@@ -1109,8 +1109,9 @@ rows:
           reads back under the sanitized name, uncounted.
   # statsd_out, influxdb_out, and datadog_out write no exemplars, and otlp_out writes an
   # exemplar's keys as is, so no record reaches these two rows there and none of them has a cell.
-  # A monotonic sum reaches the first, a histogram the second; another kind's exemplar has no line
-  # to sit on in exposition (record/exemplars).
+  # A monotonic sum reaches the first, a histogram the second, each only through an exemplar the
+  # OpenMetrics writer puts on a line (a counter's first, a histogram's first per bucket); another
+  # kind's exemplar has no line to sit on in exposition (record/exemplars).
   - kind: record
     feature: exemplar_key_unsafe
     cells:

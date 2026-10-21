@@ -9,6 +9,10 @@
     {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"cart.value.value","kind":"gauge","value":42.5}],"attributes":{"_logit.influxdb.measurement":"cart.value","host.name":"web-1","service.name":"checkout"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}}},
     {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"orders.placed.value","kind":"gauge","value":118}],"attributes":{"_logit.influxdb.measurement":"orders.placed","host.name":"web-1","service.name":"checkout"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}}}
   ], "counters": {}},
+  "exemplars-unwritten": {"events": [
+    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"orders.shipped.value","kind":"gauge","value":64}],"attributes":{"_logit.influxdb.measurement":"orders.shipped","host.name":"web-1","service.name":"checkout"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}}},
+    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"queue.wait.bucket_10","kind":"gauge","value":3}],"attributes":{"_logit.influxdb.measurement":"queue.wait","host.name":"web-1","service.name":"checkout"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}},"types":{"/metrics/0/value":"u64"}}
+  ], "counters": {}},
   "exponential-histograms": {"events": [], "counters": {
     "logit.output.metrics.skipped{component=out,kind=influxdb_out,metric_kind=exponential_histogram,role=sink}": 2
   }},

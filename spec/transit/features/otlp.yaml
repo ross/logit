@@ -67,6 +67,8 @@
   text: Exemplars on a `Histogram` data point.
 - name: exemplars_exponential_histogram
   text: Exemplars on an `ExponentialHistogram` data point.
+- name: several_exemplars
+  text: Several exemplars on one data point.
 - name: exemplar_trace
   text: An exemplar's `traceId` and `spanId`.
 - name: exemplar_filtered_attributes

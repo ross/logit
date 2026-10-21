@@ -11,6 +11,10 @@
   ], "counters": {
     "logit.output.metrics.degraded{component=out,kind=prometheus_out,reason=exemplar_omitted,role=sink}": 1
   }},
+  "exemplars-unwritten": {"events": [
+    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"orders_shipped_total","kind":"sum","value":64.0,"temporality":"cumulative","monotonic":true,"unit":"{order}","start_timestamp":"2027-01-15T07:58:50.000000000Z","exemplars":[{"timestamp":"2027-01-15T07:59:47.000000000Z","value":1.0,"attributes":{"carrier":"ups"}},{"timestamp":"2027-01-15T07:59:48.000000000Z","value":2.0,"attributes":{"carrier.id":"c-4"}}]}],"attributes":{"host_name":"web-1","service_name":"checkout"}},
+    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"queue_wait","kind":"histogram","temporality":"cumulative","buckets":[{"bound":10.0,"count":3},{"bound":"inf","count":4}],"sum":140.0,"unit":"ms","start_timestamp":"2027-01-15T07:58:50.000000000Z","exemplars":[{"timestamp":"2027-01-15T07:59:46.000000000Z","value":4.0,"attributes":{"queue":"orders"}},{"timestamp":"2027-01-15T07:59:47.000000000Z","value":6.0,"attributes":{"queue.name":"orders"}}]}],"attributes":{"host_name":"web-1","service_name":"checkout"}}
+  ], "counters": {}},
   "exponential-histograms": {"events": [], "counters": {
     "logit.output.metrics.dropped{component=out,kind=prometheus_out,reason=native_histogram,role=sink}": 2
   }},

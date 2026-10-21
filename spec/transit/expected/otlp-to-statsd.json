@@ -10,6 +10,16 @@
   ], "counters": {
     "logit.output.metrics.degraded{component=out,kind=statsd_out,metric_kind=cumulative_sum,role=sink}": 1
   }},
+  "exemplars-unwritten": {"events": [
+    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"orders.shipped","kind":"gauge","value":64.0}],"attributes":{"host":"web-1","service.name":"checkout"}},
+    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"queue.wait.bucket_10","kind":"gauge","value":3.0}],"attributes":{"host":"web-1","service.name":"checkout"}},
+    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"queue.wait.bucket_inf","kind":"gauge","value":4.0}],"attributes":{"host":"web-1","service.name":"checkout"}},
+    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"queue.wait.count","kind":"gauge","value":7.0}],"attributes":{"host":"web-1","service.name":"checkout"}},
+    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"queue.wait.sum","kind":"gauge","value":140.0}],"attributes":{"host":"web-1","service.name":"checkout"}}
+  ], "counters": {
+    "logit.output.metrics.degraded{component=out,kind=statsd_out,metric_kind=cumulative_sum,role=sink}": 1,
+    "logit.output.metrics.degraded{component=out,kind=statsd_out,metric_kind=histogram,role=sink}": 1
+  }},
   "exponential-histograms": {"events": [
     {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"messaging.payload.size.count","kind":"gauge","value":5.0}],"attributes":{"host":"web-1","messaging.system":"kafka","service.name":"checkout"}},
     {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"messaging.payload.size.sum","kind":"gauge","value":40.0}],"attributes":{"host":"web-1","messaging.system":"kafka","service.name":"checkout"}},

@@ -589,11 +589,11 @@ Recorded per workstream as each lands.
   records each: a list's data sources as separate measurements at `influxdb_out`, and a
   notification's plugin and type at `otlp_out`. It also records a wrapped COUNTER reading as a
   reset at `prometheus_out`, which no flow can show, since it's outside the codec layer.
-- **`otlp_in` source, metrics** (`totlp/w1`): 13 cases over 55 features. Twelve are hand-written
+- **`otlp_in` source, metrics** (`totlp/w1`): 14 cases over 56 features. Thirteen are hand-written
   OTLP/HTTP bodies in `.bin` beside a `.headers` naming `path:`, `content-type:`, and
   `content-encoding:`, decoded through `otlp_in`'s own `decode_request`. One of them is protobuf
   (`sums-protobuf`, the `MetricsData` the JSON decoder reads from `sums.bin`, so its `.json`
-  equals `sums.json`), and one is gzip-compressed. The thirteenth, `telemetrygen`, reads
+  equals `sums.json`), and one is gzip-compressed. The fourteenth, `telemetrygen`, reads
   `testdata/interop/otlp/metrics.json` in place: a capture with no `.headers` is read as the
   Collector `file` exporter's lines, one OTLP/JSON request each. OTLP/JSON is readable text, so a
   hand-written body runs the real decoder and needs no `.json` written by hand.
@@ -609,7 +609,9 @@ Recorded per workstream as each lands.
     reads back in the next one (`record/exemplar_key_unsafe_histogram`: `degraded`). Remote-write
     carries the key as written and `prometheus_in` reads it back. No row could say this, so the
     two rows and their reach rule in `classes.rs` are new; only `prometheus_out` writes
-    exemplar keys under a name rule, so no other sink has a cell.
+    exemplar keys under a name rule, so no other sink has a cell. The rule reads only the
+    exemplars the writer puts on a line, through `text::exposed_exemplar_labels`, so a second
+    exemplar the writer leaves off doesn't reach the rows (case `exemplars-unwritten`).
   - `statsd_out` and `datadog_out` write each element of an array attribute as its own tag, so a
     number element reads back as a string (`attributes/array_value`: `normalized`,
     `stringified`). The statsd and Datadog cases held only string arrays, so the cells read

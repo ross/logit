@@ -9,6 +9,10 @@
   ], "counters": {
     "logit.output.metrics.skipped{component=out,kind=datadog_out,metric_kind=cumulative_sum,role=sink}": 1
   }},
+  "exemplars-unwritten": {"events": [], "counters": {
+    "logit.output.metrics.skipped{component=out,kind=datadog_out,metric_kind=cumulative_sum,role=sink}": 1,
+    "logit.output.metrics.skipped{component=out,kind=datadog_out,metric_kind=histogram,role=sink}": 1
+  }},
   "exponential-histograms": {"events": [], "counters": {
     "logit.output.metrics.skipped{component=out,kind=datadog_out,metric_kind=exponential_histogram,role=sink}": 2
   }},

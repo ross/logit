@@ -15,8 +15,8 @@
 //! `no_recorded_value_other_kind` for a kind other than `sum` and `gauge`) it carries,
 //! `service_check` when it carries `_logit.statsd.service_check.name`, `name_unsafe` when the
 //! sink's wire rewrites a character of its name ([`Spelling`]), `exemplar_key_unsafe` for a
-//! monotonic `sum` (`exemplar_key_unsafe_histogram` for a `histogram`) when one of its exemplars
-//! carries an attribute key `prometheus_out` would rewrite as a label name, `sample_rate` for a
+//! monotonic `sum` (`exemplar_key_unsafe_histogram` for a `histogram`) when an exemplar
+//! `prometheus_out` writes carries an attribute key it would rewrite as a label name, `sample_rate` for a
 //! `samples`
 //! record whose rate rounds to a weight above 1, `non_finite` for a `sum` or
 //! `gauge` holding `NaN` or an infinity, and `superseded` when a later record of the run is
@@ -121,7 +121,9 @@ use super::mapping::{self, Class, Lookup, Mapping, Series};
 use super::Traced;
 use logit_core::EventBatch;
 use logit_outputs::ndjson::render_ndjson;
+use logit_proto::event_json::EventJsonDecoder;
 use logit_proto::influxdb::ATTR_MEASUREMENT;
+use logit_proto::prometheus::text::exposed_exemplar_labels;
 use logit_proto::prometheus::{sanitize_label_name, sanitize_metric_name};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -316,12 +318,14 @@ impl Spelling {
         }
     }
 
-    /// The `record/exemplar_key_unsafe*` row `rec` reaches when one of its exemplars carries a
-    /// public attribute key the sink writes as a label name it would have to rewrite:
+    /// The `record/exemplar_key_unsafe*` row `rec` reaches when an exemplar the sink writes
+    /// carries a public attribute key it writes as a label name it would have to rewrite:
     /// `exemplar_key_unsafe` for a monotonic `sum`, `exemplar_key_unsafe_histogram` for a
-    /// `histogram`, the two kinds whose exposition lines carry an exemplar. Only `prometheus_out`
-    /// writes an exemplar's attributes under a name rule; `otlp_out` writes them as is, and the
-    /// other sinks write no exemplars.
+    /// `histogram`, the two kinds whose exposition lines carry an exemplar. Which exemplars are
+    /// written is `prometheus_out`'s own selection (`exposed_exemplar_labels`): a counter's first,
+    /// a histogram's first per bucket, each within the label budget. Only `prometheus_out` writes
+    /// an exemplar's attributes under a name rule; `otlp_out` writes them as is, and the other
+    /// sinks write no exemplars.
     fn exemplar_key_unsafe(self, rec: &Rec) -> Option<&'static str> {
         if self != Spelling::Prometheus {
             return None;
@@ -331,13 +335,11 @@ impl Spelling {
             "histogram" => "exemplar_key_unsafe_histogram",
             _ => return None,
         };
-        let unsafe_key =
-            |key: &String| !key.starts_with("_logit.") && sanitize_label_name(key) != key.as_str();
-        let reaches = rec.body["exemplars"].as_array().is_some_and(|exemplars| {
-            exemplars
-                .iter()
-                .any(|e| e["attributes"].as_object().is_some_and(|a| a.keys().any(unsafe_key)))
-        });
+        let record = model_record(rec)?;
+        let reaches = exposed_exemplar_labels(&record)
+            .iter()
+            .flatten()
+            .any(|(key, _)| sanitize_label_name(key) != key.as_str());
         reaches.then_some(feature)
     }
 
@@ -1111,6 +1113,13 @@ fn kind_features(rec: &Rec) -> Vec<Option<String>> {
         "event" => vec![Some("attributes_only".to_string())],
         _ => vec![None],
     }
+}
+
+/// `rec`'s metric record in the model, read back from its `format: json` body.
+fn model_record(rec: &Rec) -> Option<logit_core::MetricRecord> {
+    let line = serde_json::json!({"timestamp": rec.timestamp, "metrics": [rec.body]});
+    let batches = EventJsonDecoder::new().decode_batches(line.to_string().as_bytes()).ok()?;
+    batches.into_iter().next()?.events.into_iter().next()?.metrics.into_iter().next()
 }
 
 /// The record-level `record` features `rec` reaches.
@@ -1908,7 +1917,6 @@ pub(super) fn check(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use logit_proto::event_json::EventJsonDecoder;
 
     /// The records of `format: json` lines, each holding `{T}` for a fixed timestamp.
     fn recs(lines: &[&str]) -> Vec<Rec> {

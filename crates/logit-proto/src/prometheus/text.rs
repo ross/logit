@@ -909,26 +909,62 @@ impl Writer<'_> {
         self.out.push(b'\n');
     }
 
-    /// The first not-yet-placed exemplar whose value falls in `(previous, le]` -- OpenMetrics allows
-    /// at most one per bucket, and an exemplar belongs on the bucket its own value lands in.
+    /// The first not-yet-placed exemplar whose value falls in `(previous, le]` ([`claim`]).
     fn claim_exemplar<'e>(
         &mut self,
         series: &'e Series,
         previous: f64,
         le: f64,
     ) -> Option<&'e Exemplar> {
-        for (i, exemplar) in series.exemplars.iter().enumerate() {
-            if self.used.get(i).copied().unwrap_or(true) || exemplar.value.as_f64().is_nan() {
-                continue;
-            }
-            let value = exemplar.value.as_f64();
-            if value > previous && value <= le {
-                self.used[i] = true;
-                return Some(exemplar);
-            }
-        }
-        None
+        claim(&series.exemplars, &mut self.used, previous, le).map(|i| &series.exemplars[i])
     }
+}
+
+/// The index of the first exemplar not yet placed (`used`) whose value falls in `(previous, le]`,
+/// marked placed: OpenMetrics allows at most one per bucket, and an exemplar belongs on the bucket
+/// its own value lands in. A `NaN` value lands in none.
+fn claim(exemplars: &[Exemplar], used: &mut [bool], previous: f64, le: f64) -> Option<usize> {
+    for (i, exemplar) in exemplars.iter().enumerate() {
+        if used.get(i).copied().unwrap_or(true) || exemplar.value.as_f64().is_nan() {
+            continue;
+        }
+        let value = exemplar.value.as_f64();
+        if value > previous && value <= le {
+            used[i] = true;
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// The exemplars of `record` the OpenMetrics writer puts on a line, each as the label pairs it's
+/// written with ([`exemplar_labels`]): a monotonic `Sum`'s first, as a counter's `_total` line
+/// holds one, and a `Histogram`'s each placed on the bucket its value falls in, one per bucket.
+/// One over the label budget, and every exemplar of any other kind, is left off, as the writer
+/// leaves it off. It reads the record alone, so it assumes the record reaches a family of that
+/// shape: a delta one is dropped before it's written.
+pub fn exposed_exemplar_labels(record: &logit_core::MetricRecord) -> Vec<Vec<(String, String)>> {
+    let exemplars = &record.exemplars;
+    let placed: Vec<&Exemplar> = match &record.kind {
+        logit_core::MetricKind::Sum(sum) if sum.monotonic => {
+            exemplars.first().into_iter().collect()
+        }
+        logit_core::MetricKind::Histogram(h) => {
+            let (buckets, _) = super::cumulative_counts(&h.buckets);
+            let mut used = vec![false; exemplars.len()];
+            let mut previous = f64::NEG_INFINITY;
+            let mut placed = Vec::new();
+            for (le, _) in buckets {
+                if let Some(i) = claim(exemplars, &mut used, previous, le) {
+                    placed.push(&exemplars[i]);
+                }
+                previous = le;
+            }
+            placed
+        }
+        _ => Vec::new(),
+    };
+    placed.into_iter().filter(|e| exemplar_fits(e)).map(exemplar_labels).collect()
 }
 
 /// The name a family's `# TYPE` line carries in `dialect`, which is not always the model name
