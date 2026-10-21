@@ -1,0 +1,14 @@
+{
+  "name": "non-monotonic",
+  "kind": "explicit",
+  "input": {
+    "bounds": ["5", "1"],
+    "counts": [0, 3, 0],
+    "count": 3,
+    "sum": "9",
+    "min": null,
+    "max": null
+  },
+  "outcome": "non_monotonic_bounds",
+  "detail": "explicit bucket histogram: non-monotonic boundaries"
+}

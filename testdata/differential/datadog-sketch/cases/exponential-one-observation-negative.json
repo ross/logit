@@ -1,0 +1,30 @@
+{
+  "name": "one-observation-negative",
+  "kind": "exponential",
+  "input": {
+    "scale": 0,
+    "zero_count": 0,
+    "positive": {
+      "offset": 0,
+      "counts": []
+    },
+    "negative": {
+      "offset": 3,
+      "counts": [1]
+    },
+    "count": 1,
+    "sum": "-9.5",
+    "min": null,
+    "max": null
+  },
+  "outcome": "sketch",
+  "sketch": {
+    "k": [-1491],
+    "n": [1],
+    "cnt": 1,
+    "sum": "-9.5",
+    "min": "-9.5",
+    "max": "-9.5",
+    "avg": "-9.5"
+  }
+}

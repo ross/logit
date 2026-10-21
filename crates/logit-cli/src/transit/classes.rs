@@ -8,8 +8,9 @@
 //!
 //! **Which rows a record reaches.** A metric record reaches its kind's rows: for a `sum`, its
 //! temporality and monotonicity and its scalar type; for a `gauge` or `gauge_delta`, its scalar
-//! type, and `negative` for a gauge below zero; for a `histogram` or `exponential_histogram`,
-//! its temporality; any other kind, its kind's one row. It also reaches a `record` row for each of
+//! type, and `negative` for a gauge below zero; for a `histogram`, `exponential_histogram`, or
+//! `summary`, its temporality, and for a `histogram` `nan_bound` and `neg_inf_bound` for each such
+//! bound it holds; any other kind, its kind's one row. It also reaches a `record` row for each of
 //! `unit` (`unit_on_distribution` for a `samples` or `distribution`), `description`,
 //! `start_timestamp`, `exemplars` (`exemplars_on_summary` for a `summary`), and `no_recorded_value` (`no_recorded_value_delta_sum` for a delta `sum`,
 //! `no_recorded_value_other_kind` for a kind other than `sum` and `gauge`) it carries,
@@ -51,13 +52,19 @@
 //! value, and type tags (`exact`); (2) the same name, kind, temporality, and monotonicity and the
 //! same value read as a number, or for `samples` and `set_members` several read-back records whose
 //! values together are the input's (`normalized`); a histogram that gained an empty `+Inf`
-//! bucket is the same value; (3) the same name in another kind, or names under `<name>.`, the
-//! dotted series of an expansion, one of each dotted name per record when several points of a
-//! series expand (`degraded`). Passes (1) and (2) run by name and then by the name as the sink
-//! writes it, where an `exact` pairing reads as `normalized`, before pass (3) runs either way, so
-//! a dotted expansion never claims a record a respelling reads back whole. Within a pass the
-//! latest record goes first, so where a sink keeps one point per series, the earlier point is the
-//! one left over.
+//! bucket is the same value; (3) once neither found a match, the same name in any metric kind,
+//! the input's own included, or names under `<name>.`, the dotted series of an expansion, one of
+//! each dotted name per record when several points of a series expand (`degraded`). Where both
+//! the input and the read-back record are histograms (or exponential histograms), pass (3) also
+//! needs the same total count and, where both carry a sum, the same sum, a non-finite sum
+//! matching only the same non-finite value. Merged or dropped bounds, an added overflow bucket,
+//! and a folded `NaN` or `-Inf` bound change no total, so they pair as `degraded`, and where each
+//! count lands is the snapshot's to pin; a sink that loses or invents observations leaves the
+//! input unread and the read-back record unclaimed. Passes (1) and (2) run by name and then by
+//! the name as the sink writes it, where an `exact` pairing reads as `normalized`, before pass
+//! (3) runs either way, so a dotted expansion never claims a record a respelling reads back
+//! whole. Within a pass the latest record goes first, so where a sink keeps one point per series,
+//! the earlier point is the one left over.
 //!
 //! [`Spelling`] holds each sink's rewrites, from its codec's module doc: `statsd_out`'s reserved
 //! characters as `_` in a name, a tag key, and a tag value (`:` allowed there), and under
@@ -70,7 +77,9 @@
 //! span's `span.kind` and `_dd.p.tid`), each accepted only with the value derived for it. A
 //! candidate's public attributes (no `_logit.`
 //! key, values compared as text, each key and value as the sink writes it) must equal the
-//! input's, or failing any that do, be a subset of them. An input left unpaired was skipped or
+//! input's, or failing any that do, be a subset of them; a `datadog_out` series under `<name>.`
+//! may also carry the `lower_bound`, `upper_bound`, or `quantile` tag of the bucket or quantile it
+//! expands. An input left unpaired was skipped or
 //! dropped: the class is the one whose counter moved, or the cell's when it says the loss is
 //! `uncounted`. A read-back record no input claims fails the check with both sides printed.
 //!
@@ -938,7 +947,10 @@ fn pair(ins: &[Rec], outs: &[Rec], spelling: Spelling) -> Pairing {
                 continue;
             }
             let input = &ins[i];
-            let direct = candidates(i, &used);
+            let direct: Vec<usize> = candidates(i, &used)
+                .into_iter()
+                .filter(|&o| same_observations(input, &outs[o]))
+                .collect();
             let sharing = (0..ins.len())
                 .filter(|&j| {
                     seen[j].is_none()
@@ -965,6 +977,7 @@ fn pair(ins: &[Rec], outs: &[Rec], spelling: Spelling) -> Pairing {
                         && out_names[o].starts_with(&prefix)
                         && out_names[o] != in_names[i]
                         && score(input, &outs[o], spelling) > 0
+                        && same_observations(input, &outs[o])
                 })
                 .collect();
             // Several points of one series each expand to one record per dotted name, so each
@@ -986,10 +999,22 @@ fn pair(ins: &[Rec], outs: &[Rec], spelling: Spelling) -> Pairing {
     Pairing { seen, claimed, unclaimed }
 }
 
+/// The tags `datadog_out` puts on a series it derives from a record: a histogram's `.bucket`
+/// bounds and a summary's `.quantile`, each from the bucket or quantile, not an attribute.
+const DATADOG_EXPANSION_KEYS: [&str; 3] = ["lower_bound", "upper_bound", "quantile"];
+
 /// 2 when `out`'s public attributes equal `input`'s as the sink spells their keys, 1 when
-/// they're a subset, else 0.
+/// they're a subset, else 0. A `datadog_out` series under `<name>.` may also carry
+/// [`DATADOG_EXPANSION_KEYS`].
 fn score(input: &Rec, out: &Rec, spelling: Spelling) -> u8 {
-    let (want, have) = (input.public_as(spelling), out.public());
+    let (want, mut have) = (input.public_as(spelling), out.public());
+    if spelling == Spelling::Datadog && out.name.starts_with(&format!("{}.", input.name)) {
+        for key in DATADOG_EXPANSION_KEYS {
+            if !want.contains_key(key) {
+                have.remove(key);
+            }
+        }
+    }
     if want == have {
         2
     } else if have.iter().all(|(k, v)| want.get(k) == Some(v)) {
@@ -1006,7 +1031,7 @@ fn same_value(a: &Rec, b: &Rec) -> bool {
         "gauge_delta" => same_number(&a.body["delta"], &b.body["delta"]),
         "log" => a.body["message"] == b.body["message"],
         // A histogram whose last bound is finite gains an empty `+Inf` bucket on a wire that
-        // states the total as one (Prometheus).
+        // states the total as one (Prometheus) or requires an overflow count (OTLP).
         "histogram" => {
             let (mut a, mut b) = (a.core().0, b.core().0);
             for body in [&mut a, &mut b] {
@@ -1021,6 +1046,40 @@ fn same_value(a: &Rec, b: &Rec) -> bool {
             a == b
         }
         _ => a.core().0 == b.core().0,
+    }
+}
+
+/// Whether `out` can stand for `input`'s observations in pass (3): when both are histograms, it
+/// needs the same total count and, where both carry a sum, the same sum. A non-finite sum
+/// matches only the same non-finite value, since a `NaN` or infinite observation is what made
+/// it non-finite. Any other pair passes, so a histogram read back as dotted gauges still pairs.
+fn same_observations(input: &Rec, out: &Rec) -> bool {
+    match (histogram_count(input), histogram_count(out)) {
+        (Some(want), Some(have)) => {
+            want == have
+                && match (input.body.get("sum"), out.body.get("sum")) {
+                    (Some(a), Some(b)) => same_number(a, b),
+                    _ => true,
+                }
+        }
+        _ => true,
+    }
+}
+
+/// A `histogram`'s bucket counts summed, or an `exponential_histogram`'s `count`; `None` for
+/// any other kind.
+fn histogram_count(rec: &Rec) -> Option<u128> {
+    match rec.kind.as_str() {
+        "histogram" => Some(
+            rec.body["buckets"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|bucket| u128::from(bucket["count"].as_u64().unwrap_or(0)))
+                .sum(),
+        ),
+        "exponential_histogram" => Some(u128::from(rec.body["count"].as_u64().unwrap_or(0))),
+        _ => None,
     }
 }
 
@@ -1093,7 +1152,24 @@ fn kind_features(rec: &Rec) -> Vec<Option<String>> {
             features
         }
         "gauge_delta" => vec![Some(scalar("delta"))],
-        "histogram" | "exponential_histogram" => vec![Some(temporality())],
+        // A record holding both a `NaN` and a `-Inf` bound reaches both rows.
+        "histogram" => {
+            let mut features = vec![Some(temporality())];
+            let bounds: Vec<&str> = rec.body["buckets"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|bucket| bucket["bound"].as_str())
+                .collect();
+            if bounds.contains(&"NaN") {
+                features.push(Some("nan_bound".to_string()));
+            }
+            if bounds.contains(&"-inf") {
+                features.push(Some("neg_inf_bound".to_string()));
+            }
+            features
+        }
+        "exponential_histogram" | "summary" => vec![Some(temporality())],
         "log" | "span" if rec.beside_metrics => vec![Some("beside_metrics".to_string())],
         "span" if datadog::otel_only(rec) => {
             vec![Some("alone".to_string()), Some("no_wire_form".to_string())]
@@ -2440,6 +2516,48 @@ mod tests {
             r#"{{T},"metrics":[{"name":"h","kind":"histogram","temporality":"cumulative","buckets":[{"bound":1.0,"count":2},{"bound":"inf","count":0}]}]}"#,
         ]);
         assert_eq!(pair(&ins, &outs, Spelling::Prometheus).seen, [Some(Class::Normalized)]);
+    }
+
+    /// A histogram read back with its buckets merged pairs as `degraded`, since it holds the same
+    /// observations.
+    #[test]
+    fn a_histogram_with_merged_buckets_pairs_degraded() {
+        let ins = recs(&[
+            r#"{{T},"metrics":[{"name":"h","kind":"histogram","temporality":"cumulative","buckets":[{"bound":1.0,"count":2},{"bound":"inf","count":1}],"sum":3.0}]}"#,
+        ]);
+        let outs = recs(&[
+            r#"{{T},"metrics":[{"name":"h","kind":"histogram","temporality":"cumulative","buckets":[{"bound":"inf","count":3}],"sum":3.0}]}"#,
+        ]);
+        assert_eq!(pair(&ins, &outs, Spelling::Prometheus).seen, [Some(Class::Degraded)]);
+    }
+
+    /// A histogram read back with another total count lost or gained observations, so it doesn't
+    /// pair.
+    #[test]
+    fn a_histogram_whose_count_changed_does_not_pair() {
+        let ins = recs(&[
+            r#"{{T},"metrics":[{"name":"h","kind":"histogram","temporality":"cumulative","buckets":[{"bound":1.0,"count":2},{"bound":"inf","count":1}],"sum":3.0}]}"#,
+        ]);
+        let outs = recs(&[
+            r#"{{T},"metrics":[{"name":"h","kind":"histogram","temporality":"cumulative","buckets":[{"bound":"inf","count":4}],"sum":3.0}]}"#,
+        ]);
+        let pairing = pair(&ins, &outs, Spelling::Prometheus);
+        assert_eq!(pairing.seen, [None]);
+        assert_eq!(pairing.unclaimed, [0]);
+    }
+
+    /// A histogram read back with another sum changed what was observed, so it doesn't pair.
+    #[test]
+    fn a_histogram_whose_sum_changed_does_not_pair() {
+        let ins = recs(&[
+            r#"{{T},"metrics":[{"name":"h","kind":"histogram","temporality":"cumulative","buckets":[{"bound":1.0,"count":2},{"bound":"inf","count":1}],"sum":3.0}]}"#,
+        ]);
+        let outs = recs(&[
+            r#"{{T},"metrics":[{"name":"h","kind":"histogram","temporality":"cumulative","buckets":[{"bound":"inf","count":3}],"sum":4.0}]}"#,
+        ]);
+        let pairing = pair(&ins, &outs, Spelling::Prometheus);
+        assert_eq!(pairing.seen, [None]);
+        assert_eq!(pairing.unclaimed, [0]);
     }
 
     /// A point flagged as holding no recorded value pairs with its stale marker, whose value is

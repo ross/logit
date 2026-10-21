@@ -1793,6 +1793,7 @@ mod tests {
                     quantiles: vec![(0.5, 1.0)],
                     count: 1,
                     sum: 1.0,
+                    temporality: Temporality::Cumulative,
                 }),
                 "summary",
             ),

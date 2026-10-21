@@ -11,6 +11,8 @@ the same date, write the record, then add a row here.
 | ADR | Created | Updated |
 |---|---|---|
 | [Full-buffer diagnostics: a full sink buffer or receive queue logs once a minute, and a gauge reads a blocked push live](buffer-full-diagnostics.md) | 2026-10-21 | 2026-10-21 |
+| [`datadog_out` maps OTLP metric kinds as Datadog's OTel exporter does, statelessly](datadog-otlp-metric-mapping.md) | 2026-10-20 | 2026-10-20 |
+| [`cumulative_to_delta`: a stateful transform that turns cumulative sums, histograms, and summaries into deltas](cumulative-to-delta-transform.md) | 2026-10-20 | 2026-10-20 |
 | [`influxdb_out` writes histograms and summaries in Telegraf's `prometheus-v1` shape](influxdb-histogram-summary-shape.md) | 2026-10-20 | 2026-10-20 |
 | [`replay_in`: a finite input that reads a `format: json` or `format: native` file once and ends](replay-input.md) | 2026-10-19 | 2026-10-19 |
 | [Transit spec: a mapping table under `spec/transit/` is the canonical statement of every cross-protocol transition, checked by flows and rendered into the docs](transit-spec.md) | 2026-10-19 | 2026-10-19 |
@@ -56,7 +58,7 @@ the same date, write the record, then add a row here.
 | [Native hop send window: several frames in flight, acknowledged in frame order](native-hop-send-window.md) | 2026-10-01 | 2026-10-18 |
 | [Native hop identity and sequence: a per-store sender identity and sequence on every hop frame, and a high-water mark at `logit_in`](native-hop-identity-and-sequence.md) | 2026-10-01 | 2026-10-18 |
 | [Sink send path and attempt accounting: counters that say what they count, one pooled-stream driver, and TLS writes that are flushed](sink-send-path-and-attempt-accounting.md) | 2026-09-29 | 2026-10-13 |
-| [Delivery semantics: at-least-once per hop, duplicates absorbed by the data model, and an effectively-once native hop](delivery-semantics.md) | 2026-09-29 | 2026-10-18 |
+| [Delivery semantics: at-least-once per hop, duplicates absorbed by the data model, and an effectively-once native hop](delivery-semantics.md) | 2026-09-29 | 2026-10-20 |
 | [Tail discovery failure and resume identity: a failed listing is no information, and a resume verifies the file's head](tail-discovery-failure-and-resume-identity.md) | 2026-09-28 | 2026-10-18 |
 | [Process-level metrics from procfs and the allocator](process-level-metrics.md) | 2026-09-28 | 2026-10-13 |
 | [`stdio_out`/`file_out`'s human render: an exhaustive, sectioned block per event](human-render-block-format.md) | 2026-09-28 | 2026-10-02 |
@@ -70,7 +72,7 @@ the same date, write the record, then add a row here.
 | [Splunk HEC: a lossless pair in the OpenTelemetry exporter's vocabulary, spans as HEC events, and opt-in acknowledgment](splunk-hec-relay.md) | 2026-09-25 | 2026-10-18 |
 | [VictoriaMetrics interop: existing components, plus zstd on Prometheus remote-write](victoriametrics-interop.md) | 2026-09-24 | 2026-10-18 |
 | [Durable checkpoint writes, observed spool I/O failures, and a feature-gated fault-injection seam](durable-checkpoint-writes-and-fault-injection.md) | 2026-09-24 | 2026-09-28 |
-| [Datadog: two lossless pairs, the Agent's own protocols, and a Datadog-mapped `DdSketch`](datadog-agent-and-intake-relay.md) | 2026-09-23 | 2026-10-19 |
+| [Datadog: two lossless pairs, the Agent's own protocols, and a Datadog-mapped `DdSketch`](datadog-agent-and-intake-relay.md) | 2026-09-23 | 2026-10-20 |
 | [`sample`: consistent, keyed event sampling with an operator override](consistent-sampling-component.md) | 2026-09-22 | 2026-10-13 |
 | [Publish the release image to GHCR, `latest` only, on manual dispatch](publish-release-image-to-ghcr.md) | 2026-09-22 | 2026-10-09 |
 | [`http_access`: web-server access lines normalized to OTel semconv once, natively, from raw fields](http-access-normalization.md) | 2026-09-22 | 2026-10-11 |
@@ -98,7 +100,7 @@ the same date, write the record, then add a row here.
 | [RFC 5424 structured-data convention: nested `syslog.sd`, strict parsing, opt-in PEN-qualified emission](syslog-structured-data-convention.md) | 2026-09-11 | 2026-10-18 |
 | [A shared build cache and one-container check execution for the local development loop](fast-local-development-loop.md) | 2026-09-11 | 2026-09-11 |
 | [statsd/DogStatsD egress: dialect, transport, packing, and the v1 metric-kind deferral](statsd-output.md) | 2026-09-10 | 2026-10-19 |
-| [Lossless like-protocol transit: the internal model is a superset of every supported wire protocol](lossless-transit.md) | 2026-09-10 | 2026-10-19 |
+| [Lossless like-protocol transit: the internal model is a superset of every supported wire protocol](lossless-transit.md) | 2026-09-10 | 2026-10-21 |
 | [Browser tracing: the real OTel-JS SDK, `addLink` for sub-resources, and living with document-load's parent (not link) behaviour](browser-tracing-sdk.md) | 2026-09-10 | 2026-10-18 |
 | [OTLP/JSON decoding: hand-written against `serde_json::Value`, not generated](otlp-json-decoding.md) | 2026-09-10 | 2026-10-18 |
 | [Provenance filtering is two transform components, combining has_attributes' and has_signal's shapes](provenance-filtering-components.md) | 2026-09-10 | 2026-10-13 |

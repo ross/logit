@@ -39,3 +39,5 @@ proptest.workspace = true
 # `Value`'s size, so the assertion is more legible naming it than hiding it behind `Value`.
 # An integration test can't reach a crate's ordinary dependencies, hence the restatement here.
 bytes.workspace = true
+# `sketch::from_otlp`'s tests read testdata/differential/datadog-sketch/'s JSON cases.
+serde_json.workspace = true

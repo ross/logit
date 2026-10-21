@@ -1,0 +1,35 @@
+{
+  "name": "single-bucket",
+  "kind": "explicit",
+  "input": {
+    "bounds": [],
+    "counts": [7],
+    "count": 7,
+    "sum": "21",
+    "min": null,
+    "max": null
+  },
+  "series": [
+    {
+      "name": "case.count",
+      "tags": [],
+      "type": "count",
+      "value": "7",
+      "unit": ""
+    },
+    {
+      "name": "case.sum",
+      "tags": [],
+      "type": "count",
+      "value": "21",
+      "unit": "millisecond"
+    },
+    {
+      "name": "case.bucket",
+      "tags": ["lower_bound:-inf", "upper_bound:inf"],
+      "type": "count",
+      "value": "7",
+      "unit": ""
+    }
+  ]
+}

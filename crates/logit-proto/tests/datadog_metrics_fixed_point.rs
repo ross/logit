@@ -340,7 +340,7 @@ fn dogsketch_with_negative_zero_positive_and_large_counts() {
                     // Negative, then zero, then positive; key 1400 split across four entries
                     // the way the Agent splits a count above 65535.
                     k: vec![-1500, -3, 0, 1, 1400, 1400, 1400, 1400],
-                    n: vec![5, 1, 7, 3, 65535, 65535, 65535, 3395],
+                    n: vec![5, 1, 7, 3, 3395, 65535, 65535, 65535],
                 },
                 Dogsketch {
                     ts: 1_700_000_010,

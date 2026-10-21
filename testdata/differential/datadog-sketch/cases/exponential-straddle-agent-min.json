@@ -1,0 +1,30 @@
+{
+  "name": "straddle-agent-min",
+  "kind": "exponential",
+  "input": {
+    "scale": 0,
+    "zero_count": 0,
+    "positive": {
+      "offset": -32,
+      "counts": [3, 4, 5, 6]
+    },
+    "negative": {
+      "offset": 0,
+      "counts": []
+    },
+    "count": 18,
+    "sum": "1e-08",
+    "min": null,
+    "max": null
+  },
+  "outcome": "sketch",
+  "sketch": {
+    "k": [0, 3, 14, 23, 31, 38, 47, 56, 64, 71, 78, 83],
+    "n": [7, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+    "cnt": 18,
+    "sum": "1e-08",
+    "min": "2.3148154144956234e-10",
+    "max": "3.7135721117329824e-09",
+    "avg": "5.555555555555555e-10"
+  }
+}

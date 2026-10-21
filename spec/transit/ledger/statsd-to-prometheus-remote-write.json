@@ -59,7 +59,8 @@
     {"sink":"prometheus_out","row":"sum/f64","cell":0,"observed":[]},
     {"sink":"prometheus_out","row":"sum/i64","cell":0,"observed":[]},
     {"sink":"prometheus_out","row":"sum/u64","cell":0,"observed":[]},
-    {"sink":"prometheus_out","row":"summary","cell":0,"observed":[]}
+    {"sink":"prometheus_out","row":"summary/cumulative","cell":0,"observed":[]},
+    {"sink":"prometheus_out","row":"summary/delta","cell":0,"observed":["dropped"]}
   ],
   "unspecified": []
 }

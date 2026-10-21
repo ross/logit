@@ -82,11 +82,11 @@ rows:
         class: exact
         text: An OTLP `Sum` with delta temporality, not monotonic.
       datadog_out:
-        class: skipped
-        counter: logit.output.metrics.skipped{metric_kind=non_monotonic_delta_sum}
+        class: degraded
+        counter: logit.output.metrics.degraded{metric_kind=non_monotonic_sum}
         text: >-
-          A Datadog `count` is a monotonic per-interval value, so a non-monotonic delta sum isn't
-          written.
+          A series `count` point of the raw value, as Datadog's exporter sends any delta sum, which
+          datadog_in reads back as a monotonic delta sum.
   - kind: sum
     feature: cumulative_monotonic
     cells:
@@ -115,10 +115,12 @@ rows:
         class: exact
         text: An OTLP `Sum` with cumulative temporality and the monotonic flag.
       datadog_out:
-        class: skipped
-        counter: logit.output.metrics.skipped{metric_kind=cumulative_sum}
+        class: dropped
+        counter: logit.output.metrics.dropped{reason=unresolved_cumulative}
         text: >-
-          A Datadog `count` carries a per-interval value, so a running total isn't written.
+          Datadog's exporter differences a running total into a delta first, so it's dropped,
+          with a throttled `unresolved_cumulative` warning; a `cumulative_to_delta` upstream
+          makes it a delta `count`.
   - kind: sum
     feature: cumulative_nonmonotonic
     cells:
@@ -143,10 +145,11 @@ rows:
         class: exact
         text: An OTLP `Sum` with cumulative temporality, not monotonic.
       datadog_out:
-        class: skipped
-        counter: logit.output.metrics.skipped{metric_kind=cumulative_sum}
+        class: degraded
+        counter: logit.output.metrics.degraded{metric_kind=non_monotonic_sum}
         text: >-
-          A running total isn't written, as for a monotonic one.
+          A series `gauge` point of the running value, as Datadog's exporter sends it, which
+          datadog_in reads back as a gauge.
 
   # --- sum: scalar type ------------------------------------------------------------------------
   - kind: sum
@@ -681,18 +684,36 @@ rows:
           Telegraf's shape: float `count`, `sum`, `min`, and `max` fields, a field per finite
           bound named by the bound and holding the cumulative count up to it, and `+Inf` holding
           the total, each read back as a gauge under `<name>.`, its temporality dropped. When
-          every component is finite, nothing is counted. A non-finite `sum`, `min`, `max`, or
-          bound is left off the line, and the record counts once as
+          every component is finite, nothing is counted. A non-finite `sum`, `min`, or `max` is
+          left off the line, and the record counts once as
           `logit.output.metrics.degraded{reason=non_finite_component}`.
       otlp_out:
-        class: exact
-        text: An OTLP `Histogram` with delta temporality.
-      datadog_out:
-        class: skipped
-        counter: logit.output.metrics.skipped{metric_kind=histogram}
+        class: normalized
+        reason: inf_bucket
         text: >-
-          The series encoders have no histogram, so none is written; `docs/known-gaps/datadog.md`'s
-          "`datadog_out` sends no Agent-style `h`/`ms` aggregates" entry has the follow-up.
+          An OTLP `Histogram` with delta temporality. OTLP requires an overflow count above the
+          highest bound, so a histogram whose last bound is finite reads back with an empty
+          `+Inf` bucket.
+      datadog_out:
+        - when: {histograms: {mode: counters, send_aggregation_metrics: true}}
+          class: degraded
+          counter: logit.output.metrics.degraded{metric_kind=histogram}
+          text: >-
+            Under `histograms.mode: counters`, a `<name>.bucket` count per bucket tagged
+            `lower_bound` and `upper_bound` in the exporter's `formatFloat` form, beside the
+            `.count`, `.sum`, `.min`, and `.max` series.
+        - when: {histograms: {mode: nobuckets, send_aggregation_metrics: true}}
+          class: degraded
+          counter: logit.output.metrics.degraded{metric_kind=histogram}
+          text: >-
+            Under `histograms.mode: nobuckets`, the `.count`, `.sum`, `.min`, and `.max` series
+            alone.
+        - class: degraded
+          counter: logit.output.metrics.degraded{metric_kind=histogram}
+          text: >-
+            A sketch under `Mapping::agent` with its counts spread over the buckets as Datadog's
+            exporter spreads them, and the point's count, sum, and average, which datadog_in reads
+            back as a distribution.
   - kind: histogram
     feature: cumulative
     cells:
@@ -712,12 +733,16 @@ rows:
           Telegraf's shape: float `count`, `sum`, `min`, and `max` fields, a field per finite
           bound named by the bound and holding the cumulative count up to it, and `+Inf` holding
           the total, each read back as a gauge under `<name>.`, its temporality dropped. When
-          every component is finite, nothing is counted. A non-finite `sum`, `min`, `max`, or
-          bound is left off the line, and the record counts once as
+          every component is finite, nothing is counted. A non-finite `sum`, `min`, or `max` is
+          left off the line, and the record counts once as
           `logit.output.metrics.degraded{reason=non_finite_component}`.
       otlp_out:
-        class: exact
-        text: An OTLP `Histogram` with cumulative temporality.
+        class: normalized
+        reason: inf_bucket
+        text: >-
+          An OTLP `Histogram` with cumulative temporality. OTLP requires an overflow count above the
+          highest bound, so a histogram whose last bound is finite reads back with an empty
+          `+Inf` bucket.
       prometheus_out:
         class: normalized
         reason: inf_bucket
@@ -727,10 +752,116 @@ rows:
           last bound is finite reads back with an empty `+Inf` bucket. `min` and `max` are
           `record/min_max`'s.
       datadog_out:
-        class: skipped
-        counter: logit.output.metrics.skipped{metric_kind=histogram}
+        class: dropped
+        counter: logit.output.metrics.dropped{reason=unresolved_cumulative}
         text: >-
-          The series encoders have no histogram, so none is written.
+          Datadog's exporter differences a running total into a delta first, so it's dropped,
+          with a throttled `unresolved_cumulative` warning; a `cumulative_to_delta` upstream
+          makes it a delta histogram.
+  # A histogram with a `NaN` bucket bound, in any order. A record holding both a `NaN` and a
+  # `-Inf` bound reaches this row and `neg_inf_bound`. A sink's other histogram outcomes are its
+  # temporality row's.
+  - kind: histogram
+    feature: nan_bound
+    cells:
+      statsd_out:
+        - when: {multi_value: skip}
+          class: skipped
+          counter: logit.output.metrics.skipped{metric_kind=histogram}
+          text: 'Under `multi_value: skip`, no line is written.'
+        - class: degraded
+          counter: logit.output.metrics.degraded{metric_kind=histogram}
+          text: >-
+            Each bucket is its own dotted series, as for any other bound: `.bucket_NaN` holds
+            that bucket's own count.
+      prometheus_out:
+        class: degraded
+        counter: logit.output.metrics.degraded{reason=non_finite_component}
+        text: >-
+          A `NaN` bound has no place among the sorted bounds, so it has no bucket, and its count
+          reaches only `+Inf` and `_count`.
+      influxdb_out:
+        class: degraded
+        counter: logit.output.metrics.degraded{reason=non_finite_component}
+        text: >-
+          No field key spells a `NaN` bound, so none is written, and its count reaches only
+          `count` and `+Inf`.
+      otlp_out:
+        class: degraded
+        counter: logit.output.metrics.degraded{reason=non_finite_component}
+        text: >-
+          OTLP bounds are finite, so a `NaN` bound's count joins the overflow bucket. `count`
+          and every cumulative count are kept.
+      datadog_out:
+        - when: {histograms: {mode: counters, send_aggregation_metrics: true}}
+          class: degraded
+          counter: logit.output.metrics.degraded{metric_kind=histogram}
+          text: >-
+            Under `histograms.mode: counters`, a `NaN` bound is one more bucket's bound: the
+            `<name>.bucket` counts beside it carry a `nan` `lower_bound` or `upper_bound` tag, the
+            exporter's `formatFloat` form.
+        - when: {histograms: {mode: nobuckets, send_aggregation_metrics: true}}
+          class: degraded
+          counter: logit.output.metrics.degraded{metric_kind=histogram}
+          text: >-
+            Under `histograms.mode: nobuckets`, no bucket is written, so the bound goes with the
+            rest.
+        - class: dropped
+          counter: logit.output.metrics.dropped{reason=non_monotonic_bounds}
+          text: >-
+            Datadog's exporter keys a `NaN` bound at the Agent's key 1 on amd64, so a `NaN` above
+            a bound that keys higher makes a bucket whose upper key is below its lower one, and
+            the point is dropped, as the exporter drops it. A `NaN` below every bound that keys
+            above 1 would instead be sketched with its count at key 1.
+  # A histogram with a `-Inf` bucket bound.
+  - kind: histogram
+    feature: neg_inf_bound
+    cells:
+      statsd_out:
+        - when: {multi_value: skip}
+          class: skipped
+          counter: logit.output.metrics.skipped{metric_kind=histogram}
+          text: 'Under `multi_value: skip`, no line is written.'
+        - class: degraded
+          counter: logit.output.metrics.degraded{metric_kind=histogram}
+          text: >-
+            Each bucket is its own dotted series, as for any other bound: `.bucket_-inf` holds
+            that bucket's own count.
+      prometheus_out:
+        class: exact
+        text: '`-Inf` is an ordinary bound: an `le="-Inf"` bucket, first.'
+      influxdb_out:
+        class: degraded
+        counter: logit.output.metrics.degraded{reason=non_finite_component}
+        text: >-
+          No field key spells a `-Inf` bound, so none is written, and its count reaches every
+          finite bound's field.
+      otlp_out:
+        class: degraded
+        counter: logit.output.metrics.degraded{reason=non_finite_component}
+        text: >-
+          OTLP bounds are finite, so a `-Inf` bound's count joins the first bucket. `count` and
+          every cumulative count are kept.
+      datadog_out:
+        - when: {histograms: {mode: counters, send_aggregation_metrics: true}}
+          class: degraded
+          counter: logit.output.metrics.degraded{metric_kind=histogram}
+          text: >-
+            Under `histograms.mode: counters`, a `-Inf` bound is one more bucket's bound: the
+            `<name>.bucket` counts beside it carry a `-inf` `lower_bound` or `upper_bound` tag,
+            the exporter's `formatFloat` form.
+        - when: {histograms: {mode: nobuckets, send_aggregation_metrics: true}}
+          class: degraded
+          counter: logit.output.metrics.degraded{metric_kind=histogram}
+          text: >-
+            Under `histograms.mode: nobuckets`, no bucket is written, so the bound goes with the
+            rest.
+        - class: degraded
+          counter: logit.output.metrics.degraded{metric_kind=histogram}
+          text: >-
+            In the sketch, as Datadog's exporter builds it on amd64: Go's `int(-Inf)` keys the
+            bound at the Agent's key -1, so the `-Inf` bucket's count lands near `-1e-9` rather
+            than below every other bucket, and the sketch's `min` is that bin's value.
   - kind: exponential_histogram
     feature: delta
     cells:
@@ -764,10 +895,13 @@ rows:
         class: exact
         text: An OTLP `ExponentialHistogram`, field for field.
       datadog_out:
-        class: skipped
-        counter: logit.output.metrics.skipped{metric_kind=exponential_histogram}
+        class: degraded
+        counter: logit.output.metrics.degraded{metric_kind=exponential_histogram}
         text: >-
-          The series encoders have no exponential histogram, so none is written.
+          A sketch under every `histograms.mode`, its buckets re-mapped onto the Agent's bins as
+          Datadog's exporter re-maps them, with the point's count, sum, and average, which
+          datadog_in reads back as a distribution; with `send_aggregation_metrics`, the `.count`,
+          `.sum`, `.min`, and `.max` series too.
   - kind: exponential_histogram
     feature: cumulative
     cells:
@@ -797,11 +931,55 @@ rows:
         class: exact
         text: An OTLP `ExponentialHistogram`, field for field.
       datadog_out:
-        class: skipped
-        counter: logit.output.metrics.skipped{metric_kind=exponential_histogram}
+        class: dropped
+        counter: logit.output.metrics.dropped{reason=unresolved_cumulative}
         text: >-
-          The series encoders have no exponential histogram, so none is written.
+          Datadog's exporter can't send a cumulative exponential histogram, so it's dropped, with
+          a throttled `unresolved_cumulative` warning; a `cumulative_to_delta` upstream makes it a
+          delta one.
   - kind: summary
+    feature: delta
+    cells:
+      statsd_out:
+        - when: {multi_value: skip}
+          class: skipped
+          counter: logit.output.metrics.skipped{metric_kind=summary}
+          text: 'Under `multi_value: skip`, no line is written.'
+        - class: degraded
+          counter: logit.output.metrics.degraded{metric_kind=summary}
+          text: >-
+            Dotted `.count` and `.sum` counters, which a statsd server sums across flushes as it
+            does a delta histogram's, and per-quantile gauges.
+      prometheus_out:
+        class: dropped
+        counter: logit.output.metrics.dropped{reason=unresolved_delta}
+        text: >-
+          A Prometheus summary is a running total, so a delta one, which only
+          `cumulative_to_delta` makes, is dropped, with a throttled `delta_summary_unresolved`
+          warning; send this sink the summary from ahead of that component.
+      influxdb_out:
+        class: degraded
+        text: >-
+          Telegraf's shape: float `count` and `sum` fields and a field per quantile named by the
+          quantile (`0.5`, `0.99`), each read back as a gauge under `<name>.`. Line protocol has
+          no temporality, so a delta summary writes as a cumulative one does. When every
+          component is finite, nothing is counted. A non-finite `sum`, quantile, or quantile value
+          is left off the line, and the record counts once as
+          `logit.output.metrics.degraded{reason=non_finite_component}`.
+      otlp_out:
+        class: dropped
+        counter: logit.output.metrics.dropped{reason=unresolved_delta}
+        text: >-
+          OTLP defines every summary as cumulative, so a delta one is dropped, with a throttled
+          `delta_summary_unresolved` warning.
+      datadog_out:
+        class: degraded
+        text: >-
+          A `<name>.quantile` gauge per quantile tagged `quantile:<q>`, and `.count` (no unit) and
+          `.sum` as `count` points, as Datadog's exporter writes a summary it differenced;
+          datadog_in reads them back as gauges and counts.
+  - kind: summary
+    feature: cumulative
     cells:
       statsd_out:
         - when: {multi_value: skip}
@@ -826,10 +1004,13 @@ rows:
         class: exact
         text: An OTLP `Summary`.
       datadog_out:
-        class: skipped
-        counter: logit.output.metrics.skipped{metric_kind=summary}
+        class: degraded
+        counter: logit.output.fields.dropped{reason=unresolved_cumulative}
         text: >-
-          The series encoders have no summary, so none is written.
+          A `<name>.quantile` gauge per quantile tagged `quantile:<q>`, which datadog_in reads back
+          as gauges. The running count and sum need differencing first, so they're dropped,
+          counted, with a throttled `unresolved_cumulative` warning; a `cumulative_to_delta`
+          upstream makes them sendable.
 
   # --- record fields ---------------------------------------------------------------------------
   - kind: record

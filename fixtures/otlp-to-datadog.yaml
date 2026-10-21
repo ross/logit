@@ -1,0 +1,35 @@
+# Sends an OpenTelemetry SDK's or Collector's metrics to Datadog's intake API with no Datadog
+# Agent or Collector exporter in the path: OTLP/HTTP in, `cumulative_to_delta` turning the SDK's
+# default cumulative counters, histograms, and summaries into deltas, and `datadog_out` writing
+# each kind as the Collector's `datadogexporter` does. docs/datadog.md's "OTel metrics to
+# Datadog" has the mapping.
+#
+# Point the SDK's metrics exporter at `http://<this-host>:4318`. An SDK already set to delta
+# temporality (`OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE=delta`) passes through
+# `cumulative_to_delta` untouched.
+#
+# The conversion keeps each series' last point in memory. Under the default `initial_value:
+# auto`, a series that began before `logit` started sends nothing for its first point, which only
+# records the baseline the next point is differenced against; so does every series after a
+# restart of `logit`. Set `max_staleness` above the SDK's longest export interval, or a quiet
+# series is forgotten and its next point is a first point again.
+components:
+  otel:
+    type: otlp_in
+    # No authentication on this listener: bind loopback or pod-local, or front it with something
+    # that authenticates.
+    bind: 127.0.0.1:4318
+    protocol: http
+
+  deltas:
+    type: cumulative_to_delta
+    sources: [otel]
+    # initial_value: auto        # the default; keep re-sends a running total after a restart
+    # max_staleness: 1h          # the default
+    # max_series: 10000          # the default
+
+  datadog:
+    type: datadog_out
+    sources: [deltas]
+    api_key: !env DD_API_KEY
+    # site: datadoghq.com        # the default; datadoghq.eu, us3.datadoghq.com, ... per your org

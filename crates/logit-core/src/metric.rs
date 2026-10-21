@@ -413,6 +413,12 @@ pub struct Summary {
     pub quantiles: Vec<(f64, f64)>,
     pub count: u64,
     pub sum: f64,
+    /// Every decoder sets `Cumulative`: OTLP defines every summary as cumulative, and a
+    /// Prometheus summary is a running total. Only `cumulative_to_delta` produces `Delta`, with
+    /// `count` and `sum` differenced and the quantiles as the producer computed them. A sink
+    /// whose wire has no delta summary drops one (`docs/adr/datadog-otlp-metric-mapping.md`'s
+    /// "Summary temporality").
+    pub temporality: Temporality,
 }
 
 /// An OTLP exemplar: one observation behind a metric point, the trace it happened under, and the
@@ -1180,7 +1186,15 @@ mod tests {
                 }),
                 "exponential_histogram",
             ),
-            (MetricKind::Summary(Summary { quantiles: vec![], count: 0, sum: 0.0 }), "summary"),
+            (
+                MetricKind::Summary(Summary {
+                    quantiles: vec![],
+                    count: 0,
+                    sum: 0.0,
+                    temporality: Temporality::Cumulative,
+                }),
+                "summary",
+            ),
         ];
         for (kind, expected) in cases {
             assert_eq!(kind.name(), expected);

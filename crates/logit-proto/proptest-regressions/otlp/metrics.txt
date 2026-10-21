@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 2db35b16a8d9d7103d0f3a2b64a758348596094fa426e65467f09f76d90ef384 # shrinks to record = MetricRecord { name: Spur(1), unit: None, description: None, start_timestamp: 0, exemplars: [], flags: 0, kind: Histogram(Histogram { buckets: [(0.0, 0)], temporality: Delta, sum: None, min: None, max: None }) }

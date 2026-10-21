@@ -169,18 +169,21 @@ Entry format and the other areas: [the known-gaps index](README.md).
   - **Revisit trigger:** a user who needs numeric OTel attributes as Datadog tags. Possible fixes,
     not decided: a typed home for span metrics (a `metrics` map on `SpanExt`), or a rule that
     depends on where the span came from.
-- **`datadog_out` sends no Agent-style `h`/`ms` aggregates, and no explicit-bucket
-  `Histogram`.** An Agent turns a DogStatsD `h` or `ms` into `.avg`, `.count`, `.median`,
-  `.95percentile`, and `.max` series. `aggregate` in front of `datadog_out` sends a sketch
-  instead, which Datadog computes quantiles from. `datadog_out` skips a `Histogram`,
-  `ExponentialHistogram`, `Summary`, `SetMembers`, and a cumulative or non-monotonic `Sum`,
-  counted `logit.output.metrics.skipped{metric_kind}`, and drops an unresolved `GaugeDelta`,
-  counted `logit.output.metrics.dropped{reason="unresolved_gauge_delta"}`.
+- **`datadog_out` sends no Agent-style `h`/`ms` aggregates.** An Agent turns a DogStatsD `h` or
+  `ms` into `.avg`, `.count`, `.median`, `.95percentile`, and `.max` series. `aggregate` in front
+  of `datadog_out` sends a sketch instead, which Datadog computes quantiles from.
   - **Consequence:** dashboards built on an Agent's `.95percentile`-style series find no data
     when the same metrics arrive through `aggregate` and `datadog_out`; query the distribution
-    instead. An OTLP explicit-bucket histogram reaches Datadog only through `otlp_out`.
-  - **Revisit trigger:** an operator who needs the Agent's five series, or a `Histogram` as
-    Datadog's `.bucket` counters.
+    instead.
+  - **Revisit trigger:** an operator who needs the Agent's five series.
+- **`datadog_out` writes a metric's unit as the record carries it, where Datadog's exporter maps
+  it.** The exporter's `AddUnits` gate, on by default, maps an OTLP UCUM unit to Datadog's name
+  for it (`ms` to `millisecond`, `By` to `byte`) and writes no unit for one it can't map
+  (`attributes.UnitMapper`). `datadog_out` sends the record's own unit, `ms` included, which
+  Datadog doesn't recognize as a unit.
+  - **Consequence:** a series sent through `datadog_out` shows no unit, or a different one, where
+    the same series sent through the exporter shows Datadog's.
+  - **Revisit trigger:** an operator who relies on Datadog's unit display or conversions.
 - **Whether an Agent's TCP `logs` listener parses a JSON body from `syslog_out` is untested.** An
   Agent's TCP `logs` listener takes `syslog_out`'s syslog-formatted lines, but no run has checked
   that it parses a JSON body into attributes.

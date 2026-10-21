@@ -1,0 +1,6 @@
+# A hand-built protobuf body, since no capture holds a non-finite bound:
+# `histogram-non-finite-bounds`'s request with one change to its data point: `count` 27, packed `bucket_counts` `[8, 1, 2, 16]`,
+# and packed `explicit_bounds` `[-Inf, 1, 5]`, in increasing order. `otlp_in` reads it as the
+# buckets `(-Inf, 8)`, `(1, 1)`, `(5, 2)`, and `(+Inf, 16)`.
+wire: histogram-neg-inf-bound.bin
+exercises: [protobuf, histogram_cumulative, histogram_explicit_bounds, histogram_neg_inf_bound, histogram_no_min_max, start_time, unit, resource_attributes, scope, attribute_string]

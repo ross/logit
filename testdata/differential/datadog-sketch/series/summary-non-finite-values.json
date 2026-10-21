@@ -1,0 +1,23 @@
+{
+  "name": "non-finite-values",
+  "kind": "summary",
+  "input": {
+    "quantiles": [
+      ["0.5", "NaN"],
+      ["0.9", "+Inf"],
+      ["0.99", "-Inf"],
+      ["1", "7"]
+    ],
+    "count": 4,
+    "sum": "7"
+  },
+  "series": [
+    {
+      "name": "case.quantile",
+      "tags": ["quantile:1.0"],
+      "type": "gauge",
+      "value": "7",
+      "unit": "millisecond"
+    }
+  ]
+}

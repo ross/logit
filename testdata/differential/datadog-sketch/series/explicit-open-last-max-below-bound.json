@@ -1,0 +1,49 @@
+{
+  "name": "open-last-max-below-bound",
+  "kind": "explicit",
+  "input": {
+    "bounds": ["10"],
+    "counts": [0, 3],
+    "count": 3,
+    "sum": "15",
+    "min": null,
+    "max": "5"
+  },
+  "series": [
+    {
+      "name": "case.count",
+      "tags": [],
+      "type": "count",
+      "value": "3",
+      "unit": ""
+    },
+    {
+      "name": "case.sum",
+      "tags": [],
+      "type": "count",
+      "value": "15",
+      "unit": "millisecond"
+    },
+    {
+      "name": "case.max",
+      "tags": [],
+      "type": "gauge",
+      "value": "5",
+      "unit": "millisecond"
+    },
+    {
+      "name": "case.bucket",
+      "tags": ["lower_bound:-inf", "upper_bound:10.0"],
+      "type": "count",
+      "value": "0",
+      "unit": ""
+    },
+    {
+      "name": "case.bucket",
+      "tags": ["lower_bound:10.0", "upper_bound:inf"],
+      "type": "count",
+      "value": "3",
+      "unit": ""
+    }
+  ]
+}

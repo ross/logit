@@ -1,0 +1,50 @@
+{
+  "name": "positive-and-negative",
+  "kind": "exponential",
+  "input": {
+    "scale": 2,
+    "zero_count": 3,
+    "positive": {
+      "offset": -4,
+      "counts": [1, 0, 5, 9, 2]
+    },
+    "negative": {
+      "offset": 1,
+      "counts": [4, 4, 0, 1]
+    },
+    "count": 29,
+    "sum": "-3.5",
+    "min": "-2.4",
+    "max": "1.7"
+  },
+  "series": [
+    {
+      "name": "case.count",
+      "tags": [],
+      "type": "count",
+      "value": "29",
+      "unit": ""
+    },
+    {
+      "name": "case.sum",
+      "tags": [],
+      "type": "count",
+      "value": "-3.5",
+      "unit": "millisecond"
+    },
+    {
+      "name": "case.min",
+      "tags": [],
+      "type": "gauge",
+      "value": "-2.4",
+      "unit": "millisecond"
+    },
+    {
+      "name": "case.max",
+      "tags": [],
+      "type": "gauge",
+      "value": "1.7",
+      "unit": "millisecond"
+    }
+  ]
+}

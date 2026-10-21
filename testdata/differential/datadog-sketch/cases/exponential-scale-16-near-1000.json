@@ -1,0 +1,30 @@
+{
+  "name": "scale-16-near-1000",
+  "kind": "exponential",
+  "input": {
+    "scale": 16,
+    "zero_count": 1,
+    "positive": {
+      "offset": 655360,
+      "counts": [1, 2, 3, 4, 5, 6, 7, 8]
+    },
+    "negative": {
+      "offset": 655357,
+      "counts": [2, 0, 2]
+    },
+    "count": 41,
+    "sum": "25000",
+    "min": null,
+    "max": null
+  },
+  "outcome": "sketch",
+  "sketch": {
+    "k": [-1785, 0, 1785],
+    "n": [4, 1, 36],
+    "cnt": 41,
+    "sum": "25000",
+    "min": "-1022.8430515658666",
+    "max": "1022.8430515658666",
+    "avg": "609.7560975609756"
+  }
+}

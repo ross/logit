@@ -1,0 +1,105 @@
+{
+  "name": "decades",
+  "kind": "explicit",
+  "input": {
+    "bounds": ["0.001", "0.01", "0.1", "1", "10", "100", "1000", "10000", "100000", "1e+06"],
+    "counts": [1, 3, 10, 30, 100, 300, 1000, 300, 100, 30, 10],
+    "count": 1884,
+    "sum": "1e+06",
+    "min": null,
+    "max": null
+  },
+  "series": [
+    {
+      "name": "case.count",
+      "tags": [],
+      "type": "count",
+      "value": "1884",
+      "unit": ""
+    },
+    {
+      "name": "case.sum",
+      "tags": [],
+      "type": "count",
+      "value": "1e+06",
+      "unit": "millisecond"
+    },
+    {
+      "name": "case.bucket",
+      "tags": ["lower_bound:-inf", "upper_bound:0.001"],
+      "type": "count",
+      "value": "1",
+      "unit": ""
+    },
+    {
+      "name": "case.bucket",
+      "tags": ["lower_bound:0.001", "upper_bound:0.01"],
+      "type": "count",
+      "value": "3",
+      "unit": ""
+    },
+    {
+      "name": "case.bucket",
+      "tags": ["lower_bound:0.01", "upper_bound:0.1"],
+      "type": "count",
+      "value": "10",
+      "unit": ""
+    },
+    {
+      "name": "case.bucket",
+      "tags": ["lower_bound:0.1", "upper_bound:1.0"],
+      "type": "count",
+      "value": "30",
+      "unit": ""
+    },
+    {
+      "name": "case.bucket",
+      "tags": ["lower_bound:1.0", "upper_bound:10.0"],
+      "type": "count",
+      "value": "100",
+      "unit": ""
+    },
+    {
+      "name": "case.bucket",
+      "tags": ["lower_bound:10.0", "upper_bound:100.0"],
+      "type": "count",
+      "value": "300",
+      "unit": ""
+    },
+    {
+      "name": "case.bucket",
+      "tags": ["lower_bound:100.0", "upper_bound:1000.0"],
+      "type": "count",
+      "value": "1000",
+      "unit": ""
+    },
+    {
+      "name": "case.bucket",
+      "tags": ["lower_bound:1000.0", "upper_bound:10000.0"],
+      "type": "count",
+      "value": "300",
+      "unit": ""
+    },
+    {
+      "name": "case.bucket",
+      "tags": ["lower_bound:10000.0", "upper_bound:100000.0"],
+      "type": "count",
+      "value": "100",
+      "unit": ""
+    },
+    {
+      "name": "case.bucket",
+      "tags": ["lower_bound:100000.0", "upper_bound:1e+06.0"],
+      "type": "count",
+      "value": "30",
+      "unit": ""
+    },
+    {
+      "name": "case.bucket",
+      "tags": ["lower_bound:1e+06.0", "upper_bound:inf"],
+      "type": "count",
+      "value": "10",
+      "unit": ""
+    }
+  ]
+}

@@ -61,7 +61,7 @@
 //! | `gauge` | `Gauge(v)` |
 //! | `histogram` (`_bucket{le}` cumulative, `_sum`, `_count`) | `Histogram { buckets: per-bucket counts by successive difference, trailing `(+Inf, n)`, Cumulative, sum, min/max: None }` |
 //! | `gaugehistogram` (OM, `_gsum`/`_gcount`) | the same `Histogram`, plus `_logit.prometheus.type: "gaugehistogram"` |
-//! | `summary` (`{quantile}`, `_sum`, `_count`) | `Summary { quantiles, count, sum }` |
+//! | `summary` (`{quantile}`, `_sum`, `_count`) | `Summary { quantiles, count, sum }`, `Cumulative` |
 //! | `untyped` (text) / `unknown` (OM) / no `# TYPE` | `Gauge(v)` + `_logit.prometheus.type: "untyped"` \| `"unknown"` |
 //! | `info` (OM, `X_info{...} 1`) | `Gauge(1)` + `_logit.prometheus.type: "info"`, `name = X` (`_info` stripped) |
 //! | `stateset` (OM) | one `Gauge(0\|1)` per state line + `_logit.prometheus.type: "stateset"` |
@@ -112,11 +112,14 @@
 //! | `set` | degraded | `logit.output.metrics.degraded{metric_kind=set}` | A `gauge` of the estimate; the registers are gone. |
 //! | `histogram/delta` | dropped | `logit.output.metrics.dropped{reason=unresolved_delta}` | A delta histogram is dropped, with a throttled `delta_temporality_unresolved` warning; an `aggregate` with `temporality: cumulative` upstream makes it a running one. |
 //! | `histogram/cumulative` | normalized | `inf_bucket` | A `histogram` family of running-sum buckets and `_sum` when it has one, or a `gaugehistogram` under the type carrier. `+Inf` states the total, so a histogram whose last bound is finite reads back with an empty `+Inf` bucket. `min` and `max` are `record/min_max`'s. |
+//! | `histogram/nan_bound` | degraded | `logit.output.metrics.degraded{reason=non_finite_component}` | A `NaN` bound has no place among the sorted bounds, so it has no bucket, and its count reaches only `+Inf` and `_count`. |
+//! | `histogram/neg_inf_bound` | exact | -- | `-Inf` is an ordinary bound: an `le="-Inf"` bucket, first. |
 //! | `exponential_histogram/delta`, with `bind:` unset | dropped | `logit.output.metrics.dropped{reason=native_histogram}` | Remote-write carries native histograms, but the sender doesn't map them yet, so one is dropped. |
 //! | `exponential_histogram/delta`, otherwise | skipped | `logit.output.metrics.skipped{metric_kind=exponential_histogram}` | Neither exposition dialect has native-histogram syntax, so none is written. |
 //! | `exponential_histogram/cumulative`, with `bind:` unset | dropped | `logit.output.metrics.dropped{reason=native_histogram}` | Dropped, as for a delta one. |
 //! | `exponential_histogram/cumulative`, otherwise | skipped | `logit.output.metrics.skipped{metric_kind=exponential_histogram}` | Neither exposition dialect has native-histogram syntax, so none is written. |
-//! | `summary` | exact | -- | A `summary` family of its quantiles, `_sum`, and `_count`. |
+//! | `summary/delta` | dropped | `logit.output.metrics.dropped{reason=unresolved_delta}` | A Prometheus summary is a running total, so a delta one, which only `cumulative_to_delta` makes, is dropped, with a throttled `delta_summary_unresolved` warning; send this sink the summary from ahead of that component. |
+//! | `summary/cumulative` | exact | -- | A `summary` family of its quantiles, `_sum`, and `_count`. |
 //! | `record/no_recorded_value`, with `bind:` unset | exact | -- | Remote-write writes a flagged `Gauge` or cumulative `Sum` as Prometheus's stale marker, read back flagged; a flagged non-monotonic `Sum`'s goes on a `gauge`, as its value would. |
 //! | `record/no_recorded_value`, otherwise | skipped | `logit.output.metrics.skipped{reason=no_recorded_value}` | A point flagged as holding no recorded value isn't exposed. |
 //! | `record/no_recorded_value_delta_sum`, with `bind:` unset | degraded | -- | Remote-write writes a flagged delta `Sum` as a stale marker, its temporality ignored, since a marker holds no reading to be delta about: a monotonic one on a `counter`, read back as a flagged cumulative counter, uncounted, and a non-monotonic one on a `gauge`, counted `logit.output.metrics.degraded{metric_kind=non_monotonic_sum}`. An unflagged delta `Sum` is dropped. |
@@ -179,6 +182,7 @@
 //! |---|---|
 //! | a `Sum` or `Gauge` value, or an exemplar's value, of `I64`/`U64`/`Bool` | the sample's double, on both wires: an integer's nearest `f64`, a `Bool` `1` or `0`, counted `logit.output.metrics.normalized{reason="bool_value"}` |
 //! | `Distribution(sketch)` | `summary` of [`DISTRIBUTION_QUANTILES`] + `_sum` + `_count`; `_sum` is [`DdSketch::sum`], exact unlike a quantile (approximate only when [`DdSketch::stats_exact`] is `false`, i.e. the sketch's stats were derived from its bins) -- `logit.output.metrics.degraded{metric_kind="distribution"}` |
+//! | a `Histogram` bound | sorted ascending, equal bounds merged into one `le`; a `NaN` bound has no `le` bucket, its count reaching only `+Inf` and `_count` -- `logit.output.metrics.degraded{reason="non_finite_component"}`, once per record. `-Inf` is an ordinary bound, `le="-Inf"` |
 //! | `Event::timestamp` | emitted only when `_logit.prometheus.timestamp: true` is present (consumed) -- or on every series, marker or not, under [`PrometheusEncoder::with_timestamps_always`]`(true)`, which is what a transport with no way to omit a timestamp needs |
 //! | labels | `Value::Str/I64/U64/F64/Bool` stringified; `Null/Bytes/Timestamp/Map` dropped -- `logit.output.labels.omitted{reason="unrepresentable"}`. An `Array` (a repeated DogStatsD tag key, `crate::statsd::decode::insert_tags`) renders its **last** representable element -- a Prometheus label set is a map, so there is no multi-value label -- counted `logit.output.labels.normalized{reason="multi_value"}`; an empty or entirely unrepresentable one stays on the `omitted{reason="unrepresentable"}` path |
 //! | names | sanitized ([`sanitize_metric_name`], [`sanitize_label_name`]); labels are ordered and collision-checked on their **rendered** names, and on a collision the one whose *original* attribute name sorts first wins -- `logit.output.labels.omitted{reason="collision"}`; a label sanitizing onto a generated one (`le` on a histogram, `quantile` on a summary) is omitted -- `logit.output.labels.omitted{reason="reserved"}`. An exemplar's attribute keys follow the same rule, and one sanitizing onto the `trace_id`/`span_id` its trace is written as is `reserved` |
@@ -272,7 +276,6 @@ use logit_core::{
     MetricValue, Resource, Sum, Summary, Telemetry, Temporality, Value,
 };
 use std::borrow::Cow;
-use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// The wire family type the model has no distinct kind for (`untyped`, `unknown`, `info`,
@@ -390,9 +393,10 @@ impl FamilyType {
 pub enum Point {
     Counter(f64),
     Gauge(f64),
-    /// `buckets` is cumulative and ends with a `(f64::INFINITY, total)` entry; `count` is that
-    /// total restated (the `_count`/`_gcount` sample), never an independent number -- see the
-    /// module doc's normalization list.
+    /// `buckets` is cumulative, in ascending bound order with no `NaN` bound and no bound twice,
+    /// and ends with a `(f64::INFINITY, total)` entry; `count` is that total restated (the
+    /// `_count`/`_gcount` sample), never an independent number -- see the module doc's
+    /// normalization list.
     Histogram {
         buckets: Vec<(f64, u64)>,
         sum: Option<f64>,
@@ -604,7 +608,8 @@ pub(crate) enum NotEncoded {
     /// An `ExponentialHistogram` bound for remote-write, which carries native histograms this
     /// codec doesn't map yet.
     NativeHistogram,
-    /// A delta `Sum` or `Histogram` with no cumulative `aggregate` upstream.
+    /// A delta `Sum` or `Histogram` with no cumulative `aggregate` upstream, or a delta
+    /// `Summary`, which only `cumulative_to_delta` makes.
     UnresolvedDelta,
     /// A `GaugeDelta` with no `aggregate` upstream.
     UnresolvedGaugeDelta,
@@ -885,6 +890,7 @@ fn point_to_kind(
                 quantiles: quantiles.clone(),
                 count: count.unwrap_or(0),
                 sum: sum.unwrap_or(0.0),
+                temporality: Temporality::Cumulative,
             }),
             // Handled above, before any of the value-bearing arms can be reached.
             Point::Stale => unreachable!("stale markers return early"),
@@ -916,9 +922,12 @@ fn stale_kind(family: FamilyType) -> MetricKind {
             min: None,
             max: None,
         }),
-        FamilyType::Summary => {
-            MetricKind::Summary(Summary { quantiles: Vec::new(), count: 0, sum: 0.0 })
-        }
+        FamilyType::Summary => MetricKind::Summary(Summary {
+            quantiles: Vec::new(),
+            count: 0,
+            sum: 0.0,
+            temporality: Temporality::Cumulative,
+        }),
         FamilyType::Gauge
         | FamilyType::Info
         | FamilyType::StateSet
@@ -1145,6 +1154,9 @@ fn record_to_point(
                 FamilyType::Histogram
             };
             let (buckets, count) = cumulative_counts(&h.buckets);
+            if h.buckets.iter().any(|(bound, _)| bound.is_nan()) {
+                encoder.degraded_reason("non_finite_component");
+            }
             (kind, Point::Histogram { buckets, sum: h.sum, count })
         }
         MetricKind::ExponentialHistogram(_) => {
@@ -1173,14 +1185,21 @@ fn record_to_point(
             }
             return None;
         }
-        MetricKind::Summary(s) => (
-            FamilyType::Summary,
-            Point::Summary {
-                quantiles: s.quantiles.clone(),
-                sum: Some(s.sum),
-                count: Some(s.count),
-            },
-        ),
+        MetricKind::Summary(s) => {
+            if s.temporality == Temporality::Delta {
+                encoder.not_encoded(NotEncoded::UnresolvedDelta);
+                warn_delta_summary(encoder, resolve(record.name));
+                return None;
+            }
+            (
+                FamilyType::Summary,
+                Point::Summary {
+                    quantiles: s.quantiles.clone(),
+                    sum: Some(s.sum),
+                    count: Some(s.count),
+                },
+            )
+        }
         MetricKind::Distribution(sketch) => {
             encoder.degraded("distribution");
             (FamilyType::Summary, sketch_summary(sketch))
@@ -1257,6 +1276,19 @@ fn warn_delta(encoder: &mut PrometheusEncoder, name: &str) {
     );
 }
 
+/// A delta `Summary`'s diagnostic, under its own key because its fix differs from
+/// [`warn_delta`]'s: `aggregate` doesn't make a summary cumulative, and only
+/// `cumulative_to_delta` makes one delta.
+fn warn_delta_summary(encoder: &mut PrometheusEncoder, name: &str) {
+    encoder.diagnostics.warn_throttled(
+        "delta_summary_unresolved",
+        format_args!(
+            "metric '{name}' is a delta summary, which Prometheus cannot express -- route the \
+             summary to this output from ahead of the `cumulative_to_delta` component"
+        ),
+    );
+}
+
 /// A sketch → the summary point the module doc's `Distribution`/`Samples` rows describe: the five
 /// shared [`DISTRIBUTION_QUANTILES`], the sketch's sum, and its count.
 fn sketch_summary(sketch: &DdSketch) -> Point {
@@ -1268,22 +1300,35 @@ fn sketch_summary(sketch: &DdSketch) -> Point {
 }
 
 /// [`logit_core::Histogram`]'s per-bucket counts → the cumulative `le` counts both dialects carry,
-/// plus the total. Bounds are sorted ascending first (the model doesn't promise an order) and a
-/// `+Inf` bucket is appended when the highest bound isn't `+Inf` -- every conforming exposition has
-/// one, and the total has to live somewhere.
+/// plus the total, with one entry per distinct bound and `+Inf` last. Bounds are sorted ascending
+/// first, because the model doesn't promise an order and `otlp_in` keeps the wire's. A `NaN`
+/// bound has no place in that order, so it gets no entry, and its count reaches only `+Inf` and
+/// the total; each caller counts that record degraded. `-Inf` is an ordinary bound and sorts
+/// first. Equal bounds merge into one entry. A `+Inf` entry is appended when no bucket has that
+/// bound: every conforming exposition has one, and the total has to live somewhere.
+///
+/// The sort is [`f64::total_cmp`], a total order once `NaN` is out. A comparator that isn't one
+/// can leave bounds out of order, and `sort_by` may panic on it.
 pub(crate) fn cumulative_counts(buckets: &[(f64, u64)]) -> (Vec<(f64, u64)>, u64) {
-    let mut sorted: Vec<(f64, u64)> = buckets.to_vec();
-    sorted.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
-    let mut out = Vec::with_capacity(sorted.len() + 1);
+    let mut sorted: Vec<(f64, u64)> =
+        buckets.iter().copied().filter(|(b, _)| !b.is_nan()).collect();
+    sorted.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let total = buckets.iter().fold(0u64, |acc, (_, count)| acc.saturating_add(*count));
+    let mut out: Vec<(f64, u64)> = Vec::with_capacity(sorted.len() + 1);
     let mut running = 0u64;
     for (bound, count) in sorted {
         running = running.saturating_add(count);
-        out.push((bound, running));
+        match out.last_mut() {
+            // `==` rather than the sort's order, so `-0.0` and `0.0` merge as well.
+            Some(last) if last.0 == bound => *last = (bound, running),
+            _ => out.push((bound, running)),
+        }
     }
-    if out.last().is_none_or(|(bound, _)| *bound != f64::INFINITY) {
-        out.push((f64::INFINITY, running));
+    match out.last_mut() {
+        Some(last) if last.0 == f64::INFINITY => last.1 = total,
+        _ => out.push((f64::INFINITY, total)),
     }
-    (out, running)
+    (out, total)
 }
 
 /// Resource attributes merged with event attributes (event wins on a collision), private `_logit.*`
@@ -1629,6 +1674,7 @@ mod tests {
                 quantiles: vec![(0.5, 4773.0), (0.99, 76656.0)],
                 count: 2693,
                 sum: 1.7560473e7,
+                temporality: Temporality::Cumulative,
             })
         );
     }
@@ -1642,7 +1688,12 @@ mod tests {
         let families = vec![family("s", FamilyType::Summary, vec![Series::new(vec![], point)])];
         assert_eq!(
             decode_kind(&families),
-            MetricKind::Summary(Summary { quantiles: vec![(0.5, 1.0)], count: 0, sum: 0.0 })
+            MetricKind::Summary(Summary {
+                quantiles: vec![(0.5, 1.0)],
+                count: 0,
+                sum: 0.0,
+                temporality: Temporality::Cumulative
+            })
         );
     }
 
@@ -1833,6 +1884,23 @@ mod tests {
         assert!(counted(&registry, "logit.output.metrics.dropped", ("reason", "unresolved_delta")));
     }
 
+    /// A Prometheus summary is a running total, so a delta one, which only `cumulative_to_delta`
+    /// makes, is dropped and counted.
+    #[test]
+    fn a_delta_summary_is_dropped_and_counted() {
+        let kind = MetricKind::Summary(Summary {
+            quantiles: vec![(0.5, 1.0)],
+            count: 2,
+            sum: 3.0,
+            temporality: Temporality::Delta,
+        });
+        let (families, registry, diag) =
+            encode_counted(&Resource::default(), &event_with(&[], record("m", kind)));
+        assert!(families.is_empty());
+        assert!(counted(&registry, "logit.output.metrics.dropped", ("reason", "unresolved_delta")));
+        assert!(counted(&diag, "logit.component.diagnostics", ("key", "delta_summary_unresolved")));
+    }
+
     #[test]
     fn a_gauges_family_type_follows_its_prometheus_type_attribute() {
         for (marker, expected_kind, expected_point) in [
@@ -1945,10 +2013,77 @@ mod tests {
         );
     }
 
+    /// More than 20 buckets in a shuffled order, one with a `NaN` bound: past 20 elements `sort_by`
+    /// may panic on a comparator that isn't a total order, and one that reads `NaN` as equal to
+    /// everything leaves bounds out of order. The `NaN` bucket's count reaches only `+Inf`.
+    #[test]
+    fn cumulative_counts_sorts_many_shuffled_bounds_around_a_nan() {
+        // 7 is coprime to 24, so `i * 7 % 24` visits every bound once, out of order.
+        let mut buckets: Vec<(f64, u64)> =
+            (0..24u64).map(|i| ((i * 7 % 24 + 1) as f64, i * 7 % 24 + 1)).collect();
+        buckets.insert(11, (f64::NAN, 1000));
+        let (out, total) = cumulative_counts(&buckets);
+        let mut expected: Vec<(f64, u64)> =
+            (1..=24u64).map(|bound| (bound as f64, bound * (bound + 1) / 2)).collect();
+        expected.push((f64::INFINITY, 300 + 1000));
+        assert_eq!(out, expected);
+        assert_eq!(total, 1300);
+    }
+
+    /// `-Inf` sorts first, a `NaN` has no entry, and a repeated `+Inf` bound is one entry, last,
+    /// holding the total.
+    #[test]
+    fn cumulative_counts_keeps_neg_inf_first_and_writes_one_inf_entry() {
+        let buckets = [
+            (f64::INFINITY, 1),
+            (2.0, 1),
+            (f64::NAN, 5),
+            (f64::NEG_INFINITY, 1),
+            (f64::INFINITY, 3),
+        ];
+        let (out, total) = cumulative_counts(&buckets);
+        assert_eq!(out, vec![(f64::NEG_INFINITY, 1), (2.0, 2), (f64::INFINITY, 11)]);
+        assert_eq!(total, 11);
+    }
+
+    /// An out-of-order histogram with a `NaN` bound encodes sorted, with no entry for the `NaN`
+    /// and its count in `+Inf` and `_count`, and the record counts degraded once.
+    #[test]
+    fn a_histogram_with_an_out_of_order_nan_bound_encodes_sorted_without_it() {
+        let kind = MetricKind::Histogram(Histogram {
+            buckets: vec![(5.0, 2), (f64::NAN, 4), (1.0, 1), (f64::INFINITY, 1)],
+            temporality: Temporality::Cumulative,
+            sum: None,
+            min: None,
+            max: None,
+        });
+        let (families, registry, _) =
+            encode_counted(&Resource::default(), &event_with(&[], record("m", kind)));
+        assert_eq!(
+            families[0].series[0].point,
+            Point::Histogram {
+                buckets: vec![(1.0, 1), (5.0, 3), (f64::INFINITY, 8)],
+                sum: None,
+                count: 8,
+            }
+        );
+        let degraded = (
+            "logit.output.metrics.degraded".to_string(),
+            "reason".to_string(),
+            "non_finite_component".to_string(),
+        );
+        let points = drained_points(&registry);
+        assert_eq!(points.iter().filter(|p| **p == degraded).count(), 1, "{points:?}");
+    }
+
     #[test]
     fn a_summary_encodes_with_its_sum_and_count() {
-        let kind =
-            MetricKind::Summary(Summary { quantiles: vec![(0.5, 1.0)], count: 7, sum: 42.0 });
+        let kind = MetricKind::Summary(Summary {
+            quantiles: vec![(0.5, 1.0)],
+            count: 7,
+            sum: 42.0,
+            temporality: Temporality::Cumulative,
+        });
         assert_eq!(
             encode_kind(kind)[0].series[0].point,
             Point::Summary { quantiles: vec![(0.5, 1.0)], sum: Some(42.0), count: Some(7) }
@@ -2401,8 +2536,12 @@ mod tests {
         assert!(families[0].series[0].labels.is_empty(), "`le` belongs to the bucket lines");
         assert!(counted(&registry, "logit.output.labels.omitted", ("reason", "reserved")));
 
-        let summary =
-            MetricKind::Summary(Summary { quantiles: vec![(0.5, 1.0)], count: 1, sum: 1.0 });
+        let summary = MetricKind::Summary(Summary {
+            quantiles: vec![(0.5, 1.0)],
+            count: 1,
+            sum: 1.0,
+            temporality: Temporality::Cumulative,
+        });
         let event = event_with(&[("quantile", Value::from("0.5"))], record("m", summary));
         let (families, registry, _) = encode_counted(&Resource::default(), &event);
         assert!(families[0].series[0].labels.is_empty());
@@ -2739,7 +2878,12 @@ mod tests {
                 min: None,
                 max: None,
             }),
-            MetricKind::Summary(Summary { quantiles: vec![], count: 1, sum: 1.0 }),
+            MetricKind::Summary(Summary {
+                quantiles: vec![],
+                count: 1,
+                sum: 1.0,
+                temporality: Temporality::Cumulative,
+            }),
             MetricKind::Set(HyperLogLog::new()),
         ];
         for kind in kinds {

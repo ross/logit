@@ -1,0 +1,30 @@
+{
+  "name": "scale--5-at-one",
+  "kind": "exponential",
+  "input": {
+    "scale": -5,
+    "zero_count": 0,
+    "positive": {
+      "offset": 0,
+      "counts": [3, 0, 2]
+    },
+    "negative": {
+      "offset": 0,
+      "counts": []
+    },
+    "count": 5,
+    "sum": "5",
+    "min": null,
+    "max": null
+  },
+  "outcome": "sketch",
+  "sketch": {
+    "k": [2653, 2724, 2757, 5540, 5611],
+    "n": [1, 1, 1, 1, 1],
+    "cnt": 5,
+    "sum": "5",
+    "min": "0.9999699532773395",
+    "max": "7.93716343440839e+28",
+    "avg": "1"
+  }
+}

@@ -148,7 +148,11 @@ back, reading names, attribute keys, and values as that sink writes them (`stats
 `host.name` and hostless mark read back as the DogStatsD `host`, `prometheus_out`'s
 sanitized names and `_total`, `influxdb_out`'s `<name>.value` field, `otlp_out`'s integer
 timestamps, `datadog_out`'s `host` tag read back as `host.name` and the attributes it writes from a
-record's own fields), then compares what it observed with the table. A record's expected class is the worst of
+record's own fields), then compares what it observed with the table. A record that pairs only by
+name, in any metric kind (its own included) or as a dotted expansion, reads `degraded`. When both
+sides are histograms, that pairing also needs the same total count, and the same sum where both
+sides carry one: a sink may merge, drop, or fold bounds and still read `degraded`, but one that
+loses or invents observations pairs nothing, and the check fails. A record's expected class is the worst of
 the record-level cells it reaches, and the observed class must equal it. A `normalized` cell also
 accepts `exact`, because a normalization touches only the shapes it names. A field may read back
 better than its cell, never worse. Every sink counter the run moved must be named by a cell the

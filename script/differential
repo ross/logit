@@ -3,6 +3,8 @@
 #   Corpora: pickle (testdata/differential/graphite-pickle/, from tools/differential/pickle/)
 #            prom-text (testdata/differential/prometheus-text/reference/, from
 #            tools/differential/prom-text/)
+#            datadog-sketch (testdata/differential/datadog-sketch/, from
+#            tools/differential/datadog-sketch/)
 #
 # Regenerates a differential corpus under testdata/differential/: generated cases, each committed
 # beside a reference implementation's reading of it, which tests read with no reference installed
@@ -33,7 +35,7 @@ GO_IMAGE="golang:1.27.2-bookworm@sha256:5cf287a799e6b94384bad13d16b14904c531f51b
 GO_CACHE_VOLUME="logit-differential-go"
 
 usage() {
-    sed -n '2,5p' "$0" >&2
+    sed -n '2,7p' "$0" >&2
     exit 2
 }
 
@@ -88,6 +90,32 @@ generate_prom_text() {
             -recorded /recorded -out /out'
 }
 
+# generate_datadog_sketch <out_dir>: writes the Datadog OTLP translator's sketch for every
+# hand-built and seeded histogram case into <out_dir>. Downloads and builds as generate_prom_text
+# does. tools/differential/datadog-sketch/go.mod pins every datadog-agent module to commit
+# 45132452b855 with `replace`, since a newer tag would otherwise win the version selection.
+# sum.golang.org had no entry for that pseudo-version when it was pinned, so the download skips the
+# checksum database for datadog-agent modules only; go.sum still holds their hashes, and the build
+# step, with no network and the proxy off, verifies against it. GOAMD64=v1 keeps the compiler from
+# fusing a multiply and add, so every Go `math` result is the one primitives.json records; the
+# generator itself refuses a CPU without FMA, whose absence changes `math.Exp`.
+generate_datadog_sketch() {
+    local out="$1"
+    local gen="${ROOT}/tools/differential/datadog-sketch"
+    local user
+    user="$(id -u):$(id -g)"
+    local env=(-e HOME=/tmp -e GOTOOLCHAIN=local -e GOFLAGS=-mod=readonly -e GOAMD64=v1
+        -e GOPATH=/cache/gopath -e GOCACHE=/cache/build)
+
+    ${DOCKER} run --rm -v "${GO_CACHE_VOLUME}:/cache" "${GO_IMAGE}" chown "${user}" /cache
+    ${DOCKER} run --rm --user "${user}" "${env[@]}" \
+        -e GONOSUMDB=github.com/DataDog/datadog-agent -v "${GO_CACHE_VOLUME}:/cache" \
+        -v "${gen}:/gen:ro,z" -w /gen "${GO_IMAGE}" go mod download
+    ${DOCKER} run --rm --network none --user "${user}" "${env[@]}" -e GOPROXY=off \
+        -v "${GO_CACHE_VOLUME}:/cache" -v "${gen}:/gen:ro,z" -v "${out}:/out:z" -w /gen \
+        "${GO_IMAGE}" bash -c 'go build -o /cache/datadog-sketch . && /cache/datadog-sketch -out /out'
+}
+
 [ $# -ge 1 ] || usage
 corpus="$1"
 shift
@@ -101,6 +129,7 @@ esac
 case "${corpus}" in
     pickle) committed="${ROOT}/testdata/differential/graphite-pickle" ;;
     prom-text) committed="${ROOT}/testdata/differential/prometheus-text/reference" ;;
+    datadog-sketch) committed="${ROOT}/testdata/differential/datadog-sketch" ;;
     *) usage ;;
 esac
 
@@ -117,7 +146,8 @@ if [ "${check}" = 1 ]; then
 else
     mkdir -p "${committed}"
     # Every file a generator writes, so a case it no longer writes doesn't linger. The pickle
-    # corpus is one flat directory; the prom-text readings sit under per-source subdirectories.
+    # corpus is one flat directory; the prom-text readings sit under per-source subdirectories,
+    # and the datadog-sketch cases under cases/.
     find "${committed}" -type f ! -name README.md -delete
     "generate_${corpus//-/_}" "${committed}"
 fi

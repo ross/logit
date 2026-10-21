@@ -826,6 +826,38 @@ pub struct DatadogEndpoints {
     pub traces: Option<String>,
 }
 
+/// How `datadog_out` writes OpenTelemetry histograms, as the Datadog exporter's `histograms:`
+/// block does, under the same names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DatadogHistograms {
+    /// How a delta explicit-bucket histogram is written: `distributions` (the default), one
+    /// Datadog distribution per point with its counts spread over the buckets as Datadog's
+    /// exporter spreads them; `counters`, one `<name>.bucket` count per bucket tagged
+    /// `lower_bound` and `upper_bound`; or `nobuckets`, nothing but the aggregation metrics,
+    /// which then have to be on. An exponential histogram is always a distribution.
+    #[serde(default)]
+    pub mode: DatadogHistogramMode,
+    /// Also writes `<name>.count` and `<name>.sum` counts and `<name>.min` and `<name>.max`
+    /// gauges for each delta histogram and exponential histogram whose sum is present and finite.
+    /// Off by default, as in the exporter.
+    #[serde(default)]
+    pub send_aggregation_metrics: bool,
+}
+
+/// `datadog_out`'s `histograms.mode`, spelled as the Datadog exporter spells it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum DatadogHistogramMode {
+    /// One distribution per point.
+    #[default]
+    Distributions,
+    /// One `<name>.bucket` count per bucket.
+    Counters,
+    /// No bucket output.
+    Nobuckets,
+}
+
 /// How `datadog_out` compresses its request bodies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -2825,6 +2857,37 @@ pub enum ComponentKind {
         #[serde(default)]
         previous: Vec<String>,
     },
+    /// Replaces each cumulative point with its difference from the series' previous point, for a
+    /// destination that takes only deltas (Datadog, `statsd_out`, a delta-only OTLP backend). It
+    /// converts a cumulative monotonic `sum`, a cumulative `histogram` and
+    /// `exponential_histogram`, and a `summary`'s count and sum (its quantiles pass unchanged);
+    /// every other record, a cumulative non-monotonic `sum` included, passes through untouched.
+    ///
+    /// A series is the metric's name, unit, and kind, the resource, the instrumentation scope,
+    /// and the event's attributes; its state lives in memory, so a restart starts every series
+    /// over. A point timestamped at or before the series' last one is skipped. A value that went
+    /// down, or a start time that moved past the previous point, is a counter restart: the
+    /// point's whole value is the delta. A histogram whose buckets changed is dropped, counted,
+    /// and becomes the new baseline.
+    CumulativeToDelta {
+        /// What a series' first point emits: `auto` (the default) emits its whole value only when
+        /// its start time shows the series began after this component started, `keep` always
+        /// does, and `drop` never does. A first point that emits nothing records the baseline the
+        /// next point is differenced against.
+        #[serde(default)]
+        initial_value: InitialValue,
+        /// Forgets a series no point has updated for this long, by the wall clock; its next point
+        /// is then a first point. Set it above the longest gap between a producer's reports.
+        /// Must be greater than zero.
+        #[serde(with = "humantime_serde_duration", default = "default_max_staleness")]
+        #[schemars(with = "String")]
+        max_staleness: Duration,
+        /// The most series tracked at once. A new series past it forgets the least recently
+        /// updated one, counted, and that series' next point is a first point. Must be at least
+        /// `1`.
+        #[serde(default = "default_max_series")]
+        max_series: usize,
+    },
     /// Forwards stale events, discarding fresh ones, judged against the wall clock. The time
     /// judged is the span's end when the event has a span with one set, otherwise the event's
     /// timestamp. An event whose time is 0 (unknown) is never stale. An event is stale when it is
@@ -3215,6 +3278,9 @@ pub enum ComponentKind {
     /// Points older than Datadog accepts (1h for metrics, 18h for logs and events, 10m for
     /// service checks) are dropped and counted before sending. Traces go out only once a Datadog
     /// Agent has processed them: send `datadog_trace_in`'s output to `datadog_trace_out` instead.
+    /// OpenTelemetry sums, histograms, and summaries go out as Datadog's OTel exporter sends
+    /// them; a cumulative counter, histogram, or exponential histogram isn't sent, counted, so
+    /// set an OpenTelemetry SDK to delta temporality.
     DatadogOut {
         /// The Datadog API key, sent as `DD-API-KEY` on every request and never logged. Take it
         /// from the environment (`!env DD_API_KEY`) rather than writing it into the file. An
@@ -3252,6 +3318,11 @@ pub enum ComponentKind {
         /// `endpoints` override.
         #[serde(default)]
         tls: TlsClientConfig,
+        /// How OpenTelemetry histograms are written, with the Datadog exporter's settings and
+        /// defaults. `mode: nobuckets` without `send_aggregation_metrics: true` writes nothing
+        /// for a histogram, so it's rejected, as the exporter rejects it.
+        #[serde(default)]
+        histograms: DatadogHistograms,
     },
     /// Sends APM traces and tracer-computed stats to a Datadog Agent's trace API (port 8126, or
     /// its Unix socket), as a dd-trace tracer does: the sending half of `datadog_trace_in`, so a
@@ -4437,6 +4508,33 @@ pub enum Sets {
     /// Keep the exact, deduplicated member set for the whole window (bounded by
     /// `max_set_members_per_series`), only falling back to an estimate on overflow.
     Members,
+}
+
+/// `cumulative_to_delta`'s `initial_value` field: what a series' first point emits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum InitialValue {
+    /// The whole value, when the point's start time is set, at or after this component
+    /// started, and not its own timestamp: the series began while `logit` was watching, so its
+    /// whole total is new. Otherwise nothing. The default.
+    #[default]
+    Auto,
+    /// Always the whole value, which re-sends a series' running total after a restart of
+    /// `logit`.
+    Keep,
+    /// Never anything: the first point only records the baseline.
+    Drop,
+}
+
+/// `cumulative_to_delta`'s `max_staleness` default, the Datadog exporter's and the OpenTelemetry
+/// Collector's.
+fn default_max_staleness() -> Duration {
+    Duration::from_secs(3600)
+}
+
+/// `cumulative_to_delta`'s `max_series` default, `aggregate`'s `max_retained_series` default.
+fn default_max_series() -> usize {
+    10_000
 }
 
 /// `aggregate`'s `temporality` field: what a flushed `Sum`/`Histogram` means.
@@ -6920,6 +7018,33 @@ mod tests {
     }
 
     #[test]
+    fn cumulative_to_delta_deserializes_with_its_defaults() {
+        let component: Component =
+            serde_json::from_str(r#"{"type": "cumulative_to_delta", "sources": ["in"]}"#).unwrap();
+        match component.kind {
+            ComponentKind::CumulativeToDelta { initial_value, max_staleness, max_series } => {
+                assert_eq!(initial_value, InitialValue::Auto);
+                assert_eq!(max_staleness, Duration::from_secs(3600));
+                assert_eq!(max_series, 10_000);
+            }
+            other => panic!("expected CumulativeToDelta, got {other:?}"),
+        }
+        let component: Component = serde_json::from_str(
+            r#"{"type": "cumulative_to_delta", "sources": ["in"], "initial_value": "keep",
+                "max_staleness": "10m", "max_series": 5}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::CumulativeToDelta { initial_value, max_staleness, max_series } => {
+                assert_eq!(initial_value, InitialValue::Keep);
+                assert_eq!(max_staleness, Duration::from_secs(600));
+                assert_eq!(max_series, 5);
+            }
+            other => panic!("expected CumulativeToDelta, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn stale_components_deserialize() {
         let component: Component = serde_json::from_str(
             r#"{"type": "drop_stale", "sources": ["in"], "max_age": "5m", "max_ahead": "1m"}"#,
@@ -7673,9 +7798,12 @@ mod tests {
                 timeout,
                 headers,
                 tls,
+                histograms,
             } => {
                 assert_eq!(api_key, "k");
                 assert_eq!(site, "datadoghq.com");
+                assert_eq!(histograms.mode, DatadogHistogramMode::Distributions);
+                assert!(!histograms.send_aggregation_metrics);
                 assert_eq!(endpoints, DatadogEndpoints::default());
                 assert_eq!(compression, DatadogCompression::Gzip);
                 assert_eq!(timeout, Duration::from_secs(10));

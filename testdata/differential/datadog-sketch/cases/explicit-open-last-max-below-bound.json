@@ -1,0 +1,22 @@
+{
+  "name": "open-last-max-below-bound",
+  "kind": "explicit",
+  "input": {
+    "bounds": ["10"],
+    "counts": [0, 3],
+    "count": 3,
+    "sum": "15",
+    "min": null,
+    "max": "5"
+  },
+  "outcome": "sketch",
+  "sketch": {
+    "k": [1487],
+    "n": [3],
+    "cnt": 3,
+    "sum": "15",
+    "min": "5",
+    "max": "5",
+    "avg": "5"
+  }
+}

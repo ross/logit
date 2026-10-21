@@ -725,11 +725,11 @@ fn render_fields(out: &mut String, kind: &MetricKind) -> Result<Fields, KindSkip
 /// bucket still writes both. Returns whether a non-finite `sum`, `min`, `max`, or bound was left
 /// out.
 fn render_histogram_fields(out: &mut String, h: &Histogram) -> bool {
-    // Sorted first: the model doesn't promise bound order, and `otlp_in` keeps the wire's.
+    // `cumulative_counts` sorts the bounds and gives a `NaN` one no entry, so look for it here.
     let (cumulative, total) = crate::prometheus::cumulative_counts(&h.buckets);
     out.push_str("count=");
     push_float(out, total as f64);
-    let mut omitted = false;
+    let mut omitted = h.buckets.iter().any(|(bound, _)| bound.is_nan());
     for (key, value) in [("sum", h.sum), ("min", h.min), ("max", h.max)] {
         omitted |= push_optional_float(out, key, value);
     }
@@ -737,8 +737,8 @@ fn render_histogram_fields(out: &mut String, h: &Histogram) -> bool {
         if bound.is_finite() {
             let _ = write!(out, ",{bound}=");
             push_float(out, count as f64);
-        } else if bound != f64::INFINITY {
-            // NaN or -Inf: no key spells it. Its count still reaches `+Inf`.
+        } else if bound == f64::NEG_INFINITY {
+            // No key spells it. Its count still reaches every bound above it.
             omitted = true;
         }
     }
@@ -1104,6 +1104,16 @@ mod tests {
         assert_eq!(out, "lat count=3,5=2,10=3,+Inf=3 1700000000000000000\n");
     }
 
+    /// A `NaN` bound has no key and no place in the order: the bounds around it still sort, its
+    /// count reaches `count` and `+Inf`, and the record counts as degraded.
+    #[test]
+    fn an_out_of_order_nan_bound_is_left_out_and_counted_degraded() {
+        let kind = histogram(vec![(10.0, 1), (f64::NAN, 4), (5.0, 2)], None);
+        let (out, stats) = encode_stats(vec![metric_event("lat", kind, &[])]);
+        assert_eq!(out, "lat count=7,5=2,10=3,+Inf=7 1700000000000000000\n");
+        assert_eq!(stats.degraded_non_finite_component, 1);
+    }
+
     /// A degraded line that then has no free timestamp counts as dropped alone, not also degraded.
     #[test]
     fn a_degraded_line_dropped_for_timestamp_overflow_is_not_counted_degraded() {
@@ -1162,6 +1172,21 @@ mod tests {
             quantiles: vec![(0.5, 0.2), (0.99, 0.9)],
             count: 7,
             sum: 3.5,
+            temporality: logit_core::Temporality::Cumulative,
+        });
+        let (out, stats) = encode_stats(vec![metric_event("rpc_latency", kind, &[])]);
+        assert_eq!(out, "rpc_latency count=7,sum=3.5,0.5=0.2,0.99=0.9 1700000000000000000\n");
+        assert_eq!(stats, EncodeStats::default());
+    }
+
+    /// A delta summary writes the same fields: line protocol has no temporality.
+    #[test]
+    fn a_delta_summary_writes_as_a_cumulative_one_does() {
+        let kind = MetricKind::Summary(Summary {
+            quantiles: vec![(0.5, 0.2), (0.99, 0.9)],
+            count: 7,
+            sum: 3.5,
+            temporality: logit_core::Temporality::Delta,
         });
         let (out, stats) = encode_stats(vec![metric_event("rpc_latency", kind, &[])]);
         assert_eq!(out, "rpc_latency count=7,sum=3.5,0.5=0.2,0.99=0.9 1700000000000000000\n");
@@ -1176,6 +1201,7 @@ mod tests {
             quantiles: vec![(0.991, 10.0), (0.994, 20.0)],
             count: 2,
             sum: 30.0,
+            temporality: logit_core::Temporality::Cumulative,
         });
         let out = encode(vec![metric_event("req.latency", kind, &[])]);
         assert!(out.contains(",0.991=10,0.994=20 "), "got: {out}");
@@ -1188,6 +1214,7 @@ mod tests {
             quantiles: vec![(0.5, f64::NAN), (0.99, 0.9)],
             count: 0,
             sum: 0.0,
+            temporality: logit_core::Temporality::Cumulative,
         });
         let (out, stats) = encode_stats(vec![metric_event("s", kind, &[])]);
         assert_eq!(out, "s count=0,sum=0,0.99=0.9 1700000000000000000\n");

@@ -1,0 +1,35 @@
+{
+  "name": "single-bucket-one",
+  "kind": "explicit",
+  "input": {
+    "bounds": [],
+    "counts": [1],
+    "count": 1,
+    "sum": "3.25",
+    "min": null,
+    "max": null
+  },
+  "series": [
+    {
+      "name": "case.count",
+      "tags": [],
+      "type": "count",
+      "value": "1",
+      "unit": ""
+    },
+    {
+      "name": "case.sum",
+      "tags": [],
+      "type": "count",
+      "value": "3.25",
+      "unit": "millisecond"
+    },
+    {
+      "name": "case.bucket",
+      "tags": ["lower_bound:-inf", "upper_bound:inf"],
+      "type": "count",
+      "value": "1",
+      "unit": ""
+    }
+  ]
+}

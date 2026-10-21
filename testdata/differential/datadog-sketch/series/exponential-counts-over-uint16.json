@@ -1,0 +1,36 @@
+{
+  "name": "counts-over-uint16",
+  "kind": "exponential",
+  "input": {
+    "scale": 3,
+    "zero_count": 0,
+    "positive": {
+      "offset": 10,
+      "counts": [70000, 200000, 65535, 65536]
+    },
+    "negative": {
+      "offset": 0,
+      "counts": []
+    },
+    "count": 401071,
+    "sum": "1.2e+06",
+    "min": null,
+    "max": null
+  },
+  "series": [
+    {
+      "name": "case.count",
+      "tags": [],
+      "type": "count",
+      "value": "401071",
+      "unit": ""
+    },
+    {
+      "name": "case.sum",
+      "tags": [],
+      "type": "count",
+      "value": "1.2e+06",
+      "unit": "millisecond"
+    }
+  ]
+}
