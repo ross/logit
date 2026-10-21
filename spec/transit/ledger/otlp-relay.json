@@ -35,7 +35,7 @@
     {"sink":"otlp_out","row":"sum/delta_nonmonotonic","cell":0,"observed":["exact"]},
     {"sink":"otlp_out","row":"sum/f64","cell":0,"observed":["exact"]},
     {"sink":"otlp_out","row":"sum/i64","cell":0,"observed":["exact"]},
-    {"sink":"otlp_out","row":"summary","cell":0,"observed":["exact"]}
+    {"sink":"otlp_out","row":"summary/cumulative","cell":0,"observed":["exact"]}
   ],
   "unspecified": []
 }

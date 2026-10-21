@@ -1,6 +1,6 @@
 ---
 created: 2026-09-24
-updated: 2026-10-05
+updated: 2026-10-20
 ---
 
 # Enabling plan: New Relic — direct APIs and OTLP, shipper-intake stand-in, APM collector stand-in
@@ -392,7 +392,11 @@ table. The amendment lands with the ADR.
   → `summary` of its count/sum/min/max (counted `degraded`); `Distribution` → `summary` of its
   summary fields (counted `degraded`); cumulative or non-monotonic `Sum`, `GaugeDelta`,
   `Histogram`, `ExponentialHistogram`, `Summary` (no min/max), `Set`, `SetMembers` skipped and
-  counted, the `statsd_out` pattern.
+  counted, the `statsd_out` pattern. A cumulative monotonic `Sum` becomes sendable behind
+  `cumulative_to_delta` ([ADR `cumulative-to-delta-transform`](../adr/cumulative-to-delta-transform.md)),
+  so its count names that transform, and under
+  [ADR `telemetry-loss-vocabulary`](../adr/telemetry-loss-vocabulary.md) it's `dropped`, not
+  `skipped`.
 - `newrelic_apm_in` (W7a): `bind:`, `tls:` **required** (agents refuse plaintext; a graph rule
   rejects its absence), `license_keys:` allowlist, `harvest:` (report period, per-type limits,
   sampling target, apdex). Answers every method in the table above; `shutdown` closes the

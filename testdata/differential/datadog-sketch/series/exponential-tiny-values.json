@@ -1,0 +1,36 @@
+{
+  "name": "tiny-values",
+  "kind": "exponential",
+  "input": {
+    "scale": 0,
+    "zero_count": 0,
+    "positive": {
+      "offset": -40,
+      "counts": [3, 4]
+    },
+    "negative": {
+      "offset": 0,
+      "counts": []
+    },
+    "count": 7,
+    "sum": "1e-11",
+    "min": null,
+    "max": null
+  },
+  "series": [
+    {
+      "name": "case.count",
+      "tags": [],
+      "type": "count",
+      "value": "7",
+      "unit": ""
+    },
+    {
+      "name": "case.sum",
+      "tags": [],
+      "type": "count",
+      "value": "1e-11",
+      "unit": "millisecond"
+    }
+  ]
+}

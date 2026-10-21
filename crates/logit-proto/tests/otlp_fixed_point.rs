@@ -144,6 +144,7 @@ fn metric_batch() -> EventBatch {
             quantiles: vec![(0.5, 10.0), (0.99, 42.0)],
             count: 100,
             sum: 543.2,
+            temporality: Temporality::Cumulative,
         }),
         Vec::new(), // no wire field for exemplars on a Summary point -- see this fn's own doc.
     );

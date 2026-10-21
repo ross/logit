@@ -1,0 +1,22 @@
+{
+  "name": "over-observation-cap",
+  "kind": "exponential",
+  "input": {
+    "scale": 0,
+    "zero_count": 1,
+    "positive": {
+      "offset": 1,
+      "counts": [268431360]
+    },
+    "negative": {
+      "offset": 0,
+      "counts": []
+    },
+    "count": 268431361,
+    "sum": "1e+09",
+    "min": null,
+    "max": null
+  },
+  "outcome": "too_many_observations",
+  "detail": "Dropped histogram data point: too many observations for a distribution"
+}

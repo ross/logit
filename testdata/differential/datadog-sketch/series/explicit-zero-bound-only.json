@@ -1,0 +1,42 @@
+{
+  "name": "zero-bound-only",
+  "kind": "explicit",
+  "input": {
+    "bounds": ["0"],
+    "counts": [4, 5],
+    "count": 9,
+    "sum": "10",
+    "min": null,
+    "max": null
+  },
+  "series": [
+    {
+      "name": "case.count",
+      "tags": [],
+      "type": "count",
+      "value": "9",
+      "unit": ""
+    },
+    {
+      "name": "case.sum",
+      "tags": [],
+      "type": "count",
+      "value": "10",
+      "unit": "millisecond"
+    },
+    {
+      "name": "case.bucket",
+      "tags": ["lower_bound:-inf", "upper_bound:0"],
+      "type": "count",
+      "value": "4",
+      "unit": ""
+    },
+    {
+      "name": "case.bucket",
+      "tags": ["lower_bound:0", "upper_bound:inf"],
+      "type": "count",
+      "value": "5",
+      "unit": ""
+    }
+  ]
+}

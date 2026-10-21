@@ -1,0 +1,36 @@
+{
+  "name": "index-too-high",
+  "kind": "exponential",
+  "input": {
+    "scale": 0,
+    "zero_count": 0,
+    "positive": {
+      "offset": 800,
+      "counts": [2]
+    },
+    "negative": {
+      "offset": 0,
+      "counts": []
+    },
+    "count": 2,
+    "sum": "1e+241",
+    "min": null,
+    "max": null
+  },
+  "series": [
+    {
+      "name": "case.count",
+      "tags": [],
+      "type": "count",
+      "value": "2",
+      "unit": ""
+    },
+    {
+      "name": "case.sum",
+      "tags": [],
+      "type": "count",
+      "value": "1e+241",
+      "unit": "millisecond"
+    }
+  ]
+}

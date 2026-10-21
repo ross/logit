@@ -1,0 +1,30 @@
+{
+  "name": "scale-19-at-one",
+  "kind": "exponential",
+  "input": {
+    "scale": 19,
+    "zero_count": 0,
+    "positive": {
+      "offset": 0,
+      "counts": [3, 0, 2]
+    },
+    "negative": {
+      "offset": 0,
+      "counts": []
+    },
+    "count": 5,
+    "sum": "5",
+    "min": null,
+    "max": null
+  },
+  "outcome": "sketch",
+  "sketch": {
+    "k": [1338],
+    "n": [5],
+    "cnt": 5,
+    "sum": "5",
+    "min": "0.9999699532773395",
+    "max": "0.9999699532773395",
+    "avg": "1"
+  }
+}

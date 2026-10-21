@@ -1,0 +1,22 @@
+{
+  "name": "open-first-min-above-bound",
+  "kind": "explicit",
+  "input": {
+    "bounds": ["10"],
+    "counts": [3, 0],
+    "count": 3,
+    "sum": "45",
+    "min": "15",
+    "max": null
+  },
+  "outcome": "sketch",
+  "sketch": {
+    "k": [1487],
+    "n": [3],
+    "cnt": 3,
+    "sum": "45",
+    "min": "15",
+    "max": "15",
+    "avg": "15"
+  }
+}

@@ -783,7 +783,12 @@ fn exp_histogram() -> MetricKind {
 }
 
 fn summary() -> MetricKind {
-    MetricKind::Summary(logit_core::Summary { quantiles: vec![(0.5, 1.0)], count: 1, sum: 1.0 })
+    MetricKind::Summary(logit_core::Summary {
+        quantiles: vec![(0.5, 1.0)],
+        count: 1,
+        sum: 1.0,
+        temporality: Temporality::Cumulative,
+    })
 }
 
 fn kind_spec() -> impl Strategy<Value = KindSpec> {

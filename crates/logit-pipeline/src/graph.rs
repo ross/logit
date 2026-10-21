@@ -209,8 +209,10 @@
 //! 66. A `datadog_out` with an empty `api_key` or one with leading or trailing whitespace, an
 //!     empty `site` or one with a scheme or `/`, an `endpoints` entry that isn't an absolute
 //!     `http://`/`https://` URL, `timeout: 0s`, a `headers:` name rule 22 would reject against
-//!     `RESERVED_DATADOG_HEADERS`, or a `tls` failing rule 24's checks, the scheme one only when no
-//!     intake is `https://` (`docs/adr/datadog-agent-and-intake-relay.md`).
+//!     `RESERVED_DATADOG_HEADERS`, a `tls` failing rule 24's checks, the scheme one only when no
+//!     intake is `https://` (`docs/adr/datadog-agent-and-intake-relay.md`), or `histograms.mode:
+//!     nobuckets` without `send_aggregation_metrics: true`, which writes nothing for a histogram
+//!     (`docs/adr/datadog-otlp-metric-mapping.md`).
 //! 67. A `datadog_trace_out` with both or neither of `endpoint`/`socket`, an `endpoint` that isn't
 //!     an absolute `http://`/`https://` URL, a `socket` that isn't an absolute path, `timeout:
 //!     0s`, a `headers:` name rule 22 would reject against `RESERVED_DATADOG_TRACE_HEADERS` or
@@ -320,6 +322,9 @@
 //!     (`docs/adr/route-signals.md`).
 //! 93. A `replay_in` with an empty `path`, which names no file, or a `batch` of `0`, which could
 //!     send nothing (`docs/adr/replay-input.md`).
+//! 94. A `cumulative_to_delta` with a `max_staleness` of `0s`, which would keep every series until
+//!     `max_series` evicts it, or a `max_series` of `0`, which could track no series and so
+//!     convert nothing (`docs/adr/cumulative-to-delta-transform.md`).
 //!
 //! Not validated: that a `by: {provenance: ..}` route key names a component in this graph. Like
 //! 37's ids, it may name a component relayed from another process. Nor is `keep`'s empty `fields`:
@@ -424,6 +429,7 @@ pub fn role(kind: &ComponentKind) -> Role {
         | DropProvenance { .. }
         | HasStale { .. }
         | DropStale { .. }
+        | CumulativeToDelta { .. }
         | KeepValues { .. }
         | Bucket { .. }
         | Logfmt { .. }
@@ -500,6 +506,7 @@ pub fn kind_name(kind: &ComponentKind) -> &'static str {
         DropProvenance { .. } => "drop_provenance",
         HasStale { .. } => "has_stale",
         DropStale { .. } => "drop_stale",
+        CumulativeToDelta { .. } => "cumulative_to_delta",
         KeepValues { .. } => "keep_values",
         Bucket { .. } => "bucket",
         Logfmt { .. } => "logfmt",
@@ -627,6 +634,7 @@ fn is_implemented(kind: &ComponentKind) -> bool {
             | ComponentKind::DropProvenance { .. }
             | ComponentKind::HasStale { .. }
             | ComponentKind::DropStale { .. }
+            | ComponentKind::CumulativeToDelta { .. }
             | ComponentKind::KeepValues { .. }
             | ComponentKind::Bucket { .. }
             | ComponentKind::Logfmt { .. }
@@ -3420,11 +3428,28 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
     // except that the scheme check fails only when no intake is `https://`: an omitted
     // `endpoints` entry derives an `https://` host from `site`.
     for (id, component) in &components {
-        let ComponentKind::DatadogOut { api_key, site, endpoints, timeout, headers, tls, .. } =
-            &component.kind
+        let ComponentKind::DatadogOut {
+            api_key,
+            site,
+            endpoints,
+            timeout,
+            headers,
+            tls,
+            histograms,
+            ..
+        } = &component.kind
         else {
             continue;
         };
+        if histograms.mode == logit_config::DatadogHistogramMode::Nobuckets
+            && !histograms.send_aggregation_metrics
+        {
+            anyhow::bail!(
+                "component '{id}': datadog_out 'histograms.mode: nobuckets' writes no buckets, so \
+                 it needs 'histograms.send_aggregation_metrics: true' or a histogram sends \
+                 nothing at all"
+            );
+        }
         if api_key.is_empty() {
             anyhow::bail!(
                 "component '{id}': datadog_out 'api_key' must not be empty -- Datadog rejects \
@@ -4168,6 +4193,26 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                      and {MAX_LOGIT_OUT_WINDOW}"
                 );
             }
+        }
+    }
+
+    // Rule 94: `cumulative_to_delta` (`docs/adr/cumulative-to-delta-transform.md`).
+    for (id, component) in &components {
+        let ComponentKind::CumulativeToDelta { max_staleness, max_series, .. } = &component.kind
+        else {
+            continue;
+        };
+        if max_staleness.is_zero() {
+            anyhow::bail!(
+                "component '{id}': cumulative_to_delta 'max_staleness' must be greater than 0s -- \
+                 set it above the longest gap between a producer's reports"
+            );
+        }
+        if *max_series == 0 {
+            anyhow::bail!(
+                "component '{id}': cumulative_to_delta 'max_series' must be at least 1 -- at 0 \
+                 no series could be tracked, so nothing would convert"
+            );
         }
     }
 
@@ -7082,6 +7127,33 @@ mod tests {
         assert!(err.contains("max_tracked_keysets"), "{err}");
     }
 
+    // ---- Rule 94: `cumulative_to_delta` -----------------------------------------------------------
+
+    fn cumulative_to_delta(max_staleness: Duration, max_series: usize) -> ComponentKind {
+        ComponentKind::CumulativeToDelta {
+            initial_value: logit_config::InitialValue::Auto,
+            max_staleness,
+            max_series,
+        }
+    }
+
+    #[test]
+    fn a_cumulative_to_delta_with_its_defaults_resolves_as_a_transform() {
+        let graph = resolve_timestamp(cumulative_to_delta(Duration::from_secs(3600), 10_000))
+            .expect("should resolve");
+        assert_eq!(graph.components["stamped"].role(), Role::Transform);
+        assert_eq!(graph.components["stamped"].kind_name(), "cumulative_to_delta");
+    }
+
+    /// Rule 94: a zero `max_staleness` or `max_series` is rejected.
+    #[test]
+    fn a_cumulative_to_delta_with_a_zero_bound_is_rejected() {
+        let err = timestamp_err(cumulative_to_delta(Duration::ZERO, 10_000));
+        assert!(err.contains("'max_staleness' must be greater than 0s"), "got: {err}");
+        let err = timestamp_err(cumulative_to_delta(Duration::from_secs(3600), 0));
+        assert!(err.contains("'max_series' must be at least 1"), "got: {err}");
+    }
+
     // ---- Rule 87: `has_stale`/`drop_stale` --------------------------------------------------------
 
     fn stale_kinds(max_age: Duration, max_ahead: Option<Duration>) -> [ComponentKind; 2] {
@@ -8654,6 +8726,7 @@ mod tests {
             timeout: logit_config::default_datadog_timeout(),
             headers: HashMap::new(),
             tls: logit_config::TlsClientConfig::default(),
+            histograms: logit_config::DatadogHistograms::default(),
         }
     }
 
@@ -8683,6 +8756,25 @@ mod tests {
         });
         resolve(cfg(vec![("in", vec![], listener()), ("out", vec!["in"], kind)]))
             .expect("http:// overrides, a custom header, and tls with one https intake are valid");
+    }
+
+    /// Rule 66: `nobuckets` writes a histogram's aggregations alone, so it needs them on, as the
+    /// Datadog exporter's `HistogramConfig.validate` requires.
+    #[test]
+    fn a_datadog_out_nobuckets_histogram_without_aggregations_is_rejected() {
+        let nobuckets = |aggregations| {
+            datadog_out_with(|k| {
+                if let ComponentKind::DatadogOut { histograms, .. } = k {
+                    histograms.mode = logit_config::DatadogHistogramMode::Nobuckets;
+                    histograms.send_aggregation_metrics = aggregations;
+                }
+            })
+        };
+        let err = datadog_out_err(nobuckets(false));
+        assert!(err.contains("'histograms.mode: nobuckets'"), "got: {err}");
+        assert!(err.contains("send_aggregation_metrics: true"), "got: {err}");
+        resolve(cfg(vec![("in", vec![], listener()), ("out", vec!["in"], nobuckets(true))]))
+            .expect("nobuckets with the aggregation metrics on is valid");
     }
 
     /// Rule 66: the key must be sendable as-is.

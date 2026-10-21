@@ -1,0 +1,22 @@
+{
+  "name": "zero-lower",
+  "kind": "explicit",
+  "input": {
+    "bounds": ["0", "5", "10"],
+    "counts": [0, 7, 3, 0],
+    "count": 10,
+    "sum": "40",
+    "min": null,
+    "max": null
+  },
+  "outcome": "sketch",
+  "sketch": {
+    "k": [1442, 1461, 1476],
+    "n": [8, 1, 1],
+    "cnt": 10,
+    "sum": "40",
+    "min": "0",
+    "max": "10",
+    "avg": "4"
+  }
+}

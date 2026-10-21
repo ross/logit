@@ -1,0 +1,22 @@
+{
+  "name": "huge-finite-bounds",
+  "kind": "explicit",
+  "input": {
+    "bounds": ["1e+300", "1e+301"],
+    "counts": [0, 5, 0],
+    "count": 5,
+    "sum": "5e+300",
+    "min": null,
+    "max": null
+  },
+  "outcome": "sketch",
+  "sketch": {
+    "k": [32766],
+    "n": [5],
+    "cnt": 5,
+    "sum": "5e+300",
+    "min": "1e+300",
+    "max": "1e+301",
+    "avg": "1e+300"
+  }
+}

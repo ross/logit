@@ -1,0 +1,49 @@
+{
+  "name": "over-observation-cap-one-bucket",
+  "kind": "explicit",
+  "input": {
+    "bounds": ["1", "2"],
+    "counts": [0, 268431361, 0],
+    "count": 268431361,
+    "sum": "4e+08",
+    "min": null,
+    "max": null
+  },
+  "series": [
+    {
+      "name": "case.count",
+      "tags": [],
+      "type": "count",
+      "value": "2.68431361e+08",
+      "unit": ""
+    },
+    {
+      "name": "case.sum",
+      "tags": [],
+      "type": "count",
+      "value": "4e+08",
+      "unit": "millisecond"
+    },
+    {
+      "name": "case.bucket",
+      "tags": ["lower_bound:-inf", "upper_bound:1.0"],
+      "type": "count",
+      "value": "0",
+      "unit": ""
+    },
+    {
+      "name": "case.bucket",
+      "tags": ["lower_bound:1.0", "upper_bound:2.0"],
+      "type": "count",
+      "value": "2.68431361e+08",
+      "unit": ""
+    },
+    {
+      "name": "case.bucket",
+      "tags": ["lower_bound:2.0", "upper_bound:inf"],
+      "type": "count",
+      "value": "0",
+      "unit": ""
+    }
+  ]
+}

@@ -1095,7 +1095,8 @@ fn push_label(out: &mut Vec<u8>, key: &str, value: &str) {
 
 /// OpenMetrics caps an exemplar's label set at 128 UTF-8 code points, names and values together,
 /// measured on the names as sanitized. One that doesn't fit is dropped rather than emitted invalid.
-fn exemplar_fits(labels: &[(String, String)]) -> bool {
+/// Shared with [`super::remote_write`], since Prometheus's receiver drops one there too.
+pub(super) fn exemplar_fits(labels: &[(String, String)]) -> bool {
     let total: usize =
         labels.iter().map(|(name, value)| name.chars().count() + value.chars().count()).sum();
     total <= 128
