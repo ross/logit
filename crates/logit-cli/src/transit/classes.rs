@@ -325,8 +325,9 @@ impl Spelling {
     /// `exemplar_key_unsafe` for a monotonic `sum`, `exemplar_key_unsafe_histogram` for a
     /// `histogram`, the two kinds whose exposition lines carry an exemplar. The selection is the
     /// OpenMetrics writer's (`exposed_exemplar_keys`): a counter's first, a histogram's first per
-    /// bucket, each within the label budget. Remote-write writes every exemplar, so the cell is
-    /// reached only through those exemplars there too, whatever the others carry. Only
+    /// bucket, each within the label budget. Remote-write writes every exemplar within the same
+    /// budget, so the cell is reached only through those exemplars there too, whatever the others
+    /// carry. Only
     /// `prometheus_out` writes an exemplar's attributes under a name rule; `otlp_out` writes them
     /// as is, and the other sinks write no exemplars.
     fn exemplar_key_unsafe(self, rec: &Rec) -> Option<&'static str> {

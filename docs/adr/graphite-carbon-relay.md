@@ -145,8 +145,8 @@ Number tokens format `f64` with `{}` and substitute `.` → `_` (`0.99 → q0_99
 `inf → bucket_inf`). This is **injective**: Rust's `Display` for `f64` emits only `-`, digits, and
 at most one `.`, so no two distinct finite values can format to the same string before the
 substitution, and the substitution itself (one character for one character, no merging) can't
-introduce a new collision. This is a materially different argument from `render_fields`'s doc
-comment in `crates/logit-proto/src/influxdb/encode.rs`: that comment rejects *rounding* a quantile to a
+introduce a new collision. This is a materially different argument from the influxdb encoder's
+`summary_quantile_keys_do_not_collide_when_rounded_percentage_would` test in `crates/logit-proto/src/influxdb/encode.rs`: that test rejects *rounding* a quantile to a
 fixed-width label (`0.991` and `0.994` both round to `p99` and collide), a lossy transform this
 codec never performs. Graphite forces the substitution not to avoid a collision like influxdb's,
 but because `.` is the wire's own hierarchy separator — the number itself is carried in full,
