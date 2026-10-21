@@ -17,7 +17,7 @@
     {"sink":"statsd_out","row":"record/unit","cell":0,"observed":["lost"]},
     {"sink":"statsd_out","row":"sum/cumulative_monotonic","cell":1,"observed":["degraded"]},
     {"sink":"statsd_out","row":"sum/f64","cell":0,"observed":[]},
-    {"sink":"statsd_out","row":"summary","cell":1,"observed":["degraded"]}
+    {"sink":"statsd_out","row":"summary/cumulative","cell":1,"observed":["degraded"]}
   ],
   "unspecified": []
 }

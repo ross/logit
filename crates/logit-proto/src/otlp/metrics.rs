@@ -47,7 +47,8 @@
 //! | `histogram/cumulative` | exact | -- | An OTLP `Histogram` with cumulative temporality. |
 //! | `exponential_histogram/delta` | exact | -- | An OTLP `ExponentialHistogram`, field for field. |
 //! | `exponential_histogram/cumulative` | exact | -- | An OTLP `ExponentialHistogram`, field for field. |
-//! | `summary` | exact | -- | An OTLP `Summary`. |
+//! | `summary/delta` | dropped | `logit.output.metrics.dropped{reason=unresolved_delta}` | OTLP defines every summary as cumulative, so a delta one is dropped, with a throttled `delta_temporality_unresolved` warning. |
+//! | `summary/cumulative` | exact | -- | An OTLP `Summary`. |
 //! | `record/no_recorded_value` | exact | -- | The data point's `flags` carry `NO_RECORDED_VALUE`, and the point is kept. |
 //! | `record/no_recorded_value_delta_sum` | exact | -- | The data point's `flags` carry `NO_RECORDED_VALUE`, and the point is kept. |
 //! | `record/no_recorded_value_other_kind` | exact | -- | The data point's `flags` carry `NO_RECORDED_VALUE`, and the point is kept. |

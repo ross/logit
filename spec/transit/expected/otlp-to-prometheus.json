@@ -52,7 +52,7 @@
     {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"payments_pending","kind":"gauge","value":4.0}],"attributes":{"service_instance_id":"3","service_name":"billing"}}
   ], "counters": {}},
   "summary": {"events": [
-    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"rpc_client_duration","kind":"summary","count":100,"sum":25.5,"quantiles":[{"quantile":0.0,"value":0.01},{"quantile":0.5,"value":0.2},{"quantile":0.99,"value":1.2},{"quantile":1.0,"value":2.5}],"description":"Client call duration.","start_timestamp":"2027-01-15T07:58:50.000000000Z"}],"attributes":{"host_name":"web-1","rpc_service":"inventory","service_name":"checkout"}}
+    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"rpc_client_duration","kind":"summary","temporality":"cumulative","count":100,"sum":25.5,"quantiles":[{"quantile":0.0,"value":0.01},{"quantile":0.5,"value":0.2},{"quantile":0.99,"value":1.2},{"quantile":1.0,"value":2.5}],"description":"Client call duration.","start_timestamp":"2027-01-15T07:58:50.000000000Z"}],"attributes":{"host_name":"web-1","rpc_service":"inventory","service_name":"checkout"}}
   ], "counters": {
     "logit.output.metrics.degraded{component=out,kind=prometheus_out,reason=unit_not_suffix,role=sink}": 1
   }},

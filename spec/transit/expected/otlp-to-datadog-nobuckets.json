@@ -7,11 +7,10 @@
   "exemplars": {"events": [
     {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"cart.value","kind":"gauge","value":42.5,"unit":"USD"}],"attributes":{"host.name":"web-1","service.name":"checkout"}}
   ], "counters": {
-    "logit.output.metrics.skipped{component=out,kind=datadog_out,metric_kind=cumulative_sum,role=sink}": 1
+    "logit.output.metrics.dropped{component=out,kind=datadog_out,reason=unresolved_cumulative,role=sink}": 1
   }},
   "exemplars-unwritten": {"events": [], "counters": {
-    "logit.output.metrics.skipped{component=out,kind=datadog_out,metric_kind=cumulative_sum,role=sink}": 1,
-    "logit.output.metrics.skipped{component=out,kind=datadog_out,metric_kind=histogram,role=sink}": 1
+    "logit.output.metrics.dropped{component=out,kind=datadog_out,reason=unresolved_cumulative,role=sink}": 2
   }},
   "exponential-histograms": {"events": [
     {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"rpc.server.duration","kind":"distribution","count":6,"sum":12.3,"min":-1.6,"max":3.4,"avg":2.0500000000000003,"p50":1.8306356841129618,"p90":2.2744127481648713,"p95":2.614988148096247,"p99":2.614988148096247,"sketch":{"mapping":"agent","stats_exact":true,"count":6.0,"min":-1.6,"max":3.4,"zero_count":1.0,"positive":[{"key":1377,"count":1.0},{"key":1386,"count":1.0},{"key":1391,"count":1.0},{"key":1400,"count":1.0}],"negative":[{"key":1355,"count":1.0}]}}],"attributes":{"host.name":"web-1","rpc.method":"GetCart","service.name":"checkout"}},
@@ -21,7 +20,7 @@
     {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"rpc.server.duration.sum","kind":"sum","value":12.3,"temporality":"delta","monotonic":true,"unit":"ms"}],"attributes":{"host.name":"web-1","rpc.method":"GetCart","service.name":"checkout"}}
   ], "counters": {
     "logit.output.metrics.degraded{component=out,kind=datadog_out,metric_kind=exponential_histogram,role=sink}": 1,
-    "logit.output.metrics.skipped{component=out,kind=datadog_out,metric_kind=exponential_histogram,role=sink}": 1
+    "logit.output.metrics.dropped{component=out,kind=datadog_out,reason=unresolved_cumulative,role=sink}": 1
   }},
   "gauges": {"events": [
     {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"jvm.thread.count","kind":"gauge","value":42.0,"unit":"{thread}"}],"attributes":{"host.name":"web-1","service.name":"checkout"}},
@@ -38,17 +37,15 @@
     {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"http.server.request.duration.sum","kind":"sum","value":1.9,"temporality":"delta","monotonic":true,"unit":"s"}],"attributes":{"host.name":"web-1","http.route":"/cart","service.name":"checkout"}}
   ], "counters": {
     "logit.output.metrics.degraded{component=out,kind=datadog_out,metric_kind=histogram,role=sink}": 1,
-    "logit.output.metrics.skipped{component=out,kind=datadog_out,metric_kind=histogram,role=sink}": 1
+    "logit.output.metrics.dropped{component=out,kind=datadog_out,reason=unresolved_cumulative,role=sink}": 1
   }},
   "no-recorded-value": {"events": [], "counters": {
-    "logit.output.metrics.skipped{component=out,kind=datadog_out,metric_kind=cumulative_sum,role=sink}": 1,
-    "logit.output.metrics.skipped{component=out,kind=datadog_out,metric_kind=exponential_histogram,role=sink}": 1,
-    "logit.output.metrics.skipped{component=out,kind=datadog_out,metric_kind=histogram,role=sink}": 1,
+    "logit.output.metrics.dropped{component=out,kind=datadog_out,reason=unresolved_cumulative,role=sink}": 3,
     "logit.output.metrics.skipped{component=out,kind=datadog_out,reason=no_recorded_value,role=sink}": 3
   }},
   "non-finite": {"events": [], "counters": {
     "logit.output.metrics.dropped{component=out,kind=datadog_out,reason=non_finite_value,role=sink}": 2,
-    "logit.output.metrics.skipped{component=out,kind=datadog_out,metric_kind=cumulative_sum,role=sink}": 1
+    "logit.output.metrics.dropped{component=out,kind=datadog_out,reason=unresolved_cumulative,role=sink}": 1
   }},
   "several-resources": {"events": [
     {"timestamp":"2027-01-15T07:59:45.000000000Z","metrics":[{"name":"parcels.queued","kind":"gauge","value":9.0}],"attributes":{"depot":"north","host.name":"transit","service.name":"shipping"}},
@@ -62,7 +59,7 @@
     {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"rpc.client.duration.quantile","kind":"gauge","value":1.2,"unit":"s"}],"attributes":{"host.name":"web-1","quantile":"0.99","rpc.service":"inventory","service.name":"checkout"}},
     {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"rpc.client.duration.quantile","kind":"gauge","value":2.5,"unit":"s"}],"attributes":{"host.name":"web-1","quantile":"1.0","rpc.service":"inventory","service.name":"checkout"}}
   ], "counters": {
-    "logit.output.fields.omitted{component=out,kind=datadog_out,reason=unresolved_cumulative,role=sink}": 1
+    "logit.output.fields.dropped{component=out,kind=datadog_out,reason=unresolved_cumulative,role=sink}": 1
   }},
   "sums": {"events": [
     {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"db.client.connections.usage","kind":"gauge","value":7.0,"unit":"{connection}"}],"attributes":{"host.name":"web-1","pool.name":"primary","service.name":"checkout"}},
@@ -70,7 +67,7 @@
     {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"queue.depth.change","kind":"sum","value":-3.0,"temporality":"delta","monotonic":true,"unit":"{item}"}],"attributes":{"host.name":"web-1","queue":"orders","service.name":"checkout"}}
   ], "counters": {
     "logit.output.metrics.degraded{component=out,kind=datadog_out,metric_kind=non_monotonic_sum,role=sink}": 2,
-    "logit.output.metrics.skipped{component=out,kind=datadog_out,metric_kind=cumulative_sum,role=sink}": 2
+    "logit.output.metrics.dropped{component=out,kind=datadog_out,reason=unresolved_cumulative,role=sink}": 2
   }},
   "sums-protobuf": {"events": [
     {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"db.client.connections.usage","kind":"gauge","value":7.0,"unit":"{connection}"}],"attributes":{"host.name":"web-1","pool.name":"primary","service.name":"checkout"}},
@@ -78,7 +75,7 @@
     {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"queue.depth.change","kind":"sum","value":-3.0,"temporality":"delta","monotonic":true,"unit":"{item}"}],"attributes":{"host.name":"web-1","queue":"orders","service.name":"checkout"}}
   ], "counters": {
     "logit.output.metrics.degraded{component=out,kind=datadog_out,metric_kind=non_monotonic_sum,role=sink}": 2,
-    "logit.output.metrics.skipped{component=out,kind=datadog_out,metric_kind=cumulative_sum,role=sink}": 2
+    "logit.output.metrics.dropped{component=out,kind=datadog_out,reason=unresolved_cumulative,role=sink}": 2
   }},
   "telemetrygen": {"events": [
     {"timestamp":"2026-09-10T21:22:20.000000000Z","metrics":[{"name":"gen","kind":"gauge","value":0.0}],"attributes":{"host.name":"transit","service.name":"telemetrygen"}},

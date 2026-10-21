@@ -137,7 +137,8 @@
 //! | `histogram/cumulative` | degraded | -- | A `bucket_<bound>` field per finite bound, each read back as a gauge under `<name>.`; `sum`, `min`, `max`, and the `+Inf` bucket aren't written, uncounted. |
 //! | `exponential_histogram/delta` | skipped | `logit.output.metrics.skipped{metric_kind=exponential_histogram}` | Line protocol has no form for an exponential histogram, so none is written, with a throttled `encode_error` warning. |
 //! | `exponential_histogram/cumulative` | skipped | `logit.output.metrics.skipped{metric_kind=exponential_histogram}` | Line protocol has no form for an exponential histogram, so none is written, with a throttled `encode_error` warning. |
-//! | `summary` | degraded | -- | A `q<quantile>` field per finite quantile, each read back as a gauge under `<name>.`; `count` and `sum` aren't written, uncounted. |
+//! | `summary/delta` | degraded | -- | A `q<quantile>` field per finite quantile, each read back as a gauge under `<name>.`; `count` and `sum` aren't written, uncounted. Line protocol has no temporality, so a delta summary writes as a cumulative one does. |
+//! | `summary/cumulative` | degraded | -- | A `q<quantile>` field per finite quantile, each read back as a gauge under `<name>.`; `count` and `sum` aren't written, uncounted. |
 //! | `record/no_recorded_value` | skipped | `logit.output.metrics.skipped{reason=no_recorded_value}` | A point flagged as holding no recorded value isn't written, with a throttled `no_recorded_value` warning. |
 //! | `record/no_recorded_value_delta_sum` | skipped | `logit.output.metrics.skipped{reason=no_recorded_value}` | A point flagged as holding no recorded value isn't written, with a throttled `no_recorded_value` warning. |
 //! | `record/no_recorded_value_other_kind` | skipped | `logit.output.metrics.skipped{reason=no_recorded_value}` | A point flagged as holding no recorded value isn't written, with a throttled `no_recorded_value` warning. |

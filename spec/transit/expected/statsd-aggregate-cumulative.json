@@ -326,6 +326,10 @@
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"response.size.bucket_1000","kind":"gauge","value":12.0}]},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"response.size.count","kind":"gauge","value":42.0}]},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"response.size.sum","kind":"gauge","value":9000.0}]},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"rpc.delta.count","kind":"sum","value":3.0,"temporality":"delta","monotonic":true}]},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"rpc.delta.q0_5","kind":"gauge","value":4.0}]},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"rpc.delta.q0_99","kind":"gauge","value":7.5}]},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"rpc.delta.sum","kind":"sum","value":12.0,"temporality":"delta","monotonic":true}]},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"rpc.duration.count","kind":"gauge","value":10.0}]},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"rpc.duration.q0_5","kind":"gauge","value":5.0}]},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"rpc.duration.q0_99","kind":"gauge","value":9.9}]},
@@ -334,8 +338,8 @@
     "logit.component.events.discarded{component=window,kind=aggregate,role=transform}": 1,
     "logit.output.metrics.degraded{component=out,kind=statsd_out,metric_kind=exponential_histogram,role=sink}": 2,
     "logit.output.metrics.degraded{component=out,kind=statsd_out,metric_kind=histogram,role=sink}": 2,
-    "logit.output.metrics.degraded{component=out,kind=statsd_out,metric_kind=summary,role=sink}": 1,
-    "logit.transform.metrics.passed_through{component=window,kind=aggregate,reason=no_merge_rule,role=transform}": 4
+    "logit.output.metrics.degraded{component=out,kind=statsd_out,metric_kind=summary,role=sink}": 2,
+    "logit.transform.metrics.passed_through{component=window,kind=aggregate,reason=no_merge_rule,role=transform}": 5
   }},
   "summary-exemplars": {"events": [
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"rpc.latency.count","kind":"gauge","value":4.0}]},

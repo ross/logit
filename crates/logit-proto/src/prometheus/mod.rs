@@ -116,7 +116,8 @@
 //! | `exponential_histogram/delta`, otherwise | skipped | `logit.output.metrics.skipped{metric_kind=exponential_histogram}` | Neither exposition dialect has native-histogram syntax, so none is written. |
 //! | `exponential_histogram/cumulative`, with `bind:` unset | dropped | `logit.output.metrics.dropped{reason=native_histogram}` | Dropped, as for a delta one. |
 //! | `exponential_histogram/cumulative`, otherwise | skipped | `logit.output.metrics.skipped{metric_kind=exponential_histogram}` | Neither exposition dialect has native-histogram syntax, so none is written. |
-//! | `summary` | exact | -- | A `summary` family of its quantiles, `_sum`, and `_count`. |
+//! | `summary/delta` | dropped | `logit.output.metrics.dropped{reason=unresolved_delta}` | A Prometheus summary is a running total, so a delta one, which only `cumulative_to_delta` makes, is dropped, with a throttled `delta_temporality_unresolved` warning; send this sink the summary from ahead of that component. |
+//! | `summary/cumulative` | exact | -- | A `summary` family of its quantiles, `_sum`, and `_count`. |
 //! | `record/no_recorded_value`, with `bind:` unset | exact | -- | Remote-write writes a flagged `Gauge` or cumulative `Sum` as Prometheus's stale marker, read back flagged; a flagged non-monotonic `Sum`'s goes on a `gauge`, as its value would. |
 //! | `record/no_recorded_value`, otherwise | skipped | `logit.output.metrics.skipped{reason=no_recorded_value}` | A point flagged as holding no recorded value isn't exposed. |
 //! | `record/no_recorded_value_delta_sum`, with `bind:` unset | degraded | -- | Remote-write writes a flagged delta `Sum` as a stale marker, its temporality ignored, since a marker holds no reading to be delta about: a monotonic one on a `counter`, read back as a flagged cumulative counter, uncounted, and a non-monotonic one on a `gauge`, counted `logit.output.metrics.degraded{metric_kind=non_monotonic_sum}`. An unflagged delta `Sum` is dropped. |

@@ -1,0 +1,20 @@
+# prometheus_in's scrape cases through `cumulative_to_delta` into statsd_out under DogStatsD: a
+# running counter leaves as a `|c` counter where with nothing between it's a `|g` gauge, and a
+# histogram's and a summary's dotted counts and sums as counters. Each case runs alone, so
+# `initial_value: keep` emits a series' first point whole; a later point of the same series is
+# its difference from the one before.
+# `path:` names one case so `logit run` can run this by hand; the transit spec runs every case in
+# that file's directory (spec/transit/README.md).
+components:
+  case:
+    type: replay_in
+    path: ../cases/prometheus/mixed.json
+  deltas:
+    type: cumulative_to_delta
+    sources: [case]
+    initial_value: keep
+  out:
+    type: statsd_out
+    sources: [deltas]
+    endpoint: 127.0.0.1:8125
+    format: dogstatsd

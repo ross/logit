@@ -245,8 +245,10 @@
 //! | `exponential_histogram/delta`, otherwise | degraded | `logit.output.metrics.degraded{metric_kind=exponential_histogram}` | Dotted `.count`, `.sum`, and `.zero_count` counters and `.min` and `.max` gauges. Its buckets aren't written, since each scale would mint its own series names. |
 //! | `exponential_histogram/cumulative`, under `multi_value: skip` | skipped | `logit.output.metrics.skipped{metric_kind=exponential_histogram}` | Under `multi_value: skip`, no line is written. |
 //! | `exponential_histogram/cumulative`, otherwise | degraded | `logit.output.metrics.degraded{metric_kind=exponential_histogram}` | The same dotted series, every one a gauge, and no buckets. |
-//! | `summary`, under `multi_value: skip` | skipped | `logit.output.metrics.skipped{metric_kind=summary}` | Under `multi_value: skip`, no line is written. |
-//! | `summary`, otherwise | degraded | `logit.output.metrics.degraded{metric_kind=summary}` | Dotted `.count`, `.sum`, and per-quantile gauges. |
+//! | `summary/delta`, under `multi_value: skip` | skipped | `logit.output.metrics.skipped{metric_kind=summary}` | Under `multi_value: skip`, no line is written. |
+//! | `summary/delta`, otherwise | degraded | `logit.output.metrics.degraded{metric_kind=summary}` | Dotted `.count` and `.sum` counters, which a statsd server sums across flushes as it does a delta histogram's, and per-quantile gauges. |
+//! | `summary/cumulative`, under `multi_value: skip` | skipped | `logit.output.metrics.skipped{metric_kind=summary}` | Under `multi_value: skip`, no line is written. |
+//! | `summary/cumulative`, otherwise | degraded | `logit.output.metrics.degraded{metric_kind=summary}` | Dotted `.count`, `.sum`, and per-quantile gauges. |
 //! | `record/no_recorded_value` | skipped | `logit.output.messages.skipped{reason=no_recorded_value}` | A point flagged as holding no recorded value has no statsd line. |
 //! | `record/no_recorded_value_delta_sum` | skipped | `logit.output.messages.skipped{reason=no_recorded_value}` | A point flagged as holding no recorded value has no statsd line. |
 //! | `record/no_recorded_value_other_kind` | skipped | `logit.output.messages.skipped{reason=no_recorded_value}` | A point flagged as holding no recorded value has no statsd line. |
