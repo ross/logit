@@ -647,8 +647,8 @@ Recorded per workstream as each lands.
     `pickle-p2`, `pickle-p5`, and `pickle-py2`, CPython 3.12 at protocols 2 and 5 and Python 2.7's
     `cPickle`, each one length-prefixed frame on a connection.
   - Four read one payload each from `testdata/differential/graphite-pickle/` in place: a tagged
-    path reused through the memo, the `-1` receipt-time timestamp, a Python 2 UTF-8 path, and the
-    value 2^63.
+    path beside an untagged one recalled through the memo, the `-1` receipt-time timestamp, a
+    Python 2 UTF-8 path, and the value 2^63.
   - `tagged` is hand-built plaintext, since no recorded sender writes carbon 1.1's tags: tags, a
     repeated key, a `_logit.` tag name, values holding `=` and `~`, exponent, signed, integer,
     and negative values, `-1` and fractional timestamps, runs of whitespace, and a non-ASCII
