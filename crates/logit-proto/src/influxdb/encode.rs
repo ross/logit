@@ -53,8 +53,8 @@ use crate::{CodecError, Encoder};
 use bytes::Bytes;
 use logit_core::interner::{intern, resolve, Symbol};
 use logit_core::{
-    DdSketch, Diagnostics, Event, EventBatch, MetricKind, MetricRecord, MetricValue, Resource,
-    Value,
+    DdSketch, Diagnostics, Event, EventBatch, Histogram, MetricKind, MetricRecord, MetricValue,
+    Resource, Value,
 };
 use std::collections::HashMap;
 // `write!` into a `String`: formats straight into the output buffer, no `String` per number
@@ -102,9 +102,10 @@ pub struct EncodeStats {
     pub dropped_reserved_key: usize,
     /// A string field over `influxd`'s 1 MiB cap: `metrics.dropped{reason="oversize_value"}`.
     pub dropped_oversize_value: usize,
-    /// A line whose field set came out empty with no field drop counted above (a `Histogram`
-    /// with no finite bound, a `Summary` with no finite quantile): `metrics.dropped{reason="no_fields"}`.
-    pub dropped_no_fields: usize,
+    /// A `Histogram`, `Summary`, `Distribution`, or `Samples` line written with a non-finite
+    /// `sum`, `min`, `max`, quantile, or bound left out, once per record:
+    /// `metrics.degraded{reason="non_finite_component"}`.
+    pub degraded_non_finite_component: usize,
     /// A record flagged [`MetricRecord::FLAG_NO_RECORDED_VALUE`]: line protocol has no "no
     /// reading" marker. `metrics.skipped{reason="no_recorded_value"}`.
     pub skipped_no_recorded_value: usize,
@@ -289,19 +290,15 @@ impl Ctx<'_> {
                 return;
             }
         };
-        match outcome {
-            Fields::Written => {}
-            Fields::ValueDropped => {
-                self.stats.dropped_unencodable_value += 1;
-                return;
-            }
-            Fields::Empty => {
-                self.stats.dropped_no_fields += 1;
-                return;
-            }
+        if let Fields::ValueDropped = outcome {
+            self.stats.dropped_unencodable_value += 1;
+            return;
         }
         if !self.measurement_ok(measurement, 1) {
             return;
+        }
+        if let Fields::Degraded = outcome {
+            self.stats.degraded_non_finite_component += 1;
         }
         self.line.clear();
         push_escaped_measurement(self.line, measurement);
@@ -658,10 +655,10 @@ fn allocate_timestamp(
 /// What [`render_fields`] left in its buffer.
 enum Fields {
     Written,
+    /// Written with at least one non-finite component left out.
+    Degraded,
     /// The one `value` of a `Gauge`/`Sum` was non-finite.
     ValueDropped,
-    /// Every component of a multi-field kind was non-finite or absent.
-    Empty,
 }
 
 /// A kind with no line-protocol shape.
@@ -671,88 +668,125 @@ enum KindSkip {
     GaugeDelta,
 }
 
-/// `Distribution` and re-sketched `Samples` fields: `count` as an unsigned integer
-/// ([`push_uint`]), `sum` ([`DdSketch::sum`], `0.0` for an empty sketch), then p50/p90/p99.
-/// `count` is unconditional, so there's always one field.
-fn render_sketch_fields(out: &mut String, sketch: &DdSketch) {
-    out.push_str("count=");
-    push_uint(out, sketch.count() as u64);
-    let sum = sketch.sum();
-    if sum.is_finite() {
-        out.push_str(",sum=");
-        push_float(out, sum);
-    }
-    for q in [0.5, 0.9, 0.99] {
-        if let Some(v) = sketch.quantile(q).filter(|v| v.is_finite()) {
-            let percentile = (q * 100.0).round() as u32;
-            let _ = write!(out, ",p{percentile}=");
-            push_float(out, v);
-        }
-    }
-}
+/// The quantiles a `Distribution` or re-sketched `Samples` writes.
+const SKETCH_QUANTILES: [f64; 3] = [0.5, 0.9, 0.99];
 
 /// Renders one metric's `k=v,k=v` field set into `out` (cleared first), for the per-record path.
+/// `docs/adr/influxdb-histogram-summary-shape.md` is the decision record for the multi-field
+/// kinds; [`super`]'s "Encode" section is the table.
 ///
 /// - `Sum`/`Gauge`: one `value` field in the value's own type ([`push_typed_value`]). Line
 ///   protocol has no temporality or monotonicity, so a cumulative or non-monotonic `Sum` writes
 ///   its current `value` too.
-/// - `Distribution`, and `Samples` re-sketched with each value weighted by its inverse sample rate:
-///   [`render_sketch_fields`].
-/// - `Histogram`: a `bucket_<bound>` field per finite bound.
-/// - `Summary`: fields keyed by the raw quantile, not a rounded percentage, since rounding isn't
-///   collision-free (0.991 and 0.994 both round to "p99" and would overwrite each other).
+/// - `Histogram`, `Summary`, `Distribution`, and `Samples`: [`render_histogram_fields`] and
+///   [`render_summary_fields`], in the shape `otel2influx`'s `telegraf-prometheus-v1` schema
+///   writes.
 /// - `Set`: its `HyperLogLog` estimate as an unsigned `value`.
 /// - `SetMembers` (raw members, no scalar to render) and `ExponentialHistogram` (no line-protocol
-///   shape) are skipped, and an unresolved `GaugeDelta` is
-///   dropped.
+///   shape) are skipped, and an unresolved `GaugeDelta` is dropped.
 ///
-/// **Field names are written unescaped.** Each is a literal (`value`, `count`, `sum`) or built from
-/// formatted numbers (`p50`, `bucket_1.5`, `q0.99`), and no `f64`/`u32` rendering contains a
-/// backslash, comma, equals, or space. A field name derived from user input goes through
-/// [`push_escaped_key`].
+/// **Field names are written unescaped.** Each is a literal (`value`, `count`, `+Inf`) or a
+/// finite `f64`'s `Display` text, which never contains a backslash, comma, equals, or space. A
+/// field name derived from user input goes through [`push_escaped_key`].
 fn render_fields(out: &mut String, kind: &MetricKind) -> Result<Fields, KindSkip> {
     out.clear();
-    match kind {
+    let omitted = match kind {
         MetricKind::Sum(s) => return Ok(push_value_field(out, s.value)),
         MetricKind::Gauge(v) => return Ok(push_value_field(out, *v)),
         MetricKind::Distribution(sketch) => render_sketch_fields(out, sketch),
-        MetricKind::Samples(s) => {
-            // Weighted by the inverse sample rate, the same extrapolation `aggregate` applies
-            // when it builds a `Distribution` from these.
-            let mut sketch = DdSketch::new();
-            let weight = s.weight();
-            for v in &s.values {
-                sketch.add_weighted(*v, weight);
-            }
-            render_sketch_fields(out, &sketch);
-        }
-        MetricKind::Histogram(h) => {
-            for (bound, count) in &h.buckets {
-                if bound.is_finite() {
-                    separator(out);
-                    let _ = write!(out, "bucket_{bound}=");
-                    push_uint(out, *count);
-                }
-            }
-        }
-        MetricKind::Summary(s) => {
-            for (q, v) in &s.quantiles {
-                if v.is_finite() {
-                    separator(out);
-                    let _ = write!(out, "q{q}=");
-                    push_float(out, *v);
-                }
-            }
-        }
+        // Weighted by the inverse sample rate, the same extrapolation `aggregate` applies when it
+        // builds a `Distribution` from these.
+        MetricKind::Samples(s) => render_sketch_fields(out, &s.sketch()),
+        MetricKind::Histogram(h) => render_histogram_fields(out, h),
+        MetricKind::Summary(s) => render_summary_fields(
+            out,
+            s.count,
+            Some(s.sum),
+            s.quantiles.iter().map(|&(q, v)| (q, Some(v))),
+        ),
         MetricKind::Set(hll) => {
             out.push_str("value=");
             push_uint(out, hll.estimate());
+            false
         }
         MetricKind::SetMembers(_) => return Err(KindSkip::SetMembers),
         MetricKind::ExponentialHistogram(_) => return Err(KindSkip::ExponentialHistogram),
         MetricKind::GaugeDelta(_) => return Err(KindSkip::GaugeDelta),
+    };
+    Ok(if omitted { Fields::Degraded } else { Fields::Written })
+}
+
+/// `count`, `sum`, `min`, and `max`, then one field per finite bound keyed by the bound and
+/// holding the **cumulative** count up to it, then `+Inf` holding the total. Every value is a
+/// float, as `otel2influx` writes it; `influx2otel` refuses an integer count. `count` and `+Inf`
+/// are the sum of every bucket, the overflow bucket included, so a histogram with no bucket still
+/// writes both. Returns whether a non-finite `sum`, `min`, `max`, or bound was left out.
+fn render_histogram_fields(out: &mut String, h: &Histogram) -> bool {
+    let total = h.buckets.iter().fold(0u64, |acc, (_, n)| acc.saturating_add(*n));
+    out.push_str("count=");
+    push_float(out, total as f64);
+    let mut omitted = false;
+    for (key, value) in [("sum", h.sum), ("min", h.min), ("max", h.max)] {
+        omitted |= push_optional_float(out, key, value);
     }
-    Ok(if out.is_empty() { Fields::Empty } else { Fields::Written })
+    let mut cumulative = 0u64;
+    for (bound, n) in &h.buckets {
+        cumulative = cumulative.saturating_add(*n);
+        if bound.is_finite() {
+            let _ = write!(out, ",{bound}=");
+            push_float(out, cumulative as f64);
+        } else if *bound != f64::INFINITY {
+            // NaN or -Inf: no key spells it. Its count still reaches `+Inf` and later bounds.
+            omitted = true;
+        }
+    }
+    out.push_str(",+Inf=");
+    push_float(out, total as f64);
+    omitted
+}
+
+/// `count`, `sum`, then one field per quantile keyed by the quantile (`0.5`, `0.99`). A `None`
+/// value is a quantile with no reading (an empty sketch's), left out uncounted. Returns whether a
+/// non-finite `sum`, quantile, or value was left out.
+fn render_summary_fields(
+    out: &mut String,
+    count: u64,
+    sum: Option<f64>,
+    quantiles: impl Iterator<Item = (f64, Option<f64>)>,
+) -> bool {
+    out.push_str("count=");
+    push_float(out, count as f64);
+    let mut omitted = push_optional_float(out, "sum", sum);
+    for (q, v) in quantiles {
+        let Some(v) = v else { continue };
+        if q.is_finite() && v.is_finite() {
+            let _ = write!(out, ",{q}=");
+            push_float(out, v);
+        } else {
+            omitted = true;
+        }
+    }
+    omitted
+}
+
+/// A `Distribution` or re-sketched `Samples` in the summary shape: the sketch's count and sum
+/// (`0.0` for an empty sketch), then [`SKETCH_QUANTILES`].
+fn render_sketch_fields(out: &mut String, sketch: &DdSketch) -> bool {
+    let quantiles = SKETCH_QUANTILES.iter().map(|&q| (q, sketch.quantile(q)));
+    render_summary_fields(out, sketch.count() as u64, Some(sketch.sum()), quantiles)
+}
+
+/// Appends `,key=<value>` for a finite `value`. Returns whether a non-finite one was left out.
+fn push_optional_float(out: &mut String, key: &str, value: Option<f64>) -> bool {
+    match value {
+        Some(v) if v.is_finite() => {
+            let _ = write!(out, ",{key}=");
+            push_float(out, v);
+            false
+        }
+        Some(_) => true,
+        None => false,
+    }
 }
 
 /// Writes the `value` field of a `Sum` or `Gauge`; a non-finite float writes nothing.
@@ -1028,77 +1062,158 @@ mod tests {
         assert_eq!(out, "cpu.load value=0.5 1700000000000000000\n");
     }
 
+    fn histogram(buckets: Vec<(f64, u64)>, sum: Option<f64>) -> MetricKind {
+        MetricKind::Histogram(Histogram {
+            buckets,
+            temporality: logit_core::Temporality::Delta,
+            sum,
+            min: None,
+            max: None,
+        })
+    }
+
+    /// The ADR's worked example: `count`, `sum`, `min`, `max`, each bound's cumulative count, and
+    /// `+Inf`, every value a float, in that order.
     #[test]
-    fn distribution_line_has_integer_count_and_percentiles() {
+    fn a_histogram_writes_cumulative_float_buckets_in_the_telegraf_v1_shape() {
+        let kind = MetricKind::Histogram(Histogram {
+            buckets: vec![(0.1, 3), (1.0, 5), (f64::INFINITY, 2)],
+            temporality: logit_core::Temporality::Cumulative,
+            sum: Some(4.2),
+            min: Some(0.01),
+            max: Some(2.5),
+        });
+        let (out, stats) =
+            encode_stats(vec![metric_event("http_req_duration", kind, &[("host", "a")])]);
+        assert_eq!(
+            out,
+            "http_req_duration,host=a count=10,sum=4.2,min=0.01,max=2.5,0.1=3,1=8,+Inf=10 \
+             1700000000000000000\n"
+        );
+        assert_eq!(stats, EncodeStats::default());
+    }
+
+    /// A delta histogram writes the same fields: line protocol has no temporality.
+    #[test]
+    fn a_delta_histogram_with_no_overflow_bucket_still_writes_the_total_as_inf() {
+        let out =
+            encode(vec![metric_event("lat", histogram(vec![(5.0, 2), (10.0, 1)], None), &[])]);
+        assert_eq!(out, "lat count=3,5=2,10=3,+Inf=3 1700000000000000000\n");
+    }
+
+    /// A bound key is never written with an exponent, as `otel2influx`'s `FormatFloat(b, 'f', -1)`
+    /// spells it.
+    #[test]
+    fn a_bound_key_is_spelled_without_an_exponent() {
+        let out =
+            encode(vec![metric_event("b", histogram(vec![(0.00001, 1), (1e6, 1)], None), &[])]);
+        assert_eq!(out, "b count=2,0.00001=1,1000000=2,+Inf=2 1700000000000000000\n");
+    }
+
+    /// A histogram with no bucket has no bound to write, but `count` and `+Inf` still make a line.
+    #[test]
+    fn a_histogram_with_no_bucket_writes_count_and_inf() {
+        let (out, stats) = encode_stats(vec![metric_event("h", histogram(vec![], Some(0.0)), &[])]);
+        assert_eq!(out, "h count=0,sum=0,+Inf=0 1700000000000000000\n");
+        assert_eq!(stats, EncodeStats::default());
+    }
+
+    /// A non-finite sum is left off the line, and the record counts as degraded once.
+    #[test]
+    fn a_non_finite_histogram_component_is_omitted_and_counted_degraded() {
+        let kind = MetricKind::Histogram(Histogram {
+            buckets: vec![(1.0, 2)],
+            temporality: logit_core::Temporality::Delta,
+            sum: Some(f64::NAN),
+            min: Some(f64::NEG_INFINITY),
+            max: Some(3.0),
+        });
+        let (out, stats) = encode_stats(vec![metric_event("h", kind, &[])]);
+        assert_eq!(out, "h count=2,max=3,1=2,+Inf=2 1700000000000000000\n");
+        assert_eq!(stats.degraded_non_finite_component, 1);
+        assert_eq!(stats.dropped_unencodable_value, 0);
+    }
+
+    #[test]
+    fn a_summary_writes_count_sum_and_one_field_per_quantile() {
+        let kind = MetricKind::Summary(Summary {
+            quantiles: vec![(0.5, 0.2), (0.99, 0.9)],
+            count: 7,
+            sum: 3.5,
+        });
+        let (out, stats) = encode_stats(vec![metric_event("rpc_latency", kind, &[])]);
+        assert_eq!(out, "rpc_latency count=7,sum=3.5,0.5=0.2,0.99=0.9 1700000000000000000\n");
+        assert_eq!(stats, EncodeStats::default());
+    }
+
+    /// Quantile keys are the raw quantile, so 0.991 and 0.994 don't collide as a rounded
+    /// percentage would.
+    #[test]
+    fn summary_quantile_keys_do_not_collide_when_rounded_percentage_would() {
+        let kind = MetricKind::Summary(Summary {
+            quantiles: vec![(0.991, 10.0), (0.994, 20.0)],
+            count: 2,
+            sum: 30.0,
+        });
+        let out = encode(vec![metric_event("req.latency", kind, &[])]);
+        assert!(out.contains(",0.991=10,0.994=20 "), "got: {out}");
+    }
+
+    /// A NaN quantile value, as a Prometheus summary with no observations exposes, is left off.
+    #[test]
+    fn a_non_finite_quantile_is_omitted_and_counted_degraded() {
+        let kind = MetricKind::Summary(Summary {
+            quantiles: vec![(0.5, f64::NAN), (0.99, 0.9)],
+            count: 0,
+            sum: 0.0,
+        });
+        let (out, stats) = encode_stats(vec![metric_event("s", kind, &[])]);
+        assert_eq!(out, "s count=0,sum=0,0.99=0.9 1700000000000000000\n");
+        assert_eq!(stats.degraded_non_finite_component, 1);
+    }
+
+    /// A `Distribution` takes the summary shape, with the sketch's quantiles.
+    #[test]
+    fn a_distribution_writes_the_summary_shape() {
         let mut sketch = logit_core::DdSketch::new();
         sketch.add(120.0);
         let out = encode(vec![metric_event("latency", MetricKind::Distribution(sketch), &[])]);
-        assert!(
-            out.starts_with("latency count=1u,sum=120,"),
-            "count should be an unsigned int field, then the sketch's sum: {out}"
-        );
-        assert!(out.contains("p50="));
-        assert!(out.contains("p90="));
-        assert!(out.contains("p99="));
+        assert!(out.starts_with("latency count=1,sum=120,0.5="), "got: {out}");
+        assert!(out.contains(",0.9="), "got: {out}");
+        assert!(out.contains(",0.99="), "got: {out}");
     }
 
+    /// An empty sketch has no quantile reading, so it writes `count` and `sum` alone, uncounted.
     #[test]
-    fn histogram_bucket_counts_are_unsigned_integers() {
-        let out = encode(vec![metric_event(
-            "resp.size",
-            MetricKind::Histogram(Histogram {
-                buckets: vec![(100.0, 5), (500.0, 2)],
-                temporality: logit_core::Temporality::Cumulative,
-                sum: None,
-                min: None,
-                max: None,
-            }),
-            &[],
-        )]);
-        assert!(out.contains("bucket_100=5u"), "got: {out}");
-        assert!(out.contains("bucket_500=2u"), "got: {out}");
-    }
-
-    #[test]
-    fn summary_quantile_keys_do_not_collide_when_rounded_percentage_would() {
-        // 0.991 and 0.994 both round to "p99"; they must not share a field key.
-        let out = encode(vec![metric_event(
-            "req.latency",
-            MetricKind::Summary(Summary {
-                quantiles: vec![(0.991, 10.0), (0.994, 20.0)],
-                count: 2,
-                sum: 30.0,
-            }),
-            &[],
-        )]);
-        assert!(out.contains("q0.991=10"), "got: {out}");
-        assert!(out.contains("q0.994=20"), "got: {out}");
+    fn an_empty_distribution_writes_count_and_sum_only() {
+        let sketch = logit_core::DdSketch::new();
+        let (out, stats) =
+            encode_stats(vec![metric_event("latency", MetricKind::Distribution(sketch), &[])]);
+        assert_eq!(out, "latency count=0,sum=0 1700000000000000000\n");
+        assert_eq!(stats, EncodeStats::default());
     }
 
     /// Unweighted `Samples` render like a `Distribution` of the same values.
     #[test]
     fn samples_renders_like_a_distribution_built_from_the_same_values() {
-        let out = encode(vec![metric_event(
-            "latency",
-            MetricKind::Samples(logit_core::Samples::new([120.0])),
-            &[],
-        )]);
-        assert!(
-            out.starts_with("latency count=1u,sum=120,"),
-            "count should be an unsigned int field, then the sketch's sum: {out}"
+        let mut sketch = logit_core::DdSketch::new();
+        sketch.add(120.0);
+        let samples = MetricKind::Samples(logit_core::Samples::new([120.0]));
+        let distribution = MetricKind::Distribution(sketch);
+        assert_eq!(
+            encode(vec![metric_event("latency", samples, &[])]),
+            encode(vec![metric_event("latency", distribution, &[])])
         );
-        assert!(out.contains("p50="));
     }
 
-    /// A NaN `sample_rate` degrades to unweighted samples, not an empty sketch (`count=0u`):
+    /// A NaN `sample_rate` degrades to unweighted samples, not an empty sketch (`count=0`):
     /// `Samples::weight` is NaN-safe where a bare `f64::clamp` isn't.
     #[test]
     fn samples_with_a_nan_sample_rate_still_render_every_observation() {
         let mut samples = logit_core::Samples::new([120.0, 130.0]);
         samples.sample_rate = f64::NAN;
         let out = encode(vec![metric_event("latency", MetricKind::Samples(samples), &[])]);
-        assert!(out.starts_with("latency count=2u,sum=250,"), "got: {out}");
-        assert!(out.contains("p50="), "got: {out}");
+        assert!(out.starts_with("latency count=2,sum=250,0.5="), "got: {out}");
     }
 
     /// An unencodable `SetMembers` is skipped, counted, and a sibling metric in the batch still
@@ -1513,25 +1628,6 @@ mod tests {
             encode_stats(vec![metric_event("bad", MetricKind::counter(f64::NAN), &[])]);
         assert_eq!(out, "", "a NaN-only line should produce no output, not `value=NaN`");
         assert_eq!(stats.dropped_unencodable_value, 1);
-        assert_eq!(stats.dropped_no_fields, 0, "the value drop already explains the line");
-    }
-
-    /// A `Histogram` with no finite bound has no field to write, and says so.
-    #[test]
-    fn a_line_with_no_fields_is_dropped_and_counted() {
-        let (out, stats) = encode_stats(vec![metric_event(
-            "resp.size",
-            MetricKind::Histogram(Histogram {
-                buckets: vec![(f64::INFINITY, 5)],
-                temporality: logit_core::Temporality::Cumulative,
-                sum: None,
-                min: None,
-                max: None,
-            }),
-            &[],
-        )]);
-        assert_eq!(out, "");
-        assert_eq!(stats.dropped_no_fields, 1);
     }
 
     #[test]
@@ -1833,7 +1929,6 @@ mod tests {
         let (out, stats) = encode_stats(vec![event]);
         assert_eq!(out, "");
         assert_eq!(stats.dropped_unencodable_value, 1);
-        assert_eq!(stats.dropped_no_fields, 0);
     }
 
     /// A batch with no carrier encodes as it did before the carrier existed: one line per

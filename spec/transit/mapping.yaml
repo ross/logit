@@ -541,8 +541,8 @@ rows:
       influxdb_out:
         class: degraded
         text: >-
-          Sketched, each value weighted by its inverse sample rate, then `count`, `sum`, `p50`,
-          `p90`, and `p99` fields, read back as one gauge each under `<name>.`, uncounted.
+          Sketched, each value weighted by its inverse sample rate, then written as the
+          `distribution` row describes.
       otlp_out:
         class: degraded
         counter: logit.output.metrics.degraded{metric_kind=samples}
@@ -610,8 +610,9 @@ rows:
       influxdb_out:
         class: degraded
         text: >-
-          `count`, `sum`, `p50`, `p90`, and `p99` fields, read back as one gauge each under
-          `<name>.`, uncounted.
+          In the `summary` row's shape: float `count` and `sum` fields and the sketch's `0.5`,
+          `0.9`, and `0.99` quantiles, each read back as a gauge under `<name>.`; the sketch is
+          gone, uncounted.
       otlp_out:
         class: degraded
         counter: logit.output.metrics.degraded{metric_kind=distribution}
@@ -675,8 +676,11 @@ rows:
       influxdb_out:
         class: degraded
         text: >-
-          A `bucket_<bound>` field per finite bound, each read back as a gauge under `<name>.`;
-          `sum`, `min`, `max`, and the `+Inf` bucket aren't written, uncounted.
+          Telegraf's shape: float `count`, `sum`, `min`, and `max` fields, a field per finite
+          bound named by the bound and holding the cumulative count up to it, and `+Inf` holding
+          the total, each read back as a gauge under `<name>.`, its temporality dropped,
+          uncounted. A non-finite `sum`, `min`, or `max` is left off, counted
+          `logit.output.metrics.degraded{reason=non_finite_component}`.
       otlp_out:
         class: exact
         text: An OTLP `Histogram` with delta temporality.
@@ -702,8 +706,11 @@ rows:
       influxdb_out:
         class: degraded
         text: >-
-          A `bucket_<bound>` field per finite bound, each read back as a gauge under `<name>.`;
-          `sum`, `min`, `max`, and the `+Inf` bucket aren't written, uncounted.
+          Telegraf's shape: float `count`, `sum`, `min`, and `max` fields, a field per finite
+          bound named by the bound and holding the cumulative count up to it, and `+Inf` holding
+          the total, each read back as a gauge under `<name>.`, its temporality dropped,
+          uncounted. A non-finite `sum`, `min`, or `max` is left off, counted
+          `logit.output.metrics.degraded{reason=non_finite_component}`.
       otlp_out:
         class: exact
         text: An OTLP `Histogram` with cumulative temporality.
@@ -747,8 +754,8 @@ rows:
         class: skipped
         counter: logit.output.metrics.skipped{metric_kind=exponential_histogram}
         text: >-
-          Line protocol has no form for an exponential histogram, so none is written, with a
-          throttled `encode_error` warning.
+          Neither Telegraf nor the OTel Collector's InfluxDB exporter has a line-protocol form for
+          an exponential histogram, so none is written, with a throttled `encode_error` warning.
       otlp_out:
         class: exact
         text: An OTLP `ExponentialHistogram`, field for field.
@@ -780,8 +787,8 @@ rows:
         class: skipped
         counter: logit.output.metrics.skipped{metric_kind=exponential_histogram}
         text: >-
-          Line protocol has no form for an exponential histogram, so none is written, with a
-          throttled `encode_error` warning.
+          Neither Telegraf nor the OTel Collector's InfluxDB exporter has a line-protocol form for
+          an exponential histogram, so none is written, with a throttled `encode_error` warning.
       otlp_out:
         class: exact
         text: An OTLP `ExponentialHistogram`, field for field.
@@ -806,8 +813,10 @@ rows:
       influxdb_out:
         class: degraded
         text: >-
-          A `q<quantile>` field per finite quantile, each read back as a gauge under `<name>.`;
-          `count` and `sum` aren't written, uncounted.
+          Telegraf's shape: float `count` and `sum` fields and a field per quantile named by the
+          quantile (`0.5`, `0.99`), each read back as a gauge under `<name>.`, uncounted. A
+          non-finite `sum` or quantile is left off, counted
+          `logit.output.metrics.degraded{reason=non_finite_component}`.
       otlp_out:
         class: exact
         text: An OTLP `Summary`.
@@ -961,6 +970,7 @@ rows:
           left off, counted.
   # statsd_out and influxdb_out write a histogram only as dotted series or fields, a lesser kind,
   # and datadog_out skips it, so its fields are never compared there and none of them has a cell.
+  # influxdb_out writes `min` and `max` as fields of that line (the `histogram` rows).
   - kind: record
     feature: min_max
     cells:
