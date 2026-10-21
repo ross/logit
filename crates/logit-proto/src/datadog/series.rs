@@ -932,7 +932,10 @@ impl DatadogEncoder {
     /// Counts the notes [`plan_series`] left for one record. A note about how a written series
     /// looks (a degrade, a normalization, a summary's left-off count and sum) counts only when
     /// `written`: none of a record whose every series the tag limit leaves off. A missing sum
-    /// counts when the record is written on some route, `sketched` for the sketches route.
+    /// counts when the series route writes the record, or when `sketched`: the sketches route
+    /// takes it under the tag limit. That route can still skip or drop it (a conversion error,
+    /// `empty_sketch`, `oversized_sketch`, or the sink's `oversize`), and the missing sum counts
+    /// all the same, since telling those apart here would run the sketch conversion twice.
     fn count_notes(&mut self, notes: &[Note], written: bool, sketched: bool) {
         for &note in notes {
             match note {
