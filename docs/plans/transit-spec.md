@@ -696,9 +696,9 @@ Recorded per workstream as each lands.
 
   The class check's name rule is now each sink's own: `Spelling::sanitize` reads a name through
   the encoder's own predicate, `logit_outputs::statsd::is_forbidden_in_name` for `statsd_out`
-  and `logit_proto::graphite::encode`'s path, tag-name, and tag-value predicates for
-  `graphite_out`, made public for it, rather than a copy of either. That settles the
-  disagreement `tgraph/w1` recorded: a non-ASCII or `=` character no longer reaches
+  and `logit_proto::graphite::encode`'s path, tag-name, and tag-value predicates and its
+  tag-value renderer for `graphite_out`, made public for it, rather than a copy of either. That
+  settles the disagreement `tgraph/w1` recorded: a non-ASCII or `=` character no longer reaches
   `record/name_unsafe` at `statsd_out`. Four records moved off the row, each read back `exact`
   before and after: `café.temperature`, `py2.café`, and `logit-fixture.diamond.café.count` in
   `graphite-to-statsd`, and `interop_escapes.f=e` in `influxdb-to-statsd`, where the case's
