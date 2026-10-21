@@ -318,12 +318,14 @@ impl Spelling {
         }
     }
 
-    /// The `record/exemplar_key_unsafe*` row `rec` reaches when an exemplar the sink writes
-    /// carries a public attribute key it writes as a label name it would have to rewrite:
-    /// `exemplar_key_unsafe` for a monotonic `sum`, `exemplar_key_unsafe_histogram` for a
-    /// `histogram`, the two kinds whose exposition lines carry an exemplar. Which exemplars are
-    /// written is `prometheus_out`'s own selection (`exposed_exemplar_labels`): a counter's first,
-    /// a histogram's first per bucket, each within the label budget. Only `prometheus_out` writes
+    /// The `record/exemplar_key_unsafe*` row `rec` reaches when an exemplar the OpenMetrics
+    /// writer puts on a line carries a public attribute key it writes as a label name it would
+    /// have to rewrite: `exemplar_key_unsafe` for a monotonic `sum`,
+    /// `exemplar_key_unsafe_histogram` for a `histogram`, the two kinds whose exposition lines
+    /// carry an exemplar. The selection is the OpenMetrics writer's (`exposed_exemplar_labels`): a
+    /// counter's first, a histogram's first per bucket, each within the label budget. Remote-write
+    /// writes every exemplar, so its `exact` cell is reached only through those exemplars too,
+    /// whatever the others carry. Only `prometheus_out` writes
     /// an exemplar's attributes under a name rule; `otlp_out` writes them as is, and the other
     /// sinks write no exemplars.
     fn exemplar_key_unsafe(self, rec: &Rec) -> Option<&'static str> {
