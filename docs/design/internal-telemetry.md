@@ -2008,11 +2008,11 @@ itself. The sink emits each once per batch, however many attempts the runtime ma
 | `logit.output.metrics.dropped{reason="unencodable_key"}` | a measurement or field key with no line-protocol spelling, once per field |
 | `logit.output.metrics.dropped{reason="reserved_key"}` | a carrier field named `time`, which `influxd` refuses |
 | `logit.output.metrics.dropped{reason="oversize_value"}` | a string field over `influxd`'s 1 MiB field cap |
-| `logit.output.metrics.dropped{reason="no_fields"}` | a line left with no field: a `Histogram` with no finite bound, or a `Summary` with no finite quantile |
 | `logit.output.metrics.dropped{reason="comment_measurement"}` | a measurement starting with `#`, which `influxd` reads as a comment line |
 | `logit.output.metrics.dropped{reason="timestamp_overflow"}` | a series with no free timestamp slot left before `i64::MAX` |
 | `logit.output.metrics.dropped{reason="unresolved_gauge_delta"}` | an unresolved `GaugeDelta` |
 | `logit.output.metrics.dropped{reason="no_bucket"}` | the sink's own counter, not `EncodeStats`: one per metric record of a batch that names no bucket (no `bucket:` or `default_bucket:` configured, and none carried), which isn't sent; a throttled `logit.component.diagnostics{key="no_bucket"}` says why |
+| `logit.output.metrics.degraded{reason="non_finite_component"}` | a `Histogram`, `Summary`, `Distribution`, or `Samples` line written with a non-finite `sum`, `min`, `max`, quantile, or bound left off, once per record |
 | `logit.output.metrics.skipped{reason="no_recorded_value"}` | a record flagged `NO_RECORDED_VALUE`; line protocol has no "no reading" marker |
 | `logit.output.metrics.skipped{metric_kind="set_members"\|"exponential_histogram"}` | a kind with no line-protocol shape |
 
@@ -2470,7 +2470,10 @@ it takes (the class table above).
 - `logit.output.metrics.skipped{metric_kind="exponential_histogram"}` in registry mode, where
   neither text dialect has a form for one, and `{reason="no_recorded_value"}`.
 - `logit.output.metrics.degraded{metric_kind="non_monotonic_sum"|"distribution"|"samples"|"set"|
-  "set_members"}` and `{reason="exemplar_omitted"|"unit_not_suffix"}` (render-side).
+  "set_members"}` and `{reason="exemplar_omitted"|"unit_not_suffix"}` (render-side). Sender mode
+  counts `exemplar_omitted` too, for an exemplar with no `_total` or `_bucket` series to ride or
+  over OpenMetrics' 128-code-point label budget, which Prometheus's receiver would drop without
+  failing the request.
 - `logit.output.labels.omitted{reason="unrepresentable"|"reserved"|"collision"}`. An exemplar
   key's `collision` or `reserved` is render-side in registry mode, counted once per OpenMetrics
   scrape.

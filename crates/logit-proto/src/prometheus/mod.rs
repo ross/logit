@@ -149,7 +149,7 @@
 //! | `record/unit`, otherwise | lost | `logit.output.metrics.degraded{reason=unit_not_suffix}` | OpenMetrics writes `# UNIT` only when `_<unit>` ends the family name; otherwise it's left off, counted. |
 //! | `record/description` | exact | -- | The family's `# HELP` line. |
 //! | `record/start_timestamp` | lost | uncounted | OpenMetrics' `_created` sample, written for a counter, histogram, or summary; a gauge's start time is left off, uncounted. |
-//! | `record/exemplars` | lost | `logit.output.metrics.degraded{reason=exemplar_omitted}` | In OpenMetrics, on a counter's `_total` line or the bucket line its value falls in, at most one per line. One with no line to sit on, such as a gauge's, is left off, counted. |
+//! | `record/exemplars` | lost | `logit.output.metrics.degraded{reason=exemplar_omitted}` | In OpenMetrics, on a counter's `_total` line or the bucket line its value falls in, at most one per line. One with no line to sit on, such as a gauge's, or one over the 128-code-point label budget, on either wire, is left off, counted. |
 //! | `record/unit_on_distribution`, with `bind:` unset | exact | -- | Remote-write carries the unit in its metadata. |
 //! | `record/unit_on_distribution`, otherwise | lost | `logit.output.metrics.degraded{reason=unit_not_suffix}` | OpenMetrics writes `# UNIT` only when `_<unit>` ends the family name; otherwise it's left off, counted. |
 //! | `record/exemplars_on_summary` | lost | `logit.output.metrics.degraded{reason=exemplar_omitted}` | A summary has no `_total` or bucket line for an exemplar to sit on, so its exemplars are left off, counted. |

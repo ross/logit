@@ -1,6 +1,6 @@
 ---
 created: 2026-10-13
-updated: 2026-10-19
+updated: 2026-10-20
 ---
 
 # InfluxDB line-protocol relay: fields as typed `Gauge` records under a measurement carrier, strings as attributes, and an all-or-nothing write
@@ -16,6 +16,9 @@ Amended on 2026-10-19 by "Amendment: string fields are private (2026-10-19)": a 
 rides as `_logit.influxdb.field.<key>`, so `influxdb_out` is the only protocol sink that writes
 it, and `aggregate` leaves it out of a series. The sections above that amendment describe the
 amended form.
+Amended on 2026-10-20 by [ADR `influxdb-histogram-summary-shape`](influxdb-histogram-summary-shape.md):
+`influxdb_out` writes a histogram, summary, or sketch in Telegraf's `prometheus-v1` shape, and a
+`Histogram`'s temporality joins normalization 10.
 
 ## Context
 
@@ -140,7 +143,9 @@ doesn't match the prefix, or isn't a scalar kind, takes the path below, counted
 `logit.output.metrics.normalized{reason="carrier_mismatch"}`.
 
 **Without the carrier**, `influxdb_out` keeps today's behavior: one line per `MetricRecord`, the
-record name as the measurement, and a `value=` field, now typed.
+record name as the measurement, and a `value=` field, now typed. A histogram, summary, or sketch
+writes the fields [ADR `influxdb-histogram-summary-shape`](influxdb-histogram-summary-shape.md)
+names instead.
 
 `influxdb_out` keeps its configured `org` and `bucket`. It doesn't read `_logit.influxdb.org` or
 `_logit.influxdb.bucket` to choose a destination. [Superseded by "Amendment: `influxdb_out`
@@ -279,8 +284,9 @@ the same list with the same numbers, and the two lists must stay numbered alike:
 8. Comments, blank lines, and runs of spaces are dropped. A CRLF line ending, a tab separator, and
    a trailing comment after the fields are parse errors, not normalized.
 9. A same-series point from another source in one sink batch is nudged forward by 1 ns.
-10. A `Sum`'s temporality and monotonicity are dropped on egress. A point from `influxdb_in` is
-    always a `Gauge`, so this applies only to an event from another protocol.
+10. A `Sum`'s temporality and monotonicity, and a `Histogram`'s temporality, are dropped on
+    egress. A point from `influxdb_in` is always a `Gauge`, so this applies only to an event from
+    another protocol.
 11. A listener's sender attributes (`network.peer.*`, `client.*`) are added under `peer:`,
     `proxy_protocol:`, or `forwarded:`.
 12. A tag key under the private `_logit.` prefix is omitted, counted.
@@ -382,7 +388,9 @@ list; this section summarizes it. Each deviation is a choice or a consequence of
   `logit_proto::influxdb` holding the lexer, decoder, encoder, and error-body writer. A fuzz target
   joins `fuzz/`.
 - `influxdb_out` gains the carrier path and typed suffixes, and counts what it drops silently today:
-  a non-finite value and a line with no fields. Its counters, and `influxdb_in`'s, follow
+  a non-finite value and a line with no fields [no multi-field kind leaves an empty line since
+  [ADR `influxdb-histogram-summary-shape`](influxdb-histogram-summary-shape.md), so that counter is
+  gone]. Its counters, and `influxdb_in`'s, follow
   [ADR `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md): a point or field lost is
   `metrics.dropped`, an unresolved `GaugeDelta` among them, a tag left off a delivered point is
   `tags.omitted`, and only a record with no value and a kind line protocol has no form for are
@@ -391,7 +399,8 @@ list; this section summarizes it. Each deviation is a choice or a consequence of
   when `influx/w3` lands.
 - Known-gaps rows, added with the codec and the listener: what `influxdb_out` drops or reshapes
   from other protocols (`SetMembers`, `ExponentialHistogram`, `unit`, `description`, exemplars, a
-  sketch leaving as `count`/`sum`/`p50`/`p90`/`p99`, and the rest), string fields leaking as tags
+  sketch leaving as `count`/`sum`/`p50`/`p90`/`p99` [`count`/`sum`/`0.5`/`0.9`/`0.99` since
+  [ADR `influxdb-histogram-summary-shape`](influxdb-histogram-summary-shape.md)], and the rest), string fields leaking as tags
   at other sinks [lost there instead since "Amendment: string fields are private (2026-10-19)"],
   a string-only point skipped at other sinks, the v1 `/write` route, no query or
   delete API, org and bucket not routed, and destination faults not reaching the producer. [The

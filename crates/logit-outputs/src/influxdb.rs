@@ -450,6 +450,7 @@ pub fn emit_encode_stats(telemetry: &Telemetry, stats: &EncodeStats) {
     const NORMALIZED: &str = "logit.output.metrics.normalized";
     const DROPPED: &str = "logit.output.metrics.dropped";
     const SKIPPED: &str = "logit.output.metrics.skipped";
+    const DEGRADED: &str = "logit.output.metrics.degraded";
     let rows: [(usize, &str, (&str, &str)); 17] = [
         (stats.tags_normalized_multi_value, TAGS_NORMALIZED, ("reason", "multi_value")),
         (stats.tags_omitted_unrepresentable, TAGS_OMITTED, ("reason", "unrepresentable")),
@@ -461,7 +462,7 @@ pub fn emit_encode_stats(telemetry: &Telemetry, stats: &EncodeStats) {
         (stats.dropped_unencodable_key, DROPPED, ("reason", "unencodable_key")),
         (stats.dropped_reserved_key, DROPPED, ("reason", "reserved_key")),
         (stats.dropped_oversize_value, DROPPED, ("reason", "oversize_value")),
-        (stats.dropped_no_fields, DROPPED, ("reason", "no_fields")),
+        (stats.degraded_non_finite_component, DEGRADED, ("reason", "non_finite_component")),
         (stats.skipped_no_recorded_value, SKIPPED, ("reason", "no_recorded_value")),
         (stats.skipped_set_members, SKIPPED, ("metric_kind", "set_members")),
         (stats.skipped_exponential_histogram, SKIPPED, ("metric_kind", "exponential_histogram")),
@@ -985,6 +986,20 @@ mod tests {
         }
         assert_eq!(probe.sum("logit.output.metrics.skipped", &[]), 0.0, "a lost metric is dropped");
         assert_eq!(probe.sum("logit.output.tags.dropped", &[]), 0.0, "a tag left off is omitted");
+    }
+
+    /// A record written with a non-finite component left out counts as degraded, not dropped.
+    #[test]
+    fn a_non_finite_component_is_emitted_as_degraded() {
+        use logit_pipeline::test_util::TelemetryProbe;
+
+        let mut probe = TelemetryProbe::new();
+        let telemetry = probe.telemetry("out", "influxdb_out", "sink");
+        let stats = EncodeStats { degraded_non_finite_component: 1, ..EncodeStats::default() };
+        emit_encode_stats(&telemetry, &stats);
+        let label = ("reason", "non_finite_component");
+        assert_eq!(probe.sum("logit.output.metrics.degraded", &[label]), 1.0);
+        assert_eq!(probe.sum("logit.output.metrics.dropped", &[]), 0.0);
     }
 
     /// `send` records one `logit.output.requests` per call, tagged by status class.
