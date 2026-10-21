@@ -1322,7 +1322,8 @@ mod tests {
         };
         assert_eq!(
             metric(MetricKind::Summary(s)),
-            "{\"name\":\"m\",\"kind\":\"summary\",\"count\":10,\"sum\":12.0,\
+            "{\"name\":\"m\",\"kind\":\"summary\",\"temporality\":\"cumulative\",\
+             \"count\":10,\"sum\":12.0,\
              \"quantiles\":[{\"quantile\":0.5,\"value\":1.0},{\"quantile\":0.99,\"value\":4.25}]}"
         );
     }

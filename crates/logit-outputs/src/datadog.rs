@@ -2417,7 +2417,7 @@ mod tests {
         (RECORDS_DROPPED, &[("route", "series"), ("reason", "too_many_tags")]),
         ("logit.component.diagnostics", &[("key", "too_many_tags")]),
         (RECORDS_DROPPED, &[("route", "traces"), ("reason", "not_datadog_origin")]),
-        ("logit.output.metrics.skipped", &[("metric_kind", "cumulative_sum")]),
+        ("logit.output.metrics.dropped", &[("reason", "unresolved_cumulative")]),
         ("logit.output.metrics.dropped", &[("reason", "oversized_sketch")]),
         ("logit.component.diagnostics", &[("key", "oversized_sketch")]),
         ("logit.output.tags.omitted", &[("reason", "reserved_key")]),

@@ -2647,6 +2647,7 @@ fn every_metric_kind_rejects_trailing_bytes_in_its_body() {
     summary.extend_from_slice(&f64_bytes);
     summary.push(2); // count
     summary.extend_from_slice(&f64_bytes); // sum
+    summary.push(1); // Cumulative
     let mut sketch = logit_core::DdSketch::new();
     sketch.add(1.5);
 
@@ -2942,7 +2943,7 @@ fn peak_allocation_per_wire_byte_matches_the_documented_ratio() {
         kind(7, n, &[0; 9], &[0, 0, 0, 0])
     }
     fn summary(n: usize) -> Vec<u8> {
-        kind(9, n, &[0; 16], &[0; 9])
+        kind(9, n, &[0; 16], &[0; 10])
     }
     fn exponential_buckets(n: usize) -> Vec<u8> {
         let mut body = vec![0u8, 0];

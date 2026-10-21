@@ -1520,6 +1520,7 @@ mod tests {
             metric_block(&[
                 "  - name: req.latency",
                 "    kind: summary",
+                "    temporality: cumulative",
                 "    count: 3",
                 "    sum: 40",
                 "    quantiles:",
