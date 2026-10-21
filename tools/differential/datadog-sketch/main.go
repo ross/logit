@@ -70,6 +70,16 @@ func optNum(v *float64) *num {
 
 func f(v float64) *float64 { return &v }
 
+// sumOrNaN is the sum the translator is given. logit reads an absent sum as the translator reads a
+// non-finite one, where the translator would read protobuf's default 0
+// (docs/adr/datadog-otlp-metric-mapping.md's "Histograms"), so an absent sum's reading is NaN's.
+func sumOrNaN(sum *float64) float64 {
+	if sum == nil {
+		return math.NaN()
+	}
+	return *sum
+}
+
 // explicitCase is an OTLP `HistogramDataPoint`: `counts` has one more entry than `bounds`, or none.
 // `count` is the sum of `counts`, as logit's `Histogram` carries no count of its own.
 type explicitCase struct {
@@ -224,9 +234,7 @@ func runExplicit(c explicitCase) reading {
 		dp.SetCount(count)
 		dp.ExplicitBounds().FromRaw(c.bounds)
 		dp.BucketCounts().FromRaw(c.counts)
-		if c.sum != nil {
-			dp.SetSum(*c.sum)
-		}
+		dp.SetSum(sumOrNaN(c.sum))
 		if c.min != nil {
 			dp.SetMin(*c.min)
 		}
@@ -262,9 +270,7 @@ func runExp(c expCase) reading {
 		dp.Negative().SetOffset(c.negative.Offset)
 		dp.Negative().BucketCounts().FromRaw(c.negative.Counts)
 		dp.SetCount(c.count)
-		if c.sum != nil {
-			dp.SetSum(*c.sum)
-		}
+		dp.SetSum(sumOrNaN(c.sum))
 		if c.min != nil {
 			dp.SetMin(*c.min)
 		}
@@ -515,13 +521,20 @@ func primitives() []primitive {
 		logs = append(logs, math.Ldexp(1+r.unit(), r.intn(2100)-1074))
 	}
 	// log_amd64.s branches on f1 <= Sqrt2/2 where log.go branches on f1 < Sqrt2/2.
+	// Of every float64 with that mantissa, only Sqrt2/2 × 2^32 takes a different result.
 	for e := -1070; e <= 1020; e += 10 {
 		logs = append(logs, math.Ldexp(math.Sqrt2/2, e))
 	}
+	logs = append(logs, math.Ldexp(math.Sqrt2/2, 32))
 	for _, v := range logs {
 		add("log", []float64{v}, math.Log(v))
 	}
 	exps := []float64{0, 1, -1, 0.5, 709.78, 709.7827128933841, -708.4, -744, -745.2, -746, 1e-20, -1e-20}
+	// Arguments where exp_amd64.s's fused polynomial steps round differently from separate ones,
+	// found by searching logit's port: about 1 in 1,500 arguments.
+	for _, bits := range []uint64{0x40844858ac1ac513, 0xc0563cd221155b2d, 0x40733772eb9d0f55, 0x407c0c7a3c892884} {
+		exps = append(exps, math.Float64frombits(bits))
+	}
 	for i := 0; i < 300; i++ {
 		exps = append(exps, (r.unit()-0.5)*1490)
 	}

@@ -46,7 +46,11 @@ error `MapMetrics` returns that it can't classify, and when the build info lacks
   with `sketch` holding the translator's `Cols()` (`k` and `n`, a key repeated where a count passes
   65535) and its summary, or the reason there's none: `empty`, `too_many_observations`,
   `non_monotonic_bounds`, or `unconvertible`, with the error or log line in `detail`. An explicit
-  point's `count` is the sum of its `counts`, since `logit`'s `Histogram` carries no count.
+  point's `count` is the sum of its `counts`, since `logit`'s `Histogram` carries no count. A
+  `null` sum is given to the translator as `NaN`: `logit` reads an absent sum as the translator
+  reads a non-finite one, where the translator itself would read protobuf's default `0`
+  ([ADR `datadog-otlp-metric-mapping`](../../../docs/adr/datadog-otlp-metric-mapping.md)'s
+  "Histograms").
 - **`primitives.json`**: Go's `Log`, `Exp`, and `Pow` on the inputs the conversion uses them on,
   and `Log1p(2/128)`, the Agent's `gamma.ln`. The test checks `gomath.rs` against each, and
   `Mapping::agent`'s own `gamma_ln` against the last.

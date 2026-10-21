@@ -28,6 +28,9 @@
 //!
 //! Where the result differs from Go:
 //!
+//! - An absent `sum` is treated as a non-finite one: the sketch keeps the summary its insertion
+//!   computed. The translator reads protobuf's default `0` and sends it, with an average of `0`;
+//!   the ADR's "Histograms" section decides against writing a sum the producer never reported.
 //! - `logit`'s [`Histogram`] carries no point `count`, so the count is the sum of the buckets, and
 //!   a histogram with no buckets has no sketch. The translator would build one from the point's
 //!   count alone.
@@ -375,7 +378,8 @@ pub fn histogram_to_agent(h: &Histogram) -> Result<AgentSketch, ConversionError>
         None => {}
     }
     let count = counts.iter().fold(0u64, |a, c| a.saturating_add(*c));
-    let sum = h.sum.unwrap_or(0.0);
+    // An absent sum is as unusable as a non-finite one; the translator would read it as 0.
+    let sum = h.sum.unwrap_or(f64::NAN);
     let ok = sum.is_finite();
 
     // A point without buckets is one bucket of its whole count, with empty buckets below its
@@ -692,7 +696,7 @@ pub fn exp_histogram_to_agent(e: &ExpHistogram) -> Result<AgentSketch, Conversio
     if total > MAX_OBSERVATIONS as f64 {
         return Err(ConversionError::TooManyObservations);
     }
-    let sum = e.sum.unwrap_or(0.0);
+    let sum = e.sum.unwrap_or(f64::NAN);
     let ok = sum.is_finite();
 
     // `exponentialHistogramToDDSketch`: OTLP's bucket index is the DDSketch index under
