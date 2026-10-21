@@ -114,7 +114,9 @@ fn metric_batch() -> EventBatch {
     let histogram = metric_record(
         "fixture_histogram",
         MetricKind::Histogram(Histogram {
-            buckets: vec![(1.0, 2), (5.0, 3), (10.0, 1)],
+            // A decode always ends with the `+Inf` bucket, built from the overflow count OTLP
+            // requires.
+            buckets: vec![(1.0, 2), (5.0, 3), (10.0, 1), (f64::INFINITY, 0)],
             temporality: Temporality::Cumulative,
             sum: Some(12.5),
             min: Some(0.5),

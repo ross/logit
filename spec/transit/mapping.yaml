@@ -685,8 +685,12 @@ rows:
           left off the line, and the record counts once as
           `logit.output.metrics.degraded{reason=non_finite_component}`.
       otlp_out:
-        class: exact
-        text: An OTLP `Histogram` with delta temporality.
+        class: normalized
+        reason: inf_bucket
+        text: >-
+          An OTLP `Histogram` with delta temporality. OTLP requires an overflow count above the
+          highest bound, so a histogram whose last bound is finite reads back with an empty
+          `+Inf` bucket.
       datadog_out:
         class: skipped
         counter: logit.output.metrics.skipped{metric_kind=histogram}
@@ -716,8 +720,12 @@ rows:
           left off the line, and the record counts once as
           `logit.output.metrics.degraded{reason=non_finite_component}`.
       otlp_out:
-        class: exact
-        text: An OTLP `Histogram` with cumulative temporality.
+        class: normalized
+        reason: inf_bucket
+        text: >-
+          An OTLP `Histogram` with cumulative temporality. OTLP requires an overflow count above the
+          highest bound, so a histogram whose last bound is finite reads back with an empty
+          `+Inf` bucket.
       prometheus_out:
         class: normalized
         reason: inf_bucket

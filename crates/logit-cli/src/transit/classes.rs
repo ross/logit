@@ -1006,7 +1006,7 @@ fn same_value(a: &Rec, b: &Rec) -> bool {
         "gauge_delta" => same_number(&a.body["delta"], &b.body["delta"]),
         "log" => a.body["message"] == b.body["message"],
         // A histogram whose last bound is finite gains an empty `+Inf` bucket on a wire that
-        // states the total as one (Prometheus).
+        // states the total as one (Prometheus) or requires an overflow count (OTLP).
         "histogram" => {
             let (mut a, mut b) = (a.core().0, b.core().0);
             for body in [&mut a, &mut b] {
