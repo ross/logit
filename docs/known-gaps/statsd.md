@@ -30,17 +30,17 @@ Entry format and the other areas: [the known-gaps index](README.md).
 - **An expanded component with a negative value leaves as a two-record gauge pair, uncounted.**
   Under `multi_value: expand`, every `|g` component of a summarized kind goes through the
   negative-gauge path: a negative `.min`, `.max`, or `.q*` leaves as `name.min:0|g` then
-  `name.min:-v|g`, and so does a `Summary`'s negative `.sum`. A statsd server ends at the right
-  value, but `statsd_in` reads the pair back as a gauge of 0 plus a relative adjustment, two
-  records. Only the kind's `degraded` count covers it
-  (`logit.output.metrics.degraded{metric_kind}`); the pair itself isn't counted. A `|c`
-  component such as a sketch's negative `.sum` is a signed increment and isn't affected. An OTLP
-  histogram with a negative `min` reaches it in the `otlp-to-statsd` transit flow. The general
-  negative-gauge case is the `gauge/negative` row in `spec/transit/mapping.yaml`; the expansion
-  case has no row of its own.
+  `name.min:-v|g`, and so does the negative `.sum` of a `Summary` or of a cumulative `Histogram`
+  or `ExponentialHistogram`. A statsd server ends at the right value, but `statsd_in` reads the
+  pair back as a gauge of 0 plus a relative adjustment, two records. Only the kind's `degraded`
+  count covers it (`logit.output.metrics.degraded{metric_kind}`); the pair itself isn't counted. A
+  `|c` component such as a sketch's or delta histogram's negative `.sum` is a signed increment and
+  isn't affected. An OTLP exponential histogram with a negative `min` reaches it in the
+  `otlp-to-statsd` transit flow. The general negative-gauge case is the `gauge/negative` row in
+  `spec/transit/mapping.yaml`; the expansion case has no row of its own.
 
   **Workaround:** none short of `multi_value: skip`, which drops the kind. Revisit with a
-  `mapping.yaml` row for the expanded case, once a flow covers it.
+  `mapping.yaml` row for the expanded case, which the exponential-histograms case can check.
 
 - **`statsd_out` has no `unit` and no metric renaming/prefixing, and carries an egress timestamp
   only on a `|T`-marked line.**
