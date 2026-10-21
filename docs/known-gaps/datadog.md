@@ -176,20 +176,6 @@ Entry format and the other areas: [the known-gaps index](README.md).
     when the same metrics arrive through `aggregate` and `datadog_out`; query the distribution
     instead.
   - **Revisit trigger:** an operator who needs the Agent's five series.
-- **`datadog_out` sends no cumulative monotonic `Sum`, cumulative `Histogram`, or cumulative
-  `ExponentialHistogram`, and no `Summary`'s `.count` or `.sum`.** Datadog's exporter
-  differences each against a per-series cache before sending it; `datadog_out` keeps no state,
-  and the `cumulative_to_delta` transform that will do the differencing upstream isn't built
-  ([ADR `cumulative-to-delta-transform`](../adr/cumulative-to-delta-transform.md),
-  [`docs/plans/ddotlp.md`](../plans/ddotlp.md)'s W2). Each is counted, with a throttled
-  `unresolved_cumulative` diagnostic: `logit.output.metrics.skipped{metric_kind=cumulative_sum |
-  histogram | exponential_histogram}`, and `logit.output.fields.omitted{reason="unresolved_cumulative"}`
-  once per summary, whose `.quantile` gauges still go out.
-  - **Consequence:** an OTel SDK's default cumulative counters and histograms don't reach
-    Datadog through `datadog_out`. Configure the SDK for delta temporality, or send through
-    `otlp_out` to an Agent or the Collector's `datadogexporter`.
-  - **Revisit trigger:** W2's transform, which turns the skips into
-    `metrics.dropped{reason="unresolved_cumulative"}` with a remedy to place.
 - **`datadog_out` writes a metric's unit as the record carries it, where Datadog's exporter maps
   it.** The exporter's `AddUnits` gate, on by default, maps an OTLP UCUM unit to Datadog's name
   for it (`ms` to `millisecond`, `By` to `byte`) and writes no unit for one it can't map

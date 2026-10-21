@@ -1,6 +1,6 @@
 ---
 created: 2026-09-29
-updated: 2026-10-20
+updated: 2026-10-21
 ---
 
 # Delivery semantics: at-least-once per hop, duplicates absorbed by the data model, and an effectively-once native hop
@@ -614,4 +614,12 @@ monotonic delta's `count` does, so neither needs a remedy. A delta `Histogram` a
 measured; a `Histogram` under `histograms.mode: counters` is a set of `.bucket` series `count`
 points, which overwrite. A `Summary`'s `.quantile` gauges overwrite. A cumulative monotonic
 `Sum` is still skipped, as item 5 says, until the transform above exists.
+
+## Amendment (2026-10-21): `datadog_out` drops a cumulative kind, and sends a delta summary's count and sum
+
+`cumulative_to_delta` exists, so `datadog_out` drops a cumulative monotonic `Sum`, `Histogram`,
+or `ExponentialHistogram`, counted `logit.output.metrics.dropped{reason="unresolved_cumulative"}`,
+where item 5 says its series route skips one. A delta `Summary`, which only that transform makes,
+adds `.count` and `.sum` series `count` points, which overwrite at their `(series, timestamp)`
+as every other `count` point does.
 

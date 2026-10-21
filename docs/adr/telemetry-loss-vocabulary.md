@@ -1,6 +1,6 @@
 ---
 created: 2026-10-13
-updated: 2026-10-20
+updated: 2026-10-21
 ---
 
 # Telemetry loss vocabulary: any nonzero `*.dropped` is loss, and intended outcomes use other words
@@ -190,7 +190,8 @@ same date has the bounds of the count and how it enters the sink identity.
     `output.metrics.skipped{metric_kind}`, though "missing upstream stage" would make them
     `dropped`. No `logit` stage converts either to a delta monotonic `Sum` a Datadog `count` can
     carry, so an operator alerted on them has nothing to change until one exists. The
-    2026-10-20 amendment below settles the non-monotonic half.
+    2026-10-20 amendment below settles the non-monotonic half, and the 2026-10-21 one the
+    cumulative half.
 - **`output.metrics.type_conflict` keeps its name** (a row in the Outputs table). It counts a
   family `prometheus_out`'s registry replaced because a later batch re-typed it: the new type
   wins and the old type's series are evicted, because exposition allows one type per family.
@@ -255,6 +256,17 @@ a cumulative one as a `gauge`, as Datadog's exporter does, each counted
 `Sum` stays skipped, under `metric_kind="cumulative_sum"`, until the `cumulative_to_delta`
 transform exists ([ADR `cumulative-to-delta-transform`](cumulative-to-delta-transform.md)); that
 ADR's workstream amends the other half.
+
+## Amendment (2026-10-21): `datadog_out`'s cumulative kinds are loss
+
+The condition the close-out named for the cumulative half is met: `cumulative_to_delta`
+converts a cumulative monotonic `Sum`, `Histogram`, `ExponentialHistogram`, and `Summary` into
+the deltas Datadog carries. A cumulative kind reaching `datadog_out` is now a missing upstream
+stage, so `datadog_out` counts each as `output.metrics.dropped{reason="unresolved_cumulative"}`,
+in place of `output.metrics.skipped{metric_kind="cumulative_sum"|"histogram"|"exponential_histogram"}`,
+and a cumulative summary's unsent `.count` and `.sum` as
+`output.fields.dropped{reason="unresolved_cumulative"}`, in place of `output.fields.omitted`. The
+throttled `unresolved_cumulative` diagnostic names the transform to place.
 
 ## Migration record
 The classification of every `*.dropped`, `*.skipped`, `*.degraded`, `*.truncated`, and loss-related

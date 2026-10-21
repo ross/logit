@@ -1,6 +1,6 @@
 ---
 created: 2026-10-20
-updated: 2026-10-20
+updated: 2026-10-21
 ---
 
 # Enabling plan: OTLP metric kinds into `datadog_out`, and a `cumulative_to_delta` transform
@@ -127,7 +127,7 @@ the Rust code under test.
 |---|---|---|---|---|---|
 | W0 | `ddotlp/w0` | `ddotlp/w0: ADRs and plan for OTLP metric kinds into datadog_out` | S | — | in review |
 | W1 | `ddotlp/w1` | `ddotlp/w1: datadog_out maps OTLP sums, histograms, and summaries as Datadog's exporter does` | L | W0 | in review |
-| W2 | `ddotlp/w2` | `ddotlp/w2: Summary temporality and the cumulative_to_delta transform` | L | W1 | not started |
+| W2 | `ddotlp/w2` | `ddotlp/w2: Summary temporality and the cumulative_to_delta transform` | L | W1 | in review |
 
 ## Settled questions
 
@@ -173,3 +173,27 @@ Recorded per workstream as each lands.
   - **The Agent's `appendSafe` order.** The `Dogsketch` encoder now writes a split count's
     remainder before its full entries, as the Agent does; a `trimLeft` fold's order still
     differs, with equal per-key totals.
+- **W2**: building it settled these cases the ADRs leave open.
+  - **A start change and a layout change on one point.** The transform ADR lists the start
+    change (its rule 4) before the layout change (its rule 5), so read literally a re-bucketed
+    histogram whose start also moved would be differenced across two layouts. The transform
+    checks the layout first: such a point is dropped as `layout_changed` and isn't counted
+    `start_adjusted`.
+  - **A summary's unknown sum.** `Summary.sum` is an `f64` with no absent form, so where the
+    ADR's rule leaves a delta with no sum (a non-finite point, or a baseline with no finite sum),
+    a delta summary carries `NaN`; `datadog_out` drops that `.sum` point as
+    `metrics.dropped{reason="non_finite_value"}`.
+  - **Validation the ADR didn't name.** Graph rule 94 rejects `max_staleness: 0s`, as the ADR
+    says, and also `max_series: 0`, which could convert nothing.
+  - **Names the ADR didn't give.** The `initial_value` enum is `logit_config::InitialValue`, and
+    the transform's throttled diagnostics are `max_series_full`, `layout_changed`, and
+    `non_finite_sum`. `otlp_out` and `prometheus_out` report a dropped delta summary under the
+    existing `delta_temporality_unresolved` key, with a message naming `cumulative_to_delta`.
+  - **The transit flows run `initial_value: keep`.** The driver runs each case alone, so under
+    `auto` every first point would only seed a baseline and the flows would show nothing; the
+    driver reads the wall clock through the transform, which is deterministic here because every
+    case predates the run and `max_staleness` outlasts it.
+  - **`statsd_out` and the other summary sinks.** `statsd_out` writes a delta summary's `.count`
+    and `.sum` as `|c` counters, as for a delta histogram; `influxdb_out`, `graphite_out`, and
+    `splunk_hec_out` have no temporality on the wire and write a delta summary as a cumulative
+    one; `collectd_out` skips every summary, as before.

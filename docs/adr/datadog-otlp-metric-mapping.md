@@ -1,14 +1,14 @@
 ---
 created: 2026-10-20
-updated: 2026-10-20
+updated: 2026-10-21
 ---
 
 # `datadog_out` maps OTLP metric kinds as Datadog's OTel exporter does, statelessly
 
 ## Status
-Accepted. Partly built: [`docs/plans/ddotlp.md`](../plans/ddotlp.md)'s W1 built `datadog_out`'s
-mappings, with the cumulative kinds counted as skipped; W2, the transform and the summary's
-temporality, isn't built.
+Accepted. Built: [`docs/plans/ddotlp.md`](../plans/ddotlp.md)'s W1 built `datadog_out`'s
+mappings, and W2 the summary's temporality, the `cumulative_to_delta` transform, and the
+cumulative kinds' switch from skipped to dropped.
 
 ## Context
 `datadog_out` writes a delta monotonic `Sum`, a `Gauge`, `Samples`, a `Distribution`, and a `Set`,

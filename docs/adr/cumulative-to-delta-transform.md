@@ -1,12 +1,14 @@
 ---
 created: 2026-10-20
-updated: 2026-10-20
+updated: 2026-10-21
 ---
 
 # `cumulative_to_delta`: a stateful transform that turns cumulative sums, histograms, and summaries into deltas
 
 ## Status
-Accepted. Not yet built: [`docs/plans/ddotlp.md`](../plans/ddotlp.md)'s W2 builds it.
+Accepted. Built by [`docs/plans/ddotlp.md`](../plans/ddotlp.md)'s W2, in
+`crates/logit-transforms/src/cumulative_to_delta.rs`; the plan's W2 findings record where the
+build settled a case this record leaves open.
 
 ## Context
 Several destinations take only delta temporality for an accumulating metric, and `logit` has no

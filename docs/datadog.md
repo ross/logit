@@ -129,7 +129,7 @@ Datadog series whichever way it went
 | `Gauge` | a `gauge` |
 | delta `Histogram` | a distribution, bin for bin as the exporter builds it; under `histograms.mode: counters`, a `<name>.bucket` count per bucket |
 | delta `ExponentialHistogram` | a distribution |
-| `Summary` | `<name>.quantile` gauges |
+| `Summary` | `<name>.quantile` gauges; for a delta one, also `<name>.count` and `<name>.sum` counts |
 
 `histograms.send_aggregation_metrics: true` adds `<name>.count`, `<name>.sum`, `<name>.min`, and
 `<name>.max` series for each delta histogram and exponential histogram, as the exporter's setting
@@ -138,13 +138,23 @@ as written rather than Datadog's name for it, and tags come from the event's att
 resource as for every other `datadog_out` metric, not from the exporter's resource-attribute
 tables (`docs/known-gaps/datadog.md`).
 
-**Configure the SDK for delta temporality.** Most SDKs default to cumulative, and `datadog_out`
-skips a cumulative monotonic `Sum`, `Histogram`, or `ExponentialHistogram`, and a summary's
-`.count` and `.sum`, because Datadog needs them as per-interval deltas and the exporter's
-per-series differencing has no stage in `logit` yet. Each is counted
-(`logit.output.metrics.skipped{metric_kind}`, `logit.output.fields.omitted{reason="unresolved_cumulative"}`),
-with a throttled `unresolved_cumulative` warning. In an OTel SDK that's the
-`OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE=delta` environment variable.
+**Convert cumulative metrics to delta first.** Most SDKs default to cumulative temporality, and
+Datadog needs a monotonic `Sum`, a `Histogram`, an `ExponentialHistogram`, and a summary's
+`.count` and `.sum` as per-interval deltas. The exporter differences them against a per-series
+cache; in `logit`, place a `cumulative_to_delta` between `otlp_in` and `datadog_out`, which keeps
+that state ([ADR `cumulative-to-delta-transform`](adr/cumulative-to-delta-transform.md),
+[fixtures/otlp-to-datadog.yaml](../fixtures/otlp-to-datadog.yaml)). Without it, `datadog_out`
+drops each, counted `logit.output.metrics.dropped{reason="unresolved_cumulative"}` or, for a
+summary's two series, `logit.output.fields.dropped{reason="unresolved_cumulative"}`, with a
+throttled `unresolved_cumulative` warning. The other remedy is to configure the SDK for delta
+temporality, with the `OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE=delta` environment
+variable.
+
+`cumulative_to_delta` keeps its state in memory. After a restart of `logit`, each series' first
+point only records a baseline under the default `initial_value: auto`, so the counts between the
+last point before the restart and the first after it are lost. A delta point resent after a
+transport error double-counts at Datadog's sketch route, though a series `count` point
+overwrites at its series and timestamp.
 
 ### From Datadog: dual-ship, tee, then cut over
 

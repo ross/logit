@@ -2956,10 +2956,12 @@ The `histograms:` block takes the exporter's settings under its names:
 ```
 
 `mode: nobuckets` needs `send_aggregation_metrics: true`, or a histogram sends nothing, so it's
-rejected at startup. A cumulative counter, histogram, or exponential histogram is skipped, counted
-`logit.output.metrics.skipped{metric_kind}` with a throttled `unresolved_cumulative` warning, as
-is a summary's count and sum (`logit.output.fields.omitted{reason="unresolved_cumulative"}`):
-Datadog needs them as per-interval deltas. Set the SDK to delta temporality
+rejected at startup. Datadog needs a counter, a histogram, an exponential histogram, and a
+summary's count and sum as per-interval deltas. A cumulative one is dropped, counted
+`logit.output.metrics.dropped{reason="unresolved_cumulative"}` (a summary's count and sum
+`logit.output.fields.dropped{reason="unresolved_cumulative"}`) with a throttled
+`unresolved_cumulative` warning. Place a `cumulative_to_delta` ahead of the sink, or set the SDK
+to delta temporality
 ([`docs/datadog.md`](datadog.md#otel-metrics-to-datadog-otlp_in-into-datadog_out)).
 
 **Compression.** `compression: gzip`, the default, gzips every body except two. Distribution
