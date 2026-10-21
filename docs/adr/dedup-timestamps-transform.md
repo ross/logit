@@ -142,9 +142,14 @@ dropped.
 A passed-through record reaches the sink as a duplicate of the survivor, and a sink that can't
 hold both drops it and counts it as loss: in remote-write mode,
 `logit.output.metrics.dropped{reason="duplicate_timestamp"}` after
-[the sink-side counter](#the-sink-side-counter) change. That's intended. A record that can't be
-merged is broken input, such as a `NaN` increment, two layouts for one series, or a total past
-the integer range, so its loss is reported as loss, not as an outcome the config asked for.
+[the sink-side counter](#the-sink-side-counter) change. That's intended. A record passed through
+for any reason but `no_recorded_value` is broken input, such as a `NaN` increment, two layouts for
+one series, or a total past the integer range, so its loss is reported as loss, not as an outcome
+the config asked for. A stale marker beside delta values isn't broken input. It passes through so
+that no increment is lost, and neither sink drops the pair as a duplicate: `prometheus_out`'s
+remote-write writes a flagged delta `Sum` as a stale marker and drops the unflagged delta,
+counted `dropped{reason="unresolved_delta"}`, and `datadog_out` skips the marker, counted
+`skipped{reason="no_recorded_value"}`, and sends the delta.
 
 `GaugeDelta` passes through because merging it would reorder it. A statsd gauge's `Gauge` and
 `GaugeDelta` share one accumulator in `aggregate`, which applies each delta in arrival order on
