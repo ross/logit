@@ -1,0 +1,31 @@
+{
+ "content_type": "application/openmetrics-text; version=1.0.0; charset=utf-8",
+ "entries": [
+  {
+   "kind": "type",
+   "name": "a",
+   "value": "counter"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "a_total",
+   "value": "0x3ff0000000000000"
+  },
+  {
+   "kind": "type",
+   "name": "c",
+   "value": "counter"
+  }
+ ],
+ "error": {
+  "after_entry": 3,
+  "message": "expected equal, got \".\" (\"INVALID\") while parsing: \"c_total 2 # {customer.\""
+ },
+ "input": {
+  "crc32c": "0x7a012610",
+  "len": 87,
+  "path": "differential/prometheus-text/cases/om-exemplar-label-unsafe.om"
+ },
+ "parser": "openmetrics"
+}

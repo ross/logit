@@ -1116,32 +1116,22 @@ rows:
     feature: exemplar_key_unsafe
     cells:
       prometheus_out:
-        - when: {bind: null}
-          class: exact
-          text: >-
-            Remote-write carries an exemplar's label names as written, unsanitized, and
-            prometheus_in reads them back.
-        - class: dropped
-          reason: uncounted
-          text: >-
-            An exemplar's attribute keys are written as label names unsanitized, so a key such as
-            `customer.tier` makes the counter's `_total` line invalid OpenMetrics, and
-            prometheus_in drops the line and the counter with it. The sink counts nothing.
+        class: normalized
+        reason: name_sanitized
+        text: >-
+          An exemplar's attribute key is written as a label name forced into
+          `[a-zA-Z_][a-zA-Z0-9_]*`, each other character `_`, as a series label's is, so the
+          exemplar reads back under the sanitized key, uncounted.
   - kind: record
     feature: exemplar_key_unsafe_histogram
     cells:
       prometheus_out:
-        - when: {bind: null}
-          class: exact
-          text: >-
-            Remote-write carries an exemplar's label names as written, unsanitized, and
-            prometheus_in reads them back.
-        - class: degraded
-          text: >-
-            An exemplar's attribute keys are written as label names unsanitized, so a key such as
-            `db.operation.name` makes the `_bucket` line its value falls in invalid OpenMetrics.
-            prometheus_in drops that line, so the bucket's count reads back in the next bucket,
-            uncounted.
+        class: normalized
+        reason: name_sanitized
+        text: >-
+          An exemplar's attribute key is written as a label name forced into
+          `[a-zA-Z_][a-zA-Z0-9_]*`, each other character `_`, as a series label's is, so the
+          exemplar reads back on its bucket under the sanitized key, uncounted.
   - kind: record
     feature: sample_rate
     cells:
