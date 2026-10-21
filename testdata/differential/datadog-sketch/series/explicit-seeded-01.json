@@ -1,0 +1,70 @@
+{
+  "name": "seeded-01",
+  "kind": "explicit",
+  "input": {
+    "bounds": ["6344.483636075822", "6345.324990202715", "6347.207495861124"],
+    "counts": [0, 1084, 488, 130227],
+    "count": 131799,
+    "sum": "-4638.422068294218",
+    "min": "6344.227983630176",
+    "max": "6353.907382824644"
+  },
+  "series": [
+    {
+      "name": "case.count",
+      "tags": [],
+      "type": "count",
+      "value": "131799",
+      "unit": ""
+    },
+    {
+      "name": "case.sum",
+      "tags": [],
+      "type": "count",
+      "value": "-4638.422068294218",
+      "unit": "millisecond"
+    },
+    {
+      "name": "case.min",
+      "tags": [],
+      "type": "gauge",
+      "value": "6344.227983630176",
+      "unit": "millisecond"
+    },
+    {
+      "name": "case.max",
+      "tags": [],
+      "type": "gauge",
+      "value": "6353.907382824644",
+      "unit": "millisecond"
+    },
+    {
+      "name": "case.bucket",
+      "tags": ["lower_bound:-inf", "upper_bound:6344.483636075822"],
+      "type": "count",
+      "value": "0",
+      "unit": ""
+    },
+    {
+      "name": "case.bucket",
+      "tags": ["lower_bound:6344.483636075822", "upper_bound:6345.324990202715"],
+      "type": "count",
+      "value": "1084",
+      "unit": ""
+    },
+    {
+      "name": "case.bucket",
+      "tags": ["lower_bound:6345.324990202715", "upper_bound:6347.207495861124"],
+      "type": "count",
+      "value": "488",
+      "unit": ""
+    },
+    {
+      "name": "case.bucket",
+      "tags": ["lower_bound:6347.207495861124", "upper_bound:inf"],
+      "type": "count",
+      "value": "130227",
+      "unit": ""
+    }
+  ]
+}

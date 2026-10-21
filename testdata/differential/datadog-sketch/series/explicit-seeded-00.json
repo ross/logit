@@ -1,0 +1,84 @@
+{
+  "name": "seeded-00",
+  "kind": "explicit",
+  "input": {
+    "bounds": ["0", "31.45638838694428", "37.00116369792489", "39.5236108420823", "40.306196046505505"],
+    "counts": [0, 1539, 1033, 1342, 265291, 262093],
+    "count": 531298,
+    "sum": "15309.643352905783",
+    "min": "-0.4078023213929488",
+    "max": "45.066326849882515"
+  },
+  "series": [
+    {
+      "name": "case.count",
+      "tags": [],
+      "type": "count",
+      "value": "531298",
+      "unit": ""
+    },
+    {
+      "name": "case.sum",
+      "tags": [],
+      "type": "count",
+      "value": "15309.643352905783",
+      "unit": "millisecond"
+    },
+    {
+      "name": "case.min",
+      "tags": [],
+      "type": "gauge",
+      "value": "-0.4078023213929488",
+      "unit": "millisecond"
+    },
+    {
+      "name": "case.max",
+      "tags": [],
+      "type": "gauge",
+      "value": "45.066326849882515",
+      "unit": "millisecond"
+    },
+    {
+      "name": "case.bucket",
+      "tags": ["lower_bound:-inf", "upper_bound:0"],
+      "type": "count",
+      "value": "0",
+      "unit": ""
+    },
+    {
+      "name": "case.bucket",
+      "tags": ["lower_bound:0", "upper_bound:31.45638838694428"],
+      "type": "count",
+      "value": "1539",
+      "unit": ""
+    },
+    {
+      "name": "case.bucket",
+      "tags": ["lower_bound:31.45638838694428", "upper_bound:37.00116369792489"],
+      "type": "count",
+      "value": "1033",
+      "unit": ""
+    },
+    {
+      "name": "case.bucket",
+      "tags": ["lower_bound:37.00116369792489", "upper_bound:39.5236108420823"],
+      "type": "count",
+      "value": "1342",
+      "unit": ""
+    },
+    {
+      "name": "case.bucket",
+      "tags": ["lower_bound:39.5236108420823", "upper_bound:40.306196046505505"],
+      "type": "count",
+      "value": "265291",
+      "unit": ""
+    },
+    {
+      "name": "case.bucket",
+      "tags": ["lower_bound:40.306196046505505", "upper_bound:inf"],
+      "type": "count",
+      "value": "262093",
+      "unit": ""
+    }
+  ]
+}

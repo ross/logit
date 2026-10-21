@@ -101,7 +101,8 @@
 //!
 //! ## Encode: events → series, distribution points, sketches
 //!
-//! One series (or sketch) per `(event, MetricRecord)`, carrying one point. Carriers are read from
+//! One series (or sketch) per `(event, MetricRecord)`, carrying one point, but for the series a
+//! histogram or summary expands to (below). Carriers are read from
 //! the resource merged with the event's attributes (event wins); every other attribute renders as
 //! a tag by [`tags`]'s rule. A `Map`/`Bytes`/`Null` tag value, or a carrier of the wrong `Value`
 //! type, counts `logit.output.tags.omitted{reason="unrepresentable"}`.
@@ -123,9 +124,9 @@
 //! | Row | Class | Reason or counter | What a consumer sees |
 //! |---|---|---|---|
 //! | `sum/delta_monotonic` | exact | -- | A series `count` point, its `interval` from the `_logit.datadog.interval` carrier or 0, which datadog_in reads back as a delta monotonic sum. |
-//! | `sum/delta_nonmonotonic` | skipped | `logit.output.metrics.skipped{metric_kind=non_monotonic_delta_sum}` | A Datadog `count` is a monotonic per-interval value, so a non-monotonic delta sum isn't written. |
-//! | `sum/cumulative_monotonic` | skipped | `logit.output.metrics.skipped{metric_kind=cumulative_sum}` | A Datadog `count` carries a per-interval value, so a running total isn't written. |
-//! | `sum/cumulative_nonmonotonic` | skipped | `logit.output.metrics.skipped{metric_kind=cumulative_sum}` | A running total isn't written, as for a monotonic one. |
+//! | `sum/delta_nonmonotonic` | degraded | `logit.output.metrics.degraded{metric_kind=non_monotonic_sum}` | A series `count` point of the raw value, as Datadog's exporter sends any delta sum, which datadog_in reads back as a monotonic delta sum. |
+//! | `sum/cumulative_monotonic` | dropped | `logit.output.metrics.dropped{reason=unresolved_cumulative}` | Datadog's exporter differences a running total into a delta first, so it's dropped, with a throttled `unresolved_cumulative` warning; a `cumulative_to_delta` upstream makes it a delta `count`. |
+//! | `sum/cumulative_nonmonotonic` | degraded | `logit.output.metrics.degraded{metric_kind=non_monotonic_sum}` | A series `gauge` point of the running value, as Datadog's exporter sends it, which datadog_in reads back as a gauge. |
 //! | `sum/f64` | exact | -- | The point's double. |
 //! | `sum/i64` | normalized | `integer_as_double` | The point's double, the integer's nearest `f64`, read back as a float. |
 //! | `sum/u64` | normalized | `integer_as_double` | The point's double, the integer's nearest `f64`, read back as a float. |
@@ -143,11 +144,14 @@
 //! | `set_members` | skipped | `logit.output.metrics.skipped{metric_kind=set_members}` | The series encoders have no form for set members, so none is written. |
 //! | `distribution` | exact | -- | A sketch under `Mapping::agent`, bin for bin, with its exact count, sum, min, and max; `avg` is recomputed from them. |
 //! | `set` | degraded | `logit.output.metrics.degraded{reason=set_estimate}` | A series `gauge` of the estimate, the Agent's `s`; the registers are gone. |
-//! | `histogram/delta` | skipped | `logit.output.metrics.skipped{metric_kind=histogram}` | The series encoders have no histogram, so none is written; `docs/known-gaps/datadog.md`'s "`datadog_out` sends no Agent-style `h`/`ms` aggregates" entry has the follow-up. |
-//! | `histogram/cumulative` | skipped | `logit.output.metrics.skipped{metric_kind=histogram}` | The series encoders have no histogram, so none is written. |
-//! | `exponential_histogram/delta` | skipped | `logit.output.metrics.skipped{metric_kind=exponential_histogram}` | The series encoders have no exponential histogram, so none is written. |
-//! | `exponential_histogram/cumulative` | skipped | `logit.output.metrics.skipped{metric_kind=exponential_histogram}` | The series encoders have no exponential histogram, so none is written. |
-//! | `summary` | skipped | `logit.output.metrics.skipped{metric_kind=summary}` | The series encoders have no summary, so none is written. |
+//! | `histogram/delta`, under `histograms: {"mode":"counters","send_aggregation_metrics":true}` | degraded | `logit.output.metrics.degraded{metric_kind=histogram}` | Under `histograms.mode: counters`, a `<name>.bucket` count per bucket tagged `lower_bound` and `upper_bound` in the exporter's `formatFloat` form, beside the `.count`, `.sum`, `.min`, and `.max` series. |
+//! | `histogram/delta`, under `histograms: {"mode":"nobuckets","send_aggregation_metrics":true}` | degraded | `logit.output.metrics.degraded{metric_kind=histogram}` | Under `histograms.mode: nobuckets`, the `.count`, `.sum`, `.min`, and `.max` series alone. |
+//! | `histogram/delta`, otherwise | degraded | `logit.output.metrics.degraded{metric_kind=histogram}` | A sketch under `Mapping::agent` with its counts spread over the buckets as Datadog's exporter spreads them, and the point's count, sum, and average, which datadog_in reads back as a distribution. |
+//! | `histogram/cumulative` | dropped | `logit.output.metrics.dropped{reason=unresolved_cumulative}` | Datadog's exporter differences a running total into a delta first, so it's dropped, with a throttled `unresolved_cumulative` warning; a `cumulative_to_delta` upstream makes it a delta histogram. |
+//! | `exponential_histogram/delta` | degraded | `logit.output.metrics.degraded{metric_kind=exponential_histogram}` | A sketch under every `histograms.mode`, its buckets re-mapped onto the Agent's bins as Datadog's exporter re-maps them, with the point's count, sum, and average, which datadog_in reads back as a distribution; with `send_aggregation_metrics`, the `.count`, `.sum`, `.min`, and `.max` series too. |
+//! | `exponential_histogram/cumulative` | dropped | `logit.output.metrics.dropped{reason=unresolved_cumulative}` | Datadog's exporter can't send a cumulative exponential histogram, so it's dropped, with a throttled `unresolved_cumulative` warning; a `cumulative_to_delta` upstream makes it a delta one. |
+//! | `summary/delta` | degraded | -- | A `<name>.quantile` gauge per quantile tagged `quantile:<q>`, and `.count` (no unit) and `.sum` as `count` points, as Datadog's exporter writes a summary it differenced; datadog_in reads them back as gauges and counts. |
+//! | `summary/cumulative` | degraded | `logit.output.fields.dropped{reason=unresolved_cumulative}` | A `<name>.quantile` gauge per quantile tagged `quantile:<q>`, which datadog_in reads back as gauges. The running count and sum need differencing first, so they're dropped, counted, with a throttled `unresolved_cumulative` warning; a `cumulative_to_delta` upstream makes them sendable. |
 //! | `record/no_recorded_value` | skipped | `logit.output.metrics.skipped{reason=no_recorded_value}` | Datadog has no marker for a point with no recorded value, so it isn't written. |
 //! | `record/no_recorded_value_delta_sum` | skipped | `logit.output.metrics.skipped{reason=no_recorded_value}` | Datadog has no marker for a point with no recorded value, so it isn't written. |
 //! | `record/no_recorded_value_other_kind` | skipped | `logit.output.metrics.skipped{reason=no_recorded_value}` | Datadog has no marker for a point with no recorded value, so it isn't written. |
@@ -200,11 +204,20 @@
 //!
 //! | Model | Wire | Counter |
 //! |---|---|---|
-//! | `Distribution` under `Mapping::agent` | a sketch only: `Dogsketch{ts, cnt, min, max, avg: sum/cnt, sum, k, n}`, `k` ascending (negative bins from the largest magnitude as `-key`, then `0`, then positive), a count above 65535 split into repeated entries | -- |
+//! | `Distribution` under `Mapping::agent` | a sketch only: `Dogsketch{ts, cnt, min, max, avg: sum/cnt, sum, k, n}`, `k` ascending (negative bins from the largest magnitude as `-key`, then `0`, then positive), a count above 65535 split into repeated entries, the remainder first | -- |
 //! | `Distribution` under a logarithmic mapping | re-binned into `Mapping::agent` at each bin's representative value, summary kept | `degraded{reason="rebinned"}` |
 //! | a sketch bin with a fractional count | rounded; a bin rounding to 0 is omitted | `degraded{reason="fractional_count"}`, once per sketch |
 //! | a `Distribution` with no bins and zero count | skipped | `logit.output.metrics.skipped{reason="empty_sketch"}` |
 //! | a `Distribution` whose counts split into more than [`sketches::MAX_DOGSKETCH_ENTRIES`] `k`/`n` entries | dropped | `logit.output.metrics.dropped{reason="oversized_sketch"}` + diag `oversized_sketch` |
+//! | a delta `Histogram` under `histograms.mode: distributions`, and every delta `ExponentialHistogram` | a sketch built as Datadog's exporter builds it (`logit_core::sketch::from_otlp`): `Dogsketch{cnt, min, max, avg, sum}` the converter's own summary, `avg` included | `degraded{metric_kind}` |
+//! | such a histogram that can't be sketched | none: no observations; more than 4,096 × 65,535 of them; a bucket whose upper bound keys below its lower; an exponential histogram past the Agent's key range | `skipped{reason="empty_sketch"}`; `dropped{reason="oversized_sketch"}` + diag `oversized_sketch`; `dropped{reason="non_monotonic_bounds"}`; `dropped{reason="sketch_range"}` |
+//! | a delta `Histogram` under `histograms.mode: counters` | a `<name>.bucket` series `count` per bucket, empty buckets included, tagged `lower_bound:` and `upper_bound:` in the exporter's `formatFloat` form ([`series::format_float`]), with no unit | `degraded{metric_kind="histogram"}` |
+//! | `histograms.send_aggregation_metrics` on a delta `Histogram` or `ExponentialHistogram` | `<name>.count` (a `count`, no unit, the buckets' total or the record's `count`) and `<name>.sum` (a `count`), then `<name>.min` and `<name>.max` gauges where the record has them, ahead of any `.bucket` series; none when the sum is absent or non-finite, and none for an exponential histogram past the observation cap, as the exporter drops it whole | `fields.omitted{reason="no_sum"}` for a missing sum |
+//! | a cumulative `Summary` | a `<name>.quantile` gauge per quantile tagged `quantile:` in `formatFloat`'s form, with the record's unit; no `.count` or `.sum`, since they're running totals | `fields.dropped{reason="unresolved_cumulative"}` + diag `unresolved_cumulative`, once per summary |
+//! | a delta `Summary` (from `cumulative_to_delta`) | the `.quantile` gauges, then `<name>.count` (a `count`, no unit) and `<name>.sum` (a `count`, the record's unit), as the exporter's `MapSummaryMetrics` writes a summary it differenced | -- |
+//! | a cumulative monotonic `Sum`, cumulative `Histogram`, or cumulative `ExponentialHistogram` | dropped: Datadog's exporter differences it into a delta first; a `cumulative_to_delta` upstream does that | `dropped{reason="unresolved_cumulative"}` + diag `unresolved_cumulative` |
+//! | a series whose tags, the event's and its own (a `.bucket` series' bounds, a `.quantile` series' quantile), pass [`MAX_METRIC_TAGS`] | left off; [`series::series_over_tag_limit`] counts it for `datadog_out`, which counts it `records.dropped{reason="too_many_tags"}` before encoding | -- |
+//! | a record flagged `NO_RECORDED_VALUE` that a sketch route would carry | skipped once, by the sketches route; the series route leaves its aggregation series off, uncounted | `skipped{reason="no_recorded_value"}` |
 //! | a kind another metrics route carries | left for that route, uncounted: only the series encoders count skips, and only of kinds no route carries | -- |
 //! | record 0 of a service check (`_logit.statsd.service_check.name` present and a `Gauge` first metric) | left for the service-checks route, uncounted; any later record encodes as usual, without the check's `_logit.statsd.service_check.*` carriers as tags | -- |
 //! | every record of an APM stats event ([`stats::ATTR_STATS_NAME`] present; [`is_datadog_stats`]) | left for the stats routes, uncounted: its `Sum`s and summary `Distribution`s are a stats group, not series or sketches | -- |
@@ -991,6 +1004,34 @@ pub struct DatadogEncoder {
     /// The host of a series, sketch, log, event, or service check that carries none of its own;
     /// `None` leaves it empty or absent.
     default_host: Option<Arc<str>>,
+    histograms: HistogramOptions,
+}
+
+/// The most `tags` strings one series, distribution point, or sketch may carry: Datadog's intake
+/// drops a metric with more, so `datadog_out` drops it first and counts it. Measured on a trial org
+/// on 2026-10-08: 100 tags were stored and 101 dropped, duplicates counted and `resources` not; the
+/// series route names the drop in its `202` body, and the other two drop it silently.
+pub const MAX_METRIC_TAGS: usize = 100;
+
+/// How a delta `Histogram` is written, the Datadog exporter's `histograms.mode`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum HistogramMode {
+    /// One sketch per record, bin for bin as the exporter's translator builds it.
+    #[default]
+    Distributions,
+    /// One `<name>.bucket` count series per bucket, tagged with its bounds.
+    Counters,
+    /// No bucket output; the aggregation series alone.
+    NoBuckets,
+}
+
+/// The Datadog exporter's `histograms:` settings, which apply to `Histogram` and, for
+/// `send_aggregation_metrics`, to `ExponentialHistogram` records.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HistogramOptions {
+    pub mode: HistogramMode,
+    /// Adds `<name>.count`, `<name>.sum`, `<name>.min`, and `<name>.max` series.
+    pub send_aggregation_metrics: bool,
 }
 
 impl DatadogEncoder {
@@ -1019,6 +1060,15 @@ impl DatadogEncoder {
     pub fn with_default_host(mut self, host: Option<Arc<str>>) -> Self {
         self.default_host = host;
         self
+    }
+
+    pub fn with_histograms(mut self, histograms: HistogramOptions) -> Self {
+        self.histograms = histograms;
+        self
+    }
+
+    pub fn histograms(&self) -> HistogramOptions {
+        self.histograms
     }
 }
 

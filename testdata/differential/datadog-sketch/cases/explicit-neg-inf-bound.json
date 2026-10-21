@@ -1,0 +1,22 @@
+{
+  "name": "neg-inf-bound",
+  "kind": "explicit",
+  "input": {
+    "bounds": ["-Inf", "5", "10"],
+    "counts": [2, 3, 4, 1],
+    "count": 10,
+    "sum": "40",
+    "min": null,
+    "max": null
+  },
+  "outcome": "sketch",
+  "sketch": {
+    "k": [-1, 1442, 1457, 1469, 1479, 1487],
+    "n": [2, 4, 1, 1, 1, 1],
+    "cnt": 10,
+    "sum": "40",
+    "min": "-9.941854089121368e-10",
+    "max": "10.075671884115119",
+    "avg": "4"
+  }
+}

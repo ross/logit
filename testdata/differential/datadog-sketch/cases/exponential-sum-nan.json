@@ -1,0 +1,30 @@
+{
+  "name": "sum-nan",
+  "kind": "exponential",
+  "input": {
+    "scale": 4,
+    "zero_count": 0,
+    "positive": {
+      "offset": 0,
+      "counts": [5, 6, 7]
+    },
+    "negative": {
+      "offset": 0,
+      "counts": []
+    },
+    "count": 18,
+    "sum": "NaN",
+    "min": null,
+    "max": null
+  },
+  "outcome": "sketch",
+  "sketch": {
+    "k": [1338, 1339, 1340, 1341, 1342, 1343, 1344, 1345, 1346],
+    "n": [1, 2, 1, 2, 3, 2, 2, 3, 2],
+    "cnt": 18,
+    "sum": "19.314704141689997",
+    "min": "0.9999699532773395",
+    "max": "1.132019770929222",
+    "avg": "1.0730391189827777"
+  }
+}

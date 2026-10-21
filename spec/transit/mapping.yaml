@@ -82,11 +82,11 @@ rows:
         class: exact
         text: An OTLP `Sum` with delta temporality, not monotonic.
       datadog_out:
-        class: skipped
-        counter: logit.output.metrics.skipped{metric_kind=non_monotonic_delta_sum}
+        class: degraded
+        counter: logit.output.metrics.degraded{metric_kind=non_monotonic_sum}
         text: >-
-          A Datadog `count` is a monotonic per-interval value, so a non-monotonic delta sum isn't
-          written.
+          A series `count` point of the raw value, as Datadog's exporter sends any delta sum, which
+          datadog_in reads back as a monotonic delta sum.
   - kind: sum
     feature: cumulative_monotonic
     cells:
@@ -115,10 +115,12 @@ rows:
         class: exact
         text: An OTLP `Sum` with cumulative temporality and the monotonic flag.
       datadog_out:
-        class: skipped
-        counter: logit.output.metrics.skipped{metric_kind=cumulative_sum}
+        class: dropped
+        counter: logit.output.metrics.dropped{reason=unresolved_cumulative}
         text: >-
-          A Datadog `count` carries a per-interval value, so a running total isn't written.
+          Datadog's exporter differences a running total into a delta first, so it's dropped,
+          with a throttled `unresolved_cumulative` warning; a `cumulative_to_delta` upstream
+          makes it a delta `count`.
   - kind: sum
     feature: cumulative_nonmonotonic
     cells:
@@ -143,10 +145,11 @@ rows:
         class: exact
         text: An OTLP `Sum` with cumulative temporality, not monotonic.
       datadog_out:
-        class: skipped
-        counter: logit.output.metrics.skipped{metric_kind=cumulative_sum}
+        class: degraded
+        counter: logit.output.metrics.degraded{metric_kind=non_monotonic_sum}
         text: >-
-          A running total isn't written, as for a monotonic one.
+          A series `gauge` point of the running value, as Datadog's exporter sends it, which
+          datadog_in reads back as a gauge.
 
   # --- sum: scalar type ------------------------------------------------------------------------
   - kind: sum
@@ -688,11 +691,25 @@ rows:
         class: exact
         text: An OTLP `Histogram` with delta temporality.
       datadog_out:
-        class: skipped
-        counter: logit.output.metrics.skipped{metric_kind=histogram}
-        text: >-
-          The series encoders have no histogram, so none is written; `docs/known-gaps/datadog.md`'s
-          "`datadog_out` sends no Agent-style `h`/`ms` aggregates" entry has the follow-up.
+        - when: {histograms: {mode: counters, send_aggregation_metrics: true}}
+          class: degraded
+          counter: logit.output.metrics.degraded{metric_kind=histogram}
+          text: >-
+            Under `histograms.mode: counters`, a `<name>.bucket` count per bucket tagged
+            `lower_bound` and `upper_bound` in the exporter's `formatFloat` form, beside the
+            `.count`, `.sum`, `.min`, and `.max` series.
+        - when: {histograms: {mode: nobuckets, send_aggregation_metrics: true}}
+          class: degraded
+          counter: logit.output.metrics.degraded{metric_kind=histogram}
+          text: >-
+            Under `histograms.mode: nobuckets`, the `.count`, `.sum`, `.min`, and `.max` series
+            alone.
+        - class: degraded
+          counter: logit.output.metrics.degraded{metric_kind=histogram}
+          text: >-
+            A sketch under `Mapping::agent` with its counts spread over the buckets as Datadog's
+            exporter spreads them, and the point's count, sum, and average, which datadog_in reads
+            back as a distribution.
   - kind: histogram
     feature: cumulative
     cells:
@@ -727,10 +744,12 @@ rows:
           last bound is finite reads back with an empty `+Inf` bucket. `min` and `max` are
           `record/min_max`'s.
       datadog_out:
-        class: skipped
-        counter: logit.output.metrics.skipped{metric_kind=histogram}
+        class: dropped
+        counter: logit.output.metrics.dropped{reason=unresolved_cumulative}
         text: >-
-          The series encoders have no histogram, so none is written.
+          Datadog's exporter differences a running total into a delta first, so it's dropped,
+          with a throttled `unresolved_cumulative` warning; a `cumulative_to_delta` upstream
+          makes it a delta histogram.
   - kind: exponential_histogram
     feature: delta
     cells:
@@ -764,10 +783,13 @@ rows:
         class: exact
         text: An OTLP `ExponentialHistogram`, field for field.
       datadog_out:
-        class: skipped
-        counter: logit.output.metrics.skipped{metric_kind=exponential_histogram}
+        class: degraded
+        counter: logit.output.metrics.degraded{metric_kind=exponential_histogram}
         text: >-
-          The series encoders have no exponential histogram, so none is written.
+          A sketch under every `histograms.mode`, its buckets re-mapped onto the Agent's bins as
+          Datadog's exporter re-maps them, with the point's count, sum, and average, which
+          datadog_in reads back as a distribution; with `send_aggregation_metrics`, the `.count`,
+          `.sum`, `.min`, and `.max` series too.
   - kind: exponential_histogram
     feature: cumulative
     cells:
@@ -797,11 +819,55 @@ rows:
         class: exact
         text: An OTLP `ExponentialHistogram`, field for field.
       datadog_out:
-        class: skipped
-        counter: logit.output.metrics.skipped{metric_kind=exponential_histogram}
+        class: dropped
+        counter: logit.output.metrics.dropped{reason=unresolved_cumulative}
         text: >-
-          The series encoders have no exponential histogram, so none is written.
+          Datadog's exporter can't send a cumulative exponential histogram, so it's dropped, with
+          a throttled `unresolved_cumulative` warning; a `cumulative_to_delta` upstream makes it a
+          delta one.
   - kind: summary
+    feature: delta
+    cells:
+      statsd_out:
+        - when: {multi_value: skip}
+          class: skipped
+          counter: logit.output.metrics.skipped{metric_kind=summary}
+          text: 'Under `multi_value: skip`, no line is written.'
+        - class: degraded
+          counter: logit.output.metrics.degraded{metric_kind=summary}
+          text: >-
+            Dotted `.count` and `.sum` counters, which a statsd server sums across flushes as it
+            does a delta histogram's, and per-quantile gauges.
+      prometheus_out:
+        class: dropped
+        counter: logit.output.metrics.dropped{reason=unresolved_delta}
+        text: >-
+          A Prometheus summary is a running total, so a delta one, which only
+          `cumulative_to_delta` makes, is dropped, with a throttled `delta_summary_unresolved`
+          warning; send this sink the summary from ahead of that component.
+      influxdb_out:
+        class: degraded
+        text: >-
+          Telegraf's shape: float `count` and `sum` fields and a field per quantile named by the
+          quantile (`0.5`, `0.99`), each read back as a gauge under `<name>.`. Line protocol has
+          no temporality, so a delta summary writes as a cumulative one does. When every
+          component is finite, nothing is counted. A non-finite `sum`, quantile, or quantile value
+          is left off the line, and the record counts once as
+          `logit.output.metrics.degraded{reason=non_finite_component}`.
+      otlp_out:
+        class: dropped
+        counter: logit.output.metrics.dropped{reason=unresolved_delta}
+        text: >-
+          OTLP defines every summary as cumulative, so a delta one is dropped, with a throttled
+          `delta_summary_unresolved` warning.
+      datadog_out:
+        class: degraded
+        text: >-
+          A `<name>.quantile` gauge per quantile tagged `quantile:<q>`, and `.count` (no unit) and
+          `.sum` as `count` points, as Datadog's exporter writes a summary it differenced;
+          datadog_in reads them back as gauges and counts.
+  - kind: summary
+    feature: cumulative
     cells:
       statsd_out:
         - when: {multi_value: skip}
@@ -826,10 +892,13 @@ rows:
         class: exact
         text: An OTLP `Summary`.
       datadog_out:
-        class: skipped
-        counter: logit.output.metrics.skipped{metric_kind=summary}
+        class: degraded
+        counter: logit.output.fields.dropped{reason=unresolved_cumulative}
         text: >-
-          The series encoders have no summary, so none is written.
+          A `<name>.quantile` gauge per quantile tagged `quantile:<q>`, which datadog_in reads back
+          as gauges. The running count and sum need differencing first, so they're dropped,
+          counted, with a throttled `unresolved_cumulative` warning; a `cumulative_to_delta`
+          upstream makes them sendable.
 
   # --- record fields ---------------------------------------------------------------------------
   - kind: record

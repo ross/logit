@@ -1,0 +1,108 @@
+{
+  "name": "quantile-forms",
+  "kind": "summary",
+  "input": {
+    "quantiles": [
+      ["0.25", "1"],
+      ["0.75", "2"],
+      ["0.999", "3"],
+      ["0.9999", "4"],
+      ["1e-05", "5"],
+      ["0.0001", "6"],
+      ["0.123456789", "7"],
+      ["2", "8"],
+      ["-1", "9"],
+      ["1e+21", "10"],
+      ["123456", "11"],
+      ["1.234567e+06", "12"]
+    ],
+    "count": 12,
+    "sum": "78"
+  },
+  "series": [
+    {
+      "name": "case.quantile",
+      "tags": ["quantile:0.25"],
+      "type": "gauge",
+      "value": "1",
+      "unit": "millisecond"
+    },
+    {
+      "name": "case.quantile",
+      "tags": ["quantile:0.75"],
+      "type": "gauge",
+      "value": "2",
+      "unit": "millisecond"
+    },
+    {
+      "name": "case.quantile",
+      "tags": ["quantile:0.999"],
+      "type": "gauge",
+      "value": "3",
+      "unit": "millisecond"
+    },
+    {
+      "name": "case.quantile",
+      "tags": ["quantile:0.9999"],
+      "type": "gauge",
+      "value": "4",
+      "unit": "millisecond"
+    },
+    {
+      "name": "case.quantile",
+      "tags": ["quantile:1e-05"],
+      "type": "gauge",
+      "value": "5",
+      "unit": "millisecond"
+    },
+    {
+      "name": "case.quantile",
+      "tags": ["quantile:0.0001"],
+      "type": "gauge",
+      "value": "6",
+      "unit": "millisecond"
+    },
+    {
+      "name": "case.quantile",
+      "tags": ["quantile:0.123456789"],
+      "type": "gauge",
+      "value": "7",
+      "unit": "millisecond"
+    },
+    {
+      "name": "case.quantile",
+      "tags": ["quantile:2.0"],
+      "type": "gauge",
+      "value": "8",
+      "unit": "millisecond"
+    },
+    {
+      "name": "case.quantile",
+      "tags": ["quantile:-1.0"],
+      "type": "gauge",
+      "value": "9",
+      "unit": "millisecond"
+    },
+    {
+      "name": "case.quantile",
+      "tags": ["quantile:1e+21.0"],
+      "type": "gauge",
+      "value": "10",
+      "unit": "millisecond"
+    },
+    {
+      "name": "case.quantile",
+      "tags": ["quantile:123456.0"],
+      "type": "gauge",
+      "value": "11",
+      "unit": "millisecond"
+    },
+    {
+      "name": "case.quantile",
+      "tags": ["quantile:1.234567e+06.0"],
+      "type": "gauge",
+      "value": "12",
+      "unit": "millisecond"
+    }
+  ]
+}

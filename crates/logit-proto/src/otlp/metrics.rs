@@ -47,7 +47,8 @@
 //! | `histogram/cumulative` | exact | -- | An OTLP `Histogram` with cumulative temporality. |
 //! | `exponential_histogram/delta` | exact | -- | An OTLP `ExponentialHistogram`, field for field. |
 //! | `exponential_histogram/cumulative` | exact | -- | An OTLP `ExponentialHistogram`, field for field. |
-//! | `summary` | exact | -- | An OTLP `Summary`. |
+//! | `summary/delta` | dropped | `logit.output.metrics.dropped{reason=unresolved_delta}` | OTLP defines every summary as cumulative, so a delta one is dropped, with a throttled `delta_summary_unresolved` warning. |
+//! | `summary/cumulative` | exact | -- | An OTLP `Summary`. |
 //! | `record/no_recorded_value` | exact | -- | The data point's `flags` carry `NO_RECORDED_VALUE`, and the point is kept. |
 //! | `record/no_recorded_value_delta_sum` | exact | -- | The data point's `flags` carry `NO_RECORDED_VALUE`, and the point is kept. |
 //! | `record/no_recorded_value_other_kind` | exact | -- | The data point's `flags` carry `NO_RECORDED_VALUE`, and the point is kept. |
@@ -107,7 +108,8 @@
 //!   counts, not cumulative ones, and a trailing `f64::INFINITY` bound becomes the implicit final
 //!   bucket `explicit_bounds` expects.
 //! - `Summary{quantiles,count,sum}` → `Summary`: a quantile outside `[0, 1]` is written as is;
-//!   `docs/known-gaps/mappings.md`'s "Cross-protocol semantic gaps" section has the row.
+//!   `docs/known-gaps/mappings.md`'s "Cross-protocol semantic gaps" section has the row. OTLP's
+//!   summary is cumulative by definition, so a delta one is dropped (`summary/delta` above).
 //! - `Samples(s)` and `Distribution(sketch)` → `Summary` of `DISTRIBUTION_QUANTILES` (see "Lossy
 //!   metric kinds" below). A `Samples` is sketched first (`Samples::sketch`, each value weighted
 //!   by `Samples::weight`). The point's `count` and `sum` are the sketch's own; `sum` is
@@ -128,7 +130,7 @@
 //! and `as_double` as `F64`, so `otlp_in -> otlp_out` keeps an integer point an integer. An
 //! `Exemplar`'s `as_int` and `as_double` decode the same way, and one with neither is `F64(0.0)`.
 //! `Histogram` → `Histogram{buckets,temporality,sum,min,max}`, rebuilding the trailing infinite bucket when `bucket_counts` has one more entry than
-//! `explicit_bounds` (the OTLP-mandated shape). `Summary` → `Summary{quantiles,count,sum}`, each quantile read with no range check.
+//! `explicit_bounds` (the OTLP-mandated shape). `Summary` → `Summary{quantiles,count,sum}`, `Cumulative`, each quantile read with no range check.
 //! `ExponentialHistogram` → `ExponentialHistogram` field for field (scale, zero count and
 //! threshold, positive and negative offset and bucket counts, temporality, count, sum/min/max),
 //! with no bucket materialization.
@@ -296,7 +298,7 @@ fn number_value(value: Option<pb::number_data_point::Value>) -> MetricValue {
 }
 
 /// Encodes one `(Event, MetricRecord)` pair into one OTLP `Metric`, or `None` for a skipped
-/// `Set`/`SetMembers`/`GaugeDelta` (counted; see the module doc).
+/// `Set`/`SetMembers`, or a dropped `GaugeDelta` or delta `Summary` (counted; see the module doc).
 pub(crate) fn encode_metric(
     event: &Event,
     record: &MetricRecord,
@@ -385,6 +387,19 @@ pub(crate) fn encode_metric(
                 }],
                 aggregation_temporality: temporality_to_pb(e.temporality),
             })
+        }
+        // OTLP defines every summary as cumulative, so a delta one, which only
+        // `cumulative_to_delta` makes, has no form here.
+        MetricKind::Summary(s) if s.temporality == Temporality::Delta => {
+            telemetry.count("logit.output.metrics.dropped", 1.0, &[("reason", "unresolved_delta")]);
+            diagnostics.warn_throttled(
+                "delta_summary_unresolved",
+                format_args!(
+                    "metric '{name}' is a delta summary, which OTLP cannot express -- route the \
+                     summary to this output from ahead of the `cumulative_to_delta` component"
+                ),
+            );
+            return None;
         }
         MetricKind::Summary(s) => pb::metric::Data::Summary(pb::Summary {
             data_points: vec![pb::SummaryDataPoint {
@@ -596,7 +611,13 @@ pub(crate) fn decode_metric(
                 let start_timestamp = common::wire_nanos(dp.start_time_unix_nano);
                 let flags = dp.flags;
                 common::key_values_into_attrs(dp.attributes, &mut attrs);
-                let kind = MetricKind::Summary(Summary { quantiles, count: dp.count, sum: dp.sum });
+                // OTLP defines every summary as cumulative.
+                let kind = MetricKind::Summary(Summary {
+                    quantiles,
+                    count: dp.count,
+                    sum: dp.sum,
+                    temporality: Temporality::Cumulative,
+                });
                 // `SummaryDataPoint` has no `exemplars` field.
                 let rec = record(kind, start_timestamp, flags, Vec::new());
                 Event::metric(ts, attrs, rec)
@@ -795,7 +816,12 @@ mod tests {
     #[test]
     fn a_summary_quantile_outside_the_unit_interval_passes_through_unchanged() {
         // Documented gap (`docs/known-gaps/mappings.md`): neither direction range-checks a quantile.
-        let s = Summary { quantiles: vec![(1.5, 10.0), (-0.25, 1.0)], count: 2, sum: 11.0 };
+        let s = Summary {
+            quantiles: vec![(1.5, 10.0), (-0.25, 1.0)],
+            count: 2,
+            sum: 11.0,
+            temporality: Temporality::Cumulative,
+        };
         let metric = encode(MetricKind::Summary(s.clone())).unwrap();
         match &metric.data {
             Some(pb::metric::Data::Summary(summary)) => {
@@ -814,7 +840,12 @@ mod tests {
 
     #[test]
     fn a_summary_encodes_and_decodes_with_count_and_sum() {
-        let s = Summary { quantiles: vec![(0.5, 10.0), (0.99, 99.0)], count: 42, sum: 543.2 };
+        let s = Summary {
+            quantiles: vec![(0.5, 10.0), (0.99, 99.0)],
+            count: 42,
+            sum: 543.2,
+            temporality: Temporality::Cumulative,
+        };
         let metric = encode(MetricKind::Summary(s.clone())).unwrap();
         match &metric.data {
             Some(pb::metric::Data::Summary(summary)) => {
@@ -1041,6 +1072,30 @@ mod tests {
         );
     }
 
+    /// OTLP's summary is cumulative by definition, so a delta one is dropped, counted, and
+    /// reported, never written as a cumulative one.
+    #[test]
+    fn a_delta_summary_is_dropped_and_counted() {
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("otlp_out", "otlp_out", "sink");
+        let mut diag = Diagnostics::new("otlp_out");
+        let kind = MetricKind::Summary(Summary {
+            quantiles: vec![(0.5, 1.0)],
+            count: 2,
+            sum: 3.0,
+            temporality: Temporality::Delta,
+        });
+        assert!(encode_metric(&event(), &record(kind), &telemetry, &mut diag).is_none());
+        assert_eq!(diag.occurrences("delta_summary_unresolved"), 1);
+        let dropped = registry.drain(0).iter().any(|e| {
+            e.attributes.get("reason").and_then(|v| v.as_str()) == Some("unresolved_delta")
+                && e.metrics.iter().any(|m| {
+                    logit_core::interner::resolve(m.name) == "logit.output.metrics.dropped"
+                })
+        });
+        assert!(dropped, "should count logit.output.metrics.dropped{{reason=unresolved_delta}}");
+    }
+
     #[test]
     fn a_delta_monotonic_sum_decodes_as_a_sum_with_both_flags() {
         let metric = encode(MetricKind::counter(3.0)).unwrap();
@@ -1146,7 +1201,12 @@ mod tests {
             MetricKind::gauge(2.0),
             MetricKind::Histogram(histogram(Temporality::Delta)),
             MetricKind::ExponentialHistogram(exp_histogram(Temporality::Delta)),
-            MetricKind::Summary(Summary { quantiles: vec![(0.5, 1.0)], count: 1, sum: 1.0 }),
+            MetricKind::Summary(Summary {
+                quantiles: vec![(0.5, 1.0)],
+                count: 1,
+                sum: 1.0,
+                temporality: Temporality::Cumulative,
+            }),
         ];
         for kind in kinds {
             let rec = MetricRecord { flags, ..MetricRecord::new(intern("m"), kind.clone()) };
@@ -1315,7 +1375,12 @@ mod tests {
     /// `SummaryDataPoint` has no `exemplars` field, so a summary's exemplars are dropped.
     #[test]
     fn a_summary_drops_its_exemplars_because_the_wire_type_has_nowhere_to_put_them() {
-        let s = Summary { quantiles: vec![(0.5, 1.0)], count: 1, sum: 1.0 };
+        let s = Summary {
+            quantiles: vec![(0.5, 1.0)],
+            count: 1,
+            sum: 1.0,
+            temporality: Temporality::Cumulative,
+        };
         let rec = MetricRecord {
             exemplars: vec![exemplar()],
             ..MetricRecord::new(intern("m"), MetricKind::Summary(s))
@@ -1334,7 +1399,12 @@ mod tests {
     #[test]
     fn an_exemplar_on_a_kind_without_exemplars_counts_no_normalization() {
         let kinds = [
-            MetricKind::Summary(Summary { quantiles: vec![(0.5, 1.0)], count: 1, sum: 1.0 }),
+            MetricKind::Summary(Summary {
+                quantiles: vec![(0.5, 1.0)],
+                count: 1,
+                sum: 1.0,
+                temporality: Temporality::Cumulative,
+            }),
             MetricKind::GaugeDelta(MetricValue::F64(1.0)),
         ];
         for kind in kinds {
@@ -1404,7 +1474,12 @@ mod tests {
                 0u64..1000u64,
                 -1e6f64..1e6f64,
             )
-                .prop_map(|(quantiles, count, sum)| Summary { quantiles, count, sum })
+                .prop_map(|(quantiles, count, sum)| Summary {
+                    quantiles,
+                    count,
+                    sum,
+                    temporality: Temporality::Cumulative,
+                })
         }
 
         /// `Sum`/`Gauge`/`Histogram`/`Summary` only: `ExponentialHistogram` has its own tests,

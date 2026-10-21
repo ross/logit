@@ -1,0 +1,63 @@
+{
+  "name": "open-both",
+  "kind": "explicit",
+  "input": {
+    "bounds": ["1", "2", "5", "10"],
+    "counts": [6, 1, 2, 3, 9],
+    "count": 21,
+    "sum": "250",
+    "min": null,
+    "max": null
+  },
+  "series": [
+    {
+      "name": "case.count",
+      "tags": [],
+      "type": "count",
+      "value": "21",
+      "unit": ""
+    },
+    {
+      "name": "case.sum",
+      "tags": [],
+      "type": "count",
+      "value": "250",
+      "unit": "millisecond"
+    },
+    {
+      "name": "case.bucket",
+      "tags": ["lower_bound:-inf", "upper_bound:1.0"],
+      "type": "count",
+      "value": "6",
+      "unit": ""
+    },
+    {
+      "name": "case.bucket",
+      "tags": ["lower_bound:1.0", "upper_bound:2.0"],
+      "type": "count",
+      "value": "1",
+      "unit": ""
+    },
+    {
+      "name": "case.bucket",
+      "tags": ["lower_bound:2.0", "upper_bound:5.0"],
+      "type": "count",
+      "value": "2",
+      "unit": ""
+    },
+    {
+      "name": "case.bucket",
+      "tags": ["lower_bound:5.0", "upper_bound:10.0"],
+      "type": "count",
+      "value": "3",
+      "unit": ""
+    },
+    {
+      "name": "case.bucket",
+      "tags": ["lower_bound:10.0", "upper_bound:inf"],
+      "type": "count",
+      "value": "9",
+      "unit": ""
+    }
+  ]
+}

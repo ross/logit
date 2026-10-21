@@ -115,7 +115,7 @@
 //! | `set` | `estimate` |
 //! | `histogram` | `temporality`, `buckets:` a block of `<bound>: <count>` in wire order (each count that bucket's own, the last bound `inf`), then `sum`, `min`, `max` when present |
 //! | `exponential_histogram` | `scale`, `temporality`, `count`, `zero_count`, `zero_threshold`, `positive:`/`negative:` each a block of `offset` and `counts: [..]` (omitted when its counts are empty), then `sum`, `min`, `max` when present |
-//! | `summary` | `count`, `sum`, `quantiles:` a block of `<q>: <value>` in wire order |
+//! | `summary` | `temporality`, `count`, `sum`, `quantiles:` a block of `<q>: <value>` in wire order |
 //!
 //! A `sum`'s `value`, a `gauge`'s `value`, a `gauge_delta`'s `delta`, and an exemplar's `value`
 //! print as the number, then
@@ -462,6 +462,7 @@ fn render_metric_kind(out: &mut String, col: usize, kind: &MetricKind) {
             optional_sum_min_max(out, col, e.sum, e.min, e.max);
         }
         MetricKind::Summary(s) => {
+            str_field(out, col, "temporality", s.temporality.as_str());
             display_field(out, col, "count", s.count);
             display_field(out, col, "sum", s.sum);
             pairs_field(out, col, "quantiles", s.quantiles.iter().map(|(q, v)| (q, v)));
@@ -1512,12 +1513,14 @@ mod tests {
             quantiles: vec![(0.99, 12.5), (0.5, 1.5)],
             count: 3,
             sum: 40.0,
+            temporality: Temporality::Cumulative,
         });
         assert_eq!(
             render(vec![metric_event("req.latency", kind)]),
             metric_block(&[
                 "  - name: req.latency",
                 "    kind: summary",
+                "    temporality: cumulative",
                 "    count: 3",
                 "    sum: 40",
                 "    quantiles:",

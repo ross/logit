@@ -1429,7 +1429,12 @@ mod tests {
             (MetricKind::Histogram(histogram()), "histogram"),
             (MetricKind::ExponentialHistogram(exp_histogram()), "exponential_histogram"),
             (
-                MetricKind::Summary(Summary { quantiles: vec![(0.5, 1.0)], count: 1, sum: 1.0 }),
+                MetricKind::Summary(Summary {
+                    quantiles: vec![(0.5, 1.0)],
+                    count: 1,
+                    sum: 1.0,
+                    temporality: Temporality::Cumulative,
+                }),
                 "summary",
             ),
         ] {
@@ -1507,6 +1512,7 @@ mod tests {
                     quantiles: vec![(0.5, 1.0), (0.99, 9.0)],
                     count: 4,
                     sum: 12.0,
+                    temporality: Temporality::Cumulative,
                 }),
                 "summary",
                 vec!["sys.cpu.count", "sys.cpu.sum", "sys.cpu.q0_5", "sys.cpu.q0_99"],
@@ -1641,6 +1647,7 @@ mod tests {
                 quantiles: vec![(0.5, 1.0), (0.9, f64::NAN), (0.99, 9.0)],
                 count: 4,
                 sum: 12.0,
+                temporality: Temporality::Cumulative,
             })),
             event(MetricKind::Set(hyper_log_log())),
             event(set_members()),

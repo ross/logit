@@ -1162,6 +1162,21 @@ mod tests {
             quantiles: vec![(0.5, 0.2), (0.99, 0.9)],
             count: 7,
             sum: 3.5,
+            temporality: logit_core::Temporality::Cumulative,
+        });
+        let (out, stats) = encode_stats(vec![metric_event("rpc_latency", kind, &[])]);
+        assert_eq!(out, "rpc_latency count=7,sum=3.5,0.5=0.2,0.99=0.9 1700000000000000000\n");
+        assert_eq!(stats, EncodeStats::default());
+    }
+
+    /// A delta summary writes the same fields: line protocol has no temporality.
+    #[test]
+    fn a_delta_summary_writes_as_a_cumulative_one_does() {
+        let kind = MetricKind::Summary(Summary {
+            quantiles: vec![(0.5, 0.2), (0.99, 0.9)],
+            count: 7,
+            sum: 3.5,
+            temporality: logit_core::Temporality::Delta,
         });
         let (out, stats) = encode_stats(vec![metric_event("rpc_latency", kind, &[])]);
         assert_eq!(out, "rpc_latency count=7,sum=3.5,0.5=0.2,0.99=0.9 1700000000000000000\n");
@@ -1176,6 +1191,7 @@ mod tests {
             quantiles: vec![(0.991, 10.0), (0.994, 20.0)],
             count: 2,
             sum: 30.0,
+            temporality: logit_core::Temporality::Cumulative,
         });
         let out = encode(vec![metric_event("req.latency", kind, &[])]);
         assert!(out.contains(",0.991=10,0.994=20 "), "got: {out}");
@@ -1188,6 +1204,7 @@ mod tests {
             quantiles: vec![(0.5, f64::NAN), (0.99, 0.9)],
             count: 0,
             sum: 0.0,
+            temporality: logit_core::Temporality::Cumulative,
         });
         let (out, stats) = encode_stats(vec![metric_event("s", kind, &[])]);
         assert_eq!(out, "s count=0,sum=0,0.99=0.9 1700000000000000000\n");

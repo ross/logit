@@ -1,0 +1,22 @@
+{
+  "name": "one-bucket-over-uint16",
+  "kind": "explicit",
+  "input": {
+    "bounds": ["3"],
+    "counts": [0, 200000],
+    "count": 200000,
+    "sum": "1e+06",
+    "min": null,
+    "max": null
+  },
+  "outcome": "sketch",
+  "sketch": {
+    "k": [1409, 1409, 1409, 1409],
+    "n": [3395, 65535, 65535, 65535],
+    "cnt": 200000,
+    "sum": "1e+06",
+    "min": "3",
+    "max": "3.0065620324196973",
+    "avg": "5"
+  }
+}

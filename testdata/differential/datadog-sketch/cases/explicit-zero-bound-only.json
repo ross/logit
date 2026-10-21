@@ -1,0 +1,22 @@
+{
+  "name": "zero-bound-only",
+  "kind": "explicit",
+  "input": {
+    "bounds": ["0"],
+    "counts": [4, 5],
+    "count": 9,
+    "sum": "10",
+    "min": null,
+    "max": null
+  },
+  "outcome": "sketch",
+  "sketch": {
+    "k": [0],
+    "n": [9],
+    "cnt": 9,
+    "sum": "10",
+    "min": "0",
+    "max": "0",
+    "avg": "1.1111111111111112"
+  }
+}

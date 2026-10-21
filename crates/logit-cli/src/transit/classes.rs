@@ -70,7 +70,9 @@
 //! span's `span.kind` and `_dd.p.tid`), each accepted only with the value derived for it. A
 //! candidate's public attributes (no `_logit.`
 //! key, values compared as text, each key and value as the sink writes it) must equal the
-//! input's, or failing any that do, be a subset of them. An input left unpaired was skipped or
+//! input's, or failing any that do, be a subset of them; a `datadog_out` series under `<name>.`
+//! may also carry the `lower_bound`, `upper_bound`, or `quantile` tag of the bucket or quantile it
+//! expands. An input left unpaired was skipped or
 //! dropped: the class is the one whose counter moved, or the cell's when it says the loss is
 //! `uncounted`. A read-back record no input claims fails the check with both sides printed.
 //!
@@ -986,10 +988,22 @@ fn pair(ins: &[Rec], outs: &[Rec], spelling: Spelling) -> Pairing {
     Pairing { seen, claimed, unclaimed }
 }
 
+/// The tags `datadog_out` puts on a series it derives from a record: a histogram's `.bucket`
+/// bounds and a summary's `.quantile`, each from the bucket or quantile, not an attribute.
+const DATADOG_EXPANSION_KEYS: [&str; 3] = ["lower_bound", "upper_bound", "quantile"];
+
 /// 2 when `out`'s public attributes equal `input`'s as the sink spells their keys, 1 when
-/// they're a subset, else 0.
+/// they're a subset, else 0. A `datadog_out` series under `<name>.` may also carry
+/// [`DATADOG_EXPANSION_KEYS`].
 fn score(input: &Rec, out: &Rec, spelling: Spelling) -> u8 {
-    let (want, have) = (input.public_as(spelling), out.public());
+    let (want, mut have) = (input.public_as(spelling), out.public());
+    if spelling == Spelling::Datadog && out.name.starts_with(&format!("{}.", input.name)) {
+        for key in DATADOG_EXPANSION_KEYS {
+            if !want.contains_key(key) {
+                have.remove(key);
+            }
+        }
+    }
     if want == have {
         2
     } else if have.iter().all(|(k, v)| want.get(k) == Some(v)) {
@@ -1093,7 +1107,7 @@ fn kind_features(rec: &Rec) -> Vec<Option<String>> {
             features
         }
         "gauge_delta" => vec![Some(scalar("delta"))],
-        "histogram" | "exponential_histogram" => vec![Some(temporality())],
+        "histogram" | "exponential_histogram" | "summary" => vec![Some(temporality())],
         "log" | "span" if rec.beside_metrics => vec![Some("beside_metrics".to_string())],
         "span" if datadog::otel_only(rec) => {
             vec![Some("alone".to_string()), Some("no_wire_form".to_string())]

@@ -1,0 +1,22 @@
+{
+  "name": "open-last",
+  "kind": "explicit",
+  "input": {
+    "bounds": ["1", "2", "5", "10"],
+    "counts": [0, 0, 0, 0, 40],
+    "count": 40,
+    "sum": "800",
+    "min": null,
+    "max": null
+  },
+  "outcome": "sketch",
+  "sketch": {
+    "k": [1487],
+    "n": [40],
+    "cnt": 40,
+    "sum": "800",
+    "min": "10",
+    "max": "10.075671884115119",
+    "avg": "20"
+  }
+}

@@ -4,13 +4,14 @@
 //!
 //! The `Dogsketch` wire form is the Agent's sparse store verbatim: `k` (ascending `sint32` keys,
 //! negative for negative values, `0` for the zero bin) paired 1:1 with `n` (`uint32` counts), a
-//! count above 65535 split across repeated entries of one key. It carries no mapping parameters,
+//! count above 65535 split across repeated entries of one key, the remainder first and then the full
+//! entries, as the Agent's `appendSafe` splits it. It carries no mapping parameters,
 //! so every decoded sketch is [`Mapping::agent`], and every encoded one has to be.
 
 use super::generated::agentpayload::sketch_payload::{sketch::Dogsketch, Sketch};
 use super::generated::agentpayload::{CommonMetadata, SketchPayload};
 use super::outcomes::{MetricIn, MetricOut};
-use super::series::{first_metric, OriginCodes, Route, WireSeries};
+use super::series::{first_metric, record_routes, OriginCodes, Route, WireSeries};
 use super::time::{nanos_to_seconds, seconds_to_nanos};
 use super::{
     DatadogDecoder, DatadogEncoder, RESOURCE_ATTR_AGENT_EPOCH, RESOURCE_ATTR_AGENT_INTERNAL_IP,
@@ -19,6 +20,9 @@ use super::{
 use crate::CodecError;
 use bytes::Bytes;
 use logit_core::interner::{intern, resolve};
+use logit_core::sketch::from_otlp::{
+    exp_histogram_to_agent, histogram_to_agent, AgentSketch, ConversionError, MAX_OBSERVATIONS,
+};
 use logit_core::{
     Bin, DdSketch, Event, EventBatch, Mapping, MappingKind, MetricKind, MetricRecord, Resource,
     SketchStats, Value,
@@ -188,19 +192,48 @@ fn dogsketch_to_sketch(dog: &Dogsketch) -> Result<Option<DdSketch>, String> {
 }
 
 impl DatadogEncoder {
-    /// `/api/beta/sketches`: every `Distribution` record as one `Sketch` with one `Dogsketch`.
-    /// Every other kind is left to its own route, uncounted here; `None` when nothing is sent.
+    /// `/api/beta/sketches`: every `Distribution` record, and every delta `Histogram` (under
+    /// `histograms.mode: distributions`) and `ExponentialHistogram` record sketched as Datadog's
+    /// exporter sketches it ([`logit_core::sketch::from_otlp`]), as one `Sketch` with one
+    /// `Dogsketch`. Every other kind is left to its own route, uncounted here; `None` when nothing
+    /// is sent.
     pub fn encode_sketches(&mut self, batch: &EventBatch) -> Option<Bytes> {
         let mut sketches = Vec::new();
         for event in &batch.events {
             let mut carriers = None;
             for record in &event.metrics[first_metric(&batch.resource, event)..] {
-                let MetricKind::Distribution(sketch) = &record.kind else { continue };
+                if !record_routes(record, self.histograms).sketch {
+                    continue;
+                }
                 if record.is_no_recorded_value() {
                     self.metric_not_sent(MetricOut::NoRecordedValue);
                     continue;
                 }
-                let Some(dog) = self.dogsketch(sketch, event.timestamp) else { continue };
+                let converted;
+                let (sketch, avg) = match &record.kind {
+                    MetricKind::Distribution(sketch) => (sketch, None),
+                    MetricKind::Histogram(h) => match self.converted(histogram_to_agent(h)) {
+                        Some(a) => {
+                            converted = a;
+                            (&converted.sketch, Some(converted.avg))
+                        }
+                        None => continue,
+                    },
+                    MetricKind::ExponentialHistogram(e) => {
+                        match self.converted(exp_histogram_to_agent(e)) {
+                            Some(a) => {
+                                converted = a;
+                                (&converted.sketch, Some(converted.avg))
+                            }
+                            None => continue,
+                        }
+                    }
+                    _ => continue,
+                };
+                let Some(dog) = self.dogsketch(sketch, event.timestamp, avg) else { continue };
+                if !matches!(record.kind, MetricKind::Distribution(_)) {
+                    self.degraded_kind(record.kind.name());
+                }
                 let c = carriers
                     .get_or_insert_with(|| self.carriers(&batch.resource, event, Route::Sketches));
                 sketches.push(Sketch {
@@ -219,9 +252,37 @@ impl DatadogEncoder {
         })
     }
 
+    /// A histogram's conversion, or `None` with the reason counted.
+    fn converted(&mut self, result: Result<AgentSketch, ConversionError>) -> Option<AgentSketch> {
+        let outcome = match result {
+            Ok(a) => return Some(a),
+            Err(ConversionError::Empty) => MetricOut::EmptySketch,
+            Err(ConversionError::TooManyObservations) => {
+                self.diagnostics.warn_throttled(
+                    "oversized_sketch",
+                    format_args!(
+                        "datadog: a histogram of more than {MAX_OBSERVATIONS} observations \
+                         dropped, as Datadog's exporter abandons one"
+                    ),
+                );
+                MetricOut::OversizedSketch
+            }
+            Err(ConversionError::NonMonotonicBounds) => MetricOut::NonMonotonicBounds,
+            Err(ConversionError::Unconvertible) => MetricOut::SketchRange,
+        };
+        self.metric_not_sent(outcome);
+        None
+    }
+
     /// One sketch as a `Dogsketch`, re-binned first when it isn't under the Agent mapping. `None`,
-    /// counted, for an empty sketch or one past [`MAX_DOGSKETCH_ENTRIES`].
-    fn dogsketch(&mut self, sketch: &DdSketch, timestamp: i64) -> Option<Dogsketch> {
+    /// counted, for an empty sketch or one past [`MAX_DOGSKETCH_ENTRIES`]. `avg` is a converted
+    /// histogram's own; without one, `avg` is `sum / cnt`.
+    fn dogsketch(
+        &mut self,
+        sketch: &DdSketch,
+        timestamp: i64,
+        avg: Option<f64>,
+    ) -> Option<Dogsketch> {
         let rebinned;
         let is_rebinned = *sketch.mapping() != Mapping::agent();
         let sketch = if is_rebinned {
@@ -258,12 +319,16 @@ impl DatadogEncoder {
         let mut fractional = false;
         let mut push = |key: i32, count: f64| {
             fractional |= count.round() != count;
-            let mut left = wire_count(count);
-            while left > 0 {
-                let chunk = left.min(MAX_BIN_COUNT);
+            // The Agent's `appendSafe` order: the remainder, then the full entries.
+            let total = wire_count(count);
+            let remainder = total % MAX_BIN_COUNT;
+            if remainder != 0 {
                 k.push(key);
-                n.push(chunk);
-                left -= chunk;
+                n.push(remainder);
+            }
+            for _ in 0..total / MAX_BIN_COUNT {
+                k.push(key);
+                n.push(MAX_BIN_COUNT);
             }
         };
         for bin in sketch.negative_bins().iter().rev() {
@@ -286,16 +351,20 @@ impl DatadogEncoder {
             return None;
         }
         let sum = sketch.sum();
-        Some(Dogsketch {
-            ts: nanos_to_seconds(timestamp),
-            cnt,
-            min: sketch.min().unwrap_or(0.0),
-            max: sketch.max().unwrap_or(0.0),
-            avg: if cnt > 0 { sum / cnt as f64 } else { 0.0 },
-            sum,
-            k,
-            n,
-        })
+        // A converted histogram's summary is the translator's, as stored: its `cnt` is the
+        // point's own, which can be 0 over populated bins.
+        let (min, max, avg) = match avg {
+            Some(avg) => {
+                let stats = sketch.stored_stats();
+                (stats.min, stats.max, avg)
+            }
+            None => (
+                sketch.min().unwrap_or(0.0),
+                sketch.max().unwrap_or(0.0),
+                if cnt > 0 { sum / cnt as f64 } else { 0.0 },
+            ),
+        };
+        Some(Dogsketch { ts: nanos_to_seconds(timestamp), cnt, min, max, avg, sum, k, n })
     }
 }
 
@@ -478,7 +547,7 @@ mod tests {
         assert_eq!(s.metadata.unwrap().origin.unwrap().origin_product, 4);
         let dog = &s.dogsketches[0];
         assert_eq!(dog.k, vec![-5, -2, 0, 1, 3, 3]);
-        assert_eq!(dog.n, vec![1, 3, 2, 1, 65535, 4465]);
+        assert_eq!(dog.n, vec![1, 3, 2, 1, 4465, 65535]);
         assert_eq!((dog.cnt, dog.ts), (70007, TS_S));
         assert_eq!(dog.avg, 10.0 / 70007.0);
     }

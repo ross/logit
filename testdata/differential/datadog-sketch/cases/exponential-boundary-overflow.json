@@ -1,0 +1,22 @@
+{
+  "name": "boundary-overflow",
+  "kind": "exponential",
+  "input": {
+    "scale": 0,
+    "zero_count": 0,
+    "positive": {
+      "offset": 1023,
+      "counts": [2]
+    },
+    "negative": {
+      "offset": 0,
+      "counts": []
+    },
+    "count": 2,
+    "sum": "1e+308",
+    "min": null,
+    "max": null
+  },
+  "outcome": "unconvertible",
+  "detail": "Failed to convert DDSketch into Sketch: couldn't convert input ddsketch into ddsketch with compatible parameters: bucket index 1024 has a boundary of +Inf, which cannot be remapped"
+}

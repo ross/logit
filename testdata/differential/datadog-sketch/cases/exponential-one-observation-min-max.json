@@ -1,0 +1,30 @@
+{
+  "name": "one-observation-min-max",
+  "kind": "exponential",
+  "input": {
+    "scale": 0,
+    "zero_count": 0,
+    "positive": {
+      "offset": 3,
+      "counts": [1]
+    },
+    "negative": {
+      "offset": 0,
+      "counts": []
+    },
+    "count": 1,
+    "sum": "9.5",
+    "min": "9.5",
+    "max": "9.5"
+  },
+  "outcome": "sketch",
+  "sketch": {
+    "k": [1491],
+    "n": [1],
+    "cnt": 1,
+    "sum": "9.5",
+    "min": "9.5",
+    "max": "9.5",
+    "avg": "9.5"
+  }
+}

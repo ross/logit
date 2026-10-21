@@ -1,6 +1,6 @@
 ---
 created: 2026-09-24
-updated: 2026-09-24
+updated: 2026-10-20
 ---
 
 # Enabling plan: Dynatrace — OTLP and the ingest APIs, OneAgent-local stand-in, intake stand-in
@@ -320,17 +320,18 @@ two of them unset for this form). `dt/w1` takes that kind if `nr/w1` has landed;
 native wire's record encoding in one commit, and the New Relic stream extends it. One kind,
 whichever stream is first. Every other Dynatrace field already has a home.
 
-### 2. One runtime dependency: a `delta` transform (outside this stream)
+### 2. One runtime dependency: the `cumulative_to_delta` transform (outside this stream)
 
 Dynatrace rejects a cumulative monotonic `Sum` and doesn't ingest a cumulative `Histogram`, and
-nothing in `logit` converts cumulative to delta: `aggregate`'s `opener_for` lets both kinds
-through untouched ([ADR `aggregation-window-semantics`](../adr/aggregation-window-semantics.md)'s
+`aggregate` doesn't convert cumulative to delta: its `opener_for` lets both kinds through
+untouched ([ADR `aggregation-window-semantics`](../adr/aggregation-window-semantics.md)'s
 cumulative amendment goes the other way). Any pipeline that relays `prometheus_in`, `otlp_in`
 with cumulative producers, or `internal -> aggregate (temporality: cumulative)` into Dynatrace
 needs a stateful per-series cumulative-to-delta stage with reset detection and a staleness bound,
-the Collector's `cumulativetodelta` processor being the precedent. That transform gets its own
-ADR and PR outside the `dt` stream, because `datadog_out` (which skips a cumulative `Sum`) and
-New Relic's OTLP path (which drops cumulative state after 5 min) want it as well. This plan records
+the Collector's `cumulativetodelta` processor being the precedent. That transform is
+`cumulative_to_delta` ([ADR `cumulative-to-delta-transform`](../adr/cumulative-to-delta-transform.md)),
+built by the `ddotlp` stream's W2 ([`ddotlp.md`](ddotlp.md)) outside the `dt` stream, because
+`datadog_out` (which can't send a cumulative `Sum`) and New Relic's OTLP path (which drops cumulative state after 5 min) want it as well. This plan records
 the requirement and the dependency; W4 and W5 name the transform in their `needs_delta`
 diagnostic, and W6's end-to-end runs need it landed.
 
@@ -431,9 +432,8 @@ component.
 W1 first: the spike closes the UNVERIFIED list, the ADR records the pair and the kind
 dependency, and the kind lands if `nr/w1` hasn't. Then the codecs and pair (W2, W3, W4), then
 `otlp_out` (W5), fixtures and environment verification (W6), and docs (W7). W5 depends only on
-W1 and the two cross-stream items and can be pulled forward; the `delta` transform lands outside
-the stream whenever it's ready, and W6 is the first workstream that runs without it only by
-sourcing delta data.
+W1 and the two cross-stream items and can be pulled forward. `cumulative_to_delta` is built
+outside the stream (`ddotlp`'s W2), so W6's end-to-end runs can place it ahead of the sink.
 
 ### 10. Not in this stack
 

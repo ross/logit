@@ -1,0 +1,22 @@
+{
+  "name": "single-bucket-min-max",
+  "kind": "explicit",
+  "input": {
+    "bounds": [],
+    "counts": [7],
+    "count": 7,
+    "sum": "21",
+    "min": "0.5",
+    "max": "9"
+  },
+  "outcome": "sketch",
+  "sketch": {
+    "k": [-1],
+    "n": [7],
+    "cnt": 7,
+    "sum": "21",
+    "min": "0.5",
+    "max": "9",
+    "avg": "3"
+  }
+}

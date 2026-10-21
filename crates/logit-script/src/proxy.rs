@@ -1067,6 +1067,9 @@ impl UserData for MetricProxy {
                     MetricKind::ExponentialHistogram(e) => {
                         Ok(LuaValue::String(lua.create_string(e.temporality.as_str())?))
                     }
+                    MetricKind::Summary(s) => {
+                        Ok(LuaValue::String(lua.create_string(s.temporality.as_str())?))
+                    }
                     _ => Ok(LuaValue::Nil),
                 },
                 "monotonic" => match &m.kind {
@@ -1410,6 +1413,7 @@ fn metric_to_table<'lua>(lua: &'lua Lua, record: &MetricRecord) -> mlua::Result<
             table.set("quantiles", quantiles)?;
             table.set("count", exact_u64_to_lua(lua, s.count)?)?;
             table.set("sum", s.sum)?;
+            table.set("temporality", s.temporality.as_str())?;
         }
     }
     Ok(table)
@@ -1763,6 +1767,7 @@ pub(crate) mod tests {
             quantiles: vec![(0.5, 10.0), (0.99, 99.0)],
             count: 42,
             sum: 500.0,
+            temporality: Temporality::Cumulative,
         })
     }
 

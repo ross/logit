@@ -1,0 +1,35 @@
+{
+  "name": "seeded-34",
+  "kind": "explicit",
+  "input": {
+    "bounds": ["3.526617249287432", "10.46740425194296"],
+    "counts": [566, 106, 1929],
+    "count": 2601,
+    "sum": null,
+    "min": null,
+    "max": null
+  },
+  "series": [
+    {
+      "name": "case.bucket",
+      "tags": ["lower_bound:-inf", "upper_bound:3.526617249287432"],
+      "type": "count",
+      "value": "566",
+      "unit": ""
+    },
+    {
+      "name": "case.bucket",
+      "tags": ["lower_bound:3.526617249287432", "upper_bound:10.46740425194296"],
+      "type": "count",
+      "value": "106",
+      "unit": ""
+    },
+    {
+      "name": "case.bucket",
+      "tags": ["lower_bound:10.46740425194296", "upper_bound:inf"],
+      "type": "count",
+      "value": "1929",
+      "unit": ""
+    }
+  ]
+}

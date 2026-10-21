@@ -1,0 +1,35 @@
+{
+  "name": "seeded-18",
+  "kind": "explicit",
+  "input": {
+    "bounds": ["669.7420716626821", "669.8473803878707"],
+    "counts": [0, 72, 81],
+    "count": 153,
+    "sum": null,
+    "min": null,
+    "max": "679.6127706853612"
+  },
+  "series": [
+    {
+      "name": "case.bucket",
+      "tags": ["lower_bound:-inf", "upper_bound:669.7420716626821"],
+      "type": "count",
+      "value": "0",
+      "unit": ""
+    },
+    {
+      "name": "case.bucket",
+      "tags": ["lower_bound:669.7420716626821", "upper_bound:669.8473803878707"],
+      "type": "count",
+      "value": "72",
+      "unit": ""
+    },
+    {
+      "name": "case.bucket",
+      "tags": ["lower_bound:669.8473803878707", "upper_bound:inf"],
+      "type": "count",
+      "value": "81",
+      "unit": ""
+    }
+  ]
+}

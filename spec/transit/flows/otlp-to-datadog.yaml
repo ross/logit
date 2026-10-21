@@ -1,6 +1,8 @@
-# otlp_in's metrics cases into datadog_out with nothing between: a delta sum as a count and a
-# gauge as a gauge; a cumulative sum, histogram, exponential histogram, or summary has no series
-# form and is skipped.
+# otlp_in's metrics cases into datadog_out with nothing between, under the default
+# `histograms.mode: distributions`: a delta sum as a count, a cumulative non-monotonic one and a
+# gauge as gauges, a delta histogram and exponential histogram as sketches, and a summary as
+# `.quantile` gauges; a cumulative monotonic sum, histogram, or exponential histogram is dropped
+# (`otlp-delta-to-datadog` converts them first).
 # `path:` names one case so `logit run` can run this by hand; the transit spec runs every case in
 # that file's directory (spec/transit/README.md).
 components:

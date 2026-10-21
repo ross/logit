@@ -2265,6 +2265,47 @@
           "additionalProperties": false
         },
         {
+          "description": "Replaces each cumulative point with its difference from the series' previous point, for a destination that takes only deltas (Datadog, `statsd_out`, a delta-only OTLP backend). It converts a cumulative monotonic `sum`, a cumulative `histogram` and `exponential_histogram`, and a `summary`'s count and sum (its quantiles pass unchanged); every other record, a cumulative non-monotonic `sum` included, passes through untouched.\n\nA series is the metric's name, unit, and kind, the resource, the instrumentation scope, and the event's attributes; its state lives in memory, so a restart starts every series over. A point timestamped at or before the series' last one is skipped. A value that went down, or a start time that moved past the previous point, is a counter restart: the point's whole value is the delta. A histogram whose buckets changed is dropped, counted, and becomes the new baseline.",
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "buffer": true,
+            "initial_value": {
+              "description": "What a series' first point emits: `auto` (the default) emits its whole value only when its start time shows the series began after this component started, `keep` always does, and `drop` never does. A first point that emits nothing records the baseline the next point is differenced against.",
+              "default": "auto",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/InitialValue"
+                }
+              ]
+            },
+            "max_series": {
+              "description": "The most series tracked at once. A new series past it forgets the least recently updated one, counted, and that series' next point is a first point. Must be at least `1`.",
+              "default": 10000,
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0.0
+            },
+            "max_staleness": {
+              "description": "Forgets a series no point has updated for this long, by the wall clock; its next point is then a first point. Set it above the longest gap between a producer's reports. Must be greater than zero.",
+              "default": "1h",
+              "type": "string"
+            },
+            "receive": true,
+            "sources": true,
+            "targets": true,
+            "type": {
+              "type": "string",
+              "enum": [
+                "cumulative_to_delta"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
           "description": "Forwards stale events, discarding fresh ones, judged against the wall clock. The time judged is the span's end when the event has a span with one set, otherwise the event's timestamp. An event whose time is 0 (unknown) is never stale. An event is stale when it is older than `max_age`, or, with `max_ahead` set, further in the future than `max_ahead`; an age equal to the bound is fresh. The clock is read once per batch.\n\n`max_age` must cover the clock skew between tiers, one `aggregate` flush interval, and normal pipeline latency, or fresh events are called stale.\n\nWith the same bounds, `has_stale` forwards what `drop_stale` discards. Point it at an archive sink, such as a `file_out` with `format: native`, which keeps every field.",
           "type": "object",
           "required": [
@@ -2892,7 +2933,7 @@
           "additionalProperties": false
         },
         {
-          "description": "Sends logs, metrics, events, service checks, APM traces, and APM stats straight to Datadog's intake API, one request per route a batch needs. Host, service, source, and tags come from each event's attributes and resource, so stamp them upstream with `set`. A metric, log, event, or service check with no host goes out with the process hostname, so hostless senders relayed through one `logit` report as one Datadog host. A metric its sender marked hostless (an empty `host:` tag, or an Agent's empty host) stays hostless. Points older than Datadog accepts (1h for metrics, 18h for logs and events, 10m for service checks) are dropped and counted before sending. Traces go out only once a Datadog Agent has processed them: send `datadog_trace_in`'s output to `datadog_trace_out` instead.",
+          "description": "Sends logs, metrics, events, service checks, APM traces, and APM stats straight to Datadog's intake API, one request per route a batch needs. Host, service, source, and tags come from each event's attributes and resource, so stamp them upstream with `set`. A metric, log, event, or service check with no host goes out with the process hostname, so hostless senders relayed through one `logit` report as one Datadog host. A metric its sender marked hostless (an empty `host:` tag, or an Agent's empty host) stays hostless. Points older than Datadog accepts (1h for metrics, 18h for logs and events, 10m for service checks) are dropped and counted before sending. Traces go out only once a Datadog Agent has processed them: send `datadog_trace_in`'s output to `datadog_trace_out` instead. OpenTelemetry sums, histograms, and summaries go out as Datadog's OTel exporter sends them; a cumulative counter, histogram, or exponential histogram isn't sent, counted, so set an OpenTelemetry SDK to delta temporality.",
           "type": "object",
           "required": [
             "api_key",
@@ -2933,6 +2974,18 @@
               "additionalProperties": {
                 "type": "string"
               }
+            },
+            "histograms": {
+              "description": "How OpenTelemetry histograms are written, with the Datadog exporter's settings and defaults. `mode: nobuckets` without `send_aggregation_metrics: true` writes nothing for a histogram, so it's rejected, as the exporter rejects it.",
+              "default": {
+                "mode": "distributions",
+                "send_aggregation_metrics": false
+              },
+              "allOf": [
+                {
+                  "$ref": "#/definitions/DatadogHistograms"
+                }
+              ]
             },
             "receive": true,
             "site": {
@@ -4250,6 +4303,53 @@
       },
       "additionalProperties": false
     },
+    "DatadogHistogramMode": {
+      "description": "`datadog_out`'s `histograms.mode`, spelled as the Datadog exporter spells it.",
+      "oneOf": [
+        {
+          "description": "One distribution per point.",
+          "type": "string",
+          "enum": [
+            "distributions"
+          ]
+        },
+        {
+          "description": "One `<name>.bucket` count per bucket.",
+          "type": "string",
+          "enum": [
+            "counters"
+          ]
+        },
+        {
+          "description": "No bucket output.",
+          "type": "string",
+          "enum": [
+            "nobuckets"
+          ]
+        }
+      ]
+    },
+    "DatadogHistograms": {
+      "description": "How `datadog_out` writes OpenTelemetry histograms, as the Datadog exporter's `histograms:` block does, under the same names.",
+      "type": "object",
+      "properties": {
+        "mode": {
+          "description": "How a delta explicit-bucket histogram is written: `distributions` (the default), one Datadog distribution per point with its counts spread over the buckets as Datadog's exporter spreads them; `counters`, one `<name>.bucket` count per bucket tagged `lower_bound` and `upper_bound`; or `nobuckets`, nothing but the aggregation metrics, which then have to be on. An exponential histogram is always a distribution.",
+          "default": "distributions",
+          "allOf": [
+            {
+              "$ref": "#/definitions/DatadogHistogramMode"
+            }
+          ]
+        },
+        "send_aggregation_metrics": {
+          "description": "Also writes `<name>.count` and `<name>.sum` counts and `<name>.min` and `<name>.max` gauges for each delta histogram and exponential histogram whose sum is present and finite. Off by default, as in the exporter.",
+          "default": false,
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
     "DatadogTraceCompression": {
       "description": "How `datadog_trace_out` compresses its request bodies.",
       "oneOf": [
@@ -4597,6 +4697,32 @@
           "type": "string",
           "enum": [
             "probes"
+          ]
+        }
+      ]
+    },
+    "InitialValue": {
+      "description": "`cumulative_to_delta`'s `initial_value` field: what a series' first point emits.",
+      "oneOf": [
+        {
+          "description": "The whole value, when the point's start time is set, at or after this component started, and not its own timestamp: the series began while `logit` was watching, so its whole total is new. Otherwise nothing. The default.",
+          "type": "string",
+          "enum": [
+            "auto"
+          ]
+        },
+        {
+          "description": "Always the whole value, which re-sends a series' running total after a restart of `logit`.",
+          "type": "string",
+          "enum": [
+            "keep"
+          ]
+        },
+        {
+          "description": "Never anything: the first point only records the baseline.",
+          "type": "string",
+          "enum": [
+            "drop"
           ]
         }
       ]

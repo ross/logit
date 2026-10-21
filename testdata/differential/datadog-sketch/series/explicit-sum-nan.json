@@ -1,0 +1,42 @@
+{
+  "name": "sum-nan",
+  "kind": "explicit",
+  "input": {
+    "bounds": ["1", "10", "100"],
+    "counts": [2, 30, 50, 4],
+    "count": 86,
+    "sum": "NaN",
+    "min": null,
+    "max": null
+  },
+  "series": [
+    {
+      "name": "case.bucket",
+      "tags": ["lower_bound:-inf", "upper_bound:1.0"],
+      "type": "count",
+      "value": "2",
+      "unit": ""
+    },
+    {
+      "name": "case.bucket",
+      "tags": ["lower_bound:1.0", "upper_bound:10.0"],
+      "type": "count",
+      "value": "30",
+      "unit": ""
+    },
+    {
+      "name": "case.bucket",
+      "tags": ["lower_bound:10.0", "upper_bound:100.0"],
+      "type": "count",
+      "value": "50",
+      "unit": ""
+    },
+    {
+      "name": "case.bucket",
+      "tags": ["lower_bound:100.0", "upper_bound:inf"],
+      "type": "count",
+      "value": "4",
+      "unit": ""
+    }
+  ]
+}

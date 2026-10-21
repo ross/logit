@@ -1,0 +1,30 @@
+{
+  "name": "min-only",
+  "kind": "exponential",
+  "input": {
+    "scale": 4,
+    "zero_count": 0,
+    "positive": {
+      "offset": 16,
+      "counts": [5, 6, 7]
+    },
+    "negative": {
+      "offset": 0,
+      "counts": []
+    },
+    "count": 18,
+    "sum": "40",
+    "min": "2.01",
+    "max": null
+  },
+  "outcome": "sketch",
+  "sketch": {
+    "k": [1383, 1384, 1385, 1386, 1387, 1388, 1389, 1390, 1391],
+    "n": [1, 2, 2, 2, 2, 3, 2, 2, 2],
+    "cnt": 18,
+    "sum": "40",
+    "min": "2.01",
+    "max": "2.274344409515812",
+    "avg": "2.2222222222222223"
+  }
+}
