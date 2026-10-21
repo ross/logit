@@ -593,8 +593,11 @@ The rule is the series one in full. Each other character is `_`, and a leading d
 prefix. Two keys sanitizing onto one name keep the one whose original key sorts first, and the
 rest are counted `logit.output.labels.omitted{reason="collision"}`. A key sanitizing onto
 `trace_id` or `span_id` beside the exemplar's trace is counted `reason="reserved"`, as an `le`
-beside a histogram's bucket is. The 128-code-point budget is measured on the names as written.
-The renaming itself is uncounted, as a series label's is.
+beside a histogram's bucket is; a `span_id` attribute beside a trace with no span is an ordinary
+label, since no `span_id` is written. The 128-code-point budget is measured on the names as
+sanitized. The renaming itself is uncounted, as a series label's is. In registry mode the
+exposition is rendered on each scrape, so an exemplar key's `collision` or `reserved` counts once
+per OpenMetrics scrape, as `exemplar_omitted` does.
 
 Prometheus 3 also reads a quoted UTF-8 exemplar label name (`# {"customer.tier"="gold"} 1`), but
 that syntax isn't OpenMetrics 1.0, and `prometheus_in` doesn't read quoted names anywhere

@@ -319,7 +319,7 @@ impl Spelling {
     }
 
     /// The `record/exemplar_key_unsafe*` row `rec` reaches when an exemplar the OpenMetrics
-    /// writer puts on a line carries a public attribute key it sanitizes into a label name:
+    /// writer puts on a line writes a label from an attribute key it sanitizes:
     /// `exemplar_key_unsafe` for a monotonic `sum`, `exemplar_key_unsafe_histogram` for a
     /// `histogram`, the two kinds whose exposition lines carry an exemplar. The selection is the
     /// OpenMetrics writer's (`exposed_exemplar_keys`): a counter's first, a histogram's first per
