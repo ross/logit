@@ -929,14 +929,15 @@ impl DatadogEncoder {
         c
     }
 
-    /// The series a series route sends for one record, counting every skip, drop, and degrade
-    /// [`plan_series`] notes on the way.
-    fn series_points(&mut self, record: &MetricRecord) -> Vec<SeriesPoint> {
-        let plan = plan_series(record, self.histograms);
-        for note in plan.notes {
+    /// Counts the notes [`plan_series`] left for one record. A note about how a written series
+    /// looks (a degrade, a normalization) counts only when `written`: none of a record whose every
+    /// series the tag limit leaves off.
+    fn count_notes(&mut self, notes: &[Note], written: bool) {
+        for &note in notes {
             match note {
                 Note::NotSent(outcome) => self.metric_not_sent(outcome),
                 Note::Cumulative(outcome, kind) => self.unresolved_cumulative(outcome, kind),
+                Note::Degraded(_) | Note::DegradedReason(_) | Note::BoolValue if !written => {}
                 Note::Degraded(kind) => self.degraded_kind(kind),
                 Note::DegradedReason(reason) => self.out_degraded(reason),
                 Note::BoolValue => self.telemetry.count(
@@ -964,7 +965,6 @@ impl DatadogEncoder {
                 }
             }
         }
-        plan.points
     }
 
     /// `logit.output.metrics.degraded{metric_kind}`: a record written in a lesser form, once.
@@ -997,21 +997,27 @@ impl DatadogEncoder {
     ) {
         for event in &batch.events {
             let mut carriers = None;
+            // The tags `carriers` renders, counted without counting what it omits.
+            let base = metric_tag_count(&batch.resource, event);
             for record in &event.metrics[first_metric(&batch.resource, event)..] {
-                if !record_routes(record, self.histograms).series_route {
+                if !on_series_route(record) {
                     continue;
                 }
-                let points = self.series_points(record);
+                let plan = plan_series(record, self.histograms);
+                let points: Vec<&SeriesPoint> = plan
+                    .points
+                    .iter()
+                    .filter(|p| base + p.extra_tags() <= MAX_METRIC_TAGS)
+                    .collect();
+                self.count_notes(&plan.notes, !points.is_empty());
                 if points.is_empty() {
                     continue;
                 }
-                // Read lazily: an event with nothing for this route counts nothing.
+                // Read lazily: an event with nothing written on this route counts nothing.
                 let c =
                     carriers.get_or_insert_with(|| self.carriers(&batch.resource, event, route));
-                for p in &points {
-                    if c.tags.len() + p.extra_tags() <= MAX_METRIC_TAGS {
-                        f(event, record, c, p);
-                    }
+                for p in points {
+                    f(event, record, c, p);
                 }
             }
         }
@@ -2481,6 +2487,35 @@ mod tests {
         assert!(!record_routes(&h, counters).sketch);
         let samples = record(MetricKind::Samples(Samples::new([1.0])));
         assert!(!record_routes(&samples, plain).series_route);
+    }
+
+    /// On an event over the tag limit nothing is written, so nothing counts how a series would
+    /// have looked: no degrade, no normalization, no omitted tag. A skip still counts.
+    #[test]
+    fn a_record_the_tag_limit_leaves_off_counts_no_degrade() {
+        let (mut e, registry) = otlp_encoder(HistogramOptions::default());
+        let mut attrs = AttrMap::new();
+        for i in 0..=MAX_METRIC_TAGS {
+            attrs.insert(format!("t{i}").as_str(), Value::str("v"));
+        }
+        attrs.insert("blob", Value::Bytes(bytes::Bytes::from_static(b"x")));
+        let mut hll = HyperLogLog::new();
+        hll.insert(b"a");
+        let kinds = [
+            sum(2.0, Temporality::Delta, false),
+            MetricKind::Gauge(MetricValue::Bool(true)),
+            MetricKind::Set(hll),
+            sum(4.0, Temporality::Cumulative, true),
+        ];
+        let events =
+            kinds.map(|k| Event::metric(TS, attrs.clone(), MetricRecord::new(intern("m"), k)));
+        assert!(v2_series(&mut e, &batch(events.to_vec())).is_empty());
+        let c = counters(&registry);
+        assert_eq!(total(&c, "logit.output.metrics.degraded", "non_monotonic_sum"), 0.0);
+        assert_eq!(total(&c, "logit.output.metrics.degraded", "set_estimate"), 0.0);
+        assert_eq!(total(&c, "logit.output.metrics.normalized", "bool_value"), 0.0);
+        assert_eq!(total(&c, "logit.output.tags.omitted", "unrepresentable"), 0.0);
+        assert_eq!(total(&c, "logit.output.metrics.skipped", "cumulative_sum"), 1.0);
     }
 
     /// A `.bucket` or `.quantile` series whose own tags take the event's past the limit is left
