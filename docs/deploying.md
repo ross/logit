@@ -920,7 +920,7 @@ buffering:
 - `logit.component.retrying` (gauge): `1` while a sink holds a failing head. A hold drops nothing,
   so it never shows in `batches.dropped`.
 - `logit.component.buffer.push.blocked` (gauge): `1` while a full `block` buffer holds intake,
-  re-written every 500 ms of the wait, so every `internal` drain window of 500 ms or longer
+  re-written about every 500 ms of the wait, so every `internal` drain window of 1 s or longer
   reads it.
   `buffer.push.blocked.duration` records a wait only once it ends, so during a stall read this one.
 - **A retried batch doesn't inflate a sink's encode-side drop counters, but a drop a peer or the

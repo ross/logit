@@ -78,9 +78,12 @@ implements it once for all three; its module doc is the canonical statement of t
    next repeat's due time, and each wake re-writes the gauge, writes a repeat if one is due, and
    goes around the wait loop. A queue doesn't know `internal`'s `interval`, which any positive
    duration can set, so the period is a constant: half the shortest interval a shipped config uses
-   (`1s`), so each window of 500 ms or longer holds a write. A shorter `interval` can see windows
-   without it. The deadline is always 500 ms past the wake, never a due time already passed, so a
-   repeat that isn't written (the episode closed under a waiting push) can't make the wait spin.
+   (`1s`), so each window of 1 s or longer holds a write. Each deadline is set 500 ms after the
+   wake that sets it, and tokio rounds a deadline up, so writes land a little over 500 ms apart and
+   a 500 ms window can miss one; an `interval` under 1 s can see windows without it. The deadline
+   is always 500 ms past the wake, never a due time already passed, so a repeat that isn't written
+   can't make the wait spin. That happens when `finish` closes the episode while a push still
+   waits; recovery can't close it then, since `utilization` does nothing while a push waits.
 7. **Shutdown isn't a recovery.** `SinkStore::finish` and the UDP listener's residual drain end an
    open episode before they empty the queue, so the emptying they do (counted `shutdown`, or
    spooled for the next start) never reads as `buffer_recovered`.
