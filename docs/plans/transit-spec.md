@@ -510,9 +510,10 @@ Recorded per workstream as each lands.
 
   Hand-written rows kept because the table has no row or cell for what they state, each a
   candidate for a row with a case:
-  - `influxdb_out`'s `no_fields` drop (a histogram with no finite bound, a summary with no finite
-    quantile), and its uncounted omission of a non-finite component of a `Distribution`,
-    `Histogram`, or `Summary`.
+  - `influxdb_out`'s omission of a non-finite component of a `Distribution`, `Samples`,
+    `Histogram`, or `Summary`, counted `metrics.degraded{reason="non_finite_component"}`; no case
+    holds one. (Its `no_fields` drop is gone since ADR `influxdb-histogram-summary-shape`, which
+    writes `count` on every such line.)
   - A `Null` attribute, omitted as unrepresentable at `prometheus_out` and `influxdb_out`; the
     table has no `null_value` row.
   - `prometheus_out`'s label and name collisions, its type conflicts, its `# UNIT` character

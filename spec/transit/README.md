@@ -229,7 +229,7 @@ earlier cell of a list, the last cell names the negation of the earlier conditio
 Everything outside the regions stays hand-written: each codec's decode tables, its grammar, its
 permitted-normalization list (per-codec policy, not per-cell outcomes), and the encode rules and
 details the spec has no row for, such as `prometheus_out`'s name collisions or `influxdb_out`'s
-`no_fields` drop. Each module doc says which part is which. A new sink column needs both regions
+`non_finite_component` count. Each module doc says which part is which. A new sink column needs both regions
 and a protocol name in `docs.rs`'s `PROTOCOLS`, or the check fails.
 `crates/logit-cli/src/transit/docs.rs`'s module doc has the rules.
 
