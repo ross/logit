@@ -108,8 +108,8 @@
 //! - `Histogram{buckets,temporality,sum,min,max}` → `Histogram`: `buckets` holds per-bucket
 //!   counts, not cumulative ones, and the `f64::INFINITY` bound's count becomes the overflow
 //!   bucket `explicit_bounds` leaves implicit. OTLP requires that overflow count whenever there's
-//!   a bound, so a histogram with no `+Inf` bucket writes it as `0` and reads back with an empty
-//!   `+Inf` bucket, the `inf_bucket` normalization. Finite bounds are sorted and equal ones merged,
+//!   a bound, so a histogram with no `+Inf` or `NaN` bucket writes it as `0` and reads back with
+//!   an empty `+Inf` bucket, the `inf_bucket` normalization. Finite bounds are sorted and equal ones merged,
 //!   since OTLP requires them strictly increasing. A `-Inf` bound's count joins the first bucket
 //!   and a `NaN` bound's joins the overflow, counted
 //!   `logit.output.metrics.degraded{reason="non_finite_component"}` once per record
@@ -506,9 +506,9 @@ pub(crate) fn encode_metric(
 /// - every `+Inf` bucket's count is the overflow.
 ///
 /// OTLP's `HistogramDataPoint` requires `bucket_counts` to hold one more element than
-/// `explicit_bounds`, except that both may be empty (`metrics.proto`). So a histogram whose last
-/// bound is finite gains an overflow count of `0`, which `otlp_in` reads back as an empty `+Inf`
-/// bucket, and one with no buckets writes neither list. `count` stays the sum of every bucket.
+/// `explicit_bounds`, except that both may be empty (`metrics.proto`). So a histogram with a bound
+/// but no `+Inf` or `NaN` bucket writes an overflow count of `0`, which `otlp_in` reads back as an
+/// empty `+Inf` bucket, and one with no buckets writes neither list. `count` stays the sum of every bucket.
 fn histogram_buckets(buckets: &[(f64, u64)]) -> (Vec<u64>, Vec<f64>, bool) {
     let mut finite: Vec<(f64, u64)> =
         buckets.iter().copied().filter(|(bound, _)| bound.is_finite()).collect();
