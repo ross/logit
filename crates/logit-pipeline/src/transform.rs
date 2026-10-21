@@ -5,7 +5,8 @@
 //! `process` is per-event on purpose: it matches `aggregate`'s accumulation contract (one event
 //! in, absorbed or forwarded), and `process_into` lets one event also emit others into the same
 //! batch (`docs/adr/transform-fan-out.md`). Everything per-batch goes through the `observe_*`/`map_resource`/
-//! `end_batch` hooks, so the per-event hot path never widens for one implementer's needs.
+//! `begin_batch`/`end_batch` hooks, so the per-event hot path never widens for one implementer's
+//! needs.
 
 use crate::fanout::TraceContext;
 use logit_core::{Event, Provenance, Resource, Scope, SpanLink};
@@ -91,6 +92,22 @@ pub trait Transform: Send {
     fn map_resource(&mut self, resource: &Arc<Resource>) -> Option<Arc<Resource>> {
         let _ = resource;
         None
+    }
+
+    /// Called once per incoming batch, after `map_resource` and before any of its events reach
+    /// `process`, with the batch's resource, scope, and events. It may edit events in place and
+    /// remove them, but not add one: a new event goes through `process_into`'s `emitted`.
+    /// [`crate::runtime::process_batch`] counts a removed event under
+    /// `logit.component.events.discarded`, as it counts a `false` from `process`. For a transform
+    /// whose decision about one event depends on a later one in the same batch
+    /// (`dedup_timestamps`, `docs/adr/dedup-timestamps-transform.md`). Default no-op.
+    fn begin_batch(
+        &mut self,
+        resource: &Arc<Resource>,
+        scope: Option<&Arc<Scope>>,
+        events: &mut Vec<Event>,
+    ) {
+        let _ = (resource, scope, events);
     }
 
     /// Called once per incoming batch, after its last event has been through `process`. A place
