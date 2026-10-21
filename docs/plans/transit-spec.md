@@ -284,6 +284,11 @@ field.
 `otlp-to-statsd`, `otlp-to-prometheus`, `otlp-to-prometheus-remote-write`, `otlp-to-influxdb`,
 and `otlp-to-datadog`. OTLP logs and traces wait for a later workstream.
 
+`tgraph/w1` added `graphite_in` as a source, plaintext and pickle, with flows into each column:
+`graphite-to-statsd`, `graphite-to-influxdb`, `graphite-to-prometheus`,
+`graphite-to-prometheus-remote-write`, `graphite-to-otlp`, and `graphite-to-datadog`. The
+`graphite_out` column and the like pair follow in `tgraph/w2`.
+
 ### 8. Not in this stack
 
 - A backend layer: the same corpus through a real sink to a real backend, with the backend's
@@ -636,4 +641,46 @@ Recorded per workstream as each lands.
 
   No feature row covers a resource's or scope's schema URL, which every sink but `otlp_out`
   leaves off uncounted; the hand-written rows beside the regions name it (W5's list above).
+- **`graphite_in` source** (`tgraph/w1`): nine cases over 23 features.
+  - Four read `testdata/interop/graphite/`'s captures in place: `write-graphite`, collectd's
+    `write_graphite` plugin sending 100 CRLF plaintext lines over four read cycles, and
+    `pickle-p2`, `pickle-p5`, and `pickle-py2`, CPython 3.12 at protocols 2 and 5 and Python 2.7's
+    `cPickle`, each one length-prefixed frame on a connection.
+  - Four read one payload each from `testdata/differential/graphite-pickle/` in place: a tagged
+    path reused through the memo, the `-1` receipt-time timestamp, a Python 2 UTF-8 path, and the
+    value 2^63.
+  - `tagged` is hand-built plaintext, since no recorded sender writes carbon 1.1's tags: tags, a
+    repeated key, a `_logit.` tag name, values holding `=` and `~`, exponent, signed, integer,
+    and negative values, `-1` and fractional timestamps, runs of whitespace, and a non-ASCII
+    path.
 
+  A case's meta gains `protocol: plaintext | pickle`, read only for a graphite case, since a
+  pickle capture and a plaintext one share the `.raw` extension. A pickle wire file is split into
+  payloads by the length-prefix `Framer` `graphite_in` uses, or read as one payload under `.pkl`.
+  The Dropwizard capture isn't read: its NaN gauge counts
+  `input.metrics.dropped{reason=non_finite_value}`, and the generator refuses a wire file whose
+  decode drops anything.
+
+  `graphite_in` decodes every datapoint to an `f64` gauge with string tags, so the flows reach
+  only `gauge/f64`, `gauge/negative`, `attributes/string_value`, `attributes/no_host`,
+  `record/name_unsafe`, and `record/superseded`. Every record reached an existing row at the
+  class it states, so the table gained no row. What the flows show at each sink, each as the
+  table already states it:
+  - `statsd_out` writes a negative gauge as the `0|g` then `-v|g` pair, which `statsd_in` reads
+    back as a gauge of 0 and a relative adjustment (`gauge/negative`: `degraded`).
+  - `prometheus_out` writes each `.`, `-`, and non-ASCII character of a path as `_`
+    (`servers.web-1.cpu` as `servers_web_1_cpu`, `café.temperature` as `caf__temperature`),
+    uncounted (`record/name_unsafe`), so two paths that differ only there share a series. Its
+    exposition registry keeps only the last of `write-graphite`'s four read cycles, uncounted
+    (`record/superseded`).
+  - `influxdb_out` writes each path as a measurement with one `value` field, read back as a
+    gauge named `<path>.value` (`gauge/*`: `normalized`, `value_field`).
+  - `datadog_out` writes a `host` tag as the point's host and stamps the process hostname on a
+    point with none (`attributes/no_host`: `normalized`), and writes a fractional timestamp in
+    whole seconds.
+
+  One disagreement in the class check, not fixed here: its `statsd_out` spelling (`classes.rs`'s
+  `sanitized`) reads every character outside `[A-Za-z0-9._/-]` as `_`, while `statsd_out`
+  rewrites only `:`, `|`, `@`, `#`, `,`, control, and whitespace characters. So `café.temperature`
+  reaches `record/name_unsafe` at `statsd_out` and reads back `exact`, which the `normalized` cell
+  accepts.

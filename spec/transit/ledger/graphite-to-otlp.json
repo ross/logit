@@ -1,0 +1,10 @@
+{
+  "cells": [
+    {"sink":"otlp_out","row":"attributes/no_host","cell":0,"observed":["exact"]},
+    {"sink":"otlp_out","row":"attributes/string_value","cell":0,"observed":["exact"]},
+    {"sink":"otlp_out","row":"gauge/f64","cell":0,"observed":["exact"]},
+    {"sink":"otlp_out","row":"gauge/negative","cell":0,"observed":["exact"]},
+    {"sink":"otlp_out","row":"record/superseded","cell":0,"observed":["exact"]}
+  ],
+  "unspecified": []
+}

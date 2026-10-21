@@ -36,7 +36,8 @@
 //! the features from `features/<system>.yaml` the case `exercises`, an optional `wire:` file
 //! (relative to the case's directory) the `.json` is decoded from by `<system>_in`'s decoder at
 //! [`RECEIVED_AT`] (with the request's `name: value` headers from a `.headers` sidecar beside
-//! the wire file, and for a collectd case the `types.db` file an optional `types_db:` names, as
+//! the wire file, for a collectd case the `types.db` file an optional `types_db:` names, and for
+//! a graphite case the carbon protocol an optional `protocol: plaintext | pickle` names, as
 //! [`decode_wire`] reads them), and optional `tolerance:` entries (`{path, abs}`: an RFC 6901
 //! pointer into each event of the document, and the most the number there may differ by). A hand-written case
 //! has no `wire:`, and its `.json` must read back to itself through `logit_proto::event_json`
@@ -66,6 +67,8 @@ use logit_pipeline::test_util::TelemetryProbe;
 use logit_proto::collectd::{CollectdDecoder, TypesDb};
 use logit_proto::datadog::DatadogDecoder;
 use logit_proto::event_json::EventJsonDecoder;
+use logit_proto::framing::{Framer, FramingMode};
+use logit_proto::graphite::{GraphiteDecoder, Protocol, DEFAULT_MAX_FRAME_BYTES};
 use logit_proto::influxdb::{write_resource, InfluxDecoder, Precision};
 use logit_proto::otlp::OtlpDecoder;
 use logit_proto::prometheus::{
@@ -108,7 +111,30 @@ struct Meta {
     #[serde(default)]
     types_db: Option<String>,
     #[serde(default)]
+    protocol: Option<CarbonProtocol>,
+    #[serde(default)]
     tolerance: Vec<Tolerance>,
+}
+
+/// A graphite case's `protocol:`, `graphite_in`'s setting of that name.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum CarbonProtocol {
+    Plaintext,
+    Pickle,
+}
+
+/// How [`decode_wire`] reads a graphite case's wire file.
+#[derive(Debug, Clone, Copy)]
+enum CarbonWire {
+    /// Plaintext lines, the whole file at once.
+    Plaintext,
+    /// A pickle connection's byte stream: length-prefixed frames, as `testdata/interop/` records
+    /// one.
+    PickleStream,
+    /// One pickle payload with no length prefix: a `.pkl` file, as
+    /// `testdata/differential/graphite-pickle/` holds one.
+    PicklePayload,
 }
 
 /// How far one number in a document may move (module doc).
@@ -266,7 +292,22 @@ fn canonical(case: &Case) -> anyhow::Result<String> {
             )
         }
     };
-    decode_wire(&case.system, bytes, &headers, types_db.as_deref())
+    let carbon = match case.meta.protocol {
+        None => CarbonWire::Plaintext,
+        Some(protocol) => {
+            ensure!(case.system == "graphite", "protocol: names a graphite_in setting");
+            match protocol {
+                CarbonProtocol::Plaintext => CarbonWire::Plaintext,
+                CarbonProtocol::Pickle if wire.ends_with(".pkl") => CarbonWire::PicklePayload,
+                CarbonProtocol::Pickle => CarbonWire::PickleStream,
+            }
+        }
+    };
+    ensure!(
+        !wire.ends_with(".pkl") || matches!(carbon, CarbonWire::PicklePayload),
+        "a .pkl wire file is a pickle payload, so its case needs protocol: pickle"
+    );
+    decode_wire(&case.system, bytes, &headers, types_db.as_deref(), carbon)
         .with_context(|| format!("decoding {}", path.display()))
 }
 
@@ -330,11 +371,16 @@ const SCRAPE_INSTANCE: &str = "transit:9100";
 ///   OTLP/JSON metrics request per line.
 /// - `collectd`: one datagram through `CollectdDecoder`, under an empty resource, naming data
 ///   sources from the meta's `types_db:` file when it names one.
+/// - `graphite`: through `GraphiteDecoder` in the meta's `protocol:` (plaintext when absent),
+///   under an empty resource. Plaintext is the whole file, which the decoder splits into lines. A
+///   pickle file is a connection's stream, split into payloads by `graphite_in`'s length-prefix
+///   `Framer`, or under a `.pkl` extension one payload with no prefix.
 fn decode_wire(
     system: &str,
     bytes: Vec<u8>,
     headers: &Headers,
     types_db: Option<&str>,
+    carbon: CarbonWire,
 ) -> anyhow::Result<String> {
     let mut probe = TelemetryProbe::new();
     let id = "transit.case";
@@ -466,6 +512,39 @@ fn decode_wire(
             let (resource, scope) =
                 decoder.decode_into(Bytes::from(bytes), RECEIVED_AT, &mut events)?;
             vec![EventBatch { resource, scope, events }]
+        }
+        "graphite" => {
+            let telemetry = probe.telemetry(id, "graphite_in", "listener");
+            let diag = Diagnostics::new(id).with_telemetry(telemetry.clone());
+            let protocol = match carbon {
+                CarbonWire::Plaintext => Protocol::Plaintext,
+                CarbonWire::PickleStream | CarbonWire::PicklePayload => Protocol::Pickle,
+            };
+            let mut decoder = GraphiteDecoder::new(Arc::new(Resource::default()))
+                .with_protocol(protocol)
+                .with_telemetry(telemetry)
+                .with_diagnostics(diag);
+            let payloads = match carbon {
+                CarbonWire::Plaintext | CarbonWire::PicklePayload => vec![Bytes::from(bytes)],
+                CarbonWire::PickleStream => {
+                    let refused = |err| anyhow::anyhow!("graphite_in's framer refused: {err}");
+                    let mut framer =
+                        Framer::new(FramingMode::LengthPrefixed, DEFAULT_MAX_FRAME_BYTES);
+                    framer.push(&bytes);
+                    let mut frames = Vec::new();
+                    while let Some(frame) = framer.next_frame().map_err(refused)? {
+                        frames.push(frame);
+                    }
+                    frames.extend(framer.finish().map_err(refused)?);
+                    frames
+                }
+            };
+            let mut events = Vec::new();
+            let mut resource = Arc::new(Resource::default());
+            for payload in payloads {
+                (resource, _) = decoder.decode_into(payload, RECEIVED_AT, &mut events)?;
+            }
+            vec![EventBatch { resource, scope: None, events }]
         }
         other => bail!("no wire decoder for a {other} case yet"),
     };
@@ -1022,6 +1101,12 @@ flow_tests! {
     datadog_to_prometheus_remote_write => "datadog-to-prometheus-remote-write",
     datadog_to_prometheus => "datadog-to-prometheus",
     datadog_to_statsd => "datadog-to-statsd",
+    graphite_to_datadog => "graphite-to-datadog",
+    graphite_to_influxdb => "graphite-to-influxdb",
+    graphite_to_otlp => "graphite-to-otlp",
+    graphite_to_prometheus_remote_write => "graphite-to-prometheus-remote-write",
+    graphite_to_prometheus => "graphite-to-prometheus",
+    graphite_to_statsd => "graphite-to-statsd",
     influxdb_aggregate_to_prometheus => "influxdb-aggregate-to-prometheus",
     influxdb_relay => "influxdb-relay",
     influxdb_to_prometheus_remote_write => "influxdb-to-prometheus-remote-write",
