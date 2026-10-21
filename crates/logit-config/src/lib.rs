@@ -2888,6 +2888,27 @@ pub enum ComponentKind {
         #[serde(default = "default_max_series")]
         max_series: usize,
     },
+    /// Collapses the metric readings in one batch that share a series and a timestamp bucket into
+    /// one reading, for a destination that can't hold two readings of one series at one instant:
+    /// Prometheus remote-write at `1ms`, Datadog at `1s`. Place it last before the sink, since a
+    /// stage after it can make two series equal again.
+    ///
+    /// A series is the metric's name, unit, and kind, the resource, the instrumentation scope,
+    /// and the event's attributes. In each colliding set the latest reading survives with its
+    /// own timestamp. A gauge or cumulative reading before it is replaced by it. Delta sums and
+    /// histograms, raw samples, set members, sketches, and set estimates are merged into it. A
+    /// reading that can't merge, such as a `NaN` increment, a gauge delta, a delta summary, or a
+    /// histogram with other buckets, is forwarded untouched, and the sink may still drop it as a
+    /// duplicate. An event left with no metric, log, or span is discarded. It keeps no state
+    /// between batches, so two batches' readings of one instant both reach the sink.
+    DedupTimestamps {
+        /// The bucket width: two readings of one series collide when their timestamps divided by
+        /// it, rounded down, are equal. Match the destination's timestamp resolution: `1ms` for
+        /// Prometheus remote-write, `1s` for Datadog. Must be greater than zero.
+        #[serde(with = "humantime_serde_duration")]
+        #[schemars(with = "String")]
+        precision: Duration,
+    },
     /// Forwards stale events, discarding fresh ones, judged against the wall clock. The time
     /// judged is the span's end when the event has a span with one set, otherwise the event's
     /// timestamp. An event whose time is 0 (unknown) is never stale. An event is stale when it is
@@ -3210,6 +3231,9 @@ pub enum ComponentKind {
     // `routing-by-condition-is-lua`): each is expressible as a `lua` component, and referencing
     // one is a deserialization error naming the valid kinds. `sample` came back as a native kind
     // because consistent, keyed sampling is the one thing a `lua` component can't express.
+    // `dedup_timestamps` isn't `dedup`: it collapses a series' readings at one instant within a
+    // batch, which a `lua` component can't do without latency, and the event-level seen-set
+    // `dedup` named stays retired.
     /// InfluxDB 2.x line protocol over HTTP, with bounded output retry.
     // Renamed explicitly: `rename_all = "snake_case"` alone would tag this `influx_db_out`.
     #[serde(rename = "influxdb_out")]
@@ -6359,11 +6383,37 @@ mod tests {
 
     /// `filter`/`rename`/`throttle`/`dedup` are retired kinds: a config referencing one is a
     /// deserialization error naming the valid kinds, not graph validation's "not implemented".
+    /// `dedup_timestamps` is a different kind and leaves `dedup` retired.
     #[test]
     fn a_retired_kind_is_a_deserialization_error_not_an_unimplemented_kind() {
-        let err = serde_json::from_str::<Component>(r#"{"type": "filter", "sources": ["in"]}"#)
-            .unwrap_err();
-        assert!(err.to_string().contains("unknown variant"), "got: {err}");
+        for kind in ["filter", "rename", "throttle", "dedup"] {
+            let json = format!(r#"{{"type": "{kind}", "sources": ["in"]}}"#);
+            let err = serde_json::from_str::<Component>(&json).unwrap_err();
+            assert!(err.to_string().contains("unknown variant"), "{kind}: {err}");
+        }
+    }
+
+    #[test]
+    fn dedup_timestamps_requires_a_precision() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "dedup_timestamps", "sources": ["in"], "precision": "1ms"}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::DedupTimestamps { precision } => {
+                assert_eq!(precision, Duration::from_millis(1));
+            }
+            other => panic!("expected DedupTimestamps, got {other:?}"),
+        }
+        let err =
+            serde_json::from_str::<Component>(r#"{"type": "dedup_timestamps", "sources": ["in"]}"#)
+                .unwrap_err();
+        assert!(err.to_string().contains("precision"), "got: {err}");
+        let err = serde_json::from_str::<Component>(
+            r#"{"type": "dedup_timestamps", "sources": ["in"], "precision": "1ms", "window": "1s"}"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("unknown field"), "got: {err}");
     }
 
     #[test]

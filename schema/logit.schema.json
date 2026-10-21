@@ -2312,6 +2312,31 @@
           "additionalProperties": false
         },
         {
+          "description": "Collapses the metric readings in one batch that share a series and a timestamp bucket into one reading, for a destination that can't hold two readings of one series at one instant: Prometheus remote-write at `1ms`, Datadog at `1s`. Place it last before the sink, since a stage after it can make two series equal again.\n\nA series is the metric's name, unit, and kind, the resource, the instrumentation scope, and the event's attributes. In each colliding set the latest reading survives with its own timestamp. A gauge or cumulative reading before it is replaced by it. Delta sums and histograms, raw samples, set members, sketches, and set estimates are merged into it. A reading that can't merge, such as a `NaN` increment, a gauge delta, a delta summary, or a histogram with other buckets, is forwarded untouched, and the sink may still drop it as a duplicate. An event left with no metric, log, or span is discarded. It keeps no state between batches, so two batches' readings of one instant both reach the sink.",
+          "type": "object",
+          "required": [
+            "precision",
+            "type"
+          ],
+          "properties": {
+            "buffer": true,
+            "precision": {
+              "description": "The bucket width: two readings of one series collide when their timestamps divided by it, rounded down, are equal. Match the destination's timestamp resolution: `1ms` for Prometheus remote-write, `1s` for Datadog. Must be greater than zero.",
+              "type": "string"
+            },
+            "receive": true,
+            "sources": true,
+            "targets": true,
+            "type": {
+              "type": "string",
+              "enum": [
+                "dedup_timestamps"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
           "description": "Forwards stale events, discarding fresh ones, judged against the wall clock. The time judged is the span's end when the event has a span with one set, otherwise the event's timestamp. An event whose time is 0 (unknown) is never stale. An event is stale when it is older than `max_age`, or, with `max_ahead` set, further in the future than `max_ahead`; an age equal to the bound is fresh. The clock is read once per batch.\n\n`max_age` must cover the clock skew between tiers, one `aggregate` flush interval, and normal pipeline latency, or fresh events are called stale.\n\nWith the same bounds, `has_stale` forwards what `drop_stale` discards. Point it at an archive sink, such as a `file_out` with `format: native`, which keeps every field.",
           "type": "object",
           "required": [

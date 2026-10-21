@@ -21,7 +21,7 @@ use logit_bench::alloc::{measure, CountingAlloc, Stats};
 use logit_bench::fixtures;
 use logit_core::subslice::within;
 use logit_core::{
-    AttrMap, EventBatch, MetricKind, MetricValue, Registry, Resource, Severity, Telemetry,
+    AttrMap, Event, EventBatch, MetricKind, MetricValue, Registry, Resource, Severity, Telemetry,
     TraceRef, Value,
 };
 use logit_outputs::influxdb::InfluxLineEncoder;
@@ -1194,6 +1194,47 @@ fn cumulative_to_delta_one_converted_record() {
     let MetricKind::Sum(sum) = &event.metrics[0].kind else { panic!("expected a Sum") };
     assert_eq!(sum.value, MetricValue::F64(15.0));
     expect_allocs("cumulative_to_delta: convert 1 record", stats, 0);
+}
+
+/// A batch of 16 counters, one per series: `code` takes 16 values. `collide` stamps every
+/// event in one millisecond and repeats the first series, so the last event collides with it.
+fn dedup_batch(collide: bool) -> Vec<Event> {
+    (0..16)
+        .map(|i| {
+            let mut e = fixtures::cumulative_counter_event(1_000_000 + i, i as f64);
+            let code = if collide && i == 15 { 0 } else { i };
+            e.attributes.insert("code", code.to_string().as_str());
+            e
+        })
+        .collect()
+}
+
+/// Zero: with no collision, a batch costs one hash and one probe per record into a table and a
+/// list that keep their capacity across batches.
+#[test]
+fn dedup_timestamps_a_batch_with_no_collision() {
+    let mut t = fixtures::dedup_timestamps();
+    let resource = fixtures::resource();
+    let mut warm = dedup_batch(false);
+    t.begin_batch(&resource, None, &mut warm);
+    let mut events = dedup_batch(false);
+    let ((), stats) = measure(|| t.begin_batch(&resource, None, &mut events));
+    assert_eq!(events.len(), 16);
+    expect_allocs("dedup_timestamps: 16 records, no collision", stats, 0);
+}
+
+/// Five: a collision pays for the second pass, one `Vec` each for the colliding entries, the
+/// hash run's taken flags, the set, its verdicts, and the emptied events' indices.
+#[test]
+fn dedup_timestamps_a_batch_with_one_collision() {
+    let mut t = fixtures::dedup_timestamps();
+    let resource = fixtures::resource();
+    let mut warm = dedup_batch(true);
+    t.begin_batch(&resource, None, &mut warm);
+    let mut events = dedup_batch(true);
+    let ((), stats) = measure(|| t.begin_batch(&resource, None, &mut events));
+    assert_eq!(events.len(), 15, "the earlier reading is absorbed and its event removed");
+    expect_allocs("dedup_timestamps: 16 records, one collision", stats, 5);
 }
 
 /// Zero: `filtered` rebuilds the map, but three surviving attributes fit inline. Its per-key
