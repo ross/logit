@@ -1,0 +1,5 @@
+# TYPE a counter
+a_total 1
+# TYPE c counter
+c_total 2 # {customer.tier="gold"} 1
+# EOF

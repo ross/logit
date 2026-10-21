@@ -123,7 +123,7 @@ use logit_core::EventBatch;
 use logit_outputs::ndjson::render_ndjson;
 use logit_proto::event_json::EventJsonDecoder;
 use logit_proto::influxdb::ATTR_MEASUREMENT;
-use logit_proto::prometheus::text::exposed_exemplar_labels;
+use logit_proto::prometheus::text::exposed_exemplar_keys;
 use logit_proto::prometheus::{sanitize_label_name, sanitize_metric_name};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -319,15 +319,14 @@ impl Spelling {
     }
 
     /// The `record/exemplar_key_unsafe*` row `rec` reaches when an exemplar the OpenMetrics
-    /// writer puts on a line carries a public attribute key it writes as a label name it would
-    /// have to rewrite: `exemplar_key_unsafe` for a monotonic `sum`,
-    /// `exemplar_key_unsafe_histogram` for a `histogram`, the two kinds whose exposition lines
-    /// carry an exemplar. The selection is the OpenMetrics writer's (`exposed_exemplar_labels`): a
-    /// counter's first, a histogram's first per bucket, each within the label budget. Remote-write
-    /// writes every exemplar, so its `exact` cell is reached only through those exemplars too,
-    /// whatever the others carry. Only `prometheus_out` writes
-    /// an exemplar's attributes under a name rule; `otlp_out` writes them as is, and the other
-    /// sinks write no exemplars.
+    /// writer puts on a line writes a label from an attribute key it sanitizes:
+    /// `exemplar_key_unsafe` for a monotonic `sum`, `exemplar_key_unsafe_histogram` for a
+    /// `histogram`, the two kinds whose exposition lines carry an exemplar. The selection is the
+    /// OpenMetrics writer's (`exposed_exemplar_keys`): a counter's first, a histogram's first per
+    /// bucket, each within the label budget. Remote-write writes every exemplar, so the cell is
+    /// reached only through those exemplars there too, whatever the others carry. Only
+    /// `prometheus_out` writes an exemplar's attributes under a name rule; `otlp_out` writes them
+    /// as is, and the other sinks write no exemplars.
     fn exemplar_key_unsafe(self, rec: &Rec) -> Option<&'static str> {
         if self != Spelling::Prometheus {
             return None;
@@ -338,10 +337,10 @@ impl Spelling {
             _ => return None,
         };
         let record = model_record(rec)?;
-        let reaches = exposed_exemplar_labels(&record)
+        let reaches = exposed_exemplar_keys(&record)
             .iter()
             .flatten()
-            .any(|(key, _)| sanitize_label_name(key) != key.as_str());
+            .any(|key| sanitize_label_name(key) != key.as_str());
         reaches.then_some(feature)
     }
 

@@ -233,8 +233,10 @@
 //!
 //! **Registry mode counts both directions on one encoder.** `send` and a render share a single
 //! [`PrometheusEncoder`], so `send`'s drops and a render's
-//! `degraded{reason="exemplar_omitted"|"unit_not_suffix"}` from [`text::write_with`] add up as one
-//! component's totals. The lock order that implies (encoder before registry) is on
+//! `degraded{reason="exemplar_omitted"|"unit_not_suffix"}` and, for an exemplar's keys,
+//! `labels.omitted{reason="collision"|"reserved"}` from [`text::write_with`] add up as one
+//! component's totals. A render counts once per OpenMetrics scrape, where `send` counts a series
+//! label's omission once per batch. The lock order that implies (encoder before registry) is on
 //! [`ExposeOutput::encoder`]. Sender mode has one direction and `&mut self`, so its encoder is a
 //! plain field, counting once per batch however many attempts it takes (`crate::accounting`);
 //! registry mode's `send` never fails, so it has no gate.
@@ -506,7 +508,8 @@ impl Registry {
     }
 
     /// Renders through [`text::write_with`], not [`text::write`], so the writer's drops
-    /// (`degraded{reason="exemplar_omitted"|"unit_not_suffix"}`, and
+    /// (`degraded{reason="exemplar_omitted"|"unit_not_suffix"}`,
+    /// `labels.omitted{reason="collision"|"reserved"}` for an exemplar's keys, and
     /// `dropped{reason="name_collision"}` for two families with one `# TYPE` name) count on the
     /// encoder `send` uses. Post-sanitization family-name collisions are that encoder's to drop and
     /// count too.
