@@ -953,10 +953,15 @@ impl DatadogEncoder {
             unit: true,
         };
         let start = out.len();
+        // The kind a record leaves in a lesser form as, counted once if anything is written.
+        let mut degraded = None;
         match &record.kind {
             MetricKind::Sum(sum) => {
                 // The translator's `mapToDDFormat`: any delta sum is a `count`, a cumulative
                 // non-monotonic one a `gauge`.
+                if !sum.monotonic {
+                    degraded = Some("non_monotonic_sum");
+                }
                 let wire_type = match (sum.temporality, sum.monotonic) {
                     (Temporality::Delta, _) => WireType::Count,
                     (Temporality::Cumulative, false) => WireType::Gauge,
@@ -1000,6 +1005,10 @@ impl DatadogEncoder {
                     }
                     return;
                 }
+                // Under `distributions`, the sketch route counts the record it sketches.
+                if self.histograms.mode != HistogramMode::Distributions {
+                    degraded = Some("histogram");
+                }
                 let count = h.buckets.iter().fold(0u64, |a, b| a.saturating_add(b.1));
                 self.aggregation_points(count as f64, h.sum, h.min, h.max, out);
                 if self.histograms.mode == HistogramMode::Counters {
@@ -1035,6 +1044,7 @@ impl DatadogEncoder {
                     self.metric_not_sent(MetricOut::NoRecordedValue);
                     return;
                 }
+                // Its cell names the omitted count and sum, so the quantiles' form isn't counted.
                 for (q, v) in &summary.quantiles {
                     out.push(SeriesPoint {
                         suffix: "quantile",
@@ -1072,6 +1082,14 @@ impl DatadogEncoder {
                 self.metric_not_sent(MetricOut::NonFiniteValue);
             }
         }
+        if let (Some(kind), true) = (degraded, out.len() > start) {
+            self.degraded_kind(kind);
+        }
+    }
+
+    /// `logit.output.metrics.degraded{metric_kind}`: a record written in a lesser form, once.
+    pub(super) fn degraded_kind(&self, kind: &'static str) {
+        self.telemetry.count("logit.output.metrics.degraded", 1.0, &[("metric_kind", kind)]);
     }
 
     /// `send_aggregation_metrics`'s series for a delta histogram: `.count` (no unit) and `.sum`

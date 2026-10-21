@@ -16,7 +16,7 @@
     {"sink":"datadog_out","row":"attributes/trace_id_high","cell":0,"observed":["normalized"]},
     {"sink":"datadog_out","row":"distribution","cell":0,"observed":["exact"]},
     {"sink":"datadog_out","row":"exponential_histogram/cumulative","cell":0,"observed":["skipped"]},
-    {"sink":"datadog_out","row":"exponential_histogram/delta","cell":0,"observed":["skipped"]},
+    {"sink":"datadog_out","row":"exponential_histogram/delta","cell":0,"observed":["degraded"]},
     {"sink":"datadog_out","row":"gauge/bool","cell":0,"observed":["normalized"]},
     {"sink":"datadog_out","row":"gauge/f64","cell":0,"observed":["exact"]},
     {"sink":"datadog_out","row":"gauge/i64","cell":0,"observed":["normalized"]},
@@ -27,7 +27,7 @@
     {"sink":"datadog_out","row":"gauge_delta/i64","cell":0,"observed":["dropped"]},
     {"sink":"datadog_out","row":"gauge_delta/u64","cell":0,"observed":["dropped"]},
     {"sink":"datadog_out","row":"histogram/cumulative","cell":0,"observed":["skipped"]},
-    {"sink":"datadog_out","row":"histogram/delta","cell":0,"observed":["skipped"]},
+    {"sink":"datadog_out","row":"histogram/delta","cell":2,"observed":["degraded"]},
     {"sink":"datadog_out","row":"log/beside_metrics","cell":0,"observed":["exact"]},
     {"sink":"datadog_out","row":"log/dogstatsd_event","cell":0,"observed":["exact"]},
     {"sink":"datadog_out","row":"log/plain","cell":0,"observed":["exact"]},
@@ -54,13 +54,13 @@
     {"sink":"datadog_out","row":"span/no_wire_form","cell":0,"observed":["degraded"]},
     {"sink":"datadog_out","row":"sum/bool","cell":0,"observed":["normalized"]},
     {"sink":"datadog_out","row":"sum/cumulative_monotonic","cell":0,"observed":["skipped"]},
-    {"sink":"datadog_out","row":"sum/cumulative_nonmonotonic","cell":0,"observed":["skipped"]},
+    {"sink":"datadog_out","row":"sum/cumulative_nonmonotonic","cell":0,"observed":["degraded"]},
     {"sink":"datadog_out","row":"sum/delta_monotonic","cell":0,"observed":["exact"]},
-    {"sink":"datadog_out","row":"sum/delta_nonmonotonic","cell":0,"observed":["skipped"]},
+    {"sink":"datadog_out","row":"sum/delta_nonmonotonic","cell":0,"observed":["degraded"]},
     {"sink":"datadog_out","row":"sum/f64","cell":0,"observed":["exact"]},
     {"sink":"datadog_out","row":"sum/i64","cell":0,"observed":["normalized"]},
     {"sink":"datadog_out","row":"sum/u64","cell":0,"observed":["normalized"]},
-    {"sink":"datadog_out","row":"summary","cell":0,"observed":["skipped"]}
+    {"sink":"datadog_out","row":"summary","cell":0,"observed":["degraded"]}
   ],
   "unspecified": []
 }

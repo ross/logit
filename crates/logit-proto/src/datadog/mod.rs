@@ -123,9 +123,9 @@
 //! | Row | Class | Reason or counter | What a consumer sees |
 //! |---|---|---|---|
 //! | `sum/delta_monotonic` | exact | -- | A series `count` point, its `interval` from the `_logit.datadog.interval` carrier or 0, which datadog_in reads back as a delta monotonic sum. |
-//! | `sum/delta_nonmonotonic` | skipped | `logit.output.metrics.skipped{metric_kind=non_monotonic_delta_sum}` | A Datadog `count` is a monotonic per-interval value, so a non-monotonic delta sum isn't written. |
-//! | `sum/cumulative_monotonic` | skipped | `logit.output.metrics.skipped{metric_kind=cumulative_sum}` | A Datadog `count` carries a per-interval value, so a running total isn't written. |
-//! | `sum/cumulative_nonmonotonic` | skipped | `logit.output.metrics.skipped{metric_kind=cumulative_sum}` | A running total isn't written, as for a monotonic one. |
+//! | `sum/delta_nonmonotonic` | degraded | `logit.output.metrics.degraded{metric_kind=non_monotonic_sum}` | A series `count` point of the raw value, as Datadog's exporter sends any delta sum, which datadog_in reads back as a monotonic delta sum. |
+//! | `sum/cumulative_monotonic` | skipped | `logit.output.metrics.skipped{metric_kind=cumulative_sum}` | Datadog's exporter differences a running total into a delta first, and nothing in logit does that yet, so it isn't written; a throttled `unresolved_cumulative` diagnostic says so. |
+//! | `sum/cumulative_nonmonotonic` | degraded | `logit.output.metrics.degraded{metric_kind=non_monotonic_sum}` | A series `gauge` point of the running value, as Datadog's exporter sends it, which datadog_in reads back as a gauge. |
 //! | `sum/f64` | exact | -- | The point's double. |
 //! | `sum/i64` | normalized | `integer_as_double` | The point's double, the integer's nearest `f64`, read back as a float. |
 //! | `sum/u64` | normalized | `integer_as_double` | The point's double, the integer's nearest `f64`, read back as a float. |
@@ -143,11 +143,13 @@
 //! | `set_members` | skipped | `logit.output.metrics.skipped{metric_kind=set_members}` | The series encoders have no form for set members, so none is written. |
 //! | `distribution` | exact | -- | A sketch under `Mapping::agent`, bin for bin, with its exact count, sum, min, and max; `avg` is recomputed from them. |
 //! | `set` | degraded | `logit.output.metrics.degraded{reason=set_estimate}` | A series `gauge` of the estimate, the Agent's `s`; the registers are gone. |
-//! | `histogram/delta` | skipped | `logit.output.metrics.skipped{metric_kind=histogram}` | The series encoders have no histogram, so none is written; `docs/known-gaps/datadog.md`'s "`datadog_out` sends no Agent-style `h`/`ms` aggregates" entry has the follow-up. |
-//! | `histogram/cumulative` | skipped | `logit.output.metrics.skipped{metric_kind=histogram}` | The series encoders have no histogram, so none is written. |
-//! | `exponential_histogram/delta` | skipped | `logit.output.metrics.skipped{metric_kind=exponential_histogram}` | The series encoders have no exponential histogram, so none is written. |
-//! | `exponential_histogram/cumulative` | skipped | `logit.output.metrics.skipped{metric_kind=exponential_histogram}` | The series encoders have no exponential histogram, so none is written. |
-//! | `summary` | skipped | `logit.output.metrics.skipped{metric_kind=summary}` | The series encoders have no summary, so none is written. |
+//! | `histogram/delta`, under `histograms: {"mode":"counters","send_aggregation_metrics":true}` | degraded | `logit.output.metrics.degraded{metric_kind=histogram}` | Under `histograms.mode: counters`, a `<name>.bucket` count per bucket tagged `lower_bound` and `upper_bound` in the exporter's `formatFloat` form, beside the `.count`, `.sum`, `.min`, and `.max` series. |
+//! | `histogram/delta`, under `histograms: {"mode":"nobuckets","send_aggregation_metrics":true}` | degraded | `logit.output.metrics.degraded{metric_kind=histogram}` | Under `histograms.mode: nobuckets`, the `.count`, `.sum`, `.min`, and `.max` series alone. |
+//! | `histogram/delta`, otherwise | degraded | `logit.output.metrics.degraded{metric_kind=histogram}` | A sketch under `Mapping::agent` with its counts spread over the buckets as Datadog's exporter spreads them, and the point's count, sum, and average, which datadog_in reads back as a distribution. |
+//! | `histogram/cumulative` | skipped | `logit.output.metrics.skipped{metric_kind=histogram}` | Datadog's exporter differences a running total into a delta first, and nothing in logit does that yet, so it isn't written; a throttled `unresolved_cumulative` diagnostic says so. |
+//! | `exponential_histogram/delta` | degraded | `logit.output.metrics.degraded{metric_kind=exponential_histogram}` | A sketch under every `histograms.mode`, its buckets re-mapped onto the Agent's bins as Datadog's exporter re-maps them, with the point's count, sum, and average, which datadog_in reads back as a distribution; with `send_aggregation_metrics`, the `.count`, `.sum`, `.min`, and `.max` series too. |
+//! | `exponential_histogram/cumulative` | skipped | `logit.output.metrics.skipped{metric_kind=exponential_histogram}` | Datadog's exporter can't send a cumulative exponential histogram, and nothing in logit turns one into a delta yet, so it isn't written; a throttled `unresolved_cumulative` diagnostic says so. |
+//! | `summary` | degraded | `logit.output.fields.omitted{reason=unresolved_cumulative}` | A `<name>.quantile` gauge per quantile tagged `quantile:<q>`, which datadog_in reads back as gauges. The running count and sum need differencing first, which nothing in logit does yet, so they aren't written, counted, with a throttled `unresolved_cumulative` diagnostic. |
 //! | `record/no_recorded_value` | skipped | `logit.output.metrics.skipped{reason=no_recorded_value}` | Datadog has no marker for a point with no recorded value, so it isn't written. |
 //! | `record/no_recorded_value_delta_sum` | skipped | `logit.output.metrics.skipped{reason=no_recorded_value}` | Datadog has no marker for a point with no recorded value, so it isn't written. |
 //! | `record/no_recorded_value_other_kind` | skipped | `logit.output.metrics.skipped{reason=no_recorded_value}` | Datadog has no marker for a point with no recorded value, so it isn't written. |

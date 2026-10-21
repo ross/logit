@@ -39,8 +39,11 @@
   "openmetrics-total-created": {"events": [], "counters": {
     "logit.output.metrics.skipped{component=out,kind=datadog_out,metric_kind=cumulative_sum,role=sink}": 1
   }},
-  "summary": {"events": [], "counters": {
-    "logit.output.metrics.skipped{component=out,kind=datadog_out,metric_kind=summary,role=sink}": 1
+  "summary": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"rpc_duration_seconds.quantile","kind":"gauge","value":0.05}],"attributes":{"host.name":"transit","instance":"transit:9100","quantile":"0.5"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"rpc_duration_seconds.quantile","kind":"gauge","value":0.2}],"attributes":{"host.name":"transit","instance":"transit:9100","quantile":"0.99"}}
+  ], "counters": {
+    "logit.output.fields.omitted{component=out,kind=datadog_out,reason=unresolved_cumulative,role=sink}": 1
   }},
   "typed-attributes": {"events": [
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"temperature","kind":"gauge","value":21.5}],"attributes":{"count":"7","host.name":"transit","room":"lab","seen":"2027-01-15T07:00:00.000000000Z"}}

@@ -17,7 +17,7 @@
     {"sink":"datadog_out","row":"record/unit","cell":0,"observed":["exact"]},
     {"sink":"datadog_out","row":"sum/cumulative_monotonic","cell":0,"observed":["skipped"]},
     {"sink":"datadog_out","row":"sum/f64","cell":0,"observed":[]},
-    {"sink":"datadog_out","row":"summary","cell":0,"observed":["skipped"]}
+    {"sink":"datadog_out","row":"summary","cell":0,"observed":["degraded"]}
   ],
   "unspecified": []
 }

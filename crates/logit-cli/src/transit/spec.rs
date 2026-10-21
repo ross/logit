@@ -1031,6 +1031,8 @@ flow_tests! {
     influxdb_to_statsd => "influxdb-to-statsd",
     otlp_relay => "otlp-relay",
     otlp_to_datadog => "otlp-to-datadog",
+    otlp_to_datadog_counters => "otlp-to-datadog-counters",
+    otlp_to_datadog_nobuckets => "otlp-to-datadog-nobuckets",
     otlp_to_influxdb => "otlp-to-influxdb",
     otlp_to_prometheus_remote_write => "otlp-to-prometheus-remote-write",
     otlp_to_prometheus => "otlp-to-prometheus",

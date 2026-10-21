@@ -231,6 +231,9 @@ impl DatadogEncoder {
                     _ => continue,
                 };
                 let Some(dog) = self.dogsketch(sketch, event.timestamp, avg) else { continue };
+                if !matches!(record.kind, MetricKind::Distribution(_)) {
+                    self.degraded_kind(record.kind.name());
+                }
                 let c = carriers
                     .get_or_insert_with(|| self.carriers(&batch.resource, event, Route::Sketches));
                 sketches.push(Sketch {

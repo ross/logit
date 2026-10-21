@@ -82,11 +82,11 @@ rows:
         class: exact
         text: An OTLP `Sum` with delta temporality, not monotonic.
       datadog_out:
-        class: skipped
-        counter: logit.output.metrics.skipped{metric_kind=non_monotonic_delta_sum}
+        class: degraded
+        counter: logit.output.metrics.degraded{metric_kind=non_monotonic_sum}
         text: >-
-          A Datadog `count` is a monotonic per-interval value, so a non-monotonic delta sum isn't
-          written.
+          A series `count` point of the raw value, as Datadog's exporter sends any delta sum, which
+          datadog_in reads back as a monotonic delta sum.
   - kind: sum
     feature: cumulative_monotonic
     cells:
@@ -118,7 +118,9 @@ rows:
         class: skipped
         counter: logit.output.metrics.skipped{metric_kind=cumulative_sum}
         text: >-
-          A Datadog `count` carries a per-interval value, so a running total isn't written.
+          Datadog's exporter differences a running total into a delta first, and nothing in logit
+          does that yet, so it isn't written; a throttled `unresolved_cumulative` diagnostic says
+          so.
   - kind: sum
     feature: cumulative_nonmonotonic
     cells:
@@ -143,10 +145,11 @@ rows:
         class: exact
         text: An OTLP `Sum` with cumulative temporality, not monotonic.
       datadog_out:
-        class: skipped
-        counter: logit.output.metrics.skipped{metric_kind=cumulative_sum}
+        class: degraded
+        counter: logit.output.metrics.degraded{metric_kind=non_monotonic_sum}
         text: >-
-          A running total isn't written, as for a monotonic one.
+          A series `gauge` point of the running value, as Datadog's exporter sends it, which
+          datadog_in reads back as a gauge.
 
   # --- sum: scalar type ------------------------------------------------------------------------
   - kind: sum
@@ -681,11 +684,25 @@ rows:
         class: exact
         text: An OTLP `Histogram` with delta temporality.
       datadog_out:
-        class: skipped
-        counter: logit.output.metrics.skipped{metric_kind=histogram}
-        text: >-
-          The series encoders have no histogram, so none is written; `docs/known-gaps/datadog.md`'s
-          "`datadog_out` sends no Agent-style `h`/`ms` aggregates" entry has the follow-up.
+        - when: {histograms: {mode: counters, send_aggregation_metrics: true}}
+          class: degraded
+          counter: logit.output.metrics.degraded{metric_kind=histogram}
+          text: >-
+            Under `histograms.mode: counters`, a `<name>.bucket` count per bucket tagged
+            `lower_bound` and `upper_bound` in the exporter's `formatFloat` form, beside the
+            `.count`, `.sum`, `.min`, and `.max` series.
+        - when: {histograms: {mode: nobuckets, send_aggregation_metrics: true}}
+          class: degraded
+          counter: logit.output.metrics.degraded{metric_kind=histogram}
+          text: >-
+            Under `histograms.mode: nobuckets`, the `.count`, `.sum`, `.min`, and `.max` series
+            alone.
+        - class: degraded
+          counter: logit.output.metrics.degraded{metric_kind=histogram}
+          text: >-
+            A sketch under `Mapping::agent` with its counts spread over the buckets as Datadog's
+            exporter spreads them, and the point's count, sum, and average, which datadog_in reads
+            back as a distribution.
   - kind: histogram
     feature: cumulative
     cells:
@@ -719,7 +736,9 @@ rows:
         class: skipped
         counter: logit.output.metrics.skipped{metric_kind=histogram}
         text: >-
-          The series encoders have no histogram, so none is written.
+          Datadog's exporter differences a running total into a delta first, and nothing in logit
+          does that yet, so it isn't written; a throttled `unresolved_cumulative` diagnostic says
+          so.
   - kind: exponential_histogram
     feature: delta
     cells:
@@ -753,10 +772,13 @@ rows:
         class: exact
         text: An OTLP `ExponentialHistogram`, field for field.
       datadog_out:
-        class: skipped
-        counter: logit.output.metrics.skipped{metric_kind=exponential_histogram}
+        class: degraded
+        counter: logit.output.metrics.degraded{metric_kind=exponential_histogram}
         text: >-
-          The series encoders have no exponential histogram, so none is written.
+          A sketch under every `histograms.mode`, its buckets re-mapped onto the Agent's bins as
+          Datadog's exporter re-maps them, with the point's count, sum, and average, which
+          datadog_in reads back as a distribution; with `send_aggregation_metrics`, the `.count`,
+          `.sum`, `.min`, and `.max` series too.
   - kind: exponential_histogram
     feature: cumulative
     cells:
@@ -789,7 +811,9 @@ rows:
         class: skipped
         counter: logit.output.metrics.skipped{metric_kind=exponential_histogram}
         text: >-
-          The series encoders have no exponential histogram, so none is written.
+          Datadog's exporter can't send a cumulative exponential histogram, and nothing in logit
+          turns one into a delta yet, so it isn't written; a throttled `unresolved_cumulative`
+          diagnostic says so.
   - kind: summary
     cells:
       statsd_out:
@@ -812,10 +836,13 @@ rows:
         class: exact
         text: An OTLP `Summary`.
       datadog_out:
-        class: skipped
-        counter: logit.output.metrics.skipped{metric_kind=summary}
+        class: degraded
+        counter: logit.output.fields.omitted{reason=unresolved_cumulative}
         text: >-
-          The series encoders have no summary, so none is written.
+          A `<name>.quantile` gauge per quantile tagged `quantile:<q>`, which datadog_in reads back
+          as gauges. The running count and sum need differencing first, which nothing in logit does
+          yet, so they aren't written, counted, with a throttled `unresolved_cumulative`
+          diagnostic.
 
   # --- record fields ---------------------------------------------------------------------------
   - kind: record
