@@ -486,6 +486,13 @@ func explicitCases() []explicitCase {
 		{name: "huge-finite-bounds", bounds: []float64{1e300, 1e301}, counts: []uint64{0, 5, 0}, sum: f(5e300)},
 		{name: "huge-finite-open-last", bounds: []float64{1e300}, counts: []uint64{0, 5}, sum: f(5e300)},
 		{name: "tiny-bounds", bounds: []float64{1e-12, 1e-10}, counts: []uint64{0, 9, 0}, sum: f(1e-10)},
+		// A NaN outermost bound becomes the summary's min or max where the point has none.
+		{name: "nan-lower-bound", bounds: []float64{math.NaN(), 10}, counts: []uint64{0, 5, 0}, sum: f(25)},
+		{name: "nan-upper-bound", bounds: []float64{1, math.NaN()}, counts: []uint64{0, 5, 0}, sum: f(25)},
+		{name: "nan-bound-min-max", bounds: []float64{math.NaN(), 10}, counts: []uint64{0, 5, 0}, sum: f(25), min: f(2), max: f(9)},
+		// An infinite explicit bound, below the implicit ones.
+		{name: "neg-inf-bound", bounds: []float64{math.Inf(-1), 5, 10}, counts: []uint64{2, 3, 4, 1}, sum: f(40)},
+		{name: "pos-inf-bound", bounds: []float64{5, math.Inf(1)}, counts: []uint64{1, 3, 2}, sum: f(40)},
 		{name: "straddle-agent-min", bounds: []float64{1e-10, 1e-8}, counts: []uint64{0, 1000, 0}, sum: f(5e-6)},
 		{name: "min-max-inverted", bounds: []float64{1, 2}, counts: []uint64{0, 4, 0}, sum: f(6), min: f(1.9), max: f(1.1)},
 		{name: "min-only", bounds: []float64{1, 2, 4}, counts: []uint64{0, 4, 4, 0}, sum: f(18), min: f(1.2)},

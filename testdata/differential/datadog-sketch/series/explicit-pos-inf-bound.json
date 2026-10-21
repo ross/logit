@@ -1,0 +1,49 @@
+{
+  "name": "pos-inf-bound",
+  "kind": "explicit",
+  "input": {
+    "bounds": ["5", "+Inf"],
+    "counts": [1, 3, 2],
+    "count": 6,
+    "sum": "40",
+    "min": null,
+    "max": null
+  },
+  "series": [
+    {
+      "name": "case.count",
+      "tags": [],
+      "type": "count",
+      "value": "6",
+      "unit": ""
+    },
+    {
+      "name": "case.sum",
+      "tags": [],
+      "type": "count",
+      "value": "40",
+      "unit": "millisecond"
+    },
+    {
+      "name": "case.bucket",
+      "tags": ["lower_bound:-inf", "upper_bound:5.0"],
+      "type": "count",
+      "value": "1",
+      "unit": ""
+    },
+    {
+      "name": "case.bucket",
+      "tags": ["lower_bound:5.0", "upper_bound:inf"],
+      "type": "count",
+      "value": "3",
+      "unit": ""
+    },
+    {
+      "name": "case.bucket",
+      "tags": ["lower_bound:inf", "upper_bound:inf"],
+      "type": "count",
+      "value": "2",
+      "unit": ""
+    }
+  ]
+}

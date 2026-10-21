@@ -37,8 +37,10 @@
 //! - When every bin `trimLeft` folds away leaves a full overflow bin and the first bin it keeps
 //!   overflows too, Go's `copy` overwrites that bin and the result reads one bin past the end of
 //!   its buffer, whatever a pooled buffer held. The port keeps the bins the code means to keep.
-//! - A `NaN` bound keys as the translator's does on amd64 (`int(NaN)` is `math.MinInt64` there),
-//!   which arm64's Go doesn't share.
+//! - A `NaN` bound matches the translator on amd64 only. There `int(NaN)` is `math.MinInt64`, so
+//!   the key clamps to 1, and the outermost populated bound of a point with no `min` or `max`
+//!   becomes the summary's, `NaN` included. arm64's Go converts `NaN` to 0, so a Collector there
+//!   keys it differently.
 
 use super::gomath;
 use super::{Bin, DdSketch, Mapping};
@@ -463,10 +465,12 @@ pub fn histogram_to_agent(h: &Histogram) -> Result<AgentSketch, ConversionError>
         s.avg = s.sum / s.cnt as f64;
     }
     if min_bound_set {
-        if min_bound.is_finite() {
+        // `!math.IsInf`, as the translator checks: a `NaN` outermost bound becomes the summary's
+        // `min` or `max`.
+        if !min_bound.is_infinite() {
             s.min = min_bound;
         }
-        if max_bound.is_finite() {
+        if !max_bound.is_infinite() {
             s.max = max_bound;
         }
     }

@@ -1,0 +1,22 @@
+{
+  "name": "nan-lower-bound",
+  "kind": "explicit",
+  "input": {
+    "bounds": ["NaN", "10"],
+    "counts": [0, 5, 0],
+    "count": 5,
+    "sum": "25",
+    "min": null,
+    "max": null
+  },
+  "outcome": "sketch",
+  "sketch": {
+    "k": [1],
+    "n": [5],
+    "cnt": 5,
+    "sum": "25",
+    "min": "NaN",
+    "max": "10",
+    "avg": "5"
+  }
+}

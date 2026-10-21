@@ -1,0 +1,22 @@
+{
+  "name": "pos-inf-bound",
+  "kind": "explicit",
+  "input": {
+    "bounds": ["5", "+Inf"],
+    "counts": [1, 3, 2],
+    "count": 6,
+    "sum": "40",
+    "min": null,
+    "max": null
+  },
+  "outcome": "sketch",
+  "sketch": {
+    "k": [1, 1442],
+    "n": [2, 4],
+    "cnt": 6,
+    "sum": "40",
+    "min": "9.941854089121368e-10",
+    "max": "5.015009921317152",
+    "avg": "6.666666666666667"
+  }
+}
