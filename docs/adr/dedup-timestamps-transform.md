@@ -9,12 +9,15 @@ updated: 2026-10-21
 Proposed.
 
 ## Context
-A remote-write series can't hold two samples at one millisecond. `prometheus_out` keeps the later
-reading and drops the earlier one, because Prometheus and Mimir answer
-`400 duplicate sample for timestamp`, which the sink reads as `Rejected` and which would drop the
-whole batch ([ADR `sink-fault-classes`](sink-fault-classes.md)). The model's timestamps are
-nanoseconds, so any source that stamps two readings of one series less than a millisecond apart
-reaches this: `statsd_in` gauges, `internal`, and a relay with no `aggregate` in the path.
+A remote-write series can't hold two samples at one millisecond. Prometheus and Mimir answer a
+request holding two such samples with a `2xx`, keep the first, and drop the second silently. A
+later request that repeats the series and millisecond with a different value draws
+`400 duplicate sample for timestamp` ([Verified destination behavior](#verified-destination-behavior)).
+`prometheus_out` collapses same-millisecond readings in a batch before it sends, keeping the later
+reading, so the loss happens inside `logit`, where it can be counted, and the sample sent is the
+series' current value. The model's timestamps are nanoseconds, so any source that stamps two
+readings of one series less than a millisecond apart reaches this: `statsd_in` gauges,
+`internal`, and a relay with no `aggregate` in the path.
 
 The sink collapses readings in two places, and only one of them counts:
 
@@ -27,20 +30,22 @@ The sink collapses readings in two places, and only one of them counts:
 counts", "Permitted normalizations") states the first row, and `spec/transit/mapping.yaml`'s
 `record/same_instant` and `record/same_millisecond` rows state both. A degraded counter is the
 wrong word for either: the reading never leaves `logit`, which is loss by
-[ADR `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md)'s definition. Exposition mode's
-registry also replaces a series' value with the later one, uncounted, which is the registry's
-purpose: a scrape reads the current value.
+[ADR `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md)'s definition.
+
+Exposition mode's registry holds one value per series and overwrites it between scrapes. That's
+how the pull model works, not loss, and it stays uncounted: an operator who needs every value
+between scrapes puts `aggregate` in front of the sink. This record doesn't change exposition; W3
+documents the overwrite in the sink.
 
 The other metric sinks, read from code on 2026-10-21:
 
 - **`datadog_out` sends both.** Its encoder writes one series per `(event, MetricRecord)`, one
   point each, at whole seconds rounded toward negative infinity
   (`crates/logit-proto/src/datadog/mod.rs`'s mapping table: `same_instant` and `same_millisecond`
-  are `exact`). Nothing collapses or counts two points of one series in one second. Datadog was
-  measured to store a *resent* series point once, the last write winning at its
-  `(series, timestamp)` (`crates/logit-outputs/src/datadog.rs`). If two points in one request
-  behave the same way, which isn't measured, the destination silently keeps one of them, and for
-  a delta `count` that loses the other's increment.
+  are `exact`). Nothing collapses or counts two points of one series in one second. Datadog keeps
+  the higher of two such points in one request, for a gauge and a `count` alike, and the later
+  write across requests ([Verified destination behavior](#verified-destination-behavior)). For a
+  delta `count`, that loses the lower point's increment, silently.
 - **`influxdb_out` keeps both.** `InfluxLineEncoder::encode` moves a point that shares a series
   and a timestamp with one already in the batch to the next free nanosecond, counted
   `normalized{reason="next_nanosecond"}`, because InfluxDB overwrites an identical
@@ -57,7 +62,7 @@ timestamp-faithful relay ([Alternatives considered](#alternatives-considered)).
 ## Decision
 **A new native transform, `dedup_timestamps`, collapses the metric records in one batch that share a series
 and a timestamp bucket of a configured `precision:` into one record, the later reading, with
-delta kinds summed into it.** An operator places it in front of a sink whose destination can't
+delta kinds and observation kinds merged into it where a merge is sound.** An operator places it in front of a sink whose destination can't
 hold two readings of one series at one instant. Separately, `prometheus_out`'s collapse becomes
 counted loss.
 
@@ -115,7 +120,10 @@ record carries depends on the kind:
 | `ExponentialHistogram`, delta | merged when scale and zero threshold are equal, aligned by absolute bucket index; otherwise passed through |
 | `Summary`, delta (only `cumulative_to_delta` makes one) | passed through: quantiles don't add |
 | a record flagged `NO_RECORDED_VALUE` | takes part in last write wins as a reading; beside a delta kind's value, passed through |
-| `Samples`, `SetMembers`, `Distribution`, `Set` | not keyed: these are collections of observations, every surveyed destination adds two of them, and no sink drops one for sharing a timestamp |
+| `Samples` | values concatenated, earlier first, when the `sample_rate`s are equal; otherwise last write wins |
+| `SetMembers` | union: the members of both, each once |
+| `Distribution` | `DdSketch::merge` when the two sketches' mappings are equal; otherwise last write wins |
+| `Set` | `HyperLogLog::merge`, a union |
 
 Last write wins needs no arithmetic, so it's safe for every kind, `NaN` included. A delta is an
 increment, so the later one alone would lose the earlier's; summing is the merge
@@ -123,6 +131,20 @@ increment, so the later one alone would lose the earlier's; summing is the merge
 same kinds, and where no merge is safe the record passes through untouched rather than being
 dropped. A passed-through record leaves the duplicate for the sink, which counts it as loss if it
 drops one.
+
+The four observation kinds merge where `aggregate` merges them, with one difference each:
+
+- **`Samples`** concatenate as `aggregate`'s `distributions: samples` does, and only under one
+  rate, because a `Samples` record carries one `sample_rate` for all its values. `aggregate`
+  falls back to a sketch on a rate mismatch; `dedup_timestamps` doesn't change a record's kind, so
+  it keeps the later record.
+- **`SetMembers`** union as `aggregate`'s `sets: members` does, with no cap: both records are in
+  the batch already.
+- **`Distribution`** merges bin for bin only under one mapping. `DdSketch::merge` also accepts two
+  mappings, re-binning the incoming sketch at each bin's representative value, within a bounded
+  error. `aggregate` takes that, and `dedup_timestamps` doesn't: a relay keeps a sketch's bins as
+  the source wrote them, and Datadog reads an Agent sketch with no mapping on the wire.
+- **`Set`** always merges: `HyperLogLog::merge` has no precondition.
 
 On a merged record:
 
@@ -152,13 +174,25 @@ nothing in the runtime coalesces batches on the way to a sink. A router or `rout
 between `dedup_timestamps` and the sink only splits a batch, so every batch the sink sees is a subset of one
 batch `dedup_timestamps` saw, and its same-millisecond pairs are already gone.
 
-A window across batches was considered and isn't recommended. Once a batch leaves, its reading
-has left too, so a later batch's reading of the same instant can only be dropped, which keeps the
-wrong one under last write wins and loses an increment under a sum, or held for the window, which
-adds the latency and the wall-clock state this component exists to avoid. Two readings in two
-requests also never reach the sink's in-request collapse. Whether a destination rejects a
-duplicate *across* requests is an [open question](#open-questions), and the answer decides
-whether a window is ever needed.
+A window across batches is ruled out: it adds latency. Once a batch leaves, its reading has left
+too, so a later batch's reading of the same instant can only be dropped, which keeps the wrong one
+under last write wins and loses an increment under a sum, or held for the window, which adds the
+latency and the wall-clock state this component exists to avoid.
+
+That leaves a hazard this record doesn't close. Two readings in two batches reach the receiver in
+two requests. With the same value, Prometheus and Mimir accept the second silently. With a new
+value, they answer `400 duplicate sample for timestamp`, the sink reads it as `Rejected`, and the
+whole batch drops ([ADR `sink-fault-classes`](sink-fault-classes.md)). What that costs depends on
+the receiver:
+
+- **Prometheus under remote-write 1.0**, the sink's default `version:`, stores nothing from the
+  request, so every clean sample in the batch is lost, counted as dropped.
+- **Prometheus under 2.0, and Mimir under either**, store the request's clean samples, so the
+  sink's drop counter overstates the loss.
+
+W3 files this in [`docs/known-gaps/prometheus.md`](../known-gaps/prometheus.md), beside the
+out-of-order `400` entry, which has the same shape. Remedies, not decided here, include reading
+the `400` body, which names the series, and making 2.0 the default `version:`.
 
 Two placement rules follow, for the operator docs:
 
@@ -189,26 +223,37 @@ does is loss: the operator asked for each outcome, so it emits no `*.dropped`.
 
 | Name | Meaning |
 |---|---|
-| `logit.transform.metrics.absorbed{reason="superseded"}` | a reading replaced by a later one of its series, under last write wins |
-| `logit.transform.metrics.absorbed{reason="merged"}` | a delta reading summed or merged into a later one |
+| `logit.transform.metrics.merged` | a reading summed or otherwise combined into the surviving reading: a delta `Sum`, a `GaugeDelta`, a delta histogram with a matching layout, and the observation kinds' merges |
+| `logit.transform.metrics.absorbed` | a reading superseded by a later one under last write wins: a `Gauge`, a cumulative kind, and an observation kind whose rate or mapping differs |
 | `logit.transform.metrics.passed_through{reason="non_finite" \| "overflow" \| "layout_mismatch" \| "no_merge_rule" \| "no_recorded_value"}` | a record that shares its series and bucket with another but has no safe merge, forwarded untouched: the sink still sees the duplicate |
 | `logit.component.events.discarded` | an event left with no metric, log, or span |
 
-A record with no collision isn't counted. `absorbed` is `aggregate`'s word for a record folded
-into a series, and `passed_through` is `aggregate`'s word for a record it forwards unmerged, so an
-operator reads both the same way on either component. `*.omitted` doesn't fit: it means a piece
-removed from a record that's still delivered, and an absorbed reading isn't delivered. `*.skipped`
-doesn't either: something was there to carry.
+Each counts the readings that are gone, never the survivor, and a record with no collision isn't
+counted. None of the names is in the loss vocabulary's table, and none ends in a loss word.
+`merged` is new under `logit.transform.*`. `passed_through` is `aggregate`'s word for a record
+forwarded unmerged, read the same way here.
+
+`absorbed` is narrower here than on `aggregate`. There it counts every record folded into a series,
+summed or held, the series' first record included, so `metrics_in == absorbed + passed_through`.
+Here it counts only a superseded reading; a combined one is `merged`, and the survivor and every
+record with no collision go uncounted, so no such identity holds. In both components an absorbed
+record leaves no record of its own downstream. `*.omitted` doesn't fit: it means a piece removed
+from a record that's still delivered. `*.skipped` doesn't either: something was there to carry.
 
 ### The sink-side counter
 
 `prometheus_out` in remote-write mode counts every reading it collapses as
 `logit.output.metrics.dropped{reason="duplicate_timestamp"}`, in both places the Context table
 names, the same-instant case included. That replaces
-`logit.output.metrics.degraded{reason="sub_ms_collapsed"}`. The collapse stays: dropping one
-reading is still better than a `400` that drops the batch. The counter change lands in its own
-PR, not with this record, and updates the transit spec's `same_instant` and `same_millisecond`
-rows for `prometheus_out` with it. Exposition mode's registry replacement stays uncounted.
+`logit.output.metrics.degraded{reason="sub_ms_collapsed"}`. The collapse stays: without it the
+receiver drops one of the pair anyway, silently, and keeps the earlier one. With it, the later
+reading survives and the loss is counted. The counter change lands in its own PR, not with this
+record, and updates the transit spec's `same_instant` and `same_millisecond` rows for
+`prometheus_out` with it. Exposition mode's registry overwrite stays uncounted.
+
+`datadog_out` gets the same counter in a later PR: a series point that shares its series and
+second with another in one request counts `logit.output.metrics.dropped{reason="duplicate_timestamp"}`,
+since Datadog keeps only the higher. Distribution points don't count, because Datadog keeps both.
 
 ### Why this isn't the retired kind
 
@@ -237,6 +282,45 @@ A script can keep the *first* reading per event, which is the retired seen-set. 
 last one, or sum two, within a batch at no latency. That's the same kind of ground on which
 [ADR `consistent-sampling-component`](consistent-sampling-component.md) brought `sample` back.
 
+## Verified destination behavior
+
+Each run sent hand-built requests to a destination, then read back what it stored. Raw logs are
+kept outside the repository.
+
+### Prometheus and Mimir
+
+Prometheus v3.15.1 and Grafana Mimir 3.2.2, run 2026-10-21, each over remote-write 1.0 and 2.0,
+with out-of-order windows at the default of `0`:
+
+- **A duplicate inside one request**, same series and millisecond, is never an error. Both answer
+  `2xx`, keep the first value, and drop the second silently. Mimir counts it in
+  `cortex_discarded_samples_total{reason="sample_duplicate_timestamp"}`; Prometheus counts nothing
+  the sender can see.
+- **A duplicate in a later request with the same value** is accepted silently.
+- **A duplicate in a later request with a different value** draws
+  `400 duplicate sample for timestamp`. For that `400`, Prometheus under 1.0 stores nothing from
+  the request. Prometheus under 2.0, and Mimir under 1.0 and 2.0, store the request's clean
+  samples.
+- **An out-of-order sample** behaves the same way: dropped silently inside one request, a `400`
+  across requests, with the same split in what's stored.
+- **2.0's `Samples-Written` response header** counted a silently dropped duplicate as written, so
+  the sink can't detect the in-request drop from it.
+
+### Datadog
+
+`/api/v2/series`, `/api/v1/series`, and `/api/v1/distribution_points`, run 2026-10-21:
+
+- **Two points of one series in one second, in one request**, collapse to one point that keeps the
+  higher value, whichever comes first (both orders were sent to `/api/v2/series`, one to v1). That held for a gauge and a `count` alike; a `count` isn't
+  summed. Each pair was two distinct positive values, so the rule is unverified for negative or
+  equal values.
+- **Across separate requests**, the later write wins.
+- **`/api/v1/distribution_points`** keeps both points.
+
+`dedup_timestamps` at `precision: 1s` ahead of `datadog_out` is the explicit remedy: it sums two
+delta counts where Datadog would keep the higher, and keeps the later gauge where Datadog would
+keep the higher.
+
 ## Alternatives considered
 - **`aggregate`.** It's the existing stage that leaves one point per series, and it's the wrong
   one for a timestamp-faithful relay. It stamps every emitted point with the flush's wall-clock
@@ -254,12 +338,14 @@ last one, or sum two, within a batch at no latency. That's the same kind of grou
   and named ([ADR `lossless-transit`](lossless-transit.md)) puts it in a component the operator
   places and the graph shows.
 - **Do nothing.** The sink keeps collapsing with a degraded counter, the same-instant case stays
-  uncounted, and `datadog_out` keeps sending same-second pairs to a destination that probably
-  keeps one. Counting the collapse as loss without a remedy leaves an operator with a nonzero
+  uncounted, and `datadog_out` keeps sending same-second pairs to a destination that keeps the
+  higher. Counting the collapse as loss without a remedy leaves an operator with a nonzero
   `*.dropped` and nothing to configure.
-- **Keep the first reading.** It's simpler, and a seen-set in Lua already does it. A gauge's later
-  reading is the current value, and remote-write's collapse, the exposition registry, and Datadog's
-  overwrite all keep the later one, so keeping the first would disagree with every destination.
+- **Keep the first reading.** It's simpler, a seen-set in Lua already does it, and it's what
+  Prometheus and Mimir keep inside one request. But a gauge's later reading is the current value,
+  and `prometheus_out`'s own collapse, the exposition registry, and Datadog across requests all
+  keep the later one. Destinations disagree within a request (first for remote-write, the higher
+  for Datadog), so no choice matches all of them, and the later reading is the one with a meaning.
 - **A cross-batch window.** See [Scope](#scope-one-batch-and-no-added-latency).
 - **A key built from the sink's rendering** (labels after sanitization, private attributes left
   out). It closes the residual collisions the sink still drops, at the cost of one key per
@@ -273,6 +359,12 @@ last one, or sum two, within a batch at no latency. That's the same kind of grou
   it. After the counter change, a flow without it shows a nonzero
   `logit.output.metrics.dropped{reason="duplicate_timestamp"}`, which is the prompt to add it.
 - `Transform` gains a batch-level hook, defaulting to a no-op.
+- `dedup_timestamps` doesn't stop a cross-batch duplicate with a new value from drawing a remote-write
+  `400` that drops a whole batch. W3 records it in `docs/known-gaps/prometheus.md`
+  ([Scope](#scope-one-batch-and-no-added-latency)).
+- `datadog_out` counts a same-second series pair it sends in one request as
+  `logit.output.metrics.dropped{reason="duplicate_timestamp"}`, in a later PR
+  ([The sink-side counter](#the-sink-side-counter)).
 - The graph gets rule 95 (`precision` of `0s`), `logit-config` gets a `ComponentKind` variant, and
   `script/schema` regenerates `schema/logit.schema.json`.
 - [`docs/design/memory.md`](../design/memory.md) gets a row for the per-batch table, and
@@ -296,18 +388,7 @@ last one, or sum two, within a batch at no latency. That's the same kind of grou
     as retired.
 
 ## Open questions
-1. **Cross-request duplicates.** Do Prometheus and Mimir reject a sample whose series and
-   millisecond were written by an *earlier* request, and what do they store from a request they
-   answer `400` for a duplicate? If they store the rest of the request, the sink's `Rejected`
-   reading over-counts loss. Neither has been verified here, and the answer decides whether a
-   window is ever needed.
-2. **Datadog in one request.** Measure what Datadog stores for two points of one series in one
-   second within one request: one, both, or a sum, for a gauge and for a delta `count`. If it keeps
-   one, should `datadog_out` count it as `dropped{reason="duplicate_timestamp"}` too?
-3. **The counter names.** `absorbed{reason}` reuses `aggregate`'s untagged counter with a new tag,
-   and `aggregate`'s identity (`metrics_in == absorbed + passed_through`) doesn't hold here, since
-   a record with no collision isn't counted. Is that acceptable, or does `dedup_timestamps` want its own word?
-4. **Observation kinds.** Should `Samples`, `SetMembers`, `Distribution`, and `Set` merge too, for
-   a destination that turns out to overwrite them? Each has an exact merge.
-5. **The exposition registry.** Should its replacement of a series' value get a non-loss counter,
-   or stay uncounted as a scrape's own semantics?
+1. **Datadog's rule for negative and equal values.** The run sent only distinct positive pairs.
+   Does Datadog keep the higher of two negative points too? It changes nothing in this record,
+   because `dedup_timestamps` decides before Datadog does, but `datadog_out`'s counter docs will
+   state the rule.
