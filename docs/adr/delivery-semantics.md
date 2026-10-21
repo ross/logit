@@ -603,3 +603,15 @@ it stays skipped. The new `cumulative_to_delta` transform
 runs item 5's remedy in reverse: upstream of it a resent cumulative point is skipped as a
 duplicate, and downstream a resent delta adds at a destination that sums what it receives. A
 Datadog series `count` point still overwrites at its `(series, timestamp)`.
+
+## Amendment (2026-10-20): what `datadog_out` sends of the OTLP kinds, on a resend
+
+[ADR `datadog-otlp-metric-mapping`](datadog-otlp-metric-mapping.md)'s first workstream has
+`datadog_out` send three more shapes. A delta `Sum` that isn't monotonic is a series `count`
+point and a cumulative one a `gauge` point, and each overwrites at its `(series, timestamp)` as a
+monotonic delta's `count` does, so neither needs a remedy. A delta `Histogram` and a delta
+`ExponentialHistogram` become sketches, which item 5 already assumes add on a resend until
+measured; a `Histogram` under `histograms.mode: counters` is a set of `.bucket` series `count`
+points, which overwrite. A `Summary`'s `.quantile` gauges overwrite. A cumulative monotonic
+`Sum` is still skipped, as item 5 says, until the transform above exists.
+

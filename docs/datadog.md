@@ -115,6 +115,37 @@ Sending directly needs no Agent: it's one hop, and it works wherever HTTPS does.
   and Datadog's OTLP mapping loses parts of a Datadog span
   ([the ADR's "Context"](adr/datadog-agent-and-intake-relay.md#context)).
 
+### OTel metrics to Datadog: `otlp_in` into `datadog_out`
+
+An OpenTelemetry SDK or Collector can send its metrics to `otlp_in`, and `datadog_out` writes
+each kind as the Collector's `datadogexporter` does by default, so a metric reaches the same
+Datadog series whichever way it went
+([ADR `datadog-otlp-metric-mapping`](adr/datadog-otlp-metric-mapping.md)):
+
+| OTLP kind | What Datadog gets |
+|---|---|
+| delta `Sum`, monotonic or not | a `count` |
+| cumulative non-monotonic `Sum` (an up-down counter) | a `gauge` |
+| `Gauge` | a `gauge` |
+| delta `Histogram` | a distribution, bin for bin as the exporter builds it; under `histograms.mode: counters`, a `<name>.bucket` count per bucket |
+| delta `ExponentialHistogram` | a distribution |
+| `Summary` | `<name>.quantile` gauges |
+
+`histograms.send_aggregation_metrics: true` adds `<name>.count`, `<name>.sum`, `<name>.min`, and
+`<name>.max` series for each delta histogram and exponential histogram, as the exporter's setting
+of the same name does. Two differences from the exporter remain: a series carries its OTLP unit
+as written rather than Datadog's name for it, and tags come from the event's attributes and
+resource as for every other `datadog_out` metric, not from the exporter's resource-attribute
+tables (`docs/known-gaps/datadog.md`).
+
+**Configure the SDK for delta temporality.** Most SDKs default to cumulative, and `datadog_out`
+skips a cumulative monotonic `Sum`, `Histogram`, or `ExponentialHistogram`, and a summary's
+`.count` and `.sum`, because Datadog needs them as per-interval deltas and the exporter's
+per-series differencing has no stage in `logit` yet. Each is counted
+(`logit.output.metrics.skipped{metric_kind}`, `logit.output.fields.omitted{reason="unresolved_cumulative"}`),
+with a throttled `unresolved_cumulative` warning. In an OTel SDK that's the
+`OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE=delta` environment variable.
+
 ### From Datadog: dual-ship, tee, then cut over
 
 A migration away from Datadog runs through the intake stand-in in three stages:

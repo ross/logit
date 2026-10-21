@@ -2533,10 +2533,15 @@ The module doc of `logit_proto::datadog` has the full mapping-to-counter tables.
 | `logit.input.metrics.skipped{reason="empty_sketch"}` | count | a `Dogsketch` with no bins and zero count |
 | `logit.input.metrics.degraded{reason="no_timestamp"}` | count | a point or sketch with no timestamp, stamped with `received_at` |
 | `logit.input.tags.omitted{reason="reserved_prefix"}` | count | a tag whose key starts with `_logit.`, the private carrier prefix, left off a delivered series, sketch, event, or service check, counted per tag: once per series or sketch however many points it delivers |
-| `logit.output.metrics.skipped{metric_kind="cumulative_sum"\|"non_monotonic_delta_sum"\|"set_members"\|"histogram"\|"exponential_histogram"\|"summary"}` | count | a metric kind no Datadog route carries; counted by the series encoders only |
+| `logit.output.metrics.skipped{metric_kind="cumulative_sum"\|"histogram"\|"exponential_histogram"}` | count | a cumulative monotonic `Sum`, `Histogram`, or `ExponentialHistogram`, which Datadog's exporter differences into a delta first and nothing in `logit` converts yet; counted by the series encoders only, with an `unresolved_cumulative` diagnostic |
+| `logit.output.metrics.skipped{metric_kind="set_members"}` | count | a kind no Datadog route carries; counted by the series encoders only |
+| `logit.output.fields.omitted{reason="unresolved_cumulative"}` | count | a `Summary`'s `.count` and `.sum`, running totals that need differencing first, left off while its `.quantile` gauges go out; once per summary, with an `unresolved_cumulative` diagnostic |
+| `logit.output.fields.omitted{reason="no_sum"}` | count | under `histograms.send_aggregation_metrics`, a delta histogram or exponential histogram whose sum is absent or non-finite, so no `.count`, `.sum`, `.min`, or `.max` series; once per record |
+| `logit.output.metrics.degraded{metric_kind="non_monotonic_sum"\|"histogram"\|"exponential_histogram"}` | count | a non-monotonic `Sum` sent as a `count` (delta) or `gauge` (cumulative), a delta `Histogram` sent as a sketch or as `.bucket` and aggregation series, or a delta `ExponentialHistogram` sent as a sketch; once per record that leaves |
 | `logit.output.metrics.dropped{reason="unresolved_gauge_delta"}` | count | a `GaugeDelta` nothing upstream resolved to a gauge; counted by the series encoders only |
 | `logit.output.metrics.skipped{reason="no_recorded_value"\|"empty_sketch"}` | count | a flagged record, or a sketch with nothing in it |
-| `logit.output.metrics.dropped{reason="non_finite_value"\|"oversized_sketch"}` | count | a non-finite value, or a sketch whose counts split into more than `MAX_DOGSKETCH_ENTRIES` `k`/`n` entries |
+| `logit.output.metrics.dropped{reason="non_finite_value"\|"oversized_sketch"}` | count | a non-finite value, a sketch whose counts split into more than `MAX_DOGSKETCH_ENTRIES` `k`/`n` entries, or a histogram or exponential histogram of more than 4,096 × 65,535 observations, which Datadog's exporter abandons too |
+| `logit.output.metrics.dropped{reason="non_monotonic_bounds"\|"sketch_range"}` | count | a delta `Histogram` with a bucket whose upper bound keys below its lower one, or a delta `ExponentialHistogram` whose scale or buckets fall outside the Agent sketch's range (a key past 32,766, or a boundary that overflows) |
 | `logit.output.metrics.degraded{reason="set_estimate"\|"sample_rate_expanded"\|"rebinned"\|"fractional_count"}` | count | a `Set` sent as a gauge of its estimate, a sampled `Samples` expanded into repeated values, a non-Agent sketch re-binned into the Agent mapping, or a fractional bin count rounded |
 | `logit.output.tags.omitted{reason="unrepresentable"\|"no_wire_form"}` | count | a tag value with no tag form (`Map`, `Bytes`, `Null`) or a carrier attribute of the wrong type; a `_logit.datadog.*` carrier the target route has no field for |
 | `logit.input.logs.dropped{reason="not_an_object"\|"no_message"}` | count | a log array element that isn't an object, or a log with no `message` |
@@ -2560,7 +2565,9 @@ The module doc of `logit_proto::datadog` has the full mapping-to-counter tables.
 timestamp that is neither a number nor RFC 3339, stamped with `received_at`), `malformed_event`,
 `malformed_service_check`; `malformed_stats` (a dropped stats payload, bucket, or group) and
 `bad_stats_sketch` (a dropped stats summary); `malformed_span` (a dropped span, trace array, or
-chunk); `oversized_sketch` (an outgoing sketch dropped past the entry cap).
+chunk); `oversized_sketch` (an outgoing sketch dropped past the entry cap, or a histogram past
+the observation cap); `unresolved_cumulative` (a cumulative kind skipped, or a summary's count and
+sum left off, naming `cumulative_to_delta`).
 
 A counter for a batch-resource attribute or a stats bucket counts once per request body the
 encoder writes, not once per record; the paragraph after the sink class table names them and says

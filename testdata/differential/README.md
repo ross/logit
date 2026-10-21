@@ -28,7 +28,7 @@ and prometheus-text cases as starting seeds.
 |---|---|---|---|
 | [`graphite-pickle/`](graphite-pickle/README.md) | `crates/logit-proto/src/graphite/pickle.rs`, carbon's pickle reader | CPython 3.12's and Python 2.7's `pickle`, and carbon 1.1.10's pickle receiver | `crates/logit-proto/tests/graphite_pickle_differential.rs` |
 | [`prometheus-text/`](prometheus-text/README.md) | `crates/logit-proto/src/prometheus/text.rs` and `assemble.rs`, the text 0.0.4 and OpenMetrics decoder | Prometheus 3.14.0's `model/textparse`, over hand-built bodies and `../interop/prometheus-scrape/`'s recorded ones | `crates/logit-proto/tests/prometheus_text_differential.rs` |
-| [`datadog-sketch/`](datadog-sketch/README.md) | `crates/logit-core/src/sketch/from_otlp.rs`, OTLP histograms to Agent sketches | the Datadog OTLP translator (`datadog-agent` `pkg/opentelemetry-mapping-go/otlp/metrics` at commit `45132452`), over hand-built and seeded histograms | `logit-core`'s `sketch::from_otlp::tests` |
+| [`datadog-sketch/`](datadog-sketch/README.md) | `crates/logit-core/src/sketch/from_otlp.rs`, OTLP histograms to Agent sketches, and `datadog_out`'s series for them | the Datadog OTLP translator (`datadog-agent` `pkg/opentelemetry-mapping-go/otlp/metrics` at commit `45132452`), over hand-built and seeded histograms, and summaries | `logit-core`'s `sketch::from_otlp::tests`, and `crates/logit-proto/tests/datadog_otlp_sketch_differential.rs` and `datadog_otlp_series_differential.rs` |
 
 ## Regenerating and checking
 
@@ -46,7 +46,7 @@ A generator self-checks before it writes anything: each corpus's README says wha
 
 ## Size
 
-The tree is about 1.2 MB, most of it JSON readings. `datadog-sketch` is about 690 KB, 220 KB of it
+The tree is about 1.3 MB, most of it JSON readings. `datadog-sketch` is about 850 KB, 220 KB of it
 in the four cases at the observation cap or wide enough to fold bins, whose sketches list thousands
 of bins. The `graphite-pickle` payloads total about
 80 KB, 68 KB of them in the one case that has to pass 64 KiB to get two `FRAME`s; the rest are a

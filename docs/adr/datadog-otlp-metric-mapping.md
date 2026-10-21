@@ -6,7 +6,9 @@ updated: 2026-10-20
 # `datadog_out` maps OTLP metric kinds as Datadog's OTel exporter does, statelessly
 
 ## Status
-Accepted. Not yet built: [`docs/plans/ddotlp.md`](../plans/ddotlp.md)'s W1 and W2 build it.
+Accepted. Partly built: [`docs/plans/ddotlp.md`](../plans/ddotlp.md)'s W1 built `datadog_out`'s
+mappings, with the cumulative kinds counted as skipped; W2, the transform and the summary's
+temporality, isn't built.
 
 ## Context
 `datadog_out` writes a delta monotonic `Sum`, a `Gauge`, `Samples`, a `Distribution`, and a `Set`,

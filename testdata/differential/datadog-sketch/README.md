@@ -1,10 +1,18 @@
 # Datadog sketch differential corpus
 
 Delta OTLP histograms, each beside the Agent sketch Datadog's OpenTelemetry translator builds from
-it, for `crates/logit-core/src/sketch/from_otlp.rs`'s `histogram_to_agent` and
-`exp_histogram_to_agent`. The test `sketch::from_otlp::tests` in `logit-core` converts every case
-and checks the result bin for bin: each key's count, and the summary's `cnt`, `sum`, `min`, `max`,
-and `avg`, bit for bit. It runs with no Go installed.
+it, and histograms and summaries beside the series it writes for them, for
+`crates/logit-core/src/sketch/from_otlp.rs` and `datadog_out`'s encoder. Three tests read it, with
+no Go installed:
+
+- `sketch::from_otlp::tests` in `logit-core` converts every case and checks the result bin for
+  bin: each key's count, and the summary's `cnt`, `sum`, `min`, `max`, and `avg`, bit for bit.
+- `crates/logit-proto/tests/datadog_otlp_sketch_differential.rs` sends every case through the
+  sketches route and checks the `Dogsketch`, its `k`/`n` order included, or the counter a case
+  with no sketch moves.
+- `crates/logit-proto/tests/datadog_otlp_series_differential.rs` sends every `series/` case
+  through the v2 series route and checks each series' name, tags, type, and value, and whether it
+  has a unit.
 
 To regenerate the corpus, run `script/differential datadog-sketch`; to check that the committed one
 is current, run `script/differential datadog-sketch --check`. See [`../README.md`](../README.md).
@@ -51,6 +59,11 @@ error `MapMetrics` returns that it can't classify, and when the build info lacks
   reads a non-finite one, where the translator itself would read protobuf's default `0`
   ([ADR `datadog-otlp-metric-mapping`](../../../docs/adr/datadog-otlp-metric-mapping.md)'s
   "Histograms").
+- **`series/<kind>-<name>.json`**: one case put through a translator with
+  `histograms.mode: counters`, the aggregation metrics, quantiles, and units on: the explicit and
+  hand-built exponential cases, and summaries (`kind: summary`, OTLP's cumulative kind, with no
+  start time, so the translator writes only their `.quantile` gauges). `series` lists every series
+  it wrote, in order, with its unit as the translator maps it (`ms` as `millisecond`).
 - **`primitives.json`**: Go's `Log`, `Exp`, and `Pow` on the inputs the conversion uses them on,
   and `Log1p(2/128)`, the Agent's `gamma.ln`. The test checks `gomath.rs` against each, and
   `Mapping::agent`'s own `gamma_ln` against the last.

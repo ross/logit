@@ -1170,8 +1170,8 @@ impl DatadogEncoder {
         }
     }
 
-    /// `/api/v2/series` as a protobuf `MetricPayload`, one series per record; `None` when nothing
-    /// in the batch is a series.
+    /// `/api/v2/series` as a protobuf `MetricPayload`, one series per point a record writes (one,
+    /// or a histogram's or summary's expansion); `None` when nothing in the batch is a series.
     pub fn encode_series_v2_protobuf(&mut self, batch: &EventBatch) -> Option<Bytes> {
         let mut series = Vec::new();
         self.each_series(batch, Route::V2Protobuf, |event, record, c, p| {

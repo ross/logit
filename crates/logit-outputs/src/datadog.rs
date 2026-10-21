@@ -23,6 +23,9 @@
 //! timeout: 10s               # default; bounds one request
 //! headers: {}                # extra headers; `!env` works on a value
 //! tls: {}                    # tunes every https:// request
+//! histograms:                # how OTLP histograms are written, as Datadog's exporter's block
+//!   mode: distributions      # default; or counters (`.bucket` counts) or nobuckets
+//!   send_aggregation_metrics: false  # default; adds .count, .sum, .min, .max; nobuckets needs it
 //! ```
 //!
 //! There are no per-sink host, service, source, or tag fields (ADR decision 10): the encoders read
@@ -40,9 +43,9 @@
 //!
 //! | What in the batch | Route (intake + path) | Body | `Content-Type` |
 //! |---|---|---|---|
-//! | metric records other than `Samples`/`Distribution` (a service check's record 0 excluded) | api `/api/v2/series` | [`DatadogEncoder::encode_series_v2_protobuf`] | `application/x-protobuf` |
+//! | metric records other than `Samples`, `Distribution`, and a delta histogram's sketch (a service check's record 0 excluded), and the `.bucket`, aggregation, and `.quantile` series a histogram or summary expands to | api `/api/v2/series` | [`DatadogEncoder::encode_series_v2_protobuf`] | `application/x-protobuf` |
 //! | `Samples` | api `/api/v1/distribution_points` | [`DatadogEncoder::encode_distribution_points`] | `application/json` |
-//! | `Distribution` | api `/api/beta/sketches` | [`DatadogEncoder::encode_sketches`] | `application/x-protobuf` |
+//! | `Distribution`, a delta `Histogram` under `histograms.mode: distributions`, and a delta `ExponentialHistogram` | api `/api/beta/sketches` | [`DatadogEncoder::encode_sketches`] | `application/x-protobuf` |
 //! | service checks | api `/api/v1/check_run` | [`DatadogEncoder::encode_service_checks`] | `application/json` |
 //! | Datadog events | api `/api/v1/events`, one request per event | [`DatadogEncoder::encode_events`] under [`EventFormat::PublicV1`] | `application/json` |
 //! | every other log | logs `/api/v2/logs` | [`DatadogEncoder::encode_logs`] | `application/json` |
@@ -110,20 +113,22 @@
 //! `resources` didn't count. The series route names such a drop in its `202` body (below), but the
 //! distribution-points and sketches routes drop it silently, answering `202 {"status": "ok"}`, so
 //! only the sink can count it there. A record of a kind the route then skips anyway (a cumulative
-//! `Sum`, say) is counted here, not by the encoder.
+//! monotonic `Sum`, say) is counted here, not by the encoder.
 //!
 //! ## Size limits
 //!
 //! | Route | Entries per request | Uncompressed body | Body on the wire |
 //! |---|---|---|---|
-//! | series (points), distribution points and sketches (records; the series limits) | 10,000 | 5,242,880 B | 512,000 B |
+//! | series (series entries), distribution points and sketches (records; the series limits) | 10,000 | 5,242,880 B | 512,000 B |
 //! | logs | 1,000 | 5,000,000 B | -- |
 //! | events | 1 | -- | -- |
 //! | traces | -- | 3,200,000 B | -- |
 //! | service checks, stats | -- | -- | -- |
 //!
 //! A route's events are cut into requests by entry count first ([`split_encode`]; an event with
-//! several records weighs as many entries). A request whose encoded body is over a byte limit is
+//! several records weighs as many entries, and on the series route a record weighs as many series
+//! as it can write: a histogram's `.bucket` and aggregation series, a summary's quantiles, from
+//! `logit_proto::datadog::series::record_routes`). The drop counts below count the same entries. A request whose encoded body is over a byte limit is
 //! bisected and each half re-encoded, down to one event, and a single event still over the limit
 //! is dropped, counted `records.dropped{reason="oversize"}` for its entries, with a throttled
 //! `oversize` diagnostic. The re-encodes of a bisection count nothing ([`split_encode`]), so an
@@ -241,10 +246,11 @@
 //! may store it twice; a disk-buffered batch replayed after a restart resends every request. A
 //! trial org was sent two resends: a resent series point was stored once, the last write winning
 //! at its `(series, timestamp)`, and an identical log was stored twice. The upstream `aggregate`
-//! `temporality: cumulative` remedy doesn't apply here: the series route skips a cumulative `Sum`,
-//! since a Datadog `count` carries a per-interval value. Distribution points, sketches, and APM
-//! stats have no remedy and are assumed to add on a resend, and events, checks, and traces to be
-//! stored again, until measured. `buffer.delivery: at_most_once` drops the batch instead.
+//! `temporality: cumulative` remedy doesn't apply here: the series route skips a cumulative
+//! monotonic `Sum`, since a Datadog `count` carries a per-interval value. Every series point,
+//! a histogram's `.bucket` counts and a summary's quantiles included, overwrites. Distribution
+//! points, sketches (a delta histogram's included), and APM stats have no remedy and are assumed
+//! to add on a resend, and events, checks, and traces to be stored again, until measured. `buffer.delivery: at_most_once` drops the batch instead.
 //!
 //! ## Telemetry
 //!

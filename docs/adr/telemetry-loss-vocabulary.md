@@ -1,6 +1,6 @@
 ---
 created: 2026-10-13
-updated: 2026-10-16
+updated: 2026-10-20
 ---
 
 # Telemetry loss vocabulary: any nonzero `*.dropped` is loss, and intended outcomes use other words
@@ -189,7 +189,8 @@ same date has the bounds of the count and how it enters the sink identity.
   - `datadog_out`'s cumulative and non-monotonic `Sum` stay
     `output.metrics.skipped{metric_kind}`, though "missing upstream stage" would make them
     `dropped`. No `logit` stage converts either to a delta monotonic `Sum` a Datadog `count` can
-    carry, so an operator alerted on them has nothing to change until one exists.
+    carry, so an operator alerted on them has nothing to change until one exists. The
+    2026-10-20 amendment below settles the non-monotonic half.
 - **`output.metrics.type_conflict` keeps its name** (a row in the Outputs table). It counts a
   family `prometheus_out`'s registry replaced because a later batch re-typed it: the new type
   wins and the old type's series are evicted, because exposition allows one type per family.
@@ -241,6 +242,19 @@ events need an ordinary consumer. For `route_signals` the config choice is visib
 already: its `signals:` map names which events are kept, as `keep_signals`' list does. With all
 three signals listed, only an event with no payload is discarded, as `has_signal` and
 `keep_signals` also do. Its parts and copies count `component.events.copied`, never `*.dropped`.
+
+## Amendment (2026-10-20): `datadog_out` writes both non-monotonic `Sum`s
+
+The close-out kept `datadog_out`'s cumulative and non-monotonic `Sum` at
+`output.metrics.skipped{metric_kind}` because no stage converts either to a delta monotonic
+`Sum`. [ADR `datadog-otlp-metric-mapping`](datadog-otlp-metric-mapping.md) settles the
+non-monotonic half another way: `datadog_out` writes a delta non-monotonic `Sum` as a `count` and
+a cumulative one as a `gauge`, as Datadog's exporter does, each counted
+`output.metrics.degraded{metric_kind="non_monotonic_sum"}`, so neither is skipped and
+`metric_kind="non_monotonic_delta_sum"` no longer moves on that sink. The cumulative monotonic
+`Sum` stays skipped, under `metric_kind="cumulative_sum"`, until the `cumulative_to_delta`
+transform exists ([ADR `cumulative-to-delta-transform`](cumulative-to-delta-transform.md)); that
+ADR's workstream amends the other half.
 
 ## Migration record
 The classification of every `*.dropped`, `*.skipped`, `*.degraded`, `*.truncated`, and loss-related

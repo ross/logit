@@ -126,7 +126,7 @@ the Rust code under test.
 | # | Branch | PR title | Size | Depends on | Status |
 |---|---|---|---|---|---|
 | W0 | `ddotlp/w0` | `ddotlp/w0: ADRs and plan for OTLP metric kinds into datadog_out` | S | — | in review |
-| W1 | `ddotlp/w1` | `ddotlp/w1: datadog_out maps OTLP sums, histograms, and summaries as Datadog's exporter does` | L | W0 | not started |
+| W1 | `ddotlp/w1` | `ddotlp/w1: datadog_out maps OTLP sums, histograms, and summaries as Datadog's exporter does` | L | W0 | in review |
 | W2 | `ddotlp/w2` | `ddotlp/w2: Summary temporality and the cumulative_to_delta transform` | L | W1 | not started |
 
 ## Settled questions
@@ -151,3 +151,25 @@ Recorded per workstream as each lands.
   only the division by the interval needs the alpha gate. `InsertInterpolate`'s `binLow(k)` is
   the key's representative value, not its lower edge. And `ConvertDDSketchIntoSketch`'s
   one-observation case adds `sketches-go`'s bin-derived `GetSum`, not the point's own sum.
+- **W1**: building it corrected or added to the ADR in these places.
+  - **Units.** The exporter's `AddUnits` gate maps a UCUM unit to Datadog's name (`ms` to
+    `millisecond`) and drops one it can't map, where `datadog_out` writes the record's unit
+    verbatim; the ADR's "Units" said they match. It's a gap in `docs/known-gaps/datadog.md`.
+  - **Degraded counts.** The transit spec needs a counter for a `degraded` cell that names one,
+    so `datadog_out` counts `metrics.degraded{metric_kind="non_monotonic_sum" | "histogram" |
+    "exponential_histogram"}`. A summary's cell names its `fields.omitted` instead, since a cell
+    names one counter.
+  - **Drops the ADR didn't name.** A bucket whose upper bound keys below its lower one makes the
+    translator's `MapMetrics` fail; `datadog_out` drops the record,
+    `metrics.dropped{reason="non_monotonic_bounds"}`. A histogram with the aggregation metrics on
+    and no finite sum counts `fields.omitted{reason="no_sum"}`. An exponential histogram past the
+    observation cap loses its aggregation series too, as the translator drops the point whole.
+  - **Go's `math` is part of the result.** Go's amd64 `Log` and FMA `Exp` round differently from
+    libm, which moves counts, so `logit_core::sketch::gomath` ports them; an arm64 Collector can
+    differ in the last place. The pinned commit's pseudo-version sorts below the `v0.84.4` tag, so
+    `go.mod` pins it with `replace`.
+  - **One translator quirk is ported.** A bucketless `(-Inf, +Inf]` point keys every observation
+    at `-1`, because Go's `int(+Inf)` is `math.MinInt64` on amd64.
+  - **The Agent's `appendSafe` order.** The `Dogsketch` encoder now writes a split count's
+    remainder before its full entries, as the Agent does; a `trimLeft` fold's order still
+    differs, with equal per-key totals.

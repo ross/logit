@@ -3247,6 +3247,9 @@ pub enum ComponentKind {
     /// Points older than Datadog accepts (1h for metrics, 18h for logs and events, 10m for
     /// service checks) are dropped and counted before sending. Traces go out only once a Datadog
     /// Agent has processed them: send `datadog_trace_in`'s output to `datadog_trace_out` instead.
+    /// OpenTelemetry sums, histograms, and summaries go out as Datadog's OTel exporter sends
+    /// them; a cumulative counter, histogram, or exponential histogram isn't sent, counted, so
+    /// set an OpenTelemetry SDK to delta temporality.
     DatadogOut {
         /// The Datadog API key, sent as `DD-API-KEY` on every request and never logged. Take it
         /// from the environment (`!env DD_API_KEY`) rather than writing it into the file. An

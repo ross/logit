@@ -622,7 +622,9 @@ Recorded per workstream as each lands.
   What the flows show about OTLP's metric model at each sink, each as the table already states
   it:
   - `datadog_out` writes only a delta monotonic sum and a gauge: a cumulative or non-monotonic
-    sum, a histogram, an exponential histogram, and a summary are skipped, counted.
+    sum, a histogram, an exponential histogram, and a summary are skipped, counted. Since
+    [`docs/plans/ddotlp.md`](ddotlp.md)'s W1, it writes all but a cumulative monotonic sum,
+    histogram, and exponential histogram, as Datadog's exporter does.
   - `influxdb_out` writes a histogram's finite buckets without its count, sum, min, max, or `+Inf`
     bucket, and a summary's quantiles without its count or sum, uncounted.
   - `statsd_out` writes an exponential histogram's count, sum, zero count, min, and max but no

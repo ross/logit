@@ -623,6 +623,6 @@ through a local Agent keeps its host. With no `host` attribute and no non-empty 
 writes on the metrics routes, to what Datadog's OTel exporter sends: a delta `Sum` of either
 monotonicity as a `count`, a cumulative non-monotonic `Sum` as a `gauge`, a delta `Histogram` or
 `ExponentialHistogram` as a sketch (or `.bucket` counts), and a `Summary` as `.quantile` gauges.
-A cumulative kind the exporter would difference is dropped, counted, and left to the
-`cumulative_to_delta` transform ([ADR `cumulative-to-delta-transform`](cumulative-to-delta-transform.md)),
+A cumulative kind the exporter would difference is counted, skipped until the transform exists
+and then dropped, and left to the `cumulative_to_delta` transform ([ADR `cumulative-to-delta-transform`](cumulative-to-delta-transform.md)),
 so decision 10's rule that `datadog_out` derives everything from the batch stands.

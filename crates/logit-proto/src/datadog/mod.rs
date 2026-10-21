@@ -101,7 +101,8 @@
 //!
 //! ## Encode: events → series, distribution points, sketches
 //!
-//! One series (or sketch) per `(event, MetricRecord)`, carrying one point. Carriers are read from
+//! One series (or sketch) per `(event, MetricRecord)`, carrying one point, but for the series a
+//! histogram or summary expands to (below). Carriers are read from
 //! the resource merged with the event's attributes (event wins); every other attribute renders as
 //! a tag by [`tags`]'s rule. A `Map`/`Bytes`/`Null` tag value, or a carrier of the wrong `Value`
 //! type, counts `logit.output.tags.omitted{reason="unrepresentable"}`.
@@ -207,6 +208,13 @@
 //! | a sketch bin with a fractional count | rounded; a bin rounding to 0 is omitted | `degraded{reason="fractional_count"}`, once per sketch |
 //! | a `Distribution` with no bins and zero count | skipped | `logit.output.metrics.skipped{reason="empty_sketch"}` |
 //! | a `Distribution` whose counts split into more than [`sketches::MAX_DOGSKETCH_ENTRIES`] `k`/`n` entries | dropped | `logit.output.metrics.dropped{reason="oversized_sketch"}` + diag `oversized_sketch` |
+//! | a delta `Histogram` under `histograms.mode: distributions`, and every delta `ExponentialHistogram` | a sketch built as Datadog's exporter builds it (`logit_core::sketch::from_otlp`): `Dogsketch{cnt, min, max, avg, sum}` the converter's own summary, `avg` included | `degraded{metric_kind}` |
+//! | such a histogram that can't be sketched | none: no observations; more than 4,096 × 65,535 of them; a bucket whose upper bound keys below its lower; an exponential histogram past the Agent's key range | `skipped{reason="empty_sketch"}`; `dropped{reason="oversized_sketch"}` + diag `oversized_sketch`; `dropped{reason="non_monotonic_bounds"}`; `dropped{reason="sketch_range"}` |
+//! | a delta `Histogram` under `histograms.mode: counters` | a `<name>.bucket` series `count` per bucket, empty buckets included, tagged `lower_bound:` and `upper_bound:` in the exporter's `formatFloat` form ([`series::format_float`]), with no unit | `degraded{metric_kind="histogram"}` |
+//! | `histograms.send_aggregation_metrics` on a delta `Histogram` or `ExponentialHistogram` | `<name>.count` (a `count`, no unit, the buckets' total or the record's `count`) and `<name>.sum` (a `count`), then `<name>.min` and `<name>.max` gauges where the record has them, ahead of any `.bucket` series; none when the sum is absent or non-finite, and none for an exponential histogram past the observation cap, as the exporter drops it whole | `fields.omitted{reason="no_sum"}` for a missing sum |
+//! | `Summary` | a `<name>.quantile` gauge per quantile tagged `quantile:` in `formatFloat`'s form, with the record's unit; no `.count` or `.sum`, since a summary is a running total | `fields.omitted{reason="unresolved_cumulative"}` + diag `unresolved_cumulative`, once per summary |
+//! | a cumulative monotonic `Sum`, cumulative `Histogram`, or cumulative `ExponentialHistogram` | skipped: Datadog's exporter differences it into a delta first, which nothing in `logit` does yet | `skipped{metric_kind}` + diag `unresolved_cumulative` |
+//! | a record flagged `NO_RECORDED_VALUE` that a sketch route would carry | skipped once, by the sketches route; the series route leaves its aggregation series off, uncounted | `skipped{reason="no_recorded_value"}` |
 //! | a kind another metrics route carries | left for that route, uncounted: only the series encoders count skips, and only of kinds no route carries | -- |
 //! | record 0 of a service check (`_logit.statsd.service_check.name` present and a `Gauge` first metric) | left for the service-checks route, uncounted; any later record encodes as usual, without the check's `_logit.statsd.service_check.*` carriers as tags | -- |
 //! | every record of an APM stats event ([`stats::ATTR_STATS_NAME`] present; [`is_datadog_stats`]) | left for the stats routes, uncounted: its `Sum`s and summary `Distribution`s are a stats group, not series or sketches | -- |

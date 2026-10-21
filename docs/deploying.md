@@ -2944,6 +2944,24 @@ and the batch resource, so stamp them upstream with `set`, as the example does f
 metric, log, event, or service check with no host goes out under the process hostname
 ([Hostname](#hostname)), so senders with no host of their own all report as the relay's host.
 
+**OpenTelemetry metrics.** `datadog_out` writes `otlp_in`'s metric kinds as Datadog's OTel
+exporter does: any delta sum as a count, a cumulative up-down counter as a gauge, a delta
+histogram or exponential histogram as a distribution, and a summary as `<name>.quantile` gauges.
+The `histograms:` block takes the exporter's settings under its names:
+
+```yaml
+    histograms:
+      mode: distributions          # default; counters writes <name>.bucket counts, nobuckets none
+      send_aggregation_metrics: false  # true adds <name>.count, .sum, .min, and .max
+```
+
+`mode: nobuckets` needs `send_aggregation_metrics: true`, or a histogram sends nothing, so it's
+rejected at startup. A cumulative counter, histogram, or exponential histogram is skipped, counted
+`logit.output.metrics.skipped{metric_kind}` with a throttled `unresolved_cumulative` warning, as
+is a summary's count and sum (`logit.output.fields.omitted{reason="unresolved_cumulative"}`):
+Datadog needs them as per-interval deltas. Set the SDK to delta temporality
+([`docs/datadog.md`](datadog.md#otel-metrics-to-datadog-otlp_in-into-datadog_out)).
+
 **Compression.** `compression: gzip`, the default, gzips every body except two. Distribution
 points go zlib-deflated, which is what Datadog documents for that route. Events go uncompressed,
 because Datadog's events route answers any compressed body `400 Invalid JSON structure`.
