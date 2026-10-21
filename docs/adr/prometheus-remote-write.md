@@ -606,3 +606,21 @@ rule at all, only the 128-rune label-set length in `tsdb/exemplar.go`'s `validat
 it would have stored `customer.tier` as sent. But this sender already writes a series label
 `customer.tier` as `customer_tier`, and an exemplar label spelled apart from the series labels
 beside it is a mismatch a query can't join across.
+
+## Amendment (2026-10-20): an exemplar over the label budget is left out, counted
+
+The sender applies OpenMetrics' 128-code-point exemplar label budget in both versions, as the
+exposition writer does: an exemplar whose label names (as sanitized) and values add up to more is
+left out and counted `logit.output.metrics.degraded{reason="exemplar_omitted"}`, once per
+exemplar. A collision or a reserved name inside it isn't counted, because none of its labels is
+written. Both writers share one check, `text::exemplar_fits`.
+
+The receiver is the reason. With exemplar storage on (`--enable-feature=exemplar-storage`; with
+it off, every exemplar is discarded silently), Prometheus 3.14.0's head appender rejects such an
+exemplar with `ErrExemplarLabelLength` (`tsdb/exemplar.go`'s `validateExemplar`), and
+`storage/remote/write_handler.go` doesn't fail the request on it, in either version. Under 1.0 it logs the error at debug level. Under 2.0
+it logs it at error level, leaves it out of `X-Prometheus-Remote-Write-Exemplars-Written`, and
+doesn't add it to the errors that make a `400`. So the request still gets its `2xx`, the
+response class reads `Clean`, and the exemplar was lost with nothing on the sender's side to show
+it. Leaving it out at the sender turns that loss into a counted one and changes no response
+class.

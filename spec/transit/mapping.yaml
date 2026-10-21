@@ -929,7 +929,8 @@ rows:
         counter: logit.output.metrics.degraded{reason=exemplar_omitted}
         text: >-
           In OpenMetrics, on a counter's `_total` line or the bucket line its value falls in, at
-          most one per line. One with no line to sit on, such as a gauge's, is left off, counted.
+          most one per line. One with no line to sit on, such as a gauge's, or one over the
+          128-code-point label budget, on either wire, is left off, counted.
       datadog_out:
         class: lost
         reason: uncounted
