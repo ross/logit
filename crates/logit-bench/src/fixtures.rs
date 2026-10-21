@@ -38,6 +38,7 @@ use logit_proto::syslog::SyslogDecoder;
 use logit_proto::Decoder;
 use logit_transforms::{
     AggregateTemporality, Aggregator, Arrays, Bucket, BucketBound, BucketField, CsvParser,
+    CumulativeToDelta, InitialValue,
     Distributions, Fields, Flatten, HttpAccess, HttpAccessConfig, JsonParser, Keep, KeepValues, Kv,
     KvMetrics, LineProtocol, Logfmt, MetricSpec, Normalize, RegexParser, RouteRule, RouteSet,
     Sample, SampleField, SampleKey, SampleMissing, SampleOverride, Set, Shape,
@@ -561,6 +562,27 @@ pub fn kv_metrics() -> KvMetrics {
             },
         ],
     )
+}
+
+/// A `cumulative_to_delta` at its defaults but `initial_value: keep`, so the first point of a
+/// series is emitted too and every point takes a converting path.
+pub fn cumulative_to_delta() -> CumulativeToDelta {
+    CumulativeToDelta::new(InitialValue::Keep, Duration::from_secs(3600), 10_000)
+}
+
+/// A scrape's cumulative counter: hand-written, shaped as `prometheus_in` decodes
+/// `http_requests_total{method="get",code="200"} <total>`, a monotonic cumulative `Sum` with
+/// two attributes.
+pub fn cumulative_counter_event(timestamp: i64, total: f64) -> Event {
+    let mut attributes = AttrMap::new();
+    attributes.insert("method", "get");
+    attributes.insert("code", "200");
+    let kind = MetricKind::Sum(logit_core::Sum {
+        value: logit_core::MetricValue::F64(total),
+        temporality: logit_core::Temporality::Cumulative,
+        monotonic: true,
+    });
+    Event::metric(timestamp, attributes, MetricRecord::new(logit_core::interner::intern("http_requests_total"), kind))
 }
 
 /// The reference example's pre-`http_access` `trimmed` component: the three tags that reached
