@@ -1350,14 +1350,16 @@ the component, not among the `script:`/`lua_file:` fields. A non-empty `targets:
 component emits goes to its own consumers.
 
 **Native transforms handle the common parsing cases without per-event VM overhead:** `json`,
-`logfmt`, `kv`, `regex`, `csv`, `keep`/`remove`/`set`, `has_attributes`/`drop_attributes`,
-`sample`, `timestamp`, `aggregate`, and the rest of the transform kinds `docs/design/pipeline-graph.md` lists.
+`logfmt`, `kv`, `regex`, `csv`, `keep`/`remove`/`set`, `has_attributes`/`drop_attributes`, `sample`,
+`timestamp`, `aggregate`, and the rest of the transform kinds `docs/design/pipeline-graph.md` lists.
 (`filter`, `rename`, `throttle`, and `dedup` were retired rather than built, per ADR
 `routing-by-condition-is-lua`; `sample` came back as a native kind for the keyed, cross-process
-consistency Lua can't express, per ADR `consistent-sampling-component`.) Each is a transform-kind
-component like `lua` above, and wires into the graph the same way. They're meant to sit in front
-of user Lua ("parse the JSON body, then run my logic"), not to replace it: a native transform can
-name a Lua component as its source, or the reverse, like any other edge.
+consistency Lua can't express, per ADR `consistent-sampling-component`. `dedup_timestamps` collapses
+a series' metric readings at one instant within a batch, which Lua can't do without latency, per ADR
+`dedup-timestamps-transform`; the event-level `dedup` stays retired.) Each is a transform-kind
+component like `lua` above, and wires into the graph the same way. They're meant to sit in front of
+user Lua ("parse the JSON body, then run my logic"), not to replace it: a native transform can name
+a Lua component as its source, or the reverse, like any other edge.
 
 ## Concurrency
 

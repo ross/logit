@@ -4,10 +4,10 @@ Entry format and the other areas: [the known-gaps index](README.md).
 
 ## Transforms: predicates and sampling
 
-- **Predicate-shaped work (throttling, dedup, and anything needing a real operator: `contains`,
-  cross-attribute comparison, boolean combinations) costs a Lua VM, an OS thread, and roughly 9× the
-  per-event allocations of a native transform, because `logit` has no native predicate
-  language.** The rest of predicate-shaped work has native answers:
+- **Predicate-shaped work (throttling, event-level dedup, and anything needing a real operator:
+  `contains`, cross-attribute comparison, boolean combinations) costs a Lua VM, an OS thread, and
+  roughly 9× the per-event allocations of a native transform, because `logit` has no native
+  predicate language.** The rest of predicate-shaped work has native answers:
   - Equality and key-presence filtering, such as splitting a `logit_in` fan-out back apart by an
     attribute an upstream `set` stamped, or keeping events that carry a key: `has_attributes`/
     `drop_attributes`
@@ -22,6 +22,11 @@ Entry format and the other areas: [the known-gaps index](README.md).
   - Sampling: `sample`
     ([ADR `consistent-sampling-component`](../adr/consistent-sampling-component.md)), because a
     `lua` component can't express keyed, cross-process-consistent sampling.
+  - Collapsing one series' metric readings at one instant before a sink that can't hold both:
+    `dedup_timestamps`
+    ([ADR `dedup-timestamps-transform`](../adr/dedup-timestamps-transform.md)), because a `lua`
+    component can't keep the later reading of a batch without adding latency. Suppressing a
+    repeated event stays `lua` work.
 
   **Consequence:** [ADR `routing-by-condition-is-lua`](../adr/routing-by-condition-is-lua.md)
   measured **9** allocations / **1.61 µs** per event through a `lua` component versus **1**

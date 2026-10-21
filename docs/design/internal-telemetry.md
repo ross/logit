@@ -494,7 +494,7 @@ config asked for never uses the word:
 | Name | Meaning | Tags |
 |---|---|---|
 | `*.dropped` | Loss: data that should have left `logit` and didn't, such as queue overflow, a destination's rejection, shutdown, a disk fault, an oversize item, malformed input, a closed consumer, a relative gauge or delta nothing upstream resolved, or a gap in `logit`'s own implementation. | Always `reason`, never `metric_kind`; `signal` or `route` where the counter needs one. |
-| `logit.component.events.discarded` | A filter, `sample`, `aggregate`, `cumulative_to_delta`, `route_signals`, or Lua script removed an event because the config asked it to. A record `cumulative_to_delta` dropped is counted under its own `*.dropped` as well. | None. |
+| `logit.component.events.discarded` | A filter, `sample`, `aggregate`, `cumulative_to_delta`, `dedup_timestamps`, `route_signals`, or Lua script removed an event because the config asked it to. A record `cumulative_to_delta` dropped is counted under its own `*.dropped` as well. | None. |
 | `logit.component.events.copied` | A router delivered an event to more than one destination, or `route_signals` split one into a part per target; counts the deliveries past each event's first. Nothing is lost. | None. |
 | `*.omitted` | A piece (a tag, label, attribute, field, structured-data element, link, sample value, or a metric record or span beside a log body) removed from a record that's still delivered. | `reason` where more than one cause exists. |
 | `*.skipped` | Nothing was there to carry, the operator chose to leave it out (`multi_value: skip`), or the destination format has no form for the kind. | `reason` or `metric_kind`. |
@@ -1640,6 +1640,22 @@ removed from an event that keeps another payload counts only under its reason ab
 
 `Diagnostics` keys: `max_series_full` (a cardinality eviction), `layout_changed`, and
 `non_finite_sum`, each mirroring its counter.
+
+##### `dedup_timestamps`
+
+`crates/logit-transforms/src/dedup_timestamps.rs`,
+[ADR `dedup-timestamps-transform`](../adr/dedup-timestamps-transform.md). Counted per batch, each
+only when nonzero, and only for a record that shares its series and bucket with another. Nothing
+here is loss: a passed-through record reaches the sink, which counts it if it drops it.
+
+| Name | Kind | Meaning |
+|---|---|---|
+| `logit.transform.metrics.merged` | count | a reading added or combined into the surviving one: a delta `Sum`, a delta `Histogram` or `ExponentialHistogram` with the survivor's layout, `Samples` at its rate, `SetMembers`, a `Distribution` (re-binned when its mapping differs), or a `Set` |
+| `logit.transform.metrics.absorbed` | count | a reading superseded by a later one under last write wins: a `Gauge` or a cumulative kind, a `NO_RECORDED_VALUE` marker on one included. Narrower than `aggregate`'s `absorbed`: the survivor isn't counted |
+| `logit.transform.metrics.passed_through{reason="non_finite"\|"overflow"\|"mixed_type"\|"layout_mismatch"\|"no_merge_rule"\|"no_recorded_value"}` | count | a colliding record forwarded untouched beside the survivor: a `NaN` or infinite increment, a total past its type's range, an `I64`/`F64` mismatch with the survivor, other histogram bounds or sample rate, a `GaugeDelta` or delta `Summary`, or a marker beside delta values. When no record of a set can merge, every one but the first counts |
+
+An event left with no metric, log, or span counts `logit.component.events.discarded`. No
+`Diagnostics` keys.
 
 ##### `kv_metrics`
 

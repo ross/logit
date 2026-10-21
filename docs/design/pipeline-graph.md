@@ -173,7 +173,9 @@ pub enum ComponentKind {
     // already expressible as a `lua` component, and `docs/adr/routing-by-condition-is-lua.md`
     // records why a native equivalent wasn't worth building yet. `sample` was retired with them
     // and came back once keyed, cross-process consistency turned out to be the part `lua` can't
-    // express.
+    // express. `DedupTimestamps { precision: Duration }` isn't the retired `dedup`: it collapses a
+    // series' readings at one instant within a batch, which `lua` can't do without latency
+    // (docs/adr/dedup-timestamps-transform.md).
 
     InfluxDbOut { url: String, org: Option<String>, default_org: Option<String>,
                   bucket: Option<String>, default_bucket: Option<String>, token: String },
@@ -238,7 +240,7 @@ literal argument string.
 | Kind class | `sources` | May be another component's source |
 |---|---|---|
 | Listener (`statsd_in`, `lines_in`, `collectd_in`, `graphite_in`, `syslog_in`, `otlp_in`, `tail_in`, `docker_in`, `logit_in`, `internal`, `prometheus_in`, `generate_in`, `replay_in`) | must be empty | required (≥1 consumer) |
-| Transform (`lua`, `lua_file`, `aggregate`, `json`, `csv`, `kv_metrics`, `keep`, `remove`, `set`, `trace_context`, `scale`, `has_signal`, `keep_signals`, `drop_signals`, `has_attributes`, `drop_attributes`, `has_provenance`, `drop_provenance`, `has_stale`, `drop_stale`, `cumulative_to_delta`, `keep_values`, `bucket`, `logfmt`, `kv`, `regex`, `shape`, `flatten`, `line_protocol`, `http_access`, `sample`, `timestamp`, `route`, `route_signals`) | ≥1 required | required (≥1 consumer), except `route_signals`, which must have none (rule 92) |
+| Transform (`lua`, `lua_file`, `aggregate`, `json`, `csv`, `kv_metrics`, `keep`, `remove`, `set`, `trace_context`, `scale`, `has_signal`, `keep_signals`, `drop_signals`, `has_attributes`, `drop_attributes`, `has_provenance`, `drop_provenance`, `has_stale`, `drop_stale`, `cumulative_to_delta`, `dedup_timestamps`, `keep_values`, `bucket`, `logfmt`, `kv`, `regex`, `shape`, `flatten`, `line_protocol`, `http_access`, `sample`, `timestamp`, `route`, `route_signals`) | ≥1 required | required (≥1 consumer), except `route_signals`, which must have none (rule 92) |
 | Sink (`influxdb_out`, `stdio_out`, `file_out`, `otlp_out`, `datadog_out`, `datadog_trace_out`, `splunk_hec_out`, `kafka_out`, `syslog_out`, `logit_out`, `statsd_out`, `collectd_out`, `graphite_out`, `prometheus_out`, `null_out`) | ≥1 required | must not be |
 | Target (`target`) | must be empty | required (≥1 consumer), and ≥1 directing router (rule 49) |
 
@@ -487,6 +489,7 @@ silently ignored. `0` for a count or duration bound is usually impossible, not s
     under `strip: false`, a component whose `sources:` lists two of its targets.
 93. A `replay_in` with an empty `path` or a `batch` of `0`.
 94. A `cumulative_to_delta` with a `max_staleness` of `0s` or a `max_series` of `0`.
+95. A `dedup_timestamps` with a `precision` of `0s`.
 
 **Deliberately not validated:** that a `by: {provenance: ..}` route key names a component in *this*
 graph — rule 37's reasoning; the key is as likely to name a component relayed from another process.
@@ -665,6 +668,13 @@ Besides `process`, `Transform` has a second per-batch hook, `map_resource`, call
 incoming batch before any event reaches `process`. It lets a transform substitute the batch's
 resource (`logit-transforms::Set` was the first implementer); see
 [ADR `operator-declared-resource-attributes`](../adr/operator-declared-resource-attributes.md).
+
+A third, `begin_batch`, runs after `map_resource` and before the per-event loop, with the batch's
+resource, scope, and `&mut Vec<Event>`. A transform that needs the whole batch in view uses it to
+edit and remove events in place; `process_batch` counts a removed event as
+`logit.component.events.discarded`. `dedup_timestamps` is its one implementer, since collapsing a
+reading into a *later* event needs that event in view; see
+[ADR `dedup-timestamps-transform`](../adr/dedup-timestamps-transform.md).
 
 A native transform can also turn one event into several. The runtime calls
 `Transform::process_into`, whose default forwards to `process`. Its bool forwards or discards the
