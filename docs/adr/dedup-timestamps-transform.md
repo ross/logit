@@ -109,8 +109,8 @@ Within a colliding set, a record that can't merge passes through: it stays on it
 event, untouched, and is counted `passed_through` with the reason the table gives. The
 **surviving record is the latest-timestamp record among the records that can merge**, and the
 later in batch order on a tie. Its event keeps its own, untruncated timestamp, and every other
-mergeable record in the set is removed from its event. A `NaN` or infinite delta value and a kind
-with no merge rule can't merge on their own. A layout, a `sample_rate`, or a value type is
+mergeable record in the set is removed from its event. A `NaN` or infinite delta value, a marker
+on a delta kind, and a kind with no merge rule can't merge on their own. A layout, a `sample_rate`, or a value type is
 compared with the survivor's, so the latest record that can merge on its own sets them, and a
 record that differs from it passes through. The rest fold into the survivor in batch order, and a
 record whose addition would overflow the running total passes through. What the surviving record
@@ -130,7 +130,8 @@ carries depends on the kind:
 | `SetMembers` | union: the members of both, each once |
 | `Distribution` | `DdSketch::merge`, which re-bins the incoming sketch when the two sketches' mappings differ |
 | `Set` | `HyperLogLog::merge`, a union |
-| a record flagged `NO_RECORDED_VALUE`, any kind | last write wins against the set's latest value: see below |
+| a record flagged `NO_RECORDED_VALUE`, on a `Gauge` or a cumulative kind | last write wins against the set's latest value: see below |
+| a record flagged `NO_RECORDED_VALUE`, on a delta `Sum`, `Histogram`, or `ExponentialHistogram` | passed through (`no_recorded_value`); the delta values merge among themselves |
 
 Last write wins needs no arithmetic, so it's safe for every kind, `NaN` included. A delta is an
 increment, so the later one alone would lose the earlier's. Summing is the merge
@@ -193,19 +194,25 @@ The four observation kinds merge where `aggregate` merges them, with one differe
 - **`Set`** always merges: `HyperLogLog::merge` has no precondition.
 
 A record flagged `NO_RECORDED_VALUE`, such as Prometheus's stale marker, carries no reading, so
-it never enters arithmetic. It takes part in last write wins against the latest mergeable value
-in its set, and the record that loses is counted `absorbed`. A record that can't merge still
-passes through, as above.
+it never enters arithmetic. What it does in a colliding set depends on the kind.
+
+On a `Gauge` or a cumulative kind, a marker supersedes a value the way a later value would, so it
+takes part in last write wins against the latest mergeable value in its set, and the record that
+loses is counted `absorbed`. A record that can't merge still passes through, as above.
 
 - **When the marker is the latest**, ties going to the later in batch order, the series ended.
   The marker survives and absorbs every mergeable value in the set.
-- **When a value is later**, the value wins. The marker is absorbed, and the values resolve among
-  themselves by their kind's rule.
+- **When a value is later**, the value wins. The marker is absorbed.
 - **Two markers** resolve by last write wins too.
 
-This departs from `aggregate`, which passes a flagged record through unmerged: `aggregate` folds
-values into a window, while here a marker and a value at one instant are two readings of one
-series, and the later one is the series' state.
+On a delta `Sum`, `Histogram`, or `ExponentialHistogram`, a value is an increment, which is real
+data a marker can't supersede. So every marker in the set passes through on its own event,
+counted `passed_through{reason="no_recorded_value"}`, and the delta values merge among themselves
+by their kind's rule. No increment is ever absorbed by a marker.
+
+The last-write-wins case departs from `aggregate`, which passes every flagged record through
+unmerged: `aggregate` folds values into a window, while here a marker and a gauge or cumulative
+value at one instant are two readings of one series, and the later one is the series' state.
 
 On a merged record:
 
@@ -286,8 +293,8 @@ it emits no `*.dropped`. The loss a passed-through record causes is counted at t
 | Name | Meaning |
 |---|---|
 | `logit.transform.metrics.merged` | a reading summed or otherwise combined into the surviving reading: a delta `Sum`, a delta histogram with a matching layout, and the observation kinds' merges, a re-binned `Distribution` included |
-| `logit.transform.metrics.absorbed` | a reading superseded by a later one under last write wins: a `Gauge`, a cumulative kind, or either side of a `NO_RECORDED_VALUE` marker and a value |
-| `logit.transform.metrics.passed_through{reason="non_finite" \| "overflow" \| "mixed_type" \| "layout_mismatch" \| "no_merge_rule"}` | a record that shares its series and bucket with another but can't merge, forwarded untouched: the sink still sees the duplicate |
+| `logit.transform.metrics.absorbed` | a reading superseded by a later one under last write wins: a `Gauge`, a cumulative kind, or either side of a `NO_RECORDED_VALUE` marker and a value of one of those kinds |
+| `logit.transform.metrics.passed_through{reason="non_finite" \| "overflow" \| "mixed_type" \| "layout_mismatch" \| "no_merge_rule" \| "no_recorded_value"}` | a record that shares its series and bucket with another but can't merge, forwarded untouched: the sink still sees the duplicate |
 | `logit.component.events.discarded` | an event left with no metric, log, or span |
 
 `merged` and `absorbed` count the readings that are gone, never the survivor. `passed_through`
