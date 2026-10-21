@@ -66,7 +66,9 @@
 //!
 //! **Stale points.** Datadog documents a window per route and discards data outside it, so before
 //! encoding, relative to the send time, this sink drops and counts
-//! `logit.output.records.dropped{reason="stale"}`, per record:
+//! `logit.output.records.dropped{reason="stale"}`, per entry (each series a record writes, and one
+//! for a series-route record that writes none; each distribution-points or sketch record; each
+//! event on the other routes):
 //!
 //! | Route | Dropped when |
 //! |---|---|
@@ -298,7 +300,7 @@ use anyhow::Context;
 use bytes::Bytes;
 use http::{HeaderMap, HeaderName, HeaderValue};
 use logit_core::interner::resolve;
-use logit_core::{redact, Diagnostics, EventBatch, Symbol, Telemetry};
+use logit_core::{redact, Diagnostics, Event, EventBatch, Resource, Symbol, Telemetry};
 use logit_pipeline::{BatchContext, DeliveryPosture, Fault, Output, SeqId};
 use logit_proto::datadog::events::EventFormat;
 use logit_proto::datadog::series::{metric_tag_count, record_routes, series_over_tag_limit};
@@ -666,7 +668,11 @@ fn plan(batch: &EventBatch, now: i64, histograms: HistogramOptions) -> Plan {
                 }
             };
             if !kept {
-                plan.stale[r] += item.weight;
+                plan.stale[r] += if route == Route::Series {
+                    stale_series_entries(resource, event, histograms)
+                } else {
+                    item.weight
+                };
                 continue;
             }
             if route == Route::Series {
@@ -712,6 +718,19 @@ fn plan(batch: &EventBatch, now: i64, histograms: HistogramOptions) -> Plan {
         }
     }
     plan
+}
+
+/// The entries a stale series item counts: each series a record writes, and one for a record
+/// the series route reads but writes nothing for (a cumulative monotonic `Sum`, say), which the
+/// encoder would have counted as skipped had the item reached it.
+fn stale_series_entries(resource: &Resource, event: &Event, histograms: HistogramOptions) -> usize {
+    let check = usize::from(is_service_check(resource, event));
+    event.metrics[check..]
+        .iter()
+        .map(|record| record_routes(record, histograms))
+        .filter(|routes| routes.series_route)
+        .map(|routes| routes.series.max(1))
+        .sum()
 }
 
 /// One request [`encode_routes`] writes: the route's path, its `Content-Type`, and its body,
@@ -1523,6 +1542,30 @@ mod tests {
             send_aggregation_metrics: true,
         };
         assert_eq!(weights(counters), (3 + 2, 0));
+    }
+
+    /// A stale series item counts its entries: each series a record writes, and one for a record
+    /// that writes none, which never reaches the encoder to count its skip.
+    #[test]
+    fn a_stale_record_that_writes_no_series_still_counts() {
+        let counters = HistogramOptions {
+            mode: logit_proto::datadog::HistogramMode::Counters,
+            send_aggregation_metrics: true,
+        };
+        let stale = NOW - 2 * HOUR;
+        let sum_only = plan(&batch(vec![cumulative_sum(stale)]), NOW, HistogramOptions::default());
+        assert_eq!(sum_only.stale[Route::Series as usize], 1);
+        let mut h = histogram(stale);
+        h.metrics.push(MetricRecord::new(
+            intern("c"),
+            MetricKind::Sum(Sum {
+                value: logit_core::MetricValue::F64(1.0),
+                temporality: Temporality::Cumulative,
+                monotonic: true,
+            }),
+        ));
+        let mixed = plan(&batch(vec![h]), NOW, counters);
+        assert_eq!(mixed.stale[Route::Series as usize], 3 + 2 + 1);
     }
 
     /// A `.bucket` series carries its two bounds after the event's tags, so on an event with 99
