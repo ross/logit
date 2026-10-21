@@ -684,3 +684,55 @@ Recorded per workstream as each lands.
   rewrites only `:`, `|`, `@`, `#`, `,`, control, and whitespace characters. So `café.temperature`
   reaches `record/name_unsafe` at `statsd_out` and reads back `exact`, which the `normalized` cell
   accepts.
+- **`graphite_out` column** (`tgraph/w2`): 63 of the table's 73 rows have a `graphite_out` cell,
+  and 11 flows end in it: the like pair under plaintext, `protocol: pickle`, and `tags: drop`;
+  one from each other source under the default `multi_value: skip`; and `statsd-to-graphite-expand`
+  and `otlp-to-graphite-expand`. The driver encodes through `graphite_out`'s encoder with the
+  sink's line cap (`logit_outputs::graphite::line_cap`) and reads each `MessageBuf` entry back
+  through `GraphiteDecoder`, a pickle frame with its length prefix stripped as `graphite_in`'s
+  framer strips it. The rows with no cell are the field rows of kinds `graphite_out` writes only
+  in a lesser form, the two exemplar-key rows, `attributes/private_carrier` (`graphite_in`
+  stamps no carrier), and the Datadog-derived log and span fields.
+
+  The class check's name rule is now each sink's own: `Spelling::sanitize` reads a name through
+  the encoder's own predicate, `logit_outputs::statsd::is_forbidden_in_name` for `statsd_out`
+  and `logit_proto::graphite::encode`'s path, tag-name, and tag-value predicates for
+  `graphite_out`, made public for it, rather than a copy of either. That settles the
+  disagreement `tgraph/w1` recorded: a non-ASCII or `=` character no longer reaches
+  `record/name_unsafe` at `statsd_out`. Four records moved off the row, each read back `exact`
+  before and after: `café.temperature`, `py2.café`, and `logit-fixture.diamond.café.count` in
+  `graphite-to-statsd`, and `interop_escapes.f=e` in `influxdb-to-statsd`, where the case's
+  other records still reach the row. The pass-3 dotted base uses the sink's spelling for
+  `statsd_out` and `graphite_out` alike.
+
+  The like pair reads `exact` everywhere under all three flows, `attributes/string_value`'s
+  `tags: drop` cell aside, which reads `lost` as configured. No case holds a path or tag that
+  `graphite_out` sanitizes (a `/`, a `\`, a tag name's `!` or `^`, a value's leading `~`), so
+  normalization 10 isn't exercised by the pair.
+
+  Each recorded as the code behaves, none fixed here:
+  - Every `Sum` reads `degraded` with no counter: the bare value reads back as a gauge. The codec
+    calls this normalization 12, "not a skip", and `statsd_out` counts the same degradation for
+    a cumulative or non-monotonic sum. Whether `graphite_out` should count
+    `metrics.degraded{metric_kind=…}` is open.
+  - An event with no metrics (a log, a span, or attributes alone) is skipped with no counter or
+    diagnostic, only `EncodeStats::skipped_no_metrics`. The log, span, and event rows record it
+    as `skipped` or `lost`, uncounted, as `influxdb_out` and `prometheus_out` do; `statsd_out`
+    counts `events.skipped`. The codec's encode table said "nothing was lost"; it now says the
+    event's content is lost.
+  - Under `multi_value: expand`, a non-finite `.sum`, `.min`, `.max`, or quantile is left off
+    uncounted, where `influxdb_out` counts `metrics.degraded{reason=non_finite_component}`.
+  - `metrics.normalized{reason=tag_sanitized}` counts once per record, whichever attribute moved
+    it, so the `string_value`, `bool_value`, `number_value`, and `resource_attribute` cells all
+    name it. An array element alone can't move it without one of those beside it, which the
+    README's "Counters no row names yet" lists with the column's other unreached series.
+  - Under `tags: drop`, series that differ only in their tags write one path, which the
+    `string_value` cell says. No other source's flow runs `tags: drop`: pass 3 pairs a sum by
+    name, and under drop two sums of one name and different tags score the same, so the first
+    claims both read-back gauges.
+  - `record/superseded`, `same_instant`, and `same_millisecond` read `exact`, since the codec
+    writes every point. A whisper store keeps one point per path and second, so two points of a
+    series in one second keep only the later there; the cells say so, and no row counts it.
+  - Carbon 1.1.10's `TaggedSeries.parse_carbon` sets `tags['name']` to the path after reading
+    the tag segments, so an attribute named `name` is replaced at a tagged carbon, uncounted.
+    `graphite_out` writes it as any other tag. No case carries one.
