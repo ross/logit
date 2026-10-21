@@ -136,7 +136,7 @@ use logit_outputs::ndjson::render_ndjson;
 use logit_outputs::statsd::is_forbidden_in_name;
 use logit_proto::event_json::EventJsonDecoder;
 use logit_proto::graphite::encode::{
-    is_forbidden_in_path, is_forbidden_in_tag_name, sanitize_tag_value_into,
+    is_forbidden_in_path, is_forbidden_in_tag_name, render_tag_value, sanitize_tag_value_into,
 };
 use logit_proto::influxdb::ATTR_MEASUREMENT;
 use logit_proto::prometheus::text::exposed_exemplar_keys;
@@ -762,34 +762,47 @@ fn substituted(s: &str, forbidden: impl Fn(char) -> bool) -> String {
     s.chars().map(|c| if forbidden(c) { '_' } else { c }).collect()
 }
 
-/// An attribute value as `graphite_out` writes it as a tag value, `None` where it writes no tag
-/// (`logit_proto::graphite::encode`'s `build_tag_suffix` and `render_scalar`): a string, an
-/// integer, or a boolean as its text, an `f64` in Rust's shortest form, and an array as its last
-/// element that's one of those, each sanitized; a null, a map, bytes, a timestamp, an array with
-/// none of those, and a value empty after sanitizing write none. `tags` is its `types` entry.
+/// An attribute value as `graphite_out` writes it as a tag value, `None` where it writes no tag:
+/// the value back in the model, rendered by the encoder's own `render_tag_value` and
+/// `sanitize_tag_value_into`, so the two can't drift. A value empty after that writes none.
+/// `tags` is its `types` entry.
 fn graphite_value(value: &Value, tags: &str) -> Option<String> {
-    let scalar = |value: &Value, pointer: &str| -> Option<String> {
-        let tagged = |tag: &str| tags.split(';').any(|entry| entry == format!("{pointer}={tag}"));
-        if tagged("bytes") || tagged("timestamp") {
-            return None;
-        }
-        match value {
-            Value::String(s) => Some(s.clone()),
-            Value::Bool(b) => Some(b.to_string()),
-            Value::Number(n) if n.is_f64() => n.as_f64().map(|f| f.to_string()),
-            Value::Number(n) => Some(n.to_string()),
-            Value::Null | Value::Array(_) | Value::Object(_) => None,
-        }
-    };
-    let raw = match value {
-        Value::Array(items) => {
-            items.iter().enumerate().rev().find_map(|(i, item)| scalar(item, &format!("/{i}")))?
-        }
-        other => scalar(other, "/")?,
-    };
+    let mut raw = String::new();
+    if !render_tag_value(&mut raw, &model_value(value, tags, "/")) {
+        return None;
+    }
     let mut out = String::new();
     sanitize_tag_value_into(&mut out, &raw);
     (!out.is_empty()).then_some(out)
+}
+
+/// A `format: json` attribute value as the model [`logit_core::Value`] it was written from,
+/// `tags` its `types` entry and `pointer` its place there (`/`, or `/<i>` for an array element).
+/// A map comes back as `Null`, since neither has a tag form; any other value is exact.
+fn model_value(value: &Value, tags: &str, pointer: &str) -> logit_core::Value {
+    use logit_core::Value as Model;
+    let tagged = |tag: &str| tags.split(';').any(|entry| entry == format!("{pointer}={tag}"));
+    match value {
+        _ if tagged("bytes") => Model::Bytes(bytes::Bytes::new()),
+        _ if tagged("timestamp") => Model::Timestamp(0),
+        Value::String(s) if tagged("f64") => s.parse().map_or(Model::Null, Model::F64),
+        Value::String(s) => Model::str(s.clone()),
+        Value::Bool(b) => Model::Bool(*b),
+        Value::Number(n) => match (n.as_i64(), n.as_u64(), n.as_f64()) {
+            (Some(i), _, _) => Model::I64(i),
+            (_, Some(u), _) => Model::U64(u),
+            (_, _, Some(f)) => Model::F64(f),
+            _ => Model::Null,
+        },
+        Value::Array(items) => Model::Array(
+            items
+                .iter()
+                .enumerate()
+                .map(|(i, item)| model_value(item, tags, &format!("/{i}")))
+                .collect(),
+        ),
+        Value::Null | Value::Object(_) => Model::Null,
+    }
 }
 
 /// RFC 6901's unescaping of one pointer token.
@@ -2176,6 +2189,38 @@ mod tests {
         assert!(record_features(&ins[0], Spelling::Graphite).contains(&"name_unsafe"));
         let plain = recs(&[r#"{{T},"metrics":[{"name":"café:x|y","kind":"gauge","value":1.0}]}"#]);
         assert!(!record_features(&plain[0], Spelling::Graphite).contains(&"name_unsafe"));
+    }
+
+    /// An `f64` attribute in its `format: json` spelling reads back as the tag value
+    /// `graphite_out`'s encoder writes for it, a non-finite one through its `types` entry.
+    #[test]
+    fn graphite_reads_an_f64_tag_as_the_encoder_writes_it() {
+        let read = |json: &str, tags: &str| {
+            graphite_value(&serde_json::from_str(json).expect("a JSON value"), tags)
+        };
+        for (json, want) in [
+            ("3.0", "3"),
+            ("1e21", "1000000000000000000000"),
+            ("-0.0", "-0"),
+            ("0.25", "0.25"),
+            ("3", "3"),
+        ] {
+            assert_eq!(read(json, "").as_deref(), Some(want), "{json}");
+        }
+        for (json, want) in [(r#""NaN""#, "NaN"), (r#""inf""#, "inf"), (r#""-inf""#, "-inf")] {
+            assert_eq!(read(json, "/=f64").as_deref(), Some(want), "{json}");
+        }
+        let mut written = String::new();
+        for value in [3.0, 1e21, -0.0, 0.25, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(render_tag_value(&mut written, &logit_core::Value::F64(value)));
+            let json = if value.is_finite() {
+                serde_json::to_string(&value).expect("a finite f64")
+            } else {
+                format!("{written:?}")
+            };
+            let tags = if value.is_finite() { "" } else { "/=f64" };
+            assert_eq!(read(&json, tags).as_deref(), Some(written.as_str()), "{value}");
+        }
     }
 
     /// `graphite_out` writes a tag name's `!` and a tag value's whitespace and leading `~` as

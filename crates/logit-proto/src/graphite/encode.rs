@@ -571,19 +571,8 @@ fn build_tag_suffix(
             continue;
         }
 
-        // An `Array` renders its *last* representable element (walking backwards past
-        // unrepresentable ones), `influxdb_out`'s rule, so a repeated DogStatsD tag key reaches
-        // both sinks the same way.
-        scratch.clear();
         let is_multi_value = matches!(value, Value::Array(_));
-        let rendered = match value {
-            Value::Array(elements) => elements.iter().rev().any(|element| {
-                scratch.clear();
-                render_scalar(scratch, element)
-            }),
-            scalar => render_scalar(scratch, scalar),
-        };
-        if !rendered {
+        if !render_tag_value(scratch, value) {
             ctx.tag_omitted_unrepresentable();
             continue;
         }
@@ -639,6 +628,22 @@ fn build_tag_suffix(
     }
 
     sanitized
+}
+
+/// Renders an attribute's [`Value`] into `out` (cleared first) as its tag value, before
+/// sanitizing, returning whether it has one. An `Array` renders its *last* representable element
+/// (walking backwards past unrepresentable ones), `influxdb_out`'s rule, so a repeated DogStatsD
+/// tag key reaches both sinks the same way. Public so the transit spec's class check reads a tag
+/// value back as this encoder writes it.
+pub fn render_tag_value(out: &mut String, value: &Value) -> bool {
+    out.clear();
+    match value {
+        Value::Array(elements) => elements.iter().rev().any(|element| {
+            out.clear();
+            render_scalar(out, element)
+        }),
+        scalar => render_scalar(out, scalar),
+    }
 }
 
 /// Renders one non-`Array` [`Value`] as a tag value, returning whether it has a faithful string
