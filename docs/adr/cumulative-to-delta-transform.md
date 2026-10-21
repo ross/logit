@@ -117,25 +117,45 @@ Each point, in batch order, takes the first rule that applies:
    includes it. Neither carries anything new. This is the Datadog translator's rule for a
    monotonic sum, applied to every kind. The Collector processor has no ordering check, so it
    differences a resent point to zero and an older one into a false reset.
-3. **A reset:** the `start_timestamp` changed (and is nonzero), equals the point's timestamp, or
-   the value went down (a `Sum`'s value, or a histogram's or summary's count, or any bucket
-   count). The point's full value is emitted as the delta, whatever `initial_value` says, and
-   becomes the baseline. The series restarted after a point this component saw, so everything
-   in the new total accrued while it watched, and emitting it double-counts nothing.
-4. **A layout change with no reset:** a `Histogram` whose bounds differ from the baseline's, or
+3. **A reset:** evidence that the counter restarted after the previous point. Either the value
+   went down (a `Sum`'s value, or a histogram's or summary's count, or any bucket count), or the
+   new `start_timestamp` is nonzero, later than the previous point's timestamp, and different
+   from the point's own timestamp. The point's full value is emitted as the delta, whatever
+   `initial_value` says, and becomes the baseline. The series restarted after a point this
+   component saw, so everything in the new total accrued while it watched, and emitting it
+   double-counts nothing.
+4. **A start change with no reset:** any other new `start_timestamp`, with a value that didn't go
+   down. A start computed from uptime jitters by a few milliseconds from point to point, a start
+   can move to at or before the previous point, and some producers stamp `start_timestamp`
+   equal to the timestamp on every point. None of these says the counter restarted, and the
+   value that didn't go down says it didn't. The difference is emitted, the new start is stored
+   with the baseline, and `logit.transform.series.start_adjusted` counts it; nothing is lost.
+   Read as a reset, each such point would re-send the series' whole total, a large overcount.
+5. **A layout change with no reset:** a `Histogram` whose bounds differ from the baseline's, or
    an `ExponentialHistogram` whose scale went up or whose zero threshold went down. Nothing says
    the counts restarted, so the full value could repeat counts already sent, and the difference
    has no meaning. The point is dropped and counted, and becomes the baseline. An
    `ExponentialHistogram` whose scale went down, or whose zero threshold went up, is not a layout
    change: the baseline is downscaled, or its low buckets folded into its zero count, and then
    differenced, as the Collector processor does.
-5. **Otherwise:** the difference is emitted, and the point becomes the baseline.
+6. **Otherwise:** the difference is emitted, and the point becomes the baseline.
 
-Rule 3 departs from both precedents. The Collector processor drops every reset point, and the
-Datadog translator applies `initial_value` to it, so under `auto` it drops the reset point of a
-series with no start time, which is every Prometheus text-format counter. Both lose the counts
-between the restart and the first point after it, which no later point can recover. A counter
-restarts from zero, so its new value is that increment.
+Rules 3 and 4 depart from both precedents, in two ways:
+
+- **What a reset point emits.** The Collector processor drops every reset point, and the Datadog
+  translator applies `initial_value` to it, so under `auto` it drops the reset point of a series
+  with no start time, which is every Prometheus text-format counter. Both lose the counts between
+  the restart and the first point after it, which no later point can recover. A counter restarts
+  from zero, so its new value is that increment.
+- **What counts as a reset.** The Datadog translator reads any start change, and a start equal to
+  the timestamp, as a reset; the Collector processor keys on the start, so any change is a new
+  series. Each then applies `initial_value`, so a series that predates the process loses its
+  increment at every start change, and one whose jittering start falls after the process started
+  re-sends its whole total at every point under `auto`. Rule 3 emits a reset point's full value
+  regardless of `initial_value`, so under those readings every jittering or `start == ts` series
+  would re-send its total on every point. Rule 3 requires evidence of a restart instead, and rule
+  4 differences every other start change. The maintainer accepted rule 3 on 2026-10-20 on the
+  condition that it have no such effect elsewhere.
 
 The Datadog translator emits a first or reset value only for the first point of a data-point
 slice (`i == 0`, with a source comment asking why). `logit` has no data-point slice: each record
@@ -167,9 +187,10 @@ Every name follows [ADR `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.m
 | `logit.transform.metrics.converted{metric_kind}` | records replaced by a delta, a full first or reset value included |
 | `logit.transform.metrics.skipped{reason="initial"}` | a first point that only recorded its baseline, as `initial_value` asked |
 | `logit.transform.metrics.skipped{reason="duplicate" \| "out_of_order"}` | a point timestamped at, or before, the tracked one |
-| `logit.transform.metrics.dropped{reason="layout_changed"}` | rule 4: the counts since the previous point are lost |
+| `logit.transform.metrics.dropped{reason="layout_changed"}` | rule 5: the counts since the previous point are lost |
 | `logit.transform.metrics.dropped{reason="non_finite"}` | a `Sum` whose value is NaN or infinite |
-| `logit.transform.series.reset{cause="start_changed" \| "start_equals_time" \| "decrease"}` | rule 3's resets, the first matching cause |
+| `logit.transform.series.reset{cause="decrease" \| "restarted"}` | rule 3's resets: the value went down, else the start moved past the previous point |
+| `logit.transform.series.start_adjusted` | rule 4: a start change that wasn't a reset, differenced and stored; nothing is lost |
 | `logit.transform.series.evicted{reason="idle" \| "cardinality"}` | `max_staleness` and `max_series` evictions, `aggregate`'s names |
 | `logit.transform.series.tracked` (gauge) | series in the table |
 | `logit.component.events.discarded` | an event left with no metric, log, or span once its skipped and dropped records are removed |

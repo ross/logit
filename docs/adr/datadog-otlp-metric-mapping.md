@@ -244,11 +244,11 @@ nowhere to say what it is. `logit` is pre-release, so the field is a plain addit
   forms, and W2 its cumulative half, once its condition (a stage that converts a cumulative
   `Sum`) is met.
 
-## Open questions
-- **Summary temporality (Ross).** Adding `temporality` to `Summary` makes `otlp_out` and
-  `prometheus_out` drop a delta summary they can't express. The alternative is the transform
-  emitting a summary's `count` and `sum` as separate delta `Sum` records, which needs no model
-  change but has the transform render a sink's shape. This record takes the model change.
+## Settled questions
+- **Summary temporality: decided by the maintainer, 2026-10-20.** `Summary` gains `temporality`,
+  though it makes `otlp_out` and `prometheus_out` drop a delta summary they can't express. The
+  alternative, the transform emitting a summary's `count` and `sum` as separate delta `Sum`
+  records, needs no model change but has the transform render a sink's shape.
 
 ## Verified destination behavior
 Read from source on 2026-10-20; nothing was built or run.

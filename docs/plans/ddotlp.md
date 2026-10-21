@@ -129,16 +129,19 @@ the Rust code under test.
 | W1 | `ddotlp/w1` | `ddotlp/w1: datadog_out maps OTLP sums, histograms, and summaries as Datadog's exporter does` | L | W0 | not started |
 | W2 | `ddotlp/w2` | `ddotlp/w2: Summary temporality and the cumulative_to_delta transform` | L | W1 | not started |
 
-## Open questions
+## Settled questions
 
-- **Summary temporality.** [ADR `datadog-otlp-metric-mapping`](../adr/datadog-otlp-metric-mapping.md)'s
-  open question: a model field that two sinks can't express, against the transform emitting
-  separate `Sum` records.
-- **Reset points emit their full value.**
-  [ADR `cumulative-to-delta-transform`](../adr/cumulative-to-delta-transform.md)'s rule 3 departs
-  from both the Collector processor (drops every reset point) and the Datadog translator (applies
-  `initial_value` to it). It recovers the post-restart counts of a series with no start time, a
-  Prometheus text-format counter included, at the cost of matching neither precedent.
+- **Summary temporality: decided by the maintainer, 2026-10-20.** `Summary` gains `temporality`
+  ([ADR `datadog-otlp-metric-mapping`](../adr/datadog-otlp-metric-mapping.md)'s "Settled
+  questions"), and `otlp_out` and `prometheus_out` drop a delta summary.
+- **Reset points emit their full value: decided by the maintainer, 2026-10-20,** on the condition
+  that it has no negative effect elsewhere.
+  [ADR `cumulative-to-delta-transform`](../adr/cumulative-to-delta-transform.md)'s rule 3 meets
+  it by requiring evidence of a restart (a value that went down, or a start moved past the
+  previous point), and rule 4 differences every other start change, so a jittering or
+  `start == ts` start never re-sends a series' whole total. It recovers the post-restart counts of
+  a series with no start time, a Prometheus text-format counter included, at the cost of
+  matching neither precedent.
 
 ## Findings
 
