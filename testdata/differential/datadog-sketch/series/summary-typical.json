@@ -1,0 +1,52 @@
+{
+  "name": "typical",
+  "kind": "summary",
+  "input": {
+    "quantiles": [
+      ["0", "1.5"],
+      ["0.5", "12"],
+      ["0.9", "40.25"],
+      ["0.99", "99"],
+      ["1", "250"]
+    ],
+    "count": 120,
+    "sum": "2400"
+  },
+  "series": [
+    {
+      "name": "case.quantile",
+      "tags": ["quantile:0"],
+      "type": "gauge",
+      "value": "1.5",
+      "unit": "millisecond"
+    },
+    {
+      "name": "case.quantile",
+      "tags": ["quantile:0.5"],
+      "type": "gauge",
+      "value": "12",
+      "unit": "millisecond"
+    },
+    {
+      "name": "case.quantile",
+      "tags": ["quantile:0.9"],
+      "type": "gauge",
+      "value": "40.25",
+      "unit": "millisecond"
+    },
+    {
+      "name": "case.quantile",
+      "tags": ["quantile:0.99"],
+      "type": "gauge",
+      "value": "99",
+      "unit": "millisecond"
+    },
+    {
+      "name": "case.quantile",
+      "tags": ["quantile:1.0"],
+      "type": "gauge",
+      "value": "250",
+      "unit": "millisecond"
+    }
+  ]
+}

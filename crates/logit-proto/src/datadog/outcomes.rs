@@ -137,18 +137,24 @@ pub(super) enum MetricOut {
     EmptySketch,
     NonFiniteValue,
     OversizedSketch,
+    /// A histogram bucket whose upper bound keys below its lower bound.
+    NonMonotonicBounds,
+    /// An exponential histogram outside the Agent sketch's key range.
+    SketchRange,
     InvalidStatus,
 }
 
 impl MetricOut {
     #[cfg(test)]
-    const ALL: [MetricOut; 7] = [
+    const ALL: [MetricOut; 9] = [
         MetricOut::Kind("summary"),
         MetricOut::GaugeDelta,
         MetricOut::NoRecordedValue,
         MetricOut::EmptySketch,
         MetricOut::NonFiniteValue,
         MetricOut::OversizedSketch,
+        MetricOut::NonMonotonicBounds,
+        MetricOut::SketchRange,
         MetricOut::InvalidStatus,
     ];
 
@@ -161,6 +167,10 @@ impl MetricOut {
             MetricOut::EmptySketch => (OUTPUT_METRICS_SKIPPED, ("reason", "empty_sketch")),
             MetricOut::NonFiniteValue => (OUTPUT_METRICS_DROPPED, ("reason", "non_finite_value")),
             MetricOut::OversizedSketch => (OUTPUT_METRICS_DROPPED, ("reason", "oversized_sketch")),
+            MetricOut::NonMonotonicBounds => {
+                (OUTPUT_METRICS_DROPPED, ("reason", "non_monotonic_bounds"))
+            }
+            MetricOut::SketchRange => (OUTPUT_METRICS_DROPPED, ("reason", "sketch_range")),
             MetricOut::InvalidStatus => (OUTPUT_METRICS_DROPPED, ("reason", "invalid_status")),
         }
     }
@@ -198,6 +208,8 @@ mod tests {
             (OUTPUT_METRICS_SKIPPED, ("reason", "empty_sketch")),
             (OUTPUT_METRICS_DROPPED, ("reason", "non_finite_value")),
             (OUTPUT_METRICS_DROPPED, ("reason", "oversized_sketch")),
+            (OUTPUT_METRICS_DROPPED, ("reason", "non_monotonic_bounds")),
+            (OUTPUT_METRICS_DROPPED, ("reason", "sketch_range")),
             (OUTPUT_METRICS_DROPPED, ("reason", "invalid_status")),
         ];
         for (outcome, want) in MetricOut::ALL.into_iter().zip(want_out) {

@@ -364,10 +364,9 @@ fn agent_sketch(store: &AgentStore, s: Summary, exact: bool) -> AgentSketch {
     AgentSketch { sketch, avg: s.avg }
 }
 
-/// An explicit-bounds histogram as `getSketchBuckets` sketches a delta point. See the module doc.
-pub fn histogram_to_agent(h: &Histogram) -> Result<AgentSketch, ConversionError> {
-    // OTLP's shape: `counts` one longer than `bounds`, the last bucket open-ended. A last bucket
-    // with a finite bound has an empty one above it.
+/// `h`'s buckets in OTLP's shape: `counts` one longer than `bounds`, the last bucket open-ended.
+/// A last bucket with a finite bound has an empty one above it.
+fn otlp_shape(h: &Histogram) -> (Vec<f64>, Vec<u64>) {
     let mut counts: Vec<u64> = h.buckets.iter().map(|b| b.1).collect();
     let mut bounds: Vec<f64> = h.buckets.iter().map(|b| b.0).collect();
     match bounds.last() {
@@ -377,6 +376,26 @@ pub fn histogram_to_agent(h: &Histogram) -> Result<AgentSketch, ConversionError>
         Some(_) => counts.push(0),
         None => {}
     }
+    (bounds, counts)
+}
+
+/// Each bucket of `h` as `(lower, upper, count)`, OTLP's `(lower, upper]` read as the translator's
+/// `getBounds` reads it: the first bucket's lower bound is `-Inf` and the last one's upper `+Inf`.
+pub fn otlp_buckets(h: &Histogram) -> Vec<(f64, f64, u64)> {
+    let (bounds, counts) = otlp_shape(h);
+    counts
+        .iter()
+        .enumerate()
+        .map(|(j, &n)| {
+            let lower = if j > 0 { bounds[j - 1] } else { f64::NEG_INFINITY };
+            (lower, bounds.get(j).copied().unwrap_or(f64::INFINITY), n)
+        })
+        .collect()
+}
+
+/// An explicit-bounds histogram as `getSketchBuckets` sketches a delta point. See the module doc.
+pub fn histogram_to_agent(h: &Histogram) -> Result<AgentSketch, ConversionError> {
+    let (mut bounds, mut counts) = otlp_shape(h);
     let count = counts.iter().fold(0u64, |a, c| a.saturating_add(*c));
     // An absent sum is as unusable as a non-finite one; the translator would read it as 0.
     let sum = h.sum.unwrap_or(f64::NAN);
@@ -688,12 +707,19 @@ impl LogSketch {
     }
 }
 
+/// Whether `e` holds more than [`MAX_OBSERVATIONS`], zero bucket included: the translator's
+/// `validateExpHistogramDataPoint`, which drops the whole point, its aggregation series too,
+/// before anything else reads it. The total is a float, as the translator's is.
+pub fn exp_histogram_oversized(e: &ExpHistogram) -> bool {
+    let total =
+        e.positive.1.iter().chain(&e.negative.1).fold(e.zero_count as f64, |t, c| t + *c as f64);
+    total > MAX_OBSERVATIONS as f64
+}
+
 /// An exponential histogram as `MapExponentialHistogramMetrics` sketches a delta point. See the
 /// module doc.
 pub fn exp_histogram_to_agent(e: &ExpHistogram) -> Result<AgentSketch, ConversionError> {
-    let total =
-        e.positive.1.iter().chain(&e.negative.1).fold(e.zero_count as f64, |t, c| t + *c as f64);
-    if total > MAX_OBSERVATIONS as f64 {
+    if exp_histogram_oversized(e) {
         return Err(ConversionError::TooManyObservations);
     }
     let sum = e.sum.unwrap_or(f64::NAN);

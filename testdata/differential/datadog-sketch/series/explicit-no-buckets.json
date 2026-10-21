@@ -1,0 +1,28 @@
+{
+  "name": "no-buckets",
+  "kind": "explicit",
+  "input": {
+    "bounds": [],
+    "counts": [],
+    "count": 0,
+    "sum": "0",
+    "min": null,
+    "max": null
+  },
+  "series": [
+    {
+      "name": "case.count",
+      "tags": [],
+      "type": "count",
+      "value": "0",
+      "unit": ""
+    },
+    {
+      "name": "case.sum",
+      "tags": [],
+      "type": "count",
+      "value": "0",
+      "unit": "millisecond"
+    }
+  ]
+}

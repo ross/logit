@@ -826,6 +826,38 @@ pub struct DatadogEndpoints {
     pub traces: Option<String>,
 }
 
+/// How `datadog_out` writes OpenTelemetry histograms, as the Datadog exporter's `histograms:`
+/// block does, under the same names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DatadogHistograms {
+    /// How a delta explicit-bucket histogram is written: `distributions` (the default), one
+    /// Datadog distribution per point with its counts spread over the buckets as Datadog's
+    /// exporter spreads them; `counters`, one `<name>.bucket` count per bucket tagged
+    /// `lower_bound` and `upper_bound`; or `nobuckets`, nothing but the aggregation metrics,
+    /// which then have to be on. An exponential histogram is always a distribution.
+    #[serde(default)]
+    pub mode: DatadogHistogramMode,
+    /// Also writes `<name>.count` and `<name>.sum` counts and `<name>.min` and `<name>.max`
+    /// gauges for each delta histogram and exponential histogram whose sum is present and finite.
+    /// Off by default, as in the exporter.
+    #[serde(default)]
+    pub send_aggregation_metrics: bool,
+}
+
+/// `datadog_out`'s `histograms.mode`, spelled as the Datadog exporter spells it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum DatadogHistogramMode {
+    /// One distribution per point.
+    #[default]
+    Distributions,
+    /// One `<name>.bucket` count per bucket.
+    Counters,
+    /// No bucket output.
+    Nobuckets,
+}
+
 /// How `datadog_out` compresses its request bodies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -3252,6 +3284,11 @@ pub enum ComponentKind {
         /// `endpoints` override.
         #[serde(default)]
         tls: TlsClientConfig,
+        /// How OpenTelemetry histograms are written, with the Datadog exporter's settings and
+        /// defaults. `mode: nobuckets` without `send_aggregation_metrics: true` writes nothing
+        /// for a histogram, so it's rejected, as the exporter rejects it.
+        #[serde(default)]
+        histograms: DatadogHistograms,
     },
     /// Sends APM traces and tracer-computed stats to a Datadog Agent's trace API (port 8126, or
     /// its Unix socket), as a dd-trace tracer does: the sending half of `datadog_trace_in`, so a
@@ -7653,9 +7690,12 @@ mod tests {
                 timeout,
                 headers,
                 tls,
+                histograms,
             } => {
                 assert_eq!(api_key, "k");
                 assert_eq!(site, "datadoghq.com");
+                assert_eq!(histograms.mode, DatadogHistogramMode::Distributions);
+                assert!(!histograms.send_aggregation_metrics);
                 assert_eq!(endpoints, DatadogEndpoints::default());
                 assert_eq!(compression, DatadogCompression::Gzip);
                 assert_eq!(timeout, Duration::from_secs(10));

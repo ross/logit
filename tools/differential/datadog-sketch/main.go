@@ -148,9 +148,39 @@ type reading struct {
 	Sketch  *sketchOut `json:"sketch,omitempty"`
 }
 
-type consumer struct{ sketches []*quantile.Sketch }
+// seriesOut is one series the translator writes: its name, tags, type, value, and unit.
+type seriesOut struct {
+	Name  string   `json:"name"`
+	Tags  []string `json:"tags"`
+	Type  string   `json:"type"`
+	Value num      `json:"value"`
+	Unit  string   `json:"unit"`
+}
 
-func (c *consumer) ConsumeTimeSeries(context.Context, *metrics.Dimensions, metrics.DataType, uint64, int64, float64) {
+// seriesReading is a case put through a translator that writes series: the explicit cases under
+// `histograms.mode: counters`, and every kind with the aggregation metrics and quantiles on.
+type seriesReading struct {
+	Name   string      `json:"name"`
+	Kind   string      `json:"kind"`
+	Input  interface{} `json:"input"`
+	Series []seriesOut `json:"series"`
+}
+
+type consumer struct {
+	sketches []*quantile.Sketch
+	series   []seriesOut
+}
+
+func (c *consumer) ConsumeTimeSeries(_ context.Context, d *metrics.Dimensions, typ metrics.DataType, _ uint64, _ int64, v float64) {
+	t, err := typ.MarshalText()
+	if err != nil {
+		fail(err)
+	}
+	tags := d.Tags()
+	if tags == nil {
+		tags = []string{}
+	}
+	c.series = append(c.series, seriesOut{Name: d.Name(), Tags: tags, Type: string(t), Value: num(v), Unit: d.Unit()})
 }
 func (c *consumer) ConsumeSketch(_ context.Context, _ *metrics.Dimensions, _ uint64, _ int64, s *quantile.Sketch) {
 	c.sketches = append(c.sketches, s)
@@ -161,6 +191,41 @@ func (c *consumer) ConsumeExponentialHistogram(context.Context, *metrics.Dimensi
 }
 
 const timestamp = pcommon.Timestamp(1_700_000_000_000_000_000)
+
+// seriesOptions is the translator a series reading uses.
+var seriesOptions = []metrics.TranslatorOption{
+	metrics.WithHistogramMode(metrics.HistogramModeCounters),
+	metrics.WithHistogramAggregations(),
+	metrics.WithQuantiles(),
+	metrics.WithUnits(),
+}
+
+// series runs one metric through a fresh translator built with seriesOptions and returns every
+// series it writes.
+func series(build func(pmetric.Metric)) []seriesOut {
+	set := componenttest.NewNopTelemetrySettings()
+	attrs, err := attributes.NewTranslator(set)
+	if err != nil {
+		fail(err)
+	}
+	tr, err := metrics.NewDefaultTranslator(set, attrs, seriesOptions...)
+	if err != nil {
+		fail(err)
+	}
+	md := pmetric.NewMetrics()
+	m := md.ResourceMetrics().AppendEmpty().ScopeMetrics().AppendEmpty().Metrics().AppendEmpty()
+	m.SetName("case")
+	m.SetUnit("ms")
+	build(m)
+	c := &consumer{}
+	if _, err := tr.MapMetrics(context.Background(), md, c, nil); err != nil {
+		fail(fmt.Errorf("a series run failed: %w", err))
+	}
+	if c.series == nil {
+		return []seriesOut{}
+	}
+	return c.series
+}
 
 // translate runs one metric through a fresh translator, so no case sees another's state.
 func translate(build func(pmetric.Metric)) (string, string, *sketchOut) {
@@ -221,12 +286,12 @@ func translate(build func(pmetric.Metric)) (string, string, *sketchOut) {
 	return "empty", "", nil
 }
 
-func runExplicit(c explicitCase) reading {
+func explicitBuild(c explicitCase) func(pmetric.Metric) {
 	var count uint64
 	for _, n := range c.counts {
 		count += n
 	}
-	outcome, detail, sketch := translate(func(m pmetric.Metric) {
+	return func(m pmetric.Metric) {
 		h := m.SetEmptyHistogram()
 		h.SetAggregationTemporality(pmetric.AggregationTemporalityDelta)
 		dp := h.DataPoints().AppendEmpty()
@@ -241,7 +306,14 @@ func runExplicit(c explicitCase) reading {
 		if c.max != nil {
 			dp.SetMax(*c.max)
 		}
-	})
+	}
+}
+
+func explicitIn(c explicitCase) explicitInput {
+	var count uint64
+	for _, n := range c.counts {
+		count += n
+	}
 	bounds := make([]num, len(c.bounds))
 	for i, b := range c.bounds {
 		bounds[i] = num(b)
@@ -250,15 +322,16 @@ func runExplicit(c explicitCase) reading {
 	if counts == nil {
 		counts = []uint64{}
 	}
-	return reading{
-		Name: c.name, Kind: "explicit",
-		Input:   explicitInput{Bounds: bounds, Counts: counts, Count: count, Sum: optNum(c.sum), Min: optNum(c.min), Max: optNum(c.max)},
-		Outcome: outcome, Detail: detail, Sketch: sketch,
-	}
+	return explicitInput{Bounds: bounds, Counts: counts, Count: count, Sum: optNum(c.sum), Min: optNum(c.min), Max: optNum(c.max)}
 }
 
-func runExp(c expCase) reading {
-	outcome, detail, sketch := translate(func(m pmetric.Metric) {
+func runExplicit(c explicitCase) reading {
+	outcome, detail, sketch := translate(explicitBuild(c))
+	return reading{Name: c.name, Kind: "explicit", Input: explicitIn(c), Outcome: outcome, Detail: detail, Sketch: sketch}
+}
+
+func expBuild(c expCase) func(pmetric.Metric) {
+	return func(m pmetric.Metric) {
 		h := m.SetEmptyExponentialHistogram()
 		h.SetAggregationTemporality(pmetric.AggregationTemporalityDelta)
 		dp := h.DataPoints().AppendEmpty()
@@ -277,7 +350,10 @@ func runExp(c expCase) reading {
 		if c.max != nil {
 			dp.SetMax(*c.max)
 		}
-	})
+	}
+}
+
+func expIn(c expCase) expInput {
 	pos, neg := c.positive, c.negative
 	if pos.Counts == nil {
 		pos.Counts = []uint64{}
@@ -285,11 +361,60 @@ func runExp(c expCase) reading {
 	if neg.Counts == nil {
 		neg.Counts = []uint64{}
 	}
-	return reading{
-		Name: c.name, Kind: "exponential",
-		Input: expInput{Scale: c.scale, ZeroCount: c.zeroCount, Positive: pos, Negative: neg,
-			Count: c.count, Sum: optNum(c.sum), Min: optNum(c.min), Max: optNum(c.max)},
-		Outcome: outcome, Detail: detail, Sketch: sketch,
+	return expInput{Scale: c.scale, ZeroCount: c.zeroCount, Positive: pos, Negative: neg,
+		Count: c.count, Sum: optNum(c.sum), Min: optNum(c.min), Max: optNum(c.max)}
+}
+
+func runExp(c expCase) reading {
+	outcome, detail, sketch := translate(expBuild(c))
+	return reading{Name: c.name, Kind: "exponential", Input: expIn(c), Outcome: outcome, Detail: detail, Sketch: sketch}
+}
+
+// summaryCase is an OTLP `SummaryDataPoint`, which OTLP defines as cumulative.
+type summaryCase struct {
+	name      string
+	quantiles [][2]float64
+	count     uint64
+	sum       float64
+}
+
+type summaryInput struct {
+	Quantiles [][2]num `json:"quantiles"`
+	Count     uint64   `json:"count"`
+	Sum       num      `json:"sum"`
+}
+
+func summaryBuild(c summaryCase) func(pmetric.Metric) {
+	return func(m pmetric.Metric) {
+		dp := m.SetEmptySummary().DataPoints().AppendEmpty()
+		dp.SetTimestamp(timestamp)
+		dp.SetCount(c.count)
+		dp.SetSum(c.sum)
+		for _, q := range c.quantiles {
+			v := dp.QuantileValues().AppendEmpty()
+			v.SetQuantile(q[0])
+			v.SetValue(q[1])
+		}
+	}
+}
+
+func summaryIn(c summaryCase) summaryInput {
+	qs := make([][2]num, len(c.quantiles))
+	for i, q := range c.quantiles {
+		qs[i] = [2]num{num(q[0]), num(q[1])}
+	}
+	return summaryInput{Quantiles: qs, Count: c.count, Sum: num(c.sum)}
+}
+
+// summaryCases are summaries with no start time, so the translator's first point writes neither
+// `.count` nor `.sum` and every series is a `.quantile` gauge.
+func summaryCases() []summaryCase {
+	return []summaryCase{
+		{name: "empty", count: 0, sum: 0},
+		{name: "typical", quantiles: [][2]float64{{0, 1.5}, {0.5, 12}, {0.9, 40.25}, {0.99, 99}, {1, 250}}, count: 120, sum: 2400},
+		{name: "quantile-forms", quantiles: [][2]float64{{0.25, 1}, {0.75, 2}, {0.999, 3}, {0.9999, 4}, {1e-05, 5}, {0.0001, 6}, {0.123456789, 7}, {2, 8}, {-1, 9}, {1e21, 10}, {123456, 11}, {1234567, 12}}, count: 12, sum: 78},
+		{name: "non-finite-values", quantiles: [][2]float64{{0.5, math.NaN()}, {0.9, math.Inf(1)}, {0.99, math.Inf(-1)}, {1, 7}}, count: 4, sum: 7},
+		{name: "non-finite-quantiles", quantiles: [][2]float64{{math.NaN(), 1}, {math.Inf(1), 2}, {math.Inf(-1), 3}}, count: 3, sum: 6},
 	}
 }
 
@@ -371,6 +496,7 @@ func explicitCases() []explicitCase {
 		{name: "fine-buckets", bounds: []float64{1, 1.01, 1.02, 1.03, 1.04, 1.05, 1.06}, counts: []uint64{0, 5, 6, 7, 8, 9, 10, 0}, sum: f(46.5)},
 		{name: "trim-left", bounds: powers(0, 210, 10), counts: append([]uint64{0}, repeat(22, 1_000_000)...), sum: f(1e215)},
 		{name: "trim-left-overflow", bounds: powers(-9, 201, 10), counts: append([]uint64{60000}, append(repeat(21, 1_000_000), 70000)...), sum: f(1e215)},
+		{name: "bound-forms", bounds: []float64{-1e21, -123456.5, -2.5, -1, -0.0001, -1e-05, 0, 5e-324, 1e-07, 0.5, 1, 123456, 999999, 1e6, 1234567, 1.5e300}, counts: []uint64{1, 0, 2, 0, 3, 0, 4, 0, 5, 0, 6, 0, 7, 0, 8, 0, 9}, sum: f(45)},
 		{name: "decades", bounds: powers(-3, 6, 1), counts: []uint64{1, 3, 10, 30, 100, 300, 1000, 300, 100, 30, 10}, sum: f(1e6)},
 	}
 
@@ -620,6 +746,22 @@ func main() {
 		seen[name] = true
 		files[filepath.Join("cases", name+".json")] = encode(runExp(c))
 	}
+	for _, c := range explicitCases() {
+		files[filepath.Join("series", "explicit-"+c.name+".json")] = encode(seriesReading{
+			Name: c.name, Kind: "explicit", Input: explicitIn(c), Series: series(explicitBuild(c))})
+	}
+	for _, c := range expCases() {
+		if strings.HasPrefix(c.name, "seeded-") || strings.HasPrefix(c.name, "scale-") {
+			continue
+		}
+		files[filepath.Join("series", "exponential-"+c.name+".json")] = encode(seriesReading{
+			Name: c.name, Kind: "exponential", Input: expIn(c), Series: series(expBuild(c))})
+	}
+	for _, c := range summaryCases() {
+		files[filepath.Join("series", "summary-"+c.name+".json")] = encode(seriesReading{
+			Name: c.name, Kind: "summary", Input: summaryIn(c), Series: series(summaryBuild(c))})
+	}
+
 	var lines []string
 	for _, p := range primitives() {
 		b, err := json.Marshal(p)

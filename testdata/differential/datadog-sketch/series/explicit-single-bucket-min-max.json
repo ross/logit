@@ -1,0 +1,49 @@
+{
+  "name": "single-bucket-min-max",
+  "kind": "explicit",
+  "input": {
+    "bounds": [],
+    "counts": [7],
+    "count": 7,
+    "sum": "21",
+    "min": "0.5",
+    "max": "9"
+  },
+  "series": [
+    {
+      "name": "case.count",
+      "tags": [],
+      "type": "count",
+      "value": "7",
+      "unit": ""
+    },
+    {
+      "name": "case.sum",
+      "tags": [],
+      "type": "count",
+      "value": "21",
+      "unit": "millisecond"
+    },
+    {
+      "name": "case.min",
+      "tags": [],
+      "type": "gauge",
+      "value": "0.5",
+      "unit": "millisecond"
+    },
+    {
+      "name": "case.max",
+      "tags": [],
+      "type": "gauge",
+      "value": "9",
+      "unit": "millisecond"
+    },
+    {
+      "name": "case.bucket",
+      "tags": ["lower_bound:-inf", "upper_bound:inf"],
+      "type": "count",
+      "value": "7",
+      "unit": ""
+    }
+  ]
+}

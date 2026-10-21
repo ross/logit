@@ -1,0 +1,56 @@
+{
+  "name": "seeded-28",
+  "kind": "explicit",
+  "input": {
+    "bounds": ["25.127828089793585"],
+    "counts": [0, 1489],
+    "count": 1489,
+    "sum": "-17041.32401364335",
+    "min": "24.181271034022053",
+    "max": "29.195020245163246"
+  },
+  "series": [
+    {
+      "name": "case.count",
+      "tags": [],
+      "type": "count",
+      "value": "1489",
+      "unit": ""
+    },
+    {
+      "name": "case.sum",
+      "tags": [],
+      "type": "count",
+      "value": "-17041.32401364335",
+      "unit": "millisecond"
+    },
+    {
+      "name": "case.min",
+      "tags": [],
+      "type": "gauge",
+      "value": "24.181271034022053",
+      "unit": "millisecond"
+    },
+    {
+      "name": "case.max",
+      "tags": [],
+      "type": "gauge",
+      "value": "29.195020245163246",
+      "unit": "millisecond"
+    },
+    {
+      "name": "case.bucket",
+      "tags": ["lower_bound:-inf", "upper_bound:25.127828089793585"],
+      "type": "count",
+      "value": "0",
+      "unit": ""
+    },
+    {
+      "name": "case.bucket",
+      "tags": ["lower_bound:25.127828089793585", "upper_bound:inf"],
+      "type": "count",
+      "value": "1489",
+      "unit": ""
+    }
+  ]
+}

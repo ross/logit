@@ -281,13 +281,13 @@ use anyhow::Context;
 use bytes::Bytes;
 use http::{HeaderMap, HeaderName, HeaderValue};
 use logit_core::interner::resolve;
-use logit_core::{redact, Diagnostics, EventBatch, MetricKind, Symbol, Telemetry};
+use logit_core::{redact, Diagnostics, EventBatch, Symbol, Telemetry};
 use logit_pipeline::{BatchContext, DeliveryPosture, Fault, Output, SeqId};
 use logit_proto::datadog::events::EventFormat;
-use logit_proto::datadog::series::metric_tag_count;
+use logit_proto::datadog::series::{metric_tag_count, record_routes};
 use logit_proto::datadog::{
     is_datadog_event, is_datadog_stats, is_service_check, trace_readiness, DatadogEncoder,
-    TraceReadiness,
+    HistogramOptions, TraceReadiness,
 };
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -568,7 +568,7 @@ struct Plan {
 
 /// Each route's items for `batch` (module doc's "Routes"), indexed by `Route as usize`, before
 /// any filter: the routing alone, which [`plan`] filters and [`encode_routes`] encodes.
-fn partition(batch: &EventBatch) -> [Vec<Item>; 8] {
+fn partition(batch: &EventBatch, histograms: HistogramOptions) -> [Vec<Item>; 8] {
     let resource = &batch.resource;
     let mut routes: [Vec<Item>; 8] = Default::default();
     for (index, event) in batch.events.iter().enumerate() {
@@ -587,14 +587,14 @@ fn partition(batch: &EventBatch) -> [Vec<Item>; 8] {
         if datadog_event {
             push(Route::Events, 1);
         }
-        // A service check's record 0 is the check route's alone.
+        // A service check's record 0 is the check route's alone. A record weighs as many series
+        // entries as it can write, a histogram's buckets and aggregations included.
         let (mut series, mut samples, mut sketches) = (0, 0, 0);
         for record in &event.metrics[usize::from(check)..] {
-            match record.kind {
-                MetricKind::Samples(_) => samples += 1,
-                MetricKind::Distribution(_) => sketches += 1,
-                _ => series += 1,
-            }
+            let routes = record_routes(record, histograms);
+            series += routes.series;
+            samples += usize::from(routes.distribution_points);
+            sketches += usize::from(routes.sketch);
         }
         for (route, n) in [
             (Route::Series, series),
@@ -619,7 +619,7 @@ fn partition(batch: &EventBatch) -> [Vec<Item>; 8] {
 /// the tag limit, and the trace readiness gate. Counts nothing:
 /// [`DatadogOutput::count_plan_drops`] counts the drops, so the sink can skip them when a retry
 /// repeats the plan.
-fn plan(batch: &EventBatch, now: i64) -> Plan {
+fn plan(batch: &EventBatch, now: i64, histograms: HistogramOptions) -> Plan {
     let resource = &batch.resource;
     let readiness = if batch.events.iter().any(|e| e.span.is_some()) {
         trace_readiness(batch)
@@ -627,7 +627,7 @@ fn plan(batch: &EventBatch, now: i64) -> Plan {
         Vec::new()
     };
     let mut plan = Plan::default();
-    for (route, items) in ROUTES.into_iter().zip(partition(batch)) {
+    for (route, items) in ROUTES.into_iter().zip(partition(batch, histograms)) {
         let r = route as usize;
         for item in items {
             let event = &batch.events[item.index];
@@ -663,10 +663,13 @@ fn plan(batch: &EventBatch, now: i64) -> Plan {
                     let first = &mut plan.too_many_tags_first[r];
                     if first.is_none() {
                         let check = usize::from(is_service_check(resource, event));
-                        let record = event.metrics[check..].iter().find(|r| match r.kind {
-                            MetricKind::Samples(_) => route == Route::DistributionPoints,
-                            MetricKind::Distribution(_) => route == Route::Sketches,
-                            _ => route == Route::Series,
+                        let record = event.metrics[check..].iter().find(|r| {
+                            let routes = record_routes(r, histograms);
+                            match route {
+                                Route::DistributionPoints => routes.distribution_points,
+                                Route::Sketches => routes.sketch,
+                                _ => routes.series > 0,
+                            }
                         });
                         *first = record.map(|r| (r.name, tags));
                     }
@@ -695,7 +698,7 @@ pub struct RouteRequest {
 /// driver) reads them here.
 pub fn encode_routes(encoder: &mut DatadogEncoder, batch: &EventBatch) -> Vec<RouteRequest> {
     let mut out = Vec::new();
-    for (route, items) in ROUTES.into_iter().zip(partition(batch)) {
+    for (route, items) in ROUTES.into_iter().zip(partition(batch, encoder.histograms())) {
         if items.is_empty() {
             continue;
         }
@@ -733,6 +736,7 @@ pub struct DatadogOutput {
     /// Built by [`DatadogOutput::with_tls`]; `None` keeps `reqwest`'s default trust.
     tls: Option<rustls::ClientConfig>,
     default_host: Option<Arc<str>>,
+    histograms: HistogramOptions,
     /// Counts through views of `telemetry`/`diag` gated by `accounting`
     /// ([`DatadogOutput::new_encoder`]).
     encoder: DatadogEncoder,
@@ -774,6 +778,7 @@ impl DatadogOutput {
             headers: HeaderMap::new(),
             tls: None,
             default_host: None,
+            histograms: HistogramOptions::default(),
             encoder: DatadogEncoder::new(),
             diag: Diagnostics::default(),
             telemetry: Telemetry::default(),
@@ -803,6 +808,14 @@ impl DatadogOutput {
     /// `logit run` passes the process hostname.
     pub fn with_default_host(mut self, host: impl Into<Arc<str>>) -> Self {
         self.default_host = Some(host.into());
+        self.encoder = self.new_encoder();
+        self
+    }
+
+    /// How a delta histogram is written (`histograms:`), as the Datadog exporter's setting of the
+    /// same name.
+    pub fn with_histograms(mut self, histograms: HistogramOptions) -> Self {
+        self.histograms = histograms;
         self.encoder = self.new_encoder();
         self
     }
@@ -897,6 +910,7 @@ impl DatadogOutput {
             .with_telemetry(self.telemetry.gated(gate))
             .with_diagnostics(self.diag.gated(gate))
             .with_default_host(self.default_host.clone())
+            .with_histograms(self.histograms)
     }
 
     /// Reads send times from `clock` instead of the wall clock.
@@ -987,7 +1001,8 @@ impl DatadogOutput {
     /// unsettled requests, and every later route's planned entries are counted
     /// `records.dropped{reason="ambiguous_at_most_once"}`.
     async fn attempt(&mut self, batch: &EventBatch, now: i64) -> anyhow::Result<()> {
-        let (first, mut plan) = self.accounting.encode(0, || plan(batch, now));
+        let histograms = self.encoder.histograms();
+        let (first, mut plan) = self.accounting.encode(0, || plan(batch, now, histograms));
         if first {
             self.count_plan_drops(&plan);
         }
@@ -1289,8 +1304,8 @@ mod tests {
     use hyper_util::rt::TokioIo;
     use logit_core::interner::{intern, resolve};
     use logit_core::{
-        AttrMap, BodyFormat, DdSketch, Event, LogRecord, MetricRecord, Registry, Resource, Samples,
-        SpanKind, SpanRecord, SpanStatus, Value,
+        AttrMap, BodyFormat, DdSketch, Event, LogRecord, MetricKind, MetricRecord, Registry,
+        Resource, Samples, SpanKind, SpanRecord, SpanStatus, Value,
     };
     use logit_proto::datadog::events::ATTR_EVENT_TITLE;
     use logit_proto::datadog::service_checks::{
@@ -1444,6 +1459,37 @@ mod tests {
         s.add(1.0);
         s.add(20.0);
         metric(ts, MetricKind::Distribution(s))
+    }
+
+    /// A delta histogram of three buckets and a sum.
+    fn histogram(ts: i64) -> Event {
+        metric(
+            ts,
+            MetricKind::Histogram(logit_core::Histogram {
+                buckets: vec![(1.0, 2), (10.0, 5), (f64::INFINITY, 1)],
+                temporality: Temporality::Delta,
+                sum: Some(30.0),
+                min: None,
+                max: None,
+            }),
+        )
+    }
+
+    /// A histogram weighs what it writes on each route: its sketch alone under `distributions`,
+    /// and under `counters` a series entry per bucket plus the four aggregation series, which the
+    /// entries cap and a `202` body's series errors count against.
+    #[test]
+    fn a_histogram_weighs_the_series_and_sketches_it_writes() {
+        let weights = |options| {
+            let routes = partition(&batch(vec![histogram(NOW)]), options);
+            (weight(&routes[Route::Series as usize]), weight(&routes[Route::Sketches as usize]))
+        };
+        assert_eq!(weights(HistogramOptions::default()), (0, 1));
+        let counters = HistogramOptions {
+            mode: logit_proto::datadog::HistogramMode::Counters,
+            send_aggregation_metrics: true,
+        };
+        assert_eq!(weights(counters), (3 + 4, 0));
     }
 
     fn log_record(message: &str) -> LogRecord {
@@ -2275,12 +2321,12 @@ mod tests {
     const SERIES: &str = "/api/v2/series";
     const LOGS: &str = "/api/v2/logs";
 
-    /// A non-monotonic delta sum, which the series codec skips and counts.
-    fn non_monotonic_delta(ts: i64) -> Event {
+    /// A cumulative monotonic sum, which the series codec skips and counts.
+    fn cumulative_sum(ts: i64) -> Event {
         let sum = Sum {
             value: logit_core::MetricValue::F64(1.0),
-            temporality: Temporality::Delta,
-            monotonic: false,
+            temporality: Temporality::Cumulative,
+            monotonic: true,
         };
         metric(ts, MetricKind::Sum(sum))
     }
@@ -2308,7 +2354,7 @@ mod tests {
         batch(vec![
             gauge(NOW),
             tagged("wide", MetricKind::gauge(1.0), MAX_METRIC_TAGS + 1),
-            non_monotonic_delta(NOW),
+            cumulative_sum(NOW),
             gauge(NOW - 2 * HOUR),
             oversized_sketch(NOW),
             log_with_reserved_key(NOW, "kept"),
@@ -2321,7 +2367,7 @@ mod tests {
         (RECORDS_DROPPED, &[("route", "series"), ("reason", "too_many_tags")]),
         ("logit.component.diagnostics", &[("key", "too_many_tags")]),
         (RECORDS_DROPPED, &[("route", "traces"), ("reason", "not_datadog_origin")]),
-        ("logit.output.metrics.skipped", &[("metric_kind", "non_monotonic_delta_sum")]),
+        ("logit.output.metrics.skipped", &[("metric_kind", "cumulative_sum")]),
         ("logit.output.metrics.dropped", &[("reason", "oversized_sketch")]),
         ("logit.component.diagnostics", &[("key", "oversized_sketch")]),
         ("logit.output.tags.omitted", &[("reason", "reserved_key")]),

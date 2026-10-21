@@ -1236,10 +1236,11 @@ pub(crate) fn build_spec(
                 write_config(&component.buffer),
             )
         }
-        DatadogOut { api_key, site, endpoints, compression, timeout, headers, tls } => {
+        DatadogOut { api_key, site, endpoints, compression, timeout, headers, tls, histograms } => {
             let output = DatadogOutput::new(api_key)?
                 .with_site(site.clone())
                 .with_default_host(hostname.clone())
+                .with_histograms(to_datadog_histograms(histograms))
                 .with_endpoints(DatadogOutEndpoints {
                     api: endpoints.api.clone(),
                     logs: endpoints.logs.clone(),
@@ -1757,14 +1758,31 @@ pub(crate) fn sink_encoder(
                 compression: to_remote_write_encoding(*compression),
             }
         }
-        DatadogOut { .. } => SinkEncoder::Datadog(
+        DatadogOut { histograms, .. } => SinkEncoder::Datadog(
             logit_proto::datadog::DatadogEncoder::new()
                 .with_telemetry(telemetry.clone())
                 .with_diagnostics(diag.clone())
-                .with_default_host(Some(hostname.clone())),
+                .with_default_host(Some(hostname.clone()))
+                .with_histograms(to_datadog_histograms(histograms)),
         ),
         other => anyhow::bail!("{} has no encoder this driver reaches", graph::kind_name(other)),
     })
+}
+
+/// `datadog_out`'s `histograms:` block as its encoder's options.
+fn to_datadog_histograms(
+    h: &logit_config::DatadogHistograms,
+) -> logit_proto::datadog::HistogramOptions {
+    use logit_config::DatadogHistogramMode as Config;
+    use logit_proto::datadog::HistogramMode as Mode;
+    logit_proto::datadog::HistogramOptions {
+        mode: match h.mode {
+            Config::Distributions => Mode::Distributions,
+            Config::Counters => Mode::Counters,
+            Config::Nobuckets => Mode::NoBuckets,
+        },
+        send_aggregation_metrics: h.send_aggregation_metrics,
+    }
 }
 
 /// `statsd_out`'s encoder from its config fields, before the sink applies its line cap.

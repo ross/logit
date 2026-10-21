@@ -1,0 +1,63 @@
+{
+  "name": "min-only",
+  "kind": "explicit",
+  "input": {
+    "bounds": ["1", "2", "4"],
+    "counts": [0, 4, 4, 0],
+    "count": 8,
+    "sum": "18",
+    "min": "1.2",
+    "max": null
+  },
+  "series": [
+    {
+      "name": "case.count",
+      "tags": [],
+      "type": "count",
+      "value": "8",
+      "unit": ""
+    },
+    {
+      "name": "case.sum",
+      "tags": [],
+      "type": "count",
+      "value": "18",
+      "unit": "millisecond"
+    },
+    {
+      "name": "case.min",
+      "tags": [],
+      "type": "gauge",
+      "value": "1.2",
+      "unit": "millisecond"
+    },
+    {
+      "name": "case.bucket",
+      "tags": ["lower_bound:-inf", "upper_bound:1.0"],
+      "type": "count",
+      "value": "0",
+      "unit": ""
+    },
+    {
+      "name": "case.bucket",
+      "tags": ["lower_bound:1.0", "upper_bound:2.0"],
+      "type": "count",
+      "value": "4",
+      "unit": ""
+    },
+    {
+      "name": "case.bucket",
+      "tags": ["lower_bound:2.0", "upper_bound:4.0"],
+      "type": "count",
+      "value": "4",
+      "unit": ""
+    },
+    {
+      "name": "case.bucket",
+      "tags": ["lower_bound:4.0", "upper_bound:inf"],
+      "type": "count",
+      "value": "0",
+      "unit": ""
+    }
+  ]
+}

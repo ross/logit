@@ -209,8 +209,10 @@
 //! 66. A `datadog_out` with an empty `api_key` or one with leading or trailing whitespace, an
 //!     empty `site` or one with a scheme or `/`, an `endpoints` entry that isn't an absolute
 //!     `http://`/`https://` URL, `timeout: 0s`, a `headers:` name rule 22 would reject against
-//!     `RESERVED_DATADOG_HEADERS`, or a `tls` failing rule 24's checks, the scheme one only when no
-//!     intake is `https://` (`docs/adr/datadog-agent-and-intake-relay.md`).
+//!     `RESERVED_DATADOG_HEADERS`, a `tls` failing rule 24's checks, the scheme one only when no
+//!     intake is `https://` (`docs/adr/datadog-agent-and-intake-relay.md`), or `histograms.mode:
+//!     nobuckets` without `send_aggregation_metrics: true`, which writes nothing for a histogram
+//!     (`docs/adr/datadog-otlp-metric-mapping.md`).
 //! 67. A `datadog_trace_out` with both or neither of `endpoint`/`socket`, an `endpoint` that isn't
 //!     an absolute `http://`/`https://` URL, a `socket` that isn't an absolute path, `timeout:
 //!     0s`, a `headers:` name rule 22 would reject against `RESERVED_DATADOG_TRACE_HEADERS` or
@@ -3420,11 +3422,28 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
     // except that the scheme check fails only when no intake is `https://`: an omitted
     // `endpoints` entry derives an `https://` host from `site`.
     for (id, component) in &components {
-        let ComponentKind::DatadogOut { api_key, site, endpoints, timeout, headers, tls, .. } =
-            &component.kind
+        let ComponentKind::DatadogOut {
+            api_key,
+            site,
+            endpoints,
+            timeout,
+            headers,
+            tls,
+            histograms,
+            ..
+        } = &component.kind
         else {
             continue;
         };
+        if histograms.mode == logit_config::DatadogHistogramMode::Nobuckets
+            && !histograms.send_aggregation_metrics
+        {
+            anyhow::bail!(
+                "component '{id}': datadog_out 'histograms.mode: nobuckets' writes no buckets, so \
+                 it needs 'histograms.send_aggregation_metrics: true' or a histogram sends \
+                 nothing at all"
+            );
+        }
         if api_key.is_empty() {
             anyhow::bail!(
                 "component '{id}': datadog_out 'api_key' must not be empty -- Datadog rejects \
@@ -8654,6 +8673,7 @@ mod tests {
             timeout: logit_config::default_datadog_timeout(),
             headers: HashMap::new(),
             tls: logit_config::TlsClientConfig::default(),
+            histograms: logit_config::DatadogHistograms::default(),
         }
     }
 
@@ -8683,6 +8703,25 @@ mod tests {
         });
         resolve(cfg(vec![("in", vec![], listener()), ("out", vec!["in"], kind)]))
             .expect("http:// overrides, a custom header, and tls with one https intake are valid");
+    }
+
+    /// Rule 66: `nobuckets` writes a histogram's aggregations alone, so it needs them on, as the
+    /// Datadog exporter's `HistogramConfig.validate` requires.
+    #[test]
+    fn a_datadog_out_nobuckets_histogram_without_aggregations_is_rejected() {
+        let nobuckets = |aggregations| {
+            datadog_out_with(|k| {
+                if let ComponentKind::DatadogOut { histograms, .. } = k {
+                    histograms.mode = logit_config::DatadogHistogramMode::Nobuckets;
+                    histograms.send_aggregation_metrics = aggregations;
+                }
+            })
+        };
+        let err = datadog_out_err(nobuckets(false));
+        assert!(err.contains("'histograms.mode: nobuckets'"), "got: {err}");
+        assert!(err.contains("send_aggregation_metrics: true"), "got: {err}");
+        resolve(cfg(vec![("in", vec![], listener()), ("out", vec!["in"], nobuckets(true))]))
+            .expect("nobuckets with the aggregation metrics on is valid");
     }
 
     /// Rule 66: the key must be sendable as-is.

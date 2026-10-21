@@ -1,0 +1,36 @@
+{
+  "name": "one-observation-negative",
+  "kind": "exponential",
+  "input": {
+    "scale": 0,
+    "zero_count": 0,
+    "positive": {
+      "offset": 0,
+      "counts": []
+    },
+    "negative": {
+      "offset": 3,
+      "counts": [1]
+    },
+    "count": 1,
+    "sum": "-9.5",
+    "min": null,
+    "max": null
+  },
+  "series": [
+    {
+      "name": "case.count",
+      "tags": [],
+      "type": "count",
+      "value": "1",
+      "unit": ""
+    },
+    {
+      "name": "case.sum",
+      "tags": [],
+      "type": "count",
+      "value": "-9.5",
+      "unit": "millisecond"
+    }
+  ]
+}

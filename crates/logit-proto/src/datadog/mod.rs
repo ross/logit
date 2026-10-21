@@ -991,6 +991,28 @@ pub struct DatadogEncoder {
     /// The host of a series, sketch, log, event, or service check that carries none of its own;
     /// `None` leaves it empty or absent.
     default_host: Option<Arc<str>>,
+    histograms: HistogramOptions,
+}
+
+/// How a delta `Histogram` is written, the Datadog exporter's `histograms.mode`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum HistogramMode {
+    /// One sketch per record, bin for bin as the exporter's translator builds it.
+    #[default]
+    Distributions,
+    /// One `<name>.bucket` count series per bucket, tagged with its bounds.
+    Counters,
+    /// No bucket output; the aggregation series alone.
+    NoBuckets,
+}
+
+/// The Datadog exporter's `histograms:` settings, which apply to `Histogram` and, for
+/// `send_aggregation_metrics`, to `ExponentialHistogram` records.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HistogramOptions {
+    pub mode: HistogramMode,
+    /// Adds `<name>.count`, `<name>.sum`, `<name>.min`, and `<name>.max` series.
+    pub send_aggregation_metrics: bool,
 }
 
 impl DatadogEncoder {
@@ -1019,6 +1041,15 @@ impl DatadogEncoder {
     pub fn with_default_host(mut self, host: Option<Arc<str>>) -> Self {
         self.default_host = host;
         self
+    }
+
+    pub fn with_histograms(mut self, histograms: HistogramOptions) -> Self {
+        self.histograms = histograms;
+        self
+    }
+
+    pub fn histograms(&self) -> HistogramOptions {
+        self.histograms
     }
 }
 

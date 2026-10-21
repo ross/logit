@@ -1,0 +1,105 @@
+{
+  "name": "seeded-16",
+  "kind": "explicit",
+  "input": {
+    "bounds": ["0", "0.7706637041299338", "4.345701848119456", "80.67307785856117", "513.0945844618902", "718.0445158706675", "1112.8189784397837", "1151.6215192679958", "1846.418021492961", "1847.3109045412382"],
+    "counts": [158, 1759, 0, 0, 278053, 451, 745, 1255, 0, 1743, 0],
+    "count": 284164,
+    "sum": "-328.16927881453296",
+    "min": null,
+    "max": null
+  },
+  "series": [
+    {
+      "name": "case.count",
+      "tags": [],
+      "type": "count",
+      "value": "284164",
+      "unit": ""
+    },
+    {
+      "name": "case.sum",
+      "tags": [],
+      "type": "count",
+      "value": "-328.16927881453296",
+      "unit": "millisecond"
+    },
+    {
+      "name": "case.bucket",
+      "tags": ["lower_bound:-inf", "upper_bound:0"],
+      "type": "count",
+      "value": "158",
+      "unit": ""
+    },
+    {
+      "name": "case.bucket",
+      "tags": ["lower_bound:0", "upper_bound:0.7706637041299338"],
+      "type": "count",
+      "value": "1759",
+      "unit": ""
+    },
+    {
+      "name": "case.bucket",
+      "tags": ["lower_bound:0.7706637041299338", "upper_bound:4.345701848119456"],
+      "type": "count",
+      "value": "0",
+      "unit": ""
+    },
+    {
+      "name": "case.bucket",
+      "tags": ["lower_bound:4.345701848119456", "upper_bound:80.67307785856117"],
+      "type": "count",
+      "value": "0",
+      "unit": ""
+    },
+    {
+      "name": "case.bucket",
+      "tags": ["lower_bound:80.67307785856117", "upper_bound:513.0945844618902"],
+      "type": "count",
+      "value": "278053",
+      "unit": ""
+    },
+    {
+      "name": "case.bucket",
+      "tags": ["lower_bound:513.0945844618902", "upper_bound:718.0445158706675"],
+      "type": "count",
+      "value": "451",
+      "unit": ""
+    },
+    {
+      "name": "case.bucket",
+      "tags": ["lower_bound:718.0445158706675", "upper_bound:1112.8189784397837"],
+      "type": "count",
+      "value": "745",
+      "unit": ""
+    },
+    {
+      "name": "case.bucket",
+      "tags": ["lower_bound:1112.8189784397837", "upper_bound:1151.6215192679958"],
+      "type": "count",
+      "value": "1255",
+      "unit": ""
+    },
+    {
+      "name": "case.bucket",
+      "tags": ["lower_bound:1151.6215192679958", "upper_bound:1846.418021492961"],
+      "type": "count",
+      "value": "0",
+      "unit": ""
+    },
+    {
+      "name": "case.bucket",
+      "tags": ["lower_bound:1846.418021492961", "upper_bound:1847.3109045412382"],
+      "type": "count",
+      "value": "1743",
+      "unit": ""
+    },
+    {
+      "name": "case.bucket",
+      "tags": ["lower_bound:1847.3109045412382", "upper_bound:inf"],
+      "type": "count",
+      "value": "0",
+      "unit": ""
+    }
+  ]
+}

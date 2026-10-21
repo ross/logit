@@ -2934,6 +2934,18 @@
                 "type": "string"
               }
             },
+            "histograms": {
+              "description": "How OpenTelemetry histograms are written, with the Datadog exporter's settings and defaults. `mode: nobuckets` without `send_aggregation_metrics: true` writes nothing for a histogram, so it's rejected, as the exporter rejects it.",
+              "default": {
+                "mode": "distributions",
+                "send_aggregation_metrics": false
+              },
+              "allOf": [
+                {
+                  "$ref": "#/definitions/DatadogHistograms"
+                }
+              ]
+            },
             "receive": true,
             "site": {
               "description": "The Datadog site your organization is on: `datadoghq.com` (the default), `datadoghq.eu`, `us3.datadoghq.com`, `us5.datadoghq.com`, `ap1.datadoghq.com`, `ap2.datadoghq.com`, `ddog-gov.com`, and so on. Requests go to `https://api.<site>`, `https://http-intake.logs.<site>`, and `https://trace.agent.<site>`. A bare domain: no scheme and no `/`.",
@@ -4246,6 +4258,53 @@
             "string",
             "null"
           ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "DatadogHistogramMode": {
+      "description": "`datadog_out`'s `histograms.mode`, spelled as the Datadog exporter spells it.",
+      "oneOf": [
+        {
+          "description": "One distribution per point.",
+          "type": "string",
+          "enum": [
+            "distributions"
+          ]
+        },
+        {
+          "description": "One `<name>.bucket` count per bucket.",
+          "type": "string",
+          "enum": [
+            "counters"
+          ]
+        },
+        {
+          "description": "No bucket output.",
+          "type": "string",
+          "enum": [
+            "nobuckets"
+          ]
+        }
+      ]
+    },
+    "DatadogHistograms": {
+      "description": "How `datadog_out` writes OpenTelemetry histograms, as the Datadog exporter's `histograms:` block does, under the same names.",
+      "type": "object",
+      "properties": {
+        "mode": {
+          "description": "How a delta explicit-bucket histogram is written: `distributions` (the default), one Datadog distribution per point with its counts spread over the buckets as Datadog's exporter spreads them; `counters`, one `<name>.bucket` count per bucket tagged `lower_bound` and `upper_bound`; or `nobuckets`, nothing but the aggregation metrics, which then have to be on. An exponential histogram is always a distribution.",
+          "default": "distributions",
+          "allOf": [
+            {
+              "$ref": "#/definitions/DatadogHistogramMode"
+            }
+          ]
+        },
+        "send_aggregation_metrics": {
+          "description": "Also writes `<name>.count` and `<name>.sum` counts and `<name>.min` and `<name>.max` gauges for each delta histogram and exponential histogram whose sum is present and finite. Off by default, as in the exporter.",
+          "default": false,
+          "type": "boolean"
         }
       },
       "additionalProperties": false

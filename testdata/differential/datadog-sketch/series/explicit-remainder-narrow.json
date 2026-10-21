@@ -1,0 +1,49 @@
+{
+  "name": "remainder-narrow",
+  "kind": "explicit",
+  "input": {
+    "bounds": ["100", "103"],
+    "counts": [0, 1001, 0],
+    "count": 1001,
+    "sum": "101500",
+    "min": null,
+    "max": null
+  },
+  "series": [
+    {
+      "name": "case.count",
+      "tags": [],
+      "type": "count",
+      "value": "1001",
+      "unit": ""
+    },
+    {
+      "name": "case.sum",
+      "tags": [],
+      "type": "count",
+      "value": "101500",
+      "unit": "millisecond"
+    },
+    {
+      "name": "case.bucket",
+      "tags": ["lower_bound:-inf", "upper_bound:100.0"],
+      "type": "count",
+      "value": "0",
+      "unit": ""
+    },
+    {
+      "name": "case.bucket",
+      "tags": ["lower_bound:100.0", "upper_bound:103.0"],
+      "type": "count",
+      "value": "1001",
+      "unit": ""
+    },
+    {
+      "name": "case.bucket",
+      "tags": ["lower_bound:103.0", "upper_bound:inf"],
+      "type": "count",
+      "value": "0",
+      "unit": ""
+    }
+  ]
+}

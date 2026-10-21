@@ -1,0 +1,36 @@
+{
+  "name": "at-observation-cap",
+  "kind": "exponential",
+  "input": {
+    "scale": 0,
+    "zero_count": 0,
+    "positive": {
+      "offset": 1,
+      "counts": [268431360]
+    },
+    "negative": {
+      "offset": 0,
+      "counts": []
+    },
+    "count": 268431360,
+    "sum": "1e+09",
+    "min": null,
+    "max": null
+  },
+  "series": [
+    {
+      "name": "case.count",
+      "tags": [],
+      "type": "count",
+      "value": "2.6843136e+08",
+      "unit": ""
+    },
+    {
+      "name": "case.sum",
+      "tags": [],
+      "type": "count",
+      "value": "1e+09",
+      "unit": "millisecond"
+    }
+  ]
+}

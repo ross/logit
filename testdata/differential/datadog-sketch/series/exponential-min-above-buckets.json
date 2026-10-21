@@ -1,0 +1,43 @@
+{
+  "name": "min-above-buckets",
+  "kind": "exponential",
+  "input": {
+    "scale": 4,
+    "zero_count": 0,
+    "positive": {
+      "offset": 16,
+      "counts": [5, 6, 7]
+    },
+    "negative": {
+      "offset": 0,
+      "counts": []
+    },
+    "count": 18,
+    "sum": "40",
+    "min": "50",
+    "max": null
+  },
+  "series": [
+    {
+      "name": "case.count",
+      "tags": [],
+      "type": "count",
+      "value": "18",
+      "unit": ""
+    },
+    {
+      "name": "case.sum",
+      "tags": [],
+      "type": "count",
+      "value": "40",
+      "unit": "millisecond"
+    },
+    {
+      "name": "case.min",
+      "tags": [],
+      "type": "gauge",
+      "value": "50",
+      "unit": "millisecond"
+    }
+  ]
+}

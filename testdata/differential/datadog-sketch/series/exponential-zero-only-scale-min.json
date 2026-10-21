@@ -1,0 +1,36 @@
+{
+  "name": "zero-only-scale-min",
+  "kind": "exponential",
+  "input": {
+    "scale": -10,
+    "zero_count": 5,
+    "positive": {
+      "offset": 0,
+      "counts": []
+    },
+    "negative": {
+      "offset": 0,
+      "counts": []
+    },
+    "count": 5,
+    "sum": "0",
+    "min": null,
+    "max": null
+  },
+  "series": [
+    {
+      "name": "case.count",
+      "tags": [],
+      "type": "count",
+      "value": "5",
+      "unit": ""
+    },
+    {
+      "name": "case.sum",
+      "tags": [],
+      "type": "count",
+      "value": "0",
+      "unit": "millisecond"
+    }
+  ]
+}

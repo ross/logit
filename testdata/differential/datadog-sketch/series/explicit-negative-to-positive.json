@@ -1,0 +1,98 @@
+{
+  "name": "negative-to-positive",
+  "kind": "explicit",
+  "input": {
+    "bounds": ["-10", "-5", "-1", "0", "1", "5", "10"],
+    "counts": [1, 4, 9, 20, 18, 7, 3, 1],
+    "count": 63,
+    "sum": "0.5",
+    "min": "-12",
+    "max": "11"
+  },
+  "series": [
+    {
+      "name": "case.count",
+      "tags": [],
+      "type": "count",
+      "value": "63",
+      "unit": ""
+    },
+    {
+      "name": "case.sum",
+      "tags": [],
+      "type": "count",
+      "value": "0.5",
+      "unit": "millisecond"
+    },
+    {
+      "name": "case.min",
+      "tags": [],
+      "type": "gauge",
+      "value": "-12",
+      "unit": "millisecond"
+    },
+    {
+      "name": "case.max",
+      "tags": [],
+      "type": "gauge",
+      "value": "11",
+      "unit": "millisecond"
+    },
+    {
+      "name": "case.bucket",
+      "tags": ["lower_bound:-inf", "upper_bound:-10.0"],
+      "type": "count",
+      "value": "1",
+      "unit": ""
+    },
+    {
+      "name": "case.bucket",
+      "tags": ["lower_bound:-10.0", "upper_bound:-5.0"],
+      "type": "count",
+      "value": "4",
+      "unit": ""
+    },
+    {
+      "name": "case.bucket",
+      "tags": ["lower_bound:-5.0", "upper_bound:-1.0"],
+      "type": "count",
+      "value": "9",
+      "unit": ""
+    },
+    {
+      "name": "case.bucket",
+      "tags": ["lower_bound:-1.0", "upper_bound:0"],
+      "type": "count",
+      "value": "20",
+      "unit": ""
+    },
+    {
+      "name": "case.bucket",
+      "tags": ["lower_bound:0", "upper_bound:1.0"],
+      "type": "count",
+      "value": "18",
+      "unit": ""
+    },
+    {
+      "name": "case.bucket",
+      "tags": ["lower_bound:1.0", "upper_bound:5.0"],
+      "type": "count",
+      "value": "7",
+      "unit": ""
+    },
+    {
+      "name": "case.bucket",
+      "tags": ["lower_bound:5.0", "upper_bound:10.0"],
+      "type": "count",
+      "value": "3",
+      "unit": ""
+    },
+    {
+      "name": "case.bucket",
+      "tags": ["lower_bound:10.0", "upper_bound:inf"],
+      "type": "count",
+      "value": "1",
+      "unit": ""
+    }
+  ]
+}

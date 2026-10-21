@@ -428,7 +428,8 @@ silently ignored. `0` for a count or duration bound is usually impossible, not s
     transport.
 66. A `datadog_out` with an empty or whitespace-padded `api_key`, an empty `site` or one with a
     scheme or `/`, an `endpoints` entry that isn't an absolute `http://`/`https://` URL,
-    `timeout: 0s`, a reserved or colliding header, or a bad `tls`.
+    `timeout: 0s`, a reserved or colliding header, a bad `tls`, or `histograms.mode: nobuckets`
+    without `send_aggregation_metrics: true`.
 67. A `datadog_trace_out` with both or neither of `endpoint`/`socket`, an `endpoint` that isn't an
     absolute `http://`/`https://` URL, a relative `socket` path, `timeout: 0s`, a reserved
     (including any `datadog-*`/`x-datadog-*`) or colliding header, or a bad `tls` (including any
