@@ -21,8 +21,8 @@ use logit_bench::alloc::{measure, CountingAlloc, Stats};
 use logit_bench::fixtures;
 use logit_core::subslice::within;
 use logit_core::{
-    AttrMap, EventBatch, MetricKind, MetricValue, Registry, Resource, Severity, Telemetry, TraceRef,
-    Value,
+    AttrMap, EventBatch, MetricKind, MetricValue, Registry, Resource, Severity, Telemetry,
+    TraceRef, Value,
 };
 use logit_outputs::influxdb::InfluxLineEncoder;
 use logit_outputs::kafka::{KafkaEncoder, RecordFormat, RecordKey, RecordMode};

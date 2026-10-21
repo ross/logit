@@ -38,10 +38,10 @@ use logit_proto::syslog::SyslogDecoder;
 use logit_proto::Decoder;
 use logit_transforms::{
     AggregateTemporality, Aggregator, Arrays, Bucket, BucketBound, BucketField, CsvParser,
-    CumulativeToDelta, InitialValue,
-    Distributions, Fields, Flatten, HttpAccess, HttpAccessConfig, JsonParser, Keep, KeepValues, Kv,
-    KvMetrics, LineProtocol, Logfmt, MetricSpec, Normalize, RegexParser, RouteRule, RouteSet,
-    Sample, SampleField, SampleKey, SampleMissing, SampleOverride, Set, Shape,
+    CumulativeToDelta, Distributions, Fields, Flatten, HttpAccess, HttpAccessConfig, InitialValue,
+    JsonParser, Keep, KeepValues, Kv, KvMetrics, LineProtocol, Logfmt, MetricSpec, Normalize,
+    RegexParser, RouteRule, RouteSet, Sample, SampleField, SampleKey, SampleMissing,
+    SampleOverride, Set, Shape,
 };
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -582,7 +582,11 @@ pub fn cumulative_counter_event(timestamp: i64, total: f64) -> Event {
         temporality: logit_core::Temporality::Cumulative,
         monotonic: true,
     });
-    Event::metric(timestamp, attributes, MetricRecord::new(logit_core::interner::intern("http_requests_total"), kind))
+    Event::metric(
+        timestamp,
+        attributes,
+        MetricRecord::new(logit_core::interner::intern("http_requests_total"), kind),
+    )
 }
 
 /// The reference example's pre-`http_access` `trimmed` component: the three tags that reached

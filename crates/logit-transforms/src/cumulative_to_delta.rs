@@ -608,7 +608,7 @@ fn value_delta(cur: MetricValue, prev: MetricValue) -> Option<MetricValue> {
         }
         _ => {
             let (c, p) = (cur.as_f64(), prev.as_f64());
-            (c >= p).then(|| MetricValue::F64(c - p))
+            (c >= p).then_some(MetricValue::F64(c - p))
         }
     }
 }

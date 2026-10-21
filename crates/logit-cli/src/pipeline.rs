@@ -5861,6 +5861,26 @@ mod tests {
     }
 
     #[test]
+    fn build_spec_builds_cumulative_to_delta() {
+        let component = ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
+            sources: vec!["in".to_string()],
+            targets: Vec::new(),
+            consumers: vec!["out".to_string()],
+            kind: ComponentKind::CumulativeToDelta {
+                initial_value: logit_config::InitialValue::Drop,
+                max_staleness: Duration::from_secs(600),
+                max_series: 5,
+            },
+        };
+        assert!(matches!(
+            build_spec("deltas", &component, Path::new(""), None).unwrap().0,
+            NodeSpec::Transform(_)
+        ));
+    }
+
+    #[test]
     fn build_spec_builds_the_stale_transforms() {
         for (name, kind) in [
             (
