@@ -2234,6 +2234,8 @@ under one component id, as for `collectd_out`. The sink adds only what a socket 
   metric the encoder skipped.
 - From the encoder, for metric kinds OTLP can't carry exactly:
   `logit.output.metrics.degraded{metric_kind="samples"|"distribution"}` (sent as a `Summary`),
+  `logit.output.metrics.degraded{reason="non_finite_component"}` for a `Histogram` with a `NaN`
+  or `-Inf` bound, whose count joins a neighboring bucket, once per record,
   `logit.output.metrics.skipped{metric_kind="set_members"|"set"}`, each with a throttled
   diagnostic (`otlp_set_members_metric_skipped`, `otlp_set_metric_skipped`), and
   `logit.output.metrics.dropped{reason="unresolved_gauge_delta"}` for a relative gauge no
@@ -2325,7 +2327,8 @@ batch).
 | `logit.output.acks{result}` | count | under `ack: true`, one per `/event` request: `acked`, `timeout` (still unacknowledged at `ack_timeout`, which fails the batch as ambiguous), or `unsupported` (a `200` with no `ackId`, or a poll answered `400` code 14: the token doesn't acknowledge, and the request counts as delivered) |
 
 The codec's own counters (`logit.output.metrics.skipped` and `metrics.degraded` by `metric_kind`
-under `multi_value`, `metrics.skipped{reason="no_recorded_value"}`,
+under `multi_value`, `metrics.degraded{reason="non_finite_component"}` for an expanded
+`Histogram` with a `NaN` bound, `metrics.skipped{reason="no_recorded_value"}`,
 `metrics.dropped{reason="unresolved_gauge_delta"|"duplicate_name"}`,
 `metrics.normalized{reason="name_sanitized"}`, `tags.omitted`, `events.skipped{reason="no_payload"}`,
 `logit.output.events.dropped{reason="blank_event"}`, `spans.degraded`) are in the tables of
@@ -2361,7 +2364,7 @@ spans, or metrics it holds.
 | `logit.output.records.unkeyed` | count | records sent without a key because the configured `key:` had no value on their event, or under `format: otlp_proto` or `otlp_json` on their request's events or resource, once per batch |
 | `logit.output.events.skipped{reason="no_log"}` | count | events `format: text` skipped for having no log record, once per batch |
 | `logit.output.metrics.omitted{reason="format"}`, `logit.output.spans.omitted{reason="format"}` | count | under `format: text`, the metric records and spans left out of a record that carries their event's log body, one per metric record and one per span, once per batch; counted at encode, so a record later dropped (`oversize`, `rejected`, or named by the broker) has still counted them |
-| `logit.output.metrics.skipped{metric_kind}`, `logit.output.metrics.dropped{reason="unresolved_gauge_delta"}`, `logit.output.metrics.degraded{metric_kind}` | count | under `format: otlp_proto` or `otlp_json`, metrics the OTLP codec skips, drops, or degrades, as `otlp_out` counts them, once per batch |
+| `logit.output.metrics.skipped{metric_kind}`, `logit.output.metrics.dropped{reason="unresolved_gauge_delta"}`, `logit.output.metrics.degraded{metric_kind}`, `logit.output.metrics.degraded{reason="non_finite_component"}` | count | under `format: otlp_proto` or `otlp_json`, metrics the OTLP codec skips, drops, or degrades, as `otlp_out` counts them, once per batch |
 
 `Diagnostics` keys, each throttled: `oversize`, naming the record count and the
 `max_request_bytes` cap, and `rejected`, `invalid_timestamp`, and `invalid_record`, each carrying
@@ -2470,7 +2473,9 @@ it takes (the class table above).
 - `logit.output.metrics.skipped{metric_kind="exponential_histogram"}` in registry mode, where
   neither text dialect has a form for one, and `{reason="no_recorded_value"}`.
 - `logit.output.metrics.degraded{metric_kind="non_monotonic_sum"|"distribution"|"samples"|"set"|
-  "set_members"}` and `{reason="exemplar_omitted"|"unit_not_suffix"}` (render-side).
+  "set_members"}`, `{reason="non_finite_component"}` for a `Histogram` with a `NaN` bound, which
+  gets no `le` bucket, once per record, and `{reason="exemplar_omitted"|"unit_not_suffix"}`
+  (render-side).
 - `logit.output.labels.omitted{reason="unrepresentable"|"reserved"|"collision"}`. An exemplar
   key's `collision` or `reserved` is render-side in registry mode, counted once per OpenMetrics
   scrape.

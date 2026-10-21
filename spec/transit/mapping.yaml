@@ -686,7 +686,10 @@ rows:
           `logit.output.metrics.degraded{reason=non_finite_component}`.
       otlp_out:
         class: exact
-        text: An OTLP `Histogram` with delta temporality.
+        text: >-
+          An OTLP `Histogram` with delta temporality, its bounds sorted. A `-Inf` bound's count
+          joins the first bucket and a `NaN` bound's joins the overflow bucket, and the record
+          counts once as `logit.output.metrics.degraded{reason=non_finite_component}`.
       datadog_out:
         class: skipped
         counter: logit.output.metrics.skipped{metric_kind=histogram}
@@ -717,14 +720,19 @@ rows:
           `logit.output.metrics.degraded{reason=non_finite_component}`.
       otlp_out:
         class: exact
-        text: An OTLP `Histogram` with cumulative temporality.
+        text: >-
+          An OTLP `Histogram` with cumulative temporality, its bounds sorted. A `-Inf` bound's count
+          joins the first bucket and a `NaN` bound's joins the overflow bucket, and the record
+          counts once as `logit.output.metrics.degraded{reason=non_finite_component}`.
       prometheus_out:
         class: normalized
         reason: inf_bucket
         text: >-
           A `histogram` family of running-sum buckets and `_sum` when it has one, or a
           `gaugehistogram` under the type carrier. `+Inf` states the total, so a histogram whose
-          last bound is finite reads back with an empty `+Inf` bucket. `min` and `max` are
+          last bound is finite reads back with an empty `+Inf` bucket. A `NaN` bound has no
+          bucket, its count reaches `+Inf` and `_count`, and the record counts once as
+          `logit.output.metrics.degraded{reason=non_finite_component}`. `min` and `max` are
           `record/min_max`'s.
       datadog_out:
         class: skipped
