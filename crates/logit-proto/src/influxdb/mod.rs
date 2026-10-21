@@ -129,15 +129,15 @@
 //! | `gauge_delta/i64` | dropped | `logit.output.metrics.dropped{reason=unresolved_gauge_delta}` | Dropped, as for a float adjustment. |
 //! | `gauge_delta/u64` | dropped | `logit.output.metrics.dropped{reason=unresolved_gauge_delta}` | Dropped, as for a float adjustment. |
 //! | `gauge_delta/bool` | dropped | `logit.output.metrics.dropped{reason=unresolved_gauge_delta}` | Dropped, as for a float adjustment. |
-//! | `samples` | degraded | -- | Sketched, each value weighted by its inverse sample rate, then written as the `distribution` row describes. |
+//! | `samples` | degraded | -- | Sketched, each value weighted by its inverse sample rate, then written as the `distribution` row describes, and counted only as that row says. |
 //! | `set_members` | skipped | `logit.output.metrics.skipped{metric_kind=set_members}` | Line protocol has no set, so set members aren't written, with a throttled `encode_error` warning. |
-//! | `distribution` | degraded | -- | In the `summary` row's shape: float `count` and `sum` fields and the sketch's `0.5`, `0.9`, and `0.99` quantiles, each read back as a gauge under `<name>.`; the sketch is gone, uncounted. |
+//! | `distribution` | degraded | -- | In the `summary` row's shape: float `count` and `sum` fields and the sketch's `0.5`, `0.9`, and `0.99` quantiles, each read back as a gauge under `<name>.`; the sketch is gone. When the sum and quantiles are finite, nothing is counted. A non-finite sum or quantile is left off the line, and the record counts once as `logit.output.metrics.degraded{reason=non_finite_component}`. |
 //! | `set` | degraded | -- | A `value=<estimate>u` field, read back as a gauge named `<name>.value`, uncounted. |
-//! | `histogram/delta` | degraded | -- | Telegraf's shape: float `count`, `sum`, `min`, and `max` fields, a field per finite bound named by the bound and holding the cumulative count up to it, and `+Inf` holding the total, each read back as a gauge under `<name>.`, its temporality dropped, uncounted. A non-finite `sum`, `min`, or `max` is left off, counted `logit.output.metrics.degraded{reason=non_finite_component}`. |
-//! | `histogram/cumulative` | degraded | -- | Telegraf's shape: float `count`, `sum`, `min`, and `max` fields, a field per finite bound named by the bound and holding the cumulative count up to it, and `+Inf` holding the total, each read back as a gauge under `<name>.`, its temporality dropped, uncounted. A non-finite `sum`, `min`, or `max` is left off, counted `logit.output.metrics.degraded{reason=non_finite_component}`. |
+//! | `histogram/delta` | degraded | -- | Telegraf's shape: float `count`, `sum`, `min`, and `max` fields, a field per finite bound named by the bound and holding the cumulative count up to it, and `+Inf` holding the total, each read back as a gauge under `<name>.`, its temporality dropped. When every component is finite, nothing is counted. A non-finite `sum`, `min`, `max`, or bound is left off the line, and the record counts once as `logit.output.metrics.degraded{reason=non_finite_component}`. |
+//! | `histogram/cumulative` | degraded | -- | Telegraf's shape: float `count`, `sum`, `min`, and `max` fields, a field per finite bound named by the bound and holding the cumulative count up to it, and `+Inf` holding the total, each read back as a gauge under `<name>.`, its temporality dropped. When every component is finite, nothing is counted. A non-finite `sum`, `min`, `max`, or bound is left off the line, and the record counts once as `logit.output.metrics.degraded{reason=non_finite_component}`. |
 //! | `exponential_histogram/delta` | skipped | `logit.output.metrics.skipped{metric_kind=exponential_histogram}` | Neither Telegraf nor the OTel Collector's InfluxDB exporter has a line-protocol form for an exponential histogram, so none is written, with a throttled `encode_error` warning. |
 //! | `exponential_histogram/cumulative` | skipped | `logit.output.metrics.skipped{metric_kind=exponential_histogram}` | Neither Telegraf nor the OTel Collector's InfluxDB exporter has a line-protocol form for an exponential histogram, so none is written, with a throttled `encode_error` warning. |
-//! | `summary` | degraded | -- | Telegraf's shape: float `count` and `sum` fields and a field per quantile named by the quantile (`0.5`, `0.99`), each read back as a gauge under `<name>.`, uncounted. A non-finite `sum` or quantile is left off, counted `logit.output.metrics.degraded{reason=non_finite_component}`. |
+//! | `summary` | degraded | -- | Telegraf's shape: float `count` and `sum` fields and a field per quantile named by the quantile (`0.5`, `0.99`), each read back as a gauge under `<name>.`. When every component is finite, nothing is counted. A non-finite `sum`, quantile, or quantile value is left off the line, and the record counts once as `logit.output.metrics.degraded{reason=non_finite_component}`. |
 //! | `record/no_recorded_value` | skipped | `logit.output.metrics.skipped{reason=no_recorded_value}` | A point flagged as holding no recorded value isn't written, with a throttled `no_recorded_value` warning. |
 //! | `record/no_recorded_value_delta_sum` | skipped | `logit.output.metrics.skipped{reason=no_recorded_value}` | A point flagged as holding no recorded value isn't written, with a throttled `no_recorded_value` warning. |
 //! | `record/no_recorded_value_other_kind` | skipped | `logit.output.metrics.skipped{reason=no_recorded_value}` | A point flagged as holding no recorded value isn't written, with a throttled `no_recorded_value` warning. |
@@ -160,8 +160,8 @@
 //! |---|---|---|---|
 //! | `record/unit` | lost | uncounted | Line protocol has no unit; it isn't written or counted. |
 //! | `record/description` | lost | uncounted | Line protocol has no description; it isn't written or counted. |
-//! | `record/start_timestamp` | lost | uncounted | Line protocol has no start time; it isn't written or counted. |
-//! | `record/exemplars` | lost | uncounted | Line protocol has no exemplars; they aren't written or counted. |
+//! | `record/start_timestamp` | lost | uncounted | Not written or counted, though the OTel Collector's InfluxDB exporter writes a `start_time_unix_nano` field; `docs/known-gaps/influxdb.md` has the gap. |
+//! | `record/exemplars` | lost | uncounted | Not written or counted, though the OTel Collector's InfluxDB exporter writes each as a point of a `<name>_exemplar` measurement; `docs/known-gaps/influxdb.md` has the gap. |
 //! | `attributes/string_value` | lost | `logit.output.tags.omitted{reason=unencodable}` | A tag. A value holding a line break, ending in `\`, or with `\` before a space has no spelling and is left off, counted. |
 //! | `attributes/bool_value` | normalized | `stringified` | A tag of `true` or `false`, read back as the string. |
 //! | `attributes/number_value` | normalized | `stringified` | A tag of the number's decimal text, read back as the string. |
@@ -187,7 +187,7 @@
 //!
 //! | Model | Wire | Counter |
 //! |---|---|---|
-//! | `Histogram` | `count=,sum=,min=,max=`, then `<bound>=` per finite bound holding the cumulative count up to it, then `+Inf=` holding the total; `count` and `+Inf` always, the rest when present | -- |
+//! | `Histogram` | `count=,sum=,min=,max=`, then `<bound>=` per finite bound, in ascending order, holding the cumulative count up to it, then `+Inf=` holding the total; `count` and `+Inf` always, the rest when present | -- |
 //! | `Summary` | `count=,sum=`, then `<quantile>=` per quantile | -- |
 //! | `Distribution`, `Samples` | the `Summary` shape with the sketch's count, sum, and `0.5`, `0.9`, and `0.99` quantiles; an empty sketch's quantiles left off | -- |
 //! | each kind in the three rows above | every value an unsuffixed float; a bound or quantile key is the `f64`'s shortest round-trip decimal, never an exponent (`1000000`, `0.00001`) | -- |

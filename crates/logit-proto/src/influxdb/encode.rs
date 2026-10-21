@@ -297,13 +297,13 @@ impl Ctx<'_> {
         if !self.measurement_ok(measurement, 1) {
             return;
         }
-        if let Fields::Degraded = outcome {
-            self.stats.degraded_non_finite_component += 1;
-        }
         self.line.clear();
         push_escaped_measurement(self.line, measurement);
         self.line.push_str(tag_suffix);
-        self.finish_line(timestamp, 1);
+        // Counted only once the line is written: a line `finish_line` drops is counted there.
+        if self.finish_line(timestamp, 1) && matches!(outcome, Fields::Degraded) {
+            self.stats.degraded_non_finite_component += 1;
+        }
     }
 
     /// One line for the whole event, under the carrier's measurement ([`super`]'s "Encode"
@@ -483,8 +483,9 @@ impl Ctx<'_> {
     }
 
     /// Appends ` <fields> <timestamp>\n` to the series prefix in `line` and the line to `buf`.
-    /// `fields` is how many fields the line carries, for the overflow count.
-    fn finish_line(&mut self, timestamp: i64, fields: usize) {
+    /// `fields` is how many fields the line carries, for the overflow count. Returns whether the
+    /// line was written.
+    fn finish_line(&mut self, timestamp: i64, fields: usize) -> bool {
         // "measurement + tags" is the series-identity key; fields and timestamp aren't part of it.
         let series_key_len = self.line.len();
         // Disambiguate same-series collisions within this batch (see `encode`'s comment). The
@@ -525,7 +526,7 @@ impl Ctx<'_> {
                     "no free timestamp slot for series {series:?} near {timestamp} (i64 overflow)"
                 ),
             );
-            return;
+            return false;
         };
         // A nanosecond nudge is below any input's timing resolution, and simpler than guessing
         // how to aggregate same-series samples, which the source protocol never specified.
@@ -535,6 +536,7 @@ impl Ctx<'_> {
         push_i64(self.line, timestamp);
         self.buf.push_str(self.line);
         self.buf.push('\n');
+        true
     }
 }
 
@@ -716,27 +718,27 @@ fn render_fields(out: &mut String, kind: &MetricKind) -> Result<Fields, KindSkip
     Ok(if omitted { Fields::Degraded } else { Fields::Written })
 }
 
-/// `count`, `sum`, `min`, and `max`, then one field per finite bound keyed by the bound and
-/// holding the **cumulative** count up to it, then `+Inf` holding the total. Every value is a
-/// float, as `otel2influx` writes it; `influx2otel` refuses an integer count. `count` and `+Inf`
-/// are the sum of every bucket, the overflow bucket included, so a histogram with no bucket still
-/// writes both. Returns whether a non-finite `sum`, `min`, `max`, or bound was left out.
+/// `count`, `sum`, `min`, and `max`, then one field per finite bound in ascending order, keyed by the
+/// bound and holding the **cumulative** count up to it, then `+Inf` holding the total. Every
+/// value is a float, as `otel2influx` writes it; `influx2otel` refuses an integer count. `count`
+/// and `+Inf` are the sum of every bucket, the overflow bucket included, so a histogram with no
+/// bucket still writes both. Returns whether a non-finite `sum`, `min`, `max`, or bound was left
+/// out.
 fn render_histogram_fields(out: &mut String, h: &Histogram) -> bool {
-    let total = h.buckets.iter().fold(0u64, |acc, (_, n)| acc.saturating_add(*n));
+    // Sorted first: the model doesn't promise bound order, and `otlp_in` keeps the wire's.
+    let (cumulative, total) = crate::prometheus::cumulative_counts(&h.buckets);
     out.push_str("count=");
     push_float(out, total as f64);
     let mut omitted = false;
     for (key, value) in [("sum", h.sum), ("min", h.min), ("max", h.max)] {
         omitted |= push_optional_float(out, key, value);
     }
-    let mut cumulative = 0u64;
-    for (bound, n) in &h.buckets {
-        cumulative = cumulative.saturating_add(*n);
+    for (bound, count) in cumulative {
         if bound.is_finite() {
             let _ = write!(out, ",{bound}=");
-            push_float(out, cumulative as f64);
-        } else if *bound != f64::INFINITY {
-            // NaN or -Inf: no key spells it. Its count still reaches `+Inf` and later bounds.
+            push_float(out, count as f64);
+        } else if bound != f64::INFINITY {
+            // NaN or -Inf: no key spells it. Its count still reaches `+Inf`.
             omitted = true;
         }
     }
@@ -1091,6 +1093,26 @@ mod tests {
              1700000000000000000\n"
         );
         assert_eq!(stats, EncodeStats::default());
+    }
+
+    /// The model doesn't promise bound order, so the encoder sorts before accumulating: in wire
+    /// order this would claim 3 observations at or below 5 and only 1 at or below 10.
+    #[test]
+    fn out_of_order_bounds_are_sorted_before_they_accumulate() {
+        let kind = histogram(vec![(10.0, 1), (5.0, 2), (f64::INFINITY, 0)], None);
+        let out = encode(vec![metric_event("lat", kind, &[])]);
+        assert_eq!(out, "lat count=3,5=2,10=3,+Inf=3 1700000000000000000\n");
+    }
+
+    /// A degraded line that then has no free timestamp counts as dropped alone, not also degraded.
+    #[test]
+    fn a_degraded_line_dropped_for_timestamp_overflow_is_not_counted_degraded() {
+        let mut event = metric_event("h", histogram(vec![(1.0, 1)], Some(f64::NAN)), &[]);
+        event.timestamp = i64::MAX;
+        let (out, stats) = encode_stats(vec![event]);
+        assert_eq!(out, "");
+        assert_eq!(stats.dropped_timestamp_overflow, 1);
+        assert_eq!(stats.degraded_non_finite_component, 0);
     }
 
     /// A delta histogram writes the same fields: line protocol has no temporality.

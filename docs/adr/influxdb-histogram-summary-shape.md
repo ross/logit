@@ -82,7 +82,8 @@ quantiles `0.5 -> 0.2` and `0.99 -> 0.9`. `otel2influx` writes the same fields, 
 
 - **Histogram**, delta and cumulative alike: `count` always, then `sum`, `min`, and `max` when the
   record has them, then a field per finite bound holding the cumulative count up to that bound,
-  then `+Inf` holding the total. `count` and `+Inf` are the sum of every bucket, the overflow
+  then `+Inf` holding the total. Bounds are sorted ascending before the counts accumulate, because
+  the model promises no bound order and `otlp_in` keeps the wire's. `count` and `+Inf` are the sum of every bucket, the overflow
   bucket included, so a histogram with no buckets still writes `count=0,+Inf=0`, and one whose
   last bound is finite still writes `+Inf`. Temporality is dropped, as `otel2influx` drops it and
   as a `Sum`'s already is (normalization 10 of `influxdb_in -> influxdb_out`).
