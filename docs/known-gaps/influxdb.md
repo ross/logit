@@ -85,3 +85,24 @@ the decoder differs from `influxd`.
     as a field type the corpus doesn't hold, would go unnoticed.
   - **Revisit trigger:** a change to the codec's typed fields or escaping, or a user report of a
     relayed table that differs from a direct one.
+- **`influxdb_out` writes no start time.** `otel2influx`, the OTel Collector's InfluxDB exporter
+  and Telegraf's `inputs.opentelemetry`, adds a `start_time_unix_nano=<n>i` field to a point whose
+  start time is set. `influxdb_out` leaves a record's `start_timestamp` off, uncounted
+  ([ADR `influxdb-histogram-summary-shape`](../adr/influxdb-histogram-summary-shape.md)).
+  - **Consequence:** a delta or cumulative series' window start doesn't reach InfluxDB, so a
+    reader can't tell a reset from a new series.
+  - **Revisit trigger:** a reader that needs the start time; `influx2otel` v0.5.12 ignores the
+    field.
+- **`influxdb_out` writes no exemplars.** `otel2influx` writes each exemplar of a sum, gauge, or
+  histogram as a point of its own, measurement `<name>_exemplar`, field `gauge`, tagged
+  `trace_id` and `span_id`. `influxdb_out` leaves exemplars off, uncounted.
+  - **Consequence:** the trace behind an observation doesn't reach InfluxDB.
+  - **Revisit trigger:** a user who links InfluxDB data to traces.
+- **A gauge or a sum writes `value`, where upstream writes `gauge` or `counter`.** `otel2influx`'s
+  `telegraf-prometheus-v1` schema writes a gauge's field as `gauge` and a sum's as `counter`, and
+  `influx2otel` reads those names to choose the kind. `influxdb_out` writes `value` for both,
+  though its histogram and summary fields follow that schema.
+  - **Consequence:** `influx2otel` doesn't recognize a `logit` gauge or sum as one, and a query
+    written for Collector data reads a different field name.
+  - **Revisit trigger:** a reader that needs the upstream names. The change renames every
+    gauge and sum series at the destination.
