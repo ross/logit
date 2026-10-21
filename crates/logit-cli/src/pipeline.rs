@@ -1787,6 +1787,7 @@ fn queue_config(buffer: &BufferConfig, base_dir: &Path) -> SinkStoreConfig {
             max_batches: buffer.max_batches,
             max_bytes: buffer.max_bytes,
             overflow: overflow_policy(buffer.overflow),
+            recover_below: buffer.recover_below,
         }),
         Some(disk) => SinkStoreConfig::Disk(DiskQueueConfig {
             dir: base_dir.join(&disk.path),
@@ -1795,6 +1796,7 @@ fn queue_config(buffer: &BufferConfig, base_dir: &Path) -> SinkStoreConfig {
             overflow: overflow_policy(buffer.overflow),
             compression: to_native_compression(disk.compression),
             checkpoint_interval: disk.checkpoint_interval,
+            recover_below: buffer.recover_below,
         }),
     }
 }
@@ -1921,6 +1923,7 @@ fn receive_config(receive: &logit_config::ReceiveConfig) -> logit_inputs::udp::U
         max_datagrams: receive.max_datagrams,
         max_bytes: receive.max_bytes,
         overflow: overflow_policy(receive.overflow),
+        recover_below: receive.recover_below,
         receive_buffer_bytes: receive.receive_buffer_bytes,
         batch_max_events: receive.batch_max_events,
         batch_max_bytes: receive.batch_max_bytes,
@@ -4730,6 +4733,7 @@ mod tests {
                 retry_max_delay: Duration::from_secs(20),
                 shutdown_grace: Duration::from_secs(10),
                 disk: None,
+                recover_below: logit_config::DEFAULT_RECOVER_BELOW,
             },
             receive: logit_config::ReceiveConfig::default(),
             sources: vec!["in".to_string()],

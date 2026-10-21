@@ -632,7 +632,12 @@ fn receive_queue_push_then_pop_costs_nothing() {
 
     let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
     let queue = BoundedQueue::with_metrics(
-        QueueConfig { max_items: 16, max_weight: u64::MAX, overflow: OverflowPolicy::DropOldest },
+        QueueConfig {
+            max_items: 16,
+            max_weight: u64::MAX,
+            overflow: OverflowPolicy::DropOldest,
+            recover_below: logit_pipeline::DEFAULT_RECOVER_BELOW,
+        },
         &RECEIVE_QUEUE_METRICS,
         Telemetry::default(),
     );
@@ -664,7 +669,12 @@ fn receive_queue_push_many_then_pop_many_costs_nothing() {
 
     let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
     let queue = BoundedQueue::with_metrics(
-        QueueConfig { max_items: 16, max_weight: u64::MAX, overflow: OverflowPolicy::DropOldest },
+        QueueConfig {
+            max_items: 16,
+            max_weight: u64::MAX,
+            overflow: OverflowPolicy::DropOldest,
+            recover_below: logit_pipeline::DEFAULT_RECOVER_BELOW,
+        },
         &RECEIVE_QUEUE_METRICS,
         Telemetry::default(),
     );
@@ -2395,6 +2405,7 @@ fn disk_queue_config(dir: std::path::PathBuf) -> logit_pipeline::DiskQueueConfig
         overflow: logit_pipeline::OverflowPolicy::Block,
         compression: logit_proto::frame::Compression::None,
         checkpoint_interval: std::time::Duration::from_secs(3600),
+        recover_below: logit_pipeline::DEFAULT_RECOVER_BELOW,
     }
 }
 

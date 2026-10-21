@@ -44,7 +44,10 @@
 //!     (`docs/adr/buffered-sink-delivery.md`).
 //! 15. A sink's `buffer.max_batches` or `buffer.max_bytes` of `0`: no batch could ever be queued.
 //!     Or its `buffer.retry_max_delay` of `0s`: a failing head would retry with no pause, for as
-//!     long as it fails (`docs/adr/sink-send-path-and-attempt-accounting.md`, decision 10).
+//!     long as it fails (`docs/adr/sink-send-path-and-attempt-accounting.md`, decision 10). Or its
+//!     `buffer.recover_below` outside `(0, 1)`: at `0` or below a full episode never ends, and at
+//!     `1` or above there's no gap between full and recovered
+//!     (`docs/adr/buffer-full-diagnostics.md`).
 //! 16. An `internal` `span_sample_rate` that is non-finite or outside `[0, 1]`: a typo, not a value
 //!     to clamp (NaN would keep every span).
 //! 17. A non-default `receive:` outside a datagram, stream, or tail listener (explicit predicates,
@@ -52,7 +55,8 @@
 //!     which has no receive queue, a queue field or `read_batch`, by name.
 //! 18. A `receive.max_datagrams`/`max_bytes`/`read_batch` (datagram listeners) or
 //!     `batch_max_events`/`batch_max_bytes` (all three drivers) of `0`. `batch_flush_interval: 0s`
-//!     is legal ("no flush timer"); 57 owns `read_batch`'s upper end.
+//!     is legal ("no flush timer"); 57 owns `read_batch`'s upper end. A datagram listener's
+//!     `receive.recover_below` outside `(0, 1)`, as rule 15 rejects `buffer.recover_below`.
 //! 19. A `trace_context` with an empty `trace_id`, `span_id`, or `flags` field name, after its
 //!     `format`'s defaults fill the absent ones: it could never match an attribute (`null`, not
 //!     `""`, disables an optional lookup)
@@ -1301,6 +1305,7 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                      would retry a failing batch with no pause for as long as it fails"
                 );
             }
+            check_recover_below(id, "buffer", component.buffer.recover_below)?;
         }
     }
 
@@ -1345,6 +1350,8 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                 Some("receive_buffer_bytes")
             } else if component.receive.read_batch != default.read_batch {
                 Some("read_batch")
+            } else if component.receive.recover_below != default.recover_below {
+                Some("recover_below")
             } else {
                 None
             };
@@ -1404,6 +1411,7 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                      datagram could ever be read off the socket"
                 );
             }
+            check_recover_below(id, "receive", component.receive.recover_below)?;
         }
         if is_datagram_listener(&component.kind)
             || is_tail_listener(&component.kind)
@@ -4730,6 +4738,19 @@ fn is_kafka_topic_name(topic: &str) -> bool {
         && topic != "."
         && topic != ".."
         && topic.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+/// Rules 15 and 18's `recover_below` check, for the `buffer` or `receive` block named by `block`.
+/// The `!(..)` form also rejects NaN.
+fn check_recover_below(id: &str, block: &str, value: f64) -> anyhow::Result<()> {
+    if !(value > 0.0 && value < 1.0) {
+        anyhow::bail!(
+            "component '{id}': '{block}.recover_below' must be greater than 0 and less than 1, \
+             got {value} -- at 0 a full episode could never end, and at 1 a buffer at its bound \
+             would log an episode per batch"
+        );
+    }
+    Ok(())
 }
 
 /// Rules 17/18/57's datagram predicate: the kinds the datagram listener driver backs
@@ -10530,6 +10551,66 @@ mod tests {
         ]));
         assert!(err.contains("'out'"), "got: {err}");
         assert!(err.contains("max_batches"), "got: {err}");
+    }
+
+    /// `recover_below` is a fraction strictly between 0 and 1, on a sink's `buffer:` and a
+    /// datagram listener's `receive:`. NaN is rejected too.
+    #[test]
+    fn a_recover_below_outside_zero_to_one_is_rejected_on_buffer_and_receive() {
+        for bad in [0.0, 1.0, -0.5, 1.5, f64::NAN] {
+            let err = expect_err(cfg_with_buffer(vec![
+                ("in", vec![], listener(), BufferConfig::default()),
+                (
+                    "out",
+                    vec!["in"],
+                    sink(),
+                    BufferConfig { recover_below: bad, ..BufferConfig::default() },
+                ),
+            ]));
+            assert!(
+                err.contains(
+                    "'out': 'buffer.recover_below' must be greater than 0 and less than 1"
+                ),
+                "{bad}: {err}"
+            );
+            let err = expect_err(cfg_with_receive(vec![
+                (
+                    "in",
+                    vec![],
+                    listener(),
+                    ReceiveConfig { recover_below: bad, ..ReceiveConfig::default() },
+                ),
+                ("out", vec!["in"], sink(), ReceiveConfig::default()),
+            ]));
+            assert!(
+                err.contains(
+                    "'in': 'receive.recover_below' must be greater than 0 and less than 1"
+                ),
+                "{bad}: {err}"
+            );
+        }
+        for good in [0.01, 0.5, 0.99] {
+            resolve(cfg_with_buffer(vec![
+                ("in", vec![], listener(), BufferConfig::default()),
+                (
+                    "out",
+                    vec!["in"],
+                    sink(),
+                    BufferConfig { recover_below: good, ..BufferConfig::default() },
+                ),
+            ]))
+            .expect("a fraction inside (0, 1) validates");
+            resolve(cfg_with_receive(vec![
+                (
+                    "in",
+                    vec![],
+                    listener(),
+                    ReceiveConfig { recover_below: good, ..ReceiveConfig::default() },
+                ),
+                ("out", vec!["in"], sink(), ReceiveConfig::default()),
+            ]))
+            .expect("a fraction inside (0, 1) validates");
+        }
     }
 
     #[test]

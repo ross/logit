@@ -1600,6 +1600,7 @@ mod tests {
                 overflow: logit_pipeline::OverflowPolicy::Block,
                 compression: Compression::None,
                 checkpoint_interval: Duration::from_secs(3600),
+                recover_below: logit_pipeline::DEFAULT_RECOVER_BELOW,
             };
             logit_pipeline::DiskQueue::open(
                 config,

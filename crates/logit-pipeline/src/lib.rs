@@ -15,6 +15,7 @@
 
 pub mod accumulator;
 pub mod atomic_write;
+mod buffer_full;
 pub mod disk_queue;
 #[cfg(test)]
 mod disk_queue_verification;
@@ -41,6 +42,7 @@ pub mod tls;
 pub mod transform;
 
 pub use accumulator::{BatchAccumulator, FlushReason};
+pub use buffer_full::FullLabels;
 pub use disk_queue::{DiskQueue, DiskQueueConfig};
 pub use fanout::{BatchContext, Delivered, Edge, Fanout, SendTimeout, TraceContext};
 pub use input::{Input, InputRuntimeConfig};
@@ -48,7 +50,8 @@ pub use logit_proto::native::SeqId;
 pub use output::{classify, is_head_only, is_retryable, DeliveryPosture, Fault, HeadOnly, Output};
 pub use queue::{
     BoundedQueue, CountedDrain, OverflowPolicy, QueueConfig, QueueMetrics, Queued, SinkQueue,
-    SinkQueueConfig, SinkStore, SinkStoreConfig, StoreItem, SINK_QUEUE_METRICS,
+    SinkQueueConfig, SinkStore, SinkStoreConfig, StoreItem, DEFAULT_RECOVER_BELOW,
+    SINK_QUEUE_METRICS,
 };
 pub use readiness::{NodeState, Phase, PipelineState, Readiness};
 pub use route_signals::{route_signals_batch, SignalRoutes};

@@ -530,6 +530,7 @@ mod window {
             overflow: OverflowPolicy::Block,
             compression: Compression::None,
             checkpoint_interval: Duration::from_millis(20),
+            recover_below: logit_pipeline::DEFAULT_RECOVER_BELOW,
         };
         let mut specs: HashMap<String, NodeSpec> = HashMap::new();
         specs.insert(

@@ -80,6 +80,13 @@ impl Diagnostics {
         tracing::warn!(target: "logit", component = %self.component_id, "{msg}");
     }
 
+    /// Reports at `warn`, unthrottled, with `component` and `key`, for a line its caller paces by
+    /// time, such as a full buffer's once-a-minute repeat. Like [`Diagnostics::info`] and
+    /// [`Diagnostics::error`], it doesn't count in `logit.component.diagnostics`.
+    pub fn warn_keyed(&self, key: &'static str, msg: impl Display) {
+        tracing::warn!(target: "logit", component = %self.component_id, key = key, "{msg}");
+    }
+
     /// Reports at `debug`, unthrottled, with `component` but no `key`. For something the operator
     /// can't act on, such as per-socket kernel counters being unavailable off Linux.
     pub fn debug(&self, msg: impl Display) {

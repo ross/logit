@@ -5,6 +5,7 @@
 //! a sync trait can't express: `Block`, which awaits room rather than dropping. [`Queued`] and
 //! [`QueueMetrics`] are what let one implementation serve both sides.
 
+use crate::buffer_full::{Bound, FullLabels, FullWatch, Waiting, WatchConfig};
 use crate::fanout::BatchContext;
 use logit_core::{Diagnostics, EventBatch, Telemetry};
 use logit_proto::buffer::{Buffer, InMemoryBuffer, OverflowPolicy as DropPolicy, PushOutcome};
@@ -59,10 +60,14 @@ pub struct QueueMetrics {
     pub utilization: &'static str,
     /// Timing: how long a `Block`-policy push waited for room; recorded only when it waited.
     pub push_blocked: &'static str,
+    /// Gauge: 1 while a `Block`-policy push waits for room, else 0.
+    pub push_blocked_now: &'static str,
     /// Count, tagged `reason`: one per dropped item.
     pub items_dropped: &'static str,
     /// Count, tagged `reason`: the dropped item's own `units()`.
     pub units_dropped: &'static str,
+    /// How the queue's full-buffer lines name it and its bounds.
+    pub labels: FullLabels,
 }
 
 pub static SINK_QUEUE_METRICS: QueueMetrics = QueueMetrics {
@@ -70,9 +75,21 @@ pub static SINK_QUEUE_METRICS: QueueMetrics = QueueMetrics {
     bytes: "logit.component.buffer.bytes",
     utilization: "logit.component.buffer.utilization",
     push_blocked: "logit.component.buffer.push.blocked.duration",
+    push_blocked_now: "logit.component.buffer.push.blocked",
     items_dropped: "logit.component.batches.dropped",
     units_dropped: "logit.component.events.dropped",
+    labels: FullLabels {
+        what: "buffer",
+        items_bound: "buffer.max_batches",
+        weight_bound: "buffer.max_bytes",
+        items: "batch(es)",
+        units: "event(s)",
+    },
 };
+
+/// `recover_below`'s default: the utilization a full queue must fall below before its
+/// `buffer_recovered` line.
+pub const DEFAULT_RECOVER_BELOW: f64 = logit_config::DEFAULT_RECOVER_BELOW;
 
 /// What to do when the queue is full. `Block` is layered here on top of the two dropping
 /// policies `logit_proto::buffer::OverflowPolicy` can express synchronously. The sink and receive
@@ -85,6 +102,17 @@ pub enum OverflowPolicy {
     DropNewest,
 }
 
+impl OverflowPolicy {
+    /// The config spelling, for self-log lines.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            OverflowPolicy::Block => "block",
+            OverflowPolicy::DropOldest => "drop_oldest",
+            OverflowPolicy::DropNewest => "drop_newest",
+        }
+    }
+}
+
 /// Bounds and overflow behavior for one [`BoundedQueue`], in generic items/weight terms.
 /// [`SinkQueueConfig`] (batches) and `logit-inputs`' `ReceiveQueueConfig` (datagrams) convert
 /// into it, so each keeps field names in its operator's unit.
@@ -93,6 +121,9 @@ pub struct QueueConfig {
     pub max_items: usize,
     pub max_weight: u64,
     pub overflow: OverflowPolicy,
+    /// The utilization a full queue must fall below to end its episode
+    /// (`docs/adr/buffer-full-diagnostics.md`).
+    pub recover_below: f64,
 }
 
 /// Bounds and overflow behavior for one sink's [`SinkQueue`]. Both bounds are enforced,
@@ -103,6 +134,7 @@ pub struct SinkQueueConfig {
     pub max_batches: usize,
     pub max_bytes: u64,
     pub overflow: OverflowPolicy,
+    pub recover_below: f64,
 }
 
 /// The values a sink gets with no `buffer:` block; keep them in step with
@@ -111,13 +143,23 @@ pub struct SinkQueueConfig {
 /// the default because dropping data should be a per-sink opt-in.
 impl Default for SinkQueueConfig {
     fn default() -> Self {
-        Self { max_batches: 1024, max_bytes: 64 * 1024 * 1024, overflow: OverflowPolicy::Block }
+        Self {
+            max_batches: 1024,
+            max_bytes: 64 * 1024 * 1024,
+            overflow: OverflowPolicy::Block,
+            recover_below: DEFAULT_RECOVER_BELOW,
+        }
     }
 }
 
 impl From<SinkQueueConfig> for QueueConfig {
     fn from(c: SinkQueueConfig) -> Self {
-        Self { max_items: c.max_batches, max_weight: c.max_bytes, overflow: c.overflow }
+        Self {
+            max_items: c.max_batches,
+            max_weight: c.max_bytes,
+            overflow: c.overflow,
+            recover_below: c.recover_below,
+        }
     }
 }
 
@@ -202,6 +244,8 @@ pub struct BoundedQueue<T: Queued> {
     max_weight: u64,
     metrics: &'static QueueMetrics,
     telemetry: Telemetry,
+    /// The full-buffer episode, its lines, and the `push_blocked_now` gauge.
+    watch: FullWatch,
     /// How many times `update_gauges` has run. [`BoundedQueue::push_many`]/
     /// [`BoundedQueue::pop_many`] exist to make it once per call, and a drained `Registry` can't
     /// show that: `Telemetry::gauge` is last-write-wins per series, so one write and sixty-four
@@ -240,10 +284,34 @@ impl<T: Queued> BoundedQueue<T> {
             max_items: config.max_items,
             max_weight: config.max_weight,
             metrics,
+            watch: FullWatch::new(
+                WatchConfig {
+                    policy: config.overflow,
+                    recover_below: config.recover_below,
+                    max_items: config.max_items as u64,
+                    max_weight: config.max_weight,
+                },
+                &metrics.labels,
+                metrics.push_blocked_now,
+                telemetry.clone(),
+                Diagnostics::default(),
+            ),
             telemetry,
             #[cfg(test)]
             gauge_updates: std::sync::atomic::AtomicUsize::new(0),
         }
+    }
+
+    /// Names the component in the queue's full-buffer lines.
+    pub fn with_diagnostics(mut self, diag: Diagnostics) -> Self {
+        self.watch.set_diagnostics(diag);
+        self
+    }
+
+    /// Ends a full-buffer episode still open once nothing will push again, writing
+    /// `buffer_full_at_shutdown` if the episode was announced. A no-op with no episode open.
+    pub fn finish_full_episode(&self) {
+        self.watch.finish();
     }
 
     /// How many `update_gauges` calls this queue has made (see the field).
@@ -269,62 +337,64 @@ impl<T: Queued> BoundedQueue<T> {
     pub async fn push(&self, item: T) {
         let weight = item.weight();
         let impossible_to_ever_fit = weight > self.max_weight || self.max_items == 0;
-        let mut waited = false;
-        let mut blocked_timer: Option<logit_core::telemetry::Timer> = None;
+        let mut waiting: Option<(Waiting<'_>, logit_core::telemetry::Timer)> = None;
         // `Option` so this needs no `T: Clone`: a retry never consumes `item`, and the one arm
         // that `take()`s it breaks the loop immediately.
         let mut item = Some(item);
 
-        let (len, total_weight, evicted, rejected) = loop {
+        let (len, total_weight, evicted, rejected, bound) = loop {
             // Registered before the state check: see the doc comment.
             let notified = self.not_full.notified();
 
             let attempt = {
                 let mut inner = self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                 let full = self.would_overflow(&inner, weight);
+                let bound = Self::bound_hit(&inner, self.max_items);
                 if self.block_when_full
                     && full
                     && !impossible_to_ever_fit
                     && !self.closed.load(Ordering::Acquire)
                 {
-                    None
+                    Err(bound)
                 } else {
                     let taken = item.take().expect(
                         "item is only ever taken on the one path that immediately breaks the loop",
                     );
                     let outcome = inner.push(taken, weight);
-                    Some((outcome, inner.len(), inner.weight()))
+                    Ok((outcome, inner.len(), inner.weight(), bound))
                 }
             };
 
             match attempt {
-                None => {
-                    if !waited {
-                        waited = true;
-                        blocked_timer = Some(self.telemetry.timer(self.metrics.push_blocked));
+                Err(bound) => {
+                    if waiting.is_none() {
+                        waiting = Some((
+                            self.watch.waiting(bound),
+                            self.telemetry.timer(self.metrics.push_blocked),
+                        ));
                     }
-                    notified.await;
+                    self.watch.wait(notified).await;
                 }
-                Some((outcome, len, total_weight)) => {
+                Ok((outcome, len, total_weight, bound)) => {
                     let (evicted, rejected) = match outcome {
                         PushOutcome::Accepted => (Vec::new(), None),
                         PushOutcome::Evicted(evicted) => (evicted, None),
                         PushOutcome::Rejected(rejected) => (Vec::new(), Some(rejected)),
                     };
-                    break (len, total_weight, evicted, rejected);
+                    break (len, total_weight, evicted, rejected, bound);
                 }
             }
         };
 
         for evicted_item in &evicted {
-            self.count_dropped("overflow_oldest", evicted_item);
+            self.count_dropped("overflow_oldest", evicted_item, bound);
         }
         if let Some(rejected_item) = &rejected {
-            self.count_dropped("overflow_newest", rejected_item);
+            self.count_dropped("overflow_newest", rejected_item, bound);
         }
 
-        // Records a sample only if this push waited.
-        drop(blocked_timer);
+        // Lowers the blocked gauge and records a timer sample, only if this push waited.
+        drop(waiting);
         self.not_empty.notify_one();
         self.update_gauges(len, total_weight);
     }
@@ -366,11 +436,11 @@ impl<T: Queued> BoundedQueue<T> {
         if items.is_empty() {
             return;
         }
-        let mut blocked_timer: Option<logit_core::telemetry::Timer> = None;
+        let mut waiting: Option<(Waiting<'_>, logit_core::telemetry::Timer)> = None;
         // What one lock acquisition evicted or rejected, counted and freed right after the lock
         // is released. Deferring to the end of the call would make the counts lag a long `Block`
         // wait and keep evicted datagrams alive for it.
-        let mut dropped: Vec<(&'static str, T)> = Vec::new();
+        let mut dropped: Vec<(&'static str, T, Bound)> = Vec::new();
         let (len, total_weight) = {
             let mut drain = CountedDrain::new(items, &self.telemetry, self.metrics, "shutdown");
             // The head item's weight, computed once however many times the wait loop re-examines
@@ -384,38 +454,40 @@ impl<T: Queued> BoundedQueue<T> {
                     let mut inner =
                         self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                     let must_wait = loop {
-                        let Some(next) = drain.peek() else { break false };
+                        let Some(next) = drain.peek() else { break None };
                         let weight = *head_weight.get_or_insert_with(|| next.weight());
                         let impossible_to_ever_fit =
                             weight > self.max_weight || self.max_items == 0;
+                        let bound = Self::bound_hit(&inner, self.max_items);
                         if self.block_when_full
                             && self.would_overflow(&inner, weight)
                             && !impossible_to_ever_fit
                             && !self.closed.load(Ordering::Acquire)
                         {
-                            break true;
+                            break Some(bound);
                         }
                         let item = drain.next().expect("just peeked");
                         head_weight = None;
                         match inner.push(item, weight) {
                             PushOutcome::Accepted => {}
-                            PushOutcome::Evicted(evicted) => dropped
-                                .extend(evicted.into_iter().map(|item| ("overflow_oldest", item))),
+                            PushOutcome::Evicted(evicted) => dropped.extend(
+                                evicted.into_iter().map(|item| ("overflow_oldest", item, bound)),
+                            ),
                             PushOutcome::Rejected(rejected) => {
-                                dropped.push(("overflow_newest", rejected))
+                                dropped.push(("overflow_newest", rejected, bound))
                             }
                         }
                     };
                     (must_wait, inner.len(), inner.weight())
                 };
 
-                for (reason, item) in dropped.drain(..) {
-                    self.count_dropped(reason, &item);
+                for (reason, item, bound) in dropped.drain(..) {
+                    self.count_dropped(reason, &item, bound);
                 }
 
-                if !must_wait {
+                let Some(bound) = must_wait else {
                     break (len, total_weight);
-                }
+                };
                 // Announce what this call has admitted before suspending, or a consumer parked on
                 // `not_empty` and this call wait on each other forever (`max_items: 2`, a batch of
                 // 5, `Block`); see the doc comment.
@@ -425,15 +497,18 @@ impl<T: Queued> BoundedQueue<T> {
                 // `len >= max_items >= 1` or `weight() + w > max_weight` with `w <= max_weight`,
                 // which needs `weight() > 0`. The queue is non-empty.
                 self.not_empty.notify_one();
-                if blocked_timer.is_none() {
-                    blocked_timer = Some(self.telemetry.timer(self.metrics.push_blocked));
+                if waiting.is_none() {
+                    waiting = Some((
+                        self.watch.waiting(bound),
+                        self.telemetry.timer(self.metrics.push_blocked),
+                    ));
                 }
-                notified.await;
+                self.watch.wait(notified).await;
             }
         };
 
-        // Records a sample only if this call waited.
-        drop(blocked_timer);
+        // Lowers the blocked gauge and records a timer sample, only if this call waited.
+        drop(waiting);
         self.not_empty.notify_one();
         self.update_gauges(len, total_weight);
     }
@@ -448,7 +523,7 @@ impl<T: Queued> BoundedQueue<T> {
             (item, inner.len(), inner.weight())
         };
         self.not_full.notify_one();
-        self.update_gauges(len, weight);
+        self.consumed(len, weight);
         item
     }
 
@@ -474,7 +549,7 @@ impl<T: Queued> BoundedQueue<T> {
             };
             if let Some(item) = item {
                 self.not_full.notify_one();
-                self.update_gauges(len, weight);
+                self.consumed(len, weight);
                 return Some(item);
             }
             notified.await;
@@ -522,7 +597,7 @@ impl<T: Queued> BoundedQueue<T> {
                 for _ in 0..popped {
                     self.not_full.notify_one();
                 }
-                self.update_gauges(len, weight);
+                self.consumed(len, weight);
                 return popped;
             }
             notified.await;
@@ -543,7 +618,7 @@ impl<T: Queued> BoundedQueue<T> {
             (items, inner.len(), inner.weight())
         };
         if !items.is_empty() {
-            self.update_gauges(len, weight);
+            self.consumed(len, weight);
         }
         items
     }
@@ -575,13 +650,28 @@ impl<T: Queued> BoundedQueue<T> {
         inner.len() >= self.max_items || inner.weight().saturating_add(weight) > self.max_weight
     }
 
-    fn count_dropped(&self, reason: &'static str, item: &T) {
+    /// Which bound a push that found no room hit: the item count once it is reached, else the
+    /// weight.
+    fn bound_hit(inner: &InMemoryBuffer<T>, max_items: usize) -> Bound {
+        if inner.len() >= max_items {
+            Bound::Items
+        } else {
+            Bound::Weight
+        }
+    }
+
+    /// Counts one item an overflow policy shed, and records it in the full-buffer episode.
+    fn count_dropped(&self, reason: &'static str, item: &T, bound: Bound) {
+        let units = item.units();
         self.telemetry.count(self.metrics.items_dropped, 1.0, &[("reason", reason)]);
-        self.telemetry.count(
-            self.metrics.units_dropped,
-            item.units() as f64,
-            &[("reason", reason)],
-        );
+        self.telemetry.count(self.metrics.units_dropped, units as f64, &[("reason", reason)]);
+        self.watch.dropped(reason, units, bound);
+    }
+
+    /// The consumer side's gauge update, which is also where a full-buffer episode can end.
+    fn consumed(&self, len: usize, weight: u64) {
+        let utilization = self.update_gauges(len, weight);
+        self.watch.utilization(utilization);
     }
 
     /// `metrics.utilization` is `max(items ratio, bytes ratio)`: whichever bound is closer to
@@ -591,7 +681,7 @@ impl<T: Queued> BoundedQueue<T> {
     /// Runs after the lock is released, so under callers on parallel threads the last write can
     /// carry an older state than the queue's. Benign in production: each queue's producer and
     /// consumer halves run in one task, so their calls never overlap.
-    fn update_gauges(&self, len: usize, weight: u64) {
+    fn update_gauges(&self, len: usize, weight: u64) -> f64 {
         #[cfg(test)]
         self.gauge_updates.fetch_add(1, Ordering::Relaxed);
         self.telemetry.gauge(self.metrics.depth, len as f64, &[]);
@@ -600,7 +690,9 @@ impl<T: Queued> BoundedQueue<T> {
             if self.max_items == 0 { 0.0 } else { len as f64 / self.max_items as f64 };
         let bytes_ratio =
             if self.max_weight == 0 { 0.0 } else { weight as f64 / self.max_weight as f64 };
-        self.telemetry.gauge(self.metrics.utilization, items_ratio.max(bytes_ratio), &[]);
+        let utilization = items_ratio.max(bytes_ratio);
+        self.telemetry.gauge(self.metrics.utilization, utilization, &[]);
+        utilization
     }
 }
 
@@ -697,6 +789,12 @@ impl SinkQueue {
         }
     }
 
+    /// See [`BoundedQueue::with_diagnostics`].
+    pub fn with_diagnostics(mut self, diag: Diagnostics) -> Self {
+        self.queue = self.queue.with_diagnostics(diag);
+        self
+    }
+
     /// Numbers the batch, then admits it under the configured overflow policy. The number is
     /// taken before `Block`'s wait, so a push that `DropNewest` rejects still consumes one.
     pub async fn push(&self, (batch, ctx): (Arc<EventBatch>, BatchContext)) {
@@ -768,7 +866,9 @@ impl SinkStore {
         diag: Diagnostics,
     ) -> anyhow::Result<Self> {
         match config {
-            SinkStoreConfig::Memory(cfg) => Ok(SinkStore::Memory(SinkQueue::new(cfg, telemetry))),
+            SinkStoreConfig::Memory(cfg) => {
+                Ok(SinkStore::Memory(SinkQueue::new(cfg, telemetry).with_diagnostics(diag)))
+            }
             SinkStoreConfig::Disk(cfg) => Ok(SinkStore::Disk(Box::new(
                 crate::disk_queue::DiskQueue::open(cfg, telemetry, diag)?,
             ))),
@@ -849,6 +949,8 @@ impl SinkStore {
     pub async fn finish(&self) -> (u64, u64) {
         match self {
             SinkStore::Memory(q) => {
+                // Before the commits below, whose drops are shutdown's, not a recovery.
+                q.queue.finish_full_episode();
                 let mut dropped_batches = 0u64;
                 let mut dropped_events = 0u64;
                 while let Some((batch, ..)) = q.commit() {
@@ -858,6 +960,7 @@ impl SinkStore {
                 (dropped_batches, dropped_events)
             }
             SinkStore::Disk(q) => {
+                q.finish_full_episode();
                 q.finish().await;
                 (0, 0)
             }
@@ -893,7 +996,15 @@ mod tests {
     }
 
     fn queue(max_batches: usize, max_bytes: u64, overflow: OverflowPolicy) -> SinkQueue {
-        SinkQueue::new(SinkQueueConfig { max_batches, max_bytes, overflow }, Telemetry::default())
+        SinkQueue::new(
+            SinkQueueConfig {
+                max_batches,
+                max_bytes,
+                overflow,
+                recover_below: DEFAULT_RECOVER_BELOW,
+            },
+            Telemetry::default(),
+        )
     }
 
     /// A placeholder context. `push_then_peek_then_commit_round_trips_one_batch` checks a real
@@ -1200,8 +1311,16 @@ mod tests {
         bytes: "test.queue.bytes",
         utilization: "test.queue.utilization",
         push_blocked: "test.queue.push.blocked.duration",
+        push_blocked_now: "test.queue.push.blocked",
         items_dropped: "test.queue.items.dropped",
         units_dropped: "test.queue.units.dropped",
+        labels: FullLabels {
+            what: "queue",
+            items_bound: "max_items",
+            weight_bound: "max_weight",
+            items: "item(s)",
+            units: "unit(s)",
+        },
     };
 
     fn test_queue(
@@ -1210,7 +1329,7 @@ mod tests {
         overflow: OverflowPolicy,
     ) -> BoundedQueue<TestItem> {
         BoundedQueue::with_metrics(
-            QueueConfig { max_items, max_weight, overflow },
+            QueueConfig { max_items, max_weight, overflow, recover_below: DEFAULT_RECOVER_BELOW },
             &TEST_METRICS,
             Telemetry::default(),
         )
@@ -1403,7 +1522,7 @@ mod tests {
         let registry = logit_core::Registry::new();
         let telemetry = registry.telemetry_for("test", "input", "source");
         let q = BoundedQueue::with_metrics(
-            QueueConfig { max_items, max_weight, overflow },
+            QueueConfig { max_items, max_weight, overflow, recover_below: DEFAULT_RECOVER_BELOW },
             &TEST_METRICS,
             telemetry,
         );
@@ -2528,5 +2647,279 @@ mod tests {
                 prop_assert_eq!(metric_sum(&e2, TEST_METRICS.items_dropped, shutdown), 0.0);
             }
         }
+    }
+}
+
+/// The full-buffer lines and the blocked-push gauge (`docs/adr/buffer-full-diagnostics.md`).
+#[cfg(test)]
+mod full_buffer_tests {
+    use super::*;
+    use crate::buffer_full::test_support::{capture, Lines};
+    use crate::buffer_full::{fmt_bytes, REPEAT_INTERVAL};
+    use crate::fanout::TraceContext;
+    use crate::test_util::{wait_until, TelemetryProbe, RECV_TIMEOUT};
+    use logit_core::{AttrMap, Event, Resource};
+    use std::time::Duration;
+
+    const BLOCKED: &str = "logit.component.buffer.push.blocked";
+
+    fn batch() -> Arc<EventBatch> {
+        Arc::new(EventBatch {
+            resource: Arc::new(Resource::default()),
+            scope: None,
+            events: vec![Event::empty(0, AttrMap::new())],
+        })
+    }
+
+    fn ctx() -> BatchContext {
+        TraceContext::default().into()
+    }
+
+    fn sink_queue(config: SinkQueueConfig, probe: &TelemetryProbe) -> Arc<SinkQueue> {
+        let telemetry = probe.telemetry("q", "influxdb_out", "sink");
+        Arc::new(SinkQueue::new(config, telemetry).with_diagnostics(Diagnostics::new("q")))
+    }
+
+    fn messages(lines: &Lines, key: &str) -> Vec<String> {
+        lines.with_key(key).into_iter().map(|(_, message)| message).collect()
+    }
+
+    /// Under `block`, the push that finds no room raises the gauge and logs `buffer_full` at once.
+    /// The waiting push wakes each minute to repeat it with the time held. Once room frees, the
+    /// gauge drops, and the episode ends only when utilization falls below `recover_below`: at
+    /// 3/4 = 0.75 it holds, at 2/4 it ends.
+    #[tokio::test(start_paused = true)]
+    async fn a_blocked_push_logs_full_repeats_each_minute_and_recovers_below_the_threshold() {
+        let (lines, _guard) = capture();
+        let mut probe = TelemetryProbe::new();
+        let q =
+            sink_queue(SinkQueueConfig { max_batches: 4, ..SinkQueueConfig::default() }, &probe);
+        for _ in 0..4 {
+            q.push((batch(), ctx())).await;
+        }
+        let q2 = Arc::clone(&q);
+        let blocked = tokio::spawn(async move { q2.push((batch(), ctx())).await });
+        probe.wait_for("the blocked gauge at 1", |t| t.gauge(BLOCKED, &[]) == Some(1.0)).await;
+        assert_eq!(
+            messages(&lines, "buffer_full"),
+            ["buffer full (buffer.max_batches 4); overflow block is holding intake"]
+        );
+        assert_eq!(lines.with_key("buffer_full")[0].0, tracing::Level::WARN);
+
+        tokio::time::sleep(REPEAT_INTERVAL).await;
+        assert_eq!(
+            messages(&lines, "buffer_full")[1..],
+            ["buffer still full for 1m0s (buffer.max_batches 4); overflow block held intake for \
+              1m0s"]
+        );
+        assert!(!blocked.is_finished(), "a repeat wakes the push but never admits it");
+
+        q.commit().expect("frees one slot");
+        tokio::time::timeout(RECV_TIMEOUT, blocked).await.expect("admitted").expect("no panic");
+        probe.wait_for("the blocked gauge at 0", |t| t.gauge(BLOCKED, &[]) == Some(0.0)).await;
+
+        q.commit().expect("3 of 4 left");
+        assert!(lines.with_key("buffer_recovered").is_empty(), "0.75 is not below 0.75");
+        q.commit().expect("2 of 4 left");
+        let recovered = lines.with_key("buffer_recovered");
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].0, tracing::Level::INFO);
+        assert_eq!(
+            recovered[0].1,
+            "buffer below 75% of its bounds after 1m0s; overflow block held intake for 1m0s"
+        );
+        assert_eq!(messages(&lines, "buffer_full").len(), 2, "nothing more once recovered");
+    }
+
+    /// Under `drop_newest` on the byte bound, the first rejection logs `buffer_full`; a rejection a
+    /// minute later repeats it with the episode's counts, and recovery reports the totals.
+    #[tokio::test(start_paused = true)]
+    async fn a_shedding_queue_logs_full_and_repeats_with_its_drop_counts() {
+        let (lines, _guard) = capture();
+        let probe = TelemetryProbe::new();
+        let max_bytes = 4 * batch().weight();
+        let q = sink_queue(
+            SinkQueueConfig {
+                max_batches: 1000,
+                max_bytes,
+                overflow: OverflowPolicy::DropNewest,
+                ..SinkQueueConfig::default()
+            },
+            &probe,
+        );
+        for _ in 0..7 {
+            q.push((batch(), ctx())).await;
+        }
+        let bound = format!("buffer.max_bytes {}", fmt_bytes(max_bytes));
+        assert_eq!(
+            messages(&lines, "buffer_full"),
+            [format!("buffer full ({bound}); overflow drop_newest is shedding new batch(es)")],
+            "three rejections inside a minute write one line"
+        );
+
+        tokio::time::advance(REPEAT_INTERVAL).await;
+        q.push((batch(), ctx())).await;
+        assert_eq!(
+            messages(&lines, "buffer_full")[1..],
+            [format!(
+                "buffer still full for 1m0s ({bound}); overflow drop_newest shed 4 batch(es) \
+                 (4 event(s))"
+            )]
+        );
+
+        q.peek().await.expect("queued");
+        q.commit();
+        assert!(lines.with_key("buffer_recovered").is_empty(), "0.75 is not below 0.75");
+        q.peek().await.expect("queued");
+        q.commit();
+        assert_eq!(
+            messages(&lines, "buffer_recovered"),
+            ["buffer below 75% of its bounds after 1m0s; overflow drop_newest shed 4 batch(es) \
+              (4 event(s))"]
+        );
+    }
+
+    /// Under `drop_oldest` on the batch bound, the line names that bound and what is shed.
+    #[tokio::test]
+    async fn a_drop_oldest_queue_names_the_batch_bound_and_sheds_the_oldest() {
+        let (lines, _guard) = capture();
+        let probe = TelemetryProbe::new();
+        let q = sink_queue(
+            SinkQueueConfig {
+                max_batches: 2,
+                overflow: OverflowPolicy::DropOldest,
+                ..SinkQueueConfig::default()
+            },
+            &probe,
+        );
+        for _ in 0..3 {
+            q.push((batch(), ctx())).await;
+        }
+        assert_eq!(
+            messages(&lines, "buffer_full"),
+            ["buffer full (buffer.max_batches 2); overflow drop_oldest is shedding the oldest \
+              batch(es)"]
+        );
+    }
+
+    /// A batch that could never fit takes `block`'s eviction fallback; the line says the queue is
+    /// shedding, not holding intake.
+    #[tokio::test]
+    async fn under_block_a_batch_too_large_to_ever_fit_logs_that_it_shed_the_oldest() {
+        let (lines, _guard) = capture();
+        let probe = TelemetryProbe::new();
+        let q = sink_queue(
+            SinkQueueConfig { max_bytes: batch().weight(), ..SinkQueueConfig::default() },
+            &probe,
+        );
+        q.push((batch(), ctx())).await;
+        let mut big = AttrMap::new();
+        big.insert("payload", logit_core::Value::str("x".repeat(4096)));
+        let big = Arc::new(EventBatch {
+            resource: Arc::new(Resource::default()),
+            scope: None,
+            events: vec![Event::empty(0, big)],
+        });
+        q.push((big, ctx())).await;
+        assert_eq!(
+            messages(&lines, "buffer_full"),
+            [format!(
+                "buffer full (buffer.max_bytes {}); overflow block is shedding the oldest batch(es)",
+                fmt_bytes(batch().weight())
+            )]
+        );
+    }
+
+    /// The gauge returns to 0 when a waiting push is cancelled, and when a close ends the wait.
+    #[tokio::test(start_paused = true)]
+    async fn the_blocked_gauge_drops_when_a_waiting_push_is_cancelled_or_the_queue_closes() {
+        let mut probe = TelemetryProbe::new();
+        let q =
+            sink_queue(SinkQueueConfig { max_batches: 1, ..SinkQueueConfig::default() }, &probe);
+        q.push((batch(), ctx())).await;
+
+        let q2 = Arc::clone(&q);
+        let cancelled = tokio::spawn(async move { q2.push((batch(), ctx())).await });
+        probe.wait_for("the blocked gauge at 1", |t| t.gauge(BLOCKED, &[]) == Some(1.0)).await;
+        cancelled.abort();
+        assert!(cancelled.await.unwrap_err().is_cancelled());
+        probe
+            .wait_for("the gauge at 0 after cancellation", |t| t.gauge(BLOCKED, &[]) == Some(0.0))
+            .await;
+
+        let q3 = Arc::clone(&q);
+        let closed = tokio::spawn(async move { q3.push((batch(), ctx())).await });
+        probe
+            .wait_for("the blocked gauge at 1 again", |t| t.gauge(BLOCKED, &[]) == Some(1.0))
+            .await;
+        q.close();
+        tokio::time::timeout(RECV_TIMEOUT, closed).await.expect("close ends the wait").unwrap();
+        probe.wait_for("the gauge at 0 after close", |t| t.gauge(BLOCKED, &[]) == Some(0.0)).await;
+    }
+
+    /// A `push_many` that admits a prefix and then waits raises the gauge and logs, as `push` does.
+    #[tokio::test(start_paused = true)]
+    async fn a_push_many_that_waits_after_a_prefix_raises_the_gauge_and_logs() {
+        let (lines, _guard) = capture();
+        let mut probe = TelemetryProbe::new();
+        let telemetry = probe.telemetry("q", "statsd_in", "source");
+        let q = Arc::new(
+            BoundedQueue::with_metrics(
+                SinkQueueConfig { max_batches: 2, ..SinkQueueConfig::default() }.into(),
+                &SINK_QUEUE_METRICS,
+                telemetry,
+            )
+            .with_diagnostics(Diagnostics::new("q")),
+        );
+        let q2 = Arc::clone(&q);
+        let pushing = tokio::spawn(async move {
+            let mut items: Vec<StoreItem> =
+                (0..5u64).map(|n| (batch(), ctx(), SeqId { id: [0; 16], seq: n })).collect();
+            q2.push_many(&mut items).await;
+        });
+        probe.wait_for("the blocked gauge at 1", |t| t.gauge(BLOCKED, &[]) == Some(1.0)).await;
+        assert_eq!(q.queued(), 2, "the prefix that fit");
+        assert_eq!(
+            messages(&lines, "buffer_full"),
+            ["buffer full (buffer.max_batches 2); overflow block is holding intake"]
+        );
+        let mut out = Vec::new();
+        while out.len() < 5 {
+            q.pop_many(&mut out, 5).await;
+        }
+        tokio::time::timeout(RECV_TIMEOUT, pushing).await.expect("completes").unwrap();
+        probe.wait_for("the gauge at 0", |t| t.gauge(BLOCKED, &[]) == Some(0.0)).await;
+        wait_until("the episode to end", || !lines.with_key("buffer_recovered").is_empty()).await;
+    }
+
+    /// An episode still open when the sink finishes ends with `buffer_full_at_shutdown`, never
+    /// `buffer_recovered`: the batches `finish` removes are shutdown's drops.
+    #[tokio::test(start_paused = true)]
+    async fn finishing_a_full_store_logs_the_episode_at_shutdown_not_a_recovery() {
+        let (lines, _guard) = capture();
+        let probe = TelemetryProbe::new();
+        let config = SinkQueueConfig {
+            max_batches: 2,
+            overflow: OverflowPolicy::DropOldest,
+            ..SinkQueueConfig::default()
+        };
+        let store = SinkStore::open(
+            SinkStoreConfig::Memory(config),
+            probe.telemetry("q", "influxdb_out", "sink"),
+            Diagnostics::new("q"),
+        )
+        .unwrap();
+        for _ in 0..3 {
+            store.push((batch(), ctx())).await;
+        }
+        tokio::time::advance(Duration::from_secs(90)).await;
+        store.close();
+        assert_eq!(store.finish().await, (2, 2));
+        assert!(lines.with_key("buffer_recovered").is_empty());
+        assert_eq!(
+            messages(&lines, "buffer_full_at_shutdown"),
+            ["buffer still full at shutdown after 1m30s; overflow drop_oldest shed 1 batch(es) \
+              (1 event(s))"]
+        );
     }
 }

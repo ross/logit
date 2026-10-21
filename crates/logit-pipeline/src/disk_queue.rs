@@ -67,6 +67,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 use crate::atomic_write::{self, AtomicWriteError};
+use crate::buffer_full::{Bound, FullLabels, FullWatch, Waiting, WatchConfig};
 use crate::fanout::{BatchContext, TraceContext};
 use crate::fault::{sites, Op, Point};
 use crate::fault_io;
@@ -97,6 +98,15 @@ const DISK_TRUNCATED: &str = "logit.component.buffer.disk.truncated";
 /// Tagged `op`: `cursor`, `flush`, `fsync`, `create`, `truncate`, or `unlink`.
 const DISK_ERRORS: &str = "logit.component.buffer.disk.errors";
 
+/// A spool has one bound, `disk.max_bytes`, so `items_bound` never appears in a line.
+static DISK_FULL_LABELS: FullLabels = FullLabels {
+    what: "buffer",
+    items_bound: "buffer.disk.max_bytes",
+    weight_bound: "buffer.disk.max_bytes",
+    items: "batch(es)",
+    units: "event(s)",
+};
+
 const SEGMENT_CREATE: Point = Point::new(sites::SPOOL_SEGMENT, Op::Create);
 const SEGMENT_OPEN: Point = Point::new(sites::SPOOL_SEGMENT, Op::Open);
 const SEGMENT_WRITE: Point = Point::new(sites::SPOOL_SEGMENT, Op::Write);
@@ -117,6 +127,8 @@ pub struct DiskQueueConfig {
     pub overflow: OverflowPolicy,
     pub compression: Compression,
     pub checkpoint_interval: Duration,
+    /// See [`crate::QueueConfig::recover_below`].
+    pub recover_below: f64,
 }
 
 fn encode_context(ctx: TraceContext) -> [u8; CONTEXT_LEN] {
@@ -652,6 +664,8 @@ pub struct DiskQueue {
     not_full: tokio::sync::Notify,
     closed: AtomicBool,
     telemetry: Telemetry,
+    /// The full-buffer episode, its lines, and the blocked-push gauge.
+    watch: FullWatch,
     /// An OS advisory lock held for the queue's lifetime. Catches two sinks sharing a spool
     /// through an aliased path (`./spool` vs `spool`); graph validation rule 35 compares only
     /// literal `disk.path` strings.
@@ -866,6 +880,18 @@ impl DiskQueue {
 
         let total_bytes: u64 = segments.iter().map(|s| s.len).sum();
         let segment_count = segments.len();
+        let watch = FullWatch::new(
+            WatchConfig {
+                policy: config.overflow,
+                recover_below: config.recover_below,
+                max_items: 0,
+                max_weight: config.max_bytes,
+            },
+            &DISK_FULL_LABELS,
+            SINK_QUEUE_METRICS.push_blocked_now,
+            telemetry.clone(),
+            diag.clone(),
+        );
 
         let state = State {
             segments,
@@ -900,19 +926,33 @@ impl DiskQueue {
             not_full: tokio::sync::Notify::new(),
             closed: AtomicBool::new(false),
             telemetry,
+            watch,
             _lock: lock_file,
         };
         queue.update_gauges(total_bytes, replayed, segment_count);
         Ok(queue)
     }
 
-    fn update_gauges(&self, total_bytes: u64, queued_records: u64, segment_count: usize) {
+    /// Returns the utilization it reported.
+    fn update_gauges(&self, total_bytes: u64, queued_records: u64, segment_count: usize) -> f64 {
         self.telemetry.gauge(SINK_QUEUE_METRICS.depth, queued_records as f64, &[]);
         self.telemetry.gauge(SINK_QUEUE_METRICS.bytes, total_bytes as f64, &[]);
         let ratio =
             if self.max_bytes == 0 { 0.0 } else { total_bytes as f64 / self.max_bytes as f64 };
         self.telemetry.gauge(SINK_QUEUE_METRICS.utilization, ratio, &[]);
         self.telemetry.gauge(DISK_SEGMENTS, segment_count as f64, &[]);
+        ratio
+    }
+
+    /// Counts one batch an overflow policy shed, and records it in the full-buffer episode.
+    fn count_overflow(&self, reason: &'static str, events: u64) {
+        self.count_dropped(reason, events);
+        self.watch.dropped(reason, events, Bound::Weight);
+    }
+
+    /// See [`crate::BoundedQueue::finish_full_episode`].
+    pub fn finish_full_episode(&self) {
+        self.watch.finish();
     }
 
     fn count_dropped(&self, reason: &'static str, units: u64) {
@@ -934,12 +974,13 @@ impl DiskQueue {
         usize::try_from(state.queued_records).unwrap_or(usize::MAX)
     }
 
-    fn after_change(&self) {
+    /// Refreshes the gauges and returns the utilization they report.
+    fn after_change(&self) -> f64 {
         let (total_bytes, queued_records, segment_count) = {
             let state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
             (state.total_bytes, state.queued_records, state.segments.len())
         };
-        self.update_gauges(total_bytes, queued_records, segment_count);
+        self.update_gauges(total_bytes, queued_records, segment_count)
     }
 
     fn closed(&self) -> bool {
@@ -988,8 +1029,7 @@ impl DiskQueue {
         let events = batch.events.len() as u64;
 
         let impossible_to_ever_fit = record_len > self.max_bytes;
-        let mut waited = false;
-        let mut blocked_timer: Option<logit_core::telemetry::Timer> = None;
+        let mut waiting: Option<(Waiting<'_>, logit_core::telemetry::Timer)> = None;
         let mut made_room = false;
 
         enum Action {
@@ -1050,7 +1090,7 @@ impl DiskQueue {
             match action {
                 Action::Write => break,
                 Action::DropNewest => {
-                    self.count_dropped("overflow_newest", events);
+                    self.count_overflow("overflow_newest", events);
                     return;
                 }
                 Action::MakeRoom => {
@@ -1069,15 +1109,18 @@ impl DiskQueue {
                     }
                 }
                 Action::Block => {
-                    if !waited {
-                        waited = true;
-                        blocked_timer = Some(self.telemetry.timer(SINK_QUEUE_METRICS.push_blocked));
+                    if waiting.is_none() {
+                        waiting = Some((
+                            self.watch.waiting(Bound::Weight),
+                            self.telemetry.timer(SINK_QUEUE_METRICS.push_blocked),
+                        ));
                     }
-                    notified.await;
+                    self.watch.wait(notified).await;
                 }
             }
         }
-        drop(blocked_timer);
+        // Lowers the blocked gauge and records a timer sample, only if this push waited.
+        drop(waiting);
 
         if let Err(err) = self.write_record(&record).await {
             // Never durably written, so count it dropped, not queued. `disk_full` is the one
@@ -1366,7 +1409,7 @@ impl DiskQueue {
             }
         }
         self.advance_read_cursor(len);
-        self.count_dropped("overflow_oldest", batch.events.len() as u64);
+        self.count_overflow("overflow_oldest", batch.events.len() as u64);
         {
             let mut state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
             state.queued_records = state.queued_records.saturating_sub(1);
@@ -1458,7 +1501,8 @@ impl DiskQueue {
         }
         self.count_dropped("disk_corrupt", 0);
         self.after_cursor_advance();
-        self.after_change();
+        let utilization = self.after_change();
+        self.watch.utilization(utilization);
         self.not_full.notify_one();
         true
     }
@@ -1756,7 +1800,8 @@ impl DiskQueue {
             ((head.batch, head.ctx, head.seq), head.len)
         };
         self.advance_read_cursor(record_len);
-        self.after_change();
+        let utilization = self.after_change();
+        self.watch.utilization(utilization);
         Some(item)
     }
 
@@ -1993,6 +2038,7 @@ pub(crate) mod test_support {
             overflow: OverflowPolicy::Block,
             compression: Compression::None,
             checkpoint_interval: Duration::from_secs(3600),
+            recover_below: crate::queue::DEFAULT_RECOVER_BELOW,
         }
     }
 
@@ -4645,6 +4691,108 @@ mod tests {
         assert_eq!(on_disk_cursor(&dir), Some((2, 0)), "the later cursor landed last");
         drop(scope);
         assert_eq!(drain_all(&q).await, vec!["c"]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+/// The disk spool's full-buffer lines and blocked-push gauge
+/// (`docs/adr/buffer-full-diagnostics.md`).
+#[cfg(test)]
+mod full_buffer_tests {
+    use super::test_support::{batch, config, ctx, raw_record, scratch_dir};
+    use super::*;
+    use crate::buffer_full::fmt_bytes;
+    use crate::buffer_full::test_support::{capture, Lines};
+    use crate::test_util::{TelemetryProbe, RECV_TIMEOUT};
+
+    const BLOCKED: &str = "logit.component.buffer.push.blocked";
+
+    fn messages(lines: &Lines, key: &str) -> Vec<String> {
+        lines.with_key(key).into_iter().map(|(_, message)| message).collect()
+    }
+
+    /// One record per segment, so each commit deletes a segment and `total_bytes` falls a record
+    /// at a time: four records fill a four-record spool.
+    fn four_record_spool(
+        label: &str,
+        overflow: OverflowPolicy,
+        probe: &TelemetryProbe,
+    ) -> (Arc<DiskQueue>, PathBuf, u64) {
+        let dir = scratch_dir(label);
+        let mut cfg = config(dir.clone());
+        let one = raw_record(&batch("a"), ctx()).len() as u64;
+        cfg.segment_bytes = 1;
+        cfg.max_bytes = 4 * one;
+        cfg.overflow = overflow;
+        let telemetry = probe.telemetry("d", "logit_out", "sink");
+        let q = DiskQueue::open(cfg, telemetry, Diagnostics::new("d")).unwrap();
+        (Arc::new(q), dir, 4 * one)
+    }
+
+    /// A blocked push on a full spool raises the gauge and names `disk.max_bytes`; the episode ends
+    /// once commits delete enough segments to fall below 75%, and not at 75%.
+    #[tokio::test]
+    async fn a_full_spool_under_block_logs_names_the_disk_bound_and_recovers_below_the_threshold() {
+        let (lines, _guard) = capture();
+        let mut probe = TelemetryProbe::new();
+        let (q, dir, max_bytes) = four_record_spool("full-block", OverflowPolicy::Block, &probe);
+        for label in ["a", "b", "c", "d"] {
+            q.push((batch(label), ctx())).await;
+        }
+        let q2 = Arc::clone(&q);
+        let blocked = tokio::spawn(async move { q2.push((batch("e"), ctx())).await });
+        probe.wait_for("the blocked gauge at 1", |t| t.gauge(BLOCKED, &[]) == Some(1.0)).await;
+        assert_eq!(
+            messages(&lines, "buffer_full"),
+            [format!(
+                "buffer full (buffer.disk.max_bytes {}); overflow block is holding intake",
+                fmt_bytes(max_bytes)
+            )]
+        );
+
+        q.peek().await.expect("a");
+        q.commit().expect("a");
+        tokio::time::timeout(RECV_TIMEOUT, blocked).await.expect("admitted").unwrap();
+        probe.wait_for("the blocked gauge at 0", |t| t.gauge(BLOCKED, &[]) == Some(0.0)).await;
+
+        q.peek().await.expect("b");
+        q.commit().expect("b");
+        assert!(lines.with_key("buffer_recovered").is_empty(), "3 of 4 records is 0.75");
+        q.peek().await.expect("c");
+        q.commit().expect("c");
+        let recovered = messages(&lines, "buffer_recovered");
+        assert_eq!(recovered.len(), 1, "2 of 4 records is below 0.75");
+        assert!(recovered[0].starts_with("buffer below 75% of its bounds after "), "{recovered:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Under `drop_newest` a full spool logs that it sheds new batches, and the finish at shutdown
+    /// closes the episode with `buffer_full_at_shutdown`.
+    #[tokio::test]
+    async fn a_full_spool_under_drop_newest_logs_shedding_and_ends_at_shutdown() {
+        let (lines, _guard) = capture();
+        let probe = TelemetryProbe::new();
+        let (q, dir, max_bytes) =
+            four_record_spool("full-drop-newest", OverflowPolicy::DropNewest, &probe);
+        for label in ["a", "b", "c", "d", "e", "f"] {
+            q.push((batch(label), ctx())).await;
+        }
+        assert_eq!(
+            messages(&lines, "buffer_full"),
+            [format!(
+                "buffer full (buffer.disk.max_bytes {}); overflow drop_newest is shedding new \
+                 batch(es)",
+                fmt_bytes(max_bytes)
+            )]
+        );
+        q.close();
+        q.finish_full_episode();
+        let ended = messages(&lines, "buffer_full_at_shutdown");
+        assert_eq!(ended.len(), 1);
+        assert!(
+            ended[0].ends_with("overflow drop_newest shed 2 batch(es) (2 event(s))"),
+            "{ended:?}"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }

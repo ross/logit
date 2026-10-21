@@ -5247,6 +5247,7 @@ mod tests {
                     max_batches: 100,
                     max_bytes: u64::MAX,
                     overflow: OverflowPolicy::Block,
+                    recover_below: crate::queue::DEFAULT_RECOVER_BELOW,
                 }),
                 WriteLoopConfig::default(),
             ),
@@ -6586,6 +6587,7 @@ mod tests {
             max_batches: 1,
             max_bytes: u64::MAX,
             overflow: OverflowPolicy::Block,
+            recover_below: crate::queue::DEFAULT_RECOVER_BELOW,
         });
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -6708,6 +6710,7 @@ mod tests {
             overflow: OverflowPolicy::Block,
             compression: logit_proto::frame::Compression::None,
             checkpoint_interval: Duration::from_secs(3600),
+            recover_below: crate::queue::DEFAULT_RECOVER_BELOW,
         });
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -6800,6 +6803,7 @@ mod tests {
                 overflow: OverflowPolicy::Block,
                 compression: logit_proto::frame::Compression::None,
                 checkpoint_interval: Duration::from_secs(3600),
+                recover_below: crate::queue::DEFAULT_RECOVER_BELOW,
             },
             logit_core::Telemetry::default(),
             Diagnostics::new("test"),
@@ -6872,6 +6876,7 @@ mod tests {
             overflow: OverflowPolicy::Block,
             compression: logit_proto::frame::Compression::None,
             checkpoint_interval: Duration::from_secs(3600),
+            recover_below: crate::queue::DEFAULT_RECOVER_BELOW,
         }
     }
 
@@ -7033,6 +7038,7 @@ mod tests {
                             max_batches: 2,
                             max_bytes: u64::MAX,
                             overflow: OverflowPolicy::Block,
+                            recover_below: crate::queue::DEFAULT_RECOVER_BELOW,
                         }),
                         (false, false) => SinkStoreConfig::Memory(SinkQueueConfig::default()),
                     };
@@ -7386,7 +7392,12 @@ mod tests {
         let registry = Registry::new();
         let telemetry = registry.telemetry_for("out", "logit_out", "sink");
         let store = Arc::new(SinkStore::Memory(SinkQueue::new(
-            SinkQueueConfig { max_batches, max_bytes: u64::MAX, overflow: OverflowPolicy::Block },
+            SinkQueueConfig {
+                max_batches,
+                max_bytes: u64::MAX,
+                overflow: OverflowPolicy::Block,
+                recover_below: crate::queue::DEFAULT_RECOVER_BELOW,
+            },
             telemetry.clone(),
         )));
         let producer = async {
@@ -8560,6 +8571,7 @@ mod tests {
                     max_batches: 2,
                     max_bytes: u64::MAX,
                     overflow: OverflowPolicy::Block,
+                    recover_below: crate::queue::DEFAULT_RECOVER_BELOW,
                 }),
                 WriteLoopConfig {
                     shutdown_grace: Duration::from_millis(100),
@@ -8646,6 +8658,7 @@ mod tests {
                 max_batches: 1,
                 max_bytes: u64::MAX,
                 overflow: OverflowPolicy::Block,
+                recover_below: crate::queue::DEFAULT_RECOVER_BELOW,
             }),
             slow_retry_write_config(Duration::from_millis(100)),
             shutdown_rx,
@@ -8946,6 +8959,7 @@ mod tests {
                     max_batches: 100,
                     max_bytes: u64::MAX,
                     overflow: OverflowPolicy::Block,
+                    recover_below: crate::queue::DEFAULT_RECOVER_BELOW,
                 }),
                 WriteLoopConfig::default(),
             ),
@@ -11100,6 +11114,7 @@ mod tests {
                     max_batches: 2,
                     max_bytes: u64::MAX,
                     overflow: OverflowPolicy::Block,
+                    recover_below: crate::queue::DEFAULT_RECOVER_BELOW,
                 }),
                 WriteLoopConfig { shutdown_grace: Duration::from_secs(1), ..Default::default() },
             ),
@@ -11153,6 +11168,7 @@ mod tests {
                 max_batches: 2,
                 max_bytes: u64::MAX,
                 overflow: OverflowPolicy::Block,
+                recover_below: crate::queue::DEFAULT_RECOVER_BELOW,
             }),
             WriteLoopConfig { shutdown_grace: Duration::from_millis(100), ..Default::default() },
         )
@@ -13756,6 +13772,7 @@ mod tests {
                 max_batches,
                 max_bytes: u64::MAX,
                 overflow: OverflowPolicy::Block,
+                recover_below: crate::queue::DEFAULT_RECOVER_BELOW,
             }),
             WriteLoopConfig { shutdown_grace: grace, ..WriteLoopConfig::default() },
         )
