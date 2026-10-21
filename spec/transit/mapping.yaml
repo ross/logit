@@ -58,8 +58,9 @@ rows:
           which datadog_in reads back as a delta monotonic sum.
       graphite_out:
         class: degraded
+        counter: logit.output.metrics.degraded{metric_kind=monotonic_delta_sum}
         text: >-
-          The bare value as a datapoint, its temporality and monotonicity dropped, uncounted, which
+          The bare value as a datapoint, its temporality and monotonicity dropped, which
           graphite_in reads back as a gauge.
   - kind: sum
     feature: delta_nonmonotonic
@@ -94,6 +95,7 @@ rows:
           datadog_in reads back as a monotonic delta sum.
       graphite_out:
         class: degraded
+        counter: logit.output.metrics.degraded{metric_kind=non_monotonic_delta_sum}
         text: The bare value, read back as a gauge, as for a monotonic delta sum.
   - kind: sum
     feature: cumulative_monotonic
@@ -131,7 +133,8 @@ rows:
           makes it a delta `count`.
       graphite_out:
         class: degraded
-        text: The running total as a bare value, read back as a gauge, uncounted.
+        counter: logit.output.metrics.degraded{metric_kind=cumulative_sum}
+        text: The running total as a bare value, read back as a gauge.
   - kind: sum
     feature: cumulative_nonmonotonic
     cells:
@@ -163,7 +166,8 @@ rows:
           datadog_in reads back as a gauge.
       graphite_out:
         class: degraded
-        text: The running total as a bare value, read back as a gauge, uncounted.
+        counter: logit.output.metrics.degraded{metric_kind=cumulative_sum}
+        text: The running total as a bare value, read back as a gauge.
 
   # --- sum: scalar type ------------------------------------------------------------------------
   - kind: sum

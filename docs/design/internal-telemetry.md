@@ -2224,7 +2224,8 @@ table:
   unresolved `GaugeDelta`, `unresolved_gauge_delta`)
 - `logit.output.metrics.skipped{reason|metric_kind}` (a `NO_RECORDED_VALUE` point, or a
   multi-value kind under `multi_value: skip`)
-- `logit.output.metrics.degraded{metric_kind}` (a multi-value kind expanded, once per record)
+- `logit.output.metrics.degraded{metric_kind}` (a multi-value kind expanded, or a `Sum` written as
+  its bare value, once per record)
 - `logit.output.metrics.normalized{reason="path_sanitized"|"tag_sanitized"}`
 - `logit.output.tags.omitted{reason="dialect"|"unrepresentable"|"empty"|"collision"}`
 - `logit.output.tags.normalized{reason="multi_value"}` (lossy; see above)

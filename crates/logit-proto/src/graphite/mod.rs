@@ -80,10 +80,10 @@
 //!
 //! | Row | Class | Reason or counter | What a consumer sees |
 //! |---|---|---|---|
-//! | `sum/delta_monotonic` | degraded | -- | The bare value as a datapoint, its temporality and monotonicity dropped, uncounted, which graphite_in reads back as a gauge. |
-//! | `sum/delta_nonmonotonic` | degraded | -- | The bare value, read back as a gauge, as for a monotonic delta sum. |
-//! | `sum/cumulative_monotonic` | degraded | -- | The running total as a bare value, read back as a gauge, uncounted. |
-//! | `sum/cumulative_nonmonotonic` | degraded | -- | The running total as a bare value, read back as a gauge, uncounted. |
+//! | `sum/delta_monotonic` | degraded | `logit.output.metrics.degraded{metric_kind=monotonic_delta_sum}` | The bare value as a datapoint, its temporality and monotonicity dropped, which graphite_in reads back as a gauge. |
+//! | `sum/delta_nonmonotonic` | degraded | `logit.output.metrics.degraded{metric_kind=non_monotonic_delta_sum}` | The bare value, read back as a gauge, as for a monotonic delta sum. |
+//! | `sum/cumulative_monotonic` | degraded | `logit.output.metrics.degraded{metric_kind=cumulative_sum}` | The running total as a bare value, read back as a gauge. |
+//! | `sum/cumulative_nonmonotonic` | degraded | `logit.output.metrics.degraded{metric_kind=cumulative_sum}` | The running total as a bare value, read back as a gauge. |
 //! | `sum/f64` | exact | -- | The value is written as the shortest float that reads back to the same bits. |
 //! | `sum/i64` | normalized | `f64_value` | Plaintext writes every digit and pickle the nearest `f64`, and graphite_in reads either back as a float, rounded beyond 2^53. |
 //! | `sum/u64` | normalized | `f64_value` | Plaintext writes every digit and pickle the nearest `f64`, and graphite_in reads either back as a float, rounded beyond 2^53. |
@@ -202,7 +202,9 @@
 //!   materializing `base^i` bounds would mint unbounded paths from one record.
 //! - A `Sum`'s bare value can't be misread, since carbon has no opinion on temporality or
 //!   monotonicity, so dropping both is normalization 12 rather than a skip. `otlp_in ->
-//!   graphite_out -> graphite_in` turns a cumulative counter into a gauge.
+//!   graphite_out -> graphite_in` turns a cumulative counter into a gauge. The record counts
+//!   `metrics.degraded` under `statsd_out`'s `metric_kind` tags, plus `monotonic_delta_sum`,
+//!   which `statsd_out` writes exact. Unlike `statsd_out`, `multi_value: skip` still writes it.
 //! - Carbon drops a `NaN` on receipt and whisper can't store an infinity, and substituting zero
 //!   fabricates a reading, so a non-finite value is dropped.
 //! - Carbon has no "no reading this interval" marker: Graphite's "no data" is an absent
@@ -214,6 +216,11 @@
 //! Resource attributes *do* become tags (as at `influxdb_out`/`statsd_out`); a `graphite_in`
 //! resource is empty, so the pair stays a fixed point, and cross-protocol it is a
 //! `docs/known-gaps/mappings.md` row.
+//!
+//! A tagged carbon 1.1.10 replaces a tag named `name` with the metric's path
+//! (`TaggedSeries.parse_carbon`), uncounted. `graphite_out` writes the tag as any other, so to keep
+//! its value, rename or remove the attribute at the source, or ahead of the sink with a `remove` or
+//! `lua` component.
 //!
 //! ## Sanitization
 //!
@@ -286,10 +293,12 @@
 //!    line including the last, a UDP datagram terminates none.
 //! 10. Sanitizer substitutions, empty-tag drops and rendered-name collision drops (all counted).
 //! 11. [`Tags::Drop`] drops the tag set entirely (counted).
-//! 12. A `Sum`'s temporality and monotonicity are dropped; the value goes on the wire bare. A
-//!     **named normalization, not a skip**: unlike `prometheus_out`, which drops a delta `Sum`
-//!     because exposition has a competing cumulative meaning, carbon's wire has no opinion on
-//!     either, so the number is carried faithfully and only the model's extra facts are lost.
+//! 12. A `Sum`'s temporality and monotonicity are dropped; the value goes on the wire bare, counted
+//!     `logit.output.metrics.degraded{metric_kind=…}` once per record. A **named normalization,
+//!     not a skip**: unlike `prometheus_out`, which drops a delta `Sum` because exposition has a
+//!     competing cumulative meaning, carbon's wire has no opinion on either, so the number is
+//!     carried faithfully and only the model's extra facts are lost. `graphite_in` decodes only
+//!     gauges, so the like pair never reaches it.
 //! 13. A pickle sender's spelling (protocol version, opcode choice, memo use) leaves as
 //!     `graphite_out`'s protocol-2 writer spelling. A protocol-0, protocol-1, or protocol-5 sender
 //!     is re-spelled, and no decoded field changes.

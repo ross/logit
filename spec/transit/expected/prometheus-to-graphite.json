@@ -2,10 +2,13 @@
   "counter": {"events": [
     {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"http_requests_total","kind":"gauge","value":3.0}],"attributes":{"code":"200","instance":"transit:9100","method":"post"}},
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"http_requests_total","kind":"gauge","value":1027.0}],"attributes":{"code":"200","instance":"transit:9100","method":"get"}}
-  ], "counters": {}},
+  ], "counters": {
+    "logit.output.metrics.degraded{component=out,kind=graphite_out,metric_kind=cumulative_sum,role=sink}": 2
+  }},
   "exemplars": {"events": [
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"hits_total","kind":"gauge","value":10.0}],"attributes":{"instance":"transit:9100"}}
   ], "counters": {
+    "logit.output.metrics.degraded{component=out,kind=graphite_out,metric_kind=cumulative_sum,role=sink}": 1,
     "logit.output.metrics.skipped{component=out,kind=graphite_out,metric_kind=histogram,role=sink}": 1
   }},
   "gauge": {"events": [
@@ -35,6 +38,7 @@
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"reqs_total","kind":"gauge","value":5.0}],"attributes":{"instance":"transit:9100"}},
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"up","kind":"gauge","value":1.0}],"attributes":{"instance":"transit:9100"}}
   ], "counters": {
+    "logit.output.metrics.degraded{component=out,kind=graphite_out,metric_kind=cumulative_sum,role=sink}": 1,
     "logit.output.metrics.skipped{component=out,kind=graphite_out,metric_kind=histogram,role=sink}": 1
   }},
   "nan-inf": {"events": [], "counters": {
@@ -42,7 +46,9 @@
   }},
   "openmetrics-total-created": {"events": [
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"jobs_total","kind":"gauge","value":42.0}],"attributes":{"instance":"transit:9100"}}
-  ], "counters": {}},
+  ], "counters": {
+    "logit.output.metrics.degraded{component=out,kind=graphite_out,metric_kind=cumulative_sum,role=sink}": 1
+  }},
   "summary": {"events": [], "counters": {
     "logit.output.metrics.skipped{component=out,kind=graphite_out,metric_kind=summary,role=sink}": 1
   }},

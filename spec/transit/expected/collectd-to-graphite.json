@@ -4,6 +4,8 @@
     {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"tail.counter","kind":"gauge","value":1.8446744073709552e19}],"attributes":{"collectd.host":"logit-fixture","collectd.plugin_instance":"nginx","collectd.type_instance":"bytes_wrapped"}},
     {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"tail.counter","kind":"gauge","value":48213.0}],"attributes":{"collectd.host":"logit-fixture","collectd.plugin_instance":"nginx","collectd.type_instance":"requests"}}
   ], "counters": {
+    "logit.output.metrics.degraded{component=out,kind=graphite_out,metric_kind=cumulative_sum,role=sink}": 2,
+    "logit.output.metrics.degraded{component=out,kind=graphite_out,metric_kind=monotonic_delta_sum,role=sink}": 1,
     "logit.output.metrics.skipped{component=out,kind=graphite_out,reason=no_recorded_value,role=sink}": 1
   }},
   "legacy-time": {"events": [
@@ -55,7 +57,9 @@
     {"timestamp":"2026-09-12T18:22:54.000000000Z","metrics":[{"name":"memory.memory","kind":"gauge","value":38146195456.0}],"attributes":{"collectd.host":"logit-fixture","collectd.type_instance":"cached"}},
     {"timestamp":"2026-09-12T18:22:54.000000000Z","metrics":[{"name":"memory.memory","kind":"gauge","value":4311457792.0}],"attributes":{"collectd.host":"logit-fixture","collectd.type_instance":"slab_recl"}},
     {"timestamp":"2026-09-12T18:22:54.000000000Z","metrics":[{"name":"memory.memory","kind":"gauge","value":6011305984.0}],"attributes":{"collectd.host":"logit-fixture","collectd.type_instance":"free"}}
-  ], "counters": {}},
+  ], "counters": {
+    "logit.output.metrics.degraded{component=out,kind=graphite_out,metric_kind=cumulative_sum,role=sink}": 24
+  }},
   "value-lists": {"events": [
     {"timestamp":"2026-09-12T18:22:53.000000000Z","metrics":[{"name":"interface.if_dropped.0","kind":"gauge","value":0.0}],"attributes":{"collectd.host":"logit-fixture","collectd.plugin_instance":"eth0"}},
     {"timestamp":"2026-09-12T18:22:53.000000000Z","metrics":[{"name":"interface.if_dropped.0","kind":"gauge","value":0.0}],"attributes":{"collectd.host":"logit-fixture","collectd.plugin_instance":"lo"}},
@@ -99,5 +103,7 @@
     {"timestamp":"2026-09-12T18:22:54.000000000Z","metrics":[{"name":"memory.memory","kind":"gauge","value":38146195456.0}],"attributes":{"collectd.host":"logit-fixture","collectd.type_instance":"cached"}},
     {"timestamp":"2026-09-12T18:22:54.000000000Z","metrics":[{"name":"memory.memory","kind":"gauge","value":4311457792.0}],"attributes":{"collectd.host":"logit-fixture","collectd.type_instance":"slab_recl"}},
     {"timestamp":"2026-09-12T18:22:54.000000000Z","metrics":[{"name":"memory.memory","kind":"gauge","value":6011305984.0}],"attributes":{"collectd.host":"logit-fixture","collectd.type_instance":"free"}}
-  ], "counters": {}}
+  ], "counters": {
+    "logit.output.metrics.degraded{component=out,kind=graphite_out,metric_kind=cumulative_sum,role=sink}": 24
+  }}
 }

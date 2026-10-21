@@ -711,10 +711,12 @@ Recorded per workstream as each lands.
   normalization 10 isn't exercised by the pair.
 
   Each recorded as the code behaves, none fixed here:
-  - Every `Sum` reads `degraded` with no counter: the bare value reads back as a gauge. The codec
-    calls this normalization 12, "not a skip", and `statsd_out` counts the same degradation for
-    a cumulative or non-monotonic sum. Whether `graphite_out` should count
-    `metrics.degraded{metric_kind=…}` is open.
+  - Every `Sum` read `degraded` with no counter: the bare value reads back as a gauge, which the
+    codec calls normalization 12, "not a skip". Settled in `tgraph/w3`: `graphite_out` counts
+    `metrics.degraded{metric_kind=…}` once per record in `statsd_out`'s vocabulary,
+    `cumulative_sum` and `non_monotonic_delta_sum`, plus `monotonic_delta_sum` for the monotonic
+    delta sum `statsd_out` writes exact. Unlike `statsd_out`, it still writes every sum under
+    `multi_value: skip`.
   - An event with no metrics (a log, a span, or attributes alone) is skipped with no counter or
     diagnostic, only `EncodeStats::skipped_no_metrics`. The log, span, and event rows record it
     as `skipped` or `lost`, uncounted, as `influxdb_out` and `prometheus_out` do; `statsd_out`
@@ -735,4 +737,6 @@ Recorded per workstream as each lands.
     series in one second keep only the later there; the cells say so, and no row counts it.
   - Carbon 1.1.10's `TaggedSeries.parse_carbon` sets `tags['name']` to the path after reading
     the tag segments, so an attribute named `name` is replaced at a tagged carbon, uncounted.
-    `graphite_out` writes it as any other tag. No case carries one.
+    `graphite_out` writes it as any other tag. No case carries one. Settled in `tgraph/w3`:
+    `graphite_out` doesn't guard against it. The operator renames or removes the attribute at the
+    source, or ahead of the sink with a `remove` or `lua` component.

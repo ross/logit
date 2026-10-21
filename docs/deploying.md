@@ -2088,6 +2088,12 @@ one:
   dotted sub-paths tabled in `logit_proto::multi_value`'s module doc (`.count`, `.sum`, `.min`,
   `.max`, `.q0_5`...`.q0_99`, per-bucket counts, and so on), an explicit, named convention counted
   `logit.output.metrics.degraded{metric_kind=...}` once per record.
+- **A counter arrives as a plain number.** Carbon has no counter type, so a `Sum` is written as its
+  bare value under either `multi_value:` setting, and carbon and `graphite_in` read it as a gauge.
+  Each record counts `logit.output.metrics.degraded{metric_kind="cumulative_sum"|"non_monotonic_delta_sum"|"monotonic_delta_sum"}`.
+- **A tag named `name` doesn't reach a tagged carbon.** Carbon 1.1.10 replaces a `name` tag with
+  the metric's path, and `graphite_out` writes the tag unchanged. To keep its value, rename or
+  remove the attribute at the source, or ahead of the sink with a `remove` or `lua` component.
 - **Size and timeout bounds.** `max_packet_bytes:` (UDP only, default `1432`, at most `65507`, the
   largest UDP payload) bounds a datagram, not a single line, like `statsd_out`'s setting. `max_frame_bytes:` (default `1MiB`, Twisted's
   `Int32StringReceiver.MAX_LENGTH`) bounds one pickle frame and applies regardless of transport,

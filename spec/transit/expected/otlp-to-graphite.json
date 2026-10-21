@@ -8,10 +8,13 @@
   "exemplars": {"events": [
     {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"cart.value","kind":"gauge","value":42.5}],"attributes":{"host.name":"web-1","service.name":"checkout"}},
     {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"orders.placed","kind":"gauge","value":118.0}],"attributes":{"host.name":"web-1","service.name":"checkout"}}
-  ], "counters": {}},
+  ], "counters": {
+    "logit.output.metrics.degraded{component=out,kind=graphite_out,metric_kind=cumulative_sum,role=sink}": 1
+  }},
   "exemplars-unwritten": {"events": [
     {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"orders.shipped","kind":"gauge","value":64.0}],"attributes":{"host.name":"web-1","service.name":"checkout"}}
   ], "counters": {
+    "logit.output.metrics.degraded{component=out,kind=graphite_out,metric_kind=cumulative_sum,role=sink}": 1,
     "logit.output.metrics.skipped{component=out,kind=graphite_out,metric_kind=histogram,role=sink}": 1
   }},
   "exponential-histograms": {"events": [], "counters": {
@@ -24,7 +27,9 @@
   ], "counters": {}},
   "gzip": {"events": [
     {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"uploads.completed","kind":"gauge","value":5.0}],"attributes":{"host.name":"web-1","service.name":"checkout"}}
-  ], "counters": {}},
+  ], "counters": {
+    "logit.output.metrics.degraded{component=out,kind=graphite_out,metric_kind=monotonic_delta_sum,role=sink}": 1
+  }},
   "histogram-neg-inf-bound": {"events": [], "counters": {
     "logit.output.metrics.skipped{component=out,kind=graphite_out,metric_kind=histogram,role=sink}": 1
   }},
@@ -55,14 +60,22 @@
     {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"process.cpu.time","kind":"gauge","value":81.25}],"attributes":{"cpu.mode":"user","host.name":"web-1","service.name":"checkout"}},
     {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"process.cpu.time","kind":"gauge","value":9.75}],"attributes":{"cpu.mode":"system","host.name":"web-1","service.name":"checkout"}},
     {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"queue.depth.change","kind":"gauge","value":-3.0}],"attributes":{"host.name":"web-1","queue":"orders","service.name":"checkout"}}
-  ], "counters": {}},
+  ], "counters": {
+    "logit.output.metrics.degraded{component=out,kind=graphite_out,metric_kind=cumulative_sum,role=sink}": 3,
+    "logit.output.metrics.degraded{component=out,kind=graphite_out,metric_kind=monotonic_delta_sum,role=sink}": 1,
+    "logit.output.metrics.degraded{component=out,kind=graphite_out,metric_kind=non_monotonic_delta_sum,role=sink}": 1
+  }},
   "sums-protobuf": {"events": [
     {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"db.client.connections.usage","kind":"gauge","value":7.0}],"attributes":{"host.name":"web-1","pool.name":"primary","service.name":"checkout"}},
     {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"http.server.requests","kind":"gauge","value":12.5}],"attributes":{"host.name":"web-1","http.route":"/cart","service.name":"checkout"}},
     {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"process.cpu.time","kind":"gauge","value":81.25}],"attributes":{"cpu.mode":"user","host.name":"web-1","service.name":"checkout"}},
     {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"process.cpu.time","kind":"gauge","value":9.75}],"attributes":{"cpu.mode":"system","host.name":"web-1","service.name":"checkout"}},
     {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"queue.depth.change","kind":"gauge","value":-3.0}],"attributes":{"host.name":"web-1","queue":"orders","service.name":"checkout"}}
-  ], "counters": {}},
+  ], "counters": {
+    "logit.output.metrics.degraded{component=out,kind=graphite_out,metric_kind=cumulative_sum,role=sink}": 3,
+    "logit.output.metrics.degraded{component=out,kind=graphite_out,metric_kind=monotonic_delta_sum,role=sink}": 1,
+    "logit.output.metrics.degraded{component=out,kind=graphite_out,metric_kind=non_monotonic_delta_sum,role=sink}": 1
+  }},
   "telemetrygen": {"events": [
     {"timestamp":"2026-09-10T21:22:20.000000000Z","metrics":[{"name":"gen","kind":"gauge","value":0.0}],"attributes":{"service.name":"telemetrygen"}},
     {"timestamp":"2026-09-10T21:22:20.000000000Z","metrics":[{"name":"gen","kind":"gauge","value":1.0}],"attributes":{"service.name":"telemetrygen"}},

@@ -1,6 +1,6 @@
-# statsd_in's cases into graphite_out, with nothing between: counters and gauges as bare
-# datapoints, DogStatsD tags as carbon tags, and timers, sets, and summarized kinds skipped
-# under the default `multi_value: skip`.
+# statsd_in's cases into graphite_out, with nothing between: counters and gauges as bare datapoints,
+# each counter counted degraded, DogStatsD tags as carbon tags, and timers, sets, and summarized
+# kinds skipped under the default `multi_value: skip`.
 # `path:` names one case so `logit run` can run this by hand; the transit spec runs every case in
 # that file's directory (spec/transit/README.md).
 components:

@@ -21,8 +21,8 @@ use crate::multi_value::{expand_dotted, DottedScratch};
 use crate::{FramedEncoder, MessageBuf};
 use logit_core::interner::resolve;
 use logit_core::{
-    Diagnostics, Event, EventBatch, MetricKind, MetricRecord, MetricValue, Resource, Telemetry,
-    Value,
+    Diagnostics, Event, EventBatch, MetricKind, MetricRecord, MetricValue, Resource, Sum,
+    Telemetry, Temporality, Value,
 };
 use std::fmt::Write as _;
 use std::ops::Range;
@@ -42,6 +42,9 @@ pub struct EncodeStats {
     /// A multi-value metric kind under [`MultiValue::Expand`], once per **record**, however many
     /// sub-paths it produced.
     pub degraded_expanded_kind: usize,
+    /// A `Sum` written as its bare value, once per record (normalization 12): its temporality
+    /// and monotonicity don't survive, so carbon and `graphite_in` read it as a gauge.
+    pub degraded_sum: usize,
     /// A `Gauge`/`Sum` whose value is NaN or ±inf. Carbon drops a NaN on receipt, and has no
     /// spelling for an infinity.
     pub dropped_unencodable_value: usize,
@@ -290,9 +293,12 @@ impl FramedEncoder for GraphiteEncoder {
 
 /// What a record's kind resolves to before its path is rendered, so a dropped kind never counts a
 /// path sanitization.
+#[derive(Clone, Copy)]
 enum Plan {
     /// One datapoint carrying this value.
     Scalar(MetricValue),
+    /// A `Sum`'s bare value, counted degraded under this `metric_kind` tag once it's written.
+    Sum(MetricValue, &'static str),
     /// Several dotted sub-paths, which [`expand_dotted`] yields.
     Expand,
 }
@@ -320,7 +326,7 @@ fn encode_record(
     // No wildcard, so a new `MetricKind` fails to compile here rather than taking a default.
     let plan = match &record.kind {
         // Every temporality and monotonicity writes the bare value (normalization 12).
-        MetricKind::Sum(sum) => Some(Plan::Scalar(sum.value)),
+        MetricKind::Sum(sum) => Some(Plan::Sum(sum.value, sum_kind_tag(sum))),
         MetricKind::Gauge(v) => Some(Plan::Scalar(*v)),
         MetricKind::GaugeDelta(_) => {
             ctx.drop_gauge_delta();
@@ -339,7 +345,7 @@ fn encode_record(
     // `None` means [`multi`] already counted the drop under `multi_value: skip`.
     let Some(plan) = plan else { return };
 
-    if let Plan::Scalar(value) = plan {
+    if let Plan::Scalar(value) | Plan::Sum(value, _) = plan {
         if !value.is_finite() {
             ctx.drop_unencodable_value(name, value.as_f64());
             return;
@@ -359,9 +365,12 @@ fn encode_record(
     }
 
     match plan {
-        Plan::Scalar(value) => {
+        Plan::Scalar(value) | Plan::Sum(value, _) => {
             if let MetricValue::Bool(_) = value {
                 ctx.value_bool();
+            }
+            if let Plan::Sum(_, metric_kind) = plan {
+                ctx.degrade_sum(metric_kind);
             }
             sink.emit(path, "", tag_suffix, value, seconds, ctx)
         }
@@ -406,6 +415,16 @@ fn metric_kind_tag(kind: &MetricKind) -> &'static str {
         MetricKind::Sum(_) | MetricKind::Gauge(_) | MetricKind::GaugeDelta(_) => {
             unreachable!("a scalar kind never expands")
         }
+    }
+}
+
+/// The `metric_kind` counter tag for a `Sum`, in `statsd_out`'s vocabulary. A monotonic delta
+/// sum is exact at `statsd_out`, so only this sink tags it.
+fn sum_kind_tag(sum: &Sum) -> &'static str {
+    match (sum.temporality, sum.monotonic) {
+        (Temporality::Cumulative, _) => "cumulative_sum",
+        (Temporality::Delta, false) => "non_monotonic_delta_sum",
+        (Temporality::Delta, true) => "monotonic_delta_sum",
     }
 }
 
@@ -766,6 +785,13 @@ impl Ctx<'_> {
         );
     }
 
+    /// No diagnostic: a relayed counter is the ordinary case, so a warning would fire on every
+    /// healthy pipeline. The counter is the signal, as at `statsd_out`.
+    fn degrade_sum(&mut self, metric_kind: &'static str) {
+        self.stats.degraded_sum += 1;
+        self.telemetry.count("logit.output.metrics.degraded", 1.0, &[("metric_kind", metric_kind)]);
+    }
+
     fn drop_gauge_delta(&mut self) {
         self.stats.dropped_gauge_delta += 1;
         self.telemetry.count(
@@ -1006,21 +1032,52 @@ mod tests {
         assert_eq!(stats.datapoints, 1);
     }
 
-    /// Normalization 12: all four `Sum` shapes write the bare value.
+    /// Normalization 12: a `Sum` writes its bare value, counted degraded once per record under
+    /// `metric_kind`.
+    fn assert_sum_degraded(temporality: Temporality, monotonic: bool, metric_kind: &str) {
+        let sum = || MetricKind::Sum(Sum { value: MetricValue::F64(7.0), temporality, monotonic });
+        let (lines, _, stats, registry) =
+            encode_with(&batch(vec![event(sum()), event(sum())]), |e| e);
+        assert_eq!(lines, vec!["sys.cpu 7 1700000000"; 2], "the bare value");
+        assert_eq!(stats.degraded_sum, 2, "once per record");
+        assert_eq!(
+            counted(&registry, "logit.output.metrics.degraded", ("metric_kind", metric_kind)),
+            2.0
+        );
+    }
+
     #[test]
-    fn every_sum_shape_writes_its_bare_value() {
-        for temporality in [Temporality::Delta, Temporality::Cumulative] {
-            for monotonic in [true, false] {
-                let kind =
-                    MetricKind::Sum(Sum { value: MetricValue::F64(7.0), temporality, monotonic });
-                let lines = encode(&batch(vec![event(kind)]));
-                assert_eq!(
-                    lines,
-                    vec!["sys.cpu 7 1700000000"],
-                    "{temporality:?}/{monotonic} must write the bare value"
-                );
-            }
-        }
+    fn a_monotonic_delta_sum_is_counted_degraded() {
+        assert_sum_degraded(Temporality::Delta, true, "monotonic_delta_sum");
+    }
+
+    #[test]
+    fn a_non_monotonic_delta_sum_is_counted_degraded() {
+        assert_sum_degraded(Temporality::Delta, false, "non_monotonic_delta_sum");
+    }
+
+    #[test]
+    fn a_monotonic_cumulative_sum_is_counted_degraded() {
+        assert_sum_degraded(Temporality::Cumulative, true, "cumulative_sum");
+    }
+
+    #[test]
+    fn a_non_monotonic_cumulative_sum_is_counted_degraded() {
+        assert_sum_degraded(Temporality::Cumulative, false, "cumulative_sum");
+    }
+
+    /// A `Sum` dropped before it's written isn't also counted degraded.
+    #[test]
+    fn a_dropped_sum_is_not_counted_degraded() {
+        let kind = MetricKind::Sum(Sum {
+            value: MetricValue::F64(f64::NAN),
+            temporality: Temporality::Delta,
+            monotonic: true,
+        });
+        let (lines, _, stats, _) = encode_with(&batch(vec![event(kind)]), |e| e);
+        assert!(lines.is_empty());
+        assert_eq!(stats.dropped_unencodable_value, 1);
+        assert_eq!(stats.degraded_sum, 0);
     }
 
     /// Normalization 8: Rust's `{}` is the shortest round-trip rendering.

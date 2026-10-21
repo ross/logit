@@ -397,10 +397,10 @@ Entry format and the other areas: [the known-gaps index](README.md).
 
   | Direction | Mapping | Counter | Why |
   |---|---|---|---|
-  | encode (Graphite) | `sum/delta_monotonic` → **degraded** | none | The bare value as a datapoint, its temporality and monotonicity dropped, uncounted, which graphite_in reads back as a gauge. |
-  | encode (Graphite) | `sum/delta_nonmonotonic` → **degraded** | none | The bare value, read back as a gauge, as for a monotonic delta sum. |
-  | encode (Graphite) | `sum/cumulative_monotonic` → **degraded** | none | The running total as a bare value, read back as a gauge, uncounted. |
-  | encode (Graphite) | `sum/cumulative_nonmonotonic` → **degraded** | none | The running total as a bare value, read back as a gauge, uncounted. |
+  | encode (Graphite) | `sum/delta_monotonic` → **degraded** | `logit.output.metrics.degraded{metric_kind=monotonic_delta_sum}` | The bare value as a datapoint, its temporality and monotonicity dropped, which graphite_in reads back as a gauge. |
+  | encode (Graphite) | `sum/delta_nonmonotonic` → **degraded** | `logit.output.metrics.degraded{metric_kind=non_monotonic_delta_sum}` | The bare value, read back as a gauge, as for a monotonic delta sum. |
+  | encode (Graphite) | `sum/cumulative_monotonic` → **degraded** | `logit.output.metrics.degraded{metric_kind=cumulative_sum}` | The running total as a bare value, read back as a gauge. |
+  | encode (Graphite) | `sum/cumulative_nonmonotonic` → **degraded** | `logit.output.metrics.degraded{metric_kind=cumulative_sum}` | The running total as a bare value, read back as a gauge. |
   | encode (Graphite) | `gauge_delta/f64` → **dropped** | `logit.output.metrics.dropped{reason=unresolved_gauge_delta}` | Carbon has no relative gauge, so an unresolved adjustment is dropped, with a throttled `gauge_delta_unresolved` warning; an `aggregate` upstream resolves it into a gauge. |
   | encode (Graphite) | `gauge_delta/i64` → **dropped** | `logit.output.metrics.dropped{reason=unresolved_gauge_delta}` | Dropped, as for a float adjustment. |
   | encode (Graphite) | `gauge_delta/u64` → **dropped** | `logit.output.metrics.dropped{reason=unresolved_gauge_delta}` | Dropped, as for a float adjustment. |
