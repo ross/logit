@@ -1,0 +1,22 @@
+{
+  "name": "nan-bound-min-max",
+  "kind": "explicit",
+  "input": {
+    "bounds": ["NaN", "10"],
+    "counts": [0, 5, 0],
+    "count": 5,
+    "sum": "25",
+    "min": "2",
+    "max": "9"
+  },
+  "outcome": "sketch",
+  "sketch": {
+    "k": [1],
+    "n": [5],
+    "cnt": 5,
+    "sum": "25",
+    "min": "2",
+    "max": "9",
+    "avg": "5"
+  }
+}

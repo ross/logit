@@ -72,7 +72,7 @@ error `MapMetrics` returns that it can't classify, and when the build info lacks
 Cases named `seeded-*` come from a fixed-seed generator in `main.go`; the rest are hand-built for
 one shape each: no buckets, a single bucket, open-ended first and last buckets, `(0, B]` and
 `(A, 0]` buckets, negative bounds, counts above 65535, the observation cap and one past it, a bucket
-range wide enough that `trimLeft` folds bins, non-finite sums, `min` and `max` set and unset, and,
+range wide enough that `trimLeft` folds bins, `NaN` and infinite explicit bounds, non-finite sums, `min` and `max` set and unset, and,
 for exponential histograms, every scale from -10 to 20, negative buckets, a zero bucket, and
 values past the Agent's highest key.
 

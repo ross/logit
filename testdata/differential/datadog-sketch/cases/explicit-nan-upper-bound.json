@@ -1,0 +1,14 @@
+{
+  "name": "nan-upper-bound",
+  "kind": "explicit",
+  "input": {
+    "bounds": ["1", "NaN"],
+    "counts": [0, 5, 0],
+    "count": 5,
+    "sum": "25",
+    "min": null,
+    "max": null
+  },
+  "outcome": "non_monotonic_bounds",
+  "detail": "explicit bucket histogram: non-monotonic boundaries"
+}
