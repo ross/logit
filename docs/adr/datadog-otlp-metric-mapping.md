@@ -240,8 +240,9 @@ nowhere to say what it is. `logit` is pre-release, so the field is a plain addit
   skips a cumulative `Sum`. That stays true through W1; from W2 it drops one, counted, and a
   resent delta `count` point still overwrites at its `(series, timestamp)`.
 - [ADR `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md)'s `datadog_out` bullet gets an
-  amendment in W2, when its condition (a stage that converts a cumulative `Sum`) is met. Its
-  non-monotonic half is resolved in W1, which writes both non-monotonic forms.
+  amendment in two parts: W1 amends its non-monotonic half, since W1 writes both non-monotonic
+  forms, and W2 its cumulative half, once its condition (a stage that converts a cumulative
+  `Sum`) is met.
 
 ## Open questions
 - **Summary temporality (Ross).** Adding `temporality` to `Summary` makes `otlp_out` and

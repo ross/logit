@@ -80,7 +80,9 @@ Non-goals:
   Agent's five `h`/`ms` series, with a new entry for a cumulative kind until W2 lands.
   [`docs/datadog.md`](../datadog.md) gains the OTel-producer topology, and
   [ADR `delivery-semantics`](../adr/delivery-semantics.md)'s item 5 sentence on `datadog_out`'s
-  cumulative `Sum` gets its amendment.
+  cumulative `Sum` gets its amendment. W1 also amends the non-monotonic half of
+  [ADR `telemetry-loss-vocabulary`](../adr/telemetry-loss-vocabulary.md)'s `datadog_out` bullet,
+  which W1 makes stale by writing both non-monotonic forms.
 
 ### W2: summary temporality and `cumulative_to_delta`
 
@@ -101,8 +103,8 @@ Non-goals:
   `metrics.dropped{reason="unresolved_cumulative"}`, and `fields.omitted{reason="unresolved_cumulative"}`
   becomes `fields.dropped{reason="unresolved_cumulative"}`. The transit spec cells and
   `internal-telemetry.md` follow, and
-  [ADR `telemetry-loss-vocabulary`](../adr/telemetry-loss-vocabulary.md)'s `datadog_out` bullet
-  gets an amendment saying the condition it named is met.
+  the vocabulary ADR's `datadog_out` bullet gets an amendment for its cumulative half, saying the
+  condition it named is met (W1 amended the non-monotonic half).
 - **Transit flows.** `otlp_in -> cumulative_to_delta -> datadog_out` over every cumulative case,
   and `prometheus_in -> cumulative_to_delta -> statsd_out`, which turns a scrape's counters into
   `|c` lines where today they leave as `|g`, degraded. A flow for `otlp_out` joins if a delta-only
