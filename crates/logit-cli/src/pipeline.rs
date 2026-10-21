@@ -81,15 +81,16 @@ use logit_proto::graphite::{
 use logit_transforms::{
     AggregateTemporality as TransformTemporality, Aggregator, Arrays as TransformArrays,
     Bucket as BucketTransform, BucketBound, BucketField, CsvParser,
-    Distributions as TransformDistributions, DropAttributes as DropAttributesTransform,
-    DropProvenance as DropProvenanceTransform, DropSignals as DropSignalsTransform,
-    DropStale as DropStaleTransform, Fields as TransformFields, Flatten as FlattenTransform,
+    CumulativeToDelta as CumulativeToDeltaTransform, Distributions as TransformDistributions,
+    DropAttributes as DropAttributesTransform, DropProvenance as DropProvenanceTransform,
+    DropSignals as DropSignalsTransform, DropStale as DropStaleTransform,
+    Fields as TransformFields, Flatten as FlattenTransform,
     HasAttributes as HasAttributesTransform, HasProvenance as HasProvenanceTransform,
     HasSignal as HasSignalTransform, HasStale as HasStaleTransform,
     HttpAccess as HttpAccessTransform, HttpAccessConfig, IdFormat as TraceIdFormatTransform,
-    InvalidUtf8 as TransformInvalidUtf8, JsonParser, Keep as KeepTransform,
-    KeepSignals as KeepSignalsTransform, KeepValues as KeepValuesTransform, Kv as KvTransform,
-    KvMetrics as KvMetricsTransform, LineProtocol as LineProtocolTransform,
+    InitialValue as TransformInitialValue, InvalidUtf8 as TransformInvalidUtf8, JsonParser,
+    Keep as KeepTransform, KeepSignals as KeepSignalsTransform, KeepValues as KeepValuesTransform,
+    Kv as KvTransform, KvMetrics as KvMetricsTransform, LineProtocol as LineProtocolTransform,
     Logfmt as LogfmtTransform, MatchMode as TransformMatchMode, Normalize as TransformNormalize,
     RegexParser, Remove as RemoveTransform, Route as RouteTransform, Sample as SampleTransform,
     Scale as ScaleTransform, Set as SetTransform, Sets as TransformSets, Shape as ShapeTransform,
@@ -1018,6 +1019,17 @@ pub(crate) fn build_spec(
                 .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
                 .with_telemetry(telemetry.clone()),
         )),
+        CumulativeToDelta { initial_value, max_staleness, max_series } => {
+            NodeSpec::Transform(Box::new(
+                CumulativeToDeltaTransform::new(
+                    to_initial_value(*initial_value),
+                    *max_staleness,
+                    *max_series,
+                )
+                .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
+                .with_telemetry(telemetry.clone()),
+            ))
+        }
         Json { skip_to_brace, invalid_utf8 } => NodeSpec::Transform(Box::new(
             JsonParser::new(*skip_to_brace)
                 .with_invalid_utf8(to_invalid_utf8(*invalid_utf8))
@@ -2164,6 +2176,15 @@ fn to_sets(mode: logit_config::Sets) -> TransformSets {
     match mode {
         logit_config::Sets::Estimate => TransformSets::Estimate,
         logit_config::Sets::Members => TransformSets::Members,
+    }
+}
+
+/// `logit_config::InitialValue` -> `logit_transforms::InitialValue`.
+fn to_initial_value(mode: logit_config::InitialValue) -> TransformInitialValue {
+    match mode {
+        logit_config::InitialValue::Auto => TransformInitialValue::Auto,
+        logit_config::InitialValue::Keep => TransformInitialValue::Keep,
+        logit_config::InitialValue::Drop => TransformInitialValue::Drop,
     }
 }
 

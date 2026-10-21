@@ -238,7 +238,7 @@ literal argument string.
 | Kind class | `sources` | May be another component's source |
 |---|---|---|
 | Listener (`statsd_in`, `lines_in`, `collectd_in`, `graphite_in`, `syslog_in`, `otlp_in`, `tail_in`, `docker_in`, `logit_in`, `internal`, `prometheus_in`, `generate_in`, `replay_in`) | must be empty | required (≥1 consumer) |
-| Transform (`lua`, `lua_file`, `aggregate`, `json`, `csv`, `kv_metrics`, `keep`, `remove`, `set`, `trace_context`, `scale`, `has_signal`, `keep_signals`, `drop_signals`, `has_attributes`, `drop_attributes`, `has_provenance`, `drop_provenance`, `has_stale`, `drop_stale`, `keep_values`, `bucket`, `logfmt`, `kv`, `regex`, `shape`, `flatten`, `line_protocol`, `http_access`, `sample`, `timestamp`, `route`, `route_signals`) | ≥1 required | required (≥1 consumer), except `route_signals`, which must have none (rule 92) |
+| Transform (`lua`, `lua_file`, `aggregate`, `json`, `csv`, `kv_metrics`, `keep`, `remove`, `set`, `trace_context`, `scale`, `has_signal`, `keep_signals`, `drop_signals`, `has_attributes`, `drop_attributes`, `has_provenance`, `drop_provenance`, `has_stale`, `drop_stale`, `cumulative_to_delta`, `keep_values`, `bucket`, `logfmt`, `kv`, `regex`, `shape`, `flatten`, `line_protocol`, `http_access`, `sample`, `timestamp`, `route`, `route_signals`) | ≥1 required | required (≥1 consumer), except `route_signals`, which must have none (rule 92) |
 | Sink (`influxdb_out`, `stdio_out`, `file_out`, `otlp_out`, `datadog_out`, `datadog_trace_out`, `splunk_hec_out`, `kafka_out`, `syslog_out`, `logit_out`, `statsd_out`, `collectd_out`, `graphite_out`, `prometheus_out`, `null_out`) | ≥1 required | must not be |
 | Target (`target`) | must be empty | required (≥1 consumer), and ≥1 directing router (rule 49) |
 
@@ -486,6 +486,7 @@ silently ignored. `0` for a count or duration bound is usually impossible, not s
     doesn't ask it for a consumer), one with no `signals:` entry set or an empty target id, or,
     under `strip: false`, a component whose `sources:` lists two of its targets.
 93. A `replay_in` with an empty `path` or a `batch` of `0`.
+94. A `cumulative_to_delta` with a `max_staleness` of `0s` or a `max_series` of `0`.
 
 **Deliberately not validated:** that a `by: {provenance: ..}` route key names a component in *this*
 graph — rule 37's reasoning; the key is as likely to name a component relayed from another process.

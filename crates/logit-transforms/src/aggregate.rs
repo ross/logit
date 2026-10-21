@@ -1532,7 +1532,7 @@ impl Hash for SeriesKey {
 /// metric carrying it; and it judges `-0.0` equal to `0.0`, which series identity keeps apart.
 ///
 /// `Arc::ptr_eq` first: an input that reuses one `Arc<Resource>` skips the field walk.
-fn resource_key_eq(a: &Arc<Resource>, b: &Arc<Resource>) -> bool {
+pub(crate) fn resource_key_eq(a: &Arc<Resource>, b: &Arc<Resource>) -> bool {
     Arc::ptr_eq(a, b)
         || (a.schema_url == b.schema_url
             && a.dropped_attributes_count == b.dropped_attributes_count
@@ -1545,7 +1545,7 @@ fn resource_key_eq(a: &Arc<Resource>, b: &Arc<Resource>) -> bool {
 ///
 /// `Arc::ptr_eq` first: events from one batch share one `Arc<Scope>`, so the common case skips
 /// the field walk.
-fn scope_key_eq(a: &Option<Arc<Scope>>, b: &Option<Arc<Scope>>) -> bool {
+pub(crate) fn scope_key_eq(a: &Option<Arc<Scope>>, b: &Option<Arc<Scope>>) -> bool {
     match (a, b) {
         (None, None) => true,
         (Some(a), Some(b)) => {
@@ -1564,7 +1564,7 @@ fn scope_key_eq(a: &Option<Arc<Scope>>, b: &Option<Arc<Scope>>) -> bool {
 /// compare, with floats by bit pattern, so key-equal pairs hash equal. A fresh
 /// `DefaultHasher::new()` has fixed keys, so a stored hash and a lookup hash agree within the
 /// process.
-fn group_hash(resource: &Resource, scope: &Option<Arc<Scope>>) -> u64 {
+pub(crate) fn group_hash(resource: &Resource, scope: &Option<Arc<Scope>>) -> u64 {
     let mut state = DefaultHasher::new();
     resource.schema_url.hash(&mut state);
     resource.dropped_attributes_count.hash(&mut state);
@@ -1585,7 +1585,7 @@ fn group_hash(resource: &Resource, scope: &Option<Arc<Scope>>) -> u64 {
 
 /// The length first, so the resource's attributes can't run into the scope fields after them.
 /// `AttrMap::iter()` yields `Symbol` order, so insertion order doesn't change the hash.
-fn hash_attr_map<H: Hasher>(map: &AttrMap, state: &mut H) {
+pub(crate) fn hash_attr_map<H: Hasher>(map: &AttrMap, state: &mut H) {
     map.len().hash(state);
     for (k, v) in map.iter() {
         k.hash(state);
@@ -1596,12 +1596,12 @@ fn hash_attr_map<H: Hasher>(map: &AttrMap, state: &mut H) {
 /// `AttrMap` equality with bitwise floats, for [`resource_key_eq`] and [`scope_key_eq`].
 /// `AttrMap::iter()` yields `Symbol` order, so a length check plus a zipped walk is
 /// order-independent.
-fn attr_map_key_eq(a: &AttrMap, b: &AttrMap) -> bool {
+pub(crate) fn attr_map_key_eq(a: &AttrMap, b: &AttrMap) -> bool {
     a.len() == b.len()
         && a.iter().zip(b.iter()).all(|((k1, v1), (k2, v2))| k1 == k2 && value_key_eq(v1, v2))
 }
 
-fn value_key_eq(a: &Value, b: &Value) -> bool {
+pub(crate) fn value_key_eq(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::Null, Value::Null) => true,
         (Value::Bool(a), Value::Bool(b)) => a == b,
@@ -1624,7 +1624,7 @@ fn value_key_eq(a: &Value, b: &Value) -> bool {
     }
 }
 
-fn hash_value<H: Hasher>(v: &Value, state: &mut H) {
+pub(crate) fn hash_value<H: Hasher>(v: &Value, state: &mut H) {
     // A variant tag first, so an empty `Array` and an empty `Map` don't collide.
     match v {
         Value::Null => 0u8.hash(state),
