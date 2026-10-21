@@ -260,8 +260,9 @@
 //! may store it twice; a disk-buffered batch replayed after a restart resends every request. A
 //! trial org was sent two resends: a resent series point was stored once, the last write winning
 //! at its `(series, timestamp)`, and an identical log was stored twice. The upstream `aggregate`
-//! `temporality: cumulative` remedy doesn't apply here: the series route skips a cumulative
-//! monotonic `Sum`, since a Datadog `count` carries a per-interval value. Every series point,
+//! `temporality: cumulative` remedy doesn't apply here: a Datadog `count` carries a per-interval
+//! value, so the series route drops a cumulative monotonic `Sum`, and a `cumulative_to_delta`
+//! upstream is what makes one sendable. Every series point,
 //! a histogram's `.bucket` counts and a summary's quantiles included, overwrites. Distribution
 //! points, sketches (a delta histogram's included), and APM stats have no remedy and are assumed
 //! to add on a resend, and events, checks, and traces to be stored again, until measured. `buffer.delivery: at_most_once` drops the batch instead.
@@ -2455,7 +2456,7 @@ mod tests {
     const SERIES: &str = "/api/v2/series";
     const LOGS: &str = "/api/v2/logs";
 
-    /// A cumulative monotonic sum, which the series codec skips and counts.
+    /// A cumulative monotonic sum, which the series codec drops and counts.
     fn cumulative_sum(ts: i64) -> Event {
         let sum = Sum {
             value: logit_core::MetricValue::F64(1.0),

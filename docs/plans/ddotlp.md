@@ -187,8 +187,9 @@ Recorded per workstream as each lands.
     says, and also `max_series: 0`, which could convert nothing.
   - **Names the ADR didn't give.** The `initial_value` enum is `logit_config::InitialValue`, and
     the transform's throttled diagnostics are `max_series_full`, `layout_changed`, and
-    `non_finite_sum`. `otlp_out` and `prometheus_out` report a dropped delta summary under the
-    existing `delta_temporality_unresolved` key, with a message naming `cumulative_to_delta`.
+    `non_finite_sum`. `otlp_out` and `prometheus_out` report a dropped delta summary under its own
+    `delta_summary_unresolved` key, since `delta_temporality_unresolved`'s advice, an `aggregate`,
+    can't help a summary.
   - **The transit flows run `initial_value: keep`.** The driver runs each case alone, so under
     `auto` every first point would only seed a baseline and the flows would show nothing; the
     driver reads the wall clock through the transform, which is deterministic here because every

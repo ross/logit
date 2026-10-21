@@ -128,9 +128,7 @@ impl StatsIn {
 /// A metric record an encoder didn't send.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum MetricOut {
-    /// A kind the series route doesn't write: a cumulative form it skips until a stage
-    /// differences it (`cumulative_sum`, `histogram`, `exponential_histogram`), or one it has no
-    /// form for (`set_members`).
+    /// A kind no Datadog route has a form for (`set_members`).
     Kind(&'static str),
     /// A relative gauge nothing upstream resolved to an absolute value.
     GaugeDelta,

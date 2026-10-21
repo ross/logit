@@ -832,7 +832,7 @@ rows:
         counter: logit.output.metrics.dropped{reason=unresolved_delta}
         text: >-
           A Prometheus summary is a running total, so a delta one, which only
-          `cumulative_to_delta` makes, is dropped, with a throttled `delta_temporality_unresolved`
+          `cumulative_to_delta` makes, is dropped, with a throttled `delta_summary_unresolved`
           warning; send this sink the summary from ahead of that component.
       influxdb_out:
         class: degraded
@@ -845,7 +845,7 @@ rows:
         counter: logit.output.metrics.dropped{reason=unresolved_delta}
         text: >-
           OTLP defines every summary as cumulative, so a delta one is dropped, with a throttled
-          `delta_temporality_unresolved` warning.
+          `delta_summary_unresolved` warning.
       datadog_out:
         class: degraded
         text: >-

@@ -34,7 +34,10 @@
 //! **Bounds.** A series no accepted point has touched for longer than `max_staleness`, by the
 //! wall clock, is evicted at the next batch; a new series past `max_series` evicts the least
 //! recently touched one. Both orders come from one update-ordered queue with lazily discarded
-//! entries, so a steady-state point allocates nothing.
+//! entries, so a steady-state point allocates nothing. Under `auto`, an evicted series that
+//! `auto` would let through keeps its last start and timestamp in a record of at most
+//! `max_series` entries, oldest out first, so its next point re-sends its total only after a
+//! restart (the ADR's "Staleness and the series bound").
 //!
 //! **Telemetry** is the ADR's "Telemetry" table, tallied per batch and emitted in `end_batch`
 //! when nonzero. The runtime counts `logit.component.events.discarded` for an event this left
@@ -283,6 +286,13 @@ pub struct CumulativeToDelta {
     /// `(seq, slot)` in update order; an entry whose seq isn't its series' is stale.
     queue: VecDeque<(u64, usize)>,
     next_seq: u64,
+    /// Under `InitialValue::Auto`, the last `(start, ts)` of each evicted series that would pass
+    /// `auto`, by key hash, with the sequence of its `evicted_order` entry. Without it, such a
+    /// series' next point passes `auto` again and re-sends its whole total.
+    evicted: HashMap<u64, (i64, i64, u64)>,
+    /// `(seq, hash)` in eviction order, capped at `max_series` live entries; an entry whose seq
+    /// isn't its hash's in `evicted` is stale.
+    evicted_order: VecDeque<(u64, u64)>,
     /// An exponential histogram side's delta, built before the baseline is overwritten.
     scratch: Vec<u64>,
     tally: Tally,
@@ -308,6 +318,8 @@ impl CumulativeToDelta {
             index: HashMap::new(),
             queue: VecDeque::new(),
             next_seq: 0,
+            evicted: HashMap::new(),
+            evicted_order: VecDeque::new(),
             scratch: Vec::new(),
             tally: Tally::default(),
             telemetry: Telemetry::default(),
@@ -349,7 +361,7 @@ impl CumulativeToDelta {
                         break;
                     }
                     self.queue.pop_front();
-                    self.remove(slot);
+                    self.evict(slot);
                     self.tally.evicted_idle += 1;
                 }
                 _ => {
@@ -420,6 +432,37 @@ impl CumulativeToDelta {
         self.live -= 1;
     }
 
+    /// [`Self::remove`], keeping the series' last point in `evicted` when `auto` would let its
+    /// next point through: the series began after this component started.
+    fn evict(&mut self, slot: usize) {
+        let s = self.series[slot].as_ref().expect("evicting a live slot");
+        let (hash, start, ts) = (s.hash, s.start, s.ts);
+        self.remove(slot);
+        if self.initial != InitialValue::Auto || !self.passes_auto(start, ts) {
+            return;
+        }
+        self.next_seq += 1;
+        self.evicted.insert(hash, (start, ts, self.next_seq));
+        self.evicted_order.push_back((self.next_seq, hash));
+        while self.evicted.len() > self.max_series {
+            let Some((seq, hash)) = self.evicted_order.pop_front() else { break };
+            if self.evicted.get(&hash).is_some_and(|e| e.2 == seq) {
+                self.evicted.remove(&hash);
+            }
+        }
+        // Entries a re-inserted series left behind are stale; compact when they dominate.
+        if self.evicted_order.len() > 2 * self.evicted.len() + 64 {
+            let evicted = &self.evicted;
+            self.evicted_order.retain(|(seq, hash)| evicted.get(hash).is_some_and(|e| e.2 == *seq));
+        }
+    }
+
+    /// `InitialValue::Auto`'s test: a nonzero start, at or after this component started, and
+    /// unequal to the point's own timestamp.
+    fn passes_auto(&self, start: i64, ts: i64) -> bool {
+        start != 0 && start >= self.started && start != ts
+    }
+
     /// Moves `slot` to the back of the update order.
     fn touch(&mut self, slot: usize, now: i64) {
         self.next_seq += 1;
@@ -439,7 +482,7 @@ impl CumulativeToDelta {
         if self.live >= self.max_series {
             while let Some((seq, slot)) = self.queue.pop_front() {
                 if self.series[slot].as_ref().is_some_and(|s| s.seq == seq) {
-                    self.remove(slot);
+                    self.evict(slot);
                     self.tally.evicted_cardinality += 1;
                     self.diag.warn_throttled(
                         "max_series_full",
@@ -496,7 +539,12 @@ impl CumulativeToDelta {
             let emit = match self.initial {
                 InitialValue::Keep => true,
                 InitialValue::Drop => false,
-                InitialValue::Auto => start != 0 && start >= self.started && start != ts,
+                // A series this component evicted already sent its total up to its last point,
+                // so it emits in full only after a restart, rule 3's test against that point.
+                InitialValue::Auto => match self.evicted.remove(&hash) {
+                    Some((_, last_ts, _)) => start != 0 && start > last_ts && start != ts,
+                    None => self.passes_auto(start, ts),
+                },
             };
             let key = Key {
                 resource: resource.clone(),
@@ -567,9 +615,16 @@ impl CumulativeToDelta {
         true
     }
 
-    /// A first or reset point: its whole value, as a delta.
+    /// A first or reset point: its whole value, as a delta, with no non-finite sum.
     fn emit_full(&mut self, record: &mut MetricRecord, kind: Kind) {
         set_delta(&mut record.kind);
+        match &mut record.kind {
+            MetricKind::Histogram(h) => h.sum = finite(h.sum),
+            MetricKind::ExponentialHistogram(e) => e.sum = finite(e.sum),
+            // `Summary::sum` has no absent form.
+            MetricKind::Summary(s) if !s.sum.is_finite() => s.sum = f64::NAN,
+            _ => {}
+        }
         self.tally.converted[kind as usize] += 1;
     }
 }
@@ -1375,6 +1430,23 @@ mod tests {
 
     // ---- Bounds ---------------------------------------------------------------------------------
 
+    /// The record of evicted series holds at most `max_series` entries; one pushed out returns
+    /// its series to first-point handling.
+    #[test]
+    fn the_eviction_record_is_capped_at_max_series() {
+        let mut rig = Rig::bounded(InitialValue::Auto, Duration::from_secs(3600), 1);
+        let named = |name: &str, ts: i64, v: f64| {
+            let mut e = event(ts, T0, cum(v));
+            e.attributes.insert("series", name);
+            e
+        };
+        rig.one(named("a", T0 + S, 1.0));
+        rig.one(named("b", T0 + S, 1.0));
+        rig.one(named("c", T0 + S, 1.0));
+        assert_eq!(rig.t.evicted.len(), 1, "only `b`'s record is left");
+        assert!(rig.one(named("a", T0 + 2 * S, 2.0)).is_some(), "`a` is a first point again");
+    }
+
     /// A series not updated for longer than `max_staleness` by the wall clock is evicted, and
     /// its next point is a first point.
     #[test]
@@ -1388,6 +1460,70 @@ mod tests {
         assert!(rig.one(event(T0 + 3 * S, T0, cum(12.0))).is_none(), "a first point again");
         assert_eq!(rig.sum("logit.transform.series.evicted", &[("reason", "idle")]), 1.0);
         assert_eq!(rig.sum("logit.transform.metrics.skipped", &[("reason", "initial")]), 2.0);
+    }
+
+    /// Under `auto`, an idle-evicted series that began after the component started doesn't re-send
+    /// its total: its next point seeds a baseline unless it restarted after its last one.
+    #[test]
+    fn auto_doesnt_resend_an_idle_evicted_series_total() {
+        let mut rig = Rig::bounded(InitialValue::Auto, Duration::from_secs(60), 10);
+        assert!(rig.one(event(T0 + S, T0, cum(10.0))).is_some(), "began while watching");
+        rig.clock.store(T0 + 200 * S, Ordering::SeqCst);
+        assert!(rig.one(event(T0 + 200 * S, T0, cum(50.0))).is_none(), "seeds, no total");
+        assert_eq!(rig.sum("logit.transform.series.evicted", &[("reason", "idle")]), 1.0);
+        let rec = rig.one(event(T0 + 201 * S, T0, cum(55.0))).expect("differenced");
+        assert_eq!(sum_of(&rec).0, MetricValue::F64(5.0));
+        // Evicted again, then restarted after its last point: the new total is all new.
+        rig.clock.store(T0 + 400 * S, Ordering::SeqCst);
+        let rec = rig.one(event(T0 + 400 * S, T0 + 300 * S, cum(4.0))).expect("restarted");
+        assert_eq!(sum_of(&rec).0, MetricValue::F64(4.0));
+    }
+
+    /// The same for a series pushed out by `max_series`.
+    #[test]
+    fn auto_doesnt_resend_a_cardinality_evicted_series_total() {
+        let mut rig = Rig::bounded(InitialValue::Auto, Duration::from_secs(3600), 1);
+        let named = |name: &str, ts: i64, v: f64| {
+            let mut e = event(ts, T0, cum(v));
+            e.attributes.insert("series", name);
+            e
+        };
+        assert!(rig.one(named("a", T0 + S, 10.0)).is_some());
+        assert!(rig.one(named("b", T0 + S, 3.0)).is_some(), "evicts `a`");
+        assert!(rig.one(named("a", T0 + 2 * S, 12.0)).is_none(), "`a` seeds, evicting `b`");
+        assert!(rig.one(named("b", T0 + 2 * S, 4.0)).is_none(), "`b` seeds");
+        assert_eq!(rig.sum("logit.transform.series.evicted", &[("reason", "cardinality")]), 3.0);
+    }
+
+    /// A series first seen after an eviction still emits its first total: the eviction record
+    /// covers only the series evicted.
+    #[test]
+    fn a_new_series_after_an_eviction_still_emits_its_first_total() {
+        let mut rig = Rig::bounded(InitialValue::Auto, Duration::from_secs(60), 10);
+        rig.one(event(T0 + 2 * S, T0 + S, cum(10.0)));
+        rig.clock.store(T0 + 200 * S, Ordering::SeqCst);
+        let mut other = event(T0 + 200 * S, T0 + S, cum(30.0));
+        other.attributes.insert("series", "new");
+        let rec = rig.one(other).expect("a new series that began while watching");
+        assert_eq!(sum_of(&rec).0, MetricValue::F64(30.0));
+        assert_eq!(rig.sum("logit.transform.series.evicted", &[("reason", "idle")]), 1.0);
+    }
+
+    /// A first point emitted in full drops a non-finite sum, as a difference does.
+    #[test]
+    fn a_first_point_emitted_in_full_has_no_non_finite_sum() {
+        let mut rig = Rig::new(InitialValue::Keep);
+        let rec = rig.one(event(T0 + S, T0, hist(&[(f64::INFINITY, 2)], Some(f64::NAN), 1.0, 2.0)));
+        assert_eq!(hist_of(rec.as_ref().expect("keep emits")).sum, None);
+        let mut nan_exp = exp(0, (0, 0.0), (0, &[1]), 1);
+        if let MetricKind::ExponentialHistogram(e) = &mut nan_exp {
+            e.sum = Some(f64::INFINITY);
+        }
+        let rec = rig.one(event(T0 + S, T0, nan_exp));
+        assert_eq!(exp_of(rec.as_ref().expect("keep emits")).sum, None);
+        let rec = rig.one(event(T0 + S, T0, summary(2, f64::INFINITY))).expect("keep emits");
+        let MetricKind::Summary(s) = &rec.kind else { panic!("expected a Summary") };
+        assert!(s.sum.is_nan());
     }
 
     /// A new series past `max_series` evicts the least recently updated one.

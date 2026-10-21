@@ -116,7 +116,7 @@
 //! | `exponential_histogram/delta`, otherwise | skipped | `logit.output.metrics.skipped{metric_kind=exponential_histogram}` | Neither exposition dialect has native-histogram syntax, so none is written. |
 //! | `exponential_histogram/cumulative`, with `bind:` unset | dropped | `logit.output.metrics.dropped{reason=native_histogram}` | Dropped, as for a delta one. |
 //! | `exponential_histogram/cumulative`, otherwise | skipped | `logit.output.metrics.skipped{metric_kind=exponential_histogram}` | Neither exposition dialect has native-histogram syntax, so none is written. |
-//! | `summary/delta` | dropped | `logit.output.metrics.dropped{reason=unresolved_delta}` | A Prometheus summary is a running total, so a delta one, which only `cumulative_to_delta` makes, is dropped, with a throttled `delta_temporality_unresolved` warning; send this sink the summary from ahead of that component. |
+//! | `summary/delta` | dropped | `logit.output.metrics.dropped{reason=unresolved_delta}` | A Prometheus summary is a running total, so a delta one, which only `cumulative_to_delta` makes, is dropped, with a throttled `delta_summary_unresolved` warning; send this sink the summary from ahead of that component. |
 //! | `summary/cumulative` | exact | -- | A `summary` family of its quantiles, `_sum`, and `_count`. |
 //! | `record/no_recorded_value`, with `bind:` unset | exact | -- | Remote-write writes a flagged `Gauge` or cumulative `Sum` as Prometheus's stale marker, read back flagged; a flagged non-monotonic `Sum`'s goes on a `gauge`, as its value would. |
 //! | `record/no_recorded_value`, otherwise | skipped | `logit.output.metrics.skipped{reason=no_recorded_value}` | A point flagged as holding no recorded value isn't exposed. |
@@ -605,7 +605,8 @@ pub(crate) enum NotEncoded {
     /// An `ExponentialHistogram` bound for remote-write, which carries native histograms this
     /// codec doesn't map yet.
     NativeHistogram,
-    /// A delta `Sum` or `Histogram` with no cumulative `aggregate` upstream.
+    /// A delta `Sum` or `Histogram` with no cumulative `aggregate` upstream, or a delta
+    /// `Summary`, which only `cumulative_to_delta` makes.
     UnresolvedDelta,
     /// A `GaugeDelta` with no `aggregate` upstream.
     UnresolvedGaugeDelta,
@@ -1269,11 +1270,12 @@ fn warn_delta(encoder: &mut PrometheusEncoder, name: &str) {
     );
 }
 
-/// [`warn_delta`]'s key for a delta `Summary`, whose fix differs: `aggregate` doesn't make a
-/// summary cumulative, and only `cumulative_to_delta` makes one delta.
+/// A delta `Summary`'s diagnostic, under its own key because its fix differs from
+/// [`warn_delta`]'s: `aggregate` doesn't make a summary cumulative, and only
+/// `cumulative_to_delta` makes one delta.
 fn warn_delta_summary(encoder: &mut PrometheusEncoder, name: &str) {
     encoder.diagnostics.warn_throttled(
-        "delta_temporality_unresolved",
+        "delta_summary_unresolved",
         format_args!(
             "metric '{name}' is a delta summary, which Prometheus cannot express -- route the \
              summary to this output from ahead of the `cumulative_to_delta` component"
@@ -1877,11 +1879,7 @@ mod tests {
             encode_counted(&Resource::default(), &event_with(&[], record("m", kind)));
         assert!(families.is_empty());
         assert!(counted(&registry, "logit.output.metrics.dropped", ("reason", "unresolved_delta")));
-        assert!(counted(
-            &diag,
-            "logit.component.diagnostics",
-            ("key", "delta_temporality_unresolved")
-        ));
+        assert!(counted(&diag, "logit.component.diagnostics", ("key", "delta_summary_unresolved")));
     }
 
     #[test]

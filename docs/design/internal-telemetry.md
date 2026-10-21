@@ -2263,7 +2263,7 @@ under one component id, as for `collectd_out`. The sink adds only what a socket 
   `logit.output.metrics.dropped{reason="unresolved_gauge_delta"}` for a relative gauge no
   `aggregate` resolved, with the shared `gauge_delta_unresolved` diagnostic, and
   `logit.output.metrics.dropped{reason="unresolved_delta"}` for a delta `Summary`, which OTLP
-  defines no form for, with a `delta_temporality_unresolved` diagnostic.
+  defines no form for, with a `delta_summary_unresolved` diagnostic.
 
 There's no `logit.output.request.duration`; layer 2's `logit.component.send.duration` times each
 attempt. The class table above says which of this sink's counters count once per batch and which
@@ -2522,8 +2522,9 @@ Some reasons exist only on one path:
   as a stale marker rather than skipped. Only a flagged `Histogram`/`Summary`/sketch, kinds that
   expand to several derived series, still counts.
 
-`Diagnostics` keys: `delta_temporality_unresolved` (both delta arms, naming the `aggregate` with
-`temporality: cumulative` fix); the shared `gauge_delta_unresolved` key `influxdb_out`/`statsd_out`
+`Diagnostics` keys: `delta_temporality_unresolved` (a delta `Sum` or `Histogram`, naming the
+`aggregate` with `temporality: cumulative` fix); `delta_summary_unresolved` (a delta `Summary`,
+naming the `cumulative_to_delta` it came through); the shared `gauge_delta_unresolved` key `influxdb_out`/`statsd_out`
 use; `prometheus_exponential_histogram_skipped`; `prometheus_accept_failed` from the
 registry-mode listener's accept loop; and `remote_write_rejected`, one per non-2xx answer in
 sender mode (`crates/logit-outputs/src/prometheus.rs`'s module doc, "Faults, retries and duplicate
