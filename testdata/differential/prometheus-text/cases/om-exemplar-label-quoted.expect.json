@@ -1,0 +1,13 @@
+{
+ "divergence": "a quoted UTF-8 exemplar label name: the line is dropped `malformed_line` (docs/known-gaps/mappings.md: Prometheus 3's quoted UTF-8 names)",
+ "divergent": [
+  [
+   "c_total",
+   []
+  ]
+ ],
+ "result": "ok",
+ "skips": {
+  "malformed_line": 1
+ }
+}

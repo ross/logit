@@ -138,6 +138,7 @@
 //! | [`Series::timestamp`] is `None` | the series is **dropped**, `logit.output.metrics.dropped{reason="no_timestamp"}`. The wire has no way to omit a timestamp, so a caller on this path runs the encoder with [`super::PrometheusEncoder::with_timestamps_always`]`(true)` and never produces one |
 //! | a label with an empty value, or named `__name__`/`le`/`quantile` where the codec generates that name itself | the label is omitted, `logit.output.labels.omitted{reason="empty_value"\|"reserved"}` -- both specs forbid an empty value, and a repeated name is an invalid label set rather than a confusing one |
 //! | an exemplar on a family with no `_total`/`_bucket` series (a gauge, an `info`, a `stateset`, a summary), or one whose value is `NaN` and so falls in no bucket | dropped, `logit.output.metrics.degraded{reason="exemplar_omitted"}` -- the same rule and the same counter the OpenMetrics writer uses |
+//! | two exemplar attribute keys sanitizing onto one label name, or one onto `trace_id`/`span_id` beside the exemplar's trace | the one whose original key sorts first is written, the rest omitted, `logit.output.labels.omitted{reason="collision"\|"reserved"}` -- the OpenMetrics writer's rule, since both build the pairs in [`text::exemplar_labels`] |
 //! | a family with an empty name | **dropped**, `logit.output.metrics.dropped{reason="invalid_labels"}`; `__name__` may not be empty |
 //! | two readings of one series whose nanosecond timestamps truncate to the same millisecond | the **later** reading wins and the earlier is dropped, `logit.output.metrics.degraded{reason="sub_ms_collapsed"}` per dropped reading. One label set may not carry two samples at one timestamp -- Prometheus and Mimir answer `400 duplicate sample for timestamp` and the sender treats that as permanent, so emitting both would cost the whole request rather than the one reading |
 //! | a counter's family name in 1.0's `MetricMetadata` | its value sample's name, `_total` included, whatever the model name: decode gives a counter that name either way, so this keeps a re-encode a fixed point |
@@ -1179,8 +1180,12 @@ fn bound(value: f64) -> String {
 }
 
 fn exemplar_out(exemplar: &Exemplar, encoder: &PrometheusEncoder) -> ExemplarOut {
+    let (labels, omitted) = text::exemplar_labels(exemplar);
+    for reason in omitted {
+        encoder.label_omitted(reason);
+    }
     ExemplarOut {
-        labels: text::exemplar_labels(exemplar),
+        labels,
         value: encoder.scalar(exemplar.value),
         timestamp_ms: exemplar.timestamp / 1_000_000,
     }

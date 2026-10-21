@@ -104,8 +104,7 @@ Where a sink's outcome depends on the record's kind, the kind is in the feature'
 `gauge`, `no_recorded_value_delta_sum` a flagged delta `sum`, `exemplars_on_summary` a
 summary's exemplars, `unit_on_distribution` a `samples` or `distribution` record's unit, and
 `exemplar_key_unsafe` and `exemplar_key_unsafe_histogram` a monotonic `sum` and a `histogram`
-whose written exemplar has an attribute key `prometheus_out` would have to rewrite as a label
-name, the only sink that writes an exemplar's keys under a name rule. Some
+whose written exemplar has an attribute key `prometheus_out` sanitizes into a label name, the only sink that writes an exemplar's keys under a name rule. Some
 rows name a shape one sink treats apart, and every sink that compares the record reaches them: `record/sample_rate` (a
 `samples` record whose rate rounds to a weight above 1) and `record/sample_rate_unweighted` (a
 rate below 1 that rounds to weight 1), `span/no_wire_form` (a span field a Datadog span has no

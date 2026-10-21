@@ -6,10 +6,9 @@
     "logit.output.labels.omitted{component=out,kind=prometheus_out,reason=unrepresentable,role=sink}": 2
   }},
   "exemplars": {"events": [
-    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"cart_value","kind":"gauge","value":42.5}],"attributes":{"host_name":"web-1","service_name":"checkout"}}
+    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"cart_value","kind":"gauge","value":42.5}],"attributes":{"host_name":"web-1","service_name":"checkout"}},
+    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"orders_placed_total","kind":"sum","value":118.0,"temporality":"cumulative","monotonic":true,"start_timestamp":"2027-01-15T07:58:50.000000000Z","exemplars":[{"timestamp":"2027-01-15T07:59:47.000000000Z","value":1.0,"trace_id":"5b8efff798038103d269b633813fc60c","span_id":"eee19b7ec3c1b174","trace_flags":0,"attributes":{"customer_tier":"gold"}}]}],"attributes":{"host_name":"web-1","service_name":"checkout"}}
   ], "counters": {
-    "logit.input.metrics.dropped{component=transit.decode,kind=prometheus_in,reason=incomplete_series,role=listener}": 1,
-    "logit.input.metrics.dropped{component=transit.decode,kind=prometheus_in,reason=malformed_line,role=listener}": 1,
     "logit.output.metrics.degraded{component=out,kind=prometheus_out,reason=exemplar_omitted,role=sink}": 1,
     "logit.output.metrics.degraded{component=out,kind=prometheus_out,reason=unit_not_suffix,role=sink}": 2
   }},
@@ -34,9 +33,8 @@
     "logit.output.metrics.dropped{component=out,kind=prometheus_out,reason=unresolved_delta,role=sink}": 1
   }},
   "histograms": {"events": [
-    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"db_client_operation_duration","kind":"histogram","temporality":"cumulative","buckets":[{"bound":10.0,"count":4},{"bound":"inf","count":6}],"sum":420.0,"start_timestamp":"2027-01-15T07:58:50.000000000Z"}],"attributes":{"db_system":"postgresql","host_name":"web-1","service_name":"checkout"}}
+    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"db_client_operation_duration","kind":"histogram","temporality":"cumulative","buckets":[{"bound":10.0,"count":4},{"bound":100.0,"count":5},{"bound":"inf","count":1}],"sum":420.0,"start_timestamp":"2027-01-15T07:58:50.000000000Z","exemplars":[{"timestamp":"2027-01-15T07:59:46.000000000Z","value":37.5,"attributes":{"db_operation_name":"SELECT"}}]}],"attributes":{"db_system":"postgresql","host_name":"web-1","service_name":"checkout"}}
   ], "counters": {
-    "logit.input.metrics.dropped{component=transit.decode,kind=prometheus_in,reason=malformed_line,role=listener}": 1,
     "logit.output.metrics.degraded{component=out,kind=prometheus_out,reason=unit_not_suffix,role=sink}": 1,
     "logit.output.metrics.dropped{component=out,kind=prometheus_out,reason=unresolved_delta,role=sink}": 1
   }},
