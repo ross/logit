@@ -272,7 +272,6 @@ use logit_core::{
     MetricValue, Resource, Sum, Summary, Telemetry, Temporality, Value,
 };
 use std::borrow::Cow;
-use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// The wire family type the model has no distinct kind for (`untyped`, `unknown`, `info`,
@@ -390,8 +389,8 @@ impl FamilyType {
 pub enum Point {
     Counter(f64),
     Gauge(f64),
-    /// `buckets` is cumulative and ends with a `(f64::INFINITY, total)` entry; `count` is that
-    /// total restated (the `_count`/`_gcount` sample), never an independent number -- see the
+    /// `buckets` is cumulative, in ascending bound order with no `NaN` bound and no bound twice,
+    /// and ends with a `(f64::INFINITY, total)` entry; `count` is that total restated (the `_count`/`_gcount` sample), never an independent number -- see the
     /// module doc's normalization list.
     Histogram {
         buckets: Vec<(f64, u64)>,
@@ -1268,22 +1267,35 @@ fn sketch_summary(sketch: &DdSketch) -> Point {
 }
 
 /// [`logit_core::Histogram`]'s per-bucket counts → the cumulative `le` counts both dialects carry,
-/// plus the total. Bounds are sorted ascending first (the model doesn't promise an order) and a
-/// `+Inf` bucket is appended when the highest bound isn't `+Inf` -- every conforming exposition has
-/// one, and the total has to live somewhere.
+/// plus the total, with one entry per distinct bound and `+Inf` last. Bounds are sorted ascending
+/// first, because the model doesn't promise an order and `otlp_in` keeps the wire's. A `NaN` bound
+/// has no place in that order, so it gets no entry, and its count reaches only `+Inf` and the total.
+/// `-Inf` is an ordinary bound and sorts first. Equal bounds merge into one entry. A `+Inf` entry
+/// is appended when no bucket has that bound: every conforming exposition has one, and the total
+/// has to live somewhere.
+///
+/// The sort is [`f64::total_cmp`], a total order once `NaN` is out. A comparator that isn't one
+/// can leave bounds out of order, and `sort_by` may panic on it.
 pub(crate) fn cumulative_counts(buckets: &[(f64, u64)]) -> (Vec<(f64, u64)>, u64) {
-    let mut sorted: Vec<(f64, u64)> = buckets.to_vec();
-    sorted.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
-    let mut out = Vec::with_capacity(sorted.len() + 1);
+    let mut sorted: Vec<(f64, u64)> =
+        buckets.iter().copied().filter(|(b, _)| !b.is_nan()).collect();
+    sorted.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let total = buckets.iter().fold(0u64, |acc, (_, count)| acc.saturating_add(*count));
+    let mut out: Vec<(f64, u64)> = Vec::with_capacity(sorted.len() + 1);
     let mut running = 0u64;
     for (bound, count) in sorted {
         running = running.saturating_add(count);
-        out.push((bound, running));
+        match out.last_mut() {
+            // `==` rather than the sort's order, so `-0.0` and `0.0` merge as well.
+            Some(last) if last.0 == bound => *last = (bound, running),
+            _ => out.push((bound, running)),
+        }
     }
-    if out.last().is_none_or(|(bound, _)| *bound != f64::INFINITY) {
-        out.push((f64::INFINITY, running));
+    match out.last_mut() {
+        Some(last) if last.0 == f64::INFINITY => last.1 = total,
+        _ => out.push((f64::INFINITY, total)),
     }
-    (out, running)
+    (out, total)
 }
 
 /// Resource attributes merged with event attributes (event wins on a collision), private `_logit.*`
@@ -1941,6 +1953,60 @@ mod tests {
                 buckets: vec![(1.0, 2), (5.0, 5), (f64::INFINITY, 5)],
                 sum: None,
                 count: 5,
+            }
+        );
+    }
+
+    /// More than 20 buckets in a shuffled order, one with a `NaN` bound: past 20 elements `sort_by`
+    /// may panic on a comparator that isn't a total order, and one that reads `NaN` as equal to
+    /// everything leaves bounds out of order. The `NaN` bucket's count reaches only `+Inf`.
+    #[test]
+    fn cumulative_counts_sorts_many_shuffled_bounds_around_a_nan() {
+        // 7 is coprime to 24, so `i * 7 % 24` visits every bound once, out of order.
+        let mut buckets: Vec<(f64, u64)> =
+            (0..24u64).map(|i| ((i * 7 % 24 + 1) as f64, i * 7 % 24 + 1)).collect();
+        buckets.insert(11, (f64::NAN, 1000));
+        let (out, total) = cumulative_counts(&buckets);
+        let mut expected: Vec<(f64, u64)> =
+            (1..=24u64).map(|bound| (bound as f64, bound * (bound + 1) / 2)).collect();
+        expected.push((f64::INFINITY, 300 + 1000));
+        assert_eq!(out, expected);
+        assert_eq!(total, 1300);
+    }
+
+    /// `-Inf` sorts first, a `NaN` has no entry, and a repeated `+Inf` bound is one entry, last,
+    /// holding the total.
+    #[test]
+    fn cumulative_counts_keeps_neg_inf_first_and_writes_one_inf_entry() {
+        let buckets = [
+            (f64::INFINITY, 1),
+            (2.0, 1),
+            (f64::NAN, 5),
+            (f64::NEG_INFINITY, 1),
+            (f64::INFINITY, 3),
+        ];
+        let (out, total) = cumulative_counts(&buckets);
+        assert_eq!(out, vec![(f64::NEG_INFINITY, 1), (2.0, 2), (f64::INFINITY, 11)]);
+        assert_eq!(total, 11);
+    }
+
+    /// An out-of-order histogram with a `NaN` bound encodes sorted, with no entry for the `NaN`
+    /// and its count in `+Inf` and `_count`.
+    #[test]
+    fn a_histogram_with_an_out_of_order_nan_bound_encodes_sorted_without_it() {
+        let kind = MetricKind::Histogram(Histogram {
+            buckets: vec![(5.0, 2), (f64::NAN, 4), (1.0, 1), (f64::INFINITY, 1)],
+            temporality: Temporality::Cumulative,
+            sum: None,
+            min: None,
+            max: None,
+        });
+        assert_eq!(
+            encode_kind(kind)[0].series[0].point,
+            Point::Histogram {
+                buckets: vec![(1.0, 1), (5.0, 3), (f64::INFINITY, 8)],
+                sum: None,
+                count: 8,
             }
         );
     }

@@ -59,7 +59,7 @@
 //!
 //! | Kind | Objects |
 //! |---|---|
-//! | `Histogram` | `<n>_sum` (when `Some`) and `<n>_count` (Σ counts), `metric_type` `Histogram`; one object per cumulative bucket with `<n>_bucket` and an `le` dimension (`+Inf` last, appended when the highest bound is finite) |
+//! | `Histogram` | `<n>_sum` (when `Some`) and `<n>_count` (Σ counts), `metric_type` `Histogram`; one object per cumulative bucket with `<n>_bucket` and an `le` dimension, in ascending bound order (`+Inf` last, appended when the highest bound is finite); a `NaN` bound has no object, and its count reaches `+Inf` and `_count` |
 //! | `Summary` | `<n>_sum` and `<n>_count`, `metric_type` `Summary`; one object per quantile with `<n>_<q>` and a `qt` dimension |
 //! | `Samples` | `<n>_count` and `<n>_sum` (each value weighted by its inverse sample rate), `<n>_min`, `<n>_max` when non-empty, `metric_type` `Summary` |
 //! | `Distribution` | `<n>_count`, `<n>_sum`, then `<n>_p50`, `<n>_p90`, `<n>_p99` each when the sketch answers it finitely, `metric_type` `Summary` |
@@ -771,6 +771,31 @@ mod tests {
                 }),
             ),
         ]
+    }
+
+    /// A `NaN` bound gets no `le` object, the bounds around it still sort, and its count reaches
+    /// `_count` and `le="+Inf"`.
+    #[test]
+    fn expand_leaves_an_out_of_order_nan_bound_out_of_the_buckets() {
+        let registry = Registry::new();
+        let mut enc = encoder(&registry).with_multi_value(MultiValue::Expand);
+        let kind = MetricKind::Histogram(Histogram {
+            buckets: vec![(1.0, 2), (f64::NAN, 4), (0.5, 1)],
+            temporality: Temporality::Cumulative,
+            sum: None,
+            min: None,
+            max: None,
+        });
+        let objects = objects_of(&mut enc, &metric_batch(vec![("hist", kind)], &[]));
+        assert_eq!(
+            objects,
+            vec![
+                r#"{"time":0,"event":"metric","fields":{"metric_type":"Histogram","metric_name:hist_count":7.0}}"#.to_string(),
+                r#"{"time":0,"event":"metric","fields":{"le":"0.5","metric_type":"Histogram","metric_name:hist_bucket":1.0}}"#.to_string(),
+                r#"{"time":0,"event":"metric","fields":{"le":"1","metric_type":"Histogram","metric_name:hist_bucket":3.0}}"#.to_string(),
+                r#"{"time":0,"event":"metric","fields":{"le":"+Inf","metric_type":"Histogram","metric_name:hist_bucket":7.0}}"#.to_string(),
+            ]
+        );
     }
 
     #[test]
