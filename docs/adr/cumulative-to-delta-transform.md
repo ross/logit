@@ -1,0 +1,256 @@
+---
+created: 2026-10-20
+updated: 2026-10-20
+---
+
+# `cumulative_to_delta`: a stateful transform that turns cumulative sums, histograms, and summaries into deltas
+
+## Status
+Accepted. Not yet built: [`docs/plans/ddotlp.md`](../plans/ddotlp.md)'s W2 builds it.
+
+## Context
+Several destinations take only delta temporality for an accumulating metric, and `logit` has no
+stage that produces one from a running total:
+
+- **Datadog.** Datadog's OTLP exporter and the Agent's OTLP ingest difference a cumulative
+  monotonic `Sum` and a cumulative `Histogram` inside the translator, keeping per-series state
+  ([ADR `datadog-otlp-metric-mapping`](datadog-otlp-metric-mapping.md)). `datadog_out` stays
+  stateless, so it needs the conversion upstream.
+- **Dynatrace and New Relic.** Dynatrace rejects a cumulative monotonic `Sum` and doesn't ingest
+  a cumulative `Histogram`, and New Relic's OTLP path drops its cumulative state after 5 minutes
+  without data ([`docs/plans/dynatrace-relay.md`](../plans/dynatrace-relay.md)'s "2. One runtime
+  dependency", [`docs/plans/newrelic-relay.md`](../plans/newrelic-relay.md)).
+- **`statsd_out` and `otlp_out`.** `statsd_out` writes a cumulative `Sum` as a `|g` line, counted
+  degraded, and `otlp_out` relays a cumulative point unchanged to a backend that may want delta.
+
+The producers are common: every `prometheus_in` scrape, OTel SDKs on their default cumulative
+temporality, and `internal -> aggregate (temporality: cumulative)`. `aggregate` goes the other way
+only: its cumulative mode turns deltas into running totals, and it passes an incoming cumulative
+record through untouched
+([ADR `aggregation-window-semantics`](aggregation-window-semantics.md)).
+
+Two implementations of the conversion exist to copy from, and they disagree in places:
+
+- **The Datadog translator**
+  (`datadog-agent/pkg/opentelemetry-mapping-go/otlp/metrics`, `ttlcache.go` and
+  `default_mapper.go`): one cache keyed by the point's dimensions without its start time, a
+  3,600 s TTL refreshed on each accepted point, a point no newer than the cached one dropped, a
+  reset read from a changed start time, a start time equal to the timestamp, or a decrease, and
+  `sums.initial_cumulative_monotonic_value: auto | keep | drop` for the first value.
+- **The Collector's `cumulativetodelta` processor**
+  (`opentelemetry-collector-contrib/processor/cumulativetodeltaprocessor`): a key that includes
+  the start time, so a changed start time is a new stream; no timestamp ordering check at all;
+  every reset point dropped and the baseline replaced; a bucket-layout change dropped as
+  `bucket_mismatch`; exponential histograms converted, scale changes included; `max_staleness`
+  (1 h) judged on the point's timestamp; `initial_value: auto | keep | drop`; and no bound on the
+  number of series.
+
+[Verified behavior](#verified-behavior) has the pinned commits and the code each fact comes from.
+
+## Decision
+**A new native transform, `cumulative_to_delta`, keeps the last point of each cumulative series
+and replaces each later point with its difference from that one.** An operator places it where a
+destination needs deltas. Its rules follow the Datadog translator where the two precedents
+differ, except where noted below with the reason.
+
+### What it converts
+
+| Input | Output |
+|---|---|
+| cumulative monotonic `Sum` | delta monotonic `Sum` of the difference |
+| cumulative `Histogram` | delta `Histogram`: each bucket count, the count, and the sum differenced |
+| cumulative `ExponentialHistogram` | delta `ExponentialHistogram`, aligned by absolute bucket index, as the Collector processor does |
+| `Summary` (cumulative by OTLP's definition) | delta `Summary`: `count` and `sum` differenced, quantiles unchanged |
+| every other record: a `Gauge`, any delta record, a cumulative non-monotonic `Sum`, `Samples`, `Distribution`, `SetMembers`, `Set`, `GaugeDelta`, a record flagged `NO_RECORDED_VALUE` | passed through untouched, with no state |
+
+- **A cumulative non-monotonic `Sum` passes through.** It's an up-down counter whose level is the
+  reading: Datadog's translator sends it as a gauge, Dynatrace and New Relic ingest it as one, and
+  the Collector processor skips it. Differencing it would throw the level away.
+- **A `Summary` needs a temporality.** `logit_core::Summary` gains a `temporality` field, and every
+  decoder sets it to `Cumulative`, so this transform can say its output is a delta.
+  [ADR `datadog-otlp-metric-mapping`](datadog-otlp-metric-mapping.md)'s "Summary temporality" has
+  the model change and what it costs each sink. The quantiles stay as the producer computed them:
+  a quantile isn't additive and can't be differenced. Datadog's translator differences a
+  summary's `count` and `sum` the same way and sends the quantiles as they are.
+- **The output's `start_timestamp` is the previous point's timestamp**, and its timestamp is
+  unchanged, as the Collector processor writes a delta. A first point emitted in full keeps its
+  own `start_timestamp`.
+- **A delta `Histogram` or `ExponentialHistogram` keeps a `min` or `max` only where it's exact.**
+  A cumulative `min` is the lowest value since the series started. When it's lower than the
+  previous point's, the new low was observed in this interval, so it's this delta's `min`;
+  otherwise this interval's `min` is unknown and the field is cleared. `max` is the mirror image.
+  This is the Datadog translator's "min from the last time window" rule
+  (`hasMinFromLastTimeWindow`); the Collector processor clears both fields always. A first or
+  reset point emitted in full keeps both, since its interval is the series' whole life.
+- **A non-finite `sum` leaves the delta with no `sum`, and the baseline keeps the last finite
+  one,** so the next finite point differences correctly. The Collector processor writes `0`;
+  `Histogram.sum` is an `Option`, so the honest value is absent. A non-finite `Sum` value is
+  dropped and counted, and the baseline is unchanged.
+
+### The series key
+
+A series is the metric name, unit, kind and monotonicity, the batch's resource attributes, its
+scope (name, version, and attributes), and the record's event attributes. The start time is not
+in the key: it's stored with the baseline and compared, as the Datadog translator does.
+
+With the start time in the key, as the Collector processor has it, a producer restart creates a
+second series and leaves the old one's state in memory until it goes stale, and nothing ever
+reads it as a reset. Keeping the start time in the value replaces the state at the restart and
+lets the reset rules below see it.
+
+### First point, resets, and ordering
+
+Each point, in batch order, takes the first rule that applies:
+
+1. **No tracked series:** a first point. `initial_value` decides it:
+   - `auto` (the default) emits the full value as the delta when the point has a nonzero
+     `start_timestamp` that is at or after the component started and differs from the point's
+     timestamp: the series began while this component was running, so its whole total is new.
+     Otherwise it records the baseline and emits nothing. Both precedents use this rule.
+   - `keep` always emits the full value.
+   - `drop` never does.
+
+   The name and values are the Collector processor's `initial_value`; the Datadog exporter calls
+   the same setting `sums.initial_cumulative_monotonic_value`.
+2. **A timestamp at or before the tracked one:** skipped, and the baseline is unchanged. An equal
+   timestamp is a resent point; an earlier one was overtaken by a later total that already
+   includes it. Neither carries anything new. This is the Datadog translator's rule for a
+   monotonic sum, applied to every kind. The Collector processor has no ordering check, so it
+   differences a resent point to zero and an older one into a false reset.
+3. **A reset:** the `start_timestamp` changed (and is nonzero), equals the point's timestamp, or
+   the value went down (a `Sum`'s value, or a histogram's or summary's count, or any bucket
+   count). The point's full value is emitted as the delta, whatever `initial_value` says, and
+   becomes the baseline. The series restarted after a point this component saw, so everything
+   in the new total accrued while it watched, and emitting it double-counts nothing.
+4. **A layout change with no reset:** a `Histogram` whose bounds differ from the baseline's, or
+   an `ExponentialHistogram` whose scale went up or whose zero threshold went down. Nothing says
+   the counts restarted, so the full value could repeat counts already sent, and the difference
+   has no meaning. The point is dropped and counted, and becomes the baseline. An
+   `ExponentialHistogram` whose scale went down, or whose zero threshold went up, is not a layout
+   change: the baseline is downscaled, or its low buckets folded into its zero count, and then
+   differenced, as the Collector processor does.
+5. **Otherwise:** the difference is emitted, and the point becomes the baseline.
+
+Rule 3 departs from both precedents. The Collector processor drops every reset point, and the
+Datadog translator applies `initial_value` to it, so under `auto` it drops the reset point of a
+series with no start time, which is every Prometheus text-format counter. Both lose the counts
+between the restart and the first point after it, which no later point can recover. A counter
+restarts from zero, so its new value is that increment.
+
+The Datadog translator emits a first or reset value only for the first point of a data-point
+slice (`i == 0`, with a source comment asking why). `logit` has no data-point slice: each record
+is judged alone.
+
+### Staleness and the series bound
+
+- **`max_staleness`** (default `1h`, the default of both precedents) evicts a series not updated
+  for that long, by the wall clock. The Collector processor judges staleness by the point's own
+  timestamp, which evicts a replayed backlog's series as fast as it arrives. `0s` is rejected:
+  every series stays until the bound below evicts it, so set `max_staleness` above the longest
+  gap between a producer's reports.
+- **`max_series`** (default `10000`, `aggregate`'s `max_retained_series` default) caps the table;
+  a new series past it evicts the least recently updated one. Neither precedent has a bound, but a
+  misconfigured producer that puts a request id in an attribute would otherwise grow the table
+  without limit
+  ([ADR `deployment-threat-model`](deployment-threat-model.md)).
+
+An evicted series' next point is a first point, so under `auto` it records a baseline and emits
+nothing: the counts since its last point are lost. A nonzero cardinality eviction count means
+`max_series` is too small for the traffic.
+
+### Telemetry
+
+Every name follows [ADR `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md):
+
+| Name | Meaning |
+|---|---|
+| `logit.transform.metrics.converted{metric_kind}` | records replaced by a delta, a full first or reset value included |
+| `logit.transform.metrics.skipped{reason="initial"}` | a first point that only recorded its baseline, as `initial_value` asked |
+| `logit.transform.metrics.skipped{reason="duplicate" \| "out_of_order"}` | a point timestamped at, or before, the tracked one |
+| `logit.transform.metrics.dropped{reason="layout_changed"}` | rule 4: the counts since the previous point are lost |
+| `logit.transform.metrics.dropped{reason="non_finite"}` | a `Sum` whose value is NaN or infinite |
+| `logit.transform.series.reset{cause="start_changed" \| "start_equals_time" \| "decrease"}` | rule 3's resets, the first matching cause |
+| `logit.transform.series.evicted{reason="idle" \| "cardinality"}` | `max_staleness` and `max_series` evictions, `aggregate`'s names |
+| `logit.transform.series.tracked` (gauge) | series in the table |
+| `logit.component.events.discarded` | an event left with no metric, log, or span once its skipped and dropped records are removed |
+
+A seeded first point is `skipped`, not `dropped`: the operator chose `initial_value`, and the
+default matches both precedents. A record removed from an event that keeps other payloads is
+counted only by the reason above.
+
+### Placement and other rules
+
+- **`aggregate`** passes a cumulative record through, so the order of the two matters only for
+  what the window does. `cumulative_to_delta` ahead of `aggregate` lets the window fold the
+  deltas into one point per window; behind it, it converts what `aggregate`'s
+  `temporality: cumulative` produced, which only makes sense when another sink on the same
+  `aggregate` needs the running totals.
+- **Lossless transit.** The transform discards the running total, the series' start time, and a
+  lifetime `min` or `max`. [ADR `lossless-transit`](lossless-transit.md)'s "Summarization is
+  opt-in and named" rule permits that from a component whose stated purpose it is, placed by the
+  operator and named in the graph. No codec converts temporality, which is why `datadog_out`
+  stays stateless.
+- **Delivery semantics.** Upstream of the transform, a cumulative point is idempotent: a resent
+  point has the same timestamp and rule 2 skips it. Downstream, a delta is not: a resend
+  double-counts at a destination that adds what it receives. This transform undoes the remedy
+  [ADR `delivery-semantics`](delivery-semantics.md)'s item 5 gives a delta `Sum` (make it
+  cumulative upstream), so the destination has to absorb the duplicate itself. A Datadog series `count` point overwrites at its `(series, timestamp)` (measured), so
+  `datadog_out`'s count route is safe; a sketch, an OTLP delta backend, and a statsd line aren't
+  known to be.
+- **State is in memory.** A restart loses it, so each series' first point after the restart is a
+  first point: under `auto` a series that started before the restart records a baseline and
+  emits nothing, and the counts between the last point before the restart and the first after it
+  are lost. Under `keep` the first point after the restart re-sends the series' whole total. The
+  Datadog exporter and the Collector processor behave the same way.
+
+## Alternatives considered
+- **Convert inside each sink, as Datadog's translator does.** Every delta-only sink would carry
+  its own copy of the state, the reset rules, and the bounds, and a sink's encoder would stop
+  being a pure function of its batch. One transform serves `datadog_out`, the Dynatrace and New
+  Relic sinks, `statsd_out`, and `otlp_out`.
+- **Copy the Collector processor whole.** Its start-time key leaks the state of every restarted
+  series until it goes stale, it has no ordering check (a resend becomes a false reset), and
+  dropping every reset point loses the post-restart counts of a series with no start time.
+- **Copy the Datadog translator whole.** Its `i == 0` rule has no meaning without data-point
+  slices, it applies `initial_value` to resets, it doesn't convert an exponential histogram, and
+  it has no series bound.
+- **Convert a cumulative non-monotonic `Sum` too.** Every surveyed destination reads it as a
+  gauge, and the difference of a level isn't a useful metric.
+- **Include and exclude lists by metric name, as the Collector processor has.** `logit` selects
+  events with routing and filter components; nothing yet needs selection by metric name inside
+  this one.
+- **Emit the summary's `count` and `sum` as separate `Sum` records instead of a delta `Summary`.**
+  That avoids the model change, but it makes the transform split a metric into a sink's shape,
+  which is `datadog_out`'s choice of rendering, not a temporality conversion.
+
+## Consequences
+- `logit_core::Summary` gains `temporality`, and every sink that writes a summary has to decide
+  what a delta one means; [ADR `datadog-otlp-metric-mapping`](datadog-otlp-metric-mapping.md)
+  records each.
+- The transform holds a table of up to `max_series` baselines, one histogram's buckets each at
+  most; [`docs/design/memory.md`](../design/memory.md) gets its row when it lands.
+- Losses on restart, eviction, and a layout change are inherent in the conversion, and are
+  counted. Persisting the table across a restart is not decided.
+- The Dynatrace and New Relic plans' delta requirement points here.
+
+## Verified behavior
+Read from source on 2026-10-20; nothing was built or run.
+
+- **Datadog translator:** `DataDog/datadog-agent` at `45132452b8555c0b0df112e3bd48e39284873e03`,
+  `pkg/opentelemetry-mapping-go/otlp/metrics/`. `ttlcache.go`'s `putAndGetMonotonic` drops a
+  point whose timestamp is at or before the cached one (`cnt.ts >= ts`) and reads a reset from
+  `!isNotFirstPoint(startTs, ts, cnt.startTs) || dx < 0`; `isNotFirstPoint` treats a zero start
+  as no reset. `metrics_translator.go`'s `shouldConsumeInitialValue` implements `auto` as
+  process start before `startTs`, and `startTs != ts`; `default_mapper.go` gates the first value
+  on `i == 0`. Its `Diff` for a histogram's count and sum accepts an equal timestamp.
+- **Collector processor:** `open-telemetry/opentelemetry-collector-contrib` at
+  `314dfba96505e27754f439a92478b274d2ab2a19`, `processor/cumulativetodeltaprocessor/`.
+  `internal/tracking/identity.go`'s `Write` puts `StartTimestamp` in the key. `tracker.go`'s
+  `Convert` applies `auto` as `metricID.StartTimestamp < t.startTime ||
+  metricPoint.ObservedTimestamp == metricID.StartTimestamp` (seed, emit nothing), drops a reset
+  point and replaces the baseline, and compares no timestamps; its sweeper evicts states whose
+  last point's timestamp is older than `max_staleness`. `processor.go` converts only cumulative
+  monotonic sums, histograms, and exponential histograms, clears `min` and `max`, and counts
+  `cumulativetodelta_datapoints_dropped{reason="reset" | "initial" | "bucket_mismatch"}`.
+  `tracker.go`'s comment on the reason constants says a histogram reset passes the full value
+  through; the code drops it, as `processor_telemetry_test.go` expects.

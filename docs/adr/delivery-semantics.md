@@ -1,6 +1,6 @@
 ---
 created: 2026-09-29
-updated: 2026-10-18
+updated: 2026-10-20
 ---
 
 # Delivery semantics: at-least-once per hop, duplicates absorbed by the data model, and an effectively-once native hop
@@ -592,3 +592,13 @@ lets a mark resume commit the frame as delivered; `docs/known-gaps/native-hop.md
 `logit.output.metrics.dropped{reason="unresolved_delta"}`, where the remedy list above says it
 skips one ([ADR `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md)). The remedy is
 unchanged: an `aggregate` with `temporality: cumulative` upstream.
+
+## Amendment (2026-10-20): `datadog_out` drops a cumulative `Sum`, and `cumulative_to_delta` undoes the delta remedy
+
+[ADR `datadog-otlp-metric-mapping`](datadog-otlp-metric-mapping.md) has `datadog_out` count a
+cumulative monotonic `Sum` as loss, `logit.output.metrics.dropped{reason="unresolved_cumulative"}`,
+where item 5 says its series route skips one. The new `cumulative_to_delta` transform
+([ADR `cumulative-to-delta-transform`](cumulative-to-delta-transform.md)) is its remedy, and
+runs item 5's remedy in reverse: upstream of it a resent cumulative point is skipped as a
+duplicate, and downstream a resent delta adds at a destination that sums what it receives. A
+Datadog series `count` point still overwrites at its `(series, timestamp)`.
