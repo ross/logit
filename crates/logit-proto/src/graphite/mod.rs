@@ -149,9 +149,9 @@
 //! | `attributes/string_value`, under `tags: drop` | lost | `logit.output.tags.omitted{reason=dialect}` | Under `tags: drop`, no tag is written, counted once per attribute, so series that differ only in their tags write one path. |
 //! | `attributes/string_value`, otherwise | normalized | `tag_sanitized`; `logit.output.metrics.normalized{reason=tag_sanitized}` | A `;name=value` tag. Each `;`, `!`, `^`, `=`, whitespace, and control character in the name, and each `;`, whitespace, and control character and a leading `~` in the value, is written as `_`, counted once per record. |
 //! | `attributes/bool_value`, under `tags: drop` | lost | `logit.output.tags.omitted{reason=dialect}` | Under `tags: drop`, no tag is written, counted once per attribute. |
-//! | `attributes/bool_value`, otherwise | normalized | `stringified`; `logit.output.metrics.normalized{reason=tag_sanitized}` | A tag of `true` or `false`, read back as the string. |
+//! | `attributes/bool_value`, otherwise | normalized | `stringified`; `logit.output.metrics.normalized{reason=tag_sanitized}` | A tag of `true` or `false`, read back as the string. Its name is sanitized as the `string_value` row says, counted once per record as `tag_sanitized`. |
 //! | `attributes/number_value`, under `tags: drop` | lost | `logit.output.tags.omitted{reason=dialect}` | Under `tags: drop`, no tag is written, counted once per attribute. |
-//! | `attributes/number_value`, otherwise | normalized | `stringified`; `logit.output.metrics.normalized{reason=tag_sanitized}` | A tag of the number's text, an `f64` in its shortest form (`3` for `3.0`), read back as the string. |
+//! | `attributes/number_value`, otherwise | normalized | `stringified`; `logit.output.metrics.normalized{reason=tag_sanitized}` | A tag of the number's text, an `f64` in its shortest form (`3` for `3.0`), read back as the string. Its name is sanitized as the `string_value` row says, counted once per record as `tag_sanitized`. |
 //! | `attributes/array_value`, under `tags: drop` | lost | `logit.output.tags.omitted{reason=dialect}` | Under `tags: drop`, no tag is written, counted once per attribute. |
 //! | `attributes/array_value`, otherwise | normalized | `multi_value`; `logit.output.tags.normalized{reason=multi_value}` | A tag holds one value, so only the last representable element is written, counted. |
 //! | `attributes/map_value`, under `tags: drop` | lost | `logit.output.tags.omitted{reason=dialect}` | Under `tags: drop`, no tag is written, counted once per attribute. |
@@ -162,7 +162,7 @@
 //! | `attributes/timestamp_value`, otherwise | lost | `logit.output.tags.omitted{reason=unrepresentable}` | A timestamp value has no tag form and is left off, counted. |
 //! | `attributes/foreign_carrier` | lost | uncounted | Another protocol's `_logit.` carrier isn't a tag and is left off, uncounted, under either `tags:` mode. |
 //! | `attributes/resource_attribute`, under `tags: drop` | lost | `logit.output.tags.omitted{reason=dialect}` | Under `tags: drop`, no tag is written, counted once per attribute. |
-//! | `attributes/resource_attribute`, otherwise | normalized | `resource_merged`; `logit.output.metrics.normalized{reason=tag_sanitized}` | A tag, the event's value winning on a shared key, uncounted, read back as an event attribute. |
+//! | `attributes/resource_attribute`, otherwise | normalized | `resource_merged`; `logit.output.metrics.normalized{reason=tag_sanitized}` | A tag, read back as an event attribute; on a key the event shares, the event's value wins, uncounted. Its name and value are sanitized as the `string_value` row says, counted once per record as `tag_sanitized`. |
 //! | `attributes/scope` | lost | uncounted | Carbon has no instrumentation scope; it isn't written or counted. |
 //! | `attributes/datadog_carrier_log` | lost | uncounted | Another protocol's `_logit.` carrier isn't a tag and is left off, uncounted. |
 //! | `attributes/no_host` | exact | -- | A record with no host leaves with none. |
@@ -182,6 +182,7 @@
 //! | `Samples`, `Distribution`, `Histogram`, `ExponentialHistogram`, `Summary`, `Set`, and `SetMembers` under [`MultiValue::Expand`] | the sub-path table in [`crate::multi_value`] | `logit.output.metrics.degraded{metric_kind=…}`, **once per record** however many sub-paths it produced |
 //! | `event.timestamp.div_euclid(1_000_000_000) <= 0` | dropped | `{reason="unencodable_timestamp"}` + diag `unencodable_timestamp` |
 //! | attributes under [`Tags::Carbon`] (the default) | `;name=value`, ascending **rendered** name | -- |
+//! | a `Value::Null`, or an `Array` with no representable element | the tag is omitted | `logit.output.tags.omitted{reason="unrepresentable"}` |
 //! | a forbidden byte in the path / a tag name / a tag value | `_` | `logit.output.metrics.normalized{reason="path_sanitized"\|"tag_sanitized"}`, once per record per reason |
 //! | a tag whose name or value is empty after sanitizing | the tag is omitted | `logit.output.tags.omitted{reason="empty"}` |
 //! | two tags colliding after rendering | the one whose **original** name sorts first is kept | `logit.output.tags.omitted{reason="collision"}` |

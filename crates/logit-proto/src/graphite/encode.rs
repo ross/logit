@@ -34,7 +34,8 @@ const NANOS_PER_SECOND: i64 = 1_000_000_000;
 /// Production telemetry comes from the counters the encoder emits itself.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct EncodeStats {
-    /// Events with no metrics (a log- or span-only event). Not a loss: nothing to carry.
+    /// Events with no metrics (a log, a span, or attributes alone). Their log, span, or attributes
+    /// are lost, uncounted: carbon has no form for them.
     pub skipped_no_metrics: usize,
     /// A multi-value metric kind under [`MultiValue::Skip`], once per record, tagged with the kind.
     pub dropped_unsupported_kind: usize,

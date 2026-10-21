@@ -1848,7 +1848,9 @@ rows:
         - class: normalized
           reason: stringified
           counter: logit.output.metrics.normalized{reason=tag_sanitized}
-          text: A tag of `true` or `false`, read back as the string.
+          text: >-
+            A tag of `true` or `false`, read back as the string. Its name is sanitized as the
+            `string_value` row says, counted once per record as `tag_sanitized`.
   - kind: attributes
     feature: number_value
     cells:
@@ -1890,7 +1892,8 @@ rows:
           counter: logit.output.metrics.normalized{reason=tag_sanitized}
           text: >-
             A tag of the number's text, an `f64` in its shortest form (`3` for `3.0`), read back as
-            the string.
+            the string. Its name is sanitized as the `string_value` row says, counted once per
+            record as `tag_sanitized`.
   - kind: attributes
     feature: array_value
     cells:
@@ -2156,8 +2159,9 @@ rows:
           reason: resource_merged
           counter: logit.output.metrics.normalized{reason=tag_sanitized}
           text: >-
-            A tag, the event's value winning on a shared key, uncounted, read back as an event
-            attribute.
+            A tag, read back as an event attribute; on a key the event shares, the event's value
+            wins, uncounted. Its name and value are sanitized as the `string_value` row says,
+            counted once per record as `tag_sanitized`.
   - kind: attributes
     feature: scope
     cells:
