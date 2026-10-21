@@ -2922,4 +2922,47 @@ mod full_buffer_tests {
               (1 event(s))"]
         );
     }
+
+    /// The latest `BLOCKED` gauge value in one drain's events, if the window holds one.
+    fn blocked_in(events: &[Event]) -> Option<f64> {
+        let name = logit_core::interner::intern(BLOCKED);
+        events
+            .iter()
+            .flat_map(|e| e.metrics.iter())
+            .filter(|m| m.name == name)
+            .filter_map(|m| match &m.kind {
+                logit_core::MetricKind::Gauge(v) => Some(v.as_f64()),
+                _ => None,
+            })
+            .last()
+    }
+
+    /// A drain takes every point, so a gauge written once at the start of a wait would show in one
+    /// `internal` window and then vanish. Drained every second, then every 5 s, over a long wait,
+    /// each window still reads 1.
+    #[tokio::test(start_paused = true)]
+    async fn the_blocked_gauge_reads_one_in_every_drain_window_of_a_long_wait() {
+        let registry = logit_core::Registry::new();
+        let telemetry = registry.telemetry_for("q", "influxdb_out", "sink");
+        let q = Arc::new(SinkQueue::new(
+            SinkQueueConfig { max_batches: 1, ..SinkQueueConfig::default() },
+            telemetry,
+        ));
+        q.push((batch(), ctx())).await;
+        let q2 = Arc::clone(&q);
+        let blocked = tokio::spawn(async move { q2.push((batch(), ctx())).await });
+        wait_until("the push to wait", || blocked_in(&registry.drain(0)) == Some(1.0)).await;
+
+        for (window, length) in std::iter::repeat_n(Duration::from_secs(1), 10)
+            .chain(std::iter::repeat_n(Duration::from_secs(5), 30))
+            .enumerate()
+        {
+            tokio::time::sleep(length).await;
+            assert_eq!(blocked_in(&registry.drain(0)), Some(1.0), "window {window} ({length:?})");
+        }
+        assert!(!blocked.is_finished(), "the refresh never admits the push");
+        q.commit();
+        tokio::time::timeout(RECV_TIMEOUT, blocked).await.expect("admitted").unwrap();
+        assert_eq!(blocked_in(&registry.drain(0)), Some(0.0));
+    }
 }

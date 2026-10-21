@@ -33,6 +33,12 @@ use tokio::time::Instant;
 /// The least time between two `buffer_full` lines for one queue.
 pub(crate) const REPEAT_INTERVAL: Duration = Duration::from_secs(60);
 
+/// How often a waiting push re-writes the blocked gauge. `ComponentBuffer::drain` takes every
+/// point, so a gauge written once shows in one `internal` drain window and then vanishes. Half the
+/// shortest `internal` interval any shipped config uses (`1s`), so each window of that length or
+/// longer holds a write.
+pub(crate) const GAUGE_REFRESH: Duration = Duration::from_millis(500);
+
 /// How one kind of queue names itself and its bounds in its lines, in the operator's config
 /// vocabulary.
 pub struct FullLabels {
@@ -211,21 +217,26 @@ impl FullWatch {
         Waiting { watch: self }
     }
 
-    /// Awaits `notified`, waking at each due `buffer_full` repeat to write it, so a push that
-    /// waits for hours still logs once a minute. A wake changes nothing else: the caller's loop
-    /// re-checks the queue as it does after any wakeup. With no tokio runtime in context (a test
-    /// polling by hand), it awaits `notified` alone.
+    /// Awaits `notified`, or at most [`GAUGE_REFRESH`]. On that tick it re-writes the blocked
+    /// gauge, which a drain removes, and writes a `buffer_full` repeat if one is due, so a push
+    /// that waits for hours keeps the gauge at 1 in every drain window and still logs once a
+    /// minute. A tick changes nothing else: the caller's loop re-checks the queue as it does after
+    /// any wakeup. The deadline is always [`GAUGE_REFRESH`] ahead of now, never a past due time,
+    /// so a repeat that isn't written can't make the loop spin. With no tokio runtime in context
+    /// (a test polling by hand), it awaits `notified` alone.
     pub(crate) async fn wait(&self, notified: Notified<'_>) {
-        let due = self.lock().last_warn.map(|last| last + REPEAT_INTERVAL);
-        match due {
-            Some(due) if tokio::runtime::Handle::try_current().is_ok() => {
-                if tokio::time::timeout_at(due, notified).await.is_err() {
-                    let now = Instant::now();
-                    let line = self.due_warn(&mut self.lock(), now);
-                    self.emit(line);
-                }
+        if tokio::runtime::Handle::try_current().is_err() {
+            notified.await;
+            return;
+        }
+        let deadline = Instant::now() + GAUGE_REFRESH;
+        if tokio::time::timeout_at(deadline, notified).await.is_err() {
+            if self.waiters.load(Ordering::Acquire) > 0 {
+                self.telemetry.gauge(self.blocked_gauge, 1.0, &[]);
             }
-            _ => notified.await,
+            let now = Instant::now();
+            let line = self.due_warn(&mut self.lock(), now);
+            self.emit(line);
         }
     }
 
@@ -250,7 +261,7 @@ impl FullWatch {
                     format!(
                         "{} below {}% of its bounds after {}; overflow {} {}",
                         self.labels.what,
-                        self.config.recover_below * 100.0,
+                        fmt_percent(self.config.recover_below),
                         fmt_duration(now - episode.started),
                         self.config.policy.as_str(),
                         self.what_happened(&episode, now, true),
@@ -417,6 +428,13 @@ pub(crate) fn fmt_bytes(bytes: u64) -> String {
     }
 }
 
+/// A fraction as a percentage with at most four decimals and no float noise: `0.57` reads `57`,
+/// not `56.99999999999999`.
+fn fmt_percent(fraction: f64) -> String {
+    let percent = (fraction * 100.0 * 10_000.0).round() / 10_000.0;
+    format!("{percent}")
+}
+
 /// `4h15m0s`, `2m30s`, `45s`, or `250ms` under a second.
 fn fmt_duration(d: Duration) -> String {
     let secs = d.as_secs();
@@ -526,6 +544,23 @@ mod tests {
         assert_eq!(fmt_duration(Duration::from_secs(45)), "45s");
         assert_eq!(fmt_duration(Duration::from_secs(150)), "2m30s");
         assert_eq!(fmt_duration(Duration::from_secs(15_300)), "4h15m0s");
+    }
+
+    /// `0.57 * 100.0` is `56.99999999999999` in `f64`; the line reads `57%`.
+    #[tokio::test]
+    async fn the_recovered_line_prints_recover_below_without_float_noise() {
+        let (lines, _guard) = capture();
+        let mut w = watch(OverflowPolicy::DropNewest, Telemetry::default());
+        w.config.recover_below = 0.57;
+        w.dropped("overflow_newest", 1, Bound::Items);
+        w.utilization(0.5);
+        let recovered = lines.with_key("buffer_recovered");
+        assert_eq!(recovered.len(), 1);
+        assert!(
+            recovered[0].1.starts_with("buffer below 57% of its bounds after "),
+            "{recovered:?}"
+        );
+        assert_eq!(fmt_percent(0.755), "75.5");
     }
 
     /// A queue whose one item fills more than a quarter of a bound opens and closes an episode
