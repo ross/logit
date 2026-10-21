@@ -66,9 +66,10 @@
 //!
 //! **Stale points.** Datadog documents a window per route and discards data outside it, so before
 //! encoding, relative to the send time, this sink drops and counts
-//! `logit.output.records.dropped{reason="stale"}`, per entry (each series a record writes, and one
-//! for a series-route record that writes none; each distribution-points or sketch record; each
-//! event on the other routes):
+//! `logit.output.records.dropped{reason="stale"}`, per entry: on the series route, each series a
+//! record would write and each record or point the encoder would skip or drop there (a cumulative
+//! monotonic `Sum`, a summary's non-finite quantile); each distribution-points or sketch record;
+//! each event on the other routes:
 //!
 //! | Route | Dropped when |
 //! |---|---|
@@ -720,16 +721,16 @@ fn plan(batch: &EventBatch, now: i64, histograms: HistogramOptions) -> Plan {
     plan
 }
 
-/// The entries a stale series item counts: each series a record writes, and one for a record
-/// the series route reads but writes nothing for (a cumulative monotonic `Sum`, say), which the
-/// encoder would have counted as skipped had the item reached it.
+/// The entries a stale series item counts: what the encoder would have counted for a fresh copy,
+/// each series a record writes and each skip or drop of the series route's own (a cumulative
+/// monotonic `Sum`, a summary's non-finite quantile). A record only the sketches route writes
+/// counts there, not here.
 fn stale_series_entries(resource: &Resource, event: &Event, histograms: HistogramOptions) -> usize {
     let check = usize::from(is_service_check(resource, event));
     event.metrics[check..]
         .iter()
         .map(|record| record_routes(record, histograms))
-        .filter(|routes| routes.series_route)
-        .map(|routes| routes.series.max(1))
+        .map(|routes| routes.series + routes.series_skips)
         .sum()
 }
 
@@ -1566,6 +1567,46 @@ mod tests {
         ));
         let mixed = plan(&batch(vec![h]), NOW, counters);
         assert_eq!(mixed.stale[Route::Series as usize], 3 + 2 + 1);
+    }
+
+    /// Under the default `histograms:`, a stale delta histogram or exponential histogram counts on
+    /// the sketches route alone, as a fresh one is written there alone; a stale summary counts each
+    /// quantile, its non-finite one too, which a fresh copy counts dropped.
+    #[test]
+    fn a_stale_record_counts_once_on_the_route_that_writes_it() {
+        let stale = NOW - 2 * HOUR;
+        let exp = MetricKind::ExponentialHistogram(logit_core::ExpHistogram {
+            scale: 0,
+            zero_count: 0,
+            zero_threshold: 0.0,
+            positive: (0, vec![1, 2]),
+            negative: (0, vec![]),
+            temporality: Temporality::Delta,
+            count: 3,
+            sum: Some(5.0),
+            min: None,
+            max: None,
+        });
+        for event in [histogram(stale), metric(stale, exp)] {
+            let p = plan(&batch(vec![event]), NOW, HistogramOptions::default());
+            assert_eq!(p.stale[Route::Series as usize], 0);
+            assert_eq!(p.stale[Route::Sketches as usize], 1);
+        }
+        let summary = |temporality| {
+            MetricKind::Summary(logit_core::Summary {
+                quantiles: vec![(0.5, 1.0), (0.9, f64::NAN)],
+                count: 2,
+                sum: 3.0,
+                temporality,
+            })
+        };
+        let cumulative = summary(logit_core::Temporality::Cumulative);
+        let p = plan(&batch(vec![metric(stale, cumulative)]), NOW, HistogramOptions::default());
+        assert_eq!(p.stale[Route::Series as usize], 2);
+        // A delta summary's `.count` and `.sum` are two more series.
+        let delta = summary(logit_core::Temporality::Delta);
+        let p = plan(&batch(vec![metric(stale, delta)]), NOW, HistogramOptions::default());
+        assert_eq!(p.stale[Route::Series as usize], 4);
     }
 
     /// A `.bucket` series carries its two bounds after the event's tags, so on an event with 99

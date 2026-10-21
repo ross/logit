@@ -930,14 +930,20 @@ impl DatadogEncoder {
     }
 
     /// Counts the notes [`plan_series`] left for one record. A note about how a written series
-    /// looks (a degrade, a normalization) counts only when `written`: none of a record whose every
-    /// series the tag limit leaves off.
-    fn count_notes(&mut self, notes: &[Note], written: bool) {
+    /// looks (a degrade, a normalization, a summary's left-off count and sum) counts only when
+    /// `written`: none of a record whose every series the tag limit leaves off. A missing sum
+    /// counts when the record is written on some route, `sketched` for the sketches route.
+    fn count_notes(&mut self, notes: &[Note], written: bool, sketched: bool) {
         for &note in notes {
             match note {
                 Note::NotSent(outcome) => self.metric_not_sent(outcome),
                 Note::Cumulative(kind) => self.unresolved_cumulative(kind),
-                Note::Degraded(_) | Note::DegradedReason(_) | Note::BoolValue if !written => {}
+                Note::Degraded(_)
+                | Note::DegradedReason(_)
+                | Note::BoolValue
+                | Note::SummaryCumulative
+                    if !written => {}
+                Note::NoSum if !(written || sketched) => {}
                 Note::Degraded(kind) => self.degraded_kind(kind),
                 Note::DegradedReason(reason) => self.out_degraded(reason),
                 Note::BoolValue => self.telemetry.count(
@@ -1008,7 +1014,9 @@ impl DatadogEncoder {
                     .iter()
                     .filter(|p| base + p.extra_tags() <= MAX_METRIC_TAGS)
                     .collect();
-                self.count_notes(&plan.notes, !points.is_empty());
+                // The sketches route drops an event over the limit whole.
+                let sketched = on_sketch_route(record, self.histograms) && base <= MAX_METRIC_TAGS;
+                self.count_notes(&plan.notes, !points.is_empty(), sketched);
                 if points.is_empty() {
                     continue;
                 }
@@ -1225,6 +1233,9 @@ pub struct RecordRoutes {
     /// The series [`DatadogEncoder`]'s series routes write for the record, from the same
     /// [`plan_series`] count.
     pub series: usize,
+    /// The records' skips and drops the series route counts for it, from the same plan: what a
+    /// stale copy, which never reaches the encoder, counts in their place.
+    pub series_skips: usize,
     pub series_route: bool,
     pub distribution_points: bool,
     pub sketch: bool,
@@ -1237,18 +1248,38 @@ fn on_series_route(record: &MetricRecord) -> bool {
 
 /// [`RecordRoutes`] for `record`.
 pub fn record_routes(record: &MetricRecord, histograms: HistogramOptions) -> RecordRoutes {
-    let (distribution_points, sketch) = match &record.kind {
-        MetricKind::Samples(_) => (true, false),
-        MetricKind::Distribution(_) => (false, true),
-        MetricKind::Histogram(h) if h.temporality == Temporality::Delta => {
-            (false, histograms.mode == HistogramMode::Distributions)
-        }
-        MetricKind::ExponentialHistogram(e) if e.temporality == Temporality::Delta => (false, true),
-        _ => (false, false),
-    };
     let series_route = on_series_route(record);
-    let series = if series_route { plan_series(record, histograms).points.len() } else { 0 };
-    RecordRoutes { series, series_route, distribution_points, sketch }
+    let (series, series_skips) = if series_route {
+        let plan = plan_series(record, histograms);
+        let skips = plan
+            .notes
+            .iter()
+            .filter(|n| matches!(n, Note::NotSent(_) | Note::Cumulative(..)))
+            .count();
+        (plan.points.len(), skips)
+    } else {
+        (0, 0)
+    };
+    RecordRoutes {
+        series,
+        series_skips,
+        series_route,
+        distribution_points: matches!(record.kind, MetricKind::Samples(_)),
+        sketch: on_sketch_route(record, histograms),
+    }
+}
+
+/// Whether the sketches route writes `record`: a `Distribution`, a delta `Histogram` under
+/// `histograms.mode: distributions`, and every delta `ExponentialHistogram`.
+fn on_sketch_route(record: &MetricRecord, histograms: HistogramOptions) -> bool {
+    match &record.kind {
+        MetricKind::Distribution(_) => true,
+        MetricKind::Histogram(h) => {
+            h.temporality == Temporality::Delta && histograms.mode == HistogramMode::Distributions
+        }
+        MetricKind::ExponentialHistogram(e) => e.temporality == Temporality::Delta,
+        _ => false,
+    }
 }
 
 /// How many of `record`'s series carry more than [`MAX_METRIC_TAGS`] tags with `base_tags` (the
@@ -2517,23 +2548,59 @@ mod tests {
                 2,
             ),
             ("summary, no quantiles", record(summary(vec![])), plain, 0),
+            (
+                "delta summary",
+                record(MetricKind::Summary(Summary {
+                    quantiles: vec![(0.5, 1.0)],
+                    count: 3,
+                    sum: 6.0,
+                    temporality: Temporality::Delta,
+                })),
+                plain,
+                3,
+            ),
+            (
+                "delta summary, a non-finite sum",
+                record(MetricKind::Summary(Summary {
+                    quantiles: vec![(0.5, 1.0)],
+                    count: 3,
+                    sum: f64::NAN,
+                    temporality: Temporality::Delta,
+                })),
+                plain,
+                2,
+            ),
             ("cumulative monotonic sum", record(sum(1.0, Temporality::Cumulative, true)), plain, 0),
             ("gauge delta", record(MetricKind::GaugeDelta(MetricValue::F64(1.0))), plain, 0),
             ("flagged gauge", flagged(MetricKind::gauge(1.0)), plain, 0),
             ("non-finite gauge", record(MetricKind::gauge(f64::NAN)), plain, 0),
             ("gauge", record(MetricKind::gauge(1.0)), plain, 1),
         ];
+        // Each row's skips too: what a fresh copy's series route counts skipped or dropped, which
+        // a stale copy counts in their place.
         let mut wrong = Vec::new();
         for (name, record, options, want) in rows {
             let routes = record_routes(&record, options);
-            let mut e = DatadogEncoder::new().with_histograms(options);
+            let (mut e, registry) = otlp_encoder(options);
             let written =
                 v2_series(&mut e, &batch(vec![Event::metric(TS, AttrMap::new(), record)]));
-            if (routes.series, written.len(), routes.series_route) != (want, want, true) {
+            let c = self::counters(&registry);
+            let skips: f64 = c
+                .iter()
+                .filter(|(m, ..)| {
+                    m == "logit.output.metrics.skipped" || m == "logit.output.metrics.dropped"
+                })
+                .map(|c| c.2)
+                .sum();
+            if (routes.series, written.len(), routes.series_route) != (want, want, true)
+                || routes.series_skips as f64 != skips
+            {
                 wrong.push(format!(
-                    "{name}: weighs {}, writes {}, want {want}; series route {}",
+                    "{name}: weighs {}, writes {}, want {want}; skips {} vs {skips} counted; \
+                     series route {}",
                     routes.series,
                     written.len(),
+                    routes.series_skips,
                     routes.series_route
                 ));
             }
@@ -2573,6 +2640,43 @@ mod tests {
         assert_eq!(total(&c, "logit.output.metrics.normalized", "bool_value"), 0.0);
         assert_eq!(total(&c, "logit.output.tags.omitted", "unrepresentable"), 0.0);
         assert_eq!(total(&c, "logit.output.metrics.dropped", "unresolved_cumulative"), 1.0);
+    }
+
+    /// A summary the tag limit leaves off whole counts no left-off count and sum, and a histogram
+    /// with no sum counts its missing aggregations only while some route writes it: the sketches
+    /// route under 100 tags, none over it.
+    #[test]
+    fn notes_about_written_fields_need_a_written_record() {
+        let options =
+            HistogramOptions { mode: HistogramMode::Distributions, send_aggregation_metrics: true };
+        let tagged = |n: usize, kind| {
+            let mut attrs = AttrMap::new();
+            for i in 0..n {
+                attrs.insert(format!("t{i}").as_str(), Value::str("v"));
+            }
+            Event::metric(TS, attrs, MetricRecord::new(intern("m"), kind))
+        };
+        let summary = || {
+            MetricKind::Summary(Summary {
+                quantiles: vec![(0.5, 1.0)],
+                count: 1,
+                sum: 1.0,
+                temporality: Temporality::Cumulative,
+            })
+        };
+        let no_sum = || MetricKind::Histogram(delta_histogram(None));
+        let run = |events| {
+            let (mut e, registry) = otlp_encoder(options);
+            v2_series(&mut e, &batch(events));
+            counters(&registry)
+        };
+        let over =
+            run(vec![tagged(MAX_METRIC_TAGS, summary()), tagged(MAX_METRIC_TAGS + 1, no_sum())]);
+        assert_eq!(total(&over, "logit.output.fields.dropped", "unresolved_cumulative"), 0.0);
+        assert_eq!(total(&over, "logit.output.fields.omitted", "no_sum"), 0.0);
+        let under = run(vec![tagged(1, summary()), tagged(1, no_sum())]);
+        assert_eq!(total(&under, "logit.output.fields.dropped", "unresolved_cumulative"), 1.0);
+        assert_eq!(total(&under, "logit.output.fields.omitted", "no_sum"), 1.0);
     }
 
     /// A `.bucket` or `.quantile` series whose own tags take the event's past the limit is left
