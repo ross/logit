@@ -76,7 +76,8 @@ rejects), and `doc-openmetrics` the OpenMetrics specification's. The rest cover:
 - metadata: conflicting and repeated `# TYPE`/`# HELP`, `# HELP` escapes, `# TYPE` after samples,
   non-contiguous families, an unknown type keyword, an empty `# HELP`, `untyped`, tabs, `# UNIT` in
   text 0.0.4 and one that isn't the name's suffix, OpenMetrics-only types in text 0.0.4;
-- OpenMetrics shapes: `info`, `stateset`, `gaugehistogram`, exemplars on every kind of line,
+- OpenMetrics shapes: `info`, `stateset`, `gaugehistogram`, exemplars on every kind of line, an
+  exemplar label name with a dot, bare and quoted,
   `_created`, a counter with no `_total`, and `_created` in text 0.0.4;
 - framing: CRLF, no trailing newline, blank lines, leading spaces, comments;
 - `Content-Type`: missing, garbage, another media type, `version=0.0.1`, bare media types, an

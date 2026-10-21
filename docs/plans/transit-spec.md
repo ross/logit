@@ -610,8 +610,10 @@ Recorded per workstream as each lands.
     carries the key as written and `prometheus_in` reads it back. No row could say this, so the
     two rows and their reach rule in `classes.rs` are new; only `prometheus_out` writes
     exemplar keys under a name rule, so no other sink has a cell. The rule reads only the
-    exemplars the writer puts on a line, through `text::exposed_exemplar_labels`, so a second
+    exemplars the writer puts on a line, through `text::exposed_exemplar_keys`, so a second
     exemplar the writer leaves off doesn't reach the rows (case `exemplars-unwritten`).
+    `prometheus_out` now sanitizes those keys as it does a series label's, in both modes, so both
+    rows read `normalized`.
   - `statsd_out` and `datadog_out` write each element of an array attribute as its own tag, so a
     number element reads back as a string (`attributes/array_value`: `normalized`,
     `stringified`). The statsd and Datadog cases held only string arrays, so the cells read

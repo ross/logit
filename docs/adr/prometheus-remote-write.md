@@ -1,6 +1,6 @@
 ---
 created: 2026-09-17
-updated: 2026-10-19
+updated: 2026-10-20
 ---
 
 # Prometheus remote-write: a receiver on `prometheus_in`, a sender on `prometheus_out`
@@ -594,3 +594,15 @@ this record names: the marker `prometheus.timestamp` is `_logit.prometheus.times
 scrape-mode resource attribute `prometheus.target` is `_logit.prometheus.target`. The sections
 above use the new names. Neither decision here changes: the receiver still stamps no target and
 sets no marker, and the sender still writes a timestamp on every sample.
+
+## Amendment (2026-10-20): an exemplar's label names are sanitized
+
+The sender writes an exemplar's attribute keys under the label-name rule a series label follows,
+in both versions, and counts a collision or a reserved name the same way
+([ADR `prometheus-scrape-and-exposition`](prometheus-scrape-and-exposition.md)'s amendment of
+this date). It follows the series labels rather than the receiver. Prometheus 3.14.0's write
+handler checks a series' labels against `model.UTF8Validation` and an exemplar's against no name
+rule at all, only the 128-rune label-set length in `tsdb/exemplar.go`'s `validateExemplar`, so
+it would have stored `customer.tier` as sent. But this sender already writes a series label
+`customer.tier` as `customer_tier`, and an exemplar label spelled apart from the series labels
+beside it is a mismatch a query can't join across.
