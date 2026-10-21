@@ -117,7 +117,7 @@
 //!
 //! | Family | Series on the wire |
 //! |---|---|
-//! | `counter` | `<name>_total` (the suffix is added when the model name lacks it), with every exemplar |
+//! | `counter` | `<name>_total` (the suffix is added when the model name lacks it), with every exemplar within the label budget |
 //! | `gauge`/`unknown`/`untyped` | `<name>` |
 //! | `info` | `<name>_info` = `1` |
 //! | `stateset` | `<name>`, `0`/`1` -- the state label is an ordinary model label and is already in the series' label set |
