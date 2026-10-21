@@ -649,7 +649,7 @@ Every sink gets a `SinkStore` (`crates/logit-pipeline/src/queue.rs`,
 `docs/adr/buffered-sink-delivery.md`) between its inbox drain and delivery. Like `Fanout`, it's one
 choke point every sink's batches pass through, so every sink gets these metrics with no per-sink
 code. The in-memory queue (`SinkQueue`, the default) and the disk queue (`DiskQueue`, opt-in via
-`buffer.disk:`, `docs/adr/disk-backed-sink-buffer.md`) emit the same first four rows with the same
+`buffer.disk:`, `docs/adr/disk-backed-sink-buffer.md`) emit the same first five rows with the same
 meanings, except that `buffer.bytes` is on-disk bytes rather than `estimated_heap_bytes` for a
 disk-backed sink:
 
@@ -658,7 +658,8 @@ disk-backed sink:
 | `logit.component.buffer.batches` | gauge | batches currently queued, sampled on every push/commit. For a disk-backed sink, skipping a corrupt region leaves it unchanged: corruption present at `DiskQueue::open` was never counted, and a record corrupted after its push over-counts by one until the next `open` re-derives the count |
 | `logit.component.buffer.bytes` | gauge | `EventBatch::estimated_heap_bytes` summed over what's queued (in-memory), or on-disk segment bytes (disk-backed) |
 | `logit.component.buffer.utilization` | gauge | `max(batches ratio, bytes ratio)` against the two configured bounds |
-| `logit.component.buffer.push.blocked.duration` | timing | how long a `Block`-policy push waited for room; only recorded when a push actually had to wait |
+| `logit.component.buffer.push.blocked.duration` | timing | how long a `Block`-policy push waited for room, one sample per wait, recorded when the wait ends (a cancelled push records its time to cancellation); only recorded when a push had to wait. During a long stall it has no sample yet, so read `push.blocked` |
+| `logit.component.buffer.push.blocked` | gauge | `1` while a `Block`-policy push waits for room, re-written about every 500 ms of the wait so each drain window of 1 s or longer holds it (see "Why a constant is re-emitted"); `0` once the wait ends for any reason: room, close, or the push's cancellation |
 | `logit.component.retrying` | gauge | `1` from the held head's first retryable failure while a retry is pending or in flight, `0` once that head is delivered or dropped and when the write loop exits. A hold drops nothing, so `batches.dropped` stays flat while this reads `1` |
 | `logit.component.batches.dropped{reason=...}` / `.events.dropped{reason=...}` | count | `reason` one of `overflow_oldest`/`overflow_newest` (queue eviction), `rejected` (`write_loop`: the destination refused this batch for its own content, or the sink attached no fault), `ambiguous_at_most_once` (`write_loop`: a send of unknown outcome under `delivery: at_most_once`), `shutdown` (`run_output` stopped with an in-memory queue still non-empty, or with batches that never reached the queue: left in the inbox, or held by a push abandoned at shutdown. A disk-backed sink spools those, so it emits `shutdown` only under `delivery: at_most_once`, for a send the shutdown grace cut off mid-flight, which the destination may have taken and which isn't replayed; its sink span carries `fault=ambiguous`), `frame_too_large`/`disk_corrupt`/`disk_torn`/`disk_full`/`disk_io_error` (disk-backed only, see below) |
 
@@ -675,6 +676,22 @@ class and the destination's error text:
 
 No send outcome ends the process: a sink that can't deliver holds or drops, and the diagnostics and
 the `retrying` gauge are how it shows.
+
+The store writes three more keys while it's full (`crates/logit-pipeline/src/buffer_full.rs`'s
+module doc has the episode rules, [ADR `buffer-full-diagnostics`](../adr/buffer-full-diagnostics.md)
+the reasons). During an outage they're the live signal, since the sink's telemetry may not reach
+its backend:
+
+- `buffer_full` (warn): a push found no room. It names the bound (`buffer.max_batches`,
+  `buffer.max_bytes`, or `buffer.disk.max_bytes`, with its value) and the `overflow` policy, then
+  repeats at most once a minute with the batches and events shed so far, or how long intake has
+  been held.
+- `buffer_recovered` (info): utilization fell below `buffer.recover_below` (default `0.75`), with
+  the episode's duration and totals.
+- `buffer_full_at_shutdown` (info): the sink finished with the buffer still full.
+
+None of them counts in `logit.component.diagnostics`; the `*.dropped` rows above stay the record of
+loss.
 
 Disk-backed sinks (`DiskQueue`) also emit:
 
@@ -727,7 +744,8 @@ datagram passes through.
 | `logit.component.receive.datagrams` | gauge | datagrams currently queued, sampled once per *pushed batch* and once per *popped batch* (`BoundedQueue::push_many`/`pop_many`, ADR `udp-intake-batching-and-socket-visibility` — a batch is one `recvmmsg(2)` read on the push side, up to `receive.read_batch` datagrams, and one `pop_many` of the same bound on the pop side) |
 | `logit.component.receive.bytes` | gauge | undecoded datagram bytes summed over what's queued |
 | `logit.component.receive.utilization` | gauge | `max(datagram ratio, byte ratio)` against the two configured bounds |
-| `logit.component.receive.push.blocked.duration` | timing | only under `overflow: block`, only when a push actually waited |
+| `logit.component.receive.push.blocked.duration` | timing | only under `overflow: block`, only when a push waited; one sample per wait, recorded when it ends |
+| `logit.component.receive.push.blocked` | gauge | `1` while a `Block`-policy push waits for room, re-written every 500 ms of the wait; `0` once the wait ends for any reason |
 | `logit.component.receive.latency` | timing | arrival (`Datagram::received_at`) → dequeue, per datagram — the number that says whether event timestamps are trustworthy under load |
 | `logit.component.datagrams.dropped{reason=...}` / `logit.component.bytes.dropped{reason=...}` | count | `reason` one of `overflow_oldest`/`overflow_newest` (`ReceiveQueue` eviction); `truncated`: a datagram longer than the 65,507-byte receive slot, which the kernel cut short (`MSG_TRUNC`), so the read half counts it and never queues it (**IPv6 or `AF_UNIX`, and Linux-only:** 65,507 is IPv4's maximum payload, and a `recv_from` build can't see the cut); or `shutdown`: datagrams read but never decoded because the listener stopped (a batch the read half never queued, a popped batch the decode half never decoded, or what the receive queue still held when the grace backstop dropped the listener). With these, `logit.input.datagrams` equals the `receive.latency` sample count plus every reason's drops. `shutdown` counts reach only a dedicated `internal` pipeline (see "With a dedicated pipeline, `internal` drains last"); with a mixed one they land after `internal`'s final drain. The listener also logs each at `warn` (see `docs/known-gaps/intake.md`) |
 | `logit.component.receive.flushed{reason=...}` | count | `reason` one of `max_events`/`max_bytes`/`interval`/`resource_change`/`shutdown`/`closed` — a `BatchAccumulator` emission. `closed` is **a single tracked file or connection** ending and flushing its own accumulator on the way out: a `tail_in`/`docker_in` file that rotated away or was removed, or a `graphite_in` TCP connection the client closed or reset, or that was dropped for an oversize frame — in every case while the listener itself keeps running. `shutdown` is the whole component stopping. An ordinary client disconnect is `closed`, never `shutdown`. |
@@ -759,6 +777,10 @@ Three naming choices, because the obvious names collide with existing ones:
   flush, and `batches.flushed` beside them would read as the same concept.
 - **`push.blocked.duration` records only under `overflow: block`**, which is never the receive
   queue's default (see the ADR).
+
+The receive queue writes the sink store's `buffer_full`, `buffer_recovered`, and
+`buffer_full_at_shutdown` keys (see "Sinks: `SinkStore`"), naming `receive.max_datagrams` or
+`receive.max_bytes`, counting datagrams and bytes, and recovering below `receive.recover_below`.
 
 #### TCP listeners: the kernel accept queue
 

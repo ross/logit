@@ -5265,6 +5265,15 @@ pub struct BufferConfig {
     /// every other sink fed from the same source, so `logit validate` warns when a source feeds
     /// two or more sinks that use `block` and have no `disk:`.
     pub overflow: OverflowPolicy,
+    /// When a push finds the buffer full, the sink logs a `buffer_full` warning naming the bound
+    /// and the overflow policy, and repeats it at most once a minute with what was shed or how
+    /// long intake has been held. The episode ends, with one `buffer_recovered` line, once the
+    /// buffer's utilization (the larger of its two bounds' fill ratios, as
+    /// `logit.component.buffer.utilization` reports it) falls below this fraction. The gap
+    /// between full and this value keeps a buffer that hovers at its bound from logging an
+    /// episode per batch. Also applies to `disk:`, against `disk.max_bytes`. Must be greater
+    /// than `0` and less than `1`. Defaults to `0.75`.
+    pub recover_below: f64,
     /// What the sink does with a batch whose delivery outcome is unknown, such as a timeout or a
     /// `5xx`. Omitted, the sink resends it (`at_least_once`), except `statsd_out`, which drops it
     /// (`at_most_once`). Set it to choose for this component.
@@ -5297,6 +5306,7 @@ impl Default for BufferConfig {
             max_batches: 1024,
             max_bytes: 64 * 1024 * 1024,
             overflow: OverflowPolicy::Block,
+            recover_below: DEFAULT_RECOVER_BELOW,
             delivery: None,
             retry_max_delay: Duration::from_secs(10),
             shutdown_grace: Duration::from_secs(5),
@@ -5304,6 +5314,9 @@ impl Default for BufferConfig {
         }
     }
 }
+
+/// `buffer.recover_below`'s and `receive.recover_below`'s default.
+pub const DEFAULT_RECOVER_BELOW: f64 = 0.75;
 
 /// Disk-backed durable buffering for one sink's delivery queue, opt-in via `buffer.disk:`. Its
 /// presence turns disk backing on for that sink. `path` is required.
@@ -5399,6 +5412,12 @@ pub struct ReceiveConfig {
     /// a counter this process never reads, so `block` relocates loss out of view rather than
     /// preventing it.
     pub overflow: OverflowPolicy,
+    /// When the read half finds the queue full, the listener logs a `buffer_full` warning naming
+    /// the bound and the overflow policy, and repeats it at most once a minute with what was shed
+    /// or how long reads have been held. The episode ends, with one `buffer_recovered` line, once
+    /// the queue's utilization (as `logit.component.receive.utilization` reports it) falls below
+    /// this fraction. Must be greater than `0` and less than `1`. Defaults to `0.75`.
+    pub recover_below: f64,
     /// Events to accumulate across datagrams before one send downstream. Defaults to `1000`; `0`
     /// is rejected. `1` means one send per datagram, since the accumulator flushes on a bound
     /// reached or exceeded and never splits a single decode's output.
@@ -5453,6 +5472,7 @@ impl Default for ReceiveConfig {
             max_datagrams: 10_000,
             max_bytes: 32 * 1024 * 1024,
             overflow: OverflowPolicy::DropOldest,
+            recover_below: DEFAULT_RECOVER_BELOW,
             batch_max_events: 1_000,
             batch_max_bytes: 1024 * 1024,
             batch_flush_interval: Duration::from_millis(100),

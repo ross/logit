@@ -144,6 +144,7 @@ fn graph_and_topology(disk_dir: std::path::PathBuf) -> (graph::Graph, DiskQueueC
         overflow: OverflowPolicy::Block,
         compression: logit_proto::frame::Compression::None,
         checkpoint_interval: Duration::from_millis(20),
+        recover_below: logit_pipeline::DEFAULT_RECOVER_BELOW,
     };
     (graph, disk_config)
 }

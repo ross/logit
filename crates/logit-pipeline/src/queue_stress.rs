@@ -235,8 +235,16 @@ static STRESS_METRICS: QueueMetrics = QueueMetrics {
     bytes: "stress.queue.bytes",
     utilization: "stress.queue.utilization",
     push_blocked: "stress.queue.push.blocked.duration",
+    push_blocked_now: "stress.queue.push.blocked",
     items_dropped: "stress.queue.items.dropped",
     units_dropped: "stress.queue.units.dropped",
+    labels: crate::FullLabels {
+        what: "queue",
+        items_bound: "max_items",
+        weight_bound: "max_weight",
+        items: "item(s)",
+        units: "unit(s)",
+    },
 };
 
 const DROP_REASONS: [&str; 3] = ["overflow_oldest", "overflow_newest", "shutdown"];
@@ -279,7 +287,12 @@ impl BoundedScenario {
         let consumers = 1 + rng.below(2) as usize;
         let cancel_per_mille = if zero_drop || rng.chance(333) { 0 } else { 1 + rng.below(300) };
         Self {
-            config: QueueConfig { max_items, max_weight, overflow },
+            config: QueueConfig {
+                max_items,
+                max_weight,
+                overflow,
+                recover_below: crate::queue::DEFAULT_RECOVER_BELOW,
+            },
             producers,
             consumers,
             cancel_per_mille,
@@ -622,8 +635,12 @@ fn a_close_while_every_producer_and_consumer_is_parked_wakes_all_of_them() {
     let rt = runtime();
     rt.block_on(async {
         let item = |seq: u64| StressItem { producer: 0, seq, weight: 1, units: 1 };
-        let config =
-            QueueConfig { max_items: 2, max_weight: u64::MAX, overflow: OverflowPolicy::Block };
+        let config = QueueConfig {
+            max_items: 2,
+            max_weight: u64::MAX,
+            overflow: OverflowPolicy::Block,
+            recover_below: crate::queue::DEFAULT_RECOVER_BELOW,
+        };
         let (registry, q) = stress_queue(config);
         q.push(item(0)).await;
         q.push(item(1)).await;

@@ -39,7 +39,8 @@ use logit_pipeline::listen::BindOptions;
 use logit_pipeline::sockstat;
 use logit_pipeline::{BatchAccumulator, FlushReason, Input};
 use logit_pipeline::{
-    BoundedQueue, CountedDrain, Fanout, OverflowPolicy, QueueConfig, QueueMetrics, Queued,
+    BoundedQueue, CountedDrain, Fanout, FullLabels, OverflowPolicy, QueueConfig, QueueMetrics,
+    Queued, DEFAULT_RECOVER_BELOW,
 };
 use logit_proto::Decoder;
 use std::future::Future;
@@ -76,8 +77,16 @@ pub static RECEIVE_QUEUE_METRICS: QueueMetrics = QueueMetrics {
     bytes: "logit.component.receive.bytes",
     utilization: "logit.component.receive.utilization",
     push_blocked: "logit.component.receive.push.blocked.duration",
+    push_blocked_now: "logit.component.receive.push.blocked",
     items_dropped: "logit.component.datagrams.dropped",
     units_dropped: "logit.component.bytes.dropped",
+    labels: FullLabels {
+        what: "receive queue",
+        items_bound: "receive.max_datagrams",
+        weight_bound: "receive.max_bytes",
+        items: "datagram(s)",
+        units: "byte(s)",
+    },
 };
 
 /// A frame a listener read and lost before it became events, by `reason`. On a datagram transport
@@ -107,6 +116,8 @@ pub struct UdpListenerConfig {
     pub max_datagrams: usize,
     pub max_bytes: u64,
     pub overflow: OverflowPolicy,
+    /// See `logit_pipeline::QueueConfig::recover_below`.
+    pub recover_below: f64,
     /// `SO_RCVBUF`, requested at bind. `None` leaves the kernel default alone.
     pub receive_buffer_bytes: Option<u64>,
     /// Events to accumulate across datagrams before one `Fanout::send`. `1` means one send per
@@ -131,6 +142,7 @@ impl Default for UdpListenerConfig {
             max_datagrams: 10_000,
             max_bytes: 32 * 1024 * 1024,
             overflow: OverflowPolicy::DropOldest,
+            recover_below: DEFAULT_RECOVER_BELOW,
             receive_buffer_bytes: None,
             batch_max_events: 1_000,
             batch_max_bytes: 1024 * 1024,
@@ -155,6 +167,7 @@ impl UdpListenerConfig {
             max_items: self.max_datagrams,
             max_weight: self.max_bytes,
             overflow: self.overflow,
+            recover_below: self.recover_below,
         }
     }
 
@@ -524,11 +537,14 @@ impl<D: Decoder + Send> UdpListener<D> {
         sink: Fanout,
         shutdown: watch::Receiver<bool>,
     ) -> anyhow::Result<()> {
-        let queue = Arc::new(BoundedQueue::with_metrics(
-            self.config.queue_config(),
-            &RECEIVE_QUEUE_METRICS,
-            self.telemetry.clone(),
-        ));
+        let queue = Arc::new(
+            BoundedQueue::with_metrics(
+                self.config.queue_config(),
+                &RECEIVE_QUEUE_METRICS,
+                self.telemetry.clone(),
+            )
+            .with_diagnostics(self.diag.clone()),
+        );
         // Declared before `read` and `decode`, so it drops after both of their futures: locals
         // drop in reverse order.
         let _residual = ResidualOnDrop {
@@ -592,6 +608,8 @@ struct ResidualOnDrop<'a> {
 impl Drop for ResidualOnDrop<'_> {
     fn drop(&mut self) {
         self.queue.close();
+        // Before `take_all`, whose emptying is shutdown's, not a recovery.
+        self.queue.finish_full_episode();
         let dropped = count_shutdown_drops(self.queue.take_all().into_iter(), self.telemetry);
         if dropped > 0 {
             self.diag.warn(format_args!(
@@ -2150,7 +2168,12 @@ mod tests {
         telemetry: &Telemetry,
     ) -> Arc<ReceiveQueue> {
         Arc::new(BoundedQueue::with_metrics(
-            QueueConfig { max_items: max_datagrams, max_weight: u64::MAX, overflow },
+            QueueConfig {
+                max_items: max_datagrams,
+                max_weight: u64::MAX,
+                overflow,
+                recover_below: DEFAULT_RECOVER_BELOW,
+            },
             &RECEIVE_QUEUE_METRICS,
             telemetry.clone(),
         ))
@@ -5321,5 +5344,105 @@ mod tests {
         let events = recv_events(&mut rx, 1).await;
         assert_eq!(peer_of(&events[0]), (None, None));
         running.stop().await;
+    }
+}
+
+/// The receive queue's full-buffer lines and blocked-push gauge, named in `receive:`'s terms
+/// (`docs/adr/buffer-full-diagnostics.md`).
+#[cfg(test)]
+mod full_receive_queue_tests {
+    use super::*;
+    use logit_pipeline::test_util::{TelemetryProbe, RECV_TIMEOUT};
+    use std::sync::Mutex;
+
+    /// Self-log output rendered on this thread while the guard lives.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Captured {
+        fn start() -> (Self, tracing::subscriber::DefaultGuard) {
+            let captured = Captured::default();
+            let writer = captured.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(move || writer.clone())
+                .with_ansi(false)
+                .finish();
+            (captured, tracing::subscriber::set_default(subscriber))
+        }
+
+        fn lines_with(&self, text: &str) -> usize {
+            let logs = String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned();
+            logs.lines().filter(|l| l.contains(text)).count()
+        }
+    }
+
+    fn datagram() -> Datagram {
+        Datagram { bytes: Bytes::from_static(b"a:1|c"), received_at: 0, peer: None }
+    }
+
+    fn queue(overflow: OverflowPolicy, probe: &TelemetryProbe) -> Arc<ReceiveQueue> {
+        Arc::new(
+            BoundedQueue::with_metrics(
+                QueueConfig {
+                    max_items: 2,
+                    max_weight: u64::MAX,
+                    overflow,
+                    recover_below: DEFAULT_RECOVER_BELOW,
+                },
+                &RECEIVE_QUEUE_METRICS,
+                probe.telemetry("udp", "statsd_in", "source"),
+            )
+            .with_diagnostics(Diagnostics::new("udp")),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_full_receive_queue_logs_in_receive_terms_and_recovers() {
+        let (logs, _guard) = Captured::start();
+        let probe = TelemetryProbe::new();
+        let q = queue(OverflowPolicy::DropOldest, &probe);
+        for _ in 0..3 {
+            q.push(datagram()).await;
+        }
+        assert_eq!(
+            logs.lines_with(
+                "receive queue full (receive.max_datagrams 2); overflow \
+                 drop_oldest is shedding the oldest datagram(s)"
+            ),
+            1
+        );
+        q.pop().await.expect("queued");
+        q.pop().await.expect("queued");
+        assert_eq!(
+            logs.lines_with("receive queue below 75% of its bounds after"),
+            1,
+            "0 of 2 queued"
+        );
+        assert_eq!(logs.lines_with("shed 1 datagram(s) (5 byte(s))"), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_blocked_read_half_raises_the_receive_gauge_until_room_frees() {
+        const BLOCKED: &str = "logit.component.receive.push.blocked";
+        let mut probe = TelemetryProbe::new();
+        let q = queue(OverflowPolicy::Block, &probe);
+        q.push(datagram()).await;
+        q.push(datagram()).await;
+        let q2 = Arc::clone(&q);
+        let blocked = tokio::spawn(async move { q2.push(datagram()).await });
+        probe.wait_for("the receive gauge at 1", |t| t.gauge(BLOCKED, &[]) == Some(1.0)).await;
+        q.pop().await.expect("queued");
+        tokio::time::timeout(RECV_TIMEOUT, blocked).await.expect("admitted").unwrap();
+        probe.wait_for("the receive gauge at 0", |t| t.gauge(BLOCKED, &[]) == Some(0.0)).await;
     }
 }

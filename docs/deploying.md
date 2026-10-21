@@ -610,6 +610,9 @@ that recorded the point.
 | `degraded` | warn | A sink's first dropped batch since it was last healthy. |
 | `retrying` | error | A sink's held head failed a retryable send; logged on the first failure, then at most once a minute while the head keeps failing. |
 | `recovered` | info | A sink's first successful delivery after `degraded` or a retried failure. |
+| `buffer_full` | warn | A sink's buffer, or a datagram listener's receive queue, found no room for a push. Names the bound and the `overflow` policy; repeats at most once a minute while it stays full, with what was shed or how long intake has been held. |
+| `buffer_recovered` | info | A full buffer's utilization fell below its `recover_below`. Carries the episode's duration and totals. |
+| `buffer_full_at_shutdown` | info | A sink or listener stopped with its buffer still full. |
 | `telemetry left undrained at exit` | debug/warn | One line per internal metric point no `internal` drain exported, logged after every node has exited and before `exiting`, on exit `0` or `2` alike. `warn` for any nonzero `*.dropped` count, whatever its `reason`; `debug` for everything else, including timings and routine counts. Only with an `internal` component. |
 | `exiting` | info/error | The process is about to exit — `info` at `0`, `error` at any failure code (`1` or `2`). A config error that fails before the pipeline starts exits without this line. |
 
@@ -820,8 +823,10 @@ An error the sink attaches no fault to is treated as `Rejected`.
 - **`stdio_out` writing to a stdout or stderr pipe has no bound**
   ([`docs/known-gaps/sinks.md`](known-gaps/sinks.md)). A reader that stops reading, such as a
   stalled log shipper, a paused pager, or a Docker log driver in its default `mode: blocking`,
-  holds the sink silently until shutdown. Once its buffer fills, the default
-  `buffer.overflow: block` stops its sources, so every other sink fed from them stops too. Don't
+  holds the sink until shutdown with no failed attempt, so no `retrying` line is logged. Once its
+  buffer fills, the sink logs `buffer_full` once a minute, and the default `buffer.overflow: block`
+  stops its sources, so every other sink fed from them stops too. Until the buffer fills, nothing
+  reports the stall. Don't
   put a stdout or stderr `stdio_out` on a critical path. When the output matters, use `file_out`.
   When the sink is only for watching, set `buffer.overflow: drop_oldest` on it, as
   [`demo/logit.yaml`](../demo/logit.yaml) does.
@@ -914,6 +919,10 @@ buffering:
   destination, or a slow drain racing shutdown.
 - `logit.component.retrying` (gauge): `1` while a sink holds a failing head. A hold drops nothing,
   so it never shows in `batches.dropped`.
+- `logit.component.buffer.push.blocked` (gauge): `1` while a full `block` buffer holds intake,
+  re-written about every 500 ms of the wait, so every `internal` drain window of 1 s or longer
+  reads it.
+  `buffer.push.blocked.duration` records a wait only once it ends, so during a stall read this one.
 - **A retried batch doesn't inflate a sink's encode-side drop counters, but a drop a peer or the
   kernel decided repeats.** While a sink retries, counts such as
   `logit.output.messages.dropped{reason="oversize_datagram"}`, a Splunk code 6, and an OTLP
@@ -922,6 +931,22 @@ buffering:
   that lists every sink counter as once per batch, once per attempt, or repeating
   ([ADR `sink-send-path-and-attempt-accounting`](adr/sink-send-path-and-attempt-accounting.md),
   decision 1).
+
+During an outage, the sink's telemetry may not reach its metrics backend, so its log is the live
+signal. A sink whose buffer fills logs a `buffer_full` warning that names the bound it hit and its
+`overflow` policy, for example:
+
+```text
+buffer full (buffer.max_batches 1024); overflow block is holding intake
+```
+
+While the buffer stays full, the warning repeats at most once a minute with the batches and events
+shed so far, or how long intake has been held. Once the buffer's utilization falls below
+`buffer.recover_below` (default `0.75`), the sink logs one `buffer_recovered` line with the
+episode's duration and totals. The gap between full and `recover_below` keeps a buffer that hovers
+at its bound from logging an episode per batch; a buffer whose single batch fills more than that gap
+still writes at most one `buffer_full` line a minute. `docs/design/internal-telemetry.md`'s "Sinks:
+`SinkStore`" lists the keys.
 
 ### A slow or unreachable sink
 
@@ -1232,6 +1257,11 @@ For a UDP listener:
   of what each requested.
 - `logit.component.receive.push.blocked.duration` (timing): how long a push waited for room in the
   queue. It records only under `overflow: block`, and only when a push had to wait.
+  `logit.component.receive.push.blocked` (gauge) reads `1` while a push is waiting, re-written
+  every 500 ms of the wait.
+- A full receive queue logs the same `buffer_full` and `buffer_recovered` lines a sink buffer does
+  (see [What to watch for sink buffering](#what-to-watch-for-sink-buffering)), naming
+  `receive.max_datagrams` or `receive.max_bytes`, and recovers below `receive.recover_below`.
 - `logit.component.receive.latency` (timing): arrival-to-dequeue time per datagram. Event
   timestamps are always receipt time, stamped at arrival, never at decode, and decode runs on its
   own loop, so this is the number that says whether those timestamps are still trustworthy under

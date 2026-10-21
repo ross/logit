@@ -221,6 +221,12 @@
             }
           ]
         },
+        "recover_below": {
+          "description": "When a push finds the buffer full, the sink logs a `buffer_full` warning naming the bound and the overflow policy, and repeats it at most once a minute with what was shed or how long intake has been held. The episode ends, with one `buffer_recovered` line, once the buffer's utilization (the larger of its two bounds' fill ratios, as `logit.component.buffer.utilization` reports it) falls below this fraction. The gap between full and this value keeps a buffer that hovers at its bound from logging an episode per batch. Also applies to `disk:`, against `disk.max_bytes`. Must be greater than `0` and less than `1`. Defaults to `0.75`.",
+          "default": 0.75,
+          "type": "number",
+          "format": "double"
+        },
         "retry_max_delay": {
           "description": "Cap on the exponential backoff between retry attempts, which starts at 200 ms and doubles. A batch that fails retryably is retried until it's delivered or the sink shuts down, and batches queue behind it up to `max_batches` and `max_bytes`, then follow `overflow`. A value below 200 ms caps every backoff. Must be greater than `0s`. Defaults to `10s`.",
           "default": "10s",
@@ -4200,6 +4206,7 @@
             "max_batches": 1024,
             "max_bytes": "67108864",
             "overflow": "block",
+            "recover_below": 0.75,
             "retry_max_delay": "10s",
             "shutdown_grace": "5s"
           },
@@ -4220,6 +4227,7 @@
             "overflow": "drop_oldest",
             "read_batch": 64,
             "receive_buffer_bytes": null,
+            "recover_below": 0.75,
             "shutdown_grace": "5s"
           },
           "allOf": [
@@ -5416,6 +5424,12 @@
             "string",
             "null"
           ]
+        },
+        "recover_below": {
+          "description": "When the read half finds the queue full, the listener logs a `buffer_full` warning naming the bound and the overflow policy, and repeats it at most once a minute with what was shed or how long reads have been held. The episode ends, with one `buffer_recovered` line, once the queue's utilization (as `logit.component.receive.utilization` reports it) falls below this fraction. Must be greater than `0` and less than `1`. Defaults to `0.75`.",
+          "default": 0.75,
+          "type": "number",
+          "format": "double"
         },
         "shutdown_grace": {
           "description": "How long a listener keeps draining after the drain starts before being cancelled. The drain starts at the shutdown signal, or once `shutdown.delay` has elapsed when that is set. Defaults to `5s`, matching `buffer.shutdown_grace`, so both ends of the pipeline drain on the same number.",

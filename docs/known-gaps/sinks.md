@@ -40,14 +40,15 @@ Entry format and the other areas: [the known-gaps index](README.md).
   tokio writes stdout and stderr on a blocking thread: a timeout around the write would return,
   but it can't cancel the write on that thread, and every later write queues behind it, so the
   sink can't bound the attempt as `Output::send`'s contract asks.
-  - **Consequence:** the sink holds silently until shutdown. No attempt fails, so
+  - **Consequence:** the sink holds until shutdown with no failed attempt, so
     `logit.component.retrying` never reads `1` and no `retrying` line is logged. The queue fills
     behind it under its `buffer:` bounds, and then the default `overflow: block` stops the
     sink's sources: every other sink fed from them stops with it. A stream or HTTP listener
     upstream then pushes back on its clients, and a UDP listener's receive queue drops. On the
-    sink, the stall shows first as `logit.component.buffer.utilization` at `1` with
-    `buffer.push.blocked.duration` samples, then as `logit.component.inbox.full` and
-    `inbox.blocked.duration` once its inbox fills.
+    sink, the stall shows first as `logit.component.buffer.utilization` at `1`,
+    `logit.component.buffer.push.blocked` at `1`, and a `buffer_full` warning repeated once a
+    minute, then as `logit.component.inbox.full` and `inbox.blocked.duration` once its inbox
+    fills. Until the queue fills, nothing reports the stall.
   - **Workaround:** when the output matters, write it with `file_out` and have the reader follow
     the file. When `stdio_out` is only for watching, set `buffer.overflow: drop_oldest` on it, so
     a stalled reader costs that sink's batches and nothing else.
@@ -61,9 +62,9 @@ Entry format and the other areas: [the known-gaps index](README.md).
   datagram send has its `send_timeout`, and `logit_out` bounds each write and acknowledgment wait
   with `request_timeout`. `stdio_out` to a pipe has no bound (the entry above).
   - **Consequence:** a sink whose write or acknowledgment wait has no transport timeout holds its
-    queue silently when the destination stops answering: no attempt fails, so
-    `logit.component.retrying` stays `0` and no `retrying` line is logged. Only the shutdown grace
-    cuts it.
+    queue when the destination stops answering: no attempt fails, so `logit.component.retrying`
+    stays `0` and no `retrying` line is logged. Only the shutdown grace cuts it. Once the queue
+    fills behind the hold, its `buffer_full` warning is the first line that reports it.
   - **Rule for a sink author:** give every write and acknowledgment wait a sink makes its own
     timeout, and classify a timeout that fires as `Ambiguous` (or `Clean` when nothing left the
     process).
@@ -124,9 +125,10 @@ Entry format and the other areas: [the known-gaps index](README.md).
     input assembled, because the sink doesn't coalesce.
   - **Symptom:** once the offered rate passes the bound, the sink's buffer fills. Under
     `buffer.overflow: drop_newest` (or `drop_oldest`) the sink counts
-    `logit.component.batches.dropped{reason="overflow_newest"}` (`overflow_oldest`), and nothing
-    else reports it. Under the default `block` the sources stall instead, and the loss moves to
-    whatever feeds them.
+    `logit.component.batches.dropped{reason="overflow_newest"}` (`overflow_oldest`) and logs a
+    `buffer_full` warning at most once a minute, and nothing names the slow round trip as the
+    cause. Under the default `block` the sources stall instead, and the loss moves to whatever
+    feeds them.
   - **Evidence:** the `otlp-fan-out` soak scenario (`docs/plans/soak-harness.md`, "Findings",
     "W13b: fan-out transforms", run `20261018T043911Z`). The generator's
     `otlp_out` offered 500 records a second in batches of 50 over OTLP/HTTP to the system under
