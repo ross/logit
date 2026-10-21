@@ -1,0 +1,10 @@
+# A hand-built protobuf body, since no capture holds a non-finite bound: one
+# `ExportMetricsServiceRequest` holding one `ResourceMetrics` (`host.name: web-1`,
+# `service.name: checkout`), one `ScopeMetrics` (`io.opentelemetry.contrib.runtime` 1.2.0), and
+# one `Metric` `http.server.duration`, unit `s`, a cumulative `Histogram` (temporality 2) with one
+# data point: attribute `http.route: /cart`, start 07:59:40Z and time 07:59:50Z on 2027-01-15,
+# `count` 31, packed `bucket_counts` `[2, 4, 1, 8, 16]`, and packed `explicit_bounds`
+# `[5, NaN, 1, -Inf]`, the NaN the quiet `0x7ff8000000000000`. `otlp_in` reads it as the buckets
+# `(5, 2)`, `(NaN, 4)`, `(1, 1)`, `(-Inf, 8)`, and `(+Inf, 16)`, in that order.
+wire: histogram-non-finite-bounds.bin
+exercises: [protobuf, histogram_cumulative, histogram_explicit_bounds, histogram_non_finite_bounds, histogram_no_min_max, start_time, unit, resource_attributes, scope, attribute_string]

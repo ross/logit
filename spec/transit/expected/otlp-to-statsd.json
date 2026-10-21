@@ -42,6 +42,16 @@
   "gzip": {"events": [
     {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"uploads.completed","kind":"sum","value":5.0,"temporality":"delta","monotonic":true}],"attributes":{"host":"web-1","service.name":"checkout"}}
   ], "counters": {}},
+  "histogram-non-finite-bounds": {"events": [
+    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"http.server.duration.bucket_-inf","kind":"gauge","value":8.0}],"attributes":{"host":"web-1","http.route":"/cart","service.name":"checkout"}},
+    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"http.server.duration.bucket_1","kind":"gauge","value":1.0}],"attributes":{"host":"web-1","http.route":"/cart","service.name":"checkout"}},
+    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"http.server.duration.bucket_5","kind":"gauge","value":2.0}],"attributes":{"host":"web-1","http.route":"/cart","service.name":"checkout"}},
+    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"http.server.duration.bucket_NaN","kind":"gauge","value":4.0}],"attributes":{"host":"web-1","http.route":"/cart","service.name":"checkout"}},
+    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"http.server.duration.bucket_inf","kind":"gauge","value":16.0}],"attributes":{"host":"web-1","http.route":"/cart","service.name":"checkout"}},
+    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"http.server.duration.count","kind":"gauge","value":31.0}],"attributes":{"host":"web-1","http.route":"/cart","service.name":"checkout"}}
+  ], "counters": {
+    "logit.output.metrics.degraded{component=out,kind=statsd_out,metric_kind=histogram,role=sink}": 1
+  }},
   "histograms": {"events": [
     {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"db.client.operation.duration.bucket_10","kind":"gauge","value":4.0}],"attributes":{"db.system":"postgresql","host":"web-1","service.name":"checkout"}},
     {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"db.client.operation.duration.bucket_100","kind":"gauge","value":5.0}],"attributes":{"db.system":"postgresql","host":"web-1","service.name":"checkout"}},

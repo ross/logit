@@ -16,6 +16,7 @@
     {"sink":"statsd_out","row":"gauge/negative","cell":0,"observed":["degraded"]},
     {"sink":"statsd_out","row":"histogram/cumulative","cell":1,"observed":["degraded"]},
     {"sink":"statsd_out","row":"histogram/delta","cell":1,"observed":["degraded"]},
+    {"sink":"statsd_out","row":"histogram/non_finite_bound","cell":1,"observed":["degraded"]},
     {"sink":"statsd_out","row":"record/description","cell":0,"observed":["lost"]},
     {"sink":"statsd_out","row":"record/exemplars","cell":0,"observed":["lost"]},
     {"sink":"statsd_out","row":"record/no_recorded_value","cell":0,"observed":["skipped"]},

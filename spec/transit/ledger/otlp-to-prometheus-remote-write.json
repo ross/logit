@@ -16,6 +16,7 @@
     {"sink":"prometheus_out","row":"gauge/negative","cell":0,"observed":[]},
     {"sink":"prometheus_out","row":"histogram/cumulative","cell":0,"observed":["normalized"]},
     {"sink":"prometheus_out","row":"histogram/delta","cell":0,"observed":["dropped"]},
+    {"sink":"prometheus_out","row":"histogram/non_finite_bound","cell":0,"observed":["degraded"]},
     {"sink":"prometheus_out","row":"record/description","cell":0,"observed":["exact"]},
     {"sink":"prometheus_out","row":"record/exemplar_key_unsafe","cell":0,"observed":["normalized"]},
     {"sink":"prometheus_out","row":"record/exemplar_key_unsafe_histogram","cell":0,"observed":["normalized"]},

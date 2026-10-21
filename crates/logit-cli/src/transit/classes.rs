@@ -9,7 +9,7 @@
 //! **Which rows a record reaches.** A metric record reaches its kind's rows: for a `sum`, its
 //! temporality and monotonicity and its scalar type; for a `gauge` or `gauge_delta`, its scalar
 //! type, and `negative` for a gauge below zero; for a `histogram` or `exponential_histogram`,
-//! its temporality; any other kind, its kind's one row. It also reaches a `record` row for each of
+//! its temporality, and `non_finite_bound` for a `histogram` with a `NaN` or `-Inf` bound; any other kind, its kind's one row. It also reaches a `record` row for each of
 //! `unit` (`unit_on_distribution` for a `samples` or `distribution`), `description`,
 //! `start_timestamp`, `exemplars` (`exemplars_on_summary` for a `summary`), and `no_recorded_value` (`no_recorded_value_delta_sum` for a delta `sum`,
 //! `no_recorded_value_other_kind` for a kind other than `sum` and `gauge`) it carries,
@@ -51,7 +51,8 @@
 //! value, and type tags (`exact`); (2) the same name, kind, temporality, and monotonicity and the
 //! same value read as a number, or for `samples` and `set_members` several read-back records whose
 //! values together are the input's (`normalized`); a histogram that gained an empty `+Inf`
-//! bucket is the same value; (3) the same name in another kind, or names under `<name>.`, the
+//! bucket is the same value, and one whose increasing bounds each hold the input's count at or
+//! below them, a `NaN` bucket's count reaching only `+Inf`, pairs `degraded`; (3) the same name in another kind, or names under `<name>.`, the
 //! dotted series of an expansion, one of each dotted name per record when several points of a
 //! series expand (`degraded`). Passes (1) and (2) run by name and then by the name as the sink
 //! writes it, where an `exact` pairing reads as `normalized`, before pass (3) runs either way, so
@@ -916,16 +917,30 @@ fn pair(ins: &[Rec], outs: &[Rec], spelling: Spelling) -> Pairing {
                 .into_iter()
                 .filter(|&o| outs[o].identity() == input.identity())
                 .collect();
-            let picked = match input.kind.as_str() {
+            let mut class = Class::Normalized;
+            let mut picked: Vec<usize> = match input.kind.as_str() {
                 "samples" | "set_members" => gather(input, &same, outs),
-                _ => same.into_iter().find(|&o| same_value(input, &outs[o])).into_iter().collect(),
+                _ => same
+                    .iter()
+                    .copied()
+                    .find(|&o| same_value(input, &outs[o]))
+                    .into_iter()
+                    .collect(),
             };
+            if picked.is_empty() && input.kind == "histogram" {
+                picked = same
+                    .into_iter()
+                    .find(|&o| same_distribution(input, &outs[o]))
+                    .into_iter()
+                    .collect();
+                class = Class::Degraded;
+            }
             if !picked.is_empty() {
                 for &o in &picked {
                     used[o] = true;
                 }
                 claimed[i] = picked;
-                seen[i] = Some(Class::Normalized);
+                seen[i] = Some(class);
             }
         }
 
@@ -1023,6 +1038,50 @@ fn same_value(a: &Rec, b: &Rec) -> bool {
     }
 }
 
+/// Whether `out`, a histogram read back, states `input`'s distribution at every bound it writes,
+/// with its bounds increasing: the cumulative count at each is the input's count at or below it,
+/// a `-Inf` bucket's included, and at `+Inf` the input's total, a `NaN` bucket's included. That's
+/// a histogram whose non-finite bounds a sink folded away, read as `degraded`; everything else in
+/// the record must match.
+fn same_distribution(input: &Rec, out: &Rec) -> bool {
+    let buckets = |rec: &Rec| -> Option<Vec<(f64, f64)>> {
+        rec.body["buckets"]
+            .as_array()?
+            .iter()
+            .map(|bucket| Some((number(&bucket["bound"])?, number(&bucket["count"])?)))
+            .collect()
+    };
+    let (Some(want), Some(have)) = (buckets(input), buckets(out)) else { return false };
+    let total: f64 = want.iter().map(|(_, count)| count).sum();
+    let at_or_below = |bound: f64| -> f64 {
+        if bound == f64::INFINITY {
+            return total;
+        }
+        want.iter().filter(|(b, _)| !b.is_nan() && *b <= bound).map(|(_, count)| count).sum()
+    };
+    let mut running = 0.0;
+    let mut previous = None;
+    for (bound, count) in &have {
+        if bound.is_nan() || previous.is_some_and(|p: f64| p >= *bound) {
+            return false;
+        }
+        running += count;
+        if running != at_or_below(*bound) {
+            return false;
+        }
+        previous = Some(*bound);
+    }
+    if have.last().is_none_or(|(bound, _)| *bound != f64::INFINITY) && running != total {
+        return false;
+    }
+    let rest = |rec: &Rec| {
+        let mut core = rec.core().0;
+        core.as_object_mut().map(|object| object.remove("buckets"));
+        core
+    };
+    rest(input) == rest(out)
+}
+
 /// Read-back `samples` or `set_members` records whose values together are `input`'s, or none.
 fn gather(input: &Rec, candidates: &[usize], outs: &[Rec]) -> Vec<usize> {
     let field = if input.kind == "samples" { "values" } else { "members" };
@@ -1092,7 +1151,16 @@ fn kind_features(rec: &Rec) -> Vec<Option<String>> {
             features
         }
         "gauge_delta" => vec![Some(scalar("delta"))],
-        "histogram" | "exponential_histogram" => vec![Some(temporality())],
+        "histogram" => {
+            let mut features = vec![Some(temporality())];
+            let non_finite =
+                |bucket: &Value| matches!(bucket["bound"].as_str(), Some("NaN" | "-inf"));
+            if rec.body["buckets"].as_array().is_some_and(|b| b.iter().any(non_finite)) {
+                features.push(Some("non_finite_bound".to_string()));
+            }
+            features
+        }
+        "exponential_histogram" => vec![Some(temporality())],
         "log" | "span" if rec.beside_metrics => vec![Some("beside_metrics".to_string())],
         "span" if datadog::otel_only(rec) => {
             vec![Some("alone".to_string()), Some("no_wire_form".to_string())]

@@ -39,6 +39,10 @@
   text: >-
     A `Histogram` data point's `explicitBounds` and one more `bucketCounts` entry, the last read
     as the `+Inf` bucket.
+- name: histogram_non_finite_bounds
+  text: >-
+    `explicit_bounds` out of order and holding a `NaN` and a `-Inf`, which `otlp_in` keeps as
+    sent.
 - name: histogram_min_max
   text: A `Histogram` data point with `min` and `max`.
 - name: histogram_no_min_max

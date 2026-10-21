@@ -32,6 +32,12 @@
   "gzip": {"events": [], "counters": {
     "logit.output.metrics.dropped{component=out,kind=prometheus_out,reason=unresolved_delta,role=sink}": 1
   }},
+  "histogram-non-finite-bounds": {"events": [
+    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"http_server_duration","kind":"histogram","temporality":"cumulative","buckets":[{"bound":"-inf","count":8},{"bound":1.0,"count":1},{"bound":5.0,"count":2},{"bound":"inf","count":20}],"start_timestamp":"2027-01-15T07:59:40.000000000Z"}],"attributes":{"host_name":"web-1","http_route":"/cart","service_name":"checkout"}}
+  ], "counters": {
+    "logit.output.metrics.degraded{component=out,kind=prometheus_out,reason=non_finite_component,role=sink}": 1,
+    "logit.output.metrics.degraded{component=out,kind=prometheus_out,reason=unit_not_suffix,role=sink}": 1
+  }},
   "histograms": {"events": [
     {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"db_client_operation_duration","kind":"histogram","temporality":"cumulative","buckets":[{"bound":10.0,"count":4},{"bound":100.0,"count":5},{"bound":"inf","count":1}],"sum":420.0,"start_timestamp":"2027-01-15T07:58:50.000000000Z","exemplars":[{"timestamp":"2027-01-15T07:59:46.000000000Z","value":37.5,"attributes":{"db_operation_name":"SELECT"}}]}],"attributes":{"db_system":"postgresql","host_name":"web-1","service_name":"checkout"}}
   ], "counters": {

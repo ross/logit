@@ -145,6 +145,7 @@
 //! | `set` | degraded | `logit.output.metrics.degraded{reason=set_estimate}` | A series `gauge` of the estimate, the Agent's `s`; the registers are gone. |
 //! | `histogram/delta` | skipped | `logit.output.metrics.skipped{metric_kind=histogram}` | The series encoders have no histogram, so none is written; `docs/known-gaps/datadog.md`'s "`datadog_out` sends no Agent-style `h`/`ms` aggregates" entry has the follow-up. |
 //! | `histogram/cumulative` | skipped | `logit.output.metrics.skipped{metric_kind=histogram}` | The series encoders have no histogram, so none is written. |
+//! | `histogram/non_finite_bound` | skipped | `logit.output.metrics.skipped{metric_kind=histogram}` | The series encoders have no histogram, so none is written. |
 //! | `exponential_histogram/delta` | skipped | `logit.output.metrics.skipped{metric_kind=exponential_histogram}` | The series encoders have no exponential histogram, so none is written. |
 //! | `exponential_histogram/cumulative` | skipped | `logit.output.metrics.skipped{metric_kind=exponential_histogram}` | The series encoders have no exponential histogram, so none is written. |
 //! | `summary` | skipped | `logit.output.metrics.skipped{metric_kind=summary}` | The series encoders have no summary, so none is written. |
