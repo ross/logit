@@ -1,0 +1,22 @@
+{
+  "name": "remainder-3",
+  "kind": "explicit",
+  "input": {
+    "bounds": ["1", "1000"],
+    "counts": [0, 3, 0],
+    "count": 3,
+    "sum": "1500",
+    "min": null,
+    "max": null
+  },
+  "outcome": "sketch",
+  "sketch": {
+    "k": [1338, 1713, 1758],
+    "n": [1, 1, 1],
+    "cnt": 3,
+    "sum": "1500",
+    "min": "1",
+    "max": "1000",
+    "avg": "500"
+  }
+}

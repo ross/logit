@@ -1,5 +1,5 @@
 //! Builds the committed starting seeds under `fuzz/seeds/<target>/` from `testdata/interop/`,
-//! `testdata/differential/`, and encoder round trips, so every fuzz target starts from inputs its
+//! `testdata/differential/`'s decoder corpora, and encoder round trips, so every fuzz target starts from inputs its
 //! decoder accepts.
 //!
 //! A target that takes a selector byte gets it prepended, matching the target's own doc: the

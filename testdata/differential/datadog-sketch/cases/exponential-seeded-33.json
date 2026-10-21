@@ -1,0 +1,30 @@
+{
+  "name": "seeded-33",
+  "kind": "exponential",
+  "input": {
+    "scale": 5,
+    "zero_count": 35,
+    "positive": {
+      "offset": 183,
+      "counts": [492, 1019]
+    },
+    "negative": {
+      "offset": 0,
+      "counts": []
+    },
+    "count": 1546,
+    "sum": "25759.403920993547",
+    "min": null,
+    "max": null
+  },
+  "outcome": "sketch",
+  "sketch": {
+    "k": [0, 1594, 1595, 1596],
+    "n": [35, 291, 515, 705],
+    "cnt": 1546,
+    "sum": "25759.403920993547",
+    "min": "0",
+    "max": "54.60088432809553",
+    "avg": "16.661968901030754"
+  }
+}

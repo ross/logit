@@ -415,7 +415,8 @@ symbol-table rules are reachable, and a fixed-point oracle on every input.
 ### Seeds and differential corpora
 
 `seedgen` also reads `testdata/interop/{statsd,syslog,graphite,collectd,datadog,prometheus-scrape}/`,
-every corpus under `testdata/differential/`, every `*.in` exposition body under
+the `graphite-pickle` and `prometheus-text` corpora under `testdata/differential/` (the
+`datadog-sketch` corpus holds no decoder input), every `*.in` exposition body under
 `crates/logit-cli/tests/fixtures/prometheus/`, and
 `tools/record-fixtures/prometheus-metadata-target.prom`. A differential corpus differs from
 `testdata/interop/`, which holds captured bytes that don't reproduce: it's generated,

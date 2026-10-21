@@ -1,0 +1,30 @@
+{
+  "name": "negative-only",
+  "kind": "exponential",
+  "input": {
+    "scale": 1,
+    "zero_count": 0,
+    "positive": {
+      "offset": 0,
+      "counts": []
+    },
+    "negative": {
+      "offset": -2,
+      "counts": [3, 8, 1]
+    },
+    "count": 12,
+    "sum": "-8",
+    "min": null,
+    "max": null
+  },
+  "outcome": "sketch",
+  "sketch": {
+    "k": [-1350, -1337, -1334, -1332, -1329, -1326, -1323, -1320, -1317, -1312, -1305, -1298],
+    "n": [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+    "cnt": 12,
+    "sum": "-8",
+    "min": "-1.4064405170948397",
+    "max": "-0.4977195857887278",
+    "avg": "-0.6666666666666666"
+  }
+}

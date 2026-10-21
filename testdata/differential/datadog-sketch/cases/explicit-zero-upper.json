@@ -1,0 +1,22 @@
+{
+  "name": "zero-upper",
+  "kind": "explicit",
+  "input": {
+    "bounds": ["-5", "0", "5"],
+    "counts": [0, 6, 4, 0],
+    "count": 10,
+    "sum": "-3",
+    "min": null,
+    "max": null
+  },
+  "outcome": "sketch",
+  "sketch": {
+    "k": [-1442, -1430, -1415, -1396, -1369, -1322, 1442],
+    "n": [1, 1, 1, 1, 1, 1, 4],
+    "cnt": 10,
+    "sum": "-3",
+    "min": "-5",
+    "max": "5",
+    "avg": "-0.3"
+  }
+}

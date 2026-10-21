@@ -1,0 +1,22 @@
+{
+  "name": "index-too-high",
+  "kind": "exponential",
+  "input": {
+    "scale": 0,
+    "zero_count": 0,
+    "positive": {
+      "offset": 800,
+      "counts": [2]
+    },
+    "negative": {
+      "offset": 0,
+      "counts": []
+    },
+    "count": 2,
+    "sum": "1e+241",
+    "min": null,
+    "max": null
+  },
+  "outcome": "unconvertible",
+  "detail": "Failed to convert DDSketch into Sketch: couldn't convert ddsketch into Sketch: index value 37104 exceeds the maximum supported index value (32767)"
+}

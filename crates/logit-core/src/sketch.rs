@@ -20,6 +20,9 @@
 //! into an empty sketch adopts the incoming mapping instead, so `aggregate` relays a stats sketch
 //! unchanged.
 //!
+//! [`from_otlp`] builds an Agent sketch from an OTLP histogram or exponential histogram bin for
+//! bin as Datadog's OpenTelemetry translator does, which neither re-binning rule matches.
+//!
 //! A quantile is the representative value of the bin holding the rank (see
 //! [`DdSketch::quantile`] for why not the Agent's own interpolation), clamped to the exact
 //! `[min, max]`, so the relative error is at most the mapping's: `1 - 1/√γ` (0.78%) under the
@@ -39,6 +42,9 @@
 //! `docs/adr/untrusted-input-bounds.md`'s "Threat model".
 
 use std::fmt;
+
+pub mod from_otlp;
+mod gomath;
 
 /// Which of Datadog's two bin mappings a [`Mapping`] is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

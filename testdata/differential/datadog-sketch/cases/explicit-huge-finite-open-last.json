@@ -1,0 +1,22 @@
+{
+  "name": "huge-finite-open-last",
+  "kind": "explicit",
+  "input": {
+    "bounds": ["1e+300"],
+    "counts": [0, 5],
+    "count": 5,
+    "sum": "5e+300",
+    "min": null,
+    "max": null
+  },
+  "outcome": "sketch",
+  "sketch": {
+    "k": [32766],
+    "n": [5],
+    "cnt": 5,
+    "sum": "5e+300",
+    "min": "4.137616223466919e+211",
+    "max": "4.137616223466919e+211",
+    "avg": "1e+300"
+  }
+}
