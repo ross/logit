@@ -245,3 +245,15 @@ None.
 ## Cells no flow reaches: datadog_out
 
 None.
+
+## Cells no flow reaches: graphite_out
+
+| Row | Cell | When |
+|---|---|---|
+| `attributes/bool_value` | 0 | `{"tags":"drop"}` |
+| `attributes/number_value` | 0 | `{"tags":"drop"}` |
+| `attributes/array_value` | 0 | `{"tags":"drop"}` |
+| `attributes/map_value` | 0 | `{"tags":"drop"}` |
+| `attributes/bytes_value` | 0 | `{"tags":"drop"}` |
+| `attributes/timestamp_value` | 0 | `{"tags":"drop"}` |
+| `attributes/resource_attribute` | 0 | `{"tags":"drop"}` |

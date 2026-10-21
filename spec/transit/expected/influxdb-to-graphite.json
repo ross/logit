@@ -1,0 +1,146 @@
+{
+  "boolean-field": {"events": [
+    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"service.degraded","kind":"gauge","value":0.0}],"attributes":{"host":"web-01"}},
+    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"service.up","kind":"gauge","value":1.0}],"attributes":{"host":"web-01"}}
+  ], "counters": {
+    "logit.output.metrics.normalized{component=out,kind=graphite_out,reason=bool_value,role=sink}": 2
+  }},
+  "carriers": {"events": [
+    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"cpu.usage_idle","kind":"gauge","value":80.0}],"attributes":{"host":"web-01"}}
+  ], "counters": {}},
+  "escaped-names": {"events": [
+    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"my_measurement.field_one","kind":"gauge","value":1.5}],"attributes":{"eq_key":"a=b","tag_key":"tag,value"}}
+  ], "counters": {
+    "logit.output.metrics.normalized{component=out,kind=graphite_out,reason=path_sanitized,role=sink}": 1,
+    "logit.output.metrics.normalized{component=out,kind=graphite_out,reason=tag_sanitized,role=sink}": 1
+  }},
+  "float-field": {"events": [
+    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"cpu.usage_user","kind":"gauge","value":12.5}],"attributes":{"host":"web-01"}}
+  ], "counters": {}},
+  "integer-field": {"events": [
+    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"disk.delta","kind":"gauge","value":-3.0}],"attributes":{"host":"web-01","path":"/"}},
+    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"disk.free","kind":"gauge","value":1024.0}],"attributes":{"host":"web-01","path":"/"}}
+  ], "counters": {}},
+  "mixed": {"events": [
+    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"cpu.usage_system","kind":"gauge","value":3.25}],"attributes":{"host":"web-01"}},
+    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"cpu.usage_user","kind":"gauge","value":12.5}],"attributes":{"host":"web-01"}},
+    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"mem.available","kind":"gauge","value":1024.0}],"attributes":{"host":"web-01"}},
+    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"mem.used","kind":"gauge","value":48236580864.0}],"attributes":{"host":"web-01"}},
+    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"mem.used_percent","kind":"gauge","value":35.9}],"attributes":{"host":"web-01"}},
+    {"timestamp":"2027-01-15T07:59:55.000000000Z","metrics":[{"name":"cpu.usage_user","kind":"gauge","value":13.0}],"attributes":{"host":"web-01"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"service.up","kind":"gauge","value":1.0}],"attributes":{"host":"web-01"}}
+  ], "counters": {
+    "logit.output.metrics.normalized{component=out,kind=graphite_out,reason=bool_value,role=sink}": 1
+  }},
+  "multi-field": {"events": [
+    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"system.healthy","kind":"gauge","value":1.0}],"attributes":{"host":"web-01"}},
+    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"system.load1","kind":"gauge","value":0.5}],"attributes":{"host":"web-01"}},
+    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"system.procs","kind":"gauge","value":120.0}],"attributes":{"host":"web-01"}},
+    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"system.uptime","kind":"gauge","value":3600.0}],"attributes":{"host":"web-01"}}
+  ], "counters": {
+    "logit.output.metrics.normalized{component=out,kind=graphite_out,reason=bool_value,role=sink}": 1
+  }},
+  "no-carrier": {"events": [], "counters": {}},
+  "precision-ms": {"events": [
+    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"cpu.usage","kind":"gauge","value":1.5}],"attributes":{"host":"web-01"}}
+  ], "counters": {}},
+  "precision-s": {"events": [
+    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"cpu.usage","kind":"gauge","value":1.5}],"attributes":{"host":"web-01"}}
+  ], "counters": {}},
+  "precision-us": {"events": [
+    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"cpu.usage","kind":"gauge","value":1.5}],"attributes":{"host":"web-01"}}
+  ], "counters": {}},
+  "reserved-tag-key": {"events": [
+    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"cpu.usage","kind":"gauge","value":1.0}],"attributes":{"host":"web-01"}}
+  ], "counters": {}},
+  "string-field": {"events": [
+    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"deploy.count","kind":"gauge","value":1.0}],"attributes":{"host":"web-01"}}
+  ], "counters": {}},
+  "string-field-series": {"events": [
+    {"timestamp":"2027-01-15T07:59:40.000000000Z","metrics":[{"name":"system.uptime","kind":"gauge","value":3600.0}],"attributes":{"host":"web-01"}},
+    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"system.uptime","kind":"gauge","value":3610.0}],"attributes":{"host":"web-01"}}
+  ], "counters": {}},
+  "tags": {"events": [
+    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"http.requests","kind":"gauge","value":5.0}],"attributes":{"host":"web-01","method":"GET","status":"200"}}
+  ], "counters": {}},
+  "telegraf-gzip": {"events": [
+    {"timestamp":"2023-11-14T22:13:20.000000000Z","metrics":[{"name":"interop_dup.v","kind":"gauge","value":2.0}],"attributes":{"host":"telegraf-fixture","id":"1"}},
+    {"timestamp":"2023-11-14T22:13:20.000000000Z","metrics":[{"name":"interop_dup.w","kind":"gauge","value":3.0}],"attributes":{"host":"telegraf-fixture","id":"1"}},
+    {"timestamp":"2023-11-14T22:13:20.000000000Z","metrics":[{"name":"interop_escapes.f,c","kind":"gauge","value":3.0}],"attributes":{"host":"telegraf-fixture","plain":"x","tag,comma":"c,d","tag_eq":"e=f","tag_space":"a_b"}},
+    {"timestamp":"2023-11-14T22:13:20.000000000Z","metrics":[{"name":"interop_escapes.f=e","kind":"gauge","value":4.0}],"attributes":{"host":"telegraf-fixture","plain":"x","tag,comma":"c,d","tag_eq":"e=f","tag_space":"a_b"}},
+    {"timestamp":"2023-11-14T22:13:20.000000000Z","metrics":[{"name":"interop_escapes.f_s","kind":"gauge","value":2.0}],"attributes":{"host":"telegraf-fixture","plain":"x","tag,comma":"c,d","tag_eq":"e=f","tag_space":"a_b"}},
+    {"timestamp":"2023-11-14T22:13:20.000000000Z","metrics":[{"name":"interop_escapes.v","kind":"gauge","value":1.0}],"attributes":{"host":"telegraf-fixture","plain":"x","tag,comma":"c,d","tag_eq":"e=f","tag_space":"a_b"}},
+    {"timestamp":"2023-11-14T22:13:20.000000000Z","metrics":[{"name":"interop_escapes_and,more.n","kind":"gauge","value":1.0}],"attributes":{"host":"telegraf-fixture","t":"v"}},
+    {"timestamp":"2023-11-14T22:13:20.000000000Z","metrics":[{"name":"interop_multi.a","kind":"gauge","value":1.0}],"attributes":{"host":"fixture-a","region":"eu"}},
+    {"timestamp":"2023-11-14T22:13:20.000000000Z","metrics":[{"name":"interop_multi.a","kind":"gauge","value":10.0}],"attributes":{"host":"fixture-b","region":"us"}},
+    {"timestamp":"2023-11-14T22:13:20.000000000Z","metrics":[{"name":"interop_multi.b","kind":"gauge","value":2.5}],"attributes":{"host":"fixture-a","region":"eu"}},
+    {"timestamp":"2023-11-14T22:13:20.000000000Z","metrics":[{"name":"interop_multi.b","kind":"gauge","value":25.5}],"attributes":{"host":"fixture-b","region":"us"}},
+    {"timestamp":"2023-11-14T22:13:20.000000000Z","metrics":[{"name":"interop_multi.c","kind":"gauge","value":0.0}],"attributes":{"host":"fixture-b","region":"us"}},
+    {"timestamp":"2023-11-14T22:13:20.000000000Z","metrics":[{"name":"interop_multi.c","kind":"gauge","value":1.0}],"attributes":{"host":"fixture-a","region":"eu"}},
+    {"timestamp":"2023-11-14T22:13:20.000000000Z","metrics":[{"name":"interop_multi.e","kind":"gauge","value":5.0}],"attributes":{"host":"fixture-a","region":"eu"}},
+    {"timestamp":"2023-11-14T22:13:20.000000000Z","metrics":[{"name":"interop_multi.e","kind":"gauge","value":50.0}],"attributes":{"host":"fixture-b","region":"us"}},
+    {"timestamp":"2023-11-14T22:13:20.000000000Z","metrics":[{"name":"interop_types.b_false","kind":"gauge","value":0.0}],"attributes":{"host":"telegraf-fixture","kind":"all"}},
+    {"timestamp":"2023-11-14T22:13:20.000000000Z","metrics":[{"name":"interop_types.b_true","kind":"gauge","value":1.0}],"attributes":{"host":"telegraf-fixture","kind":"all"}},
+    {"timestamp":"2023-11-14T22:13:20.000000000Z","metrics":[{"name":"interop_types.f_exp","kind":"gauge","value":1.5e-7}],"attributes":{"host":"telegraf-fixture","kind":"all"}},
+    {"timestamp":"2023-11-14T22:13:20.000000000Z","metrics":[{"name":"interop_types.f_neg","kind":"gauge","value":-0.25}],"attributes":{"host":"telegraf-fixture","kind":"all"}},
+    {"timestamp":"2023-11-14T22:13:20.000000000Z","metrics":[{"name":"interop_types.f_plain","kind":"gauge","value":1.5}],"attributes":{"host":"telegraf-fixture","kind":"all"}},
+    {"timestamp":"2023-11-14T22:13:20.000000000Z","metrics":[{"name":"interop_types.i_max","kind":"gauge","value":9.223372036854776e18}],"attributes":{"host":"telegraf-fixture","kind":"all"}},
+    {"timestamp":"2023-11-14T22:13:20.000000000Z","metrics":[{"name":"interop_types.i_neg","kind":"gauge","value":-7.0}],"attributes":{"host":"telegraf-fixture","kind":"all"}},
+    {"timestamp":"2023-11-14T22:13:20.000000000Z","metrics":[{"name":"interop_types.i_pos","kind":"gauge","value":42.0}],"attributes":{"host":"telegraf-fixture","kind":"all"}},
+    {"timestamp":"2023-11-14T22:13:20.000000000Z","metrics":[{"name":"interop_types.u_big","kind":"gauge","value":1.8446744073709552e19}],"attributes":{"host":"telegraf-fixture","kind":"all"}},
+    {"timestamp":"2023-11-14T22:13:20.000000000Z","metrics":[{"name":"interop_types.u_small","kind":"gauge","value":3.0}],"attributes":{"host":"telegraf-fixture","kind":"all"}},
+    {"timestamp":"2026-10-13T17:53:34.000000000Z","metrics":[{"name":"mem.active","kind":"gauge","value":72904290304.0}],"attributes":{"host":"telegraf-fixture"}},
+    {"timestamp":"2026-10-13T17:53:34.000000000Z","metrics":[{"name":"mem.available","kind":"gauge","value":86061228032.0}],"attributes":{"host":"telegraf-fixture"}},
+    {"timestamp":"2026-10-13T17:53:34.000000000Z","metrics":[{"name":"mem.available_percent","kind":"gauge","value":64.08237687529636}],"attributes":{"host":"telegraf-fixture"}},
+    {"timestamp":"2026-10-13T17:53:34.000000000Z","metrics":[{"name":"mem.buffered","kind":"gauge","value":3219456.0}],"attributes":{"host":"telegraf-fixture"}},
+    {"timestamp":"2026-10-13T17:53:34.000000000Z","metrics":[{"name":"mem.cached","kind":"gauge","value":106140454912.0}],"attributes":{"host":"telegraf-fixture"}},
+    {"timestamp":"2026-10-13T17:53:34.000000000Z","metrics":[{"name":"mem.commit_limit","kind":"gauge","value":75738832896.0}],"attributes":{"host":"telegraf-fixture"}},
+    {"timestamp":"2026-10-13T17:53:34.000000000Z","metrics":[{"name":"mem.committed_as","kind":"gauge","value":67442835456.0}],"attributes":{"host":"telegraf-fixture"}},
+    {"timestamp":"2026-10-13T17:53:34.000000000Z","metrics":[{"name":"mem.dirty","kind":"gauge","value":23117824.0}],"attributes":{"host":"telegraf-fixture"}},
+    {"timestamp":"2026-10-13T17:53:34.000000000Z","metrics":[{"name":"mem.free","kind":"gauge","value":2348589056.0}],"attributes":{"host":"telegraf-fixture"}},
+    {"timestamp":"2026-10-13T17:53:34.000000000Z","metrics":[{"name":"mem.high_free","kind":"gauge","value":0.0}],"attributes":{"host":"telegraf-fixture"}},
+    {"timestamp":"2026-10-13T17:53:34.000000000Z","metrics":[{"name":"mem.high_total","kind":"gauge","value":0.0}],"attributes":{"host":"telegraf-fixture"}},
+    {"timestamp":"2026-10-13T17:53:34.000000000Z","metrics":[{"name":"mem.huge_page_size","kind":"gauge","value":2097152.0}],"attributes":{"host":"telegraf-fixture"}},
+    {"timestamp":"2026-10-13T17:53:34.000000000Z","metrics":[{"name":"mem.huge_pages_free","kind":"gauge","value":0.0}],"attributes":{"host":"telegraf-fixture"}},
+    {"timestamp":"2026-10-13T17:53:34.000000000Z","metrics":[{"name":"mem.huge_pages_total","kind":"gauge","value":0.0}],"attributes":{"host":"telegraf-fixture"}},
+    {"timestamp":"2026-10-13T17:53:34.000000000Z","metrics":[{"name":"mem.inactive","kind":"gauge","value":45819793408.0}],"attributes":{"host":"telegraf-fixture"}},
+    {"timestamp":"2026-10-13T17:53:34.000000000Z","metrics":[{"name":"mem.low_free","kind":"gauge","value":0.0}],"attributes":{"host":"telegraf-fixture"}},
+    {"timestamp":"2026-10-13T17:53:34.000000000Z","metrics":[{"name":"mem.low_total","kind":"gauge","value":0.0}],"attributes":{"host":"telegraf-fixture"}},
+    {"timestamp":"2026-10-13T17:53:34.000000000Z","metrics":[{"name":"mem.mapped","kind":"gauge","value":1498140672.0}],"attributes":{"host":"telegraf-fixture"}},
+    {"timestamp":"2026-10-13T17:53:34.000000000Z","metrics":[{"name":"mem.page_tables","kind":"gauge","value":172269568.0}],"attributes":{"host":"telegraf-fixture"}},
+    {"timestamp":"2026-10-13T17:53:34.000000000Z","metrics":[{"name":"mem.shared","kind":"gauge","value":21153751040.0}],"attributes":{"host":"telegraf-fixture"}},
+    {"timestamp":"2026-10-13T17:53:34.000000000Z","metrics":[{"name":"mem.slab","kind":"gauge","value":4363173888.0}],"attributes":{"host":"telegraf-fixture"}},
+    {"timestamp":"2026-10-13T17:53:34.000000000Z","metrics":[{"name":"mem.sreclaimable","kind":"gauge","value":2912071680.0}],"attributes":{"host":"telegraf-fixture"}},
+    {"timestamp":"2026-10-13T17:53:34.000000000Z","metrics":[{"name":"mem.sunreclaim","kind":"gauge","value":1451102208.0}],"attributes":{"host":"telegraf-fixture"}},
+    {"timestamp":"2026-10-13T17:53:34.000000000Z","metrics":[{"name":"mem.swap_cached","kind":"gauge","value":12288.0}],"attributes":{"host":"telegraf-fixture"}},
+    {"timestamp":"2026-10-13T17:53:34.000000000Z","metrics":[{"name":"mem.swap_free","kind":"gauge","value":217088.0}],"attributes":{"host":"telegraf-fixture"}},
+    {"timestamp":"2026-10-13T17:53:34.000000000Z","metrics":[{"name":"mem.swap_total","kind":"gauge","value":8589930496.0}],"attributes":{"host":"telegraf-fixture"}},
+    {"timestamp":"2026-10-13T17:53:34.000000000Z","metrics":[{"name":"mem.total","kind":"gauge","value":134297808896.0}],"attributes":{"host":"telegraf-fixture"}},
+    {"timestamp":"2026-10-13T17:53:34.000000000Z","metrics":[{"name":"mem.used","kind":"gauge","value":48236580864.0}],"attributes":{"host":"telegraf-fixture"}},
+    {"timestamp":"2026-10-13T17:53:34.000000000Z","metrics":[{"name":"mem.used_percent","kind":"gauge","value":35.91762312470364}],"attributes":{"host":"telegraf-fixture"}},
+    {"timestamp":"2026-10-13T17:53:34.000000000Z","metrics":[{"name":"mem.vmalloc_chunk","kind":"gauge","value":0.0}],"attributes":{"host":"telegraf-fixture"}},
+    {"timestamp":"2026-10-13T17:53:34.000000000Z","metrics":[{"name":"mem.vmalloc_total","kind":"gauge","value":35184372087808.0}],"attributes":{"host":"telegraf-fixture"}},
+    {"timestamp":"2026-10-13T17:53:34.000000000Z","metrics":[{"name":"mem.vmalloc_used","kind":"gauge","value":191447040.0}],"attributes":{"host":"telegraf-fixture"}},
+    {"timestamp":"2026-10-13T17:53:34.000000000Z","metrics":[{"name":"mem.write_back","kind":"gauge","value":20480.0}],"attributes":{"host":"telegraf-fixture"}},
+    {"timestamp":"2026-10-13T17:53:34.000000000Z","metrics":[{"name":"mem.write_back_tmp","kind":"gauge","value":0.0}],"attributes":{"host":"telegraf-fixture"}},
+    {"timestamp":"2026-10-13T17:53:34.000000000Z","metrics":[{"name":"system.load1","kind":"gauge","value":8.45}],"attributes":{"host":"telegraf-fixture"}},
+    {"timestamp":"2026-10-13T17:53:34.000000000Z","metrics":[{"name":"system.load15","kind":"gauge","value":8.7}],"attributes":{"host":"telegraf-fixture"}},
+    {"timestamp":"2026-10-13T17:53:34.000000000Z","metrics":[{"name":"system.load5","kind":"gauge","value":8.89}],"attributes":{"host":"telegraf-fixture"}},
+    {"timestamp":"2026-10-13T17:53:34.000000000Z","metrics":[{"name":"system.n_cpus","kind":"gauge","value":32.0}],"attributes":{"host":"telegraf-fixture"}},
+    {"timestamp":"2026-10-13T17:53:34.000000000Z","metrics":[{"name":"system.n_physical_cpus","kind":"gauge","value":16.0}],"attributes":{"host":"telegraf-fixture"}},
+    {"timestamp":"2026-10-13T17:53:34.000000000Z","metrics":[{"name":"system.uptime","kind":"gauge","value":578142.0}],"attributes":{"host":"telegraf-fixture"}}
+  ], "counters": {
+    "logit.output.metrics.normalized{component=out,kind=graphite_out,reason=bool_value,role=sink}": 4,
+    "logit.output.metrics.normalized{component=out,kind=graphite_out,reason=path_sanitized,role=sink}": 2,
+    "logit.output.metrics.normalized{component=out,kind=graphite_out,reason=tag_sanitized,role=sink}": 4
+  }},
+  "typed-attributes": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"temperature","kind":"gauge","value":21.5}],"attributes":{"count":"7","room":"lab"}}
+  ], "counters": {
+    "logit.output.tags.omitted{component=out,kind=graphite_out,reason=unrepresentable,role=sink}": 3
+  }},
+  "unsigned-field": {"events": [
+    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"net.bytes_recv","kind":"gauge","value":1.8446744073709552e19}],"attributes":{"host":"web-01"}},
+    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"net.errors","kind":"gauge","value":0.0}],"attributes":{"host":"web-01"}}
+  ], "counters": {}}
+}

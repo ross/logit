@@ -1,0 +1,13 @@
+# otlp_in's metrics cases into graphite_out, with nothing between: sums and gauges as bare
+# datapoints, resource and point attributes as carbon tags, and histograms, exponential
+# histograms, and summaries skipped under the default `multi_value: skip`.
+# `path:` names one case so `logit run` can run this by hand; the transit spec runs every case in
+# that file's directory (spec/transit/README.md).
+components:
+  case:
+    type: replay_in
+    path: ../cases/otlp/sums.json
+  out:
+    type: graphite_out
+    sources: [case]
+    endpoint: 127.0.0.1:2003

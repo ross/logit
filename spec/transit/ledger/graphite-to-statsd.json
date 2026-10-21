@@ -4,7 +4,6 @@
     {"sink":"statsd_out","row":"attributes/string_value","cell":1,"observed":["exact"]},
     {"sink":"statsd_out","row":"gauge/f64","cell":0,"observed":["exact"]},
     {"sink":"statsd_out","row":"gauge/negative","cell":0,"observed":["degraded"]},
-    {"sink":"statsd_out","row":"record/name_unsafe","cell":0,"observed":["exact"]},
     {"sink":"statsd_out","row":"record/superseded","cell":0,"observed":["exact"]}
   ],
   "unspecified": []

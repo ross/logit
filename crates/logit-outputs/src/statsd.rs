@@ -1953,7 +1953,7 @@ fn sanitize_into(out: &mut String, s: &str, forbidden: impl Fn(char) -> bool) {
 
 /// Forbidden in a metric name and a tag key (module doc's "Sanitization" section). A `:` in a key
 /// would reparse as a shorter key, since `parse_line` splits a tag on its first colon.
-fn is_forbidden_in_name(c: char) -> bool {
+pub fn is_forbidden_in_name(c: char) -> bool {
     matches!(c, ':' | '|' | '@' | '#' | ',' | '\n' | '\r' | '\0')
         || c.is_control()
         || c.is_whitespace()

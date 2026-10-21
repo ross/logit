@@ -692,7 +692,7 @@ fn sanitize_into(out: &mut String, s: &str, forbidden: impl Fn(char) -> bool) ->
 
 /// [`sanitize_into`] for a tag value, which also substitutes a **leading** `~` (reserved by
 /// carbon's tag grammar); a `~` elsewhere rides through.
-fn sanitize_tag_value_into(out: &mut String, s: &str) -> bool {
+pub fn sanitize_tag_value_into(out: &mut String, s: &str) -> bool {
     let mut substituted = false;
     for (i, c) in s.chars().enumerate() {
         if is_forbidden_in_tag_value(c) || (i == 0 && c == '~') {
@@ -708,19 +708,19 @@ fn sanitize_tag_value_into(out: &mut String, s: &str) -> bool {
 /// Forbidden in a path: `;` opens the tag segment, whitespace ends the field, a control byte would
 /// corrupt line framing, and `/`/`\` are whisper's **directory separators**. Unicode whitespace,
 /// per [`super`]'s "Sanitization" section.
-fn is_forbidden_in_path(c: char) -> bool {
+pub fn is_forbidden_in_path(c: char) -> bool {
     matches!(c, ';' | '/' | '\\') || c.is_whitespace() || c.is_control()
 }
 
 /// Forbidden in a tag name: carbon's `TaggedSeries` grammar reserves `;` (tag separator), `=`
 /// (name/value separator), and `!`/`^` (query operators), plus whitespace and control bytes.
-fn is_forbidden_in_tag_name(c: char) -> bool {
+pub fn is_forbidden_in_tag_name(c: char) -> bool {
     matches!(c, ';' | '!' | '^' | '=') || c.is_whitespace() || c.is_control()
 }
 
 /// Forbidden anywhere in a tag value. `=` is legal (carbon splits on the *first* `=`, so `k=a=b`
 /// is `k` → `a=b`), and so are `!`/`^`. The leading-`~` rule is in [`sanitize_tag_value_into`].
-fn is_forbidden_in_tag_value(c: char) -> bool {
+pub fn is_forbidden_in_tag_value(c: char) -> bool {
     c == ';' || c.is_whitespace() || c.is_control()
 }
 
