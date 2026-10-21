@@ -2614,7 +2614,8 @@ mod tests {
     }
 
     /// On an event over the tag limit nothing is written, so nothing counts how a series would
-    /// have looked: no degrade, no normalization, no omitted tag. A cumulative kind's drop still counts.
+    /// have looked: no degrade, no normalization, no omitted tag. A cumulative kind's drop still
+    /// counts.
     #[test]
     fn a_record_the_tag_limit_leaves_off_counts_no_degrade() {
         let (mut e, registry) = otlp_encoder(HistogramOptions::default());

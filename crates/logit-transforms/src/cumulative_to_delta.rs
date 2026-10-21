@@ -1118,7 +1118,7 @@ mod tests {
         assert_eq!(rig.sum("logit.transform.series.start_adjusted", &[]), 0.0);
     }
 
-    // ---- The ADR's rule 4: a start change with no reset -----------------------------------------
+    // ---- Rule 5: a start change with no reset ---------------------------------------------------
 
     /// A start that jitters, moves to before the previous point, or equals the timestamp on
     /// every point is differenced, never re-sent whole.

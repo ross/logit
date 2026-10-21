@@ -115,7 +115,7 @@
 //! | `set` | `estimate` |
 //! | `histogram` | `temporality`, `buckets:` a block of `<bound>: <count>` in wire order (each count that bucket's own, the last bound `inf`), then `sum`, `min`, `max` when present |
 //! | `exponential_histogram` | `scale`, `temporality`, `count`, `zero_count`, `zero_threshold`, `positive:`/`negative:` each a block of `offset` and `counts: [..]` (omitted when its counts are empty), then `sum`, `min`, `max` when present |
-//! | `summary` | `count`, `sum`, `quantiles:` a block of `<q>: <value>` in wire order |
+//! | `summary` | `temporality`, `count`, `sum`, `quantiles:` a block of `<q>: <value>` in wire order |
 //!
 //! A `sum`'s `value`, a `gauge`'s `value`, a `gauge_delta`'s `delta`, and an exemplar's `value`
 //! print as the number, then
