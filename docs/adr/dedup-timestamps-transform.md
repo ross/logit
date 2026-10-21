@@ -110,11 +110,14 @@ event, untouched, and is counted `passed_through` with the reason the table give
 **surviving record is the latest-timestamp record among the records that can merge**, and the
 later in batch order on a tie. Its event keeps its own, untruncated timestamp, and every other
 mergeable record in the set is removed from its event. A `NaN` or infinite delta value, a marker
-on a delta kind, and a kind with no merge rule can't merge on their own. A layout, a `sample_rate`, or a value type is
-compared with the survivor's, so the latest record that can merge on its own sets them, and a
-record that differs from it passes through. The rest fold into the survivor in batch order, and a
-record whose addition would overflow the running total passes through. What the surviving record
-carries depends on the kind:
+on a delta kind, and a kind with no merge rule can't merge on their own. For the kinds that merge
+(delta `Sum`, delta `Histogram`, delta `ExponentialHistogram`, and `Samples`), a layout, a
+`sample_rate`, or a value type is compared with the survivor's, so the latest record that can merge
+on its own sets them, and a record that differs from it passes through. The last-write-wins kinds
+(`Gauge`, the cumulative kinds, and a stale marker on either) take part in last write wins whatever
+their value type or layout. The rest fold into the survivor in batch order, and a record whose
+addition would overflow the running total passes through. What the surviving record carries depends
+on the kind:
 
 | Kind | Rule |
 |---|---|
@@ -143,9 +146,17 @@ A passed-through record reaches the sink as a duplicate of the survivor, and a s
 hold both drops it and counts it as loss: in remote-write mode,
 `logit.output.metrics.dropped{reason="duplicate_timestamp"}` after
 [the sink-side counter](#the-sink-side-counter) change. That's intended. A record passed through
-for any reason but `no_recorded_value` is broken input, such as a `NaN` increment, two layouts for
-one series, or a total past the integer range, so its loss is reported as loss, not as an outcome
-the config asked for. A stale marker beside delta values isn't broken input. It passes through so
+for any reason but `no_recorded_value` or `no_merge_rule` is broken input, such as a `NaN`
+increment, two layouts for one series, or a total past the integer range, so its loss is reported
+as loss, not as an outcome the config asked for. `no_merge_rule` is the other exception:
+
+- A passed-through `GaugeDelta` never reaches a sink as a duplicate. Every sink drops it, counted
+  `dropped{reason="unresolved_gauge_delta"}`, and `aggregate` is what resolves it.
+- A delta `Summary` pair, such as `cumulative_to_delta` makes, is legitimate input. `datadog_out`
+  sends both points and Datadog keeps the higher. That loss is counted only once `datadog_out`
+  gets the `duplicate_timestamp` counter ([The sink-side counter](#the-sink-side-counter)).
+
+A stale marker beside delta values isn't broken input. It passes through so
 that no increment is lost, and neither sink drops the pair as a duplicate: `prometheus_out`'s
 remote-write writes a flagged delta `Sum` as a stale marker and drops the unflagged delta,
 counted `dropped{reason="unresolved_delta"}`, and `datadog_out` skips the marker, counted
