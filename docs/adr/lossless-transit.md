@@ -1,6 +1,6 @@
 ---
 created: 2026-09-10
-updated: 2026-10-19
+updated: 2026-10-21
 ---
 
 # Lossless like-protocol transit: the internal model is a superset of every supported wire protocol
@@ -76,6 +76,10 @@ round-trip test can assert equality against a concrete expectation rather than "
 - OTLP timestamp saturation: a wire timestamp past `i64::MAX` nanoseconds decodes as `i64::MAX`
   and relays as 2262-04-11T23:47:16.854775807Z, not the original value (the 2026-09-25
   amendment below).
+- An OTLP histogram's overflow count: `metrics.proto` requires a `HistogramDataPoint`'s
+  `bucket_counts` to hold one more entry than `explicit_bounds`, so `otlp_out` writes a `0`
+  overflow count for a histogram whose last bound is finite, which reads back as an empty `+Inf`
+  bucket. A conforming point relays unchanged; one sent with no overflow count gains it.
 - A listener's sender attributes: under `peer:`, `proxy_protocol:`, or an HTTP listener's
   `forwarded:`, `network.peer.*` or `client.*` is added to every event, an opt-in addition the
   sender never sent ([ADR `listener-peer-address`](listener-peer-address.md), [ADR

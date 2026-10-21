@@ -1,0 +1,22 @@
+{
+  "name": "empty",
+  "kind": "exponential",
+  "input": {
+    "scale": 0,
+    "zero_count": 0,
+    "positive": {
+      "offset": 0,
+      "counts": []
+    },
+    "negative": {
+      "offset": 0,
+      "counts": []
+    },
+    "count": 0,
+    "sum": "0",
+    "min": null,
+    "max": null
+  },
+  "outcome": "empty",
+  "detail": "Failed to convert DDSketch into Sketch: couldn't convert ddsketch into Sketch: couldn't compute maximum of ddsketch: MinIndex of empty store is undefined"
+}

@@ -1,0 +1,42 @@
+{
+  "name": "huge-finite-open-last",
+  "kind": "explicit",
+  "input": {
+    "bounds": ["1e+300"],
+    "counts": [0, 5],
+    "count": 5,
+    "sum": "5e+300",
+    "min": null,
+    "max": null
+  },
+  "series": [
+    {
+      "name": "case.count",
+      "tags": [],
+      "type": "count",
+      "value": "5",
+      "unit": ""
+    },
+    {
+      "name": "case.sum",
+      "tags": [],
+      "type": "count",
+      "value": "5e+300",
+      "unit": "millisecond"
+    },
+    {
+      "name": "case.bucket",
+      "tags": ["lower_bound:-inf", "upper_bound:1e+300.0"],
+      "type": "count",
+      "value": "0",
+      "unit": ""
+    },
+    {
+      "name": "case.bucket",
+      "tags": ["lower_bound:1e+300.0", "upper_bound:inf"],
+      "type": "count",
+      "value": "5",
+      "unit": ""
+    }
+  ]
+}

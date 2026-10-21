@@ -1,0 +1,22 @@
+{
+  "go": "go1.27.2",
+  "arch": "amd64 (AVX, FMA)",
+  "modules": [
+    {
+      "path": "github.com/DataDog/datadog-agent/pkg/opentelemetry-mapping-go/otlp/metrics",
+      "version": "v0.84.0-devel.0.20261020233841-45132452b855"
+    },
+    {
+      "path": "github.com/DataDog/datadog-agent/pkg/util/quantile",
+      "version": "v0.84.0-devel.0.20261020233841-45132452b855"
+    },
+    {
+      "path": "github.com/DataDog/sketches-go",
+      "version": "v1.4.8"
+    },
+    {
+      "path": "go.opentelemetry.io/collector/pdata",
+      "version": "v1.69.0"
+    }
+  ]
+}

@@ -1,0 +1,36 @@
+{
+  "name": "straddle-agent-min",
+  "kind": "exponential",
+  "input": {
+    "scale": 0,
+    "zero_count": 0,
+    "positive": {
+      "offset": -32,
+      "counts": [3, 4, 5, 6]
+    },
+    "negative": {
+      "offset": 0,
+      "counts": []
+    },
+    "count": 18,
+    "sum": "1e-08",
+    "min": null,
+    "max": null
+  },
+  "series": [
+    {
+      "name": "case.count",
+      "tags": [],
+      "type": "count",
+      "value": "18",
+      "unit": ""
+    },
+    {
+      "name": "case.sum",
+      "tags": [],
+      "type": "count",
+      "value": "1e-08",
+      "unit": "millisecond"
+    }
+  ]
+}

@@ -1,0 +1,30 @@
+{
+  "name": "seeded-30",
+  "kind": "exponential",
+  "input": {
+    "scale": 9,
+    "zero_count": 64,
+    "positive": {
+      "offset": -3412,
+      "counts": [1227, 315, 1207, 0, 0, 458]
+    },
+    "negative": {
+      "offset": 0,
+      "counts": []
+    },
+    "count": 3271,
+    "sum": "47490.23758892006",
+    "min": null,
+    "max": "4723.27967403386"
+  },
+  "outcome": "sketch",
+  "sketch": {
+    "k": [0, 1040, 1041],
+    "n": [64, 2749, 458],
+    "cnt": 3271,
+    "sum": "47490.23758892006",
+    "min": "0",
+    "max": "4723.27967403386",
+    "avg": "14.518568507771343"
+  }
+}

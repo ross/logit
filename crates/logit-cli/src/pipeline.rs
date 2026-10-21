@@ -81,15 +81,16 @@ use logit_proto::graphite::{
 use logit_transforms::{
     AggregateTemporality as TransformTemporality, Aggregator, Arrays as TransformArrays,
     Bucket as BucketTransform, BucketBound, BucketField, CsvParser,
-    Distributions as TransformDistributions, DropAttributes as DropAttributesTransform,
-    DropProvenance as DropProvenanceTransform, DropSignals as DropSignalsTransform,
-    DropStale as DropStaleTransform, Fields as TransformFields, Flatten as FlattenTransform,
+    CumulativeToDelta as CumulativeToDeltaTransform, Distributions as TransformDistributions,
+    DropAttributes as DropAttributesTransform, DropProvenance as DropProvenanceTransform,
+    DropSignals as DropSignalsTransform, DropStale as DropStaleTransform,
+    Fields as TransformFields, Flatten as FlattenTransform,
     HasAttributes as HasAttributesTransform, HasProvenance as HasProvenanceTransform,
     HasSignal as HasSignalTransform, HasStale as HasStaleTransform,
     HttpAccess as HttpAccessTransform, HttpAccessConfig, IdFormat as TraceIdFormatTransform,
-    InvalidUtf8 as TransformInvalidUtf8, JsonParser, Keep as KeepTransform,
-    KeepSignals as KeepSignalsTransform, KeepValues as KeepValuesTransform, Kv as KvTransform,
-    KvMetrics as KvMetricsTransform, LineProtocol as LineProtocolTransform,
+    InitialValue as TransformInitialValue, InvalidUtf8 as TransformInvalidUtf8, JsonParser,
+    Keep as KeepTransform, KeepSignals as KeepSignalsTransform, KeepValues as KeepValuesTransform,
+    Kv as KvTransform, KvMetrics as KvMetricsTransform, LineProtocol as LineProtocolTransform,
     Logfmt as LogfmtTransform, MatchMode as TransformMatchMode, Normalize as TransformNormalize,
     RegexParser, Remove as RemoveTransform, Route as RouteTransform, Sample as SampleTransform,
     Scale as ScaleTransform, Set as SetTransform, Sets as TransformSets, Shape as ShapeTransform,
@@ -1018,6 +1019,17 @@ pub(crate) fn build_spec(
                 .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
                 .with_telemetry(telemetry.clone()),
         )),
+        CumulativeToDelta { initial_value, max_staleness, max_series } => {
+            NodeSpec::Transform(Box::new(
+                CumulativeToDeltaTransform::new(
+                    to_initial_value(*initial_value),
+                    *max_staleness,
+                    *max_series,
+                )
+                .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
+                .with_telemetry(telemetry.clone()),
+            ))
+        }
         Json { skip_to_brace, invalid_utf8 } => NodeSpec::Transform(Box::new(
             JsonParser::new(*skip_to_brace)
                 .with_invalid_utf8(to_invalid_utf8(*invalid_utf8))
@@ -1236,10 +1248,11 @@ pub(crate) fn build_spec(
                 write_config(&component.buffer),
             )
         }
-        DatadogOut { api_key, site, endpoints, compression, timeout, headers, tls } => {
+        DatadogOut { api_key, site, endpoints, compression, timeout, headers, tls, histograms } => {
             let output = DatadogOutput::new(api_key)?
                 .with_site(site.clone())
                 .with_default_host(hostname.clone())
+                .with_histograms(to_datadog_histograms(histograms))
                 .with_endpoints(DatadogOutEndpoints {
                     api: endpoints.api.clone(),
                     logs: endpoints.logs.clone(),
@@ -1757,14 +1770,31 @@ pub(crate) fn sink_encoder(
                 compression: to_remote_write_encoding(*compression),
             }
         }
-        DatadogOut { .. } => SinkEncoder::Datadog(
+        DatadogOut { histograms, .. } => SinkEncoder::Datadog(
             logit_proto::datadog::DatadogEncoder::new()
                 .with_telemetry(telemetry.clone())
                 .with_diagnostics(diag.clone())
-                .with_default_host(Some(hostname.clone())),
+                .with_default_host(Some(hostname.clone()))
+                .with_histograms(to_datadog_histograms(histograms)),
         ),
         other => anyhow::bail!("{} has no encoder this driver reaches", graph::kind_name(other)),
     })
+}
+
+/// `datadog_out`'s `histograms:` block as its encoder's options.
+fn to_datadog_histograms(
+    h: &logit_config::DatadogHistograms,
+) -> logit_proto::datadog::HistogramOptions {
+    use logit_config::DatadogHistogramMode as Config;
+    use logit_proto::datadog::HistogramMode as Mode;
+    logit_proto::datadog::HistogramOptions {
+        mode: match h.mode {
+            Config::Distributions => Mode::Distributions,
+            Config::Counters => Mode::Counters,
+            Config::Nobuckets => Mode::NoBuckets,
+        },
+        send_aggregation_metrics: h.send_aggregation_metrics,
+    }
 }
 
 /// `statsd_out`'s encoder from its config fields, before the sink applies its line cap.
@@ -2146,6 +2176,15 @@ fn to_sets(mode: logit_config::Sets) -> TransformSets {
     match mode {
         logit_config::Sets::Estimate => TransformSets::Estimate,
         logit_config::Sets::Members => TransformSets::Members,
+    }
+}
+
+/// `logit_config::InitialValue` -> `logit_transforms::InitialValue`.
+fn to_initial_value(mode: logit_config::InitialValue) -> TransformInitialValue {
+    match mode {
+        logit_config::InitialValue::Auto => TransformInitialValue::Auto,
+        logit_config::InitialValue::Keep => TransformInitialValue::Keep,
+        logit_config::InitialValue::Drop => TransformInitialValue::Drop,
     }
 }
 
@@ -5817,6 +5856,26 @@ mod tests {
         };
         assert!(matches!(
             build_spec("drop_provenance", &component, Path::new(""), None).unwrap().0,
+            NodeSpec::Transform(_)
+        ));
+    }
+
+    #[test]
+    fn build_spec_builds_cumulative_to_delta() {
+        let component = ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
+            sources: vec!["in".to_string()],
+            targets: Vec::new(),
+            consumers: vec!["out".to_string()],
+            kind: ComponentKind::CumulativeToDelta {
+                initial_value: logit_config::InitialValue::Drop,
+                max_staleness: Duration::from_secs(600),
+                max_series: 5,
+            },
+        };
+        assert!(matches!(
+            build_spec("deltas", &component, Path::new(""), None).unwrap().0,
             NodeSpec::Transform(_)
         ));
     }

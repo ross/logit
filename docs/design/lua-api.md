@@ -826,7 +826,7 @@ against a future surface that *can* shrink the list, such as an `event.metrics:r
 | `kind` | string (list above) | read-only | every kind |
 | `exemplars` | table, array of exemplar tables | read-only | every kind (empty when none) |
 | `value` | number | read on `sum`/`gauge`/`gauge_delta`; **write only on `sum`/`gauge`** | see note below |
-| `temporality` | `"delta"` or `"cumulative"` | read on `sum`/`histogram`/`exponential_histogram`; **write only on `sum`** | see note below |
+| `temporality` | `"delta"` or `"cumulative"` | read on `sum`/`histogram`/`exponential_histogram`/`summary`; **write only on `sum`** | see note below |
 | `monotonic` | boolean | read/write on `sum` only | `sum` |
 | `values` | table, array of numbers | read-only | `samples` |
 | `sample_rate` | number | read-only | `samples` |
@@ -1056,6 +1056,7 @@ Per kind (only that kind's keys are accepted):
 | `summary` | `quantiles` | array of `{quantile = <number in [0, 1]>, value = <finite number>}` rows; may be empty and need not be sorted | **required** |
 | | `count` | non-negative integer, or a string of decimal digits | **required** |
 | | `sum` | finite number | **required** |
+| | `temporality` | `"delta"` or `"cumulative"` | **required** -- core documents no default for it |
 
 A `sum`'s or `gauge`'s `type` decides what its `value` must be:
 

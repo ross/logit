@@ -1,0 +1,14 @@
+{
+  "name": "non-monotonic-after-cap",
+  "kind": "explicit",
+  "input": {
+    "bounds": ["1", "2", "0.5"],
+    "counts": [0, 268431361, 1, 0],
+    "count": 268431362,
+    "sum": "9",
+    "min": null,
+    "max": null
+  },
+  "outcome": "too_many_observations",
+  "detail": "Dropped histogram data point: too many observations for a distribution"
+}

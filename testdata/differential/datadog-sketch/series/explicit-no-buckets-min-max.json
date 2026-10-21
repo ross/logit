@@ -1,0 +1,42 @@
+{
+  "name": "no-buckets-min-max",
+  "kind": "explicit",
+  "input": {
+    "bounds": [],
+    "counts": [],
+    "count": 0,
+    "sum": "12",
+    "min": "1",
+    "max": "9"
+  },
+  "series": [
+    {
+      "name": "case.count",
+      "tags": [],
+      "type": "count",
+      "value": "0",
+      "unit": ""
+    },
+    {
+      "name": "case.sum",
+      "tags": [],
+      "type": "count",
+      "value": "12",
+      "unit": "millisecond"
+    },
+    {
+      "name": "case.min",
+      "tags": [],
+      "type": "gauge",
+      "value": "1",
+      "unit": "millisecond"
+    },
+    {
+      "name": "case.max",
+      "tags": [],
+      "type": "gauge",
+      "value": "9",
+      "unit": "millisecond"
+    }
+  ]
+}

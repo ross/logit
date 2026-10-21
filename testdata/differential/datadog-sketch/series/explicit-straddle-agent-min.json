@@ -1,0 +1,49 @@
+{
+  "name": "straddle-agent-min",
+  "kind": "explicit",
+  "input": {
+    "bounds": ["1e-10", "1e-08"],
+    "counts": [0, 1000, 0],
+    "count": 1000,
+    "sum": "5e-06",
+    "min": null,
+    "max": null
+  },
+  "series": [
+    {
+      "name": "case.count",
+      "tags": [],
+      "type": "count",
+      "value": "1000",
+      "unit": ""
+    },
+    {
+      "name": "case.sum",
+      "tags": [],
+      "type": "count",
+      "value": "5e-06",
+      "unit": "millisecond"
+    },
+    {
+      "name": "case.bucket",
+      "tags": ["lower_bound:-inf", "upper_bound:1e-10"],
+      "type": "count",
+      "value": "0",
+      "unit": ""
+    },
+    {
+      "name": "case.bucket",
+      "tags": ["lower_bound:1e-10", "upper_bound:1e-08"],
+      "type": "count",
+      "value": "1000",
+      "unit": ""
+    },
+    {
+      "name": "case.bucket",
+      "tags": ["lower_bound:1e-08", "upper_bound:inf"],
+      "type": "count",
+      "value": "0",
+      "unit": ""
+    }
+  ]
+}

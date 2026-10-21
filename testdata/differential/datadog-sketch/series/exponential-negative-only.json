@@ -1,0 +1,36 @@
+{
+  "name": "negative-only",
+  "kind": "exponential",
+  "input": {
+    "scale": 1,
+    "zero_count": 0,
+    "positive": {
+      "offset": 0,
+      "counts": []
+    },
+    "negative": {
+      "offset": -2,
+      "counts": [3, 8, 1]
+    },
+    "count": 12,
+    "sum": "-8",
+    "min": null,
+    "max": null
+  },
+  "series": [
+    {
+      "name": "case.count",
+      "tags": [],
+      "type": "count",
+      "value": "12",
+      "unit": ""
+    },
+    {
+      "name": "case.sum",
+      "tags": [],
+      "type": "count",
+      "value": "-8",
+      "unit": "millisecond"
+    }
+  ]
+}

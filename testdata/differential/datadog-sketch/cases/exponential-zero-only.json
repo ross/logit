@@ -1,0 +1,30 @@
+{
+  "name": "zero-only",
+  "kind": "exponential",
+  "input": {
+    "scale": 0,
+    "zero_count": 5,
+    "positive": {
+      "offset": 0,
+      "counts": []
+    },
+    "negative": {
+      "offset": 0,
+      "counts": []
+    },
+    "count": 5,
+    "sum": "0",
+    "min": null,
+    "max": null
+  },
+  "outcome": "sketch",
+  "sketch": {
+    "k": [0],
+    "n": [5],
+    "cnt": 5,
+    "sum": "0",
+    "min": "0",
+    "max": "0",
+    "avg": "0"
+  }
+}

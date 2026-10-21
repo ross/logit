@@ -37,7 +37,7 @@
     {"sink":"prometheus_out","row":"sum/delta_nonmonotonic","cell":0,"observed":["dropped"]},
     {"sink":"prometheus_out","row":"sum/f64","cell":0,"observed":[]},
     {"sink":"prometheus_out","row":"sum/i64","cell":0,"observed":["normalized"]},
-    {"sink":"prometheus_out","row":"summary","cell":0,"observed":[]}
+    {"sink":"prometheus_out","row":"summary/cumulative","cell":0,"observed":[]}
   ],
   "unspecified": []
 }

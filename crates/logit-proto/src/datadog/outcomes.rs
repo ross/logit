@@ -128,8 +128,7 @@ impl StatsIn {
 /// A metric record an encoder didn't send.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum MetricOut {
-    /// A kind the series route has no form for, named by [`logit_core::MetricKind::name`] or
-    /// the temporality it can't carry (`cumulative_sum`, `non_monotonic_delta_sum`).
+    /// A kind no Datadog route has a form for (`set_members`).
     Kind(&'static str),
     /// A relative gauge nothing upstream resolved to an absolute value.
     GaugeDelta,
@@ -137,19 +136,29 @@ pub(super) enum MetricOut {
     EmptySketch,
     NonFiniteValue,
     OversizedSketch,
+    /// A histogram bucket whose upper bound keys below its lower bound.
+    NonMonotonicBounds,
+    /// An exponential histogram outside the Agent sketch's key range.
+    SketchRange,
     InvalidStatus,
+    /// A cumulative kind Datadog's exporter would difference, with no `cumulative_to_delta`
+    /// upstream.
+    UnresolvedCumulative,
 }
 
 impl MetricOut {
     #[cfg(test)]
-    const ALL: [MetricOut; 7] = [
-        MetricOut::Kind("summary"),
+    const ALL: [MetricOut; 10] = [
+        MetricOut::Kind("set_members"),
         MetricOut::GaugeDelta,
         MetricOut::NoRecordedValue,
         MetricOut::EmptySketch,
         MetricOut::NonFiniteValue,
         MetricOut::OversizedSketch,
+        MetricOut::NonMonotonicBounds,
+        MetricOut::SketchRange,
         MetricOut::InvalidStatus,
+        MetricOut::UnresolvedCumulative,
     ];
 
     /// The counter and its one tag.
@@ -161,7 +170,14 @@ impl MetricOut {
             MetricOut::EmptySketch => (OUTPUT_METRICS_SKIPPED, ("reason", "empty_sketch")),
             MetricOut::NonFiniteValue => (OUTPUT_METRICS_DROPPED, ("reason", "non_finite_value")),
             MetricOut::OversizedSketch => (OUTPUT_METRICS_DROPPED, ("reason", "oversized_sketch")),
+            MetricOut::NonMonotonicBounds => {
+                (OUTPUT_METRICS_DROPPED, ("reason", "non_monotonic_bounds"))
+            }
+            MetricOut::SketchRange => (OUTPUT_METRICS_DROPPED, ("reason", "sketch_range")),
             MetricOut::InvalidStatus => (OUTPUT_METRICS_DROPPED, ("reason", "invalid_status")),
+            MetricOut::UnresolvedCumulative => {
+                (OUTPUT_METRICS_DROPPED, ("reason", "unresolved_cumulative"))
+            }
         }
     }
 }
@@ -192,13 +208,16 @@ mod tests {
             assert_eq!(outcome.metric(), want, "{outcome:?}");
         }
         let want_out = [
-            (OUTPUT_METRICS_SKIPPED, ("metric_kind", "summary")),
+            (OUTPUT_METRICS_SKIPPED, ("metric_kind", "set_members")),
             (OUTPUT_METRICS_DROPPED, ("reason", "unresolved_gauge_delta")),
             (OUTPUT_METRICS_SKIPPED, ("reason", "no_recorded_value")),
             (OUTPUT_METRICS_SKIPPED, ("reason", "empty_sketch")),
             (OUTPUT_METRICS_DROPPED, ("reason", "non_finite_value")),
             (OUTPUT_METRICS_DROPPED, ("reason", "oversized_sketch")),
+            (OUTPUT_METRICS_DROPPED, ("reason", "non_monotonic_bounds")),
+            (OUTPUT_METRICS_DROPPED, ("reason", "sketch_range")),
             (OUTPUT_METRICS_DROPPED, ("reason", "invalid_status")),
+            (OUTPUT_METRICS_DROPPED, ("reason", "unresolved_cumulative")),
         ];
         for (outcome, want) in MetricOut::ALL.into_iter().zip(want_out) {
             assert_eq!(outcome.counter(), want, "{outcome:?}");

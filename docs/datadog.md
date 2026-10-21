@@ -115,6 +115,47 @@ Sending directly needs no Agent: it's one hop, and it works wherever HTTPS does.
   and Datadog's OTLP mapping loses parts of a Datadog span
   ([the ADR's "Context"](adr/datadog-agent-and-intake-relay.md#context)).
 
+### OTel metrics to Datadog: `otlp_in` into `datadog_out`
+
+An OpenTelemetry SDK or Collector can send its metrics to `otlp_in`, and `datadog_out` writes
+each kind as the Collector's `datadogexporter` does by default, so a metric reaches the same
+Datadog series whichever way it went
+([ADR `datadog-otlp-metric-mapping`](adr/datadog-otlp-metric-mapping.md)):
+
+| OTLP kind | What Datadog gets |
+|---|---|
+| delta `Sum`, monotonic or not | a `count` |
+| cumulative non-monotonic `Sum` (an up-down counter) | a `gauge` |
+| `Gauge` | a `gauge` |
+| delta `Histogram` | a distribution, bin for bin as the exporter builds it; under `histograms.mode: counters`, a `<name>.bucket` count per bucket |
+| delta `ExponentialHistogram` | a distribution |
+| `Summary` | `<name>.quantile` gauges; for a delta one, also `<name>.count` and `<name>.sum` counts |
+
+`histograms.send_aggregation_metrics: true` adds `<name>.count`, `<name>.sum`, `<name>.min`, and
+`<name>.max` series for each delta histogram and exponential histogram, as the exporter's setting
+of the same name does. Two differences from the exporter remain: a series carries its OTLP unit
+as written rather than Datadog's name for it, and tags come from the event's attributes and
+resource as for every other `datadog_out` metric, not from the exporter's resource-attribute
+tables (`docs/known-gaps/datadog.md`).
+
+**Convert cumulative metrics to delta first.** Most SDKs default to cumulative temporality, and
+Datadog needs a monotonic `Sum`, a `Histogram`, an `ExponentialHistogram`, and a summary's
+`.count` and `.sum` as per-interval deltas. The exporter differences them against a per-series
+cache; in `logit`, place a `cumulative_to_delta` between `otlp_in` and `datadog_out`, which keeps
+that state ([ADR `cumulative-to-delta-transform`](adr/cumulative-to-delta-transform.md),
+[fixtures/otlp-to-datadog.yaml](../fixtures/otlp-to-datadog.yaml)). Without it, `datadog_out`
+drops each, counted `logit.output.metrics.dropped{reason="unresolved_cumulative"}` or, for a
+summary's two series, `logit.output.fields.dropped{reason="unresolved_cumulative"}`, with a
+throttled `unresolved_cumulative` warning. The other remedy is to configure the SDK for delta
+temporality, with the `OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE=delta` environment
+variable.
+
+`cumulative_to_delta` keeps its state in memory. After a restart of `logit`, each series' first
+point only records a baseline under the default `initial_value: auto`, so the counts between the
+last point before the restart and the first after it are lost. A delta point resent after a
+transport error double-counts at Datadog's sketch route, though a series `count` point
+overwrites at its series and timestamp.
+
 ### From Datadog: dual-ship, tee, then cut over
 
 A migration away from Datadog runs through the intake stand-in in three stages:
@@ -167,8 +208,11 @@ strings, and only the series route says so. `datadog_out` drops such a record be
 counts it `logit.output.records.dropped{reason="too_many_tags"}`, with a throttled `too_many_tags`
 diagnostic naming its metric. Every attribute the encoder renders as a tag counts, resource
 attributes and repeated values included, but `host.name`, the device, and the other fields with
-their own place on the wire don't. To keep a metric, cut its tags upstream with `keep` or
-`remove`.
+their own place on the wire don't. A histogram's `.bucket` series carries two more tags, its
+bounds, so on a metric with 99 or 100 tags it's dropped; a summary's `.quantile` series carries
+one more, its quantile, so on a metric with 100 tags it's dropped. Each counts one, and the
+metric's other series go out. To keep a metric, cut
+its tags upstream with `keep` or `remove`.
 
 The series route also names what it dropped from an accepted request in its `202` body, such as
 a point more than 10 minutes in the future when the sender's clock runs ahead. `datadog_out`

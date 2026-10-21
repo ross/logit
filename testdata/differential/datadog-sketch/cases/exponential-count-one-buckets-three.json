@@ -1,0 +1,30 @@
+{
+  "name": "count-one-buckets-three",
+  "kind": "exponential",
+  "input": {
+    "scale": 0,
+    "zero_count": 0,
+    "positive": {
+      "offset": 0,
+      "counts": [1, 1, 1]
+    },
+    "negative": {
+      "offset": 0,
+      "counts": []
+    },
+    "count": 1,
+    "sum": "4",
+    "min": null,
+    "max": null
+  },
+  "outcome": "sketch",
+  "sketch": {
+    "k": [1364, 1409, 1454],
+    "n": [1, 1, 1],
+    "cnt": 1,
+    "sum": "4",
+    "min": "4",
+    "max": "4",
+    "avg": "4"
+  }
+}

@@ -1,0 +1,36 @@
+{
+  "name": "count-one-buckets-three",
+  "kind": "exponential",
+  "input": {
+    "scale": 0,
+    "zero_count": 0,
+    "positive": {
+      "offset": 0,
+      "counts": [1, 1, 1]
+    },
+    "negative": {
+      "offset": 0,
+      "counts": []
+    },
+    "count": 1,
+    "sum": "4",
+    "min": null,
+    "max": null
+  },
+  "series": [
+    {
+      "name": "case.count",
+      "tags": [],
+      "type": "count",
+      "value": "1",
+      "unit": ""
+    },
+    {
+      "name": "case.sum",
+      "tags": [],
+      "type": "count",
+      "value": "4",
+      "unit": "millisecond"
+    }
+  ]
+}

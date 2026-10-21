@@ -1,0 +1,84 @@
+{
+  "name": "seeded-07",
+  "kind": "explicit",
+  "input": {
+    "bounds": ["4807.015376930703", "4807.663521438261", "4808.618364652936", "4809.086425739949", "5063.536289280107"],
+    "counts": [1453, 576, 0, 603, 127, 367],
+    "count": 3126,
+    "sum": "38359.247078966226",
+    "min": "4806.201357765138",
+    "max": "5065.524710792525"
+  },
+  "series": [
+    {
+      "name": "case.count",
+      "tags": [],
+      "type": "count",
+      "value": "3126",
+      "unit": ""
+    },
+    {
+      "name": "case.sum",
+      "tags": [],
+      "type": "count",
+      "value": "38359.247078966226",
+      "unit": "millisecond"
+    },
+    {
+      "name": "case.min",
+      "tags": [],
+      "type": "gauge",
+      "value": "4806.201357765138",
+      "unit": "millisecond"
+    },
+    {
+      "name": "case.max",
+      "tags": [],
+      "type": "gauge",
+      "value": "5065.524710792525",
+      "unit": "millisecond"
+    },
+    {
+      "name": "case.bucket",
+      "tags": ["lower_bound:-inf", "upper_bound:4807.015376930703"],
+      "type": "count",
+      "value": "1453",
+      "unit": ""
+    },
+    {
+      "name": "case.bucket",
+      "tags": ["lower_bound:4807.015376930703", "upper_bound:4807.663521438261"],
+      "type": "count",
+      "value": "576",
+      "unit": ""
+    },
+    {
+      "name": "case.bucket",
+      "tags": ["lower_bound:4807.663521438261", "upper_bound:4808.618364652936"],
+      "type": "count",
+      "value": "0",
+      "unit": ""
+    },
+    {
+      "name": "case.bucket",
+      "tags": ["lower_bound:4808.618364652936", "upper_bound:4809.086425739949"],
+      "type": "count",
+      "value": "603",
+      "unit": ""
+    },
+    {
+      "name": "case.bucket",
+      "tags": ["lower_bound:4809.086425739949", "upper_bound:5063.536289280107"],
+      "type": "count",
+      "value": "127",
+      "unit": ""
+    },
+    {
+      "name": "case.bucket",
+      "tags": ["lower_bound:5063.536289280107", "upper_bound:inf"],
+      "type": "count",
+      "value": "367",
+      "unit": ""
+    }
+  ]
+}

@@ -1,0 +1,36 @@
+{
+  "name": "non-finite-quantiles",
+  "kind": "summary",
+  "input": {
+    "quantiles": [
+      ["NaN", "1"],
+      ["+Inf", "2"],
+      ["-Inf", "3"]
+    ],
+    "count": 3,
+    "sum": "6"
+  },
+  "series": [
+    {
+      "name": "case.quantile",
+      "tags": ["quantile:nan"],
+      "type": "gauge",
+      "value": "1",
+      "unit": "millisecond"
+    },
+    {
+      "name": "case.quantile",
+      "tags": ["quantile:inf"],
+      "type": "gauge",
+      "value": "2",
+      "unit": "millisecond"
+    },
+    {
+      "name": "case.quantile",
+      "tags": ["quantile:-inf"],
+      "type": "gauge",
+      "value": "3",
+      "unit": "millisecond"
+    }
+  ]
+}
