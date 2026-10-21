@@ -46,9 +46,10 @@ implements it once for all three; its module doc is the canonical statement of t
    duration and totals. `buffer_full_at_shutdown` (info) when the queue's owner finishes with an
    announced episode still open.
 3. **The minute repeat under `block` comes from the waiting push.** No new push arrives while one
-   waits, so the waiting push awaits its `Notified` under `tokio::time::timeout_at` at the next due
-   repeat, writes the line when the timeout fires, and goes around its wait loop as after any
-   wakeup. The wake re-checks the queue and changes nothing else.
+   waits, so the waiting push awaits its `Notified` under `tokio::time::timeout_at`, writes the
+   line on the first wake at or past its due time, and goes around its wait loop as after any
+   wakeup. The wake re-checks the queue and changes nothing else. Decision 6 sets the wake's
+   period.
 4. **An episode ends below `recover_below`.** After a consumer-side change (a `commit`, `pop`,
    `pop_many`, or `take_all`, or the spool's `commit` or corrupt-record skip), if utilization, the
    same `max(items ratio, bytes ratio)` the `utilization` gauge reports, is below `recover_below`
@@ -68,6 +69,18 @@ implements it once for all three; its module doc is the canonical statement of t
    A drop guard held across the wait lowers it however the wait ends: room, `close`, or the push
    future's cancellation. The `*.push.blocked.duration` timers are unchanged: one sample per wait,
    recorded when the wait's `Timer` drops, which on cancellation records the time to cancellation.
+
+   **The waiting push re-writes the `1` every 500 ms.** `ComponentBuffer::drain` takes every
+   point, so a gauge written only on its transitions shows in one `internal` drain window and then
+   vanishes for the rest of a multi-hour stall, and an exposition endpoint expires it after five
+   minutes (internal-telemetry.md's "Why a constant is re-emitted"). The re-write rides the same
+   wake as the minute repeat: decision 3's `timeout_at` deadline is 500 ms ahead instead of the
+   next repeat's due time, and each wake re-writes the gauge, writes a repeat if one is due, and
+   goes around the wait loop. A queue doesn't know `internal`'s `interval`, which any positive
+   duration can set, so the period is a constant: half the shortest interval a shipped config uses
+   (`1s`), so each window of 500 ms or longer holds a write. A shorter `interval` can see windows
+   without it. The deadline is always 500 ms past the wake, never a due time already passed, so a
+   repeat that isn't written (the episode closed under a waiting push) can't make the wait spin.
 7. **Shutdown isn't a recovery.** `SinkStore::finish` and the UDP listener's residual drain end an
    open episode before they empty the queue, so the emptying they do (counted `shutdown`, or
    spooled for the next start) never reads as `buffer_recovered`.
@@ -89,8 +102,13 @@ implements it once for all three; its module doc is the canonical statement of t
   consumer side matches what recovery means: the consumer drained it.
 - **Logging from `write_loop`.** It sees a held head, not a full queue, and the receive queue has
   no `write_loop`.
-- **A spawned task per queue for the repeat.** A task to supervise and cancel at shutdown, for a
-  wake the waiting push can take itself.
+- **A spawned task per queue for the repeat and the gauge.** A task to supervise and cancel at
+  shutdown, for a wake the waiting push can take itself.
+- **Re-writing the gauge from an existing periodic sampler.** The only per-component sampler,
+  `sockstat`'s once-a-second read, runs on UDP listeners alone; sinks have none.
+- **A gauge that survives a drain.** A held-value kind in `ComponentBuffer` would fix every
+  transition-only gauge at once, but changes the drain contract every component relies on, for one
+  new metric.
 
 ## Consequences
 - An operator sees `buffer_full` within the push that fills a buffer, then one line a minute, then
