@@ -593,11 +593,12 @@ lets a mark resume commit the frame as delivered; `docs/known-gaps/native-hop.md
 skips one ([ADR `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md)). The remedy is
 unchanged: an `aggregate` with `temporality: cumulative` upstream.
 
-## Amendment (2026-10-20): `datadog_out` drops a cumulative `Sum`, and `cumulative_to_delta` undoes the delta remedy
+## Amendment (2026-10-20): `cumulative_to_delta` undoes the delta remedy, and `datadog_out` then drops a cumulative `Sum`
 
 [ADR `datadog-otlp-metric-mapping`](datadog-otlp-metric-mapping.md) has `datadog_out` count a
 cumulative monotonic `Sum` as loss, `logit.output.metrics.dropped{reason="unresolved_cumulative"}`,
-where item 5 says its series route skips one. The new `cumulative_to_delta` transform
+where item 5 says its series route skips one, once a stage exists that converts it; until then
+it stays skipped. The new `cumulative_to_delta` transform
 ([ADR `cumulative-to-delta-transform`](cumulative-to-delta-transform.md)) is its remedy, and
 runs item 5's remedy in reverse: upstream of it a resent cumulative point is skipped as a
 duplicate, and downstream a resent delta adds at a destination that sums what it receives. A

@@ -54,7 +54,16 @@ translator would have differenced, naming `cumulative_to_delta` as the remedy.**
 The `unresolved_cumulative` reason follows `prometheus_out`'s `unresolved_delta`: a missing
 upstream stage is loss under [ADR `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md),
 since a different config would have delivered it. Its throttled diagnostic names
-`cumulative_to_delta`. For a cumulative `ExponentialHistogram` the transform makes `logit` a
+`cumulative_to_delta`.
+
+**Sequencing.** That vocabulary ADR's "Decisions the vocabulary forces" keeps `datadog_out`'s
+cumulative `Sum` at `output.metrics.skipped{metric_kind}` until a stage exists that converts it,
+because an operator alerted on it would have nothing to change. That holds while W1 ships without
+the transform, so W1 counts each cumulative kind above as
+`metrics.skipped{metric_kind=cumulative_sum | histogram | exponential_histogram}`, with the same
+diagnostic naming the coming transform. W2, which lands `cumulative_to_delta`, switches them to
+`metrics.dropped{reason="unresolved_cumulative"}` and amends that bullet to say its condition is
+met. The table states the end state. For a cumulative `ExponentialHistogram` the transform makes `logit` a
 superset of the translator, which can't send one at all.
 
 Two rows change what the sink does today. A delta non-monotonic `Sum` was skipped as having no
@@ -151,7 +160,9 @@ arithmetic included.
   once per summary record, with the same throttled diagnostic naming `cumulative_to_delta`.
   `*.omitted` would hide it from an operator who alerts only on `*.dropped`. No
   `fields.dropped` counter exists yet; it's new, inside the loss vocabulary's pattern. A
-  `cumulative_to_delta` upstream makes them sendable.
+  `cumulative_to_delta` upstream makes them sendable. Sequenced as the cumulative kinds are: W1,
+  with no transform to place yet, counts them `logit.output.fields.omitted{reason="unresolved_cumulative"}`,
+  and W2 switches the name to `fields.dropped`.
 
 #### Summary temporality
 
@@ -209,9 +220,10 @@ nowhere to say what it is. `logit` is pre-release, so the field is a plain addit
   enum strings either way.
 - **Honor `datadog.metric.as_type`.** It would match the translator for a Collector-relayed rate,
   but let any producer's attribute change the wire type.
-- **Keep skipping a cumulative kind instead of dropping it.** The loss vocabulary reserves
+- **Keep skipping a cumulative kind once the transform exists.** The loss vocabulary reserves
   `skipped` for nothing to carry, an operator's choice, or a format with no form; a cumulative
-  sum has a form once a stage upstream converts it.
+  sum has a form once a stage upstream converts it. Skipping is right only until that stage
+  exists, which is why W1 still skips.
 
 ## Consequences
 - `datadog_out` gains a sketch builder for explicit buckets, a port of `InsertInterpolate`
@@ -225,8 +237,11 @@ nowhere to say what it is. `logit` is pre-release, so the field is a plain addit
 - A delta `Summary` is a new state for every summary sink, and `otlp_out` and `prometheus_out`
   drop one.
 - [ADR `delivery-semantics`](delivery-semantics.md)'s item 5 says `datadog_out`'s series route
-  skips a cumulative `Sum`; it now drops one, counted, and a resent delta `count` point still
-  overwrites at its `(series, timestamp)`.
+  skips a cumulative `Sum`. That stays true through W1; from W2 it drops one, counted, and a
+  resent delta `count` point still overwrites at its `(series, timestamp)`.
+- [ADR `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md)'s `datadog_out` bullet gets an
+  amendment in W2, when its condition (a stage that converts a cumulative `Sum`) is met. Its
+  non-monotonic half is resolved in W1, which writes both non-monotonic forms.
 
 ## Open questions
 - **Summary temporality (Ross).** Adding `temporality` to `Summary` makes `otlp_out` and

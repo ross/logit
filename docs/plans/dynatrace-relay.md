@@ -331,7 +331,7 @@ needs a stateful per-series cumulative-to-delta stage with reset detection and a
 the Collector's `cumulativetodelta` processor being the precedent. That transform is
 `cumulative_to_delta` ([ADR `cumulative-to-delta-transform`](../adr/cumulative-to-delta-transform.md)),
 built by the `ddotlp` stream's W2 ([`ddotlp.md`](ddotlp.md)) outside the `dt` stream, because
-`datadog_out` (which drops a cumulative `Sum`) and New Relic's OTLP path (which drops cumulative state after 5 min) want it as well. This plan records
+`datadog_out` (which can't send a cumulative `Sum`) and New Relic's OTLP path (which drops cumulative state after 5 min) want it as well. This plan records
 the requirement and the dependency; W4 and W5 name the transform in their `needs_delta`
 diagnostic, and W6's end-to-end runs need it landed.
 

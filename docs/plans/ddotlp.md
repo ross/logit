@@ -42,21 +42,24 @@ Non-goals:
 ### W1: `datadog_out`'s stateless mappings
 
 - **Sums.** A delta `Sum`, monotonic or not, is a `count`; a cumulative non-monotonic one is a
-  `gauge`; a cumulative monotonic one is `metrics.dropped{reason="unresolved_cumulative"}` with a
-  throttled diagnostic naming `cumulative_to_delta`.
+  `gauge`; a cumulative monotonic one stays `metrics.skipped{metric_kind=cumulative_sum}`, with a
+  throttled diagnostic naming the coming `cumulative_to_delta`. It isn't `dropped` yet: no stage
+  converts it, so an alerted operator would have nothing to change (the ADR's "Sequencing").
 - **Explicit-bucket histograms.** A port of the Agent's `quantile.Agent.InsertInterpolate` and the
   translator's `getSketchBuckets` (bound fixes, summary overrides, the `MaxCount` cutoff),
   building a `Mapping::agent` `DdSketch` directly. The `histograms:` block (`mode:
   distributions | counters | nobuckets`, `send_aggregation_metrics`) in `logit-config`, with its
   validation and `script/schema`. Counters mode's `.bucket` series and the `formatFloat` tag form.
-  A cumulative `Histogram` is `unresolved_cumulative`.
+  A cumulative `Histogram` stays `metrics.skipped{metric_kind=histogram}`, and a cumulative
+  `ExponentialHistogram` `metrics.skipped{metric_kind=exponential_histogram}`, each with the same
+  diagnostic.
 - **Exponential histograms.** A port of `exponentialHistogramToDDSketch`,
   `ConvertDDSketchIntoSketch`, and `sketches-go`'s `ChangeMapping` and `LogarithmicMapping`
   arithmetic. `rebin_to_agent` isn't reused; the ADR's "Exponential histograms" section says why.
   The helpers in `logit-core/src/sketch.rs` it needs (`key`, `lower_bound`) become visible to the
   port, or the port lives in `logit-core`.
 - **Summaries.** `.quantile` gauges for every summary. A cumulative summary's `.count` and
-  `.sum` aren't written, counted as loss, `logit.output.fields.dropped{reason="unresolved_cumulative"}`
+  `.sum` aren't written, counted `logit.output.fields.omitted{reason="unresolved_cumulative"}`
   (a new counter, with its row in [internal-telemetry.md](../design/internal-telemetry.md)), once
   per summary record, with the diagnostic naming `cumulative_to_delta`; W2 adds the delta case.
 - **Differential corpus.** `script/differential datadog-sketch` builds a small Go program against
@@ -93,6 +96,13 @@ Non-goals:
   `docs/design/memory.md` gets a row for its per-series state, and `allocations.rs` a pin for one
   converted record.
 - **`datadog_out`'s delta summary.** `.count` (no unit) and `.sum` as `count` points.
+- **Loss counters flip.** With the transform in place, W1's interim counts become loss:
+  `metrics.skipped{metric_kind=cumulative_sum | histogram | exponential_histogram}` becomes
+  `metrics.dropped{reason="unresolved_cumulative"}`, and `fields.omitted{reason="unresolved_cumulative"}`
+  becomes `fields.dropped{reason="unresolved_cumulative"}`. The transit spec cells and
+  `internal-telemetry.md` follow, and
+  [ADR `telemetry-loss-vocabulary`](../adr/telemetry-loss-vocabulary.md)'s `datadog_out` bullet
+  gets an amendment saying the condition it named is met.
 - **Transit flows.** `otlp_in -> cumulative_to_delta -> datadog_out` over every cumulative case,
   and `prometheus_in -> cumulative_to_delta -> statsd_out`, which turns a scrape's counters into
   `|c` lines where today they leave as `|g`, degraded. A flow for `otlp_out` joins if a delta-only
