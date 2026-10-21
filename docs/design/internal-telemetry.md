@@ -2470,7 +2470,10 @@ it takes (the class table above).
 - `logit.output.metrics.skipped{metric_kind="exponential_histogram"}` in registry mode, where
   neither text dialect has a form for one, and `{reason="no_recorded_value"}`.
 - `logit.output.metrics.degraded{metric_kind="non_monotonic_sum"|"distribution"|"samples"|"set"|
-  "set_members"}` and `{reason="exemplar_omitted"|"unit_not_suffix"}` (render-side).
+  "set_members"}` and `{reason="exemplar_omitted"|"unit_not_suffix"}` (render-side). Sender mode
+  counts `exemplar_omitted` too, for an exemplar with no `_total` or `_bucket` series to ride or
+  over OpenMetrics' 128-code-point label budget, which Prometheus's receiver would drop without
+  failing the request.
 - `logit.output.labels.omitted{reason="unrepresentable"|"reserved"|"collision"}`. An exemplar
   key's `collision` or `reserved` is render-side in registry mode, counted once per OpenMetrics
   scrape.

@@ -697,6 +697,66 @@ fn exemplar_label_names_are_sanitized_as_series_label_names_are() {
     }
 }
 
+/// An exemplar over OpenMetrics' 128-code-point label budget is left out in both versions and
+/// counted `degraded{reason="exemplar_omitted"}` once, on a counter and on a histogram bucket
+/// alike, since Prometheus's receiver would drop it without failing the request. A key collision
+/// inside a left-out exemplar counts nothing, because no label of it is written.
+#[test]
+fn an_over_budget_exemplar_is_left_out_and_counted_in_both_versions() {
+    let long = "x".repeat(200);
+    let exemplar = |value: f64, attributes: &[(&str, &str)]| {
+        let mut filtered_attributes = AttrMap::new();
+        for (key, value) in attributes {
+            filtered_attributes.insert(key, Value::str(*value));
+        }
+        Exemplar {
+            timestamp: TIMESTAMP,
+            value: MetricValue::F64(value),
+            trace: None,
+            filtered_attributes,
+        }
+    };
+    let counter = MetricFamily {
+        series: vec![Series {
+            timestamp: Some(TIMESTAMP),
+            exemplars: vec![
+                exemplar(0.5, &[("kept", "1")]),
+                exemplar(0.6, &[("a.b", "dot"), ("a-b", "dash"), ("detail", &long)]),
+            ],
+            ..Series::new(vec![], Point::Counter(3.0))
+        }],
+        ..MetricFamily::new("requests_total", FamilyType::Counter)
+    };
+    let histogram = MetricFamily {
+        series: vec![Series {
+            timestamp: Some(TIMESTAMP),
+            exemplars: vec![exemplar(0.05, &[("detail", &long)]), exemplar(5.0, &[("kept", "1")])],
+            ..Series::new(
+                vec![],
+                Point::Histogram {
+                    buckets: vec![(0.1, 2), (f64::INFINITY, 3)],
+                    sum: Some(5.1),
+                    count: 3,
+                },
+            )
+        }],
+        ..MetricFamily::new("latency", FamilyType::Histogram)
+    };
+    let families = vec![vec![counter, histogram]];
+    for version in [Version::V1, Version::V2] {
+        let (body, reasons) = encode_reasons(&families, version);
+        assert_eq!(reasons, [("exemplar_omitted".to_string(), 2)], "{version:?}");
+        let decoded = decode(&body, version, &mut PrometheusDecoder::new()).expect("must decode");
+        assert_eq!(decoded.exemplars, 2, "{version:?}");
+        let values = |name: &str| -> Vec<f64> {
+            let family = decoded.groups[0].iter().find(|f| f.name == name).expect("family");
+            family.series[0].exemplars.iter().map(|e| e.value.as_f64()).collect()
+        };
+        assert_eq!(values("requests_total"), [0.5], "{version:?}");
+        assert_eq!(values("latency"), [5.0], "{version:?}");
+    }
+}
+
 /// Encodes with telemetry attached and returns every `logit.output.*` reason it recorded --
 /// `metrics.{dropped,skipped,degraded}` and `labels.omitted` alike -- alongside the body.
 fn encode_reasons(groups: &[Vec<MetricFamily>], version: Version) -> (Vec<u8>, Vec<(String, u64)>) {
