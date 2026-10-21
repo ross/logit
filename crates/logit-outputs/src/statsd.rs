@@ -298,6 +298,7 @@
 //! | `attributes/timestamp_value`, otherwise | lost | `logit.output.tags.omitted{reason=unrepresentable}` | A timestamp value has no tag form and is left off, counted. |
 //! | `attributes/private_carrier`, under `format: statsd` | lost | `logit.output.fields.omitted{reason=dialect}` | Plain statsd has no `\|c:`, `\|e:`, `\|card:`, or `\|T` segment, so those carriers are omitted, counted once per carrier per line; the type carrier survives as the line's type, `h` and `d` as `ms`. |
 //! | `attributes/private_carrier`, otherwise | exact | -- | A `_logit.statsd.*` carrier is written as its own segment or field and statsd_in stamps it back. |
+//! | `attributes/prometheus_target` | lost | uncounted | The scrape target isn't a tag and is left off, uncounted. |
 //! | `attributes/foreign_carrier` | lost | uncounted | Another protocol's `_logit.` carrier isn't a tag and is left off, uncounted. Under `format: dogstatsd`, `_logit.datadog.hostless` on a record with no `host`, no non-empty `host.name`, and no non-empty `h:` field is an empty `host:` tag, which statsd_in reads back as an empty `host`. |
 //! | `attributes/resource_attribute`, under `format: statsd` | lost | `logit.output.tags.omitted{reason=dialect}` | Plain statsd has no tags. |
 //! | `attributes/resource_attribute`, otherwise | normalized | `resource_merged` | A resource attribute is written as a tag, the event's value winning on a shared key, and reads back as an event attribute. |

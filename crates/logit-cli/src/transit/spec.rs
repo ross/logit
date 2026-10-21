@@ -1044,6 +1044,8 @@ flow_tests! {
     prometheus_to_datadog => "prometheus-to-datadog",
     prometheus_to_influxdb => "prometheus-to-influxdb",
     prometheus_to_otlp => "prometheus-to-otlp",
+    prometheus_to_prometheus_remote_write => "prometheus-to-prometheus-remote-write",
+    prometheus_to_prometheus => "prometheus-to-prometheus",
     prometheus_to_statsd => "prometheus-to-statsd",
     statsd_aggregate_cumulative => "statsd-aggregate-cumulative",
     statsd_aggregate_samples => "statsd-aggregate-samples",

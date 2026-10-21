@@ -1715,15 +1715,39 @@ rows:
           The family type and timestamp carriers are consumed into the wire form and a scrape
           stamps them back; OpenMetrics has no `untyped`, so that type reads back as `unknown`.
           Remote-write gives every sample a timestamp, so prometheus_in stamps no timestamp
-          carrier. The resource's `_logit.prometheus.target` isn't written: a scrape of
-          prometheus_out stamps its own URL, and the original target survives only as the
-          `instance` label.
+          carrier; the sample's own timestamp reads back unchanged.
       datadog_out:
         class: lost
         counter: logit.output.tags.omitted{reason=no_wire_form}
         text: >-
           A `_logit.datadog.*` carrier rides in its own wire field; one the route has no field for
           is left off, counted.
+  - kind: attributes
+    feature: prometheus_target
+    cells:
+      statsd_out:
+        class: lost
+        reason: uncounted
+        text: The scrape target isn't a tag and is left off, uncounted.
+      prometheus_out:
+        class: normalized
+        reason: retargeted
+        text: >-
+          The resource's `_logit.prometheus.target` isn't written. A scrape of prometheus_out
+          stamps prometheus_out's own URL, and a remote-write receiver stamps none; the original
+          target's identity survives as the `instance` label.
+      influxdb_out:
+        class: lost
+        reason: uncounted
+        text: The scrape target isn't a tag and is left off, uncounted.
+      otlp_out:
+        class: lost
+        reason: uncounted
+        text: The scrape target is private and isn't an OTLP attribute, uncounted.
+      datadog_out:
+        class: lost
+        reason: uncounted
+        text: The scrape target is never a tag; it isn't written or counted.
   - kind: attributes
     feature: foreign_carrier
     cells:

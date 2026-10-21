@@ -29,7 +29,8 @@
 //! to weight 1 the field row `record/sample_rate_unweighted` for its rate, left out the same way.
 //! It reaches an
 //! `attributes` row for each attribute, event or resource: a `_logit.<protocol>.` carrier of the
-//! sink's own protocol is `private_carrier`, a `_logit.datadog.` carrier on a log, a Datadog
+//! sink's own protocol is `private_carrier`, `_logit.prometheus.target` `prometheus_target` at
+//! every sink, a `_logit.datadog.` carrier on a log, a Datadog
 //! event, or a service check `datadog_carrier_log`, any other `_logit.` key `foreign_carrier`, an
 //! event
 //! attribute by its value (`string_value`, `bool_value`, `number_value`, `array_value`,
@@ -133,7 +134,9 @@ use logit_outputs::ndjson::render_ndjson;
 use logit_proto::event_json::EventJsonDecoder;
 use logit_proto::influxdb::ATTR_MEASUREMENT;
 use logit_proto::prometheus::text::exposed_exemplar_keys;
-use logit_proto::prometheus::{sanitize_label_name, sanitize_metric_name};
+use logit_proto::prometheus::{
+    sanitize_label_name, sanitize_metric_name, ATTR_TARGET, ATTR_TIMESTAMP,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -1331,7 +1334,9 @@ fn field_rows(rec: &Rec, protocol: &str) -> Vec<(String, Option<String>, Field)>
             datadog::Route::Log | datadog::Route::Event | datadog::Route::Check
         );
     let carrier = |key: &str| {
-        if key.starts_with("_logit.datadog.") && json_route {
+        if key == ATTR_TARGET {
+            Some("prometheus_target")
+        } else if key.starts_with("_logit.datadog.") && json_route {
             Some("datadog_carrier_log")
         } else if key.starts_with(&own) {
             Some("private_carrier")
@@ -1410,6 +1415,28 @@ fn observe_field(field: &Field, input: &Rec, out: &Rec, spelling: Spelling) -> C
             None => Class::Lost,
         },
         Field::Attribute { key, resource } => {
+            if matches!(spelling, Spelling::Prometheus) {
+                // A relay re-targets: a scrape of `prometheus_out` stamps its own URL, and the
+                // original target survives as the `instance` label.
+                if *resource && key == ATTR_TARGET {
+                    return match (
+                        either_side(out, "instance", false),
+                        input.resource.get("instance"),
+                    ) {
+                        (Some(read), Some(want)) if read == want => Class::Normalized,
+                        _ => Class::Lost,
+                    };
+                }
+                // Remote-write sends every sample's timestamp, so the receiver stamps no marker;
+                // the marker's meaning survives as the record's own timestamp.
+                if !*resource && key == ATTR_TIMESTAMP && either_side(out, key, false).is_none() {
+                    return if out.timestamp == input.timestamp {
+                        Class::Normalized
+                    } else {
+                        Class::Lost
+                    };
+                }
+            }
             let (want, want_tags) = if *resource {
                 (&input.resource[key], input.resource_types.get(key))
             } else {
@@ -2571,6 +2598,50 @@ mod tests {
             r#"{{T},"metrics":[{"name":"g","kind":"gauge","value":"NaN","flags":1,"no_recorded_value":true}]}"#,
         ]);
         assert_eq!(pair(&ins, &outs, Spelling::Prometheus).seen, [Some(Class::Exact)]);
+    }
+
+    /// `prometheus_out` writes no scrape target: the original target survives as the `instance`
+    /// label, so the target reads `normalized` only when that label holds the input's instance.
+    #[test]
+    fn a_prometheus_target_reads_normalized_when_its_instance_survives() {
+        let ins = recs(&[
+            r#"{{T},"metrics":[{"name":"g","kind":"gauge","value":1.0}],"resource":{"attributes":{"_logit.prometheus.target":"http://a:9100/metrics","instance":"a:9100"}}}"#,
+        ]);
+        let outs = recs(&[
+            r#"{{T},"metrics":[{"name":"g","kind":"gauge","value":1.0}],"attributes":{"instance":"a:9100"}}"#,
+            r#"{{T},"metrics":[{"name":"g","kind":"gauge","value":1.0}],"attributes":{"instance":"b:9100"}}"#,
+        ]);
+        let rows = field_rows(&ins[0], "prometheus");
+        let target = rows
+            .iter()
+            .find(|(_, f, _)| f.as_deref() == Some("prometheus_target"))
+            .map(|r| &r.2)
+            .expect("the target's row");
+        assert_eq!(
+            observe_field(target, &ins[0], &outs[0], Spelling::Prometheus),
+            Class::Normalized
+        );
+        assert_eq!(observe_field(target, &ins[0], &outs[1], Spelling::Prometheus), Class::Lost);
+        assert_eq!(observe_field(target, &ins[0], &outs[0], Spelling::Otlp), Class::Lost);
+    }
+
+    /// A remote-write receiver stamps no timestamp marker, so the marker reads `normalized` only
+    /// when the record's timestamp came back unchanged.
+    #[test]
+    fn a_prometheus_timestamp_marker_reads_normalized_when_the_timestamp_survives() {
+        let ins = recs(&[
+            r#"{{T},"metrics":[{"name":"g","kind":"gauge","value":1.0}],"attributes":{"_logit.prometheus.timestamp":true}}"#,
+        ]);
+        let outs = recs(&[
+            r#"{{T},"metrics":[{"name":"g","kind":"gauge","value":1.0}]}"#,
+            r#"{"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"g","kind":"gauge","value":1.0}]}"#,
+        ]);
+        let marker = Field::Attribute { key: ATTR_TIMESTAMP.to_string(), resource: false };
+        assert_eq!(
+            observe_field(&marker, &ins[0], &outs[0], Spelling::Prometheus),
+            Class::Normalized
+        );
+        assert_eq!(observe_field(&marker, &ins[0], &outs[1], Spelling::Prometheus), Class::Lost);
     }
 
     /// A histogram's `min` and `max` are `record/min_max`'s to compare, so a sink that drops them

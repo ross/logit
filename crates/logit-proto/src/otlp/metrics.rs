@@ -84,6 +84,7 @@
 //! | `attributes/map_value` | exact | -- | A key-value list attribute. |
 //! | `attributes/bytes_value` | exact | -- | A bytes attribute. |
 //! | `attributes/timestamp_value` | normalized | `timestamp_as_int` | OTLP has no timestamp value, so it's an integer of Unix nanoseconds. |
+//! | `attributes/prometheus_target` | lost | uncounted | The scrape target is private and isn't an OTLP attribute, uncounted. |
 //! | `attributes/foreign_carrier` | lost | uncounted | A `_logit.` carrier is private and isn't an OTLP attribute, uncounted. |
 //! | `attributes/resource_attribute` | exact | -- | A resource attribute. |
 //! | `attributes/scope` | exact | -- | The `InstrumentationScope` of the batch. |

@@ -293,9 +293,6 @@ and `otlp-to-datadog`. OTLP logs and traces wait for a later workstream.
 - `kafka_out` and `splunk_hec_out` columns: their metric forms are JSON documents with their own
   readers, and neither has a `_in` pair that reads metrics back the same way (`splunk_hec_in`
   does; it joins when a flow asks).
-- A `prometheus_in -> prometheus_out` flow. Every scrape case fails `attributes/private_carrier`
-  on `prometheus_in`'s target carrier, which no read-back restores, so the flow waits on a
-  decision about that cell ([the mappings known gaps](../known-gaps/mappings.md) has the cause).
 - Compressed JSON archives: gzip on `file_out`'s `format: json` rotation and `replay_in` reading a
   `.gz` file by its extension, added together in one follow-up (`docs/known-gaps/tailing.md`).
 
