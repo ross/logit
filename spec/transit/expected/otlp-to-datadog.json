@@ -26,6 +26,12 @@
   "gzip": {"events": [
     {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"uploads.completed","kind":"sum","value":5.0,"temporality":"delta","monotonic":true}],"attributes":{"host.name":"web-1","service.name":"checkout"}}
   ], "counters": {}},
+  "histogram-neg-inf-bound": {"events": [], "counters": {
+    "logit.output.metrics.dropped{component=out,kind=datadog_out,reason=unresolved_cumulative,role=sink}": 1
+  }},
+  "histogram-non-finite-bounds": {"events": [], "counters": {
+    "logit.output.metrics.dropped{component=out,kind=datadog_out,reason=unresolved_cumulative,role=sink}": 1
+  }},
   "histograms": {"events": [
     {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"http.server.request.duration","kind":"distribution","count":6,"sum":1.9,"min":0.05,"max":0.9,"avg":0.31666666666666665,"p50":0.17614127764963636,"p90":0.38241091101235614,"p95":0.49773454108044224,"p99":0.49773454108044224,"sketch":{"mapping":"agent","stats_exact":true,"count":6.0,"min":0.05,"max":0.9,"positive":[{"key":1189,"count":2.0},{"key":1226,"count":1.0},{"key":1249,"count":1.0},{"key":1276,"count":1.0},{"key":1293,"count":1.0}]}}],"attributes":{"host.name":"web-1","http.route":"/cart","service.name":"checkout"}}
   ], "counters": {

@@ -30,6 +30,12 @@
   "gzip": {"events": [
     {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"uploads.completed","kind":"sum","value":5.0,"temporality":"delta","monotonic":true}],"attributes":{"host.name":"web-1","service.name":"checkout"}}
   ], "counters": {}},
+  "histogram-neg-inf-bound": {"events": [], "counters": {
+    "logit.output.metrics.dropped{component=out,kind=datadog_out,reason=unresolved_cumulative,role=sink}": 1
+  }},
+  "histogram-non-finite-bounds": {"events": [], "counters": {
+    "logit.output.metrics.dropped{component=out,kind=datadog_out,reason=unresolved_cumulative,role=sink}": 1
+  }},
   "histograms": {"events": [
     {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"http.server.request.duration.bucket","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"host.name":"web-1","http.route":"/cart","lower_bound":"-inf","service.name":"checkout","upper_bound":"0.1"}},
     {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"http.server.request.duration.bucket","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"host.name":"web-1","http.route":"/cart","lower_bound":"0.5","service.name":"checkout","upper_bound":"inf"}},

@@ -43,8 +43,10 @@
 //! | `set_members` | skipped | `logit.output.metrics.skipped{metric_kind=set_members}` | OTLP has no cardinality type, so set members aren't written, with a throttled `otlp_set_members_metric_skipped` warning. |
 //! | `distribution` | degraded | `logit.output.metrics.degraded{metric_kind=distribution}` | An OTLP `Summary` of fixed quantiles with the sketch's own count and sum; OTLP has no mergeable sketch. |
 //! | `set` | skipped | `logit.output.metrics.skipped{metric_kind=set}` | OTLP has no cardinality type, so a set estimate isn't written, with a throttled `otlp_set_metric_skipped` warning. |
-//! | `histogram/delta` | exact | -- | An OTLP `Histogram` with delta temporality. |
-//! | `histogram/cumulative` | exact | -- | An OTLP `Histogram` with cumulative temporality. |
+//! | `histogram/delta` | normalized | `inf_bucket` | An OTLP `Histogram` with delta temporality. OTLP requires an overflow count above the highest bound, so a histogram whose last bound is finite reads back with an empty `+Inf` bucket. |
+//! | `histogram/cumulative` | normalized | `inf_bucket` | An OTLP `Histogram` with cumulative temporality. OTLP requires an overflow count above the highest bound, so a histogram whose last bound is finite reads back with an empty `+Inf` bucket. |
+//! | `histogram/nan_bound` | degraded | `logit.output.metrics.degraded{reason=non_finite_component}` | OTLP bounds are finite, so a `NaN` bound's count joins the overflow bucket. `count` and every cumulative count are kept. |
+//! | `histogram/neg_inf_bound` | degraded | `logit.output.metrics.degraded{reason=non_finite_component}` | OTLP bounds are finite, so a `-Inf` bound's count joins the first bucket. `count` and every cumulative count are kept. |
 //! | `exponential_histogram/delta` | exact | -- | An OTLP `ExponentialHistogram`, field for field. |
 //! | `exponential_histogram/cumulative` | exact | -- | An OTLP `ExponentialHistogram`, field for field. |
 //! | `summary/delta` | dropped | `logit.output.metrics.dropped{reason=unresolved_delta}` | OTLP defines every summary as cumulative, so a delta one is dropped, with a throttled `delta_summary_unresolved` warning. |
@@ -105,8 +107,14 @@
 //! follows the same rule, counted the same way, once per exemplar.
 //!
 //! - `Histogram{buckets,temporality,sum,min,max}` → `Histogram`: `buckets` holds per-bucket
-//!   counts, not cumulative ones, and a trailing `f64::INFINITY` bound becomes the implicit final
-//!   bucket `explicit_bounds` expects.
+//!   counts, not cumulative ones, and the `f64::INFINITY` bound's count becomes the overflow
+//!   bucket `explicit_bounds` leaves implicit. OTLP requires that overflow count whenever there's
+//!   a bound, so a histogram with no `+Inf` or `NaN` bucket writes it as `0` and reads back with
+//!   an empty `+Inf` bucket, the `inf_bucket` normalization. Finite bounds are sorted and equal ones merged,
+//!   since OTLP requires them strictly increasing. A `-Inf` bound's count joins the first bucket
+//!   and a `NaN` bound's joins the overflow, counted
+//!   `logit.output.metrics.degraded{reason="non_finite_component"}` once per record
+//!   ([`histogram_buckets`]).
 //! - `Summary{quantiles,count,sum}` → `Summary`: a quantile outside `[0, 1]` is written as is;
 //!   `docs/known-gaps/mappings.md`'s "Cross-protocol semantic gaps" section has the row. OTLP's
 //!   summary is cumulative by definition, so a delta one is dropped (`summary/delta` above).
@@ -129,8 +137,11 @@
 //! cumulative `Sum` stays a `Sum`. A `NumberDataPoint`'s `as_int` decodes as `MetricValue::I64`
 //! and `as_double` as `F64`, so `otlp_in -> otlp_out` keeps an integer point an integer. An
 //! `Exemplar`'s `as_int` and `as_double` decode the same way, and one with neither is `F64(0.0)`.
-//! `Histogram` → `Histogram{buckets,temporality,sum,min,max}`, rebuilding the trailing infinite bucket when `bucket_counts` has one more entry than
-//! `explicit_bounds` (the OTLP-mandated shape). `Summary` → `Summary{quantiles,count,sum}`, `Cumulative`, each quantile read with no range check.
+//! `Histogram` → `Histogram{buckets,temporality,sum,min,max}`, rebuilding the trailing infinite
+//! bucket when `bucket_counts` has one more entry than `explicit_bounds` (the OTLP-mandated
+//! shape), even when its count is `0`, so `otlp_in -> otlp_out` writes a conforming point's lists
+//! back as they arrived. `Summary` → `Summary{quantiles,count,sum}`, `Cumulative`, each quantile
+//! read with no range check.
 //! `ExponentialHistogram` → `ExponentialHistogram` field for field (scale, zero count and
 //! threshold, positive and negative offset and bucket counts, temporality, count, sum/min/max),
 //! with no bucket materialization.
@@ -340,10 +351,15 @@ pub(crate) fn encode_metric(
             )],
         }),
         MetricKind::Histogram(h) => {
-            let bucket_counts: Vec<u64> = h.buckets.iter().map(|(_, c)| *c).collect();
-            let explicit_bounds: Vec<f64> =
-                h.buckets.iter().filter(|(b, _)| b.is_finite()).map(|(b, _)| *b).collect();
-            let count = bucket_counts.iter().sum();
+            let (bucket_counts, explicit_bounds, non_finite) = histogram_buckets(&h.buckets);
+            if non_finite {
+                telemetry.count(
+                    "logit.output.metrics.degraded",
+                    1.0,
+                    &[("reason", "non_finite_component")],
+                );
+            }
+            let count = bucket_counts.iter().fold(0u64, |acc, c| acc.saturating_add(*c));
             pb::metric::Data::Histogram(pb::Histogram {
                 data_points: vec![pb::HistogramDataPoint {
                     attributes,
@@ -490,6 +506,64 @@ pub(crate) fn encode_metric(
     };
 
     Some(pb::Metric { name, description, unit, metadata: Vec::new(), data: Some(data) })
+}
+
+/// The model's `(bound, count)` buckets → OTLP's `bucket_counts` and `explicit_bounds`, plus
+/// whether a non-finite bound other than `+Inf` was folded away. OTLP wants finite bounds in
+/// strictly increasing order and one more count than bounds, the last being the overflow bucket
+/// above the highest bound, so:
+///
+/// - finite bounds are sorted by [`f64::total_cmp`], and equal ones merge, summing their counts;
+/// - a `-Inf` bucket's count joins the first bucket, which already covers everything at or below
+///   the lowest bound;
+/// - a `NaN` bucket has no position, so its count joins the overflow bucket, as it reaches only
+///   `+Inf` in `prometheus_out`'s cumulative counts;
+/// - every `+Inf` bucket's count is the overflow.
+///
+/// OTLP's `HistogramDataPoint` requires `bucket_counts` to hold one more element than
+/// `explicit_bounds`, except that both may be empty (`metrics.proto`). So a histogram with a bound
+/// but no `+Inf` or `NaN` bucket writes an overflow count of `0`, which `otlp_in` reads back as an
+/// empty `+Inf` bucket, and one with no buckets writes neither list. `count` stays the sum of every bucket.
+fn histogram_buckets(buckets: &[(f64, u64)]) -> (Vec<u64>, Vec<f64>, bool) {
+    let mut finite: Vec<(f64, u64)> =
+        buckets.iter().copied().filter(|(bound, _)| bound.is_finite()).collect();
+    finite.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut bounds: Vec<f64> = Vec::with_capacity(finite.len());
+    let mut counts: Vec<u64> = Vec::with_capacity(finite.len() + 1);
+    for (bound, count) in finite {
+        match (bounds.last(), counts.last_mut()) {
+            // `==` rather than the sort's order, so `-0.0` and `0.0` merge as well.
+            (Some(last), Some(merged)) if *last == bound => *merged = merged.saturating_add(count),
+            _ => {
+                bounds.push(bound);
+                counts.push(count);
+            }
+        }
+    }
+    let mut below = 0u64;
+    let mut overflow = None::<u64>;
+    let mut non_finite = false;
+    for &(bound, count) in buckets {
+        if bound == f64::NEG_INFINITY {
+            below = below.saturating_add(count);
+            non_finite = true;
+        } else if bound.is_nan() {
+            overflow = Some(overflow.unwrap_or(0).saturating_add(count));
+            non_finite = true;
+        } else if bound == f64::INFINITY {
+            overflow = Some(overflow.unwrap_or(0).saturating_add(count));
+        }
+    }
+    if overflow.is_some() || !bounds.is_empty() {
+        counts.push(overflow.unwrap_or(0));
+    }
+    if let Some(first) = counts.first_mut() {
+        *first = first.saturating_add(below);
+    } else if non_finite {
+        // Only `-Inf` buckets: with no bound to sit under, their count is the one bucket.
+        counts.push(below);
+    }
+    (counts, bounds, non_finite)
 }
 
 fn distribution_summary_point(
@@ -800,6 +874,90 @@ mod tests {
             }
             other => panic!("expected Histogram, got {other:?}"),
         }
+    }
+
+    /// OTLP requires one more count than bounds, so a histogram whose last bound is finite, as
+    /// `aggregate` emits, writes a `0` overflow count, which decodes as an empty `+Inf` bucket.
+    #[test]
+    fn a_histogram_with_a_finite_last_bound_writes_a_zero_overflow_count() {
+        let h = Histogram {
+            buckets: vec![(1.0, 2), (5.0, 3), (10.0, 1)],
+            temporality: Temporality::Delta,
+            sum: Some(12.5),
+            min: Some(0.5),
+            max: Some(9.9),
+        };
+        let metric = encode(MetricKind::Histogram(h.clone())).unwrap();
+        let Some(pb::metric::Data::Histogram(hist)) = metric.data.clone() else {
+            panic!("not a Histogram")
+        };
+        let dp = &hist.data_points[0];
+        assert_eq!(dp.explicit_bounds, vec![1.0, 5.0, 10.0]);
+        assert_eq!(dp.bucket_counts, vec![2, 3, 1, 0]);
+        assert_eq!(dp.count, 6);
+        let events = decode_metric(metric, &AttrMap::new(), &Telemetry::default());
+        let MetricKind::Histogram(got) = &events[0].metrics[0].kind else {
+            panic!("not a Histogram")
+        };
+        assert_eq!(got.buckets, vec![(1.0, 2), (5.0, 3), (10.0, 1), (f64::INFINITY, 0)]);
+    }
+
+    /// A histogram with no buckets writes neither list, which OTLP allows.
+    #[test]
+    fn a_histogram_with_no_buckets_writes_no_counts_or_bounds() {
+        let h = Histogram {
+            buckets: Vec::new(),
+            temporality: Temporality::Delta,
+            sum: Some(1.0),
+            min: None,
+            max: None,
+        };
+        let metric = encode(MetricKind::Histogram(h)).unwrap();
+        let Some(pb::metric::Data::Histogram(hist)) = metric.data else {
+            panic!("not a Histogram")
+        };
+        let dp = &hist.data_points[0];
+        assert!(dp.bucket_counts.is_empty());
+        assert!(dp.explicit_bounds.is_empty());
+    }
+
+    /// Out-of-order bounds with a `NaN` and a `-Inf` among them: the finite bounds sort, the `-Inf`
+    /// count joins the first bucket, the `NaN` count joins the overflow, every count lines up with
+    /// its bound, and the record counts degraded once.
+    #[test]
+    fn a_histogram_with_out_of_order_non_finite_bounds_writes_aligned_buckets() {
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("otlp_out", "otlp_out", "sink");
+        let kind = MetricKind::Histogram(Histogram {
+            buckets: vec![
+                (5.0, 2),
+                (f64::NAN, 4),
+                (1.0, 1),
+                (f64::NEG_INFINITY, 8),
+                (f64::INFINITY, 16),
+            ],
+            temporality: Temporality::Cumulative,
+            sum: None,
+            min: None,
+            max: None,
+        });
+        let mut diag = Diagnostics::default();
+        let metric = encode_metric(&event(), &record(kind), &telemetry, &mut diag).unwrap();
+        let Some(pb::metric::Data::Histogram(hist)) = metric.data else {
+            panic!("not a Histogram")
+        };
+        let dp = &hist.data_points[0];
+        assert_eq!(dp.explicit_bounds, vec![1.0, 5.0]);
+        assert_eq!(dp.bucket_counts, vec![9, 2, 20]);
+        assert_eq!(dp.count, 31);
+        let degraded: Vec<_> = registry
+            .drain(0)
+            .into_iter()
+            .filter(|e| {
+                e.attributes.get("reason").and_then(|v| v.as_str()) == Some("non_finite_component")
+            })
+            .collect();
+        assert_eq!(degraded.len(), 1, "one degraded count per record");
     }
 
     #[test]
@@ -1454,17 +1612,22 @@ mod tests {
         fn arb_histogram() -> impl Strategy<Value = Histogram> {
             (
                 prop::collection::vec((-1e6f64..1e6f64, 0u64..1000u64), 0..5),
+                prop::option::of(0u64..1000u64),
                 arb_temporality(),
                 prop::option::of(-1e6f64..1e6f64),
                 prop::option::of(-1e6f64..1e6f64),
                 prop::option::of(-1e6f64..1e6f64),
             )
-                .prop_map(|(buckets, temporality, sum, min, max)| Histogram {
-                    buckets,
-                    temporality,
-                    sum,
-                    min,
-                    max,
+                .prop_map(|(mut buckets, overflow, temporality, sum, min, max)| {
+                    // Strictly increasing, as OTLP requires: the encoder sorts and merges the rest.
+                    buckets.sort_by(|a, b| a.0.total_cmp(&b.0));
+                    buckets.dedup_by(|a, b| a.0 == b.0);
+                    // The shape a decode produces: any bound means an overflow count, read back
+                    // as a trailing `+Inf` bucket.
+                    if overflow.is_some() || !buckets.is_empty() {
+                        buckets.push((f64::INFINITY, overflow.unwrap_or(0)));
+                    }
+                    Histogram { buckets, temporality, sum, min, max }
                 })
         }
 

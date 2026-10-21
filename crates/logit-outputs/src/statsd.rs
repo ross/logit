@@ -241,6 +241,10 @@
 //! | `histogram/delta`, otherwise | degraded | `logit.output.metrics.degraded{metric_kind=histogram}` | Dotted `.count`, `.sum`, and `.bucket_<bound>` counters and `.min` and `.max` gauges. |
 //! | `histogram/cumulative`, under `multi_value: skip` | skipped | `logit.output.metrics.skipped{metric_kind=histogram}` | Under `multi_value: skip`, no line is written. |
 //! | `histogram/cumulative`, otherwise | degraded | `logit.output.metrics.degraded{metric_kind=histogram}` | The same dotted series, every one a gauge, since a running total sent as `\|c` would be added to itself. |
+//! | `histogram/nan_bound`, under `multi_value: skip` | skipped | `logit.output.metrics.skipped{metric_kind=histogram}` | Under `multi_value: skip`, no line is written. |
+//! | `histogram/nan_bound`, otherwise | degraded | `logit.output.metrics.degraded{metric_kind=histogram}` | Each bucket is its own dotted series, as for any other bound: `.bucket_NaN` holds that bucket's own count. |
+//! | `histogram/neg_inf_bound`, under `multi_value: skip` | skipped | `logit.output.metrics.skipped{metric_kind=histogram}` | Under `multi_value: skip`, no line is written. |
+//! | `histogram/neg_inf_bound`, otherwise | degraded | `logit.output.metrics.degraded{metric_kind=histogram}` | Each bucket is its own dotted series, as for any other bound: `.bucket_-inf` holds that bucket's own count. |
 //! | `exponential_histogram/delta`, under `multi_value: skip` | skipped | `logit.output.metrics.skipped{metric_kind=exponential_histogram}` | Under `multi_value: skip`, no line is written. |
 //! | `exponential_histogram/delta`, otherwise | degraded | `logit.output.metrics.degraded{metric_kind=exponential_histogram}` | Dotted `.count`, `.sum`, and `.zero_count` counters and `.min` and `.max` gauges. Its buckets aren't written, since each scale would mint its own series names. |
 //! | `exponential_histogram/cumulative`, under `multi_value: skip` | skipped | `logit.output.metrics.skipped{metric_kind=exponential_histogram}` | Under `multi_value: skip`, no line is written. |

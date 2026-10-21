@@ -44,7 +44,7 @@
 //! | `ExponentialHistogram` | skipped under both `MultiValue` settings, as the exporter does | `logit.output.metrics.skipped{metric_kind="exponential_histogram"}` |
 //! | a record flagged `NO_RECORDED_VALUE` | skipped | `skipped{reason="no_recorded_value"}` |
 //! | `Samples`, `Distribution`, `Set`, `SetMembers`, `Histogram`, `Summary` under `MultiValue::Skip` | skipped | `skipped{metric_kind="samples"\|"distribution"\|"set"\|"set_members"\|"histogram"\|"summary"}` |
-//! | the same under `MultiValue::Expand` | the table below | `degraded{metric_kind=…}`, once per record |
+//! | the same under `MultiValue::Expand` | the table below | `degraded{metric_kind=…}`, once per record, and a `Histogram` with a `NaN` bound also `degraded{reason="non_finite_component"}` |
 //! | a name outside `[A-Za-z0-9_.:]`, starting with a digit or `_`, or containing `metric_name` | each other character → `_`, `metric_name` → `metricname`, then an `m` prefix on a leading digit or `_` | `logit.output.metrics.normalized{reason="name_sanitized"}` |
 //! | a name another record of the same object already wrote (after sanitizing) | dropped | `dropped{reason="duplicate_name"}` |
 //! | a `metric_name`, `_value`, or `metric_name:*` attribute; a `metric_type` attribute on an event with a `Sum`; an `le` or `qt` attribute on an expanded bucket or quantile object | omitted from that object | `logit.output.tags.omitted{reason="reserved_key"}` |
@@ -59,7 +59,7 @@
 //!
 //! | Kind | Objects |
 //! |---|---|
-//! | `Histogram` | `<n>_sum` (when `Some`) and `<n>_count` (Σ counts), `metric_type` `Histogram`; one object per cumulative bucket with `<n>_bucket` and an `le` dimension (`+Inf` last, appended when the highest bound is finite) |
+//! | `Histogram` | `<n>_sum` (when `Some`) and `<n>_count` (Σ counts), `metric_type` `Histogram`; one object per cumulative bucket with `<n>_bucket` and an `le` dimension, in ascending bound order (`+Inf` last, appended when the highest bound is finite); a `NaN` bound has no object, its count reaching `+Inf` and `_count`, counted `logit.output.metrics.degraded{reason="non_finite_component"}` once per record |
 //! | `Summary` | `<n>_sum` and `<n>_count`, `metric_type` `Summary`; one object per quantile with `<n>_<q>` and a `qt` dimension |
 //! | `Samples` | `<n>_count` and `<n>_sum` (each value weighted by its inverse sample rate), `<n>_min`, `<n>_max` when non-empty, `metric_type` `Summary` |
 //! | `Distribution` | `<n>_count`, `<n>_sum`, then `<n>_p50`, `<n>_p90`, `<n>_p99` each when the sketch answers it finitely, `metric_type` `Summary` |
@@ -324,6 +324,15 @@ impl SplunkEncoder {
                     MultiValue::Skip => self.unencoded(Unencoded::Kind(kind.name()), 1),
                     MultiValue::Expand => {
                         self.degrade_kind(kind.name());
+                        if let MetricKind::Histogram(h) = kind {
+                            if h.buckets.iter().any(|(bound, _)| bound.is_nan()) {
+                                self.telemetry.count(
+                                    "logit.output.metrics.degraded",
+                                    1.0,
+                                    &[("reason", "non_finite_component")],
+                                );
+                            }
+                        }
                         expand(kind, &name, &mut objects);
                     }
                 },
@@ -776,6 +785,35 @@ mod tests {
                 }),
             ),
         ]
+    }
+
+    /// A `NaN` bound gets no `le` object, the bounds around it still sort, its count reaches
+    /// `_count` and `le="+Inf"`, and the record counts degraded once.
+    #[test]
+    fn expand_leaves_an_out_of_order_nan_bound_out_of_the_buckets() {
+        let registry = Registry::new();
+        let mut enc = encoder(&registry).with_multi_value(MultiValue::Expand);
+        let kind = MetricKind::Histogram(Histogram {
+            buckets: vec![(1.0, 2), (f64::NAN, 4), (0.5, 1)],
+            temporality: Temporality::Cumulative,
+            sum: None,
+            min: None,
+            max: None,
+        });
+        let objects = objects_of(&mut enc, &metric_batch(vec![("hist", kind)], &[]));
+        assert_eq!(
+            objects,
+            vec![
+                r#"{"time":0,"event":"metric","fields":{"metric_type":"Histogram","metric_name:hist_count":7.0}}"#.to_string(),
+                r#"{"time":0,"event":"metric","fields":{"le":"0.5","metric_type":"Histogram","metric_name:hist_bucket":1.0}}"#.to_string(),
+                r#"{"time":0,"event":"metric","fields":{"le":"1","metric_type":"Histogram","metric_name:hist_bucket":3.0}}"#.to_string(),
+                r#"{"time":0,"event":"metric","fields":{"le":"+Inf","metric_type":"Histogram","metric_name:hist_bucket":7.0}}"#.to_string(),
+            ]
+        );
+        assert_eq!(
+            counted(&registry, "logit.output.metrics.degraded", ("reason", "non_finite_component")),
+            1.0
+        );
     }
 
     #[test]

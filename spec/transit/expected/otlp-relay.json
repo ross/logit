@@ -22,6 +22,16 @@
   "gzip": {"events": [
     {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"uploads.completed","kind":"sum","value":5,"temporality":"delta","monotonic":true,"start_timestamp":"2027-01-15T07:59:40.000000000Z"}],"resource":{"attributes":{"host.name":"web-1","service.name":"checkout"}},"scope":{"name":"io.opentelemetry.contrib.runtime","version":"1.2.0","attributes":{"library.language":"go"}}}
   ], "counters": {}},
+  "histogram-neg-inf-bound": {"events": [
+    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"http.server.duration","kind":"histogram","temporality":"cumulative","buckets":[{"bound":1.0,"count":9},{"bound":5.0,"count":2},{"bound":"inf","count":16}],"unit":"s","start_timestamp":"2027-01-15T07:59:40.000000000Z"}],"attributes":{"http.route":"/cart"},"resource":{"attributes":{"host.name":"web-1","service.name":"checkout"}},"scope":{"name":"io.opentelemetry.contrib.runtime","version":"1.2.0"}}
+  ], "counters": {
+    "logit.output.metrics.degraded{component=out,kind=otlp_out,reason=non_finite_component,role=sink}": 1
+  }},
+  "histogram-non-finite-bounds": {"events": [
+    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"http.server.duration","kind":"histogram","temporality":"cumulative","buckets":[{"bound":1.0,"count":9},{"bound":5.0,"count":2},{"bound":"inf","count":20}],"unit":"s","start_timestamp":"2027-01-15T07:59:40.000000000Z"}],"attributes":{"http.route":"/cart"},"resource":{"attributes":{"host.name":"web-1","service.name":"checkout"}},"scope":{"name":"io.opentelemetry.contrib.runtime","version":"1.2.0"}}
+  ], "counters": {
+    "logit.output.metrics.degraded{component=out,kind=otlp_out,reason=non_finite_component,role=sink}": 1
+  }},
   "histograms": {"events": [
     {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"db.client.operation.duration","kind":"histogram","temporality":"cumulative","buckets":[{"bound":10.0,"count":4},{"bound":100.0,"count":5},{"bound":"inf","count":1}],"sum":420.0,"unit":"ms","start_timestamp":"2027-01-15T07:58:50.000000000Z","exemplars":[{"timestamp":"2027-01-15T07:59:46.000000000Z","value":37.5,"attributes":{"db.operation.name":"SELECT"}}]}],"attributes":{"db.system":"postgresql"},"resource":{"attributes":{"host.name":"web-1","service.name":"checkout"}},"scope":{"name":"io.opentelemetry.contrib.runtime","version":"1.2.0","attributes":{"library.language":"go"}}},
     {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"http.server.request.duration","kind":"histogram","temporality":"delta","buckets":[{"bound":0.1,"count":1},{"bound":0.25,"count":2},{"bound":0.5,"count":2},{"bound":"inf","count":1}],"sum":1.9,"min":0.05,"max":0.9,"unit":"s","description":"Request duration.","start_timestamp":"2027-01-15T07:59:40.000000000Z","exemplars":[{"timestamp":"2027-01-15T07:59:48.000000000Z","value":0.9,"trace_id":"5b8efff798038103d269b633813fc60c","span_id":"eee19b7ec3c1b174","trace_flags":0,"attributes":{"user.id":"u-7"}}]}],"attributes":{"http.route":"/cart"},"resource":{"attributes":{"host.name":"web-1","service.name":"checkout"}},"scope":{"name":"io.opentelemetry.contrib.runtime","version":"1.2.0","attributes":{"library.language":"go"}}}

@@ -16,6 +16,8 @@
     {"sink":"influxdb_out","row":"gauge/negative","cell":0,"observed":["normalized"]},
     {"sink":"influxdb_out","row":"histogram/cumulative","cell":0,"observed":["degraded"]},
     {"sink":"influxdb_out","row":"histogram/delta","cell":0,"observed":["degraded"]},
+    {"sink":"influxdb_out","row":"histogram/nan_bound","cell":0,"observed":["degraded"]},
+    {"sink":"influxdb_out","row":"histogram/neg_inf_bound","cell":0,"observed":["degraded"]},
     {"sink":"influxdb_out","row":"record/description","cell":0,"observed":["lost"]},
     {"sink":"influxdb_out","row":"record/exemplars","cell":0,"observed":["lost"]},
     {"sink":"influxdb_out","row":"record/no_recorded_value","cell":0,"observed":["skipped"]},

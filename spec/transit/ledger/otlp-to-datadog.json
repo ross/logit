@@ -16,6 +16,8 @@
     {"sink":"datadog_out","row":"gauge/negative","cell":0,"observed":["exact"]},
     {"sink":"datadog_out","row":"histogram/cumulative","cell":0,"observed":["dropped"]},
     {"sink":"datadog_out","row":"histogram/delta","cell":2,"observed":["degraded"]},
+    {"sink":"datadog_out","row":"histogram/nan_bound","cell":2,"observed":["dropped"]},
+    {"sink":"datadog_out","row":"histogram/neg_inf_bound","cell":2,"observed":[]},
     {"sink":"datadog_out","row":"record/description","cell":0,"observed":["lost"]},
     {"sink":"datadog_out","row":"record/exemplars","cell":0,"observed":["lost"]},
     {"sink":"datadog_out","row":"record/no_recorded_value","cell":0,"observed":["skipped"]},

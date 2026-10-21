@@ -30,7 +30,7 @@
     {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"severity":"warn","format":"raw","message":"first\nline","observed_timestamp":"2027-01-15T08:00:01.000000000Z"},"attributes":{"_logit.otel.severity_number":13,"_logit.otel.severity_text":"Warn","env":"prod"}}
   ], "counters": {}},
   "flagged-histogram": {"events": [
-    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"response.size","kind":"histogram","temporality":"cumulative","buckets":[{"bound":100.0,"count":0},{"bound":1000.0,"count":0}],"flags":1,"no_recorded_value":true}]}
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"response.size","kind":"histogram","temporality":"cumulative","buckets":[{"bound":100.0,"count":0},{"bound":1000.0,"count":0},{"bound":"inf","count":0}],"flags":1,"no_recorded_value":true}]}
   ], "counters": {}},
   "flagged-kinds": {"events": [
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"jobs.started","kind":"sum","value":0.0,"temporality":"delta","monotonic":true,"flags":1,"no_recorded_value":true}]},
@@ -160,8 +160,8 @@
   "summarized-kinds": {"events": [
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"latency.exp","kind":"exponential_histogram","scale":2,"temporality":"delta","count":5,"zero_count":1,"zero_threshold":0.0,"positive":{"offset":0,"counts":[1,2,1]},"sum":12.5}]},
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"queue.wait","kind":"exponential_histogram","scale":1,"temporality":"cumulative","count":9,"zero_count":0,"zero_threshold":0.0,"positive":{"offset":1,"counts":[4,5]},"sum":30.0}]},
-    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"request.size","kind":"histogram","temporality":"delta","buckets":[{"bound":100.0,"count":3},{"bound":1000.0,"count":1}],"sum":850.0,"min":10.0,"max":400.0}]},
-    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"response.size","kind":"histogram","temporality":"cumulative","buckets":[{"bound":100.0,"count":30},{"bound":1000.0,"count":12}],"sum":9000.0}]},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"request.size","kind":"histogram","temporality":"delta","buckets":[{"bound":100.0,"count":3},{"bound":1000.0,"count":1},{"bound":"inf","count":0}],"sum":850.0,"min":10.0,"max":400.0}]},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"response.size","kind":"histogram","temporality":"cumulative","buckets":[{"bound":100.0,"count":30},{"bound":1000.0,"count":12},{"bound":"inf","count":0}],"sum":9000.0}]},
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"rpc.duration","kind":"summary","temporality":"cumulative","count":10,"sum":55.0,"quantiles":[{"quantile":0.5,"value":5.0},{"quantile":0.99,"value":9.9}]}]}
   ], "counters": {
     "logit.output.metrics.dropped{component=out,kind=otlp_out,reason=unresolved_delta,role=sink}": 1

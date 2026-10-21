@@ -28,6 +28,14 @@
   "gzip": {"events": [
     {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"uploads.completed","kind":"sum","value":5.0,"temporality":"delta","monotonic":true}],"attributes":{"host.name":"web-1","service.name":"checkout"}}
   ], "counters": {}},
+  "histogram-neg-inf-bound": {"events": [
+    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"http.server.duration","kind":"distribution","count":27,"sum":85.24672076554066,"min":-9.941854089121368e-10,"max":5.015009921317152,"avg":3.1572859542792835,"p50":5.015009921317149,"p90":5.015009921317149,"p95":5.015009921317149,"p99":5.015009921317149,"sketch":{"mapping":"agent","stats_exact":true,"count":27.0,"min":-9.941854089121368e-10,"max":5.015009921317152,"positive":[{"key":1338,"count":2.0},{"key":1409,"count":1.0},{"key":1442,"count":16.0}],"negative":[{"key":1,"count":8.0}]}}],"attributes":{"host.name":"web-1","http.route":"/cart","service.name":"checkout"}}
+  ], "counters": {
+    "logit.output.metrics.degraded{component=out,kind=datadog_out,metric_kind=histogram,role=sink}": 1
+  }},
+  "histogram-non-finite-bounds": {"events": [], "counters": {
+    "logit.output.metrics.dropped{component=out,kind=datadog_out,reason=non_monotonic_bounds,role=sink}": 1
+  }},
   "histograms": {"events": [
     {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"db.client.operation.duration","kind":"distribution","count":10,"sum":420.0,"min":10.075671884115119,"max":99.95733062532716,"avg":42.0,"p50":10.075671884115119,"p90":84.28444675960954,"p95":99.95733062532699,"p99":99.95733062532699,"sketch":{"mapping":"agent","stats_exact":true,"count":10.0,"min":10.075671884115119,"max":99.95733062532716,"positive":[{"key":1487,"count":5.0},{"key":1554,"count":1.0},{"key":1586,"count":1.0},{"key":1608,"count":1.0},{"key":1624,"count":1.0},{"key":1635,"count":1.0}]}}],"attributes":{"db.system":"postgresql","host.name":"web-1","service.name":"checkout"}},
     {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"http.server.request.duration","kind":"distribution","count":6,"sum":1.9,"min":0.05,"max":0.9,"avg":0.31666666666666665,"p50":0.17614127764963636,"p90":0.38241091101235614,"p95":0.49773454108044224,"p99":0.49773454108044224,"sketch":{"mapping":"agent","stats_exact":true,"count":6.0,"min":0.05,"max":0.9,"positive":[{"key":1189,"count":2.0},{"key":1226,"count":1.0},{"key":1249,"count":1.0},{"key":1276,"count":1.0},{"key":1293,"count":1.0}]}}],"attributes":{"host.name":"web-1","http.route":"/cart","service.name":"checkout"}}

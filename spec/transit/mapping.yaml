@@ -684,12 +684,16 @@ rows:
           Telegraf's shape: float `count`, `sum`, `min`, and `max` fields, a field per finite
           bound named by the bound and holding the cumulative count up to it, and `+Inf` holding
           the total, each read back as a gauge under `<name>.`, its temporality dropped. When
-          every component is finite, nothing is counted. A non-finite `sum`, `min`, `max`, or
-          bound is left off the line, and the record counts once as
+          every component is finite, nothing is counted. A non-finite `sum`, `min`, or `max` is
+          left off the line, and the record counts once as
           `logit.output.metrics.degraded{reason=non_finite_component}`.
       otlp_out:
-        class: exact
-        text: An OTLP `Histogram` with delta temporality.
+        class: normalized
+        reason: inf_bucket
+        text: >-
+          An OTLP `Histogram` with delta temporality. OTLP requires an overflow count above the
+          highest bound, so a histogram whose last bound is finite reads back with an empty
+          `+Inf` bucket.
       datadog_out:
         - when: {histograms: {mode: counters, send_aggregation_metrics: true}}
           class: degraded
@@ -729,12 +733,16 @@ rows:
           Telegraf's shape: float `count`, `sum`, `min`, and `max` fields, a field per finite
           bound named by the bound and holding the cumulative count up to it, and `+Inf` holding
           the total, each read back as a gauge under `<name>.`, its temporality dropped. When
-          every component is finite, nothing is counted. A non-finite `sum`, `min`, `max`, or
-          bound is left off the line, and the record counts once as
+          every component is finite, nothing is counted. A non-finite `sum`, `min`, or `max` is
+          left off the line, and the record counts once as
           `logit.output.metrics.degraded{reason=non_finite_component}`.
       otlp_out:
-        class: exact
-        text: An OTLP `Histogram` with cumulative temporality.
+        class: normalized
+        reason: inf_bucket
+        text: >-
+          An OTLP `Histogram` with cumulative temporality. OTLP requires an overflow count above the
+          highest bound, so a histogram whose last bound is finite reads back with an empty
+          `+Inf` bucket.
       prometheus_out:
         class: normalized
         reason: inf_bucket
@@ -750,6 +758,110 @@ rows:
           Datadog's exporter differences a running total into a delta first, so it's dropped,
           with a throttled `unresolved_cumulative` warning; a `cumulative_to_delta` upstream
           makes it a delta histogram.
+  # A histogram with a `NaN` bucket bound, in any order. A record holding both a `NaN` and a
+  # `-Inf` bound reaches this row and `neg_inf_bound`. A sink's other histogram outcomes are its
+  # temporality row's.
+  - kind: histogram
+    feature: nan_bound
+    cells:
+      statsd_out:
+        - when: {multi_value: skip}
+          class: skipped
+          counter: logit.output.metrics.skipped{metric_kind=histogram}
+          text: 'Under `multi_value: skip`, no line is written.'
+        - class: degraded
+          counter: logit.output.metrics.degraded{metric_kind=histogram}
+          text: >-
+            Each bucket is its own dotted series, as for any other bound: `.bucket_NaN` holds
+            that bucket's own count.
+      prometheus_out:
+        class: degraded
+        counter: logit.output.metrics.degraded{reason=non_finite_component}
+        text: >-
+          A `NaN` bound has no place among the sorted bounds, so it has no bucket, and its count
+          reaches only `+Inf` and `_count`.
+      influxdb_out:
+        class: degraded
+        counter: logit.output.metrics.degraded{reason=non_finite_component}
+        text: >-
+          No field key spells a `NaN` bound, so none is written, and its count reaches only
+          `count` and `+Inf`.
+      otlp_out:
+        class: degraded
+        counter: logit.output.metrics.degraded{reason=non_finite_component}
+        text: >-
+          OTLP bounds are finite, so a `NaN` bound's count joins the overflow bucket. `count`
+          and every cumulative count are kept.
+      datadog_out:
+        - when: {histograms: {mode: counters, send_aggregation_metrics: true}}
+          class: degraded
+          counter: logit.output.metrics.degraded{metric_kind=histogram}
+          text: >-
+            Under `histograms.mode: counters`, a `NaN` bound is one more bucket's bound: the
+            `<name>.bucket` counts beside it carry a `nan` `lower_bound` or `upper_bound` tag, the
+            exporter's `formatFloat` form.
+        - when: {histograms: {mode: nobuckets, send_aggregation_metrics: true}}
+          class: degraded
+          counter: logit.output.metrics.degraded{metric_kind=histogram}
+          text: >-
+            Under `histograms.mode: nobuckets`, no bucket is written, so the bound goes with the
+            rest.
+        - class: dropped
+          counter: logit.output.metrics.dropped{reason=non_monotonic_bounds}
+          text: >-
+            Datadog's exporter keys a `NaN` bound at the Agent's key 1 on amd64, so a `NaN` above
+            a bound that keys higher makes a bucket whose upper key is below its lower one, and
+            the point is dropped, as the exporter drops it. A `NaN` below every bound that keys
+            above 1 would instead be sketched with its count at key 1.
+  # A histogram with a `-Inf` bucket bound.
+  - kind: histogram
+    feature: neg_inf_bound
+    cells:
+      statsd_out:
+        - when: {multi_value: skip}
+          class: skipped
+          counter: logit.output.metrics.skipped{metric_kind=histogram}
+          text: 'Under `multi_value: skip`, no line is written.'
+        - class: degraded
+          counter: logit.output.metrics.degraded{metric_kind=histogram}
+          text: >-
+            Each bucket is its own dotted series, as for any other bound: `.bucket_-inf` holds
+            that bucket's own count.
+      prometheus_out:
+        class: exact
+        text: '`-Inf` is an ordinary bound: an `le="-Inf"` bucket, first.'
+      influxdb_out:
+        class: degraded
+        counter: logit.output.metrics.degraded{reason=non_finite_component}
+        text: >-
+          No field key spells a `-Inf` bound, so none is written, and its count reaches every
+          finite bound's field.
+      otlp_out:
+        class: degraded
+        counter: logit.output.metrics.degraded{reason=non_finite_component}
+        text: >-
+          OTLP bounds are finite, so a `-Inf` bound's count joins the first bucket. `count` and
+          every cumulative count are kept.
+      datadog_out:
+        - when: {histograms: {mode: counters, send_aggregation_metrics: true}}
+          class: degraded
+          counter: logit.output.metrics.degraded{metric_kind=histogram}
+          text: >-
+            Under `histograms.mode: counters`, a `-Inf` bound is one more bucket's bound: the
+            `<name>.bucket` counts beside it carry a `-inf` `lower_bound` or `upper_bound` tag,
+            the exporter's `formatFloat` form.
+        - when: {histograms: {mode: nobuckets, send_aggregation_metrics: true}}
+          class: degraded
+          counter: logit.output.metrics.degraded{metric_kind=histogram}
+          text: >-
+            Under `histograms.mode: nobuckets`, no bucket is written, so the bound goes with the
+            rest.
+        - class: degraded
+          counter: logit.output.metrics.degraded{metric_kind=histogram}
+          text: >-
+            In the sketch, as Datadog's exporter builds it on amd64: Go's `int(-Inf)` keys the
+            bound at the Agent's key -1, so the `-Inf` bucket's count lands near `-1e-9` rather
+            than below every other bucket, and the sketch's `min` is that bin's value.
   - kind: exponential_histogram
     feature: delta
     cells:
