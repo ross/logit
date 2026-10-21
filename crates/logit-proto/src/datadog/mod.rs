@@ -214,6 +214,7 @@
 //! | `histograms.send_aggregation_metrics` on a delta `Histogram` or `ExponentialHistogram` | `<name>.count` (a `count`, no unit, the buckets' total or the record's `count`) and `<name>.sum` (a `count`), then `<name>.min` and `<name>.max` gauges where the record has them, ahead of any `.bucket` series; none when the sum is absent or non-finite, and none for an exponential histogram past the observation cap, as the exporter drops it whole | `fields.omitted{reason="no_sum"}` for a missing sum |
 //! | `Summary` | a `<name>.quantile` gauge per quantile tagged `quantile:` in `formatFloat`'s form, with the record's unit; no `.count` or `.sum`, since a summary is a running total | `fields.omitted{reason="unresolved_cumulative"}` + diag `unresolved_cumulative`, once per summary |
 //! | a cumulative monotonic `Sum`, cumulative `Histogram`, or cumulative `ExponentialHistogram` | skipped: Datadog's exporter differences it into a delta first, which nothing in `logit` does yet | `skipped{metric_kind}` + diag `unresolved_cumulative` |
+//! | a series whose tags, the event's and its own (a `.bucket` series' bounds, a `.quantile` series' quantile), pass [`MAX_METRIC_TAGS`] | left off; [`series::series_over_tag_limit`] counts it for `datadog_out`, which counts it `records.dropped{reason="too_many_tags"}` before encoding | -- |
 //! | a record flagged `NO_RECORDED_VALUE` that a sketch route would carry | skipped once, by the sketches route; the series route leaves its aggregation series off, uncounted | `skipped{reason="no_recorded_value"}` |
 //! | a kind another metrics route carries | left for that route, uncounted: only the series encoders count skips, and only of kinds no route carries | -- |
 //! | record 0 of a service check (`_logit.statsd.service_check.name` present and a `Gauge` first metric) | left for the service-checks route, uncounted; any later record encodes as usual, without the check's `_logit.statsd.service_check.*` carriers as tags | -- |
@@ -1003,6 +1004,12 @@ pub struct DatadogEncoder {
     default_host: Option<Arc<str>>,
     histograms: HistogramOptions,
 }
+
+/// The most `tags` strings one series, distribution point, or sketch may carry: Datadog's intake
+/// drops a metric with more, so `datadog_out` drops it first and counts it. Measured on a trial org
+/// on 2026-10-08: 100 tags were stored and 101 dropped, duplicates counted and `resources` not; the
+/// series route names the drop in its `202` body, and the other two drop it silently.
+pub const MAX_METRIC_TAGS: usize = 100;
 
 /// How a delta `Histogram` is written, the Datadog exporter's `histograms.mode`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

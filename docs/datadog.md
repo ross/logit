@@ -198,8 +198,10 @@ strings, and only the series route says so. `datadog_out` drops such a record be
 counts it `logit.output.records.dropped{reason="too_many_tags"}`, with a throttled `too_many_tags`
 diagnostic naming its metric. Every attribute the encoder renders as a tag counts, resource
 attributes and repeated values included, but `host.name`, the device, and the other fields with
-their own place on the wire don't. To keep a metric, cut its tags upstream with `keep` or
-`remove`.
+their own place on the wire don't. A histogram's `.bucket` series carries two more tags, its
+bounds, and a summary's `.quantile` series one, its quantile, so on a metric with 99 or 100 tags
+those series are dropped, one count each, while its other series go out. To keep a metric, cut
+its tags upstream with `keep` or `remove`.
 
 The series route also names what it dropped from an accepted request in its `202` body, such as
 a point more than 10 minutes in the future when the sender's clock runs ahead. `datadog_out`

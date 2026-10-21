@@ -105,15 +105,24 @@
 //!
 //! **A metric over Datadog's tag limit.** A series, distribution point, or sketch whose `tags`
 //! list holds more than 100 strings is dropped by the intake, so this sink drops it first and
-//! counts `records.dropped{reason="too_many_tags"}`, one per record, with a throttled
-//! `too_many_tags` diagnostic naming the route and the first record's metric name. The count is
-//! the list the encoder writes (`logit_proto::datadog::series::metric_tag_count`): every rendered
-//! attribute, repeats included, and not the host, device, or other carriers, which go in fields of
-//! their own. A trial org stored 100 tags and dropped 101 on all three routes on 2026-10-08;
-//! `resources` didn't count. The series route names such a drop in its `202` body (below), but the
-//! distribution-points and sketches routes drop it silently, answering `202 {"status": "ok"}`, so
-//! only the sink can count it there. A record of a kind the route then skips anyway (a cumulative
-//! monotonic `Sum`, say) is counted here, not by the encoder.
+//! counts `records.dropped{reason="too_many_tags"}`, with a throttled `too_many_tags` diagnostic
+//! naming the route and the first record's metric name and tag count. The count starts from the
+//! list the encoder writes for every record of the event
+//! (`logit_proto::datadog::series::metric_tag_count`): every rendered attribute, repeats included,
+//! and not the host, device, or other carriers, which go in fields of their own. A trial org stored
+//! 100 tags and dropped 101 on all three routes on 2026-10-08; `resources` didn't count. The series
+//! route names such a drop in its `202` body (below), but the distribution-points and sketches
+//! routes drop it silently, answering `202 {"status": "ok"}`, so only the sink can count it there.
+//!
+//! On the distribution-points and sketches routes the check is per event: every record carries
+//! the event's list as it is, so one over the limit drops them all, one count per record. On the
+//! series route it's per series, because a `.bucket` series adds its `lower_bound` and
+//! `upper_bound` tags and a `.quantile` series its `quantile`
+//! (`logit_proto::datadog::series::series_over_tag_limit`). Each series over the limit counts one,
+//! the encoder leaves it off, and the event's other series still go out. An event whose own list
+//! is over the limit has every series over it, so the per-event check isn't needed there. A record
+//! the route writes nothing for (a cumulative monotonic `Sum`, say) has no series to count, and
+//! the encoder counts its skip as usual.
 //!
 //! ## Size limits
 //!
@@ -127,8 +136,10 @@
 //!
 //! A route's events are cut into requests by entry count first ([`split_encode`]; an event with
 //! several records weighs as many entries, and on the series route a record weighs as many series
-//! as it can write: a histogram's `.bucket` and aggregation series, a summary's quantiles, from
-//! `logit_proto::datadog::series::record_routes`). The drop counts below count the same entries. A request whose encoded body is over a byte limit is
+//! as the encoder writes for it: a histogram's `.bucket` and aggregation series, a summary's
+//! finite quantiles, and none for a record it skips, from
+//! `logit_proto::datadog::series::record_routes`, which shares the encoder's own count). The
+//! delivered and drop counts below count the same entries. A request whose encoded body is over a byte limit is
 //! bisected and each half re-encoded, down to one event, and a single event still over the limit
 //! is dropped, counted `records.dropped{reason="oversize"}` for its entries, with a throttled
 //! `oversize` diagnostic. The re-encodes of a bisection count nothing ([`split_encode`]), so an
@@ -290,10 +301,10 @@ use logit_core::interner::resolve;
 use logit_core::{redact, Diagnostics, EventBatch, Symbol, Telemetry};
 use logit_pipeline::{BatchContext, DeliveryPosture, Fault, Output, SeqId};
 use logit_proto::datadog::events::EventFormat;
-use logit_proto::datadog::series::{metric_tag_count, record_routes};
+use logit_proto::datadog::series::{metric_tag_count, record_routes, series_over_tag_limit};
 use logit_proto::datadog::{
     is_datadog_event, is_datadog_stats, is_service_check, trace_readiness, DatadogEncoder,
-    HistogramOptions, TraceReadiness,
+    HistogramOptions, TraceReadiness, MAX_METRIC_TAGS,
 };
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -325,11 +336,6 @@ const METRIC_MAX_AHEAD: i64 = 10 * MINUTE;
 const LOG_MAX_AGE: i64 = 18 * 60 * MINUTE;
 /// Service checks: 10 min.
 const CHECK_MAX_AGE: i64 = 10 * MINUTE;
-
-/// The most `tags` strings a series, distribution, or sketch may carry. Measured on a trial org on
-/// 2026-10-08: 100 tags were stored and 101 dropped, duplicates counted and `resources` not; the
-/// series route names the drop in its `202` body, and the other two drop it silently.
-const MAX_METRIC_TAGS: usize = 100;
 
 /// How much of a series `2xx` body to read for its `errors` (module doc's "Faults, retries, and
 /// duplicate safety"): one entry per dropped series, each about 100 bytes plus the metric name, for
@@ -594,19 +600,21 @@ fn partition(batch: &EventBatch, histograms: HistogramOptions) -> [Vec<Item>; 8]
             push(Route::Events, 1);
         }
         // A service check's record 0 is the check route's alone. A record weighs as many series
-        // entries as it can write, a histogram's buckets and aggregations included.
+        // entries as the encoder writes for it, a histogram's buckets and aggregations included.
+        // The series route reads a record that writes none too, since it counts the skip.
         let (mut series, mut samples, mut sketches) = (0, 0, 0);
+        let mut reads_series = false;
         for record in &event.metrics[usize::from(check)..] {
             let routes = record_routes(record, histograms);
             series += routes.series;
+            reads_series |= routes.series_route;
             samples += usize::from(routes.distribution_points);
             sketches += usize::from(routes.sketch);
         }
-        for (route, n) in [
-            (Route::Series, series),
-            (Route::DistributionPoints, samples),
-            (Route::Sketches, sketches),
-        ] {
+        if reads_series {
+            push(Route::Series, series);
+        }
+        for (route, n) in [(Route::DistributionPoints, samples), (Route::Sketches, sketches)] {
             if n > 0 {
                 push(route, n);
             }
@@ -661,8 +669,27 @@ fn plan(batch: &EventBatch, now: i64, histograms: HistogramOptions) -> Plan {
                 plan.stale[r] += item.weight;
                 continue;
             }
-            if matches!(route, Route::Series | Route::DistributionPoints | Route::Sketches) {
-                // Every metrics route writes the same `tags` list for each of the event's records.
+            if route == Route::Series {
+                // A series carries the event's tags and its own: a `.bucket` series its bounds and
+                // a `.quantile` series its quantile. Each one over the limit is counted here and
+                // left off by the encoder; the event's other series still go out.
+                let base = metric_tag_count(resource, event);
+                let check = usize::from(is_service_check(resource, event));
+                let mut over = 0;
+                for record in &event.metrics[check..] {
+                    let (n, most) = series_over_tag_limit(record, histograms, base);
+                    over += n;
+                    let first = &mut plan.too_many_tags_first[r];
+                    if n > 0 && first.is_none() {
+                        *first = Some((record.name, most));
+                    }
+                }
+                plan.too_many_tags[r] += over;
+                plan.routes[r].push(Item { weight: item.weight - over, ..item });
+                continue;
+            }
+            if matches!(route, Route::DistributionPoints | Route::Sketches) {
+                // A distribution point and a sketch carry the event's `tags` list as it is.
                 let tags = metric_tag_count(resource, event);
                 if tags > MAX_METRIC_TAGS {
                     plan.too_many_tags[r] += item.weight;
@@ -673,8 +700,7 @@ fn plan(batch: &EventBatch, now: i64, histograms: HistogramOptions) -> Plan {
                             let routes = record_routes(r, histograms);
                             match route {
                                 Route::DistributionPoints => routes.distribution_points,
-                                Route::Sketches => routes.sketch,
-                                _ => routes.series > 0,
+                                _ => routes.sketch,
                             }
                         });
                         *first = record.map(|r| (r.name, tags));
@@ -1482,8 +1508,9 @@ mod tests {
     }
 
     /// A histogram weighs what it writes on each route: its sketch alone under `distributions`,
-    /// and under `counters` a series entry per bucket plus the four aggregation series, which the
-    /// entries cap and a `202` body's series errors count against.
+    /// and under `counters` a series entry per bucket plus `.count` and `.sum` (it has no min or
+    /// max), which the entries cap, the `records` count, and a `202` body's series errors count
+    /// against.
     #[test]
     fn a_histogram_weighs_the_series_and_sketches_it_writes() {
         let weights = |options| {
@@ -1495,7 +1522,24 @@ mod tests {
             mode: logit_proto::datadog::HistogramMode::Counters,
             send_aggregation_metrics: true,
         };
-        assert_eq!(weights(counters), (3 + 4, 0));
+        assert_eq!(weights(counters), (3 + 2, 0));
+    }
+
+    /// A `.bucket` series carries its two bounds after the event's tags, so on an event with 99
+    /// of them each bucket is over the limit: counted `too_many_tags` one per series, while the
+    /// record's `.count` and `.sum` keep their place in the request.
+    #[test]
+    fn a_series_its_bounds_take_past_the_tag_limit_is_counted_alone() {
+        let counters = HistogramOptions {
+            mode: logit_proto::datadog::HistogramMode::Counters,
+            send_aggregation_metrics: true,
+        };
+        let kind = histogram(NOW).metrics[0].kind.clone();
+        let plan = plan(&batch(vec![tagged("h", kind, MAX_METRIC_TAGS - 1)]), NOW, counters);
+        let r = Route::Series as usize;
+        assert_eq!(plan.too_many_tags[r], 3);
+        assert_eq!(weight(&plan.routes[r]), 2);
+        assert_eq!(plan.too_many_tags_first[r], Some((intern("h"), MAX_METRIC_TAGS + 1)));
     }
 
     fn log_record(message: &str) -> LogRecord {

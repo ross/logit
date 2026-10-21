@@ -128,8 +128,9 @@ impl StatsIn {
 /// A metric record an encoder didn't send.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum MetricOut {
-    /// A kind the series route has no form for, named by [`logit_core::MetricKind::name`] or
-    /// the temporality it can't carry (`cumulative_sum`, `non_monotonic_delta_sum`).
+    /// A kind the series route doesn't write: a cumulative form it skips until a stage
+    /// differences it (`cumulative_sum`, `histogram`, `exponential_histogram`), or one it has no
+    /// form for (`set_members`).
     Kind(&'static str),
     /// A relative gauge nothing upstream resolved to an absolute value.
     GaugeDelta,
@@ -147,7 +148,7 @@ pub(super) enum MetricOut {
 impl MetricOut {
     #[cfg(test)]
     const ALL: [MetricOut; 9] = [
-        MetricOut::Kind("summary"),
+        MetricOut::Kind("cumulative_sum"),
         MetricOut::GaugeDelta,
         MetricOut::NoRecordedValue,
         MetricOut::EmptySketch,
@@ -202,7 +203,7 @@ mod tests {
             assert_eq!(outcome.metric(), want, "{outcome:?}");
         }
         let want_out = [
-            (OUTPUT_METRICS_SKIPPED, ("metric_kind", "summary")),
+            (OUTPUT_METRICS_SKIPPED, ("metric_kind", "cumulative_sum")),
             (OUTPUT_METRICS_DROPPED, ("reason", "unresolved_gauge_delta")),
             (OUTPUT_METRICS_SKIPPED, ("reason", "no_recorded_value")),
             (OUTPUT_METRICS_SKIPPED, ("reason", "empty_sketch")),
