@@ -2547,7 +2547,7 @@ mod tests {
     }
 
     /// On an event over the tag limit nothing is written, so nothing counts how a series would
-    /// have looked: no degrade, no normalization, no omitted tag. A skip still counts.
+    /// have looked: no degrade, no normalization, no omitted tag. A cumulative kind's drop still counts.
     #[test]
     fn a_record_the_tag_limit_leaves_off_counts_no_degrade() {
         let (mut e, registry) = otlp_encoder(HistogramOptions::default());
@@ -2572,7 +2572,7 @@ mod tests {
         assert_eq!(total(&c, "logit.output.metrics.degraded", "set_estimate"), 0.0);
         assert_eq!(total(&c, "logit.output.metrics.normalized", "bool_value"), 0.0);
         assert_eq!(total(&c, "logit.output.tags.omitted", "unrepresentable"), 0.0);
-        assert_eq!(total(&c, "logit.output.metrics.skipped", "cumulative_sum"), 1.0);
+        assert_eq!(total(&c, "logit.output.metrics.dropped", "unresolved_cumulative"), 1.0);
     }
 
     /// A `.bucket` or `.quantile` series whose own tags take the event's past the limit is left
