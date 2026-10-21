@@ -200,7 +200,7 @@
 //!
 //! | Model | Wire | Counter |
 //! |---|---|---|
-//! | `Distribution` under `Mapping::agent` | a sketch only: `Dogsketch{ts, cnt, min, max, avg: sum/cnt, sum, k, n}`, `k` ascending (negative bins from the largest magnitude as `-key`, then `0`, then positive), a count above 65535 split into repeated entries | -- |
+//! | `Distribution` under `Mapping::agent` | a sketch only: `Dogsketch{ts, cnt, min, max, avg: sum/cnt, sum, k, n}`, `k` ascending (negative bins from the largest magnitude as `-key`, then `0`, then positive), a count above 65535 split into repeated entries, the remainder first | -- |
 //! | `Distribution` under a logarithmic mapping | re-binned into `Mapping::agent` at each bin's representative value, summary kept | `degraded{reason="rebinned"}` |
 //! | a sketch bin with a fractional count | rounded; a bin rounding to 0 is omitted | `degraded{reason="fractional_count"}`, once per sketch |
 //! | a `Distribution` with no bins and zero count | skipped | `logit.output.metrics.skipped{reason="empty_sketch"}` |

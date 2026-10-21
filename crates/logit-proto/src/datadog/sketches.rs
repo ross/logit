@@ -4,7 +4,8 @@
 //!
 //! The `Dogsketch` wire form is the Agent's sparse store verbatim: `k` (ascending `sint32` keys,
 //! negative for negative values, `0` for the zero bin) paired 1:1 with `n` (`uint32` counts), a
-//! count above 65535 split across repeated entries of one key. It carries no mapping parameters,
+//! count above 65535 split across repeated entries of one key, the remainder first and then the full
+//! entries, as the Agent's `appendSafe` splits it. It carries no mapping parameters,
 //! so every decoded sketch is [`Mapping::agent`], and every encoded one has to be.
 
 use super::generated::agentpayload::sketch_payload::{sketch::Dogsketch, Sketch};
@@ -258,12 +259,16 @@ impl DatadogEncoder {
         let mut fractional = false;
         let mut push = |key: i32, count: f64| {
             fractional |= count.round() != count;
-            let mut left = wire_count(count);
-            while left > 0 {
-                let chunk = left.min(MAX_BIN_COUNT);
+            // The Agent's `appendSafe` order: the remainder, then the full entries.
+            let total = wire_count(count);
+            let remainder = total % MAX_BIN_COUNT;
+            if remainder != 0 {
                 k.push(key);
-                n.push(chunk);
-                left -= chunk;
+                n.push(remainder);
+            }
+            for _ in 0..total / MAX_BIN_COUNT {
+                k.push(key);
+                n.push(MAX_BIN_COUNT);
             }
         };
         for bin in sketch.negative_bins().iter().rev() {
@@ -478,7 +483,7 @@ mod tests {
         assert_eq!(s.metadata.unwrap().origin.unwrap().origin_product, 4);
         let dog = &s.dogsketches[0];
         assert_eq!(dog.k, vec![-5, -2, 0, 1, 3, 3]);
-        assert_eq!(dog.n, vec![1, 3, 2, 1, 65535, 4465]);
+        assert_eq!(dog.n, vec![1, 3, 2, 1, 4465, 65535]);
         assert_eq!((dog.cnt, dog.ts), (70007, TS_S));
         assert_eq!(dog.avg, 10.0 / 70007.0);
     }
