@@ -297,7 +297,8 @@ impl FramedEncoder for GraphiteEncoder {
 enum Plan {
     /// One datapoint carrying this value.
     Scalar(MetricValue),
-    /// A `Sum`'s bare value, counted degraded under this `metric_kind` tag once it's written.
+    /// A `Sum`'s bare value, counted degraded under this `metric_kind` tag before the sink writes
+    /// it, so an oversize drop counts under both counters.
     Sum(MetricValue, &'static str),
     /// Several dotted sub-paths, which [`expand_dotted`] yields.
     Expand,
