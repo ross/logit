@@ -189,6 +189,7 @@ These `graphite_out` series have no row, and no case reaches them yet:
 | `metrics.normalized{reason=tag_sanitized}`, from an array element alone | an array attribute whose last representable element holds whitespace, `;`, or a control character, on an event with no string, bool, number, or resource attribute: the `array_value` cell names `tags.normalized{reason=multi_value}` instead |
 | `metrics.dropped{reason=empty_name}` | a name that sanitizes to nothing, which no decoder emits |
 | `metrics.dropped{reason=unencodable_timestamp}` | an event at or before the Unix epoch's first second |
+| `metrics.degraded{reason=non_finite_component}` | a record under `multi_value: expand` with a NaN or infinite `sum`, `min`, `max`, or quantile, which no case holds |
 | `metrics.dropped{reason=oversize_line}`, `metrics.dropped{reason=oversize_datapoint}` | a line over `max_packet_bytes` under `transport: udp`, or a datapoint over `max_frame_bytes`, transport bounds the row model has no feature for |
 
 ## Determinism

@@ -30,7 +30,9 @@
     "logit.output.metrics.skipped{component=out,kind=graphite_out,metric_kind=set,role=sink}": 1,
     "logit.output.tags.normalized{component=out,kind=graphite_out,reason=multi_value,role=sink}": 1
   }},
-  "event": {"events": [], "counters": {}},
+  "event": {"events": [], "counters": {
+    "logit.output.events.skipped{component=out,kind=graphite_out,reason=no_metrics,role=sink}": 2
+  }},
   "flagged-histogram": {"events": [], "counters": {
     "logit.output.metrics.skipped{component=out,kind=graphite_out,reason=no_recorded_value,role=sink}": 1
   }},
@@ -51,6 +53,7 @@
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"requests","kind":"gauge","value":1.0}],"attributes":{"env":"prod","host.name":"web-1"}},
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"requests.tagged","kind":"gauge","value":1.0}],"attributes":{"host":"web-2","host.name":"web-1"}}
   ], "counters": {
+    "logit.output.events.skipped{component=out,kind=graphite_out,reason=no_metrics,role=sink}": 1,
     "logit.output.metrics.degraded{component=out,kind=graphite_out,metric_kind=monotonic_delta_sum,role=sink}": 2
   }},
   "interop-dogstatsd-buffered": {"events": [
@@ -79,7 +82,9 @@
   "log-beside-metrics": {"events": [
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"requests.inflight","kind":"gauge","value":3.0}],"attributes":{"route":"/api"}}
   ], "counters": {}},
-  "log-only": {"events": [], "counters": {}},
+  "log-only": {"events": [], "counters": {
+    "logit.output.events.skipped{component=out,kind=graphite_out,reason=no_metrics,role=sink}": 1
+  }},
   "mixed": {"events": [
     {"timestamp":"2027-01-15T07:59:30.000000000Z","metrics":[{"name":"queue.depth","kind":"gauge","value":7.0}]},
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"db.up","kind":"gauge","value":1.0}]},
@@ -88,6 +93,7 @@
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"requests","kind":"gauge","value":4.0}],"attributes":{"route":"/api","team":"b"}},
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"temperature","kind":"gauge","value":21.5}],"attributes":{"room":"lab"}}
   ], "counters": {
+    "logit.output.events.skipped{component=out,kind=graphite_out,reason=no_metrics,role=sink}": 1,
     "logit.output.metrics.degraded{component=out,kind=graphite_out,metric_kind=monotonic_delta_sum,role=sink}": 3,
     "logit.output.metrics.dropped{component=out,kind=graphite_out,reason=unresolved_gauge_delta,role=sink}": 1,
     "logit.output.metrics.skipped{component=out,kind=graphite_out,metric_kind=samples,role=sink}": 3,
@@ -133,9 +139,15 @@
   "span-beside-metrics": {"events": [
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"requests.inflight","kind":"gauge","value":3.0}]}
   ], "counters": {}},
-  "span-client": {"events": [], "counters": {}},
-  "span-only": {"events": [], "counters": {}},
-  "span-pair": {"events": [], "counters": {}},
+  "span-client": {"events": [], "counters": {
+    "logit.output.events.skipped{component=out,kind=graphite_out,reason=no_metrics,role=sink}": 1
+  }},
+  "span-only": {"events": [], "counters": {
+    "logit.output.events.skipped{component=out,kind=graphite_out,reason=no_metrics,role=sink}": 1
+  }},
+  "span-pair": {"events": [], "counters": {
+    "logit.output.events.skipped{component=out,kind=graphite_out,reason=no_metrics,role=sink}": 2
+  }},
   "sub-millisecond": {"events": [
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"queue.depth","kind":"gauge","value":3.0}]},
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"queue.depth","kind":"gauge","value":4.0}]}

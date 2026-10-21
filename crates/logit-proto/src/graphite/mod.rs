@@ -105,7 +105,7 @@
 //! | `distribution`, otherwise | skipped | `logit.output.metrics.skipped{metric_kind=distribution}` | Under `multi_value: skip`, the default, no datapoint is written. |
 //! | `set`, under `multi_value: expand` | degraded | `logit.output.metrics.degraded{metric_kind=set}` | Under `multi_value: expand`, the estimate as a `.count` datapoint; the registers are gone. |
 //! | `set`, otherwise | skipped | `logit.output.metrics.skipped{metric_kind=set}` | Under `multi_value: skip`, the default, no datapoint is written. |
-//! | `histogram/delta`, under `multi_value: expand` | degraded | `logit.output.metrics.degraded{metric_kind=histogram}` | Under `multi_value: expand`, dotted `.count`, `.sum`, `.min`, and `.max` datapoints and a `.bucket_<bound>` datapoint per bucket holding that bucket's own count, its temporality dropped; a non-finite `.sum`, `.min`, or `.max` is left off, uncounted. |
+//! | `histogram/delta`, under `multi_value: expand` | degraded | `logit.output.metrics.degraded{metric_kind=histogram}` | Under `multi_value: expand`, dotted `.count`, `.sum`, `.min`, and `.max` datapoints and a `.bucket_<bound>` datapoint per bucket holding that bucket's own count, its temporality dropped. A non-finite `.sum`, `.min`, or `.max` is left off, and the record also counts once as `logit.output.metrics.degraded{reason=non_finite_component}`. |
 //! | `histogram/delta`, otherwise | skipped | `logit.output.metrics.skipped{metric_kind=histogram}` | Under `multi_value: skip`, the default, no datapoint is written. |
 //! | `histogram/cumulative`, under `multi_value: expand` | degraded | `logit.output.metrics.degraded{metric_kind=histogram}` | Under `multi_value: expand`, the same dotted datapoints as a delta one's. |
 //! | `histogram/cumulative`, otherwise | skipped | `logit.output.metrics.skipped{metric_kind=histogram}` | Under `multi_value: skip`, the default, no datapoint is written. |
@@ -131,12 +131,12 @@
 //! | `record/same_instant` | exact | -- | Each record is its own datapoint; a whisper store keeps the later of two points at one second. |
 //! | `record/same_millisecond` | exact | -- | Each record is its own datapoint, its timestamp floored to the second; a whisper store keeps the later of two points in one second. |
 //! | `record/non_finite` | dropped | `logit.output.metrics.dropped{reason=unencodable_value}` | Carbon has no non-finite value, so the datapoint isn't written, with a throttled `unencodable_value` warning. |
-//! | `log/dogstatsd_event` | skipped | uncounted | A log has no carbon form and isn't written, uncounted. |
-//! | `log/plain` | skipped | uncounted | A log has no carbon form and isn't written, uncounted. |
-//! | `span/alone` | skipped | uncounted | A span has no carbon form and isn't written, uncounted. |
+//! | `log/dogstatsd_event` | skipped | `logit.output.events.skipped{reason=no_metrics}` | A log has no carbon form and isn't written. |
+//! | `log/plain` | skipped | `logit.output.events.skipped{reason=no_metrics}` | A log has no carbon form and isn't written. |
+//! | `span/alone` | skipped | `logit.output.events.skipped{reason=no_metrics}` | A span has no carbon form and isn't written. |
 //! | `span/no_wire_form` | exact | -- | Nothing beyond `span/alone`'s outcome. |
-//! | `event/attributes_only` | skipped | uncounted | An event with no metric, log, or span has no datapoint and isn't written, uncounted. |
-//! | `event/string_only` | skipped | uncounted | An InfluxDB point whose fields are all strings has no metric, so it has no datapoint and isn't written, uncounted. |
+//! | `event/attributes_only` | skipped | `logit.output.events.skipped{reason=no_metrics}` | An event with no metric, log, or span has no datapoint and isn't written. |
+//! | `event/string_only` | skipped | `logit.output.events.skipped{reason=no_metrics}` | An InfluxDB point whose fields are all strings has no metric, so it has no datapoint and isn't written. |
 //!
 //! Per field of a record that reaches the wire, attribute shape, and payload beside metrics:
 //!
@@ -190,7 +190,8 @@
 //! | a plaintext line longer than `max_packet_bytes` | dropped whole, never split | `{reason="oversize_line"}` + diag `oversize_line` |
 //! | a single pickle datapoint larger than `max_frame_bytes` | dropped whole, never split | `{reason="oversize_datapoint"}` + diag `oversize_datapoint` |
 //! | `Resource::schema_url` and every `dropped_attributes_count` | dropped | none; carbon has no field for either |
-//! | an event with no metrics at all (a log, a span, or attributes alone) | skipped, and its log, span, or attributes are lost | none: [`EncodeStats::skipped_no_metrics`] only, no counter or diagnostic |
+//! | an event with no metrics at all (a log, a span, or attributes alone) | skipped, and its log, span, or attributes are lost | `logit.output.events.skipped{reason="no_metrics"}`, once per event, no diagnostic |
+//! | a non-finite component of a record under [`MultiValue::Expand`] | that sub-path is left off, and the rest are written | `logit.output.metrics.degraded{reason="non_finite_component"}`, once per record however many it left off, beside the record's `{metric_kind=…}` |
 //!
 //! Why the wire forces the generated rows:
 //!
@@ -248,7 +249,7 @@
 //! [`crate::multi_value`]'s module doc is the canonical table of the dotted sub-paths each kind
 //! expands into, with the rules behind it: every expansion adds at least one suffix, a sketch's
 //! `.sum`, `.min`, and `.max` come from its tracked statistics rather than its bins, non-finite
-//! values are skipped, and number tokens are injective. The encoder appends each sub-path's suffix
+//! values are skipped and reported to the encoder, and number tokens are injective. The encoder appends each sub-path's suffix
 //! to the sanitized path, then the tag segment.
 //!
 //! ## `Protocol` and `Meta`

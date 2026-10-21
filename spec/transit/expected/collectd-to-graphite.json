@@ -13,7 +13,9 @@
     {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"load.load.1","kind":"gauge","value":0.5}],"attributes":{"collectd.host":"logit-fixture"}},
     {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"load.load.2","kind":"gauge","value":0.75}],"attributes":{"collectd.host":"logit-fixture"}}
   ], "counters": {}},
-  "notification": {"events": [], "counters": {}},
+  "notification": {"events": [], "counters": {
+    "logit.output.events.skipped{component=out,kind=graphite_out,reason=no_metrics,role=sink}": 1
+  }},
   "types-db": {"events": [
     {"timestamp":"2026-09-12T18:22:53.000000000Z","metrics":[{"name":"interface.if_dropped.rx","kind":"gauge","value":0.0}],"attributes":{"collectd.host":"logit-fixture","collectd.plugin_instance":"eth0"}},
     {"timestamp":"2026-09-12T18:22:53.000000000Z","metrics":[{"name":"interface.if_dropped.rx","kind":"gauge","value":0.0}],"attributes":{"collectd.host":"logit-fixture","collectd.plugin_instance":"lo"}},

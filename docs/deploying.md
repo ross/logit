@@ -2087,7 +2087,11 @@ one:
   instead of guessing at a convention. To keep them, set `multi_value: expand`, which renders the
   dotted sub-paths tabled in `logit_proto::multi_value`'s module doc (`.count`, `.sum`, `.min`,
   `.max`, `.q0_5`...`.q0_99`, per-bucket counts, and so on), an explicit, named convention counted
-  `logit.output.metrics.degraded{metric_kind=...}` once per record.
+  `logit.output.metrics.degraded{metric_kind=...}` once per record. A non-finite component, such
+  as a NaN `.sum`, is left off, and its record also counts
+  `logit.output.metrics.degraded{reason="non_finite_component"}`.
+- **Logs and spans aren't written.** Carbon has no form for an event with no metrics, so the sink
+  skips it, counted `logit.output.events.skipped{reason="no_metrics"}` once per event.
 - **A counter arrives as a plain number.** Carbon has no counter type, so a `Sum` is written as its
   bare value under either `multi_value:` setting, and carbon and `graphite_in` read it as a gauge.
   Each record counts `logit.output.metrics.degraded{metric_kind="cumulative_sum"|"non_monotonic_delta_sum"|"monotonic_delta_sum"}`.

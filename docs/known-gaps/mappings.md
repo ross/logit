@@ -413,7 +413,7 @@ Entry format and the other areas: [the known-gaps index](README.md).
   | encode (Graphite) | `distribution`, otherwise → **skipped** | `logit.output.metrics.skipped{metric_kind=distribution}` | Under `multi_value: skip`, the default, no datapoint is written. |
   | encode (Graphite) | `set`, under `multi_value: expand` → **degraded** | `logit.output.metrics.degraded{metric_kind=set}` | Under `multi_value: expand`, the estimate as a `.count` datapoint; the registers are gone. |
   | encode (Graphite) | `set`, otherwise → **skipped** | `logit.output.metrics.skipped{metric_kind=set}` | Under `multi_value: skip`, the default, no datapoint is written. |
-  | encode (Graphite) | `histogram/delta`, under `multi_value: expand` → **degraded** | `logit.output.metrics.degraded{metric_kind=histogram}` | Under `multi_value: expand`, dotted `.count`, `.sum`, `.min`, and `.max` datapoints and a `.bucket_<bound>` datapoint per bucket holding that bucket's own count, its temporality dropped; a non-finite `.sum`, `.min`, or `.max` is left off, uncounted. |
+  | encode (Graphite) | `histogram/delta`, under `multi_value: expand` → **degraded** | `logit.output.metrics.degraded{metric_kind=histogram}` | Under `multi_value: expand`, dotted `.count`, `.sum`, `.min`, and `.max` datapoints and a `.bucket_<bound>` datapoint per bucket holding that bucket's own count, its temporality dropped. A non-finite `.sum`, `.min`, or `.max` is left off, and the record also counts once as `logit.output.metrics.degraded{reason=non_finite_component}`. |
   | encode (Graphite) | `histogram/delta`, otherwise → **skipped** | `logit.output.metrics.skipped{metric_kind=histogram}` | Under `multi_value: skip`, the default, no datapoint is written. |
   | encode (Graphite) | `histogram/cumulative`, under `multi_value: expand` → **degraded** | `logit.output.metrics.degraded{metric_kind=histogram}` | Under `multi_value: expand`, the same dotted datapoints as a delta one's. |
   | encode (Graphite) | `histogram/cumulative`, otherwise → **skipped** | `logit.output.metrics.skipped{metric_kind=histogram}` | Under `multi_value: skip`, the default, no datapoint is written. |
@@ -451,13 +451,13 @@ Entry format and the other areas: [the known-gaps index](README.md).
   | encode (Graphite) | field `attributes/resource_attribute`, under `tags: drop` → **lost** | `logit.output.tags.omitted{reason=dialect}` | Under `tags: drop`, no tag is written, counted once per attribute. |
   | encode (Graphite) | field `attributes/scope` → **lost** | none (uncounted) | Carbon has no instrumentation scope; it isn't written or counted. |
   | encode (Graphite) | field `attributes/datadog_carrier_log` → **lost** | none (uncounted) | Another protocol's `_logit.` carrier isn't a tag and is left off, uncounted. |
-  | encode (Graphite) | `log/dogstatsd_event` → **skipped** | none (uncounted) | A log has no carbon form and isn't written, uncounted. |
-  | encode (Graphite) | `log/plain` → **skipped** | none (uncounted) | A log has no carbon form and isn't written, uncounted. |
+  | encode (Graphite) | `log/dogstatsd_event` → **skipped** | `logit.output.events.skipped{reason=no_metrics}` | A log has no carbon form and isn't written. |
+  | encode (Graphite) | `log/plain` → **skipped** | `logit.output.events.skipped{reason=no_metrics}` | A log has no carbon form and isn't written. |
   | encode (Graphite) | field `log/beside_metrics` → **lost** | none (uncounted) | A log on an event that carries metrics is left off while the metrics are written, uncounted. |
-  | encode (Graphite) | `span/alone` → **skipped** | none (uncounted) | A span has no carbon form and isn't written, uncounted. |
+  | encode (Graphite) | `span/alone` → **skipped** | `logit.output.events.skipped{reason=no_metrics}` | A span has no carbon form and isn't written. |
   | encode (Graphite) | field `span/beside_metrics` → **lost** | none (uncounted) | A span on an event that carries metrics is left off while the metrics are written, uncounted. |
-  | encode (Graphite) | `event/attributes_only` → **skipped** | none (uncounted) | An event with no metric, log, or span has no datapoint and isn't written, uncounted. |
-  | encode (Graphite) | `event/string_only` → **skipped** | none (uncounted) | An InfluxDB point whose fields are all strings has no metric, so it has no datapoint and isn't written, uncounted. |
+  | encode (Graphite) | `event/attributes_only` → **skipped** | `logit.output.events.skipped{reason=no_metrics}` | An event with no metric, log, or span has no datapoint and isn't written. |
+  | encode (Graphite) | `event/string_only` → **skipped** | `logit.output.events.skipped{reason=no_metrics}` | An InfluxDB point whose fields are all strings has no metric, so it has no datapoint and isn't written. |
 
   <!-- transit:end -->
 

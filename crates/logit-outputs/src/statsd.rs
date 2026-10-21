@@ -1691,7 +1691,7 @@ fn render_multi_value(
             render_gauge_entry(line, name, suffix, value, ctx);
         }
     });
-    debug_assert!(expanded, "only a multi-value kind reaches render_multi_value");
+    debug_assert!(expanded.is_some(), "only a multi-value kind reaches render_multi_value");
 }
 
 /// Counts and warns for a multi-value kind dropped under [`MultiValue::Skip`]. The hint names the

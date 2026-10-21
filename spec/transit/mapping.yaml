@@ -844,7 +844,8 @@ rows:
           text: >-
             Under `multi_value: expand`, dotted `.count`, `.sum`, `.min`, and `.max` datapoints and
             a `.bucket_<bound>` datapoint per bucket holding that bucket's own count, its
-            temporality dropped; a non-finite `.sum`, `.min`, or `.max` is left off, uncounted.
+            temporality dropped. A non-finite `.sum`, `.min`, or `.max` is left off, and the record
+            also counts once as `logit.output.metrics.degraded{reason=non_finite_component}`.
         - class: skipped
           counter: logit.output.metrics.skipped{metric_kind=histogram}
           text: >-
@@ -2333,8 +2334,8 @@ rows:
           carriers.
       graphite_out:
         class: skipped
-        reason: uncounted
-        text: A log has no carbon form and isn't written, uncounted.
+        counter: logit.output.events.skipped{reason=no_metrics}
+        text: A log has no carbon form and isn't written.
   - kind: log
     feature: plain
     cells:
@@ -2362,8 +2363,8 @@ rows:
           One object of a `/api/v2/logs` body, its attributes as top-level keys.
       graphite_out:
         class: skipped
-        reason: uncounted
-        text: A log has no carbon form and isn't written, uncounted.
+        counter: logit.output.events.skipped{reason=no_metrics}
+        text: A log has no carbon form and isn't written.
   - kind: log
     feature: beside_metrics
     cells:
@@ -2426,8 +2427,8 @@ rows:
           rows).
       graphite_out:
         class: skipped
-        reason: uncounted
-        text: A span has no carbon form and isn't written, uncounted.
+        counter: logit.output.events.skipped{reason=no_metrics}
+        text: A span has no carbon form and isn't written.
   - kind: span
     feature: no_wire_form
     cells:
@@ -2522,8 +2523,8 @@ rows:
           carries it, uncounted.
       graphite_out:
         class: skipped
-        reason: uncounted
-        text: An event with no metric, log, or span has no datapoint and isn't written, uncounted.
+        counter: logit.output.events.skipped{reason=no_metrics}
+        text: An event with no metric, log, or span has no datapoint and isn't written.
   - kind: event
     feature: string_only
     cells:
@@ -2558,7 +2559,7 @@ rows:
           intake's routes and no request carries it, uncounted.
       graphite_out:
         class: skipped
-        reason: uncounted
+        counter: logit.output.events.skipped{reason=no_metrics}
         text: >-
           An InfluxDB point whose fields are all strings has no metric, so it has no datapoint and
-          isn't written, uncounted.
+          isn't written.

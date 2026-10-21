@@ -34,14 +34,17 @@ const NANOS_PER_SECOND: i64 = 1_000_000_000;
 /// Production telemetry comes from the counters the encoder emits itself.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct EncodeStats {
-    /// Events with no metrics (a log, a span, or attributes alone). Their log, span, or attributes
-    /// are lost, uncounted: carbon has no form for them.
+    /// Events with no metrics (a log, a span, or attributes alone), counted
+    /// `events.skipped{reason="no_metrics"}`: carbon has no form for them.
     pub skipped_no_metrics: usize,
     /// A multi-value metric kind under [`MultiValue::Skip`], once per record, tagged with the kind.
     pub dropped_unsupported_kind: usize,
     /// A multi-value metric kind under [`MultiValue::Expand`], once per **record**, however many
     /// sub-paths it produced.
     pub degraded_expanded_kind: usize,
+    /// An expanded record with a non-finite component left off, once per record however many it
+    /// left off, counted `metrics.degraded{reason="non_finite_component"}`.
+    pub degraded_non_finite_component: usize,
     /// A `Sum` written as its bare value, once per record (normalization 12): its temporality
     /// and monotonicity don't survive, so carbon and `graphite_in` read it as a gauge.
     pub degraded_sum: usize,
@@ -247,7 +250,7 @@ impl FramedEncoder for GraphiteEncoder {
 
         for event in &batch.events {
             if event.metrics.is_empty() {
-                ctx.stats.skipped_no_metrics += 1;
+                ctx.skip_no_metrics();
                 continue;
             }
 
@@ -380,7 +383,10 @@ fn encode_record(
             let expanded = expand_dotted(&record.kind, dotted, |suffix, value, _| {
                 sink.emit(path, suffix, tag_suffix, MetricValue::F64(value), seconds, ctx)
             });
-            debug_assert!(expanded, "only a multi-value kind plans an expansion");
+            debug_assert!(expanded.is_some(), "only a multi-value kind plans an expansion");
+            if expanded.is_some_and(|skipped| skipped > 0) {
+                ctx.degrade_non_finite_component();
+            }
         }
     }
 }
@@ -793,6 +799,21 @@ impl Ctx<'_> {
         self.telemetry.count("logit.output.metrics.degraded", 1.0, &[("metric_kind", metric_kind)]);
     }
 
+    fn degrade_non_finite_component(&mut self) {
+        self.stats.degraded_non_finite_component += 1;
+        self.telemetry.count(
+            "logit.output.metrics.degraded",
+            1.0,
+            &[("reason", "non_finite_component")],
+        );
+    }
+
+    /// No diagnostic: a log or span tapped into a metrics sink is a topology choice, not a fault.
+    fn skip_no_metrics(&mut self) {
+        self.stats.skipped_no_metrics += 1;
+        self.telemetry.count("logit.output.events.skipped", 1.0, &[("reason", "no_metrics")]);
+    }
+
     fn drop_gauge_delta(&mut self) {
         self.stats.dropped_gauge_delta += 1;
         self.telemetry.count(
@@ -1159,11 +1180,50 @@ mod tests {
     }
 
     #[test]
-    fn an_event_with_no_metrics_is_skipped_without_a_counter() {
-        let (lines, _, stats, _) =
-            encode_with(&batch(vec![Event::empty(TS, AttrMap::new())]), |e| e);
-        assert!(lines.is_empty());
-        assert_eq!(stats.skipped_no_metrics, 1);
+    fn an_event_with_no_metrics_is_skipped_and_counted_once_per_event() {
+        let empty = || Event::empty(TS, AttrMap::new());
+        let (lines, _, stats, registry) =
+            encode_with(&batch(vec![empty(), event(MetricKind::gauge(1.0)), empty()]), |e| e);
+        assert_eq!(lines, vec!["sys.cpu 1 1700000000"]);
+        assert_eq!(stats.skipped_no_metrics, 2);
+        assert_eq!(
+            counted(&registry, "logit.output.events.skipped", ("reason", "no_metrics")),
+            2.0
+        );
+    }
+
+    /// Under `multi_value: expand`, a record with non-finite components counts once, however many
+    /// it left off; one with none counts nothing.
+    #[test]
+    fn an_expanded_non_finite_component_is_counted_degraded_once_per_record() {
+        let histogram = |sum: f64, max: f64| {
+            event(MetricKind::Histogram(Histogram {
+                buckets: vec![(1.0, 2)],
+                temporality: Temporality::Delta,
+                sum: Some(sum),
+                min: Some(0.5),
+                max: Some(max),
+            }))
+        };
+        let (lines, _, stats, registry) = encode_with(
+            &batch(vec![
+                histogram(f64::NAN, f64::INFINITY),
+                histogram(1.5, 1.0),
+                event(MetricKind::Summary(Summary {
+                    quantiles: vec![(0.5, f64::NAN)],
+                    count: 1,
+                    sum: 1.0,
+                    temporality: Temporality::Cumulative,
+                })),
+            ]),
+            |e| e.with_multi_value(MultiValue::Expand),
+        );
+        assert!(!lines.iter().any(|l| l.contains("NaN") || l.contains("inf ")), "{lines:?}");
+        assert_eq!(stats.degraded_non_finite_component, 2, "one per record with a skip");
+        assert_eq!(
+            counted(&registry, "logit.output.metrics.degraded", ("reason", "non_finite_component")),
+            2.0
+        );
     }
 
     // -- timestamps ------------------------------------------------------------------------------

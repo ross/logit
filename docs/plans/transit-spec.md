@@ -717,13 +717,17 @@ Recorded per workstream as each lands.
     `cumulative_sum` and `non_monotonic_delta_sum`, plus `monotonic_delta_sum` for the monotonic
     delta sum `statsd_out` writes exact. Unlike `statsd_out`, it still writes every sum under
     `multi_value: skip`.
-  - An event with no metrics (a log, a span, or attributes alone) is skipped with no counter or
-    diagnostic, only `EncodeStats::skipped_no_metrics`. The log, span, and event rows record it
-    as `skipped` or `lost`, uncounted, as `influxdb_out` and `prometheus_out` do; `statsd_out`
-    counts `events.skipped`. The codec's encode table said "nothing was lost"; it now says the
-    event's content is lost.
-  - Under `multi_value: expand`, a non-finite `.sum`, `.min`, `.max`, or quantile is left off
+  - An event with no metrics (a log, a span, or attributes alone) was skipped with no counter or
+    diagnostic, only `EncodeStats::skipped_no_metrics`. Settled in `tgraph/w4`: it counts
+    `events.skipped{reason=no_metrics}` once per event, and the `log/dogstatsd_event`,
+    `log/plain`, `span/alone`, `event/attributes_only`, and `event/string_only` cells name it. A
+    log or span beside metrics is still lost uncounted (`log/beside_metrics`,
+    `span/beside_metrics`).
+  - Under `multi_value: expand`, a non-finite `.sum`, `.min`, `.max`, or quantile was left off
     uncounted, where `influxdb_out` counts `metrics.degraded{reason=non_finite_component}`.
+    Settled in `tgraph/w4`: `logit_proto::multi_value::expand_dotted` returns how many components
+    it skipped, and `graphite_out` counts that series once per record. `statsd_out` ignores the
+    count, so it still leaves them off uncounted. No case reaches the series, so no cell names it.
   - `metrics.normalized{reason=tag_sanitized}` counts once per record, whichever attribute moved
     it, so the `string_value`, `bool_value`, `number_value`, and `resource_attribute` cells all
     name it. An array element alone can't move it without one of those beside it, which the

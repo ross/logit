@@ -2226,6 +2226,10 @@ table:
   multi-value kind under `multi_value: skip`)
 - `logit.output.metrics.degraded{metric_kind}` (a multi-value kind expanded, or a `Sum` written as
   its bare value, once per record)
+- `logit.output.metrics.degraded{reason="non_finite_component"}` (an expanded record with a
+  non-finite component left off, once per record)
+- `logit.output.events.skipped{reason="no_metrics"}` (a log, a span, or attributes alone, once per
+  event)
 - `logit.output.metrics.normalized{reason="path_sanitized"|"tag_sanitized"}`
 - `logit.output.tags.omitted{reason="dialect"|"unrepresentable"|"empty"|"collision"}`
 - `logit.output.tags.normalized{reason="multi_value"}` (lossy; see above)
