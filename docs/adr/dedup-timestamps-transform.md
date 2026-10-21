@@ -39,17 +39,17 @@ documents the overwrite in the sink.
 
 The other metric sinks, read from code on 2026-10-21:
 
-- **`datadog_out` sends both.** Its encoder writes one series per `(event, MetricRecord)`, one
-  point each, at whole seconds rounded toward negative infinity
+- **`datadog_out` sends both.** Its encoder writes one series per point a record writes (one, or a
+  histogram's or summary's expansion), at whole seconds rounded toward negative infinity
   (`crates/logit-proto/src/datadog/mod.rs`'s mapping table: `same_instant` and `same_millisecond`
   are `exact`). Nothing collapses or counts two points of one series in one second. Datadog keeps
   the higher of two such points in one request, for a gauge and a `count` alike, and the later
   write across requests ([Verified destination behavior](#verified-destination-behavior)). For a
   delta `count`, that loses the lower point's increment, silently.
 - **`influxdb_out` keeps both.** `InfluxLineEncoder::encode` moves a point that shares a series
-  and a timestamp with one already in the batch to the next free nanosecond, counted
-  `normalized{reason="next_nanosecond"}`, because InfluxDB overwrites an identical
-  `(measurement, tag set, timestamp)`. It needs no remedy.
+  and a timestamp with one already in the batch to the next free nanosecond, uncounted, because InfluxDB overwrites an identical
+  `(measurement, tag set, timestamp)`. `next_nanosecond` is only the transit spec's reason label
+  for that `normalized` cell. It needs no remedy.
 - **`otlp_out` keeps both**, one data point per record (`crates/logit-proto/src/otlp/metrics.rs`'s
   mapping table). What the backend does with them is the backend's.
 - **`statsd_out`** writes one line per record, and statsd lines carry no timestamp.
@@ -61,8 +61,9 @@ timestamp-faithful relay ([Alternatives considered](#alternatives-considered)).
 
 ## Decision
 **A new native transform, `dedup_timestamps`, collapses the metric records in one batch that share a series
-and a timestamp bucket of a configured `precision:` into one record, the later reading, with
-delta kinds and observation kinds merged into it where a merge is sound.** An operator places it in front of a sink whose destination can't
+and a timestamp bucket of a configured `precision:` into one record, the latest reading that can merge,
+with delta kinds and observation kinds merged into it where a merge is sound, and every record
+that can't merge passed through untouched.** An operator places it in front of a sink whose destination can't
 hold two readings of one series at one instant. Separately, `prometheus_out`'s collapse becomes
 counted loss.
 
@@ -104,42 +105,85 @@ would close that, but it ties the transform to one sink's label rules.
 
 ### Which reading survives
 
-Within a colliding set, the **surviving record is the one on the event with the latest
-timestamp**, and the later in batch order on a tie. Its event keeps its own, untruncated
-timestamp, and every earlier record in the set is removed from its event. What the surviving
-record carries depends on the kind:
+Within a colliding set, a record that can't merge passes through: it stays on its own
+event, untouched, and is counted `passed_through` with the reason the table gives. The
+**surviving record is the latest-timestamp record among the records that can merge**, and the
+later in batch order on a tie. Its event keeps its own, untruncated timestamp, and every other
+mergeable record in the set is removed from its event. A `NaN` or infinite delta value and a kind
+with no merge rule can't merge on their own. A layout, a `sample_rate`, or a value type is
+compared with the survivor's, so the latest record that can merge on its own sets them, and a
+record that differs from it passes through. The rest fold into the survivor in batch order, and a
+record whose addition would overflow the running total passes through. What the surviving record
+carries depends on the kind:
 
 | Kind | Rule |
 |---|---|
 | `Gauge`, any `MetricValue` (a `NaN` gauge included) | last write wins: the later value |
 | `Sum`, cumulative, monotonic or not | last write wins |
 | `Histogram`, `ExponentialHistogram`, `Summary`, cumulative | last write wins |
-| `Sum`, delta, monotonic or not | summed, with `aggregate`'s widening rule for mixed value types; a `NaN` or infinite value, or an integer overflow, passes through |
-| `GaugeDelta` | summed: two adjustments at one instant apply as one |
-| `Histogram`, delta | merged when the bounds are equal: bucket counts, `count`, and `sum` added, `min` and `max` the lower and higher; otherwise passed through |
-| `ExponentialHistogram`, delta | merged when scale and zero threshold are equal, aligned by absolute bucket index; otherwise passed through |
-| `Summary`, delta (only `cumulative_to_delta` makes one) | passed through: quantiles don't add |
-| a record flagged `NO_RECORDED_VALUE` | takes part in last write wins as a reading; beside a delta kind's value, passed through |
-| `Samples` | values concatenated, earlier first, when the `sample_rate`s are equal; otherwise passed through |
+| `Sum`, delta, monotonic or not | summed, keeping the value type. A `NaN` or infinite value passes through (`non_finite`), as does a value of the other `I64`/`F64` type from the survivor's (`mixed_type`) and one whose addition would overflow the total (`overflow`) |
+| `GaugeDelta` | passed through (`no_merge_rule`) |
+| `Histogram`, delta | merged when the bucket bounds equal the survivor's: bucket counts added, `sum` added, `min` the lower and `max` the higher, under `aggregate`'s rules below. Other bounds pass through (`layout_mismatch`) |
+| `ExponentialHistogram`, delta | merged when scale and zero threshold equal the survivor's: `positive` and `negative` bucket counts added by absolute bucket index, `zero_count` and `count` added, and `sum`, `min`, and `max` under `aggregate`'s rules. Another scale or zero threshold passes through (`layout_mismatch`) |
+| `Summary`, delta (only `cumulative_to_delta` makes one) | passed through (`no_merge_rule`): quantiles don't add |
+| `Samples` | values concatenated, earlier first, when the `sample_rate` equals the survivor's. Another rate passes through (`layout_mismatch`) |
 | `SetMembers` | union: the members of both, each once |
 | `Distribution` | `DdSketch::merge`, which re-bins the incoming sketch when the two sketches' mappings differ |
 | `Set` | `HyperLogLog::merge`, a union |
+| a record flagged `NO_RECORDED_VALUE`, any kind | last write wins against the set's latest value: see below |
 
 Last write wins needs no arithmetic, so it's safe for every kind, `NaN` included. A delta is an
-increment, so the later one alone would lose the earlier's; summing is the merge
+increment, so the later one alone would lose the earlier's. Summing is the merge
 [ADR `aggregation-window-semantics`](aggregation-window-semantics.md) already defines for the
 same kinds, and where no merge is safe the record passes through untouched rather than being
-dropped. A passed-through record leaves the duplicate for the sink, which counts it as loss if it
-drops one.
+dropped.
+
+A passed-through record reaches the sink as a duplicate of the survivor, and a sink that can't
+hold both drops it and counts it as loss: in remote-write mode,
+`logit.output.metrics.dropped{reason="duplicate_timestamp"}` after
+[the sink-side counter](#the-sink-side-counter) change. That's intended. A record that can't be
+merged is broken input, such as a `NaN` increment, two layouts for one series, or a total past
+the integer range, so its loss is reported as loss, not as an outcome the config asked for.
+
+`GaugeDelta` passes through because merging it would reorder it. A statsd gauge's `Gauge` and
+`GaugeDelta` share one accumulator in `aggregate`, which applies each delta in arrival order on
+top of the current value. The series key includes the kind, so summing the deltas apart from
+the absolute moves them past it: `g:+5`, `g:10`, `g:+1` in one datagram would resolve to 16
+instead of 11. A `GaugeDelta` exists only upstream of an `aggregate`, which resolves it, so
+merging it here gains nothing.
+
+The delta merges never change a value's type. `aggregate` widens a mixed `I64`/`F64` pair or an
+overflowing integer sum to `F64` (`crates/logit-transforms/src/aggregate.rs`'s module doc), and
+this transform departs from it by design. `aggregate` summarizes; `dedup_timestamps` keeps the
+data as it arrived, and some destinations reject a type change on a series: InfluxDB answers a
+field type conflict, and OTLP backends treat an int and a double for one series as a conflict.
+So the record that would force a widening passes through instead, and no `widened` counter
+exists here.
+
+The histogram merges follow `aggregate`'s, in the module doc of
+`crates/logit-transforms/src/aggregate.rs` and its histogram merge:
+
+- **`sum`, `min`, and `max`** each become `None` once a contributing record lacks one, because a
+  value over part of the observations is a wrong number a consumer can't detect.
+- **`min` and `max`** fold only over records that observed something, through `fold_extreme`: a
+  record whose buckets (and, for an `ExponentialHistogram`, `zero_count`) total zero contributes
+  neither.
+- **Bucket counts, `count`, and `zero_count`** add with an overflow check, not `aggregate`'s
+  `saturating_add`. A saturated count changes a value silently, so a record whose addition would
+  overflow any of them passes through (`overflow`), as an overflowing integer sum does. An `F64`
+  `sum` that would leave the finite range passes through the same way.
+- **`ExponentialHistogram` buckets** realign by absolute bucket index: the merged `positive` and
+  `negative` ranges each start at the lower of the two offsets and cover both records' buckets.
+  `aggregate` has no exponential-histogram merge, so this arithmetic is new.
 
 The four observation kinds merge where `aggregate` merges them, with one difference each:
 
 - **`Samples`** concatenate as `aggregate`'s `distributions: samples` does, and only under one
   rate, because a `Samples` record carries one `sample_rate` for all its values. `aggregate`
-  falls back to a sketch on a rate mismatch; `dedup_timestamps` doesn't change a record's kind, so
-  it passes both records through unmerged, counted `passed_through{reason="layout_mismatch"}`.
-  That matches a delta kind whose layouts differ: the duplicate reaches the sink, which drops it
-  and counts the loss.
+  falls back to a sketch on a rate mismatch. `dedup_timestamps` doesn't change a record's kind,
+  so a record whose rate differs from the survivor's passes through, counted
+  `passed_through{reason="layout_mismatch"}`, and the records at the survivor's rate still
+  merge.
 - **`SetMembers`** union as `aggregate`'s `sets: members` does, with no cap: both records are in
   the batch already.
 - **`Distribution`** merges bin for bin under one mapping. Under two, `DdSketch::merge` re-bins
@@ -147,6 +191,21 @@ The four observation kinds merge where `aggregate` merges them, with one differe
   `aggregate`. Two mappings for one series at one timestamp are rare in a relay. Re-binning loses
   some precision, where last write wins would lose every observation in the earlier sketch.
 - **`Set`** always merges: `HyperLogLog::merge` has no precondition.
+
+A record flagged `NO_RECORDED_VALUE`, such as Prometheus's stale marker, carries no reading, so
+it never enters arithmetic. It takes part in last write wins against the latest mergeable value
+in its set, and the record that loses is counted `absorbed`. A record that can't merge still
+passes through, as above.
+
+- **When the marker is the latest**, ties going to the later in batch order, the series ended.
+  The marker survives and absorbs every mergeable value in the set.
+- **When a value is later**, the value wins. The marker is absorbed, and the values resolve among
+  themselves by their kind's rule.
+- **Two markers** resolve by last write wins too.
+
+This departs from `aggregate`, which passes a flagged record through unmerged: `aggregate` folds
+values into a window, while here a marker and a value at one instant are two readings of one
+series, and the later one is the series' state.
 
 On a merged record:
 
@@ -161,7 +220,7 @@ On a merged record:
 
 An `Event` carries any mix of metrics, a log, and a span, and `dedup_timestamps` acts only on metric records:
 
-- An event whose records all collapse into later events, and that carries no log and no span, is
+- An event whose records all collapse into the survivors' events, and that carries no log and no span, is
   removed from the batch and counted `logit.component.events.discarded`.
 - An event that keeps another record, a log, or a span is forwarded with only its collapsed
   records removed. Its log and span are never touched.
@@ -221,17 +280,21 @@ rest. A batch with no collision pays one hash and one probe per metric record.
 ### Telemetry
 
 Names follow [ADR `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md). Nothing `dedup_timestamps`
-does is loss: the operator asked for each outcome, so it emits no `*.dropped`.
+does is loss: it removes only readings it merged or superseded, which the operator asked for, so
+it emits no `*.dropped`. The loss a passed-through record causes is counted at the sink.
 
 | Name | Meaning |
 |---|---|
-| `logit.transform.metrics.merged` | a reading summed or otherwise combined into the surviving reading: a delta `Sum`, a `GaugeDelta`, a delta histogram with a matching layout, and the observation kinds' merges, a re-binned `Distribution` included |
-| `logit.transform.metrics.absorbed` | a reading superseded by a later one under last write wins: a `Gauge` or a cumulative kind |
-| `logit.transform.metrics.passed_through{reason="non_finite" \| "overflow" \| "layout_mismatch" \| "no_merge_rule" \| "no_recorded_value"}` | a record that shares its series and bucket with another but has no safe merge, forwarded untouched: the sink still sees the duplicate |
+| `logit.transform.metrics.merged` | a reading summed or otherwise combined into the surviving reading: a delta `Sum`, a delta histogram with a matching layout, and the observation kinds' merges, a re-binned `Distribution` included |
+| `logit.transform.metrics.absorbed` | a reading superseded by a later one under last write wins: a `Gauge`, a cumulative kind, or either side of a `NO_RECORDED_VALUE` marker and a value |
+| `logit.transform.metrics.passed_through{reason="non_finite" \| "overflow" \| "mixed_type" \| "layout_mismatch" \| "no_merge_rule"}` | a record that shares its series and bucket with another but can't merge, forwarded untouched: the sink still sees the duplicate |
 | `logit.component.events.discarded` | an event left with no metric, log, or span |
 
-Each counts the readings that are gone, never the survivor, and a record with no collision isn't
-counted. None of the names is in the loss vocabulary's table, and none ends in a loss word.
+`merged` and `absorbed` count the readings that are gone, never the survivor. `passed_through`
+counts each record forwarded beside the survivor, that is, each duplicate left for the sink: when
+no record of the set can merge, every one but the first, so a passed-through pair counts once. A
+record with no collision isn't counted. None of the names is in the loss vocabulary's table, and
+none ends in a loss word.
 `merged` is new under `logit.transform.*`. `passed_through` is `aggregate`'s word for a record
 forwarded unmerged, read the same way here.
 
