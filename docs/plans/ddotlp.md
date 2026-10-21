@@ -55,9 +55,10 @@ Non-goals:
   arithmetic. `rebin_to_agent` isn't reused; the ADR's "Exponential histograms" section says why.
   The helpers in `logit-core/src/sketch.rs` it needs (`key`, `lower_bound`) become visible to the
   port, or the port lives in `logit-core`.
-- **Summaries.** `.quantile` gauges for every summary. `.count` and `.sum` are omitted from a
-  cumulative summary, counted `metrics.omitted{reason="unresolved_cumulative"}`; W2 adds the delta
-  case.
+- **Summaries.** `.quantile` gauges for every summary. A cumulative summary's `.count` and
+  `.sum` aren't written, counted as loss, `logit.output.fields.dropped{reason="unresolved_cumulative"}`
+  (a new counter, with its row in [internal-telemetry.md](../design/internal-telemetry.md)), once
+  per summary record, with the diagnostic naming `cumulative_to_delta`; W2 adds the delta case.
 - **Differential corpus.** `script/differential datadog-sketch` builds a small Go program against
   `datadog-agent/pkg/util/quantile` and `pkg/opentelemetry-mapping-go/otlp/metrics` at the pinned
   commit, `prom-text`'s pattern: Go modules in a docker volume, the image pinned by tag and

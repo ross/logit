@@ -143,11 +143,14 @@ arithmetic included.
 - **Quantiles.** Each `(q, v)` pair becomes a `<name>.quantile` gauge tagged `quantile:<q>`, with
   `q` in `formatFloat`'s form (`quantile:0.5`, `quantile:0.99`, `quantile:1.0`, `quantile:0`). A
   non-finite value is dropped, counted `metrics.dropped{reason="non_finite_value"}` as for any
-  gauge. The exporter's
-  `summaries.mode: noquantiles` isn't offered: nothing yet needs it.
+  gauge. The exporter's `summaries.mode: noquantiles` isn't offered: nothing yet needs it.
 - **`.count` and `.sum`.** A delta `Summary` adds `<name>.count` (no unit) and `<name>.sum` as
-  `count` points. A cumulative one is a running total, so they're left off and the quantiles still
-  go out: `logit.output.metrics.omitted{reason="unresolved_cumulative"}`, once per record. A
+  `count` points. A cumulative one is a running total, so they aren't written and the quantiles
+  still go out. They're lost because a stage is missing, not because the operator asked, so the
+  count is loss, as for a cumulative `Sum`: `logit.output.fields.dropped{reason="unresolved_cumulative"}`,
+  once per summary record, with the same throttled diagnostic naming `cumulative_to_delta`.
+  `*.omitted` would hide it from an operator who alerts only on `*.dropped`. No
+  `fields.dropped` counter exists yet; it's new, inside the loss vocabulary's pattern. A
   `cumulative_to_delta` upstream makes them sendable.
 
 #### Summary temporality
