@@ -966,7 +966,7 @@ impl DatadogEncoder {
                     (Temporality::Delta, _) => WireType::Count,
                     (Temporality::Cumulative, false) => WireType::Gauge,
                     (Temporality::Cumulative, true) => {
-                        self.unresolved_cumulative(MetricOut::Kind("cumulative_sum"), "sum");
+                        self.unresolved_cumulative("sum");
                         return;
                     }
                 };
@@ -995,7 +995,7 @@ impl DatadogEncoder {
             }
             MetricKind::Histogram(h) => {
                 if h.temporality == Temporality::Cumulative {
-                    self.unresolved_cumulative(MetricOut::Kind("histogram"), "histogram");
+                    self.unresolved_cumulative("histogram");
                     return;
                 }
                 if record.is_no_recorded_value() {
@@ -1028,10 +1028,7 @@ impl DatadogEncoder {
             }
             MetricKind::ExponentialHistogram(e) => {
                 if e.temporality == Temporality::Cumulative {
-                    self.unresolved_cumulative(
-                        MetricOut::Kind("exponential_histogram"),
-                        "exponential histogram",
-                    );
+                    self.unresolved_cumulative("exponential histogram");
                     return;
                 }
                 // The sketch route counts a flagged or oversized record.
@@ -1044,7 +1041,7 @@ impl DatadogEncoder {
                     self.metric_not_sent(MetricOut::NoRecordedValue);
                     return;
                 }
-                // Its cell names the omitted count and sum, so the quantiles' form isn't counted.
+                // Its cell names the dropped count and sum, so the quantiles' form isn't counted.
                 for (q, v) in &summary.quantiles {
                     out.push(SeriesPoint {
                         suffix: "quantile",
@@ -1052,18 +1049,28 @@ impl DatadogEncoder {
                         ..point(WireType::Gauge, *v)
                     });
                 }
-                // A summary is a running total: its count and sum need differencing first.
-                self.telemetry.count(
-                    "logit.output.fields.omitted",
-                    1.0,
-                    &[("reason", "unresolved_cumulative")],
-                );
-                self.diagnostics.warn_throttled(
-                    "unresolved_cumulative",
-                    "datadog: a summary's .count and .sum aren't sent: they're running totals, \
-                     which Datadog's exporter differences first; logit has no stage that does \
-                     that yet (docs/plans/ddotlp.md's W2, cumulative_to_delta)",
-                );
+                if summary.temporality == Temporality::Delta {
+                    // `MapSummaryMetrics`: `.count` with no unit, `.sum` with the record's.
+                    out.push(SeriesPoint {
+                        suffix: "count",
+                        unit: false,
+                        ..point(WireType::Count, summary.count as f64)
+                    });
+                    out.push(SeriesPoint { suffix: "sum", ..point(WireType::Count, summary.sum) });
+                } else {
+                    // A running total: its count and sum need differencing first.
+                    self.telemetry.count(
+                        "logit.output.fields.dropped",
+                        1.0,
+                        &[("reason", "unresolved_cumulative")],
+                    );
+                    self.diagnostics.warn_throttled(
+                        "unresolved_cumulative",
+                        "datadog: a cumulative summary's .count and .sum aren't sent: they're \
+                         running totals, which Datadog's exporter differences first -- place a \
+                         `cumulative_to_delta` component ahead of this output",
+                    );
+                }
             }
         }
         if matches!(record.kind, MetricKind::Sum(_) | MetricKind::Gauge(_) | MetricKind::Set(_))
@@ -1127,16 +1134,15 @@ impl DatadogEncoder {
         }
     }
 
-    /// A cumulative kind the translator would difference, skipped until a stage that converts it
-    /// exists (ADR `datadog-otlp-metric-mapping`'s "Sequencing").
-    pub(super) fn unresolved_cumulative(&mut self, outcome: MetricOut, kind: &str) {
-        self.metric_not_sent(outcome);
+    /// A cumulative kind the translator would difference, dropped: a `cumulative_to_delta`
+    /// upstream converts it (ADR `datadog-otlp-metric-mapping`'s "Per kind").
+    pub(super) fn unresolved_cumulative(&mut self, kind: &str) {
+        self.metric_not_sent(MetricOut::UnresolvedCumulative);
         self.diagnostics.warn_throttled(
             "unresolved_cumulative",
             format_args!(
                 "datadog: a cumulative {kind} isn't sent: Datadog's exporter differences it into \
-                 a delta first, and logit has no stage that does that yet \
-                 (docs/plans/ddotlp.md's W2, cumulative_to_delta)"
+                 a delta first -- place a `cumulative_to_delta` component ahead of this output"
             ),
         );
     }
@@ -1387,7 +1393,10 @@ pub fn record_routes(record: &MetricRecord, histograms: HistogramOptions) -> Rec
         MetricKind::ExponentialHistogram(e) if e.temporality == Temporality::Delta => {
             RecordRoutes { series: aggregations, sketch: true, distribution_points: false }
         }
-        // A summary with no quantiles still counts its unsent `.count` and `.sum`.
+        MetricKind::Summary(s) if s.temporality == Temporality::Delta => {
+            series(s.quantiles.len() + 2)
+        }
+        // A cumulative summary with no quantiles still counts its unsent `.count` and `.sum`.
         MetricKind::Summary(s) => series(s.quantiles.len().max(1)),
         _ => series(1),
     }
@@ -2161,7 +2170,7 @@ mod tests {
     }
 
     /// As the translator's `mapToDDFormat`: any delta sum is a `count` (1), a cumulative
-    /// non-monotonic one a `gauge` (3), and a cumulative monotonic one is skipped with the
+    /// non-monotonic one a `gauge` (3), and a cumulative monotonic one is dropped with the
     /// diagnostic naming the stage it needs.
     #[test]
     fn sums_map_as_datadogs_exporter_maps_them() {
@@ -2179,15 +2188,16 @@ mod tests {
             .collect();
         assert_eq!(wire, [(1, 2.0), (3, 3.0)]);
         let c = counters(&registry);
-        assert_eq!(total(&c, "logit.output.metrics.skipped", "cumulative_sum"), 1.0);
+        assert_eq!(total(&c, "logit.output.metrics.dropped", "unresolved_cumulative"), 1.0);
+        assert_eq!(total(&c, "logit.output.metrics.skipped", "cumulative_sum"), 0.0);
         assert_eq!(total(&c, "logit.output.metrics.skipped", "non_monotonic_delta_sum"), 0.0);
         assert_eq!(total(&c, "logit.component.diagnostics", "unresolved_cumulative"), 1.0);
     }
 
-    /// A cumulative histogram or exponential histogram goes to no route, skipped once with the
+    /// A cumulative histogram or exponential histogram goes to no route, dropped once with the
     /// diagnostic, whatever the histogram mode.
     #[test]
-    fn a_cumulative_histogram_kind_is_skipped_once_with_the_diagnostic() {
+    fn a_cumulative_histogram_kind_is_dropped_once_with_the_diagnostic() {
         for mode in [HistogramMode::Distributions, HistogramMode::Counters] {
             let (mut e, registry) =
                 otlp_encoder(HistogramOptions { mode, send_aggregation_metrics: true });
@@ -2220,26 +2230,27 @@ mod tests {
             assert!(v2_series(&mut e, &b).is_empty());
             assert!(e.encode_sketches(&b).is_none());
             let c = counters(&registry);
-            assert_eq!(total(&c, "logit.output.metrics.skipped", "histogram"), 1.0, "{mode:?}");
             assert_eq!(
-                total(&c, "logit.output.metrics.skipped", "exponential_histogram"),
-                1.0,
+                total(&c, "logit.output.metrics.dropped", "unresolved_cumulative"),
+                2.0,
                 "{mode:?}"
             );
+            assert_eq!(total(&c, "logit.output.metrics.skipped", "histogram"), 0.0, "{mode:?}");
             // One per record: the counter counts every diagnostic, a throttled one included.
             assert_eq!(total(&c, "logit.component.diagnostics", "unresolved_cumulative"), 2.0);
         }
     }
 
-    /// A summary's quantiles go out as `.quantile` gauges, a non-finite one dropped and counted,
-    /// and its `.count` and `.sum` are left off, counted once per summary.
+    /// A cumulative summary's quantiles go out as `.quantile` gauges, a non-finite one dropped
+    /// and counted, and its `.count` and `.sum` are left off, counted once per summary.
     #[test]
-    fn a_summary_writes_its_quantiles_and_counts_its_count_and_sum_omitted() {
+    fn a_cumulative_summary_writes_its_quantiles_and_counts_its_count_and_sum_dropped() {
         let (mut e, registry) = otlp_encoder(HistogramOptions::default());
         let s = Summary {
             quantiles: vec![(0.5, 2.0), (0.99, f64::NAN), (1.0, 9.0)],
             count: 4,
             sum: 15.0,
+            temporality: Temporality::Cumulative,
         };
         let b = one_event_batch(AttrMap::new(), MetricKind::Summary(s));
         let series = v2_series(&mut e, &b);
@@ -2250,9 +2261,52 @@ mod tests {
             [("m.quantile", &json!(["quantile:0.5"])), ("m.quantile", &json!(["quantile:1.0"]))]
         );
         let c = counters(&registry);
-        assert_eq!(total(&c, "logit.output.fields.omitted", "unresolved_cumulative"), 1.0);
+        assert_eq!(total(&c, "logit.output.fields.dropped", "unresolved_cumulative"), 1.0);
+        assert_eq!(total(&c, "logit.output.fields.omitted", "unresolved_cumulative"), 0.0);
         assert_eq!(total(&c, "logit.output.metrics.dropped", "non_finite_value"), 1.0);
         assert_eq!(total(&c, "logit.component.diagnostics", "unresolved_cumulative"), 1.0);
+    }
+
+    /// A delta summary adds `.count` (no unit) and `.sum` (the record's unit) as `count` points
+    /// after its quantiles, as the translator's `MapSummaryMetrics` writes them, and counts
+    /// nothing.
+    #[test]
+    fn a_delta_summary_writes_its_count_and_sum_as_counts() {
+        let (mut e, registry) = otlp_encoder(HistogramOptions::default());
+        let s = Summary {
+            quantiles: vec![(0.5, 2.0)],
+            count: 4,
+            sum: 15.0,
+            temporality: Temporality::Delta,
+        };
+        let rec = MetricRecord {
+            unit: Some(intern("ms")),
+            ..MetricRecord::new(intern("m"), MetricKind::Summary(s))
+        };
+        let b = batch(vec![Event::metric(TS, AttrMap::new(), rec)]);
+        let series = v2_series(&mut e, &b);
+        let got: Vec<(&str, i64, f64, Option<&str>)> = series
+            .iter()
+            .map(|s| {
+                (
+                    s["metric"].as_str().unwrap(),
+                    s["type"].as_i64().unwrap(),
+                    s["points"][0]["value"].as_f64().unwrap(),
+                    s["unit"].as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("m.quantile", 3, 2.0, Some("ms")),
+                ("m.count", 1, 4.0, None),
+                ("m.sum", 1, 15.0, Some("ms")),
+            ]
+        );
+        let c = counters(&registry);
+        assert_eq!(total(&c, "logit.output.fields.dropped", "unresolved_cumulative"), 0.0);
+        assert_eq!(total(&c, "logit.component.diagnostics", "unresolved_cumulative"), 0.0);
     }
 
     /// A flagged delta histogram is counted `no_recorded_value` once, on whichever route it
@@ -2324,8 +2378,12 @@ mod tests {
             routes(&h, options(HistogramMode::NoBuckets, true)),
             RecordRoutes { series: 4, distribution_points: false, sketch: false }
         );
-        let empty_summary =
-            record(MetricKind::Summary(Summary { quantiles: vec![], count: 0, sum: 0.0 }));
+        let empty_summary = record(MetricKind::Summary(Summary {
+            quantiles: vec![],
+            count: 0,
+            sum: 0.0,
+            temporality: Temporality::Cumulative,
+        }));
         assert_eq!(routes(&empty_summary, HistogramOptions::default()).series, 1);
         assert_eq!(routes(&record(MetricKind::gauge(1.0)), HistogramOptions::default()).series, 1);
     }

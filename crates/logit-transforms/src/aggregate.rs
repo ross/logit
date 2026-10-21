@@ -1860,6 +1860,7 @@ mod tests {
                 quantiles: vec![(0.5, 1.0)],
                 count: 1,
                 sum: 1.0,
+                temporality: Temporality::Cumulative,
             }),
         ] {
             let event = metric_event("m", kind, 0);
@@ -1918,6 +1919,7 @@ mod tests {
                 quantiles: vec![(0.5, 1.0)],
                 count: 1,
                 sum: 1.0,
+                temporality: Temporality::Cumulative,
             }),
         ]
     }
@@ -4648,7 +4650,12 @@ mod tests {
             ),
             MetricRecord::new(
                 intern("q"),
-                MetricKind::Summary(logit_core::Summary { quantiles: vec![], count: 0, sum: 0.0 }),
+                MetricKind::Summary(logit_core::Summary {
+                    quantiles: vec![],
+                    count: 0,
+                    sum: 0.0,
+                    temporality: Temporality::Cumulative,
+                }),
             ),
             MetricRecord::new(intern("g"), MetricKind::gauge(1.0)),
             MetricRecord::new(intern("g"), MetricKind::counter(1.0)),

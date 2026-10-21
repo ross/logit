@@ -1068,6 +1068,7 @@ mod tests {
                 quantiles: vec![(0.991, 10.0), (0.994, 20.0)],
                 count: 2,
                 sum: 30.0,
+                temporality: logit_core::Temporality::Cumulative,
             }),
             &[],
         )]);

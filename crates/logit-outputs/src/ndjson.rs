@@ -46,7 +46,7 @@
 //! | `set` | `estimate`, `hll` (the `HyperLogLog`'s `to_bytes`, standard base64) |
 //! | `histogram` | `temporality`, `buckets` (`[{"bound": b, "count": n}]` in wire order, each count the bucket's own), then `sum`, `min`, `max` when present |
 //! | `exponential_histogram` | `scale`, `temporality`, `count`, `zero_count`, `zero_threshold`, `positive`, `negative` (each `{"offset": o, "counts": [..]}`, omitted when its counts are empty and its offset `0`), then `sum`, `min`, `max` when present |
-//! | `summary` | `count`, `sum`, `quantiles` (`[{"quantile": q, "value": v}]` in wire order) |
+//! | `summary` | `temporality`, `count`, `sum`, `quantiles` (`[{"quantile": q, "value": v}]` in wire order) |
 //!
 //! A distribution's `sketch` is the `DdSketch` as stored, which the statistics above are read
 //! from: `mapping` (`agent`, or `logarithmic` followed by its `gamma`, `index_offset`, and
@@ -614,6 +614,7 @@ fn walk_kind_fields<W: TreeWriter>(w: &mut W, obj: &mut W::Map, kind: &MetricKin
         }
         MetricKind::ExponentialHistogram(e) => walk_exp_histogram(w, obj, e),
         MetricKind::Summary(s) => {
+            push_temporality(w, obj, s.temporality);
             push_u64(w, obj, "count", s.count);
             push_f64(w, obj, "sum", s.sum);
             w.key(obj, "quantiles");
@@ -1313,7 +1314,12 @@ mod tests {
 
     #[test]
     fn a_summary() {
-        let s = Summary { quantiles: vec![(0.5, 1.0), (0.99, 4.25)], count: 10, sum: 12.0 };
+        let s = Summary {
+            quantiles: vec![(0.5, 1.0), (0.99, 4.25)],
+            count: 10,
+            sum: 12.0,
+            temporality: Temporality::Cumulative,
+        };
         assert_eq!(
             metric(MetricKind::Summary(s)),
             "{\"name\":\"m\",\"kind\":\"summary\",\"count\":10,\"sum\":12.0,\

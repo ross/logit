@@ -191,6 +191,7 @@ fn every_kind() -> Vec<MetricKind> {
             quantiles: vec![(0.5, 1.0), (0.99, 4.25)],
             count: 10,
             sum: 12.0,
+            temporality: Temporality::Cumulative,
         }),
     ]
 }

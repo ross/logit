@@ -161,7 +161,7 @@
 //! Each component's type letter depends on whether a statsd server, which sums every `|c` line
 //! for a name across its flush interval and across senders, would sum it correctly:
 //!
-//! | Component | `Distribution`, delta `Histogram`, delta `ExponentialHistogram` | cumulative `Histogram`/`ExponentialHistogram`, every `Summary` |
+//! | Component | `Distribution`, delta `Histogram`, delta `ExponentialHistogram`, delta `Summary` | cumulative `Histogram`/`ExponentialHistogram`/`Summary` |
 //! |---|---|---|
 //! | `.count`, `.sum`, `.bucket_<b>`, `.zero_count` (`Part::is_additive`) | `\|c` | `\|g` |
 //! | `.q<q>`, `.min`, `.max` | `\|g` | `\|g` |
@@ -1673,6 +1673,7 @@ fn render_multi_value(
         MetricKind::Distribution(_) => true,
         MetricKind::Histogram(h) => h.temporality == Temporality::Delta,
         MetricKind::ExponentialHistogram(h) => h.temporality == Temporality::Delta,
+        MetricKind::Summary(s) => s.temporality == Temporality::Delta,
         _ => false,
     };
     let expanded = expand_dotted(kind, dotted, |suffix, value, part| {
@@ -2969,7 +2970,12 @@ mod tests {
     }
 
     fn summary(quantiles: Vec<(f64, f64)>, count: u64, sum: f64) -> MetricKind {
-        MetricKind::Summary(logit_core::Summary { quantiles, count, sum })
+        MetricKind::Summary(logit_core::Summary {
+            quantiles,
+            count,
+            sum,
+            temporality: Temporality::Cumulative,
+        })
     }
 
     fn sum_kind(value: f64, temporality: Temporality, monotonic: bool) -> MetricKind {
@@ -3073,6 +3079,16 @@ mod tests {
                 "q.q0_99:9|g",
             ]
         );
+    }
+
+    /// A delta summary's count and sum are per-window, so they add up at a statsd server: `|c`.
+    #[test]
+    fn a_delta_summary_writes_its_count_and_sum_as_counters() {
+        let MetricKind::Summary(mut s) = summary(vec![(0.5, 1.0)], 4, 12.0) else { unreachable!() };
+        s.temporality = Temporality::Delta;
+        let (msgs, stats) = encode(vec![metric_event("q", MetricKind::Summary(s), &[])]);
+        assert_eq!(msgs, vec!["q.count:4|c", "q.sum:12|c", "q.q0_5:1|g"]);
+        assert_eq!(stats.degraded_kinds.summary, 1);
     }
 
     #[test]

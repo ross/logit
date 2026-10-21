@@ -462,6 +462,7 @@ fn render_metric_kind(out: &mut String, col: usize, kind: &MetricKind) {
             optional_sum_min_max(out, col, e.sum, e.min, e.max);
         }
         MetricKind::Summary(s) => {
+            str_field(out, col, "temporality", s.temporality.as_str());
             display_field(out, col, "count", s.count);
             display_field(out, col, "sum", s.sum);
             pairs_field(out, col, "quantiles", s.quantiles.iter().map(|(q, v)| (q, v)));
@@ -1512,6 +1513,7 @@ mod tests {
             quantiles: vec![(0.99, 12.5), (0.5, 1.5)],
             count: 3,
             sum: 40.0,
+            temporality: Temporality::Cumulative,
         });
         assert_eq!(
             render(vec![metric_event("req.latency", kind)]),

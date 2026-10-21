@@ -142,11 +142,14 @@ pub(super) enum MetricOut {
     /// An exponential histogram outside the Agent sketch's key range.
     SketchRange,
     InvalidStatus,
+    /// A cumulative kind Datadog's exporter would difference, with no `cumulative_to_delta`
+    /// upstream.
+    UnresolvedCumulative,
 }
 
 impl MetricOut {
     #[cfg(test)]
-    const ALL: [MetricOut; 9] = [
+    const ALL: [MetricOut; 10] = [
         MetricOut::Kind("summary"),
         MetricOut::GaugeDelta,
         MetricOut::NoRecordedValue,
@@ -156,6 +159,7 @@ impl MetricOut {
         MetricOut::NonMonotonicBounds,
         MetricOut::SketchRange,
         MetricOut::InvalidStatus,
+        MetricOut::UnresolvedCumulative,
     ];
 
     /// The counter and its one tag.
@@ -172,6 +176,9 @@ impl MetricOut {
             }
             MetricOut::SketchRange => (OUTPUT_METRICS_DROPPED, ("reason", "sketch_range")),
             MetricOut::InvalidStatus => (OUTPUT_METRICS_DROPPED, ("reason", "invalid_status")),
+            MetricOut::UnresolvedCumulative => {
+                (OUTPUT_METRICS_DROPPED, ("reason", "unresolved_cumulative"))
+            }
         }
     }
 }
@@ -211,6 +218,7 @@ mod tests {
             (OUTPUT_METRICS_DROPPED, ("reason", "non_monotonic_bounds")),
             (OUTPUT_METRICS_DROPPED, ("reason", "sketch_range")),
             (OUTPUT_METRICS_DROPPED, ("reason", "invalid_status")),
+            (OUTPUT_METRICS_DROPPED, ("reason", "unresolved_cumulative")),
         ];
         for (outcome, want) in MetricOut::ALL.into_iter().zip(want_out) {
             assert_eq!(outcome.counter(), want, "{outcome:?}");

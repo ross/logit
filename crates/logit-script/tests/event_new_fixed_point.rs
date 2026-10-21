@@ -276,7 +276,12 @@ fn metric_kind() -> impl Strategy<Value = MetricKind> {
         histogram().prop_map(MetricKind::Histogram),
         exp_histogram().prop_map(MetricKind::ExponentialHistogram),
         (prop::collection::vec((0.0f64..=1.0, finite()), 0..4), count(), finite()).prop_map(
-            |(quantiles, count, sum)| MetricKind::Summary(Summary { quantiles, count, sum })
+            |(quantiles, count, sum)| MetricKind::Summary(Summary {
+                quantiles,
+                count,
+                sum,
+                temporality: Temporality::Cumulative
+            })
         ),
     ]
 }

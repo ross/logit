@@ -61,7 +61,7 @@
 //! | `gauge` | `Gauge(v)` |
 //! | `histogram` (`_bucket{le}` cumulative, `_sum`, `_count`) | `Histogram { buckets: per-bucket counts by successive difference, trailing `(+Inf, n)`, Cumulative, sum, min/max: None }` |
 //! | `gaugehistogram` (OM, `_gsum`/`_gcount`) | the same `Histogram`, plus `_logit.prometheus.type: "gaugehistogram"` |
-//! | `summary` (`{quantile}`, `_sum`, `_count`) | `Summary { quantiles, count, sum }` |
+//! | `summary` (`{quantile}`, `_sum`, `_count`) | `Summary { quantiles, count, sum }`, `Cumulative` |
 //! | `untyped` (text) / `unknown` (OM) / no `# TYPE` | `Gauge(v)` + `_logit.prometheus.type: "untyped"` \| `"unknown"` |
 //! | `info` (OM, `X_info{...} 1`) | `Gauge(1)` + `_logit.prometheus.type: "info"`, `name = X` (`_info` stripped) |
 //! | `stateset` (OM) | one `Gauge(0\|1)` per state line + `_logit.prometheus.type: "stateset"` |
@@ -885,6 +885,7 @@ fn point_to_kind(
                 quantiles: quantiles.clone(),
                 count: count.unwrap_or(0),
                 sum: sum.unwrap_or(0.0),
+                temporality: Temporality::Cumulative,
             }),
             // Handled above, before any of the value-bearing arms can be reached.
             Point::Stale => unreachable!("stale markers return early"),
@@ -916,9 +917,12 @@ fn stale_kind(family: FamilyType) -> MetricKind {
             min: None,
             max: None,
         }),
-        FamilyType::Summary => {
-            MetricKind::Summary(Summary { quantiles: Vec::new(), count: 0, sum: 0.0 })
-        }
+        FamilyType::Summary => MetricKind::Summary(Summary {
+            quantiles: Vec::new(),
+            count: 0,
+            sum: 0.0,
+            temporality: Temporality::Cumulative,
+        }),
         FamilyType::Gauge
         | FamilyType::Info
         | FamilyType::StateSet
@@ -1173,14 +1177,21 @@ fn record_to_point(
             }
             return None;
         }
-        MetricKind::Summary(s) => (
-            FamilyType::Summary,
-            Point::Summary {
-                quantiles: s.quantiles.clone(),
-                sum: Some(s.sum),
-                count: Some(s.count),
-            },
-        ),
+        MetricKind::Summary(s) => {
+            if s.temporality == Temporality::Delta {
+                encoder.not_encoded(NotEncoded::UnresolvedDelta);
+                warn_delta_summary(encoder, resolve(record.name));
+                return None;
+            }
+            (
+                FamilyType::Summary,
+                Point::Summary {
+                    quantiles: s.quantiles.clone(),
+                    sum: Some(s.sum),
+                    count: Some(s.count),
+                },
+            )
+        }
         MetricKind::Distribution(sketch) => {
             encoder.degraded("distribution");
             (FamilyType::Summary, sketch_summary(sketch))
@@ -1253,6 +1264,18 @@ fn warn_delta(encoder: &mut PrometheusEncoder, name: &str) {
         format_args!(
             "metric '{name}' has delta temporality, which Prometheus exposition cannot express -- \
              add an `aggregate` component with `temporality: cumulative` before this output"
+        ),
+    );
+}
+
+/// [`warn_delta`]'s key for a delta `Summary`, whose fix differs: `aggregate` doesn't make a
+/// summary cumulative, and only `cumulative_to_delta` makes one delta.
+fn warn_delta_summary(encoder: &mut PrometheusEncoder, name: &str) {
+    encoder.diagnostics.warn_throttled(
+        "delta_temporality_unresolved",
+        format_args!(
+            "metric '{name}' is a delta summary, which Prometheus cannot express -- route the \
+             summary to this output from ahead of the `cumulative_to_delta` component"
         ),
     );
 }
@@ -1629,6 +1652,7 @@ mod tests {
                 quantiles: vec![(0.5, 4773.0), (0.99, 76656.0)],
                 count: 2693,
                 sum: 1.7560473e7,
+                temporality: Temporality::Cumulative,
             })
         );
     }
@@ -1642,7 +1666,12 @@ mod tests {
         let families = vec![family("s", FamilyType::Summary, vec![Series::new(vec![], point)])];
         assert_eq!(
             decode_kind(&families),
-            MetricKind::Summary(Summary { quantiles: vec![(0.5, 1.0)], count: 0, sum: 0.0 })
+            MetricKind::Summary(Summary {
+                quantiles: vec![(0.5, 1.0)],
+                count: 0,
+                sum: 0.0,
+                temporality: Temporality::Cumulative
+            })
         );
     }
 
@@ -1833,6 +1862,27 @@ mod tests {
         assert!(counted(&registry, "logit.output.metrics.dropped", ("reason", "unresolved_delta")));
     }
 
+    /// A Prometheus summary is a running total, so a delta one, which only `cumulative_to_delta`
+    /// makes, is dropped and counted.
+    #[test]
+    fn a_delta_summary_is_dropped_and_counted() {
+        let kind = MetricKind::Summary(Summary {
+            quantiles: vec![(0.5, 1.0)],
+            count: 2,
+            sum: 3.0,
+            temporality: Temporality::Delta,
+        });
+        let (families, registry, diag) =
+            encode_counted(&Resource::default(), &event_with(&[], record("m", kind)));
+        assert!(families.is_empty());
+        assert!(counted(&registry, "logit.output.metrics.dropped", ("reason", "unresolved_delta")));
+        assert!(counted(
+            &diag,
+            "logit.component.diagnostics",
+            ("key", "delta_temporality_unresolved")
+        ));
+    }
+
     #[test]
     fn a_gauges_family_type_follows_its_prometheus_type_attribute() {
         for (marker, expected_kind, expected_point) in [
@@ -1947,8 +1997,12 @@ mod tests {
 
     #[test]
     fn a_summary_encodes_with_its_sum_and_count() {
-        let kind =
-            MetricKind::Summary(Summary { quantiles: vec![(0.5, 1.0)], count: 7, sum: 42.0 });
+        let kind = MetricKind::Summary(Summary {
+            quantiles: vec![(0.5, 1.0)],
+            count: 7,
+            sum: 42.0,
+            temporality: Temporality::Cumulative,
+        });
         assert_eq!(
             encode_kind(kind)[0].series[0].point,
             Point::Summary { quantiles: vec![(0.5, 1.0)], sum: Some(42.0), count: Some(7) }
@@ -2401,8 +2455,12 @@ mod tests {
         assert!(families[0].series[0].labels.is_empty(), "`le` belongs to the bucket lines");
         assert!(counted(&registry, "logit.output.labels.omitted", ("reason", "reserved")));
 
-        let summary =
-            MetricKind::Summary(Summary { quantiles: vec![(0.5, 1.0)], count: 1, sum: 1.0 });
+        let summary = MetricKind::Summary(Summary {
+            quantiles: vec![(0.5, 1.0)],
+            count: 1,
+            sum: 1.0,
+            temporality: Temporality::Cumulative,
+        });
         let event = event_with(&[("quantile", Value::from("0.5"))], record("m", summary));
         let (families, registry, _) = encode_counted(&Resource::default(), &event);
         assert!(families[0].series[0].labels.is_empty());
@@ -2739,7 +2797,12 @@ mod tests {
                 min: None,
                 max: None,
             }),
-            MetricKind::Summary(Summary { quantiles: vec![], count: 1, sum: 1.0 }),
+            MetricKind::Summary(Summary {
+                quantiles: vec![],
+                count: 1,
+                sum: 1.0,
+                temporality: Temporality::Cumulative,
+            }),
             MetricKind::Set(HyperLogLog::new()),
         ];
         for kind in kinds {

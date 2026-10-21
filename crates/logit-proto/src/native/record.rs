@@ -434,6 +434,7 @@ fn write_metric_kind(out: &mut BytesMut, kind: &MetricKind) {
             }
             write_uvarint(&mut tmp, s.count);
             tmp.extend_from_slice(&s.sum.to_le_bytes());
+            tmp.extend_from_slice(&[temporality_tag(s.temporality)]);
             out.extend_from_slice(&[METRIC_SUMMARY]);
             write_uvarint(out, tmp.len() as u64);
             out.extend_from_slice(&tmp);
@@ -558,7 +559,8 @@ fn read_metric_kind(bytes: &mut Bytes, budget: &DecodeBudget) -> Result<MetricKi
             }
             let record_count = read_uvarint(&mut body)?;
             let sum = read_f64(&mut body)?;
-            MetricKind::Summary(Summary { quantiles, count: record_count, sum })
+            let temporality = temporality_from_tag(read_u8(&mut body)?)?;
+            MetricKind::Summary(Summary { quantiles, count: record_count, sum, temporality })
         }
         other => {
             return Err(CodecError::Malformed(format!(
@@ -1375,6 +1377,7 @@ mod tests {
                 quantiles: vec![(0.5, 10.0), (0.99, 42.0)],
                 count: 100,
                 sum: 543.2,
+                temporality: Temporality::Cumulative,
             }),
         ];
         for kind in kinds {

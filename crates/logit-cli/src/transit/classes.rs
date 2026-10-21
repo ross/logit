@@ -1106,7 +1106,7 @@ fn kind_features(rec: &Rec) -> Vec<Option<String>> {
             features
         }
         "gauge_delta" => vec![Some(scalar("delta"))],
-        "histogram" | "exponential_histogram" => vec![Some(temporality())],
+        "histogram" | "exponential_histogram" | "summary" => vec![Some(temporality())],
         "log" | "span" if rec.beside_metrics => vec![Some("beside_metrics".to_string())],
         "span" if datadog::otel_only(rec) => {
             vec![Some("alone".to_string()), Some("no_wire_form".to_string())]

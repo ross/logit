@@ -84,6 +84,7 @@ fn kind(case: &Value) -> MetricKind {
                 .collect(),
             count: input["count"].as_u64().unwrap(),
             sum: num(&input["sum"]),
+            temporality: Temporality::Cumulative,
         }),
         other => panic!("unknown kind {other}"),
     }

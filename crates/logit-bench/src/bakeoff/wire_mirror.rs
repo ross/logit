@@ -597,6 +597,7 @@ fn wire_to_metric_kind(kind: &WireMetricKind) -> MetricKind {
             quantiles: s.quantiles.clone(),
             count: s.count,
             sum: s.sum,
+            temporality: Temporality::Cumulative,
         }),
     }
 }
@@ -1027,6 +1028,7 @@ mod tests {
                 quantiles: vec![(0.5, 1.0), (0.99, 9.0)],
                 count: 10,
                 sum: 20.0,
+                temporality: Temporality::Cumulative,
             }),
         );
 

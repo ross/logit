@@ -753,7 +753,12 @@ mod tests {
             ),
             (
                 "summ",
-                MetricKind::Summary(Summary { quantiles: vec![(0.99, 9.0)], count: 4, sum: 10.0 }),
+                MetricKind::Summary(Summary {
+                    quantiles: vec![(0.99, 9.0)],
+                    count: 4,
+                    sum: 10.0,
+                    temporality: Temporality::Cumulative,
+                }),
             ),
             (
                 "exp",
