@@ -120,9 +120,9 @@ record carries depends on the kind:
 | `ExponentialHistogram`, delta | merged when scale and zero threshold are equal, aligned by absolute bucket index; otherwise passed through |
 | `Summary`, delta (only `cumulative_to_delta` makes one) | passed through: quantiles don't add |
 | a record flagged `NO_RECORDED_VALUE` | takes part in last write wins as a reading; beside a delta kind's value, passed through |
-| `Samples` | values concatenated, earlier first, when the `sample_rate`s are equal; otherwise last write wins |
+| `Samples` | values concatenated, earlier first, when the `sample_rate`s are equal; otherwise passed through |
 | `SetMembers` | union: the members of both, each once |
-| `Distribution` | `DdSketch::merge` when the two sketches' mappings are equal; otherwise last write wins |
+| `Distribution` | `DdSketch::merge`, which re-bins the incoming sketch when the two sketches' mappings differ |
 | `Set` | `HyperLogLog::merge`, a union |
 
 Last write wins needs no arithmetic, so it's safe for every kind, `NaN` included. A delta is an
@@ -137,13 +137,15 @@ The four observation kinds merge where `aggregate` merges them, with one differe
 - **`Samples`** concatenate as `aggregate`'s `distributions: samples` does, and only under one
   rate, because a `Samples` record carries one `sample_rate` for all its values. `aggregate`
   falls back to a sketch on a rate mismatch; `dedup_timestamps` doesn't change a record's kind, so
-  it keeps the later record.
+  it passes both records through unmerged, counted `passed_through{reason="layout_mismatch"}`.
+  That matches a delta kind whose layouts differ: the duplicate reaches the sink, which drops it
+  and counts the loss.
 - **`SetMembers`** union as `aggregate`'s `sets: members` does, with no cap: both records are in
   the batch already.
-- **`Distribution`** merges bin for bin only under one mapping. `DdSketch::merge` also accepts two
-  mappings, re-binning the incoming sketch at each bin's representative value, within a bounded
-  error. `aggregate` takes that, and `dedup_timestamps` doesn't: a relay keeps a sketch's bins as
-  the source wrote them, and Datadog reads an Agent sketch with no mapping on the wire.
+- **`Distribution`** merges bin for bin under one mapping. Under two, `DdSketch::merge` re-bins
+  the incoming sketch at each bin's representative value, within a bounded error, as it does for
+  `aggregate`. Two mappings for one series at one timestamp are rare in a relay. Re-binning loses
+  some precision, where last write wins would lose every observation in the earlier sketch.
 - **`Set`** always merges: `HyperLogLog::merge` has no precondition.
 
 On a merged record:
@@ -223,8 +225,8 @@ does is loss: the operator asked for each outcome, so it emits no `*.dropped`.
 
 | Name | Meaning |
 |---|---|
-| `logit.transform.metrics.merged` | a reading summed or otherwise combined into the surviving reading: a delta `Sum`, a `GaugeDelta`, a delta histogram with a matching layout, and the observation kinds' merges |
-| `logit.transform.metrics.absorbed` | a reading superseded by a later one under last write wins: a `Gauge`, a cumulative kind, and an observation kind whose rate or mapping differs |
+| `logit.transform.metrics.merged` | a reading summed or otherwise combined into the surviving reading: a delta `Sum`, a `GaugeDelta`, a delta histogram with a matching layout, and the observation kinds' merges, a re-binned `Distribution` included |
+| `logit.transform.metrics.absorbed` | a reading superseded by a later one under last write wins: a `Gauge` or a cumulative kind |
 | `logit.transform.metrics.passed_through{reason="non_finite" \| "overflow" \| "layout_mismatch" \| "no_merge_rule" \| "no_recorded_value"}` | a record that shares its series and bucket with another but has no safe merge, forwarded untouched: the sink still sees the duplicate |
 | `logit.component.events.discarded` | an event left with no metric, log, or span |
 
