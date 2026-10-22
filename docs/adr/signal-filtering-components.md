@@ -1,6 +1,6 @@
 ---
 created: 2026-09-03
-updated: 2026-10-18
+updated: 2026-10-21
 ---
 
 # Signal filtering is two transform components, not a sink field
@@ -146,3 +146,28 @@ one `route_signals` instead. It counts what it strips and discards with the coun
 use: `logit.transform.payloads.stripped{signal}` and `logit.component.events.discarded`. The three
 filters are unchanged and remain the answer for one signal-specific sink, or a filter on one
 branch.
+
+## Amendment: the `none` selector (2026-10-21)
+
+"All three drop an event that ends up carrying nothing" rested on "such an event carries nothing
+any sink could act on." The InfluxDB relay made that false for an event that *arrives* empty: a
+point whose fields are all strings is one, and `influxdb_out` writes it
+([ADR `influxdb-line-protocol-relay`](influxdb-line-protocol-relay.md)). `logit_config::Signal`
+gains a fourth value, `none`, which selects an event that arrived with no log, no metrics, and no
+span. It's opt-in: a list without it behaves as before. The same type is `route_signals`'
+vocabulary ([ADR `route-signals`](route-signals.md)'s 2026-10-21 amendment), so each kind that
+reads it decides what `none` means:
+
+- **`has_signal`** forwards a payload-less event when `none` is listed, under either mode.
+  `mode: only` stays "carries nothing outside the list": `[metrics, none]` forwards an event
+  carrying only metrics, or nothing. `[none]` forwards only payload-less events.
+- **`keep_signals`** forwards an event that arrived with no payload when `none` is listed, and
+  drops it otherwise, as before. An event its own strip emptied is still dropped: it carried a
+  payload the list chose to clear.
+- **`drop_signals`** rejects `none` at validation (rule 21). It has no payload to clear, and
+  `drop_signals` already drops an event that carries nothing, so listing it could only be a
+  mistake.
+
+Rule 21's "naming all three" checks still read `logs`, `metrics`, and `traces`. A `keep_signals`
+naming those three keeps every payload; its message now points at `has_signal` for dropping an
+event that carries none. No component reads a protocol's `_logit.*` carriers to decide this.

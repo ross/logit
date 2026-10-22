@@ -1,6 +1,6 @@
 ---
 created: 2026-10-13
-updated: 2026-10-20
+updated: 2026-10-21
 ---
 
 # InfluxDB line-protocol relay: fields as typed `Gauge` records under a measurement carrier, strings as attributes, and an all-or-nothing write
@@ -155,7 +155,9 @@ writes each batch to the org and bucket it carries.]
 Other sinks see the decoded shape. A record named `cpu.usage_user` reaches `prometheus_out` as
 `cpu_usage_user` after sanitizing, the name Telegraf's own Prometheus output uses. The measurement
 and the org and bucket never reach another sink's wire, because they're private, and neither do
-string fields. A string-only point has no metrics, so metric sinks skip it.
+string fields. A string-only point has no metrics, so metric sinks skip it. [It carries no
+signal either, so a signal router discards it unless told otherwise; see "Amendment: a string-only
+point carries no signal (2026-10-21)".]
 
 ### Strings are attributes, not metrics
 
@@ -698,3 +700,19 @@ matching skip of a public `influxdb.field.` attribute is gone for the same reaso
 
 Keeping the guard would have omitted and counted a tag that no longer collides with anything,
 which loses a sender's data for no reason.
+
+## Amendment: a string-only point carries no signal (2026-10-21)
+
+A point whose fields are all strings decodes, through `influxdb_in` or the `line_protocol`
+transform, to an event with no log, no metrics, and no span. `influxdb_out` writes it, but a
+component that selects by signal discarded it: `route_signals` and `has_signal` saw nothing to
+route or forward. A relay of the form `logit_in -> route_signals -> target -> influxdb_out` lost
+every such point.
+
+Signal selectors gain an opt-in `none`
+([ADR `route-signals`](route-signals.md)'s and
+[ADR `signal-filtering-components`](signal-filtering-components.md)'s 2026-10-21 amendments). A
+`route_signals` ahead of `influxdb_out` sets `signals.none` to the target that feeds
+`influxdb_out`, usually the metrics target. No generic component reads the `_logit.influxdb.*`
+carriers to decide this. The codec's module doc (`crates/logit-proto/src/influxdb/mod.rs`) holds
+the canonical statement.

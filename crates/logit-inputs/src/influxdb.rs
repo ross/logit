@@ -7,6 +7,10 @@
 //! and the permitted normalizations. This module owns HTTP: routing, authentication, compression,
 //! size caps, the query parameters, and backpressure.
 //!
+//! A point whose fields are all strings decodes to an event carrying no signal, so a
+//! `route_signals` downstream discards it unless `signals.none` names the target that feeds
+//! `influxdb_out`; the codec's module doc has the rule for every signal selector.
+//!
 //! The accept loop, connection cap, handshake timeout, idle timeout, shutdown close, and
 //! sender-address handling are `splunk_hec_in`'s ([`crate::splunk`]), which takes them from
 //! `otlp_in`; `crate::otlp`'s module doc has the reasoning for each. The request helpers are shared

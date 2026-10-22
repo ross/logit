@@ -63,9 +63,10 @@
 //!     (`docs/adr/log-record-trace-context.md`).
 //! 20. A `scale` with no `fields`, an empty field name, or a non-finite factor
 //!     (`docs/adr/scale-transform.md`).
-//! 21. An empty `signals:` on `has_signal`/`keep_signals`/`drop_signals`, or all three signals on
-//!     `keep_signals`/`drop_signals`. Which shape is the black hole and which the no-op is
-//!     opposite between those two, so each message names the right one
+//! 21. An empty `signals:` on `has_signal`/`keep_signals`/`drop_signals`, all three payload
+//!     signals on `keep_signals`/`drop_signals`, or `none` on `drop_signals`. Which shape is the
+//!     black hole and which the no-op is opposite between those two, so each message names the
+//!     right one; `drop_signals` has no payload to clear on an event carrying none
 //!     (`docs/adr/signal-filtering-components.md`).
 //! 22. An `otlp_out` `headers:` name that is empty, `:`-prefixed, `grpc-*`, in
 //!     `RESERVED_OTLP_HEADERS`, or a case-insensitive duplicate: the transport sets those itself,
@@ -321,7 +322,9 @@
 //!     and has no ordinary edge, so 7 doesn't ask it for a consumer. Also a `route_signals` with no
 //!     `signals:` entry set (it would discard every event) or an empty target id, checked before
 //!     48 as 51 is; and, after 48, under `strip: false`, a component whose `sources:` lists two of
-//!     its targets: a mixed event reaches both whole, so that component would receive it twice.
+//!     its targets: a mixed event reaches both whole, so that component would receive it twice. A
+//!     target only `signals.none` names is outside that check, since an event reaching it reaches
+//!     no other target.
 //!     Under `strip: true` each target receives disjoint payloads, so reading several is legal
 //!     (`docs/adr/route-signals.md`).
 //! 93. A `replay_in` with an empty `path`, which names no file, or a `batch` of `0`, which could
