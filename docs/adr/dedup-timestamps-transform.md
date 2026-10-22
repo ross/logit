@@ -6,7 +6,7 @@ updated: 2026-10-21
 # `dedup_timestamps`: collapse readings of one series that share a timestamp, within a batch, before a sink that can't hold both
 
 ## Status
-Proposed.
+Accepted.
 
 ## Context
 A remote-write series can't hold two samples at one millisecond. Prometheus and Mimir answer a
@@ -64,8 +64,9 @@ timestamp-faithful relay ([Alternatives considered](#alternatives-considered)).
 and a timestamp bucket of a configured `precision:` into one record, the latest reading that can merge,
 with delta kinds and observation kinds merged into it where a merge is sound, and every record
 that can't merge passed through untouched.** An operator places it in front of a sink whose destination can't
-hold two readings of one series at one instant. Separately, `prometheus_out`'s collapse becomes
-counted loss.
+hold two readings of one series at one instant. Separately, `prometheus_out`'s and `datadog_out`'s
+own collapses become counted: a removed reading is loss unless it equals the reading the sink
+sends ([The sink-side counter](#the-sink-side-counter)).
 
 ### Configuration
 
@@ -145,9 +146,9 @@ same kinds, and where no merge is safe the record passes through untouched rathe
 dropped.
 
 A passed-through record reaches the sink as a duplicate of the survivor, and a sink that can't
-hold both drops it and counts it as loss: in remote-write mode,
-`logit.output.metrics.dropped{reason="duplicate_timestamp"}` after
-[the sink-side counter](#the-sink-side-counter) change. That's intended. A record passed through
+hold both drops it and counts it as loss,
+`logit.output.metrics.dropped{reason="duplicate_timestamp"}`, unless the sink would write it
+as the same reading it sends ([The sink-side counter](#the-sink-side-counter)). That's intended. A record passed through
 for any reason but `no_recorded_value` or `no_merge_rule` is broken input, such as a `NaN`
 increment, two layouts for one series, or a total past the integer range, so its loss is reported
 as loss, not as an outcome the config asked for. `no_merge_rule` is the other exception:
@@ -155,8 +156,8 @@ as loss, not as an outcome the config asked for. `no_merge_rule` is the other ex
 - A passed-through `GaugeDelta` never reaches a sink as a duplicate. Every sink drops it, counted
   `dropped{reason="unresolved_gauge_delta"}`, and `aggregate` is what resolves it.
 - A delta `Summary` pair, such as `cumulative_to_delta` makes, is legitimate input. `datadog_out`
-  sends both points and Datadog keeps the higher. That loss is counted only once `datadog_out`
-  gets the `duplicate_timestamp` counter ([The sink-side counter](#the-sink-side-counter)).
+  sends one point of each `.quantile` series and counts the other under `duplicate_timestamp`
+  ([The sink-side counter](#the-sink-side-counter)).
 - A delta `Sum` of `Bool`s is rare: InfluxDB's boolean fields decode as gauges, so a Lua script
   is the likely source. It passes through because no merge keeps its type, the rule below.
 
@@ -335,18 +336,47 @@ from a record that's still delivered. `*.skipped` doesn't either: something was 
 
 ### The sink-side counter
 
-`prometheus_out` in remote-write mode counts every reading it collapses as
-`logit.output.metrics.dropped{reason="duplicate_timestamp"}`, in both places the Context table
-names, the same-instant case included. That replaces
-`logit.output.metrics.degraded{reason="sub_ms_collapsed"}`. The collapse stays: without it the
-receiver drops one of the pair anyway, silently, and keeps the earlier one. With it, the later
-reading survives and the loss is counted. The counter change lands in its own PR, not with this
-record, and updates the transit spec's `same_instant` and `same_millisecond` rows for
-`prometheus_out` with it. Exposition mode's registry overwrite stays uncounted.
+Each sink keeps collapsing on its own, since without it the destination drops one reading of the
+pair anyway, silently: Prometheus and Mimir keep the first of two in one request, and Datadog
+keeps the higher. The sink keeps the later reading, the later in batch order on a tie, and counts
+every reading it removes:
 
-`datadog_out` gets the same counter in a later PR: a series point that shares its series and
-second with another in one request counts `logit.output.metrics.dropped{reason="duplicate_timestamp"}`,
-since Datadog keeps only the higher. Distribution points don't count, because Datadog keeps both.
+- **`prometheus_out` in remote-write mode** collapses readings of one series at one millisecond,
+  in both places the Context table names, the same-instant case included. That replaces
+  `logit.output.metrics.degraded{reason="sub_ms_collapsed"}`. Exposition mode's registry
+  overwrite stays uncounted.
+- **`datadog_out`** collapses the series points of one series in one second, planned over the
+  whole batch so no request cut splits a pair. Distribution points aren't collapsed, because
+  Datadog keeps both.
+
+What a removed reading counts depends on whether it equals the reading the sink sends:
+
+| Removed reading | Counted |
+|---|---|
+| equal to the reading sent | `logit.output.metrics.normalized{reason="duplicate_timestamp"}` |
+| any other | `logit.output.metrics.dropped{reason="duplicate_timestamp"}`, with a throttled `duplicate_timestamp` diagnostic naming `dedup_timestamps` |
+
+An equal reading loses nothing: the destination stores the same sample whichever of the two
+arrives, so the rule each destination applies inside one request (the first, or the higher) makes
+no difference. A Datadog Agent relay or a retry resends identical points, and that mustn't raise a
+loss alarm.
+
+Equal means the whole reading as the sink writes it, each `f64` compared by its bits, so a `NaN`
+equals only the same `NaN` and `0.0` doesn't equal `-0.0`:
+
+- **Remote-write** compares the family type and the point: the sample, or every bucket, quantile,
+  sum, and count of a histogram or summary. The created timestamp, at the wire's millisecond, and
+  the exemplars must match too, since the removed reading's exemplars go with it.
+- **`datadog_out`** compares each series point on its own, since a histogram's or summary's
+  expansion writes one series per point: the value, the wire type, the unit, the interval, the
+  source type, and the origin.
+
+Neither wire carries a value's model type: both write a double. So an `I64` of `5` and an `F64` of
+`5.0` are equal readings here.
+
+Each removed reading is compared with the reading the sink sends for its series and bucket, not
+with the reading that displaced it. Of three readings `5`, `7`, and `5`, in that order, the last
+is sent, the first counts `normalized`, and the `7` counts `dropped`.
 
 ### Why this isn't the retired kind
 
@@ -449,21 +479,26 @@ keep the higher.
   whose source can stamp two readings of one series inside one bucket, at `precision: 1ms` or
   `1s`. That's almost every such flow from a sub-millisecond source: `statsd_in` gauges,
   `internal`, and any relay with no `aggregate` in it. A flow through `aggregate` doesn't need
-  it. After the counter change, a flow without it shows a nonzero
-  `logit.output.metrics.dropped{reason="duplicate_timestamp"}`, which is the prompt to add it.
+  it. A flow without it shows a nonzero
+  `logit.output.metrics.dropped{reason="duplicate_timestamp"}` once two readings of a series in
+  one bucket differ, which is the prompt to add it.
+- **Two equal delta increments in one bucket count `normalized`, not `dropped`.** The rule
+  compares readings, not what they mean: two `count` points of `1` in one second are two
+  increments, and the sink sends one. Datadog would keep one of the pair too. A `dedup_timestamps`
+  upstream sums them. Remote-write never sends a delta, so the case is `datadog_out`'s alone.
 - `Transform` gains a batch-level hook, defaulting to a no-op.
 - `dedup_timestamps` doesn't stop a cross-batch duplicate with a new value from drawing a remote-write
   `400` that drops a whole batch. W3 records it in `docs/known-gaps/prometheus.md`
   ([Scope](#scope-one-batch-and-no-added-latency)).
-- `datadog_out` counts a same-second series pair it sends in one request as
-  `logit.output.metrics.dropped{reason="duplicate_timestamp"}`, in a later PR
+- `datadog_out` counts each series point it leaves off as a same-second duplicate, `normalized`
+  or `dropped` by the same rule as remote-write
   ([The sink-side counter](#the-sink-side-counter)).
 - The graph gets rule 95 (`precision` of `0s`), `logit-config` gets a `ComponentKind` variant, and
   `script/schema` regenerates `schema/logit.schema.json`.
 - [`docs/design/memory.md`](../design/memory.md) gets a row for the per-batch table, and
   `crates/logit-bench/tests/allocations.rs` a pin, when the transform lands.
 - The transit spec gains flows with `dedup_timestamps` in front of `prometheus_out` and `datadog_out`, and the
-  `same_instant` and `same_millisecond` rows change with the sink counter.
+  `same_instant` and `same_millisecond` rows change with the sink counters.
 - If this record is accepted, these must change, in the PR that builds the component:
   - [ADR `routing-by-condition-is-lua`](routing-by-condition-is-lua.md) gets an amendment beside
     its `sample` one, saying `dedup_timestamps` is back for series-level collapse and
@@ -483,5 +518,5 @@ keep the higher.
 ## Open questions
 1. **Datadog's rule for negative and equal values.** The run sent only distinct positive pairs.
    Does Datadog keep the higher of two negative points too? It changes nothing in this record,
-   because `dedup_timestamps` decides before Datadog does, but `datadog_out`'s counter docs will
-   state the rule.
+   because `dedup_timestamps` decides before Datadog does, and an equal pair is moot under any
+   rule.
