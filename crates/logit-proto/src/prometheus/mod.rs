@@ -165,7 +165,7 @@
 //! | `attributes/bytes_value` | lost | `logit.output.labels.omitted{reason=unrepresentable}` | A bytes value has no label form and is left off, counted. |
 //! | `attributes/timestamp_value` | lost | `logit.output.labels.omitted{reason=unrepresentable}` | A timestamp value has no label form and is left off, counted. |
 //! | `attributes/private_carrier` | normalized | `dialect` | The family type and timestamp carriers are consumed into the wire form and a scrape stamps them back; OpenMetrics has no `untyped`, so that type reads back as `unknown`. Remote-write gives every sample a timestamp, so prometheus_in stamps no timestamp carrier; the sample's own timestamp reads back unchanged. |
-//! | `attributes/prometheus_target` | normalized | `retargeted` | The resource's `_logit.prometheus.target` isn't written. A scrape of prometheus_out stamps prometheus_out's own URL, and a remote-write receiver stamps none; the original target's identity survives as the `instance` label. |
+//! | `attributes/prometheus_target` | normalized | `retargeted` | The resource's `_logit.prometheus.target` isn't written. A scrape of prometheus_out stamps prometheus_out's own URL, and a remote-write receiver stamps none. Only the original target's host:port survives, as the `instance` label; its scheme and path are lost. |
 //! | `attributes/foreign_carrier` | lost | uncounted | Another protocol's `_logit.` carrier isn't a label and is left off, uncounted. |
 //! | `attributes/resource_attribute` | normalized | `resource_merged` | A label, the event's value winning on a shared key, read back as an event attribute. |
 //! | `attributes/scope` | lost | uncounted | Prometheus has no instrumentation scope; it isn't written or counted. |
@@ -224,6 +224,12 @@
 //! - family and series reordering: families sorted by the name on their `# TYPE` line, series by
 //!   label set, labels by rendered name;
 //! - the scraper's own `instance` label, added the way Prometheus's own scrape adds it (above);
+//! - the scrape target re-stamped: `_logit.prometheus.target` isn't written, so a scrape of the
+//!   relay stamps the relay's URL and a remote-write receiver stamps none, and only the original
+//!   target's host:port survives, as `instance`;
+//! - the remote-write receiver's missing `_logit.prometheus.timestamp` marker: every sample keeps
+//!   its timestamp, but the receiver stamps no marker
+//!   ([`PrometheusDecoder::with_timestamp_marker`]);
 //! - float formatting: shortest round-trip (`1.0` → `1`, `1.458255915e9` → `1458255915`);
 //! - a counter's value sample gains `_total` when the model name lacks it (both dialects), and the
 //!   OpenMetrics family name loses it -- see [`text`]'s own table;

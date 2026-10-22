@@ -89,6 +89,11 @@ Entry format and the other areas: [the known-gaps index](README.md).
     disagrees with its buckets leaves with the buckets' total. Nothing counts either.
   - **Revisit trigger:** a producer that sends bucketless histograms, which needs a `count` field
     on `Histogram` (and its size checked against `docs/design/memory.md`).
+- **`otlp_out` writes OpenMetrics' `gaugehistogram`, `info`, and `stateset` as ordinary kinds,
+  uncounted.** `prometheus_in` decodes a `gaugehistogram` as a cumulative `Histogram` and `info`
+  and `stateset` as gauges, each with a `_logit.prometheus.type` carrier, and `otlp_out` writes
+  the kind and drops the carrier. The OTel Prometheus compatibility spec says a GaugeHistogram
+  MUST be dropped and `info` and `stateset` MUST become non-monotonic Sums. A fix is planned.
 - **`otlp_in` drops `keyStrindex`, `stringValueStrindex`, `entityRefs`, and `metadata`.** These
   fields belong to the profiles signal and to experimental parts of the data model. The JSON
   decoder skips them and the protobuf decoder never maps them

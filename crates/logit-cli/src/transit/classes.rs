@@ -84,8 +84,9 @@
 //! dropped: the class is the one whose counter moved, or the cell's when it says the loss is
 //! `uncounted`. A read-back record no input claims fails the check with both sides printed.
 //!
-//! The check compares no timestamp but one: a `same_instant` record paired `exact` whose read-back
-//! instant differs from its twin's reads `normalized`, since the sink moved them apart.
+//! The check compares a timestamp in two places: a `same_instant` record paired `exact` whose
+//! read-back instant differs from its twin's reads `normalized`, since the sink moved them apart,
+//! and `prometheus_out`'s timestamp marker (under "Field level").
 //!
 //! **Record level.** The expected class is the worst (`exact < normalized < degraded < skipped
 //! < dropped`) over the record-level cells it reaches, and the observed class must equal it; a
@@ -96,7 +97,11 @@
 //! input's field with its first pairing's: the same value in the same place is `exact`, present
 //! but changed, moved (a resource attribute read back as an event attribute), or under the
 //! sink's spelling of its key is `normalized`,
-//! and absent is `lost`. The observed class may be better than the cell's but never worse. A
+//! and absent is `lost`. `prometheus_out` has two exceptions, each of which compares a value:
+//! `_logit.prometheus.target` absent reads `normalized` when the read-back's `instance` equals the
+//! input's, and `_logit.prometheus.timestamp` absent reads `normalized` when the record's
+//! timestamp reads back unchanged, as a remote-write receiver stamps no marker. Either is `lost`
+//! otherwise. The observed class may be better than the cell's but never worse. A
 //! degraded, skipped, or dropped record's field rows aren't looked up, so they're neither reached
 //! nor unspecified there: the carriers that describe its wire form describe a shape that's gone.
 //!

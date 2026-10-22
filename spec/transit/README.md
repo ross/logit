@@ -17,8 +17,9 @@ aren't written yet), `datadog_in`'s metrics routes, with one case each for its l
 service checks (no APM cases yet), `collectd_in`, and `otlp_in`'s metrics (no log or trace cases
 yet). The sink columns are `statsd_out`, `prometheus_out` (exposition and remote-write),
 `influxdb_out`, `otlp_out`, and `datadog_out`. Each flow's name says which source meets which
-sink: `statsd-relay`, `influxdb-relay`, `datadog-relay`, and `otlp-relay` are like pairs, and
-`influxdb-to-prometheus` a cross-protocol one.
+sink: `statsd-relay`, `influxdb-relay`, `datadog-relay`, `otlp-relay`, `prometheus-to-prometheus`,
+and `prometheus-to-prometheus-remote-write` are like pairs, and `influxdb-to-prometheus` a
+cross-protocol one.
 
 `datadog_out` makes four drops above its encoders: `stale` and `too_many_tags`, which read the
 wall clock or apply an intake limit, and `needs_agent_processing` and `not_datadog_origin`, which

@@ -1734,8 +1734,9 @@ rows:
         reason: retargeted
         text: >-
           The resource's `_logit.prometheus.target` isn't written. A scrape of prometheus_out
-          stamps prometheus_out's own URL, and a remote-write receiver stamps none; the original
-          target's identity survives as the `instance` label.
+          stamps prometheus_out's own URL, and a remote-write receiver stamps none. Only the
+          original target's host:port survives, as the `instance` label; its scheme and path are
+          lost.
       influxdb_out:
         class: lost
         reason: uncounted

@@ -212,7 +212,10 @@ omit today: `families_to_events` inserts `_logit.prometheus.timestamp: true` whe
 `Series.timestamp` is `Some` (`crates/logit-proto/src/prometheus/mod.rs`), and on this transport it
 always is. `PrometheusDecoder::with_timestamp_marker(bool)` defaults to **`true`**, which is exactly
 today's behaviour for the scrape path, and the receiver passes `false`: `Event::timestamp` is still
-set from the sample, only the marker attribute is omitted.
+set from the sample, only the marker attribute is omitted. The missing marker is one of the
+pair's permitted normalizations
+([ADR `prometheus-scrape-and-exposition`](prometheus-scrape-and-exposition.md)'s "Permitted
+normalizations for this pair").
 
 The sender goes the other way and **always emits a timestamp**, via
 `PrometheusEncoder::with_timestamps_always(true)`, because the wire has no way to omit one. Net:
