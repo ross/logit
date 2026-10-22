@@ -1060,7 +1060,7 @@ impl DatadogOutput {
         }
         self.dropped(Route::Traces, "needs_agent_processing", plan.needs_agent_processing);
         self.dropped(Route::Traces, "not_datadog_origin", plan.not_datadog_origin);
-        self.encoder.count_duplicates(plan.duplicates.total());
+        self.encoder.count_duplicates(plan.duplicates.differing(), plan.duplicates.equal());
     }
 
     /// `route`'s request limits: [`Route::caps`], or a test's override.
@@ -3243,6 +3243,28 @@ mod tests {
             1.0
         );
         assert_eq!(sum_of(&sums, RECORDS, &[("route", "series")]), 2.0);
+    }
+
+    /// Two equal points of one series in one second, as a relay or a resend writes them: one is
+    /// sent, and the other counted `normalized` once for the batch, though it took two attempts,
+    /// with no loss and no diagnostic.
+    #[tokio::test]
+    async fn an_equal_series_point_sharing_its_second_is_counted_normalized_once() {
+        let b = batch(vec![
+            metric(NOW, MetricKind::gauge(2.0)),
+            metric(NOW + 500_000_000, MetricKind::gauge(2.0)),
+        ]);
+        let (sums, log) = run_dd(busy_once, vec![b], at_least_once(), instrumented).await;
+        assert_eq!(bodies(&log, SERIES).len(), 2, "one request per attempt");
+        assert_eq!(sent_series(&log), [("m".to_string(), 2.0), ("m".to_string(), 2.0)]);
+        let duplicate = [("reason", "duplicate_timestamp")];
+        assert_eq!(sum_of(&sums, "logit.output.metrics.normalized", &duplicate), 1.0);
+        assert_eq!(sum_of(&sums, "logit.output.metrics.dropped", &duplicate), 0.0);
+        assert_eq!(
+            sum_of(&sums, "logit.component.diagnostics", &[("key", "duplicate_timestamp")]),
+            0.0
+        );
+        assert_eq!(sum_of(&sums, RECORDS, &[("route", "series")]), 1.0);
     }
 
     /// Datadog keeps both of two distribution points in one second, so nothing is dropped there.

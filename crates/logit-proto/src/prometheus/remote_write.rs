@@ -183,7 +183,7 @@ use super::generated::io::prometheus::write::v2 as pb2;
 use super::generated::prometheus as pb1;
 use super::{
     is_stale_nan, text, DecodeDrop, FamilyType, MetricFamily, NotEncoded, PendingCounts,
-    PendingFamily, Point, PrometheusDecoder, PrometheusEncoder, Series, STALE_NAN_BITS,
+    PendingFamily, Point, PrometheusDecoder, PrometheusEncoder, Replaced, Series, STALE_NAN_BITS,
 };
 use crate::CodecError;
 use logit_core::Exemplar;
@@ -1021,11 +1021,11 @@ pub fn encode_counted(
     version: Version,
     encoder: &mut PrometheusEncoder,
 ) -> (Vec<u8>, u64) {
-    let losers = shadowed(groups);
+    let (losers, replaced) = shadowed(groups);
     if losers.is_empty() {
         return encode_flat(groups, version, encoder);
     }
-    count_shadowed(losers.len(), encoder);
+    super::count_duplicates(encoder, replaced.differing, replaced.equal);
     encode_flat(&without(groups, &losers), version, encoder)
 }
 
@@ -1044,7 +1044,7 @@ pub fn encode_pending(
         families.push(f);
         pending.push(p);
     }
-    let losers = shadowed(&families);
+    let (losers, replaced) = shadowed(&families);
     for (g, group) in pending.into_iter().enumerate() {
         for (f, family) in group.into_iter().enumerate() {
             for (s, counts) in family.into_iter().enumerate() {
@@ -1057,7 +1057,7 @@ pub fn encode_pending(
     if losers.is_empty() {
         return encode_flat(&families, version, encoder);
     }
-    count_shadowed(losers.len(), encoder);
+    super::count_duplicates(encoder, replaced.differing, replaced.equal);
     encode_flat(&without(&families, &losers), version, encoder)
 }
 
@@ -1072,17 +1072,20 @@ type ReadingKey<'a> = (&'a str, FamilyType, &'a [(String, String)], i64);
 /// label set holds one sample per millisecond, and inside one request Prometheus and Mimir keep
 /// the first of two and drop the second silently, so the sink keeps the later reading itself,
 /// whole, before any reading is flattened into samples.
-fn shadowed(groups: &[Vec<MetricFamily>]) -> HashSet<At> {
+///
+/// Also returns how many of them equal the reading kept for their key ([`super::same_reading`]),
+/// compared with that reading, not with the one that displaced them.
+fn shadowed(groups: &[Vec<MetricFamily>]) -> (HashSet<At>, Replaced) {
     // One group whose families' label sets strictly increase holds no two readings of a series,
     // which is every group `events_to_families` builds; no table is built for it.
     if let [families] = groups {
         if families.iter().all(|f| f.series.windows(2).all(|w| w[0].labels < w[1].labels)) {
-            return HashSet::new();
+            return Default::default();
         }
     }
     let readings = groups.iter().flatten().map(|f| f.series.len()).sum();
     if readings < 2 {
-        return HashSet::new();
+        return Default::default();
     }
     // Sized once: one allocation per encode, not one per growth.
     let mut latest: HashMap<ReadingKey<'_>, (At, i64)> = HashMap::with_capacity(readings);
@@ -1114,15 +1117,17 @@ fn shadowed(groups: &[Vec<MetricFamily>]) -> HashSet<At> {
             }
         }
     }
-    losers
-}
-
-/// Counts `n` readings [`shadowed`] dropped.
-fn count_shadowed(n: usize, encoder: &mut PrometheusEncoder) {
-    for _ in 0..n {
-        encoder.not_encoded(NotEncoded::DuplicateTimestamp);
+    let mut replaced = Replaced::default();
+    for &(g, f, s) in &losers {
+        let family = &groups[g][f];
+        let series = &family.series[s];
+        let timestamp = series.timestamp.expect("only a timestamped reading is shadowed");
+        let key =
+            (family.name.as_str(), family.kind, series.labels.as_slice(), timestamp / 1_000_000);
+        let ((kg, kf, ks), _) = latest[&key];
+        replaced.add(series, &groups[kg][kf].series[ks]);
     }
-    super::warn_duplicate_timestamp(encoder, n);
+    (losers, replaced)
 }
 
 /// `groups` less the readings at `losers`.
@@ -1232,7 +1237,8 @@ fn encode_flat(
         // [`shadowed`] already left one reading per family, label set, and millisecond, so two
         // samples here share a millisecond only when two families flatten onto one label set.
         // One label set still holds one sample per millisecond, so the later is sent and the
-        // earlier's reading counted lost.
+        // earlier's reading counted lost, whatever the two values: readings of two families are
+        // never one reading.
         out.samples.dedup_by(|later, earlier| {
             if later.timestamp_ms != earlier.timestamp_ms {
                 return false;

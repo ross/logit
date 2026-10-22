@@ -13,6 +13,7 @@ const INPUT_STATS_DROPPED: &str = "logit.input.stats.dropped";
 const INPUT_STATS_SKIPPED: &str = "logit.input.stats.skipped";
 const OUTPUT_METRICS_DROPPED: &str = "logit.output.metrics.dropped";
 const OUTPUT_METRICS_SKIPPED: &str = "logit.output.metrics.skipped";
+const OUTPUT_METRICS_NORMALIZED: &str = "logit.output.metrics.normalized";
 
 /// A series point, sketch, or service check the decoder didn't turn into an event.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -146,11 +147,14 @@ pub(super) enum MetricOut {
     UnresolvedCumulative,
     /// A series point another point of its series replaced in the same second of one request.
     DuplicateTimestamp,
+    /// A series point replaced in the same second by a point equal to it: nothing is lost, since
+    /// Datadog stores the same point.
+    EqualDuplicateTimestamp,
 }
 
 impl MetricOut {
     #[cfg(test)]
-    const ALL: [MetricOut; 11] = [
+    const ALL: [MetricOut; 12] = [
         MetricOut::Kind("set_members"),
         MetricOut::GaugeDelta,
         MetricOut::NoRecordedValue,
@@ -162,6 +166,7 @@ impl MetricOut {
         MetricOut::InvalidStatus,
         MetricOut::UnresolvedCumulative,
         MetricOut::DuplicateTimestamp,
+        MetricOut::EqualDuplicateTimestamp,
     ];
 
     /// The counter and its one tag.
@@ -183,6 +188,9 @@ impl MetricOut {
             }
             MetricOut::DuplicateTimestamp => {
                 (OUTPUT_METRICS_DROPPED, ("reason", "duplicate_timestamp"))
+            }
+            MetricOut::EqualDuplicateTimestamp => {
+                (OUTPUT_METRICS_NORMALIZED, ("reason", "duplicate_timestamp"))
             }
         }
     }
@@ -225,6 +233,7 @@ mod tests {
             (OUTPUT_METRICS_DROPPED, ("reason", "invalid_status")),
             (OUTPUT_METRICS_DROPPED, ("reason", "unresolved_cumulative")),
             (OUTPUT_METRICS_DROPPED, ("reason", "duplicate_timestamp")),
+            (OUTPUT_METRICS_NORMALIZED, ("reason", "duplicate_timestamp")),
         ];
         for (outcome, want) in MetricOut::ALL.into_iter().zip(want_out) {
             assert_eq!(outcome.counter(), want, "{outcome:?}");

@@ -621,11 +621,14 @@ pub(crate) enum NotEncoded {
     NoTimestamp,
     /// A remote-write reading another reading of its series replaced at the same millisecond.
     DuplicateTimestamp,
+    /// A remote-write reading replaced at the same millisecond by a reading equal to it
+    /// ([`same_reading`]): nothing is lost, since the receiver stores the same sample.
+    EqualDuplicateTimestamp,
 }
 
 impl NotEncoded {
     #[cfg(test)]
-    const ALL: [NotEncoded; 11] = [
+    const ALL: [NotEncoded; 12] = [
         NotEncoded::NoRecordedValue,
         NotEncoded::Stale,
         NotEncoded::ExponentialHistogram,
@@ -637,12 +640,14 @@ impl NotEncoded {
         NotEncoded::InvalidLabels,
         NotEncoded::NoTimestamp,
         NotEncoded::DuplicateTimestamp,
+        NotEncoded::EqualDuplicateTimestamp,
     ];
 
     /// The counter name and its one tag.
     fn counter(self) -> (&'static str, (&'static str, &'static str)) {
         const SKIPPED: &str = "logit.output.metrics.skipped";
         const DROPPED: &str = "logit.output.metrics.dropped";
+        const NORMALIZED: &str = "logit.output.metrics.normalized";
         match self {
             NotEncoded::NoRecordedValue => (SKIPPED, ("reason", "no_recorded_value")),
             NotEncoded::Stale => (SKIPPED, ("reason", "stale")),
@@ -655,6 +660,7 @@ impl NotEncoded {
             NotEncoded::InvalidLabels => (DROPPED, ("reason", "invalid_labels")),
             NotEncoded::NoTimestamp => (DROPPED, ("reason", "no_timestamp")),
             NotEncoded::DuplicateTimestamp => (DROPPED, ("reason", "duplicate_timestamp")),
+            NotEncoded::EqualDuplicateTimestamp => (NORMALIZED, ("reason", "duplicate_timestamp")),
         }
     }
 }
@@ -1141,23 +1147,23 @@ pub fn events_to_families_pending<'a>(
 
     // The map is keyed by the emitted name, so draining it in key order is already the canonical
     // family ordering -- no re-sort needed.
-    let mut replaced = 0usize;
+    let mut replaced = Replaced::default();
     let mut out: Vec<PendingFamily> = Vec::with_capacity(families.len());
     for entry in families.into_values() {
         if entry.pending.is_empty() {
             // Nothing held back: the latest-wins pass alone, with no counts to carry.
             let mut family = entry.family;
             family.series.sort_by(|a, b| a.labels.cmp(&b.labels));
+            // Walked from the end, so the first of a run of equal label sets met is the latest,
+            // the one kept, and each earlier one is compared with it.
             let mut deduped: Vec<Series> = Vec::with_capacity(family.series.len());
-            for series in family.series.drain(..) {
-                match deduped.last_mut() {
-                    Some(last) if last.labels == series.labels => {
-                        *last = series;
-                        replaced += 1;
-                    }
+            for series in family.series.drain(..).rev() {
+                match deduped.last() {
+                    Some(kept) if kept.labels == series.labels => replaced.add(&series, kept),
                     _ => deduped.push(series),
                 }
             }
+            deduped.reverse();
             family.series = deduped;
             out.push(PendingFamily { family, pending: Vec::new() });
             continue;
@@ -1168,20 +1174,18 @@ pub fn events_to_families_pending<'a>(
             dense[index] = counts;
         }
         let mut paired: Vec<(Series, PendingCounts)> = series.into_iter().zip(dense).collect();
-        // Stable, so the last of a run of equal label sets is the last one pushed -- latest wins,
-        // the cumulative-series semantics `prometheus_out`'s registry upsert also uses. A replaced
-        // series' own counts go with it.
+        // Stable, so the last of a run of equal label sets is the latest, and walked from the end,
+        // so it's the one kept -- latest wins, the cumulative-series semantics `prometheus_out`'s
+        // registry upsert also uses. A replaced series' own counts go with it.
         paired.sort_by(|a, b| a.0.labels.cmp(&b.0.labels));
         let mut deduped: Vec<(Series, PendingCounts)> = Vec::with_capacity(paired.len());
-        for item in paired {
-            match deduped.last_mut() {
-                Some(last) if last.0.labels == item.0.labels => {
-                    *last = item;
-                    replaced += 1;
-                }
+        for item in paired.into_iter().rev() {
+            match deduped.last() {
+                Some(kept) if kept.0.labels == item.0.labels => replaced.add(&item.0, &kept.0),
                 _ => deduped.push(item),
             }
         }
+        deduped.reverse();
         let (series, pending) = deduped.into_iter().unzip();
         out.push(PendingFamily {
             family: MetricFamily { name, kind, help, unit, series },
@@ -1189,13 +1193,10 @@ pub fn events_to_families_pending<'a>(
         });
     }
     // A remote-write sender calls this once per timestamp, so a replaced series is a reading lost
-    // at its instant. The exposition registry keeps one value per series between scrapes by
-    // design, so there it's the pull model's overwrite, uncounted.
-    if replaced > 0 && encoder.destination == Destination::RemoteWrite {
-        for _ in 0..replaced {
-            encoder.not_encoded(NotEncoded::DuplicateTimestamp);
-        }
-        warn_duplicate_timestamp(encoder, replaced);
+    // at its instant, unless it equals the one kept. The exposition registry keeps one value per
+    // series between scrapes by design, so there it's the pull model's overwrite, uncounted.
+    if encoder.destination == Destination::RemoteWrite {
+        count_duplicates(encoder, replaced.differing, replaced.equal);
     }
     out
 }
@@ -1212,15 +1213,95 @@ pub struct PendingFamily {
 #[derive(Debug, Clone, Default)]
 pub struct PendingCounts(Vec<(&'static str, (&'static str, &'static str))>);
 
+/// How many readings a remote-write collapse removed, by whether each equals the reading kept for
+/// its series and millisecond ([`same_reading`]).
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Replaced {
+    pub(crate) differing: usize,
+    pub(crate) equal: usize,
+}
+
+impl Replaced {
+    /// Counts `removed`, which `kept` replaces.
+    pub(crate) fn add(&mut self, removed: &Series, kept: &Series) {
+        if same_reading(removed, kept) {
+            self.equal += 1;
+        } else {
+            self.differing += 1;
+        }
+    }
+}
+
+/// Whether two readings of one family and label set are one reading on the remote-write wire:
+/// the same point, each `f64` by its bits (as Prometheus's own duplicate check compares them), the
+/// same created timestamp at the wire's millisecond, and the same exemplars, which go with a
+/// removed reading. A value's model type isn't compared: every sample is a double.
+pub(crate) fn same_reading(a: &Series, b: &Series) -> bool {
+    let millis = |created: Option<i64>| created.map(|c| c / 1_000_000);
+    same_point(&a.point, &b.point)
+        && millis(a.created) == millis(b.created)
+        && a.exemplars == b.exemplars
+}
+
+fn same_point(a: &Point, b: &Point) -> bool {
+    let f = |x: f64, y: f64| x.to_bits() == y.to_bits();
+    let sum = |x: Option<f64>, y: Option<f64>| match (x, y) {
+        (Some(x), Some(y)) => f(x, y),
+        (x, y) => x.is_none() && y.is_none(),
+    };
+    match (a, b) {
+        (Point::Counter(x), Point::Counter(y))
+        | (Point::Gauge(x), Point::Gauge(y))
+        | (Point::Unknown(x), Point::Unknown(y)) => f(*x, *y),
+        (
+            Point::Histogram { buckets: ab, sum: asum, count: ac },
+            Point::Histogram { buckets: bb, sum: bsum, count: bc },
+        ) => {
+            ac == bc
+                && sum(*asum, *bsum)
+                && ab.len() == bb.len()
+                && ab.iter().zip(bb).all(|(x, y)| f(x.0, y.0) && x.1 == y.1)
+        }
+        (
+            Point::Summary { quantiles: aq, sum: asum, count: ac },
+            Point::Summary { quantiles: bq, sum: bsum, count: bc },
+        ) => {
+            ac == bc
+                && sum(*asum, *bsum)
+                && aq.len() == bq.len()
+                && aq.iter().zip(bq).all(|(x, y)| f(x.0, y.0) && f(x.1, y.1))
+        }
+        (Point::StateSet(x), Point::StateSet(y)) => x == y,
+        (Point::Info, Point::Info) | (Point::Stale, Point::Stale) => true,
+        _ => false,
+    }
+}
+
+/// Counts the readings a remote-write collapse removed: `differing` ones as lost, with the
+/// diagnostic, and `equal` ones as normalized, since the receiver stores the same sample.
+fn count_duplicates(encoder: &mut PrometheusEncoder, differing: usize, equal: usize) {
+    for _ in 0..equal {
+        encoder.not_encoded(NotEncoded::EqualDuplicateTimestamp);
+    }
+    if differing == 0 {
+        return;
+    }
+    for _ in 0..differing {
+        encoder.not_encoded(NotEncoded::DuplicateTimestamp);
+    }
+    warn_duplicate_timestamp(encoder, differing);
+}
+
 /// The diagnostic both remote-write collapses report under: `n` readings of a series dropped
-/// because a later one shared its millisecond.
+/// because a later, different one shared its millisecond.
 fn warn_duplicate_timestamp(encoder: &mut PrometheusEncoder, n: usize) {
     encoder.diagnostics.warn_throttled(
         "duplicate_timestamp",
         format_args!(
-            "dropped {n} reading(s) that shared a series and a millisecond with a later one, \
-             which remote-write can't carry -- add a `dedup_timestamps` component with \
-             `precision: 1ms` before this output, or an `aggregate` for a live delta flow"
+            "dropped {n} reading(s) that shared a series and a millisecond with a later, \
+             different one, which remote-write can't carry -- add a `dedup_timestamps` \
+             component with `precision: 1ms` before this output, or an `aggregate` for a live \
+             delta flow"
         ),
     );
 }
@@ -2412,6 +2493,8 @@ mod tests {
             );
             let expected = if dropped {
                 "logit.output.metrics.dropped"
+            } else if outcome == NotEncoded::EqualDuplicateTimestamp {
+                "logit.output.metrics.normalized"
             } else {
                 "logit.output.metrics.skipped"
             };

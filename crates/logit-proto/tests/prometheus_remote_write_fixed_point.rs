@@ -832,6 +832,124 @@ fn two_readings_on_one_millisecond_collapse_to_the_later_one() {
     }
 }
 
+/// Encodes with telemetry attached and returns each `logit.output.metrics.*` counter as
+/// `(name, reason, total)`, so a `normalized` reason reads apart from a `dropped` one.
+fn encode_counters(groups: &[Vec<MetricFamily>]) -> Vec<(String, String, u64)> {
+    let registry = Registry::new();
+    let mut encoder = PrometheusEncoder::new().with_telemetry(registry.telemetry_for(
+        "prometheus",
+        "prometheus_out",
+        "sink",
+    ));
+    encode(groups, Version::V1, &mut encoder);
+    let mut out: Vec<(String, String, u64)> = registry
+        .drain(0)
+        .iter()
+        .flat_map(|event| {
+            let reason = event.attributes.get("reason").and_then(|value| value.as_str());
+            let reason = reason.unwrap_or_default().to_string();
+            event.metrics.iter().filter_map(move |metric| {
+                let name = resolve(metric.name);
+                let MetricKind::Sum(sum) = &metric.kind else { return None };
+                name.starts_with("logit.output.metrics.")
+                    .then(|| (name.to_string(), reason.clone(), sum.value.as_f64() as u64))
+            })
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+fn gauge_reading(timestamp: i64, value: f64) -> Vec<MetricFamily> {
+    vec![MetricFamily {
+        series: vec![Series {
+            timestamp: Some(timestamp),
+            ..Series::new(vec![("shard".to_string(), "1".to_string())], Point::Gauge(value))
+        }],
+        ..MetricFamily::new("m", FamilyType::Gauge)
+    }]
+}
+
+const NORMALIZED: &str = "logit.output.metrics.normalized";
+const DROPPED: &str = "logit.output.metrics.dropped";
+
+fn duplicates(counters: &[(String, String, u64)], metric: &str) -> u64 {
+    counters
+        .iter()
+        .filter(|(name, reason, _)| name == metric && reason == "duplicate_timestamp")
+        .map(|counter| counter.2)
+        .sum()
+}
+
+/// A reading equal to the one sent for its millisecond loses nothing: it counts
+/// `normalized{reason="duplicate_timestamp"}`, not `dropped`, for a gauge and a histogram alike.
+#[test]
+fn an_equal_reading_on_one_millisecond_is_counted_normalized() {
+    let groups = vec![gauge_reading(TIMESTAMP, 2.0), gauge_reading(TIMESTAMP + 1, 2.0)];
+    let counters = encode_counters(&groups);
+    assert_eq!(duplicates(&counters, NORMALIZED), 1, "{counters:?}");
+    assert_eq!(duplicates(&counters, DROPPED), 0, "{counters:?}");
+
+    let histogram = |timestamp: i64| {
+        vec![MetricFamily {
+            series: vec![Series {
+                timestamp: Some(timestamp),
+                ..Series::new(
+                    vec![("shard".to_string(), "1".to_string())],
+                    Point::Histogram {
+                        buckets: vec![(1.0, 2), (f64::INFINITY, 3)],
+                        sum: Some(4.5),
+                        count: 3,
+                    },
+                )
+            }],
+            ..MetricFamily::new("h", FamilyType::Histogram)
+        }]
+    };
+    let counters = encode_counters(&[histogram(TIMESTAMP), histogram(TIMESTAMP + 1)]);
+    assert_eq!(duplicates(&counters, NORMALIZED), 1, "{counters:?}");
+    assert_eq!(duplicates(&counters, DROPPED), 0, "{counters:?}");
+}
+
+/// An equal value isn't an equal reading when anything else the wire carries for it differs:
+/// the removed reading's exemplars go with it, and `0.0` and `-0.0` are two samples.
+#[test]
+fn an_equal_value_with_other_exemplars_or_sign_is_counted_dropped() {
+    let mut with_exemplar = gauge_reading(TIMESTAMP, 2.0);
+    with_exemplar[0].series[0].exemplars = vec![Exemplar {
+        timestamp: TIMESTAMP,
+        value: MetricValue::F64(2.0),
+        trace: None,
+        filtered_attributes: AttrMap::new(),
+    }];
+    for groups in [
+        vec![with_exemplar, gauge_reading(TIMESTAMP + 1, 2.0)],
+        vec![gauge_reading(TIMESTAMP, 0.0), gauge_reading(TIMESTAMP + 1, -0.0)],
+    ] {
+        let counters = encode_counters(&groups);
+        assert_eq!(duplicates(&counters, NORMALIZED), 0, "{counters:?}");
+        assert_eq!(duplicates(&counters, DROPPED), 1, "{counters:?}");
+    }
+}
+
+/// Each removed reading is compared with the reading sent, not with the one that displaced it:
+/// of `5`, `7`, and `5` in one millisecond, the last is sent, the first equals it, and the `7`
+/// is lost.
+#[test]
+fn a_removed_reading_is_compared_with_the_reading_sent() {
+    let groups = vec![
+        gauge_reading(TIMESTAMP, 5.0),
+        gauge_reading(TIMESTAMP + 1, 7.0),
+        gauge_reading(TIMESTAMP + 2, 5.0),
+    ];
+    let counters = encode_counters(&groups);
+    assert_eq!(duplicates(&counters, NORMALIZED), 1, "{counters:?}");
+    assert_eq!(duplicates(&counters, DROPPED), 1, "{counters:?}");
+    let body = encode(&groups, Version::V1, &mut PrometheusEncoder::new());
+    let decoded = decode(&body, Version::V1, &mut PrometheusDecoder::new()).expect("must decode");
+    assert_eq!(decoded.groups, vec![gauge_reading(TIMESTAMP, 5.0)]);
+}
+
 /// A histogram reading that collapses loses all of its `_bucket`, `_sum`, and `_count` samples,
 /// and counts once: the counter counts readings, not wire samples.
 #[test]

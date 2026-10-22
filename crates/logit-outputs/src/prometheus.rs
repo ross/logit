@@ -3448,6 +3448,36 @@ mod tests {
         assert_eq!(sum_of(&sums, "logit.output.metrics.degraded", &[]), 0.0);
     }
 
+    /// A reading equal to the one sent for its series loses nothing, at either collapse: it's
+    /// counted `normalized` once for the batch, with no loss and no diagnostic.
+    #[tokio::test]
+    async fn a_remote_write_reading_equal_to_the_one_sent_is_counted_normalized_once() {
+        let at = 1_700_000_000_000_000_000;
+        for later in [at, at + 1] {
+            let (sums, samples) =
+                retried_remote_write(batch(vec![gauge_at(at, 2.0), gauge_at(later, 2.0)])).await;
+            assert_eq!(samples, [(2.0, at / 1_000_000)], "{later}");
+            let reason = [("reason", "duplicate_timestamp")];
+            assert_eq!(sum_of(&sums, "logit.output.metrics.normalized", &reason), 1.0, "{later}");
+            assert_eq!(sum_of(&sums, DUPLICATE.0, DUPLICATE.1), 0.0, "{later}");
+            let diagnostics = [("key", "duplicate_timestamp")];
+            assert_eq!(sum_of(&sums, "logit.component.diagnostics", &diagnostics), 0.0, "{later}");
+        }
+    }
+
+    /// Of `5`, `7`, and `5` at one instant, the last is sent: the first, equal to it, is counted
+    /// `normalized`, and the `7` `dropped`, since each is compared with the reading sent.
+    #[tokio::test]
+    async fn a_remote_write_reading_is_compared_with_the_one_sent() {
+        let at = 1_700_000_000_000_000_000;
+        let events = vec![gauge_at(at, 5.0), gauge_at(at, 7.0), gauge_at(at, 5.0)];
+        let (sums, samples) = retried_remote_write(batch(events)).await;
+        assert_eq!(samples, [(5.0, at / 1_000_000)]);
+        let reason = [("reason", "duplicate_timestamp")];
+        assert_eq!(sum_of(&sums, "logit.output.metrics.normalized", &reason), 1.0);
+        assert_eq!(sum_of(&sums, DUPLICATE.0, DUPLICATE.1), 1.0);
+    }
+
     /// The exposition registry keeps one value per series between scrapes, so a later reading
     /// replacing an earlier one in a batch is the pull model's overwrite, uncounted.
     #[tokio::test]
@@ -3467,19 +3497,20 @@ mod tests {
     /// its record's degrade describes a summary that isn't sent.
     #[tokio::test]
     async fn a_duplicate_reading_counts_no_degrade() {
-        let samples = |timestamp: i64| {
+        let samples = |timestamp: i64, value: f64| {
             Event::metric(
                 timestamp,
                 AttrMap::new(),
                 MetricRecord::new(
                     intern("latency"),
-                    MetricKind::Samples(logit_core::Samples::new([1.0])),
+                    MetricKind::Samples(logit_core::Samples::new([value])),
                 ),
             )
         };
         let at = 1_700_000_000_000_000_000;
         for later in [at, at + 1] {
-            let (sums, _) = retried_remote_write(batch(vec![samples(at), samples(later)])).await;
+            let pair = vec![samples(at, 1.0), samples(later, 2.0)];
+            let (sums, _) = retried_remote_write(batch(pair)).await;
             let degraded = [("metric_kind", "samples")];
             assert_eq!(sum_of(&sums, "logit.output.metrics.degraded", &degraded), 1.0, "{later}");
             assert_eq!(sum_of(&sums, DUPLICATE.0, DUPLICATE.1), 1.0, "{later}");

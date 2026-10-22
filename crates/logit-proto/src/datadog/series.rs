@@ -1064,13 +1064,14 @@ impl DatadogEncoder {
     pub fn series_duplicates_in(&self, batch: &EventBatch, events: &[usize]) -> SeriesDuplicates {
         let (carriers, records) =
             self.series_records(batch, events.iter().copied(), Route::V2Protobuf);
-        let keep = collapse(batch, &carriers, &records);
+        let fates = collapse(batch, &carriers, &records);
         let mut out = SeriesDuplicates::default();
         let points = records.iter().flat_map(|r| (0..r.points.len()).map(move |k| (r, k)));
-        for ((r, k), kept) in points.zip(keep) {
-            if !kept {
+        for ((r, k), fate) in points.zip(fates) {
+            if fate != Fate::Sent {
                 out.dropped.insert((r.index, r.record_index, k));
                 *out.per_event.entry(r.index).or_default() += 1;
+                out.equal += usize::from(fate == Fate::Equal);
             }
         }
         out
@@ -1085,7 +1086,8 @@ impl DatadogEncoder {
     /// and doesn't sum two counts, so sending both loses one of them uncounted. Under a
     /// [`DatadogEncoder::with_series_plan`], the plan names the points to leave off and the sink
     /// has counted them; with none, the points are collapsed here and each one left off is
-    /// counted `dropped{reason="duplicate_timestamp"}`.
+    /// counted `normalized{reason="duplicate_timestamp"}` when it equals the point sent
+    /// ([`same_point`]), else `dropped{reason="duplicate_timestamp"}`.
     ///
     /// A record whose every point is left off as a duplicate counts none of its notes, and an
     /// event with no point sent counts none of its omitted tags: those describe a written series.
@@ -1107,11 +1109,12 @@ impl DatadogEncoder {
                 })
                 .collect(),
             None => {
-                let keep = collapse(batch, &carriers, &records);
-                let duplicates = keep.iter().filter(|kept| !**kept).count();
-                self.series_duplicates = duplicates;
-                self.count_duplicates(duplicates);
-                keep
+                let fates = collapse(batch, &carriers, &records);
+                let equal = fates.iter().filter(|fate| **fate == Fate::Equal).count();
+                let differing = fates.iter().filter(|fate| **fate == Fate::Differing).count();
+                self.series_duplicates = equal + differing;
+                self.count_duplicates(differing, equal);
+                fates.into_iter().map(|fate| fate == Fate::Sent).collect()
             }
         };
 
@@ -1145,19 +1148,24 @@ impl DatadogEncoder {
         }
     }
 
-    /// Counts `n` series points left off as duplicates, with the diagnostic naming the remedy.
-    pub fn count_duplicates(&mut self, n: usize) {
-        if n == 0 {
+    /// Counts the series points left off as duplicates: `differing` ones as lost, with the
+    /// diagnostic naming the remedy, and `equal` ones, each equal to the point sent, as
+    /// normalized.
+    pub fn count_duplicates(&mut self, differing: usize, equal: usize) {
+        for _ in 0..equal {
+            self.metric_not_sent(MetricOut::EqualDuplicateTimestamp);
+        }
+        if differing == 0 {
             return;
         }
-        for _ in 0..n {
+        for _ in 0..differing {
             self.metric_not_sent(MetricOut::DuplicateTimestamp);
         }
         self.diagnostics.warn_throttled(
             "duplicate_timestamp",
             format_args!(
-                "datadog: dropped {n} series point(s) that shared a series and a second with a \
-                 later one, since Datadog keeps only the higher of the two -- add a \
+                "datadog: dropped {differing} series point(s) that shared a series and a second with a \
+                 later, different one, since Datadog keeps only the higher of the two -- add a \
                  `dedup_timestamps` component with `precision: 1s` before this output, or an \
                  `aggregate` for a live delta flow"
             ),
@@ -1348,14 +1356,27 @@ struct SeriesRecord<'a> {
 /// ([`DatadogEncoder::series_duplicates_in`]), by `(event, record, point)` index in the batch.
 #[derive(Clone, Debug, Default)]
 pub struct SeriesDuplicates {
+    /// Every point left off, equal to the point sent or not.
     dropped: HashSet<(usize, usize, usize)>,
     per_event: HashMap<usize, usize>,
+    /// How many of `dropped` equal the point sent for their series and second ([`same_point`]).
+    equal: usize,
 }
 
 impl SeriesDuplicates {
     /// Every point left off.
     pub fn total(&self) -> usize {
         self.dropped.len()
+    }
+
+    /// The points left off that equal the point sent for their series and second.
+    pub fn equal(&self) -> usize {
+        self.equal
+    }
+
+    /// The points left off that differ from the point sent for their series and second.
+    pub fn differing(&self) -> usize {
+        self.dropped.len() - self.equal
     }
 
     /// The points left off from the batch's event `index`.
@@ -1372,16 +1393,28 @@ pub struct SeriesPlanned {
     pub origin: Vec<usize>,
 }
 
+/// What [`collapse`] does with one planned point.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Fate {
+    /// The latest of its series and second: sent.
+    Sent,
+    /// Left off, equal to the point sent ([`same_point`]).
+    Equal,
+    /// Left off, differing from the point sent.
+    Differing,
+}
+
 /// Which planned points survive: the latest of each (series, second), the later in plan order on
-/// a tie. One flag per point, in `records`' order.
+/// a tie. One fate per point, in `records`' order, each point left off compared with the one sent
+/// for its series and second, not with the one that displaced it.
 fn collapse(
     batch: &EventBatch,
     carriers: &[Option<(Carriers, Omitted)>],
     records: &[SeriesRecord<'_>],
-) -> Vec<bool> {
+) -> Vec<Fate> {
     let flat: Vec<(usize, &MetricRecord, &SeriesPoint)> =
         records.iter().flat_map(|r| r.points.iter().map(move |p| (r.index, r.record, p))).collect();
-    let mut keep = vec![true; flat.len()];
+    let mut keep = vec![Fate::Sent; flat.len()];
     if flat.len() < 2 {
         return keep;
     }
@@ -1403,9 +1436,34 @@ fn collapse(
         group_of.push(group);
     }
     for (n, &group) in group_of.iter().enumerate() {
-        keep[n] = latest[group] == n;
+        let sent = latest[group];
+        if sent == n {
+            continue;
+        }
+        let carriers = |index: usize| &carriers[index].as_ref().expect("read for every event").0;
+        let (a, b) = (flat[n], flat[sent]);
+        keep[n] = if same_point((a.1, carriers(a.0), a.2), (b.1, carriers(b.0), b.2)) {
+            Fate::Equal
+        } else {
+            Fate::Differing
+        };
     }
     keep
+}
+
+/// Whether two points of one series in one second are one point on the series route: the same
+/// value by its bits, wire type, unit, interval, source type, and origin. A value's model type
+/// isn't compared: every series value is a double.
+fn same_point(
+    (ra, ca, pa): (&MetricRecord, &Carriers, &SeriesPoint),
+    (rb, cb, pb): (&MetricRecord, &Carriers, &SeriesPoint),
+) -> bool {
+    pa.value.to_bits() == pb.value.to_bits()
+        && pa.wire_type(ca) == pb.wire_type(cb)
+        && pa.unit(ra) == pb.unit(rb)
+        && ca.interval == cb.interval
+        && ca.source_type_name == cb.source_type_name
+        && ca.origin == cb.origin
 }
 
 /// What makes two series points one Datadog series in one second: the metric name, the tag set
@@ -2189,10 +2247,10 @@ mod tests {
     }
 
     /// Of two points of one series in one second, the later is sent and the earlier counted, for
-    /// a count as for a gauge and whether or not the values differ; a point of another series
-    /// (another tag set) or another second is no duplicate.
+    /// a count as for a gauge: `normalized` when the two are equal, `dropped` when they differ. A
+    /// point of another series (another tag set) or another second is no duplicate.
     #[test]
-    fn a_series_point_sharing_its_second_with_a_later_one_is_dropped_and_counted() {
+    fn a_series_point_sharing_its_second_with_a_later_one_is_left_off_and_counted() {
         let (mut e, registry) = encoder();
         let at = |offset_ms: i64, name: &str, kind: MetricKind, env: &str| {
             let mut attrs = AttrMap::new();
@@ -2223,10 +2281,53 @@ mod tests {
         let want: Vec<(String, f64)> = want.iter().map(|(n, v)| (n.to_string(), *v)).collect();
         assert_eq!(sent, want, "the later point of each pair is sent, in batch order");
         assert_eq!(e.series_duplicates(), 3);
-        assert_eq!(
-            counted(&registry, "logit.output.metrics.dropped", ("reason", "duplicate_timestamp")),
-            3.0
-        );
+        let c = counters(&registry);
+        // The `c` and `g` pairs are equal, and `h`'s `1.0` differs from the `9.0` sent.
+        assert_eq!(total(&c, "logit.output.metrics.normalized", "duplicate_timestamp"), 2.0);
+        assert_eq!(total(&c, "logit.output.metrics.dropped", "duplicate_timestamp"), 1.0);
+    }
+
+    /// Each point left off is compared with the point sent for its series and second, not with
+    /// the one that displaced it: of `5`, `7`, and `5`, the last is sent, the first is equal to
+    /// it, and the `7` is lost.
+    #[test]
+    fn a_left_off_point_is_compared_with_the_point_sent() {
+        let (mut e, registry) = encoder();
+        let at = |offset_ms: i64, value: f64| {
+            Event::metric(
+                TS + offset_ms * 1_000_000,
+                AttrMap::new(),
+                MetricRecord::new(intern("g"), MetricKind::gauge(value)),
+            )
+        };
+        let body = e.encode_series_v1(&batch(vec![at(0, 5.0), at(1, 7.0), at(2, 5.0)])).unwrap();
+        let json: JsonValue = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["series"].as_array().unwrap().len(), 1);
+        assert_eq!(json["series"][0]["points"][0][1].as_f64(), Some(5.0));
+        let c = counters(&registry);
+        assert_eq!(total(&c, "logit.output.metrics.normalized", "duplicate_timestamp"), 1.0);
+        assert_eq!(total(&c, "logit.output.metrics.dropped", "duplicate_timestamp"), 1.0);
+    }
+
+    /// An equal value isn't an equal point when a field the series carries beside it differs:
+    /// here the interval, a delta `count`'s window. Nor is `0.0` the same value as `-0.0`.
+    #[test]
+    fn an_equal_value_with_another_wire_field_is_dropped() {
+        let (mut e, registry) = encoder();
+        let at = |offset_ms: i64, value: f64, interval: i64| {
+            let mut attrs = AttrMap::new();
+            attrs.insert(super::super::ATTR_INTERVAL, Value::I64(interval));
+            Event::metric(
+                TS + offset_ms * 1_000_000,
+                attrs,
+                MetricRecord::new(intern("c"), MetricKind::counter(value)),
+            )
+        };
+        let events = vec![at(0, 3.0, 10), at(1, 3.0, 20), at(1_000, 0.0, 10), at(1_001, -0.0, 10)];
+        e.encode_series_v1(&batch(events)).unwrap();
+        let c = counters(&registry);
+        assert_eq!(total(&c, "logit.output.metrics.normalized", "duplicate_timestamp"), 0.0);
+        assert_eq!(total(&c, "logit.output.metrics.dropped", "duplicate_timestamp"), 2.0);
     }
 
     /// A point left off as a duplicate counts only its `duplicate_timestamp`: its record's
