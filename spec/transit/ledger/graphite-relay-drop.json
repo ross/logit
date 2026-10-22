@@ -1,0 +1,10 @@
+{
+  "cells": [
+    {"sink":"graphite_out","row":"attributes/no_host","cell":0,"observed":["exact"]},
+    {"sink":"graphite_out","row":"attributes/string_value","cell":0,"observed":["lost"]},
+    {"sink":"graphite_out","row":"gauge/f64","cell":0,"observed":["exact"]},
+    {"sink":"graphite_out","row":"gauge/negative","cell":0,"observed":["exact"]},
+    {"sink":"graphite_out","row":"record/superseded","cell":0,"observed":["exact"]}
+  ],
+  "unspecified": []
+}

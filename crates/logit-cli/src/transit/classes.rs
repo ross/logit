@@ -74,7 +74,10 @@
 //! timestamp value as an integer of nanoseconds; `datadog_out`'s `host` attribute read back under
 //! its route's host key, and the attributes it writes from a record's own fields
 //! ([`Spelling::derived`]: the run's hostname on a record with no host, a log's `status`, a
-//! span's `span.kind` and `_dd.p.tid`), each accepted only with the value derived for it. A
+//! span's `span.kind` and `_dd.p.tid`), each accepted only with the value derived for it;
+//! `graphite_out`'s forbidden characters as `_` in a path, a tag name, and a tag value (and a tag
+//! value's leading `~`), a tag value in the encoder's rendering, and the values it omits as no
+//! tag ([`graphite_value`]). Each name, key, and value set is the encoder's own predicate. A
 //! candidate's public attributes (no `_logit.`
 //! key, values compared as text, each key and value as the sink writes it) must equal the
 //! input's, or failing any that do, be a subset of them; a `datadog_out` series under `<name>.`
@@ -108,7 +111,7 @@
 //! skips a flagged histogram as `no_recorded_value` before `multi_value: skip` sees its kind).
 //! For a record flagged as holding no recorded value, its `record/no_recorded_value*` cell goes
 //! ahead of a kind row's counted `degraded`, `skipped`, or `dropped` cell whose counter didn't
-//! move: `statsd_out`, `influxdb_out`, and `prometheus_out` test the
+//! move: `statsd_out`, `influxdb_out`, `prometheus_out`, and `graphite_out` test the
 //! flag before the kind, so a flagged `gauge_delta` is skipped there rather than dropped, and
 //! remote-write writes a flagged delta `sum` as a stale marker rather than dropping it. A sink
 //! that tests the kind first moves the kind cell's counter, and that cell decides as before
@@ -130,7 +133,11 @@ use super::mapping::{self, Class, Lookup, Mapping, Series};
 use super::Traced;
 use logit_core::EventBatch;
 use logit_outputs::ndjson::render_ndjson;
+use logit_outputs::statsd::is_forbidden_in_name;
 use logit_proto::event_json::EventJsonDecoder;
+use logit_proto::graphite::encode::{
+    is_forbidden_in_path, is_forbidden_in_tag_name, render_tag_value, sanitize_tag_value_into,
+};
 use logit_proto::influxdb::ATTR_MEASUREMENT;
 use logit_proto::prometheus::text::exposed_exemplar_keys;
 use logit_proto::prometheus::{sanitize_label_name, sanitize_metric_name};
@@ -262,7 +269,9 @@ impl Rec {
             // A carrier is public only where the sink writes it as an ordinary attribute.
             if !key.starts_with("_logit.") {
                 let tags = tags.map(String::as_str).unwrap_or("");
-                out.insert(key, spelling.value_for(name, value, tags, self));
+                if let Some(value) = spelling.value_for(name, value, tags, self) {
+                    out.insert(key, value);
+                }
             }
         }
         for (_, key, value) in spelling.derived(self) {
@@ -279,10 +288,9 @@ impl Rec {
 /// sink's encoder and its pair's decoder, cited from the codec's module doc.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Spelling {
-    /// `statsd_out`: a name with each character outside `[A-Za-z0-9._/-]` as `_`, on both sides;
-    /// a tag key with each of `statsd_out`'s reserved characters as `_`, and a tag value the
-    /// same but for `:`. Under `format: dogstatsd` (`dogstatsd`), also the host as the `host:`
-    /// tag ([`statsd`]).
+    /// `statsd_out`: a name and a tag key with each of `statsd_out`'s reserved characters as
+    /// `_`, the name on both sides, and a tag value the same but for `:`. Under
+    /// `format: dogstatsd` (`dogstatsd`), also the host as the `host:` tag ([`statsd`]).
     Statsd { dogstatsd: bool },
     /// `prometheus_out`: `sanitize_metric_name`, plus `_total` on a counter that lacks it;
     /// `sanitize_label_name` on every key; an array's last element as its label value.
@@ -298,6 +306,11 @@ enum Spelling {
     /// `host.name`; and the attributes [`Spelling::derived`] lists, which the encoder writes from
     /// a record's own fields and `datadog_in` reads back as attributes the input lacks.
     Datadog,
+    /// `graphite_out`: each character carbon forbids in a path, a tag name, or a tag value as
+    /// `_`, and a tag value's leading `~`; a tag value as the encoder renders it (an `f64` in
+    /// Rust's shortest form, `3` for `3.0`, and an array's last representable element), and a
+    /// value it omits, such as a timestamp or bytes, as no tag at all ([`graphite_value`]).
+    Graphite,
     /// Any other sink: names, keys, and values as written.
     Verbatim,
 }
@@ -311,6 +324,7 @@ impl Spelling {
             "influxdb_out" => Spelling::Influxdb,
             "otlp_out" => Spelling::Otlp,
             "datadog_out" => Spelling::Datadog,
+            "graphite_out" => Spelling::Graphite,
             _ => Spelling::Verbatim,
         }
     }
@@ -319,8 +333,9 @@ impl Spelling {
     /// changes reaches `record/name_unsafe`.
     fn sanitize(self, name: &str) -> String {
         match self {
-            Spelling::Statsd { .. } => sanitized(name),
+            Spelling::Statsd { .. } => substituted(name, is_forbidden_in_name),
             Spelling::Prometheus => sanitize_metric_name(name).into_owned(),
+            Spelling::Graphite => substituted(name, is_forbidden_in_path),
             Spelling::Influxdb | Spelling::Otlp | Spelling::Datadog | Spelling::Verbatim => {
                 name.to_string()
             }
@@ -390,7 +405,7 @@ impl Spelling {
     /// The name a read-back record is compared under.
     fn read(self, rec: &Rec) -> String {
         match self {
-            Spelling::Statsd { .. } => sanitized(&rec.name),
+            Spelling::Statsd { .. } => self.sanitize(&rec.name),
             _ => rec.name.clone(),
         }
     }
@@ -403,7 +418,10 @@ impl Spelling {
                 sanitize_label_name(key).into_owned()
             }
             Spelling::Statsd { .. } if !key.starts_with("_logit.") => {
-                key.chars().map(|c| if statsd_reserved(c) { '_' } else { c }).collect()
+                substituted(key, is_forbidden_in_name)
+            }
+            Spelling::Graphite if !key.starts_with("_logit.") => {
+                substituted(key, is_forbidden_in_tag_name)
             }
             _ => key.to_string(),
         }
@@ -437,15 +455,19 @@ impl Spelling {
     }
 
     /// [`Spelling::value`] for attribute `key` of `rec`: the hostless mark `statsd_out` writes
-    /// as the `host:` tag reads back empty.
-    fn value_for(self, key: &str, value: &Value, tags: &str, rec: &Rec) -> String {
+    /// as the `host:` tag reads back empty. `None` where the sink writes no tag for the value
+    /// (`graphite_out`'s omitted values).
+    fn value_for(self, key: &str, value: &Value, tags: &str, rec: &Rec) -> Option<String> {
         if self == (Spelling::Statsd { dogstatsd: true })
             && key == statsd::HOSTLESS
             && statsd::hostless_is_host(rec)
         {
-            return String::new();
+            return Some(String::new());
         }
-        self.value(value, tags)
+        if self == Spelling::Graphite {
+            return graphite_value(value, tags);
+        }
+        Some(self.value(value, tags))
     }
 
     /// [`derived`] where the sink writes those attributes, which only `datadog_out` does; empty
@@ -470,7 +492,7 @@ impl Spelling {
                     .map_or_else(|_| s.clone(), |nanos| nanos.to_string())
             }
             (Spelling::Statsd { .. }, Value::String(s)) => {
-                s.chars().map(|c| if c != ':' && statsd_reserved(c) { '_' } else { c }).collect()
+                substituted(s, |c| c != ':' && is_forbidden_in_name(c))
             }
             _ => text(value),
         }
@@ -733,20 +755,54 @@ fn same_number(a: &Value, b: &Value) -> bool {
     }
 }
 
-/// `name` with each character outside `[A-Za-z0-9._/-]` read as `_`.
-fn sanitized(name: &str) -> String {
-    name.chars().map(|c| if safe(c) { c } else { '_' }).collect()
+/// `s` with each character `forbidden` names as `_`. The predicates are the encoders' own
+/// (`crates/logit-outputs/src/statsd.rs`'s and `logit_proto::graphite`'s "Sanitization"), since a
+/// read-back name, key, or value is compared as the sink wrote it.
+fn substituted(s: &str, forbidden: impl Fn(char) -> bool) -> String {
+    s.chars().map(|c| if forbidden(c) { '_' } else { c }).collect()
 }
 
-fn safe(c: char) -> bool {
-    c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | '-')
+/// An attribute value as `graphite_out` writes it as a tag value, `None` where it writes no tag:
+/// the value back in the model, rendered by the encoder's own `render_tag_value` and
+/// `sanitize_tag_value_into`, so the two can't drift. A value empty after that writes none.
+/// `tags` is its `types` entry.
+fn graphite_value(value: &Value, tags: &str) -> Option<String> {
+    let mut raw = String::new();
+    if !render_tag_value(&mut raw, &model_value(value, tags, "/")) {
+        return None;
+    }
+    let mut out = String::new();
+    sanitize_tag_value_into(&mut out, &raw);
+    (!out.is_empty()).then_some(out)
 }
 
-/// A character `statsd_out` writes as `_` in a tag key, and in a tag value but for `:`
-/// (`crates/logit-outputs/src/statsd.rs`'s "Sanitization"). Unlike [`sanitized`], it's the
-/// encoder's own set, since a read-back value is compared as written.
-fn statsd_reserved(c: char) -> bool {
-    matches!(c, ':' | '|' | '@' | '#' | ',') || c.is_control() || c.is_whitespace()
+/// A `format: json` attribute value as the model [`logit_core::Value`] it was written from,
+/// `tags` its `types` entry and `pointer` its place there (`/`, or `/<i>` for an array element).
+/// A map comes back as `Null`, since neither has a tag form; any other value is exact.
+fn model_value(value: &Value, tags: &str, pointer: &str) -> logit_core::Value {
+    use logit_core::Value as Model;
+    let tagged = |tag: &str| tags.split(';').any(|entry| entry == format!("{pointer}={tag}"));
+    match value {
+        _ if tagged("bytes") => Model::Bytes(bytes::Bytes::new()),
+        _ if tagged("timestamp") => Model::Timestamp(0),
+        Value::String(s) if tagged("f64") => s.parse().map_or(Model::Null, Model::F64),
+        Value::String(s) => Model::str(s.clone()),
+        Value::Bool(b) => Model::Bool(*b),
+        Value::Number(n) => match (n.as_i64(), n.as_u64(), n.as_f64()) {
+            (Some(i), _, _) => Model::I64(i),
+            (_, Some(u), _) => Model::U64(u),
+            (_, _, Some(f)) => Model::F64(f),
+            _ => Model::Null,
+        },
+        Value::Array(items) => Model::Array(
+            items
+                .iter()
+                .enumerate()
+                .map(|(i, item)| model_value(item, tags, &format!("/{i}")))
+                .collect(),
+        ),
+        Value::Null | Value::Object(_) => Model::Null,
+    }
 }
 
 /// RFC 6901's unescaping of one pointer token.
@@ -962,11 +1018,12 @@ fn pair(ins: &[Rec], outs: &[Rec], spelling: Spelling) -> Pairing {
                 if sharing == 1 { direct } else { direct.into_iter().take(1).collect() };
             // A dotted expansion hangs off the record's own name, before any respelling of the
             // whole record (`influxdb_out`'s `.value`).
-            let base = if respelled && matches!(spelling, Spelling::Statsd { .. }) {
-                sanitized(&input.name)
-            } else {
-                input.name.clone()
-            };
+            let base =
+                if respelled && matches!(spelling, Spelling::Statsd { .. } | Spelling::Graphite) {
+                    spelling.sanitize(&input.name)
+                } else {
+                    input.name.clone()
+                };
             let prefix = format!("{base}.");
             let dotted: Vec<usize> = (0..outs.len())
                 .filter(|&o| {
@@ -1086,13 +1143,16 @@ fn histogram_count(rec: &Rec) -> Option<u128> {
 /// Read-back `samples` or `set_members` records whose values together are `input`'s, or none.
 fn gather(input: &Rec, candidates: &[usize], outs: &[Rec]) -> Vec<usize> {
     let field = if input.kind == "samples" { "values" } else { "members" };
-    // A member compares by its sanitized text, since a sink may rewrite a reserved character.
+    // A member compares by its text with every character outside `[A-Za-z0-9._/-]` read as `_`,
+    // since a sink may rewrite a reserved character. It's looser than any sink's set, and only
+    // pairs members, never decides a row.
+    let loose = |c: char| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | '-'));
     let values = |rec: &Rec| -> Vec<String> {
         rec.body[field]
             .as_array()
             .into_iter()
             .flatten()
-            .map(|v| sanitized(&v.to_string()))
+            .map(|v| substituted(&v.to_string(), loose))
             .collect()
     };
     let mut want = values(input);
@@ -2105,6 +2165,96 @@ mod tests {
             observe_field(&field, &ins[0], &outs[0], Spelling::Statsd { dogstatsd: true }),
             Class::Normalized
         );
+    }
+
+    /// `statsd_out` writes a non-ASCII name and a `/` as they are, so neither reaches
+    /// `record/name_unsafe`; a space does.
+    #[test]
+    fn statsd_name_unsafe_is_the_encoders_set() {
+        let line = r#"{{T},"metrics":[{"name":"NAME","kind":"gauge","value":1.0}]}"#;
+        let rec = |name: &str| recs(&[&line.replace("NAME", name)]).remove(0);
+        for name in ["caf\u{e9}.load", "a/b", "a-b.c_d"] {
+            assert!(!record_features(&rec(name), PLAIN_STATSD).contains(&"name_unsafe"), "{name}");
+        }
+        assert!(record_features(&rec("queue depth"), PLAIN_STATSD).contains(&"name_unsafe"));
+    }
+
+    /// `graphite_out` writes `/`, `\`, `;`, and whitespace in a path as `_`, and nothing else.
+    #[test]
+    fn graphite_pairs_a_sanitized_path() {
+        let ins = recs(&[r#"{{T},"metrics":[{"name":"a/b c\\d","kind":"gauge","value":1.0}]}"#]);
+        let outs = recs(&[r#"{{T},"metrics":[{"name":"a_b_c_d","kind":"gauge","value":1.0}]}"#]);
+        assert_eq!(pair(&ins, &outs, Spelling::Graphite).seen, [Some(Class::Normalized)]);
+        assert_eq!(pair(&ins, &outs, Spelling::Verbatim).seen, [None]);
+        assert!(record_features(&ins[0], Spelling::Graphite).contains(&"name_unsafe"));
+        let plain = recs(&[r#"{{T},"metrics":[{"name":"café:x|y","kind":"gauge","value":1.0}]}"#]);
+        assert!(!record_features(&plain[0], Spelling::Graphite).contains(&"name_unsafe"));
+    }
+
+    /// An `f64` attribute in its `format: json` spelling reads back as the tag value
+    /// `graphite_out`'s encoder writes for it, a non-finite one through its `types` entry.
+    #[test]
+    fn graphite_reads_an_f64_tag_as_the_encoder_writes_it() {
+        let read = |json: &str, tags: &str| {
+            graphite_value(&serde_json::from_str(json).expect("a JSON value"), tags)
+        };
+        for (json, want) in [
+            ("3.0", "3"),
+            ("1e21", "1000000000000000000000"),
+            ("-0.0", "-0"),
+            ("0.25", "0.25"),
+            ("3", "3"),
+        ] {
+            assert_eq!(read(json, "").as_deref(), Some(want), "{json}");
+        }
+        for (json, want) in [(r#""NaN""#, "NaN"), (r#""inf""#, "inf"), (r#""-inf""#, "-inf")] {
+            assert_eq!(read(json, "/=f64").as_deref(), Some(want), "{json}");
+        }
+        let mut written = String::new();
+        for value in [3.0, 1e21, -0.0, 0.25, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(render_tag_value(&mut written, &logit_core::Value::F64(value)));
+            let json = if value.is_finite() {
+                serde_json::to_string(&value).expect("a finite f64")
+            } else {
+                format!("{written:?}")
+            };
+            let tags = if value.is_finite() { "" } else { "/=f64" };
+            assert_eq!(read(&json, tags).as_deref(), Some(written.as_str()), "{value}");
+        }
+    }
+
+    /// `graphite_out` writes a tag name's `!` and a tag value's whitespace and leading `~` as
+    /// `_`, an `f64` in its shortest form and a boolean as text, an array as its last
+    /// representable element, and no tag for a timestamp.
+    #[test]
+    fn graphite_pairs_rendered_tags() {
+        let ins = recs(&[concat!(
+            r#"{{T},"metrics":[{"name":"g","kind":"gauge","value":1.0}],"#,
+            r#""attributes":{"a!b":"~x y","f":3.0,"ok":true,"arr":["one",{"m":1}],"#,
+            r#""at":"2027-01-15T08:00:00.000000000Z"},"types":{"/attributes/at":"timestamp"}}"#
+        )]);
+        let outs = recs(&[concat!(
+            r#"{{T},"metrics":[{"name":"g","kind":"gauge","value":1.0}],"#,
+            r#""attributes":{"a_b":"_x_y","f":"3","ok":"true","arr":"one"}}"#
+        )]);
+        assert_eq!(pair(&ins, &outs, Spelling::Graphite).seen, [Some(Class::Exact)]);
+        let field = |key: &str| Field::Attribute { key: key.to_string(), resource: false };
+        let observe = |key: &str| observe_field(&field(key), &ins[0], &outs[0], Spelling::Graphite);
+        assert_eq!(observe("a!b"), Class::Normalized);
+        assert_eq!(observe("f"), Class::Normalized);
+        assert_eq!(observe("at"), Class::Lost);
+    }
+
+    /// A `graphite_out` expansion of a record whose path it sanitizes hangs off the sanitized
+    /// path.
+    #[test]
+    fn graphite_pairs_an_expansion_of_a_sanitized_path() {
+        let ins = recs(&[
+            r#"{{T},"metrics":[{"name":"a b","kind":"distribution","count":1,"sum":12.0,"min":12.0,"max":12.0,"avg":12.0,"p50":12.0,"p90":12.0,"p95":12.0,"p99":12.0,"sketch":{"mapping":"agent","stats_exact":true,"count":1.0,"min":12.0,"max":12.0,"positive":[{"key":1498,"count":1.0}]}}]}"#,
+        ]);
+        let outs = recs(&[r#"{{T},"metrics":[{"name":"a_b.count","kind":"gauge","value":1.0}]}"#]);
+        assert_eq!(pair(&ins, &outs, Spelling::Graphite).seen, [Some(Class::Degraded)]);
+        assert_eq!(pair(&ins, &outs, Spelling::Verbatim).seen, [None]);
     }
 
     /// An event with no metric, log, or span and no measurement carrier is one `event` record

@@ -1,0 +1,17 @@
+{
+  "cells": [
+    {"sink":"graphite_out","row":"attributes/foreign_carrier","cell":0,"observed":["lost"]},
+    {"sink":"graphite_out","row":"attributes/no_host","cell":0,"observed":["exact"]},
+    {"sink":"graphite_out","row":"attributes/string_value","cell":1,"observed":["exact"]},
+    {"sink":"graphite_out","row":"gauge/f64","cell":0,"observed":["exact"]},
+    {"sink":"graphite_out","row":"log/plain","cell":0,"observed":["skipped"]},
+    {"sink":"graphite_out","row":"record/no_recorded_value","cell":0,"observed":["skipped"]},
+    {"sink":"graphite_out","row":"record/superseded","cell":0,"observed":["exact"]},
+    {"sink":"graphite_out","row":"sum/cumulative_monotonic","cell":0,"observed":["degraded"]},
+    {"sink":"graphite_out","row":"sum/cumulative_nonmonotonic","cell":0,"observed":["degraded"]},
+    {"sink":"graphite_out","row":"sum/delta_monotonic","cell":0,"observed":["degraded"]},
+    {"sink":"graphite_out","row":"sum/i64","cell":0,"observed":[]},
+    {"sink":"graphite_out","row":"sum/u64","cell":0,"observed":[]}
+  ],
+  "unspecified": []
+}

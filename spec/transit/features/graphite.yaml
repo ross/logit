@@ -1,0 +1,67 @@
+# The carbon plaintext and pickle wire features a case under cases/graphite/ can exercise, from
+# crates/logit-proto/src/graphite/mod.rs's "Decode: wire → model" table. A case names the ones it
+# exercises in its `.meta.yaml`.
+- name: plaintext
+  text: >-
+    A `path value timestamp` line, decoded to one event holding one `f64` gauge named for the
+    path.
+- name: crlf
+  text: A line ending in `\r\n`, as a TCP sender writes it, read as one ending in `\n`.
+- name: whitespace_runs
+  text: Fields separated by runs of spaces and tabs, read as one separator each.
+- name: tags
+  text: A `;name=value` tag segment after the path, decoded to string event attributes.
+- name: duplicate_tag_key
+  text: >-
+    A tag key repeated on one line, keeping the last value, counted
+    `logit.input.tags.normalized{reason="duplicate_key"}`.
+- name: reserved_tag_key
+  text: >-
+    A tag name under the private `_logit.` prefix, omitted while the line still decodes, counted
+    `logit.input.tags.omitted{reason="reserved_prefix"}`.
+- name: tag_value_punctuation
+  text: A tag value holding `=` or `~`, kept whole, since only the first `=` splits a segment.
+- name: integer_value
+  text: An integer value, decoded to an `f64` gauge, since carbon's value is a double.
+- name: signed_value
+  text: A value written with an exponent (`1e5`) or a leading `+`.
+- name: negative_value
+  text: A negative value.
+- name: fractional_timestamp
+  text: A fractional timestamp, its sub-second part kept to the nanosecond.
+- name: receipt_time
+  text: The timestamp `-1`, carbon's sentinel for the receipt time.
+- name: utf8_path
+  text: A path holding non-ASCII UTF-8.
+- name: superseded
+  text: Several points of one series, one per read cycle, on one connection.
+- name: pickle_frame
+  text: >-
+    A pickled `[(path, (timestamp, value)), ...]` list behind a 4-byte big-endian length prefix,
+    as a TCP connection carries it, each datapoint decoded as a plaintext line is.
+- name: pickle_payload
+  text: One pickle payload with no length prefix, as the framer hands it to the decoder.
+- name: pickle_protocol_0
+  text: >-
+    Protocol 0's text opcodes: `MARK`, `LIST`, `STRING` paths, `INT`, `LONG`, and `FLOAT` lines,
+    `TUPLE`, `APPEND`, and a `PUT` memo.
+- name: pickle_protocol_2
+  text: >-
+    Protocol 2's binary opcodes: `PROTO`, `EMPTY_LIST`, `BINPUT`, `BINUNICODE`, `BININT1` or
+    `BININT`, `BINFLOAT`, `TUPLE2`, and `APPENDS` or `APPEND`.
+- name: pickle_protocol_5
+  text: >-
+    The opcodes protocol 4 and later add, which protocol 2 never writes: `FRAME`,
+    `SHORT_BINUNICODE`, and `MEMOIZE`.
+- name: pickle_python2
+  text: >-
+    A Python 2 payload: `STRING` paths in Python 2 `repr` form, a UTF-8 path escaped as
+    `\xc3\xa9`.
+- name: pickle_memo
+  text: A path written once and reused through the memo, by `GET` or `BINGET`.
+- name: pickle_tagged_path
+  text: A `;name=value` tag segment inside a pickled path, decoded as a plaintext line's tags.
+- name: pickle_long
+  text: >-
+    A Python `long` timestamp or value (`L…L` or `LONG1`), including an integer past `i64::MAX`
+    read as the nearest `f64`.

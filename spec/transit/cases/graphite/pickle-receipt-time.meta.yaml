@@ -1,0 +1,4 @@
+# A CPython 3.12 protocol-2 payload, read in place from testdata/differential/: the timestamp `-1`.
+wire: ../../../../testdata/differential/graphite-pickle/py3-ts-sentinel-int-p2.pkl
+protocol: pickle
+exercises: [pickle_payload, pickle_protocol_2, receipt_time]
