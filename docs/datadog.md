@@ -229,9 +229,8 @@ Two equal delta counts or `rate`s are two increments, and only one is sent, so t
 Distribution points aren't collapsed, because Datadog keeps both. A relay that
 keeps source timestamps from a source stamping several readings of one series in a second (an
 Agent's unaggregated `|T` gauges, `statsd_in` gauges, `internal`) shows a nonzero dropped count.
-Put a
-`dedup_timestamps` with `precision: 1s` last before the sink: it keeps the latest gauge and sums
-deltas. Two points of one series in one second that arrive in two batches are both sent, and
+Put a `dedup_timestamps` with `precision: 1s` last before the sink: it keeps the latest gauge and
+sums deltas and `rate`s of one interval. Two points of one series in one second that arrive in two batches are both sent, and
 Datadog keeps the later, uncounted (`docs/known-gaps/datadog.md`).
 
 The series route also names what it dropped from an accepted request in its `202` body, such as

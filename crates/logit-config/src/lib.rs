@@ -3488,8 +3488,9 @@ pub enum ComponentKind {
     /// them; a cumulative counter, histogram, or exponential histogram isn't sent, counted, so
     /// set an OpenTelemetry SDK to delta temporality. Datadog keeps one point per series per
     /// second, so of two series points of one series in one second of a request, the later is
-    /// sent and the earlier dropped and counted; put a `dedup_timestamps` with `precision: 1s`
-    /// last before this sink to sum two counts or keep the later gauge first.
+    /// sent and the earlier left off, counted dropped, or normalized when it's a gauge equal to
+    /// the later; put a `dedup_timestamps` with `precision: 1s` last before this sink to sum two
+    /// counts or rates or keep the later gauge first.
     DatadogOut {
         /// The Datadog API key, sent as `DD-API-KEY` on every request and never logged. Take it
         /// from the environment (`!env DD_API_KEY`) rather than writing it into the file. An
@@ -4259,10 +4260,12 @@ pub enum ComponentKind {
         /// A remote-write series holds one sample per millisecond, so of two readings of one
         /// series in one millisecond of a batch, the sink sends the later and leaves the earlier
         /// off, counted `logit.output.metrics.dropped{reason="duplicate_timestamp"}`. When the
-        /// earlier is a state (a gauge or a cumulative kind) equal to the later, nothing is lost,
-        /// and it counts `logit.output.metrics.normalized{reason="duplicate_timestamp"}` instead;
-        /// two equal sets of observations, a set's size included, are still two. To merge or collapse such
-        /// readings first, put a `dedup_timestamps` with `precision: 1ms` last before this sink.
+        /// earlier is a state (a gauge other than a Datadog `rate`, or a cumulative kind) equal
+        /// to the later, nothing is lost, and it counts
+        /// `logit.output.metrics.normalized{reason="duplicate_timestamp"}` instead; two equal
+        /// increments or sets of observations, a set's size included, are still two. To merge or
+        /// collapse such readings first, put a `dedup_timestamps` with `precision: 1ms` last
+        /// before this sink.
         #[serde(default)]
         endpoint: Option<String>,
         /// Which remote-write protocol version this sender writes, `1` or `2`. Defaults to `1`,

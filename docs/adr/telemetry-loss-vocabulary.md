@@ -283,8 +283,8 @@ millisecond as `output.metrics.dropped{reason="duplicate_timestamp"}`, in place 
 `sub_ms_collapsed`, the same-nanosecond case included, which no counter saw before.
 `datadog_out` counts each series point it leaves off because a later point of its series shares
 its second under the same name. Both name the remedy, `dedup_timestamps`, in a throttled
-`duplicate_timestamp` diagnostic. A removed state (a gauge or a cumulative kind) equal to the one
-sent loses nothing, so both sinks count it
+`duplicate_timestamp` diagnostic. A removed state (a gauge other than a Datadog `rate`,
+or a cumulative kind) equal to the one sent loses nothing, so both sinks count it
 `output.metrics.normalized{reason="duplicate_timestamp"}` instead: a relay or a retry resending
 identical points raises no loss alarm. An equal increment or observation set stays `dropped`:
 two equal delta counts or Datadog rates are two events, and two sets of size 1 can hold different

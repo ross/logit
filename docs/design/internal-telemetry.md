@@ -2571,11 +2571,12 @@ Some reasons exist only on one path:
   a later reading shares a millisecond with, at the same nanosecond or another, once per reading
   (a histogram reading counts once, not once per wire sample), with a throttled
   `duplicate_timestamp` diagnostic naming `dedup_timestamps` (`precision: 1ms`), or `aggregate`
-  for a live delta flow. The later reading is sent. A removed state (a gauge or a cumulative
-  kind) equal to the one sent (the point, each `f64` by its bits, the created
-  timestamp, and the exemplars) loses nothing, and counts `normalized{reason="duplicate_timestamp"}`
-  instead, with no diagnostic. A `samples` or distribution summary, or a set's size gauge, stays
-  `dropped` when equal: two equal sets of observations are two. The exposition
+  for a live delta flow. The later reading is sent. A removed state (a gauge other than a
+  Datadog `rate`, or a cumulative kind) equal to the one sent (the point, each `f64` by its bits,
+  the created timestamp, and the exemplars) loses nothing, and counts
+  `normalized{reason="duplicate_timestamp"}` instead, with no diagnostic. A `samples` or
+  distribution summary, a set's size gauge, or a `rate` stays `dropped` when equal: two equal
+  sets of observations or increments are two. The exposition
   registry's overwrite of a series between scrapes is the pull model's, and isn't counted.
 - `skipped{reason="no_recorded_value"}` means something narrower in sender mode. The encoder runs
   with `with_stale_markers(true)` there, so a flagged `Gauge`/`Sum`/marker-untyped record is written

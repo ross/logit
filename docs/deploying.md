@@ -2677,7 +2677,8 @@ before_remote_write:
   precision: 1ms
 ```
 
-`dedup_timestamps` keeps the latest gauge or cumulative reading and sums deltas, where the sink
+`dedup_timestamps` keeps the latest gauge or cumulative reading and sums deltas and Datadog
+`rate`s, where the sink
 can only keep one reading. A record it can't merge passes through, and the sink then drops it,
 counted. It works within one batch, so a later batch repeating a series and instant still reaches
 the destination twice (`docs/known-gaps/prometheus.md` and `docs/known-gaps/datadog.md`).

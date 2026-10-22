@@ -200,10 +200,10 @@
 //! **Duplicate timestamps.** One series holds one sample per millisecond. Given two in one
 //! request, Prometheus and Mimir answer `2xx`, keep the first, and drop the second silently, so
 //! the sink sends only the later reading of each series and millisecond in a batch. It counts
-//! each earlier one that's a state (a gauge or a cumulative kind) equal to the reading sent
-//! `logit.output.metrics.normalized{reason="duplicate_timestamp"}`, since the receiver stores the
-//! same sample, and every other one, a `samples` record's equal summary and a set's equal size
-//! gauge included,
+//! each earlier one that's a state (a gauge other than a Datadog `rate`, or a cumulative kind)
+//! equal to the reading sent `logit.output.metrics.normalized{reason="duplicate_timestamp"}`,
+//! since the receiver stores the same sample, and every other one, a `samples` record's equal
+//! summary, a set's equal size gauge, and an equal `rate` included,
 //! `logit.output.metrics.dropped{reason="duplicate_timestamp"}`, with a throttled
 //! `duplicate_timestamp` diagnostic (`logit_proto::prometheus`'s encode table). A sub-millisecond
 //! source (`statsd_in` gauges,
