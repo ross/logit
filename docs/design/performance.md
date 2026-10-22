@@ -330,8 +330,10 @@ form is the difference ("What moved since 2026-10-15", below).
 The scenarios added after the suite above was fixed ran on n's binary through a harness at
 `894e396e`, whose `crates/logit-perf` matches n's: two rounds of `--repeat 3`, pooled into six
 repeats per row. `lua-edit-jit` is `lua-edit.yaml` with `jit: true` on its `lua` component, a
-temporary copy that isn't committed. Four relays run past §0's 10 s wall target, and
-`otlp-relay-grpc` runs well short of 5 s.
+temporary copy that isn't committed. The Count column is what ran: five relays have been resized
+since, to land inside §0's 5–10 s wall target (`datadog-relay` and `splunk-hec-relay` 2M,
+`influxdb-relay` 5M, `prometheus-remote-write-relay` 3M, `otlp-relay-grpc` 4M), so their
+committed counts differ from the rows below.
 
 | Scenario | Count | events/s | events/s (min–max) | CPU µs/event | Peak RSS | Wall |
 |---|---:|---:|---:|---:|---:|---:|
