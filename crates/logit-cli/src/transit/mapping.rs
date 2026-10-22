@@ -32,7 +32,7 @@
 //! point shares its timestamp, and `record/same_millisecond` one whose later point falls at
 //! another nanosecond of its millisecond, which a wire stamping milliseconds can't tell apart.
 //! `record/same_instant_equal` and `record/same_millisecond_equal` are those two where the record
-//! is a state (a `gauge`, a set, or a cumulative kind) and the latest point of the series in its
+//! is a state (a `gauge` or a cumulative kind) and the latest point of the series in its
 //! millisecond is equal to it, so a sink that keeps one point loses nothing; an equal increment
 //! reaches the unequal row.
 //! `record/name_unsafe` is a name holding a character the sink's wire rewrites, which differs by

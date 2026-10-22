@@ -2649,14 +2649,14 @@ latest of a series' readings in one bucket, and count every other one:
 
 The sink keeps the later reading because Prometheus and Mimir would keep the first of two in one
 request, and Datadog the higher, and neither adds two deltas. A state is a reading a later one
-fully replaces: a gauge, a set written as its size, or a cumulative sum, histogram, or summary.
+fully replaces: a gauge, or a cumulative sum, histogram, or summary.
 An equal state loses nothing: the destination stores the same sample either way, so a relay or a
 retry resending identical points raises no loss alarm. Equal means the whole reading as the sink
 writes it: for remote-write, the sample or every bucket and quantile, the created timestamp, and
 the exemplars; for `datadog_out`, the value, type, unit, interval, source type, and origin. An
 increment or a set of observations (a delta count, a delta histogram, `samples`, a
-distribution) counts `dropped` even when equal: two equal ones are two sets of events, and only
-one is sent.
+distribution, a set) counts `dropped` even when equal: two equal ones are two sets of events, and
+only one is sent. Two sets `{alice}` and `{bob}` both write a size of 1, and their union is 2.
 
 A nonzero dropped count means the flow needs a `dedup_timestamps` component, placed last before
 the sink.

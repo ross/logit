@@ -200,9 +200,10 @@
 //! **Duplicate timestamps.** One series holds one sample per millisecond. Given two in one
 //! request, Prometheus and Mimir answer `2xx`, keep the first, and drop the second silently, so
 //! the sink sends only the later reading of each series and millisecond in a batch. It counts
-//! each earlier one that's a state (a gauge, a set, or a cumulative kind) equal to the reading
-//! sent `logit.output.metrics.normalized{reason="duplicate_timestamp"}`, since the receiver stores
-//! the same sample, and every other one, a `samples` record's equal summary included,
+//! each earlier one that's a state (a gauge or a cumulative kind) equal to the reading sent
+//! `logit.output.metrics.normalized{reason="duplicate_timestamp"}`, since the receiver stores the
+//! same sample, and every other one, a `samples` record's equal summary and a set's equal size
+//! gauge included,
 //! `logit.output.metrics.dropped{reason="duplicate_timestamp"}`, with a throttled
 //! `duplicate_timestamp` diagnostic (`logit_proto::prometheus`'s encode table). A sub-millisecond
 //! source (`statsd_in` gauges,
@@ -3468,6 +3469,32 @@ mod tests {
             assert_eq!(sum_of(&sums, DUPLICATE.0, DUPLICATE.1), 0.0, "{later}");
             let diagnostics = [("key", "duplicate_timestamp")];
             assert_eq!(sum_of(&sums, "logit.component.diagnostics", &diagnostics), 0.0, "{later}");
+        }
+    }
+
+    /// Two sets of one member each, `{alice}` and `{bob}`, both write a size gauge of `1`, but
+    /// their union is `2`: the earlier is a lost observation set, counted `dropped`, though the
+    /// two gauges are equal.
+    #[tokio::test]
+    async fn an_equal_size_set_with_other_members_is_counted_dropped() {
+        let members = |timestamp: i64, member: &'static str| {
+            Event::metric(
+                timestamp,
+                AttrMap::new(),
+                MetricRecord::new(
+                    intern("users"),
+                    MetricKind::SetMembers(vec![bytes::Bytes::from_static(member.as_bytes())]),
+                ),
+            )
+        };
+        let at = 1_700_000_000_000_000_000;
+        for later in [at, at + 1] {
+            let pair = vec![members(at, "alice"), members(later, "bob")];
+            let (sums, samples) = retried_remote_write(batch(pair)).await;
+            assert_eq!(samples, [(1.0, at / 1_000_000)], "{later}");
+            let reason = [("reason", "duplicate_timestamp")];
+            assert_eq!(sum_of(&sums, "logit.output.metrics.normalized", &reason), 0.0, "{later}");
+            assert_eq!(sum_of(&sums, DUPLICATE.0, DUPLICATE.1), 1.0, "{later}");
         }
     }
 

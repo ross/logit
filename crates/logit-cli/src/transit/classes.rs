@@ -1319,36 +1319,24 @@ fn same_millisecond(rec: &Rec, later: &Rec) -> bool {
     millis(rec).is_some() && millis(rec) == millis(later)
 }
 
-/// Whether `rec` and `later`, two points of one series, are one state as `sink` writes it: each a
-/// kind a later reading fully replaces ([`is_state`]), with the same metric object, attributes,
-/// and resource, private carriers included. `prometheus_out` writes a `set_members` record as its
-/// distinct member count, so there two records with as many members are one reading.
-fn same_reading(rec: &Rec, later: &Rec, sink: &str) -> bool {
-    if !is_state(rec) || !is_state(later) {
-        return false;
-    }
-    let written = |rec: &Rec| {
-        let mut body = rec.body.clone();
-        if sink == "prometheus_out" && rec.kind == "set_members" {
-            if let Some(members) = body.get("members").and_then(Value::as_array) {
-                let distinct: BTreeSet<String> = members.iter().map(Value::to_string).collect();
-                body["members"] = Value::from(distinct.len());
-            }
-        }
-        body
-    };
-    written(rec) == written(later)
+/// Whether `rec` and `later`, two points of one series, are one state: each a kind a later
+/// reading fully replaces ([`is_state`]), with the same metric object, attributes, and resource,
+/// private carriers included.
+fn same_reading(rec: &Rec, later: &Rec) -> bool {
+    is_state(rec)
+        && is_state(later)
+        && rec.body == later.body
         && rec.attributes == later.attributes
         && rec.resource == later.resource
 }
 
-/// Whether a later reading of `rec`'s series fully replaces it: a `gauge`, a set, or a cumulative
-/// `sum`, `histogram`, `exponential_histogram`, or `summary`. Any other kind is an increment or
-/// an observation set, so two equal ones are two sets of events (`logit_proto`'s
+/// Whether a later reading of `rec`'s series fully replaces it: a `gauge`, or a cumulative `sum`,
+/// `histogram`, `exponential_histogram`, or `summary`. Any other kind, a set included, is an
+/// increment or an observation set, so two equal ones are two sets of events (`logit_proto`'s
 /// `replaced_by_a_later_reading`).
 fn is_state(rec: &Rec) -> bool {
     match rec.kind.as_str() {
-        "gauge" | "set_members" | "set" => true,
+        "gauge" => true,
         "sum" | "histogram" | "exponential_histogram" | "summary" => {
             rec.body["temporality"] == "cumulative"
         }
@@ -1902,7 +1890,7 @@ pub(super) fn check(
             .copied()
             .filter(|&j| same_millisecond(input, &ins[j]))
             .max_by(|&a, &b| ins[a].timestamp.cmp(&ins[b].timestamp).then(a.cmp(&b)));
-        let equal = sent.filter(|&j| same_reading(input, &ins[j], &sink));
+        let equal = sent.filter(|&j| same_reading(input, &ins[j]));
         if twin.is_some() && collapsible {
             features.push(if equal.is_some() { "same_instant_equal" } else { "same_instant" });
         } else if twin.is_none() && collapsible && sent.is_some() {
