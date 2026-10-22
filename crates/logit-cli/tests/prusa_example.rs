@@ -5,8 +5,10 @@
 //! produces the points its comments and the example's README describe.
 //!
 //! The fixtures are two consecutive datagrams captured from one printer on firmware 7.0.0+16903.
+//! The script runs with the `vars:` `logit.yaml` gives it, which names that printer.
 
 use bytes::Bytes;
+use logit_config::{LuaVar, LuaVars};
 use logit_core::{interner, Event, EventBatch, MetricKind, MetricValue, Resource, Value};
 use logit_pipeline::runtime::process_batch;
 use logit_pipeline::test_util::TelemetryProbe;
@@ -31,6 +33,9 @@ const DATAGRAM_2: &[u8] = include_bytes!("fixtures/prusa-datagram-2.txt");
 
 const MAC: &str = "10:9c:70:2d:d5:c4";
 
+/// The name `logit.yaml`'s `vars.names` gives `MAC`.
+const NAME: &str = "mk4";
+
 /// The newest offset in `DATAGRAM_1`, `esp_out`'s, in microseconds.
 const NEWEST_OFFSET_US: i64 = 676_222;
 
@@ -39,8 +44,27 @@ fn script_source() -> String {
     fs::read_to_string(&path).unwrap_or_else(|e| panic!("reading {}: {e}", path.display()))
 }
 
+fn config_path() -> std::path::PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/prusa/logit.yaml")
+}
+
+/// The `prusa` component's `vars:` from `logit.yaml`. Read through a plain `Value`, because the
+/// file's `!env` tag needs `logit`'s own loader to resolve.
+fn shipped_vars() -> LuaVars {
+    let path = config_path();
+    let text =
+        fs::read_to_string(&path).unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
+    let config: serde_norway::Value = serde_norway::from_str(&text).unwrap();
+    serde_norway::from_value(config["components"]["prusa"]["vars"].clone())
+        .expect("the prusa component's vars should parse")
+}
+
 fn worker(probe: &TelemetryProbe) -> ScriptWorker {
-    ScriptWorker::new(&script_source())
+    worker_with(probe, &shipped_vars())
+}
+
+fn worker_with(probe: &TelemetryProbe, vars: &LuaVars) -> ScriptWorker {
+    ScriptWorker::new_with_vars(&script_source(), false, vars)
         .expect("examples/prusa/prusa.lua should load")
         .with_telemetry(probe.telemetry("prusa", "lua_file", "transform"))
         .expect("telemetry should install")
@@ -121,16 +145,23 @@ fn fixture_points() -> Vec<(String, i64)> {
 
 #[test]
 fn the_config_runs_the_pipeline_this_test_assumes() {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/prusa/logit.yaml");
+    let path = config_path();
     let text =
         fs::read_to_string(&path).unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
     assert!(text.contains("framing: datagram"), "printer_in should take one datagram per event");
     assert!(text.contains("lua_file: prusa.lua"), "logit.yaml should point at prusa.lua");
     assert!(text.contains("type: line_protocol"), "logit.yaml should parse the points");
+    let config: serde_norway::Value = serde_norway::from_str(&text).unwrap();
     assert!(
-        !text.lines().any(|line| line.trim_start().starts_with("bucket:")),
+        config["components"]["influx_out"].get("bucket").is_none(),
         "influx_out should follow the bucket the script carries"
     );
+    let vars = shipped_vars();
+    assert_eq!(vars.get("bucket"), Some(&LuaVar::String("prusa".into())));
+    match vars.get("names") {
+        Some(LuaVar::Map(names)) => assert_eq!(names.get(MAC), Some(&LuaVar::String(NAME.into()))),
+        other => panic!("vars.names should name the fixtures' printer, got {other:?}"),
+    }
 }
 
 #[test]
@@ -175,7 +206,8 @@ fn a_datagram_becomes_one_anchored_point_per_line() {
             Some(measurement.as_str()),
             "point {i}'s measurement"
         );
-        assert_eq!(attr(child, "mac_address"), Some(MAC), "point {i}'s mac_address");
+        assert_eq!(attr(child, "printer"), Some(NAME), "point {i}'s printer");
+        assert_eq!(attr(child, "mac_address"), None, "point {i} carries no mac_address");
         for (key, _) in child.attributes.iter() {
             let key = interner::resolve(key);
             assert!(!key.starts_with("syslog."), "point {i} still carries {key}");
@@ -248,7 +280,7 @@ fn a_gap_in_the_sequence_counts_the_missed_datagrams() {
         RECEIVED_AT + 2_500_000_000,
     );
     run_script(&w, resource, event);
-    assert_eq!(probe.sum("prusa.datagrams.missed", &[("mac_address", MAC)]), 4.0);
+    assert_eq!(probe.sum("prusa.datagrams.missed", &[("printer", NAME)]), 4.0);
     assert_eq!(probe.sum("prusa.datagrams.resync", &[]), 0.0);
 }
 
@@ -349,4 +381,55 @@ fn only_a_lone_v_field_is_renamed_to_value() {
     assert_eq!(attr(&points[0], "_logit.influxdb.field.value"), Some("7.0.0+16903"));
     assert_eq!(gauge(&points[1], "pair.v"), MetricValue::I64(1));
     assert_eq!(gauge(&points[1], "pair.w"), MetricValue::I64(2));
+}
+
+/// A printer `vars.names` doesn't list is tagged with its MAC address, on its points and its
+/// sequence counters, so it shows up before anyone names it.
+#[test]
+fn an_unnamed_printer_is_tagged_with_its_mac_address() {
+    const OTHER: &str = "10:9c:70:00:00:01";
+    let mut probe = TelemetryProbe::new();
+    let w = worker(&probe);
+    let datagram = |msg: u32| {
+        format!("<14>1 - {OTHER} buddy - - - msg={msg},tm=5000,v=4 cpu_usage v=73i 0\n")
+            .into_bytes()
+    };
+    let (resource, event) = decode(datagram(1).leak(), RECEIVED_AT);
+    let (resource, rewritten) = run_script(&w, resource, event);
+    let points = line_protocol(&probe, resource, rewritten).events;
+    assert_eq!(points.len(), 1);
+    assert_eq!(attr(&points[0], "printer"), Some(OTHER));
+
+    let (resource, event) = decode(datagram(4).leak(), RECEIVED_AT + 1_500_000_000);
+    run_script(&w, resource, event);
+    assert_eq!(probe.sum("prusa.datagrams.missed", &[("printer", OTHER)]), 2.0);
+}
+
+/// With no `vars:` at all, every printer is tagged with its MAC address and the bucket is
+/// `prusa`.
+#[test]
+fn with_no_vars_the_mac_address_and_the_default_bucket_apply() {
+    let probe = TelemetryProbe::new();
+    let w = worker_with(&probe, &LuaVars::new());
+    let (resource, event) = decode(DATAGRAM_1, RECEIVED_AT);
+    let (resource, rewritten) = run_script(&w, resource, event);
+    assert_eq!(
+        resource.attributes.get("_logit.influxdb.bucket").and_then(Value::as_str),
+        Some("prusa")
+    );
+    assert_eq!(attr(&rewritten, "printer"), Some(MAC));
+}
+
+/// `vars.bucket` names the bucket the batch carries.
+#[test]
+fn vars_bucket_names_the_batch_bucket() {
+    let probe = TelemetryProbe::new();
+    let vars = LuaVars::from([("bucket".to_string(), LuaVar::String("shop".into()))]);
+    let w = worker_with(&probe, &vars);
+    let (resource, event) = decode(DATAGRAM_1, RECEIVED_AT);
+    let (resource, _) = run_script(&w, resource, event);
+    assert_eq!(
+        resource.attributes.get("_logit.influxdb.bucket").and_then(Value::as_str),
+        Some("shop")
+    );
 }

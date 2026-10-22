@@ -1,6 +1,6 @@
 ---
 created: 2026-10-16
-updated: 2026-10-16
+updated: 2026-10-21
 ---
 
 # `route_signals`: a native signal router that splits a mixed event into one part per target
@@ -177,3 +177,42 @@ All three are tallied per batch and recorded only when nonzero.
 - Amendments, dated 2026-10-16: [ADR `target-components`](target-components.md),
   [ADR `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md), and
   [ADR `signal-filtering-components`](signal-filtering-components.md).
+
+## Amendment: a `none` target for an event that carries no signal (2026-10-21)
+
+**`signals:` takes an optional fourth key, `none`, the target for an event that arrives carrying no
+log, no metrics, and no span.** This decision assumed a payload-less event carries nothing any sink
+can act on, so discarding it lost nothing. The InfluxDB relay made that false: a point whose fields
+are all strings decodes to an event with only its `_logit.influxdb.*` carriers
+([ADR `influxdb-line-protocol-relay`](influxdb-line-protocol-relay.md)), and `influxdb_out` writes
+it. A `logit_in -> route_signals -> target -> influxdb_out` relay discarded every such point, a
+printer's `filament v="PLA"` among them.
+
+```yaml
+remote_by_signal:
+  type: route_signals
+  sources: [remote_in]
+  signals: {logs: remote_logs, metrics: remote_metrics, traces: remote_spans, none: remote_metrics}
+```
+
+- **The test reads the event on arrival**, before any strip. An event left empty only because
+  `strip: true` cleared its unlisted signals carried a signal the operator chose to drop, so it's
+  still discarded. Under `strip: false` an event carrying only unlisted signals is discarded too.
+- **`none` may share a target with another signal**, as two signals may. A payload-less event
+  goes to its target whole, once, as one part: it's routed, so it counts neither
+  `events.discarded` nor `events.copied`.
+- **It's opt-in.** Unset, an event that arrives empty is discarded and counted, as before. The
+  router doesn't read `_logit.influxdb.*` or any other protocol's carriers: a generic component
+  deciding by one protocol's private attributes would break
+  [ADR `private-attribute-namespace`](private-attribute-namespace.md)'s ignore rule. `none` names
+  the case by its shape instead, and covers any source that produces it.
+- **Graph.** `none`'s edge is keyed `none` in `logit graph`, and its target takes the last slot,
+  after `logs`, `metrics`, and `traces`. Rule 92 accepts a table that sets only `none`, and rejects
+  an empty `none` id as it does any other. Rule 92's reconvergence clause leaves `none`'s target
+  out of the co-marked set under `strip: false`: an event that reaches it reaches no other target.
+  When `none` shares a signal's target, that target is in the set through the signal.
+- **Telemetry.** "With all three signals listed, only an empty event is discarded" now holds only
+  when `none` is unset; with all four listed, `route_signals` discards nothing.
+
+The `signals:` vocabulary is shared with the three signal filters, which take `none` too
+([ADR `signal-filtering-components`](signal-filtering-components.md)'s 2026-10-21 amendment).
