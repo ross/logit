@@ -14,8 +14,10 @@
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"queue_depth","kind":"gauge","value":9.0}],"attributes":{"host.name":"transit","instance":"transit:9100","q":"b"}}
   ], "counters": {}},
   "help-unit": {"events": [
-    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"disk_bytes","kind":"gauge","value":1024.0,"unit":"bytes"}],"attributes":{"dev":"sda","host.name":"transit","instance":"transit:9100"}}
-  ], "counters": {}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"disk_bytes","kind":"gauge","value":1024.0}],"attributes":{"dev":"sda","host.name":"transit","instance":"transit:9100"}}
+  ], "counters": {
+    "logit.output.fields.omitted{component=out,kind=datadog_out,reason=unit_unmapped,role=sink}": 1
+  }},
   "histogram": {"events": [], "counters": {
     "logit.output.metrics.dropped{component=out,kind=datadog_out,reason=unresolved_cumulative,role=sink}": 1
   }},

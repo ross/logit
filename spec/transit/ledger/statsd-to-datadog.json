@@ -1,7 +1,7 @@
 {
   "cells": [
     {"sink":"datadog_out","row":"attributes/array_value","cell":0,"observed":["exact"]},
-    {"sink":"datadog_out","row":"attributes/bool_value","cell":0,"observed":["exact","lost"]},
+    {"sink":"datadog_out","row":"attributes/bool_value","cell":0,"observed":["exact","normalized"]},
     {"sink":"datadog_out","row":"attributes/bytes_value","cell":0,"observed":["lost"]},
     {"sink":"datadog_out","row":"attributes/foreign_carrier","cell":0,"observed":["exact","normalized","lost"]},
     {"sink":"datadog_out","row":"attributes/log_status","cell":0,"observed":["normalized"]},
@@ -45,7 +45,7 @@
     {"sink":"datadog_out","row":"record/service_check","cell":0,"observed":["exact"]},
     {"sink":"datadog_out","row":"record/start_timestamp","cell":0,"observed":["lost"]},
     {"sink":"datadog_out","row":"record/superseded","cell":0,"observed":["exact"]},
-    {"sink":"datadog_out","row":"record/unit","cell":0,"observed":["exact"]},
+    {"sink":"datadog_out","row":"record/unit","cell":0,"observed":["normalized"]},
     {"sink":"datadog_out","row":"record/unit_on_distribution","cell":0,"observed":["lost"]},
     {"sink":"datadog_out","row":"samples","cell":0,"observed":["exact"]},
     {"sink":"datadog_out","row":"set","cell":0,"observed":["degraded"]},

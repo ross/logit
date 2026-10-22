@@ -1350,9 +1350,13 @@ rows:
             OpenMetrics writes `# UNIT` only when `_<unit>` ends the family name; otherwise it's
             left off, counted.
       datadog_out:
-        class: exact
+        class: lost
+        counter: logit.output.fields.omitted{reason=unit_unmapped}
         text: >-
-          The series' `unit`.
+          The series' `unit` as Datadog names it, mapped as Datadog's OTel exporter maps a UCUM
+          unit (`ms` as `millisecond`, `By/s` as `byte/second`, `{request}` as `request`); a
+          Datadog unit name leaves as it is. A unit with no Datadog name, `1` included, is left
+          off, counted once per record.
       graphite_out:
         class: lost
         reason: structural
@@ -2009,7 +2013,9 @@ rows:
           A `key:value` tag. A `host` attribute on a metric with no `host.name` is the host and not
           a tag, which datadog_in reads back as `host.name`. On a Datadog event or service check
           with no non-empty host carrier, `host.name`, else `host`, is the host and not a tag,
-          which datadog_in reads back as that carrier.
+          which datadog_in reads back as that carrier. A `collectd.host` on a record with none of
+          those, or on a log with no `hostname`, `host.name`, `syslog.hostname`, or `host`, is the
+          host and not a tag or log attribute, read back where that route's host reads back.
       graphite_out:
         - when: {tags: drop}
           class: lost
@@ -2052,11 +2058,11 @@ rows:
         class: exact
         text: A boolean attribute.
       datadog_out:
-        class: lost
-        counter: logit.output.tags.omitted{reason=unrepresentable}
+        class: normalized
+        reason: bool_tag
         text: >-
-          `true` is a bare `key` tag, read back as `true`; `false` has no Datadog tag form, so it
-          writes no tag and is counted.
+          `true` is a bare `key` tag and reads back `true`; `false` is `key:false` and reads back as
+          the string.
       graphite_out:
         - when: {tags: drop}
           class: lost
@@ -2498,7 +2504,8 @@ rows:
         class: normalized
         reason: default_host
         text: >-
-          A record with no host and no hostless mark leaves with the process hostname as its host,
+          A record with no host, no `collectd.host`, and no hostless mark leaves with the process
+          hostname as its host,
           which datadog_in reads back as `host.name`, a log's `hostname`, or an event's or service
           check's host carrier; a span keeps its own hostnames.
       graphite_out:

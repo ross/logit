@@ -18,7 +18,7 @@
     {"sink":"datadog_out","row":"histogram/gauge_histogram","cell":0,"observed":[]},
     {"sink":"datadog_out","row":"record/description","cell":0,"observed":["lost"]},
     {"sink":"datadog_out","row":"record/non_finite","cell":0,"observed":["dropped"]},
-    {"sink":"datadog_out","row":"record/unit","cell":0,"observed":["exact"]},
+    {"sink":"datadog_out","row":"record/unit","cell":0,"observed":["lost"]},
     {"sink":"datadog_out","row":"sum/cumulative_monotonic","cell":0,"observed":["dropped"]},
     {"sink":"datadog_out","row":"sum/f64","cell":0,"observed":[]},
     {"sink":"datadog_out","row":"summary/cumulative","cell":0,"observed":["degraded"]}
