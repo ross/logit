@@ -358,8 +358,7 @@ silently ignored. `0` for a count or duration bound is usually impossible, not s
 19. An empty `trace_context` `trace_id`, `span_id`, or `flags` field name, after `format`'s
     defaults.
 20. A `scale` with no `fields`, an empty field name, or a non-finite factor.
-21. An empty `signals:` list, all three payload signals on `keep_signals`/`drop_signals`, or
-    `none` on `drop_signals`.
+21. An empty `signals:` list, or all three payload signals on `drop_signals`.
 22. An `otlp_out` header the transport sets itself, or two that differ only in case.
 23. An `otlp_out` `paths:` under `protocol: grpc`.
 24. An inconsistent `otlp_out` `tls:`, or one under a non-`https://` endpoint.

@@ -63,10 +63,10 @@
 //!     (`docs/adr/log-record-trace-context.md`).
 //! 20. A `scale` with no `fields`, an empty field name, or a non-finite factor
 //!     (`docs/adr/scale-transform.md`).
-//! 21. An empty `signals:` on `has_signal`/`keep_signals`/`drop_signals`, all three payload
-//!     signals on `keep_signals`/`drop_signals`, or `none` on `drop_signals`. Which shape is the
-//!     black hole and which the no-op is opposite between those two, so each message names the
-//!     right one; `drop_signals` has no payload to clear on an event carrying none
+//! 21. An empty `signals:` on `has_signal`/`keep_signals`/`drop_signals`, or all three payload
+//!     signals on `drop_signals`. A `keep_signals` naming all three payload signals is legal: it
+//!     drops an event that arrived with no payload. `none` on `drop_signals` is legal and
+//!     changes nothing, since `drop_signals` drops such an event regardless
 //!     (`docs/adr/signal-filtering-components.md`).
 //! 22. An `otlp_out` `headers:` name that is empty, `:`-prefixed, `grpc-*`, in
 //!     `RESERVED_OTLP_HEADERS`, or a case-insensitive duplicate: the transport sets those itself,
@@ -692,7 +692,7 @@ fn interval(kind: &ComponentKind) -> Option<Duration> {
 }
 
 /// `true` if `signals` names all three of `Logs`/`Metrics`/`Traces`: rule 21's test for
-/// `keep_signals`/`drop_signals`.
+/// `drop_signals`.
 fn names_all_three(signals: &[logit_config::Signal]) -> bool {
     signals.contains(&logit_config::Signal::Logs)
         && signals.contains(&logit_config::Signal::Metrics)
@@ -1582,12 +1582,11 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
     }
 
     // Rule 21: `has_signal`/`keep_signals`/`drop_signals` need a non-empty `signals:`, and
-    // `keep_signals`/`drop_signals` may not name all three payload signals. For an allowlist,
-    // empty keeps nothing (black hole) and all three keeps every payload (a no-op on any event
-    // carrying one); a denylist is the mirror. Both are rejected, but each message must name the
-    // right failure. `drop_signals` may not name `none`: it has no payload to clear, and an event
-    // carrying nothing is dropped already. `has_signal` naming all three stays legal: under
-    // `mode: only` it forwards anything with a payload.
+    // `drop_signals` may not name all three payload signals, which would drop every event.
+    // `keep_signals` naming all three stays legal: it keeps every payload and drops an event
+    // that arrived with none. `drop_signals` naming `none` stays legal and changes nothing: it
+    // drops an event that carries nothing regardless. `has_signal` naming all three stays
+    // legal: under `mode: only` it forwards anything with a payload.
     for (id, component) in &components {
         match &component.kind {
             ComponentKind::HasSignal { signals, .. } => {
@@ -1605,13 +1604,6 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                          list keeps nothing, dropping every event"
                     );
                 }
-                if names_all_three(signals) {
-                    anyhow::bail!(
-                        "component '{id}': 'signals' names all three signals -- that keeps \
-                         everything, a no-op on every event carrying a payload; use has_signal \
-                         to drop an event carrying none"
-                    );
-                }
             }
             ComponentKind::DropSignals { signals } => {
                 if signals.is_empty() {
@@ -1624,13 +1616,6 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                     anyhow::bail!(
                         "component '{id}': 'signals' names all three signals -- that drops \
                          everything, dropping every event"
-                    );
-                }
-                if signals.contains(&logit_config::Signal::None) {
-                    anyhow::bail!(
-                        "component '{id}': drop_signals 'signals' may not name none -- an event \
-                         carrying no payload has nothing to clear, and drop_signals already drops \
-                         it"
                     );
                 }
             }
@@ -5887,10 +5872,10 @@ mod tests {
     }
 
     #[test]
-    fn a_keep_signals_naming_all_three_signals_is_rejected_as_a_no_op_not_a_black_hole() {
-        // The inverse of the drop_signals case above: for keep_signals (an allowlist), naming
-        // all three signals keeps everything -- a no-op, not the "drop every event" black hole.
-        let err = expect_err(cfg(vec![
+    fn a_keep_signals_naming_all_three_signals_resolves() {
+        // Naming all three keeps every payload and drops an event that arrived with none, so it
+        // is a filter, not a no-op. `KeepSignals`' own tests pin the drop.
+        resolve(cfg(vec![
             ("in", vec![], listener()),
             (
                 "filter",
@@ -5904,39 +5889,21 @@ mod tests {
                 },
             ),
             ("out", vec!["filter"], sink()),
-        ]));
-        assert!(err.contains("names all three signals"), "got: {err}");
-        assert!(
-            err.contains("keeps everything") && err.contains("no-op"),
-            "a keep_signals naming all three signals is the no-op shape (keeps every event \
-             untouched), not the black-hole shape -- got: {err}"
-        );
+        ]))
+        .expect("keep_signals naming every payload signal is legal");
     }
 
     #[test]
-    fn a_drop_signals_naming_none_is_rejected() {
-        let err = expect_err(cfg(vec![
-            ("in", vec![], listener()),
-            (
-                "filter",
-                vec!["in"],
-                ComponentKind::DropSignals {
-                    signals: vec![logit_config::Signal::Metrics, logit_config::Signal::None],
-                },
-            ),
-            ("out", vec!["filter"], sink()),
-        ]));
-        assert!(err.contains("may not name none"), "got: {err}");
-    }
-
-    #[test]
-    fn has_signal_and_keep_signals_naming_none_resolve() {
+    fn every_signal_filter_naming_none_resolves() {
         for kind in [
             ComponentKind::HasSignal {
                 signals: vec![logit_config::Signal::None],
                 mode: logit_config::MatchMode::Only,
             },
             ComponentKind::KeepSignals {
+                signals: vec![logit_config::Signal::Metrics, logit_config::Signal::None],
+            },
+            ComponentKind::DropSignals {
                 signals: vec![logit_config::Signal::Metrics, logit_config::Signal::None],
             },
         ] {
@@ -5968,8 +5935,8 @@ mod tests {
 
     #[test]
     fn a_has_signal_naming_all_three_signals_resolves_fine() {
-        // Unlike `keep_signals`/`drop_signals`, `has_signal` naming all three signals is a real,
-        // permissive filter under `mode: only` ("forward anything with a payload"), not a no-op.
+        // Unlike `drop_signals`, `has_signal` naming all three signals is a real, permissive
+        // filter under `mode: only` ("forward anything with a payload"), not a black hole.
         resolve(cfg(vec![
             ("in", vec![], listener()),
             (

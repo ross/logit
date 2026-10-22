@@ -81,13 +81,12 @@ reason other than `aggregate`'s accumulation.
 
 **Config validation (rule 21, `logit-pipeline::graph::resolve`).** An empty `signals:` list is
 rejected on all three — the same silent-black-hole failure rule 7 already guards against elsewhere.
-`keep_signals`/`drop_signals` additionally reject naming all three signals. Which shape is the
-black hole and which is the no-op is *opposite* between the two: `keep_signals` (an allowlist)
-naming nothing keeps nothing — black hole — while naming everything keeps everything — a no-op,
-every event forwarded untouched; `drop_signals` (a denylist) is the mirror, naming everything is
-the black hole and naming nothing the no-op. Both shapes are rejected either way for both kinds —
-a no-op component is as much a config mistake as a black-hole one — but the validation error names
-the right one, not "drop every event" for a case that actually keeps every event. `has_signal`
+`drop_signals` additionally rejects naming all three signals. Which shape is the black hole and
+which is the no-op is *opposite* between the two: `keep_signals` (an allowlist) naming nothing
+keeps nothing — black hole — while `drop_signals` (a denylist) naming everything is the black
+hole and naming nothing the no-op. Both shapes are rejected where they apply, and the validation
+error names the right failure, not "drop every event" for a case that keeps every event. (The
+2026-10-21 amendment below lifts the rejection of `keep_signals` naming all three.) `has_signal`
 naming all three signals is deliberately *not* rejected: under `mode: only` that's a real, if
 permissive, "forward anything with a payload" filter, not a no-op — unlike the other two,
 `has_signal` never mutates, so there's no equivalent "keeps/strips everything" pair to catch.
@@ -164,10 +163,19 @@ reads it decides what `none` means:
 - **`keep_signals`** forwards an event that arrived with no payload when `none` is listed, and
   drops it otherwise, as before. An event its own strip emptied is still dropped: it carried a
   payload the list chose to clear.
-- **`drop_signals`** rejects `none` at validation (rule 21). It has no payload to clear, and
-  `drop_signals` already drops an event that carries nothing, so listing it could only be a
-  mistake.
+- **`drop_signals`** accepts `none` and it changes nothing: `drop_signals` already drops an event
+  that carries nothing. (The 2026-10-21 amendment below lifted the validation error.)
 
-Rule 21's "naming all three" checks still read `logs`, `metrics`, and `traces`. A `keep_signals`
-naming those three keeps every payload; its message now points at `has_signal` for dropping an
-event that carries none. No component reads a protocol's `_logit.*` carriers to decide this.
+No component reads a protocol's `_logit.*` carriers to decide this.
+
+## Amendment: `keep_signals` may name all three signals (2026-10-21)
+
+Rule 21 no longer rejects a `keep_signals` naming `logs`, `metrics`, and `traces`. The rejection
+rested on that list being a no-op, and the `none` selector above made it false: such a list keeps
+every payload and drops an event that arrived with none, which a list can't otherwise express
+short of `has_signal`. A config that says so is doing something, and `logit` does what it says
+even where the result is odd; it can't protect an operator from every odd config. The same
+amendment lifts rule 21's rejection of `none` on `drop_signals`. Listing it changes nothing,
+because `drop_signals` drops an event that arrives with no payload either way, so the list says
+what it does. `drop_signals` still rejects an empty list and naming all three, so rule 21 keeps its
+number.

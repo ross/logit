@@ -2773,13 +2773,14 @@ pub enum ComponentKind {
     /// log and derived metrics loses the metrics under `signals: [logs]` but keeps the log. An
     /// event left with no payload is dropped. Listing `none` keeps an event that arrived with no
     /// payload; without it, such an event is dropped. `signals` may not be empty (that would drop
-    /// every event) and may not name `logs`, `metrics`, and `traces` together (that keeps every
-    /// payload; use `has_signal` to drop an event carrying none).
+    /// every event). Naming `logs`, `metrics`, and `traces` together keeps every payload and drops
+    /// an event that arrived with none.
     KeepSignals { signals: Vec<Signal> },
     /// Clears the listed signals' payloads on every event, keeping the rest: the mirror of
     /// `keep_signals`. An event left with no payload is dropped, as is one that arrived with
-    /// none. `signals` may not be empty (a no-op), may not name all three signals (that would drop
-    /// every event), and may not name `none` (there is no payload to clear).
+    /// none. `signals` may not be empty (a no-op) and may not name all three signals (that would
+    /// drop every event). Listing `none` changes nothing: an event that arrived with no payload is
+    /// dropped either way.
     DropSignals { signals: Vec<Signal> },
     /// Forwards an event whose batch resource and/or own attributes match every configured pair
     /// and carry every listed key, dropping the rest. `resource:` and `attributes:` are `set`'s
