@@ -1,6 +1,6 @@
 ---
 created: 2026-09-10
-updated: 2026-10-18
+updated: 2026-10-21
 ---
 
 # Attribute filtering is two transform components, and a bounded matcher is not a predicate language
@@ -155,19 +155,20 @@ bool). A non-finite configured or actual value matches nothing, inherited from `
 
 ### Validation
 
-At least one of `resource`/`attributes` must be non-empty; every key must be non-empty; every
-numeric value must be finite. The black-hole/no-op assignment for the empty-config case is
-*inverted* relative to `has_signal`'s family (rule 21): there, an allowlist (`keep_signals`) naming
-nothing is the black hole, because `signals:` is a list of alternatives and an empty list satisfies
-nothing. Here, `resource:`/`attributes:` is a map of *conjunctions*, and a conjunction over zero
-pairs is vacuously true -- `has_attributes` with nothing configured therefore matches *every* event
-(a no-op, forwarding everything untouched), and `drop_attributes` with nothing configured, being its
-exact complement, also matches every event, which for a denylist means dropping every one of them (a
-black hole). The same key appearing in both `resource:` and `attributes:` is deliberately *not*
-rejected: the two maps address different objects (the batch vs. the event), so that configuration
-is meaningful, not a mistake. `set`'s own empty-key gap (rule 12 previously checked only for "both
-maps empty," not an individual empty key) is closed in the same change, so the "config is exactly
-`set`'s config" claim above stays true of validation, not just of the type.
+Every key must be non-empty, and every numeric value must be finite. Both maps may be empty (see
+"Amendment: an empty match is legal" below). The black-hole/no-op assignment for the empty-config
+case is *inverted* relative to `has_signal`'s family: there, an allowlist (`keep_signals`) naming
+nothing keeps nothing and drops every event, because `signals:` is a list of alternatives and an
+empty list satisfies nothing. Here, `resource:`/`attributes:` is a map of *conjunctions*, and a
+conjunction over zero pairs is vacuously true -- `has_attributes` with nothing configured therefore
+matches *every* event (a no-op, forwarding everything untouched), and `drop_attributes` with nothing
+configured, being its exact complement, also matches every event, which for a denylist means
+dropping every one of them (a black hole). The same key appearing in both `resource:` and
+`attributes:` is deliberately *not* rejected: the two maps address different objects (the batch vs.
+the event), so that configuration is meaningful, not a mistake. `set`'s own empty-key gap (rule 12
+previously checked only for "both maps empty," not an individual empty key) is closed in the same
+change, so the "config is exactly `set`'s config" claim above stays true of validation, not just of
+the type.
 
 ### Where the matcher lives
 
@@ -178,7 +179,7 @@ validate_semantics` is literally `graph::resolve(config)?`, so anything not chec
 `logit-core` is the only crate both `logit-pipeline` (which owns `graph::resolve`) and
 `logit-transforms` (which would own the transform) can share without a dependency cycle. That
 argument does not apply here: rule 36 (`crates/logit-pipeline/src/graph.rs`) checks only
-non-emptiness, empty keys, and finiteness -- all pure `logit-config` data, no `Value` comparison at
+empty keys, repeated keys, and finiteness -- all pure `logit-config` data, no `Value` comparison at
 all. The value matcher (`value_matches`, `crates/logit-transforms/src/lib.rs`) is never called from
 validation, so it stays `pub(crate)` in `logit-transforms`, beside `numeric`, which makes the same
 placement argument for itself already.
@@ -189,7 +190,7 @@ placement argument for itself already.
   `drop_signals` and `logfmt`/`kv` precedent ("separate kinds sharing a module" over "one kind with
   a mode field") -- and for a reason specific to this pair: a mode flag would make rule 36's
   black-hole-vs-no-op error message conditional on a field's *value* rather than on the component's
-  *kind*, which is exactly the confusion rule 21 already exists to avoid for `has_signal`'s family.
+  *kind*, which would make one message mean two things.
 - **A third kind, or a `mode: any_of` field, for "any of these pairs matches."** Rejected per the
   composability principle above: N sibling single-pair `has_attributes` components already express
   it, since fan-in is free, and a mode flag would be a second way to spell something the graph
@@ -275,12 +276,11 @@ http_only:
   every listed key is present, and `drop_attributes` drops only when all of that holds, forwarding
   the rest. The complement is still taken as a whole, so a missing key makes `drop_attributes`
   forward the event, as an unmatched pair does.
-- **Validation.** Rule 36 gains four conditions. At least one of the four fields must be
-  non-empty. Every listed key must be non-empty. A key may not repeat within a list. A key may not
-  appear in both `attributes` and `attributes_present`, or in both `resource` and
-  `resource_present`, because the pair already requires the key; the redundancy reads like a
-  mistake. A key in `resource_present` and `attributes_present` together stays legal, for the
-  reason the maps' shared key does.
+- **Validation.** Rule 36 gains three conditions. Every listed key must be non-empty. A key may not
+  repeat within a list. A key may not appear in both `attributes` and `attributes_present`, or in
+  both `resource` and `resource_present`, because the pair already requires the key; the redundancy
+  reads like a mistake. A key in `resource_present` and `attributes_present` together stays legal,
+  for the reason the maps' shared key does.
 - **A list, not a null value in the map.** `SetValue` has no null variant, and a `key:` with
   nothing after it reads as a typo rather than a presence test. A list names the intent.
 - **The earlier text changes in two places.** "Key present with any value is not expressible"
@@ -305,3 +305,14 @@ Under [ADR `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md), `has_attr
 either removes is `logit.component.events.discarded`, which the runtime counts under the filter's
 id; the shared `logit.transform.events.filtered` counter they registered is removed, because it
 duplicated that count.
+
+## Amendment: an empty match is legal (2026-10-21)
+
+Rule 36 no longer rejects a `has_attributes` or `drop_attributes` whose `resource`,
+`attributes`, `resource_present`, and `attributes_present` are all empty. A conjunction over
+nothing is true, so the component matches every event: `has_attributes` forwards every event,
+and `drop_attributes` discards every event, counted as `logit.component.events.discarded`.
+Validation rejects a config only when it can't run, or when it would lose or duplicate data the
+operator didn't ask to lose or duplicate; a `drop_attributes` with nothing configured loses every
+event, but it's a loss the config states. Rule 36 keeps its empty-key, non-finite-value,
+repeated-key, and map-and-list redundancy checks.

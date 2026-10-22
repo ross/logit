@@ -89,7 +89,3 @@ components:
     sources: [shape_rollup]
     path: /out/shape.log
     format: json
-    rotate:
-      # `file_out` requires a rotation trigger, and a survey that rotated would lose the start of
-      # its own capture.
-      max_bytes: "64GiB"

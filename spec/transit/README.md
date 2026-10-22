@@ -96,7 +96,8 @@ is one nothing checks: add a case or a flow that reaches it.
   `event/attributes_only`), and the `record` rows that decide a record's fate
   (`no_recorded_value`, `no_recorded_value_delta_sum`, `no_recorded_value_other_kind`,
   `service_check`, `name_unsafe`, `exemplar_key_unsafe`, `exemplar_key_unsafe_histogram`,
-  `sample_rate`, `non_finite`, `superseded`, `same_instant`, `same_millisecond`): `exact`, `normalized`, `degraded`, `skipped`, or `dropped`, best to worst.
+  `sample_rate`, `non_finite`, `superseded`, `same_instant`, `same_instant_equal`,
+  `same_millisecond`, `same_millisecond_equal`): `exact`, `normalized`, `degraded`, `skipped`, or `dropped`, best to worst.
 - **Field level**, for the `record` rows `unit`, `description`, `start_timestamp`, `exemplars`,
   `exemplars_on_summary`, `unit_on_distribution`, `min_max`, and `sample_rate_unweighted`, every `attributes` row, and a log or span beside metrics
   (`beside_metrics`), which is a field of its event: `exact`, `normalized`, or `lost`.
@@ -120,11 +121,18 @@ loss where that loss's counter didn't move, since most sinks test the flag first
 
 Each row is a `kind` and, for a kind that has them, a `feature`. `cells` maps a sink to what it
 does. A cell has a `class`, a `text` sentence for an operator, a `reason` (required on a
-`normalized` cell), and the `counter` series it counts under (required on a `skipped`, `dropped`,
-or `lost` cell unless its reason is `uncounted`). An `uncounted` loss is the sink's behavior as it
-stands, recorded so the table says so, not an endorsement. When a sink's behavior depends on its
-config, the sink's entry is a list: each cell but the last has a `when:` map of config fields, the
-first that matches the flow's sink config applies, and the last applies otherwise:
+`normalized` cell), and the `counter` series it counts under. A `skipped`, `dropped`, or `lost`
+cell names its counter, except a `lost` cell whose reason is `structural`: the destination's
+format has no slot for the field, so every record loses it, the table is its record, and no
+counter would add anything
+([ADR `telemetry-loss-vocabulary`](../../docs/adr/telemetry-loss-vocabulary.md)'s amendment
+"structural loss has no counter"). A loss that depends on the value, such as `false` or a
+rewritten name, is counted. The table's schema accepts `reason: uncounted`, the sink's behavior
+as it stands, only on the cells `crates/logit-cli/src/transit/mapping.rs`'s `UNCOUNTED_ALLOWED`
+names: log and span payloads, `datadog_out`'s carrier on a log among them, not yet classified.
+When a sink's behavior depends on its config, the sink's entry is a list: each cell but the last
+has a `when:` map of config fields, the first that matches the flow's sink config applies, and
+the last applies otherwise:
 
 ```yaml
 - kind: distribution
@@ -158,12 +166,18 @@ loses or invents observations pairs nothing, and the check fails. A record's exp
 the record-level cells it reaches, and the observed class must equal it. A `normalized` cell also
 accepts `exact`, because a normalization touches only the shapes it names. A field may read back
 better than its cell, never worse. Every sink counter the run moved must be named by a cell the
-case reached, and a loss cell observed at its class must see its counter move. Across every
+case reached, and a loss cell observed at its class must see its counter move. A record nothing
+reads back is credited to the class of the counter that moved, or of a cell whose loss is
+`uncounted`, with one exception: under `prometheus_out` exposition, a record whose series has a
+later record read back was overwritten in the registry, so it reads at its expected class when
+that's `normalized` or `degraded`. Across every
 flow, every `normalized` or `lost` cell a record reached must be observed at that class at least
 once; the `ledger` test checks this from the flows' ledger files.
 
 `crates/logit-cli/src/transit/classes.rs`'s module doc has the rules in full: which rows a record
 reaches, how records pair, and what each failure message names.
+[`docs/known-gaps/mappings.md`](../../docs/known-gaps/mappings.md) lists where the check misreads
+`graphite_out`, including why only a gauge-only flow runs `tags: drop`.
 
 ### Counters no row names yet
 

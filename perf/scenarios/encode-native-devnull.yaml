@@ -5,8 +5,6 @@
 # docs/design/performance.md, "Scenarios".
 #
 #   script/perf run --scenario encode-native-devnull
-#
-# `rotate:` is required for the reason encode-human-devnull gives.
 components:
   gen:
     type: generate_in
@@ -25,5 +23,3 @@ components:
     sources: [gen]
     path: /dev/null
     format: native
-    rotate:
-      max_bytes: "100GiB"

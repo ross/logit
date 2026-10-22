@@ -1,18 +1,31 @@
 {
+  "pickle-p0": {"events": [
+    {"timestamp":"2023-11-14T22:13:24.000000000Z","metrics":[{"name":"logit-fixture.pickle.float_value","kind":"gauge","value":12.75}]},
+    {"timestamp":"2023-11-14T22:13:24.000000000Z","metrics":[{"name":"logit-fixture.pickle.int_value","kind":"gauge","value":42.0}]},
+    {"timestamp":"2023-11-14T22:13:24.000000000Z","metrics":[{"name":"logit-fixture.pickle.large_value","kind":"gauge","value":1234567.0}]},
+    {"timestamp":"2023-11-14T22:13:24.000000000Z","metrics":[{"name":"logit-fixture.pickle.negative_value","kind":"gauge","value":0.0}]},
+    {"timestamp":"2023-11-14T22:13:24.000000000Z","metrics":[{"name":"logit-fixture.pickle.negative_value","kind":"gauge_delta","delta":-17.5}]}
+  ], "counters": {
+    "logit.output.metrics.degraded{component=out,kind=statsd_out,reason=negative_gauge,role=sink}": 1
+  }},
   "pickle-p2": {"events": [
     {"timestamp":"2023-11-14T22:13:24.000000000Z","metrics":[{"name":"logit-fixture.pickle.float_value","kind":"gauge","value":12.75}]},
     {"timestamp":"2023-11-14T22:13:24.000000000Z","metrics":[{"name":"logit-fixture.pickle.int_value","kind":"gauge","value":42.0}]},
     {"timestamp":"2023-11-14T22:13:24.000000000Z","metrics":[{"name":"logit-fixture.pickle.large_value","kind":"gauge","value":1234567.0}]},
     {"timestamp":"2023-11-14T22:13:24.000000000Z","metrics":[{"name":"logit-fixture.pickle.negative_value","kind":"gauge","value":0.0}]},
     {"timestamp":"2023-11-14T22:13:24.000000000Z","metrics":[{"name":"logit-fixture.pickle.negative_value","kind":"gauge_delta","delta":-17.5}]}
-  ], "counters": {}},
+  ], "counters": {
+    "logit.output.metrics.degraded{component=out,kind=statsd_out,reason=negative_gauge,role=sink}": 1
+  }},
   "pickle-p5": {"events": [
     {"timestamp":"2023-11-14T22:13:24.000000000Z","metrics":[{"name":"logit-fixture.pickle.float_value","kind":"gauge","value":12.75}]},
     {"timestamp":"2023-11-14T22:13:24.000000000Z","metrics":[{"name":"logit-fixture.pickle.int_value","kind":"gauge","value":42.0}]},
     {"timestamp":"2023-11-14T22:13:24.000000000Z","metrics":[{"name":"logit-fixture.pickle.large_value","kind":"gauge","value":1234567.0}]},
     {"timestamp":"2023-11-14T22:13:24.000000000Z","metrics":[{"name":"logit-fixture.pickle.negative_value","kind":"gauge","value":0.0}]},
     {"timestamp":"2023-11-14T22:13:24.000000000Z","metrics":[{"name":"logit-fixture.pickle.negative_value","kind":"gauge_delta","delta":-17.5}]}
-  ], "counters": {}},
+  ], "counters": {
+    "logit.output.metrics.degraded{component=out,kind=statsd_out,reason=negative_gauge,role=sink}": 1
+  }},
   "pickle-py2": {"events": [
     {"timestamp":"2023-11-14T22:13:24.000000000Z","metrics":[{"name":"logit-fixture.diamond.café.count","kind":"gauge","value":3.0}]},
     {"timestamp":"2023-11-14T22:13:24.000000000Z","metrics":[{"name":"logit-fixture.diamond.cpu.total.user","kind":"gauge","value":0.0}]},
@@ -20,7 +33,9 @@
     {"timestamp":"2023-11-14T22:13:24.000000000Z","metrics":[{"name":"logit-fixture.diamond.cpu.total.user","kind":"gauge_delta","delta":-1.0}]},
     {"timestamp":"2023-11-14T22:13:24.000000000Z","metrics":[{"name":"logit-fixture.diamond.loadavg.01","kind":"gauge","value":0.25}]},
     {"timestamp":"2023-11-14T22:13:24.000000000Z","metrics":[{"name":"logit-fixture.diamond.uptime","kind":"gauge","value":7.0}]}
-  ], "counters": {}},
+  ], "counters": {
+    "logit.output.metrics.degraded{component=out,kind=statsd_out,reason=negative_gauge,role=sink}": 1
+  }},
   "pickle-receipt-time": {"events": [
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"ts.sentinel-int","kind":"gauge","value":1.0}]}
   ], "counters": {}},
@@ -30,7 +45,9 @@
     {"timestamp":"2023-11-14T22:13:24.000000000Z","metrics":[{"name":"base.load","kind":"gauge","value":0.0}],"attributes":{"host":"web-1"}},
     {"timestamp":"2023-11-14T22:13:24.000000000Z","metrics":[{"name":"base.load","kind":"gauge_delta","delta":-2.0}],"attributes":{"host":"web-1"}},
     {"timestamp":"2023-11-14T22:13:24.000000000Z","metrics":[{"name":"base.mem","kind":"gauge","value":1234567.0}]}
-  ], "counters": {}},
+  ], "counters": {
+    "logit.output.metrics.degraded{component=out,kind=statsd_out,reason=negative_gauge,role=sink}": 1
+  }},
   "pickle-utf8-path": {"events": [
     {"timestamp":"2023-11-14T22:13:21.000000000Z","metrics":[{"name":"py2.café","kind":"gauge","value":1.0}]}
   ], "counters": {}},
@@ -38,6 +55,7 @@
     {"timestamp":"2023-11-14T22:13:21.000000000Z","metrics":[{"name":"value.2p63","kind":"gauge","value":9.223372036854776e18}]}
   ], "counters": {}},
   "tagged": {"events": [
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app/web\\svc","kind":"gauge","value":7.0}],"attributes":{"dc!zone":"a","pri^o":"~low"}},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"café.temperature","kind":"gauge","value":21.5}]},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"query.time","kind":"gauge","value":3.5}],"attributes":{"expr":"a=b","pattern":"x~y"}},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"sensor.delta","kind":"gauge","value":0.0}]},
@@ -48,7 +66,9 @@
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"servers.web-1.cpu","kind":"gauge","value":0.5}],"attributes":{"env":"staging"}},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"servers.web-1.disk","kind":"gauge","value":42.0}]},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"servers.web-1.mem","kind":"gauge","value":1234.0}],"attributes":{"role":"db"}}
-  ], "counters": {}},
+  ], "counters": {
+    "logit.output.metrics.degraded{component=out,kind=statsd_out,reason=negative_gauge,role=sink}": 1
+  }},
   "write-graphite": {"events": [
     {"timestamp":"2026-09-13T12:30:37.000000000Z","metrics":[{"name":"logit-fixture.interface-eth0.if_dropped.rx","kind":"gauge","value":0.0}]},
     {"timestamp":"2026-09-13T12:30:37.000000000Z","metrics":[{"name":"logit-fixture.interface-eth0.if_dropped.rx","kind":"gauge","value":0.0}]},

@@ -7,3 +7,4 @@
 {"timestamp":"2027-01-15T07:59:55.000000000Z","metrics":[{"name":"sensor.delta","kind":"gauge","value":-2.75}]}
 {"timestamp":"2027-01-15T07:59:56.000000000Z","metrics":[{"name":"servers.web-1.disk","kind":"gauge","value":42.0}]}
 {"timestamp":"2027-01-15T07:59:57.000000000Z","metrics":[{"name":"café.temperature","kind":"gauge","value":21.5}]}
+{"timestamp":"2027-01-15T07:59:58.000000000Z","metrics":[{"name":"app/web\\svc","kind":"gauge","value":7.0}],"attributes":{"dc!zone":"a","pri^o":"~low"}}

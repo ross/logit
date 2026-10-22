@@ -287,10 +287,10 @@ pub struct ValueAllowList {
     /// result is allowed. Empty (the default) means no normalization. A repeated step is rejected.
     #[serde(default)]
     pub normalize: Vec<NormalizeStep>,
-    /// The permitted values. Comparison coerces across numeric representations: a configured
-    /// `200` matches an integer, float, or string `200`. Must be non-empty, and every number must
-    /// be finite. Under `normalize: [lower]`, a string literal here must already be
-    /// ASCII-lowercase, or it could never match.
+    /// The permitted values. Comparison coerces across numeric representations: a configured `200`
+    /// matches an integer, float, or string `200`. Every number must be finite. An empty list
+    /// allows nothing, so every value becomes `other` or is removed. Under `normalize: [lower]`, a
+    /// string literal here must already be ASCII-lowercase, or it could never match.
     pub allow: Vec<SetValue>,
     /// What a value outside `allow` becomes. Absent (the default) removes the attribute instead.
     /// The same literal rules as `allow` apply: a number must be finite, and under
@@ -811,11 +811,12 @@ impl JsonSchema for LuaVar {
     }
 }
 
-/// `route_signals`' `signals:`: the one target each signal goes to. At least one must be set, and
-/// each set id must name a `target` component. Two signals may name the same target. A signal
-/// left unset is stripped under `strip: true`; under `strip: false` it rides along on an event
-/// that also carries a listed signal. An event carrying only unset signals is discarded, and so
-/// is an event that arrives carrying no signal at all unless `none` names a target.
+/// `route_signals`' `signals:`: the one target each signal goes to. Each set id must name a
+/// `target` component; with none set, every event is discarded. Two signals may name the same
+/// target. A signal left unset is stripped under `strip: true`; under `strip: false` it rides along
+/// on an event that also carries a listed signal. An event carrying only unset signals is
+/// discarded, and so is an event that arrives carrying no signal at all unless `none` names a
+/// target.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SignalTargets {
@@ -2458,7 +2459,7 @@ pub enum ComponentKind {
     /// Tails one or more files as a log source, one line per event; rotation-, truncation-, and
     /// checkpoint-aware. `paths` entries are absolute paths; a `*` is permitted only in the final
     /// path component (`/var/log/app/*.log`) and matches any run of non-`/` characters. An empty
-    /// list or entry is rejected.
+    /// entry is rejected; an empty list tails nothing.
     TailIn {
         paths: Vec<String>,
         #[serde(flatten)]
@@ -2474,11 +2475,11 @@ pub enum ComponentKind {
         /// non-empty.
         #[serde(default = "default_docker_root")]
         root: String,
-        /// Container names (the `docker ps` name, without a leading `/`) or id prefixes (at
-        /// least 12 hex characters) to follow. A container not named here is never tailed, even
-        /// if it exists under `root`, so a mistyped name is a silent no-op rather than every
-        /// container on the host. Required unless `discover: true`; an empty or duplicate entry
-        /// is rejected.
+        /// Container names (the `docker ps` name, without a leading `/`) or id prefixes (at least
+        /// 12 hex characters) to follow. A container not named here is never tailed, even if it
+        /// exists under `root`, so a mistyped name is a silent no-op rather than every container on
+        /// the host. Without `discover: true`, an empty list follows nothing. An empty or duplicate
+        /// entry is rejected.
         #[serde(default)]
         containers: Vec<String>,
         /// Follow every container under `root`, including ones that appear after startup,
@@ -2756,9 +2757,9 @@ pub enum ComponentKind {
     /// attributes. Columns are positional, declared in config; there is no header-row mode, and
     /// every field stays a string.
     Csv {
-        /// Attribute names for each field, left to right. Required and non-empty; an empty entry
-        /// or a duplicate entry is rejected (a duplicate would silently overwrite the earlier
-        /// column on every event).
+        /// Attribute names for each field, left to right. A line whose field count differs passes
+        /// through unparsed. An empty entry or a duplicate entry is rejected (a duplicate would
+        /// silently overwrite the earlier column on every event).
         columns: Vec<String>,
         /// The field separator, one ASCII character. `,` by default; `"\t"` (double-quoted, so
         /// YAML resolves the escape) for TSV, or `;`/`|`. Rejected: `"` (the quote character,
@@ -2767,11 +2768,10 @@ pub enum ComponentKind {
         #[serde(default = "default_csv_delimiter")]
         delimiter: char,
     },
-    /// Turns attributes already on an event (typically merged there by `json`) into metrics on
-    /// that same event. A missing or non-numeric attribute is a silent skip for that entry. At
-    /// least one of `counters`/`gauges`/`distributions` must be non-empty. There is no `tags:`
-    /// field: every metrics sink already reads `event.attributes`, so tag selection is `keep`'s
-    /// job.
+    /// Turns attributes already on an event (typically merged there by `json`) into metrics on that
+    /// same event. A missing or non-numeric attribute is a silent skip for that entry. There is no
+    /// `tags:` field: every metrics sink already reads `event.attributes`, so tag selection is
+    /// `keep`'s job.
     KvMetrics {
         #[serde(default)]
         counters: Vec<MetricSpec>,
@@ -2796,8 +2796,8 @@ pub enum ComponentKind {
     /// Drops the named attributes, keeping the rest.
     Remove { fields: Vec<String> },
     /// Stamps constant values onto every event's attributes and/or the batch's resource. A
-    /// configured value overwrites whatever the wire carried under the same key. At least one of
-    /// `resource`/`attributes` must be non-empty.
+    /// configured value overwrites whatever the wire carried under the same key. A key must not be
+    /// empty.
     Set {
         /// Applied once per batch, to the batch's resource, which every event in the batch
         /// shares.
@@ -2878,8 +2878,8 @@ pub enum ComponentKind {
     /// (nginx's `request_time` in seconds to milliseconds, say) without a Lua script. A missing
     /// or non-numeric attribute is a silent skip for that field, never a dropped event.
     Scale {
-        /// Attribute name to multiplication factor. At least one entry is required; an empty name
-        /// or a non-finite factor is rejected.
+        /// Attribute name to multiplication factor. An empty name or a non-finite factor is
+        /// rejected.
         fields: std::collections::BTreeMap<String, f64>,
     },
     /// Resolves `event.timestamp` from an attribute holding the sender's own stamp, so a replayed
@@ -2923,8 +2923,8 @@ pub enum ComponentKind {
     /// the event carry nothing outside `signals`. Listing `none` also matches an event carrying
     /// no signal at all, under either mode: `signals: [metrics, none]` with `mode: only` forwards
     /// an event carrying only metrics, or nothing. Place `keep_signals`/`drop_signals` ahead of
-    /// this instead if unwanted payloads must be stripped rather than tolerated. `signals` may
-    /// not be empty.
+    /// this instead if unwanted payloads must be stripped rather than tolerated. An empty
+    /// `signals` forwards nothing.
     HasSignal {
         signals: Vec<Signal>,
         #[serde(default)]
@@ -2934,14 +2934,15 @@ pub enum ComponentKind {
     /// `keep`'s relationship to `remove`. Unlike `has_signal`, this mutates: an event carrying a
     /// log and derived metrics loses the metrics under `signals: [logs]` but keeps the log. An
     /// event left with no payload is dropped. Listing `none` keeps an event that arrived with no
-    /// payload; without it, such an event is dropped. `signals` may not be empty (that would drop
-    /// every event) and may not name `logs`, `metrics`, and `traces` together (that keeps every
-    /// payload; use `has_signal` to drop an event carrying none).
+    /// payload; without it, such an event is dropped. An empty `signals` drops every
+    /// event. Naming `logs`, `metrics`, and `traces` together keeps every payload and drops
+    /// an event that arrived with none.
     KeepSignals { signals: Vec<Signal> },
     /// Clears the listed signals' payloads on every event, keeping the rest: the mirror of
     /// `keep_signals`. An event left with no payload is dropped, as is one that arrived with
-    /// none. `signals` may not be empty (a no-op), may not name all three signals (that would drop
-    /// every event), and may not name `none` (there is no payload to clear).
+    /// none. An empty `signals` clears nothing, and naming all three
+    /// signals drops every event. Listing `none` changes nothing: an event that arrived with no
+    /// payload is dropped either way.
     DropSignals { signals: Vec<Signal> },
     /// Forwards an event whose batch resource and/or own attributes match every configured pair
     /// and carry every listed key, dropping the rest. `resource:` and `attributes:` are `set`'s
@@ -2949,14 +2950,13 @@ pub enum ComponentKind {
     /// `attributes_present:` list keys that must exist with any value, `null` included. Never
     /// mutates a forwarded event.
     ///
-    /// Everything configured must hold: every pair, across both maps, matches and every listed
-    /// key is present; there is no `or`. A key the event or resource doesn't carry never matches.
+    /// Everything configured must hold: every pair, across both maps, matches and every listed key
+    /// is present; there is no `or`. A key the event or resource doesn't carry never matches.
     /// Values coerce across numeric representations (`status: 200` matches an integer, float, or
-    /// string `200`), but a boolean never coerces, and two strings are never compared
-    /// numerically. At least one of the four fields must be non-empty, every key must be
-    /// non-empty, every numeric value must be finite, and a key may not repeat within a list or
-    /// appear both in a map and in the matching `_present` list (the pair already requires the
-    /// key).
+    /// string `200`), but a boolean never coerces, and two strings are never compared numerically.
+    /// With all four fields empty, every event matches. Every key must be non-empty, every numeric
+    /// value must be finite, and a key may not repeat within a list or appear both in a map and in
+    /// the matching `_present` list (the pair already requires the key).
     HasAttributes {
         #[serde(default)]
         resource: std::collections::BTreeMap<String, SetValue>,
@@ -2991,8 +2991,8 @@ pub enum ComponentKind {
     /// value-side sibling, for a tag whose valid set you know but the producer doesn't enforce
     /// (a `Host` header against a handful of real vhosts, say). A value not in a field's `allow`
     /// becomes that field's `other`, or is removed if `other` is absent. Never drops an event. An
-    /// attribute the event doesn't carry is a silent no-op for that field, never a stamp. At
-    /// least one of `resource`/`attributes` must be non-empty, and no field name may be empty.
+    /// attribute the event doesn't carry is a silent no-op for that field, never a stamp. No
+    /// field name may be empty.
     KeepValues {
         /// Applied once per batch, to the batch's resource.
         #[serde(default)]
@@ -3006,7 +3006,7 @@ pub enum ComponentKind {
     /// `http.request.duration_s` becomes `fast`, `ok`, or `slow` in
     /// `http.request.duration_class`. Integers, floats, and strings that parse as a finite number
     /// are classified. Never drops an event. An attribute the event doesn't carry is a silent
-    /// no-op for that field, never a stamp. `attributes` must be non-empty.
+    /// no-op for that field, never a stamp.
     Bucket {
         /// Applied per event, to `event.attributes`, keyed by the source field.
         attributes: std::collections::BTreeMap<String, BucketSpec>,
@@ -3016,8 +3016,8 @@ pub enum ComponentKind {
     /// it, not event data. Never mutates a forwarded event.
     ///
     /// Each field is a list of alternatives, OR'd within the field; the two fields AND together
-    /// when both are configured. An empty list means "not checked" for that field. At least one
-    /// of `origin`/`previous` must be non-empty, and no entry may be an empty string.
+    /// when both are configured. An empty list means "not checked" for that field, so with both
+    /// empty every batch matches. No entry may be an empty string or repeat.
     HasProvenance {
         #[serde(default)]
         origin: Vec<String>,
@@ -3065,6 +3065,32 @@ pub enum ComponentKind {
         /// `1`.
         #[serde(default = "default_max_series")]
         max_series: usize,
+    },
+    /// Collapses the metric readings in one batch that share a series and a timestamp bucket into
+    /// one reading, for a destination that can't hold two readings of one series at one instant:
+    /// Prometheus remote-write at `1ms`, Datadog at `1s`. Place it last before the sink, since a
+    /// stage after it can make two series equal again.
+    ///
+    /// A series is the metric's name, unit, and kind, the resource, the instrumentation scope,
+    /// and the event's attributes. In each colliding set the latest reading survives with its
+    /// own timestamp. A gauge or cumulative reading before it is replaced by it. Delta sums,
+    /// Datadog rates of one interval, delta histograms, raw samples, set members, sketches, and
+    /// set estimates are merged into it, always keeping the value's type. A Datadog rate is a
+    /// gauge whose `_logit.datadog.type` is `rate`, an increment over its interval, so it's summed
+    /// rather than replaced. A reading that can't merge is forwarded untouched, and the
+    /// sink may still drop it as a duplicate: a `NaN` increment, a delta of another value type
+    /// than the survivor's (`i64` beside `f64`, or `u64` beside `i64`), a total that would
+    /// overflow, a gauge delta, a delta summary, a delta sum or a Datadog rate of booleans, or a
+    /// histogram with other buckets. An event left with no metric, log, or span is discarded. It
+    /// keeps no state between batches, so two batches' readings of one instant both reach the
+    /// sink.
+    DedupTimestamps {
+        /// The bucket width: two readings of one series collide when their timestamps divided by
+        /// it, rounded down, are equal. Match the destination's timestamp resolution: `1ms` for
+        /// Prometheus remote-write, `1s` for Datadog. Must be greater than zero.
+        #[serde(with = "humantime_serde_duration")]
+        #[schemars(with = "String")]
+        precision: Duration,
     },
     /// Forwards stale events, discarding fresh ones, judged against the wall clock. The time
     /// judged is the span's end when the event has a span with one set, otherwise the event's
@@ -3124,10 +3150,10 @@ pub enum ComponentKind {
     Route {
         by: RouteBy,
         /// Value to a target id, or to a list of target ids that each receive a copy of a matching
-        /// event. Several values may name one target. The router's edges derive from these
-        /// values, so there is no separate `targets:` list. Must be non-empty, with no empty key,
-        /// value, or list, no target repeated within one list, and at most 63 distinct targets;
-        /// every id must name a `target` component.
+        /// event. Several values may name one target. The router's edges derive from these values,
+        /// so there is no separate `targets:` list. Empty means every event is unrouted. No key,
+        /// value, or list may be empty, no target repeated within one list, and at most 63 distinct
+        /// targets; every id must name a `target` component.
         routes: std::collections::BTreeMap<String, RouteTargets>,
     },
     /// Sends each signal an event carries to that signal's target: logs to one, metrics to
@@ -3168,9 +3194,10 @@ pub enum ComponentKind {
         bare_keys: bool,
     },
     /// Parses a log record's message as literal `key<kv_sep>value` pairs separated by `pair_sep`
-    /// (`a=1&b=2`, `a: 1, b: 2`), with no quoting and no escapes, unlike `logfmt`. Both
-    /// separators are required and must differ; an empty separator, or a `kv_sep` that contains
-    /// `pair_sep`, is rejected.
+    /// (`a=1&b=2`, `a: 1, b: 2`), with no quoting and no escapes, unlike `logfmt`. `pair_sep`
+    /// splits first, so an empty `kv_sep`, identical separators, or a `kv_sep` that contains
+    /// `pair_sep` never finds a pair, and an empty `pair_sep` reads the whole line as one segment,
+    /// so at most one pair.
     Kv {
         /// Separator between one pair and the next. Whitespace around each key and value is
         /// trimmed, so `", "` and `","` behave the same on `a=1, b=2`.
@@ -3186,8 +3213,7 @@ pub enum ComponentKind {
     /// Matches a pattern against a log message (or, with `field:`, a named attribute), turning
     /// every named capture group (`(?P<name>...)` or `(?<name>...)`) into an attribute of that
     /// name; an unnamed group is grouping/alternation only. The pattern is compiled by `logit
-    /// validate`, so an invalid pattern, or one with no named capture group, is a validation
-    /// error rather than a run-time surprise.
+    /// validate`, so an invalid pattern is a validation error rather than a run-time surprise.
     Regex {
         /// The pattern. Every named capture group becomes an attribute; first match only. A
         /// non-matching line, or one with no `field` attribute, passes through unchanged with no
@@ -3225,13 +3251,13 @@ pub enum ComponentKind {
         #[serde(default)]
         resource: ShapeResource,
         /// A hard cap on the distinct top-level attribute keys tracked since start; a memory
-        /// guard, not a tuning knob. Defaults to `4096`; `0` is rejected. Past it a new key is
-        /// counted as overflow rather than tracked, and `logit.shape.tracking_overflow` goes to
-        /// `1`.
+        /// guard, not a tuning knob. Defaults to `4096`. Past it a new key is counted as overflow
+        /// rather than tracked, and `logit.shape.tracking_overflow` goes to `1`; at `0` nothing is
+        /// tracked.
         #[serde(default = "default_max_tracked_keys")]
         max_tracked_keys: usize,
         /// A hard cap on the distinct top-level key-sets tracked since start. Same guard and
-        /// overflow behavior as `max_tracked_keys`. Defaults to `4096`; `0` is rejected.
+        /// overflow behavior as `max_tracked_keys`. Defaults to `4096`.
         #[serde(default = "default_max_tracked_keysets")]
         max_tracked_keysets: usize,
     },
@@ -3247,8 +3273,8 @@ pub enum ComponentKind {
         /// attribute, the useful default for a source whose keys you don't control (a Kubernetes
         /// label map, an OTLP `KvlistValue`). `all` never selects an attribute under the `_logit.`
         /// prefix, which protocol codecs reserve for their own use; name one to flatten it. A named
-        /// list holds literal attribute names, never paths. Rejected if both this and `resource` are
-        /// `none`, or if a named list is empty or contains an empty or duplicate name.
+        /// list holds literal attribute names, never paths; an empty or duplicate name is rejected.
+        /// An empty list, like `none`, expands nothing.
         #[serde(default = "default_flatten_attributes")]
         attributes: FlattenFields,
         /// Also expand the batch's resource attributes, under the same rules, once per batch.
@@ -3324,9 +3350,10 @@ pub enum ComponentKind {
         /// disabled.
         #[serde(default)]
         user_agent_rules: Vec<UserAgentRule>,
-        /// Per-field limits, in characters (not bytes), overriding the built-in cap on a
-        /// free-text field such as `url.path` (256) or `client.address` (128). A key must name a
-        /// field `http_access` caps (`logit validate` lists them), and a limit of `0` is rejected.
+        /// Per-field limits, in characters (not bytes), overriding the built-in cap on a free-text
+        /// field such as `url.path` (256) or `client.address` (128). A key must name a field
+        /// `http_access` caps (`logit validate` lists them). A limit of `0` empties the field,
+        /// counted as truncated.
         #[serde(default)]
         max_length: std::collections::BTreeMap<String, usize>,
         /// Extra `url.query` keys whose values are replaced with `REDACTED`, beyond semconv's
@@ -3369,9 +3396,8 @@ pub enum ComponentKind {
     /// nothing propagated between them. With no `key:`, each event is an independent draw.
     /// `always_keep:` pins flagged events through regardless. Never mutates an event.
     Sample {
-        /// Fraction of events (or of keys) kept, `0.0..=1.0`. `1` is rejected (a no-op), and `0`
-        /// is rejected unless `always_keep` is set, in which case only the flagged events are
-        /// kept.
+        /// Fraction of events (or of keys) kept, `0.0..=1.0`. `1` keeps every event; `0` keeps
+        /// only the events `always_keep` flags and, under `missing: keep`, those without the key.
         rate: f64,
         /// What to hash. Absent means an independent draw per event. An empty field name is
         /// rejected.
@@ -3390,6 +3416,9 @@ pub enum ComponentKind {
     // `routing-by-condition-is-lua`): each is expressible as a `lua` component, and referencing
     // one is a deserialization error naming the valid kinds. `sample` came back as a native kind
     // because consistent, keyed sampling is the one thing a `lua` component can't express.
+    // `dedup_timestamps` isn't `dedup`: it collapses a series' readings at one instant within a
+    // batch, which a `lua` component can't do without latency, and the event-level seen-set
+    // `dedup` named stays retired.
     /// InfluxDB 2.x line protocol over HTTP, with bounded output retry.
     // Renamed explicitly: `rename_all = "snake_case"` alone would tag this `influx_db_out`.
     #[serde(rename = "influxdb_out")]
@@ -3460,7 +3489,11 @@ pub enum ComponentKind {
     /// Agent has processed them: send `datadog_trace_in`'s output to `datadog_trace_out` instead.
     /// OpenTelemetry sums, histograms, and summaries go out as Datadog's OTel exporter sends
     /// them; a cumulative counter, histogram, or exponential histogram isn't sent, counted, so
-    /// set an OpenTelemetry SDK to delta temporality.
+    /// set an OpenTelemetry SDK to delta temporality. Datadog keeps one point per series per
+    /// second, so of two series points of one series in one second of a request, the later is
+    /// sent and the earlier left off, counted dropped, or normalized when it's a gauge equal to
+    /// the later; put a `dedup_timestamps` with `precision: 1s` last before this sink to sum two
+    /// counts or rates or keep the later gauge first.
     DatadogOut {
         /// The Datadog API key, sent as `DD-API-KEY` on every request and never logged. Take it
         /// from the environment (`!env DD_API_KEY`) rather than writing it into the file. An
@@ -4133,7 +4166,7 @@ pub enum ComponentKind {
         /// Total events to generate, after which the input exits and the process shuts down
         /// cleanly. Exact: the last batch is short rather than rounded up, so a scenario's derived
         /// events/s and CPU-per-event count what was produced. Omitted means unbounded (a soak
-        /// run, or one a profiler attaches to). `0` is rejected.
+        /// run, or one a profiler attaches to). `0` generates nothing.
         #[serde(default)]
         count: Option<u64>,
         /// Events per generated batch, the same unit a real listener's batch assembly produces.
@@ -4226,6 +4259,16 @@ pub enum ComponentKind {
         /// An absolute `http://`/`https://` remote-write URL, path included (typically
         /// `/api/v1/write`): sender mode. Never resolved at config-load time, so a receiver that
         /// isn't up yet is not a config error.
+        ///
+        /// A remote-write series holds one sample per millisecond, so of two readings of one
+        /// series in one millisecond of a batch, the sink sends the later and leaves the earlier
+        /// off, counted `logit.output.metrics.dropped{reason="duplicate_timestamp"}`. When the
+        /// earlier is a state (a gauge other than a Datadog `rate`, or a cumulative kind) equal
+        /// to the later, nothing is lost, and it counts
+        /// `logit.output.metrics.normalized{reason="duplicate_timestamp"}` instead; two equal
+        /// increments or sets of observations, a set's size included, are still two. To merge or
+        /// collapse such readings first, put a `dedup_timestamps` with `precision: 1ms` last
+        /// before this sink.
         #[serde(default)]
         endpoint: Option<String>,
         /// Which remote-write protocol version this sender writes, `1` or `2`. Defaults to `1`,
@@ -5337,10 +5380,9 @@ impl JsonSchema for SocketMode {
 /// without a use a count-based policy needs.
 pub const MAX_ROTATE_FILES: u32 = 1000;
 
-/// `file_out`'s rotation policy. At least one of `max_bytes`/`interval` must be set; a config
-/// that would never rotate is rejected (use `stdio_out` for an unrotated file). `max_files`
-/// counts every file `file_out` maintains, active plus rotated, so `max_files * max_bytes` reads
-/// as a disk budget.
+/// `file_out`'s rotation policy. With neither `max_bytes` nor `interval` set, the file never
+/// rotates. `max_files` counts every file `file_out` maintains, active plus rotated, so
+/// `max_files * max_bytes` reads as a disk budget.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields, default)]
 pub struct RotateConfig {
@@ -6626,11 +6668,37 @@ mod tests {
 
     /// `filter`/`rename`/`throttle`/`dedup` are retired kinds: a config referencing one is a
     /// deserialization error naming the valid kinds, not graph validation's "not implemented".
+    /// `dedup_timestamps` is a different kind and leaves `dedup` retired.
     #[test]
     fn a_retired_kind_is_a_deserialization_error_not_an_unimplemented_kind() {
-        let err = serde_json::from_str::<Component>(r#"{"type": "filter", "sources": ["in"]}"#)
-            .unwrap_err();
-        assert!(err.to_string().contains("unknown variant"), "got: {err}");
+        for kind in ["filter", "rename", "throttle", "dedup"] {
+            let json = format!(r#"{{"type": "{kind}", "sources": ["in"]}}"#);
+            let err = serde_json::from_str::<Component>(&json).unwrap_err();
+            assert!(err.to_string().contains("unknown variant"), "{kind}: {err}");
+        }
+    }
+
+    #[test]
+    fn dedup_timestamps_requires_a_precision() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "dedup_timestamps", "sources": ["in"], "precision": "1ms"}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::DedupTimestamps { precision } => {
+                assert_eq!(precision, Duration::from_millis(1));
+            }
+            other => panic!("expected DedupTimestamps, got {other:?}"),
+        }
+        let err =
+            serde_json::from_str::<Component>(r#"{"type": "dedup_timestamps", "sources": ["in"]}"#)
+                .unwrap_err();
+        assert!(err.to_string().contains("precision"), "got: {err}");
+        let err = serde_json::from_str::<Component>(
+            r#"{"type": "dedup_timestamps", "sources": ["in"], "precision": "1ms", "window": "1s"}"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("unknown field"), "got: {err}");
     }
 
     #[test]

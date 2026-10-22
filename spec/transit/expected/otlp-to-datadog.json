@@ -2,7 +2,7 @@
   "attributes": {"events": [
     {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"build.info","kind":"gauge","value":1.0}],"attributes":{"host.name":"web-1","regions":["us-east","2"],"service.name":"checkout","shard":"12","version":"2.4.1","weight":"0.75"}}
   ], "counters": {
-    "logit.output.tags.omitted{component=out,kind=datadog_out,reason=unrepresentable,role=sink}": 2
+    "logit.output.tags.omitted{component=out,kind=datadog_out,reason=unrepresentable,role=sink}": 3
   }},
   "exemplars": {"events": [
     {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"cart.value","kind":"gauge","value":42.5,"unit":"USD"}],"attributes":{"host.name":"web-1","service.name":"checkout"}}
@@ -80,8 +80,9 @@
     "logit.output.metrics.dropped{component=out,kind=datadog_out,reason=unresolved_cumulative,role=sink}": 2
   }},
   "telemetrygen": {"events": [
-    {"timestamp":"2026-09-10T21:22:20.000000000Z","metrics":[{"name":"gen","kind":"gauge","value":0.0}],"attributes":{"host.name":"transit","service.name":"telemetrygen"}},
     {"timestamp":"2026-09-10T21:22:20.000000000Z","metrics":[{"name":"gen","kind":"gauge","value":1.0}],"attributes":{"host.name":"transit","service.name":"telemetrygen"}},
     {"timestamp":"2026-09-10T21:22:21.000000000Z","metrics":[{"name":"gen","kind":"gauge","value":2.0}],"attributes":{"host.name":"transit","service.name":"telemetrygen"}}
-  ], "counters": {}}
+  ], "counters": {
+    "logit.output.metrics.dropped{component=out,kind=datadog_out,reason=duplicate_timestamp,role=sink}": 1
+  }}
 }

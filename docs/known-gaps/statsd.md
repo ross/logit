@@ -33,7 +33,9 @@ Entry format and the other areas: [the known-gaps index](README.md).
   `name.min:-v|g`, and so does the negative `.sum` of a `Summary` or of a cumulative `Histogram`
   or `ExponentialHistogram`. A statsd server ends at the right value, but `statsd_in` reads the
   pair back as a gauge of 0 plus a relative adjustment, two records. Only the kind's `degraded`
-  count covers it (`logit.output.metrics.degraded{metric_kind}`); the pair itself isn't counted. A
+  count covers it (`logit.output.metrics.degraded{metric_kind}`); the pair itself isn't counted,
+  unlike a negative `Gauge` record's pair, which counts
+  `logit.output.metrics.degraded{reason="negative_gauge"}`. A
   `|c` component such as a sketch's or delta histogram's negative `.sum` is a signed increment and
   isn't affected. An OTLP exponential histogram with a negative `min` reaches it in the
   `otlp-to-statsd` transit flow. The general negative-gauge case is the `gauge/negative` row in

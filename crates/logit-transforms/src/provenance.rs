@@ -490,4 +490,17 @@ mod tests {
         assert_eq!(received.events[0].attributes.get("source"), Some(&Value::str("web")));
         assert!(second.is_err(), "api_in's batch must be dropped by the filter, not forwarded");
     }
+
+    #[test]
+    fn with_nothing_configured_has_provenance_forwards_and_drop_provenance_discards_every_event() {
+        let mut has = HasProvenance::new(vec![], vec![]);
+        let mut drop = DropProvenance::new(vec![], vec![]);
+        for observed in [Provenance::default(), provenance(Some("nginx_in"), Some("edge"))] {
+            has.observe_provenance(observed);
+            drop.observe_provenance(observed);
+            let mut ev = event();
+            assert!(has.process(&default_resource(), &mut ev));
+            assert!(!drop.process(&default_resource(), &mut ev));
+        }
+    }
 }

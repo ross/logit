@@ -3720,8 +3720,9 @@ and out of scope. The only `unsafe` in `logit-pipeline` is in `sockstat.rs` (`me
 ### RT-09 — `process_batch`: in-place `retain_mut` per-event loop and absorbed accounting
 - **Location:** `runtime.rs` (`process_batch`); trait at `transform.rs` (`Transform`).
 - **What it does:** The per-batch body of `run_transform`: reads `scope` out, offers it to `observe_scope`,
-  applies `map_resource`, then `events.retain_mut(|e| transform.process(&resource, e))` in place, calls
-  `end_batch`, and counts `before - after` as `events.discarded`. Returns `None` for an empty
+  applies `map_resource`, calls `begin_batch` with the whole `&mut Vec<Event>`, then
+  `events.retain_mut(|e| transform.process(&resource, e))` in place, calls `end_batch`, and counts
+  `before - after` as `events.discarded`, `before` taken ahead of `begin_batch`. Returns `None` for an empty
   result so no empty batch is ever sent.
 - **Why sensitive:** hot-path (per event, per batch, on every transform node); custom (the in-place
   `retain_mut` shape exists specifically to avoid memcpy'ing an 864-byte `Event`); accounting.
@@ -7403,8 +7404,9 @@ dropping its bins; a `GaugeDelta` on a kind conflict reaching a sink unresolved;
   `UnterminatedQuote` for a `\` with nothing after it, so `a="abc\`, `a="\`, `a="\"`, and
   `a="x\\\` all fail at the opening quote, pinned by
   `logfmt_a_lone_trailing_backslash_inside_quotes_is_an_unterminated_quote`. `find_bytes` only
-  ever gets `pair_sep` or `kv_sep`, both from config, and rule 30 rejects an empty one; its
-  `None` for an empty needle is now documented beside that invariant. A quadratic search needs a
+  ever gets `pair_sep` or `kv_sep`, both from config. Rule 30 rejected an empty one until it was
+  retired on 2026-10-21; its `None` for an empty needle is what keeps an empty separator from
+  looping, and is documented there. A quadratic search needs a
   long needle a peer chooses, and the needle is operator config, so no sender reaches it. Work is linear in the
   message for a fixed separator: `parse_kv`'s cursor moves to `seg_end + pair_sep.len()` and each
   search starts there, so the search costs at most `pair_sep.len()` comparisons per byte;

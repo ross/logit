@@ -38,6 +38,7 @@
     {"sink":"statsd_out","row":"record/non_finite","cell":0,"observed":["dropped"]},
     {"sink":"statsd_out","row":"record/same_instant","cell":0,"observed":["exact"]},
     {"sink":"statsd_out","row":"record/same_millisecond","cell":0,"observed":["exact"]},
+    {"sink":"statsd_out","row":"record/same_millisecond_equal","cell":0,"observed":["exact"]},
     {"sink":"statsd_out","row":"record/sample_rate","cell":0,"observed":["exact"]},
     {"sink":"statsd_out","row":"record/sample_rate_unweighted","cell":0,"observed":["exact"]},
     {"sink":"statsd_out","row":"record/service_check","cell":1,"observed":["exact"]},

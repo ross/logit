@@ -1,6 +1,6 @@
 ---
 created: 2026-09-09
-updated: 2026-10-19
+updated: 2026-10-21
 ---
 
 # `stdio_out`/`file_out` gain a `native` wire-format option
@@ -87,8 +87,8 @@ rejects it on both encode and decode (the real `zstd` crate needs a C build via 
 breaking ADR `containerized-development`), so there is nothing valid for a config to select.
 
 Graph rule 33 rejects `compression` set to anything but `none` while `format` stays `human` (the
-default) — the same "would silently do nothing" reasoning rule 29 already applies to `rotate:`'s
-own triggers.
+default): the human format has no compression, so the operator would ask for compressed output
+and silently get uncompressed output.
 
 ## Alternatives considered
 

@@ -1,0 +1,33 @@
+# Relays statsd gauges to a remote-write receiver with each reading's own arrival time:
+# `statsd_in`, `dedup_timestamps`, then `prometheus_out` sending remote-write. statsd stamps every
+# line on arrival, so one datagram's readings of one gauge land in one millisecond, and
+# remote-write holds one sample per series per millisecond
+# (docs/adr/dedup-timestamps-transform.md).
+#
+# Without `dedup_timestamps`, `prometheus_out` collapses those readings itself, keeping the
+# latest, and counts each lost one as loss,
+# `logit.output.metrics.dropped{reason="duplicate_timestamp"}`, or a gauge equal to the latest as
+# `logit.output.metrics.normalized{reason="duplicate_timestamp"}`. With it, the collapse happens here,
+# under the rule you chose: the latest gauge wins, and each reading removed is counted as an
+# intended outcome (`logit.transform.metrics.absorbed`). A relative `+N`/`-N` gauge line passes
+# through untouched for an `aggregate` to resolve.
+#
+# Keep it last before the sink: a stage after it can make two series equal again. statsd
+# counters are deltas, which `prometheus_out` drops, counted; a counter flow needs `aggregate`
+# with `temporality: cumulative` instead (fixtures/prometheus-remote-write-send.yaml).
+components:
+  app_metrics:
+    type: statsd_in
+    bind: 127.0.0.1:8125
+
+  one_per_ms:
+    type: dedup_timestamps
+    sources: [app_metrics]
+    # Required: remote-write's resolution. `1s` in front of `datadog_out`.
+    precision: 1ms
+
+  remote_write:
+    type: prometheus_out
+    sources: [one_per_ms]
+    endpoint: http://127.0.0.1:9090/api/v1/write
+    version: 1

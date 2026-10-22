@@ -10,13 +10,14 @@ the same date, write the record, then add a row here.
 
 | ADR | Created | Updated |
 |---|---|---|
+| [`dedup_timestamps`: collapse readings of one series that share a timestamp, within a batch, before a sink that can't hold both](dedup-timestamps-transform.md) | 2026-10-21 | 2026-10-21 |
 | [Lua `vars`: a component's `vars:` map reaches its script as a plain-table global](lua-script-vars.md) | 2026-10-21 | 2026-10-21 |
 | [Full-buffer diagnostics: a full sink buffer or receive queue logs once a minute, and a gauge reads a blocked push live](buffer-full-diagnostics.md) | 2026-10-21 | 2026-10-21 |
 | [`datadog_out` maps OTLP metric kinds as Datadog's OTel exporter does, statelessly](datadog-otlp-metric-mapping.md) | 2026-10-20 | 2026-10-20 |
-| [`cumulative_to_delta`: a stateful transform that turns cumulative sums, histograms, and summaries into deltas](cumulative-to-delta-transform.md) | 2026-10-20 | 2026-10-20 |
+| [`cumulative_to_delta`: a stateful transform that turns cumulative sums, histograms, and summaries into deltas](cumulative-to-delta-transform.md) | 2026-10-20 | 2026-10-21 |
 | [`influxdb_out` writes histograms and summaries in Telegraf's `prometheus-v1` shape](influxdb-histogram-summary-shape.md) | 2026-10-20 | 2026-10-21 |
 | [`replay_in`: a finite input that reads a `format: json` or `format: native` file once and ends](replay-input.md) | 2026-10-19 | 2026-10-19 |
-| [Transit spec: a mapping table under `spec/transit/` is the canonical statement of every cross-protocol transition, checked by flows and rendered into the docs](transit-spec.md) | 2026-10-19 | 2026-10-19 |
+| [Transit spec: a mapping table under `spec/transit/` is the canonical statement of every cross-protocol transition, checked by flows and rendered into the docs](transit-spec.md) | 2026-10-19 | 2026-10-21 |
 | [`route_signals`: a native signal router that splits a mixed event into one part per target](route-signals.md) | 2026-10-16 | 2026-10-21 |
 | [LuaJIT's trace compiler is off by default, and `jit: true` turns it on per component](lua-jit-opt-in.md) | 2026-10-16 | 2026-10-16 |
 | [Lua in-place edits: writable log fields, `= nil` deletes an attribute, and `pairs` enumerates a proxy](lua-in-place-edits.md) | 2026-10-16 | 2026-10-18 |
@@ -36,7 +37,7 @@ the same date, write the record, then add a row here.
 | [`kafka_out` SASL: PLAIN, SCRAM, OAUTHBEARER, and AWS MSK IAM, authenticated in the dialer and renewed by redial](kafka-sasl.md) | 2026-10-11 | 2026-10-17 |
 | [`kafka_out`: a pure-Rust producer on `kafka-protocol`, with the Java producer's semantics and named divergences](kafka-output.md) | 2026-10-11 | 2026-10-18 |
 | [Lua `random`: a global that mints trace ids, span ids, UUIDs, and ULIDs, with the time passed in](lua-random-ids.md) | 2026-10-11 | 2026-10-11 |
-| [`bucket`: a numeric-range classifier that writes a bounded attribute value](bucket-transform.md) | 2026-10-11 | 2026-10-11 |
+| [`bucket`: a numeric-range classifier that writes a bounded attribute value](bucket-transform.md) | 2026-10-11 | 2026-10-21 |
 | [Run CI in an image prebaked from `Dockerfile.dev` and published to GHCR](ci-image-on-ghcr.md) | 2026-10-09 | 2026-10-09 |
 | [Parsers of producer bytes live in `logit-proto`, and listeners and transforms wrap them](parsers-live-in-logit-proto.md) | 2026-10-09 | 2026-10-09 |
 | [A soak harness: real containers over ordinary config, one-shot netem, and a reset-aware ledger as the loss oracle](soak-harness.md) | 2026-10-08 | 2026-10-18 |
@@ -74,19 +75,19 @@ the same date, write the record, then add a row here.
 | [VictoriaMetrics interop: existing components, plus zstd on Prometheus remote-write](victoriametrics-interop.md) | 2026-09-24 | 2026-10-18 |
 | [Durable checkpoint writes, observed spool I/O failures, and a feature-gated fault-injection seam](durable-checkpoint-writes-and-fault-injection.md) | 2026-09-24 | 2026-09-28 |
 | [Datadog: two lossless pairs, the Agent's own protocols, and a Datadog-mapped `DdSketch`](datadog-agent-and-intake-relay.md) | 2026-09-23 | 2026-10-20 |
-| [`sample`: consistent, keyed event sampling with an operator override](consistent-sampling-component.md) | 2026-09-22 | 2026-10-13 |
+| [`sample`: consistent, keyed event sampling with an operator override](consistent-sampling-component.md) | 2026-09-22 | 2026-10-21 |
 | [Publish the release image to GHCR, `latest` only, on manual dispatch](publish-release-image-to-ghcr.md) | 2026-09-22 | 2026-10-09 |
-| [`http_access`: web-server access lines normalized to OTel semconv once, natively, from raw fields](http-access-normalization.md) | 2026-09-22 | 2026-10-11 |
+| [`http_access`: web-server access lines normalized to OTel semconv once, natively, from raw fields](http-access-normalization.md) | 2026-09-22 | 2026-10-21 |
 | [Out-of-CI verification of raw-`libc` `unsafe`: a throwaway nightly image, not a Dockerfile.dev change](out-of-ci-unsafe-verification.md) | 2026-09-21 | 2026-09-25 |
-| [`flatten`: dotted-key expansion as an opt-in, operator-placed transform](flatten-transform.md) | 2026-09-21 | 2026-10-13 |
+| [`flatten`: dotted-key expansion as an opt-in, operator-placed transform](flatten-transform.md) | 2026-09-21 | 2026-10-21 |
 | [Event sizing: `AttrMap`'s inline capacity stays 8, and attribute maps are not pre-sized](event-sizing-and-allocation-strategy.md) | 2026-09-21 | 2026-10-18 |
-| [`shape`: an observer component that turns each event into measurements of its own shape](shape-observer-component.md) | 2026-09-20 | 2026-10-18 |
+| [`shape`: an observer component that turns each event into measurements of its own shape](shape-observer-component.md) | 2026-09-20 | 2026-10-21 |
 | [A disposable Azure VM for perf measurement: `up`/`down` only, no stop and no snapshot](disposable-azure-perf-vm.md) | 2026-09-18 | 2026-10-18 |
-| [UDP intake batching and socket visibility](udp-intake-batching-and-socket-visibility.md) | 2026-09-18 | 2026-10-18 |
-| [Prometheus remote-write: a receiver on `prometheus_in`, a sender on `prometheus_out`](prometheus-remote-write.md) | 2026-09-17 | 2026-10-20 |
+| [UDP intake batching and socket visibility](udp-intake-batching-and-socket-visibility.md) | 2026-09-18 | 2026-10-21 |
+| [Prometheus remote-write: a receiver on `prometheus_in`, a sender on `prometheus_out`](prometheus-remote-write.md) | 2026-09-17 | 2026-10-21 |
 | [`docker_in`: live container identity, and a minimal `inotify` watch set](docker-container-identity-and-minimal-watches.md) | 2026-09-17 | 2026-10-18 |
 | [`Transform::process` transforms in place: `&mut Event -> bool`, not `Event -> Option<Event>`](in-place-transform-process.md) | 2026-09-17 | 2026-10-16 |
-| [`keep_values`: an attribute-value allowlist, and an optional normalize-before-compare step](value-allowlist-cardinality-clamp.md) | 2026-09-15 | 2026-09-15 |
+| [`keep_values`: an attribute-value allowlist, and an optional normalize-before-compare step](value-allowlist-cardinality-clamp.md) | 2026-09-15 | 2026-10-21 |
 | [A Lua `flush()` runs in a root context, not the last batch's](lua-flush-root-context.md) | 2026-09-15 | 2026-09-15 |
 | [`Event.new(t)`: Lua constructs events from the table shape `event:to_table()` already emits](lua-event-constructor.md) | 2026-09-15 | 2026-10-18 |
 | [Idle-connection timeouts on TCP listeners: an opt-in `idle_timeout`, a next-byte deadline, and a client-side pooled-connection probe](idle-connection-timeout.md) | 2026-09-14 | 2026-10-11 |
@@ -104,26 +105,26 @@ the same date, write the record, then add a row here.
 | [Lossless like-protocol transit: the internal model is a superset of every supported wire protocol](lossless-transit.md) | 2026-09-10 | 2026-10-21 |
 | [Browser tracing: the real OTel-JS SDK, `addLink` for sub-resources, and living with document-load's parent (not link) behaviour](browser-tracing-sdk.md) | 2026-09-10 | 2026-10-18 |
 | [OTLP/JSON decoding: hand-written against `serde_json::Value`, not generated](otlp-json-decoding.md) | 2026-09-10 | 2026-10-18 |
-| [Provenance filtering is two transform components, combining has_attributes' and has_signal's shapes](provenance-filtering-components.md) | 2026-09-10 | 2026-10-13 |
+| [Provenance filtering is two transform components, combining has_attributes' and has_signal's shapes](provenance-filtering-components.md) | 2026-09-10 | 2026-10-21 |
 | [Batch provenance (`origin`/`previous`) carried on `Delivered`, stamped by `Fanout`](batch-provenance-on-delivered.md) | 2026-09-10 | 2026-10-15 |
-| [Attribute filtering is two transform components, and a bounded matcher is not a predicate language](attribute-filtering-components.md) | 2026-09-10 | 2026-10-18 |
+| [Attribute filtering is two transform components, and a bounded matcher is not a predicate language](attribute-filtering-components.md) | 2026-09-10 | 2026-10-21 |
 | [Native transport: handshake, implicit sequencing, and per-batch acknowledgement](native-transport-handshake-and-ack.md) | 2026-09-09 | 2026-10-18 |
 | [`tracing` for self-logging, with `Diagnostics` as its producer](tracing-for-self-logging.md) | 2026-09-09 | 2026-09-09 |
 | [A top-level `admin:` block, not a component, for readiness/liveness](admin-readiness-endpoint.md) | 2026-09-09 | 2026-10-07 |
 | [Disk-backed durable buffering for a sink's delivery queue](disk-backed-sink-buffer.md) | 2026-09-09 | 2026-10-18 |
-| [`stdio_out`/`file_out` gain a `native` wire-format option](file-output-native-format.md) | 2026-09-09 | 2026-10-19 |
-| [`file_out`: a rotating file sink, sharing `stdio_out`'s implementation](rotating-file-output.md) | 2026-09-08 | 2026-10-05 |
+| [`stdio_out`/`file_out` gain a `native` wire-format option](file-output-native-format.md) | 2026-09-09 | 2026-10-21 |
+| [`file_out`: a rotating file sink, sharing `stdio_out`'s implementation](rotating-file-output.md) | 2026-09-08 | 2026-10-21 |
 | [Native wire format encoding: hand-rolled, not `rkyv` or a `serde`/`postcard` derive](native-wire-format-encoding.md) | 2026-09-08 | 2026-09-25 |
 | [Routing by condition, sampling, throttling, dedup, and renaming are `lua` components](routing-by-condition-is-lua.md) | 2026-09-07 | 2026-10-16 |
-| [`logfmt` and `kv`: the de-facto key=value parsers, and why they stay two kinds](logfmt-and-kv-parsing.md) | 2026-09-07 | 2026-10-11 |
-| [`regex`: named captures into attributes, and taking the `regex` crate](regex-transform.md) | 2026-09-07 | 2026-09-07 |
-| [`csv`: positional columns from config, not a header row, and no type coercion](csv-positional-columns.md) | 2026-09-07 | 2026-09-07 |
-| [`tail_in`: generic file tailing, and `docker_in` on top of it for Docker's json-file logs](file-tailing-and-docker-json-logs.md) | 2026-09-06 | 2026-10-18 |
+| [`logfmt` and `kv`: the de-facto key=value parsers, and why they stay two kinds](logfmt-and-kv-parsing.md) | 2026-09-07 | 2026-10-21 |
+| [`regex`: named captures into attributes, and taking the `regex` crate](regex-transform.md) | 2026-09-07 | 2026-10-21 |
+| [`csv`: positional columns from config, not a header row, and no type coercion](csv-positional-columns.md) | 2026-09-07 | 2026-10-21 |
+| [`tail_in`: generic file tailing, and `docker_in` on top of it for Docker's json-file logs](file-tailing-and-docker-json-logs.md) | 2026-09-06 | 2026-10-21 |
 | [`trace_context` grows a `span:` block, and a native `traceparent` parser](trace-context-span-lifting.md) | 2026-09-04 | 2026-10-18 |
 | [TLS for `otlp_out`/`otlp_in`, and a pooled gRPC client to carry it](otlp-tls-and-pooled-grpc-client.md) | 2026-09-03 | 2026-10-18 |
-| [`scale`: unit conversion by constant factor, and why it stays out of `kv_metrics`](scale-transform.md) | 2026-09-03 | 2026-09-22 |
+| [`scale`: unit conversion by constant factor, and why it stays out of `kv_metrics`](scale-transform.md) | 2026-09-03 | 2026-10-21 |
 | [`LogRecord` gains a native application trace/span reference](log-record-trace-context.md) | 2026-09-03 | 2026-10-18 |
-| [Operator-declared resource attributes: a `set` transform, not a per-input config field](operator-declared-resource-attributes.md) | 2026-09-03 | 2026-10-18 |
+| [Operator-declared resource attributes: a `set` transform, not a per-input config field](operator-declared-resource-attributes.md) | 2026-09-03 | 2026-10-21 |
 | [`otlp_out`/`otlp_in` gzip: client never accepts a compressed response, server bounds decompressed size](otlp-compression-and-decompression-bounds.md) | 2026-09-03 | 2026-10-18 |
 | [Signal filtering is two transform components, not a sink field](signal-filtering-components.md) | 2026-09-03 | 2026-10-21 |
 | [Syslog egress: format, transport, and header-field precedence](syslog-output.md) | 2026-09-02 | 2026-10-18 |
@@ -132,7 +133,7 @@ the same date, write the record, then add a row here.
 | [Committed, pre-generated OTLP protobuf types; no `protoc` in any build path](committed-pregenerated-otlp-protobuf.md) | 2026-09-02 | 2026-09-11 |
 | [Internal span emission, one span per node-visit, and deterministic-on-`trace_id` sampling](internal-span-emission-and-deterministic-sampling.md) | 2026-09-02 | 2026-10-15 |
 | [Hand-rolled unary gRPC over `hyper`, not `tonic`](hand-rolled-grpc-over-hyper.md) | 2026-09-02 | 2026-10-18 |
-| [Buffered, decoupled sink delivery](buffered-sink-delivery.md) | 2026-09-01 | 2026-10-18 |
+| [Buffered, decoupled sink delivery](buffered-sink-delivery.md) | 2026-09-01 | 2026-10-21 |
 | [Propagate real trace context on `Delivered`, for the node kinds with one unambiguous parent](trace-context-propagation-on-delivered.md) | 2026-09-01 | 2026-09-15 |
 | [Lua-authored telemetry: cardinality is convention-enforced, not type-system-enforced](lua-authored-telemetry-cardinality.md) | 2026-09-01 | 2026-09-01 |
 | [A separate demo stack, not an extension of the dev stack](demo-stack-separate-from-dev-stack.md) | 2026-09-01 | 2026-10-18 |
@@ -142,7 +143,7 @@ the same date, write the record, then add a row here.
 | [`Arc<EventBatch>` copy-on-write on channels](arc-eventbatch-copy-on-write.md) | 2026-08-31 | 2026-08-31 |
 | [Service lifecycle: signal-driven shutdown and bounded output retry](service-lifecycle-and-output-retry.md) | 2026-08-30 | 2026-10-18 |
 | [`Event` carries a log, metrics, and a span at once, not one of the three](multi-payload-events.md) | 2026-08-30 | 2026-10-18 |
-| [`kv_metrics`: skip rules, numeric coercion, and no `tags:` field](kv-metrics-semantics.md) | 2026-08-30 | 2026-10-18 |
+| [`kv_metrics`: skip rules, numeric coercion, and no `tags:` field](kv-metrics-semantics.md) | 2026-08-30 | 2026-10-21 |
 | [Configuration: a component graph, not inputs/outputs/pipelines](component-graph-configuration.md) | 2026-08-29 | 2026-09-13 |
 | [`aggregate` transform: tumbling windows, pass-through, and the flush-tick contract](aggregation-window-semantics.md) | 2026-08-29 | 2026-10-19 |
 | [`json` transform: structured attributes, additive, pass-through on failure](json-parsing-into-attributes.md) | 2026-08-29 | 2026-09-22 |

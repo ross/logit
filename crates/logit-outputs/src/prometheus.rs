@@ -197,6 +197,22 @@
 //! `400`s from a receiver with no out-of-order window; a single chain into one `prometheus_out`
 //! can't.
 //!
+//! **Duplicate timestamps.** One series holds one sample per millisecond. Given two in one
+//! request, Prometheus and Mimir answer `2xx`, keep the first, and drop the second silently, so
+//! the sink sends only the later reading of each series and millisecond in a batch. It counts
+//! each earlier one that's a state (a gauge other than a Datadog `rate`, or a cumulative kind)
+//! equal to the reading sent `logit.output.metrics.normalized{reason="duplicate_timestamp"}`,
+//! since the receiver stores the same sample, and every other one, a `samples` record's equal
+//! summary, a set's equal size gauge, and an equal `rate` included,
+//! `logit.output.metrics.dropped{reason="duplicate_timestamp"}`, with a throttled
+//! `duplicate_timestamp` diagnostic (`logit_proto::prometheus`'s encode table). A sub-millisecond
+//! source (`statsd_in` gauges,
+//! `internal`, a relay with no `aggregate`) reaches this; a `dedup_timestamps` with
+//! `precision: 1ms` as the last stage before this sink merges or collapses such readings first.
+//! It works within a batch: a later batch repeating a series and millisecond with a new value
+//! draws `400 duplicate sample for timestamp`, `Rejected` above, which drops that whole batch
+//! (`docs/known-gaps/prometheus.md`).
+//!
 //! ## Telemetry
 //!
 //! Registry mode:
@@ -218,12 +234,21 @@
 //! | `logit.output.samples` | samples in the request body, counted by the codec ([`remote_write::encode_counted`]) rather than guessed from family counts: one `Series` is one sample for a gauge and several for a histogram. Mirrors `prometheus_in`'s `logit.input.samples`, so the two ends of a relay compare |
 //!
 //! Both modes also get everything the codec counts on the sink's [`PrometheusEncoder`]:
-//! `logit.output.metrics.{dropped,skipped,degraded}`, `logit.output.labels.omitted`, and
-//! `logit.output.labels.normalized{reason="multi_value"}`. That last one is a `Value::Array`
+//! `logit.output.metrics.{dropped,skipped,degraded}`, `logit.output.events.skipped`,
+//! `logit.output.labels.omitted`, `logit.output.metrics.normalized{reason="name_sanitized"}` and
+//! `logit.output.labels.normalized{reason="name_sanitized"}` for a metric or label name rewritten
+//! into its grammar, and `logit.output.labels.normalized{reason="multi_value"}`. That last one is a
+//! `Value::Array`
 //! attribute (a repeated DogStatsD tag key relayed from `statsd_in`) collapsed to its last
 //! representable element, since a Prometheus label set has no multi-value label. Unlike the other
 //! `*.normalized` reasons in `docs/design/internal-telemetry.md`, it's **lossy**: the non-last
 //! elements are discarded. It's `normalized` rather than `omitted` because the label survives.
+//!
+//! In sender mode the codec also counts `logit.output.metrics.dropped{reason="duplicate_timestamp"}`
+//! and `logit.output.metrics.normalized{reason="duplicate_timestamp"}` ("Duplicate timestamps"
+//! above). Registry mode's upsert keeps one value per series between
+//! scrapes, so a later reading replacing an earlier one there is the pull model's overwrite,
+//! uncounted; an operator who needs every value between scrapes puts an `aggregate` in front.
 //!
 //! A delta `Sum` is the common drop in either mode: counted
 //! `logit.output.metrics.dropped{reason="unresolved_delta"}`, with a throttled
@@ -274,8 +299,8 @@ use logit_pipeline::listen::BindOptions;
 use logit_pipeline::{BatchContext, DeliveryPosture, Fault, Output, SeqId};
 use logit_proto::prometheus::compression::{self, Encoding};
 use logit_proto::prometheus::{
-    events_to_families, remote_write, text, Destination, Dialect, FamilyType, MetricFamily, Point,
-    PrometheusEncoder, Series,
+    events_to_families, events_to_families_pending, remote_write, text, Destination, Dialect,
+    FamilyType, MetricFamily, PendingFamily, Point, PrometheusEncoder, Series,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::io::ErrorKind;
@@ -408,7 +433,7 @@ impl Registry {
         entry.help = help;
         entry.unit = unit;
         for series in series {
-            let Series { labels, point, timestamp, created, exemplars } = series;
+            let Series { labels, point, timestamp, created, exemplars, increment: _ } = series;
             entry
                 .series
                 .insert(labels, Stored { point, timestamp, created, exemplars, updated_at: now });
@@ -496,6 +521,7 @@ impl Registry {
                     .series
                     .iter()
                     .map(|(labels, stored)| Series {
+                        increment: false,
                         labels: labels.clone(),
                         point: stored.point.clone(),
                         timestamp: stored.timestamp,
@@ -1034,10 +1060,10 @@ pub fn encode_remote_write(
     encoder: &mut PrometheusEncoder,
 ) -> Result<Option<(Vec<u8>, u64)>, compression::CompressError> {
     let resource = batch.resource.as_ref();
-    let groups: Vec<Vec<MetricFamily>> = partition(batch)
+    let groups: Vec<Vec<PendingFamily>> = partition(batch)
         .into_values()
         .map(|events| {
-            events_to_families(events.into_iter().map(|event| (resource, event)), encoder)
+            events_to_families_pending(events.into_iter().map(|event| (resource, event)), encoder)
         })
         .collect();
     // No request for a batch that produced nothing: an empty `WriteRequest` is legal, but it
@@ -1045,7 +1071,7 @@ pub fn encode_remote_write(
     if groups.iter().all(Vec::is_empty) {
         return Ok(None);
     }
-    let (body, samples) = remote_write::encode_counted(&groups, version, encoder);
+    let (body, samples) = remote_write::encode_pending(groups, version, encoder);
     compression::compress(encoding, &body).map(|compressed| Some((compressed, samples)))
 }
 
@@ -3107,7 +3133,9 @@ mod tests {
         )])
     }
 
-    /// A counter that is sent, and [`nothing_to_send_batch`]'s delta `Sum`.
+    /// A counter that is sent, [`nothing_to_send_batch`]'s delta `Sum`, and one of each shape the
+    /// codec counts as rewritten: a counter whose name and exemplar key are sanitized, a flagged
+    /// delta `Sum` sent as a stale marker, and an event with no metrics.
     fn encode_side_batch() -> EventBatch {
         let mut batch = nothing_to_send_batch();
         batch.events.push(Event::metric(
@@ -3115,13 +3143,106 @@ mod tests {
             AttrMap::new(),
             MetricRecord::new(intern("http_requests"), cumulative_counter(5.0)),
         ));
+        let mut renamed = MetricRecord::new(intern("http.hits"), cumulative_counter(1.0));
+        let mut exemplar_attributes = AttrMap::new();
+        exemplar_attributes.insert("user.id", Value::str("u1"));
+        renamed.exemplars = vec![Exemplar {
+            timestamp: 0,
+            value: logit_core::MetricValue::F64(1.0),
+            trace: None,
+            filtered_attributes: exemplar_attributes,
+        }];
+        batch.events.push(Event::metric(1_000_000_000, AttrMap::new(), renamed));
+        let mut flagged = MetricRecord::new(intern("retries"), delta_sum(0.0));
+        flagged.flags = MetricRecord::FLAG_NO_RECORDED_VALUE;
+        batch.events.push(Event::metric(1_000_000_000, AttrMap::new(), flagged));
+        batch.events.push(Event::empty(1_000_000_000, AttrMap::new()));
         batch
     }
 
-    const ENCODE_SIDE: [SumSeries<'static>; 2] = [
+    const ENCODE_SIDE: [SumSeries<'static>; 6] = [
         ("logit.output.metrics.dropped", &[("reason", "unresolved_delta")]),
         ("logit.component.diagnostics", &[("key", "delta_temporality_unresolved")]),
+        ("logit.output.metrics.normalized", &[("reason", "name_sanitized")]),
+        ("logit.output.labels.normalized", &[("reason", "name_sanitized")]),
+        ("logit.output.metrics.degraded", &[("metric_kind", "delta_sum")]),
+        ("logit.output.events.skipped", &[("reason", "no_metrics")]),
     ];
+
+    /// [`encode_side_batch`]'s value-dependent counts, each once, and a series label name
+    /// rewritten beside them: nothing counts for the names that needed no rewrite.
+    #[tokio::test]
+    async fn a_remote_write_batch_counts_each_rewrite_and_skip_once() {
+        let (url, _log) = scripted_receiver(&[200]).await;
+        let mut probe = TelemetryProbe::new();
+        let mut output = instrumented_sender(&url, &probe);
+        let mut batch = encode_side_batch();
+        let mut attributes = AttrMap::new();
+        attributes.insert("http.route", Value::str("/"));
+        attributes.insert("job", Value::str("api"));
+        batch.events.push(Event::metric(
+            1_000_000_000,
+            attributes,
+            MetricRecord::new(intern("routes"), MetricKind::gauge(1.0)),
+        ));
+        let sums = sums_through_write_loop(
+            &mut output,
+            &mut probe,
+            "prometheus_out",
+            vec![batch],
+            fast_retry(),
+        )
+        .await;
+        let counted = [
+            ("logit.output.metrics.normalized", ("reason", "name_sanitized"), 1.0),
+            ("logit.output.labels.normalized", ("reason", "name_sanitized"), 2.0),
+            ("logit.output.metrics.degraded", ("metric_kind", "delta_sum"), 1.0),
+            ("logit.output.events.skipped", ("reason", "no_metrics"), 1.0),
+        ];
+        for (name, tag, n) in counted {
+            assert_eq!(sum_of(&sums, name, &[tag]), n, "{name} {tag:?}");
+        }
+    }
+
+    /// Two names sanitizing onto one in a batch keep one family: the record kept counts its
+    /// rewrite, and the displaced one counts only its drop, its rewritten label name and collapsed
+    /// array included, as does a record dropped for a type conflict. Of two points of one series
+    /// in a batch, only the later one's rewrites count.
+    #[tokio::test]
+    async fn a_name_collision_counts_the_kept_records_rewrite_only() {
+        let mut probe = TelemetryProbe::new();
+        let telemetry = probe.telemetry("out", "prometheus_out", "sink");
+        let mut sink: PrometheusOutput = ExposeOutput::new("127.0.0.1:0")
+            .with_expire_after(Duration::ZERO)
+            .with_diagnostics(Diagnostics::new("out").with_telemetry(telemetry.clone()))
+            .with_telemetry(telemetry)
+            .into();
+        sink.bind().await.unwrap();
+        let label = [("http.route", Value::str("/"))];
+        let both = [
+            ("http.route", Value::str("/")),
+            ("team", Value::Array(vec![Value::str("a"), Value::str("b")])),
+        ];
+        let b = batch(vec![
+            metric_event("a_b", MetricKind::gauge(1.0), &both),
+            metric_event("a.b", MetricKind::gauge(2.0), &[]),
+            metric_event("hits", MetricKind::gauge(1.0), &[]),
+            metric_event("hits", cumulative_counter(1.0), &label),
+            metric_event("free.mem", MetricKind::gauge(1.0), &both),
+            metric_event("free.mem", MetricKind::gauge(2.0), &both),
+        ]);
+        sink.send(&b).await.unwrap();
+        let renamed = probe.sum("logit.output.metrics.normalized", &[("reason", "name_sanitized")]);
+        assert_eq!(renamed, 2.0, "`a.b` and the later `free.mem`");
+        let dropped = probe.sum("logit.output.metrics.dropped", &[("reason", "name_collision")]);
+        assert_eq!(dropped, 1.0);
+        let conflict = probe.sum("logit.output.metrics.dropped", &[("reason", "type_conflict")]);
+        assert_eq!(conflict, 1.0);
+        let labels = probe.sum("logit.output.labels.normalized", &[("reason", "name_sanitized")]);
+        assert_eq!(labels, 1.0, "the later `free.mem`'s only");
+        let arrays = probe.sum("logit.output.labels.normalized", &[("reason", "multi_value")]);
+        assert_eq!(arrays, 1.0, "the later `free.mem`'s only");
+    }
 
     /// The diagnostic for a non-2xx answer: the receiver's verdict on one attempt.
     const REJECTED: (&str, &str) = ("key", "remote_write_rejected");
@@ -3364,5 +3485,216 @@ mod tests {
             tagged(&events, "logit.output.metrics.degraded", "reason", "exemplar_omitted"),
             2.0
         );
+    }
+
+    // -- duplicate timestamps ---------------------------------------------------------------
+
+    fn gauge_at(timestamp: i64, value: f64) -> Event {
+        Event::metric(
+            timestamp,
+            AttrMap::new(),
+            MetricRecord::new(
+                intern("queue_depth"),
+                MetricKind::Gauge(logit_core::MetricValue::F64(value)),
+            ),
+        )
+    }
+
+    const DUPLICATE: SumSeries<'static> =
+        ("logit.output.metrics.dropped", &[("reason", "duplicate_timestamp")]);
+
+    /// `batch` through a remote-write sink whose receiver answers a `503` and then a `200`: the
+    /// sums, and each sample the last request carried as `(value, timestamp_ms)`.
+    async fn retried_remote_write(batch: EventBatch) -> (Sums, Vec<(f64, i64)>) {
+        let (url, log) = scripted_receiver(&[503, 200]).await;
+        let mut probe = TelemetryProbe::new();
+        let mut output = instrumented_sender(&url, &probe);
+        let sums = sums_through_write_loop(
+            &mut output,
+            &mut probe,
+            "prometheus_out",
+            vec![batch],
+            fast_retry(),
+        )
+        .await;
+        let log = log.lock().unwrap();
+        assert_eq!(log.len(), 2, "one request per attempt");
+        let body = snap::raw::Decoder::new().decompress_vec(&log[1].body).unwrap();
+        let request = pb1::WriteRequest::decode(body.as_slice()).unwrap();
+        let samples =
+            request.timeseries.iter().flat_map(|s| &s.samples).map(|s| (s.value, s.timestamp));
+        (sums, samples.collect())
+    }
+
+    /// Two readings of one series at one nanosecond: the later is sent, and the earlier is
+    /// counted dropped once for the batch, though the batch took two attempts.
+    #[tokio::test]
+    async fn a_remote_write_reading_at_the_same_instant_is_counted_dropped_once() {
+        let at = 1_700_000_000_000_000_000;
+        let (sums, samples) =
+            retried_remote_write(batch(vec![gauge_at(at, 1.0), gauge_at(at, 2.0)])).await;
+        assert_eq!(samples, [(2.0, at / 1_000_000)]);
+        assert_eq!(sum_of(&sums, DUPLICATE.0, DUPLICATE.1), 1.0);
+        assert_eq!(
+            sum_of(&sums, "logit.component.diagnostics", &[("key", "duplicate_timestamp")]),
+            1.0
+        );
+    }
+
+    /// Two readings of one series a nanosecond apart, inside one millisecond: the later is sent,
+    /// and the earlier is counted dropped once for the batch.
+    #[tokio::test]
+    async fn a_remote_write_reading_in_the_same_millisecond_is_counted_dropped_once() {
+        let at = 1_700_000_000_000_000_000;
+        let (sums, samples) =
+            retried_remote_write(batch(vec![gauge_at(at, 1.0), gauge_at(at + 1, 2.0)])).await;
+        assert_eq!(samples, [(2.0, at / 1_000_000)]);
+        assert_eq!(sum_of(&sums, DUPLICATE.0, DUPLICATE.1), 1.0);
+        assert_eq!(sum_of(&sums, "logit.output.metrics.degraded", &[]), 0.0);
+    }
+
+    /// A reading equal to the one sent for its series loses nothing, at either collapse: it's
+    /// counted `normalized` once for the batch, with no loss and no diagnostic.
+    #[tokio::test]
+    async fn a_remote_write_reading_equal_to_the_one_sent_is_counted_normalized_once() {
+        let at = 1_700_000_000_000_000_000;
+        for later in [at, at + 1] {
+            let (sums, samples) =
+                retried_remote_write(batch(vec![gauge_at(at, 2.0), gauge_at(later, 2.0)])).await;
+            assert_eq!(samples, [(2.0, at / 1_000_000)], "{later}");
+            let reason = [("reason", "duplicate_timestamp")];
+            assert_eq!(sum_of(&sums, "logit.output.metrics.normalized", &reason), 1.0, "{later}");
+            assert_eq!(sum_of(&sums, DUPLICATE.0, DUPLICATE.1), 0.0, "{later}");
+            let diagnostics = [("key", "duplicate_timestamp")];
+            assert_eq!(sum_of(&sums, "logit.component.diagnostics", &diagnostics), 0.0, "{later}");
+        }
+    }
+
+    /// A Datadog `rate` relayed to remote-write is a gauge carrying `_logit.datadog.type: rate`,
+    /// an increment over its interval: two equal rates at one instant are two, so the earlier
+    /// counts `dropped`.
+    #[tokio::test]
+    async fn an_equal_datadog_rate_is_counted_dropped() {
+        let rate = |timestamp: i64| {
+            let mut attributes = AttrMap::new();
+            attributes.insert("_logit.datadog.type", logit_core::Value::str("rate"));
+            Event::metric(
+                timestamp,
+                attributes,
+                MetricRecord::new(
+                    intern("requests"),
+                    MetricKind::Gauge(logit_core::MetricValue::F64(0.5)),
+                ),
+            )
+        };
+        let at = 1_700_000_000_000_000_000;
+        for later in [at, at + 1] {
+            let (sums, samples) = retried_remote_write(batch(vec![rate(at), rate(later)])).await;
+            assert_eq!(samples, [(0.5, at / 1_000_000)], "{later}");
+            let reason = [("reason", "duplicate_timestamp")];
+            assert_eq!(sum_of(&sums, "logit.output.metrics.normalized", &reason), 0.0, "{later}");
+            assert_eq!(sum_of(&sums, DUPLICATE.0, DUPLICATE.1), 1.0, "{later}");
+        }
+    }
+
+    /// Two sets of one member each, `{alice}` and `{bob}`, both write a size gauge of `1`, but
+    /// their union is `2`: the earlier is a lost observation set, counted `dropped`, though the
+    /// two gauges are equal.
+    #[tokio::test]
+    async fn an_equal_size_set_with_other_members_is_counted_dropped() {
+        let members = |timestamp: i64, member: &'static str| {
+            Event::metric(
+                timestamp,
+                AttrMap::new(),
+                MetricRecord::new(
+                    intern("users"),
+                    MetricKind::SetMembers(vec![bytes::Bytes::from_static(member.as_bytes())]),
+                ),
+            )
+        };
+        let at = 1_700_000_000_000_000_000;
+        for later in [at, at + 1] {
+            let pair = vec![members(at, "alice"), members(later, "bob")];
+            let (sums, samples) = retried_remote_write(batch(pair)).await;
+            assert_eq!(samples, [(1.0, at / 1_000_000)], "{later}");
+            let reason = [("reason", "duplicate_timestamp")];
+            assert_eq!(sum_of(&sums, "logit.output.metrics.normalized", &reason), 0.0, "{later}");
+            assert_eq!(sum_of(&sums, DUPLICATE.0, DUPLICATE.1), 1.0, "{later}");
+        }
+    }
+
+    /// Two equal `Samples` records at one instant are two sets of observations, written as
+    /// summaries: the later is sent and the earlier counted `dropped`, though they're equal.
+    #[tokio::test]
+    async fn an_equal_samples_reading_is_counted_dropped() {
+        let samples = |timestamp: i64| {
+            Event::metric(
+                timestamp,
+                AttrMap::new(),
+                MetricRecord::new(
+                    intern("latency"),
+                    MetricKind::Samples(logit_core::Samples::new([1.0])),
+                ),
+            )
+        };
+        let at = 1_700_000_000_000_000_000;
+        for later in [at, at + 1] {
+            let (sums, _) = retried_remote_write(batch(vec![samples(at), samples(later)])).await;
+            let reason = [("reason", "duplicate_timestamp")];
+            assert_eq!(sum_of(&sums, "logit.output.metrics.normalized", &reason), 0.0, "{later}");
+            assert_eq!(sum_of(&sums, DUPLICATE.0, DUPLICATE.1), 1.0, "{later}");
+        }
+    }
+
+    /// Of `5`, `7`, and `5` at one instant, the last is sent: the first, equal to it, is counted
+    /// `normalized`, and the `7` `dropped`, since each is compared with the reading sent.
+    #[tokio::test]
+    async fn a_remote_write_reading_is_compared_with_the_one_sent() {
+        let at = 1_700_000_000_000_000_000;
+        let events = vec![gauge_at(at, 5.0), gauge_at(at, 7.0), gauge_at(at, 5.0)];
+        let (sums, samples) = retried_remote_write(batch(events)).await;
+        assert_eq!(samples, [(5.0, at / 1_000_000)]);
+        let reason = [("reason", "duplicate_timestamp")];
+        assert_eq!(sum_of(&sums, "logit.output.metrics.normalized", &reason), 1.0);
+        assert_eq!(sum_of(&sums, DUPLICATE.0, DUPLICATE.1), 1.0);
+    }
+
+    /// The exposition registry keeps one value per series between scrapes, so a later reading
+    /// replacing an earlier one in a batch is the pull model's overwrite, uncounted.
+    #[tokio::test]
+    async fn an_exposition_sink_counts_no_duplicate_timestamp() {
+        let registry = logit_core::Registry::new();
+        let mut sink = ExposeOutput::new("127.0.0.1:0")
+            .with_expire_after(Duration::ZERO)
+            .with_telemetry(registry.telemetry_for("out", "prometheus_out", "sink"));
+        sink.send(&batch(vec![gauge_at(5, 1.0), gauge_at(5, 2.0)])).await.unwrap();
+        assert_eq!(
+            counter(&registry, "logit.output.metrics.dropped", "reason", "duplicate_timestamp"),
+            0.0
+        );
+    }
+
+    /// A reading dropped as a duplicate counts only its `duplicate_timestamp`, at either collapse:
+    /// its record's degrade describes a summary that isn't sent.
+    #[tokio::test]
+    async fn a_duplicate_reading_counts_no_degrade() {
+        let samples = |timestamp: i64, value: f64| {
+            Event::metric(
+                timestamp,
+                AttrMap::new(),
+                MetricRecord::new(
+                    intern("latency"),
+                    MetricKind::Samples(logit_core::Samples::new([value])),
+                ),
+            )
+        };
+        let at = 1_700_000_000_000_000_000;
+        for later in [at, at + 1] {
+            let pair = vec![samples(at, 1.0), samples(later, 2.0)];
+            let (sums, _) = retried_remote_write(batch(pair)).await;
+            let degraded = [("metric_kind", "samples")];
+            assert_eq!(sum_of(&sums, "logit.output.metrics.degraded", &degraded), 1.0, "{later}");
+            assert_eq!(sum_of(&sums, DUPLICATE.0, DUPLICATE.1), 1.0, "{later}");
+        }
     }
 }

@@ -8,7 +8,8 @@
 //! - `Value::U64` up to `i64::MAX` encodes as `IntValue` and decodes as `Value::I64`: numerically
 //!   exact, but no longer unsigned.
 //! - `Value::U64` above `i64::MAX` encodes as `DoubleValue`, exact up to 2^53 and lossy above, and
-//!   decodes as `Value::F64`.
+//!   decodes as `Value::F64`. The encoder counts one in a resource, scope, or event attribute as
+//!   `logit.output.attributes.normalized{reason="u64_as_double"}` ([`u64_as_double_count`]).
 //! - `Value::Timestamp` encodes as `IntValue` and decodes as `Value::I64`.
 //!
 //! **Nesting** (grouping rules in `super`'s module doc). A batch's resource becomes one
@@ -110,6 +111,24 @@ pub(crate) fn attrs_to_key_values(attrs: &AttrMap) -> Vec<pb::KeyValue> {
         .filter(|(key, _)| !logit_core::attrs::is_private(resolve(*key)))
         .map(|(key, value)| key_value(key, value))
         .collect()
+}
+
+/// How many values [`attrs_to_key_values`] writes as a `DoubleValue` for a `Value::U64` above
+/// `i64::MAX` (the module doc's lossy cases), nested ones included, for the encoder to count.
+pub(crate) fn u64_as_double_count(attrs: &AttrMap) -> usize {
+    fn count(value: &Value) -> usize {
+        match value {
+            Value::U64(u) => usize::from(*u > i64::MAX as u64),
+            Value::Array(items) => items.iter().map(count).sum(),
+            Value::Map(map) => map.iter().map(|(_, v)| count(v)).sum(),
+            _ => 0,
+        }
+    }
+    attrs
+        .iter()
+        .filter(|(key, _)| !logit_core::attrs::is_private(resolve(*key)))
+        .map(|(_, value)| count(value))
+        .sum()
 }
 
 /// A `Value::Map` nested inside an attribute as OTLP `KeyValue`s, every key kept: a nested key is

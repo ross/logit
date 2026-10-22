@@ -1423,4 +1423,24 @@ mod tests {
         let c = attrs(&[("x", Value::str("1"))]);
         assert_ne!(keyset_hash(&a), keyset_hash(&c));
     }
+
+    #[test]
+    fn zero_caps_track_nothing_and_report_overflow() {
+        let registry = Registry::new();
+        let mut shape = Shape::new(Duration::from_secs(10))
+            .with_caps(0, 0)
+            .with_telemetry(registry.telemetry_for("tap", "shape", "transform"));
+        let resource = resource();
+        run_batch(&mut shape, Some("in"), &resource, None, vec![nginx_shaped_event()]);
+
+        let flushed = flush_events(&mut shape, 1);
+        let gauges =
+            flushed.iter().find(|e| gauge(e, "logit.shape.distinct_keys").is_some()).unwrap();
+        assert_eq!(gauge(gauges, "logit.shape.distinct_keys"), Some(0.0));
+        assert_eq!(gauge(gauges, "logit.shape.distinct_keysets"), Some(0.0));
+        assert_eq!(gauge(gauges, "logit.shape.tracking_overflow"), Some(1.0));
+
+        let points = registry.drain(0);
+        assert_eq!(telemetry_counter(&points, "logit.transform.keys.untracked"), Some(10.0));
+    }
 }
