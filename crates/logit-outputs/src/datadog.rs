@@ -2573,15 +2573,15 @@ mod tests {
             oversized_sketch(NOW),
             log_with_reserved_key(NOW, "kept"),
             span(3, 5, None, &[("http.route", Value::str("/"))]),
-            bool_false_gauge(),
+            map_valued_gauge(),
             Event::empty(NOW, AttrMap::new()),
         ])
     }
 
-    /// A gauge tagged `off: false`, which has no Datadog tag form.
-    fn bool_false_gauge() -> Event {
+    /// A gauge with a map-valued attribute, which has no Datadog tag form.
+    fn map_valued_gauge() -> Event {
         let mut attrs = AttrMap::new();
-        attrs.insert("off", Value::Bool(false));
+        attrs.insert("nested", Value::Map(Box::new(AttrMap::new())));
         Event::metric(NOW, attrs, MetricRecord::new(intern("flags"), MetricKind::gauge(1.0)))
     }
 

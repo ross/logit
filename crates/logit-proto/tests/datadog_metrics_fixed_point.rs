@@ -90,6 +90,34 @@ fn json_bytes(v: JsonValue) -> Vec<u8> {
 
 // -- hand-written vectors ------------------------------------------------------------------------
 
+/// A unit `datadog_in` decodes is a Datadog unit name, whatever it spells: it leaves as it is,
+/// a name outside the UCUM mapper's set (`percent_nano`) and a UCUM-looking one (`ms`) alike.
+/// Every series batch carries the resource marker that says so, a unit-less one included.
+#[test]
+fn a_decoded_unit_leaves_as_it_is() {
+    for unit in ["percent_nano", "millicore", "degree fahrenheit", "ms", "teaspoon"] {
+        let body = format!(
+            r#"{{"series":[{{"metric":"m","points":[[1700000000,1.0]],"tags":[],"host":"h","type":"gauge","interval":0,"unit":"{unit}"}}]}}"#
+        );
+        let decoded = decode(Route::V1, body.as_bytes());
+        assert_eq!(
+            decoded.resource.attributes.get(logit_proto::datadog::ATTR_UNITS),
+            Some(&Value::str("datadog")),
+            "{unit}"
+        );
+        let encoded = encode(Route::V1, &decoded).unwrap();
+        let wire: JsonValue = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(wire["series"][0]["unit"], unit);
+        assert_fixed_point(Route::V1, body.as_bytes());
+    }
+    let unitless =
+        br#"{"series":[{"metric":"m","points":[[1700000000,1.0]],"tags":[],"host":"h"}]}"#;
+    assert_eq!(
+        decode(Route::V1, unitless).resource.attributes.get(logit_proto::datadog::ATTR_UNITS),
+        Some(&Value::str("datadog"))
+    );
+}
+
 #[test]
 fn v1_agent_field_set() {
     let body = br#"{"series":[{"metric":"my.metric","points":[[1700000000,1.0]],"tags":["env:prod"],"host":"myhost","device":"/dev/sda1","type":"rate","interval":20,"source_type_name":"my_check","unit":"byte"}]}"#;

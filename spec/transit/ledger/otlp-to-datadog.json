@@ -1,7 +1,7 @@
 {
   "cells": [
     {"sink":"datadog_out","row":"attributes/array_value","cell":0,"observed":["normalized"]},
-    {"sink":"datadog_out","row":"attributes/bool_value","cell":0,"observed":["lost"]},
+    {"sink":"datadog_out","row":"attributes/bool_value","cell":0,"observed":["normalized"]},
     {"sink":"datadog_out","row":"attributes/bytes_value","cell":0,"observed":["lost"]},
     {"sink":"datadog_out","row":"attributes/map_value","cell":0,"observed":["lost"]},
     {"sink":"datadog_out","row":"attributes/no_host","cell":0,"observed":["normalized"]},
@@ -27,7 +27,7 @@
     {"sink":"datadog_out","row":"record/same_millisecond","cell":0,"observed":["dropped"]},
     {"sink":"datadog_out","row":"record/start_timestamp","cell":0,"observed":["lost"]},
     {"sink":"datadog_out","row":"record/superseded","cell":0,"observed":[]},
-    {"sink":"datadog_out","row":"record/unit","cell":0,"observed":["exact"]},
+    {"sink":"datadog_out","row":"record/unit","cell":0,"observed":["normalized","lost"]},
     {"sink":"datadog_out","row":"sum/cumulative_monotonic","cell":0,"observed":["dropped"]},
     {"sink":"datadog_out","row":"sum/cumulative_nonmonotonic","cell":0,"observed":["degraded"]},
     {"sink":"datadog_out","row":"sum/delta_monotonic","cell":0,"observed":["exact"]},

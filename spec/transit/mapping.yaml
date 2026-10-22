@@ -1350,9 +1350,14 @@ rows:
             OpenMetrics writes `# UNIT` only when `_<unit>` ends the family name; otherwise it's
             left off, counted.
       datadog_out:
-        class: exact
+        class: lost
+        counter: logit.output.fields.omitted{reason=unit_unmapped}
         text: >-
-          The series' `unit`.
+          The series' `unit` as Datadog names it. A unit datadog_in decoded (its batch marked
+          `_logit.datadog.units`) leaves as it is. Any other source's unit leaves as it is when
+          it's a Datadog unit name, else mapped as Datadog's OTel exporter maps a UCUM unit (`ms`
+          as `millisecond`, `By/s` as `byte/second`, `{request}` as `request`); one with no
+          Datadog name, `1` included, is left off, counted once per record.
       graphite_out:
         class: lost
         reason: structural
@@ -2009,7 +2014,9 @@ rows:
           A `key:value` tag. A `host` attribute on a metric with no `host.name` is the host and not
           a tag, which datadog_in reads back as `host.name`. On a Datadog event or service check
           with no non-empty host carrier, `host.name`, else `host`, is the host and not a tag,
-          which datadog_in reads back as that carrier.
+          which datadog_in reads back as that carrier. A `collectd.host` on a record with none of
+          those, or on a log with no `hostname`, `host.name`, `syslog.hostname`, or `host`, is the
+          host and not a tag or log attribute, read back where that route's host reads back.
       graphite_out:
         - when: {tags: drop}
           class: lost
@@ -2052,11 +2059,11 @@ rows:
         class: exact
         text: A boolean attribute.
       datadog_out:
-        class: lost
-        counter: logit.output.tags.omitted{reason=unrepresentable}
+        class: normalized
+        reason: bool_tag
         text: >-
-          `true` is a bare `key` tag, read back as `true`; `false` has no Datadog tag form, so it
-          writes no tag and is counted.
+          `true` is a bare `key` tag and reads back `true`; `false` is `key:false` and reads back as
+          the string.
       graphite_out:
         - when: {tags: drop}
           class: lost
@@ -2302,7 +2309,9 @@ rows:
         counter: logit.output.tags.omitted{reason=no_wire_form}
         text: >-
           A `_logit.datadog.*` carrier rides in its own wire field; one the route has no field for
-          is left off, counted.
+          is left off, counted. `_logit.datadog.units`, which marks a decoded batch's units as
+          Datadog names, is read and not written; datadog_in stamps it again on every series
+          batch.
   - kind: attributes
     feature: prometheus_target
     cells:
@@ -2498,7 +2507,8 @@ rows:
         class: normalized
         reason: default_host
         text: >-
-          A record with no host and no hostless mark leaves with the process hostname as its host,
+          A record with no host, no `collectd.host`, and no hostless mark leaves with the process
+          hostname as its host,
           which datadog_in reads back as `host.name`, a log's `hostname`, or an event's or service
           check's host carrier; a span keeps its own hostnames.
       graphite_out:

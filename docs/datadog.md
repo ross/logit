@@ -133,10 +133,13 @@ Datadog series whichever way it went
 
 `histograms.send_aggregation_metrics: true` adds `<name>.count`, `<name>.sum`, `<name>.min`, and
 `<name>.max` series for each delta histogram and exponential histogram, as the exporter's setting
-of the same name does. Two differences from the exporter remain: a series carries its OTLP unit
-as written rather than Datadog's name for it, and tags come from the event's attributes and
-resource as for every other `datadog_out` metric, not from the exporter's resource-attribute
-tables (`docs/known-gaps/datadog.md`).
+of the same name does. A series carries its unit as the exporter writes it: an OTLP (UCUM) unit
+under Datadog's name for it (`ms` as `millisecond`, `By/s` as `byte/second`), and no unit where
+Datadog has none, counted `logit.output.fields.omitted{reason="unit_unmapped"}`. A unit that
+arrived through `datadog_in` is already Datadog's and leaves as it is. One difference
+from the exporter remains: tags come from the event's attributes and resource as for every other
+`datadog_out` metric, not from the exporter's resource-attribute tables
+(`docs/known-gaps/datadog.md`).
 
 **Convert cumulative metrics to delta first.** Most SDKs default to cumulative temporality, and
 Datadog needs a monotonic `Sum`, a `Histogram`, an `ExponentialHistogram`, and a summary's
@@ -158,8 +161,9 @@ overwrites at its series and timestamp.
 
 ### collectd to Datadog: `collectd_in` into `datadog_out`
 
-A collectd fleet's `network` plugin can send to `collectd_in`, and `datadog_out` writes each
-data-source type as follows
+A collectd fleet's `network` plugin can send to `collectd_in`. `datadog_out` sends each value
+list and notification under its collectd host (`collectd.host`) unless it carries a `host.name`,
+so every collectd sender keeps its own Datadog host, and writes each data-source type as follows
 ([fixtures/collectd-to-datadog.yaml](../fixtures/collectd-to-datadog.yaml)):
 
 | collectd type | `logit` model | What Datadog gets |
@@ -284,9 +288,10 @@ the rest of the request was stored.
 ([deploying.md's "Hostname"](deploying.md#hostname)) as the host of anything that carries none of
 its own:
 
-- a metric with no `host.name` and no DogStatsD `host:` tag;
-- an event or service check with no `h:` field, no `host.name`, and no `host:` tag;
-- a log with none of `hostname`, `host.name`, `syslog.hostname`, or `host`.
+- a metric with no `host.name`, no DogStatsD `host:` tag, and no `collectd.host`;
+- an event or service check with no `h:` field, no `host.name`, no `host:` tag, and no
+  `collectd.host`;
+- a log with none of `hostname`, `host.name`, `syslog.hostname`, `host`, or `collectd.host`.
 
 That's what an Agent does for a DogStatsD client that names no host, so a `logit` on each host
 behaves as the Agent it replaces. A central `logit` receiving from many hosts is different: every
@@ -295,7 +300,9 @@ view of them is lost. Datadog bills per host, so the cost matches one Agent.
 
 To keep a host per sender, stamp `host.name` upstream with `set`, or have each DogStatsD client
 send a `host:` tag (or `h:` on an event or check). A host the data carries is never replaced. A
-`host:` tag is the host, and isn't sent as a tag, as the Agent reads it. A sample a client made
+`host:` tag is the host, and isn't sent as a tag, as the Agent reads it. So is a `collectd.host`,
+which `collectd_in` stamps from each value list's and notification's host, unless the sample is
+marked hostless as below. A sample a client made
 hostless with an empty `host:` tag stays hostless, and so does a sample an Agent sends hostless:
 a v2 `host` resource with no name, or `"host":""` on the v1, distribution-point, and sketch
 routes. An empty sketch `host` always reads as hostless, because protobuf can't tell it from a

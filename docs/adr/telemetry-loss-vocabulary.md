@@ -1,6 +1,6 @@
 ---
 created: 2026-10-13
-updated: 2026-10-21
+updated: 2026-10-22
 ---
 
 # Telemetry loss vocabulary: any nonzero `*.dropped` is loss, and intended outcomes use other words
@@ -282,7 +282,7 @@ uncounted:
 |---|---|---|
 | Record level | a whole record or event isn't written | `*.skipped{reason}` when the format can't hold it, `*.dropped{reason}` when it's loss to look into, per the `skipped` versus `dropped` rule above |
 | Structural | a field the destination's format has no slot for: a unit, description, start time, or instrumentation scope at a sink with none, a histogram's `min` and `max` at `prometheus_out`, a summary's exemplars at `otlp_out`, a private carrier at a foreign sink | nothing; the cell's reason is `structural` |
-| Value dependent | a field that survives or not by its value: `Bool(false)` at `datadog_out`, a `u64` past `i64::MAX` at `otlp_out`, a rate that rounds to weight 1, a name the sink rewrites | `*.omitted{reason}`, `*.degraded{reason}`, or `*.normalized{reason}` for a rewrite, as `tags.omitted{reason="unrepresentable"}` and `labels.omitted` already do |
+| Value dependent | a field that survives or not by its value: a unit with no Datadog name at `datadog_out`, a `u64` past `i64::MAX` at `otlp_out`, a rate that rounds to weight 1, a name the sink rewrites | `*.omitted{reason}`, `*.degraded{reason}`, or `*.normalized{reason}` for a rewrite, as `tags.omitted{reason="unrepresentable"}` and `labels.omitted` already do |
 
 - **A structural loss isn't counted because the count would say nothing.** Every record of that
   kind loses the field at that sink, so a counter would track the record count, and an alert on

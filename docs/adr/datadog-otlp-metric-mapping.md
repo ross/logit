@@ -1,6 +1,6 @@
 ---
 created: 2026-10-20
-updated: 2026-10-21
+updated: 2026-10-22
 ---
 
 # `datadog_out` maps OTLP metric kinds as Datadog's OTel exporter does, statelessly
@@ -192,7 +192,8 @@ nowhere to say what it is. `logit` is pre-release, so the field is a plain addit
 - **Interval** is the `_logit.datadog.interval` carrier where present, else `0`. The exporter
   sends `0` unless its alpha `InferIntervalForDeltaMetrics` gate is on.
 - **Units.** The exporter's `AddUnits` gate is on by default, so a series carries the record's
-  unit, as `datadog_out` already writes it; `.count` and `.bucket` drop it.
+  unit, as `datadog_out` already writes it; `.count` and `.bucket` drop it. The
+  [units amendment](#amendment-units-as-datadog-names-them-2026-10-22) maps the unit first.
 - **Names** are the record's own plus the translator's suffixes (`.count`, `.sum`, `.min`,
   `.max`, `.bucket`, `.quantile`). There's no `otel.` prefix or Datadog-name remapping: the
   exporter's `DisableAllMetricRemapping` gate is beta, so on by default, and skips both.
@@ -291,3 +292,46 @@ Read from source on 2026-10-20; nothing was built or run.
   sum's type into `RATE`; the value is divided by the interval only when the interval is nonzero,
   which needs the alpha gate, and an error is logged once otherwise. The attribute stays among the
   point's tags.
+
+## Amendment: units as Datadog names them (2026-10-22)
+
+The decision above sent a series' unit as the record carries it. Under `AddUnits` the exporter
+doesn't: `UnitMapper.Map` (`pkg/opentelemetry-mapping-go/otlp/attributes/units.go`) maps a UCUM
+unit to Datadog's name for it and writes no unit for one it can't map. A unit Datadog doesn't
+recognize, such as `ms`, shows in Datadog as no unit or the wrong one.
+
+`datadog_out` now maps a unit the same way, from a table transcribed from that file at
+datadog-agent commit `45132452`, the commit `tools/differential/datadog-sketch/go.mod` pins
+(`logit_proto::datadog::units`):
+
+- `""` and `1` map to no unit. A rate maps each side of its one `/`, and more than one `/`
+  doesn't map.
+- An annotation maps to its name when Datadog has that unit (`{request}` to `request`), and
+  `{datapoint}` to `item`.
+- A base unit maps bare or after a prefix that the translator lists for it: `By` to `byte`,
+  `KiBy` to `kibibyte`, `ms` to `millisecond`. `mBy`, `min`, and `d` don't map.
+- A Datadog unit name passes through unchanged, ahead of the mapping: any name the mapping can
+  produce, a rate of two, and `nanocore`, which the translator's own `metrics_remapping.go` sets.
+
+A unit that neither passes through nor maps is left off the series and counted
+`logit.output.fields.omitted{reason="unit_unmapped"}`, once per record. It's `omitted` because
+the record is still delivered without one of its fields, per
+[ADR `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md). The exporter counts nothing.
+
+**A unit `datadog_in` decoded is never mapped.** Datadog's unit catalog holds names the
+translator never produces (`percent_nano`, `millicore`, `degree fahrenheit`), and an Agent or a
+client may send any of them, so the pass-through set alone would drop them on the
+`datadog_in -> datadog_out` relay. `datadog_in` marks every series batch it decodes (v1, v2
+JSON, v2 protobuf) with the private resource attribute `_logit.datadog.units: datadog`, and
+`datadog_out` writes the unit of an event under that mark as it is. The mark sits on the batch
+resource rather than on each record because every series in a batch comes from one decode. It's
+on every series batch, a unit-less one included, because `aggregate` and `cumulative_to_delta`
+key a series on its resource: a mark on some payloads and not others would split one series into
+two points per window, which a Datadog `count` loses uncounted. Distribution points and sketches
+carry no unit, so their batches carry no mark; each route still gives one source one resource.
+The mark covers the whole batch, so a unit a later stage sets on a record of a marked batch also
+leaves unmapped. It's private, so every other sink ignores it.
+It survives every stage that keeps the batch resource: `aggregate` groups records by resource and
+emits each group under its own, and `keep`, `remove`, and `set` leave other resource attributes
+alone. A stage that builds a new resource drops it, and `datadog_out` then maps those units as
+any other source's.

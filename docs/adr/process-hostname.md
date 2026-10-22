@@ -1,6 +1,6 @@
 ---
 created: 2026-10-14
-updated: 2026-10-14
+updated: 2026-10-22
 ---
 
 # Process hostname: one resolved name, `host.name` on `internal`'s resource
@@ -101,3 +101,23 @@ lists the hostless spellings. The Consequences' recipe for host-less `internal` 
 removed host back in with the same name. Trace and stats hostnames in `datadog_out` and everything in
 `datadog_trace_out` stay verbatim relay metadata. `collectd_out` is unchanged, for the reason in
 the Decision above.
+
+## Amendment: `datadog_out` reads `collectd.host` (2026-10-22)
+
+`collectd_in` stamps each value list's and notification's host as `collectd.host`, and
+`datadog_out` didn't read it, so every collectd sender behind a relay reported under the relay's
+process hostname. collectd identifies a value by host, plugin, and type, so its host is the Datadog
+host of the series it sends.
+
+`datadog_out` now ranks a non-empty `Str` `collectd.host` as an event's own host, after the
+others in the table above and before the process hostname: for a metric, after `host.name`, a
+DogStatsD `host:` tag, and the Datadog hostless marks (an empty `host:` tag, a v2 `host` resource
+with no name, or `_logit.datadog.hostless`), since a sender that marked a sample hostless chose no
+host; for an event or service check, after `statsd.*.host`, `host.name`, and `host:`; for a log,
+after `hostname` and `host.name`, and only when the log carries neither `syslog.hostname` nor
+`host`. Read as the host, it leaves as the host and not as a tag or a log attribute; when another
+host or a hostless mark wins, it stays a tag.
+
+`host.name` stays first, ahead of `collectd.host`, because it's how an operator overrides a host
+with `set`. `collectd_out` reads the two the other way round (`collectd.host`, then `host.name`),
+because there `collectd.host` is the wire's own field.

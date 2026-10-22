@@ -5,6 +5,7 @@
 use super::time::{millis_to_nanos, nanos_to_millis, or_received};
 use super::{
     is_datadog_event, DatadogDecoder, DatadogEncoder, ATTR_HOST_NAME, ATTR_HOST_TAG, ATTR_SOURCE,
+    COLLECTD_HOST_KEY,
 };
 use crate::json::{json_to_value, value_text, write_i64, write_str, write_value, JsonObject};
 use crate::CodecError;
@@ -256,7 +257,14 @@ impl DatadogEncoder {
                 && find(keys.syslog_hostname).is_none()
                 && find(keys.host_tag).is_none()
             {
-                if let Some(host) = &self.default_host {
+                // collectd's own host (a notification's), else the default; a `collectd.host`
+                // read as the host isn't also an attribute.
+                let collectd = *COLLECTD_HOST_KEY;
+                let own = find(collectd).and_then(Value::as_str).filter(|h| !h.is_empty());
+                if let Some(host) = own {
+                    write_str(obj.key(key), host);
+                    consumed.push(collectd);
+                } else if let Some(host) = &self.default_host {
                     write_str(obj.key(key), host);
                 }
             }
@@ -550,6 +558,31 @@ pub(super) mod tests {
             let item = &serde_json::from_slice::<Json>(&out.unwrap()).unwrap()[0];
             assert!(item.get("hostname").is_none(), "{key}: {item}");
             assert_eq!(item[key], "web1");
+        }
+    }
+
+    /// A `collectd.host` (a collectd notification's host) is the `hostname` of a log with no
+    /// host of its own, and then not an attribute; any of the log's own hosts outranks it.
+    #[test]
+    fn a_collectd_host_is_the_hostname_below_the_logs_own_hosts() {
+        let encoder = DatadogEncoder::new().with_default_host(Some(Arc::from("relay")));
+        let encode_with = |extra: &str| {
+            let body = format!(r#"[{{"message":"a","collectd.host":"web1"{extra}}}]"#);
+            let out = encoder.encode_logs(&decode(&body)).unwrap();
+            serde_json::from_slice::<Json>(&out).unwrap()[0].clone()
+        };
+        let item = encode_with("");
+        assert_eq!(item["hostname"], "web1");
+        assert!(item.get("collectd.host").is_none(), "{item}");
+        for (extra, hostname) in [
+            (r#","hostname":"h""#, Some("h")),
+            (r#","host.name":"m""#, Some("m")),
+            (r#","host":"t""#, None),
+            (r#","syslog.hostname":"s""#, None),
+        ] {
+            let item = encode_with(extra);
+            assert_eq!(item.get("hostname").and_then(Json::as_str), hostname, "{extra}");
+            assert_eq!(item["collectd.host"], "web1", "{extra}");
         }
     }
 

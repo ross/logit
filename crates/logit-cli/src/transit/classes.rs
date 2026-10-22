@@ -82,8 +82,8 @@
 //! key's `sanitize_label_name`, and an array's last element; `influxdb_out`'s `<name>.value` for
 //! a `sum`, `gauge`, or `set` off the carrier path, and an array's last element; `otlp_out`'s
 //! timestamp value as an integer of nanoseconds, and an OpenMetrics `info` or `stateset` gauge
-//! read back as a cumulative non-monotonic sum, an `info` one under `<name>_info`; `datadog_out`'s `host` attribute read back under
-//! its route's host key, and the attributes it writes from a record's own fields
+//! read back as a cumulative non-monotonic sum, an `info` one under `<name>_info`; `datadog_out`'s `host` attribute, and a `collectd.host` on a
+//! record with no other host, read back under its route's host key, and the attributes it writes from a record's own fields
 //! ([`Spelling::derived`]: the run's hostname on a record with no host, a log's `status`, a
 //! span's `span.kind` and `_dd.p.tid`), each accepted only with the value derived for it;
 //! `graphite_out`'s forbidden characters as `_` in a path, a tag name, and a tag value (and a tag
@@ -325,8 +325,8 @@ enum Spelling {
     /// suffix; an `info` or `stateset` gauge as a cumulative non-monotonic sum; a timestamp value
     /// as an integer of Unix nanoseconds.
     Otlp,
-    /// `datadog_out`: names as written; a `host` attribute the encoder takes as the host as
-    /// `host.name`; and the attributes [`Spelling::derived`] lists, which the encoder writes from
+    /// `datadog_out`: names as written; a `host` or `collectd.host` attribute the encoder takes
+    /// as the host under its route's host key; and the attributes [`Spelling::derived`] lists, which the encoder writes from
     /// a record's own fields and `datadog_in` reads back as attributes the input lacks.
     Datadog,
     /// `graphite_out`: each character carbon forbids in a path, a tag name, or a tag value as
@@ -468,7 +468,8 @@ impl Spelling {
 
     /// [`Spelling::key`] for attribute `key` of `rec`, where the spelling depends on the record:
     /// `datadog_out` writes a non-empty `Str` `host` as the host of a metric, Datadog event, or
-    /// service check that carries no other, and `datadog_in` reads that host back under the
+    /// service check that carries no other, and a non-empty `Str` `collectd.host` as the host of
+    /// any record but a span that carries none of those, and `datadog_in` reads that host back under the
     /// route's host key ([`datadog::Route::host_key`]; `logit_proto::datadog`'s encode tables and
     /// permitted normalizations). `statsd_out` under `format: dogstatsd` writes `host.name` or
     /// the hostless mark as the `host:` tag where [`statsd`] says so, which `statsd_in` reads back
@@ -476,7 +477,8 @@ impl Spelling {
     fn key_for(self, key: &str, rec: &Rec) -> String {
         if self == Spelling::Datadog
             && ((key == "host" && datadog::host_tag_is_host(rec))
-                || (key == "host.name" && datadog::host_name_is_carried_host(rec)))
+                || (key == "host.name" && datadog::host_name_is_carried_host(rec))
+                || (key == datadog::COLLECTD_HOST && datadog::collectd_host_is_host(rec)))
         {
             return datadog::Route::of(rec).host_key().to_string();
         }
@@ -695,6 +697,9 @@ mod datadog {
         }
     }
 
+    /// `collectd_in`'s host attribute, which the encoder takes as the host below the others.
+    pub(super) const COLLECTD_HOST: &str = "collectd.host";
+
     /// An attribute, the event's over the resource's.
     fn get<'a>(rec: &'a Rec, key: &str) -> Option<&'a Value> {
         rec.attributes.get(key).or_else(|| rec.resource.get(key))
@@ -736,6 +741,31 @@ mod datadog {
             && get(rec, "host").and_then(Value::as_str).is_some_and(|h| !h.is_empty())
     }
 
+    /// Whether a non-empty `Str` `collectd.host` is the host of `rec`, and so not written as a
+    /// tag or a log attribute: on a log with none of `hostname`, `host.name`, `syslog.hostname`,
+    /// or `host`, and on any other record but a span with no host carrier of its own, no
+    /// [`named`] `host.name`, no `Str` `host`, and no hostless mark ([`hostless_mark`]).
+    pub(super) fn collectd_host_is_host(rec: &Rec) -> bool {
+        let bytes = rec.attribute_types.get(COLLECTD_HOST).is_some_and(|t| t.contains("=bytes"));
+        let usable = !bytes
+            && get(rec, COLLECTD_HOST).and_then(Value::as_str).is_some_and(|h| !h.is_empty());
+        let route = Route::of(rec);
+        let has = |key: &str| get(rec, key).is_some();
+        usable
+            && match route {
+                Route::Span => false,
+                Route::Log => {
+                    !["hostname", "host.name", "syslog.hostname", "host"].iter().any(|k| has(k))
+                }
+                Route::Metric | Route::Event | Route::Check => {
+                    !named(rec)
+                        && !own_host(rec, route)
+                        && !get(rec, "host").is_some_and(Value::is_string)
+                        && !hostless_mark(rec)
+                }
+            }
+    }
+
     /// Whether a span carries a field a Datadog span has no form for: `status: ok`, a status
     /// message, `trace_state`, `flags`, or a dropped count.
     pub(super) fn otel_only(rec: &Rec) -> bool {
@@ -745,8 +775,21 @@ mod datadog {
             || body.as_object().is_some_and(|o| o.keys().any(|k| k.starts_with("dropped_")))
     }
 
+    /// Whether `rec` carries a Datadog hostless mark: `_logit.datadog.hostless` `true`, or a
+    /// `host` entry in `_logit.datadog.resources`.
+    fn hostless_mark(rec: &Rec) -> bool {
+        let hostless = get(rec, "_logit.datadog.hostless") == Some(&Value::Bool(true));
+        let host_resource = get(rec, "_logit.datadog.resources")
+            .and_then(Value::as_array)
+            .is_some_and(|r| r.iter().any(|e| e["type"] == "host"));
+        hostless || host_resource
+    }
+
     /// Whether `rec` carries a host or a hostless mark, so the encoder writes no default host.
     pub(super) fn carries_host(rec: &Rec, route: Route) -> bool {
+        if collectd_host_is_host(rec) {
+            return true;
+        }
         let has = |key: &str| get(rec, key).is_some();
         let host_str = get(rec, "host").is_some_and(Value::is_string);
         let own = own_host(rec, route);
@@ -756,13 +799,7 @@ mod datadog {
                 has("hostname") || has("host.name") || has("syslog.hostname") || has("host")
             }
             Route::Event | Route::Check => own || named(rec) || host_str,
-            Route::Metric => {
-                let hostless = get(rec, "_logit.datadog.hostless") == Some(&Value::Bool(true));
-                let host_resource = get(rec, "_logit.datadog.resources")
-                    .and_then(Value::as_array)
-                    .is_some_and(|r| r.iter().any(|e| e["type"] == "host"));
-                named(rec) || host_str || hostless || host_resource
-            }
+            Route::Metric => named(rec) || host_str || hostless_mark(rec),
             Route::Span => true,
         }
     }
@@ -2511,6 +2548,40 @@ mod tests {
         assert_eq!(pair(&ins, &other, Spelling::Datadog).seen, [None]);
         let host = Field::Attribute { key: "host".to_string(), resource: false };
         assert_eq!(observe_field(&host, &ins[0], &same[0], Spelling::Datadog), Class::Normalized);
+    }
+
+    /// A `collectd.host` on a metric with no other host is the Datadog host, read back as
+    /// `host.name`, and on a log as `hostname`; it reaches no `no_host` row. Beside a
+    /// `host.name` it stays a tag.
+    #[test]
+    fn datadog_pairs_a_collectd_host_read_back_as_the_routes_host() {
+        let gauge = |attributes: &str| {
+            format!(
+                r#"{{{{T}},"metrics":[{{"name":"g","kind":"gauge","value":1.0}}],"attributes":{attributes}}}"#
+            )
+        };
+        let ins = recs(&[&gauge(r#"{"collectd.host":"web-1"}"#)]);
+        let same = recs(&[&gauge(r#"{"host.name":"web-1"}"#)]);
+        assert_eq!(pair(&ins, &same, Spelling::Datadog).seen, [Some(Class::Exact)]);
+        assert_eq!(pair(&ins, &same, Spelling::Verbatim).seen, [None]);
+        let host = Field::Attribute { key: "collectd.host".to_string(), resource: false };
+        assert_eq!(observe_field(&host, &ins[0], &same[0], Spelling::Datadog), Class::Normalized);
+        assert!(!derived(&ins[0]).iter().any(|(feature, _, _)| *feature == "no_host"));
+
+        let named = recs(&[&gauge(r#"{"collectd.host":"web-1","host.name":"h"}"#)]);
+        assert!(!datadog::collectd_host_is_host(&named[0]));
+        let hostless =
+            recs(&[&gauge(r#"{"collectd.host":"web-1","_logit.datadog.hostless":true}"#)]);
+        assert!(!datadog::collectd_host_is_host(&hostless[0]));
+        assert_eq!(pair(&named, &named, Spelling::Datadog).seen, [Some(Class::Exact)]);
+
+        let log = recs(&[
+            r#"{{T},"log":{"format":"raw","message":"m"},"attributes":{"collectd.host":"web-1"}}"#,
+        ]);
+        let read = recs(&[
+            r#"{{T},"log":{"format":"raw","message":"m"},"attributes":{"hostname":"web-1"}}"#,
+        ]);
+        assert_eq!(observe_field(&host, &log[0], &read[0], Spelling::Datadog), Class::Normalized);
     }
 
     const DOGSTATSD: Spelling = Spelling::Statsd { dogstatsd: true };
