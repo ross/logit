@@ -360,7 +360,7 @@ pub struct DedupTimestamps {
 }
 
 impl DedupTimestamps {
-    /// `precision` must be nonzero (graph rule 95); a zero one is read as one nanosecond.
+    /// `precision` must be nonzero (graph rule 96); a zero one is read as one nanosecond.
     pub fn new(precision: Duration) -> Self {
         Self {
             precision: i64::try_from(precision.as_nanos()).unwrap_or(i64::MAX).max(1),

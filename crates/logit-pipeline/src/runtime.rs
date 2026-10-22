@@ -86,6 +86,8 @@ pub enum NodeSpec {
         script: String,
         interval: Option<Duration>,
         runtime: LuaRuntimeConfig,
+        /// The component's `vars:`, built into the VM's `vars` global before the script runs.
+        vars: logit_config::LuaVars,
     },
 }
 
@@ -444,7 +446,7 @@ pub async fn run_with_options(
                 // component (nothing checks spec kind against config kind here); the `Role::Target`
                 // guard above skips real targets. Doing nothing beats panicking.
             }
-            NodeSpec::Lua { script, interval, runtime } => {
+            NodeSpec::Lua { script, interval, runtime, vars } => {
                 // A Lua node is a router too: the ids in `component.targets` become
                 // `event:to("..")`'s name -> slot table in the VM, resolved from the same
                 // pre-spawn map as the `Router` arm, so target slot `n` and the script's n-th
@@ -481,6 +483,7 @@ pub async fn run_with_options(
                         run_lua(
                             thread_id,
                             script,
+                            vars,
                             jit,
                             interval,
                             targets,
@@ -2271,6 +2274,7 @@ async fn run_flush(transform: &mut (dyn Transform + Send), fanout: &Fanout, tele
 fn run_lua(
     id: String,
     script: String,
+    vars: logit_config::LuaVars,
     jit: bool,
     configured_interval: Option<Duration>,
     targets: Vec<String>,
@@ -2284,7 +2288,7 @@ fn run_lua(
     shutdown_dropped: Arc<AtomicU64>,
     runtime: tokio::runtime::Handle,
 ) {
-    let worker = match ScriptWorker::new_with_jit(&script, jit)
+    let worker = match ScriptWorker::new_with_vars(&script, jit, &vars)
         .and_then(|w| w.with_telemetry(telemetry.clone()))
         .map(|w| w.with_component(&id))
         .map(|w| w.with_targets(&targets))
@@ -3239,6 +3243,7 @@ mod tests {
                     interval: None,
                     max_memory: None,
                     jit: false,
+                    vars: Default::default(),
                 },
             },
         );
@@ -3285,6 +3290,7 @@ mod tests {
                         .to_string(),
                 interval: None,
                 runtime: LuaRuntimeConfig::default(),
+                vars: Default::default(),
             },
         );
         specs.insert(
@@ -4350,6 +4356,7 @@ mod tests {
                     interval: None,
                     max_memory: None,
                     jit: false,
+                    vars: Default::default(),
                 },
             },
         );
@@ -4387,6 +4394,7 @@ mod tests {
                 script: "function process(event) return {event, event:clone()} end".to_string(),
                 interval: None,
                 runtime: LuaRuntimeConfig::default(),
+                vars: Default::default(),
             },
         );
         specs.insert(
@@ -4498,6 +4506,7 @@ mod tests {
                     interval: None,
                     max_memory: None,
                     jit: false,
+                    vars: Default::default(),
                 },
             },
         );
@@ -4531,7 +4540,12 @@ mod tests {
         );
         specs.insert(
             "enrich".to_string(),
-            NodeSpec::Lua { script, interval: None, runtime: LuaRuntimeConfig::default() },
+            NodeSpec::Lua {
+                script,
+                interval: None,
+                runtime: LuaRuntimeConfig::default(),
+                vars: Default::default(),
+            },
         );
         specs.insert(
             "out".to_string(),
@@ -4609,6 +4623,7 @@ mod tests {
                     interval: None,
                     max_memory: None,
                     jit: false,
+                    vars: Default::default(),
                 },
             },
         );
@@ -4642,7 +4657,12 @@ mod tests {
         );
         specs.insert(
             "enrich".to_string(),
-            NodeSpec::Lua { script, interval: None, runtime: LuaRuntimeConfig::default() },
+            NodeSpec::Lua {
+                script,
+                interval: None,
+                runtime: LuaRuntimeConfig::default(),
+                vars: Default::default(),
+            },
         );
         specs.insert(
             "out".to_string(),
@@ -4731,6 +4751,7 @@ mod tests {
                     interval: None,
                     max_memory: None,
                     jit: false,
+                    vars: Default::default(),
                 },
             },
         );
@@ -4768,6 +4789,7 @@ mod tests {
                 script: "function process(event) error('boom') end".to_string(),
                 interval: None,
                 runtime: LuaRuntimeConfig::default(),
+                vars: Default::default(),
             },
         );
         specs.insert(
@@ -4848,6 +4870,7 @@ mod tests {
                     interval: None,
                     max_memory: None,
                     jit: false,
+                    vars: Default::default(),
                 },
             },
         );
@@ -4881,7 +4904,12 @@ mod tests {
         );
         specs.insert(
             "enrich".to_string(),
-            NodeSpec::Lua { script, interval: None, runtime: LuaRuntimeConfig::default() },
+            NodeSpec::Lua {
+                script,
+                interval: None,
+                runtime: LuaRuntimeConfig::default(),
+                vars: Default::default(),
+            },
         );
         specs.insert(
             "out".to_string(),
@@ -4943,6 +4971,7 @@ mod tests {
                     interval: None,
                     max_memory: None,
                     jit: false,
+                    vars: Default::default(),
                 },
             ),
         );
@@ -4971,7 +5000,12 @@ mod tests {
         );
         specs.insert(
             "enrich".to_string(),
-            NodeSpec::Lua { script, interval: None, runtime: LuaRuntimeConfig::default() },
+            NodeSpec::Lua {
+                script,
+                interval: None,
+                runtime: LuaRuntimeConfig::default(),
+                vars: Default::default(),
+            },
         );
         specs.insert(
             "out".to_string(),
@@ -5050,6 +5084,7 @@ mod tests {
                     interval: Some(Duration::from_secs(3600)),
                     max_memory: None,
                     jit: false,
+                    vars: Default::default(),
                 },
             },
         );
@@ -5077,6 +5112,7 @@ mod tests {
                 script: "function process(event) return event end".to_string(),
                 interval: Some(Duration::from_secs(3600)),
                 runtime: LuaRuntimeConfig::default(),
+                vars: Default::default(),
             },
         );
         let (result_tx, _result_rx) = std::sync::mpsc::channel();
@@ -9684,6 +9720,7 @@ mod tests {
                     interval: None,
                     max_memory: None,
                     jit: false,
+                    vars: Default::default(),
                 },
             ),
         );
@@ -9708,6 +9745,7 @@ mod tests {
                 // lands, find a new vector rather than relaxing the assertions.
                 interval: Some(Duration::ZERO),
                 runtime: LuaRuntimeConfig::default(),
+                vars: Default::default(),
             },
         );
         let (tx, _out_rx) = std::sync::mpsc::channel();
@@ -9764,6 +9802,7 @@ mod tests {
                     interval: None,
                     max_memory: None,
                     jit: false,
+                    vars: Default::default(),
                 },
             ),
         );
@@ -9792,6 +9831,7 @@ mod tests {
                 script: "function process(event) return event end".to_string(),
                 interval: None,
                 runtime: LuaRuntimeConfig::default(),
+                vars: Default::default(),
             },
         );
         let (tx, out_rx) = std::sync::mpsc::channel();
@@ -10140,7 +10180,7 @@ mod tests {
     }
 
     fn lua_spec(script: &str, interval: Option<Duration>, runtime: LuaRuntimeConfig) -> NodeSpec {
-        NodeSpec::Lua { script: script.to_string(), interval, runtime }
+        NodeSpec::Lua { script: script.to_string(), interval, runtime, vars: Default::default() }
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -10157,6 +10197,7 @@ mod tests {
                     interval: None,
                     max_memory: None,
                     jit: false,
+                    vars: Default::default(),
                 },
             ),
         );
@@ -10267,6 +10308,7 @@ mod tests {
                     interval: None,
                     max_memory: None,
                     jit: false,
+                    vars: Default::default(),
                 },
             ),
         );
@@ -10421,6 +10463,7 @@ mod tests {
                     interval: Some(Duration::from_secs(3600)),
                     max_memory: None,
                     jit: false,
+                    vars: Default::default(),
                 },
             ),
         );
@@ -10515,6 +10558,7 @@ mod tests {
                     interval: None,
                     max_memory: None,
                     jit: false,
+                    vars: Default::default(),
                 },
             ),
         );
@@ -10623,6 +10667,7 @@ mod tests {
                     interval: None,
                     max_memory: None,
                     jit: false,
+                    vars: Default::default(),
                 },
             ),
         );
@@ -10791,6 +10836,7 @@ mod tests {
                     interval,
                     max_memory: Some(max_memory as u64),
                     jit: false,
+                    vars: Default::default(),
                 },
             ),
         );
@@ -11129,6 +11175,7 @@ mod tests {
                     interval: None,
                     max_memory: None,
                     jit: false,
+                    vars: Default::default(),
                 },
             ),
         );
@@ -11392,6 +11439,7 @@ mod tests {
                     interval: None,
                     max_memory: None,
                     jit: false,
+                    vars: Default::default(),
                 },
             ),
         );
@@ -11404,6 +11452,7 @@ mod tests {
                     interval: None,
                     max_memory: None,
                     jit: false,
+                    vars: Default::default(),
                 },
             ),
         );
@@ -11467,6 +11516,7 @@ mod tests {
                     interval: Some(Duration::from_millis(50)),
                     max_memory: None,
                     jit: false,
+                    vars: Default::default(),
                 },
             ),
         );
@@ -12178,6 +12228,7 @@ mod tests {
                     interval: None,
                     max_memory: None,
                     jit: false,
+                    vars: Default::default(),
                 },
             ),
             ("a", vec![], vec![], ComponentKind::Target {}),
@@ -12277,6 +12328,7 @@ mod tests {
                     interval: None,
                     max_memory: None,
                     jit: false,
+                    vars: Default::default(),
                 },
             ),
             ("a", vec![], vec![], ComponentKind::Target {}),
@@ -12380,6 +12432,7 @@ mod tests {
                     interval: None,
                     max_memory: None,
                     jit: false,
+                    vars: Default::default(),
                 },
             ),
             ("a", vec![], vec![], ComponentKind::Target {}),
@@ -12453,6 +12506,7 @@ mod tests {
                     interval: None,
                     max_memory: None,
                     jit: false,
+                    vars: Default::default(),
                 },
             ),
             ("a", vec![], vec![], ComponentKind::Target {}),
@@ -12582,6 +12636,7 @@ mod tests {
                     interval: None,
                     max_memory: None,
                     jit: false,
+                    vars: Default::default(),
                 },
             ),
             ("a", vec![], vec![], ComponentKind::Target {}),
@@ -12668,6 +12723,7 @@ mod tests {
                     interval: None,
                     max_memory: None,
                     jit: false,
+                    vars: Default::default(),
                 },
             ),
             (
@@ -12679,6 +12735,7 @@ mod tests {
                     interval: None,
                     max_memory: None,
                     jit: false,
+                    vars: Default::default(),
                 },
             ),
             ("shared", vec![], vec![], ComponentKind::Target {}),
@@ -12889,6 +12946,7 @@ mod tests {
                 logs: Some("l".to_string()),
                 metrics: Some("m".to_string()),
                 traces: None,
+                none: None,
             },
             true,
             &["l".to_string(), "m".to_string()],
@@ -13035,6 +13093,7 @@ mod tests {
                     interval: None,
                     max_memory: None,
                     jit: false,
+                    vars: Default::default(),
                 },
             ),
             ("a", vec![], vec![], ComponentKind::Target {}),
@@ -13070,6 +13129,7 @@ mod tests {
                 script: SPLIT_SCRIPT.to_string(),
                 interval: None,
                 runtime: LuaRuntimeConfig::default(),
+                vars: Default::default(),
             },
         );
         specs.insert("a".to_string(), NodeSpec::Target);
@@ -13134,6 +13194,7 @@ mod tests {
                     interval: None,
                     max_memory: None,
                     jit: false,
+                    vars: Default::default(),
                 },
             ),
             ("a", vec![], vec![], ComponentKind::Target {}),
@@ -13161,6 +13222,7 @@ mod tests {
                 script: SPLIT_SCRIPT.to_string(),
                 interval: None,
                 runtime: LuaRuntimeConfig::default(),
+                vars: Default::default(),
             },
         );
         specs.insert("a".to_string(), NodeSpec::Target);
@@ -13220,6 +13282,7 @@ mod tests {
                     interval: None,
                     max_memory: None,
                     jit: false,
+                    vars: Default::default(),
                 },
             ),
             ("a", vec![], vec![], ComponentKind::Target {}),
@@ -13252,6 +13315,7 @@ mod tests {
                 script: script.to_string(),
                 interval: None,
                 runtime: LuaRuntimeConfig::default(),
+                vars: Default::default(),
             },
         );
         specs.insert("a".to_string(), NodeSpec::Target);
@@ -13357,6 +13421,7 @@ mod tests {
                     interval: Some(Duration::from_secs(3600)),
                     max_memory: None,
                     jit: false,
+                    vars: Default::default(),
                 },
             ),
             ("a", vec![], vec![], ComponentKind::Target {}),
@@ -13383,6 +13448,7 @@ mod tests {
                 script: script.to_string(),
                 interval: Some(Duration::from_secs(3600)),
                 runtime: LuaRuntimeConfig::default(),
+                vars: Default::default(),
             },
         );
         specs.insert("a".to_string(), NodeSpec::Target);
@@ -13468,6 +13534,7 @@ mod tests {
                     interval: Some(Duration::from_secs(3600)),
                     max_memory: None,
                     jit: false,
+                    vars: Default::default(),
                 },
             ),
             (
@@ -13479,6 +13546,7 @@ mod tests {
                     interval: None,
                     max_memory: None,
                     jit: false,
+                    vars: Default::default(),
                 },
             ),
             ("out", vec!["watcher"], vec![], influxdb_out()),
@@ -13501,6 +13569,7 @@ mod tests {
                 script: script.to_string(),
                 interval: Some(Duration::from_secs(3600)),
                 runtime: LuaRuntimeConfig::default(),
+                vars: Default::default(),
             },
         );
         specs.insert(
@@ -13714,6 +13783,7 @@ mod tests {
                     interval: Some(Duration::from_secs(3600)),
                     max_memory: None,
                     jit: false,
+                    vars: Default::default(),
                 },
             ),
             ("a", vec![], vec![], ComponentKind::Target {}),
@@ -13742,6 +13812,7 @@ mod tests {
                 script: script.to_string(),
                 interval: Some(Duration::from_secs(3600)),
                 runtime: LuaRuntimeConfig::default(),
+                vars: Default::default(),
             },
         );
         specs.insert("a".to_string(), NodeSpec::Target);

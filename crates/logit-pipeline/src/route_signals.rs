@@ -6,8 +6,14 @@
 //!
 //! **No ordinary edge.** Every event goes to targets or is discarded, so a mark never names
 //! [`Destinations::FORWARD`] (graph rule 92 keeps it out of every `sources:`). An empty mark is a
-//! discard: an event carrying none of the listed signals, an empty event included, counts as
+//! discard: an event carrying none of the listed signals counts as
 //! `logit.component.events.discarded`.
+//!
+//! **`none`.** An event that arrives with no payload takes `signals.none`'s target, whole, as one
+//! part, and is discarded when `none` is unset. The test reads the signals carried on arrival, so
+//! an event emptied only by stripping its unlisted signals is still discarded. The InfluxDB codec
+//! decodes a point whose fields are all strings to such an event (`logit_proto::influxdb`'s module
+//! doc), and `influxdb_out` writes it.
 //!
 //! **Strip semantics, `strip: true`:**
 //!
@@ -46,7 +52,8 @@ pub struct SignalRoutes {
     /// Each signal's destination slot (`n + 1` for target `n`), `None` for an unlisted signal, in
     /// [`signal_index`] bit order.
     slots: [Option<usize>; 3],
-    /// [`signal_masks`]' table, with an empty mark for a carried set naming no listed signal.
+    /// [`signal_masks`]' table, with an empty mark for a carried set naming no listed signal, and
+    /// entry 0, an event that arrived with no payload, `signals.none`'s target or empty.
     masks: [Destinations; 8],
     /// The [`signal_index`] bits of the listed signals.
     listed: usize,
@@ -66,28 +73,30 @@ impl SignalRoutes {
             targets.len(),
             Destinations::MAX_TARGETS
         );
-        let mut slots = [None; 3];
-        let mut per_signal = [Destinations::NONE; 3];
-        let mut listed = 0usize;
-        for (bit, (_, id)) in signals.iter().enumerate() {
-            let Some(id) = id else { continue };
-            let n = targets.iter().position(|t| t == id).unwrap_or_else(|| {
+        let slot_of = |id: &str| {
+            targets.iter().position(|t| t == id).unwrap_or_else(|| {
                 panic!(
                     "route_signals target '{id}' is not among its targets {targets:?} -- rules \
                      48/92 should have guaranteed this resolves"
                 )
-            });
+            })
+        };
+        let mut slots = [None; 3];
+        let mut per_signal = [Destinations::NONE; 3];
+        let mut listed = 0usize;
+        let payload_signals = [&signals.logs, &signals.metrics, &signals.traces];
+        for (bit, id) in payload_signals.into_iter().enumerate() {
+            let Some(id) = id else { continue };
+            let n = slot_of(id);
             slots[bit] = Some(n + 1);
             per_signal[bit] = Destinations::target(n as u16);
             listed |= 1 << bit;
         }
-        Self {
-            slots,
-            masks: signal_masks(per_signal, Destinations::NONE),
-            listed,
-            strip,
-            targets: targets.len(),
-        }
+        let none = signals
+            .none
+            .as_deref()
+            .map_or(Destinations::NONE, |id| Destinations::target(slot_of(id) as u16));
+        Self { slots, masks: signal_masks(per_signal, none), listed, strip, targets: targets.len() }
     }
 
     /// How many targets the table addresses: the length of the node's slot-ordered target
@@ -310,7 +319,13 @@ mod tests {
             logs: logs.map(String::from),
             metrics: metrics.map(String::from),
             traces: traces.map(String::from),
+            none: None,
         }
+    }
+
+    fn with_none(mut signals: SignalTargets, none: &str) -> SignalTargets {
+        signals.none = Some(none.to_string());
+        signals
     }
 
     fn targets(ids: &[&str]) -> Vec<String> {
@@ -523,5 +538,70 @@ mod tests {
         let (out, totals) = run(&routes, vec![event("a", "m"), event("b", "m")]);
         assert_eq!(out, vec![(1, false, parts(&[("a", "m"), ("b", "m")]))]);
         assert_eq!(totals.sum("logit.component.events.copied", &[]), 0.0);
+    }
+
+    #[test]
+    fn none_alone_routes_an_empty_event_and_discards_the_rest() {
+        for strip in [true, false] {
+            let routes = SignalRoutes::new(
+                &with_none(signals(None, None, None), "none_t"),
+                strip,
+                &targets(&["none_t"]),
+            );
+            let (out, totals) = run(&routes, vec![event("a", ""), event("b", "m"), event("c", "")]);
+            assert_eq!(out, vec![(1, false, parts(&[("a", ""), ("c", "")]))], "strip: {strip}");
+            assert_eq!(totals.sum("logit.component.events.discarded", &[]), 1.0, "strip: {strip}");
+            assert_eq!(totals.sum("logit.component.events.copied", &[]), 0.0, "strip: {strip}");
+        }
+    }
+
+    #[test]
+    fn none_sharing_the_metrics_target_routes_both_there_once() {
+        for strip in [true, false] {
+            let routes = SignalRoutes::new(
+                &with_none(signals(Some("logs_t"), Some("metrics_t"), None), "metrics_t"),
+                strip,
+                &targets(&["logs_t", "metrics_t"]),
+            );
+            let (out, totals) =
+                run(&routes, vec![event("a", ""), event("b", "m"), event("c", "l")]);
+            assert_eq!(
+                out,
+                vec![(1, false, parts(&[("c", "l")])), (2, false, parts(&[("a", ""), ("b", "m")])),],
+                "strip: {strip}"
+            );
+            assert_eq!(totals.sum("logit.component.events.received", &[]), 3.0);
+            assert_eq!(
+                totals.sum("logit.component.events.discarded", &[]),
+                0.0,
+                "routed, not discarded"
+            );
+            assert_eq!(totals.sum("logit.component.events.copied", &[]), 0.0, "no copies");
+        }
+    }
+
+    #[test]
+    fn an_event_emptied_by_strip_is_discarded_not_routed_to_none() {
+        let routes = SignalRoutes::new(
+            &with_none(signals(Some("logs_t"), None, None), "none_t"),
+            true,
+            &targets(&["logs_t", "none_t"]),
+        );
+        let (out, totals) = run(&routes, vec![event("a", "m"), event("b", "")]);
+        assert_eq!(out, vec![(2, false, parts(&[("b", "")]))]);
+        assert_eq!(totals.sum("logit.component.events.discarded", &[]), 1.0);
+        assert_eq!(totals.sum("logit.transform.payloads.stripped", &[("signal", "metrics")]), 1.0);
+    }
+
+    #[test]
+    fn without_strip_an_event_with_only_unlisted_signals_is_discarded_not_routed_to_none() {
+        let routes = SignalRoutes::new(
+            &with_none(signals(Some("logs_t"), None, None), "none_t"),
+            false,
+            &targets(&["logs_t", "none_t"]),
+        );
+        let (out, totals) = run(&routes, vec![event("a", "mt"), event("b", "")]);
+        assert_eq!(out, vec![(2, false, parts(&[("b", "")]))]);
+        assert_eq!(totals.sum("logit.component.events.discarded", &[]), 1.0);
     }
 }

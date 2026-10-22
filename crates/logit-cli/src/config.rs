@@ -105,7 +105,18 @@ fn value_kind(value: &Value) -> &'static str {
     }
 }
 
-/// Replaces every `!env VAR_NAME` tag with `VAR_NAME`'s value re-parsed as a YAML scalar, so
+/// How an `!env` value becomes a YAML value.
+#[derive(Clone, Copy, PartialEq)]
+enum EnvScalar {
+    /// Re-parsed as a YAML scalar ([`scalar_from_env`]), so `!env PORT` works in an integer field.
+    Retype,
+    /// Kept as the string it is. Inside a `lua`/`lua_file` `vars:`, where every type is valid, a
+    /// re-parse would silently turn a digit-only token into a number the script rounds.
+    String,
+}
+
+/// Replaces every `!env VAR_NAME` tag with `VAR_NAME`'s value: a string anywhere inside a
+/// `lua`/`lua_file` component's `vars:`, and re-parsed as a YAML scalar everywhere else, so
 /// `!env PORT` works in an integer field.
 ///
 /// Rejects any other non-core tag: `serde_norway` drops an unrecognized tag on a non-enum target,
@@ -116,17 +127,55 @@ fn resolve(
     path: &mut Vec<PathSeg>,
     substitutions: &mut Vec<Substitution>,
 ) -> anyhow::Result<Value> {
+    resolve_as(value, lookup, path, substitutions, EnvScalar::Retype)
+}
+
+/// Whether `mapping`, at `path`, is a `lua`/`lua_file` component: `components.<id>` whose `type`
+/// is `lua` or `lua_file`, written inline or as `!env VAR`. Runs before the mapping's entries
+/// resolve, so an `!env` `type` is looked up here; an unset variable is reported when the entry
+/// itself resolves.
+fn is_lua_component(
+    path: &[PathSeg],
+    mapping: &Mapping,
+    lookup: &impl Fn(&str) -> Option<String>,
+) -> bool {
+    if !matches!(path, [PathSeg::Key(root), PathSeg::Key(_)] if root == "components") {
+        return false;
+    }
+    let kind = match mapping.get("type") {
+        Some(Value::String(kind)) => Some(kind.clone()),
+        Some(Value::Tagged(tagged)) if tagged.tag == "env" => match &tagged.value {
+            Value::String(var) => lookup(var),
+            _ => None,
+        },
+        _ => None,
+    };
+    matches!(kind.as_deref(), Some("lua" | "lua_file"))
+}
+
+fn resolve_as(
+    value: Value,
+    lookup: &impl Fn(&str) -> Option<String>,
+    path: &mut Vec<PathSeg>,
+    substitutions: &mut Vec<Substitution>,
+    env: EnvScalar,
+) -> anyhow::Result<Value> {
     match value {
         Value::Mapping(mapping) => {
+            let lua = is_lua_component(path, &mapping, lookup);
             let mut resolved = Mapping::with_capacity(mapping.len());
             for (key, value) in mapping {
-                let key = resolve(key, lookup, path, substitutions)?;
+                let key = resolve_as(key, lookup, path, substitutions, env)?;
                 let label = match &key {
                     Value::String(s) => s.clone(),
                     other => format!("<{}>", value_kind(other)),
                 };
+                let env = match lua && label == "vars" {
+                    true => EnvScalar::String,
+                    false => env,
+                };
                 path.push(PathSeg::Key(label));
-                let value = resolve(value, lookup, path, substitutions);
+                let value = resolve_as(value, lookup, path, substitutions, env);
                 path.pop();
                 resolved.insert(key, value?);
             }
@@ -136,7 +185,7 @@ fn resolve(
             let mut resolved = Vec::with_capacity(sequence.len());
             for (index, item) in sequence.into_iter().enumerate() {
                 path.push(PathSeg::Index(index));
-                let item = resolve(item, lookup, path, substitutions);
+                let item = resolve_as(item, lookup, path, substitutions, env);
                 path.pop();
                 resolved.push(item?);
             }
@@ -145,11 +194,11 @@ fn resolve(
         Value::Tagged(tagged) => {
             let TaggedValue { tag, value } = *tagged;
             if tag == "env" {
-                resolve_env_tag(value, tag, lookup, path, substitutions)
+                resolve_env_tag(value, tag, lookup, path, substitutions, env)
             } else if tag.to_string().starts_with("!!") {
                 // A core-schema tag (`!!str`, `!!int`, ...) isn't ours to interpret, but its
                 // contents could nest an `!env`.
-                let value = resolve(value, lookup, path, substitutions)?;
+                let value = resolve_as(value, lookup, path, substitutions, env)?;
                 Ok(Value::Tagged(Box::new(TaggedValue { tag, value })))
             } else {
                 anyhow::bail!(
@@ -168,6 +217,7 @@ fn resolve_env_tag(
     lookup: &impl Fn(&str) -> Option<String>,
     path: &[PathSeg],
     substitutions: &mut Vec<Substitution>,
+    env: EnvScalar,
 ) -> anyhow::Result<Value> {
     let Value::String(var) = value else {
         anyhow::bail!(
@@ -182,7 +232,10 @@ fn resolve_env_tag(
             path_string(path)
         );
     };
-    let resolved = scalar_from_env(raw);
+    let resolved = match env {
+        EnvScalar::Retype => scalar_from_env(raw),
+        EnvScalar::String => Value::String(raw),
+    };
     if !matches!(resolved, Value::String(_)) {
         substitutions.push(Substitution {
             path: path_string(path),
@@ -418,6 +471,179 @@ components:
                 assert_eq!(missing, &Some(logit_config::SampleMissing::Drop));
             }
             other => panic!("expected Sample, got {other:?}"),
+        }
+    }
+
+    /// A `lua_file`'s `vars:` reads through the real YAML path, `Component`'s flatten included,
+    /// with `!env` resolved inside it.
+    #[test]
+    fn lua_vars_read_through_the_real_yaml_path() {
+        use logit_config::LuaVar;
+        let yaml = r#"
+components:
+  in:
+    type: lines_in
+    bind: 127.0.0.1:5140
+  prusa:
+    type: lua_file
+    sources: [in]
+    lua_file: prusa.lua
+    vars:
+      bucket: !env PRUSA_BUCKET
+      port: !env PRUSA_PORT
+      names:
+        "10:9c:70:2d:d5:c4": sand
+      hosts: [a, 2, 0.5, true]
+  out:
+    type: null_out
+    sources: [prusa]
+"#;
+        let config =
+            parse(yaml, &env(&[("PRUSA_BUCKET", "printers"), ("PRUSA_PORT", "8086")])).unwrap();
+        let vars = match &config.components["prusa"].kind {
+            logit_config::ComponentKind::LuaFile { vars, .. } => vars.clone(),
+            other => panic!("expected LuaFile, got {other:?}"),
+        };
+        assert_eq!(vars["bucket"], LuaVar::String("printers".into()));
+        assert_eq!(vars["port"], LuaVar::String("8086".into()), "an !env value is a string");
+        match &vars["names"] {
+            LuaVar::Map(names) => {
+                assert_eq!(names["10:9c:70:2d:d5:c4"], LuaVar::String("sand".into()))
+            }
+            other => panic!("expected a map, got {other:?}"),
+        }
+        assert_eq!(
+            vars["hosts"],
+            LuaVar::List(vec![
+                LuaVar::String("a".into()),
+                LuaVar::Integer(2),
+                LuaVar::Float(0.5),
+                LuaVar::Bool(true),
+            ])
+        );
+    }
+
+    /// A literal YAML `null` and an integer past 2^53 survive parsing so validation can reject
+    /// them by path without printing the value.
+    #[test]
+    fn lua_vars_null_and_wide_integers_fail_validation_by_path() {
+        for (vars, want) in [
+            ("names: {sand: ~}", "'vars.names.sand' is null"),
+            ("ids: [1, 9007199254740993]", "'vars.ids[1]' is an integer larger than 2^53"),
+            ("big: 18446744073709551615", "'vars.big' is an integer larger than 2^53"),
+        ] {
+            let yaml = format!(
+                "components:\n  in: {{type: lines_in, bind: '127.0.0.1:5140'}}\n  \
+                 script:\n    type: lua\n    sources: [in]\n    script: x\n    vars:\n      \
+                 {vars}\n  out: {{type: null_out, sources: [script]}}\n"
+            );
+            let config = parse(&yaml, &env(&[])).unwrap_or_else(|e| panic!("{vars}: {e:#}"));
+            let err = crate::pipeline::validate_semantics(config).unwrap_err().to_string();
+            assert!(err.contains(want), "{vars}: want {want:?}, got: {err}");
+            assert!(!err.contains("18446744073709551615"), "the value leaked: {err}");
+            assert!(!err.contains("9007199254740993"), "the value leaked: {err}");
+        }
+    }
+
+    /// An `!env` value anywhere inside a `lua`/`lua_file` `vars:` stays the string it is, however
+    /// it looks, so a digit-only token never reaches a script as a rounded number. `!env` outside
+    /// `vars:`, in the same component and in another, is still re-parsed.
+    #[test]
+    fn env_values_inside_lua_vars_are_strings() {
+        use logit_config::{ComponentKind, LuaVar};
+        let yaml = r#"
+components:
+  in:
+    type: statsd_in
+    bind: 127.0.0.1:8125
+    transport: tcp
+    max_connections: !env MAX
+  inline:
+    type: lua
+    sources: [in]
+    script: x
+    jit: !env JIT
+    vars:
+      token: !env TOKEN
+      big: !env BIG
+      flag: !env JIT
+      gone: !env NOTHING
+      nested: {list: [!env TOKEN]}
+  file:
+    type: lua_file
+    sources: [inline]
+    lua_file: x.lua
+    vars:
+      token: !env TOKEN
+  out:
+    type: null_out
+    sources: [file]
+"#;
+        let lookup = env(&[
+            ("MAX", "7"),
+            ("JIT", "true"),
+            ("TOKEN", "1234567890123456"),
+            ("BIG", "18446744073709551615"),
+            ("NOTHING", "null"),
+        ]);
+        let config = parse(yaml, &lookup).unwrap();
+        let s = |v: &str| LuaVar::String(v.into());
+        match &config.components["inline"].kind {
+            ComponentKind::Lua { jit, vars, .. } => {
+                assert!(*jit, "jit, outside vars, is still a re-parsed boolean");
+                assert_eq!(vars["token"], s("1234567890123456"));
+                assert_eq!(vars["big"], s("18446744073709551615"));
+                assert_eq!(vars["flag"], s("true"));
+                assert_eq!(vars["gone"], s("null"));
+                assert_eq!(
+                    vars["nested"],
+                    LuaVar::Map(
+                        [("list".into(), LuaVar::List(vec![s("1234567890123456")]))].into()
+                    )
+                );
+            }
+            other => panic!("expected Lua, got {other:?}"),
+        }
+        match &config.components["file"].kind {
+            ComponentKind::LuaFile { vars, .. } => {
+                assert_eq!(vars["token"], s("1234567890123456"))
+            }
+            other => panic!("expected LuaFile, got {other:?}"),
+        }
+        match &config.components["in"].kind {
+            ComponentKind::StatsdIn { max_connections, .. } => assert_eq!(*max_connections, 7),
+            other => panic!("expected StatsdIn, got {other:?}"),
+        }
+        crate::pipeline::validate_semantics(config).expect("every !env value in vars is valid");
+    }
+
+    /// A `vars` key on a component that isn't `lua`/`lua_file`, or a `vars` nested deeper than a
+    /// component's top level, keeps the re-parse: only a Lua component's own `vars:` is exempt.
+    #[test]
+    fn env_values_keep_their_type_outside_a_lua_components_vars() {
+        let yaml = "components:\n  c:\n    type: aggregate\n    vars: !env N\n  \
+                    d:\n    type: lua\n    other: {type: lua, vars: !env N}\n";
+        let value: Value = serde_norway::from_str(yaml).unwrap();
+        let resolved =
+            resolve(value, &env(&[("N", "5")]), &mut Vec::new(), &mut Vec::new()).unwrap();
+        assert_eq!(resolved["components"]["c"]["vars"], Value::from(5));
+        assert_eq!(resolved["components"]["d"]["other"]["vars"], Value::from(5));
+    }
+
+    /// A `type` written as `!env` still marks a Lua component, so its `vars:` keeps `!env` values
+    /// as strings.
+    #[test]
+    fn env_values_inside_vars_are_strings_when_the_type_is_env() {
+        use logit_config::{ComponentKind, LuaVar};
+        let yaml = "components:\n  in: {type: lines_in, bind: '127.0.0.1:5140'}\n  \
+                    script:\n    type: !env KIND\n    sources: [in]\n    script: x\n    \
+                    vars: {token: !env TOKEN}\n  out: {type: null_out, sources: [script]}\n";
+        let config = parse(yaml, &env(&[("KIND", "lua"), ("TOKEN", "1234567890123456")])).unwrap();
+        match &config.components["script"].kind {
+            ComponentKind::Lua { vars, .. } => {
+                assert_eq!(vars["token"], LuaVar::String("1234567890123456".into()))
+            }
+            other => panic!("expected Lua, got {other:?}"),
         }
     }
 
