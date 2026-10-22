@@ -66,8 +66,8 @@ and a timestamp bucket of a configured `precision:` into one record, the latest 
 with delta kinds and observation kinds merged into it where a merge is sound, and every record
 that can't merge passed through untouched.** An operator places it in front of a sink whose destination can't
 hold two readings of one series at one instant. Separately, `prometheus_out`'s and `datadog_out`'s
-own collapses become counted: a removed reading is loss unless it equals the reading the sink
-sends ([The sink-side counter](#the-sink-side-counter)).
+own collapses become counted: a removed reading is loss unless it's a state equal to the reading
+the sink sends ([The sink-side counter](#the-sink-side-counter)).
 
 ### Configuration
 
