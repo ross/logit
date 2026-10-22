@@ -1091,8 +1091,9 @@ pub fn events_to_families_pending<'a>(
                 Some(existing) if existing.origin == name => {
                     if existing.family.kind != kind {
                         // Two records sharing one name but disagreeing on type: the wire has exactly
-                        // one `# TYPE` line per name, so the second one has nowhere to go.
-                        encoder.flush(counts);
+                        // one `# TYPE` line per name, so the second one has nowhere to go. Its drop
+                        // is its whole fate, so its held-back counts go with it.
+                        drop(counts);
                         encoder.not_encoded(NotEncoded::TypeConflict);
                     } else {
                         if !counts.0.is_empty() {
@@ -1105,16 +1106,12 @@ pub fn events_to_families_pending<'a>(
                 // A different model name sanitizing onto the same wire name: the one whose model
                 // name sorts first wins, so the outcome is the data's, not the arrival order's.
                 Some(existing) if name < existing.origin => {
+                    // The displaced family's series are dropped whole, held-back counts too.
                     displaced = existing.family.series.len().max(1);
-                    for (_, counts) in std::mem::take(&mut existing.pending) {
-                        encoder.flush(counts);
-                    }
+                    existing.pending.clear();
                     start_family = true;
                 }
-                Some(_) => {
-                    encoder.flush(counts.clone());
-                    encoder.not_encoded(NotEncoded::NameCollision);
-                }
+                Some(_) => encoder.not_encoded(NotEncoded::NameCollision),
                 None => start_family = true,
             }
             if !start_family {
@@ -2829,6 +2826,49 @@ mod tests {
         assert_eq!(families.len(), 1);
         assert_eq!(families[0].series[0].point, Point::Gauge(2.0));
         assert!(counted(&registry, "logit.output.metrics.dropped", ("reason", "name_collision")));
+    }
+
+    /// A series dropped as a type-conflict or name-collision loser counts only that drop: the
+    /// `bool_value` normalization its conversion held back describes a series that isn't written.
+    /// That covers the arriving loser of either kind and a displaced family.
+    #[test]
+    fn a_conflict_or_collision_loser_counts_none_of_its_held_back_counts() {
+        let bool_gauge =
+            |name: &str| event_with(&[], record(name, MetricKind::Gauge(MetricValue::Bool(true))));
+        let counter = event_with(
+            &[],
+            record(
+                "m",
+                MetricKind::Sum(Sum {
+                    value: MetricValue::Bool(true),
+                    temporality: Temporality::Cumulative,
+                    monotonic: true,
+                }),
+            ),
+        );
+        let float = |name: &str| event_with(&[], record(name, MetricKind::gauge(1.0)));
+        let (m, winner, dashed) = (float("m"), float("a-b"), float("a-b"));
+        let (loser, displaced) = (bool_gauge("a.b"), bool_gauge("a.b"));
+        let cases: [(&str, [&Event; 2], &str); 3] = [
+            ("type conflict", [&m, &counter], "type_conflict"),
+            ("arriving name collision", [&winner, &loser], "name_collision"),
+            ("displaced family", [&displaced, &dashed], "name_collision"),
+        ];
+        for (case, events, reason) in cases {
+            let (registry, telemetry) = telemetry();
+            let mut encoder = PrometheusEncoder::new().with_telemetry(telemetry);
+            let resource = Resource::default();
+            events_to_families(events.into_iter().map(|e| (&resource, e)), &mut encoder);
+            let points = registry.drain(0);
+            let has = |metric: &str, value: &str| {
+                points.iter().any(|event| {
+                    event.metrics.iter().any(|m| resolve(m.name) == metric)
+                        && event.attributes.get("reason").and_then(|v| v.as_str()) == Some(value)
+                })
+            };
+            assert!(has("logit.output.metrics.dropped", reason), "{case}");
+            assert!(!has("logit.output.metrics.normalized", "bool_value"), "{case}");
+        }
     }
 
     /// A name that needs sanitizing but collides with nothing is renamed, not counted.

@@ -1701,7 +1701,8 @@ rows:
           Only the series route collapses: a `samples` record leaves on the distribution-points
           route, where Datadog keeps both, and a `distribution`, an `exponential_histogram`, and
           a `histogram` under `histograms.mode: distributions` on the sketches route, so they
-          don't reach this row. A `dedup_timestamps` with `precision: 1s` upstream merges or
+          don't reach this row, unless `histograms.send_aggregation_metrics` also writes a
+          histogram's `.count`, `.sum`, `.min`, and `.max` series, which collapse. A `dedup_timestamps` with `precision: 1s` upstream merges or
           collapses the pair instead.
       graphite_out:
         class: exact
