@@ -2059,6 +2059,7 @@ itself. The sink emits each once per batch, however many attempts the runtime ma
 | `logit.output.metrics.dropped{reason="unresolved_gauge_delta"}` | an unresolved `GaugeDelta` |
 | `logit.output.metrics.dropped{reason="no_bucket"}` | the sink's own counter, not `EncodeStats`: one per metric record of a batch that names no bucket (no `bucket:` or `default_bucket:` configured, and none carried), which isn't sent; a throttled `logit.component.diagnostics{key="no_bucket"}` says why |
 | `logit.output.metrics.degraded{reason="non_finite_component"}` | a `Histogram`, `Summary`, `Distribution`, or `Samples` line written with a non-finite `sum`, `min`, `max`, quantile, or bound left off, once per record |
+| `logit.output.metrics.degraded{metric_kind="distribution"\|"samples"\|"histogram"\|"summary"\|"set"}` | a record written as fields of another shape (a sketch or sample list as quantile fields, a histogram or summary in Telegraf's shape, a set as its estimate), each read back as a gauge, once per line written |
 | `logit.output.metrics.skipped{reason="no_recorded_value"}` | a record flagged `NO_RECORDED_VALUE`; line protocol has no "no reading" marker |
 | `logit.output.metrics.skipped{metric_kind="set_members"\|"exponential_histogram"}` | a kind with no line-protocol shape |
 | `logit.output.events.skipped{reason="no_metrics"}` | an event with no metric record and no `_logit.influxdb.measurement` carrier (a log, a span, or neither), which has nothing to write |
@@ -2543,7 +2544,8 @@ it takes (the class table above).
 - `logit.output.metrics.skipped{metric_kind="exponential_histogram"}` in registry mode, where
   neither text dialect has a form for one, and `{reason="no_recorded_value"}`.
 - `logit.output.metrics.degraded{metric_kind="non_monotonic_sum"|"distribution"|"samples"|"set"|
-  "set_members"}`, `{reason="non_finite_component"}` for a `Histogram` with a `NaN` bound, which
+  "set_members"|"delta_sum"}` (`delta_sum` in sender mode only, a flagged delta monotonic `Sum`'s
+  stale marker), `{reason="non_finite_component"}` for a `Histogram` with a `NaN` bound, which
   gets no `le` bucket, once per record, and `{reason="exemplar_omitted"|"unit_not_suffix"}`
   (render-side). Sender mode counts `exemplar_omitted` too, for an exemplar with no `_total` or
   `_bucket` series to ride or over OpenMetrics' 128-code-point label budget, which Prometheus's
@@ -2580,7 +2582,7 @@ Some reasons exist only on one path:
   with `with_stale_markers(true)` there, so a flagged `Gauge`/`Sum`/marker-untyped record is written
   as a stale marker rather than skipped. Only a flagged `Histogram`/`Summary`/sketch, kinds that
   expand to several derived series, still counts. A flagged delta monotonic `Sum`'s marker reads
-  back cumulative, a structural loss with no counter.
+  back as a cumulative counter, counted `degraded{metric_kind="delta_sum"}`.
 
 `Diagnostics` keys: `delta_temporality_unresolved` (a delta `Sum` or `Histogram`, naming the
 `aggregate` with `temporality: cumulative` fix); `delta_summary_unresolved` (a delta `Summary`,
@@ -2625,7 +2627,7 @@ The module doc of `logit_proto::datadog` has the full mapping-to-counter tables.
 | `logit.output.metrics.skipped{metric_kind="set_members"}` | count | a kind no Datadog route carries; counted by the series encoders only |
 | `logit.output.fields.dropped{reason="unresolved_cumulative"}` | count | a cumulative `Summary`'s `.count` and `.sum`, running totals that need differencing first, left off while its `.quantile` gauges go out; once per summary, with an `unresolved_cumulative` diagnostic. A delta `Summary`, which `cumulative_to_delta` makes, sends both |
 | `logit.output.fields.omitted{reason="no_sum"}` | count | under `histograms.send_aggregation_metrics`, a delta histogram or exponential histogram whose sum is absent or non-finite, so no `.count`, `.sum`, `.min`, or `.max` series; once per record that the series route writes or the sketches route takes under the tag limit, so also for one the sketches route then skips or drops (a conversion error, `empty_sketch`, `oversized_sketch`, or the sink's `oversize`) |
-| `logit.output.metrics.degraded{metric_kind="non_monotonic_sum"\|"histogram"\|"exponential_histogram"}` | count | a non-monotonic `Sum` sent as a `count` (delta) or `gauge` (cumulative), a delta `Histogram` sent as a sketch or as `.bucket` and aggregation series, or a delta `ExponentialHistogram` sent as a sketch; once per record that leaves |
+| `logit.output.metrics.degraded{metric_kind="non_monotonic_sum"\|"histogram"\|"exponential_histogram"\|"summary"}` | count | a non-monotonic `Sum` sent as a `count` (delta) or `gauge` (cumulative), a delta `Histogram` sent as a sketch or as `.bucket` and aggregation series, a delta `ExponentialHistogram` sent as a sketch, or a delta `Summary` sent as `.quantile` gauges and `count` points; once per record that leaves |
 | `logit.output.metrics.dropped{reason="unresolved_gauge_delta"}` | count | a `GaugeDelta` nothing upstream resolved to a gauge; counted by the series encoders only |
 | `logit.output.metrics.skipped{reason="no_recorded_value"\|"empty_sketch"}` | count | a flagged record, or a sketch with nothing in it |
 | `logit.output.metrics.dropped{reason="non_finite_value"\|"oversized_sketch"}` | count | a non-finite value, a sketch whose counts split into more than `MAX_DOGSKETCH_ENTRIES` `k`/`n` entries, or a histogram or exponential histogram of more than 4,096 × 65,535 observations, which Datadog's exporter abandons too |

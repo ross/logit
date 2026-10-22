@@ -1439,7 +1439,8 @@ fn plan_series(record: &MetricRecord, histograms: HistogramOptions) -> SeriesPla
                 notes.push(Note::NotSent(MetricOut::NoRecordedValue));
                 return done(out, notes);
             }
-            // Its cell names the dropped count and sum, so the quantiles' form isn't counted.
+            // A cumulative one's cell names its dropped count and sum, so only a delta one counts
+            // its form.
             for (q, v) in &summary.quantiles {
                 out.push(SeriesPoint {
                     suffix: "quantile",
@@ -1448,6 +1449,7 @@ fn plan_series(record: &MetricRecord, histograms: HistogramOptions) -> SeriesPla
                 });
             }
             if summary.temporality == Temporality::Delta {
+                degraded = Some("summary");
                 // `MapSummaryMetrics`: `.count` with no unit, `.sum` with the record's.
                 out.push(SeriesPoint {
                     suffix: "count",

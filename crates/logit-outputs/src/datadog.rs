@@ -2565,6 +2565,33 @@ mod tests {
         assert_counted_once_per_batch(&single, &retried, &encode_side, &PER_ATTEMPT);
     }
 
+    /// A delta summary, written as quantile gauges and `count` points, counts
+    /// `metrics.degraded{metric_kind="summary"}` once per batch however many attempts it takes.
+    #[tokio::test]
+    async fn a_delta_summary_counts_its_lesser_form_once_per_batch() {
+        let summary = || {
+            metric(
+                NOW,
+                MetricKind::Summary(logit_core::Summary {
+                    quantiles: vec![(0.5, 1.0)],
+                    count: 2,
+                    sum: 3.0,
+                    temporality: Temporality::Delta,
+                }),
+            )
+        };
+        let batches = || vec![batch(vec![summary()])];
+        let (single, _) =
+            run_dd(|p, _| accepted(p), batches(), at_least_once(), instrumented).await;
+        let (retried, log) = run_dd(busy_once, batches(), at_least_once(), instrumented).await;
+        assert_eq!(recorded_paths(&log), [SERIES, SERIES]);
+        let kind = [("metric_kind", "summary")];
+        assert_eq!(sum_of(&single, "logit.output.metrics.degraded", &kind), 1.0);
+        let encode_side: [SumSeries<'static>; 1] =
+            [("logit.output.metrics.degraded", &[("metric_kind", "summary")])];
+        assert_counted_once_per_batch(&single, &retried, &encode_side, &PER_ATTEMPT);
+    }
+
     /// Beyond `logit.output.requests`, what a retried batch counts once per attempt here.
     const PER_ATTEMPT: [SumSeries<'static>; 2] = [(REQUEST_BYTES, &[]), (RECORDS, &[])];
 

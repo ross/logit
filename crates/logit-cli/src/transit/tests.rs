@@ -316,6 +316,7 @@ fn influxdb_out_with_a_bucket_and_no_org_is_refused_counted() {
         "counters": {
             "logit.component.batches.dropped{component=out,kind=influxdb_out,reason=rejected,role=sink}": 1,
             "logit.component.events.dropped{component=out,kind=influxdb_out,reason=rejected,role=sink}": 4,
+            "logit.output.metrics.degraded{component=out,kind=influxdb_out,metric_kind=samples,role=sink}": 1,
             "logit.output.metrics.skipped{component=out,kind=influxdb_out,metric_kind=set_members,role=sink}": 1,
         },
     });

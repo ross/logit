@@ -8,8 +8,8 @@
   "agent-series-timestamped": {"events": [
     {"timestamp":"2026-09-21T14:13:21.000000000Z","metrics":[{"name":"record_batch_lag","kind":"gauge","value":2.5}],"attributes":{"env":"record","host_name":"record-fixtures","service":"record-fixtures","team":"obs","version":"1.2.3"}}
   ], "counters": {
-    "logit.output.labels.normalized{component=out,kind=prometheus_out,reason=name_sanitized,role=sink}": 3,
-    "logit.output.metrics.normalized{component=out,kind=prometheus_out,reason=name_sanitized,role=sink}": 3
+    "logit.output.labels.normalized{component=out,kind=prometheus_out,reason=name_sanitized,role=sink}": 1,
+    "logit.output.metrics.normalized{component=out,kind=prometheus_out,reason=name_sanitized,role=sink}": 1
   }},
   "agent-service-check": {"events": [
     {"timestamp":"2026-09-24T22:41:06.000000000Z","metrics":[{"name":"datadog_agent_up","kind":"gauge","value":0.0}]}
@@ -40,11 +40,11 @@
     {"timestamp":"2027-01-15T07:59:56.000000000Z","metrics":[{"name":"queue_depth","kind":"gauge","value":9.0}],"attributes":{"env":"prod","team":"b"}},
     {"timestamp":"2027-01-15T07:59:56.000000000Z","metrics":[{"name":"web_requests_rate","kind":"gauge","value":1.2}],"attributes":{"env":"prod","host_name":"web-1"}}
   ], "counters": {
-    "logit.output.labels.normalized{component=out,kind=prometheus_out,reason=multi_value,role=sink}": 2,
+    "logit.output.labels.normalized{component=out,kind=prometheus_out,reason=multi_value,role=sink}": 1,
     "logit.output.labels.normalized{component=out,kind=prometheus_out,reason=name_sanitized,role=sink}": 3,
     "logit.output.metrics.degraded{component=out,kind=prometheus_out,reason=unit_not_suffix,role=sink}": 1,
     "logit.output.metrics.dropped{component=out,kind=prometheus_out,reason=unresolved_delta,role=sink}": 1,
-    "logit.output.metrics.normalized{component=out,kind=prometheus_out,reason=name_sanitized,role=sink}": 5
+    "logit.output.metrics.normalized{component=out,kind=prometheus_out,reason=name_sanitized,role=sink}": 4
   }},
   "series-v2-json": {"events": [
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app_heap","kind":"gauge","value":1048576.5}],"attributes":{"env":"prod","host_name":"worker-2"}},

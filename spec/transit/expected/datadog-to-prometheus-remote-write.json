@@ -8,8 +8,8 @@
   "agent-series-timestamped": {"events": [
     {"timestamp":"2026-09-21T14:13:20.000000000Z","metrics":[{"name":"record_batch_lag","kind":"gauge","value":2.5}],"attributes":{"env":"record","host_name":"record-fixtures","service":"record-fixtures","team":"obs","version":"1.2.3"}}
   ], "counters": {
-    "logit.output.labels.normalized{component=out,kind=prometheus_out,reason=name_sanitized,role=sink}": 3,
-    "logit.output.metrics.normalized{component=out,kind=prometheus_out,reason=name_sanitized,role=sink}": 3
+    "logit.output.labels.normalized{component=out,kind=prometheus_out,reason=name_sanitized,role=sink}": 1,
+    "logit.output.metrics.normalized{component=out,kind=prometheus_out,reason=name_sanitized,role=sink}": 1
   }},
   "agent-service-check": {"events": [
     {"timestamp":"2026-09-24T22:41:05.000000000Z","metrics":[{"name":"datadog_agent_up","kind":"gauge","value":0.0}]}

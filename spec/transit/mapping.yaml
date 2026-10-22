@@ -12,9 +12,9 @@ classes:
     A permitted normalization applied, named by the cell's reason; a record or field the
     normalization doesn't touch reads back exact.
   degraded: >-
-    The value survives in a lesser kind, such as a sketch written as dotted count and quantile
-    series; the cell names the counter that counts it, or its reason is structural when every
-    record of the kind is written so.
+    The value survives in a lesser kind or shape, such as a sketch written as dotted count and
+    quantile series; the cell names the counter that counts it. A cell whose loss is only a field
+    the format has no slot for, such as a sum's temporality, has reason structural instead.
   lost: >-
     A field the record loses while the record itself survives; the cell names the counter that
     counts it, or its reason is structural when the destination's format has no slot for it.
@@ -632,10 +632,11 @@ rows:
           quantiles with `_sum` and `_count`.
       influxdb_out:
         class: degraded
-        reason: structural
+        counter: logit.output.metrics.degraded{metric_kind=samples}
         text: >-
           Sketched, each value weighted by its inverse sample rate, then written as the
-          `distribution` row describes, and counted only as that row says.
+          `distribution` row describes, counted once per record. A non-finite sum or quantile counts
+          as that row says.
       otlp_out:
         class: degraded
         counter: logit.output.metrics.degraded{metric_kind=samples}
@@ -724,13 +725,12 @@ rows:
           is gone, so quantiles from two senders don't merge.
       influxdb_out:
         class: degraded
-        reason: structural
+        counter: logit.output.metrics.degraded{metric_kind=distribution}
         text: >-
           In the `summary` row's shape: float `count` and `sum` fields and the sketch's `0.5`,
           `0.9`, and `0.99` quantiles, each read back as a gauge under `<name>.`; the sketch is
-          gone. When the sum and quantiles are finite, nothing is counted. A non-finite sum or
-          quantile is left off the line, and the record counts once as
-          `logit.output.metrics.degraded{reason=non_finite_component}`.
+          gone, counted once per record. A non-finite sum or quantile is left off the line, and the
+          record also counts `logit.output.metrics.degraded{reason=non_finite_component}`.
       otlp_out:
         class: degraded
         counter: logit.output.metrics.degraded{metric_kind=distribution}
@@ -771,10 +771,10 @@ rows:
         text: A `gauge` of the estimate; the registers are gone.
       influxdb_out:
         class: degraded
-        reason: structural
+        counter: logit.output.metrics.degraded{metric_kind=set}
         text: >-
           A `value=<estimate>u` field, read back as a gauge named `<name>.value`; the registers are
-          gone.
+          gone, counted once per record.
       otlp_out:
         class: skipped
         counter: logit.output.metrics.skipped{metric_kind=set}
@@ -818,14 +818,13 @@ rows:
           an `aggregate` with `temporality: cumulative` upstream makes it a running one.
       influxdb_out:
         class: degraded
-        reason: structural
+        counter: logit.output.metrics.degraded{metric_kind=histogram}
         text: >-
-          Telegraf's shape: float `count`, `sum`, `min`, and `max` fields, a field per finite
-          bound named by the bound and holding the cumulative count up to it, and `+Inf` holding
-          the total, each read back as a gauge under `<name>.`, its temporality dropped. When
-          every component is finite, nothing is counted. A non-finite `sum`, `min`, or `max` is
-          left off the line, and the record counts once as
-          `logit.output.metrics.degraded{reason=non_finite_component}`.
+          Telegraf's shape: float `count`, `sum`, `min`, and `max` fields, a field per finite bound
+          named by the bound and holding the cumulative count up to it, and `+Inf` holding the
+          total, each read back as a gauge under `<name>.`, its temporality dropped, counted once
+          per record. A non-finite `sum`, `min`, or `max` is left off the line, and the record also
+          counts `logit.output.metrics.degraded{reason=non_finite_component}`.
       otlp_out:
         class: normalized
         reason: inf_bucket
@@ -881,14 +880,13 @@ rows:
             be added to itself.
       influxdb_out:
         class: degraded
-        reason: structural
+        counter: logit.output.metrics.degraded{metric_kind=histogram}
         text: >-
-          Telegraf's shape: float `count`, `sum`, `min`, and `max` fields, a field per finite
-          bound named by the bound and holding the cumulative count up to it, and `+Inf` holding
-          the total, each read back as a gauge under `<name>.`, its temporality dropped. When
-          every component is finite, nothing is counted. A non-finite `sum`, `min`, or `max` is
-          left off the line, and the record counts once as
-          `logit.output.metrics.degraded{reason=non_finite_component}`.
+          Telegraf's shape: float `count`, `sum`, `min`, and `max` fields, a field per finite bound
+          named by the bound and holding the cumulative count up to it, and `+Inf` holding the
+          total, each read back as a gauge under `<name>.`, its temporality dropped, counted once
+          per record. A non-finite `sum`, `min`, or `max` is left off the line, and the record also
+          counts `logit.output.metrics.degraded{reason=non_finite_component}`.
       otlp_out:
         class: normalized
         reason: inf_bucket
@@ -1166,14 +1164,13 @@ rows:
           warning; send this sink the summary from ahead of that component.
       influxdb_out:
         class: degraded
-        reason: structural
+        counter: logit.output.metrics.degraded{metric_kind=summary}
         text: >-
           Telegraf's shape: float `count` and `sum` fields and a field per quantile named by the
-          quantile (`0.5`, `0.99`), each read back as a gauge under `<name>.`. Line protocol has
-          no temporality, so a delta summary writes as a cumulative one does. When every
-          component is finite, nothing is counted. A non-finite `sum`, quantile, or quantile value
-          is left off the line, and the record counts once as
-          `logit.output.metrics.degraded{reason=non_finite_component}`.
+          quantile (`0.5`, `0.99`), each read back as a gauge under `<name>.`, counted once per
+          record. Line protocol has no temporality, so a delta summary writes as a cumulative one
+          does. A non-finite `sum`, quantile, or quantile value is left off the line, and the record
+          also counts `logit.output.metrics.degraded{reason=non_finite_component}`.
       otlp_out:
         class: dropped
         counter: logit.output.metrics.dropped{reason=unresolved_delta}
@@ -1182,11 +1179,11 @@ rows:
           `delta_summary_unresolved` warning.
       datadog_out:
         class: degraded
-        reason: structural
+        counter: logit.output.metrics.degraded{metric_kind=summary}
         text: >-
           A `<name>.quantile` gauge per quantile tagged `quantile:<q>`, and `.count` (no unit) and
-          `.sum` as `count` points, as Datadog's exporter writes a summary it differenced;
-          datadog_in reads them back as gauges and counts.
+          `.sum` as `count` points, as Datadog's exporter writes a summary it differenced, counted
+          once per record; datadog_in reads them back as gauges and counts.
       graphite_out:
         - when: {multi_value: expand}
           class: degraded
@@ -1214,13 +1211,12 @@ rows:
         text: A `summary` family of its quantiles, `_sum`, and `_count`.
       influxdb_out:
         class: degraded
-        reason: structural
+        counter: logit.output.metrics.degraded{metric_kind=summary}
         text: >-
           Telegraf's shape: float `count` and `sum` fields and a field per quantile named by the
-          quantile (`0.5`, `0.99`), each read back as a gauge under `<name>.`. When every
-          component is finite, nothing is counted. A non-finite `sum`, quantile, or quantile value
-          is left off the line, and the record counts once as
-          `logit.output.metrics.degraded{reason=non_finite_component}`.
+          quantile (`0.5`, `0.99`), each read back as a gauge under `<name>.`, counted once per
+          record. A non-finite `sum`, quantile, or quantile value is left off the line, and the
+          record also counts `logit.output.metrics.degraded{reason=non_finite_component}`.
       otlp_out:
         class: exact
         text: An OTLP `Summary`.
@@ -1475,11 +1471,12 @@ rows:
       prometheus_out:
         - when: {bind: null}
           class: degraded
-          reason: structural
+          counter: logit.output.metrics.degraded
           text: >-
             Remote-write writes a flagged delta `Sum` as a stale marker, its temporality ignored,
             since a marker holds no reading to be delta about: a monotonic one on a `counter`, read
-            back as a flagged cumulative counter, a structural loss, and a non-monotonic one on a
+            back as a flagged cumulative counter, counted
+            `logit.output.metrics.degraded{metric_kind=delta_sum}`, and a non-monotonic one on a
             `gauge`, counted `logit.output.metrics.degraded{metric_kind=non_monotonic_sum}`. An
             unflagged delta `Sum` is dropped.
         - class: skipped

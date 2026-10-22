@@ -121,6 +121,15 @@ pub struct EncodeStats {
     /// A series with no free timestamp slot left before `i64::MAX`:
     /// `metrics.dropped{reason="timestamp_overflow"}`.
     pub dropped_timestamp_overflow: usize,
+    /// A record written as fields of another shape, once per line written, by kind:
+    /// `metrics.degraded{metric_kind="distribution"|"samples"|"histogram"|"summary"|"set"}`. A
+    /// sketch or a sample list leaves as quantile fields, a histogram or summary as Telegraf's
+    /// fields, and a set as its estimate; each reads back as gauges.
+    pub degraded_distribution: usize,
+    pub degraded_samples: usize,
+    pub degraded_histogram: usize,
+    pub degraded_summary: usize,
+    pub degraded_set: usize,
     /// An event with no metric record and no `_logit.influxdb.measurement` carrier, which has
     /// nothing to write: `events.skipped{reason="no_metrics"}`.
     pub skipped_no_metrics: usize,
@@ -306,8 +315,18 @@ impl Ctx<'_> {
         push_escaped_measurement(self.line, measurement);
         self.line.push_str(tag_suffix);
         // Counted only once the line is written: a line `finish_line` drops is counted there.
-        if self.finish_line(timestamp, 1) && matches!(outcome, Fields::Degraded) {
-            self.stats.degraded_non_finite_component += 1;
+        if self.finish_line(timestamp, 1) {
+            if matches!(outcome, Fields::Degraded) {
+                self.stats.degraded_non_finite_component += 1;
+            }
+            match metric.kind {
+                MetricKind::Distribution(_) => self.stats.degraded_distribution += 1,
+                MetricKind::Samples(_) => self.stats.degraded_samples += 1,
+                MetricKind::Histogram(_) => self.stats.degraded_histogram += 1,
+                MetricKind::Summary(_) => self.stats.degraded_summary += 1,
+                MetricKind::Set(_) => self.stats.degraded_set += 1,
+                _ => {}
+            }
         }
     }
 
@@ -1097,7 +1116,7 @@ mod tests {
             "http_req_duration,host=a count=10,sum=4.2,min=0.01,max=2.5,0.1=3,1=8,+Inf=10 \
              1700000000000000000\n"
         );
-        assert_eq!(stats, EncodeStats::default());
+        assert_eq!(stats, EncodeStats { degraded_histogram: 1, ..EncodeStats::default() });
     }
 
     /// The model doesn't promise bound order, so the encoder sorts before accumulating: in wire
@@ -1152,7 +1171,7 @@ mod tests {
     fn a_histogram_with_no_bucket_writes_count_and_inf() {
         let (out, stats) = encode_stats(vec![metric_event("h", histogram(vec![], Some(0.0)), &[])]);
         assert_eq!(out, "h count=0,sum=0,+Inf=0 1700000000000000000\n");
-        assert_eq!(stats, EncodeStats::default());
+        assert_eq!(stats, EncodeStats { degraded_histogram: 1, ..EncodeStats::default() });
     }
 
     /// A non-finite sum is left off the line, and the record counts as degraded once.
@@ -1181,7 +1200,7 @@ mod tests {
         });
         let (out, stats) = encode_stats(vec![metric_event("rpc_latency", kind, &[])]);
         assert_eq!(out, "rpc_latency count=7,sum=3.5,0.5=0.2,0.99=0.9 1700000000000000000\n");
-        assert_eq!(stats, EncodeStats::default());
+        assert_eq!(stats, EncodeStats { degraded_summary: 1, ..EncodeStats::default() });
     }
 
     /// A delta summary writes the same fields: line protocol has no temporality.
@@ -1195,7 +1214,7 @@ mod tests {
         });
         let (out, stats) = encode_stats(vec![metric_event("rpc_latency", kind, &[])]);
         assert_eq!(out, "rpc_latency count=7,sum=3.5,0.5=0.2,0.99=0.9 1700000000000000000\n");
-        assert_eq!(stats, EncodeStats::default());
+        assert_eq!(stats, EncodeStats { degraded_summary: 1, ..EncodeStats::default() });
     }
 
     /// Quantile keys are the raw quantile, so 0.991 and 0.994 don't collide as a rounded
@@ -1244,7 +1263,7 @@ mod tests {
         let (out, stats) =
             encode_stats(vec![metric_event("latency", MetricKind::Distribution(sketch), &[])]);
         assert_eq!(out, "latency count=0,sum=0 1700000000000000000\n");
-        assert_eq!(stats, EncodeStats::default());
+        assert_eq!(stats, EncodeStats { degraded_distribution: 1, ..EncodeStats::default() });
     }
 
     /// Unweighted `Samples` render like a `Distribution` of the same values.

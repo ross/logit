@@ -64,7 +64,9 @@
     {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"rpc.client.duration.quantile","kind":"gauge","value":1.2,"unit":"s"}],"attributes":{"host.name":"web-1","quantile":"0.99","rpc.service":"inventory","service.name":"checkout"}},
     {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"rpc.client.duration.quantile","kind":"gauge","value":2.5,"unit":"s"}],"attributes":{"host.name":"web-1","quantile":"1.0","rpc.service":"inventory","service.name":"checkout"}},
     {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"rpc.client.duration.sum","kind":"sum","value":25.5,"temporality":"delta","monotonic":true,"unit":"s"}],"attributes":{"host.name":"web-1","rpc.service":"inventory","service.name":"checkout"}}
-  ], "counters": {}},
+  ], "counters": {
+    "logit.output.metrics.degraded{component=out,kind=datadog_out,metric_kind=summary,role=sink}": 1
+  }},
   "sums": {"events": [
     {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"db.client.connections.usage","kind":"gauge","value":7.0,"unit":"{connection}"}],"attributes":{"host.name":"web-1","pool.name":"primary","service.name":"checkout"}},
     {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"http.server.requests","kind":"sum","value":12.5,"temporality":"delta","monotonic":true,"unit":"{request}"}],"attributes":{"host.name":"web-1","http.route":"/cart","service.name":"checkout"}},

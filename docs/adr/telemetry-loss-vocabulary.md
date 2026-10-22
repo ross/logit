@@ -286,10 +286,13 @@ uncounted:
   once, which is where an operator choosing a destination looks.
 - **A value-dependent loss is counted because the table can't say how often it happens.** Most
   records keep the field, so a nonzero count is the only sign one didn't.
-- **A kind every record of which a sink writes in a lesser form is structural too**, such as
-  `influxdb_out`'s `Set` as its estimate or its histogram in Telegraf's shape, and a flagged delta
-  `Sum` as `prometheus_out`'s remote-write stale marker. Its `degraded` cell has no counter; one
-  that degrades only some records names a counter.
+- **Structural is about fields; a record written as another kind or shape is counted.** A field
+  the format has no slot for (a unit, a description, a scope, a start time, `min` and `max`, a
+  temporality, exemplars, a foreign carrier) is structural, on a `lost` or `degraded` cell with
+  no counter, as `influxdb_out`'s `Sum` keeps its value and loses its temporality. A record whose
+  kind or shape is rewritten counts `metrics.degraded{metric_kind}`, as every sink already did
+  before this amendment: a sketch as quantile fields or gauges, a set's estimate as a gauge, a
+  histogram or summary flattened to fields.
 - **A private `_logit.` carrier left off at another protocol's sink is structural**, though its
   presence varies by event: the ignore rule in
   [ADR `private-attribute-namespace`](private-attribute-namespace.md) makes it part of every such
@@ -308,6 +311,10 @@ uncounted:
     `metrics.normalized{reason="u64_as_double"}`.
   - `output.metrics.degraded{reason="sample_rate_rounded"}` at `datadog_out`, and
     `{reason="negative_gauge"}` at `statsd_out`.
+  - `output.metrics.degraded{metric_kind}` for a kind written in another shape:
+    `"distribution"|"samples"|"histogram"|"summary"|"set"` at `influxdb_out`, `"summary"` for a
+    delta summary at `datadog_out`, and `"delta_sum"` for the stale marker `prometheus_out`'s
+    remote-write sends for a flagged delta monotonic `Sum`, which reads back cumulative.
 - **`uncounted` remains only where this change doesn't reach.** The table's schema accepts it on
   the `log` and `span` rows and on `datadog_out`'s carrier on a log, not yet classified, and on
   `prometheus_out`'s one-sample-per-series rows, which another change settles

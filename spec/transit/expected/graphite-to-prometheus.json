@@ -21,7 +21,7 @@
     {"timestamp":"2023-11-14T22:13:24.000000000Z","metrics":[{"name":"logit_fixture_diamond_loadavg_01","kind":"gauge","value":0.25}]},
     {"timestamp":"2023-11-14T22:13:24.000000000Z","metrics":[{"name":"logit_fixture_diamond_uptime","kind":"gauge","value":7.0}]}
   ], "counters": {
-    "logit.output.metrics.normalized{component=out,kind=prometheus_out,reason=name_sanitized,role=sink}": 5
+    "logit.output.metrics.normalized{component=out,kind=prometheus_out,reason=name_sanitized,role=sink}": 4
   }},
   "pickle-receipt-time": {"events": [
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"ts_sentinel_int","kind":"gauge","value":1.0}]}
@@ -33,7 +33,7 @@
     {"timestamp":"2023-11-14T22:13:24.000000000Z","metrics":[{"name":"base_load","kind":"gauge","value":-2.0}],"attributes":{"host":"web-1"}},
     {"timestamp":"2023-11-14T22:13:24.000000000Z","metrics":[{"name":"base_mem","kind":"gauge","value":1234567.0}]}
   ], "counters": {
-    "logit.output.metrics.normalized{component=out,kind=prometheus_out,reason=name_sanitized,role=sink}": 4
+    "logit.output.metrics.normalized{component=out,kind=prometheus_out,reason=name_sanitized,role=sink}": 3
   }},
   "pickle-utf8-path": {"events": [
     {"timestamp":"2023-11-14T22:13:21.000000000Z","metrics":[{"name":"py2_caf_","kind":"gauge","value":1.0}]}
@@ -85,6 +85,6 @@
     {"timestamp":"2026-09-13T12:30:37.000000000Z","metrics":[{"name":"logit_fixture_memory_memory_slab_unrecl","kind":"gauge","value":1393889280.0}]},
     {"timestamp":"2026-09-13T12:30:37.000000000Z","metrics":[{"name":"logit_fixture_memory_memory_used","kind":"gauge","value":17981325312.0}]}
   ], "counters": {
-    "logit.output.metrics.normalized{component=out,kind=prometheus_out,reason=name_sanitized,role=sink}": 100
+    "logit.output.metrics.normalized{component=out,kind=prometheus_out,reason=name_sanitized,role=sink}": 25
   }}
 }

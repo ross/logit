@@ -37,7 +37,7 @@
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"service_up","kind":"gauge","value":1.0}],"attributes":{"host":"web-01"}}
   ], "counters": {
     "logit.output.metrics.normalized{component=out,kind=prometheus_out,reason=bool_value,role=sink}": 1,
-    "logit.output.metrics.normalized{component=out,kind=prometheus_out,reason=name_sanitized,role=sink}": 7
+    "logit.output.metrics.normalized{component=out,kind=prometheus_out,reason=name_sanitized,role=sink}": 6
   }},
   "multi-field": {"events": [
     {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"system_healthy","kind":"gauge","value":1.0}],"attributes":{"host":"web-01"}},
@@ -79,7 +79,7 @@
   "string-field-series": {"events": [
     {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"system_uptime","kind":"gauge","value":3610.0}],"attributes":{"host":"web-01"}}
   ], "counters": {
-    "logit.output.metrics.normalized{component=out,kind=prometheus_out,reason=name_sanitized,role=sink}": 2
+    "logit.output.metrics.normalized{component=out,kind=prometheus_out,reason=name_sanitized,role=sink}": 1
   }},
   "tags": {"events": [
     {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"http_requests","kind":"gauge","value":5.0}],"attributes":{"host":"web-01","method":"GET","status":"200"}}

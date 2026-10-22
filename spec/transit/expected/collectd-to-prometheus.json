@@ -46,9 +46,9 @@
     {"timestamp":"2026-09-12T18:22:55.661517736Z","metrics":[{"name":"memory_memory","kind":"gauge","value":4311457792.0}],"attributes":{"collectd_host":"logit-fixture","collectd_type_instance":"slab_recl"}},
     {"timestamp":"2026-09-12T18:22:55.661517736Z","metrics":[{"name":"memory_memory","kind":"gauge","value":6011305984.0}],"attributes":{"collectd_host":"logit-fixture","collectd_type_instance":"free"}}
   ], "counters": {
-    "logit.output.labels.normalized{component=out,kind=prometheus_out,reason=name_sanitized,role=sink}": 78,
+    "logit.output.labels.normalized{component=out,kind=prometheus_out,reason=name_sanitized,role=sink}": 47,
     "logit.output.metrics.degraded{component=out,kind=prometheus_out,metric_kind=non_monotonic_sum,role=sink}": 24,
-    "logit.output.metrics.normalized{component=out,kind=prometheus_out,reason=name_sanitized,role=sink}": 42
+    "logit.output.metrics.normalized{component=out,kind=prometheus_out,reason=name_sanitized,role=sink}": 25
   }},
   "value-lists": {"events": [
     {"timestamp":"2026-09-12T18:22:55.661517736Z","metrics":[{"name":"interface_if_dropped_0","kind":"gauge","value":0.0}],"attributes":{"collectd_host":"logit-fixture","collectd_plugin_instance":"eth0"}},
@@ -77,8 +77,8 @@
     {"timestamp":"2026-09-12T18:22:55.661517736Z","metrics":[{"name":"memory_memory","kind":"gauge","value":4311457792.0}],"attributes":{"collectd_host":"logit-fixture","collectd_type_instance":"slab_recl"}},
     {"timestamp":"2026-09-12T18:22:55.661517736Z","metrics":[{"name":"memory_memory","kind":"gauge","value":6011305984.0}],"attributes":{"collectd_host":"logit-fixture","collectd_type_instance":"free"}}
   ], "counters": {
-    "logit.output.labels.normalized{component=out,kind=prometheus_out,reason=name_sanitized,role=sink}": 78,
+    "logit.output.labels.normalized{component=out,kind=prometheus_out,reason=name_sanitized,role=sink}": 47,
     "logit.output.metrics.degraded{component=out,kind=prometheus_out,metric_kind=non_monotonic_sum,role=sink}": 24,
-    "logit.output.metrics.normalized{component=out,kind=prometheus_out,reason=name_sanitized,role=sink}": 42
+    "logit.output.metrics.normalized{component=out,kind=prometheus_out,reason=name_sanitized,role=sink}": 25
   }}
 }

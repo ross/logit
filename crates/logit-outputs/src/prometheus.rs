@@ -3111,8 +3111,8 @@ mod tests {
     }
 
     /// A counter that is sent, [`nothing_to_send_batch`]'s delta `Sum`, and one of each shape the
-    /// codec counts as rewritten: a counter whose name and exemplar key are sanitized, and an
-    /// event with no metrics.
+    /// codec counts as rewritten: a counter whose name and exemplar key are sanitized, a flagged
+    /// delta `Sum` sent as a stale marker, and an event with no metrics.
     fn encode_side_batch() -> EventBatch {
         let mut batch = nothing_to_send_batch();
         batch.events.push(Event::metric(
@@ -3130,15 +3130,19 @@ mod tests {
             filtered_attributes: exemplar_attributes,
         }];
         batch.events.push(Event::metric(1_000_000_000, AttrMap::new(), renamed));
+        let mut flagged = MetricRecord::new(intern("retries"), delta_sum(0.0));
+        flagged.flags = MetricRecord::FLAG_NO_RECORDED_VALUE;
+        batch.events.push(Event::metric(1_000_000_000, AttrMap::new(), flagged));
         batch.events.push(Event::empty(1_000_000_000, AttrMap::new()));
         batch
     }
 
-    const ENCODE_SIDE: [SumSeries<'static>; 5] = [
+    const ENCODE_SIDE: [SumSeries<'static>; 6] = [
         ("logit.output.metrics.dropped", &[("reason", "unresolved_delta")]),
         ("logit.component.diagnostics", &[("key", "delta_temporality_unresolved")]),
         ("logit.output.metrics.normalized", &[("reason", "name_sanitized")]),
         ("logit.output.labels.normalized", &[("reason", "name_sanitized")]),
+        ("logit.output.metrics.degraded", &[("metric_kind", "delta_sum")]),
         ("logit.output.events.skipped", &[("reason", "no_metrics")]),
     ];
 
@@ -3169,6 +3173,7 @@ mod tests {
         let counted = [
             ("logit.output.metrics.normalized", ("reason", "name_sanitized"), 1.0),
             ("logit.output.labels.normalized", ("reason", "name_sanitized"), 2.0),
+            ("logit.output.metrics.degraded", ("metric_kind", "delta_sum"), 1.0),
             ("logit.output.events.skipped", ("reason", "no_metrics"), 1.0),
         ];
         for (name, tag, n) in counted {
@@ -3177,8 +3182,9 @@ mod tests {
     }
 
     /// Two names sanitizing onto one in a batch keep one family: the record kept counts its
-    /// rewrite, and the displaced one counts only its drop, its rewritten label name included, as
-    /// does a record dropped for a type conflict.
+    /// rewrite, and the displaced one counts only its drop, its rewritten label name and collapsed
+    /// array included, as does a record dropped for a type conflict. Of two points of one series
+    /// in a batch, only the later one's rewrites count.
     #[tokio::test]
     async fn a_name_collision_counts_the_kept_records_rewrite_only() {
         let mut probe = TelemetryProbe::new();
@@ -3190,21 +3196,29 @@ mod tests {
             .into();
         sink.bind().await.unwrap();
         let label = [("http.route", Value::str("/"))];
+        let both = [
+            ("http.route", Value::str("/")),
+            ("team", Value::Array(vec![Value::str("a"), Value::str("b")])),
+        ];
         let b = batch(vec![
-            metric_event("a_b", MetricKind::gauge(1.0), &label),
+            metric_event("a_b", MetricKind::gauge(1.0), &both),
             metric_event("a.b", MetricKind::gauge(2.0), &[]),
             metric_event("hits", MetricKind::gauge(1.0), &[]),
             metric_event("hits", cumulative_counter(1.0), &label),
+            metric_event("free.mem", MetricKind::gauge(1.0), &both),
+            metric_event("free.mem", MetricKind::gauge(2.0), &both),
         ]);
         sink.send(&b).await.unwrap();
         let renamed = probe.sum("logit.output.metrics.normalized", &[("reason", "name_sanitized")]);
-        assert_eq!(renamed, 1.0);
+        assert_eq!(renamed, 2.0, "`a.b` and the later `free.mem`");
         let dropped = probe.sum("logit.output.metrics.dropped", &[("reason", "name_collision")]);
         assert_eq!(dropped, 1.0);
         let conflict = probe.sum("logit.output.metrics.dropped", &[("reason", "type_conflict")]);
         assert_eq!(conflict, 1.0);
         let labels = probe.sum("logit.output.labels.normalized", &[("reason", "name_sanitized")]);
-        assert_eq!(labels, 0.0, "neither dropped record's label reached the wire");
+        assert_eq!(labels, 1.0, "the later `free.mem`'s only");
+        let arrays = probe.sum("logit.output.labels.normalized", &[("reason", "multi_value")]);
+        assert_eq!(arrays, 1.0, "the later `free.mem`'s only");
     }
 
     /// The diagnostic for a non-2xx answer: the receiver's verdict on one attempt.
