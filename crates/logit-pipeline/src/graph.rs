@@ -1076,7 +1076,7 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
     }
 
     // Rule 92's shape clause, before rule 48 for rule 51's reason: an empty id is reported as
-    // empty, not as an unknown target `''`. At most three distinct targets, so the `Destinations`
+    // empty, not as an unknown target `''`. At most four distinct targets, so the `Destinations`
     // width needs no check.
     for (id, component) in &components {
         let ComponentKind::RouteSignals { signals, .. } = &component.kind else { continue };
@@ -10553,7 +10553,8 @@ mod tests {
             .expect("an event carrying no signal reaches only none's target");
     }
 
-    /// `none` sharing another signal's target leaves a co-marked pair rejected as before.
+    /// `none` sharing another signal's target is still a co-marked pair, rejected under
+    /// `strip: false`.
     #[test]
     fn none_sharing_a_target_keeps_the_unstripped_reconvergence_check() {
         let kind = with_none(route_signals(Some("l"), Some("m"), None, false), "m");
