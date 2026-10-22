@@ -38,7 +38,7 @@ use std::sync::{Arc, LazyLock};
 type JsonMap = Map<String, JsonValue>;
 
 /// `_logit.datadog.type`'s two values; `count` and `gauge` are said by the model kind itself.
-const TYPE_RATE: &str = "rate";
+pub(super) const TYPE_RATE: &str = "rate";
 const TYPE_UNSPECIFIED: &str = "unspecified";
 
 /// The resource `type` the Agent's v2 serializer gives a series' `device`.

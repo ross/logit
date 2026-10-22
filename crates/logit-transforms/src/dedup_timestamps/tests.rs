@@ -651,3 +651,67 @@ fn no_state_carries_across_batches() {
     assert_eq!(rig.run(vec![ev(T, MetricKind::gauge(2.0))]).len(), 1);
     assert_eq!(rig.absorbed(), 0.0);
 }
+
+fn rate(ts: i64, value: f64, interval: Option<i64>) -> Event {
+    let mut attributes = AttrMap::new();
+    attributes.insert(datadog::ATTR_TYPE, Value::str("rate"));
+    if let Some(interval) = interval {
+        attributes.insert(datadog::ATTR_INTERVAL, Value::I64(interval));
+    }
+    Event::metric(ts, attributes, record(MetricKind::gauge(value)))
+}
+
+/// A Datadog `rate` is a `Gauge` carrying `_logit.datadog.type: rate`, but it's an increment over
+/// its interval: two in one bucket sum, counted `merged`, where two gauges would keep the later.
+#[test]
+fn datadog_rates_of_one_interval_sum() {
+    let mut rig = Rig::new();
+    let out = rig.run(vec![rate(T, 1.5, Some(10)), rate(T + 1, 2.0, Some(10))]);
+    assert_eq!(kinds(&out), [&MetricKind::gauge(3.5)]);
+    assert_eq!(rig.merged(), 1.0);
+    assert_eq!(rig.absorbed(), 0.0);
+
+    // Two rates with no interval at all count as one interval.
+    let mut rig = Rig::new();
+    let out = rig.run(vec![rate(T, 1.0, None), rate(T + 1, 1.0, None)]);
+    assert_eq!(kinds(&out), [&MetricKind::gauge(2.0)]);
+    assert_eq!(rig.merged(), 1.0);
+}
+
+/// The type carrier is read the way `datadog_out` reads it, the event's value winning over the
+/// resource's: a rate marked on the resource sums too.
+#[test]
+fn a_rate_marked_on_the_resource_sums() {
+    let mut rig = Rig::new();
+    let mut resource = Resource::default();
+    resource.attributes.insert(datadog::ATTR_TYPE, Value::str("rate"));
+    let batch = EventBatch {
+        resource: Arc::new(resource),
+        scope: None,
+        events: vec![ev(T, MetricKind::gauge(1.0)), ev(T + 1, MetricKind::gauge(2.0))],
+    };
+    let out = process_batch(&mut rig.t, batch, &mut Vec::new(), &rig.telemetry)
+        .map(|b| b.events)
+        .unwrap_or_default();
+    assert_eq!(kinds(&out), [&MetricKind::gauge(3.0)]);
+    assert_eq!(rig.merged(), 1.0);
+}
+
+/// A rate sums only with a rate of its own interval, and never with a gauge that isn't one: each
+/// such pair passes through, `no_merge_rule`. The series key holds the carriers, so no batch
+/// puts such a pair in one set; the set is handed to `resolve` directly.
+#[test]
+fn a_rate_of_another_interval_or_beside_a_plain_gauge_passes_through() {
+    for mut events in [
+        vec![rate(T, 1.0, Some(10)), rate(T + 1, 2.0, Some(20))],
+        vec![ev(T, MetricKind::gauge(1.0)), rate(T + 1, 2.0, Some(10))],
+        vec![rate(T, 1.0, Some(10)), ev(T + 1, MetricKind::gauge(2.0))],
+    ] {
+        let mut rig = Rig::new();
+        rig.t.resolve(&Resource::default(), &mut events, &[(0, 0, 0), (0, 1, 0)]);
+        rig.t.report();
+        assert!(rig.t.removed.is_empty(), "{events:?}");
+        assert_eq!(rig.passed("no_merge_rule"), 1.0, "{events:?}");
+        assert_eq!(rig.merged() + rig.absorbed(), 0.0, "{events:?}");
+    }
+}
