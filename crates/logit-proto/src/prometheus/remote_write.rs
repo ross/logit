@@ -1064,14 +1064,16 @@ pub fn encode_pending(
 /// A reading's place in a group list: (group, family, series).
 type At = (usize, usize, usize);
 
+/// What [`shadowed`] keys a reading by: family name, type, label set, and millisecond.
+type ReadingKey<'a> = (&'a str, FamilyType, &'a [(String, String)], i64);
+
 /// The readings a later reading of their series shares a millisecond with: of each family name,
 /// type, label set, and millisecond, every reading but the latest, the later group on a tie. One
 /// label set holds one sample per millisecond, and inside one request Prometheus and Mimir keep
 /// the first of two and drop the second silently, so the sink keeps the later reading itself,
 /// whole, before any reading is flattened into samples.
 fn shadowed(groups: &[Vec<MetricFamily>]) -> HashSet<At> {
-    let mut latest: HashMap<(&str, FamilyType, &[(String, String)], i64), (At, i64)> =
-        HashMap::new();
+    let mut latest: HashMap<ReadingKey<'_>, (At, i64)> = HashMap::new();
     let mut losers = HashSet::new();
     for (g, families) in groups.iter().enumerate() {
         for (f, family) in families.iter().enumerate() {
