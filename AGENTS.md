@@ -238,7 +238,8 @@ Details an agent needs beyond the table:
   flagged events through, and `missing:` decides the fate of an event the key isn't on. It's the
   one kind `routing-by-condition-is-lua` retired that came back, because keyed consistency is the
   thing a `lua` component can't express. `trace_is_sampled` shares its 53-bit compare in
-  `logit_core::sampling`. Graph rule 61 validates it. See
+  `logit_core::sampling`. Graph rule 61 validates it; `rate: 1` (keep every event) and `rate: 0`
+  with no `always_keep:` (discard every event `missing: keep` doesn't keep, counted) are legal. See
   [fixtures/sample-traces.yaml](fixtures/sample-traces.yaml).
 - **`shape`** is tapped off a flow by ordinary fan-out and never placed in it. It rewrites every
   event it sees into a measurement of that event's own shape: attribute and nested-map counts,
