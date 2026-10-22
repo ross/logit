@@ -1,0 +1,9 @@
+{"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"servers.web-1.cpu","kind":"gauge","value":0.25}],"attributes":{"dc":"us-east","host":"web-1"}}
+{"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"servers.web-1.cpu","kind":"gauge","value":0.5}],"attributes":{"env":"staging"}}
+{"timestamp":"2027-01-15T07:59:52.000000000Z","metrics":[{"name":"servers.web-1.mem","kind":"gauge","value":1234.0}],"attributes":{"role":"db"}}
+{"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"query.time","kind":"gauge","value":3.5}],"attributes":{"expr":"a=b","pattern":"x~y"}}
+{"timestamp":"2027-01-15T07:59:53.250000000Z","metrics":[{"name":"sensor.reading","kind":"gauge","value":100000.0}]}
+{"timestamp":"2027-01-15T07:59:54.000000000Z","metrics":[{"name":"sensor.offset","kind":"gauge","value":1.5}]}
+{"timestamp":"2027-01-15T07:59:55.000000000Z","metrics":[{"name":"sensor.delta","kind":"gauge","value":-2.75}]}
+{"timestamp":"2027-01-15T07:59:56.000000000Z","metrics":[{"name":"servers.web-1.disk","kind":"gauge","value":42.0}]}
+{"timestamp":"2027-01-15T07:59:57.000000000Z","metrics":[{"name":"café.temperature","kind":"gauge","value":21.5}]}

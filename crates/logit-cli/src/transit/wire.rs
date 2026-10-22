@@ -9,9 +9,11 @@
 //! | `prometheus_out`, `bind:` | one scrape after the last batch, in the run's dialect, held to `max_series:` (no expiry: it reads a clock) | `text::parse_with`, then `families_to_events` |
 //! | `prometheus_out`, `endpoint:` | one compressed request per batch | `decompress_bounded`, `remote_write::decode`, then `families_to_events` per timestamp group |
 //! | `datadog_out` | one uncompressed request per route per batch, one per event on the events route, with the sink's routing (`encode_routes`) and none of its stale filter, tag limit, trace readiness gate, or size cuts | `datadog_in`'s `decode_request`, by the request's path and `Content-Type` |
+//! | `graphite_out` | each `MessageBuf` entry: one plaintext line, or one length-prefixed pickle frame, line-capped as the sink's transport caps it | `GraphiteDecoder` of the encoder's protocol, one entry at a time, a pickle frame's length prefix stripped as `graphite_in`'s framer strips it |
 //!
 //! The statsd and InfluxDB encoders return their counts, so this counts them through the sink's
-//! own reporting functions; the OTLP, Prometheus, and Datadog encoders count through the handle they hold.
+//! own reporting functions; the OTLP, Prometheus, Datadog, and Graphite encoders count through
+//! the handle they hold.
 //! A decode error fails the run: the pair's decoder refusing its own sink's bytes is a finding.
 
 use crate::pipeline::SinkEncoder;
@@ -21,6 +23,8 @@ use http::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
 use logit_core::{Diagnostics, EventBatch, Resource, Telemetry};
 use logit_pipeline::test_util::TelemetryProbe;
 use logit_proto::datadog::DatadogDecoder;
+use logit_proto::graphite::pickle::LENGTH_PREFIX_BYTES;
+use logit_proto::graphite::{GraphiteDecoder, Protocol as GraphiteProtocol};
 use logit_proto::influxdb::{write_resource, InfluxDecoder, Precision};
 use logit_proto::otlp::OtlpDecoder;
 use logit_proto::prometheus::compression::decompress_bounded;
@@ -183,6 +187,40 @@ pub(super) fn round_trip(
                         anyhow::anyhow!("datadog_in refused a {} request: {err}", request.path)
                     })?;
                     out.extend(decoded);
+                }
+            }
+        }
+        SinkEncoder::Graphite(mut encoder) => {
+            let (telemetry, diag) = decode.handles("graphite_in");
+            let protocol = encoder.protocol();
+            let mut decoder = GraphiteDecoder::new(empty())
+                .with_protocol(protocol)
+                .with_telemetry(telemetry)
+                .with_diagnostics(diag);
+            let mut entries = MessageBuf::default();
+            for batch in batches {
+                // The encoder counts through the handle it holds; `EncodeStats` repeats them.
+                encoder.encode_into(batch, &mut entries);
+                let mut events = Vec::new();
+                let mut resource = empty();
+                for entry in entries.iter() {
+                    // `graphite_in`'s framer strips a pickle frame's length prefix.
+                    let payload = match protocol {
+                        GraphiteProtocol::Plaintext => entry,
+                        GraphiteProtocol::Pickle => &entry[LENGTH_PREFIX_BYTES..],
+                    };
+                    (resource, _) = decoder
+                        .decode_into(
+                            Bytes::copy_from_slice(payload),
+                            decode.received_at,
+                            &mut events,
+                        )
+                        .with_context(|| {
+                            format!("graphite_in refused {:?}", String::from_utf8_lossy(entry))
+                        })?;
+                }
+                if !events.is_empty() {
+                    out.push(EventBatch { resource, scope: None, events });
                 }
             }
         }

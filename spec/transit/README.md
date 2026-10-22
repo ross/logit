@@ -14,10 +14,11 @@ limits, and [the plan](../../docs/plans/transit-spec.md) the workstreams.
 
 The sources are `statsd_in`, `influxdb_in`, `prometheus_in`'s scrape (remote-write cases
 aren't written yet), `datadog_in`'s metrics routes, with one case each for its logs, events, and
-service checks (no APM cases yet), `collectd_in`, and `otlp_in`'s metrics (no log or trace cases
-yet). The sink columns are `statsd_out`, `prometheus_out` (exposition and remote-write),
-`influxdb_out`, `otlp_out`, and `datadog_out`. Each flow's name says which source meets which
-sink: `statsd-relay`, `influxdb-relay`, `datadog-relay`, and `otlp-relay` are like pairs, and
+service checks (no APM cases yet), `collectd_in`, `otlp_in`'s metrics (no log or trace cases
+yet), and `graphite_in`, plaintext and pickle. The sink columns are `statsd_out`,
+`prometheus_out` (exposition and remote-write), `influxdb_out`, `otlp_out`, `datadog_out`, and
+`graphite_out`. Each flow's name says which source meets which sink: `statsd-relay`,
+`influxdb-relay`, `datadog-relay`, `otlp-relay`, and `graphite-relay` are like pairs, and
 `influxdb-to-prometheus` a cross-protocol one.
 
 `datadog_out` makes four drops above its encoders: `stale` and `too_many_tags`, which read the
@@ -40,9 +41,9 @@ key, a stale document, and a key no case has each fail naming the flow and the c
 |---|---|
 | `mapping.yaml` | The table: the class vocabulary, the sinks, and one row per kind and feature |
 | `features/<system>.yaml` | The wire features a source's cases can exercise, one `{name, text}` each |
-| `cases/<system>/<case>.meta.yaml` | What the case exercises, and its wire file, a collectd case's `types_db:` file, and tolerances if any |
+| `cases/<system>/<case>.meta.yaml` | What the case exercises, and its wire file, a collectd case's `types_db:` file, a graphite case's `protocol:`, and tolerances if any |
 | `cases/<system>/<case>.json` | The case's events, one `format: json` line each |
-| `cases/<system>/<case>.<wire>` | The wire bytes a generated case decodes from, recorded, written as text, or hand-built ("Adding a case"): `.statsd` lines, InfluxDB line protocol in `.lp`, a Prometheus scrape body in `.prom`, a Datadog or OTLP/HTTP request body, compressed as sent, in `.bin`, or one collectd datagram in `.raw` |
+| `cases/<system>/<case>.<wire>` | The wire bytes a generated case decodes from, recorded, written as text, or hand-built ("Adding a case"): `.statsd` lines, InfluxDB line protocol in `.lp`, a Prometheus scrape body in `.prom`, a Datadog or OTLP/HTTP request body, compressed as sent, in `.bin`, one collectd datagram in `.raw`, carbon plaintext lines in `.graphite`, or one pickle payload with no length prefix in `.pkl` |
 | `cases/<system>/<case>.headers` | The request beside an HTTP wire file, one `name: value` per line as `testdata/interop/` records it: `path:` with an InfluxDB write's `org`, `orgID`, `bucket`, and `precision`, a scrape's `content-type:` choosing its dialect, or a Datadog or OTLP/HTTP request's `path:`, `content-type:`, and `content-encoding:` |
 | `flows/<flow>.yaml` | A runnable config: `replay_in -> [stages] -> <sink>` |
 | `expected/<flow>.json` | Each case's run through the flow, keyed by case name: the events read back and the counters moved (generated) |
@@ -179,6 +180,18 @@ A cross-protocol source or a hand-written case can reach each; the row comes wit
 hand-written `cross-kinds` and `typed-attributes` cases reach `messages.dropped{reason=unencodable_value}`
 (a non-finite gauge) and `tags.omitted{reason=unrepresentable}` (a map, bytes, or timestamp value).
 
+These `graphite_out` series have no row, and no case reaches them yet:
+
+| Series | What would reach it |
+|---|---|
+| `tags.omitted{reason=empty}` | a public attribute whose value is the empty string, which reads back lost against the `normalized` `string_value` cell |
+| `tags.omitted{reason=collision}` | two attribute keys on one event that sanitize to one tag name, such as `a b` and `a_b` |
+| `metrics.normalized{reason=tag_sanitized}`, from an array element alone | an array attribute whose last representable element holds whitespace, `;`, or a control character, on an event with no string, bool, number, or resource attribute: the `array_value` cell names `tags.normalized{reason=multi_value}` instead |
+| `metrics.dropped{reason=empty_name}` | a name that sanitizes to nothing, which no decoder emits |
+| `metrics.dropped{reason=unencodable_timestamp}` | an event at or before the Unix epoch's first second |
+| `metrics.degraded{reason=non_finite_component}` | a record under `multi_value: expand` with a NaN or infinite `sum`, `min`, `max`, or quantile, which no case holds |
+| `metrics.dropped{reason=oversize_line}`, `metrics.dropped{reason=oversize_datapoint}` | a line over `max_packet_bytes` under `transport: udp`, or a datapoint over `max_frame_bytes`, transport bounds the row model has no feature for |
+
 ## Determinism
 
 A wire case decodes at a fixed receipt time, 2027-01-15T08:00:00Z. Each run's clock is the case's
@@ -213,6 +226,7 @@ Each sink column has two regions:
 | `doc:influxdb_out` | `crates/logit-proto/src/influxdb/mod.rs` | Every cell of the column |
 | `doc:otlp_out` | `crates/logit-proto/src/otlp/metrics.rs` | Every cell of the column |
 | `doc:datadog_out` | `crates/logit-proto/src/datadog/mod.rs` | Every cell of the column |
+| `doc:graphite_out` | `crates/logit-proto/src/graphite/mod.rs` | Every cell of the column |
 | `gaps:<sink>`, one per sink | `docs/known-gaps/mappings.md` | The column's `degraded`, `lost`, `skipped`, and `dropped` cells, in that file's row format |
 
 A region opens on a line ending `<!-- transit:doc:<sink> -->` or `<!-- transit:gaps:<sink> -->`
@@ -241,7 +255,7 @@ and a protocol name in `docs.rs`'s `PROTOCOLS`, or the check fails.
 
 1. Pick the source system's directory under `cases/`.
 2. For a case that starts on the wire, write the wire file (`<case>.statsd`, `<case>.lp`,
-   `<case>.prom`, `<case>.bin`, or `<case>.raw`) and `<case>.meta.yaml` with `wire: <case>.statsd`.
+   `<case>.prom`, `<case>.bin`, `<case>.raw`, `<case>.graphite`, or `<case>.pkl`) and `<case>.meta.yaml` with `wire: <case>.statsd`.
    An InfluxDB case needs a `<case>.headers` beside its wire file whose `path:` names a `bucket` and an `org` or `orgID`,
    as `influxdb_in` requires; a Prometheus case reads text 0.0.4 unless its `.headers` gives an
    OpenMetrics `content-type:`. A Datadog case's `.headers` gives the request's `path:`, which
@@ -253,7 +267,10 @@ and a protocol name in `docs.rs`'s `PROTOCOLS`, or the check fails.
    instead of copying it, and its `.headers` comes with it; an InfluxDB body sent with
    `content-encoding: gzip` is decompressed first, as `influxdb_in` does. A collectd case may name
    a `types.db` file in `types_db:`, relative to its directory, to name its data sources as
-   `collectd_in`'s `types_db:` setting does. Run `script/transit gen` to write `<case>.json`.
+   `collectd_in`'s `types_db:` setting does. A graphite case reads plaintext unless its
+   `protocol: pickle` says otherwise; a pickle wire file is a connection's length-prefixed frames,
+   as `testdata/interop/graphite/` records them, or under `.pkl` one payload with no prefix, as
+   `testdata/differential/graphite-pickle/` holds them. Run `script/transit gen` to write `<case>.json`.
 3. For an edge case no producer sends, write `<case>.json` by hand and leave `wire:` out. The check
    requires it to read back to itself through `format: json`, and prints the form to use when it
    doesn't.

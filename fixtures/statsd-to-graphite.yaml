@@ -6,7 +6,8 @@
 # increments or timer samples has to become the single reading each flush emits. Its default
 # `distributions: sketch`/`sets: estimate` summarizes timers and sets, and `multi_value: expand`
 # on `graphite_out` renders those summaries as dotted sub-paths; `skip` (the default) drops every
-# multi-value record, raw or summarized.
+# multi-value record, raw or summarized. Each window's counter leaves as a bare number, which carbon
+# reads as a gauge, counted `logit.output.metrics.degraded{metric_kind="monotonic_delta_sum"}`.
 #
 # A repeated DogStatsD tag key (`#team:a,team:b`) decodes to an array, and `graphite_out` renders
 # only its last element as the carbon tag, counted

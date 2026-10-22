@@ -1,0 +1,4 @@
+# A recorded collectd 5.12 `write_graphite` connection, read in place from testdata/interop/: 100
+# CRLF plaintext lines from the load, memory, and interface plugins, over four read cycles.
+wire: ../../../../testdata/interop/graphite/write-graphite-000.raw
+exercises: [plaintext, crlf, integer_value, superseded]

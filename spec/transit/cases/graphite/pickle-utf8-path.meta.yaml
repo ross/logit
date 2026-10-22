@@ -1,0 +1,5 @@
+# A Python 2.7 protocol-0 payload, read in place from testdata/differential/: a UTF-8 `str` path
+# escaped as `\xc3\xa9`.
+wire: ../../../../testdata/differential/graphite-pickle/py2-path-utf8-str-p0.pkl
+protocol: pickle
+exercises: [pickle_payload, pickle_protocol_0, pickle_python2, utf8_path]
