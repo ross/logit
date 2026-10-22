@@ -196,6 +196,22 @@ Entry format and the other areas: [the known-gaps index](README.md).
   - **Why not a monotonic clock:** it would need its own mapping to wall time on every emitted
     point, which nothing else in the pipeline does.
 
+## `cumulative_to_delta`
+
+- **Under `non_monotonic: difference`, a counter that resets with no start time reads as one
+  large negative delta.** `difference` reads a decrease as the reading, not a restart, so only a
+  start time moved past the previous point marks a reset. A collectd value list has no start
+  time, so a DERIVE that restarts from 0 after a host reboot leaves as a delta of the new value
+  minus the previous total, and a Datadog `count` view of it dips by that total once.
+  - **Remedy:** `non_monotonic: reset_on_decrease` for a DERIVE whose `types.db` minimum is 0,
+    which is every stock one. It reads the decrease as a restart, as collectd does.
+  - **Trade-off:** under `reset_on_decrease`, a source that can go down for real reads each
+    decrease as a restart and over-counts by its new value. No single setting fits a listener
+    that receives both kinds; split them upstream with a `route` on an attribute that tells them
+    apart, and give each branch its own `cumulative_to_delta`
+    ([ADR `cumulative-to-delta-transform`](../adr/cumulative-to-delta-transform.md)'s
+    non-monotonic amendment).
+
 ## HTTP access logs: nginx, HAProxy, and `http_access`
 
 - **`http_access` has no per-server presets.** It never learns a server's native variable names:

@@ -1627,7 +1627,7 @@ each only when nonzero.
 
 | Name | Kind | Meaning |
 |---|---|---|
-| `logit.transform.metrics.converted{metric_kind="sum"\|"histogram"\|"exponential_histogram"\|"summary"}` | count | records replaced by a delta, a first or reset point emitted in full included |
+| `logit.transform.metrics.converted{metric_kind="sum"\|"histogram"\|"exponential_histogram"\|"summary"\|"non_monotonic_sum"}` | count | records replaced by a delta, a first or reset point emitted in full included; `non_monotonic_sum` is a cumulative non-monotonic `Sum` converted under `non_monotonic:` |
 | `logit.transform.metrics.skipped{reason="initial"}` | count | a series' first point that only recorded its baseline, as `initial_value` asked |
 | `logit.transform.metrics.skipped{reason="duplicate"\|"out_of_order"}` | count | a point timestamped at, or before, its series' last one, which carries nothing new |
 | `logit.transform.metrics.dropped{reason="layout_changed"}` | count | a `Histogram` whose bounds changed, or an `ExponentialHistogram` whose scale went up or zero threshold went down, with no reset: the counts since the previous point are lost, and the point is the new baseline |

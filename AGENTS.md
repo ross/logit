@@ -131,7 +131,7 @@ Native transforms live in `crates/logit-transforms`; `lua`/`lua_file` live in `c
 |---|---|---|
 | `lua`, `lua_file` | a user script, inline or from a `.lua` file path relative to the config file; an optional `interval` runs its `flush()`, a `random` global mints trace ids, UUIDs, and ULIDs, and a script edits a log's message, severity, and body format and deletes attributes in place, with `pairs` enumerating them; scripts run interpreted unless `jit: true` turns on LuaJIT's compiler for that component; an optional `vars:` map reaches the script as a plain-table `vars` global, so a copied script reads its deployment settings from config | [ADR `lua-flush-root-context`](docs/adr/lua-flush-root-context.md), [ADR `lua-event-constructor`](docs/adr/lua-event-constructor.md), [ADR `lua-in-place-edits`](docs/adr/lua-in-place-edits.md), [ADR `lua-random-ids`](docs/adr/lua-random-ids.md), [ADR `lua-jit-opt-in`](docs/adr/lua-jit-opt-in.md), [ADR `lua-script-vars`](docs/adr/lua-script-vars.md) |
 | `aggregate` | windowed aggregation into mergeable metric kinds | [ADR `aggregation-window-semantics`](docs/adr/aggregation-window-semantics.md) |
-| `cumulative_to_delta` | replaces each point of a cumulative monotonic `Sum`, `Histogram`, `ExponentialHistogram`, or `Summary` with its difference from the series' previous point, for a delta-only destination; per-series state in memory, keyed without the start time, bounded by `max_staleness` (wall clock) and `max_series` | [ADR `cumulative-to-delta-transform`](docs/adr/cumulative-to-delta-transform.md) |
+| `cumulative_to_delta` | replaces each point of a cumulative monotonic `Sum`, `Histogram`, `ExponentialHistogram`, or `Summary` with its difference from the series' previous point, for a delta-only destination, and a cumulative non-monotonic `Sum` under `non_monotonic: difference \| reset_on_decrease`; per-series state in memory, keyed without the start time, bounded by `max_staleness` (wall clock) and `max_series` | [ADR `cumulative-to-delta-transform`](docs/adr/cumulative-to-delta-transform.md) |
 | `json` | parses JSON into attributes | [ADR `json-parsing-into-attributes`](docs/adr/json-parsing-into-attributes.md) |
 | `csv` | delimiter-separated columns into attributes from a config-declared, positional schema; no header-row mode | [ADR `csv-positional-columns`](docs/adr/csv-positional-columns.md) |
 | `logfmt`, `kv` | the de-facto `key=value` parsers | [ADR `logfmt-and-kv-parsing`](docs/adr/logfmt-and-kv-parsing.md) |
@@ -192,8 +192,11 @@ Details an agent needs beyond the table:
   a start change with no reset (differenced, counted `start_adjusted`), and the difference.
   `Summary` carries a `temporality` only it sets to `Delta`; `otlp_out` and `prometheus_out` drop
   a delta summary (`unresolved_delta`), and `datadog_out` drops a cumulative kind
-  (`unresolved_cumulative`) with the transform as the remedy. See
-  [fixtures/otlp-to-datadog.yaml](fixtures/otlp-to-datadog.yaml).
+  (`unresolved_cumulative`) with the transform as the remedy. A cumulative non-monotonic `Sum`
+  passes through unless `non_monotonic:` is `difference` (a decrease is a negative delta) or
+  `reset_on_decrease` (a decrease is a reset, for collectd's DERIVE). See
+  [fixtures/otlp-to-datadog.yaml](fixtures/otlp-to-datadog.yaml) and
+  [fixtures/collectd-to-datadog.yaml](fixtures/collectd-to-datadog.yaml).
 - **`json`**: `invalid_utf8: replace` retries a parse that failed on invalid UTF-8 (nginx's
   `escape=json` passes high bytes raw) on a lossy copy, on the failure path only.
 - **`regex`** replaced a `lua` component in `demo/logit.yaml`'s postgres tier.
@@ -887,7 +890,7 @@ the operator-facing account of all of this.
   Cases come from `statsd_in`, `influxdb_in`, `prometheus_in`'s scrape, `datadog_in`,
   `collectd_in`, `otlp_in`'s metrics, and `graphite_in`; the columns are `statsd_out`,
   `prometheus_out`, `influxdb_out`, `otlp_out`, `datadog_out`, and `graphite_out`, through the
-  statsd, InfluxDB, Prometheus, Datadog, OTLP, and Graphite like pairs and 50 cross-protocol flows ([ADR `transit-spec`](docs/adr/transit-spec.md), [plan](docs/plans/transit-spec.md)).
+  statsd, InfluxDB, Prometheus, Datadog, OTLP, and Graphite like pairs and 51 cross-protocol flows ([ADR `transit-spec`](docs/adr/transit-spec.md), [plan](docs/plans/transit-spec.md)).
 
 ### Not yet built
 

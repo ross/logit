@@ -65,9 +65,11 @@ differ, except where noted below with the reason.
 | `Summary` (cumulative by OTLP's definition) | delta `Summary`: `count` and `sum` differenced, quantiles unchanged |
 | every other record: a `Gauge`, any delta record, a cumulative non-monotonic `Sum`, `Samples`, `Distribution`, `SetMembers`, `Set`, `GaugeDelta`, a record flagged `NO_RECORDED_VALUE` | passed through untouched, with no state |
 
-- **A cumulative non-monotonic `Sum` passes through.** It's an up-down counter whose level is the
-  reading: Datadog's translator sends it as a gauge, Dynatrace and New Relic ingest it as one, and
-  the Collector processor skips it. Differencing it would throw the level away.
+- **A cumulative non-monotonic `Sum` passes through by default.** It's an up-down counter whose
+  level is the reading: Datadog's translator sends it as a gauge, Dynatrace and New Relic ingest
+  it as one, and the Collector processor skips it. Differencing it would throw the level away.
+  The [non-monotonic amendment](#amendment-2026-10-21-non-monotonic-sums-on-request) converts one
+  on request.
 - **A `Summary` needs a temporality.** `logit_core::Summary` gains a `temporality` field, and every
   decoder sets it to `Cumulative`, so this transform can say its output is a delta.
   [ADR `datadog-otlp-metric-mapping`](datadog-otlp-metric-mapping.md)'s "Summary temporality" has
@@ -248,7 +250,9 @@ counted only by the reason above.
   slices, it applies `initial_value` to resets, it doesn't convert an exponential histogram, and
   it has no series bound.
 - **Convert a cumulative non-monotonic `Sum` too.** Every surveyed destination reads it as a
-  gauge, and the difference of a level isn't a useful metric.
+  gauge, and the difference of a level isn't a useful metric. Rejected as the default only: the
+  [non-monotonic amendment](#amendment-2026-10-21-non-monotonic-sums-on-request) adds it as an
+  opt-in, for a counter its producer can't mark monotonic.
 - **Include and exclude lists by metric name, as the Collector processor has.** `logit` selects
   events with routing and filter components; nothing yet needs selection by metric name inside
   this one.
@@ -265,6 +269,68 @@ counted only by the reason above.
 - Losses on restart, eviction, and a layout change are inherent in the conversion, and are
   counted. Persisting the table across a restart is not decided.
 - The Dynatrace and New Relic plans' delta requirement points here.
+
+## Amendment (2026-10-21): non-monotonic sums on request
+
+### Context
+collectd's DERIVE is a counter: collectd computes its rate, `(v - v_prev) / dt`, as it does a
+COUNTER's, and allows a negative rate only where a type's `types.db` minimum does. Every stock
+DERIVE source has a minimum of 0 (`if_octets`, `disk_octets`, `cpu`), so collectd discards a
+negative rate as a reset. collectd marks DERIVE non-monotonic only because it can't detect a
+reset or a wrap, and `collectd_in` decodes it as a cumulative non-monotonic `Sum`
+([ADR `collectd-binary-relay`](collectd-binary-relay.md)). Under the decision above it passes
+through, and `datadog_out` writes it as a `gauge` of the running total, a value an operator
+almost never wants. The up-down-counter reasoning that rejected the conversion doesn't fit a
+counter whose producer can't promise monotonicity. COUNTER, a cumulative monotonic `Sum`,
+already converts.
+
+### Decision
+**`cumulative_to_delta` takes `non_monotonic: pass | difference | reset_on_decrease`, default
+`pass`.** Under either of the two converting values a cumulative non-monotonic `Sum` is a series
+of its own, keyed apart from a monotonic `Sum` of the same name, and leaves as a delta
+non-monotonic `Sum`. Its monotonic flag stays as the producer set it: the transform converts
+temporality, and a destination that reads the flag still learns the producer didn't promise it.
+`pass` leaves the decision above unchanged, so no existing config changes behavior.
+
+- **`difference`: a decrease is a negative delta.** For an up-down counter sent to a destination
+  that takes only deltas. Rule 3's decrease test doesn't apply, because a decrease is the
+  reading, not evidence of a restart; its start-time test does, so a producer that stamps a start
+  time still has a reset read. A counter that resets with no start time, such as a collectd
+  DERIVE after a host reboot, reads as one large negative delta, the previous total subtracted
+  from the new one. That's the cost of the setting's meaning, and the reason it isn't the one
+  the collectd recipe uses.
+- **`reset_on_decrease`: a decrease is a reset.** The point takes every rule a monotonic `Sum`
+  takes, rule 3's decrease test included, so a DERIVE that went down emits its new value. This
+  is collectd's own handling of a stock DERIVE, where the minimum of 0 discards the negative
+  rate. A DERIVE whose value can go down for real reads each decrease as a restart and
+  over-counts by the new value; such a source should use `difference`.
+- **A first point** takes rule 1 unchanged. A collectd value list has no start time, so under
+  `auto` its first point records a baseline and emits nothing.
+
+The setting is an enum, not a boolean, because "convert" alone doesn't say what a decrease
+means, and the two readings are both real: an OpenTelemetry up-down counter needs `difference`,
+and collectd's DERIVE needs `reset_on_decrease`. A boolean would pick one for every producer.
+
+`logit.transform.metrics.converted{metric_kind="non_monotonic_sum"}` counts the converted
+records, apart from the monotonic ones.
+
+### What reaches each sink
+`datadog_out` writes a delta non-monotonic `Sum` as a series `count` of the raw value, as
+Datadog's exporter writes any delta sum, counted
+`logit.output.metrics.degraded{metric_kind="non_monotonic_sum"}`, so a Datadog rate or count
+view reads it as a counter's increment. A negative delta leaves as a negative `count`. The other
+sinks take it as they take any delta non-monotonic `Sum`, as `spec/transit/mapping.yaml`'s
+`sum/delta_nonmonotonic` row states: `otlp_out` writes it exact, `statsd_out` as a signed `|c`
+increment, and `influxdb_out` and `graphite_out` as a bare value. `prometheus_out` drops it, and
+`collectd_out` skips it, since collectd has no delta type that can go down; each is counted.
+
+### Consequences
+- The opt-in departs from both precedents, which never convert a non-monotonic `Sum`.
+- [`docs/datadog.md`](../datadog.md)'s "collectd to Datadog" and
+  [fixtures/collectd-to-datadog.yaml](../../fixtures/collectd-to-datadog.yaml) give the
+  collectd recipe, `reset_on_decrease`, and
+  [`docs/known-gaps/transforms.md`](../known-gaps/transforms.md) records `difference`'s
+  reset gap.
 
 ## Verified behavior
 Read from source on 2026-10-20; nothing was built or run.
