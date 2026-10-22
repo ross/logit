@@ -7,9 +7,9 @@
 # Without `dedup_timestamps`, `prometheus_out` collapses those readings itself, keeping the
 # latest, and counts each lost one only as
 # `logit.output.metrics.degraded{reason="sub_ms_collapsed"}`. With it, the collapse happens here,
-# under the rules you chose: the latest gauge wins, delta readings are summed instead of all but
-# one being lost, and each reading removed is counted as an intended outcome
-# (`logit.transform.metrics.absorbed` or `.merged`).
+# under the rule you chose: the latest gauge wins, and each reading removed is counted as an
+# intended outcome (`logit.transform.metrics.absorbed`). A relative `+N`/`-N` gauge line passes
+# through untouched for an `aggregate` to resolve.
 #
 # Keep it last before the sink: a stage after it can make two series equal again. statsd
 # counters are deltas, which `prometheus_out` drops, counted; a counter flow needs `aggregate`
