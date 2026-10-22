@@ -1676,9 +1676,9 @@ rows:
           counter: logit.output.metrics.dropped{reason=duplicate_timestamp}
           text: >-
             One series can't hold two samples at one timestamp, so the later point wins and the
-            earlier is dropped, counted, when it differs from it or is an observation set, such as
-            a `samples` record's summary; a `dedup_timestamps` upstream merges or collapses the
-            pair instead.
+            earlier is dropped, counted, when it differs from it or is an increment, such as a
+            Datadog `rate`, or an observation set, such as a `samples` record's summary; a
+            `dedup_timestamps` upstream merges or collapses the pair instead.
         - class: normalized
           reason: superseded
           text: >-
@@ -1766,7 +1766,8 @@ rows:
           text: >-
             A remote-write sample's timestamp is in milliseconds, and one series can't hold two
             samples at one timestamp, so the later reading wins and the earlier is dropped,
-            counted, when it differs from it or is an observation set; a `dedup_timestamps` with
+            counted, when it differs from it or is an increment, such as a Datadog `rate`, or an
+            observation set; a `dedup_timestamps` with
             `precision: 1ms` upstream merges or collapses the pair instead.
         - class: normalized
           reason: superseded

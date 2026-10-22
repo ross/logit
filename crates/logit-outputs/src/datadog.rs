@@ -144,8 +144,8 @@
 //! an `at_most_once` drop count only the points sent. Distribution points aren't collapsed:
 //! Datadog keeps both. Two points of one series in one second in two batches are both sent, and
 //! Datadog keeps the later, uncounted (`docs/known-gaps/datadog.md`). A `dedup_timestamps` with
-//! `precision: 1s` as the last stage before this sink sums two counts and keeps the later gauge
-//! first.
+//! `precision: 1s` as the last stage before this sink sums two counts or rates of one interval and
+//! keeps the later gauge first.
 //!
 //! ## Size limits
 //!
