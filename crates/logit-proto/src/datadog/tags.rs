@@ -67,10 +67,11 @@ pub struct Dropped {
     pub unrepresentable: usize,
 }
 
-/// Renders attribute pairs as Datadog tags: `Str` → `k:v`, `Bool(true)` → `k`, numbers →
-/// `k:<display>`, `Timestamp` → `k:<RFC 3339>`, `Array` → one tag per element under the same
-/// rules, `Bool(false)`/`Map`/`Bytes`/`Null` → omitted and counted. A bare tag reads back as
-/// `true`, so `false` has no tag form. Keys in `skip` are the ones a
+/// Renders attribute pairs as Datadog tags: `Str` → `k:v`, `Bool(true)` → `k`, `Bool(false)` →
+/// `k:false`, numbers → `k:<display>`, `Timestamp` → `k:<RFC 3339>`, `Array` → one tag per
+/// element under the same rules, `Map`/`Bytes`/`Null` → omitted and counted. A bare tag reads
+/// back as `true`, so `true` round-trips through [`insert_tag`] and `false` reads back as the
+/// string `"false"`, as `statsd_out` writes and `statsd_in` reads it. Keys in `skip` are the ones a
 /// caller already consumed into a wire field of its own (`host.name`, the `_logit.datadog.*`
 /// carriers) and are never rendered, and neither is any other private `_logit.` key, which is
 /// never counted.
@@ -94,6 +95,7 @@ fn render_one(key: &str, value: &Value, out: &mut Vec<String>, dropped: &mut Dro
     match value {
         Value::Str(s) => out.push(format!("{key}:{}", String::from_utf8_lossy(s))),
         Value::Bool(true) => out.push(key.to_string()),
+        Value::Bool(false) => out.push(format!("{key}:false")),
         Value::I64(n) => out.push(format!("{key}:{n}")),
         Value::U64(n) => out.push(format!("{key}:{n}")),
         Value::F64(n) => out.push(format!("{key}:{n}")),
@@ -103,9 +105,7 @@ fn render_one(key: &str, value: &Value, out: &mut Vec<String>, dropped: &mut Dro
                 render_one(key, item, out, dropped);
             }
         }
-        Value::Bool(false) | Value::Map(_) | Value::Bytes(_) | Value::Null => {
-            dropped.unrepresentable += 1
-        }
+        Value::Map(_) | Value::Bytes(_) | Value::Null => dropped.unrepresentable += 1,
     }
 }
 
@@ -125,13 +125,13 @@ pub fn count_tags<'a>(
 fn count_one(value: &Value) -> usize {
     match value {
         Value::Str(_)
-        | Value::Bool(true)
+        | Value::Bool(_)
         | Value::I64(_)
         | Value::U64(_)
         | Value::F64(_)
         | Value::Timestamp(_) => 1,
         Value::Array(items) => items.iter().map(count_one).sum(),
-        Value::Bool(false) | Value::Map(_) | Value::Bytes(_) | Value::Null => 0,
+        Value::Map(_) | Value::Bytes(_) | Value::Null => 0,
     }
 }
 
@@ -179,8 +179,8 @@ mod tests {
         let mut out = Vec::new();
         let dropped = render_tags(attrs.iter(), &[intern("skipped")], &mut out);
         out.sort();
-        assert_eq!(out, ["env:prod", "n:3", "team:a", "team:b", "urgent"]);
-        assert_eq!(dropped, Dropped { unrepresentable: 2 }, "`off` and `nested`");
+        assert_eq!(out, ["env:prod", "n:3", "off:false", "team:a", "team:b", "urgent"]);
+        assert_eq!(dropped, Dropped { unrepresentable: 1 }, "`nested`");
     }
 
     /// `count_tags` agrees with `render_tags` on every `Value` variant, nested arrays and
@@ -213,7 +213,25 @@ mod tests {
         let mut out = Vec::new();
         render_tags(attrs.iter(), &skip, &mut out);
         assert_eq!(count_tags(attrs.iter(), &skip), out.len());
-        assert_eq!(out.len(), 10);
+        assert_eq!(out.len(), 12);
+    }
+
+    /// `false` leaves as `key:false` and reads back as the string; `true` leaves bare and reads
+    /// back as itself.
+    #[test]
+    fn a_false_attribute_is_a_key_false_tag() {
+        let mut attrs = AttrMap::new();
+        attrs.insert("on", Value::Bool(true));
+        attrs.insert("off", Value::Bool(false));
+        let mut out = Vec::new();
+        let dropped = render_tags(attrs.iter(), &[], &mut out);
+        out.sort();
+        assert_eq!(out, ["off:false", "on"]);
+        assert_eq!(dropped, Dropped::default());
+        let mut back = AttrMap::new();
+        insert_tags(&mut back, out.iter().map(String::as_str));
+        assert_eq!(back.get("on"), Some(&Value::Bool(true)));
+        assert_eq!(back.get("off"), Some(&Value::str("false")));
     }
 
     #[test]
