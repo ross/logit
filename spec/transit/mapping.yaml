@@ -163,7 +163,8 @@ rows:
         counter: logit.output.metrics.degraded{metric_kind=non_monotonic_sum}
         text: >-
           A series `gauge` point of the running value, as Datadog's exporter sends it, which
-          datadog_in reads back as a gauge.
+          datadog_in reads back as a gauge; a `cumulative_to_delta` upstream with
+          `non_monotonic: difference` or `reset_on_decrease` makes it a delta `count`.
       graphite_out:
         class: degraded
         counter: logit.output.metrics.degraded{metric_kind=cumulative_sum}

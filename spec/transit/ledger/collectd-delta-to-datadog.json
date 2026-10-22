@@ -1,0 +1,17 @@
+{
+  "cells": [
+    {"sink":"datadog_out","row":"attributes/foreign_carrier","cell":0,"observed":["lost"]},
+    {"sink":"datadog_out","row":"attributes/log_status","cell":0,"observed":["normalized"]},
+    {"sink":"datadog_out","row":"attributes/no_host","cell":0,"observed":["normalized"]},
+    {"sink":"datadog_out","row":"attributes/string_value","cell":0,"observed":["exact"]},
+    {"sink":"datadog_out","row":"gauge/f64","cell":0,"observed":["exact"]},
+    {"sink":"datadog_out","row":"log/plain","cell":0,"observed":["exact"]},
+    {"sink":"datadog_out","row":"record/no_recorded_value","cell":0,"observed":["skipped"]},
+    {"sink":"datadog_out","row":"record/superseded","cell":0,"observed":["exact"]},
+    {"sink":"datadog_out","row":"sum/delta_monotonic","cell":0,"observed":[]},
+    {"sink":"datadog_out","row":"sum/delta_nonmonotonic","cell":0,"observed":["degraded"]},
+    {"sink":"datadog_out","row":"sum/i64","cell":0,"observed":[]},
+    {"sink":"datadog_out","row":"sum/u64","cell":0,"observed":["normalized"]}
+  ],
+  "unspecified": []
+}

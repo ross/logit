@@ -1090,6 +1090,7 @@ macro_rules! flow_tests {
 }
 
 flow_tests! {
+    collectd_delta_to_datadog => "collectd-delta-to-datadog",
     collectd_to_datadog => "collectd-to-datadog",
     collectd_to_influxdb => "collectd-to-influxdb",
     collectd_to_otlp => "collectd-to-otlp",
