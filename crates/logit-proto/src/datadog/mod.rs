@@ -802,6 +802,20 @@ fn merged_get<'a>(resource: &'a Resource, event: &'a Event, key: &str) -> Option
     event.attributes.get(key).or_else(|| resource.attributes.get(key))
 }
 
+/// Whether `kind` on `event` is a Datadog `rate`: a `Gauge` whose [`ATTR_TYPE`], the event's value
+/// winning over the resource's, is `rate`, the form `datadog_in` decodes a rate to. A rate is an
+/// increment over its [`ATTR_INTERVAL`], not a state, so a stage that collapses readings of one
+/// series at one timestamp sums it rather than keeping the later one.
+pub fn is_rate(resource: &Resource, event: &Event, kind: &MetricKind) -> bool {
+    matches!(kind, MetricKind::Gauge(_))
+        && merged_get(resource, event, ATTR_TYPE).and_then(Value::as_str) == Some(series::TYPE_RATE)
+}
+
+/// [`ATTR_INTERVAL`], the event's value winning over the resource's.
+pub fn interval<'a>(resource: &'a Resource, event: &'a Event) -> Option<&'a Value> {
+    merged_get(resource, event, ATTR_INTERVAL)
+}
+
 /// A service check: `_logit.statsd.service_check.name` present and a `Gauge` first metric, the
 /// shape [`DatadogEncoder::encode_service_checks`] sends. Its record 0 belongs to that route alone;
 /// the metrics routes skip it and send any later records as ordinary metrics, as `statsd_out` does.

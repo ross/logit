@@ -16,7 +16,10 @@
 //! latest-timestamp record among the rest, the later in batch order on a tie. The rest of the set
 //! folds into it in batch order:
 //!
-//! - a `Gauge` or a cumulative kind, flagged or not, is superseded (`absorbed`);
+//! - a `Gauge` or a cumulative kind, flagged or not, is superseded (`absorbed`), except a Datadog
+//!   `rate` ([`logit_proto::datadog::is_rate`]), an increment over its interval, which sums as a
+//!   delta `Sum` does when its interval equals the survivor's, and otherwise passes through
+//!   (`no_merge_rule`), as does a rate beside a gauge that isn't one;
 //! - a delta `Sum`, `Histogram`, or `ExponentialHistogram`, `Samples`, `SetMembers`,
 //!   `Distribution`, or `Set` is merged (`merged`), unless its value type, bucket layout, or
 //!   sample rate differs from the survivor's (`mixed_type`, `layout_mismatch`) or its addition
@@ -42,9 +45,10 @@ use crate::aggregate::{
 use bytes::Bytes;
 use logit_core::{
     Event, ExpHistogram, Histogram, MetricKind, MetricRecord, MetricValue, Resource, Scope,
-    Telemetry, Temporality,
+    Telemetry, Temporality, Value,
 };
 use logit_pipeline::Transform;
+use logit_proto::datadog;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
@@ -137,9 +141,10 @@ fn kind_key(kind: &MetricKind) -> (u8, u8, bool) {
     }
 }
 
-/// Whether a record can be merged or superseded at all, before it's compared with a survivor.
-fn alone(record: &MetricRecord) -> Result<Class, Reason> {
-    let class = class(&record.kind);
+/// Whether a record can be merged or superseded at all, before it's compared with a survivor. A
+/// Datadog `rate` (`rate`) is an increment, so it takes the delta rules.
+fn alone(record: &MetricRecord, rate: bool) -> Result<Class, Reason> {
+    let class = if rate { Class::Delta } else { class(&record.kind) };
     let finite = |v: Option<f64>| v.is_none_or(f64::is_finite);
     match class {
         Class::LastWriteWins => Ok(class),
@@ -152,6 +157,8 @@ fn alone(record: &MetricRecord) -> Result<Class, Reason> {
                 Err(Reason::NoMergeRule)
             }
             MetricKind::Sum(s) if !s.value.is_finite() => Err(Reason::NonFinite),
+            MetricKind::Gauge(MetricValue::Bool(_)) => Err(Reason::NoMergeRule),
+            MetricKind::Gauge(v) if !v.is_finite() => Err(Reason::NonFinite),
             MetricKind::Histogram(h) if !finite(h.sum) => Err(Reason::NonFinite),
             MetricKind::ExponentialHistogram(e) if !finite(e.sum) => Err(Reason::NonFinite),
             _ => Ok(class),
@@ -282,6 +289,11 @@ fn merge(
             a.value = add_value(a.value, b.value)?;
             Ok(())
         }
+        // Only a Datadog `rate` reaches a merge as a `Gauge`; any other gauge is last write wins.
+        (MetricKind::Gauge(a), MetricKind::Gauge(b)) => {
+            *a = add_value(*a, *b)?;
+            Ok(())
+        }
         (MetricKind::Histogram(a), MetricKind::Histogram(b)) => merge_histogram(a, b),
         (MetricKind::ExponentialHistogram(a), MetricKind::ExponentialHistogram(b)) => {
             merge_exponential(a, b)
@@ -335,6 +347,9 @@ fn apply_prefix(kind: &mut MetricKind, prefix: Prefix) {
         _ => {}
     }
 }
+
+/// A record's Datadog `rate` carrier: whether it's a rate, and the interval of one that is.
+type Rate = (bool, Option<Value>);
 
 /// One keyed record of the batch: `(key hash, event index, record index)`.
 type Entry = (u64, u32, u32);
@@ -399,26 +414,36 @@ impl DedupTimestamps {
     }
 
     /// Resolves one colliding set, its entries in batch order.
-    fn resolve(&mut self, events: &mut [Event], set: &[Entry]) {
-        let verdicts: Vec<Result<Class, Reason>> =
-            set.iter().map(|e| alone(&events[e.1 as usize].metrics[e.2 as usize])).collect();
+    fn resolve(&mut self, resource: &Resource, events: &mut [Event], set: &[Entry]) {
+        // Each entry's verdict beside its Datadog `rate` carrier, read the way `datadog_out` reads
+        // it: whether it's a rate, and its interval. One vector, so a collision allocates once.
+        let verdicts: Vec<(Result<Class, Reason>, Rate)> = set
+            .iter()
+            .map(|e| {
+                let event = &events[e.1 as usize];
+                let record = &event.metrics[e.2 as usize];
+                let rate = datadog::is_rate(resource, event, &record.kind);
+                let interval = rate.then(|| datadog::interval(resource, event).cloned()).flatten();
+                (alone(record, rate), (rate, interval))
+            })
+            .collect();
         // The latest timestamp among the records that can merge, the later on a tie.
         let survivor = set
             .iter()
             .zip(&verdicts)
             .enumerate()
-            .filter(|(_, (_, v))| v.is_ok())
+            .filter(|(_, (_, v))| v.0.is_ok())
             .max_by_key(|(i, (e, _))| (events[e.1 as usize].timestamp, *i))
             .map(|(i, _)| i);
         let Some(s) = survivor else {
             for v in verdicts.iter().skip(1) {
-                if let Err(reason) = v {
+                if let Err(reason) = &v.0 {
                     self.tally.passed[*reason as usize] += 1;
                 }
             }
             return;
         };
-        let class = verdicts[s].expect("the survivor can merge");
+        let class = verdicts[s].0.expect("the survivor can merge");
         let (sev, srec) = (set[s].1 as usize, set[s].2 as usize);
         let slot = &mut events[sev].metrics[srec];
         let placeholder = MetricRecord::new(slot.name, MetricKind::Gauge(MetricValue::F64(0.0)));
@@ -427,12 +452,19 @@ impl DedupTimestamps {
         let mut prefix = Prefix::default();
         let mut start = acc.start_timestamp;
         let mut description = acc.description;
-        for (i, (entry, verdict)) in set.iter().zip(&verdicts).enumerate() {
+        for (i, (entry, (verdict, rate))) in set.iter().zip(&verdicts).enumerate() {
             if i == s {
                 continue;
             }
             if let Err(reason) = verdict {
                 self.tally.passed[*reason as usize] += 1;
+                continue;
+            }
+            // A rate sums only with a rate of its interval, and a gauge that isn't one never
+            // folds into a rate or takes one in. The series key holds the carriers, so a set
+            // doesn't mix them today; this keeps the rule if the key changes.
+            if *rate != verdicts[s].1 {
+                self.tally.passed[Reason::NoMergeRule as usize] += 1;
                 continue;
             }
             let other = &mut events[entry.1 as usize].metrics[entry.2 as usize];
@@ -498,7 +530,7 @@ impl Transform for DedupTimestamps {
 
     fn begin_batch(
         &mut self,
-        _resource: &Arc<Resource>,
+        resource: &Arc<Resource>,
         _scope: Option<&Arc<Scope>>,
         events: &mut Vec<Event>,
     ) {
@@ -539,7 +571,7 @@ impl Transform for DedupTimestamps {
                     }
                 }
                 if set.len() > 1 {
-                    self.resolve(events, &set);
+                    self.resolve(resource, events, &set);
                 }
             }
         }
