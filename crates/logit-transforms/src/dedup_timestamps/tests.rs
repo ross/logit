@@ -3,7 +3,7 @@ use crate::aggregate::Aggregator;
 use logit_core::interner::intern;
 use logit_core::{
     AttrMap, BodyFormat, DdSketch, EventBatch, Exemplar, HyperLogLog, LogRecord, Mapping, Samples,
-    Sum, Summary, Value,
+    SpanKind, SpanRecord, SpanStatus, Sum, Summary, Value,
 };
 use logit_pipeline::runtime::process_batch;
 use logit_pipeline::test_util::TelemetryProbe;
@@ -315,6 +315,27 @@ fn a_mixed_i64_and_f64_pair_passes_through_unwidened() {
     assert_eq!(rig.merged(), 1.0);
 }
 
+/// `U64` beside `I64` is a type mismatch too: the merge never changes either's type.
+#[test]
+fn a_u64_and_i64_pair_passes_through_as_mixed_type() {
+    let mut rig = Rig::new();
+    let events = vec![ev(T, delta(MetricValue::U64(2))), ev(T + 1, delta(MetricValue::I64(3)))];
+    assert_eq!(rig.run(events.clone()), events);
+    assert_eq!(rig.passed("mixed_type"), 1.0);
+    assert_eq!(rig.merged(), 0.0);
+}
+
+/// Two `Bool`s would sum to an `I64` count, so a `Bool` delta pair has no merge rule.
+#[test]
+fn a_bool_delta_pair_passes_through_as_no_merge_rule() {
+    let mut rig = Rig::new();
+    let events =
+        vec![ev(T, delta(MetricValue::Bool(true))), ev(T + 1, delta(MetricValue::Bool(true)))];
+    assert_eq!(rig.run(events.clone()), events);
+    assert_eq!(rig.passed("no_merge_rule"), 1.0);
+    assert_eq!(rig.merged(), 0.0);
+}
+
 #[test]
 fn an_overflowing_delta_passes_through() {
     let mut rig = Rig::new();
@@ -568,7 +589,7 @@ fn sets_merge_their_estimates() {
 // ---- Events -----------------------------------------------------------------------------------
 
 #[test]
-fn an_event_keeps_its_log_span_and_other_records_and_batch_order_holds() {
+fn an_event_keeps_its_log_and_other_records_and_batch_order_holds() {
     let mut rig = Rig::new();
     let mut with_log = ev(T, MetricKind::gauge(1.0));
     with_log.log = Some(log_record());
@@ -581,6 +602,34 @@ fn an_event_keeps_its_log_span_and_other_records_and_batch_order_holds() {
     assert_eq!(out[1], plain_log, "an event with no records is left alone");
     assert_eq!(kinds(&out[2..3]), [&MetricKind::gauge(9.0)]);
     assert_eq!(kinds(&out[3..]), [&MetricKind::gauge(3.0)]);
+    assert_eq!(rig.discarded(), 0.0);
+}
+
+/// An event whose only metric is absorbed still carries a span, so it isn't discarded.
+#[test]
+fn an_event_whose_only_metric_is_absorbed_keeps_its_span() {
+    let mut rig = Rig::new();
+    let span = SpanRecord {
+        trace_id: [1; 16],
+        span_id: [1; 8],
+        parent_span_id: None,
+        name: Value::str("span"),
+        kind: SpanKind::Internal,
+        status: SpanStatus::Unset,
+        events: Vec::new(),
+        links: Vec::new(),
+        end_timestamp: 0,
+        flags: 0,
+        ext: None,
+    };
+    let mut with_span = ev(T, MetricKind::gauge(1.0));
+    with_span.span = Some(span.clone());
+    let out = rig.run(vec![with_span, ev(T + 1, MetricKind::gauge(2.0))]);
+    assert_eq!(out.len(), 2);
+    assert_eq!(out[0].span, Some(span));
+    assert!(out[0].metrics.is_empty());
+    assert_eq!(kinds(&out[1..]), [&MetricKind::gauge(2.0)]);
+    assert_eq!(rig.absorbed(), 1.0);
     assert_eq!(rig.discarded(), 0.0);
 }
 
