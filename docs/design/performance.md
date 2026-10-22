@@ -421,18 +421,19 @@ decimal.
 - **`aggregate` +5.2% and `aggregate-groups` +7.8% are InfluxDB's string fields.** `1f30eb3c`
   ("leave InfluxDB string fields out of a series") steps +11.6% and +11.5%, testing each attribute
   key against the private string-field carriers. `927f7733`, in the same stack, memoizes which keys
-  are string fields and wins most of it back: at the stack's merge, `92b6b708`, the two read +4.2%
-  and +3.1% over `72191ead`. Both steps clear the 10-repeat ranges of the cells on either side.
+  are string fields and wins most of it back: at `92b6b708`, the merge inside #782's stack that
+  joins the two, they read +4.2% and +3.1% over `72191ead`. Both steps clear the 10-repeat ranges
+  of the cells on either side.
 - **The rest of `aggregate-groups`' rise is Datadog's APM stats.** `118cc7e1` ("pass Datadog APM
   stats groups through as bucketed"), the next commit in the same stack, steps `aggregate-groups`
-  +4.0% (0.300 → 0.313, the second cell's 15 repeats within 0.311–0.314) and `aggregate` +1.2%,
+  +4.4% (0.299 → 0.313, the second cell's 15 repeats within 0.311–0.314) and `aggregate` +1.3%,
   testing each event for an APM stats group. The merges after it, #782 through n, don't move
   either scenario by more than 1.1%.
 - **`native-relay` is 7.7% faster on events/s and 3.3% cheaper on CPU, and `lua` 3.5% cheaper.**
   Neither was bisected; read `native-relay`'s with "`native-relay` is code-layout-sensitive" below.
 - **`buffered-small-segments`' −42.3% events/s is wall-clock noise, not a change.** Its CPU
-  µs/event is flat across all four binaries (1.756–1.792), while events/s swings by up to ±40%
-  between binaries and inside one binary's five repeats (255,261–607,870 on n). It's the disk-wait
+  µs/event is flat across all four binaries (1.756–1.792), while events/s medians range from 321,798 to
+  557,580 between binaries, and one binary's five repeats span 255,261–607,870 (n). It's the disk-wait
   spread §3 describes for `buffered`, at about 70 segment rolls a run.
 - **`route` +3.7%, under the gate.** Its five-repeat ranges don't overlap (0.681–0.723 on m,
   0.735–0.737 on n); nothing here attributes it.
