@@ -113,17 +113,18 @@ later in batch order on a tie. Its event keeps its own, untruncated timestamp, a
 mergeable record in the set is removed from its event. A `NaN` or infinite delta value, a marker
 on a delta kind, a delta `Sum` of `Bool`s, and a kind with no merge rule can't merge on their
 own. For the kinds that merge
-(delta `Sum`, delta `Histogram`, delta `ExponentialHistogram`, and `Samples`), a layout, a
+(delta `Sum`, a Datadog `rate`, delta `Histogram`, delta `ExponentialHistogram`, and `Samples`), a layout, a
 `sample_rate`, or a value type is compared with the survivor's, so the latest record that can merge
 on its own sets them, and a record that differs from it passes through. The last-write-wins kinds
-(`Gauge`, the cumulative kinds, and a stale marker on either) take part in last write wins whatever
+(`Gauge` other than a Datadog `rate`, the cumulative kinds, and a stale marker on either) take part in last write wins whatever
 their value type or layout. The rest fold into the survivor in batch order, and a record whose
 addition would overflow the running total passes through. What the surviving record carries depends
 on the kind:
 
 | Kind | Rule |
 |---|---|
-| `Gauge`, any `MetricValue` (a `NaN` gauge included) | last write wins: the later value |
+| `Gauge`, any `MetricValue` (a `NaN` gauge included), other than a Datadog `rate` | last write wins: the later value |
+| `Gauge` that's a Datadog `rate`: its `_logit.datadog.type`, the event's value else the resource's, is `rate` | an increment over its interval, so summed as a delta `Sum` is, under the same `non_finite`, `mixed_type`, and `overflow` rules, when its `_logit.datadog.interval`, read the same way, equals the survivor's (both absent counts as equal). A rate whose interval differs, and a rate beside a gauge that isn't one, pass through (`no_merge_rule`). The series key includes the event's attributes and the batch's resource, so neither case reaches a colliding set today; the checks guard the rule against a key change |
 | `Sum`, cumulative, monotonic or not | last write wins |
 | `Histogram`, `ExponentialHistogram`, `Summary`, cumulative | last write wins |
 | `Sum`, delta, monotonic or not | summed, keeping the value type. A `NaN` or infinite value passes through (`non_finite`), as does a value of any other type from the survivor's, such as `I64` beside `F64` or `U64` beside `I64` (`mixed_type`), and one whose addition would overflow the total (`overflow`) |
@@ -137,7 +138,7 @@ on the kind:
 | `Distribution` | `DdSketch::merge`, which re-bins the incoming sketch when the two sketches' mappings differ |
 | `Set` | `HyperLogLog::merge`, a union |
 | a record flagged `NO_RECORDED_VALUE`, on a `Gauge` or a cumulative kind | last write wins against the set's latest value: see below |
-| a record flagged `NO_RECORDED_VALUE`, on a delta `Sum`, `Histogram`, or `ExponentialHistogram` | passed through (`no_recorded_value`); the delta values merge among themselves |
+| a record flagged `NO_RECORDED_VALUE`, on a delta `Sum`, a Datadog `rate`, a delta `Histogram`, or a delta `ExponentialHistogram` | passed through (`no_recorded_value`); the delta values merge among themselves |
 
 Last write wins needs no arithmetic, so it's safe for every kind, `NaN` included. A delta is an
 increment, so the later one alone would lose the earlier's. Summing is the merge
@@ -315,8 +316,8 @@ it emits no `*.dropped`. The loss a passed-through record causes is counted at t
 
 | Name | Meaning |
 |---|---|
-| `logit.transform.metrics.merged` | a reading summed or otherwise combined into the surviving reading: a delta `Sum`, a delta histogram with a matching layout, and the observation kinds' merges, a re-binned `Distribution` included |
-| `logit.transform.metrics.absorbed` | a reading superseded by a later one under last write wins: a `Gauge`, a cumulative kind, or either side of a `NO_RECORDED_VALUE` marker and a value of one of those kinds |
+| `logit.transform.metrics.merged` | a reading summed or otherwise combined into the surviving reading: a delta `Sum`, a Datadog `rate`, a delta histogram with a matching layout, and the observation kinds' merges, a re-binned `Distribution` included |
+| `logit.transform.metrics.absorbed` | a reading superseded by a later one under last write wins: a `Gauge` other than a Datadog `rate`, a cumulative kind, or either side of a `NO_RECORDED_VALUE` marker and a value of one of those kinds |
 | `logit.transform.metrics.passed_through{reason="non_finite" \| "overflow" \| "mixed_type" \| "layout_mismatch" \| "no_merge_rule" \| "no_recorded_value"}` | a record that shares its series and bucket with another but can't merge, forwarded untouched: the sink still sees the duplicate |
 | `logit.component.events.discarded` | an event left with no metric, log, or span |
 
@@ -358,9 +359,9 @@ sends:
 | a state, equal to the reading sent | `logit.output.metrics.normalized{reason="duplicate_timestamp"}` |
 | any other | `logit.output.metrics.dropped{reason="duplicate_timestamp"}`, with a throttled `duplicate_timestamp` diagnostic naming `dedup_timestamps` |
 
-A **state** is a reading a later equal reading fully replaces: a `Gauge`, or a cumulative `Sum`,
-`Histogram`, `ExponentialHistogram`, or `Summary`. An equal state loses nothing: the destination stores the same sample
-whichever of the two arrives, so the rule each destination applies inside one request (the first,
+A **state** is a reading a later equal reading fully replaces: a gauge other than a Datadog
+`rate`, or a cumulative `Sum`, `Histogram`, `ExponentialHistogram`, or `Summary`. An equal state
+loses nothing: the destination stores the same sample whichever of the two arrives, so the rule each destination applies inside one request (the first,
 or the higher) makes no difference. A Datadog Agent relay or a retry resends identical points,
 and that mustn't raise a loss alarm.
 
