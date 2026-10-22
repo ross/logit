@@ -392,8 +392,8 @@ a black hole counts what it discards as `events.discarded`.
 40. A scrape-mode `prometheus_in` with a bad target URL, `timeout: 0s`, a bad `scrape_tls:`, or a
     reserved or colliding header.
 41. A registry-mode `prometheus_out` `path` not starting with `/`, or `max_series: 0`.
-42. A `generate_in` `batch` or `rate` of `0`, an empty key or metric name, a non-finite metric value, or an
-    unknown or unbounded template placeholder.
+42. A `generate_in` `batch` or `rate` of `0`, an empty key or metric name, a non-finite metric
+    value, or an unknown or unbounded template placeholder.
 43. A `tls:` on a UDP `syslog_in`, `graphite_in`, `statsd_in`, or `lines_in`.
 44. An inconsistent `syslog_out` `tls:`, or one under `transport: udp`.
 45. A `0s` `handshake_timeout`, or a non-default one on a UDP listener.
@@ -406,9 +406,9 @@ a black hole counts what it discards as `events.discarded`.
     through it.
 50. A router (`route`, or `lua`/`lua_file` with `targets:`) with no ordinary consumer. Name a
     `null_out` as its consumer to discard the events no target claims.
-51. A `route` with an empty key or value, an empty list, a target repeated within
-    one list, more than 63 distinct targets, or an empty `by:` key; or a component whose
-    `sources:` lists two targets of one `route` list.
+51. A `route` with an empty key or value, an empty list, a target repeated within one list, more
+    than 63 distinct targets, or an empty `by:` key; or a component whose `sources:` lists two
+    targets of one `route` list.
 52. An inconsistent `statsd_out` `tls:`, or one under `transport: udp`.
 53. A `0s` `idle_timeout`, or any `idle_timeout` on a UDP listener.
 54. A `keep_values` with an empty name, a non-finite literal, a literal `normalize: [lower]` can't
@@ -499,7 +499,9 @@ graph — rule 37's reasoning; the key is as likely to name a component relayed 
 
 **Sink reachability from a listener needs no separate rule.** It follows from 2 + 5 + 7: every
 acyclic chain of ≥1-source components ends somewhere, and rule 7 requires every non-terminal
-component in it to have a consumer, so the chain can only end at a sink.
+component in it to have a consumer, so the chain can only end at a sink, or at a `route_signals`
+with no `signals:` entry set. Rule 92 exempts `route_signals` from rule 7, and with no entry set it
+discards every event and counts it as `events.discarded`.
 
 **Sharing needs no rule either.** The pre-graph validator rejected an input or output claimed by
 more than one pipeline, because that runtime couldn't express sharing. In the graph model a shared

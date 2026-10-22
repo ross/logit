@@ -1,6 +1,6 @@
 ---
 created: 2026-09-01
-updated: 2026-10-18
+updated: 2026-10-21
 ---
 
 # Buffered, decoupled sink delivery
