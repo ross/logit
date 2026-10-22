@@ -90,22 +90,29 @@ fn json_bytes(v: JsonValue) -> Vec<u8> {
 
 // -- hand-written vectors ------------------------------------------------------------------------
 
-/// A unit that isn't a Datadog unit name leaves under Datadog's name for it, or with none, as
-/// the module doc's permitted normalizations say; a second hop is then a fixed point.
+/// A unit `datadog_in` decodes is a Datadog unit name, whatever it spells: it leaves as it is,
+/// a name outside the UCUM mapper's set (`percent_nano`) and a UCUM-looking one (`ms`) alike, and
+/// only a batch with a unit carries the resource marker that says so.
 #[test]
-fn a_unit_without_a_datadog_name_is_mapped_or_left_off() {
-    for (unit, want) in
-        [("ms", Some("millisecond")), ("By/s", Some("byte/second")), ("teaspoon", None)]
-    {
+fn a_decoded_unit_leaves_as_it_is() {
+    for unit in ["percent_nano", "millicore", "degree fahrenheit", "ms", "teaspoon"] {
         let body = format!(
             r#"{{"series":[{{"metric":"m","points":[[1700000000,1.0]],"tags":[],"host":"h","type":"gauge","interval":0,"unit":"{unit}"}}]}}"#
         );
-        let encoded = encode(Route::V1, &decode(Route::V1, body.as_bytes())).unwrap();
-        let read = decode(Route::V1, &encoded).events[0].metrics[0].unit;
-        let read = read.map(logit_core::interner::resolve);
-        assert_eq!(read, want, "{unit}");
-        assert_fixed_point(Route::V1, &encoded);
+        let decoded = decode(Route::V1, body.as_bytes());
+        assert_eq!(
+            decoded.resource.attributes.get(logit_proto::datadog::ATTR_UNITS),
+            Some(&Value::str("datadog")),
+            "{unit}"
+        );
+        let encoded = encode(Route::V1, &decoded).unwrap();
+        let wire: JsonValue = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(wire["series"][0]["unit"], unit);
+        assert_fixed_point(Route::V1, body.as_bytes());
     }
+    let unitless =
+        br#"{"series":[{"metric":"m","points":[[1700000000,1.0]],"tags":[],"host":"h"}]}"#;
+    assert!(decode(Route::V1, unitless).resource.attributes.is_empty());
 }
 
 #[test]
@@ -586,10 +593,7 @@ fn gen_series() -> impl Strategy<Value = GenSeries> {
             (prop::sample::select(vec!["db", "queue", "host", "device", ""]), "[a-z0-9]{0,5}"),
             0..3,
         ),
-        // A Datadog unit name, which passes through; any other unit is mapped or left off
-        // (`a_unit_without_a_datadog_name_is_mapped_or_left_off`).
-        prop::sample::select(vec!["", "byte", "millisecond", "request", "item", "byte/second"])
-            .prop_map(str::to_string),
+        "[a-z]{0,6}",
         "[a-zA-Z]{0,6}",
         prop_oneof![Just(0i64), 1i64..3600],
         (0u32..3, 0u32..3, 0u32..3),

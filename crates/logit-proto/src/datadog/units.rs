@@ -14,10 +14,11 @@
 //! - Any other component is a base unit ([`BASE_UNITS`]), bare or after a prefix ([`PREFIXES`])
 //!   that the base unit lists as forming a Datadog unit: `KiBy` is `kibibyte`, `mBy` doesn't map.
 //!
-//! A Datadog unit name, which a `datadog_in` series carries, passes through unchanged ahead of
-//! the mapping: any name the mapping can produce, a rate of two of them, and `nanocore`, which
-//! the translator's own `metrics_remapping.go` writes. Datadog's unit catalog has names outside
-//! that set; one of those is left off like an unmapped UCUM unit.
+//! A Datadog unit name passes through unchanged ahead of the mapping: any name the mapping can
+//! produce, a rate of two of them, and `nanocore`, which the translator's own
+//! `metrics_remapping.go` writes. A unit `datadog_in` decoded never reaches this mapping: the
+//! encoder writes it as it is under the batch's [`super::ATTR_UNITS`] mark, since Datadog's unit
+//! catalog has names outside that set.
 
 use std::borrow::Cow;
 

@@ -16,12 +16,13 @@ use super::tags::{count_tags, insert_tags, render_tags};
 use super::time::{nanos_to_seconds, seconds_to_nanos};
 use super::units;
 use super::{
-    collectd_host, host_tag, is_datadog_stats, is_service_check, DatadogDecoder, DatadogEncoder,
-    HistogramMode, HistogramOptions, ATTR_DEVICE, ATTR_HOSTLESS, ATTR_HOST_NAME, ATTR_HOST_TAG,
-    ATTR_INTERVAL, ATTR_ORIGIN_CATEGORY, ATTR_ORIGIN_METRIC_TYPE, ATTR_ORIGIN_PRODUCT,
-    ATTR_ORIGIN_SERVICE, ATTR_RESOURCES, ATTR_SOURCE_TYPE_NAME, ATTR_TYPE, MAX_METRIC_TAGS,
-    RESOURCE_ATTR_AGENT_EPOCH, RESOURCE_ATTR_AGENT_INTERNAL_IP, RESOURCE_ATTR_AGENT_PUBLIC_IP,
-    RESOURCE_ATTR_AGENT_TIMEZONE, RESOURCE_ATTR_AGENT_VERSION,
+    collectd_host, host_tag, is_datadog_stats, is_service_check, units_are_datadog, DatadogDecoder,
+    DatadogEncoder, HistogramMode, HistogramOptions, ATTR_DEVICE, ATTR_HOSTLESS, ATTR_HOST_NAME,
+    ATTR_HOST_TAG, ATTR_INTERVAL, ATTR_ORIGIN_CATEGORY, ATTR_ORIGIN_METRIC_TYPE,
+    ATTR_ORIGIN_PRODUCT, ATTR_ORIGIN_SERVICE, ATTR_RESOURCES, ATTR_SOURCE_TYPE_NAME, ATTR_TYPE,
+    ATTR_UNITS, MAX_METRIC_TAGS, RESOURCE_ATTR_AGENT_EPOCH, RESOURCE_ATTR_AGENT_INTERNAL_IP,
+    RESOURCE_ATTR_AGENT_PUBLIC_IP, RESOURCE_ATTR_AGENT_TIMEZONE, RESOURCE_ATTR_AGENT_VERSION,
+    UNITS_DATADOG,
 };
 use crate::CodecError;
 use bytes::Bytes;
@@ -327,6 +328,18 @@ fn batch(events: Vec<Event>) -> EventBatch {
     EventBatch { resource: Arc::new(Resource::default()), scope: None, events }
 }
 
+/// A decoded series batch: [`batch`], with [`ATTR_UNITS`] on its resource when a record carries a
+/// unit, which is then a Datadog unit name the encoders write as it is.
+fn series_batch(events: Vec<Event>) -> EventBatch {
+    let mut out = batch(events);
+    if out.events.iter().flat_map(|e| &e.metrics).any(|r| r.unit.is_some()) {
+        let mut resource = Resource::default();
+        resource.attributes.insert(ATTR_UNITS, Value::str(UNITS_DATADOG));
+        out.resource = Arc::new(resource);
+    }
+    out
+}
+
 impl DatadogDecoder {
     pub(super) fn metric_not_decoded(&self, outcome: MetricIn, n: usize) {
         if n > 0 {
@@ -415,7 +428,7 @@ impl DatadogDecoder {
             let points = s.points.iter().map(|p| (Some(p.timestamp), p.value));
             self.push_points(&mut out, &s.metric, Some(&s.unit), &series, points, received_at);
         }
-        Ok(batch(out))
+        Ok(series_batch(out))
     }
 
     /// `/api/v2/series` as the public API takes it: `{"series":[{"metric","type":<int>,
@@ -437,7 +450,7 @@ impl DatadogDecoder {
                 Err(why) => self.bad_series(MetricIn::BadSeries, why),
             }
         }
-        Ok(batch(out))
+        Ok(series_batch(out))
     }
 
     /// `/api/v1/series`: `{"series":[{"metric","points":[[ts, value]],"tags","host","device",
@@ -465,7 +478,7 @@ impl DatadogDecoder {
                 Err(why) => self.bad_series(MetricIn::BadSeries, why),
             }
         }
-        Ok(batch(out))
+        Ok(series_batch(out))
     }
 
     /// `/api/v1/distribution_points`: `{"series":[{"metric","points":[[ts,[v, ...]]],"host",
@@ -700,6 +713,8 @@ pub(super) struct Carriers {
     /// How many `_logit.datadog.agent.*` carriers (a sketch payload's `CommonMetadata`) are
     /// present; only the sketches route writes them, from the batch resource.
     pub agent_metadata: usize,
+    /// [`ATTR_UNITS`] marks the records' units as Datadog unit names, written as they are.
+    pub datadog_units: bool,
 }
 
 impl Carriers {
@@ -853,7 +868,8 @@ impl DatadogEncoder {
     ) -> (Carriers, Omitted) {
         let consumed = &*CONSUMED;
         let skip = tag_skip(resource, event);
-        let mut c = Carriers::default();
+        let mut c =
+            Carriers { datadog_units: units_are_datadog(resource, event), ..Carriers::default() };
         let dropped = render_tags(merged(resource, event), skip, &mut c.tags);
         let mut unrepresentable = dropped.unrepresentable;
         // A `host.name` that isn't a `Str` is the event's own host, unwritable: counted, and
@@ -937,16 +953,16 @@ impl DatadogEncoder {
                 Some(tag) if !tag.is_empty() => c.host = Some(tag.to_string()),
                 // An empty `#host:` tag: marked hostless, as the Agent reads it.
                 Some(_) => c.hostless = true,
-                // collectd's own host, ahead of any hostless mark: only a collectd sender sets it.
-                None if collectd_host(resource, event).is_some() => {
-                    c.host = collectd_host(resource, event).map(str::to_string);
-                }
                 // The Agent's v2 spelling of a hostless series: a `host` resource with no name.
                 None if c.resources.iter().any(|(kind, _)| *kind == RESOURCE_HOST) => {
                     c.hostless = true;
                 }
                 // The v1, distribution, and sketch spelling: `"host":""`.
                 None if c.hostless => {}
+                // collectd's own host, below the hostless marks above.
+                None if collectd_host(resource, event).is_some() => {
+                    c.host = collectd_host(resource, event).map(str::to_string);
+                }
                 None => c.host = self.default_host.as_deref().map(str::to_string),
             }
         }
@@ -1053,14 +1069,12 @@ impl DatadogEncoder {
                 if !points.is_empty() && carriers[index].is_none() {
                     carriers[index] = Some(self.carriers_uncounted(&batch.resource, event, route));
                 }
-                records.push(SeriesRecord {
-                    index,
-                    record_index,
-                    record,
-                    points,
-                    notes: plan.notes,
-                    sketched,
-                });
+                let mut notes = plan.notes;
+                // A Datadog unit name leaves as it is, so nothing is left off.
+                if units_are_datadog(&batch.resource, event) {
+                    notes.retain(|note| !matches!(note, Note::UnitUnmapped));
+                }
+                records.push(SeriesRecord { index, record_index, record, points, notes, sketched });
             }
         }
         (carriers, records)
@@ -1216,7 +1230,7 @@ impl DatadogEncoder {
                     timestamp: nanos_to_seconds(event.timestamp),
                 }],
                 r#type: p.wire_type(c).proto(),
-                unit: p.unit(record).map(Cow::into_owned).unwrap_or_default(),
+                unit: p.unit(record, c).map(Cow::into_owned).unwrap_or_default(),
                 source_type_name: c.source_type_name.clone().unwrap_or_default(),
                 interval: c.interval,
                 metadata: c.proto_metadata(),
@@ -1242,7 +1256,7 @@ impl DatadogEncoder {
                 s.insert("resources".into(), JsonValue::Array(list.collect()));
             }
             s.insert("tags".into(), p.tags(c).into());
-            if let Some(unit) = p.unit(record) {
+            if let Some(unit) = p.unit(record, c) {
                 s.insert("unit".into(), unit.into_owned().into());
             }
             if let Some(name) = &c.source_type_name {
@@ -1288,7 +1302,7 @@ impl DatadogEncoder {
             if let Some(name) = &c.source_type_name {
                 s.insert("source_type_name".into(), name.as_str().into());
             }
-            if let Some(unit) = p.unit(record) {
+            if let Some(unit) = p.unit(record, c) {
                 s.insert("unit".into(), unit.into_owned().into());
             }
             series.push(JsonValue::Object(s));
@@ -1481,7 +1495,7 @@ fn same_point(
         && pa.wire_type(ca) != WireType::Rate
         && pa.value.to_bits() == pb.value.to_bits()
         && pa.wire_type(ca) == pb.wire_type(cb)
-        && pa.unit(ra) == pb.unit(rb)
+        && pa.unit(ra, ca) == pb.unit(rb, cb)
         && ca.interval == cb.interval
         && ca.source_type_name == cb.source_type_name
         && ca.origin == cb.origin
@@ -1557,10 +1571,16 @@ impl SeriesPoint {
         self.wire_type.unwrap_or(c.wire_type.unwrap_or(WireType::Gauge))
     }
 
-    /// The record's unit as Datadog names it ([`units::to_datadog`]); `None` for a series that
-    /// carries no unit, or a unit with no Datadog name, which [`plan_series`] notes.
-    fn unit(&self, record: &MetricRecord) -> Option<Cow<'static, str>> {
-        record.unit.filter(|_| self.unit).and_then(|u| units::to_datadog(resolve(u)))
+    /// The record's unit as Datadog names it: as it is under [`ATTR_UNITS`], else through
+    /// [`units::to_datadog`]; `None` for a series that carries no unit, or a unit with no Datadog
+    /// name, which [`plan_series`] notes.
+    fn unit(&self, record: &MetricRecord, c: &Carriers) -> Option<Cow<'static, str>> {
+        let unit = resolve(record.unit.filter(|_| self.unit)?);
+        if c.datadog_units {
+            (!unit.is_empty()).then_some(Cow::Borrowed(unit))
+        } else {
+            units::to_datadog(unit)
+        }
     }
 
     /// The tags the series carries after the event's own.
@@ -2613,6 +2633,8 @@ mod tests {
             (&[(collectd, "web1"), ("host", "t")][..], "t", json!(["collectd.host:web1"])),
             // An empty one is no host: the default fills, and it stays a tag.
             (&[(collectd, "")][..], "relay", json!(["collectd.host:"])),
+            // An empty `host:` tag marks the sample hostless, which `collectd.host` doesn't fill.
+            (&[(collectd, "web1"), ("host", "")][..], "", json!(["collectd.host:web1"])),
         ] {
             let b = one_event_batch(attrs(pairs), MetricKind::gauge(1.0));
             let v1: JsonValue = serde_json::from_slice(&e.encode_series_v1(&b).unwrap()).unwrap();
@@ -2709,6 +2731,50 @@ mod tests {
                 serde_json::from_slice(&e.encode_distribution_points(&samples).unwrap()).unwrap();
             assert_eq!(points["series"][0]["host"], want);
         }
+    }
+
+    /// A hostless mark outranks `collectd.host`: the sample stays hostless and `collectd.host`
+    /// leaves as a tag.
+    #[test]
+    fn a_hostless_mark_keeps_a_collectd_host_a_tag() {
+        let mut e = DatadogEncoder::new().with_default_host(Some(Arc::from("relay")));
+        let mut marked = AttrMap::new();
+        marked.insert(ATTR_HOSTLESS, Value::Bool(true));
+        let mut resource = AttrMap::new();
+        let mut entry = AttrMap::new();
+        entry.insert("type", Value::str("host"));
+        entry.insert("name", Value::str(""));
+        resource.insert(ATTR_RESOURCES, Value::Array(vec![Value::Map(Box::new(entry))]));
+        for mut attrs in [marked, resource] {
+            attrs.insert(crate::collectd::ATTR_HOST, Value::str("web1"));
+            let b = one_event_batch(attrs, MetricKind::gauge(1.0));
+            let v1: JsonValue = serde_json::from_slice(&e.encode_series_v1(&b).unwrap()).unwrap();
+            assert_eq!(v1["series"][0]["host"], "");
+            assert_eq!(v1["series"][0]["tags"], json!(["collectd.host:web1"]));
+            assert_eq!(metric_tag_count(&b.resource, &b.events[0]), 1);
+        }
+    }
+
+    /// Under `_logit.datadog.units` (a `datadog_in` series batch), a unit leaves as it is, one
+    /// outside the UCUM mapper's names included, and nothing is counted.
+    #[test]
+    fn a_marked_unit_leaves_as_it_is() {
+        let (mut e, registry) = otlp_encoder(HistogramOptions::default());
+        let rec = MetricRecord {
+            unit: Some(intern("percent_nano")),
+            ..MetricRecord::new(intern("m"), MetricKind::gauge(1.0))
+        };
+        let mut b = batch(vec![Event::metric(TS, AttrMap::new(), rec)]);
+        let mut resource = Resource::default();
+        resource.attributes.insert(ATTR_UNITS, Value::str(UNITS_DATADOG));
+        b.resource = Arc::new(resource);
+        assert_eq!(v2_series(&mut e, &b)[0]["unit"], "percent_nano");
+        let v1: JsonValue = serde_json::from_slice(&e.encode_series_v1(&b).unwrap()).unwrap();
+        assert_eq!(v1["series"][0]["unit"], "percent_nano");
+        assert_eq!(
+            total(&counters(&registry), "logit.output.fields.omitted", "unit_unmapped"),
+            0.0
+        );
     }
 
     /// A v1 or distribution-point `"host":""` decodes to `_logit.datadog.hostless`; an absent
