@@ -16,9 +16,15 @@
 -- event per point.
 --
 -- An event that isn't a Buddy datagram passes through unchanged.
+--
+-- Settings come from the component's `vars:` in logit.yaml, so this file needs no edits:
+--
+--   bucket  the InfluxDB bucket the points are written to; `prusa` when unset.
+--   names   a map from a printer's MAC address to the name its points are tagged with. A printer
+--           missing from it is tagged with its MAC address.
 
--- The InfluxDB bucket the points are written to. Edit this line to use another bucket.
-local BUCKET = "prusa"
+local BUCKET = vars.bucket or "prusa"
+local NAMES = vars.names or {}
 
 -- Nanoseconds per offset unit, by format version: microseconds in v4, milliseconds before it.
 local UNIT_NS = {[2] = 1000000, [3] = 1000000, [4] = 1000}
@@ -66,8 +72,8 @@ end
 
 -- Counts gaps in a printer's `msg` sequence. A step of 2 to 9 is datagrams lost on the network.
 -- A jump of 10 or more, or a step back, is a reboot or a firmware restart, and starts the count
--- over. A MAC address is a bounded tag: one value per printer.
-local function track_sequence(mac, msg)
+-- over. The `printer` tag is bounded: one value per printer.
+local function track_sequence(mac, printer, msg)
   local last = last_msg[mac]
   last_msg[mac] = msg
   if last == nil then
@@ -75,9 +81,9 @@ local function track_sequence(mac, msg)
   end
   local step = msg - last
   if step >= 2 and step <= 9 then
-    telemetry.count("prusa.datagrams.missed", step - 1, {mac_address = mac})
+    telemetry.count("prusa.datagrams.missed", step - 1, {printer = printer})
   elseif step >= 10 or step < 0 then
-    telemetry.count("prusa.datagrams.resync", 1, {mac_address = mac})
+    telemetry.count("prusa.datagrams.resync", 1, {printer = printer})
   end
 end
 
@@ -113,7 +119,8 @@ function process(event)
     telemetry.count("prusa.datagrams.dropped", 1, {reason = "version"})
     return nil
   end
-  track_sequence(mac, msg)
+  local printer = NAMES[mac] or mac
+  track_sequence(mac, printer, msg)
 
   -- Split each line into its series (measurement and tags), its fields, and its offset. A v2
   -- offset is relative to the line before it, so it's summed into an offset from `tm`.
@@ -168,13 +175,13 @@ function process(event)
   end
 
   -- Every `syslog.*` attribute would become an InfluxDB tag on every point, so remove them and
-  -- keep only the MAC address.
+  -- tag the points with the printer instead.
   for key in pairs(event.attributes) do
     if string.sub(key, 1, 7) == "syslog." then
       event.attributes[key] = nil
     end
   end
-  event.attributes.mac_address = mac
+  event.attributes.printer = printer
   event.log.message = table.concat(lines, "\n")
 
   -- influxdb_out writes a batch to the bucket its resource names when the sink sets no `bucket:`.
