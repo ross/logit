@@ -744,7 +744,7 @@ mod datadog {
     /// Whether a non-empty `Str` `collectd.host` is the host of `rec`, and so not written as a
     /// tag or a log attribute: on a log with none of `hostname`, `host.name`, `syslog.hostname`,
     /// or `host`, and on any other record but a span with no host carrier of its own, no
-    /// [`named`] `host.name`, and no `Str` `host`.
+    /// [`named`] `host.name`, no `Str` `host`, and no hostless mark ([`hostless_mark`]).
     pub(super) fn collectd_host_is_host(rec: &Rec) -> bool {
         let bytes = rec.attribute_types.get(COLLECTD_HOST).is_some_and(|t| t.contains("=bytes"));
         let usable = !bytes
@@ -761,6 +761,7 @@ mod datadog {
                     !named(rec)
                         && !own_host(rec, route)
                         && !get(rec, "host").is_some_and(Value::is_string)
+                        && !hostless_mark(rec)
                 }
             }
     }
@@ -772,6 +773,16 @@ mod datadog {
         body["status"] == "ok"
             || ["status_message", "trace_state", "flags"].iter().any(|k| body.get(*k).is_some())
             || body.as_object().is_some_and(|o| o.keys().any(|k| k.starts_with("dropped_")))
+    }
+
+    /// Whether `rec` carries a Datadog hostless mark: `_logit.datadog.hostless` `true`, or a
+    /// `host` entry in `_logit.datadog.resources`.
+    fn hostless_mark(rec: &Rec) -> bool {
+        let hostless = get(rec, "_logit.datadog.hostless") == Some(&Value::Bool(true));
+        let host_resource = get(rec, "_logit.datadog.resources")
+            .and_then(Value::as_array)
+            .is_some_and(|r| r.iter().any(|e| e["type"] == "host"));
+        hostless || host_resource
     }
 
     /// Whether `rec` carries a host or a hostless mark, so the encoder writes no default host.
@@ -788,13 +799,7 @@ mod datadog {
                 has("hostname") || has("host.name") || has("syslog.hostname") || has("host")
             }
             Route::Event | Route::Check => own || named(rec) || host_str,
-            Route::Metric => {
-                let hostless = get(rec, "_logit.datadog.hostless") == Some(&Value::Bool(true));
-                let host_resource = get(rec, "_logit.datadog.resources")
-                    .and_then(Value::as_array)
-                    .is_some_and(|r| r.iter().any(|e| e["type"] == "host"));
-                named(rec) || host_str || hostless || host_resource
-            }
+            Route::Metric => named(rec) || host_str || hostless_mark(rec),
             Route::Span => true,
         }
     }
@@ -2565,6 +2570,9 @@ mod tests {
 
         let named = recs(&[&gauge(r#"{"collectd.host":"web-1","host.name":"h"}"#)]);
         assert!(!datadog::collectd_host_is_host(&named[0]));
+        let hostless =
+            recs(&[&gauge(r#"{"collectd.host":"web-1","_logit.datadog.hostless":true}"#)]);
+        assert!(!datadog::collectd_host_is_host(&hostless[0]));
         assert_eq!(pair(&named, &named, Spelling::Datadog).seen, [Some(Class::Exact)]);
 
         let log = recs(&[

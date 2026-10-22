@@ -1353,10 +1353,11 @@ rows:
         class: lost
         counter: logit.output.fields.omitted{reason=unit_unmapped}
         text: >-
-          The series' `unit` as Datadog names it, mapped as Datadog's OTel exporter maps a UCUM
-          unit (`ms` as `millisecond`, `By/s` as `byte/second`, `{request}` as `request`); a
-          Datadog unit name leaves as it is. A unit with no Datadog name, `1` included, is left
-          off, counted once per record.
+          The series' `unit` as Datadog names it. A unit datadog_in decoded (its batch marked
+          `_logit.datadog.units`) leaves as it is. Any other source's unit leaves as it is when
+          it's a Datadog unit name, else mapped as Datadog's OTel exporter maps a UCUM unit (`ms`
+          as `millisecond`, `By/s` as `byte/second`, `{request}` as `request`); one with no
+          Datadog name, `1` included, is left off, counted once per record.
       graphite_out:
         class: lost
         reason: structural
@@ -2308,7 +2309,9 @@ rows:
         counter: logit.output.tags.omitted{reason=no_wire_form}
         text: >-
           A `_logit.datadog.*` carrier rides in its own wire field; one the route has no field for
-          is left off, counted.
+          is left off, counted. `_logit.datadog.units`, which marks a decoded batch's units as
+          Datadog names, is read and not written; datadog_in stamps it again on a batch with a
+          unit.
   - kind: attributes
     feature: prometheus_target
     cells:

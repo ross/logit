@@ -111,7 +111,7 @@
   "record-fields": {"events": [
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"cpu.usage","kind":"gauge","value":0.5}],"attributes":{"host.name":"web-07"}},
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"hits","kind":"sum","value":4.0,"temporality":"delta","monotonic":true}],"attributes":{"host.name":"transit"}},
-    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"request.duration","kind":"gauge","value":0.25,"unit":"second"}],"attributes":{"host.name":"transit","service.name":"checkout"}}
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"request.duration","kind":"gauge","value":0.25,"unit":"second"}],"attributes":{"host.name":"transit","service.name":"checkout"},"resource":{"attributes":{"_logit.datadog.units":"datadog"}}}
   ], "counters": {
     "logit.output.metrics.skipped{component=out,kind=datadog_out,reason=no_recorded_value,role=sink}": 1
   }},
