@@ -63,9 +63,10 @@
 //!     (`docs/adr/log-record-trace-context.md`).
 //! 20. A `scale` with no `fields`, an empty field name, or a non-finite factor
 //!     (`docs/adr/scale-transform.md`).
-//! 21. An empty `signals:` on `has_signal`/`keep_signals`/`drop_signals`, or all three signals on
-//!     `keep_signals`/`drop_signals`. Which shape is the black hole and which the no-op is
-//!     opposite between those two, so each message names the right one
+//! 21. An empty `signals:` on `has_signal`/`keep_signals`/`drop_signals`, all three payload
+//!     signals on `keep_signals`/`drop_signals`, or `none` on `drop_signals`. Which shape is the
+//!     black hole and which the no-op is opposite between those two, so each message names the
+//!     right one; `drop_signals` has no payload to clear on an event carrying none
 //!     (`docs/adr/signal-filtering-components.md`).
 //! 22. An `otlp_out` `headers:` name that is empty, `:`-prefixed, `grpc-*`, in
 //!     `RESERVED_OTLP_HEADERS`, or a case-insensitive duplicate: the transport sets those itself,
@@ -321,7 +322,9 @@
 //!     and has no ordinary edge, so 7 doesn't ask it for a consumer. Also a `route_signals` with no
 //!     `signals:` entry set (it would discard every event) or an empty target id, checked before
 //!     48 as 51 is; and, after 48, under `strip: false`, a component whose `sources:` lists two of
-//!     its targets: a mixed event reaches both whole, so that component would receive it twice.
+//!     its targets: a mixed event reaches both whole, so that component would receive it twice. A
+//!     target only `signals.none` names is outside that check, since an event reaching it reaches
+//!     no other target.
 //!     Under `strip: true` each target receives disjoint payloads, so reading several is legal
 //!     (`docs/adr/route-signals.md`).
 //! 93. A `replay_in` with an empty `path`, which names no file, or a `batch` of `0`, which could
@@ -580,12 +583,13 @@ fn signal_name(signal: logit_config::Signal) -> &'static str {
         logit_config::Signal::Logs => "logs",
         logit_config::Signal::Metrics => "metrics",
         logit_config::Signal::Traces => "traces",
+        logit_config::Signal::None => "none",
     }
 }
 
 /// The slot-ordered, de-duplicated `target` ids one component directs events into: a `route`'s
 /// `routes:` values in key order, each list in its written order (first occurrence wins), a
-/// `route_signals`' targets in `logs`, `metrics`, `traces` order, a `lua`/`lua_file`'s `targets:`
+/// `route_signals`' targets in `logs`, `metrics`, `traces`, `none` order, a `lua`/`lua_file`'s `targets:`
 /// as written, nothing for any other kind. This order is what a router's slot index means downstream
 /// (the node runtime's `Vec<Fanout>`, a Lua worker's `event:to("..")` table), so it is derived here
 /// once (`docs/adr/target-components.md`).
@@ -1076,14 +1080,14 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
     }
 
     // Rule 92's shape clause, before rule 48 for rule 51's reason: an empty id is reported as
-    // empty, not as an unknown target `''`. At most three distinct targets, so the `Destinations`
+    // empty, not as an unknown target `''`. At most four distinct targets, so the `Destinations`
     // width needs no check.
     for (id, component) in &components {
         let ComponentKind::RouteSignals { signals, .. } = &component.kind else { continue };
         if signals.iter().all(|(_, target)| target.is_none()) {
             anyhow::bail!(
                 "component '{id}': a route_signals with no 'signals' entry would discard every \
-                 event -- name a target for logs, metrics, or traces"
+                 event -- name a target for logs, metrics, traces, or none"
             );
         }
         if let Some((signal, _)) = signals.iter().find(|(_, target)| *target == Some("")) {
@@ -1165,10 +1169,21 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
     // Rule 92's reconvergence clause, rule 51's for `route_signals`: under `strip: false` a mixed
     // event reaches every target its signals name, whole, so a component reading two of them would
     // receive it twice. Under `strip: true` each target receives a different part of the event,
-    // disjoint payloads, so reading several is legal (`docs/adr/route-signals.md`).
+    // disjoint payloads, so reading several is legal (`docs/adr/route-signals.md`). `none`'s
+    // target is outside the co-marked set: only an event carrying no signal reaches it, and that
+    // event reaches no other target.
     for (id, component) in &components {
-        let ComponentKind::RouteSignals { strip: false, .. } = &component.kind else { continue };
-        let group = targets_of(component);
+        let ComponentKind::RouteSignals { signals, strip: false } = &component.kind else {
+            continue;
+        };
+        let mut group: Vec<&str> = Vec::new();
+        for (signal, target) in signals.iter() {
+            if let (false, Some(target)) = (signal == logit_config::Signal::None, target) {
+                if !group.contains(&target) {
+                    group.push(target);
+                }
+            }
+        }
         for (consumer, c) in &components {
             let both: Vec<&str> = c
                 .sources
@@ -1571,10 +1586,12 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
     }
 
     // Rule 21: `has_signal`/`keep_signals`/`drop_signals` need a non-empty `signals:`, and
-    // `keep_signals`/`drop_signals` may not name all three. For an allowlist, empty keeps nothing
-    // (black hole) and all three keeps everything (no-op); a denylist is the mirror. Both are
-    // rejected, but each message must name the right failure. `has_signal` naming all three stays
-    // legal: under `mode: only` it forwards anything with a payload.
+    // `keep_signals`/`drop_signals` may not name all three payload signals. For an allowlist,
+    // empty keeps nothing (black hole) and all three keeps every payload (a no-op on any event
+    // carrying one); a denylist is the mirror. Both are rejected, but each message must name the
+    // right failure. `drop_signals` may not name `none`: it has no payload to clear, and an event
+    // carrying nothing is dropped already. `has_signal` naming all three stays legal: under
+    // `mode: only` it forwards anything with a payload.
     for (id, component) in &components {
         match &component.kind {
             ComponentKind::HasSignal { signals, .. } => {
@@ -1595,7 +1612,8 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                 if names_all_three(signals) {
                     anyhow::bail!(
                         "component '{id}': 'signals' names all three signals -- that keeps \
-                         everything, a no-op that forwards every event untouched"
+                         everything, a no-op on every event carrying a payload; use has_signal \
+                         to drop an event carrying none"
                     );
                 }
             }
@@ -1610,6 +1628,13 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                     anyhow::bail!(
                         "component '{id}': 'signals' names all three signals -- that drops \
                          everything, dropping every event"
+                    );
+                }
+                if signals.contains(&logit_config::Signal::None) {
+                    anyhow::bail!(
+                        "component '{id}': drop_signals 'signals' may not name none -- an event \
+                         carrying no payload has nothing to clear, and drop_signals already drops \
+                         it"
                     );
                 }
             }
@@ -5952,6 +5977,42 @@ mod tests {
             "a keep_signals naming all three signals is the no-op shape (keeps every event \
              untouched), not the black-hole shape -- got: {err}"
         );
+    }
+
+    #[test]
+    fn a_drop_signals_naming_none_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "filter",
+                vec!["in"],
+                ComponentKind::DropSignals {
+                    signals: vec![logit_config::Signal::Metrics, logit_config::Signal::None],
+                },
+            ),
+            ("out", vec!["filter"], sink()),
+        ]));
+        assert!(err.contains("may not name none"), "got: {err}");
+    }
+
+    #[test]
+    fn has_signal_and_keep_signals_naming_none_resolve() {
+        for kind in [
+            ComponentKind::HasSignal {
+                signals: vec![logit_config::Signal::None],
+                mode: logit_config::MatchMode::Only,
+            },
+            ComponentKind::KeepSignals {
+                signals: vec![logit_config::Signal::Metrics, logit_config::Signal::None],
+            },
+        ] {
+            resolve(cfg(vec![
+                ("in", vec![], listener()),
+                ("filter", vec!["in"], kind),
+                ("out", vec!["filter"], sink()),
+            ]))
+            .expect("none is a legal selector here");
+        }
     }
 
     #[test]
@@ -10390,9 +10451,18 @@ mod tests {
                 logs: logs.map(String::from),
                 metrics: metrics.map(String::from),
                 traces: traces.map(String::from),
+                none: None,
             },
             strip,
         }
+    }
+
+    /// `kind`, a `route_signals`, with `signals.none` set to `id`.
+    fn with_none(mut kind: ComponentKind, id: &str) -> ComponentKind {
+        if let ComponentKind::RouteSignals { signals, .. } = &mut kind {
+            signals.none = Some(id.to_string());
+        }
+        kind
     }
 
     /// `in -> by_signal -> {l, m}`, each target read by its own sink, plus `extra`.
@@ -10509,6 +10579,54 @@ mod tests {
             ),
             "got: {err}"
         );
+    }
+
+    /// A `route_signals` naming only `none` resolves: it routes the events carrying no signal and
+    /// discards the rest.
+    #[test]
+    fn a_route_signals_naming_only_none_resolves() {
+        let kind = with_none(route_signals(None, None, None, true), "m");
+        let graph = resolve(cfg_with_targets(vec![
+            ("in", vec![], vec![], listener()),
+            ("by_signal", vec!["in"], vec![], kind),
+            ("m", vec![], vec![], target()),
+            ("m_out", vec!["m"], vec![], sink()),
+        ]))
+        .expect("none alone is a legal table");
+        assert_eq!(graph.components["by_signal"].targets, vec!["m".to_string()]);
+    }
+
+    /// `none`'s target follows the payload signals' in slot order, and an empty `none` id is
+    /// reported as empty.
+    #[test]
+    fn a_route_signals_none_target_is_the_last_slot_and_may_not_be_empty() {
+        let kind = with_none(route_signals(None, Some("m"), None, true), "l");
+        let component = component(vec!["in"], vec![], kind);
+        assert_eq!(target_edges(&component), vec![(Some("metrics"), "m"), (Some("none"), "l")]);
+        assert_eq!(targets_of(&component), vec!["m", "l"]);
+
+        let kind = with_none(route_signals(Some("l"), Some("m"), None, true), "");
+        let err = expect_err(route_signals_config(kind, vec![]));
+        assert!(err.contains("route_signals 'signals.none' must not be empty"), "got: {err}");
+    }
+
+    /// Rule 92's reconvergence clause leaves `none`'s target out: no event reaches it and another
+    /// target, so a consumer may read both under `strip: false`.
+    #[test]
+    fn a_consumer_of_an_unstripped_signal_target_and_the_none_target_resolves() {
+        let kind = with_none(route_signals(None, Some("m"), None, false), "l");
+        resolve(route_signals_config(kind, vec![("both", vec!["l", "m"], vec![], sink())]))
+            .expect("an event carrying no signal reaches only none's target");
+    }
+
+    /// `none` sharing another signal's target is still a co-marked pair, rejected under
+    /// `strip: false`.
+    #[test]
+    fn none_sharing_a_target_keeps_the_unstripped_reconvergence_check() {
+        let kind = with_none(route_signals(Some("l"), Some("m"), None, false), "m");
+        let err =
+            expect_err(route_signals_config(kind, vec![("both", vec!["l", "m"], vec![], sink())]));
+        assert!(err.contains("component 'both' lists 'l' and 'm'"), "got: {err}");
     }
 
     /// `route_signals`' edges carry the signal as their key, which `logit graph` labels them by.

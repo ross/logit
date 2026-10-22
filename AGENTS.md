@@ -148,14 +148,14 @@ Native transforms live in `crates/logit-transforms`; `lua`/`lua_file` live in `c
 | `http_access` | normalizes web-server access logs onto OTel semconv | [ADR `http-access-normalization`](docs/adr/http-access-normalization.md) |
 | `flatten` | rewrites a nested attribute into flat, dot-joined keys | [ADR `flatten-transform`](docs/adr/flatten-transform.md) |
 | `line_protocol` | parses a log message as InfluxDB line protocol into one event per point, in `influxdb_in`'s shape and through its code, each inheriting the parent's attributes; a bad line is skipped and counted, and the parent's log is removed unless `keep_source: true` | [ADR `line-protocol-transform`](docs/adr/line-protocol-transform.md), [ADR `transform-fan-out`](docs/adr/transform-fan-out.md) |
-| `has_signal`, `keep_signals`, `drop_signals` | forward an event carrying a listed signal; keep, or clear, the listed signals' payloads | [ADR `signal-filtering-components`](docs/adr/signal-filtering-components.md) |
+| `has_signal`, `keep_signals`, `drop_signals` | forward an event carrying a listed signal; keep, or clear, the listed signals' payloads; `none` selects an event that arrived with no payload (not on `drop_signals`) | [ADR `signal-filtering-components`](docs/adr/signal-filtering-components.md) |
 | `has_attributes`, `drop_attributes` | forward, or drop, an event whose resource and/or attributes match every configured pair, and carry every listed key | [ADR `attribute-filtering-components`](docs/adr/attribute-filtering-components.md) |
 | `has_provenance`, `drop_provenance` | forward, or drop, an event whose batch `origin`/`previous` match a configured list | [ADR `provenance-filtering-components`](docs/adr/provenance-filtering-components.md) |
 | `has_stale`, `drop_stale` | forward, or discard, an event older than `max_age` or, with `max_ahead` set, stamped further ahead of the wall clock; exact complements, so `drop_stale` keeps a replayed backlog out of `aggregate` and `has_stale` archives it | [ADR `stale-event-filtering`](docs/adr/stale-event-filtering.md) |
 | `sample` | consistent, keyed sampling | [ADR `consistent-sampling-component`](docs/adr/consistent-sampling-component.md) |
 | `shape` | an observer that measures each event's shape | [ADR `shape-observer-component`](docs/adr/shape-observer-component.md) |
 | `route`, `target` | native equality-only router, and the named destinations it fills; one event may go whole to several | [ADR `target-components`](docs/adr/target-components.md) |
-| `route_signals` | sends each signal an event carries to that signal's target, by default splitting a mixed event into one part per target; no ordinary consumers, and an event carrying no listed signal is discarded | [ADR `route-signals`](docs/adr/route-signals.md) |
+| `route_signals` | sends each signal an event carries to that signal's target, by default splitting a mixed event into one part per target; no ordinary consumers, and an event carrying no listed signal is discarded; an event arriving with no payload goes to `none:`'s target if set | [ADR `route-signals`](docs/adr/route-signals.md) |
 
 Details an agent needs beyond the table:
 
@@ -270,6 +270,8 @@ Details an agent needs beyond the table:
   event carrying no listed signal counts `events.discarded`, never `*.dropped`, and needs no
   `null_out`. A component may read several of its targets under `strip: true`, receiving one
   event per part; under `strip: false` rule 92 rejects that, as rule 51 does for a `route` list.
+  An event that arrives with no payload (a string-only InfluxDB point) goes whole to the opt-in
+  `signals.none` target, else is discarded; one emptied only by stripping is still discarded.
 - **`generate_in`**: `event:` templates via `logit_core::template`, with `{seq}`/`{seq%N}`
   placeholders. `generate_in` ships unconditionally but exists only to drive the load-test
   harness (see [Harnesses](#harnesses)), whose sink end is `null_out`.

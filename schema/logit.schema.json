@@ -1965,7 +1965,7 @@
           "additionalProperties": false
         },
         {
-          "description": "Forwards an event carrying a wanted signal and drops the rest: `signals: [traces]` ahead of a traces-only sink, say, fed from a source whose events also carry metrics. Never mutates a forwarded event: under the default `mode: any_of`, an event carrying a listed signal is forwarded as it arrived, unlisted signals included. `mode: only` also requires the event carry nothing outside `signals`. Place `keep_signals`/`drop_signals` ahead of this instead if unwanted payloads must be stripped rather than tolerated. `signals` may not be empty.",
+          "description": "Forwards an event carrying a wanted signal and drops the rest: `signals: [traces]` ahead of a traces-only sink, say, fed from a source whose events also carry metrics. Never mutates a forwarded event: under the default `mode: any_of`, an event carrying a listed signal is forwarded as it arrived, unlisted signals included. `mode: only` also requires the event carry nothing outside `signals`. Listing `none` also matches an event carrying no signal at all, under either mode: `signals: [metrics, none]` with `mode: only` forwards an event carrying only metrics, or nothing. Place `keep_signals`/`drop_signals` ahead of this instead if unwanted payloads must be stripped rather than tolerated. `signals` may not be empty.",
           "type": "object",
           "required": [
             "signals",
@@ -2000,7 +2000,7 @@
           "additionalProperties": false
         },
         {
-          "description": "Retains only the listed signals' payloads on every event, clearing the rest: an allowlist, `keep`'s relationship to `remove`. Unlike `has_signal`, this mutates: an event carrying a log and derived metrics loses the metrics under `signals: [logs]` but keeps the log. An event left with no payload is dropped. `signals` may not be empty (that would drop every event) and may not name all three signals (a no-op).",
+          "description": "Retains only the listed signals' payloads on every event, clearing the rest: an allowlist, `keep`'s relationship to `remove`. Unlike `has_signal`, this mutates: an event carrying a log and derived metrics loses the metrics under `signals: [logs]` but keeps the log. An event left with no payload is dropped. Listing `none` keeps an event that arrived with no payload; without it, such an event is dropped. `signals` may not be empty (that would drop every event) and may not name `logs`, `metrics`, and `traces` together (that keeps every payload; use `has_signal` to drop an event carrying none).",
           "type": "object",
           "required": [
             "signals",
@@ -2027,7 +2027,7 @@
           "additionalProperties": false
         },
         {
-          "description": "Clears the listed signals' payloads on every event, keeping the rest: the mirror of `keep_signals`. An event left with no payload is dropped. `signals` may not be empty (a no-op) and may not name all three signals (that would drop every event).",
+          "description": "Clears the listed signals' payloads on every event, keeping the rest: the mirror of `keep_signals`. An event left with no payload is dropped, as is one that arrived with none. `signals` may not be empty (a no-op), may not name all three signals (that would drop every event), and may not name `none` (there is no payload to clear).",
           "type": "object",
           "required": [
             "signals",
@@ -2425,7 +2425,7 @@
           "additionalProperties": false
         },
         {
-          "description": "Sends each signal an event carries to that signal's target: logs to one, metrics to another, spans to a third, or any two to one target. An event carrying none of the listed signals is discarded. This component has no ordinary consumers: no component may list it in `sources:`; read its targets instead.\n\nWith `strip: true` (the default), an event carrying signals bound for different targets is split: each target receives one event holding only its own signals' payloads, with the original's timestamp and a copy of its attributes. A signal `signals:` leaves out is stripped. Each part past the first counts as `logit.component.events.copied`. A component may read several of these targets; it receives one event per part. To keep two signals on one event, send both to one target.\n\nWith `strip: false`, each target receives the whole event, unlisted signals included, and no component may list two of these targets in `sources:`, since it would receive one event twice.",
+          "description": "Sends each signal an event carries to that signal's target: logs to one, metrics to another, spans to a third, or any two to one target. An event carrying none of the listed signals is discarded. An event that arrives carrying no signal at all goes to `none`'s target when `signals:` sets one, whole and once, and is discarded otherwise. This component has no ordinary consumers: no component may list it in `sources:`; read its targets instead.\n\nWith `strip: true` (the default), an event carrying signals bound for different targets is split: each target receives one event holding only its own signals' payloads, with the original's timestamp and a copy of its attributes. A signal `signals:` leaves out is stripped. Each part past the first counts as `logit.component.events.copied`. A component may read several of these targets; it receives one event per part. To keep two signals on one event, send both to one target.\n\nWith `strip: false`, each target receives the whole event, unlisted signals included, and no component may list two of these targets in `sources:`, since it would receive one event twice.",
           "type": "object",
           "required": [
             "signals",
@@ -5774,16 +5774,17 @@
       "additionalProperties": false
     },
     "Signal": {
-      "description": "A signal an event's payload may carry, in OTLP's vocabulary. `traces` corresponds to the event's span.",
+      "description": "A signal an event's payload may carry, in OTLP's vocabulary. `traces` corresponds to the event's span. `none` selects an event that arrives carrying no log, no metrics, and no span, such as an InfluxDB point whose fields are all strings, which still carries its measurement and fields as attributes.",
       "type": "string",
       "enum": [
         "logs",
         "metrics",
-        "traces"
+        "traces",
+        "none"
       ]
     },
     "SignalTargets": {
-      "description": "`route_signals`' `signals:`: the one target each signal goes to. At least one must be set, and each set id must name a `target` component. Two signals may name the same target. A signal left unset is stripped under `strip: true`; under `strip: false` it rides along on an event that also carries a listed signal. An event carrying only unset signals is discarded.",
+      "description": "`route_signals`' `signals:`: the one target each signal goes to. At least one must be set, and each set id must name a `target` component. Two signals may name the same target. A signal left unset is stripped under `strip: true`; under `strip: false` it rides along on an event that also carries a listed signal. An event carrying only unset signals is discarded, and so is an event that arrives carrying no signal at all unless `none` names a target.",
       "type": "object",
       "properties": {
         "logs": {
@@ -5795,6 +5796,13 @@
         },
         "metrics": {
           "description": "The target for metric records. An event's metric records always travel together.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "none": {
+          "description": "The target for an event that arrives carrying no log, no metrics, and no span, such as an InfluxDB point whose fields are all strings. Usually the target that feeds the sink able to write such an event, which may also be another signal's target. An event left with no payload only because `strip: true` removed its unlisted signals is still discarded.",
           "type": [
             "string",
             "null"

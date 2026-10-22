@@ -17,7 +17,7 @@ the same date, write the record, then add a row here.
 | [`influxdb_out` writes histograms and summaries in Telegraf's `prometheus-v1` shape](influxdb-histogram-summary-shape.md) | 2026-10-20 | 2026-10-20 |
 | [`replay_in`: a finite input that reads a `format: json` or `format: native` file once and ends](replay-input.md) | 2026-10-19 | 2026-10-19 |
 | [Transit spec: a mapping table under `spec/transit/` is the canonical statement of every cross-protocol transition, checked by flows and rendered into the docs](transit-spec.md) | 2026-10-19 | 2026-10-19 |
-| [`route_signals`: a native signal router that splits a mixed event into one part per target](route-signals.md) | 2026-10-16 | 2026-10-16 |
+| [`route_signals`: a native signal router that splits a mixed event into one part per target](route-signals.md) | 2026-10-16 | 2026-10-21 |
 | [LuaJIT's trace compiler is off by default, and `jit: true` turns it on per component](lua-jit-opt-in.md) | 2026-10-16 | 2026-10-16 |
 | [Lua in-place edits: writable log fields, `= nil` deletes an attribute, and `pairs` enumerates a proxy](lua-in-place-edits.md) | 2026-10-16 | 2026-10-18 |
 | [`line_protocol`: parse a log message as InfluxDB line protocol into one event per point, skipping bad lines](line-protocol-transform.md) | 2026-10-16 | 2026-10-19 |
@@ -29,9 +29,9 @@ the same date, write the record, then add a row here.
 | [CI runs no advisory check: Dependabot files the bump PRs, and `script/audit` checks locally](advisories-off-ci.md) | 2026-10-14 | 2026-10-14 |
 | [Private attribute namespace: protocol carriers live under `_logit.<protocol>.`, and every other protocol's sink ignores them](private-attribute-namespace.md) | 2026-10-13 | 2026-10-19 |
 | [Stale events are filtered by a `drop_stale`/`has_stale` transform pair](stale-event-filtering.md) | 2026-10-13 | 2026-10-13 |
-| [InfluxDB line-protocol relay: fields as typed `Gauge` records under a measurement carrier, strings as attributes, and an all-or-nothing write](influxdb-line-protocol-relay.md) | 2026-10-13 | 2026-10-19 |
+| [InfluxDB line-protocol relay: fields as typed `Gauge` records under a measurement carrier, strings as attributes, and an all-or-nothing write](influxdb-line-protocol-relay.md) | 2026-10-13 | 2026-10-21 |
 | [Typed metric scalar: `MetricValue { F64, I64, U64, Bool }` replaces the `f64` in `Gauge`, `GaugeDelta`, and `Sum`](typed-metric-scalar.md) | 2026-10-13 | 2026-10-18 |
-| [Telemetry loss vocabulary: any nonzero `*.dropped` is loss, and intended outcomes use other words](telemetry-loss-vocabulary.md) | 2026-10-13 | 2026-10-16 |
+| [Telemetry loss vocabulary: any nonzero `*.dropped` is loss, and intended outcomes use other words](telemetry-loss-vocabulary.md) | 2026-10-13 | 2026-10-21 |
 | [`kafka_out` OTLP formats: one export request per signal per record, a topic per signal, and a producer per topic behind a multi-topic facade](kafka-otlp-formats.md) | 2026-10-12 | 2026-10-13 |
 | [`kafka_out` SASL: PLAIN, SCRAM, OAUTHBEARER, and AWS MSK IAM, authenticated in the dialer and renewed by redial](kafka-sasl.md) | 2026-10-11 | 2026-10-17 |
 | [`kafka_out`: a pure-Rust producer on `kafka-protocol`, with the Java producer's semantics and named divergences](kafka-output.md) | 2026-10-11 | 2026-10-18 |
@@ -92,7 +92,7 @@ the same date, write the record, then add a row here.
 | [Idle-connection timeouts on TCP listeners: an opt-in `idle_timeout`, a next-byte deadline, and a client-side pooled-connection probe](idle-connection-timeout.md) | 2026-09-14 | 2026-10-11 |
 | [`syslog_in` gains TCP and TLS ingress; `syslog_out` gains TLS](syslog-tcp-ingress-and-tls.md) | 2026-09-13 | 2026-10-18 |
 | [Graphite/Carbon relay: untyped datapoints as `Gauge`, tags as attributes, a restricted pickle codec, and a multi-value switch](graphite-carbon-relay.md) | 2026-09-13 | 2026-10-21 |
-| [`target` components: named destinations a router directs events into, beside `sources:`](target-components.md) | 2026-09-13 | 2026-10-16 |
+| [`target` components: named destinations a router directs events into, beside `sources:`](target-components.md) | 2026-09-13 | 2026-10-21 |
 | [A load-test harness: the real binary, a declarative event template, and CPU per event as the signal](load-test-harness.md) | 2026-09-12 | 2026-10-18 |
 | [`FramedEncoder`: a third codec trait for sinks that need per-message framing, over a shared `MessageBuf`](framed-encoder.md) | 2026-09-12 | 2026-10-18 |
 | [collectd binary-protocol relay: identity as attributes, value types as `Sum`/`Gauge`, and a packing encoder](collectd-binary-relay.md) | 2026-09-12 | 2026-10-18 |
@@ -125,7 +125,7 @@ the same date, write the record, then add a row here.
 | [`LogRecord` gains a native application trace/span reference](log-record-trace-context.md) | 2026-09-03 | 2026-10-18 |
 | [Operator-declared resource attributes: a `set` transform, not a per-input config field](operator-declared-resource-attributes.md) | 2026-09-03 | 2026-10-18 |
 | [`otlp_out`/`otlp_in` gzip: client never accepts a compressed response, server bounds decompressed size](otlp-compression-and-decompression-bounds.md) | 2026-09-03 | 2026-10-18 |
-| [Signal filtering is two transform components, not a sink field](signal-filtering-components.md) | 2026-09-03 | 2026-10-18 |
+| [Signal filtering is two transform components, not a sink field](signal-filtering-components.md) | 2026-09-03 | 2026-10-21 |
 | [Syslog egress: format, transport, and header-field precedence](syslog-output.md) | 2026-09-02 | 2026-10-18 |
 | [Decoupled listener I/O](decoupled-listener-io.md) | 2026-09-02 | 2026-10-07 |
 | [Relative gauge adjustments (`+`/`-` in statsd)](relative-gauge-adjustments.md) | 2026-09-02 | 2026-10-13 |
