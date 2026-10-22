@@ -148,7 +148,7 @@ Native transforms live in `crates/logit-transforms`; `lua`/`lua_file` live in `c
 | `http_access` | normalizes web-server access logs onto OTel semconv | [ADR `http-access-normalization`](docs/adr/http-access-normalization.md) |
 | `flatten` | rewrites a nested attribute into flat, dot-joined keys | [ADR `flatten-transform`](docs/adr/flatten-transform.md) |
 | `line_protocol` | parses a log message as InfluxDB line protocol into one event per point, in `influxdb_in`'s shape and through its code, each inheriting the parent's attributes; a bad line is skipped and counted, and the parent's log is removed unless `keep_source: true` | [ADR `line-protocol-transform`](docs/adr/line-protocol-transform.md), [ADR `transform-fan-out`](docs/adr/transform-fan-out.md) |
-| `has_signal`, `keep_signals`, `drop_signals` | forward an event carrying a listed signal; keep, or clear, the listed signals' payloads; `none` selects an event that arrived with no payload (not on `drop_signals`) | [ADR `signal-filtering-components`](docs/adr/signal-filtering-components.md) |
+| `has_signal`, `keep_signals`, `drop_signals` | forward an event carrying a listed signal; keep, or clear, the listed signals' payloads; `none` selects an event that arrived with no payload (on `drop_signals` it changes nothing) | [ADR `signal-filtering-components`](docs/adr/signal-filtering-components.md) |
 | `has_attributes`, `drop_attributes` | forward, or drop, an event whose resource and/or attributes match every configured pair, and carry every listed key | [ADR `attribute-filtering-components`](docs/adr/attribute-filtering-components.md) |
 | `has_provenance`, `drop_provenance` | forward, or drop, an event whose batch `origin`/`previous` match a configured list | [ADR `provenance-filtering-components`](docs/adr/provenance-filtering-components.md) |
 | `has_stale`, `drop_stale` | forward, or discard, an event older than `max_age` or, with `max_ahead` set, stamped further ahead of the wall clock; exact complements, so `drop_stale` keeps a replayed backlog out of `aggregate` and `has_stale` archives it | [ADR `stale-event-filtering`](docs/adr/stale-event-filtering.md) |
@@ -242,7 +242,8 @@ Details an agent needs beyond the table:
   flagged events through, and `missing:` decides the fate of an event the key isn't on. It's the
   one kind `routing-by-condition-is-lua` retired that came back, because keyed consistency is the
   thing a `lua` component can't express. `trace_is_sampled` shares its 53-bit compare in
-  `logit_core::sampling`. Graph rule 61 validates it. See
+  `logit_core::sampling`. Graph rule 61 validates it; `rate: 1` (keep every event) and `rate: 0`
+  with no `always_keep:` (discard every event `missing: keep` doesn't keep, counted) are legal. See
   [fixtures/sample-traces.yaml](fixtures/sample-traces.yaml).
 - **`shape`** is tapped off a flow by ordinary fan-out and never placed in it. It rewrites every
   event it sees into a measurement of that event's own shape: attribute and nested-map counts,

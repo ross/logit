@@ -49,10 +49,10 @@ by_signal:
 ### Config
 
 `signals:` is a struct with three optional fields, `logs`, `metrics`, and `traces`, each one target
-id, with unknown keys rejected. At least one must be set. A value is one id, never a list: a signal
-that should reach two places is a `route` concern (a list value) or a fan-out downstream of the
-target, and one id per signal keeps every part single-destination. `strip` is a boolean that
-defaults to `true`.
+id, with unknown keys rejected. Any of them may be unset, all of them included. A value is one id,
+never a list: a signal that should reach two places is a `route` concern (a list value) or a fan-out
+downstream of the target, and one id per signal keeps every part single-destination. `strip` is a
+boolean that defaults to `true`.
 
 ### Graph
 
@@ -65,7 +65,8 @@ router) apply as to any router.
 **It has no ordinary edge.** New rule 92 rejects any component that lists a `route_signals` in
 `sources:`, and rule 7 doesn't ask it for a consumer. Rule 50 doesn't apply: an event no listed
 signal claims is discarded, not forwarded, so there is no else-branch to give a consumer. Rule 92
-also rejects a `route_signals` with no signal set and an empty target id.
+also rejects an empty target id. A `route_signals` with no signal set discards every event (see
+"Amendment: no signal set is legal" below).
 
 **Reconvergence depends on `strip`.** Under `strip: true` a component may list several targets of
 one `route_signals`: each part carries different payloads, so nothing is counted twice at the
@@ -207,12 +208,21 @@ remote_by_signal:
   [ADR `private-attribute-namespace`](private-attribute-namespace.md)'s ignore rule. `none` names
   the case by its shape instead, and covers any source that produces it.
 - **Graph.** `none`'s edge is keyed `none` in `logit graph`, and its target takes the last slot,
-  after `logs`, `metrics`, and `traces`. Rule 92 accepts a table that sets only `none`, and rejects
-  an empty `none` id as it does any other. Rule 92's reconvergence clause leaves `none`'s target
-  out of the co-marked set under `strip: false`: an event that reaches it reaches no other target.
-  When `none` shares a signal's target, that target is in the set through the signal.
+  after `logs`, `metrics`, and `traces`. Rule 92 accepts a table that sets only `none`, or none of
+  the four, and rejects an empty `none` id as it does any other. Rule 92's reconvergence clause
+  leaves `none`'s target out of the co-marked set under `strip: false`: an event that reaches it
+  reaches no other target. When `none` shares a signal's target, that target is in the set through
+  the signal.
 - **Telemetry.** "With all three signals listed, only an empty event is discarded" now holds only
   when `none` is unset; with all four listed, `route_signals` discards nothing.
 
 The `signals:` vocabulary is shared with the three signal filters, which take `none` too
 ([ADR `signal-filtering-components`](signal-filtering-components.md)'s 2026-10-21 amendment).
+
+## Amendment: no signal set is legal (2026-10-21)
+
+Rule 92 no longer rejects a `route_signals` whose `signals:` sets no entry. No event carries a
+listed signal, so every event is discarded and counted as `logit.component.events.discarded`.
+Validation rejects a config only when it can't run, or when it would lose or duplicate data the
+operator didn't ask to lose or duplicate; this loss is one the config states. Rule 92 keeps its
+empty-id, `sources:`, and `strip: false` reconvergence clauses.

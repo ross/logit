@@ -11,7 +11,7 @@
 //! ```yaml
 //!   __perf_internal: { type: internal, interval: 1s, span_sample_rate: 0.0, logs: off }
 //!   __perf_dump: { type: file_out, sources: [__perf_internal], path: <tmp>/<purpose>.native,
-//!                  format: native, rotate: { max_bytes: "1024GiB" } }
+//!                  format: native }
 //! ```
 //!
 //! The dump is decoded with the codec that wrote it: [`logit_proto::frame::read_frame`] in a loop,
@@ -53,10 +53,6 @@ use std::time::Duration;
 pub const INTERNAL_ID: &str = "__perf_internal";
 pub const DUMP_ID: &str = "__perf_dump";
 pub const HARNESS_PREFIX: &str = "__perf_";
-
-/// `file_out` needs a rotation trigger (graph rule 29), but rotating mid-dump would split the
-/// data across two files, so this sits far above any dump (kilobytes per drain).
-const ROTATE_MAX_BYTES: &str = "1024GiB";
 
 /// A path removed when this guard drops, so every early return or panic removes the rewritten
 /// scenario from `perf/scenarios/`, where a leftover would do the most harm.
@@ -185,8 +181,7 @@ pub fn rewrite_scenario(
         format_interval(interval)
     ));
     out.push_str(&format!(
-        "  {DUMP_ID}: {{ type: file_out, sources: [{INTERNAL_ID}], path: {}, format: native, \
-         rotate: {{ max_bytes: \"{ROTATE_MAX_BYTES}\" }} }}\n",
+        "  {DUMP_ID}: {{ type: file_out, sources: [{INTERNAL_ID}], path: {}, format: native }}\n",
         yaml_double_quoted(&dump_path.to_string_lossy())
     ));
 
@@ -386,7 +381,7 @@ mod tests {
         );
         assert!(
             out.contains(
-                "  __perf_dump: { type: file_out, sources: [__perf_internal], path: \"/tmp/logit-perf-attribute-1/attribute.native\", format: native, rotate: { max_bytes: \"1024GiB\" } }\n"
+                "  __perf_dump: { type: file_out, sources: [__perf_internal], path: \"/tmp/logit-perf-attribute-1/attribute.native\", format: native }\n"
             ),
             "{out}"
         );

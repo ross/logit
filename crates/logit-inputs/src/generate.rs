@@ -921,6 +921,13 @@ mod tests {
         assert_eq!(batches.iter().map(|b| b.events.len()).collect::<Vec<_>>(), vec![1, 1]);
     }
 
+    /// `count: 0` is a finite generator with nothing to send: the run returns at once.
+    #[tokio::test]
+    async fn a_zero_count_sends_nothing_and_returns() {
+        let batches = run_to_completion(GenerateInput::new(Some(0), 100)).await;
+        assert!(batches.is_empty());
+    }
+
     /// `build_batch`, `logit-bench`'s seam, works with no runtime and no channel.
     #[test]
     fn build_batch_renders_without_a_runtime() {

@@ -479,3 +479,40 @@ Entry format and the other areas: [the known-gaps index](README.md).
   [ADR `committed-pregenerated-otlp-protobuf`](../adr/committed-pregenerated-otlp-protobuf.md)'s
   Consequences section, and `crates/logit-proto/src/otlp/metrics.rs`'s module doc for the full
   encode/decode tables this summarizes.
+
+- **The class check can misread two `graphite_out` tag names that sanitize to one.** Where two
+  attribute keys on a record, such as `a b` and `a_b`, render as the same tag name, the encoder
+  keeps the one whose original name sorts first and counts the other
+  `logit.output.tags.omitted{reason=collision}` (`build_tag_suffix` in
+  `crates/logit-proto/src/graphite/encode.rs`). The class check's matcher builds the expected tags
+  in a `BTreeMap` keyed by the rendered name (`Rec::public_as` in
+  `crates/logit-cli/src/transit/classes.rs`), resource attributes first and then the event's, so
+  it keeps whichever key it inserts last. When the two sides keep different keys with different
+  values, the record pairs with nothing and the check fails, though the sink did what the codec
+  documents. No case has such a collision today, and the counter has no row yet ("Counters no
+  row names yet" in `spec/transit/README.md`). A case that adds one needs the matcher to keep
+  the key the encoder keeps.
+- **The class check can misread a resource attribute that an omitted event attribute
+  shadows.** An event attribute whose value `graphite_out` writes no tag for (a timestamp,
+  bytes, a map, null, an empty string, or an array with no representable element) can share its
+  key with a resource attribute. The encoder merges the two with the event's value winning
+  (`logit_core::attrs::merged`), then omits the tag, counted `logit.output.tags.omitted` with
+  `reason=unrepresentable`, or `reason=empty` for an empty string, so neither value reaches the
+  wire. The matcher inserts the resource's value and then skips the event's, so it expects the resource's
+  value. The record still pairs, since the tags read back are a subset of the expected ones, but
+  the `attributes/resource_attribute` field row reads `lost`, worse than its `normalized` cell,
+  whose text permits the event's value winning on a shared key. The check fails, though the sink
+  did what the cell says. No case reaches it today. A case that does needs the matcher to apply
+  the event's omission to the shared key.
+- **The class check can't pair `graphite_out` records that differ only by tags under
+  `tags: drop`.** With no tag segment, such records read back as several datapoints on one path.
+  A gauge pairs by value in the check's first pass, but a sum or a `multi_value: expand` series
+  reads back as a gauge and pairs in the third pass (`classes.rs`'s "Pairing"). That pass gives
+  an input every read-back record under its name when no other unpaired input shares both its
+  name and its tags, and under `tags: drop` the inputs differ by tags, so the first input claims
+  every read-back record and the rest read as unpaired, and the check fails. So the only flow
+  under `tags: drop` is `graphite-relay-drop`, whose `graphite_in` cases hold only gauges, and
+  the `tags: drop` cells of `bool_value`, `number_value`, `array_value`, `map_value`,
+  `bytes_value`, `timestamp_value`, and `resource_attribute` are in `spec/transit/coverage.md`'s
+  "Cells no flow reaches: graphite_out". Another source's flow under `tags: drop` needs pass 3 to
+  share the read-back records of one path among the inputs that wrote them.

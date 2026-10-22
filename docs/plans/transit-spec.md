@@ -705,7 +705,9 @@ Recorded per workstream as each lands.
   The like pair reads `exact` everywhere under all three flows, `attributes/string_value`'s
   `tags: drop` cell aside, which reads `lost` as configured. No case holds a path or tag that
   `graphite_out` sanitizes (a `/`, a `\`, a tag name's `!` or `^`, a value's leading `~`), so
-  normalization 10 isn't exercised by the pair.
+  normalization 10 isn't exercised by the pair. Settled in `tgraph/known-gaps`: a `tagged` line
+  holds each of them, and its path reads back `normalized` under all three flows and its tags
+  under the two that write tags, and a `pickle-p0` case reads the CPython protocol-0 capture.
 
   Each recorded as the code behaves, none fixed here:
   - Every `Sum` read `degraded` with no counter: the bare value reads back as a gauge, which the
@@ -733,7 +735,8 @@ Recorded per workstream as each lands.
   - Under `tags: drop`, series that differ only in their tags write one path, which the
     `string_value` cell says. No other source's flow runs `tags: drop`: pass 3 pairs a sum by
     name, and under drop two sums of one name and different tags score the same, so the first
-    claims both read-back gauges.
+    claims both read-back gauges. `docs/known-gaps/mappings.md` records it, with two other
+    places the check misreads `graphite_out`.
   - `record/superseded`, `same_instant`, and `same_millisecond` read `exact`, since the codec
     writes every point. A whisper store keeps one point per path and second, so two points of a
     series in one second keep only the later there; the cells say so, and no row counts it.

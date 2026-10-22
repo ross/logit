@@ -1,6 +1,6 @@
 ---
 created: 2026-09-15
-updated: 2026-09-15
+updated: 2026-10-21
 ---
 
 # `keep_values`: an attribute-value allowlist, and an optional normalize-before-compare step
@@ -122,14 +122,14 @@ strictly better than a mismatch nobody notices.
 `flush_interval`/`flush` keep the `Transform` trait's defaults. No `Diagnostics` builder — a clamp
 is documented behavior, not a failure, matching `Keep`/`Remove`/`Set`/`Scale`'s posture exactly.
 
-**Graph validation** (rule 54) rejects: both maps empty (certain no-op, `set`'s own rule); an empty
-field name in either map (`trace_context`'s rule, extended); an empty `allow` list (a config that
-could only ever clamp everything — that's `set` with `other:` or `remove` without it, both of which
-already exist, and the error names them); a non-finite `SetValue::F64` in `allow`/`other`
-(`value_matches` makes it match nothing, so it's dead config, `has_attributes`' rule 36 reasoning);
-a non-lowercase `Str` literal under `normalize: [lower]` (above); and a duplicate step within one
-field's `normalize:` list (certain no-op). An empty `normalize:` list is legal — it's the default,
-meaning no normalization.
+**Graph validation** (rule 54) rejects: an empty field name in either map (`trace_context`'s rule,
+extended); a non-finite `SetValue::F64` in `allow`/`other` (`value_matches` makes it match nothing,
+so it's dead config, `has_attributes`' rule 36 reasoning); a non-lowercase `Str` literal under
+`normalize: [lower]` (above); and a duplicate step within one field's `normalize:` list. An empty
+`normalize:` list is legal — it's the default, meaning no normalization. Both maps empty is legal
+and forwards every event unchanged. An empty `allow` list is legal and clamps every value of its
+field: to `other`, or by removing the attribute, each counted in `logit.transform.values.clamped`.
+`set` with `other:`, or `remove` without it, does the same job more plainly.
 
 ## Alternatives considered
 
@@ -209,3 +209,11 @@ meaning no normalization.
 - A `keep_values` clamping everything on a field the config author no longer needs (every legitimate
   value already covered, and the field is now dead weight) gets no warning — the same non-goal
   `has_attributes`/`drop_attributes`'s ADR already accepts for its own bounded matcher.
+
+## Amendment: nothing configured and an empty `allow` are legal (2026-10-21)
+
+Rule 54 no longer rejects a `keep_values` with both maps empty, or a field with `allow: []`. The
+first forwards every event unchanged. The second clamps every value of that field, as the Decision's
+validation paragraph now says. Validation rejects a config only when it can't run, or when it would
+lose or duplicate data the operator didn't ask to lose or duplicate; a pointless config runs as
+written. The rule's other clauses stand.

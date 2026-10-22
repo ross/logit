@@ -53,5 +53,3 @@ components:
     sources: [shape_rollup]
     path: /out/shape.log
     format: json
-    rotate:
-      max_bytes: "64GiB"
