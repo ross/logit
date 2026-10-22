@@ -31,9 +31,10 @@
 //! which a sink holding one value per series replaces; `record/same_instant` is one whose later
 //! point shares its timestamp, and `record/same_millisecond` one whose later point falls at
 //! another nanosecond of its millisecond, which a wire stamping milliseconds can't tell apart.
-//! `record/same_instant_equal` and `record/same_millisecond_equal` are those two where the
-//! latest point of the series in the record's millisecond is equal to it, so a sink that keeps
-//! one point loses nothing.
+//! `record/same_instant_equal` and `record/same_millisecond_equal` are those two where the record
+//! is a state (a `gauge`, a set, or a cumulative kind) and the latest point of the series in its
+//! millisecond is equal to it, so a sink that keeps one point loses nothing; an equal increment
+//! reaches the unequal row.
 //! `record/name_unsafe` is a name holding a character the sink's wire rewrites, which differs by
 //! sink, and `record/exemplar_key_unsafe` a monotonic `sum` whose written exemplar has an
 //! attribute key holding a character the sink's label names can't carry,

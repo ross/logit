@@ -23,9 +23,9 @@
 //! `gauge` holding `NaN` or an infinity, and `superseded` when a later record of the run is
 //! another point of its series (the same name, kind, and public attributes), with `same_instant`
 //! when that point shares its timestamp or else `same_millisecond` when it shares its
-//! millisecond, each as `same_instant_equal` or `same_millisecond_equal` when the latest point of
-//! the series in its millisecond, the later in the run on a tie, is the same reading as the sink
-//! writes it ([`same_reading`]); at `datadog_out`, a `samples`, `distribution`, `set_members`, or
+//! millisecond, each as `same_instant_equal` or `same_millisecond_equal` when the record is a
+//! state ([`is_state`]) and the latest point of the series in its millisecond, the later in the
+//! run on a tie, is the same state as the sink writes it ([`same_reading`]); at `datadog_out`, a `samples`, `distribution`, `set_members`, or
 //! `exponential_histogram` record reaches neither, nor a `histogram` under `histograms.mode:
 //! distributions`, since that sink collapses a series' points only on its series route, and the
 //! distribution-points and sketches routes carry those kinds or nothing does; under
@@ -1319,11 +1319,14 @@ fn same_millisecond(rec: &Rec, later: &Rec) -> bool {
     millis(rec).is_some() && millis(rec) == millis(later)
 }
 
-/// Whether `rec` and `later`, two points of one series, are one reading as `sink` writes it: the
-/// same metric object, attributes, and resource, private carriers included. `prometheus_out`
-/// writes a `set_members` record as its distinct member count, so there two records with as many
-/// members are one reading.
+/// Whether `rec` and `later`, two points of one series, are one state as `sink` writes it: each a
+/// kind a later reading fully replaces ([`is_state`]), with the same metric object, attributes,
+/// and resource, private carriers included. `prometheus_out` writes a `set_members` record as its
+/// distinct member count, so there two records with as many members are one reading.
 fn same_reading(rec: &Rec, later: &Rec, sink: &str) -> bool {
+    if !is_state(rec) || !is_state(later) {
+        return false;
+    }
     let written = |rec: &Rec| {
         let mut body = rec.body.clone();
         if sink == "prometheus_out" && rec.kind == "set_members" {
@@ -1337,6 +1340,20 @@ fn same_reading(rec: &Rec, later: &Rec, sink: &str) -> bool {
     written(rec) == written(later)
         && rec.attributes == later.attributes
         && rec.resource == later.resource
+}
+
+/// Whether a later reading of `rec`'s series fully replaces it: a `gauge`, a set, or a cumulative
+/// `sum`, `histogram`, `exponential_histogram`, or `summary`. Any other kind is an increment or
+/// an observation set, so two equal ones are two sets of events (`logit_proto`'s
+/// `replaced_by_a_later_reading`).
+fn is_state(rec: &Rec) -> bool {
+    match rec.kind.as_str() {
+        "gauge" | "set_members" | "set" => true,
+        "sum" | "histogram" | "exponential_histogram" | "summary" => {
+            rec.body["temporality"] == "cumulative"
+        }
+        _ => false,
+    }
 }
 
 /// Whether inputs `i` and `j`, which share an instant, read back at different ones.

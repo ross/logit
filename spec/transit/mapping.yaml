@@ -1676,8 +1676,9 @@ rows:
           counter: logit.output.metrics.dropped{reason=duplicate_timestamp}
           text: >-
             One series can't hold two samples at one timestamp, so the later point wins and the
-            earlier, which differs from it, is dropped, counted; a `dedup_timestamps` upstream
-            merges or collapses the pair instead.
+            earlier is dropped, counted, when it differs from it or is an observation set, such as
+            a `samples` record's summary; a `dedup_timestamps` upstream merges or collapses the
+            pair instead.
         - class: normalized
           reason: superseded
           text: >-
@@ -1697,7 +1698,8 @@ rows:
         counter: logit.output.metrics.dropped{reason=duplicate_timestamp}
         text: >-
           Datadog keeps one point per series per second, the higher of two in one request, so the
-          sink sends the later point and drops this one, which differs from it, counted.
+          sink sends the later point and drops this one, counted, when it differs from the one
+          sent or is an increment: two equal delta counts are two events.
           Only the series route collapses: a `samples` record leaves on the distribution-points
           route, where Datadog keeps both, and a `distribution`, an `exponential_histogram`, and
           a `histogram` under `histograms.mode: distributions` on the sketches route, so they
@@ -1722,7 +1724,7 @@ rows:
           counter: logit.output.metrics.normalized{reason=duplicate_timestamp}
           text: >-
             One series can't hold two samples at one timestamp, so the later point is sent, and
-            this one, equal to it, is left off, counted: the receiver stores the same sample
+            this state, equal to it, is left off, counted: the receiver stores the same sample
             either way.
         - class: normalized
           reason: superseded
@@ -1744,10 +1746,8 @@ rows:
         counter: logit.output.metrics.normalized{reason=duplicate_timestamp}
         text: >-
           Datadog keeps one point per series per second, so the sink sends the later point and
-          leaves this one, equal to it, off, counted: Datadog stores the same point either way.
-          Two equal delta counts are two increments, and one is sent; a `dedup_timestamps` with
-          `precision: 1s` upstream sums them. Only the series route collapses, as for
-          `record/same_instant`.
+          leaves this state, equal to it, off, counted: Datadog stores the same point either way.
+          Only the series route collapses, as for `record/same_instant`.
       graphite_out:
         class: exact
         text: >-
@@ -1765,9 +1765,9 @@ rows:
           counter: logit.output.metrics.dropped{reason=duplicate_timestamp}
           text: >-
             A remote-write sample's timestamp is in milliseconds, and one series can't hold two
-            samples at one timestamp, so the later reading wins and the earlier, which differs
-            from it, is dropped, counted; a `dedup_timestamps` with `precision: 1ms` upstream
-            merges or collapses the pair instead.
+            samples at one timestamp, so the later reading wins and the earlier is dropped,
+            counted, when it differs from it or is an observation set; a `dedup_timestamps` with
+            `precision: 1ms` upstream merges or collapses the pair instead.
         - class: normalized
           reason: superseded
           text: >-
@@ -1804,7 +1804,7 @@ rows:
           counter: logit.output.metrics.normalized{reason=duplicate_timestamp}
           text: >-
             A remote-write sample's timestamp is in milliseconds, so the later reading is sent,
-            and this one, equal to it, is left off, counted: the receiver stores the same sample
+            and this state, equal to it, is left off, counted: the receiver stores the same sample
             either way.
         - class: normalized
           reason: superseded
