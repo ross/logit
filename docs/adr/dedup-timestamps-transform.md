@@ -357,17 +357,18 @@ sends:
 | a state, equal to the reading sent | `logit.output.metrics.normalized{reason="duplicate_timestamp"}` |
 | any other | `logit.output.metrics.dropped{reason="duplicate_timestamp"}`, with a throttled `duplicate_timestamp` diagnostic naming `dedup_timestamps` |
 
-A **state** is a reading a later equal reading fully replaces: a `Gauge`, a cumulative `Sum`,
-`Histogram`, `ExponentialHistogram`, or `Summary`, and a set written as a gauge of its size
-(`SetMembers` or `Set`). An equal state loses nothing: the destination stores the same sample
+A **state** is a reading a later equal reading fully replaces: a `Gauge`, or a cumulative `Sum`,
+`Histogram`, `ExponentialHistogram`, or `Summary`. An equal state loses nothing: the destination stores the same sample
 whichever of the two arrives, so the rule each destination applies inside one request (the first,
 or the higher) makes no difference. A Datadog Agent relay or a retry resends identical points,
 and that mustn't raise a loss alarm.
 
 Every other reading is an **increment or an observation set**: a delta `Sum` (Datadog's `count`
-and `rate`), a delta `Histogram`, `ExponentialHistogram`, or `Summary`, `Samples`, and a
-`Distribution`. Two equal ones in one bucket are two real sets of events, and the sink sends one,
-so the removed one stays `dropped` whatever its value. A `dedup_timestamps` upstream sums them.
+and `rate`), a delta `Histogram`, `ExponentialHistogram`, or `Summary`, `Samples`, a
+`Distribution`, and a set, `SetMembers` or `Set`. Two equal ones in one bucket are two real sets
+of events, and the sink sends one, so the removed one stays `dropped` whatever its value. A set
+written as a gauge of its size shows this most plainly: `{alice}` and `{bob}` both write `1`, and
+their union is `2`. A `dedup_timestamps` upstream sums the increments and unions the sets.
 
 Equal means the whole reading as the sink writes it, each `f64` compared by its bits, so a `NaN`
 equals only the same `NaN` and `0.0` doesn't equal `-0.0`:
