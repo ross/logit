@@ -1593,11 +1593,7 @@ pub(crate) fn build_spec(
                     GraphiteOutput::tcp(endpoint.clone(), *connect_timeout)
                 }
             };
-            let encoder = GraphiteEncoder::new()
-                .with_protocol(graphite_out_protocol(*protocol))
-                .with_tags(graphite_tags(*tags))
-                .with_multi_value(graphite_multi_value(*multi_value))
-                .with_max_frame_bytes(*max_frame_bytes as usize);
+            let encoder = graphite_encoder(*protocol, *tags, *multi_value, *max_frame_bytes);
             let output = output
                 .with_encoder(encoder)?
                 .with_max_packet_bytes(*max_packet_bytes as usize)
@@ -1722,6 +1718,9 @@ pub(crate) enum SinkEncoder {
     /// `Content-Type`, and body (`logit_outputs::datadog::encode_routes`), filling the host of
     /// anything that carries none with the process hostname, as the sink does.
     Datadog(logit_proto::datadog::DatadogEncoder),
+    /// `graphite_out`: one plaintext line, or one length-prefixed pickle frame, per
+    /// [`logit_proto::MessageBuf`] entry, line-capped as the sink's transport caps it.
+    Graphite(GraphiteEncoder),
 }
 
 /// The [`SinkEncoder`] for `kind`, its codec counting through `telemetry` and `diag`. Every
@@ -1780,6 +1779,26 @@ pub(crate) fn sink_encoder(
                 .with_default_host(Some(hostname.clone()))
                 .with_histograms(to_datadog_histograms(histograms)),
         ),
+        GraphiteOut {
+            transport,
+            protocol,
+            tags,
+            multi_value,
+            max_packet_bytes,
+            max_frame_bytes,
+            ..
+        } => {
+            let tcp = matches!(transport, logit_config::GraphiteTransport::Tcp);
+            SinkEncoder::Graphite(
+                graphite_encoder(*protocol, *tags, *multi_value, *max_frame_bytes)
+                    .with_max_packet_bytes(logit_outputs::graphite::line_cap(
+                        tcp,
+                        *max_packet_bytes as usize,
+                    ))
+                    .with_telemetry(telemetry.clone())
+                    .with_diagnostics(diag.clone()),
+            )
+        }
         other => anyhow::bail!("{} has no encoder this driver reaches", graph::kind_name(other)),
     })
 }
@@ -1809,6 +1828,20 @@ fn statsd_encoder(
     StatsdEncoder::new(statsd_format(format))
         .with_relative_gauges(relative_gauges)
         .with_multi_value(statsd_multi_value(multi_value))
+}
+
+/// `graphite_out`'s encoder from its config fields, before the sink applies its line cap.
+fn graphite_encoder(
+    protocol: logit_config::GraphiteProtocol,
+    tags: logit_config::GraphiteTags,
+    multi_value: logit_config::GraphiteMultiValue,
+    max_frame_bytes: u64,
+) -> GraphiteEncoder {
+    GraphiteEncoder::new()
+        .with_protocol(graphite_out_protocol(protocol))
+        .with_tags(graphite_tags(tags))
+        .with_multi_value(graphite_multi_value(multi_value))
+        .with_max_frame_bytes(max_frame_bytes as usize)
 }
 
 /// A sink's `SinkStoreConfig` from its `BufferConfig` (`docs/adr/buffered-sink-delivery.md`,

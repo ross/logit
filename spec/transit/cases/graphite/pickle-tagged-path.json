@@ -1,0 +1,4 @@
+{"timestamp":"2023-11-14T22:13:20.000000000Z","metrics":[{"name":"base.cpu.user","kind":"gauge","value":1.5}]}
+{"timestamp":"2023-11-14T22:13:21.250000000Z","metrics":[{"name":"base.load","kind":"gauge","value":-2.0}],"attributes":{"host":"web-1"}}
+{"timestamp":"2023-11-14T22:13:22.000000000Z","metrics":[{"name":"base.mem","kind":"gauge","value":1234567.0}]}
+{"timestamp":"2023-11-14T22:13:23.000000000Z","metrics":[{"name":"base.cpu.user","kind":"gauge","value":0.0}]}

@@ -26,8 +26,9 @@
 //! | `Set` | `.count` = [`logit_core::HyperLogLog::estimate`] |
 //! | `SetMembers` | `.count` = the distinct member count |
 //!
-//! A non-finite value (a NaN `sum`, an infinite quantile) is skipped, never emitted: the record is
-//! already counted degraded by its sink, and a fabricated `inf` is worse than a missing component.
+//! A non-finite value (a NaN `sum`, an infinite quantile) is skipped, never emitted, since a
+//! fabricated `inf` is worse than a missing component. [`expand_dotted`] returns how many it
+//! skipped, so a sink can count the record degraded for it.
 //! An empty sketch yields `.count 0` and `.sum 0` and no extremes or quantiles, since it has no
 //! observation to report.
 //!
@@ -114,8 +115,8 @@ pub struct DottedScratch {
 }
 
 /// Calls `emit(suffix, value, part)` once per component of `kind`, in the module doc's table
-/// order, skipping non-finite values. Returns `false` and emits nothing for a scalar kind (`Sum`,
-/// `Gauge`, `GaugeDelta`), which has no row in the table.
+/// order, skipping non-finite values, and returns how many it skipped. Returns `None` and emits
+/// nothing for a scalar kind (`Sum`, `Gauge`, `GaugeDelta`), which has no row in the table.
 ///
 /// Allocates only where a kind requires it: a `Samples` record builds its sketch, and a
 /// `SetMembers` record builds a de-duplication buffer.
@@ -123,8 +124,16 @@ pub fn expand_dotted(
     kind: &MetricKind,
     scratch: &mut DottedScratch,
     mut emit: impl FnMut(&str, f64, Part),
-) -> bool {
-    let emit = &mut emit;
+) -> Option<usize> {
+    // The single place a non-finite value is skipped, for every row.
+    let mut skipped = 0;
+    let emit = &mut |suffix: &str, value: f64, part: Part| {
+        if value.is_finite() {
+            emit(suffix, value, part);
+        } else {
+            skipped += 1;
+        }
+    };
     match kind {
         // `sketch()` allocates a `DdSketch` per record, inherent to re-summarizing raw values (as
         // at `influxdb_out`/`otlp_out`).
@@ -141,9 +150,9 @@ pub fn expand_dotted(
         MetricKind::Histogram(histogram) => expand_histogram(histogram, scratch, emit),
         MetricKind::ExponentialHistogram(histogram) => expand_exp_histogram(histogram, emit),
         MetricKind::Summary(summary) => expand_summary(summary, scratch, emit),
-        MetricKind::Sum(_) | MetricKind::Gauge(_) | MetricKind::GaugeDelta(_) => return false,
+        MetricKind::Sum(_) | MetricKind::Gauge(_) | MetricKind::GaugeDelta(_) => return None,
     }
-    true
+    Some(skipped)
 }
 
 /// `.count`, `.sum`, `.min`/`.max` when the sketch has an observation, then one `.q<q>` per
@@ -207,12 +216,9 @@ fn expand_summary(
     }
 }
 
-/// One component with a literal suffix; the single place a non-finite value is skipped for every
-/// literal row.
+/// One component with a literal suffix.
 fn component(emit: &mut impl FnMut(&str, f64, Part), suffix: &str, value: f64, part: Part) {
-    if value.is_finite() {
-        emit(suffix, value, part);
-    }
+    emit(suffix, value, part);
 }
 
 /// [`component`] for an `Option` field: absent means "not reported", which must not be written as
@@ -223,8 +229,7 @@ fn optional(emit: &mut impl FnMut(&str, f64, Part), suffix: &str, value: Option<
     }
 }
 
-/// One component whose suffix is `prefix` plus `token`'s number token, skipped when `value` is
-/// non-finite.
+/// One component whose suffix is `prefix` plus `token`'s number token.
 fn numbered(
     scratch: &mut DottedScratch,
     emit: &mut impl FnMut(&str, f64, Part),
@@ -233,9 +238,6 @@ fn numbered(
     value: f64,
     part: Part,
 ) {
-    if !value.is_finite() {
-        return;
-    }
     scratch.suffix.clear();
     scratch.suffix.push_str(prefix);
     push_number_token(&mut scratch.suffix, &mut scratch.number, token);
@@ -268,7 +270,7 @@ mod tests {
     }
 
     /// Every component of `kind` as `(suffix, value, part)`, and the return value.
-    fn expand(kind: &MetricKind) -> (Vec<(String, f64, Part)>, bool) {
+    fn expand(kind: &MetricKind) -> (Vec<(String, f64, Part)>, Option<usize>) {
         let mut parts = Vec::new();
         let expanded = expand_dotted(kind, &mut DottedScratch::default(), |suffix, v, part| {
             parts.push((suffix.to_string(), v, part))
@@ -364,7 +366,7 @@ mod tests {
         ];
         for (kind, expected) in cases {
             assert_eq!(suffixes_and_parts(&kind), owned(&expected), "{kind:?}");
-            assert!(expand(&kind).1, "{kind:?} has a row in the table");
+            assert_eq!(expand(&kind).1, Some(0), "{kind:?} has a row in the table");
         }
     }
 
@@ -409,6 +411,7 @@ mod tests {
             suffixes_and_parts(&histogram),
             owned(&[(".count", Part::Count), (".bucket_1", Part::Bucket)])
         );
+        assert_eq!(expand(&histogram).1, Some(3), "sum, min, and max skipped");
 
         let summary = MetricKind::Summary(Summary {
             quantiles: vec![(0.5, 1.0), (0.9, f64::NAN), (0.99, f64::INFINITY)],
@@ -420,6 +423,7 @@ mod tests {
             suffixes_and_parts(&summary),
             owned(&[(".count", Part::Count), (".q0_5", Part::Quantile)])
         );
+        assert_eq!(expand(&summary).1, Some(3), "sum and two quantiles skipped");
     }
 
     #[test]
@@ -438,7 +442,7 @@ mod tests {
     #[test]
     fn an_empty_sketch_yields_count_and_sum_only() {
         let (parts, expanded) = expand(&MetricKind::Distribution(DdSketch::new()));
-        assert!(expanded);
+        assert_eq!(expanded, Some(0));
         assert_eq!(
             parts,
             vec![(".count".to_string(), 0.0, Part::Count), (".sum".to_string(), 0.0, Part::Sum)]
@@ -446,7 +450,7 @@ mod tests {
     }
 
     #[test]
-    fn scalar_kinds_yield_nothing_and_return_false() {
+    fn scalar_kinds_yield_nothing_and_return_none() {
         for kind in [
             MetricKind::Sum(Sum {
                 value: MetricValue::F64(1.0),
@@ -458,7 +462,7 @@ mod tests {
         ] {
             let (parts, expanded) = expand(&kind);
             assert!(parts.is_empty(), "{kind:?}");
-            assert!(!expanded, "{kind:?}");
+            assert_eq!(expanded, None, "{kind:?}");
         }
     }
 

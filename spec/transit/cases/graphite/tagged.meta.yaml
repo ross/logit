@@ -1,0 +1,6 @@
+# Hand-built, since no recorded sender writes carbon 1.1's tags: plaintext lines with tags, a
+# repeated tag key, a `_logit.` tag name, tag values holding `=` and `~`, integer, exponent,
+# signed, and negative values, `-1` and fractional timestamps, runs of spaces and tabs, and a
+# non-ASCII path.
+wire: tagged.graphite
+exercises: [plaintext, whitespace_runs, tags, duplicate_tag_key, reserved_tag_key, tag_value_punctuation, integer_value, signed_value, negative_value, fractional_timestamp, receipt_time, utf8_path]

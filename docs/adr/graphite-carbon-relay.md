@@ -1,6 +1,6 @@
 ---
 created: 2026-09-13
-updated: 2026-10-18
+updated: 2026-10-21
 ---
 
 # Graphite/Carbon relay: untyped datapoints as `Gauge`, tags as attributes, a restricted pickle codec, and a multi-value switch
@@ -639,3 +639,35 @@ fault reason (`unencodable_value`, `unencodable_timestamp`, `empty_name`, `overs
 `oversize_datapoint`) moves from `metrics.skipped` to `metrics.dropped`. `no_recorded_value` and a
 kind under `multi_value: skip` stay `metrics.skipped`. `crates/logit-proto/src/graphite/mod.rs`'s
 module doc is the canonical table.
+
+## Amendment (2026-10-21): a bare `Sum` is counted degraded
+
+Normalization 12 stays a normalization, but it's no longer silent: `graphite_out` counts every
+`Sum` it writes as a bare value as `logit.output.metrics.degraded{metric_kind}`, once per record,
+in `statsd_out`'s vocabulary. A cumulative sum counts `cumulative_sum` and a non-monotonic delta
+sum `non_monotonic_delta_sum`. A monotonic delta sum, which `statsd_out` writes exact as a `|c`
+line, degrades here too and counts `monotonic_delta_sum`. The model mapping table's `Sum` row
+above predates this.
+
+Only the count is new. `statsd_out` skips a cumulative or non-monotonic sum under
+`multi_value: skip`; `graphite_out` writes every `Sum` under either `multi_value` setting, since
+its bare value can't be misread. The like pair never reaches the counter, because `graphite_in`
+decodes only gauges.
+
+A tagged carbon 1.1.10 replaces a tag named `name` with the metric's path
+(`TaggedSeries.parse_carbon`). `graphite_out` doesn't guard against it: the operator renames or
+removes the attribute at the source, or ahead of the sink with a `remove` or `lua` component.
+
+## Amendment (2026-10-21): skipped events and non-finite components are counted
+
+Two losses that `graphite_out` left uncounted now have counters:
+
+- An event with no metrics (a log, a span, or attributes alone) has no carbon form and isn't
+  written. It counts `logit.output.events.skipped{reason="no_metrics"}` once per event, with no
+  diagnostic.
+- Under `multi_value: expand`, a non-finite component, such as a NaN `.sum`, is left off and the
+  rest of the record is written. The record counts
+  `logit.output.metrics.degraded{reason="non_finite_component"}` once, however many components it
+  left off, beside its `{metric_kind}` count, as `influxdb_out` counts it.
+
+The model mapping table's "event with no metrics" row above predates this.

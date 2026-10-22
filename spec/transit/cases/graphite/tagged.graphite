@@ -1,0 +1,9 @@
+servers.web-1.cpu;host=web-1;dc=us-east 0.25 1799999990
+servers.web-1.cpu;env=prod;env=staging 0.5 1799999991
+servers.web-1.mem;_logit.graphite.kind=x;role=db 1234 1799999992
+query.time;expr=a=b;pattern=x~y 3.5 -1
+sensor.reading 1e5 1799999993.25
+sensor.offset +1.5 1799999994
+sensor.delta -2.75 1799999995
+servers.web-1.disk 	  42 		1799999996
+café.temperature 21.5 1799999997

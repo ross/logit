@@ -148,13 +148,9 @@ impl GraphiteOutput {
         .with_max_packet_bytes(logit_proto::graphite::DEFAULT_MAX_PACKET_BYTES)
     }
 
-    /// The encoder's line cap: `max_packet_bytes` on UDP, none on TCP.
+    /// The encoder's line cap for this sink's transport ([`line_cap`]).
     fn encoder_cap(&self) -> usize {
-        if matches!(self.conn, Conn::Udp(_)) {
-            self.max_packet_bytes
-        } else {
-            usize::MAX
-        }
+        line_cap(matches!(self.conn, Conn::Tcp { .. }), self.max_packet_bytes)
     }
 
     /// Installs `encoder` with this sink's line cap and its diagnostics and telemetry (gated)
@@ -195,6 +191,16 @@ impl GraphiteOutput {
         self.encoder = self.encoder.with_telemetry(telemetry.gated(self.accounting.gate()));
         self.telemetry = telemetry;
         self
+    }
+}
+
+/// The longest line the encoder may write for a transport: `max_packet_bytes` on UDP, where lines
+/// are packed into datagrams, uncapped over TCP.
+pub fn line_cap(tcp: bool, max_packet_bytes: usize) -> usize {
+    if tcp {
+        usize::MAX
+    } else {
+        max_packet_bytes
     }
 }
 
