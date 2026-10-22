@@ -24,7 +24,7 @@ classes:
     The record is lost for a reason the config didn't ask for; the cell names the counter that
     counts it, or says it's uncounted.
 
-sinks: [statsd_out, prometheus_out, influxdb_out, otlp_out, datadog_out]
+sinks: [statsd_out, prometheus_out, influxdb_out, otlp_out, datadog_out, graphite_out]
 
 rows:
   # --- sum: temporality and monotonicity -------------------------------------------------------
@@ -56,6 +56,12 @@ rows:
         text: >-
           A series `count` point, its `interval` from the `_logit.datadog.interval` carrier or 0,
           which datadog_in reads back as a delta monotonic sum.
+      graphite_out:
+        class: degraded
+        counter: logit.output.metrics.degraded{metric_kind=monotonic_delta_sum}
+        text: >-
+          The bare value as a datapoint, its temporality and monotonicity dropped, which
+          graphite_in reads back as a gauge.
   - kind: sum
     feature: delta_nonmonotonic
     cells:
@@ -87,6 +93,10 @@ rows:
         text: >-
           A series `count` point of the raw value, as Datadog's exporter sends any delta sum, which
           datadog_in reads back as a monotonic delta sum.
+      graphite_out:
+        class: degraded
+        counter: logit.output.metrics.degraded{metric_kind=non_monotonic_delta_sum}
+        text: The bare value, read back as a gauge, as for a monotonic delta sum.
   - kind: sum
     feature: cumulative_monotonic
     cells:
@@ -121,6 +131,10 @@ rows:
           Datadog's exporter differences a running total into a delta first, so it's dropped,
           with a throttled `unresolved_cumulative` warning; a `cumulative_to_delta` upstream
           makes it a delta `count`.
+      graphite_out:
+        class: degraded
+        counter: logit.output.metrics.degraded{metric_kind=cumulative_sum}
+        text: The running total as a bare value, read back as a gauge.
   - kind: sum
     feature: cumulative_nonmonotonic
     cells:
@@ -150,6 +164,10 @@ rows:
         text: >-
           A series `gauge` point of the running value, as Datadog's exporter sends it, which
           datadog_in reads back as a gauge.
+      graphite_out:
+        class: degraded
+        counter: logit.output.metrics.degraded{metric_kind=cumulative_sum}
+        text: The running total as a bare value, read back as a gauge.
 
   # --- sum: scalar type ------------------------------------------------------------------------
   - kind: sum
@@ -171,6 +189,9 @@ rows:
         class: exact
         text: >-
           The point's double.
+      graphite_out:
+        class: exact
+        text: The value is written as the shortest float that reads back to the same bits.
   - kind: sum
     feature: i64
     cells:
@@ -197,6 +218,12 @@ rows:
         reason: integer_as_double
         text: >-
           The point's double, the integer's nearest `f64`, read back as a float.
+      graphite_out:
+        class: normalized
+        reason: f64_value
+        text: >-
+          Plaintext writes every digit and pickle the nearest `f64`, and graphite_in reads either
+          back as a float, rounded beyond 2^53.
   - kind: sum
     feature: u64
     cells:
@@ -227,6 +254,12 @@ rows:
         reason: integer_as_double
         text: >-
           The point's double, the integer's nearest `f64`, read back as a float.
+      graphite_out:
+        class: normalized
+        reason: f64_value
+        text: >-
+          Plaintext writes every digit and pickle the nearest `f64`, and graphite_in reads either
+          back as a float, rounded beyond 2^53.
   - kind: sum
     feature: bool
     cells:
@@ -254,6 +287,11 @@ rows:
         counter: logit.output.metrics.normalized{reason=bool_value}
         text: >-
           The point's double, `1` or `0`, read back as a float.
+      graphite_out:
+        class: normalized
+        reason: bool_value
+        counter: logit.output.metrics.normalized{reason=bool_value}
+        text: A boolean is written as `1` or `0` and reads back as that number.
 
   # --- gauge -----------------------------------------------------------------------------------
   - kind: gauge
@@ -281,6 +319,9 @@ rows:
         class: exact
         text: >-
           A series `gauge` point, or `rate` or unspecified under the `_logit.datadog.type` carrier.
+      graphite_out:
+        class: exact
+        text: A `path value timestamp` line, or a pickled datapoint.
   - kind: gauge
     feature: i64
     cells:
@@ -308,6 +349,12 @@ rows:
         reason: integer_as_double
         text: >-
           The point's double, the integer's nearest `f64`, read back as a float.
+      graphite_out:
+        class: normalized
+        reason: f64_value
+        text: >-
+          Plaintext writes every digit and pickle the nearest `f64`, and graphite_in reads either
+          back as a float, rounded beyond 2^53.
   - kind: gauge
     feature: u64
     cells:
@@ -339,6 +386,12 @@ rows:
         reason: integer_as_double
         text: >-
           The point's double, the integer's nearest `f64`, read back as a float.
+      graphite_out:
+        class: normalized
+        reason: f64_value
+        text: >-
+          Plaintext writes every digit and pickle the nearest `f64`, and graphite_in reads either
+          back as a float, rounded beyond 2^53.
   - kind: gauge
     feature: bool
     cells:
@@ -367,6 +420,11 @@ rows:
         counter: logit.output.metrics.normalized{reason=bool_value}
         text: >-
           The point's double, `1` or `0`, read back as a float.
+      graphite_out:
+        class: normalized
+        reason: bool_value
+        counter: logit.output.metrics.normalized{reason=bool_value}
+        text: A boolean is written as `1` or `0` and reads back as that number.
   - kind: gauge
     feature: negative
     cells:
@@ -390,6 +448,9 @@ rows:
         class: exact
         text: >-
           A negative double, as any other.
+      graphite_out:
+        class: exact
+        text: A negative value, written as is.
 
   # --- gauge_delta -----------------------------------------------------------------------------
   - kind: gauge_delta
@@ -430,6 +491,12 @@ rows:
         text: >-
           Nothing upstream resolved the relative gauge to an absolute one, so the series encoders
           drop it.
+      graphite_out:
+        class: dropped
+        counter: logit.output.metrics.dropped{reason=unresolved_gauge_delta}
+        text: >-
+          Carbon has no relative gauge, so an unresolved adjustment is dropped, with a throttled
+          `gauge_delta_unresolved` warning; an `aggregate` upstream resolves it into a gauge.
   - kind: gauge_delta
     feature: i64
     cells:
@@ -459,6 +526,10 @@ rows:
         text: >-
           Nothing upstream resolved the relative gauge to an absolute one, so the series encoders
           drop it.
+      graphite_out:
+        class: dropped
+        counter: logit.output.metrics.dropped{reason=unresolved_gauge_delta}
+        text: Dropped, as for a float adjustment.
   - kind: gauge_delta
     feature: u64
     cells:
@@ -488,6 +559,10 @@ rows:
         text: >-
           Nothing upstream resolved the relative gauge to an absolute one, so the series encoders
           drop it.
+      graphite_out:
+        class: dropped
+        counter: logit.output.metrics.dropped{reason=unresolved_gauge_delta}
+        text: Dropped, as for a float adjustment.
   - kind: gauge_delta
     feature: bool
     cells:
@@ -518,6 +593,10 @@ rows:
         text: >-
           Nothing upstream resolved the relative gauge to an absolute one, so the series encoders
           drop it.
+      graphite_out:
+        class: dropped
+        counter: logit.output.metrics.dropped{reason=unresolved_gauge_delta}
+        text: Dropped, as for a float adjustment.
 
   # --- raw multi-value kinds -------------------------------------------------------------------
   - kind: samples
@@ -557,6 +636,17 @@ rows:
         text: >-
           A distribution point holding every value, which datadog_in reads back as samples at rate
           1.
+      graphite_out:
+        - when: {multi_value: expand}
+          class: degraded
+          counter: logit.output.metrics.degraded{metric_kind=samples}
+          text: >-
+            Under `multi_value: expand`, sketched, each value weighted by its inverse sample rate,
+            then dotted `.count`, `.sum`, `.min`, `.max`, and `.q0_5` to `.q0_99` datapoints.
+        - class: skipped
+          counter: logit.output.metrics.skipped{metric_kind=samples}
+          text: >-
+            Under `multi_value: skip`, the default, no datapoint is written.
   - kind: set_members
     cells:
       statsd_out:
@@ -589,6 +679,17 @@ rows:
         counter: logit.output.metrics.skipped{metric_kind=set_members}
         text: >-
           The series encoders have no form for set members, so none is written.
+      graphite_out:
+        - when: {multi_value: expand}
+          class: degraded
+          counter: logit.output.metrics.degraded{metric_kind=set_members}
+          text: >-
+            Under `multi_value: expand`, the distinct member count as a `.count` datapoint; the
+            members are gone.
+        - class: skipped
+          counter: logit.output.metrics.skipped{metric_kind=set_members}
+          text: >-
+            Under `multi_value: skip`, the default, no datapoint is written.
 
   # --- summarized kinds ------------------------------------------------------------------------
   - kind: distribution
@@ -629,6 +730,17 @@ rows:
         text: >-
           A sketch under `Mapping::agent`, bin for bin, with its exact count, sum, min, and max;
           `avg` is recomputed from them.
+      graphite_out:
+        - when: {multi_value: expand}
+          class: degraded
+          counter: logit.output.metrics.degraded{metric_kind=distribution}
+          text: >-
+            Under `multi_value: expand`, dotted `.count`, `.sum`, `.min`, `.max`, and `.q0_5` to
+            `.q0_99` datapoints; the sketch is gone, so quantiles from two senders don't merge.
+        - class: skipped
+          counter: logit.output.metrics.skipped{metric_kind=distribution}
+          text: >-
+            Under `multi_value: skip`, the default, no datapoint is written.
   - kind: set
     cells:
       statsd_out:
@@ -659,6 +771,17 @@ rows:
         counter: logit.output.metrics.degraded{reason=set_estimate}
         text: >-
           A series `gauge` of the estimate, the Agent's `s`; the registers are gone.
+      graphite_out:
+        - when: {multi_value: expand}
+          class: degraded
+          counter: logit.output.metrics.degraded{metric_kind=set}
+          text: >-
+            Under `multi_value: expand`, the estimate as a `.count` datapoint; the registers are
+            gone.
+        - class: skipped
+          counter: logit.output.metrics.skipped{metric_kind=set}
+          text: >-
+            Under `multi_value: skip`, the default, no datapoint is written.
   - kind: histogram
     feature: delta
     cells:
@@ -714,6 +837,19 @@ rows:
             A sketch under `Mapping::agent` with its counts spread over the buckets as Datadog's
             exporter spreads them, and the point's count, sum, and average, which datadog_in reads
             back as a distribution.
+      graphite_out:
+        - when: {multi_value: expand}
+          class: degraded
+          counter: logit.output.metrics.degraded{metric_kind=histogram}
+          text: >-
+            Under `multi_value: expand`, dotted `.count`, `.sum`, `.min`, and `.max` datapoints and
+            a `.bucket_<bound>` datapoint per bucket holding that bucket's own count, its
+            temporality dropped. A non-finite `.sum`, `.min`, or `.max` is left off, and the record
+            also counts once as `logit.output.metrics.degraded{reason=non_finite_component}`.
+        - class: skipped
+          counter: logit.output.metrics.skipped{metric_kind=histogram}
+          text: >-
+            Under `multi_value: skip`, the default, no datapoint is written.
   - kind: histogram
     feature: cumulative
     cells:
@@ -758,6 +894,16 @@ rows:
           Datadog's exporter differences a running total into a delta first, so it's dropped,
           with a throttled `unresolved_cumulative` warning; a `cumulative_to_delta` upstream
           makes it a delta histogram.
+      graphite_out:
+        - when: {multi_value: expand}
+          class: degraded
+          counter: logit.output.metrics.degraded{metric_kind=histogram}
+          text: >-
+            Under `multi_value: expand`, the same dotted datapoints as a delta one's.
+        - class: skipped
+          counter: logit.output.metrics.skipped{metric_kind=histogram}
+          text: >-
+            Under `multi_value: skip`, the default, no datapoint is written.
   # A histogram with a `NaN` bucket bound, in any order. A record holding both a `NaN` and a
   # `-Inf` bound reaches this row and `neg_inf_bound`. A sink's other histogram outcomes are its
   # temporality row's.
@@ -813,6 +959,17 @@ rows:
             a bound that keys higher makes a bucket whose upper key is below its lower one, and
             the point is dropped, as the exporter drops it. A `NaN` below every bound that keys
             above 1 would instead be sketched with its count at key 1.
+      graphite_out:
+        - when: {multi_value: expand}
+          class: degraded
+          counter: logit.output.metrics.degraded{metric_kind=histogram}
+          text: >-
+            Under `multi_value: expand`, each bucket is its own dotted datapoint, as for any other
+            bound: `.bucket_NaN` holds that bucket's own count.
+        - class: skipped
+          counter: logit.output.metrics.skipped{metric_kind=histogram}
+          text: >-
+            Under `multi_value: skip`, the default, no datapoint is written.
   # A histogram with a `-Inf` bucket bound.
   - kind: histogram
     feature: neg_inf_bound
@@ -862,6 +1019,17 @@ rows:
             In the sketch, as Datadog's exporter builds it on amd64: Go's `int(-Inf)` keys the
             bound at the Agent's key -1, so the `-Inf` bucket's count lands near `-1e-9` rather
             than below every other bucket, and the sketch's `min` is that bin's value.
+      graphite_out:
+        - when: {multi_value: expand}
+          class: degraded
+          counter: logit.output.metrics.degraded{metric_kind=histogram}
+          text: >-
+            Under `multi_value: expand`, each bucket is its own dotted datapoint, as for any other
+            bound: `.bucket_-inf` holds that bucket's own count.
+        - class: skipped
+          counter: logit.output.metrics.skipped{metric_kind=histogram}
+          text: >-
+            Under `multi_value: skip`, the default, no datapoint is written.
   - kind: exponential_histogram
     feature: delta
     cells:
@@ -902,6 +1070,17 @@ rows:
           Datadog's exporter re-maps them, with the point's count, sum, and average, which
           datadog_in reads back as a distribution; with `send_aggregation_metrics`, the `.count`,
           `.sum`, `.min`, and `.max` series too.
+      graphite_out:
+        - when: {multi_value: expand}
+          class: degraded
+          counter: logit.output.metrics.degraded{metric_kind=exponential_histogram}
+          text: >-
+            Under `multi_value: expand`, dotted `.count`, `.sum`, `.min`, `.max`, and `.zero_count`
+            datapoints. Its buckets aren't written, since each scale would mint its own paths.
+        - class: skipped
+          counter: logit.output.metrics.skipped{metric_kind=exponential_histogram}
+          text: >-
+            Under `multi_value: skip`, the default, no datapoint is written.
   - kind: exponential_histogram
     feature: cumulative
     cells:
@@ -937,6 +1116,17 @@ rows:
           Datadog's exporter can't send a cumulative exponential histogram, so it's dropped, with
           a throttled `unresolved_cumulative` warning; a `cumulative_to_delta` upstream makes it a
           delta one.
+      graphite_out:
+        - when: {multi_value: expand}
+          class: degraded
+          counter: logit.output.metrics.degraded{metric_kind=exponential_histogram}
+          text: >-
+            Under `multi_value: expand`, the same dotted datapoints as a delta one's, and no
+            buckets.
+        - class: skipped
+          counter: logit.output.metrics.skipped{metric_kind=exponential_histogram}
+          text: >-
+            Under `multi_value: skip`, the default, no datapoint is written.
   - kind: summary
     feature: delta
     cells:
@@ -978,6 +1168,17 @@ rows:
           A `<name>.quantile` gauge per quantile tagged `quantile:<q>`, and `.count` (no unit) and
           `.sum` as `count` points, as Datadog's exporter writes a summary it differenced;
           datadog_in reads them back as gauges and counts.
+      graphite_out:
+        - when: {multi_value: expand}
+          class: degraded
+          counter: logit.output.metrics.degraded{metric_kind=summary}
+          text: >-
+            Under `multi_value: expand`, dotted `.count` and `.sum` datapoints and a `.q<quantile>`
+            datapoint per quantile, its temporality dropped.
+        - class: skipped
+          counter: logit.output.metrics.skipped{metric_kind=summary}
+          text: >-
+            Under `multi_value: skip`, the default, no datapoint is written.
   - kind: summary
     feature: cumulative
     cells:
@@ -1011,6 +1212,17 @@ rows:
           as gauges. The running count and sum need differencing first, so they're dropped,
           counted, with a throttled `unresolved_cumulative` warning; a `cumulative_to_delta`
           upstream makes them sendable.
+      graphite_out:
+        - when: {multi_value: expand}
+          class: degraded
+          counter: logit.output.metrics.degraded{metric_kind=summary}
+          text: >-
+            Under `multi_value: expand`, dotted `.count` and `.sum` datapoints and a `.q<quantile>`
+            datapoint per quantile.
+        - class: skipped
+          counter: logit.output.metrics.skipped{metric_kind=summary}
+          text: >-
+            Under `multi_value: skip`, the default, no datapoint is written.
 
   # --- record fields ---------------------------------------------------------------------------
   - kind: record
@@ -1040,6 +1252,10 @@ rows:
         class: exact
         text: >-
           The series' `unit`.
+      graphite_out:
+        class: lost
+        reason: uncounted
+        text: Carbon has no unit; it isn't written or counted.
   - kind: record
     feature: description
     cells:
@@ -1062,6 +1278,10 @@ rows:
         reason: uncounted
         text: >-
           Datadog's intake has no description; it isn't written or counted.
+      graphite_out:
+        class: lost
+        reason: uncounted
+        text: Carbon has no description; it isn't written or counted.
   - kind: record
     feature: start_timestamp
     cells:
@@ -1089,6 +1309,10 @@ rows:
         reason: uncounted
         text: >-
           A series point has no start time; it isn't written or counted.
+      graphite_out:
+        class: lost
+        reason: uncounted
+        text: Carbon has no start time; it isn't written or counted.
   - kind: record
     feature: exemplars
     cells:
@@ -1117,9 +1341,14 @@ rows:
         reason: uncounted
         text: >-
           Datadog's intake has no exemplars; they aren't written or counted.
-  # influxdb_out and otlp_out write a `samples` or `distribution` record only in a lesser form, so
-  # its fields are never compared there and neither has a cell. prometheus_out's summary is a
-  # lesser form too, but its cell names the counter its exposition moves for the unit.
+      graphite_out:
+        class: lost
+        reason: uncounted
+        text: Carbon has no exemplars; they aren't written or counted.
+  # influxdb_out, otlp_out, and graphite_out write a `samples` or `distribution` record only in a
+  # lesser form, so its fields are never compared there and none of them has a cell.
+  # prometheus_out's summary is a lesser form too, but its cell names the counter its exposition
+  # moves for the unit.
   - kind: record
     feature: unit_on_distribution
     cells:
@@ -1142,8 +1371,9 @@ rows:
         text: >-
           Distribution points and sketches have no unit field, so a `samples` or `distribution`
           record's unit is left off, uncounted; only the series routes write one.
-  # statsd_out and influxdb_out write a summary only as dotted series or fields, a lesser kind, and
-  # datadog_out skips it, so its fields are never compared there and none of them has a cell.
+  # statsd_out, influxdb_out, and graphite_out write a summary only as dotted series or fields, a
+  # lesser kind, and datadog_out skips it, so its fields are never compared there and none of them
+  # has a cell.
   - kind: record
     feature: exemplars_on_summary
     cells:
@@ -1159,8 +1389,9 @@ rows:
         text: >-
           A summary has no `_total` or bucket line for an exemplar to sit on, so its exemplars are
           left off, counted.
-  # statsd_out and influxdb_out write a histogram only as dotted series or fields, a lesser kind,
-  # and datadog_out skips it, so its fields are never compared there and none of them has a cell.
+  # statsd_out, influxdb_out, and graphite_out write a histogram only as dotted series or fields, a
+  # lesser kind, and datadog_out skips it, so its fields are never compared there and none of them
+  # has a cell.
   # influxdb_out writes `min` and `max` as fields of that line (the `histogram` rows).
   - kind: record
     feature: min_max
@@ -1203,6 +1434,12 @@ rows:
         counter: logit.output.metrics.skipped{reason=no_recorded_value}
         text: >-
           Datadog has no marker for a point with no recorded value, so it isn't written.
+      graphite_out:
+        class: skipped
+        counter: logit.output.metrics.skipped{reason=no_recorded_value}
+        text: >-
+          Carbon has no marker for a point with no recorded value, so it isn't written, with a
+          throttled `no_recorded_value` warning.
   - kind: record
     feature: no_recorded_value_delta_sum
     cells:
@@ -1236,6 +1473,12 @@ rows:
         counter: logit.output.metrics.skipped{reason=no_recorded_value}
         text: >-
           Datadog has no marker for a point with no recorded value, so it isn't written.
+      graphite_out:
+        class: skipped
+        counter: logit.output.metrics.skipped{reason=no_recorded_value}
+        text: >-
+          Carbon has no marker for a point with no recorded value, so it isn't written, with a
+          throttled `no_recorded_value` warning.
   - kind: record
     feature: no_recorded_value_other_kind
     cells:
@@ -1264,6 +1507,12 @@ rows:
         counter: logit.output.metrics.skipped{reason=no_recorded_value}
         text: >-
           Datadog has no marker for a point with no recorded value, so it isn't written.
+      graphite_out:
+        class: skipped
+        counter: logit.output.metrics.skipped{reason=no_recorded_value}
+        text: >-
+          Carbon has no marker for a point with no recorded value, so it isn't written, with a
+          throttled `no_recorded_value` warning.
   - kind: record
     feature: service_check
     cells:
@@ -1291,6 +1540,9 @@ rows:
         text: >-
           Record 0 of a service check goes to the check route alone, and datadog_in reads it back
           as the same status gauge and carriers.
+      graphite_out:
+        class: exact
+        text: The status gauge; the check's carriers aren't tags.
   # influxdb_out escapes any name, and otlp_out and datadog_out write it as is, so no record reaches
   # this row there and none of them has a cell.
   - kind: record
@@ -1308,8 +1560,16 @@ rows:
         text: >-
           A name is forced into `[a-zA-Z_:][a-zA-Z0-9_:]*`, each other character `_`, so the record
           reads back under the sanitized name, uncounted.
-  # statsd_out, influxdb_out, and datadog_out write no exemplars, and otlp_out writes an
-  # exemplar's keys as is, so no record reaches these two rows there and none of them has a cell.
+      graphite_out:
+        class: normalized
+        reason: path_sanitized
+        counter: logit.output.metrics.normalized{reason=path_sanitized}
+        text: >-
+          Every whitespace, control, `;`, `/`, and `\` character in a path is written as `_`, so the
+          record reads back under the sanitized path, counted once per record.
+  # statsd_out, influxdb_out, datadog_out, and graphite_out write no exemplars, and otlp_out
+  # writes an exemplar's keys as is, so no record reaches these two rows there and none of them
+  # has a cell.
   # A monotonic sum reaches the first, a histogram the second, each only through an exemplar the
   # OpenMetrics writer puts on a line (a counter's first, a histogram's first per bucket); another
   # kind's exemplar has no line to sit on in exposition (record/exemplars).
@@ -1354,8 +1614,13 @@ rows:
         text: >-
           The distribution route has no sample rate, so each value is repeated by its weight,
           the inverse of the rate rounded, and datadog_in reads the values back at rate 1.
+      graphite_out:
+        class: exact
+        text: >-
+          Under `multi_value: expand`, each value is weighted by its inverse rate in the sketch the
+          `samples` row describes.
   # A sink that writes a `samples` record only in a lesser form, as prometheus_out, influxdb_out,
-  # and otlp_out do, never compares its fields, so none of them has a cell.
+  # otlp_out, and graphite_out do, never compares its fields, so none of them has a cell.
   - kind: record
     feature: sample_rate_unweighted
     cells:
@@ -1393,6 +1658,11 @@ rows:
         class: exact
         text: >-
           Each record is its own point at its own timestamp.
+      graphite_out:
+        class: exact
+        text: >-
+          Each record is its own datapoint at its own second. A whisper store keeps one point per
+          path and second, so there a later point in the same second replaces an earlier one.
   - kind: record
     feature: same_instant
     cells:
@@ -1424,6 +1694,11 @@ rows:
         class: exact
         text: >-
           Each record is its own point.
+      graphite_out:
+        class: exact
+        text: >-
+          Each record is its own datapoint; a whisper store keeps the later of two points at one
+          second.
   - kind: record
     feature: same_millisecond
     cells:
@@ -1453,6 +1728,11 @@ rows:
         class: exact
         text: >-
           Each record is its own point; series timestamps are whole seconds.
+      graphite_out:
+        class: exact
+        text: >-
+          Each record is its own datapoint, its timestamp floored to the second; a whisper store
+          keeps the later of two points in one second.
   - kind: record
     feature: non_finite
     cells:
@@ -1475,6 +1755,12 @@ rows:
         counter: logit.output.metrics.dropped{reason=non_finite_value}
         text: >-
           JSON has no `NaN` or infinity, so the point isn't written.
+      graphite_out:
+        class: dropped
+        counter: logit.output.metrics.dropped{reason=unencodable_value}
+        text: >-
+          Carbon has no non-finite value, so the datapoint isn't written, with a throttled
+          `unencodable_value` warning.
 
   # --- attributes ------------------------------------------------------------------------------
   - kind: attributes
@@ -1515,6 +1801,20 @@ rows:
           a tag, which datadog_in reads back as `host.name`. On a Datadog event or service check
           with no non-empty host carrier, `host.name`, else `host`, is the host and not a tag,
           which datadog_in reads back as that carrier.
+      graphite_out:
+        - when: {tags: drop}
+          class: lost
+          counter: logit.output.tags.omitted{reason=dialect}
+          text: >-
+            Under `tags: drop`, no tag is written, counted once per attribute, so series that differ
+            only in their tags write one path.
+        - class: normalized
+          reason: tag_sanitized
+          counter: logit.output.metrics.normalized{reason=tag_sanitized}
+          text: >-
+            A `;name=value` tag. Each `;`, `!`, `^`, `=`, whitespace, and control character in the
+            name, and each `;`, whitespace, and control character and a leading `~` in the value, is
+            written as `_`, counted once per record.
   - kind: attributes
     feature: bool_value
     cells:
@@ -1544,6 +1844,18 @@ rows:
         reason: uncounted
         text: >-
           `true` is a bare `key` tag, read back as `true`; `false` writes no tag at all, uncounted.
+      graphite_out:
+        - when: {tags: drop}
+          class: lost
+          counter: logit.output.tags.omitted{reason=dialect}
+          text: >-
+            Under `tags: drop`, no tag is written, counted once per attribute.
+        - class: normalized
+          reason: stringified
+          counter: logit.output.metrics.normalized{reason=tag_sanitized}
+          text: >-
+            A tag of `true` or `false`, read back as the string. Its name is sanitized as the
+            `string_value` row says, counted once per record as `tag_sanitized`.
   - kind: attributes
     feature: number_value
     cells:
@@ -1574,6 +1886,19 @@ rows:
         reason: stringified
         text: >-
           A `key:<number>` tag, read back as a string.
+      graphite_out:
+        - when: {tags: drop}
+          class: lost
+          counter: logit.output.tags.omitted{reason=dialect}
+          text: >-
+            Under `tags: drop`, no tag is written, counted once per attribute.
+        - class: normalized
+          reason: stringified
+          counter: logit.output.metrics.normalized{reason=tag_sanitized}
+          text: >-
+            A tag of the number's text, an `f64` in its shortest form (`3` for `3.0`), read back as
+            the string. Its name is sanitized as the `string_value` row says, counted once per
+            record as `tag_sanitized`.
   - kind: attributes
     feature: array_value
     cells:
@@ -1606,6 +1931,16 @@ rows:
         text: >-
           One tag per element in order, which datadog_in folds back into an array of strings, so a
           number element reads back as its text.
+      graphite_out:
+        - when: {tags: drop}
+          class: lost
+          counter: logit.output.tags.omitted{reason=dialect}
+          text: >-
+            Under `tags: drop`, no tag is written, counted once per attribute.
+        - class: normalized
+          reason: multi_value
+          counter: logit.output.tags.normalized{reason=multi_value}
+          text: A tag holds one value, so only the last representable element is written, counted.
   - kind: attributes
     feature: map_value
     cells:
@@ -1633,6 +1968,15 @@ rows:
         counter: logit.output.tags.omitted{reason=unrepresentable}
         text: >-
           A tag has no nested form, so a map is left off, counted.
+      graphite_out:
+        - when: {tags: drop}
+          class: lost
+          counter: logit.output.tags.omitted{reason=dialect}
+          text: >-
+            Under `tags: drop`, no tag is written, counted once per attribute.
+        - class: lost
+          counter: logit.output.tags.omitted{reason=unrepresentable}
+          text: A map has no tag form and is left off, counted.
   - kind: attributes
     feature: bytes_value
     cells:
@@ -1660,6 +2004,15 @@ rows:
         counter: logit.output.tags.omitted{reason=unrepresentable}
         text: >-
           A tag has no bytes form, so the value is left off, counted.
+      graphite_out:
+        - when: {tags: drop}
+          class: lost
+          counter: logit.output.tags.omitted{reason=dialect}
+          text: >-
+            Under `tags: drop`, no tag is written, counted once per attribute.
+        - class: lost
+          counter: logit.output.tags.omitted{reason=unrepresentable}
+          text: A bytes value has no tag form and is left off, counted.
   - kind: attributes
     feature: timestamp_value
     cells:
@@ -1688,6 +2041,17 @@ rows:
         reason: stringified
         text: >-
           A `key:<RFC 3339>` tag, read back as a string.
+      graphite_out:
+        - when: {tags: drop}
+          class: lost
+          counter: logit.output.tags.omitted{reason=dialect}
+          text: >-
+            Under `tags: drop`, no tag is written, counted once per attribute.
+        - class: lost
+          counter: logit.output.tags.omitted{reason=unrepresentable}
+          text: A timestamp value has no tag form and is left off, counted.
+  # graphite_in stamps no `_logit.graphite.` carrier, so no record reaches this row at
+  # graphite_out and it has no cell.
   - kind: attributes
     feature: private_carrier
     cells:
@@ -1749,6 +2113,12 @@ rows:
         class: lost
         reason: uncounted
         text: The scrape target is never a tag; it isn't written or counted.
+      graphite_out:
+        class: lost
+        reason: uncounted
+        text: >-
+          Another protocol's `_logit.` carrier isn't a tag and is left off, uncounted, under either
+          `tags:` mode.
   - kind: attributes
     feature: foreign_carrier
     cells:
@@ -1779,6 +2149,12 @@ rows:
           Another protocol's `_logit.` carrier is never a tag; it isn't written or counted. The
           `_logit.statsd.event.*` and `_logit.statsd.service_check.*` carriers are read as the
           Datadog fields they name.
+      graphite_out:
+        class: lost
+        reason: uncounted
+        text: >-
+          Another protocol's `_logit.` carrier isn't a tag and is left off, uncounted, under either
+          `tags:` mode.
   - kind: attributes
     feature: resource_attribute
     cells:
@@ -1809,6 +2185,19 @@ rows:
         reason: resource_as_tag
         text: >-
           Merged into the record's tags, so it reads back as an event attribute.
+      graphite_out:
+        - when: {tags: drop}
+          class: lost
+          counter: logit.output.tags.omitted{reason=dialect}
+          text: >-
+            Under `tags: drop`, no tag is written, counted once per attribute.
+        - class: normalized
+          reason: resource_merged
+          counter: logit.output.metrics.normalized{reason=tag_sanitized}
+          text: >-
+            A tag, read back as an event attribute; on a key the event shares, the event's value
+            wins, uncounted. Its name and value are sanitized as the `string_value` row says,
+            counted once per record as `tag_sanitized`.
   - kind: attributes
     feature: scope
     cells:
@@ -1832,6 +2221,10 @@ rows:
         reason: uncounted
         text: >-
           Datadog has no instrumentation scope; it isn't written or counted.
+      graphite_out:
+        class: lost
+        reason: uncounted
+        text: Carbon has no instrumentation scope; it isn't written or counted.
 
   - kind: attributes
     feature: datadog_carrier_log
@@ -1860,6 +2253,10 @@ rows:
           route has no field for is left off, uncounted, where the metrics routes count one as
           `no_wire_form`; the events route's public form has no field for the Agent envelope's
           `_logit.datadog.agent.hostname`.
+      graphite_out:
+        class: lost
+        reason: uncounted
+        text: Another protocol's `_logit.` carrier isn't a tag and is left off, uncounted.
 
   # --- attributes datadog_out writes from a record's own fields ----------------------------------
   # Every sink reaches these rows; only datadog_out writes the attribute, which its pair decoder
@@ -1886,8 +2283,11 @@ rows:
           A record with no host and no hostless mark leaves with the process hostname as its host,
           which datadog_in reads back as `host.name`, a log's `hostname`, or an event's or service
           check's host carrier; a span keeps its own hostnames.
-  # statsd_out, prometheus_out, and influxdb_out don't write a log on an event with no metrics, so
-  # its fields are never compared there and none of them has a cell.
+      graphite_out:
+        class: exact
+        text: A record with no host leaves with none.
+  # statsd_out, prometheus_out, influxdb_out, and graphite_out don't write a log on an event with
+  # no metrics, so its fields are never compared there and none of them has a cell.
   - kind: attributes
     feature: log_status
     cells:
@@ -1900,8 +2300,8 @@ rows:
         text: >-
           A log with a severity and no `status` attribute leaves with `status` set to the
           severity's name, which datadog_in reads back as a `status` attribute beside the severity.
-  # statsd_out, prometheus_out, and influxdb_out don't write a span, so its fields are never
-  # compared there and none of them has a cell.
+  # statsd_out, prometheus_out, influxdb_out, and graphite_out don't write a span, so its fields
+  # are never compared there and none of them has a cell.
   - kind: attributes
     feature: span_kind
     cells:
@@ -1915,8 +2315,8 @@ rows:
           A span whose kind isn't internal, with no `span.kind` attribute, leaves with
           `meta["span.kind"]`, which datadog_in reads back as a `span.kind` attribute beside the
           kind.
-  # statsd_out, prometheus_out, and influxdb_out don't write a span, so its fields are never
-  # compared there and none of them has a cell.
+  # statsd_out, prometheus_out, influxdb_out, and graphite_out don't write a span, so its fields
+  # are never compared there and none of them has a cell.
   - kind: attributes
     feature: trace_id_high
     cells:
@@ -1963,6 +2363,10 @@ rows:
         text: >-
           One `/api/v1/events` request per event, read back with the same `_logit.statsd.event.*`
           carriers.
+      graphite_out:
+        class: skipped
+        counter: logit.output.events.skipped{reason=no_metrics}
+        text: A log has no carbon form and isn't written.
   - kind: log
     feature: plain
     cells:
@@ -1988,6 +2392,10 @@ rows:
         class: exact
         text: >-
           One object of a `/api/v2/logs` body, its attributes as top-level keys.
+      graphite_out:
+        class: skipped
+        counter: logit.output.events.skipped{reason=no_metrics}
+        text: A log has no carbon form and isn't written.
   - kind: log
     feature: beside_metrics
     cells:
@@ -2016,6 +2424,12 @@ rows:
         text: >-
           The log goes to the logs route, the metrics to theirs, and each reads back as its own
           event.
+      graphite_out:
+        class: lost
+        reason: uncounted
+        text: >-
+          A log on an event that carries metrics is left off while the metrics are written,
+          uncounted.
 
   # --- spans -----------------------------------------------------------------------------------
   - kind: span
@@ -2042,6 +2456,10 @@ rows:
           A span of an `AgentPayload` chunk on the trace route, read back with its kind as a
           `span.kind` attribute and its trace id's high half as `_dd.p.tid` (the `attributes`
           rows).
+      graphite_out:
+        class: skipped
+        counter: logit.output.events.skipped{reason=no_metrics}
+        text: A span has no carbon form and isn't written.
   - kind: span
     feature: no_wire_form
     cells:
@@ -2063,6 +2481,9 @@ rows:
         text: >-
           Datadog has no field for `status: ok`, a status message, `trace_state`, span flags, or
           a dropped count, so each is dropped, counted, and the span reads back without it.
+      graphite_out:
+        class: exact
+        text: Nothing beyond `span/alone`'s outcome.
   - kind: span
     feature: beside_metrics
     cells:
@@ -2090,6 +2511,12 @@ rows:
         text: >-
           The span goes to the trace route, the metrics to theirs, and each reads back as its own
           event; the span loses the fields Datadog has no form for, as `span/alone` says.
+      graphite_out:
+        class: lost
+        reason: uncounted
+        text: >-
+          A span on an event that carries metrics is left off while the metrics are written,
+          uncounted.
 
   # --- events with no metric, log, or span ------------------------------------------------------
   # `string_only` is an InfluxDB point whose fields are all strings, its measurement carrier
@@ -2125,6 +2552,10 @@ rows:
         text: >-
           An event with no metric, log, or span takes none of the intake's routes, so no request
           carries it, uncounted.
+      graphite_out:
+        class: skipped
+        counter: logit.output.events.skipped{reason=no_metrics}
+        text: An event with no metric, log, or span has no datapoint and isn't written.
   - kind: event
     feature: string_only
     cells:
@@ -2157,3 +2588,9 @@ rows:
         text: >-
           An InfluxDB point whose fields are all strings has no metric, so it takes none of the
           intake's routes and no request carries it, uncounted.
+      graphite_out:
+        class: skipped
+        counter: logit.output.events.skipped{reason=no_metrics}
+        text: >-
+          An InfluxDB point whose fields are all strings has no metric, so it has no datapoint and
+          isn't written.

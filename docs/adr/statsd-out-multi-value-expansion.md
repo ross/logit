@@ -1,6 +1,6 @@
 ---
 created: 2026-10-07
-updated: 2026-10-19
+updated: 2026-10-21
 ---
 
 # `statsd_out` multi-value expansion: summarized kinds leave as dotted counter and gauge lines by default
@@ -318,3 +318,12 @@ the quantiles, the order the `Histogram` row already uses. This supersedes "Why 
   "about seven lines" consequence above. The encoder still allocates nothing for them.
 - **Merging downstream.** Like a quantile, a downstream statsd server keeps the last sender's
   `.min` and `.max`, so two senders' extremes don't combine into the true global extreme.
+
+## Amendment: `graphite_out` tags its sums too (2026-10-21)
+
+The Telemetry section's claim that `graphite_out` never tags a `Sum` no longer holds. `graphite_out`
+now counts every `Sum` it writes bare as `logit.output.metrics.degraded{metric_kind}`, using this
+sink's `cumulative_sum` and `non_monotonic_delta_sum`, plus its own `monotonic_delta_sum` for the
+monotonic delta sum this sink writes exact. Under `multi_value: skip` it still writes every sum,
+where this sink skips them ([ADR `graphite-carbon-relay`](graphite-carbon-relay.md)'s 2026-10-21
+amendment).

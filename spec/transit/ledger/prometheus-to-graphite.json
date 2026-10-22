@@ -1,0 +1,24 @@
+{
+  "cells": [
+    {"sink":"graphite_out","row":"attributes/bytes_value","cell":1,"observed":["lost"]},
+    {"sink":"graphite_out","row":"attributes/foreign_carrier","cell":0,"observed":["lost"]},
+    {"sink":"graphite_out","row":"attributes/map_value","cell":1,"observed":["lost"]},
+    {"sink":"graphite_out","row":"attributes/no_host","cell":0,"observed":["exact"]},
+    {"sink":"graphite_out","row":"attributes/number_value","cell":1,"observed":["normalized"]},
+    {"sink":"graphite_out","row":"attributes/prometheus_target","cell":0,"observed":["lost"]},
+    {"sink":"graphite_out","row":"attributes/resource_attribute","cell":1,"observed":["normalized"]},
+    {"sink":"graphite_out","row":"attributes/scope","cell":0,"observed":["lost"]},
+    {"sink":"graphite_out","row":"attributes/string_value","cell":1,"observed":["exact","normalized"]},
+    {"sink":"graphite_out","row":"attributes/timestamp_value","cell":1,"observed":["lost"]},
+    {"sink":"graphite_out","row":"gauge/f64","cell":0,"observed":["exact"]},
+    {"sink":"graphite_out","row":"gauge/negative","cell":0,"observed":["exact"]},
+    {"sink":"graphite_out","row":"histogram/cumulative","cell":1,"observed":["skipped"]},
+    {"sink":"graphite_out","row":"record/description","cell":0,"observed":["lost"]},
+    {"sink":"graphite_out","row":"record/non_finite","cell":0,"observed":["dropped"]},
+    {"sink":"graphite_out","row":"record/unit","cell":0,"observed":["lost"]},
+    {"sink":"graphite_out","row":"sum/cumulative_monotonic","cell":0,"observed":["degraded"]},
+    {"sink":"graphite_out","row":"sum/f64","cell":0,"observed":[]},
+    {"sink":"graphite_out","row":"summary/cumulative","cell":1,"observed":["skipped"]}
+  ],
+  "unspecified": []
+}

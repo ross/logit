@@ -395,7 +395,8 @@ Per pair:
   opcode-allowlisted reader, no new crate dependency). `multi_value: skip | expand` decides the
   metric kinds carbon's one-number-per-datapoint wire can't carry natively, and
   `tags: carbon | drop` decides whether attributes render as carbon's own `;k=v` segment. It's a
-  fixed point modulo its own named normalization list
+  fixed point modulo its own named normalization list, which the transit spec's
+  `graphite-relay` flows check under plaintext, pickle, and `tags: drop`
   ([ADR `graphite-carbon-relay`](docs/adr/graphite-carbon-relay.md),
   [fixtures/graphite-relay.yaml](fixtures/graphite-relay.yaml)).
 - **`datadog_in -> datadog_out`** (Datadog's intake API): `crates/logit-proto/src/datadog/` holds
@@ -878,9 +879,9 @@ the operator-facing account of all of this.
   gap tables, so a row changes in `mapping.yaml`, never in a region (the README's "Generated
   docs"). `script/transit gen|check|docs|coverage` wraps both; `script/test` runs them.
   Cases come from `statsd_in`, `influxdb_in`, `prometheus_in`'s scrape, `datadog_in`,
-  `collectd_in`, and `otlp_in`'s metrics; the columns are `statsd_out`, `prometheus_out`,
-  `influxdb_out`, `otlp_out`, and `datadog_out`, through the statsd, InfluxDB, Prometheus, Datadog, and OTLP
-  like pairs and 36 cross-protocol flows ([ADR `transit-spec`](docs/adr/transit-spec.md), [plan](docs/plans/transit-spec.md)).
+  `collectd_in`, `otlp_in`'s metrics, and `graphite_in`; the columns are `statsd_out`,
+  `prometheus_out`, `influxdb_out`, `otlp_out`, `datadog_out`, and `graphite_out`, through the
+  statsd, InfluxDB, Prometheus, Datadog, OTLP, and Graphite like pairs and 50 cross-protocol flows ([ADR `transit-spec`](docs/adr/transit-spec.md), [plan](docs/plans/transit-spec.md)).
 
 ### Not yet built
 

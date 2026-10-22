@@ -1,0 +1,6 @@
+# A recorded CPython 3.12 connection, read in place from testdata/interop/: one length-prefixed
+# protocol-2 frame of four datapoints, with an integer value, a fractional timestamp, and a
+# negative value.
+wire: ../../../../testdata/interop/graphite/graphite-pickle-p2-000.raw
+protocol: pickle
+exercises: [pickle_frame, pickle_protocol_2, integer_value, negative_value, fractional_timestamp]

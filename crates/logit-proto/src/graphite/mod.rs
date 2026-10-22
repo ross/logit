@@ -70,33 +70,147 @@
 //! carry, or a kind the operator chose to skip, is `logit.output.metrics.skipped` instead, tagged
 //! `{metric_kind=…}` for a whole kind, the shape every other sink uses.
 //!
+//! The tables below are generated from `graphite_out`'s column of `spec/transit/mapping.yaml`, the
+//! canonical copy, by `script/transit docs`, and a test fails when they're stale: change the table
+//! there, not here. "Consumer" means `graphite_in` reading the lines or frames back.
+//!
+//! <!-- transit:doc:graphite_out -->
+//!
+//! Per metric kind, and per record feature that decides a record's fate:
+//!
+//! | Row | Class | Reason or counter | What a consumer sees |
+//! |---|---|---|---|
+//! | `sum/delta_monotonic` | degraded | `logit.output.metrics.degraded{metric_kind=monotonic_delta_sum}` | The bare value as a datapoint, its temporality and monotonicity dropped, which graphite_in reads back as a gauge. |
+//! | `sum/delta_nonmonotonic` | degraded | `logit.output.metrics.degraded{metric_kind=non_monotonic_delta_sum}` | The bare value, read back as a gauge, as for a monotonic delta sum. |
+//! | `sum/cumulative_monotonic` | degraded | `logit.output.metrics.degraded{metric_kind=cumulative_sum}` | The running total as a bare value, read back as a gauge. |
+//! | `sum/cumulative_nonmonotonic` | degraded | `logit.output.metrics.degraded{metric_kind=cumulative_sum}` | The running total as a bare value, read back as a gauge. |
+//! | `sum/f64` | exact | -- | The value is written as the shortest float that reads back to the same bits. |
+//! | `sum/i64` | normalized | `f64_value` | Plaintext writes every digit and pickle the nearest `f64`, and graphite_in reads either back as a float, rounded beyond 2^53. |
+//! | `sum/u64` | normalized | `f64_value` | Plaintext writes every digit and pickle the nearest `f64`, and graphite_in reads either back as a float, rounded beyond 2^53. |
+//! | `sum/bool` | normalized | `bool_value`; `logit.output.metrics.normalized{reason=bool_value}` | A boolean is written as `1` or `0` and reads back as that number. |
+//! | `gauge/f64` | exact | -- | A `path value timestamp` line, or a pickled datapoint. |
+//! | `gauge/i64` | normalized | `f64_value` | Plaintext writes every digit and pickle the nearest `f64`, and graphite_in reads either back as a float, rounded beyond 2^53. |
+//! | `gauge/u64` | normalized | `f64_value` | Plaintext writes every digit and pickle the nearest `f64`, and graphite_in reads either back as a float, rounded beyond 2^53. |
+//! | `gauge/bool` | normalized | `bool_value`; `logit.output.metrics.normalized{reason=bool_value}` | A boolean is written as `1` or `0` and reads back as that number. |
+//! | `gauge/negative` | exact | -- | A negative value, written as is. |
+//! | `gauge_delta/f64` | dropped | `logit.output.metrics.dropped{reason=unresolved_gauge_delta}` | Carbon has no relative gauge, so an unresolved adjustment is dropped, with a throttled `gauge_delta_unresolved` warning; an `aggregate` upstream resolves it into a gauge. |
+//! | `gauge_delta/i64` | dropped | `logit.output.metrics.dropped{reason=unresolved_gauge_delta}` | Dropped, as for a float adjustment. |
+//! | `gauge_delta/u64` | dropped | `logit.output.metrics.dropped{reason=unresolved_gauge_delta}` | Dropped, as for a float adjustment. |
+//! | `gauge_delta/bool` | dropped | `logit.output.metrics.dropped{reason=unresolved_gauge_delta}` | Dropped, as for a float adjustment. |
+//! | `samples`, under `multi_value: expand` | degraded | `logit.output.metrics.degraded{metric_kind=samples}` | Under `multi_value: expand`, sketched, each value weighted by its inverse sample rate, then dotted `.count`, `.sum`, `.min`, `.max`, and `.q0_5` to `.q0_99` datapoints. |
+//! | `samples`, otherwise | skipped | `logit.output.metrics.skipped{metric_kind=samples}` | Under `multi_value: skip`, the default, no datapoint is written. |
+//! | `set_members`, under `multi_value: expand` | degraded | `logit.output.metrics.degraded{metric_kind=set_members}` | Under `multi_value: expand`, the distinct member count as a `.count` datapoint; the members are gone. |
+//! | `set_members`, otherwise | skipped | `logit.output.metrics.skipped{metric_kind=set_members}` | Under `multi_value: skip`, the default, no datapoint is written. |
+//! | `distribution`, under `multi_value: expand` | degraded | `logit.output.metrics.degraded{metric_kind=distribution}` | Under `multi_value: expand`, dotted `.count`, `.sum`, `.min`, `.max`, and `.q0_5` to `.q0_99` datapoints; the sketch is gone, so quantiles from two senders don't merge. |
+//! | `distribution`, otherwise | skipped | `logit.output.metrics.skipped{metric_kind=distribution}` | Under `multi_value: skip`, the default, no datapoint is written. |
+//! | `set`, under `multi_value: expand` | degraded | `logit.output.metrics.degraded{metric_kind=set}` | Under `multi_value: expand`, the estimate as a `.count` datapoint; the registers are gone. |
+//! | `set`, otherwise | skipped | `logit.output.metrics.skipped{metric_kind=set}` | Under `multi_value: skip`, the default, no datapoint is written. |
+//! | `histogram/delta`, under `multi_value: expand` | degraded | `logit.output.metrics.degraded{metric_kind=histogram}` | Under `multi_value: expand`, dotted `.count`, `.sum`, `.min`, and `.max` datapoints and a `.bucket_<bound>` datapoint per bucket holding that bucket's own count, its temporality dropped. A non-finite `.sum`, `.min`, or `.max` is left off, and the record also counts once as `logit.output.metrics.degraded{reason=non_finite_component}`. |
+//! | `histogram/delta`, otherwise | skipped | `logit.output.metrics.skipped{metric_kind=histogram}` | Under `multi_value: skip`, the default, no datapoint is written. |
+//! | `histogram/cumulative`, under `multi_value: expand` | degraded | `logit.output.metrics.degraded{metric_kind=histogram}` | Under `multi_value: expand`, the same dotted datapoints as a delta one's. |
+//! | `histogram/cumulative`, otherwise | skipped | `logit.output.metrics.skipped{metric_kind=histogram}` | Under `multi_value: skip`, the default, no datapoint is written. |
+//! | `histogram/nan_bound`, under `multi_value: expand` | degraded | `logit.output.metrics.degraded{metric_kind=histogram}` | Under `multi_value: expand`, each bucket is its own dotted datapoint, as for any other bound: `.bucket_NaN` holds that bucket's own count. |
+//! | `histogram/nan_bound`, otherwise | skipped | `logit.output.metrics.skipped{metric_kind=histogram}` | Under `multi_value: skip`, the default, no datapoint is written. |
+//! | `histogram/neg_inf_bound`, under `multi_value: expand` | degraded | `logit.output.metrics.degraded{metric_kind=histogram}` | Under `multi_value: expand`, each bucket is its own dotted datapoint, as for any other bound: `.bucket_-inf` holds that bucket's own count. |
+//! | `histogram/neg_inf_bound`, otherwise | skipped | `logit.output.metrics.skipped{metric_kind=histogram}` | Under `multi_value: skip`, the default, no datapoint is written. |
+//! | `exponential_histogram/delta`, under `multi_value: expand` | degraded | `logit.output.metrics.degraded{metric_kind=exponential_histogram}` | Under `multi_value: expand`, dotted `.count`, `.sum`, `.min`, `.max`, and `.zero_count` datapoints. Its buckets aren't written, since each scale would mint its own paths. |
+//! | `exponential_histogram/delta`, otherwise | skipped | `logit.output.metrics.skipped{metric_kind=exponential_histogram}` | Under `multi_value: skip`, the default, no datapoint is written. |
+//! | `exponential_histogram/cumulative`, under `multi_value: expand` | degraded | `logit.output.metrics.degraded{metric_kind=exponential_histogram}` | Under `multi_value: expand`, the same dotted datapoints as a delta one's, and no buckets. |
+//! | `exponential_histogram/cumulative`, otherwise | skipped | `logit.output.metrics.skipped{metric_kind=exponential_histogram}` | Under `multi_value: skip`, the default, no datapoint is written. |
+//! | `summary/delta`, under `multi_value: expand` | degraded | `logit.output.metrics.degraded{metric_kind=summary}` | Under `multi_value: expand`, dotted `.count` and `.sum` datapoints and a `.q<quantile>` datapoint per quantile, its temporality dropped. |
+//! | `summary/delta`, otherwise | skipped | `logit.output.metrics.skipped{metric_kind=summary}` | Under `multi_value: skip`, the default, no datapoint is written. |
+//! | `summary/cumulative`, under `multi_value: expand` | degraded | `logit.output.metrics.degraded{metric_kind=summary}` | Under `multi_value: expand`, dotted `.count` and `.sum` datapoints and a `.q<quantile>` datapoint per quantile. |
+//! | `summary/cumulative`, otherwise | skipped | `logit.output.metrics.skipped{metric_kind=summary}` | Under `multi_value: skip`, the default, no datapoint is written. |
+//! | `record/no_recorded_value` | skipped | `logit.output.metrics.skipped{reason=no_recorded_value}` | Carbon has no marker for a point with no recorded value, so it isn't written, with a throttled `no_recorded_value` warning. |
+//! | `record/no_recorded_value_delta_sum` | skipped | `logit.output.metrics.skipped{reason=no_recorded_value}` | Carbon has no marker for a point with no recorded value, so it isn't written, with a throttled `no_recorded_value` warning. |
+//! | `record/no_recorded_value_other_kind` | skipped | `logit.output.metrics.skipped{reason=no_recorded_value}` | Carbon has no marker for a point with no recorded value, so it isn't written, with a throttled `no_recorded_value` warning. |
+//! | `record/service_check` | exact | -- | The status gauge; the check's carriers aren't tags. |
+//! | `record/name_unsafe` | normalized | `path_sanitized`; `logit.output.metrics.normalized{reason=path_sanitized}` | Every whitespace, control, `;`, `/`, and `\` character in a path is written as `_`, so the record reads back under the sanitized path, counted once per record. |
+//! | `record/sample_rate` | exact | -- | Under `multi_value: expand`, each value is weighted by its inverse rate in the sketch the `samples` row describes. |
+//! | `record/superseded` | exact | -- | Each record is its own datapoint at its own second. A whisper store keeps one point per path and second, so there a later point in the same second replaces an earlier one. |
+//! | `record/same_instant` | exact | -- | Each record is its own datapoint; a whisper store keeps the later of two points at one second. |
+//! | `record/same_millisecond` | exact | -- | Each record is its own datapoint, its timestamp floored to the second; a whisper store keeps the later of two points in one second. |
+//! | `record/non_finite` | dropped | `logit.output.metrics.dropped{reason=unencodable_value}` | Carbon has no non-finite value, so the datapoint isn't written, with a throttled `unencodable_value` warning. |
+//! | `log/dogstatsd_event` | skipped | `logit.output.events.skipped{reason=no_metrics}` | A log has no carbon form and isn't written. |
+//! | `log/plain` | skipped | `logit.output.events.skipped{reason=no_metrics}` | A log has no carbon form and isn't written. |
+//! | `span/alone` | skipped | `logit.output.events.skipped{reason=no_metrics}` | A span has no carbon form and isn't written. |
+//! | `span/no_wire_form` | exact | -- | Nothing beyond `span/alone`'s outcome. |
+//! | `event/attributes_only` | skipped | `logit.output.events.skipped{reason=no_metrics}` | An event with no metric, log, or span has no datapoint and isn't written. |
+//! | `event/string_only` | skipped | `logit.output.events.skipped{reason=no_metrics}` | An InfluxDB point whose fields are all strings has no metric, so it has no datapoint and isn't written. |
+//!
+//! Per field of a record that reaches the wire, attribute shape, and payload beside metrics:
+//!
+//! | Row | Class | Reason or counter | What a consumer sees |
+//! |---|---|---|---|
+//! | `record/unit` | lost | uncounted | Carbon has no unit; it isn't written or counted. |
+//! | `record/description` | lost | uncounted | Carbon has no description; it isn't written or counted. |
+//! | `record/start_timestamp` | lost | uncounted | Carbon has no start time; it isn't written or counted. |
+//! | `record/exemplars` | lost | uncounted | Carbon has no exemplars; they aren't written or counted. |
+//! | `attributes/string_value`, under `tags: drop` | lost | `logit.output.tags.omitted{reason=dialect}` | Under `tags: drop`, no tag is written, counted once per attribute, so series that differ only in their tags write one path. |
+//! | `attributes/string_value`, otherwise | normalized | `tag_sanitized`; `logit.output.metrics.normalized{reason=tag_sanitized}` | A `;name=value` tag. Each `;`, `!`, `^`, `=`, whitespace, and control character in the name, and each `;`, whitespace, and control character and a leading `~` in the value, is written as `_`, counted once per record. |
+//! | `attributes/bool_value`, under `tags: drop` | lost | `logit.output.tags.omitted{reason=dialect}` | Under `tags: drop`, no tag is written, counted once per attribute. |
+//! | `attributes/bool_value`, otherwise | normalized | `stringified`; `logit.output.metrics.normalized{reason=tag_sanitized}` | A tag of `true` or `false`, read back as the string. Its name is sanitized as the `string_value` row says, counted once per record as `tag_sanitized`. |
+//! | `attributes/number_value`, under `tags: drop` | lost | `logit.output.tags.omitted{reason=dialect}` | Under `tags: drop`, no tag is written, counted once per attribute. |
+//! | `attributes/number_value`, otherwise | normalized | `stringified`; `logit.output.metrics.normalized{reason=tag_sanitized}` | A tag of the number's text, an `f64` in its shortest form (`3` for `3.0`), read back as the string. Its name is sanitized as the `string_value` row says, counted once per record as `tag_sanitized`. |
+//! | `attributes/array_value`, under `tags: drop` | lost | `logit.output.tags.omitted{reason=dialect}` | Under `tags: drop`, no tag is written, counted once per attribute. |
+//! | `attributes/array_value`, otherwise | normalized | `multi_value`; `logit.output.tags.normalized{reason=multi_value}` | A tag holds one value, so only the last representable element is written, counted. |
+//! | `attributes/map_value`, under `tags: drop` | lost | `logit.output.tags.omitted{reason=dialect}` | Under `tags: drop`, no tag is written, counted once per attribute. |
+//! | `attributes/map_value`, otherwise | lost | `logit.output.tags.omitted{reason=unrepresentable}` | A map has no tag form and is left off, counted. |
+//! | `attributes/bytes_value`, under `tags: drop` | lost | `logit.output.tags.omitted{reason=dialect}` | Under `tags: drop`, no tag is written, counted once per attribute. |
+//! | `attributes/bytes_value`, otherwise | lost | `logit.output.tags.omitted{reason=unrepresentable}` | A bytes value has no tag form and is left off, counted. |
+//! | `attributes/timestamp_value`, under `tags: drop` | lost | `logit.output.tags.omitted{reason=dialect}` | Under `tags: drop`, no tag is written, counted once per attribute. |
+//! | `attributes/timestamp_value`, otherwise | lost | `logit.output.tags.omitted{reason=unrepresentable}` | A timestamp value has no tag form and is left off, counted. |
+//! | `attributes/prometheus_target` | lost | uncounted | Another protocol's `_logit.` carrier isn't a tag and is left off, uncounted, under either `tags:` mode. |
+//! | `attributes/foreign_carrier` | lost | uncounted | Another protocol's `_logit.` carrier isn't a tag and is left off, uncounted, under either `tags:` mode. |
+//! | `attributes/resource_attribute`, under `tags: drop` | lost | `logit.output.tags.omitted{reason=dialect}` | Under `tags: drop`, no tag is written, counted once per attribute. |
+//! | `attributes/resource_attribute`, otherwise | normalized | `resource_merged`; `logit.output.metrics.normalized{reason=tag_sanitized}` | A tag, read back as an event attribute; on a key the event shares, the event's value wins, uncounted. Its name and value are sanitized as the `string_value` row says, counted once per record as `tag_sanitized`. |
+//! | `attributes/scope` | lost | uncounted | Carbon has no instrumentation scope; it isn't written or counted. |
+//! | `attributes/datadog_carrier_log` | lost | uncounted | Another protocol's `_logit.` carrier isn't a tag and is left off, uncounted. |
+//! | `attributes/no_host` | exact | -- | A record with no host leaves with none. |
+//! | `log/beside_metrics` | lost | uncounted | A log on an event that carries metrics is left off while the metrics are written, uncounted. |
+//! | `span/beside_metrics` | lost | uncounted | A span on an event that carries metrics is left off while the metrics are written, uncounted. |
+//!
+//! <!-- transit:end -->
+//!
+//! The rest of the encode mapping is hand-written: rules the spec has no row for, and details its
+//! cells don't state.
+//!
 //! | Model | Wire | Counter |
 //! |---|---|---|
 //! | event with N metrics | N datapoints, in `MetricList` order | -- |
 //! | `MetricRecord::name`, sanitized | the path, verbatim | -- |
-//! | `Sum{Delta\|Cumulative, monotonic\|!monotonic}` | the bare value | -- (normalization 12) |
-//! | `Gauge(v)`, finite | `path v ts` | -- |
-//! | an `I64`/`U64` value | plaintext: the integer's own digits, exact above 2⁵³; pickle: its nearest `f64`, as a pickled value is a Python float | -- |
-//! | a `Bool` value | `1` or `0` | `logit.output.metrics.normalized{reason="bool_value"}` |
-//! | `Gauge` NaN / ±inf, or any non-finite value | dropped | `{reason="unencodable_value"}` + diag `unencodable_value` |
-//! | any kind flagged [`logit_core::MetricRecord::FLAG_NO_RECORDED_VALUE`] | skipped | `logit.output.metrics.skipped{reason="no_recorded_value"}` + diag `no_recorded_value` |
-//! | `GaugeDelta` | dropped | `{reason="unresolved_gauge_delta"}` + diag `gauge_delta_unresolved` |
-//! | `Samples`/`Distribution`/`Histogram`/`ExponentialHistogram`/`Summary`/`Set`/`SetMembers` under [`MultiValue::Skip`] (the default) | skipped, one exhaustive `match` arm each, no wildcard | `logit.output.metrics.skipped{metric_kind="samples"\|"distribution"\|"histogram"\|"exponential_histogram"\|"summary"\|"set"\|"set_members"}` |
-//! | the same seven kinds under [`MultiValue::Expand`] | the sub-path table in [`crate::multi_value`] | `logit.output.metrics.degraded{metric_kind=…}`, **once per record** however many sub-paths it produced |
+//! | any kind flagged [`logit_core::MetricRecord::FLAG_NO_RECORDED_VALUE`], tested before the kind | skipped | `logit.output.metrics.skipped{reason="no_recorded_value"}` + diag `no_recorded_value` |
+//! | `Samples`, `Distribution`, `Histogram`, `ExponentialHistogram`, `Summary`, `Set`, and `SetMembers` under [`MultiValue::Expand`] | the sub-path table in [`crate::multi_value`] | `logit.output.metrics.degraded{metric_kind=…}`, **once per record** however many sub-paths it produced |
 //! | `event.timestamp.div_euclid(1_000_000_000) <= 0` | dropped | `{reason="unencodable_timestamp"}` + diag `unencodable_timestamp` |
 //! | attributes under [`Tags::Carbon`] (the default) | `;name=value`, ascending **rendered** name | -- |
-//! | attributes under [`Tags::Drop`] | no tag segment at all | `logit.output.tags.omitted{reason="dialect"}`, once per attribute |
-//! | `Value::Str/I64/U64/F64/Bool` | stringified | -- |
-//! | `Value::Array` | the **last** representable element | `logit.output.tags.normalized{reason="multi_value"}`, once per attribute |
-//! | `Value::Null/Bytes/Timestamp/Map`, or an `Array` with no representable element | the tag is omitted | `logit.output.tags.omitted{reason="unrepresentable"}` |
+//! | a `Value::Null`, or an `Array` with no representable element | the tag is omitted | `logit.output.tags.omitted{reason="unrepresentable"}` |
 //! | a forbidden byte in the path / a tag name / a tag value | `_` | `logit.output.metrics.normalized{reason="path_sanitized"\|"tag_sanitized"}`, once per record per reason |
 //! | a tag whose name or value is empty after sanitizing | the tag is omitted | `logit.output.tags.omitted{reason="empty"}` |
 //! | two tags colliding after rendering | the one whose **original** name sorts first is kept | `logit.output.tags.omitted{reason="collision"}` |
 //! | a path empty after sanitizing | dropped | `{reason="empty_name"}` |
 //! | a plaintext line longer than `max_packet_bytes` | dropped whole, never split | `{reason="oversize_line"}` + diag `oversize_line` |
 //! | a single pickle datapoint larger than `max_frame_bytes` | dropped whole, never split | `{reason="oversize_datapoint"}` + diag `oversize_datapoint` |
-//! | `MetricRecord`'s `unit`, `description`, `start_timestamp`, `exemplars`; `EventBatch::scope`; `Resource::schema_url` | dropped | none; `docs/known-gaps/mappings.md` rows -- carbon has no field for any of them |
-//! | an event with no metrics at all | skipped | [`EncodeStats::skipped_no_metrics`], no counter (nothing was lost) |
+//! | `Resource::schema_url` and every `dropped_attributes_count` | dropped | none; carbon has no field for either |
+//! | an event with no metrics at all (a log, a span, or attributes alone) | skipped, and its log, span, or attributes are lost | `logit.output.events.skipped{reason="no_metrics"}`, once per event, no diagnostic |
+//! | a non-finite component of a record under [`MultiValue::Expand`] | that sub-path is left off, and the rest are written | `logit.output.metrics.degraded{reason="non_finite_component"}`, once per record however many it left off, beside the record's `{metric_kind=…}` |
+//!
+//! Why the wire forces the generated rows:
+//!
+//! - A carbon datapoint is one number at one second: no bucket, quantile, sketch, or member-set
+//!   form. `multi_value: skip` is the default because the alternative is a naming convention the
+//!   far end doesn't know: `x.q0_99` is a series called `x.q0_99`, not a quantile of `x`.
+//!   `expand` is opt-in and named, and loses mergeability: two relays' `.count` series can't
+//!   recombine like their sketches. An `ExponentialHistogram`'s buckets aren't expanded, since
+//!   materializing `base^i` bounds would mint unbounded paths from one record.
+//! - A `Sum`'s bare value can't be misread, since carbon has no opinion on temporality or
+//!   monotonicity, so dropping both is normalization 12 rather than a skip. `otlp_in ->
+//!   graphite_out -> graphite_in` turns a cumulative counter into a gauge. The record counts
+//!   `metrics.degraded` under `statsd_out`'s `metric_kind` tags, plus `monotonic_delta_sum`,
+//!   which `statsd_out` writes exact. Unlike `statsd_out`, `multi_value: skip` still writes it.
+//! - Carbon drops a `NaN` on receipt and whisper can't store an infinity, and substituting zero
+//!   fabricates a reading, so a non-finite value is dropped.
+//! - Carbon has no "no reading this interval" marker: Graphite's "no data" is an absent
+//!   datapoint, and writing a flagged record's default payload would report a sample nobody sent.
 //!
 //! Every private `_logit.` attribute is **skipped uncounted**, as `influxdb_out` skips it: it is
 //! a carrier, not a tag
@@ -104,6 +218,11 @@
 //! Resource attributes *do* become tags (as at `influxdb_out`/`statsd_out`); a `graphite_in`
 //! resource is empty, so the pair stays a fixed point, and cross-protocol it is a
 //! `docs/known-gaps/mappings.md` row.
+//!
+//! A tagged carbon 1.1.10 replaces a tag named `name` with the metric's path
+//! (`TaggedSeries.parse_carbon`), uncounted. `graphite_out` writes the tag as any other, so to keep
+//! its value, rename or remove the attribute at the source, or ahead of the sink with a `remove` or
+//! `lua` component.
 //!
 //! ## Sanitization
 //!
@@ -131,8 +250,8 @@
 //! [`crate::multi_value`]'s module doc is the canonical table of the dotted sub-paths each kind
 //! expands into, with the rules behind it: every expansion adds at least one suffix, a sketch's
 //! `.sum`, `.min`, and `.max` come from its tracked statistics rather than its bins, non-finite
-//! values are skipped, and number tokens are injective. The encoder appends each sub-path's suffix
-//! to the sanitized path, then the tag segment.
+//! values are skipped and reported to the encoder, and number tokens are injective. The encoder
+//! appends each sub-path's suffix to the sanitized path, then the tag segment.
 //!
 //! ## `Protocol` and `Meta`
 //!
@@ -176,10 +295,12 @@
 //!    line including the last, a UDP datagram terminates none.
 //! 10. Sanitizer substitutions, empty-tag drops and rendered-name collision drops (all counted).
 //! 11. [`Tags::Drop`] drops the tag set entirely (counted).
-//! 12. A `Sum`'s temporality and monotonicity are dropped; the value goes on the wire bare. A
-//!     **named normalization, not a skip**: unlike `prometheus_out`, which drops a delta `Sum`
-//!     because exposition has a competing cumulative meaning, carbon's wire has no opinion on
-//!     either, so the number is carried faithfully and only the model's extra facts are lost.
+//! 12. A `Sum`'s temporality and monotonicity are dropped; the value goes on the wire bare, counted
+//!     `logit.output.metrics.degraded{metric_kind=…}` once per record. A **named normalization,
+//!     not a skip**: unlike `prometheus_out`, which drops a delta `Sum` because exposition has a
+//!     competing cumulative meaning, carbon's wire has no opinion on either, so the number is
+//!     carried faithfully and only the model's extra facts are lost. `graphite_in` decodes only
+//!     gauges, so the like pair never reaches it.
 //! 13. A pickle sender's spelling (protocol version, opcode choice, memo use) leaves as
 //!     `graphite_out`'s protocol-2 writer spelling. A protocol-0, protocol-1, or protocol-5 sender
 //!     is re-spelled, and no decoded field changes.
