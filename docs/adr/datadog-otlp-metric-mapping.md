@@ -321,11 +321,16 @@ the record is still delivered without one of its fields, per
 **A unit `datadog_in` decoded is never mapped.** Datadog's unit catalog holds names the
 translator never produces (`percent_nano`, `millicore`, `degree fahrenheit`), and an Agent or a
 client may send any of them, so the pass-through set alone would drop them on the
-`datadog_in -> datadog_out` relay. `datadog_in` marks a series batch whose records carry a unit
-with the private resource attribute `_logit.datadog.units: datadog`, and `datadog_out` writes the
-unit of an event under that mark as it is. The mark sits on the batch resource rather than on
-each record because every series in a batch comes from one decode, and a batch with no unit gets
-none, so a unit-less decode allocates nothing more. It's private, so every other sink ignores it.
+`datadog_in -> datadog_out` relay. `datadog_in` marks every series batch it decodes (v1, v2
+JSON, v2 protobuf) with the private resource attribute `_logit.datadog.units: datadog`, and
+`datadog_out` writes the unit of an event under that mark as it is. The mark sits on the batch
+resource rather than on each record because every series in a batch comes from one decode. It's
+on every series batch, a unit-less one included, because `aggregate` and `cumulative_to_delta`
+key a series on its resource: a mark on some payloads and not others would split one series into
+two points per window, which a Datadog `count` loses uncounted. Distribution points and sketches
+carry no unit, so their batches carry no mark; each route still gives one source one resource.
+The mark covers the whole batch, so a unit a later stage sets on a record of a marked batch also
+leaves unmapped. It's private, so every other sink ignores it.
 It survives every stage that keeps the batch resource: `aggregate` groups records by resource and
 emits each group under its own, and `keep`, `remove`, and `set` leave other resource attributes
 alone. A stage that builds a new resource drops it, and `datadog_out` then maps those units as

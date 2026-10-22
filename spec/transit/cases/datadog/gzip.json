@@ -1,1 +1,1 @@
-{"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"batch.records","kind":"sum","value":250.0,"temporality":"delta","monotonic":true}],"attributes":{"env":"prod","host.name":"etl-1","pipeline":"nightly"}}
+{"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"batch.records","kind":"sum","value":250.0,"temporality":"delta","monotonic":true}],"attributes":{"env":"prod","host.name":"etl-1","pipeline":"nightly"},"resource":{"attributes":{"_logit.datadog.units":"datadog"}}}

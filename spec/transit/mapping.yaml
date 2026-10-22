@@ -2310,8 +2310,8 @@ rows:
         text: >-
           A `_logit.datadog.*` carrier rides in its own wire field; one the route has no field for
           is left off, counted. `_logit.datadog.units`, which marks a decoded batch's units as
-          Datadog names, is read and not written; datadog_in stamps it again on a batch with a
-          unit.
+          Datadog names, is read and not written; datadog_in stamps it again on every series
+          batch.
   - kind: attributes
     feature: prometheus_target
     cells:
