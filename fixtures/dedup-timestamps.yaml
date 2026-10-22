@@ -1,29 +1,28 @@
-# Relays an OpenTelemetry SDK's metrics to a remote-write receiver with each point's own
-# timestamp: OTLP/HTTP in, `dedup_timestamps` collapsing two readings of one series in one
-# millisecond, and `prometheus_out` sending remote-write. A remote-write series holds one sample
-# per millisecond, and a receiver keeps the first of two in one request and drops the second
-# silently (docs/adr/dedup-timestamps-transform.md). In front of it, the later reading survives
-# and deltas are summed.
+# Relays statsd gauges to a remote-write receiver with each reading's own arrival time:
+# `statsd_in`, `dedup_timestamps`, then `prometheus_out` sending remote-write. statsd stamps every
+# line on arrival, so one datagram's readings of one gauge land in one millisecond, and
+# remote-write holds one sample per series per millisecond
+# (docs/adr/dedup-timestamps-transform.md).
 #
-# Place `dedup_timestamps` last before the sink: a stage after it can make two series equal
-# again. It works within one batch, so two batches' readings of one instant both reach the
-# receiver. Use `precision: 1s` instead in front of `datadog_out`.
+# Without `dedup_timestamps`, `prometheus_out` collapses those readings itself, keeping the
+# latest, and counts each lost one only as
+# `logit.output.metrics.degraded{reason="sub_ms_collapsed"}`. With it, the collapse happens here,
+# under the rules you chose: the latest gauge wins, delta readings are summed instead of all but
+# one being lost, and each reading removed is counted as an intended outcome
+# (`logit.transform.metrics.absorbed` or `.merged`).
 #
-# A delta counter still needs `aggregate` with `temporality: cumulative` upstream, as in
-# fixtures/prometheus-remote-write-send.yaml: `prometheus_out` drops a delta `Sum`. An SDK left at
-# its default cumulative temporality needs nothing more.
+# Keep it last before the sink: a stage after it can make two series equal again. statsd
+# counters are deltas, which `prometheus_out` drops, counted; a counter flow needs `aggregate`
+# with `temporality: cumulative` instead (fixtures/prometheus-remote-write-send.yaml).
 components:
-  otel:
-    type: otlp_in
-    # No authentication on this listener: bind loopback or pod-local, or front it with something
-    # that authenticates.
-    bind: 127.0.0.1:4318
-    protocol: http
+  app_metrics:
+    type: statsd_in
+    bind: 127.0.0.1:8125
 
   one_per_ms:
     type: dedup_timestamps
-    sources: [otel]
-    # Required: remote-write's resolution.
+    sources: [app_metrics]
+    # Required: remote-write's resolution. `1s` in front of `datadog_out`.
     precision: 1ms
 
   remote_write:
