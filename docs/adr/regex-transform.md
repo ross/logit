@@ -1,6 +1,6 @@
 ---
 created: 2026-09-07
-updated: 2026-09-07
+updated: 2026-10-21
 ---
 
 # `regex`: named captures into attributes, and taking the `regex` crate
@@ -122,9 +122,10 @@ Compiling at resolve time is what keeps `docs/deploying.md`'s preflight promise 
 escapes `logit validate`. The compiled `Regex` is then dropped, not threaded through:
 `ResolvedComponent` carries no parsed artifact for *any* kind today, and one `Regex::new` per
 component at process start -- on a path that already reads `lua_file` scripts and TLS certificates
-off disk -- is not worth inventing a mechanism for. The validation rule also rejects a pattern with
-no named group and an empty `field` name. A duplicate capture-group name needs no rule of its own:
-the `regex` crate rejects it at compile time already.
+off disk -- is not worth inventing a mechanism for. The validation rule also rejects an empty
+`field` name. A pattern with no named group is legal: it matches and writes no attribute, so every
+event passes through unchanged. A duplicate capture-group name needs no rule of its own: the
+`regex` crate rejects it at compile time already.
 
 ## Alternatives considered
 

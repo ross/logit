@@ -227,11 +227,11 @@ Then call it from `postrotate`, in rename mode, the default:
   though the rename succeeded.
 - **An idle sink reopens late.** The reopen happens before the target's next write, so the renamed
   file stays open, and its disk space allocated, until the sink's next batch.
-- **Don't give logrotate a `file_out` path.** Every `file_out` has a `rotate:` policy of its own,
-  so both rotators rename the same path on their own triggers: one stream splits across
-  `events.log.N` and logrotate's names under two retention limits. If you do it anyway, add
-  `dateext` so the two sets of names don't collide, and set `max_bytes` well above one logrotate
-  period's output so `file_out`'s rotation is only a backstop.
+- **Don't give logrotate a `file_out` path that rotates.** A `file_out` whose `rotate:` sets
+  `max_bytes` or `interval` renames its own file, so both rotators rename the same path on their
+  own triggers: one stream splits across `events.log.N` and logrotate's names under two retention
+  limits. If you do it anyway, add `dateext` so the two sets of names don't collide, and set
+  `max_bytes` well above one logrotate period's output so `file_out`'s rotation is only a backstop.
 
 ## Probes and exit codes
 

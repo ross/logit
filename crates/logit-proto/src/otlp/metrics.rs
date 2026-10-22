@@ -66,8 +66,8 @@
 //! | `log/plain` | normalized | `observed_timestamp` | An OTLP log record. otlp_out stamps an observed time on a log that has none, and otlp_in stamps the `_logit.otel.severity_*` carriers. |
 //! | `span/alone` | exact | -- | An OTLP span. |
 //! | `span/no_wire_form` | exact | -- | OTLP carries the status, its message, `trace_state`, flags, and dropped counts. |
-//! | `event/attributes_only` | skipped | uncounted | An event with no metric, log, or span has no OTLP signal and isn't sent, uncounted. |
-//! | `event/string_only` | skipped | uncounted | An InfluxDB point whose fields are all strings has no OTLP signal and isn't sent, uncounted, so its fields are lost. |
+//! | `event/attributes_only` | skipped | `logit.output.events.skipped{reason=no_payload}` | An event with no metric, log, or span has no OTLP signal and isn't sent. |
+//! | `event/string_only` | skipped | `logit.output.events.skipped{reason=no_payload}` | An InfluxDB point whose fields are all strings has no OTLP signal and isn't sent, so its fields are lost. |
 //!
 //! Per field of a record that reaches the wire, attribute shape, and payload beside metrics:
 //!
@@ -77,19 +77,20 @@
 //! | `record/description` | exact | -- | The `Metric`'s `description`. |
 //! | `record/start_timestamp` | exact | -- | The data point's `start_time_unix_nano`. |
 //! | `record/exemplars` | exact | -- | The data point's exemplars. |
-//! | `record/exemplars_on_summary` | lost | uncounted | A `SummaryDataPoint` has no exemplars field, so a summary's exemplars are left off, uncounted. |
+//! | `record/exemplars_on_summary` | lost | structural | A `SummaryDataPoint` has no exemplars field, so a summary's exemplars are left off. |
 //! | `record/min_max` | exact | -- | The data point's `min` and `max`. |
 //! | `attributes/string_value` | exact | -- | A string attribute. |
 //! | `attributes/bool_value` | exact | -- | A boolean attribute. |
-//! | `attributes/number_value` | normalized | `u64_as_int` | An integer or double attribute. A `u64` reads back as an `i64`, or, above `i64::MAX`, as a double, approximate beyond 2^53, uncounted. |
+//! | `attributes/number_value` | normalized | `u64_as_int`; `logit.output.attributes.normalized{reason=u64_as_double}` | An integer or double attribute. A `u64` reads back as an `i64`, or, above `i64::MAX`, as a double, approximate beyond 2^53, counted once per such value. |
 //! | `attributes/array_value` | exact | -- | An array attribute. |
 //! | `attributes/map_value` | exact | -- | A key-value list attribute. |
 //! | `attributes/bytes_value` | exact | -- | A bytes attribute. |
 //! | `attributes/timestamp_value` | normalized | `timestamp_as_int` | OTLP has no timestamp value, so it's an integer of Unix nanoseconds. |
-//! | `attributes/foreign_carrier` | lost | uncounted | A `_logit.` carrier is private and isn't an OTLP attribute, uncounted. |
+//! | `attributes/prometheus_target` | lost | structural | The scrape target is private and isn't an OTLP attribute, so it's left off. |
+//! | `attributes/foreign_carrier` | lost | structural | A `_logit.` carrier is private and isn't an OTLP attribute, so it's left off. |
 //! | `attributes/resource_attribute` | exact | -- | A resource attribute. |
 //! | `attributes/scope` | exact | -- | The `InstrumentationScope` of the batch. |
-//! | `attributes/datadog_carrier_log` | lost | uncounted | A `_logit.` carrier is private and isn't an OTLP attribute, uncounted. |
+//! | `attributes/datadog_carrier_log` | lost | structural | A `_logit.` carrier is private and isn't an OTLP attribute, so it's left off. |
 //! | `attributes/no_host` | exact | -- | A record with no host leaves with none. |
 //! | `attributes/log_status` | exact | -- | The severity is the `LogRecord`'s own; no `status` attribute is written. |
 //! | `attributes/span_kind` | exact | -- | The kind is the `Span`'s own; no `span.kind` attribute is written. |
@@ -125,7 +126,8 @@
 //!   by `Samples::weight`). The point's `count` and `sum` are the sketch's own; `sum` is
 //!   `DdSketch::sum`, exact unlike a quantile (approximate only when `DdSketch::stats_exact` is
 //!   `false`, i.e. the sketch's stats were derived from its bins). Its exemplars are left off,
-//!   uncounted, as a `Summary`'s are (`record/exemplars_on_summary` above).
+//!   as a `Summary`'s are (`record/exemplars_on_summary` above): the wire type has no field for
+//!   them, a structural loss with no counter.
 //!
 //! **Lossy metric kinds.** OTLP has no mergeable-sketch type. `ExponentialHistogram` is the nearest
 //! shape, but its base is `2^(2^-scale)` and a `DdSketch`'s γ isn't (1.015625 under

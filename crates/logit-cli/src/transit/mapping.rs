@@ -13,7 +13,7 @@
 //! | `samples`, `set_members`, `distribution`, `set` | none | record |
 //! | `record` | `no_recorded_value`, `no_recorded_value_delta_sum`, `no_recorded_value_other_kind`, `service_check`, `name_unsafe`, `exemplar_key_unsafe`, `exemplar_key_unsafe_histogram`, `sample_rate`, `non_finite`, `superseded`, `same_instant`, `same_instant_equal`, `same_millisecond`, `same_millisecond_equal` | record |
 //! | `record` | `unit`, `description`, `start_timestamp`, `exemplars`, `exemplars_on_summary`, `unit_on_distribution`, `min_max`, `sample_rate_unweighted` | field |
-//! | `attributes` | `string_value`, `bool_value`, `number_value`, `array_value`, `map_value`, `bytes_value`, `timestamp_value`, `private_carrier`, `foreign_carrier`, `datadog_carrier_log`, `resource_attribute`, `scope` | field |
+//! | `attributes` | `string_value`, `bool_value`, `number_value`, `array_value`, `map_value`, `bytes_value`, `timestamp_value`, `private_carrier`, `prometheus_target` (`_logit.prometheus.target`, at every sink), `foreign_carrier`, `datadog_carrier_log`, `resource_attribute`, `scope` | field |
 //! | `attributes` | `no_host`, `log_status`, `span_kind`, `trace_id_high` (a record `datadog_out` writes an attribute for from the record's own fields) | field |
 //! | `log` | `dogstatsd_event`, `plain` (each on an event with no metrics) | record |
 //! | `span` | `alone` (on an event with no metrics); `no_wire_form` (one of those carrying a field a Datadog span has no form for) | record |
@@ -67,13 +67,36 @@
 //! - `text`, one operator-facing sentence or two, always;
 //! - `reason`, the normalization's name, on a `normalized` cell;
 //! - `counter`, the series it counts under (`name{tag=value,...}`, the tags a subset of the
-//!   series'), on a `skipped`, `dropped`, or `lost` cell, unless `reason` is `uncounted`: a loss
-//!   the sink doesn't count, which the class check accepts for a record nothing reads back.
+//!   series'), on a `degraded`, `skipped`, `dropped`, or `lost` cell, unless `reason` says why
+//!   there's none. A `lost` or `degraded` cell's reason may be `structural`: the destination's
+//!   format has no slot for a field (on a `degraded` cell, one the record loses while keeping its
+//!   kind and shape), so every such record loses it and the table is its
+//!   record; a record written as another kind or shape names its counter (ADR
+//!   `telemetry-loss-vocabulary`'s amendment "structural loss has no counter"). `uncounted`, a
+//!   loss the sink doesn't count yet, is accepted only on a cell [`UNCOUNTED_ALLOWED`] names, and
+//!   the class check accepts it for a record nothing reads back.
 
 use anyhow::{bail, ensure, Context};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
+
+/// The cells whose loss may still be `uncounted`, as `(row kind, feature, sink)`, where `None`
+/// matches any. Every other `skipped`, `dropped`, or `lost` cell names a counter, or a `lost` one
+/// is `structural`. Logs and spans aren't classified yet, a `_logit.datadog.*` carrier
+/// `datadog_out` leaves off a log among them.
+const UNCOUNTED_ALLOWED: [(&str, Option<&str>, Option<&str>); 3] = [
+    ("log", None, None),
+    ("span", None, None),
+    ("attributes", Some("datadog_carrier_log"), Some("datadog_out")),
+];
+
+/// Whether the cell of `sink` in row `kind`/`feature` may be `uncounted` ([`UNCOUNTED_ALLOWED`]).
+fn uncounted_allowed(kind: &str, feature: Option<&str>, sink: &str) -> bool {
+    UNCOUNTED_ALLOWED.iter().any(|&(k, f, s)| {
+        k == kind && f.is_none_or(|f| Some(f) == feature) && s.is_none_or(|s| s == sink)
+    })
+}
 
 /// The class vocabulary, in the order `mapping.yaml`'s `classes:` must list it.
 pub(super) const CLASSES: [&str; 6] =
@@ -141,6 +164,7 @@ const KINDS: [(&str, &[&str]); 15] = [
             "bytes_value",
             "timestamp_value",
             "private_carrier",
+            "prometheus_target",
             "foreign_carrier",
             "resource_attribute",
             "scope",
@@ -430,6 +454,20 @@ impl Mapping {
                     if let Some(counter) = &cell.counter {
                         Series::parse(counter).with_context(|| format!("{at}: counter"))?;
                     }
+                    let reason = cell.reason.as_deref();
+                    if reason == Some("uncounted") {
+                        ensure!(
+                            uncounted_allowed(&row.kind, feature, sink),
+                            "{at}: an uncounted loss is counted, or a lost cell is structural"
+                        );
+                    }
+                    if reason == Some("structural") {
+                        ensure!(
+                            matches!(cell.class, Class::Lost | Class::Degraded)
+                                && cell.counter.is_none(),
+                            "{at}: only a lost or degraded cell with no counter is structural"
+                        );
+                    }
                     match cell.class {
                         Class::Normalized => {
                             ensure!(
@@ -438,15 +476,20 @@ impl Mapping {
                             )
                         }
                         Class::Skipped | Class::Dropped => ensure!(
-                            cell.counter.is_some() || cell.reason.as_deref() == Some("uncounted"),
-                            "{at}: a {} cell names its counter, or its reason is uncounted",
+                            cell.counter.is_some() || reason == Some("uncounted"),
+                            "{at}: a {} cell names its counter",
                             cell.class.as_str()
                         ),
                         Class::Lost => ensure!(
-                            cell.counter.is_some() || cell.reason.as_deref() == Some("uncounted"),
-                            "{at}: a lost cell names its counter, or its reason is uncounted"
+                            cell.counter.is_some()
+                                || matches!(reason, Some("structural" | "uncounted")),
+                            "{at}: a lost cell names its counter, or its reason is structural"
                         ),
-                        Class::Exact | Class::Degraded => {}
+                        Class::Degraded => ensure!(
+                            cell.counter.is_some() || reason == Some("structural"),
+                            "{at}: a degraded cell names its counter, or its reason is structural"
+                        ),
+                        Class::Exact => {}
                     }
                 }
             }

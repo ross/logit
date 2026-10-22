@@ -11,8 +11,8 @@ use std::sync::Arc;
 /// Stamps fixed key/value pairs onto event attributes (`process`) and/or the batch resource
 /// (`map_resource`).
 ///
-/// A configured value overwrites whatever the wire carried. Either list may be empty; graph rule
-/// 12 rejects a `Set` with both empty.
+/// A configured value overwrites whatever the wire carried. Either list may be empty; with both
+/// empty, the component changes nothing.
 pub struct Set {
     /// Interned once in [`Set::new`] to keep interner lookups off the per-event path.
     resource_pairs: Vec<(Symbol, Value)>,
@@ -217,5 +217,15 @@ mod tests {
         let original_message = e.log.as_ref().unwrap().message.clone();
         assert!(set.process(&resource, &mut e));
         assert_eq!(e.log.as_ref().unwrap().message, original_message);
+    }
+
+    #[test]
+    fn a_set_with_neither_resource_nor_attributes_changes_nothing() {
+        let mut set = Set::new(vec![], vec![]);
+        let resource = resource(&[("service.name", "nginx")]);
+        let mut event = event();
+        assert!(set.process(&resource, &mut event));
+        assert!(event.attributes.is_empty());
+        assert!(set.map_resource(&resource).is_none());
     }
 }

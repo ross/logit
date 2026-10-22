@@ -875,7 +875,7 @@ impl Writer<'_> {
             self.out.extend_from_slice(self.number.as_bytes());
         }
         if let Some(exemplar) = exemplar.filter(|_| self.dialect.is_openmetrics()) {
-            let (labels, omitted) = exemplar_labels(exemplar);
+            let (labels, omitted, renamed) = exemplar_labels(exemplar);
             if !exemplar_fits(&labels) {
                 // Over OpenMetrics' 128-code-point exemplar label budget: emitting it would make the
                 // line invalid, and truncating a trace id would make it a lie.
@@ -883,6 +883,9 @@ impl Writer<'_> {
             } else {
                 for reason in omitted {
                     self.encoder.label_omitted(reason);
+                }
+                for _ in 0..renamed {
+                    self.encoder.label_normalized("name_sanitized");
                 }
                 self.out.extend_from_slice(b" # ");
                 push_exemplar_labels(self.out, &labels);
@@ -1111,6 +1114,8 @@ struct ExemplarLabels {
     omitted: Vec<&'static str>,
     /// The original key of each attribute written, in no particular order.
     keys: Vec<&'static str>,
+    /// Attributes written under a name [`super::sanitize_label_name`] rewrote.
+    renamed: usize,
 }
 
 /// An [`Exemplar`]'s labels, sorted by name, and the reason for each attribute left off: a
@@ -1119,21 +1124,25 @@ struct ExemplarLabels {
 /// ([`super::sanitize_label_name`], an unrepresentable one dropped and a private `_logit.` one
 /// skipped). Two keys sanitizing onto one name keep the one whose original key sorts first, and
 /// the rest are `collision`; one sanitizing onto a trace label the exemplar writes is `reserved`,
-/// as a series label sanitizing onto `le` is. The caller counts the reasons, so an exemplar that
-/// isn't written counts none. The inverse of [`super::assemble::exemplar_from_labels`].
+/// as a series label sanitizing onto `le` is. The caller counts the reasons and the attributes
+/// written under a rewritten name, so an exemplar that isn't written counts none. The inverse of
+/// [`super::assemble::exemplar_from_labels`].
 ///
 /// Shared with [`super::remote_write`], which puts the same pairs in a protobuf field rather than
 /// between braces -- the *spelling* of an exemplar's trace reference is a Prometheus convention,
 /// not an exposition one.
-pub(super) fn exemplar_labels(exemplar: &Exemplar) -> (Vec<(String, String)>, Vec<&'static str>) {
+pub(super) fn exemplar_labels(
+    exemplar: &Exemplar,
+) -> (Vec<(String, String)>, Vec<&'static str>, usize) {
     let built = build_exemplar_labels(exemplar);
-    (built.labels, built.omitted)
+    (built.labels, built.omitted, built.renamed)
 }
 
 fn build_exemplar_labels(exemplar: &Exemplar) -> ExemplarLabels {
     let mut labels: Vec<(String, String)> = Vec::new();
     let mut omitted = Vec::new();
     let mut keys = Vec::new();
+    let mut renamed = 0;
     if let Some(trace) = &exemplar.trace {
         labels.push(("trace_id".to_string(), to_hex(&trace.trace_id)));
         if let Some(span) = trace.span_id {
@@ -1157,13 +1166,14 @@ fn build_exemplar_labels(exemplar: &Exemplar) -> ExemplarLabels {
             Some(i) if i < traced => omitted.push("reserved"),
             Some(_) => omitted.push("collision"),
             None => {
+                renamed += usize::from(matches!(name, std::borrow::Cow::Owned(_)));
                 labels.push((name.into_owned(), value));
                 keys.push(key);
             }
         }
     }
     labels.sort_by(|a, b| a.0.cmp(&b.0));
-    ExemplarLabels { labels, omitted, keys }
+    ExemplarLabels { labels, omitted, keys, renamed }
 }
 
 /// `{trace_id="...",span_id="...",<other>}` -- [`exemplar_labels`] between braces.
@@ -2496,7 +2506,8 @@ mod tests {
 
     /// An exemplar attribute key outside the label-name grammar is written sanitized, as a series
     /// label is, so the `_total` line stays valid OpenMetrics and reads back with the counter and
-    /// its exemplar, uncounted.
+    /// its exemplar, counted `labels.normalized{reason="name_sanitized"}` once for the one key
+    /// rewritten.
     #[test]
     fn a_dotted_exemplar_key_is_sanitized_and_its_counter_reads_back() {
         let family =
@@ -2506,7 +2517,7 @@ mod tests {
             body,
             "# TYPE requests counter\nrequests_total 17 # {customer_tier=\"gold\",n=\"1\"} 0.1\n# EOF\n"
         );
-        assert!(counts.is_empty(), "{counts:?}");
+        assert_eq!(counts, vec![("name_sanitized".to_string(), 1.0)]);
 
         let registry = Registry::new();
         let mut decoder = PrometheusDecoder::new().with_telemetry(registry.telemetry_for(
@@ -2550,7 +2561,7 @@ mod tests {
             body.contains("latency_bucket{le=\"0.1\"} 2 # {db_operation_name=\"SELECT\"} 0.05\n"),
             "{body}"
         );
-        assert!(counts.is_empty(), "{counts:?}");
+        assert_eq!(counts, vec![("name_sanitized".to_string(), 1.0)]);
         let families = parsed(&body, Dialect::OpenMetrics1_0);
         let Point::Histogram { buckets, .. } = &families[0].series[0].point else {
             panic!("{families:?}");
@@ -2559,18 +2570,24 @@ mod tests {
     }
 
     /// Two exemplar keys sanitizing onto one name keep the one whose original key sorts first and
-    /// count the other `labels.omitted{reason="collision"}`; a key sanitizing onto a trace label
-    /// beside a trace is `reserved`, as `le` is beside a histogram's bucket.
+    /// count the other `labels.omitted{reason="collision"}`, the kept one counting its rewrite; a
+    /// key sanitizing onto a trace label beside a trace is `reserved`, as `le` is beside a
+    /// histogram's bucket.
     #[test]
     fn exemplar_keys_colliding_after_sanitizing_keep_the_first_and_count_the_rest() {
         let family =
             counter_with_exemplars(vec![exemplar(0.1, &[("a.b", "dot"), ("a-b", "dash")])]);
-        let (body, counts) = write_counted(&[family], Dialect::OpenMetrics1_0);
+        let (body, mut counts) = write_counted(&[family], Dialect::OpenMetrics1_0);
         assert_eq!(
             body,
             "# TYPE requests counter\nrequests_total 17 # {a_b=\"dash\"} 0.1\n# EOF\n"
         );
-        assert_eq!(counts, vec![("collision".to_string(), 1.0)]);
+        // A registry drain has no order across series.
+        counts.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            counts,
+            vec![("collision".to_string(), 1.0), ("name_sanitized".to_string(), 1.0)]
+        );
 
         let ex = Exemplar {
             trace: Some(logit_core::TraceRef { trace_id: [0xab; 16], span_id: None, flags: 0 }),
@@ -2610,7 +2627,7 @@ mod tests {
         let fits = counter_with_exemplars(vec![exemplar(0.1, &[("1", &"x".repeat(126))])]);
         let (body, counts) = write_counted(&[fits], Dialect::OpenMetrics1_0);
         assert!(body.contains(" # {_1="), "{body}");
-        assert!(counts.is_empty(), "{counts:?}");
+        assert_eq!(counts, vec![("name_sanitized".to_string(), 1.0)]);
         // One more code point: 128 before sanitizing, 129 after.
         let over = counter_with_exemplars(vec![exemplar(0.1, &[("1", &"x".repeat(127))])]);
         let (body, counts) = write_counted(&[over], Dialect::OpenMetrics1_0);

@@ -1,0 +1,54 @@
+{
+  "counter": {"events": [
+    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"http_requests_total","kind":"sum","value":3.0,"temporality":"cumulative","monotonic":true,"description":"Requests served."}],"attributes":{"code":"200","method":"post"},"resource":{"attributes":{"instance":"transit:9100"}}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"http_requests_total","kind":"sum","value":1027.0,"temporality":"cumulative","monotonic":true,"description":"Requests served."}],"attributes":{"code":"200","method":"get"},"resource":{"attributes":{"instance":"transit:9100"}}}
+  ], "counters": {}},
+  "exemplars": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"hits_total","kind":"sum","value":10.0,"temporality":"cumulative","monotonic":true,"exemplars":[{"timestamp":"2027-01-15T07:59:49.500000000Z","value":1.0,"trace_id":"0102030405060708090a0b0c0d0e0f10","span_id":"0102030405060708","trace_flags":0}]}],"resource":{"attributes":{"instance":"transit:9100"}}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"latency","kind":"histogram","temporality":"cumulative","buckets":[{"bound":0.1,"count":2},{"bound":"inf","count":1}],"sum":0.4,"exemplars":[{"timestamp":"1970-01-01T00:00:00.000000000Z","value":0.05,"trace_id":"0102030405060708090a0b0c0d0e0f10","span_id":"0102030405060708","trace_flags":0}]}],"resource":{"attributes":{"instance":"transit:9100"}}}
+  ], "counters": {}},
+  "gauge": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"temperature_celsius","kind":"gauge","value":-4.5}],"attributes":{"room":"cold"},"resource":{"attributes":{"instance":"transit:9100"}}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"temperature_celsius","kind":"gauge","value":21.5}],"attributes":{"room":"lab"},"resource":{"attributes":{"instance":"transit:9100"}}}
+  ], "counters": {}},
+  "gauge-timestamp": {"events": [
+    {"timestamp":"2027-01-15T07:59:30.000000000Z","metrics":[{"name":"queue_depth","kind":"gauge","value":7.0}],"attributes":{"q":"a"},"resource":{"attributes":{"instance":"transit:9100"}}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"queue_depth","kind":"gauge","value":9.0}],"attributes":{"q":"b"},"resource":{"attributes":{"instance":"transit:9100"}}}
+  ], "counters": {}},
+  "help-unit": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"disk_bytes","kind":"gauge","value":1024.0,"unit":"bytes","description":"Disk usage."}],"attributes":{"dev":"sda"},"resource":{"attributes":{"instance":"transit:9100"}}}
+  ], "counters": {}},
+  "histogram": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"request_duration_seconds","kind":"histogram","temporality":"cumulative","buckets":[{"bound":0.1,"count":3},{"bound":0.5,"count":4},{"bound":"inf","count":2}],"sum":2.75}],"resource":{"attributes":{"instance":"transit:9100"}}}
+  ], "counters": {}},
+  "label-escaping": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"escaped","kind":"gauge","value":1.0}],"attributes":{"nl":"a\nb","path":"C:\\dir","quote":"say \"hi\""},"resource":{"attributes":{"instance":"transit:9100"}}}
+  ], "counters": {}},
+  "mixed": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"build","kind":"gauge","value":1.0}],"attributes":{"version":"1.2.3"},"resource":{"attributes":{"instance":"transit:9100"}}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"feature","kind":"gauge","value":0.0}],"attributes":{"feature":"b"},"resource":{"attributes":{"instance":"transit:9100"}}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"feature","kind":"gauge","value":1.0}],"attributes":{"feature":"a"},"resource":{"attributes":{"instance":"transit:9100"}}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"mystery","kind":"gauge","value":3.0}],"resource":{"attributes":{"instance":"transit:9100"}}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"queue","kind":"histogram","temporality":"cumulative","buckets":[{"bound":1.0,"count":2},{"bound":"inf","count":3}],"sum":7.5}],"resource":{"attributes":{"instance":"transit:9100"}}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"reqs_total","kind":"sum","value":5.0,"temporality":"cumulative","monotonic":true}],"resource":{"attributes":{"instance":"transit:9100"}}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"up","kind":"gauge","value":1.0}],"resource":{"attributes":{"instance":"transit:9100"}}}
+  ], "counters": {}},
+  "nan-inf": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"reading","kind":"gauge","value":"-inf"}],"attributes":{"k":"ninf"},"resource":{"attributes":{"instance":"transit:9100"}}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"reading","kind":"gauge","value":"NaN"}],"attributes":{"k":"nan"},"resource":{"attributes":{"instance":"transit:9100"}}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"reading","kind":"gauge","value":"inf"}],"attributes":{"k":"pinf"},"resource":{"attributes":{"instance":"transit:9100"}}}
+  ], "counters": {}},
+  "openmetrics-total-created": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"jobs_total","kind":"sum","value":42.0,"temporality":"cumulative","monotonic":true,"description":"Jobs run.","start_timestamp":"2027-01-15T07:43:20.000000000Z"}],"resource":{"attributes":{"instance":"transit:9100"}}}
+  ], "counters": {}},
+  "summary": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"rpc_duration_seconds","kind":"summary","temporality":"cumulative","count":140,"sum":12.5,"quantiles":[{"quantile":0.5,"value":0.05},{"quantile":0.99,"value":0.2}]}],"resource":{"attributes":{"instance":"transit:9100"}}}
+  ], "counters": {}},
+  "typed-attributes": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"temperature","kind":"gauge","value":21.5}],"attributes":{"blob":"b\"ab\"","count":7,"labels":{"rack":2,"zone":"a"},"room":"lab","seen":1799996400000000000},"scope":{"name":"transit.scope","version":"1.0"},"types":{"/attributes/blob":"bytes"}}
+  ], "counters": {}},
+  "untyped": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"legacy_value","kind":"gauge","value":7.0}],"attributes":{"source":"old"},"resource":{"attributes":{"instance":"transit:9100"}}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"no_metadata","kind":"gauge","value":1.5}],"resource":{"attributes":{"instance":"transit:9100"}}}
+  ], "counters": {}}
+}

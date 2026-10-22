@@ -144,10 +144,10 @@
 //!
 //! | Row | Class | Reason or counter | What a consumer sees |
 //! |---|---|---|---|
-//! | `record/unit` | lost | uncounted | Carbon has no unit; it isn't written or counted. |
-//! | `record/description` | lost | uncounted | Carbon has no description; it isn't written or counted. |
-//! | `record/start_timestamp` | lost | uncounted | Carbon has no start time; it isn't written or counted. |
-//! | `record/exemplars` | lost | uncounted | Carbon has no exemplars; they aren't written or counted. |
+//! | `record/unit` | lost | structural | Carbon has no unit, so none is written. |
+//! | `record/description` | lost | structural | Carbon has no description, so none is written. |
+//! | `record/start_timestamp` | lost | structural | Carbon has no start time, so none is written. |
+//! | `record/exemplars` | lost | structural | Carbon has no exemplars, so none are written. |
 //! | `attributes/string_value`, under `tags: drop` | lost | `logit.output.tags.omitted{reason=dialect}` | Under `tags: drop`, no tag is written, counted once per attribute, so series that differ only in their tags write one path. |
 //! | `attributes/string_value`, otherwise | normalized | `tag_sanitized`; `logit.output.metrics.normalized{reason=tag_sanitized}` | A `;name=value` tag. Each `;`, `!`, `^`, `=`, whitespace, and control character in the name, and each `;`, whitespace, and control character and a leading `~` in the value, is written as `_`, counted once per record. |
 //! | `attributes/bool_value`, under `tags: drop` | lost | `logit.output.tags.omitted{reason=dialect}` | Under `tags: drop`, no tag is written, counted once per attribute. |
@@ -162,11 +162,12 @@
 //! | `attributes/bytes_value`, otherwise | lost | `logit.output.tags.omitted{reason=unrepresentable}` | A bytes value has no tag form and is left off, counted. |
 //! | `attributes/timestamp_value`, under `tags: drop` | lost | `logit.output.tags.omitted{reason=dialect}` | Under `tags: drop`, no tag is written, counted once per attribute. |
 //! | `attributes/timestamp_value`, otherwise | lost | `logit.output.tags.omitted{reason=unrepresentable}` | A timestamp value has no tag form and is left off, counted. |
-//! | `attributes/foreign_carrier` | lost | uncounted | Another protocol's `_logit.` carrier isn't a tag and is left off, uncounted, under either `tags:` mode. |
+//! | `attributes/prometheus_target` | lost | structural | The scrape target is private and isn't a tag, so it's left off, under either `tags:` mode. |
+//! | `attributes/foreign_carrier` | lost | structural | Another protocol's `_logit.` carrier is private and isn't a tag, so it's left off, under either `tags:` mode. |
 //! | `attributes/resource_attribute`, under `tags: drop` | lost | `logit.output.tags.omitted{reason=dialect}` | Under `tags: drop`, no tag is written, counted once per attribute. |
 //! | `attributes/resource_attribute`, otherwise | normalized | `resource_merged`; `logit.output.metrics.normalized{reason=tag_sanitized}` | A tag, read back as an event attribute; on a key the event shares, the event's value wins, uncounted. Its name and value are sanitized as the `string_value` row says, counted once per record as `tag_sanitized`. |
-//! | `attributes/scope` | lost | uncounted | Carbon has no instrumentation scope; it isn't written or counted. |
-//! | `attributes/datadog_carrier_log` | lost | uncounted | Another protocol's `_logit.` carrier isn't a tag and is left off, uncounted. |
+//! | `attributes/scope` | lost | structural | Carbon has no instrumentation scope, so none is written. |
+//! | `attributes/datadog_carrier_log` | lost | structural | Another protocol's `_logit.` carrier is private and isn't a tag, so it's left off. |
 //! | `attributes/no_host` | exact | -- | A record with no host leaves with none. |
 //! | `log/beside_metrics` | lost | uncounted | A log on an event that carries metrics is left off while the metrics are written, uncounted. |
 //! | `span/beside_metrics` | lost | uncounted | A span on an event that carries metrics is left off while the metrics are written, uncounted. |

@@ -1822,6 +1822,21 @@ mod tests {
     }
 
     #[test]
+    fn a_zero_max_length_empties_the_field_and_counts_it_truncated() {
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("http", "http_access", "transform");
+        let mut t = http(HttpAccessConfig {
+            max_length: vec![("user.name".to_string(), 0)],
+            ..HttpAccessConfig::default()
+        })
+        .with_telemetry(telemetry);
+        let event = run(&mut t, &[("user.name", s("alexandra"))]);
+        assert_eq!(get(&event, "user.name"), Some(&s("")));
+        let events = registry.drain(0);
+        assert_eq!(counter(&events, TRUNCATED, Some(("field", "user.name"))), 1.0);
+    }
+
+    #[test]
     fn control_bytes_become_underscores_at_unchanged_length() {
         let ua = "curl/8.0\u{1}\t\u{7f}é";
         let event = run(&mut bare(), &[("user_agent.original", s(ua))]);

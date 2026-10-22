@@ -1,0 +1,5 @@
+# The datapoints pickle-p2 holds, recorded at protocol 0 by CPython 3.12 and read in place from
+# testdata/interop/: `UNICODE` paths, `INT` and `FLOAT` lines, and a `PUT` memo.
+wire: ../../../../testdata/interop/graphite/graphite-pickle-p0-000.raw
+protocol: pickle
+exercises: [pickle_frame, pickle_protocol_0, pickle_unicode, integer_value, negative_value, fractional_timestamp]

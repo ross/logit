@@ -106,6 +106,18 @@ Entry format and the other areas: [the known-gaps index](README.md).
   - **To close:** undecided. Reading the `400` body, which names the series, could tell a batch
     whose clean samples were stored from one whose weren't; making `version: 2` the default would
     make the clean samples stored on Prometheus too.
+- **Two metric names that sanitize onto one merge across batches, uncounted.** `prometheus_out`
+  writes a name's `.`, `-`, and other characters outside the metric-name grammar as `_`, counted
+  `logit.output.metrics.normalized{reason="name_sanitized"}`. Within one batch, two names that
+  land on one wire name keep one family and count the other's records
+  `metrics.dropped{reason="name_collision"}` (`crates/logit-proto/src/prometheus/mod.rs`'s encode
+  table). Across batches nothing compares them: the exposition registry keys a family by its wire
+  name, and a remote-write receiver keys a series by its labels.
+  - **Consequence:** `http.requests` in one batch and `http_requests` in the next are one series,
+    each batch's sample replacing the other's, with no `name_collision` for either. Label names
+    merge the same way across batches.
+  - **Workaround:** a nonzero `metrics.normalized{reason="name_sanitized"}` says some name was
+    rewritten; rename upstream (a `lua` stage) so no two producers' names sanitize onto one.
 - **`prometheus_in`'s scrape client still follows HTTP redirects.** It builds its own
   `reqwest::Client` with no redirect policy (`crates/logit-inputs/src/prometheus.rs`'s scrape
   client), so it inherits `reqwest`'s `limited(10)`.

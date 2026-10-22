@@ -38,7 +38,8 @@
     "logit.output.metrics.degraded{component=out,kind=statsd_out,metric_kind=cumulative_sum,role=sink}": 1,
     "logit.output.metrics.degraded{component=out,kind=statsd_out,metric_kind=distribution,role=sink}": 1,
     "logit.output.metrics.degraded{component=out,kind=statsd_out,metric_kind=histogram,role=sink}": 1,
-    "logit.output.metrics.degraded{component=out,kind=statsd_out,metric_kind=set,role=sink}": 1
+    "logit.output.metrics.degraded{component=out,kind=statsd_out,metric_kind=set,role=sink}": 1,
+    "logit.output.metrics.degraded{component=out,kind=statsd_out,reason=negative_gauge,role=sink}": 1
   }},
   "event": {"events": [
     {"timestamp":"2027-01-15T08:00:01.000000000Z","log":{"format":"raw","message":"abc"},"attributes":{"_logit.statsd.event.title":"Plain"}},
@@ -92,7 +93,7 @@
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"requests.inflight","kind":"gauge","value":3.0}],"attributes":{"route":"/api"}}
   ], "counters": {}},
   "log-only": {"events": [], "counters": {
-    "logit.output.events.skipped{component=out,kind=statsd_out,role=sink}": 1
+    "logit.output.events.skipped{component=out,kind=statsd_out,reason=no_metrics,role=sink}": 1
   }},
   "mixed": {"events": [
     {"timestamp":"2027-01-15T07:59:30.000000000Z","metrics":[{"name":"queue.depth","kind":"gauge","value":7.0}],"attributes":{"_logit.statsd.cardinality":"low","_logit.statsd.container_id":"in-82046","_logit.statsd.external_data":"it-false","_logit.statsd.timestamp":1799999970},"types":{"/attributes/_logit.statsd.timestamp":"u64"}},
@@ -123,7 +124,9 @@
   "name-sanitized": {"events": [
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"http_requests_total","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"route":"/api"}},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"queue_depth","kind":"gauge","value":3.0}]}
-  ], "counters": {}},
+  ], "counters": {
+    "logit.output.metrics.normalized{component=out,kind=statsd_out,reason=name_sanitized,role=sink}": 2
+  }},
   "record-fields": {"events": [
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"cpu.usage","kind":"gauge","value":0.5}],"attributes":{"host":"web-07"}},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"hits","kind":"sum","value":4.0,"temporality":"delta","monotonic":true}]},
@@ -150,13 +153,13 @@
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"requests.inflight","kind":"gauge","value":3.0}]}
   ], "counters": {}},
   "span-client": {"events": [], "counters": {
-    "logit.output.events.skipped{component=out,kind=statsd_out,role=sink}": 1
+    "logit.output.events.skipped{component=out,kind=statsd_out,reason=no_metrics,role=sink}": 1
   }},
   "span-only": {"events": [], "counters": {
-    "logit.output.events.skipped{component=out,kind=statsd_out,role=sink}": 1
+    "logit.output.events.skipped{component=out,kind=statsd_out,reason=no_metrics,role=sink}": 1
   }},
   "span-pair": {"events": [], "counters": {
-    "logit.output.events.skipped{component=out,kind=statsd_out,role=sink}": 2
+    "logit.output.events.skipped{component=out,kind=statsd_out,reason=no_metrics,role=sink}": 2
   }},
   "sub-millisecond": {"events": [
     {"timestamp":"2027-01-15T08:00:01.000000500Z","metrics":[{"name":"queue.depth","kind":"gauge","value":3.0}]},
@@ -223,7 +226,10 @@
   ], "counters": {}},
   "tags-reserved": {"events": [
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"requests","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"env":"a:b","my_key":"a_b_c"}}
-  ], "counters": {}},
+  ], "counters": {
+    "logit.output.tags.normalized{component=out,kind=statsd_out,reason=name_sanitized,role=sink}": 1,
+    "logit.output.tags.normalized{component=out,kind=statsd_out,reason=value_sanitized,role=sink}": 1
+  }},
   "timer-h-d": {"events": [
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"request.size","kind":"samples","values":[512.0],"sample_rate":1.0}],"attributes":{"_logit.statsd.type":"h"}},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"response.size","kind":"samples","values":[60196.0],"sample_rate":1.0}],"attributes":{"_logit.statsd.type":"d","endpoint":"/orders"}}

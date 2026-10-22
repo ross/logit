@@ -1,6 +1,6 @@
 ---
 created: 2026-09-07
-updated: 2026-09-07
+updated: 2026-10-21
 ---
 
 # `csv`: positional columns from config, not a header row, and no type coercion
@@ -24,10 +24,11 @@ settles those questions, the same way `docs/adr/json-parsing-into-attributes.md`
 
 ## Decision
 
-**Explicit `columns: Vec<String>`, required and non-empty, positional — no header-row mode.**
-`columns[i]` names the attribute the row's `i`-th field is written to. There is no `has_header:
-bool` and no positional fallback naming (`column_0`, `column_1`, ...); see "Alternatives
-considered" for why both were rejected.
+**Explicit `columns: Vec<String>`, required, positional — no header-row mode.** `columns[i]` names
+the attribute the row's `i`-th field is written to. An empty list is legal: no row has zero fields,
+so every row passes through unparsed with a throttled warning (`field_count` for a well-formed row).
+There is no `has_header: bool` and no positional fallback naming (`column_0`, `column_1`, ...); see
+"Alternatives considered" for why both were rejected.
 
 **A row byte-identical to the configured header line is recognized *by value*, not position, and
 passed through unparsed.** `CsvParser` builds `header_line = columns.join(delimiter)` once at
@@ -116,8 +117,7 @@ weight here.
 - **Positional fallback names (`column_0`, `column_1`, ...) when `columns` is absent or short.**
   Rejected: pushes the coupling downstream (`kv_metrics`/`keep` would need to know `field:
   column_5`), a config change that adds a column earlier in the row silently shifts every fallback
-  name after it, defeats the "empty/absent list is a certain no-op" validation shape every other
-  transform here uses, and produces attribute names nobody would ever choose to key logic on.
+  name after it, and produces attribute names nobody would ever choose to key logic on.
 - **A separate `Tsv` sibling kind.** Rejected — one parameterized kind (`delimiter:`) matches the
   precedent already set by `syslog_out`'s `format:` and `otlp_out`'s `protocol:`: a format
   difference is a field, not a new `ComponentKind`.

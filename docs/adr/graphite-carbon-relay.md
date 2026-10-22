@@ -671,3 +671,29 @@ Two losses that `graphite_out` left uncounted now have counters:
   left off, beside its `{metric_kind}` count, as `influxdb_out` counts it.
 
 The model mapping table's "event with no metrics" row above predates this.
+
+## Amendment (2026-10-21): the model mapping table's stale rows
+
+These rows of the encode table under "Model mapping" predate the loss vocabulary: each names a
+counter, a counter prefix, a label, or a "dropped" outcome the code no longer uses. The
+2026-10-13 amendment renamed them in prose, and the two amendments above cover the `Sum` and
+"event with no metrics" rows. The table stays as written. The stale rows are:
+
+- the preamble's `logit.output.metrics.skipped{reason=…}` prefix
+- NaN / ±inf
+- `NO_RECORDED_VALUE`
+- `GaugeDelta`
+- `Samples`/…/`SetMembers`, `multi_value: skip`
+- `floor(ts/1e9) <= 0`
+- attrs, `tags: drop`
+- `Null/Bytes/Timestamp/Map`, or empty-representable `Array`
+- tag empty after sanitizing
+- two tags collide after rendering
+- path empty after sanitizing
+- plaintext line > `max_packet_bytes` (UDP)
+- single pickle datapoint > `max_frame_bytes`
+
+The canonical copies of what the code does now are `graphite_out`'s column of
+[`spec/transit/mapping.yaml`](../../spec/transit/mapping.yaml), which `script/transit docs`
+renders into `crates/logit-proto/src/graphite/mod.rs`'s "Encode: model → wire" section, and the
+hand-written encode rows below that generated region.

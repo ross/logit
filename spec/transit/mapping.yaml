@@ -12,17 +12,22 @@ classes:
     A permitted normalization applied, named by the cell's reason; a record or field the
     normalization doesn't touch reads back exact.
   degraded: >-
-    The value survives in a lesser kind, such as a sketch written as dotted count and quantile
-    series.
+    The value survives in a lesser kind or shape, such as a sketch written as dotted count and
+    quantile series; the cell names the counter that counts it. A cell whose record keeps its kind
+    and shape and loses only a field the format has no slot for has reason structural instead.
   lost: >-
     A field the record loses while the record itself survives; the cell names the counter that
-    counts it, or says it's uncounted.
+    counts it, or its reason is structural when the destination's format has no slot for it.
   skipped: >-
     The record leaves no wire form, because the sink has none for it or the config chose none;
-    the cell names the counter that counts it, or says it's uncounted.
+    the cell names the counter that counts it.
   dropped: >-
     The record is lost for a reason the config didn't ask for; the cell names the counter that
-    counts it, or says it's uncounted.
+    counts it.
+# A cell may still say `reason: uncounted` only on the rows `UNCOUNTED_ALLOWED` names in
+# `crates/logit-cli/src/transit/mapping.rs`: log and span payloads, `datadog_out`'s carrier on a
+# log among them, not yet classified. docs/adr/telemetry-loss-vocabulary.md's amendment
+# "structural loss has no counter" has the rule.
 
 sinks: [statsd_out, prometheus_out, influxdb_out, otlp_out, datadog_out, graphite_out]
 
@@ -45,9 +50,11 @@ rows:
           upstream turns it into a counter.
       influxdb_out:
         class: degraded
+        counter: logit.output.metrics.degraded{metric_kind=monotonic_delta_sum}
         text: >-
           A `value` field of a measurement named for the record, its temporality and monotonicity
-          dropped, which influxdb_in reads back as a gauge named `<name>.value`.
+          dropped, which influxdb_in reads back as a gauge named `<name>.value`, counted once per
+          record.
       otlp_out:
         class: exact
         text: An OTLP `Sum` with delta temporality and the monotonic flag.
@@ -81,9 +88,10 @@ rows:
         text: A bare delta sum is dropped, as for a monotonic one.
       influxdb_out:
         class: degraded
+        counter: logit.output.metrics.degraded{metric_kind=non_monotonic_delta_sum}
         text: >-
           A `value` field, its temporality and monotonicity dropped, read back as a gauge named
-          `<name>.value`.
+          `<name>.value`, counted once per record.
       otlp_out:
         class: exact
         text: An OTLP `Sum` with delta temporality, not monotonic.
@@ -118,9 +126,10 @@ rows:
           lacks it, so such a record reads back under the longer name.
       influxdb_out:
         class: degraded
+        counter: logit.output.metrics.degraded{metric_kind=cumulative_sum}
         text: >-
           A `value` field holding the running total, its temporality and monotonicity dropped,
-          read back as a gauge named `<name>.value`.
+          read back as a gauge named `<name>.value`, counted once per record.
       otlp_out:
         class: exact
         text: An OTLP `Sum` with cumulative temporality and the monotonic flag.
@@ -152,9 +161,10 @@ rows:
         text: Prometheus has no non-monotonic counter, so the running total is a `gauge`.
       influxdb_out:
         class: degraded
+        counter: logit.output.metrics.degraded{metric_kind=cumulative_sum}
         text: >-
           A `value` field, its temporality and monotonicity dropped, read back as a gauge named
-          `<name>.value`.
+          `<name>.value`, counted once per record.
       otlp_out:
         class: exact
         text: An OTLP `Sum` with cumulative temporality, not monotonic.
@@ -430,10 +440,11 @@ rows:
     cells:
       statsd_out:
         class: degraded
+        counter: logit.output.metrics.degraded{reason=negative_gauge}
         text: >-
           statsd has no negative absolute gauge, so statsd_out writes `0|g` then `-v|g` in one
-          datagram. A statsd server ends at the right value, but statsd_in reads the pair as a
-          gauge of 0 and a relative adjustment, uncounted.
+          datagram, counted once per record. A statsd server ends at the right value, but statsd_in
+          reads the pair as a gauge of 0 and a relative adjustment.
       prometheus_out:
         class: exact
         text: A negative sample, written as is.
@@ -622,9 +633,11 @@ rows:
           quantiles with `_sum` and `_count`.
       influxdb_out:
         class: degraded
+        counter: logit.output.metrics.degraded{metric_kind=samples}
         text: >-
           Sketched, each value weighted by its inverse sample rate, then written as the
-          `distribution` row describes, and counted only as that row says.
+          `distribution` row describes, counted once per record. A non-finite sum or quantile counts
+          as that row says.
       otlp_out:
         class: degraded
         counter: logit.output.metrics.degraded{metric_kind=samples}
@@ -713,12 +726,12 @@ rows:
           is gone, so quantiles from two senders don't merge.
       influxdb_out:
         class: degraded
+        counter: logit.output.metrics.degraded{metric_kind=distribution}
         text: >-
           In the `summary` row's shape: float `count` and `sum` fields and the sketch's `0.5`,
           `0.9`, and `0.99` quantiles, each read back as a gauge under `<name>.`; the sketch is
-          gone. When the sum and quantiles are finite, nothing is counted. A non-finite sum or
-          quantile is left off the line, and the record counts once as
-          `logit.output.metrics.degraded{reason=non_finite_component}`.
+          gone, counted once per record. A non-finite sum or quantile is left off the line, and the
+          record also counts `logit.output.metrics.degraded{reason=non_finite_component}`.
       otlp_out:
         class: degraded
         counter: logit.output.metrics.degraded{metric_kind=distribution}
@@ -759,7 +772,10 @@ rows:
         text: A `gauge` of the estimate; the registers are gone.
       influxdb_out:
         class: degraded
-        text: A `value=<estimate>u` field, read back as a gauge named `<name>.value`, uncounted.
+        counter: logit.output.metrics.degraded{metric_kind=set}
+        text: >-
+          A `value=<estimate>u` field, read back as a gauge named `<name>.value`; the registers are
+          gone, counted once per record.
       otlp_out:
         class: skipped
         counter: logit.output.metrics.skipped{metric_kind=set}
@@ -768,7 +784,7 @@ rows:
           `otlp_set_metric_skipped` warning.
       datadog_out:
         class: degraded
-        counter: logit.output.metrics.degraded{reason=set_estimate}
+        counter: logit.output.metrics.degraded{metric_kind=set}
         text: >-
           A series `gauge` of the estimate, the Agent's `s`; the registers are gone.
       graphite_out:
@@ -803,13 +819,13 @@ rows:
           an `aggregate` with `temporality: cumulative` upstream makes it a running one.
       influxdb_out:
         class: degraded
+        counter: logit.output.metrics.degraded{metric_kind=histogram}
         text: >-
-          Telegraf's shape: float `count`, `sum`, `min`, and `max` fields, a field per finite
-          bound named by the bound and holding the cumulative count up to it, and `+Inf` holding
-          the total, each read back as a gauge under `<name>.`, its temporality dropped. When
-          every component is finite, nothing is counted. A non-finite `sum`, `min`, or `max` is
-          left off the line, and the record counts once as
-          `logit.output.metrics.degraded{reason=non_finite_component}`.
+          Telegraf's shape: float `count`, `sum`, `min`, and `max` fields, a field per finite bound
+          named by the bound and holding the cumulative count up to it, and `+Inf` holding the
+          total, each read back as a gauge under `<name>.`, its temporality dropped, counted once
+          per record. A non-finite `sum`, `min`, or `max` is left off the line, and the record also
+          counts `logit.output.metrics.degraded{reason=non_finite_component}`.
       otlp_out:
         class: normalized
         reason: inf_bucket
@@ -865,13 +881,13 @@ rows:
             be added to itself.
       influxdb_out:
         class: degraded
+        counter: logit.output.metrics.degraded{metric_kind=histogram}
         text: >-
-          Telegraf's shape: float `count`, `sum`, `min`, and `max` fields, a field per finite
-          bound named by the bound and holding the cumulative count up to it, and `+Inf` holding
-          the total, each read back as a gauge under `<name>.`, its temporality dropped. When
-          every component is finite, nothing is counted. A non-finite `sum`, `min`, or `max` is
-          left off the line, and the record counts once as
-          `logit.output.metrics.degraded{reason=non_finite_component}`.
+          Telegraf's shape: float `count`, `sum`, `min`, and `max` fields, a field per finite bound
+          named by the bound and holding the cumulative count up to it, and `+Inf` holding the
+          total, each read back as a gauge under `<name>.`, its temporality dropped, counted once
+          per record. A non-finite `sum`, `min`, or `max` is left off the line, and the record also
+          counts `logit.output.metrics.degraded{reason=non_finite_component}`.
       otlp_out:
         class: normalized
         reason: inf_bucket
@@ -1149,13 +1165,13 @@ rows:
           warning; send this sink the summary from ahead of that component.
       influxdb_out:
         class: degraded
+        counter: logit.output.metrics.degraded{metric_kind=summary}
         text: >-
           Telegraf's shape: float `count` and `sum` fields and a field per quantile named by the
-          quantile (`0.5`, `0.99`), each read back as a gauge under `<name>.`. Line protocol has
-          no temporality, so a delta summary writes as a cumulative one does. When every
-          component is finite, nothing is counted. A non-finite `sum`, quantile, or quantile value
-          is left off the line, and the record counts once as
-          `logit.output.metrics.degraded{reason=non_finite_component}`.
+          quantile (`0.5`, `0.99`), each read back as a gauge under `<name>.`, counted once per
+          record. Line protocol has no temporality, so a delta summary writes as a cumulative one
+          does. A non-finite `sum`, quantile, or quantile value is left off the line, and the record
+          also counts `logit.output.metrics.degraded{reason=non_finite_component}`.
       otlp_out:
         class: dropped
         counter: logit.output.metrics.dropped{reason=unresolved_delta}
@@ -1164,10 +1180,11 @@ rows:
           `delta_summary_unresolved` warning.
       datadog_out:
         class: degraded
+        counter: logit.output.metrics.degraded{metric_kind=summary}
         text: >-
           A `<name>.quantile` gauge per quantile tagged `quantile:<q>`, and `.count` (no unit) and
-          `.sum` as `count` points, as Datadog's exporter writes a summary it differenced;
-          datadog_in reads them back as gauges and counts.
+          `.sum` as `count` points, as Datadog's exporter writes a summary it differenced, counted
+          once per record; datadog_in reads them back as gauges and counts.
       graphite_out:
         - when: {multi_value: expand}
           class: degraded
@@ -1195,12 +1212,12 @@ rows:
         text: A `summary` family of its quantiles, `_sum`, and `_count`.
       influxdb_out:
         class: degraded
+        counter: logit.output.metrics.degraded{metric_kind=summary}
         text: >-
           Telegraf's shape: float `count` and `sum` fields and a field per quantile named by the
-          quantile (`0.5`, `0.99`), each read back as a gauge under `<name>.`. When every
-          component is finite, nothing is counted. A non-finite `sum`, quantile, or quantile value
-          is left off the line, and the record counts once as
-          `logit.output.metrics.degraded{reason=non_finite_component}`.
+          quantile (`0.5`, `0.99`), each read back as a gauge under `<name>.`, counted once per
+          record. A non-finite `sum`, quantile, or quantile value is left off the line, and the
+          record also counts `logit.output.metrics.degraded{reason=non_finite_component}`.
       otlp_out:
         class: exact
         text: An OTLP `Summary`.
@@ -1230,12 +1247,12 @@ rows:
     cells:
       statsd_out:
         class: lost
-        reason: uncounted
-        text: statsd has no unit; it isn't written or counted.
+        reason: structural
+        text: statsd has no unit, so none is written.
       influxdb_out:
         class: lost
-        reason: uncounted
-        text: Line protocol has no unit; it isn't written or counted.
+        reason: structural
+        text: Line protocol has no unit, so none is written.
       otlp_out:
         class: exact
         text: The `Metric`'s `unit`.
@@ -1254,78 +1271,77 @@ rows:
           The series' `unit`.
       graphite_out:
         class: lost
-        reason: uncounted
-        text: Carbon has no unit; it isn't written or counted.
+        reason: structural
+        text: Carbon has no unit, so none is written.
   - kind: record
     feature: description
     cells:
       statsd_out:
         class: lost
-        reason: uncounted
-        text: statsd has no description; it isn't written or counted.
+        reason: structural
+        text: statsd has no description, so none is written.
       prometheus_out:
         class: exact
         text: The family's `# HELP` line.
       influxdb_out:
         class: lost
-        reason: uncounted
-        text: Line protocol has no description; it isn't written or counted.
+        reason: structural
+        text: Line protocol has no description, so none is written.
       otlp_out:
         class: exact
         text: The `Metric`'s `description`.
       datadog_out:
         class: lost
-        reason: uncounted
-        text: >-
-          Datadog's intake has no description; it isn't written or counted.
+        reason: structural
+        text: Datadog's intake has no description, so none is written.
       graphite_out:
         class: lost
-        reason: uncounted
-        text: Carbon has no description; it isn't written or counted.
+        reason: structural
+        text: Carbon has no description, so none is written.
   - kind: record
     feature: start_timestamp
     cells:
       statsd_out:
         class: lost
-        reason: uncounted
-        text: statsd has no start time; it isn't written or counted.
+        reason: structural
+        text: statsd has no start time, so none is written.
       influxdb_out:
         class: lost
-        reason: uncounted
+        reason: structural
         text: >-
-          Not written or counted, though the OTel Collector's InfluxDB exporter writes a
-          `start_time_unix_nano` field; `docs/known-gaps/influxdb.md` has the gap.
+          Line protocol has no start time, so none is written, though the OTel Collector's InfluxDB
+          exporter writes a `start_time_unix_nano` field; `docs/known-gaps/influxdb.md` has the gap.
       otlp_out:
         class: exact
         text: The data point's `start_time_unix_nano`.
       prometheus_out:
         class: lost
-        reason: uncounted
+        reason: structural
         text: >-
-          OpenMetrics' `_created` sample, written for a counter, histogram, or summary; a gauge's
-          start time is left off, uncounted.
+          OpenMetrics' `_created` sample, written for a counter, histogram, or summary; a gauge has
+          no `_created`, so its start time is left off.
       datadog_out:
         class: lost
-        reason: uncounted
-        text: >-
-          A series point has no start time; it isn't written or counted.
+        reason: structural
+        text: A series point has no start time, so none is written.
       graphite_out:
         class: lost
-        reason: uncounted
-        text: Carbon has no start time; it isn't written or counted.
+        reason: structural
+        text: Carbon has no start time, so none is written.
   - kind: record
     feature: exemplars
     cells:
       statsd_out:
         class: lost
-        reason: uncounted
-        text: statsd has no exemplars; they aren't written or counted.
+        reason: structural
+        text: statsd has no exemplars, so none are written.
       influxdb_out:
         class: lost
-        reason: uncounted
+        reason: structural
         text: >-
-          Not written or counted, though the OTel Collector's InfluxDB exporter writes each as a
-          point of a `<name>_exemplar` measurement; `docs/known-gaps/influxdb.md` has the gap.
+          Line protocol has no exemplars, so none are written, though the OTel Collector's InfluxDB
+          exporter writes each as a point of a `<name>_exemplar` measurement;
+          `docs/known-gaps/influxdb.md` has the gap.
       otlp_out:
         class: exact
         text: The data point's exemplars.
@@ -1338,13 +1354,12 @@ rows:
           128-code-point label budget, on either wire, is left off, counted.
       datadog_out:
         class: lost
-        reason: uncounted
-        text: >-
-          Datadog's intake has no exemplars; they aren't written or counted.
+        reason: structural
+        text: Datadog's intake has no exemplars, so none are written.
       graphite_out:
         class: lost
-        reason: uncounted
-        text: Carbon has no exemplars; they aren't written or counted.
+        reason: structural
+        text: Carbon has no exemplars, so none are written.
   # influxdb_out, otlp_out, and graphite_out write a `samples` or `distribution` record only in a
   # lesser form, so its fields are never compared there and none of them has a cell.
   # prometheus_out's summary is a lesser form too, but its cell names the counter its exposition
@@ -1363,14 +1378,14 @@ rows:
             left off, counted.
       statsd_out:
         class: lost
-        reason: uncounted
-        text: statsd has no unit; it isn't written or counted.
+        reason: structural
+        text: statsd has no unit, so none is written.
       datadog_out:
         class: lost
-        reason: uncounted
+        reason: structural
         text: >-
           Distribution points and sketches have no unit field, so a `samples` or `distribution`
-          record's unit is left off, uncounted; only the series routes write one.
+          record's unit is left off; only the series routes write one.
   # statsd_out, influxdb_out, and graphite_out write a summary only as dotted series or fields, a
   # lesser kind, and datadog_out skips it, so its fields are never compared there and none of them
   # has a cell.
@@ -1379,10 +1394,8 @@ rows:
     cells:
       otlp_out:
         class: lost
-        reason: uncounted
-        text: >-
-          A `SummaryDataPoint` has no exemplars field, so a summary's exemplars are left off,
-          uncounted.
+        reason: structural
+        text: A `SummaryDataPoint` has no exemplars field, so a summary's exemplars are left off.
       prometheus_out:
         class: lost
         counter: logit.output.metrics.degraded{reason=exemplar_omitted}
@@ -1398,8 +1411,8 @@ rows:
     cells:
       prometheus_out:
         class: lost
-        reason: uncounted
-        text: A histogram's `min` and `max` have no Prometheus series and aren't written, uncounted.
+        reason: structural
+        text: A histogram's `min` and `max` have no Prometheus series, so they aren't written.
       otlp_out:
         class: exact
         text: The data point's `min` and `max`.
@@ -1459,12 +1472,14 @@ rows:
       prometheus_out:
         - when: {bind: null}
           class: degraded
+          counter: logit.output.metrics.degraded
           text: >-
             Remote-write writes a flagged delta `Sum` as a stale marker, its temporality ignored,
             since a marker holds no reading to be delta about: a monotonic one on a `counter`, read
-            back as a flagged cumulative counter, uncounted, and a non-monotonic one on a `gauge`,
-            counted `logit.output.metrics.degraded{metric_kind=non_monotonic_sum}`. An unflagged
-            delta `Sum` is dropped.
+            back as a flagged cumulative counter, counted
+            `logit.output.metrics.degraded{metric_kind=delta_sum}`, and a non-monotonic one on a
+            `gauge`, counted `logit.output.metrics.degraded{metric_kind=non_monotonic_sum}`. An
+            unflagged delta `Sum` is dropped.
         - class: skipped
           counter: logit.output.metrics.skipped{reason=no_recorded_value}
           text: A point flagged as holding no recorded value isn't exposed.
@@ -1551,15 +1566,21 @@ rows:
       statsd_out:
         class: normalized
         reason: name_sanitized
+        counter: logit.output.metrics.normalized{reason=name_sanitized}
         text: >-
           Every `:`, `|`, `@`, `#`, `,`, control, and whitespace character in a name is written as
-          `_`, so the record reads back under the sanitized name, uncounted.
+          `_`, so the record reads back under the sanitized name, counted once per record it
+          renames.
       prometheus_out:
         class: normalized
         reason: name_sanitized
+        counter: logit.output.metrics.normalized{reason=name_sanitized}
         text: >-
           A name is forced into `[a-zA-Z_:][a-zA-Z0-9_:]*`, each other character `_`, so the record
-          reads back under the sanitized name, uncounted.
+          reads back under the sanitized name, counted once per record it renames. Two names that
+          sanitize onto one in a batch keep one family, the other counted
+          `logit.output.metrics.dropped{reason=name_collision}`; across batches they merge into one
+          series, uncounted.
       graphite_out:
         class: normalized
         reason: path_sanitized
@@ -1579,20 +1600,23 @@ rows:
       prometheus_out:
         class: normalized
         reason: name_sanitized
+        counter: logit.output.labels.normalized{reason=name_sanitized}
         text: >-
           An exemplar's attribute key is written as a label name forced into
           `[a-zA-Z_][a-zA-Z0-9_]*`, each other character `_`, as a series label's is, so the
-          exemplar reads back under the sanitized key, uncounted.
+          exemplar reads back under the sanitized key, counted once per key it renames.
   - kind: record
     feature: exemplar_key_unsafe_histogram
     cells:
       prometheus_out:
         class: normalized
         reason: name_sanitized
+        counter: logit.output.labels.normalized{reason=name_sanitized}
         text: >-
           An exemplar's attribute key is written as a label name forced into
           `[a-zA-Z_][a-zA-Z0-9_]*`, each other character `_`, as a series label's is, so the
-          exemplar reads back on its bucket under the sanitized key, uncounted.
+          exemplar reads back on its bucket under the sanitized key, counted once per key it
+          renames.
   - kind: record
     feature: sample_rate
     cells:
@@ -1629,10 +1653,11 @@ rows:
         text: The rate is written as `@rate` on the line.
       datadog_out:
         class: lost
-        reason: uncounted
+        counter: logit.output.metrics.degraded{reason=sample_rate_rounded}
         text: >-
           A rate below 1 that rounds to weight 1, such as 0.8, writes each value once on the
-          distribution route, which has no rate, so datadog_in reads it back at rate 1, uncounted.
+          distribution route, which has no rate, so datadog_in reads it back at rate 1, counted once
+          per record.
   - kind: record
     feature: superseded
     cells:
@@ -1870,17 +1895,20 @@ rows:
           text: Plain statsd has no tags; each is counted once per wire tag.
         - class: normalized
           reason: tag_rewritten
+          counter: logit.output.tags.normalized
           text: >-
             A DogStatsD `key:value` tag. Each `:`, `|`, `@`, `#`, `,`, control, and whitespace
-            character in the key, and each but `:` in the value, is written as `_`, uncounted. A
-            non-empty `host.name` on a record with no `host` and no non-empty `h:` field is the
-            `host:` tag, which statsd_in reads back as `host`.
+            character in the key, and each but `:` in the value, is written as `_`, counted once per
+            wire tag as `name_sanitized` for a key and `value_sanitized` for a value. A non-empty
+            `host.name` on a record with no `host` and no non-empty `h:` field is the `host:` tag,
+            which statsd_in reads back as `host`.
       prometheus_out:
         class: normalized
         reason: label_sanitized
+        counter: logit.output.labels.normalized{reason=name_sanitized}
         text: >-
-          A label; its name is forced into `[a-zA-Z_][a-zA-Z0-9_]*`, so a key holding `.` or
-          another character reads back under the sanitized name.
+          A label; its name is forced into `[a-zA-Z_][a-zA-Z0-9_]*`, so a key holding `.` or another
+          character reads back under the sanitized name, counted once per label it renames.
       otlp_out:
         class: exact
         text: A string attribute.
@@ -1928,7 +1956,10 @@ rows:
       prometheus_out:
         class: normalized
         reason: stringified
-        text: A label of `true` or `false`, read back as the string.
+        counter: logit.output.labels.normalized{reason=name_sanitized}
+        text: >-
+          A label of `true` or `false`, read back as the string. A name outside the label-name
+          grammar is sanitized, counted once per label it renames.
       influxdb_out:
         class: normalized
         reason: stringified
@@ -1938,9 +1969,10 @@ rows:
         text: A boolean attribute.
       datadog_out:
         class: lost
-        reason: uncounted
+        counter: logit.output.tags.omitted{reason=unrepresentable}
         text: >-
-          `true` is a bare `key` tag, read back as `true`; `false` writes no tag at all, uncounted.
+          `true` is a bare `key` tag, read back as `true`; `false` has no Datadog tag form, so it
+          writes no tag and is counted.
       graphite_out:
         - when: {tags: drop}
           class: lost
@@ -1967,7 +1999,10 @@ rows:
       prometheus_out:
         class: normalized
         reason: stringified
-        text: A label of the number's decimal text, read back as the string.
+        counter: logit.output.labels.normalized{reason=name_sanitized}
+        text: >-
+          A label of the number's decimal text, read back as the string. A name outside the
+          label-name grammar is sanitized, counted once per label it renames.
       influxdb_out:
         class: normalized
         reason: stringified
@@ -1975,9 +2010,10 @@ rows:
       otlp_out:
         class: normalized
         reason: u64_as_int
+        counter: logit.output.attributes.normalized{reason=u64_as_double}
         text: >-
-          An integer or double attribute. A `u64` reads back as an `i64`, or, above `i64::MAX`,
-          as a double, approximate beyond 2^53, uncounted.
+          An integer or double attribute. A `u64` reads back as an `i64`, or, above `i64::MAX`, as a
+          double, approximate beyond 2^53, counted once per such value.
       datadog_out:
         class: normalized
         reason: stringified
@@ -2176,9 +2212,7 @@ rows:
           The family type and timestamp carriers are consumed into the wire form and a scrape
           stamps them back; OpenMetrics has no `untyped`, so that type reads back as `unknown`.
           Remote-write gives every sample a timestamp, so prometheus_in stamps no timestamp
-          carrier. The resource's `_logit.prometheus.target` isn't written: a scrape of
-          prometheus_out stamps its own URL, and the original target survives only as the
-          `instance` label.
+          carrier; the sample's own timestamp reads back unchanged.
       datadog_out:
         class: lost
         counter: logit.output.tags.omitted{reason=no_wire_form}
@@ -2186,41 +2220,74 @@ rows:
           A `_logit.datadog.*` carrier rides in its own wire field; one the route has no field for
           is left off, counted.
   - kind: attributes
+    feature: prometheus_target
+    cells:
+      statsd_out:
+        class: lost
+        reason: structural
+        text: The scrape target is private and isn't a tag, so it's left off.
+      prometheus_out:
+        class: normalized
+        reason: retargeted
+        text: >-
+          The resource's `_logit.prometheus.target` isn't written. A scrape of prometheus_out
+          stamps prometheus_out's own URL, and a remote-write receiver stamps none. Only the
+          original target's host:port survives, as the `instance` label; its scheme and path are
+          lost.
+      influxdb_out:
+        class: lost
+        reason: structural
+        text: The scrape target is private and isn't a tag, so it's left off.
+      otlp_out:
+        class: lost
+        reason: structural
+        text: The scrape target is private and isn't an OTLP attribute, so it's left off.
+      datadog_out:
+        class: lost
+        reason: structural
+        text: The scrape target is private and never a tag, so it's left off.
+      graphite_out:
+        class: lost
+        reason: structural
+        text: >-
+          The scrape target is private and isn't a tag, so it's left off, under either `tags:`
+          mode.
+  - kind: attributes
     feature: foreign_carrier
     cells:
       statsd_out:
         class: lost
-        reason: uncounted
+        reason: structural
         text: >-
-          Another protocol's `_logit.` carrier isn't a tag and is left off, uncounted. Under
+          Another protocol's `_logit.` carrier is private and isn't a tag, so it's left off. Under
           `format: dogstatsd`, `_logit.datadog.hostless` on a record with no `host`, no non-empty
           `host.name`, and no non-empty `h:` field is an empty `host:` tag, which statsd_in reads
           back as an empty `host`.
       prometheus_out:
         class: lost
-        reason: uncounted
-        text: Another protocol's `_logit.` carrier isn't a label and is left off, uncounted.
+        reason: structural
+        text: Another protocol's `_logit.` carrier is private and isn't a label, so it's left off.
       influxdb_out:
         class: lost
-        reason: uncounted
-        text: Another protocol's `_logit.` carrier isn't a tag and is left off, uncounted.
+        reason: structural
+        text: Another protocol's `_logit.` carrier is private and isn't a tag, so it's left off.
       otlp_out:
         class: lost
-        reason: uncounted
-        text: A `_logit.` carrier is private and isn't an OTLP attribute, uncounted.
+        reason: structural
+        text: A `_logit.` carrier is private and isn't an OTLP attribute, so it's left off.
       datadog_out:
         class: lost
-        reason: uncounted
+        reason: structural
         text: >-
-          Another protocol's `_logit.` carrier is never a tag; it isn't written or counted. The
+          Another protocol's `_logit.` carrier is private and never a tag, so it's left off. The
           `_logit.statsd.event.*` and `_logit.statsd.service_check.*` carriers are read as the
           Datadog fields they name.
       graphite_out:
         class: lost
-        reason: uncounted
+        reason: structural
         text: >-
-          Another protocol's `_logit.` carrier isn't a tag and is left off, uncounted, under either
-          `tags:` mode.
+          Another protocol's `_logit.` carrier is private and isn't a tag, so it's left off, under
+          either `tags:` mode.
   - kind: attributes
     feature: resource_attribute
     cells:
@@ -2237,8 +2304,10 @@ rows:
       prometheus_out:
         class: normalized
         reason: resource_merged
+        counter: logit.output.labels.normalized{reason=name_sanitized}
         text: >-
-          A label, the event's value winning on a shared key, read back as an event attribute.
+          A label, the event's value winning on a shared key, read back as an event attribute. A
+          name outside the label-name grammar is sanitized, counted once per label it renames.
       influxdb_out:
         class: normalized
         reason: resource_merged
@@ -2269,48 +2338,47 @@ rows:
     cells:
       statsd_out:
         class: lost
-        reason: uncounted
-        text: statsd has no instrumentation scope; it isn't written or counted.
+        reason: structural
+        text: statsd has no instrumentation scope, so none is written.
       prometheus_out:
         class: lost
-        reason: uncounted
-        text: Prometheus has no instrumentation scope; it isn't written or counted.
+        reason: structural
+        text: Prometheus has no instrumentation scope, so none is written.
       influxdb_out:
         class: lost
-        reason: uncounted
-        text: Line protocol has no instrumentation scope; it isn't written or counted.
+        reason: structural
+        text: Line protocol has no instrumentation scope, so none is written.
       otlp_out:
         class: exact
         text: The `InstrumentationScope` of the batch.
       datadog_out:
         class: lost
-        reason: uncounted
-        text: >-
-          Datadog has no instrumentation scope; it isn't written or counted.
+        reason: structural
+        text: Datadog has no instrumentation scope, so none is written.
       graphite_out:
         class: lost
-        reason: uncounted
-        text: Carbon has no instrumentation scope; it isn't written or counted.
+        reason: structural
+        text: Carbon has no instrumentation scope, so none is written.
 
   - kind: attributes
     feature: datadog_carrier_log
     cells:
       statsd_out:
         class: lost
-        reason: uncounted
-        text: Another protocol's `_logit.` carrier isn't a tag and is left off, uncounted.
+        reason: structural
+        text: Another protocol's `_logit.` carrier is private and isn't a tag, so it's left off.
       prometheus_out:
         class: lost
-        reason: uncounted
-        text: Another protocol's `_logit.` carrier isn't a label and is left off, uncounted.
+        reason: structural
+        text: Another protocol's `_logit.` carrier is private and isn't a label, so it's left off.
       influxdb_out:
         class: lost
-        reason: uncounted
-        text: Another protocol's `_logit.` carrier isn't a tag and is left off, uncounted.
+        reason: structural
+        text: Another protocol's `_logit.` carrier is private and isn't a tag, so it's left off.
       otlp_out:
         class: lost
-        reason: uncounted
-        text: A `_logit.` carrier is private and isn't an OTLP attribute, uncounted.
+        reason: structural
+        text: A `_logit.` carrier is private and isn't an OTLP attribute, so it's left off.
       datadog_out:
         class: lost
         reason: uncounted
@@ -2321,8 +2389,8 @@ rows:
           `_logit.datadog.agent.hostname`.
       graphite_out:
         class: lost
-        reason: uncounted
-        text: Another protocol's `_logit.` carrier isn't a tag and is left off, uncounted.
+        reason: structural
+        text: Another protocol's `_logit.` carrier is private and isn't a tag, so it's left off.
 
   # --- attributes datadog_out writes from a record's own fields ----------------------------------
   # Every sink reaches these rows; only datadog_out writes the attribute, which its pair decoder
@@ -2411,12 +2479,12 @@ rows:
             A log carrying the `_logit.statsd.event.*` carriers is a DogStatsD `_e` line again.
       prometheus_out:
         class: skipped
-        reason: uncounted
-        text: A log has no Prometheus form and isn't written, uncounted.
+        counter: logit.output.events.skipped{reason=no_metrics}
+        text: A log has no Prometheus form and isn't written.
       influxdb_out:
         class: skipped
-        reason: uncounted
-        text: A log has no line-protocol form and isn't written, uncounted.
+        counter: logit.output.events.skipped{reason=no_metrics}
+        text: A log has no line-protocol form and isn't written.
       otlp_out:
         class: normalized
         reason: observed_timestamp
@@ -2438,16 +2506,16 @@ rows:
     cells:
       statsd_out:
         class: skipped
-        counter: logit.output.events.skipped
+        counter: logit.output.events.skipped{reason=no_metrics}
         text: Any other log on an event with no metrics has no statsd form and isn't written.
       prometheus_out:
         class: skipped
-        reason: uncounted
-        text: A log has no Prometheus form and isn't written, uncounted.
+        counter: logit.output.events.skipped{reason=no_metrics}
+        text: A log has no Prometheus form and isn't written.
       influxdb_out:
         class: skipped
-        reason: uncounted
-        text: A log has no line-protocol form and isn't written, uncounted.
+        counter: logit.output.events.skipped{reason=no_metrics}
+        text: A log has no line-protocol form and isn't written.
       otlp_out:
         class: normalized
         reason: observed_timestamp
@@ -2503,19 +2571,19 @@ rows:
     cells:
       statsd_out:
         class: skipped
-        counter: logit.output.events.skipped
+        counter: logit.output.events.skipped{reason=no_metrics}
         text: A span on an event with no metrics has no statsd form and isn't written.
       otlp_out:
         class: exact
         text: An OTLP span.
       prometheus_out:
         class: skipped
-        reason: uncounted
-        text: A span has no Prometheus form and isn't written, uncounted.
+        counter: logit.output.events.skipped{reason=no_metrics}
+        text: A span has no Prometheus form and isn't written.
       influxdb_out:
         class: skipped
-        reason: uncounted
-        text: A span has no line-protocol form and isn't written, uncounted.
+        counter: logit.output.events.skipped{reason=no_metrics}
+        text: A span has no line-protocol form and isn't written.
       datadog_out:
         class: exact
         text: >-
@@ -2594,30 +2662,30 @@ rows:
     cells:
       statsd_out:
         class: skipped
-        counter: logit.output.events.skipped
+        counter: logit.output.events.skipped{reason=no_metrics}
         text: An event with no metric, log, or span has no statsd line and isn't written.
       prometheus_out:
         class: skipped
-        reason: uncounted
-        text: An event with no metric, log, or span has no sample and isn't written, uncounted.
+        counter: logit.output.events.skipped{reason=no_metrics}
+        text: An event with no metric, log, or span has no sample and isn't written.
       influxdb_out:
         class: skipped
-        reason: uncounted
+        counter: logit.output.events.skipped{reason=no_metrics}
         text: >-
-          An event with no metric, log, or span and no `_logit.influxdb.measurement` carrier has
-          no measurement to write under and isn't written, uncounted. A stage that drops the
-          carrier leaves an InfluxDB point whose fields are all strings this way: a `remove` of
-          it, or a `keep` under `private: drop`, which drops the string fields too.
+          An event with no metric, log, or span and no `_logit.influxdb.measurement` carrier has no
+          measurement to write under and isn't written. A stage that drops the carrier leaves an
+          InfluxDB point whose fields are all strings this way: a `remove` of it, or a `keep` under
+          `private: drop`, which drops the string fields too.
       otlp_out:
         class: skipped
-        reason: uncounted
-        text: An event with no metric, log, or span has no OTLP signal and isn't sent, uncounted.
+        counter: logit.output.events.skipped{reason=no_payload}
+        text: An event with no metric, log, or span has no OTLP signal and isn't sent.
       datadog_out:
         class: skipped
-        reason: uncounted
+        counter: logit.output.events.skipped{reason=no_payload}
         text: >-
           An event with no metric, log, or span takes none of the intake's routes, so no request
-          carries it, uncounted.
+          carries it.
       graphite_out:
         class: skipped
         counter: logit.output.events.skipped{reason=no_metrics}
@@ -2627,16 +2695,16 @@ rows:
     cells:
       statsd_out:
         class: skipped
-        counter: logit.output.events.skipped
+        counter: logit.output.events.skipped{reason=no_metrics}
         text: >-
           An InfluxDB point whose fields are all strings has no metric, so it has no statsd line
           and isn't written.
       prometheus_out:
         class: skipped
-        reason: uncounted
+        counter: logit.output.events.skipped{reason=no_metrics}
         text: >-
           An InfluxDB point whose fields are all strings has no metric, so it has no sample and
-          isn't written, uncounted.
+          isn't written.
       influxdb_out:
         class: exact
         text: >-
@@ -2644,16 +2712,16 @@ rows:
           its `_logit.influxdb.measurement` carrier names, read back as the same event.
       otlp_out:
         class: skipped
-        reason: uncounted
+        counter: logit.output.events.skipped{reason=no_payload}
         text: >-
-          An InfluxDB point whose fields are all strings has no OTLP signal and isn't sent,
-          uncounted, so its fields are lost.
+          An InfluxDB point whose fields are all strings has no OTLP signal and isn't sent, so its
+          fields are lost.
       datadog_out:
         class: skipped
-        reason: uncounted
+        counter: logit.output.events.skipped{reason=no_payload}
         text: >-
           An InfluxDB point whose fields are all strings has no metric, so it takes none of the
-          intake's routes and no request carries it, uncounted.
+          intake's routes and no request carries it.
       graphite_out:
         class: skipped
         counter: logit.output.events.skipped{reason=no_metrics}

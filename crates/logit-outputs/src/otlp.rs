@@ -2080,17 +2080,73 @@ mod tests {
         }
     }
 
-    /// A counter that is sent, and [`nothing_to_send_batch`]'s gauge delta: one metrics request.
+    /// A counter that is sent with a `u64` attribute above `i64::MAX`, [`nothing_to_send_batch`]'s
+    /// gauge delta, and an event with no payload: one metrics request.
     fn encode_side_batch() -> EventBatch {
         let mut batch = nothing_to_send_batch();
-        batch.events.extend(metric_batch().events);
+        let mut sent = metric_batch().events;
+        sent[0].attributes.insert("bytes", logit_core::Value::U64(u64::MAX));
+        batch.events.extend(sent);
+        batch.events.push(Event::empty(1, AttrMap::new()));
         batch
     }
 
-    const ENCODE_SIDE: [SumSeries<'static>; 2] = [
+    const ENCODE_SIDE: [SumSeries<'static>; 4] = [
         ("logit.output.metrics.dropped", &[("reason", "unresolved_gauge_delta")]),
         ("logit.component.diagnostics", &[("key", "gauge_delta_unresolved")]),
+        ("logit.output.attributes.normalized", &[("reason", "u64_as_double")]),
+        ("logit.output.events.skipped", &[("reason", "no_payload")]),
     ];
+
+    /// A `u64` above `i64::MAX` counts once per value, nested and resource values included, and
+    /// one that fits an `int64` or sits under a private key counts nothing. An event with no
+    /// payload counts once and writes nothing.
+    #[test]
+    fn a_u64_attribute_written_as_a_double_and_an_event_with_no_payload_are_counted() {
+        use logit_core::Value;
+        use logit_proto::SignalEncoder as _;
+
+        let mut probe = TelemetryProbe::new();
+        let mut encoder =
+            OtlpEncoder::new().with_telemetry(probe.telemetry("out", "otlp_out", "sink"));
+        let mut resource = Resource::default();
+        resource.attributes.insert("host.id", Value::U64(u64::MAX));
+        let mut batch = metric_batch();
+        batch.resource = Arc::new(resource);
+        let attributes = &mut batch.events[0].attributes;
+        attributes.insert("ids", Value::Array(vec![Value::U64(u64::MAX), Value::U64(7)]));
+        attributes.insert("small", Value::U64(i64::MAX as u64));
+        attributes.insert("_logit.statsd.big", Value::U64(u64::MAX));
+        batch.events.push(Event::empty(1, AttrMap::new()));
+        let payloads = encoder.encode_signals(&batch).unwrap();
+        assert_eq!(payloads.len(), 1, "the empty event adds no payload");
+        assert_eq!(payloads[0].records, 1);
+        let reason = [("reason", "u64_as_double")];
+        assert_eq!(probe.sum("logit.output.attributes.normalized", &reason), 2.0);
+        assert_eq!(probe.sum("logit.output.events.skipped", &[("reason", "no_payload")]), 1.0);
+    }
+
+    /// An event whose every metric is dropped writes no attribute, so a `u64` above `i64::MAX` on
+    /// it counts nothing; with no payload, the resource's isn't written either.
+    #[test]
+    fn a_u64_attribute_on_a_dropped_event_is_not_counted() {
+        use logit_core::Value;
+        use logit_proto::SignalEncoder as _;
+
+        let mut probe = TelemetryProbe::new();
+        let mut encoder =
+            OtlpEncoder::new().with_telemetry(probe.telemetry("out", "otlp_out", "sink"));
+        let mut batch = nothing_to_send_batch();
+        let mut resource = Resource::default();
+        resource.attributes.insert("host.id", Value::U64(u64::MAX));
+        batch.resource = Arc::new(resource);
+        batch.events[0].attributes.insert("bytes", Value::U64(u64::MAX));
+        assert!(encoder.encode_signals(&batch).unwrap().is_empty());
+        let dropped = [("reason", "unresolved_gauge_delta")];
+        assert_eq!(probe.sum("logit.output.metrics.dropped", &dropped), 1.0);
+        let reason = [("reason", "u64_as_double")];
+        assert_eq!(probe.sum("logit.output.attributes.normalized", &reason), 0.0);
+    }
 
     /// An `Export*ServiceResponse` whose `partial_success` rejects two data points.
     fn partial_success() -> Vec<u8> {

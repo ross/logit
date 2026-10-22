@@ -372,12 +372,30 @@ mod tests {
 
     #[test]
     fn rate_one_keeps_everything() {
-        // Rule 61 rejects `rate: 1` in config; the transform itself still keeps everything.
         let mut s = keyed(1.0, SampleKey::Attribute("k".into()));
         let r = no_resource();
         for n in 0..200 {
             assert!(s.process(&r, &mut log_event(&[("k", Value::I64(n))])));
         }
+    }
+
+    #[test]
+    fn rate_zero_with_no_override_discards_everything_and_counts_it() {
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("sampled", "sample", "transform");
+        let mut s =
+            Sample::new(0.0, Some(SampleKey::Attribute("k".into())), SampleMissing::Random, None)
+                .with_telemetry(telemetry);
+        let r = no_resource();
+        for n in 0..50 {
+            assert!(!s.process(&r, &mut log_event(&[("k", Value::I64(n))])));
+        }
+        assert!(!s.process(&r, &mut log_event(&[])), "a missing key draws against rate 0");
+        s.end_batch();
+        let events = registry.drain(0);
+        assert_eq!(decisions(&events, "discarded", "key"), Some(50.0));
+        assert_eq!(decisions(&events, "discarded", "missing"), Some(1.0));
+        assert_eq!(decisions(&events, "kept", "key"), None);
     }
 
     #[test]

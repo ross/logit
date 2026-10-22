@@ -1,6 +1,6 @@
 ---
 created: 2026-10-11
-updated: 2026-10-11
+updated: 2026-10-21
 ---
 
 # `bucket`: a numeric-range classifier that writes a bounded attribute value
@@ -91,12 +91,13 @@ an unset field), as `kv_metrics` argues for its skips. Telemetry mirrors `keep_v
 pair: `logit.transform.values.bucketed` and `logit.transform.values.unmatched`, each tagged with the
 config-declared `field`.
 
-**Graph validation (rule 82)** rejects an empty `attributes` map; an empty field name, `into`,
-`ranges`, class `value`, or `other`; an `into` that names another configured source field, or that
-two fields share; a range with both `lt` and `le`; a boundless range that isn't last; a non-finite
-bound; and a range the ranges before it already cover: a bound below the previous one, or equal to
-it unless `lt: X` is followed by `le: X`. Each is a config that can never write a class, a range
-that can never match, or a result that depends on key order. Two ranges may share a class.
+**Graph validation (rule 82)** rejects an empty field name, `into`, `ranges`, class `value`, or
+`other`; an `into` that names another configured source field, or that two fields share; a range
+with both `lt` and `le`; a boundless range that isn't last; a non-finite bound; and a range the
+ranges before it already cover: a bound below the previous one, or equal to it unless `lt: X` is
+followed by `le: X`. Each is a config that can never write a class, a range that can never match, or
+a result that depends on key order. Two ranges may share a class. An empty `attributes` map is
+legal: the component forwards every event unchanged.
 
 ## Alternatives considered
 
