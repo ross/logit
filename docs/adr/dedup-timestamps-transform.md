@@ -349,17 +349,25 @@ every reading it removes:
   whole batch so no request cut splits a pair. Distribution points aren't collapsed, because
   Datadog keeps both.
 
-What a removed reading counts depends on whether it equals the reading the sink sends:
+What a removed reading counts depends on what it is and whether it equals the reading the sink
+sends:
 
 | Removed reading | Counted |
 |---|---|
-| equal to the reading sent | `logit.output.metrics.normalized{reason="duplicate_timestamp"}` |
+| a state, equal to the reading sent | `logit.output.metrics.normalized{reason="duplicate_timestamp"}` |
 | any other | `logit.output.metrics.dropped{reason="duplicate_timestamp"}`, with a throttled `duplicate_timestamp` diagnostic naming `dedup_timestamps` |
 
-An equal reading loses nothing: the destination stores the same sample whichever of the two
-arrives, so the rule each destination applies inside one request (the first, or the higher) makes
-no difference. A Datadog Agent relay or a retry resends identical points, and that mustn't raise a
-loss alarm.
+A **state** is a reading a later equal reading fully replaces: a `Gauge`, a cumulative `Sum`,
+`Histogram`, `ExponentialHistogram`, or `Summary`, and a set written as a gauge of its size
+(`SetMembers` or `Set`). An equal state loses nothing: the destination stores the same sample
+whichever of the two arrives, so the rule each destination applies inside one request (the first,
+or the higher) makes no difference. A Datadog Agent relay or a retry resends identical points,
+and that mustn't raise a loss alarm.
+
+Every other reading is an **increment or an observation set**: a delta `Sum` (Datadog's `count`
+and `rate`), a delta `Histogram`, `ExponentialHistogram`, or `Summary`, `Samples`, and a
+`Distribution`. Two equal ones in one bucket are two real sets of events, and the sink sends one,
+so the removed one stays `dropped` whatever its value. A `dedup_timestamps` upstream sums them.
 
 Equal means the whole reading as the sink writes it, each `f64` compared by its bits, so a `NaN`
 equals only the same `NaN` and `0.0` doesn't equal `-0.0`:
@@ -482,10 +490,9 @@ keep the higher.
   it. A flow without it shows a nonzero
   `logit.output.metrics.dropped{reason="duplicate_timestamp"}` once two readings of a series in
   one bucket differ, which is the prompt to add it.
-- **Two equal delta increments in one bucket count `normalized`, not `dropped`.** The rule
-  compares readings, not what they mean: two `count` points of `1` in one second are two
-  increments, and the sink sends one. Datadog would keep one of the pair too. A `dedup_timestamps`
-  upstream sums them. Remote-write never sends a delta, so the case is `datadog_out`'s alone.
+- **Two equal increments in one bucket stay `dropped`.** Two `count` points of `1` in one second
+  are two events, and the sink sends one, so an operator relaying such a flow sees the loss and
+  places a `dedup_timestamps` to sum them. Only an equal state counts `normalized`.
 - `Transform` gains a batch-level hook, defaulting to a no-op.
 - `dedup_timestamps` doesn't stop a cross-batch duplicate with a new value from drawing a remote-write
   `400` that drops a whole batch. W3 records it in `docs/known-gaps/prometheus.md`
