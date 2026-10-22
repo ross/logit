@@ -555,6 +555,22 @@ mod tests {
         assert_eq!(event.attributes.get("foo"), Some(&map(&[("key", Value::str("bar"))])));
     }
 
+    #[test]
+    fn an_empty_named_list_expands_nothing() {
+        let mut f = Flatten::new(Fields::Named(vec![]), Fields::Named(vec![]), Arrays::Index);
+        let resource = default_resource();
+        let mut event = event_with_attrs(&[("foo", map(&[("key", Value::str("bar"))]))]);
+        assert!(f.process(&resource, &mut event));
+        assert_eq!(event.attributes.get("foo"), Some(&map(&[("key", Value::str("bar"))])));
+
+        // An empty named list still builds a mapped Resource, with the same attributes.
+        let mut attrs = AttrMap::new();
+        attrs.insert("svc", map(&[("name", Value::str("api"))]));
+        let nested = Arc::new(Resource { attributes: attrs.clone(), ..Default::default() });
+        let mapped = f.map_resource(&nested).expect("an empty named list still maps the resource");
+        assert_eq!(mapped.attributes, attrs);
+    }
+
     // -- collision --------------------------------------------------------------------------
 
     #[test]

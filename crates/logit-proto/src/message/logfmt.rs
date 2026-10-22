@@ -25,8 +25,9 @@
 //!   count one `pairs.skipped`; none of them gets a diagnostic.
 //! - [`ParseError::NoPairs`] means no segment produced a `key<kv_sep>value` pair, so a line whose
 //!   every `kv_sep` segment has an empty key (`=1&=2`) fails like a line with no `kv_sep`.
-//! - Both separators are non-empty: graph rule 30 rejects an empty one, which would split between
-//!   every byte. The byte search here returns no match for an empty needle rather than looping.
+//! - Any separators parse without panicking or looping: the byte search returns no match for an
+//!   empty needle. So an empty `pair_sep` reads the whole line as one segment, and an empty
+//!   `kv_sep`, identical separators, or a `kv_sep` containing `pair_sep` find no pair.
 
 use bytes::Bytes;
 use logit_core::interner::KeyCache;
@@ -208,8 +209,8 @@ pub fn parse_logfmt(
 /// Finds `needle`'s first occurrence in `haystack` at or after byte offset `from`.
 ///
 /// A plain byte search: a valid UTF-8 needle found in valid UTF-8 always lands on a char boundary
-/// (self-synchronization), so no boundary check is needed. An empty `needle` finds nothing; graph
-/// rule 30 keeps both of `kv`'s separators non-empty.
+/// (self-synchronization), so no boundary check is needed. An empty `needle` finds nothing, which
+/// is what keeps an empty `kv` separator from looping.
 fn find_bytes(haystack: &[u8], needle: &[u8], from: usize) -> Option<usize> {
     if needle.is_empty() || from > haystack.len() {
         return None;

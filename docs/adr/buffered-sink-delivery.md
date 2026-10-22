@@ -1,6 +1,6 @@
 ---
 created: 2026-09-01
-updated: 2026-10-18
+updated: 2026-10-21
 ---
 
 # Buffered, decoupled sink delivery
@@ -136,6 +136,10 @@ destination restarting) surfaces as `Clean`, and is retried under both postures 
 duplicate risk, since the connection never succeeded in the first place.
 
 ### Retry moves behind the queue boundary and its budget widens
+
+[`buffer.retry_budget` no longer exists. [ADR `sink-fault-classes`](sink-fault-classes.md) removed
+it: a retryable fault retries until it succeeds or shutdown cuts it. See "Amendment: four fault
+classes and no process exit (2026-10-04)" below.]
 
 Retry relocates from `InfluxDbOutput::send`'s own loop into a generic `deliver_with_retry` in
 `logit-pipeline`, driven by the writer per the resolved posture and `Fault`. `InfluxDbOutput` keeps
@@ -327,13 +331,16 @@ means for counters. Encode-side counters count once per batch, through a gate
 `Output::observe_batch` arms, and transport counters count once per attempt. Server-verdict drops
 count per attempt and repeat on a retried batch. `Output::observe_batch` runs once per batch, not
 once per attempt. A sink's zero `buffer.retry_budget` or `buffer.retry_max_delay` fails config
-validation (graph rule 15), so `logit validate` and `logit run` both reject it. `Output` gains no
+validation (graph rule 15), so `logit validate` and `logit run` both reject it.
+[`buffer.retry_budget` no longer exists ([ADR `sink-fault-classes`](sink-fault-classes.md)); rule
+15 rejects a zero `buffer.retry_max_delay`.] `Output` gains no
 method and no parameter.
 
 ## Amendment: once-per-batch counting (2026-09-29)
 
 `statsd_out`, `syslog_out`, `graphite_out`, `collectd_out`, `influxdb_out`, `stdio_out`, and
-`file_out` count once per batch as above, and graph rule 15 rejects the two zero durations ([ADR
+`file_out` count once per batch as above, and graph rule 15 rejects the two zero durations
+[now one: `buffer.retry_budget` no longer exists] ([ADR
 `sink-send-path-and-attempt-accounting`](sink-send-path-and-attempt-accounting.md), decisions 2, 10,
 and 13). The gate lives in `logit_core::Telemetry`, armed by `observe_batch`, and mutes only
 during an encode that repeats one an earlier attempt at the batch already counted. An unarmed gate

@@ -1,6 +1,6 @@
 ---
 created: 2026-08-30
-updated: 2026-10-18
+updated: 2026-10-21
 ---
 
 # `kv_metrics`: skip rules, numeric coercion, and no `tags:` field
@@ -29,10 +29,10 @@ own — their behavior is mechanical once `kv_metrics` decides it doesn't own ta
 ## Decision
 
 **No `field` means `+1` per event (counter) or "set to 1" (gauge); a distribution with no `field` is
-a config error, rejected at graph-validation time.** A distribution of nothing is meaningless, and
-catching this at `logit validate`/`logit run`'s validation step (`crates/logit-pipeline/src/graph.rs`)
-is strictly better than a runtime no-op nobody notices — the same reasoning as rule 7's "every
-non-sink component has a consumer" catching a different silent-black-hole shape.
+a config error, rejected at graph-validation time (rule 11).** A counter or gauge with no `field`
+still has a value to record, but a distribution has no sample to add, so the entry can't run as
+written. `logit validate`/`logit run`'s validation step (`crates/logit-pipeline/src/graph.rs`) says
+so before the process starts.
 
 **An empty `name` on any counter, gauge, or distribution entry is also a config error, rejected at
 graph-validation time (rule 11).** `name` becomes the measurement in every metric line the
@@ -153,3 +153,12 @@ never touched — only `metrics` is written.
 - `KvMetrics::new` interning names/units once means a `kv_metrics` component's `counters`/`gauges`/
   `distributions` lists are fixed for that component's lifetime — there is no way to add or rename a
   derived metric without restarting the process, same as every other config-driven component today.
+
+## Amendment: an empty `kv_metrics` is legal; rule 10 is retired (2026-10-21)
+
+Graph rule 10 rejected a `kv_metrics` whose `counters`, `gauges`, and `distributions` were all
+empty, as a certain no-op. It's gone: such a component forwards every event unchanged. Validation
+rejects a config only when it can't run, or when it would lose or duplicate data the operator didn't
+ask to lose or duplicate; a pointless config runs as written. Rule 11, a distribution with no
+`field` or an entry with an empty `name`, stays. The number 10 is not reused, so the other rules
+keep theirs.

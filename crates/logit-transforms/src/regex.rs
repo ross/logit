@@ -441,4 +441,14 @@ mod tests {
         assert_eq!(matched_count(&events, "logit.transform.matched"), None);
         assert_eq!(matched_count(&events, "logit.transform.matched.skipped"), Some(1.0));
     }
+
+    #[test]
+    fn a_pattern_with_no_named_group_matches_and_adds_no_attribute() {
+        let mut re = RegexParser::new(r"(\d+)", None).unwrap();
+        let resource = default_resource();
+        let mut event = log_event("status 200");
+        assert!(re.process(&resource, &mut event), "always forwards");
+        assert!(event.attributes.is_empty());
+        assert_eq!(event.log.as_ref().unwrap().message, Value::str("status 200"));
+    }
 }

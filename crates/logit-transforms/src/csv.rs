@@ -541,4 +541,23 @@ mod tests {
             other => panic!("expected Str, got {other:?}"),
         }
     }
+
+    #[test]
+    fn a_parser_with_no_columns_passes_every_line_through_with_a_field_count_diagnostic() {
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("csv", "csv", "transform");
+        let diag = Diagnostics::new("csv").with_telemetry(telemetry);
+        let mut csv = parser(&[]).with_diagnostics(diag);
+        let resource = default_resource();
+        let mut event = log_event("1,2,3");
+        assert!(csv.process(&resource, &mut event), "always forwards");
+        assert!(event.attributes.is_empty());
+        assert_eq!(message_of(&event), &Value::str("1,2,3"));
+
+        let events = registry.drain(0);
+        let fired = events
+            .iter()
+            .any(|e| e.attributes.get("key").and_then(|v| v.as_str()) == Some("field_count"));
+        assert!(fired, "expected logit.component.diagnostics{{key=\"field_count\"}}");
+    }
 }

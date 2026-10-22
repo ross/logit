@@ -768,6 +768,41 @@ mod tests {
             other => panic!("expected Sum, got {other:?}"),
         }
     }
+
+    #[test]
+    fn degenerate_separators_find_no_pair_and_pass_the_event_through() {
+        for (pair_sep, kv_sep, message) in
+            [("&", "", "a=1&b=2"), ("=", "=", "a=1"), ("=", "==", "a==1")]
+        {
+            let registry = Registry::new();
+            let mut kv = Kv::new(pair_sep.into(), kv_sep.into(), false).with_diagnostics(
+                Diagnostics::new("kv").with_telemetry(registry.telemetry_for(
+                    "kv",
+                    "kv",
+                    "transform",
+                )),
+            );
+            let mut event = log_event(message);
+            assert!(kv.process(&default_resource(), &mut event), "{pair_sep:?} {kv_sep:?}");
+            assert!(event.attributes.is_empty(), "{pair_sep:?} {kv_sep:?}");
+            assert_eq!(message_of(&event), &Value::str(message));
+            let events = registry.drain(0);
+            assert_eq!(events.len(), 1, "{pair_sep:?} {kv_sep:?}");
+            assert_eq!(
+                events[0].attributes.get("key").and_then(|v| v.as_str()),
+                Some("parse_failure")
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_pair_sep_reads_the_whole_line_as_one_segment() {
+        let mut kv = Kv::new(String::new(), "=".into(), false);
+        let mut event = log_event("a=1 b=2");
+        assert!(kv.process(&default_resource(), &mut event));
+        assert_eq!(attr(&event, "a"), Some(&Value::str("1 b=2")));
+        assert_eq!(event.attributes.len(), 1);
+    }
 }
 
 /// `logfmt` against a regex reading of the ADR's grammar on generated well-formed lines.

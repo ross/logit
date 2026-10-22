@@ -172,9 +172,12 @@ would be. `logit graph` renders targets as dashed boxes and router → target ed
 labelled with the route key. Validation adds five rules (47-51, `docs/design/pipeline-graph.md`):
 `targets:` only on `lua`/`lua_file`; every target reference resolves, names a `target`, isn't
 the router itself, and isn't repeated; a `target` declares no `sources`, has at least one
-consumer, and is directed to by at least one router (rule 7's mirror: a target nothing routes to
-is the same black hole, seen from the other end); a router needs at least one consumer *or*
-target; a `route` has a non-empty `routes:` with no empty key, value, or key name. Deliberately
+consumer, and is directed to by at least one router (rule 7's mirror: a target no router feeds
+is a wiring mistake, since nothing could ever reach its consumers through it; the runtime drops
+its own copy of every target's `Fanout` at startup, so such a target's edges close at once and a
+consumer reading only it ends); a router needs at least one consumer *or* target; a `route`'s
+`routes:` has no empty key, value, or key name. An empty `routes:` is legal (see "Amendment
+(2026-10-21): an empty `routes:` is legal" below). Deliberately
 not validated, per rule 37's reasoning: that a `{provenance: ..}` route key names a component in
 *this* graph -- it is exactly as likely to name one relayed from another process.
 
@@ -423,3 +426,16 @@ part.
   lists; the mask table moved to `logit_pipeline::signal_masks`, which `route_signals` uses.
 - **`route_signals` isn't a `Router`.** A router still never mutates or absorbs an event; the new
   kind has its own node arm and shares the partition code.
+
+## Amendment (2026-10-21): an empty `routes:` is legal
+
+Rule 51 no longer rejects a `route` with `routes: {}`. No value names a target, so every event
+goes to the router's ordinary consumers, which rule 50 requires it to have. Validation rejects a
+config only when it can't run, or when it would lose or duplicate data the operator didn't ask to
+lose or duplicate; a router that routes nothing does neither. Rule 51 keeps its empty-key,
+empty-value, empty-list, repeated-target, and reconvergence clauses.
+
+Rule 49 is unchanged, but its reason is restated above. A target no router feeds doesn't leave
+its consumers waiting: the runtime drops its own copy of each target's `Fanout` at startup
+(`drop(target_fanouts)` in `crates/logit-pipeline/src/runtime.rs`), so the target's edges close
+at once. The rule stands because such a target is a wiring mistake.
