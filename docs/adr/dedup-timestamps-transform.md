@@ -81,7 +81,7 @@ before_remote_write:
   equal and `floor(timestamp / precision)` is equal. Use `1ms` in front of remote-write and `1s` in
   front of `datadog_out`, matching each wire's resolution. There's no default, because no width is
   right for every destination, and a wrong one either collapses readings the destination would
-  keep or leaves the duplicates the sink drops. `0s` is rejected (graph rule 95, the next free
+  keep or leaves the duplicates the sink drops. `0s` is rejected (graph rule 96, the next free
   number). For a timestamp at or after 1970 the floor is the truncation toward zero that
   `remote_write::encode_counted` applies.
 
@@ -493,7 +493,7 @@ keep the higher.
 - `datadog_out` counts each series point it leaves off as a same-second duplicate, `normalized`
   or `dropped` by the same rule as remote-write
   ([The sink-side counter](#the-sink-side-counter)).
-- The graph gets rule 95 (`precision` of `0s`), `logit-config` gets a `ComponentKind` variant, and
+- The graph gets rule 96 (`precision` of `0s`), `logit-config` gets a `ComponentKind` variant, and
   `script/schema` regenerates `schema/logit.schema.json`.
 - [`docs/design/memory.md`](../design/memory.md) gets a row for the per-batch table, and
   `crates/logit-bench/tests/allocations.rs` a pin, when the transform lands.
