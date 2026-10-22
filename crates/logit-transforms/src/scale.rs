@@ -235,4 +235,13 @@ mod tests {
         assert_eq!(scaled_count(&events, "logit.transform.scaled"), None);
         assert_eq!(scaled_count(&events, "logit.transform.scaled.skipped"), Some(1.0));
     }
+
+    #[test]
+    fn a_scale_with_no_fields_forwards_an_event_unchanged() {
+        let mut scale = Scale::new(vec![]);
+        let resource = default_resource();
+        let mut event = event_with_attrs(&[("request_time", Value::I64(2))]);
+        assert!(scale.process(&resource, &mut event));
+        assert_eq!(event.attributes.get("request_time"), Some(&Value::I64(2)));
+    }
 }

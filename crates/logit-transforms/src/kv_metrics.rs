@@ -624,4 +624,15 @@ mod tests {
         assert_eq!(derived_count(&events, "logit.transform.derived.skipped", "gauge"), Some(1.0));
         assert_eq!(derived_count(&events, "logit.transform.derived", "distribution"), Some(1.0));
     }
+
+    #[test]
+    fn a_config_with_no_metrics_forwards_an_event_unchanged() {
+        let mut kv = KvMetrics::new(vec![], vec![], vec![]);
+        let resource = default_resource();
+        let mut event = event_with_attrs(&[("status", Value::U64(200))]);
+        assert!(kv.process(&resource, &mut event));
+        assert!(event.metrics.is_empty());
+        assert_eq!(event.attributes.len(), 1);
+        assert_eq!(event.attributes.get("status"), Some(&Value::U64(200)));
+    }
 }
