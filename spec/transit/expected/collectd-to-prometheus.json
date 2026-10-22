@@ -3,15 +3,22 @@
     {"timestamp":"2027-01-15T07:59:51.500000000Z","metrics":[{"name":"tail_counter_total","kind":"sum","value":1.8446744073709552e19,"temporality":"cumulative","monotonic":true}],"attributes":{"collectd_host":"logit-fixture","collectd_plugin_instance":"nginx","collectd_type_instance":"bytes_wrapped"}},
     {"timestamp":"2027-01-15T07:59:51.500000000Z","metrics":[{"name":"tail_counter_total","kind":"sum","value":48213.0,"temporality":"cumulative","monotonic":true}],"attributes":{"collectd_host":"logit-fixture","collectd_plugin_instance":"nginx","collectd_type_instance":"requests"}}
   ], "counters": {
+    "logit.output.labels.normalized{component=out,kind=prometheus_out,reason=name_sanitized,role=sink}": 6,
     "logit.output.metrics.dropped{component=out,kind=prometheus_out,reason=unresolved_delta,role=sink}": 1,
+    "logit.output.metrics.normalized{component=out,kind=prometheus_out,reason=name_sanitized,role=sink}": 2,
     "logit.output.metrics.skipped{component=out,kind=prometheus_out,reason=no_recorded_value,role=sink}": 1
   }},
   "legacy-time": {"events": [
     {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"load_load_0","kind":"gauge","value":0.25}],"attributes":{"collectd_host":"logit-fixture"}},
     {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"load_load_1","kind":"gauge","value":0.5}],"attributes":{"collectd_host":"logit-fixture"}},
     {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"load_load_2","kind":"gauge","value":0.75}],"attributes":{"collectd_host":"logit-fixture"}}
-  ], "counters": {}},
-  "notification": {"events": [], "counters": {}},
+  ], "counters": {
+    "logit.output.labels.normalized{component=out,kind=prometheus_out,reason=name_sanitized,role=sink}": 3,
+    "logit.output.metrics.normalized{component=out,kind=prometheus_out,reason=name_sanitized,role=sink}": 3
+  }},
+  "notification": {"events": [], "counters": {
+    "logit.output.events.skipped{component=out,kind=prometheus_out,reason=no_metrics,role=sink}": 1
+  }},
   "types-db": {"events": [
     {"timestamp":"2026-09-12T18:22:55.661517736Z","metrics":[{"name":"interface_if_dropped_rx","kind":"gauge","value":0.0}],"attributes":{"collectd_host":"logit-fixture","collectd_plugin_instance":"eth0"}},
     {"timestamp":"2026-09-12T18:22:55.661517736Z","metrics":[{"name":"interface_if_dropped_rx","kind":"gauge","value":0.0}],"attributes":{"collectd_host":"logit-fixture","collectd_plugin_instance":"lo"}},
@@ -39,7 +46,9 @@
     {"timestamp":"2026-09-12T18:22:55.661517736Z","metrics":[{"name":"memory_memory","kind":"gauge","value":4311457792.0}],"attributes":{"collectd_host":"logit-fixture","collectd_type_instance":"slab_recl"}},
     {"timestamp":"2026-09-12T18:22:55.661517736Z","metrics":[{"name":"memory_memory","kind":"gauge","value":6011305984.0}],"attributes":{"collectd_host":"logit-fixture","collectd_type_instance":"free"}}
   ], "counters": {
-    "logit.output.metrics.degraded{component=out,kind=prometheus_out,metric_kind=non_monotonic_sum,role=sink}": 16
+    "logit.output.labels.normalized{component=out,kind=prometheus_out,reason=name_sanitized,role=sink}": 47,
+    "logit.output.metrics.degraded{component=out,kind=prometheus_out,metric_kind=non_monotonic_sum,role=sink}": 16,
+    "logit.output.metrics.normalized{component=out,kind=prometheus_out,reason=name_sanitized,role=sink}": 25
   }},
   "value-lists": {"events": [
     {"timestamp":"2026-09-12T18:22:55.661517736Z","metrics":[{"name":"interface_if_dropped_0","kind":"gauge","value":0.0}],"attributes":{"collectd_host":"logit-fixture","collectd_plugin_instance":"eth0"}},
@@ -68,6 +77,8 @@
     {"timestamp":"2026-09-12T18:22:55.661517736Z","metrics":[{"name":"memory_memory","kind":"gauge","value":4311457792.0}],"attributes":{"collectd_host":"logit-fixture","collectd_type_instance":"slab_recl"}},
     {"timestamp":"2026-09-12T18:22:55.661517736Z","metrics":[{"name":"memory_memory","kind":"gauge","value":6011305984.0}],"attributes":{"collectd_host":"logit-fixture","collectd_type_instance":"free"}}
   ], "counters": {
-    "logit.output.metrics.degraded{component=out,kind=prometheus_out,metric_kind=non_monotonic_sum,role=sink}": 16
+    "logit.output.labels.normalized{component=out,kind=prometheus_out,reason=name_sanitized,role=sink}": 47,
+    "logit.output.metrics.degraded{component=out,kind=prometheus_out,metric_kind=non_monotonic_sum,role=sink}": 16,
+    "logit.output.metrics.normalized{component=out,kind=prometheus_out,reason=name_sanitized,role=sink}": 25
   }}
 }
