@@ -287,12 +287,16 @@ uncounted:
 - **A value-dependent loss is counted because the table can't say how often it happens.** Most
   records keep the field, so a nonzero count is the only sign one didn't.
 - **Structural is about fields; a record written as another kind or shape is counted.** A field
-  the format has no slot for (a unit, a description, a scope, a start time, `min` and `max`, a
-  temporality, exemplars, a foreign carrier) is structural, on a `lost` or `degraded` cell with
-  no counter. A record whose
-  kind or shape is rewritten counts `metrics.degraded{metric_kind}`, as every sink already did
-  before this amendment: a sketch as quantile fields or gauges, a set's estimate as a gauge, a
-  histogram or summary flattened to fields.
+  the format has no slot for (a unit, a description, a scope, a start time, `min` and `max`,
+  exemplars, a foreign carrier) is structural, on a `lost` or `degraded` cell with no counter. A
+  record whose kind or shape is rewritten counts `metrics.degraded{metric_kind}`, as every sink
+  already did before this amendment: a sketch as quantile fields or gauges, a set's estimate as a
+  gauge, a histogram or summary flattened to fields. A temporality lost so that the record reads
+  back as another kind (a `Sum` read back as a gauge, a delta `Sum` as a cumulative counter) is
+  that kind-level rewrite, not a structural field.
+- **A rewrite whose record also loses data counts the loss alone.** `datadog_out` writes a
+  cumulative `Summary`'s quantiles as gauges but can't send its running `.count` and `.sum`, so it
+  counts `fields.dropped{reason="unresolved_cumulative"}`, not `metric_kind="summary"` as well.
 - **A private `_logit.` carrier left off at another protocol's sink is structural**, though its
   presence varies by event: the ignore rule in
   [ADR `private-attribute-namespace`](private-attribute-namespace.md) makes it part of every such
@@ -315,8 +319,10 @@ uncounted:
     `"distribution"|"samples"|"histogram"|"summary"|"set"` at `influxdb_out`, and a `Sum`, read
     back as a gauge, under the shape `statsd_out` and `graphite_out` name
     (`"monotonic_delta_sum"|"non_monotonic_delta_sum"|"cumulative_sum"`); `"summary"` for a
-    delta summary at `datadog_out`, and `"delta_sum"` for the stale marker `prometheus_out`'s
-    remote-write sends for a flagged delta monotonic `Sum`, which reads back cumulative.
+    delta summary at `datadog_out`, and `"set"` for its set sent as an estimate gauge, which
+    replaces `degraded{reason="set_estimate"}`; and `"delta_sum"` for the stale marker
+    `prometheus_out`'s remote-write sends for a flagged delta monotonic `Sum`, which reads back
+    cumulative.
 - **`uncounted` remains only where this change doesn't reach.** The table's schema accepts it on
   the `log` and `span` rows and on `datadog_out`'s carrier on a log, not yet classified, and on
   `prometheus_out`'s one-sample-per-series rows, which another change settles

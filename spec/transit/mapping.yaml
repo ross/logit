@@ -784,7 +784,7 @@ rows:
           `otlp_set_metric_skipped` warning.
       datadog_out:
         class: degraded
-        counter: logit.output.metrics.degraded{reason=set_estimate}
+        counter: logit.output.metrics.degraded{metric_kind=set}
         text: >-
           A series `gauge` of the estimate, the Agent's `s`; the registers are gone.
       graphite_out:

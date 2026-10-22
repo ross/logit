@@ -941,14 +941,9 @@ impl DatadogEncoder {
             match note {
                 Note::NotSent(outcome) => self.metric_not_sent(outcome),
                 Note::Cumulative(kind) => self.unresolved_cumulative(kind),
-                Note::Degraded(_)
-                | Note::DegradedReason(_)
-                | Note::BoolValue
-                | Note::SummaryCumulative
-                    if !written => {}
+                Note::Degraded(_) | Note::BoolValue | Note::SummaryCumulative if !written => {}
                 Note::NoSum if !(written || sketched) => {}
                 Note::Degraded(kind) => self.degraded_kind(kind),
-                Note::DegradedReason(reason) => self.out_degraded(reason),
                 Note::BoolValue => self.telemetry.count(
                     "logit.output.metrics.normalized",
                     1.0,
@@ -1316,7 +1311,6 @@ enum Note {
     /// A cumulative kind, named for the diagnostic.
     Cumulative(&'static str),
     Degraded(&'static str),
-    DegradedReason(&'static str),
     BoolValue,
     NoSum,
     SummaryCumulative,
@@ -1377,7 +1371,7 @@ fn plan_series(record: &MetricRecord, histograms: HistogramOptions) -> SeriesPla
             });
         }
         MetricKind::Set(hll) => {
-            notes.push(Note::DegradedReason("set_estimate"));
+            degraded = Some("set");
             out.push(point(WireType::Gauge, hll.estimate() as f64));
         }
         // Their own routes: `encode_distribution_points` and `encode_sketches`.
@@ -1439,8 +1433,8 @@ fn plan_series(record: &MetricRecord, histograms: HistogramOptions) -> SeriesPla
                 notes.push(Note::NotSent(MetricOut::NoRecordedValue));
                 return done(out, notes);
             }
-            // A cumulative one's cell names its dropped count and sum, so only a delta one counts
-            // its form.
+            // A cumulative one's `.count` and `.sum` are loss, counted `fields.dropped` below, and
+            // that count stands for the record; a delta one counts its form.
             for (q, v) in &summary.quantiles {
                 out.push(SeriesPoint {
                     suffix: "quantile",
@@ -1975,7 +1969,7 @@ mod tests {
                     && ev.metrics.iter().any(|m| resolve(m.name) == metric)
             })
         };
-        assert!(has("logit.output.metrics.degraded", "reason", "set_estimate"));
+        assert!(has("logit.output.metrics.degraded", "metric_kind", "set"));
         assert!(has("logit.output.metrics.dropped", "reason", "unresolved_cumulative"));
         assert!(has("logit.output.metrics.dropped", "reason", "unresolved_gauge_delta"));
         assert!(!has("logit.output.metrics.skipped", "metric_kind", "gauge_delta"));
@@ -2647,7 +2641,7 @@ mod tests {
         assert!(v2_series(&mut e, &batch(events.to_vec())).is_empty());
         let c = counters(&registry);
         assert_eq!(total(&c, "logit.output.metrics.degraded", "non_monotonic_sum"), 0.0);
-        assert_eq!(total(&c, "logit.output.metrics.degraded", "set_estimate"), 0.0);
+        assert_eq!(total(&c, "logit.output.metrics.degraded", "set"), 0.0);
         assert_eq!(total(&c, "logit.output.metrics.normalized", "bool_value"), 0.0);
         assert_eq!(total(&c, "logit.output.tags.omitted", "unrepresentable"), 0.0);
         assert_eq!(total(&c, "logit.output.metrics.dropped", "unresolved_cumulative"), 1.0);
