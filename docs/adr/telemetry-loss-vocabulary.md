@@ -244,6 +244,9 @@ events need an ordinary consumer. For `route_signals` the config choice is visib
 already: its `signals:` map names which events are kept, as `keep_signals`' list does. With all
 three signals listed, only an event with no payload is discarded, as `has_signal` and
 `keep_signals` also do. Its parts and copies count `component.events.copied`, never `*.dropped`.
+[Since [ADR `route-signals`](route-signals.md)'s 2026-10-21 amendment, an event that arrives with
+no payload goes to `signals.none`'s target when one is set, routed and uncounted, and only
+otherwise counts `component.events.discarded`.]
 
 ## Amendment (2026-10-20): `datadog_out` writes both non-monotonic `Sum`s
 

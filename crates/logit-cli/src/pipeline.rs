@@ -986,12 +986,13 @@ pub(crate) fn build_spec(
 
         // The runtime reads a Lua router's `targets:` off the `ResolvedComponent`, not
         // `NodeSpec::Lua` (`docs/adr/target-components.md`).
-        Lua { script, interval, max_memory, jit } => NodeSpec::Lua {
+        Lua { script, interval, max_memory, jit, vars } => NodeSpec::Lua {
             script: script.clone(),
             interval: *interval,
             runtime: lua_runtime_config(*max_memory, *jit),
+            vars: vars.clone(),
         },
-        LuaFile { lua_file, interval, max_memory, jit } => {
+        LuaFile { lua_file, interval, max_memory, jit, vars } => {
             let script_path = base_dir.join(lua_file);
             let script = std::fs::read_to_string(&script_path)
                 .with_context(|| format!("reading lua_file {}", script_path.display()))?;
@@ -999,6 +1000,7 @@ pub(crate) fn build_spec(
                 script,
                 interval: *interval,
                 runtime: lua_runtime_config(*max_memory, *jit),
+                vars: vars.clone(),
             }
         }
         Aggregate {
@@ -2173,6 +2175,7 @@ fn to_signal_set(signals: &[logit_config::Signal]) -> SignalSet {
             logit_config::Signal::Logs => set.logs = true,
             logit_config::Signal::Metrics => set.metrics = true,
             logit_config::Signal::Traces => set.traces = true,
+            logit_config::Signal::None => set.none = true,
         }
     }
     set
@@ -2753,6 +2756,7 @@ mod tests {
                         interval: None,
                         max_memory: None,
                         jit: false,
+                        vars: Default::default(),
                     },
                 },
             ),
@@ -2768,6 +2772,7 @@ mod tests {
                         interval: None,
                         max_memory: None,
                         jit: false,
+                        vars: Default::default(),
                     },
                 },
             ),
@@ -2792,6 +2797,7 @@ mod tests {
                         interval: None,
                         max_memory: None,
                         jit: false,
+                        vars: Default::default(),
                     },
                 },
             ),
@@ -3293,6 +3299,7 @@ mod tests {
                     interval: None,
                     max_memory: None,
                     jit: false,
+                    vars: Default::default(),
                 },
                 None,
                 false,
@@ -3303,6 +3310,7 @@ mod tests {
                     interval: None,
                     max_memory: Some(4 * 1024 * 1024),
                     jit: true,
+                    vars: Default::default(),
                 },
                 Some(4 * 1024 * 1024),
                 true,
@@ -3313,6 +3321,7 @@ mod tests {
                     interval: None,
                     max_memory: Some(256 * 1024 * 1024),
                     jit: true,
+                    vars: Default::default(),
                 },
                 Some(256 * 1024 * 1024),
                 true,
@@ -3357,6 +3366,75 @@ mod tests {
         ));
     }
 
+    /// A string-only InfluxDB point carries no signal; `none: remote_metrics` routes it to the
+    /// target `influxdb_out` reads, which writes its line. Without `none` support the point is
+    /// discarded.
+    #[test]
+    fn a_string_only_influxdb_point_reaches_influxdb_out_through_route_signals_none() {
+        use logit_proto::Encoder as _;
+        let yaml = "components:
+  remote_in:
+    type: influxdb_in
+    bind: 127.0.0.1:0
+  remote_by_signal:
+    type: route_signals
+    sources: [remote_in]
+    signals: {logs: remote_logs, metrics: remote_metrics, none: remote_metrics}
+  remote_logs:
+    type: target
+  remote_metrics:
+    type: target
+  logs_out:
+    type: null_out
+    sources: [remote_logs]
+  influx_out:
+    type: influxdb_out
+    sources: [remote_metrics]
+    url: http://127.0.0.1:8086
+    org: o
+    bucket: b
+    token: t
+";
+        let path = logit_pipeline::test_util::scratch_dir("route-signals-none").join("logit.yaml");
+        std::fs::write(&path, yaml).unwrap();
+        let graph = graph::resolve(crate::config::load(&path).unwrap()).unwrap();
+        let router = &graph.components["remote_by_signal"];
+        let NodeSpec::RouteSignals(routes) =
+            build_spec("remote_by_signal", router, Path::new(""), None).unwrap().0
+        else {
+            panic!("expected NodeSpec::RouteSignals");
+        };
+        let slot = 1 + router.targets.iter().position(|t| t == "remote_metrics").unwrap();
+        assert_eq!(graph.components["remote_metrics"].consumers, vec!["influx_out".to_string()]);
+
+        let batch = logit_proto::influxdb::decode::InfluxDecoder::new()
+            .decode_body(
+                bytes::Bytes::from_static(b"filament v=\"PLA\" 1700000000000000000\n"),
+                logit_proto::influxdb::Precision::Ns,
+                0,
+                Arc::new(logit_core::Resource::default()),
+            )
+            .unwrap();
+        let event = &batch.events[0];
+        assert!(event.log.is_none() && event.metrics.is_empty() && event.span.is_none());
+
+        let mut scratch = logit_pipeline::RouterScratch::new(routes.targets());
+        let parts = logit_pipeline::route_signals_batch(
+            &routes,
+            &mut scratch,
+            batch,
+            &Telemetry::default(),
+        );
+        let [(routed_to, part)] = parts.as_slice() else {
+            panic!("expected one partition, got {}", parts.len());
+        };
+        assert_eq!(*routed_to, slot, "routed to remote_metrics");
+
+        let mut encoder = logit_proto::influxdb::encode::InfluxLineEncoder::default();
+        let body = encoder.encode(part).unwrap();
+        assert_eq!(&body[..], b"filament v=\"PLA\" 1700000000000000000\n");
+    }
+
     #[test]
     fn build_spec_builds_a_route_signals_node() {
         let component = ResolvedComponent {
@@ -3370,6 +3448,7 @@ mod tests {
                     logs: Some("log_events".to_string()),
                     metrics: Some("metric_events".to_string()),
                     traces: None,
+                    none: None,
                 },
                 strip: true,
             },

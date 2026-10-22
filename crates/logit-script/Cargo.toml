@@ -8,6 +8,8 @@ description = "LuaJIT scripting: one Lua VM per pipeline worker, and the Event u
 
 [dependencies]
 logit-core.workspace = true
+# `LuaVar`, the `vars:` values `ScriptWorker::new_with_vars` builds the `vars` global from.
+logit-config.workspace = true
 thiserror.workspace = true
 bytes.workspace = true
 mlua = { version = "0.9", features = ["luajit", "vendored"] }

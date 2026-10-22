@@ -623,7 +623,8 @@ Graph rule 50 rejects a router (`route`, or `lua`/`lua_file` with `targets:`) th
 ordinary consumer, so every event no target claims reaches one. A config that discards those
 events names a `null_out` as that consumer, whose `events.received` counts them. A
 `route_signals` has no ordinary consumer: an event carrying none of its listed signals counts
-`logit.component.events.discarded` under its id ([ADR `route-signals`](../adr/route-signals.md)).
+`logit.component.events.discarded` under its id, unless it arrived with no payload and
+`signals.none` routes it ([ADR `route-signals`](../adr/route-signals.md)).
 
 **A router's copies count once per destination.** An event sent to two destinations counts as
 `events.sent` on each: under the router's own id for its forward edge, and under the target's id
@@ -1568,7 +1569,8 @@ which every router has.
 
 Recorded by its node loop, `run_route_signals`, on the component's own handle: the layer-2
 receive set, `events.copied` for each part or copy past an event's first,
-`logit.component.events.discarded` for an event carrying none of its listed signals, and, under
+`logit.component.events.discarded` for an event carrying none of its listed signals (an event
+arriving with no payload is routed instead when `signals.none` is set), and, under
 `strip: true`, `logit.transform.payloads.stripped{signal}` per unlisted payload cleared. Each
 target's `Fanout` counts what it sent. It has no forward edge, so none of its events reach an
 ordinary consumer.
