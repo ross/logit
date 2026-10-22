@@ -33,6 +33,14 @@
   text: The timestamp `-1`, carbon's sentinel for the receipt time.
 - name: utf8_path
   text: A path holding non-ASCII UTF-8.
+- name: sink_forbidden_characters
+  text: >-
+    A `/` or `\` in a path, a `!` or `^` in a tag name, or a leading `~` in a tag value, which
+    graphite_in keeps and graphite_out writes as `_`.
+- name: pickle_unicode
+  text: >-
+    Protocol 0's `UNICODE` opcode for a path, as CPython 3 writes one at protocol 0, where
+    Python 2 writes `STRING`.
 - name: superseded
   text: Several points of one series, one per read cycle, on one connection.
 - name: pickle_frame

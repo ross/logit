@@ -1,4 +1,10 @@
 {
+  "pickle-p0": {"events": [
+    {"timestamp":"2023-11-14T22:13:24.000000000Z","metrics":[{"name":"logit_fixture_pickle_float_value","kind":"gauge","value":12.75}]},
+    {"timestamp":"2023-11-14T22:13:24.000000000Z","metrics":[{"name":"logit_fixture_pickle_int_value","kind":"gauge","value":42.0}]},
+    {"timestamp":"2023-11-14T22:13:24.000000000Z","metrics":[{"name":"logit_fixture_pickle_large_value","kind":"gauge","value":1234567.0}]},
+    {"timestamp":"2023-11-14T22:13:24.000000000Z","metrics":[{"name":"logit_fixture_pickle_negative_value","kind":"gauge","value":-17.5}]}
+  ], "counters": {}},
   "pickle-p2": {"events": [
     {"timestamp":"2023-11-14T22:13:24.000000000Z","metrics":[{"name":"logit_fixture_pickle_float_value","kind":"gauge","value":12.75}]},
     {"timestamp":"2023-11-14T22:13:24.000000000Z","metrics":[{"name":"logit_fixture_pickle_int_value","kind":"gauge","value":42.0}]},
@@ -32,6 +38,7 @@
     {"timestamp":"2023-11-14T22:13:21.000000000Z","metrics":[{"name":"value_2p63","kind":"gauge","value":9.223372036854776e18}]}
   ], "counters": {}},
   "tagged": {"events": [
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app_web_svc","kind":"gauge","value":7.0}],"attributes":{"dc_zone":"a","pri_o":"~low"}},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"caf__temperature","kind":"gauge","value":21.5}]},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"query_time","kind":"gauge","value":3.5}],"attributes":{"expr":"a=b","pattern":"x~y"}},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"sensor_delta","kind":"gauge","value":-2.75}]},

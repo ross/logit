@@ -1,0 +1,4 @@
+{"timestamp":"2023-11-14T22:13:20.000000000Z","metrics":[{"name":"logit-fixture.pickle.int_value","kind":"gauge","value":42.0}]}
+{"timestamp":"2023-11-14T22:13:21.500000000Z","metrics":[{"name":"logit-fixture.pickle.float_value","kind":"gauge","value":12.75}]}
+{"timestamp":"2023-11-14T22:13:22.000000000Z","metrics":[{"name":"logit-fixture.pickle.negative_value","kind":"gauge","value":-17.5}]}
+{"timestamp":"2023-11-14T22:13:23.000000000Z","metrics":[{"name":"logit-fixture.pickle.large_value","kind":"gauge","value":1234567.0}]}
