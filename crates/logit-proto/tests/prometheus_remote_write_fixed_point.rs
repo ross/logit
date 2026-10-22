@@ -932,6 +932,20 @@ fn an_equal_value_with_other_exemplars_or_sign_is_counted_dropped() {
     }
 }
 
+/// A reading marked an increment, such as a `Samples` record written as a summary, isn't
+/// replaced by an equal later one: two equal observation sets are two sets of events, so the
+/// removed one counts `dropped`.
+#[test]
+fn an_equal_increment_on_one_millisecond_is_counted_dropped() {
+    let mut earlier = gauge_reading(TIMESTAMP, 2.0);
+    earlier[0].series[0].increment = true;
+    let mut later = gauge_reading(TIMESTAMP + 1, 2.0);
+    later[0].series[0].increment = true;
+    let counters = encode_counters(&[earlier, later]);
+    assert_eq!(duplicates(&counters, NORMALIZED), 0, "{counters:?}");
+    assert_eq!(duplicates(&counters, DROPPED), 1, "{counters:?}");
+}
+
 /// Each removed reading is compared with the reading sent, not with the one that displaced it:
 /// of `5`, `7`, and `5` in one millisecond, the last is sent, the first equals it, and the `7`
 /// is lost.
@@ -1598,7 +1612,14 @@ fn series(kind: FamilyType, version: Version, timestamp: i64) -> BoxedStrategy<S
         .prop_map(move |(labels, point, created, exemplars)| {
             // A stale series has no reading for an exemplar to be an example of.
             let exemplars = if point == Point::Stale { Vec::new() } else { exemplars };
-            Series { labels, point, timestamp: Some(timestamp), created, exemplars }
+            Series {
+                increment: false,
+                labels,
+                point,
+                timestamp: Some(timestamp),
+                created,
+                exemplars,
+            }
         })
         .boxed()
 }
@@ -1766,6 +1787,7 @@ proptest! {
 fn a_created_timestamp_is_a_wire_sample_in_version_1_and_a_field_in_version_2() {
     let mut family = MetricFamily::new("requests", FamilyType::Counter);
     family.series.push(Series {
+        increment: false,
         labels: vec![("job".to_string(), "api".to_string())],
         point: Point::Counter(7.0),
         timestamp: Some(1_605_281_325_000_000_000),

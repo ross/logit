@@ -1451,14 +1451,18 @@ fn collapse(
     keep
 }
 
-/// Whether two points of one series in one second are one point on the series route: the same
-/// value by its bits, wire type, unit, interval, source type, and origin. A value's model type
-/// isn't compared: every series value is a double.
+/// Whether two points of one series in one second are one state on the series route: both
+/// records' kinds a later reading replaces ([`crate::replaced_by_a_later_reading`]; a delta
+/// `count` or a histogram's expansion is an increment), and the same value by its bits, wire
+/// type, unit, interval, source type, and origin. A value's model type isn't compared: every
+/// series value is a double.
 fn same_point(
     (ra, ca, pa): (&MetricRecord, &Carriers, &SeriesPoint),
     (rb, cb, pb): (&MetricRecord, &Carriers, &SeriesPoint),
 ) -> bool {
-    pa.value.to_bits() == pb.value.to_bits()
+    crate::replaced_by_a_later_reading(&ra.kind)
+        && crate::replaced_by_a_later_reading(&rb.kind)
+        && pa.value.to_bits() == pb.value.to_bits()
         && pa.wire_type(ca) == pb.wire_type(cb)
         && pa.unit(ra) == pb.unit(rb)
         && ca.interval == cb.interval
@@ -2246,9 +2250,10 @@ mod tests {
         );
     }
 
-    /// Of two points of one series in one second, the later is sent and the earlier counted, for
-    /// a count as for a gauge: `normalized` when the two are equal, `dropped` when they differ. A
-    /// point of another series (another tag set) or another second is no duplicate.
+    /// Of two points of one series in one second, the later is sent and the earlier counted:
+    /// `normalized` for a gauge equal to the one sent, and `dropped` for one that differs or for a
+    /// delta count, equal or not, since two counts are two increments. A point of another series
+    /// (another tag set) or another second is no duplicate.
     #[test]
     fn a_series_point_sharing_its_second_with_a_later_one_is_left_off_and_counted() {
         let (mut e, registry) = encoder();
@@ -2282,9 +2287,10 @@ mod tests {
         assert_eq!(sent, want, "the later point of each pair is sent, in batch order");
         assert_eq!(e.series_duplicates(), 3);
         let c = counters(&registry);
-        // The `c` and `g` pairs are equal, and `h`'s `1.0` differs from the `9.0` sent.
-        assert_eq!(total(&c, "logit.output.metrics.normalized", "duplicate_timestamp"), 2.0);
-        assert_eq!(total(&c, "logit.output.metrics.dropped", "duplicate_timestamp"), 1.0);
+        // The `g` pair is an equal state; the `c` pair is two equal increments, and `h`'s `1.0`
+        // differs from the `9.0` sent.
+        assert_eq!(total(&c, "logit.output.metrics.normalized", "duplicate_timestamp"), 1.0);
+        assert_eq!(total(&c, "logit.output.metrics.dropped", "duplicate_timestamp"), 2.0);
     }
 
     /// Each point left off is compared with the point sent for its series and second, not with
@@ -2310,7 +2316,7 @@ mod tests {
     }
 
     /// An equal value isn't an equal point when a field the series carries beside it differs:
-    /// here the interval, a delta `count`'s window. Nor is `0.0` the same value as `-0.0`.
+    /// here the interval. Nor is `0.0` the same value as `-0.0`.
     #[test]
     fn an_equal_value_with_another_wire_field_is_dropped() {
         let (mut e, registry) = encoder();
@@ -2320,7 +2326,7 @@ mod tests {
             Event::metric(
                 TS + offset_ms * 1_000_000,
                 attrs,
-                MetricRecord::new(intern("c"), MetricKind::counter(value)),
+                MetricRecord::new(intern("g"), MetricKind::gauge(value)),
             )
         };
         let events = vec![at(0, 3.0, 10), at(1, 3.0, 20), at(1_000, 0.0, 10), at(1_001, -0.0, 10)];
@@ -2328,6 +2334,39 @@ mod tests {
         let c = counters(&registry);
         assert_eq!(total(&c, "logit.output.metrics.normalized", "duplicate_timestamp"), 0.0);
         assert_eq!(total(&c, "logit.output.metrics.dropped", "duplicate_timestamp"), 2.0);
+    }
+
+    /// Only a state is replaced by an equal later reading. A cumulative `Sum` is one, written as a
+    /// gauge or a `count` of its running total; a delta histogram's `.count` and `.sum` series
+    /// are increments, so an equal pair of them in one second stays `dropped`.
+    #[test]
+    fn an_equal_increment_is_dropped_and_an_equal_state_normalized() {
+        let (e, registry) = encoder();
+        let mut e = e.with_histograms(HistogramOptions {
+            mode: HistogramMode::Counters,
+            send_aggregation_metrics: true,
+        });
+        let at = |offset_ms: i64, name: &str, kind: MetricKind| {
+            Event::metric(
+                TS + offset_ms * 1_000_000,
+                AttrMap::new(),
+                MetricRecord::new(intern(name), kind),
+            )
+        };
+        let cumulative = || sum(4.0, Temporality::Cumulative, false);
+        let histogram = || MetricKind::Histogram(delta_histogram(Some(3.0)));
+        let events = vec![
+            at(0, "total", cumulative()),
+            at(1, "total", cumulative()),
+            at(0, "latency", histogram()),
+            at(1, "latency", histogram()),
+        ];
+        e.encode_series_v1(&batch(events)).unwrap();
+        let c = counters(&registry);
+        assert_eq!(total(&c, "logit.output.metrics.normalized", "duplicate_timestamp"), 1.0);
+        // Every point of the delta histogram: three `.bucket` series, `.count`, `.sum`, `.min`,
+        // and `.max`.
+        assert_eq!(total(&c, "logit.output.metrics.dropped", "duplicate_timestamp"), 7.0);
     }
 
     /// A point left off as a duplicate counts only its `duplicate_timestamp`: its record's

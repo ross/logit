@@ -3270,6 +3270,25 @@ mod tests {
         assert_eq!(sum_of(&sums, RECORDS, &[("route", "series")]), 1.0);
     }
 
+    /// Two equal delta counts of one series in one second are two increments: one is sent, and
+    /// the other counted `dropped`, with the diagnostic, though the values are equal.
+    #[tokio::test]
+    async fn an_equal_count_sharing_its_second_is_counted_dropped() {
+        let b = batch(vec![
+            metric(NOW, MetricKind::counter(1.0)),
+            metric(NOW + 500_000_000, MetricKind::counter(1.0)),
+        ]);
+        let (sums, _) = run_dd(|p, _| accepted(p), vec![b], at_least_once(), instrumented).await;
+        let duplicate = [("reason", "duplicate_timestamp")];
+        assert_eq!(sum_of(&sums, "logit.output.metrics.dropped", &duplicate), 1.0);
+        assert_eq!(sum_of(&sums, "logit.output.metrics.normalized", &duplicate), 0.0);
+        assert_eq!(
+            sum_of(&sums, "logit.component.diagnostics", &[("key", "duplicate_timestamp")]),
+            1.0
+        );
+        assert_eq!(sum_of(&sums, RECORDS, &[("route", "series")]), 1.0);
+    }
+
     /// Datadog keeps both of two distribution points in one second, so nothing is dropped there.
     #[tokio::test]
     async fn distribution_points_sharing_a_second_are_all_sent() {

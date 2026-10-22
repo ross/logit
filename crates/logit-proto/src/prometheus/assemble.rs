@@ -947,7 +947,14 @@ fn finish_series(
     // before the per-type completeness rules, which would otherwise count a stale series as
     // `incomplete_series`.
     if stale {
-        return Some(Series { labels, point: Point::Stale, timestamp, created, exemplars });
+        return Some(Series {
+            increment: false,
+            labels,
+            point: Point::Stale,
+            timestamp,
+            created,
+            exemplars,
+        });
     }
     let point = match kind {
         FamilyType::Counter => Point::Counter(value_or_drop(value, decoder)?),
@@ -987,7 +994,7 @@ fn finish_series(
             Point::Summary { quantiles, sum, count }
         }
     };
-    Some(Series { labels, point, timestamp, created, exemplars })
+    Some(Series { increment: false, labels, point, timestamp, created, exemplars })
 }
 
 fn value_or_drop(value: Option<f64>, decoder: &mut PrometheusDecoder) -> Option<f64> {

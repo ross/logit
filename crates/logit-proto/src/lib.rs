@@ -32,6 +32,25 @@ pub use msgbuf::MessageBuf;
 pub use multi_value::MultiValue;
 
 use logit_core::{Event, EventBatch, Resource, Scope};
+
+/// Whether a later reading of a series fully replaces a reading of this kind: a state (a `Gauge`,
+/// a cumulative `Sum`, `Histogram`, `ExponentialHistogram`, or `Summary`, a set read as its size).
+/// Every other kind is an increment or an observation set, so two equal readings of it in one
+/// bucket are two sets of events. A sink that collapses same-timestamp readings counts an equal
+/// state it leaves off as normalized and anything else as lost
+/// ([ADR `dedup-timestamps-transform`](../../../docs/adr/dedup-timestamps-transform.md)'s "The
+/// sink-side counter").
+pub(crate) fn replaced_by_a_later_reading(kind: &logit_core::MetricKind) -> bool {
+    use logit_core::{MetricKind, Temporality};
+    match kind {
+        MetricKind::Gauge(_) | MetricKind::SetMembers(_) | MetricKind::Set(_) => true,
+        MetricKind::Sum(sum) => sum.temporality == Temporality::Cumulative,
+        MetricKind::Histogram(h) => h.temporality == Temporality::Cumulative,
+        MetricKind::ExponentialHistogram(h) => h.temporality == Temporality::Cumulative,
+        MetricKind::Summary(s) => s.temporality == Temporality::Cumulative,
+        MetricKind::GaugeDelta(_) | MetricKind::Samples(_) | MetricKind::Distribution(_) => false,
+    }
+}
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 

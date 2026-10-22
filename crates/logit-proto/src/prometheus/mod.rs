@@ -447,13 +447,24 @@ pub struct Series {
     /// OpenMetrics exemplars, in bucket order for a histogram. The writer places each one on the
     /// bucket its own value falls in.
     pub exemplars: Vec<Exemplar>,
+    /// The reading is an increment or an observation set, such as a `Samples` record written as
+    /// a summary, so a later equal reading doesn't replace it: remote-write's collapse counts it
+    /// lost even when equal ([`same_reading`]). Never on the wire, and `false` from every decoder.
+    pub increment: bool,
 }
 
 impl Series {
     /// A series with no timestamp, no `_created`, and no exemplars -- what most producers and
     /// nearly every test want.
     pub fn new(labels: Vec<(String, String)>, point: Point) -> Self {
-        Series { labels, point, timestamp: None, created: None, exemplars: Vec::new() }
+        Series {
+            labels,
+            point,
+            timestamp: None,
+            created: None,
+            exemplars: Vec::new(),
+            increment: false,
+        }
     }
 }
 
@@ -1091,6 +1102,7 @@ pub fn events_to_families_pending<'a>(
                 timestamp,
                 created,
                 exemplars: record.exemplars.clone(),
+                increment: !crate::replaced_by_a_later_reading(&record.kind),
             });
 
             // One map probe on the steady-state path (a family this record already belongs to); the
@@ -1236,13 +1248,16 @@ impl Replaced {
     }
 }
 
-/// Whether two readings of one family and label set are one reading on the remote-write wire:
-/// the same point, each `f64` by its bits (as Prometheus's own duplicate check compares them), the
-/// same created timestamp at the wire's millisecond, and the same exemplars, which go with a
-/// removed reading. A value's model type isn't compared: every sample is a double.
+/// Whether two readings of one family and label set are one state on the remote-write wire:
+/// neither an increment ([`Series::increment`]), the same point, each `f64` by its bits (as
+/// Prometheus's own duplicate check compares them), the same created timestamp at the wire's
+/// millisecond, and the same exemplars, which go with a removed reading. A value's model type
+/// isn't compared: every sample is a double.
 pub(crate) fn same_reading(a: &Series, b: &Series) -> bool {
     let millis = |created: Option<i64>| created.map(|c| c / 1_000_000);
-    same_point(&a.point, &b.point)
+    !a.increment
+        && !b.increment
+        && same_point(&a.point, &b.point)
         && millis(a.created) == millis(b.created)
         && a.exemplars == b.exemplars
 }

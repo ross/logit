@@ -428,7 +428,7 @@ impl Registry {
         entry.help = help;
         entry.unit = unit;
         for series in series {
-            let Series { labels, point, timestamp, created, exemplars } = series;
+            let Series { labels, point, timestamp, created, exemplars, increment: _ } = series;
             entry
                 .series
                 .insert(labels, Stored { point, timestamp, created, exemplars, updated_at: now });
@@ -516,6 +516,7 @@ impl Registry {
                     .series
                     .iter()
                     .map(|(labels, stored)| Series {
+                        increment: false,
                         labels: labels.clone(),
                         point: stored.point.clone(),
                         timestamp: stored.timestamp,
@@ -3466,6 +3467,29 @@ mod tests {
             assert_eq!(sum_of(&sums, DUPLICATE.0, DUPLICATE.1), 0.0, "{later}");
             let diagnostics = [("key", "duplicate_timestamp")];
             assert_eq!(sum_of(&sums, "logit.component.diagnostics", &diagnostics), 0.0, "{later}");
+        }
+    }
+
+    /// Two equal `Samples` records at one instant are two sets of observations, written as
+    /// summaries: the later is sent and the earlier counted `dropped`, though they're equal.
+    #[tokio::test]
+    async fn an_equal_samples_reading_is_counted_dropped() {
+        let samples = |timestamp: i64| {
+            Event::metric(
+                timestamp,
+                AttrMap::new(),
+                MetricRecord::new(
+                    intern("latency"),
+                    MetricKind::Samples(logit_core::Samples::new([1.0])),
+                ),
+            )
+        };
+        let at = 1_700_000_000_000_000_000;
+        for later in [at, at + 1] {
+            let (sums, _) = retried_remote_write(batch(vec![samples(at), samples(later)])).await;
+            let reason = [("reason", "duplicate_timestamp")];
+            assert_eq!(sum_of(&sums, "logit.output.metrics.normalized", &reason), 0.0, "{later}");
+            assert_eq!(sum_of(&sums, DUPLICATE.0, DUPLICATE.1), 1.0, "{later}");
         }
     }
 
