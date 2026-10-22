@@ -2964,7 +2964,7 @@
           "additionalProperties": false
         },
         {
-          "description": "Sends logs, metrics, events, service checks, APM traces, and APM stats straight to Datadog's intake API, one request per route a batch needs. Host, service, source, and tags come from each event's attributes and resource, so stamp them upstream with `set`. A metric, log, event, or service check with no host goes out with the process hostname, so hostless senders relayed through one `logit` report as one Datadog host. A metric its sender marked hostless (an empty `host:` tag, or an Agent's empty host) stays hostless. Points older than Datadog accepts (1h for metrics, 18h for logs and events, 10m for service checks) are dropped and counted before sending. Traces go out only once a Datadog Agent has processed them: send `datadog_trace_in`'s output to `datadog_trace_out` instead. OpenTelemetry sums, histograms, and summaries go out as Datadog's OTel exporter sends them; a cumulative counter, histogram, or exponential histogram isn't sent, counted, so set an OpenTelemetry SDK to delta temporality.",
+          "description": "Sends logs, metrics, events, service checks, APM traces, and APM stats straight to Datadog's intake API, one request per route a batch needs. Host, service, source, and tags come from each event's attributes and resource, so stamp them upstream with `set`. A metric, log, event, or service check with no host goes out with the process hostname, so hostless senders relayed through one `logit` report as one Datadog host. A metric its sender marked hostless (an empty `host:` tag, or an Agent's empty host) stays hostless. Points older than Datadog accepts (1h for metrics, 18h for logs and events, 10m for service checks) are dropped and counted before sending. Traces go out only once a Datadog Agent has processed them: send `datadog_trace_in`'s output to `datadog_trace_out` instead. OpenTelemetry sums, histograms, and summaries go out as Datadog's OTel exporter sends them; a cumulative counter, histogram, or exponential histogram isn't sent, counted, so set an OpenTelemetry SDK to delta temporality. Datadog keeps one point per series per second, so of two series points of one series in one second of a request, the later is sent and the earlier dropped and counted; put a `dedup_timestamps` with `precision: 1s` last before this sink to sum two counts or keep the later gauge first.",
           "type": "object",
           "required": [
             "api_key",
@@ -4106,7 +4106,7 @@
               ]
             },
             "endpoint": {
-              "description": "An absolute `http://`/`https://` remote-write URL, path included (typically `/api/v1/write`): sender mode. Never resolved at config-load time, so a receiver that isn't up yet is not a config error.",
+              "description": "An absolute `http://`/`https://` remote-write URL, path included (typically `/api/v1/write`): sender mode. Never resolved at config-load time, so a receiver that isn't up yet is not a config error.\n\nA remote-write series holds one sample per millisecond, so of two readings of one series in one millisecond of a batch, the sink sends the later and drops the earlier, counted `logit.output.metrics.dropped{reason=\"duplicate_timestamp\"}`; to merge or collapse such readings first, put a `dedup_timestamps` with `precision: 1ms` last before this sink.",
               "default": null,
               "type": [
                 "string",

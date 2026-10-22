@@ -3306,7 +3306,10 @@ pub enum ComponentKind {
     /// Agent has processed them: send `datadog_trace_in`'s output to `datadog_trace_out` instead.
     /// OpenTelemetry sums, histograms, and summaries go out as Datadog's OTel exporter sends
     /// them; a cumulative counter, histogram, or exponential histogram isn't sent, counted, so
-    /// set an OpenTelemetry SDK to delta temporality.
+    /// set an OpenTelemetry SDK to delta temporality. Datadog keeps one point per series per
+    /// second, so of two series points of one series in one second of a request, the later is
+    /// sent and the earlier dropped and counted; put a `dedup_timestamps` with `precision: 1s`
+    /// last before this sink to sum two counts or keep the later gauge first.
     DatadogOut {
         /// The Datadog API key, sent as `DD-API-KEY` on every request and never logged. Take it
         /// from the environment (`!env DD_API_KEY`) rather than writing it into the file. An
@@ -4072,6 +4075,12 @@ pub enum ComponentKind {
         /// An absolute `http://`/`https://` remote-write URL, path included (typically
         /// `/api/v1/write`): sender mode. Never resolved at config-load time, so a receiver that
         /// isn't up yet is not a config error.
+        ///
+        /// A remote-write series holds one sample per millisecond, so of two readings of one
+        /// series in one millisecond of a batch, the sink sends the later and drops the earlier,
+        /// counted `logit.output.metrics.dropped{reason="duplicate_timestamp"}`; to merge or
+        /// collapse such readings first, put a `dedup_timestamps` with `precision: 1ms` last
+        /// before this sink.
         #[serde(default)]
         endpoint: Option<String>,
         /// Which remote-write protocol version this sender writes, `1` or `2`. Defaults to `1`,
