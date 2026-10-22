@@ -8,7 +8,9 @@
 #   * ABSOLUTE is already a per-interval delta, so it's a `count` with nothing in between.
 #   * COUNTER is a running total, which Datadog takes only as a per-interval delta.
 #     `cumulative_to_delta` differences it into a `count`; without it, `datadog_out` drops it,
-#     counted `logit.output.metrics.dropped{reason="unresolved_cumulative"}`.
+#     counted `logit.output.metrics.dropped{reason="unresolved_cumulative"}`. A COUNTER that
+#     went down reads as a restart, not a wrap as collectd reads it, so the increase up to the
+#     wrap point is lost.
 #   * DERIVE is a running total too, but collectd marks it non-monotonic, so
 #     `cumulative_to_delta` converts it only under `non_monotonic:`. Without that setting,
 #     `datadog_out` writes it as a `gauge` of the running total.

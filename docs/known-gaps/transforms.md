@@ -211,6 +211,15 @@ Entry format and the other areas: [the known-gaps index](README.md).
     apart, and give each branch its own `cumulative_to_delta`
     ([ADR `cumulative-to-delta-transform`](../adr/cumulative-to-delta-transform.md)'s
     non-monotonic amendment).
+- **A collectd COUNTER that wraps reads as a reset, and the increase up to the wrap is lost.**
+  collectd reads a COUNTER that went down as a wrap at 2^32 or 2^64 and adds that width to the
+  rate. `cumulative_to_delta` can't tell a wrap from a restart, so it reads every decrease of a
+  monotonic `Sum` as a reset and emits the new value: the distance from the previous value to
+  the wrap point never reaches the destination. `non_monotonic: reset_on_decrease` does the same
+  to a DERIVE, which collectd never treats as a wrap.
+  - **Consequence:** one undercount per wrap, of less than one wrap width. A 64-bit counter
+    wraps rarely; a 32-bit one, such as an old SNMP interface counter, can wrap in minutes on a
+    busy link.
 
 ## HTTP access logs: nginx, HAProxy, and `http_access`
 

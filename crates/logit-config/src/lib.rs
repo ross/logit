@@ -3046,7 +3046,8 @@ pub enum ComponentKind {
     /// and the event's attributes; its state lives in memory, so a restart starts every series
     /// over. A point timestamped at or before the series' last one is skipped. A value that went
     /// down, or a start time that moved past the previous point, is a counter restart: the
-    /// point's whole value is the delta. A histogram whose buckets changed is dropped, counted,
+    /// point's whole value is the delta. The exception is a non-monotonic `sum` under
+    /// `non_monotonic: difference`, whose decrease is a negative delta. A histogram whose buckets changed is dropped, counted,
     /// and becomes the new baseline.
     CumulativeToDelta {
         /// What a series' first point emits: `auto` (the default) emits its whole value only when

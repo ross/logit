@@ -170,7 +170,10 @@ data-source type as follows
 | DERIVE | cumulative non-monotonic `Sum` | a `gauge` of the running total, unless a `cumulative_to_delta` with `non_monotonic:` set makes it a `count` |
 
 COUNTER and DERIVE are running totals, and a Datadog `count` is a per-interval delta, so place a
-`cumulative_to_delta` between `collectd_in` and `datadog_out`. It converts COUNTER as it is.
+`cumulative_to_delta` between `collectd_in` and `datadog_out`. It converts COUNTER as it is,
+with one difference from collectd: collectd reads a COUNTER that went down as a wrap and adds
+2^32 or 2^64, but `cumulative_to_delta` reads it as a reset and sends the new value, so the
+increase between the previous value and the wrap point is lost.
 DERIVE converts only under `non_monotonic:`, because collectd marks it non-monotonic: collectd
 can't detect a DERIVE reset, so it can't promise the value never goes down.
 
