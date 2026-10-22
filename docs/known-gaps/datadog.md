@@ -191,16 +191,6 @@ Entry format and the other areas: [the known-gaps index](README.md).
     when the same metrics arrive through `aggregate` and `datadog_out`; query the distribution
     instead.
   - **Revisit trigger:** an operator who needs the Agent's five series.
-- **`datadog_out` leaves off a Datadog unit name the exporter's mapper can't produce.** A series'
-  unit passes through when it's a Datadog unit name that Datadog's OTel exporter's
-  `UnitMapper` can write (`byte`, `millisecond`, `request`, a rate of two), or `nanocore`; else
-  it's mapped from UCUM as the exporter maps it; else it's left off, counted
-  `logit.output.fields.omitted{reason="unit_unmapped"}`. Datadog's unit catalog has names
-  outside that set, so a `datadog_in` series carrying one loses its unit on the way back out.
-  - **Consequence:** the `datadog_in -> datadog_out` relay isn't lossless for such a unit. An
-    Agent rarely sets a series unit, since Datadog keeps units in metric metadata.
-  - **Revisit trigger:** a relayed series whose unit Datadog shows and `datadog_out` drops; the
-    fix is a fuller Datadog unit list in `logit_proto::datadog::units`.
 - **Whether an Agent's TCP `logs` listener parses a JSON body from `syslog_out` is untested.** An
   Agent's TCP `logs` listener takes `syslog_out`'s syslog-formatted lines, but no run has checked
   that it parses a JSON body into attributes.

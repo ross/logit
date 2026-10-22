@@ -243,7 +243,11 @@ the record name or a typed field already says what `plugin`, `type`, and `severi
 only `collectd_out` reads `interval`. `collectd.host`,
 `collectd.plugin_instance`, and `collectd.type_instance` are public identity with no other home,
 and every other sink renders them as ordinary tags; hiding them would merge different hosts' and
-instances' lists into one series.
+instances' lists into one series. One exception: `datadog_out` takes a non-empty `Str`
+`collectd.host` as the Datadog host, and then doesn't send it as a tag, when nothing outranks it.
+It ranks below `host.name`, a DogStatsD `host` tag, an event's or check's own host, a log's
+`hostname`, `syslog.hostname`, or `host`, and a Datadog hostless mark, and above the process
+hostname (`crates/logit-proto/src/datadog/mod.rs`'s encode tables).
 
 These are **event** attributes, never resource ones. `logit_pipeline::BatchAccumulator::absorb`
 keys accumulation on `Arc::ptr_eq`, so a per-host resource would split every batch by sender; the
@@ -253,7 +257,7 @@ path. `crates/logit-proto/src/collectd/mod.rs`'s module doc has the full mapping
 
 | Attribute | Value | Meaning |
 |---|---|---|
-| `collectd.host` | `Value::Str`, or `Value::Bytes` when the wire bytes aren't UTF-8 | The wire Host. Absent when the wire carried an empty one (an empty string part is how a sender *clears* a sticky field). Outranks `host.name` on `collectd_out`, which then falls back to `host.name` and finally to the sink's own `hostname:` — with none of the three, the value list is dropped and counted (`logit.output.metrics.dropped{reason="no_host"}`), since collectd's receiver rejects an empty host and inventing one would merge every unlabelled sender into a single host's metrics. |
+| `collectd.host` | `Value::Str`, or `Value::Bytes` when the wire bytes aren't UTF-8 | The wire Host. Absent when the wire carried an empty one (an empty string part is how a sender *clears* a sticky field). Outranks `host.name` on `collectd_out`, which then falls back to `host.name` and finally to the sink's own `hostname:` — with none of the three, the value list is dropped and counted (`logit.output.metrics.dropped{reason="no_host"}`), since collectd's receiver rejects an empty host and inventing one would merge every unlabelled sender into a single host's metrics. On `datadog_out`, the host when nothing outranks it, as above. |
 | `_logit.collectd.plugin` | `Value::Str`/`Value::Bytes` | The wire Plugin (`cpu`, `load`, `df`). Required for like-relay encoding: a list whose plugin or type sanitizes to nothing is dropped (`{reason="empty_name"}`). |
 | `collectd.plugin_instance` | `Value::Str`/`Value::Bytes`, only when non-empty | The wire PluginInstance (a CPU number, a mount point). |
 | `_logit.collectd.type` | `Value::Str`/`Value::Bytes` | The wire Type — a `types.db` entry name (`cpu`, `if_octets`, `df_complex`) naming the data-source layout the list's values follow. **Its presence is what selects like-relay encoding** on `collectd_out`. |

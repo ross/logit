@@ -110,12 +110,13 @@ process hostname. collectd identifies a value by host, plugin, and type, so its 
 host of the series it sends.
 
 `datadog_out` now ranks a non-empty `Str` `collectd.host` as an event's own host, after the
-others in the table above and before the process hostname: for a metric, after `host.name` and a
-DogStatsD `host:` tag; for an event or service check, after `statsd.*.host`, `host.name`, and
-`host:`; for a log, after `hostname` and `host.name`, and only when the log carries neither
-`syslog.hostname` nor `host`. A metric's `collectd.host` outranks the Datadog hostless marks,
-which only a Datadog sender writes. Read as the host, it leaves as the host and not as a tag or a
-log attribute; when another host wins, it stays a tag.
+others in the table above and before the process hostname: for a metric, after `host.name`, a
+DogStatsD `host:` tag, and the Datadog hostless marks (an empty `host:` tag, a v2 `host` resource
+with no name, or `_logit.datadog.hostless`), since a sender that marked a sample hostless chose no
+host; for an event or service check, after `statsd.*.host`, `host.name`, and `host:`; for a log,
+after `hostname` and `host.name`, and only when the log carries neither `syslog.hostname` nor
+`host`. Read as the host, it leaves as the host and not as a tag or a log attribute; when another
+host or a hostless mark wins, it stays a tag.
 
 `host.name` stays first, ahead of `collectd.host`, because it's how an operator overrides a host
 with `set`. `collectd_out` reads the two the other way round (`collectd.host`, then `host.name`),

@@ -135,7 +135,8 @@ Datadog series whichever way it went
 `<name>.max` series for each delta histogram and exponential histogram, as the exporter's setting
 of the same name does. A series carries its unit as the exporter writes it: an OTLP (UCUM) unit
 under Datadog's name for it (`ms` as `millisecond`, `By/s` as `byte/second`), and no unit where
-Datadog has none, counted `logit.output.fields.omitted{reason="unit_unmapped"}`. One difference
+Datadog has none, counted `logit.output.fields.omitted{reason="unit_unmapped"}`. A unit that
+arrived through `datadog_in` is already Datadog's and leaves as it is. One difference
 from the exporter remains: tags come from the event's attributes and resource as for every other
 `datadog_out` metric, not from the exporter's resource-attribute tables
 (`docs/known-gaps/datadog.md`).
@@ -300,7 +301,8 @@ view of them is lost. Datadog bills per host, so the cost matches one Agent.
 To keep a host per sender, stamp `host.name` upstream with `set`, or have each DogStatsD client
 send a `host:` tag (or `h:` on an event or check). A host the data carries is never replaced. A
 `host:` tag is the host, and isn't sent as a tag, as the Agent reads it. So is a `collectd.host`,
-which `collectd_in` stamps from each value list's and notification's host. A sample a client made
+which `collectd_in` stamps from each value list's and notification's host, unless the sample is
+marked hostless as below. A sample a client made
 hostless with an empty `host:` tag stays hostless, and so does a sample an Agent sends hostless:
 a v2 `host` resource with no name, or `"host":""` on the v1, distribution-point, and sketch
 routes. An empty sketch `host` always reads as hostless, because protobuf can't tell it from a

@@ -310,15 +310,23 @@ datadog-agent commit `45132452`, the commit `tools/differential/datadog-sketch/g
   `{datapoint}` to `item`.
 - A base unit maps bare or after a prefix that the translator lists for it: `By` to `byte`,
   `KiBy` to `kibibyte`, `ms` to `millisecond`. `mBy`, `min`, and `d` don't map.
-- A Datadog unit name passes through unchanged, ahead of the mapping, so the
-  `datadog_in -> datadog_out` relay keeps the unit an Agent or a client sent: any name the
-  mapping can produce, a rate of two, and `nanocore`, which the translator's own
-  `metrics_remapping.go` sets.
+- A Datadog unit name passes through unchanged, ahead of the mapping: any name the mapping can
+  produce, a rate of two, and `nanocore`, which the translator's own `metrics_remapping.go` sets.
 
 A unit that neither passes through nor maps is left off the series and counted
 `logit.output.fields.omitted{reason="unit_unmapped"}`, once per record. It's `omitted` because
 the record is still delivered without one of its fields, per
-[ADR `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md). The exporter counts nothing. A
-Datadog unit name outside the pass-through set (Datadog's catalog is larger than the names the
-translator produces) is left off and counted the same way, which the relay records as a gap in
-`docs/known-gaps/datadog.md`.
+[ADR `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md). The exporter counts nothing.
+
+**A unit `datadog_in` decoded is never mapped.** Datadog's unit catalog holds names the
+translator never produces (`percent_nano`, `millicore`, `degree fahrenheit`), and an Agent or a
+client may send any of them, so the pass-through set alone would drop them on the
+`datadog_in -> datadog_out` relay. `datadog_in` marks a series batch whose records carry a unit
+with the private resource attribute `_logit.datadog.units: datadog`, and `datadog_out` writes the
+unit of an event under that mark as it is. The mark sits on the batch resource rather than on
+each record because every series in a batch comes from one decode, and a batch with no unit gets
+none, so a unit-less decode allocates nothing more. It's private, so every other sink ignores it.
+It survives every stage that keeps the batch resource: `aggregate` groups records by resource and
+emits each group under its own, and `keep`, `remove`, and `set` leave other resource attributes
+alone. A stage that builds a new resource drops it, and `datadog_out` then maps those units as
+any other source's.
