@@ -19,7 +19,7 @@
 components:
   gen:
     type: generate_in
-    count: 3000000
+    count: 2000000
     event:
       attributes:
         host: "h{seq%1000}"
