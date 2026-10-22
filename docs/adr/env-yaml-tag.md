@@ -1,6 +1,6 @@
 ---
 created: 2026-08-29
-updated: 2026-10-03
+updated: 2026-10-21
 ---
 
 # Secrets in config: a general `!env` YAML tag, not per-field `*_env` indirection
@@ -49,6 +49,11 @@ string-typed ones like `token`. The cost: a secret that happens to look like a n
 error, rather than working. Accepted as a documented rough edge rather than solved by always
 coercing to a string, because the always-a-string alternative fails silently in the opposite,
 worse direction for numeric fields — see Alternatives.
+
+**Inside a `lua`/`lua_file` component's `vars:`, the substituted value stays a string**, however
+it looks. Every type is valid there, so a re-parse never fails: it would hand a script a
+digit-only token as a rounded number. A script calls `tonumber` when it wants a number
+([ADR `lua-script-vars`](lua-script-vars.md)).
 
 **Every `!env` reference must resolve, unconditionally, for all three commands.** `logit run` and
 `logit validate` erroring on an unset variable is the obvious case — `validate` is meant to be a

@@ -230,6 +230,7 @@ mod tests {
                     interval: None,
                     max_memory: None,
                     jit: false,
+                    vars: Default::default(),
                 },
             ),
         );
@@ -281,6 +282,7 @@ mod tests {
                     interval: None,
                     max_memory: None,
                     jit: false,
+                    vars: Default::default(),
                 },
             ),
         );
