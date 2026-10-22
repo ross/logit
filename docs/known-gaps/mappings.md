@@ -506,10 +506,11 @@ Entry format and the other areas: [the known-gaps index](README.md).
   the key the encoder keeps.
 - **The class check can misread a resource attribute that an omitted event attribute
   shadows.** An event attribute whose value `graphite_out` writes no tag for (a timestamp,
-  bytes, a map, or null) can share its key with a resource attribute. The encoder merges the two
-  with the event's value winning (`logit_core::attrs::merged`), then omits the tag, counted
-  `logit.output.tags.omitted{reason=unrepresentable}`, so neither value reaches the wire. The
-  matcher inserts the resource's value and then skips the event's, so it expects the resource's
+  bytes, a map, null, an empty string, or an array with no representable element) can share its
+  key with a resource attribute. The encoder merges the two with the event's value winning
+  (`logit_core::attrs::merged`), then omits the tag, counted `logit.output.tags.omitted` with
+  `reason=unrepresentable`, or `reason=empty` for an empty string, so neither value reaches the
+  wire. The matcher inserts the resource's value and then skips the event's, so it expects the resource's
   value. The record still pairs, since the tags read back are a subset of the expected ones, but
   the `attributes/resource_attribute` field row reads `lost`, worse than its `normalized` cell,
   whose text permits the event's value winning on a shared key. The check fails, though the sink

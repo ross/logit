@@ -51,8 +51,8 @@
   text: One pickle payload with no length prefix, as the framer hands it to the decoder.
 - name: pickle_protocol_0
   text: >-
-    Protocol 0's text opcodes: `MARK`, `LIST`, `STRING` paths, `INT`, `LONG`, and `FLOAT` lines,
-    `TUPLE`, `APPEND`, and a `PUT` memo.
+    Protocol 0's text opcodes: `MARK`, `LIST`, `STRING` or `UNICODE` paths, `INT`, `LONG`, or
+    `FLOAT` lines, `TUPLE`, `APPEND`, and a `PUT` memo.
 - name: pickle_protocol_2
   text: >-
     Protocol 2's binary opcodes: `PROTO`, `EMPTY_LIST`, `BINPUT`, `BINUNICODE`, `BININT1` or
