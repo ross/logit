@@ -772,7 +772,7 @@ fn encode_reasons(groups: &[Vec<MetricFamily>], version: Version) -> (Vec<u8>, V
 }
 
 /// Two readings truncating onto one millisecond: the later wins, the earlier is counted
-/// `sub_ms_collapsed` (see `remote_write.rs`'s drop table).
+/// `dropped{reason="duplicate_timestamp"}` (see `remote_write.rs`'s drop table).
 #[test]
 fn two_readings_on_one_millisecond_collapse_to_the_later_one() {
     let reading = |timestamp: i64, value: f64| {
@@ -790,9 +790,9 @@ fn two_readings_on_one_millisecond_collapse_to_the_later_one() {
 
     for version in [Version::V1, Version::V2] {
         let (body, reasons) = encode_reasons(&groups, version);
-        assert_eq!(reasons, [("sub_ms_collapsed".to_string(), 1)], "{version:?}");
+        assert_eq!(reasons, [("duplicate_timestamp".to_string(), 1)], "{version:?}");
 
-        // One `TimeSeries`, and crucially one `Sample` in it: two would be the 400.
+        // One `TimeSeries` with one `Sample`: given two, the receiver would keep the earlier.
         let samples: Vec<(f64, i64)> = match version {
             Version::V1 => {
                 let request = pb1::WriteRequest::decode(body.as_slice()).expect("must decode");
@@ -829,6 +829,35 @@ fn two_readings_on_one_millisecond_collapse_to_the_later_one() {
         let decoded = decode(&body, version, &mut PrometheusDecoder::new()).expect("must decode");
         assert_eq!(decoded.groups.len(), 2, "{version:?}");
         assert_eq!(decoded.samples, 2, "{version:?}");
+    }
+}
+
+/// A histogram reading that collapses loses all of its `_bucket`, `_sum`, and `_count` samples,
+/// and counts once: the counter counts readings, not wire samples.
+#[test]
+fn a_collapsed_histogram_counts_one_reading() {
+    let reading = |timestamp: i64, count: u64| {
+        vec![MetricFamily {
+            series: vec![Series {
+                timestamp: Some(timestamp),
+                ..Series::new(
+                    vec![("shard".to_string(), "1".to_string())],
+                    Point::Histogram {
+                        buckets: vec![(1.0, count), (f64::INFINITY, count)],
+                        sum: Some(1.0),
+                        count,
+                    },
+                )
+            }],
+            ..MetricFamily::new("h", FamilyType::Histogram)
+        }]
+    };
+    let groups = vec![reading(TIMESTAMP, 1), reading(TIMESTAMP + 1, 2)];
+    for version in [Version::V1, Version::V2] {
+        let (body, reasons) = encode_reasons(&groups, version);
+        assert_eq!(reasons, [("duplicate_timestamp".to_string(), 1)], "{version:?}");
+        let decoded = decode(&body, version, &mut PrometheusDecoder::new()).expect("must decode");
+        assert_eq!(decoded.groups, vec![reading(TIMESTAMP, 2)], "{version:?}");
     }
 }
 

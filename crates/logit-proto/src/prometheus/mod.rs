@@ -131,11 +131,11 @@
 //! | `record/exemplar_key_unsafe_histogram` | normalized | `name_sanitized` | An exemplar's attribute key is written as a label name forced into `[a-zA-Z_][a-zA-Z0-9_]*`, each other character `_`, as a series label's is, so the exemplar reads back on its bucket under the sanitized key, uncounted. |
 //! | `record/sample_rate` | exact | -- | Each value is weighted by its inverse rate in the sketch the `samples` row describes. |
 //! | `record/superseded`, with `bind:` unset | exact | -- | Remote-write sends each sample with its own timestamp. |
-//! | `record/superseded`, otherwise | skipped | uncounted | The exposition registry holds one sample per series, so a later record of the series replaces an earlier one before a scrape reads it, uncounted. |
-//! | `record/same_instant`, with `bind:` unset | dropped | uncounted | One series can't hold two samples at one timestamp, so the later point wins and the earlier is dropped, uncounted. |
-//! | `record/same_instant`, otherwise | skipped | uncounted | The exposition registry holds one sample per series, so the later point replaces this one, uncounted. |
-//! | `record/same_millisecond`, with `bind:` unset | dropped | `logit.output.metrics.degraded{reason=sub_ms_collapsed}` | A remote-write sample's timestamp is in milliseconds, and one series can't hold two samples at one timestamp, so the later reading wins and the earlier is dropped, counted under a `degraded` series. |
-//! | `record/same_millisecond`, otherwise | skipped | uncounted | The exposition registry holds one sample per series, so the later point replaces this one, uncounted. |
+//! | `record/superseded`, otherwise | normalized | `superseded` | The exposition registry holds one sample per series, so a later record of the series replaces an earlier one before a scrape reads it: the pull model's overwrite, uncounted. |
+//! | `record/same_instant`, with `bind:` unset | dropped | `logit.output.metrics.dropped{reason=duplicate_timestamp}` | One series can't hold two samples at one timestamp, so the later point wins and the earlier is dropped, counted; a `dedup_timestamps` upstream merges or collapses the pair instead. |
+//! | `record/same_instant`, otherwise | normalized | `superseded` | The exposition registry holds one sample per series, so the later point replaces this one: the pull model's overwrite, uncounted. |
+//! | `record/same_millisecond`, with `bind:` unset | dropped | `logit.output.metrics.dropped{reason=duplicate_timestamp}` | A remote-write sample's timestamp is in milliseconds, and one series can't hold two samples at one timestamp, so the later reading wins and the earlier is dropped, counted; a `dedup_timestamps` with `precision: 1ms` upstream merges or collapses the pair instead. |
+//! | `record/same_millisecond`, otherwise | normalized | `superseded` | The exposition registry holds one sample per series, so the later point replaces this one: the pull model's overwrite, uncounted. |
 //! | `record/non_finite` | exact | -- | `NaN`, `+Inf`, or `-Inf`, as the sample. |
 //! | `log/dogstatsd_event` | skipped | uncounted | A log has no Prometheus form and isn't written, uncounted. |
 //! | `log/plain` | skipped | uncounted | A log has no Prometheus form and isn't written, uncounted. |
@@ -190,6 +190,7 @@
 //! | `unit` / `description` | `# UNIT` (OM only, and only when `_<unit>` suffixes the family name and the unit is `[a-zA-Z0-9_]+` -- the OpenMetrics spec requires it and Prometheus's parser fails the entire body otherwise; dropped counted `logit.output.metrics.degraded{reason="unit_not_suffix"}`) / `# HELP` |
 //! | two families whose `# TYPE` lines carry one name | one is written, the other's series **dropped**, `logit.output.metrics.dropped{reason="name_collision"}` -- see the normalization list below |
 //! | two records, one name, different family types | the first record's type wins, the rest are **dropped**, `logit.output.metrics.dropped{reason="type_conflict"}` -- one name cannot carry two `# TYPE` lines |
+//! | two records of one series at one `Event::timestamp`, in one [`events_to_families`] call | the later replaces the earlier. Under [`Destination::RemoteWrite`], where the sender calls this once per timestamp, the earlier is a lost reading, counted `logit.output.metrics.dropped{reason="duplicate_timestamp"}` with a throttled `duplicate_timestamp` diagnostic naming `dedup_timestamps` as the remedy; [`remote_write`]'s drop table has the sub-millisecond case. Under exposition it's the registry's one value per series, uncounted |
 //! | `EventBatch::scope`, `Resource::schema_url`, `dropped_attributes_count` | dropped (known-gaps rows) |
 //!
 //! ## Well-known attributes (`_logit.prometheus.*`) and target identity
@@ -617,11 +618,13 @@ pub(crate) enum NotEncoded {
     NameCollision,
     InvalidLabels,
     NoTimestamp,
+    /// A remote-write reading another reading of its series replaced at the same millisecond.
+    DuplicateTimestamp,
 }
 
 impl NotEncoded {
     #[cfg(test)]
-    const ALL: [NotEncoded; 10] = [
+    const ALL: [NotEncoded; 11] = [
         NotEncoded::NoRecordedValue,
         NotEncoded::Stale,
         NotEncoded::ExponentialHistogram,
@@ -632,6 +635,7 @@ impl NotEncoded {
         NotEncoded::NameCollision,
         NotEncoded::InvalidLabels,
         NotEncoded::NoTimestamp,
+        NotEncoded::DuplicateTimestamp,
     ];
 
     /// The counter name and its one tag.
@@ -649,6 +653,7 @@ impl NotEncoded {
             NotEncoded::NameCollision => (DROPPED, ("reason", "name_collision")),
             NotEncoded::InvalidLabels => (DROPPED, ("reason", "invalid_labels")),
             NotEncoded::NoTimestamp => (DROPPED, ("reason", "no_timestamp")),
+            NotEncoded::DuplicateTimestamp => (DROPPED, ("reason", "duplicate_timestamp")),
         }
     }
 }
@@ -1076,6 +1081,7 @@ pub fn events_to_families<'a>(
     // The map is keyed by the emitted name, so draining it in key order is already the canonical
     // family ordering -- no re-sort needed.
     let mut out: Vec<MetricFamily> = families.into_values().map(|entry| entry.family).collect();
+    let mut replaced = 0usize;
     for family in &mut out {
         // Stable, so the last of a run of equal label sets is the last one pushed -- latest wins,
         // the cumulative-series semantics `prometheus_out`'s registry upsert also uses.
@@ -1083,13 +1089,38 @@ pub fn events_to_families<'a>(
         let mut deduped: Vec<Series> = Vec::with_capacity(family.series.len());
         for series in family.series.drain(..) {
             match deduped.last_mut() {
-                Some(last) if last.labels == series.labels => *last = series,
+                Some(last) if last.labels == series.labels => {
+                    *last = series;
+                    replaced += 1;
+                }
                 _ => deduped.push(series),
             }
         }
         family.series = deduped;
     }
+    // A remote-write sender calls this once per timestamp, so a replaced series is a reading lost
+    // at its instant. The exposition registry keeps one value per series between scrapes by
+    // design, so there it's the pull model's overwrite, uncounted.
+    if replaced > 0 && encoder.destination == Destination::RemoteWrite {
+        for _ in 0..replaced {
+            encoder.not_encoded(NotEncoded::DuplicateTimestamp);
+        }
+        warn_duplicate_timestamp(encoder, replaced);
+    }
     out
+}
+
+/// The diagnostic both remote-write collapses report under: `n` readings of a series dropped
+/// because a later one shared its millisecond.
+fn warn_duplicate_timestamp(encoder: &mut PrometheusEncoder, n: usize) {
+    encoder.diagnostics.warn_throttled(
+        "duplicate_timestamp",
+        format_args!(
+            "dropped {n} reading(s) that shared a series and a millisecond with a later one, \
+             which remote-write can't carry -- add a `dedup_timestamps` component with \
+             `precision: 1ms` before this output, or an `aggregate` for a live delta flow"
+        ),
+    );
 }
 
 /// A family under construction plus the model name that claimed it -- the two together are what
@@ -2273,6 +2304,7 @@ mod tests {
                     | NotEncoded::NameCollision
                     | NotEncoded::InvalidLabels
                     | NotEncoded::NoTimestamp
+                    | NotEncoded::DuplicateTimestamp
             );
             let expected = if dropped {
                 "logit.output.metrics.dropped"

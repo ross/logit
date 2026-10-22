@@ -197,6 +197,17 @@
 //! `400`s from a receiver with no out-of-order window; a single chain into one `prometheus_out`
 //! can't.
 //!
+//! **Duplicate timestamps.** One series holds one sample per millisecond. Given two in one
+//! request, Prometheus and Mimir answer `2xx`, keep the first, and drop the second silently, so
+//! the sink sends only the later reading of each series and millisecond in a batch and counts
+//! every earlier one `logit.output.metrics.dropped{reason="duplicate_timestamp"}`, with a
+//! throttled `duplicate_timestamp` diagnostic. A sub-millisecond source (`statsd_in` gauges,
+//! `internal`, a relay with no `aggregate`) reaches this; a `dedup_timestamps` with
+//! `precision: 1ms` as the last stage before this sink merges or collapses such readings first.
+//! It works within a batch: a later batch repeating a series and millisecond with a new value
+//! draws `400 duplicate sample for timestamp`, `Rejected` above, which drops that whole batch
+//! (`docs/known-gaps/prometheus.md`).
+//!
 //! ## Telemetry
 //!
 //! Registry mode:
@@ -224,6 +235,11 @@
 //! representable element, since a Prometheus label set has no multi-value label. Unlike the other
 //! `*.normalized` reasons in `docs/design/internal-telemetry.md`, it's **lossy**: the non-last
 //! elements are discarded. It's `normalized` rather than `omitted` because the label survives.
+//!
+//! In sender mode the codec also counts `logit.output.metrics.dropped{reason="duplicate_timestamp"}`
+//! ("Duplicate timestamps" above). Registry mode's upsert keeps one value per series between
+//! scrapes, so a later reading replacing an earlier one there is the pull model's overwrite,
+//! uncounted; an operator who needs every value between scrapes puts an `aggregate` in front.
 //!
 //! A delta `Sum` is the common drop in either mode: counted
 //! `logit.output.metrics.dropped{reason="unresolved_delta"}`, with a throttled
@@ -3363,6 +3379,87 @@ mod tests {
         assert_eq!(
             tagged(&events, "logit.output.metrics.degraded", "reason", "exemplar_omitted"),
             2.0
+        );
+    }
+
+    // -- duplicate timestamps ---------------------------------------------------------------
+
+    fn gauge_at(timestamp: i64, value: f64) -> Event {
+        Event::metric(
+            timestamp,
+            AttrMap::new(),
+            MetricRecord::new(
+                intern("queue_depth"),
+                MetricKind::Gauge(logit_core::MetricValue::F64(value)),
+            ),
+        )
+    }
+
+    const DUPLICATE: SumSeries<'static> =
+        ("logit.output.metrics.dropped", &[("reason", "duplicate_timestamp")]);
+
+    /// `batch` through a remote-write sink whose receiver answers a `503` and then a `200`: the
+    /// sums, and each sample the last request carried as `(value, timestamp_ms)`.
+    async fn retried_remote_write(batch: EventBatch) -> (Sums, Vec<(f64, i64)>) {
+        let (url, log) = scripted_receiver(&[503, 200]).await;
+        let mut probe = TelemetryProbe::new();
+        let mut output = instrumented_sender(&url, &probe);
+        let sums = sums_through_write_loop(
+            &mut output,
+            &mut probe,
+            "prometheus_out",
+            vec![batch],
+            fast_retry(),
+        )
+        .await;
+        let log = log.lock().unwrap();
+        assert_eq!(log.len(), 2, "one request per attempt");
+        let body = snap::raw::Decoder::new().decompress_vec(&log[1].body).unwrap();
+        let request = pb1::WriteRequest::decode(body.as_slice()).unwrap();
+        let samples =
+            request.timeseries.iter().flat_map(|s| &s.samples).map(|s| (s.value, s.timestamp));
+        (sums, samples.collect())
+    }
+
+    /// Two readings of one series at one nanosecond: the later is sent, and the earlier is
+    /// counted dropped once for the batch, though the batch took two attempts.
+    #[tokio::test]
+    async fn a_remote_write_reading_at_the_same_instant_is_counted_dropped_once() {
+        let at = 1_700_000_000_000_000_000;
+        let (sums, samples) =
+            retried_remote_write(batch(vec![gauge_at(at, 1.0), gauge_at(at, 2.0)])).await;
+        assert_eq!(samples, [(2.0, at / 1_000_000)]);
+        assert_eq!(sum_of(&sums, DUPLICATE.0, DUPLICATE.1), 1.0);
+        assert_eq!(
+            sum_of(&sums, "logit.component.diagnostics", &[("key", "duplicate_timestamp")]),
+            1.0
+        );
+    }
+
+    /// Two readings of one series a nanosecond apart, inside one millisecond: the later is sent,
+    /// and the earlier is counted dropped once for the batch.
+    #[tokio::test]
+    async fn a_remote_write_reading_in_the_same_millisecond_is_counted_dropped_once() {
+        let at = 1_700_000_000_000_000_000;
+        let (sums, samples) =
+            retried_remote_write(batch(vec![gauge_at(at, 1.0), gauge_at(at + 1, 2.0)])).await;
+        assert_eq!(samples, [(2.0, at / 1_000_000)]);
+        assert_eq!(sum_of(&sums, DUPLICATE.0, DUPLICATE.1), 1.0);
+        assert_eq!(sum_of(&sums, "logit.output.metrics.degraded", &[]), 0.0);
+    }
+
+    /// The exposition registry keeps one value per series between scrapes, so a later reading
+    /// replacing an earlier one in a batch is the pull model's overwrite, uncounted.
+    #[tokio::test]
+    async fn an_exposition_sink_counts_no_duplicate_timestamp() {
+        let registry = logit_core::Registry::new();
+        let mut sink = ExposeOutput::new("127.0.0.1:0")
+            .with_expire_after(Duration::ZERO)
+            .with_telemetry(registry.telemetry_for("out", "prometheus_out", "sink"));
+        sink.send(&batch(vec![gauge_at(5, 1.0), gauge_at(5, 2.0)])).await.unwrap();
+        assert_eq!(
+            counter(&registry, "logit.output.metrics.dropped", "reason", "duplicate_timestamp"),
+            0.0
         );
     }
 }

@@ -142,7 +142,7 @@
 //! | an exemplar whose labels are over OpenMetrics' 128-code-point budget, names (as sanitized) and values together | dropped, `logit.output.metrics.degraded{reason="exemplar_omitted"}`, the OpenMetrics writer's rule through [`text::exemplar_fits`]. Prometheus's receiver drops one over that budget without failing the request (`tsdb/exemplar.go`'s `validateExemplar`), so sending it would lose it uncounted |
 //! | two exemplar attribute keys sanitizing onto one label name, or one onto `trace_id`/`span_id` beside the exemplar's trace | the one whose original key sorts first is written, the rest omitted, `logit.output.labels.omitted{reason="collision"\|"reserved"}` -- the OpenMetrics writer's rule, since both build the pairs in [`text::exemplar_labels`]. Counted only for an exemplar that is written |
 //! | a family with an empty name | **dropped**, `logit.output.metrics.dropped{reason="invalid_labels"}`; `__name__` may not be empty |
-//! | two readings of one series whose nanosecond timestamps truncate to the same millisecond | the **later** reading wins and the earlier is dropped, `logit.output.metrics.degraded{reason="sub_ms_collapsed"}` per dropped reading. One label set may not carry two samples at one timestamp -- Prometheus and Mimir answer `400 duplicate sample for timestamp` and the sender treats that as permanent, so emitting both would cost the whole request rather than the one reading |
+//! | two readings of one series whose nanosecond timestamps truncate to the same millisecond | the **later** reading wins and the earlier is **dropped**, `logit.output.metrics.dropped{reason="duplicate_timestamp"}` once per dropped reading (not per wire sample: a histogram reading is one), with a throttled `duplicate_timestamp` diagnostic naming the remedy, a `dedup_timestamps` upstream. One label set holds one sample per millisecond. Given two in one request, Prometheus and Mimir answer `2xx`, keep the first, and drop the second silently, so the sink collapses them itself to send the later reading and count the loss. Two readings with the same nanosecond never reach here: [`super::events_to_families`] replaces the earlier and counts it under the same reason |
 //! | a counter's family name in 1.0's `MetricMetadata` | its value sample's name, `_total` included, whatever the model name: decode gives a counter that name either way, so this keeps a re-encode a fixed point |
 //! | [`Series::created`], **version 1.0 only** | dropped, uncounted. 1.0 has no field for it at all; this is the operator's choice of wire version, listed with the permitted normalizations below the way text 0.0.4's `_created` drop is |
 //!
@@ -154,10 +154,10 @@
 //! - everything on [`super`]'s own list, which this module inherits whole;
 //! - series and label reordering: series by label set, labels by byte order, groups by timestamp;
 //! - timestamps and created timestamps are **milliseconds** on the wire, so sub-millisecond
-//!   precision is truncated (toward zero, as the text 0.0.4 writer truncates) -- and where that
-//!   truncation puts two readings of one series on one millisecond, the later one wins and the
-//!   earlier is dropped and counted (see the drop table above). This is the one entry on this list
-//!   that loses a *reading* rather than a rendering of one;
+//!   precision is truncated (toward zero, as the text 0.0.4 writer truncates). Where that
+//!   truncation puts two readings of one series on one millisecond, the earlier isn't a
+//!   normalization but a counted drop (see the drop table above), so a relay of such a pair isn't a
+//!   fixed point;
 //! - `Untyped` is spelled `Unknown` on both versions: the metadata enums have one value for "no
 //!   type", so a text 0.0.4 relay's `untyped` comes back as `unknown`. Both decode to the same
 //!   `Gauge` + `_logit.prometheus.type` marker and both write as `untyped` in text 0.0.4;
@@ -1037,9 +1037,13 @@ pub fn encode_counted(
             entry.1 = entry.1.or(family.unit.as_deref());
         }
     }
+    // Each `Series` is one reading; its samples share its number, so a collapse below counts the
+    // readings it removes, not the wire samples a histogram's reading spans.
+    let mut reading: u32 = 0;
     for families in groups {
         for family in families {
             for series in &family.series {
+                reading = reading.wrapping_add(1);
                 let Some(timestamp) = series.timestamp else {
                     encoder.not_encoded(NotEncoded::NoTimestamp);
                     continue;
@@ -1070,12 +1074,15 @@ pub fn encode_counted(
                         value: sample.value,
                         timestamp_ms: timestamp / 1_000_000,
                         start_ms: series.created.map(|c| c / 1_000_000).unwrap_or(0),
+                        reading,
                     });
                     out.exemplars.extend(sample.exemplars);
                 }
             }
         }
     }
+    // The readings the collapse below removed, by number.
+    let mut lost: Vec<u32> = Vec::new();
     for out in built.values_mut() {
         // Both versions require a series' samples to be in timestamp order. The sort is stable, so
         // two samples that truncate to the same millisecond keep the order their groups gave them
@@ -1085,26 +1092,27 @@ pub fn encode_counted(
         // was written from, so a series merged from several groups would otherwise come back in
         // a different order and the body wouldn't be a fixed point.
         out.exemplars.sort_by_key(|exemplar| exemplar.timestamp_ms);
-        // One label set may not carry two samples at one timestamp: Prometheus and Mimir answer
-        // `400 duplicate sample for timestamp`, which the sender classifies as rejected and the
-        // whole batch is dropped -- so a pair of readings a microsecond apart would cost every
-        // other series in the request too. The wire has millisecond resolution and the model has
-        // nanosecond, so any sub-millisecond source (`statsd_in` gauges, `internal`) reaches this.
-        //
-        // The last reading wins, the same rule `prometheus_out`'s own registry upsert applies to
-        // two scrapes of one series, and each dropped reading is counted -- it is real data loss,
-        // not a reordering.
-        let before = out.samples.len();
+        // One label set holds one sample per millisecond. Inside one request, Prometheus and Mimir
+        // keep the first of two and drop the second silently, so the sink collapses them itself:
+        // the later reading is the one sent, and the earlier is counted as loss here, where the
+        // receiver would count nothing the sender can see. The model's timestamps are
+        // nanoseconds, so any sub-millisecond source (`statsd_in` gauges, `internal`) reaches this.
         out.samples.dedup_by(|later, earlier| {
             if later.timestamp_ms != earlier.timestamp_ms {
                 return false;
             }
+            lost.push(earlier.reading);
             *earlier = *later;
             true
         });
-        for _ in out.samples.len()..before {
-            encoder.degraded_reason("sub_ms_collapsed");
+    }
+    if !lost.is_empty() {
+        lost.sort_unstable();
+        lost.dedup();
+        for _ in &lost {
+            encoder.not_encoded(NotEncoded::DuplicateTimestamp);
         }
+        super::warn_duplicate_timestamp(encoder, lost.len());
     }
     // Counted in its own pass, *after* everything that can still add to or remove from `built`:
     // `logit.output.samples` has to be what the body carries.
@@ -1133,6 +1141,8 @@ struct SampleOut {
     value: f64,
     timestamp_ms: i64,
     start_ms: i64,
+    /// The [`Series`] this sample came from, numbered within one encode.
+    reading: u32,
 }
 
 struct ExemplarOut {
