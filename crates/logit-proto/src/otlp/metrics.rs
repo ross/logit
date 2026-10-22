@@ -317,14 +317,15 @@ fn number_value(value: Option<pb::number_data_point::Value>) -> MetricValue {
 }
 
 /// Encodes one `(Event, MetricRecord)` pair into one OTLP `Metric`, or `None` for a skipped
-/// `Set`/`SetMembers`, or a dropped `GaugeDelta` or delta `Summary` (counted; see the module doc).
+/// `Set`/`SetMembers` or OpenMetrics gaugehistogram, or a dropped `GaugeDelta` or delta `Summary`
+/// (counted; see the module doc).
 pub(crate) fn encode_metric(
     event: &Event,
     record: &MetricRecord,
     telemetry: &Telemetry,
     diagnostics: &mut Diagnostics,
 ) -> Option<pb::Metric> {
-    let name = resolve(record.name).to_string();
+    let mut name = resolve(record.name).to_string();
     let unit = record.unit.map(resolve).unwrap_or_default().to_string();
     let description = record.description.map(resolve).unwrap_or_default().to_string();
     let attributes = common::attrs_to_key_values(&event.attributes);
@@ -333,7 +334,49 @@ pub(crate) fn encode_metric(
     // Only the four kinds below carry exemplars on the wire, so only they count a normalization.
     let exemplars = || encode_exemplars(&record.exemplars, telemetry);
 
+    let prometheus_type =
+        event.attributes.get(crate::prometheus::ATTR_TYPE).and_then(|v| v.as_str());
+
     let data = match &record.kind {
+        // The OTel Prometheus compatibility spec ("Prometheus/OpenMetrics to OTLP") drops a
+        // GaugeHistogram, and OTLP has no histogram that isn't a running count.
+        MetricKind::Histogram(_) if prometheus_type == Some("gaugehistogram") => {
+            telemetry.count(
+                "logit.output.metrics.skipped",
+                1.0,
+                &[("metric_kind", "gauge_histogram")],
+            );
+            diagnostics.warn_throttled(
+                "otlp_gauge_histogram_skipped",
+                format_args!(
+                    "metric '{name}' is an OpenMetrics gaugehistogram, which the OTel Prometheus \
+                     compatibility spec drops -- skipped"
+                ),
+            );
+            return None;
+        }
+        // The same spec's Info and StateSet sections, marked Development, make each a
+        // non-monotonic Sum, so the `1` sums when a label is aggregated away. `prometheus_in`
+        // strips an info family's `_info` suffix from the name; the OTLP name keeps it, as the
+        // Collector's Prometheus receiver does.
+        MetricKind::Gauge(v) if matches!(prometheus_type, Some("info" | "stateset")) => {
+            if prometheus_type == Some("info") {
+                name.push_str("_info");
+            }
+            pb::metric::Data::Sum(pb::Sum {
+                data_points: vec![number_data_point(
+                    attributes,
+                    start,
+                    ts,
+                    record.flags,
+                    exemplars(),
+                    *v,
+                    telemetry,
+                )],
+                aggregation_temporality: temporality_to_pb(Temporality::Cumulative),
+                is_monotonic: false,
+            })
+        }
         MetricKind::Sum(s) => pb::metric::Data::Sum(pb::Sum {
             data_points: vec![number_data_point(
                 attributes,
@@ -1274,6 +1317,75 @@ mod tests {
                 })
         });
         assert!(dropped, "should count logit.output.metrics.dropped{{reason=unresolved_delta}}");
+    }
+
+    /// Whether `registry` holds a count of `name` tagged `tag`.
+    fn counted_in(registry: &Registry, name: &str, tag: (&str, &str)) -> bool {
+        registry.drain(0).iter().any(|e| {
+            e.attributes.get(tag.0).and_then(|v| v.as_str()) == Some(tag.1)
+                && e.metrics.iter().any(|m| logit_core::interner::resolve(m.name) == name)
+        })
+    }
+
+    /// An event `prometheus_in` marked with OpenMetrics family type `family`.
+    fn prometheus_event(family: &str) -> Event {
+        let mut attrs = AttrMap::new();
+        attrs.insert(crate::prometheus::ATTR_TYPE, family);
+        Event::empty(1000, attrs)
+    }
+
+    /// The OTel Prometheus compatibility spec drops a GaugeHistogram.
+    #[test]
+    fn a_gaugehistogram_is_skipped_and_counted() {
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("otlp_out", "otlp_out", "sink");
+        let mut diag = Diagnostics::new("otlp_out");
+        let rec = record(MetricKind::Histogram(histogram(Temporality::Cumulative)));
+        let event = prometheus_event("gaugehistogram");
+        assert!(encode_metric(&event, &rec, &telemetry, &mut diag).is_none());
+        assert_eq!(diag.occurrences("otlp_gauge_histogram_skipped"), 1);
+        assert!(counted_in(
+            &registry,
+            "logit.output.metrics.skipped",
+            ("metric_kind", "gauge_histogram")
+        ));
+    }
+
+    /// An OpenMetrics info or stateset is a cumulative non-monotonic `Sum`, and an info metric
+    /// gets back the `_info` suffix `prometheus_in` strips.
+    #[test]
+    fn an_info_or_stateset_gauge_encodes_as_a_non_monotonic_sum() {
+        for (family, name) in [("info", "m_info"), ("stateset", "m")] {
+            let mut diag = Diagnostics::default();
+            let rec = record(MetricKind::gauge(1.0));
+            let metric =
+                encode_metric(&prometheus_event(family), &rec, &Telemetry::default(), &mut diag)
+                    .unwrap();
+            assert_eq!(metric.name, name, "{family}");
+            match metric.data {
+                Some(pb::metric::Data::Sum(sum)) => {
+                    assert!(!sum.is_monotonic, "{family}");
+                    assert_eq!(
+                        sum.aggregation_temporality,
+                        pb::AggregationTemporality::Cumulative as i32
+                    );
+                    assert_eq!(number_value(sum.data_points[0].value), MetricValue::F64(1.0));
+                }
+                other => panic!("{family}: expected Sum, got {other:?}"),
+            }
+        }
+    }
+
+    /// A family type the spec maps like its kind changes nothing.
+    #[test]
+    fn an_unknown_family_gauge_stays_a_gauge() {
+        let mut diag = Diagnostics::default();
+        let rec = record(MetricKind::gauge(3.0));
+        let metric =
+            encode_metric(&prometheus_event("unknown"), &rec, &Telemetry::default(), &mut diag)
+                .unwrap();
+        assert_eq!(metric.name, "m");
+        assert!(matches!(metric.data, Some(pb::metric::Data::Gauge(_))));
     }
 
     #[test]
