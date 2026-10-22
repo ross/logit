@@ -554,13 +554,16 @@ pub enum OtlpCompression {
 }
 
 /// A signal an event's payload may carry, in OTLP's vocabulary. `traces` corresponds to the
-/// event's span.
+/// event's span. `none` selects an event that arrives carrying no log, no metrics, and no span,
+/// such as an InfluxDB point whose fields are all strings, which still carries its measurement
+/// and fields as attributes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Signal {
     Logs,
     Metrics,
     Traces,
+    None,
 }
 
 /// `has_signal`'s matching rule. `any_of` forwards an event carrying at least one listed signal,
@@ -667,7 +670,8 @@ impl JsonSchema for RouteTargets {
 /// `route_signals`' `signals:`: the one target each signal goes to. At least one must be set, and
 /// each set id must name a `target` component. Two signals may name the same target. A signal
 /// left unset is stripped under `strip: true`; under `strip: false` it rides along on an event
-/// that also carries a listed signal. An event carrying only unset signals is discarded.
+/// that also carries a listed signal. An event carrying only unset signals is discarded, and so
+/// is an event that arrives carrying no signal at all unless `none` names a target.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SignalTargets {
@@ -680,15 +684,22 @@ pub struct SignalTargets {
     /// The target for spans.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub traces: Option<String>,
+    /// The target for an event that arrives carrying no log, no metrics, and no span, such as an
+    /// InfluxDB point whose fields are all strings. Usually the target that feeds the sink able
+    /// to write such an event, which may also be another signal's target. An event left with no
+    /// payload only because `strip: true` removed its unlisted signals is still discarded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub none: Option<String>,
 }
 
 impl SignalTargets {
-    /// Each signal with its target id, in `logs`, `metrics`, `traces` order.
+    /// Each selector with its target id, in `logs`, `metrics`, `traces`, `none` order.
     pub fn iter(&self) -> impl Iterator<Item = (Signal, Option<&str>)> {
         [
             (Signal::Logs, self.logs.as_deref()),
             (Signal::Metrics, self.metrics.as_deref()),
             (Signal::Traces, self.traces.as_deref()),
+            (Signal::None, self.none.as_deref()),
         ]
         .into_iter()
     }
@@ -2747,7 +2758,9 @@ pub enum ComponentKind {
     /// of a traces-only sink, say, fed from a source whose events also carry metrics. Never
     /// mutates a forwarded event: under the default `mode: any_of`, an event carrying a listed
     /// signal is forwarded as it arrived, unlisted signals included. `mode: only` also requires
-    /// the event carry nothing outside `signals`. Place `keep_signals`/`drop_signals` ahead of
+    /// the event carry nothing outside `signals`. Listing `none` also matches an event carrying
+    /// no signal at all, under either mode: `signals: [metrics, none]` with `mode: only` forwards
+    /// an event carrying only metrics, or nothing. Place `keep_signals`/`drop_signals` ahead of
     /// this instead if unwanted payloads must be stripped rather than tolerated. `signals` may
     /// not be empty.
     HasSignal {
@@ -2758,12 +2771,15 @@ pub enum ComponentKind {
     /// Retains only the listed signals' payloads on every event, clearing the rest: an allowlist,
     /// `keep`'s relationship to `remove`. Unlike `has_signal`, this mutates: an event carrying a
     /// log and derived metrics loses the metrics under `signals: [logs]` but keeps the log. An
-    /// event left with no payload is dropped. `signals` may not be empty (that would drop every
-    /// event) and may not name all three signals (a no-op).
+    /// event left with no payload is dropped. Listing `none` keeps an event that arrived with no
+    /// payload; without it, such an event is dropped. `signals` may not be empty (that would drop
+    /// every event) and may not name `logs`, `metrics`, and `traces` together (that keeps every
+    /// payload; use `has_signal` to drop an event carrying none).
     KeepSignals { signals: Vec<Signal> },
     /// Clears the listed signals' payloads on every event, keeping the rest: the mirror of
-    /// `keep_signals`. An event left with no payload is dropped. `signals` may not be empty (a
-    /// no-op) and may not name all three signals (that would drop every event).
+    /// `keep_signals`. An event left with no payload is dropped, as is one that arrived with
+    /// none. `signals` may not be empty (a no-op), may not name all three signals (that would drop
+    /// every event), and may not name `none` (there is no payload to clear).
     DropSignals { signals: Vec<Signal> },
     /// Forwards an event whose batch resource and/or own attributes match every configured pair
     /// and carry every listed key, dropping the rest. `resource:` and `attributes:` are `set`'s
@@ -2954,8 +2970,10 @@ pub enum ComponentKind {
     },
     /// Sends each signal an event carries to that signal's target: logs to one, metrics to
     /// another, spans to a third, or any two to one target. An event carrying none of the listed
-    /// signals is discarded. This component has no ordinary consumers: no component may list it
-    /// in `sources:`; read its targets instead.
+    /// signals is discarded. An event that arrives carrying no signal at all goes to `none`'s
+    /// target when `signals:` sets one, whole and once, and is discarded otherwise. This
+    /// component has no ordinary consumers: no component may list it in `sources:`; read its
+    /// targets instead.
     ///
     /// With `strip: true` (the default), an event carrying signals bound for different targets
     /// is split: each target receives one event holding only its own signals' payloads, with the
@@ -9888,6 +9906,7 @@ mod tests {
                         logs: Some("log_events".to_string()),
                         metrics: Some("metric_events".to_string()),
                         traces: None,
+                        none: None,
                     }
                 );
             }
@@ -9896,11 +9915,43 @@ mod tests {
     }
 
     #[test]
+    fn route_signals_takes_a_none_target_that_may_share_another_signals() {
+        let component: Component = serde_json::from_str(
+            r#"{
+                "type": "route_signals",
+                "sources": ["in"],
+                "signals": {"metrics": "remote_metrics", "none": "remote_metrics"}
+            }"#,
+        )
+        .unwrap();
+        let ComponentKind::RouteSignals { signals, .. } = component.kind else {
+            panic!("expected RouteSignals");
+        };
+        assert_eq!(signals.none.as_deref(), Some("remote_metrics"));
+        assert_eq!(
+            signals.iter().map(|(signal, _)| signal).collect::<Vec<_>>(),
+            vec![Signal::Logs, Signal::Metrics, Signal::Traces, Signal::None]
+        );
+    }
+
+    #[test]
+    fn has_signal_accepts_none() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "has_signal", "sources": ["in"], "signals": ["metrics", "none"]}"#,
+        )
+        .unwrap();
+        let ComponentKind::HasSignal { signals, .. } = component.kind else {
+            panic!("expected HasSignal");
+        };
+        assert_eq!(signals, vec![Signal::Metrics, Signal::None]);
+    }
+
+    #[test]
     fn route_signals_rejects_a_key_that_is_not_a_signal() {
         let err = serde_json::from_str::<Component>(
             r#"{"type": "route_signals", "sources": ["in"], "signals": {"spans": "t"}}"#,
         )
-        .expect_err("`signals:` takes logs, metrics, and traces only");
+        .expect_err("`signals:` takes logs, metrics, traces, and none only");
         assert!(err.to_string().contains("unknown field `spans`"), "got: {err}");
     }
 
