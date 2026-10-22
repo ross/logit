@@ -110,7 +110,8 @@ event, untouched, and is counted `passed_through` with the reason the table give
 **surviving record is the latest-timestamp record among the records that can merge**, and the
 later in batch order on a tie. Its event keeps its own, untruncated timestamp, and every other
 mergeable record in the set is removed from its event. A `NaN` or infinite delta value, a marker
-on a delta kind, and a kind with no merge rule can't merge on their own. For the kinds that merge
+on a delta kind, a delta `Sum` of `Bool`s, and a kind with no merge rule can't merge on their
+own. For the kinds that merge
 (delta `Sum`, delta `Histogram`, delta `ExponentialHistogram`, and `Samples`), a layout, a
 `sample_rate`, or a value type is compared with the survivor's, so the latest record that can merge
 on its own sets them, and a record that differs from it passes through. The last-write-wins kinds
@@ -124,7 +125,8 @@ on the kind:
 | `Gauge`, any `MetricValue` (a `NaN` gauge included) | last write wins: the later value |
 | `Sum`, cumulative, monotonic or not | last write wins |
 | `Histogram`, `ExponentialHistogram`, `Summary`, cumulative | last write wins |
-| `Sum`, delta, monotonic or not | summed, keeping the value type. A `NaN` or infinite value passes through (`non_finite`), as does a value of the other `I64`/`F64` type from the survivor's (`mixed_type`) and one whose addition would overflow the total (`overflow`) |
+| `Sum`, delta, monotonic or not | summed, keeping the value type. A `NaN` or infinite value passes through (`non_finite`), as does a value of any other type from the survivor's, such as `I64` beside `F64` or `U64` beside `I64` (`mixed_type`), and one whose addition would overflow the total (`overflow`) |
+| `Sum`, delta, of `Bool`s | passed through (`no_merge_rule`): two booleans sum to a count, an `I64`, so no merge keeps the type |
 | `GaugeDelta` | passed through (`no_merge_rule`) |
 | `Histogram`, delta | merged when the bucket bounds equal the survivor's: bucket counts added, `sum` added, `min` the lower and `max` the higher, under `aggregate`'s rules below. Other bounds pass through (`layout_mismatch`) |
 | `ExponentialHistogram`, delta | merged when scale and zero threshold equal the survivor's: `positive` and `negative` bucket counts added by absolute bucket index, `zero_count` and `count` added, and `sum`, `min`, and `max` under `aggregate`'s rules. Another scale or zero threshold passes through (`layout_mismatch`) |
@@ -155,6 +157,8 @@ as loss, not as an outcome the config asked for. `no_merge_rule` is the other ex
 - A delta `Summary` pair, such as `cumulative_to_delta` makes, is legitimate input. `datadog_out`
   sends both points and Datadog keeps the higher. That loss is counted only once `datadog_out`
   gets the `duplicate_timestamp` counter ([The sink-side counter](#the-sink-side-counter)).
+- A delta `Sum` of `Bool`s is rare: InfluxDB's boolean fields decode as gauges, so a Lua script
+  is the likely source. It passes through because no merge keeps its type, the rule below.
 
 A stale marker beside delta values isn't broken input. It passes through so
 that no increment is lost, and neither sink drops the pair as a duplicate: `prometheus_out`'s
@@ -169,9 +173,10 @@ the absolute moves them past it: `g:+5`, `g:10`, `g:+1` in one datagram would re
 instead of 11. A `GaugeDelta` exists only upstream of an `aggregate`, which resolves it, so
 merging it here gains nothing.
 
-The delta merges never change a value's type. `aggregate` widens a mixed `I64`/`F64` pair or an
-overflowing integer sum to `F64` (`crates/logit-transforms/src/aggregate.rs`'s module doc), and
-this transform departs from it by design. `aggregate` summarizes; `dedup_timestamps` keeps the
+The delta merges never change a value's type. `aggregate` changes it for a mixed-type pair (`I64`
+and `F64`, or `U64` and `I64`), an overflowing integer sum, and two `Bool`s, which sum to an `I64`
+(`crates/logit-transforms/src/aggregate.rs`'s module doc), and this transform departs from it by
+design. `aggregate` summarizes; `dedup_timestamps` keeps the
 data as it arrived, and some destinations reject a type change on a series: InfluxDB answers a
 field type conflict, and OTLP backends treat an int and a double for one series as a conflict.
 So the record that would force a widening passes through instead, and no `widened` counter
