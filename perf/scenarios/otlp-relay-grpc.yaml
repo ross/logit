@@ -16,7 +16,7 @@
 components:
   gen:
     type: generate_in
-    count: 750000
+    count: 4000000
     event:
       log: "GET /x/{seq%50} 200"
       attributes:
