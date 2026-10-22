@@ -14,7 +14,7 @@
 
 use schemars::{gen::SchemaGenerator, schema::Schema, JsonSchema};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -664,6 +664,150 @@ impl JsonSchema for RouteTargets {
 
     fn json_schema(generator: &mut SchemaGenerator) -> Schema {
         RouteTargetsSchema::json_schema(generator)
+    }
+}
+
+/// A `lua`/`lua_file` component's `vars:`, keyed by the name a script reads.
+pub type LuaVars = BTreeMap<String, LuaVar>;
+
+/// One value under a `lua`/`lua_file` component's `vars:`, as YAML wrote it.
+///
+/// `Null` and an integer past what a Lua number holds deserialize here so `logit validate` can
+/// reject them naming the key path (`logit-pipeline`'s graph rule 95). The published schema
+/// leaves both out.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LuaVar {
+    Null,
+    Bool(bool),
+    /// Any YAML integer. Wider than `i64` so a `u64` past `i64::MAX` reaches validation, which
+    /// rejects anything a double can't hold.
+    Integer(i128),
+    Float(f64),
+    String(String),
+    List(Vec<LuaVar>),
+    Map(BTreeMap<String, LuaVar>),
+}
+
+impl Serialize for LuaVar {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            LuaVar::Null => serializer.serialize_unit(),
+            LuaVar::Bool(b) => serializer.serialize_bool(*b),
+            LuaVar::Integer(n) => serializer.serialize_i128(*n),
+            LuaVar::Float(x) => serializer.serialize_f64(*x),
+            LuaVar::String(s) => serializer.serialize_str(s),
+            LuaVar::List(items) => items.serialize(serializer),
+            LuaVar::Map(map) => map.serialize(serializer),
+        }
+    }
+}
+
+// Hand-rolled rather than `#[serde(untagged)]`, which can't carry an `i128` and whose error names
+// no expected shape.
+impl<'de> Deserialize<'de> for LuaVar {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = LuaVar;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a string, number, boolean, list, or map with string keys")
+            }
+
+            fn visit_unit<E: serde::de::Error>(self) -> Result<LuaVar, E> {
+                Ok(LuaVar::Null)
+            }
+
+            fn visit_none<E: serde::de::Error>(self) -> Result<LuaVar, E> {
+                Ok(LuaVar::Null)
+            }
+
+            fn visit_some<D: serde::Deserializer<'de>>(self, d: D) -> Result<LuaVar, D::Error> {
+                LuaVar::deserialize(d)
+            }
+
+            fn visit_bool<E: serde::de::Error>(self, b: bool) -> Result<LuaVar, E> {
+                Ok(LuaVar::Bool(b))
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, n: i64) -> Result<LuaVar, E> {
+                Ok(LuaVar::Integer(n.into()))
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, n: u64) -> Result<LuaVar, E> {
+                Ok(LuaVar::Integer(n.into()))
+            }
+
+            fn visit_i128<E: serde::de::Error>(self, n: i128) -> Result<LuaVar, E> {
+                Ok(LuaVar::Integer(n))
+            }
+
+            fn visit_u128<E: serde::de::Error>(self, n: u128) -> Result<LuaVar, E> {
+                // Past `i128::MAX` is past 2^53 too; saturating keeps it rejectable by path.
+                Ok(LuaVar::Integer(i128::try_from(n).unwrap_or(i128::MAX)))
+            }
+
+            fn visit_f64<E: serde::de::Error>(self, x: f64) -> Result<LuaVar, E> {
+                Ok(LuaVar::Float(x))
+            }
+
+            fn visit_str<E: serde::de::Error>(self, s: &str) -> Result<LuaVar, E> {
+                Ok(LuaVar::String(s.to_string()))
+            }
+
+            fn visit_string<E: serde::de::Error>(self, s: String) -> Result<LuaVar, E> {
+                Ok(LuaVar::String(s))
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<LuaVar, A::Error> {
+                let mut items = Vec::with_capacity(seq.size_hint().unwrap_or(0));
+                while let Some(item) = seq.next_element::<LuaVar>()? {
+                    items.push(item);
+                }
+                Ok(LuaVar::List(items))
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<LuaVar, A::Error> {
+                let mut out = BTreeMap::new();
+                while let Some((key, value)) = map.next_entry::<String, LuaVar>()? {
+                    out.insert(key, value);
+                }
+                Ok(LuaVar::Map(out))
+            }
+        }
+
+        deserializer.deserialize_any(Visitor)
+    }
+}
+
+// The schema `LuaVar` publishes; its doc comment is the schema's description.
+/// A string, number, boolean, list, or map with string keys. `null` is rejected, and so is an
+/// integer larger than 2^53 in magnitude, which a Lua number can't hold without rounding.
+#[derive(JsonSchema)]
+#[serde(untagged)]
+#[allow(dead_code)]
+enum LuaVarSchema {
+    Bool(bool),
+    Number(f64),
+    String(String),
+    List(Vec<LuaVar>),
+    Map(BTreeMap<String, LuaVar>),
+}
+
+impl JsonSchema for LuaVar {
+    fn schema_name() -> String {
+        "LuaVar".to_string()
+    }
+
+    fn json_schema(generator: &mut SchemaGenerator) -> Schema {
+        LuaVarSchema::json_schema(generator)
     }
 }
 
@@ -2491,9 +2635,25 @@ pub enum ComponentKind {
         /// detection.
         #[serde(default)]
         jit: bool,
+        /// Values the script reads from its `vars` global, so one script serves several
+        /// deployments with only the config changing. A map of strings, numbers, booleans, lists,
+        /// and nested maps, each key a string. `!env` works anywhere inside it and always gives a
+        /// string, even for a value that looks like a number, boolean, or `null`, so a script
+        /// that wants a number from the environment calls `tonumber` on it.
+        ///
+        /// The script sees Lua tables: a list as an array indexed from 1, a map as a table with
+        /// string keys, and an integer as a Lua number. `vars` is an empty table when this is
+        /// omitted, so `vars.name or "default"` works either way. A script that writes to
+        /// `vars` changes only its own copy.
+        ///
+        /// `null` is rejected anywhere inside it, and so is an integer larger than 2^53 in
+        /// magnitude, which a Lua number can't hold without rounding. Nothing checks which keys
+        /// the script reads: a misspelled key reads as `nil`.
+        #[serde(default)]
+        vars: LuaVars,
     },
     /// A `.lua` file path, relative to the config file. Takes the same `interval`, `max_memory`,
-    /// and `jit` as `lua`.
+    /// `jit`, and `vars` as `lua`.
     LuaFile {
         lua_file: String,
         #[serde(default, with = "humantime_serde_duration::option")]
@@ -2504,6 +2664,8 @@ pub enum ComponentKind {
         max_memory: Option<u64>,
         #[serde(default)]
         jit: bool,
+        #[serde(default)]
+        vars: LuaVars,
     },
     /// The windowed aggregator (counters, gauges, sets, distributions). Flushes every `interval`;
     /// `0s` is rejected.
@@ -6014,11 +6176,12 @@ mod tests {
                 .unwrap();
         assert_eq!(component.sources, vec!["in".to_string()]);
         match component.kind {
-            ComponentKind::Lua { script, interval, max_memory, jit } => {
+            ComponentKind::Lua { script, interval, max_memory, jit, vars } => {
                 assert_eq!(script, "return event");
                 assert_eq!(interval, None);
                 assert_eq!(max_memory, None);
                 assert!(!jit, "jit defaults to off");
+                assert!(vars.is_empty(), "vars defaults to empty");
             }
             other => panic!("expected Lua, got {other:?}"),
         }
@@ -6045,7 +6208,8 @@ mod tests {
         )
         .unwrap();
         match component.kind {
-            ComponentKind::LuaFile { lua_file, interval, max_memory, jit } => {
+            ComponentKind::LuaFile { lua_file, interval, max_memory, jit, vars } => {
+                assert!(vars.is_empty(), "vars defaults to empty");
                 assert_eq!(lua_file, "x.lua");
                 assert_eq!(interval, Some(Duration::from_secs(60)));
                 assert_eq!(max_memory, None);
@@ -6089,6 +6253,91 @@ mod tests {
         let string: Result<Component, _> =
             serde_json::from_str(r#"{"type": "lua", "script": "x", "jit": "on"}"#);
         assert!(string.is_err(), "a string jit should be rejected");
+    }
+
+    fn lua_vars_of(json: &str) -> LuaVars {
+        let component: Component = serde_json::from_str(json).unwrap();
+        match component.kind {
+            ComponentKind::Lua { vars, .. } | ComponentKind::LuaFile { vars, .. } => vars,
+            other => panic!("expected Lua or LuaFile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lua_and_lua_file_take_nested_vars() {
+        let vars = r#""vars": {
+            "bucket": "prusa",
+            "port": 8086,
+            "ratio": 0.5,
+            "debug": false,
+            "hosts": ["a", 2, true],
+            "names": {"10:9c:70:2d:d5:c4": "sand", "deep": {"list": [[1]]}}
+        }"#;
+        let want = LuaVars::from([
+            ("bucket".to_string(), LuaVar::String("prusa".to_string())),
+            ("port".to_string(), LuaVar::Integer(8086)),
+            ("ratio".to_string(), LuaVar::Float(0.5)),
+            ("debug".to_string(), LuaVar::Bool(false)),
+            (
+                "hosts".to_string(),
+                LuaVar::List(vec![
+                    LuaVar::String("a".to_string()),
+                    LuaVar::Integer(2),
+                    LuaVar::Bool(true),
+                ]),
+            ),
+            (
+                "names".to_string(),
+                LuaVar::Map(BTreeMap::from([
+                    ("10:9c:70:2d:d5:c4".to_string(), LuaVar::String("sand".to_string())),
+                    (
+                        "deep".to_string(),
+                        LuaVar::Map(BTreeMap::from([(
+                            "list".to_string(),
+                            LuaVar::List(vec![LuaVar::List(vec![LuaVar::Integer(1)])]),
+                        )])),
+                    ),
+                ])),
+            ),
+        ]);
+        assert_eq!(lua_vars_of(&format!(r#"{{"type": "lua", "script": "x", {vars}}}"#)), want);
+        assert_eq!(
+            lua_vars_of(&format!(r#"{{"type": "lua_file", "lua_file": "x.lua", {vars}}}"#)),
+            want
+        );
+    }
+
+    #[test]
+    fn lua_vars_keep_a_null_and_a_wide_integer_for_validation_to_name() {
+        let vars = lua_vars_of(
+            r#"{"type": "lua", "script": "x", "vars": {"gone": null, "big": 18446744073709551615}}"#,
+        );
+        assert_eq!(vars["gone"], LuaVar::Null);
+        assert_eq!(vars["big"], LuaVar::Integer(u64::MAX.into()));
+    }
+
+    #[test]
+    fn lua_vars_must_be_a_map() {
+        for vars in [r#"["a"]"#, r#""prusa""#, "1"] {
+            let parsed: Result<Component, _> = serde_json::from_str(&format!(
+                r#"{{"type": "lua", "script": "x", "vars": {vars}}}"#
+            ));
+            assert!(parsed.is_err(), "vars: {vars} should be rejected");
+        }
+    }
+
+    #[test]
+    fn lua_vars_round_trip_through_serialize() {
+        let json = r#"{"type":"lua","script":"x","vars":{"a":[1,2.5,"s",true],"m":{"k":"v"}}}"#;
+        let component: Component = serde_json::from_str(json).unwrap();
+        let back: Component =
+            serde_json::from_str(&serde_json::to_string(&component).unwrap()).unwrap();
+        match (component.kind, back.kind) {
+            (ComponentKind::Lua { vars: a, .. }, ComponentKind::Lua { vars: b, .. }) => {
+                assert_eq!(a, b)
+            }
+            other => panic!("expected two Luas, got {other:?}"),
+        }
     }
 
     #[test]
@@ -9160,6 +9409,7 @@ mod tests {
                 interval: Some(Duration::from_secs(30)),
                 max_memory: None,
                 jit: false,
+                vars: LuaVars::new(),
             },
         };
         let json = serde_json::to_string(&original).unwrap();

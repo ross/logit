@@ -1,4 +1,10 @@
 {
+  "pickle-p0": {"events": [
+    {"timestamp":"2023-11-14T22:13:20.000000000Z","metrics":[{"name":"logit-fixture.pickle.int_value","kind":"gauge","value":42.0}]},
+    {"timestamp":"2023-11-14T22:13:21.000000000Z","metrics":[{"name":"logit-fixture.pickle.float_value","kind":"gauge","value":12.75}]},
+    {"timestamp":"2023-11-14T22:13:22.000000000Z","metrics":[{"name":"logit-fixture.pickle.negative_value","kind":"gauge","value":-17.5}]},
+    {"timestamp":"2023-11-14T22:13:23.000000000Z","metrics":[{"name":"logit-fixture.pickle.large_value","kind":"gauge","value":1234567.0}]}
+  ], "counters": {}},
   "pickle-p2": {"events": [
     {"timestamp":"2023-11-14T22:13:20.000000000Z","metrics":[{"name":"logit-fixture.pickle.int_value","kind":"gauge","value":42.0}]},
     {"timestamp":"2023-11-14T22:13:21.000000000Z","metrics":[{"name":"logit-fixture.pickle.float_value","kind":"gauge","value":12.75}]},
@@ -42,8 +48,12 @@
     {"timestamp":"2027-01-15T07:59:55.000000000Z","metrics":[{"name":"sensor.delta","kind":"gauge","value":-2.75}]},
     {"timestamp":"2027-01-15T07:59:56.000000000Z","metrics":[{"name":"servers.web-1.disk","kind":"gauge","value":42.0}]},
     {"timestamp":"2027-01-15T07:59:57.000000000Z","metrics":[{"name":"café.temperature","kind":"gauge","value":21.5}]},
+    {"timestamp":"2027-01-15T07:59:58.000000000Z","metrics":[{"name":"app_web_svc","kind":"gauge","value":7.0}],"attributes":{"dc_zone":"a","pri_o":"_low"}},
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"query.time","kind":"gauge","value":3.5}],"attributes":{"expr":"a=b","pattern":"x~y"}}
-  ], "counters": {}},
+  ], "counters": {
+    "logit.output.metrics.normalized{component=out,kind=graphite_out,reason=path_sanitized,role=sink}": 1,
+    "logit.output.metrics.normalized{component=out,kind=graphite_out,reason=tag_sanitized,role=sink}": 1
+  }},
   "write-graphite": {"events": [
     {"timestamp":"2026-09-13T12:30:33.000000000Z","metrics":[{"name":"logit-fixture.interface-eth0.if_dropped.rx","kind":"gauge","value":0.0}]},
     {"timestamp":"2026-09-13T12:30:33.000000000Z","metrics":[{"name":"logit-fixture.interface-eth0.if_dropped.tx","kind":"gauge","value":0.0}]},

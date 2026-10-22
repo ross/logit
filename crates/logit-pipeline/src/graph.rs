@@ -335,6 +335,10 @@
 //! 94. A `cumulative_to_delta` with a `max_staleness` of `0s`, which would forget every series at
 //!     the next batch, so no point is ever differenced, or a `max_series` of `0`, an impossible
 //!     bound the transform would clamp to `1` (`docs/adr/cumulative-to-delta-transform.md`).
+//! 95. A `lua`/`lua_file` `vars:` holding, at any depth, a `null`, which a Lua table can't store,
+//!     or an integer larger than 2^53 in magnitude, which a Lua number can't hold without
+//!     rounding. Only a YAML literal can trip it: `!env` inside `vars:` always gives a string. The
+//!     error names the key path, never the value (`docs/adr/lua-script-vars.md`).
 //!
 //! Not validated: that a `by: {provenance: ..}` route key names a component in this graph. Like
 //! 37's ids, it may name a component relayed from another process. Nor is `keep`'s empty `fields`:
@@ -3864,6 +3868,16 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
+    // Rule 95: a `null`, or an integer a double can't hold, anywhere in a `lua`/`lua_file`'s
+    // `vars:` (`docs/adr/lua-script-vars.md`).
+    for (id, component) in &components {
+        if let ComponentKind::Lua { vars, .. } | ComponentKind::LuaFile { vars, .. } =
+            &component.kind
+        {
+            check_lua_vars(id, vars)?;
+        }
+    }
+
     // Rule 72: `message:` does nothing under any `format:` but `human`, as rule 33's
     // `compression:` does nothing under any `format:` but `native`
     // (`docs/adr/human-render-block-format.md`).
@@ -4417,6 +4431,52 @@ fn is_host_port(entry: &str) -> bool {
         let host = host.trim_start_matches('[').trim_end_matches(']');
         !host.is_empty() && port.parse::<u16>().is_ok()
     })
+}
+
+/// The largest integer magnitude a double holds without rounding, and so a Lua number: 2^53.
+const LUA_MAX_EXACT_INTEGER: i128 = 1 << 53;
+
+/// Rule 95 over one component's `vars:`, depth first. A list element's path is its 0-based
+/// index in brackets (`vars.hosts[0]`), as the YAML lists it. No message prints a value.
+fn check_lua_vars(id: &str, vars: &logit_config::LuaVars) -> anyhow::Result<()> {
+    fn walk(id: &str, path: &mut String, value: &logit_config::LuaVar) -> anyhow::Result<()> {
+        use logit_config::LuaVar;
+        match value {
+            LuaVar::Null => anyhow::bail!(
+                "component '{id}': '{path}' is null -- a Lua table can't hold nil; give it a \
+                 value or remove the key"
+            ),
+            LuaVar::Integer(n) if n.abs() > LUA_MAX_EXACT_INTEGER => anyhow::bail!(
+                "component '{id}': '{path}' is an integer larger than 2^53 in magnitude, which a \
+                 Lua number can't hold without rounding -- quote it in the YAML to pass it as a \
+                 string"
+            ),
+            LuaVar::List(items) => {
+                for (i, item) in items.iter().enumerate() {
+                    let len = path.len();
+                    path.push_str(&format!("[{i}]"));
+                    walk(id, path, item)?;
+                    path.truncate(len);
+                }
+            }
+            LuaVar::Map(map) => walk_map(id, path, map)?,
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn walk_map(id: &str, path: &mut String, map: &logit_config::LuaVars) -> anyhow::Result<()> {
+        for (key, value) in map {
+            let len = path.len();
+            path.push('.');
+            path.push_str(key);
+            walk(id, path, value)?;
+            path.truncate(len);
+        }
+        Ok(())
+    }
+
+    walk_map(id, &mut "vars".to_string(), vars)
 }
 
 /// Rule 85's `sasl: {mechanism: oauthbearer}` checks. No message prints the token, the client
@@ -4986,7 +5046,13 @@ mod tests {
     }
 
     fn lua() -> ComponentKind {
-        ComponentKind::Lua { script: "".to_string(), interval: None, max_memory: None, jit: false }
+        ComponentKind::Lua {
+            script: "".to_string(),
+            interval: None,
+            max_memory: None,
+            jit: false,
+            vars: Default::default(),
+        }
     }
 
     fn json() -> ComponentKind {
@@ -15194,7 +15260,13 @@ mod tests {
     // ---- rule 71: lua / lua_file max_memory ------------------------------------------------
 
     fn lua_with_max_memory(max_memory: Option<u64>) -> ComponentKind {
-        ComponentKind::Lua { script: String::new(), interval: None, max_memory, jit: false }
+        ComponentKind::Lua {
+            script: String::new(),
+            interval: None,
+            max_memory,
+            jit: false,
+            vars: Default::default(),
+        }
     }
 
     fn lua_file_with_max_memory(max_memory: Option<u64>) -> ComponentKind {
@@ -15203,6 +15275,7 @@ mod tests {
             interval: None,
             max_memory,
             jit: false,
+            vars: Default::default(),
         }
     }
 
@@ -15234,6 +15307,122 @@ mod tests {
             ]))
             .expect("an unset or nonzero max_memory is valid");
         }
+    }
+
+    // ---- Rule 95: lua / lua_file vars ----------------------------------------------------------
+
+    fn lua_vars_err(vars: logit_config::LuaVars) -> String {
+        let mut errs = Vec::new();
+        for kind in [
+            ComponentKind::Lua {
+                script: String::new(),
+                interval: None,
+                max_memory: None,
+                jit: false,
+                vars: vars.clone(),
+            },
+            ComponentKind::LuaFile {
+                lua_file: "x.lua".to_string(),
+                interval: None,
+                max_memory: None,
+                jit: false,
+                vars: vars.clone(),
+            },
+        ] {
+            errs.push(expect_err(cfg(vec![
+                ("in", vec![], listener()),
+                ("script", vec!["in"], kind),
+                ("out", vec!["script"], sink()),
+            ])));
+        }
+        assert_eq!(errs[0], errs[1], "lua and lua_file should fail alike");
+        errs.remove(0)
+    }
+
+    fn var_map(
+        entries: impl IntoIterator<Item = (&'static str, logit_config::LuaVar)>,
+    ) -> logit_config::LuaVars {
+        entries.into_iter().map(|(k, v)| (k.to_string(), v)).collect()
+    }
+
+    /// Rule 95: a Lua table can't hold `nil`, at the top level or nested in a map or list, and
+    /// the message names the path.
+    #[test]
+    fn a_null_in_lua_vars_is_rejected_by_path() {
+        use logit_config::LuaVar;
+        let cases = [
+            (var_map([("gone", LuaVar::Null)]), "'vars.gone' is null"),
+            (
+                var_map([(
+                    "names",
+                    LuaVar::Map(var_map([
+                        ("a", LuaVar::String("x".into())),
+                        ("foo", LuaVar::Null),
+                    ])),
+                )]),
+                "'vars.names.foo' is null",
+            ),
+            (
+                var_map([(
+                    "hosts",
+                    LuaVar::List(vec![
+                        LuaVar::String("a".into()),
+                        LuaVar::Map(var_map([("port", LuaVar::Null)])),
+                    ]),
+                )]),
+                "'vars.hosts[1].port' is null",
+            ),
+        ];
+        for (vars, want) in cases {
+            let err = lua_vars_err(vars);
+            assert!(err.contains("component 'script'"), "got: {err}");
+            assert!(err.contains(want), "want {want:?}, got: {err}");
+        }
+    }
+
+    /// Rule 95: an integer past 2^53 in magnitude can't round-trip through a Lua number. The
+    /// message names the path and never the value, as no config error prints one.
+    #[test]
+    fn an_integer_past_2_pow_53_in_lua_vars_is_rejected_by_path_without_its_value() {
+        use logit_config::LuaVar;
+        let past = (1i128 << 53) + 1;
+        for n in [past, -past, i128::from(u64::MAX)] {
+            let vars =
+                var_map([("ids", LuaVar::List(vec![LuaVar::Integer(1), LuaVar::Integer(n)]))]);
+            let err = lua_vars_err(vars);
+            assert!(err.contains("'vars.ids[1]' is an integer larger than 2^53"), "got: {err}");
+            assert!(!err.contains(&n.to_string()), "the value leaked: {err}");
+        }
+    }
+
+    /// Rule 95's other side: every other value, and 2^53 itself, validates.
+    #[test]
+    fn lua_vars_without_a_null_or_a_wide_integer_validate() {
+        use logit_config::LuaVar;
+        let vars = var_map([
+            ("max", LuaVar::Integer(1 << 53)),
+            ("min", LuaVar::Integer(-(1 << 53))),
+            ("ratio", LuaVar::Float(f64::MAX)),
+            ("on", LuaVar::Bool(true)),
+            ("empty", LuaVar::List(Vec::new())),
+            ("names", LuaVar::Map(var_map([("a", LuaVar::String("b".into()))]))),
+        ]);
+        resolve(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "script",
+                vec!["in"],
+                ComponentKind::Lua {
+                    script: String::new(),
+                    interval: None,
+                    max_memory: None,
+                    jit: false,
+                    vars,
+                },
+            ),
+            ("out", vec!["script"], sink()),
+        ]))
+        .expect("vars with no null and no integer past 2^53 are valid");
     }
 
     // ---- Datagram sinks: rule 38's UDP ceiling, rule 65's path length, rule 73 -----------------

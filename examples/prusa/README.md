@@ -1,8 +1,8 @@
 # Prusa printer metrics
 
 This example writes the metrics a Prusa printer on Buddy firmware (MK4, XL, MINI, CORE One)
-sends over syslog into InfluxDB 2.x, one point per metric, with each printer's MAC address as a
-tag. It's [`logit.yaml`](logit.yaml) and the script it loads, [`prusa.lua`](prusa.lua).
+sends over syslog into InfluxDB 2.x, one point per metric, each tagged with the printer it came
+from. It's [`logit.yaml`](logit.yaml) and the script it loads, [`prusa.lua`](prusa.lua).
 
 ## What the printer sends
 
@@ -32,7 +32,7 @@ leaves any such line to `line_protocol`, which skips and counts it.
 | Node | What it does |
 |---|---|
 | `printer_in` | `syslog_in` on UDP port 5141 with `framing: datagram`, so one datagram is one event instead of one event per line. |
-| `prusa` | `prusa.lua`: strips the header, gives each point an absolute timestamp, tags it `mac_address`, and names the bucket. |
+| `prusa` | `prusa.lua`: strips the header, gives each point an absolute timestamp, tags it `printer`, and names the bucket. |
 | `points` | `line_protocol`: one event per point. |
 | `influx_out` | `influxdb_out`: writes the points to InfluxDB. |
 
@@ -48,16 +48,20 @@ whose `value` is NaN is skipped, and a format-3 point tagged `_seq` is skipped. 
 
 ## Run it
 
-1. Create a bucket named `prusa` in InfluxDB. InfluxDB refuses a write to a bucket that doesn't
-   exist, and `logit` drops and counts that batch.
+1. Create a bucket named `prusa` in InfluxDB, or the name you set as `vars.bucket` on the `prusa`
+   component. InfluxDB refuses a write to a bucket that doesn't exist, and `logit` drops and
+   counts that batch.
 2. In `logit.yaml`, set `influx_out`'s `url` and `org` to your InfluxDB's.
-3. Start `logit` with a token that can write the bucket:
+3. In `logit.yaml`, list each printer's MAC address and the name to tag it with under the `prusa`
+   component's `vars.names`, or remove `names` to tag every printer with its MAC address. The
+   printer shows its MAC address in its network settings.
+4. Start `logit` with a token that can write the bucket:
 
    ```sh
    INFLUXDB_TOKEN=... logit run logit.yaml
    ```
 
-4. In the printer's metrics settings, set the metrics host to the address of the machine running
+5. In the printer's metrics settings, set the metrics host to the address of the machine running
    `logit`, set the port to 5141, and allow metrics to be sent. The menu differs between printer
    models and firmware versions; Prusa's documentation for your printer has the path.
 
@@ -65,17 +69,24 @@ whose `value` is NaN is skipped, and a format-3 point tagged `_seq` is skipped. 
 
 - **Measurements** are the firmware's metric names: `temp_noz`, `fan`, `heap`, `cpu_usage`, and
   so on.
-- **Tags** are `mac_address`, plus each point's own tags, such as `n` and `a` on `temp_noz` or
+- **Tags** are `printer`, plus each point's own tags, such as `n` and `a` on `temp_noz` or
   `fan` on `fan`.
 - **Fields** keep their names, except that a lone `v` becomes `value`. Numbers keep their type, so
   `v=1i` is an integer `value` and `v=19.5` a float. String fields such as `fw_version`'s `value`
   are written as strings.
 
+## Name the printers
+
+The `printer` tag is the name `vars.names` gives the printer's MAC address, which is the
+datagram's syslog hostname. A printer missing from `vars.names` is tagged with its MAC address,
+so a new printer shows up at once, under its MAC address until you name it. Naming a printer
+starts a new series for it: points written before the change keep the MAC address.
+
 ## Send to a different bucket
 
-Change the `BUCKET` line at the top of `prusa.lua`. `influx_out` sets no `bucket:`, so it writes
-each batch to the bucket the script names. The name rides with the points, so it survives a
-forwarding hop too.
+Change `vars.bucket` on the `prusa` component in `logit.yaml`. `influx_out` sets no `bucket:`, so
+it writes each batch to the bucket the script names. The name rides with the points, so it
+survives a forwarding hop too.
 
 ## Forward instead of writing InfluxDB directly
 
@@ -89,7 +100,7 @@ The script counts through `logit`'s internal telemetry, which an `internal` comp
 
 | Counter | Meaning |
 |---|---|
-| `prusa.datagrams.missed{mac_address}` | datagrams lost between two that arrived, from a step of 2 to 9 in the sequence number |
-| `prusa.datagrams.resync{mac_address}` | a jump of 10 or more, or a step back, in the sequence number: a reboot or firmware restart |
+| `prusa.datagrams.missed{printer}` | datagrams lost between two that arrived, from a step of 2 to 9 in the sequence number |
+| `prusa.datagrams.resync{printer}` | a jump of 10 or more, or a step back, in the sequence number: a reboot or firmware restart |
 | `prusa.datagrams.dropped{reason="version"}` | a datagram in a format the script doesn't support, dropped with its points; nonzero means the firmware sends a format this script needs to learn |
 | `prusa.points.skipped{reason}` | a point skipped as Prusa's collector skips it: `nan` or `seq` |

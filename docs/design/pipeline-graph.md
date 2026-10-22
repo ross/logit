@@ -227,7 +227,8 @@ trace of it: to serde, a `!env`-tagged field is identical to one written with th
 The substituted value is re-parsed as a YAML scalar: `8125` becomes an integer and `true` a bool;
 anything else, including a value that looks like a mapping or sequence, stays a string. That lets
 `!env` fill a non-string field. The cost: a secret that looks like a number or bool must be quoted
-at the source.
+at the source. Inside a `lua`/`lua_file` component's `vars:`, the value stays a string, because
+every type is valid there and a re-parse would hand the script a digit-only token as a number.
 
 Every `!env` reference must resolve for `run`, `validate`, and `graph` alike — including `logit
 graph`, which never reads a component's field values (only `sources` and `type`). Any tag other
@@ -493,6 +494,8 @@ a black hole counts what it discards as `events.discarded`.
     `signals.none` names doesn't count).
 93. A `replay_in` with an empty `path` or a `batch` of `0`.
 94. A `cumulative_to_delta` with a `max_staleness` of `0s` or a `max_series` of `0`.
+95. A `lua`/`lua_file` `vars:` holding a `null` or an integer larger than 2^53 in magnitude, at any
+    depth.
 
 **Deliberately not validated:** that a `by: {provenance: ..}` route key names a component in *this*
 graph — rule 37's reasoning; the key is as likely to name a component relayed from another process.
