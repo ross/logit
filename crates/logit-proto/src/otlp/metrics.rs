@@ -643,6 +643,33 @@ fn distribution_summary_point(
     }
 }
 
+/// A `HistogramDataPoint`'s `bucket_counts` and `explicit_bounds` → the model's buckets, the
+/// count past the last bound under `+Inf`. A point with no buckets but a nonzero `count`, which
+/// `metrics.proto` allows when only the count and sum are known, becomes one `+Inf` bucket of
+/// that count, since `Histogram` has no `count` of its own. A point whose `count` isn't the sum
+/// of its buckets keeps its buckets, counted
+/// `logit.input.metrics.degraded{reason="count_mismatch"}`: they're the distribution, and
+/// `metrics.proto` requires the two to agree.
+fn histogram_buckets_from_pb(
+    dp: &pb::HistogramDataPoint,
+    telemetry: &Telemetry,
+) -> Vec<(f64, u64)> {
+    if dp.bucket_counts.is_empty() {
+        return if dp.count == 0 { Vec::new() } else { vec![(f64::INFINITY, dp.count)] };
+    }
+    let mut buckets = Vec::with_capacity(dp.bucket_counts.len());
+    let mut total = 0u64;
+    for (i, count) in dp.bucket_counts.iter().enumerate() {
+        let bound = dp.explicit_bounds.get(i).copied().unwrap_or(f64::INFINITY);
+        buckets.push((bound, *count));
+        total = total.saturating_add(*count);
+    }
+    if total != dp.count {
+        telemetry.count("logit.input.metrics.degraded", 1.0, &[("reason", "count_mismatch")]);
+    }
+    buckets
+}
+
 /// Decodes one OTLP `Metric` into one `Event` per data point. Never fails; a `NO_RECORDED_VALUE`
 /// point is kept, flagged (see the module doc).
 pub(crate) fn decode_metric(
@@ -706,11 +733,7 @@ pub(crate) fn decode_metric(
                 .map(|dp| {
                     let mut attrs = base_attrs.clone();
                     let ts = common::wire_nanos(dp.time_unix_nano);
-                    let mut buckets = Vec::with_capacity(dp.bucket_counts.len());
-                    for (i, count) in dp.bucket_counts.iter().enumerate() {
-                        let bound = dp.explicit_bounds.get(i).copied().unwrap_or(f64::INFINITY);
-                        buckets.push((bound, *count));
-                    }
+                    let buckets = histogram_buckets_from_pb(&dp, telemetry);
                     let start_timestamp = common::wire_nanos(dp.start_time_unix_nano);
                     let flags = dp.flags;
                     let exemplars = decode_exemplars(dp.exemplars);
@@ -1386,6 +1409,92 @@ mod tests {
                 .unwrap();
         assert_eq!(metric.name, "m");
         assert!(matches!(metric.data, Some(pb::metric::Data::Gauge(_))));
+    }
+
+    fn histogram_metric(dp: pb::HistogramDataPoint) -> pb::Metric {
+        pb::Metric {
+            name: "h".to_string(),
+            data: Some(pb::metric::Data::Histogram(pb::Histogram {
+                data_points: vec![dp],
+                aggregation_temporality: pb::AggregationTemporality::Cumulative as i32,
+            })),
+            ..Default::default()
+        }
+    }
+
+    fn decoded_buckets(events: &[Event]) -> Vec<(f64, u64)> {
+        match &events[0].metrics[0].kind {
+            MetricKind::Histogram(h) => h.buckets.clone(),
+            other => panic!("expected Histogram, got {other:?}"),
+        }
+    }
+
+    /// A point with only `count` and `sum` keeps its population as one `+Inf` bucket, which
+    /// `otlp_out` writes back as one bucket count and no bounds.
+    #[test]
+    fn a_bucketless_histogram_point_decodes_as_one_inf_bucket_of_its_count() {
+        let dp = pb::HistogramDataPoint { count: 12, sum: Some(30.0), ..Default::default() };
+        let events = decode_metric(histogram_metric(dp), &AttrMap::new(), &Telemetry::default());
+        assert_eq!(decoded_buckets(&events), vec![(f64::INFINITY, 12)]);
+        let mut diag = Diagnostics::default();
+        let metric =
+            encode_metric(&events[0], &events[0].metrics[0], &Telemetry::default(), &mut diag)
+                .unwrap();
+        match metric.data {
+            Some(pb::metric::Data::Histogram(h)) => {
+                let dp = &h.data_points[0];
+                assert_eq!((dp.count, dp.bucket_counts.clone()), (12, vec![12]));
+                assert!(dp.explicit_bounds.is_empty());
+            }
+            other => panic!("expected Histogram, got {other:?}"),
+        }
+    }
+
+    /// An empty bucketless point has no population to place, so it stays bucketless.
+    #[test]
+    fn an_empty_bucketless_histogram_point_decodes_with_no_buckets() {
+        let dp = pb::HistogramDataPoint::default();
+        let events = decode_metric(histogram_metric(dp), &AttrMap::new(), &Telemetry::default());
+        assert_eq!(decoded_buckets(&events), vec![]);
+    }
+
+    /// The buckets win over a `count` that disagrees with them, and the mismatch is counted.
+    #[test]
+    fn a_count_that_disagrees_with_the_buckets_keeps_the_buckets_and_is_counted() {
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("otlp_in", "otlp_in", "input");
+        let dp = pb::HistogramDataPoint {
+            count: 10,
+            bucket_counts: vec![3, 4],
+            explicit_bounds: vec![1.0],
+            ..Default::default()
+        };
+        let events = decode_metric(histogram_metric(dp), &AttrMap::new(), &telemetry);
+        assert_eq!(decoded_buckets(&events), vec![(1.0, 3), (f64::INFINITY, 4)]);
+        assert!(counted_in(
+            &registry,
+            "logit.input.metrics.degraded",
+            ("reason", "count_mismatch")
+        ));
+    }
+
+    /// A conforming point counts nothing.
+    #[test]
+    fn a_count_that_agrees_with_the_buckets_counts_nothing() {
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("otlp_in", "otlp_in", "input");
+        let dp = pb::HistogramDataPoint {
+            count: 7,
+            bucket_counts: vec![3, 4],
+            explicit_bounds: vec![1.0],
+            ..Default::default()
+        };
+        decode_metric(histogram_metric(dp), &AttrMap::new(), &telemetry);
+        assert!(!counted_in(
+            &registry,
+            "logit.input.metrics.degraded",
+            ("reason", "count_mismatch")
+        ));
     }
 
     #[test]
