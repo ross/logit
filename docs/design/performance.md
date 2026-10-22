@@ -423,9 +423,11 @@ decimal.
   key against the private string-field carriers. `927f7733`, in the same stack, memoizes which keys
   are string fields and wins most of it back: at the stack's merge, `92b6b708`, the two read +4.2%
   and +3.1% over `72191ead`. Both steps clear the 10-repeat ranges of the cells on either side.
-- **`aggregate-groups` takes another +3.3% between `92b6b708` and n** (0.302 → 0.312, ranges
-  0.297–0.307 against 0.310–0.315). The desktop bisect puts it after #782's merge, and it isn't
-  bisected further. `aggregate` moves +1.1% over the same span.
+- **The rest of `aggregate-groups`' rise is Datadog's APM stats.** `118cc7e1` ("pass Datadog APM
+  stats groups through as bucketed"), the next commit in the same stack, steps `aggregate-groups`
+  +4.0% (0.300 → 0.313, the second cell's 15 repeats within 0.311–0.314) and `aggregate` +1.2%,
+  testing each event for an APM stats group. The merges after it, #782 through n, don't move
+  either scenario by more than 1.1%.
 - **`native-relay` is 7.7% faster on events/s and 3.3% cheaper on CPU, and `lua` 3.5% cheaper.**
   Neither was bisected; read `native-relay`'s with "`native-relay` is code-layout-sensitive" below.
 - **`buffered-small-segments`' −42.3% events/s is wall-clock noise, not a change.** Its CPU
