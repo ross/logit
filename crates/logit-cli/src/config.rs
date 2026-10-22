@@ -421,6 +421,82 @@ components:
         }
     }
 
+    /// A `lua_file`'s `vars:` reads through the real YAML path, `Component`'s flatten included,
+    /// with `!env` resolved inside it.
+    #[test]
+    fn lua_vars_read_through_the_real_yaml_path() {
+        use logit_config::LuaVar;
+        let yaml = r#"
+components:
+  in:
+    type: lines_in
+    bind: 127.0.0.1:5140
+  prusa:
+    type: lua_file
+    sources: [in]
+    lua_file: prusa.lua
+    vars:
+      bucket: !env PRUSA_BUCKET
+      port: !env PRUSA_PORT
+      names:
+        "10:9c:70:2d:d5:c4": sand
+      hosts: [a, 2, 0.5, true]
+  out:
+    type: null_out
+    sources: [prusa]
+"#;
+        let config =
+            parse(yaml, &env(&[("PRUSA_BUCKET", "printers"), ("PRUSA_PORT", "8086")])).unwrap();
+        let vars = match &config.components["prusa"].kind {
+            logit_config::ComponentKind::LuaFile { vars, .. } => vars.clone(),
+            other => panic!("expected LuaFile, got {other:?}"),
+        };
+        assert_eq!(vars["bucket"], LuaVar::String("printers".into()));
+        assert_eq!(vars["port"], LuaVar::Integer(8086));
+        match &vars["names"] {
+            LuaVar::Map(names) => {
+                assert_eq!(names["10:9c:70:2d:d5:c4"], LuaVar::String("sand".into()))
+            }
+            other => panic!("expected a map, got {other:?}"),
+        }
+        assert_eq!(
+            vars["hosts"],
+            LuaVar::List(vec![
+                LuaVar::String("a".into()),
+                LuaVar::Integer(2),
+                LuaVar::Float(0.5),
+                LuaVar::Bool(true),
+            ])
+        );
+    }
+
+    /// A YAML `null` and an integer past 2^53, from the file or from `!env`, survive parsing so
+    /// validation can reject them by path without printing the value.
+    #[test]
+    fn lua_vars_null_and_wide_integers_fail_validation_by_path() {
+        for (vars, lookup, want) in [
+            ("names: {sand: ~}", vec![], "'vars.names.sand' is null"),
+            ("token: !env TOKEN", vec![("TOKEN", "null")], "'vars.token' is null"),
+            ("ids: [1, 9007199254740993]", vec![], "'vars.ids[1]' is an integer larger than 2^53"),
+            (
+                "secret: !env SECRET",
+                vec![("SECRET", "18446744073709551615")],
+                "'vars.secret' is an integer larger than 2^53",
+            ),
+        ] {
+            let yaml = format!(
+                "components:\n  in: {{type: lines_in, bind: '127.0.0.1:5140'}}\n  \
+                 script:\n    type: lua\n    sources: [in]\n    script: x\n    vars:\n      \
+                 {vars}\n  out: {{type: null_out, sources: [script]}}\n"
+            );
+            let config = parse(&yaml, &env(&lookup)).unwrap_or_else(|e| panic!("{vars}: {e:#}"));
+            let err = crate::pipeline::validate_semantics(config).unwrap_err().to_string();
+            assert!(err.contains(want), "{vars}: want {want:?}, got: {err}");
+            assert!(!err.contains("18446744073709551615"), "the value leaked: {err}");
+            assert!(!err.contains("9007199254740993"), "the value leaked: {err}");
+        }
+    }
+
     /// `timestamp`'s unit-variant and `{pattern: ..}` `format:` forms read via YAML.
     #[test]
     fn timestamp_format_reads_through_the_real_yaml_path() {

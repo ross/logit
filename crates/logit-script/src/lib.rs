@@ -26,6 +26,7 @@ mod scope;
 mod telemetry;
 mod trace;
 mod value;
+mod vars;
 
 #[cfg(test)]
 mod lifetime_tests;
@@ -170,6 +171,16 @@ impl ScriptWorker {
     /// [`ScriptWorker::new`], with LuaJIT's trace compiler on when `jit` is true (see
     /// [`vm_libs`]). The component's `jit:` option.
     pub fn new_with_jit(source: &str, jit: bool) -> Result<Self, ScriptError> {
+        Self::new_with_vars(source, jit, &logit_config::LuaVars::new())
+    }
+
+    /// [`ScriptWorker::new_with_jit`], with the `vars` global built from `vars`, the component's
+    /// `vars:` option (see `crate::vars`).
+    pub fn new_with_vars(
+        source: &str,
+        jit: bool,
+        vars: &logit_config::LuaVars,
+    ) -> Result<Self, ScriptError> {
         let lua = Lua::new_with(vm_libs(jit), LuaOptions::new())?;
         if jit {
             remove_jit_global(&lua)?;
@@ -186,6 +197,7 @@ impl ScriptWorker {
         print::install(&lua, provenance_state.clone())?;
         random::install(&lua)?;
         pairs::install(&lua)?;
+        vars::install(&lua, vars)?;
         // `Event.new` reads the targets cell at call time, so a later `with_targets` still takes
         // effect; an `Event.new` at top level, during `.exec()`, sees the empty table
         // (`docs/design/lua-api.md` says so).
@@ -1757,6 +1769,7 @@ mod tests {
             "trace",
             "type",
             "unpack",
+            "vars",
             "xpcall",
         ];
         assert_eq!(names, expected, "jit: {jit}");

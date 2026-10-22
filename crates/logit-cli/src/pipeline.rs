@@ -986,12 +986,13 @@ pub(crate) fn build_spec(
 
         // The runtime reads a Lua router's `targets:` off the `ResolvedComponent`, not
         // `NodeSpec::Lua` (`docs/adr/target-components.md`).
-        Lua { script, interval, max_memory, jit } => NodeSpec::Lua {
+        Lua { script, interval, max_memory, jit, vars } => NodeSpec::Lua {
             script: script.clone(),
             interval: *interval,
             runtime: lua_runtime_config(*max_memory, *jit),
+            vars: vars.clone(),
         },
-        LuaFile { lua_file, interval, max_memory, jit } => {
+        LuaFile { lua_file, interval, max_memory, jit, vars } => {
             let script_path = base_dir.join(lua_file);
             let script = std::fs::read_to_string(&script_path)
                 .with_context(|| format!("reading lua_file {}", script_path.display()))?;
@@ -999,6 +1000,7 @@ pub(crate) fn build_spec(
                 script,
                 interval: *interval,
                 runtime: lua_runtime_config(*max_memory, *jit),
+                vars: vars.clone(),
             }
         }
         Aggregate {
@@ -2750,6 +2752,7 @@ mod tests {
                         interval: None,
                         max_memory: None,
                         jit: false,
+                        vars: Default::default(),
                     },
                 },
             ),
@@ -2765,6 +2768,7 @@ mod tests {
                         interval: None,
                         max_memory: None,
                         jit: false,
+                        vars: Default::default(),
                     },
                 },
             ),
@@ -2789,6 +2793,7 @@ mod tests {
                         interval: None,
                         max_memory: None,
                         jit: false,
+                        vars: Default::default(),
                     },
                 },
             ),
@@ -3290,6 +3295,7 @@ mod tests {
                     interval: None,
                     max_memory: None,
                     jit: false,
+                    vars: Default::default(),
                 },
                 None,
                 false,
@@ -3300,6 +3306,7 @@ mod tests {
                     interval: None,
                     max_memory: Some(4 * 1024 * 1024),
                     jit: true,
+                    vars: Default::default(),
                 },
                 Some(4 * 1024 * 1024),
                 true,
@@ -3310,6 +3317,7 @@ mod tests {
                     interval: None,
                     max_memory: Some(256 * 1024 * 1024),
                     jit: true,
+                    vars: Default::default(),
                 },
                 Some(256 * 1024 * 1024),
                 true,

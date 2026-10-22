@@ -487,6 +487,8 @@ silently ignored. `0` for a count or duration bound is usually impossible, not s
     under `strip: false`, a component whose `sources:` lists two of its targets.
 93. A `replay_in` with an empty `path` or a `batch` of `0`.
 94. A `cumulative_to_delta` with a `max_staleness` of `0s` or a `max_series` of `0`.
+95. A `lua`/`lua_file` `vars:` holding a `null` or an integer larger than 2^53 in magnitude, at any
+    depth.
 
 **Deliberately not validated:** that a `by: {provenance: ..}` route key names a component in *this*
 graph — rule 37's reasoning; the key is as likely to name a component relayed from another process.
