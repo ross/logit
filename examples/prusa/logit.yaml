@@ -16,8 +16,8 @@ components:
     bind: 0.0.0.0:5141
     framing: datagram
 
-  # Strips the header, gives every point an absolute timestamp, tags it with the printer's MAC
-  # address, and names the bucket. Points renamed or skipped here follow Prusa's own collector.
+  # Strips the header, gives every point an absolute timestamp, tags it with the printer, and
+  # names the bucket. Points renamed or skipped here follow Prusa's own collector.
   # `jit: true` turns on LuaJIT's compiler, which speeds up a script that parses and loops in
   # plain Lua, as this one does. It's off by default.
   prusa:
@@ -25,6 +25,14 @@ components:
     jit: true
     sources: [printer_in]
     lua_file: prusa.lua
+    # The script reads its settings from here, so prusa.lua stays as shipped.
+    vars:
+      # The InfluxDB bucket to write. Create it first.
+      bucket: prusa
+      # The `printer` tag for each printer, keyed by its MAC address, which is its syslog
+      # hostname. A printer not listed here is tagged with its MAC address.
+      names:
+        "10:9c:70:2d:d5:c4": mk4
 
   # One event per point: the measurement, its tags, and one gauge per numeric field. The script
   # writes nanosecond timestamps, the default `precision`.
@@ -32,8 +40,8 @@ components:
     type: line_protocol
     sources: [prusa]
 
-  # No `bucket:` here, so each batch goes to the bucket the script names, `prusa` unless you edit
-  # it. Create that bucket first: InfluxDB refuses a write to a bucket that doesn't exist, and the
+  # No `bucket:` here, so each batch goes to the bucket the script names, `vars.bucket` above.
+  # Create that bucket first: InfluxDB refuses a write to a bucket that doesn't exist, and the
   # batch is dropped and counted.
   influx_out:
     type: influxdb_out

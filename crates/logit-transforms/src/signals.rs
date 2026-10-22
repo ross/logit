@@ -8,7 +8,11 @@
 //! payload slots, as `keep`/`remove` do for attributes.
 //!
 //! All three drop an event that ends up carrying nothing: for `HasSignal` because no listed signal
-//! matched, for the other two because stripping left no payload.
+//! matched, for the other two because stripping left no payload. The `none` selector is the
+//! exception: `HasSignal` and `KeepSignals` listing it pass an event that arrived with no payload,
+//! such as an InfluxDB point whose fields are all strings (`logit_proto::influxdb`'s module doc).
+//! An event emptied by `KeepSignals`' own stripping is still dropped. Graph rule 21 rejects
+//! `none` on `DropSignals`, which already drops an event that carries nothing.
 
 use logit_core::{Event, Resource, Telemetry};
 use logit_pipeline::Transform;
@@ -23,11 +27,18 @@ pub struct SignalSet {
     pub logs: bool,
     pub metrics: bool,
     pub traces: bool,
+    /// Selects an event that arrived with no payload.
+    pub none: bool,
 }
 
 impl SignalSet {
+    /// Whether the set selects an event carrying these payloads: a listed one present, or
+    /// nothing present and `none` listed.
     fn contains(self, has_log: bool, has_metrics: bool, has_span: bool) -> bool {
-        (self.logs && has_log) || (self.metrics && has_metrics) || (self.traces && has_span)
+        (self.logs && has_log)
+            || (self.metrics && has_metrics)
+            || (self.traces && has_span)
+            || (self.none && !(has_log || has_metrics || has_span))
     }
 }
 
@@ -35,7 +46,7 @@ impl SignalSet {
 ///
 /// `AnyOf` forwards an event carrying at least one listed signal; `Only` also requires nothing
 /// outside the listed set. Both require a listed signal to be present, so an event with no payload
-/// is dropped under either mode rather than satisfying `Only` vacuously.
+/// is dropped under either mode rather than satisfying `Only` vacuously, unless `none` is listed.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum MatchMode {
     #[default]
@@ -97,6 +108,10 @@ impl KeepSignals {
 
 impl Transform for KeepSignals {
     fn process(&mut self, _resource: &Arc<Resource>, event: &mut Event) -> bool {
+        let arrived_empty = event.log.is_none() && event.metrics.is_empty() && event.span.is_none();
+        if arrived_empty {
+            return self.signals.none;
+        }
         strip(event, self.signals, &self.telemetry)
     }
 }
@@ -126,6 +141,7 @@ impl Transform for DropSignals {
             logs: !self.signals.logs,
             metrics: !self.signals.metrics,
             traces: !self.signals.traces,
+            none: false,
         };
         strip(event, complement, &self.telemetry)
     }
@@ -222,6 +238,22 @@ mod tests {
         SignalSet { metrics: true, ..SignalSet::default() }
     }
 
+    fn none() -> SignalSet {
+        SignalSet { none: true, ..SignalSet::default() }
+    }
+
+    fn metrics_or_none() -> SignalSet {
+        SignalSet { metrics: true, none: true, ..SignalSet::default() }
+    }
+
+    /// A string-only InfluxDB point as `influxdb_in` decodes it: attributes, no payload.
+    fn string_only_event() -> Event {
+        let mut attributes = AttrMap::new();
+        attributes.insert("_logit.influxdb.measurement", Value::str("filament"));
+        attributes.insert("_logit.influxdb.field.v", Value::str("PLA"));
+        Event::empty(0, attributes)
+    }
+
     // -- HasSignal --------------------------------------------------------------------------
 
     #[test]
@@ -264,7 +296,56 @@ mod tests {
         assert!(!HasSignal::new(traces(), MatchMode::Only).process(&resource, &mut empty));
     }
 
+    #[test]
+    fn has_signal_none_forwards_only_an_empty_event_under_either_mode() {
+        let resource = default_resource();
+        for mode in [MatchMode::AnyOf, MatchMode::Only] {
+            let mut has_signal = HasSignal::new(none(), mode);
+            assert!(has_signal.process(&resource, &mut string_only_event()), "{mode:?}");
+            assert!(!has_signal.process(&resource, &mut metric_event()), "{mode:?}");
+            assert!(!has_signal.process(&resource, &mut log_event()), "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn has_signal_any_of_metrics_or_none_forwards_a_mixed_event_and_an_empty_one() {
+        let mut has_signal = HasSignal::new(metrics_or_none(), MatchMode::AnyOf);
+        let resource = default_resource();
+        assert!(has_signal.process(&resource, &mut string_only_event()));
+        assert!(has_signal.process(&resource, &mut add_metric(span_event())));
+        assert!(!has_signal.process(&resource, &mut span_event()));
+    }
+
+    #[test]
+    fn has_signal_only_metrics_or_none_forwards_metrics_alone_or_nothing() {
+        let mut has_signal = HasSignal::new(metrics_or_none(), MatchMode::Only);
+        let resource = default_resource();
+        assert!(has_signal.process(&resource, &mut string_only_event()));
+        assert!(has_signal.process(&resource, &mut metric_event()));
+        assert!(!has_signal.process(&resource, &mut add_metric(span_event())), "carries a span");
+        assert!(!has_signal.process(&resource, &mut log_event()));
+    }
+
     // -- KeepSignals / DropSignals ------------------------------------------------------------
+
+    #[test]
+    fn keep_signals_none_keeps_an_event_that_arrived_empty() {
+        let resource = default_resource();
+        let mut keep =
+            KeepSignals::new(SignalSet { logs: true, none: true, ..SignalSet::default() });
+        let mut event = string_only_event();
+        assert!(keep.process(&resource, &mut event));
+        assert_eq!(event.attributes.len(), 2, "forwarded untouched");
+        assert!(!KeepSignals::new(logs()).process(&resource, &mut string_only_event()));
+    }
+
+    #[test]
+    fn keep_signals_none_still_drops_an_event_its_strip_emptied() {
+        let mut keep =
+            KeepSignals::new(SignalSet { logs: true, none: true, ..SignalSet::default() });
+        let resource = default_resource();
+        assert!(!keep.process(&resource, &mut metric_event()));
+    }
 
     #[test]
     fn keep_signals_strips_disallowed_payloads_and_keeps_the_rest() {

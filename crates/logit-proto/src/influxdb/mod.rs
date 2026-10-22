@@ -63,6 +63,13 @@
 //! or label at another sink each distinct value would start a series. Lua and transforms still
 //! read a string field by its full key, and `aggregate` leaves it out of a series.
 //!
+//! **A point whose fields are all strings carries no signal.** Its event has no log, no metrics,
+//! and no span, only the carriers, and `influxdb_out` still writes its line. A component that
+//! selects by signal discards such an event unless its config names `none`: a `route_signals`
+//! ahead of `influxdb_out` needs `signals.none` set to the target that feeds `influxdb_out`
+//! (`none: remote_metrics` beside `metrics: remote_metrics`, say), a `has_signal` needs `none` in
+//! its list, and a `keep_signals` drops it unless its list names `none`.
+//!
 //! A sender's tag never becomes a carrier or a string field, because every key under `_logit.` is
 //! private to `logit`. Any other tag, one under `influxdb.` or `influxdb.field.` included, is an
 //! ordinary tag, and `influxdb_out` writes it back as one.

@@ -11,6 +11,9 @@ jobs:
     env:
       # `.config/nextest.toml`'s `ci` profile: more test threads than the runner has vCPUs.
       NEXTEST_PROFILE: ci
+      # A run starts from a restored `target` and never reuses incremental state, which would
+      # otherwise be most of what the cache holds.
+      CARGO_INCREMENTAL: "0"
     container:
       # Dockerfile.dev's `ci` stage, published by the "Publish CI image" workflow and tagged by
       # Dockerfile.dev's hash (docs/adr/ci-image-on-ghcr.md). `script/ci-image tag` prints the
@@ -39,13 +42,30 @@ jobs:
             /usr/local/cargo/registry/index
             /usr/local/cargo/registry/cache
             target
-          key: ${{ runner.os }}-cargo-v3-${{ steps.cache-month.outputs.month }}-${{ hashFiles('**/Cargo.lock', 'Cargo.toml') }}
+            fuzz/target
+          key: ${{ runner.os }}-cargo-v4-${{ steps.cache-month.outputs.month }}-${{ hashFiles('**/Cargo.lock', 'Cargo.toml') }}
           restore-keys: >-
             ${{ github.ref == 'refs/heads/main'
-              && format('{0}-cargo-v3-{1}-', runner.os, steps.cache-month.outputs.month)
-              || format('{0}-cargo-v3-', runner.os) }}
+              && format('{0}-cargo-v4-{1}-', runner.os, steps.cache-month.outputs.month)
+              || format('{0}-cargo-v4-', runner.os) }}
 
       - run: ./script/cibuild
+
+      # Workspace artifacts are stale on the next run, because every push changes them, so
+      # remove them before the save and keep only third-party crates. `cargo clean -p` takes a
+      # package's lib, test binaries, and build scripts. fuzz/ is its own workspace and builds
+      # logit-core and logit-proto again into its own `target`. The image has no jq.
+      - name: Prune workspace artifacts from the cache
+        if: github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true'
+        run: |
+          members() {
+            cargo metadata --no-deps --format-version 1 "$@" \
+              | grep -oE '"name":"[^"]*","version"' \
+              | sed -E 's/"name":"([^"]*)".*/-p \1/'
+          }
+          cargo clean $(members)
+          cargo clean --manifest-path fuzz/Cargo.toml $(members --manifest-path fuzz/Cargo.toml) -p logit-core -p logit-proto
+          du -sh target fuzz/target
 
       # A save under an existing key only logs a warning; skip it on an exact hit.
       - uses: actions/cache/save@v4
@@ -55,4 +75,5 @@ jobs:
             /usr/local/cargo/registry/index
             /usr/local/cargo/registry/cache
             target
-          key: ${{ runner.os }}-cargo-v3-${{ steps.cache-month.outputs.month }}-${{ hashFiles('**/Cargo.lock', 'Cargo.toml') }}
+            fuzz/target
+          key: ${{ runner.os }}-cargo-v4-${{ steps.cache-month.outputs.month }}-${{ hashFiles('**/Cargo.lock', 'Cargo.toml') }}
