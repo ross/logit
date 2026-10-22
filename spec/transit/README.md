@@ -156,7 +156,11 @@ loses or invents observations pairs nothing, and the check fails. A record's exp
 the record-level cells it reaches, and the observed class must equal it. A `normalized` cell also
 accepts `exact`, because a normalization touches only the shapes it names. A field may read back
 better than its cell, never worse. Every sink counter the run moved must be named by a cell the
-case reached, and a loss cell observed at its class must see its counter move. Across every
+case reached, and a loss cell observed at its class must see its counter move. A record nothing
+reads back is credited to the class of the counter that moved, or of a cell whose loss is
+`uncounted`, with one exception: under `prometheus_out` exposition, a record whose series has a
+later record read back was overwritten in the registry, so it reads at its expected class when
+that's `normalized` or `degraded`. Across every
 flow, every `normalized` or `lost` cell a record reached must be observed at that class at least
 once; the `ledger` test checks this from the flows' ledger files.
 

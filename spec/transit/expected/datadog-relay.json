@@ -8,10 +8,10 @@
     {"timestamp":"2026-09-24T22:40:42.787000000Z","log":{"severity":"info","format":"raw","message":"2026-09-24 10:00:02,000 ERROR record-fixtures request failed: status=500 path=/fail"},"attributes":{"ddsource":"python","ddtags":"filename:app.log,dirname:/var/log/record","hostname":"record-fixtures","service":"record-fixtures","status":"info"}}
   ], "counters": {}},
   "agent-series-timestamped": {"events": [
-    {"timestamp":"2026-09-21T14:13:20.000000000Z","metrics":[{"name":"record.batch.lag","kind":"gauge","value":2.5}],"attributes":{"_logit.datadog.interval":10,"_logit.datadog.origin.product":10,"env":"record","host.name":"record-fixtures","service":"record-fixtures","team":"obs","version":"1.2.3"},"types":{"/attributes/_logit.datadog.origin.product":"u64"}},
-    {"timestamp":"2026-09-21T14:13:20.000000000Z","metrics":[{"name":"record.batch.lag","kind":"gauge","value":2.5}],"attributes":{"_logit.datadog.interval":10,"_logit.datadog.origin.product":10,"env":"record","host.name":"record-fixtures","service":"record-fixtures","team":"obs","version":"1.2.3"},"types":{"/attributes/_logit.datadog.origin.product":"u64"}},
     {"timestamp":"2026-09-21T14:13:20.000000000Z","metrics":[{"name":"record.batch.lag","kind":"gauge","value":2.5}],"attributes":{"_logit.datadog.interval":10,"_logit.datadog.origin.product":10,"env":"record","host.name":"record-fixtures","service":"record-fixtures","team":"obs","version":"1.2.3"},"types":{"/attributes/_logit.datadog.origin.product":"u64"}}
-  ], "counters": {}},
+  ], "counters": {
+    "logit.output.metrics.dropped{component=out,kind=datadog_out,reason=duplicate_timestamp,role=sink}": 2
+  }},
   "agent-service-check": {"events": [
     {"timestamp":"2026-09-24T22:41:05.000000000Z","metrics":[{"name":"datadog.agent.up","kind":"gauge","value":0.0}],"attributes":{"_logit.statsd.service_check.host":"record-fixtures","_logit.statsd.service_check.name":"datadog.agent.up","_logit.statsd.service_check.status":0},"types":{"/attributes/_logit.statsd.service_check.status":"u64"}}
   ], "counters": {}},

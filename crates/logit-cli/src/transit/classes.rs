@@ -23,7 +23,9 @@
 //! `gauge` holding `NaN` or an infinity, and `superseded` when a later record of the run is
 //! another point of its series (the same name, kind, and public attributes), with `same_instant`
 //! when that point shares its timestamp or else `same_millisecond` when it shares its
-//! millisecond. A `histogram` or `exponential_histogram` reaches the field row `record/min_max`
+//! millisecond; at `datadog_out`, a `samples`, `distribution`, or `set_members` record reaches
+//! neither, since that sink collapses a series' points only on its series route, which writes
+//! none of those kinds. A `histogram` or `exponential_histogram` reaches the field row `record/min_max`
 //! for its `min` and `max`, which its own comparison leaves out, as a flagged point's leaves out
 //! its value: a stale marker reads back as `NaN`, and a `samples` record below rate 1 that rounds
 //! to weight 1 the field row `record/sample_rate_unweighted` for its rate, left out the same way.
@@ -81,7 +83,10 @@
 //! may also carry the `lower_bound`, `upper_bound`, or `quantile` tag of the bucket or quantile it
 //! expands. An input left unpaired was skipped or
 //! dropped: the class is the one whose counter moved, or the cell's when it says the loss is
-//! `uncounted`. A read-back record no input claims fails the check with both sides printed.
+//! `uncounted`. One exception: under `prometheus_out` exposition (`bind:` set), an unpaired
+//! record whose series has a later record in the case that was read back was overwritten in the
+//! registry, and reads at its expected class when that's `normalized` or `degraded`. A read-back
+//! record no input claims fails the check with both sides printed.
 //!
 //! The check compares no timestamp but one: a `same_instant` record paired `exact` whose read-back
 //! instant differs from its twin's reads `normalized`, since the sink moved them apart.
@@ -1772,9 +1777,17 @@ pub(super) fn check(
         }
         // The later point of its series at this record's instant, if any.
         let twin = later.iter().copied().find(|&j| ins[j].timestamp == input.timestamp);
-        if twin.is_some() {
+        // `datadog_out` collapses a series' points in one second on its series route only, which
+        // writes nothing for these kinds: a `samples` or `distribution` record has its own route,
+        // where Datadog keeps both points, and a `set_members` record has no Datadog form.
+        let collapsible = sink != "datadog_out"
+            || !matches!(input.kind.as_str(), "samples" | "distribution" | "set_members");
+        if twin.is_some() && collapsible {
             features.push("same_instant");
-        } else if later.iter().any(|&j| same_millisecond(input, &ins[j])) {
+        } else if twin.is_none()
+            && collapsible
+            && later.iter().any(|&j| same_millisecond(input, &ins[j]))
+        {
             features.push("same_millisecond");
         }
         rows.extend(features.into_iter().map(|f| ("record".to_string(), Some(f.to_string()))));
@@ -1849,6 +1862,16 @@ pub(super) fn check(
                     cell.counter.is_none() && cell.reason.as_deref() == Some("uncounted")
                 });
                 if counted || uncounted {
+                    Some(expected)
+                } else if matches!(expected, Class::Normalized | Class::Degraded)
+                    && sink == "prometheus_out"
+                    && traced.sink.get("bind").is_some_and(|bind| !bind.is_null())
+                    && later.iter().any(|&j| !pairing.claimed[j].is_empty())
+                {
+                    // The exposition registry keeps one value per series, so a record whose
+                    // series has a later record read back was overwritten by it: the pull
+                    // model's normalization, which leaves the earlier record nothing to pair
+                    // with. A kind the sink writes in a lesser form stays at that class.
                     Some(expected)
                 } else if moved.iter().any(|s| s.name.ends_with(".skipped")) {
                     Some(Class::Skipped)
@@ -2607,5 +2630,60 @@ mod tests {
         let pairing = pair(&ins, &outs, Spelling::Influxdb);
         assert!(moved_apart(&pairing, 0, 1, &outs));
         assert!(!moved_apart(&pairing, 0, 0, &outs));
+    }
+
+    /// [`check`] over `ins` read back as `outs` by a `prometheus_out` with `config`, against the
+    /// committed table.
+    fn check_prometheus(ins: &[&str], outs: &[&str], config: Value) -> Vec<String> {
+        let batches = |lines: &[&str]| {
+            let text: String = lines
+                .iter()
+                .map(|line| line.replace("{T}", "\"timestamp\":\"2027-01-15T08:00:00.000000000Z\""))
+                .map(|line| format!("{line}\n"))
+                .collect();
+            EventJsonDecoder::new().decode_batches(text.as_bytes()).expect("JSON lines")
+        };
+        let table = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../spec/transit/mapping.yaml");
+        let mapping = mapping::load(&table).expect("the committed table loads");
+        let traced = Traced {
+            outcome: super::super::Outcome { events: Vec::new(), counters: BTreeMap::new() },
+            sunk: batches(ins),
+            decoded: batches(outs),
+            sink: config,
+        };
+        let at = At { flow: "test", case: "test" };
+        check(&mapping, &at, &traced, &mut Ledger::default())
+    }
+
+    /// Under exposition, a record a later record of its series overwrote in the registry is
+    /// credited to its cell's `normalized` class, though nothing reads back for it.
+    #[test]
+    fn an_exposed_record_a_later_one_of_its_series_overwrote_is_normalized() {
+        let ins = [
+            r#"{{T},"metrics":[{"name":"g","kind":"gauge","value":1.0}],"attributes":{"a":"x"}}"#,
+            r#"{{T},"metrics":[{"name":"g","kind":"gauge","value":2.0}],"attributes":{"a":"x"}}"#,
+        ];
+        let outs =
+            [r#"{{T},"metrics":[{"name":"g","kind":"gauge","value":2.0}],"attributes":{"a":"x"}}"#];
+        let exposed = serde_json::json!({"type": "prometheus_out", "bind": "127.0.0.1:9464"});
+        let failures = check_prometheus(&ins, &outs, exposed);
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    /// The credit needs a later record of the record's own series: an unread record whose cell
+    /// is `normalized` for another reason, beside a later record of another series, still fails.
+    #[test]
+    fn an_exposed_record_with_no_later_record_of_its_series_still_fails() {
+        let ins = [
+            r#"{{T},"metrics":[{"name":"g","kind":"gauge","value":1}],"attributes":{"a":"x"}}"#,
+            r#"{{T},"metrics":[{"name":"g","kind":"gauge","value":2}],"attributes":{"a":"y"}}"#,
+        ];
+        let outs =
+            [r#"{{T},"metrics":[{"name":"g","kind":"gauge","value":2.0}],"attributes":{"a":"y"}}"#];
+        let exposed = serde_json::json!({"type": "prometheus_out", "bind": "127.0.0.1:9464"});
+        let failures = check_prometheus(&ins, &outs, exposed);
+        assert_eq!(failures.len(), 1, "{failures:#?}");
+        assert!(failures[0].contains("isn't read back"), "{failures:#?}");
     }
 }

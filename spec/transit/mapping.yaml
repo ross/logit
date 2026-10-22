@@ -1378,11 +1378,12 @@ rows:
         - when: {bind: null}
           class: exact
           text: Remote-write sends each sample with its own timestamp.
-        - class: skipped
-          reason: uncounted
+        - class: normalized
+          reason: superseded
           text: >-
             The exposition registry holds one sample per series, so a later record of the series
-            replaces an earlier one before a scrape reads it, uncounted.
+            replaces an earlier one before a scrape reads it: the pull model's overwrite,
+            uncounted.
       otlp_out:
         class: exact
         text: Each record is its own data point.
@@ -1402,15 +1403,16 @@ rows:
       prometheus_out:
         - when: {bind: null}
           class: dropped
-          reason: uncounted
+          counter: logit.output.metrics.dropped{reason=duplicate_timestamp}
           text: >-
             One series can't hold two samples at one timestamp, so the later point wins and the
-            earlier is dropped, uncounted.
-        - class: skipped
-          reason: uncounted
+            earlier is dropped, counted; a `dedup_timestamps` upstream merges or collapses the
+            pair instead.
+        - class: normalized
+          reason: superseded
           text: >-
             The exposition registry holds one sample per series, so the later point replaces this
-            one, uncounted.
+            one: the pull model's overwrite, uncounted.
       influxdb_out:
         class: normalized
         reason: next_nanosecond
@@ -1421,9 +1423,14 @@ rows:
         class: exact
         text: Each record is its own data point.
       datadog_out:
-        class: exact
+        class: dropped
+        counter: logit.output.metrics.dropped{reason=duplicate_timestamp}
         text: >-
-          Each record is its own point.
+          Datadog keeps one point per series per second, the higher of two in one request, so the
+          sink sends the later point and drops this one, counted, whatever the two values are. A
+          `samples` record leaves on the distribution route, where Datadog keeps both, so it
+          doesn't reach this row. A `dedup_timestamps` with `precision: 1s` upstream merges or
+          collapses the pair instead.
   - kind: record
     feature: same_millisecond
     cells:
@@ -1433,16 +1440,17 @@ rows:
       prometheus_out:
         - when: {bind: null}
           class: dropped
-          counter: logit.output.metrics.degraded{reason=sub_ms_collapsed}
+          counter: logit.output.metrics.dropped{reason=duplicate_timestamp}
           text: >-
             A remote-write sample's timestamp is in milliseconds, and one series can't hold two
             samples at one timestamp, so the later reading wins and the earlier is dropped,
-            counted under a `degraded` series.
-        - class: skipped
-          reason: uncounted
+            counted; a `dedup_timestamps` with `precision: 1ms` upstream merges or collapses the
+            pair instead.
+        - class: normalized
+          reason: superseded
           text: >-
             The exposition registry holds one sample per series, so the later point replaces this
-            one, uncounted.
+            one: the pull model's overwrite, uncounted.
       influxdb_out:
         class: exact
         text: Each point is its own line at its own nanosecond.
@@ -1450,9 +1458,12 @@ rows:
         class: exact
         text: Each record is its own data point, at its own nanosecond.
       datadog_out:
-        class: exact
+        class: dropped
+        counter: logit.output.metrics.dropped{reason=duplicate_timestamp}
         text: >-
-          Each record is its own point; series timestamps are whole seconds.
+          Series timestamps are whole seconds, and Datadog keeps one point per series per
+          second, so the sink sends the later point and drops this one, counted, as for
+          `record/same_instant`.
   - kind: record
     feature: non_finite
     cells:

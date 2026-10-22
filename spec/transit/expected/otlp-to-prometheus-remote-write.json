@@ -80,6 +80,6 @@
     {"timestamp":"2026-09-10T21:22:20.439000000Z","metrics":[{"name":"gen","kind":"gauge","value":1.0}],"attributes":{"service_name":"telemetrygen"}},
     {"timestamp":"2026-09-10T21:22:21.440000000Z","metrics":[{"name":"gen","kind":"gauge","value":2.0}],"attributes":{"service_name":"telemetrygen"}}
   ], "counters": {
-    "logit.output.metrics.degraded{component=out,kind=prometheus_out,reason=sub_ms_collapsed,role=sink}": 1
+    "logit.output.metrics.dropped{component=out,kind=prometheus_out,reason=duplicate_timestamp,role=sink}": 1
   }}
 }

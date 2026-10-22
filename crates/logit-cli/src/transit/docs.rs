@@ -521,7 +521,9 @@ mod tests {
             unit[0]
         );
         assert!(
-            lines.iter().any(|l| l.contains("`record/superseded`, with `bind:` set → **skipped**")),
+            lines
+                .iter()
+                .any(|l| l.contains("`record/no_recorded_value`, with `bind:` set → **skipped**")),
             "{lines:#?}"
         );
         let statsd = render_gaps(&table(), "statsd_out", "statsd");

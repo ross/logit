@@ -7,7 +7,7 @@
     {"sink":"prometheus_out","row":"log/plain","cell":0,"observed":["skipped"]},
     {"sink":"prometheus_out","row":"record/name_unsafe","cell":0,"observed":["normalized"]},
     {"sink":"prometheus_out","row":"record/no_recorded_value","cell":1,"observed":["skipped"]},
-    {"sink":"prometheus_out","row":"record/superseded","cell":1,"observed":["skipped"]},
+    {"sink":"prometheus_out","row":"record/superseded","cell":1,"observed":["normalized"]},
     {"sink":"prometheus_out","row":"sum/cumulative_monotonic","cell":0,"observed":["normalized"]},
     {"sink":"prometheus_out","row":"sum/cumulative_nonmonotonic","cell":0,"observed":["degraded"]},
     {"sink":"prometheus_out","row":"sum/delta_monotonic","cell":0,"observed":["dropped"]},
