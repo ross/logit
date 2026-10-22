@@ -1,0 +1,3 @@
+# Two equal points of one series at different nanoseconds of one millisecond, as a resend or a
+# relay writes them: a sink keeping one point per series and millisecond loses nothing.
+exercises: []

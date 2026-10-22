@@ -1,0 +1,22 @@
+{
+  "name": "no-buckets-count",
+  "kind": "explicit",
+  "input": {
+    "bounds": [],
+    "counts": [],
+    "count": 12,
+    "sum": "30",
+    "min": null,
+    "max": null
+  },
+  "outcome": "sketch",
+  "sketch": {
+    "k": [-1],
+    "n": [12],
+    "cnt": 12,
+    "sum": "30",
+    "min": "-9.941854089121368e-10",
+    "max": "-9.941854089121368e-10",
+    "avg": "2.5"
+  }
+}

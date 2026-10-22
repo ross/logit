@@ -81,10 +81,10 @@ use logit_proto::graphite::{
 use logit_transforms::{
     AggregateTemporality as TransformTemporality, Aggregator, Arrays as TransformArrays,
     Bucket as BucketTransform, BucketBound, BucketField, CsvParser,
-    CumulativeToDelta as CumulativeToDeltaTransform, Distributions as TransformDistributions,
-    DropAttributes as DropAttributesTransform, DropProvenance as DropProvenanceTransform,
-    DropSignals as DropSignalsTransform, DropStale as DropStaleTransform,
-    Fields as TransformFields, Flatten as FlattenTransform,
+    CumulativeToDelta as CumulativeToDeltaTransform, DedupTimestamps as DedupTimestampsTransform,
+    Distributions as TransformDistributions, DropAttributes as DropAttributesTransform,
+    DropProvenance as DropProvenanceTransform, DropSignals as DropSignalsTransform,
+    DropStale as DropStaleTransform, Fields as TransformFields, Flatten as FlattenTransform,
     HasAttributes as HasAttributesTransform, HasProvenance as HasProvenanceTransform,
     HasSignal as HasSignalTransform, HasStale as HasStaleTransform,
     HttpAccess as HttpAccessTransform, HttpAccessConfig, IdFormat as TraceIdFormatTransform,
@@ -1034,6 +1034,9 @@ pub(crate) fn build_spec(
                 .with_telemetry(telemetry.clone()),
             ))
         }
+        DedupTimestamps { precision } => NodeSpec::Transform(Box::new(
+            DedupTimestampsTransform::new(*precision).with_telemetry(telemetry.clone()),
+        )),
         Json { skip_to_brace, invalid_utf8 } => NodeSpec::Transform(Box::new(
             JsonParser::new(*skip_to_brace)
                 .with_invalid_utf8(to_invalid_utf8(*invalid_utf8))
@@ -6004,6 +6007,22 @@ mod tests {
         };
         assert!(matches!(
             build_spec("deltas", &component, Path::new(""), None).unwrap().0,
+            NodeSpec::Transform(_)
+        ));
+    }
+
+    #[test]
+    fn build_spec_builds_dedup_timestamps() {
+        let component = ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
+            sources: vec!["in".to_string()],
+            targets: Vec::new(),
+            consumers: vec!["out".to_string()],
+            kind: ComponentKind::DedupTimestamps { precision: Duration::from_millis(1) },
+        };
+        assert!(matches!(
+            build_spec("dedup", &component, Path::new(""), None).unwrap().0,
             NodeSpec::Transform(_)
         ));
     }

@@ -227,11 +227,11 @@ Then call it from `postrotate`, in rename mode, the default:
   though the rename succeeded.
 - **An idle sink reopens late.** The reopen happens before the target's next write, so the renamed
   file stays open, and its disk space allocated, until the sink's next batch.
-- **Don't give logrotate a `file_out` path.** Every `file_out` has a `rotate:` policy of its own,
-  so both rotators rename the same path on their own triggers: one stream splits across
-  `events.log.N` and logrotate's names under two retention limits. If you do it anyway, add
-  `dateext` so the two sets of names don't collide, and set `max_bytes` well above one logrotate
-  period's output so `file_out`'s rotation is only a backstop.
+- **Don't give logrotate a `file_out` path that rotates.** A `file_out` whose `rotate:` sets
+  `max_bytes` or `interval` renames its own file, so both rotators rename the same path on their
+  own triggers: one stream splits across `events.log.N` and logrotate's names under two retention
+  limits. If you do it anyway, add `dateext` so the two sets of names don't collide, and set
+  `max_bytes` well above one logrotate period's output so `file_out`'s rotation is only a backstop.
 
 ## Probes and exit codes
 
@@ -2636,6 +2636,60 @@ sample or set member doesn't share (see
 The full list of reasons is in [internal-telemetry.md](design/internal-telemetry.md)'s
 `aggregate` table.
 
+## Duplicate timestamps
+
+Remote-write holds one sample per series per millisecond, and Datadog's series intake one point
+per series per second. So `prometheus_out`'s remote-write and `datadog_out` each send only the
+latest of a series' readings in one bucket, and count every other one:
+
+| Removed reading | Counter |
+|---|---|
+| a state equal to the reading sent | `logit.output.metrics.normalized{reason="duplicate_timestamp"}` |
+| any other | `logit.output.metrics.dropped{reason="duplicate_timestamp"}`, with a throttled `duplicate_timestamp` diagnostic |
+
+The sink keeps the later reading because Prometheus and Mimir would keep the first of two in one
+request, and Datadog the higher, and neither adds two deltas. A state is a reading a later one
+fully replaces: a gauge, or a cumulative sum, histogram, or summary.
+An equal state loses nothing: the destination stores the same sample either way, so a relay or a
+retry resending identical points raises no loss alarm. Equal means the whole reading as the sink
+writes it: for remote-write, the sample or every bucket and quantile, the created timestamp, and
+the exemplars; for `datadog_out`, the value, type, unit, interval, source type, and origin. An
+increment or a set of observations (a delta count, a Datadog `rate`, a delta histogram,
+`samples`, a distribution, a set) counts `dropped` even when equal: two equal ones are two sets of events, and
+only one is sent. Two sets `{alice}` and `{bob}` both write a size of 1, and their union is 2.
+
+A nonzero dropped count means the flow needs a `dedup_timestamps` component, placed last before
+the sink.
+You meet it on a flow that keeps source timestamps from a source that can stamp two readings of
+one series inside one bucket: `statsd_in` gauges, which share their datagram's arrival time,
+`internal`, and any relay with no `aggregate` in the path. Set `precision:` to the sink's
+resolution:
+
+| Sink | `precision:` |
+|---|---|
+| `prometheus_out` with `endpoint:` (remote-write) | `1ms` |
+| `datadog_out` | `1s` |
+
+```yaml
+before_remote_write:
+  type: dedup_timestamps
+  sources: [app_metrics]
+  precision: 1ms
+```
+
+`dedup_timestamps` keeps the latest gauge or cumulative reading and sums deltas and Datadog
+`rate`s, where the sink
+can only keep one reading. A record it can't merge passes through, and the sink then drops it,
+counted. It works within one batch, so a later batch repeating a series and instant still reaches
+the destination twice (`docs/known-gaps/prometheus.md` and `docs/known-gaps/datadog.md`).
+
+`aggregate` also leaves one point per series, but it's the wrong stage for a timestamp-faithful
+relay. It stamps every point with the flush's wall-clock time, adds up to a window of latency, and
+passes a record that carries its own source timestamp through unmerged. For a live delta flow
+that needs a window anyway, `aggregate` is the answer. Exposition mode (`prometheus_out` with
+`bind:`) needs neither: its registry keeps the latest value per series between scrapes, by design,
+and counts nothing.
+
 ## Measuring a flow's shape with `shape`
 
 `shape` answers "what do the events on this leg look like?": how many attributes they carry, how
@@ -3026,6 +3080,14 @@ retries can send a point that far past its window):
 sketch whose `tags` list holds more than 100 strings, so `datadog_out` drops it first and counts
 `records.dropped{reason="too_many_tags"}`. The host and the other fields Datadog carries outside
 `tags` don't count. Cut tags upstream with `keep` or `remove` to keep such a metric.
+
+**Two points of one series in one second leave as one.** Datadog keeps the higher of two such
+points in one request, so of each batch's pair `datadog_out` sends the later and counts the other
+`metrics.dropped{reason="duplicate_timestamp"}`, or
+`metrics.normalized{reason="duplicate_timestamp"}` for a gauge equal to the one sent;
+distribution points are kept, as Datadog keeps them. A `dedup_timestamps` with
+`precision: 1s` ahead of the sink merges deltas instead (see
+[Duplicate timestamps](#duplicate-timestamps)).
 
 **A disk buffer can't deliver an outage's metrics late.** A `buffer.disk:` on this sink holds
 batches through a Datadog outage, but on replay, the metrics that aged past 1 hour and the logs
@@ -3848,7 +3910,11 @@ Native histograms are skipped and counted on both wires regardless of version
   means the endpoint is redirecting; this client deliberately doesn't follow redirects.
 - A sender feeding one series from two upstream branches can draw out-of-order `400`s from a
   receiver with no out-of-order window. That is the topology, not the sink;
-  `docs/known-gaps/prometheus.md` has the row.
+  `docs/known-gaps/prometheus.md` has the row. A later batch that repeats a series and millisecond
+  with a new value draws `400 duplicate sample for timestamp` the same way. Within one batch, the
+  sink counts `logit.output.metrics.dropped{reason="duplicate_timestamp"}` instead, or
+  `normalized` for a state equal to the one sent; see
+  [Duplicate timestamps](#duplicate-timestamps).
 
 ## VictoriaMetrics, VictoriaLogs, and VictoriaTraces
 

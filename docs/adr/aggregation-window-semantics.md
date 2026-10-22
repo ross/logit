@@ -60,6 +60,8 @@ either still see exactly one distinct resource across the batches they receive).
 timestamp, and not the gauge's internally-tracked "latest write" timestamp (used only to pick the
 winner, then discarded). A record that carries its source's own timestamp isn't merged at all;
 see "Amendment: timestamped records, APM stats, and non-finite gauges pass through (2026-10-19)".
+A relay that must keep source timestamps and still leave one point per series per instant uses
+[`dedup_timestamps`](dedup-timestamps-transform.md) instead.
 
 **Windows are wall-clock-driven, not event-time.** A flush fires when the pipeline's clock reaches
 the deadline, regardless of what timestamps the accumulated events actually carry. There is no

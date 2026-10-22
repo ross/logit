@@ -949,10 +949,10 @@ max_length:
   user_agent.original: 512
 ```
 
-A key not in this table, or a limit of `0`, is a config error (graph rule 60). A cap cuts at a
-character boundary, so a capped value stays valid UTF-8. After capping, any control byte (`< 0x20`,
-`0x7F`) left in the value becomes `_`. A value that arrived as raw, non-UTF-8 bytes is capped in
-bytes instead.
+A key not in this table is a config error (graph rule 60). A limit of `0` empties the field on every
+event, counted as truncated. A cap cuts at a character boundary, so a capped value stays valid
+UTF-8. After capping, any control byte (`< 0x20`, `0x7F`) left in the value becomes `_`. A value
+that arrived as raw, non-UTF-8 bytes is capped in bytes instead.
 
 ### `redact_query:`
 

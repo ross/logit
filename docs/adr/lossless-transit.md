@@ -80,6 +80,9 @@ round-trip test can assert equality against a concrete expectation rather than "
   `bucket_counts` to hold one more entry than `explicit_bounds`, so `otlp_out` writes a `0`
   overflow count for a histogram whose last bound is finite, which reads back as an empty `+Inf`
   bucket. A conforming point relays unchanged; one sent with no overflow count gains it.
+- An OTLP histogram point with only `count` and `sum`: `otlp_in` reads it as one `+Inf` bucket
+  holding `count`, so `otlp_out` writes it back with one bucket count and no bounds (the
+  2026-10-21 amendment below).
 - A listener's sender attributes: under `peer:`, `proxy_protocol:`, or an HTTP listener's
   `forwarded:`, `network.peer.*` or `client.*` is added to every event, an opt-in addition the
   sender never sent ([ADR `listener-peer-address`](listener-peer-address.md), [ADR
@@ -370,3 +373,32 @@ relay sends it where the destination reads one. [ADR `statsd-output`](statsd-out
 amendment of the same date records the decision, and the transit spec's `string_value` row the
 class.
 
+## Amendment: a bucketless OTLP histogram keeps its count (2026-10-21)
+
+`logit_core::Histogram` has no `count` field; its population is the sum of its buckets. An OTLP
+`HistogramDataPoint` may carry only `count` and `sum` ("both 'explicit_bounds' and
+'bucket_counts' must be omitted and only 'count' and 'sum' are known", `metrics.proto`), and
+`otlp_in` used to read such a point as an empty histogram, so every sink saw a population of 0.
+
+`otlp_in` now reads a bucketless point with a nonzero `count` as one `+Inf` bucket holding that
+count. A single bucket covering every value describes the same population, so this is a
+permitted normalization of `otlp_in -> otlp_out`, listed above: the point leaves as `count` n,
+`bucket_counts` `[n]`, and no bounds. Every other sink sees the true population too, such as
+`prometheus_out`'s `+Inf` bucket equal to `_count`. `datadog_out` sketches it as Datadog's
+exporter sketches the bucketless point when it carries no `min` and `max`: one bin at the Agent's
+key -1, about `-9.94e-10`, holding every observation, with the count and sum exact. Given a `min`
+and a `max`, the exporter spreads the count between them, and under `histograms.mode: counters`
+it writes no `.bucket` series, which `datadog_out` can't tell apart from a one-bucket point's
+(`docs/known-gaps/datadog.md`; the `no-buckets-count*` cases of
+`testdata/differential/datadog-sketch/`).
+
+A point whose `count` isn't the sum of its `bucket_counts` breaks `metrics.proto`'s "The sum of
+the bucket_counts must equal the value in the count field". `otlp_in` keeps the buckets, since
+they're the distribution, and counts the point
+`logit.input.metrics.degraded{reason="histogram_count_mismatch"}`, the reason `prometheus_in`
+counts when `_count` disagrees with its `+Inf` bucket.
+
+Adding a `count` field to `Histogram` would carry both cases unchanged, but it touches every
+constructor, the native wire record, `event_json`, Lua's `Event.new` and `to_table`, and every
+encoder, for a mismatch only a nonconforming producer sends. `docs/known-gaps/otlp.md` keeps the
+mismatch as residual debt.

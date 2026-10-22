@@ -102,18 +102,21 @@
 //! | `gauge/u64` | normalized | `f64_value` | A sample is a double, so an integer is written as its nearest `f64` and reads back as a float, rounded beyond 2^53. |
 //! | `gauge/bool` | normalized | `bool_value`; `logit.output.metrics.normalized{reason=bool_value}` | A boolean is the sample `1` or `0` and reads back as that number. |
 //! | `gauge/negative` | exact | -- | A negative sample, written as is. |
+//! | `gauge/prometheus_info` | exact | -- | An `info` family, its sample named `<name>_info`. |
+//! | `gauge/prometheus_stateset` | exact | -- | A `stateset` family, one sample per state. |
 //! | `gauge_delta/f64` | dropped | `logit.output.metrics.dropped{reason=unresolved_gauge_delta}` | An unresolved relative adjustment has no absolute value to expose and is dropped, with a throttled `gauge_delta_unresolved` warning; an `aggregate` upstream resolves it into a gauge. |
 //! | `gauge_delta/i64` | dropped | `logit.output.metrics.dropped{reason=unresolved_gauge_delta}` | Dropped, as for a float adjustment. |
 //! | `gauge_delta/u64` | dropped | `logit.output.metrics.dropped{reason=unresolved_gauge_delta}` | Dropped, as for a float adjustment. |
 //! | `gauge_delta/bool` | dropped | `logit.output.metrics.dropped{reason=unresolved_gauge_delta}` | Dropped, as for a float adjustment. |
-//! | `samples` | degraded | `logit.output.metrics.degraded{metric_kind=samples}` | Sketched, each value weighted by its inverse sample rate, then a `summary` of fixed quantiles with `_sum` and `_count`. |
+//! | `samples` | degraded | `logit.output.metrics.degraded{metric_kind=samples}` | Sketched, each value weighted by its inverse sample rate, then written as the `distribution` row describes. |
 //! | `set_members` | degraded | `logit.output.metrics.degraded{metric_kind=set_members}` | A `gauge` of the distinct member count; the members are gone. |
-//! | `distribution` | degraded | `logit.output.metrics.degraded{metric_kind=distribution}` | A `summary` of fixed quantiles with the sketch's exact `_sum` and `_count`; the sketch is gone, so quantiles from two senders don't merge. |
+//! | `distribution` | degraded | `logit.output.metrics.degraded{metric_kind=distribution}` | A `summary` of the sketch's `0` (its minimum), `0.5`, `0.75`, `0.9`, `0.95`, `0.99`, and `1` (its maximum) quantiles with its exact `_sum` and `_count`; the sketch is gone, so quantiles from two senders don't merge. |
 //! | `set` | degraded | `logit.output.metrics.degraded{metric_kind=set}` | A `gauge` of the estimate; the registers are gone. |
 //! | `histogram/delta` | dropped | `logit.output.metrics.dropped{reason=unresolved_delta}` | A delta histogram is dropped, with a throttled `delta_temporality_unresolved` warning; an `aggregate` with `temporality: cumulative` upstream makes it a running one. |
 //! | `histogram/cumulative` | normalized | `inf_bucket` | A `histogram` family of running-sum buckets and `_sum` when it has one, or a `gaugehistogram` under the type carrier. `+Inf` states the total, so a histogram whose last bound is finite reads back with an empty `+Inf` bucket. `min` and `max` are `record/min_max`'s. |
 //! | `histogram/nan_bound` | degraded | `logit.output.metrics.degraded{reason=non_finite_component}` | A `NaN` bound has no place among the sorted bounds, so it has no bucket, and its count reaches only `+Inf` and `_count`. |
 //! | `histogram/neg_inf_bound` | exact | -- | `-Inf` is an ordinary bound: an `le="-Inf"` bucket, first. |
+//! | `histogram/gauge_histogram` | exact | -- | A `gaugehistogram` family, with `_gsum` and `_gcount`. |
 //! | `exponential_histogram/delta`, with `bind:` unset | dropped | `logit.output.metrics.dropped{reason=native_histogram}` | Remote-write carries native histograms, but the sender doesn't map them yet, so one is dropped. |
 //! | `exponential_histogram/delta`, otherwise | skipped | `logit.output.metrics.skipped{metric_kind=exponential_histogram}` | Neither exposition dialect has native-histogram syntax, so none is written. |
 //! | `exponential_histogram/cumulative`, with `bind:` unset | dropped | `logit.output.metrics.dropped{reason=native_histogram}` | Dropped, as for a delta one. |
@@ -122,27 +125,31 @@
 //! | `summary/cumulative` | exact | -- | A `summary` family of its quantiles, `_sum`, and `_count`. |
 //! | `record/no_recorded_value`, with `bind:` unset | exact | -- | Remote-write writes a flagged `Gauge` or cumulative `Sum` as Prometheus's stale marker, read back flagged; a flagged non-monotonic `Sum`'s goes on a `gauge`, as its value would. |
 //! | `record/no_recorded_value`, otherwise | skipped | `logit.output.metrics.skipped{reason=no_recorded_value}` | A point flagged as holding no recorded value isn't exposed. |
-//! | `record/no_recorded_value_delta_sum`, with `bind:` unset | degraded | -- | Remote-write writes a flagged delta `Sum` as a stale marker, its temporality ignored, since a marker holds no reading to be delta about: a monotonic one on a `counter`, read back as a flagged cumulative counter, uncounted, and a non-monotonic one on a `gauge`, counted `logit.output.metrics.degraded{metric_kind=non_monotonic_sum}`. An unflagged delta `Sum` is dropped. |
+//! | `record/no_recorded_value_delta_sum`, with `bind:` unset | degraded | `logit.output.metrics.degraded` | Remote-write writes a flagged delta `Sum` as a stale marker, its temporality ignored, since a marker holds no reading to be delta about: a monotonic one on a `counter`, read back as a flagged cumulative counter, counted `logit.output.metrics.degraded{metric_kind=delta_sum}`, and a non-monotonic one on a `gauge`, counted `logit.output.metrics.degraded{metric_kind=non_monotonic_sum}`. An unflagged delta `Sum` is dropped. |
 //! | `record/no_recorded_value_delta_sum`, otherwise | skipped | `logit.output.metrics.skipped{reason=no_recorded_value}` | A point flagged as holding no recorded value isn't exposed. |
 //! | `record/no_recorded_value_other_kind` | skipped | `logit.output.metrics.skipped{reason=no_recorded_value}` | A flagged record of a kind other than `Gauge` or `Sum` isn't written in either mode. It would be several series, and the flag doesn't say which of them existed, so a stale marker would name a series that may never have been sent. |
 //! | `record/service_check` | exact | -- | The status gauge; the check's carriers aren't labels. |
-//! | `record/name_unsafe` | normalized | `name_sanitized` | A name is forced into `[a-zA-Z_:][a-zA-Z0-9_:]*`, each other character `_`, so the record reads back under the sanitized name, uncounted. |
-//! | `record/exemplar_key_unsafe` | normalized | `name_sanitized` | An exemplar's attribute key is written as a label name forced into `[a-zA-Z_][a-zA-Z0-9_]*`, each other character `_`, as a series label's is, so the exemplar reads back under the sanitized key, uncounted. |
-//! | `record/exemplar_key_unsafe_histogram` | normalized | `name_sanitized` | An exemplar's attribute key is written as a label name forced into `[a-zA-Z_][a-zA-Z0-9_]*`, each other character `_`, as a series label's is, so the exemplar reads back on its bucket under the sanitized key, uncounted. |
+//! | `record/name_unsafe` | normalized | `name_sanitized`; `logit.output.metrics.normalized{reason=name_sanitized}` | A name is forced into `[a-zA-Z_:][a-zA-Z0-9_:]*`, each other character `_`, so the record reads back under the sanitized name, counted once per record it renames. Two names that sanitize onto one in a batch keep one family, the other counted `logit.output.metrics.dropped{reason=name_collision}`; across batches they merge into one series, uncounted. |
+//! | `record/exemplar_key_unsafe` | normalized | `name_sanitized`; `logit.output.labels.normalized{reason=name_sanitized}` | An exemplar's attribute key is written as a label name forced into `[a-zA-Z_][a-zA-Z0-9_]*`, each other character `_`, as a series label's is, so the exemplar reads back under the sanitized key, counted once per key it renames. |
+//! | `record/exemplar_key_unsafe_histogram` | normalized | `name_sanitized`; `logit.output.labels.normalized{reason=name_sanitized}` | An exemplar's attribute key is written as a label name forced into `[a-zA-Z_][a-zA-Z0-9_]*`, each other character `_`, as a series label's is, so the exemplar reads back on its bucket under the sanitized key, counted once per key it renames. |
 //! | `record/sample_rate` | exact | -- | Each value is weighted by its inverse rate in the sketch the `samples` row describes. |
 //! | `record/superseded`, with `bind:` unset | exact | -- | Remote-write sends each sample with its own timestamp. |
-//! | `record/superseded`, otherwise | skipped | uncounted | The exposition registry holds one sample per series, so a later record of the series replaces an earlier one before a scrape reads it, uncounted. |
-//! | `record/same_instant`, with `bind:` unset | dropped | uncounted | One series can't hold two samples at one timestamp, so the later point wins and the earlier is dropped, uncounted. |
-//! | `record/same_instant`, otherwise | skipped | uncounted | The exposition registry holds one sample per series, so the later point replaces this one, uncounted. |
-//! | `record/same_millisecond`, with `bind:` unset | dropped | `logit.output.metrics.degraded{reason=sub_ms_collapsed}` | A remote-write sample's timestamp is in milliseconds, and one series can't hold two samples at one timestamp, so the later reading wins and the earlier is dropped, counted under a `degraded` series. |
-//! | `record/same_millisecond`, otherwise | skipped | uncounted | The exposition registry holds one sample per series, so the later point replaces this one, uncounted. |
+//! | `record/superseded`, otherwise | normalized | `superseded` | The exposition registry holds one sample per series, so a later record of the series replaces an earlier one before a scrape reads it: the pull model's overwrite, uncounted. |
+//! | `record/same_instant`, with `bind:` unset | dropped | `logit.output.metrics.dropped{reason=duplicate_timestamp}` | One series can't hold two samples at one timestamp, so the later point wins and the earlier is dropped, counted, when it differs from it or is an increment, such as a Datadog `rate`, or an observation set, such as a `samples` record's summary; a `dedup_timestamps` upstream merges or collapses the pair instead. |
+//! | `record/same_instant`, otherwise | normalized | `superseded` | The exposition registry holds one sample per series, so the later point replaces this one: the pull model's overwrite, uncounted. |
+//! | `record/same_instant_equal`, with `bind:` unset | normalized | `duplicate_timestamp`; `logit.output.metrics.normalized{reason=duplicate_timestamp}` | One series can't hold two samples at one timestamp, so the later point is sent, and this state, equal to it, is left off, counted: the receiver stores the same sample either way. |
+//! | `record/same_instant_equal`, otherwise | normalized | `superseded` | The exposition registry holds one sample per series, so the later point replaces this one: the pull model's overwrite, uncounted. |
+//! | `record/same_millisecond`, with `bind:` unset | dropped | `logit.output.metrics.dropped{reason=duplicate_timestamp}` | A remote-write sample's timestamp is in milliseconds, and one series can't hold two samples at one timestamp, so the later reading wins and the earlier is dropped, counted, when it differs from it or is an increment, such as a Datadog `rate`, or an observation set; a `dedup_timestamps` with `precision: 1ms` upstream merges or collapses the pair instead. |
+//! | `record/same_millisecond`, otherwise | normalized | `superseded` | The exposition registry holds one sample per series, so the later point replaces this one: the pull model's overwrite, uncounted. |
+//! | `record/same_millisecond_equal`, with `bind:` unset | normalized | `duplicate_timestamp`; `logit.output.metrics.normalized{reason=duplicate_timestamp}` | A remote-write sample's timestamp is in milliseconds, so the later reading is sent, and this state, equal to it, is left off, counted: the receiver stores the same sample either way. |
+//! | `record/same_millisecond_equal`, otherwise | normalized | `superseded` | The exposition registry holds one sample per series, so the later point replaces this one: the pull model's overwrite, uncounted. |
 //! | `record/non_finite` | exact | -- | `NaN`, `+Inf`, or `-Inf`, as the sample. |
-//! | `log/dogstatsd_event` | skipped | uncounted | A log has no Prometheus form and isn't written, uncounted. |
-//! | `log/plain` | skipped | uncounted | A log has no Prometheus form and isn't written, uncounted. |
-//! | `span/alone` | skipped | uncounted | A span has no Prometheus form and isn't written, uncounted. |
+//! | `log/dogstatsd_event` | skipped | `logit.output.events.skipped{reason=no_metrics}` | A log has no Prometheus form and isn't written. |
+//! | `log/plain` | skipped | `logit.output.events.skipped{reason=no_metrics}` | A log has no Prometheus form and isn't written. |
+//! | `span/alone` | skipped | `logit.output.events.skipped{reason=no_metrics}` | A span has no Prometheus form and isn't written. |
 //! | `span/no_wire_form` | exact | -- | Nothing beyond `span/alone`'s outcome. |
-//! | `event/attributes_only` | skipped | uncounted | An event with no metric, log, or span has no sample and isn't written, uncounted. |
-//! | `event/string_only` | skipped | uncounted | An InfluxDB point whose fields are all strings has no metric, so it has no sample and isn't written, uncounted. |
+//! | `event/attributes_only` | skipped | `logit.output.events.skipped{reason=no_metrics}` | An event with no metric, log, or span has no sample and isn't written. |
+//! | `event/string_only` | skipped | `logit.output.events.skipped{reason=no_metrics}` | An InfluxDB point whose fields are all strings has no metric, so it has no sample and isn't written. |
 //!
 //! Per field of a record that reaches the wire, attribute shape, and payload beside metrics:
 //!
@@ -151,25 +158,25 @@
 //! | `record/unit`, with `bind:` unset | exact | -- | Remote-write carries the unit in its metadata. |
 //! | `record/unit`, otherwise | lost | `logit.output.metrics.degraded{reason=unit_not_suffix}` | OpenMetrics writes `# UNIT` only when `_<unit>` ends the family name; otherwise it's left off, counted. |
 //! | `record/description` | exact | -- | The family's `# HELP` line. |
-//! | `record/start_timestamp` | lost | uncounted | OpenMetrics' `_created` sample, written for a counter, histogram, or summary; a gauge's start time is left off, uncounted. |
+//! | `record/start_timestamp` | lost | structural | OpenMetrics' `_created` sample, written for a counter, histogram, or summary; a gauge has no `_created`, so its start time is left off. |
 //! | `record/exemplars` | lost | `logit.output.metrics.degraded{reason=exemplar_omitted}` | In OpenMetrics, on a counter's `_total` line or the bucket line its value falls in, at most one per line. One with no line to sit on, such as a gauge's, or one over the 128-code-point label budget, on either wire, is left off, counted. |
 //! | `record/unit_on_distribution`, with `bind:` unset | exact | -- | Remote-write carries the unit in its metadata. |
 //! | `record/unit_on_distribution`, otherwise | lost | `logit.output.metrics.degraded{reason=unit_not_suffix}` | OpenMetrics writes `# UNIT` only when `_<unit>` ends the family name; otherwise it's left off, counted. |
 //! | `record/exemplars_on_summary` | lost | `logit.output.metrics.degraded{reason=exemplar_omitted}` | A summary has no `_total` or bucket line for an exemplar to sit on, so its exemplars are left off, counted. |
-//! | `record/min_max` | lost | uncounted | A histogram's `min` and `max` have no Prometheus series and aren't written, uncounted. |
-//! | `attributes/string_value` | normalized | `label_sanitized` | A label; its name is forced into `[a-zA-Z_][a-zA-Z0-9_]*`, so a key holding `.` or another character reads back under the sanitized name. |
-//! | `attributes/bool_value` | normalized | `stringified` | A label of `true` or `false`, read back as the string. |
-//! | `attributes/number_value` | normalized | `stringified` | A label of the number's decimal text, read back as the string. |
+//! | `record/min_max` | lost | structural | A histogram's `min` and `max` have no Prometheus series, so they aren't written. |
+//! | `attributes/string_value` | normalized | `label_sanitized`; `logit.output.labels.normalized{reason=name_sanitized}` | A label; its name is forced into `[a-zA-Z_][a-zA-Z0-9_]*`, so a key holding `.` or another character reads back under the sanitized name, counted once per label it renames. |
+//! | `attributes/bool_value` | normalized | `stringified`; `logit.output.labels.normalized{reason=name_sanitized}` | A label of `true` or `false`, read back as the string. A name outside the label-name grammar is sanitized, counted once per label it renames. |
+//! | `attributes/number_value` | normalized | `stringified`; `logit.output.labels.normalized{reason=name_sanitized}` | A label of the number's decimal text, read back as the string. A name outside the label-name grammar is sanitized, counted once per label it renames. |
 //! | `attributes/array_value` | normalized | `multi_value`; `logit.output.labels.normalized{reason=multi_value}` | A label set is a map, so only the last representable element is written, counted. |
 //! | `attributes/map_value` | lost | `logit.output.labels.omitted{reason=unrepresentable}` | A map has no label form and is left off, counted. |
 //! | `attributes/bytes_value` | lost | `logit.output.labels.omitted{reason=unrepresentable}` | A bytes value has no label form and is left off, counted. |
 //! | `attributes/timestamp_value` | lost | `logit.output.labels.omitted{reason=unrepresentable}` | A timestamp value has no label form and is left off, counted. |
 //! | `attributes/private_carrier` | normalized | `dialect` | The family type and timestamp carriers are consumed into the wire form and a scrape stamps them back; OpenMetrics has no `untyped`, so that type reads back as `unknown`. Remote-write gives every sample a timestamp, so prometheus_in stamps no timestamp carrier; the sample's own timestamp reads back unchanged. |
 //! | `attributes/prometheus_target` | normalized | `retargeted` | The resource's `_logit.prometheus.target` isn't written. A scrape of prometheus_out stamps prometheus_out's own URL, and a remote-write receiver stamps none. Only the original target's host:port survives, as the `instance` label; its scheme and path are lost. |
-//! | `attributes/foreign_carrier` | lost | uncounted | Another protocol's `_logit.` carrier isn't a label and is left off, uncounted. |
-//! | `attributes/resource_attribute` | normalized | `resource_merged` | A label, the event's value winning on a shared key, read back as an event attribute. |
-//! | `attributes/scope` | lost | uncounted | Prometheus has no instrumentation scope; it isn't written or counted. |
-//! | `attributes/datadog_carrier_log` | lost | uncounted | Another protocol's `_logit.` carrier isn't a label and is left off, uncounted. |
+//! | `attributes/foreign_carrier` | lost | structural | Another protocol's `_logit.` carrier is private and isn't a label, so it's left off. |
+//! | `attributes/resource_attribute` | normalized | `resource_merged`; `logit.output.labels.normalized{reason=name_sanitized}` | A label, the event's value winning on a shared key, read back as an event attribute. A name outside the label-name grammar is sanitized, counted once per label it renames. |
+//! | `attributes/scope` | lost | structural | Prometheus has no instrumentation scope, so none is written. |
+//! | `attributes/datadog_carrier_log` | lost | structural | Another protocol's `_logit.` carrier is private and isn't a label, so it's left off. |
 //! | `attributes/no_host` | exact | -- | A record with no host leaves with none. |
 //! | `log/beside_metrics` | lost | uncounted | A log on an event that carries metrics is left off while the metrics are written, uncounted. |
 //! | `span/beside_metrics` | lost | uncounted | A span on an event that carries metrics is left off while the metrics are written, uncounted. |
@@ -182,15 +189,18 @@
 //! | Model | Wire |
 //! |---|---|
 //! | a `Sum` or `Gauge` value, or an exemplar's value, of `I64`/`U64`/`Bool` | the sample's double, on both wires: an integer's nearest `f64`, a `Bool` `1` or `0`, counted `logit.output.metrics.normalized{reason="bool_value"}` |
-//! | `Distribution(sketch)` | `summary` of [`DISTRIBUTION_QUANTILES`] + `_sum` + `_count`; `_sum` is [`DdSketch::sum`], exact unlike a quantile (approximate only when [`DdSketch::stats_exact`] is `false`, i.e. the sketch's stats were derived from its bins) -- `logit.output.metrics.degraded{metric_kind="distribution"}` |
+//! | `Distribution(sketch)` | `summary` of [`SUMMARY_QUANTILES`], `0` and `1` the sketch's minimum and maximum, + `_sum` + `_count`; `_sum` is [`DdSketch::sum`], exact unlike a quantile (approximate only when [`DdSketch::stats_exact`] is `false`, i.e. the sketch's stats were derived from its bins) -- `logit.output.metrics.degraded{metric_kind="distribution"}` |
 //! | a `Histogram` bound | sorted ascending, equal bounds merged into one `le`; a `NaN` bound has no `le` bucket, its count reaching only `+Inf` and `_count` -- `logit.output.metrics.degraded{reason="non_finite_component"}`, once per record. `-Inf` is an ordinary bound, `le="-Inf"` |
+//! | an event with no metric record (a log, a span, or neither) | nothing -- `logit.output.events.skipped{reason="no_metrics"}` |
+//! | a flagged delta monotonic `Sum` under [`PrometheusEncoder::with_stale_markers`]`(true)` | a stale marker on a `counter`, which reads back as a cumulative counter -- `logit.output.metrics.degraded{metric_kind="delta_sum"}`; a flagged non-monotonic one is a `gauge`'s marker, `{metric_kind="non_monotonic_sum"}` |
 //! | `Event::timestamp` | emitted only when `_logit.prometheus.timestamp: true` is present (consumed) -- or on every series, marker or not, under [`PrometheusEncoder::with_timestamps_always`]`(true)`, which is what a transport with no way to omit a timestamp needs |
 //! | labels | `Value::Str/I64/U64/F64/Bool` stringified; `Null/Bytes/Timestamp/Map` dropped -- `logit.output.labels.omitted{reason="unrepresentable"}`. An `Array` (a repeated DogStatsD tag key, `crate::statsd::decode::insert_tags`) renders its **last** representable element -- a Prometheus label set is a map, so there is no multi-value label -- counted `logit.output.labels.normalized{reason="multi_value"}`; an empty or entirely unrepresentable one stays on the `omitted{reason="unrepresentable"}` path |
-//! | names | sanitized ([`sanitize_metric_name`], [`sanitize_label_name`]); labels are ordered and collision-checked on their **rendered** names, and on a collision the one whose *original* attribute name sorts first wins -- `logit.output.labels.omitted{reason="collision"}`; a label sanitizing onto a generated one (`le` on a histogram, `quantile` on a summary) is omitted -- `logit.output.labels.omitted{reason="reserved"}`. An exemplar's attribute keys follow the same rule, and one sanitizing onto the `trace_id`/`span_id` its trace is written as is `reserved` |
-//! | two names sanitizing onto one wire name | the family whose *model* name sorts first is exposed, the rest are **dropped** -- `logit.output.metrics.dropped{reason="name_collision"}`. Both cannot be exposed: a second `# TYPE` line for one name makes Prometheus reject the whole scrape, so one clash would poison every other metric in the body. The tie-break is on model names, which means a name that needed no sanitizing can lose to one that did (`a.b` sorts before `a_b`) -- deterministic and counted, but worth knowing before reading it as a bug |
+//! | names | sanitized ([`sanitize_metric_name`], [`sanitize_label_name`]), each record written under a rewritten name counted `logit.output.metrics.normalized{reason="name_sanitized"}` and each label, a written exemplar's included, `logit.output.labels.normalized{reason="name_sanitized"}`; labels are ordered and collision-checked on their **rendered** names, and on a collision the one whose *original* attribute name sorts first wins -- `logit.output.labels.omitted{reason="collision"}`; a label sanitizing onto a generated one (`le` on a histogram, `quantile` on a summary) is omitted -- `logit.output.labels.omitted{reason="reserved"}`. An exemplar's attribute keys follow the same rule, and one sanitizing onto the `trace_id`/`span_id` its trace is written as is `reserved` |
+//! | two names sanitizing onto one wire name | within one batch, the family whose *model* name sorts first is exposed, the rest are **dropped** -- `logit.output.metrics.dropped{reason="name_collision"}`. Both cannot be exposed: a second `# TYPE` line for one name makes Prometheus reject the whole scrape, so one clash would poison every other metric in the body. The tie-break is on model names, which means a name that needed no sanitizing can lose to one that did (`a.b` sorts before `a_b`) -- deterministic and counted, but worth knowing before reading it as a bug. **Across batches nothing resolves it**: the registry keys a family by its wire name, and a receiver a series by its labels, so `a.b` in one batch and `a_b` in the next merge into one series, uncounted beyond the rewrite's `name_sanitized` (`docs/known-gaps/prometheus.md`) |
 //! | `unit` / `description` | `# UNIT` (OM only, and only when `_<unit>` suffixes the family name and the unit is `[a-zA-Z0-9_]+` -- the OpenMetrics spec requires it and Prometheus's parser fails the entire body otherwise; dropped counted `logit.output.metrics.degraded{reason="unit_not_suffix"}`) / `# HELP` |
 //! | two families whose `# TYPE` lines carry one name | one is written, the other's series **dropped**, `logit.output.metrics.dropped{reason="name_collision"}` -- see the normalization list below |
 //! | two records, one name, different family types | the first record's type wins, the rest are **dropped**, `logit.output.metrics.dropped{reason="type_conflict"}` -- one name cannot carry two `# TYPE` lines |
+//! | two records of one series at one `Event::timestamp`, in one [`events_to_families`] call | the later replaces the earlier, and what the earlier's conversion counted (a degrade, a normalization, an omitted label) is discarded with it. Under [`Destination::RemoteWrite`], where the sender calls this once per timestamp, the earlier is a lost reading, counted `logit.output.metrics.dropped{reason="duplicate_timestamp"}` with a throttled `duplicate_timestamp` diagnostic naming `dedup_timestamps` as the remedy, unless both are states and it's the same reading as the later one ([`same_reading`]), which counts `logit.output.metrics.normalized{reason="duplicate_timestamp"}`; [`remote_write`]'s drop table has the sub-millisecond case. Each collapse compares with its own survivor, so an earlier reading equal to a later one of its instant counts `normalized` even when the millisecond collapse then drops that later one, counted `dropped`: the value is counted lost once. Under exposition it's the registry's one value per series, uncounted |
 //! | `EventBatch::scope`, `Resource::schema_url`, `dropped_attributes_count` | dropped (known-gaps rows) |
 //!
 //! ## Well-known attributes (`_logit.prometheus.*`) and target identity
@@ -275,7 +285,7 @@ pub mod text;
 
 pub use text::Dialect;
 
-use crate::otlp::metrics::DISTRIBUTION_QUANTILES;
+use crate::otlp::metrics::SUMMARY_QUANTILES;
 use logit_core::attrs::is_private;
 use logit_core::interner::{intern, resolve};
 use logit_core::{
@@ -283,6 +293,7 @@ use logit_core::{
     MetricValue, Resource, Sum, Summary, Telemetry, Temporality, Value,
 };
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// The wire family type the model has no distinct kind for (`untyped`, `unknown`, `info`,
@@ -321,7 +332,7 @@ pub fn is_stale_nan(value: f64) -> bool {
 /// under two dialect spellings, kept apart so `prometheus_in -> prometheus_out` re-emits the
 /// spelling it received (`_logit.prometheus.type` carries it through the model). Each dialect
 /// writes the other's spelling as its own -- see [`text`]'s module doc.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FamilyType {
     Counter,
     Gauge,
@@ -448,13 +459,24 @@ pub struct Series {
     /// OpenMetrics exemplars, in bucket order for a histogram. The writer places each one on the
     /// bucket its own value falls in.
     pub exemplars: Vec<Exemplar>,
+    /// The reading is an increment or an observation set, such as a `Samples` record written as
+    /// a summary, so a later equal reading doesn't replace it: remote-write's collapse counts it
+    /// lost even when equal ([`same_reading`]). Never on the wire, and `false` from every decoder.
+    pub increment: bool,
 }
 
 impl Series {
     /// A series with no timestamp, no `_created`, and no exemplars -- what most producers and
     /// nearly every test want.
     pub fn new(labels: Vec<(String, String)>, point: Point) -> Self {
-        Series { labels, point, timestamp: None, created: None, exemplars: Vec::new() }
+        Series {
+            labels,
+            point,
+            timestamp: None,
+            created: None,
+            exemplars: Vec::new(),
+            increment: false,
+        }
     }
 }
 
@@ -624,11 +646,16 @@ pub(crate) enum NotEncoded {
     NameCollision,
     InvalidLabels,
     NoTimestamp,
+    /// A remote-write reading another reading of its series replaced at the same millisecond.
+    DuplicateTimestamp,
+    /// A remote-write state replaced at the same millisecond by a state equal to it
+    /// ([`same_reading`]): nothing is lost, since the receiver stores the same sample.
+    EqualDuplicateTimestamp,
 }
 
 impl NotEncoded {
     #[cfg(test)]
-    const ALL: [NotEncoded; 10] = [
+    const ALL: [NotEncoded; 12] = [
         NotEncoded::NoRecordedValue,
         NotEncoded::Stale,
         NotEncoded::ExponentialHistogram,
@@ -639,12 +666,15 @@ impl NotEncoded {
         NotEncoded::NameCollision,
         NotEncoded::InvalidLabels,
         NotEncoded::NoTimestamp,
+        NotEncoded::DuplicateTimestamp,
+        NotEncoded::EqualDuplicateTimestamp,
     ];
 
     /// The counter name and its one tag.
     fn counter(self) -> (&'static str, (&'static str, &'static str)) {
         const SKIPPED: &str = "logit.output.metrics.skipped";
         const DROPPED: &str = "logit.output.metrics.dropped";
+        const NORMALIZED: &str = "logit.output.metrics.normalized";
         match self {
             NotEncoded::NoRecordedValue => (SKIPPED, ("reason", "no_recorded_value")),
             NotEncoded::Stale => (SKIPPED, ("reason", "stale")),
@@ -656,6 +686,8 @@ impl NotEncoded {
             NotEncoded::NameCollision => (DROPPED, ("reason", "name_collision")),
             NotEncoded::InvalidLabels => (DROPPED, ("reason", "invalid_labels")),
             NotEncoded::NoTimestamp => (DROPPED, ("reason", "no_timestamp")),
+            NotEncoded::DuplicateTimestamp => (DROPPED, ("reason", "duplicate_timestamp")),
+            NotEncoded::EqualDuplicateTimestamp => (NORMALIZED, ("reason", "duplicate_timestamp")),
         }
     }
 }
@@ -678,6 +710,9 @@ pub struct PrometheusEncoder {
     timestamps_always: bool,
     stale_markers: bool,
     destination: Destination,
+    /// While set, counts go here instead of to `telemetry`: one series' conversion in
+    /// [`events_to_families_pending`].
+    pending: RefCell<Option<PendingCounts>>,
 }
 
 impl PrometheusEncoder {
@@ -729,22 +764,44 @@ impl PrometheusEncoder {
     /// [`NotEncoded::counter`] names.
     fn not_encoded(&self, outcome: NotEncoded) {
         let (metric, tag) = outcome.counter();
+        self.count(metric, tag);
+    }
+
+    /// One count, held back while a conversion is captured.
+    fn count(&self, metric: &'static str, tag: (&'static str, &'static str)) {
+        if let Some(pending) = self.pending.borrow_mut().as_mut() {
+            pending.0.push((metric, tag));
+            return;
+        }
         self.telemetry.count(metric, 1.0, &[tag]);
     }
 
+    /// Starts holding back counts.
+    fn capture(&self) {
+        *self.pending.borrow_mut() = Some(PendingCounts::default());
+    }
+
+    /// Stops holding back counts, returning them.
+    fn release(&self) -> PendingCounts {
+        self.pending.borrow_mut().take().unwrap_or_default()
+    }
+
+    /// Counts what a conversion held back.
+    fn flush(&self, counts: PendingCounts) {
+        for (metric, tag) in counts.0 {
+            self.telemetry.count(metric, 1.0, &[tag]);
+        }
+    }
+
     fn degraded(&self, metric_kind: &'static str) {
-        self.telemetry.count("logit.output.metrics.degraded", 1.0, &[("metric_kind", metric_kind)]);
+        self.count("logit.output.metrics.degraded", ("metric_kind", metric_kind));
     }
 
     /// A scalar's sample value. A sample is a double on both wires, so an integer leaves as its
     /// nearest `f64` and a `Bool` as `1` or `0`, counted.
     fn scalar(&self, value: MetricValue) -> f64 {
         if let MetricValue::Bool(_) = value {
-            self.telemetry.count(
-                "logit.output.metrics.normalized",
-                1.0,
-                &[("reason", "bool_value")],
-            );
+            self.count("logit.output.metrics.normalized", ("reason", "bool_value"));
         }
         value.as_f64()
     }
@@ -753,25 +810,38 @@ impl PrometheusEncoder {
     /// which model kind, for a degradation the wire format forces on a metric of any kind (a
     /// `# UNIT` the format won't accept, an exemplar with nowhere to sit).
     fn degraded_reason(&self, reason: &'static str) {
-        self.telemetry.count("logit.output.metrics.degraded", 1.0, &[("reason", reason)]);
+        self.count("logit.output.metrics.degraded", ("reason", reason));
+    }
+
+    /// `logit.output.events.skipped{reason}`: an event the encoder wrote nothing for, once per
+    /// event. The one reason is `no_metrics`: a log, a span, or neither, with no metric record.
+    fn event_skipped(&self, reason: &'static str) {
+        self.telemetry.count("logit.output.events.skipped", 1.0, &[("reason", reason)]);
+    }
+
+    /// `logit.output.metrics.normalized{reason="name_sanitized"}`: a record written under a name
+    /// [`sanitize_metric_name`] rewrote.
+    fn name_sanitized(&self) {
+        self.count("logit.output.metrics.normalized", ("reason", "name_sanitized"));
     }
 
     fn label_omitted(&self, reason: &'static str) {
-        self.telemetry.count("logit.output.labels.omitted", 1.0, &[("reason", reason)]);
+        self.count("logit.output.labels.omitted", ("reason", reason));
     }
 
     /// `logit.output.labels.normalized{reason}` -- a label that reached the wire, but not in the
-    /// form the model held it. The one reason is `multi_value`: a `Value::Array` attribute
-    /// collapsed to its last representable element by [`build_labels`], because a Prometheus label
-    /// set is a map and has no multi-value label at all.
+    /// form the model held it: `name_sanitized`, a series or exemplar label whose name
+    /// [`sanitize_label_name`] rewrote, or `multi_value`, a `Value::Array` attribute collapsed to
+    /// its last representable element by [`build_labels`], because a Prometheus label set is a map
+    /// and has no multi-value label at all.
     ///
-    /// **This reason is lossy**, unlike every other `*.normalized` reason in
+    /// **`multi_value` is lossy**, unlike every other `*.normalized` reason in
     /// `docs/design/internal-telemetry.md`: those are a lossless-but-different rendering of the
     /// same information, whereas this discards the non-last elements outright. It is `normalized`
     /// rather than `dropped` because the label itself survives and the series still exposes -- but
     /// an operator reading this counter should read it as data loss.
     fn label_normalized(&self, reason: &'static str) {
-        self.telemetry.count("logit.output.labels.normalized", 1.0, &[("reason", reason)]);
+        self.count("logit.output.labels.normalized", ("reason", reason));
     }
 }
 
@@ -990,28 +1060,60 @@ pub fn events_to_families<'a>(
     events: impl Iterator<Item = (&'a Resource, &'a Event)>,
     encoder: &mut PrometheusEncoder,
 ) -> Vec<MetricFamily> {
+    events_to_families_pending(events, encoder)
+        .into_iter()
+        .map(|pending| {
+            for counts in pending.pending {
+                encoder.flush(counts);
+            }
+            pending.family
+        })
+        .collect()
+}
+
+/// [`events_to_families`], holding back what each surviving [`Series`]' conversion counted (a
+/// degrade, a normalization, an omitted label) on [`PendingFamily`], for a caller that may still
+/// drop the series: [`remote_write::encode_pending`] collapses readings of one series at one
+/// millisecond, and a reading it drops counts only its `duplicate_timestamp`. What a record
+/// that leaves no series counts, and a series this call replaces, is settled here.
+pub fn events_to_families_pending<'a>(
+    events: impl Iterator<Item = (&'a Resource, &'a Event)>,
+    encoder: &mut PrometheusEncoder,
+) -> Vec<PendingFamily> {
     // Keyed by the *emitted* (sanitized) name, not the model name: two model names that sanitize
     // onto one cannot both be exposed -- a second `# TYPE` line for one name makes Prometheus reject
     // the whole scrape, so one naming clash would poison every other metric in the body.
     let mut families: BTreeMap<String, FamilyEntry> = BTreeMap::new();
     for (resource, event) in events {
+        if event.metrics.is_empty() {
+            encoder.event_skipped("no_metrics");
+        }
         for record in &event.metrics {
             let stale = record.is_no_recorded_value();
             if stale && !encoder.stale_markers {
                 encoder.not_encoded(NotEncoded::NoRecordedValue);
                 continue;
             }
+            encoder.capture();
             let converted = if stale {
                 stale_point(record, event, encoder)
             } else {
                 record_to_point(record, event, encoder)
             };
-            let Some((kind, point)) = converted else { continue };
+            let Some((kind, point)) = converted else {
+                let counts = encoder.release();
+                encoder.flush(counts);
+                continue;
+            };
             let name = resolve(record.name);
             // Borrows `name` whenever it already conforms, which is nearly always -- one allocation
             // per *family*, not per point, and only for a name that has to change.
             let key = sanitize_metric_name(name);
             let labels = build_labels(resource, event, kind, encoder);
+            if matches!(key, Cow::Owned(_)) {
+                encoder.name_sanitized();
+            }
+            let counts = encoder.release();
             let timestamp = if encoder.timestamps_always {
                 Some(event.timestamp)
             } else {
@@ -1031,6 +1133,8 @@ pub fn events_to_families<'a>(
                 timestamp,
                 created,
                 exemplars: record.exemplars.clone(),
+                increment: !crate::replaced_by_a_later_reading(&record.kind)
+                    || crate::datadog::is_rate(resource, event, &record.kind),
             });
 
             // One map probe on the steady-state path (a family this record already belongs to); the
@@ -1041,16 +1145,24 @@ pub fn events_to_families<'a>(
                 Some(existing) if existing.origin == name => {
                     if existing.family.kind != kind {
                         // Two records sharing one name but disagreeing on type: the wire has exactly
-                        // one `# TYPE` line per name, so the second one has nowhere to go.
+                        // one `# TYPE` line per name, so the second one has nowhere to go. Its drop
+                        // is its whole fate, so its held-back counts go with it.
+                        drop(counts);
                         encoder.not_encoded(NotEncoded::TypeConflict);
                     } else {
+                        if !counts.0.is_empty() {
+                            existing.pending.push((existing.family.series.len(), counts));
+                        }
                         existing.family.series.push(series.take().expect("built above"));
                     }
+                    continue;
                 }
                 // A different model name sanitizing onto the same wire name: the one whose model
                 // name sorts first wins, so the outcome is the data's, not the arrival order's.
                 Some(existing) if name < existing.origin => {
+                    // The displaced family's series are dropped whole, held-back counts too.
                     displaced = existing.family.series.len().max(1);
+                    existing.pending.clear();
                     start_family = true;
                 }
                 Some(_) => encoder.not_encoded(NotEncoded::NameCollision),
@@ -1075,6 +1187,7 @@ pub fn events_to_families<'a>(
                         unit: record.unit.map(|s| resolve(s).to_string()),
                         series: vec![series],
                     },
+                    pending: if counts.0.is_empty() { Vec::new() } else { vec![(0, counts)] },
                 },
             );
         }
@@ -1082,21 +1195,166 @@ pub fn events_to_families<'a>(
 
     // The map is keyed by the emitted name, so draining it in key order is already the canonical
     // family ordering -- no re-sort needed.
-    let mut out: Vec<MetricFamily> = families.into_values().map(|entry| entry.family).collect();
-    for family in &mut out {
-        // Stable, so the last of a run of equal label sets is the last one pushed -- latest wins,
-        // the cumulative-series semantics `prometheus_out`'s registry upsert also uses.
-        family.series.sort_by(|a, b| a.labels.cmp(&b.labels));
-        let mut deduped: Vec<Series> = Vec::with_capacity(family.series.len());
-        for series in family.series.drain(..) {
-            match deduped.last_mut() {
-                Some(last) if last.labels == series.labels => *last = series,
-                _ => deduped.push(series),
+    let mut replaced = Replaced::default();
+    let mut out: Vec<PendingFamily> = Vec::with_capacity(families.len());
+    for entry in families.into_values() {
+        if entry.pending.is_empty() {
+            // Nothing held back: the latest-wins pass alone, with no counts to carry.
+            let mut family = entry.family;
+            family.series.sort_by(|a, b| a.labels.cmp(&b.labels));
+            // Walked from the end, so the first of a run of equal label sets met is the latest,
+            // the one kept, and each earlier one is compared with it.
+            let mut deduped: Vec<Series> = Vec::with_capacity(family.series.len());
+            for series in family.series.drain(..).rev() {
+                match deduped.last() {
+                    Some(kept) if kept.labels == series.labels => replaced.add(&series, kept),
+                    _ => deduped.push(series),
+                }
+            }
+            deduped.reverse();
+            family.series = deduped;
+            out.push(PendingFamily { family, pending: Vec::new() });
+            continue;
+        }
+        let MetricFamily { name, kind, help, unit, series } = entry.family;
+        let mut dense: Vec<PendingCounts> = vec![PendingCounts::default(); series.len()];
+        for (index, counts) in entry.pending {
+            dense[index] = counts;
+        }
+        let mut paired: Vec<(Series, PendingCounts)> = series.into_iter().zip(dense).collect();
+        // Stable, so the last of a run of equal label sets is the latest, and walked from the end,
+        // so it's the one kept -- latest wins, the cumulative-series semantics `prometheus_out`'s
+        // registry upsert also uses. A replaced series' own counts go with it.
+        paired.sort_by(|a, b| a.0.labels.cmp(&b.0.labels));
+        let mut deduped: Vec<(Series, PendingCounts)> = Vec::with_capacity(paired.len());
+        for item in paired.into_iter().rev() {
+            match deduped.last() {
+                Some(kept) if kept.0.labels == item.0.labels => replaced.add(&item.0, &kept.0),
+                _ => deduped.push(item),
             }
         }
-        family.series = deduped;
+        deduped.reverse();
+        let (series, pending) = deduped.into_iter().unzip();
+        out.push(PendingFamily {
+            family: MetricFamily { name, kind, help, unit, series },
+            pending,
+        });
+    }
+    // A remote-write sender calls this once per timestamp, so a replaced series is a reading lost
+    // at its instant, unless it's a state equal to the one kept. The exposition registry keeps one value per
+    // series between scrapes by design, so there it's the pull model's overwrite, uncounted.
+    if encoder.destination == Destination::RemoteWrite {
+        count_duplicates(encoder, replaced.differing, replaced.equal);
     }
     out
+}
+
+/// One [`MetricFamily`] from [`events_to_families_pending`], with the counts each of its series'
+/// conversion is holding back, in series order, or none at all when no series holds any.
+#[derive(Debug, Clone)]
+pub struct PendingFamily {
+    pub family: MetricFamily,
+    pending: Vec<PendingCounts>,
+}
+
+/// The counts one series' conversion holds back until the series is known to survive.
+#[derive(Debug, Clone, Default)]
+pub struct PendingCounts(Vec<(&'static str, (&'static str, &'static str))>);
+
+/// How many readings a remote-write collapse removed, by whether each equals the reading kept for
+/// its series and millisecond ([`same_reading`]).
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Replaced {
+    pub(crate) differing: usize,
+    pub(crate) equal: usize,
+}
+
+impl Replaced {
+    /// Counts `removed`, which `kept` replaces.
+    pub(crate) fn add(&mut self, removed: &Series, kept: &Series) {
+        if same_reading(removed, kept) {
+            self.equal += 1;
+        } else {
+            self.differing += 1;
+        }
+    }
+}
+
+/// Whether two readings of one family and label set are one state on the remote-write wire:
+/// neither an increment ([`Series::increment`]), the same point, each `f64` by its bits (as
+/// Prometheus's own duplicate check compares them), the same created timestamp at the wire's
+/// millisecond, and the same exemplars, which go with a removed reading. A value's model type
+/// isn't compared: every sample is a double.
+pub(crate) fn same_reading(a: &Series, b: &Series) -> bool {
+    let millis = |created: Option<i64>| created.map(|c| c / 1_000_000);
+    !a.increment
+        && !b.increment
+        && same_point(&a.point, &b.point)
+        && millis(a.created) == millis(b.created)
+        && a.exemplars == b.exemplars
+}
+
+fn same_point(a: &Point, b: &Point) -> bool {
+    let f = |x: f64, y: f64| x.to_bits() == y.to_bits();
+    let sum = |x: Option<f64>, y: Option<f64>| match (x, y) {
+        (Some(x), Some(y)) => f(x, y),
+        (x, y) => x.is_none() && y.is_none(),
+    };
+    match (a, b) {
+        (Point::Counter(x), Point::Counter(y))
+        | (Point::Gauge(x), Point::Gauge(y))
+        | (Point::Unknown(x), Point::Unknown(y)) => f(*x, *y),
+        (
+            Point::Histogram { buckets: ab, sum: asum, count: ac },
+            Point::Histogram { buckets: bb, sum: bsum, count: bc },
+        ) => {
+            ac == bc
+                && sum(*asum, *bsum)
+                && ab.len() == bb.len()
+                && ab.iter().zip(bb).all(|(x, y)| f(x.0, y.0) && x.1 == y.1)
+        }
+        (
+            Point::Summary { quantiles: aq, sum: asum, count: ac },
+            Point::Summary { quantiles: bq, sum: bsum, count: bc },
+        ) => {
+            ac == bc
+                && sum(*asum, *bsum)
+                && aq.len() == bq.len()
+                && aq.iter().zip(bq).all(|(x, y)| f(x.0, y.0) && f(x.1, y.1))
+        }
+        (Point::StateSet(x), Point::StateSet(y)) => x == y,
+        (Point::Info, Point::Info) | (Point::Stale, Point::Stale) => true,
+        _ => false,
+    }
+}
+
+/// Counts the readings a remote-write collapse removed: `differing` ones as lost, with the
+/// diagnostic, and `equal` ones as normalized, since the receiver stores the same sample.
+fn count_duplicates(encoder: &mut PrometheusEncoder, differing: usize, equal: usize) {
+    for _ in 0..equal {
+        encoder.not_encoded(NotEncoded::EqualDuplicateTimestamp);
+    }
+    if differing == 0 {
+        return;
+    }
+    for _ in 0..differing {
+        encoder.not_encoded(NotEncoded::DuplicateTimestamp);
+    }
+    warn_duplicate_timestamp(encoder, differing);
+}
+
+/// The diagnostic both remote-write collapses report under: `n` readings of a series dropped
+/// because a later, different one shared its millisecond.
+fn warn_duplicate_timestamp(encoder: &mut PrometheusEncoder, n: usize) {
+    encoder.diagnostics.warn_throttled(
+        "duplicate_timestamp",
+        format_args!(
+            "dropped {n} reading(s) that shared a series and a millisecond with a later, \
+             different one, which remote-write can't carry -- add a `dedup_timestamps` \
+             component with `precision: 1ms` before this output, or an `aggregate` for a live \
+             delta flow"
+        ),
+    );
 }
 
 /// A family under construction plus the model name that claimed it -- the two together are what
@@ -1104,6 +1362,8 @@ pub fn events_to_families<'a>(
 struct FamilyEntry {
     origin: &'static str,
     family: MetricFamily,
+    /// The held-back counts of each series that has any, by its index in `family.series`.
+    pending: Vec<(usize, PendingCounts)>,
 }
 
 /// One [`MetricRecord`] → its family type and wire point, or `None` for a kind Prometheus can't
@@ -1250,6 +1510,11 @@ fn stale_point(
     let kind = match &record.kind {
         MetricKind::Sum(s) => {
             if s.monotonic {
+                // A marker has no reading to be delta about, so a delta one reads back as a
+                // cumulative counter: a record of another kind.
+                if s.temporality == Temporality::Delta {
+                    encoder.degraded("delta_sum");
+                }
                 FamilyType::Counter
             } else {
                 encoder.degraded("non_monotonic_sum");
@@ -1296,13 +1561,12 @@ fn warn_delta_summary(encoder: &mut PrometheusEncoder, name: &str) {
     );
 }
 
-/// A sketch → the summary point the module doc's `Distribution`/`Samples` rows describe: the five
-/// shared [`DISTRIBUTION_QUANTILES`], the sketch's sum, and its count.
+/// A sketch → the summary point the module doc's `Distribution`/`Samples` rows describe: the
+/// shared [`SUMMARY_QUANTILES`], `0` and `1` being the sketch's minimum and maximum, the sketch's
+/// sum, and its count.
 fn sketch_summary(sketch: &DdSketch) -> Point {
-    let quantiles = DISTRIBUTION_QUANTILES
-        .iter()
-        .filter_map(|q| sketch.quantile(*q).map(|v| (*q, v)))
-        .collect();
+    let quantiles =
+        SUMMARY_QUANTILES.iter().filter_map(|q| sketch.quantile(*q).map(|v| (*q, v))).collect();
     Point::Summary { quantiles, sum: Some(sketch.sum()), count: Some(sketch.count() as u64) }
 }
 
@@ -1399,6 +1663,9 @@ fn build_labels(
         if labels.iter().any(|(existing, _)| existing.as_str() == name.as_ref()) {
             encoder.label_omitted("collision");
             continue;
+        }
+        if matches!(name, Cow::Owned(_)) {
+            encoder.label_normalized("name_sanitized");
         }
         labels.push((name.into_owned(), value));
     }
@@ -2098,7 +2365,7 @@ mod tests {
     }
 
     #[test]
-    fn a_distribution_encodes_as_a_five_quantile_summary_and_is_counted_degraded() {
+    fn a_distribution_encodes_as_a_summary_with_its_extremes_and_is_counted_degraded() {
         let mut sketch = DdSketch::new();
         for v in [1.0, 2.0, 3.0, 4.0, 5.0] {
             sketch.add(v);
@@ -2110,7 +2377,9 @@ mod tests {
         assert_eq!(families[0].kind, FamilyType::Summary);
         match &families[0].series[0].point {
             Point::Summary { quantiles, sum, count } => {
-                assert_eq!(quantiles.len(), DISTRIBUTION_QUANTILES.len());
+                assert_eq!(quantiles.len(), SUMMARY_QUANTILES.len());
+                assert_eq!(quantiles.first(), Some(&(0.0, 1.0)), "quantile 0 is the minimum");
+                assert_eq!(quantiles.last(), Some(&(1.0, 5.0)), "quantile 1 is the maximum");
                 assert_eq!(*sum, Some(15.0), "a sketch's sum is exact");
                 assert_eq!(*count, Some(5));
             }
@@ -2280,9 +2549,12 @@ mod tests {
                     | NotEncoded::NameCollision
                     | NotEncoded::InvalidLabels
                     | NotEncoded::NoTimestamp
+                    | NotEncoded::DuplicateTimestamp
             );
             let expected = if dropped {
                 "logit.output.metrics.dropped"
+            } else if outcome == NotEncoded::EqualDuplicateTimestamp {
+                "logit.output.metrics.normalized"
             } else {
                 "logit.output.metrics.skipped"
             };
@@ -2697,6 +2969,49 @@ mod tests {
         assert_eq!(families.len(), 1);
         assert_eq!(families[0].series[0].point, Point::Gauge(2.0));
         assert!(counted(&registry, "logit.output.metrics.dropped", ("reason", "name_collision")));
+    }
+
+    /// A series dropped as a type-conflict or name-collision loser counts only that drop: the
+    /// `bool_value` normalization its conversion held back describes a series that isn't written.
+    /// That covers the arriving loser of either kind and a displaced family.
+    #[test]
+    fn a_conflict_or_collision_loser_counts_none_of_its_held_back_counts() {
+        let bool_gauge =
+            |name: &str| event_with(&[], record(name, MetricKind::Gauge(MetricValue::Bool(true))));
+        let counter = event_with(
+            &[],
+            record(
+                "m",
+                MetricKind::Sum(Sum {
+                    value: MetricValue::Bool(true),
+                    temporality: Temporality::Cumulative,
+                    monotonic: true,
+                }),
+            ),
+        );
+        let float = |name: &str| event_with(&[], record(name, MetricKind::gauge(1.0)));
+        let (m, winner, dashed) = (float("m"), float("a-b"), float("a-b"));
+        let (loser, displaced) = (bool_gauge("a.b"), bool_gauge("a.b"));
+        let cases: [(&str, [&Event; 2], &str); 3] = [
+            ("type conflict", [&m, &counter], "type_conflict"),
+            ("arriving name collision", [&winner, &loser], "name_collision"),
+            ("displaced family", [&displaced, &dashed], "name_collision"),
+        ];
+        for (case, events, reason) in cases {
+            let (registry, telemetry) = telemetry();
+            let mut encoder = PrometheusEncoder::new().with_telemetry(telemetry);
+            let resource = Resource::default();
+            events_to_families(events.into_iter().map(|e| (&resource, e)), &mut encoder);
+            let points = registry.drain(0);
+            let has = |metric: &str, value: &str| {
+                points.iter().any(|event| {
+                    event.metrics.iter().any(|m| resolve(m.name) == metric)
+                        && event.attributes.get("reason").and_then(|v| v.as_str()) == Some(value)
+                })
+            };
+            assert!(has("logit.output.metrics.dropped", reason), "{case}");
+            assert!(!has("logit.output.metrics.normalized", "bool_value"), "{case}");
+        }
     }
 
     /// A name that needs sanitizing but collides with nothing is renamed, not counted.

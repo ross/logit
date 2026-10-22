@@ -25,14 +25,15 @@
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"escaped","kind":"gauge","value":1.0}],"attributes":{"nl":"a\nb","path":"C:\\dir","quote":"say \"hi\""},"resource":{"attributes":{"instance":"transit:9100"}}}
   ], "counters": {}},
   "mixed": {"events": [
-    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"build","kind":"gauge","value":1.0}],"attributes":{"version":"1.2.3"},"resource":{"attributes":{"instance":"transit:9100"}}},
-    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"feature","kind":"gauge","value":0.0}],"attributes":{"feature":"b"},"resource":{"attributes":{"instance":"transit:9100"}}},
-    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"feature","kind":"gauge","value":1.0}],"attributes":{"feature":"a"},"resource":{"attributes":{"instance":"transit:9100"}}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"build_info","kind":"sum","value":1.0,"temporality":"cumulative","monotonic":false}],"attributes":{"version":"1.2.3"},"resource":{"attributes":{"instance":"transit:9100"}}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"feature","kind":"sum","value":0.0,"temporality":"cumulative","monotonic":false}],"attributes":{"feature":"b"},"resource":{"attributes":{"instance":"transit:9100"}}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"feature","kind":"sum","value":1.0,"temporality":"cumulative","monotonic":false}],"attributes":{"feature":"a"},"resource":{"attributes":{"instance":"transit:9100"}}},
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"mystery","kind":"gauge","value":3.0}],"resource":{"attributes":{"instance":"transit:9100"}}},
-    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"queue","kind":"histogram","temporality":"cumulative","buckets":[{"bound":1.0,"count":2},{"bound":"inf","count":3}],"sum":7.5}],"resource":{"attributes":{"instance":"transit:9100"}}},
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"reqs_total","kind":"sum","value":5.0,"temporality":"cumulative","monotonic":true}],"resource":{"attributes":{"instance":"transit:9100"}}},
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"up","kind":"gauge","value":1.0}],"resource":{"attributes":{"instance":"transit:9100"}}}
-  ], "counters": {}},
+  ], "counters": {
+    "logit.output.metrics.skipped{component=out,kind=otlp_out,metric_kind=gauge_histogram,role=sink}": 1
+  }},
   "nan-inf": {"events": [
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"reading","kind":"gauge","value":"-inf"}],"attributes":{"k":"ninf"},"resource":{"attributes":{"instance":"transit:9100"}}},
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"reading","kind":"gauge","value":"NaN"}],"attributes":{"k":"nan"},"resource":{"attributes":{"instance":"transit:9100"}}},

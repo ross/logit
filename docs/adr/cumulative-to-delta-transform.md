@@ -170,13 +170,14 @@ is judged alone.
 - **`max_staleness`** (default `1h`, the default of both precedents) evicts a series not updated
   for that long, by the wall clock. The Collector processor judges staleness by the point's own
   timestamp, which evicts a replayed backlog's series as fast as it arrives. `0s` is rejected:
-  every series stays until the bound below evicts it, so set `max_staleness` above the longest
-  gap between a producer's reports.
+  any time passing makes a series idle, so every series is evicted at the next batch and no point
+  is ever differenced. Set `max_staleness` above the longest gap between a producer's reports.
 - **`max_series`** (default `10000`, `aggregate`'s `max_retained_series` default) caps the table;
   a new series past it evicts the least recently updated one. Neither precedent has a bound, but a
   misconfigured producer that puts a request id in an attribute would otherwise grow the table
   without limit
-  ([ADR `deployment-threat-model`](deployment-threat-model.md)).
+  ([ADR `deployment-threat-model`](deployment-threat-model.md)). `0` is rejected as an
+  impossible bound: the transform would clamp it to `1`, which `0` doesn't say.
 
 An evicted series' next point is a first point. Unless it restarted after its last point, under
 `auto` it records a baseline and emits nothing: the counts since its last point are lost. A

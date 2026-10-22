@@ -1,6 +1,6 @@
 ---
 created: 2026-09-03
-updated: 2026-09-22
+updated: 2026-10-21
 ---
 
 # `scale`: unit conversion by constant factor, and why it stays out of `kv_metrics`
@@ -47,12 +47,12 @@ identical to `kv_metrics`'s own rule — `I64`/`U64`/`F64` directly, a `Str` tha
 finite `f64`, everything else rejected — lifted into a shared `pub(crate) fn numeric` in
 `crates/logit-transforms/src/lib.rs` rather than duplicated, since both transforms now need it.
 
-**Graph validation rejects an empty `fields` map (a certain no-op, the same rule `kv_metrics` and
-`set` already have), an empty field name (could never match a real attribute, the same rule
-`trace_context` already has for `trace_id`), and a non-finite factor** (`NaN`/`inf` in config is
-almost certainly a typo, and would only ever produce values `numeric` then silently rejects
-downstream — catching it at `logit validate` time is strictly better than a config error nobody
-notices).
+**Graph validation (rule 20) rejects an empty field name (could never match a real attribute, the
+same rule `trace_context` already has for `trace_id`) and a non-finite factor** (`NaN`/`inf` in
+config is almost certainly a typo, and would only ever produce values `numeric` then silently
+rejects downstream — catching it at `logit validate` time is strictly better than a config error
+nobody notices). An empty `fields` map is legal: the component forwards every event unchanged, as
+an empty `kv_metrics` or `set` does.
 
 **Stateless**, like `json`/`kv_metrics`: only `process` is overridden, `flush_interval`/`flush`
 keep the `Transform` trait's defaults. No `Diagnostics` builder, matching `Keep`/`Remove`/`Set`: a

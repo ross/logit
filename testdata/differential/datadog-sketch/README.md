@@ -54,7 +54,9 @@ error `MapMetrics` returns that it can't classify, and when the build info lacks
   with `sketch` holding the translator's `Cols()` (`k` and `n`, a key repeated where a count passes
   65535) and its summary, or the reason there's none: `empty`, `too_many_observations`,
   `non_monotonic_bounds`, or `unconvertible`, with the error or log line in `detail`. An explicit
-  point's `count` is the sum of its `counts`, since `logit`'s `Histogram` carries no count. A
+  point's `count` is the sum of its `counts`, since `logit`'s `Histogram` carries no count, except
+  in a `no-buckets-count*` case: a point with no buckets and only a `count`, which `metrics.proto`
+  allows and the readers decode as `otlp_in` does, as one `+Inf` bucket holding it. A
   `null` sum is given to the translator as `NaN`: `logit` reads an absent sum as the translator
   reads a non-finite one, where the translator itself would read protobuf's default `0`
   ([ADR `datadog-otlp-metric-mapping`](../../../docs/adr/datadog-otlp-metric-mapping.md)'s
@@ -81,5 +83,12 @@ values past the Agent's highest key.
 - A point with one bucket and no bounds, `(-Inf, +Inf]`, keys every observation at `-1`, and its
   `min` and `max` are about `-1e-9`. Both bounds become `-Inf`, and Go's `int(+Inf)` is
   `math.MinInt64` on amd64, which keys clamp to 1.
+- A point with no buckets and a nonzero `count` is sketched as one `(-Inf, +Inf]` bucket of that
+  count, so with no `min` or `max` it keys every observation at `-1`, as above. A delta point with
+  a `min` and a `max` gains a bound at each, so the count spreads between them. Under
+  `histograms.mode: counters` it writes no `.bucket` series. `otlp_in` reads both shapes as one
+  `+Inf` bucket, so `no-buckets-count` matches the sketch but not the series, and
+  `no-buckets-count-min-max` matches neither; each reader lists them in its `COLLAPSED`
+  (`docs/known-gaps/datadog.md`).
 - At scales -10 to -8, every case is `unconvertible`, because the base or a bucket boundary
   overflows a float64. At scale -7, a case is `unconvertible` once its buckets reach 2^1024.

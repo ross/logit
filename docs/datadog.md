@@ -253,6 +253,25 @@ one more, its quantile, so on a metric with 100 tags it's dropped. Each counts o
 metric's other series go out. To keep a metric, cut
 its tags upstream with `keep` or `remove`.
 
+### Two points of one series in one second leave as one
+
+Datadog keeps one point per series per second: the higher of two in one request, the later
+across requests, and a `count` isn't summed. So of each batch's series points, `datadog_out`
+sends the latest point of a series in one second and leaves the others off, counted
+`logit.output.metrics.dropped{reason="duplicate_timestamp"}` with a throttled
+`duplicate_timestamp` diagnostic. A gauge (not a `rate`) or a cumulative kind equal to the point
+sent (the same value, type, unit, interval, source type, and origin) is counted
+`logit.output.metrics.normalized{reason="duplicate_timestamp"}` instead, since Datadog stores the
+same point either way: an Agent relay or a retry resending identical gauges raises no loss alarm.
+Two equal delta counts or `rate`s are two increments, and only one is sent, so they count
+`dropped`. A series is the metric name, the tag set, and the host, device, and resources.
+Distribution points aren't collapsed, because Datadog keeps both. A relay that
+keeps source timestamps from a source stamping several readings of one series in a second (an
+Agent's unaggregated `|T` gauges, `statsd_in` gauges, `internal`) shows a nonzero dropped count.
+Put a `dedup_timestamps` with `precision: 1s` last before the sink: it keeps the latest gauge and
+sums deltas and `rate`s of one interval. Two points of one series in one second that arrive in two batches are both sent, and
+Datadog keeps the later, uncounted (`docs/known-gaps/datadog.md`).
+
 The series route also names what it dropped from an accepted request in its `202` body, such as
 a point more than 10 minutes in the future when the sender's clock runs ahead. `datadog_out`
 counts each named series `logit.output.records.dropped{route="series", reason="rejected"}`, leaves it out of

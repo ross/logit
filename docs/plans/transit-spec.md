@@ -429,12 +429,17 @@ Recorded per workstream as each lands.
     InfluxDB's table writes it with no counter.
   - `prometheus_out`'s exposition registry holds one sample per series, so an earlier point of a
     series in the same run is replaced, uncounted (`record/superseded`: `skipped`, `uncounted`).
-    Neither the codec's normalization list nor `mappings.md` names it.
+    Neither the codec's normalization list nor `mappings.md` names it. Since `tfix/w3` the cell is
+    `normalized`, reason `superseded`: the pull model's overwrite.
   - Remote-write sends each point of a series, but two at one instant reach `events_to_families`
     in one group, which keeps the later and drops the earlier, uncounted (`record/same_instant`:
     `dropped`, `uncounted`). Two at different nanoseconds of one millisecond are collapsed the
     same way and counted, under `metrics.degraded{reason="sub_ms_collapsed"}`, a `degraded`
-    series for a reading that's gone (`record/same_millisecond`: `dropped`).
+    series for a reading that's gone (`record/same_millisecond`: `dropped`). Since `tfix/w3`
+    both count `metrics.dropped{reason="duplicate_timestamp"}`, or
+    `metrics.normalized{reason="duplicate_timestamp"}` for a state equal to the one sent
+    (`record/same_instant_equal`, `record/same_millisecond_equal`)
+    ([ADR `dedup-timestamps-transform`](../adr/dedup-timestamps-transform.md)).
   - `prometheus_out` writes no start time for a gauge: `_created` is a counter's, histogram's,
     or summary's, so a gauge's `start_timestamp` is lost uncounted. The encode table doesn't say.
   - Under OpenMetrics, `prometheus_out` writes a gauge whose `_logit.prometheus.type` is
@@ -705,7 +710,9 @@ Recorded per workstream as each lands.
   The like pair reads `exact` everywhere under all three flows, `attributes/string_value`'s
   `tags: drop` cell aside, which reads `lost` as configured. No case holds a path or tag that
   `graphite_out` sanitizes (a `/`, a `\`, a tag name's `!` or `^`, a value's leading `~`), so
-  normalization 10 isn't exercised by the pair.
+  normalization 10 isn't exercised by the pair. Settled in `tgraph/known-gaps`: a `tagged` line
+  holds each of them, and its path reads back `normalized` under all three flows and its tags
+  under the two that write tags, and a `pickle-p0` case reads the CPython protocol-0 capture.
 
   Each recorded as the code behaves, none fixed here:
   - Every `Sum` read `degraded` with no counter: the bare value reads back as a gauge, which the
@@ -733,7 +740,8 @@ Recorded per workstream as each lands.
   - Under `tags: drop`, series that differ only in their tags write one path, which the
     `string_value` cell says. No other source's flow runs `tags: drop`: pass 3 pairs a sum by
     name, and under drop two sums of one name and different tags score the same, so the first
-    claims both read-back gauges.
+    claims both read-back gauges. `docs/known-gaps/mappings.md` records it, with two other
+    places the check misreads `graphite_out`.
   - `record/superseded`, `same_instant`, and `same_millisecond` read `exact`, since the codec
     writes every point. A whisper store keeps one point per path and second, so two points of a
     series in one second keep only the later there; the cells say so, and no row counts it.

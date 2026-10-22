@@ -178,6 +178,7 @@ fn a_hand_built_family_list_is_a_model_fixed_point() {
     counter.unit = Some("requests".to_string());
     counter.series = vec![
         Series {
+            increment: false,
             labels: vec![("code".to_string(), "200".to_string())],
             point: Point::Counter(1027.0),
             timestamp: Some(1_395_066_363_500_000_000),
@@ -417,6 +418,7 @@ fn series(dialect: Dialect, kind: FamilyType) -> BoxedStrategy<Series> {
         exemplars(dialect, kind),
     )
         .prop_map(|(labels, point, timestamp, created, exemplars)| Series {
+            increment: false,
             labels,
             point,
             timestamp,

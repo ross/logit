@@ -142,7 +142,7 @@
 //! | an exemplar whose labels are over OpenMetrics' 128-code-point budget, names (as sanitized) and values together | dropped, `logit.output.metrics.degraded{reason="exemplar_omitted"}`, the OpenMetrics writer's rule through [`text::exemplar_fits`]. Prometheus's receiver drops one over that budget without failing the request (`tsdb/exemplar.go`'s `validateExemplar`), so sending it would lose it uncounted |
 //! | two exemplar attribute keys sanitizing onto one label name, or one onto `trace_id`/`span_id` beside the exemplar's trace | the one whose original key sorts first is written, the rest omitted, `logit.output.labels.omitted{reason="collision"\|"reserved"}` -- the OpenMetrics writer's rule, since both build the pairs in [`text::exemplar_labels`]. Counted only for an exemplar that is written |
 //! | a family with an empty name | **dropped**, `logit.output.metrics.dropped{reason="invalid_labels"}`; `__name__` may not be empty |
-//! | two readings of one series whose nanosecond timestamps truncate to the same millisecond | the **later** reading wins and the earlier is dropped, `logit.output.metrics.degraded{reason="sub_ms_collapsed"}` per dropped reading. One label set may not carry two samples at one timestamp -- Prometheus and Mimir answer `400 duplicate sample for timestamp` and the sender treats that as permanent, so emitting both would cost the whole request rather than the one reading |
+//! | two readings of one series whose nanosecond timestamps truncate to the same millisecond | the **later** reading wins whole and the earlier is **dropped** before either is flattened into samples (keyed by family name, type, label set, and millisecond), `logit.output.metrics.dropped{reason="duplicate_timestamp"}` once per dropped reading (not per wire sample: a histogram reading is one), with a throttled `duplicate_timestamp` diagnostic naming the remedy, a `dedup_timestamps` upstream. A dropped reading that's a state equal to the one sent ([`super::same_reading`]: neither marked [`Series::increment`], and the same point, each `f64` by its bits, the created timestamp, and the exemplars) loses nothing and counts `logit.output.metrics.normalized{reason="duplicate_timestamp"}` instead; each is compared with the reading sent, not the one that displaced it. Under [`encode_pending`], the dropped reading's held-back counts (a degrade, an omitted label) are discarded with it. One label set holds one sample per millisecond. Given two in one request, Prometheus and Mimir answer `2xx`, keep the first, and drop the second silently, so the sink collapses them itself to send the later reading and count the loss. Two readings with the same nanosecond never reach here: [`super::events_to_families`] replaces the earlier and counts it under the same reason |
 //! | a counter's family name in 1.0's `MetricMetadata` | its value sample's name, `_total` included, whatever the model name: decode gives a counter that name either way, so this keeps a re-encode a fixed point |
 //! | [`Series::created`], **version 1.0 only** | dropped, uncounted. 1.0 has no field for it at all; this is the operator's choice of wire version, listed with the permitted normalizations below the way text 0.0.4's `_created` drop is |
 //!
@@ -154,10 +154,10 @@
 //! - everything on [`super`]'s own list, which this module inherits whole;
 //! - series and label reordering: series by label set, labels by byte order, groups by timestamp;
 //! - timestamps and created timestamps are **milliseconds** on the wire, so sub-millisecond
-//!   precision is truncated (toward zero, as the text 0.0.4 writer truncates) -- and where that
-//!   truncation puts two readings of one series on one millisecond, the later one wins and the
-//!   earlier is dropped and counted (see the drop table above). This is the one entry on this list
-//!   that loses a *reading* rather than a rendering of one;
+//!   precision is truncated (toward zero, as the text 0.0.4 writer truncates). Where that
+//!   truncation puts two readings of one series on one millisecond, the earlier isn't a
+//!   normalization but a counted drop (see the drop table above), so a relay of such a pair isn't a
+//!   fixed point;
 //! - `Untyped` is spelled `Unknown` on both versions: the metadata enums have one value for "no
 //!   type", so a text 0.0.4 relay's `untyped` comes back as `unknown`. Both decode to the same
 //!   `Gauge` + `_logit.prometheus.type` marker and both write as `untyped` in text 0.0.4;
@@ -182,14 +182,14 @@ pub use super::assemble::{Declaration, Declarations};
 use super::generated::io::prometheus::write::v2 as pb2;
 use super::generated::prometheus as pb1;
 use super::{
-    is_stale_nan, text, DecodeDrop, FamilyType, MetricFamily, NotEncoded, Point, PrometheusDecoder,
-    PrometheusEncoder, Series, STALE_NAN_BITS,
+    is_stale_nan, text, DecodeDrop, FamilyType, MetricFamily, NotEncoded, PendingCounts,
+    PendingFamily, Point, PrometheusDecoder, PrometheusEncoder, Replaced, Series, STALE_NAN_BITS,
 };
 use crate::CodecError;
 use logit_core::Exemplar;
 use prost::Message;
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{hash_map, BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 /// `X-Prometheus-Remote-Write-Version`, which both versions require on every request.
@@ -1021,6 +1021,148 @@ pub fn encode_counted(
     version: Version,
     encoder: &mut PrometheusEncoder,
 ) -> (Vec<u8>, u64) {
+    let (losers, replaced) = shadowed(groups);
+    if losers.is_empty() {
+        return encode_flat(groups, version, encoder);
+    }
+    super::count_duplicates(encoder, replaced.differing, replaced.equal);
+    encode_flat(&without(groups, &losers), version, encoder)
+}
+
+/// [`encode_counted`] over [`super::events_to_families_pending`]'s groups: a reading the
+/// millisecond collapse drops counts only its `duplicate_timestamp`, and every surviving
+/// reading's held-back counts are counted.
+pub fn encode_pending(
+    groups: Vec<Vec<PendingFamily>>,
+    version: Version,
+    encoder: &mut PrometheusEncoder,
+) -> (Vec<u8>, u64) {
+    let mut families: Vec<Vec<MetricFamily>> = Vec::with_capacity(groups.len());
+    let mut pending: Vec<Vec<Vec<PendingCounts>>> = Vec::with_capacity(groups.len());
+    for group in groups {
+        let (f, p): (Vec<_>, Vec<_>) = group.into_iter().map(|g| (g.family, g.pending)).unzip();
+        families.push(f);
+        pending.push(p);
+    }
+    let (losers, replaced) = shadowed(&families);
+    for (g, group) in pending.into_iter().enumerate() {
+        for (f, family) in group.into_iter().enumerate() {
+            for (s, counts) in family.into_iter().enumerate() {
+                if !losers.contains(&(g, f, s)) {
+                    encoder.flush(counts);
+                }
+            }
+        }
+    }
+    if losers.is_empty() {
+        return encode_flat(&families, version, encoder);
+    }
+    super::count_duplicates(encoder, replaced.differing, replaced.equal);
+    encode_flat(&without(&families, &losers), version, encoder)
+}
+
+/// A reading's place in a group list: (group, family, series).
+type At = (usize, usize, usize);
+
+/// What [`shadowed`] keys a reading by: family name, type, label set, and millisecond.
+type ReadingKey<'a> = (&'a str, FamilyType, &'a [(String, String)], i64);
+
+/// The readings a later reading of their series shares a millisecond with: of each family name,
+/// type, label set, and millisecond, every reading but the latest, the later group on a tie. One
+/// label set holds one sample per millisecond, and inside one request Prometheus and Mimir keep
+/// the first of two and drop the second silently, so the sink keeps the later reading itself,
+/// whole, before any reading is flattened into samples.
+///
+/// Also returns how many of them equal the reading kept for their key ([`super::same_reading`]),
+/// compared with that reading, not with the one that displaced them.
+fn shadowed(groups: &[Vec<MetricFamily>]) -> (HashSet<At>, Replaced) {
+    // One group whose families' label sets strictly increase holds no two readings of a series,
+    // which is every group `events_to_families` builds; no table is built for it.
+    if let [families] = groups {
+        if families.iter().all(|f| f.series.windows(2).all(|w| w[0].labels < w[1].labels)) {
+            return Default::default();
+        }
+    }
+    let readings = groups.iter().flatten().map(|f| f.series.len()).sum();
+    if readings < 2 {
+        return Default::default();
+    }
+    // Sized once: one allocation per encode, not one per growth.
+    let mut latest: HashMap<ReadingKey<'_>, (At, i64)> = HashMap::with_capacity(readings);
+    let mut losers = HashSet::new();
+    for (g, families) in groups.iter().enumerate() {
+        for (f, family) in families.iter().enumerate() {
+            for (s, series) in family.series.iter().enumerate() {
+                let Some(timestamp) = series.timestamp else { continue };
+                let key = (
+                    family.name.as_str(),
+                    family.kind,
+                    series.labels.as_slice(),
+                    timestamp / 1_000_000,
+                );
+                match latest.entry(key) {
+                    hash_map::Entry::Vacant(slot) => {
+                        slot.insert(((g, f, s), timestamp));
+                    }
+                    hash_map::Entry::Occupied(mut slot) => {
+                        let (held, held_at) = *slot.get();
+                        if timestamp >= held_at {
+                            losers.insert(held);
+                            slot.insert(((g, f, s), timestamp));
+                        } else {
+                            losers.insert((g, f, s));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut replaced = Replaced::default();
+    for &(g, f, s) in &losers {
+        let family = &groups[g][f];
+        let series = &family.series[s];
+        let timestamp = series.timestamp.expect("only a timestamped reading is shadowed");
+        let key =
+            (family.name.as_str(), family.kind, series.labels.as_slice(), timestamp / 1_000_000);
+        let ((kg, kf, ks), _) = latest[&key];
+        replaced.add(series, &groups[kg][kf].series[ks]);
+    }
+    (losers, replaced)
+}
+
+/// `groups` less the readings at `losers`.
+fn without(groups: &[Vec<MetricFamily>], losers: &HashSet<At>) -> Vec<Vec<MetricFamily>> {
+    groups
+        .iter()
+        .enumerate()
+        .map(|(g, families)| {
+            families
+                .iter()
+                .enumerate()
+                .map(|(f, family)| MetricFamily {
+                    name: family.name.clone(),
+                    kind: family.kind,
+                    help: family.help.clone(),
+                    unit: family.unit.clone(),
+                    series: family
+                        .series
+                        .iter()
+                        .enumerate()
+                        .filter(|(s, _)| !losers.contains(&(g, f, *s)))
+                        .map(|(_, series)| series.clone())
+                        .collect(),
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// [`encode_counted`] once no two readings of one series share a millisecond.
+fn encode_flat(
+    groups: &[Vec<MetricFamily>],
+    version: Version,
+    encoder: &mut PrometheusEncoder,
+) -> (Vec<u8>, u64) {
     let mut built: BTreeMap<Vec<(String, String)>, SeriesOut> = BTreeMap::new();
     let mut flat = Vec::new();
     // One help and one unit per family name, the first each group order offers, so every series
@@ -1037,9 +1179,13 @@ pub fn encode_counted(
             entry.1 = entry.1.or(family.unit.as_deref());
         }
     }
+    // Each `Series` is one reading; its samples share its number, so a collapse below counts the
+    // readings it removes, not the wire samples a histogram's reading spans.
+    let mut reading: u32 = 0;
     for families in groups {
         for family in families {
             for series in &family.series {
+                reading = reading.wrapping_add(1);
                 let Some(timestamp) = series.timestamp else {
                     encoder.not_encoded(NotEncoded::NoTimestamp);
                     continue;
@@ -1070,12 +1216,15 @@ pub fn encode_counted(
                         value: sample.value,
                         timestamp_ms: timestamp / 1_000_000,
                         start_ms: series.created.map(|c| c / 1_000_000).unwrap_or(0),
+                        reading,
                     });
                     out.exemplars.extend(sample.exemplars);
                 }
             }
         }
     }
+    // The readings the collapse below removed, by number.
+    let mut lost: Vec<u32> = Vec::new();
     for out in built.values_mut() {
         // Both versions require a series' samples to be in timestamp order. The sort is stable, so
         // two samples that truncate to the same millisecond keep the order their groups gave them
@@ -1085,26 +1234,27 @@ pub fn encode_counted(
         // was written from, so a series merged from several groups would otherwise come back in
         // a different order and the body wouldn't be a fixed point.
         out.exemplars.sort_by_key(|exemplar| exemplar.timestamp_ms);
-        // One label set may not carry two samples at one timestamp: Prometheus and Mimir answer
-        // `400 duplicate sample for timestamp`, which the sender classifies as rejected and the
-        // whole batch is dropped -- so a pair of readings a microsecond apart would cost every
-        // other series in the request too. The wire has millisecond resolution and the model has
-        // nanosecond, so any sub-millisecond source (`statsd_in` gauges, `internal`) reaches this.
-        //
-        // The last reading wins, the same rule `prometheus_out`'s own registry upsert applies to
-        // two scrapes of one series, and each dropped reading is counted -- it is real data loss,
-        // not a reordering.
-        let before = out.samples.len();
+        // [`shadowed`] already left one reading per family, label set, and millisecond, so two
+        // samples here share a millisecond only when two families flatten onto one label set.
+        // One label set still holds one sample per millisecond, so the later is sent and the
+        // earlier's reading counted lost, whatever the two values: readings of two families are
+        // never one reading.
         out.samples.dedup_by(|later, earlier| {
             if later.timestamp_ms != earlier.timestamp_ms {
                 return false;
             }
+            lost.push(earlier.reading);
             *earlier = *later;
             true
         });
-        for _ in out.samples.len()..before {
-            encoder.degraded_reason("sub_ms_collapsed");
+    }
+    if !lost.is_empty() {
+        lost.sort_unstable();
+        lost.dedup();
+        for _ in &lost {
+            encoder.not_encoded(NotEncoded::DuplicateTimestamp);
         }
+        super::warn_duplicate_timestamp(encoder, lost.len());
     }
     // Counted in its own pass, *after* everything that can still add to or remove from `built`:
     // `logit.output.samples` has to be what the body carries.
@@ -1133,6 +1283,8 @@ struct SampleOut {
     value: f64,
     timestamp_ms: i64,
     start_ms: i64,
+    /// The [`Series`] this sample came from, numbered within one encode.
+    reading: u32,
 }
 
 struct ExemplarOut {
@@ -1187,13 +1339,16 @@ fn bound(value: f64) -> String {
 /// failing the request, so writing it would lose it uncounted. A key's omission counts only for
 /// an exemplar that is written, as in the OpenMetrics writer.
 fn exemplar_out(exemplar: &Exemplar, encoder: &PrometheusEncoder) -> Option<ExemplarOut> {
-    let (labels, omitted) = text::exemplar_labels(exemplar);
+    let (labels, omitted, renamed) = text::exemplar_labels(exemplar);
     if !text::exemplar_fits(&labels) {
         encoder.degraded_reason("exemplar_omitted");
         return None;
     }
     for reason in omitted {
         encoder.label_omitted(reason);
+    }
+    for _ in 0..renamed {
+        encoder.label_normalized("name_sanitized");
     }
     Some(ExemplarOut {
         labels,

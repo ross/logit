@@ -10,11 +10,15 @@
 //! interleaves them (49's first clause runs inside 6 and 50 inside 7; 92's first clause right
 //! before 7; 47, 51, 92's shape clause, 48, 51's and 92's reconvergence clauses, and 49's last
 //! clause right after 7; 26-28 before 19; 52 after 44; 53 between 45 and 46). A new rule takes the
-//! next number.
+//! next number; a retired rule's number (10, 21, 30, 58) is not reused.
 //!
-//! One principle recurs, cited by number: a config that can only be a no-op, a black hole, or an
-//! impossible bound (`0` for a count or duration) is an error, and so is a setting that would be
-//! silently ignored.
+//! One principle decides what is a rule: validation rejects a config only when it can't run as
+//! written, or when it would lose or duplicate data the operator didn't ask to lose or duplicate.
+//! Can't run as written covers an impossible or unintended bound (`0` for a count, size, or
+//! duration is usually one, not a small value), a setting that would be silently ignored, and a
+//! name or value that could never match. A config isn't rejected for being pointless: a no-op or
+//! a black hole the operator wrote explicitly, such as an empty `set` or a `sample` at `rate: 0`,
+//! runs as written, and a black hole counts what it discards as `events.discarded`.
 //!
 //! 1. A config with no components.
 //! 2. A `sources` id that names no defined component.
@@ -30,13 +34,12 @@
 //! 8. A kind `is_implemented` doesn't list.
 //! 9. A zero `interval` on a kind that has one (the `interval` fn's table): it would flush
 //!    continuously.
-//! 10. A `kv_metrics` with `counters`, `gauges`, and `distributions` all empty: a no-op.
 //! 11. A `kv_metrics` distribution with no `field`, or any entry with an empty `name`: a
 //!     distribution of nothing is meaningless, and `influxdb_out` can't encode a nameless metric
 //!     (`docs/adr/kv-metrics-semantics.md`).
-//! 12. A `set` with neither `resource` nor `attributes`, or an empty key in either: a no-op, or a
-//!     key that could never name a real attribute, so `has_attributes` (36), which shares `set`'s
-//!     config shape, never meets a key `set` stamped that its own rule rejects
+//! 12. A `set` with an empty key in `resource` or `attributes`: it could never name a real
+//!     attribute, so `has_attributes` (36), which shares `set`'s config shape, never meets a key
+//!     `set` stamped that its own rule rejects
 //!     (`docs/adr/operator-declared-resource-attributes.md`).
 //! 13. More than one `internal`: each would drain, and so split, the one process-wide telemetry
 //!     registry.
@@ -61,13 +64,7 @@
 //!     `format`'s defaults fill the absent ones: it could never match an attribute (`null`, not
 //!     `""`, disables an optional lookup)
 //!     (`docs/adr/log-record-trace-context.md`).
-//! 20. A `scale` with no `fields`, an empty field name, or a non-finite factor
-//!     (`docs/adr/scale-transform.md`).
-//! 21. An empty `signals:` on `has_signal`/`keep_signals`/`drop_signals`, all three payload
-//!     signals on `keep_signals`/`drop_signals`, or `none` on `drop_signals`. Which shape is the
-//!     black hole and which the no-op is opposite between those two, so each message names the
-//!     right one; `drop_signals` has no payload to clear on an event carrying none
-//!     (`docs/adr/signal-filtering-components.md`).
+//! 20. A `scale` with an empty field name or a non-finite factor (`docs/adr/scale-transform.md`).
 //! 22. An `otlp_out` `headers:` name that is empty, `:`-prefixed, `grpc-*`, in
 //!     `RESERVED_OTLP_HEADERS`, or a case-insensitive duplicate: the transport sets those itself,
 //!     and which duplicate is sent is undefined.
@@ -78,24 +75,22 @@
 //!     the block would do nothing (`docs/adr/otlp-tls-and-pooled-grpc-client.md`).
 //! 25. A `trace_context` `span:` with an empty `name` (OTLP requires one) or a `max_skew` of `0s`
 //!     (every span would be skewed) (`docs/adr/trace-context-span-lifting.md`).
-//! 26. A `tail_in` with no `paths`, an empty entry, or a `*` outside the final path component,
-//!     which the tail matcher never expands (`check_tail_glob`).
-//! 27. A `docker_in` with no `containers` and no `discover: true` (it would tail nothing), an empty
-//!     `containers`/`labels` entry, a duplicate `containers` entry, or an empty `root`.
+//! 26. A `tail_in` `paths` entry that is empty or has a `*` outside the final path component, which
+//!     the tail matcher never expands (`check_tail_glob`). No `paths` is legal and tails nothing.
+//! 27. A `docker_in` with an empty `containers`/`labels` entry, a duplicate `containers` entry, or
+//!     an empty `root`. No `containers` without `discover: true` is legal and follows nothing.
 //! 28. A `tail_in`/`docker_in` `poll_interval`, `checkpoint_interval`, or `max_line_bytes` of `0`:
 //!     a busy loop, a checkpoint write every tick, or every line dropped. 26-28 are
 //!     `docs/adr/file-tailing-and-docker-json-logs.md`'s.
-//! 29. A `file_out` whose `rotate:` sets neither `max_bytes` nor `interval` (use `stdio_out` for an
-//!     unrotated file), a `rotate.max_bytes`/`max_files` of `0`, or a `max_files` above
-//!     `logit_config::MAX_ROTATE_FILES` (`docs/adr/rotating-file-output.md`).
-//! 30. A `kv` with an empty `pair_sep`/`kv_sep`, `pair_sep == kv_sep`, or a `kv_sep` containing
-//!     `pair_sep`: since `pair_sep` splits first, each is a certain no-op or garbage
-//!     (`docs/adr/logfmt-and-kv-parsing.md`). `logfmt` needs no rule: its one field is a `bool`.
-//! 31. A `regex` with an empty `field`, or a `pattern` that fails to compile or has no named
-//!     capture group. Compiling here makes a bad pattern a `logit validate` error
-//!     (`docs/adr/regex-transform.md`).
-//! 32. A `csv` with no `columns`, an empty column name, a duplicate one (the later would overwrite
-//!     the earlier), or a `delimiter` that is `"`, `\n`, `\r`, or non-ASCII
+//! 29. A `file_out` `rotate.max_bytes` or `max_files` of `0`, or a `max_files` above
+//!     `logit_config::MAX_ROTATE_FILES`. `max_files` counts the active file, so `0` is a bound no
+//!     file could meet; the sink would clamp it to `1`, which truncates in place. A `rotate:` with
+//!     neither `max_bytes` nor `interval` is legal and never rotates
+//!     (`docs/adr/rotating-file-output.md`).
+//! 31. A `regex` with an empty `field`, or a `pattern` that fails to compile. Compiling here makes
+//!     a bad pattern a `logit validate` error (`docs/adr/regex-transform.md`).
+//! 32. A `csv` with an empty column name, a duplicate one (the later would overwrite the earlier),
+//!     or a `delimiter` that is `"`, `\n`, `\r`, or non-ASCII
 //!     (`docs/adr/csv-positional-columns.md`).
 //! 33. A `stdio_out`/`file_out` `compression:` other than `none` outside `format: native`, where it
 //!     would do nothing (`docs/adr/file-output-native-format.md`).
@@ -105,11 +100,12 @@
 //! 35. A `buffer.disk:` alongside a non-default `buffer.max_batches`/`max_bytes` (disk replaces
 //!     them), a disk bound of `0` or with `segment_bytes > max_bytes`, or two sinks sharing a
 //!     literal `disk.path` (`docs/adr/disk-backed-sink-buffer.md`).
-//! 36. A `has_attributes`/`drop_attributes` with nothing configured, an empty key, or a non-finite
-//!     value. Zero pairs match vacuously, so `has_*` is the no-op and `drop_*` the black hole, the
-//!     inverse of 21 (`docs/adr/attribute-filtering-components.md`).
-//! 37. A `has_provenance`/`drop_provenance` with neither `origin` nor `previous`, or an empty or
-//!     repeated entry. Oriented like 36, not 21: an empty field is left out of the match
+//! 36. A `has_attributes`/`drop_attributes` with an empty key, a non-finite value, or a presence
+//!     key repeated or also named in the same side's map. Nothing configured is legal: zero pairs
+//!     match vacuously, so `has_*` forwards every event and `drop_*` discards every one
+//!     (`docs/adr/attribute-filtering-components.md`).
+//! 37. A `has_provenance`/`drop_provenance` with an empty or repeated entry. An empty field is left
+//!     out of the match, so with neither `origin` nor `previous` every batch matches, as in 36
 //!     (`docs/adr/provenance-filtering-components.md`).
 //! 38. A `statsd_out`/`collectd_out`/`graphite_out` `max_packet_bytes` of `0`; above
 //!     `MAX_UDP_PAYLOAD_BYTES` (65507) on `collectd_out` or a UDP `statsd_out`/`graphite_out`,
@@ -128,9 +124,10 @@
 //! 41. A registry-mode `prometheus_out` `path` not starting with `/` (every scrape would 404) or
 //!     `max_series: 0` (every series evicted on arrival)
 //!     (`docs/adr/prometheus-scrape-and-exposition.md`).
-//! 42. A `generate_in` `count`/`batch`/`rate` of `0`, an empty metric name or attribute/resource
+//! 42. A `generate_in` `batch` or `rate` of `0`, an empty metric name or attribute/resource
 //!     key, a non-finite metric value, or a placeholder other than `{seq}`/`{seq%N}`, with only
-//!     `{seq%N}` in the interned metric name (`check_generate_template`).
+//!     `{seq%N}` in the interned metric name (`check_generate_template`). `count: 0` is legal and
+//!     ends the listener at once.
 //! 43. A `tls:` on a UDP `syslog_in`/`graphite_in`/`statsd_in`/`lines_in`: DTLS is out of scope,
 //!     so it could never take effect. One rule for every listener: a new one adds a match arm
 //!     (`docs/adr/syslog-tcp-ingress-and-tls.md`).
@@ -150,17 +147,19 @@
 //! 48. A router target id that is unresolved, the router itself, or not a `target` (the message
 //!     names the `sources:` fix), or a repeated `lua` `targets:` id. A `route` may map many values
 //!     onto one target.
-//! 49. A `target` with `sources` (checked in 6), or one no router directs to: its consumers would
-//!     wait forever.
+//! 49. A `target` with `sources` (checked in 6), or one no router directs to: a wiring mistake.
+//!     Startup drops the runtime's copy of every target's `Fanout`, so nothing could reach its
+//!     consumers through it.
 //! 50. A router (`route`, or `lua`/`lua_file` with `targets:`) with no ordinary consumer: its
 //!     consumers receive every event no target claims, so with none those events would vanish.
 //!     Checked with 7, under its own message naming the `null_out` fix
 //!     (`docs/adr/target-components.md`).
-//! 51. A `route` with no `routes:`, an empty key or value, an empty list or a target repeated
+//! 51. A `route` with an empty key or value, an empty list or a target repeated
 //!     within one list, more than 63 distinct targets (the `Destinations` bitset's width), or an
 //!     empty `by:` attribute/resource key. Runs before 48, so an empty value isn't reported as an unknown target. After 48, its
 //!     reconvergence clause rejects a component listing two targets of one list: that component
-//!     would receive the event twice.
+//!     would receive the event twice. No `routes:` is legal: every event goes to the ordinary
+//!     consumers.
 //! 52. A `statsd_out` `tls:` failing 44's three checks, messages verbatim
 //!     (`docs/adr/statsd-output.md`). Sink TLS rules are one per sink (24/34/44/52), since each
 //!     also checks its own block.
@@ -168,9 +167,10 @@
 //!     `syslog_in`/`graphite_in`/`statsd_in`/`lines_in` or a `transport: unix`
 //!     `statsd_in`/`lines_in`. It's an `Option`, so there is no default to exempt
 //!     (`docs/adr/idle-connection-timeout.md`).
-//! 54. A `keep_values` with nothing configured, an empty field name, an empty `allow` (that's
-//!     `set`/`remove`), a non-finite literal, a non-lowercase `Str` under `normalize: [lower]`, or
-//!     a repeated `normalize` step (`docs/adr/value-allowlist-cardinality-clamp.md`).
+//! 54. A `keep_values` with an empty field name, a non-finite literal, a non-lowercase `Str` under
+//!     `normalize: [lower]`, or a repeated `normalize` step. Nothing configured is legal, and so
+//!     is an empty `allow`, which clamps every value of its field
+//!     (`docs/adr/value-allowlist-cardinality-clamp.md`).
 //! 55. A `prometheus_in` with both or neither of `scrape_targets`/`bind`, a non-default field of
 //!     the other mode (`peer`/`proxy_protocol`/`forwarded`/`reuse_port` among the receiver's), a
 //!     bind-mode `path` not starting with `/`, or `metadata_cache.ttl: 0s` with
@@ -184,17 +184,16 @@
 //! 57. A datagram listener's `receive.read_batch` above `MAX_READ_BATCH`: the kernel doesn't clamp
 //!     `recvmmsg`'s `vlen`, so this bounds the receive slab and the shutdown-path loss
 //!     (`docs/adr/udp-intake-batching-and-socket-visibility.md`).
-//! 58. A `shape` `max_tracked_keys`/`max_tracked_keysets` of `0`: nothing would be tracked, and
-//!     there is no "table off" spelling; remove the component instead
-//!     (`docs/adr/shape-observer-component.md`).
-//! 59. A `flatten` with `attributes: none` and `resource: none`, an empty named list (write
-//!     `none` or `all`), or an empty or repeated field name (`docs/adr/flatten-transform.md`).
+//! 59. A `flatten` with an empty or repeated field name. Selecting nothing, `none` or an empty
+//!     list, is legal on either field (`docs/adr/flatten-transform.md`).
 //! 60. An `http_access` `match` that is empty or invalid, an empty `route`/`class`/`route_other`/
 //!     `redact_query`, a `routes` entry not `builtin` xor `match` + `route`, a repeated `builtin`,
-//!     or a bad `max_length` (`docs/adr/http-access-normalization.md`).
-//! 61. A `sample` `rate` non-finite, outside `[0, 1]`, `1`, or `0` without `always_keep`; an empty
-//!     field name; an `always_keep` naming both or neither side, or with a non-finite value; or
-//!     `missing:` without `key:` (`docs/adr/consistent-sampling-component.md`).
+//!     or a `max_length` key `http_access` never caps. A `max_length` of `0` is legal and empties
+//!     the field, counted as truncated (`docs/adr/http-access-normalization.md`).
+//! 61. A `sample` `rate` non-finite or outside `[0, 1]`; an empty field name; an `always_keep`
+//!     naming both or neither side, or with a non-finite value; or `missing:` without `key:`.
+//!     `rate: 1` keeps every event, and `rate: 0` keeps only what `always_keep` flags or
+//!     `missing: keep` keeps (`docs/adr/consistent-sampling-component.md`).
 //! 62. Two `tail_in`/`docker_in` components sharing a literal `checkpoint_path`, or one whose
 //!     `checkpoint_path` is another's `<checkpoint_path>.tmp`: each would overwrite, or truncate
 //!     and rename away, the other's offsets (`docs/adr/file-tailing-and-docker-json-logs.md`).
@@ -275,7 +274,7 @@
 //! 81. An `admin.socket_mode` without `admin.socket`; an empty `admin.bind` or `admin.socket`; or
 //!     an `admin.bind` starting with `/`, a path that belongs in `socket`
 //!     (`docs/adr/listener-port-sharing-and-shutdown-delay.md`).
-//! 82. A `bucket` with no `attributes`; an empty field name, `into`, `ranges`, class `value`, or
+//! 82. A `bucket` with an empty field name, `into`, `ranges`, class `value`, or
 //!     `other`; an `into` naming another configured source field, or shared by two fields; a
 //!     range with both `lt` and `le`; a boundless range that isn't last; a non-finite bound; or a
 //!     range the ranges before it already cover, which can never match: a bound below the
@@ -315,33 +314,41 @@
 //!     a zero bound would call nearly every event stale (`docs/adr/stale-event-filtering.md`).
 //! 88. A top-level `hostname` that is empty or only whitespace: it would stamp a blank `host.name`
 //!     (`docs/adr/process-hostname.md`).
+//! 89. An `influxdb_out` that sets both `bucket` and `default_bucket`: `bucket` sends every batch
+//!     to one bucket, so `default_bucket` would be silently ignored
+//!     (`docs/adr/influxdb-line-protocol-relay.md`).
+//! 90. An `influxdb_out` that sets both `org` and `default_org`, 89's org-side twin
+//!     (`docs/adr/influxdb-line-protocol-relay.md`).
 //! 91. A `syslog_in` `framing` set to any value, `lines` included, under `transport: tcp`: TCP
 //!     framing is detected per connection, and the field chooses how a UDP datagram maps to
 //!     messages (`docs/adr/syslog-udp-datagram-framing.md`).
 //! 92. A `route_signals` named in any component's `sources:`: it sends every event to its targets
-//!     and has no ordinary edge, so 7 doesn't ask it for a consumer. Also a `route_signals` with no
-//!     `signals:` entry set (it would discard every event) or an empty target id, checked before
-//!     48 as 51 is; and, after 48, under `strip: false`, a component whose `sources:` lists two of
-//!     its targets: a mixed event reaches both whole, so that component would receive it twice. A
-//!     target only `signals.none` names is outside that check, since an event reaching it reaches
-//!     no other target.
-//!     Under `strip: true` each target receives disjoint payloads, so reading several is legal
-//!     (`docs/adr/route-signals.md`).
+//!     and has no ordinary edge, so 7 doesn't ask it for a consumer. Also a `route_signals` with an
+//!     empty target id, checked before 48 as 51 is; and, after 48, under `strip: false`, a
+//!     component whose `sources:` lists two of its targets: a mixed event reaches both whole, so
+//!     that component would receive it twice. A target only `signals.none` names is outside that
+//!     check, since an event reaching it reaches no other target. Under `strip: true` each target
+//!     receives disjoint payloads, so reading several is legal. No `signals:` entry set is legal
+//!     and discards every event (`docs/adr/route-signals.md`).
 //! 93. A `replay_in` with an empty `path`, which names no file, or a `batch` of `0`, which could
 //!     send nothing (`docs/adr/replay-input.md`).
-//! 94. A `cumulative_to_delta` with a `max_staleness` of `0s`, which would keep every series until
-//!     `max_series` evicts it, or a `max_series` of `0`, which could track no series and so
-//!     convert nothing (`docs/adr/cumulative-to-delta-transform.md`).
+//! 94. A `cumulative_to_delta` with a `max_staleness` of `0s`, which would forget every series at
+//!     the next batch, so no point is ever differenced, or a `max_series` of `0`, an impossible
+//!     bound the transform would clamp to `1` (`docs/adr/cumulative-to-delta-transform.md`).
 //! 95. A `lua`/`lua_file` `vars:` holding, at any depth, a `null`, which a Lua table can't store,
 //!     or an integer larger than 2^53 in magnitude, which a Lua number can't hold without
 //!     rounding. Only a YAML literal can trip it: `!env` inside `vars:` always gives a string. The
 //!     error names the key path, never the value (`docs/adr/lua-script-vars.md`).
+//! 96. A `dedup_timestamps` with a `precision` of `0s`, which has no bucket to put a timestamp in
+//!     (`docs/adr/dedup-timestamps-transform.md`).
 //!
 //! Not validated: that a `by: {provenance: ..}` route key names a component in this graph. Like
 //! 37's ids, it may name a component relayed from another process. Nor is `keep`'s empty `fields`:
-//! "drop every attribute" is a real operation, unlike 21's "drop every event".
+//! "drop every attribute" is a real operation.
 //!
-//! Sink reachability needs no rule: by 2 + 5 + 7, every acyclic chain ends, and only at a sink.
+//! Sink reachability needs no rule: by 2 + 5 + 7, every acyclic chain ends, and only at a sink or
+//! at a `route_signals` with no `signals:` entry set, which discards every event and counts it
+//! (92 exempts `route_signals` from 7).
 
 use logit_config::{
     default_handshake_timeout, default_max_connections, default_prometheus_scrape_interval,
@@ -441,6 +448,7 @@ pub fn role(kind: &ComponentKind) -> Role {
         | HasStale { .. }
         | DropStale { .. }
         | CumulativeToDelta { .. }
+        | DedupTimestamps { .. }
         | KeepValues { .. }
         | Bucket { .. }
         | Logfmt { .. }
@@ -518,6 +526,7 @@ pub fn kind_name(kind: &ComponentKind) -> &'static str {
         HasStale { .. } => "has_stale",
         DropStale { .. } => "drop_stale",
         CumulativeToDelta { .. } => "cumulative_to_delta",
+        DedupTimestamps { .. } => "dedup_timestamps",
         KeepValues { .. } => "keep_values",
         Bucket { .. } => "bucket",
         Logfmt { .. } => "logfmt",
@@ -647,6 +656,7 @@ fn is_implemented(kind: &ComponentKind) -> bool {
             | ComponentKind::HasStale { .. }
             | ComponentKind::DropStale { .. }
             | ComponentKind::CumulativeToDelta { .. }
+            | ComponentKind::DedupTimestamps { .. }
             | ComponentKind::KeepValues { .. }
             | ComponentKind::Bucket { .. }
             | ComponentKind::Logfmt { .. }
@@ -693,14 +703,6 @@ fn interval(kind: &ComponentKind) -> Option<Duration> {
         | ComponentKind::PrometheusIn { interval, .. } => Some(*interval),
         _ => None,
     }
-}
-
-/// `true` if `signals` names all three of `Logs`/`Metrics`/`Traces`: rule 21's test for
-/// `keep_signals`/`drop_signals`.
-fn names_all_three(signals: &[logit_config::Signal]) -> bool {
-    signals.contains(&logit_config::Signal::Logs)
-        && signals.contains(&logit_config::Signal::Metrics)
-        && signals.contains(&logit_config::Signal::Traces)
 }
 
 pub struct ResolvedComponent {
@@ -1022,12 +1024,6 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
     // target ids, so an empty value is reported as empty rather than as an unknown target `''`.
     for (id, component) in &components {
         if let ComponentKind::Route { by, routes } = &component.kind {
-            if routes.is_empty() {
-                anyhow::bail!(
-                    "component '{id}': a route with no 'routes' configured can only ever be a \
-                     no-op"
-                );
-            }
             if routes.keys().any(|value| value.is_empty()) {
                 anyhow::bail!(
                     "component '{id}': a route 'routes' key must not be empty -- it could never \
@@ -1081,15 +1077,9 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
 
     // Rule 92's shape clause, before rule 48 for rule 51's reason: an empty id is reported as
     // empty, not as an unknown target `''`. At most four distinct targets, so the `Destinations`
-    // width needs no check.
+    // width needs no check. With no entry set, every event is discarded, counted.
     for (id, component) in &components {
         let ComponentKind::RouteSignals { signals, .. } = &component.kind else { continue };
-        if signals.iter().all(|(_, target)| target.is_none()) {
-            anyhow::bail!(
-                "component '{id}': a route_signals with no 'signals' entry would discard every \
-                 event -- name a target for logs, metrics, traces, or none"
-            );
-        }
         if let Some((signal, _)) = signals.iter().find(|(_, target)| *target == Some("")) {
             anyhow::bail!(
                 "component '{id}': route_signals 'signals.{}' must not be empty -- it could \
@@ -1202,14 +1192,15 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 49's last clause: a `target` no router directs to would leave its consumers waiting
-    // forever.
+    // Rule 49's last clause: a `target` no router directs to is a wiring mistake. No router holds
+    // its `Fanout`, and startup drops the runtime's copy (`drop(target_fanouts)`), so its edges
+    // close at once and a consumer reading only it ends at startup.
     let directed_to: BTreeSet<&str> = components.values().flat_map(targets_of).collect();
     for (id, component) in &components {
         if role(&component.kind) == Role::Target && !directed_to.contains(id.as_str()) {
             anyhow::bail!(
-                "component '{id}': is a target that no router directs to -- its consumers would \
-                 wait on it forever"
+                "component '{id}': is a target that no router directs to -- nothing could ever \
+                 reach its consumers through it"
             );
         }
     }
@@ -1235,17 +1226,10 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 10: a `kv_metrics` with nothing configured is a no-op.
+    // Rule 11: a distribution needs a `field`, and every entry a `name` (`influxdb_out` can't
+    // encode a metric with no measurement name).
     for (id, component) in &components {
         if let ComponentKind::KvMetrics { counters, gauges, distributions } = &component.kind {
-            if counters.is_empty() && gauges.is_empty() && distributions.is_empty() {
-                anyhow::bail!(
-                    "component '{id}': a kv_metrics with no counters, gauges, or distributions \
-                     configured can only ever be a no-op"
-                );
-            }
-            // Rule 11: a distribution needs a `field`, and every entry a `name` (`influxdb_out`
-            // can't encode a metric with no measurement name).
             if distributions.iter().any(|m| m.field.is_none()) {
                 anyhow::bail!(
                     "component '{id}': a kv_metrics distribution entry requires a 'field' -- a \
@@ -1262,17 +1246,11 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 12: a `set` with nothing configured is a no-op, and an empty key could never name a real
-    // attribute. Rejecting it here means `has_attributes` (rule 36), which shares `set`'s config
-    // shape and rejects an empty key itself, never meets one `set` stamped.
+    // Rule 12: an empty `set` key could never name a real attribute. Rejecting it here means
+    // `has_attributes` (rule 36), which shares `set`'s config shape and rejects an empty key
+    // itself, never meets one `set` stamped.
     for (id, component) in &components {
         if let ComponentKind::Set { resource, attributes } = &component.kind {
-            if resource.is_empty() && attributes.is_empty() {
-                anyhow::bail!(
-                    "component '{id}': a set with neither 'resource' nor 'attributes' \
-                     configured can only ever be a no-op"
-                );
-            }
             if resource.keys().chain(attributes.keys()).any(|key| key.is_empty()) {
                 anyhow::bail!(
                     "component '{id}': a set key must not be empty -- it could never name a \
@@ -1459,13 +1437,10 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 26: `tail_in`'s `paths`: at least one, none empty, and `*` only in the final path
-    // component (`check_tail_glob`).
+    // Rule 26: `tail_in`'s `paths`: none empty, and `*` only in the final path component
+    // (`check_tail_glob`).
     for (id, component) in &components {
         if let ComponentKind::TailIn { paths, .. } = &component.kind {
-            if paths.is_empty() {
-                anyhow::bail!("component '{id}': 'paths' must name at least one file");
-            }
             for path in paths {
                 if path.is_empty() {
                     anyhow::bail!("component '{id}': 'paths' has an empty entry");
@@ -1475,19 +1450,11 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 27: `docker_in`'s shape. No `containers` and no `discover` would tail nothing (rule 7's
-    // black hole, invisible to arity). An empty `containers`/`labels` entry can never match, a
+    // Rule 27: `docker_in`'s shape. An empty `containers`/`labels` entry can never match, a
     // repeated `containers` entry is a mistake, and an empty `root` would resolve to the working
     // directory.
     for (id, component) in &components {
-        if let ComponentKind::DockerIn { root, containers, discover, labels, .. } = &component.kind
-        {
-            if containers.is_empty() && !discover {
-                anyhow::bail!(
-                    "component '{id}': 'containers' must name at least one container, or \
-                     'discover: true' must be set -- otherwise this listener would tail nothing"
-                );
-            }
+        if let ComponentKind::DockerIn { root, containers, labels, .. } = &component.kind {
             if root.is_empty() {
                 anyhow::bail!("component '{id}': 'root' must not be empty");
             }
@@ -1547,8 +1514,8 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
             let (trace_id, span_id, flags) = format.resolve_fields(trace_id, span_id, flags);
             if trace_id.is_empty() {
                 anyhow::bail!(
-                    "component '{id}': a trace_context with an empty 'trace_id' field name can \
-                     only ever be a no-op"
+                    "component '{id}': a trace_context with an empty 'trace_id' field name could \
+                     never match an attribute"
                 );
             }
             for (field, value) in [("span_id", span_id), ("flags", flags)] {
@@ -1562,17 +1529,11 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 20: `scale`. No `fields` is a no-op, an empty field name can't match (rule 19's
-    // reasoning), and a non-finite factor only produces values `numeric`
-    // (`crates/logit-transforms/src/lib.rs`) rejects downstream.
+    // Rule 20: `scale`. An empty field name can't match (rule 19's reasoning), and a non-finite
+    // factor only produces values `numeric` (`crates/logit-transforms/src/lib.rs`) rejects
+    // downstream.
     for (id, component) in &components {
         if let ComponentKind::Scale { fields } = &component.kind {
-            if fields.is_empty() {
-                anyhow::bail!(
-                    "component '{id}': a scale with no 'fields' configured can only ever be a \
-                     no-op"
-                );
-            }
             if fields.keys().any(|field| field.is_empty()) {
                 anyhow::bail!(
                     "component '{id}': a scale field name must not be empty -- it could never \
@@ -1582,63 +1543,6 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
             if fields.values().any(|factor| !factor.is_finite()) {
                 anyhow::bail!("component '{id}': every scale factor must be a finite number");
             }
-        }
-    }
-
-    // Rule 21: `has_signal`/`keep_signals`/`drop_signals` need a non-empty `signals:`, and
-    // `keep_signals`/`drop_signals` may not name all three payload signals. For an allowlist,
-    // empty keeps nothing (black hole) and all three keeps every payload (a no-op on any event
-    // carrying one); a denylist is the mirror. Both are rejected, but each message must name the
-    // right failure. `drop_signals` may not name `none`: it has no payload to clear, and an event
-    // carrying nothing is dropped already. `has_signal` naming all three stays legal: under
-    // `mode: only` it forwards anything with a payload.
-    for (id, component) in &components {
-        match &component.kind {
-            ComponentKind::HasSignal { signals, .. } => {
-                if signals.is_empty() {
-                    anyhow::bail!(
-                        "component '{id}': 'signals' must name at least one signal -- an empty \
-                         list can only ever drop every event"
-                    );
-                }
-            }
-            ComponentKind::KeepSignals { signals } => {
-                if signals.is_empty() {
-                    anyhow::bail!(
-                        "component '{id}': 'signals' must name at least one signal -- an empty \
-                         list keeps nothing, dropping every event"
-                    );
-                }
-                if names_all_three(signals) {
-                    anyhow::bail!(
-                        "component '{id}': 'signals' names all three signals -- that keeps \
-                         everything, a no-op on every event carrying a payload; use has_signal \
-                         to drop an event carrying none"
-                    );
-                }
-            }
-            ComponentKind::DropSignals { signals } => {
-                if signals.is_empty() {
-                    anyhow::bail!(
-                        "component '{id}': 'signals' must name at least one signal -- an empty \
-                         list drops nothing, a no-op that forwards every event untouched"
-                    );
-                }
-                if names_all_three(signals) {
-                    anyhow::bail!(
-                        "component '{id}': 'signals' names all three signals -- that drops \
-                         everything, dropping every event"
-                    );
-                }
-                if signals.contains(&logit_config::Signal::None) {
-                    anyhow::bail!(
-                        "component '{id}': drop_signals 'signals' may not name none -- an event \
-                         carrying no payload has nothing to clear, and drop_signals already drops \
-                         it"
-                    );
-                }
-            }
-            _ => {}
         }
     }
 
@@ -1741,18 +1645,12 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 29: `file_out`'s `rotate:`. With neither trigger it never rotates, which is what
-    // `stdio_out` is for, so the message points there. `max_bytes: 0`/`max_files: 0` are impossible
-    // bounds, and `max_files` above `MAX_ROTATE_FILES` makes every rotation a syscall storm.
+    // Rule 29: `file_out`'s `rotate:`. `max_bytes: 0` and `max_files: 0` are impossible bounds:
+    // `max_files` counts the active file, and the sink would clamp `0` to `1`, truncating in place,
+    // which an operator who wrote `0` didn't ask for. `max_files` above `MAX_ROTATE_FILES` makes
+    // every rotation a syscall storm. A `rotate:` with neither trigger is legal and never rotates.
     for (id, component) in &components {
-        if let ComponentKind::FileOut { path, rotate, .. } = &component.kind {
-            if rotate.max_bytes.is_none() && rotate.interval.is_none() {
-                anyhow::bail!(
-                    "component '{id}': 'file_out' needs at least one of 'rotate.max_bytes' or \
-                     'rotate.interval' -- for an unrotated file, use 'stdio_out' with \
-                     'target: {path}'"
-                );
-            }
+        if let ComponentKind::FileOut { rotate, .. } = &component.kind {
             if rotate.max_bytes == Some(0) {
                 anyhow::bail!(
                     "component '{id}': 'rotate.max_bytes' must be at least 1 -- 0 means every \
@@ -1761,8 +1659,8 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
             }
             if rotate.max_files == 0 {
                 anyhow::bail!(
-                    "component '{id}': 'rotate.max_files' must be at least 1 -- 0 would delete \
-                     the file it just rotated"
+                    "component '{id}': 'rotate.max_files' must be at least 1 -- it counts the \
+                     active file, so 0 is a bound no file could meet; 1 truncates in place"
                 );
             }
             if rotate.max_files > logit_config::MAX_ROTATE_FILES {
@@ -1775,37 +1673,10 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 30: `kv`'s separators. An empty one splits between every character, identical ones split
-    // every segment away from its own separator, and a `kv_sep` containing `pair_sep` never
-    // survives the `pair_sep` split, which runs first.
-    for (id, component) in &components {
-        if let ComponentKind::Kv { pair_sep, kv_sep, .. } = &component.kind {
-            if pair_sep.is_empty() {
-                anyhow::bail!("component '{id}': a kv 'pair_sep' must not be empty");
-            }
-            if kv_sep.is_empty() {
-                anyhow::bail!("component '{id}': a kv 'kv_sep' must not be empty");
-            }
-            if pair_sep == kv_sep {
-                anyhow::bail!(
-                    "component '{id}': a kv 'pair_sep' and 'kv_sep' must differ -- identical \
-                     separators mean every segment is split away from its own separator, so no \
-                     line could ever produce a pair"
-                );
-            }
-            if kv_sep.contains(pair_sep.as_str()) {
-                anyhow::bail!(
-                    "component '{id}': a kv 'kv_sep' must not contain 'pair_sep' -- it could \
-                     never appear intact inside a segment, since the 'pair_sep' split runs first"
-                );
-            }
-        }
-    }
-
     // Rule 31: `regex`. An empty `field` can't match (rule 19's reasoning); a pattern that fails to
-    // compile or has no named group is caught here rather than by `build_spec` at startup. The
-    // compiled `Regex` is dropped: `build_spec` rebuilds from the raw `ComponentKind`, like every
-    // kind. A duplicate group name needs no check; the `regex` crate rejects it.
+    // compile is caught here rather than by `build_spec` at startup. The compiled `Regex` is
+    // dropped: `build_spec` rebuilds from the raw `ComponentKind`, like every kind. A duplicate
+    // group name needs no check; the `regex` crate rejects it.
     for (id, component) in &components {
         if let ComponentKind::Regex { pattern, field } = &component.kind {
             if field.as_deref() == Some("") {
@@ -1814,30 +1685,18 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                      attribute -- omit 'field' to match the log message instead"
                 );
             }
-            let re = ::regex::Regex::new(pattern).map_err(|err| {
+            ::regex::Regex::new(pattern).map_err(|err| {
                 anyhow::anyhow!("component '{id}': 'pattern' is not a valid regex: {err}")
             })?;
-            if !re.capture_names().skip(1).any(|n| n.is_some()) {
-                anyhow::bail!(
-                    "component '{id}': a regex whose 'pattern' declares no named capture group \
-                     can only ever be a no-op -- name the groups you want as attributes, e.g. \
-                     (?P<status>\\d+)"
-                );
-            }
         }
     }
 
-    // Rule 32: `csv` (`docs/adr/csv-positional-columns.md`). No `columns` is a no-op, an empty name
-    // is no usable attribute, and a duplicate name would let the later field overwrite the earlier
-    // on every event (rule 4's reasoning, applied to columns). `"` is the quote character this
-    // parser frames fields with, and `\n`/`\r` are line framing every input already consumes.
+    // Rule 32: `csv` (`docs/adr/csv-positional-columns.md`). An empty name is no usable
+    // attribute, and a duplicate name would let the later field overwrite the earlier on every
+    // event (rule 4's reasoning, applied to columns). `"` is the quote character this parser
+    // frames fields with, and `\n`/`\r` are line framing every input already consumes.
     for (id, component) in &components {
         if let ComponentKind::Csv { columns, delimiter } = &component.kind {
-            if columns.is_empty() {
-                anyhow::bail!(
-                    "component '{id}': a csv with no 'columns' configured can only ever be a no-op"
-                );
-            }
             if columns.iter().any(|c| c.is_empty()) {
                 anyhow::bail!(
                     "component '{id}': a csv column name must not be empty -- it could never be \
@@ -1977,13 +1836,12 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
 
     // Rule 36: `has_attributes`/`drop_attributes` (`docs/adr/attribute-filtering-components.md`).
     // The maps and presence lists are conjunctions, so zero entries match every event:
-    // `has_attributes` forwards all (no-op) and `drop_attributes` drops all (black hole), the
-    // inverse of rule 21's list of alternatives. An empty key can't name an attribute; a
-    // non-finite value never compares equal under `crate::attributes`' coercing matcher. The same
-    // key in `resource:` and `attributes:` is legal: one addresses the batch, the other the event.
-    // Within one side, a key in both the map and its `_present` list is a redundancy (the pair
-    // already requires the key), and a key repeated in a list is a copy-paste mistake (rule 4's
-    // reasoning).
+    // `has_attributes` forwards all and `drop_attributes` discards all, as written. An empty key
+    // can't name an attribute; a non-finite value never compares equal under `crate::attributes`'
+    // coercing matcher. The same key in `resource:` and `attributes:` is legal: one addresses the
+    // batch, the other the event. Within one side, a key in both the map and its `_present` list is
+    // a redundancy (the pair already requires the key), and a key repeated in a list is a
+    // copy-paste mistake (rule 4's reasoning).
     for (id, component) in &components {
         let (kind_name, resource, attributes, resource_present, attributes_present) =
             match &component.kind {
@@ -2003,26 +1861,6 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                 }
                 _ => continue,
             };
-
-        if resource.is_empty()
-            && attributes.is_empty()
-            && resource_present.is_empty()
-            && attributes_present.is_empty()
-        {
-            if kind_name == "has_attributes" {
-                anyhow::bail!(
-                    "component '{id}': a has_attributes with none of 'resource', 'attributes', \
-                     'resource_present', or 'attributes_present' configured matches every \
-                     event -- a no-op that forwards every event untouched"
-                );
-            } else {
-                anyhow::bail!(
-                    "component '{id}': a drop_attributes with none of 'resource', 'attributes', \
-                     'resource_present', or 'attributes_present' configured matches every \
-                     event -- and so can only ever drop every one of them"
-                );
-            }
-        }
 
         for (map_name, map) in [("resource", resource), ("attributes", attributes)] {
             if map.keys().any(|key| key.is_empty()) {
@@ -2073,11 +1911,9 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
     }
 
     // Rule 37: `has_provenance`/`drop_provenance` (`docs/adr/provenance-filtering-components.md`).
-    // Oriented like rule 36, not rule 21, although each field is a list of alternatives: an empty
-    // `origin:`/`previous:` leaves that field out of the match (vacuously true) rather than
-    // matching zero alternatives, and the two AND'd fields decide. So with both empty
-    // `has_provenance` is the no-op and `drop_provenance` the black hole. An empty entry can't name
-    // a component id; a repeated one is a copy-paste mistake (rule 4's reasoning).
+    // An empty entry can't name a component id; a repeated one is a copy-paste mistake (rule 4's
+    // reasoning). An empty `origin:`/`previous:` leaves that field out of the match, so with both
+    // empty every batch matches, as with rule 36's empty maps.
     for (id, component) in &components {
         let (kind_name, origin, previous) = match &component.kind {
             ComponentKind::HasProvenance { origin, previous } => {
@@ -2088,21 +1924,6 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
             }
             _ => continue,
         };
-
-        if origin.is_empty() && previous.is_empty() {
-            if kind_name == "has_provenance" {
-                anyhow::bail!(
-                    "component '{id}': a has_provenance with neither 'origin' nor 'previous' \
-                     configured matches every batch -- a no-op that forwards every event \
-                     untouched"
-                );
-            } else {
-                anyhow::bail!(
-                    "component '{id}': a drop_provenance with neither 'origin' nor 'previous' \
-                     configured matches every batch -- and so can only ever drop every event"
-                );
-            }
-        }
 
         for (field_name, list) in [("origin", origin), ("previous", previous)] {
             if list.iter().any(|entry| entry.is_empty()) {
@@ -2322,29 +2143,23 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 42: a `generate_in`'s bounds and templates. `0` for a count means "generate nothing"
-    // (`None` spells unbounded/unthrottled). The template checks keep a mistyped placeholder from
-    // silently collapsing a scenario's cardinality. As with rule 31's `regex`, the parse result is
-    // dropped; `build_spec` re-derives from the raw `ComponentKind`.
+    // Rule 42: a `generate_in`'s bounds and templates. `count: 0` is legal and ends the listener at
+    // once. `batch: 0` and `rate: 0` are impossible bounds, which the generator would clamp to a
+    // batch of 1 and to no throttle, neither what `0` says. The template checks keep a mistyped
+    // placeholder from silently collapsing a scenario's cardinality. As with rule 31's `regex`, the
+    // parse result is dropped; `build_spec` re-derives from the raw `ComponentKind`.
     for (id, component) in &components {
-        let ComponentKind::GenerateIn { count, batch, rate, event, resource } = &component.kind
-        else {
+        let ComponentKind::GenerateIn { batch, rate, event, resource, .. } = &component.kind else {
             continue;
         };
-        if *count == Some(0) {
-            anyhow::bail!(
-                "component '{id}': count: 0 would generate nothing -- omit 'count' for an \
-                 unbounded run, or name a positive number of events"
-            );
-        }
         if *batch == 0 {
             anyhow::bail!(
-                "component '{id}': batch: 0 would generate nothing -- use a positive batch size"
+                "component '{id}': batch: 0 is an impossible batch size -- use a positive one"
             );
         }
         if *rate == Some(0) {
             anyhow::bail!(
-                "component '{id}': rate: 0 would generate nothing -- omit 'rate' to generate as \
+                "component '{id}': rate: 0 is an impossible rate -- omit 'rate' to generate as \
                  fast as backpressure allows"
             );
         }
@@ -2648,20 +2463,13 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
     }
 
     // Rule 54: `keep_values` (`docs/adr/value-allowlist-cardinality-clamp.md`), shaped like `set`
-    // and checked like rule 12, plus: an empty `allow` clamps every value, which `set`/`remove`
-    // already express, so the message names them; a non-finite `F64` never compares equal under
+    // and checked like rule 12, plus: a non-finite `F64` never compares equal under
     // `value_matches` (rule 36's reasoning); and under `normalize: [lower]` a `Str` literal that
     // isn't ASCII-lowercase could never be produced, and is rejected rather than lowercased so what
-    // validates is what the operator wrote. A repeated step is a no-op; an empty `normalize:` is
-    // the default.
+    // validates is what the operator wrote. A repeated step is a copy-paste mistake (rule 4's
+    // reasoning); an empty `normalize:` is the default.
     for (id, component) in &components {
         if let ComponentKind::KeepValues { resource, attributes } = &component.kind {
-            if resource.is_empty() && attributes.is_empty() {
-                anyhow::bail!(
-                    "component '{id}': a keep_values with neither 'resource' nor 'attributes' \
-                     configured can only ever be a no-op"
-                );
-            }
             for (map_name, map) in [("resource", resource), ("attributes", attributes)] {
                 for (field, allow_list) in map {
                     if field.is_empty() {
@@ -2670,20 +2478,13 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                              -- it could never name a real attribute"
                         );
                     }
-                    if allow_list.allow.is_empty() {
-                        anyhow::bail!(
-                            "component '{id}': keep_values '{map_name}.{field}' has an empty \
-                             'allow' list -- that clamps every value unconditionally, which is \
-                             what 'set' (with 'other:') or 'remove' (without it) already do"
-                        );
-                    }
                     let lower = allow_list.normalize.contains(&logit_config::NormalizeStep::Lower);
                     let mut seen_steps = std::collections::HashSet::new();
                     for step in &allow_list.normalize {
                         if !seen_steps.insert(step) {
                             anyhow::bail!(
                                 "component '{id}': keep_values '{map_name}.{field}' repeats a \
-                                 'normalize' step -- a duplicate can only ever be a no-op"
+                                 'normalize' step -- the repeat is a copy-paste mistake"
                             );
                         }
                     }
@@ -3026,52 +2827,13 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 58: a `shape` cap of `0` tracks nothing, so its cumulative gauges would read `0` (and
-    // `tracking_overflow` `1`) forever (`docs/adr/shape-observer-component.md`). There is no "table
-    // off" spelling: those gauges are half of what `shape` is for.
-    for (id, component) in &components {
-        if let ComponentKind::Shape { max_tracked_keys, max_tracked_keysets, .. } = &component.kind
-        {
-            for (field, value) in [
-                ("max_tracked_keys", *max_tracked_keys),
-                ("max_tracked_keysets", *max_tracked_keysets),
-            ] {
-                if value == 0 {
-                    anyhow::bail!(
-                        "component '{id}': shape '{field}' is 0 -- nothing would ever be tracked, \
-                         so every cumulative gauge would read 0 and 'logit.shape.tracking_overflow' \
-                         1 forever. Remove the component instead of capping it to nothing"
-                    );
-                }
-            }
-        }
-    }
-
-    // Rule 59: `flatten` (`docs/adr/flatten-transform.md`). Both fields `none` is a no-op; an empty
-    // named list meant `none` or `all`, so the message names both; an empty name can't match (rule
-    // 19's reasoning) and a repeated one is a no-op. `attributes: all`, the default, is legal.
+    // Rule 59: `flatten` (`docs/adr/flatten-transform.md`). An empty name can't match (rule 19's
+    // reasoning) and a repeated one is a copy-paste mistake (rule 4's). A selection of nothing,
+    // `none` or an empty list, is legal on either field.
     for (id, component) in &components {
         if let ComponentKind::Flatten { attributes, resource, .. } = &component.kind {
-            let selects_nothing = |fields: &logit_config::FlattenFields| {
-                matches!(
-                    fields,
-                    logit_config::FlattenFields::Keyword(logit_config::FlattenKeyword::None)
-                )
-            };
-            if selects_nothing(attributes) && selects_nothing(resource) {
-                anyhow::bail!(
-                    "component '{id}': a flatten with 'attributes: none' and 'resource: none' \
-                     can only ever be a no-op"
-                );
-            }
             for (field_name, fields) in [("attributes", attributes), ("resource", resource)] {
                 if let logit_config::FlattenFields::Named(names) = fields {
-                    if names.is_empty() {
-                        anyhow::bail!(
-                            "component '{id}': flatten '{field_name}' is an empty list -- write \
-                             'none' to mean nothing, or 'all' to mean every nested attribute"
-                        );
-                    }
                     let mut seen = std::collections::HashSet::new();
                     for name in names {
                         if name.is_empty() {
@@ -3083,7 +2845,7 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                         if !seen.insert(name.as_str()) {
                             anyhow::bail!(
                                 "component '{id}': flatten '{field_name}' repeats '{name}' -- a \
-                                 duplicate entry can only ever be a no-op"
+                                 duplicate entry is a copy-paste mistake"
                             );
                         }
                     }
@@ -3185,7 +2947,7 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                     );
                 }
             }
-            for (field, limit) in max_length {
+            for field in max_length.keys() {
                 if !logit_config::CAPPED_FIELDS.iter().any(|(name, _)| name == field) {
                     let valid: Vec<&str> =
                         logit_config::CAPPED_FIELDS.iter().map(|(name, _)| *name).collect();
@@ -3193,13 +2955,6 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                         "component '{id}': http_access 'max_length' names '{field}', which \
                          http_access never caps -- valid keys: {}",
                         valid.join(", ")
-                    );
-                }
-                if *limit == 0 {
-                    anyhow::bail!(
-                        "component '{id}': http_access 'max_length' for '{field}' is 0 -- that \
-                         would empty the field on every event; remove the attribute downstream \
-                         instead"
                     );
                 }
             }
@@ -3214,9 +2969,9 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
 
     // Rule 61: `sample` (`docs/adr/consistent-sampling-component.md`). The rate range is rule 16's,
     // since `sampling::keep` shares `trace_is_sampled`'s NaN-keeps-everything fallback. `rate: 1`
-    // keeps everything and `rate: 0` alone keeps nothing; `rate: 0` with `always_keep` is the "only
-    // flagged events" mode. A non-finite override value never compares equal under `value_matches`
-    // (rules 36/54); `missing:` means nothing without `key:`.
+    // keeps every event and `rate: 0` keeps only what `always_keep` flags or `missing: keep` keeps,
+    // as written. A non-finite override value never compares equal under `value_matches` (rules
+    // 36/54); `missing:` means nothing without `key:`.
     for (id, component) in &components {
         if let ComponentKind::Sample { rate, key, missing, always_keep } = &component.kind {
             if !rate.is_finite() {
@@ -3227,19 +2982,6 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
             if !(0.0..=1.0).contains(rate) {
                 anyhow::bail!(
                     "component '{id}': sample 'rate' must be between 0.0 and 1.0, got {rate}"
-                );
-            }
-            if *rate == 1.0 {
-                anyhow::bail!(
-                    "component '{id}': a sample with 'rate: 1' keeps every event and can only \
-                     ever be a no-op -- remove the component instead"
-                );
-            }
-            if *rate == 0.0 && always_keep.is_none() {
-                anyhow::bail!(
-                    "component '{id}': a sample with 'rate: 0' and no 'always_keep' drops every \
-                     event -- that is what 'null_out' does; add 'always_keep' to keep only flagged \
-                     events"
                 );
             }
             match key {
@@ -4243,7 +3985,9 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 94: `cumulative_to_delta` (`docs/adr/cumulative-to-delta-transform.md`).
+    // Rule 94: `cumulative_to_delta` (`docs/adr/cumulative-to-delta-transform.md`). Both bounds
+    // are impossible at `0`: a zero `max_staleness` evicts every series at the next batch, so no
+    // point is ever differenced, and the transform would clamp a zero `max_series` to `1`.
     for (id, component) in &components {
         let ComponentKind::CumulativeToDelta { max_staleness, max_series, .. } = &component.kind
         else {
@@ -4252,14 +3996,27 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         if max_staleness.is_zero() {
             anyhow::bail!(
                 "component '{id}': cumulative_to_delta 'max_staleness' must be greater than 0s -- \
-                 set it above the longest gap between a producer's reports"
+                 at 0s every series is forgotten at the next batch; set it above the longest gap \
+                 between a producer's reports"
             );
         }
         if *max_series == 0 {
             anyhow::bail!(
-                "component '{id}': cumulative_to_delta 'max_series' must be at least 1 -- at 0 \
-                 no series could be tracked, so nothing would convert"
+                "component '{id}': cumulative_to_delta 'max_series' must be at least 1 -- 0 is an \
+                 impossible bound"
             );
+        }
+    }
+
+    // Rule 96: `dedup_timestamps` (`docs/adr/dedup-timestamps-transform.md`).
+    for (id, component) in &components {
+        if let ComponentKind::DedupTimestamps { precision } = &component.kind {
+            if precision.is_zero() {
+                anyhow::bail!(
+                    "component '{id}': dedup_timestamps 'precision' must be greater than 0s -- \
+                     use 1ms in front of remote-write, 1s in front of datadog_out"
+                );
+            }
         }
     }
 
@@ -4501,12 +4258,6 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
     // order.
     for (id, component) in &components {
         let ComponentKind::Bucket { attributes } = &component.kind else { continue };
-        if attributes.is_empty() {
-            anyhow::bail!(
-                "component '{id}': a bucket with no 'attributes' configured can only ever be a \
-                 no-op"
-            );
-        }
         let mut intos: HashMap<&str, &str> = HashMap::new();
         for (field, spec) in attributes {
             if field.is_empty() {
@@ -5717,43 +5468,17 @@ mod tests {
     }
 
     #[test]
-    fn kv_with_an_empty_pair_sep_is_rejected() {
-        let err = expect_err(cfg(vec![
-            ("in", vec![], listener()),
-            ("parse", vec!["in"], kv("", "=")),
-            ("out", vec!["parse"], sink()),
-        ]));
-        assert!(err.contains("pair_sep") && err.contains("empty"), "got: {err}");
-    }
-
-    #[test]
-    fn kv_with_an_empty_kv_sep_is_rejected() {
-        let err = expect_err(cfg(vec![
-            ("in", vec![], listener()),
-            ("parse", vec!["in"], kv("&", "")),
-            ("out", vec!["parse"], sink()),
-        ]));
-        assert!(err.contains("kv_sep") && err.contains("empty"), "got: {err}");
-    }
-
-    #[test]
-    fn kv_with_identical_separators_is_rejected() {
-        let err = expect_err(cfg(vec![
-            ("in", vec![], listener()),
-            ("parse", vec!["in"], kv("=", "=")),
-            ("out", vec!["parse"], sink()),
-        ]));
-        assert!(err.contains("must differ"), "got: {err}");
-    }
-
-    #[test]
-    fn kv_with_a_kv_sep_containing_pair_sep_is_rejected() {
-        let err = expect_err(cfg(vec![
-            ("in", vec![], listener()),
-            ("parse", vec!["in"], kv("=", "==")),
-            ("out", vec!["parse"], sink()),
-        ]));
-        assert!(err.contains("must not contain"), "got: {err}");
+    fn kv_with_degenerate_separators_resolves() {
+        // Each runs: an empty `pair_sep` reads the line as one segment, and the rest find no
+        // pair, so the event passes through with a `parse_failure` warning.
+        for (pair_sep, kv_sep) in [("", "="), ("&", ""), ("=", "="), ("=", "==")] {
+            resolve(cfg(vec![
+                ("in", vec![], listener()),
+                ("parse", vec!["in"], kv(pair_sep, kv_sep)),
+                ("out", vec!["parse"], sink()),
+            ]))
+            .unwrap_or_else(|err| panic!("{pair_sep:?}/{kv_sep:?} should resolve: {err}"));
+        }
     }
 
     #[test]
@@ -5809,8 +5534,8 @@ mod tests {
     }
 
     #[test]
-    fn a_kv_metrics_with_no_lists_configured_is_rejected() {
-        let err = expect_err(cfg(vec![
+    fn a_kv_metrics_with_no_lists_configured_resolves() {
+        resolve(cfg(vec![
             ("in", vec![], listener()),
             (
                 "derive",
@@ -5822,8 +5547,8 @@ mod tests {
                 },
             ),
             ("out", vec!["derive"], sink()),
-        ]));
-        assert!(err.contains("no-op"), "got: {err}");
+        ]))
+        .expect("a kv_metrics with nothing configured is legal");
     }
 
     #[test]
@@ -5899,37 +5624,26 @@ mod tests {
     }
 
     #[test]
-    fn a_has_signal_with_an_empty_signals_list_is_rejected() {
-        let err = expect_err(cfg(vec![
-            ("in", vec![], listener()),
-            (
-                "filter",
-                vec!["in"],
-                ComponentKind::HasSignal { signals: vec![], mode: logit_config::MatchMode::AnyOf },
-            ),
-            ("out", vec!["filter"], sink()),
-        ]));
-        assert!(err.contains("must name at least one signal"), "got: {err}");
+    fn a_signal_filter_with_an_empty_list_resolves() {
+        // An empty list does what it says: `has_signal` and `keep_signals` drop every event,
+        // `drop_signals` clears nothing. The transforms' tests pin the runtime behavior.
+        for kind in [
+            ComponentKind::HasSignal { signals: vec![], mode: logit_config::MatchMode::AnyOf },
+            ComponentKind::KeepSignals { signals: vec![] },
+            ComponentKind::DropSignals { signals: vec![] },
+        ] {
+            resolve(cfg(vec![
+                ("in", vec![], listener()),
+                ("filter", vec!["in"], kind),
+                ("out", vec!["filter"], sink()),
+            ]))
+            .expect("an empty signals list is legal");
+        }
     }
 
     #[test]
-    fn a_keep_signals_with_an_empty_signals_list_is_rejected() {
-        let err = expect_err(cfg(vec![
-            ("in", vec![], listener()),
-            ("filter", vec!["in"], ComponentKind::KeepSignals { signals: vec![] }),
-            ("out", vec!["filter"], sink()),
-        ]));
-        assert!(err.contains("must name at least one signal"), "got: {err}");
-        assert!(
-            err.contains("keeps nothing"),
-            "a keep_signals with an empty list is the black-hole shape (drops every event), \
-             not the no-op shape -- got: {err}"
-        );
-    }
-
-    #[test]
-    fn a_drop_signals_naming_all_three_signals_is_rejected() {
-        let err = expect_err(cfg(vec![
+    fn a_drop_signals_naming_all_three_signals_resolves() {
+        resolve(cfg(vec![
             ("in", vec![], listener()),
             (
                 "filter",
@@ -5943,20 +5657,15 @@ mod tests {
                 },
             ),
             ("out", vec!["filter"], sink()),
-        ]));
-        assert!(err.contains("names all three signals"), "got: {err}");
-        assert!(
-            err.contains("drops everything"),
-            "a drop_signals naming all three signals is the black-hole shape (drops every \
-             event), not the no-op shape -- got: {err}"
-        );
+        ]))
+        .expect("drop_signals naming every payload signal is legal");
     }
 
     #[test]
-    fn a_keep_signals_naming_all_three_signals_is_rejected_as_a_no_op_not_a_black_hole() {
-        // The inverse of the drop_signals case above: for keep_signals (an allowlist), naming
-        // all three signals keeps everything -- a no-op, not the "drop every event" black hole.
-        let err = expect_err(cfg(vec![
+    fn a_keep_signals_naming_all_three_signals_resolves() {
+        // Naming all three keeps every payload and drops an event that arrived with none, so it
+        // is a filter, not a no-op. `KeepSignals`' own tests pin the drop.
+        resolve(cfg(vec![
             ("in", vec![], listener()),
             (
                 "filter",
@@ -5970,39 +5679,21 @@ mod tests {
                 },
             ),
             ("out", vec!["filter"], sink()),
-        ]));
-        assert!(err.contains("names all three signals"), "got: {err}");
-        assert!(
-            err.contains("keeps everything") && err.contains("no-op"),
-            "a keep_signals naming all three signals is the no-op shape (keeps every event \
-             untouched), not the black-hole shape -- got: {err}"
-        );
+        ]))
+        .expect("keep_signals naming every payload signal is legal");
     }
 
     #[test]
-    fn a_drop_signals_naming_none_is_rejected() {
-        let err = expect_err(cfg(vec![
-            ("in", vec![], listener()),
-            (
-                "filter",
-                vec!["in"],
-                ComponentKind::DropSignals {
-                    signals: vec![logit_config::Signal::Metrics, logit_config::Signal::None],
-                },
-            ),
-            ("out", vec!["filter"], sink()),
-        ]));
-        assert!(err.contains("may not name none"), "got: {err}");
-    }
-
-    #[test]
-    fn has_signal_and_keep_signals_naming_none_resolve() {
+    fn every_signal_filter_naming_none_resolves() {
         for kind in [
             ComponentKind::HasSignal {
                 signals: vec![logit_config::Signal::None],
                 mode: logit_config::MatchMode::Only,
             },
             ComponentKind::KeepSignals {
+                signals: vec![logit_config::Signal::Metrics, logit_config::Signal::None],
+            },
+            ComponentKind::DropSignals {
                 signals: vec![logit_config::Signal::Metrics, logit_config::Signal::None],
             },
         ] {
@@ -6016,26 +5707,9 @@ mod tests {
     }
 
     #[test]
-    fn a_drop_signals_with_an_empty_signals_list_is_rejected_as_a_no_op_not_a_black_hole() {
-        // The inverse of the keep_signals-empty case: for drop_signals (a denylist), an empty
-        // list drops nothing -- a no-op, not the "drop every event" black hole.
-        let err = expect_err(cfg(vec![
-            ("in", vec![], listener()),
-            ("filter", vec!["in"], ComponentKind::DropSignals { signals: vec![] }),
-            ("out", vec!["filter"], sink()),
-        ]));
-        assert!(err.contains("must name at least one signal"), "got: {err}");
-        assert!(
-            err.contains("drops nothing") && err.contains("no-op"),
-            "a drop_signals with an empty list is the no-op shape (forwards every event \
-             untouched), not the black-hole shape -- got: {err}"
-        );
-    }
-
-    #[test]
     fn a_has_signal_naming_all_three_signals_resolves_fine() {
-        // Unlike `keep_signals`/`drop_signals`, `has_signal` naming all three signals is a real,
-        // permissive filter under `mode: only` ("forward anything with a payload"), not a no-op.
+        // Unlike `drop_signals`, `has_signal` naming all three signals is a real, permissive
+        // filter under `mode: only` ("forward anything with a payload"), not a black hole.
         resolve(cfg(vec![
             ("in", vec![], listener()),
             (
@@ -6076,51 +5750,30 @@ mod tests {
     }
 
     #[test]
-    fn a_has_attributes_with_neither_map_configured_is_rejected_as_a_no_op() {
-        let err = expect_err(cfg(vec![
-            ("in", vec![], listener()),
-            (
-                "filter",
-                vec!["in"],
-                ComponentKind::HasAttributes {
-                    resource: std::collections::BTreeMap::new(),
-                    attributes: std::collections::BTreeMap::new(),
-                    resource_present: Vec::new(),
-                    attributes_present: Vec::new(),
-                },
-            ),
-            ("out", vec!["filter"], sink()),
-        ]));
-        assert!(
-            err.contains("no-op") && err.contains("forwards every event untouched"),
-            "a has_attributes with nothing configured is the no-op shape (matches every event), \
-             not the black-hole shape -- got: {err}"
-        );
-    }
-
-    #[test]
-    fn a_drop_attributes_with_neither_map_configured_is_rejected_as_a_black_hole() {
-        // The inverse of the has_attributes case above: nothing configured matches every event
-        // too, but for drop_attributes that means dropping every one of them.
-        let err = expect_err(cfg(vec![
-            ("in", vec![], listener()),
-            (
-                "filter",
-                vec!["in"],
-                ComponentKind::DropAttributes {
-                    resource: std::collections::BTreeMap::new(),
-                    attributes: std::collections::BTreeMap::new(),
-                    resource_present: Vec::new(),
-                    attributes_present: Vec::new(),
-                },
-            ),
-            ("out", vec!["filter"], sink()),
-        ]));
-        assert!(
-            err.contains("drop every one of them"),
-            "a drop_attributes with nothing configured is the black-hole shape (drops every \
-             event), not the no-op shape -- got: {err}"
-        );
+    fn an_attribute_filter_with_nothing_configured_resolves() {
+        // Zero pairs match every event: `has_attributes` forwards all and `drop_attributes`
+        // discards all. `crate::attributes`' tests pin the runtime behavior.
+        for kind in [
+            ComponentKind::HasAttributes {
+                resource: std::collections::BTreeMap::new(),
+                attributes: std::collections::BTreeMap::new(),
+                resource_present: Vec::new(),
+                attributes_present: Vec::new(),
+            },
+            ComponentKind::DropAttributes {
+                resource: std::collections::BTreeMap::new(),
+                attributes: std::collections::BTreeMap::new(),
+                resource_present: Vec::new(),
+                attributes_present: Vec::new(),
+            },
+        ] {
+            resolve(cfg(vec![
+                ("in", vec![], listener()),
+                ("filter", vec!["in"], kind),
+                ("out", vec!["filter"], sink()),
+            ]))
+            .expect("an attribute filter with nothing configured is legal");
+        }
     }
 
     #[test]
@@ -6225,60 +5878,20 @@ mod tests {
     }
 
     #[test]
-    fn a_has_attributes_with_all_four_fields_empty_is_still_a_no_op() {
-        let err = expect_err(cfg(vec![
-            ("in", vec![], listener()),
-            (
-                "filter",
-                vec!["in"],
-                ComponentKind::HasAttributes {
-                    resource: std::collections::BTreeMap::new(),
-                    attributes: std::collections::BTreeMap::new(),
-                    resource_present: vec![],
-                    attributes_present: vec![],
-                },
-            ),
-            ("out", vec!["filter"], sink()),
-        ]));
-        assert!(err.contains("resource_present"), "got: {err}");
-    }
-
-    #[test]
-    fn a_has_provenance_with_neither_field_configured_is_rejected_as_a_no_op() {
-        let err = expect_err(cfg(vec![
-            ("in", vec![], listener()),
-            (
-                "filter",
-                vec!["in"],
-                ComponentKind::HasProvenance { origin: vec![], previous: vec![] },
-            ),
-            ("out", vec!["filter"], sink()),
-        ]));
-        assert!(
-            err.contains("no-op") && err.contains("forwards every event untouched"),
-            "a has_provenance with nothing configured is the no-op shape (matches every batch), \
-             not the black-hole shape -- got: {err}"
-        );
-    }
-
-    #[test]
-    fn a_drop_provenance_with_neither_field_configured_is_rejected_as_a_black_hole() {
-        // The inverse of the has_provenance case above: nothing configured matches every batch
-        // too, but for drop_provenance that means dropping every one of them.
-        let err = expect_err(cfg(vec![
-            ("in", vec![], listener()),
-            (
-                "filter",
-                vec!["in"],
-                ComponentKind::DropProvenance { origin: vec![], previous: vec![] },
-            ),
-            ("out", vec!["filter"], sink()),
-        ]));
-        assert!(
-            err.contains("drop every event"),
-            "a drop_provenance with nothing configured is the black-hole shape (drops every \
-             event), not the no-op shape -- got: {err}"
-        );
+    fn a_provenance_filter_with_nothing_configured_resolves() {
+        // Both fields empty match every batch: `has_provenance` forwards all and
+        // `drop_provenance` discards all.
+        for kind in [
+            ComponentKind::HasProvenance { origin: vec![], previous: vec![] },
+            ComponentKind::DropProvenance { origin: vec![], previous: vec![] },
+        ] {
+            resolve(cfg(vec![
+                ("in", vec![], listener()),
+                ("filter", vec!["in"], kind),
+                ("out", vec!["filter"], sink()),
+            ]))
+            .expect("a provenance filter with nothing configured is legal");
+        }
     }
 
     #[test]
@@ -6718,8 +6331,8 @@ mod tests {
     }
 
     #[test]
-    fn a_set_with_neither_map_configured_is_rejected() {
-        let err = expect_err(cfg(vec![
+    fn a_set_with_neither_map_configured_resolves() {
+        resolve(cfg(vec![
             ("in", vec![], listener()),
             (
                 "identity",
@@ -6730,8 +6343,8 @@ mod tests {
                 },
             ),
             ("out", vec!["identity"], sink()),
-        ]));
-        assert!(err.contains("no-op"), "got: {err}");
+        ]))
+        .expect("a set with nothing configured is legal");
     }
 
     #[test]
@@ -6775,7 +6388,7 @@ mod tests {
             ("trace", vec!["in"], trace_context("")),
             ("out", vec!["trace"], sink()),
         ]));
-        assert!(err.contains("no-op"), "got: {err}");
+        assert!(err.contains("empty 'trace_id' field name could never match"), "got: {err}");
     }
 
     #[test]
@@ -6896,8 +6509,8 @@ mod tests {
     }
 
     #[test]
-    fn a_scale_with_no_fields_configured_is_rejected() {
-        let err = expect_err(cfg(vec![
+    fn a_scale_with_no_fields_configured_resolves() {
+        resolve(cfg(vec![
             ("in", vec![], listener()),
             (
                 "scale",
@@ -6905,8 +6518,8 @@ mod tests {
                 ComponentKind::Scale { fields: std::collections::BTreeMap::new() },
             ),
             ("out", vec!["scale"], sink()),
-        ]));
-        assert!(err.contains("no-op"), "got: {err}");
+        ]))
+        .expect("a scale with no fields is legal");
     }
 
     #[test]
@@ -6975,20 +6588,28 @@ mod tests {
     }
 
     #[test]
-    fn a_keep_values_with_neither_map_configured_is_rejected() {
-        let err = expect_err(cfg(vec![
-            ("in", vec![], listener()),
-            (
-                "kv",
-                vec!["in"],
-                ComponentKind::KeepValues {
-                    resource: std::collections::BTreeMap::new(),
-                    attributes: std::collections::BTreeMap::new(),
-                },
-            ),
-            ("out", vec!["kv"], sink()),
-        ]));
-        assert!(err.contains("no-op"), "got: {err}");
+    fn a_keep_values_with_nothing_configured_or_an_empty_allow_resolves() {
+        for attributes in [
+            std::collections::BTreeMap::new(),
+            std::collections::BTreeMap::from([(
+                "host".to_string(),
+                allow_list(vec![], vec![], None),
+            )]),
+        ] {
+            resolve(cfg(vec![
+                ("in", vec![], listener()),
+                (
+                    "kv",
+                    vec!["in"],
+                    ComponentKind::KeepValues {
+                        resource: std::collections::BTreeMap::new(),
+                        attributes,
+                    },
+                ),
+                ("out", vec!["kv"], sink()),
+            ]))
+            .expect("an empty keep_values or allow list is legal");
+        }
     }
 
     #[test]
@@ -7013,27 +6634,6 @@ mod tests {
             ("out", vec!["kv"], sink()),
         ]));
         assert!(err.contains("empty"), "got: {err}");
-    }
-
-    #[test]
-    fn a_keep_values_with_an_empty_allow_list_is_rejected() {
-        let err = expect_err(cfg(vec![
-            ("in", vec![], listener()),
-            (
-                "kv",
-                vec!["in"],
-                ComponentKind::KeepValues {
-                    resource: std::collections::BTreeMap::new(),
-                    attributes: std::collections::BTreeMap::from([(
-                        "host".to_string(),
-                        allow_list(vec![], vec![], None),
-                    )]),
-                },
-            ),
-            ("out", vec!["kv"], sink()),
-        ]));
-        assert!(err.contains("'allow'"), "got: {err}");
-        assert!(err.contains("set"), "message should name the alternative -- got: {err}");
     }
 
     #[test]
@@ -7245,34 +6845,24 @@ mod tests {
         assert!(err.contains("interval"), "{err}");
     }
 
-    /// Rule 58, key half.
     #[test]
-    fn a_shape_with_a_zero_key_cap_is_rejected() {
-        let mut kind = shape_defaults();
-        if let ComponentKind::Shape { max_tracked_keys, .. } = &mut kind {
-            *max_tracked_keys = 0;
+    fn a_shape_with_a_zero_cap_resolves() {
+        for keys_zero in [true, false] {
+            let mut kind = shape_defaults();
+            if let ComponentKind::Shape { max_tracked_keys, max_tracked_keysets, .. } = &mut kind {
+                if keys_zero {
+                    *max_tracked_keys = 0;
+                } else {
+                    *max_tracked_keysets = 0;
+                }
+            }
+            resolve(cfg(vec![
+                ("in", vec![], listener()),
+                ("tap", vec!["in"], kind),
+                ("out", vec!["tap"], sink()),
+            ]))
+            .expect("a shape cap of 0 is legal");
         }
-        let err = expect_err(cfg(vec![
-            ("in", vec![], listener()),
-            ("tap", vec!["in"], kind),
-            ("out", vec!["tap"], sink()),
-        ]));
-        assert!(err.contains("max_tracked_keys"), "{err}");
-    }
-
-    /// Rule 58, key-set half.
-    #[test]
-    fn a_shape_with_a_zero_keyset_cap_is_rejected() {
-        let mut kind = shape_defaults();
-        if let ComponentKind::Shape { max_tracked_keysets, .. } = &mut kind {
-            *max_tracked_keysets = 0;
-        }
-        let err = expect_err(cfg(vec![
-            ("in", vec![], listener()),
-            ("tap", vec!["in"], kind),
-            ("out", vec!["tap"], sink()),
-        ]));
-        assert!(err.contains("max_tracked_keysets"), "{err}");
     }
 
     // ---- Rule 94: `cumulative_to_delta` -----------------------------------------------------------
@@ -7301,6 +6891,25 @@ mod tests {
         assert!(err.contains("'max_staleness' must be greater than 0s"), "got: {err}");
         let err = timestamp_err(cumulative_to_delta(Duration::from_secs(3600), 0));
         assert!(err.contains("'max_series' must be at least 1"), "got: {err}");
+    }
+
+    // ---- Rule 96: `dedup_timestamps` --------------------------------------------------------------
+
+    #[test]
+    fn a_dedup_timestamps_with_a_positive_precision_resolves_as_a_transform() {
+        let graph = resolve_timestamp(ComponentKind::DedupTimestamps {
+            precision: Duration::from_millis(1),
+        })
+        .expect("should resolve");
+        assert_eq!(graph.components["stamped"].role(), Role::Transform);
+        assert_eq!(graph.components["stamped"].kind_name(), "dedup_timestamps");
+    }
+
+    /// Rule 96: a zero `precision` is rejected.
+    #[test]
+    fn a_dedup_timestamps_with_a_zero_precision_is_rejected() {
+        let err = timestamp_err(ComponentKind::DedupTimestamps { precision: Duration::ZERO });
+        assert!(err.contains("'precision' must be greater than 0s"), "got: {err}");
     }
 
     // ---- Rule 87: `has_stale`/`drop_stale` --------------------------------------------------------
@@ -7536,18 +7145,17 @@ mod tests {
         }
     }
 
-    /// Rule 61: `rate: 1` is a no-op.
+    /// Rule 61: `rate: 1` keeps every event and `rate: 0` alone discards every one; both are legal.
     #[test]
-    fn a_sample_at_rate_one_is_rejected() {
-        let err = sample_err(sample_at(1.0));
-        assert!(err.contains("no-op"), "got: {err}");
-    }
-
-    /// Rule 61: `rate: 0` alone drops everything.
-    #[test]
-    fn a_sample_at_rate_zero_without_always_keep_is_rejected() {
-        let err = sample_err(sample_at(0.0));
-        assert!(err.contains("null_out"), "got: {err}");
+    fn a_sample_at_rate_one_or_zero_resolves() {
+        for rate in [1.0, 0.0] {
+            resolve(cfg(vec![
+                ("in", vec![], listener()),
+                ("sampled", vec!["in"], sample_at(rate)),
+                ("out", vec!["sampled"], sink()),
+            ]))
+            .unwrap_or_else(|err| panic!("rate {rate} should resolve: {err}"));
+        }
     }
 
     /// Rule 61: empty key field names.
@@ -9269,33 +8877,25 @@ mod tests {
     }
 
     #[test]
-    fn a_flatten_with_both_fields_set_to_none_is_rejected() {
-        let kind = ComponentKind::Flatten {
-            attributes: logit_config::FlattenFields::Keyword(logit_config::FlattenKeyword::None),
-            resource: logit_config::FlattenFields::Keyword(logit_config::FlattenKeyword::None),
-            arrays: logit_config::FlattenArrays::Index,
-        };
-        let err = expect_err(cfg(vec![
-            ("in", vec![], listener()),
-            ("flat", vec!["in"], kind),
-            ("out", vec!["flat"], sink()),
-        ]));
-        assert!(err.contains("no-op"), "got: {err}");
-    }
-
-    #[test]
-    fn a_flatten_with_an_empty_named_list_is_rejected() {
-        let kind = ComponentKind::Flatten {
-            attributes: logit_config::FlattenFields::Named(vec![]),
-            resource: logit_config::FlattenFields::Keyword(logit_config::FlattenKeyword::None),
-            arrays: logit_config::FlattenArrays::Index,
-        };
-        let err = expect_err(cfg(vec![
-            ("in", vec![], listener()),
-            ("flat", vec!["in"], kind),
-            ("out", vec!["flat"], sink()),
-        ]));
-        assert!(err.contains("empty list"), "got: {err}");
+    fn a_flatten_that_selects_nothing_resolves() {
+        let none = || logit_config::FlattenFields::Keyword(logit_config::FlattenKeyword::None);
+        for (attributes, resource) in [
+            (none(), none()),
+            (logit_config::FlattenFields::Named(vec![]), none()),
+            (none(), logit_config::FlattenFields::Named(vec![])),
+        ] {
+            let kind = ComponentKind::Flatten {
+                attributes,
+                resource,
+                arrays: logit_config::FlattenArrays::Index,
+            };
+            resolve(cfg(vec![
+                ("in", vec![], listener()),
+                ("flat", vec!["in"], kind),
+                ("out", vec!["flat"], sink()),
+            ]))
+            .expect("a flatten that selects nothing is legal");
+        }
     }
 
     #[test]
@@ -9552,15 +9152,19 @@ mod tests {
         assert!(err.contains("'url.paths'") && err.contains("valid keys: url.path,"), "{err}");
     }
 
-    /// Rule 60: a `max_length` of `0`.
+    /// Rule 60: a `max_length` of `0` is legal; the field becomes `""`, counted as truncated.
     #[test]
-    fn an_http_access_zero_max_length_is_rejected() {
-        let err = http_access_err(|kind| {
-            if let ComponentKind::HttpAccess { max_length, .. } = kind {
-                max_length.insert("url.path".to_string(), 0);
-            }
-        });
-        assert!(err.contains("'url.path' is 0"), "{err}");
+    fn an_http_access_zero_max_length_resolves() {
+        let mut kind = http_access_defaults();
+        if let ComponentKind::HttpAccess { max_length, .. } = &mut kind {
+            max_length.insert("url.path".to_string(), 0);
+        }
+        resolve(cfg(vec![
+            ("in", vec![], listener()),
+            ("http", vec!["in"], kind),
+            ("out", vec!["http"], sink()),
+        ]))
+        .expect("max_length: 0 is legal");
     }
 
     /// Rule 60 has nothing to check on `forwarded`: every header it can name validates.
@@ -9639,8 +9243,8 @@ mod tests {
     }
 
     #[test]
-    fn a_regex_with_no_named_capture_groups_is_rejected() {
-        let err = expect_err(cfg(vec![
+    fn a_regex_with_no_named_capture_groups_resolves() {
+        resolve(cfg(vec![
             ("in", vec![], listener()),
             (
                 "regex",
@@ -9648,8 +9252,8 @@ mod tests {
                 ComponentKind::Regex { pattern: r"(\d+)".to_string(), field: None },
             ),
             ("out", vec!["regex"], sink()),
-        ]));
-        assert!(err.contains("no-op"), "got: {err}");
+        ]))
+        .expect("a regex with no named group is legal");
     }
 
     #[test]
@@ -9684,13 +9288,13 @@ mod tests {
     }
 
     #[test]
-    fn a_csv_with_no_columns_is_rejected() {
-        let err = expect_err(cfg(vec![
+    fn a_csv_with_no_columns_resolves() {
+        resolve(cfg(vec![
             ("in", vec![], listener()),
             ("csv", vec!["in"], ComponentKind::Csv { columns: vec![], delimiter: ',' }),
             ("out", vec!["csv"], sink()),
-        ]));
-        assert!(err.contains("no-op"), "got: {err}");
+        ]))
+        .expect("a csv with no columns is legal");
     }
 
     #[test]
@@ -10276,13 +9880,13 @@ mod tests {
     }
 
     #[test]
-    fn a_route_with_empty_routes_is_rejected() {
-        let err = expect_err(cfg_with_targets(vec![
+    fn a_route_with_empty_routes_resolves() {
+        resolve(cfg_with_targets(vec![
             ("in", vec![], vec![], listener()),
             ("r", vec!["in"], vec![], route(by_attribute("stream"), &[])),
             ("out", vec!["r"], vec![], sink()),
-        ]));
-        assert!(err.contains("no 'routes' configured can only ever be a no-op"), "got: {err}");
+        ]))
+        .expect("a route with no routes forwards every event and is legal");
     }
 
     #[test]
@@ -10512,14 +10116,14 @@ mod tests {
         );
     }
 
-    /// Rule 92's shape clause: a `route_signals` naming no signal would discard everything.
+    /// Rule 92's shape clause: a `route_signals` naming no signal discards every event, counted.
     #[test]
-    fn a_route_signals_with_no_signal_set_is_rejected() {
-        let err = expect_err(cfg_with_targets(vec![
+    fn a_route_signals_with_no_signal_set_resolves() {
+        resolve(cfg_with_targets(vec![
             ("in", vec![], vec![], listener()),
             ("by_signal", vec!["in"], vec![], route_signals(None, None, None, true)),
-        ]));
-        assert!(err.contains("a route_signals with no 'signals' entry"), "got: {err}");
+        ]))
+        .expect("a route_signals with no entry set is legal");
     }
 
     /// Rule 92's shape clause runs before rule 48, so an empty id is reported as empty.
@@ -11403,11 +11007,9 @@ mod tests {
     }
 
     #[test]
-    fn tail_in_with_no_paths_is_rejected() {
-        let err =
-            expect_err(cfg(vec![("in", vec![], tail_in(vec![])), ("out", vec!["in"], sink())]));
-        assert!(err.contains("'in'"), "got: {err}");
-        assert!(err.contains("'paths' must name at least one file"), "got: {err}");
+    fn tail_in_with_no_paths_resolves() {
+        resolve(cfg(vec![("in", vec![], tail_in(vec![])), ("out", vec!["in"], sink())]))
+            .expect("a tail_in with no paths idles and is legal");
     }
 
     #[test]
@@ -11452,13 +11054,9 @@ mod tests {
     }
 
     #[test]
-    fn docker_in_with_no_containers_and_no_discover_is_rejected() {
-        let err = expect_err(cfg(vec![
-            ("in", vec![], docker_in(vec![], false)),
-            ("out", vec!["in"], sink()),
-        ]));
-        assert!(err.contains("'in'"), "got: {err}");
-        assert!(err.contains("must name at least one container"), "got: {err}");
+    fn docker_in_with_no_containers_and_no_discover_resolves() {
+        resolve(cfg(vec![("in", vec![], docker_in(vec![], false)), ("out", vec!["in"], sink())]))
+            .expect("a docker_in that follows no container idles and is legal");
     }
 
     #[test]
@@ -11567,17 +11165,12 @@ mod tests {
     }
 
     #[test]
-    fn file_out_with_neither_rotate_trigger_set_is_rejected() {
-        let err = expect_err(cfg(vec![
+    fn file_out_with_neither_rotate_trigger_set_resolves() {
+        resolve(cfg(vec![
             ("in", vec![], listener()),
             ("out", vec!["in"], file_out(logit_config::RotateConfig::default())),
-        ]));
-        assert!(err.contains("'out'"), "got: {err}");
-        assert!(
-            err.contains("needs at least one of 'rotate.max_bytes' or 'rotate.interval'"),
-            "got: {err}"
-        );
-        assert!(err.contains("'target: events.log'"), "got: {err}");
+        ]))
+        .expect("a file_out that never rotates is legal");
     }
 
     #[test]
@@ -14455,12 +14048,12 @@ mod tests {
     }
 
     #[test]
-    fn a_zero_generate_in_count_is_rejected() {
-        let err = expect_err(cfg(vec![
+    fn a_zero_generate_in_count_resolves() {
+        resolve(cfg(vec![
             ("gen", vec![], generate_in_with_counts(Some(0), 100, None)),
             ("sink", vec!["gen"], null_out()),
-        ]));
-        assert!(err.contains("'gen'") && err.contains("count: 0"), "got: {err}");
+        ]))
+        .expect("count: 0 ends the generator at once and is legal");
     }
 
     #[test]
@@ -16051,9 +15644,13 @@ mod tests {
     }
 
     #[test]
+    fn a_bucket_with_no_attributes_resolves() {
+        resolve(cfg_with_bucket("{}")).expect("a bucket with no attributes is legal");
+    }
+
+    #[test]
     fn rule_82_rejects_each_malformed_bucket() {
         for (attributes, expected) in [
-            (r#"{}"#, "no 'attributes'"),
             (r#"{"": {"into": "c", "ranges": [{"value": "a"}]}}"#, "key must not be empty"),
             (r#"{"d": {"into": "", "ranges": [{"value": "a"}]}}"#, "empty 'into'"),
             (r#"{"d": {"into": "c", "ranges": []}}"#, "empty 'ranges'"),

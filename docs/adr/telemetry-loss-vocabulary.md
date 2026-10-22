@@ -185,7 +185,8 @@ same date has the bounds of the count and how it enters the sink identity.
 - **Two classifications stay as the migration record has them**, by the maintainer's call:
   - `prometheus_out`'s `output.metrics.degraded{reason="sub_ms_collapsed"}` stays `degraded`.
     Of two readings of one series whose timestamps share a millisecond, the series is delivered
-    with the later one, because the destination holds one sample per millisecond.
+    with the later one, because the destination holds one sample per millisecond. The 2026-10-21
+    amendment below reverses this.
   - `datadog_out`'s cumulative and non-monotonic `Sum` stay
     `output.metrics.skipped{metric_kind}`, though "missing upstream stage" would make them
     `dropped`. No `logit` stage converts either to a delta monotonic `Sum` a Datadog `count` can
@@ -270,6 +271,87 @@ in place of `output.metrics.skipped{metric_kind="cumulative_sum"|"histogram"|"ex
 and a cumulative summary's unsent `.count` and `.sum` as
 `output.fields.dropped{reason="unresolved_cumulative"}`, in place of `output.fields.omitted`. The
 throttled `unresolved_cumulative` diagnostic names the transform to place.
+
+## Amendment (2026-10-21): structural loss has no counter; value-dependent and record-level loss does
+
+The transit spec's table (`spec/transit/mapping.yaml`) listed every sink outcome with no counter
+as `reason: uncounted`. Each such loss now falls in one of three groups, and only one goes
+uncounted:
+
+| Group | What's lost | Counted as |
+|---|---|---|
+| Record level | a whole record or event isn't written | `*.skipped{reason}` when the format can't hold it, `*.dropped{reason}` when it's loss to look into, per the `skipped` versus `dropped` rule above |
+| Structural | a field the destination's format has no slot for: a unit, description, start time, or instrumentation scope at a sink with none, a histogram's `min` and `max` at `prometheus_out`, a summary's exemplars at `otlp_out`, a private carrier at a foreign sink | nothing; the cell's reason is `structural` |
+| Value dependent | a field that survives or not by its value: `Bool(false)` at `datadog_out`, a `u64` past `i64::MAX` at `otlp_out`, a rate that rounds to weight 1, a name the sink rewrites | `*.omitted{reason}`, `*.degraded{reason}`, or `*.normalized{reason}` for a rewrite, as `tags.omitted{reason="unrepresentable"}` and `labels.omitted` already do |
+
+- **A structural loss isn't counted because the count would say nothing.** Every record of that
+  kind loses the field at that sink, so a counter would track the record count, and an alert on
+  it would fire on every healthy relay. The mapping table and the sink's module doc state the loss
+  once, which is where an operator choosing a destination looks.
+- **A value-dependent loss is counted because the table can't say how often it happens.** Most
+  records keep the field, so a nonzero count is the only sign one didn't.
+- **Structural is about fields; a record written as another kind or shape is counted.** A field
+  the format has no slot for (a unit, a description, a scope, a start time, `min` and `max`,
+  exemplars, a foreign carrier) is structural, on a `lost` or `degraded` cell with no counter. A
+  record whose kind or shape is rewritten counts `metrics.degraded{metric_kind}`, as every sink
+  already did before this amendment: a sketch as quantile fields or gauges, a set's estimate as a
+  gauge, a histogram or summary flattened to fields. A temporality lost so that the record reads
+  back as another kind (a `Sum` read back as a gauge, a delta `Sum` as a cumulative counter) is
+  that kind-level rewrite, not a structural field.
+- **A rewrite whose record also loses data counts the loss alone.** `datadog_out` writes a
+  cumulative `Summary`'s quantiles as gauges but can't send its running `.count` and `.sum`, so it
+  counts `fields.dropped{reason="unresolved_cumulative"}`, not `metric_kind="summary"` as well.
+- **A private `_logit.` carrier left off at another protocol's sink is structural**, though its
+  presence varies by event: the ignore rule in
+  [ADR `private-attribute-namespace`](private-attribute-namespace.md) makes it part of every such
+  sink's format, and counting it would fire on every cross-protocol relay.
+- **The new names reuse the vocabulary:**
+  - `output.events.skipped{reason="no_metrics"}` at `statsd_out`, `prometheus_out`, and
+    `influxdb_out`, which carry metrics alone, for an event with no metric record (a log, a span,
+    or neither; `influxdb_out` also writes a string-only carrier event), as `graphite_out`
+    already counts it. `statsd_out`'s untagged count gains the reason.
+  - `output.events.skipped{reason="no_payload"}` at `otlp_out` and `datadog_out`, which carry all
+    three signals, as `splunk_hec_out` already counts it.
+  - `output.metrics.normalized{reason="name_sanitized"}` at `statsd_out` and `prometheus_out`, and
+    `output.labels.normalized{reason="name_sanitized"}` and
+    `output.tags.normalized{reason="name_sanitized"|"value_sanitized"}` for a label or tag.
+  - `output.attributes.normalized{reason="u64_as_double"}` at `otlp_out`, the attribute twin of
+    `metrics.normalized{reason="u64_as_double"}`.
+  - `output.metrics.degraded{reason="sample_rate_rounded"}` at `datadog_out`, and
+    `{reason="negative_gauge"}` at `statsd_out`.
+  - `output.metrics.degraded{metric_kind}` for a kind written in another shape:
+    `"distribution"|"samples"|"histogram"|"summary"|"set"` at `influxdb_out`, and a `Sum`, read
+    back as a gauge, under the shape `statsd_out` and `graphite_out` name
+    (`"monotonic_delta_sum"|"non_monotonic_delta_sum"|"cumulative_sum"`); `"summary"` for a
+    delta summary at `datadog_out`, and `"set"` for its set sent as an estimate gauge, which
+    replaces `degraded{reason="set_estimate"}`; and `"delta_sum"` for the stale marker
+    `prometheus_out`'s remote-write sends for a flagged delta monotonic `Sum`, which reads back
+    cumulative.
+- **`uncounted` remains only where this change doesn't reach.** The table's schema accepts it on
+  the `log` and `span` rows and on `datadog_out`'s carrier on a log, not yet classified
+  (`crates/logit-cli/src/transit/mapping.rs`'s `UNCOUNTED_ALLOWED`).
+- **Each new count is encode-side**, once per batch however many attempts the sink makes,
+  through the sink's batch accounting, and counts a rewrite only on a record or line the sink
+  writes.
+
+## Amendment (2026-10-21): a collapsed reading is loss
+
+The close-out kept `prometheus_out`'s `output.metrics.degraded{reason="sub_ms_collapsed"}` at
+`degraded` because no stage could keep both readings.
+[ADR `dedup-timestamps-transform`](dedup-timestamps-transform.md) adds that stage, and the collapsed
+reading never leaves `logit`, which is this record's definition of loss. So `prometheus_out`'s
+remote-write counts each reading it removes because a later reading of its series shares its
+millisecond as `output.metrics.dropped{reason="duplicate_timestamp"}`, in place of
+`sub_ms_collapsed`, the same-nanosecond case included, which no counter saw before.
+`datadog_out` counts each series point it leaves off because a later point of its series shares
+its second under the same name. Both name the remedy, `dedup_timestamps`, in a throttled
+`duplicate_timestamp` diagnostic. A removed state (a gauge other than a Datadog `rate`,
+or a cumulative kind) equal to the one sent loses nothing, so both sinks count it
+`output.metrics.normalized{reason="duplicate_timestamp"}` instead: a relay or a retry resending
+identical points raises no loss alarm. An equal increment or observation set stays `dropped`:
+two equal delta counts or Datadog rates are two events, and two sets of size 1 can hold different
+members. The exposition registry's overwrite between scrapes is the pull model working, not loss,
+and stays uncounted.
 
 ## Migration record
 The classification of every `*.dropped`, `*.skipped`, `*.degraded`, `*.truncated`, and loss-related

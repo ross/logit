@@ -70,7 +70,8 @@ components:
   sampled:
     type: sample
     sources: [traced]
-    # In [0, 1]. `1` is rejected as a no-op; `0` is rejected unless `always_keep` is set.
+    # In [0, 1]. `1` keeps every event; `0` keeps only what `always_keep` flags or
+    # `missing: keep` keeps.
     rate: 0.5
     # `trace_id`, `{attribute: <name>}`, or `{resource: <name>}`; omit for a per-event draw.
     key: trace_id

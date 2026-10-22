@@ -521,7 +521,7 @@ impl Tally {
 /// Whether two histograms have the same bucket layout, and so can be added bucket by bucket.
 /// Compared bitwise, like `SeriesKey`'s `f64` attributes: a bound is an identity, not a
 /// measurement, so a `NaN` bound must equal itself rather than mismatch on every record.
-fn bucket_bounds_match(held: &[(f64, u64)], incoming: &[(f64, u64)]) -> bool {
+pub(crate) fn bucket_bounds_match(held: &[(f64, u64)], incoming: &[(f64, u64)]) -> bool {
     held.len() == incoming.len()
         && held.iter().zip(incoming).all(|((a, _), (b, _))| a.to_bits() == b.to_bits())
 }
@@ -578,7 +578,7 @@ fn sketch_samples(sketch: &mut logit_core::DdSketch, samples: &Samples) -> u32 {
 
 /// Whether a histogram's buckets hold any observation. A record that observed nothing has no
 /// `min`/`max` to contribute, so [`fold_extreme`] skips it.
-fn observed(buckets: &[(f64, u64)]) -> bool {
+pub(crate) fn observed(buckets: &[(f64, u64)]) -> bool {
     buckets.iter().any(|(_, count)| *count > 0)
 }
 
@@ -587,7 +587,7 @@ fn observed(buckets: &[(f64, u64)]) -> bool {
 /// part of the observations can pair one window's `min` with another's `max` and give
 /// `min > max`. A side that observed nothing is ignored, so the empty accumulator a series opens
 /// with takes the first observed record's value. `pick` decides when both sides have one.
-fn fold_extreme(
+pub(crate) fn fold_extreme(
     held: (bool, Option<f64>),
     incoming: (bool, Option<f64>),
     pick: fn(f64, f64) -> f64,

@@ -1,0 +1,79 @@
+{
+ "resourceMetrics": [
+  {
+   "resource": {
+    "attributes": [
+     {
+      "key": "service.name",
+      "value": {
+       "stringValue": "checkout"
+      }
+     }
+    ]
+   },
+   "scopeMetrics": [
+    {
+     "scope": {
+      "name": "io.opentelemetry.contrib.runtime",
+      "version": "1.2.0"
+     },
+     "metrics": [
+      {
+       "name": "rpc.server.duration",
+       "unit": "ms",
+       "histogram": {
+        "aggregationTemporality": 2,
+        "dataPoints": [
+         {
+          "startTimeUnixNano": "1799999930000000000",
+          "timeUnixNano": "1799999990000000000",
+          "count": "12",
+          "sum": 30.0,
+          "attributes": [
+           {
+            "key": "rpc.service",
+            "value": {
+             "stringValue": "cart"
+            }
+           }
+          ]
+         }
+        ]
+       }
+      },
+      {
+       "name": "queue.wait",
+       "unit": "s",
+       "histogram": {
+        "aggregationTemporality": 2,
+        "dataPoints": [
+         {
+          "startTimeUnixNano": "1799999930000000000",
+          "timeUnixNano": "1799999990000000000",
+          "count": "10",
+          "sum": 4.5,
+          "bucketCounts": [
+           "3",
+           "4"
+          ],
+          "explicitBounds": [
+           1.0
+          ],
+          "attributes": [
+           {
+            "key": "queue.name",
+            "value": {
+             "stringValue": "orders"
+            }
+           }
+          ]
+         }
+        ]
+       }
+      }
+     ]
+    }
+   ]
+  }
+ ]
+}

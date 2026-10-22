@@ -1926,6 +1926,19 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// A tailer with no path patterns idles: it delivers nothing and stops on shutdown.
+    #[tokio::test]
+    async fn a_tailer_with_no_patterns_delivers_nothing_and_stops_cleanly() {
+        let (fanout, mut rx) = fanout_channel(8);
+        let tailer = Tailer::new(vec![], LineFactory, fast_config(ReadFrom::Beginning));
+        let running = spawn_tailer(tailer, fanout);
+
+        // Several 15ms poll and flush ticks fit in the window.
+        assert_no_batch(&mut rx, Duration::from_millis(100), "a tailer with no patterns").await;
+
+        running.stop().await;
+    }
+
     #[tokio::test]
     async fn tail_in_emits_one_event_per_line_with_read_time_and_log_file_path() {
         let dir = scratch_dir("emit-basic");

@@ -1,6 +1,6 @@
 ---
 created: 2026-09-03
-updated: 2026-10-18
+updated: 2026-10-21
 ---
 
 # Operator-declared resource attributes: a `set` transform, not a per-input config field
@@ -52,13 +52,13 @@ web_identity:
 ```
 
 `resource` is applied once per batch, to `EventBatch::resource`; `attributes` is applied per event,
-to `event.attributes`. Both maps are optional but at least one must be non-empty (a `set` with
-neither is a graph-validation error, the same rule `kv_metrics` already has for "can only ever be
-a no-op"). Both overwrite on key collision: a configured value always wins over whatever the wire
-carried, matching `syslog_out`'s existing `hostname`/`app_name` config fields — an operator naming
-a value here is declaring what a specific pipeline stage carries, the same category of knowledge
-those fields already represent, not code inventing an identity for data it didn't produce. The
-rule from PR #60 stands unchanged: `logit`'s own code still may not guess a `service.name`.
+to `event.attributes`. Both maps are optional, and a `set` with neither forwards every event
+unchanged; an empty key in either is a graph-validation error (rule 12), since it could never name a
+real attribute. Both overwrite on key collision: a configured value always wins over whatever the
+wire carried, matching `syslog_out`'s existing `hostname`/`app_name` config fields — an operator
+naming a value here is declaring what a specific pipeline stage carries, the same category of
+knowledge those fields already represent, not code inventing an identity for data it didn't produce.
+The rule from PR #60 stands unchanged: `logit`'s own code still may not guess a `service.name`.
 `Set` overwrites; it never invents.
 
 Mechanically, this needed one addition to `logit_pipeline::Transform`

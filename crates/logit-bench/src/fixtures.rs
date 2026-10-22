@@ -38,10 +38,10 @@ use logit_proto::syslog::SyslogDecoder;
 use logit_proto::Decoder;
 use logit_transforms::{
     AggregateTemporality, Aggregator, Arrays, Bucket, BucketBound, BucketField, CsvParser,
-    CumulativeToDelta, Distributions, Fields, Flatten, HttpAccess, HttpAccessConfig, InitialValue,
-    JsonParser, Keep, KeepValues, Kv, KvMetrics, LineProtocol, Logfmt, MetricSpec, Normalize,
-    RegexParser, RouteRule, RouteSet, Sample, SampleField, SampleKey, SampleMissing,
-    SampleOverride, Set, Shape,
+    CumulativeToDelta, DedupTimestamps, Distributions, Fields, Flatten, HttpAccess,
+    HttpAccessConfig, InitialValue, JsonParser, Keep, KeepValues, Kv, KvMetrics, LineProtocol,
+    Logfmt, MetricSpec, Normalize, RegexParser, RouteRule, RouteSet, Sample, SampleField,
+    SampleKey, SampleMissing, SampleOverride, Set, Shape,
 };
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -568,6 +568,11 @@ pub fn kv_metrics() -> KvMetrics {
 /// series is emitted too and every point takes a converting path.
 pub fn cumulative_to_delta() -> CumulativeToDelta {
     CumulativeToDelta::new(InitialValue::Keep, Duration::from_secs(3600), 10_000)
+}
+
+/// A `dedup_timestamps` at `precision: 1ms`, as in front of remote-write.
+pub fn dedup_timestamps() -> DedupTimestamps {
+    DedupTimestamps::new(Duration::from_millis(1))
 }
 
 /// A scrape's cumulative counter: hand-written, shaped as `prometheus_in` decodes

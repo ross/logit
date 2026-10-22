@@ -1206,7 +1206,10 @@ mod tests {
             "  - kind: sum\n    feature: delta_monotonic\n    cells:\n      statsd_out:\n        \
                      class: exact\n";
         assert!(text.contains(right), "the table's delta_monotonic row moved");
-        let wrong = text.replace(right, &right.replace("class: exact", "class: degraded"));
+        let wrong = text.replace(
+            right,
+            &right.replace("class: exact", "class: degraded\n        reason: structural"),
+        );
         let (flow, case) = relay();
         let traced = run_traced(&flow.path, &case.json(), Options::default()).expect("runs");
         let at = At { flow: &flow.name, case: &case.name };
@@ -1225,39 +1228,35 @@ mod tests {
     }
 
     /// A record nothing reads back fails when the cell names a counter that didn't move and no
-    /// other sink counter says why: `prometheus_out` skips a log uncounted, so a cell claiming a
-    /// counter for it is wrong. It pins that path only: the flagged-record rule in `classes.rs`'s
-    /// "Counters" is pinned by the `flagged-kinds` case across the statsd flows.
+    /// other sink counter says why: with `prometheus_out`'s `events.skipped` taken out of the run,
+    /// it skips a log and counts nothing, so the cell's counter accounts for nothing. It pins that
+    /// path only: the flagged-record rule in `classes.rs`'s "Counters" is pinned by the
+    /// `flagged-kinds` case across the statsd flows.
     #[test]
     fn a_loss_no_counter_explains_fails_the_class_check() {
         let spec = spec_dir();
         let text = std::fs::read_to_string(spec.join("mapping.yaml")).expect("the table");
-        let right =
-            "      prometheus_out:\n        class: skipped\n        reason: uncounted\n        \
-                     text: A log has no Prometheus form and isn't written, uncounted.\n";
-        assert_eq!(text.matches(right).count(), 2, "the table's two log rows moved");
-        let wrong = text.replacen(
-            right,
-            &right.replace("reason: uncounted", "counter: logit.output.events.skipped"),
-            2,
-        );
         let flow = flow(&spec, &spec.join("flows/statsd-to-prometheus.yaml")).expect("the flow");
         let case = system_cases(&spec, "statsd")
             .expect("statsd cases")
             .into_iter()
             .find(|c| c.name == "log-only")
             .expect("the log-only case");
-        let traced = run_traced(&flow.path, &case.json(), Options::default()).expect("runs");
+        let mut traced = run_traced(&flow.path, &case.json(), Options::default()).expect("runs");
         let at = At { flow: &flow.name, case: &case.name };
-
-        let right = mapping::parse(&text).expect("the table parses");
+        let table = mapping::parse(&text).expect("the table parses");
         assert_eq!(
-            classes::check(&right, &at, &traced, &mut Ledger::default()),
+            classes::check(&table, &at, &traced, &mut Ledger::default()),
             Vec::<String>::new()
         );
 
-        let wrong = mapping::parse(&wrong).expect("the edited table parses");
-        let failures = classes::check(&wrong, &at, &traced, &mut Ledger::default());
+        let skipped = traced.outcome.counters.len();
+        traced
+            .outcome
+            .counters
+            .retain(|series, _| !series.starts_with("logit.output.events.skipped"));
+        assert_eq!(traced.outcome.counters.len() + 1, skipped, "the run counted the skip once");
+        let failures = classes::check(&table, &at, &traced, &mut Ledger::default());
         assert!(
             failures.iter().any(|f| f.contains("isn't read back and no sink counter says why")),
             "{failures:#?}"
@@ -1375,7 +1374,10 @@ mod tests {
     fn gen_never_rewrites_over_a_class_failure() {
         let delta = "    feature: delta_monotonic\n    cells:\n      statsd_out:\n        class: ";
         let spec = small_spec("transit-gen-class", |table| {
-            table.replace(&format!("{delta}exact\n"), &format!("{delta}degraded\n"))
+            table.replace(
+                &format!("{delta}exact\n"),
+                &format!("{delta}degraded\n        reason: structural\n"),
+            )
         });
         let expected = spec.join("expected/statsd-relay.json");
         let ledger = spec.join("ledger/statsd-relay.json");
@@ -1558,6 +1560,29 @@ mod tests {
             ("  - {kind: samples, cells: {statsd_out: {class: skipped, text: t}}}\n", "names its counter"),
             ("  - {kind: samples, cells: {statsd_out: {class: lost, text: t}}}\n", "can't be lost"),
             (
+                "  - {kind: samples, cells: {statsd_out: {class: skipped, reason: uncounted, \
+                 text: t}}}\n",
+                "an uncounted loss is counted",
+            ),
+            (
+                "  - {kind: record, feature: unit, cells: {statsd_out: {class: lost, \
+                 reason: uncounted, text: t}}}\n",
+                "an uncounted loss is counted",
+            ),
+            (
+                "  - {kind: samples, cells: {statsd_out: {class: skipped, reason: structural, \
+                 text: t}}}\n",
+                "only a lost or degraded cell with no counter is structural",
+            ),
+            (
+                "  - {kind: samples, cells: {statsd_out: {class: degraded, text: t}}}\n",
+                "a degraded cell names its counter",
+            ),
+            (
+                "  - {kind: record, feature: unit, cells: {statsd_out: {class: lost, text: t}}}\n",
+                "its reason is structural",
+            ),
+            (
                 "  - {kind: attributes, feature: string_value, cells: {statsd_out: {class: dropped, \
                  counter: x, text: t}}}\n",
                 "a field row can't be",
@@ -1573,9 +1598,16 @@ mod tests {
             let err = mapping::parse(&table(rows)).expect_err(rows);
             assert!(format!("{err:#}").contains(want), "{rows}: {err:#}");
         }
-        assert!(mapping::parse(&table(
-            "  - {kind: samples, cells: {statsd_out: {class: exact, text: t}}}\n"
-        ))
-        .is_ok());
+        for rows in [
+            "  - {kind: samples, cells: {statsd_out: {class: exact, text: t}}}\n",
+            "  - {kind: record, feature: unit, cells: {statsd_out: {class: lost, \
+             reason: structural, text: t}}}\n",
+            "  - {kind: log, feature: plain, cells: {statsd_out: {class: skipped, \
+             reason: uncounted, text: t}}}\n",
+            "  - {kind: samples, cells: {statsd_out: {class: degraded, reason: structural, \
+             text: t}}}\n",
+        ] {
+            assert!(mapping::parse(&table(rows)).is_ok(), "{rows}");
+        }
     }
 }

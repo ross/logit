@@ -2,7 +2,7 @@
   "attributes": {"events": [
     {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"build.info","kind":"gauge","value":1.0}],"attributes":{"host.name":"web-1","regions":["us-east","2"],"service.name":"checkout","shard":"12","version":"2.4.1","weight":"0.75"}}
   ], "counters": {
-    "logit.output.tags.omitted{component=out,kind=datadog_out,reason=unrepresentable,role=sink}": 2
+    "logit.output.tags.omitted{component=out,kind=datadog_out,reason=unrepresentable,role=sink}": 3
   }},
   "exemplars": {"events": [
     {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"cart.value","kind":"gauge","value":42.5,"unit":"USD"}],"attributes":{"host.name":"web-1","service.name":"checkout"}},
@@ -28,6 +28,12 @@
   "gzip": {"events": [
     {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"uploads.completed","kind":"sum","value":5.0,"temporality":"delta","monotonic":true}],"attributes":{"host.name":"web-1","service.name":"checkout"}}
   ], "counters": {}},
+  "histogram-count": {"events": [
+    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"queue.wait","kind":"distribution","count":7,"sum":4.5,"min":1.0,"max":1.0,"avg":0.6428571428571429,"p50":1.0,"p90":1.0,"p95":1.0,"p99":1.0,"sketch":{"mapping":"agent","stats_exact":true,"count":7.0,"min":1.0,"max":1.0,"positive":[{"key":1338,"count":7.0}]}}],"attributes":{"host.name":"transit","queue.name":"orders","service.name":"checkout"}},
+    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"rpc.server.duration","kind":"distribution","count":12,"sum":30.0,"min":-9.941854089121368e-10,"max":-9.941854089121368e-10,"avg":2.5,"p50":-9.941854089121368e-10,"p90":-9.941854089121368e-10,"p95":-9.941854089121368e-10,"p99":-9.941854089121368e-10,"sketch":{"mapping":"agent","stats_exact":true,"count":12.0,"min":-9.941854089121368e-10,"max":-9.941854089121368e-10,"negative":[{"key":1,"count":12.0}]}}],"attributes":{"host.name":"transit","rpc.service":"cart","service.name":"checkout"}}
+  ], "counters": {
+    "logit.output.metrics.degraded{component=out,kind=datadog_out,metric_kind=histogram,role=sink}": 2
+  }},
   "histogram-neg-inf-bound": {"events": [
     {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"http.server.duration","kind":"distribution","count":27,"sum":85.24672076554066,"min":-9.941854089121368e-10,"max":5.015009921317152,"avg":3.1572859542792835,"p50":5.015009921317149,"p90":5.015009921317149,"p95":5.015009921317149,"p99":5.015009921317149,"sketch":{"mapping":"agent","stats_exact":true,"count":27.0,"min":-9.941854089121368e-10,"max":5.015009921317152,"positive":[{"key":1338,"count":2.0},{"key":1409,"count":1.0},{"key":1442,"count":16.0}],"negative":[{"key":1,"count":8.0}]}}],"attributes":{"host.name":"web-1","http.route":"/cart","service.name":"checkout"}}
   ], "counters": {
@@ -64,7 +70,9 @@
     {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"rpc.client.duration.quantile","kind":"gauge","value":1.2,"unit":"s"}],"attributes":{"host.name":"web-1","quantile":"0.99","rpc.service":"inventory","service.name":"checkout"}},
     {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"rpc.client.duration.quantile","kind":"gauge","value":2.5,"unit":"s"}],"attributes":{"host.name":"web-1","quantile":"1.0","rpc.service":"inventory","service.name":"checkout"}},
     {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"rpc.client.duration.sum","kind":"sum","value":25.5,"temporality":"delta","monotonic":true,"unit":"s"}],"attributes":{"host.name":"web-1","rpc.service":"inventory","service.name":"checkout"}}
-  ], "counters": {}},
+  ], "counters": {
+    "logit.output.metrics.degraded{component=out,kind=datadog_out,metric_kind=summary,role=sink}": 1
+  }},
   "sums": {"events": [
     {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"db.client.connections.usage","kind":"gauge","value":7.0,"unit":"{connection}"}],"attributes":{"host.name":"web-1","pool.name":"primary","service.name":"checkout"}},
     {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"http.server.requests","kind":"sum","value":12.5,"temporality":"delta","monotonic":true,"unit":"{request}"}],"attributes":{"host.name":"web-1","http.route":"/cart","service.name":"checkout"}},
@@ -84,8 +92,9 @@
     "logit.output.metrics.degraded{component=out,kind=datadog_out,metric_kind=non_monotonic_sum,role=sink}": 2
   }},
   "telemetrygen": {"events": [
-    {"timestamp":"2026-09-10T21:22:20.000000000Z","metrics":[{"name":"gen","kind":"gauge","value":0.0}],"attributes":{"host.name":"transit","service.name":"telemetrygen"}},
     {"timestamp":"2026-09-10T21:22:20.000000000Z","metrics":[{"name":"gen","kind":"gauge","value":1.0}],"attributes":{"host.name":"transit","service.name":"telemetrygen"}},
     {"timestamp":"2026-09-10T21:22:21.000000000Z","metrics":[{"name":"gen","kind":"gauge","value":2.0}],"attributes":{"host.name":"transit","service.name":"telemetrygen"}}
-  ], "counters": {}}
+  ], "counters": {
+    "logit.output.metrics.dropped{component=out,kind=datadog_out,reason=duplicate_timestamp,role=sink}": 1
+  }}
 }

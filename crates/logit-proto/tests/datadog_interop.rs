@@ -206,9 +206,15 @@ impl Route {
         result.unwrap_or_else(|e| panic!("{self:?}: a recorded body must decode: {e}"))
     }
 
-    /// One batch re-encoded on this route; `None` when nothing in it belongs here.
-    fn encode(self, batch: &EventBatch) -> Option<Bytes> {
+    /// One batch re-encoded on this route, `None` when nothing in it belongs here, and the series
+    /// points the encoder left off as duplicates of a later one.
+    fn encode(self, batch: &EventBatch) -> (Option<Bytes>, usize) {
         let mut e = DatadogEncoder::new();
+        let body = self.encode_with(&mut e, batch);
+        (body, e.series_duplicates())
+    }
+
+    fn encode_with(self, e: &mut DatadogEncoder, batch: &EventBatch) -> Option<Bytes> {
         match self {
             Route::SeriesV2Protobuf => e.encode_series_v2_protobuf(batch),
             Route::Sketches => e.encode_sketches(batch),
@@ -238,18 +244,29 @@ fn replay(capture: &Capture) -> Vec<EventBatch> {
     assert!(problems.is_empty(), "{}: {problems:?}", capture.name);
 
     for batch in &first {
-        let Some(encoded) = route.encode(batch) else {
+        let (Some(encoded), duplicates) = route.encode(batch) else {
             assert!(batch.events.is_empty(), "{}: decoded events didn't re-encode", capture.name);
             continue;
         };
         let second = route.decode(&mut DatadogDecoder::new(), &encoded);
-        assert_eq!(
-            second,
-            std::slice::from_ref(batch),
-            "{}: decode(encode(decode(b))) != decode(b)",
-            capture.name
-        );
-        let again = route.encode(&second[0]).expect("the same batch encodes again");
+        if duplicates == 0 {
+            assert_eq!(
+                second,
+                std::slice::from_ref(batch),
+                "{}: decode(encode(decode(b))) != decode(b)",
+                capture.name
+            );
+        } else {
+            // Points of one series in one second leave as the latest alone, and the rest are
+            // counted dropped: what's read back is the batch less those.
+            assert_eq!(second.len(), 1, "{}", capture.name);
+            let kept = &second[0].events;
+            assert_eq!(kept.len() + duplicates, batch.events.len(), "{}", capture.name);
+            assert!(kept.iter().all(|e| batch.events.contains(e)), "{}", capture.name);
+        }
+        let (again, none) = route.encode(&second[0]);
+        assert_eq!(none, 0, "{}: a re-encode leaves nothing more off", capture.name);
+        let again = again.expect("the same batch encodes again");
         assert_eq!(again, encoded, "{}: encode(decode(encode(d))) != encode(d)", capture.name);
     }
     first
@@ -338,6 +355,8 @@ fn the_agent_series_carry_the_dogstatsd_clients_metrics() {
     }
     assert_eq!(by_name["record.users.active"].metrics[0].kind, MetricKind::gauge(1.0));
 
+    // The Agent relays a `|T` gauge unaggregated, so the three share a series and a second; a
+    // relay through `datadog_out` sends one of them and counts two dropped (`replay`).
     let lagged: Vec<&Event> =
         events(&series).filter(|e| metric_name(e) == "record.batch.lag").collect();
     assert_eq!(lagged.len(), 3, "one `|T` gauge per transport");

@@ -152,6 +152,10 @@
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"queue.depth","kind":"gauge","value":3.0}]},
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"queue.depth","kind":"gauge","value":4.0}]}
   ], "counters": {}},
+  "sub-millisecond-equal": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"queue.depth","kind":"gauge","value":3.0}]},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"queue.depth","kind":"gauge","value":3.0}]}
+  ], "counters": {}},
   "sum-shapes": {"events": [
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"active.sessions","kind":"gauge","value":14.0}]},
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"balance.change","kind":"gauge","value":-4.0}]},

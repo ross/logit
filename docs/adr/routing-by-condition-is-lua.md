@@ -1,6 +1,6 @@
 ---
 created: 2026-09-07
-updated: 2026-10-16
+updated: 2026-10-21
 ---
 
 # Routing by condition, sampling, throttling, dedup, and renaming are `lua` components
@@ -14,6 +14,14 @@ span of a trace must reach the same verdict with nothing propagated; `lua` expos
 its `math.random` is per-VM. `sample` is a native `ComponentKind` again, implemented. Everything
 else here — no native predicate language, no `filter`/`rename`/`throttle`/`dedup`, the measured
 cost table and its revisit trigger — stands unchanged.
+
+Amended on 2026-10-21 by
+[ADR `dedup-timestamps-transform`](dedup-timestamps-transform.md): `dedup_timestamps` is a native
+kind for collapsing one series' metric readings at one instant within a batch, the later reading
+kept and deltas summed. A `lua` component can't choose the later reading without adding latency,
+since `process` sees one event at a time and can't change an event it already returned. The
+retired `dedup`, an event-level seen-set that forwards an event the first time, stays retired and
+stays a `lua` job.
 
 ## Context
 

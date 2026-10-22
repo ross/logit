@@ -8,9 +8,11 @@
 //!
 //! **Which rows a record reaches.** A metric record reaches its kind's rows: for a `sum`, its
 //! temporality and monotonicity and its scalar type; for a `gauge` or `gauge_delta`, its scalar
-//! type, and `negative` for a gauge below zero; for a `histogram`, `exponential_histogram`, or
-//! `summary`, its temporality, and for a `histogram` `nan_bound` and `neg_inf_bound` for each such
-//! bound it holds; any other kind, its kind's one row. It also reaches a `record` row for each of
+//! type, `negative` for a gauge below zero, and `prometheus_info` or `prometheus_stateset` for a
+//! gauge whose `_logit.prometheus.type` is `info` or `stateset`; for a `histogram`,
+//! `exponential_histogram`, or `summary`, its temporality, and for a `histogram` `nan_bound` and
+//! `neg_inf_bound` for each such bound it holds and `gauge_histogram` when its
+//! `_logit.prometheus.type` is `gaugehistogram`; any other kind, its kind's one row. It also reaches a `record` row for each of
 //! `unit` (`unit_on_distribution` for a `samples` or `distribution`), `description`,
 //! `start_timestamp`, `exemplars` (`exemplars_on_summary` for a `summary`), and `no_recorded_value` (`no_recorded_value_delta_sum` for a delta `sum`,
 //! `no_recorded_value_other_kind` for a kind other than `sum` and `gauge`) it carries,
@@ -23,7 +25,14 @@
 //! `gauge` holding `NaN` or an infinity, and `superseded` when a later record of the run is
 //! another point of its series (the same name, kind, and public attributes), with `same_instant`
 //! when that point shares its timestamp or else `same_millisecond` when it shares its
-//! millisecond. A `histogram` or `exponential_histogram` reaches the field row `record/min_max`
+//! millisecond, each as `same_instant_equal` or `same_millisecond_equal` when the record is a
+//! state ([`is_state`]) and the latest point of the series in its millisecond, the later in the
+//! run on a tie, is the same state as the sink writes it ([`same_reading`]); at `datadog_out`, a `samples`, `distribution`, `set_members`, or
+//! `exponential_histogram` record reaches neither, nor a `histogram` under `histograms.mode:
+//! distributions`, since that sink collapses a series' points only on its series route, and the
+//! distribution-points and sketches routes carry those kinds or nothing does; under
+//! `histograms.send_aggregation_metrics` the two histogram kinds reach both, since their
+//! aggregation series go on the series route. A `histogram` or `exponential_histogram` reaches the field row `record/min_max`
 //! for its `min` and `max`, which its own comparison leaves out, as a flagged point's leaves out
 //! its value: a stale marker reads back as `NaN`, and a `samples` record below rate 1 that rounds
 //! to weight 1 the field row `record/sample_rate_unweighted` for its rate, left out the same way.
@@ -72,7 +81,8 @@
 //! `format: dogstatsd` a `host.name` or hostless mark read back as `host` ([`statsd`]); `prometheus_out`'s `sanitize_metric_name`, `_total` on a counter, a label
 //! key's `sanitize_label_name`, and an array's last element; `influxdb_out`'s `<name>.value` for
 //! a `sum`, `gauge`, or `set` off the carrier path, and an array's last element; `otlp_out`'s
-//! timestamp value as an integer of nanoseconds; `datadog_out`'s `host` attribute read back under
+//! timestamp value as an integer of nanoseconds, and an OpenMetrics `info` or `stateset` gauge
+//! read back as a cumulative non-monotonic sum, an `info` one under `<name>_info`; `datadog_out`'s `host` attribute read back under
 //! its route's host key, and the attributes it writes from a record's own fields
 //! ([`Spelling::derived`]: the run's hostname on a record with no host, a log's `status`, a
 //! span's `span.kind` and `_dd.p.tid`), each accepted only with the value derived for it;
@@ -85,7 +95,11 @@
 //! may also carry the `lower_bound`, `upper_bound`, or `quantile` tag of the bucket or quantile it
 //! expands. An input left unpaired was skipped or
 //! dropped: the class is the one whose counter moved, or the cell's when it says the loss is
-//! `uncounted`. A read-back record no input claims fails the check with both sides printed.
+//! `uncounted`, or the expected class when it reached a `normalized` cell whose counter moved for
+//! an equal point that was read back: a sink that collapses two equal readings sends one of them. One exception: under `prometheus_out` exposition (`bind:` set), an unpaired
+//! record whose series has a later record in the case that was read back was overwritten in the
+//! registry, and reads at its expected class when that's `normalized` or `degraded`. A read-back
+//! record no input claims fails the check with both sides printed.
 //!
 //! The check compares a timestamp in two places: a `same_instant` record paired `exact` whose
 //! read-back instant differs from its twin's reads `normalized`, since the sink moved them apart,
@@ -307,8 +321,9 @@ enum Spelling {
     /// of a measurement named for the record, which `influxdb_in` reads back as `<name>.value`;
     /// an array's last element as its tag value.
     Influxdb,
-    /// `otlp_out`: names and keys as written; a timestamp value as an integer of Unix
-    /// nanoseconds.
+    /// `otlp_out`: names and keys as written, but for an OpenMetrics `info` gauge's `_info`
+    /// suffix; an `info` or `stateset` gauge as a cumulative non-monotonic sum; a timestamp value
+    /// as an integer of Unix nanoseconds.
     Otlp,
     /// `datadog_out`: names as written; a `host` attribute the encoder takes as the host as
     /// `host.name`; and the attributes [`Spelling::derived`] lists, which the encoder writes from
@@ -406,7 +421,23 @@ impl Spelling {
                     rec.name.clone()
                 }
             }
+            Spelling::Otlp if rec.kind == "gauge" && prometheus_type(rec) == Some("info") => {
+                format!("{}_info", rec.name)
+            }
             _ => self.sanitize(&rec.name),
+        }
+    }
+
+    /// The [`Rec::identity`] the sink's pair decoder reads `rec`, a sink input, back under:
+    /// `otlp_out` writes an OpenMetrics `info` or `stateset` gauge as a cumulative non-monotonic
+    /// sum.
+    fn written_identity(self, rec: &Rec) -> String {
+        let respelled =
+            rec.kind == "gauge" && matches!(prometheus_type(rec), Some("info" | "stateset"));
+        if self == Spelling::Otlp && respelled {
+            "sum/\"cumulative\"/false".to_string()
+        } else {
+            rec.identity()
         }
     }
 
@@ -988,7 +1019,7 @@ fn pair(ins: &[Rec], outs: &[Rec], spelling: Spelling) -> Pairing {
             let input = &ins[i];
             let same: Vec<usize> = candidates(i, &used)
                 .into_iter()
-                .filter(|&o| outs[o].identity() == input.identity())
+                .filter(|&o| outs[o].identity() == spelling.written_identity(input))
                 .collect();
             let picked = match input.kind.as_str() {
                 "samples" | "set_members" => gather(input, &same, outs),
@@ -1217,6 +1248,11 @@ fn kind_features(rec: &Rec) -> Vec<Option<String>> {
             if number(&rec.body["value"]).is_some_and(|v| v < 0.0) {
                 features.push(Some("negative".to_string()));
             }
+            match prometheus_type(rec) {
+                Some("info") => features.push(Some("prometheus_info".to_string())),
+                Some("stateset") => features.push(Some("prometheus_stateset".to_string())),
+                _ => {}
+            }
             features
         }
         "gauge_delta" => vec![Some(scalar("delta"))],
@@ -1234,6 +1270,9 @@ fn kind_features(rec: &Rec) -> Vec<Option<String>> {
             }
             if bounds.contains(&"-inf") {
                 features.push(Some("neg_inf_bound".to_string()));
+            }
+            if prometheus_type(rec) == Some("gaugehistogram") {
+                features.push(Some("gauge_histogram".to_string()));
             }
             features
         }
@@ -1259,6 +1298,11 @@ fn kind_features(rec: &Rec) -> Vec<Option<String>> {
         "event" => vec![Some("attributes_only".to_string())],
         _ => vec![None],
     }
+}
+
+/// The OpenMetrics family type `prometheus_in` carried on `rec`, if any.
+fn prometheus_type(rec: &Rec) -> Option<&str> {
+    rec.attributes.get(logit_proto::prometheus::ATTR_TYPE).and_then(Value::as_str)
 }
 
 /// `rec`'s metric record in the model, read back from its `format: json` body.
@@ -1314,6 +1358,44 @@ fn same_millisecond(rec: &Rec, later: &Rec) -> bool {
     // An RFC 3339 timestamp through its milliseconds: `2027-01-15T08:00:00.000`.
     let millis = |rec: &Rec| rec.timestamp.get(..23).map(str::to_string);
     millis(rec).is_some() && millis(rec) == millis(later)
+}
+
+/// Whether `rec` and `later`, two points of one series, are one state: each a kind a later
+/// reading fully replaces ([`is_state`]), with the same metric object, attributes, and resource,
+/// private carriers included.
+fn same_reading(rec: &Rec, later: &Rec) -> bool {
+    is_state(rec)
+        && is_state(later)
+        && rec.body == later.body
+        && rec.attributes == later.attributes
+        && rec.resource == later.resource
+}
+
+/// Whether a later reading of `rec`'s series fully replaces it: a `gauge`, or a cumulative `sum`,
+/// `histogram`, `exponential_histogram`, or `summary`. Any other kind, a set included, is an
+/// increment or an observation set, so two equal ones are two sets of events (`logit_proto`'s
+/// `replaced_by_a_later_reading`), and so is a Datadog `rate`: a `gauge` whose
+/// `_logit.datadog.type`, the event's value else the resource's, is `rate` (`logit_proto`'s
+/// `datadog::is_rate`).
+fn is_state(rec: &Rec) -> bool {
+    let carrier = "_logit.datadog.type";
+    let rate = rec.kind == "gauge"
+        && rec
+            .attributes
+            .get(carrier)
+            .or_else(|| rec.resource.get(carrier))
+            .and_then(Value::as_str)
+            == Some("rate");
+    if rate {
+        return false;
+    }
+    match rec.kind.as_str() {
+        "gauge" => true,
+        "sum" | "histogram" | "exponential_histogram" | "summary" => {
+            rec.body["temporality"] == "cumulative"
+        }
+        _ => false,
+    }
 }
 
 /// Whether inputs `i` and `j`, which share an instant, read back at different ones.
@@ -1864,10 +1946,37 @@ pub(super) fn check(
         }
         // The later point of its series at this record's instant, if any.
         let twin = later.iter().copied().find(|&j| ins[j].timestamp == input.timestamp);
-        if twin.is_some() {
-            features.push("same_instant");
-        } else if later.iter().any(|&j| same_millisecond(input, &ins[j])) {
-            features.push("same_millisecond");
+        // `datadog_out` collapses a series' points in one second on its series route only. A
+        // `samples` record has the distribution-points route, where Datadog keeps both points, a
+        // `distribution` record the sketches route, and a `set_members` record no Datadog form; the
+        // sketches route also carries every `exponential_histogram`, and a `histogram` under the
+        // default `histograms.mode: distributions`, unless `histograms.send_aggregation_metrics`
+        // also writes its `.count`, `.sum`, `.min`, and `.max` on the series route.
+        let histograms = &traced.sink["histograms"];
+        let aggregations = histograms["send_aggregation_metrics"].as_bool().unwrap_or(false);
+        let distributions = histograms["mode"].as_str().is_none_or(|mode| mode == "distributions");
+        let sketched = !aggregations
+            && (input.kind == "exponential_histogram"
+                || (input.kind == "histogram" && distributions));
+        let collapsible = sink != "datadog_out"
+            || !(matches!(input.kind.as_str(), "samples" | "distribution" | "set_members")
+                || sketched);
+        // The point a sink keeping one per series and millisecond sends in this record's place:
+        // the latest, the later in the run on a tie.
+        let sent = later
+            .iter()
+            .copied()
+            .filter(|&j| same_millisecond(input, &ins[j]))
+            .max_by(|&a, &b| ins[a].timestamp.cmp(&ins[b].timestamp).then(a.cmp(&b)));
+        let equal = sent.filter(|&j| same_reading(input, &ins[j]));
+        if twin.is_some() && collapsible {
+            features.push(if equal.is_some() { "same_instant_equal" } else { "same_instant" });
+        } else if twin.is_none() && collapsible && sent.is_some() {
+            features.push(if equal.is_some() {
+                "same_millisecond_equal"
+            } else {
+                "same_millisecond"
+            });
         }
         rows.extend(features.into_iter().map(|f| ("record".to_string(), Some(f.to_string()))));
         let mut cells = Vec::new();
@@ -1940,7 +2049,25 @@ pub(super) fn check(
                 let uncounted = loss.is_some_and(|(_, cell, _)| {
                     cell.counter.is_none() && cell.reason.as_deref() == Some("uncounted")
                 });
-                if counted || uncounted {
+                // A sink that collapses two equal readings counts the one it removes under a
+                // `normalized` cell and sends the other, so the removed one reads as the other
+                // does: at its worst cell, which is that one unless the kind is written in a
+                // lesser form.
+                let collapsed = cells.iter().any(|(_, cell, _)| {
+                    cell.class == Class::Normalized
+                        && cell.counter.as_deref().is_some_and(&did_move)
+                }) && equal.is_some_and(|j| !pairing.claimed[j].is_empty());
+                if counted || uncounted || collapsed {
+                    Some(expected)
+                } else if matches!(expected, Class::Normalized | Class::Degraded)
+                    && sink == "prometheus_out"
+                    && traced.sink.get("bind").is_some_and(|bind| !bind.is_null())
+                    && later.iter().any(|&j| !pairing.claimed[j].is_empty())
+                {
+                    // The exposition registry keeps one value per series, so a record whose
+                    // series has a later record read back was overwritten by it: the pull
+                    // model's normalization, which leaves the earlier record nothing to pair
+                    // with. A kind the sink writes in a lesser form stays at that class.
                     Some(expected)
                 } else if moved.iter().any(|s| s.name.ends_with(".skipped")) {
                     Some(Class::Skipped)
@@ -2121,6 +2248,26 @@ mod tests {
 
         let verbatim = pair(&ins, &outs, Spelling::Verbatim);
         assert_eq!(verbatim.seen, [None, None]);
+    }
+
+    /// `otlp_out` writes an OpenMetrics `info` or `stateset` gauge as a cumulative non-monotonic
+    /// sum, an `info` one under `<name>_info`; with no carrier, the same sum pairs nothing.
+    #[test]
+    fn otlp_pairs_an_info_and_a_stateset_gauge_with_their_sums() {
+        let info = r#"{{T},"metrics":[{"name":"build","kind":"gauge","value":1.0}],"attributes":{"_logit.prometheus.type":"info","version":"1"}}"#;
+        let state = r#"{{T},"metrics":[{"name":"feature","kind":"gauge","value":0.0}],"attributes":{"_logit.prometheus.type":"stateset","feature":"a"}}"#;
+        let outs = recs(&[
+            r#"{{T},"metrics":[{"name":"build_info","kind":"sum","value":1.0,"temporality":"cumulative","monotonic":false}],"attributes":{"version":"1"}}"#,
+            r#"{{T},"metrics":[{"name":"feature","kind":"sum","value":0.0,"temporality":"cumulative","monotonic":false}],"attributes":{"feature":"a"}}"#,
+        ]);
+        let pairing = pair(&recs(&[info, state]), &outs, Spelling::Otlp);
+        assert_eq!(pairing.seen, [Some(Class::Normalized), Some(Class::Normalized)]);
+        assert!(pairing.unclaimed.is_empty());
+
+        let bare = recs(&[
+            r#"{{T},"metrics":[{"name":"feature","kind":"gauge","value":0.0}],"attributes":{"feature":"a"}}"#,
+        ]);
+        assert_eq!(pair(&bare, &outs[1..], Spelling::Otlp).seen, [Some(Class::Degraded)]);
     }
 
     /// `influxdb_out` writes a gauge with no measurement carrier as field `value`, read back as
@@ -2833,5 +2980,60 @@ mod tests {
         let pairing = pair(&ins, &outs, Spelling::Influxdb);
         assert!(moved_apart(&pairing, 0, 1, &outs));
         assert!(!moved_apart(&pairing, 0, 0, &outs));
+    }
+
+    /// [`check`] over `ins` read back as `outs` by a `prometheus_out` with `config`, against the
+    /// committed table.
+    fn check_prometheus(ins: &[&str], outs: &[&str], config: Value) -> Vec<String> {
+        let batches = |lines: &[&str]| {
+            let text: String = lines
+                .iter()
+                .map(|line| line.replace("{T}", "\"timestamp\":\"2027-01-15T08:00:00.000000000Z\""))
+                .map(|line| format!("{line}\n"))
+                .collect();
+            EventJsonDecoder::new().decode_batches(text.as_bytes()).expect("JSON lines")
+        };
+        let table = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../spec/transit/mapping.yaml");
+        let mapping = mapping::load(&table).expect("the committed table loads");
+        let traced = Traced {
+            outcome: super::super::Outcome { events: Vec::new(), counters: BTreeMap::new() },
+            sunk: batches(ins),
+            decoded: batches(outs),
+            sink: config,
+        };
+        let at = At { flow: "test", case: "test" };
+        check(&mapping, &at, &traced, &mut Ledger::default())
+    }
+
+    /// Under exposition, a record a later record of its series overwrote in the registry is
+    /// credited to its cell's `normalized` class, though nothing reads back for it.
+    #[test]
+    fn an_exposed_record_a_later_one_of_its_series_overwrote_is_normalized() {
+        let ins = [
+            r#"{{T},"metrics":[{"name":"g","kind":"gauge","value":1.0}],"attributes":{"a":"x"}}"#,
+            r#"{{T},"metrics":[{"name":"g","kind":"gauge","value":2.0}],"attributes":{"a":"x"}}"#,
+        ];
+        let outs =
+            [r#"{{T},"metrics":[{"name":"g","kind":"gauge","value":2.0}],"attributes":{"a":"x"}}"#];
+        let exposed = serde_json::json!({"type": "prometheus_out", "bind": "127.0.0.1:9464"});
+        let failures = check_prometheus(&ins, &outs, exposed);
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    /// The credit needs a later record of the record's own series: an unread record whose cell
+    /// is `normalized` for another reason, beside a later record of another series, still fails.
+    #[test]
+    fn an_exposed_record_with_no_later_record_of_its_series_still_fails() {
+        let ins = [
+            r#"{{T},"metrics":[{"name":"g","kind":"gauge","value":1}],"attributes":{"a":"x"}}"#,
+            r#"{{T},"metrics":[{"name":"g","kind":"gauge","value":2}],"attributes":{"a":"y"}}"#,
+        ];
+        let outs =
+            [r#"{{T},"metrics":[{"name":"g","kind":"gauge","value":2.0}],"attributes":{"a":"y"}}"#];
+        let exposed = serde_json::json!({"type": "prometheus_out", "bind": "127.0.0.1:9464"});
+        let failures = check_prometheus(&ins, &outs, exposed);
+        assert_eq!(failures.len(), 1, "{failures:#?}");
+        assert!(failures[0].contains("isn't read back"), "{failures:#?}");
     }
 }

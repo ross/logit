@@ -93,6 +93,8 @@
 //! | `gauge/u64` | normalized | `f64_value` | Plaintext writes every digit and pickle the nearest `f64`, and graphite_in reads either back as a float, rounded beyond 2^53. |
 //! | `gauge/bool` | normalized | `bool_value`; `logit.output.metrics.normalized{reason=bool_value}` | A boolean is written as `1` or `0` and reads back as that number. |
 //! | `gauge/negative` | exact | -- | A negative value, written as is. |
+//! | `gauge/prometheus_info` | exact | -- | As any other gauge; the type carrier isn't written. |
+//! | `gauge/prometheus_stateset` | exact | -- | As any other gauge; the type carrier isn't written. |
 //! | `gauge_delta/f64` | dropped | `logit.output.metrics.dropped{reason=unresolved_gauge_delta}` | Carbon has no relative gauge, so an unresolved adjustment is dropped, with a throttled `gauge_delta_unresolved` warning; an `aggregate` upstream resolves it into a gauge. |
 //! | `gauge_delta/i64` | dropped | `logit.output.metrics.dropped{reason=unresolved_gauge_delta}` | Dropped, as for a float adjustment. |
 //! | `gauge_delta/u64` | dropped | `logit.output.metrics.dropped{reason=unresolved_gauge_delta}` | Dropped, as for a float adjustment. |
@@ -113,6 +115,7 @@
 //! | `histogram/nan_bound`, otherwise | skipped | `logit.output.metrics.skipped{metric_kind=histogram}` | Under `multi_value: skip`, the default, no datapoint is written. |
 //! | `histogram/neg_inf_bound`, under `multi_value: expand` | degraded | `logit.output.metrics.degraded{metric_kind=histogram}` | Under `multi_value: expand`, each bucket is its own dotted datapoint, as for any other bound: `.bucket_-inf` holds that bucket's own count. |
 //! | `histogram/neg_inf_bound`, otherwise | skipped | `logit.output.metrics.skipped{metric_kind=histogram}` | Under `multi_value: skip`, the default, no datapoint is written. |
+//! | `histogram/gauge_histogram` | exact | -- | As `histogram/cumulative`; the type carrier isn't written. |
 //! | `exponential_histogram/delta`, under `multi_value: expand` | degraded | `logit.output.metrics.degraded{metric_kind=exponential_histogram}` | Under `multi_value: expand`, dotted `.count`, `.sum`, `.min`, `.max`, and `.zero_count` datapoints. Its buckets aren't written, since each scale would mint its own paths. |
 //! | `exponential_histogram/delta`, otherwise | skipped | `logit.output.metrics.skipped{metric_kind=exponential_histogram}` | Under `multi_value: skip`, the default, no datapoint is written. |
 //! | `exponential_histogram/cumulative`, under `multi_value: expand` | degraded | `logit.output.metrics.degraded{metric_kind=exponential_histogram}` | Under `multi_value: expand`, the same dotted datapoints as a delta one's, and no buckets. |
@@ -129,7 +132,9 @@
 //! | `record/sample_rate` | exact | -- | Under `multi_value: expand`, each value is weighted by its inverse rate in the sketch the `samples` row describes. |
 //! | `record/superseded` | exact | -- | Each record is its own datapoint at its own second. A whisper store keeps one point per path and second, so there a later point in the same second replaces an earlier one. |
 //! | `record/same_instant` | exact | -- | Each record is its own datapoint; a whisper store keeps the later of two points at one second. |
+//! | `record/same_instant_equal` | exact | -- | Each record is its own datapoint; a whisper store keeps the later of two points at one second. |
 //! | `record/same_millisecond` | exact | -- | Each record is its own datapoint, its timestamp floored to the second; a whisper store keeps the later of two points in one second. |
+//! | `record/same_millisecond_equal` | exact | -- | Each record is its own datapoint, its timestamp floored to the second; a whisper store keeps the later of two points in one second. |
 //! | `record/non_finite` | dropped | `logit.output.metrics.dropped{reason=unencodable_value}` | Carbon has no non-finite value, so the datapoint isn't written, with a throttled `unencodable_value` warning. |
 //! | `log/dogstatsd_event` | skipped | `logit.output.events.skipped{reason=no_metrics}` | A log has no carbon form and isn't written. |
 //! | `log/plain` | skipped | `logit.output.events.skipped{reason=no_metrics}` | A log has no carbon form and isn't written. |
@@ -142,10 +147,10 @@
 //!
 //! | Row | Class | Reason or counter | What a consumer sees |
 //! |---|---|---|---|
-//! | `record/unit` | lost | uncounted | Carbon has no unit; it isn't written or counted. |
-//! | `record/description` | lost | uncounted | Carbon has no description; it isn't written or counted. |
-//! | `record/start_timestamp` | lost | uncounted | Carbon has no start time; it isn't written or counted. |
-//! | `record/exemplars` | lost | uncounted | Carbon has no exemplars; they aren't written or counted. |
+//! | `record/unit` | lost | structural | Carbon has no unit, so none is written. |
+//! | `record/description` | lost | structural | Carbon has no description, so none is written. |
+//! | `record/start_timestamp` | lost | structural | Carbon has no start time, so none is written. |
+//! | `record/exemplars` | lost | structural | Carbon has no exemplars, so none are written. |
 //! | `attributes/string_value`, under `tags: drop` | lost | `logit.output.tags.omitted{reason=dialect}` | Under `tags: drop`, no tag is written, counted once per attribute, so series that differ only in their tags write one path. |
 //! | `attributes/string_value`, otherwise | normalized | `tag_sanitized`; `logit.output.metrics.normalized{reason=tag_sanitized}` | A `;name=value` tag. Each `;`, `!`, `^`, `=`, whitespace, and control character in the name, and each `;`, whitespace, and control character and a leading `~` in the value, is written as `_`, counted once per record. |
 //! | `attributes/bool_value`, under `tags: drop` | lost | `logit.output.tags.omitted{reason=dialect}` | Under `tags: drop`, no tag is written, counted once per attribute. |
@@ -160,12 +165,12 @@
 //! | `attributes/bytes_value`, otherwise | lost | `logit.output.tags.omitted{reason=unrepresentable}` | A bytes value has no tag form and is left off, counted. |
 //! | `attributes/timestamp_value`, under `tags: drop` | lost | `logit.output.tags.omitted{reason=dialect}` | Under `tags: drop`, no tag is written, counted once per attribute. |
 //! | `attributes/timestamp_value`, otherwise | lost | `logit.output.tags.omitted{reason=unrepresentable}` | A timestamp value has no tag form and is left off, counted. |
-//! | `attributes/prometheus_target` | lost | uncounted | Another protocol's `_logit.` carrier isn't a tag and is left off, uncounted, under either `tags:` mode. |
-//! | `attributes/foreign_carrier` | lost | uncounted | Another protocol's `_logit.` carrier isn't a tag and is left off, uncounted, under either `tags:` mode. |
+//! | `attributes/prometheus_target` | lost | structural | The scrape target is private and isn't a tag, so it's left off, under either `tags:` mode. |
+//! | `attributes/foreign_carrier` | lost | structural | Another protocol's `_logit.` carrier is private and isn't a tag, so it's left off, under either `tags:` mode. |
 //! | `attributes/resource_attribute`, under `tags: drop` | lost | `logit.output.tags.omitted{reason=dialect}` | Under `tags: drop`, no tag is written, counted once per attribute. |
 //! | `attributes/resource_attribute`, otherwise | normalized | `resource_merged`; `logit.output.metrics.normalized{reason=tag_sanitized}` | A tag, read back as an event attribute; on a key the event shares, the event's value wins, uncounted. Its name and value are sanitized as the `string_value` row says, counted once per record as `tag_sanitized`. |
-//! | `attributes/scope` | lost | uncounted | Carbon has no instrumentation scope; it isn't written or counted. |
-//! | `attributes/datadog_carrier_log` | lost | uncounted | Another protocol's `_logit.` carrier isn't a tag and is left off, uncounted. |
+//! | `attributes/scope` | lost | structural | Carbon has no instrumentation scope, so none is written. |
+//! | `attributes/datadog_carrier_log` | lost | structural | Another protocol's `_logit.` carrier is private and isn't a tag, so it's left off. |
 //! | `attributes/no_host` | exact | -- | A record with no host leaves with none. |
 //! | `log/beside_metrics` | lost | uncounted | A log on an event that carries metrics is left off while the metrics are written, uncounted. |
 //! | `span/beside_metrics` | lost | uncounted | A span on an event that carries metrics is left off while the metrics are written, uncounted. |
