@@ -1,0 +1,22 @@
+{
+  "cells": [
+    {"sink":"graphite_out","row":"attributes/array_value","cell":1,"observed":["normalized"]},
+    {"sink":"graphite_out","row":"attributes/datadog_carrier_log","cell":0,"observed":["lost"]},
+    {"sink":"graphite_out","row":"attributes/foreign_carrier","cell":0,"observed":["lost"]},
+    {"sink":"graphite_out","row":"attributes/no_host","cell":0,"observed":["exact"]},
+    {"sink":"graphite_out","row":"attributes/string_value","cell":1,"observed":["exact"]},
+    {"sink":"graphite_out","row":"distribution","cell":1,"observed":["skipped"]},
+    {"sink":"graphite_out","row":"gauge/f64","cell":0,"observed":["exact"]},
+    {"sink":"graphite_out","row":"gauge/negative","cell":0,"observed":["exact"]},
+    {"sink":"graphite_out","row":"log/dogstatsd_event","cell":0,"observed":["skipped"]},
+    {"sink":"graphite_out","row":"log/plain","cell":0,"observed":["skipped"]},
+    {"sink":"graphite_out","row":"record/same_instant","cell":0,"observed":["exact"]},
+    {"sink":"graphite_out","row":"record/service_check","cell":0,"observed":["exact"]},
+    {"sink":"graphite_out","row":"record/superseded","cell":0,"observed":["exact"]},
+    {"sink":"graphite_out","row":"record/unit","cell":0,"observed":["lost"]},
+    {"sink":"graphite_out","row":"samples","cell":1,"observed":["skipped"]},
+    {"sink":"graphite_out","row":"sum/delta_monotonic","cell":0,"observed":["degraded"]},
+    {"sink":"graphite_out","row":"sum/f64","cell":0,"observed":[]}
+  ],
+  "unspecified": []
+}

@@ -1,0 +1,4 @@
+# The datapoints pickle-p2 holds, recorded at protocol 5 and read in place from testdata/interop/.
+wire: ../../../../testdata/interop/graphite/graphite-pickle-p5-000.raw
+protocol: pickle
+exercises: [pickle_frame, pickle_protocol_5, integer_value, negative_value, fractional_timestamp]

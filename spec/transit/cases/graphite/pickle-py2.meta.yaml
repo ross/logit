@@ -1,0 +1,6 @@
+# A recorded Python 2.7 connection, read in place from testdata/interop/: Diamond's
+# `cPickle.dumps(batch)` call, with a UTF-8 path, a path reused through `GET`, and a `long`
+# timestamp.
+wire: ../../../../testdata/interop/graphite/graphite-pickle-py2-000.raw
+protocol: pickle
+exercises: [pickle_frame, pickle_protocol_0, pickle_python2, pickle_memo, pickle_long, utf8_path, negative_value]

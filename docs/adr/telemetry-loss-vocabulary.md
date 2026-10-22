@@ -293,8 +293,8 @@ uncounted:
 - **The new names reuse the vocabulary:**
   - `output.events.skipped{reason="no_metrics"}` at `statsd_out`, `prometheus_out`, and
     `influxdb_out`, which carry metrics alone, for an event with no metric record (a log, a span,
-    or neither; `influxdb_out` also writes a string-only carrier event). `statsd_out`'s untagged
-    count gains the reason.
+    or neither; `influxdb_out` also writes a string-only carrier event), as `graphite_out`
+    already counts it. `statsd_out`'s untagged count gains the reason.
   - `output.events.skipped{reason="no_payload"}` at `otlp_out` and `datadog_out`, which carry all
     three signals, as `splunk_hec_out` already counts it.
   - `output.metrics.normalized{reason="name_sanitized"}` at `statsd_out` and `prometheus_out`, and

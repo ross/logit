@@ -1,0 +1,5 @@
+# A CPython 3.12 protocol-2 payload, read in place from testdata/differential/: a tagged path, a
+# path reused through `BINGET`, and integer and float timestamps and values.
+wire: ../../../../testdata/differential/graphite-pickle/py3-base-p2.pkl
+protocol: pickle
+exercises: [pickle_payload, pickle_protocol_2, pickle_tagged_path, pickle_memo, tags, integer_value, negative_value, fractional_timestamp]

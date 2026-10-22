@@ -1,0 +1,15 @@
+# graphite_in's cases into influxdb_out with nothing between: each gauge a measurement named for
+# its path, each tag an InfluxDB tag.
+# `path:` names one case so `logit run` can run this by hand; the transit spec runs every case in
+# that file's directory (spec/transit/README.md).
+components:
+  case:
+    type: replay_in
+    path: ../cases/graphite/tagged.json
+  out:
+    type: influxdb_out
+    sources: [case]
+    url: http://127.0.0.1:8086
+    token: unused
+    bucket: metrics
+    org: acme

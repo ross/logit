@@ -21,8 +21,8 @@ use crate::multi_value::{expand_dotted, DottedScratch};
 use crate::{FramedEncoder, MessageBuf};
 use logit_core::interner::resolve;
 use logit_core::{
-    Diagnostics, Event, EventBatch, MetricKind, MetricRecord, MetricValue, Resource, Telemetry,
-    Value,
+    Diagnostics, Event, EventBatch, MetricKind, MetricRecord, MetricValue, Resource, Sum,
+    Telemetry, Temporality, Value,
 };
 use std::fmt::Write as _;
 use std::ops::Range;
@@ -34,13 +34,20 @@ const NANOS_PER_SECOND: i64 = 1_000_000_000;
 /// Production telemetry comes from the counters the encoder emits itself.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct EncodeStats {
-    /// Events with no metrics (a log- or span-only event). Not a loss: nothing to carry.
+    /// Events with no metrics (a log, a span, or attributes alone), counted
+    /// `events.skipped{reason="no_metrics"}`: carbon has no form for them.
     pub skipped_no_metrics: usize,
     /// A multi-value metric kind under [`MultiValue::Skip`], once per record, tagged with the kind.
     pub dropped_unsupported_kind: usize,
     /// A multi-value metric kind under [`MultiValue::Expand`], once per **record**, however many
     /// sub-paths it produced.
     pub degraded_expanded_kind: usize,
+    /// An expanded record with a non-finite component left off, once per record however many it
+    /// left off, counted `metrics.degraded{reason="non_finite_component"}`.
+    pub degraded_non_finite_component: usize,
+    /// A `Sum` written as its bare value, once per record (normalization 12): its temporality
+    /// and monotonicity don't survive, so carbon and `graphite_in` read it as a gauge.
+    pub degraded_sum: usize,
     /// A `Gauge`/`Sum` whose value is NaN or ±inf. Carbon drops a NaN on receipt, and has no
     /// spelling for an infinity.
     pub dropped_unencodable_value: usize,
@@ -243,7 +250,7 @@ impl FramedEncoder for GraphiteEncoder {
 
         for event in &batch.events {
             if event.metrics.is_empty() {
-                ctx.stats.skipped_no_metrics += 1;
+                ctx.skip_no_metrics();
                 continue;
             }
 
@@ -289,9 +296,13 @@ impl FramedEncoder for GraphiteEncoder {
 
 /// What a record's kind resolves to before its path is rendered, so a dropped kind never counts a
 /// path sanitization.
+#[derive(Clone, Copy)]
 enum Plan {
     /// One datapoint carrying this value.
     Scalar(MetricValue),
+    /// A `Sum`'s bare value, counted degraded under this `metric_kind` tag before the sink writes
+    /// it, so an oversize drop counts under both counters.
+    Sum(MetricValue, &'static str),
     /// Several dotted sub-paths, which [`expand_dotted`] yields.
     Expand,
 }
@@ -319,7 +330,7 @@ fn encode_record(
     // No wildcard, so a new `MetricKind` fails to compile here rather than taking a default.
     let plan = match &record.kind {
         // Every temporality and monotonicity writes the bare value (normalization 12).
-        MetricKind::Sum(sum) => Some(Plan::Scalar(sum.value)),
+        MetricKind::Sum(sum) => Some(Plan::Sum(sum.value, sum_kind_tag(sum))),
         MetricKind::Gauge(v) => Some(Plan::Scalar(*v)),
         MetricKind::GaugeDelta(_) => {
             ctx.drop_gauge_delta();
@@ -338,7 +349,7 @@ fn encode_record(
     // `None` means [`multi`] already counted the drop under `multi_value: skip`.
     let Some(plan) = plan else { return };
 
-    if let Plan::Scalar(value) = plan {
+    if let Plan::Scalar(value) | Plan::Sum(value, _) = plan {
         if !value.is_finite() {
             ctx.drop_unencodable_value(name, value.as_f64());
             return;
@@ -358,9 +369,12 @@ fn encode_record(
     }
 
     match plan {
-        Plan::Scalar(value) => {
+        Plan::Scalar(value) | Plan::Sum(value, _) => {
             if let MetricValue::Bool(_) = value {
                 ctx.value_bool();
+            }
+            if let Plan::Sum(_, metric_kind) = plan {
+                ctx.degrade_sum(metric_kind);
             }
             sink.emit(path, "", tag_suffix, value, seconds, ctx)
         }
@@ -369,7 +383,10 @@ fn encode_record(
             let expanded = expand_dotted(&record.kind, dotted, |suffix, value, _| {
                 sink.emit(path, suffix, tag_suffix, MetricValue::F64(value), seconds, ctx)
             });
-            debug_assert!(expanded, "only a multi-value kind plans an expansion");
+            debug_assert!(expanded.is_some(), "only a multi-value kind plans an expansion");
+            if expanded.is_some_and(|skipped| skipped > 0) {
+                ctx.degrade_non_finite_component();
+            }
         }
     }
 }
@@ -405,6 +422,16 @@ fn metric_kind_tag(kind: &MetricKind) -> &'static str {
         MetricKind::Sum(_) | MetricKind::Gauge(_) | MetricKind::GaugeDelta(_) => {
             unreachable!("a scalar kind never expands")
         }
+    }
+}
+
+/// The `metric_kind` counter tag for a `Sum`, in `statsd_out`'s vocabulary. A monotonic delta
+/// sum is exact at `statsd_out`, so only this sink tags it.
+fn sum_kind_tag(sum: &Sum) -> &'static str {
+    match (sum.temporality, sum.monotonic) {
+        (Temporality::Cumulative, _) => "cumulative_sum",
+        (Temporality::Delta, false) => "non_monotonic_delta_sum",
+        (Temporality::Delta, true) => "monotonic_delta_sum",
     }
 }
 
@@ -571,19 +598,8 @@ fn build_tag_suffix(
             continue;
         }
 
-        // An `Array` renders its *last* representable element (walking backwards past
-        // unrepresentable ones), `influxdb_out`'s rule, so a repeated DogStatsD tag key reaches
-        // both sinks the same way.
-        scratch.clear();
         let is_multi_value = matches!(value, Value::Array(_));
-        let rendered = match value {
-            Value::Array(elements) => elements.iter().rev().any(|element| {
-                scratch.clear();
-                render_scalar(scratch, element)
-            }),
-            scalar => render_scalar(scratch, scalar),
-        };
-        if !rendered {
+        if !render_tag_value(scratch, value) {
             ctx.tag_omitted_unrepresentable();
             continue;
         }
@@ -641,6 +657,22 @@ fn build_tag_suffix(
     sanitized
 }
 
+/// Renders an attribute's [`Value`] into `out` (cleared first) as its tag value, before
+/// sanitizing, returning whether it has one. An `Array` renders its *last* representable element
+/// (walking backwards past unrepresentable ones), `influxdb_out`'s rule, so a repeated DogStatsD
+/// tag key reaches both sinks the same way. Public so the transit spec's class check reads a tag
+/// value back as this encoder writes it.
+pub fn render_tag_value(out: &mut String, value: &Value) -> bool {
+    out.clear();
+    match value {
+        Value::Array(elements) => elements.iter().rev().any(|element| {
+            out.clear();
+            render_scalar(out, element)
+        }),
+        scalar => render_scalar(out, scalar),
+    }
+}
+
 /// Renders one non-`Array` [`Value`] as a tag value, returning whether it has a faithful string
 /// form. The rest are dropped rather than given an invented syntax (`Bytes` need not be UTF-8,
 /// and nothing parses a flattened `Map` back).
@@ -692,7 +724,7 @@ fn sanitize_into(out: &mut String, s: &str, forbidden: impl Fn(char) -> bool) ->
 
 /// [`sanitize_into`] for a tag value, which also substitutes a **leading** `~` (reserved by
 /// carbon's tag grammar); a `~` elsewhere rides through.
-fn sanitize_tag_value_into(out: &mut String, s: &str) -> bool {
+pub fn sanitize_tag_value_into(out: &mut String, s: &str) -> bool {
     let mut substituted = false;
     for (i, c) in s.chars().enumerate() {
         if is_forbidden_in_tag_value(c) || (i == 0 && c == '~') {
@@ -708,19 +740,19 @@ fn sanitize_tag_value_into(out: &mut String, s: &str) -> bool {
 /// Forbidden in a path: `;` opens the tag segment, whitespace ends the field, a control byte would
 /// corrupt line framing, and `/`/`\` are whisper's **directory separators**. Unicode whitespace,
 /// per [`super`]'s "Sanitization" section.
-fn is_forbidden_in_path(c: char) -> bool {
+pub fn is_forbidden_in_path(c: char) -> bool {
     matches!(c, ';' | '/' | '\\') || c.is_whitespace() || c.is_control()
 }
 
 /// Forbidden in a tag name: carbon's `TaggedSeries` grammar reserves `;` (tag separator), `=`
 /// (name/value separator), and `!`/`^` (query operators), plus whitespace and control bytes.
-fn is_forbidden_in_tag_name(c: char) -> bool {
+pub fn is_forbidden_in_tag_name(c: char) -> bool {
     matches!(c, ';' | '!' | '^' | '=') || c.is_whitespace() || c.is_control()
 }
 
 /// Forbidden anywhere in a tag value. `=` is legal (carbon splits on the *first* `=`, so `k=a=b`
 /// is `k` → `a=b`), and so are `!`/`^`. The leading-`~` rule is in [`sanitize_tag_value_into`].
-fn is_forbidden_in_tag_value(c: char) -> bool {
+pub fn is_forbidden_in_tag_value(c: char) -> bool {
     c == ';' || c.is_whitespace() || c.is_control()
 }
 
@@ -758,6 +790,28 @@ impl Ctx<'_> {
                  the aggregate's mergeability is lost on the wire"
             ),
         );
+    }
+
+    /// No diagnostic: a relayed counter is the ordinary case, so a warning would fire on every
+    /// healthy pipeline. The counter is the signal, as at `statsd_out`.
+    fn degrade_sum(&mut self, metric_kind: &'static str) {
+        self.stats.degraded_sum += 1;
+        self.telemetry.count("logit.output.metrics.degraded", 1.0, &[("metric_kind", metric_kind)]);
+    }
+
+    fn degrade_non_finite_component(&mut self) {
+        self.stats.degraded_non_finite_component += 1;
+        self.telemetry.count(
+            "logit.output.metrics.degraded",
+            1.0,
+            &[("reason", "non_finite_component")],
+        );
+    }
+
+    /// No diagnostic: a log or span tapped into a metrics sink is a topology choice, not a fault.
+    fn skip_no_metrics(&mut self) {
+        self.stats.skipped_no_metrics += 1;
+        self.telemetry.count("logit.output.events.skipped", 1.0, &[("reason", "no_metrics")]);
     }
 
     fn drop_gauge_delta(&mut self) {
@@ -1000,21 +1054,52 @@ mod tests {
         assert_eq!(stats.datapoints, 1);
     }
 
-    /// Normalization 12: all four `Sum` shapes write the bare value.
+    /// Normalization 12: a `Sum` writes its bare value, counted degraded once per record under
+    /// `metric_kind`.
+    fn assert_sum_degraded(temporality: Temporality, monotonic: bool, metric_kind: &str) {
+        let sum = || MetricKind::Sum(Sum { value: MetricValue::F64(7.0), temporality, monotonic });
+        let (lines, _, stats, registry) =
+            encode_with(&batch(vec![event(sum()), event(sum())]), |e| e);
+        assert_eq!(lines, vec!["sys.cpu 7 1700000000"; 2], "the bare value");
+        assert_eq!(stats.degraded_sum, 2, "once per record");
+        assert_eq!(
+            counted(&registry, "logit.output.metrics.degraded", ("metric_kind", metric_kind)),
+            2.0
+        );
+    }
+
     #[test]
-    fn every_sum_shape_writes_its_bare_value() {
-        for temporality in [Temporality::Delta, Temporality::Cumulative] {
-            for monotonic in [true, false] {
-                let kind =
-                    MetricKind::Sum(Sum { value: MetricValue::F64(7.0), temporality, monotonic });
-                let lines = encode(&batch(vec![event(kind)]));
-                assert_eq!(
-                    lines,
-                    vec!["sys.cpu 7 1700000000"],
-                    "{temporality:?}/{monotonic} must write the bare value"
-                );
-            }
-        }
+    fn a_monotonic_delta_sum_is_counted_degraded() {
+        assert_sum_degraded(Temporality::Delta, true, "monotonic_delta_sum");
+    }
+
+    #[test]
+    fn a_non_monotonic_delta_sum_is_counted_degraded() {
+        assert_sum_degraded(Temporality::Delta, false, "non_monotonic_delta_sum");
+    }
+
+    #[test]
+    fn a_monotonic_cumulative_sum_is_counted_degraded() {
+        assert_sum_degraded(Temporality::Cumulative, true, "cumulative_sum");
+    }
+
+    #[test]
+    fn a_non_monotonic_cumulative_sum_is_counted_degraded() {
+        assert_sum_degraded(Temporality::Cumulative, false, "cumulative_sum");
+    }
+
+    /// A `Sum` dropped before it's written isn't also counted degraded.
+    #[test]
+    fn a_dropped_sum_is_not_counted_degraded() {
+        let kind = MetricKind::Sum(Sum {
+            value: MetricValue::F64(f64::NAN),
+            temporality: Temporality::Delta,
+            monotonic: true,
+        });
+        let (lines, _, stats, _) = encode_with(&batch(vec![event(kind)]), |e| e);
+        assert!(lines.is_empty());
+        assert_eq!(stats.dropped_unencodable_value, 1);
+        assert_eq!(stats.degraded_sum, 0);
     }
 
     /// Normalization 8: Rust's `{}` is the shortest round-trip rendering.
@@ -1095,11 +1180,50 @@ mod tests {
     }
 
     #[test]
-    fn an_event_with_no_metrics_is_skipped_without_a_counter() {
-        let (lines, _, stats, _) =
-            encode_with(&batch(vec![Event::empty(TS, AttrMap::new())]), |e| e);
-        assert!(lines.is_empty());
-        assert_eq!(stats.skipped_no_metrics, 1);
+    fn an_event_with_no_metrics_is_skipped_and_counted_once_per_event() {
+        let empty = || Event::empty(TS, AttrMap::new());
+        let (lines, _, stats, registry) =
+            encode_with(&batch(vec![empty(), event(MetricKind::gauge(1.0)), empty()]), |e| e);
+        assert_eq!(lines, vec!["sys.cpu 1 1700000000"]);
+        assert_eq!(stats.skipped_no_metrics, 2);
+        assert_eq!(
+            counted(&registry, "logit.output.events.skipped", ("reason", "no_metrics")),
+            2.0
+        );
+    }
+
+    /// Under `multi_value: expand`, a record with non-finite components counts once, however many
+    /// it left off; one with none counts nothing.
+    #[test]
+    fn an_expanded_non_finite_component_is_counted_degraded_once_per_record() {
+        let histogram = |sum: f64, max: f64| {
+            event(MetricKind::Histogram(Histogram {
+                buckets: vec![(1.0, 2)],
+                temporality: Temporality::Delta,
+                sum: Some(sum),
+                min: Some(0.5),
+                max: Some(max),
+            }))
+        };
+        let (lines, _, stats, registry) = encode_with(
+            &batch(vec![
+                histogram(f64::NAN, f64::INFINITY),
+                histogram(1.5, 1.0),
+                event(MetricKind::Summary(Summary {
+                    quantiles: vec![(0.5, f64::NAN)],
+                    count: 1,
+                    sum: 1.0,
+                    temporality: Temporality::Cumulative,
+                })),
+            ]),
+            |e| e.with_multi_value(MultiValue::Expand),
+        );
+        assert!(!lines.iter().any(|l| l.contains("NaN") || l.contains("inf ")), "{lines:?}");
+        assert_eq!(stats.degraded_non_finite_component, 2, "one per record with a skip");
+        assert_eq!(
+            counted(&registry, "logit.output.metrics.degraded", ("reason", "non_finite_component")),
+            2.0
+        );
     }
 
     // -- timestamps ------------------------------------------------------------------------------
