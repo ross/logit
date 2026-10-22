@@ -130,14 +130,27 @@ fn resolve(
     resolve_as(value, lookup, path, substitutions, EnvScalar::Retype)
 }
 
-/// Whether `mapping`, at `path`, is a `lua`/`lua_file` component: `components.<id>` with a plain
-/// `type: lua` or `type: lua_file`.
-fn is_lua_component(path: &[PathSeg], mapping: &Mapping) -> bool {
-    matches!(path, [PathSeg::Key(root), PathSeg::Key(_)] if root == "components")
-        && matches!(
-            mapping.get("type"),
-            Some(Value::String(kind)) if kind == "lua" || kind == "lua_file"
-        )
+/// Whether `mapping`, at `path`, is a `lua`/`lua_file` component: `components.<id>` whose `type`
+/// is `lua` or `lua_file`, written inline or as `!env VAR`. Runs before the mapping's entries
+/// resolve, so an `!env` `type` is looked up here; an unset variable is reported when the entry
+/// itself resolves.
+fn is_lua_component(
+    path: &[PathSeg],
+    mapping: &Mapping,
+    lookup: &impl Fn(&str) -> Option<String>,
+) -> bool {
+    if !matches!(path, [PathSeg::Key(root), PathSeg::Key(_)] if root == "components") {
+        return false;
+    }
+    let kind = match mapping.get("type") {
+        Some(Value::String(kind)) => Some(kind.clone()),
+        Some(Value::Tagged(tagged)) if tagged.tag == "env" => match &tagged.value {
+            Value::String(var) => lookup(var),
+            _ => None,
+        },
+        _ => None,
+    };
+    matches!(kind.as_deref(), Some("lua" | "lua_file"))
 }
 
 fn resolve_as(
@@ -149,7 +162,7 @@ fn resolve_as(
 ) -> anyhow::Result<Value> {
     match value {
         Value::Mapping(mapping) => {
-            let lua = is_lua_component(path, &mapping);
+            let lua = is_lua_component(path, &mapping, lookup);
             let mut resolved = Mapping::with_capacity(mapping.len());
             for (key, value) in mapping {
                 let key = resolve_as(key, lookup, path, substitutions, env)?;
@@ -609,12 +622,29 @@ components:
     #[test]
     fn env_values_keep_their_type_outside_a_lua_components_vars() {
         let yaml = "components:\n  c:\n    type: aggregate\n    vars: !env N\n  \
-                    d:\n    type: lua\n    other: {vars: !env N}\n";
+                    d:\n    type: lua\n    other: {type: lua, vars: !env N}\n";
         let value: Value = serde_norway::from_str(yaml).unwrap();
         let resolved =
             resolve(value, &env(&[("N", "5")]), &mut Vec::new(), &mut Vec::new()).unwrap();
         assert_eq!(resolved["components"]["c"]["vars"], Value::from(5));
         assert_eq!(resolved["components"]["d"]["other"]["vars"], Value::from(5));
+    }
+
+    /// A `type` written as `!env` still marks a Lua component, so its `vars:` keeps `!env` values
+    /// as strings.
+    #[test]
+    fn env_values_inside_vars_are_strings_when_the_type_is_env() {
+        use logit_config::{ComponentKind, LuaVar};
+        let yaml = "components:\n  in: {type: lines_in, bind: '127.0.0.1:5140'}\n  \
+                    script:\n    type: !env KIND\n    sources: [in]\n    script: x\n    \
+                    vars: {token: !env TOKEN}\n  out: {type: null_out, sources: [script]}\n";
+        let config = parse(yaml, &env(&[("KIND", "lua"), ("TOKEN", "1234567890123456")])).unwrap();
+        match &config.components["script"].kind {
+            ComponentKind::Lua { vars, .. } => {
+                assert_eq!(vars["token"], LuaVar::String("1234567890123456".into()))
+            }
+            other => panic!("expected Lua, got {other:?}"),
+        }
     }
 
     /// `timestamp`'s unit-variant and `{pattern: ..}` `format:` forms read via YAML.
