@@ -164,7 +164,7 @@
 //! | `record/service_check` | exact | -- | Record 0 of a service check goes to the check route alone, and datadog_in reads it back as the same status gauge and carriers. |
 //! | `record/sample_rate` | degraded | `logit.output.metrics.degraded{reason=sample_rate_expanded}` | The distribution route has no sample rate, so each value is repeated by its weight, the inverse of the rate rounded, and datadog_in reads the values back at rate 1. |
 //! | `record/superseded` | exact | -- | Each record is its own point at its own timestamp. |
-//! | `record/same_instant` | dropped | `logit.output.metrics.dropped{reason=duplicate_timestamp}` | Datadog keeps one point per series per second, the higher of two in one request, so the sink sends the later point and drops this one, counted, whatever the two values are. A `samples` record leaves on the distribution route, where Datadog keeps both, so it doesn't reach this row. A `dedup_timestamps` with `precision: 1s` upstream merges or collapses the pair instead. |
+//! | `record/same_instant` | dropped | `logit.output.metrics.dropped{reason=duplicate_timestamp}` | Datadog keeps one point per series per second, the higher of two in one request, so the sink sends the later point and drops this one, counted, whatever the two values are. Only the series route collapses: a `samples` record leaves on the distribution-points route, where Datadog keeps both, and a `distribution`, an `exponential_histogram`, and a `histogram` under `histograms.mode: distributions` on the sketches route, so they don't reach this row. A `dedup_timestamps` with `precision: 1s` upstream merges or collapses the pair instead. |
 //! | `record/same_millisecond` | dropped | `logit.output.metrics.dropped{reason=duplicate_timestamp}` | Series timestamps are whole seconds, and Datadog keeps one point per series per second, so the sink sends the later point and drops this one, counted, as for `record/same_instant`. |
 //! | `record/non_finite` | dropped | `logit.output.metrics.dropped{reason=non_finite_value}` | JSON has no `NaN` or infinity, so the point isn't written. |
 //! | `log/dogstatsd_event` | exact | -- | One `/api/v1/events` request per event, read back with the same `_logit.statsd.event.*` carriers. |
@@ -228,7 +228,7 @@
 //! | record 0 of a service check (`_logit.statsd.service_check.name` present and a `Gauge` first metric) | left for the service-checks route, uncounted; any later record encodes as usual, without the check's `_logit.statsd.service_check.*` carriers as tags | -- |
 //! | every record of an APM stats event ([`stats::ATTR_STATS_NAME`] present; [`is_datadog_stats`]) | left for the stats routes, uncounted: its `Sum`s and summary `Distribution`s are a stats group, not series or sketches | -- |
 //! | `Event::timestamp` | whole seconds, rounded toward negative infinity | -- |
-//! | two series points in one request with one metric name, one tag set (order and repeats aside), one host, device, and resources, in one second | the latest point is written, the later in batch order on a tie; Datadog would keep the higher of the two, not the later, and never sums two counts. The type, unit, interval, and origin aren't part of the key. Distribution points and sketches aren't collapsed | `logit.output.metrics.dropped{reason="duplicate_timestamp"}` per point left off, equal values included, + diag `duplicate_timestamp` |
+//! | two series points in one batch (under `datadog_out`, planned before its request cuts; [`series::SeriesDuplicates`]) with one metric name, one tag set (order and repeats aside), one host, device, and resources, in one second | the latest point is written, the later in batch order on a tie; Datadog would keep the higher of the two, not the later, and never sums two counts. The type, unit, interval, and origin aren't part of the key. Distribution points and sketches aren't collapsed | `logit.output.metrics.dropped{reason="duplicate_timestamp"}` per point left off, equal values included, + diag `duplicate_timestamp` |
 //! | [`ATTR_HOST_NAME`] | v2: a `{type: "host"}` resource, first; v1, distribution, and sketch: `host` | -- |
 //! | no [`ATTR_HOST_NAME`] or an empty one, and a `Str` [`ATTR_HOST_TAG`] (a DogStatsD `#host:` tag) | the host, where [`ATTR_HOST_NAME`] would go, and not a tag. An empty one is a sample marked hostless: written as the hostless rows below, never filled | -- |
 //! | a `host`-typed entry in [`ATTR_RESOURCES`] and no host from the rows above (the Agent's hostless v2 series: a `host` resource with no name) | v2: that entry, in order; v1, distribution, and sketch: a `host` of `""` (the entry itself is omitted, per the `no_wire_form` row); never filled | -- |
@@ -1016,6 +1016,8 @@ pub struct DatadogEncoder {
     histograms: HistogramOptions,
     /// Series points the last series encode left off as duplicates of a later one.
     series_duplicates: usize,
+    /// The sink's per-batch duplicate plan for the next series encodes, if any.
+    series_plan: Option<series::SeriesPlanned>,
 }
 
 /// The most `tags` strings one series, distribution point, or sketch may carry: Datadog's intake

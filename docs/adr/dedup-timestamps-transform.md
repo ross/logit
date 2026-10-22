@@ -346,15 +346,15 @@ record, and updates the transit spec's `same_instant` and `same_millisecond` row
 `prometheus_out` with it. Exposition mode's registry overwrite stays uncounted: the transit spec
 reads it as `normalized`, reason `superseded`, the pull model's overwrite.
 
-`datadog_out` gets the same counter in the same PR. In each series-route request, points of one
-Datadog series (the metric name, the tag set, and the host, device, and resources) in one second
-leave as the latest alone, the later in batch order on a tie, and each other point counts
+`datadog_out` gets the same counter in the same PR. In each batch, planned before the sink cuts
+it into requests, points of one Datadog series (the metric name, the tag set, and the host,
+device, and resources) in one second leave as the latest alone, the later in batch order on a
+tie, and each other point counts
 `logit.output.metrics.dropped{reason="duplicate_timestamp"}`, equal values included, with a
 throttled `duplicate_timestamp` diagnostic naming the remedy. That's the pre-filter, not a count
 of what's sent: Datadog would keep the higher point, not the later. Distribution points don't
-count, because Datadog keeps both, and sketches aren't collapsed. Two points that the sink's
-request cut puts in separate requests aren't collapsed: Datadog keeps the later request's,
-uncounted (`docs/known-gaps/datadog.md`).
+count, because Datadog keeps both, and sketches aren't collapsed. Two points in two batches
+aren't collapsed: Datadog keeps the later, uncounted (`docs/known-gaps/datadog.md`).
 
 ### Why this isn't the retired kind
 
@@ -463,7 +463,7 @@ keep the higher.
 - `dedup_timestamps` doesn't stop a cross-batch duplicate with a new value from drawing a remote-write
   `400` that drops a whole batch. W3 records it in `docs/known-gaps/prometheus.md`
   ([Scope](#scope-one-batch-and-no-added-latency)).
-- `datadog_out` drops all but the latest point of a series in one second of one request, and
+- `datadog_out` drops all but the latest point of a series in one second of one batch, and
   counts each as `logit.output.metrics.dropped{reason="duplicate_timestamp"}`
   ([The sink-side counter](#the-sink-side-counter)). A relay of a Datadog Agent's unaggregated
   `|T` gauges, which share a series and a second, counts all but one.

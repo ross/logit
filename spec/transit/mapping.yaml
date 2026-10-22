@@ -1697,9 +1697,11 @@ rows:
         counter: logit.output.metrics.dropped{reason=duplicate_timestamp}
         text: >-
           Datadog keeps one point per series per second, the higher of two in one request, so the
-          sink sends the later point and drops this one, counted, whatever the two values are. A
-          `samples` record leaves on the distribution route, where Datadog keeps both, so it
-          doesn't reach this row. A `dedup_timestamps` with `precision: 1s` upstream merges or
+          sink sends the later point and drops this one, counted, whatever the two values are.
+          Only the series route collapses: a `samples` record leaves on the distribution-points
+          route, where Datadog keeps both, and a `distribution`, an `exponential_histogram`, and
+          a `histogram` under `histograms.mode: distributions` on the sketches route, so they
+          don't reach this row. A `dedup_timestamps` with `precision: 1s` upstream merges or
           collapses the pair instead.
       graphite_out:
         class: exact

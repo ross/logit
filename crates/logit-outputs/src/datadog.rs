@@ -129,13 +129,16 @@
 //!
 //! **Two points of one series in one second.** Datadog keeps one point per series per second:
 //! of two in one request, the higher, for a `count` as for a gauge (a trial org, 2026-10-21), and
-//! across requests the later write. So the series encoder sends only the latest point of each
-//! series and second in a request, the later in batch order on a tie, and counts each other one
-//! `logit.output.metrics.dropped{reason="duplicate_timestamp"}`, equal values included, with a
-//! throttled `duplicate_timestamp` diagnostic (`logit_proto::datadog`'s encode table has the
-//! series key). `logit.output.records` counts only the points sent. Distribution points aren't
-//! collapsed: Datadog keeps both. Two points a request cut separates are both sent, and Datadog
-//! keeps the later request's, uncounted (`docs/known-gaps/datadog.md`). A `dedup_timestamps` with
+//! across requests the later write. So the plan finds, over the whole batch, the latest point of
+//! each series and second, the later in batch order on a tie
+//! (`logit_proto::datadog::series::SeriesDuplicates`; `logit_proto::datadog`'s encode table has
+//! the series key), and the series encoder sends only that one. Each other point is counted once
+//! per batch with the plan's drops, `logit.output.metrics.dropped{reason="duplicate_timestamp"}`,
+//! equal values included, with a throttled `duplicate_timestamp` diagnostic, and comes out of its
+//! event's weight, so no request cut or bisection splits a pair, and `logit.output.records` and
+//! an `at_most_once` drop count only the points sent. Distribution points aren't collapsed:
+//! Datadog keeps both. Two points of one series in one second in two batches are both sent, and
+//! Datadog keeps the later, uncounted (`docs/known-gaps/datadog.md`). A `dedup_timestamps` with
 //! `precision: 1s` as the last stage before this sink sums two counts and keeps the later gauge
 //! first.
 //!
@@ -317,7 +320,9 @@ use logit_core::interner::resolve;
 use logit_core::{redact, Diagnostics, Event, EventBatch, Resource, Symbol, Telemetry};
 use logit_pipeline::{BatchContext, DeliveryPosture, Fault, Output, SeqId};
 use logit_proto::datadog::events::EventFormat;
-use logit_proto::datadog::series::{metric_tag_count, record_routes, series_over_tag_limit};
+use logit_proto::datadog::series::{
+    metric_tag_count, record_routes, series_over_tag_limit, SeriesDuplicates, SeriesPlanned,
+};
 use logit_proto::datadog::{
     is_datadog_event, is_datadog_stats, is_service_check, trace_readiness, DatadogEncoder,
     HistogramOptions, TraceReadiness, MAX_METRIC_TAGS,
@@ -592,6 +597,26 @@ struct Plan {
     /// Spans the trace route drops, per [`TraceReadiness::drop_reason`].
     needs_agent_processing: usize,
     not_datadog_origin: usize,
+    /// The series points left off as duplicates of a later point of their series and second,
+    /// planned over the whole batch so no request cut or bisection splits a pair.
+    duplicates: Arc<SeriesDuplicates>,
+}
+
+/// Plans the series route's duplicates over the whole batch, after the stale filter and the tag
+/// limit, and takes each event's left-off points out of its weight, so the request cuts and the
+/// `records` count see only the points sent (module doc's "Two points of one series in one
+/// second").
+fn plan_duplicates(plan: &mut Plan, encoder: &DatadogEncoder, batch: &EventBatch) {
+    let series = &mut plan.routes[Route::Series as usize];
+    if series.len() < 2 && series.iter().all(|item| item.weight < 2) {
+        return;
+    }
+    let events: Vec<usize> = series.iter().map(|item| item.index).collect();
+    let duplicates = encoder.series_duplicates_in(batch, &events);
+    for item in series.iter_mut() {
+        item.weight = item.weight.saturating_sub(duplicates.of_event(item.index));
+    }
+    plan.duplicates = Arc::new(duplicates);
 }
 
 /// Each route's items for `batch` (module doc's "Routes"), indexed by `Route as usize`, before
@@ -1035,6 +1060,7 @@ impl DatadogOutput {
         }
         self.dropped(Route::Traces, "needs_agent_processing", plan.needs_agent_processing);
         self.dropped(Route::Traces, "not_datadog_origin", plan.not_datadog_origin);
+        self.encoder.count_duplicates(plan.duplicates.total());
     }
 
     /// `route`'s request limits: [`Route::caps`], or a test's override.
@@ -1067,11 +1093,17 @@ impl DatadogOutput {
     /// `records.dropped{reason="ambiguous_at_most_once"}`.
     async fn attempt(&mut self, batch: &EventBatch, now: i64) -> anyhow::Result<()> {
         let histograms = self.encoder.histograms();
-        let (first, mut plan) = self.accounting.encode(0, || plan(batch, now, histograms));
+        let encoder = &self.encoder;
+        let (first, mut plan) = self.accounting.encode(0, || {
+            let mut plan = plan(batch, now, histograms);
+            plan_duplicates(&mut plan, encoder, batch);
+            plan
+        });
         if first {
             self.count_plan_drops(&plan);
         }
         let gate = self.accounting.gate().clone();
+        let duplicates = Arc::clone(&plan.duplicates);
         let mut outcomes = Outcomes::new(self.accounting.any_accepted());
         let mut next_request: u32 = 0;
         for route in ROUTES {
@@ -1088,15 +1120,19 @@ impl DatadogOutput {
                     &gate,
                     |item| item.weight,
                     |chunk| {
-                        let raw = route.encode(encoder, &sub_batch(batch, chunk))?;
-                        // The series points the encoder left off as duplicates, which the
-                        // chunk's items weigh but the body doesn't hold.
-                        let duplicates =
-                            if route == Route::Series { encoder.series_duplicates() } else { 0 };
+                        if route == Route::Series {
+                            encoder.with_series_plan(Some(SeriesPlanned {
+                                dropped: Arc::clone(&duplicates),
+                                origin: chunk.iter().map(|item| item.index).collect(),
+                            }));
+                        }
+                        let raw = route.encode(encoder, &sub_batch(batch, chunk));
+                        encoder.with_series_plan(None);
+                        let raw = raw?;
                         Some(Encoded {
                             raw_len: raw.len(),
                             body: body_encoding.apply(raw),
-                            meta: duplicates,
+                            meta: (),
                         })
                     },
                 )
@@ -1121,7 +1157,7 @@ impl DatadogOutput {
                 if self.accounting.settled(request) {
                     continue;
                 }
-                let entries = weight(&chunk).saturating_sub(encoded.meta);
+                let entries = weight(&chunk);
                 // `post` counts and diagnoses a rejection itself.
                 let result = self.post(route, encoded, entries).await;
                 let accepted = result.is_ok();
@@ -1189,12 +1225,7 @@ impl DatadogOutput {
     /// dropped here, `oversize` for a `413` and `rejected` for any other 3xx or 4xx that
     /// [`classify_status`] doesn't read as `Refused`. A series `2xx` counts the entries its body
     /// names `rejected` as well ([`series_errors`]), and takes them out of `records`.
-    async fn post(
-        &mut self,
-        route: Route,
-        encoded: Encoded<usize>,
-        entries: usize,
-    ) -> anyhow::Result<()> {
+    async fn post(&mut self, route: Route, encoded: Encoded, entries: usize) -> anyhow::Result<()> {
         let url = self.url(route);
         let tags = [("route", route.name())];
         let wire_len = encoded.body.len();
@@ -3224,5 +3255,100 @@ mod tests {
         let (sums, _) = run_dd(|p, _| accepted(p), vec![b], at_least_once(), instrumented).await;
         assert_eq!(sum_of(&sums, "logit.output.metrics.dropped", &[]), 0.0);
         assert_eq!(sum_of(&sums, RECORDS, &[("route", "distribution_points")]), 2.0);
+    }
+
+    /// Each series body's points as `(metric, value)`, in send order across the bodies.
+    fn sent_series(log: &[Recorded]) -> Vec<(String, f64)> {
+        bodies(log, SERIES)
+            .iter()
+            .flat_map(|body| {
+                let decoded = DatadogDecoder::new().decode_series_v2_protobuf(body, NOW).unwrap();
+                decoded.events.into_iter().map(|e| {
+                    let value = match e.metrics[0].kind {
+                        MetricKind::Gauge(v) => v.as_f64(),
+                        ref other => panic!("a gauge, got {other:?}"),
+                    };
+                    (resolve(e.metrics[0].name).to_string(), value)
+                })
+            })
+            .collect()
+    }
+
+    fn named(name: &str, ts: i64, value: f64) -> Event {
+        Event::metric(ts, AttrMap::new(), MetricRecord::new(intern(name), MetricKind::gauge(value)))
+    }
+
+    /// A same-second pair four events apart, the rest other series: the pair, its later point, and
+    /// the filler as `(metric, value)`.
+    fn split_pair_batch() -> EventBatch {
+        batch(vec![
+            named("m", NOW, 9.0),
+            named("a", NOW, 1.0),
+            named("b", NOW, 1.0),
+            named("c", NOW, 1.0),
+            named("m", NOW + 500_000_000, 2.0),
+        ])
+    }
+
+    fn assert_pair_collapsed_once(sums: &Sums, log: &[Recorded]) {
+        let sent = sent_series(log);
+        let m: Vec<f64> = sent.iter().filter(|(n, _)| n == "m").map(|(_, v)| *v).collect();
+        assert_eq!(m, [2.0], "only the later point of the pair is sent: {sent:?}");
+        let duplicate = [("reason", "duplicate_timestamp")];
+        assert_eq!(sum_of(sums, "logit.output.metrics.dropped", &duplicate), 1.0);
+        assert_eq!(sum_of(sums, RECORDS, &[("route", "series")]), sent.len() as f64);
+    }
+
+    /// A same-second pair that a request cut by entry count would split is collapsed before the
+    /// cut: one point sent, one dropped, and `records` counting what was sent.
+    #[tokio::test]
+    async fn a_same_second_pair_split_by_the_entry_cut_is_collapsed_once() {
+        let build = |addr, probe: &TelemetryProbe| {
+            instrumented(addr, probe).with_caps(Caps { entries: 2, ..Caps::UNBOUNDED })
+        };
+        let (sums, log) =
+            run_dd(|p, _| accepted(p), vec![split_pair_batch()], at_least_once(), build).await;
+        assert!(bodies(&log, SERIES).len() > 1, "the cut makes several requests");
+        assert_pair_collapsed_once(&sums, &log);
+    }
+
+    /// A same-second pair in one count-capped chunk whose body is over the byte cap, so the chunk
+    /// is bisected down to single events: still one point sent and one dropped.
+    #[tokio::test]
+    async fn a_same_second_pair_split_by_bisection_is_collapsed_once() {
+        let build = |addr, probe: &TelemetryProbe| {
+            instrumented(addr, probe).with_caps(Caps { raw_bytes: 300, ..Caps::UNBOUNDED })
+        };
+        let (sums, log) =
+            run_dd(|p, _| accepted(p), vec![split_pair_batch()], at_least_once(), build).await;
+        assert!(bodies(&log, SERIES).len() > 2, "the chunk was bisected");
+        assert_pair_collapsed_once(&sums, &log);
+    }
+
+    /// An ambiguous failure under `at_most_once` counts the entries it loses, and a point already
+    /// counted `duplicate_timestamp` isn't one of them.
+    #[tokio::test]
+    async fn an_ambiguous_at_most_once_drop_does_not_count_a_duplicate_twice() {
+        let script = |p: &str, k| {
+            if p == SERIES && k == 0 {
+                Reply::Answer(503, Vec::new())
+            } else {
+                accepted(p)
+            }
+        };
+        let build = |addr, probe: &TelemetryProbe| {
+            instrumented(addr, probe).with_caps(Caps { entries: 1, ..Caps::UNBOUNDED })
+        };
+        let b = batch(vec![
+            named("m", NOW, 9.0),
+            named("m", NOW + 500_000_000, 2.0),
+            named("a", NOW, 1.0),
+            named("b", NOW, 1.0),
+        ]);
+        let (sums, _) = run_dd(script, vec![b], at_most_once(), build).await;
+        let ambiguous = [("route", "series"), ("reason", "ambiguous_at_most_once")];
+        assert_eq!(sum_of(&sums, RECORDS_DROPPED, &ambiguous), 3.0);
+        let duplicate = [("reason", "duplicate_timestamp")];
+        assert_eq!(sum_of(&sums, "logit.output.metrics.dropped", &duplicate), 1.0);
     }
 }

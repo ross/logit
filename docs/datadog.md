@@ -217,16 +217,17 @@ its tags upstream with `keep` or `remove`.
 ### Two points of one series in one second leave as one
 
 Datadog keeps one point per series per second: the higher of two in one request, the later
-across requests, and a `count` isn't summed. So in each series request `datadog_out` sends the
-latest point of a series in one second and drops the others, equal values included, counted
+across requests, and a `count` isn't summed. So of each batch's series points, `datadog_out`
+sends the latest point of a series in one second and drops the others, equal values included,
+counted
 `logit.output.metrics.dropped{reason="duplicate_timestamp"}` with a throttled
 `duplicate_timestamp` diagnostic. A series is the metric name, the tag set, and the host, device,
 and resources. Distribution points aren't collapsed, because Datadog keeps both. A relay that
 keeps source timestamps from a source stamping several readings of one series in a second (an
 Agent's unaggregated `|T` gauges, `statsd_in` gauges, `internal`) shows a nonzero count. Put a
 `dedup_timestamps` with `precision: 1s` last before the sink: it keeps the latest gauge and sums
-deltas. Two points the sink's 10,000-entry request cut separates aren't collapsed, and Datadog
-keeps the later request's, uncounted (`docs/known-gaps/datadog.md`).
+deltas. Two points of one series in one second that arrive in two batches are both sent, and
+Datadog keeps the later, uncounted (`docs/known-gaps/datadog.md`).
 
 The series route also names what it dropped from an accepted request in its `202` body, such as
 a point more than 10 minutes in the future when the sender's clock runs ahead. `datadog_out`

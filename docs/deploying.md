@@ -3067,7 +3067,7 @@ sketch whose `tags` list holds more than 100 strings, so `datadog_out` drops it 
 `tags` don't count. Cut tags upstream with `keep` or `remove` to keep such a metric.
 
 **Two points of one series in one second leave as one.** Datadog keeps the higher of two such
-points in one request, so `datadog_out` sends the later and counts the other
+points in one request, so of each batch's pair `datadog_out` sends the later and counts the other
 `metrics.dropped{reason="duplicate_timestamp"}`; distribution points are kept, as Datadog keeps
 them. A `dedup_timestamps` with `precision: 1s` ahead of the sink merges deltas instead (see
 [Duplicate timestamps](#duplicate-timestamps)).

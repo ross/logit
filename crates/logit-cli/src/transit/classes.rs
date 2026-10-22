@@ -23,9 +23,10 @@
 //! `gauge` holding `NaN` or an infinity, and `superseded` when a later record of the run is
 //! another point of its series (the same name, kind, and public attributes), with `same_instant`
 //! when that point shares its timestamp or else `same_millisecond` when it shares its
-//! millisecond; at `datadog_out`, a `samples`, `distribution`, or `set_members` record reaches
-//! neither, since that sink collapses a series' points only on its series route, which writes
-//! none of those kinds. A `histogram` or `exponential_histogram` reaches the field row `record/min_max`
+//! millisecond; at `datadog_out`, a `samples`, `distribution`, `set_members`, or
+//! `exponential_histogram` record reaches neither, nor a `histogram` under `histograms.mode:
+//! distributions`, since that sink collapses a series' points only on its series route, and the
+//! distribution-points and sketches routes carry those kinds or nothing does. A `histogram` or `exponential_histogram` reaches the field row `record/min_max`
 //! for its `min` and `max`, which its own comparison leaves out, as a flagged point's leaves out
 //! its value: a stale marker reads back as `NaN`, and a `samples` record below rate 1 that rounds
 //! to weight 1 the field row `record/sample_rate_unweighted` for its rate, left out the same way.
@@ -1837,11 +1838,18 @@ pub(super) fn check(
         }
         // The later point of its series at this record's instant, if any.
         let twin = later.iter().copied().find(|&j| ins[j].timestamp == input.timestamp);
-        // `datadog_out` collapses a series' points in one second on its series route only, which
-        // writes nothing for these kinds: a `samples` or `distribution` record has its own route,
-        // where Datadog keeps both points, and a `set_members` record has no Datadog form.
+        // `datadog_out` collapses a series' points in one second on its series route only. A
+        // `samples` record has the distribution-points route, where Datadog keeps both points, a
+        // `distribution` record the sketches route, and a `set_members` record no Datadog form; the
+        // sketches route also carries every `exponential_histogram`, and a `histogram` under the
+        // default `histograms.mode: distributions`.
+        let sketched_histogram =
+            traced.sink["histograms"]["mode"].as_str().is_none_or(|mode| mode == "distributions");
         let collapsible = sink != "datadog_out"
-            || !matches!(input.kind.as_str(), "samples" | "distribution" | "set_members");
+            || !(matches!(
+                input.kind.as_str(),
+                "samples" | "distribution" | "set_members" | "exponential_histogram"
+            ) || (input.kind == "histogram" && sketched_histogram));
         if twin.is_some() && collapsible {
             features.push("same_instant");
         } else if twin.is_none()
