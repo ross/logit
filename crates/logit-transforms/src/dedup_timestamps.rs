@@ -10,7 +10,7 @@
 //!
 //! **Which record survives.** In a colliding set, a record that can't merge on its own passes
 //! through, counted `passed_through{reason}`: a `GaugeDelta`, a delta `Summary`, or a delta `Sum`
-//! of `Bool`s, whose sum is a count of another type (`no_merge_rule`); a flagged
+//! or a Datadog rate of `Bool`s, whose sum is a count of another type (`no_merge_rule`); a flagged
 //! `NO_RECORDED_VALUE` record of a delta or observation kind (`no_recorded_value`); and a
 //! non-finite delta value or histogram `sum` (`non_finite`). The survivor is the
 //! latest-timestamp record among the rest, the later in batch order on a tie. The rest of the set
