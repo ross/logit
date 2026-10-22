@@ -222,6 +222,21 @@ Entry format and the other areas: [the known-gaps index](README.md).
     a fixed-size key buffer (`pkg/util/quantile/agent.go` buffers 512 keys and merges them into
     the sorted store in one pass) instead of a binary search plus `Vec::insert` per value.
     Measure on the VM before believing it helps.
+- **`datadog_out` sketches an OTLP histogram point with no buckets as a one-bucket point.**
+  `otlp_in` reads a point with only `count` and `sum` as one `+Inf` bucket holding `count`, the
+  model shape of a point with one bucket and no bounds. Datadog's exporter treats the two apart:
+  given a bucketless delta point with a `min` and a `max`, it adds a bound at each and spreads the
+  count between them, and under `histograms.mode: counters` it writes no `.bucket` series for a
+  bucketless point. `datadog_out` writes the one-bucket point's sketch, every observation at the
+  Agent's key -1, and its `lower_bound:-inf,upper_bound:inf` `.bucket` series. With no `min` or
+  `max`, the sketch matches the exporter's. The `no-buckets-count*` cases of
+  `testdata/differential/datadog-sketch/` record the exporter's output, and each corpus reader
+  lists them in its `COLLAPSED`.
+  - **Consequence:** a bucketless point with `min` and `max` reaches Datadog with its count and
+    sum exact but every observation in one bin at about `-9.94e-10` rather than between them,
+    and counters mode adds one `.bucket` series.
+  - **Revisit trigger:** a producer that sends bucketless histograms to Datadog. Telling the
+    shapes apart needs a `count` field on `Histogram` (`docs/known-gaps/otlp.md`).
 - **`datadog_out` drops a sketch that would encode as more than 2^20 `k`/`n` entries**
   (`MAX_DOGSKETCH_ENTRIES`, `crates/logit-proto/src/datadog/sketches.rs`), rather than splitting
   each bin's count into `uint16` entries without bound.

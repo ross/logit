@@ -1070,7 +1070,7 @@ connection then discards input until its next `LF`.
 `crates/logit-inputs/src/otlp.rs`,
 [ADR `otlp-tls-and-pooled-grpc-client`](../adr/otlp-tls-and-pooled-grpc-client.md).
 
-**The connection metrics, and one codec counter.** `logit.input.connections`,
+**The connection metrics, and two codec counters.** `logit.input.connections`,
 `logit.input.connections.rejected{reason="limit"}` (the connection cap, `max_connections`, 1024
 by default, binding), `logit.input.connections.rejected{reason="proxy_header"}` (under
 `proxy_protocol: true`, a PROXY header that was missing, malformed, cut short, or late, read
@@ -1095,7 +1095,9 @@ counted there and once per consumer in `logit.component.events.dropped{reason="c
 batches after it that were never offered appear only here.
 
 The OTLP codec counts a metric with no data as
-`logit.input.metrics.skipped{metric_kind="unknown", reason="no_data"}`
+`logit.input.metrics.skipped{metric_kind="unknown", reason="no_data"}`, and a histogram point
+whose `count` isn't the sum of its bucket counts, which keeps its buckets, as
+`logit.input.metrics.degraded{reason="histogram_count_mismatch"}`
 (`crates/logit-proto/src/otlp/metrics.rs`).
 
 `Diagnostics` keys: `bound`, `connection_error` (one connection's I/O failing, a TLS accept
@@ -2289,8 +2291,10 @@ under one component id, as for `collectd_out`. The sink adds only what a socket 
   `logit.output.metrics.degraded{metric_kind="samples"|"distribution"}` (sent as a `Summary`),
   `logit.output.metrics.degraded{reason="non_finite_component"}` for a `Histogram` with a `NaN`
   or `-Inf` bound, whose count joins a neighboring bucket, once per record,
-  `logit.output.metrics.skipped{metric_kind="set_members"|"set"}`, each with a throttled
-  diagnostic (`otlp_set_members_metric_skipped`, `otlp_set_metric_skipped`), and
+  `logit.output.metrics.skipped{metric_kind="set_members"|"set"|"gauge_histogram"}`, each with a
+  throttled diagnostic (`otlp_set_members_metric_skipped`, `otlp_set_metric_skipped`,
+  `otlp_gauge_histogram_skipped`), the last for an OpenMetrics `gaugehistogram`, which the OTel
+  Prometheus compatibility spec drops, and
   `logit.output.metrics.dropped{reason="unresolved_gauge_delta"}` for a relative gauge no
   `aggregate` resolved, with the shared `gauge_delta_unresolved` diagnostic, and
   `logit.output.metrics.dropped{reason="unresolved_delta"}` for a delta `Summary`, which OTLP

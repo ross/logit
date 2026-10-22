@@ -889,7 +889,9 @@ rows:
           text: >-
             A sketch under `Mapping::agent` with its counts spread over the buckets as Datadog's
             exporter spreads them, and the point's count, sum, and average, which datadog_in reads
-            back as a distribution.
+            back as a distribution. A histogram whose one bucket is `+Inf`, such as otlp_in's
+            reading of a bucketless point, keys every observation at the Agent's key -1, about
+            `-9.94e-10`, as the exporter does.
       graphite_out:
         - when: {multi_value: expand}
           class: degraded

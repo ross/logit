@@ -81,14 +81,30 @@ func sumOrNaN(sum *float64) float64 {
 }
 
 // explicitCase is an OTLP `HistogramDataPoint`: `counts` has one more entry than `bounds`, or none.
-// `count` is the sum of `counts`, as logit's `Histogram` carries no count of its own.
+// `count` is the sum of `counts`, as logit's `Histogram` carries no count of its own, except for a
+// bucketless point, which `metrics.proto` allows to carry only `count` and `sum`: `count` sets it.
 type explicitCase struct {
 	name     string
 	bounds   []float64
 	counts   []uint64
+	count    *uint64
 	sum      *float64
 	min, max *float64
 }
+
+// pointCount is the point's `count`: the sum of its bucket counts, or `c.count` when set.
+func (c explicitCase) pointCount() uint64 {
+	if c.count != nil {
+		return *c.count
+	}
+	var count uint64
+	for _, n := range c.counts {
+		count += n
+	}
+	return count
+}
+
+func u(v uint64) *uint64 { return &v }
 
 type buckets struct {
 	Offset int32    `json:"offset"`
@@ -287,10 +303,7 @@ func translate(build func(pmetric.Metric)) (string, string, *sketchOut) {
 }
 
 func explicitBuild(c explicitCase) func(pmetric.Metric) {
-	var count uint64
-	for _, n := range c.counts {
-		count += n
-	}
+	count := c.pointCount()
 	return func(m pmetric.Metric) {
 		h := m.SetEmptyHistogram()
 		h.SetAggregationTemporality(pmetric.AggregationTemporalityDelta)
@@ -310,10 +323,7 @@ func explicitBuild(c explicitCase) func(pmetric.Metric) {
 }
 
 func explicitIn(c explicitCase) explicitInput {
-	var count uint64
-	for _, n := range c.counts {
-		count += n
-	}
+	count := c.pointCount()
 	bounds := make([]num, len(c.bounds))
 	for i, b := range c.bounds {
 		bounds[i] = num(b)
@@ -453,6 +463,8 @@ func explicitCases() []explicitCase {
 	cases := []explicitCase{
 		{name: "no-buckets", sum: f(0)},
 		{name: "no-buckets-min-max", sum: f(12), min: f(1), max: f(9)},
+		{name: "no-buckets-count", count: u(12), sum: f(30)},
+		{name: "no-buckets-count-min-max", count: u(12), sum: f(30), min: f(1), max: f(9)},
 		{name: "all-zero-counts", bounds: []float64{1, 2, 5}, counts: []uint64{0, 0, 0, 0}, sum: f(0)},
 		{name: "single-bucket", counts: []uint64{7}, sum: f(21)},
 		{name: "single-bucket-min-max", counts: []uint64{7}, sum: f(21), min: f(0.5), max: f(9)},

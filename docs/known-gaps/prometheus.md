@@ -136,7 +136,7 @@ Entry format and the other areas: [the known-gaps index](README.md).
     `_sum` (verified, leg 6).
   - **Revisit trigger:** closes with that native-histogram row.
 - **A `Distribution` isn't re-binned onto VictoriaMetrics's `vmrange` buckets.** Both are
-  log-bucketed, but `prometheus_out` sends a `Distribution` as the five-quantile summary it sends
+  log-bucketed, but `prometheus_out` sends a `Distribution` as the fixed-quantile summary it sends
   any Prometheus receiver. VictoriaMetrics's histogram functions (`prometheus_buckets()`,
   `histogram_quantile()` over `vmrange`) don't apply to it, and the quantiles can't be merged
   across series. VictoriaMetrics doesn't impose this loss: re-binning is a mapping nobody has

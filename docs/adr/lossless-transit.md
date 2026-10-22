@@ -384,8 +384,13 @@ class.
 count. A single bucket covering every value describes the same population, so this is a
 permitted normalization of `otlp_in -> otlp_out`, listed above: the point leaves as `count` n,
 `bucket_counts` `[n]`, and no bounds. Every other sink sees the true population too, such as
-`prometheus_out`'s `+Inf` bucket equal to `_count` and `datadog_out`'s one-bucket sketch, as
-Datadog's exporter sends.
+`prometheus_out`'s `+Inf` bucket equal to `_count`. `datadog_out` sketches it as Datadog's
+exporter sketches the bucketless point when it carries no `min` and `max`: one bin at the Agent's
+key -1, about `-9.94e-10`, holding every observation, with the count and sum exact. Given a `min`
+and a `max`, the exporter spreads the count between them, and under `histograms.mode: counters`
+it writes no `.bucket` series, which `datadog_out` can't tell apart from a one-bucket point's
+(`docs/known-gaps/datadog.md`; the `no-buckets-count*` cases of
+`testdata/differential/datadog-sketch/`).
 
 A point whose `count` isn't the sum of its `bucket_counts` breaks `metrics.proto`'s "The sum of
 the bucket_counts must equal the value in the count field". `otlp_in` keeps the buckets, since
