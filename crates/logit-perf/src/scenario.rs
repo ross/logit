@@ -245,7 +245,10 @@ fn parse(yaml: &str) -> anyhow::Result<Parsed> {
              can't be turned into events/s or CPU-per-event, so the harness requires a finite count",
         )?;
         if count == 0 {
-            bail!("`generate_in.count` is 0 -- graph rule 42 already rejects this at `logit validate` time");
+            bail!(
+                "`generate_in.count` is 0 -- the harness divides by the count, so it needs a \
+                 positive one"
+            );
         }
         Some(count)
     } else {

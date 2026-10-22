@@ -1,6 +1,6 @@
 ---
 created: 2026-09-22
-updated: 2026-10-11
+updated: 2026-10-21
 ---
 
 # `http_access`: web-server access lines normalized to OTel semconv once, natively, from raw fields
@@ -245,12 +245,13 @@ everywhere.
 ## Consequences
 
 - **Config surface:** `ComponentKind::HttpAccess { routes, route_other, user_agent_rules,
-  max_length, redact_query, forwarded }`, every field optional — a bare `type: http_access` is
-  meaningful, so unlike `keep_values`/`flatten` there is no "nothing configured is a no-op" rule.
-  Graph rule 60 compiles every pattern at validate time (rule 31's reasoning) and rejects the
-  usual empties, a duplicate built-in, a `max_length` key that names nothing this component caps,
+  max_length, redact_query, forwarded }`, every field optional — a bare `type: http_access`
+  normalizes with the built-in tables. Graph rule 60 compiles every pattern at validate time (rule
+  31's reasoning) and rejects the usual empties, a duplicate built-in, a `max_length` key that
+  names nothing this component caps,
   ~~and `forwarded: {trust: false}` (omit the block instead)~~ (superseded 2026-10-05; see the
-  amendment below). `CAPPED_FIELDS` and its defaults live
+  amendment below). A `max_length` of `0` is legal: that field becomes `""` on every event,
+  counted as truncated. `CAPPED_FIELDS` and its defaults live
   in `logit-config` so the rule and the transform cannot disagree. `ComponentKind::Json` gains
   `invalid_utf8: reject | replace`. Schema regenerated.
 - **Allocation contract**, enforced by `crates/logit-bench/tests/allocations.rs` and recorded in

@@ -254,6 +254,22 @@ mod tests {
         assert_eq!(route.route(&default_resource(), &event()), Destinations::FORWARD);
     }
 
+    #[test]
+    fn an_empty_routes_map_forwards_every_event() {
+        let mut route =
+            Route::new(RouteBy::Attribute("stream".to_string()), &routes(&[]), &targets(&[]));
+        assert_eq!(
+            route.route(&default_resource(), &event_with_attr("stream", Value::str("host"))),
+            Destinations::FORWARD
+        );
+        assert_eq!(route.route(&default_resource(), &event()), Destinations::FORWARD);
+
+        let mut by_origin =
+            Route::new(RouteBy::Provenance(ProvenanceField::Origin), &routes(&[]), &targets(&[]));
+        by_origin.observe_provenance(provenance(Some("edge_host"), None));
+        assert_eq!(by_origin.route(&default_resource(), &event()), Destinations::FORWARD);
+    }
+
     // -- Previous ---------------------------------------------------------------------------
 
     #[test]

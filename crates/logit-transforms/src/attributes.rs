@@ -613,4 +613,16 @@ mod tests {
         let mut event = event_with_attrs(&[]);
         assert!(!has.process(&resource, &mut event));
     }
+
+    #[test]
+    fn with_nothing_configured_has_attributes_forwards_and_drop_attributes_discards_every_event() {
+        let mut has = HasAttributes::new(vec![], vec![]);
+        let mut drop = DropAttributes::new(vec![], vec![]);
+        let resource = default_resource();
+        for attrs in [&[][..], &[("stream", Value::str("a"))][..]] {
+            let mut event = event_with_attrs(attrs);
+            assert!(has.process(&resource, &mut event), "an empty match holds for every event");
+            assert!(!drop.process(&resource, &mut event), "so drop_attributes discards each");
+        }
+    }
 }
