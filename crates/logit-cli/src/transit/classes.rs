@@ -23,7 +23,9 @@
 //! `gauge` holding `NaN` or an infinity, and `superseded` when a later record of the run is
 //! another point of its series (the same name, kind, and public attributes), with `same_instant`
 //! when that point shares its timestamp or else `same_millisecond` when it shares its
-//! millisecond; at `datadog_out`, a `samples`, `distribution`, `set_members`, or
+//! millisecond, each as `same_instant_equal` or `same_millisecond_equal` when the latest point of
+//! the series in its millisecond, the later in the run on a tie, is the same reading as the sink
+//! writes it ([`same_reading`]); at `datadog_out`, a `samples`, `distribution`, `set_members`, or
 //! `exponential_histogram` record reaches neither, nor a `histogram` under `histograms.mode:
 //! distributions`, since that sink collapses a series' points only on its series route, and the
 //! distribution-points and sketches routes carry those kinds or nothing does; under
@@ -89,7 +91,8 @@
 //! may also carry the `lower_bound`, `upper_bound`, or `quantile` tag of the bucket or quantile it
 //! expands. An input left unpaired was skipped or
 //! dropped: the class is the one whose counter moved, or the cell's when it says the loss is
-//! `uncounted`. One exception: under `prometheus_out` exposition (`bind:` set), an unpaired
+//! `uncounted`, or the expected class when it reached a `normalized` cell whose counter moved for
+//! an equal point that was read back: a sink that collapses two equal readings sends one of them. One exception: under `prometheus_out` exposition (`bind:` set), an unpaired
 //! record whose series has a later record in the case that was read back was overwritten in the
 //! registry, and reads at its expected class when that's `normalized` or `degraded`. A read-back
 //! record no input claims fails the check with both sides printed.
@@ -1316,6 +1319,26 @@ fn same_millisecond(rec: &Rec, later: &Rec) -> bool {
     millis(rec).is_some() && millis(rec) == millis(later)
 }
 
+/// Whether `rec` and `later`, two points of one series, are one reading as `sink` writes it: the
+/// same metric object, attributes, and resource, private carriers included. `prometheus_out`
+/// writes a `set_members` record as its distinct member count, so there two records with as many
+/// members are one reading.
+fn same_reading(rec: &Rec, later: &Rec, sink: &str) -> bool {
+    let written = |rec: &Rec| {
+        let mut body = rec.body.clone();
+        if sink == "prometheus_out" && rec.kind == "set_members" {
+            if let Some(members) = body.get("members").and_then(Value::as_array) {
+                let distinct: BTreeSet<String> = members.iter().map(Value::to_string).collect();
+                body["members"] = Value::from(distinct.len());
+            }
+        }
+        body
+    };
+    written(rec) == written(later)
+        && rec.attributes == later.attributes
+        && rec.resource == later.resource
+}
+
 /// Whether inputs `i` and `j`, which share an instant, read back at different ones.
 fn moved_apart(pairing: &Pairing, i: usize, j: usize, outs: &[Rec]) -> bool {
     let (Some(&a), Some(&b)) = (pairing.claimed[i].first(), pairing.claimed[j].first()) else {
@@ -1855,13 +1878,22 @@ pub(super) fn check(
         let collapsible = sink != "datadog_out"
             || !(matches!(input.kind.as_str(), "samples" | "distribution" | "set_members")
                 || sketched);
+        // The point a sink keeping one per series and millisecond sends in this record's place:
+        // the latest, the later in the run on a tie.
+        let sent = later
+            .iter()
+            .copied()
+            .filter(|&j| same_millisecond(input, &ins[j]))
+            .max_by(|&a, &b| ins[a].timestamp.cmp(&ins[b].timestamp).then(a.cmp(&b)));
+        let equal = sent.filter(|&j| same_reading(input, &ins[j], &sink));
         if twin.is_some() && collapsible {
-            features.push("same_instant");
-        } else if twin.is_none()
-            && collapsible
-            && later.iter().any(|&j| same_millisecond(input, &ins[j]))
-        {
-            features.push("same_millisecond");
+            features.push(if equal.is_some() { "same_instant_equal" } else { "same_instant" });
+        } else if twin.is_none() && collapsible && sent.is_some() {
+            features.push(if equal.is_some() {
+                "same_millisecond_equal"
+            } else {
+                "same_millisecond"
+            });
         }
         rows.extend(features.into_iter().map(|f| ("record".to_string(), Some(f.to_string()))));
         let mut cells = Vec::new();
@@ -1934,7 +1966,15 @@ pub(super) fn check(
                 let uncounted = loss.is_some_and(|(_, cell, _)| {
                     cell.counter.is_none() && cell.reason.as_deref() == Some("uncounted")
                 });
-                if counted || uncounted {
+                // A sink that collapses two equal readings counts the one it removes under a
+                // `normalized` cell and sends the other, so the removed one reads as the other
+                // does: at its worst cell, which is that one unless the kind is written in a
+                // lesser form.
+                let collapsed = cells.iter().any(|(_, cell, _)| {
+                    cell.class == Class::Normalized
+                        && cell.counter.as_deref().is_some_and(&did_move)
+                }) && equal.is_some_and(|j| !pairing.claimed[j].is_empty());
+                if counted || uncounted || collapsed {
                     Some(expected)
                 } else if matches!(expected, Class::Normalized | Class::Degraded)
                     && sink == "prometheus_out"

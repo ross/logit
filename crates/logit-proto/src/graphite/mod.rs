@@ -129,7 +129,9 @@
 //! | `record/sample_rate` | exact | -- | Under `multi_value: expand`, each value is weighted by its inverse rate in the sketch the `samples` row describes. |
 //! | `record/superseded` | exact | -- | Each record is its own datapoint at its own second. A whisper store keeps one point per path and second, so there a later point in the same second replaces an earlier one. |
 //! | `record/same_instant` | exact | -- | Each record is its own datapoint; a whisper store keeps the later of two points at one second. |
+//! | `record/same_instant_equal` | exact | -- | Each record is its own datapoint; a whisper store keeps the later of two points at one second. |
 //! | `record/same_millisecond` | exact | -- | Each record is its own datapoint, its timestamp floored to the second; a whisper store keeps the later of two points in one second. |
+//! | `record/same_millisecond_equal` | exact | -- | Each record is its own datapoint, its timestamp floored to the second; a whisper store keeps the later of two points in one second. |
 //! | `record/non_finite` | dropped | `logit.output.metrics.dropped{reason=unencodable_value}` | Carbon has no non-finite value, so the datapoint isn't written, with a throttled `unencodable_value` warning. |
 //! | `log/dogstatsd_event` | skipped | `logit.output.events.skipped{reason=no_metrics}` | A log has no carbon form and isn't written. |
 //! | `log/plain` | skipped | `logit.output.events.skipped{reason=no_metrics}` | A log has no carbon form and isn't written. |

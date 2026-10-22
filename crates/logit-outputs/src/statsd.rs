@@ -262,7 +262,9 @@
 //! | `record/sample_rate` | exact | -- | The rate is written as `@rate` on the line. |
 //! | `record/superseded` | exact | -- | Each record is its own line; a statsd server applies them in order. |
 //! | `record/same_instant` | exact | -- | Each record is its own line. |
+//! | `record/same_instant_equal` | exact | -- | Each record is its own line. |
 //! | `record/same_millisecond` | exact | -- | Each record is its own line. |
+//! | `record/same_millisecond_equal` | exact | -- | Each record is its own line. |
 //! | `record/non_finite` | dropped | `logit.output.messages.dropped{reason=unencodable_value}` | statsd has no non-finite value, so the line isn't written. |
 //! | `log/dogstatsd_event`, under `format: statsd` | skipped | `logit.output.messages.skipped{reason=dialect}` | Plain statsd has no event, so none is written. |
 //! | `log/dogstatsd_event`, otherwise | exact | -- | A log carrying the `_logit.statsd.event.*` carriers is a DogStatsD `_e` line again. |

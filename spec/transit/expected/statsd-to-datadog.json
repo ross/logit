@@ -92,8 +92,8 @@
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"temperature","kind":"gauge","value":21.5}],"attributes":{"host.name":"transit","room":"lab"}}
   ], "counters": {
     "logit.output.metrics.degraded{component=out,kind=datadog_out,reason=sample_rate_expanded,role=sink}": 1,
-    "logit.output.metrics.dropped{component=out,kind=datadog_out,reason=duplicate_timestamp,role=sink}": 1,
     "logit.output.metrics.dropped{component=out,kind=datadog_out,reason=unresolved_gauge_delta,role=sink}": 1,
+    "logit.output.metrics.normalized{component=out,kind=datadog_out,reason=duplicate_timestamp,role=sink}": 1,
     "logit.output.metrics.skipped{component=out,kind=datadog_out,metric_kind=set_members,role=sink}": 1
   }},
   "multi-value": {"events": [
@@ -147,6 +147,11 @@
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"queue.depth","kind":"gauge","value":4.0}],"attributes":{"host.name":"transit"}}
   ], "counters": {
     "logit.output.metrics.dropped{component=out,kind=datadog_out,reason=duplicate_timestamp,role=sink}": 1
+  }},
+  "sub-millisecond-equal": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"queue.depth","kind":"gauge","value":3.0}],"attributes":{"host.name":"transit"}}
+  ], "counters": {
+    "logit.output.metrics.normalized{component=out,kind=datadog_out,reason=duplicate_timestamp,role=sink}": 1
   }},
   "sum-shapes": {"events": [
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"active.sessions","kind":"gauge","value":14.0}],"attributes":{"host.name":"transit"}},

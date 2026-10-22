@@ -1676,8 +1676,8 @@ rows:
           counter: logit.output.metrics.dropped{reason=duplicate_timestamp}
           text: >-
             One series can't hold two samples at one timestamp, so the later point wins and the
-            earlier is dropped, counted; a `dedup_timestamps` upstream merges or collapses the
-            pair instead.
+            earlier, which differs from it, is dropped, counted; a `dedup_timestamps` upstream
+            merges or collapses the pair instead.
         - class: normalized
           reason: superseded
           text: >-
@@ -1697,13 +1697,57 @@ rows:
         counter: logit.output.metrics.dropped{reason=duplicate_timestamp}
         text: >-
           Datadog keeps one point per series per second, the higher of two in one request, so the
-          sink sends the later point and drops this one, counted, whatever the two values are.
+          sink sends the later point and drops this one, which differs from it, counted.
           Only the series route collapses: a `samples` record leaves on the distribution-points
           route, where Datadog keeps both, and a `distribution`, an `exponential_histogram`, and
           a `histogram` under `histograms.mode: distributions` on the sketches route, so they
           don't reach this row, unless `histograms.send_aggregation_metrics` also writes a
           histogram's `.count`, `.sum`, `.min`, and `.max` series, which collapse. A `dedup_timestamps` with `precision: 1s` upstream merges or
           collapses the pair instead.
+      graphite_out:
+        class: exact
+        text: >-
+          Each record is its own datapoint; a whisper store keeps the later of two points at one
+          second.
+  - kind: record
+    feature: same_instant_equal
+    cells:
+      statsd_out:
+        class: exact
+        text: Each record is its own line.
+      prometheus_out:
+        - when: {bind: null}
+          class: normalized
+          reason: duplicate_timestamp
+          counter: logit.output.metrics.normalized{reason=duplicate_timestamp}
+          text: >-
+            One series can't hold two samples at one timestamp, so the later point is sent, and
+            this one, equal to it, is left off, counted: the receiver stores the same sample
+            either way.
+        - class: normalized
+          reason: superseded
+          text: >-
+            The exposition registry holds one sample per series, so the later point replaces this
+            one: the pull model's overwrite, uncounted.
+      influxdb_out:
+        class: normalized
+        reason: next_nanosecond
+        text: >-
+          A point sharing a series and a timestamp with one already in the batch takes the next
+          free nanosecond, so both are kept.
+      otlp_out:
+        class: exact
+        text: Each record is its own data point.
+      datadog_out:
+        class: normalized
+        reason: duplicate_timestamp
+        counter: logit.output.metrics.normalized{reason=duplicate_timestamp}
+        text: >-
+          Datadog keeps one point per series per second, so the sink sends the later point and
+          leaves this one, equal to it, off, counted: Datadog stores the same point either way.
+          Two equal delta counts are two increments, and one is sent; a `dedup_timestamps` with
+          `precision: 1s` upstream sums them. Only the series route collapses, as for
+          `record/same_instant`.
       graphite_out:
         class: exact
         text: >-
@@ -1721,9 +1765,9 @@ rows:
           counter: logit.output.metrics.dropped{reason=duplicate_timestamp}
           text: >-
             A remote-write sample's timestamp is in milliseconds, and one series can't hold two
-            samples at one timestamp, so the later reading wins and the earlier is dropped,
-            counted; a `dedup_timestamps` with `precision: 1ms` upstream merges or collapses the
-            pair instead.
+            samples at one timestamp, so the later reading wins and the earlier, which differs
+            from it, is dropped, counted; a `dedup_timestamps` with `precision: 1ms` upstream
+            merges or collapses the pair instead.
         - class: normalized
           reason: superseded
           text: >-
@@ -1742,6 +1786,44 @@ rows:
           Series timestamps are whole seconds, and Datadog keeps one point per series per
           second, so the sink sends the later point and drops this one, counted, as for
           `record/same_instant`.
+      graphite_out:
+        class: exact
+        text: >-
+          Each record is its own datapoint, its timestamp floored to the second; a whisper store
+          keeps the later of two points in one second.
+  - kind: record
+    feature: same_millisecond_equal
+    cells:
+      statsd_out:
+        class: exact
+        text: Each record is its own line.
+      prometheus_out:
+        - when: {bind: null}
+          class: normalized
+          reason: duplicate_timestamp
+          counter: logit.output.metrics.normalized{reason=duplicate_timestamp}
+          text: >-
+            A remote-write sample's timestamp is in milliseconds, so the later reading is sent,
+            and this one, equal to it, is left off, counted: the receiver stores the same sample
+            either way.
+        - class: normalized
+          reason: superseded
+          text: >-
+            The exposition registry holds one sample per series, so the later point replaces this
+            one: the pull model's overwrite, uncounted.
+      influxdb_out:
+        class: exact
+        text: Each point is its own line at its own nanosecond.
+      otlp_out:
+        class: exact
+        text: Each record is its own data point, at its own nanosecond.
+      datadog_out:
+        class: normalized
+        reason: duplicate_timestamp
+        counter: logit.output.metrics.normalized{reason=duplicate_timestamp}
+        text: >-
+          Series timestamps are whole seconds, so the sink sends the later point and leaves this
+          one, equal to it, off, counted, as for `record/same_instant_equal`.
       graphite_out:
         class: exact
         text: >-

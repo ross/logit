@@ -58,7 +58,9 @@
 //! | `record/sample_rate` | exact | -- | Each value is weighted by its inverse rate in the sketch the `samples` row describes. |
 //! | `record/superseded` | exact | -- | Each record is its own data point. |
 //! | `record/same_instant` | exact | -- | Each record is its own data point. |
+//! | `record/same_instant_equal` | exact | -- | Each record is its own data point. |
 //! | `record/same_millisecond` | exact | -- | Each record is its own data point, at its own nanosecond. |
+//! | `record/same_millisecond_equal` | exact | -- | Each record is its own data point, at its own nanosecond. |
 //! | `record/non_finite` | exact | -- | The non-finite `as_double`. |
 //! | `log/dogstatsd_event` | normalized | `observed_timestamp` | An OTLP log record. Its `_logit.statsd.event.*` carriers aren't attributes; otlp_out stamps an observed time on a log that has none, and otlp_in stamps the `_logit.otel.severity_*` carriers. |
 //! | `log/plain` | normalized | `observed_timestamp` | An OTLP log record. otlp_out stamps an observed time on a log that has none, and otlp_in stamps the `_logit.otel.severity_*` carriers. |

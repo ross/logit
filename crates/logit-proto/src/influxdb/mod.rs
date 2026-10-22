@@ -155,7 +155,9 @@
 //! | `record/sample_rate` | exact | -- | Each value is weighted by its inverse rate in the sketch the `samples` row describes. |
 //! | `record/superseded` | exact | -- | Each point is its own line at its own timestamp. |
 //! | `record/same_instant` | normalized | `next_nanosecond` | A point sharing a series and a timestamp with one already in the batch takes the next free nanosecond, so both are kept. |
+//! | `record/same_instant_equal` | normalized | `next_nanosecond` | A point sharing a series and a timestamp with one already in the batch takes the next free nanosecond, so both are kept. |
 //! | `record/same_millisecond` | exact | -- | Each point is its own line at its own nanosecond. |
+//! | `record/same_millisecond_equal` | exact | -- | Each point is its own line at its own nanosecond. |
 //! | `record/non_finite` | dropped | `logit.output.metrics.dropped{reason=unencodable_value}` | Line protocol has no non-finite float, so the record is dropped. |
 //! | `log/dogstatsd_event` | skipped | uncounted | A log has no line-protocol form and isn't written, uncounted. |
 //! | `log/plain` | skipped | uncounted | A log has no line-protocol form and isn't written, uncounted. |

@@ -11,7 +11,7 @@
 //! | `histogram` | `delta`, `cumulative`, `nan_bound`, `neg_inf_bound` (a `NaN` or a `-Inf` bucket bound) | record |
 //! | `exponential_histogram`, `summary` | `delta`, `cumulative` | record |
 //! | `samples`, `set_members`, `distribution`, `set` | none | record |
-//! | `record` | `no_recorded_value`, `no_recorded_value_delta_sum`, `no_recorded_value_other_kind`, `service_check`, `name_unsafe`, `exemplar_key_unsafe`, `exemplar_key_unsafe_histogram`, `sample_rate`, `non_finite`, `superseded`, `same_instant`, `same_millisecond` | record |
+//! | `record` | `no_recorded_value`, `no_recorded_value_delta_sum`, `no_recorded_value_other_kind`, `service_check`, `name_unsafe`, `exemplar_key_unsafe`, `exemplar_key_unsafe_histogram`, `sample_rate`, `non_finite`, `superseded`, `same_instant`, `same_instant_equal`, `same_millisecond`, `same_millisecond_equal` | record |
 //! | `record` | `unit`, `description`, `start_timestamp`, `exemplars`, `exemplars_on_summary`, `unit_on_distribution`, `min_max`, `sample_rate_unweighted` | field |
 //! | `attributes` | `string_value`, `bool_value`, `number_value`, `array_value`, `map_value`, `bytes_value`, `timestamp_value`, `private_carrier`, `foreign_carrier`, `datadog_carrier_log`, `resource_attribute`, `scope` | field |
 //! | `attributes` | `no_host`, `log_status`, `span_kind`, `trace_id_high` (a record `datadog_out` writes an attribute for from the record's own fields) | field |
@@ -31,6 +31,9 @@
 //! which a sink holding one value per series replaces; `record/same_instant` is one whose later
 //! point shares its timestamp, and `record/same_millisecond` one whose later point falls at
 //! another nanosecond of its millisecond, which a wire stamping milliseconds can't tell apart.
+//! `record/same_instant_equal` and `record/same_millisecond_equal` are those two where the
+//! latest point of the series in the record's millisecond is equal to it, so a sink that keeps
+//! one point loses nothing.
 //! `record/name_unsafe` is a name holding a character the sink's wire rewrites, which differs by
 //! sink, and `record/exemplar_key_unsafe` a monotonic `sum` whose written exemplar has an
 //! attribute key holding a character the sink's label names can't carry,
@@ -113,7 +116,9 @@ const KINDS: [(&str, &[&str]); 15] = [
             "non_finite",
             "superseded",
             "same_instant",
+            "same_instant_equal",
             "same_millisecond",
+            "same_millisecond_equal",
             "unit",
             "description",
             "start_timestamp",

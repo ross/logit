@@ -167,6 +167,11 @@
   ], "counters": {
     "logit.component.events.discarded{component=window,kind=aggregate,role=transform}": 2
   }},
+  "sub-millisecond-equal": {"events": [
+    {"timestamp":"2027-01-15T08:00:01.000000500Z","metrics":[{"name":"queue.depth","kind":"gauge","value":3.0}]}
+  ], "counters": {
+    "logit.component.events.discarded{component=window,kind=aggregate,role=transform}": 2
+  }},
   "sum-shapes": {"events": [], "counters": {
     "logit.component.events.discarded{component=window,kind=aggregate,role=transform}": 1,
     "logit.output.metrics.skipped{component=out,kind=statsd_out,metric_kind=cumulative_sum,role=sink}": 2,

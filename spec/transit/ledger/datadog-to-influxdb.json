@@ -10,7 +10,7 @@
     {"sink":"influxdb_out","row":"gauge/negative","cell":0,"observed":["normalized"]},
     {"sink":"influxdb_out","row":"log/dogstatsd_event","cell":0,"observed":["skipped"]},
     {"sink":"influxdb_out","row":"log/plain","cell":0,"observed":["skipped"]},
-    {"sink":"influxdb_out","row":"record/same_instant","cell":0,"observed":["normalized"]},
+    {"sink":"influxdb_out","row":"record/same_instant_equal","cell":0,"observed":["normalized"]},
     {"sink":"influxdb_out","row":"record/service_check","cell":0,"observed":["normalized"]},
     {"sink":"influxdb_out","row":"record/superseded","cell":0,"observed":[]},
     {"sink":"influxdb_out","row":"record/unit","cell":0,"observed":["lost"]},

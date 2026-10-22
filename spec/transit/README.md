@@ -95,7 +95,8 @@ is one nothing checks: add a case or a flow that reaches it.
   `event/attributes_only`), and the `record` rows that decide a record's fate
   (`no_recorded_value`, `no_recorded_value_delta_sum`, `no_recorded_value_other_kind`,
   `service_check`, `name_unsafe`, `exemplar_key_unsafe`, `exemplar_key_unsafe_histogram`,
-  `sample_rate`, `non_finite`, `superseded`, `same_instant`, `same_millisecond`): `exact`, `normalized`, `degraded`, `skipped`, or `dropped`, best to worst.
+  `sample_rate`, `non_finite`, `superseded`, `same_instant`, `same_instant_equal`,
+  `same_millisecond`, `same_millisecond_equal`): `exact`, `normalized`, `degraded`, `skipped`, or `dropped`, best to worst.
 - **Field level**, for the `record` rows `unit`, `description`, `start_timestamp`, `exemplars`,
   `exemplars_on_summary`, `unit_on_distribution`, `min_max`, and `sample_rate_unweighted`, every `attributes` row, and a log or span beside metrics
   (`beside_metrics`), which is a field of its event: `exact`, `normalized`, or `lost`.

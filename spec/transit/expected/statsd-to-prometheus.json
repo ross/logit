@@ -133,6 +133,9 @@
   "sub-millisecond": {"events": [
     {"timestamp":"2027-01-15T08:00:01.000000500Z","metrics":[{"name":"queue_depth","kind":"gauge","value":4.0}]}
   ], "counters": {}},
+  "sub-millisecond-equal": {"events": [
+    {"timestamp":"2027-01-15T08:00:01.000000500Z","metrics":[{"name":"queue_depth","kind":"gauge","value":3.0}]}
+  ], "counters": {}},
   "sum-shapes": {"events": [
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"active_sessions","kind":"gauge","value":14.0}]},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"requests_total","kind":"sum","value":120.0,"temporality":"cumulative","monotonic":true}]}
