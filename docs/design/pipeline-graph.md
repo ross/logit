@@ -331,9 +331,11 @@ whole event, and rule 92 keeps one component from reading two of its targets.
 `validate_semantics` (`crates/logit-cli/src/pipeline.rs`) is a thin wrapper around it. The
 canonical list, with each rule's reasoning, is `graph.rs`'s module doc; each rule is enforced at
 its `// Rule N` label in `resolve`. Each entry below names what is rejected; the numbers are
-identifiers, not execution order, and a retired rule's number (21) is not reused. Several rules share one principle: **a config that can only be
-a no-op, a black hole, or an impossible bound is an error**, and so is a setting that would be
-silently ignored. `0` for a count or duration bound is usually impossible, not small.
+identifiers, not execution order, and a retired rule's number (21) is not reused. Several rules
+share one principle: **they reject a config that can only be a no-op, a black hole, or an
+impossible bound**, and a setting that would be silently ignored. It isn't a general law: a
+component's own list, such as `signals:`, does what it says even when the result is odd. `0` for a
+count or duration bound is usually impossible, not small.
 
 1. No components at all.
 2. A `sources` id naming no defined component.

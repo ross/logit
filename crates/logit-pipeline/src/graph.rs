@@ -12,9 +12,10 @@
 //! clause right after 7; 26-28 before 19; 52 after 44; 53 between 45 and 46). A new rule takes the
 //! next number.
 //!
-//! One principle recurs, cited by number: a config that can only be a no-op, a black hole, or an
-//! impossible bound (`0` for a count or duration) is an error, and so is a setting that would be
-//! silently ignored.
+//! One principle recurs, cited by number: several rules reject a config that can only be a no-op,
+//! a black hole, or an impossible bound (`0` for a count or duration), and a setting that would be
+//! silently ignored. It isn't a general law: a component's own list, such as `signals:`, does what
+//! it says even when the result is odd.
 //!
 //! 1. A config with no components.
 //! 2. A `sources` id that names no defined component.

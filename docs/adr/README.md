@@ -103,9 +103,9 @@ the same date, write the record, then add a row here.
 | [Lossless like-protocol transit: the internal model is a superset of every supported wire protocol](lossless-transit.md) | 2026-09-10 | 2026-10-21 |
 | [Browser tracing: the real OTel-JS SDK, `addLink` for sub-resources, and living with document-load's parent (not link) behaviour](browser-tracing-sdk.md) | 2026-09-10 | 2026-10-18 |
 | [OTLP/JSON decoding: hand-written against `serde_json::Value`, not generated](otlp-json-decoding.md) | 2026-09-10 | 2026-10-18 |
-| [Provenance filtering is two transform components, combining has_attributes' and has_signal's shapes](provenance-filtering-components.md) | 2026-09-10 | 2026-10-13 |
+| [Provenance filtering is two transform components, combining has_attributes' and has_signal's shapes](provenance-filtering-components.md) | 2026-09-10 | 2026-10-21 |
 | [Batch provenance (`origin`/`previous`) carried on `Delivered`, stamped by `Fanout`](batch-provenance-on-delivered.md) | 2026-09-10 | 2026-10-15 |
-| [Attribute filtering is two transform components, and a bounded matcher is not a predicate language](attribute-filtering-components.md) | 2026-09-10 | 2026-10-18 |
+| [Attribute filtering is two transform components, and a bounded matcher is not a predicate language](attribute-filtering-components.md) | 2026-09-10 | 2026-10-21 |
 | [Native transport: handshake, implicit sequencing, and per-batch acknowledgement](native-transport-handshake-and-ack.md) | 2026-09-09 | 2026-10-18 |
 | [`tracing` for self-logging, with `Diagnostics` as its producer](tracing-for-self-logging.md) | 2026-09-09 | 2026-09-09 |
 | [A top-level `admin:` block, not a component, for readiness/liveness](admin-readiness-endpoint.md) | 2026-09-09 | 2026-10-07 |

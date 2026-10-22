@@ -1,6 +1,6 @@
 ---
 created: 2026-09-10
-updated: 2026-10-18
+updated: 2026-10-21
 ---
 
 # Attribute filtering is two transform components, and a bounded matcher is not a predicate language
@@ -189,7 +189,7 @@ placement argument for itself already.
   `drop_signals` and `logfmt`/`kv` precedent ("separate kinds sharing a module" over "one kind with
   a mode field") -- and for a reason specific to this pair: a mode flag would make rule 36's
   black-hole-vs-no-op error message conditional on a field's *value* rather than on the component's
-  *kind*, which is the confusion `has_signal`'s family would have faced with a conditional message.
+  *kind*, which would make one message mean two things.
 - **A third kind, or a `mode: any_of` field, for "any of these pairs matches."** Rejected per the
   composability principle above: N sibling single-pair `has_attributes` components already express
   it, since fan-in is free, and a mode flag would be a second way to spell something the graph

@@ -1,6 +1,6 @@
 ---
 created: 2026-09-10
-updated: 2026-10-13
+updated: 2026-10-21
 ---
 
 # Provenance filtering is two transform components, combining has_attributes' and has_signal's shapes
@@ -130,7 +130,7 @@ inside it, and it is the *top* level that decides this assignment: both fields e
 therefore drops every one of them (a black hole).
 
 This was caught during implementation, not designed correctly on the first pass: an earlier draft
-of rule 37 copied `signals:`' orientation by surface analogy to `signals:`, and only a concrete
+of rule 37 copied the orientation of `signals:` by surface analogy, and only a concrete
 trace through `Matcher::matches` with both fields empty (always returns `true`) caught the error
 before it landed. Recorded here because the field-vs.-list distinction that resolves it is easy to
 miss again.

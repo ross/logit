@@ -163,9 +163,9 @@ No component reads a protocol's `_logit.*` carriers to decide this.
 
 ## Amendment: no validation on `signals:`; rule 21 is retired (2026-10-21)
 
-The original rule 21 rejected an empty `signals:` on all three kinds and `drop_signals` naming all
-three signals, and the `none` selector's amendment added `none` on `drop_signals`. All of it is
-gone. Each rejected list is well defined, so the component does what the list says, even where
+The original rule 21 rejected an empty `signals:` on all three kinds and
+`keep_signals`/`drop_signals` naming all three signals, and the `none` selector's amendment added
+`none` on `drop_signals`. All of it is gone. Each rejected list is well defined, so the component does what the list says, even where
 the result is odd; `logit` can't protect an operator from every odd config.
 
 - **`has_signal: []`** forwards nothing: no listed signal can match.
