@@ -140,7 +140,6 @@ Entry format and the other areas: [the known-gaps index](README.md).
 - **`datadog_out` ignores `collectd.host`.** It takes a metric's host only from `host.name` or a
   `host` tag, so every collectd sender behind a relay lands on the relay's process hostname.
   A fix is planned.
-  - **Workaround:** copy `collectd.host` into `host.name` upstream with a `lua` stage.
 - **`datadog_trace_out` under `version: v0.4` drops the trace chunk and tracer payload fields.**
   v0.4 has no field for a chunk's `_logit.datadog.chunk.*` fields (sampling priority, origin,
   dropped flag, tags) or for the tracer payload fields no request header carries
