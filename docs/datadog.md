@@ -218,13 +218,17 @@ its tags upstream with `keep` or `remove`.
 
 Datadog keeps one point per series per second: the higher of two in one request, the later
 across requests, and a `count` isn't summed. So of each batch's series points, `datadog_out`
-sends the latest point of a series in one second and drops the others, equal values included,
-counted
-`logit.output.metrics.dropped{reason="duplicate_timestamp"}` with a throttled
-`duplicate_timestamp` diagnostic. A series is the metric name, the tag set, and the host, device,
-and resources. Distribution points aren't collapsed, because Datadog keeps both. A relay that
+sends the latest point of a series in one second and leaves the others off. A point that differs
+from the one sent is counted `logit.output.metrics.dropped{reason="duplicate_timestamp"}`, with a
+throttled `duplicate_timestamp` diagnostic. A point equal to the one sent (the same value, type,
+unit, interval, source type, and origin) is counted
+`logit.output.metrics.normalized{reason="duplicate_timestamp"}`, since Datadog stores the same
+point either way: an Agent relay or a retry resending identical points raises no loss alarm. Two
+equal delta counts are still two increments, of which one is sent. A series is the metric name,
+the tag set, and the host, device, and resources. Distribution points aren't collapsed, because Datadog keeps both. A relay that
 keeps source timestamps from a source stamping several readings of one series in a second (an
-Agent's unaggregated `|T` gauges, `statsd_in` gauges, `internal`) shows a nonzero count. Put a
+Agent's unaggregated `|T` gauges, `statsd_in` gauges, `internal`) shows a nonzero dropped count.
+Put a
 `dedup_timestamps` with `precision: 1s` last before the sink: it keeps the latest gauge and sums
 deltas. Two points of one series in one second that arrive in two batches are both sent, and
 Datadog keeps the later, uncounted (`docs/known-gaps/datadog.md`).

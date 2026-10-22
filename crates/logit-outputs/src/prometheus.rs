@@ -199,9 +199,12 @@
 //!
 //! **Duplicate timestamps.** One series holds one sample per millisecond. Given two in one
 //! request, Prometheus and Mimir answer `2xx`, keep the first, and drop the second silently, so
-//! the sink sends only the later reading of each series and millisecond in a batch and counts
-//! every earlier one `logit.output.metrics.dropped{reason="duplicate_timestamp"}`, with a
-//! throttled `duplicate_timestamp` diagnostic. A sub-millisecond source (`statsd_in` gauges,
+//! the sink sends only the later reading of each series and millisecond in a batch. It counts each
+//! earlier one equal to the reading sent `logit.output.metrics.normalized{reason="duplicate_timestamp"}`,
+//! since the receiver stores the same sample, and every other one
+//! `logit.output.metrics.dropped{reason="duplicate_timestamp"}`, with a throttled
+//! `duplicate_timestamp` diagnostic (`logit_proto::prometheus`'s encode table). A sub-millisecond
+//! source (`statsd_in` gauges,
 //! `internal`, a relay with no `aggregate`) reaches this; a `dedup_timestamps` with
 //! `precision: 1ms` as the last stage before this sink merges or collapses such readings first.
 //! It works within a batch: a later batch repeating a series and millisecond with a new value
@@ -237,7 +240,8 @@
 //! elements are discarded. It's `normalized` rather than `omitted` because the label survives.
 //!
 //! In sender mode the codec also counts `logit.output.metrics.dropped{reason="duplicate_timestamp"}`
-//! ("Duplicate timestamps" above). Registry mode's upsert keeps one value per series between
+//! and `logit.output.metrics.normalized{reason="duplicate_timestamp"}` ("Duplicate timestamps"
+//! above). Registry mode's upsert keeps one value per series between
 //! scrapes, so a later reading replacing an earlier one there is the pull model's overwrite,
 //! uncounted; an operator who needs every value between scrapes puts an `aggregate` in front.
 //!

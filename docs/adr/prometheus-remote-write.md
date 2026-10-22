@@ -1,6 +1,6 @@
 ---
 created: 2026-09-17
-updated: 2026-10-20
+updated: 2026-10-21
 ---
 
 # Prometheus remote-write: a receiver on `prometheus_in`, a sender on `prometheus_out`
@@ -637,6 +637,11 @@ pass over two readings at one nanosecond, which counts only for remote-write.
 `degraded{reason="sub_ms_collapsed"}` is gone, and the collapse is no longer on the codec's list of
 permitted normalizations: the reading never leaves `logit`, which is loss by
 [ADR `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md)'s definition.
+
+A removed reading equal to the one sent is the exception: the receiver stores the same sample, so
+nothing is lost, and it counts `logit.output.metrics.normalized{reason="duplicate_timestamp"}`
+with no diagnostic. [ADR `dedup-timestamps-transform`](dedup-timestamps-transform.md)'s "The
+sink-side counter" defines equal.
 
 The collapse stays, for a different reason than this record gave. Prometheus 3.15.1 and Mimir
 3.2.2, run 2026-10-21, don't reject two samples of one series at one millisecond inside one

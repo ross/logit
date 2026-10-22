@@ -283,8 +283,10 @@ millisecond as `output.metrics.dropped{reason="duplicate_timestamp"}`, in place 
 `sub_ms_collapsed`, the same-nanosecond case included, which no counter saw before.
 `datadog_out` counts each series point it leaves off because a later point of its series shares
 its second under the same name. Both name the remedy, `dedup_timestamps`, in a throttled
-`duplicate_timestamp` diagnostic. The exposition registry's overwrite between scrapes is the pull
-model working, not loss, and stays uncounted.
+`duplicate_timestamp` diagnostic. A removed reading equal to the one sent loses nothing, so both
+sinks count it `output.metrics.normalized{reason="duplicate_timestamp"}` instead: a relay or a
+retry resending identical points raises no loss alarm. The exposition registry's overwrite between
+scrapes is the pull model working, not loss, and stays uncounted.
 
 ## Migration record
 The classification of every `*.dropped`, `*.skipped`, `*.degraded`, `*.truncated`, and loss-related

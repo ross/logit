@@ -133,9 +133,12 @@
 //! each series and second, the later in batch order on a tie
 //! (`logit_proto::datadog::series::SeriesDuplicates`; `logit_proto::datadog`'s encode table has
 //! the series key), and the series encoder sends only that one. Each other point is counted once
-//! per batch with the plan's drops, `logit.output.metrics.dropped{reason="duplicate_timestamp"}`,
-//! equal values included, with a throttled `duplicate_timestamp` diagnostic, and comes out of its
-//! event's weight, so no request cut or bisection splits a pair, and `logit.output.records` and
+//! per batch with the plan's drops: `logit.output.metrics.normalized{reason="duplicate_timestamp"}`
+//! when it equals the point sent (`logit_proto::datadog::series`'s `same_point`: the value, wire
+//! type, unit, interval, source type, and origin), since Datadog stores the same point, and
+//! otherwise `logit.output.metrics.dropped{reason="duplicate_timestamp"}`, with a throttled
+//! `duplicate_timestamp` diagnostic. Two equal delta counts are two increments, of which one is
+//! sent, and still count `normalized`. Each point left off comes out of its event's weight, so no request cut or bisection splits a pair, and `logit.output.records` and
 //! an `at_most_once` drop count only the points sent. Distribution points aren't collapsed:
 //! Datadog keeps both. Two points of one series in one second in two batches are both sent, and
 //! Datadog keeps the later, uncounted (`docs/known-gaps/datadog.md`). A `dedup_timestamps` with

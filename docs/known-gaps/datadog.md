@@ -129,9 +129,10 @@ Entry format and the other areas: [the known-gaps index](README.md).
   - **Revisit trigger:** Datadog documents or answers a different limit; the series route's `202`
     body states it (`limit=100`).
 - **`datadog_out` collapses a series' points in one second only within one batch.** Of the
-  points of one series in one second in a batch, the sink sends the latest and drops the rest,
-  counted `metrics.dropped{reason="duplicate_timestamp"}`, because Datadog keeps only the higher of
-  two in one request (verified 2026-10-21;
+  points of one series in one second in a batch, the sink sends the latest and leaves the rest
+  off, counted `metrics.dropped{reason="duplicate_timestamp"}`, or
+  `metrics.normalized{reason="duplicate_timestamp"}` for a point equal to the one sent, because
+  Datadog keeps only the higher of two in one request (verified 2026-10-21;
   [ADR `dedup-timestamps-transform`](../adr/dedup-timestamps-transform.md)'s "Verified destination
   behavior"). It plans that over the whole batch before cutting requests, so no cut splits a pair,
   but it holds no state between batches.
