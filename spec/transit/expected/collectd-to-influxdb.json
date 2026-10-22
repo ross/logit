@@ -11,7 +11,9 @@
     {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"load.load.1.value","kind":"gauge","value":0.5}],"attributes":{"_logit.influxdb.measurement":"load.load.1","collectd.host":"logit-fixture"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}}},
     {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"load.load.2.value","kind":"gauge","value":0.75}],"attributes":{"_logit.influxdb.measurement":"load.load.2","collectd.host":"logit-fixture"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}}}
   ], "counters": {}},
-  "notification": {"events": [], "counters": {}},
+  "notification": {"events": [], "counters": {
+    "logit.output.events.skipped{component=out,kind=influxdb_out,reason=no_metrics,role=sink}": 1
+  }},
   "types-db": {"events": [
     {"timestamp":"2026-09-12T18:22:53.661987063Z","metrics":[{"name":"load.load.longterm.value","kind":"gauge","value":1.1103515625}],"attributes":{"_logit.influxdb.measurement":"load.load.longterm","collectd.host":"logit-fixture"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}}},
     {"timestamp":"2026-09-12T18:22:53.661987063Z","metrics":[{"name":"load.load.midterm.value","kind":"gauge","value":0.39453125}],"attributes":{"_logit.influxdb.measurement":"load.load.midterm","collectd.host":"logit-fixture"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}}},

@@ -653,8 +653,9 @@ fn histogram_exemplars_are_placed_on_the_bucket_their_value_falls_in() {
 }
 
 /// An exemplar's attribute keys are sent sanitized in both versions, as the series' own label
-/// names are, and two keys sanitizing onto one name keep the one whose original key sorts first,
-/// the other counted `labels.omitted{reason="collision"}`.
+/// names are, each key rewritten counted `labels.normalized{reason="name_sanitized"}`, and two
+/// keys sanitizing onto one name keep the one whose original key sorts first, the other counted
+/// `labels.omitted{reason="collision"}`.
 #[test]
 fn exemplar_label_names_are_sanitized_as_series_label_names_are() {
     let mut filtered_attributes = AttrMap::new();
@@ -676,7 +677,8 @@ fn exemplar_label_names_are_sanitized_as_series_label_names_are() {
     }]];
     for version in [Version::V1, Version::V2] {
         let (body, reasons) = encode_reasons(&families, version);
-        assert_eq!(reasons, [("collision".to_string(), 1)], "{version:?}");
+        let want = [("collision".to_string(), 1), ("name_sanitized".to_string(), 2)];
+        assert_eq!(reasons, want, "{version:?}");
         let decoded = decode(&body, version, &mut PrometheusDecoder::new()).expect("must decode");
         let exemplars = &decoded.groups[0][0].series[0].exemplars;
         assert_eq!(exemplars.len(), 1, "{version:?}");

@@ -1,6 +1,10 @@
 {
-  "agent-events": {"events": [], "counters": {}},
-  "agent-logs": {"events": [], "counters": {}},
+  "agent-events": {"events": [], "counters": {
+    "logit.output.events.skipped{component=out,kind=influxdb_out,reason=no_metrics,role=sink}": 1
+  }},
+  "agent-logs": {"events": [], "counters": {
+    "logit.output.events.skipped{component=out,kind=influxdb_out,reason=no_metrics,role=sink}": 3
+  }},
   "agent-series-timestamped": {"events": [
     {"timestamp":"2026-09-21T14:13:20.000000000Z","metrics":[{"name":"record.batch.lag.value","kind":"gauge","value":2.5}],"attributes":{"_logit.influxdb.measurement":"record.batch.lag","env":"record","host.name":"record-fixtures","service":"record-fixtures","team":"obs","version":"1.2.3"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}}},
     {"timestamp":"2026-09-21T14:13:20.000000001Z","metrics":[{"name":"record.batch.lag.value","kind":"gauge","value":2.5}],"attributes":{"_logit.influxdb.measurement":"record.batch.lag","env":"record","host.name":"record-fixtures","service":"record-fixtures","team":"obs","version":"1.2.3"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}}},

@@ -23,7 +23,8 @@
 //! point needs that).
 //!
 //! **An empty batch encodes to no payloads**, never an empty request
-//! ([`SignalEncoder::encode_signals`]).
+//! ([`SignalEncoder::encode_signals`]). An event with no metric, log, or span is in no payload,
+//! counted `logit.output.events.skipped{reason="no_payload"}`.
 //!
 //! **The listener adds sender attributes after decode.** Under `otlp_in`'s `peer:`,
 //! `proxy_protocol:`, or `forwarded:`, `network.peer.*` or `client.*` is added to every event, an
@@ -113,8 +114,15 @@ impl SignalEncoder for OtlpEncoder {
         let mut log_records = Vec::new();
         let mut spans = Vec::new();
         let mut metric_points = Vec::new();
+        let mut u64_as_double = 0;
+        let mut no_payload = 0;
 
         for event in &batch.events {
+            if event.log.is_none() && event.span.is_none() && event.metrics.is_empty() {
+                no_payload += 1;
+                continue;
+            }
+            u64_as_double += common::u64_as_double_count(&event.attributes);
             if let Some(log) = &event.log {
                 log_records.push(logs::encode_log_record(event, log));
             }
@@ -128,6 +136,26 @@ impl SignalEncoder for OtlpEncoder {
                     metric_points.push(m);
                 }
             }
+        }
+
+        if no_payload > 0 {
+            self.telemetry.count(
+                "logit.output.events.skipped",
+                no_payload as f64,
+                &[("reason", "no_payload")],
+            );
+        }
+        // The resource and scope go out once per payload but count once, as one batch's values.
+        if !(log_records.is_empty() && spans.is_empty() && metric_points.is_empty()) {
+            u64_as_double += common::u64_as_double_count(&batch.resource.attributes)
+                + batch.scope.as_ref().map_or(0, |s| common::u64_as_double_count(&s.attributes));
+        }
+        if u64_as_double > 0 {
+            self.telemetry.count(
+                "logit.output.attributes.normalized",
+                u64_as_double as f64,
+                &[("reason", "u64_as_double")],
+            );
         }
 
         let mut payloads = Vec::with_capacity(3);

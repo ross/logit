@@ -132,7 +132,7 @@
 //! | `samples` | degraded | -- | Sketched, each value weighted by its inverse sample rate, then written as the `distribution` row describes, and counted only as that row says. |
 //! | `set_members` | skipped | `logit.output.metrics.skipped{metric_kind=set_members}` | Line protocol has no set, so set members aren't written, with a throttled `encode_error` warning. |
 //! | `distribution` | degraded | -- | In the `summary` row's shape: float `count` and `sum` fields and the sketch's `0.5`, `0.9`, and `0.99` quantiles, each read back as a gauge under `<name>.`; the sketch is gone. When the sum and quantiles are finite, nothing is counted. A non-finite sum or quantile is left off the line, and the record counts once as `logit.output.metrics.degraded{reason=non_finite_component}`. |
-//! | `set` | degraded | -- | A `value=<estimate>u` field, read back as a gauge named `<name>.value`, uncounted. |
+//! | `set` | degraded | `logit.output.metrics.degraded{metric_kind=set}` | A `value=<estimate>u` field, read back as a gauge named `<name>.value`; the registers are gone. |
 //! | `histogram/delta` | degraded | -- | Telegraf's shape: float `count`, `sum`, `min`, and `max` fields, a field per finite bound named by the bound and holding the cumulative count up to it, and `+Inf` holding the total, each read back as a gauge under `<name>.`, its temporality dropped. When every component is finite, nothing is counted. A non-finite `sum`, `min`, or `max` is left off the line, and the record counts once as `logit.output.metrics.degraded{reason=non_finite_component}`. |
 //! | `histogram/cumulative` | degraded | -- | Telegraf's shape: float `count`, `sum`, `min`, and `max` fields, a field per finite bound named by the bound and holding the cumulative count up to it, and `+Inf` holding the total, each read back as a gauge under `<name>.`, its temporality dropped. When every component is finite, nothing is counted. A non-finite `sum`, `min`, or `max` is left off the line, and the record counts once as `logit.output.metrics.degraded{reason=non_finite_component}`. |
 //! | `histogram/nan_bound` | degraded | `logit.output.metrics.degraded{reason=non_finite_component}` | No field key spells a `NaN` bound, so none is written, and its count reaches only `count` and `+Inf`. |
@@ -150,21 +150,21 @@
 //! | `record/same_instant` | normalized | `next_nanosecond` | A point sharing a series and a timestamp with one already in the batch takes the next free nanosecond, so both are kept. |
 //! | `record/same_millisecond` | exact | -- | Each point is its own line at its own nanosecond. |
 //! | `record/non_finite` | dropped | `logit.output.metrics.dropped{reason=unencodable_value}` | Line protocol has no non-finite float, so the record is dropped. |
-//! | `log/dogstatsd_event` | skipped | uncounted | A log has no line-protocol form and isn't written, uncounted. |
-//! | `log/plain` | skipped | uncounted | A log has no line-protocol form and isn't written, uncounted. |
-//! | `span/alone` | skipped | uncounted | A span has no line-protocol form and isn't written, uncounted. |
+//! | `log/dogstatsd_event` | skipped | `logit.output.events.skipped{reason=no_metrics}` | A log has no line-protocol form and isn't written. |
+//! | `log/plain` | skipped | `logit.output.events.skipped{reason=no_metrics}` | A log has no line-protocol form and isn't written. |
+//! | `span/alone` | skipped | `logit.output.events.skipped{reason=no_metrics}` | A span has no line-protocol form and isn't written. |
 //! | `span/no_wire_form` | exact | -- | Nothing beyond `span/alone`'s outcome. |
-//! | `event/attributes_only` | skipped | uncounted | An event with no metric, log, or span and no `_logit.influxdb.measurement` carrier has no measurement to write under and isn't written, uncounted. A stage that drops the carrier leaves an InfluxDB point whose fields are all strings this way: a `remove` of it, or a `keep` under `private: drop`, which drops the string fields too. |
+//! | `event/attributes_only` | skipped | `logit.output.events.skipped{reason=no_metrics}` | An event with no metric, log, or span and no `_logit.influxdb.measurement` carrier has no measurement to write under and isn't written. A stage that drops the carrier leaves an InfluxDB point whose fields are all strings this way: a `remove` of it, or a `keep` under `private: drop`, which drops the string fields too. |
 //! | `event/string_only` | exact | -- | A line of the event's `_logit.influxdb.field.*` string fields under the measurement its `_logit.influxdb.measurement` carrier names, read back as the same event. |
 //!
 //! Per field of a record that reaches the wire, attribute shape, and payload beside metrics:
 //!
 //! | Row | Class | Reason or counter | What a consumer sees |
 //! |---|---|---|---|
-//! | `record/unit` | lost | uncounted | Line protocol has no unit; it isn't written or counted. |
-//! | `record/description` | lost | uncounted | Line protocol has no description; it isn't written or counted. |
-//! | `record/start_timestamp` | lost | uncounted | Not written or counted, though the OTel Collector's InfluxDB exporter writes a `start_time_unix_nano` field; `docs/known-gaps/influxdb.md` has the gap. |
-//! | `record/exemplars` | lost | uncounted | Not written or counted, though the OTel Collector's InfluxDB exporter writes each as a point of a `<name>_exemplar` measurement; `docs/known-gaps/influxdb.md` has the gap. |
+//! | `record/unit` | lost | structural | Line protocol has no unit, so none is written. |
+//! | `record/description` | lost | structural | Line protocol has no description, so none is written. |
+//! | `record/start_timestamp` | lost | structural | Line protocol has no start time, so none is written, though the OTel Collector's InfluxDB exporter writes a `start_time_unix_nano` field; `docs/known-gaps/influxdb.md` has the gap. |
+//! | `record/exemplars` | lost | structural | Line protocol has no exemplars, so none are written, though the OTel Collector's InfluxDB exporter writes each as a point of a `<name>_exemplar` measurement; `docs/known-gaps/influxdb.md` has the gap. |
 //! | `attributes/string_value` | lost | `logit.output.tags.omitted{reason=unencodable}` | A tag. A value holding a line break, ending in `\`, or with `\` before a space has no spelling and is left off, counted. |
 //! | `attributes/bool_value` | normalized | `stringified` | A tag of `true` or `false`, read back as the string. |
 //! | `attributes/number_value` | normalized | `stringified` | A tag of the number's decimal text, read back as the string. |
@@ -173,10 +173,10 @@
 //! | `attributes/bytes_value` | lost | `logit.output.tags.omitted{reason=unrepresentable}` | A bytes value has no tag form and is left off, counted. |
 //! | `attributes/timestamp_value` | lost | `logit.output.tags.omitted{reason=unrepresentable}` | A timestamp value has no tag form and is left off, counted. |
 //! | `attributes/private_carrier` | exact | -- | A `_logit.influxdb.*` carrier is consumed into the wire form (the measurement, the string fields, the write's org and bucket) and influxdb_in stamps it back. |
-//! | `attributes/foreign_carrier` | lost | uncounted | Another protocol's `_logit.` carrier isn't a tag and is left off, uncounted. |
+//! | `attributes/foreign_carrier` | lost | structural | Another protocol's `_logit.` carrier is private and isn't a tag, so it's left off. |
 //! | `attributes/resource_attribute` | normalized | `resource_merged` | A tag, the event's value winning on a shared key, read back as an event attribute. |
-//! | `attributes/scope` | lost | uncounted | Line protocol has no instrumentation scope; it isn't written or counted. |
-//! | `attributes/datadog_carrier_log` | lost | uncounted | Another protocol's `_logit.` carrier isn't a tag and is left off, uncounted. |
+//! | `attributes/scope` | lost | structural | Line protocol has no instrumentation scope, so none is written. |
+//! | `attributes/datadog_carrier_log` | lost | structural | Another protocol's `_logit.` carrier is private and isn't a tag, so it's left off. |
 //! | `attributes/no_host` | exact | -- | A record with no host leaves with none. |
 //! | `log/beside_metrics` | lost | uncounted | A log on an event that carries metrics is left off while the metrics are written, uncounted. |
 //! | `span/beside_metrics` | lost | uncounted | A span on an event that carries metrics is left off while the metrics are written, uncounted. |

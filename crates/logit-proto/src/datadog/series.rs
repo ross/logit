@@ -1161,6 +1161,11 @@ impl DatadogEncoder {
                     self.out_degraded("sample_rate_expanded");
                     finite.iter().flat_map(|v| std::iter::repeat_n(*v, weight as usize)).collect()
                 } else {
+                    // A rate below 1 that rounds to weight 1 leaves no trace on a route with no
+                    // rate.
+                    if samples.sample_rate > 0.0 && samples.sample_rate < 1.0 {
+                        self.out_degraded("sample_rate_rounded");
+                    }
                     finite
                 };
                 let c = carriers.get_or_insert_with(|| {

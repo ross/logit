@@ -1187,13 +1187,16 @@ fn bound(value: f64) -> String {
 /// failing the request, so writing it would lose it uncounted. A key's omission counts only for
 /// an exemplar that is written, as in the OpenMetrics writer.
 fn exemplar_out(exemplar: &Exemplar, encoder: &PrometheusEncoder) -> Option<ExemplarOut> {
-    let (labels, omitted) = text::exemplar_labels(exemplar);
+    let (labels, omitted, renamed) = text::exemplar_labels(exemplar);
     if !text::exemplar_fits(&labels) {
         encoder.degraded_reason("exemplar_omitted");
         return None;
     }
     for reason in omitted {
         encoder.label_omitted(reason);
+    }
+    for _ in 0..renamed {
+        encoder.label_normalized("name_sanitized");
     }
     Some(ExemplarOut {
         labels,

@@ -121,6 +121,12 @@ pub struct EncodeStats {
     /// A series with no free timestamp slot left before `i64::MAX`:
     /// `metrics.dropped{reason="timestamp_overflow"}`.
     pub dropped_timestamp_overflow: usize,
+    /// A `Set` written as its estimate, the registers gone, once per line written:
+    /// `metrics.degraded{metric_kind="set"}`.
+    pub degraded_set: usize,
+    /// An event with no metric record and no `_logit.influxdb.measurement` carrier, which has
+    /// nothing to write: `events.skipped{reason="no_metrics"}`.
+    pub skipped_no_metrics: usize,
 }
 
 /// Encodes an [`EventBatch`] as InfluxDB line protocol.
@@ -220,7 +226,9 @@ impl Encoder for InfluxLineEncoder {
         for event in &batch.events {
             let carrier = carrier_measurement(event, *measurement_key);
             if event.metrics.is_empty() && carrier.is_none() {
-                continue; // a log-only, span-only, or empty event: nothing to encode
+                // A log-only, span-only, or empty event: nothing to encode.
+                ctx.stats.skipped_no_metrics += 1;
+                continue;
             }
             // Tags depend only on resource and event attributes, so render once per event.
             render_tag_suffix(tag_suffix, scratch, &batch.resource, event, ctx.stats);
@@ -301,8 +309,13 @@ impl Ctx<'_> {
         push_escaped_measurement(self.line, measurement);
         self.line.push_str(tag_suffix);
         // Counted only once the line is written: a line `finish_line` drops is counted there.
-        if self.finish_line(timestamp, 1) && matches!(outcome, Fields::Degraded) {
-            self.stats.degraded_non_finite_component += 1;
+        if self.finish_line(timestamp, 1) {
+            if matches!(outcome, Fields::Degraded) {
+                self.stats.degraded_non_finite_component += 1;
+            }
+            if matches!(metric.kind, MetricKind::Set(_)) {
+                self.stats.degraded_set += 1;
+            }
         }
     }
 
