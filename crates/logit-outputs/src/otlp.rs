@@ -2126,6 +2126,28 @@ mod tests {
         assert_eq!(probe.sum("logit.output.events.skipped", &[("reason", "no_payload")]), 1.0);
     }
 
+    /// An event whose every metric is dropped writes no attribute, so a `u64` above `i64::MAX` on
+    /// it counts nothing; with no payload, the resource's isn't written either.
+    #[test]
+    fn a_u64_attribute_on_a_dropped_event_is_not_counted() {
+        use logit_core::Value;
+        use logit_proto::SignalEncoder as _;
+
+        let mut probe = TelemetryProbe::new();
+        let mut encoder =
+            OtlpEncoder::new().with_telemetry(probe.telemetry("out", "otlp_out", "sink"));
+        let mut batch = nothing_to_send_batch();
+        let mut resource = Resource::default();
+        resource.attributes.insert("host.id", Value::U64(u64::MAX));
+        batch.resource = Arc::new(resource);
+        batch.events[0].attributes.insert("bytes", Value::U64(u64::MAX));
+        assert!(encoder.encode_signals(&batch).unwrap().is_empty());
+        let dropped = [("reason", "unresolved_gauge_delta")];
+        assert_eq!(probe.sum("logit.output.metrics.dropped", &dropped), 1.0);
+        let reason = [("reason", "u64_as_double")];
+        assert_eq!(probe.sum("logit.output.attributes.normalized", &reason), 0.0);
+    }
+
     /// An `Export*ServiceResponse` whose `partial_success` rejects two data points.
     fn partial_success() -> Vec<u8> {
         let sub = [0x08, 2];

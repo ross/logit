@@ -644,15 +644,20 @@ pub struct EncodeStats {
     /// whose `logit.output.messages.dropped{reason="unencodable_value"}` would claim the whole
     /// message was dropped.
     pub omitted_invalid_values: usize,
-    /// A metric record whose name [`is_forbidden_in_name`] rewrote, once per record.
+    /// A metric record written under a name [`is_forbidden_in_name`] rewrote, once per record.
     pub names_sanitized: usize,
-    /// A wire tag whose key [`is_forbidden_in_tag_key`] rewrote, once per tag.
+    /// A wire tag whose key [`is_forbidden_in_tag_key`] rewrote, once per tag of an event that
+    /// wrote a line.
     pub tag_names_sanitized: usize,
-    /// A wire tag whose value [`is_forbidden_in_tag_value_only`] rewrote, once per tag.
+    /// A wire tag whose value [`is_forbidden_in_tag_value_only`] rewrote, once per tag of an event
+    /// that wrote a line.
     pub tag_values_sanitized: usize,
     /// A negative `Gauge` written as a `0|g` line and a `-v|g` adjustment, once per record:
     /// statsd_in reads the pair back as a gauge of 0 and a relative adjustment.
     pub degraded_negative_gauges: usize,
+    /// The current event's tag rewrites, held until the event writes a line or writes none.
+    pending_tag_names: usize,
+    pending_tag_values: usize,
 }
 
 /// A metric kind with no single statsd line, as the `metric_kind` tag on
@@ -823,77 +828,55 @@ impl FramedEncoder for StatsdEncoder {
         out.clear();
         let mut stats = EncodeStats::default();
         for event in &batch.events {
-            if event.metrics.is_empty() {
-                // Usually a plain log/span line, rarely a DogStatsD event; telling them apart
-                // needs only `_logit.statsd.event.title`, not the full merged walk (module doc's
-                // "DogStatsD events and service checks" section).
-                if !is_dogstatsd_event(&batch.resource, event) {
-                    stats.skipped_no_metrics += 1;
-                    continue;
-                }
+            let start = out.len();
+            self.encode_event(&batch.resource, event, out, &mut stats);
+            // A rewrite counts only when it reached the wire: the event's tags when it wrote a
+            // line, and a record's name or negative pair when that record did.
+            if out.len() > start {
+                stats.tag_names_sanitized += stats.pending_tag_names;
+                stats.tag_values_sanitized += stats.pending_tag_values;
+            }
+            stats.pending_tag_names = 0;
+            stats.pending_tag_values = 0;
+        }
+        stats
+    }
+}
 
-                let mut carriers = Carriers::default();
-                build_tag_suffix(
-                    &mut self.tag_suffix,
-                    &mut self.scratch,
-                    self.format,
-                    &batch.resource,
-                    event,
-                    &mut stats,
-                    &mut carriers,
-                );
-
-                if self.format == Format::Statsd {
-                    // No `Format::Statsd` wire form. The walk above already counted this event's
-                    // attributes into `tags_omitted_dialect`; both counters rising is expected.
-                    stats.skipped_dialect_events += 1;
-                    continue;
-                }
-
-                let mut ctx = EncodeCtx {
-                    format: self.format,
-                    multi_value: self.multi_value,
-                    tag_suffix: &self.tag_suffix,
-                    statsd_type: carriers.statsd_type,
-                    container_id: carriers.container_id,
-                    external_data: carriers.external_data,
-                    cardinality: carriers.cardinality,
-                    timestamp_secs: carriers.timestamp_secs,
-                    max_packet_bytes: self.max_packet_bytes,
-                    stats: &mut stats,
-                    diag: &mut self.diag,
-                    out: &mut *out,
-                };
-                render_event(
-                    &mut self.line,
-                    &mut self.title_buf,
-                    &mut self.text_buf,
-                    &carriers,
-                    event,
-                    &mut ctx,
-                );
-                continue;
+impl StatsdEncoder {
+    /// Encodes one event's lines into `out`, as [`StatsdEncoder::encode_into`] does for each.
+    fn encode_event(
+        &mut self,
+        resource: &Resource,
+        event: &Event,
+        out: &mut MessageBuf,
+        stats: &mut EncodeStats,
+    ) {
+        if event.metrics.is_empty() {
+            // Usually a plain log/span line, rarely a DogStatsD event; telling them apart
+            // needs only `_logit.statsd.event.title`, not the full merged walk (module doc's
+            // "DogStatsD events and service checks" section).
+            if !is_dogstatsd_event(resource, event) {
+                stats.skipped_no_metrics += 1;
+                return;
             }
 
-            // An event with metrics always runs the full walk; service-check detection reads
-            // `carriers` with no extra lookup.
             let mut carriers = Carriers::default();
             build_tag_suffix(
                 &mut self.tag_suffix,
                 &mut self.scratch,
                 self.format,
-                &batch.resource,
+                resource,
                 event,
-                &mut stats,
+                stats,
                 &mut carriers,
             );
 
-            let is_service_check = carriers.service_check_name.is_some();
-
-            if is_service_check && self.format == Format::Statsd {
-                // No `Format::Statsd` wire form; drop before inspecting anything else.
+            if self.format == Format::Statsd {
+                // No `Format::Statsd` wire form. The walk above already counted this event's
+                // attributes into `tags_omitted_dialect`; both counters rising is expected.
                 stats.skipped_dialect_events += 1;
-                continue;
+                return;
             }
 
             let mut ctx = EncodeCtx {
@@ -906,55 +889,99 @@ impl FramedEncoder for StatsdEncoder {
                 cardinality: carriers.cardinality,
                 timestamp_secs: carriers.timestamp_secs,
                 max_packet_bytes: self.max_packet_bytes,
-                stats: &mut stats,
+                stats,
                 diag: &mut self.diag,
                 out: &mut *out,
             };
+            render_event(
+                &mut self.line,
+                &mut self.title_buf,
+                &mut self.text_buf,
+                &carriers,
+                event,
+                &mut ctx,
+            );
+            return;
+        }
 
-            if is_service_check {
-                match event.metrics.first() {
-                    Some(first) if matches!(first.kind, MetricKind::Gauge(_)) => {
-                        render_service_check(&mut self.line, &carriers, first, &mut ctx);
-                        for metric in &event.metrics[1..] {
-                            render_metric(
-                                &mut self.line,
-                                &mut self.name,
-                                &mut self.member,
-                                &mut self.dotted,
-                                self.relative_gauges,
-                                metric,
-                                &mut ctx,
-                            );
-                        }
-                    }
-                    _ => {
-                        ctx.stats.dropped_invalid_service_check += 1;
-                        ctx.diag.warn_throttled(
-                            "invalid_service_check",
-                            format_args!(
-                                "statsd_out: service check {:?} has no Gauge as its first \
-                                 metric; dropping",
-                                carriers.service_check_name.unwrap_or_default()
-                            ),
+        // An event with metrics always runs the full walk; service-check detection reads
+        // `carriers` with no extra lookup.
+        let mut carriers = Carriers::default();
+        build_tag_suffix(
+            &mut self.tag_suffix,
+            &mut self.scratch,
+            self.format,
+            resource,
+            event,
+            stats,
+            &mut carriers,
+        );
+
+        let is_service_check = carriers.service_check_name.is_some();
+
+        if is_service_check && self.format == Format::Statsd {
+            // No `Format::Statsd` wire form; drop before inspecting anything else.
+            stats.skipped_dialect_events += 1;
+            return;
+        }
+
+        let mut ctx = EncodeCtx {
+            format: self.format,
+            multi_value: self.multi_value,
+            tag_suffix: &self.tag_suffix,
+            statsd_type: carriers.statsd_type,
+            container_id: carriers.container_id,
+            external_data: carriers.external_data,
+            cardinality: carriers.cardinality,
+            timestamp_secs: carriers.timestamp_secs,
+            max_packet_bytes: self.max_packet_bytes,
+            stats,
+            diag: &mut self.diag,
+            out: &mut *out,
+        };
+
+        if is_service_check {
+            match event.metrics.first() {
+                Some(first) if matches!(first.kind, MetricKind::Gauge(_)) => {
+                    render_service_check(&mut self.line, &carriers, first, &mut ctx);
+                    for metric in &event.metrics[1..] {
+                        render_metric_counted(
+                            &mut self.line,
+                            &mut self.name,
+                            &mut self.member,
+                            &mut self.dotted,
+                            self.relative_gauges,
+                            metric,
+                            &mut ctx,
                         );
                     }
                 }
-                continue;
+                _ => {
+                    ctx.stats.dropped_invalid_service_check += 1;
+                    ctx.diag.warn_throttled(
+                        "invalid_service_check",
+                        format_args!(
+                            "statsd_out: service check {:?} has no Gauge as its first \
+                             metric; dropping",
+                            carriers.service_check_name.unwrap_or_default()
+                        ),
+                    );
+                }
             }
-
-            for metric in &event.metrics {
-                render_metric(
-                    &mut self.line,
-                    &mut self.name,
-                    &mut self.member,
-                    &mut self.dotted,
-                    self.relative_gauges,
-                    metric,
-                    &mut ctx,
-                );
-            }
+            return;
         }
-        stats
+
+        for metric in &event.metrics {
+            render_metric_counted(
+                &mut self.line,
+                &mut self.name,
+                &mut self.member,
+                &mut self.dotted,
+                self.relative_gauges,
+                metric,
+                &mut ctx,
+            );
+        }
     }
 }
 
@@ -1206,7 +1233,7 @@ fn push_one_tag(
     }
     let key_start = suffix.len();
     if sanitize_into(suffix, key_str, is_forbidden_in_tag_key) {
-        stats.tag_names_sanitized += 1;
+        stats.pending_tag_names += 1;
     }
     if suffix.len() == key_start {
         // Unreachable while substitution never shortens a non-empty key; a defensive guard that
@@ -1218,7 +1245,7 @@ fn push_one_tag(
     if let Some(v) = rendered_value {
         suffix.push(':');
         if sanitize_into(suffix, v, is_forbidden_in_tag_value_only) {
-            stats.tag_values_sanitized += 1;
+            stats.pending_tag_values += 1;
         }
     }
     true
@@ -1481,6 +1508,30 @@ fn push_line(
     out.push(line);
 }
 
+/// [`render_metric`], counting a rewritten name and a negative `Gauge`'s pair once the record
+/// wrote an entry, so a record dropped after its name was sanitized counts only its drop.
+fn render_metric_counted(
+    line: &mut String,
+    name: &mut String,
+    member: &mut String,
+    dotted: &mut DottedScratch,
+    relative_gauges: bool,
+    metric: &MetricRecord,
+    ctx: &mut EncodeCtx,
+) {
+    let start = ctx.out.len();
+    render_metric(line, name, member, dotted, relative_gauges, metric, ctx);
+    if ctx.out.len() == start {
+        return;
+    }
+    if logit_core::interner::resolve(metric.name).chars().any(is_forbidden_in_name) {
+        ctx.stats.names_sanitized += 1;
+    }
+    if matches!(metric.kind, MetricKind::Gauge(v) if v.as_f64() < 0.0) {
+        ctx.stats.degraded_negative_gauges += 1;
+    }
+}
+
 /// Encodes one metric into `ctx.out`: no entry for a dropped metric, one for most kinds (a
 /// negative-gauge pair is one two-line entry), one per member for `SetMembers`, one per value
 /// for `Samples` under `Format::Statsd`, and one per component for an expanded multi-value kind.
@@ -1495,8 +1546,7 @@ fn render_metric(
     ctx: &mut EncodeCtx,
 ) {
     name.clear();
-    let renamed =
-        sanitize_into(name, logit_core::interner::resolve(metric.name), is_forbidden_in_name);
+    sanitize_into(name, logit_core::interner::resolve(metric.name), is_forbidden_in_name);
     if name.is_empty() {
         ctx.stats.dropped_empty_name += 1;
         ctx.diag.warn_throttled(
@@ -1520,10 +1570,6 @@ fn render_metric(
         );
         return;
     }
-    if renamed {
-        ctx.stats.names_sanitized += 1;
-    }
-
     match &metric.kind {
         // Only a delta, monotonic `Sum` means `|c`; any other `Sum` falls to the next arm.
         MetricKind::Sum(s) if s.temporality == Temporality::Delta && s.monotonic => {
@@ -1550,9 +1596,6 @@ fn render_metric(
                     format_args!("statsd_out: non-finite gauge value on {name:?}; dropping"),
                 );
                 return;
-            }
-            if v.as_f64() < 0.0 {
-                ctx.stats.degraded_negative_gauges += 1;
             }
             render_gauge_entry(line, name, "", v, ctx);
         }
@@ -3570,6 +3613,27 @@ mod tests {
         ] {
             assert_eq!(probe.sum(name, &[("reason", reason)]), 1.0, "{name}{{reason={reason}}}");
         }
+    }
+
+    /// A rewrite counts only on a line that's written: an unresolved gauge delta and an oversize
+    /// negative gauge, each with a rewritten name and tag, count their drop and no rewrite.
+    #[test]
+    fn a_rewritten_record_that_is_dropped_counts_no_rewrite() {
+        let tag = [("the team", Value::str("a|b"))];
+        let mut encoder = StatsdEncoder::new(Format::DogStatsd).with_max_packet_bytes(20);
+        let mut out = MessageBuf::default();
+        let stats = encoder.encode_into(
+            &batch_with(vec![
+                metric_event("free mem", MetricKind::GaugeDelta(MetricValue::F64(5.0)), &tag),
+                metric_event("used mem", MetricKind::Gauge(MetricValue::F64(-2.0)), &tag),
+            ]),
+            &mut out,
+        );
+        assert!(out.is_empty());
+        assert_eq!((stats.dropped_gauge_delta, stats.dropped_oversize_line), (1, 1));
+        assert_eq!(stats.names_sanitized, 0);
+        assert_eq!(stats.degraded_negative_gauges, 0);
+        assert_eq!((stats.tag_names_sanitized, stats.tag_values_sanitized), (0, 0));
     }
 
     #[test]

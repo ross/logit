@@ -279,11 +279,13 @@
 //!
 //! Plus everything [`DatadogEncoder`] counts itself (`logit.output.metrics.skipped` by
 //! `metric_kind` or `reason`; `metrics.dropped`; `metrics.degraded`; `tags.omitted`;
-//! `spans.degraded`; `stats.*`), which this sink doesn't repeat.
+//! `spans.degraded`; `stats.*`; and `events.skipped{reason="no_payload"}`, an event no route
+//! carries, which the plan finds and counts through the encoder), which this sink doesn't repeat.
 //!
 //! **Once per batch or per attempt** (ADR `sink-send-path-and-attempt-accounting`, decision 1).
 //! What the plan and the encoder decide counts once per batch: `stale`, `too_many_tags`,
-//! `needs_agent_processing`, `not_datadog_origin`, an event too large to send alone, and the
+//! `needs_agent_processing`, `not_datadog_origin`, an event too large to send alone, an event no
+//! route carries (`events.skipped{reason="no_payload"}`), and the
 //! encoder's counters and diagnostics, through handles gated by the sink's `BatchAccounting`. The
 //! plan is unit 0 and each route its own unit, so a route an earlier attempt never reached counts
 //! on the attempt that first encodes it. The transport counters, a series `202`'s `rejected`,

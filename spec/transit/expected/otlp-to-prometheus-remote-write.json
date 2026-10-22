@@ -62,7 +62,6 @@
     {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"process_restarts_total","kind":"sum","value":"NaN","temporality":"cumulative","monotonic":true,"start_timestamp":"2027-01-15T07:58:50.000000000Z","flags":1,"no_recorded_value":true}],"attributes":{"host_name":"web-1","service_name":"checkout"}}
   ], "counters": {
     "logit.output.labels.normalized{component=out,kind=prometheus_out,reason=name_sanitized,role=sink}": 6,
-    "logit.output.metrics.degraded{component=out,kind=prometheus_out,metric_kind=delta_sum,role=sink}": 1,
     "logit.output.metrics.normalized{component=out,kind=prometheus_out,reason=name_sanitized,role=sink}": 3,
     "logit.output.metrics.skipped{component=out,kind=prometheus_out,reason=no_recorded_value,role=sink}": 3
   }},

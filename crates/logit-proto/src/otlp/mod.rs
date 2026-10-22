@@ -122,19 +122,26 @@ impl SignalEncoder for OtlpEncoder {
                 no_payload += 1;
                 continue;
             }
-            u64_as_double += common::u64_as_double_count(&event.attributes);
+            let mut written = false;
             if let Some(log) = &event.log {
                 log_records.push(logs::encode_log_record(event, log));
+                written = true;
             }
             if let Some(span) = &event.span {
                 spans.push(traces::encode_span(event, span));
+                written = true;
             }
             for metric in &event.metrics {
                 if let Some(m) =
                     metrics::encode_metric(event, metric, &self.telemetry, &mut self.diagnostics)
                 {
                     metric_points.push(m);
+                    written = true;
                 }
+            }
+            // Only an event something was written for carries its attributes onto the wire.
+            if written {
+                u64_as_double += common::u64_as_double_count(&event.attributes);
             }
         }
 

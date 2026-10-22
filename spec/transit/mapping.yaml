@@ -13,16 +13,21 @@ classes:
     normalization doesn't touch reads back exact.
   degraded: >-
     The value survives in a lesser kind, such as a sketch written as dotted count and quantile
-    series.
+    series; the cell names the counter that counts it, or its reason is structural when every
+    record of the kind is written so.
   lost: >-
     A field the record loses while the record itself survives; the cell names the counter that
-    counts it, or says it's uncounted.
+    counts it, or its reason is structural when the destination's format has no slot for it.
   skipped: >-
     The record leaves no wire form, because the sink has none for it or the config chose none;
-    the cell names the counter that counts it, or says it's uncounted.
+    the cell names the counter that counts it.
   dropped: >-
     The record is lost for a reason the config didn't ask for; the cell names the counter that
-    counts it, or says it's uncounted.
+    counts it.
+# A cell may still say `reason: uncounted` only on the rows `UNCOUNTED_ALLOWED` names in
+# `crates/logit-cli/src/transit/mapping.rs`: log and span payloads, not yet classified, and rows
+# another change owns. docs/adr/telemetry-loss-vocabulary.md's amendment "structural loss has no
+# counter" has the rule.
 
 sinks: [statsd_out, prometheus_out, influxdb_out, otlp_out, datadog_out, graphite_out]
 
@@ -45,6 +50,7 @@ rows:
           upstream turns it into a counter.
       influxdb_out:
         class: degraded
+        reason: structural
         text: >-
           A `value` field of a measurement named for the record, its temporality and monotonicity
           dropped, which influxdb_in reads back as a gauge named `<name>.value`.
@@ -81,6 +87,7 @@ rows:
         text: A bare delta sum is dropped, as for a monotonic one.
       influxdb_out:
         class: degraded
+        reason: structural
         text: >-
           A `value` field, its temporality and monotonicity dropped, read back as a gauge named
           `<name>.value`.
@@ -118,6 +125,7 @@ rows:
           lacks it, so such a record reads back under the longer name.
       influxdb_out:
         class: degraded
+        reason: structural
         text: >-
           A `value` field holding the running total, its temporality and monotonicity dropped,
           read back as a gauge named `<name>.value`.
@@ -152,6 +160,7 @@ rows:
         text: Prometheus has no non-monotonic counter, so the running total is a `gauge`.
       influxdb_out:
         class: degraded
+        reason: structural
         text: >-
           A `value` field, its temporality and monotonicity dropped, read back as a gauge named
           `<name>.value`.
@@ -623,6 +632,7 @@ rows:
           quantiles with `_sum` and `_count`.
       influxdb_out:
         class: degraded
+        reason: structural
         text: >-
           Sketched, each value weighted by its inverse sample rate, then written as the
           `distribution` row describes, and counted only as that row says.
@@ -714,6 +724,7 @@ rows:
           is gone, so quantiles from two senders don't merge.
       influxdb_out:
         class: degraded
+        reason: structural
         text: >-
           In the `summary` row's shape: float `count` and `sum` fields and the sketch's `0.5`,
           `0.9`, and `0.99` quantiles, each read back as a gauge under `<name>.`; the sketch is
@@ -760,7 +771,7 @@ rows:
         text: A `gauge` of the estimate; the registers are gone.
       influxdb_out:
         class: degraded
-        counter: logit.output.metrics.degraded{metric_kind=set}
+        reason: structural
         text: >-
           A `value=<estimate>u` field, read back as a gauge named `<name>.value`; the registers are
           gone.
@@ -807,6 +818,7 @@ rows:
           an `aggregate` with `temporality: cumulative` upstream makes it a running one.
       influxdb_out:
         class: degraded
+        reason: structural
         text: >-
           Telegraf's shape: float `count`, `sum`, `min`, and `max` fields, a field per finite
           bound named by the bound and holding the cumulative count up to it, and `+Inf` holding
@@ -869,6 +881,7 @@ rows:
             be added to itself.
       influxdb_out:
         class: degraded
+        reason: structural
         text: >-
           Telegraf's shape: float `count`, `sum`, `min`, and `max` fields, a field per finite
           bound named by the bound and holding the cumulative count up to it, and `+Inf` holding
@@ -1153,6 +1166,7 @@ rows:
           warning; send this sink the summary from ahead of that component.
       influxdb_out:
         class: degraded
+        reason: structural
         text: >-
           Telegraf's shape: float `count` and `sum` fields and a field per quantile named by the
           quantile (`0.5`, `0.99`), each read back as a gauge under `<name>.`. Line protocol has
@@ -1168,6 +1182,7 @@ rows:
           `delta_summary_unresolved` warning.
       datadog_out:
         class: degraded
+        reason: structural
         text: >-
           A `<name>.quantile` gauge per quantile tagged `quantile:<q>`, and `.count` (no unit) and
           `.sum` as `count` points, as Datadog's exporter writes a summary it differenced;
@@ -1199,6 +1214,7 @@ rows:
         text: A `summary` family of its quantiles, `_sum`, and `_count`.
       influxdb_out:
         class: degraded
+        reason: structural
         text: >-
           Telegraf's shape: float `count` and `sum` fields and a field per quantile named by the
           quantile (`0.5`, `0.99`), each read back as a gauge under `<name>.`. When every
@@ -1459,12 +1475,11 @@ rows:
       prometheus_out:
         - when: {bind: null}
           class: degraded
-          counter: logit.output.metrics.degraded
+          reason: structural
           text: >-
             Remote-write writes a flagged delta `Sum` as a stale marker, its temporality ignored,
             since a marker holds no reading to be delta about: a monotonic one on a `counter`, read
-            back as a flagged cumulative counter, counted
-            `logit.output.metrics.degraded{metric_kind=delta_sum}`, and a non-monotonic one on a
+            back as a flagged cumulative counter, a structural loss, and a non-monotonic one on a
             `gauge`, counted `logit.output.metrics.degraded{metric_kind=non_monotonic_sum}`. An
             unflagged delta `Sum` is dropped.
         - class: skipped

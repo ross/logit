@@ -36,7 +36,6 @@
   "flagged-kinds": {"events": [
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"jobs_started_total","kind":"sum","value":"NaN","temporality":"cumulative","monotonic":true,"flags":1,"no_recorded_value":true}]}
   ], "counters": {
-    "logit.output.metrics.degraded{component=out,kind=prometheus_out,metric_kind=delta_sum,role=sink}": 1,
     "logit.output.metrics.normalized{component=out,kind=prometheus_out,reason=name_sanitized,role=sink}": 1,
     "logit.output.metrics.skipped{component=out,kind=prometheus_out,reason=no_recorded_value,role=sink}": 2
   }},

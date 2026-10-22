@@ -63,9 +63,10 @@
 //! - `text`, one operator-facing sentence or two, always;
 //! - `reason`, the normalization's name, on a `normalized` cell;
 //! - `counter`, the series it counts under (`name{tag=value,...}`, the tags a subset of the
-//!   series'), on a `skipped`, `dropped`, or `lost` cell, unless `reason` says why there's none.
-//!   A `lost` cell's reason may be `structural`: the destination's format has no slot for the
-//!   field, so every record loses it and the table is its record (ADR
+//!   series'), on a `degraded`, `skipped`, `dropped`, or `lost` cell, unless `reason` says why
+//!   there's none. A `lost` or `degraded` cell's reason may be `structural`: the destination's
+//!   format has no slot for the field or no form for the kind, so every such record loses it and
+//!   the table is its record (ADR
 //!   `telemetry-loss-vocabulary`'s amendment "structural loss has no counter"). `uncounted`, a
 //!   loss the sink doesn't count yet, is accepted only on a cell [`UNCOUNTED_ALLOWED`] names, and
 //!   the class check accepts it for a record nothing reads back.
@@ -458,8 +459,9 @@ impl Mapping {
                     }
                     if reason == Some("structural") {
                         ensure!(
-                            cell.class == Class::Lost && cell.counter.is_none(),
-                            "{at}: only a lost cell with no counter is structural"
+                            matches!(cell.class, Class::Lost | Class::Degraded)
+                                && cell.counter.is_none(),
+                            "{at}: only a lost or degraded cell with no counter is structural"
                         );
                     }
                     match cell.class {
@@ -479,7 +481,11 @@ impl Mapping {
                                 || matches!(reason, Some("structural" | "uncounted")),
                             "{at}: a lost cell names its counter, or its reason is structural"
                         ),
-                        Class::Exact | Class::Degraded => {}
+                        Class::Degraded => ensure!(
+                            cell.counter.is_some() || reason == Some("structural"),
+                            "{at}: a degraded cell names its counter, or its reason is structural"
+                        ),
+                        Class::Exact => {}
                     }
                 }
             }

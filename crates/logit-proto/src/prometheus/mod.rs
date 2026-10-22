@@ -122,7 +122,7 @@
 //! | `summary/cumulative` | exact | -- | A `summary` family of its quantiles, `_sum`, and `_count`. |
 //! | `record/no_recorded_value`, with `bind:` unset | exact | -- | Remote-write writes a flagged `Gauge` or cumulative `Sum` as Prometheus's stale marker, read back flagged; a flagged non-monotonic `Sum`'s goes on a `gauge`, as its value would. |
 //! | `record/no_recorded_value`, otherwise | skipped | `logit.output.metrics.skipped{reason=no_recorded_value}` | A point flagged as holding no recorded value isn't exposed. |
-//! | `record/no_recorded_value_delta_sum`, with `bind:` unset | degraded | `logit.output.metrics.degraded` | Remote-write writes a flagged delta `Sum` as a stale marker, its temporality ignored, since a marker holds no reading to be delta about: a monotonic one on a `counter`, read back as a flagged cumulative counter, counted `logit.output.metrics.degraded{metric_kind=delta_sum}`, and a non-monotonic one on a `gauge`, counted `logit.output.metrics.degraded{metric_kind=non_monotonic_sum}`. An unflagged delta `Sum` is dropped. |
+//! | `record/no_recorded_value_delta_sum`, with `bind:` unset | degraded | structural | Remote-write writes a flagged delta `Sum` as a stale marker, its temporality ignored, since a marker holds no reading to be delta about: a monotonic one on a `counter`, read back as a flagged cumulative counter, a structural loss, and a non-monotonic one on a `gauge`, counted `logit.output.metrics.degraded{metric_kind=non_monotonic_sum}`. An unflagged delta `Sum` is dropped. |
 //! | `record/no_recorded_value_delta_sum`, otherwise | skipped | `logit.output.metrics.skipped{reason=no_recorded_value}` | A point flagged as holding no recorded value isn't exposed. |
 //! | `record/no_recorded_value_other_kind` | skipped | `logit.output.metrics.skipped{reason=no_recorded_value}` | A flagged record of a kind other than `Gauge` or `Sum` isn't written in either mode. It would be several series, and the flag doesn't say which of them existed, so a stale marker would name a series that may never have been sent. |
 //! | `record/service_check` | exact | -- | The status gauge; the check's carriers aren't labels. |
@@ -184,7 +184,7 @@
 //! | `Distribution(sketch)` | `summary` of [`DISTRIBUTION_QUANTILES`] + `_sum` + `_count`; `_sum` is [`DdSketch::sum`], exact unlike a quantile (approximate only when [`DdSketch::stats_exact`] is `false`, i.e. the sketch's stats were derived from its bins) -- `logit.output.metrics.degraded{metric_kind="distribution"}` |
 //! | a `Histogram` bound | sorted ascending, equal bounds merged into one `le`; a `NaN` bound has no `le` bucket, its count reaching only `+Inf` and `_count` -- `logit.output.metrics.degraded{reason="non_finite_component"}`, once per record. `-Inf` is an ordinary bound, `le="-Inf"` |
 //! | an event with no metric record (a log, a span, or neither) | nothing -- `logit.output.events.skipped{reason="no_metrics"}` |
-//! | a flagged delta monotonic `Sum` under [`PrometheusEncoder::with_stale_markers`]`(true)` | a stale marker on a `counter`, which reads back cumulative -- `logit.output.metrics.degraded{metric_kind="delta_sum"}`; a flagged non-monotonic one is a `gauge`'s marker, `{metric_kind="non_monotonic_sum"}` |
+//! | a flagged delta monotonic `Sum` under [`PrometheusEncoder::with_stale_markers`]`(true)` | a stale marker on a `counter`, which reads back cumulative, uncounted: every such record loses its temporality, a structural loss; a flagged non-monotonic one is a `gauge`'s marker, `logit.output.metrics.degraded{metric_kind="non_monotonic_sum"}` |
 //! | `Event::timestamp` | emitted only when `_logit.prometheus.timestamp: true` is present (consumed) -- or on every series, marker or not, under [`PrometheusEncoder::with_timestamps_always`]`(true)`, which is what a transport with no way to omit a timestamp needs |
 //! | labels | `Value::Str/I64/U64/F64/Bool` stringified; `Null/Bytes/Timestamp/Map` dropped -- `logit.output.labels.omitted{reason="unrepresentable"}`. An `Array` (a repeated DogStatsD tag key, `crate::statsd::decode::insert_tags`) renders its **last** representable element -- a Prometheus label set is a map, so there is no multi-value label -- counted `logit.output.labels.normalized{reason="multi_value"}`; an empty or entirely unrepresentable one stays on the `omitted{reason="unrepresentable"}` path |
 //! | names | sanitized ([`sanitize_metric_name`], [`sanitize_label_name`]), each record written under a rewritten name counted `logit.output.metrics.normalized{reason="name_sanitized"}` and each label, a written exemplar's included, `logit.output.labels.normalized{reason="name_sanitized"}`; labels are ordered and collision-checked on their **rendered** names, and on a collision the one whose *original* attribute name sorts first wins -- `logit.output.labels.omitted{reason="collision"}`; a label sanitizing onto a generated one (`le` on a histogram, `quantile` on a summary) is omitted -- `logit.output.labels.omitted{reason="reserved"}`. An exemplar's attribute keys follow the same rule, and one sanitizing onto the `trace_id`/`span_id` its trace is written as is `reserved` |
@@ -1029,7 +1029,7 @@ pub fn events_to_families<'a>(
             // per *family*, not per point, and only for a name that has to change.
             let key = sanitize_metric_name(name);
             let renamed = usize::from(matches!(key, Cow::Owned(_)));
-            let labels = build_labels(resource, event, kind, encoder);
+            let (labels, labels_renamed) = build_labels(resource, event, kind, encoder);
             let timestamp = if encoder.timestamps_always {
                 Some(event.timestamp)
             } else {
@@ -1064,6 +1064,7 @@ pub fn events_to_families<'a>(
                     } else {
                         existing.family.series.push(series.take().expect("built above"));
                         existing.renamed += renamed;
+                        existing.labels_renamed += labels_renamed;
                     }
                 }
                 // A different model name sanitizing onto the same wire name: the one whose model
@@ -1088,6 +1089,7 @@ pub fn events_to_families<'a>(
                 FamilyEntry {
                     origin: name,
                     renamed,
+                    labels_renamed,
                     family: MetricFamily {
                         name: key,
                         kind,
@@ -1102,6 +1104,9 @@ pub fn events_to_families<'a>(
 
     // Counted from the families kept, so a record a collision displaced counts only its drop.
     encoder.names_sanitized(families.values().map(|entry| entry.renamed).sum());
+    for _ in 0..families.values().map(|entry| entry.labels_renamed).sum::<usize>() {
+        encoder.label_normalized("name_sanitized");
+    }
     // The map is keyed by the emitted name, so draining it in key order is already the canonical
     // family ordering -- no re-sort needed.
     let mut out: Vec<MetricFamily> = families.into_values().map(|entry| entry.family).collect();
@@ -1127,6 +1132,8 @@ struct FamilyEntry {
     origin: &'static str,
     /// Records in `family` whose name [`sanitize_metric_name`] rewrote.
     renamed: usize,
+    /// Labels of the series in `family` whose name [`sanitize_label_name`] rewrote.
+    labels_renamed: usize,
     family: MetricFamily,
 }
 
@@ -1274,10 +1281,6 @@ fn stale_point(
     let kind = match &record.kind {
         MetricKind::Sum(s) => {
             if s.monotonic {
-                // A marker has no reading to be delta about, so a delta one reads back cumulative.
-                if s.temporality == Temporality::Delta {
-                    encoder.degraded("delta_sum");
-                }
                 FamilyType::Counter
             } else {
                 encoder.degraded("non_monotonic_sum");
@@ -1373,12 +1376,15 @@ pub(crate) fn cumulative_counts(buckets: &[(f64, u64)]) -> (Vec<(f64, u64)>, u64
 /// order: the emitted label set is sorted by the name that appears on the wire, and when two
 /// attributes sanitize onto one label name the one whose *original* attribute name sorts first wins,
 /// so the outcome depends on the data rather than on process-wide interning history.
+///
+/// Also returns how many labels were written under a rewritten name, for the caller to count once
+/// it keeps the series.
 fn build_labels(
     resource: &Resource,
     event: &Event,
     kind: FamilyType,
     encoder: &mut PrometheusEncoder,
-) -> Vec<(String, String)> {
+) -> (Vec<(String, String)>, usize) {
     // The label name this family type generates itself, which an attribute must not collide with:
     // a duplicate label name is invalid exposition, not merely confusing.
     let generated = match kind {
@@ -1423,18 +1429,17 @@ fn build_labels(
     }
     candidates.sort_by(|a, b| a.0.cmp(b.0));
     let mut labels: Vec<(String, String)> = Vec::with_capacity(candidates.len());
+    let mut renamed = 0;
     for (_, name, value) in candidates {
         if labels.iter().any(|(existing, _)| existing.as_str() == name.as_ref()) {
             encoder.label_omitted("collision");
             continue;
         }
-        if matches!(name, Cow::Owned(_)) {
-            encoder.label_normalized("name_sanitized");
-        }
+        renamed += usize::from(matches!(name, Cow::Owned(_)));
         labels.push((name.into_owned(), value));
     }
     labels.sort_by(|a, b| a.0.cmp(&b.0));
-    labels
+    (labels, renamed)
 }
 
 /// A [`Value`] as a Prometheus label value (always a string on the wire), or `None` for the kinds

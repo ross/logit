@@ -451,7 +451,7 @@ pub fn emit_encode_stats(telemetry: &Telemetry, stats: &EncodeStats) {
     const DROPPED: &str = "logit.output.metrics.dropped";
     const SKIPPED: &str = "logit.output.metrics.skipped";
     const DEGRADED: &str = "logit.output.metrics.degraded";
-    let rows: [(usize, &str, (&str, &str)); 19] = [
+    let rows: [(usize, &str, (&str, &str)); 18] = [
         (stats.tags_normalized_multi_value, TAGS_NORMALIZED, ("reason", "multi_value")),
         (stats.tags_omitted_unrepresentable, TAGS_OMITTED, ("reason", "unrepresentable")),
         (stats.tags_omitted_empty, TAGS_OMITTED, ("reason", "empty")),
@@ -469,7 +469,6 @@ pub fn emit_encode_stats(telemetry: &Telemetry, stats: &EncodeStats) {
         (stats.dropped_unresolved_gauge_delta, DROPPED, ("reason", "unresolved_gauge_delta")),
         (stats.dropped_comment_measurement, DROPPED, ("reason", "comment_measurement")),
         (stats.dropped_timestamp_overflow, DROPPED, ("reason", "timestamp_overflow")),
-        (stats.degraded_set, DEGRADED, ("metric_kind", "set")),
         (stats.skipped_no_metrics, "logit.output.events.skipped", ("reason", "no_metrics")),
     ];
     for (count, name, label) in rows {
@@ -1049,8 +1048,8 @@ mod tests {
         };
         use logit_pipeline::test_util::TelemetryProbe;
 
-        // A collapsed multi-value tag, a gauge delta dropped with its diagnostic, a set written as
-        // its estimate, and an event with nothing to write.
+        // A collapsed multi-value tag, a gauge delta dropped with its diagnostic, and an event
+        // with nothing to write.
         let batch = || {
             let mut tagged = metric_event("hits", MetricKind::counter(1.0), &[]);
             tagged.attributes.insert("team", Value::Array(vec![Value::str("a"), Value::str("b")]));
@@ -1061,15 +1060,13 @@ mod tests {
                     MetricKind::GaugeDelta(logit_core::MetricValue::F64(5.0)),
                     &[],
                 ),
-                metric_event("users", MetricKind::Set(logit_core::HyperLogLog::default()), &[]),
                 Event::empty(0, AttrMap::new()),
             ])
         };
-        const ENCODE_SIDE: [(&str, &[(&str, &str)]); 6] = [
+        const ENCODE_SIDE: [(&str, &[(&str, &str)]); 5] = [
             ("logit.output.tags.normalized", &[("reason", "multi_value")]),
             ("logit.component.diagnostics", &[("key", "gauge_delta_unresolved")]),
             ("logit.output.metrics.dropped", &[("reason", "unresolved_gauge_delta")]),
-            ("logit.output.metrics.degraded", &[("metric_kind", "set")]),
             ("logit.output.events.skipped", &[("reason", "no_metrics")]),
             ("logit.output.batch.bytes", &[]),
         ];
@@ -1100,10 +1097,10 @@ mod tests {
         assert_counted_once_per_batch(single, retried, &ENCODE_SIDE, &[]);
     }
 
-    /// A set written as its estimate counts once per record, and each event with nothing to
-    /// write once, a log-only one and an empty one alike; a counter beside them counts neither.
+    /// Each event with nothing to write counts once, a log-only one and an empty one alike; a set
+    /// and a counter beside them count nothing, a set's estimate being a structural loss.
     #[test]
-    fn a_set_and_a_metricless_event_are_counted() {
+    fn a_metricless_event_is_counted() {
         use logit_pipeline::test_util::TelemetryProbe;
 
         let mut probe = TelemetryProbe::new();
@@ -1129,7 +1126,7 @@ mod tests {
             .unwrap();
         assert!(std::str::from_utf8(&body).unwrap().contains("users value=0u"));
         emit_encode_stats(&telemetry, encoder.stats());
-        assert_eq!(probe.sum("logit.output.metrics.degraded", &[("metric_kind", "set")]), 1.0);
+        assert_eq!(probe.sum("logit.output.metrics.degraded", &[]), 0.0);
         assert_eq!(probe.sum("logit.output.events.skipped", &[("reason", "no_metrics")]), 2.0);
     }
 

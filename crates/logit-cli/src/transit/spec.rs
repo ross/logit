@@ -1201,7 +1201,10 @@ mod tests {
             "  - kind: sum\n    feature: delta_monotonic\n    cells:\n      statsd_out:\n        \
                      class: exact\n";
         assert!(text.contains(right), "the table's delta_monotonic row moved");
-        let wrong = text.replace(right, &right.replace("class: exact", "class: degraded"));
+        let wrong = text.replace(
+            right,
+            &right.replace("class: exact", "class: degraded\n        reason: structural"),
+        );
         let (flow, case) = relay();
         let traced = run_traced(&flow.path, &case.json(), Options::default()).expect("runs");
         let at = At { flow: &flow.name, case: &case.name };
@@ -1366,7 +1369,10 @@ mod tests {
     fn gen_never_rewrites_over_a_class_failure() {
         let delta = "    feature: delta_monotonic\n    cells:\n      statsd_out:\n        class: ";
         let spec = small_spec("transit-gen-class", |table| {
-            table.replace(&format!("{delta}exact\n"), &format!("{delta}degraded\n"))
+            table.replace(
+                &format!("{delta}exact\n"),
+                &format!("{delta}degraded\n        reason: structural\n"),
+            )
         });
         let expected = spec.join("expected/statsd-relay.json");
         let ledger = spec.join("ledger/statsd-relay.json");
@@ -1561,7 +1567,11 @@ mod tests {
             (
                 "  - {kind: samples, cells: {statsd_out: {class: skipped, reason: structural, \
                  text: t}}}\n",
-                "only a lost cell with no counter is structural",
+                "only a lost or degraded cell with no counter is structural",
+            ),
+            (
+                "  - {kind: samples, cells: {statsd_out: {class: degraded, text: t}}}\n",
+                "a degraded cell names its counter",
             ),
             (
                 "  - {kind: record, feature: unit, cells: {statsd_out: {class: lost, text: t}}}\n",
@@ -1589,6 +1599,8 @@ mod tests {
              reason: structural, text: t}}}\n",
             "  - {kind: log, feature: plain, cells: {statsd_out: {class: skipped, \
              reason: uncounted, text: t}}}\n",
+            "  - {kind: samples, cells: {statsd_out: {class: degraded, reason: structural, \
+             text: t}}}\n",
         ] {
             assert!(mapping::parse(&table(rows)).is_ok(), "{rows}");
         }
