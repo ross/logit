@@ -1,9 +1,10 @@
 {
   "cells": [
     {"sink":"graphite_out","row":"attributes/no_host","cell":0,"observed":["exact"]},
-    {"sink":"graphite_out","row":"attributes/string_value","cell":1,"observed":["exact"]},
+    {"sink":"graphite_out","row":"attributes/string_value","cell":1,"observed":["exact","normalized"]},
     {"sink":"graphite_out","row":"gauge/f64","cell":0,"observed":["exact"]},
     {"sink":"graphite_out","row":"gauge/negative","cell":0,"observed":["exact"]},
+    {"sink":"graphite_out","row":"record/name_unsafe","cell":0,"observed":["normalized"]},
     {"sink":"graphite_out","row":"record/superseded","cell":0,"observed":["exact"]}
   ],
   "unspecified": []

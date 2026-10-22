@@ -129,7 +129,7 @@ Native transforms live in `crates/logit-transforms`; `lua`/`lua_file` live in `c
 
 | Kind | What it does | Decision record |
 |---|---|---|
-| `lua`, `lua_file` | a user script, inline or from a `.lua` file path relative to the config file; an optional `interval` runs its `flush()`, a `random` global mints trace ids, UUIDs, and ULIDs, and a script edits a log's message, severity, and body format and deletes attributes in place, with `pairs` enumerating them; scripts run interpreted unless `jit: true` turns on LuaJIT's compiler for that component | [ADR `lua-flush-root-context`](docs/adr/lua-flush-root-context.md), [ADR `lua-event-constructor`](docs/adr/lua-event-constructor.md), [ADR `lua-in-place-edits`](docs/adr/lua-in-place-edits.md), [ADR `lua-random-ids`](docs/adr/lua-random-ids.md), [ADR `lua-jit-opt-in`](docs/adr/lua-jit-opt-in.md) |
+| `lua`, `lua_file` | a user script, inline or from a `.lua` file path relative to the config file; an optional `interval` runs its `flush()`, a `random` global mints trace ids, UUIDs, and ULIDs, and a script edits a log's message, severity, and body format and deletes attributes in place, with `pairs` enumerating them; scripts run interpreted unless `jit: true` turns on LuaJIT's compiler for that component; an optional `vars:` map reaches the script as a plain-table `vars` global, so a copied script reads its deployment settings from config | [ADR `lua-flush-root-context`](docs/adr/lua-flush-root-context.md), [ADR `lua-event-constructor`](docs/adr/lua-event-constructor.md), [ADR `lua-in-place-edits`](docs/adr/lua-in-place-edits.md), [ADR `lua-random-ids`](docs/adr/lua-random-ids.md), [ADR `lua-jit-opt-in`](docs/adr/lua-jit-opt-in.md), [ADR `lua-script-vars`](docs/adr/lua-script-vars.md) |
 | `aggregate` | windowed aggregation into mergeable metric kinds | [ADR `aggregation-window-semantics`](docs/adr/aggregation-window-semantics.md) |
 | `cumulative_to_delta` | replaces each point of a cumulative monotonic `Sum`, `Histogram`, `ExponentialHistogram`, or `Summary` with its difference from the series' previous point, for a delta-only destination; per-series state in memory, keyed without the start time, bounded by `max_staleness` (wall clock) and `max_series` | [ADR `cumulative-to-delta-transform`](docs/adr/cumulative-to-delta-transform.md) |
 | `json` | parses JSON into attributes | [ADR `json-parsing-into-attributes`](docs/adr/json-parsing-into-attributes.md) |
@@ -182,6 +182,10 @@ Details an agent needs beyond the table:
   assigns `nil` to delete an attribute, and loops over an attribute proxy with `pairs`, so it
   needs `event:to_table()` and `Event.new` only to build a new structure
   ([ADR `lua-in-place-edits`](docs/adr/lua-in-place-edits.md)).
+  A component's `vars:` map is the script's `vars` global, plain tables built into each VM before
+  its source runs, so a copied example script stays unedited while each deployment sets its
+  values in config; `logit validate` rejects a `null` or an integer past 2^53 anywhere in it
+  ([ADR `lua-script-vars`](docs/adr/lua-script-vars.md)).
 - **`cumulative_to_delta`** takes each point through the ADR's six rules in order: a first
   point (`initial_value: auto | keep | drop`), a resent or overtaken point (skipped), a reset (a
   decrease, or a start moved past the previous point, emitted whole), a layout change (dropped),
