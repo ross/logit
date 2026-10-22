@@ -147,8 +147,8 @@ pub(super) enum MetricOut {
     UnresolvedCumulative,
     /// A series point another point of its series replaced in the same second of one request.
     DuplicateTimestamp,
-    /// A series point replaced in the same second by a point equal to it: nothing is lost, since
-    /// Datadog stores the same point.
+    /// A state's series point replaced in the same second by a point equal to it: nothing is
+    /// lost, since Datadog stores the same point.
     EqualDuplicateTimestamp,
 }
 

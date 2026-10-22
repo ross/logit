@@ -89,7 +89,7 @@ Entry format and the other areas: [the known-gaps index](README.md).
 - **A later batch repeating a series and millisecond with a new value draws a `400` that drops
   the whole batch.** `prometheus_out(endpoint)` collapses readings of one series that share a
   millisecond within one batch, keeping the later and counting the rest
-  `logit.output.metrics.dropped{reason="duplicate_timestamp"}`, or `normalized` for a reading
+  `logit.output.metrics.dropped{reason="duplicate_timestamp"}`, or `normalized` for a state
   equal to the one kept, and `dedup_timestamps` works within
   one batch too ([ADR `dedup-timestamps-transform`](../adr/dedup-timestamps-transform.md)'s
   "Scope"). Neither sees across batches. Prometheus 3.15.1 and Mimir 3.2.2, run 2026-10-21, accept a

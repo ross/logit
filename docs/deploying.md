@@ -2644,19 +2644,22 @@ latest of a series' readings in one bucket, and count every other one:
 
 | Removed reading | Counter |
 |---|---|
-| equal to the reading sent | `logit.output.metrics.normalized{reason="duplicate_timestamp"}` |
+| a state equal to the reading sent | `logit.output.metrics.normalized{reason="duplicate_timestamp"}` |
 | any other | `logit.output.metrics.dropped{reason="duplicate_timestamp"}`, with a throttled `duplicate_timestamp` diagnostic |
 
 The sink keeps the later reading because Prometheus and Mimir would keep the first of two in one
-request, and Datadog the higher, and neither adds two deltas. An equal reading loses nothing: the
-destination stores the same sample either way, so a relay or a retry resending identical points
-raises no loss alarm. Equal means the whole reading as the sink writes it: for remote-write, the
-sample or every bucket and quantile, the created timestamp, and the exemplars; for `datadog_out`,
-the value, type, unit, interval, source type, and origin. Two equal delta counts sent to
-`datadog_out` are still two increments, and only one is sent.
+request, and Datadog the higher, and neither adds two deltas. A state is a reading a later one
+fully replaces: a gauge, a set written as its size, or a cumulative sum, histogram, or summary.
+An equal state loses nothing: the destination stores the same sample either way, so a relay or a
+retry resending identical points raises no loss alarm. Equal means the whole reading as the sink
+writes it: for remote-write, the sample or every bucket and quantile, the created timestamp, and
+the exemplars; for `datadog_out`, the value, type, unit, interval, source type, and origin. An
+increment or a set of observations (a delta count, a delta histogram, `samples`, a
+distribution) counts `dropped` even when equal: two equal ones are two sets of events, and only
+one is sent.
 
 A nonzero dropped count means the flow needs a `dedup_timestamps` component, placed last before
-the sink. Add one too where equal deltas must add up.
+the sink.
 You meet it on a flow that keeps source timestamps from a source that can stamp two readings of
 one series inside one bucket: `statsd_in` gauges, which share their datagram's arrival time,
 `internal`, and any relay with no `aggregate` in the path. Set `precision:` to the sink's
@@ -3079,8 +3082,10 @@ sketch whose `tags` list holds more than 100 strings, so `datadog_out` drops it 
 
 **Two points of one series in one second leave as one.** Datadog keeps the higher of two such
 points in one request, so of each batch's pair `datadog_out` sends the later and counts the other
-`metrics.dropped{reason="duplicate_timestamp"}`, or `metrics.normalized{reason="duplicate_timestamp"}`
-when the two are equal; distribution points are kept, as Datadog keeps them. A `dedup_timestamps` with `precision: 1s` ahead of the sink merges deltas instead (see
+`metrics.dropped{reason="duplicate_timestamp"}`, or
+`metrics.normalized{reason="duplicate_timestamp"}` for a gauge equal to the one sent;
+distribution points are kept, as Datadog keeps them. A `dedup_timestamps` with
+`precision: 1s` ahead of the sink merges deltas instead (see
 [Duplicate timestamps](#duplicate-timestamps)).
 
 **A disk buffer can't deliver an outage's metrics late.** A `buffer.disk:` on this sink holds
@@ -3907,7 +3912,7 @@ Native histograms are skipped and counted on both wires regardless of version
   `docs/known-gaps/prometheus.md` has the row. A later batch that repeats a series and millisecond
   with a new value draws `400 duplicate sample for timestamp` the same way. Within one batch, the
   sink counts `logit.output.metrics.dropped{reason="duplicate_timestamp"}` instead, or
-  `normalized` for a reading equal to the one sent; see
+  `normalized` for a state equal to the one sent; see
   [Duplicate timestamps](#duplicate-timestamps).
 
 ## VictoriaMetrics, VictoriaLogs, and VictoriaTraces

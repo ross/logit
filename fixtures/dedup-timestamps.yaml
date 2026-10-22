@@ -6,7 +6,7 @@
 #
 # Without `dedup_timestamps`, `prometheus_out` collapses those readings itself, keeping the
 # latest, and counts each lost one as loss,
-# `logit.output.metrics.dropped{reason="duplicate_timestamp"}`, or one equal to the latest as
+# `logit.output.metrics.dropped{reason="duplicate_timestamp"}`, or a gauge equal to the latest as
 # `logit.output.metrics.normalized{reason="duplicate_timestamp"}`. With it, the collapse happens here,
 # under the rule you chose: the latest gauge wins, and each reading removed is counted as an
 # intended outcome (`logit.transform.metrics.absorbed`). A relative `+N`/`-N` gauge line passes

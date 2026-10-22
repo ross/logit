@@ -1086,8 +1086,8 @@ impl DatadogEncoder {
     /// and doesn't sum two counts, so sending both loses one of them uncounted. Under a
     /// [`DatadogEncoder::with_series_plan`], the plan names the points to leave off and the sink
     /// has counted them; with none, the points are collapsed here and each one left off is
-    /// counted `normalized{reason="duplicate_timestamp"}` when it equals the point sent
-    /// ([`same_point`]), else `dropped{reason="duplicate_timestamp"}`.
+    /// counted `normalized{reason="duplicate_timestamp"}` when it's a state equal to the point
+    /// sent ([`same_point`]), else `dropped{reason="duplicate_timestamp"}`.
     ///
     /// A record whose every point is left off as a duplicate counts none of its notes, and an
     /// event with no point sent counts none of its omitted tags: those describe a written series.
@@ -1398,7 +1398,7 @@ pub struct SeriesPlanned {
 enum Fate {
     /// The latest of its series and second: sent.
     Sent,
-    /// Left off, equal to the point sent ([`same_point`]).
+    /// Left off, a state equal to the point sent ([`same_point`]).
     Equal,
     /// Left off, differing from the point sent.
     Differing,

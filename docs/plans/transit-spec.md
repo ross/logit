@@ -440,7 +440,7 @@ Recorded per workstream as each lands.
     same way and counted, under `metrics.degraded{reason="sub_ms_collapsed"}`, a `degraded`
     series for a reading that's gone (`record/same_millisecond`: `dropped`). Since `tfix/w3`
     both count `metrics.dropped{reason="duplicate_timestamp"}`, or
-    `metrics.normalized{reason="duplicate_timestamp"}` for a reading equal to the one sent
+    `metrics.normalized{reason="duplicate_timestamp"}` for a state equal to the one sent
     (`record/same_instant_equal`, `record/same_millisecond_equal`)
     ([ADR `dedup-timestamps-transform`](../adr/dedup-timestamps-transform.md)).
   - `prometheus_out` writes no start time for a gauge: `_created` is a counter's, histogram's,

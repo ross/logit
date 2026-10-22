@@ -498,7 +498,7 @@ config asked for never uses the word:
 | `logit.component.events.copied` | A router delivered an event to more than one destination, or `route_signals` split one into a part per target; counts the deliveries past each event's first. Nothing is lost. | None. |
 | `*.omitted` | A piece (a tag, label, attribute, field, structured-data element, link, sample value, or a metric record or span beside a log body) removed from a record that's still delivered. | `reason` where more than one cause exists. |
 | `*.skipped` | Nothing was there to carry, the operator chose to leave it out (`multi_value: skip`), or the destination format has no form for the kind. | `reason` or `metric_kind`. |
-| `*.degraded`, `*.truncated`, `*.normalized` | Delivered, but lossy, shortened, or rewritten. `metrics.normalized{reason="duplicate_timestamp"}` counts a reading a sink left off beside an equal one it delivered, so nothing is lost. | `reason`, `metric_kind`, or `field`. |
+| `*.degraded`, `*.truncated`, `*.normalized` | Delivered, but lossy, shortened, or rewritten. `metrics.normalized{reason="duplicate_timestamp"}` counts a state a sink left off beside an equal one it delivered, so nothing is lost. | `reason`, `metric_kind`, or `field`. |
 | `*.evicted`, `*.untracked` | An entry left a bounded bookkeeping table. No data was lost. | `reason` where more than one cause exists. |
 | `logit.input.batches.deferred` | A listener answered busy (`503`). The client keeps the data and retries, so this is back-pressure, not loss. | None. |
 | `logit.input.connections.rejected`, `logit.input.requests.rejected` | A listener refused a connection or request and told the peer, which still holds the data. | `reason`. |
@@ -2571,9 +2571,11 @@ Some reasons exist only on one path:
   a later reading shares a millisecond with, at the same nanosecond or another, once per reading
   (a histogram reading counts once, not once per wire sample), with a throttled
   `duplicate_timestamp` diagnostic naming `dedup_timestamps` (`precision: 1ms`), or `aggregate`
-  for a live delta flow. The later reading is sent. A removed reading equal to the one sent (the
-  point, each `f64` by its bits, the created timestamp, and the exemplars) loses nothing, and
-  counts `normalized{reason="duplicate_timestamp"}` instead, with no diagnostic. The exposition
+  for a live delta flow. The later reading is sent. A removed state (a gauge, a set, or a
+  cumulative kind) equal to the one sent (the point, each `f64` by its bits, the created
+  timestamp, and the exemplars) loses nothing, and counts `normalized{reason="duplicate_timestamp"}`
+  instead, with no diagnostic. A `samples` or distribution summary stays `dropped` when equal:
+  two equal sets of observations are two. The exposition
   registry's overwrite of a series between scrapes is the pull model's, and isn't counted.
 - `skipped{reason="no_recorded_value"}` means something narrower in sender mode. The encoder runs
   with `with_stale_markers(true)` there, so a flagged `Gauge`/`Sum`/marker-untyped record is written
@@ -2628,7 +2630,7 @@ The module doc of `logit_proto::datadog` has the full mapping-to-counter tables.
 | `logit.output.metrics.degraded{metric_kind="non_monotonic_sum"\|"histogram"\|"exponential_histogram"}` | count | a non-monotonic `Sum` sent as a `count` (delta) or `gauge` (cumulative), a delta `Histogram` sent as a sketch or as `.bucket` and aggregation series, or a delta `ExponentialHistogram` sent as a sketch; once per record that leaves |
 | `logit.output.metrics.dropped{reason="unresolved_gauge_delta"}` | count | a `GaugeDelta` nothing upstream resolved to a gauge; counted by the series encoders only |
 | `logit.output.metrics.dropped{reason="duplicate_timestamp"}` | count | a series point left off because a later point of its series (metric name, tag set, host, device, and resources) falls in the same second of one request and differs from it, since Datadog keeps one point per series per second, the higher; counted by the series encoders only, with a `duplicate_timestamp` diagnostic naming `dedup_timestamps` (`precision: 1s`). Distribution points and sketches aren't collapsed |
-| `logit.output.metrics.normalized{reason="duplicate_timestamp"}` | count | a series point left off as above that equals the point sent (the value by its bits, the type, unit, interval, source type, and origin), so Datadog stores the same point and nothing is lost; no diagnostic. Two equal delta counts are two increments, of which one is sent |
+| `logit.output.metrics.normalized{reason="duplicate_timestamp"}` | count | a series point of a gauge or a cumulative kind left off as above that equals the point sent (the value by its bits, the type, unit, interval, source type, and origin), so Datadog stores the same point and nothing is lost; no diagnostic. A delta count or a delta histogram's point stays `dropped` when equal: two equal increments are two events |
 | `logit.output.metrics.skipped{reason="no_recorded_value"\|"empty_sketch"}` | count | a flagged record, or a sketch with nothing in it |
 | `logit.output.metrics.dropped{reason="non_finite_value"\|"oversized_sketch"}` | count | a non-finite value, a sketch whose counts split into more than `MAX_DOGSKETCH_ENTRIES` `k`/`n` entries, or a histogram or exponential histogram of more than 4,096 × 65,535 observations, which Datadog's exporter abandons too |
 | `logit.output.metrics.dropped{reason="non_monotonic_bounds"\|"sketch_range"}` | count | a delta `Histogram` with a bucket whose upper bound keys below its lower one, or a delta `ExponentialHistogram` whose scale or buckets fall outside the Agent sketch's range (a key past 32,766, or a boundary that overflows) |

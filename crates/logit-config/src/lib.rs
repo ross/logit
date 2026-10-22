@@ -4258,10 +4258,11 @@ pub enum ComponentKind {
         ///
         /// A remote-write series holds one sample per millisecond, so of two readings of one
         /// series in one millisecond of a batch, the sink sends the later and leaves the earlier
-        /// off: counted `logit.output.metrics.dropped{reason="duplicate_timestamp"}` when the
-        /// two differ, and `logit.output.metrics.normalized{reason="duplicate_timestamp"}` when
-        /// they're equal, since nothing is lost. To merge or collapse such readings first, put a
-        /// `dedup_timestamps` with `precision: 1ms` last before this sink.
+        /// off, counted `logit.output.metrics.dropped{reason="duplicate_timestamp"}`. When the
+        /// earlier is a state (a gauge, a set, or a cumulative kind) equal to the later, nothing
+        /// is lost, and it counts `logit.output.metrics.normalized{reason="duplicate_timestamp"}`
+        /// instead; two equal sets of observations are still two. To merge or collapse such
+        /// readings first, put a `dedup_timestamps` with `precision: 1ms` last before this sink.
         #[serde(default)]
         endpoint: Option<String>,
         /// Which remote-write protocol version this sender writes, `1` or `2`. Defaults to `1`,

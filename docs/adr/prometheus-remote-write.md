@@ -638,10 +638,11 @@ pass over two readings at one nanosecond, which counts only for remote-write.
 permitted normalizations: the reading never leaves `logit`, which is loss by
 [ADR `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md)'s definition.
 
-A removed reading equal to the one sent is the exception: the receiver stores the same sample, so
-nothing is lost, and it counts `logit.output.metrics.normalized{reason="duplicate_timestamp"}`
+A removed state (a gauge, a set, or a cumulative kind) equal to the one sent is the exception:
+the receiver stores the same sample, so nothing is lost, and it counts `logit.output.metrics.normalized{reason="duplicate_timestamp"}`
 with no diagnostic. [ADR `dedup-timestamps-transform`](dedup-timestamps-transform.md)'s "The
-sink-side counter" defines equal.
+sink-side counter" defines a state and equal. A `samples` or distribution summary is a set of
+observations, so an equal one still counts `dropped`.
 
 The collapse stays, for a different reason than this record gave. Prometheus 3.15.1 and Mimir
 3.2.2, run 2026-10-21, don't reject two samples of one series at one millisecond inside one
