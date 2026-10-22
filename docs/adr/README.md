@@ -10,6 +10,7 @@ the same date, write the record, then add a row here.
 
 | ADR | Created | Updated |
 |---|---|---|
+| [Lua `vars`: a component's `vars:` map reaches its script as a plain-table global](lua-script-vars.md) | 2026-10-21 | 2026-10-21 |
 | [Full-buffer diagnostics: a full sink buffer or receive queue logs once a minute, and a gauge reads a blocked push live](buffer-full-diagnostics.md) | 2026-10-21 | 2026-10-21 |
 | [`datadog_out` maps OTLP metric kinds as Datadog's OTel exporter does, statelessly](datadog-otlp-metric-mapping.md) | 2026-10-20 | 2026-10-20 |
 | [`cumulative_to_delta`: a stateful transform that turns cumulative sums, histograms, and summaries into deltas](cumulative-to-delta-transform.md) | 2026-10-20 | 2026-10-20 |

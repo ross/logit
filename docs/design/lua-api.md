@@ -20,6 +20,7 @@ What a script can reach:
 | `telemetry` | `count`/`gauge` | "Emitting telemetry from a script" |
 | `trace` | read (writes aren't enforced, but are overwritten each batch) | "Reading trace context" |
 | `random` | functions that mint ids | "Minting ids" |
+| `vars` | the component's `vars:` config as plain tables; writes stay in this VM | "Reading configuration from `vars`" |
 | `provenance` | read-only | "Reading provenance" |
 | `resource` | read/write, per batch | "Reading and writing `resource`" |
 | `scope` | read/write, per batch | "Reading and writing `scope`" |
@@ -497,6 +498,64 @@ or a token.
 with one constant: without that, every worker's VM drew the same sequence. A script that calls
 `math.randomseed` gets the sequence it asks for. See
 [ADR `lua-random-ids`](../adr/lua-random-ids.md).
+
+## Reading configuration from `vars`
+
+A `vars` global holds the component's `vars:` config, so one script serves several deployments
+and only the config changes between them. A copied example script stays as shipped while each
+`logit.yaml` sets its own bucket name or lookup table:
+
+```yaml
+  prusa:
+    type: lua_file
+    sources: [printer_in]
+    lua_file: prusa.lua
+    vars:
+      bucket: prusa
+      names:
+        "10:9c:70:2d:d5:c4": sand
+```
+
+```lua
+local BUCKET = vars.bucket or "prusa"
+local NAMES = vars.names or {}
+
+function process(event)
+  local mac = event.attributes["syslog.hostname"]
+  event.attributes.printer = NAMES[mac] or mac
+  resource["_logit.influxdb.bucket"] = BUCKET
+  return event
+end
+```
+
+| YAML | Lua |
+|---|---|
+| string | string |
+| boolean | boolean |
+| integer, float | number |
+| map | table with string keys |
+| list | array table indexed from 1 |
+
+- **`vars` is always a table.** With no `vars:` in the config it's empty, so `vars.name or
+  "default"` works either way.
+- **It's built before the script's source runs**, once per VM, so top-level code can read it and
+  a top-level alias (`local BUCKET = vars.bucket`) captures the value. Reading it costs a table
+  lookup and nothing per event beyond that.
+- **The tables are plain Lua tables**, so `pairs`, `ipairs`, `next`, and `#` work on them as on
+  any table. A write changes only this VM's copy: another component running the same script with
+  the same `vars:` doesn't see it.
+- **`logit validate` rejects a `null` anywhere in `vars:`**, which a Lua table can't hold, and an
+  integer larger than 2^53 in magnitude, which a Lua number can't hold without rounding. Its error
+  names the key path, such as `vars.names.sand` or `vars.hosts[0]` (a list index counts from 0, as
+  the YAML lists it), and never the value, which `!env` may have filled from a secret. Quote a
+  large integer to pass it as a string.
+- **Nothing checks which keys a script reads.** A key the config misspells or omits reads as `nil`
+  in the script, so a script that needs a value should say so with `assert` at its top level,
+  which fails the component at load.
+
+`!env` works anywhere inside `vars:`, as in any config field. Use it rather than reading the
+environment from Lua: the sandbox has no `os` library and no file access ("Sandboxing" below). See
+[ADR `lua-script-vars`](../adr/lua-script-vars.md).
 
 ## Reading provenance
 
@@ -1327,6 +1386,9 @@ components:
 never ticks, the same as a script with no `flush()`. Config validation rejects a zero interval on
 either kind of component.
 
+**`vars`** is optional and becomes the script's `vars` global: a map of strings, numbers,
+booleans, lists, and nested maps ("Reading configuration from `vars`" above).
+
 **`max_memory`** is optional and caps the component's Lua VM heap, as a quoted byte-count string
 (`"256MiB"`). A VM still over it after full garbage collection fails the component and, with it,
 the process (exit code 2), logging `memory_limit_exceeded`. Omitted means no limit; config
@@ -1417,8 +1479,8 @@ The sandbox is pinned by one test, `the_global_table_is_exactly_the_allowlist`
 (`crates/logit-script/src/lib.rs`), which holds the exact list. It builds a worker as the runtime
 does, once with the JIT off and once on, and requires `_G` to be Lua's base library, minus the removed loaders, environment functions,
 and `newproxy`, with `print` rerouted; the `math`, `string`, and `table`
-libraries; the seven `logit` globals this document describes, each a proxy or a table of Rust
-closures and none a route to the host; and the script's own `process`, and `flush` if it defines one. It also checks that the host
+libraries; the eight `logit` globals this document describes, each a proxy, a table of Rust
+closures, or (`vars`) a plain table of config values, and none a route to the host; and the script's own `process`, and `flush` if it defines one. It also checks that the host
 and debugging libraries LuaJIT can load are absent. `collectgarbage` and `coroutine` stay: neither
 reaches the host, and each has an ordinary use in a transform script. The test checks names
 only: `pairs` keeps its name but is the sandbox's wrapper, which the tests in
