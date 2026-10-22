@@ -657,3 +657,17 @@ decodes only gauges.
 A tagged carbon 1.1.10 replaces a tag named `name` with the metric's path
 (`TaggedSeries.parse_carbon`). `graphite_out` doesn't guard against it: the operator renames or
 removes the attribute at the source, or ahead of the sink with a `remove` or `lua` component.
+
+## Amendment (2026-10-21): skipped events and non-finite components are counted
+
+Two losses that `graphite_out` left uncounted now have counters:
+
+- An event with no metrics (a log, a span, or attributes alone) has no carbon form and isn't
+  written. It counts `logit.output.events.skipped{reason="no_metrics"}` once per event, with no
+  diagnostic.
+- Under `multi_value: expand`, a non-finite component, such as a NaN `.sum`, is left off and the
+  rest of the record is written. The record counts
+  `logit.output.metrics.degraded{reason="non_finite_component"}` once, however many components it
+  left off, beside its `{metric_kind}` count, as `influxdb_out` counts it.
+
+The model mapping table's "event with no metrics" row above predates this.

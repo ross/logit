@@ -727,7 +727,8 @@ Recorded per workstream as each lands.
     uncounted, where `influxdb_out` counts `metrics.degraded{reason=non_finite_component}`.
     Settled in `tgraph/w4`: `logit_proto::multi_value::expand_dotted` returns how many components
     it skipped, and `graphite_out` counts that series once per record. `statsd_out` ignores the
-    count, so it still leaves them off uncounted. No case reaches the series, so no cell names it.
+    count, so it still leaves them off uncounted. No case reaches the series, so no cell names it
+    as its counter; the `histogram/delta` cell's text mentions it.
   - `metrics.normalized{reason=tag_sanitized}` counts once per record, whichever attribute moved
     it, so the `string_value`, `bool_value`, `number_value`, and `resource_attribute` cells all
     name it. An array element alone can't move it without one of those beside it, which the

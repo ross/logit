@@ -249,8 +249,8 @@
 //! [`crate::multi_value`]'s module doc is the canonical table of the dotted sub-paths each kind
 //! expands into, with the rules behind it: every expansion adds at least one suffix, a sketch's
 //! `.sum`, `.min`, and `.max` come from its tracked statistics rather than its bins, non-finite
-//! values are skipped and reported to the encoder, and number tokens are injective. The encoder appends each sub-path's suffix
-//! to the sanitized path, then the tag segment.
+//! values are skipped and reported to the encoder, and number tokens are injective. The encoder
+//! appends each sub-path's suffix to the sanitized path, then the tag segment.
 //!
 //! ## `Protocol` and `Meta`
 //!
