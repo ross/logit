@@ -3317,11 +3317,12 @@ mod tests {
     #[tokio::test]
     async fn a_same_second_pair_split_by_bisection_is_collapsed_once() {
         let build = |addr, probe: &TelemetryProbe| {
-            instrumented(addr, probe).with_caps(Caps { raw_bytes: 300, ..Caps::UNBOUNDED })
+            instrumented(addr, probe).with_caps(Caps { raw_bytes: 60, ..Caps::UNBOUNDED })
         };
         let (sums, log) =
             run_dd(|p, _| accepted(p), vec![split_pair_batch()], at_least_once(), build).await;
-        assert!(bodies(&log, SERIES).len() > 2, "the chunk was bisected");
+        let sizes: Vec<usize> = bodies(&log, SERIES).iter().map(Vec::len).collect();
+        assert!(sizes.len() > 2, "the chunk was bisected: {sizes:?}");
         assert_pair_collapsed_once(&sums, &log);
     }
 

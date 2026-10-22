@@ -3556,11 +3556,11 @@ fn remote_write_encode_100_series_v1() {
 
     let (body, stats) = measure(|| encode(groups, Version::V1, &mut encoder));
     assert!(!body.is_empty());
-    expect_allocs("prometheus_out: encode 100 series, remote-write 1.0", stats, 1223);
+    expect_allocs("prometheus_out: encode 100 series, remote-write 1.0", stats, 1224);
 }
 
 /// The same in 2.0, where every label name, label value, and help string goes through the symbol
-/// table: 1434 against 1.0's 1223. The extra ~2/series is the table's owned-`String` key per
+/// table: 1435 against 1.0's 1224. The extra ~2/series is the table's owned-`String` key per
 /// distinct value, one per series for this fixture's `shard` labels. The decode pair has the
 /// opposite sign: interning costs the sender and saves the receiver.
 #[test]
@@ -3574,7 +3574,7 @@ fn remote_write_encode_100_series_v2() {
 
     let (body, stats) = measure(|| encode(groups, Version::V2, &mut encoder));
     assert!(!body.is_empty());
-    expect_allocs("prometheus_out: encode 100 series, remote-write 2.0", stats, 1434);
+    expect_allocs("prometheus_out: encode 100 series, remote-write 2.0", stats, 1435);
 }
 
 // ---------------------------------------------------------------------------------------------

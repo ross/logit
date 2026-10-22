@@ -1073,7 +1073,19 @@ type ReadingKey<'a> = (&'a str, FamilyType, &'a [(String, String)], i64);
 /// the first of two and drop the second silently, so the sink keeps the later reading itself,
 /// whole, before any reading is flattened into samples.
 fn shadowed(groups: &[Vec<MetricFamily>]) -> HashSet<At> {
-    let mut latest: HashMap<ReadingKey<'_>, (At, i64)> = HashMap::new();
+    // One group whose families' label sets strictly increase holds no two readings of a series,
+    // which is every group `events_to_families` builds; no table is built for it.
+    if let [families] = groups {
+        if families.iter().all(|f| f.series.windows(2).all(|w| w[0].labels < w[1].labels)) {
+            return HashSet::new();
+        }
+    }
+    let readings = groups.iter().flatten().map(|f| f.series.len()).sum();
+    if readings < 2 {
+        return HashSet::new();
+    }
+    // Sized once: one allocation per encode, not one per growth.
+    let mut latest: HashMap<ReadingKey<'_>, (At, i64)> = HashMap::with_capacity(readings);
     let mut losers = HashSet::new();
     for (g, families) in groups.iter().enumerate() {
         for (f, family) in families.iter().enumerate() {

@@ -1095,8 +1095,10 @@ pub fn events_to_families_pending<'a>(
                         encoder.flush(counts);
                         encoder.not_encoded(NotEncoded::TypeConflict);
                     } else {
+                        if !counts.0.is_empty() {
+                            existing.pending.push((existing.family.series.len(), counts));
+                        }
                         existing.family.series.push(series.take().expect("built above"));
-                        existing.pending.push(counts);
                     }
                     continue;
                 }
@@ -1104,7 +1106,7 @@ pub fn events_to_families_pending<'a>(
                 // name sorts first wins, so the outcome is the data's, not the arrival order's.
                 Some(existing) if name < existing.origin => {
                     displaced = existing.family.series.len().max(1);
-                    for counts in std::mem::take(&mut existing.pending) {
+                    for (_, counts) in std::mem::take(&mut existing.pending) {
                         encoder.flush(counts);
                     }
                     start_family = true;
@@ -1134,7 +1136,7 @@ pub fn events_to_families_pending<'a>(
                         unit: record.unit.map(|s| resolve(s).to_string()),
                         series: vec![series],
                     },
-                    pending: vec![counts],
+                    pending: if counts.0.is_empty() { Vec::new() } else { vec![(0, counts)] },
                 },
             );
         }
@@ -1145,9 +1147,30 @@ pub fn events_to_families_pending<'a>(
     let mut replaced = 0usize;
     let mut out: Vec<PendingFamily> = Vec::with_capacity(families.len());
     for entry in families.into_values() {
+        if entry.pending.is_empty() {
+            // Nothing held back: the latest-wins pass alone, with no counts to carry.
+            let mut family = entry.family;
+            family.series.sort_by(|a, b| a.labels.cmp(&b.labels));
+            let mut deduped: Vec<Series> = Vec::with_capacity(family.series.len());
+            for series in family.series.drain(..) {
+                match deduped.last_mut() {
+                    Some(last) if last.labels == series.labels => {
+                        *last = series;
+                        replaced += 1;
+                    }
+                    _ => deduped.push(series),
+                }
+            }
+            family.series = deduped;
+            out.push(PendingFamily { family, pending: Vec::new() });
+            continue;
+        }
         let MetricFamily { name, kind, help, unit, series } = entry.family;
-        let mut paired: Vec<(Series, PendingCounts)> =
-            series.into_iter().zip(entry.pending).collect();
+        let mut dense: Vec<PendingCounts> = vec![PendingCounts::default(); series.len()];
+        for (index, counts) in entry.pending {
+            dense[index] = counts;
+        }
+        let mut paired: Vec<(Series, PendingCounts)> = series.into_iter().zip(dense).collect();
         // Stable, so the last of a run of equal label sets is the last one pushed -- latest wins,
         // the cumulative-series semantics `prometheus_out`'s registry upsert also uses. A replaced
         // series' own counts go with it.
@@ -1181,7 +1204,7 @@ pub fn events_to_families_pending<'a>(
 }
 
 /// One [`MetricFamily`] from [`events_to_families_pending`], with the counts each of its series'
-/// conversion is holding back, in series order.
+/// conversion is holding back, in series order, or none at all when no series holds any.
 #[derive(Debug, Clone)]
 pub struct PendingFamily {
     pub family: MetricFamily,
@@ -1210,8 +1233,8 @@ fn warn_duplicate_timestamp(encoder: &mut PrometheusEncoder, n: usize) {
 struct FamilyEntry {
     origin: &'static str,
     family: MetricFamily,
-    /// Each series' held-back counts, in `family.series` order.
-    pending: Vec<PendingCounts>,
+    /// The held-back counts of each series that has any, by its index in `family.series`.
+    pending: Vec<(usize, PendingCounts)>,
 }
 
 /// One [`MetricRecord`] → its family type and wire point, or `None` for a kind Prometheus can't
