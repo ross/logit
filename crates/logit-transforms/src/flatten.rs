@@ -567,7 +567,7 @@ mod tests {
         let mut attrs = AttrMap::new();
         attrs.insert("svc", map(&[("name", Value::str("api"))]));
         let nested = Arc::new(Resource { attributes: attrs.clone(), ..Default::default() });
-        let mapped = f.map_resource(&nested).unwrap_or_else(|| nested.clone());
+        let mapped = f.map_resource(&nested).expect("an empty named list still maps the resource");
         assert_eq!(mapped.attributes, attrs);
     }
 

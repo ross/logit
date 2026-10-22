@@ -340,7 +340,9 @@
 //! 37's ids, it may name a component relayed from another process. Nor is `keep`'s empty `fields`:
 //! "drop every attribute" is a real operation.
 //!
-//! Sink reachability needs no rule: by 2 + 5 + 7, every acyclic chain ends, and only at a sink.
+//! Sink reachability needs no rule: by 2 + 5 + 7, every acyclic chain ends, and only at a sink or
+//! at a `route_signals` with no `signals:` entry set, which discards every event and counts it
+//! (92 exempts `route_signals` from 7).
 
 use logit_config::{
     default_handshake_timeout, default_max_connections, default_prometheus_scrape_interval,
@@ -1503,8 +1505,8 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
             let (trace_id, span_id, flags) = format.resolve_fields(trace_id, span_id, flags);
             if trace_id.is_empty() {
                 anyhow::bail!(
-                    "component '{id}': a trace_context with an empty 'trace_id' field name can \
-                     only ever be a no-op"
+                    "component '{id}': a trace_context with an empty 'trace_id' field name could \
+                     never match an attribute"
                 );
             }
             for (field, value) in [("span_id", span_id), ("flags", flags)] {
@@ -6303,7 +6305,7 @@ mod tests {
             ("trace", vec!["in"], trace_context("")),
             ("out", vec!["trace"], sink()),
         ]));
-        assert!(err.contains("no-op"), "got: {err}");
+        assert!(err.contains("empty 'trace_id' field name could never match"), "got: {err}");
     }
 
     #[test]
