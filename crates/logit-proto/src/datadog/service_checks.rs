@@ -12,7 +12,8 @@ use super::outcomes::{MetricIn, MetricOut};
 use super::tags::{insert_tags, render_tags};
 use super::time::{nanos_to_seconds, or_received};
 use super::{
-    host_tag, is_service_check, DatadogDecoder, DatadogEncoder, ATTR_HOST_NAME, ATTR_HOST_TAG,
+    collectd_host, host_tag, is_service_check, DatadogDecoder, DatadogEncoder, ATTR_HOST_NAME,
+    ATTR_HOST_TAG, COLLECTD_HOST_KEY,
 };
 use crate::json::{value_text, write_i64, write_str, JsonObject};
 use crate::CodecError;
@@ -162,14 +163,18 @@ impl DatadogEncoder {
             };
 
             // `statsd.service_check.host`, else `host.name`, else a DogStatsD `#host:` tag, else
-            // the default. A `host.name` or `host` read this way leaves as the host and not a
-            // tag; the Agent consumes a `host:` tag even when `h:` wins.
+            // `collectd.host`, else the default. A `host.name`, `host`, or `collectd.host` read
+            // this way leaves as the host and not a tag; the Agent consumes a `host:` tag even
+            // when `h:` wins.
             let non_empty = |key: Symbol| find(key).filter(|v| v.as_str() != Some(""));
             let own_host = non_empty(keys.host);
             let host_name = if own_host.is_none() { non_empty(keys.host_name) } else { None };
             let host_tag = host_tag(&batch.resource, event);
+            let collectd =
+                if own_host.is_none() { collectd_host(&batch.resource, event) } else { None };
             let mut skip =
                 vec![keys.name, keys.status, keys.message, keys.host, keys.statsd_timestamp];
+            skip.extend(collectd.map(|_| *COLLECTD_HOST_KEY));
             // An empty `host.name` is no host, so it isn't a tag either.
             let empty_host_name = find(keys.host_name).is_some_and(|v| v.as_str() == Some(""));
             skip.extend((host_name.is_some() || empty_host_name).then_some(keys.host_name));
@@ -194,7 +199,9 @@ impl DatadogEncoder {
                 (Some(host), _) => value_text(host),
                 // An empty `#host:` tag: marked hostless, never filled.
                 (None, Some(tag)) => Cow::Borrowed(tag),
-                (None, None) => Cow::Borrowed(self.default_host.as_deref().unwrap_or_default()),
+                (None, None) => {
+                    Cow::Borrowed(collectd.or(self.default_host.as_deref()).unwrap_or_default())
+                }
             };
             write_str(obj.key("host_name"), &host);
             write_i64(obj.key("timestamp"), nanos_to_seconds(event.timestamp));
@@ -322,6 +329,31 @@ mod tests {
             encode_with(&own),
             r#"[{"check":"app.ok","host_name":"h","timestamp":1700000000,"status":1,"message":"","tags":["host.name:web-1"]}]"#
         );
+    }
+
+    /// A `collectd.host` is the host after `h:`, `host.name`, and a `#host:` tag, and is then
+    /// not a tag; when any of those wins it stays one.
+    #[test]
+    fn a_collectd_host_is_the_host_after_the_others() {
+        let encoder = DatadogEncoder::new().with_default_host(Some(Arc::from("relay")));
+        let encode_with = |own: &str, tags: &str| {
+            let body = format!(
+                r#"[{{"check":"c"{own},"timestamp":1700000000,"status":0,"tags":["collectd.host:web1"{tags}]}}]"#
+            );
+            String::from_utf8(encoder.encode_service_checks(&decode(&body)).unwrap().to_vec())
+                .unwrap()
+        };
+        let check = |host: &str, tags: &str| {
+            format!(
+                r#"[{{"check":"c","host_name":"{host}","timestamp":1700000000,"status":0,"message":"","tags":{tags}}}]"#
+            )
+        };
+        assert_eq!(encode_with("", ""), check("web1", "[]"));
+        assert_eq!(encode_with("", r#","host.name:""#), check("web1", "[]"));
+        let kept = r#"["collectd.host:web1"]"#;
+        assert_eq!(encode_with(r#","host_name":"h""#, ""), check("h", kept));
+        assert_eq!(encode_with("", r#","host.name:m""#), check("m", kept));
+        assert_eq!(encode_with("", r#","host:t""#), check("t", kept));
     }
 
     /// A DogStatsD `#host:` tag (`statsd_in`'s `host`) is the host after `h:` and `host.name`,
