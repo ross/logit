@@ -27,7 +27,7 @@
     {"timestamp":"2027-01-15T07:59:56.000000000Z","metrics":[{"name":"queue_depth","kind":"gauge","value":9.0}],"attributes":{"env":"prod","team":"b"}},
     {"timestamp":"2027-01-15T07:59:56.000000000Z","metrics":[{"name":"web_requests_rate","kind":"gauge","value":1.2}],"attributes":{"env":"prod","host_name":"web-1"}}
   ], "counters": {
-    "logit.output.labels.normalized{component=out,kind=prometheus_out,reason=multi_value,role=sink}": 2,
+    "logit.output.labels.normalized{component=out,kind=prometheus_out,reason=multi_value,role=sink}": 1,
     "logit.output.metrics.degraded{component=out,kind=prometheus_out,reason=unit_not_suffix,role=sink}": 1,
     "logit.output.metrics.dropped{component=out,kind=prometheus_out,reason=unresolved_delta,role=sink}": 1
   }},

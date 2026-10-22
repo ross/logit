@@ -290,8 +290,8 @@ use logit_pipeline::listen::BindOptions;
 use logit_pipeline::{BatchContext, DeliveryPosture, Fault, Output, SeqId};
 use logit_proto::prometheus::compression::{self, Encoding};
 use logit_proto::prometheus::{
-    events_to_families, remote_write, text, Destination, Dialect, FamilyType, MetricFamily, Point,
-    PrometheusEncoder, Series,
+    events_to_families, events_to_families_pending, remote_write, text, Destination, Dialect,
+    FamilyType, MetricFamily, PendingFamily, Point, PrometheusEncoder, Series,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::io::ErrorKind;
@@ -1050,10 +1050,10 @@ pub fn encode_remote_write(
     encoder: &mut PrometheusEncoder,
 ) -> Result<Option<(Vec<u8>, u64)>, compression::CompressError> {
     let resource = batch.resource.as_ref();
-    let groups: Vec<Vec<MetricFamily>> = partition(batch)
+    let groups: Vec<Vec<PendingFamily>> = partition(batch)
         .into_values()
         .map(|events| {
-            events_to_families(events.into_iter().map(|event| (resource, event)), encoder)
+            events_to_families_pending(events.into_iter().map(|event| (resource, event)), encoder)
         })
         .collect();
     // No request for a batch that produced nothing: an empty `WriteRequest` is legal, but it
@@ -1061,7 +1061,7 @@ pub fn encode_remote_write(
     if groups.iter().all(Vec::is_empty) {
         return Ok(None);
     }
-    let (body, samples) = remote_write::encode_counted(&groups, version, encoder);
+    let (body, samples) = remote_write::encode_pending(groups, version, encoder);
     compression::compress(encoding, &body).map(|compressed| Some((compressed, samples)))
 }
 
@@ -3461,5 +3461,28 @@ mod tests {
             counter(&registry, "logit.output.metrics.dropped", "reason", "duplicate_timestamp"),
             0.0
         );
+    }
+
+    /// A reading dropped as a duplicate counts only its `duplicate_timestamp`, at either collapse:
+    /// its record's degrade describes a summary that isn't sent.
+    #[tokio::test]
+    async fn a_duplicate_reading_counts_no_degrade() {
+        let samples = |timestamp: i64| {
+            Event::metric(
+                timestamp,
+                AttrMap::new(),
+                MetricRecord::new(
+                    intern("latency"),
+                    MetricKind::Samples(logit_core::Samples::new([1.0])),
+                ),
+            )
+        };
+        let at = 1_700_000_000_000_000_000;
+        for later in [at, at + 1] {
+            let (sums, _) = retried_remote_write(batch(vec![samples(at), samples(later)])).await;
+            let degraded = [("metric_kind", "samples")];
+            assert_eq!(sum_of(&sums, "logit.output.metrics.degraded", &degraded), 1.0, "{later}");
+            assert_eq!(sum_of(&sums, DUPLICATE.0, DUPLICATE.1), 1.0, "{later}");
+        }
     }
 }

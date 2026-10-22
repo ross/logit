@@ -861,6 +861,34 @@ fn a_collapsed_histogram_counts_one_reading() {
     }
 }
 
+/// Two summaries of one series in one millisecond with different quantile layouts collapse
+/// whole: the later is sent, and nothing of the earlier, its `0.9` quantile included.
+#[test]
+fn two_summaries_of_different_layouts_in_one_millisecond_collapse_whole() {
+    let reading = |timestamp: i64, quantiles: Vec<(f64, f64)>| {
+        vec![MetricFamily {
+            series: vec![Series {
+                timestamp: Some(timestamp),
+                ..Series::new(
+                    vec![("shard".to_string(), "1".to_string())],
+                    Point::Summary { quantiles, sum: Some(3.0), count: Some(2) },
+                )
+            }],
+            ..MetricFamily::new("s", FamilyType::Summary)
+        }]
+    };
+    let groups = vec![
+        reading(TIMESTAMP, vec![(0.5, 1.0), (0.9, 2.0)]),
+        reading(TIMESTAMP + 1, vec![(0.5, 1.5)]),
+    ];
+    for version in [Version::V1, Version::V2] {
+        let (body, reasons) = encode_reasons(&groups, version);
+        assert_eq!(reasons, [("duplicate_timestamp".to_string(), 1)], "{version:?}");
+        let decoded = decode(&body, version, &mut PrometheusDecoder::new()).expect("must decode");
+        assert_eq!(decoded.groups, vec![reading(TIMESTAMP, vec![(0.5, 1.5)])], "{version:?}");
+    }
+}
+
 /// A body sent under the other version's `Content-Type` is `Malformed`, not an empty request.
 #[test]
 fn a_body_of_the_other_version_is_malformed_rather_than_an_empty_request() {

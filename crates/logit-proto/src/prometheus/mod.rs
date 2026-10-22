@@ -190,7 +190,7 @@
 //! | `unit` / `description` | `# UNIT` (OM only, and only when `_<unit>` suffixes the family name and the unit is `[a-zA-Z0-9_]+` -- the OpenMetrics spec requires it and Prometheus's parser fails the entire body otherwise; dropped counted `logit.output.metrics.degraded{reason="unit_not_suffix"}`) / `# HELP` |
 //! | two families whose `# TYPE` lines carry one name | one is written, the other's series **dropped**, `logit.output.metrics.dropped{reason="name_collision"}` -- see the normalization list below |
 //! | two records, one name, different family types | the first record's type wins, the rest are **dropped**, `logit.output.metrics.dropped{reason="type_conflict"}` -- one name cannot carry two `# TYPE` lines |
-//! | two records of one series at one `Event::timestamp`, in one [`events_to_families`] call | the later replaces the earlier. Under [`Destination::RemoteWrite`], where the sender calls this once per timestamp, the earlier is a lost reading, counted `logit.output.metrics.dropped{reason="duplicate_timestamp"}` with a throttled `duplicate_timestamp` diagnostic naming `dedup_timestamps` as the remedy; [`remote_write`]'s drop table has the sub-millisecond case. Under exposition it's the registry's one value per series, uncounted |
+//! | two records of one series at one `Event::timestamp`, in one [`events_to_families`] call | the later replaces the earlier, and what the earlier's conversion counted (a degrade, a normalization, an omitted label) is discarded with it. Under [`Destination::RemoteWrite`], where the sender calls this once per timestamp, the earlier is a lost reading, counted `logit.output.metrics.dropped{reason="duplicate_timestamp"}` with a throttled `duplicate_timestamp` diagnostic naming `dedup_timestamps` as the remedy; [`remote_write`]'s drop table has the sub-millisecond case. Under exposition it's the registry's one value per series, uncounted |
 //! | `EventBatch::scope`, `Resource::schema_url`, `dropped_attributes_count` | dropped (known-gaps rows) |
 //!
 //! ## Well-known attributes (`_logit.prometheus.*`) and target identity
@@ -277,6 +277,7 @@ use logit_core::{
     MetricValue, Resource, Sum, Summary, Telemetry, Temporality, Value,
 };
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// The wire family type the model has no distinct kind for (`untyped`, `unknown`, `info`,
@@ -315,7 +316,7 @@ pub fn is_stale_nan(value: f64) -> bool {
 /// under two dialect spellings, kept apart so `prometheus_in -> prometheus_out` re-emits the
 /// spelling it received (`_logit.prometheus.type` carries it through the model). Each dialect
 /// writes the other's spelling as its own -- see [`text`]'s module doc.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FamilyType {
     Counter,
     Gauge,
@@ -676,6 +677,9 @@ pub struct PrometheusEncoder {
     timestamps_always: bool,
     stale_markers: bool,
     destination: Destination,
+    /// While set, counts go here instead of to `telemetry`: one series' conversion in
+    /// [`events_to_families_pending`].
+    pending: RefCell<Option<PendingCounts>>,
 }
 
 impl PrometheusEncoder {
@@ -727,22 +731,44 @@ impl PrometheusEncoder {
     /// [`NotEncoded::counter`] names.
     fn not_encoded(&self, outcome: NotEncoded) {
         let (metric, tag) = outcome.counter();
+        self.count(metric, tag);
+    }
+
+    /// One count, held back while a conversion is captured.
+    fn count(&self, metric: &'static str, tag: (&'static str, &'static str)) {
+        if let Some(pending) = self.pending.borrow_mut().as_mut() {
+            pending.0.push((metric, tag));
+            return;
+        }
         self.telemetry.count(metric, 1.0, &[tag]);
     }
 
+    /// Starts holding back counts.
+    fn capture(&self) {
+        *self.pending.borrow_mut() = Some(PendingCounts::default());
+    }
+
+    /// Stops holding back counts, returning them.
+    fn release(&self) -> PendingCounts {
+        self.pending.borrow_mut().take().unwrap_or_default()
+    }
+
+    /// Counts what a conversion held back.
+    fn flush(&self, counts: PendingCounts) {
+        for (metric, tag) in counts.0 {
+            self.telemetry.count(metric, 1.0, &[tag]);
+        }
+    }
+
     fn degraded(&self, metric_kind: &'static str) {
-        self.telemetry.count("logit.output.metrics.degraded", 1.0, &[("metric_kind", metric_kind)]);
+        self.count("logit.output.metrics.degraded", ("metric_kind", metric_kind));
     }
 
     /// A scalar's sample value. A sample is a double on both wires, so an integer leaves as its
     /// nearest `f64` and a `Bool` as `1` or `0`, counted.
     fn scalar(&self, value: MetricValue) -> f64 {
         if let MetricValue::Bool(_) = value {
-            self.telemetry.count(
-                "logit.output.metrics.normalized",
-                1.0,
-                &[("reason", "bool_value")],
-            );
+            self.count("logit.output.metrics.normalized", ("reason", "bool_value"));
         }
         value.as_f64()
     }
@@ -751,11 +777,11 @@ impl PrometheusEncoder {
     /// which model kind, for a degradation the wire format forces on a metric of any kind (a
     /// `# UNIT` the format won't accept, an exemplar with nowhere to sit).
     fn degraded_reason(&self, reason: &'static str) {
-        self.telemetry.count("logit.output.metrics.degraded", 1.0, &[("reason", reason)]);
+        self.count("logit.output.metrics.degraded", ("reason", reason));
     }
 
     fn label_omitted(&self, reason: &'static str) {
-        self.telemetry.count("logit.output.labels.omitted", 1.0, &[("reason", reason)]);
+        self.count("logit.output.labels.omitted", ("reason", reason));
     }
 
     /// `logit.output.labels.normalized{reason}` -- a label that reached the wire, but not in the
@@ -769,7 +795,7 @@ impl PrometheusEncoder {
     /// rather than `dropped` because the label itself survives and the series still exposes -- but
     /// an operator reading this counter should read it as data loss.
     fn label_normalized(&self, reason: &'static str) {
-        self.telemetry.count("logit.output.labels.normalized", 1.0, &[("reason", reason)]);
+        self.count("logit.output.labels.normalized", ("reason", reason));
     }
 }
 
@@ -988,6 +1014,26 @@ pub fn events_to_families<'a>(
     events: impl Iterator<Item = (&'a Resource, &'a Event)>,
     encoder: &mut PrometheusEncoder,
 ) -> Vec<MetricFamily> {
+    events_to_families_pending(events, encoder)
+        .into_iter()
+        .map(|pending| {
+            for counts in pending.pending {
+                encoder.flush(counts);
+            }
+            pending.family
+        })
+        .collect()
+}
+
+/// [`events_to_families`], holding back what each surviving [`Series`]' conversion counted (a
+/// degrade, a normalization, an omitted label) on [`PendingFamily`], for a caller that may still
+/// drop the series: [`remote_write::encode_pending`] collapses readings of one series at one
+/// millisecond, and a reading it drops counts only its `duplicate_timestamp`. What a record
+/// that leaves no series counts, and a series this call replaces, is settled here.
+pub fn events_to_families_pending<'a>(
+    events: impl Iterator<Item = (&'a Resource, &'a Event)>,
+    encoder: &mut PrometheusEncoder,
+) -> Vec<PendingFamily> {
     // Keyed by the *emitted* (sanitized) name, not the model name: two model names that sanitize
     // onto one cannot both be exposed -- a second `# TYPE` line for one name makes Prometheus reject
     // the whole scrape, so one naming clash would poison every other metric in the body.
@@ -999,17 +1045,23 @@ pub fn events_to_families<'a>(
                 encoder.not_encoded(NotEncoded::NoRecordedValue);
                 continue;
             }
+            encoder.capture();
             let converted = if stale {
                 stale_point(record, event, encoder)
             } else {
                 record_to_point(record, event, encoder)
             };
-            let Some((kind, point)) = converted else { continue };
+            let Some((kind, point)) = converted else {
+                let counts = encoder.release();
+                encoder.flush(counts);
+                continue;
+            };
             let name = resolve(record.name);
             // Borrows `name` whenever it already conforms, which is nearly always -- one allocation
             // per *family*, not per point, and only for a name that has to change.
             let key = sanitize_metric_name(name);
             let labels = build_labels(resource, event, kind, encoder);
+            let counts = encoder.release();
             let timestamp = if encoder.timestamps_always {
                 Some(event.timestamp)
             } else {
@@ -1040,18 +1092,27 @@ pub fn events_to_families<'a>(
                     if existing.family.kind != kind {
                         // Two records sharing one name but disagreeing on type: the wire has exactly
                         // one `# TYPE` line per name, so the second one has nowhere to go.
+                        encoder.flush(counts);
                         encoder.not_encoded(NotEncoded::TypeConflict);
                     } else {
                         existing.family.series.push(series.take().expect("built above"));
+                        existing.pending.push(counts);
                     }
+                    continue;
                 }
                 // A different model name sanitizing onto the same wire name: the one whose model
                 // name sorts first wins, so the outcome is the data's, not the arrival order's.
                 Some(existing) if name < existing.origin => {
                     displaced = existing.family.series.len().max(1);
+                    for counts in std::mem::take(&mut existing.pending) {
+                        encoder.flush(counts);
+                    }
                     start_family = true;
                 }
-                Some(_) => encoder.not_encoded(NotEncoded::NameCollision),
+                Some(_) => {
+                    encoder.flush(counts.clone());
+                    encoder.not_encoded(NotEncoded::NameCollision);
+                }
                 None => start_family = true,
             }
             if !start_family {
@@ -1073,6 +1134,7 @@ pub fn events_to_families<'a>(
                         unit: record.unit.map(|s| resolve(s).to_string()),
                         series: vec![series],
                     },
+                    pending: vec![counts],
                 },
             );
         }
@@ -1080,23 +1142,31 @@ pub fn events_to_families<'a>(
 
     // The map is keyed by the emitted name, so draining it in key order is already the canonical
     // family ordering -- no re-sort needed.
-    let mut out: Vec<MetricFamily> = families.into_values().map(|entry| entry.family).collect();
     let mut replaced = 0usize;
-    for family in &mut out {
+    let mut out: Vec<PendingFamily> = Vec::with_capacity(families.len());
+    for entry in families.into_values() {
+        let MetricFamily { name, kind, help, unit, series } = entry.family;
+        let mut paired: Vec<(Series, PendingCounts)> =
+            series.into_iter().zip(entry.pending).collect();
         // Stable, so the last of a run of equal label sets is the last one pushed -- latest wins,
-        // the cumulative-series semantics `prometheus_out`'s registry upsert also uses.
-        family.series.sort_by(|a, b| a.labels.cmp(&b.labels));
-        let mut deduped: Vec<Series> = Vec::with_capacity(family.series.len());
-        for series in family.series.drain(..) {
+        // the cumulative-series semantics `prometheus_out`'s registry upsert also uses. A replaced
+        // series' own counts go with it.
+        paired.sort_by(|a, b| a.0.labels.cmp(&b.0.labels));
+        let mut deduped: Vec<(Series, PendingCounts)> = Vec::with_capacity(paired.len());
+        for item in paired {
             match deduped.last_mut() {
-                Some(last) if last.labels == series.labels => {
-                    *last = series;
+                Some(last) if last.0.labels == item.0.labels => {
+                    *last = item;
                     replaced += 1;
                 }
-                _ => deduped.push(series),
+                _ => deduped.push(item),
             }
         }
-        family.series = deduped;
+        let (series, pending) = deduped.into_iter().unzip();
+        out.push(PendingFamily {
+            family: MetricFamily { name, kind, help, unit, series },
+            pending,
+        });
     }
     // A remote-write sender calls this once per timestamp, so a replaced series is a reading lost
     // at its instant. The exposition registry keeps one value per series between scrapes by
@@ -1109,6 +1179,18 @@ pub fn events_to_families<'a>(
     }
     out
 }
+
+/// One [`MetricFamily`] from [`events_to_families_pending`], with the counts each of its series'
+/// conversion is holding back, in series order.
+#[derive(Debug, Clone)]
+pub struct PendingFamily {
+    pub family: MetricFamily,
+    pending: Vec<PendingCounts>,
+}
+
+/// The counts one series' conversion holds back until the series is known to survive.
+#[derive(Debug, Clone, Default)]
+pub struct PendingCounts(Vec<(&'static str, (&'static str, &'static str))>);
 
 /// The diagnostic both remote-write collapses report under: `n` readings of a series dropped
 /// because a later one shared its millisecond.
@@ -1128,6 +1210,8 @@ fn warn_duplicate_timestamp(encoder: &mut PrometheusEncoder, n: usize) {
 struct FamilyEntry {
     origin: &'static str,
     family: MetricFamily,
+    /// Each series' held-back counts, in `family.series` order.
+    pending: Vec<PendingCounts>,
 }
 
 /// One [`MetricRecord`] → its family type and wire point, or `None` for a kind Prometheus can't

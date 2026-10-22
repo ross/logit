@@ -142,7 +142,7 @@
 //! | an exemplar whose labels are over OpenMetrics' 128-code-point budget, names (as sanitized) and values together | dropped, `logit.output.metrics.degraded{reason="exemplar_omitted"}`, the OpenMetrics writer's rule through [`text::exemplar_fits`]. Prometheus's receiver drops one over that budget without failing the request (`tsdb/exemplar.go`'s `validateExemplar`), so sending it would lose it uncounted |
 //! | two exemplar attribute keys sanitizing onto one label name, or one onto `trace_id`/`span_id` beside the exemplar's trace | the one whose original key sorts first is written, the rest omitted, `logit.output.labels.omitted{reason="collision"\|"reserved"}` -- the OpenMetrics writer's rule, since both build the pairs in [`text::exemplar_labels`]. Counted only for an exemplar that is written |
 //! | a family with an empty name | **dropped**, `logit.output.metrics.dropped{reason="invalid_labels"}`; `__name__` may not be empty |
-//! | two readings of one series whose nanosecond timestamps truncate to the same millisecond | the **later** reading wins and the earlier is **dropped**, `logit.output.metrics.dropped{reason="duplicate_timestamp"}` once per dropped reading (not per wire sample: a histogram reading is one), with a throttled `duplicate_timestamp` diagnostic naming the remedy, a `dedup_timestamps` upstream. One label set holds one sample per millisecond. Given two in one request, Prometheus and Mimir answer `2xx`, keep the first, and drop the second silently, so the sink collapses them itself to send the later reading and count the loss. Two readings with the same nanosecond never reach here: [`super::events_to_families`] replaces the earlier and counts it under the same reason |
+//! | two readings of one series whose nanosecond timestamps truncate to the same millisecond | the **later** reading wins whole and the earlier is **dropped** before either is flattened into samples (keyed by family name, type, label set, and millisecond), `logit.output.metrics.dropped{reason="duplicate_timestamp"}` once per dropped reading (not per wire sample: a histogram reading is one). Under [`encode_pending`], the dropped reading's held-back counts (a degrade, an omitted label) are discarded with it, with a throttled `duplicate_timestamp` diagnostic naming the remedy, a `dedup_timestamps` upstream. One label set holds one sample per millisecond. Given two in one request, Prometheus and Mimir answer `2xx`, keep the first, and drop the second silently, so the sink collapses them itself to send the later reading and count the loss. Two readings with the same nanosecond never reach here: [`super::events_to_families`] replaces the earlier and counts it under the same reason |
 //! | a counter's family name in 1.0's `MetricMetadata` | its value sample's name, `_total` included, whatever the model name: decode gives a counter that name either way, so this keeps a re-encode a fixed point |
 //! | [`Series::created`], **version 1.0 only** | dropped, uncounted. 1.0 has no field for it at all; this is the operator's choice of wire version, listed with the permitted normalizations below the way text 0.0.4's `_created` drop is |
 //!
@@ -182,14 +182,14 @@ pub use super::assemble::{Declaration, Declarations};
 use super::generated::io::prometheus::write::v2 as pb2;
 use super::generated::prometheus as pb1;
 use super::{
-    is_stale_nan, text, DecodeDrop, FamilyType, MetricFamily, NotEncoded, Point, PrometheusDecoder,
-    PrometheusEncoder, Series, STALE_NAN_BITS,
+    is_stale_nan, text, DecodeDrop, FamilyType, MetricFamily, NotEncoded, PendingCounts,
+    PendingFamily, Point, PrometheusDecoder, PrometheusEncoder, Series, STALE_NAN_BITS,
 };
 use crate::CodecError;
 use logit_core::Exemplar;
 use prost::Message;
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{hash_map, BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 /// `X-Prometheus-Remote-Write-Version`, which both versions require on every request.
@@ -1021,6 +1021,129 @@ pub fn encode_counted(
     version: Version,
     encoder: &mut PrometheusEncoder,
 ) -> (Vec<u8>, u64) {
+    let losers = shadowed(groups);
+    if losers.is_empty() {
+        return encode_flat(groups, version, encoder);
+    }
+    count_shadowed(losers.len(), encoder);
+    encode_flat(&without(groups, &losers), version, encoder)
+}
+
+/// [`encode_counted`] over [`super::events_to_families_pending`]'s groups: a reading the
+/// millisecond collapse drops counts only its `duplicate_timestamp`, and every surviving
+/// reading's held-back counts are counted.
+pub fn encode_pending(
+    groups: Vec<Vec<PendingFamily>>,
+    version: Version,
+    encoder: &mut PrometheusEncoder,
+) -> (Vec<u8>, u64) {
+    let mut families: Vec<Vec<MetricFamily>> = Vec::with_capacity(groups.len());
+    let mut pending: Vec<Vec<Vec<PendingCounts>>> = Vec::with_capacity(groups.len());
+    for group in groups {
+        let (f, p): (Vec<_>, Vec<_>) = group.into_iter().map(|g| (g.family, g.pending)).unzip();
+        families.push(f);
+        pending.push(p);
+    }
+    let losers = shadowed(&families);
+    for (g, group) in pending.into_iter().enumerate() {
+        for (f, family) in group.into_iter().enumerate() {
+            for (s, counts) in family.into_iter().enumerate() {
+                if !losers.contains(&(g, f, s)) {
+                    encoder.flush(counts);
+                }
+            }
+        }
+    }
+    if losers.is_empty() {
+        return encode_flat(&families, version, encoder);
+    }
+    count_shadowed(losers.len(), encoder);
+    encode_flat(&without(&families, &losers), version, encoder)
+}
+
+/// A reading's place in a group list: (group, family, series).
+type At = (usize, usize, usize);
+
+/// The readings a later reading of their series shares a millisecond with: of each family name,
+/// type, label set, and millisecond, every reading but the latest, the later group on a tie. One
+/// label set holds one sample per millisecond, and inside one request Prometheus and Mimir keep
+/// the first of two and drop the second silently, so the sink keeps the later reading itself,
+/// whole, before any reading is flattened into samples.
+fn shadowed(groups: &[Vec<MetricFamily>]) -> HashSet<At> {
+    let mut latest: HashMap<(&str, FamilyType, &[(String, String)], i64), (At, i64)> =
+        HashMap::new();
+    let mut losers = HashSet::new();
+    for (g, families) in groups.iter().enumerate() {
+        for (f, family) in families.iter().enumerate() {
+            for (s, series) in family.series.iter().enumerate() {
+                let Some(timestamp) = series.timestamp else { continue };
+                let key = (
+                    family.name.as_str(),
+                    family.kind,
+                    series.labels.as_slice(),
+                    timestamp / 1_000_000,
+                );
+                match latest.entry(key) {
+                    hash_map::Entry::Vacant(slot) => {
+                        slot.insert(((g, f, s), timestamp));
+                    }
+                    hash_map::Entry::Occupied(mut slot) => {
+                        let (held, held_at) = *slot.get();
+                        if timestamp >= held_at {
+                            losers.insert(held);
+                            slot.insert(((g, f, s), timestamp));
+                        } else {
+                            losers.insert((g, f, s));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    losers
+}
+
+/// Counts `n` readings [`shadowed`] dropped.
+fn count_shadowed(n: usize, encoder: &mut PrometheusEncoder) {
+    for _ in 0..n {
+        encoder.not_encoded(NotEncoded::DuplicateTimestamp);
+    }
+    super::warn_duplicate_timestamp(encoder, n);
+}
+
+/// `groups` less the readings at `losers`.
+fn without(groups: &[Vec<MetricFamily>], losers: &HashSet<At>) -> Vec<Vec<MetricFamily>> {
+    groups
+        .iter()
+        .enumerate()
+        .map(|(g, families)| {
+            families
+                .iter()
+                .enumerate()
+                .map(|(f, family)| MetricFamily {
+                    name: family.name.clone(),
+                    kind: family.kind,
+                    help: family.help.clone(),
+                    unit: family.unit.clone(),
+                    series: family
+                        .series
+                        .iter()
+                        .enumerate()
+                        .filter(|(s, _)| !losers.contains(&(g, f, *s)))
+                        .map(|(_, series)| series.clone())
+                        .collect(),
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// [`encode_counted`] once no two readings of one series share a millisecond.
+fn encode_flat(
+    groups: &[Vec<MetricFamily>],
+    version: Version,
+    encoder: &mut PrometheusEncoder,
+) -> (Vec<u8>, u64) {
     let mut built: BTreeMap<Vec<(String, String)>, SeriesOut> = BTreeMap::new();
     let mut flat = Vec::new();
     // One help and one unit per family name, the first each group order offers, so every series
@@ -1092,11 +1215,10 @@ pub fn encode_counted(
         // was written from, so a series merged from several groups would otherwise come back in
         // a different order and the body wouldn't be a fixed point.
         out.exemplars.sort_by_key(|exemplar| exemplar.timestamp_ms);
-        // One label set holds one sample per millisecond. Inside one request, Prometheus and Mimir
-        // keep the first of two and drop the second silently, so the sink collapses them itself:
-        // the later reading is the one sent, and the earlier is counted as loss here, where the
-        // receiver would count nothing the sender can see. The model's timestamps are
-        // nanoseconds, so any sub-millisecond source (`statsd_in` gauges, `internal`) reaches this.
+        // [`shadowed`] already left one reading per family, label set, and millisecond, so two
+        // samples here share a millisecond only when two families flatten onto one label set.
+        // One label set still holds one sample per millisecond, so the later is sent and the
+        // earlier's reading counted lost.
         out.samples.dedup_by(|later, earlier| {
             if later.timestamp_ms != earlier.timestamp_ms {
                 return false;
