@@ -24,7 +24,7 @@
     {"sink":"datadog_out","row":"record/no_recorded_value_delta_sum","cell":0,"observed":["skipped"]},
     {"sink":"datadog_out","row":"record/no_recorded_value_other_kind","cell":0,"observed":["skipped"]},
     {"sink":"datadog_out","row":"record/non_finite","cell":0,"observed":["dropped"]},
-    {"sink":"datadog_out","row":"record/same_millisecond","cell":0,"observed":[]},
+    {"sink":"datadog_out","row":"record/same_millisecond","cell":0,"observed":["dropped"]},
     {"sink":"datadog_out","row":"record/start_timestamp","cell":0,"observed":["lost"]},
     {"sink":"datadog_out","row":"record/superseded","cell":0,"observed":[]},
     {"sink":"datadog_out","row":"record/unit","cell":0,"observed":["exact"]},

@@ -28,8 +28,18 @@ components:
     # max_staleness: 1h          # the default
     # max_series: 10000          # the default
 
+  # Datadog keeps one point per series per second, and `datadog_out` leaves the rest off, counted
+  # `duplicate_timestamp`: dropped, or normalized where a gauge equals the one sent. A Collector
+  # batching several exports, or an SDK on a short interval, can put two points of one series in
+  # one second; this keeps the latest gauge and sums deltas.
+  # Keep it last before the sink.
+  one_per_second:
+    type: dedup_timestamps
+    sources: [deltas]
+    precision: 1s
+
   datadog:
     type: datadog_out
-    sources: [deltas]
+    sources: [one_per_second]
     api_key: !env DD_API_KEY
     # site: datadoghq.com        # the default; datadoghq.eu, us3.datadoghq.com, ... per your org

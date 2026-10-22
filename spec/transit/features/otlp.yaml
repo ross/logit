@@ -49,6 +49,14 @@
   text: A `Histogram` data point with `min` and `max`.
 - name: histogram_no_min_max
   text: A `Histogram` data point with neither `min` nor `max`.
+- name: histogram_bucketless
+  text: >-
+    A `Histogram` data point with no `bucketCounts` or `explicitBounds`, only `count` and `sum`,
+    decoded as one `+Inf` bucket holding `count`.
+- name: histogram_count_mismatch
+  text: >-
+    A `Histogram` data point whose `count` isn't the sum of its `bucketCounts`, decoded with its
+    buckets and counted `logit.input.metrics.degraded{reason=histogram_count_mismatch}`.
 - name: exponential_histogram_delta
   text: An `ExponentialHistogram` with delta temporality.
 - name: exponential_histogram_cumulative

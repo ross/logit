@@ -494,11 +494,11 @@ config asked for never uses the word:
 | Name | Meaning | Tags |
 |---|---|---|
 | `*.dropped` | Loss: data that should have left `logit` and didn't, such as queue overflow, a destination's rejection, shutdown, a disk fault, an oversize item, malformed input, a closed consumer, a relative gauge or delta nothing upstream resolved, or a gap in `logit`'s own implementation. | Always `reason`, never `metric_kind`; `signal` or `route` where the counter needs one. |
-| `logit.component.events.discarded` | A filter, `sample`, `aggregate`, `cumulative_to_delta`, `route_signals`, or Lua script removed an event because the config asked it to. A record `cumulative_to_delta` dropped is counted under its own `*.dropped` as well. | None. |
+| `logit.component.events.discarded` | A filter, `sample`, `aggregate`, `cumulative_to_delta`, `dedup_timestamps`, `route_signals`, or Lua script removed an event because the config asked it to. A record `cumulative_to_delta` dropped is counted under its own `*.dropped` as well. | None. |
 | `logit.component.events.copied` | A router delivered an event to more than one destination, or `route_signals` split one into a part per target; counts the deliveries past each event's first. Nothing is lost. | None. |
 | `*.omitted` | A piece (a tag, label, attribute, field, structured-data element, link, sample value, or a metric record or span beside a log body) removed from a record that's still delivered. | `reason` where more than one cause exists. |
 | `*.skipped` | Nothing was there to carry, the operator chose to leave it out (`multi_value: skip`), or the destination format has no form for the kind. | `reason` or `metric_kind`. |
-| `*.degraded`, `*.truncated`, `*.normalized` | Delivered, but lossy, shortened, or rewritten. | `reason`, `metric_kind`, or `field`. |
+| `*.degraded`, `*.truncated`, `*.normalized` | Delivered, but lossy, shortened, or rewritten. `metrics.normalized{reason="duplicate_timestamp"}` counts a state a sink left off beside an equal one it delivered, so nothing is lost. | `reason`, `metric_kind`, or `field`. |
 | `*.evicted`, `*.untracked` | An entry left a bounded bookkeeping table. No data was lost. | `reason` where more than one cause exists. |
 | `logit.input.batches.deferred` | A listener answered busy (`503`). The client keeps the data and retries, so this is back-pressure, not loss. | None. |
 | `logit.input.connections.rejected`, `logit.input.requests.rejected` | A listener refused a connection or request and told the peer, which still holds the data. | `reason`. |
@@ -1070,7 +1070,7 @@ connection then discards input until its next `LF`.
 `crates/logit-inputs/src/otlp.rs`,
 [ADR `otlp-tls-and-pooled-grpc-client`](../adr/otlp-tls-and-pooled-grpc-client.md).
 
-**The connection metrics, and one codec counter.** `logit.input.connections`,
+**The connection metrics, and two codec counters.** `logit.input.connections`,
 `logit.input.connections.rejected{reason="limit"}` (the connection cap, `max_connections`, 1024
 by default, binding), `logit.input.connections.rejected{reason="proxy_header"}` (under
 `proxy_protocol: true`, a PROXY header that was missing, malformed, cut short, or late, read
@@ -1095,7 +1095,9 @@ counted there and once per consumer in `logit.component.events.dropped{reason="c
 batches after it that were never offered appear only here.
 
 The OTLP codec counts a metric with no data as
-`logit.input.metrics.skipped{metric_kind="unknown", reason="no_data"}`
+`logit.input.metrics.skipped{metric_kind="unknown", reason="no_data"}`, and a histogram point
+whose `count` isn't the sum of its bucket counts, which keeps its buckets, as
+`logit.input.metrics.degraded{reason="histogram_count_mismatch"}`
 (`crates/logit-proto/src/otlp/metrics.rs`).
 
 `Diagnostics` keys: `bound`, `connection_error` (one connection's I/O failing, a TLS accept
@@ -1627,7 +1629,7 @@ each only when nonzero.
 
 | Name | Kind | Meaning |
 |---|---|---|
-| `logit.transform.metrics.converted{metric_kind="sum"\|"histogram"\|"exponential_histogram"\|"summary"}` | count | records replaced by a delta, a first or reset point emitted in full included |
+| `logit.transform.metrics.converted{metric_kind="sum"\|"histogram"\|"exponential_histogram"\|"summary"\|"non_monotonic_sum"}` | count | records replaced by a delta, a first or reset point emitted in full included; `non_monotonic_sum` is a cumulative non-monotonic `Sum` converted under `non_monotonic:` |
 | `logit.transform.metrics.skipped{reason="initial"}` | count | a series' first point that only recorded its baseline, as `initial_value` asked |
 | `logit.transform.metrics.skipped{reason="duplicate"\|"out_of_order"}` | count | a point timestamped at, or before, its series' last one, which carries nothing new |
 | `logit.transform.metrics.dropped{reason="layout_changed"}` | count | a `Histogram` whose bounds changed, or an `ExponentialHistogram` whose scale went up or zero threshold went down, with no reset: the counts since the previous point are lost, and the point is the new baseline |
@@ -1642,6 +1644,22 @@ removed from an event that keeps another payload counts only under its reason ab
 
 `Diagnostics` keys: `max_series_full` (a cardinality eviction), `layout_changed`, and
 `non_finite_sum`, each mirroring its counter.
+
+##### `dedup_timestamps`
+
+`crates/logit-transforms/src/dedup_timestamps.rs`,
+[ADR `dedup-timestamps-transform`](../adr/dedup-timestamps-transform.md). Counted per batch, each
+only when nonzero, and only for a record that shares its series and bucket with another. Nothing
+here is loss: a passed-through record reaches the sink, which counts it if it drops it.
+
+| Name | Kind | Meaning |
+|---|---|---|
+| `logit.transform.metrics.merged` | count | a reading added or combined into the surviving one: a delta `Sum`, a Datadog `rate` (a `Gauge` carrying `_logit.datadog.type: rate`) of the survivor's interval, a delta `Histogram` or `ExponentialHistogram` with the survivor's layout, `Samples` at its rate, `SetMembers`, a `Distribution` (re-binned when its mapping differs), or a `Set` |
+| `logit.transform.metrics.absorbed` | count | a reading superseded by a later one under last write wins: a `Gauge` other than a Datadog `rate`, or a cumulative kind, a `NO_RECORDED_VALUE` marker on one included. Narrower than `aggregate`'s `absorbed`: the survivor isn't counted |
+| `logit.transform.metrics.passed_through{reason="non_finite"\|"overflow"\|"mixed_type"\|"layout_mismatch"\|"no_merge_rule"\|"no_recorded_value"}` | count | a colliding record forwarded untouched beside the survivor: a `NaN` or infinite increment, a total past its type's range, a value type other than the survivor's (`I64` beside `F64`, `U64` beside `I64`), other histogram bounds or sample rate, a Datadog `rate` of another interval or beside a gauge that isn't one, a `GaugeDelta`, a delta `Summary`, or a delta `Sum` or a Datadog rate of `Bool`s, or a marker beside delta values. When no record of a set can merge, every one but the first counts |
+
+An event left with no metric, log, or span counts `logit.component.events.discarded`. No
+`Diagnostics` keys.
 
 ##### `kv_metrics`
 
@@ -1977,7 +1995,7 @@ decision 1). For `statsd_out`, `syslog_out`, `graphite_out`, `collectd_out`, `in
 
 | Class | Counts | Counters |
 |---|---|---|
-| Encode-side | once per batch, however many attempts the runtime makes | `batch.bytes`; `messages.dropped` for a reason the encoder decided; `tags.omitted`, `tags.normalized`, `messages.skipped`, `messages.normalized`, `messages.truncated`, `fields.omitted`, `events.skipped`, `events.dropped`, `structured_data.omitted`; the codec counters of `statsd_out`, `graphite_out`, `collectd_out`, `otlp_out`, `prometheus_out`, `splunk_hec_out`, `datadog_out`, and `datadog_trace_out` (`metrics.dropped`, `metrics.skipped`, `metrics.degraded`, `metrics.normalized`, `identity.sanitized`, `labels.omitted`, `labels.normalized`, `spans.degraded`, `stats.dropped`, `stats.degraded`); `splunk_hec_out`'s `records.dropped{reason="oversize"}` for an object over `max_body_bytes`; `datadog_out`'s `records.dropped{reason="stale"\|"too_many_tags"\|"needs_agent_processing"\|"not_datadog_origin"}` and its `too_many_tags` diagnostic; both Datadog sinks' `records.dropped{reason="oversize"}` for an event too large to send alone; `influxdb_out`'s `metrics.dropped{reason="no_bucket"}` and its `no_bucket` diagnostic, for a batch it never sends; `kafka_out`'s `records.dropped{reason="oversize"}`, `records.unkeyed`, `events.skipped{reason="no_log"}`, `metrics.omitted{reason="format"}`, `spans.omitted{reason="format"}`, its `oversize` diagnostic, and under `format: otlp_proto` the OTLP codec's `metrics.skipped`, `metrics.dropped`, and `metrics.degraded`; `file.rotations` and `file.reopens`; and every `logit.component.diagnostics` count an encoder emits, `datadog_trace_out`'s `bad_header` included |
+| Encode-side | once per batch, however many attempts the runtime makes | `batch.bytes`; `messages.dropped` for a reason the encoder decided; `tags.omitted`, `tags.normalized`, `messages.skipped`, `messages.normalized`, `messages.truncated`, `fields.omitted`, `events.skipped`, `events.dropped`, `structured_data.omitted`; the codec counters of `statsd_out`, `graphite_out`, `collectd_out`, `otlp_out`, `prometheus_out`, `splunk_hec_out`, `datadog_out`, and `datadog_trace_out` (`metrics.dropped`, `metrics.skipped`, `metrics.degraded`, `metrics.normalized`, `attributes.normalized`, `identity.sanitized`, `labels.omitted`, `labels.normalized`, `spans.degraded`, `stats.dropped`, `stats.degraded`); `splunk_hec_out`'s `records.dropped{reason="oversize"}` for an object over `max_body_bytes`; `datadog_out`'s `records.dropped{reason="stale"\|"too_many_tags"\|"needs_agent_processing"\|"not_datadog_origin"}` and its `too_many_tags` diagnostic; both Datadog sinks' `records.dropped{reason="oversize"}` for an event too large to send alone; `influxdb_out`'s `metrics.dropped{reason="no_bucket"}` and its `no_bucket` diagnostic, for a batch it never sends; `kafka_out`'s `records.dropped{reason="oversize"}`, `records.unkeyed`, `events.skipped{reason="no_log"}`, `metrics.omitted{reason="format"}`, `spans.omitted{reason="format"}`, its `oversize` diagnostic, and under `format: otlp_proto` the OTLP codec's `metrics.skipped`, `metrics.dropped`, and `metrics.degraded`; `file.rotations` and `file.reopens`; and every `logit.component.diagnostics` count an encoder emits, `datadog_trace_out`'s `bad_header` included |
 | Transport | once per attempt | `requests`, `request.duration`, `request.bytes`, `reconnects`, and what the attempt sent or had accepted: `messages`, `datagrams`, `datapoints`, `samples`, `records` |
 | Kernel or destination verdict, and packer backstop | once per attempt that meets it | `messages.dropped{reason="oversize_datagram"}`, from `EMSGSIZE` or from the packer's skip of an entry over the cap; `splunk_hec_out`'s `records.dropped{reason="invalid_event"}`, its `records.dropped{reason="oversize"}` from Splunk Cloud's oversize answer, `requests.rejected`, and `acks`; `datadog_out`'s `records.dropped{route="series", reason="rejected"}` from a series `202`'s body; the Datadog sinks' `records.dropped{reason="oversize"}` for a request answered `413`; `otlp_out`'s `records.dropped{signal, reason="rejected"\|"ambiguous_at_most_once"}`, from a `partial_success` (`rejected` only) or a verdict that names a signal, and the Datadog sinks' `records.dropped{route, reason="rejected"\|"ambiguous_at_most_once"}` for a request answered with a verdict that names it (counted even when the send ends `Ok`); `kafka_out`'s `records.dropped{reason="rejected"\|"invalid_timestamp"\|"invalid_record"\|"ambiguous_at_most_once"}` for a partition batch; and the diagnostics a verdict raises (`remote_write_rejected`, `otlp_partial_success`, `signal_rejected`, `invalid_event`, `token_rejected`, `request_refused`, `request_rejected`, `api_key_rejected`, `series_rejected`, `ack_unsupported`, `ack_timeout`, `oversize` for Splunk Cloud's answer, and `kafka_out`'s `rejected`, `invalid_timestamp`, and `invalid_record`). `otlp_out`, `datadog_out`, `datadog_trace_out`, and `kafka_out` meet each of their verdicts at most once per batch, because a retry never resends a signal, request, or partition batch the destination settled; only `splunk_hec_out` and the datagram sinks meet one again on a retry |
 
@@ -2061,8 +2079,10 @@ itself. The sink emits each once per batch, however many attempts the runtime ma
 | `logit.output.metrics.dropped{reason="unresolved_gauge_delta"}` | an unresolved `GaugeDelta` |
 | `logit.output.metrics.dropped{reason="no_bucket"}` | the sink's own counter, not `EncodeStats`: one per metric record of a batch that names no bucket (no `bucket:` or `default_bucket:` configured, and none carried), which isn't sent; a throttled `logit.component.diagnostics{key="no_bucket"}` says why |
 | `logit.output.metrics.degraded{reason="non_finite_component"}` | a `Histogram`, `Summary`, `Distribution`, or `Samples` line written with a non-finite `sum`, `min`, `max`, quantile, or bound left off, once per record |
+| `logit.output.metrics.degraded{metric_kind="distribution"\|"samples"\|"histogram"\|"summary"\|"set"\|"monotonic_delta_sum"\|"non_monotonic_delta_sum"\|"cumulative_sum"}` | a record written as fields of another shape (a sketch or sample list as quantile fields, a histogram or summary in Telegraf's shape, a set as its estimate, a `Sum` as a plain field, on its own line or its carrier's), each read back as a gauge, once per line written |
 | `logit.output.metrics.skipped{reason="no_recorded_value"}` | a record flagged `NO_RECORDED_VALUE`; line protocol has no "no reading" marker |
 | `logit.output.metrics.skipped{metric_kind="set_members"\|"exponential_histogram"}` | a kind with no line-protocol shape |
+| `logit.output.events.skipped{reason="no_metrics"}` | an event with no metric record and no `_logit.influxdb.measurement` carrier (a log, a span, or neither), which has nothing to write |
 
 - A `MetricKind::GaugeDelta` reaching this encoder unresolved means the pipeline is missing an
   `aggregate` component (`docs/adr/relative-gauge-adjustments.md`). It reports under its own
@@ -2162,6 +2182,11 @@ itself. The sink emits each once per batch, however many attempts the runtime ma
   under `multi_value: expand` (the default), or dropped under `multi_value: skip`. Counted once per
   record, however many lines it writes. `skip` also raises the throttled
   `logit.component.diagnostics{key="unsupported_metric_kind"}`; `expand` raises no diagnostic.
+- `logit.output.metrics.degraded{reason="negative_gauge"}`: a negative `Gauge` record written as
+  its `0|g`/`-n|g` pair, once per record. `statsd_in` reads the pair back as a gauge of 0 and a
+  relative adjustment.
+- `logit.output.events.skipped{reason="no_metrics"}`: an event with no metric record that isn't a
+  DogStatsD event or service check, such as a plain log or a span, which has no statsd line.
 - `logit.output.tags.omitted{reason="dialect"|"unrepresentable"}`: `format: statsd` omitting the
   whole tag segment, or an individual unrepresentable tag. Counted **per wire tag**, so a
   multi-valued attribute (an `Array`, from a repeated DogStatsD tag key, `docs/adr/statsd-output.md`'s
@@ -2170,6 +2195,11 @@ itself. The sink emits each once per batch, however many attempts the runtime ma
 - `logit.output.messages.normalized{reason="dialect"|"member_sanitized"}`: a lossless-but-different
   rendering rather than a drop. A timer's `h`/`d` wire-type letter collapsing to `ms` under
   `format: statsd`, or a `SetMembers` member changing after lossy UTF-8 plus sanitization.
+- `logit.output.metrics.normalized{reason="name_sanitized"}`: a record written under a name whose
+  reserved characters became `_`, once per record. It reads back under the rewritten name.
+- `logit.output.tags.normalized{reason="name_sanitized"|"value_sanitized"}`: a DogStatsD tag whose
+  key, or whose value, had a reserved character written as `_`, once per wire tag of an event that
+  wrote a line.
 - `logit.output.reconnects` (count; `tcp`, `unix_stream`, and `unix`): every connect *after* the
   first, as for `syslog_out`. Counted on plaintext and TLS connections alike, because `tcp` and
   `unix_stream` both go through the shared pooled-stream driver.
@@ -2289,12 +2319,19 @@ under one component id, as for `collectd_out`. The sink adds only what a socket 
   `logit.output.metrics.degraded{metric_kind="samples"|"distribution"}` (sent as a `Summary`),
   `logit.output.metrics.degraded{reason="non_finite_component"}` for a `Histogram` with a `NaN`
   or `-Inf` bound, whose count joins a neighboring bucket, once per record,
-  `logit.output.metrics.skipped{metric_kind="set_members"|"set"}`, each with a throttled
-  diagnostic (`otlp_set_members_metric_skipped`, `otlp_set_metric_skipped`), and
+  `logit.output.metrics.skipped{metric_kind="set_members"|"set"|"gauge_histogram"}`, each with a
+  throttled diagnostic (`otlp_set_members_metric_skipped`, `otlp_set_metric_skipped`,
+  `otlp_gauge_histogram_skipped`), the last for an OpenMetrics `gaugehistogram`, which the OTel
+  Prometheus compatibility spec drops, and
   `logit.output.metrics.dropped{reason="unresolved_gauge_delta"}` for a relative gauge no
   `aggregate` resolved, with the shared `gauge_delta_unresolved` diagnostic, and
   `logit.output.metrics.dropped{reason="unresolved_delta"}` for a delta `Summary`, which OTLP
   defines no form for, with a `delta_summary_unresolved` diagnostic.
+- From the encoder, for every signal: `logit.output.attributes.normalized{reason="u64_as_double"}`,
+  a resource, scope, or event attribute value (nested ones included) that's a `U64` above
+  `i64::MAX`, written as a `DoubleValue` because `IntValue` is signed, once per value; and
+  `logit.output.events.skipped{reason="no_payload"}`, an event with no metric, log, or span, which
+  no signal carries.
 
 There's no `logit.output.request.duration`; layer 2's `logit.component.send.duration` times each
 attempt. The class table above says which of this sink's counters count once per batch and which
@@ -2529,7 +2566,8 @@ it takes (the class table above).
 - `logit.output.metrics.skipped{metric_kind="exponential_histogram"}` in registry mode, where
   neither text dialect has a form for one, and `{reason="no_recorded_value"}`.
 - `logit.output.metrics.degraded{metric_kind="non_monotonic_sum"|"distribution"|"samples"|"set"|
-  "set_members"}`, `{reason="non_finite_component"}` for a `Histogram` with a `NaN` bound, which
+  "set_members"|"delta_sum"}` (`delta_sum` in sender mode only, a flagged delta monotonic `Sum`'s
+  stale marker), `{reason="non_finite_component"}` for a `Histogram` with a `NaN` bound, which
   gets no `le` bucket, once per record, and `{reason="exemplar_omitted"|"unit_not_suffix"}`
   (render-side). Sender mode counts `exemplar_omitted` too, for an exemplar with no `_total` or
   `_bucket` series to ride or over OpenMetrics' 128-code-point label budget, which Prometheus's
@@ -2540,6 +2578,15 @@ it takes (the class table above).
 - `logit.output.labels.normalized{reason="multi_value"}`: a multi-valued attribute collapsed to its
   last representable element, because a Prometheus label set has no multi-value label. Lossy; see
   above.
+- `logit.output.labels.normalized{reason="name_sanitized"}`: a label of a series kept, or of a
+  written exemplar, whose name `sanitize_label_name` rewrote, once per label. An exemplar's is
+  render-side in registry mode, counted once per OpenMetrics scrape.
+- `logit.output.metrics.normalized{reason="name_sanitized"}`: a record exposed or sent under a name
+  `sanitize_metric_name` rewrote, once per record. Two names that sanitize onto one within a batch
+  keep one family, the other's records counted `dropped{reason="name_collision"}`; across batches
+  they merge into one series, uncounted (`docs/known-gaps/prometheus.md`).
+- `logit.output.events.skipped{reason="no_metrics"}`: an event with no metric record, such as a log
+  or a span, which has no sample.
 
 Some reasons exist only on one path:
 
@@ -2549,19 +2596,31 @@ Some reasons exist only on one path:
   Remote-write has native histograms, which this codec doesn't map yet, so the record is loss
   rather than the format skip registry mode counts.
 - `dropped{reason="no_timestamp"}`, `dropped{reason="invalid_labels"}` (a family with an empty
-  name; `__name__` may not be empty), `degraded{reason="sub_ms_collapsed"}` (two readings of one
-  series landing on one millisecond, the later winning; `docs/known-gaps/mappings.md`), and
-  `labels.omitted{reason="empty_value"}` are remote-write encode's, where the wire forbids what the
-  exposition grammar merely renders differently.
+  name; `__name__` may not be empty), and `labels.omitted{reason="empty_value"}` are remote-write
+  encode's, where the wire forbids what the exposition grammar merely renders differently.
+- `dropped{reason="duplicate_timestamp"}` is remote-write encode's too: a reading of a series that
+  a later reading shares a millisecond with, at the same nanosecond or another, once per reading
+  (a histogram reading counts once, not once per wire sample), with a throttled
+  `duplicate_timestamp` diagnostic naming `dedup_timestamps` (`precision: 1ms`), or `aggregate`
+  for a live delta flow. The later reading is sent. A removed state (a gauge other than a
+  Datadog `rate`, or a cumulative kind) equal to the one sent (the point, each `f64` by its bits,
+  the created timestamp, and the exemplars) loses nothing, and counts
+  `normalized{reason="duplicate_timestamp"}` instead, with no diagnostic. A `samples` or
+  distribution summary, a set's size gauge, or a `rate` stays `dropped` when equal: two equal
+  sets of observations or increments are two. The exposition
+  registry's overwrite of a series between scrapes is the pull model's, and isn't counted.
 - `skipped{reason="no_recorded_value"}` means something narrower in sender mode. The encoder runs
   with `with_stale_markers(true)` there, so a flagged `Gauge`/`Sum`/marker-untyped record is written
   as a stale marker rather than skipped. Only a flagged `Histogram`/`Summary`/sketch, kinds that
-  expand to several derived series, still counts.
+  expand to several derived series, still counts. A flagged delta monotonic `Sum`'s marker reads
+  back as a cumulative counter, counted `degraded{metric_kind="delta_sum"}`.
 
 `Diagnostics` keys: `delta_temporality_unresolved` (a delta `Sum` or `Histogram`, naming the
 `aggregate` with `temporality: cumulative` fix); `delta_summary_unresolved` (a delta `Summary`,
 naming the `cumulative_to_delta` it came through); the shared `gauge_delta_unresolved` key `influxdb_out`/`statsd_out`
-use; `prometheus_exponential_histogram_skipped`; `prometheus_accept_failed` from the
+use; `duplicate_timestamp` (remote-write readings dropped for sharing a series and a
+millisecond with a different reading, naming `dedup_timestamps`); `prometheus_exponential_histogram_skipped`;
+`prometheus_accept_failed` from the
 registry-mode listener's accept loop; and `remote_write_rejected`, one per non-2xx answer in
 sender mode (`crates/logit-outputs/src/prometheus.rs`'s module doc, "Faults, retries and duplicate
 safety", has what it carries).
@@ -2601,13 +2660,16 @@ The module doc of `logit_proto::datadog` has the full mapping-to-counter tables.
 | `logit.output.metrics.skipped{metric_kind="set_members"}` | count | a kind no Datadog route carries; counted by the series encoders only |
 | `logit.output.fields.dropped{reason="unresolved_cumulative"}` | count | a cumulative `Summary`'s `.count` and `.sum`, running totals that need differencing first, left off while its `.quantile` gauges go out; once per summary, with an `unresolved_cumulative` diagnostic. A delta `Summary`, which `cumulative_to_delta` makes, sends both |
 | `logit.output.fields.omitted{reason="no_sum"}` | count | under `histograms.send_aggregation_metrics`, a delta histogram or exponential histogram whose sum is absent or non-finite, so no `.count`, `.sum`, `.min`, or `.max` series; once per record that the series route writes or the sketches route takes under the tag limit, so also for one the sketches route then skips or drops (a conversion error, `empty_sketch`, `oversized_sketch`, or the sink's `oversize`) |
-| `logit.output.metrics.degraded{metric_kind="non_monotonic_sum"\|"histogram"\|"exponential_histogram"}` | count | a non-monotonic `Sum` sent as a `count` (delta) or `gauge` (cumulative), a delta `Histogram` sent as a sketch or as `.bucket` and aggregation series, or a delta `ExponentialHistogram` sent as a sketch; once per record that leaves |
+| `logit.output.metrics.degraded{metric_kind="non_monotonic_sum"\|"histogram"\|"exponential_histogram"\|"summary"\|"set"}` | count | a non-monotonic `Sum` sent as a `count` (delta) or `gauge` (cumulative), a delta `Histogram` sent as a sketch or as `.bucket` and aggregation series, a delta `ExponentialHistogram` sent as a sketch, a delta `Summary` sent as `.quantile` gauges and `count` points, or a `Set` sent as a gauge of its estimate; once per record that leaves. A cumulative `Summary` counts its lost `.count` and `.sum` as `fields.dropped` instead |
 | `logit.output.metrics.dropped{reason="unresolved_gauge_delta"}` | count | a `GaugeDelta` nothing upstream resolved to a gauge; counted by the series encoders only |
+| `logit.output.metrics.dropped{reason="duplicate_timestamp"}` | count | a series point left off because a later point of its series (metric name, tag set, host, device, and resources) falls in the same second of one request and differs from it, since Datadog keeps one point per series per second, the higher; counted by the series encoders only, with a `duplicate_timestamp` diagnostic naming `dedup_timestamps` (`precision: 1s`). Distribution points and sketches aren't collapsed |
+| `logit.output.metrics.normalized{reason="duplicate_timestamp"}` | count | a series point of a gauge (not a `rate`) or a cumulative kind left off as above that equals the point sent (the value by its bits, the type, unit, interval, source type, and origin), so Datadog stores the same point and nothing is lost; no diagnostic. A delta count, a `rate`, or a delta histogram's point stays `dropped` when equal: two equal increments are two events |
 | `logit.output.metrics.skipped{reason="no_recorded_value"\|"empty_sketch"}` | count | a flagged record, or a sketch with nothing in it |
 | `logit.output.metrics.dropped{reason="non_finite_value"\|"oversized_sketch"}` | count | a non-finite value, a sketch whose counts split into more than `MAX_DOGSKETCH_ENTRIES` `k`/`n` entries, or a histogram or exponential histogram of more than 4,096 × 65,535 observations, which Datadog's exporter abandons too |
 | `logit.output.metrics.dropped{reason="non_monotonic_bounds"\|"sketch_range"}` | count | a delta `Histogram` with a bucket whose upper bound keys below its lower one, or a delta `ExponentialHistogram` whose scale or buckets fall outside the Agent sketch's range (a key past 32,766, or a boundary that overflows) |
-| `logit.output.metrics.degraded{reason="set_estimate"\|"sample_rate_expanded"\|"rebinned"\|"fractional_count"}` | count | a `Set` sent as a gauge of its estimate, a sampled `Samples` expanded into repeated values, a non-Agent sketch re-binned into the Agent mapping, or a fractional bin count rounded |
-| `logit.output.tags.omitted{reason="unrepresentable"\|"no_wire_form"}` | count | a tag value with no tag form (`Map`, `Bytes`, `Null`) or a carrier attribute of the wrong type; a `_logit.datadog.*` carrier the target route has no field for |
+| `logit.output.metrics.degraded{reason="sample_rate_expanded"\|"sample_rate_rounded"\|"rebinned"\|"fractional_count"}` | count | a sampled `Samples` expanded into repeated values, a `Samples` whose rate below 1 rounds to weight 1 sent with no trace of it, a non-Agent sketch re-binned into the Agent mapping, or a fractional bin count rounded |
+| `logit.output.tags.omitted{reason="unrepresentable"\|"no_wire_form"}` | count | a tag value with no tag form (`Bool(false)`, since a bare tag reads back `true`, `Map`, `Bytes`, `Null`) or a carrier attribute of the wrong type; a `_logit.datadog.*` carrier the target route has no field for |
+| `logit.output.events.skipped{reason="no_payload"}` | count | an event with no metric, log, or span, which takes no route; counted by `datadog_out`'s routing through the codec's handle, once per batch |
 | `logit.input.logs.dropped{reason="not_an_object"\|"no_message"}` | count | a log array element that isn't an object, or a log with no `message` |
 | `logit.input.events.dropped{reason="malformed"\|"no_title"}` | count | an events-envelope group that isn't an array or an item that isn't an object, or an event with neither a title nor a text |
 | `logit.input.metrics.dropped{reason="malformed"\|"no_name"\|"invalid_status"}` | count | a service check that isn't an object, has no `check` name, or has a status outside 0 to 3 |
@@ -2631,7 +2693,8 @@ timestamp that is neither a number nor RFC 3339, stamped with `received_at`), `m
 `bad_stats_sketch` (a dropped stats summary); `malformed_span` (a dropped span, trace array, or
 chunk); `oversized_sketch` (an outgoing sketch dropped past the entry cap, or a histogram past
 the observation cap); `unresolved_cumulative` (a cumulative kind dropped, or a summary's count and
-sum left off, naming `cumulative_to_delta`).
+sum left off, naming `cumulative_to_delta`); `duplicate_timestamp` (series points dropped as
+duplicates in one second that differ from the point sent, naming `dedup_timestamps`).
 
 A counter for a batch-resource attribute or a stats bucket counts once per request body the
 encoder writes, not once per record; the paragraph after the sink class table names them and says

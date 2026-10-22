@@ -2,7 +2,7 @@
   "carriers": {"events": [
     {"timestamp":"2027-01-15T07:59:30.000000000Z","metrics":[{"name":"requests","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"env":"prod"}},
     {"timestamp":"2027-01-15T07:59:30.000000000Z","metrics":[{"name":"temperature","kind":"gauge","value":20.0}]},
-    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"latency","kind":"summary","temporality":"cumulative","count":1,"sum":5.0,"quantiles":[{"quantile":0.5,"value":5.0},{"quantile":0.75,"value":5.0},{"quantile":0.9,"value":5.0},{"quantile":0.95,"value":5.0},{"quantile":0.99,"value":5.0}]}]}
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"latency","kind":"summary","temporality":"cumulative","count":1,"sum":5.0,"quantiles":[{"quantile":0.0,"value":5.0},{"quantile":0.5,"value":5.0},{"quantile":0.75,"value":5.0},{"quantile":0.9,"value":5.0},{"quantile":0.95,"value":5.0},{"quantile":0.99,"value":5.0},{"quantile":1.0,"value":5.0}]}]}
   ], "counters": {
     "logit.output.metrics.degraded{component=out,kind=otlp_out,metric_kind=samples,role=sink}": 1
   }},
@@ -17,7 +17,7 @@
   "cross-kinds": {"events": [
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"balance","kind":"gauge","value":-3.5,"exemplars":[{"timestamp":"2027-01-15T07:59:59.000000000Z","value":-3.5,"trace_id":"0102030405060708090a0b0c0d0e0f10","span_id":"0102030405060708","trace_flags":0}]}]},
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"jobs.done","kind":"sum","value":12.0,"temporality":"cumulative","monotonic":true,"exemplars":[{"timestamp":"2027-01-15T07:59:59.000000000Z","value":1.0,"trace_id":"0102030405060708090a0b0c0d0e0f10","span_id":"0102030405060708","trace_flags":0}]}]},
-    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"latency","kind":"summary","temporality":"cumulative","count":2,"sum":27.0,"quantiles":[{"quantile":0.5,"value":12.0},{"quantile":0.75,"value":15.0},{"quantile":0.9,"value":15.0},{"quantile":0.95,"value":15.0},{"quantile":0.99,"value":15.0}]}],"attributes":{"route":"/api"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"latency","kind":"summary","temporality":"cumulative","count":2,"sum":27.0,"quantiles":[{"quantile":0.0,"value":12.0},{"quantile":0.5,"value":12.0},{"quantile":0.75,"value":15.0},{"quantile":0.9,"value":15.0},{"quantile":0.95,"value":15.0},{"quantile":0.99,"value":15.0},{"quantile":1.0,"value":15.0}]}],"attributes":{"route":"/api"}},
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"payload.size","kind":"histogram","temporality":"cumulative","buckets":[{"bound":100.0,"count":3},{"bound":"inf","count":1}],"sum":250.0,"min":10.0,"max":150.0}]},
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"queue.depth","kind":"gauge","value":7.0}],"attributes":{"shards":["a","b"]}},
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"reading","kind":"gauge","value":"NaN"}]}
@@ -54,12 +54,12 @@
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"requests.tagged","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"host":"web-2","host.name":"web-1"}}
   ], "counters": {}},
   "interop-dogstatsd-buffered": {"events": [
-    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"app.db.query.duration_ms","kind":"summary","temporality":"cumulative","count":1,"sum":0.33313615206930347,"quantiles":[{"quantile":0.5,"value":0.33313615206930347},{"quantile":0.75,"value":0.33313615206930347},{"quantile":0.9,"value":0.33313615206930347},{"quantile":0.95,"value":0.33313615206930347},{"quantile":0.99,"value":0.33313615206930347}]}],"attributes":{"db":"primary","env":"prod","host":"web-07","query":"select_user","region":"us-east-1","service":"checkout-api"}},
-    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"app.http.request.duration_ms","kind":"summary","temporality":"cumulative","count":1,"sum":0.05,"quantiles":[{"quantile":0.5,"value":0.05},{"quantile":0.75,"value":0.05},{"quantile":0.9,"value":0.05},{"quantile":0.95,"value":0.05},{"quantile":0.99,"value":0.05}]}],"attributes":{"endpoint":"/api/v1/orders","env":"prod","host":"web-07","region":"us-east-1","service":"checkout-api","status":"200"}},
-    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"app.http.request.duration_ms","kind":"summary","temporality":"cumulative","count":1,"sum":23.483176616760144,"quantiles":[{"quantile":0.5,"value":23.483176616760144},{"quantile":0.75,"value":23.483176616760144},{"quantile":0.9,"value":23.483176616760144},{"quantile":0.95,"value":23.483176616760144},{"quantile":0.99,"value":23.483176616760144}]}],"attributes":{"endpoint":"/healthz","env":"prod","host":"web-07","region":"us-east-1","service":"checkout-api","status":"200"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"app.db.query.duration_ms","kind":"summary","temporality":"cumulative","count":1,"sum":0.33313615206930347,"quantiles":[{"quantile":0.0,"value":0.33313615206930347},{"quantile":0.5,"value":0.33313615206930347},{"quantile":0.75,"value":0.33313615206930347},{"quantile":0.9,"value":0.33313615206930347},{"quantile":0.95,"value":0.33313615206930347},{"quantile":0.99,"value":0.33313615206930347},{"quantile":1.0,"value":0.33313615206930347}]}],"attributes":{"db":"primary","env":"prod","host":"web-07","query":"select_user","region":"us-east-1","service":"checkout-api"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"app.http.request.duration_ms","kind":"summary","temporality":"cumulative","count":1,"sum":0.05,"quantiles":[{"quantile":0.0,"value":0.05},{"quantile":0.5,"value":0.05},{"quantile":0.75,"value":0.05},{"quantile":0.9,"value":0.05},{"quantile":0.95,"value":0.05},{"quantile":0.99,"value":0.05},{"quantile":1.0,"value":0.05}]}],"attributes":{"endpoint":"/api/v1/orders","env":"prod","host":"web-07","region":"us-east-1","service":"checkout-api","status":"200"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"app.http.request.duration_ms","kind":"summary","temporality":"cumulative","count":1,"sum":23.483176616760144,"quantiles":[{"quantile":0.0,"value":23.483176616760144},{"quantile":0.5,"value":23.483176616760144},{"quantile":0.75,"value":23.483176616760144},{"quantile":0.9,"value":23.483176616760144},{"quantile":0.95,"value":23.483176616760144},{"quantile":0.99,"value":23.483176616760144},{"quantile":1.0,"value":23.483176616760144}]}],"attributes":{"endpoint":"/healthz","env":"prod","host":"web-07","region":"us-east-1","service":"checkout-api","status":"200"}},
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"app.http.requests.count","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"endpoint":"/api/v1/orders","env":"prod","host":"web-07","region":"us-east-1","service":"checkout-api","status":"200"}},
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"app.http.requests.count","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"endpoint":"/healthz","env":"prod","host":"web-07","region":"us-east-1","service":"checkout-api","status":"200"}},
-    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"app.http.response.size_bytes","kind":"summary","temporality":"cumulative","count":1,"sum":60196.0,"quantiles":[{"quantile":0.5,"value":60196.0},{"quantile":0.75,"value":60196.0},{"quantile":0.9,"value":60196.0},{"quantile":0.95,"value":60196.0},{"quantile":0.99,"value":60196.0}]}],"attributes":{"endpoint":"/api/v1/orders","env":"prod","host":"web-07","region":"us-east-1","service":"checkout-api","status":"200"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"app.http.response.size_bytes","kind":"summary","temporality":"cumulative","count":1,"sum":60196.0,"quantiles":[{"quantile":0.0,"value":60196.0},{"quantile":0.5,"value":60196.0},{"quantile":0.75,"value":60196.0},{"quantile":0.9,"value":60196.0},{"quantile":0.95,"value":60196.0},{"quantile":0.99,"value":60196.0},{"quantile":1.0,"value":60196.0}]}],"attributes":{"endpoint":"/api/v1/orders","env":"prod","host":"web-07","region":"us-east-1","service":"checkout-api","status":"200"}},
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"app.render.calls.count","kind":"sum","value":2.0,"temporality":"delta","monotonic":true}],"attributes":{"endpoint":"/api/v1/orders","env":"prod","host":"web-07","region":"us-east-1","service":"checkout-api","status":"200"}},
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"app.worker.queue.depth","kind":"gauge","value":110.0}],"attributes":{"env":"prod","host":"web-07","queue":"email","region":"us-east-1","service":"checkout-api"}},
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"app.worker.queue.depth","kind":"gauge","value":210.0}],"attributes":{"env":"prod","host":"web-07","queue":"reindex","region":"us-east-1","service":"checkout-api"}},
@@ -70,9 +70,9 @@
   }},
   "interop-plain-pipeline": {"events": [
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"app.checkout_api.web_07.us_east_1.cache.lookups","kind":"sum","value":10.0,"temporality":"delta","monotonic":true}]},
-    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"app.checkout_api.web_07.us_east_1.db.select_user.duration","kind":"summary","temporality":"cumulative","count":1,"sum":0.333136,"quantiles":[{"quantile":0.5,"value":0.333136},{"quantile":0.75,"value":0.333136},{"quantile":0.9,"value":0.333136},{"quantile":0.95,"value":0.333136},{"quantile":0.99,"value":0.333136}]}]},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"app.checkout_api.web_07.us_east_1.db.select_user.duration","kind":"summary","temporality":"cumulative","count":1,"sum":0.333136,"quantiles":[{"quantile":0.0,"value":0.333136},{"quantile":0.5,"value":0.333136},{"quantile":0.75,"value":0.333136},{"quantile":0.9,"value":0.333136},{"quantile":0.95,"value":0.333136},{"quantile":0.99,"value":0.333136},{"quantile":1.0,"value":0.333136}]}]},
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"app.checkout_api.web_07.us_east_1.http.api.v1.orders.200.count","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}]},
-    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"app.checkout_api.web_07.us_east_1.http.api.v1.orders.duration","kind":"summary","temporality":"cumulative","count":1,"sum":0.05,"quantiles":[{"quantile":0.5,"value":0.05},{"quantile":0.75,"value":0.05},{"quantile":0.9,"value":0.05},{"quantile":0.95,"value":0.05},{"quantile":0.99,"value":0.05}]}]},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"app.checkout_api.web_07.us_east_1.http.api.v1.orders.duration","kind":"summary","temporality":"cumulative","count":1,"sum":0.05,"quantiles":[{"quantile":0.0,"value":0.05},{"quantile":0.5,"value":0.05},{"quantile":0.75,"value":0.05},{"quantile":0.9,"value":0.05},{"quantile":0.95,"value":0.05},{"quantile":0.99,"value":0.05},{"quantile":1.0,"value":0.05}]}]},
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"app.checkout_api.web_07.us_east_1.render.calls","kind":"sum","value":2.0,"temporality":"delta","monotonic":true}]},
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"app.checkout_api.web_07.us_east_1.worker.email.depth","kind":"gauge","value":234.0}]},
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"app.checkout_api.web_07.us_east_1.worker.reindex.depth","kind":"gauge","value":90.0}]},
@@ -90,13 +90,13 @@
   "mixed": {"events": [
     {"timestamp":"2027-01-15T07:59:30.000000000Z","metrics":[{"name":"queue.depth","kind":"gauge","value":7.0}]},
     {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"severity":"info","format":"raw","message":"v1.2","observed_timestamp":"2027-01-15T08:00:01.000000000Z"},"attributes":{"_logit.otel.severity_number":9,"_logit.otel.severity_text":"Info"}},
-    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"bytes","kind":"summary","temporality":"cumulative","count":2,"sum":120392.0,"quantiles":[{"quantile":0.5,"value":60196.0},{"quantile":0.75,"value":60196.0},{"quantile":0.9,"value":60196.0},{"quantile":0.95,"value":60196.0},{"quantile":0.99,"value":60196.0}]}]},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"bytes","kind":"summary","temporality":"cumulative","count":2,"sum":120392.0,"quantiles":[{"quantile":0.0,"value":60196.0},{"quantile":0.5,"value":60196.0},{"quantile":0.75,"value":60196.0},{"quantile":0.9,"value":60196.0},{"quantile":0.95,"value":60196.0},{"quantile":0.99,"value":60196.0},{"quantile":1.0,"value":60196.0}]}]},
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"db.up","kind":"gauge","value":1.0}]},
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"hits","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}]},
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"hits","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}]},
-    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"latency","kind":"summary","temporality":"cumulative","count":2,"sum":27.0,"quantiles":[{"quantile":0.5,"value":12.0},{"quantile":0.75,"value":15.0},{"quantile":0.9,"value":15.0},{"quantile":0.95,"value":15.0},{"quantile":0.99,"value":15.0}]}],"attributes":{"route":"/api"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"latency","kind":"summary","temporality":"cumulative","count":2,"sum":27.0,"quantiles":[{"quantile":0.0,"value":12.0},{"quantile":0.5,"value":12.0},{"quantile":0.75,"value":15.0},{"quantile":0.9,"value":15.0},{"quantile":0.95,"value":15.0},{"quantile":0.99,"value":15.0},{"quantile":1.0,"value":15.0}]}],"attributes":{"route":"/api"}},
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"requests","kind":"sum","value":4.0,"temporality":"delta","monotonic":true}],"attributes":{"route":"/api","team":["a","b"]}},
-    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"size","kind":"summary","temporality":"cumulative","count":1,"sum":512.0,"quantiles":[{"quantile":0.5,"value":512.0},{"quantile":0.75,"value":512.0},{"quantile":0.9,"value":512.0},{"quantile":0.95,"value":512.0},{"quantile":0.99,"value":512.0}]}]},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"size","kind":"summary","temporality":"cumulative","count":1,"sum":512.0,"quantiles":[{"quantile":0.0,"value":512.0},{"quantile":0.5,"value":512.0},{"quantile":0.75,"value":512.0},{"quantile":0.9,"value":512.0},{"quantile":0.95,"value":512.0},{"quantile":0.99,"value":512.0},{"quantile":1.0,"value":512.0}]}]},
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"temperature","kind":"gauge","value":21.5}],"attributes":{"room":"lab"}}
   ], "counters": {
     "logit.output.metrics.degraded{component=out,kind=otlp_out,metric_kind=samples,role=sink}": 3,
@@ -107,7 +107,7 @@
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"hits","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}]},
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"hits","kind":"sum","value":2.0,"temporality":"delta","monotonic":true}]},
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"hits","kind":"sum","value":3.0,"temporality":"delta","monotonic":true}]},
-    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"latency","kind":"summary","temporality":"cumulative","count":3,"sum":6.0,"quantiles":[{"quantile":0.5,"value":2.009103080990281},{"quantile":0.75,"value":3.0},{"quantile":0.9,"value":3.0},{"quantile":0.95,"value":3.0},{"quantile":0.99,"value":3.0}]}]},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"latency","kind":"summary","temporality":"cumulative","count":3,"sum":6.0,"quantiles":[{"quantile":0.0,"value":1.0},{"quantile":0.5,"value":2.009103080990281},{"quantile":0.75,"value":3.0},{"quantile":0.9,"value":3.0},{"quantile":0.95,"value":3.0},{"quantile":0.99,"value":3.0},{"quantile":1.0,"value":3.0}]}]},
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"level","kind":"gauge","value":4.0}]},
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"level","kind":"gauge","value":5.0}]}
   ], "counters": {
@@ -152,6 +152,10 @@
     {"timestamp":"2027-01-15T08:00:00.000000100Z","metrics":[{"name":"queue.depth","kind":"gauge","value":3.0}]},
     {"timestamp":"2027-01-15T08:00:00.000000500Z","metrics":[{"name":"queue.depth","kind":"gauge","value":4.0}]}
   ], "counters": {}},
+  "sub-millisecond-equal": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000100Z","metrics":[{"name":"queue.depth","kind":"gauge","value":3.0}]},
+    {"timestamp":"2027-01-15T08:00:00.000000500Z","metrics":[{"name":"queue.depth","kind":"gauge","value":3.0}]}
+  ], "counters": {}},
   "sum-shapes": {"events": [
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"active.sessions","kind":"sum","value":14.0,"temporality":"cumulative","monotonic":false}]},
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"balance.change","kind":"sum","value":-4.0,"temporality":"delta","monotonic":false}]},
@@ -182,25 +186,25 @@
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"requests","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"env":"a:b","my key":"a@b c"}}
   ], "counters": {}},
   "timer-h-d": {"events": [
-    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"request.size","kind":"summary","temporality":"cumulative","count":1,"sum":512.0,"quantiles":[{"quantile":0.5,"value":512.0},{"quantile":0.75,"value":512.0},{"quantile":0.9,"value":512.0},{"quantile":0.95,"value":512.0},{"quantile":0.99,"value":512.0}]}]},
-    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"response.size","kind":"summary","temporality":"cumulative","count":1,"sum":60196.0,"quantiles":[{"quantile":0.5,"value":60196.0},{"quantile":0.75,"value":60196.0},{"quantile":0.9,"value":60196.0},{"quantile":0.95,"value":60196.0},{"quantile":0.99,"value":60196.0}]}],"attributes":{"endpoint":"/orders"}}
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"request.size","kind":"summary","temporality":"cumulative","count":1,"sum":512.0,"quantiles":[{"quantile":0.0,"value":512.0},{"quantile":0.5,"value":512.0},{"quantile":0.75,"value":512.0},{"quantile":0.9,"value":512.0},{"quantile":0.95,"value":512.0},{"quantile":0.99,"value":512.0},{"quantile":1.0,"value":512.0}]}]},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"response.size","kind":"summary","temporality":"cumulative","count":1,"sum":60196.0,"quantiles":[{"quantile":0.0,"value":60196.0},{"quantile":0.5,"value":60196.0},{"quantile":0.75,"value":60196.0},{"quantile":0.9,"value":60196.0},{"quantile":0.95,"value":60196.0},{"quantile":0.99,"value":60196.0},{"quantile":1.0,"value":60196.0}]}],"attributes":{"endpoint":"/orders"}}
   ], "counters": {
     "logit.output.metrics.degraded{component=out,kind=otlp_out,metric_kind=samples,role=sink}": 2
   }},
   "timer-ms": {"events": [
-    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"latency","kind":"summary","temporality":"cumulative","count":1,"sum":12.0,"quantiles":[{"quantile":0.5,"value":12.0},{"quantile":0.75,"value":12.0},{"quantile":0.9,"value":12.0},{"quantile":0.95,"value":12.0},{"quantile":0.99,"value":12.0}]}],"attributes":{"route":"/api"}},
-    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"latency","kind":"summary","temporality":"cumulative","count":1,"sum":7.5,"quantiles":[{"quantile":0.5,"value":7.5},{"quantile":0.75,"value":7.5},{"quantile":0.9,"value":7.5},{"quantile":0.95,"value":7.5},{"quantile":0.99,"value":7.5}]}],"attributes":{"route":"/api"}}
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"latency","kind":"summary","temporality":"cumulative","count":1,"sum":12.0,"quantiles":[{"quantile":0.0,"value":12.0},{"quantile":0.5,"value":12.0},{"quantile":0.75,"value":12.0},{"quantile":0.9,"value":12.0},{"quantile":0.95,"value":12.0},{"quantile":0.99,"value":12.0},{"quantile":1.0,"value":12.0}]}],"attributes":{"route":"/api"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"latency","kind":"summary","temporality":"cumulative","count":1,"sum":7.5,"quantiles":[{"quantile":0.0,"value":7.5},{"quantile":0.5,"value":7.5},{"quantile":0.75,"value":7.5},{"quantile":0.9,"value":7.5},{"quantile":0.95,"value":7.5},{"quantile":0.99,"value":7.5},{"quantile":1.0,"value":7.5}]}],"attributes":{"route":"/api"}}
   ], "counters": {
     "logit.output.metrics.degraded{component=out,kind=otlp_out,metric_kind=samples,role=sink}": 2
   }},
   "timer-sample-rate": {"events": [
-    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"db.query","kind":"summary","temporality":"cumulative","count":2,"sum":6.4,"quantiles":[{"quantile":0.5,"value":3.2},{"quantile":0.75,"value":3.2},{"quantile":0.9,"value":3.2},{"quantile":0.95,"value":3.2},{"quantile":0.99,"value":3.2}]}]},
-    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"render.time","kind":"summary","temporality":"cumulative","count":4,"sum":160.0,"quantiles":[{"quantile":0.5,"value":40.0},{"quantile":0.75,"value":40.0},{"quantile":0.9,"value":40.0},{"quantile":0.95,"value":40.0},{"quantile":0.99,"value":40.0}]}],"attributes":{"route":"/home"}}
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"db.query","kind":"summary","temporality":"cumulative","count":2,"sum":6.4,"quantiles":[{"quantile":0.0,"value":3.2},{"quantile":0.5,"value":3.2},{"quantile":0.75,"value":3.2},{"quantile":0.9,"value":3.2},{"quantile":0.95,"value":3.2},{"quantile":0.99,"value":3.2},{"quantile":1.0,"value":3.2}]}]},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"render.time","kind":"summary","temporality":"cumulative","count":4,"sum":160.0,"quantiles":[{"quantile":0.0,"value":40.0},{"quantile":0.5,"value":40.0},{"quantile":0.75,"value":40.0},{"quantile":0.9,"value":40.0},{"quantile":0.95,"value":40.0},{"quantile":0.99,"value":40.0},{"quantile":1.0,"value":40.0}]}],"attributes":{"route":"/home"}}
   ], "counters": {
     "logit.output.metrics.degraded{component=out,kind=otlp_out,metric_kind=samples,role=sink}": 2
   }},
   "timer-sample-rate-unweighted": {"events": [
-    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"api.latency","kind":"summary","temporality":"cumulative","count":1,"sum":12.0,"quantiles":[{"quantile":0.5,"value":12.0},{"quantile":0.75,"value":12.0},{"quantile":0.9,"value":12.0},{"quantile":0.95,"value":12.0},{"quantile":0.99,"value":12.0}]}]}
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"api.latency","kind":"summary","temporality":"cumulative","count":1,"sum":12.0,"quantiles":[{"quantile":0.0,"value":12.0},{"quantile":0.5,"value":12.0},{"quantile":0.75,"value":12.0},{"quantile":0.9,"value":12.0},{"quantile":0.95,"value":12.0},{"quantile":0.99,"value":12.0},{"quantile":1.0,"value":12.0}]}]}
   ], "counters": {
     "logit.output.metrics.degraded{component=out,kind=otlp_out,metric_kind=samples,role=sink}": 1
   }},
@@ -228,7 +232,7 @@
     "logit.output.metrics.normalized{component=out,kind=otlp_out,reason=u64_as_double,role=sink}": 1
   }},
   "unit-on-samples": {"events": [
-    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"upload.size","kind":"summary","temporality":"cumulative","count":2,"sum":2560.0,"quantiles":[{"quantile":0.5,"value":512.0},{"quantile":0.75,"value":2048.0},{"quantile":0.9,"value":2048.0},{"quantile":0.95,"value":2048.0},{"quantile":0.99,"value":2048.0}],"unit":"By"}]}
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"upload.size","kind":"summary","temporality":"cumulative","count":2,"sum":2560.0,"quantiles":[{"quantile":0.0,"value":512.0},{"quantile":0.5,"value":512.0},{"quantile":0.75,"value":2048.0},{"quantile":0.9,"value":2048.0},{"quantile":0.95,"value":2048.0},{"quantile":0.99,"value":2048.0},{"quantile":1.0,"value":2048.0}],"unit":"By"}]}
   ], "counters": {
     "logit.output.metrics.degraded{component=out,kind=otlp_out,metric_kind=samples,role=sink}": 1
   }}

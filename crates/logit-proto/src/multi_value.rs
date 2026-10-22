@@ -39,9 +39,10 @@
 //! from bin representatives, so they're approximate.
 //!
 //! The quantiles are [`crate::otlp::metrics::DISTRIBUTION_QUANTILES`], the five every
-//! sketch-to-quantiles degradation in this crate reports, so a metric describes itself identically
-//! at `otlp_out`, `prometheus_out`, and `graphite_out`. `influxdb_out` keeps its narrower
-//! `[0.5, 0.9, 0.99]`.
+//! sketch-to-quantiles degradation in this crate reports, so a metric describes itself the same
+//! way at `otlp_out`, `prometheus_out`, and `graphite_out`. `otlp_out` and `prometheus_out` write
+//! quantiles `0` and `1` beside them, where this expansion writes `.min` and `.max`.
+//! `influxdb_out` keeps its narrower `[0, 0.5, 0.9, 0.99, 1]`.
 //!
 //! **Number tokens are injective.** A quantile or bucket bound is formatted with `f64`'s `Display`
 //! and every `.` substituted with `_`: `0.99 → q0_99`, `1.5 → bucket_1_5`,

@@ -1,6 +1,6 @@
 ---
 created: 2026-09-11
-updated: 2026-10-20
+updated: 2026-10-21
 ---
 
 # Prometheus scrape ingestion and exposition: transports, dialects, and the model mapping
@@ -126,7 +126,7 @@ can't carry natively:
 | `GaugeDelta` | skipped, `warn_throttled("gauge_delta_unresolved")` (shared key across sinks) |
 | `Histogram{Cumulative}` | `histogram`: running-sum buckets, `+Inf` = total, `_sum` only when `Some`, `_count` = bucket total; `min`/`max` dropped (known-gaps row); `_logit.prometheus.type: gaugehistogram` → `_gsum`/`_gcount` on OM egress, `_sum`/`_count` on text egress (text has no `gaugehistogram`) |
 | `Summary` | `summary` + `_created` (OM) |
-| `Distribution(sketch)` | `summary` with `DISTRIBUTION_QUANTILES` (reused from `otlp/metrics.rs`, made `pub(crate)`) with `_sum` and `_count` (the sketch's exact sum and count; see the 2026-10-03 amendment) — `degraded{metric_kind="distribution"}` |
+| `Distribution(sketch)` | `summary` with `SUMMARY_QUANTILES` (shared with `otlp/metrics.rs`; quantiles `0` and `1` from the 2026-10-21 amendment) with `_sum` and `_count` (the sketch's exact sum and count; see the 2026-10-03 amendment) — `degraded{metric_kind="distribution"}` |
 | `Samples` | `s.sketch()` then as above — `degraded{metric_kind="samples"}` |
 | `Set` / `SetMembers` | `gauge` of `estimate()` / distinct count — `degraded{metric_kind="set"\|"set_members"}` |
 | `ExponentialHistogram` | skipped, `skipped{metric_kind="exponential_histogram"}` (text has no native-histogram syntax) |
@@ -266,6 +266,13 @@ equality modulo:
 - **An `instance` label is added**, `host:port` of the scraped target, exactly as Prometheus's own
   scrape adds one — see "Attribute conventions" above. An event-level `instance` label from a
   downstream transform wins over it (`honor_labels` semantics).
+- **The scrape target is re-stamped.** `prometheus_out` doesn't write `_logit.prometheus.target`,
+  so a scrape of the relay stamps the relay's own URL, and a remote-write receiver stamps none.
+  Only the original target's `host:port` survives, as `instance`; its scheme and path are lost.
+- **A remote-write receiver stamps no `_logit.prometheus.timestamp` marker.** Every sample keeps
+  its timestamp; only the marker is absent
+  ([ADR `prometheus-remote-write`](prometheus-remote-write.md)'s "Timestamps: received without the
+  marker, sent always").
 - **A counter sample name gains a `_total` suffix if it lacked one**, in either dialect — see the
   "Model mapping" encode table above; every client library does this normalization on the way out
   regardless of which dialect it's writing. In text 0.0.4, the `# TYPE`/`# HELP` lines (text has no
@@ -595,7 +602,8 @@ rest are counted `logit.output.labels.omitted{reason="collision"}`. A key saniti
 `trace_id` or `span_id` beside the exemplar's trace is counted `reason="reserved"`, as an `le`
 beside a histogram's bucket is; a `span_id` attribute beside a trace with no span is an ordinary
 label, since no `span_id` is written. The 128-code-point budget is measured on the names as
-sanitized. The renaming itself is uncounted, as a series label's is. In registry mode the
+sanitized. Each key written under a rewritten name counts
+`logit.output.labels.normalized{reason="name_sanitized"}`, as a series label's does. In registry mode the
 exposition is rendered on each scrape, so an exemplar key's `collision` or `reserved` counts once
 per OpenMetrics scrape, as `exemplar_omitted` does.
 
@@ -603,3 +611,38 @@ Prometheus 3 also reads a quoted UTF-8 exemplar label name (`# {"customer.tier"=
 that syntax isn't OpenMetrics 1.0, and `prometheus_in` doesn't read quoted names anywhere
 (`docs/known-gaps/mappings.md`'s "Prometheus 3's quoted UTF-8 names"). Writing one is part of
 that deferred alternative, not this rule.
+
+## Amendment (2026-10-21): `otlp_out` reads the family-type carrier
+
+`_logit.prometheus.type` was read only by `prometheus_out`, so `otlp_out` wrote an `info` or
+`stateset` gauge as an OTLP `Gauge` and a `gaugehistogram` as an ordinary `Histogram`. The OTel
+[Prometheus and OpenMetrics compatibility spec](https://opentelemetry.io/docs/specs/otel/compatibility/prometheus_and_openmetrics/)'s
+"Prometheus/OpenMetrics to OTLP" section says otherwise, and `otlp_out` now follows it:
+
+- **GaugeHistogram**: "The following Prometheus types MUST be dropped: … Prometheus
+  GaugeHistogram." OTLP has no histogram of a quantity that can go down, so the record isn't
+  written, counted `logit.output.metrics.skipped{metric_kind="gauge_histogram"}`. It's `skipped`,
+  not `dropped`: the destination format has no form for the kind, as for a `Set` at `otlp_out`
+  ([ADR `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md)).
+- **Info**: "A Prometheus Info metric MUST be converted to an OTLP Non-Monotonic Sum", so its `1`
+  sums when a label is aggregated away. It leaves as a cumulative non-monotonic `Sum`, named with
+  the `_info` suffix this ADR's decoder strips (`build_info`), as the Collector's Prometheus
+  receiver names it.
+- **StateSet**: "A Prometheus StateSet metric MUST be converted to an OTLP Non-Monotonic Sum." Each
+  state's gauge leaves as a cumulative non-monotonic `Sum`.
+
+The Info and StateSet sections are marked Development in the spec, so they may change; Dropped
+Types is Stable. The rewrite is uncounted, since the spec mandates it. The spec's `target_info`
+exception, which turns that info metric into resource attributes, isn't implemented
+(`docs/known-gaps/otlp.md`). A stale marker of any of the three follows the same mapping.
+
+## Amendment (2026-10-21): a sketch's summary carries its minimum and maximum
+
+A `Distribution` or `Samples` written as a `summary` now carries quantiles `0` and `1` around the
+five shared ones: `SUMMARY_QUANTILES` in `crates/logit-proto/src/otlp/metrics.rs`, which
+`otlp_out` writes too. `DdSketch::quantile` answers `0` and `1` with the sketch's tracked `min`
+and `max`, so the summary keeps the exact extremes the sketch holds. Prometheus accepts
+`quantile="0"` and `quantile="1"`, and `metrics.proto`'s `ValueAtQuantile` reads them as the
+minimum and maximum observed. The cost is two more series per distribution. Graphite's and
+statsd's dotted expansion keep `DISTRIBUTION_QUANTILES`, since they write `.min` and `.max`
+already.

@@ -40,6 +40,7 @@
     {"sink":"prometheus_out","row":"record/non_finite","cell":0,"observed":["exact"]},
     {"sink":"prometheus_out","row":"record/same_instant","cell":0,"observed":["dropped"]},
     {"sink":"prometheus_out","row":"record/same_millisecond","cell":0,"observed":["dropped"]},
+    {"sink":"prometheus_out","row":"record/same_millisecond_equal","cell":0,"observed":["normalized"]},
     {"sink":"prometheus_out","row":"record/sample_rate","cell":0,"observed":[]},
     {"sink":"prometheus_out","row":"record/service_check","cell":0,"observed":[]},
     {"sink":"prometheus_out","row":"record/start_timestamp","cell":0,"observed":["lost"]},

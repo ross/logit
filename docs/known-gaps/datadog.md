@@ -128,6 +128,20 @@ Entry format and the other areas: [the known-gaps index](README.md).
   - **Workaround:** keep metrics under 100 tags with `keep` or `remove` upstream.
   - **Revisit trigger:** Datadog documents or answers a different limit; the series route's `202`
     body states it (`limit=100`).
+- **`datadog_out` collapses a series' points in one second only within one batch.** Of the
+  points of one series in one second in a batch, the sink sends the latest and leaves the rest
+  off, counted `metrics.dropped{reason="duplicate_timestamp"}`, or
+  `metrics.normalized{reason="duplicate_timestamp"}` for a gauge (not a `rate`) or cumulative
+  point equal to the one sent, because
+  Datadog keeps only the higher of two in one request (verified 2026-10-21;
+  [ADR `dedup-timestamps-transform`](../adr/dedup-timestamps-transform.md)'s "Verified destination
+  behavior"). It plans that over the whole batch before cutting requests, so no cut splits a pair,
+  but it holds no state between batches.
+  - **Consequence:** two such points in two batches are both sent, and Datadog keeps the later,
+    so the earlier one is lost, uncounted; for a `count`, that's an increment. `dedup_timestamps`
+    holds no state between batches either.
+  - **Workaround:** keep one series' readings of one second in one batch: an `aggregate` upstream
+    leaves one point per series per window.
 - **`datadog_out` reports every hostless sender under the relay's hostname.** It sends the
   process hostname for a metric with no `host.name` and no DogStatsD `host:` tag, an event or
   service check with no `h:` field, no `host.name`, and no `host:` tag, and a log with none of
@@ -137,6 +151,9 @@ Entry format and the other areas: [the known-gaps index](README.md).
     their series merged under it. Datadog bills per host, so this costs what one Agent would.
   - **Workaround:** stamp `host.name` per sender upstream with `set`, or have each DogStatsD
     client send a `host:` tag (or `h:` on an event or check).
+- **`datadog_out` ignores `collectd.host`.** It takes a metric's host only from `host.name` or a
+  `host` tag, so every collectd sender behind a relay lands on the relay's process hostname.
+  A fix is planned.
 - **`datadog_trace_out` under `version: v0.4` drops the trace chunk and tracer payload fields.**
   v0.4 has no field for a chunk's `_logit.datadog.chunk.*` fields (sampling priority, origin,
   dropped flag, tags) or for the tracer payload fields no request header carries
@@ -219,6 +236,21 @@ Entry format and the other areas: [the known-gaps index](README.md).
     a fixed-size key buffer (`pkg/util/quantile/agent.go` buffers 512 keys and merges them into
     the sorted store in one pass) instead of a binary search plus `Vec::insert` per value.
     Measure on the VM before believing it helps.
+- **`datadog_out` sketches an OTLP histogram point with no buckets as a one-bucket point.**
+  `otlp_in` reads a point with only `count` and `sum` as one `+Inf` bucket holding `count`, the
+  model shape of a point with one bucket and no bounds. Datadog's exporter treats the two apart:
+  given a bucketless delta point with a `min` and a `max`, it adds a bound at each and spreads the
+  count between them, and under `histograms.mode: counters` it writes no `.bucket` series for a
+  bucketless point. `datadog_out` writes the one-bucket point's sketch, every observation at the
+  Agent's key -1, and its `lower_bound:-inf,upper_bound:inf` `.bucket` series. With no `min` or
+  `max`, the sketch matches the exporter's. The `no-buckets-count*` cases of
+  `testdata/differential/datadog-sketch/` record the exporter's output, and each corpus reader
+  lists them in its `COLLAPSED`.
+  - **Consequence:** a bucketless point with `min` and `max` reaches Datadog with its count and
+    sum exact but every observation in one bin at about `-9.94e-10` rather than between them,
+    and counters mode adds one `.bucket` series.
+  - **Revisit trigger:** a producer that sends bucketless histograms to Datadog. Telling the
+    shapes apart needs a `count` field on `Histogram` (`docs/known-gaps/otlp.md`).
 - **`datadog_out` drops a sketch that would encode as more than 2^20 `k`/`n` entries**
   (`MAX_DOGSKETCH_ENTRIES`, `crates/logit-proto/src/datadog/sketches.rs`), rather than splitting
   each bin's count into `uint16` entries without bound.

@@ -339,6 +339,8 @@
 //!     or an integer larger than 2^53 in magnitude, which a Lua number can't hold without
 //!     rounding. Only a YAML literal can trip it: `!env` inside `vars:` always gives a string. The
 //!     error names the key path, never the value (`docs/adr/lua-script-vars.md`).
+//! 96. A `dedup_timestamps` with a `precision` of `0s`, which has no bucket to put a timestamp in
+//!     (`docs/adr/dedup-timestamps-transform.md`).
 //!
 //! Not validated: that a `by: {provenance: ..}` route key names a component in this graph. Like
 //! 37's ids, it may name a component relayed from another process. Nor is `keep`'s empty `fields`:
@@ -446,6 +448,7 @@ pub fn role(kind: &ComponentKind) -> Role {
         | HasStale { .. }
         | DropStale { .. }
         | CumulativeToDelta { .. }
+        | DedupTimestamps { .. }
         | KeepValues { .. }
         | Bucket { .. }
         | Logfmt { .. }
@@ -523,6 +526,7 @@ pub fn kind_name(kind: &ComponentKind) -> &'static str {
         HasStale { .. } => "has_stale",
         DropStale { .. } => "drop_stale",
         CumulativeToDelta { .. } => "cumulative_to_delta",
+        DedupTimestamps { .. } => "dedup_timestamps",
         KeepValues { .. } => "keep_values",
         Bucket { .. } => "bucket",
         Logfmt { .. } => "logfmt",
@@ -652,6 +656,7 @@ fn is_implemented(kind: &ComponentKind) -> bool {
             | ComponentKind::HasStale { .. }
             | ComponentKind::DropStale { .. }
             | ComponentKind::CumulativeToDelta { .. }
+            | ComponentKind::DedupTimestamps { .. }
             | ComponentKind::KeepValues { .. }
             | ComponentKind::Bucket { .. }
             | ComponentKind::Logfmt { .. }
@@ -4003,6 +4008,18 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
+    // Rule 96: `dedup_timestamps` (`docs/adr/dedup-timestamps-transform.md`).
+    for (id, component) in &components {
+        if let ComponentKind::DedupTimestamps { precision } = &component.kind {
+            if precision.is_zero() {
+                anyhow::bail!(
+                    "component '{id}': dedup_timestamps 'precision' must be greater than 0s -- \
+                     use 1ms in front of remote-write, 1s in front of datadog_out"
+                );
+            }
+        }
+    }
+
     // Rule 87: `has_stale`/`drop_stale` (`docs/adr/stale-event-filtering.md`). A zero bound would
     // call nearly every event stale.
     for (id, component) in &components {
@@ -6853,6 +6870,7 @@ mod tests {
     fn cumulative_to_delta(max_staleness: Duration, max_series: usize) -> ComponentKind {
         ComponentKind::CumulativeToDelta {
             initial_value: logit_config::InitialValue::Auto,
+            non_monotonic: logit_config::NonMonotonicSums::Pass,
             max_staleness,
             max_series,
         }
@@ -6873,6 +6891,25 @@ mod tests {
         assert!(err.contains("'max_staleness' must be greater than 0s"), "got: {err}");
         let err = timestamp_err(cumulative_to_delta(Duration::from_secs(3600), 0));
         assert!(err.contains("'max_series' must be at least 1"), "got: {err}");
+    }
+
+    // ---- Rule 96: `dedup_timestamps` --------------------------------------------------------------
+
+    #[test]
+    fn a_dedup_timestamps_with_a_positive_precision_resolves_as_a_transform() {
+        let graph = resolve_timestamp(ComponentKind::DedupTimestamps {
+            precision: Duration::from_millis(1),
+        })
+        .expect("should resolve");
+        assert_eq!(graph.components["stamped"].role(), Role::Transform);
+        assert_eq!(graph.components["stamped"].kind_name(), "dedup_timestamps");
+    }
+
+    /// Rule 96: a zero `precision` is rejected.
+    #[test]
+    fn a_dedup_timestamps_with_a_zero_precision_is_rejected() {
+        let err = timestamp_err(ComponentKind::DedupTimestamps { precision: Duration::ZERO });
+        assert!(err.contains("'precision' must be greater than 0s"), "got: {err}");
     }
 
     // ---- Rule 87: `has_stale`/`drop_stale` --------------------------------------------------------

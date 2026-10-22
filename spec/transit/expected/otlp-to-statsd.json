@@ -38,10 +38,23 @@
     {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"room.temperature.offset","kind":"gauge","value":0.0}],"attributes":{"host":"web-1","room":"lab","service.name":"checkout"}},
     {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"room.temperature.offset","kind":"gauge_delta","delta":-4.5}],"attributes":{"host":"web-1","room":"lab","service.name":"checkout"}},
     {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"system.memory.utilization","kind":"gauge","value":0.625}],"attributes":{"host":"web-1","service.name":"checkout","state":"used"}}
-  ], "counters": {}},
+  ], "counters": {
+    "logit.output.metrics.degraded{component=out,kind=statsd_out,reason=negative_gauge,role=sink}": 1
+  }},
   "gzip": {"events": [
     {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"uploads.completed","kind":"sum","value":5.0,"temporality":"delta","monotonic":true}],"attributes":{"host":"web-1","service.name":"checkout"}}
   ], "counters": {}},
+  "histogram-count": {"events": [
+    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"queue.wait.bucket_1","kind":"gauge","value":3.0}],"attributes":{"queue.name":"orders","service.name":"checkout"}},
+    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"queue.wait.bucket_inf","kind":"gauge","value":4.0}],"attributes":{"queue.name":"orders","service.name":"checkout"}},
+    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"queue.wait.count","kind":"gauge","value":7.0}],"attributes":{"queue.name":"orders","service.name":"checkout"}},
+    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"queue.wait.sum","kind":"gauge","value":4.5}],"attributes":{"queue.name":"orders","service.name":"checkout"}},
+    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"rpc.server.duration.bucket_inf","kind":"gauge","value":12.0}],"attributes":{"rpc.service":"cart","service.name":"checkout"}},
+    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"rpc.server.duration.count","kind":"gauge","value":12.0}],"attributes":{"rpc.service":"cart","service.name":"checkout"}},
+    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"rpc.server.duration.sum","kind":"gauge","value":30.0}],"attributes":{"rpc.service":"cart","service.name":"checkout"}}
+  ], "counters": {
+    "logit.output.metrics.degraded{component=out,kind=statsd_out,metric_kind=histogram,role=sink}": 2
+  }},
   "histogram-neg-inf-bound": {"events": [
     {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"http.server.duration.bucket_-inf","kind":"gauge","value":8.0}],"attributes":{"host":"web-1","http.route":"/cart","service.name":"checkout"}},
     {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"http.server.duration.bucket_1","kind":"gauge","value":1.0}],"attributes":{"host":"web-1","http.route":"/cart","service.name":"checkout"}},

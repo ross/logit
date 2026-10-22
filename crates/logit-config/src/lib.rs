@@ -3038,14 +3038,16 @@ pub enum ComponentKind {
     /// Replaces each cumulative point with its difference from the series' previous point, for a
     /// destination that takes only deltas (Datadog, `statsd_out`, a delta-only OTLP backend). It
     /// converts a cumulative monotonic `sum`, a cumulative `histogram` and
-    /// `exponential_histogram`, and a `summary`'s count and sum (its quantiles pass unchanged);
-    /// every other record, a cumulative non-monotonic `sum` included, passes through untouched.
+    /// `exponential_histogram`, and a `summary`'s count and sum (its quantiles pass unchanged). A
+    /// cumulative non-monotonic `sum` converts only when `non_monotonic` says so; every other
+    /// record passes through untouched.
     ///
     /// A series is the metric's name, unit, and kind, the resource, the instrumentation scope,
     /// and the event's attributes; its state lives in memory, so a restart starts every series
     /// over. A point timestamped at or before the series' last one is skipped. A value that went
     /// down, or a start time that moved past the previous point, is a counter restart: the
-    /// point's whole value is the delta. A histogram whose buckets changed is dropped, counted,
+    /// point's whole value is the delta. The exception is a non-monotonic `sum` under
+    /// `non_monotonic: difference`, whose decrease is a negative delta. A histogram whose buckets changed is dropped, counted,
     /// and becomes the new baseline.
     CumulativeToDelta {
         /// What a series' first point emits: `auto` (the default) emits its whole value only when
@@ -3054,6 +3056,11 @@ pub enum ComponentKind {
         /// next point is differenced against.
         #[serde(default)]
         initial_value: InitialValue,
+        /// What a cumulative non-monotonic `sum` does: `pass` (the default) leaves it as it is,
+        /// `difference` converts it with a decrease as a negative delta, and `reset_on_decrease`
+        /// converts it with a decrease as a counter restart, as for a monotonic `sum`.
+        #[serde(default)]
+        non_monotonic: NonMonotonicSums,
         /// Forgets a series no point has updated for this long, by the wall clock; its next point
         /// is then a first point. Set it above the longest gap between a producer's reports.
         /// Must be greater than zero.
@@ -3065,6 +3072,32 @@ pub enum ComponentKind {
         /// `1`.
         #[serde(default = "default_max_series")]
         max_series: usize,
+    },
+    /// Collapses the metric readings in one batch that share a series and a timestamp bucket into
+    /// one reading, for a destination that can't hold two readings of one series at one instant:
+    /// Prometheus remote-write at `1ms`, Datadog at `1s`. Place it last before the sink, since a
+    /// stage after it can make two series equal again.
+    ///
+    /// A series is the metric's name, unit, and kind, the resource, the instrumentation scope,
+    /// and the event's attributes. In each colliding set the latest reading survives with its
+    /// own timestamp. A gauge or cumulative reading before it is replaced by it. Delta sums,
+    /// Datadog rates of one interval, delta histograms, raw samples, set members, sketches, and
+    /// set estimates are merged into it, always keeping the value's type. A Datadog rate is a
+    /// gauge whose `_logit.datadog.type` is `rate`, an increment over its interval, so it's summed
+    /// rather than replaced. A reading that can't merge is forwarded untouched, and the
+    /// sink may still drop it as a duplicate: a `NaN` increment, a delta of another value type
+    /// than the survivor's (`i64` beside `f64`, or `u64` beside `i64`), a total that would
+    /// overflow, a gauge delta, a delta summary, a delta sum or a Datadog rate of booleans, or a
+    /// histogram with other buckets. An event left with no metric, log, or span is discarded. It
+    /// keeps no state between batches, so two batches' readings of one instant both reach the
+    /// sink.
+    DedupTimestamps {
+        /// The bucket width: two readings of one series collide when their timestamps divided by
+        /// it, rounded down, are equal. Match the destination's timestamp resolution: `1ms` for
+        /// Prometheus remote-write, `1s` for Datadog. Must be greater than zero.
+        #[serde(with = "humantime_serde_duration")]
+        #[schemars(with = "String")]
+        precision: Duration,
     },
     /// Forwards stale events, discarding fresh ones, judged against the wall clock. The time
     /// judged is the span's end when the event has a span with one set, otherwise the event's
@@ -3390,6 +3423,9 @@ pub enum ComponentKind {
     // `routing-by-condition-is-lua`): each is expressible as a `lua` component, and referencing
     // one is a deserialization error naming the valid kinds. `sample` came back as a native kind
     // because consistent, keyed sampling is the one thing a `lua` component can't express.
+    // `dedup_timestamps` isn't `dedup`: it collapses a series' readings at one instant within a
+    // batch, which a `lua` component can't do without latency, and the event-level seen-set
+    // `dedup` named stays retired.
     /// InfluxDB 2.x line protocol over HTTP, with bounded output retry.
     // Renamed explicitly: `rename_all = "snake_case"` alone would tag this `influx_db_out`.
     #[serde(rename = "influxdb_out")]
@@ -3460,7 +3496,11 @@ pub enum ComponentKind {
     /// Agent has processed them: send `datadog_trace_in`'s output to `datadog_trace_out` instead.
     /// OpenTelemetry sums, histograms, and summaries go out as Datadog's OTel exporter sends
     /// them; a cumulative counter, histogram, or exponential histogram isn't sent, counted, so
-    /// set an OpenTelemetry SDK to delta temporality.
+    /// set an OpenTelemetry SDK to delta temporality. Datadog keeps one point per series per
+    /// second, so of two series points of one series in one second of a request, the later is
+    /// sent and the earlier left off, counted dropped, or normalized when it's a gauge equal to
+    /// the later; put a `dedup_timestamps` with `precision: 1s` last before this sink to sum two
+    /// counts or rates or keep the later gauge first.
     DatadogOut {
         /// The Datadog API key, sent as `DD-API-KEY` on every request and never logged. Take it
         /// from the environment (`!env DD_API_KEY`) rather than writing it into the file. An
@@ -4226,6 +4266,16 @@ pub enum ComponentKind {
         /// An absolute `http://`/`https://` remote-write URL, path included (typically
         /// `/api/v1/write`): sender mode. Never resolved at config-load time, so a receiver that
         /// isn't up yet is not a config error.
+        ///
+        /// A remote-write series holds one sample per millisecond, so of two readings of one
+        /// series in one millisecond of a batch, the sink sends the later and leaves the earlier
+        /// off, counted `logit.output.metrics.dropped{reason="duplicate_timestamp"}`. When the
+        /// earlier is a state (a gauge other than a Datadog `rate`, or a cumulative kind) equal
+        /// to the later, nothing is lost, and it counts
+        /// `logit.output.metrics.normalized{reason="duplicate_timestamp"}` instead; two equal
+        /// increments or sets of observations, a set's size included, are still two. To merge or
+        /// collapse such readings first, put a `dedup_timestamps` with `precision: 1ms` last
+        /// before this sink.
         #[serde(default)]
         endpoint: Option<String>,
         /// Which remote-write protocol version this sender writes, `1` or `2`. Defaults to `1`,
@@ -4704,6 +4754,24 @@ pub enum InitialValue {
     Keep,
     /// Never anything: the first point only records the baseline.
     Drop,
+}
+
+/// `cumulative_to_delta`'s `non_monotonic` field: what a cumulative non-monotonic `sum` does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum NonMonotonicSums {
+    /// Passed through untouched: its running value is a level, such as an OpenTelemetry
+    /// up-down counter's, and most destinations read it as a gauge. The default.
+    #[default]
+    Pass,
+    /// Converted to a delta that goes negative when the value went down. For an up-down counter
+    /// sent to a destination that takes only deltas. A counter that restarts with no start time
+    /// reads as one large negative delta.
+    Difference,
+    /// Converted as a monotonic `sum` is: a value that went down is a counter restart, and the
+    /// new value is the delta. For a counter its producer can't mark monotonic, such as
+    /// collectd's DERIVE, whose stock types have a minimum of 0.
+    ResetOnDecrease,
 }
 
 /// `cumulative_to_delta`'s `max_staleness` default, the Datadog exporter's and the OpenTelemetry
@@ -6625,11 +6693,37 @@ mod tests {
 
     /// `filter`/`rename`/`throttle`/`dedup` are retired kinds: a config referencing one is a
     /// deserialization error naming the valid kinds, not graph validation's "not implemented".
+    /// `dedup_timestamps` is a different kind and leaves `dedup` retired.
     #[test]
     fn a_retired_kind_is_a_deserialization_error_not_an_unimplemented_kind() {
-        let err = serde_json::from_str::<Component>(r#"{"type": "filter", "sources": ["in"]}"#)
-            .unwrap_err();
-        assert!(err.to_string().contains("unknown variant"), "got: {err}");
+        for kind in ["filter", "rename", "throttle", "dedup"] {
+            let json = format!(r#"{{"type": "{kind}", "sources": ["in"]}}"#);
+            let err = serde_json::from_str::<Component>(&json).unwrap_err();
+            assert!(err.to_string().contains("unknown variant"), "{kind}: {err}");
+        }
+    }
+
+    #[test]
+    fn dedup_timestamps_requires_a_precision() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "dedup_timestamps", "sources": ["in"], "precision": "1ms"}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::DedupTimestamps { precision } => {
+                assert_eq!(precision, Duration::from_millis(1));
+            }
+            other => panic!("expected DedupTimestamps, got {other:?}"),
+        }
+        let err =
+            serde_json::from_str::<Component>(r#"{"type": "dedup_timestamps", "sources": ["in"]}"#)
+                .unwrap_err();
+        assert!(err.to_string().contains("precision"), "got: {err}");
+        let err = serde_json::from_str::<Component>(
+            r#"{"type": "dedup_timestamps", "sources": ["in"], "precision": "1ms", "window": "1s"}"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("unknown field"), "got: {err}");
     }
 
     #[test]
@@ -7288,8 +7382,14 @@ mod tests {
         let component: Component =
             serde_json::from_str(r#"{"type": "cumulative_to_delta", "sources": ["in"]}"#).unwrap();
         match component.kind {
-            ComponentKind::CumulativeToDelta { initial_value, max_staleness, max_series } => {
+            ComponentKind::CumulativeToDelta {
+                initial_value,
+                non_monotonic,
+                max_staleness,
+                max_series,
+            } => {
                 assert_eq!(initial_value, InitialValue::Auto);
+                assert_eq!(non_monotonic, NonMonotonicSums::Pass);
                 assert_eq!(max_staleness, Duration::from_secs(3600));
                 assert_eq!(max_series, 10_000);
             }
@@ -7297,12 +7397,18 @@ mod tests {
         }
         let component: Component = serde_json::from_str(
             r#"{"type": "cumulative_to_delta", "sources": ["in"], "initial_value": "keep",
-                "max_staleness": "10m", "max_series": 5}"#,
+                "non_monotonic": "reset_on_decrease", "max_staleness": "10m", "max_series": 5}"#,
         )
         .unwrap();
         match component.kind {
-            ComponentKind::CumulativeToDelta { initial_value, max_staleness, max_series } => {
+            ComponentKind::CumulativeToDelta {
+                initial_value,
+                non_monotonic,
+                max_staleness,
+                max_series,
+            } => {
                 assert_eq!(initial_value, InitialValue::Keep);
+                assert_eq!(non_monotonic, NonMonotonicSums::ResetOnDecrease);
                 assert_eq!(max_staleness, Duration::from_secs(600));
                 assert_eq!(max_series, 5);
             }

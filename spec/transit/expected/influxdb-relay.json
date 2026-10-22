@@ -23,7 +23,9 @@
   "multi-field": {"events": [
     {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"system.load1","kind":"gauge","value":0.5},{"name":"system.procs","kind":"gauge","value":120},{"name":"system.uptime","kind":"gauge","value":3600},{"name":"system.healthy","kind":"gauge","value":true}],"attributes":{"_logit.influxdb.measurement":"system","host":"web-01"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}},"types":{"/metrics/2/value":"u64"}}
   ], "counters": {}},
-  "no-carrier": {"events": [], "counters": {}},
+  "no-carrier": {"events": [], "counters": {
+    "logit.output.events.skipped{component=out,kind=influxdb_out,reason=no_metrics,role=sink}": 1
+  }},
   "precision-ms": {"events": [
     {"timestamp":"2027-01-15T07:59:50.123000000Z","metrics":[{"name":"cpu.usage","kind":"gauge","value":1.5}],"attributes":{"_logit.influxdb.measurement":"cpu","host":"web-01"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}}}
   ], "counters": {}},

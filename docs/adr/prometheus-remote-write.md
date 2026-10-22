@@ -1,6 +1,6 @@
 ---
 created: 2026-09-17
-updated: 2026-10-20
+updated: 2026-10-21
 ---
 
 # Prometheus remote-write: a receiver on `prometheus_in`, a sender on `prometheus_out`
@@ -212,7 +212,10 @@ omit today: `families_to_events` inserts `_logit.prometheus.timestamp: true` whe
 `Series.timestamp` is `Some` (`crates/logit-proto/src/prometheus/mod.rs`), and on this transport it
 always is. `PrometheusDecoder::with_timestamp_marker(bool)` defaults to **`true`**, which is exactly
 today's behaviour for the scrape path, and the receiver passes `false`: `Event::timestamp` is still
-set from the sample, only the marker attribute is omitted.
+set from the sample, only the marker attribute is omitted. The missing marker is one of the
+pair's permitted normalizations
+([ADR `prometheus-scrape-and-exposition`](prometheus-scrape-and-exposition.md)'s "Permitted
+normalizations for this pair").
 
 The sender goes the other way and **always emits a timestamp**, via
 `PrometheusEncoder::with_timestamps_always(true)`, because the wire has no way to omit one. Net:
@@ -505,8 +508,8 @@ hand-written `generated/mod.rs` mirrors OTLP's `#[path]`/`#[rustfmt::skip]` nest
   as a stale marker; and the sender does no cross-batch reordering, so a fan-in topology writing one
   series can draw `400`s from a receiver with no out-of-order window. Five more the build surfaced
   that this ADR had not: same-millisecond samples collapse to the later reading
-  (`degraded{reason="sub_ms_collapsed"}`) — the one permitted normalization that loses a *reading*
-  rather than a rendering; a closed fanout during shutdown still answers `204`, which is
+  (`degraded{reason="sub_ms_collapsed"}` then; a counted drop since the 2026-10-21 amendment) —
+  the one permitted normalization that loses a *reading* rather than a rendering; a closed fanout during shutdown still answers `204`, which is
   `docs/design/pipeline-graph.md`'s own closed-downstream open question reaching a transport with a
   wire acknowledgement to be wrong about; `tls:` written under `prometheus_in` was silently
   ignored, since no `ComponentKind` variant denied unknown fields (now rejected at load, per
@@ -585,7 +588,8 @@ report:
   every reason; and `exemplar_dropped` is `exemplar_omitted` on both ends.
 
 A flagged multi-series record stays `skipped{reason="no_recorded_value"}`, and
-`degraded{reason="sub_ms_collapsed"}` is unchanged.
+`degraded{reason="sub_ms_collapsed"}` is unchanged (until the 2026-10-21 amendment below makes it
+a drop).
 
 ## Amendment (2026-10-13): the timestamp marker and the target are private
 
@@ -624,3 +628,33 @@ doesn't add it to the errors that make a `400`. So the request still gets its `2
 response class reads `Clean`, and the exemplar was lost with nothing on the sender's side to show
 it. Leaving it out at the sender turns that loss into a counted one and changes no response
 class.
+
+## Amendment (2026-10-21): a collapsed reading is a counted drop
+
+The sender counts every reading it removes because a later reading of its series shares its
+millisecond as `logit.output.metrics.dropped{reason="duplicate_timestamp"}`, once per reading (a
+histogram reading counts once, not once per wire sample) and once per batch, with a throttled
+`duplicate_timestamp` diagnostic naming the remedy. Two paths collapse a reading, and both count:
+`remote_write::encode_counted`'s sub-millisecond collapse, and `events_to_families`' latest-wins
+pass over two readings at one nanosecond, which counts only for remote-write.
+`degraded{reason="sub_ms_collapsed"}` is gone, and the collapse is no longer on the codec's list of
+permitted normalizations: the reading never leaves `logit`, which is loss by
+[ADR `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md)'s definition.
+
+A removed state (a gauge other than a Datadog `rate`, or a cumulative kind) equal to the one
+sent is the exception: the receiver stores the same sample, so nothing is lost, and it counts
+`logit.output.metrics.normalized{reason="duplicate_timestamp"}` with no diagnostic.
+[ADR `dedup-timestamps-transform`](dedup-timestamps-transform.md)'s "The sink-side counter"
+defines a state and equal. A `samples` or distribution summary and a set's size gauge are sets of
+observations, and a `rate` an increment, so an equal one still counts `dropped`.
+
+The collapse stays, for a different reason than this record gave. Prometheus 3.15.1 and Mimir
+3.2.2, run 2026-10-21, don't reject two samples of one series at one millisecond inside one
+request: they answer `2xx`, keep the first, and drop the second silently. Only a later request
+repeating the series and millisecond with a new value draws `400 duplicate sample for timestamp`.
+So the sender collapses a pair to send the later reading and to count the loss, not to avoid a
+`400`. The cross-request case stays open (`docs/known-gaps/prometheus.md`). The remedy is a
+`dedup_timestamps` with `precision: 1ms` ahead of the sink
+([ADR `dedup-timestamps-transform`](dedup-timestamps-transform.md)), or `aggregate` for a live
+delta flow. The exposition registry's overwrite of one series' value between scrapes is the pull
+model working, and stays uncounted.

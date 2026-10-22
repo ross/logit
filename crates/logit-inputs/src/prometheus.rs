@@ -2561,6 +2561,7 @@ mod tests {
     fn gauge_family(name: &str, label: (&str, &str), value: f64, timestamp: i64) -> MetricFamily {
         let mut family = MetricFamily::new(name, FamilyType::Gauge);
         family.series.push(Series {
+            increment: false,
             labels: vec![(label.0.to_string(), label.1.to_string())],
             point: Point::Gauge(value),
             timestamp: Some(timestamp),
@@ -3211,6 +3212,7 @@ mod tests {
 
         let mut family = MetricFamily::new("request_seconds", FamilyType::Histogram);
         family.series.push(Series {
+            increment: false,
             labels: vec![("job".to_string(), "api".to_string())],
             // Cumulative counts must never decrease; `5` after `9` makes this series unmappable.
             point: Point::Histogram {
@@ -3258,6 +3260,7 @@ mod tests {
 
         let mut family = MetricFamily::new("request_seconds", FamilyType::Histogram);
         family.series.push(Series {
+            increment: false,
             labels: vec![("job".to_string(), "api".to_string())],
             // Two `_bucket` samples, a `_sum` and a `_count`: four on the wire, one event here.
             point: Point::Histogram {
@@ -3297,6 +3300,7 @@ mod tests {
 
         let mut family = MetricFamily::new("request_seconds", FamilyType::Summary);
         family.series.push(Series {
+            increment: false,
             labels: vec![("job".to_string(), "api".to_string())],
             point: Point::Summary {
                 quantiles: vec![(0.5, 1.0), (0.9, 2.0)],

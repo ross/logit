@@ -1828,12 +1828,14 @@ pub fn process_batch(
 
     let process_timer = telemetry.timer("logit.component.process.duration");
     let before = events.len();
+    transform.begin_batch(&resource, scope.as_ref(), &mut events);
     events.retain_mut(|event| transform.process_into(&resource, event, emitted));
     // Inside the timer: work a transform defers to `end_batch` is still this node's per-batch
     // cost (`docs/design/internal-telemetry.md`).
     transform.end_batch();
     drop(process_timer);
-    // Before the append, so only parents `process_into` returned `false` for count.
+    // Before the append, so only the events `begin_batch` removed and the parents `process_into`
+    // returned `false` for count.
     let discarded = (before - events.len()) as u64;
     if discarded > 0 {
         telemetry.count("logit.component.events.discarded", discarded as f64, &[]);
@@ -3552,6 +3554,50 @@ mod tests {
         .expect("survivors and children");
 
         assert_eq!(timestamps(&out), [2, 4, 101, 102, 201, 202, 301, 302, 401, 402]);
+        let totals = Totals::of(probe.registry().drain(0));
+        assert_eq!(totals.sum("logit.component.events.discarded", &[]), 2.0);
+    }
+
+    /// Drops the odd-timestamped events in `begin_batch` and doubles every timestamp in
+    /// `process`, so a test can see that `begin_batch` ran first.
+    struct BatchHookTransform {
+        saw_scope: bool,
+    }
+
+    impl Transform for BatchHookTransform {
+        fn process(&mut self, _resource: &Arc<Resource>, event: &mut Event) -> bool {
+            event.timestamp *= 2;
+            true
+        }
+
+        fn begin_batch(
+            &mut self,
+            _resource: &Arc<Resource>,
+            scope: Option<&Arc<Scope>>,
+            events: &mut Vec<Event>,
+        ) {
+            self.saw_scope = scope.is_some();
+            events.retain(|e| e.timestamp % 2 == 0);
+        }
+    }
+
+    /// `begin_batch` sees the batch before `process`, and what it removes counts as discarded.
+    #[test]
+    fn process_batch_runs_begin_batch_first_and_counts_what_it_removes() {
+        let mut transform = BatchHookTransform { saw_scope: false };
+        let probe = TelemetryProbe::new();
+        let telemetry = probe.telemetry("hook", "x", "transform");
+
+        let out = process_batch(
+            &mut transform,
+            timestamped_batch(&[1, 2, 3, 4]),
+            &mut Vec::new(),
+            &telemetry,
+        )
+        .expect("two events survive");
+
+        assert_eq!(timestamps(&out), [4, 8]);
+        assert!(transform.saw_scope);
         let totals = Totals::of(probe.registry().drain(0));
         assert_eq!(totals.sum("logit.component.events.discarded", &[]), 2.0);
     }

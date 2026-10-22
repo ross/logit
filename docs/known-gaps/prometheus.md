@@ -86,6 +86,38 @@ Entry format and the other areas: [the known-gaps index](README.md).
   - **Workaround:** use a topology that doesn't split one series across branches, or a receiver
     with an out-of-order window. The sink won't buffer its way out: a reorder window is
     `aggregate`-shaped state a sink doesn't hold.
+- **A later batch repeating a series and millisecond with a new value draws a `400` that drops
+  the whole batch.** `prometheus_out(endpoint)` collapses readings of one series that share a
+  millisecond within one batch, keeping the later and counting the rest
+  `logit.output.metrics.dropped{reason="duplicate_timestamp"}`, or `normalized` for a state
+  equal to the one kept, and `dedup_timestamps` works within
+  one batch too ([ADR `dedup-timestamps-transform`](../adr/dedup-timestamps-transform.md)'s
+  "Scope"). Neither sees across batches. Prometheus 3.15.1 and Mimir 3.2.2, run 2026-10-21, accept a
+  repeat with the same value silently and answer one with a new value
+  `400 duplicate sample for timestamp`.
+  - **Consequence:** the sink reads the `400` as `Rejected` and drops the batch, counted
+    `batches.dropped{reason="rejected"}`. Against Prometheus under remote-write 1.0, the sink's
+    default `version:`, that loses every clean sample in the batch, because Prometheus stored
+    none of them. Against Prometheus under 2.0, or Mimir under either version, the clean samples
+    were stored, so the drop counter overstates the loss.
+  - **Workaround:** keep one series' readings of one millisecond in one batch: a source that
+    stamps sub-millisecond readings rarely splits them across batches, and an `aggregate` upstream
+    leaves one point per series per window.
+  - **To close:** undecided. Reading the `400` body, which names the series, could tell a batch
+    whose clean samples were stored from one whose weren't; making `version: 2` the default would
+    make the clean samples stored on Prometheus too.
+- **Two metric names that sanitize onto one merge across batches, uncounted.** `prometheus_out`
+  writes a name's `.`, `-`, and other characters outside the metric-name grammar as `_`, counted
+  `logit.output.metrics.normalized{reason="name_sanitized"}`. Within one batch, two names that
+  land on one wire name keep one family and count the other's records
+  `metrics.dropped{reason="name_collision"}` (`crates/logit-proto/src/prometheus/mod.rs`'s encode
+  table). Across batches nothing compares them: the exposition registry keys a family by its wire
+  name, and a remote-write receiver keys a series by its labels.
+  - **Consequence:** `http.requests` in one batch and `http_requests` in the next are one series,
+    each batch's sample replacing the other's, with no `name_collision` for either. Label names
+    merge the same way across batches.
+  - **Workaround:** a nonzero `metrics.normalized{reason="name_sanitized"}` says some name was
+    rewritten; rename upstream (a `lua` stage) so no two producers' names sanitize onto one.
 - **`prometheus_in`'s scrape client still follows HTTP redirects.** It builds its own
   `reqwest::Client` with no redirect policy (`crates/logit-inputs/src/prometheus.rs`'s scrape
   client), so it inherits `reqwest`'s `limited(10)`.
@@ -136,7 +168,7 @@ Entry format and the other areas: [the known-gaps index](README.md).
     `_sum` (verified, leg 6).
   - **Revisit trigger:** closes with that native-histogram row.
 - **A `Distribution` isn't re-binned onto VictoriaMetrics's `vmrange` buckets.** Both are
-  log-bucketed, but `prometheus_out` sends a `Distribution` as the five-quantile summary it sends
+  log-bucketed, but `prometheus_out` sends a `Distribution` as the fixed-quantile summary it sends
   any Prometheus receiver. VictoriaMetrics's histogram functions (`prometheus_buckets()`,
   `histogram_quantile()` over `vmrange`) don't apply to it, and the quantiles can't be merged
   across series. VictoriaMetrics doesn't impose this loss: re-binning is a mapping nobody has

@@ -8,7 +8,9 @@ updated: 2026-10-21
 ## Status
 Accepted. Supersedes, in part, [ADR `routing-by-condition-is-lua`](routing-by-condition-is-lua.md):
 its `sample` clause only. That ADR's core holding — no native predicate language, no
-`filter`/`rename`/`throttle`/`dedup` kinds — stands unchanged.
+`filter`/`rename`/`throttle`/`dedup` kinds — stands unchanged. `dedup_timestamps`
+([ADR `dedup-timestamps-transform`](dedup-timestamps-transform.md)) collapses a series' readings
+at one instant and isn't the retired event-level `dedup`.
 
 ## Context
 
@@ -161,7 +163,8 @@ exists for the central-collector rates where per-event telemetry calls are the c
 - **The hash contract is frozen.** XXH64 seed 0 over the canonicalization table above, pinned by
   test vectors. A change is a wire-breaking change between `logit` versions and needs its own ADR.
 - `routing-by-condition-is-lua`'s Status, Context, and Decision carry "superseded in part" markers
-  pointing here. `filter`, `rename`, `throttle`, and `dedup` stay retired;
+  pointing here. `filter`, `rename`, `throttle`, and `dedup` stay retired (`dedup_timestamps` is
+  a series-level collapse, not the event-level `dedup`);
   `docs/known-gaps/transforms.md`'s entry narrows to throttling, dedup, and operator-shaped
   conditions.
 - `always_keep` is per leg. An operator who wants a flagged request kept end to end places the

@@ -104,8 +104,10 @@
 //! One series (or sketch) per `(event, MetricRecord)`, carrying one point, but for the series a
 //! histogram or summary expands to (below). Carriers are read from
 //! the resource merged with the event's attributes (event wins); every other attribute renders as
-//! a tag by [`tags`]'s rule. A `Map`/`Bytes`/`Null` tag value, or a carrier of the wrong `Value`
-//! type, counts `logit.output.tags.omitted{reason="unrepresentable"}`.
+//! a tag by [`tags`]'s rule. A `Bool(false)`/`Map`/`Bytes`/`Null` tag value, or a carrier of the
+//! wrong `Value` type, counts `logit.output.tags.omitted{reason="unrepresentable"}`. An event with
+//! no metric, log, or span takes no route, counted `logit.output.events.skipped{reason="no_payload"}`
+//! by `datadog_out`'s routing ([`DatadogEncoder::events_without_payload`]).
 //!
 //! The tables below are generated from `datadog_out`'s column of `spec/transit/mapping.yaml`, the
 //! canonical copy, by `script/transit docs`, and a test fails when they're stale: change the table
@@ -126,7 +128,7 @@
 //! | `sum/delta_monotonic` | exact | -- | A series `count` point, its `interval` from the `_logit.datadog.interval` carrier or 0, which datadog_in reads back as a delta monotonic sum. |
 //! | `sum/delta_nonmonotonic` | degraded | `logit.output.metrics.degraded{metric_kind=non_monotonic_sum}` | A series `count` point of the raw value, as Datadog's exporter sends any delta sum, which datadog_in reads back as a monotonic delta sum. |
 //! | `sum/cumulative_monotonic` | dropped | `logit.output.metrics.dropped{reason=unresolved_cumulative}` | Datadog's exporter differences a running total into a delta first, so it's dropped, with a throttled `unresolved_cumulative` warning; a `cumulative_to_delta` upstream makes it a delta `count`. |
-//! | `sum/cumulative_nonmonotonic` | degraded | `logit.output.metrics.degraded{metric_kind=non_monotonic_sum}` | A series `gauge` point of the running value, as Datadog's exporter sends it, which datadog_in reads back as a gauge. |
+//! | `sum/cumulative_nonmonotonic` | degraded | `logit.output.metrics.degraded{metric_kind=non_monotonic_sum}` | A series `gauge` point of the running value, as Datadog's exporter sends it, which datadog_in reads back as a gauge; a `cumulative_to_delta` upstream with `non_monotonic: difference` or `reset_on_decrease` makes it a delta `count`. |
 //! | `sum/f64` | exact | -- | The point's double. |
 //! | `sum/i64` | normalized | `integer_as_double` | The point's double, the integer's nearest `f64`, read back as a float. |
 //! | `sum/u64` | normalized | `integer_as_double` | The point's double, the integer's nearest `f64`, read back as a float. |
@@ -136,6 +138,8 @@
 //! | `gauge/u64` | normalized | `integer_as_double` | The point's double, the integer's nearest `f64`, read back as a float. |
 //! | `gauge/bool` | normalized | `bool_as_double`; `logit.output.metrics.normalized{reason=bool_value}` | The point's double, `1` or `0`, read back as a float. |
 //! | `gauge/negative` | exact | -- | A negative double, as any other. |
+//! | `gauge/prometheus_info` | exact | -- | As any other gauge; the type carrier isn't written. |
+//! | `gauge/prometheus_stateset` | exact | -- | As any other gauge; the type carrier isn't written. |
 //! | `gauge_delta/f64` | dropped | `logit.output.metrics.dropped{reason=unresolved_gauge_delta}` | Nothing upstream resolved the relative gauge to an absolute one, so the series encoders drop it. |
 //! | `gauge_delta/i64` | dropped | `logit.output.metrics.dropped{reason=unresolved_gauge_delta}` | Nothing upstream resolved the relative gauge to an absolute one, so the series encoders drop it. |
 //! | `gauge_delta/u64` | dropped | `logit.output.metrics.dropped{reason=unresolved_gauge_delta}` | Nothing upstream resolved the relative gauge to an absolute one, so the series encoders drop it. |
@@ -143,10 +147,10 @@
 //! | `samples` | exact | -- | A distribution point holding every value, which datadog_in reads back as samples at rate 1. |
 //! | `set_members` | skipped | `logit.output.metrics.skipped{metric_kind=set_members}` | The series encoders have no form for set members, so none is written. |
 //! | `distribution` | exact | -- | A sketch under `Mapping::agent`, bin for bin, with its exact count, sum, min, and max; `avg` is recomputed from them. |
-//! | `set` | degraded | `logit.output.metrics.degraded{reason=set_estimate}` | A series `gauge` of the estimate, the Agent's `s`; the registers are gone. |
+//! | `set` | degraded | `logit.output.metrics.degraded{metric_kind=set}` | A series `gauge` of the estimate, the Agent's `s`; the registers are gone. |
 //! | `histogram/delta`, under `histograms: {"mode":"counters","send_aggregation_metrics":true}` | degraded | `logit.output.metrics.degraded{metric_kind=histogram}` | Under `histograms.mode: counters`, a `<name>.bucket` count per bucket tagged `lower_bound` and `upper_bound` in the exporter's `formatFloat` form, beside the `.count`, `.sum`, `.min`, and `.max` series. |
 //! | `histogram/delta`, under `histograms: {"mode":"nobuckets","send_aggregation_metrics":true}` | degraded | `logit.output.metrics.degraded{metric_kind=histogram}` | Under `histograms.mode: nobuckets`, the `.count`, `.sum`, `.min`, and `.max` series alone. |
-//! | `histogram/delta`, otherwise | degraded | `logit.output.metrics.degraded{metric_kind=histogram}` | A sketch under `Mapping::agent` with its counts spread over the buckets as Datadog's exporter spreads them, and the point's count, sum, and average, which datadog_in reads back as a distribution. |
+//! | `histogram/delta`, otherwise | degraded | `logit.output.metrics.degraded{metric_kind=histogram}` | A sketch under `Mapping::agent` with its counts spread over the buckets as Datadog's exporter spreads them, and the point's count, sum, and average, which datadog_in reads back as a distribution. A histogram whose one bucket is `+Inf`, such as otlp_in's reading of a bucketless point, keys every observation at the Agent's key -1, about `-9.94e-10`, as the exporter does. |
 //! | `histogram/cumulative` | dropped | `logit.output.metrics.dropped{reason=unresolved_cumulative}` | Datadog's exporter differences a running total into a delta first, so it's dropped, with a throttled `unresolved_cumulative` warning; a `cumulative_to_delta` upstream makes it a delta histogram. |
 //! | `histogram/nan_bound`, under `histograms: {"mode":"counters","send_aggregation_metrics":true}` | degraded | `logit.output.metrics.degraded{metric_kind=histogram}` | Under `histograms.mode: counters`, a `NaN` bound is one more bucket's bound: the `<name>.bucket` counts beside it carry a `nan` `lower_bound` or `upper_bound` tag, the exporter's `formatFloat` form. |
 //! | `histogram/nan_bound`, under `histograms: {"mode":"nobuckets","send_aggregation_metrics":true}` | degraded | `logit.output.metrics.degraded{metric_kind=histogram}` | Under `histograms.mode: nobuckets`, no bucket is written, so the bound goes with the rest. |
@@ -154,9 +158,10 @@
 //! | `histogram/neg_inf_bound`, under `histograms: {"mode":"counters","send_aggregation_metrics":true}` | degraded | `logit.output.metrics.degraded{metric_kind=histogram}` | Under `histograms.mode: counters`, a `-Inf` bound is one more bucket's bound: the `<name>.bucket` counts beside it carry a `-inf` `lower_bound` or `upper_bound` tag, the exporter's `formatFloat` form. |
 //! | `histogram/neg_inf_bound`, under `histograms: {"mode":"nobuckets","send_aggregation_metrics":true}` | degraded | `logit.output.metrics.degraded{metric_kind=histogram}` | Under `histograms.mode: nobuckets`, no bucket is written, so the bound goes with the rest. |
 //! | `histogram/neg_inf_bound`, otherwise | degraded | `logit.output.metrics.degraded{metric_kind=histogram}` | In the sketch, as Datadog's exporter builds it on amd64: Go's `int(-Inf)` keys the bound at the Agent's key -1, so the `-Inf` bucket's count lands near `-1e-9` rather than below every other bucket, and the sketch's `min` is that bin's value. |
+//! | `histogram/gauge_histogram` | exact | -- | As `histogram/cumulative`; the type carrier isn't written. |
 //! | `exponential_histogram/delta` | degraded | `logit.output.metrics.degraded{metric_kind=exponential_histogram}` | A sketch under every `histograms.mode`, its buckets re-mapped onto the Agent's bins as Datadog's exporter re-maps them, with the point's count, sum, and average, which datadog_in reads back as a distribution; with `send_aggregation_metrics`, the `.count`, `.sum`, `.min`, and `.max` series too. |
 //! | `exponential_histogram/cumulative` | dropped | `logit.output.metrics.dropped{reason=unresolved_cumulative}` | Datadog's exporter can't send a cumulative exponential histogram, so it's dropped, with a throttled `unresolved_cumulative` warning; a `cumulative_to_delta` upstream makes it a delta one. |
-//! | `summary/delta` | degraded | -- | A `<name>.quantile` gauge per quantile tagged `quantile:<q>`, and `.count` (no unit) and `.sum` as `count` points, as Datadog's exporter writes a summary it differenced; datadog_in reads them back as gauges and counts. |
+//! | `summary/delta` | degraded | `logit.output.metrics.degraded{metric_kind=summary}` | A `<name>.quantile` gauge per quantile tagged `quantile:<q>`, and `.count` (no unit) and `.sum` as `count` points, as Datadog's exporter writes a summary it differenced, counted once per record; datadog_in reads them back as gauges and counts. |
 //! | `summary/cumulative` | degraded | `logit.output.fields.dropped{reason=unresolved_cumulative}` | A `<name>.quantile` gauge per quantile tagged `quantile:<q>`, which datadog_in reads back as gauges. The running count and sum need differencing first, so they're dropped, counted, with a throttled `unresolved_cumulative` warning; a `cumulative_to_delta` upstream makes them sendable. |
 //! | `record/no_recorded_value` | skipped | `logit.output.metrics.skipped{reason=no_recorded_value}` | Datadog has no marker for a point with no recorded value, so it isn't written. |
 //! | `record/no_recorded_value_delta_sum` | skipped | `logit.output.metrics.skipped{reason=no_recorded_value}` | Datadog has no marker for a point with no recorded value, so it isn't written. |
@@ -164,37 +169,40 @@
 //! | `record/service_check` | exact | -- | Record 0 of a service check goes to the check route alone, and datadog_in reads it back as the same status gauge and carriers. |
 //! | `record/sample_rate` | degraded | `logit.output.metrics.degraded{reason=sample_rate_expanded}` | The distribution route has no sample rate, so each value is repeated by its weight, the inverse of the rate rounded, and datadog_in reads the values back at rate 1. |
 //! | `record/superseded` | exact | -- | Each record is its own point at its own timestamp. |
-//! | `record/same_instant` | exact | -- | Each record is its own point. |
-//! | `record/same_millisecond` | exact | -- | Each record is its own point; series timestamps are whole seconds. |
+//! | `record/same_instant` | dropped | `logit.output.metrics.dropped{reason=duplicate_timestamp}` | Datadog keeps one point per series per second, the higher of two in one request, so the sink sends the later point and drops this one, counted, when it differs from the one sent or is an increment: two equal delta counts or `rate`s are two events. Only the series route collapses: a `samples` record leaves on the distribution-points route, where Datadog keeps both, and a `distribution`, an `exponential_histogram`, and a `histogram` under `histograms.mode: distributions` on the sketches route, so they don't reach this row, unless `histograms.send_aggregation_metrics` also writes a histogram's `.count`, `.sum`, `.min`, and `.max` series, which collapse. A `dedup_timestamps` with `precision: 1s` upstream merges or collapses the pair instead. |
+//! | `record/same_instant_equal` | normalized | `duplicate_timestamp`; `logit.output.metrics.normalized{reason=duplicate_timestamp}` | Datadog keeps one point per series per second, so the sink sends the later point and leaves this state, equal to it, off, counted: Datadog stores the same point either way. Only the series route collapses, as for `record/same_instant`. |
+//! | `record/same_millisecond` | dropped | `logit.output.metrics.dropped{reason=duplicate_timestamp}` | Series timestamps are whole seconds, and Datadog keeps one point per series per second, so the sink sends the later point and drops this one, counted, as for `record/same_instant`. |
+//! | `record/same_millisecond_equal` | normalized | `duplicate_timestamp`; `logit.output.metrics.normalized{reason=duplicate_timestamp}` | Series timestamps are whole seconds, so the sink sends the later point and leaves this one, equal to it, off, counted, as for `record/same_instant_equal`. |
 //! | `record/non_finite` | dropped | `logit.output.metrics.dropped{reason=non_finite_value}` | JSON has no `NaN` or infinity, so the point isn't written. |
 //! | `log/dogstatsd_event` | exact | -- | One `/api/v1/events` request per event, read back with the same `_logit.statsd.event.*` carriers. |
 //! | `log/plain` | exact | -- | One object of a `/api/v2/logs` body, its attributes as top-level keys. |
 //! | `span/alone` | exact | -- | A span of an `AgentPayload` chunk on the trace route, read back with its kind as a `span.kind` attribute and its trace id's high half as `_dd.p.tid` (the `attributes` rows). |
 //! | `span/no_wire_form` | degraded | `logit.output.spans.degraded{reason=no_wire_form}` | Datadog has no field for `status: ok`, a status message, `trace_state`, span flags, or a dropped count, so each is dropped, counted, and the span reads back without it. |
-//! | `event/attributes_only` | skipped | uncounted | An event with no metric, log, or span takes none of the intake's routes, so no request carries it, uncounted. |
-//! | `event/string_only` | skipped | uncounted | An InfluxDB point whose fields are all strings has no metric, so it takes none of the intake's routes and no request carries it, uncounted. |
+//! | `event/attributes_only` | skipped | `logit.output.events.skipped{reason=no_payload}` | An event with no metric, log, or span takes none of the intake's routes, so no request carries it. |
+//! | `event/string_only` | skipped | `logit.output.events.skipped{reason=no_payload}` | An InfluxDB point whose fields are all strings has no metric, so it takes none of the intake's routes and no request carries it. |
 //!
 //! Per field of a record that reaches the wire, attribute shape, and payload beside metrics:
 //!
 //! | Row | Class | Reason or counter | What a consumer sees |
 //! |---|---|---|---|
 //! | `record/unit` | exact | -- | The series' `unit`. |
-//! | `record/description` | lost | uncounted | Datadog's intake has no description; it isn't written or counted. |
-//! | `record/start_timestamp` | lost | uncounted | A series point has no start time; it isn't written or counted. |
-//! | `record/exemplars` | lost | uncounted | Datadog's intake has no exemplars; they aren't written or counted. |
-//! | `record/unit_on_distribution` | lost | uncounted | Distribution points and sketches have no unit field, so a `samples` or `distribution` record's unit is left off, uncounted; only the series routes write one. |
-//! | `record/sample_rate_unweighted` | lost | uncounted | A rate below 1 that rounds to weight 1, such as 0.8, writes each value once on the distribution route, which has no rate, so datadog_in reads it back at rate 1, uncounted. |
+//! | `record/description` | lost | structural | Datadog's intake has no description, so none is written. |
+//! | `record/start_timestamp` | lost | structural | A series point has no start time, so none is written. |
+//! | `record/exemplars` | lost | structural | Datadog's intake has no exemplars, so none are written. |
+//! | `record/unit_on_distribution` | lost | structural | Distribution points and sketches have no unit field, so a `samples` or `distribution` record's unit is left off; only the series routes write one. |
+//! | `record/sample_rate_unweighted` | lost | `logit.output.metrics.degraded{reason=sample_rate_rounded}` | A rate below 1 that rounds to weight 1, such as 0.8, writes each value once on the distribution route, which has no rate, so datadog_in reads it back at rate 1, counted once per record. |
 //! | `attributes/string_value` | normalized | `host_tag` | A `key:value` tag. A `host` attribute on a metric with no `host.name` is the host and not a tag, which datadog_in reads back as `host.name`. On a Datadog event or service check with no non-empty host carrier, `host.name`, else `host`, is the host and not a tag, which datadog_in reads back as that carrier. |
-//! | `attributes/bool_value` | lost | uncounted | `true` is a bare `key` tag, read back as `true`; `false` writes no tag at all, uncounted. |
+//! | `attributes/bool_value` | lost | `logit.output.tags.omitted{reason=unrepresentable}` | `true` is a bare `key` tag, read back as `true`; `false` has no Datadog tag form, so it writes no tag and is counted. |
 //! | `attributes/number_value` | normalized | `stringified` | A `key:<number>` tag, read back as a string. |
 //! | `attributes/array_value` | normalized | `stringified` | One tag per element in order, which datadog_in folds back into an array of strings, so a number element reads back as its text. |
 //! | `attributes/map_value` | lost | `logit.output.tags.omitted{reason=unrepresentable}` | A tag has no nested form, so a map is left off, counted. |
 //! | `attributes/bytes_value` | lost | `logit.output.tags.omitted{reason=unrepresentable}` | A tag has no bytes form, so the value is left off, counted. |
 //! | `attributes/timestamp_value` | normalized | `stringified` | A `key:<RFC 3339>` tag, read back as a string. |
 //! | `attributes/private_carrier` | lost | `logit.output.tags.omitted{reason=no_wire_form}` | A `_logit.datadog.*` carrier rides in its own wire field; one the route has no field for is left off, counted. |
-//! | `attributes/foreign_carrier` | lost | uncounted | Another protocol's `_logit.` carrier is never a tag; it isn't written or counted. The `_logit.statsd.event.*` and `_logit.statsd.service_check.*` carriers are read as the Datadog fields they name. |
+//! | `attributes/prometheus_target` | lost | structural | The scrape target is private and never a tag, so it's left off. |
+//! | `attributes/foreign_carrier` | lost | structural | Another protocol's `_logit.` carrier is private and never a tag, so it's left off. The `_logit.statsd.event.*` and `_logit.statsd.service_check.*` carriers are read as the Datadog fields they name. |
 //! | `attributes/resource_attribute` | normalized | `resource_as_tag` | Merged into the record's tags, so it reads back as an event attribute. |
-//! | `attributes/scope` | lost | uncounted | Datadog has no instrumentation scope; it isn't written or counted. |
+//! | `attributes/scope` | lost | structural | Datadog has no instrumentation scope, so none is written. |
 //! | `attributes/datadog_carrier_log` | lost | uncounted | A `_logit.datadog.*` carrier on a log, a Datadog event, or a service check that the route has no field for is left off, uncounted, where the metrics routes count one as `no_wire_form`; the events route's public form has no field for the Agent envelope's `_logit.datadog.agent.hostname`. |
 //! | `attributes/no_host` | normalized | `default_host` | A record with no host and no hostless mark leaves with the process hostname as its host, which datadog_in reads back as `host.name`, a log's `hostname`, or an event's or service check's host carrier; a span keeps its own hostnames. |
 //! | `attributes/log_status` | normalized | `status_from_severity` | A log with a severity and no `status` attribute leaves with `status` set to the severity's name, which datadog_in reads back as a `status` attribute beside the severity. |
@@ -228,6 +236,7 @@
 //! | record 0 of a service check (`_logit.statsd.service_check.name` present and a `Gauge` first metric) | left for the service-checks route, uncounted; any later record encodes as usual, without the check's `_logit.statsd.service_check.*` carriers as tags | -- |
 //! | every record of an APM stats event ([`stats::ATTR_STATS_NAME`] present; [`is_datadog_stats`]) | left for the stats routes, uncounted: its `Sum`s and summary `Distribution`s are a stats group, not series or sketches | -- |
 //! | `Event::timestamp` | whole seconds, rounded toward negative infinity | -- |
+//! | two series points in one batch (under `datadog_out`, planned before its request cuts; [`series::SeriesDuplicates`]) with one metric name, one tag set (order and repeats aside), one host, device, and resources, in one second | the latest point is written, the later in batch order on a tie; Datadog would keep the higher of the two, not the later, and never sums two counts. The type, unit, interval, and origin aren't part of the key. Distribution points and sketches aren't collapsed | per point left off: `logit.output.metrics.normalized{reason="duplicate_timestamp"}` when both records are states (a gauge not written as a `rate`, or a cumulative kind) and it equals the point written (the value by its bits, and the type, unit, interval, source type, and origin), else `logit.output.metrics.dropped{reason="duplicate_timestamp"}` + diag `duplicate_timestamp` |
 //! | [`ATTR_HOST_NAME`] | v2: a `{type: "host"}` resource, first; v1, distribution, and sketch: `host` | -- |
 //! | no [`ATTR_HOST_NAME`] or an empty one, and a `Str` [`ATTR_HOST_TAG`] (a DogStatsD `#host:` tag) | the host, where [`ATTR_HOST_NAME`] would go, and not a tag. An empty one is a sample marked hostless: written as the hostless rows below, never filled | -- |
 //! | a `host`-typed entry in [`ATTR_RESOURCES`] and no host from the rows above (the Agent's hostless v2 series: a `host` resource with no name) | v2: that entry, in order; v1, distribution, and sketch: a `host` of `""` (the entry itself is omitted, per the `no_wire_form` row); never filled | -- |
@@ -252,7 +261,9 @@
 //!
 //! 1. point timestamps are whole seconds: a fractional v1 timestamp truncates, and a missing one
 //!    becomes `received_at`, truncated;
-//! 2. a series with N points leaves as N one-point series;
+//! 2. a series with N points leaves as N one-point series. Two of those points in one second
+//!    aren't a normalization: the earlier is dropped and counted (the encode table above), so a
+//!    relay of such a request isn't a fixed point;
 //! 3. v2 resources reorder to host, device, then the rest; tags reorder by attribute order, and an
 //!    exact duplicate tag is dropped;
 //! 4. a zero `interval` or origin code, an empty `unit`/`source_type_name`/`device`, and a v1 `type`
@@ -373,7 +384,7 @@
 //! | **service checks** ([`DatadogEncoder::encode_service_checks`]): an event carrying `_logit.statsd.service_check.name` whose first metric is a `Gauge` | one array item with every key: `check`, `host_name` (`""`), `timestamp` (seconds), `status`, `message` (`""`), `tags` (`[]`) | -- |
 //! | `_logit.statsd.service_check.host`, else `host.name`, else a `Str` `host` (a DogStatsD `#host:` tag), else the default host | `host_name`; `""` when the `host` is empty (marked hostless, never filled) or nothing applies. A `host.name` read as the host, or an empty one, is not a tag, and neither is a `host` whenever `host.name` is absent or empty | -- |
 //! | `_logit.statsd.service_check.status` `U64` 0 to 3, else the gauge when it is an integer 0 to 3 | `status` | otherwise dropped: `logit.output.metrics.dropped{reason="invalid_status"}` |
-//! | every attribute not consumed above (events and checks) | `tags`, by [`tags::render_tags`]; `_logit.statsd.timestamp` (DogStatsD's timestamp carrier) is never rendered | `logit.output.tags.omitted{reason="unrepresentable"}` for a `Map`/`Bytes`/`Null` |
+//! | every attribute not consumed above (events and checks) | `tags`, by [`tags::render_tags`]; `_logit.statsd.timestamp` (DogStatsD's timestamp carrier) is never rendered | `logit.output.tags.omitted{reason="unrepresentable"}` for a `Bool(false)`/`Map`/`Bytes`/`Null` |
 //!
 //! ## Permitted normalizations (logs, events, service checks)
 //!
@@ -797,6 +808,20 @@ fn merged_get<'a>(resource: &'a Resource, event: &'a Event, key: &str) -> Option
     event.attributes.get(key).or_else(|| resource.attributes.get(key))
 }
 
+/// Whether `kind` on `event` is a Datadog `rate`: a `Gauge` whose [`ATTR_TYPE`], the event's value
+/// winning over the resource's, is `rate`, the form `datadog_in` decodes a rate to. A rate is an
+/// increment over its [`ATTR_INTERVAL`], not a state, so a stage that collapses readings of one
+/// series at one timestamp sums it rather than keeping the later one.
+pub fn is_rate(resource: &Resource, event: &Event, kind: &MetricKind) -> bool {
+    matches!(kind, MetricKind::Gauge(_))
+        && merged_get(resource, event, ATTR_TYPE).and_then(Value::as_str) == Some(series::TYPE_RATE)
+}
+
+/// [`ATTR_INTERVAL`], the event's value winning over the resource's.
+pub fn interval<'a>(resource: &'a Resource, event: &'a Event) -> Option<&'a Value> {
+    merged_get(resource, event, ATTR_INTERVAL)
+}
+
 /// A service check: `_logit.statsd.service_check.name` present and a `Gauge` first metric, the
 /// shape [`DatadogEncoder::encode_service_checks`] sends. Its record 0 belongs to that route alone;
 /// the metrics routes skip it and send any later records as ordinary metrics, as `statsd_out` does.
@@ -1011,6 +1036,10 @@ pub struct DatadogEncoder {
     /// `None` leaves it empty or absent.
     default_host: Option<Arc<str>>,
     histograms: HistogramOptions,
+    /// Series points the last series encode left off as duplicates of a later one.
+    series_duplicates: usize,
+    /// The sink's per-batch duplicate plan for the next series encodes, if any.
+    series_plan: Option<series::SeriesPlanned>,
 }
 
 /// The most `tags` strings one series, distribution point, or sketch may carry: Datadog's intake
@@ -1075,6 +1104,19 @@ impl DatadogEncoder {
 
     pub fn histograms(&self) -> HistogramOptions {
         self.histograms
+    }
+
+    /// Counts `n` events no route carries, an event with no metric, log, or span, as
+    /// `logit.output.events.skipped{reason="no_payload"}`. The sink's routing finds them, so it
+    /// counts them through the encoder's handle.
+    pub fn events_without_payload(&self, n: usize) {
+        if n > 0 {
+            self.telemetry.count(
+                "logit.output.events.skipped",
+                n as f64,
+                &[("reason", "no_payload")],
+            );
+        }
     }
 }
 

@@ -2286,7 +2286,7 @@
           "additionalProperties": false
         },
         {
-          "description": "Replaces each cumulative point with its difference from the series' previous point, for a destination that takes only deltas (Datadog, `statsd_out`, a delta-only OTLP backend). It converts a cumulative monotonic `sum`, a cumulative `histogram` and `exponential_histogram`, and a `summary`'s count and sum (its quantiles pass unchanged); every other record, a cumulative non-monotonic `sum` included, passes through untouched.\n\nA series is the metric's name, unit, and kind, the resource, the instrumentation scope, and the event's attributes; its state lives in memory, so a restart starts every series over. A point timestamped at or before the series' last one is skipped. A value that went down, or a start time that moved past the previous point, is a counter restart: the point's whole value is the delta. A histogram whose buckets changed is dropped, counted, and becomes the new baseline.",
+          "description": "Replaces each cumulative point with its difference from the series' previous point, for a destination that takes only deltas (Datadog, `statsd_out`, a delta-only OTLP backend). It converts a cumulative monotonic `sum`, a cumulative `histogram` and `exponential_histogram`, and a `summary`'s count and sum (its quantiles pass unchanged). A cumulative non-monotonic `sum` converts only when `non_monotonic` says so; every other record passes through untouched.\n\nA series is the metric's name, unit, and kind, the resource, the instrumentation scope, and the event's attributes; its state lives in memory, so a restart starts every series over. A point timestamped at or before the series' last one is skipped. A value that went down, or a start time that moved past the previous point, is a counter restart: the point's whole value is the delta. The exception is a non-monotonic `sum` under `non_monotonic: difference`, whose decrease is a negative delta. A histogram whose buckets changed is dropped, counted, and becomes the new baseline.",
           "type": "object",
           "required": [
             "type"
@@ -2314,6 +2314,15 @@
               "default": "1h",
               "type": "string"
             },
+            "non_monotonic": {
+              "description": "What a cumulative non-monotonic `sum` does: `pass` (the default) leaves it as it is, `difference` converts it with a decrease as a negative delta, and `reset_on_decrease` converts it with a decrease as a counter restart, as for a monotonic `sum`.",
+              "default": "pass",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/NonMonotonicSums"
+                }
+              ]
+            },
             "receive": true,
             "sources": true,
             "targets": true,
@@ -2321,6 +2330,31 @@
               "type": "string",
               "enum": [
                 "cumulative_to_delta"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Collapses the metric readings in one batch that share a series and a timestamp bucket into one reading, for a destination that can't hold two readings of one series at one instant: Prometheus remote-write at `1ms`, Datadog at `1s`. Place it last before the sink, since a stage after it can make two series equal again.\n\nA series is the metric's name, unit, and kind, the resource, the instrumentation scope, and the event's attributes. In each colliding set the latest reading survives with its own timestamp. A gauge or cumulative reading before it is replaced by it. Delta sums, Datadog rates of one interval, delta histograms, raw samples, set members, sketches, and set estimates are merged into it, always keeping the value's type. A Datadog rate is a gauge whose `_logit.datadog.type` is `rate`, an increment over its interval, so it's summed rather than replaced. A reading that can't merge is forwarded untouched, and the sink may still drop it as a duplicate: a `NaN` increment, a delta of another value type than the survivor's (`i64` beside `f64`, or `u64` beside `i64`), a total that would overflow, a gauge delta, a delta summary, a delta sum or a Datadog rate of booleans, or a histogram with other buckets. An event left with no metric, log, or span is discarded. It keeps no state between batches, so two batches' readings of one instant both reach the sink.",
+          "type": "object",
+          "required": [
+            "precision",
+            "type"
+          ],
+          "properties": {
+            "buffer": true,
+            "precision": {
+              "description": "The bucket width: two readings of one series collide when their timestamps divided by it, rounded down, are equal. Match the destination's timestamp resolution: `1ms` for Prometheus remote-write, `1s` for Datadog. Must be greater than zero.",
+              "type": "string"
+            },
+            "receive": true,
+            "sources": true,
+            "targets": true,
+            "type": {
+              "type": "string",
+              "enum": [
+                "dedup_timestamps"
               ]
             }
           },
@@ -2954,7 +2988,7 @@
           "additionalProperties": false
         },
         {
-          "description": "Sends logs, metrics, events, service checks, APM traces, and APM stats straight to Datadog's intake API, one request per route a batch needs. Host, service, source, and tags come from each event's attributes and resource, so stamp them upstream with `set`. A metric, log, event, or service check with no host goes out with the process hostname, so hostless senders relayed through one `logit` report as one Datadog host. A metric its sender marked hostless (an empty `host:` tag, or an Agent's empty host) stays hostless. Points older than Datadog accepts (1h for metrics, 18h for logs and events, 10m for service checks) are dropped and counted before sending. Traces go out only once a Datadog Agent has processed them: send `datadog_trace_in`'s output to `datadog_trace_out` instead. OpenTelemetry sums, histograms, and summaries go out as Datadog's OTel exporter sends them; a cumulative counter, histogram, or exponential histogram isn't sent, counted, so set an OpenTelemetry SDK to delta temporality.",
+          "description": "Sends logs, metrics, events, service checks, APM traces, and APM stats straight to Datadog's intake API, one request per route a batch needs. Host, service, source, and tags come from each event's attributes and resource, so stamp them upstream with `set`. A metric, log, event, or service check with no host goes out with the process hostname, so hostless senders relayed through one `logit` report as one Datadog host. A metric its sender marked hostless (an empty `host:` tag, or an Agent's empty host) stays hostless. Points older than Datadog accepts (1h for metrics, 18h for logs and events, 10m for service checks) are dropped and counted before sending. Traces go out only once a Datadog Agent has processed them: send `datadog_trace_in`'s output to `datadog_trace_out` instead. OpenTelemetry sums, histograms, and summaries go out as Datadog's OTel exporter sends them; a cumulative counter, histogram, or exponential histogram isn't sent, counted, so set an OpenTelemetry SDK to delta temporality. Datadog keeps one point per series per second, so of two series points of one series in one second of a request, the later is sent and the earlier left off, counted dropped, or normalized when it's a gauge equal to the later; put a `dedup_timestamps` with `precision: 1s` last before this sink to sum two counts or rates or keep the later gauge first.",
           "type": "object",
           "required": [
             "api_key",
@@ -4096,7 +4130,7 @@
               ]
             },
             "endpoint": {
-              "description": "An absolute `http://`/`https://` remote-write URL, path included (typically `/api/v1/write`): sender mode. Never resolved at config-load time, so a receiver that isn't up yet is not a config error.",
+              "description": "An absolute `http://`/`https://` remote-write URL, path included (typically `/api/v1/write`): sender mode. Never resolved at config-load time, so a receiver that isn't up yet is not a config error.\n\nA remote-write series holds one sample per millisecond, so of two readings of one series in one millisecond of a batch, the sink sends the later and leaves the earlier off, counted `logit.output.metrics.dropped{reason=\"duplicate_timestamp\"}`. When the earlier is a state (a gauge other than a Datadog `rate`, or a cumulative kind) equal to the later, nothing is lost, and it counts `logit.output.metrics.normalized{reason=\"duplicate_timestamp\"}` instead; two equal increments or sets of observations, a set's size included, are still two. To merge or collapse such readings first, put a `dedup_timestamps` with `precision: 1ms` last before this sink.",
               "default": null,
               "type": [
                 "string",
@@ -5289,6 +5323,32 @@
         }
       },
       "additionalProperties": false
+    },
+    "NonMonotonicSums": {
+      "description": "`cumulative_to_delta`'s `non_monotonic` field: what a cumulative non-monotonic `sum` does.",
+      "oneOf": [
+        {
+          "description": "Passed through untouched: its running value is a level, such as an OpenTelemetry up-down counter's, and most destinations read it as a gauge. The default.",
+          "type": "string",
+          "enum": [
+            "pass"
+          ]
+        },
+        {
+          "description": "Converted to a delta that goes negative when the value went down. For an up-down counter sent to a destination that takes only deltas. A counter that restarts with no start time reads as one large negative delta.",
+          "type": "string",
+          "enum": [
+            "difference"
+          ]
+        },
+        {
+          "description": "Converted as a monotonic `sum` is: a value that went down is a counter restart, and the new value is the delta. For a counter its producer can't mark monotonic, such as collectd's DERIVE, whose stock types have a minimum of 0.",
+          "type": "string",
+          "enum": [
+            "reset_on_decrease"
+          ]
+        }
+      ]
     },
     "NormalizeStep": {
       "description": "A rewrite `keep_values` applies to a field's value before testing it against `allow`. A list, so further steps can be added beside `lower`.",

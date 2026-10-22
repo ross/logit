@@ -653,8 +653,9 @@ fn histogram_exemplars_are_placed_on_the_bucket_their_value_falls_in() {
 }
 
 /// An exemplar's attribute keys are sent sanitized in both versions, as the series' own label
-/// names are, and two keys sanitizing onto one name keep the one whose original key sorts first,
-/// the other counted `labels.omitted{reason="collision"}`.
+/// names are, each key rewritten counted `labels.normalized{reason="name_sanitized"}`, and two
+/// keys sanitizing onto one name keep the one whose original key sorts first, the other counted
+/// `labels.omitted{reason="collision"}`.
 #[test]
 fn exemplar_label_names_are_sanitized_as_series_label_names_are() {
     let mut filtered_attributes = AttrMap::new();
@@ -676,7 +677,8 @@ fn exemplar_label_names_are_sanitized_as_series_label_names_are() {
     }]];
     for version in [Version::V1, Version::V2] {
         let (body, reasons) = encode_reasons(&families, version);
-        assert_eq!(reasons, [("collision".to_string(), 1)], "{version:?}");
+        let want = [("collision".to_string(), 1), ("name_sanitized".to_string(), 2)];
+        assert_eq!(reasons, want, "{version:?}");
         let decoded = decode(&body, version, &mut PrometheusDecoder::new()).expect("must decode");
         let exemplars = &decoded.groups[0][0].series[0].exemplars;
         assert_eq!(exemplars.len(), 1, "{version:?}");
@@ -772,7 +774,7 @@ fn encode_reasons(groups: &[Vec<MetricFamily>], version: Version) -> (Vec<u8>, V
 }
 
 /// Two readings truncating onto one millisecond: the later wins, the earlier is counted
-/// `sub_ms_collapsed` (see `remote_write.rs`'s drop table).
+/// `dropped{reason="duplicate_timestamp"}` (see `remote_write.rs`'s drop table).
 #[test]
 fn two_readings_on_one_millisecond_collapse_to_the_later_one() {
     let reading = |timestamp: i64, value: f64| {
@@ -790,9 +792,9 @@ fn two_readings_on_one_millisecond_collapse_to_the_later_one() {
 
     for version in [Version::V1, Version::V2] {
         let (body, reasons) = encode_reasons(&groups, version);
-        assert_eq!(reasons, [("sub_ms_collapsed".to_string(), 1)], "{version:?}");
+        assert_eq!(reasons, [("duplicate_timestamp".to_string(), 1)], "{version:?}");
 
-        // One `TimeSeries`, and crucially one `Sample` in it: two would be the 400.
+        // One `TimeSeries` with one `Sample`: given two, the receiver would keep the earlier.
         let samples: Vec<(f64, i64)> = match version {
             Version::V1 => {
                 let request = pb1::WriteRequest::decode(body.as_slice()).expect("must decode");
@@ -829,6 +831,195 @@ fn two_readings_on_one_millisecond_collapse_to_the_later_one() {
         let decoded = decode(&body, version, &mut PrometheusDecoder::new()).expect("must decode");
         assert_eq!(decoded.groups.len(), 2, "{version:?}");
         assert_eq!(decoded.samples, 2, "{version:?}");
+    }
+}
+
+/// Encodes with telemetry attached and returns each `logit.output.metrics.*` counter as
+/// `(name, reason, total)`, so a `normalized` reason reads apart from a `dropped` one.
+fn encode_counters(groups: &[Vec<MetricFamily>]) -> Vec<(String, String, u64)> {
+    let registry = Registry::new();
+    let mut encoder = PrometheusEncoder::new().with_telemetry(registry.telemetry_for(
+        "prometheus",
+        "prometheus_out",
+        "sink",
+    ));
+    encode(groups, Version::V1, &mut encoder);
+    let mut out: Vec<(String, String, u64)> = registry
+        .drain(0)
+        .iter()
+        .flat_map(|event| {
+            let reason = event.attributes.get("reason").and_then(|value| value.as_str());
+            let reason = reason.unwrap_or_default().to_string();
+            event.metrics.iter().filter_map(move |metric| {
+                let name = resolve(metric.name);
+                let MetricKind::Sum(sum) = &metric.kind else { return None };
+                name.starts_with("logit.output.metrics.")
+                    .then(|| (name.to_string(), reason.clone(), sum.value.as_f64() as u64))
+            })
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+fn gauge_reading(timestamp: i64, value: f64) -> Vec<MetricFamily> {
+    vec![MetricFamily {
+        series: vec![Series {
+            timestamp: Some(timestamp),
+            ..Series::new(vec![("shard".to_string(), "1".to_string())], Point::Gauge(value))
+        }],
+        ..MetricFamily::new("m", FamilyType::Gauge)
+    }]
+}
+
+const NORMALIZED: &str = "logit.output.metrics.normalized";
+const DROPPED: &str = "logit.output.metrics.dropped";
+
+fn duplicates(counters: &[(String, String, u64)], metric: &str) -> u64 {
+    counters
+        .iter()
+        .filter(|(name, reason, _)| name == metric && reason == "duplicate_timestamp")
+        .map(|counter| counter.2)
+        .sum()
+}
+
+/// A reading equal to the one sent for its millisecond loses nothing: it counts
+/// `normalized{reason="duplicate_timestamp"}`, not `dropped`, for a gauge and a histogram alike.
+#[test]
+fn an_equal_reading_on_one_millisecond_is_counted_normalized() {
+    let groups = vec![gauge_reading(TIMESTAMP, 2.0), gauge_reading(TIMESTAMP + 1, 2.0)];
+    let counters = encode_counters(&groups);
+    assert_eq!(duplicates(&counters, NORMALIZED), 1, "{counters:?}");
+    assert_eq!(duplicates(&counters, DROPPED), 0, "{counters:?}");
+
+    let histogram = |timestamp: i64| {
+        vec![MetricFamily {
+            series: vec![Series {
+                timestamp: Some(timestamp),
+                ..Series::new(
+                    vec![("shard".to_string(), "1".to_string())],
+                    Point::Histogram {
+                        buckets: vec![(1.0, 2), (f64::INFINITY, 3)],
+                        sum: Some(4.5),
+                        count: 3,
+                    },
+                )
+            }],
+            ..MetricFamily::new("h", FamilyType::Histogram)
+        }]
+    };
+    let counters = encode_counters(&[histogram(TIMESTAMP), histogram(TIMESTAMP + 1)]);
+    assert_eq!(duplicates(&counters, NORMALIZED), 1, "{counters:?}");
+    assert_eq!(duplicates(&counters, DROPPED), 0, "{counters:?}");
+}
+
+/// An equal value isn't an equal reading when anything else the wire carries for it differs:
+/// the removed reading's exemplars go with it, and `0.0` and `-0.0` are two samples.
+#[test]
+fn an_equal_value_with_other_exemplars_or_sign_is_counted_dropped() {
+    let mut with_exemplar = gauge_reading(TIMESTAMP, 2.0);
+    with_exemplar[0].series[0].exemplars = vec![Exemplar {
+        timestamp: TIMESTAMP,
+        value: MetricValue::F64(2.0),
+        trace: None,
+        filtered_attributes: AttrMap::new(),
+    }];
+    for groups in [
+        vec![with_exemplar, gauge_reading(TIMESTAMP + 1, 2.0)],
+        vec![gauge_reading(TIMESTAMP, 0.0), gauge_reading(TIMESTAMP + 1, -0.0)],
+    ] {
+        let counters = encode_counters(&groups);
+        assert_eq!(duplicates(&counters, NORMALIZED), 0, "{counters:?}");
+        assert_eq!(duplicates(&counters, DROPPED), 1, "{counters:?}");
+    }
+}
+
+/// A reading marked an increment, such as a `Samples` record written as a summary, isn't
+/// replaced by an equal later one: two equal observation sets are two sets of events, so the
+/// removed one counts `dropped`.
+#[test]
+fn an_equal_increment_on_one_millisecond_is_counted_dropped() {
+    let mut earlier = gauge_reading(TIMESTAMP, 2.0);
+    earlier[0].series[0].increment = true;
+    let mut later = gauge_reading(TIMESTAMP + 1, 2.0);
+    later[0].series[0].increment = true;
+    let counters = encode_counters(&[earlier, later]);
+    assert_eq!(duplicates(&counters, NORMALIZED), 0, "{counters:?}");
+    assert_eq!(duplicates(&counters, DROPPED), 1, "{counters:?}");
+}
+
+/// Each removed reading is compared with the reading sent, not with the one that displaced it:
+/// of `5`, `7`, and `5` in one millisecond, the last is sent, the first equals it, and the `7`
+/// is lost.
+#[test]
+fn a_removed_reading_is_compared_with_the_reading_sent() {
+    let groups = vec![
+        gauge_reading(TIMESTAMP, 5.0),
+        gauge_reading(TIMESTAMP + 1, 7.0),
+        gauge_reading(TIMESTAMP + 2, 5.0),
+    ];
+    let counters = encode_counters(&groups);
+    assert_eq!(duplicates(&counters, NORMALIZED), 1, "{counters:?}");
+    assert_eq!(duplicates(&counters, DROPPED), 1, "{counters:?}");
+    let body = encode(&groups, Version::V1, &mut PrometheusEncoder::new());
+    let decoded = decode(&body, Version::V1, &mut PrometheusDecoder::new()).expect("must decode");
+    assert_eq!(decoded.groups, vec![gauge_reading(TIMESTAMP, 5.0)]);
+}
+
+/// A histogram reading that collapses loses all of its `_bucket`, `_sum`, and `_count` samples,
+/// and counts once: the counter counts readings, not wire samples.
+#[test]
+fn a_collapsed_histogram_counts_one_reading() {
+    let reading = |timestamp: i64, count: u64| {
+        vec![MetricFamily {
+            series: vec![Series {
+                timestamp: Some(timestamp),
+                ..Series::new(
+                    vec![("shard".to_string(), "1".to_string())],
+                    Point::Histogram {
+                        buckets: vec![(1.0, count), (f64::INFINITY, count)],
+                        sum: Some(1.0),
+                        count,
+                    },
+                )
+            }],
+            ..MetricFamily::new("h", FamilyType::Histogram)
+        }]
+    };
+    let groups = vec![reading(TIMESTAMP, 1), reading(TIMESTAMP + 1, 2)];
+    for version in [Version::V1, Version::V2] {
+        let (body, reasons) = encode_reasons(&groups, version);
+        assert_eq!(reasons, [("duplicate_timestamp".to_string(), 1)], "{version:?}");
+        let decoded = decode(&body, version, &mut PrometheusDecoder::new()).expect("must decode");
+        assert_eq!(decoded.groups, vec![reading(TIMESTAMP, 2)], "{version:?}");
+    }
+}
+
+/// Two summaries of one series in one millisecond with different quantile layouts collapse
+/// whole: the later is sent, and nothing of the earlier, its `0.9` quantile included.
+#[test]
+fn two_summaries_of_different_layouts_in_one_millisecond_collapse_whole() {
+    let reading = |timestamp: i64, quantiles: Vec<(f64, f64)>| {
+        vec![MetricFamily {
+            series: vec![Series {
+                timestamp: Some(timestamp),
+                ..Series::new(
+                    vec![("shard".to_string(), "1".to_string())],
+                    Point::Summary { quantiles, sum: Some(3.0), count: Some(2) },
+                )
+            }],
+            ..MetricFamily::new("s", FamilyType::Summary)
+        }]
+    };
+    let groups = vec![
+        reading(TIMESTAMP, vec![(0.5, 1.0), (0.9, 2.0)]),
+        reading(TIMESTAMP + 1, vec![(0.5, 1.5)]),
+    ];
+    for version in [Version::V1, Version::V2] {
+        let (body, reasons) = encode_reasons(&groups, version);
+        assert_eq!(reasons, [("duplicate_timestamp".to_string(), 1)], "{version:?}");
+        let decoded = decode(&body, version, &mut PrometheusDecoder::new()).expect("must decode");
+        assert_eq!(decoded.groups, vec![reading(TIMESTAMP, vec![(0.5, 1.5)])], "{version:?}");
     }
 }
 
@@ -1423,7 +1614,14 @@ fn series(kind: FamilyType, version: Version, timestamp: i64) -> BoxedStrategy<S
         .prop_map(move |(labels, point, created, exemplars)| {
             // A stale series has no reading for an exemplar to be an example of.
             let exemplars = if point == Point::Stale { Vec::new() } else { exemplars };
-            Series { labels, point, timestamp: Some(timestamp), created, exemplars }
+            Series {
+                increment: false,
+                labels,
+                point,
+                timestamp: Some(timestamp),
+                created,
+                exemplars,
+            }
         })
         .boxed()
 }
@@ -1591,6 +1789,7 @@ proptest! {
 fn a_created_timestamp_is_a_wire_sample_in_version_1_and_a_field_in_version_2() {
     let mut family = MetricFamily::new("requests", FamilyType::Counter);
     family.series.push(Series {
+        increment: false,
         labels: vec![("job".to_string(), "api".to_string())],
         point: Point::Counter(7.0),
         timestamp: Some(1_605_281_325_000_000_000),

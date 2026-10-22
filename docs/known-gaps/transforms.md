@@ -4,10 +4,10 @@ Entry format and the other areas: [the known-gaps index](README.md).
 
 ## Transforms: predicates and sampling
 
-- **Predicate-shaped work (throttling, dedup, and anything needing a real operator: `contains`,
-  cross-attribute comparison, boolean combinations) costs a Lua VM, an OS thread, and roughly 9× the
-  per-event allocations of a native transform, because `logit` has no native predicate
-  language.** The rest of predicate-shaped work has native answers:
+- **Predicate-shaped work (throttling, event-level dedup, and anything needing a real operator:
+  `contains`, cross-attribute comparison, boolean combinations) costs a Lua VM, an OS thread, and
+  roughly 9× the per-event allocations of a native transform, because `logit` has no native
+  predicate language.** The rest of predicate-shaped work has native answers:
   - Equality and key-presence filtering, such as splitting a `logit_in` fan-out back apart by an
     attribute an upstream `set` stamped, or keeping events that carry a key: `has_attributes`/
     `drop_attributes`
@@ -22,6 +22,11 @@ Entry format and the other areas: [the known-gaps index](README.md).
   - Sampling: `sample`
     ([ADR `consistent-sampling-component`](../adr/consistent-sampling-component.md)), because a
     `lua` component can't express keyed, cross-process-consistent sampling.
+  - Collapsing one series' metric readings at one instant before a sink that can't hold both:
+    `dedup_timestamps`
+    ([ADR `dedup-timestamps-transform`](../adr/dedup-timestamps-transform.md)), because a `lua`
+    component can't keep the later reading of a batch without adding latency. Suppressing a
+    repeated event stays `lua` work.
 
   **Consequence:** [ADR `routing-by-condition-is-lua`](../adr/routing-by-condition-is-lua.md)
   measured **9** allocations / **1.61 µs** per event through a `lua` component versus **1**
@@ -123,7 +128,10 @@ Entry format and the other areas: [the known-gaps index](README.md).
   (OTLP, InfluxDB, Graphite, collectd, Datadog series, Prometheus remote-write) carry no marker,
   so they merge and take the flush time.
   - **Workaround:** to summarize a timestamped point anyway, `remove` its
-    `_logit.statsd.timestamp` or `_logit.prometheus.timestamp` attribute ahead of `aggregate`.
+    `_logit.statsd.timestamp` or `_logit.prometheus.timestamp` attribute ahead of `aggregate`. To
+    keep source timestamps and still leave one point per series per instant, as remote-write and
+    `datadog_out` need, use `dedup_timestamps` in place of `aggregate`
+    ([ADR `dedup-timestamps-transform`](../adr/dedup-timestamps-transform.md)).
 - **A `keep` ahead of `aggregate` turns Datadog APM stats into ordinary metrics.** `aggregate`
   passes a stats group through whole (`passed_through{reason="bucketed"}`), detected by its
   `_logit.datadog.stats.name` marker. `keep` drops `_logit.*` attributes unless `private: keep`
@@ -195,6 +203,31 @@ Entry format and the other areas: [the known-gaps index](README.md).
     re-bases.
   - **Why not a monotonic clock:** it would need its own mapping to wall time on every emitted
     point, which nothing else in the pipeline does.
+
+## `cumulative_to_delta`
+
+- **Under `non_monotonic: difference`, a counter that resets with no start time reads as one
+  large negative delta.** `difference` reads a decrease as the reading, not a restart, so only a
+  start time moved past the previous point marks a reset. A collectd value list has no start
+  time, so a DERIVE that restarts from 0 after a host reboot leaves as a delta of the new value
+  minus the previous total, and a Datadog `count` view of it dips by that total once.
+  - **Remedy:** `non_monotonic: reset_on_decrease` for a DERIVE whose `types.db` minimum is 0,
+    which is every stock one. It reads the decrease as a restart, as collectd does.
+  - **Trade-off:** under `reset_on_decrease`, a source that can go down for real reads each
+    decrease as a restart and over-counts by its new value. No single setting fits a listener
+    that receives both kinds; split them upstream with a `route` on an attribute that tells them
+    apart, and give each branch its own `cumulative_to_delta`
+    ([ADR `cumulative-to-delta-transform`](../adr/cumulative-to-delta-transform.md)'s
+    non-monotonic amendment).
+- **A collectd COUNTER that wraps reads as a reset, and the increase up to the wrap is lost.**
+  collectd reads a COUNTER that went down as a wrap at 2^32 or 2^64 and adds that width to the
+  rate. `cumulative_to_delta` can't tell a wrap from a restart, so it reads every decrease of a
+  monotonic `Sum` as a reset and emits the new value: the distance from the previous value to
+  the wrap point never reaches the destination. `non_monotonic: reset_on_decrease` does the same
+  to a DERIVE, which collectd never treats as a wrap.
+  - **Consequence:** one undercount per wrap, of less than one wrap width. A 64-bit counter
+    wraps rarely; a 32-bit one, such as an old SNMP interface counter, can wrap in minutes on a
+    busy link.
 
 ## HTTP access logs: nginx, HAProxy, and `http_access`
 

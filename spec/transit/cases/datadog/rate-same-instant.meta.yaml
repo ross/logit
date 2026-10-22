@@ -1,0 +1,4 @@
+# Two equal `rate` points of one series at one instant, as a resend writes them. A rate is an
+# increment over its interval, so a sink keeping one point per series and bucket loses one, even
+# though the two are equal.
+exercises: []

@@ -3,21 +3,27 @@
     {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"build_info","kind":"gauge","value":1.0}],"attributes":{"debug":"false","host_name":"web-1","regions":"2","service_name":"checkout","shard":"12","version":"2.4.1","weight":"0.75"}}
   ], "counters": {
     "logit.output.labels.normalized{component=out,kind=prometheus_out,reason=multi_value,role=sink}": 1,
-    "logit.output.labels.omitted{component=out,kind=prometheus_out,reason=unrepresentable,role=sink}": 2
+    "logit.output.labels.normalized{component=out,kind=prometheus_out,reason=name_sanitized,role=sink}": 2,
+    "logit.output.labels.omitted{component=out,kind=prometheus_out,reason=unrepresentable,role=sink}": 2,
+    "logit.output.metrics.normalized{component=out,kind=prometheus_out,reason=name_sanitized,role=sink}": 1
   }},
   "exemplars": {"events": [
     {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"cart_value","kind":"gauge","value":42.5}],"attributes":{"host_name":"web-1","service_name":"checkout"}},
     {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"orders_placed_total","kind":"sum","value":118.0,"temporality":"cumulative","monotonic":true,"start_timestamp":"2027-01-15T07:58:50.000000000Z","exemplars":[{"timestamp":"2027-01-15T07:59:47.000000000Z","value":1.0,"trace_id":"5b8efff798038103d269b633813fc60c","span_id":"eee19b7ec3c1b174","trace_flags":0,"attributes":{"customer_tier":"gold"}}]}],"attributes":{"host_name":"web-1","service_name":"checkout"}}
   ], "counters": {
+    "logit.output.labels.normalized{component=out,kind=prometheus_out,reason=name_sanitized,role=sink}": 5,
     "logit.output.metrics.degraded{component=out,kind=prometheus_out,reason=exemplar_omitted,role=sink}": 1,
-    "logit.output.metrics.degraded{component=out,kind=prometheus_out,reason=unit_not_suffix,role=sink}": 2
+    "logit.output.metrics.degraded{component=out,kind=prometheus_out,reason=unit_not_suffix,role=sink}": 2,
+    "logit.output.metrics.normalized{component=out,kind=prometheus_out,reason=name_sanitized,role=sink}": 2
   }},
   "exemplars-unwritten": {"events": [
     {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"orders_shipped_total","kind":"sum","value":64.0,"temporality":"cumulative","monotonic":true,"start_timestamp":"2027-01-15T07:58:50.000000000Z","exemplars":[{"timestamp":"2027-01-15T07:59:47.000000000Z","value":1.0,"attributes":{"carrier":"ups"}}]}],"attributes":{"host_name":"web-1","service_name":"checkout"}},
     {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"queue_wait","kind":"histogram","temporality":"cumulative","buckets":[{"bound":10.0,"count":3},{"bound":"inf","count":4}],"sum":140.0,"start_timestamp":"2027-01-15T07:58:50.000000000Z","exemplars":[{"timestamp":"2027-01-15T07:59:46.000000000Z","value":4.0,"attributes":{"queue":"orders"}}]}],"attributes":{"host_name":"web-1","service_name":"checkout"}}
   ], "counters": {
+    "logit.output.labels.normalized{component=out,kind=prometheus_out,reason=name_sanitized,role=sink}": 4,
     "logit.output.metrics.degraded{component=out,kind=prometheus_out,reason=exemplar_omitted,role=sink}": 2,
-    "logit.output.metrics.degraded{component=out,kind=prometheus_out,reason=unit_not_suffix,role=sink}": 2
+    "logit.output.metrics.degraded{component=out,kind=prometheus_out,reason=unit_not_suffix,role=sink}": 2,
+    "logit.output.metrics.normalized{component=out,kind=prometheus_out,reason=name_sanitized,role=sink}": 2
   }},
   "exponential-histograms": {"events": [], "counters": {
     "logit.output.metrics.skipped{component=out,kind=prometheus_out,metric_kind=exponential_histogram,role=sink}": 2
@@ -27,27 +33,43 @@
     {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"room_temperature_offset","kind":"gauge","value":-4.5}],"attributes":{"host_name":"web-1","room":"lab","service_name":"checkout"}},
     {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"system_memory_utilization","kind":"gauge","value":0.625,"description":"Memory in use."}],"attributes":{"host_name":"web-1","service_name":"checkout","state":"used"}}
   ], "counters": {
-    "logit.output.metrics.degraded{component=out,kind=prometheus_out,reason=unit_not_suffix,role=sink}": 3
+    "logit.output.labels.normalized{component=out,kind=prometheus_out,reason=name_sanitized,role=sink}": 6,
+    "logit.output.metrics.degraded{component=out,kind=prometheus_out,reason=unit_not_suffix,role=sink}": 3,
+    "logit.output.metrics.normalized{component=out,kind=prometheus_out,reason=name_sanitized,role=sink}": 3
   }},
   "gzip": {"events": [], "counters": {
     "logit.output.metrics.dropped{component=out,kind=prometheus_out,reason=unresolved_delta,role=sink}": 1
   }},
+  "histogram-count": {"events": [
+    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"queue_wait","kind":"histogram","temporality":"cumulative","buckets":[{"bound":1.0,"count":3},{"bound":"inf","count":4}],"sum":4.5,"start_timestamp":"2027-01-15T07:58:50.000000000Z"}],"attributes":{"queue_name":"orders","service_name":"checkout"}},
+    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"rpc_server_duration","kind":"histogram","temporality":"cumulative","buckets":[{"bound":"inf","count":12}],"sum":30.0,"start_timestamp":"2027-01-15T07:58:50.000000000Z"}],"attributes":{"rpc_service":"cart","service_name":"checkout"}}
+  ], "counters": {
+    "logit.output.labels.normalized{component=out,kind=prometheus_out,reason=name_sanitized,role=sink}": 4,
+    "logit.output.metrics.degraded{component=out,kind=prometheus_out,reason=unit_not_suffix,role=sink}": 2,
+    "logit.output.metrics.normalized{component=out,kind=prometheus_out,reason=name_sanitized,role=sink}": 2
+  }},
   "histogram-neg-inf-bound": {"events": [
     {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"http_server_duration","kind":"histogram","temporality":"cumulative","buckets":[{"bound":"-inf","count":8},{"bound":1.0,"count":1},{"bound":5.0,"count":2},{"bound":"inf","count":16}],"start_timestamp":"2027-01-15T07:59:40.000000000Z"}],"attributes":{"host_name":"web-1","http_route":"/cart","service_name":"checkout"}}
   ], "counters": {
-    "logit.output.metrics.degraded{component=out,kind=prometheus_out,reason=unit_not_suffix,role=sink}": 1
+    "logit.output.labels.normalized{component=out,kind=prometheus_out,reason=name_sanitized,role=sink}": 3,
+    "logit.output.metrics.degraded{component=out,kind=prometheus_out,reason=unit_not_suffix,role=sink}": 1,
+    "logit.output.metrics.normalized{component=out,kind=prometheus_out,reason=name_sanitized,role=sink}": 1
   }},
   "histogram-non-finite-bounds": {"events": [
     {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"http_server_duration","kind":"histogram","temporality":"cumulative","buckets":[{"bound":"-inf","count":8},{"bound":1.0,"count":1},{"bound":5.0,"count":2},{"bound":"inf","count":20}],"start_timestamp":"2027-01-15T07:59:40.000000000Z"}],"attributes":{"host_name":"web-1","http_route":"/cart","service_name":"checkout"}}
   ], "counters": {
+    "logit.output.labels.normalized{component=out,kind=prometheus_out,reason=name_sanitized,role=sink}": 3,
     "logit.output.metrics.degraded{component=out,kind=prometheus_out,reason=non_finite_component,role=sink}": 1,
-    "logit.output.metrics.degraded{component=out,kind=prometheus_out,reason=unit_not_suffix,role=sink}": 1
+    "logit.output.metrics.degraded{component=out,kind=prometheus_out,reason=unit_not_suffix,role=sink}": 1,
+    "logit.output.metrics.normalized{component=out,kind=prometheus_out,reason=name_sanitized,role=sink}": 1
   }},
   "histograms": {"events": [
     {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"db_client_operation_duration","kind":"histogram","temporality":"cumulative","buckets":[{"bound":10.0,"count":4},{"bound":100.0,"count":5},{"bound":"inf","count":1}],"sum":420.0,"start_timestamp":"2027-01-15T07:58:50.000000000Z","exemplars":[{"timestamp":"2027-01-15T07:59:46.000000000Z","value":37.5,"attributes":{"db_operation_name":"SELECT"}}]}],"attributes":{"db_system":"postgresql","host_name":"web-1","service_name":"checkout"}}
   ], "counters": {
+    "logit.output.labels.normalized{component=out,kind=prometheus_out,reason=name_sanitized,role=sink}": 4,
     "logit.output.metrics.degraded{component=out,kind=prometheus_out,reason=unit_not_suffix,role=sink}": 1,
-    "logit.output.metrics.dropped{component=out,kind=prometheus_out,reason=unresolved_delta,role=sink}": 1
+    "logit.output.metrics.dropped{component=out,kind=prometheus_out,reason=unresolved_delta,role=sink}": 1,
+    "logit.output.metrics.normalized{component=out,kind=prometheus_out,reason=name_sanitized,role=sink}": 1
   }},
   "no-recorded-value": {"events": [], "counters": {
     "logit.output.metrics.skipped{component=out,kind=prometheus_out,reason=no_recorded_value,role=sink}": 6
@@ -56,36 +78,50 @@
     {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"overflow_total","kind":"sum","value":"inf","temporality":"cumulative","monotonic":true,"start_timestamp":"2027-01-15T07:58:50.000000000Z"}],"attributes":{"host_name":"web-1","service_name":"checkout"}},
     {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"sensor_reading","kind":"gauge","value":"-inf"}],"attributes":{"host_name":"web-1","sensor":"b","service_name":"checkout"}},
     {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"sensor_reading","kind":"gauge","value":"NaN"}],"attributes":{"host_name":"web-1","sensor":"a","service_name":"checkout"}}
-  ], "counters": {}},
+  ], "counters": {
+    "logit.output.labels.normalized{component=out,kind=prometheus_out,reason=name_sanitized,role=sink}": 6,
+    "logit.output.metrics.normalized{component=out,kind=prometheus_out,reason=name_sanitized,role=sink}": 3
+  }},
   "several-resources": {"events": [
     {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"invoices_open","kind":"gauge","value":17.0}],"attributes":{"service_instance_id":"3","service_name":"billing"}},
     {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"parcels_queued","kind":"gauge","value":11.0}],"attributes":{"depot":"north","service_name":"shipping"}},
     {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"payments_pending","kind":"gauge","value":4.0}],"attributes":{"service_instance_id":"3","service_name":"billing"}}
-  ], "counters": {}},
+  ], "counters": {
+    "logit.output.labels.normalized{component=out,kind=prometheus_out,reason=name_sanitized,role=sink}": 5,
+    "logit.output.metrics.normalized{component=out,kind=prometheus_out,reason=name_sanitized,role=sink}": 3
+  }},
   "summary": {"events": [
     {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"rpc_client_duration","kind":"summary","temporality":"cumulative","count":100,"sum":25.5,"quantiles":[{"quantile":0.0,"value":0.01},{"quantile":0.5,"value":0.2},{"quantile":0.99,"value":1.2},{"quantile":1.0,"value":2.5}],"description":"Client call duration.","start_timestamp":"2027-01-15T07:58:50.000000000Z"}],"attributes":{"host_name":"web-1","rpc_service":"inventory","service_name":"checkout"}}
   ], "counters": {
-    "logit.output.metrics.degraded{component=out,kind=prometheus_out,reason=unit_not_suffix,role=sink}": 1
+    "logit.output.labels.normalized{component=out,kind=prometheus_out,reason=name_sanitized,role=sink}": 3,
+    "logit.output.metrics.degraded{component=out,kind=prometheus_out,reason=unit_not_suffix,role=sink}": 1,
+    "logit.output.metrics.normalized{component=out,kind=prometheus_out,reason=name_sanitized,role=sink}": 1
   }},
   "sums": {"events": [
     {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"db_client_connections_usage","kind":"gauge","value":7.0}],"attributes":{"host_name":"web-1","pool_name":"primary","service_name":"checkout"}},
     {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"process_cpu_time_total","kind":"sum","value":81.25,"temporality":"cumulative","monotonic":true,"description":"CPU time by state.","start_timestamp":"2027-01-15T07:58:50.000000000Z"}],"attributes":{"cpu_mode":"user","host_name":"web-1","service_name":"checkout"}},
     {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"process_cpu_time_total","kind":"sum","value":9.75,"temporality":"cumulative","monotonic":true,"description":"CPU time by state.","start_timestamp":"2027-01-15T07:58:50.000000000Z"}],"attributes":{"cpu_mode":"system","host_name":"web-1","service_name":"checkout"}}
   ], "counters": {
+    "logit.output.labels.normalized{component=out,kind=prometheus_out,reason=name_sanitized,role=sink}": 9,
     "logit.output.metrics.degraded{component=out,kind=prometheus_out,metric_kind=non_monotonic_sum,role=sink}": 1,
     "logit.output.metrics.degraded{component=out,kind=prometheus_out,reason=unit_not_suffix,role=sink}": 2,
-    "logit.output.metrics.dropped{component=out,kind=prometheus_out,reason=unresolved_delta,role=sink}": 2
+    "logit.output.metrics.dropped{component=out,kind=prometheus_out,reason=unresolved_delta,role=sink}": 2,
+    "logit.output.metrics.normalized{component=out,kind=prometheus_out,reason=name_sanitized,role=sink}": 3
   }},
   "sums-protobuf": {"events": [
     {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"db_client_connections_usage","kind":"gauge","value":7.0}],"attributes":{"host_name":"web-1","pool_name":"primary","service_name":"checkout"}},
     {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"process_cpu_time_total","kind":"sum","value":81.25,"temporality":"cumulative","monotonic":true,"description":"CPU time by state.","start_timestamp":"2027-01-15T07:58:50.000000000Z"}],"attributes":{"cpu_mode":"user","host_name":"web-1","service_name":"checkout"}},
     {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"process_cpu_time_total","kind":"sum","value":9.75,"temporality":"cumulative","monotonic":true,"description":"CPU time by state.","start_timestamp":"2027-01-15T07:58:50.000000000Z"}],"attributes":{"cpu_mode":"system","host_name":"web-1","service_name":"checkout"}}
   ], "counters": {
+    "logit.output.labels.normalized{component=out,kind=prometheus_out,reason=name_sanitized,role=sink}": 9,
     "logit.output.metrics.degraded{component=out,kind=prometheus_out,metric_kind=non_monotonic_sum,role=sink}": 1,
     "logit.output.metrics.degraded{component=out,kind=prometheus_out,reason=unit_not_suffix,role=sink}": 2,
-    "logit.output.metrics.dropped{component=out,kind=prometheus_out,reason=unresolved_delta,role=sink}": 2
+    "logit.output.metrics.dropped{component=out,kind=prometheus_out,reason=unresolved_delta,role=sink}": 2,
+    "logit.output.metrics.normalized{component=out,kind=prometheus_out,reason=name_sanitized,role=sink}": 3
   }},
   "telemetrygen": {"events": [
     {"timestamp":"2026-09-10T21:22:22.440075069Z","metrics":[{"name":"gen","kind":"gauge","value":2.0}],"attributes":{"service_name":"telemetrygen"}}
-  ], "counters": {}}
+  ], "counters": {
+    "logit.output.labels.normalized{component=out,kind=prometheus_out,reason=name_sanitized,role=sink}": 1
+  }}
 }

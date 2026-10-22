@@ -79,16 +79,29 @@ Entry format and the other areas: [the known-gaps index](README.md).
   2262-04-11T23:47:16.854775807Z, not the original. It's listed under
   [ADR `lossless-transit`](../adr/lossless-transit.md)'s "Permitted normalizations"
   ([ADR `untrusted-input-bounds`](../adr/untrusted-input-bounds.md) has the rule).
-- **A `Histogram` carries no point `count`, so `otlp_in` loses it, uncounted.** `otlp_in`'s
-  decoder builds `logit_core::Histogram`'s buckets from `bucket_counts` and never reads the data
-  point's `count` (`crates/logit-proto/src/otlp/metrics.rs`'s decode). `otlp_out` writes the sum
-  of the buckets as `count`, and `datadog_out` sketches the buckets.
-  - **Consequence:** a point with no buckets, which OTLP allows ("a population in terms of only the
-    sum and count"), leaves `otlp_out` with a `count` of 0, and `datadog_out` sends no sketch for
-    it, where Datadog's exporter would send one bucket of the whole count. A point whose `count`
-    disagrees with its buckets leaves with the buckets' total. Nothing counts either.
-  - **Revisit trigger:** a producer that sends bucketless histograms, which needs a `count` field
+- **A `Histogram` carries no point `count`, so a `count` that disagrees with the buckets is
+  lost.** `logit_core::Histogram`'s population is the sum of its buckets. `otlp_in` reads a point
+  with only `count` and `sum` as one `+Inf` bucket holding `count`, but a point whose `count`
+  isn't the sum of its `bucket_counts` keeps the buckets and loses the `count`, counted
+  `logit.input.metrics.degraded{reason="histogram_count_mismatch"}`
+  ([ADR `lossless-transit`](../adr/lossless-transit.md)'s 2026-10-21 amendment).
+  - **Consequence:** `otlp_out` writes such a point with the buckets' total as its `count`. The
+    point breaks `metrics.proto` ("The sum of the bucket_counts must equal the value in the count
+    field"), so only a nonconforming producer sends one.
+  - **Revisit trigger:** a producer whose points disagree by design, which needs a `count` field
     on `Histogram` (and its size checked against `docs/design/memory.md`).
+- **`otlp_out` writes Prometheus's `target_info` as a metric.** The OTel Prometheus compatibility
+  spec turns the `target` info metric into resource attributes rather than a metric, and
+  `otlp_out` writes it as any other info metric: a non-monotonic `Sum` named `target_info`.
+  - **Consequence:** a backend sees a `target_info` series, and the resource lacks its labels.
+  - **Revisit trigger:** an operator relaying a Prometheus target into OTLP who needs the resource
+    attributes. It needs `target_info` joined to its target's other batches by `job` and
+    `instance`, which `otlp_out` encodes one event at a time.
+- **A sketch's summary quantiles can be negative.** `metrics.proto` says "Quantile values must NOT
+  be negative", and `otlp_out` writes a `Distribution` or `Samples` holding a negative observation
+  as a `Summary` with a negative quantile value, quantile `0`, its minimum, among them.
+  - **Consequence:** a consumer that enforces the rule may refuse the point.
+  - **Revisit trigger:** a consumer that refuses one.
 - **`otlp_in` drops `keyStrindex`, `stringValueStrindex`, `entityRefs`, and `metadata`.** These
   fields belong to the profiles signal and to experimental parts of the data model. The JSON
   decoder skips them and the protobuf decoder never maps them

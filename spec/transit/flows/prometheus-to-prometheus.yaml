@@ -1,0 +1,12 @@
+# prometheus_in's scrape cases exposed by prometheus_out for a scrape, with nothing between: the
+# like pair, the scrape target carried as the `instance` label.
+# `path:` names one case so `logit run` can run this by hand; the transit spec runs every case in
+# that file's directory (spec/transit/README.md).
+components:
+  case:
+    type: replay_in
+    path: ../cases/prometheus/mixed.json
+  out:
+    type: prometheus_out
+    sources: [case]
+    bind: 127.0.0.1:9464

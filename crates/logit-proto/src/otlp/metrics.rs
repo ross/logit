@@ -35,18 +35,21 @@
 //! | `gauge/u64` | normalized | `u64_as_int`; `logit.output.metrics.normalized{reason=u64_as_double}` | A `u64` that fits an `int64` is `as_int` and reads back as an `i64`; one above `i64::MAX` is `as_double`, counted, and reads back as an `f64`. |
 //! | `gauge/bool` | normalized | `bool_value`; `logit.output.metrics.normalized{reason=bool_value}` | A boolean is `as_int` `1` or `0` and reads back as that integer. |
 //! | `gauge/negative` | exact | -- | A negative data point, written as is. |
+//! | `gauge/prometheus_info` | normalized | `prometheus_info_sum` | A cumulative non-monotonic OTLP `Sum` named `<name>_info`, as the OTel Prometheus compatibility spec's Info section (marked Development) has it, read back as that sum. |
+//! | `gauge/prometheus_stateset` | normalized | `prometheus_stateset_sum` | A cumulative non-monotonic OTLP `Sum`, as the OTel Prometheus compatibility spec's StateSet section (marked Development) has it, read back as that sum. |
 //! | `gauge_delta/f64` | dropped | `logit.output.metrics.dropped{reason=unresolved_gauge_delta}` | An unresolved relative adjustment is dropped, with a throttled `gauge_delta_unresolved` warning; an `aggregate` upstream resolves it into a gauge. |
 //! | `gauge_delta/i64` | dropped | `logit.output.metrics.dropped{reason=unresolved_gauge_delta}` | Dropped, as for a float adjustment. |
 //! | `gauge_delta/u64` | dropped | `logit.output.metrics.dropped{reason=unresolved_gauge_delta}` | Dropped, as for a float adjustment. |
 //! | `gauge_delta/bool` | dropped | `logit.output.metrics.dropped{reason=unresolved_gauge_delta}` | Dropped, as for a float adjustment. |
-//! | `samples` | degraded | `logit.output.metrics.degraded{metric_kind=samples}` | Sketched, each value weighted by its inverse sample rate, then an OTLP `Summary` of fixed quantiles. |
+//! | `samples` | degraded | `logit.output.metrics.degraded{metric_kind=samples}` | Sketched, each value weighted by its inverse sample rate, then written as the `distribution` row describes. |
 //! | `set_members` | skipped | `logit.output.metrics.skipped{metric_kind=set_members}` | OTLP has no cardinality type, so set members aren't written, with a throttled `otlp_set_members_metric_skipped` warning. |
-//! | `distribution` | degraded | `logit.output.metrics.degraded{metric_kind=distribution}` | An OTLP `Summary` of fixed quantiles with the sketch's own count and sum; OTLP has no mergeable sketch. |
+//! | `distribution` | degraded | `logit.output.metrics.degraded{metric_kind=distribution}` | An OTLP `Summary` of the sketch's `0` (its minimum), `0.5`, `0.75`, `0.9`, `0.95`, `0.99`, and `1` (its maximum) quantiles with its own count and sum; OTLP has no mergeable sketch. |
 //! | `set` | skipped | `logit.output.metrics.skipped{metric_kind=set}` | OTLP has no cardinality type, so a set estimate isn't written, with a throttled `otlp_set_metric_skipped` warning. |
 //! | `histogram/delta` | normalized | `inf_bucket` | An OTLP `Histogram` with delta temporality. OTLP requires an overflow count above the highest bound, so a histogram whose last bound is finite reads back with an empty `+Inf` bucket. |
 //! | `histogram/cumulative` | normalized | `inf_bucket` | An OTLP `Histogram` with cumulative temporality. OTLP requires an overflow count above the highest bound, so a histogram whose last bound is finite reads back with an empty `+Inf` bucket. |
 //! | `histogram/nan_bound` | degraded | `logit.output.metrics.degraded{reason=non_finite_component}` | OTLP bounds are finite, so a `NaN` bound's count joins the overflow bucket. `count` and every cumulative count are kept. |
 //! | `histogram/neg_inf_bound` | degraded | `logit.output.metrics.degraded{reason=non_finite_component}` | OTLP bounds are finite, so a `-Inf` bound's count joins the first bucket. `count` and every cumulative count are kept. |
+//! | `histogram/gauge_histogram` | skipped | `logit.output.metrics.skipped{metric_kind=gauge_histogram}` | The OTel Prometheus compatibility spec drops a GaugeHistogram, since OTLP has no histogram that isn't a running count, so it isn't written, with a throttled `otlp_gauge_histogram_skipped` warning. |
 //! | `exponential_histogram/delta` | exact | -- | An OTLP `ExponentialHistogram`, field for field. |
 //! | `exponential_histogram/cumulative` | exact | -- | An OTLP `ExponentialHistogram`, field for field. |
 //! | `summary/delta` | dropped | `logit.output.metrics.dropped{reason=unresolved_delta}` | OTLP defines every summary as cumulative, so a delta one is dropped, with a throttled `delta_summary_unresolved` warning. |
@@ -58,14 +61,16 @@
 //! | `record/sample_rate` | exact | -- | Each value is weighted by its inverse rate in the sketch the `samples` row describes. |
 //! | `record/superseded` | exact | -- | Each record is its own data point. |
 //! | `record/same_instant` | exact | -- | Each record is its own data point. |
+//! | `record/same_instant_equal` | exact | -- | Each record is its own data point. |
 //! | `record/same_millisecond` | exact | -- | Each record is its own data point, at its own nanosecond. |
+//! | `record/same_millisecond_equal` | exact | -- | Each record is its own data point, at its own nanosecond. |
 //! | `record/non_finite` | exact | -- | The non-finite `as_double`. |
 //! | `log/dogstatsd_event` | normalized | `observed_timestamp` | An OTLP log record. Its `_logit.statsd.event.*` carriers aren't attributes; otlp_out stamps an observed time on a log that has none, and otlp_in stamps the `_logit.otel.severity_*` carriers. |
 //! | `log/plain` | normalized | `observed_timestamp` | An OTLP log record. otlp_out stamps an observed time on a log that has none, and otlp_in stamps the `_logit.otel.severity_*` carriers. |
 //! | `span/alone` | exact | -- | An OTLP span. |
 //! | `span/no_wire_form` | exact | -- | OTLP carries the status, its message, `trace_state`, flags, and dropped counts. |
-//! | `event/attributes_only` | skipped | uncounted | An event with no metric, log, or span has no OTLP signal and isn't sent, uncounted. |
-//! | `event/string_only` | skipped | uncounted | An InfluxDB point whose fields are all strings has no OTLP signal and isn't sent, uncounted, so its fields are lost. |
+//! | `event/attributes_only` | skipped | `logit.output.events.skipped{reason=no_payload}` | An event with no metric, log, or span has no OTLP signal and isn't sent. |
+//! | `event/string_only` | skipped | `logit.output.events.skipped{reason=no_payload}` | An InfluxDB point whose fields are all strings has no OTLP signal and isn't sent, so its fields are lost. |
 //!
 //! Per field of a record that reaches the wire, attribute shape, and payload beside metrics:
 //!
@@ -75,19 +80,20 @@
 //! | `record/description` | exact | -- | The `Metric`'s `description`. |
 //! | `record/start_timestamp` | exact | -- | The data point's `start_time_unix_nano`. |
 //! | `record/exemplars` | exact | -- | The data point's exemplars. |
-//! | `record/exemplars_on_summary` | lost | uncounted | A `SummaryDataPoint` has no exemplars field, so a summary's exemplars are left off, uncounted. |
+//! | `record/exemplars_on_summary` | lost | structural | A `SummaryDataPoint` has no exemplars field, so a summary's exemplars are left off. |
 //! | `record/min_max` | exact | -- | The data point's `min` and `max`. |
 //! | `attributes/string_value` | exact | -- | A string attribute. |
 //! | `attributes/bool_value` | exact | -- | A boolean attribute. |
-//! | `attributes/number_value` | normalized | `u64_as_int` | An integer or double attribute. A `u64` reads back as an `i64`, or, above `i64::MAX`, as a double, approximate beyond 2^53, uncounted. |
+//! | `attributes/number_value` | normalized | `u64_as_int`; `logit.output.attributes.normalized{reason=u64_as_double}` | An integer or double attribute. A `u64` reads back as an `i64`, or, above `i64::MAX`, as a double, approximate beyond 2^53, counted once per such value. |
 //! | `attributes/array_value` | exact | -- | An array attribute. |
 //! | `attributes/map_value` | exact | -- | A key-value list attribute. |
 //! | `attributes/bytes_value` | exact | -- | A bytes attribute. |
 //! | `attributes/timestamp_value` | normalized | `timestamp_as_int` | OTLP has no timestamp value, so it's an integer of Unix nanoseconds. |
-//! | `attributes/foreign_carrier` | lost | uncounted | A `_logit.` carrier is private and isn't an OTLP attribute, uncounted. |
+//! | `attributes/prometheus_target` | lost | structural | The scrape target is private and isn't an OTLP attribute, so it's left off. |
+//! | `attributes/foreign_carrier` | lost | structural | A `_logit.` carrier is private and isn't an OTLP attribute, so it's left off. |
 //! | `attributes/resource_attribute` | exact | -- | A resource attribute. |
 //! | `attributes/scope` | exact | -- | The `InstrumentationScope` of the batch. |
-//! | `attributes/datadog_carrier_log` | lost | uncounted | A `_logit.` carrier is private and isn't an OTLP attribute, uncounted. |
+//! | `attributes/datadog_carrier_log` | lost | structural | A `_logit.` carrier is private and isn't an OTLP attribute, so it's left off. |
 //! | `attributes/no_host` | exact | -- | A record with no host leaves with none. |
 //! | `attributes/log_status` | exact | -- | The severity is the `LogRecord`'s own; no `status` attribute is written. |
 //! | `attributes/span_kind` | exact | -- | The kind is the `Span`'s own; no `span.kind` attribute is written. |
@@ -118,12 +124,20 @@
 //! - `Summary{quantiles,count,sum}` → `Summary`: a quantile outside `[0, 1]` is written as is;
 //!   `docs/known-gaps/mappings.md`'s "Cross-protocol semantic gaps" section has the row. OTLP's
 //!   summary is cumulative by definition, so a delta one is dropped (`summary/delta` above).
-//! - `Samples(s)` and `Distribution(sketch)` → `Summary` of `DISTRIBUTION_QUANTILES` (see "Lossy
-//!   metric kinds" below). A `Samples` is sketched first (`Samples::sketch`, each value weighted
+//! - `Samples(s)` and `Distribution(sketch)` → `Summary` of `SUMMARY_QUANTILES` (see "Lossy
+//!   metric kinds" below), whose `0` and `1` are the sketch's tracked minimum and maximum. A `Samples` is sketched first (`Samples::sketch`, each value weighted
 //!   by `Samples::weight`). The point's `count` and `sum` are the sketch's own; `sum` is
 //!   `DdSketch::sum`, exact unlike a quantile (approximate only when `DdSketch::stats_exact` is
 //!   `false`, i.e. the sketch's stats were derived from its bins). Its exemplars are left off,
-//!   uncounted, as a `Summary`'s are (`record/exemplars_on_summary` above).
+//!   as a `Summary`'s are (`record/exemplars_on_summary` above): the wire type has no field for
+//!   them, a structural loss with no counter.
+//! - An OpenMetrics type `prometheus_in` carried as `_logit.prometheus.type` follows the OTel
+//!   Prometheus and OpenMetrics compatibility spec's "Prometheus/OpenMetrics to OTLP": a
+//!   `gaugehistogram` `Histogram` isn't written, counted
+//!   `logit.output.metrics.skipped{metric_kind="gauge_histogram"}`, and an `info` or `stateset`
+//!   `Gauge` is a cumulative non-monotonic `Sum`, an `info` one named `<name>_info`. The spec marks
+//!   its Info and StateSet sections Development. Its `target_info` exception, resource attributes
+//!   in place of a metric, isn't implemented (`docs/known-gaps/otlp.md`).
 //!
 //! **Lossy metric kinds.** OTLP has no mergeable-sketch type. `ExponentialHistogram` is the nearest
 //! shape, but its base is `2^(2^-scale)` and a `DdSketch`'s γ isn't (1.015625 under
@@ -140,7 +154,11 @@
 //! `Histogram` → `Histogram{buckets,temporality,sum,min,max}`, rebuilding the trailing infinite
 //! bucket when `bucket_counts` has one more entry than `explicit_bounds` (the OTLP-mandated
 //! shape), even when its count is `0`, so `otlp_in -> otlp_out` writes a conforming point's lists
-//! back as they arrived. `Summary` → `Summary{quantiles,count,sum}`, `Cumulative`, each quantile
+//! back as they arrived. `Histogram` has no `count` of its own, so a point with no buckets and a
+//! nonzero `count` decodes as one `+Inf` bucket holding it, which `otlp_out` writes back as one
+//! bucket count and no bounds, a permitted normalization (ADR `lossless-transit`). A point whose
+//! `count` isn't the sum of its buckets keeps the buckets, counted
+//! `logit.input.metrics.degraded{reason="histogram_count_mismatch"}`. `Summary` → `Summary{quantiles,count,sum}`, `Cumulative`, each quantile
 //! read with no range check.
 //! `ExponentialHistogram` → `ExponentialHistogram` field for field (scale, zero count and
 //! threshold, positive and negative offset and bucket counts, temporality, count, sum/min/max),
@@ -173,6 +191,13 @@ use logit_core::{
 /// The quantiles every sketch-to-quantiles degradation in this crate reports. `crate::prometheus`
 /// and `crate::graphite` share them so one metric describes itself the same way at every sink.
 pub(crate) const DISTRIBUTION_QUANTILES: [f64; 5] = [0.5, 0.75, 0.90, 0.95, 0.99];
+
+/// [`DISTRIBUTION_QUANTILES`] between `0` and `1`, the quantiles a sketch written as a summary
+/// reports. `metrics.proto`'s `ValueAtQuantile` reads `0` as the minimum observed and `1` as the
+/// maximum, and `DdSketch::quantile` answers them with the sketch's own `min` and `max`, so a
+/// summary keeps the extremes. A dotted expansion writes `.min` and `.max` instead, so
+/// `crate::multi_value` reads [`DISTRIBUTION_QUANTILES`].
+pub(crate) const SUMMARY_QUANTILES: [f64; 7] = [0.0, 0.5, 0.75, 0.90, 0.95, 0.99, 1.0];
 
 fn temporality_to_pb(t: Temporality) -> i32 {
     match t {
@@ -309,14 +334,15 @@ fn number_value(value: Option<pb::number_data_point::Value>) -> MetricValue {
 }
 
 /// Encodes one `(Event, MetricRecord)` pair into one OTLP `Metric`, or `None` for a skipped
-/// `Set`/`SetMembers`, or a dropped `GaugeDelta` or delta `Summary` (counted; see the module doc).
+/// `Set`/`SetMembers` or OpenMetrics gaugehistogram, or a dropped `GaugeDelta` or delta `Summary`
+/// (counted; see the module doc).
 pub(crate) fn encode_metric(
     event: &Event,
     record: &MetricRecord,
     telemetry: &Telemetry,
     diagnostics: &mut Diagnostics,
 ) -> Option<pb::Metric> {
-    let name = resolve(record.name).to_string();
+    let mut name = resolve(record.name).to_string();
     let unit = record.unit.map(resolve).unwrap_or_default().to_string();
     let description = record.description.map(resolve).unwrap_or_default().to_string();
     let attributes = common::attrs_to_key_values(&event.attributes);
@@ -325,7 +351,49 @@ pub(crate) fn encode_metric(
     // Only the four kinds below carry exemplars on the wire, so only they count a normalization.
     let exemplars = || encode_exemplars(&record.exemplars, telemetry);
 
+    let prometheus_type =
+        event.attributes.get(crate::prometheus::ATTR_TYPE).and_then(|v| v.as_str());
+
     let data = match &record.kind {
+        // The OTel Prometheus compatibility spec ("Prometheus/OpenMetrics to OTLP") drops a
+        // GaugeHistogram, and OTLP has no histogram that isn't a running count.
+        MetricKind::Histogram(_) if prometheus_type == Some("gaugehistogram") => {
+            telemetry.count(
+                "logit.output.metrics.skipped",
+                1.0,
+                &[("metric_kind", "gauge_histogram")],
+            );
+            diagnostics.warn_throttled(
+                "otlp_gauge_histogram_skipped",
+                format_args!(
+                    "metric '{name}' is an OpenMetrics gaugehistogram, which the OTel Prometheus \
+                     compatibility spec drops -- skipped"
+                ),
+            );
+            return None;
+        }
+        // The same spec's Info and StateSet sections, marked Development, make each a
+        // non-monotonic Sum, so the `1` sums when a label is aggregated away. `prometheus_in`
+        // strips an info family's `_info` suffix from the name; the OTLP name keeps it, as the
+        // Collector's Prometheus receiver does.
+        MetricKind::Gauge(v) if matches!(prometheus_type, Some("info" | "stateset")) => {
+            if prometheus_type == Some("info") {
+                name.push_str("_info");
+            }
+            pb::metric::Data::Sum(pb::Sum {
+                data_points: vec![number_data_point(
+                    attributes,
+                    start,
+                    ts,
+                    record.flags,
+                    exemplars(),
+                    *v,
+                    telemetry,
+                )],
+                aggregation_temporality: temporality_to_pb(Temporality::Cumulative),
+                is_monotonic: false,
+            })
+        }
         MetricKind::Sum(s) => pb::metric::Data::Sum(pb::Sum {
             data_points: vec![number_data_point(
                 attributes,
@@ -573,7 +641,7 @@ fn distribution_summary_point(
     flags: u32,
     sketch: &DdSketch,
 ) -> pb::SummaryDataPoint {
-    let quantile_values = DISTRIBUTION_QUANTILES
+    let quantile_values = SUMMARY_QUANTILES
         .iter()
         .filter_map(|q| {
             sketch
@@ -590,6 +658,37 @@ fn distribution_summary_point(
         quantile_values,
         flags,
     }
+}
+
+/// A `HistogramDataPoint`'s `bucket_counts` and `explicit_bounds` → the model's buckets, the
+/// count past the last bound under `+Inf`. A point with no buckets but a nonzero `count`, which
+/// `metrics.proto` allows when only the count and sum are known, becomes one `+Inf` bucket of
+/// that count, since `Histogram` has no `count` of its own. A point whose `count` isn't the sum
+/// of its buckets keeps its buckets, counted
+/// `logit.input.metrics.degraded{reason="histogram_count_mismatch"}`: they're the distribution, and
+/// `metrics.proto` requires the two to agree.
+fn histogram_buckets_from_pb(
+    dp: &pb::HistogramDataPoint,
+    telemetry: &Telemetry,
+) -> Vec<(f64, u64)> {
+    if dp.bucket_counts.is_empty() {
+        return if dp.count == 0 { Vec::new() } else { vec![(f64::INFINITY, dp.count)] };
+    }
+    let mut buckets = Vec::with_capacity(dp.bucket_counts.len());
+    let mut total = 0u64;
+    for (i, count) in dp.bucket_counts.iter().enumerate() {
+        let bound = dp.explicit_bounds.get(i).copied().unwrap_or(f64::INFINITY);
+        buckets.push((bound, *count));
+        total = total.saturating_add(*count);
+    }
+    if total != dp.count {
+        telemetry.count(
+            "logit.input.metrics.degraded",
+            1.0,
+            &[("reason", "histogram_count_mismatch")],
+        );
+    }
+    buckets
 }
 
 /// Decodes one OTLP `Metric` into one `Event` per data point. Never fails; a `NO_RECORDED_VALUE`
@@ -655,11 +754,7 @@ pub(crate) fn decode_metric(
                 .map(|dp| {
                     let mut attrs = base_attrs.clone();
                     let ts = common::wire_nanos(dp.time_unix_nano);
-                    let mut buckets = Vec::with_capacity(dp.bucket_counts.len());
-                    for (i, count) in dp.bucket_counts.iter().enumerate() {
-                        let bound = dp.explicit_bounds.get(i).copied().unwrap_or(f64::INFINITY);
-                        buckets.push((bound, *count));
-                    }
+                    let buckets = histogram_buckets_from_pb(&dp, telemetry);
                     let start_timestamp = common::wire_nanos(dp.start_time_unix_nano);
                     let flags = dp.flags;
                     let exemplars = decode_exemplars(dp.exemplars);
@@ -1076,7 +1171,7 @@ mod tests {
     }
 
     #[test]
-    fn a_samples_metric_encodes_as_a_five_quantile_summary_and_is_counted_degraded() {
+    fn a_samples_metric_encodes_as_a_summary_with_its_extremes_and_is_counted_degraded() {
         let samples = {
             let mut s = Samples::new([1.0, 2.0, 3.0, 4.0, 5.0]);
             s.sample_rate = 1.0;
@@ -1090,7 +1185,14 @@ mod tests {
                 .unwrap();
         match metric.data.unwrap() {
             pb::metric::Data::Summary(s) => {
-                assert_eq!(s.data_points[0].quantile_values.len(), 5, "p50/p75/p90/p95/p99");
+                let quantiles: Vec<(f64, f64)> = s.data_points[0]
+                    .quantile_values
+                    .iter()
+                    .map(|q| (q.quantile, q.value))
+                    .collect();
+                assert_eq!(quantiles.len(), 7, "min, p50/p75/p90/p95/p99, max");
+                assert_eq!(quantiles.first(), Some(&(0.0, 1.0)), "quantile 0 is the minimum");
+                assert_eq!(quantiles.last(), Some(&(1.0, 5.0)), "quantile 1 is the maximum");
                 assert_eq!(s.data_points[0].count, 5);
                 assert_eq!(s.data_points[0].sum, 15.0);
             }
@@ -1118,14 +1220,14 @@ mod tests {
         match metric.data.unwrap() {
             pb::metric::Data::Summary(s) => {
                 assert_eq!(s.data_points[0].count, 2);
-                assert_eq!(s.data_points[0].quantile_values.len(), 5);
+                assert_eq!(s.data_points[0].quantile_values.len(), 7);
             }
             other => panic!("expected Summary, got {other:?}"),
         }
     }
 
     #[test]
-    fn a_distribution_encodes_as_a_five_quantile_summary_and_is_counted_degraded() {
+    fn a_distribution_encodes_as_a_summary_with_its_extremes_and_is_counted_degraded() {
         let mut sketch = DdSketch::new();
         for v in [1.0, 2.0, 3.0, 4.0, 5.0] {
             sketch.add(v);
@@ -1142,7 +1244,14 @@ mod tests {
         .unwrap();
         match metric.data.unwrap() {
             pb::metric::Data::Summary(s) => {
-                assert_eq!(s.data_points[0].quantile_values.len(), 5, "p50/p75/p90/p95/p99");
+                let quantiles: Vec<(f64, f64)> = s.data_points[0]
+                    .quantile_values
+                    .iter()
+                    .map(|q| (q.quantile, q.value))
+                    .collect();
+                assert_eq!(quantiles.len(), 7, "min, p50/p75/p90/p95/p99, max");
+                assert_eq!(quantiles.first(), Some(&(0.0, 1.0)), "quantile 0 is the minimum");
+                assert_eq!(quantiles.last(), Some(&(1.0, 5.0)), "quantile 1 is the maximum");
                 assert_eq!(s.data_points[0].count, 5);
                 assert_eq!(s.data_points[0].sum, 15.0);
             }
@@ -1252,6 +1361,161 @@ mod tests {
                 })
         });
         assert!(dropped, "should count logit.output.metrics.dropped{{reason=unresolved_delta}}");
+    }
+
+    /// Whether `registry` holds a count of `name` tagged `tag`.
+    fn counted_in(registry: &Registry, name: &str, tag: (&str, &str)) -> bool {
+        registry.drain(0).iter().any(|e| {
+            e.attributes.get(tag.0).and_then(|v| v.as_str()) == Some(tag.1)
+                && e.metrics.iter().any(|m| logit_core::interner::resolve(m.name) == name)
+        })
+    }
+
+    /// An event `prometheus_in` marked with OpenMetrics family type `family`.
+    fn prometheus_event(family: &str) -> Event {
+        let mut attrs = AttrMap::new();
+        attrs.insert(crate::prometheus::ATTR_TYPE, family);
+        Event::empty(1000, attrs)
+    }
+
+    /// The OTel Prometheus compatibility spec drops a GaugeHistogram.
+    #[test]
+    fn a_gaugehistogram_is_skipped_and_counted() {
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("otlp_out", "otlp_out", "sink");
+        let mut diag = Diagnostics::new("otlp_out");
+        let rec = record(MetricKind::Histogram(histogram(Temporality::Cumulative)));
+        let event = prometheus_event("gaugehistogram");
+        assert!(encode_metric(&event, &rec, &telemetry, &mut diag).is_none());
+        assert_eq!(diag.occurrences("otlp_gauge_histogram_skipped"), 1);
+        assert!(counted_in(
+            &registry,
+            "logit.output.metrics.skipped",
+            ("metric_kind", "gauge_histogram")
+        ));
+    }
+
+    /// An OpenMetrics info or stateset is a cumulative non-monotonic `Sum`, and an info metric
+    /// gets back the `_info` suffix `prometheus_in` strips.
+    #[test]
+    fn an_info_or_stateset_gauge_encodes_as_a_non_monotonic_sum() {
+        for (family, name) in [("info", "m_info"), ("stateset", "m")] {
+            let mut diag = Diagnostics::default();
+            let rec = record(MetricKind::gauge(1.0));
+            let metric =
+                encode_metric(&prometheus_event(family), &rec, &Telemetry::default(), &mut diag)
+                    .unwrap();
+            assert_eq!(metric.name, name, "{family}");
+            match metric.data {
+                Some(pb::metric::Data::Sum(sum)) => {
+                    assert!(!sum.is_monotonic, "{family}");
+                    assert_eq!(
+                        sum.aggregation_temporality,
+                        pb::AggregationTemporality::Cumulative as i32
+                    );
+                    assert_eq!(number_value(sum.data_points[0].value), MetricValue::F64(1.0));
+                }
+                other => panic!("{family}: expected Sum, got {other:?}"),
+            }
+        }
+    }
+
+    /// A family type the spec maps like its kind changes nothing.
+    #[test]
+    fn an_unknown_family_gauge_stays_a_gauge() {
+        let mut diag = Diagnostics::default();
+        let rec = record(MetricKind::gauge(3.0));
+        let metric =
+            encode_metric(&prometheus_event("unknown"), &rec, &Telemetry::default(), &mut diag)
+                .unwrap();
+        assert_eq!(metric.name, "m");
+        assert!(matches!(metric.data, Some(pb::metric::Data::Gauge(_))));
+    }
+
+    fn histogram_metric(dp: pb::HistogramDataPoint) -> pb::Metric {
+        pb::Metric {
+            name: "h".to_string(),
+            data: Some(pb::metric::Data::Histogram(pb::Histogram {
+                data_points: vec![dp],
+                aggregation_temporality: pb::AggregationTemporality::Cumulative as i32,
+            })),
+            ..Default::default()
+        }
+    }
+
+    fn decoded_buckets(events: &[Event]) -> Vec<(f64, u64)> {
+        match &events[0].metrics[0].kind {
+            MetricKind::Histogram(h) => h.buckets.clone(),
+            other => panic!("expected Histogram, got {other:?}"),
+        }
+    }
+
+    /// A point with only `count` and `sum` keeps its population as one `+Inf` bucket, which
+    /// `otlp_out` writes back as one bucket count and no bounds.
+    #[test]
+    fn a_bucketless_histogram_point_decodes_as_one_inf_bucket_of_its_count() {
+        let dp = pb::HistogramDataPoint { count: 12, sum: Some(30.0), ..Default::default() };
+        let events = decode_metric(histogram_metric(dp), &AttrMap::new(), &Telemetry::default());
+        assert_eq!(decoded_buckets(&events), vec![(f64::INFINITY, 12)]);
+        let mut diag = Diagnostics::default();
+        let metric =
+            encode_metric(&events[0], &events[0].metrics[0], &Telemetry::default(), &mut diag)
+                .unwrap();
+        match metric.data {
+            Some(pb::metric::Data::Histogram(h)) => {
+                let dp = &h.data_points[0];
+                assert_eq!((dp.count, dp.bucket_counts.clone()), (12, vec![12]));
+                assert!(dp.explicit_bounds.is_empty());
+            }
+            other => panic!("expected Histogram, got {other:?}"),
+        }
+    }
+
+    /// An empty bucketless point has no population to place, so it stays bucketless.
+    #[test]
+    fn an_empty_bucketless_histogram_point_decodes_with_no_buckets() {
+        let dp = pb::HistogramDataPoint::default();
+        let events = decode_metric(histogram_metric(dp), &AttrMap::new(), &Telemetry::default());
+        assert_eq!(decoded_buckets(&events), vec![]);
+    }
+
+    /// The buckets win over a `count` that disagrees with them, and the mismatch is counted.
+    #[test]
+    fn a_count_that_disagrees_with_the_buckets_keeps_the_buckets_and_is_counted() {
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("otlp_in", "otlp_in", "input");
+        let dp = pb::HistogramDataPoint {
+            count: 10,
+            bucket_counts: vec![3, 4],
+            explicit_bounds: vec![1.0],
+            ..Default::default()
+        };
+        let events = decode_metric(histogram_metric(dp), &AttrMap::new(), &telemetry);
+        assert_eq!(decoded_buckets(&events), vec![(1.0, 3), (f64::INFINITY, 4)]);
+        assert!(counted_in(
+            &registry,
+            "logit.input.metrics.degraded",
+            ("reason", "histogram_count_mismatch")
+        ));
+    }
+
+    /// A conforming point counts nothing.
+    #[test]
+    fn a_count_that_agrees_with_the_buckets_counts_nothing() {
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("otlp_in", "otlp_in", "input");
+        let dp = pb::HistogramDataPoint {
+            count: 7,
+            bucket_counts: vec![3, 4],
+            explicit_bounds: vec![1.0],
+            ..Default::default()
+        };
+        decode_metric(histogram_metric(dp), &AttrMap::new(), &telemetry);
+        assert!(!counted_in(
+            &registry,
+            "logit.input.metrics.degraded",
+            ("reason", "histogram_count_mismatch")
+        ));
     }
 
     #[test]

@@ -3457,6 +3457,7 @@ fn remote_write_counter(
 ) -> MetricFamily {
     let mut family = MetricFamily::new(name, FamilyType::Counter);
     family.series.push(Series {
+        increment: false,
         labels: Vec::new(),
         point: Point::Counter(value),
         timestamp: Some(timestamp),
@@ -3538,6 +3539,7 @@ fn remote_write_every_series_of_a_family_carries_one_description() {
         let mut family = MetricFamily::new("g", FamilyType::Gauge);
         family.help = help.map(String::from);
         family.series.push(Series {
+            increment: false,
             labels: vec![("a".to_string(), value.to_string())],
             point: Point::Gauge(1.0),
             timestamp: Some(if help.is_some() { 1_000_000_000 } else { 0 }),

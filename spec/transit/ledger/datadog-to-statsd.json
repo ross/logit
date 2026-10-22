@@ -13,6 +13,7 @@
     {"sink":"statsd_out","row":"log/dogstatsd_event","cell":1,"observed":["exact"]},
     {"sink":"statsd_out","row":"log/plain","cell":0,"observed":["skipped"]},
     {"sink":"statsd_out","row":"record/same_instant","cell":0,"observed":["exact"]},
+    {"sink":"statsd_out","row":"record/same_instant_equal","cell":0,"observed":["exact"]},
     {"sink":"statsd_out","row":"record/service_check","cell":1,"observed":["exact"]},
     {"sink":"statsd_out","row":"record/superseded","cell":0,"observed":["exact"]},
     {"sink":"statsd_out","row":"record/unit","cell":0,"observed":["lost"]},

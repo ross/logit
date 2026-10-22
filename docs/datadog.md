@@ -156,6 +156,45 @@ last point before the restart and the first after it are lost. A delta point res
 transport error double-counts at Datadog's sketch route, though a series `count` point
 overwrites at its series and timestamp.
 
+### collectd to Datadog: `collectd_in` into `datadog_out`
+
+A collectd fleet's `network` plugin can send to `collectd_in`, and `datadog_out` writes each
+data-source type as follows
+([fixtures/collectd-to-datadog.yaml](../fixtures/collectd-to-datadog.yaml)):
+
+| collectd type | `logit` model | What Datadog gets |
+|---|---|---|
+| GAUGE | `Gauge` | a `gauge` |
+| ABSOLUTE | delta monotonic `Sum` | a `count` |
+| COUNTER | cumulative monotonic `Sum` | dropped, unless a `cumulative_to_delta` upstream makes it a `count` |
+| DERIVE | cumulative non-monotonic `Sum` | a `gauge` of the running total, unless a `cumulative_to_delta` with `non_monotonic:` set makes it a `count` |
+
+COUNTER and DERIVE are running totals, and a Datadog `count` is a per-interval delta, so place a
+`cumulative_to_delta` between `collectd_in` and `datadog_out`. It converts COUNTER as it is,
+with one difference from collectd: collectd reads a COUNTER that went down as a wrap and adds
+2^32 or 2^64, but `cumulative_to_delta` reads it as a reset and sends the new value, so the
+increase between the previous value and the wrap point is lost.
+DERIVE converts only under `non_monotonic:`, because collectd marks it non-monotonic: collectd
+can't detect a DERIVE reset, so it can't promise the value never goes down.
+
+- **`non_monotonic: reset_on_decrease`** reads a DERIVE that went down as a counter restart and
+  sends the new value, as for COUNTER. Use it for the stock collectd types, whose DERIVE sources
+  have a minimum of 0 (`if_octets`, `disk_octets`, `cpu`), so collectd itself discards a negative
+  rate as a reset.
+- **`non_monotonic: difference`** sends a decrease as a negative `count`. Use it only when every
+  DERIVE that reaches it can go down for real. A collectd value list has no start time, so under
+  `difference` a counter reset after a host reboot reads as one large negative `count`: the
+  previous total subtracted from the new one.
+
+Without `cumulative_to_delta`, `datadog_out` drops COUNTER, counted
+`logit.output.metrics.dropped{reason="unresolved_cumulative"}`, and writes DERIVE as a `gauge` of
+its running total, counted `logit.output.metrics.degraded{metric_kind="non_monotonic_sum"}`. A
+converted DERIVE stays non-monotonic, so its `count` is counted under that name too.
+
+A value list carries no start time, so under the default `initial_value: auto` each series'
+first point only records a baseline, at startup and after a restart of `logit`. Set
+`max_staleness` above collectd's longest `Interval`.
+
 ### From Datadog: dual-ship, tee, then cut over
 
 A migration away from Datadog runs through the intake stand-in in three stages:
@@ -213,6 +252,25 @@ bounds, so on a metric with 99 or 100 tags it's dropped; a summary's `.quantile`
 one more, its quantile, so on a metric with 100 tags it's dropped. Each counts one, and the
 metric's other series go out. To keep a metric, cut
 its tags upstream with `keep` or `remove`.
+
+### Two points of one series in one second leave as one
+
+Datadog keeps one point per series per second: the higher of two in one request, the later
+across requests, and a `count` isn't summed. So of each batch's series points, `datadog_out`
+sends the latest point of a series in one second and leaves the others off, counted
+`logit.output.metrics.dropped{reason="duplicate_timestamp"}` with a throttled
+`duplicate_timestamp` diagnostic. A gauge (not a `rate`) or a cumulative kind equal to the point
+sent (the same value, type, unit, interval, source type, and origin) is counted
+`logit.output.metrics.normalized{reason="duplicate_timestamp"}` instead, since Datadog stores the
+same point either way: an Agent relay or a retry resending identical gauges raises no loss alarm.
+Two equal delta counts or `rate`s are two increments, and only one is sent, so they count
+`dropped`. A series is the metric name, the tag set, and the host, device, and resources.
+Distribution points aren't collapsed, because Datadog keeps both. A relay that
+keeps source timestamps from a source stamping several readings of one series in a second (an
+Agent's unaggregated `|T` gauges, `statsd_in` gauges, `internal`) shows a nonzero dropped count.
+Put a `dedup_timestamps` with `precision: 1s` last before the sink: it keeps the latest gauge and
+sums deltas and `rate`s of one interval. Two points of one series in one second that arrive in two batches are both sent, and
+Datadog keeps the later, uncounted (`docs/known-gaps/datadog.md`).
 
 The series route also names what it dropped from an accepted request in its `202` body, such as
 a point more than 10 minutes in the future when the sender's clock runs ahead. `datadog_out`

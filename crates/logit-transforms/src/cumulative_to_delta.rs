@@ -4,8 +4,10 @@
 //!
 //! **What converts.** A cumulative monotonic `Sum`, a cumulative `Histogram` and
 //! `ExponentialHistogram`, and a cumulative `Summary` (its `count` and `sum`; the quantiles pass
-//! as they are). Every other record, a flagged `NO_RECORDED_VALUE` one included, passes through
-//! untouched and keeps no state.
+//! as they are). A cumulative non-monotonic `Sum` converts only under [`NonMonotonic::Difference`],
+//! where a decrease is a negative delta and never a reset, or [`NonMonotonic::ResetOnDecrease`],
+//! where it's handled as a monotonic one (the ADR's non-monotonic amendment). Every other record,
+//! a flagged `NO_RECORDED_VALUE` one included, passes through untouched and keeps no state.
 //!
 //! **The series key** is the record's name, unit, and [`Kind`], the batch's resource and scope,
 //! and the event's attributes. The start time is stored with the baseline, not keyed.
@@ -17,7 +19,9 @@
 //!    the point becomes the baseline;
 //! 2. a timestamp at or before the tracked one: skipped, baseline unchanged;
 //! 3. a value that went down, or a nonzero start later than the previous point's timestamp and
-//!    unequal to the point's own: a reset, emitted in full, and the new baseline;
+//!    unequal to the point's own: a reset, emitted in full, and the new baseline. Under
+//!    `NonMonotonic::Difference` a non-monotonic `Sum`'s decrease isn't a reset, so only the start
+//!    rule applies to it;
 //! 4. a layout change (a `Histogram`'s bounds, an `ExponentialHistogram`'s scale going up or its
 //!    zero threshold going down): dropped, and the new baseline;
 //! 5. any other start change: differenced, the new start stored, counted `start_adjusted`;
@@ -79,6 +83,19 @@ pub enum InitialValue {
     Drop,
 }
 
+/// What a cumulative non-monotonic `Sum` does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NonMonotonic {
+    /// Passes through untouched, with no state.
+    #[default]
+    Pass,
+    /// Differenced; a decrease is a negative delta, and only a start moved past the previous
+    /// point is a reset.
+    Difference,
+    /// Differenced as a monotonic `Sum` is: a decrease is a reset, emitted in full.
+    ResetOnDecrease,
+}
+
 /// The converted kind a series holds, part of its key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Kind {
@@ -86,16 +103,30 @@ enum Kind {
     Histogram,
     ExponentialHistogram,
     Summary,
+    NonMonotonicSum,
 }
 
 impl Kind {
-    fn of(record: &MetricRecord) -> Option<Kind> {
+    const ALL: [Kind; 5] = [
+        Kind::Sum,
+        Kind::Histogram,
+        Kind::ExponentialHistogram,
+        Kind::Summary,
+        Kind::NonMonotonicSum,
+    ];
+
+    fn of(record: &MetricRecord, non_monotonic: NonMonotonic) -> Option<Kind> {
         if record.is_no_recorded_value() {
             return None;
         }
         let cumulative = |t: Temporality| t == Temporality::Cumulative;
         match &record.kind {
             MetricKind::Sum(s) if cumulative(s.temporality) && s.monotonic => Some(Kind::Sum),
+            MetricKind::Sum(s)
+                if cumulative(s.temporality) && non_monotonic != NonMonotonic::Pass =>
+            {
+                Some(Kind::NonMonotonicSum)
+            }
             MetricKind::Histogram(h) if cumulative(h.temporality) => Some(Kind::Histogram),
             MetricKind::ExponentialHistogram(e) if cumulative(e.temporality) => {
                 Some(Kind::ExponentialHistogram)
@@ -111,6 +142,7 @@ impl Kind {
             Kind::Histogram => "histogram",
             Kind::ExponentialHistogram => "exponential_histogram",
             Kind::Summary => "summary",
+            Kind::NonMonotonicSum => "non_monotonic_sum",
         }
     }
 }
@@ -251,7 +283,7 @@ struct Series {
 /// One batch's tallies, emitted by `end_batch`.
 #[derive(Default)]
 struct Tally {
-    converted: [u64; 4],
+    converted: [u64; Kind::ALL.len()],
     skipped_initial: u64,
     skipped_duplicate: u64,
     skipped_out_of_order: u64,
@@ -267,6 +299,7 @@ struct Tally {
 /// The `cumulative_to_delta` transform. See the module doc.
 pub struct CumulativeToDelta {
     initial: InitialValue,
+    non_monotonic: NonMonotonic,
     max_staleness: i64,
     max_series: usize,
     clock: Clock,
@@ -305,6 +338,7 @@ impl CumulativeToDelta {
         let clock: Clock = Box::new(wall_clock_nanos);
         Self {
             initial,
+            non_monotonic: NonMonotonic::Pass,
             max_staleness: i64::try_from(max_staleness.as_nanos()).unwrap_or(i64::MAX),
             max_series: max_series.max(1),
             started: clock(),
@@ -325,6 +359,12 @@ impl CumulativeToDelta {
             telemetry: Telemetry::default(),
             diag: Diagnostics::default(),
         }
+    }
+
+    /// Sets what a cumulative non-monotonic `Sum` does; it passes through by default.
+    pub fn with_non_monotonic(mut self, non_monotonic: NonMonotonic) -> Self {
+        self.non_monotonic = non_monotonic;
+        self
     }
 
     /// Counts the ADR's telemetry into `telemetry`.
@@ -521,7 +561,7 @@ impl CumulativeToDelta {
         attributes: &AttrMap,
         record: &mut MetricRecord,
     ) -> bool {
-        let Some(kind) = Kind::of(record) else { return true };
+        let Some(kind) = Kind::of(record, self.non_monotonic) else { return true };
         if let MetricKind::Sum(s) = &record.kind {
             if !s.value.is_finite() {
                 self.tally.dropped_non_finite += 1;
@@ -590,7 +630,10 @@ impl CumulativeToDelta {
             return false;
         }
         let layout = align(&mut series.base, &record.kind);
-        let decreased = decreased(&series.base, &record.kind, layout);
+        // An up-down counter's decrease is a negative delta, not evidence of a restart.
+        let signed =
+            kind == Kind::NonMonotonicSum && self.non_monotonic == NonMonotonic::Difference;
+        let decreased = !signed && decreased(&series.base, &record.kind, layout);
         let restarted = start != 0 && start > series.ts && start != ts;
         if decreased || restarted {
             if decreased {
@@ -622,7 +665,7 @@ impl CumulativeToDelta {
             series.start = start;
             self.tally.start_adjusted += 1;
         }
-        difference(&mut series.base, &mut record.kind, &mut self.scratch);
+        difference(&mut series.base, &mut record.kind, signed, &mut self.scratch);
         record.start_timestamp = series.ts;
         series.ts = ts;
         self.touch(slot, now);
@@ -664,23 +707,32 @@ fn exact_int(v: MetricValue) -> Option<i128> {
     }
 }
 
-/// `cur - prev` in `cur`'s type where it fits (a `Bool` as an `I64`), else an `F64`; `None` when
-/// `cur` is below `prev`.
-fn value_delta(cur: MetricValue, prev: MetricValue) -> Option<MetricValue> {
+/// `cur - prev` in `cur`'s type where it fits (a `Bool`, or a `U64` going negative, as an
+/// `I64`), else an `F64`.
+fn signed_delta(cur: MetricValue, prev: MetricValue) -> MetricValue {
     match (exact_int(cur), exact_int(prev)) {
+        // Both are within 64 bits, so the `i128` difference can't overflow.
         (Some(c), Some(p)) => {
-            let d = c.checked_sub(p).filter(|d| *d >= 0)?;
+            let d = c - p;
             let fallback = MetricValue::F64(d as f64);
-            Some(match cur {
-                MetricValue::U64(_) => u64::try_from(d).map_or(fallback, MetricValue::U64),
+            match cur {
+                MetricValue::U64(_) if d >= 0 => {
+                    u64::try_from(d).map_or(fallback, MetricValue::U64)
+                }
                 _ => i64::try_from(d).map_or(fallback, MetricValue::I64),
-            })
+            }
         }
-        _ => {
-            let (c, p) = (cur.as_f64(), prev.as_f64());
-            (c >= p).then_some(MetricValue::F64(c - p))
-        }
+        _ => MetricValue::F64(cur.as_f64() - prev.as_f64()),
     }
+}
+
+/// [`signed_delta`], or `None` when `cur` is below `prev`.
+fn value_delta(cur: MetricValue, prev: MetricValue) -> Option<MetricValue> {
+    let below = match (exact_int(cur), exact_int(prev)) {
+        (Some(c), Some(p)) => c < p,
+        _ => cur.as_f64() < prev.as_f64(),
+    };
+    (!below).then(|| signed_delta(cur, prev))
 }
 
 /// The count at absolute index `idx` of an exponential histogram side, `0` outside it.
@@ -810,12 +862,16 @@ fn sum_delta(cur: Option<f64>, prev: Option<f64>) -> Option<f64> {
 }
 
 /// Replaces `kind` with its difference from `base`, and `base` with `kind`'s point. The caller
-/// has ruled out a decrease and a layout change.
-fn difference(base: &mut Baseline, kind: &mut MetricKind, scratch: &mut Vec<u64>) {
+/// has ruled out a layout change, and a decrease unless `signed`, which lets a `Sum` go negative.
+fn difference(base: &mut Baseline, kind: &mut MetricKind, signed: bool, scratch: &mut Vec<u64>) {
     match (base, kind) {
         (Baseline::Sum(prev), MetricKind::Sum(s)) => {
             let cur = s.value;
-            s.value = value_delta(cur, *prev).expect("no decrease");
+            s.value = if signed {
+                signed_delta(cur, *prev)
+            } else {
+                value_delta(cur, *prev).expect("no decrease")
+            };
             s.temporality = Temporality::Delta;
             *prev = cur;
         }
@@ -904,7 +960,7 @@ impl Transform for CumulativeToDelta {
                 tel.count(name, n as f64, tags);
             }
         };
-        for kind in [Kind::Sum, Kind::Histogram, Kind::ExponentialHistogram, Kind::Summary] {
+        for kind in Kind::ALL {
             count(
                 "logit.transform.metrics.converted",
                 t.converted[kind as usize],
@@ -1360,7 +1416,8 @@ mod tests {
 
     // ---- What passes through --------------------------------------------------------------------
 
-    /// Every kind the transform doesn't convert passes untouched and tracks no series.
+    /// Every kind the transform doesn't convert, a non-monotonic sum under the default `pass`
+    /// included, passes untouched and tracks no series.
     #[test]
     fn unconverted_kinds_pass_through_untouched() {
         let mut rig = Rig::new(InitialValue::Drop);
@@ -1385,6 +1442,84 @@ mod tests {
         }
         assert_eq!(rig.t.live, 0);
         assert_eq!(rig.probe.gauge("logit.transform.series.tracked", &[]), None);
+    }
+
+    // ---- Non-monotonic sums ----------------------------------------------------------------------
+
+    fn updown(v: MetricValue) -> MetricKind {
+        MetricKind::Sum(Sum { value: v, temporality: Temporality::Cumulative, monotonic: false })
+    }
+
+    fn non_monotonic(mode: NonMonotonic) -> Rig {
+        let mut rig = Rig::new(InitialValue::Drop);
+        rig.t.non_monotonic = mode;
+        rig
+    }
+
+    /// Under `difference`, a decrease is a negative delta in the point's own type, not a reset,
+    /// and the record stays non-monotonic.
+    #[test]
+    fn difference_reads_a_decrease_as_a_negative_delta() {
+        let mut rig = non_monotonic(NonMonotonic::Difference);
+        assert!(rig.one(event(T0 + S, 0, updown(MetricValue::I64(10)))).is_none());
+        let rec = rig.one(event(T0 + 2 * S, 0, updown(MetricValue::I64(4)))).expect("a delta");
+        assert_eq!(sum_of(&rec), (MetricValue::I64(-6), Temporality::Delta));
+        assert_eq!(rec.start_timestamp, T0 + S, "the previous point's timestamp");
+        assert!(matches!(&rec.kind, MetricKind::Sum(s) if !s.monotonic));
+        let rec = rig.one(event(T0 + 3 * S, 0, updown(MetricValue::I64(9)))).expect("a delta");
+        assert_eq!(sum_of(&rec).0, MetricValue::I64(5), "against the decreased baseline");
+        assert_eq!(rig.sum("logit.transform.series.reset", &[]), 0.0);
+        let converted = [("metric_kind", "non_monotonic_sum")];
+        assert_eq!(rig.sum("logit.transform.metrics.converted", &converted), 2.0);
+    }
+
+    /// A `U64` that goes down under `difference` leaves as a negative `I64`.
+    #[test]
+    fn difference_writes_a_negative_unsigned_delta_as_signed() {
+        let mut rig = non_monotonic(NonMonotonic::Difference);
+        rig.one(event(T0 + S, 0, updown(MetricValue::U64(10))));
+        let rec = rig.one(event(T0 + 2 * S, 0, updown(MetricValue::U64(3)))).expect("a delta");
+        assert_eq!(sum_of(&rec).0, MetricValue::I64(-7));
+        let rec = rig.one(event(T0 + 3 * S, 0, updown(MetricValue::U64(8)))).expect("a delta");
+        assert_eq!(sum_of(&rec).0, MetricValue::U64(5));
+    }
+
+    /// Under `difference`, a start moved past the previous point is still a restart.
+    #[test]
+    fn difference_still_reads_a_moved_start_as_a_restart() {
+        let mut rig = non_monotonic(NonMonotonic::Difference);
+        rig.one(event(T0 + 10 * S, T0, updown(MetricValue::F64(50.0))));
+        let rec = rig
+            .one(event(T0 + 20 * S, T0 + 15 * S, updown(MetricValue::F64(2.0))))
+            .expect("a reset emits");
+        assert_eq!(sum_of(&rec).0, MetricValue::F64(2.0), "the whole new total");
+        assert_eq!(rig.sum("logit.transform.series.reset", &[("cause", "restarted")]), 1.0);
+    }
+
+    /// Under `reset_on_decrease`, a decrease is a reset emitted in full, as for a monotonic sum.
+    #[test]
+    fn reset_on_decrease_reads_a_decrease_as_a_restart() {
+        let mut rig = non_monotonic(NonMonotonic::ResetOnDecrease);
+        rig.one(event(T0 + S, 0, updown(MetricValue::I64(1_000))));
+        let rec = rig.one(event(T0 + 2 * S, 0, updown(MetricValue::I64(1_250)))).expect("delta");
+        assert_eq!(sum_of(&rec), (MetricValue::I64(250), Temporality::Delta));
+        let rec = rig.one(event(T0 + 3 * S, 0, updown(MetricValue::I64(40)))).expect("a reset");
+        assert_eq!(sum_of(&rec), (MetricValue::I64(40), Temporality::Delta));
+        assert!(matches!(&rec.kind, MetricKind::Sum(s) if !s.monotonic));
+        assert_eq!(rig.sum("logit.transform.series.reset", &[("cause", "decrease")]), 1.0);
+    }
+
+    /// A monotonic and a non-monotonic sum of one name are separate series.
+    #[test]
+    fn a_non_monotonic_sum_is_its_own_series() {
+        let mut rig = non_monotonic(NonMonotonic::Difference);
+        rig.run(vec![
+            event(T0 + S, 0, cum(100.0)),
+            event(T0 + S, 0, updown(MetricValue::F64(5.0))),
+        ]);
+        let rec = rig.one(event(T0 + 2 * S, 0, updown(MetricValue::F64(7.0)))).expect("a delta");
+        assert_eq!(sum_of(&rec).0, MetricValue::F64(2.0));
+        assert_eq!(rig.t.live, 2);
     }
 
     /// A non-finite cumulative sum is dropped and counted, and the baseline is unchanged.

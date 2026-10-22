@@ -461,9 +461,12 @@ async fn a_recorded_agent_series_request_relays_unchanged() {
         .expect("the Agent compressed it with zstd");
     let mut batch = decoder().decode_series_v2_protobuf(&body, 0).expect("the Agent's series");
     assert!(batch.events.len() > 10, "a whole flush: {} points", batch.events.len());
-    let now = now_s() * 1_000_000_000;
+    // Moved to the current second as a whole, so each point stays in its own second: two points
+    // of one series in one second would leave as one.
+    let latest = batch.events.iter().map(|e| e.timestamp).max().expect("a whole flush");
+    let shift = now_s() * 1_000_000_000 - latest;
     for event in &mut batch.events {
-        event.timestamp = now;
+        event.timestamp += shift;
     }
 
     let (addr, mut rx) = listener().await;
