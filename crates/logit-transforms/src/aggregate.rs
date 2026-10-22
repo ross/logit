@@ -1752,6 +1752,31 @@ mod tests {
         assert_eq!(events[0].timestamp, 100);
     }
 
+    /// `datadog_in` gives every series batch one resource, whether or not a payload carries a
+    /// unit, so one series from two payloads aggregates in one group.
+    #[test]
+    fn datadog_series_from_payloads_with_and_without_units_share_a_group() {
+        let mut decoder = logit_proto::datadog::DatadogDecoder::new();
+        let with_unit = br#"{"series":[{"metric":"hits","points":[[1700000000,1]],"type":"count","host":"h"},{"metric":"bytes","points":[[1700000000,5]],"type":"count","host":"h","unit":"byte"}]}"#;
+        let without = br#"{"series":[{"metric":"hits","points":[[1700000001,2]],"type":"count","host":"h"}]}"#;
+        let mut agg = Aggregator::new(Duration::from_secs(10));
+        for body in [&with_unit[..], &without[..]] {
+            let batch = decoder.decode_series_v1(body, 0).unwrap();
+            for event in batch.events {
+                assert!(feed(&mut agg, &batch.resource, event).is_none());
+            }
+        }
+        let flushed = flush_events(&mut agg, 100);
+        let hits: Vec<f64> = flushed
+            .iter()
+            .flat_map(|(_, events)| events)
+            .filter(|e| logit_core::interner::resolve(e.metrics[0].name) == "hits")
+            .map(|e| counter_value(kind_of(e)))
+            .collect();
+        assert_eq!(hits, [3.0], "one `hits` series, summed across both payloads");
+        assert_eq!(flushed.len(), 1, "one resource group");
+    }
+
     #[test]
     fn gauge_keeps_the_value_with_the_latest_source_timestamp() {
         let mut agg = Aggregator::new(Duration::from_secs(10));

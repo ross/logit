@@ -65,7 +65,7 @@
 //! | a non-finite protobuf value | the point is dropped | `dropped{reason="non_finite_value"}` |
 //! | point timestamp (s) | `Event::timestamp`; a fractional v1 timestamp truncates to its second | -- |
 //! | timestamp absent, zero, or negative | `received_at`, truncated to its second | `logit.input.metrics.degraded{reason="no_timestamp"}` |
-//! | `unit` | `MetricRecord::unit` when non-empty, and [`ATTR_UNITS`] on the batch resource when any record of the batch has one | -- |
+//! | `unit` | `MetricRecord::unit` when non-empty; every series batch carries [`ATTR_UNITS`] on its resource | -- |
 //! | `tags` | attributes by [`tags`]'s rule | -- |
 //! | a tag whose key is under the private `_logit.` prefix | omitted; counted once per series that delivers a point | `logit.input.tags.omitted{reason="reserved_prefix"}` |
 //! | the first named `host` resource; v1 and distribution `host` | [`ATTR_HOST_NAME`] | -- |
@@ -199,7 +199,7 @@
 //! | `attributes/map_value` | lost | `logit.output.tags.omitted{reason=unrepresentable}` | A tag has no nested form, so a map is left off, counted. |
 //! | `attributes/bytes_value` | lost | `logit.output.tags.omitted{reason=unrepresentable}` | A tag has no bytes form, so the value is left off, counted. |
 //! | `attributes/timestamp_value` | normalized | `stringified` | A `key:<RFC 3339>` tag, read back as a string. |
-//! | `attributes/private_carrier` | lost | `logit.output.tags.omitted{reason=no_wire_form}` | A `_logit.datadog.*` carrier rides in its own wire field; one the route has no field for is left off, counted. `_logit.datadog.units`, which marks a decoded batch's units as Datadog names, is read and not written; datadog_in stamps it again on a batch with a unit. |
+//! | `attributes/private_carrier` | lost | `logit.output.tags.omitted{reason=no_wire_form}` | A `_logit.datadog.*` carrier rides in its own wire field; one the route has no field for is left off, counted. `_logit.datadog.units`, which marks a decoded batch's units as Datadog names, is read and not written; datadog_in stamps it again on every series batch. |
 //! | `attributes/prometheus_target` | lost | structural | The scrape target is private and never a tag, so it's left off. |
 //! | `attributes/foreign_carrier` | lost | structural | Another protocol's `_logit.` carrier is private and never a tag, so it's left off. The `_logit.statsd.event.*` and `_logit.statsd.service_check.*` carriers are read as the Datadog fields they name. |
 //! | `attributes/resource_attribute` | normalized | `resource_as_tag` | Merged into the record's tags, so it reads back as an event attribute. |
@@ -290,9 +290,9 @@
 //!    a `host` resource with no name on v2. Below all of these, a `collectd.host:` tag on a sample
 //!    with no host and no hostless mark leaves as the host and not a tag;
 //! 10. a tag whose key is under the private `_logit.` prefix is omitted and counted.
-//! 11. a series batch with a unit carries [`ATTR_UNITS`] on its resource, so its units leave as
-//!     they arrived, whatever they spell. The UCUM mapping in the encode table applies only to
-//!     other sources' units.
+//! 11. every series batch carries [`ATTR_UNITS`] on its resource, so its units leave as they
+//!     arrived, whatever they spell. The UCUM mapping in the encode table applies only to other
+//!     sources' units.
 //!
 //! # Logs, events, service checks (`logs`, `events`, `service_checks`)
 //!
@@ -717,10 +717,12 @@ pub(crate) fn collectd_host<'a>(resource: &'a Resource, event: &'a Event) -> Opt
     host
 }
 
-/// `_logit.datadog.units`: `"datadog"` on the resource of a series batch `datadog_in` decoded
-/// with a unit on any record, so `datadog_out` writes those units as they are rather than mapping
-/// them as UCUM ([`units`]): they're Datadog unit names already. Absent from a batch with no unit,
-/// so a unit-less decode allocates no resource attribute.
+/// `_logit.datadog.units`: `"datadog"` on the resource of every series batch `datadog_in` decodes
+/// (v1, v2 JSON, v2 protobuf), so `datadog_out` writes its units as they are rather than mapping
+/// them as UCUM ([`units`]): they're Datadog unit names already. It's on every one, unit or not,
+/// because `aggregate` and `cumulative_to_delta` key a series on its resource. It marks the whole
+/// batch, so a unit a later stage sets on one of its records leaves unmapped too. Distribution
+/// points and sketches carry no unit and no mark.
 pub const ATTR_UNITS: &str = "_logit.datadog.units";
 /// [`ATTR_UNITS`]'s one value.
 pub const UNITS_DATADOG: &str = "datadog";

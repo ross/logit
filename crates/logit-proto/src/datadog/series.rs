@@ -328,16 +328,16 @@ fn batch(events: Vec<Event>) -> EventBatch {
     EventBatch { resource: Arc::new(Resource::default()), scope: None, events }
 }
 
-/// A decoded series batch: [`batch`], with [`ATTR_UNITS`] on its resource when a record carries a
-/// unit, which is then a Datadog unit name the encoders write as it is.
+/// A decoded series batch: [`batch`], with [`ATTR_UNITS`] on its resource, so every unit in it is
+/// a Datadog unit name the encoders write as it is. Every series batch carries it, unit or not:
+/// `aggregate` and `cumulative_to_delta` key a series on its resource, so a marker on some
+/// payloads and not others would split one series in two.
 fn series_batch(events: Vec<Event>) -> EventBatch {
-    let mut out = batch(events);
-    if out.events.iter().flat_map(|e| &e.metrics).any(|r| r.unit.is_some()) {
-        let mut resource = Resource::default();
-        resource.attributes.insert(ATTR_UNITS, Value::str(UNITS_DATADOG));
-        out.resource = Arc::new(resource);
-    }
-    out
+    let mut resource = Resource::default();
+    resource
+        .attributes
+        .insert(ATTR_UNITS, Value::Str(Bytes::from_static(UNITS_DATADOG.as_bytes())));
+    EventBatch { resource: Arc::new(resource), scope: None, events }
 }
 
 impl DatadogDecoder {
