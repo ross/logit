@@ -1,0 +1,42 @@
+# Splunk HEC round trip: one process, two disconnected chains sharing one loopback connection,
+# `gen -> relay_out` (splunk_hec_out, `/event` JSON under gzip) and `relay_in -> drop`
+# (splunk_hec_in). The event is a log line with one attribute, HEC's native signal, so this
+# measures the event-object encode, gzip, one HTTP request per 100 events, and the decode back
+# to events. Scenario table: docs/design/performance.md, "Scenarios".
+#
+#   script/perf run --scenario splunk-hec-relay
+#
+# `buffer.max_batches: 64` on the sink keeps the queue left at `generation complete` small. The
+# harness divides by `ready` to `generation complete`, and under the default 1024-batch bound a
+# sink slower than the generator still holds up to 1024 batches at that line, which inflates
+# events/s and can outlast `--settle`.
+#
+# This scenario never self-exits: `relay_in` is a listener, so the harness sends SIGTERM
+# `--settle` after the `generation complete` line (crates/logit-perf/src/scenario.rs's
+# `needs_sigterm`). The runtime binds every listener before any task runs, so `relay_in` is
+# listening before `relay_out` sends.
+components:
+  gen:
+    type: generate_in
+    count: 3000000
+    event:
+      log: "GET /x/{seq%50} 200"
+      attributes:
+        host: "web-{seq%10}"
+
+  relay_out:
+    type: splunk_hec_out
+    sources: [gen]
+    endpoint: http://127.0.0.1:19106/services/collector
+    token: perf-token
+    buffer:
+      max_batches: 64
+
+  relay_in:
+    type: splunk_hec_in
+    bind: 127.0.0.1:19106
+    tokens: [perf-token]
+
+  drop:
+    type: null_out
+    sources: [relay_in]

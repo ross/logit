@@ -128,7 +128,7 @@ prints a warning to that repeat's stderr rather than silently reporting a startu
 
 `perf/scenarios/*.yaml` are ordinary, shipped `logit` configs with no `!env` and any Lua inline,
 validated like every other shipped config. Each file's header comment says what it isolates and
-which scenario to read it against; §1 has each one's committed `count` and numbers.
+which scenario to read it against; §1 has each measured one's committed `count` and numbers.
 
 | Scenario | Graph | Measures |
 |---|---|---|
@@ -151,6 +151,22 @@ which scenario to read it against; §1 has each one's committed `count` and numb
 | `buffered-small-segments` | `buffered` with `segment_bytes: 1MiB` | Segment-roll cost (a durable cursor persist and an unlink per roll), read against `buffered` |
 | `tail`, `tail-rotate` | a file `logit-perf` writes first → `tail_in` → `null_out` | The tail read path, and the rotation path on top of it ([File scenarios](#file-scenarios-tail-ends-on-a-delivered-count-not-a-log-line)) |
 | `udp-statsd`, `-small`, `-packed` | real UDP load from `perf/load/` → `statsd_in` → `null_out` | UDP intake ([Driven scenarios](#driven-scenarios-udp-statsd-is-measured-differently-on-purpose)) |
+| `route-copy` | `route`'s `generate_in` → `route` (list-valued `routes:`, 8 of 10 hosts to 2 targets) → 3 × `null_out` | The router's copy path: an event with two destinations is shared or cloned and counted in `events.copied`, read against `route` |
+| `route-signals` | `generate_in` (log and sum metric) → `route_signals` (`strip: true`) → 2 × `null_out` | Per-signal splitting: each event becomes a log part and a metric part, an attribute clone and a payload move per event |
+| `http-access` | `generate_in` (semconv-named nginx access JSON) → `json` → `http_access` → `null_out` | `http_access` normalization over a 20-key line (coercion, decomposition, caps, route and user-agent derivation, span fields), read against `json-parse` |
+| `regex-parse` | `generate_in` (nginx combined line) → `regex` (8 named groups) → `null_out` | A regex match and 8 attribute inserts per line, read against `logfmt-parse` |
+| `timestamp-strftime` | `generate_in` (`$time_local`-shaped attribute) → `timestamp` (`%d/%b/%Y:%H:%M:%S %z`) → `null_out` | A strftime parse of an attribute into `event.timestamp`, no tz database, read against `passthrough` |
+| `cumulative-to-delta` | `generate_in` (20,000 series) → `aggregate` (`temporality: cumulative`, 50 ms) → `cumulative_to_delta` → `null_out` | The difference path over a cumulative stream; the transform sees one point per series per flush, so `attribute` reads its own cost |
+| `line-protocol-fanout` | `generate_in` (log of 4 line-protocol points) → `line_protocol` → `null_out` | Fan-out of one log into 4 events; `count` is parent logs |
+| `flatten` | `generate_in` (nested JSON) → `json` → `flatten` → `null_out` | 3 nested attributes rewritten into 11 dot-joined keys, read against `json-parse-nested-log` |
+| `sample` | `generate_in` (unique `request_id`) → `sample` (`rate: 0.25`, attribute key) → `null_out` | The keyed hash verdict; a quarter of events reach the sink, so it doesn't read against `passthrough` per event |
+| `lua-edit` | `generate_in` → `lua` (`pairs` loop, `nil` delete, `event.log.message` write) → `null_out` | In-place edits through the event proxy, read against `lua`; valid under `jit: true` too |
+| `otlp-relay-http` | `generate_in` (log) → `otlp_out` (OTLP/HTTP) → `otlp_in` → `null_out`, in one process | OTLP protobuf encode, one loopback HTTP request per batch, and decode |
+| `otlp-relay-grpc` | `otlp-relay-http` over OTLP/gRPC | The same round trip over the gRPC transport, read against `otlp-relay-http` |
+| `influxdb-relay` | `generate_in` (gauge, `host: h{seq%1000}`) → `influxdb_out` → `influxdb_in` → `null_out`, in one process | Line-protocol encode, one write request per batch, and the whole-body parse |
+| `prometheus-remote-write-relay` | `influxdb-relay`'s `generate_in` → `prometheus_out` (remote-write 1.0, Snappy) → `prometheus_in` (receiver) → `null_out`, in one process | Remote-write encode, Snappy, one request per batch, and decode |
+| `datadog-relay` | `influxdb-relay`'s `generate_in` → `datadog_out` (series v2, gzip) → `datadog_in` → `null_out`, in one process | Datadog series encode, gzip, one intake request per batch, and decode |
+| `splunk-hec-relay` | `otlp-relay-http`'s `generate_in` → `splunk_hec_out` (`/event`, gzip) → `splunk_hec_in` → `null_out`, in one process | HEC event-object encode, gzip, one request per batch, and decode |
 
 Rules a new or retuned scenario follows:
 
@@ -164,7 +180,13 @@ Rules a new or retuned scenario follows:
   laptop run), which was the lighter generator, not cheap delivery. Change all three together.
 - **`native-relay` never exits by itself**, because `logit_in` is a listener. It's the scenario
   that exercises the harness's settle-then-SIGTERM path; every `generate_in` scenario ends on its
-  generator's `generation complete` line.
+  generator's `generation complete` line. The protocol relays (`*-relay`) share that path.
+- **A relay scenario bounds its sink's `buffer.max_batches`.** The relay's sink is slower than
+  `generate_in`, so its queue is full at `generation complete`, and events/s counts only the time
+  up to that line. At the default 1024-batch queue, that tail inflates events/s, can outlast
+  `--settle` (SIGTERM then drops it as `reason=shutdown`), and dominates peak RSS. Each protocol
+  relay sets `max_batches: 64`, so the tail is a small share of the count and drains inside
+  `--settle`. `native-relay` runs at the default queue; its 7M count dilutes the tail.
 - **`buffered` does real disk I/O**, so expect its wall time to vary more than any in-memory
   scenario's. §3 has the variance account.
 

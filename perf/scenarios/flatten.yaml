@@ -1,0 +1,28 @@
+# Nested attribute flattening (docs/adr/flatten-transform.md): generate_in renders a JSON log with a
+# nested map, a nested array, and scalars, `json` parses it into attributes (nested values stay
+# `Map`/`Array`), `flatten` rewrites them to dot-joined keys, null_out discards. Each event goes
+# from 3 nested attributes (`user`, `request`, `tags`) to 12 flat ones: `user.id`, `user.geo.city`,
+# `user.geo.cc`, `request.method`, `request.path`, `tags.0`, `tags.1`, `tags.2`, plus the scalars
+# `level`, `msg`, and `attempt`. Scenario table: docs/design/performance.md, "Scenarios".
+#
+#   script/perf run --scenario flatten
+#
+# Read against json-parse-nested-log (the same parse without the rewrite): the gap is `flatten`.
+components:
+  gen:
+    type: generate_in
+    count: 8000000
+    event:
+      log: '{{"level":"info","msg":"request handled","attempt":{seq%5},"user":{{"id":{seq%1000},"geo":{{"city":"Berlin","cc":"DE"}}}},"request":{{"method":"GET","path":"/x/{seq%50}"}},"tags":["a","b","c"]}}'
+
+  parsed:
+    type: json
+    sources: [gen]
+
+  flat:
+    type: flatten
+    sources: [parsed]
+
+  out:
+    type: null_out
+    sources: [flat]

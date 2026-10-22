@@ -1,0 +1,34 @@
+# Timestamp resolution from a strftime pattern (docs/adr/timestamp-transform.md): generate_in
+# stamps an attribute holding nginx's `$time_local` shape, `timestamp` parses it with
+# `%d/%b/%Y:%H:%M:%S %z` and writes `event.timestamp`, null_out discards. Measures the pattern
+# parse and the attribute removal for a replayed backlog or a tailed file. Scenario table:
+# docs/design/performance.md, "Scenarios".
+#
+#   script/perf run --scenario timestamp-strftime
+#
+# The pattern carries `%z`, so the result is an instant and no `timezone:` is read: no dependency on
+# the system tz database. `max_skew` is widened to a year because the template's date is fixed and
+# the default 24h would leave every event unresolved (forwarded untouched, counted), which measures
+# the skip path. The minutes and seconds vary per event (`{seq%6}{seq%10}`) so the parser sees
+# distinct input. Read against passthrough (same runtime, no transform): the gap is `timestamp`.
+components:
+  gen:
+    type: generate_in
+    count: 36000000
+    event:
+      attributes:
+        ts: "07/Sep/2026:06:{seq%6}{seq%10}:{seq%6}{seq%10} +0000"
+        host: web-{seq%10}
+        service: web
+
+  stamped:
+    type: timestamp
+    sources: [gen]
+    from: ts
+    format:
+      pattern: "%d/%b/%Y:%H:%M:%S %z"
+    max_skew: 8760h
+
+  out:
+    type: null_out
+    sources: [stamped]

@@ -1,0 +1,31 @@
+# Consistent keyed sampling (docs/adr/consistent-sampling-component.md): generate_in stamps a
+# unique `request_id` per event, `sample` hashes it (XXH64, seed 0) and keeps 25%, null_out
+# discards what survives. The other 75% count as `events.discarded`. Scenario table:
+# docs/design/performance.md, "Scenarios".
+#
+#   script/perf run --scenario sample
+#
+# `request_id` is `req-{seq}`, distinct per event, so the verdict is an independent hash per event
+# and the kept fraction converges on `rate`. `count` is generated events, so CPU us/event is per
+# generated event; only a quarter reach the sink. Read against passthrough: the gap is the hash and
+# the batch compaction, offset by the sink work the dropped events skip.
+components:
+  gen:
+    type: generate_in
+    count: 50000000
+    event:
+      attributes:
+        request_id: req-{seq}
+        host: web-{seq%10}
+        service: web
+
+  sampled:
+    type: sample
+    sources: [gen]
+    rate: 0.25
+    key:
+      attribute: request_id
+
+  out:
+    type: null_out
+    sources: [sampled]

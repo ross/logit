@@ -1,0 +1,55 @@
+# Router fan-out to several targets (docs/adr/target-components.md): route.yaml's event stream
+# through a `route` whose `routes:` values are lists, so an event goes whole to two `target`s, each
+# into its own null_out. Eight of the ten `host` values name `[tier_a, tier_b]`; `web-8` and
+# `web-9` are unrouted and reach `unrouted_out` through the router's own `sources:` edge. An event
+# with two destinations is shared or cloned rather than moved, and counted in
+# `logit.component.events.copied`. Scenario table: docs/design/performance.md, "Scenarios".
+#
+#   script/perf run --scenario route-copy
+#
+# Read against route (same events, one destination per event, three targets): the gap is the copy
+# path. Read against fanout (same events, three sinks): both deliver most events twice or more, but
+# fanout shares one Arc per edge where this goes through `route_batch`'s partition passes. `count`
+# is generated events, so CPU us/event is per generated event, not per delivery.
+components:
+  gen:
+    type: generate_in
+    count: 22000000
+    event:
+      attributes:
+        method: GET
+        path: /x/{seq%50}
+        status: "200"
+        host: web-{seq%10}
+        region: us-east-1
+        service: web
+
+  split:
+    type: route
+    sources: [gen]
+    by: {attribute: host}
+    routes:
+      web-0: [tier_a, tier_b]
+      web-1: [tier_a, tier_b]
+      web-2: [tier_a, tier_b]
+      web-3: [tier_a, tier_b]
+      web-4: [tier_a, tier_b]
+      web-5: [tier_a, tier_b]
+      web-6: [tier_a, tier_b]
+      web-7: [tier_a, tier_b]
+      # web-8 and web-9 are unrouted.
+
+  tier_a: {type: target}
+  tier_b: {type: target}
+
+  out_a:
+    type: null_out
+    sources: [tier_a]
+
+  out_b:
+    type: null_out
+    sources: [tier_b]
+
+  unrouted_out:
+    type: null_out
+    sources: [split]

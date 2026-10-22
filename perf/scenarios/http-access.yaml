@@ -1,0 +1,44 @@
+# Access-log normalization (docs/adr/http-access-normalization.md): generate_in renders an nginx
+# access line as JSON under the raw OTel semconv names, `json` merges it into attributes,
+# `http_access` coerces, decomposes, caps, redacts, and derives, null_out discards. This is the
+# `json -> http_access` leg of fixtures/nginx-to-influxdb.yaml without the syslog framing. Scenario
+# table: docs/design/performance.md, "Scenarios".
+#
+#   script/perf run --scenario http-access
+#
+# `gen`'s `log:` follows `access_semconv` in fixtures/nginx/nginx.conf (the format
+# crates/logit-bench/src/fixtures.rs's NGINX_SYSLOG_LINE descends from), whose key set is
+# docs/http-access-logs.md's nginx snippet: the quoted numeric status, the unit-suffixed duration,
+# the `$request_uri` composite, `traceparent` and `span.end_s` left out because the scenario places
+# no `trace_context`. Three fields vary per event so `http_access` does different work:
+#   - `url.original` is `/api/v{seq%3}/orders/{seq%1000}?page={seq%7}`, which the `routes:` rules
+#     below classify into `/api/v1/{id}`, `/api/v2/{id}`, and the unmatched `route_other`;
+#   - `http.response.status_code` is `{seq%6}00`, so one event in six carries nginx's `"000"`
+#     abnormal-termination status, coerced to `0`, and the rest span `1xx` to `5xx`;
+#   - `user_agent.original` varies in version, so the class table runs on distinct strings (every
+#     value classifies as `browser`).
+# Read against json-parse: the added cost is `http_access` itself, over a log twice as wide.
+components:
+  gen:
+    type: generate_in
+    count: 3000000
+    event:
+      log: '{{"http.request.method":"GET","url.original":"/api/v{seq%3}/orders/{seq%1000}?page={seq%7}","url.scheme":"http","network.protocol.version":"HTTP/1.1","http.response.status_code":"{seq%6}00","http.response.body.size":612,"http.response.size":835,"http.request.size":214,"http.request.duration_s":0.004,"server.address":"static.local","client.address":"10.0.0.17","user_agent.original":"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{seq%20}.0.0.0 Safari/537.36","http.request.header.referer":"","user.name":"","upstream.address":"-","upstream.status":"-","upstream.duration_s":"","upstream.connect_s":"","upstream.header_s":""}}'
+
+  parsed:
+    type: json
+    sources: [gen]
+
+  normalized:
+    type: http_access
+    sources: [parsed]
+    routes:
+      - match: '^/api/v1/'
+        route: /api/v1/{id}
+      - match: '^/api/v2/'
+        route: /api/v2/{id}
+    route_other: /{other}
+
+  out:
+    type: null_out
+    sources: [normalized]

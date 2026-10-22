@@ -1,0 +1,40 @@
+# Cumulative-to-delta conversion (docs/adr/cumulative-to-delta-transform.md): generate_in can only
+# produce delta sums, so the cumulative stream is made the way a real pipeline makes one:
+# `aggregate` with `temporality: cumulative` keeps a running total per series and emits all 20000
+# series every 50ms, `cumulative_to_delta` differences each against the series' previous point,
+# null_out discards. After the first flush every point takes the difference path (series state is
+# found, the value increased, no reset or layout change). Scenario table:
+# docs/design/performance.md, "Scenarios".
+#
+#   script/perf run --scenario cumulative-to-delta
+#
+# Caveat: `count` is generated events, but `cumulative_to_delta` sees one point per series per
+# flush, not one per event, so CPU us/event is dominated by `aggregate` and the generator. Read
+# the transform's own cost from `script/perf attribute --scenario cumulative-to-delta`, and read
+# the scenario against aggregate (same graph minus the transform and temporality).
+components:
+  gen:
+    type: generate_in
+    count: 4000000
+    event:
+      attributes:
+        host: "h{seq%20000}"
+      metric:
+        name: req.total
+        kind: sum
+        value: 1
+
+  running:
+    type: aggregate
+    sources: [gen]
+    interval: 50ms
+    temporality: cumulative
+
+  deltas:
+    type: cumulative_to_delta
+    sources: [running]
+    max_series: 50000
+
+  out:
+    type: null_out
+    sources: [deltas]

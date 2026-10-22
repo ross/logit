@@ -1,0 +1,40 @@
+# OTLP/gRPC encode + decode round trip: otlp-relay-http's graph and event over OTLP/gRPC, so the
+# gap between the two is the gRPC transport (h2 framing, the hand-rolled service over hyper, and
+# a round trip per export request). Scenario table: docs/design/performance.md, "Scenarios".
+#
+#   script/perf run --scenario otlp-relay-grpc
+#
+# `buffer.max_batches: 64` on the sink keeps the queue left at `generation complete` small. The
+# harness divides by `ready` to `generation complete`, and under the default 1024-batch bound a
+# sink slower than the generator still holds up to 1024 batches at that line, which inflates
+# events/s and can outlast `--settle`.
+#
+# This scenario never self-exits: `relay_in` is a listener, so the harness sends SIGTERM
+# `--settle` after the `generation complete` line (crates/logit-perf/src/scenario.rs's
+# `needs_sigterm`). The runtime binds every listener before any task runs, so `relay_in` is
+# listening before `relay_out` sends.
+components:
+  gen:
+    type: generate_in
+    count: 750000
+    event:
+      log: "GET /x/{seq%50} 200"
+      attributes:
+        host: "web-{seq%10}"
+
+  relay_out:
+    type: otlp_out
+    sources: [gen]
+    endpoint: http://127.0.0.1:19102
+    protocol: grpc
+    buffer:
+      max_batches: 64
+
+  relay_in:
+    type: otlp_in
+    bind: 127.0.0.1:19102
+    protocol: grpc
+
+  drop:
+    type: null_out
+    sources: [relay_in]
