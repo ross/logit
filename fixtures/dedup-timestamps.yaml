@@ -5,8 +5,8 @@
 # (docs/adr/dedup-timestamps-transform.md).
 #
 # Without `dedup_timestamps`, `prometheus_out` collapses those readings itself, keeping the
-# latest, and counts each lost one only as
-# `logit.output.metrics.degraded{reason="sub_ms_collapsed"}`. With it, the collapse happens here,
+# latest, and counts each lost one as loss,
+# `logit.output.metrics.dropped{reason="duplicate_timestamp"}`. With it, the collapse happens here,
 # under the rule you chose: the latest gauge wins, and each reading removed is counted as an
 # intended outcome (`logit.transform.metrics.absorbed`). A relative `+N`/`-N` gauge line passes
 # through untouched for an `aggregate` to resolve.

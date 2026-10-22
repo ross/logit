@@ -1,6 +1,8 @@
 # statsd_in's cases sent by prometheus_out as remote-write 1.0, with nothing between: a flagged
 # gauge as a stale marker, the unit in metadata, and two points of a series in one millisecond
-# collapsed.
+# collapsed to the later, the earlier counted
+# `logit.output.metrics.dropped{reason="duplicate_timestamp"}` (a `dedup_timestamps` with
+# `precision: 1ms` ahead of the sink is the remedy).
 # `path:` names one case so `logit run` can run this by hand; the transit spec runs every case in
 # that file's directory (spec/transit/README.md).
 components:

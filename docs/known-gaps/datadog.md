@@ -128,6 +128,18 @@ Entry format and the other areas: [the known-gaps index](README.md).
   - **Workaround:** keep metrics under 100 tags with `keep` or `remove` upstream.
   - **Revisit trigger:** Datadog documents or answers a different limit; the series route's `202`
     body states it (`limit=100`).
+- **`datadog_out` collapses a series' points in one second only within one request.** Of the
+  points of one series in one second in a series request, the sink sends the latest and drops the
+  rest, counted `metrics.dropped{reason="duplicate_timestamp"}`, because Datadog keeps only the
+  higher of two in one request (verified 2026-10-21;
+  [ADR `dedup-timestamps-transform`](../adr/dedup-timestamps-transform.md)'s "Verified destination
+  behavior"). A route is cut into requests of at most 10,000 entries, and two points the cut puts
+  in different requests aren't collapsed.
+  - **Consequence:** Datadog keeps the later request's point, so the earlier one is lost,
+    uncounted. Across batches the same holds, with `dedup_timestamps` no help either, since it
+    holds no state between batches.
+  - **Workaround:** a `dedup_timestamps` with `precision: 1s` ahead of the sink collapses the pair
+    within the batch before any cut, merging deltas where Datadog would keep one of them.
 - **`datadog_out` reports every hostless sender under the relay's hostname.** It sends the
   process hostname for a metric with no `host.name` and no DogStatsD `host:` tag, an event or
   service check with no `h:` field, no `host.name`, and no `host:` tag, and a log with none of

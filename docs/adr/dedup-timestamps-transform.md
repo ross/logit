@@ -39,7 +39,8 @@ documents the overwrite in the sink.
 
 The other metric sinks, read from code on 2026-10-21:
 
-- **`datadog_out` sends both.** Its encoder writes one series per point a record writes (one, or a
+- **`datadog_out` sends both** (until [the sink-side counter](#the-sink-side-counter) change).
+  Its encoder writes one series per point a record writes (one, or a
   histogram's or summary's expansion), at whole seconds rounded toward negative infinity
   (`crates/logit-proto/src/datadog/mod.rs`'s mapping table: `same_instant` and `same_millisecond`
   are `exact`). Nothing collapses or counts two points of one series in one second. Datadog keeps
@@ -155,8 +156,8 @@ as loss, not as an outcome the config asked for. `no_merge_rule` is the other ex
 - A passed-through `GaugeDelta` never reaches a sink as a duplicate. Every sink drops it, counted
   `dropped{reason="unresolved_gauge_delta"}`, and `aggregate` is what resolves it.
 - A delta `Summary` pair, such as `cumulative_to_delta` makes, is legitimate input. `datadog_out`
-  sends both points and Datadog keeps the higher. That loss is counted only once `datadog_out`
-  gets the `duplicate_timestamp` counter ([The sink-side counter](#the-sink-side-counter)).
+  sends the later point and drops the earlier, counted `duplicate_timestamp`
+  ([The sink-side counter](#the-sink-side-counter)).
 - A delta `Sum` of `Bool`s is rare: InfluxDB's boolean fields decode as gauges, so a Lua script
   is the likely source. It passes through because no merge keeps its type, the rule below.
 
@@ -342,11 +343,18 @@ names, the same-instant case included. That replaces
 receiver drops one of the pair anyway, silently, and keeps the earlier one. With it, the later
 reading survives and the loss is counted. The counter change lands in its own PR, not with this
 record, and updates the transit spec's `same_instant` and `same_millisecond` rows for
-`prometheus_out` with it. Exposition mode's registry overwrite stays uncounted.
+`prometheus_out` with it. Exposition mode's registry overwrite stays uncounted: the transit spec
+reads it as `normalized`, reason `superseded`, the pull model's overwrite.
 
-`datadog_out` gets the same counter in a later PR: a series point that shares its series and
-second with another in one request counts `logit.output.metrics.dropped{reason="duplicate_timestamp"}`,
-since Datadog keeps only the higher. Distribution points don't count, because Datadog keeps both.
+`datadog_out` gets the same counter in the same PR. In each series-route request, points of one
+Datadog series (the metric name, the tag set, and the host, device, and resources) in one second
+leave as the latest alone, the later in batch order on a tie, and each other point counts
+`logit.output.metrics.dropped{reason="duplicate_timestamp"}`, equal values included, with a
+throttled `duplicate_timestamp` diagnostic naming the remedy. That's the pre-filter, not a count
+of what's sent: Datadog would keep the higher point, not the later. Distribution points don't
+count, because Datadog keeps both, and sketches aren't collapsed. Two points that the sink's
+request cut puts in separate requests aren't collapsed: Datadog keeps the later request's,
+uncounted (`docs/known-gaps/datadog.md`).
 
 ### Why this isn't the retired kind
 
@@ -455,9 +463,10 @@ keep the higher.
 - `dedup_timestamps` doesn't stop a cross-batch duplicate with a new value from drawing a remote-write
   `400` that drops a whole batch. W3 records it in `docs/known-gaps/prometheus.md`
   ([Scope](#scope-one-batch-and-no-added-latency)).
-- `datadog_out` counts a same-second series pair it sends in one request as
-  `logit.output.metrics.dropped{reason="duplicate_timestamp"}`, in a later PR
-  ([The sink-side counter](#the-sink-side-counter)).
+- `datadog_out` drops all but the latest point of a series in one second of one request, and
+  counts each as `logit.output.metrics.dropped{reason="duplicate_timestamp"}`
+  ([The sink-side counter](#the-sink-side-counter)). A relay of a Datadog Agent's unaggregated
+  `|T` gauges, which share a series and a second, counts all but one.
 - The graph gets rule 95 (`precision` of `0s`), `logit-config` gets a `ComponentKind` variant, and
   `script/schema` regenerates `schema/logit.schema.json`.
 - [`docs/design/memory.md`](../design/memory.md) gets a row for the per-batch table, and
@@ -483,5 +492,6 @@ keep the higher.
 ## Open questions
 1. **Datadog's rule for negative and equal values.** The run sent only distinct positive pairs.
    Does Datadog keep the higher of two negative points too? It changes nothing in this record,
-   because `dedup_timestamps` decides before Datadog does, but `datadog_out`'s counter docs will
-   state the rule.
+   because `dedup_timestamps` decides before Datadog does, and `datadog_out` now sends only the
+   later point and counts the rest, equal values included, so no Datadog rule decides what's
+   stored within one request.

@@ -427,12 +427,15 @@ Recorded per workstream as each lands.
     InfluxDB's table writes it with no counter.
   - `prometheus_out`'s exposition registry holds one sample per series, so an earlier point of a
     series in the same run is replaced, uncounted (`record/superseded`: `skipped`, `uncounted`).
-    Neither the codec's normalization list nor `mappings.md` names it.
+    Neither the codec's normalization list nor `mappings.md` names it. Since `tfix/w3` the cell is
+    `normalized`, reason `superseded`: the pull model's overwrite.
   - Remote-write sends each point of a series, but two at one instant reach `events_to_families`
     in one group, which keeps the later and drops the earlier, uncounted (`record/same_instant`:
     `dropped`, `uncounted`). Two at different nanoseconds of one millisecond are collapsed the
     same way and counted, under `metrics.degraded{reason="sub_ms_collapsed"}`, a `degraded`
-    series for a reading that's gone (`record/same_millisecond`: `dropped`).
+    series for a reading that's gone (`record/same_millisecond`: `dropped`). Since `tfix/w3`
+    both count `metrics.dropped{reason="duplicate_timestamp"}`
+    ([ADR `dedup-timestamps-transform`](../adr/dedup-timestamps-transform.md)).
   - `prometheus_out` writes no start time for a gauge: `_created` is a counter's, histogram's,
     or summary's, so a gauge's `start_timestamp` is lost uncounted. The encode table doesn't say.
   - Under OpenMetrics, `prometheus_out` writes a gauge whose `_logit.prometheus.type` is

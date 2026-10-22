@@ -429,8 +429,9 @@ without pretending to precision the batch does not have.
 Two neighbours worth naming, because `+ i` does not fix them and is not meant to.
 **`prometheus_out`'s remote-write** encoder truncates to milliseconds and collapses same-series
 samples landing in the same millisecond, counting each dropped reading as
-`logit.output.metrics.degraded{reason="sub_ms_collapsed"}`; a nanosecond offset cannot separate
-those. **`graphite_out`** works in whole seconds, with the same answer. Neither is a new consequence
+`logit.output.metrics.degraded{reason="sub_ms_collapsed"}` (since 2026-10-21,
+`logit.output.metrics.dropped{reason="duplicate_timestamp"}`, with `dedup_timestamps` as the
+remedy); a nanosecond offset cannot separate those. **`graphite_out`** works in whole seconds, with the same answer. Neither is a new consequence
 of the batched read — a statsd datagram's own multi-value expansion already shared one timestamp
 across many points long before this ADR, which is what both mechanisms were built for.
 

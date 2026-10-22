@@ -86,6 +86,25 @@ Entry format and the other areas: [the known-gaps index](README.md).
   - **Workaround:** use a topology that doesn't split one series across branches, or a receiver
     with an out-of-order window. The sink won't buffer its way out: a reorder window is
     `aggregate`-shaped state a sink doesn't hold.
+- **A later batch repeating a series and millisecond with a new value draws a `400` that drops
+  the whole batch.** `prometheus_out(endpoint)` collapses readings of one series that share a
+  millisecond within one batch, keeping the later and counting the rest
+  `logit.output.metrics.dropped{reason="duplicate_timestamp"}`, and `dedup_timestamps` works within
+  one batch too ([ADR `dedup-timestamps-transform`](../adr/dedup-timestamps-transform.md)'s
+  "Scope"). Neither sees across batches. Prometheus 3.15.1 and Mimir 3.2.2, run 2026-10-21, accept a
+  repeat with the same value silently and answer one with a new value
+  `400 duplicate sample for timestamp`.
+  - **Consequence:** the sink reads the `400` as `Rejected` and drops the batch, counted
+    `batches.dropped{reason="rejected"}`. Against Prometheus under remote-write 1.0, the sink's
+    default `version:`, that loses every clean sample in the batch, because Prometheus stored
+    none of them. Against Prometheus under 2.0, or Mimir under either version, the clean samples
+    were stored, so the drop counter overstates the loss.
+  - **Workaround:** keep one series' readings of one millisecond in one batch: a source that
+    stamps sub-millisecond readings rarely splits them across batches, and an `aggregate` upstream
+    leaves one point per series per window.
+  - **To close:** undecided. Reading the `400` body, which names the series, could tell a batch
+    whose clean samples were stored from one whose weren't; making `version: 2` the default would
+    make the clean samples stored on Prometheus too.
 - **`prometheus_in`'s scrape client still follows HTTP redirects.** It builds its own
   `reqwest::Client` with no redirect policy (`crates/logit-inputs/src/prometheus.rs`'s scrape
   client), so it inherits `reqwest`'s `limited(10)`.

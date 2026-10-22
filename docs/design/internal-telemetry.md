@@ -2558,10 +2558,14 @@ Some reasons exist only on one path:
   Remote-write has native histograms, which this codec doesn't map yet, so the record is loss
   rather than the format skip registry mode counts.
 - `dropped{reason="no_timestamp"}`, `dropped{reason="invalid_labels"}` (a family with an empty
-  name; `__name__` may not be empty), `degraded{reason="sub_ms_collapsed"}` (two readings of one
-  series landing on one millisecond, the later winning; `docs/known-gaps/mappings.md`), and
-  `labels.omitted{reason="empty_value"}` are remote-write encode's, where the wire forbids what the
-  exposition grammar merely renders differently.
+  name; `__name__` may not be empty), and `labels.omitted{reason="empty_value"}` are remote-write
+  encode's, where the wire forbids what the exposition grammar merely renders differently.
+- `dropped{reason="duplicate_timestamp"}` is remote-write encode's too: a reading of a series that
+  a later reading shares a millisecond with, at the same nanosecond or another, once per reading
+  (a histogram reading counts once, not once per wire sample), with a throttled
+  `duplicate_timestamp` diagnostic naming `dedup_timestamps` (`precision: 1ms`), or `aggregate`
+  for a live delta flow. The later reading is sent. The exposition registry's overwrite of a
+  series between scrapes is the pull model's, and isn't counted.
 - `skipped{reason="no_recorded_value"}` means something narrower in sender mode. The encoder runs
   with `with_stale_markers(true)` there, so a flagged `Gauge`/`Sum`/marker-untyped record is written
   as a stale marker rather than skipped. Only a flagged `Histogram`/`Summary`/sketch, kinds that
@@ -2570,7 +2574,9 @@ Some reasons exist only on one path:
 `Diagnostics` keys: `delta_temporality_unresolved` (a delta `Sum` or `Histogram`, naming the
 `aggregate` with `temporality: cumulative` fix); `delta_summary_unresolved` (a delta `Summary`,
 naming the `cumulative_to_delta` it came through); the shared `gauge_delta_unresolved` key `influxdb_out`/`statsd_out`
-use; `prometheus_exponential_histogram_skipped`; `prometheus_accept_failed` from the
+use; `duplicate_timestamp` (remote-write readings dropped for sharing a series and a
+millisecond, naming `dedup_timestamps`); `prometheus_exponential_histogram_skipped`;
+`prometheus_accept_failed` from the
 registry-mode listener's accept loop; and `remote_write_rejected`, one per non-2xx answer in
 sender mode (`crates/logit-outputs/src/prometheus.rs`'s module doc, "Faults, retries and duplicate
 safety", has what it carries).
@@ -2612,6 +2618,7 @@ The module doc of `logit_proto::datadog` has the full mapping-to-counter tables.
 | `logit.output.fields.omitted{reason="no_sum"}` | count | under `histograms.send_aggregation_metrics`, a delta histogram or exponential histogram whose sum is absent or non-finite, so no `.count`, `.sum`, `.min`, or `.max` series; once per record that the series route writes or the sketches route takes under the tag limit, so also for one the sketches route then skips or drops (a conversion error, `empty_sketch`, `oversized_sketch`, or the sink's `oversize`) |
 | `logit.output.metrics.degraded{metric_kind="non_monotonic_sum"\|"histogram"\|"exponential_histogram"}` | count | a non-monotonic `Sum` sent as a `count` (delta) or `gauge` (cumulative), a delta `Histogram` sent as a sketch or as `.bucket` and aggregation series, or a delta `ExponentialHistogram` sent as a sketch; once per record that leaves |
 | `logit.output.metrics.dropped{reason="unresolved_gauge_delta"}` | count | a `GaugeDelta` nothing upstream resolved to a gauge; counted by the series encoders only |
+| `logit.output.metrics.dropped{reason="duplicate_timestamp"}` | count | a series point left off because a later point of its series (metric name, tag set, host, device, and resources) falls in the same second of one request, equal values included, since Datadog keeps one point per series per second, the higher; counted by the series encoders only, with a `duplicate_timestamp` diagnostic naming `dedup_timestamps` (`precision: 1s`). Distribution points and sketches aren't collapsed |
 | `logit.output.metrics.skipped{reason="no_recorded_value"\|"empty_sketch"}` | count | a flagged record, or a sketch with nothing in it |
 | `logit.output.metrics.dropped{reason="non_finite_value"\|"oversized_sketch"}` | count | a non-finite value, a sketch whose counts split into more than `MAX_DOGSKETCH_ENTRIES` `k`/`n` entries, or a histogram or exponential histogram of more than 4,096 × 65,535 observations, which Datadog's exporter abandons too |
 | `logit.output.metrics.dropped{reason="non_monotonic_bounds"\|"sketch_range"}` | count | a delta `Histogram` with a bucket whose upper bound keys below its lower one, or a delta `ExponentialHistogram` whose scale or buckets fall outside the Agent sketch's range (a key past 32,766, or a boundary that overflows) |
@@ -2640,7 +2647,8 @@ timestamp that is neither a number nor RFC 3339, stamped with `received_at`), `m
 `bad_stats_sketch` (a dropped stats summary); `malformed_span` (a dropped span, trace array, or
 chunk); `oversized_sketch` (an outgoing sketch dropped past the entry cap, or a histogram past
 the observation cap); `unresolved_cumulative` (a cumulative kind dropped, or a summary's count and
-sum left off, naming `cumulative_to_delta`).
+sum left off, naming `cumulative_to_delta`); `duplicate_timestamp` (series points dropped as
+duplicates in one second, naming `dedup_timestamps`).
 
 A counter for a batch-resource attribute or a stats bucket counts once per request body the
 encoder writes, not once per record; the paragraph after the sink class table names them and says

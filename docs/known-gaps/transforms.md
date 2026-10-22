@@ -128,7 +128,10 @@ Entry format and the other areas: [the known-gaps index](README.md).
   (OTLP, InfluxDB, Graphite, collectd, Datadog series, Prometheus remote-write) carry no marker,
   so they merge and take the flush time.
   - **Workaround:** to summarize a timestamped point anyway, `remove` its
-    `_logit.statsd.timestamp` or `_logit.prometheus.timestamp` attribute ahead of `aggregate`.
+    `_logit.statsd.timestamp` or `_logit.prometheus.timestamp` attribute ahead of `aggregate`. To
+    keep source timestamps and still leave one point per series per instant, as remote-write and
+    `datadog_out` need, use `dedup_timestamps` in place of `aggregate`
+    ([ADR `dedup-timestamps-transform`](../adr/dedup-timestamps-transform.md)).
 - **A `keep` ahead of `aggregate` turns Datadog APM stats into ordinary metrics.** `aggregate`
   passes a stats group through whole (`passed_through{reason="bucketed"}`), detected by its
   `_logit.datadog.stats.name` marker. `keep` drops `_logit.*` attributes unless `private: keep`

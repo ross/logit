@@ -185,7 +185,8 @@ same date has the bounds of the count and how it enters the sink identity.
 - **Two classifications stay as the migration record has them**, by the maintainer's call:
   - `prometheus_out`'s `output.metrics.degraded{reason="sub_ms_collapsed"}` stays `degraded`.
     Of two readings of one series whose timestamps share a millisecond, the series is delivered
-    with the later one, because the destination holds one sample per millisecond.
+    with the later one, because the destination holds one sample per millisecond. The 2026-10-21
+    amendment below reverses this.
   - `datadog_out`'s cumulative and non-monotonic `Sum` stay
     `output.metrics.skipped{metric_kind}`, though "missing upstream stage" would make them
     `dropped`. No `logit` stage converts either to a delta monotonic `Sum` a Datadog `count` can
@@ -267,6 +268,20 @@ in place of `output.metrics.skipped{metric_kind="cumulative_sum"|"histogram"|"ex
 and a cumulative summary's unsent `.count` and `.sum` as
 `output.fields.dropped{reason="unresolved_cumulative"}`, in place of `output.fields.omitted`. The
 throttled `unresolved_cumulative` diagnostic names the transform to place.
+
+## Amendment (2026-10-21): a collapsed reading is loss
+
+The close-out kept `prometheus_out`'s `output.metrics.degraded{reason="sub_ms_collapsed"}` at
+`degraded` because no stage could keep both readings.
+[ADR `dedup-timestamps-transform`](dedup-timestamps-transform.md) adds that stage, and the collapsed
+reading never leaves `logit`, which is this record's definition of loss. So `prometheus_out`'s
+remote-write counts each reading it removes because a later reading of its series shares its
+millisecond as `output.metrics.dropped{reason="duplicate_timestamp"}`, in place of
+`sub_ms_collapsed`, the same-nanosecond case included, which no counter saw before.
+`datadog_out` counts each series point it leaves off because a later point of its series shares
+its second under the same name. Both name the remedy, `dedup_timestamps`, in a throttled
+`duplicate_timestamp` diagnostic. The exposition registry's overwrite between scrapes is the pull
+model working, not loss, and stays uncounted.
 
 ## Migration record
 The classification of every `*.dropped`, `*.skipped`, `*.degraded`, `*.truncated`, and loss-related
