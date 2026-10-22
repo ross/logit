@@ -2654,8 +2654,8 @@ An equal state loses nothing: the destination stores the same sample either way,
 retry resending identical points raises no loss alarm. Equal means the whole reading as the sink
 writes it: for remote-write, the sample or every bucket and quantile, the created timestamp, and
 the exemplars; for `datadog_out`, the value, type, unit, interval, source type, and origin. An
-increment or a set of observations (a delta count, a delta histogram, `samples`, a
-distribution, a set) counts `dropped` even when equal: two equal ones are two sets of events, and
+increment or a set of observations (a delta count, a Datadog `rate`, a delta histogram,
+`samples`, a distribution, a set) counts `dropped` even when equal: two equal ones are two sets of events, and
 only one is sent. Two sets `{alice}` and `{bob}` both write a size of 1, and their union is 2.
 
 A nonzero dropped count means the flow needs a `dedup_timestamps` component, placed last before

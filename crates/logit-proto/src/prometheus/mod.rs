@@ -1102,7 +1102,8 @@ pub fn events_to_families_pending<'a>(
                 timestamp,
                 created,
                 exemplars: record.exemplars.clone(),
-                increment: !crate::replaced_by_a_later_reading(&record.kind),
+                increment: !crate::replaced_by_a_later_reading(&record.kind)
+                    || crate::carries_datadog_rate(resource, &event.attributes),
             });
 
             // One map probe on the steady-state path (a family this record already belongs to); the

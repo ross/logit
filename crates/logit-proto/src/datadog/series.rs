@@ -1453,7 +1453,8 @@ fn collapse(
 
 /// Whether two points of one series in one second are one state on the series route: both
 /// records' kinds a later reading replaces ([`crate::replaced_by_a_later_reading`]; a delta
-/// `count` or a histogram's expansion is an increment), and the same value by its bits, wire
+/// `count` or a histogram's expansion is an increment), neither written as a `rate`, which is an
+/// increment over its interval, and the same value by its bits, wire
 /// type, unit, interval, source type, and origin. A value's model type isn't compared: every
 /// series value is a double.
 fn same_point(
@@ -1462,6 +1463,7 @@ fn same_point(
 ) -> bool {
     crate::replaced_by_a_later_reading(&ra.kind)
         && crate::replaced_by_a_later_reading(&rb.kind)
+        && pa.wire_type(ca) != WireType::Rate
         && pa.value.to_bits() == pb.value.to_bits()
         && pa.wire_type(ca) == pb.wire_type(cb)
         && pa.unit(ra) == pb.unit(rb)
@@ -2336,9 +2338,9 @@ mod tests {
         assert_eq!(total(&c, "logit.output.metrics.dropped", "duplicate_timestamp"), 2.0);
     }
 
-    /// Only a state is replaced by an equal later reading. A cumulative `Sum` is one, written as a
-    /// gauge or a `count` of its running total; a delta histogram's `.count` and `.sum` series
-    /// are increments, so an equal pair of them in one second stays `dropped`.
+    /// Only a state is replaced by an equal later reading. A non-monotonic cumulative `Sum` is
+    /// one, written as a gauge; a delta histogram's `.count` and `.sum` series are increments, so
+    /// an equal pair of them in one second stays `dropped`.
     #[test]
     fn an_equal_increment_is_dropped_and_an_equal_state_normalized() {
         let (e, registry) = encoder();
@@ -2367,6 +2369,28 @@ mod tests {
         // Every point of the delta histogram: three `.bucket` series, `.count`, `.sum`, `.min`,
         // and `.max`.
         assert_eq!(total(&c, "logit.output.metrics.dropped", "duplicate_timestamp"), 7.0);
+    }
+
+    /// A Datadog `rate` decodes as a `Gauge` carrying `_logit.datadog.type: rate`, but it's an
+    /// increment over its interval: two equal rates in one second are two, so the one left off
+    /// counts `dropped`, as two equal gauges wouldn't.
+    #[test]
+    fn an_equal_rate_is_dropped() {
+        let (mut e, registry) = encoder();
+        let at = |offset_ms: i64| {
+            let mut attrs = AttrMap::new();
+            attrs.insert(super::super::ATTR_TYPE, Value::str("rate"));
+            attrs.insert(super::super::ATTR_INTERVAL, Value::I64(10));
+            Event::metric(
+                TS + offset_ms * 1_000_000,
+                attrs,
+                MetricRecord::new(intern("r"), MetricKind::gauge(0.5)),
+            )
+        };
+        e.encode_series_v1(&batch(vec![at(0), at(1)])).unwrap();
+        let c = counters(&registry);
+        assert_eq!(total(&c, "logit.output.metrics.normalized", "duplicate_timestamp"), 0.0);
+        assert_eq!(total(&c, "logit.output.metrics.dropped", "duplicate_timestamp"), 1.0);
     }
 
     /// A point left off as a duplicate counts only its `duplicate_timestamp`: its record's

@@ -3472,6 +3472,33 @@ mod tests {
         }
     }
 
+    /// A Datadog `rate` relayed to remote-write is a gauge carrying `_logit.datadog.type: rate`,
+    /// an increment over its interval: two equal rates at one instant are two, so the earlier
+    /// counts `dropped`.
+    #[tokio::test]
+    async fn an_equal_datadog_rate_is_counted_dropped() {
+        let rate = |timestamp: i64| {
+            let mut attributes = AttrMap::new();
+            attributes.insert("_logit.datadog.type", logit_core::Value::str("rate"));
+            Event::metric(
+                timestamp,
+                attributes,
+                MetricRecord::new(
+                    intern("requests"),
+                    MetricKind::Gauge(logit_core::MetricValue::F64(0.5)),
+                ),
+            )
+        };
+        let at = 1_700_000_000_000_000_000;
+        for later in [at, at + 1] {
+            let (sums, samples) = retried_remote_write(batch(vec![rate(at), rate(later)])).await;
+            assert_eq!(samples, [(0.5, at / 1_000_000)], "{later}");
+            let reason = [("reason", "duplicate_timestamp")];
+            assert_eq!(sum_of(&sums, "logit.output.metrics.normalized", &reason), 0.0, "{later}");
+            assert_eq!(sum_of(&sums, DUPLICATE.0, DUPLICATE.1), 1.0, "{later}");
+        }
+    }
+
     /// Two sets of one member each, `{alice}` and `{bob}`, both write a size gauge of `1`, but
     /// their union is `2`: the earlier is a lost observation set, counted `dropped`, though the
     /// two gauges are equal.

@@ -287,8 +287,9 @@ its second under the same name. Both name the remedy, `dedup_timestamps`, in a t
 sent loses nothing, so both sinks count it
 `output.metrics.normalized{reason="duplicate_timestamp"}` instead: a relay or a retry resending
 identical points raises no loss alarm. An equal increment or observation set stays `dropped`:
-two equal delta counts are two events, and two sets of size 1 can hold different members. The exposition registry's overwrite between
-scrapes is the pull model working, not loss, and stays uncounted.
+two equal delta counts or Datadog rates are two events, and two sets of size 1 can hold different
+members. The exposition registry's overwrite between scrapes is the pull model working, not loss,
+and stays uncounted.
 
 ## Migration record
 The classification of every `*.dropped`, `*.skipped`, `*.degraded`, `*.truncated`, and loss-related

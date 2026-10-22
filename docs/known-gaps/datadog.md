@@ -131,8 +131,8 @@ Entry format and the other areas: [the known-gaps index](README.md).
 - **`datadog_out` collapses a series' points in one second only within one batch.** Of the
   points of one series in one second in a batch, the sink sends the latest and leaves the rest
   off, counted `metrics.dropped{reason="duplicate_timestamp"}`, or
-  `metrics.normalized{reason="duplicate_timestamp"}` for a gauge or cumulative point equal to the
-  one sent, because
+  `metrics.normalized{reason="duplicate_timestamp"}` for a gauge (not a `rate`) or cumulative
+  point equal to the one sent, because
   Datadog keeps only the higher of two in one request (verified 2026-10-21;
   [ADR `dedup-timestamps-transform`](../adr/dedup-timestamps-transform.md)'s "Verified destination
   behavior"). It plans that over the whole batch before cutting requests, so no cut splits a pair,

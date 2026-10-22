@@ -1333,8 +1333,15 @@ fn same_reading(rec: &Rec, later: &Rec) -> bool {
 /// Whether a later reading of `rec`'s series fully replaces it: a `gauge`, or a cumulative `sum`,
 /// `histogram`, `exponential_histogram`, or `summary`. Any other kind, a set included, is an
 /// increment or an observation set, so two equal ones are two sets of events (`logit_proto`'s
-/// `replaced_by_a_later_reading`).
+/// `replaced_by_a_later_reading`), and so is a `gauge` carrying `_logit.datadog.type: rate`, a
+/// Datadog `rate`.
 fn is_state(rec: &Rec) -> bool {
+    let rate = |attributes: &Map<String, Value>| {
+        attributes.get("_logit.datadog.type").and_then(Value::as_str) == Some("rate")
+    };
+    if rate(&rec.attributes) || rate(&rec.resource) {
+        return false;
+    }
     match rec.kind.as_str() {
         "gauge" => true,
         "sum" | "histogram" | "exponential_histogram" | "summary" => {

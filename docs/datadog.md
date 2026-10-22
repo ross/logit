@@ -220,13 +220,13 @@ Datadog keeps one point per series per second: the higher of two in one request,
 across requests, and a `count` isn't summed. So of each batch's series points, `datadog_out`
 sends the latest point of a series in one second and leaves the others off, counted
 `logit.output.metrics.dropped{reason="duplicate_timestamp"}` with a throttled
-`duplicate_timestamp` diagnostic. A gauge or a cumulative kind equal to the point sent (the same
-value, type, unit, interval, source type, and origin) is counted
+`duplicate_timestamp` diagnostic. A gauge (not a `rate`) or a cumulative kind equal to the point
+sent (the same value, type, unit, interval, source type, and origin) is counted
 `logit.output.metrics.normalized{reason="duplicate_timestamp"}` instead, since Datadog stores the
 same point either way: an Agent relay or a retry resending identical gauges raises no loss alarm.
-Two equal delta counts are two increments, and only one is sent, so they count `dropped`. A series
-is the metric name, the tag set, and the host, device, and resources. Distribution points aren't
-collapsed, because Datadog keeps both. A relay that
+Two equal delta counts or `rate`s are two increments, and only one is sent, so they count
+`dropped`. A series is the metric name, the tag set, and the host, device, and resources.
+Distribution points aren't collapsed, because Datadog keeps both. A relay that
 keeps source timestamps from a source stamping several readings of one series in a second (an
 Agent's unaggregated `|T` gauges, `statsd_in` gauges, `internal`) shows a nonzero dropped count.
 Put a

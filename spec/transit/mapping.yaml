@@ -1699,7 +1699,7 @@ rows:
         text: >-
           Datadog keeps one point per series per second, the higher of two in one request, so the
           sink sends the later point and drops this one, counted, when it differs from the one
-          sent or is an increment: two equal delta counts are two events.
+          sent or is an increment: two equal delta counts or `rate`s are two events.
           Only the series route collapses: a `samples` record leaves on the distribution-points
           route, where Datadog keeps both, and a `distribution`, an `exponential_histogram`, and
           a `histogram` under `histograms.mode: distributions` on the sketches route, so they

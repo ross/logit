@@ -23,6 +23,11 @@
   "gzip": {"events": [], "counters": {
     "logit.output.metrics.dropped{component=out,kind=prometheus_out,reason=unresolved_delta,role=sink}": 1
   }},
+  "rate-same-instant": {"events": [
+    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"web_requests_rate","kind":"gauge","value":1.2}],"attributes":{"env":"prod","host_name":"web-1"}}
+  ], "counters": {
+    "logit.output.metrics.dropped{component=out,kind=prometheus_out,reason=duplicate_timestamp,role=sink}": 1
+  }},
   "series-v1": {"events": [
     {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"disk_used","kind":"gauge","value":0.42,"unit":"fraction"}],"attributes":{"env":"prod","host_name":"web-1"}},
     {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"legacy_unspecified","kind":"gauge","value":3.0}],"attributes":{"env":"prod","host_name":"web-1"}},

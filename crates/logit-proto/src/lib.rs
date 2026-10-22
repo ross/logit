@@ -36,7 +36,9 @@ use logit_core::{Event, EventBatch, Resource, Scope};
 /// Whether a later reading of a series fully replaces a reading of this kind: a state (a `Gauge`,
 /// or a cumulative `Sum`, `Histogram`, `ExponentialHistogram`, or `Summary`). Every other kind is
 /// an increment or an observation set, so two equal readings of it in one bucket are two sets of
-/// events: a set's among them, since `{alice}` and `{bob}` both have size 1 and their union 2. A sink that collapses same-timestamp readings counts an equal
+/// events: a set's among them, since `{alice}` and `{bob}` both have size 1 and their union 2. A
+/// Datadog `rate` decodes as a `Gauge` carrying [`datadog::ATTR_TYPE`] `rate` but is an increment
+/// too; [`carries_datadog_rate`] tells it apart. A sink that collapses same-timestamp readings counts an equal
 /// state it leaves off as normalized and anything else as lost
 /// ([ADR `dedup-timestamps-transform`](../../../docs/adr/dedup-timestamps-transform.md)'s "The
 /// sink-side counter").
@@ -54,6 +56,15 @@ pub(crate) fn replaced_by_a_later_reading(kind: &logit_core::MetricKind) -> bool
         | MetricKind::SetMembers(_)
         | MetricKind::Set(_) => false,
     }
+}
+
+/// Whether `resource` or `attributes` carry [`datadog::ATTR_TYPE`] `rate`: a Datadog `rate`, an
+/// increment over its interval, decoded as a `Gauge`.
+pub(crate) fn carries_datadog_rate(resource: &Resource, attributes: &logit_core::AttrMap) -> bool {
+    let rate = |a: &logit_core::AttrMap| {
+        a.get(datadog::ATTR_TYPE).and_then(logit_core::Value::as_str) == Some("rate")
+    };
+    rate(attributes) || rate(&resource.attributes)
 }
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};

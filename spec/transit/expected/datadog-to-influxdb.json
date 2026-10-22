@@ -19,6 +19,10 @@
   "gzip": {"events": [
     {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"batch.records.value","kind":"gauge","value":250.0}],"attributes":{"_logit.influxdb.measurement":"batch.records","env":"prod","host.name":"etl-1","pipeline":"nightly"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}}}
   ], "counters": {}},
+  "rate-same-instant": {"events": [
+    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"web.requests.rate.value","kind":"gauge","value":1.2}],"attributes":{"_logit.influxdb.measurement":"web.requests.rate","env":"prod","host.name":"web-1"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}}},
+    {"timestamp":"2027-01-15T07:59:50.000000001Z","metrics":[{"name":"web.requests.rate.value","kind":"gauge","value":1.2}],"attributes":{"_logit.influxdb.measurement":"web.requests.rate","env":"prod","host.name":"web-1"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}}}
+  ], "counters": {}},
   "series-v1": {"events": [
     {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"disk.used.value","kind":"gauge","value":0.42}],"attributes":{"_logit.influxdb.measurement":"disk.used","env":"prod","host.name":"web-1"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}}},
     {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"legacy.unspecified.value","kind":"gauge","value":3.0}],"attributes":{"_logit.influxdb.measurement":"legacy.unspecified","env":"prod","host.name":"web-1"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}}},
