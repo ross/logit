@@ -10,8 +10,10 @@
 #
 # Caveat: `count` is generated events, but `cumulative_to_delta` sees one point per series per
 # flush, not one per event, so CPU us/event is dominated by `aggregate` and the generator. Read
-# the transform's own cost from `script/perf attribute --scenario cumulative-to-delta`, and read
-# the scenario against aggregate (same graph minus the transform and temporality).
+# the transform's own cost from `script/perf attribute --scenario cumulative-to-delta`.
+# `max_retained_series` on `running` sits above the series count: at the default 10000, `aggregate`
+# evicts active cumulative series every flush, each restarts from zero, and `cumulative_to_delta`
+# reads about half its points as resets instead of differences.
 components:
   gen:
     type: generate_in
@@ -29,6 +31,7 @@ components:
     sources: [gen]
     interval: 50ms
     temporality: cumulative
+    max_retained_series: 25000
 
   deltas:
     type: cumulative_to_delta

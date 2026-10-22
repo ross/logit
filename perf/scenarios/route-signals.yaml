@@ -2,7 +2,7 @@
 # and a sum metric, `route_signals` (default `strip: true`) splits it into a part per target, the
 # log to `log_tier` and the metric to `metric_tier`, each into its own null_out. Every input event
 # becomes two output events, the second counted in `logit.component.events.copied`; the part
-# carrying the metric gets a clone of the attributes. `route_signals` takes no ordinary consumers
+# carrying the log gets a clone of the attributes. `route_signals` takes no ordinary consumers
 # and discards an event carrying no listed signal, so there is no unrouted sink. Scenario table:
 # docs/design/performance.md, "Scenarios".
 #

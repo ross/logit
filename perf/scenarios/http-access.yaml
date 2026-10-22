@@ -17,7 +17,8 @@
 #     abnormal-termination status, coerced to `0`, and the rest span `1xx` to `5xx`;
 #   - `user_agent.original` varies in version, so the class table runs on distinct strings (every
 #     value classifies as `browser`).
-# Read against json-parse: the added cost is `http_access` itself, over a log twice as wide.
+# Read against json-parse with care: that scenario parses a narrower log and adds `kv_metrics`, so
+# `script/perf attribute --scenario http-access` reads `http_access`'s own cost.
 components:
   gen:
     type: generate_in
