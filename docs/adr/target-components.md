@@ -1,6 +1,6 @@
 ---
 created: 2026-09-13
-updated: 2026-10-16
+updated: 2026-10-21
 ---
 
 # `target` components: named destinations a router directs events into, beside `sources:`
@@ -415,6 +415,8 @@ part.
 - **Rule 50 doesn't apply to `route_signals`.** It has no ordinary edge: rule 92 keeps it out of
   every `sources:`, and an event carrying no listed signal is discarded and counted
   `logit.component.events.discarded`, because the `signals:` map names which events are kept.
+  [An event that arrives carrying no signal goes to `signals.none`'s target when one is set
+  ([ADR `route-signals`](route-signals.md)'s 2026-10-21 amendment).]
 - **`route by: signal` is removed.** The `route_signals` kind took over its job, and the shipped
   configs that used it moved to `route_signals`. `route` keeps list-valued `routes:` values, the
   shared-`Arc` path, `logit.component.events.copied`, and rule 51's reconvergence clause for

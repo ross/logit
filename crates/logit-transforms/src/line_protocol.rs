@@ -5,7 +5,9 @@
 //!
 //! The mapping from a point to an event is `influxdb_in`'s, built by the same code
 //! ([`InfluxDecoder::decode_skipping`]); `crates/logit-proto/src/influxdb/mod.rs`'s module doc is
-//! its table. This module doc is the canonical copy of what the transform adds around it.
+//! its table. This module doc is the canonical copy of what the transform adds around it. As
+//! there, a point whose fields are all strings is an event carrying no signal, which a
+//! `route_signals` discards unless `signals.none` names a target.
 //!
 //! **Input.** The log message, when it's a `Value::Str` or `Value::Bytes`. An event with no log,
 //! or with a message of another type, is forwarded untouched and uncounted.

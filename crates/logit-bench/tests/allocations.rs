@@ -2243,6 +2243,7 @@ fn signal_routes(
             logs: logs.map(String::from),
             metrics: metrics.map(String::from),
             traces: None,
+            none: None,
         },
         strip,
         &["a".to_string(), "b".to_string()],

@@ -12843,6 +12843,7 @@ mod tests {
                 logs: Some("l".to_string()),
                 metrics: Some("m".to_string()),
                 traces: None,
+                none: None,
             },
             true,
             &["l".to_string(), "m".to_string()],

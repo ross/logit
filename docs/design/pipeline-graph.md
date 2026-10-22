@@ -155,7 +155,8 @@ pub enum ComponentKind {
     Route { by: RouteBy, routes: BTreeMap<String, RouteTargets> },
     // Sends each signal an event carries to that signal's target, by default splitting a mixed
     // event into one part per target; no ordinary consumers, and an event carrying no listed
-    // signal is discarded (docs/adr/route-signals.md).
+    // signal is discarded, except that one arriving with no payload goes to `none`'s target when
+    // set (docs/adr/route-signals.md).
     RouteSignals { signals: SignalTargets, strip: bool },
     // Keeps a fraction of events by a hashed key (trace_id, an attribute, or a resource
     // attribute), so every event sharing a key gets the same verdict in every process;
@@ -319,7 +320,8 @@ runnable version of the config above is `fixtures/fan-out-central.yaml`.
 Under `strip: true`, the default, a mixed event is split: each target receives one event holding
 only its own signals' payloads, with the original's timestamp and a copy of its attributes. A
 signal `signals:` leaves out is stripped, and an event carrying none of the listed signals is
-discarded. A component may read several of its targets, receiving one event per part; to keep two
+discarded. An event that arrives with no payload at all, such as an InfluxDB point whose fields are
+all strings, goes to the target an optional `none:` key names, else it's discarded too. A component may read several of its targets, receiving one event per part; to keep two
 signals on one event, send both to one target. Under `strip: false` each target receives the
 whole event, and rule 92 keeps one component from reading two of its targets.
 
@@ -356,7 +358,8 @@ silently ignored. `0` for a count or duration bound is usually impossible, not s
 19. An empty `trace_context` `trace_id`, `span_id`, or `flags` field name, after `format`'s
     defaults.
 20. A `scale` with no `fields`, an empty field name, or a non-finite factor.
-21. An empty `signals:` list, or all three signals on `keep_signals`/`drop_signals`.
+21. An empty `signals:` list, all three payload signals on `keep_signals`/`drop_signals`, or
+    `none` on `drop_signals`.
 22. An `otlp_out` header the transport sets itself, or two that differ only in case.
 23. An `otlp_out` `paths:` under `protocol: grpc`.
 24. An inconsistent `otlp_out` `tls:`, or one under a non-`https://` endpoint.
@@ -484,7 +487,8 @@ silently ignored. `0` for a count or duration bound is usually impossible, not s
     whitespace, or a `max_request_bytes` of `0`.
 92. A `route_signals` listed in any component's `sources:` (it has no ordinary edge, so rule 7
     doesn't ask it for a consumer), one with no `signals:` entry set or an empty target id, or,
-    under `strip: false`, a component whose `sources:` lists two of its targets.
+    under `strip: false`, a component whose `sources:` lists two of its targets (a target only
+    `signals.none` names doesn't count).
 93. A `replay_in` with an empty `path` or a `batch` of `0`.
 94. A `cumulative_to_delta` with a `max_staleness` of `0s` or a `max_series` of `0`.
 
