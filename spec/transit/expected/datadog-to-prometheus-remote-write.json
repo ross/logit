@@ -8,13 +8,13 @@
     {"timestamp":"2026-09-24T22:41:05.000000000Z","metrics":[{"name":"datadog_agent_up","kind":"gauge","value":0.0}]}
   ], "counters": {}},
   "agent-sketches": {"events": [
-    {"timestamp":"2026-09-24T22:41:00.000000000Z","metrics":[{"name":"record_response_size","kind":"summary","temporality":"cumulative","count":3,"sum":5490.0,"quantiles":[{"quantile":0.5,"value":1830.0},{"quantile":0.75,"value":1830.0},{"quantile":0.9,"value":1830.0},{"quantile":0.95,"value":1830.0},{"quantile":0.99,"value":1830.0}]}],"attributes":{"env":"record","host_name":"record-fixtures","service":"record-fixtures","team":"obs","version":"1.2.3"}}
+    {"timestamp":"2026-09-24T22:41:00.000000000Z","metrics":[{"name":"record_response_size","kind":"summary","temporality":"cumulative","count":3,"sum":5490.0,"quantiles":[{"quantile":0.0,"value":1830.0},{"quantile":0.5,"value":1830.0},{"quantile":0.75,"value":1830.0},{"quantile":0.9,"value":1830.0},{"quantile":0.95,"value":1830.0},{"quantile":0.99,"value":1830.0},{"quantile":1.0,"value":1830.0}]}],"attributes":{"env":"record","host_name":"record-fixtures","service":"record-fixtures","team":"obs","version":"1.2.3"}}
   ], "counters": {
     "logit.output.metrics.degraded{component=out,kind=prometheus_out,metric_kind=distribution,role=sink}": 1
   }},
   "distribution-points": {"events": [
-    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"request_latency","kind":"summary","temporality":"cumulative","count":4,"sum":0.33,"quantiles":[{"quantile":0.5,"value":0.03405042840434277},{"quantile":0.75,"value":0.03405042840434277},{"quantile":0.9,"value":0.25},{"quantile":0.95,"value":0.25},{"quantile":0.99,"value":0.25}]}],"attributes":{"env":"prod","host_name":"web-1","route":"/orders"}},
-    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"request_size","kind":"summary","temporality":"cumulative","count":2,"sum":2560.0,"quantiles":[{"quantile":0.5,"value":512.0},{"quantile":0.75,"value":2048.0},{"quantile":0.9,"value":2048.0},{"quantile":0.95,"value":2048.0},{"quantile":0.99,"value":2048.0}]}],"attributes":{"env":"prod"}}
+    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"request_latency","kind":"summary","temporality":"cumulative","count":4,"sum":0.33,"quantiles":[{"quantile":0.0,"value":0.012},{"quantile":0.5,"value":0.03405042840434277},{"quantile":0.75,"value":0.03405042840434277},{"quantile":0.9,"value":0.25},{"quantile":0.95,"value":0.25},{"quantile":0.99,"value":0.25},{"quantile":1.0,"value":0.25}]}],"attributes":{"env":"prod","host_name":"web-1","route":"/orders"}},
+    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"request_size","kind":"summary","temporality":"cumulative","count":2,"sum":2560.0,"quantiles":[{"quantile":0.0,"value":512.0},{"quantile":0.5,"value":512.0},{"quantile":0.75,"value":2048.0},{"quantile":0.9,"value":2048.0},{"quantile":0.95,"value":2048.0},{"quantile":0.99,"value":2048.0},{"quantile":1.0,"value":2048.0}]}],"attributes":{"env":"prod"}}
   ], "counters": {
     "logit.output.metrics.degraded{component=out,kind=prometheus_out,metric_kind=samples,role=sink}": 2
   }},

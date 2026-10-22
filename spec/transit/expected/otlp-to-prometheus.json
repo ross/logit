@@ -32,6 +32,12 @@
   "gzip": {"events": [], "counters": {
     "logit.output.metrics.dropped{component=out,kind=prometheus_out,reason=unresolved_delta,role=sink}": 1
   }},
+  "histogram-count": {"events": [
+    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"queue_wait","kind":"histogram","temporality":"cumulative","buckets":[{"bound":1.0,"count":3},{"bound":"inf","count":4}],"sum":4.5,"start_timestamp":"2027-01-15T07:58:50.000000000Z"}],"attributes":{"queue_name":"orders","service_name":"checkout"}},
+    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"rpc_server_duration","kind":"histogram","temporality":"cumulative","buckets":[{"bound":"inf","count":12}],"sum":30.0,"start_timestamp":"2027-01-15T07:58:50.000000000Z"}],"attributes":{"rpc_service":"cart","service_name":"checkout"}}
+  ], "counters": {
+    "logit.output.metrics.degraded{component=out,kind=prometheus_out,reason=unit_not_suffix,role=sink}": 2
+  }},
   "histogram-neg-inf-bound": {"events": [
     {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"http_server_duration","kind":"histogram","temporality":"cumulative","buckets":[{"bound":"-inf","count":8},{"bound":1.0,"count":1},{"bound":5.0,"count":2},{"bound":"inf","count":16}],"start_timestamp":"2027-01-15T07:59:40.000000000Z"}],"attributes":{"host_name":"web-1","http_route":"/cart","service_name":"checkout"}}
   ], "counters": {

@@ -8,9 +8,11 @@
 //!
 //! **Which rows a record reaches.** A metric record reaches its kind's rows: for a `sum`, its
 //! temporality and monotonicity and its scalar type; for a `gauge` or `gauge_delta`, its scalar
-//! type, and `negative` for a gauge below zero; for a `histogram`, `exponential_histogram`, or
-//! `summary`, its temporality, and for a `histogram` `nan_bound` and `neg_inf_bound` for each such
-//! bound it holds; any other kind, its kind's one row. It also reaches a `record` row for each of
+//! type, `negative` for a gauge below zero, and `prometheus_info` or `prometheus_stateset` for a
+//! gauge whose `_logit.prometheus.type` is `info` or `stateset`; for a `histogram`,
+//! `exponential_histogram`, or `summary`, its temporality, and for a `histogram` `nan_bound` and
+//! `neg_inf_bound` for each such bound it holds and `gauge_histogram` when its
+//! `_logit.prometheus.type` is `gaugehistogram`; any other kind, its kind's one row. It also reaches a `record` row for each of
 //! `unit` (`unit_on_distribution` for a `samples` or `distribution`), `description`,
 //! `start_timestamp`, `exemplars` (`exemplars_on_summary` for a `summary`), and `no_recorded_value` (`no_recorded_value_delta_sum` for a delta `sum`,
 //! `no_recorded_value_other_kind` for a kind other than `sum` and `gauge`) it carries,
@@ -72,7 +74,8 @@
 //! `format: dogstatsd` a `host.name` or hostless mark read back as `host` ([`statsd`]); `prometheus_out`'s `sanitize_metric_name`, `_total` on a counter, a label
 //! key's `sanitize_label_name`, and an array's last element; `influxdb_out`'s `<name>.value` for
 //! a `sum`, `gauge`, or `set` off the carrier path, and an array's last element; `otlp_out`'s
-//! timestamp value as an integer of nanoseconds; `datadog_out`'s `host` attribute read back under
+//! timestamp value as an integer of nanoseconds, and an OpenMetrics `info` or `stateset` gauge
+//! read back as a cumulative non-monotonic sum, an `info` one under `<name>_info`; `datadog_out`'s `host` attribute read back under
 //! its route's host key, and the attributes it writes from a record's own fields
 //! ([`Spelling::derived`]: the run's hostname on a record with no host, a log's `status`, a
 //! span's `span.kind` and `_dd.p.tid`), each accepted only with the value derived for it;
@@ -307,8 +310,9 @@ enum Spelling {
     /// of a measurement named for the record, which `influxdb_in` reads back as `<name>.value`;
     /// an array's last element as its tag value.
     Influxdb,
-    /// `otlp_out`: names and keys as written; a timestamp value as an integer of Unix
-    /// nanoseconds.
+    /// `otlp_out`: names and keys as written, but for an OpenMetrics `info` gauge's `_info`
+    /// suffix; an `info` or `stateset` gauge as a cumulative non-monotonic sum; a timestamp value
+    /// as an integer of Unix nanoseconds.
     Otlp,
     /// `datadog_out`: names as written; a `host` attribute the encoder takes as the host as
     /// `host.name`; and the attributes [`Spelling::derived`] lists, which the encoder writes from
@@ -406,7 +410,23 @@ impl Spelling {
                     rec.name.clone()
                 }
             }
+            Spelling::Otlp if rec.kind == "gauge" && prometheus_type(rec) == Some("info") => {
+                format!("{}_info", rec.name)
+            }
             _ => self.sanitize(&rec.name),
+        }
+    }
+
+    /// The [`Rec::identity`] the sink's pair decoder reads `rec`, a sink input, back under:
+    /// `otlp_out` writes an OpenMetrics `info` or `stateset` gauge as a cumulative non-monotonic
+    /// sum.
+    fn written_identity(self, rec: &Rec) -> String {
+        let respelled =
+            rec.kind == "gauge" && matches!(prometheus_type(rec), Some("info" | "stateset"));
+        if self == Spelling::Otlp && respelled {
+            "sum/\"cumulative\"/false".to_string()
+        } else {
+            rec.identity()
         }
     }
 
@@ -988,7 +1008,7 @@ fn pair(ins: &[Rec], outs: &[Rec], spelling: Spelling) -> Pairing {
             let input = &ins[i];
             let same: Vec<usize> = candidates(i, &used)
                 .into_iter()
-                .filter(|&o| outs[o].identity() == input.identity())
+                .filter(|&o| outs[o].identity() == spelling.written_identity(input))
                 .collect();
             let picked = match input.kind.as_str() {
                 "samples" | "set_members" => gather(input, &same, outs),
@@ -1217,6 +1237,11 @@ fn kind_features(rec: &Rec) -> Vec<Option<String>> {
             if number(&rec.body["value"]).is_some_and(|v| v < 0.0) {
                 features.push(Some("negative".to_string()));
             }
+            match prometheus_type(rec) {
+                Some("info") => features.push(Some("prometheus_info".to_string())),
+                Some("stateset") => features.push(Some("prometheus_stateset".to_string())),
+                _ => {}
+            }
             features
         }
         "gauge_delta" => vec![Some(scalar("delta"))],
@@ -1234,6 +1259,9 @@ fn kind_features(rec: &Rec) -> Vec<Option<String>> {
             }
             if bounds.contains(&"-inf") {
                 features.push(Some("neg_inf_bound".to_string()));
+            }
+            if prometheus_type(rec) == Some("gaugehistogram") {
+                features.push(Some("gauge_histogram".to_string()));
             }
             features
         }
@@ -1259,6 +1287,11 @@ fn kind_features(rec: &Rec) -> Vec<Option<String>> {
         "event" => vec![Some("attributes_only".to_string())],
         _ => vec![None],
     }
+}
+
+/// The OpenMetrics family type `prometheus_in` carried on `rec`, if any.
+fn prometheus_type(rec: &Rec) -> Option<&str> {
+    rec.attributes.get(logit_proto::prometheus::ATTR_TYPE).and_then(Value::as_str)
 }
 
 /// `rec`'s metric record in the model, read back from its `format: json` body.
@@ -2121,6 +2154,26 @@ mod tests {
 
         let verbatim = pair(&ins, &outs, Spelling::Verbatim);
         assert_eq!(verbatim.seen, [None, None]);
+    }
+
+    /// `otlp_out` writes an OpenMetrics `info` or `stateset` gauge as a cumulative non-monotonic
+    /// sum, an `info` one under `<name>_info`; with no carrier, the same sum pairs nothing.
+    #[test]
+    fn otlp_pairs_an_info_and_a_stateset_gauge_with_their_sums() {
+        let info = r#"{{T},"metrics":[{"name":"build","kind":"gauge","value":1.0}],"attributes":{"_logit.prometheus.type":"info","version":"1"}}"#;
+        let state = r#"{{T},"metrics":[{"name":"feature","kind":"gauge","value":0.0}],"attributes":{"_logit.prometheus.type":"stateset","feature":"a"}}"#;
+        let outs = recs(&[
+            r#"{{T},"metrics":[{"name":"build_info","kind":"sum","value":1.0,"temporality":"cumulative","monotonic":false}],"attributes":{"version":"1"}}"#,
+            r#"{{T},"metrics":[{"name":"feature","kind":"sum","value":0.0,"temporality":"cumulative","monotonic":false}],"attributes":{"feature":"a"}}"#,
+        ]);
+        let pairing = pair(&recs(&[info, state]), &outs, Spelling::Otlp);
+        assert_eq!(pairing.seen, [Some(Class::Normalized), Some(Class::Normalized)]);
+        assert!(pairing.unclaimed.is_empty());
+
+        let bare = recs(&[
+            r#"{{T},"metrics":[{"name":"feature","kind":"gauge","value":0.0}],"attributes":{"feature":"a"}}"#,
+        ]);
+        assert_eq!(pair(&bare, &outs[1..], Spelling::Otlp).seen, [Some(Class::Degraded)]);
     }
 
     /// `influxdb_out` writes a gauge with no measurement carrier as field `value`, read back as

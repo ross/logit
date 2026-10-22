@@ -1,0 +1,5 @@
+# A hand-written OTLP/JSON body: a cumulative `Histogram` point with only `count` 12 and `sum`,
+# which otlp_in reads as one `+Inf` bucket of 12, and one whose `count` 10 disagrees with its
+# `bucketCounts` `[3, 4]`, which otlp_in reads as those buckets, counted.
+wire: histogram-count.bin
+exercises: [otlp_json, histogram_cumulative, histogram_bucketless, histogram_count_mismatch, histogram_explicit_bounds, histogram_no_min_max, start_time, unit, resource_attributes, scope, attribute_string]

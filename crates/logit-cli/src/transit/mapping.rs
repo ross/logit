@@ -6,9 +6,9 @@
 //! | `kind` | `feature` | Level |
 //! |---|---|---|
 //! | `sum` | `delta_monotonic`, `delta_nonmonotonic`, `cumulative_monotonic`, `cumulative_nonmonotonic`, `f64`, `i64`, `u64`, `bool` | record |
-//! | `gauge` | `f64`, `i64`, `u64`, `bool`, `negative` | record |
+//! | `gauge` | `f64`, `i64`, `u64`, `bool`, `negative`, `prometheus_info`, `prometheus_stateset` (an OpenMetrics `info` or `stateset` under the `_logit.prometheus.type` carrier) | record |
 //! | `gauge_delta` | `f64`, `i64`, `u64`, `bool` | record |
-//! | `histogram` | `delta`, `cumulative`, `nan_bound`, `neg_inf_bound` (a `NaN` or a `-Inf` bucket bound) | record |
+//! | `histogram` | `delta`, `cumulative`, `nan_bound`, `neg_inf_bound` (a `NaN` or a `-Inf` bucket bound), `gauge_histogram` (an OpenMetrics `gaugehistogram` under the `_logit.prometheus.type` carrier) | record |
 //! | `exponential_histogram`, `summary` | `delta`, `cumulative` | record |
 //! | `samples`, `set_members`, `distribution`, `set` | none | record |
 //! | `record` | `no_recorded_value`, `no_recorded_value_delta_sum`, `no_recorded_value_other_kind`, `service_check`, `name_unsafe`, `exemplar_key_unsafe`, `exemplar_key_unsafe_histogram`, `sample_rate`, `non_finite`, `superseded`, `same_instant`, `same_millisecond` | record |
@@ -90,9 +90,9 @@ const KINDS: [(&str, &[&str]); 15] = [
             "bool",
         ],
     ),
-    ("gauge", &["f64", "i64", "u64", "bool", "negative"]),
+    ("gauge", &["f64", "i64", "u64", "bool", "negative", "prometheus_info", "prometheus_stateset"]),
     ("gauge_delta", &["f64", "i64", "u64", "bool"]),
-    ("histogram", &["delta", "cumulative", "nan_bound", "neg_inf_bound"]),
+    ("histogram", &["delta", "cumulative", "nan_bound", "neg_inf_bound", "gauge_histogram"]),
     ("exponential_histogram", &["delta", "cumulative"]),
     ("samples", &[]),
     ("set_members", &[]),

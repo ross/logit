@@ -149,7 +149,7 @@ For each flow and case, the check pairs every record that reached the sink with 
 back, reading names, attribute keys, and values as that sink writes them (`statsd_out`'s
 `host.name` and hostless mark read back as the DogStatsD `host`, `prometheus_out`'s
 sanitized names and `_total`, `influxdb_out`'s `<name>.value` field, `otlp_out`'s integer
-timestamps, `datadog_out`'s `host` tag read back as `host.name` and the attributes it writes from a
+timestamps and an OpenMetrics `info` or `stateset` gauge read back as a non-monotonic sum, `datadog_out`'s `host` tag read back as `host.name` and the attributes it writes from a
 record's own fields), then compares what it observed with the table. A record that pairs only by
 name, in any metric kind (its own included) or as a dotted expansion, reads `degraded`. When both
 sides are histograms, that pairing also needs the same total count, and the same sum where both

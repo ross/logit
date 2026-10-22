@@ -452,6 +452,57 @@ rows:
         class: exact
         text: A negative value, written as is.
 
+  # An OpenMetrics `info` or `stateset` family, which prometheus_in decodes as gauges under the
+  # `_logit.prometheus.type` carrier. A sink's other outcomes for the gauge are its scalar row's.
+  - kind: gauge
+    feature: prometheus_info
+    cells:
+      statsd_out:
+        class: exact
+        text: As any other gauge; the type carrier isn't written.
+      prometheus_out:
+        class: exact
+        text: An `info` family, its sample named `<name>_info`.
+      influxdb_out:
+        class: exact
+        text: As any other gauge; the type carrier isn't written.
+      otlp_out:
+        class: normalized
+        reason: prometheus_info_sum
+        text: >-
+          A cumulative non-monotonic OTLP `Sum` named `<name>_info`, as the OTel Prometheus
+          compatibility spec's Info section (marked Development) has it, read back as that sum.
+      datadog_out:
+        class: exact
+        text: As any other gauge; the type carrier isn't written.
+      graphite_out:
+        class: exact
+        text: As any other gauge; the type carrier isn't written.
+  - kind: gauge
+    feature: prometheus_stateset
+    cells:
+      statsd_out:
+        class: exact
+        text: As any other gauge; the type carrier isn't written.
+      prometheus_out:
+        class: exact
+        text: A `stateset` family, one sample per state.
+      influxdb_out:
+        class: exact
+        text: As any other gauge; the type carrier isn't written.
+      otlp_out:
+        class: normalized
+        reason: prometheus_stateset_sum
+        text: >-
+          A cumulative non-monotonic OTLP `Sum`, as the OTel Prometheus compatibility spec's
+          StateSet section (marked Development) has it, read back as that sum.
+      datadog_out:
+        class: exact
+        text: As any other gauge; the type carrier isn't written.
+      graphite_out:
+        class: exact
+        text: As any other gauge; the type carrier isn't written.
+
   # --- gauge_delta -----------------------------------------------------------------------------
   - kind: gauge_delta
     feature: f64
@@ -618,8 +669,8 @@ rows:
         class: degraded
         counter: logit.output.metrics.degraded{metric_kind=samples}
         text: >-
-          Sketched, each value weighted by its inverse sample rate, then a `summary` of fixed
-          quantiles with `_sum` and `_count`.
+          Sketched, each value weighted by its inverse sample rate, then written as the
+          `distribution` row describes.
       influxdb_out:
         class: degraded
         text: >-
@@ -629,8 +680,8 @@ rows:
         class: degraded
         counter: logit.output.metrics.degraded{metric_kind=samples}
         text: >-
-          Sketched, each value weighted by its inverse sample rate, then an OTLP `Summary` of fixed
-          quantiles.
+          Sketched, each value weighted by its inverse sample rate, then written as the
+          `distribution` row describes.
       datadog_out:
         class: exact
         text: >-
@@ -709,22 +760,24 @@ rows:
         class: degraded
         counter: logit.output.metrics.degraded{metric_kind=distribution}
         text: >-
-          A `summary` of fixed quantiles with the sketch's exact `_sum` and `_count`; the sketch
-          is gone, so quantiles from two senders don't merge.
+          A `summary` of the sketch's `0` (its minimum), `0.5`, `0.75`, `0.9`, `0.95`, `0.99`,
+          and `1` (its maximum) quantiles with its exact `_sum` and `_count`; the sketch is gone,
+          so quantiles from two senders don't merge.
       influxdb_out:
         class: degraded
         text: >-
-          In the `summary` row's shape: float `count` and `sum` fields and the sketch's `0.5`,
-          `0.9`, and `0.99` quantiles, each read back as a gauge under `<name>.`; the sketch is
-          gone. When the sum and quantiles are finite, nothing is counted. A non-finite sum or
+          In the `summary` row's shape: float `count` and `sum` fields and the sketch's `0` (its
+          minimum), `0.5`, `0.9`, `0.99`, and `1` (its maximum) quantiles, each read back as a
+          gauge under `<name>.`; the sketch is gone. When the sum and quantiles are finite, nothing is counted. A non-finite sum or
           quantile is left off the line, and the record counts once as
           `logit.output.metrics.degraded{reason=non_finite_component}`.
       otlp_out:
         class: degraded
         counter: logit.output.metrics.degraded{metric_kind=distribution}
         text: >-
-          An OTLP `Summary` of fixed quantiles with the sketch's own count and sum; OTLP has no
-          mergeable sketch.
+          An OTLP `Summary` of the sketch's `0` (its minimum), `0.5`, `0.75`, `0.9`, `0.95`,
+          `0.99`, and `1` (its maximum) quantiles with its own count and sum; OTLP has no mergeable
+          sketch.
       datadog_out:
         class: exact
         text: >-
@@ -1030,6 +1083,33 @@ rows:
           counter: logit.output.metrics.skipped{metric_kind=histogram}
           text: >-
             Under `multi_value: skip`, the default, no datapoint is written.
+  # An OpenMetrics `gaugehistogram`, which prometheus_in decodes as a cumulative histogram under
+  # the `_logit.prometheus.type` carrier. A sink's other outcomes are its temporality row's.
+  - kind: histogram
+    feature: gauge_histogram
+    cells:
+      statsd_out:
+        class: exact
+        text: As `histogram/cumulative`; the type carrier isn't written.
+      prometheus_out:
+        class: exact
+        text: A `gaugehistogram` family, with `_gsum` and `_gcount`.
+      influxdb_out:
+        class: exact
+        text: As `histogram/cumulative`; the type carrier isn't written.
+      otlp_out:
+        class: skipped
+        counter: logit.output.metrics.skipped{metric_kind=gauge_histogram}
+        text: >-
+          The OTel Prometheus compatibility spec drops a GaugeHistogram, since OTLP has no
+          histogram that isn't a running count, so it isn't written, with a throttled
+          `otlp_gauge_histogram_skipped` warning.
+      datadog_out:
+        class: exact
+        text: As `histogram/cumulative`; the type carrier isn't written.
+      graphite_out:
+        class: exact
+        text: As `histogram/cumulative`; the type carrier isn't written.
   - kind: exponential_histogram
     feature: delta
     cells:
