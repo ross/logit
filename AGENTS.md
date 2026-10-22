@@ -129,7 +129,7 @@ Native transforms live in `crates/logit-transforms`; `lua`/`lua_file` live in `c
 
 | Kind | What it does | Decision record |
 |---|---|---|
-| `lua`, `lua_file` | a user script, inline or from a `.lua` file path relative to the config file; an optional `interval` runs its `flush()`, a `random` global mints trace ids, UUIDs, and ULIDs, and a script edits a log's message, severity, and body format and deletes attributes in place, with `pairs` enumerating them; scripts run interpreted unless `jit: true` turns on LuaJIT's compiler for that component | [ADR `lua-flush-root-context`](docs/adr/lua-flush-root-context.md), [ADR `lua-event-constructor`](docs/adr/lua-event-constructor.md), [ADR `lua-in-place-edits`](docs/adr/lua-in-place-edits.md), [ADR `lua-random-ids`](docs/adr/lua-random-ids.md), [ADR `lua-jit-opt-in`](docs/adr/lua-jit-opt-in.md) |
+| `lua`, `lua_file` | a user script, inline or from a `.lua` file path relative to the config file; an optional `interval` runs its `flush()`, a `random` global mints trace ids, UUIDs, and ULIDs, and a script edits a log's message, severity, and body format and deletes attributes in place, with `pairs` enumerating them; scripts run interpreted unless `jit: true` turns on LuaJIT's compiler for that component; an optional `vars:` map reaches the script as a plain-table `vars` global, so a copied script reads its deployment settings from config | [ADR `lua-flush-root-context`](docs/adr/lua-flush-root-context.md), [ADR `lua-event-constructor`](docs/adr/lua-event-constructor.md), [ADR `lua-in-place-edits`](docs/adr/lua-in-place-edits.md), [ADR `lua-random-ids`](docs/adr/lua-random-ids.md), [ADR `lua-jit-opt-in`](docs/adr/lua-jit-opt-in.md), [ADR `lua-script-vars`](docs/adr/lua-script-vars.md) |
 | `aggregate` | windowed aggregation into mergeable metric kinds | [ADR `aggregation-window-semantics`](docs/adr/aggregation-window-semantics.md) |
 | `cumulative_to_delta` | replaces each point of a cumulative monotonic `Sum`, `Histogram`, `ExponentialHistogram`, or `Summary` with its difference from the series' previous point, for a delta-only destination; per-series state in memory, keyed without the start time, bounded by `max_staleness` (wall clock) and `max_series` | [ADR `cumulative-to-delta-transform`](docs/adr/cumulative-to-delta-transform.md) |
 | `json` | parses JSON into attributes | [ADR `json-parsing-into-attributes`](docs/adr/json-parsing-into-attributes.md) |
@@ -148,14 +148,14 @@ Native transforms live in `crates/logit-transforms`; `lua`/`lua_file` live in `c
 | `http_access` | normalizes web-server access logs onto OTel semconv | [ADR `http-access-normalization`](docs/adr/http-access-normalization.md) |
 | `flatten` | rewrites a nested attribute into flat, dot-joined keys | [ADR `flatten-transform`](docs/adr/flatten-transform.md) |
 | `line_protocol` | parses a log message as InfluxDB line protocol into one event per point, in `influxdb_in`'s shape and through its code, each inheriting the parent's attributes; a bad line is skipped and counted, and the parent's log is removed unless `keep_source: true` | [ADR `line-protocol-transform`](docs/adr/line-protocol-transform.md), [ADR `transform-fan-out`](docs/adr/transform-fan-out.md) |
-| `has_signal`, `keep_signals`, `drop_signals` | forward an event carrying a listed signal; keep, or clear, the listed signals' payloads | [ADR `signal-filtering-components`](docs/adr/signal-filtering-components.md) |
+| `has_signal`, `keep_signals`, `drop_signals` | forward an event carrying a listed signal; keep, or clear, the listed signals' payloads; `none` selects an event that arrived with no payload (not on `drop_signals`) | [ADR `signal-filtering-components`](docs/adr/signal-filtering-components.md) |
 | `has_attributes`, `drop_attributes` | forward, or drop, an event whose resource and/or attributes match every configured pair, and carry every listed key | [ADR `attribute-filtering-components`](docs/adr/attribute-filtering-components.md) |
 | `has_provenance`, `drop_provenance` | forward, or drop, an event whose batch `origin`/`previous` match a configured list | [ADR `provenance-filtering-components`](docs/adr/provenance-filtering-components.md) |
 | `has_stale`, `drop_stale` | forward, or discard, an event older than `max_age` or, with `max_ahead` set, stamped further ahead of the wall clock; exact complements, so `drop_stale` keeps a replayed backlog out of `aggregate` and `has_stale` archives it | [ADR `stale-event-filtering`](docs/adr/stale-event-filtering.md) |
 | `sample` | consistent, keyed sampling | [ADR `consistent-sampling-component`](docs/adr/consistent-sampling-component.md) |
 | `shape` | an observer that measures each event's shape | [ADR `shape-observer-component`](docs/adr/shape-observer-component.md) |
 | `route`, `target` | native equality-only router, and the named destinations it fills; one event may go whole to several | [ADR `target-components`](docs/adr/target-components.md) |
-| `route_signals` | sends each signal an event carries to that signal's target, by default splitting a mixed event into one part per target; no ordinary consumers, and an event carrying no listed signal is discarded | [ADR `route-signals`](docs/adr/route-signals.md) |
+| `route_signals` | sends each signal an event carries to that signal's target, by default splitting a mixed event into one part per target; no ordinary consumers, and an event carrying no listed signal is discarded; an event arriving with no payload goes to `none:`'s target if set | [ADR `route-signals`](docs/adr/route-signals.md) |
 
 Details an agent needs beyond the table:
 
@@ -182,6 +182,10 @@ Details an agent needs beyond the table:
   assigns `nil` to delete an attribute, and loops over an attribute proxy with `pairs`, so it
   needs `event:to_table()` and `Event.new` only to build a new structure
   ([ADR `lua-in-place-edits`](docs/adr/lua-in-place-edits.md)).
+  A component's `vars:` map is the script's `vars` global, plain tables built into each VM before
+  its source runs, so a copied example script stays unedited while each deployment sets its
+  values in config; `logit validate` rejects a `null` or an integer past 2^53 anywhere in it
+  ([ADR `lua-script-vars`](docs/adr/lua-script-vars.md)).
 - **`cumulative_to_delta`** takes each point through the ADR's six rules in order: a first
   point (`initial_value: auto | keep | drop`), a resent or overtaken point (skipped), a reset (a
   decrease, or a start moved past the previous point, emitted whole), a layout change (dropped),
@@ -266,6 +270,8 @@ Details an agent needs beyond the table:
   event carrying no listed signal counts `events.discarded`, never `*.dropped`, and needs no
   `null_out`. A component may read several of its targets under `strip: true`, receiving one
   event per part; under `strip: false` rule 92 rejects that, as rule 51 does for a `route` list.
+  An event that arrives with no payload (a string-only InfluxDB point) goes whole to the opt-in
+  `signals.none` target, else is discarded; one emptied only by stripping is still discarded.
 - **`generate_in`**: `event:` templates via `logit_core::template`, with `{seq}`/`{seq%N}`
   placeholders. `generate_in` ships unconditionally but exists only to drive the load-test
   harness (see [Harnesses](#harnesses)), whose sink end is `null_out`.

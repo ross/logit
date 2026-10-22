@@ -874,8 +874,7 @@ mod chained_pipeline_test {
         assert!(kv.process(&resource, &mut event), "kv_metrics always forwards");
         assert_eq!(event.metrics.len(), 1, "one derived counter");
 
-        let mut keep_logs =
-            KeepSignals::new(SignalSet { logs: true, metrics: false, traces: false });
+        let mut keep_logs = KeepSignals::new(SignalSet { logs: true, ..SignalSet::default() });
         assert!(keep_logs.process(&resource, &mut event), "the log half survives");
         assert!(
             event.metrics.is_empty(),
