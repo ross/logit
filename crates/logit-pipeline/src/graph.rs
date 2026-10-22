@@ -331,8 +331,8 @@
 //!     convert nothing (`docs/adr/cumulative-to-delta-transform.md`).
 //! 95. A `lua`/`lua_file` `vars:` holding, at any depth, a `null`, which a Lua table can't store,
 //!     or an integer larger than 2^53 in magnitude, which a Lua number can't hold without
-//!     rounding. The error names the key path, never the value, which `!env` may have filled from
-//!     a secret (`docs/adr/lua-script-vars.md`).
+//!     rounding. Only a YAML literal can trip it: `!env` inside `vars:` always gives a string. The
+//!     error names the key path, never the value (`docs/adr/lua-script-vars.md`).
 //!
 //! Not validated: that a `by: {provenance: ..}` route key names a component in this graph. Like
 //! 37's ids, it may name a component relayed from another process. Nor is `keep`'s empty `fields`:
@@ -4689,7 +4689,8 @@ fn check_lua_vars(id: &str, vars: &logit_config::LuaVars) -> anyhow::Result<()> 
             ),
             LuaVar::Integer(n) if n.abs() > LUA_MAX_EXACT_INTEGER => anyhow::bail!(
                 "component '{id}': '{path}' is an integer larger than 2^53 in magnitude, which a \
-                 Lua number can't hold without rounding -- quote it to pass it as a string"
+                 Lua number can't hold without rounding -- quote it in the YAML to pass it as a \
+                 string"
             ),
             LuaVar::List(items) => {
                 for (i, item) in items.iter().enumerate() {
@@ -15705,7 +15706,7 @@ mod tests {
     }
 
     /// Rule 95: an integer past 2^53 in magnitude can't round-trip through a Lua number. The
-    /// message names the path and never the value, which `!env` may have filled from a secret.
+    /// message names the path and never the value, as no config error prints one.
     #[test]
     fn an_integer_past_2_pow_53_in_lua_vars_is_rejected_by_path_without_its_value() {
         use logit_config::LuaVar;

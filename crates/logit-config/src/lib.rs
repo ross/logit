@@ -2625,7 +2625,9 @@ pub enum ComponentKind {
         jit: bool,
         /// Values the script reads from its `vars` global, so one script serves several
         /// deployments with only the config changing. A map of strings, numbers, booleans, lists,
-        /// and nested maps, each key a string; `!env` works anywhere inside it.
+        /// and nested maps, each key a string. `!env` works anywhere inside it and always gives a
+        /// string, even for a value that looks like a number, boolean, or `null`, so a script
+        /// that wants a number from the environment calls `tonumber` on it.
         ///
         /// The script sees Lua tables: a list as an array indexed from 1, a map as a table with
         /// string keys, and an integer as a Lua number. `vars` is an empty table when this is

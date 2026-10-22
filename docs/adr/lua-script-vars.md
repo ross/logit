@@ -39,10 +39,18 @@ it as a global named `vars`.
    `nil`: a `null` would vanish from a map and leave a hole that changes `#` in a list. Every
    integer up to 2^53 is exact as a double, the only number type LuaJIT has, and a larger one
    would reach the script silently rounded. The error names the key path (`vars.names.sand`,
-   `vars.hosts[0]`) and never the value, which `!env` may have filled from a secret. The config
-   type, `logit_config::LuaVar`, deserializes both so validation can name the path; its published
-   schema omits them.
-5. **Nothing per event.** The tables are built once per VM, and a read is a table lookup.
+   `vars.hosts[0]`) and never the value. Only a literal can trip it, given item 5, so its advice
+   to quote the value in the YAML always applies. The config type, `logit_config::LuaVar`,
+   deserializes both so validation can name the path; its published schema omits them.
+5. **An `!env` value anywhere inside `vars:` stays a string**, even when it looks like a number,
+   a boolean, or `null`; a script calls `tonumber` when it wants a number. Everywhere else the
+   loader re-parses an `!env` value as a YAML scalar so it can fill a typed field
+   ([`env-yaml-tag`](env-yaml-tag.md)). In `vars:` every type is valid, so a re-parse never fails:
+   it would turn `API_TOKEN=1234567890123456` into a number the script prints as
+   `1.2345678901235e+15`, and give a value past 2^53 a quoting error the environment can't follow.
+   `logit_cli::config`'s resolver applies this to a `components.<id>.vars` subtree whose `type` is
+   `lua` or `lua_file`.
+6. **Nothing per event.** The tables are built once per VM, and a read is a table lookup.
 
 ## Alternatives considered
 

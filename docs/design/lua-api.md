@@ -547,13 +547,17 @@ end
 - **`logit validate` rejects a `null` anywhere in `vars:`**, which a Lua table can't hold, and an
   integer larger than 2^53 in magnitude, which a Lua number can't hold without rounding. Its error
   names the key path, such as `vars.names.sand` or `vars.hosts[0]` (a list index counts from 0, as
-  the YAML lists it), and never the value, which `!env` may have filled from a secret. Quote a
-  large integer to pass it as a string.
+  the YAML lists it), and never the value. Quote a large integer in the YAML to pass it as a
+  string.
 - **Nothing checks which keys a script reads.** A key the config misspells or omits reads as `nil`
   in the script, so a script that needs a value should say so with `assert` at its top level,
   which fails the component at load.
 
-`!env` works anywhere inside `vars:`, as in any config field. Use it rather than reading the
+**`!env` inside `vars:` always gives a string**, even for a value that looks like a number, a
+boolean, or `null`: `!env API_TOKEN` with `API_TOKEN=1234567890123456` is the string
+`"1234567890123456"`, never a number rounded to `1.2345678901235e+15`. A script that wants a
+number from the environment calls `tonumber(vars.port)`. Outside `vars:`, `!env` still re-parses
+the value so it can fill an integer or boolean field. Use `!env` rather than reading the
 environment from Lua: the sandbox has no `os` library and no file access ("Sandboxing" below). See
 [ADR `lua-script-vars`](../adr/lua-script-vars.md).
 

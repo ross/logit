@@ -226,7 +226,8 @@ trace of it: to serde, a `!env`-tagged field is identical to one written with th
 The substituted value is re-parsed as a YAML scalar: `8125` becomes an integer and `true` a bool;
 anything else, including a value that looks like a mapping or sequence, stays a string. That lets
 `!env` fill a non-string field. The cost: a secret that looks like a number or bool must be quoted
-at the source.
+at the source. Inside a `lua`/`lua_file` component's `vars:`, the value stays a string, because
+every type is valid there and a re-parse would hand the script a digit-only token as a number.
 
 Every `!env` reference must resolve for `run`, `validate`, and `graph` alike — including `logit
 graph`, which never reads a component's field values (only `sources` and `type`). Any tag other
