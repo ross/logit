@@ -222,11 +222,12 @@ Entry format and the other areas: [the known-gaps index](README.md).
   measured.
   - **Consequence:** a listener near its knee drops more of a burst than it did before #678,
     about a 2% loss of read headroom, and any build can land on either side of a layout step.
-  - **To close:** measure `-C llvm-args=-align-all-functions=6` on the perf VM across every
-    scenario family. It's a release-profile change, so it needs that data before adoption
-    ([ADR `release-build-profile`](../adr/release-build-profile.md)). It may also bear on
-    `native-relay`'s build-to-build swing ("`native-relay` is code-layout-sensitive",
-    `performance.md` §1).
+  - **To close:** no fix is known. 64-byte function alignment
+    (`-C llvm-args=-align-all-functions=6`) was measured on the perf VM on 2026-10-22 and
+    rejected: on m and on `main` it left kernel drops inside control drift and every suite and
+    `tail` CPU row within 3%, made `native-relay` no steadier, and grew the binary 1.69%
+    (`performance.md` §7, "2026-10-22 regression check"). The release profile stays as
+    [ADR `release-build-profile`](../adr/release-build-profile.md) sets it.
 - **The `receive_buffer_bytes` clamp warning has no end-to-end run.** A UDP listener that asks for
   more than `net.core.rmem_max` gets the clamped size and a startup warning that names the
   sysctl. Unit tests cover the warning's logic, but no run lowers `rmem_max` on a host and

@@ -1,0 +1,29 @@
+# One log into several events (docs/adr/line-protocol-transform.md, docs/adr/transform-fan-out.md):
+# generate_in renders a log whose message holds N = 4 InfluxDB line-protocol points (cpu, mem,
+# disk, net), `line_protocol` parses it into one event per point, each a copy of the parent's
+# attributes plus the point's tags and one gauge per numeric field, and removes the parent's log.
+# null_out discards. Scenario table: docs/design/performance.md, "Scenarios".
+#
+#   script/perf run --scenario line-protocol-fanout
+#
+# `count` is generated events (parent logs); the transform emits 4 events per parent, so the
+# downstream null_out receives 4 x count. CPU us/event is per parent, and covers the line parse,
+# four attribute-map clones, and the batch rebuild. The points carry no timestamp, so each takes
+# the parent's. Measurements differ, so no two points merge.
+components:
+  gen:
+    type: generate_in
+    count: 3000000
+    event:
+      log: "cpu,host=web-{seq%10},core=0 usage=42.5,idle=57.5\nmem,host=web-{seq%10} used=8123456i,free=1024i\ndisk,host=web-{seq%10},dev=sda read_bytes=912345i,write_bytes=45678i\nnet,host=web-{seq%10},iface=eth0 rx=123456789i,tx=987654321i"
+      attributes:
+        service: telegraf
+        region: us-east-1
+
+  points:
+    type: line_protocol
+    sources: [gen]
+
+  out:
+    type: null_out
+    sources: [points]

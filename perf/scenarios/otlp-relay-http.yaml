@@ -1,0 +1,42 @@
+# OTLP/HTTP encode + decode round trip: one process, two disconnected chains sharing one loopback
+# connection, `gen -> relay_out` (otlp_out, protobuf over OTLP/HTTP) and `relay_in -> drop`
+# (otlp_in). Each batch of 100 log events is one export request, and the event is a log line
+# with one attribute, the signal OTLP most often relays. Read it against native-relay and
+# otlp-relay-grpc. Scenario table: docs/design/performance.md, "Scenarios".
+#
+#   script/perf run --scenario otlp-relay-http
+#
+# `buffer.max_batches: 64` on the sink keeps the queue left at `generation complete` small. The
+# harness divides by `ready` to `generation complete`, and under the default 1024-batch bound a
+# sink slower than the generator still holds up to 1024 batches at that line, which inflates
+# events/s and can outlast `--settle`.
+#
+# This scenario never self-exits: `relay_in` is a listener, so the harness sends SIGTERM
+# `--settle` after the `generation complete` line (crates/logit-perf/src/scenario.rs's
+# `needs_sigterm`). The runtime binds every listener before any task runs, so `relay_in` is
+# listening before `relay_out` sends.
+components:
+  gen:
+    type: generate_in
+    count: 5000000
+    event:
+      log: "GET /x/{seq%50} 200"
+      attributes:
+        host: "web-{seq%10}"
+
+  relay_out:
+    type: otlp_out
+    sources: [gen]
+    endpoint: http://127.0.0.1:19101
+    protocol: http
+    buffer:
+      max_batches: 64
+
+  relay_in:
+    type: otlp_in
+    bind: 127.0.0.1:19101
+    protocol: http
+
+  drop:
+    type: null_out
+    sources: [relay_in]

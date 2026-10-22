@@ -1,0 +1,42 @@
+# Lua in-place edits (docs/adr/lua-in-place-edits.md): generate_in renders a log and four
+# attributes, a `lua` script enumerates the attributes with `pairs`, deletes one by assigning
+# `nil`, and rewrites `event.log.message` in place, null_out discards. No `to_table()` or
+# `Event.new`, so the cost is the proxy's iterator, delete, and string write. Scenario table:
+# docs/design/performance.md, "Scenarios".
+#
+#   script/perf run --scenario lua-edit
+#
+# Plain interpreted Lua (no `jit:`); the script is valid under `jit: true` too, for a second run
+# against the same file. Read against lua (a single attribute write, same hop): the gap is the
+# `pairs` loop over four attributes, the delete, and the message read and write. `debug` is set on
+# every event, so the delete always takes effect.
+components:
+  gen:
+    type: generate_in
+    count: 1400000
+    event:
+      log: "user alice logged in from 10.0.{seq%256}.17"
+      attributes:
+        host: "web-{seq%10}"
+        service: web
+        region: us-east-1
+        debug: "1"
+
+  edit:
+    type: lua
+    sources: [gen]
+    script: |
+      function process(event)
+        local n = 0
+        for _, _ in pairs(event.attributes) do
+          n = n + 1
+        end
+        event.attributes.debug = nil
+        event.attributes.attr_count = n
+        event.log.message = "[" .. n .. "] " .. event.log.message
+        return event
+      end
+
+  out:
+    type: null_out
+    sources: [edit]

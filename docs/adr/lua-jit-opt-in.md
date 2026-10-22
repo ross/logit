@@ -1,6 +1,6 @@
 ---
 created: 2026-10-16
-updated: 2026-10-16
+updated: 2026-10-22
 ---
 
 # LuaJIT's trace compiler is off by default, and `jit: true` turns it on per component
@@ -29,7 +29,9 @@ Measured on 2026-10-16 on a developer machine (a Ryzen AI MAX+ 395, pinned cores
 | a pure-Lua helper (hashing and table work) | 2.282 | 1.733 | -24.0% |
 | `examples/prusa/prusa.lua` at `63fd8238` | 33.679 | 28.349 | -15.8% |
 
-Nothing ran slower. The compiler helps only work that stays in plain Lua. A proxy's
+Nothing ran slower. (The perf VM later read `lua.yaml` 0.9% cheaper compiled and a proxy-heavy
+in-place edit script 2.5% dearer with overlapping repeat ranges: `docs/design/performance.md` §1,
+"Reading the rows".) The compiler helps only work that stays in plain Lua. A proxy's
 `__index`/`__newindex` is an mlua C function, and `string.match`/`gmatch` are C, so a trace ends
 at each call and stitches around it, and that work runs at interpreter speed either way. Over a
 pure-Lua loop, a concatenation loop ran 378.7 ns per iteration interpreted and 32.4 ns compiled,
