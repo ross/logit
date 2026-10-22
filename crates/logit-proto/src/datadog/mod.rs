@@ -194,6 +194,7 @@
 //! | `attributes/bytes_value` | lost | `logit.output.tags.omitted{reason=unrepresentable}` | A tag has no bytes form, so the value is left off, counted. |
 //! | `attributes/timestamp_value` | normalized | `stringified` | A `key:<RFC 3339>` tag, read back as a string. |
 //! | `attributes/private_carrier` | lost | `logit.output.tags.omitted{reason=no_wire_form}` | A `_logit.datadog.*` carrier rides in its own wire field; one the route has no field for is left off, counted. |
+//! | `attributes/prometheus_target` | lost | structural | The scrape target is private and never a tag, so it's left off. |
 //! | `attributes/foreign_carrier` | lost | structural | Another protocol's `_logit.` carrier is private and never a tag, so it's left off. The `_logit.statsd.event.*` and `_logit.statsd.service_check.*` carriers are read as the Datadog fields they name. |
 //! | `attributes/resource_attribute` | normalized | `resource_as_tag` | Merged into the record's tags, so it reads back as an event attribute. |
 //! | `attributes/scope` | lost | structural | Datadog has no instrumentation scope, so none is written. |

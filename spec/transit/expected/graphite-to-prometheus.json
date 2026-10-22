@@ -4,7 +4,9 @@
     {"timestamp":"2023-11-14T22:13:24.000000000Z","metrics":[{"name":"logit_fixture_pickle_int_value","kind":"gauge","value":42.0}]},
     {"timestamp":"2023-11-14T22:13:24.000000000Z","metrics":[{"name":"logit_fixture_pickle_large_value","kind":"gauge","value":1234567.0}]},
     {"timestamp":"2023-11-14T22:13:24.000000000Z","metrics":[{"name":"logit_fixture_pickle_negative_value","kind":"gauge","value":-17.5}]}
-  ], "counters": {}},
+  ], "counters": {
+    "logit.output.metrics.normalized{component=out,kind=prometheus_out,reason=name_sanitized,role=sink}": 4
+  }},
   "pickle-p2": {"events": [
     {"timestamp":"2023-11-14T22:13:24.000000000Z","metrics":[{"name":"logit_fixture_pickle_float_value","kind":"gauge","value":12.75}]},
     {"timestamp":"2023-11-14T22:13:24.000000000Z","metrics":[{"name":"logit_fixture_pickle_int_value","kind":"gauge","value":42.0}]},
@@ -63,7 +65,8 @@
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"servers_web_1_disk","kind":"gauge","value":42.0}]},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"servers_web_1_mem","kind":"gauge","value":1234.0}],"attributes":{"role":"db"}}
   ], "counters": {
-    "logit.output.metrics.normalized{component=out,kind=prometheus_out,reason=name_sanitized,role=sink}": 9
+    "logit.output.labels.normalized{component=out,kind=prometheus_out,reason=name_sanitized,role=sink}": 2,
+    "logit.output.metrics.normalized{component=out,kind=prometheus_out,reason=name_sanitized,role=sink}": 10
   }},
   "write-graphite": {"events": [
     {"timestamp":"2026-09-13T12:30:37.000000000Z","metrics":[{"name":"logit_fixture_interface_eth0_if_dropped_rx","kind":"gauge","value":0.0}]},

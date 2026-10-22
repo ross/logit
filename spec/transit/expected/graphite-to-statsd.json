@@ -5,7 +5,9 @@
     {"timestamp":"2023-11-14T22:13:24.000000000Z","metrics":[{"name":"logit-fixture.pickle.large_value","kind":"gauge","value":1234567.0}]},
     {"timestamp":"2023-11-14T22:13:24.000000000Z","metrics":[{"name":"logit-fixture.pickle.negative_value","kind":"gauge","value":0.0}]},
     {"timestamp":"2023-11-14T22:13:24.000000000Z","metrics":[{"name":"logit-fixture.pickle.negative_value","kind":"gauge_delta","delta":-17.5}]}
-  ], "counters": {}},
+  ], "counters": {
+    "logit.output.metrics.degraded{component=out,kind=statsd_out,reason=negative_gauge,role=sink}": 1
+  }},
   "pickle-p2": {"events": [
     {"timestamp":"2023-11-14T22:13:24.000000000Z","metrics":[{"name":"logit-fixture.pickle.float_value","kind":"gauge","value":12.75}]},
     {"timestamp":"2023-11-14T22:13:24.000000000Z","metrics":[{"name":"logit-fixture.pickle.int_value","kind":"gauge","value":42.0}]},

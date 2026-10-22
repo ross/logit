@@ -160,6 +160,7 @@
 //! | `attributes/bytes_value`, otherwise | lost | `logit.output.tags.omitted{reason=unrepresentable}` | A bytes value has no tag form and is left off, counted. |
 //! | `attributes/timestamp_value`, under `tags: drop` | lost | `logit.output.tags.omitted{reason=dialect}` | Under `tags: drop`, no tag is written, counted once per attribute. |
 //! | `attributes/timestamp_value`, otherwise | lost | `logit.output.tags.omitted{reason=unrepresentable}` | A timestamp value has no tag form and is left off, counted. |
+//! | `attributes/prometheus_target` | lost | structural | The scrape target is private and isn't a tag, so it's left off, under either `tags:` mode. |
 //! | `attributes/foreign_carrier` | lost | structural | Another protocol's `_logit.` carrier is private and isn't a tag, so it's left off, under either `tags:` mode. |
 //! | `attributes/resource_attribute`, under `tags: drop` | lost | `logit.output.tags.omitted{reason=dialect}` | Under `tags: drop`, no tag is written, counted once per attribute. |
 //! | `attributes/resource_attribute`, otherwise | normalized | `resource_merged`; `logit.output.metrics.normalized{reason=tag_sanitized}` | A tag, read back as an event attribute; on a key the event shares, the event's value wins, uncounted. Its name and value are sanitized as the `string_value` row says, counted once per record as `tag_sanitized`. |

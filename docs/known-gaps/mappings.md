@@ -205,6 +205,7 @@ Entry format and the other areas: [the known-gaps index](README.md).
   | encode (statsd) | field `attributes/timestamp_value`, under `format: statsd` → **lost** | `logit.output.tags.omitted{reason=dialect}` | Plain statsd has no tags. |
   | encode (statsd) | field `attributes/timestamp_value`, otherwise → **lost** | `logit.output.tags.omitted{reason=unrepresentable}` | A timestamp value has no tag form and is left off, counted. |
   | encode (statsd) | field `attributes/private_carrier`, under `format: statsd` → **lost** | `logit.output.fields.omitted{reason=dialect}` | Plain statsd has no `\|c:`, `\|e:`, `\|card:`, or `\|T` segment, so those carriers are omitted, counted once per carrier per line; the type carrier survives as the line's type, `h` and `d` as `ms`. |
+  | encode (statsd) | field `attributes/prometheus_target` → **lost** | none (structural) | The scrape target is private and isn't a tag, so it's left off. |
   | encode (statsd) | field `attributes/foreign_carrier` → **lost** | none (structural) | Another protocol's `_logit.` carrier is private and isn't a tag, so it's left off. Under `format: dogstatsd`, `_logit.datadog.hostless` on a record with no `host`, no non-empty `host.name`, and no non-empty `h:` field is an empty `host:` tag, which statsd_in reads back as an empty `host`. |
   | encode (statsd) | field `attributes/resource_attribute`, under `format: statsd` → **lost** | `logit.output.tags.omitted{reason=dialect}` | Plain statsd has no tags. |
   | encode (statsd) | field `attributes/scope` → **lost** | none (structural) | statsd has no instrumentation scope, so none is written. |
@@ -308,6 +309,7 @@ Entry format and the other areas: [the known-gaps index](README.md).
   | encode (InfluxDB) | field `attributes/map_value` → **lost** | `logit.output.tags.omitted{reason=unrepresentable}` | A map has no tag form and is left off, counted. |
   | encode (InfluxDB) | field `attributes/bytes_value` → **lost** | `logit.output.tags.omitted{reason=unrepresentable}` | A bytes value has no tag form and is left off, counted. |
   | encode (InfluxDB) | field `attributes/timestamp_value` → **lost** | `logit.output.tags.omitted{reason=unrepresentable}` | A timestamp value has no tag form and is left off, counted. |
+  | encode (InfluxDB) | field `attributes/prometheus_target` → **lost** | none (structural) | The scrape target is private and isn't a tag, so it's left off. |
   | encode (InfluxDB) | field `attributes/foreign_carrier` → **lost** | none (structural) | Another protocol's `_logit.` carrier is private and isn't a tag, so it's left off. |
   | encode (InfluxDB) | field `attributes/scope` → **lost** | none (structural) | Line protocol has no instrumentation scope, so none is written. |
   | encode (InfluxDB) | field `attributes/datadog_carrier_log` → **lost** | none (structural) | Another protocol's `_logit.` carrier is private and isn't a tag, so it's left off. |
@@ -336,6 +338,7 @@ Entry format and the other areas: [the known-gaps index](README.md).
   | encode (OTLP) | `histogram/neg_inf_bound` → **degraded** | `logit.output.metrics.degraded{reason=non_finite_component}` | OTLP bounds are finite, so a `-Inf` bound's count joins the first bucket. `count` and every cumulative count are kept. |
   | encode (OTLP) | `summary/delta` → **dropped** | `logit.output.metrics.dropped{reason=unresolved_delta}` | OTLP defines every summary as cumulative, so a delta one is dropped, with a throttled `delta_summary_unresolved` warning. |
   | encode (OTLP) | field `record/exemplars_on_summary` → **lost** | none (structural) | A `SummaryDataPoint` has no exemplars field, so a summary's exemplars are left off. |
+  | encode (OTLP) | field `attributes/prometheus_target` → **lost** | none (structural) | The scrape target is private and isn't an OTLP attribute, so it's left off. |
   | encode (OTLP) | field `attributes/foreign_carrier` → **lost** | none (structural) | A `_logit.` carrier is private and isn't an OTLP attribute, so it's left off. |
   | encode (OTLP) | field `attributes/datadog_carrier_log` → **lost** | none (structural) | A `_logit.` carrier is private and isn't an OTLP attribute, so it's left off. |
   | encode (OTLP) | `event/attributes_only` → **skipped** | `logit.output.events.skipped{reason=no_payload}` | An event with no metric, log, or span has no OTLP signal and isn't sent. |
@@ -384,6 +387,7 @@ Entry format and the other areas: [the known-gaps index](README.md).
   | encode (Datadog) | field `attributes/map_value` → **lost** | `logit.output.tags.omitted{reason=unrepresentable}` | A tag has no nested form, so a map is left off, counted. |
   | encode (Datadog) | field `attributes/bytes_value` → **lost** | `logit.output.tags.omitted{reason=unrepresentable}` | A tag has no bytes form, so the value is left off, counted. |
   | encode (Datadog) | field `attributes/private_carrier` → **lost** | `logit.output.tags.omitted{reason=no_wire_form}` | A `_logit.datadog.*` carrier rides in its own wire field; one the route has no field for is left off, counted. |
+  | encode (Datadog) | field `attributes/prometheus_target` → **lost** | none (structural) | The scrape target is private and never a tag, so it's left off. |
   | encode (Datadog) | field `attributes/foreign_carrier` → **lost** | none (structural) | Another protocol's `_logit.` carrier is private and never a tag, so it's left off. The `_logit.statsd.event.*` and `_logit.statsd.service_check.*` carriers are read as the Datadog fields they name. |
   | encode (Datadog) | field `attributes/scope` → **lost** | none (structural) | Datadog has no instrumentation scope, so none is written. |
   | encode (Datadog) | field `attributes/datadog_carrier_log` → **lost** | none (uncounted) | A `_logit.datadog.*` carrier on a log, a Datadog event, or a service check that the route has no field for is left off, uncounted, where the metrics routes count one as `no_wire_form`; the events route's public form has no field for the Agent envelope's `_logit.datadog.agent.hostname`. |
@@ -447,6 +451,7 @@ Entry format and the other areas: [the known-gaps index](README.md).
   | encode (Graphite) | field `attributes/bytes_value`, otherwise → **lost** | `logit.output.tags.omitted{reason=unrepresentable}` | A bytes value has no tag form and is left off, counted. |
   | encode (Graphite) | field `attributes/timestamp_value`, under `tags: drop` → **lost** | `logit.output.tags.omitted{reason=dialect}` | Under `tags: drop`, no tag is written, counted once per attribute. |
   | encode (Graphite) | field `attributes/timestamp_value`, otherwise → **lost** | `logit.output.tags.omitted{reason=unrepresentable}` | A timestamp value has no tag form and is left off, counted. |
+  | encode (Graphite) | field `attributes/prometheus_target` → **lost** | none (structural) | The scrape target is private and isn't a tag, so it's left off, under either `tags:` mode. |
   | encode (Graphite) | field `attributes/foreign_carrier` → **lost** | none (structural) | Another protocol's `_logit.` carrier is private and isn't a tag, so it's left off, under either `tags:` mode. |
   | encode (Graphite) | field `attributes/resource_attribute`, under `tags: drop` → **lost** | `logit.output.tags.omitted{reason=dialect}` | Under `tags: drop`, no tag is written, counted once per attribute. |
   | encode (Graphite) | field `attributes/scope` → **lost** | none (structural) | Carbon has no instrumentation scope, so none is written. |
