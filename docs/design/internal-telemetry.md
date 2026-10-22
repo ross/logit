@@ -2059,7 +2059,6 @@ itself. The sink emits each once per batch, however many attempts the runtime ma
 | `logit.output.metrics.dropped{reason="unresolved_gauge_delta"}` | an unresolved `GaugeDelta` |
 | `logit.output.metrics.dropped{reason="no_bucket"}` | the sink's own counter, not `EncodeStats`: one per metric record of a batch that names no bucket (no `bucket:` or `default_bucket:` configured, and none carried), which isn't sent; a throttled `logit.component.diagnostics{key="no_bucket"}` says why |
 | `logit.output.metrics.degraded{reason="non_finite_component"}` | a `Histogram`, `Summary`, `Distribution`, or `Samples` line written with a non-finite `sum`, `min`, `max`, quantile, or bound left off, once per record |
-| `logit.output.metrics.degraded{metric_kind="set"}` | a `Set` written as its estimate, the registers gone, once per line written |
 | `logit.output.metrics.skipped{reason="no_recorded_value"}` | a record flagged `NO_RECORDED_VALUE`; line protocol has no "no reading" marker |
 | `logit.output.metrics.skipped{metric_kind="set_members"\|"exponential_histogram"}` | a kind with no line-protocol shape |
 | `logit.output.events.skipped{reason="no_metrics"}` | an event with no metric record and no `_logit.influxdb.measurement` carrier (a log, a span, or neither), which has nothing to write |
@@ -2175,10 +2174,11 @@ itself. The sink emits each once per batch, however many attempts the runtime ma
 - `logit.output.messages.normalized{reason="dialect"|"member_sanitized"}`: a lossless-but-different
   rendering rather than a drop. A timer's `h`/`d` wire-type letter collapsing to `ms` under
   `format: statsd`, or a `SetMembers` member changing after lossy UTF-8 plus sanitization.
-- `logit.output.metrics.normalized{reason="name_sanitized"}`: a record whose name had a reserved
-  character written as `_`, once per record. It reads back under the rewritten name.
+- `logit.output.metrics.normalized{reason="name_sanitized"}`: a record written under a name whose
+  reserved characters became `_`, once per record. It reads back under the rewritten name.
 - `logit.output.tags.normalized{reason="name_sanitized"|"value_sanitized"}`: a DogStatsD tag whose
-  key, or whose value, had a reserved character written as `_`, once per wire tag.
+  key, or whose value, had a reserved character written as `_`, once per wire tag of an event that
+  wrote a line.
 - `logit.output.reconnects` (count; `tcp`, `unix_stream`, and `unix`): every connect *after* the
   first, as for `syslog_out`. Counted on plaintext and TLS connections alike, because `tcp` and
   `unix_stream` both go through the shared pooled-stream driver.
@@ -2554,8 +2554,8 @@ it takes (the class table above).
 - `logit.output.labels.normalized{reason="multi_value"}`: a multi-valued attribute collapsed to its
   last representable element, because a Prometheus label set has no multi-value label. Lossy; see
   above.
-- `logit.output.labels.normalized{reason="name_sanitized"}`: a series label, or a written
-  exemplar's label, whose name `sanitize_label_name` rewrote, once per label. An exemplar's is
+- `logit.output.labels.normalized{reason="name_sanitized"}`: a label of a series kept, or of a
+  written exemplar, whose name `sanitize_label_name` rewrote, once per label. An exemplar's is
   render-side in registry mode, counted once per OpenMetrics scrape.
 - `logit.output.metrics.normalized{reason="name_sanitized"}`: a record exposed or sent under a name
   `sanitize_metric_name` rewrote, once per record. Two names that sanitize onto one within a batch
@@ -2580,7 +2580,7 @@ Some reasons exist only on one path:
   with `with_stale_markers(true)` there, so a flagged `Gauge`/`Sum`/marker-untyped record is written
   as a stale marker rather than skipped. Only a flagged `Histogram`/`Summary`/sketch, kinds that
   expand to several derived series, still counts. A flagged delta monotonic `Sum`'s marker reads
-  back cumulative, counted `degraded{metric_kind="delta_sum"}`.
+  back cumulative, a structural loss with no counter.
 
 `Diagnostics` keys: `delta_temporality_unresolved` (a delta `Sum` or `Histogram`, naming the
 `aggregate` with `temporality: cumulative` fix); `delta_summary_unresolved` (a delta `Summary`,

@@ -286,6 +286,10 @@ uncounted:
   once, which is where an operator choosing a destination looks.
 - **A value-dependent loss is counted because the table can't say how often it happens.** Most
   records keep the field, so a nonzero count is the only sign one didn't.
+- **A kind every record of which a sink writes in a lesser form is structural too**, such as
+  `influxdb_out`'s `Set` as its estimate or its histogram in Telegraf's shape, and a flagged delta
+  `Sum` as `prometheus_out`'s remote-write stale marker. Its `degraded` cell has no counter; one
+  that degrades only some records names a counter.
 - **A private `_logit.` carrier left off at another protocol's sink is structural**, though its
   presence varies by event: the ignore rule in
   [ADR `private-attribute-namespace`](private-attribute-namespace.md) makes it part of every such
@@ -304,15 +308,13 @@ uncounted:
     `metrics.normalized{reason="u64_as_double"}`.
   - `output.metrics.degraded{reason="sample_rate_rounded"}` at `datadog_out`, and
     `{reason="negative_gauge"}` at `statsd_out`.
-  - `output.metrics.degraded{metric_kind="set"}` at `influxdb_out` and
-    `{metric_kind="delta_sum"}` at `prometheus_out`'s remote-write, for a kind written in a lesser
-    form, as other sinks count theirs.
 - **`uncounted` remains only where this change doesn't reach.** The table's schema accepts it on
   the `log` and `span` rows and on `datadog_out`'s carrier on a log, not yet classified, and on
   `prometheus_out`'s one-sample-per-series rows, which another change settles
   (`crates/logit-cli/src/transit/mapping.rs`'s `UNCOUNTED_ALLOWED`).
 - **Each new count is encode-side**, once per batch however many attempts the sink makes,
-  through the sink's batch accounting.
+  through the sink's batch accounting, and counts a rewrite only on a record or line the sink
+  writes.
 
 ## Migration record
 The classification of every `*.dropped`, `*.skipped`, `*.degraded`, `*.truncated`, and loss-related
