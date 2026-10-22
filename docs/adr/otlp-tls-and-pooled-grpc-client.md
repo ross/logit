@@ -1,6 +1,6 @@
 ---
 created: 2026-09-03
-updated: 2026-10-18
+updated: 2026-10-22
 ---
 
 # TLS for `otlp_out`/`otlp_in`, and a pooled gRPC client to carry it
@@ -231,3 +231,23 @@ client side, `otlp_out`'s pooled gRPC client and its HTTP client keep the `Clien
 built with. The config's verifier and certificate resolver are swappable and shared by every
 clone, so neither client is rebuilt on a rotation and the connection pool survives it. The trigger
 is a content poll on the PEM files plus SIGHUP, rather than a file watcher alone.
+
+## Amendment: every HTTP listener sets `TCP_NODELAY` on accept (2026-10-22)
+
+The pooled gRPC client sets `TCP_NODELAY` because h2 writes a message's frames in separate writes.
+The server side has the same shape. hyper's h2 server writes a response's HEADERS, DATA, and
+trailing HEADERS in separate writes, so with Nagle's algorithm on, the trailers wait until the
+client ACKs the frames before them. A client with one request in flight, as `otlp_out` holds, has
+nothing else to send, so that ACK waits for its delayed-ACK timer. `ss -tin` on `otlp_in`'s side
+showed a small unacknowledged segment with the trailers queued behind it, over and over.
+`logit-perf attribute` measured about 1.09 ms per send on loopback before the fix and 0.09 ms
+after. A real link's delayed-ACK timer is longer. HTTP/1.1 writes a response in one write and
+doesn't stall.
+
+`otlp_in`, `prometheus_in`'s remote-write receiver, `datadog_in`, `datadog_trace_in`,
+`splunk_hec_in`, and `influxdb_in` all serve h2 through hyper, and each one now accepts through
+`crate::http::accept` in `crates/logit-inputs`, which sets `TCP_NODELAY` on the accepted socket
+before any PROXY header read or TLS accept. `datadog_trace_in`'s Unix socket has no Nagle's
+algorithm and is unchanged. A failed `set_nodelay` keeps the connection, since it costs latency
+and loses nothing, so it isn't counted or reported. `logit_in` already set `TCP_NODELAY` on accept
+for the same reason ([ADR `native-hop-send-window`](native-hop-send-window.md)).
