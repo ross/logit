@@ -1,0 +1,48 @@
+# collectd's binary `network` protocol in, Datadog's intake API out. Point a collectd fleet's
+# `<Plugin network> Server "<this host>" "25826" </Plugin>` at it. docs/datadog.md's "collectd to
+# Datadog" has the mapping.
+#
+# collectd's four data-source types reach Datadog as follows:
+#
+#   * GAUGE is a `gauge`.
+#   * ABSOLUTE is already a per-interval delta, so it's a `count` with nothing in between.
+#   * COUNTER is a running total, which Datadog takes only as a per-interval delta.
+#     `cumulative_to_delta` differences it into a `count`; without it, `datadog_out` drops it,
+#     counted `logit.output.metrics.dropped{reason="unresolved_cumulative"}`.
+#   * DERIVE is a running total too, but collectd marks it non-monotonic, so
+#     `cumulative_to_delta` converts it only under `non_monotonic:`. Without that setting,
+#     `datadog_out` writes it as a `gauge` of the running total.
+#
+# `non_monotonic: reset_on_decrease` reads a DERIVE that went down as a counter restart, as
+# collectd's own rate computation does for the stock types, whose DERIVE sources have a minimum
+# of 0 (`if_octets`, `disk_octets`). A host reboot then sends the counter's new value, not one
+# large negative count. Use `difference` instead only when every DERIVE this listener receives
+# can go down for real.
+#
+# A collectd value list carries no start time, so under the default `initial_value: auto` each
+# series' first point only records the baseline the next point is differenced against; the same
+# holds for every series after a restart of `logit`. Set `max_staleness` above collectd's
+# longest `Interval`, or a quiet series is forgotten and its next point is a first point again.
+components:
+  collectd_in:
+    type: collectd_in
+    # collectd's default port. `0.0.0.0` accepts unicast from any sender.
+    bind: 0.0.0.0:25826
+    # Optional: the sending hosts' `types.db`, which names each data source in a
+    # multi-data-source list (`interface.if_octets.rx` instead of `interface.if_octets.0`).
+    # types_db:
+    #   - /usr/share/collectd/types.db
+
+  deltas:
+    type: cumulative_to_delta
+    sources: [collectd_in]
+    non_monotonic: reset_on_decrease
+    # initial_value: auto        # the default; keep re-sends a running total after a restart
+    # max_staleness: 1h          # the default
+    # max_series: 10000          # the default
+
+  datadog:
+    type: datadog_out
+    sources: [deltas]
+    api_key: !env DD_API_KEY
+    # site: datadoghq.com        # the default; datadoghq.eu, us3.datadoghq.com, ... per your org
