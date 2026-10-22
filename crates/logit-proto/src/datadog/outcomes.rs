@@ -144,11 +144,13 @@ pub(super) enum MetricOut {
     /// A cumulative kind Datadog's exporter would difference, with no `cumulative_to_delta`
     /// upstream.
     UnresolvedCumulative,
+    /// A series point another point of its series replaced in the same second of one request.
+    DuplicateTimestamp,
 }
 
 impl MetricOut {
     #[cfg(test)]
-    const ALL: [MetricOut; 10] = [
+    const ALL: [MetricOut; 11] = [
         MetricOut::Kind("set_members"),
         MetricOut::GaugeDelta,
         MetricOut::NoRecordedValue,
@@ -159,6 +161,7 @@ impl MetricOut {
         MetricOut::SketchRange,
         MetricOut::InvalidStatus,
         MetricOut::UnresolvedCumulative,
+        MetricOut::DuplicateTimestamp,
     ];
 
     /// The counter and its one tag.
@@ -177,6 +180,9 @@ impl MetricOut {
             MetricOut::InvalidStatus => (OUTPUT_METRICS_DROPPED, ("reason", "invalid_status")),
             MetricOut::UnresolvedCumulative => {
                 (OUTPUT_METRICS_DROPPED, ("reason", "unresolved_cumulative"))
+            }
+            MetricOut::DuplicateTimestamp => {
+                (OUTPUT_METRICS_DROPPED, ("reason", "duplicate_timestamp"))
             }
         }
     }
@@ -218,6 +224,7 @@ mod tests {
             (OUTPUT_METRICS_DROPPED, ("reason", "sketch_range")),
             (OUTPUT_METRICS_DROPPED, ("reason", "invalid_status")),
             (OUTPUT_METRICS_DROPPED, ("reason", "unresolved_cumulative")),
+            (OUTPUT_METRICS_DROPPED, ("reason", "duplicate_timestamp")),
         ];
         for (outcome, want) in MetricOut::ALL.into_iter().zip(want_out) {
             assert_eq!(outcome.counter(), want, "{outcome:?}");

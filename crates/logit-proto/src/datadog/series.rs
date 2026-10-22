@@ -33,6 +33,7 @@ use logit_core::{
 };
 use prost::Message;
 use serde_json::{json, Map, Value as JsonValue};
+use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
 type JsonMap = Map<String, JsonValue>;
@@ -994,17 +995,28 @@ impl DatadogEncoder {
         );
     }
 
-    /// Calls `f` once per `(event, record, series)` a series route sends. A series whose tags,
-    /// the event's and its own together, pass [`MAX_METRIC_TAGS`] is left off, uncounted: the sink
-    /// counts it before encoding ([`series_over_tag_limit`]).
+    /// Calls `f` once per `(event, record, series)` a series route sends, in batch order. A
+    /// series whose tags, the event's and its own together, pass [`MAX_METRIC_TAGS`] is left off,
+    /// uncounted: the sink counts it before encoding ([`series_over_tag_limit`]).
+    ///
+    /// Of several points of one series in one second, only the latest is sent, the later in batch
+    /// order on a tie; each other is left off and counted
+    /// `dropped{reason="duplicate_timestamp"}`. Datadog keeps the higher of two such points in
+    /// one request, not the later, and doesn't sum two counts, so sending both loses one of them
+    /// uncounted. [`DatadogEncoder::series_duplicates`] reports how many this call left off.
     fn each_series(
         &mut self,
         batch: &EventBatch,
         route: Route,
         mut f: impl FnMut(&Event, &MetricRecord, &Carriers, &SeriesPoint),
     ) {
-        for event in &batch.events {
-            let mut carriers = None;
+        self.series_duplicates = 0;
+        // Each event's carriers, read only for an event with a series to write.
+        let mut carriers: Vec<Option<Carriers>> = Vec::with_capacity(batch.events.len());
+        // Every series point to write: (event, record, point), in batch order.
+        let mut plans: Vec<(usize, &MetricRecord, Vec<SeriesPoint>)> = Vec::new();
+        for (index, event) in batch.events.iter().enumerate() {
+            carriers.push(None);
             // The tags `carriers` renders, counted without counting what it omits.
             let base = metric_tag_count(&batch.resource, event);
             for record in &event.metrics[first_metric(&batch.resource, event)..] {
@@ -1012,9 +1024,9 @@ impl DatadogEncoder {
                     continue;
                 }
                 let plan = plan_series(record, self.histograms);
-                let points: Vec<&SeriesPoint> = plan
+                let points: Vec<SeriesPoint> = plan
                     .points
-                    .iter()
+                    .into_iter()
                     .filter(|p| base + p.extra_tags() <= MAX_METRIC_TAGS)
                     .collect();
                 // The sketches route drops an event over the limit whole.
@@ -1024,13 +1036,70 @@ impl DatadogEncoder {
                     continue;
                 }
                 // Read lazily: an event with nothing written on this route counts nothing.
-                let c =
-                    carriers.get_or_insert_with(|| self.carriers(&batch.resource, event, route));
-                for p in points {
-                    f(event, record, c, p);
+                if carriers[index].is_none() {
+                    carriers[index] = Some(self.carriers(&batch.resource, event, route));
                 }
+                plans.push((index, record, points));
             }
         }
+
+        // Which points survive: the latest of each (series, second).
+        let flat: Vec<(usize, &MetricRecord, &SeriesPoint)> = plans
+            .iter()
+            .flat_map(|(index, record, points)| points.iter().map(move |p| (*index, *record, p)))
+            .collect();
+        let mut keep = vec![true; flat.len()];
+        if flat.len() > 1 {
+            // Each point's group, a group being one (series, second), and each group's latest
+            // point, the later in batch order on a tie.
+            let mut groups: HashMap<SeriesKey<'_>, usize> = HashMap::with_capacity(flat.len());
+            let mut group_of = Vec::with_capacity(flat.len());
+            let mut latest: Vec<usize> = Vec::new();
+            for (n, &(index, record, p)) in flat.iter().enumerate() {
+                let timestamp = batch.events[index].timestamp;
+                let c = carriers[index].as_ref().expect("read for every planned event");
+                let key = SeriesKey::new(record, p, c, nanos_to_seconds(timestamp));
+                let next = latest.len();
+                let group = *groups.entry(key).or_insert(next);
+                if group == next {
+                    latest.push(n);
+                } else if timestamp >= batch.events[flat[latest[group]].0].timestamp {
+                    latest[group] = n;
+                }
+                group_of.push(group);
+            }
+            for (n, &group) in group_of.iter().enumerate() {
+                keep[n] = latest[group] == n;
+            }
+        }
+        let duplicates = keep.iter().filter(|kept| !**kept).count();
+        if duplicates > 0 {
+            self.series_duplicates = duplicates;
+            for _ in 0..duplicates {
+                self.metric_not_sent(MetricOut::DuplicateTimestamp);
+            }
+            self.diagnostics.warn_throttled(
+                "duplicate_timestamp",
+                format_args!(
+                    "datadog: dropped {duplicates} series point(s) that shared a series and a \
+                     second with a later one, since Datadog keeps only the higher of the two -- \
+                     add a `dedup_timestamps` component with `precision: 1s` before this \
+                     output, or an `aggregate` for a live delta flow"
+                ),
+            );
+        }
+        for (&(index, record, p), kept) in flat.iter().zip(keep) {
+            if kept {
+                let c = carriers[index].as_ref().expect("read for every planned event");
+                f(&batch.events[index], record, c, p);
+            }
+        }
+    }
+
+    /// How many series points the last series encode left off as `duplicate_timestamp`: the
+    /// entries a request holds fewer than its records weigh.
+    pub fn series_duplicates(&self) -> usize {
+        self.series_duplicates
     }
 
     /// `/api/v2/series` as a protobuf `MetricPayload`, one series per point a record writes (one,
@@ -1178,6 +1247,40 @@ impl DatadogEncoder {
             }
         }
         json_body(series)
+    }
+}
+
+/// What makes two series points one Datadog series in one second: the metric name, the tag set
+/// (order and repeats aside), and the host, device, and resources. The wire type, unit, interval,
+/// and origin are the series' metadata, not its identity.
+#[derive(PartialEq, Eq, Hash)]
+struct SeriesKey<'a> {
+    name: Symbol,
+    suffix: &'static str,
+    tags: Vec<&'a str>,
+    host: Option<&'a str>,
+    hostless: bool,
+    device: Option<&'a str>,
+    resources: &'a [(String, String)],
+    second: i64,
+}
+
+impl<'a> SeriesKey<'a> {
+    fn new(record: &MetricRecord, p: &'a SeriesPoint, c: &'a Carriers, second: i64) -> Self {
+        let mut tags: Vec<&str> = c.tags.iter().map(String::as_str).collect();
+        tags.extend(p.tag.iter().flatten().map(String::as_str));
+        tags.sort_unstable();
+        tags.dedup();
+        SeriesKey {
+            name: record.name,
+            suffix: p.suffix,
+            tags,
+            host: c.host.as_deref(),
+            hostless: c.hostless,
+            device: c.device.as_deref(),
+            resources: &c.resources,
+            second,
+        }
     }
 }
 
@@ -1927,6 +2030,47 @@ mod tests {
         );
     }
 
+    /// Of two points of one series in one second, the later is sent and the earlier counted, for
+    /// a count as for a gauge and whether or not the values differ; a point of another series
+    /// (another tag set) or another second is no duplicate.
+    #[test]
+    fn a_series_point_sharing_its_second_with_a_later_one_is_dropped_and_counted() {
+        let (mut e, registry) = encoder();
+        let at = |offset_ms: i64, name: &str, kind: MetricKind, env: &str| {
+            let mut attrs = AttrMap::new();
+            attrs.insert("env", Value::str(env));
+            Event::metric(TS + offset_ms * 1_000_000, attrs, MetricRecord::new(intern(name), kind))
+        };
+        let events = vec![
+            at(0, "c", MetricKind::counter(2.0), "prod"),
+            at(400, "c", MetricKind::counter(2.0), "prod"),
+            at(0, "g", MetricKind::gauge(5.0), "prod"),
+            at(0, "g", MetricKind::gauge(5.0), "prod"),
+            at(0, "g", MetricKind::gauge(7.0), "dev"),
+            at(900, "h", MetricKind::gauge(9.0), "prod"),
+            at(100, "h", MetricKind::gauge(1.0), "prod"),
+            at(1_000, "h", MetricKind::gauge(4.0), "prod"),
+        ];
+        let body = e.encode_series_v1(&batch(events)).unwrap();
+        let json: JsonValue = serde_json::from_slice(&body).unwrap();
+        let sent: Vec<(String, f64)> = json["series"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| {
+                (s["metric"].as_str().unwrap().to_string(), s["points"][0][1].as_f64().unwrap())
+            })
+            .collect();
+        let want = [("c", 2.0), ("g", 5.0), ("g", 7.0), ("h", 9.0), ("h", 4.0)];
+        let want: Vec<(String, f64)> = want.iter().map(|(n, v)| (n.to_string(), *v)).collect();
+        assert_eq!(sent, want, "the later point of each pair is sent, in batch order");
+        assert_eq!(e.series_duplicates(), 3);
+        assert_eq!(
+            counted(&registry, "logit.output.metrics.dropped", ("reason", "duplicate_timestamp")),
+            3.0
+        );
+    }
+
     #[test]
     fn encode_maps_kinds_and_counts_the_rest() {
         let (mut e, registry) = encoder();
@@ -1937,7 +2081,8 @@ mod tests {
         let mut hll = HyperLogLog::new();
         hll.insert(b"a");
         hll.insert(b"b");
-        for kind in [
+        // A second apart, so no two are one series in one second.
+        for (second, kind) in [
             MetricKind::counter(3.0),
             MetricKind::Set(hll),
             MetricKind::Sum(Sum {
@@ -1948,8 +2093,12 @@ mod tests {
             MetricKind::GaugeDelta(MetricValue::F64(1.0)),
             MetricKind::Samples(Samples::new([1.0])),
             MetricKind::gauge(f64::NAN),
-        ] {
-            events.push(Event::metric(TS, attrs.clone(), MetricRecord::new(intern("m"), kind)));
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let ts = TS + second as i64 * 1_000_000_000;
+            events.push(Event::metric(ts, attrs.clone(), MetricRecord::new(intern("m"), kind)));
         }
         let body = e.encode_series_v1(&batch(events)).unwrap();
         let json: JsonValue = serde_json::from_slice(&body).unwrap();
@@ -2289,7 +2438,16 @@ mod tests {
             sum(4.0, Temporality::Cumulative, true),
         ]
         .map(|k| Event::metric(TS, AttrMap::new(), MetricRecord::new(intern("m"), k)));
-        let series = v2_series(&mut e, &batch(events.to_vec()));
+        // A second apart, so the delta and the cumulative sum aren't one series in one second.
+        let events: Vec<Event> = events
+            .into_iter()
+            .enumerate()
+            .map(|(second, mut e)| {
+                e.timestamp += second as i64 * 1_000_000_000;
+                e
+            })
+            .collect();
+        let series = v2_series(&mut e, &batch(events));
         let wire: Vec<(i64, f64)> = series
             .iter()
             .map(|s| (s["type"].as_i64().unwrap(), s["points"][0]["value"].as_f64().unwrap()))

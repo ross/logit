@@ -127,6 +127,18 @@
 //! the route writes nothing for (a cumulative monotonic `Sum`, say) has no series to count, and
 //! the encoder counts its skip as usual.
 //!
+//! **Two points of one series in one second.** Datadog keeps one point per series per second:
+//! of two in one request, the higher, for a `count` as for a gauge (a trial org, 2026-10-21), and
+//! across requests the later write. So the series encoder sends only the latest point of each
+//! series and second in a request, the later in batch order on a tie, and counts each other one
+//! `logit.output.metrics.dropped{reason="duplicate_timestamp"}`, equal values included, with a
+//! throttled `duplicate_timestamp` diagnostic (`logit_proto::datadog`'s encode table has the
+//! series key). `logit.output.records` counts only the points sent. Distribution points aren't
+//! collapsed: Datadog keeps both. Two points a request cut separates are both sent, and Datadog
+//! keeps the later request's, uncounted (`docs/known-gaps/datadog.md`). A `dedup_timestamps` with
+//! `precision: 1s` as the last stage before this sink sums two counts and keeps the later gauge
+//! first.
+//!
 //! ## Size limits
 //!
 //! | Route | Entries per request | Uncompressed body | Body on the wire |
@@ -1077,10 +1089,14 @@ impl DatadogOutput {
                     |item| item.weight,
                     |chunk| {
                         let raw = route.encode(encoder, &sub_batch(batch, chunk))?;
+                        // The series points the encoder left off as duplicates, which the
+                        // chunk's items weigh but the body doesn't hold.
+                        let duplicates =
+                            if route == Route::Series { encoder.series_duplicates() } else { 0 };
                         Some(Encoded {
                             raw_len: raw.len(),
                             body: body_encoding.apply(raw),
-                            meta: (),
+                            meta: duplicates,
                         })
                     },
                 )
@@ -1105,7 +1121,7 @@ impl DatadogOutput {
                 if self.accounting.settled(request) {
                     continue;
                 }
-                let entries = weight(&chunk);
+                let entries = weight(&chunk).saturating_sub(encoded.meta);
                 // `post` counts and diagnoses a rejection itself.
                 let result = self.post(route, encoded, entries).await;
                 let accepted = result.is_ok();
@@ -1173,7 +1189,12 @@ impl DatadogOutput {
     /// dropped here, `oversize` for a `413` and `rejected` for any other 3xx or 4xx that
     /// [`classify_status`] doesn't read as `Refused`. A series `2xx` counts the entries its body
     /// names `rejected` as well ([`series_errors`]), and takes them out of `records`.
-    async fn post(&mut self, route: Route, encoded: Encoded, entries: usize) -> anyhow::Result<()> {
+    async fn post(
+        &mut self,
+        route: Route,
+        encoded: Encoded<usize>,
+        entries: usize,
+    ) -> anyhow::Result<()> {
         let url = self.url(route);
         let tags = [("route", route.name())];
         let wire_len = encoded.body.len();
@@ -2178,7 +2199,7 @@ mod tests {
     async fn a_413_counts_the_requests_entries_oversize() {
         let (addr, _log) = intake(|_| (413, String::new())).await;
         let (registry, mut out) = metered(addr);
-        out.send_at(&batch(vec![gauge(NOW), gauge(NOW)]), NOW).await.unwrap_err();
+        out.send_at(&batch(vec![gauge(NOW), gauge(NOW - 1_000_000_000)]), NOW).await.unwrap_err();
         let points = registry.drain(0);
         assert_eq!(
             total(&points, RECORDS_DROPPED, &[("route", "series"), ("reason", "oversize")]),
@@ -2216,7 +2237,8 @@ mod tests {
         let mut out = sink(addr)
             .with_diagnostics(Diagnostics::new("out").with_telemetry(telemetry.clone()))
             .with_telemetry(telemetry);
-        let b = batch((0..gauges).map(|_| gauge(NOW)).collect());
+        // A second apart, so no two are one series in one second.
+        let b = batch((0..gauges as i64).map(|i| gauge(NOW - i * 1_000_000_000)).collect());
         out.send_at(&b, NOW).await.expect("a 202 is accepted whatever its body names");
         let points = registry.drain(0);
         let tags = [("route", "series")];
@@ -2956,7 +2978,7 @@ mod tests {
             _ if p == SERIES => Reply::Answer(413, b"too large".to_vec()),
             _ => accepted(p),
         };
-        let b = batch(vec![gauge(NOW), gauge(NOW)]);
+        let b = batch(vec![gauge(NOW), gauge(NOW - 1_000_000_000)]);
         let (sums, log) = run_dd(script, vec![b], at_least_once(), instrumented).await;
         assert_eq!(recorded_paths(&log), [SERIES, SERIES]);
         assert_eq!(sum_of(&sums, "logit.component.batches.dropped", &[]), 1.0);
@@ -3080,7 +3102,7 @@ mod tests {
                 }
             };
             let events = || {
-                let mut events = vec![gauge(NOW), gauge(NOW)];
+                let mut events = vec![gauge(NOW), gauge(NOW - 1_000_000_000)];
                 events.extend(numbered_logs(3));
                 vec![batch(events)]
             };
@@ -3156,5 +3178,51 @@ mod tests {
         let err = out.send_at(&batch(vec![gauge(NOW)]), NOW).await.unwrap_err();
         assert_eq!(logit_pipeline::classify(&err), Fault::Ambiguous);
         assert!(total(&registry.drain(0), REQUEST_BYTES, &[("route", "series")]) > 0.0);
+    }
+
+    // ---- duplicate timestamps ----------------------------------------------------------------
+
+    /// Two gauges of one series in one second, the later reading the lower value, beside a point
+    /// of another second: the later reading of the pair is sent and the earlier counted dropped,
+    /// once for the batch though it took two attempts, and `records` counts only what was sent.
+    #[tokio::test]
+    async fn a_series_point_sharing_its_second_is_dropped_and_counted_once() {
+        let b = batch(vec![
+            metric(NOW, MetricKind::gauge(9.0)),
+            metric(NOW + 500_000_000, MetricKind::gauge(2.0)),
+            metric(NOW + 1_000_000_000, MetricKind::gauge(3.0)),
+        ]);
+        let (sums, log) = run_dd(busy_once, vec![b], at_least_once(), instrumented).await;
+        let values: Vec<Vec<f64>> = bodies(&log, SERIES)
+            .iter()
+            .map(|body| {
+                let decoded = DatadogDecoder::new().decode_series_v2_protobuf(body, NOW).unwrap();
+                let value = |e: &Event| match e.metrics[0].kind {
+                    MetricKind::Gauge(v) => v.as_f64(),
+                    ref other => panic!("a gauge, got {other:?}"),
+                };
+                decoded.events.iter().map(value).collect()
+            })
+            .collect();
+        assert_eq!(values, [vec![2.0, 3.0], vec![2.0, 3.0]], "the later reading is sent");
+        let duplicate = [("reason", "duplicate_timestamp")];
+        assert_eq!(sum_of(&sums, "logit.output.metrics.dropped", &duplicate), 1.0);
+        assert_eq!(
+            sum_of(&sums, "logit.component.diagnostics", &[("key", "duplicate_timestamp")]),
+            1.0
+        );
+        assert_eq!(sum_of(&sums, RECORDS, &[("route", "series")]), 2.0);
+    }
+
+    /// Datadog keeps both of two distribution points in one second, so nothing is dropped there.
+    #[tokio::test]
+    async fn distribution_points_sharing_a_second_are_all_sent() {
+        let b = batch(vec![
+            metric(NOW, MetricKind::Samples(Samples::new([1.0]))),
+            metric(NOW, MetricKind::Samples(Samples::new([2.0]))),
+        ]);
+        let (sums, _) = run_dd(|p, _| accepted(p), vec![b], at_least_once(), instrumented).await;
+        assert_eq!(sum_of(&sums, "logit.output.metrics.dropped", &[]), 0.0);
+        assert_eq!(sum_of(&sums, RECORDS, &[("route", "distribution_points")]), 2.0);
     }
 }
