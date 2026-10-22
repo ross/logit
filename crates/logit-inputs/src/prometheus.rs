@@ -1311,7 +1311,7 @@ impl Input for PrometheusReceiver {
             // Both waits race shutdown: see `docs/design/pipeline-graph.md`'s "Cancellation
             // points".
             let accepted = tokio::select! {
-                accepted = accept_queue.accept(&listener) => accepted,
+                accepted = crate::http::accept(&mut accept_queue, &listener) => accepted,
                 _ = shutdown.wait_for(|&due| due) => break,
             };
             let (mut stream, peer) = match accepted {

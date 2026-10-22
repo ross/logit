@@ -1,6 +1,7 @@
 //! Connection-level plumbing shared by this crate's `hyper`-based listeners (`otlp_in`,
 //! `prometheus_in`'s remote-write receiver, `datadog_in`, `datadog_trace_in`,
-//! `splunk_hec_in`, and `influxdb_in`): the connection builders that pin hyper's HTTP/2 settings ([`auto_builder`],
+//! `splunk_hec_in`, and `influxdb_in`): the accept that sets `TCP_NODELAY` on each connection
+//! ([`accept`]), the connection builders that pin hyper's HTTP/2 settings ([`auto_builder`],
 //! [`h2_builder`]), the idle-timeout tracker ([`Activity`], [`InFlight`]), the connection driver
 //! that acts on it ([`drive_connection`]), and the bounded request-body read
 //! ([`collect_with_stall_bound`], which holds one buffer per body however many reads it arrives
@@ -27,6 +28,7 @@
 //! doesn't reach, and [`deliver_with_deadline`] sends nothing until it holds a slot on every
 //! consumer, so a wait dropped before then has sent and counted nothing.
 
+use crate::tcp::AcceptQueueSampler;
 use bytes::{Bytes, BytesMut};
 use http_body_util::{BodyExt, Limited};
 use hyper::body::Incoming;
@@ -79,6 +81,27 @@ pub(crate) fn h2_builder() -> http2::Builder<TokioExecutor> {
         .max_pending_accept_reset_streams(MAX_PENDING_ACCEPT_RESET_STREAMS)
         .max_header_list_size(MAX_HEADER_LIST_SIZE);
     builder
+}
+
+/// Accepts the next connection on an HTTP listener's TCP socket through `sampler`'s accept-queue
+/// gauges, with `TCP_NODELAY` set on it. Each of the six listeners' accept loops calls this
+/// rather than [`AcceptQueueSampler::accept`].
+///
+/// hyper's h2 server writes a response's frames in separate writes. With Nagle's algorithm on,
+/// a gRPC response's trailers wait for the client's ACK of the frames before them, which a
+/// client holding one request in flight sends only after its delayed-ACK timer: a stall on every
+/// request (ADR `otlp-tls-and-pooled-grpc-client`'s server-side amendment). A failed
+/// `set_nodelay` keeps the connection and costs only that latency, so it is neither counted nor
+/// reported.
+///
+/// Cancellation-safe as [`AcceptQueueSampler::accept`] is: nothing follows the accept's await.
+pub(crate) async fn accept(
+    sampler: &mut AcceptQueueSampler,
+    listener: &tokio::net::TcpListener,
+) -> std::io::Result<(tokio::net::TcpStream, std::net::SocketAddr)> {
+    let (stream, peer) = sampler.accept(listener).await?;
+    let _ = stream.set_nodelay(true);
+    Ok((stream, peer))
 }
 
 /// One connection's idle state, shared between its service and [`drive_connection`].
@@ -728,5 +751,21 @@ mod tests {
         assert!(matches_any_key(&keys, b"two"));
         assert!(!matches_any_key(&keys, b"three"));
         assert!(!matches_any_key(&[], b"one"));
+    }
+
+    /// [`accept`] hands its caller a connection with `TCP_NODELAY` on, which a socket accepted
+    /// on Linux doesn't start with.
+    #[tokio::test]
+    async fn accept_sets_nodelay_on_the_accepted_connection() {
+        let listener =
+            tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("should bind loopback");
+        let addr = listener.local_addr().expect("a bound listener has an address");
+        let mut sampler =
+            AcceptQueueSampler::new(Telemetry::default(), logit_core::Diagnostics::default());
+        let (client, accepted) =
+            tokio::join!(tokio::net::TcpStream::connect(addr), accept(&mut sampler, &listener));
+        let _client = client.expect("should connect to loopback");
+        let (stream, _peer) = accepted.expect("should accept the loopback connection");
+        assert!(stream.nodelay().expect("should read TCP_NODELAY"), "TCP_NODELAY is off");
     }
 }

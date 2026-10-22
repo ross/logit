@@ -1,0 +1,29 @@
+# Regex extraction (docs/adr/regex-transform.md): generate_in renders an nginx combined-format
+# access line as plain text, `regex` turns its ten named capture groups into attributes, null_out
+# discards. Measures the pattern match plus the attribute inserts for the
+# `lines_in -> regex` shape a tailed unstructured log takes. Scenario table:
+# docs/design/performance.md, "Scenarios".
+#
+#   script/perf run --scenario regex-parse
+#
+# The line is nginx's built-in `combined` log_format (nginx.org, ngx_http_log_module): remote
+# address, user, time_local, request, status, bytes sent, referer, user agent, with the request
+# split into method, path, and protocol. The address, path, and status code vary per event
+# (`{seq%256}`, `{seq%50}`, `{seq%4}`) so the match runs on distinct bytes. Every line matches; a
+# pattern that never matched would measure the miss path. Read against logfmt-parse (a hand-written
+# parser over a similar field count): the gap is the regex engine.
+components:
+  gen:
+    type: generate_in
+    count: 10000000
+    event:
+      log: '10.0.{seq%256}.17 - alice [07/Sep/2026:06:52:01 +0000] "GET /static/app-{seq%50}.js HTTP/1.1" 2{seq%4}0 612 "https://example.com/" "Mozilla/5.0 (X11; Linux x86_64) Chrome/120.0"'
+
+  parsed:
+    type: regex
+    sources: [gen]
+    pattern: '^(?P<client>\S+) \S+ (?P<user>\S+) \[(?P<time>[^\]]+)\] "(?P<method>\S+) (?P<path>\S+) (?P<proto>[^"]+)" (?P<status>\d{3}) (?P<bytes>\d+) "(?P<referer>[^"]*)" "(?P<agent>[^"]*)"$'
+
+  out:
+    type: null_out
+    sources: [parsed]

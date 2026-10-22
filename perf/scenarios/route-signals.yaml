@@ -1,0 +1,46 @@
+# Per-signal splitting (docs/adr/route-signals.md): generate_in stamps each event with a log record
+# and a sum metric, `route_signals` (default `strip: true`) splits it into a part per target, the
+# log to `log_tier` and the metric to `metric_tier`, each into its own null_out. Every input event
+# becomes two output events, the second counted in `logit.component.events.copied`; the part
+# carrying the log gets a clone of the attributes. `route_signals` takes no ordinary consumers
+# and discards an event carrying no listed signal, so there is no unrouted sink. Scenario table:
+# docs/design/performance.md, "Scenarios".
+#
+#   script/perf run --scenario route-signals
+#
+# Read against route-copy: that scenario delivers an event whole to two targets, this one builds
+# two stripped parts, which pays an attribute-map clone and a payload move per event. `count` is
+# generated events, so CPU us/event is per generated event, not per part.
+components:
+  gen:
+    type: generate_in
+    count: 18000000
+    event:
+      log: GET /x/{seq%50} 200
+      attributes:
+        method: GET
+        host: web-{seq%10}
+        region: us-east-1
+        service: web
+      metric:
+        name: web.requests
+        kind: sum
+        value: 1
+
+  split:
+    type: route_signals
+    sources: [gen]
+    signals:
+      logs: log_tier
+      metrics: metric_tier
+
+  log_tier: {type: target}
+  metric_tier: {type: target}
+
+  log_out:
+    type: null_out
+    sources: [log_tier]
+
+  metric_out:
+    type: null_out
+    sources: [metric_tier]

@@ -1,0 +1,45 @@
+# Prometheus remote-write 1.0 round trip: one process, two disconnected chains sharing one
+# loopback connection, `gen -> relay_out` (prometheus_out sending remote-write, Snappy) and
+# `relay_in -> drop` (prometheus_in's remote-write receiver). The event is one gauge over 1000
+# series (`host: h{seq%1000}`), so this measures protobuf encode, Snappy, one HTTP request per
+# 100 samples, and the decode back to events. Scenario table: docs/design/performance.md,
+# "Scenarios".
+#
+#   script/perf run --scenario prometheus-remote-write-relay
+#
+# `buffer.max_batches: 64` on the sink keeps the queue left at `generation complete` small. The
+# harness divides by `ready` to `generation complete`, and under the default 1024-batch bound a
+# sink slower than the generator still holds up to 1024 batches at that line, which inflates
+# events/s and can outlast `--settle`.
+#
+# This scenario never self-exits: `relay_in` is a listener, so the harness sends SIGTERM
+# `--settle` after the `generation complete` line (crates/logit-perf/src/scenario.rs's
+# `needs_sigterm`). The runtime binds every listener before any task runs, so `relay_in` is
+# listening before `relay_out` sends.
+components:
+  gen:
+    type: generate_in
+    count: 3000000
+    event:
+      attributes:
+        host: "h{seq%1000}"
+      metric:
+        name: cpu.usage
+        kind: gauge
+        value: 12.5
+
+  relay_out:
+    type: prometheus_out
+    sources: [gen]
+    endpoint: http://127.0.0.1:19104/api/v1/write
+    version: 1
+    buffer:
+      max_batches: 64
+
+  relay_in:
+    type: prometheus_in
+    bind: 127.0.0.1:19104
+
+  drop:
+    type: null_out
+    sources: [relay_in]

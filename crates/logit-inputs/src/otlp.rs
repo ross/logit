@@ -15,6 +15,8 @@
 //! [`hyper_util::server::conn::auto::Builder`], which handles HTTP/1.1 (what `curl` and most OTel
 //! HTTP exporters speak) and h2c (prior-knowledge HTTP/2 without TLS) off one socket; gRPC
 //! connections by [`hyper::server::conn::http2::Builder`] directly, since gRPC is HTTP/2 only.
+//! Every accepted socket has `TCP_NODELAY` on ([`crate::http::accept`]), or a gRPC response's
+//! trailers wait on the client's delayed ACK.
 //!
 //! **Backpressure reaches the client.** A UDP listener's slow downstream means the kernel drops
 //! datagrams; TCP has no such escape hatch. A slow downstream blocks the handler's delivery, which
@@ -457,7 +459,7 @@ impl Input for OtlpInput {
             // Both waits race shutdown: see `docs/design/pipeline-graph.md`'s "Cancellation
             // points".
             let accepted = tokio::select! {
-                accepted = accept_queue.accept(&listener) => accepted,
+                accepted = crate::http::accept(&mut accept_queue, &listener) => accepted,
                 _ = shutdown.wait_for(|&due| due) => break,
             };
             let (mut stream, peer) = match accepted {
