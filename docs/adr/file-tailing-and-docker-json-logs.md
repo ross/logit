@@ -1,6 +1,6 @@
 ---
 created: 2026-09-06
-updated: 2026-10-18
+updated: 2026-10-21
 ---
 
 # `tail_in`: generic file tailing, and `docker_in` on top of it for Docker's json-file logs
@@ -257,8 +257,8 @@ and needs no additional privilege beyond the read access already required for th
 
 `docker_in`'s `containers: [name | id-prefix (≥12 hex)]` selects which containers to follow;
 `discover: true` follows every container under `root`, including ones that appear after startup.
-`containers` empty and `discover` unset is rejected (rule 27) — the same "would silently do
-nothing" reasoning rule 7 already applies to a listener with no consumers. Explicit is the default
+With `containers` empty and `discover` unset, `docker_in` follows no container and idles (see
+"Amendment: an empty selection idles" below). Explicit is the default
 because a container log stream, unlike a metric or a datagram source, is a *named, deliberate*
 selection in most operational setups — an operator names what they want observed. Even in explicit
 mode, `docker_in` still watches the whole root directory (not just the named containers'
@@ -620,3 +620,13 @@ nothing for a stream mid-drop. At a truncation the driver counts the line splitt
 line only when the decoder holds no entry, so a held reassembly and the unterminated line that
 continues it count once. The cost is that an unterminated line on the other stream, beside a held
 reassembly or a drop in progress, goes uncounted (`docs/known-gaps/tailing.md`).
+
+## Amendment: an empty selection idles (2026-10-21)
+
+Rule 26 no longer rejects a `tail_in` with `paths: []`, and rule 27 no longer rejects a
+`docker_in` with no `containers` and `discover: false`. Each runs as written. The `tail_in`
+tails nothing, and the `docker_in` still watches `root` but follows no container. Both deliver
+nothing and stop cleanly on shutdown. Validation rejects a config only when it can't run, or when
+it would lose or duplicate data the operator didn't ask to lose or duplicate, and an idle listener
+does neither. Rule 26 keeps its empty-entry and glob checks, and rule 27 keeps its empty-entry,
+duplicate-entry, and empty-`root` checks.

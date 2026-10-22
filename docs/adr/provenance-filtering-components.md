@@ -110,12 +110,11 @@ profile.
 
 ### Validation
 
-Rule 37 (`crates/logit-pipeline/src/graph.rs`) rejects: both `origin:` and `previous:` empty
-(`has_provenance` -- "matches every event, a no-op"; `drop_provenance` -- "matches every event,
-and so can only ever drop every one of them"); any empty-string entry within either list ("could
-never name a real component id"); a duplicate entry within one list (the same "a repeated entry is
-almost certainly a copy-paste typo" reasoning rule 4 already applies to a repeated `sources`
-entry).
+Rule 37 (`crates/logit-pipeline/src/graph.rs`) rejects any empty-string entry within either list
+("could never name a real component id") and a duplicate entry within one list (the same "a
+repeated entry is almost certainly a copy-paste typo" reasoning rule 4 already applies to a
+repeated `sources` entry). Both `origin:` and `previous:` may be empty (see "Amendment: an empty
+match is legal" below).
 
 **The empty-config black-hole/no-op assignment lines up with rule 36's (`has_attributes`), not
 `has_signal`'s family's -- despite each field's own contents being a list of
@@ -190,3 +189,13 @@ Under [ADR `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md), `has_prov
 Consequences bullet on sharing `logit.transform.events.filtered` no longer applies: that counter is
 removed. Every event either removes is `logit.component.events.discarded`, which the runtime
 counts under the filter's id.
+
+## Amendment: an empty match is legal (2026-10-21)
+
+Rule 37 no longer rejects a `has_provenance` or `drop_provenance` whose `origin:` and `previous:`
+are both empty. With neither field in the match, every batch matches: `has_provenance` forwards
+every event, and `drop_provenance` discards every event, counted as
+`logit.component.events.discarded`. This is rule 36's empty case, and the orientation argument
+above still decides which of the two is the black hole. Validation rejects a config only when it
+can't run, or when it would lose or duplicate data the operator didn't ask to lose or duplicate;
+the loss here is one the config states. Rule 37 keeps its empty-entry and duplicate-entry checks.
