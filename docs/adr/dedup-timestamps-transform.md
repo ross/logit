@@ -147,9 +147,10 @@ dropped.
 
 A passed-through record reaches the sink as a duplicate of the survivor, and a sink that can't
 hold both drops it and counts it as loss,
-`logit.output.metrics.dropped{reason="duplicate_timestamp"}`, unless the sink would write it
-as the same reading it sends ([The sink-side counter](#the-sink-side-counter)). That's intended. A record passed through
-for any reason but `no_recorded_value` or `no_merge_rule` is broken input, such as a `NaN`
+`logit.output.metrics.dropped{reason="duplicate_timestamp"}`: a passed-through record is never a
+state, so it counts `dropped` whatever its value
+([The sink-side counter](#the-sink-side-counter)). That's intended. A record passed through for
+any reason but `no_recorded_value` or `no_merge_rule` is broken input, such as a `NaN`
 increment, two layouts for one series, or a total past the integer range, so its loss is reported
 as loss, not as an outcome the config asked for. `no_merge_rule` is the other exception:
 
@@ -363,12 +364,14 @@ whichever of the two arrives, so the rule each destination applies inside one re
 or the higher) makes no difference. A Datadog Agent relay or a retry resends identical points,
 and that mustn't raise a loss alarm.
 
-Every other reading is an **increment or an observation set**: a delta `Sum` (Datadog's `count`
-and `rate`), a delta `Histogram`, `ExponentialHistogram`, or `Summary`, `Samples`, a
+Every other reading is an **increment or an observation set**: a delta `Sum` (Datadog's `count`),
+a Datadog `rate` (a `Gauge` carrying `_logit.datadog.type: rate`), a delta `Histogram`, `ExponentialHistogram`, or `Summary`, `Samples`, a
 `Distribution`, and a set, `SetMembers` or `Set`. Two equal ones in one bucket are two real sets
 of events, and the sink sends one, so the removed one stays `dropped` whatever its value. A set
 written as a gauge of its size shows this most plainly: `{alice}` and `{bob}` both write `1`, and
-their union is `2`. A `dedup_timestamps` upstream sums the increments and unions the sets.
+their union is `2`. A `dedup_timestamps` upstream merges the increments and observation sets it has
+a rule for and unions the sets; a delta `Summary` pair passes through it (`no_merge_rule`) and
+stays `dropped` at the sink.
 
 Equal means the whole reading as the sink writes it, each `f64` compared by its bits, so a `NaN`
 equals only the same `NaN` and `0.0` doesn't equal `-0.0`:
@@ -507,7 +510,7 @@ keep the higher.
   `crates/logit-bench/tests/allocations.rs` a pin, when the transform lands.
 - The transit spec gains flows with `dedup_timestamps` in front of `prometheus_out` and `datadog_out`, and the
   `same_instant` and `same_millisecond` rows change with the sink counters.
-- If this record is accepted, these must change, in the PR that builds the component:
+- Now that this record is accepted, these change in the PR that builds the component:
   - [ADR `routing-by-condition-is-lua`](routing-by-condition-is-lua.md) gets an amendment beside
     its `sample` one, saying `dedup_timestamps` is back for series-level collapse and
     the event-level seen-set stays retired.
