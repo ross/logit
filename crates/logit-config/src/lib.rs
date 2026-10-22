@@ -3038,8 +3038,9 @@ pub enum ComponentKind {
     /// Replaces each cumulative point with its difference from the series' previous point, for a
     /// destination that takes only deltas (Datadog, `statsd_out`, a delta-only OTLP backend). It
     /// converts a cumulative monotonic `sum`, a cumulative `histogram` and
-    /// `exponential_histogram`, and a `summary`'s count and sum (its quantiles pass unchanged);
-    /// every other record, a cumulative non-monotonic `sum` included, passes through untouched.
+    /// `exponential_histogram`, and a `summary`'s count and sum (its quantiles pass unchanged). A
+    /// cumulative non-monotonic `sum` converts only when `non_monotonic` says so; every other
+    /// record passes through untouched.
     ///
     /// A series is the metric's name, unit, and kind, the resource, the instrumentation scope,
     /// and the event's attributes; its state lives in memory, so a restart starts every series
@@ -3054,6 +3055,11 @@ pub enum ComponentKind {
         /// next point is differenced against.
         #[serde(default)]
         initial_value: InitialValue,
+        /// What a cumulative non-monotonic `sum` does: `pass` (the default) leaves it as it is,
+        /// `difference` converts it with a decrease as a negative delta, and `reset_on_decrease`
+        /// converts it with a decrease as a counter restart, as for a monotonic `sum`.
+        #[serde(default)]
+        non_monotonic: NonMonotonicSums,
         /// Forgets a series no point has updated for this long, by the wall clock; its next point
         /// is then a first point. Set it above the longest gap between a producer's reports.
         /// Must be greater than zero.
@@ -4704,6 +4710,24 @@ pub enum InitialValue {
     Keep,
     /// Never anything: the first point only records the baseline.
     Drop,
+}
+
+/// `cumulative_to_delta`'s `non_monotonic` field: what a cumulative non-monotonic `sum` does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum NonMonotonicSums {
+    /// Passed through untouched: its running value is a level, such as an OpenTelemetry
+    /// up-down counter's, and most destinations read it as a gauge. The default.
+    #[default]
+    Pass,
+    /// Converted to a delta that goes negative when the value went down. For an up-down counter
+    /// sent to a destination that takes only deltas. A counter that restarts with no start time
+    /// reads as one large negative delta.
+    Difference,
+    /// Converted as a monotonic `sum` is: a value that went down is a counter restart, and the
+    /// new value is the delta. For a counter its producer can't mark monotonic, such as
+    /// collectd's DERIVE, whose stock types have a minimum of 0.
+    ResetOnDecrease,
 }
 
 /// `cumulative_to_delta`'s `max_staleness` default, the Datadog exporter's and the OpenTelemetry
@@ -7289,8 +7313,14 @@ mod tests {
         let component: Component =
             serde_json::from_str(r#"{"type": "cumulative_to_delta", "sources": ["in"]}"#).unwrap();
         match component.kind {
-            ComponentKind::CumulativeToDelta { initial_value, max_staleness, max_series } => {
+            ComponentKind::CumulativeToDelta {
+                initial_value,
+                non_monotonic,
+                max_staleness,
+                max_series,
+            } => {
                 assert_eq!(initial_value, InitialValue::Auto);
+                assert_eq!(non_monotonic, NonMonotonicSums::Pass);
                 assert_eq!(max_staleness, Duration::from_secs(3600));
                 assert_eq!(max_series, 10_000);
             }
@@ -7298,12 +7328,18 @@ mod tests {
         }
         let component: Component = serde_json::from_str(
             r#"{"type": "cumulative_to_delta", "sources": ["in"], "initial_value": "keep",
-                "max_staleness": "10m", "max_series": 5}"#,
+                "non_monotonic": "reset_on_decrease", "max_staleness": "10m", "max_series": 5}"#,
         )
         .unwrap();
         match component.kind {
-            ComponentKind::CumulativeToDelta { initial_value, max_staleness, max_series } => {
+            ComponentKind::CumulativeToDelta {
+                initial_value,
+                non_monotonic,
+                max_staleness,
+                max_series,
+            } => {
                 assert_eq!(initial_value, InitialValue::Keep);
+                assert_eq!(non_monotonic, NonMonotonicSums::ResetOnDecrease);
                 assert_eq!(max_staleness, Duration::from_secs(600));
                 assert_eq!(max_series, 5);
             }

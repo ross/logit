@@ -2286,7 +2286,7 @@
           "additionalProperties": false
         },
         {
-          "description": "Replaces each cumulative point with its difference from the series' previous point, for a destination that takes only deltas (Datadog, `statsd_out`, a delta-only OTLP backend). It converts a cumulative monotonic `sum`, a cumulative `histogram` and `exponential_histogram`, and a `summary`'s count and sum (its quantiles pass unchanged); every other record, a cumulative non-monotonic `sum` included, passes through untouched.\n\nA series is the metric's name, unit, and kind, the resource, the instrumentation scope, and the event's attributes; its state lives in memory, so a restart starts every series over. A point timestamped at or before the series' last one is skipped. A value that went down, or a start time that moved past the previous point, is a counter restart: the point's whole value is the delta. A histogram whose buckets changed is dropped, counted, and becomes the new baseline.",
+          "description": "Replaces each cumulative point with its difference from the series' previous point, for a destination that takes only deltas (Datadog, `statsd_out`, a delta-only OTLP backend). It converts a cumulative monotonic `sum`, a cumulative `histogram` and `exponential_histogram`, and a `summary`'s count and sum (its quantiles pass unchanged). A cumulative non-monotonic `sum` converts only when `non_monotonic` says so; every other record passes through untouched.\n\nA series is the metric's name, unit, and kind, the resource, the instrumentation scope, and the event's attributes; its state lives in memory, so a restart starts every series over. A point timestamped at or before the series' last one is skipped. A value that went down, or a start time that moved past the previous point, is a counter restart: the point's whole value is the delta. A histogram whose buckets changed is dropped, counted, and becomes the new baseline.",
           "type": "object",
           "required": [
             "type"
@@ -2313,6 +2313,15 @@
               "description": "Forgets a series no point has updated for this long, by the wall clock; its next point is then a first point. Set it above the longest gap between a producer's reports. Must be greater than zero.",
               "default": "1h",
               "type": "string"
+            },
+            "non_monotonic": {
+              "description": "What a cumulative non-monotonic `sum` does: `pass` (the default) leaves it as it is, `difference` converts it with a decrease as a negative delta, and `reset_on_decrease` converts it with a decrease as a counter restart, as for a monotonic `sum`.",
+              "default": "pass",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/NonMonotonicSums"
+                }
+              ]
             },
             "receive": true,
             "sources": true,
@@ -5289,6 +5298,32 @@
         }
       },
       "additionalProperties": false
+    },
+    "NonMonotonicSums": {
+      "description": "`cumulative_to_delta`'s `non_monotonic` field: what a cumulative non-monotonic `sum` does.",
+      "oneOf": [
+        {
+          "description": "Passed through untouched: its running value is a level, such as an OpenTelemetry up-down counter's, and most destinations read it as a gauge. The default.",
+          "type": "string",
+          "enum": [
+            "pass"
+          ]
+        },
+        {
+          "description": "Converted to a delta that goes negative when the value went down. For an up-down counter sent to a destination that takes only deltas. A counter that restarts with no start time reads as one large negative delta.",
+          "type": "string",
+          "enum": [
+            "difference"
+          ]
+        },
+        {
+          "description": "Converted as a monotonic `sum` is: a value that went down is a counter restart, and the new value is the delta. For a counter its producer can't mark monotonic, such as collectd's DERIVE, whose stock types have a minimum of 0.",
+          "type": "string",
+          "enum": [
+            "reset_on_decrease"
+          ]
+        }
+      ]
     },
     "NormalizeStep": {
       "description": "A rewrite `keep_values` applies to a field's value before testing it against `allow`. A list, so further steps can be added beside `lower`.",

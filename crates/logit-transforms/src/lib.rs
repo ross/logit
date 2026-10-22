@@ -39,7 +39,7 @@ pub use aggregate::{AggregateTemporality, Aggregator, Distributions, Sets};
 pub use attributes::{DropAttributes, HasAttributes};
 pub use bucket::{Bucket, BucketBound, BucketField};
 pub use csv::CsvParser;
-pub use cumulative_to_delta::{CumulativeToDelta, InitialValue};
+pub use cumulative_to_delta::{CumulativeToDelta, InitialValue, NonMonotonic};
 pub use flatten::{Arrays, Fields, Flatten};
 pub use http_access::{HttpAccess, HttpAccessConfig, RouteRule, RouteSet, UaRule};
 pub use json::{InvalidUtf8, JsonParser};

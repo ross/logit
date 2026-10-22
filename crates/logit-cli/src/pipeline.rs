@@ -91,8 +91,9 @@ use logit_transforms::{
     InitialValue as TransformInitialValue, InvalidUtf8 as TransformInvalidUtf8, JsonParser,
     Keep as KeepTransform, KeepSignals as KeepSignalsTransform, KeepValues as KeepValuesTransform,
     Kv as KvTransform, KvMetrics as KvMetricsTransform, LineProtocol as LineProtocolTransform,
-    Logfmt as LogfmtTransform, MatchMode as TransformMatchMode, Normalize as TransformNormalize,
-    RegexParser, Remove as RemoveTransform, Route as RouteTransform, Sample as SampleTransform,
+    Logfmt as LogfmtTransform, MatchMode as TransformMatchMode,
+    NonMonotonic as TransformNonMonotonic, Normalize as TransformNormalize, RegexParser,
+    Remove as RemoveTransform, Route as RouteTransform, Sample as SampleTransform,
     Scale as ScaleTransform, Set as SetTransform, Sets as TransformSets, Shape as ShapeTransform,
     SignalSet, SpanLift, TimestampFormat as TimestampFormatTransform, TimestampResolver,
     TraceContext as TraceContextTransform,
@@ -1021,13 +1022,14 @@ pub(crate) fn build_spec(
                 .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
                 .with_telemetry(telemetry.clone()),
         )),
-        CumulativeToDelta { initial_value, max_staleness, max_series } => {
+        CumulativeToDelta { initial_value, non_monotonic, max_staleness, max_series } => {
             NodeSpec::Transform(Box::new(
                 CumulativeToDeltaTransform::new(
                     to_initial_value(*initial_value),
                     *max_staleness,
                     *max_series,
                 )
+                .with_non_monotonic(to_non_monotonic(*non_monotonic))
                 .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
                 .with_telemetry(telemetry.clone()),
             ))
@@ -2224,6 +2226,15 @@ fn to_initial_value(mode: logit_config::InitialValue) -> TransformInitialValue {
         logit_config::InitialValue::Auto => TransformInitialValue::Auto,
         logit_config::InitialValue::Keep => TransformInitialValue::Keep,
         logit_config::InitialValue::Drop => TransformInitialValue::Drop,
+    }
+}
+
+/// `logit_config::NonMonotonicSums` -> `logit_transforms::NonMonotonic`.
+fn to_non_monotonic(mode: logit_config::NonMonotonicSums) -> TransformNonMonotonic {
+    match mode {
+        logit_config::NonMonotonicSums::Pass => TransformNonMonotonic::Pass,
+        logit_config::NonMonotonicSums::Difference => TransformNonMonotonic::Difference,
+        logit_config::NonMonotonicSums::ResetOnDecrease => TransformNonMonotonic::ResetOnDecrease,
     }
 }
 
@@ -5986,6 +5997,7 @@ mod tests {
             consumers: vec!["out".to_string()],
             kind: ComponentKind::CumulativeToDelta {
                 initial_value: logit_config::InitialValue::Drop,
+                non_monotonic: logit_config::NonMonotonicSums::Difference,
                 max_staleness: Duration::from_secs(600),
                 max_series: 5,
             },

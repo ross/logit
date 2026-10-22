@@ -7280,6 +7280,7 @@ mod tests {
     fn cumulative_to_delta(max_staleness: Duration, max_series: usize) -> ComponentKind {
         ComponentKind::CumulativeToDelta {
             initial_value: logit_config::InitialValue::Auto,
+            non_monotonic: logit_config::NonMonotonicSums::Pass,
             max_staleness,
             max_series,
         }
