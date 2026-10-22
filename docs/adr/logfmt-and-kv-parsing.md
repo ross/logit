@@ -1,6 +1,6 @@
 ---
 created: 2026-09-07
-updated: 2026-10-11
+updated: 2026-10-21
 ---
 
 # `logfmt` and `kv`: the de-facto key=value parsers, and why they stay two kinds
@@ -74,14 +74,13 @@ value it can't quote anyway. An empty or keyless segment adds nothing, a barewor
 like `logfmt`'s `NoPairs` case;
 `crates/logit-proto/src/message/logfmt.rs`'s module doc holds the segment rules.
 
-**Both are rejected at graph-validation time when `kv`'s separators can only ever misbehave**
-(new rule 30, `crates/logit-pipeline/src/graph.rs`): an empty `pair_sep` or `kv_sep`, identical
-`pair_sep`/`kv_sep`, or a `kv_sep` that contains `pair_sep`. Each is a certain no-op (an empty
-separator splits between every byte; identical separators mean every segment is split away from
-its own separator, so no line could ever produce a pair) or a certain garbage result (a `kv_sep`
-containing `pair_sep` can never appear intact inside a segment, since the `pair_sep` split always
-runs first) -- exactly the "can only ever be a no-op" family `kv_metrics`/`scale`/`set` already
-established (rules 10-12, 20).
+**Every `pair_sep`/`kv_sep` pair validates, and none panics or loops.** An empty separator never
+matches: the scanner treats an empty needle as absent. So an empty `kv_sep`, identical separators,
+or a `kv_sep` that contains `pair_sep` leaves no segment holding a `kv_sep` (the `pair_sep` split
+runs first), and every non-blank line fails like `logfmt`'s `NoPairs` case: the event passes
+through unchanged with a throttled `parse_failure` warning. An empty `pair_sep` makes the whole
+line one segment, so a line yields at most one pair: the key before the first `kv_sep`, and the
+rest of the line as its value.
 
 **Values are always `Value::Str` -- never numeric coercion, ever**, unlike `json`'s type-by-JSON-
 syntax rule. `crate::numeric` (already shared by `scale`/`kv_metrics`) accepts a `Value::Str` that
@@ -154,3 +153,12 @@ allocation row and confuse this diff).
 - `\uXXXX`/`\xNN` escapes are unsupported in `logfmt`'s quoted values (an unknown escape is kept
   verbatim, backslash included) -- no producer observed in this codebase's fixtures emits either,
   and adding them later is purely additive to `unescape`.
+
+## Amendment: any `kv` separators validate; rule 30 is retired (2026-10-21)
+
+Graph rule 30 rejected an empty `pair_sep` or `kv_sep`, identical separators, and a `kv_sep` that
+contains `pair_sep`. It's gone, and the Decision now states what each does. The rule's stated reason
+was also wrong: an empty separator doesn't split between every byte, it never matches. Validation
+rejects a config only when it can't run, or when it would lose or duplicate data the operator didn't
+ask to lose or duplicate; a pointless config runs as written. The number 30 is not reused, so the
+other rules keep theirs.

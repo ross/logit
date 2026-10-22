@@ -86,15 +86,12 @@ survey_demo_config() {
     max_samples_per_series: 5000000
     max_retained_series: 1000000
 
-  # A huge \`rotate.max_bytes\`: \`file_out\` requires a rotation trigger, and a survey that rotated
-  # would lose the start of its capture.
+  # No \`rotate:\`: a survey that rotated would lose the start of its capture.
   shape_out:
     type: file_out
     sources: [shape_rollup]
     path: /shape-survey/shape.log
     format: json
-    rotate:
-      max_bytes: "64GiB"
 EOF
 }
 

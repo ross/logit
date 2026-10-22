@@ -214,7 +214,7 @@ fn label(row: &Row, when: &str) -> String {
 fn reason_and_counter(cell: &Cell) -> String {
     let mut parts = Vec::new();
     match cell.reason.as_deref() {
-        Some("uncounted") => parts.push("uncounted".to_string()),
+        Some(reason @ ("uncounted" | "structural")) => parts.push(reason.to_string()),
         Some(reason) => parts.push(format!("`{reason}`")),
         None => {}
     }
@@ -286,7 +286,7 @@ fn render_gaps(mapping: &Mapping, sink: &str, protocol: &str) -> Vec<String> {
             };
             let counter = match (&cell.counter, cell.reason.as_deref()) {
                 (Some(counter), _) => format!("`{counter}`"),
-                (None, Some("uncounted")) => "none (uncounted)".to_string(),
+                (None, Some(reason @ ("uncounted" | "structural"))) => format!("none ({reason})"),
                 (None, _) => "none".to_string(),
             };
             out.push(format!(

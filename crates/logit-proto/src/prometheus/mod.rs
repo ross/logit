@@ -122,13 +122,13 @@
 //! | `summary/cumulative` | exact | -- | A `summary` family of its quantiles, `_sum`, and `_count`. |
 //! | `record/no_recorded_value`, with `bind:` unset | exact | -- | Remote-write writes a flagged `Gauge` or cumulative `Sum` as Prometheus's stale marker, read back flagged; a flagged non-monotonic `Sum`'s goes on a `gauge`, as its value would. |
 //! | `record/no_recorded_value`, otherwise | skipped | `logit.output.metrics.skipped{reason=no_recorded_value}` | A point flagged as holding no recorded value isn't exposed. |
-//! | `record/no_recorded_value_delta_sum`, with `bind:` unset | degraded | -- | Remote-write writes a flagged delta `Sum` as a stale marker, its temporality ignored, since a marker holds no reading to be delta about: a monotonic one on a `counter`, read back as a flagged cumulative counter, uncounted, and a non-monotonic one on a `gauge`, counted `logit.output.metrics.degraded{metric_kind=non_monotonic_sum}`. An unflagged delta `Sum` is dropped. |
+//! | `record/no_recorded_value_delta_sum`, with `bind:` unset | degraded | `logit.output.metrics.degraded` | Remote-write writes a flagged delta `Sum` as a stale marker, its temporality ignored, since a marker holds no reading to be delta about: a monotonic one on a `counter`, read back as a flagged cumulative counter, counted `logit.output.metrics.degraded{metric_kind=delta_sum}`, and a non-monotonic one on a `gauge`, counted `logit.output.metrics.degraded{metric_kind=non_monotonic_sum}`. An unflagged delta `Sum` is dropped. |
 //! | `record/no_recorded_value_delta_sum`, otherwise | skipped | `logit.output.metrics.skipped{reason=no_recorded_value}` | A point flagged as holding no recorded value isn't exposed. |
 //! | `record/no_recorded_value_other_kind` | skipped | `logit.output.metrics.skipped{reason=no_recorded_value}` | A flagged record of a kind other than `Gauge` or `Sum` isn't written in either mode. It would be several series, and the flag doesn't say which of them existed, so a stale marker would name a series that may never have been sent. |
 //! | `record/service_check` | exact | -- | The status gauge; the check's carriers aren't labels. |
-//! | `record/name_unsafe` | normalized | `name_sanitized` | A name is forced into `[a-zA-Z_:][a-zA-Z0-9_:]*`, each other character `_`, so the record reads back under the sanitized name, uncounted. |
-//! | `record/exemplar_key_unsafe` | normalized | `name_sanitized` | An exemplar's attribute key is written as a label name forced into `[a-zA-Z_][a-zA-Z0-9_]*`, each other character `_`, as a series label's is, so the exemplar reads back under the sanitized key, uncounted. |
-//! | `record/exemplar_key_unsafe_histogram` | normalized | `name_sanitized` | An exemplar's attribute key is written as a label name forced into `[a-zA-Z_][a-zA-Z0-9_]*`, each other character `_`, as a series label's is, so the exemplar reads back on its bucket under the sanitized key, uncounted. |
+//! | `record/name_unsafe` | normalized | `name_sanitized`; `logit.output.metrics.normalized{reason=name_sanitized}` | A name is forced into `[a-zA-Z_:][a-zA-Z0-9_:]*`, each other character `_`, so the record reads back under the sanitized name, counted once per record it renames. Two names that sanitize onto one in a batch keep one family, the other counted `logit.output.metrics.dropped{reason=name_collision}`; across batches they merge into one series, uncounted. |
+//! | `record/exemplar_key_unsafe` | normalized | `name_sanitized`; `logit.output.labels.normalized{reason=name_sanitized}` | An exemplar's attribute key is written as a label name forced into `[a-zA-Z_][a-zA-Z0-9_]*`, each other character `_`, as a series label's is, so the exemplar reads back under the sanitized key, counted once per key it renames. |
+//! | `record/exemplar_key_unsafe_histogram` | normalized | `name_sanitized`; `logit.output.labels.normalized{reason=name_sanitized}` | An exemplar's attribute key is written as a label name forced into `[a-zA-Z_][a-zA-Z0-9_]*`, each other character `_`, as a series label's is, so the exemplar reads back on its bucket under the sanitized key, counted once per key it renames. |
 //! | `record/sample_rate` | exact | -- | Each value is weighted by its inverse rate in the sketch the `samples` row describes. |
 //! | `record/superseded`, with `bind:` unset | exact | -- | Remote-write sends each sample with its own timestamp. |
 //! | `record/superseded`, otherwise | skipped | uncounted | The exposition registry holds one sample per series, so a later record of the series replaces an earlier one before a scrape reads it, uncounted. |
@@ -137,12 +137,12 @@
 //! | `record/same_millisecond`, with `bind:` unset | dropped | `logit.output.metrics.degraded{reason=sub_ms_collapsed}` | A remote-write sample's timestamp is in milliseconds, and one series can't hold two samples at one timestamp, so the later reading wins and the earlier is dropped, counted under a `degraded` series. |
 //! | `record/same_millisecond`, otherwise | skipped | uncounted | The exposition registry holds one sample per series, so the later point replaces this one, uncounted. |
 //! | `record/non_finite` | exact | -- | `NaN`, `+Inf`, or `-Inf`, as the sample. |
-//! | `log/dogstatsd_event` | skipped | uncounted | A log has no Prometheus form and isn't written, uncounted. |
-//! | `log/plain` | skipped | uncounted | A log has no Prometheus form and isn't written, uncounted. |
-//! | `span/alone` | skipped | uncounted | A span has no Prometheus form and isn't written, uncounted. |
+//! | `log/dogstatsd_event` | skipped | `logit.output.events.skipped{reason=no_metrics}` | A log has no Prometheus form and isn't written. |
+//! | `log/plain` | skipped | `logit.output.events.skipped{reason=no_metrics}` | A log has no Prometheus form and isn't written. |
+//! | `span/alone` | skipped | `logit.output.events.skipped{reason=no_metrics}` | A span has no Prometheus form and isn't written. |
 //! | `span/no_wire_form` | exact | -- | Nothing beyond `span/alone`'s outcome. |
-//! | `event/attributes_only` | skipped | uncounted | An event with no metric, log, or span has no sample and isn't written, uncounted. |
-//! | `event/string_only` | skipped | uncounted | An InfluxDB point whose fields are all strings has no metric, so it has no sample and isn't written, uncounted. |
+//! | `event/attributes_only` | skipped | `logit.output.events.skipped{reason=no_metrics}` | An event with no metric, log, or span has no sample and isn't written. |
+//! | `event/string_only` | skipped | `logit.output.events.skipped{reason=no_metrics}` | An InfluxDB point whose fields are all strings has no metric, so it has no sample and isn't written. |
 //!
 //! Per field of a record that reaches the wire, attribute shape, and payload beside metrics:
 //!
@@ -151,24 +151,25 @@
 //! | `record/unit`, with `bind:` unset | exact | -- | Remote-write carries the unit in its metadata. |
 //! | `record/unit`, otherwise | lost | `logit.output.metrics.degraded{reason=unit_not_suffix}` | OpenMetrics writes `# UNIT` only when `_<unit>` ends the family name; otherwise it's left off, counted. |
 //! | `record/description` | exact | -- | The family's `# HELP` line. |
-//! | `record/start_timestamp` | lost | uncounted | OpenMetrics' `_created` sample, written for a counter, histogram, or summary; a gauge's start time is left off, uncounted. |
+//! | `record/start_timestamp` | lost | structural | OpenMetrics' `_created` sample, written for a counter, histogram, or summary; a gauge has no `_created`, so its start time is left off. |
 //! | `record/exemplars` | lost | `logit.output.metrics.degraded{reason=exemplar_omitted}` | In OpenMetrics, on a counter's `_total` line or the bucket line its value falls in, at most one per line. One with no line to sit on, such as a gauge's, or one over the 128-code-point label budget, on either wire, is left off, counted. |
 //! | `record/unit_on_distribution`, with `bind:` unset | exact | -- | Remote-write carries the unit in its metadata. |
 //! | `record/unit_on_distribution`, otherwise | lost | `logit.output.metrics.degraded{reason=unit_not_suffix}` | OpenMetrics writes `# UNIT` only when `_<unit>` ends the family name; otherwise it's left off, counted. |
 //! | `record/exemplars_on_summary` | lost | `logit.output.metrics.degraded{reason=exemplar_omitted}` | A summary has no `_total` or bucket line for an exemplar to sit on, so its exemplars are left off, counted. |
-//! | `record/min_max` | lost | uncounted | A histogram's `min` and `max` have no Prometheus series and aren't written, uncounted. |
-//! | `attributes/string_value` | normalized | `label_sanitized` | A label; its name is forced into `[a-zA-Z_][a-zA-Z0-9_]*`, so a key holding `.` or another character reads back under the sanitized name. |
-//! | `attributes/bool_value` | normalized | `stringified` | A label of `true` or `false`, read back as the string. |
-//! | `attributes/number_value` | normalized | `stringified` | A label of the number's decimal text, read back as the string. |
+//! | `record/min_max` | lost | structural | A histogram's `min` and `max` have no Prometheus series, so they aren't written. |
+//! | `attributes/string_value` | normalized | `label_sanitized`; `logit.output.labels.normalized{reason=name_sanitized}` | A label; its name is forced into `[a-zA-Z_][a-zA-Z0-9_]*`, so a key holding `.` or another character reads back under the sanitized name, counted once per label it renames. |
+//! | `attributes/bool_value` | normalized | `stringified`; `logit.output.labels.normalized{reason=name_sanitized}` | A label of `true` or `false`, read back as the string. A name outside the label-name grammar is sanitized, counted once per label it renames. |
+//! | `attributes/number_value` | normalized | `stringified`; `logit.output.labels.normalized{reason=name_sanitized}` | A label of the number's decimal text, read back as the string. A name outside the label-name grammar is sanitized, counted once per label it renames. |
 //! | `attributes/array_value` | normalized | `multi_value`; `logit.output.labels.normalized{reason=multi_value}` | A label set is a map, so only the last representable element is written, counted. |
 //! | `attributes/map_value` | lost | `logit.output.labels.omitted{reason=unrepresentable}` | A map has no label form and is left off, counted. |
 //! | `attributes/bytes_value` | lost | `logit.output.labels.omitted{reason=unrepresentable}` | A bytes value has no label form and is left off, counted. |
 //! | `attributes/timestamp_value` | lost | `logit.output.labels.omitted{reason=unrepresentable}` | A timestamp value has no label form and is left off, counted. |
-//! | `attributes/private_carrier` | normalized | `dialect` | The family type and timestamp carriers are consumed into the wire form and a scrape stamps them back; OpenMetrics has no `untyped`, so that type reads back as `unknown`. Remote-write gives every sample a timestamp, so prometheus_in stamps no timestamp carrier. The resource's `_logit.prometheus.target` isn't written: a scrape of prometheus_out stamps its own URL, and the original target survives only as the `instance` label. |
-//! | `attributes/foreign_carrier` | lost | uncounted | Another protocol's `_logit.` carrier isn't a label and is left off, uncounted. |
-//! | `attributes/resource_attribute` | normalized | `resource_merged` | A label, the event's value winning on a shared key, read back as an event attribute. |
-//! | `attributes/scope` | lost | uncounted | Prometheus has no instrumentation scope; it isn't written or counted. |
-//! | `attributes/datadog_carrier_log` | lost | uncounted | Another protocol's `_logit.` carrier isn't a label and is left off, uncounted. |
+//! | `attributes/private_carrier` | normalized | `dialect` | The family type and timestamp carriers are consumed into the wire form and a scrape stamps them back; OpenMetrics has no `untyped`, so that type reads back as `unknown`. Remote-write gives every sample a timestamp, so prometheus_in stamps no timestamp carrier; the sample's own timestamp reads back unchanged. |
+//! | `attributes/prometheus_target` | normalized | `retargeted` | The resource's `_logit.prometheus.target` isn't written. A scrape of prometheus_out stamps prometheus_out's own URL, and a remote-write receiver stamps none. Only the original target's host:port survives, as the `instance` label; its scheme and path are lost. |
+//! | `attributes/foreign_carrier` | lost | structural | Another protocol's `_logit.` carrier is private and isn't a label, so it's left off. |
+//! | `attributes/resource_attribute` | normalized | `resource_merged`; `logit.output.labels.normalized{reason=name_sanitized}` | A label, the event's value winning on a shared key, read back as an event attribute. A name outside the label-name grammar is sanitized, counted once per label it renames. |
+//! | `attributes/scope` | lost | structural | Prometheus has no instrumentation scope, so none is written. |
+//! | `attributes/datadog_carrier_log` | lost | structural | Another protocol's `_logit.` carrier is private and isn't a label, so it's left off. |
 //! | `attributes/no_host` | exact | -- | A record with no host leaves with none. |
 //! | `log/beside_metrics` | lost | uncounted | A log on an event that carries metrics is left off while the metrics are written, uncounted. |
 //! | `span/beside_metrics` | lost | uncounted | A span on an event that carries metrics is left off while the metrics are written, uncounted. |
@@ -183,10 +184,12 @@
 //! | a `Sum` or `Gauge` value, or an exemplar's value, of `I64`/`U64`/`Bool` | the sample's double, on both wires: an integer's nearest `f64`, a `Bool` `1` or `0`, counted `logit.output.metrics.normalized{reason="bool_value"}` |
 //! | `Distribution(sketch)` | `summary` of [`DISTRIBUTION_QUANTILES`] + `_sum` + `_count`; `_sum` is [`DdSketch::sum`], exact unlike a quantile (approximate only when [`DdSketch::stats_exact`] is `false`, i.e. the sketch's stats were derived from its bins) -- `logit.output.metrics.degraded{metric_kind="distribution"}` |
 //! | a `Histogram` bound | sorted ascending, equal bounds merged into one `le`; a `NaN` bound has no `le` bucket, its count reaching only `+Inf` and `_count` -- `logit.output.metrics.degraded{reason="non_finite_component"}`, once per record. `-Inf` is an ordinary bound, `le="-Inf"` |
+//! | an event with no metric record (a log, a span, or neither) | nothing -- `logit.output.events.skipped{reason="no_metrics"}` |
+//! | a flagged delta monotonic `Sum` under [`PrometheusEncoder::with_stale_markers`]`(true)` | a stale marker on a `counter`, which reads back as a cumulative counter -- `logit.output.metrics.degraded{metric_kind="delta_sum"}`; a flagged non-monotonic one is a `gauge`'s marker, `{metric_kind="non_monotonic_sum"}` |
 //! | `Event::timestamp` | emitted only when `_logit.prometheus.timestamp: true` is present (consumed) -- or on every series, marker or not, under [`PrometheusEncoder::with_timestamps_always`]`(true)`, which is what a transport with no way to omit a timestamp needs |
 //! | labels | `Value::Str/I64/U64/F64/Bool` stringified; `Null/Bytes/Timestamp/Map` dropped -- `logit.output.labels.omitted{reason="unrepresentable"}`. An `Array` (a repeated DogStatsD tag key, `crate::statsd::decode::insert_tags`) renders its **last** representable element -- a Prometheus label set is a map, so there is no multi-value label -- counted `logit.output.labels.normalized{reason="multi_value"}`; an empty or entirely unrepresentable one stays on the `omitted{reason="unrepresentable"}` path |
-//! | names | sanitized ([`sanitize_metric_name`], [`sanitize_label_name`]); labels are ordered and collision-checked on their **rendered** names, and on a collision the one whose *original* attribute name sorts first wins -- `logit.output.labels.omitted{reason="collision"}`; a label sanitizing onto a generated one (`le` on a histogram, `quantile` on a summary) is omitted -- `logit.output.labels.omitted{reason="reserved"}`. An exemplar's attribute keys follow the same rule, and one sanitizing onto the `trace_id`/`span_id` its trace is written as is `reserved` |
-//! | two names sanitizing onto one wire name | the family whose *model* name sorts first is exposed, the rest are **dropped** -- `logit.output.metrics.dropped{reason="name_collision"}`. Both cannot be exposed: a second `# TYPE` line for one name makes Prometheus reject the whole scrape, so one clash would poison every other metric in the body. The tie-break is on model names, which means a name that needed no sanitizing can lose to one that did (`a.b` sorts before `a_b`) -- deterministic and counted, but worth knowing before reading it as a bug |
+//! | names | sanitized ([`sanitize_metric_name`], [`sanitize_label_name`]), each record written under a rewritten name counted `logit.output.metrics.normalized{reason="name_sanitized"}` and each label, a written exemplar's included, `logit.output.labels.normalized{reason="name_sanitized"}`; labels are ordered and collision-checked on their **rendered** names, and on a collision the one whose *original* attribute name sorts first wins -- `logit.output.labels.omitted{reason="collision"}`; a label sanitizing onto a generated one (`le` on a histogram, `quantile` on a summary) is omitted -- `logit.output.labels.omitted{reason="reserved"}`. An exemplar's attribute keys follow the same rule, and one sanitizing onto the `trace_id`/`span_id` its trace is written as is `reserved` |
+//! | two names sanitizing onto one wire name | within one batch, the family whose *model* name sorts first is exposed, the rest are **dropped** -- `logit.output.metrics.dropped{reason="name_collision"}`. Both cannot be exposed: a second `# TYPE` line for one name makes Prometheus reject the whole scrape, so one clash would poison every other metric in the body. The tie-break is on model names, which means a name that needed no sanitizing can lose to one that did (`a.b` sorts before `a_b`) -- deterministic and counted, but worth knowing before reading it as a bug. **Across batches nothing resolves it**: the registry keys a family by its wire name, and a receiver a series by its labels, so `a.b` in one batch and `a_b` in the next merge into one series, uncounted beyond the rewrite's `name_sanitized` (`docs/known-gaps/prometheus.md`) |
 //! | `unit` / `description` | `# UNIT` (OM only, and only when `_<unit>` suffixes the family name and the unit is `[a-zA-Z0-9_]+` -- the OpenMetrics spec requires it and Prometheus's parser fails the entire body otherwise; dropped counted `logit.output.metrics.degraded{reason="unit_not_suffix"}`) / `# HELP` |
 //! | two families whose `# TYPE` lines carry one name | one is written, the other's series **dropped**, `logit.output.metrics.dropped{reason="name_collision"}` -- see the normalization list below |
 //! | two records, one name, different family types | the first record's type wins, the rest are **dropped**, `logit.output.metrics.dropped{reason="type_conflict"}` -- one name cannot carry two `# TYPE` lines |
@@ -749,16 +752,35 @@ impl PrometheusEncoder {
         self.telemetry.count("logit.output.metrics.degraded", 1.0, &[("reason", reason)]);
     }
 
+    /// `logit.output.events.skipped{reason}`: an event the encoder wrote nothing for, once per
+    /// event. The one reason is `no_metrics`: a log, a span, or neither, with no metric record.
+    fn event_skipped(&self, reason: &'static str) {
+        self.telemetry.count("logit.output.events.skipped", 1.0, &[("reason", reason)]);
+    }
+
+    /// `logit.output.metrics.normalized{reason="name_sanitized"}`, `n` records written under a
+    /// name [`sanitize_metric_name`] rewrote.
+    fn names_sanitized(&self, n: usize) {
+        if n > 0 {
+            self.telemetry.count(
+                "logit.output.metrics.normalized",
+                n as f64,
+                &[("reason", "name_sanitized")],
+            );
+        }
+    }
+
     fn label_omitted(&self, reason: &'static str) {
         self.telemetry.count("logit.output.labels.omitted", 1.0, &[("reason", reason)]);
     }
 
     /// `logit.output.labels.normalized{reason}` -- a label that reached the wire, but not in the
-    /// form the model held it. The one reason is `multi_value`: a `Value::Array` attribute
-    /// collapsed to its last representable element by [`build_labels`], because a Prometheus label
-    /// set is a map and has no multi-value label at all.
+    /// form the model held it: `name_sanitized`, a series or exemplar label whose name
+    /// [`sanitize_label_name`] rewrote, or `multi_value`, a `Value::Array` attribute collapsed to
+    /// its last representable element by [`build_labels`], because a Prometheus label set is a map
+    /// and has no multi-value label at all.
     ///
-    /// **This reason is lossy**, unlike every other `*.normalized` reason in
+    /// **`multi_value` is lossy**, unlike every other `*.normalized` reason in
     /// `docs/design/internal-telemetry.md`: those are a lossless-but-different rendering of the
     /// same information, whereas this discards the non-last elements outright. It is `normalized`
     /// rather than `dropped` because the label itself survives and the series still exposes -- but
@@ -988,6 +1010,9 @@ pub fn events_to_families<'a>(
     // the whole scrape, so one naming clash would poison every other metric in the body.
     let mut families: BTreeMap<String, FamilyEntry> = BTreeMap::new();
     for (resource, event) in events {
+        if event.metrics.is_empty() {
+            encoder.event_skipped("no_metrics");
+        }
         for record in &event.metrics {
             let stale = record.is_no_recorded_value();
             if stale && !encoder.stale_markers {
@@ -1004,7 +1029,8 @@ pub fn events_to_families<'a>(
             // Borrows `name` whenever it already conforms, which is nearly always -- one allocation
             // per *family*, not per point, and only for a name that has to change.
             let key = sanitize_metric_name(name);
-            let labels = build_labels(resource, event, kind, encoder);
+            let (labels, mut counts) = build_labels(resource, event, kind, encoder);
+            counts.renamed = usize::from(matches!(key, Cow::Owned(_)));
             let timestamp = if encoder.timestamps_always {
                 Some(event.timestamp)
             } else {
@@ -1037,13 +1063,13 @@ pub fn events_to_families<'a>(
                         // one `# TYPE` line per name, so the second one has nowhere to go.
                         encoder.not_encoded(NotEncoded::TypeConflict);
                     } else {
-                        existing.family.series.push(series.take().expect("built above"));
+                        existing.series.push((series.take().expect("built above"), counts));
                     }
                 }
                 // A different model name sanitizing onto the same wire name: the one whose model
                 // name sorts first wins, so the outcome is the data's, not the arrival order's.
                 Some(existing) if name < existing.origin => {
-                    displaced = existing.family.series.len().max(1);
+                    displaced = existing.series.len().max(1);
                     start_family = true;
                 }
                 Some(_) => encoder.not_encoded(NotEncoded::NameCollision),
@@ -1061,12 +1087,13 @@ pub fn events_to_families<'a>(
                 key.clone(),
                 FamilyEntry {
                     origin: name,
+                    series: vec![(series, counts)],
                     family: MetricFamily {
                         name: key,
                         kind,
                         help: record.description.map(|s| resolve(s).to_string()),
                         unit: record.unit.map(|s| resolve(s).to_string()),
-                        series: vec![series],
+                        series: Vec::new(),
                     },
                 },
             );
@@ -1075,19 +1102,31 @@ pub fn events_to_families<'a>(
 
     // The map is keyed by the emitted name, so draining it in key order is already the canonical
     // family ordering -- no re-sort needed.
-    let mut out: Vec<MetricFamily> = families.into_values().map(|entry| entry.family).collect();
-    for family in &mut out {
+    let mut kept = SeriesCounts::default();
+    let mut out: Vec<MetricFamily> = Vec::with_capacity(families.len());
+    for FamilyEntry { mut family, mut series, .. } in families.into_values() {
         // Stable, so the last of a run of equal label sets is the last one pushed -- latest wins,
         // the cumulative-series semantics `prometheus_out`'s registry upsert also uses.
-        family.series.sort_by(|a, b| a.labels.cmp(&b.labels));
-        let mut deduped: Vec<Series> = Vec::with_capacity(family.series.len());
-        for series in family.series.drain(..) {
-            match deduped.last_mut() {
-                Some(last) if last.labels == series.labels => *last = series,
-                _ => deduped.push(series),
+        series.sort_by(|a, b| a.0.labels.cmp(&b.0.labels));
+        family.series = Vec::with_capacity(series.len());
+        let mut series = series.into_iter().peekable();
+        while let Some((one, counts)) = series.next() {
+            if series.peek().is_some_and(|(next, _)| next.labels == one.labels) {
+                continue;
             }
+            kept.add(counts);
+            family.series.push(one);
         }
-        family.series = deduped;
+        out.push(family);
+    }
+    // Counted from the series kept, so a record a collision displaced or a later point of its
+    // series superseded counts only its own fate.
+    encoder.names_sanitized(kept.renamed);
+    for _ in 0..kept.labels_renamed {
+        encoder.label_normalized("name_sanitized");
+    }
+    for _ in 0..kept.multi_value {
+        encoder.label_normalized("multi_value");
     }
     out
 }
@@ -1096,7 +1135,28 @@ pub fn events_to_families<'a>(
 /// resolves a post-sanitization name collision deterministically (see [`events_to_families`]).
 struct FamilyEntry {
     origin: &'static str,
+    /// The family's series with the rewrites each made, moved into `family` once deduplicated.
+    series: Vec<(Series, SeriesCounts)>,
     family: MetricFamily,
+}
+
+/// The rewrites one series made, counted only if the series is written.
+#[derive(Clone, Copy, Default)]
+struct SeriesCounts {
+    /// 1 when [`sanitize_metric_name`] rewrote the record's name.
+    renamed: usize,
+    /// Labels written under a name [`sanitize_label_name`] rewrote.
+    labels_renamed: usize,
+    /// `Value::Array` labels collapsed to their last representable element.
+    multi_value: usize,
+}
+
+impl SeriesCounts {
+    fn add(&mut self, other: SeriesCounts) {
+        self.renamed += other.renamed;
+        self.labels_renamed += other.labels_renamed;
+        self.multi_value += other.multi_value;
+    }
 }
 
 /// One [`MetricRecord`] → its family type and wire point, or `None` for a kind Prometheus can't
@@ -1243,6 +1303,11 @@ fn stale_point(
     let kind = match &record.kind {
         MetricKind::Sum(s) => {
             if s.monotonic {
+                // A marker has no reading to be delta about, so a delta one reads back as a
+                // cumulative counter: a record of another kind.
+                if s.temporality == Temporality::Delta {
+                    encoder.degraded("delta_sum");
+                }
                 FamilyType::Counter
             } else {
                 encoder.degraded("non_monotonic_sum");
@@ -1338,12 +1403,14 @@ pub(crate) fn cumulative_counts(buckets: &[(f64, u64)]) -> (Vec<(f64, u64)>, u64
 /// order: the emitted label set is sorted by the name that appears on the wire, and when two
 /// attributes sanitize onto one label name the one whose *original* attribute name sorts first wins,
 /// so the outcome depends on the data rather than on process-wide interning history.
+///
+/// Also returns the label rewrites it made, for the caller to count once it keeps the series.
 fn build_labels(
     resource: &Resource,
     event: &Event,
     kind: FamilyType,
     encoder: &mut PrometheusEncoder,
-) -> Vec<(String, String)> {
+) -> (Vec<(String, String)>, SeriesCounts) {
     // The label name this family type generates itself, which an attribute must not collide with:
     // a duplicate label name is invalid exposition, not merely confusing.
     let generated = match kind {
@@ -1351,6 +1418,7 @@ fn build_labels(
         FamilyType::Summary => Some("quantile"),
         _ => None,
     };
+    let mut counts = SeriesCounts::default();
     let mut candidates: Vec<(&str, Cow<'_, str>, String)> = Vec::new();
     for (key, value) in logit_core::attrs::merged(resource, event) {
         let key = resolve(key);
@@ -1368,7 +1436,7 @@ fn build_labels(
         let rendered = match value {
             Value::Array(elements) => match elements.iter().rev().find_map(label_value) {
                 Some(last) => {
-                    encoder.label_normalized("multi_value");
+                    counts.multi_value += 1;
                     Some(last)
                 }
                 None => None,
@@ -1393,10 +1461,11 @@ fn build_labels(
             encoder.label_omitted("collision");
             continue;
         }
+        counts.labels_renamed += usize::from(matches!(name, Cow::Owned(_)));
         labels.push((name.into_owned(), value));
     }
     labels.sort_by(|a, b| a.0.cmp(&b.0));
-    labels
+    (labels, counts)
 }
 
 /// A [`Value`] as a Prometheus label value (always a string on the wire), or `None` for the kinds

@@ -1,6 +1,6 @@
 ---
 created: 2026-10-19
-updated: 2026-10-19
+updated: 2026-10-21
 ---
 
 # Transit spec: a mapping table under `spec/transit/` is the canonical statement of every cross-protocol transition, checked by flows and rendered into the docs
@@ -137,7 +137,9 @@ left open:
 - **A sixth class, `lost`, at a second level.** A record's class (`exact`, `normalized`,
   `degraded`, `skipped`, `dropped`) can't say that a gauge reached the wire but its `unit` didn't.
   Rows for a record's own fields and for attribute shapes are field-level, and their class is
-  `exact`, `normalized`, or `lost`, the last naming its counter or saying it's `uncounted`.
+  `exact`, `normalized`, or `lost`, the last naming its counter or saying it's `uncounted` (now
+  `structural`; see the 2026-10-21 note in "Amendment: uncounted losses and cells a sink can't
+  reach").
 - **A cell can depend on the sink's config.** `statsd_out`'s `format:`, `multi_value:`, and
   `relative_gauges:` each change a row's outcome, so a sink's entry in a row may be a list of
   cells, each but the last guarded by a `when:` map of config fields. A column per sink
@@ -163,7 +165,11 @@ The cross-protocol columns settled two more things:
   `prometheus_out` replaces an earlier point of a series without counting it. The table records a
   sink as it behaves, so an uncounted loss needs a cell that says so; refusing the cell would hide
   the loss instead. The check accepts such a cell's class for a record nothing reads back. Each
-  is a finding for the sink, not an endorsement.
+  is a finding for the sink, not an endorsement. [ADR
+  `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md)'s amendment "structural loss has
+  no counter" (2026-10-21) narrows this: a `lost` or `degraded` cell names its counter or is
+  `structural`, a `skipped` or `dropped` one names its counter, and `uncounted` stays only on the
+  rows `crates/logit-cli/src/transit/mapping.rs`'s `UNCOUNTED_ALLOWED` names.
 - **A row may omit a sink's cell when no record is compared against it there**, and
   `mapping.yaml` says why beside the row: `name_unsafe` at a sink that rewrites no name, or a
   field row at a sink that writes the kind only in a lesser form, so the field is never compared.

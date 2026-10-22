@@ -279,11 +279,13 @@
 //!
 //! Plus everything [`DatadogEncoder`] counts itself (`logit.output.metrics.skipped` by
 //! `metric_kind` or `reason`; `metrics.dropped`; `metrics.degraded`; `tags.omitted`;
-//! `spans.degraded`; `stats.*`), which this sink doesn't repeat.
+//! `spans.degraded`; `stats.*`; and `events.skipped{reason="no_payload"}`, an event no route
+//! carries, which the plan finds and counts through the encoder), which this sink doesn't repeat.
 //!
 //! **Once per batch or per attempt** (ADR `sink-send-path-and-attempt-accounting`, decision 1).
 //! What the plan and the encoder decide counts once per batch: `stale`, `too_many_tags`,
-//! `needs_agent_processing`, `not_datadog_origin`, an event too large to send alone, and the
+//! `needs_agent_processing`, `not_datadog_origin`, an event too large to send alone, an event no
+//! route carries (`events.skipped{reason="no_payload"}`), and the
 //! encoder's counters and diagnostics, through handles gated by the sink's `BatchAccounting`. The
 //! plan is unit 0 and each route its own unit, so a route an earlier attempt never reached counts
 //! on the attempt that first encodes it. The transport counters, a series `202`'s `rejected`,
@@ -580,16 +582,28 @@ struct Plan {
     /// Spans the trace route drops, per [`TraceReadiness::drop_reason`].
     needs_agent_processing: usize,
     not_datadog_origin: usize,
+    /// Events no route carries ([`Routing::unrouted`]).
+    unrouted: usize,
 }
 
-/// Each route's items for `batch` (module doc's "Routes"), indexed by `Route as usize`, before
-/// any filter: the routing alone, which [`plan`] filters and [`encode_routes`] encodes.
-fn partition(batch: &EventBatch, histograms: HistogramOptions) -> [Vec<Item>; 8] {
+/// [`partition`]'s result: each route's items, indexed by `Route as usize`, and how many events
+/// took no route, an event with no metric, log, or span.
+struct Routing {
+    routes: [Vec<Item>; 8],
+    unrouted: usize,
+}
+
+/// Each route's items for `batch` (module doc's "Routes"), before any filter: the routing
+/// alone, which [`plan`] filters and [`encode_routes`] encodes.
+fn partition(batch: &EventBatch, histograms: HistogramOptions) -> Routing {
     let resource = &batch.resource;
     let mut routes: [Vec<Item>; 8] = Default::default();
+    let mut unrouted = 0;
     for (index, event) in batch.events.iter().enumerate() {
+        let mut routed = false;
         let mut push = |route: Route, weight: usize| {
             routes[route as usize].push(Item { index, weight });
+            routed = true;
         };
         if is_datadog_stats(resource, event) {
             push(Route::Stats, 1);
@@ -629,8 +643,9 @@ fn partition(batch: &EventBatch, histograms: HistogramOptions) -> [Vec<Item>; 8]
         if event.span.is_some() {
             push(Route::Traces, 1);
         }
+        unrouted += usize::from(!routed);
     }
-    routes
+    Routing { routes, unrouted }
 }
 
 /// Each route's items for `batch` at send time `now`: [`partition`]'s, after the stale filter,
@@ -645,7 +660,9 @@ fn plan(batch: &EventBatch, now: i64, histograms: HistogramOptions) -> Plan {
         Vec::new()
     };
     let mut plan = Plan::default();
-    for (route, items) in ROUTES.into_iter().zip(partition(batch, histograms)) {
+    let routing = partition(batch, histograms);
+    plan.unrouted = routing.unrouted;
+    for (route, items) in ROUTES.into_iter().zip(routing.routes) {
         let r = route as usize;
         for item in items {
             let event = &batch.events[item.index];
@@ -751,7 +768,9 @@ pub struct RouteRequest {
 /// driver) reads them here.
 pub fn encode_routes(encoder: &mut DatadogEncoder, batch: &EventBatch) -> Vec<RouteRequest> {
     let mut out = Vec::new();
-    for (route, items) in ROUTES.into_iter().zip(partition(batch, encoder.histograms())) {
+    let routing = partition(batch, encoder.histograms());
+    encoder.events_without_payload(routing.unrouted);
+    for (route, items) in ROUTES.into_iter().zip(routing.routes) {
         if items.is_empty() {
             continue;
         }
@@ -1003,8 +1022,10 @@ impl DatadogOutput {
         }
     }
 
-    /// Counts what [`plan`] dropped, per route and reason, and diagnoses the tag-limit drops.
+    /// Counts what [`plan`] dropped, per route and reason, and the events it routed nowhere, and
+    /// diagnoses the tag-limit drops.
     fn count_plan_drops(&mut self, plan: &Plan) {
+        self.encoder.events_without_payload(plan.unrouted);
         for route in ROUTES {
             self.dropped(route, "stale", plan.stale[route as usize]);
             let n = plan.too_many_tags[route as usize];
@@ -1535,7 +1556,7 @@ mod tests {
     #[test]
     fn a_histogram_weighs_the_series_and_sketches_it_writes() {
         let weights = |options| {
-            let routes = partition(&batch(vec![histogram(NOW)]), options);
+            let routes = partition(&batch(vec![histogram(NOW)]), options).routes;
             (weight(&routes[Route::Series as usize]), weight(&routes[Route::Sketches as usize]))
         };
         assert_eq!(weights(HistogramOptions::default()), (0, 1));
@@ -2494,10 +2515,19 @@ mod tests {
             oversized_sketch(NOW),
             log_with_reserved_key(NOW, "kept"),
             span(3, 5, None, &[("http.route", Value::str("/"))]),
+            bool_false_gauge(),
+            Event::empty(NOW, AttrMap::new()),
         ])
     }
 
-    const ENCODE_SIDE: [SumSeries<'static>; 8] = [
+    /// A gauge tagged `off: false`, which has no Datadog tag form.
+    fn bool_false_gauge() -> Event {
+        let mut attrs = AttrMap::new();
+        attrs.insert("off", Value::Bool(false));
+        Event::metric(NOW, attrs, MetricRecord::new(intern("flags"), MetricKind::gauge(1.0)))
+    }
+
+    const ENCODE_SIDE: [SumSeries<'static>; 10] = [
         (RECORDS_DROPPED, &[("route", "series"), ("reason", "stale")]),
         (RECORDS_DROPPED, &[("route", "series"), ("reason", "too_many_tags")]),
         ("logit.component.diagnostics", &[("key", "too_many_tags")]),
@@ -2506,7 +2536,61 @@ mod tests {
         ("logit.output.metrics.dropped", &[("reason", "oversized_sketch")]),
         ("logit.component.diagnostics", &[("key", "oversized_sketch")]),
         ("logit.output.tags.omitted", &[("reason", "reserved_key")]),
+        ("logit.output.tags.omitted", &[("reason", "unrepresentable")]),
+        ("logit.output.events.skipped", &[("reason", "no_payload")]),
     ];
+
+    /// A `samples` record at rate 0.8, which rounds to weight 1, counts `sample_rate_rounded`
+    /// once per batch however many attempts its route takes, and one at rate 1 or 0.5 counts
+    /// nothing under that reason.
+    #[tokio::test]
+    async fn a_rate_rounded_to_weight_one_counts_once_per_batch() {
+        const DISTRIBUTION: &str = "/api/v1/distribution_points";
+        let at = |rate: f64| {
+            let mut samples = Samples::new([1.0, 2.0]);
+            samples.sample_rate = rate;
+            metric(NOW, MetricKind::Samples(samples))
+        };
+        let batches = || vec![batch(vec![at(0.8), at(1.0), at(0.5)])];
+        let (single, _) =
+            run_dd(|p, _| accepted(p), batches(), at_least_once(), instrumented).await;
+        let (retried, log) = run_dd(busy_once, batches(), at_least_once(), instrumented).await;
+        assert_eq!(recorded_paths(&log), [DISTRIBUTION, DISTRIBUTION]);
+        let rounded = [("reason", "sample_rate_rounded")];
+        assert_eq!(sum_of(&single, "logit.output.metrics.degraded", &rounded), 1.0);
+        let encode_side: [SumSeries<'static>; 2] = [
+            ("logit.output.metrics.degraded", &[("reason", "sample_rate_rounded")]),
+            ("logit.output.metrics.degraded", &[("reason", "sample_rate_expanded")]),
+        ];
+        assert_counted_once_per_batch(&single, &retried, &encode_side, &PER_ATTEMPT);
+    }
+
+    /// A delta summary, written as quantile gauges and `count` points, counts
+    /// `metrics.degraded{metric_kind="summary"}` once per batch however many attempts it takes.
+    #[tokio::test]
+    async fn a_delta_summary_counts_its_lesser_form_once_per_batch() {
+        let summary = || {
+            metric(
+                NOW,
+                MetricKind::Summary(logit_core::Summary {
+                    quantiles: vec![(0.5, 1.0)],
+                    count: 2,
+                    sum: 3.0,
+                    temporality: Temporality::Delta,
+                }),
+            )
+        };
+        let batches = || vec![batch(vec![summary()])];
+        let (single, _) =
+            run_dd(|p, _| accepted(p), batches(), at_least_once(), instrumented).await;
+        let (retried, log) = run_dd(busy_once, batches(), at_least_once(), instrumented).await;
+        assert_eq!(recorded_paths(&log), [SERIES, SERIES]);
+        let kind = [("metric_kind", "summary")];
+        assert_eq!(sum_of(&single, "logit.output.metrics.degraded", &kind), 1.0);
+        let encode_side: [SumSeries<'static>; 1] =
+            [("logit.output.metrics.degraded", &[("metric_kind", "summary")])];
+        assert_counted_once_per_batch(&single, &retried, &encode_side, &PER_ATTEMPT);
+    }
 
     /// Beyond `logit.output.requests`, what a retried batch counts once per attempt here.
     const PER_ATTEMPT: [SumSeries<'static>; 2] = [(REQUEST_BYTES, &[]), (RECORDS, &[])];

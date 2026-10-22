@@ -1,4 +1,10 @@
 {
+  "pickle-p0": {"events": [
+    {"timestamp":"2023-11-14T22:13:20.000000000Z","metrics":[{"name":"logit-fixture.pickle.int_value.value","kind":"gauge","value":42.0}],"attributes":{"_logit.influxdb.measurement":"logit-fixture.pickle.int_value"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}}},
+    {"timestamp":"2023-11-14T22:13:21.500000000Z","metrics":[{"name":"logit-fixture.pickle.float_value.value","kind":"gauge","value":12.75}],"attributes":{"_logit.influxdb.measurement":"logit-fixture.pickle.float_value"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}}},
+    {"timestamp":"2023-11-14T22:13:22.000000000Z","metrics":[{"name":"logit-fixture.pickle.negative_value.value","kind":"gauge","value":-17.5}],"attributes":{"_logit.influxdb.measurement":"logit-fixture.pickle.negative_value"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}}},
+    {"timestamp":"2023-11-14T22:13:23.000000000Z","metrics":[{"name":"logit-fixture.pickle.large_value.value","kind":"gauge","value":1234567.0}],"attributes":{"_logit.influxdb.measurement":"logit-fixture.pickle.large_value"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}}}
+  ], "counters": {}},
   "pickle-p2": {"events": [
     {"timestamp":"2023-11-14T22:13:20.000000000Z","metrics":[{"name":"logit-fixture.pickle.int_value.value","kind":"gauge","value":42.0}],"attributes":{"_logit.influxdb.measurement":"logit-fixture.pickle.int_value"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}}},
     {"timestamp":"2023-11-14T22:13:21.500000000Z","metrics":[{"name":"logit-fixture.pickle.float_value.value","kind":"gauge","value":12.75}],"attributes":{"_logit.influxdb.measurement":"logit-fixture.pickle.float_value"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}}},
@@ -42,6 +48,7 @@
     {"timestamp":"2027-01-15T07:59:55.000000000Z","metrics":[{"name":"sensor.delta.value","kind":"gauge","value":-2.75}],"attributes":{"_logit.influxdb.measurement":"sensor.delta"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}}},
     {"timestamp":"2027-01-15T07:59:56.000000000Z","metrics":[{"name":"servers.web-1.disk.value","kind":"gauge","value":42.0}],"attributes":{"_logit.influxdb.measurement":"servers.web-1.disk"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}}},
     {"timestamp":"2027-01-15T07:59:57.000000000Z","metrics":[{"name":"café.temperature.value","kind":"gauge","value":21.5}],"attributes":{"_logit.influxdb.measurement":"café.temperature"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}}},
+    {"timestamp":"2027-01-15T07:59:58.000000000Z","metrics":[{"name":"app/web\\svc.value","kind":"gauge","value":7.0}],"attributes":{"_logit.influxdb.measurement":"app/web\\svc","dc!zone":"a","pri^o":"~low"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}}},
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"query.time.value","kind":"gauge","value":3.5}],"attributes":{"_logit.influxdb.measurement":"query.time","expr":"a=b","pattern":"x~y"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}}}
   ], "counters": {}},
   "write-graphite": {"events": [

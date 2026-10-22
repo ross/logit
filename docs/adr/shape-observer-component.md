@@ -1,6 +1,6 @@
 ---
 created: 2026-09-20
-updated: 2026-10-18
+updated: 2026-10-21
 ---
 
 # `shape`: an observer component that turns each event into measurements of its own shape
@@ -90,7 +90,8 @@ by the most common one and five key-sets — are gauges emitted at `flush`, cumu
 key-set's identity is a hash of the event's `Symbol` sequence; `AttrMap` is sorted by `Symbol`, so
 that costs no sort and no allocation. Both tables are capped (`max_tracked_keys`,
 `max_tracked_keysets`); past a cap, new entries are counted as overflow rather than tracked, and a
-`tracking_overflow` gauge says so.
+`tracking_overflow` gauge says so. A cap of `0` is legal: that table tracks nothing, and every
+entry counts as overflow.
 
 What `shape` calls a batch is whatever its upstream delivered: an input's accumulator flush by
 default, the wire's own grouping when that input runs `receive.batch_max_events: 1`, and always the
@@ -153,3 +154,12 @@ A native transform can now emit extra events through `Transform::process_into`
 ([ADR `transform-fan-out`](transform-fan-out.md)), so "never two" no longer holds for every
 transform. `process` still forwards or discards the one event it's given, and `shape` emits no
 extra events.
+
+## Amendment: a tracking cap of `0` is legal; rule 58 is retired (2026-10-21)
+
+Graph rule 58 rejected a `max_tracked_keys` or `max_tracked_keysets` of `0`. It's gone. A zero cap
+tracks nothing: its distinct-count gauge reads `0`, `logit.shape.tracking_overflow` reads `1`, and
+every key or key-set it meets counts in `logit.transform.keys.untracked` or
+`logit.transform.keysets.untracked`. Validation rejects a config only when it can't run, or when it
+would lose or duplicate data the operator didn't ask to lose or duplicate; a pointless config runs
+as written. The number 58 is not reused, so the other rules keep theirs.

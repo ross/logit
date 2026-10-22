@@ -121,6 +121,24 @@ pub struct EncodeStats {
     /// A series with no free timestamp slot left before `i64::MAX`:
     /// `metrics.dropped{reason="timestamp_overflow"}`.
     pub dropped_timestamp_overflow: usize,
+    /// A record written as fields of another shape, once per line written, by kind:
+    /// `metrics.degraded{metric_kind="distribution"|"samples"|"histogram"|"summary"|"set"}`. A
+    /// sketch or a sample list leaves as quantile fields, a histogram or summary as Telegraf's
+    /// fields, and a set as its estimate; each reads back as gauges.
+    pub degraded_distribution: usize,
+    pub degraded_samples: usize,
+    pub degraded_histogram: usize,
+    pub degraded_summary: usize,
+    pub degraded_set: usize,
+    /// A `Sum` written as a plain `value` field, its temporality and monotonicity gone, which
+    /// reads back as a gauge, once per record written, by shape:
+    /// `metrics.degraded{metric_kind="monotonic_delta_sum"|"non_monotonic_delta_sum"|"cumulative_sum"}`.
+    pub degraded_monotonic_delta_sum: usize,
+    pub degraded_non_monotonic_delta_sum: usize,
+    pub degraded_cumulative_sum: usize,
+    /// An event with no metric record and no `_logit.influxdb.measurement` carrier, which has
+    /// nothing to write: `events.skipped{reason="no_metrics"}`.
+    pub skipped_no_metrics: usize,
 }
 
 /// Encodes an [`EventBatch`] as InfluxDB line protocol.
@@ -220,7 +238,9 @@ impl Encoder for InfluxLineEncoder {
         for event in &batch.events {
             let carrier = carrier_measurement(event, *measurement_key);
             if event.metrics.is_empty() && carrier.is_none() {
-                continue; // a log-only, span-only, or empty event: nothing to encode
+                // A log-only, span-only, or empty event: nothing to encode.
+                ctx.stats.skipped_no_metrics += 1;
+                continue;
             }
             // Tags depend only on resource and event attributes, so render once per event.
             render_tag_suffix(tag_suffix, scratch, &batch.resource, event, ctx.stats);
@@ -259,6 +279,25 @@ fn carrier_field<'a>(metric: &MetricRecord, measurement: &str) -> Option<(&'a st
         .strip_prefix('.')
         .filter(|key| !key.is_empty())?;
     Some((key, value))
+}
+
+/// A `Sum`'s shape, as `metrics.degraded{metric_kind}` names it when the sum leaves as a plain
+/// field: the names `statsd_out` and `graphite_out` count the same loss under.
+#[derive(Clone, Copy)]
+enum SumShape {
+    MonotonicDelta,
+    NonMonotonicDelta,
+    Cumulative,
+}
+
+impl SumShape {
+    fn of(sum: &logit_core::Sum) -> Self {
+        match (sum.temporality, sum.monotonic) {
+            (logit_core::Temporality::Delta, true) => Self::MonotonicDelta,
+            (logit_core::Temporality::Delta, false) => Self::NonMonotonicDelta,
+            _ => Self::Cumulative,
+        }
+    }
 }
 
 /// The encoder's per-batch state, borrowed apart so a line can be built while the tag suffix is
@@ -301,8 +340,23 @@ impl Ctx<'_> {
         push_escaped_measurement(self.line, measurement);
         self.line.push_str(tag_suffix);
         // Counted only once the line is written: a line `finish_line` drops is counted there.
-        if self.finish_line(timestamp, 1) && matches!(outcome, Fields::Degraded) {
-            self.stats.degraded_non_finite_component += 1;
+        if self.finish_line(timestamp, 1) {
+            if matches!(outcome, Fields::Degraded) {
+                self.stats.degraded_non_finite_component += 1;
+            }
+            match &metric.kind {
+                MetricKind::Sum(sum) => match SumShape::of(sum) {
+                    SumShape::MonotonicDelta => self.stats.degraded_monotonic_delta_sum += 1,
+                    SumShape::NonMonotonicDelta => self.stats.degraded_non_monotonic_delta_sum += 1,
+                    SumShape::Cumulative => self.stats.degraded_cumulative_sum += 1,
+                },
+                MetricKind::Distribution(_) => self.stats.degraded_distribution += 1,
+                MetricKind::Samples(_) => self.stats.degraded_samples += 1,
+                MetricKind::Histogram(_) => self.stats.degraded_histogram += 1,
+                MetricKind::Summary(_) => self.stats.degraded_summary += 1,
+                MetricKind::Set(_) => self.stats.degraded_set += 1,
+                _ => {}
+            }
         }
     }
 
@@ -313,6 +367,8 @@ impl Ctx<'_> {
         self.fields.clear();
         self.deferred.clear();
         let mut written = 0;
+        // Sums by `SumShape`, counted once the line is written.
+        let mut sums = [0usize; 3];
         for metric in &event.metrics {
             if self.skip_no_recorded_value(metric) {
                 continue;
@@ -331,6 +387,9 @@ impl Ctx<'_> {
             }
             self.push_carrier_field(key, FieldValue::Typed(value));
             written += 1;
+            if let MetricKind::Sum(sum) = &metric.kind {
+                sums[SumShape::of(sum) as usize] += 1;
+            }
         }
         for (key, value) in event.attributes.iter() {
             let Some(field) = resolve(key).strip_prefix(FIELD_ATTR_PREFIX) else {
@@ -362,7 +421,12 @@ impl Ctx<'_> {
             self.line.clear();
             push_escaped_measurement(self.line, measurement);
             self.line.push_str(tag_suffix);
-            self.finish_line(event.timestamp, written);
+            if self.finish_line(event.timestamp, written) {
+                self.stats.degraded_monotonic_delta_sum += sums[SumShape::MonotonicDelta as usize];
+                self.stats.degraded_non_monotonic_delta_sum +=
+                    sums[SumShape::NonMonotonicDelta as usize];
+                self.stats.degraded_cumulative_sum += sums[SumShape::Cumulative as usize];
+            }
         }
         for metric in &event.metrics {
             // Flagged records were counted by the pass above.
@@ -1092,7 +1156,7 @@ mod tests {
             "http_req_duration,host=a count=10,sum=4.2,min=0.01,max=2.5,0.1=3,1=8,+Inf=10 \
              1700000000000000000\n"
         );
-        assert_eq!(stats, EncodeStats::default());
+        assert_eq!(stats, EncodeStats { degraded_histogram: 1, ..EncodeStats::default() });
     }
 
     /// The model doesn't promise bound order, so the encoder sorts before accumulating: in wire
@@ -1147,7 +1211,7 @@ mod tests {
     fn a_histogram_with_no_bucket_writes_count_and_inf() {
         let (out, stats) = encode_stats(vec![metric_event("h", histogram(vec![], Some(0.0)), &[])]);
         assert_eq!(out, "h count=0,sum=0,+Inf=0 1700000000000000000\n");
-        assert_eq!(stats, EncodeStats::default());
+        assert_eq!(stats, EncodeStats { degraded_histogram: 1, ..EncodeStats::default() });
     }
 
     /// A non-finite sum is left off the line, and the record counts as degraded once.
@@ -1176,7 +1240,7 @@ mod tests {
         });
         let (out, stats) = encode_stats(vec![metric_event("rpc_latency", kind, &[])]);
         assert_eq!(out, "rpc_latency count=7,sum=3.5,0.5=0.2,0.99=0.9 1700000000000000000\n");
-        assert_eq!(stats, EncodeStats::default());
+        assert_eq!(stats, EncodeStats { degraded_summary: 1, ..EncodeStats::default() });
     }
 
     /// A delta summary writes the same fields: line protocol has no temporality.
@@ -1190,7 +1254,7 @@ mod tests {
         });
         let (out, stats) = encode_stats(vec![metric_event("rpc_latency", kind, &[])]);
         assert_eq!(out, "rpc_latency count=7,sum=3.5,0.5=0.2,0.99=0.9 1700000000000000000\n");
-        assert_eq!(stats, EncodeStats::default());
+        assert_eq!(stats, EncodeStats { degraded_summary: 1, ..EncodeStats::default() });
     }
 
     /// Quantile keys are the raw quantile, so 0.991 and 0.994 don't collide as a rounded
@@ -1239,7 +1303,7 @@ mod tests {
         let (out, stats) =
             encode_stats(vec![metric_event("latency", MetricKind::Distribution(sketch), &[])]);
         assert_eq!(out, "latency count=0,sum=0 1700000000000000000\n");
-        assert_eq!(stats, EncodeStats::default());
+        assert_eq!(stats, EncodeStats { degraded_distribution: 1, ..EncodeStats::default() });
     }
 
     /// Unweighted `Samples` render like a `Distribution` of the same values.
@@ -1349,7 +1413,8 @@ mod tests {
             "got: {out}"
         );
         assert_eq!(rest, "value=1 1700000000000000000\n");
-        assert_eq!(*encoder.stats(), EncodeStats::default(), "carriers are skipped uncounted");
+        let want = EncodeStats { degraded_monotonic_delta_sum: 1, ..EncodeStats::default() };
+        assert_eq!(*encoder.stats(), want, "carriers are skipped uncounted");
     }
 
     /// A private attribute, on the event or the resource, never becomes a tag and is never
@@ -1367,7 +1432,8 @@ mod tests {
         let batch = EventBatch { resource: Arc::new(resource), scope: None, events: vec![event] };
         let out = String::from_utf8(encoder.encode(&batch).unwrap().to_vec()).unwrap();
         assert_eq!(out, "page.views,env=prod value=1 1700000000000000000\n");
-        assert_eq!(*encoder.stats(), EncodeStats::default(), "private keys are skipped uncounted");
+        let want = EncodeStats { degraded_monotonic_delta_sum: 1, ..EncodeStats::default() };
+        assert_eq!(*encoder.stats(), want, "private keys are skipped uncounted");
     }
 
     #[test]

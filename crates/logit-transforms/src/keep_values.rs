@@ -492,4 +492,29 @@ mod tests {
         assert_eq!(counter_value(&events, "logit.transform.values.allowed"), Some(1.0));
         assert_eq!(counter_value(&events, "logit.transform.values.clamped"), Some(1.0));
     }
+
+    #[test]
+    fn nothing_configured_forwards_and_an_empty_allow_list_clamps_every_value() {
+        let resource = default_resource();
+        let mut none = KeepValues::new(vec![], vec![]);
+        let mut event = event_with_attrs(&[("host", Value::str("a"))]);
+        assert!(none.process(&resource, &mut event));
+        assert_eq!(event.attributes.get("host"), Some(&Value::str("a")));
+        assert_eq!(none.map_resource(&resource), None);
+
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("host_clamp", "keep_values", "transform");
+        let mut with_other = allow_with_other("host", &[], "other").with_telemetry(telemetry);
+        let mut event = event_with_attrs(&[("host", Value::str("a"))]);
+        assert!(with_other.process(&resource, &mut event));
+        assert_eq!(event.attributes.get("host"), Some(&Value::str("other")));
+        let events = registry.drain(0);
+        assert_eq!(counter_value(&events, "logit.transform.values.clamped"), Some(1.0));
+        assert_eq!(counter_value(&events, "logit.transform.values.allowed"), None);
+
+        let mut removing = allow_only("host", &[]);
+        let mut event = event_with_attrs(&[("host", Value::str("a"))]);
+        assert!(removing.process(&resource, &mut event));
+        assert_eq!(event.attributes.get("host"), None);
+    }
 }

@@ -38,7 +38,9 @@
     {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"room.temperature.offset","kind":"gauge","value":0.0}],"attributes":{"host":"web-1","room":"lab","service.name":"checkout"}},
     {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"room.temperature.offset","kind":"gauge_delta","delta":-4.5}],"attributes":{"host":"web-1","room":"lab","service.name":"checkout"}},
     {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"system.memory.utilization","kind":"gauge","value":0.625}],"attributes":{"host":"web-1","service.name":"checkout","state":"used"}}
-  ], "counters": {}},
+  ], "counters": {
+    "logit.output.metrics.degraded{component=out,kind=statsd_out,reason=negative_gauge,role=sink}": 1
+  }},
   "gzip": {"events": [
     {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"uploads.completed","kind":"sum","value":5.0,"temporality":"delta","monotonic":true}],"attributes":{"host":"web-1","service.name":"checkout"}}
   ], "counters": {}},

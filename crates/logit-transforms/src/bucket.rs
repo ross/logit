@@ -373,4 +373,14 @@ mod tests {
             "an absent source counts as neither"
         );
     }
+
+    #[test]
+    fn a_bucket_with_no_attributes_forwards_an_event_unchanged() {
+        let mut bucket = Bucket::new(vec![]);
+        let resource = Arc::new(Resource::default());
+        let mut event = event_with_attrs(&[("d", Value::F64(0.5))]);
+        assert!(bucket.process(&resource, &mut event));
+        assert_eq!(event.attributes.len(), 1);
+        assert_eq!(event.attributes.get("d"), Some(&Value::F64(0.5)));
+    }
 }

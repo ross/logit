@@ -334,9 +334,15 @@ whole event, and rule 92 keeps one component from reading two of its targets.
 `validate_semantics` (`crates/logit-cli/src/pipeline.rs`) is a thin wrapper around it. The
 canonical list, with each rule's reasoning, is `graph.rs`'s module doc; each rule is enforced at
 its `// Rule N` label in `resolve`. Each entry below names what is rejected; the numbers are
-identifiers, not execution order. Several rules share one principle: **a config that can only be
-a no-op, a black hole, or an impossible bound is an error**, and so is a setting that would be
-silently ignored. `0` for a count or duration bound is usually impossible, not small.
+identifiers, not execution order, and a retired rule's number (10, 21, 30, 58) is not reused.
+
+One principle decides what is a rule: **validation rejects a config only when it can't run as
+written, or when it would lose or duplicate data the operator didn't ask to lose or duplicate.**
+Can't run as written covers an impossible or unintended bound (`0` for a count, size, or duration
+is usually one, not a small value), a setting that would be silently ignored, and a name or value
+that could never match. A config isn't rejected for being pointless: a no-op or a black hole the
+operator wrote explicitly, such as an empty `set` or a `sample` at `rate: 0`, runs as written, and
+a black hole counts what it discards as `events.discarded`.
 
 1. No components at all.
 2. A `sources` id naming no defined component.
@@ -347,9 +353,8 @@ silently ignored. `0` for a count or duration bound is usually impossible, not s
 7. A non-sink component with no consumer.
 8. A kind that isn't implemented.
 9. A zero `interval` on a kind that has one.
-10. A `kv_metrics` with no counters, gauges, or distributions.
 11. A `kv_metrics` distribution with no `field`, or an entry with an empty `name`.
-12. A `set` with neither `resource` nor `attributes`, or with an empty key.
+12. A `set` with an empty key.
 13. More than one `internal` component.
 14. A non-default `buffer:` on a non-sink.
 15. A sink `buffer.max_batches` or `buffer.max_bytes` of `0`, or `buffer.retry_max_delay` of `0s`
@@ -360,29 +365,26 @@ silently ignored. `0` for a count or duration bound is usually impossible, not s
 18. A `0` receive-queue or batch-assembly bound (`batch_flush_interval: 0s` is legal).
 19. An empty `trace_context` `trace_id`, `span_id`, or `flags` field name, after `format`'s
     defaults.
-20. A `scale` with no `fields`, an empty field name, or a non-finite factor.
-21. An empty `signals:` list, all three payload signals on `keep_signals`/`drop_signals`, or
-    `none` on `drop_signals`.
+20. A `scale` with an empty field name or a non-finite factor.
 22. An `otlp_out` header the transport sets itself, or two that differ only in case.
 23. An `otlp_out` `paths:` under `protocol: grpc`.
 24. An inconsistent `otlp_out` `tls:`, or one under a non-`https://` endpoint.
 25. A `trace_context` `span:` with an empty `name` or a `0s` `max_skew`.
-26. A `tail_in` with no `paths`, an empty entry, or a `*` outside the final path component.
-27. A `docker_in` that would tail nothing, or with an empty or duplicate entry or an empty `root`.
+26. A `tail_in` `paths` entry that is empty or has a `*` outside the final path component.
+27. A `docker_in` with an empty or duplicate entry or an empty `root`.
 28. A `tail_in`/`docker_in` `poll_interval`, `checkpoint_interval`, or `max_line_bytes` of `0`.
-29. A `file_out` that would never rotate, a `rotate.max_bytes`/`max_files` of `0`, or a
-    `max_files` above 1000 (`logit_config::MAX_ROTATE_FILES`).
-30. A `kv` with an empty, identical, or overlapping `pair_sep`/`kv_sep`.
-31. A `regex` with an empty `field`, or a `pattern` that fails to compile or has no named group.
-32. A `csv` with no `columns`, an empty or duplicate column name, or an unusable `delimiter`.
+29. A `file_out` `rotate.max_bytes`/`max_files` of `0`, or a `max_files` above 1000
+    (`logit_config::MAX_ROTATE_FILES`).
+31. A `regex` with an empty `field`, or a `pattern` that fails to compile.
+32. A `csv` with an empty or duplicate column name, or an unusable `delimiter`.
 33. A `stdio_out`/`file_out` `compression:` outside `format: native`.
 34. An inconsistent `logit_out` `tls:`, or a `logit_in` `max_frame_bytes` of `0` or above 64 MiB.
 35. A `buffer.disk:` beside a non-default in-memory bound, a bad disk bound, or a shared
     `disk.path`.
-36. A `has_attributes`/`drop_attributes` with nothing configured, an empty key, a non-finite
-    value, or a presence key repeated or also named in the same side's map.
-37. A `has_provenance`/`drop_provenance` with nothing configured, or an empty or repeated entry.
-    An id isn't checked against this graph: it may name a component in another process.
+36. A `has_attributes`/`drop_attributes` with an empty key, a non-finite value, or a presence key
+    repeated or also named in the same side's map.
+37. A `has_provenance`/`drop_provenance` with an empty or repeated entry. An id isn't checked
+    against this graph: it may name a component in another process.
 38. A `statsd_out`/`collectd_out`/`graphite_out` `max_packet_bytes` of `0`, a value above 65507
     (the largest UDP payload) on `collectd_out` or a UDP `statsd_out`/`graphite_out`, or a
     `collectd_out` value below 1024.
@@ -393,8 +395,8 @@ silently ignored. `0` for a count or duration bound is usually impossible, not s
 40. A scrape-mode `prometheus_in` with a bad target URL, `timeout: 0s`, a bad `scrape_tls:`, or a
     reserved or colliding header.
 41. A registry-mode `prometheus_out` `path` not starting with `/`, or `max_series: 0`.
-42. A `generate_in` count of `0`, an empty key or metric name, a non-finite metric value, or an
-    unknown or unbounded template placeholder.
+42. A `generate_in` `batch` or `rate` of `0`, an empty key or metric name, a non-finite metric
+    value, or an unknown or unbounded template placeholder.
 43. A `tls:` on a UDP `syslog_in`, `graphite_in`, `statsd_in`, or `lines_in`.
 44. An inconsistent `syslog_out` `tls:`, or one under `transport: udp`.
 45. A `0s` `handshake_timeout`, or a non-default one on a UDP listener.
@@ -403,25 +405,25 @@ silently ignored. `0` for a count or duration bound is usually impossible, not s
 47. A `targets:` list on anything but `lua`/`lua_file`.
 48. A router target that is unresolved, the router itself, or not a `target`, or a repeated `lua`
     target.
-49. A `target` with `sources`, or one no router directs to.
+49. A `target` with `sources`, or one no router directs to: nothing could reach its consumers
+    through it.
 50. A router (`route`, or `lua`/`lua_file` with `targets:`) with no ordinary consumer. Name a
     `null_out` as its consumer to discard the events no target claims.
-51. A `route` with no `routes:`, an empty key or value, an empty list, a target repeated within
-    one list, more than 63 distinct targets, or an empty `by:` key; or a component whose
-    `sources:` lists two targets of one `route` list.
+51. A `route` with an empty key or value, an empty list, a target repeated within one list, more
+    than 63 distinct targets, or an empty `by:` key; or a component whose `sources:` lists two
+    targets of one `route` list.
 52. An inconsistent `statsd_out` `tls:`, or one under `transport: udp`.
 53. A `0s` `idle_timeout`, or any `idle_timeout` on a UDP listener.
-54. A `keep_values` with nothing configured, an empty name or `allow`, a non-finite literal, a
-    literal `normalize: [lower]` can't produce, or a repeated step.
+54. A `keep_values` with an empty name, a non-finite literal, a literal `normalize: [lower]` can't
+    produce, or a repeated step.
 55. A `prometheus_in` with both or neither mode, or a field set for the other mode.
 56. A `prometheus_out` with both or neither mode, a field set for the other mode, or a bad sender
     setting.
 57. A datagram listener's `receive.read_batch` above 1024.
-58. A `shape` `max_tracked_keys` or `max_tracked_keysets` of `0`.
-59. A `flatten` that selects nothing, or has an empty list or an empty or repeated name.
+59. A `flatten` with an empty or repeated name.
 60. An `http_access` with an empty or invalid pattern, an empty label, a malformed or repeated
-    route rule, or a bad `max_length`.
-61. A `sample` rate outside `[0, 1)` (`0` needs `always_keep`), an empty field name, a malformed
+    route rule, or a `max_length` key it never caps.
+61. A `sample` rate that is non-finite or outside `[0, 1]`, an empty field name, a malformed
     `always_keep`, or `missing:` without `key:`.
 62. Two `tail_in`/`docker_in` components sharing a `checkpoint_path`, or one whose
     `checkpoint_path` is another's `<checkpoint_path>.tmp`.
@@ -472,7 +474,7 @@ silently ignored. `0` for a count or duration bound is usually impossible, not s
     `datadog_trace_in` without `bind`.
 81. An `admin.socket_mode` without `admin.socket`, an empty `admin.bind` or `admin.socket`, or an
     `admin.bind` that is a path.
-82. A `bucket` with no `attributes`; an empty field name, `into`, `ranges`, `value`, or `other`; an
+82. A `bucket` with an empty field name, `into`, `ranges`, `value`, or `other`; an
     `into` naming another configured source or shared by two fields; a range with both `lt` and
     `le`; a boundless range that isn't last; a non-finite bound; or a range that can never match
     (a bound below the previous one, or equal to it unless `lt: X` is followed by `le: X`).
@@ -489,7 +491,7 @@ silently ignored. `0` for a count or duration bound is usually impossible, not s
 86. An `influxdb_in` with an empty `bind`, a `tokens` entry that is empty or has surrounding
     whitespace, or a `max_request_bytes` of `0`.
 92. A `route_signals` listed in any component's `sources:` (it has no ordinary edge, so rule 7
-    doesn't ask it for a consumer), one with no `signals:` entry set or an empty target id, or,
+    doesn't ask it for a consumer), one with an empty target id, or,
     under `strip: false`, a component whose `sources:` lists two of its targets (a target only
     `signals.none` names doesn't count).
 93. A `replay_in` with an empty `path` or a `batch` of `0`.
@@ -503,7 +505,9 @@ graph — rule 37's reasoning; the key is as likely to name a component relayed 
 
 **Sink reachability from a listener needs no separate rule.** It follows from 2 + 5 + 7: every
 acyclic chain of ≥1-source components ends somewhere, and rule 7 requires every non-terminal
-component in it to have a consumer, so the chain can only end at a sink.
+component in it to have a consumer, so the chain can only end at a sink, or at a `route_signals`
+with no `signals:` entry set. Rule 92 exempts `route_signals` from rule 7, and with no entry set it
+discards every event and counts it as `events.discarded`.
 
 **Sharing needs no rule either.** The pre-graph validator rejected an input or output claimed by
 more than one pipeline, because that runtime couldn't express sharing. In the graph model a shared

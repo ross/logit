@@ -137,6 +137,9 @@ Entry format and the other areas: [the known-gaps index](README.md).
     their series merged under it. Datadog bills per host, so this costs what one Agent would.
   - **Workaround:** stamp `host.name` per sender upstream with `set`, or have each DogStatsD
     client send a `host:` tag (or `h:` on an event or check).
+- **`datadog_out` ignores `collectd.host`.** It takes a metric's host only from `host.name` or a
+  `host` tag, so every collectd sender behind a relay lands on the relay's process hostname.
+  A fix is planned.
 - **`datadog_trace_out` under `version: v0.4` drops the trace chunk and tracer payload fields.**
   v0.4 has no field for a chunk's `_logit.datadog.chunk.*` fields (sampling priority, origin,
   dropped flag, tags) or for the tracer payload fields no request header carries
