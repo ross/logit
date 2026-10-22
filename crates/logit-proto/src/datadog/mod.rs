@@ -136,6 +136,8 @@
 //! | `gauge/u64` | normalized | `integer_as_double` | The point's double, the integer's nearest `f64`, read back as a float. |
 //! | `gauge/bool` | normalized | `bool_as_double`; `logit.output.metrics.normalized{reason=bool_value}` | The point's double, `1` or `0`, read back as a float. |
 //! | `gauge/negative` | exact | -- | A negative double, as any other. |
+//! | `gauge/prometheus_info` | exact | -- | As any other gauge; the type carrier isn't written. |
+//! | `gauge/prometheus_stateset` | exact | -- | As any other gauge; the type carrier isn't written. |
 //! | `gauge_delta/f64` | dropped | `logit.output.metrics.dropped{reason=unresolved_gauge_delta}` | Nothing upstream resolved the relative gauge to an absolute one, so the series encoders drop it. |
 //! | `gauge_delta/i64` | dropped | `logit.output.metrics.dropped{reason=unresolved_gauge_delta}` | Nothing upstream resolved the relative gauge to an absolute one, so the series encoders drop it. |
 //! | `gauge_delta/u64` | dropped | `logit.output.metrics.dropped{reason=unresolved_gauge_delta}` | Nothing upstream resolved the relative gauge to an absolute one, so the series encoders drop it. |
@@ -154,6 +156,7 @@
 //! | `histogram/neg_inf_bound`, under `histograms: {"mode":"counters","send_aggregation_metrics":true}` | degraded | `logit.output.metrics.degraded{metric_kind=histogram}` | Under `histograms.mode: counters`, a `-Inf` bound is one more bucket's bound: the `<name>.bucket` counts beside it carry a `-inf` `lower_bound` or `upper_bound` tag, the exporter's `formatFloat` form. |
 //! | `histogram/neg_inf_bound`, under `histograms: {"mode":"nobuckets","send_aggregation_metrics":true}` | degraded | `logit.output.metrics.degraded{metric_kind=histogram}` | Under `histograms.mode: nobuckets`, no bucket is written, so the bound goes with the rest. |
 //! | `histogram/neg_inf_bound`, otherwise | degraded | `logit.output.metrics.degraded{metric_kind=histogram}` | In the sketch, as Datadog's exporter builds it on amd64: Go's `int(-Inf)` keys the bound at the Agent's key -1, so the `-Inf` bucket's count lands near `-1e-9` rather than below every other bucket, and the sketch's `min` is that bin's value. |
+//! | `histogram/gauge_histogram` | exact | -- | As `histogram/cumulative`; the type carrier isn't written. |
 //! | `exponential_histogram/delta` | degraded | `logit.output.metrics.degraded{metric_kind=exponential_histogram}` | A sketch under every `histograms.mode`, its buckets re-mapped onto the Agent's bins as Datadog's exporter re-maps them, with the point's count, sum, and average, which datadog_in reads back as a distribution; with `send_aggregation_metrics`, the `.count`, `.sum`, `.min`, and `.max` series too. |
 //! | `exponential_histogram/cumulative` | dropped | `logit.output.metrics.dropped{reason=unresolved_cumulative}` | Datadog's exporter can't send a cumulative exponential histogram, so it's dropped, with a throttled `unresolved_cumulative` warning; a `cumulative_to_delta` upstream makes it a delta one. |
 //! | `summary/delta` | degraded | -- | A `<name>.quantile` gauge per quantile tagged `quantile:<q>`, and `.count` (no unit) and `.sum` as `count` points, as Datadog's exporter writes a summary it differenced; datadog_in reads them back as gauges and counts. |

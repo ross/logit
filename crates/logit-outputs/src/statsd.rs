@@ -222,6 +222,8 @@
 //! | `gauge/u64` | normalized | `f64_value` | statsd_out writes every digit, and statsd_in reads the number back as an f64, so an integer reads back as a float and one beyond 2^53 rounds. |
 //! | `gauge/bool` | normalized | `bool_value`; `logit.output.metrics.normalized{reason=bool_value}` | A boolean is written as `1` or `0` and reads back as that number. |
 //! | `gauge/negative` | degraded | -- | statsd has no negative absolute gauge, so statsd_out writes `0\|g` then `-v\|g` in one datagram. A statsd server ends at the right value, but statsd_in reads the pair as a gauge of 0 and a relative adjustment, uncounted. |
+//! | `gauge/prometheus_info` | exact | -- | As any other gauge; the type carrier isn't written. |
+//! | `gauge/prometheus_stateset` | exact | -- | As any other gauge; the type carrier isn't written. |
 //! | `gauge_delta/f64`, under `relative_gauges: true` | exact | -- | A relative `+v\|g` or `-v\|g` line. |
 //! | `gauge_delta/f64`, otherwise | dropped | `logit.output.messages.dropped{reason=unresolved_gauge_delta}` | An unresolved relative adjustment is dropped unless `relative_gauges: true`, with a throttled `gauge_delta_unresolved` warning; an `aggregate` upstream resolves it into a gauge. |
 //! | `gauge_delta/i64`, under `relative_gauges: true` | normalized | `f64_value` | A relative line, read back as an f64. |
@@ -245,6 +247,7 @@
 //! | `histogram/nan_bound`, otherwise | degraded | `logit.output.metrics.degraded{metric_kind=histogram}` | Each bucket is its own dotted series, as for any other bound: `.bucket_NaN` holds that bucket's own count. |
 //! | `histogram/neg_inf_bound`, under `multi_value: skip` | skipped | `logit.output.metrics.skipped{metric_kind=histogram}` | Under `multi_value: skip`, no line is written. |
 //! | `histogram/neg_inf_bound`, otherwise | degraded | `logit.output.metrics.degraded{metric_kind=histogram}` | Each bucket is its own dotted series, as for any other bound: `.bucket_-inf` holds that bucket's own count. |
+//! | `histogram/gauge_histogram` | exact | -- | As `histogram/cumulative`; the type carrier isn't written. |
 //! | `exponential_histogram/delta`, under `multi_value: skip` | skipped | `logit.output.metrics.skipped{metric_kind=exponential_histogram}` | Under `multi_value: skip`, no line is written. |
 //! | `exponential_histogram/delta`, otherwise | degraded | `logit.output.metrics.degraded{metric_kind=exponential_histogram}` | Dotted `.count`, `.sum`, and `.zero_count` counters and `.min` and `.max` gauges. Its buckets aren't written, since each scale would mint its own series names. |
 //! | `exponential_histogram/cumulative`, under `multi_value: skip` | skipped | `logit.output.metrics.skipped{metric_kind=exponential_histogram}` | Under `multi_value: skip`, no line is written. |

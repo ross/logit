@@ -1,6 +1,6 @@
 ---
 created: 2026-10-20
-updated: 2026-10-20
+updated: 2026-10-21
 ---
 
 # `influxdb_out` writes histograms and summaries in Telegraf's `prometheus-v1` shape
@@ -90,7 +90,7 @@ quantiles `0.5 -> 0.2` and `0.99 -> 0.9`. `otel2influx` writes the same fields, 
 - **Summary**: `count`, `sum`, then a field per quantile, named by the quantile.
 - **Distribution and Samples**: the summary shape, with the sketch's count and sum and the `0.5`,
   `0.9`, and `0.99` quantiles that replace `p50`, `p90`, and `p99`, so a reader sees one quantile
-  spelling. A `Samples` record is sketched first, each value weighted by its inverse sample rate.
+  spelling, plus `0` and `1` (the 2026-10-21 amendment). A `Samples` record is sketched first, each value weighted by its inverse sample rate.
   An empty sketch has no quantile reading, so it writes `count` and `sum` alone.
 - **Keys**: a bound or quantile key is the `f64`'s shortest round-trip decimal with no exponent,
   `otel2influx`'s `'f'` spelling (`1000000`, `0.00001`). Rust's `f64` `Display` writes that form.
@@ -151,3 +151,12 @@ because `influxdb_in` makes only gauges.
 - `spec/transit/mapping.yaml`'s `influxdb_out` cells for `histogram`, `summary`, `distribution`,
   `samples`, and `exponential_histogram` state this shape, and the codec's module doc
   (`crates/logit-proto/src/influxdb/mod.rs`) carries the details the cells don't.
+
+## Amendment (2026-10-21): a sketch's summary carries its minimum and maximum
+
+A `Distribution` or `Samples` record's summary shape adds the `0` and `1` quantile fields, the
+sketch's minimum and maximum, which `DdSketch::quantile` answers with its tracked `min` and `max`.
+A histogram already writes `min` and `max` fields; a sketch written as a summary now keeps its
+extremes as well, as `otlp_out` and `prometheus_out` do
+([ADR `prometheus-scrape-and-exposition`](prometheus-scrape-and-exposition.md)'s amendment of the
+same date).

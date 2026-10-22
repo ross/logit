@@ -35,18 +35,21 @@
 //! | `gauge/u64` | normalized | `u64_as_int`; `logit.output.metrics.normalized{reason=u64_as_double}` | A `u64` that fits an `int64` is `as_int` and reads back as an `i64`; one above `i64::MAX` is `as_double`, counted, and reads back as an `f64`. |
 //! | `gauge/bool` | normalized | `bool_value`; `logit.output.metrics.normalized{reason=bool_value}` | A boolean is `as_int` `1` or `0` and reads back as that integer. |
 //! | `gauge/negative` | exact | -- | A negative data point, written as is. |
+//! | `gauge/prometheus_info` | normalized | `prometheus_info_sum` | A cumulative non-monotonic OTLP `Sum` named `<name>_info`, as the OTel Prometheus compatibility spec's Info section (marked Development) has it, read back as that sum. |
+//! | `gauge/prometheus_stateset` | normalized | `prometheus_stateset_sum` | A cumulative non-monotonic OTLP `Sum`, as the OTel Prometheus compatibility spec's StateSet section (marked Development) has it, read back as that sum. |
 //! | `gauge_delta/f64` | dropped | `logit.output.metrics.dropped{reason=unresolved_gauge_delta}` | An unresolved relative adjustment is dropped, with a throttled `gauge_delta_unresolved` warning; an `aggregate` upstream resolves it into a gauge. |
 //! | `gauge_delta/i64` | dropped | `logit.output.metrics.dropped{reason=unresolved_gauge_delta}` | Dropped, as for a float adjustment. |
 //! | `gauge_delta/u64` | dropped | `logit.output.metrics.dropped{reason=unresolved_gauge_delta}` | Dropped, as for a float adjustment. |
 //! | `gauge_delta/bool` | dropped | `logit.output.metrics.dropped{reason=unresolved_gauge_delta}` | Dropped, as for a float adjustment. |
-//! | `samples` | degraded | `logit.output.metrics.degraded{metric_kind=samples}` | Sketched, each value weighted by its inverse sample rate, then an OTLP `Summary` of fixed quantiles. |
+//! | `samples` | degraded | `logit.output.metrics.degraded{metric_kind=samples}` | Sketched, each value weighted by its inverse sample rate, then written as the `distribution` row describes. |
 //! | `set_members` | skipped | `logit.output.metrics.skipped{metric_kind=set_members}` | OTLP has no cardinality type, so set members aren't written, with a throttled `otlp_set_members_metric_skipped` warning. |
-//! | `distribution` | degraded | `logit.output.metrics.degraded{metric_kind=distribution}` | An OTLP `Summary` of fixed quantiles with the sketch's own count and sum; OTLP has no mergeable sketch. |
+//! | `distribution` | degraded | `logit.output.metrics.degraded{metric_kind=distribution}` | An OTLP `Summary` of the sketch's `0` (its minimum), `0.5`, `0.75`, `0.9`, `0.95`, `0.99`, and `1` (its maximum) quantiles with its own count and sum; OTLP has no mergeable sketch. |
 //! | `set` | skipped | `logit.output.metrics.skipped{metric_kind=set}` | OTLP has no cardinality type, so a set estimate isn't written, with a throttled `otlp_set_metric_skipped` warning. |
 //! | `histogram/delta` | normalized | `inf_bucket` | An OTLP `Histogram` with delta temporality. OTLP requires an overflow count above the highest bound, so a histogram whose last bound is finite reads back with an empty `+Inf` bucket. |
 //! | `histogram/cumulative` | normalized | `inf_bucket` | An OTLP `Histogram` with cumulative temporality. OTLP requires an overflow count above the highest bound, so a histogram whose last bound is finite reads back with an empty `+Inf` bucket. |
 //! | `histogram/nan_bound` | degraded | `logit.output.metrics.degraded{reason=non_finite_component}` | OTLP bounds are finite, so a `NaN` bound's count joins the overflow bucket. `count` and every cumulative count are kept. |
 //! | `histogram/neg_inf_bound` | degraded | `logit.output.metrics.degraded{reason=non_finite_component}` | OTLP bounds are finite, so a `-Inf` bound's count joins the first bucket. `count` and every cumulative count are kept. |
+//! | `histogram/gauge_histogram` | skipped | `logit.output.metrics.skipped{metric_kind=gauge_histogram}` | The OTel Prometheus compatibility spec drops a GaugeHistogram, since OTLP has no histogram that isn't a running count, so it isn't written, with a throttled `otlp_gauge_histogram_skipped` warning. |
 //! | `exponential_histogram/delta` | exact | -- | An OTLP `ExponentialHistogram`, field for field. |
 //! | `exponential_histogram/cumulative` | exact | -- | An OTLP `ExponentialHistogram`, field for field. |
 //! | `summary/delta` | dropped | `logit.output.metrics.dropped{reason=unresolved_delta}` | OTLP defines every summary as cumulative, so a delta one is dropped, with a throttled `delta_summary_unresolved` warning. |
@@ -119,12 +122,19 @@
 //! - `Summary{quantiles,count,sum}` → `Summary`: a quantile outside `[0, 1]` is written as is;
 //!   `docs/known-gaps/mappings.md`'s "Cross-protocol semantic gaps" section has the row. OTLP's
 //!   summary is cumulative by definition, so a delta one is dropped (`summary/delta` above).
-//! - `Samples(s)` and `Distribution(sketch)` → `Summary` of `DISTRIBUTION_QUANTILES` (see "Lossy
-//!   metric kinds" below). A `Samples` is sketched first (`Samples::sketch`, each value weighted
+//! - `Samples(s)` and `Distribution(sketch)` → `Summary` of `SUMMARY_QUANTILES` (see "Lossy
+//!   metric kinds" below), whose `0` and `1` are the sketch's tracked minimum and maximum. A `Samples` is sketched first (`Samples::sketch`, each value weighted
 //!   by `Samples::weight`). The point's `count` and `sum` are the sketch's own; `sum` is
 //!   `DdSketch::sum`, exact unlike a quantile (approximate only when `DdSketch::stats_exact` is
 //!   `false`, i.e. the sketch's stats were derived from its bins). Its exemplars are left off,
 //!   uncounted, as a `Summary`'s are (`record/exemplars_on_summary` above).
+//! - An OpenMetrics type `prometheus_in` carried as `_logit.prometheus.type` follows the OTel
+//!   Prometheus and OpenMetrics compatibility spec's "Prometheus/OpenMetrics to OTLP": a
+//!   `gaugehistogram` `Histogram` isn't written, counted
+//!   `logit.output.metrics.skipped{metric_kind="gauge_histogram"}`, and an `info` or `stateset`
+//!   `Gauge` is a cumulative non-monotonic `Sum`, an `info` one named `<name>_info`. The spec marks
+//!   its Info and StateSet sections Development. Its `target_info` exception, resource attributes
+//!   in place of a metric, isn't implemented (`docs/known-gaps/otlp.md`).
 //!
 //! **Lossy metric kinds.** OTLP has no mergeable-sketch type. `ExponentialHistogram` is the nearest
 //! shape, but its base is `2^(2^-scale)` and a `DdSketch`'s γ isn't (1.015625 under
@@ -141,7 +151,11 @@
 //! `Histogram` → `Histogram{buckets,temporality,sum,min,max}`, rebuilding the trailing infinite
 //! bucket when `bucket_counts` has one more entry than `explicit_bounds` (the OTLP-mandated
 //! shape), even when its count is `0`, so `otlp_in -> otlp_out` writes a conforming point's lists
-//! back as they arrived. `Summary` → `Summary{quantiles,count,sum}`, `Cumulative`, each quantile
+//! back as they arrived. `Histogram` has no `count` of its own, so a point with no buckets and a
+//! nonzero `count` decodes as one `+Inf` bucket holding it, which `otlp_out` writes back as one
+//! bucket count and no bounds, a permitted normalization (ADR `lossless-transit`). A point whose
+//! `count` isn't the sum of its buckets keeps the buckets, counted
+//! `logit.input.metrics.degraded{reason="histogram_count_mismatch"}`. `Summary` → `Summary{quantiles,count,sum}`, `Cumulative`, each quantile
 //! read with no range check.
 //! `ExponentialHistogram` → `ExponentialHistogram` field for field (scale, zero count and
 //! threshold, positive and negative offset and bucket counts, temporality, count, sum/min/max),
@@ -648,7 +662,7 @@ fn distribution_summary_point(
 /// `metrics.proto` allows when only the count and sum are known, becomes one `+Inf` bucket of
 /// that count, since `Histogram` has no `count` of its own. A point whose `count` isn't the sum
 /// of its buckets keeps its buckets, counted
-/// `logit.input.metrics.degraded{reason="count_mismatch"}`: they're the distribution, and
+/// `logit.input.metrics.degraded{reason="histogram_count_mismatch"}`: they're the distribution, and
 /// `metrics.proto` requires the two to agree.
 fn histogram_buckets_from_pb(
     dp: &pb::HistogramDataPoint,
@@ -665,7 +679,11 @@ fn histogram_buckets_from_pb(
         total = total.saturating_add(*count);
     }
     if total != dp.count {
-        telemetry.count("logit.input.metrics.degraded", 1.0, &[("reason", "count_mismatch")]);
+        telemetry.count(
+            "logit.input.metrics.degraded",
+            1.0,
+            &[("reason", "histogram_count_mismatch")],
+        );
     }
     buckets
 }
@@ -1474,7 +1492,7 @@ mod tests {
         assert!(counted_in(
             &registry,
             "logit.input.metrics.degraded",
-            ("reason", "count_mismatch")
+            ("reason", "histogram_count_mismatch")
         ));
     }
 
@@ -1493,7 +1511,7 @@ mod tests {
         assert!(!counted_in(
             &registry,
             "logit.input.metrics.degraded",
-            ("reason", "count_mismatch")
+            ("reason", "histogram_count_mismatch")
         ));
     }
 

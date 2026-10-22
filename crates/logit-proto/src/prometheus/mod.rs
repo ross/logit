@@ -102,18 +102,21 @@
 //! | `gauge/u64` | normalized | `f64_value` | A sample is a double, so an integer is written as its nearest `f64` and reads back as a float, rounded beyond 2^53. |
 //! | `gauge/bool` | normalized | `bool_value`; `logit.output.metrics.normalized{reason=bool_value}` | A boolean is the sample `1` or `0` and reads back as that number. |
 //! | `gauge/negative` | exact | -- | A negative sample, written as is. |
+//! | `gauge/prometheus_info` | exact | -- | An `info` family, its sample named `<name>_info`. |
+//! | `gauge/prometheus_stateset` | exact | -- | A `stateset` family, one sample per state. |
 //! | `gauge_delta/f64` | dropped | `logit.output.metrics.dropped{reason=unresolved_gauge_delta}` | An unresolved relative adjustment has no absolute value to expose and is dropped, with a throttled `gauge_delta_unresolved` warning; an `aggregate` upstream resolves it into a gauge. |
 //! | `gauge_delta/i64` | dropped | `logit.output.metrics.dropped{reason=unresolved_gauge_delta}` | Dropped, as for a float adjustment. |
 //! | `gauge_delta/u64` | dropped | `logit.output.metrics.dropped{reason=unresolved_gauge_delta}` | Dropped, as for a float adjustment. |
 //! | `gauge_delta/bool` | dropped | `logit.output.metrics.dropped{reason=unresolved_gauge_delta}` | Dropped, as for a float adjustment. |
-//! | `samples` | degraded | `logit.output.metrics.degraded{metric_kind=samples}` | Sketched, each value weighted by its inverse sample rate, then a `summary` of fixed quantiles with `_sum` and `_count`. |
+//! | `samples` | degraded | `logit.output.metrics.degraded{metric_kind=samples}` | Sketched, each value weighted by its inverse sample rate, then written as the `distribution` row describes. |
 //! | `set_members` | degraded | `logit.output.metrics.degraded{metric_kind=set_members}` | A `gauge` of the distinct member count; the members are gone. |
-//! | `distribution` | degraded | `logit.output.metrics.degraded{metric_kind=distribution}` | A `summary` of fixed quantiles with the sketch's exact `_sum` and `_count`; the sketch is gone, so quantiles from two senders don't merge. |
+//! | `distribution` | degraded | `logit.output.metrics.degraded{metric_kind=distribution}` | A `summary` of the sketch's `0` (its minimum), `0.5`, `0.75`, `0.9`, `0.95`, `0.99`, and `1` (its maximum) quantiles with its exact `_sum` and `_count`; the sketch is gone, so quantiles from two senders don't merge. |
 //! | `set` | degraded | `logit.output.metrics.degraded{metric_kind=set}` | A `gauge` of the estimate; the registers are gone. |
 //! | `histogram/delta` | dropped | `logit.output.metrics.dropped{reason=unresolved_delta}` | A delta histogram is dropped, with a throttled `delta_temporality_unresolved` warning; an `aggregate` with `temporality: cumulative` upstream makes it a running one. |
 //! | `histogram/cumulative` | normalized | `inf_bucket` | A `histogram` family of running-sum buckets and `_sum` when it has one, or a `gaugehistogram` under the type carrier. `+Inf` states the total, so a histogram whose last bound is finite reads back with an empty `+Inf` bucket. `min` and `max` are `record/min_max`'s. |
 //! | `histogram/nan_bound` | degraded | `logit.output.metrics.degraded{reason=non_finite_component}` | A `NaN` bound has no place among the sorted bounds, so it has no bucket, and its count reaches only `+Inf` and `_count`. |
 //! | `histogram/neg_inf_bound` | exact | -- | `-Inf` is an ordinary bound: an `le="-Inf"` bucket, first. |
+//! | `histogram/gauge_histogram` | exact | -- | A `gaugehistogram` family, with `_gsum` and `_gcount`. |
 //! | `exponential_histogram/delta`, with `bind:` unset | dropped | `logit.output.metrics.dropped{reason=native_histogram}` | Remote-write carries native histograms, but the sender doesn't map them yet, so one is dropped. |
 //! | `exponential_histogram/delta`, otherwise | skipped | `logit.output.metrics.skipped{metric_kind=exponential_histogram}` | Neither exposition dialect has native-histogram syntax, so none is written. |
 //! | `exponential_histogram/cumulative`, with `bind:` unset | dropped | `logit.output.metrics.dropped{reason=native_histogram}` | Dropped, as for a delta one. |
@@ -182,7 +185,7 @@
 //! | Model | Wire |
 //! |---|---|
 //! | a `Sum` or `Gauge` value, or an exemplar's value, of `I64`/`U64`/`Bool` | the sample's double, on both wires: an integer's nearest `f64`, a `Bool` `1` or `0`, counted `logit.output.metrics.normalized{reason="bool_value"}` |
-//! | `Distribution(sketch)` | `summary` of [`DISTRIBUTION_QUANTILES`] + `_sum` + `_count`; `_sum` is [`DdSketch::sum`], exact unlike a quantile (approximate only when [`DdSketch::stats_exact`] is `false`, i.e. the sketch's stats were derived from its bins) -- `logit.output.metrics.degraded{metric_kind="distribution"}` |
+//! | `Distribution(sketch)` | `summary` of [`SUMMARY_QUANTILES`], `0` and `1` the sketch's minimum and maximum, + `_sum` + `_count`; `_sum` is [`DdSketch::sum`], exact unlike a quantile (approximate only when [`DdSketch::stats_exact`] is `false`, i.e. the sketch's stats were derived from its bins) -- `logit.output.metrics.degraded{metric_kind="distribution"}` |
 //! | a `Histogram` bound | sorted ascending, equal bounds merged into one `le`; a `NaN` bound has no `le` bucket, its count reaching only `+Inf` and `_count` -- `logit.output.metrics.degraded{reason="non_finite_component"}`, once per record. `-Inf` is an ordinary bound, `le="-Inf"` |
 //! | `Event::timestamp` | emitted only when `_logit.prometheus.timestamp: true` is present (consumed) -- or on every series, marker or not, under [`PrometheusEncoder::with_timestamps_always`]`(true)`, which is what a transport with no way to omit a timestamp needs |
 //! | labels | `Value::Str/I64/U64/F64/Bool` stringified; `Null/Bytes/Timestamp/Map` dropped -- `logit.output.labels.omitted{reason="unrepresentable"}`. An `Array` (a repeated DogStatsD tag key, `crate::statsd::decode::insert_tags`) renders its **last** representable element -- a Prometheus label set is a map, so there is no multi-value label -- counted `logit.output.labels.normalized{reason="multi_value"}`; an empty or entirely unrepresentable one stays on the `omitted{reason="unrepresentable"}` path |
