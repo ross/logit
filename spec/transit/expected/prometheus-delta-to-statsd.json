@@ -16,7 +16,9 @@
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"temperature_celsius","kind":"gauge","value":0.0}],"attributes":{"instance":"transit:9100","room":"cold"}},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"temperature_celsius","kind":"gauge","value":21.5}],"attributes":{"instance":"transit:9100","room":"lab"}},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"temperature_celsius","kind":"gauge_delta","delta":-4.5}],"attributes":{"instance":"transit:9100","room":"cold"}}
-  ], "counters": {}},
+  ], "counters": {
+    "logit.output.metrics.degraded{component=out,kind=statsd_out,reason=negative_gauge,role=sink}": 1
+  }},
   "gauge-timestamp": {"events": [
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"queue_depth","kind":"gauge","value":7.0}],"attributes":{"instance":"transit:9100","q":"a"}},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"queue_depth","kind":"gauge","value":9.0}],"attributes":{"instance":"transit:9100","q":"b"}}
@@ -35,7 +37,9 @@
   }},
   "label-escaping": {"events": [
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"escaped","kind":"gauge","value":1.0}],"attributes":{"instance":"transit:9100","nl":"a_b","path":"C:\\dir","quote":"say_\"hi\""}}
-  ], "counters": {}},
+  ], "counters": {
+    "logit.output.tags.normalized{component=out,kind=statsd_out,reason=value_sanitized,role=sink}": 2
+  }},
   "mixed": {"events": [
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"build","kind":"gauge","value":1.0}],"attributes":{"instance":"transit:9100","version":"1.2.3"}},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"feature","kind":"gauge","value":0.0}],"attributes":{"feature":"b","instance":"transit:9100"}},

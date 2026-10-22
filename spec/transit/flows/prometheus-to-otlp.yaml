@@ -1,0 +1,12 @@
+# prometheus_in's scrape cases into otlp_out with nothing between: every kind as its OTLP
+# counterpart, the `_logit.prometheus.*` carriers left off.
+# `path:` names one case so `logit run` can run this by hand; the transit spec runs every case in
+# that file's directory (spec/transit/README.md).
+components:
+  case:
+    type: replay_in
+    path: ../cases/prometheus/mixed.json
+  out:
+    type: otlp_out
+    sources: [case]
+    endpoint: http://127.0.0.1:4318

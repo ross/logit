@@ -1,6 +1,6 @@
 ---
 created: 2026-09-21
-updated: 2026-10-13
+updated: 2026-10-21
 ---
 
 # `flatten`: dotted-key expansion as an opt-in, operator-placed transform
@@ -93,7 +93,8 @@ named entry still flattens one ([ADR `private-attribute-namespace`](private-attr
 paying a per-batch `Resource` rebuild for a map that usually isn't nested is a cost with no case behind it.
 `arrays: skip` treats an array as a leaf wherever it appears and leaves a top-level array attribute
 untouched entirely — the escape hatch for a source whose arrays are wide data rather than
-structure.
+structure. A selection of nothing, `none` or an empty list, is legal on either field, so a
+`flatten` with both is a no-op; an empty or repeated name is a graph-validation error (rule 59).
 
 **No `separator:` field.** The dot is fixed. `prometheus_out` and `statsd_out` already sanitize
 `.` out of names/tags on their own wire (`sanitize_label_name`, `statsd`'s own `sanitize_into`), so

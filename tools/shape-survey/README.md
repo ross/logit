@@ -308,8 +308,8 @@ with it.
 - **`receive.batch_max_events: 1`** on accumulator-fronted inputs, so a batch is a wire group.
 - **`aggregate` with `distributions: samples`** and a `max_samples_per_series` far above what the
   capture can produce. That's what keeps `shape`'s raw observations raw through the window.
-- **`file_out` with a huge `rotate.max_bytes`.** `file_out` requires a rotation trigger, and a
-  survey that rotated would silently lose the start of its own capture.
+- **`file_out` with no `rotate:`.** A survey that rotated would silently lose the start of its own
+  capture.
 - **An `admin:` block**, because `start_logit` waits on `logit ready` rather than sleeping.
 
 ## The acceptance test

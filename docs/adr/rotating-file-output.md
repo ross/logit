@@ -1,6 +1,6 @@
 ---
 created: 2026-09-08
-updated: 2026-10-05
+updated: 2026-10-21
 ---
 
 # `file_out`: a rotating file sink, sharing `stdio_out`'s implementation
@@ -41,7 +41,8 @@ pub struct StreamOutput<E> {
 ```
 
 `stdio_out` and `file_out` are both a `StreamOutput<EventDump>`, differing only in `target`:
-`stdio_out` never rotates (`RotatePolicy::never()`), `file_out` always carries a real policy.
+`stdio_out` never rotates (`RotatePolicy::never()`), and `file_out` carries its configured
+policy.
 `EventDump` (`crates/logit-outputs/src/stdio.rs`) now implements `logit_proto::Encoder`, joining
 `InfluxLineEncoder` on the trait its own doc comment already claimed every output implemented. The
 inherent `EventDump::encode(&self, ...) -> String` is renamed `render` so it doesn't silently keep
@@ -212,13 +213,14 @@ can inject a failing opener, while `rotate` itself always passes the real `open_
 ```
 
 `path` resolves against the config file's own directory when relative, exactly like
-`StdioTarget::Path`. `rotate: RotateConfig` defaults every field; graph validation (rule 29,
-`crates/logit-pipeline/src/graph.rs`) rejects a `file_out` whose `rotate:` sets neither
-`max_bytes` nor `interval` -- that would silently never rotate at all, and `stdio_out` already
-covers "no rotation" on purpose, so this is a config error rather than a quiet no-op. Rule 29 also
-rejects `rotate.max_bytes: "0"` (every batch would rotate) and `rotate.max_files: 0` (would delete
-the file it just rotated) -- the same "0 is impossible, not just small" instinct as the existing
-tail/receive rules.
+`StdioTarget::Path`. `rotate: RotateConfig` defaults every field. A `file_out` whose `rotate:`
+sets neither `max_bytes` nor `interval` writes one file and never rotates it (see "Amendment: a
+`file_out` with no rotation trigger is legal" below). Graph validation (rule 29,
+`crates/logit-pipeline/src/graph.rs`) rejects `rotate.max_bytes: "0"` (every batch would rotate)
+and `rotate.max_files: 0`. `max_files` counts the active file, so `0` is a bound no file could
+meet; the sink would clamp it to `1` and truncate in place, which an operator who wrote `0` didn't
+ask for. Both are the same "0 is impossible, not only small" instinct as the existing tail/receive
+rules.
 
 Format is unchanged from `stdio_out`'s human-readable `EventDump` render; no `format:` field lands
 in this pass (see Alternatives). Retention is `max_files` alone -- no `max_age`, no compression.
@@ -354,3 +356,17 @@ the re-open, and each retention unlink and rename, plus the ordinary write and f
 turn and restarts it; after the restart no line is lost beyond retention and none is duplicated,
 which confirms "commit point first" against a process crash. The durability ADR's "Running it"
 section lists the tests.
+
+## Amendment: a `file_out` with no rotation trigger is legal (2026-10-21)
+
+Rule 29 no longer rejects a `file_out` whose `rotate:` sets neither `max_bytes` nor `interval`,
+or that omits `rotate:`. The sink writes one file at `path` and never rotates it. Validation
+rejects a config only when it can't run, or when it would lose or duplicate data the operator
+didn't ask to lose or duplicate; an unrotated file does neither, even where `stdio_out` would do
+the same job. Rule 29 keeps `max_bytes: "0"`, `max_files: 0`, and `max_files` above
+`MAX_ROTATE_FILES`.
+
+The body's original reason for rejecting `max_files: 0`, that it would delete the file it had
+rotated, didn't match the sink, which clamps `max_files` to `1` and so truncates in place. The
+reason the body now gives is that `max_files` counts the active file, so `0` is a bound no file
+could meet.

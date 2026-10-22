@@ -7,7 +7,7 @@
 //!
 //! - **Selection** ([`ContainerFilter`]): `containers:` entries match a container's name or an id
 //!   prefix of at least 12 hex characters; `discover: true` follows every container, including
-//!   later ones. Graph rule 27 rejects neither being set.
+//!   later ones. With neither set, the listener follows no container and sends nothing.
 //! - **Identity**: the resource carries `container.id`, `container.name`, `container.image.name`,
 //!   `container.image.tag`, and `container.label.<key>` for each key in `labels:`
 //!   ([`ContainerMeta::resource`]). `config.v2.json` is re-read on a poll tick only when its stat
@@ -1260,6 +1260,13 @@ mod tests {
     fn discover_mode_matches_every_container_regardless_of_entries() {
         let filter = ContainerFilter::new(vec![], true);
         assert!(filter.matches("anything", None));
+    }
+
+    #[test]
+    fn no_entries_and_no_discovery_match_no_container() {
+        let filter = ContainerFilter::new(vec![], false);
+        assert!(!filter.matches(&"a".repeat(64), Some("nginx")));
+        assert!(!filter.matches(&"a".repeat(64), None));
     }
 
     #[test]

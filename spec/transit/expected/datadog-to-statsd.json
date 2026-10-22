@@ -3,7 +3,7 @@
     {"timestamp":"2026-09-24T22:40:42.000000000Z","log":{"format":"raw","message":"Version 7.83.3"},"attributes":{"_logit.statsd.event.host":"record-fixtures","_logit.statsd.event.source_type":"System","_logit.statsd.event.title":"Agent Startup"}}
   ], "counters": {}},
   "agent-logs": {"events": [], "counters": {
-    "logit.output.events.skipped{component=out,kind=statsd_out,role=sink}": 3
+    "logit.output.events.skipped{component=out,kind=statsd_out,reason=no_metrics,role=sink}": 3
   }},
   "agent-series-timestamped": {"events": [
     {"timestamp":"2026-09-21T14:13:21.000000000Z","metrics":[{"name":"record.batch.lag","kind":"gauge","value":2.5}],"attributes":{"env":"record","host":"record-fixtures","service":"record-fixtures","team":"obs","version":"1.2.3"}},
@@ -49,7 +49,9 @@
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app.temperature","kind":"gauge","value":0.0}],"attributes":{"env":"prod","host":"worker-2"}},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app.temperature","kind":"gauge_delta","delta":-4.25}],"attributes":{"env":"prod","host":"worker-2"}},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app.unspecified","kind":"gauge","value":2.0}],"attributes":{"env":"prod"}}
-  ], "counters": {}},
+  ], "counters": {
+    "logit.output.metrics.degraded{component=out,kind=statsd_out,reason=negative_gauge,role=sink}": 1
+  }},
   "service-check-carrier": {"events": [
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app.ready","kind":"gauge","value":0.0}],"attributes":{"_logit.statsd.service_check.host":"web-07","_logit.statsd.service_check.name":"app.ready","_logit.statsd.service_check.status":0},"types":{"/attributes/_logit.statsd.service_check.status":"u64"}}
   ], "counters": {}}

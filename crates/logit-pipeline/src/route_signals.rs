@@ -408,6 +408,15 @@ mod tests {
     }
 
     #[test]
+    fn with_every_signal_unset_every_event_is_discarded() {
+        let routes = SignalRoutes::new(&signals(None, None, None), true, &targets(&[]));
+        let (out, totals) = run(&routes, vec![event("a", "lmt"), event("b", "l"), event("c", "")]);
+        assert!(out.is_empty());
+        assert_eq!(totals.sum("logit.component.events.received", &[]), 3.0);
+        assert_eq!(totals.sum("logit.component.events.discarded", &[]), 3.0);
+    }
+
+    #[test]
     fn signals_sharing_a_target_stay_on_one_part() {
         let routes = SignalRoutes::new(
             &signals(Some("events_t"), Some("metrics_t"), Some("events_t")),

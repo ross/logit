@@ -5,6 +5,7 @@
     {"sink":"datadog_out","row":"attributes/map_value","cell":0,"observed":["lost"]},
     {"sink":"datadog_out","row":"attributes/no_host","cell":0,"observed":["normalized"]},
     {"sink":"datadog_out","row":"attributes/number_value","cell":0,"observed":["normalized"]},
+    {"sink":"datadog_out","row":"attributes/prometheus_target","cell":0,"observed":["lost"]},
     {"sink":"datadog_out","row":"attributes/resource_attribute","cell":0,"observed":["normalized"]},
     {"sink":"datadog_out","row":"attributes/scope","cell":0,"observed":["lost"]},
     {"sink":"datadog_out","row":"attributes/string_value","cell":0,"observed":["exact"]},

@@ -4,6 +4,8 @@
     {"timestamp":"2027-01-15T07:59:50.500000000Z","metrics":[{"name":"tail.counter.value","kind":"gauge","value":18446744073709551000}],"attributes":{"_logit.influxdb.measurement":"tail.counter","collectd.host":"logit-fixture","collectd.plugin_instance":"nginx","collectd.type_instance":"bytes_wrapped"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}},"types":{"/metrics/0/value":"u64"}},
     {"timestamp":"2027-01-15T07:59:50.500000000Z","metrics":[{"name":"tail.counter.value","kind":"gauge","value":48213}],"attributes":{"_logit.influxdb.measurement":"tail.counter","collectd.host":"logit-fixture","collectd.plugin_instance":"nginx","collectd.type_instance":"requests"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}},"types":{"/metrics/0/value":"u64"}}
   ], "counters": {
+    "logit.output.metrics.degraded{component=out,kind=influxdb_out,metric_kind=cumulative_sum,role=sink}": 2,
+    "logit.output.metrics.degraded{component=out,kind=influxdb_out,metric_kind=monotonic_delta_sum,role=sink}": 1,
     "logit.output.metrics.skipped{component=out,kind=influxdb_out,reason=no_recorded_value,role=sink}": 1
   }},
   "legacy-time": {"events": [
@@ -11,7 +13,9 @@
     {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"load.load.1.value","kind":"gauge","value":0.5}],"attributes":{"_logit.influxdb.measurement":"load.load.1","collectd.host":"logit-fixture"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}}},
     {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"load.load.2.value","kind":"gauge","value":0.75}],"attributes":{"_logit.influxdb.measurement":"load.load.2","collectd.host":"logit-fixture"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}}}
   ], "counters": {}},
-  "notification": {"events": [], "counters": {}},
+  "notification": {"events": [], "counters": {
+    "logit.output.events.skipped{component=out,kind=influxdb_out,reason=no_metrics,role=sink}": 1
+  }},
   "types-db": {"events": [
     {"timestamp":"2026-09-12T18:22:53.661987063Z","metrics":[{"name":"load.load.longterm.value","kind":"gauge","value":1.1103515625}],"attributes":{"_logit.influxdb.measurement":"load.load.longterm","collectd.host":"logit-fixture"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}}},
     {"timestamp":"2026-09-12T18:22:53.661987063Z","metrics":[{"name":"load.load.midterm.value","kind":"gauge","value":0.39453125}],"attributes":{"_logit.influxdb.measurement":"load.load.midterm","collectd.host":"logit-fixture"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}}},
@@ -55,7 +59,9 @@
     {"timestamp":"2026-09-12T18:22:54.661514430Z","metrics":[{"name":"interface.if_packets.tx.value","kind":"gauge","value":4514}],"attributes":{"_logit.influxdb.measurement":"interface.if_packets.tx","collectd.host":"logit-fixture","collectd.plugin_instance":"eth0"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}}},
     {"timestamp":"2026-09-12T18:22:54.661517736Z","metrics":[{"name":"interface.if_octets.rx.value","kind":"gauge","value":41947307}],"attributes":{"_logit.influxdb.measurement":"interface.if_octets.rx","collectd.host":"logit-fixture","collectd.plugin_instance":"eth0"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}}},
     {"timestamp":"2026-09-12T18:22:54.661517736Z","metrics":[{"name":"interface.if_octets.tx.value","kind":"gauge","value":314361}],"attributes":{"_logit.influxdb.measurement":"interface.if_octets.tx","collectd.host":"logit-fixture","collectd.plugin_instance":"eth0"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}}}
-  ], "counters": {}},
+  ], "counters": {
+    "logit.output.metrics.degraded{component=out,kind=influxdb_out,metric_kind=cumulative_sum,role=sink}": 24
+  }},
   "value-lists": {"events": [
     {"timestamp":"2026-09-12T18:22:53.661987063Z","metrics":[{"name":"load.load.0.value","kind":"gauge","value":0.10693359375}],"attributes":{"_logit.influxdb.measurement":"load.load.0","collectd.host":"logit-fixture"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}}},
     {"timestamp":"2026-09-12T18:22:53.661987063Z","metrics":[{"name":"load.load.1.value","kind":"gauge","value":0.39453125}],"attributes":{"_logit.influxdb.measurement":"load.load.1","collectd.host":"logit-fixture"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}}},
@@ -99,5 +105,7 @@
     {"timestamp":"2026-09-12T18:22:54.661514430Z","metrics":[{"name":"interface.if_packets.1.value","kind":"gauge","value":4514}],"attributes":{"_logit.influxdb.measurement":"interface.if_packets.1","collectd.host":"logit-fixture","collectd.plugin_instance":"eth0"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}}},
     {"timestamp":"2026-09-12T18:22:54.661517736Z","metrics":[{"name":"interface.if_octets.0.value","kind":"gauge","value":41947307}],"attributes":{"_logit.influxdb.measurement":"interface.if_octets.0","collectd.host":"logit-fixture","collectd.plugin_instance":"eth0"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}}},
     {"timestamp":"2026-09-12T18:22:54.661517736Z","metrics":[{"name":"interface.if_octets.1.value","kind":"gauge","value":314361}],"attributes":{"_logit.influxdb.measurement":"interface.if_octets.1","collectd.host":"logit-fixture","collectd.plugin_instance":"eth0"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}}}
-  ], "counters": {}}
+  ], "counters": {
+    "logit.output.metrics.degraded{component=out,kind=influxdb_out,metric_kind=cumulative_sum,role=sink}": 24
+  }}
 }

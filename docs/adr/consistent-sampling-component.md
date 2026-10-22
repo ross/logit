@@ -1,6 +1,6 @@
 ---
 created: 2026-09-22
-updated: 2026-10-13
+updated: 2026-10-21
 ---
 
 # `sample`: consistent, keyed event sampling with an operator override
@@ -100,11 +100,10 @@ wire-breaking change, gated by pinned test vectors in `logit_core::sampling`, an
 dependency (a named, stable algorithm rather than one whose output is allowed to change between
 releases).
 
-**Rate edges follow the graph's "a config that can only ever be a no-op is an error" precedent**
-(rules 10, 12, 54, 59): `rate: 1` is rejected, and `rate: 0` is rejected *unless* `always_keep` is
-set — `rate: 0` with an override is the "only flagged events" debugging mode, and worth having.
-Non-finite and out-of-`[0, 1]` rates are rejected the way `span_sample_rate`'s are (rule 16).
-`missing:` without `key:` is rejected as meaningless.
+**Both rate edges run as written.** `rate: 1` keeps every event. `rate: 0` discards every event
+that `always_keep` doesn't flag and `missing: keep` doesn't keep; with an override, it's the "only
+flagged events" debugging mode. Non-finite and out-of-`[0, 1]` rates are rejected the way
+`span_sample_rate`'s are (rule 16). `missing:` without `key:` is rejected as meaningless.
 
 **The internal-span sampler is untouched.** `trace_is_sampled` keeps taking raw trace-id bits with
 no hash — those ids are `logit`'s own pipeline trace ids, random by construction and never an
@@ -184,3 +183,11 @@ Under [ADR `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md), `sample` 
 counter keeps its tags with the outcome renamed:
 `logit.transform.sample.decisions{outcome="kept"|"discarded", by}`. An event `sample` removes is
 the config's choice, not loss, so it never appears under `*.dropped`.
+
+## Amendment: `rate: 1` and a bare `rate: 0` are legal (2026-10-21)
+
+Rule 61 no longer rejects `rate: 1`, or `rate: 0` without `always_keep`. `rate: 1` keeps every
+event. `rate: 0` discards every event that `always_keep` doesn't flag and `missing: keep` doesn't
+keep, counted in `logit.component.events.discarded`. Validation rejects a config only when it can't
+run, or when it would lose or duplicate data the operator didn't ask to lose or duplicate; a
+pointless config runs as written. The rule's other clauses stand.
