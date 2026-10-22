@@ -111,8 +111,8 @@ event, untouched, and is counted `passed_through` with the reason the table give
 **surviving record is the latest-timestamp record among the records that can merge**, and the
 later in batch order on a tie. Its event keeps its own, untruncated timestamp, and every other
 mergeable record in the set is removed from its event. A `NaN` or infinite delta value, a marker
-on a delta kind, a delta `Sum` of `Bool`s, and a kind with no merge rule can't merge on their
-own. For the kinds that merge
+on a delta kind, a delta `Sum` of `Bool`s, a Datadog `rate` of `Bool`s, and a kind with no merge
+rule can't merge on their own. For the kinds that merge
 (delta `Sum`, a Datadog `rate`, delta `Histogram`, delta `ExponentialHistogram`, and `Samples`), a layout, a
 `sample_rate`, or a value type is compared with the survivor's, so the latest record that can merge
 on its own sets them, and a record that differs from it passes through. The last-write-wins kinds
@@ -124,7 +124,8 @@ on the kind:
 | Kind | Rule |
 |---|---|
 | `Gauge`, any `MetricValue` (a `NaN` gauge included), other than a Datadog `rate` | last write wins: the later value |
-| `Gauge` that's a Datadog `rate`: its `_logit.datadog.type`, the event's value else the resource's, is `rate` | an increment over its interval, so summed as a delta `Sum` is, under the same `non_finite`, `mixed_type`, and `overflow` rules, when its `_logit.datadog.interval`, read the same way, equals the survivor's (both absent counts as equal). A rate whose interval differs, and a rate beside a gauge that isn't one, pass through (`no_merge_rule`). The series key includes the event's attributes and the batch's resource, so neither case reaches a colliding set today; the checks guard the rule against a key change |
+| `Gauge` that's a Datadog `rate`: its `_logit.datadog.type`, the event's value else the resource's, is `rate` | an increment over its interval, so summed as a delta `Sum` is, under the same `non_finite`, `mixed_type`, and `overflow` rules, when its `_logit.datadog.interval`, read the same way, equals the survivor's (both absent counts as equal). A rate of `Bool`s passes through
+(`no_merge_rule`), as a delta `Sum` of them does. A rate whose interval differs, and a rate beside a gauge that isn't one, pass through (`no_merge_rule`). The series key includes the event's attributes and the batch's resource, so neither case reaches a colliding set today; the checks guard the rule against a key change |
 | `Sum`, cumulative, monotonic or not | last write wins |
 | `Histogram`, `ExponentialHistogram`, `Summary`, cumulative | last write wins |
 | `Sum`, delta, monotonic or not | summed, keeping the value type. A `NaN` or infinite value passes through (`non_finite`), as does a value of any other type from the survivor's, such as `I64` beside `F64` or `U64` beside `I64` (`mixed_type`), and one whose addition would overflow the total (`overflow`) |
@@ -137,7 +138,7 @@ on the kind:
 | `SetMembers` | union: the members of both, each once |
 | `Distribution` | `DdSketch::merge`, which re-bins the incoming sketch when the two sketches' mappings differ |
 | `Set` | `HyperLogLog::merge`, a union |
-| a record flagged `NO_RECORDED_VALUE`, on a `Gauge` or a cumulative kind | last write wins against the set's latest value: see below |
+| a record flagged `NO_RECORDED_VALUE`, on a `Gauge` other than a Datadog `rate` or a cumulative kind | last write wins against the set's latest value: see below |
 | a record flagged `NO_RECORDED_VALUE`, on a delta `Sum`, a Datadog `rate`, a delta `Histogram`, or a delta `ExponentialHistogram` | passed through (`no_recorded_value`); the delta values merge among themselves |
 
 Last write wins needs no arithmetic, so it's safe for every kind, `NaN` included. A delta is an
