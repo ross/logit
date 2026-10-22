@@ -671,3 +671,34 @@ Two losses that `graphite_out` left uncounted now have counters:
   left off, beside its `{metric_kind}` count, as `influxdb_out` counts it.
 
 The model mapping table's "event with no metrics" row above predates this.
+
+## Amendment (2026-10-21): the model mapping table's stale rows
+
+The encode table under "Model mapping" predates the loss vocabulary and the typed metric value,
+so several rows name counters the code no longer moves. The 2026-10-13 amendment renamed them in
+prose, and the two amendments above cover the `Sum` and "event with no metrics" rows. The table
+stays as written; this lists every other row it gets wrong, as the code behaves now.
+`crates/logit-proto/src/graphite/mod.rs`'s "Encode: model → wire" section is the canonical copy.
+
+The table's preamble puts every reason under `logit.output.metrics.skipped`. Now a fault reason
+is `logit.output.metrics.dropped`, and `metrics.skipped` is left for a record with nothing to
+carry or a kind the operator chose to skip.
+
+| Row | What the code does now |
+|---|---|
+| NaN / ±inf | dropped, `logit.output.metrics.dropped{reason="unencodable_value"}`, with a throttled `unencodable_value` warning |
+| `NO_RECORDED_VALUE` | skipped, not dropped, and tested before the kind: `logit.output.metrics.skipped{reason="no_recorded_value"}`, with a throttled `no_recorded_value` warning |
+| `GaugeDelta` | dropped, `logit.output.metrics.dropped{reason="unresolved_gauge_delta"}`, with a throttled `gauge_delta_unresolved` warning; the `{metric_kind="gauge_delta"}` label is gone |
+| a kind under `multi_value: skip` | skipped, not dropped, with the counter the row names |
+| `floor(ts/1e9) <= 0` | dropped, `logit.output.metrics.dropped{reason="unencodable_timestamp"}`, with a throttled `unencodable_timestamp` warning |
+| attrs, `tags: drop` | `logit.output.tags.omitted{reason="dialect"}` per attribute, not `tags.dropped` |
+| `Null/Bytes/Timestamp/Map`, or empty-representable `Array` | the tag is omitted, `logit.output.tags.omitted{reason="unrepresentable"}` |
+| tag empty after sanitizing | the tag is omitted, `logit.output.tags.omitted{reason="empty"}`, when its name or its value is empty |
+| two tags collide after rendering | the one whose original name sorts first is kept, the other counted `logit.output.tags.omitted{reason="collision"}` |
+| path empty after sanitizing | dropped, `logit.output.metrics.dropped{reason="empty_name"}`, with a throttled `empty_metric_name` warning |
+| plaintext line > `max_packet_bytes` (UDP) | dropped whole, `logit.output.metrics.dropped{reason="oversize_line"}`, with a throttled `oversize_line` warning |
+| single pickle datapoint > `max_frame_bytes` | dropped whole, `logit.output.metrics.dropped{reason="oversize_datapoint"}`, with a throttled `oversize_datapoint` warning |
+
+The table also has no row for a metric value that isn't an `f64`. A boolean value is written as
+`1` or `0`, counted `logit.output.metrics.normalized{reason="bool_value"}`. An `i64` or `u64`
+value is written with every digit in plaintext and as the nearest `f64` in pickle, uncounted.
