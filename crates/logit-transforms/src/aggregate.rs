@@ -752,9 +752,9 @@ impl Aggregator {
         // Only `group_for` pushes to `groups` and nothing in the loop removes one, so it stays
         // valid for the whole call.
         let mut group_index: Option<usize> = None;
-        // Found on the event's first keyed record, and empty unless an InfluxDB point carries a
-        // string field, so an event without one clones its attributes into each key as before.
-        let mut string_fields: Option<SmallVec<[Symbol; 4]>> = None;
+        // Answered on the event's first keyed record. Only an InfluxDB point carries a string
+        // field, so every other event clones its attributes into each key whole.
+        let mut has_string_field: Option<bool> = None;
         for record in metrics {
             // An OTLP `NO_RECORDED_VALUE` record has no reading to fold in; its default numeric
             // payload would count as a real sample (`MetricRecord::flags`'s doc).
@@ -797,11 +797,11 @@ impl Aggregator {
                 continue;
             }
 
-            let string_fields =
-                string_fields.get_or_insert_with(|| self.string_field_keys.of(&event.attributes));
+            let has_string_field = *has_string_field
+                .get_or_insert_with(|| self.string_field_keys.any(&event.attributes));
             let mut attributes = event.attributes.clone();
-            for &key in string_fields.iter() {
-                attributes.remove_sym(key);
+            if has_string_field {
+                self.string_field_keys.remove_from(&mut attributes);
             }
             let key = SeriesKey { name: record.name, unit: record.unit, attributes };
             let open_seq = self.next_open_seq;
@@ -1471,21 +1471,43 @@ const STRING_FIELD: u8 = 1;
 const OTHER_KEY: u8 = 2;
 
 impl StringFieldKeys {
-    /// The string-field keys among `attributes`.
-    fn of(&mut self, attributes: &AttrMap) -> SmallVec<[Symbol; 4]> {
-        attributes.iter().map(|(key, _)| key).filter(|&key| self.is_string_field(key)).collect()
+    /// Whether any key of `attributes` is a string field.
+    fn any(&mut self, attributes: &AttrMap) -> bool {
+        attributes.iter().any(|(key, _)| self.is_string_field(key))
     }
 
+    /// Removes every string-field key from `attributes`.
+    #[cold]
+    fn remove_from(&mut self, attributes: &mut AttrMap) {
+        let keys: SmallVec<[Symbol; 4]> = attributes
+            .iter()
+            .map(|(key, _)| key)
+            .filter(|&key| self.is_string_field(key))
+            .collect();
+        for key in keys {
+            attributes.remove_sym(key);
+        }
+    }
+
+    #[inline]
     fn is_string_field(&mut self, key: Symbol) -> bool {
+        match self.seen.get(logit_core::interner::index(key)) {
+            Some(&STRING_FIELD) => true,
+            Some(&OTHER_KEY) => false,
+            _ => self.classify(key),
+        }
+    }
+
+    /// A key's first sighting: resolves it and records the answer.
+    #[cold]
+    fn classify(&mut self, key: Symbol) -> bool {
         let i = logit_core::interner::index(key);
         if i >= self.seen.len() {
             self.seen.resize(i + 1, UNSEEN);
         }
-        if self.seen[i] == UNSEEN {
-            let field = logit_core::interner::resolve(key).starts_with(FIELD_ATTR_PREFIX);
-            self.seen[i] = if field { STRING_FIELD } else { OTHER_KEY };
-        }
-        self.seen[i] == STRING_FIELD
+        let field = logit_core::interner::resolve(key).starts_with(FIELD_ATTR_PREFIX);
+        self.seen[i] = if field { STRING_FIELD } else { OTHER_KEY };
+        field
     }
 }
 
