@@ -203,6 +203,9 @@ Entry format and the other areas: [the known-gaps index](README.md).
   `844be079` and `efd50c1e`, whose only difference runs on an error path.
   - **Consequence:** one before/after pair can't attribute a `native-relay` move under about 8%,
     and the VM has no PMU to say which cache or front-end effect is at work.
+    64-byte function alignment doesn't remove the swing: measured on 2026-10-22, both aligned
+    builds read above both unaligned ones, and the #697-to-#702 gap reversed its sign between
+    sittings.
   - **Workaround:** measure a change against two or three neighbouring builds, 20 runs each
     ([performance.md](../design/performance.md) §1, "`native-relay` is code-layout-sensitive").
 - **When and how the load-test harness runs in the development process is undecided.** Nightly,

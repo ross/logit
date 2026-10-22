@@ -1,6 +1,6 @@
 ---
 created: 2026-10-03
-updated: 2026-10-15
+updated: 2026-10-22
 ---
 
 # Release profile: fat LTO and one codegen unit, measured against thin LTO and 16 units
@@ -119,10 +119,11 @@ The native hop carries every event in a split-collection topology. The build run
 - **Follow-up:** with one codegen unit, thin LTO drops UDP statsd events at about an eighth of
   fat LTO's rate. The two builds differ only in how LTO inlines and lays out code across crates, so
   that's the likely cause. A later profile found a layout step in UDP intake that 64-byte function
-  alignment removed (`docs/design/performance.md` §7, "Profile of the `0c0b4c34` step"), which is a
-  candidate to measure here. A perf study of the `udp-statsd` intake path under both
-  builds might recover that rate without giving up the native hop. The `json-parse-x3` difference
-  is the known layout trade above, and it doesn't need a separate study.
+  alignment removed (`docs/design/performance.md` §7, "Profile of the `0c0b4c34` step"). The perf
+  VM measured that alignment on 2026-10-22 and rejected it: no scenario family gained beyond its
+  drift (same section, "2026-10-22 regression check"). A perf study of the `udp-statsd` intake
+  path under both builds might recover that rate without giving up the native hop. The
+  `json-parse-x3` difference is the known layout trade above, and it doesn't need a separate study.
 - Don't rerun this comparison unless the toolchain or a major dependency changes enough to move
   it. To rerun it, build each arm with `script/vm build` and compare the arms with
   `logit-perf compare`. If an arm comes within a few percent of fat LTO, follow up with an
