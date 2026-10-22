@@ -3,7 +3,10 @@
     {"timestamp":"2027-01-15T07:59:30.000000000Z","metrics":[{"name":"requests.value","kind":"gauge","value":1.0}],"attributes":{"_logit.influxdb.measurement":"requests","env":"prod"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}}},
     {"timestamp":"2027-01-15T07:59:30.000000000Z","metrics":[{"name":"temperature.value","kind":"gauge","value":20.0}],"attributes":{"_logit.influxdb.measurement":"temperature"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}}},
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"latency.count","kind":"gauge","value":1.0},{"name":"latency.sum","kind":"gauge","value":5.0},{"name":"latency.0","kind":"gauge","value":5.0},{"name":"latency.0.5","kind":"gauge","value":5.0},{"name":"latency.0.9","kind":"gauge","value":5.0},{"name":"latency.0.99","kind":"gauge","value":5.0},{"name":"latency.1","kind":"gauge","value":5.0}],"attributes":{"_logit.influxdb.measurement":"latency"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}}}
-  ], "counters": {}},
+  ], "counters": {
+    "logit.output.metrics.degraded{component=out,kind=influxdb_out,metric_kind=monotonic_delta_sum,role=sink}": 1,
+    "logit.output.metrics.degraded{component=out,kind=influxdb_out,metric_kind=samples,role=sink}": 1
+  }},
   "counter": {"events": [
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"jobs.started.value","kind":"gauge","value":1.0}],"attributes":{"_logit.influxdb.measurement":"jobs.started"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}}},
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"requests.value","kind":"gauge","value":3.0}],"attributes":{"_logit.influxdb.measurement":"requests","route":"/api"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}}}
@@ -213,18 +216,26 @@
   "timer-h-d": {"events": [
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"request.size.count","kind":"gauge","value":1.0},{"name":"request.size.sum","kind":"gauge","value":512.0},{"name":"request.size.0","kind":"gauge","value":512.0},{"name":"request.size.0.5","kind":"gauge","value":512.0},{"name":"request.size.0.9","kind":"gauge","value":512.0},{"name":"request.size.0.99","kind":"gauge","value":512.0},{"name":"request.size.1","kind":"gauge","value":512.0}],"attributes":{"_logit.influxdb.measurement":"request.size"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}}},
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"response.size.count","kind":"gauge","value":1.0},{"name":"response.size.sum","kind":"gauge","value":60196.0},{"name":"response.size.0","kind":"gauge","value":60196.0},{"name":"response.size.0.5","kind":"gauge","value":60196.0},{"name":"response.size.0.9","kind":"gauge","value":60196.0},{"name":"response.size.0.99","kind":"gauge","value":60196.0},{"name":"response.size.1","kind":"gauge","value":60196.0}],"attributes":{"_logit.influxdb.measurement":"response.size","endpoint":"/orders"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}}}
-  ], "counters": {}},
+  ], "counters": {
+    "logit.output.metrics.degraded{component=out,kind=influxdb_out,metric_kind=samples,role=sink}": 2
+  }},
   "timer-ms": {"events": [
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"latency.count","kind":"gauge","value":1.0},{"name":"latency.sum","kind":"gauge","value":12.0},{"name":"latency.0","kind":"gauge","value":12.0},{"name":"latency.0.5","kind":"gauge","value":12.0},{"name":"latency.0.9","kind":"gauge","value":12.0},{"name":"latency.0.99","kind":"gauge","value":12.0},{"name":"latency.1","kind":"gauge","value":12.0}],"attributes":{"_logit.influxdb.measurement":"latency","route":"/api"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}}},
     {"timestamp":"2027-01-15T08:00:00.000000001Z","metrics":[{"name":"latency.count","kind":"gauge","value":1.0},{"name":"latency.sum","kind":"gauge","value":7.5},{"name":"latency.0","kind":"gauge","value":7.5},{"name":"latency.0.5","kind":"gauge","value":7.5},{"name":"latency.0.9","kind":"gauge","value":7.5},{"name":"latency.0.99","kind":"gauge","value":7.5},{"name":"latency.1","kind":"gauge","value":7.5}],"attributes":{"_logit.influxdb.measurement":"latency","route":"/api"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}}}
-  ], "counters": {}},
+  ], "counters": {
+    "logit.output.metrics.degraded{component=out,kind=influxdb_out,metric_kind=samples,role=sink}": 2
+  }},
   "timer-sample-rate": {"events": [
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"db.query.count","kind":"gauge","value":2.0},{"name":"db.query.sum","kind":"gauge","value":6.4},{"name":"db.query.0","kind":"gauge","value":3.2},{"name":"db.query.0.5","kind":"gauge","value":3.2},{"name":"db.query.0.9","kind":"gauge","value":3.2},{"name":"db.query.0.99","kind":"gauge","value":3.2},{"name":"db.query.1","kind":"gauge","value":3.2}],"attributes":{"_logit.influxdb.measurement":"db.query"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}}},
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"render.time.count","kind":"gauge","value":4.0},{"name":"render.time.sum","kind":"gauge","value":160.0},{"name":"render.time.0","kind":"gauge","value":40.0},{"name":"render.time.0.5","kind":"gauge","value":40.0},{"name":"render.time.0.9","kind":"gauge","value":40.0},{"name":"render.time.0.99","kind":"gauge","value":40.0},{"name":"render.time.1","kind":"gauge","value":40.0}],"attributes":{"_logit.influxdb.measurement":"render.time","route":"/home"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}}}
-  ], "counters": {}},
+  ], "counters": {
+    "logit.output.metrics.degraded{component=out,kind=influxdb_out,metric_kind=samples,role=sink}": 2
+  }},
   "timer-sample-rate-unweighted": {"events": [
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"api.latency.count","kind":"gauge","value":1.0},{"name":"api.latency.sum","kind":"gauge","value":12.0},{"name":"api.latency.0","kind":"gauge","value":12.0},{"name":"api.latency.0.5","kind":"gauge","value":12.0},{"name":"api.latency.0.9","kind":"gauge","value":12.0},{"name":"api.latency.0.99","kind":"gauge","value":12.0},{"name":"api.latency.1","kind":"gauge","value":12.0}],"attributes":{"_logit.influxdb.measurement":"api.latency"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}}}
-  ], "counters": {}},
+  ], "counters": {
+    "logit.output.metrics.degraded{component=out,kind=influxdb_out,metric_kind=samples,role=sink}": 1
+  }},
   "timestamped": {"events": [
     {"timestamp":"2027-01-15T07:59:30.000000000Z","metrics":[{"name":"queue.depth.value","kind":"gauge","value":7.0}],"attributes":{"_logit.influxdb.measurement":"queue.depth"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}}},
     {"timestamp":"2027-01-15T07:59:30.000000000Z","metrics":[{"name":"requests.value","kind":"gauge","value":1.0}],"attributes":{"_logit.influxdb.measurement":"requests"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}}},
@@ -253,5 +264,7 @@
   }},
   "unit-on-samples": {"events": [
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"upload.size.count","kind":"gauge","value":2.0},{"name":"upload.size.sum","kind":"gauge","value":2560.0},{"name":"upload.size.0","kind":"gauge","value":512.0},{"name":"upload.size.0.5","kind":"gauge","value":512.0},{"name":"upload.size.0.9","kind":"gauge","value":2048.0},{"name":"upload.size.0.99","kind":"gauge","value":2048.0},{"name":"upload.size.1","kind":"gauge","value":2048.0}],"attributes":{"_logit.influxdb.measurement":"upload.size"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}}}
-  ], "counters": {}}
+  ], "counters": {
+    "logit.output.metrics.degraded{component=out,kind=influxdb_out,metric_kind=samples,role=sink}": 1
+  }}
 }

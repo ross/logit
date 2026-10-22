@@ -223,7 +223,7 @@
 //! | `gauge/i64` | normalized | `f64_value` | statsd_out writes every digit, and statsd_in reads the number back as an f64, so an integer reads back as a float and one beyond 2^53 rounds. |
 //! | `gauge/u64` | normalized | `f64_value` | statsd_out writes every digit, and statsd_in reads the number back as an f64, so an integer reads back as a float and one beyond 2^53 rounds. |
 //! | `gauge/bool` | normalized | `bool_value`; `logit.output.metrics.normalized{reason=bool_value}` | A boolean is written as `1` or `0` and reads back as that number. |
-//! | `gauge/negative` | degraded | -- | statsd has no negative absolute gauge, so statsd_out writes `0\|g` then `-v\|g` in one datagram. A statsd server ends at the right value, but statsd_in reads the pair as a gauge of 0 and a relative adjustment, uncounted. |
+//! | `gauge/negative` | degraded | `logit.output.metrics.degraded{reason=negative_gauge}` | statsd has no negative absolute gauge, so statsd_out writes `0\|g` then `-v\|g` in one datagram, counted once per record. A statsd server ends at the right value, but statsd_in reads the pair as a gauge of 0 and a relative adjustment. |
 //! | `gauge/prometheus_info` | exact | -- | As any other gauge; the type carrier isn't written. |
 //! | `gauge/prometheus_stateset` | exact | -- | As any other gauge; the type carrier isn't written. |
 //! | `gauge_delta/f64`, under `relative_gauges: true` | exact | -- | A relative `+v\|g` or `-v\|g` line. |

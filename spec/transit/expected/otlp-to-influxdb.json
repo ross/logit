@@ -28,11 +28,15 @@
   ], "counters": {}},
   "gzip": {"events": [
     {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"uploads.completed.value","kind":"gauge","value":5}],"attributes":{"_logit.influxdb.measurement":"uploads.completed","host.name":"web-1","service.name":"checkout"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}}}
-  ], "counters": {}},
+  ], "counters": {
+    "logit.output.metrics.degraded{component=out,kind=influxdb_out,metric_kind=monotonic_delta_sum,role=sink}": 1
+  }},
   "histogram-count": {"events": [
     {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"queue.wait.count","kind":"gauge","value":7.0},{"name":"queue.wait.sum","kind":"gauge","value":4.5},{"name":"queue.wait.1","kind":"gauge","value":3.0},{"name":"queue.wait.+Inf","kind":"gauge","value":7.0}],"attributes":{"_logit.influxdb.measurement":"queue.wait","queue.name":"orders","service.name":"checkout"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}}},
     {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"rpc.server.duration.count","kind":"gauge","value":12.0},{"name":"rpc.server.duration.sum","kind":"gauge","value":30.0},{"name":"rpc.server.duration.+Inf","kind":"gauge","value":12.0}],"attributes":{"_logit.influxdb.measurement":"rpc.server.duration","rpc.service":"cart","service.name":"checkout"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}}}
-  ], "counters": {}},
+  ], "counters": {
+    "logit.output.metrics.degraded{component=out,kind=influxdb_out,metric_kind=histogram,role=sink}": 2
+  }},
   "histogram-neg-inf-bound": {"events": [
     {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"http.server.duration.count","kind":"gauge","value":27.0},{"name":"http.server.duration.1","kind":"gauge","value":9.0},{"name":"http.server.duration.5","kind":"gauge","value":11.0},{"name":"http.server.duration.+Inf","kind":"gauge","value":27.0}],"attributes":{"_logit.influxdb.measurement":"http.server.duration","host.name":"web-1","http.route":"/cart","service.name":"checkout"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}}}
   ], "counters": {
