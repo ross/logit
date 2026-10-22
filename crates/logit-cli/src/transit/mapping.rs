@@ -66,7 +66,7 @@
 //!   series'), on a `degraded`, `skipped`, `dropped`, or `lost` cell, unless `reason` says why
 //!   there's none. A `lost` or `degraded` cell's reason may be `structural`: the destination's
 //!   format has no slot for a field (on a `degraded` cell, one the record loses while keeping its
-//!   value, such as a sum's temporality), so every such record loses it and the table is its
+//!   kind and shape), so every such record loses it and the table is its
 //!   record; a record written as another kind or shape names its counter (ADR
 //!   `telemetry-loss-vocabulary`'s amendment "structural loss has no counter"). `uncounted`, a
 //!   loss the sink doesn't count yet, is accepted only on a cell [`UNCOUNTED_ALLOWED`] names, and

@@ -276,10 +276,10 @@ Entry format and the other areas: [the known-gaps index](README.md).
 
   | Direction | Mapping | Counter | Why |
   |---|---|---|---|
-  | encode (InfluxDB) | `sum/delta_monotonic` → **degraded** | none (structural) | A `value` field of a measurement named for the record, its temporality and monotonicity dropped, which influxdb_in reads back as a gauge named `<name>.value`. |
-  | encode (InfluxDB) | `sum/delta_nonmonotonic` → **degraded** | none (structural) | A `value` field, its temporality and monotonicity dropped, read back as a gauge named `<name>.value`. |
-  | encode (InfluxDB) | `sum/cumulative_monotonic` → **degraded** | none (structural) | A `value` field holding the running total, its temporality and monotonicity dropped, read back as a gauge named `<name>.value`. |
-  | encode (InfluxDB) | `sum/cumulative_nonmonotonic` → **degraded** | none (structural) | A `value` field, its temporality and monotonicity dropped, read back as a gauge named `<name>.value`. |
+  | encode (InfluxDB) | `sum/delta_monotonic` → **degraded** | `logit.output.metrics.degraded{metric_kind=monotonic_delta_sum}` | A `value` field of a measurement named for the record, its temporality and monotonicity dropped, which influxdb_in reads back as a gauge named `<name>.value`, counted once per record. |
+  | encode (InfluxDB) | `sum/delta_nonmonotonic` → **degraded** | `logit.output.metrics.degraded{metric_kind=non_monotonic_delta_sum}` | A `value` field, its temporality and monotonicity dropped, read back as a gauge named `<name>.value`, counted once per record. |
+  | encode (InfluxDB) | `sum/cumulative_monotonic` → **degraded** | `logit.output.metrics.degraded{metric_kind=cumulative_sum}` | A `value` field holding the running total, its temporality and monotonicity dropped, read back as a gauge named `<name>.value`, counted once per record. |
+  | encode (InfluxDB) | `sum/cumulative_nonmonotonic` → **degraded** | `logit.output.metrics.degraded{metric_kind=cumulative_sum}` | A `value` field, its temporality and monotonicity dropped, read back as a gauge named `<name>.value`, counted once per record. |
   | encode (InfluxDB) | `gauge_delta/f64` → **dropped** | `logit.output.metrics.dropped{reason=unresolved_gauge_delta}` | An unresolved relative adjustment is dropped, with a throttled `gauge_delta_unresolved` warning; an `aggregate` upstream resolves it into a gauge. |
   | encode (InfluxDB) | `gauge_delta/i64` → **dropped** | `logit.output.metrics.dropped{reason=unresolved_gauge_delta}` | Dropped, as for a float adjustment. |
   | encode (InfluxDB) | `gauge_delta/u64` → **dropped** | `logit.output.metrics.dropped{reason=unresolved_gauge_delta}` | Dropped, as for a float adjustment. |

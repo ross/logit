@@ -112,10 +112,10 @@
 //!
 //! | Row | Class | Reason or counter | What a consumer sees |
 //! |---|---|---|---|
-//! | `sum/delta_monotonic` | degraded | structural | A `value` field of a measurement named for the record, its temporality and monotonicity dropped, which influxdb_in reads back as a gauge named `<name>.value`. |
-//! | `sum/delta_nonmonotonic` | degraded | structural | A `value` field, its temporality and monotonicity dropped, read back as a gauge named `<name>.value`. |
-//! | `sum/cumulative_monotonic` | degraded | structural | A `value` field holding the running total, its temporality and monotonicity dropped, read back as a gauge named `<name>.value`. |
-//! | `sum/cumulative_nonmonotonic` | degraded | structural | A `value` field, its temporality and monotonicity dropped, read back as a gauge named `<name>.value`. |
+//! | `sum/delta_monotonic` | degraded | `logit.output.metrics.degraded{metric_kind=monotonic_delta_sum}` | A `value` field of a measurement named for the record, its temporality and monotonicity dropped, which influxdb_in reads back as a gauge named `<name>.value`, counted once per record. |
+//! | `sum/delta_nonmonotonic` | degraded | `logit.output.metrics.degraded{metric_kind=non_monotonic_delta_sum}` | A `value` field, its temporality and monotonicity dropped, read back as a gauge named `<name>.value`, counted once per record. |
+//! | `sum/cumulative_monotonic` | degraded | `logit.output.metrics.degraded{metric_kind=cumulative_sum}` | A `value` field holding the running total, its temporality and monotonicity dropped, read back as a gauge named `<name>.value`, counted once per record. |
+//! | `sum/cumulative_nonmonotonic` | degraded | `logit.output.metrics.degraded{metric_kind=cumulative_sum}` | A `value` field, its temporality and monotonicity dropped, read back as a gauge named `<name>.value`, counted once per record. |
 //! | `sum/f64` | exact | -- | A float field, written as the shortest string that reads back to the same bits. |
 //! | `sum/i64` | exact | -- | An `<n>i` integer field, read back as an `i64`. |
 //! | `sum/u64` | exact | -- | An `<n>u` unsigned field, read back as a `u64`. |

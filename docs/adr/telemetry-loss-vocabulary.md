@@ -289,7 +289,7 @@ uncounted:
 - **Structural is about fields; a record written as another kind or shape is counted.** A field
   the format has no slot for (a unit, a description, a scope, a start time, `min` and `max`, a
   temporality, exemplars, a foreign carrier) is structural, on a `lost` or `degraded` cell with
-  no counter, as `influxdb_out`'s `Sum` keeps its value and loses its temporality. A record whose
+  no counter. A record whose
   kind or shape is rewritten counts `metrics.degraded{metric_kind}`, as every sink already did
   before this amendment: a sketch as quantile fields or gauges, a set's estimate as a gauge, a
   histogram or summary flattened to fields.
@@ -312,7 +312,9 @@ uncounted:
   - `output.metrics.degraded{reason="sample_rate_rounded"}` at `datadog_out`, and
     `{reason="negative_gauge"}` at `statsd_out`.
   - `output.metrics.degraded{metric_kind}` for a kind written in another shape:
-    `"distribution"|"samples"|"histogram"|"summary"|"set"` at `influxdb_out`, `"summary"` for a
+    `"distribution"|"samples"|"histogram"|"summary"|"set"` at `influxdb_out`, and a `Sum`, read
+    back as a gauge, under the shape `statsd_out` and `graphite_out` name
+    (`"monotonic_delta_sum"|"non_monotonic_delta_sum"|"cumulative_sum"`); `"summary"` for a
     delta summary at `datadog_out`, and `"delta_sum"` for the stale marker `prometheus_out`'s
     remote-write sends for a flagged delta monotonic `Sum`, which reads back cumulative.
 - **`uncounted` remains only where this change doesn't reach.** The table's schema accepts it on

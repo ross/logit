@@ -130,6 +130,12 @@ pub struct EncodeStats {
     pub degraded_histogram: usize,
     pub degraded_summary: usize,
     pub degraded_set: usize,
+    /// A `Sum` written as a plain `value` field, its temporality and monotonicity gone, which
+    /// reads back as a gauge, once per record written, by shape:
+    /// `metrics.degraded{metric_kind="monotonic_delta_sum"|"non_monotonic_delta_sum"|"cumulative_sum"}`.
+    pub degraded_monotonic_delta_sum: usize,
+    pub degraded_non_monotonic_delta_sum: usize,
+    pub degraded_cumulative_sum: usize,
     /// An event with no metric record and no `_logit.influxdb.measurement` carrier, which has
     /// nothing to write: `events.skipped{reason="no_metrics"}`.
     pub skipped_no_metrics: usize,
@@ -275,6 +281,25 @@ fn carrier_field<'a>(metric: &MetricRecord, measurement: &str) -> Option<(&'a st
     Some((key, value))
 }
 
+/// A `Sum`'s shape, as `metrics.degraded{metric_kind}` names it when the sum leaves as a plain
+/// field: the names `statsd_out` and `graphite_out` count the same loss under.
+#[derive(Clone, Copy)]
+enum SumShape {
+    MonotonicDelta,
+    NonMonotonicDelta,
+    Cumulative,
+}
+
+impl SumShape {
+    fn of(sum: &logit_core::Sum) -> Self {
+        match (sum.temporality, sum.monotonic) {
+            (logit_core::Temporality::Delta, true) => Self::MonotonicDelta,
+            (logit_core::Temporality::Delta, false) => Self::NonMonotonicDelta,
+            _ => Self::Cumulative,
+        }
+    }
+}
+
 /// The encoder's per-batch state, borrowed apart so a line can be built while the tag suffix is
 /// read.
 struct Ctx<'a> {
@@ -319,7 +344,12 @@ impl Ctx<'_> {
             if matches!(outcome, Fields::Degraded) {
                 self.stats.degraded_non_finite_component += 1;
             }
-            match metric.kind {
+            match &metric.kind {
+                MetricKind::Sum(sum) => match SumShape::of(sum) {
+                    SumShape::MonotonicDelta => self.stats.degraded_monotonic_delta_sum += 1,
+                    SumShape::NonMonotonicDelta => self.stats.degraded_non_monotonic_delta_sum += 1,
+                    SumShape::Cumulative => self.stats.degraded_cumulative_sum += 1,
+                },
                 MetricKind::Distribution(_) => self.stats.degraded_distribution += 1,
                 MetricKind::Samples(_) => self.stats.degraded_samples += 1,
                 MetricKind::Histogram(_) => self.stats.degraded_histogram += 1,
@@ -337,6 +367,8 @@ impl Ctx<'_> {
         self.fields.clear();
         self.deferred.clear();
         let mut written = 0;
+        // Sums by `SumShape`, counted once the line is written.
+        let mut sums = [0usize; 3];
         for metric in &event.metrics {
             if self.skip_no_recorded_value(metric) {
                 continue;
@@ -355,6 +387,9 @@ impl Ctx<'_> {
             }
             self.push_carrier_field(key, FieldValue::Typed(value));
             written += 1;
+            if let MetricKind::Sum(sum) = &metric.kind {
+                sums[SumShape::of(sum) as usize] += 1;
+            }
         }
         for (key, value) in event.attributes.iter() {
             let Some(field) = resolve(key).strip_prefix(FIELD_ATTR_PREFIX) else {
@@ -386,7 +421,12 @@ impl Ctx<'_> {
             self.line.clear();
             push_escaped_measurement(self.line, measurement);
             self.line.push_str(tag_suffix);
-            self.finish_line(event.timestamp, written);
+            if self.finish_line(event.timestamp, written) {
+                self.stats.degraded_monotonic_delta_sum += sums[SumShape::MonotonicDelta as usize];
+                self.stats.degraded_non_monotonic_delta_sum +=
+                    sums[SumShape::NonMonotonicDelta as usize];
+                self.stats.degraded_cumulative_sum += sums[SumShape::Cumulative as usize];
+            }
         }
         for metric in &event.metrics {
             // Flagged records were counted by the pass above.
@@ -1373,7 +1413,8 @@ mod tests {
             "got: {out}"
         );
         assert_eq!(rest, "value=1 1700000000000000000\n");
-        assert_eq!(*encoder.stats(), EncodeStats::default(), "carriers are skipped uncounted");
+        let want = EncodeStats { degraded_monotonic_delta_sum: 1, ..EncodeStats::default() };
+        assert_eq!(*encoder.stats(), want, "carriers are skipped uncounted");
     }
 
     /// A private attribute, on the event or the resource, never becomes a tag and is never
@@ -1391,7 +1432,8 @@ mod tests {
         let batch = EventBatch { resource: Arc::new(resource), scope: None, events: vec![event] };
         let out = String::from_utf8(encoder.encode(&batch).unwrap().to_vec()).unwrap();
         assert_eq!(out, "page.views,env=prod value=1 1700000000000000000\n");
-        assert_eq!(*encoder.stats(), EncodeStats::default(), "private keys are skipped uncounted");
+        let want = EncodeStats { degraded_monotonic_delta_sum: 1, ..EncodeStats::default() };
+        assert_eq!(*encoder.stats(), want, "private keys are skipped uncounted");
     }
 
     #[test]

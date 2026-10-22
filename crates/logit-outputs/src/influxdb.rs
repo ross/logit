@@ -451,7 +451,7 @@ pub fn emit_encode_stats(telemetry: &Telemetry, stats: &EncodeStats) {
     const DROPPED: &str = "logit.output.metrics.dropped";
     const SKIPPED: &str = "logit.output.metrics.skipped";
     const DEGRADED: &str = "logit.output.metrics.degraded";
-    let rows: [(usize, &str, (&str, &str)); 23] = [
+    let rows: [(usize, &str, (&str, &str)); 26] = [
         (stats.tags_normalized_multi_value, TAGS_NORMALIZED, ("reason", "multi_value")),
         (stats.tags_omitted_unrepresentable, TAGS_OMITTED, ("reason", "unrepresentable")),
         (stats.tags_omitted_empty, TAGS_OMITTED, ("reason", "empty")),
@@ -474,6 +474,13 @@ pub fn emit_encode_stats(telemetry: &Telemetry, stats: &EncodeStats) {
         (stats.degraded_histogram, DEGRADED, ("metric_kind", "histogram")),
         (stats.degraded_summary, DEGRADED, ("metric_kind", "summary")),
         (stats.degraded_set, DEGRADED, ("metric_kind", "set")),
+        (stats.degraded_monotonic_delta_sum, DEGRADED, ("metric_kind", "monotonic_delta_sum")),
+        (
+            stats.degraded_non_monotonic_delta_sum,
+            DEGRADED,
+            ("metric_kind", "non_monotonic_delta_sum"),
+        ),
+        (stats.degraded_cumulative_sum, DEGRADED, ("metric_kind", "cumulative_sum")),
         (stats.skipped_no_metrics, "logit.output.events.skipped", ("reason", "no_metrics")),
     ];
     for (count, name, label) in rows {
@@ -1102,8 +1109,8 @@ mod tests {
         assert_counted_once_per_batch(single, retried, &ENCODE_SIDE, &[]);
     }
 
-    /// Each event with nothing to write counts once, a log-only one and an empty one alike; a
-    /// counter beside them counts neither.
+    /// Each event with nothing to write counts once, a log-only one and an empty one alike, and
+    /// a counter beside them doesn't.
     #[test]
     fn a_metricless_event_is_counted() {
         use logit_pipeline::test_util::TelemetryProbe;
@@ -1129,13 +1136,12 @@ mod tests {
             ]))
             .unwrap();
         emit_encode_stats(&telemetry, encoder.stats());
-        assert_eq!(probe.sum("logit.output.metrics.degraded", &[]), 0.0);
         assert_eq!(probe.sum("logit.output.events.skipped", &[("reason", "no_metrics")]), 2.0);
     }
 
-    /// A record written as fields of another shape counts once under its kind, and one dropped
-    /// before its line is written (a measurement `influxd` reads as a comment) counts its drop
-    /// alone.
+    /// A record written as fields of another shape counts once under its kind, a sum under its
+    /// shape, and one dropped when its line is written (a second point of a series at
+    /// `i64::MAX - 1`, with no free timestamp left) counts its drop alone.
     #[test]
     fn a_record_written_as_another_shape_is_counted_by_kind() {
         use logit_core::{DdSketch, Histogram, HyperLogLog, Samples, Summary, Temporality};
@@ -1159,6 +1165,20 @@ mod tests {
             sum: 0.2,
             temporality: Temporality::Cumulative,
         });
+        let sum = |temporality, monotonic| {
+            MetricKind::Sum(logit_core::Sum {
+                value: logit_core::MetricValue::F64(1.0),
+                temporality,
+                monotonic,
+            })
+        };
+        let late = |name: &str, kind| {
+            Event::metric(
+                i64::MAX - 1,
+                AttrMap::new(),
+                MetricRecord::new(logit_core::interner::intern(name), kind),
+            )
+        };
         let mut sketch = DdSketch::new();
         sketch.add(1.0);
         encoder
@@ -1168,16 +1188,59 @@ mod tests {
                 metric_event("buckets", histogram(), &[]),
                 metric_event("rpc", summary, &[]),
                 metric_event("users", MetricKind::Set(HyperLogLog::default()), &[]),
-                metric_event("#comment", histogram(), &[]),
+                metric_event("hits", sum(Temporality::Delta, true), &[]),
+                metric_event("level", sum(Temporality::Delta, false), &[]),
+                metric_event("total", sum(Temporality::Cumulative, true), &[]),
+                late("buckets", histogram()),
+                late("buckets", histogram()),
+                late("total", sum(Temporality::Cumulative, true)),
+                late("total", sum(Temporality::Cumulative, true)),
             ]))
             .unwrap();
         emit_encode_stats(&telemetry, encoder.stats());
-        for kind in ["distribution", "samples", "histogram", "summary", "set"] {
+        let kinds = [
+            ("distribution", 1.0),
+            ("samples", 1.0),
+            ("histogram", 2.0),
+            ("summary", 1.0),
+            ("set", 1.0),
+            ("monotonic_delta_sum", 1.0),
+            ("non_monotonic_delta_sum", 1.0),
+            ("cumulative_sum", 2.0),
+        ];
+        for (kind, n) in kinds {
             let counted = probe.sum("logit.output.metrics.degraded", &[("metric_kind", kind)]);
-            assert_eq!(counted, 1.0, "{kind}");
+            assert_eq!(counted, n, "{kind}");
         }
-        let dropped = [("reason", "comment_measurement")];
-        assert_eq!(probe.sum("logit.output.metrics.dropped", &dropped), 1.0);
+        let dropped = [("reason", "timestamp_overflow")];
+        assert_eq!(probe.sum("logit.output.metrics.dropped", &dropped), 2.0);
+    }
+
+    /// A `Sum` written as a field of its measurement carrier's line counts its shape, as one on a
+    /// line of its own does.
+    #[test]
+    fn a_sum_on_a_carrier_line_is_counted_by_shape() {
+        use logit_pipeline::test_util::TelemetryProbe;
+
+        let mut probe = TelemetryProbe::new();
+        let telemetry = probe.telemetry("out", "influxdb_out", "sink");
+        let mut encoder = InfluxLineEncoder::new();
+        let mut event = metric_event(
+            "cpu.total",
+            MetricKind::Sum(logit_core::Sum {
+                value: logit_core::MetricValue::F64(4.0),
+                temporality: logit_core::Temporality::Cumulative,
+                monotonic: true,
+            }),
+            &[],
+        );
+        event.attributes.insert(logit_proto::influxdb::ATTR_MEASUREMENT, Value::str("cpu"));
+        let body = encoder.encode(&batch_with(vec![event])).unwrap();
+        assert!(std::str::from_utf8(&body).unwrap().starts_with("cpu total=4"), "{body:?}");
+        emit_encode_stats(&telemetry, encoder.stats());
+        let kind = [("metric_kind", "cumulative_sum")];
+        assert_eq!(probe.sum("logit.output.metrics.degraded", &kind), 1.0);
+        assert_eq!(encoder.stats().metrics_normalized_carrier_mismatch, 0);
     }
 
     /// A batch that encodes to an empty body returns `Ok` early and still leaves the accounting

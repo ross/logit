@@ -13,8 +13,8 @@ classes:
     normalization doesn't touch reads back exact.
   degraded: >-
     The value survives in a lesser kind or shape, such as a sketch written as dotted count and
-    quantile series; the cell names the counter that counts it. A cell whose loss is only a field
-    the format has no slot for, such as a sum's temporality, has reason structural instead.
+    quantile series; the cell names the counter that counts it. A cell whose record keeps its kind
+    and shape and loses only a field the format has no slot for has reason structural instead.
   lost: >-
     A field the record loses while the record itself survives; the cell names the counter that
     counts it, or its reason is structural when the destination's format has no slot for it.
@@ -50,10 +50,11 @@ rows:
           upstream turns it into a counter.
       influxdb_out:
         class: degraded
-        reason: structural
+        counter: logit.output.metrics.degraded{metric_kind=monotonic_delta_sum}
         text: >-
           A `value` field of a measurement named for the record, its temporality and monotonicity
-          dropped, which influxdb_in reads back as a gauge named `<name>.value`.
+          dropped, which influxdb_in reads back as a gauge named `<name>.value`, counted once per
+          record.
       otlp_out:
         class: exact
         text: An OTLP `Sum` with delta temporality and the monotonic flag.
@@ -87,10 +88,10 @@ rows:
         text: A bare delta sum is dropped, as for a monotonic one.
       influxdb_out:
         class: degraded
-        reason: structural
+        counter: logit.output.metrics.degraded{metric_kind=non_monotonic_delta_sum}
         text: >-
           A `value` field, its temporality and monotonicity dropped, read back as a gauge named
-          `<name>.value`.
+          `<name>.value`, counted once per record.
       otlp_out:
         class: exact
         text: An OTLP `Sum` with delta temporality, not monotonic.
@@ -125,10 +126,10 @@ rows:
           lacks it, so such a record reads back under the longer name.
       influxdb_out:
         class: degraded
-        reason: structural
+        counter: logit.output.metrics.degraded{metric_kind=cumulative_sum}
         text: >-
           A `value` field holding the running total, its temporality and monotonicity dropped,
-          read back as a gauge named `<name>.value`.
+          read back as a gauge named `<name>.value`, counted once per record.
       otlp_out:
         class: exact
         text: An OTLP `Sum` with cumulative temporality and the monotonic flag.
@@ -160,10 +161,10 @@ rows:
         text: Prometheus has no non-monotonic counter, so the running total is a `gauge`.
       influxdb_out:
         class: degraded
-        reason: structural
+        counter: logit.output.metrics.degraded{metric_kind=cumulative_sum}
         text: >-
           A `value` field, its temporality and monotonicity dropped, read back as a gauge named
-          `<name>.value`.
+          `<name>.value`, counted once per record.
       otlp_out:
         class: exact
         text: An OTLP `Sum` with cumulative temporality, not monotonic.
