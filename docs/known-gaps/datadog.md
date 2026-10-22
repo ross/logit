@@ -143,17 +143,15 @@ Entry format and the other areas: [the known-gaps index](README.md).
   - **Workaround:** keep one series' readings of one second in one batch: an `aggregate` upstream
     leaves one point per series per window.
 - **`datadog_out` reports every hostless sender under the relay's hostname.** It sends the
-  process hostname for a metric with no `host.name` and no DogStatsD `host:` tag, an event or
-  service check with no `h:` field, no `host.name`, and no `host:` tag, and a log with none of
-  `hostname`, `host.name`, `syslog.hostname`, or `host`. An Agent does the same for a DogStatsD
+  process hostname for a metric with no `host.name`, no DogStatsD `host:` tag, and no
+  `collectd.host`, an event or service check with no `h:` field, no `host.name`, no `host:` tag,
+  and no `collectd.host`, and a log with none of `hostname`, `host.name`, `syslog.hostname`,
+  `host`, or `collectd.host`. An Agent does the same for a DogStatsD
   client that names no host.
   - **Consequence:** many senders behind one central `logit` show in Datadog as one host, with
     their series merged under it. Datadog bills per host, so this costs what one Agent would.
   - **Workaround:** stamp `host.name` per sender upstream with `set`, or have each DogStatsD
     client send a `host:` tag (or `h:` on an event or check).
-- **`datadog_out` ignores `collectd.host`.** It takes a metric's host only from `host.name` or a
-  `host` tag, so every collectd sender behind a relay lands on the relay's process hostname.
-  A fix is planned.
 - **`datadog_trace_out` under `version: v0.4` drops the trace chunk and tracer payload fields.**
   v0.4 has no field for a chunk's `_logit.datadog.chunk.*` fields (sampling priority, origin,
   dropped flag, tags) or for the tracer payload fields no request header carries
@@ -193,14 +191,16 @@ Entry format and the other areas: [the known-gaps index](README.md).
     when the same metrics arrive through `aggregate` and `datadog_out`; query the distribution
     instead.
   - **Revisit trigger:** an operator who needs the Agent's five series.
-- **`datadog_out` writes a metric's unit as the record carries it, where Datadog's exporter maps
-  it.** The exporter's `AddUnits` gate, on by default, maps an OTLP UCUM unit to Datadog's name
-  for it (`ms` to `millisecond`, `By` to `byte`) and writes no unit for one it can't map
-  (`attributes.UnitMapper`). `datadog_out` sends the record's own unit, `ms` included, which
-  Datadog doesn't recognize as a unit.
-  - **Consequence:** a series sent through `datadog_out` shows no unit, or a different one, where
-    the same series sent through the exporter shows Datadog's.
-  - **Revisit trigger:** an operator who relies on Datadog's unit display or conversions.
+- **`datadog_out` leaves off a Datadog unit name the exporter's mapper can't produce.** A series'
+  unit passes through when it's a Datadog unit name that Datadog's OTel exporter's
+  `UnitMapper` can write (`byte`, `millisecond`, `request`, a rate of two), or `nanocore`; else
+  it's mapped from UCUM as the exporter maps it; else it's left off, counted
+  `logit.output.fields.omitted{reason="unit_unmapped"}`. Datadog's unit catalog has names
+  outside that set, so a `datadog_in` series carrying one loses its unit on the way back out.
+  - **Consequence:** the `datadog_in -> datadog_out` relay isn't lossless for such a unit. An
+    Agent rarely sets a series unit, since Datadog keeps units in metric metadata.
+  - **Revisit trigger:** a relayed series whose unit Datadog shows and `datadog_out` drops; the
+    fix is a fuller Datadog unit list in `logit_proto::datadog::units`.
 - **Whether an Agent's TCP `logs` listener parses a JSON body from `syslog_out` is untested.** An
   Agent's TCP `logs` listener takes `syslog_out`'s syslog-formatted lines, but no run has checked
   that it parses a JSON body into attributes.

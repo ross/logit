@@ -2,6 +2,9 @@
 # `<Plugin network> Server "<this host>" "25826" </Plugin>` at it. docs/datadog.md's "collectd to
 # Datadog" has the mapping.
 #
+# Each value list and notification goes out under its collectd host, so every sender keeps its
+# own Datadog host; a `host.name` stamped upstream with `set` takes its place.
+#
 # collectd's four data-source types reach Datadog as follows:
 #
 #   * GAUGE is a `gauge`.

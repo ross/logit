@@ -532,7 +532,7 @@ replace a host an event or its resource carries:
 |---|---|---|
 | `syslog_out` | `syslog.hostname` | HOSTNAME, unless the sink sets its own `hostname:` |
 | `splunk_hec_out` | resource `host.name` | the envelope `host` |
-| `datadog_out` | a metric's `host.name` or DogStatsD `host:` tag; an event's or check's `h:` field, `host.name`, or `host:` tag; a log's `hostname`, `host.name`, `syslog.hostname`, or `host` | the host of a metric, log, event, or service check |
+| `datadog_out` | a metric's `host.name`, DogStatsD `host:` tag, or `collectd.host`; an event's or check's `h:` field, `host.name`, `host:` tag, or `collectd.host`; a log's `hostname`, `host.name`, `syslog.hostname`, `host`, or `collectd.host` | the host of a metric, log, event, or service check |
 
 So a relay sends the relay's hostname for whatever arrived without one. Through `datadog_out`,
 that means every DogStatsD sender that names no host reports as one Datadog host, as it would
