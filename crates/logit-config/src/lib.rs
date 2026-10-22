@@ -3080,9 +3080,10 @@ pub enum ComponentKind {
     /// rather than replaced. A reading that can't merge is forwarded untouched, and the
     /// sink may still drop it as a duplicate: a `NaN` increment, a delta of another value type
     /// than the survivor's (`i64` beside `f64`, or `u64` beside `i64`), a total that would
-    /// overflow, a gauge delta, a delta summary, a delta sum of booleans, or a histogram with other
-    /// buckets. An event left with no metric, log, or span is discarded. It keeps no state
-    /// between batches, so two batches' readings of one instant both reach the sink.
+    /// overflow, a gauge delta, a delta summary, a delta sum or a Datadog rate of booleans, or a
+    /// histogram with other buckets. An event left with no metric, log, or span is discarded. It
+    /// keeps no state between batches, so two batches' readings of one instant both reach the
+    /// sink.
     DedupTimestamps {
         /// The bucket width: two readings of one series collide when their timestamps divided by
         /// it, rounded down, are equal. Match the destination's timestamp resolution: `1ms` for
