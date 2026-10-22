@@ -331,7 +331,7 @@ whole event, and rule 92 keeps one component from reading two of its targets.
 `validate_semantics` (`crates/logit-cli/src/pipeline.rs`) is a thin wrapper around it. The
 canonical list, with each rule's reasoning, is `graph.rs`'s module doc; each rule is enforced at
 its `// Rule N` label in `resolve`. Each entry below names what is rejected; the numbers are
-identifiers, not execution order. Several rules share one principle: **a config that can only be
+identifiers, not execution order, and a retired rule's number (21) is not reused. Several rules share one principle: **a config that can only be
 a no-op, a black hole, or an impossible bound is an error**, and so is a setting that would be
 silently ignored. `0` for a count or duration bound is usually impossible, not small.
 
@@ -358,7 +358,6 @@ silently ignored. `0` for a count or duration bound is usually impossible, not s
 19. An empty `trace_context` `trace_id`, `span_id`, or `flags` field name, after `format`'s
     defaults.
 20. A `scale` with no `fields`, an empty field name, or a non-finite factor.
-21. An empty `signals:` list, or all three payload signals on `drop_signals`.
 22. An `otlp_out` header the transport sets itself, or two that differ only in case.
 23. An `otlp_out` `paths:` under `protocol: grpc`.
 24. An inconsistent `otlp_out` `tls:`, or one under a non-`https://` endpoint.

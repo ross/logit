@@ -363,6 +363,35 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_signal_list_does_what_it_says() {
+        let resource = default_resource();
+        let none_listed = SignalSet::default();
+        for mode in [MatchMode::AnyOf, MatchMode::Only] {
+            let mut has = HasSignal::new(none_listed, mode);
+            assert!(!has.process(&resource, &mut log_event()), "has_signal [] drops a log");
+            assert!(!has.process(&resource, &mut string_only_event()));
+        }
+        let mut keep = KeepSignals::new(none_listed);
+        assert!(!keep.process(&resource, &mut log_event()), "keep_signals [] strips and drops");
+        assert!(!keep.process(&resource, &mut string_only_event()));
+        let mut drop = DropSignals::new(none_listed);
+        let mut event = add_metric(log_event());
+        assert!(drop.process(&resource, &mut event), "drop_signals [] passes a payload");
+        assert!(event.log.is_some() && !event.metrics.is_empty(), "untouched");
+        assert!(!drop.process(&resource, &mut string_only_event()), "an empty event still drops");
+    }
+
+    #[test]
+    fn drop_signals_naming_every_payload_signal_drops_every_event() {
+        let resource = default_resource();
+        let all = SignalSet { logs: true, metrics: true, traces: true, ..SignalSet::default() };
+        let mut drop = DropSignals::new(all);
+        assert!(!drop.process(&resource, &mut add_metric(log_event())));
+        assert!(!drop.process(&resource, &mut span_event()));
+        assert!(!drop.process(&resource, &mut string_only_event()));
+    }
+
+    #[test]
     fn keep_signals_none_still_drops_an_event_its_strip_emptied() {
         let mut keep =
             KeepSignals::new(SignalSet { logs: true, none: true, ..SignalSet::default() });

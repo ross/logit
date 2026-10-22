@@ -2761,8 +2761,8 @@ pub enum ComponentKind {
     /// the event carry nothing outside `signals`. Listing `none` also matches an event carrying
     /// no signal at all, under either mode: `signals: [metrics, none]` with `mode: only` forwards
     /// an event carrying only metrics, or nothing. Place `keep_signals`/`drop_signals` ahead of
-    /// this instead if unwanted payloads must be stripped rather than tolerated. `signals` may
-    /// not be empty.
+    /// this instead if unwanted payloads must be stripped rather than tolerated. An empty
+    /// `signals` forwards nothing.
     HasSignal {
         signals: Vec<Signal>,
         #[serde(default)]
@@ -2772,15 +2772,15 @@ pub enum ComponentKind {
     /// `keep`'s relationship to `remove`. Unlike `has_signal`, this mutates: an event carrying a
     /// log and derived metrics loses the metrics under `signals: [logs]` but keeps the log. An
     /// event left with no payload is dropped. Listing `none` keeps an event that arrived with no
-    /// payload; without it, such an event is dropped. `signals` may not be empty (that would drop
-    /// every event). Naming `logs`, `metrics`, and `traces` together keeps every payload and drops
+    /// payload; without it, such an event is dropped. An empty `signals` drops every
+    /// event. Naming `logs`, `metrics`, and `traces` together keeps every payload and drops
     /// an event that arrived with none.
     KeepSignals { signals: Vec<Signal> },
     /// Clears the listed signals' payloads on every event, keeping the rest: the mirror of
     /// `keep_signals`. An event left with no payload is dropped, as is one that arrived with
-    /// none. `signals` may not be empty (a no-op) and may not name all three signals (that would
-    /// drop every event). Listing `none` changes nothing: an event that arrived with no payload is
-    /// dropped either way.
+    /// none. An empty `signals` clears nothing, and naming all three
+    /// signals drops every event. Listing `none` changes nothing: an event that arrived with no
+    /// payload is dropped either way.
     DropSignals { signals: Vec<Signal> },
     /// Forwards an event whose batch resource and/or own attributes match every configured pair
     /// and carry every listed key, dropping the rest. `resource:` and `attributes:` are `set`'s

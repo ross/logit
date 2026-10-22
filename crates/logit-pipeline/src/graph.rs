@@ -63,11 +63,6 @@
 //!     (`docs/adr/log-record-trace-context.md`).
 //! 20. A `scale` with no `fields`, an empty field name, or a non-finite factor
 //!     (`docs/adr/scale-transform.md`).
-//! 21. An empty `signals:` on `has_signal`/`keep_signals`/`drop_signals`, or all three payload
-//!     signals on `drop_signals`. A `keep_signals` naming all three payload signals is legal: it
-//!     drops an event that arrived with no payload. `none` on `drop_signals` is legal and
-//!     changes nothing, since `drop_signals` drops such an event regardless
-//!     (`docs/adr/signal-filtering-components.md`).
 //! 22. An `otlp_out` `headers:` name that is empty, `:`-prefixed, `grpc-*`, in
 //!     `RESERVED_OTLP_HEADERS`, or a case-insensitive duplicate: the transport sets those itself,
 //!     and which duplicate is sent is undefined.
@@ -689,14 +684,6 @@ fn interval(kind: &ComponentKind) -> Option<Duration> {
         | ComponentKind::PrometheusIn { interval, .. } => Some(*interval),
         _ => None,
     }
-}
-
-/// `true` if `signals` names all three of `Logs`/`Metrics`/`Traces`: rule 21's test for
-/// `drop_signals`.
-fn names_all_three(signals: &[logit_config::Signal]) -> bool {
-    signals.contains(&logit_config::Signal::Logs)
-        && signals.contains(&logit_config::Signal::Metrics)
-        && signals.contains(&logit_config::Signal::Traces)
 }
 
 pub struct ResolvedComponent {
@@ -1581,48 +1568,6 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 21: `has_signal`/`keep_signals`/`drop_signals` need a non-empty `signals:`, and
-    // `drop_signals` may not name all three payload signals, which would drop every event.
-    // `keep_signals` naming all three stays legal: it keeps every payload and drops an event
-    // that arrived with none. `drop_signals` naming `none` stays legal and changes nothing: it
-    // drops an event that carries nothing regardless. `has_signal` naming all three stays
-    // legal: under `mode: only` it forwards anything with a payload.
-    for (id, component) in &components {
-        match &component.kind {
-            ComponentKind::HasSignal { signals, .. } => {
-                if signals.is_empty() {
-                    anyhow::bail!(
-                        "component '{id}': 'signals' must name at least one signal -- an empty \
-                         list can only ever drop every event"
-                    );
-                }
-            }
-            ComponentKind::KeepSignals { signals } => {
-                if signals.is_empty() {
-                    anyhow::bail!(
-                        "component '{id}': 'signals' must name at least one signal -- an empty \
-                         list keeps nothing, dropping every event"
-                    );
-                }
-            }
-            ComponentKind::DropSignals { signals } => {
-                if signals.is_empty() {
-                    anyhow::bail!(
-                        "component '{id}': 'signals' must name at least one signal -- an empty \
-                         list drops nothing, a no-op that forwards every event untouched"
-                    );
-                }
-                if names_all_three(signals) {
-                    anyhow::bail!(
-                        "component '{id}': 'signals' names all three signals -- that drops \
-                         everything, dropping every event"
-                    );
-                }
-            }
-            _ => {}
-        }
-    }
-
     // Rule 22: an `otlp_out` header the transport sets itself (`grpc-*` by prefix; see
     // `RESERVED_OTLP_HEADERS`), or two names equal ignoring case, which would collide into one
     // `HeaderMap` entry (`OtlpOutput::with_headers`) with an unpredictable winner.
@@ -1959,7 +1904,7 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
     // Rule 36: `has_attributes`/`drop_attributes` (`docs/adr/attribute-filtering-components.md`).
     // The maps and presence lists are conjunctions, so zero entries match every event:
     // `has_attributes` forwards all (no-op) and `drop_attributes` drops all (black hole), the
-    // inverse of rule 21's list of alternatives. An empty key can't name an attribute; a
+    // inverse of `signals:`' list of alternatives. An empty key can't name an attribute; a
     // non-finite value never compares equal under `crate::attributes`' coercing matcher. The same
     // key in `resource:` and `attributes:` is legal: one addresses the batch, the other the event.
     // Within one side, a key in both the map and its `_present` list is a redundancy (the pair
@@ -2054,7 +1999,7 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
     }
 
     // Rule 37: `has_provenance`/`drop_provenance` (`docs/adr/provenance-filtering-components.md`).
-    // Oriented like rule 36, not rule 21, although each field is a list of alternatives: an empty
+    // Oriented like rule 36, not like `signals:`, although each field is a list of alternatives: an empty
     // `origin:`/`previous:` leaves that field out of the match (vacuously true) rather than
     // matching zero alternatives, and the two AND'd fields decide. So with both empty
     // `has_provenance` is the no-op and `drop_provenance` the black hole. An empty entry can't name
@@ -5818,37 +5763,26 @@ mod tests {
     }
 
     #[test]
-    fn a_has_signal_with_an_empty_signals_list_is_rejected() {
-        let err = expect_err(cfg(vec![
-            ("in", vec![], listener()),
-            (
-                "filter",
-                vec!["in"],
-                ComponentKind::HasSignal { signals: vec![], mode: logit_config::MatchMode::AnyOf },
-            ),
-            ("out", vec!["filter"], sink()),
-        ]));
-        assert!(err.contains("must name at least one signal"), "got: {err}");
+    fn a_signal_filter_with_an_empty_list_resolves() {
+        // An empty list does what it says: `has_signal` and `keep_signals` drop every event,
+        // `drop_signals` clears nothing. The transforms' tests pin the runtime behavior.
+        for kind in [
+            ComponentKind::HasSignal { signals: vec![], mode: logit_config::MatchMode::AnyOf },
+            ComponentKind::KeepSignals { signals: vec![] },
+            ComponentKind::DropSignals { signals: vec![] },
+        ] {
+            resolve(cfg(vec![
+                ("in", vec![], listener()),
+                ("filter", vec!["in"], kind),
+                ("out", vec!["filter"], sink()),
+            ]))
+            .expect("an empty signals list is legal");
+        }
     }
 
     #[test]
-    fn a_keep_signals_with_an_empty_signals_list_is_rejected() {
-        let err = expect_err(cfg(vec![
-            ("in", vec![], listener()),
-            ("filter", vec!["in"], ComponentKind::KeepSignals { signals: vec![] }),
-            ("out", vec!["filter"], sink()),
-        ]));
-        assert!(err.contains("must name at least one signal"), "got: {err}");
-        assert!(
-            err.contains("keeps nothing"),
-            "a keep_signals with an empty list is the black-hole shape (drops every event), \
-             not the no-op shape -- got: {err}"
-        );
-    }
-
-    #[test]
-    fn a_drop_signals_naming_all_three_signals_is_rejected() {
-        let err = expect_err(cfg(vec![
+    fn a_drop_signals_naming_all_three_signals_resolves() {
+        resolve(cfg(vec![
             ("in", vec![], listener()),
             (
                 "filter",
@@ -5862,13 +5796,8 @@ mod tests {
                 },
             ),
             ("out", vec!["filter"], sink()),
-        ]));
-        assert!(err.contains("names all three signals"), "got: {err}");
-        assert!(
-            err.contains("drops everything"),
-            "a drop_signals naming all three signals is the black-hole shape (drops every \
-             event), not the no-op shape -- got: {err}"
-        );
+        ]))
+        .expect("drop_signals naming every payload signal is legal");
     }
 
     #[test]
@@ -5914,23 +5843,6 @@ mod tests {
             ]))
             .expect("none is a legal selector here");
         }
-    }
-
-    #[test]
-    fn a_drop_signals_with_an_empty_signals_list_is_rejected_as_a_no_op_not_a_black_hole() {
-        // The inverse of the keep_signals-empty case: for drop_signals (a denylist), an empty
-        // list drops nothing -- a no-op, not the "drop every event" black hole.
-        let err = expect_err(cfg(vec![
-            ("in", vec![], listener()),
-            ("filter", vec!["in"], ComponentKind::DropSignals { signals: vec![] }),
-            ("out", vec!["filter"], sink()),
-        ]));
-        assert!(err.contains("must name at least one signal"), "got: {err}");
-        assert!(
-            err.contains("drops nothing") && err.contains("no-op"),
-            "a drop_signals with an empty list is the no-op shape (forwards every event \
-             untouched), not the black-hole shape -- got: {err}"
-        );
     }
 
     #[test]

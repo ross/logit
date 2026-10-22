@@ -1950,7 +1950,7 @@
           "additionalProperties": false
         },
         {
-          "description": "Forwards an event carrying a wanted signal and drops the rest: `signals: [traces]` ahead of a traces-only sink, say, fed from a source whose events also carry metrics. Never mutates a forwarded event: under the default `mode: any_of`, an event carrying a listed signal is forwarded as it arrived, unlisted signals included. `mode: only` also requires the event carry nothing outside `signals`. Listing `none` also matches an event carrying no signal at all, under either mode: `signals: [metrics, none]` with `mode: only` forwards an event carrying only metrics, or nothing. Place `keep_signals`/`drop_signals` ahead of this instead if unwanted payloads must be stripped rather than tolerated. `signals` may not be empty.",
+          "description": "Forwards an event carrying a wanted signal and drops the rest: `signals: [traces]` ahead of a traces-only sink, say, fed from a source whose events also carry metrics. Never mutates a forwarded event: under the default `mode: any_of`, an event carrying a listed signal is forwarded as it arrived, unlisted signals included. `mode: only` also requires the event carry nothing outside `signals`. Listing `none` also matches an event carrying no signal at all, under either mode: `signals: [metrics, none]` with `mode: only` forwards an event carrying only metrics, or nothing. Place `keep_signals`/`drop_signals` ahead of this instead if unwanted payloads must be stripped rather than tolerated. An empty `signals` forwards nothing.",
           "type": "object",
           "required": [
             "signals",
@@ -1985,7 +1985,7 @@
           "additionalProperties": false
         },
         {
-          "description": "Retains only the listed signals' payloads on every event, clearing the rest: an allowlist, `keep`'s relationship to `remove`. Unlike `has_signal`, this mutates: an event carrying a log and derived metrics loses the metrics under `signals: [logs]` but keeps the log. An event left with no payload is dropped. Listing `none` keeps an event that arrived with no payload; without it, such an event is dropped. `signals` may not be empty (that would drop every event). Naming `logs`, `metrics`, and `traces` together keeps every payload and drops an event that arrived with none.",
+          "description": "Retains only the listed signals' payloads on every event, clearing the rest: an allowlist, `keep`'s relationship to `remove`. Unlike `has_signal`, this mutates: an event carrying a log and derived metrics loses the metrics under `signals: [logs]` but keeps the log. An event left with no payload is dropped. Listing `none` keeps an event that arrived with no payload; without it, such an event is dropped. An empty `signals` drops every event. Naming `logs`, `metrics`, and `traces` together keeps every payload and drops an event that arrived with none.",
           "type": "object",
           "required": [
             "signals",
@@ -2012,7 +2012,7 @@
           "additionalProperties": false
         },
         {
-          "description": "Clears the listed signals' payloads on every event, keeping the rest: the mirror of `keep_signals`. An event left with no payload is dropped, as is one that arrived with none. `signals` may not be empty (a no-op) and may not name all three signals (that would drop every event). Listing `none` changes nothing: an event that arrived with no payload is dropped either way.",
+          "description": "Clears the listed signals' payloads on every event, keeping the rest: the mirror of `keep_signals`. An event left with no payload is dropped, as is one that arrived with none. An empty `signals` clears nothing, and naming all three signals drops every event. Listing `none` changes nothing: an event that arrived with no payload is dropped either way.",
           "type": "object",
           "required": [
             "signals",

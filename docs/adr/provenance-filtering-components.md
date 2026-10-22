@@ -118,7 +118,7 @@ almost certainly a copy-paste typo" reasoning rule 4 already applies to a repeat
 entry).
 
 **The empty-config black-hole/no-op assignment lines up with rule 36's (`has_attributes`), not
-rule 21's (`has_signal`'s family) -- despite each field's own contents being a list of
+`has_signal`'s family's -- despite each field's own contents being a list of
 alternatives, the same shape `signals:` has.** The difference is what "empty" means at the
 *field*, not the list. An empty `origin:`/`previous:` means "this field isn't part of the match"
 (vacuously true, so it never narrows what matches) -- exactly like `has_attributes`' empty
@@ -130,7 +130,7 @@ inside it, and it is the *top* level that decides this assignment: both fields e
 therefore drops every one of them (a black hole).
 
 This was caught during implementation, not designed correctly on the first pass: an earlier draft
-of rule 37 copied rule 21's orientation by surface analogy to `signals:`, and only a concrete
+of rule 37 copied `signals:`' orientation by surface analogy to `signals:`, and only a concrete
 trace through `Matcher::matches` with both fields empty (always returns `true`) caught the error
 before it landed. Recorded here because the field-vs.-list distinction that resolves it is easy to
 miss again.

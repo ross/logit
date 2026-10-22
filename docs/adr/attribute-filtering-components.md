@@ -157,8 +157,8 @@ bool). A non-finite configured or actual value matches nothing, inherited from `
 
 At least one of `resource`/`attributes` must be non-empty; every key must be non-empty; every
 numeric value must be finite. The black-hole/no-op assignment for the empty-config case is
-*inverted* relative to `has_signal`'s family (rule 21): there, an allowlist (`keep_signals`) naming
-nothing is the black hole, because `signals:` is a list of alternatives and an empty list satisfies
+*inverted* relative to `has_signal`'s family: there, an allowlist (`keep_signals`) naming
+nothing keeps nothing and drops every event, because `signals:` is a list of alternatives and an empty list satisfies
 nothing. Here, `resource:`/`attributes:` is a map of *conjunctions*, and a conjunction over zero
 pairs is vacuously true -- `has_attributes` with nothing configured therefore matches *every* event
 (a no-op, forwarding everything untouched), and `drop_attributes` with nothing configured, being its
@@ -189,7 +189,7 @@ placement argument for itself already.
   `drop_signals` and `logfmt`/`kv` precedent ("separate kinds sharing a module" over "one kind with
   a mode field") -- and for a reason specific to this pair: a mode flag would make rule 36's
   black-hole-vs-no-op error message conditional on a field's *value* rather than on the component's
-  *kind*, which is exactly the confusion rule 21 already exists to avoid for `has_signal`'s family.
+  *kind*, which is the confusion `has_signal`'s family would have faced with a conditional message.
 - **A third kind, or a `mode: any_of` field, for "any of these pairs matches."** Rejected per the
   composability principle above: N sibling single-pair `has_attributes` components already express
   it, since fan-in is free, and a mode flag would be a second way to spell something the graph
