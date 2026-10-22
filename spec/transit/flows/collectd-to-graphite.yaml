@@ -1,0 +1,12 @@
+# collectd_in's cases into graphite_out, with nothing between: each data source a bare
+# datapoint, and a notification not written.
+# `path:` names one case so `logit run` can run this by hand; the transit spec runs every case in
+# that file's directory (spec/transit/README.md).
+components:
+  case:
+    type: replay_in
+    path: ../cases/collectd/value-lists.json
+  out:
+    type: graphite_out
+    sources: [case]
+    endpoint: 127.0.0.1:2003

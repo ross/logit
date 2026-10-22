@@ -36,12 +36,13 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 /// The files holding regions, relative to the repository root.
-const FILES: [&str; 6] = [
+const FILES: [&str; 7] = [
     "crates/logit-outputs/src/statsd.rs",
     "crates/logit-proto/src/prometheus/mod.rs",
     "crates/logit-proto/src/influxdb/mod.rs",
     "crates/logit-proto/src/otlp/metrics.rs",
     "crates/logit-proto/src/datadog/mod.rs",
+    "crates/logit-proto/src/graphite/mod.rs",
     "docs/known-gaps/mappings.md",
 ];
 
@@ -49,12 +50,13 @@ const FILES: [&str; 6] = [
 const REGENERATE: &str = "script/transit docs";
 
 /// Each sink's protocol, as `mappings.md`'s `encode (<Protocol>)` labels name it.
-const PROTOCOLS: [(&str, &str); 5] = [
+const PROTOCOLS: [(&str, &str); 6] = [
     ("statsd_out", "statsd"),
     ("prometheus_out", "Prometheus"),
     ("influxdb_out", "InfluxDB"),
     ("otlp_out", "OTLP"),
     ("datadog_out", "Datadog"),
+    ("graphite_out", "Graphite"),
 ];
 
 const OPEN: &str = "<!-- transit:";
@@ -547,12 +549,12 @@ mod tests {
     #[test]
     fn a_sink_without_its_regions_fails() {
         let mut mapping = table();
-        mapping.sinks.push("graphite_out".to_string());
+        mapping.sinks.push("collectd_out".to_string());
         let failures = sync(&root(), &mapping, false);
         assert!(
-            failures.iter().any(|f| f.starts_with("transit:doc:graphite_out: no file")),
+            failures.iter().any(|f| f.starts_with("transit:doc:collectd_out: no file")),
             "{failures:?}"
         );
-        assert!(failures.iter().any(|f| f.starts_with("transit:gaps:graphite_out: no file")));
+        assert!(failures.iter().any(|f| f.starts_with("transit:gaps:collectd_out: no file")));
     }
 }

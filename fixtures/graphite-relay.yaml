@@ -4,10 +4,10 @@
 # `endpoint` below to the central collector; nothing carbon-side changes.
 #
 # The relay is lossless modulo the normalization list in `crates/logit-proto/src/graphite/mod.rs`'s
-# module doc. Anything the pair can't carry (a multi-value record under the default `multi_value:
-# skip`, a non-finite value, a timestamp that floors to zero or below) is a counted drop
-# (`logit.output.metrics.skipped`) with a throttled diagnostic. Both protocols work in both
-# directions, and this sink's `protocol:`/`transport:` need not match `graphite_in`'s.
+# module doc. A multi-value record under the default `multi_value: skip` is counted as
+# `logit.output.metrics.skipped`, and a non-finite value or a timestamp that floors to zero or
+# below as `logit.output.metrics.dropped`, each with a throttled diagnostic. Both protocols work
+# in both directions, and this sink's `protocol:`/`transport:` need not match `graphite_in`'s.
 #
 # No `aggregate`, unlike fixtures/statsd-to-graphite.yaml: a carbon datapoint already carries its
 # own second. Add one only when you want to re-window.

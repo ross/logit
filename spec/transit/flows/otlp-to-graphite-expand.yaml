@@ -1,0 +1,13 @@
+# otlp_in's metrics cases into graphite_out under `multi_value: expand`: histograms,
+# exponential histograms, and summaries as dotted datapoints.
+# `path:` names one case so `logit run` can run this by hand; the transit spec runs every case in
+# that file's directory (spec/transit/README.md).
+components:
+  case:
+    type: replay_in
+    path: ../cases/otlp/sums.json
+  out:
+    type: graphite_out
+    sources: [case]
+    endpoint: 127.0.0.1:2003
+    multi_value: expand

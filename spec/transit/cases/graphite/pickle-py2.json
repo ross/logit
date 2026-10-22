@@ -1,0 +1,5 @@
+{"timestamp":"2023-11-14T22:13:20.000000000Z","metrics":[{"name":"logit-fixture.diamond.cpu.total.user","kind":"gauge","value":12.5}]}
+{"timestamp":"2023-11-14T22:13:20.000000000Z","metrics":[{"name":"logit-fixture.diamond.loadavg.01","kind":"gauge","value":0.25}]}
+{"timestamp":"2023-11-14T22:13:21.000000000Z","metrics":[{"name":"logit-fixture.diamond.café.count","kind":"gauge","value":3.0}]}
+{"timestamp":"2023-11-14T22:13:22.000000000Z","metrics":[{"name":"logit-fixture.diamond.cpu.total.user","kind":"gauge","value":-1.0}]}
+{"timestamp":"2023-11-14T22:13:23.000000000Z","metrics":[{"name":"logit-fixture.diamond.uptime","kind":"gauge","value":7.0}]}
