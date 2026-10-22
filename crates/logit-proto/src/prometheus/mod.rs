@@ -275,7 +275,7 @@ pub mod text;
 
 pub use text::Dialect;
 
-use crate::otlp::metrics::DISTRIBUTION_QUANTILES;
+use crate::otlp::metrics::SUMMARY_QUANTILES;
 use logit_core::attrs::is_private;
 use logit_core::interner::{intern, resolve};
 use logit_core::{
@@ -1296,13 +1296,12 @@ fn warn_delta_summary(encoder: &mut PrometheusEncoder, name: &str) {
     );
 }
 
-/// A sketch → the summary point the module doc's `Distribution`/`Samples` rows describe: the five
-/// shared [`DISTRIBUTION_QUANTILES`], the sketch's sum, and its count.
+/// A sketch → the summary point the module doc's `Distribution`/`Samples` rows describe: the
+/// shared [`SUMMARY_QUANTILES`], `0` and `1` being the sketch's minimum and maximum, the sketch's
+/// sum, and its count.
 fn sketch_summary(sketch: &DdSketch) -> Point {
-    let quantiles = DISTRIBUTION_QUANTILES
-        .iter()
-        .filter_map(|q| sketch.quantile(*q).map(|v| (*q, v)))
-        .collect();
+    let quantiles =
+        SUMMARY_QUANTILES.iter().filter_map(|q| sketch.quantile(*q).map(|v| (*q, v))).collect();
     Point::Summary { quantiles, sum: Some(sketch.sum()), count: Some(sketch.count() as u64) }
 }
 
@@ -2098,7 +2097,7 @@ mod tests {
     }
 
     #[test]
-    fn a_distribution_encodes_as_a_five_quantile_summary_and_is_counted_degraded() {
+    fn a_distribution_encodes_as_a_summary_with_its_extremes_and_is_counted_degraded() {
         let mut sketch = DdSketch::new();
         for v in [1.0, 2.0, 3.0, 4.0, 5.0] {
             sketch.add(v);
@@ -2110,7 +2109,9 @@ mod tests {
         assert_eq!(families[0].kind, FamilyType::Summary);
         match &families[0].series[0].point {
             Point::Summary { quantiles, sum, count } => {
-                assert_eq!(quantiles.len(), DISTRIBUTION_QUANTILES.len());
+                assert_eq!(quantiles.len(), SUMMARY_QUANTILES.len());
+                assert_eq!(quantiles.first(), Some(&(0.0, 1.0)), "quantile 0 is the minimum");
+                assert_eq!(quantiles.last(), Some(&(1.0, 5.0)), "quantile 1 is the maximum");
                 assert_eq!(*sum, Some(15.0), "a sketch's sum is exact");
                 assert_eq!(*count, Some(5));
             }

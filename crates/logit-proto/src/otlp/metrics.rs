@@ -175,6 +175,13 @@ use logit_core::{
 /// and `crate::graphite` share them so one metric describes itself the same way at every sink.
 pub(crate) const DISTRIBUTION_QUANTILES: [f64; 5] = [0.5, 0.75, 0.90, 0.95, 0.99];
 
+/// [`DISTRIBUTION_QUANTILES`] between `0` and `1`, the quantiles a sketch written as a summary
+/// reports. `metrics.proto`'s `ValueAtQuantile` reads `0` as the minimum observed and `1` as the
+/// maximum, and `DdSketch::quantile` answers them with the sketch's own `min` and `max`, so a
+/// summary keeps the extremes. A dotted expansion writes `.min` and `.max` instead, so
+/// `crate::multi_value` reads [`DISTRIBUTION_QUANTILES`].
+pub(crate) const SUMMARY_QUANTILES: [f64; 7] = [0.0, 0.5, 0.75, 0.90, 0.95, 0.99, 1.0];
+
 fn temporality_to_pb(t: Temporality) -> i32 {
     match t {
         Temporality::Delta => pb::AggregationTemporality::Delta as i32,
@@ -574,7 +581,7 @@ fn distribution_summary_point(
     flags: u32,
     sketch: &DdSketch,
 ) -> pb::SummaryDataPoint {
-    let quantile_values = DISTRIBUTION_QUANTILES
+    let quantile_values = SUMMARY_QUANTILES
         .iter()
         .filter_map(|q| {
             sketch
@@ -1077,7 +1084,7 @@ mod tests {
     }
 
     #[test]
-    fn a_samples_metric_encodes_as_a_five_quantile_summary_and_is_counted_degraded() {
+    fn a_samples_metric_encodes_as_a_summary_with_its_extremes_and_is_counted_degraded() {
         let samples = {
             let mut s = Samples::new([1.0, 2.0, 3.0, 4.0, 5.0]);
             s.sample_rate = 1.0;
@@ -1091,7 +1098,14 @@ mod tests {
                 .unwrap();
         match metric.data.unwrap() {
             pb::metric::Data::Summary(s) => {
-                assert_eq!(s.data_points[0].quantile_values.len(), 5, "p50/p75/p90/p95/p99");
+                let quantiles: Vec<(f64, f64)> = s.data_points[0]
+                    .quantile_values
+                    .iter()
+                    .map(|q| (q.quantile, q.value))
+                    .collect();
+                assert_eq!(quantiles.len(), 7, "min, p50/p75/p90/p95/p99, max");
+                assert_eq!(quantiles.first(), Some(&(0.0, 1.0)), "quantile 0 is the minimum");
+                assert_eq!(quantiles.last(), Some(&(1.0, 5.0)), "quantile 1 is the maximum");
                 assert_eq!(s.data_points[0].count, 5);
                 assert_eq!(s.data_points[0].sum, 15.0);
             }
@@ -1119,14 +1133,14 @@ mod tests {
         match metric.data.unwrap() {
             pb::metric::Data::Summary(s) => {
                 assert_eq!(s.data_points[0].count, 2);
-                assert_eq!(s.data_points[0].quantile_values.len(), 5);
+                assert_eq!(s.data_points[0].quantile_values.len(), 7);
             }
             other => panic!("expected Summary, got {other:?}"),
         }
     }
 
     #[test]
-    fn a_distribution_encodes_as_a_five_quantile_summary_and_is_counted_degraded() {
+    fn a_distribution_encodes_as_a_summary_with_its_extremes_and_is_counted_degraded() {
         let mut sketch = DdSketch::new();
         for v in [1.0, 2.0, 3.0, 4.0, 5.0] {
             sketch.add(v);
@@ -1143,7 +1157,14 @@ mod tests {
         .unwrap();
         match metric.data.unwrap() {
             pb::metric::Data::Summary(s) => {
-                assert_eq!(s.data_points[0].quantile_values.len(), 5, "p50/p75/p90/p95/p99");
+                let quantiles: Vec<(f64, f64)> = s.data_points[0]
+                    .quantile_values
+                    .iter()
+                    .map(|q| (q.quantile, q.value))
+                    .collect();
+                assert_eq!(quantiles.len(), 7, "min, p50/p75/p90/p95/p99, max");
+                assert_eq!(quantiles.first(), Some(&(0.0, 1.0)), "quantile 0 is the minimum");
+                assert_eq!(quantiles.last(), Some(&(1.0, 5.0)), "quantile 1 is the maximum");
                 assert_eq!(s.data_points[0].count, 5);
                 assert_eq!(s.data_points[0].sum, 15.0);
             }

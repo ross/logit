@@ -670,8 +670,9 @@ enum KindSkip {
     GaugeDelta,
 }
 
-/// The quantiles a `Distribution` or re-sketched `Samples` writes.
-const SKETCH_QUANTILES: [f64; 3] = [0.5, 0.9, 0.99];
+/// The quantiles a `Distribution` or re-sketched `Samples` writes; `0` and `1` are the sketch's
+/// minimum and maximum, as `DdSketch::quantile` answers them.
+const SKETCH_QUANTILES: [f64; 5] = [0.0, 0.5, 0.9, 0.99, 1.0];
 
 /// Renders one metric's `k=v,k=v` field set into `out` (cleared first), for the per-record path.
 /// `docs/adr/influxdb-histogram-summary-shape.md` is the decision record for the multi-field
@@ -1221,15 +1222,19 @@ mod tests {
         assert_eq!(stats.degraded_non_finite_component, 1);
     }
 
-    /// A `Distribution` takes the summary shape, with the sketch's quantiles.
+    /// A `Distribution` takes the summary shape, with the sketch's quantiles between its
+    /// minimum (`0`) and maximum (`1`).
     #[test]
-    fn a_distribution_writes_the_summary_shape() {
+    fn a_distribution_writes_the_summary_shape_with_its_extremes() {
         let mut sketch = logit_core::DdSketch::new();
-        sketch.add(120.0);
+        for v in [120.0, 80.0, 300.0] {
+            sketch.add(v);
+        }
         let out = encode(vec![metric_event("latency", MetricKind::Distribution(sketch), &[])]);
-        assert!(out.starts_with("latency count=1,sum=120,0.5="), "got: {out}");
+        assert!(out.starts_with("latency count=3,sum=500,0=80,0.5="), "got: {out}");
         assert!(out.contains(",0.9="), "got: {out}");
         assert!(out.contains(",0.99="), "got: {out}");
+        assert!(out.contains(",1=300 "), "got: {out}");
     }
 
     /// An empty sketch has no quantile reading, so it writes `count` and `sum` alone, uncounted.
@@ -1262,7 +1267,7 @@ mod tests {
         let mut samples = logit_core::Samples::new([120.0, 130.0]);
         samples.sample_rate = f64::NAN;
         let out = encode(vec![metric_event("latency", MetricKind::Samples(samples), &[])]);
-        assert!(out.starts_with("latency count=2,sum=250,0.5="), "got: {out}");
+        assert!(out.starts_with("latency count=2,sum=250,0=120,0.5="), "got: {out}");
     }
 
     /// An unencodable `SetMembers` is skipped, counted, and a sibling metric in the batch still
