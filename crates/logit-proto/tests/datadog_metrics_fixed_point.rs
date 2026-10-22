@@ -90,6 +90,24 @@ fn json_bytes(v: JsonValue) -> Vec<u8> {
 
 // -- hand-written vectors ------------------------------------------------------------------------
 
+/// A unit that isn't a Datadog unit name leaves under Datadog's name for it, or with none, as
+/// the module doc's permitted normalizations say; a second hop is then a fixed point.
+#[test]
+fn a_unit_without_a_datadog_name_is_mapped_or_left_off() {
+    for (unit, want) in
+        [("ms", Some("millisecond")), ("By/s", Some("byte/second")), ("teaspoon", None)]
+    {
+        let body = format!(
+            r#"{{"series":[{{"metric":"m","points":[[1700000000,1.0]],"tags":[],"host":"h","type":"gauge","interval":0,"unit":"{unit}"}}]}}"#
+        );
+        let encoded = encode(Route::V1, &decode(Route::V1, body.as_bytes())).unwrap();
+        let read = decode(Route::V1, &encoded).events[0].metrics[0].unit;
+        let read = read.map(logit_core::interner::resolve);
+        assert_eq!(read, want, "{unit}");
+        assert_fixed_point(Route::V1, &encoded);
+    }
+}
+
 #[test]
 fn v1_agent_field_set() {
     let body = br#"{"series":[{"metric":"my.metric","points":[[1700000000,1.0]],"tags":["env:prod"],"host":"myhost","device":"/dev/sda1","type":"rate","interval":20,"source_type_name":"my_check","unit":"byte"}]}"#;
@@ -568,7 +586,10 @@ fn gen_series() -> impl Strategy<Value = GenSeries> {
             (prop::sample::select(vec!["db", "queue", "host", "device", ""]), "[a-z0-9]{0,5}"),
             0..3,
         ),
-        "[a-z]{0,6}",
+        // A Datadog unit name, which passes through; any other unit is mapped or left off
+        // (`a_unit_without_a_datadog_name_is_mapped_or_left_off`).
+        prop::sample::select(vec!["", "byte", "millisecond", "request", "item", "byte/second"])
+            .prop_map(str::to_string),
         "[a-zA-Z]{0,6}",
         prop_oneof![Just(0i64), 1i64..3600],
         (0u32..3, 0u32..3, 0u32..3),

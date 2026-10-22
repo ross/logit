@@ -289,6 +289,9 @@
 //!    leaves in the target's hostless spelling: `""` on v1, distribution points, and sketches, and
 //!    a `host` resource with no name on v2;
 //! 10. a tag whose key is under the private `_logit.` prefix is omitted and counted.
+//! 11. a `unit` that isn't a Datadog unit name ([`units`]) leaves under Datadog's name for it, a
+//!     UCUM unit mapped as Datadog's OTel exporter maps it; one with no Datadog name is left off
+//!     and counted `logit.output.fields.omitted{reason="unit_unmapped"}`.
 //!
 //! # Logs, events, service checks (`logs`, `events`, `service_checks`)
 //!
