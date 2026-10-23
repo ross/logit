@@ -269,7 +269,7 @@ rather than adding a parallel one:
 
 `route-copy` and `route-signals` read bimodal on identical work on the 2026-10-22 VM: CPU
 µs/event spread 37–108% across repeats of one binary. A VM whose vCPUs measure as one host L3
-showed no spread, so the cause is the host's placement of vCPUs
+showed no spread, so the cause is most likely the host's placement of vCPUs
 ([performance.md](../design/performance.md#11-runtime-worker-count-2026-10-23)). The extra time is copying 864-byte `Event`s whose cache lines were
 written on another core. Pinning the child to one CPU removed the spread and halved CPU per event,
 but tokio sizes its worker pool from the affinity mask, so that arm also ran one worker. Worker

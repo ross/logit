@@ -51,7 +51,7 @@ The router figures in Context (0.58 against 1.1 to 2.3 µs/event) came from a VM
 straddled two host L3 caches, and they overstate the general case. Measured across 16 scenarios on
 a VM with one L3, one worker is not a default: it lost 30 to 59% of throughput on parse- and
 encode-heavy pipelines, and 10 of the 16 failed the criterion for adopting it. The default stays.
-`workers: 1` is the shape for a node whose rate is fixed by its producers (10 to 37% less CPU per
-event at the same rate, about half the RSS), and `workers: 2` is the shape for a router-heavy node
+`workers: 1` is the shape for a node whose rate is fixed by its producers (9 to 37% less CPU per
+event at the same rate, usually about half the RSS), and `workers: 2` is the shape for a router-heavy node
 (`route_signals` at 37% less CPU and 47% more throughput). See
 [performance.md](../design/performance.md#11-runtime-worker-count-2026-10-23) for the tables.

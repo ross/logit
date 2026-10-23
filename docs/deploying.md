@@ -595,9 +595,9 @@ and move with the host's cache layout, so measure your own traffic before you ch
 
 | Node | Set | What to expect |
 |---|---|---|
-| Its event rate is set by its producers, such as an edge agent relaying a trickle | `workers: 1` | 10 to 37% less CPU per event at the same rate, and about half the memory. |
+| Its event rate is set by its producers, such as an edge agent relaying a trickle | `workers: 1` | 9 to 37% less CPU per event at the same rate, and usually about half the memory. |
 | Its work is mostly routing (`route`, `route_signals`) | `workers: 2` | `route_signals` used 37% less CPU per event and ran 47% faster than the default. |
-| It parses, encodes, or relays, or must keep up with a flood | the default | One worker lost up to 59% of the throughput of a parse-heavy pipeline, and two lost up to 31%. |
+| It parses, encodes, relays natively or to Splunk, or must keep up with a flood | the default | One worker lost up to 59% of the throughput of a parse-heavy pipeline, and two lost up to 31%. |
 
 A pipeline that runs on one busy thread anyway (`aggregate`, `lua`) gains nothing from fewer
 workers, so leave it at the default.

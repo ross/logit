@@ -2521,7 +2521,7 @@ What `runtime.workers:` buys, measured on the disposable perf VM on 2026-10-23 w
 VM's 8 vCPUs measure as one host L3: `core-to-core-latency` reads 25 to 33 ns on every pair
 (mean 27.4 ns), where a pair across two Genoa CCDs reads about 100 ns or more. CPU is µs/event,
 the median of 5 repeats (8 for the router ladder); `free` is the default runtime (8 workers),
-`w1` is `runtime.workers: 1`, and `w2` is `runtime.workers: 2`. None of the 92 cells of the
+`w1` is `runtime.workers: 1`, and `w2` is `runtime.workers: 2`. None of the 91 cells of the
 generality ladder was bimodal.
 
 ### One worker is not a default
@@ -2552,19 +2552,22 @@ The experiment's kill criterion for making one worker the default failed on 10 o
 scenarios (the six that pass are `fanout`, `route-copy`, `route-signals`, and the three
 OTLP and remote-write relays, which get both cheaper and faster). The parse- and encode-heavy ones lose 30 to 59% of their throughput
 (`json-parse-x3` −59%, `json-parse` and `native-relay` −36%, `route` −30%). The ones that
-already run on one busy thread (`aggregate`, `aggregate-groups`, `lua`, `lua-edit`,
-`splunk-hec-relay`) gain 0 to 10% CPU. `fanout` and the relays run faster on one worker.
+already run on one busy thread (`aggregate`, `aggregate-groups`, `lua`, `lua-edit`) gain 0 to 1%
+CPU. `fanout` and the OTLP and remote-write relays run faster on one worker; `native-relay` (−36%)
+and `splunk-hec-relay` (−2%, at 10% less CPU) do not.
 
-Two workers is within 1% of `free` on throughput everywhere but the router family, `native-relay`
+Two workers is within 5% of `free` on throughput everywhere but the router family, `native-relay`
 (−12%), and `json-parse-x3` (−31%). On `route-signals`, `route-copy`, `route`, and `fanout` it
-beats `free` on both axes. Peak RSS on one worker is about half of `free`'s (36 against 78 MiB on
-`passthrough`, 125 against 352 on `native-relay`), and two workers sit between.
+beats `free` on both axes. Peak RSS on one worker is usually about half of `free`'s (36 against 78 MiB on
+`passthrough`, 125 against 352 on `native-relay`), and two workers usually sit between. `json-parse`
+is the exception for one worker (87 against 112 MiB), and on `json-parse` (48.5 MiB) and `fanout`
+(27.8 against 31.8) two workers hold less than one.
 
-### At a fixed rate, one worker saves 10 to 37% CPU
+### At a fixed rate, one worker saves 9 to 37% CPU
 
-The paced cells hold the same event rate in every shape (`generate_in` `rate:`), and
-`native-relay-lz4` and `otlp-relay-grpc-gzip` add compression to their base scenarios, so CPU is
-the whole result.
+The four paced cells hold the same event rate in every shape (`generate_in` `rate:`), so CPU is
+the whole result for them. `native-relay-lz4` and `otlp-relay-grpc-gzip` add compression to their
+base scenarios and run free, so their throughput also moves.
 
 | Cell | free CPU | w1 CPU | w1 saves | w1 throughput |
 |---|---:|---:|---:|---|
@@ -2610,16 +2613,19 @@ targets instead of three changes `route` by 8%. None of the eight was bimodal.
   generator waits on the router and the sinks wait on the router, never the reverse.
 - **Batch size trades memory for CPU.** `route-signals` reads 1.307, 1.088, and 0.733 µs/event at
   `batch:` 10, 100, and 1000, at 77 MiB for the default and 347 MiB for 1000.
-- **One jemalloc arena is cheaper than the default.** On `route-signals`, `narenas:1` reads 1.050
-  µs/event at 2.34M events/s and 24 MiB, against 1.089 at 1.96M and 75 MiB; `tcache:false` reads
-  1.187. This was measured on two scenarios, not the suite, and changes no default.
+- **One jemalloc arena cuts RSS by two thirds and raises throughput.** On `route-signals`,
+  `narenas:1` reads 1.050 µs/event at 2.34M events/s and 24 MiB, against 1.089 at 1.96M and 75 MiB;
+  `tcache:false` reads 1.187. On `route-copy` it reads 1.237 at 2.15M and 29 MiB, against 1.181 at
+  2.03M and 78 MiB, so CPU per event is higher there; `tcache:false` reads 1.417. This was measured
+  on two scenarios, not the suite, and changes no default.
 
 ### Where the 2026-10-22 spread went
 
 The VM of 2026-10-22 showed `route-copy` and `route-signals` spreading 37 to 108% run to run on
-one binary, which the preamble to "Reading the rows" and the harness ADR record. The VM of
+one binary, which section 1's note on the missing `route-copy` and `route-signals` rows and the harness ADR record. The VM of
 2026-10-23 did not: 73 runs of `route-signals` all sat at 1.08 to 1.10 µs/event (5 in the
-ladder, 8 in the router ladder, 18 in the queue-depth arms, 36 in the queue-interval arms, and 6 bare),
+ladder, 8 in the router ladder, 18 in the allocator control and the two capacity controls
+(8 + 5 + 5), 36 in the queue-interval arms, and 6 bare),
 whatever the placement, migration count, or tokio's `global_queue_interval`. Under `perf sched
 record`, 4 of 6 runs sat at 1.12 to 1.14 and 2 were slow (2.4 and 1.5), and the slow runs ran
 within two minutes of each other, which reads as a slow window of the host and not as a mode.
@@ -2636,10 +2642,11 @@ numbers.
 ### Conclusion
 
 One worker is not a default. Set `runtime.workers: 1` on a node whose event rate is fixed by its
-producers: it saves 10 to 37% CPU per event at the same rate and about half the RSS. It is wrong
+producers: it saves 9 to 37% CPU per event at the same rate and about half the RSS. It is wrong
 for a node that must keep up with a flood of parse- or encode-heavy work. Set `runtime.workers: 2`
 on a node whose work is mostly routing: `route-signals` costs 37% less CPU per event at 47% more
-throughput. Leave the default for parsing, encoding, and relays.
+throughput. Leave the default for parsing, encoding, `native-relay`, and `splunk-hec-relay`. The OTLP and
+remote-write relays gained on one worker, so `workers: 1` suits them at a fixed rate.
 
 ## Open questions
 
