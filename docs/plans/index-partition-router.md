@@ -12,12 +12,16 @@ buffer (0.4 µs per event on the perf VM) and clones one a `routes:` list sends 
 destinations (0.75 µs); `route_signals_batch` under `strip: true` splits each event into parts
 at the same cost. Sharing the batch behind one `Arc` costs 0.04 to 0.12 µs per event, and that's
 what a destination that only reads needs. The worker-count session recorded in
-[`docs/design/performance.md`](../design/performance.md)'s "Runtime worker count" section
-measured the ladder (`route-copy-all2` at 0.456 against `route-copy` at 1.181 and `route` at
-0.734, the only difference being whether the router copies), and a prototype that sends each
-destination the shared batch plus an index list confirmed it on the same VM on 2026-10-23
-(prototype branch `cores/e6b-prototype` at `6a306c9b`, against `main` at `5d5a0429`, both sinking
-into `null_out`, 5 repeats per cell, free runtime):
+[`docs/design/performance.md`](../design/performance.md)'s "11. Runtime worker count
+(2026-10-23)" section (PR #840) measured the ladder: `route-copy-all2` at 0.456 against
+`route-copy` and `route`, the only difference being whether the router copies. The four variant
+scenarios it uses (`route-copy-all2`, `route-copy-half2`, `route-2t`, `route-signals-nostrip`)
+are that session's variants of the shipped `route-copy` and `route-signals` scenarios and don't
+ship under `perf/scenarios/`. A prototype that sends each destination the shared batch plus an
+index list confirmed it on the same VM on 2026-10-23 (prototype branch `cores/e6b-prototype` at
+`6a306c9b`, against `main` at `5d5a0429`, both sinking into `null_out`, 5 repeats per cell, free
+runtime). The `main` column is that E6 run, so its `route-copy` and `route` figures (1.181 and
+0.734) differ slightly from the section's:
 
 | Scenario | `main` µs/event | Prototype µs/event | CPU | Throughput |
 |---|---:|---:|---:|---:|
@@ -29,7 +33,8 @@ into `null_out`, 5 repeats per cell, free runtime):
 | `fanout`, `route-copy-all2`, `route-signals-nostrip` (share-only paths) | | | +1 to 2% | 0% |
 | General suite (no router: parse, relay, tail, encode) | | | 0 to 2% | 0 to 2% |
 
-The five copying scenarios converge on 0.46 to 0.51, the share floor. `route` and `route-2t`
+The five router scenarios land at 0.38 to 0.51, at or below the share floor (`route-copy-all2`
+0.456, `route-signals-nostrip` 0.374). `route` and `route-2t`
 were bound by the generator, so their gain shows on CPU alone. The raw results and the session's
 findings live outside the repository, in `~/lib/logit/tmp/perf/vm-2026-10f/`, as every VM
 session's do.
@@ -92,12 +97,12 @@ The rule is ownership, not reading:
 
 ### Sinks
 
-`Output::send` takes `&BatchView`, as do `Encoder`, `FramedEncoder`, and `SignalEncoder`,
+`Output::send` and `Output::submit` (which `window_round` calls) take `&BatchView`, as do `Encoder`, `FramedEncoder`, and `SignalEncoder`,
 `prometheus`'s own pair (exposition and remote-write), and `datadog`'s `encode_routes`. Each
 encoder's event loop iterates the view's masked events. Nothing on the delivery path
 materializes: the sink queue stores views (`StoreItem` carries one), a retry resends the same
 view, `logit_out`'s window round encodes a hop frame from it, and the disk spool encodes its
-record from it and drops the view once the record is written (a replayed record is an owned
+record from it (both through `native::encode_hop_batch`, which takes a view) and drops the view once the record is written (a replayed record is an owned
 batch, as today), so a `buffer.disk:` sink never pins a shared batch and the backlogged-sink
 rule below applies to the memory store alone.
 
@@ -129,7 +134,7 @@ project is pre-release.
 
 ### Mechanics
 
-Per AGENTS.md "Workflow": each workstream is a PR stacked on the one before, `pr-review` runs on
+Per AGENTS.md "Workflow": each workstream is a PR stacked on the one before (W8a to W8c are siblings off W7, and W9 and W10 stack on `main` once all three have merged), `pr-review` runs on
 it before the fix rounds, every regression test is run once with its fix reverted and the PR
 body says so, and the prose sweep (docs, ADRs, module docs, config field docs,
 `docs/known-gaps/`) precedes each review. Allocation pins in
@@ -145,32 +150,44 @@ later one.
 | W6 | `cores/w6` | `cores/w6: ADR index-partition-router` | S | W5 | — |
 | W7 | `cores/w7` | `cores/w7: a routed batch is a view` | L | W6 | — |
 | W8a–c | `cores/w8a`, `cores/w8b`, `cores/w8c` | `cores/w8<x>: <crate>'s encoders read a view` | M each | W7 | — |
-| W9 | `cores/w9` | `cores/w9: operator docs for views and the pinned-batch bound` | S | W8 | — |
-| W10 | `cores/w10` | `cores/w10: router-into-sink scenarios and the VM numbers` | S | W8 | — |
+| W9 | `cores/w9` | `cores/w9: operator docs for views and the pinned-batch bound` | S | W8a–c (all merged) | — |
+| W10 | `cores/w10` | `cores/w10: router-into-sink scenarios and the VM numbers` | S | W8a–c (all merged) | — |
 
 - **W6, the ADR.** `docs/adr/index-partition-router.md`: the view, the masked event, the
   ownership rule, the backlogged-sink rule, and the rename. It amends
-  [ADR `target-components`](../adr/target-components.md) and
-  [ADR `route-signals`](../adr/route-signals.md), which each say an event is moved when it has
-  one destination and shared or cloned when it has several, and AGENTS.md's `route`/`target`
-  bullet, which repeats that.
+  [ADR `target-components`](../adr/target-components.md), which says an event is moved with one
+  destination and shared or cloned with several, and the `strip: true` rules of
+  [ADR `route-signals`](../adr/route-signals.md): rule 1 (cleared before routing), rule 4
+  (attributes cloned, payloads moved per part), and rule 7 (no shared path out). It also amends
+  two restatements: AGENTS.md's `route`/`target` and `route_signals` bullets, and the module doc
+  of `crates/logit-pipeline/src/route_signals.rs`, which moves in W7 with the code.
 - **W7, the pipeline layer.** `BatchView` and the masked event; `Delivered` carrying a view;
   `route_batch` and `route_signals_batch` emitting views (index lists, signal masks, no in-place
-  strip, index composition for a router behind a router); `Output::send` taking `&BatchView`,
+  strip, index composition for a router behind a router); `Output::send` and `Output::submit` taking `&BatchView`, and `native::encode_hop_batch` (the
+  spool's `DiskQueue::push` and `logit_out`) encoding from a view,
   with `null_out` reading it and every other sink's body opening with one helper call that
   materializes a partial view until its W8 PR removes the call, so the PR is shippable on its
   own (a materializing sink pays what the router paid, a shift, not a loss); the sink queue storing
   views with the backlogged-sink rule and its default; the `multicast` rename across the code,
   `tools/soak/soaklib` (`checks.py`, `selftest.py`), the two `route-*` scenario TOML files,
   [`docs/design/internal-telemetry.md`](../design/internal-telemetry.md), the two ADRs,
-  [ADR `telemetry-loss-vocabulary`](../adr/telemetry-loss-vocabulary.md), and AGENTS.md; the allocation pins and `memory.md`'s "Routing" rows. The prototype's
+  [ADR `telemetry-loss-vocabulary`](../adr/telemetry-loss-vocabulary.md), AGENTS.md,
+  [`docs/design/pipeline-graph.md`](../design/pipeline-graph.md), `performance.md`'s Scenarios
+  table, `tools/soak/README.md` (scenario table, ledger prose, `R_copied`), the comments in
+  `perf/scenarios/route-copy.yaml` and `route-signals.yaml`, the `route` and `route_signals`
+  field docs in `crates/logit-config/src/lib.rs` (rerun `script/schema` and commit
+  `schema/logit.schema.json`), and the module doc of `crates/logit-pipeline/src/router.rs`.
+  `grep -rln 'events\.copied'` finds the set; plans that record history, such as
+  `docs/plans/soak-harness.md` and `critical-sections-inventory.md`, stay as written. Also in
+  W7: the allocation pins and `memory.md`'s "Routing" rows. The prototype's
   `crates/logit-pipeline/src/view.rs` is the starting point; its materializing default and
   `unwrap_batch` arm are the shapes to keep.
 - **W8, the encoder sweep.** The three trait signatures and every impl, split by crate into
   sibling PRs off W7: `logit-proto`'s `SplunkEncoder`, `OtlpEncoder`, `NativeEncoder`,
   `InfluxLineEncoder`, `GraphiteEncoder`, and `CollectdEncoder`; `logit-outputs`'s
   `SyslogEncoder`, `StreamEncoder`, `StatsdEncoder`, `KafkaEncoder`, and `EventDump`; and
-  `prometheus`'s exposition and remote-write pair with `datadog`'s `encode_routes`. Each PR
+  `prometheus`'s exposition and remote-write pair with `datadog`'s `encode_routes` and
+  `datadog_trace_out`'s `encode_tracer_api_traces` and `encode_client_stats_v06`. Each PR
   removes its sinks' materialize and moves their pins. An encoder with a grouping pass
   (`datadog`'s route split, `prometheus`'s registry) is where to look for a regression under
   indexed access.
