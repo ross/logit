@@ -372,8 +372,9 @@ or the higher) makes no difference. A Datadog Agent relay or a retry resends ide
 and that mustn't raise a loss alarm.
 
 Every other reading is an **increment or an observation set**: a delta `Sum` (Datadog's `count`),
-a rate (a `Gauge` flagged `_logit.metrics.type: rate`, such as a rate), a delta `Histogram`, `ExponentialHistogram`, or `Summary`, `Samples`, a
-`Distribution`, and a set, `SetMembers` or `Set`. Two equal ones in one bucket are two real sets
+a rate (a `Gauge` flagged `_logit.metrics.type: rate`, such as a Datadog `rate`), a delta
+`Histogram`, `ExponentialHistogram`, or `Summary`, `Samples`, a `Distribution`, and a set,
+`SetMembers` or `Set`. Two equal ones in one bucket are two real sets
 of events, and the sink sends one, so the removed one stays `dropped` whatever its value. A set
 written as a gauge of its size shows this most plainly: `{alice}` and `{bob}` both write `1`, and
 their union is `2`. A `dedup_timestamps` upstream merges the increments and observation sets it has

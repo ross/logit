@@ -39,7 +39,8 @@
 //! It reaches an
 //! `attributes` row for each attribute, event or resource: a `_logit.<protocol>.` carrier of the
 //! sink's own protocol is `private_carrier`, `_logit.prometheus.target` `prometheus_target` and
-//! `_logit.metrics.closed: "timestamped"` `timestamped` at every sink, a `_logit.datadog.` carrier on a log, a Datadog
+//! `_logit.metrics.closed: "timestamped"` `timestamped`, `_logit.metrics.type: "rate"` `rate`, and
+//! `_logit.metrics.interval` `interval` at every sink, a `_logit.datadog.` carrier on a log, a Datadog
 //! event, or a service check `datadog_carrier_log`, any other `_logit.` key `foreign_carrier`, an
 //! event
 //! attribute by its value (`string_value`, `bool_value`, `number_value`, `array_value`,
@@ -148,7 +149,9 @@
 
 use super::mapping::{self, Class, Lookup, Mapping, Series};
 use super::Traced;
-use logit_core::attrs::{is_field, CLOSED_TIMESTAMPED, METRICS_CLOSED};
+use logit_core::attrs::{
+    is_field, CLOSED_TIMESTAMPED, METRICS_CLOSED, METRICS_INTERVAL, METRICS_TYPE, TYPE_RATE,
+};
 use logit_core::EventBatch;
 use logit_outputs::ndjson::render_ndjson;
 use logit_outputs::statsd::is_forbidden_in_name;
@@ -1408,13 +1411,13 @@ fn same_reading(rec: &Rec, later: &Rec) -> bool {
 /// `histogram`, `exponential_histogram`, or `summary`. Any other kind, a set included, is an
 /// increment or an observation set, so two equal ones are two sets of events (`logit_proto`'s
 /// `replaced_by_a_later_reading`), and so is a rate: a `gauge` whose
-/// [`METRICS_TYPE`](logit_core::attrs::METRICS_TYPE), the event's value else the resource's, is
+/// [`METRICS_TYPE`], the event's value else the resource's, is
 /// `rate` (`logit_core::attrs::is_rate`).
 fn is_state(rec: &Rec) -> bool {
-    let flag = logit_core::attrs::METRICS_TYPE;
+    let flag = METRICS_TYPE;
     let rate = rec.kind == "gauge"
         && rec.attributes.get(flag).or_else(|| rec.resource.get(flag)).and_then(Value::as_str)
-            == Some(logit_core::attrs::TYPE_RATE);
+            == Some(TYPE_RATE);
     if rate {
         return false;
     }
@@ -1512,6 +1515,10 @@ fn field_rows(rec: &Rec, protocol: &str) -> Vec<(String, Option<String>, Field)>
     let carrier = |key: &str, value: &Value| {
         if key == METRICS_CLOSED && value.as_str() == Some(CLOSED_TIMESTAMPED) {
             Some("timestamped")
+        } else if key == METRICS_TYPE && value.as_str() == Some(TYPE_RATE) {
+            Some("rate")
+        } else if key == METRICS_INTERVAL {
+            Some("interval")
         } else if key == ATTR_TARGET {
             Some("prometheus_target")
         } else if key.starts_with("_logit.datadog.") && json_route {

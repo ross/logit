@@ -168,6 +168,8 @@
 //! | `attributes/prometheus_target` | lost | structural | The scrape target is private and isn't a tag, so it's left off, under either `tags:` mode. |
 //! | `attributes/foreign_carrier` | lost | structural | Another protocol's `_logit.` carrier is private and isn't a tag, so it's left off, under either `tags:` mode. |
 //! | `attributes/timestamped` | lost | structural | The flag is private and isn't a tag, so it's left off, under either `tags:` mode. Every datapoint carries its timestamp. |
+//! | `attributes/rate` | lost | structural | The flag is private and isn't a tag, so it's left off, under either `tags:` mode. |
+//! | `attributes/interval` | lost | structural | The flag is private and isn't a tag, so it's left off, under either `tags:` mode. |
 //! | `attributes/resource_attribute`, under `tags: drop` | lost | `logit.output.tags.omitted{reason=dialect}` | Under `tags: drop`, no tag is written, counted once per attribute. |
 //! | `attributes/resource_attribute`, otherwise | normalized | `resource_merged`; `logit.output.metrics.normalized{reason=tag_sanitized}` | A tag, read back as an event attribute; on a key the event shares, the event's value wins, uncounted. Its name and value are sanitized as the `string_value` row says, counted once per record as `tag_sanitized`. |
 //! | `attributes/scope` | lost | structural | Carbon has no instrumentation scope, so none is written. |

@@ -697,8 +697,8 @@ fn a_rate_flagged_on_the_resource_sums() {
     assert_eq!(rig.merged(), 1.0);
 }
 
-/// The retired Datadog carriers, `_logit.datadog.type: rate` and `_logit.datadog.interval`, say
-/// nothing here: a `Gauge` carrying only them is a state, so the later reading is kept.
+/// `_logit.datadog.type: rate` and `_logit.datadog.interval` are not rate flags here: a `Gauge`
+/// carrying only them is a state, so the later reading is kept.
 #[test]
 fn a_gauge_with_the_retired_datadog_carriers_is_a_state() {
     let retired = |ts: i64, value: f64| {

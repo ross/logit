@@ -2844,9 +2844,9 @@ mod tests {
 
     /// A rate is the neutral flag: a `Gauge` flagged `_logit.metrics.type: rate` leaves as a `rate`
     /// with its `_logit.metrics.interval`, from the event or the batch resource, whoever flagged
-    /// it. The retired `_logit.datadog.type: rate` and `_logit.datadog.interval` carriers say
-    /// nothing: a `Gauge` carrying only them leaves as a `gauge` with no interval. A `rate` flag on
-    /// a `Sum` is ignored.
+    /// it. `_logit.datadog.type: rate` and `_logit.datadog.interval` are not rate flags: a `Gauge`
+    /// carrying only them leaves as a `gauge` with no interval. A `rate` flag on a `Sum` is
+    /// ignored.
     #[test]
     fn the_neutral_rate_flag_writes_a_rate_and_the_retired_carriers_do_not() {
         let series = |resource: Resource, attrs: AttrMap, kind: MetricKind| {

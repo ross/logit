@@ -13,7 +13,7 @@
 //! | `samples`, `set_members`, `distribution`, `set` | none | record |
 //! | `record` | `no_recorded_value`, `no_recorded_value_delta_sum`, `no_recorded_value_other_kind`, `service_check`, `name_unsafe`, `exemplar_key_unsafe`, `exemplar_key_unsafe_histogram`, `sample_rate`, `non_finite`, `superseded`, `same_instant`, `same_instant_equal`, `same_millisecond`, `same_millisecond_equal` | record |
 //! | `record` | `unit`, `description`, `start_timestamp`, `exemplars`, `exemplars_on_summary`, `unit_on_distribution`, `min_max`, `sample_rate_unweighted` | field |
-//! | `attributes` | `string_value`, `bool_value`, `number_value`, `array_value`, `map_value`, `bytes_value`, `timestamp_value`, `private_carrier`, `prometheus_target` (`_logit.prometheus.target`, at every sink), `foreign_carrier`, `timestamped` (`_logit.metrics.closed: "timestamped"`, at every sink), `datadog_carrier_log`, `resource_attribute`, `scope` | field |
+//! | `attributes` | `string_value`, `bool_value`, `number_value`, `array_value`, `map_value`, `bytes_value`, `timestamp_value`, `private_carrier`, `prometheus_target` (`_logit.prometheus.target`, at every sink), `foreign_carrier`, `timestamped` (`_logit.metrics.closed: "timestamped"`, at every sink), `rate` (`_logit.metrics.type: "rate"`, at every sink), `interval` (`_logit.metrics.interval`, at every sink), `datadog_carrier_log`, `resource_attribute`, `scope` | field |
 //! | `attributes` | `no_host`, `log_status`, `span_kind`, `trace_id_high` (a record `datadog_out` writes an attribute for from the record's own fields) | field |
 //! | `log` | `dogstatsd_event`, `plain` (each on an event with no metrics) | record |
 //! | `span` | `alone` (on an event with no metrics); `no_wire_form` (one of those carrying a field a Datadog span has no form for) | record |
@@ -22,7 +22,7 @@
 //!
 //! `attributes/scope` is the batch's instrumentation scope, a field of every record in the batch
 //! like a resource attribute, so it's an `attributes` row rather than a kind of its own. A
-//! resource attribute under `_logit.` reaches `private_carrier` or `foreign_carrier`, as an event
+//! resource attribute under `_logit.` reaches `private_carrier`, `foreign_carrier`, or a flag row, as an event
 //! attribute does, not `resource_attribute`; a `_logit.datadog.*` carrier on a log, a Datadog event,
 //! or a service check reaches `datadog_carrier_log` in their place, at every sink.
 //! `record/non_finite` is a `sum` or `gauge` holding
@@ -167,6 +167,8 @@ const KINDS: [(&str, &[&str]); 15] = [
             "prometheus_target",
             "foreign_carrier",
             "timestamped",
+            "rate",
+            "interval",
             "resource_attribute",
             "scope",
             "datadog_carrier_log",

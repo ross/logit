@@ -92,6 +92,8 @@
 //! | `attributes/prometheus_target` | lost | structural | The scrape target is private and isn't an OTLP attribute, so it's left off. |
 //! | `attributes/foreign_carrier` | lost | structural | A `_logit.` carrier is private and isn't an OTLP attribute, so it's left off. |
 //! | `attributes/timestamped` | lost | structural | The flag is private and isn't an OTLP attribute, so it's left off. The point's time carries the timestamp. |
+//! | `attributes/rate` | lost | structural | The flag is private and isn't an OTLP attribute, so it's left off. |
+//! | `attributes/interval` | lost | structural | The flag is private and isn't an OTLP attribute, so it's left off. |
 //! | `attributes/resource_attribute` | exact | -- | A resource attribute. |
 //! | `attributes/scope` | exact | -- | The `InstrumentationScope` of the batch. |
 //! | `attributes/datadog_carrier_log` | lost | structural | A `_logit.` carrier is private and isn't an OTLP attribute, so it's left off. |

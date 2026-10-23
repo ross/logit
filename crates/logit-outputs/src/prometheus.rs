@@ -3573,8 +3573,8 @@ mod tests {
 
     /// A rate relayed to remote-write is a gauge flagged `_logit.metrics.type: rate`, on the event
     /// or the batch resource, an increment over its interval: two equal rates at one instant are
-    /// two, so the earlier counts `dropped`. The retired `_logit.datadog.type: rate` carrier says
-    /// nothing, and the flag on a `Sum` is ignored: each such pair is an equal state, normalized.
+    /// two, so the earlier counts `dropped`. `_logit.datadog.type: rate` is not a rate flag, and
+    /// the flag on a `Sum` is ignored: each such pair is an equal state, normalized.
     #[tokio::test]
     async fn an_equal_rate_is_counted_dropped_and_only_under_the_neutral_flag() {
         let event = |timestamp: i64, key: Option<&str>, kind: &MetricKind| {
