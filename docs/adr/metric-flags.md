@@ -40,11 +40,14 @@ the same handling for an event it built, although both may write private keys
 ([ADR `private-attribute-namespace`](private-attribute-namespace.md), "Transforms").
 
 The probes also cost: on the perf VM, `aggregate` rose from 0.334 to 0.353 CPU µs/event and
-`aggregate-groups` from 0.289 to 0.311 between the 2026-10-15 baseline and `5e297cce`, all of it
-in the string-field scan and the stats lookup
-([performance.md](../design/performance.md), "What moved since 2026-10-15"). Speed is the
-secondary reason for this decision. The primary one is that a shared transform shouldn't know
-protocols, and that the event's creator is the component that knows what it made.
+`aggregate-groups` from 0.289 to 0.311 between the 2026-10-15 baseline and `5e297cce`. The
+2026-10-22 bisect put all of it in the string-field scan and the stats lookup; the 2026-10-23
+measurement found most of it in how `1f30eb3c` built the series key, with the probes themselves
+costing within the spread on `aggregate` and about 2% on `aggregate-groups`
+([performance.md](../design/performance.md), "`aggregate`: the flag reads and the series-key copy
+(2026-10-23)"). Speed is the secondary reason for this decision. The primary one is that a shared
+transform shouldn't know protocols, and that the event's creator is the component that knows what
+it made.
 
 ## Decision
 
@@ -140,6 +143,8 @@ a non-finite delta `Sum`, `Gauge`, or `GaugeDelta` (`non_finite`). After this ch
   and [lua-api.md](../design/lua-api.md) documents the capability.
 - **Measurement.** The perf VM compares `72191ead` (before both probes), main, the flag build,
   and a floor build with no probe at all, on `aggregate`, `aggregate-groups`, `json-parse`, and
-  `passthrough`. The flag build is expected at or under `72191ead`; if the floor explains a gap
-  above it, the `Event` flags byte becomes its own measured change.
+  `passthrough`. Measured 2026-10-23: once the series key is built in place, the flag build reads
+  at `72191ead`'s level on all four, and the flag reads cost less than the spread against the
+  floor, so the `Event` flags byte stays unbuilt ([performance.md](../design/performance.md),
+  "`aggregate`: the flag reads and the series-key copy (2026-10-23)").
 - [docs/plans/metric-flags.md](../plans/metric-flags.md) has the workstreams.

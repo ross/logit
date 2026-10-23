@@ -27,8 +27,8 @@ Non-goals:
 
 - Honoring the flags in `dedup_timestamps` or `cumulative_to_delta`. The names leave room for
   it; nothing here builds it.
-- A flags byte on `Event`. It's the ADR's fallback, taken only if W2's measurement says the
-  attribute lookup is the cost.
+- A flags byte on `Event`. It's the ADR's fallback, not taken: W2 measured the attribute lookup
+  inside the spread (the Outcome paragraph under "Measurement").
 - Changing which carriers the protocol sinks read. `statsd_out`, `prometheus_out`,
   `datadog_out`, and `influxdb_out` keep their own carriers; `influxdb_out` reads the renamed
   `_logit.field.` as well.
@@ -58,9 +58,9 @@ The ADR holds the vocabulary. The pieces this plan adds to it:
 | # | Branch | PR title | Size | Depends on | Status |
 |---|---|---|---|---|---|
 | W0 | `flags/w0` | `flags/w0: ADR and plan for producer-set metric flags` | S | — | in review |
-| W1a | `flags/w1a` | `flags/w1a: string fields move to the _logit.field. namespace` | M | W0 | planned |
-| W1b | `flags/w1b` | `flags/w1b: decoders set _logit.metrics.* flags, and aggregate reads flags only` | L | W1a | planned |
-| W2 | — | VM measurement, recorded in `docs/design/performance.md` as a docs PR | S | W1b | planned |
+| W1a | `flags/w1a` | `flags/w1a: string fields move to the _logit.field. namespace` | M | W0 | in review |
+| W1b | `flags/w1b` | `flags/w1b: decoders set _logit.metrics.* flags, and aggregate reads flags only` | L | W1a | in review |
+| W2 | `flags/w2` | `flags/w2: VM measurement of the flag reads and the series-key copy` | S | W1b | in review |
 | W3 | `flags/w3` | `flags/w3: ADR and plan for keeping protocol knowledge in family` | S | W1b | in review |
 
 - **W1a.** `FIELD_PREFIX`/`is_field` in `logit_core::attrs`; the InfluxDB decoder and encoder,
@@ -81,8 +81,9 @@ The ADR holds the vocabulary. The pieces this plan adds to it:
   [ADR `aggregation-window-semantics`](../adr/aggregation-window-semantics.md) and
   `private-attribute-namespace`; the `data-model.md` rows; the Lua capability in
   [lua-api.md](../design/lua-api.md) with an example.
-- **W2.** Not a PR. The protocol is below; the numbers land in `performance.md`'s "What moved"
-  section as a docs PR.
+- **W2.** A docs PR. The protocol is in "Measurement" below; the numbers are in
+  [performance.md](../design/performance.md)'s "`aggregate`: the flag reads and the series-key
+  copy (2026-10-23)".
 - **W3.** [ADR `protocol-knowledge-stays-in-family`](../adr/protocol-knowledge-stays-in-family.md)
   generalizes this stream's rule to every component, and
   [its plan](protocol-knowledge-stays-in-family.md) lists the four cross-family reads left after
@@ -105,6 +106,12 @@ Read W1b against main and `72191ead`, and the floor against `72191ead`. If W1b s
 byte as its own measured change; otherwise record the cost. Don't decide on desktop numbers:
 #826's desktop A/B read −3.4% / −4.8% where the VM read −0.65% / −0.55%.
 
+**Outcome.** Against the floor, the flag reads cost less than the spread on all four scenarios.
+W1b sat +4.7% / +4.1% above `72191ead` on `aggregate` / `aggregate-groups` until it removed the
+series-key copy `1f30eb3c` introduced (`1ceca584`), after which it reads at `72191ead`'s level. No
+`Event` flags byte. [performance.md](../design/performance.md)'s "`aggregate`: the flag reads and
+the series-key copy (2026-10-23)" has the numbers.
+
 ## Review mechanics
 
 - W1a and W1b get `pr-review --comment` after opening, with the lead assessing each finding, the
@@ -120,9 +127,11 @@ byte as its own measured change; otherwise record the cost. Don't decide on desk
 Found while reading `aggregate` for this plan, out of scope here:
 
 - `SeriesKey` clones the event's attributes per record to look up the series
-  (`event.attributes.clone()` in `Aggregator::process`). For `aggregate`'s `host: h{seq%N}`
-  that's a `Bytes` refcount pair per event, more than any probe. A borrowed-key lookup would
-  remove it.
+  (`event.attributes.clone()` in `Aggregator::process`). W1b removed the second copy that the
+  string-field pruning had added, a clone into a local map then moved into the key (+4.8% /
+  +4.7% on the VM). The per-record clone remains: for `aggregate`'s `host: h{seq%N}` that's a
+  `Bytes` refcount pair per event, more than any probe. A borrowed-key lookup would remove it;
+  nothing measures that yet.
 - `datadog_out` and `datadog/series.rs` call `is_datadog_stats` per event, which does an
   `interner::lookup` per call. The symbol form `aggregate` used is free for them to take once
   `aggregate` stops calling it.
