@@ -817,11 +817,14 @@ leaves as any other.
 reading them per event would add three more cases for no producer.
 
 The relay gains one permitted normalization (`crates/logit-proto/src/splunk/mod.rs`'s list): an
-object's `fields` `host.name` is an event attribute, so it leaves as the object's `host` and
-returns on the resource, in a batch of its own per host. When that object also carried a `host`,
-the `host` is replaced. The four recorded HEC clients (`testdata/interop/splunk/`), the
-OpenTelemetry exporter among them, write no `host.name` in `fields`, so a relay of their traffic
-is unchanged (`crates/logit-proto/tests/splunk_fixed_point.rs`).
+object's `fields` `host.name` (a span object's `attributes` `host.name`) is an event attribute,
+so it leaves as the object's `host` and returns on the resource, in a batch of its own per host.
+When that object also carried a `host`, the `host` is replaced. A span object's `fields` go to the
+resource, so a `fields` `host.name` there is the resource's, under normalizations 3 and 8, as
+before. The four
+recorded HEC clients (`testdata/interop/splunk/`), the OpenTelemetry exporter among them, write
+no event-level `host.name`, so a relay of their traffic is unchanged
+(`crates/logit-proto/tests/splunk_interop.rs`).
 
 The 2026-10-14 amendment's "a `host.name` the batch carries always wins" now reads: a host the
 event or the batch carries always beats the process hostname.

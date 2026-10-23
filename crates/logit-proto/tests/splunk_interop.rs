@@ -279,15 +279,34 @@ fn every_recorded_post_request_decodes_with_nothing_skipped_or_degraded() {
 #[test]
 fn every_event_capture_sits_on_the_fixed_point() {
     let mut checked = 0;
+    let mut hosted = 0;
     for capture in every_capture() {
         if capture.method() != "POST" || Route::of(&capture) != Route::Events {
             continue;
         }
         checked += 1;
         let d1 = SplunkDecoder::new().decode_events(&capture.body, RECEIVED_AT).unwrap();
+        // No recorded client sends an event-level `host.name`, so each object keeps the `host` it
+        // carried; only a hostless one (SC4S's) takes the default, as normalization 10 says.
+        assert!(
+            d1.iter().flat_map(|b| &b.events).all(|e| e.attributes.get("host.name").is_none()),
+            "{}: an event carries host.name",
+            capture.name
+        );
         let mut e1 = Vec::new();
+        let mut relay = SplunkEncoder::new().with_default_host(Some("relay".into()));
         for batch in &d1 {
-            e1.extend_from_slice(&SplunkEncoder::new().encode(batch).unwrap());
+            let plain = SplunkEncoder::new().encode(batch).unwrap();
+            if batch.resource.attributes.get("host.name").is_some() {
+                hosted += 1;
+                assert_eq!(
+                    relay.encode(batch).unwrap(),
+                    plain,
+                    "{}: a default host replaced a carried one",
+                    capture.name
+                );
+            }
+            e1.extend_from_slice(&plain);
         }
         let d2 = SplunkDecoder::new().decode_events(&e1, RECEIVED_AT).unwrap();
         assert_eq!(d1, d2, "{}: decode(encode(decode(b))) != decode(b)", capture.name);
@@ -298,6 +317,7 @@ fn every_event_capture_sits_on_the_fixed_point() {
         assert_eq!(e1, e2, "{}: encode(decode(encode(d))) != encode(d)", capture.name);
     }
     assert_eq!(checked, 24, "every /event capture in the corpus");
+    assert!(hosted > 0, "some capture carries a host");
 }
 
 // -------------------------------------------------------------------------------------------------

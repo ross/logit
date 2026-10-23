@@ -123,10 +123,11 @@
 //!    fields when they parse) is read in either case and leaves lowercase;
 //! 10. an object that arrived with no `host` leaves with the relay's process hostname as its
 //!     `host` ([`SplunkEncoder::with_default_host`]); a `host` it carries is never replaced, except
-//!     by its own `fields` `host.name` (11);
-//! 11. an object's `fields` `host.name`, a non-empty string, is an event attribute that leaves as
-//!     the object's `host` and not as a field, so it returns on the resource, in a batch of its own
-//!     per host; when the object also carried a `host`, that `host` is replaced.
+//!     by its own `fields` `host.name` (a span object's `attributes` `host.name`) (11);
+//! 11. an object's `fields` `host.name` (a span object's `attributes` `host.name`), a non-empty
+//!     string, is an event attribute that leaves as the object's `host` and not as an attribute,
+//!     so it returns on the resource, in a batch of its own per host; when the object also carried
+//!     a `host`, that `host` is replaced.
 //!
 //! The model-side losses (a resource attribute returning as an event attribute, `Sum`
 //! temporality, the multi-number kinds under `MultiValue`) are in [`metrics`], [`logs`], and
