@@ -530,10 +530,11 @@ writes it there, read by its protocol's own rules: `collectd_in`, `syslog_in`, `
 `datadog_in`, and `splunk_hec_in`. A sink that writes a host reads `host.name`, and no protocol's
 host field. To set or override a host, stamp `host.name` with `set`.
 
-A tailed log line, a plain line, and a carbon path have no standard host field, so `tail_in`,
-`lines_in`, and `graphite_in` write no `host.name`. A host inside the data, such as pino's or
-bunyan's `hostname`, reaches a sink only once a transform puts it in `host.name`: `set` for a
-constant, or `lua` to copy a parsed attribute:
+Every other host is yours to put in `host.name`: a parsed log field, a carbon path segment, a
+line's text, an event a script builds, or a relay from a protocol with no host field. A transform
+does it, `set` for a constant or `lua` to copy an attribute, and no sink reads any other key for
+the host. For example, a pino or bunyan log tailed by `tail_in` and parsed by `json` carries its
+host as a `hostname` attribute, which this stage moves to `host.name`:
 
 ```yaml
   host_from_log:

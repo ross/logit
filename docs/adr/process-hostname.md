@@ -212,12 +212,14 @@ wire form: a wire form that names the same fact is decoded onto the common key, 
 doesn't survive as a carrier. Where the protocol has its own rule for which of several wire forms
 names the host, the source applies it, so a sink sees one answer.
 
-**Where the wire has no standard host field, the operator fills `host.name`.** An input whose
-protocol defines a host field writes `host.name` from it. Where the wire has none, as for a tailed
-or piped log line, a carbon path, or a plain line, a host inside the data is whatever an
-operator's transform puts in `host.name` (`set` for a constant, `lua` to copy a parsed
-attribute), and no sink reads any other key for it. That's settled behavior, not a gap: the input
-can't know which of the data's fields, if any, names a host.
+**Every other host is the operator's to put in `host.name`.** An input whose protocol defines a
+host field writes `host.name` from it. For every other way a host reaches an event (a parsed log
+field, a carbon path segment, a line's text, a Lua-built event, a relay from a protocol with no
+host field), an operator's transform puts it in `host.name`, and no sink reads any other key for
+it. That's settled behavior, not a gap: only the protocol's own definition tells an input which
+field, if any, names a host. For example, a pino or bunyan log tailed by `tail_in` and parsed by
+`json` carries the host as a `hostname` attribute; a `lua` stage that copies it to `host.name`
+(or a `set` of a constant) is what makes it the host at every sink.
 
 For the host, the Datadog family's decoders now apply that rule:
 
@@ -277,7 +279,7 @@ its template says.
   Agent's is the relaying Agent's identity, not a sender's host. They stay carriers.
 
 Settled, and not follow-ups: `prometheus_in`'s `instance` and `job` labels are Prometheus target
-identity, not a host, and stay labels; `graphite_in`, `lines_in`, and `tail_in` have no standard
-host field, so a host inside a metric path or a line is an operator's transform's to put in
-`host.name`, as the rule above says.
+identity, not a host, and stay labels; and `graphite_in`, `lines_in`, and `tail_in` have no
+protocol host field, so any host they carry is the operator's to put in `host.name`, as the rule
+above says.
 
