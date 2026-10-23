@@ -1,6 +1,6 @@
 ---
 created: 2026-09-12
-updated: 2026-10-18
+updated: 2026-10-23
 ---
 
 # A load-test harness: the real binary, a declarative event template, and CPU per event as the signal
@@ -264,6 +264,38 @@ rather than adding a parallel one:
 - **The self-check is exact.** A file can't drop a line, so delivered events, `tail_in`'s line
   count, its diagnostics, and its rotation count must each match the plan on every repeat, as
   `--verify` demands of a UDP run.
+
+### Amended 2026-10-23: worker count, per-thread accounting, and bimodal cells
+
+`route-copy` and `route-signals` read bimodal on identical work: CPU µs/event spread 37–108%
+across repeats of one binary. The extra time is copying 864-byte `Event`s whose cache lines were
+written on another core. Pinning the child to one CPU removed the spread and halved CPU per event,
+but tokio sizes its worker pool from the affinity mask, so that arm also ran one worker. Worker
+count and core count had never been set apart, and nothing in a results file said which mode a
+repeat ran in. Three changes close that:
+
+- **`--workers N` and `--env KEY=VALUE` set the child's environment.** `--workers` sets
+  `TOKIO_WORKER_THREADS`, which tokio reads only when the runtime builder sets no worker count, so
+  a worker count in the config wins. `--pin-child` stays the core count. `run`, `attribute`, and
+  `flamegraph` take both, and the results file records `workers`, `pin_child`, and `env`, so a
+  result names its arm. Every number recorded before this amendment ran with tokio's default:
+  one worker per CPU in the child's affinity mask, placed wherever the scheduler put them.
+- **A sampler reads `/proc/PID/task/*` every 200 ms while the child runs** (`crates/logit-perf/src/threads.rs`):
+  each thread's run time, run-queue wait, migrations, and last CPU. Each repeat records how many
+  threads ran, the busiest thread's share of run time, total migrations and run-queue wait, and
+  the five busiest threads. These identify the execution mode without `perf`, which needs
+  `perf_event_paranoid` below 2. A thread's numbers are its last sweep, since its task directory
+  vanishes when it exits, so up to 200 ms per thread and the shutdown drain after the last sweep
+  are missing. `wait4`'s rusage stays the CPU total. A `flamegraph` run records none: its child
+  is `perf record`.
+- **A bimodal scenario isn't gated.** With five or more repeats, exact one-dimensional two-means
+  over their CPU µs/event (`crates/logit-perf/src/bimodal.rs`) flags a scenario bimodal when both
+  clusters hold at least two repeats and the gap between them exceeds both the wider cluster's
+  range and 10% of the lower cluster's median.
+  `run` prints both modes and records `bimodal` and `cpu_clusters`; `bimodal` is `null` under five
+  repeats, not `false`. `compare` decides it from each file's repeats, reports such a row as
+  "bimodal, not gated" instead of diffing pooled medians, and exits 2 when that left a row ungated
+  and nothing regressed. A pooled median of two modes moves with the mix, not the code.
 
 ### Open question, deliberately not decided here: when the harness runs
 

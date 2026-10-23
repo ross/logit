@@ -2,13 +2,15 @@
 //! drain and a second one exits 130; SIGHUP bumps the reopen generation that file targets and the
 //! TLS reloader watch, and never exits.
 //!
-//! [`Signals::install`] runs first in `run_pipelines`, before the config loads. On Unix it creates
-//! every tokio `Signal` stream before it returns. Once a stream exists, the signal's default
+//! [`Signals::install_detached`] installs the handlers before the config loads, on a runtime of
+//! its own. It calls [`Signals::install`], which on Unix creates every tokio `Signal` stream
+//! before it returns. Once a stream exists, the signal's default
 //! disposition is gone for the life of the process and a delivery waits for the stream's next
 //! poll, so a signal that arrives during startup is handled rather than killing the process. Off
 //! Unix, `ctrl_c()` registers when its task first polls it, so a Ctrl-C before then still gets the
 //! default.
 
+use anyhow::Context;
 use std::future::Future;
 use std::sync::Arc;
 use tokio::sync::{watch, Notify};
@@ -46,6 +48,23 @@ impl Signals {
             [tokio::spawn(count_ctrl_c(shutdown.clone())), tokio::spawn(async {})]
         };
         Self { shutdown, tasks, reopen }
+    }
+
+    /// Installs the handlers on a one-thread runtime of their own, which keeps serving them for
+    /// the life of the process. `main` calls it before the config loads, and the config's
+    /// `runtime.workers` sizes the runtime the pipeline then runs on, which doesn't exist yet. The
+    /// returned handles use channels that don't belong to either runtime.
+    pub fn install_detached() -> anyhow::Result<Self> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("building the signal runtime")?;
+        let signals = runtime.block_on(async { Self::install() });
+        std::thread::Builder::new()
+            .name("logit-signals".into())
+            .spawn(move || runtime.block_on(std::future::pending::<()>()))
+            .context("spawning the signal thread")?;
+        Ok(signals)
     }
 
     /// Resolves once the first SIGTERM or SIGINT has arrived, including one that arrived before

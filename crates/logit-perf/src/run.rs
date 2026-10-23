@@ -26,6 +26,8 @@
 //! deliver the ring's event count. A file run is held to `crate::file_load::self_check`'s exact
 //! counts every time, since a file has no loss to tolerate.
 
+use crate::bimodal;
+use crate::child_env::ChildEnv;
 use crate::file_load::{self, FilePlan};
 use crate::load::{self, CpuSet, LoadOutcome, LoadPlan};
 use crate::result::{BinaryInfo, BoxState, GitInfo, RunReport, Sample, ScenarioReport, UdpSample};
@@ -89,6 +91,8 @@ pub struct RunArgs {
     /// Multiplies every driven spec's `rate`. `None` means 1.0, or `load::VERIFY_RATE_SCALE` under
     /// `--verify`; an explicit value wins over both, so a `--verify` run can be paced by hand.
     pub rate_scale: Option<f64>,
+    /// `--env` and `--workers`, set on every spawned child.
+    pub child_env: ChildEnv,
 }
 
 pub fn run(root: &Path, args: RunArgs) -> anyhow::Result<()> {
@@ -129,6 +133,15 @@ pub fn run(root: &Path, args: RunArgs) -> anyhow::Result<()> {
             (Some(source), None) => format!(", {source}"),
             (None, _) => String::new(),
         }
+    );
+
+    println!(
+        "child:         {}{}",
+        args.pin_child
+            .as_ref()
+            .map(|pin| format!("pinned to {pin}"))
+            .unwrap_or_else(|| "unpinned".to_string()),
+        args.child_env.describe(),
     );
 
     let mut reports: BTreeMap<String, ScenarioReport> = BTreeMap::new();
@@ -220,14 +233,20 @@ pub fn run(root: &Path, args: RunArgs) -> anyhow::Result<()> {
             match outcome {
                 Ok(sample) => {
                     println!(
-                        "   repeat {repeat}/{}: {:.0} events/s, {:.3} us/event, {:.1} MiB peak RSS, {} startup{}",
+                        "   repeat {repeat}/{}: {:.0} events/s, {:.3} us/event, {:.1} MiB peak RSS, {} startup{}{}",
                         args.repeat,
                         sample.events_per_s,
                         sample.cpu_us_per_event,
                         sample.max_rss_bytes as f64 / (1024.0 * 1024.0),
                         format_startup(sample.startup_s),
                         sample.udp.map(format_udp_suffix).unwrap_or_default(),
+                        sample.threads.as_ref().map(|t| t.describe()).unwrap_or_default(),
                     );
+                    if let Some(threads) = &sample.threads {
+                        for line in threads.table("     ") {
+                            println!("{line}");
+                        }
+                    }
                     samples.push(sample);
                 }
                 Err(err) => {
@@ -243,6 +262,14 @@ pub fn run(root: &Path, args: RunArgs) -> anyhow::Result<()> {
         }
         let median = crate::result::median_sample(&samples);
         let min = crate::result::min_sample(&samples);
+        let verdict =
+            bimodal::detect(&samples.iter().map(|s| s.cpu_us_per_event).collect::<Vec<_>>());
+        if let Some(clusters) = verdict.clusters() {
+            println!(
+                "   bimodal: {} -- the median pools both modes and measures neither",
+                clusters.describe()
+            );
+        }
         // Recorded so a results file is self-describing: events generated for a generated
         // scenario, lines sent for a driven one, lines written for a file one. Lines, not
         // datagrams: a line is one metric.
@@ -251,8 +278,17 @@ pub fn run(root: &Path, args: RunArgs) -> anyhow::Result<()> {
             Workload::Driven(_) => median.udp.map(|udp| udp.sent_lines).unwrap_or_default(),
             Workload::File(spec) => spec.lines,
         };
-        reports
-            .insert(scenario.name.clone(), ScenarioReport { count, repeats: samples, median, min });
+        reports.insert(
+            scenario.name.clone(),
+            ScenarioReport {
+                count,
+                repeats: samples,
+                median,
+                min,
+                bimodal: verdict.flag(),
+                cpu_clusters: verdict.clusters(),
+            },
+        );
     }
 
     if reports.is_empty() {
@@ -271,6 +307,9 @@ pub fn run(root: &Path, args: RunArgs) -> anyhow::Result<()> {
         label: args.label.clone(),
         box_state: Some(state),
         binary,
+        workers: args.child_env.workers,
+        pin_child: args.pin_child.as_ref().map(ToString::to_string),
+        env: args.child_env.env.clone(),
         scenarios: reports,
     };
 
@@ -475,6 +514,9 @@ pub(crate) struct SpawnConfig<'a> {
     /// CPUs to pin the child to, applied between `fork` and `exec` so it never runs unpinned (see
     /// [`spawn_and_measure`]).
     pub pin_child: Option<&'a CpuSet>,
+    /// Variables set on the child on top of this process's environment. Under a wrapper the
+    /// wrapper gets them, and passes them on to `logit`.
+    pub env: &'a ChildEnv,
     /// Whether the graph keeps running after the load stops. When true, the measurement is
     /// followed by `settle`, then SIGTERM. Always true for a driven scenario.
     pub needs_sigterm: bool,
@@ -492,6 +534,8 @@ pub(crate) struct Measured {
     pub usage: Usage,
     /// What the sender put on the wire; `None` for a generated scenario.
     pub load: Option<LoadOutcome>,
+    /// The child's per-thread accounting; `None` under a wrapper, whose threads aren't `logit`'s.
+    pub threads: Option<crate::threads::ThreadSummary>,
 }
 
 impl Measured {
@@ -506,14 +550,16 @@ impl Measured {
     }
 
     pub fn sample(&self, events: u64) -> Sample {
-        Sample::from_usage(
+        let mut sample = Sample::from_usage(
             events,
             self.startup,
             self.usage.wall,
             self.usage.user,
             self.usage.sys,
             self.usage.max_rss_bytes,
-        )
+        );
+        sample.threads = self.threads.clone();
+        sample
     }
 }
 
@@ -531,6 +577,7 @@ fn run_one_generated(
         config: &scenario.path,
         drive: Drive::Generated { count },
         pin_child: args.pin_child.as_ref(),
+        env: &args.child_env,
         needs_sigterm: scenario.needs_sigterm,
         settle: args.settle,
         timeout: args.timeout,
@@ -573,6 +620,7 @@ fn run_one_driven(
         config: &config_path,
         drive: Drive::Driven { plan, pin_sender: args.pin_sender.as_ref() },
         pin_child: args.pin_child.as_ref(),
+        env: &args.child_env,
         // A socket listener plus a telemetry leg never exits on its own.
         needs_sigterm: true,
         settle: args.settle.max(DRIVEN_SETTLE_FLOOR),
@@ -657,6 +705,7 @@ fn run_one_file(
         config: &config_path,
         drive: Drive::File { plan, dump: &dump_path },
         pin_child: args.pin_child.as_ref(),
+        env: &args.child_env,
         needs_sigterm: true,
         settle: args.settle,
         timeout: args.timeout,
@@ -933,6 +982,7 @@ pub(crate) fn spawn_and_measure(spawn: SpawnConfig<'_>) -> anyhow::Result<Measur
         config,
         drive,
         pin_child,
+        env,
         needs_sigterm,
         settle,
         timeout,
@@ -954,6 +1004,7 @@ pub(crate) fn spawn_and_measure(spawn: SpawnConfig<'_>) -> anyhow::Result<Measur
     command
         .args(["--log-format", "json", "--log-level", "info", "run"])
         .arg(config)
+        .envs(env.vars())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
@@ -991,6 +1042,9 @@ pub(crate) fn spawn_and_measure(spawn: SpawnConfig<'_>) -> anyhow::Result<Measur
         })?;
     let spawned_at = Instant::now();
     let pid = child.id() as libc::pid_t;
+    // Not under a wrapper: `pid` is then the wrapper, and `logit` one of its children. Dropped on
+    // an error path, which stops it.
+    let sampler = wrapper.is_empty().then(|| crate::threads::start(child.id()));
 
     // Drained so a full pipe buffer can't block the child on a write nobody reads.
     let mut stdout = child.stdout.take().expect("stdout was piped");
@@ -1114,6 +1168,9 @@ pub(crate) fn spawn_and_measure(spawn: SpawnConfig<'_>) -> anyhow::Result<Measur
 
     if needs_sigterm {
         std::thread::sleep(settle);
+        if let Some(sampler) = &sampler {
+            sampler.sweep_now();
+        }
         // SAFETY: `pid` is this scenario's own child, spawned above and not yet reaped (neither
         // `child.wait()` nor `rusage::wait4` below has run yet), so it is a valid, still-live
         // signal target.
@@ -1145,6 +1202,7 @@ pub(crate) fn spawn_and_measure(spawn: SpawnConfig<'_>) -> anyhow::Result<Measur
         .unwrap_or_else(|_| Err(io::Error::other("wait4 thread panicked")))
         .with_context(|| format!("wait4({pid})"))?;
     let stderr_text = drain_and_join(stdout_drain, stderr_reader);
+    let threads = sampler.and_then(crate::threads::Running::finish);
 
     match usage.exit_code() {
         Some(0) => {}
@@ -1159,7 +1217,7 @@ pub(crate) fn spawn_and_measure(spawn: SpawnConfig<'_>) -> anyhow::Result<Measur
         None => bail!("terminated by signal (raw status {}); stderr:\n{stderr_text}", usage.status),
     }
 
-    Ok(Measured { startup, usage, load })
+    Ok(Measured { startup, usage, load, threads })
 }
 
 /// Builds `logit` under `profile` (unless `no_build`) and returns the binary's path, failing if
@@ -1531,12 +1589,17 @@ fn print_table(report: &RunReport) {
     );
     for (name, scenario) in &report.scenarios {
         println!(
-            "{:<22} {:>12.0} {:>14.3} {:>9.1} MiB {:>10}",
+            "{:<22} {:>12.0} {:>14.3} {:>9.1} MiB {:>10}{}",
             name,
             scenario.median.events_per_s,
             scenario.median.cpu_us_per_event,
             scenario.median.max_rss_bytes as f64 / (1024.0 * 1024.0),
             format_startup(scenario.median.startup_s),
+            // The median of a bimodal scenario is a mix, not a measurement.
+            match &scenario.cpu_clusters {
+                Some(clusters) => format!("  bimodal: {}", clusters.describe()),
+                None => String::new(),
+            },
         );
     }
 }
@@ -2056,6 +2119,9 @@ mod tests {
             label: None,
             box_state: None,
             binary,
+            workers: None,
+            pin_child: None,
+            env: BTreeMap::new(),
             scenarios: BTreeMap::new(),
         }
     }

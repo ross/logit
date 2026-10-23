@@ -5,6 +5,8 @@
 //! numbers mean something only uncontended.
 
 mod attribute;
+mod bimodal;
+mod child_env;
 mod compare;
 mod file_load;
 mod flamegraph;
@@ -15,6 +17,7 @@ mod rusage;
 mod scenario;
 mod spool;
 mod telemetry_leg;
+mod threads;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
@@ -26,6 +29,26 @@ use std::time::Duration;
 struct Cli {
     #[command(subcommand)]
     command: Command,
+}
+
+/// What the spawned `logit` gets on top of this process's environment (`crate::child_env`).
+#[derive(clap::Args)]
+struct ChildArgs {
+    /// Set KEY=VALUE in the spawned `logit` process's environment (repeatable); the value may
+    /// contain `=`. Recorded in the results file.
+    #[arg(long = "env", value_name = "KEY=VALUE", value_parser = child_env::parse_env_pair)]
+    env: Vec<(String, String)>,
+    /// Run the spawned `logit` with N tokio worker threads, through `TOKIO_WORKER_THREADS`. A
+    /// worker count the config sets wins over it. Independent of `--pin-child`, which sets cores,
+    /// not threads; recorded in the results file.
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
+    workers: Option<u32>,
+}
+
+impl ChildArgs {
+    fn into_env(self) -> anyhow::Result<child_env::ChildEnv> {
+        child_env::ChildEnv::new(self.env, self.workers)
+    }
 }
 
 #[derive(Subcommand)]
@@ -86,8 +109,11 @@ enum Command {
         /// (with `--verify`, replaces its 0.25 derate but keeps the exactness check).
         #[arg(long = "rate-scale")]
         rate_scale: Option<f64>,
+        #[command(flatten)]
+        child: ChildArgs,
     },
-    /// Diff two results files' medians and exit non-zero on a regression past `--threshold`.
+    /// Diff two results files' medians: exit 1 on a regression past `--threshold`, else 2 when a
+    /// scenario was left ungated because its repeats are bimodal on either side.
     Compare {
         before: PathBuf,
         after: PathBuf,
@@ -129,6 +155,8 @@ enum Command {
         /// Pin the spawned `logit` process and all its threads to these CPUs.
         #[arg(long = "pin-child", value_parser = parse_cpu_list)]
         pin_child: Option<load::CpuSet>,
+        #[command(flatten)]
+        child: ChildArgs,
     },
     /// Profile one scenario with `perf record` into a flamegraph SVG (run via
     /// `script/perf flamegraph`).
@@ -160,6 +188,8 @@ enum Command {
         /// Pin the profiled process to these CPUs.
         #[arg(long = "pin-child", value_parser = parse_cpu_list)]
         pin_child: Option<load::CpuSet>,
+        #[command(flatten)]
+        child: ChildArgs,
     },
 }
 
@@ -182,27 +212,40 @@ fn main() {
             pin_child,
             verify,
             rate_scale,
-        } => run::run(
-            &repo_root(),
-            run::RunArgs {
-                scenarios: scenario,
-                repeat,
-                label,
-                settle,
-                timeout,
-                shutdown_timeout,
-                no_build,
-                profile,
-                logit_bin,
-                interval,
-                pin_sender,
-                pin_child,
-                verify,
-                rate_scale,
-            },
-        ),
+            child,
+        } => child.into_env().and_then(|child_env| {
+            run::run(
+                &repo_root(),
+                run::RunArgs {
+                    scenarios: scenario,
+                    repeat,
+                    label,
+                    settle,
+                    timeout,
+                    shutdown_timeout,
+                    no_build,
+                    profile,
+                    logit_bin,
+                    interval,
+                    pin_sender,
+                    pin_child,
+                    verify,
+                    rate_scale,
+                    child_env,
+                },
+            )
+        }),
         Command::Compare { before, after, threshold, rss_threshold } => {
-            run_compare(&before, &after, threshold, rss_threshold)
+            run_compare(&before, &after, threshold, rss_threshold).map(|ungated| {
+                if !ungated.is_empty() {
+                    eprintln!(
+                        "not gated: {} -- bimodal repeats have no single median to compare; \
+                         see docs/design/performance.md's \"Reading the rows\"",
+                        ungated.join(", ")
+                    );
+                    std::process::exit(2);
+                }
+            })
         }
         Command::List => run_list(&repo_root()),
         Command::Attribute {
@@ -216,21 +259,25 @@ fn main() {
             logit_bin,
             pin_sender,
             pin_child,
-        } => attribute::attribute(
-            &repo_root(),
-            attribute::AttributeArgs {
-                scenario,
-                interval,
-                settle,
-                timeout,
-                shutdown_timeout,
-                no_build,
-                profile,
-                logit_bin,
-                pin_sender,
-                pin_child,
-            },
-        ),
+            child,
+        } => child.into_env().and_then(|child_env| {
+            attribute::attribute(
+                &repo_root(),
+                attribute::AttributeArgs {
+                    scenario,
+                    interval,
+                    settle,
+                    timeout,
+                    shutdown_timeout,
+                    no_build,
+                    profile,
+                    logit_bin,
+                    pin_sender,
+                    pin_child,
+                    child_env,
+                },
+            )
+        }),
         Command::Flamegraph {
             scenario,
             out,
@@ -242,21 +289,25 @@ fn main() {
             no_build,
             pin_sender,
             pin_child,
-        } => flamegraph::flamegraph(
-            &repo_root(),
-            flamegraph::FlamegraphArgs {
-                scenario,
-                out,
-                folded,
-                freq,
-                settle,
-                timeout,
-                shutdown_timeout,
-                no_build,
-                pin_sender,
-                pin_child,
-            },
-        ),
+            child,
+        } => child.into_env().and_then(|child_env| {
+            flamegraph::flamegraph(
+                &repo_root(),
+                flamegraph::FlamegraphArgs {
+                    scenario,
+                    out,
+                    folded,
+                    freq,
+                    settle,
+                    timeout,
+                    shutdown_timeout,
+                    no_build,
+                    pin_sender,
+                    pin_child,
+                    child_env,
+                },
+            )
+        }),
     };
 
     if let Err(err) = result {
@@ -316,12 +367,14 @@ fn format_binary_provenance(binary: &result::BinaryInfo) -> String {
     }
 }
 
+/// Prints the comparison and fails on a regression; otherwise returns the scenarios left ungated
+/// because either side's repeats are bimodal, for `main` to exit 2 on.
 fn run_compare(
     before: &Path,
     after: &Path,
     threshold: f64,
     rss_threshold: Option<f64>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Vec<String>> {
     let a = read_report(before)?;
     let b = read_report(after)?;
 
@@ -352,6 +405,18 @@ fn run_compare(
         "scenario", "events/s", "us/event", "peak RSS", "drop rate"
     );
     for scenario in &report.scenarios {
+        if !scenario.is_gated() {
+            let side = |clusters: Option<bimodal::Clusters>| {
+                clusters.map(|c| c.describe()).unwrap_or_else(|| "one mode".to_string())
+            };
+            println!(
+                "{:<22} bimodal, not gated: before {}; after {}",
+                scenario.name,
+                side(scenario.before_clusters),
+                side(scenario.after_clusters),
+            );
+            continue;
+        }
         match &scenario.deltas {
             Some(deltas) => {
                 let regressed = deltas.is_regression(threshold, rss_threshold);
@@ -399,7 +464,7 @@ fn run_compare(
                 .unwrap_or_default()
         );
     }
-    Ok(())
+    Ok(report.ungated().map(|scenario| scenario.name.clone()).collect())
 }
 
 fn parse_duration(s: &str) -> Result<Duration, String> {
