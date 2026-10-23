@@ -307,8 +307,9 @@ and codecs carry for them:
   [docs/design/data-model.md](docs/design/data-model.md)'s "Well-known attribute names" is the
   canonical statement). A decoder that needs `aggregate` to treat an event specially sets a
   `_logit.metrics.*` flag beside the carrier ([ADR `metric-flags`](docs/adr/metric-flags.md)), and
-  a component outside the carrier's family doesn't act on the carrier itself, apart from the four
-  reads [ADR `protocol-knowledge-stays-in-family`](docs/adr/protocol-knowledge-stays-in-family.md)
+  a component outside the carrier's family doesn't act on the carrier itself, apart from the three
+  carrier reads (C1 to C3) that
+  [ADR `protocol-knowledge-stays-in-family`](docs/adr/protocol-knowledge-stays-in-family.md)
   records as debt.
 - **Model v2**: `Sum`/`Samples`/`SetMembers`/`ExponentialHistogram`, `SpanExt`, batch-level
   `Scope`, `MetricRecord.flags`.
@@ -1136,9 +1137,10 @@ not a style preference:
   survey it's built on ([`docs/design/telemetry-landscape.md`](docs/design/telemetry-landscape.md)) first.
 - **Protocol knowledge stays in its family.** A component keys behavior on another component's
   internals (its `_logit.<protocol>.` carriers, wire-specific attribute names, hop identity, or a
-  batch's provenance) only within a lossless family: one like pair above, or the Datadog family of
-  DogStatsD, `datadog`, and `datadog_trace`. Everything else reads neutral `_logit.metrics.` and
-  `_logit.field.` flags its creator set, public vocabulary, or its own config; an exception needs
+  batch's provenance) only within a lossless family: one like pair above, the Datadog family of
+  DogStatsD, `datadog`, and `datadog_trace`, or the native hop's (`logit_out`, `logit_in`, and the
+  `buffer.disk:` spool). Everything else reads neutral `_logit.metrics.` and `_logit.field.` flags
+  its creator set, public vocabulary, or its own config (provenance ids included); an exception needs
   its own ADR ([ADR `protocol-knowledge-stays-in-family`](docs/adr/protocol-knowledge-stays-in-family.md),
   whose plan lists the four reads that break it today).
 - **The wire encoding is decided: hand-rolled, shipped as `logit_proto::native`** — a four-arm

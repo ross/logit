@@ -59,8 +59,8 @@ A key is private when it's one of these:
 - A protocol's raw wire spelling of something the model already normalizes into a typed field: a
   severity, a metric kind's wire type, the fact that the wire carried its own timestamp, a name
   the model folds into `MetricRecord.name`.
-- A payload or envelope field that only that protocol's own sink reads: a Datadog series interval,
-  a tracer's request headers, an InfluxDB bucket.
+- A payload or envelope field that only that protocol's family reads: a tracer's request
+  headers, an InfluxDB bucket.
 
 Everything else a decoder stamps is public data that any sink may render.
 
@@ -152,7 +152,9 @@ Without the guard, a sender's tag would be read back as carrier data at that car
 Every other decoder admits the key uncounted: OTLP metric data-point attributes and Splunk HEC
 metric `fields` included, the log and span decoders, and the parsing transforms (`json`,
 `logfmt`, `kv`, `csv`, `regex`). A top-level `_logit.*` key they admit is taken as the carrier
-it names at that carrier's own sink. The guard generalizes a counter `influxdb_in` already keeps
+it names by that carrier's family, and by the cross-family reads
+[ADR `protocol-knowledge-stays-in-family`](protocol-knowledge-stays-in-family.md) records as
+debt. The guard generalizes a counter `influxdb_in` already keeps
 for its own prefix; the other decoders have no tag-omission counter, and a producer has to choose
 the `_logit.` prefix to reach a carrier. Under [ADR `deployment-threat-model`](deployment-threat-model.md),
 that makes it a documented gap rather than a guard to add.

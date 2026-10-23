@@ -107,7 +107,7 @@ as `Value::U64`, because RFC 5424's PROCID is free-form PRINTUSASCII. `syslog.ti
 
 **The private namespace `_logit.`: a carrier lives under `_logit.<protocol>.`**
 (`_logit.statsd.type`). A carrier is a protocol's raw wire spelling of something the model
-normalizes, or a payload field only that protocol's own sink reads. The tables below list every
+normalizes, or a payload field only that protocol's family reads. The tables below list every
 carrier by protocol, except InfluxDB's and Datadog's, whose codec module docs
 (`crates/logit-proto/src/influxdb/mod.rs`, `crates/logit-proto/src/datadog/mod.rs`) hold them.
 [ADR `private-attribute-namespace`](../adr/private-attribute-namespace.md) records which keys are
@@ -141,8 +141,10 @@ private, which stay public, and why. The prefix has one definition,
   `logit.input.tags.omitted{reason="reserved_prefix"}`; the point itself is kept. Every other
   decoder admits the key uncounted: OTLP and Splunk HEC metrics included, the log and span
   decoders, and the parsing transforms (`json`, `logfmt`, `kv`, `csv`, `regex`). A top-level
-  `_logit.*` key they admit is read as the carrier it names at that carrier's own sink, and
-  skipped everywhere else (`docs/known-gaps/mappings.md`).
+  `_logit.*` key they admit is read as the carrier it names by that carrier's family and by the
+  cross-family reads
+  [ADR `protocol-knowledge-stays-in-family`](../adr/protocol-knowledge-stays-in-family.md) records
+  as debt, and skipped everywhere else (`docs/known-gaps/mappings.md`).
 
 **The field namespace `_logit.field.<key>` isn't a protocol's.** An attribute under it
 (`logit_core::attrs::FIELD_PREFIX`, tested by `logit_core::attrs::is_field`) is data about its

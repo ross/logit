@@ -31,9 +31,10 @@ Non-goals:
 
 ## The rule
 
-Outside a lossless family, a component reads only neutral meaning segments (`_logit.metrics.`,
-`_logit.field.`), public vocabulary, and what its own config names
-([the ADR's Decision](../adr/protocol-knowledge-stays-in-family.md#decision)).
+Outside a lossless family (a like pair, the Datadog family, or the native hop's), a component
+reads only neutral meaning segments (`_logit.metrics.`, `_logit.field.`), public vocabulary, and
+what its own config names, a component id in `has_provenance`, `drop_provenance`, or a provenance
+`route` included ([the ADR's Decision](../adr/protocol-knowledge-stays-in-family.md#decision)).
 
 ## C1 and C2: the Datadog rate carrier in `dedup_timestamps` and `prometheus_out`
 

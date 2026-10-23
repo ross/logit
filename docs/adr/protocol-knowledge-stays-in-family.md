@@ -47,7 +47,11 @@ A component may key behavior on another component's internals only within a loss
 **A family** is one like-protocol pair of [ADR `lossless-transit`](lossless-transit.md)
 (`statsd`, `otlp`, `syslog`, `prometheus`, `collectd`, `graphite`, `splunk_hec`, `influxdb`), or
 the **Datadog family**: `statsd_in` and `statsd_out` (DogStatsD), `datadog_in` and `datadog_out`,
-and `datadog_trace_in` and `datadog_trace_out`. The `statsd` pair belongs to both. Inside a family
+and `datadog_trace_in` and `datadog_trace_out`. The `statsd` pair belongs to both. `logit_out` and
+`logit_in`, with the `buffer.disk:` spool that records hop frames, are the native hop's family:
+`logit_in` keys its high-water marks and acknowledgments on `logit_out`'s sender identity and
+sequence
+([ADR `native-hop-identity-and-sequence`](native-hop-identity-and-sequence.md)). Inside a family
 a component reads another member's carriers, wire-specific attribute names, and shared codec
 constants freely.
 
@@ -62,7 +66,8 @@ only:
    destination's own documented attribute names (`com.splunk.*` for Splunk, Datadog's reserved
    `host` and `syslog.hostname` for `datadog_out`).
 3. **What its own config names**: a key in `route`, `has_attributes`, `remove`, or `set`, a
-   `timestamp` source attribute, a `trace_context` `format:`.
+   `timestamp` source attribute, a `trace_context` `format:`, or a component id in
+   `has_provenance`, `drop_provenance`, or a `route` on `by: {provenance: origin | previous}`.
 
 **"Any component may read a private key" holds for visibility and not for logic.** Lua, `set`,
 `keep`, `route`, and whole-event renders (`stdio_out`'s `format: json`, the native wire) see every
