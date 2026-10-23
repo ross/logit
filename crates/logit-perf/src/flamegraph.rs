@@ -58,6 +58,8 @@ pub struct FlamegraphArgs {
     /// Sender CPU pinning; only a real-socket scenario has a sender.
     pub pin_sender: Option<CpuSet>,
     pub pin_child: Option<CpuSet>,
+    /// `--env` and `--workers`, set on the child.
+    pub child_env: crate::child_env::ChildEnv,
 }
 
 pub fn flamegraph(root: &Path, args: FlamegraphArgs) -> anyhow::Result<()> {
@@ -163,6 +165,7 @@ fn record_and_render(
         config: &config,
         drive,
         pin_child: args.pin_child.as_ref(),
+        env: &args.child_env,
         needs_sigterm: scenario.needs_sigterm,
         settle: args.settle,
         timeout: args.timeout,

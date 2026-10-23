@@ -19,6 +19,8 @@ To reproduce any number here:
 | A real-socket UDP scenario | `script/perf run --scenario udp-statsd --repeat 5 --pin-sender 0,1 --pin-child 2,3` |
 | Its zero-drop self-check | `script/perf run --scenario udp-statsd --verify --pin-sender 0,1 --pin-child 2,3` |
 | A stashed binary, not a build | `script/perf run --scenario passthrough --logit-bin perf/bins/<slug>/logit` |
+| One tokio worker, any core | `script/perf run --scenario route-copy --repeat 5 --workers 1` |
+| An arbitrary child variable | `script/perf run --scenario route-copy --repeat 5 --env KEY=VALUE` |
 
 To measure several sources in one session on the disposable perf VM
 (`docs/adr/disposable-azure-perf-vm.md`), run `script/vm build <ref\|dir\|tarball>...`. It stashes
@@ -713,6 +715,31 @@ its one per RTT (100 batches/s). Window 1's CPU per event is inflated by idle wa
 
 ### Reading the rows
 
+**Every number recorded here so far ran with an unspecified worker placement.** No run before
+2026-10-23 set `--workers`, so tokio started one worker per CPU in the child's affinity mask, and
+the scheduler placed them. A pinned run (`--pin-child`) also shrank the worker pool to the pinned
+CPUs. Read an older row as "tokio's default on that box", not as a fixed worker count.
+
+Since 2026-10-23, `run` records three more things per scenario. Read them before the median:
+
+- **The child's arm.** The results file's `workers` (`--workers`, `null` when unset), `pin_child`,
+  and `env` (`--env` pairs) say what the child ran with. `compare` warns when the two sides differ.
+- **Per-thread accounting**, per repeat under `threads`: `threads_ran`, `ran_by_name` (threads that
+  ran, by name: `tokio-rt-worker`, `logit-<id>` for a Lua thread, `logit` for the main thread),
+  `busiest_share` (the busiest thread's share of run time: near 1 is one thread doing the work,
+  near 1/N is N threads sharing it), `migrations_total` (from the kernel's `se.nr_migrations`, or
+  counted as last-CPU changes between sweeps when `migrations_source` says so), and
+  `run_queue_wait_ms_total`, plus the five busiest threads under `top`. The repeat's line prints
+  the same, and a thread table under it. A thread's numbers are its last 200 ms sweep, so they
+  undercount its run time; `user_s`/`sys_s` stay the CPU total.
+- **`bimodal`.** With five or more repeats, `run` splits their CPU µs/event into the two clusters
+  with the smallest within-cluster sum of squares, and calls the scenario bimodal when both hold
+  at least two repeats and the gap between them is wider than either cluster's range and than 10%
+  of the lower cluster's median. A bimodal
+  scenario's `cpu_clusters` holds each mode's size and median, and `run` prints both. Its pooled
+  median describes neither mode, so don't record it as a row; record the modes, or find out what
+  sets the mode. `bimodal` is `null` under five repeats: too few to tell, not a clean bill.
+
 The readings below cross-reference each `perf/scenarios/*.yaml`'s own comments. **The top-line
 numbers are from the 2026-10-22 session.** The flamegraph shares below come from the 2026-10-02
 session's `cpu-clock` captures of `d1521c5f` (`script/perf flamegraph`, 999 Hz, `--folded` kept for
@@ -1165,16 +1192,18 @@ inside the tip that moved) puts all of it in `dur/w5`:
 ## 4. Before/after: the regression workflow
 
 ```sh
-script/perf run --repeat 3 --profile release --label before   # on the base commit
+script/perf run --repeat 5 --profile release --label before   # on the base commit
 # ... make a change ...
-script/perf run --repeat 3 --profile release --label after    # on the changed commit
+script/perf run --repeat 5 --profile release --label after    # on the changed commit
 script/perf compare perf/results/<before-file>.json perf/results/<after-file>.json --threshold 5
 ```
 
 `compare` prints each scenario's Δ% on events/s, CPU µs/event, and peak RSS between the two files'
-medians. It exits non-zero if events/s dropped or CPU µs/event rose by more than `--threshold`
-percent; peak RSS gates only with `--rss-threshold`. A scenario present in only one file is listed,
-not compared.
+medians. It exits 1 if events/s dropped or CPU µs/event rose by more than `--threshold` percent;
+peak RSS gates only with `--rss-threshold`. A scenario present in only one file is listed, not
+compared. A scenario whose repeats are bimodal on either side ("Reading the rows") is listed as
+"bimodal, not gated" with each side's modes, and `compare` exits 2 when that left a row ungated
+and nothing regressed. Run at least five repeats per side, or no scenario can be judged bimodal.
 
 - **Run both sides on the same box.** `compare` warns, but doesn't fail, on a hostname or CPU-model
   mismatch, because neither number is trustworthy across machines, and a new `script/vm up` may land
