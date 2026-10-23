@@ -67,7 +67,9 @@ Ownership decides, not reading:
 
 - **Reads, no copy.** A sink and its encoder: `Output::send`, `Output::submit` (which
   `window_round` calls), and the three encoder traits (`Encoder`, `FramedEncoder`,
-  `SignalEncoder`), plus `prometheus`'s own pair, take `&BatchView`. Counting reads `view.len()`.
+  `SignalEncoder`), `prometheus`'s own pair, `datadog`'s `encode_routes`, and
+  `datadog_trace_out`'s `encode_tracer_api_traces` and `encode_client_stats_v06`, take
+  `&BatchView`. Counting reads `view.len()`.
 - **Narrows, no copy.** A router. `route` emits one index list per destination. `route_signals`
   emits index lists plus a signal mask per target and never strips in place; it still counts
   `logit.transform.payloads.stripped{signal}` for each payload its masks hide. A router fed a
@@ -139,8 +141,8 @@ that word. There's no alias, because `logit` is pre-release.
   bounded by the backlogged-sink rule. A transform behind a router still copies its slice, no worse
   than today.
 - **A wide signature change.** `Delivered`, `Output::send` and `Output::submit`, the three encoder
-  traits and every impl, `prometheus`'s pair, `datadog`'s `encode_routes`, and
-  `native::encode_hop_batch` take a view. It lands over the plan's W7 to W10: the pipeline layer
+  traits and every impl, `prometheus`'s pair, `datadog`'s `encode_routes`, `datadog_trace_out`'s
+  two encoders, and `native::encode_hop_batch` take a view. It lands over the plan's W7 to W10: the pipeline layer
   first, with each sink materializing a partial view until its encoder PR removes the call.
 - **Pins move with the code.** Allocation pins in `crates/logit-bench/tests/allocations.rs` and the
   matching `docs/design/memory.md` rows change in the PR that changes them.
