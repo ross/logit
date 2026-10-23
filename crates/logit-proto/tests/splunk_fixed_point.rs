@@ -86,6 +86,51 @@ fn a_hostless_object_leaves_with_the_relay_hostname() {
     assert_eq!(next_hop.encode(&d2[0]).unwrap(), e1);
 }
 
+/// Permitted normalization 11: an event's `host.name` leaves as its object's `host`, so it returns
+/// on the resource, one batch per host, and from the second hop on it's a fixed point.
+#[test]
+fn an_event_host_name_returns_on_the_resource_one_batch_per_host() {
+    let mut relay = SplunkEncoder::new().with_default_host(Some("relay".into()));
+    let d1 = decode(
+        br#"{"time":1,"event":"a","fields":{"host.name":"h1"}}{"time":1,"event":"b"}{"time":1,"event":"c","fields":{"host.name":"h2"}}"#,
+    );
+    assert_eq!(d1.len(), 1, "no envelope host: one resource");
+    let e1 = relay.encode(&d1[0]).unwrap();
+    assert_eq!(
+        &e1[..],
+        br#"{"time":1,"host":"h1","event":"a"}{"time":1,"host":"relay","event":"b"}{"time":1,"host":"h2","event":"c"}"#
+    );
+    let d2 = decode(&e1);
+    let hosts: Vec<_> =
+        d2.iter().map(|b| b.resource.attributes.get("host.name").cloned()).collect();
+    assert_eq!(hosts, [Some(Value::str("h1")), Some(Value::str("relay")), Some(Value::str("h2"))]);
+    assert!(d2.iter().all(|b| b.events[0].attributes.get("host.name").is_none()));
+    assert_eq!(encode(&d2), e1.to_vec());
+}
+
+/// Normalization 11's one replacement: a `fields` `host.name` is an event attribute, so it
+/// becomes the object's `host` over the `host` the object carried.
+#[test]
+fn a_fields_host_name_leaves_as_the_object_host() {
+    let d1 = decode(br#"{"time":1,"host":"a","event":"x","fields":{"host.name":"b"}}"#);
+    assert_eq!(encode(&d1), br#"{"time":1,"host":"b","event":"x"}"#.to_vec());
+}
+
+/// A relay of HEC objects that carry no `fields` `host.name` writes every object's own `host`:
+/// the event-level rule has nothing to read.
+#[test]
+fn a_relay_whose_events_carry_no_host_name_is_unaffected() {
+    let batches = assert_fixed_point(OTEL_EXPORTER_BODY.as_bytes());
+    assert!(batches
+        .iter()
+        .flat_map(|b| &b.events)
+        .all(|e| e.attributes.get("host.name").is_none()));
+    let mut relay = SplunkEncoder::new().with_default_host(Some("relay".into()));
+    for batch in &batches {
+        assert_eq!(relay.encode(batch).unwrap().to_vec(), encode(std::slice::from_ref(batch)));
+    }
+}
+
 #[test]
 fn array_and_concatenated_framing_and_whitespace() {
     let array = assert_fixed_point(

@@ -166,7 +166,8 @@ impl SplunkEncoder {
         }
 
         let keys = &*KEYS;
-        let mut fields = SplunkEncoder::object_fields(ctx.resource, event);
+        let host = ctx.host(event);
+        let mut fields = SplunkEncoder::object_fields(ctx.resource, event, host);
         if text.as_deref() == Some(METRIC_EVENT) {
             // The keys `metrics::is_metric_fields` reads: any `metric_name:<n>`, and the
             // `metric_name` + `_value` pair only when both are present.
@@ -214,7 +215,7 @@ impl SplunkEncoder {
         }
 
         self.scratch.clear();
-        let mut obj = begin_object(&mut self.scratch, event.timestamp, ctx);
+        let mut obj = begin_object(&mut self.scratch, event.timestamp, ctx, host);
         let slot = obj.key("event");
         match &log.message {
             Value::Str(_) | Value::Bytes(_) => write_str(slot, &value_text(&log.message)),
