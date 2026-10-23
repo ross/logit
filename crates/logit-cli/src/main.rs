@@ -248,12 +248,26 @@ fn main() -> anyhow::Result<()> {
         Command::Run { path } => {
             let telemetry_layer = logit_core::TelemetryLayer::new();
             init_logging(&cli.log_level, cli.log_format, telemetry_layer.clone())?;
+            // The handlers go in before the config loads, so a signal during startup is held, not
+            // defaulted. `runtime.workers` sizes the pipeline's runtime, so the config loads
+            // before that runtime exists. A load failure is a startup failure, exit 1.
+            let signals = signals::Signals::install_detached()?;
+            let config = match config::load(&path) {
+                Ok(config) => config,
+                Err(err) => {
+                    eprintln!("Error: {err:?}");
+                    std::process::exit(1);
+                }
+            };
             // Only `Run` pays for an async runtime.
-            let runtime = tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-                .context("building the tokio runtime")?;
-            match runtime.block_on(pipeline::run_pipelines(path, telemetry_layer)) {
+            let mut builder = tokio::runtime::Builder::new_multi_thread();
+            builder.enable_all();
+            if let Some(workers) = config.runtime.workers {
+                builder.worker_threads(workers.get());
+            }
+            let runtime = builder.build().context("building the tokio runtime")?;
+            match runtime.block_on(pipeline::run_pipelines(path, config, signals, telemetry_layer))
+            {
                 Ok(()) => Ok(()),
                 Err(err) => {
                     // 1 for a startup failure, 2 for a runtime failure after the process was ready

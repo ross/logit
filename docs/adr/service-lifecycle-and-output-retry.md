@@ -60,7 +60,8 @@ runtime's grace backstop; the five HTTP listeners will join them per [ADR
 `idle-connection-timeout`](idle-connection-timeout.md)'s "Amendment: shutdown is the second
 trigger of the close sequence".
 
-`crates/logit-cli/src/pipeline.rs::run_pipelines` installs the real signal handler:
+`Signals::install` in `crates/logit-cli/src/signals.rs`, installed from `main.rs` before the
+config loads, sets up the real signal handler:
 `SignalKind::terminate()`/`SignalKind::interrupt()` under `#[cfg(unix)]`, `tokio::signal::ctrl_c()`
 otherwise. A second signal before the drain finishes calls `std::process::exit(130)` immediately —
 a wedged drain must stay killable by the same signal that started it, which matters specifically
@@ -166,9 +167,10 @@ bounded under typical load.
 ## Consequences
 - `crates/logit-pipeline/src/runtime.rs`: new `run_with_shutdown`, re-exported from `lib.rs`
   alongside `run`. `run_input` gains a `watch::Receiver<bool>` parameter.
-- `crates/logit-cli/src/pipeline.rs`: `run_pipelines` installs the signal handler and a
-  second-signal kill switch; `run_config` (the test-only helper) is now `#[cfg(test)]`, since
-  `run_pipelines` no longer calls through it in production.
+- `crates/logit-cli/src/signals.rs`, installed from `main.rs`: the signal handler and a
+  second-signal kill switch.
+- `crates/logit-cli/src/pipeline.rs`: `run_config` (the test-only helper) is now `#[cfg(test)]`,
+  since `run_pipelines` no longer calls through it in production.
 - Workspace `Cargo.toml`: `tokio`'s `signal` feature is now enabled.
 - `crates/logit-outputs/src/influxdb.rs`: `InfluxDbOutput` gains `RetryPolicy`/`with_retry`;
   `tokio` moves from `logit-outputs`' dev-dependencies to real dependencies (`tokio::time::sleep`).
