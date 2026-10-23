@@ -525,6 +525,11 @@ was considered.
 own `internal` telemetry, so several instances writing to one metrics backend stay
 distinguishable. The startup log records it as `hostname resolved`.
 
+`host.name` is the one host key every component shares. `collectd_in` writes each sender's host
+there, and a sink that writes a host reads `host.name` beside its own protocol's host fields,
+never another protocol's; `syslog_out` reads only `syslog.hostname`. To set or override a host, stamp
+`host.name` with `set`.
+
 Three sinks also send it as the host of any event that carries none of its own. They never
 replace a host an event or its resource carries:
 
@@ -532,7 +537,7 @@ replace a host an event or its resource carries:
 |---|---|---|
 | `syslog_out` | `syslog.hostname` | HOSTNAME, unless the sink sets its own `hostname:` |
 | `splunk_hec_out` | resource `host.name` | the envelope `host` |
-| `datadog_out` | a metric's `host.name`, DogStatsD `host:` tag, or `collectd.host`; an event's or check's `h:` field, `host.name`, `host:` tag, or `collectd.host`; a log's `hostname`, `host.name`, `syslog.hostname`, `host`, or `collectd.host` | the host of a metric, log, event, or service check |
+| `datadog_out` | a metric's `host.name` or DogStatsD `host:` tag; an event's or check's `h:` field, `host.name`, or `host:` tag; a log's `hostname`, `host.name`, `syslog.hostname`, or `host` | the host of a metric, log, event, or service check |
 
 So a relay sends the relay's hostname for whatever arrived without one. Through `datadog_out`,
 that means every DogStatsD sender that names no host reports as one Datadog host, as it would
@@ -1790,8 +1795,8 @@ above as commented alternatives. **Don't put an `aggregate` between them.** Unli
 [`fixtures/statsd-to-influxdb.yaml`](../fixtures/statsd-to-influxdb.yaml), it has none, because a
 collectd value list is already one pre-aggregated reading per `Interval` with its own timestamp;
 re-windowing it would average averages and re-stamp them with the flush time. The file's header
-comment lists what the cross-protocol hop costs. `collectd.host`, `collectd.plugin_instance`, and
-`collectd.type_instance` become InfluxDB tags, so lists from different hosts or instances stay
+comment lists what the cross-protocol hop costs. `host.name` (collectd's host),
+`collectd.plugin_instance`, and `collectd.type_instance` become InfluxDB tags, so lists from different hosts or instances stay
 apart. The plugin, type, interval, and severity ride on private `_logit.collectd.*` attributes that
 only `collectd_out` writes; the plugin and type already make up the measurement name. One
 N-data-source list becomes N measurements named `plugin.type.ds` sharing a tag set and a timestamp.
@@ -2071,8 +2076,8 @@ reference. Before deploying one:
   list too large to fit alone is dropped whole and counted
   `logit.output.metrics.dropped{reason="oversize_value_list"}`, not split.
 - **Set `hostname:` if the pipeline carries metrics that didn't come from `collectd_in`.** A relayed
-  list already carries its origin's host on `collectd.host`, so a pure relay never needs it. Metrics
-  from a `statsd_in` with no `collectd.host` or `host.name`, and no `hostname:` set, are
+  list already carries its origin's host on `host.name`, so a pure relay never needs it. Metrics
+  from a `statsd_in` with no `host.name`, and no `hostname:` set, are
   dropped and counted `logit.output.metrics.dropped{reason="no_host"}` with a `no_host` diagnostic.
   That is deliberate: collectd's receiver rejects an empty host, and inventing one would merge every
   unlabeled sender into one host's metrics. `internal` is the exception: it stamps the process

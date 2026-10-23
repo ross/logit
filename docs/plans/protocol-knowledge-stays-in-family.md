@@ -11,7 +11,8 @@ updated: 2026-10-23
 that a component keys behavior on another component's internals only within a lossless family.
 Outside one, it reads neutral meaning segments, public vocabulary, or its own config. Four
 production reads broke that rule when the ADR landed. This plan lists each one with its remedy, so
-a later session can pick one up without redoing the survey. C1, C2, and C3 are done; C6 remains.
+a later session can pick one up without redoing the survey. C1, C2, C3, and C6 are done, so no
+cross-family read remains.
 
 None of this is scheduled. Each section is a future workstream with its own stream key, picked
 when the work starts.
@@ -26,7 +27,7 @@ Goals:
 Non-goals:
 
 - Changing what a family's own members read. C4, C5, C7, and C8 below stay as they are.
-- A native copy or rename component. C6's remedy may want one; it gets its own ADR if so.
+- A native copy or rename component.
 - Honoring the new neutral flags anywhere they aren't needed to replace a cross-family read.
 
 ## The rule
@@ -142,7 +143,12 @@ model field instead of an attribute adds a VM measurement.
 
 ## C6: `collectd.host` in `datadog_out`
 
-**Future workstream, not scheduled.**
+**Done** in `carry/w4`, by the second remedy below with `host.name` as the key. The open design
+questions were settled: `host.name` is the one documented host key, written by a source at the
+scope where the host is identity, so `collectd_in` writes it on the event and not the resource,
+and every other sink renders it under that one name. No copy or rename component was needed ([ADR `process-hostname`](../adr/process-hostname.md)'s "Amendment:
+`host.name` is the standard host key (2026-10-23)"). The section below records the read as it
+was.
 
 **What reads what.** `collectd_in` stamps each value list's and notification's host as the public
 `collectd.host`. `datadog_out` takes it as the host of a series, event, service check, or log,

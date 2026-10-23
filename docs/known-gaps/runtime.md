@@ -285,12 +285,6 @@ Entry format and the other areas: [the known-gaps index](README.md).
     on an empty incoming sketch.
   - A `HyperLogLog` whose harmonic sum (`data[1]`) is wrong estimates wrong. The sum is an `f32`
     accumulated per register update, so recomputing it on decode wouldn't reproduce the bytes.
-- **One read outside a lossless family keys behavior on another protocol's internals**,
-  against [ADR `protocol-knowledge-stays-in-family`](../adr/protocol-knowledge-stays-in-family.md):
-  `datadog_out` takes `collectd.host` as the host. No other producer can ask for this handling:
-  a Lua script or a `set` gets it only by writing collectd's key, which `collectd_out` then reads
-  too. **Revisit** through [the in-family plan](../plans/protocol-knowledge-stays-in-family.md),
-  which has a remedy and an estimate.
 
 ## Config and CLI
 

@@ -15,7 +15,7 @@ only its own code defines:
 
 - a protocol's private carriers under `_logit.<protocol>.`
   ([ADR `private-attribute-namespace`](private-attribute-namespace.md));
-- a protocol's wire-specific public attribute names, such as `collectd.host`;
+- a protocol's wire-specific public attribute names, such as `collectd.plugin_instance`;
 - a native hop's sender identity and sequence
   ([ADR `native-hop-identity-and-sequence`](native-hop-identity-and-sequence.md));
 - a batch's provenance, the `origin` and `previous` components it passed through.
@@ -94,14 +94,11 @@ crosses a family.
 
 ## Consequences
 
-- **One cross-family read is recorded debt**, with a remedy in
-  [the in-family plan](../plans/protocol-knowledge-stays-in-family.md): C6, `datadog_out` taking
-  `collectd.host` as the host
-  ([ADR `process-hostname`](process-hostname.md)'s "Amendment: `datadog_out` reads
-  `collectd.host` (2026-10-22)"). `docs/known-gaps/runtime.md` lists it until the plan closes
-  it. Three are closed, each by a neutral flag ("Amendment: move, don't mirror (2026-10-23)"):
-  C1 and C2, the Datadog rate carrier `dedup_timestamps` and `prometheus_out` read ("The next
-  applications"), and C3, the Prometheus family-type carrier `otlp_out` read ("The third
+- **No cross-family read remains.** [The in-family plan](../plans/protocol-knowledge-stays-in-family.md)
+  found four, and each is closed by a neutral key ("Amendment: move, don't mirror
+  (2026-10-23)"): C1 and C2, the Datadog rate carrier `dedup_timestamps` and `prometheus_out`
+  read ("The next applications"); C3, the Prometheus family-type carrier `otlp_out` read ("The
+  third application"); and C6, `datadog_out` taking `collectd.host` as the host ("The fourth
   application").
 - **Four reads are in family and allowed:** C4, `statsd_out` writing an empty DogStatsD `host:` tag
   for `_logit.datadog.hostless`; C5, `datadog_out` and `statsd_out` reading the
@@ -210,3 +207,18 @@ no neutral meaning. No event carries both keys. An attribute, not a field on `Me
 - **A retired value says nothing.** A record carrying only `_logit.prometheus.type: info`,
   `stateset`, or `gaugehistogram` is an ordinary gauge or histogram at `otlp_out` and
   `prometheus_out`.
+
+### The fourth application: the host
+
+[The in-family plan](../plans/protocol-knowledge-stays-in-family.md)'s C6 remedy moves collectd's
+host to a public key every family shares rather than to a flag: a host is identity, not a
+directive. `collectd_in` writes a value list's or notification's Host part as `host.name`, the
+standard host key, instead of `collectd.host`, and `collectd_out` reads `host.name` as its Host.
+`datadog_out` reads no `collectd.host` on any route, and `host.name` reaches it as every other
+producer's does ([ADR `process-hostname`](process-hostname.md)'s "Amendment: `host.name` is the
+standard host key (2026-10-23)").
+
+- **No sink reads another family's host key.** Each reads `host.name` beside its own family's
+  wire forms, and falls back to the process hostname or its own `hostname:`.
+- **A retired key says nothing.** An attribute named `collectd.host` is an ordinary attribute at
+  every sink, `collectd_out` and `datadog_out` included.

@@ -28,7 +28,7 @@ the same date, write the record, then add a row here.
 | [Native transform fan-out: `Transform::process_into` emits extra events into the same batch](transform-fan-out.md) | 2026-10-16 | 2026-10-18 |
 | [`syslog_in` UDP framing: `framing: lines \| datagram`, with today's per-line split as the default](syslog-udp-datagram-framing.md) | 2026-10-16 | 2026-10-18 |
 | [Native hop trace context: the hop trailer carries a sampled batch's trace context, and `logit_in` continues it](native-hop-trace-context.md) | 2026-10-15 | 2026-10-15 |
-| [Process hostname: one resolved name, `host.name` on `internal`'s resource](process-hostname.md) | 2026-10-14 | 2026-10-22 |
+| [Process hostname: one resolved name, `host.name` on `internal`'s resource](process-hostname.md) | 2026-10-14 | 2026-10-23 |
 | [CI saves the cargo cache from `main` only, and every run restores it with a prefix fallback](ci-cargo-cache-saved-on-main.md) | 2026-10-14 | 2026-10-14 |
 | [CI runs no advisory check: Dependabot files the bump PRs, and `script/audit` checks locally](advisories-off-ci.md) | 2026-10-14 | 2026-10-14 |
 | [Private attribute namespace: protocol carriers live under `_logit.<protocol>.`, and every other protocol's sink ignores them](private-attribute-namespace.md) | 2026-10-13 | 2026-10-23 |
@@ -99,7 +99,7 @@ the same date, write the record, then add a row here.
 | [`target` components: named destinations a router directs events into, beside `sources:`](target-components.md) | 2026-09-13 | 2026-10-21 |
 | [A load-test harness: the real binary, a declarative event template, and CPU per event as the signal](load-test-harness.md) | 2026-09-12 | 2026-10-18 |
 | [`FramedEncoder`: a third codec trait for sinks that need per-message framing, over a shared `MessageBuf`](framed-encoder.md) | 2026-09-12 | 2026-10-18 |
-| [collectd binary-protocol relay: identity as attributes, value types as `Sum`/`Gauge`, and a packing encoder](collectd-binary-relay.md) | 2026-09-12 | 2026-10-18 |
+| [collectd binary-protocol relay: identity as attributes, value types as `Sum`/`Gauge`, and a packing encoder](collectd-binary-relay.md) | 2026-09-12 | 2026-10-23 |
 | [Prometheus scrape ingestion and exposition: transports, dialects, and the model mapping](prometheus-scrape-and-exposition.md) | 2026-09-11 | 2026-10-23 |
 | [Metrics model v2: `Sum` replaces `Counter`, raw/summarized pairs, boxed span fidelity, batch-level `Scope`](metrics-model-v2.md) | 2026-09-11 | 2026-10-18 |
 | [RFC 5424 structured-data convention: nested `syslog.sd`, strict parsing, opt-in PEN-qualified emission](syslog-structured-data-convention.md) | 2026-09-11 | 2026-10-18 |

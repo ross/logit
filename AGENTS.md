@@ -317,8 +317,9 @@ and codecs carry for them:
   beside one only for a fact the flag doesn't carry
   ([ADR `protocol-knowledge-stays-in-family`](docs/adr/protocol-knowledge-stays-in-family.md)'s
   "Amendment: move, don't mirror (2026-10-23)"). A component outside a carrier's family doesn't
-  act on the carrier itself, apart from the one cross-family read (C6) that ADR records as
-  debt.
+  act on the carrier itself. A sender's host rides on the standard `host.name`, never a
+  protocol's own key ([ADR `process-hostname`](docs/adr/process-hostname.md)'s "Amendment:
+  `host.name` is the standard host key (2026-10-23)").
 - **Model v2**: `Sum`/`Samples`/`SetMembers`/`ExponentialHistogram`, `SpanExt`, batch-level
   `Scope`, `MetricRecord.flags`.
 - **OTLP**: scope grouping, start time, description, exemplars, a `NO_RECORDED_VALUE` point
@@ -649,7 +650,9 @@ the operator-facing account of all of this.
 - **Hostname**: `logit run` resolves one process hostname at startup (`logit_pipeline::host`):
   the top-level `hostname:`, else the kernel hostname through `rustix`'s `uname`, never `$HOSTNAME`
   or DNS. `prepare` passes it to `build_spec`, and `internal` stamps it as `host.name` beside
-  `service.name`. `syslog_out`, `splunk_hec_out`, and `datadog_out` send it as the host of an
+  `service.name`. `host.name` is the one standard host key: a source writes a sender's host
+  there, and a sink reads it beside its own family's forms and never reads another family's.
+  `syslog_out`, `splunk_hec_out`, and `datadog_out` send the process hostname as the host of an
   event that carries none, never over one it carries; each relay pair names that a permitted
   normalization. `logit validate` doesn't resolve it. `collectd_out` doesn't fall back to it
   ([ADR `process-hostname`](docs/adr/process-hostname.md),
@@ -1150,8 +1153,8 @@ not a style preference:
   DogStatsD, `datadog`, and `datadog_trace`, or the native hop's (`logit_out`, `logit_in`, and the
   `buffer.disk:` spool). Everything else reads neutral `_logit.metrics.` and `_logit.field.` flags
   its creator set, public vocabulary, or its own config (provenance ids included); an exception needs
-  its own ADR ([ADR `protocol-knowledge-stays-in-family`](docs/adr/protocol-knowledge-stays-in-family.md),
-  whose plan lists the one read that breaks it today).
+  its own ADR ([ADR `protocol-knowledge-stays-in-family`](docs/adr/protocol-knowledge-stays-in-family.md);
+  its plan closed every cross-family read it found).
 - **The wire encoding is decided: hand-rolled, shipped as `logit_proto::native`** — a four-arm
   bake-off (`crates/logit-bench/src/bakeoff/`) settled it against `rkyv`, `postcard`, and OTLP
   itself; see [ADR `native-wire-format-encoding`](docs/adr/native-wire-format-encoding.md) and

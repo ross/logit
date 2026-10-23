@@ -105,6 +105,15 @@ as `Value::U64`, because RFC 5424's PROCID is free-form PRINTUSASCII. `syslog.ti
 ([ADR `timestamp-transform`](../adr/timestamp-transform.md)). See
 [ADR `syslog-structured-data-convention`](../adr/syslog-structured-data-convention.md).
 
+**`host.name` is the standard host key** (`logit_core::attrs::HOST_NAME`, the OpenTelemetry
+semantic-conventions name). A source that learns a sender's host writes it as `host.name` at the
+scope where it is identity: `collectd_in` on each event, since collectd's host varies per value
+list, and `internal` on its resource. A sink that needs a host reads `host.name` off the event,
+else the resource, beside its own family's wire forms, and falls back to the process hostname or
+its own `hostname:`. No sink reads another family's host key
+([ADR `process-hostname`](../adr/process-hostname.md)'s "Amendment: `host.name` is the standard
+host key (2026-10-23)").
+
 **The private namespace `_logit.`: a carrier lives under `_logit.<protocol>.`**
 (`_logit.statsd.type`). A carrier is a protocol's raw wire spelling of something the model
 normalizes, or a payload field only that protocol's family reads. The tables below list every
@@ -141,10 +150,8 @@ private, which stay public, and why. The prefix has one definition,
   `logit.input.tags.omitted{reason="reserved_prefix"}`; the point itself is kept. Every other
   decoder admits the key uncounted: OTLP and Splunk HEC metrics included, the log and span
   decoders, and the parsing transforms (`json`, `logfmt`, `kv`, `csv`, `regex`). A top-level
-  `_logit.*` key they admit is read as the carrier it names by that carrier's family and by the
-  cross-family reads
-  [ADR `protocol-knowledge-stays-in-family`](../adr/protocol-knowledge-stays-in-family.md) records
-  as debt, and skipped everywhere else (`docs/known-gaps/mappings.md`).
+  `_logit.*` key they admit is read as the carrier it names by that carrier's family, and skipped
+  everywhere else (`docs/known-gaps/mappings.md`).
 
 **The field namespace `_logit.field.<key>` isn't a protocol's.** An attribute under it
 (`logit_core::attrs::FIELD_PREFIX`, tested by `logit_core::attrs::is_field`) is data about its
@@ -267,17 +274,13 @@ Rules for the trace/span rows (`syslog.sd` follows its own ADR's rules instead):
 list by a five-tuple (host, plugin, plugin instance, type, type instance) where this model has one
 `MetricRecord.name`, and carries a per-list reporting interval the model has no field for. The raw
 wire facts ride alongside as attributes and win on the way back out. `collectd_out` **consumes**
-all seven (never re-emits one as anything else). That is what makes `collectd_in -> collectd_out` a
+all seven (never re-emits one as anything else); the host rides on the standard `host.name`. That is what makes `collectd_in -> collectd_out` a
 fixed point. The four under `_logit.collectd.` are private, and every other sink ignores them:
 the record name or a typed field already says what `plugin`, `type`, and `severity` carry, and
-only `collectd_out` reads `interval`. `collectd.host`,
-`collectd.plugin_instance`, and `collectd.type_instance` are public identity with no other home,
-and every other sink renders them as ordinary tags; hiding them would merge different hosts' and
-instances' lists into one series. One exception: `datadog_out` takes a non-empty `Str`
-`collectd.host` as the Datadog host, and then doesn't send it as a tag, when nothing outranks it.
-It ranks below `host.name`, a DogStatsD `host` tag, an event's or check's own host, a log's
-`hostname`, `syslog.hostname`, or `host`, and a Datadog hostless mark, and above the process
-hostname (`crates/logit-proto/src/datadog/mod.rs`'s encode tables).
+only `collectd_out` reads `interval`. `host.name`, `collectd.plugin_instance`, and
+`collectd.type_instance` are public identity, and every other sink renders them as ordinary tags,
+or `host.name` as its own host where it has one; hiding them would merge different hosts' and
+instances' lists into one series.
 
 These are **event** attributes, never resource ones. `logit_pipeline::BatchAccumulator::absorb`
 keys accumulation on `Arc::ptr_eq`, so a per-host resource would split every batch by sender; the
@@ -287,7 +290,7 @@ path. `crates/logit-proto/src/collectd/mod.rs`'s module doc has the full mapping
 
 | Attribute | Value | Meaning |
 |---|---|---|
-| `collectd.host` | `Value::Str`, or `Value::Bytes` when the wire bytes aren't UTF-8 | The wire Host. Absent when the wire carried an empty one (an empty string part is how a sender *clears* a sticky field). Outranks `host.name` on `collectd_out`, which then falls back to `host.name` and finally to the sink's own `hostname:` — with none of the three, the value list is dropped and counted (`logit.output.metrics.dropped{reason="no_host"}`), since collectd's receiver rejects an empty host and inventing one would merge every unlabelled sender into a single host's metrics. On `datadog_out`, the host when nothing outranks it, as above. |
+| `host.name` | `Value::Str`, or `Value::Bytes` when the wire bytes aren't UTF-8 | The wire Host, under the standard host key. Absent when the wire carried an empty one (an empty string part is how a sender *clears* a sticky field). `collectd_out` reads it off the event, else the resource, then falls back to the sink's own `hostname:` — with neither, the value list is dropped and counted (`logit.output.metrics.dropped{reason="no_host"}`), since collectd's receiver rejects an empty host and inventing one would merge every unlabelled sender into a single host's metrics. |
 | `_logit.collectd.plugin` | `Value::Str`/`Value::Bytes` | The wire Plugin (`cpu`, `load`, `df`). Required for like-relay encoding: a list whose plugin or type sanitizes to nothing is dropped (`{reason="empty_name"}`). |
 | `collectd.plugin_instance` | `Value::Str`/`Value::Bytes`, only when non-empty | The wire PluginInstance (a CPU number, a mount point). |
 | `_logit.collectd.type` | `Value::Str`/`Value::Bytes` | The wire Type — a `types.db` entry name (`cpu`, `if_octets`, `df_complex`) naming the data-source layout the list's values follow. **Its presence is what selects like-relay encoding** on `collectd_out`. |

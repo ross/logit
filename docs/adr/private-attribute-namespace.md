@@ -78,9 +78,12 @@ By protocol, these move under `_logit.`:
 
 These stay public:
 
-- `collectd.host`, `collectd.plugin_instance`, and `collectd.type_instance`: identity with no
+- collectd's host, `collectd.plugin_instance`, and `collectd.type_instance`: identity with no
   other home. The record name holds only the plugin and type, and the host stays off the
   resource, so hiding them would merge different hosts' and instances' lists into one series.
+  The host rides on the standard `host.name`
+  ([ADR `process-hostname`](process-hostname.md)'s "Amendment: `host.name` is the standard host
+  key (2026-10-23)").
 - `syslog.timestamp`: the sender's own stamp. `Event.timestamp` is receipt time until a
   `timestamp` component resolves it, so the attribute duplicates nothing, and an operator names it
   in that component's config.
@@ -152,9 +155,7 @@ Without the guard, a sender's tag would be read back as carrier data at that car
 Every other decoder admits the key uncounted: OTLP metric data-point attributes and Splunk HEC
 metric `fields` included, the log and span decoders, and the parsing transforms (`json`,
 `logfmt`, `kv`, `csv`, `regex`). A top-level `_logit.*` key they admit is taken as the carrier
-it names by that carrier's family, and by the cross-family reads
-[ADR `protocol-knowledge-stays-in-family`](protocol-knowledge-stays-in-family.md) records as
-debt. The guard generalizes a counter `influxdb_in` already keeps
+it names by that carrier's family. The guard generalizes a counter `influxdb_in` already keeps
 for its own prefix; the other decoders have no tag-omission counter, and a producer has to choose
 the `_logit.` prefix to reach a carrier. Under [ADR `deployment-threat-model`](deployment-threat-model.md),
 that makes it a documented gap rather than a guard to add.

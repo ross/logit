@@ -1,6 +1,6 @@
 ---
 created: 2026-09-12
-updated: 2026-10-18
+updated: 2026-10-23
 ---
 
 # collectd binary-protocol relay: identity as attributes, value types as `Sum`/`Gauge`, and a packing encoder
@@ -105,7 +105,7 @@ natively:
 | like-relay list where any record fails | whole list dropped (receiver's `ds_num` check would reject a partial one anyway) | the failing reason, once |
 | `timestamp > 0` / `<= 0` | TimeHR / dropped | `unencodable_timestamp` |
 | `_logit.collectd.interval` finite >0 / absent or bad | IntervalHR round(v·2³⁰) / IntervalHR 0 | bad non-absent: `logit.output.tags.dropped{reason="unrepresentable"}` |
-| host | `collectd.host` → `host.name` (event, then resource) → configured `hostname:`; none resolved → **list dropped** | `{reason="no_host"}` |
+| host | `host.name` (event, then resource) → configured `hostname:`; none resolved → **list dropped** | `{reason="no_host"}` |
 | identity attr `Str`/`Bytes` | verbatim after sanitizing (`Bytes` byte-verbatim) | `logit.output.identity.sanitized{reason="substituted"\|"truncated"}` |
 | identity attr of another `Value` type | treated as absent | `tags.dropped{unrepresentable}` |
 | every other attribute | dropped (collectd has no tags) | `tags.dropped{reason="no_wire_form"}` |
@@ -134,7 +134,7 @@ other sink ignores them (see the private-namespace amendment at the end of this 
 
 | Attribute | Value | Meaning |
 |---|---|---|
-| `collectd.host` | `Str` (`Bytes` if not UTF-8) | Host; absent when empty on the wire; outranks `host.name` on `collectd_out` |
+| `host.name` | `Str` (`Bytes` if not UTF-8) | Host, under the standard host key; absent when empty on the wire |
 | `_logit.collectd.plugin` | `Str`/`Bytes` | required for like-relay |
 | `collectd.plugin_instance` | `Str`/`Bytes`, only when non-empty | |
 | `_logit.collectd.type` | `Str`/`Bytes` | its presence selects like-relay encoding |
@@ -255,10 +255,9 @@ and re-emits `TimeHR = received_at`, since there is no better time to hand back.
 
 collectd's own receiver (`network_dispatch_values`) rejects any `Values` list with an empty host (or
 plugin, or type) with `-EINVAL`. `collectd_out` treats that as a hard invariant on its own egress,
-but resolves it by **omission, not fabrication**: a `collectd.host` attribute wins when present and
-non-empty, falling back to `host.name` (event, then resource attribute) next, and finally to the
-sink's own optional `hostname:` config field — config-supplied only, exactly like `syslog_out`'s own
-`hostname:` field (`crates/logit-config/src/lib.rs`'s `SyslogOut::hostname` doc: omitted entirely
+but resolves it by **omission, not fabrication**: a `host.name` attribute (event, then resource)
+wins when present and non-empty, falling back to the sink's own optional `hostname:` config
+field — config-supplied only, exactly like `syslog_out`'s own `hostname:` field (`crates/logit-config/src/lib.rs`'s `SyslogOut::hostname` doc: omitted entirely
 rather than a literal `logit` default, "so a relayed line's origin is never silently overwritten
 with something that looks like a config mistake"). There is deliberately **no OS-hostname read and
 no placeholder default** in this sink. (Amended 2026-10-14: the process now resolves a hostname
@@ -266,12 +265,12 @@ no placeholder default** in this sink. (Amended 2026-10-14: the process now reso
 `collectd_out` still doesn't fall back to it, because one made-up host would merge every
 unlabeled sender into a single host's metrics.)
 
-When none of the three resolves — no `collectd.host`, no `host.name` anywhere on event or
-resource, and no configured `hostname:` — the value list is **dropped whole**, counted
+When neither resolves — no `host.name` anywhere on event or resource, and no configured
+`hostname:` — the value list is **dropped whole**, counted
 `logit.output.metrics.skipped{reason="no_host"}`, with a throttled `no_host` diagnostic telling the
 operator to set `hostname:` or stamp `host.name` with a `set` transform. This is the one case in the
 encode table above where host resolution doesn't always succeed — but every like-relay list (one
-whose event carries `_logit.collectd.type`) already carries `collectd.host` as part of the
+whose event carries `_logit.collectd.type`) already carries `host.name` as part of the
 same attribute set the like-relay encoding requires, so `no_host` only ever bites cross-protocol
 ingress (an event from some other input with no host anywhere on it), never a genuine
 `collectd_in -> collectd_out` relay.
@@ -459,7 +458,7 @@ unchanged.
   of. `syslog_in`'s `syslog.hostname` precedent already answers this the same way for a structurally
   identical situation.
 - **A raw `_logit.collectd.time` cdtime attribute**, carrying the original bits alongside the
-  normalized `Event::timestamp`, the way `collectd.host`/`_logit.collectd.plugin`/etc. carry
+  normalized `Event::timestamp`, the way `host.name`/`_logit.collectd.plugin`/etc. carry
   the raw identity. Rejected: identity fields have a genuine two-sided split (a raw wire spelling
   *and* a normalized field that can each independently be right or wrong — e.g. sanitization changes
   the raw spelling but not what it means). Time has exactly one normalized field and the only
@@ -542,3 +541,21 @@ the private four. There are no aliases and no decode path for the old private na
 - **Every other sink renders the public three as tags and ignores the private four.**
 - **`collectd_out` skips other protocols' carriers uncounted.** Any other `_logit.` key reaching it
   is skipped without counting `tags.omitted{reason="no_wire_form"}`.
+
+## Amendment (2026-10-23): the host is `host.name`
+
+`collectd_in` writes a value list's or notification's Host part as the event attribute
+`host.name`, the standard host key, instead of `collectd.host`, and `collectd_out` reads
+`host.name` as the Host part, then its `hostname:`
+([ADR `process-hostname`](process-hostname.md)'s "Amendment: `host.name` is the standard host key
+(2026-10-23)"). The tables above state the current form.
+
+- **The relay is unchanged.** `collectd_in -> collectd_out` stays a fixed point: the Host part
+  decodes to `host.name` and encodes from it.
+- **The host stays on the event**, for the `Arc::ptr_eq` reason above.
+- **Every other sink reads the host under one name.** `prometheus_out` labels it `host_name`,
+  `influxdb_out` and `graphite_out` tag it `host.name`, `datadog_out` takes it as the host, and
+  `statsd_out` under `format: dogstatsd` writes it as the `host:` tag.
+- **`collectd_out` no longer counts `host.name` as an omitted tag**: it is the Host part. There is
+  no alias and no decode path for `collectd.host`; an attribute of that name is an ordinary
+  attribute, counted `tags.omitted{reason="no_wire_form"}` like any other.
