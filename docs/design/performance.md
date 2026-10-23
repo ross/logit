@@ -482,18 +482,17 @@ cell and reversed on even rounds, so each leads 3 of the 12 cells. One throwaway
 | `passthrough` | 0.337 | 0.339 | 0.341 | 0.340 | +0.72% | +1.21% | +0.48% | +0.22% | +0.98% |
 
 CPU µs/event, pooled median of 15, `+` = slower. Bold marks a delta past 2%, the ladder's own
-threshold; the suite's gate is 5%. b→n is the probes' cost, n→f the flags against the probes,
-fl→f the flag reads' cost, and b→fl the gap the flags don't explain. Each tag's three per-round
-medians lie within 0.004 of each other, the widest `passthrough` n (0.338–0.342). Ranges (min–max
-of 15): `aggregate` b 0.334–0.339, n 0.351–0.356,
-f 0.349–0.360, fl 0.349–0.354; `aggregate-groups` b 0.287–0.298, n 0.308–0.315, f 0.300–0.305,
-fl 0.303–0.310. Median events/s: `aggregate` b 2,999,803, n 2,857,190, f 2,864,808;
-`aggregate-groups` b 3,517,146, n 3,279,736, f 3,364,772.
+threshold; the suite's gate is 5%. b→n is the probes' cost, n→f the flags against the probes, fl→f
+the flag reads' cost, and b→fl the gap the flags don't explain. Each tag's three per-round medians
+lie within 0.004 of each other, the widest `passthrough` n (0.338–0.342). Ranges (min–max of 15):
+`aggregate` b 0.334–0.339, n 0.351–0.356, f 0.349–0.360, fl 0.349–0.354; `aggregate-groups` b
+0.287–0.298, n 0.308–0.315, f 0.300–0.305, fl 0.303–0.310. Median events/s: `aggregate` b 2,999,803,
+n 2,857,190, f 2,864,808; `aggregate-groups` b 3,517,146, n 3,279,736, f 3,364,772.
 
 fl→f is inside the spread on all four rows, so the two attribute lookups per event and the two
-resource lookups per batch cost nothing the ladder can see. f still sits +4.7% and +4.1% above b, and fl sits
-there too (+4.5% and +5.5%). fl has neither the flags nor the probes, so the gap is something else
-`1f30eb3c` changed that the flag build kept.
+resource lookups per batch cost nothing the ladder can see. f still sits +4.7% and +4.1% above b,
+and fl sits there too (+4.5% and +5.5%). fl has neither the flags nor the probes, so the gap is
+something else `1f30eb3c` changed that the flag build kept.
 
 `logit-perf flamegraph` on b and fl, with `--no-build` and the measured release binary in the
 profiling binary's place, two captures each, folded stacks, each share multiplied by the ladder's
@@ -555,11 +554,12 @@ medians are 0.291–0.293). Median events/s: `aggregate` b 3,012,453, n 2,864,22
 `aggregate-groups` b 3,516,543, n 3,279,818, f 3,572,500. The run's verify pass found 0 problems
 in its 52 results files.
 
-On the W1b head, f reads at b on all four scenarios (−0.1%, −1.9%, +1.8%, −0.8%) and 5.0% and
-7.9% under n on the two `aggregate` scenarios. The floor is no longer faster than the flag build:
-fl reads +1.1% and +2.9% above f, inside the spread on `aggregate`. On `aggregate-groups` the gap
-holds in all three rounds (fl 0.291, 0.293, 0.293 against f 0.285, 0.285, 0.284), and is the
-layout difference a patched build brings. With the key copy gone, taking the flag reads out buys nothing the ladder can resolve.
+On the W1b head, f reads at b on all four scenarios (−0.1%, −1.9%, +1.8%, −0.8%) and 5.0% and 7.9%
+under n on the two `aggregate` scenarios. The floor is no longer faster than the flag build: fl
+reads +1.1% and +2.9% above f, inside the spread on `aggregate`. On `aggregate-groups` the gap holds
+in all three rounds (fl 0.291, 0.293, 0.293 against f 0.285, 0.285, 0.284), and is the layout
+difference a patched build brings. With the key copy gone, taking the flag reads out buys nothing
+the ladder can resolve.
 
 What the session concludes:
 
