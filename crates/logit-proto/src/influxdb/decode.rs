@@ -23,7 +23,7 @@ use super::line::{
 };
 use super::{Precision, ATTR_MEASUREMENT};
 use bytes::Bytes;
-use logit_core::attrs::{is_private, FIELD_PREFIX, METRICS_FIELDS};
+use logit_core::attrs::{is_field, is_private, FIELD_PREFIX, METRICS_FIELDS};
 use logit_core::interner::{intern, KeyCache, Symbol};
 use logit_core::subslice;
 use logit_core::{
@@ -301,6 +301,14 @@ impl InfluxDecoder {
                 _ => {
                     let sym = self.field_attr(key);
                     event.attributes.remove_sym(sym);
+                    // The flag marks an event with a string field; drop it with the last one.
+                    if !event
+                        .attributes
+                        .iter()
+                        .any(|(k, _)| is_field(logit_core::interner::resolve(k)))
+                    {
+                        event.attributes.remove_sym(self.fields_flag);
+                    }
                     match existing {
                         Some(i) => event.metrics[i].kind = gauge(value),
                         None => event.metrics.push(MetricRecord::new(name, gauge(value))),
@@ -427,6 +435,11 @@ m s=\"a\" 5",
         );
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].attributes.get(METRICS_FIELDS), Some(&Value::Bool(true)));
+        // A merge that turns the only string field into a number takes the flag with it.
+        let unflagged = decode("m s=\"a\" 5\nm s=1i 5");
+        assert_eq!(unflagged.len(), 1);
+        assert_eq!(unflagged[0].attributes.get("_logit.field.s"), None);
+        assert_eq!(unflagged[0].attributes.get(METRICS_FIELDS), None);
     }
 
     // influxd 2.9.1, item 9
