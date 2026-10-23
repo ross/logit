@@ -22,7 +22,8 @@ pub struct ScenarioComparison {
     /// `None` when the scenario is in only one file: listed, not compared. [`Presence`] says which.
     pub deltas: Option<Deltas>,
     pub presence: Presence,
-    /// Each side's two modes, when its repeats are bimodal.
+    /// Each side's two modes, when its repeats are bimodal; `None` on both for a scenario in only
+    /// one file.
     pub before_clusters: Option<Clusters>,
     pub after_clusters: Option<Clusters>,
 }
@@ -259,19 +260,21 @@ pub fn compare(a: &RunReport, b: &RunReport) -> CompareReport {
                     after_clusters: clusters(b_scenario),
                 }
             }
-            (Some(a_scenario), None) => ScenarioComparison {
+            // No clusters on a one-sided row: there is no comparison for them to withhold, and
+            // `main.rs` must list it as "only in", not as an ungated comparison.
+            (Some(_), None) => ScenarioComparison {
                 name: name.clone(),
                 deltas: None,
                 presence: Presence::BeforeOnly,
-                before_clusters: clusters(a_scenario),
+                before_clusters: None,
                 after_clusters: None,
             },
-            (None, Some(b_scenario)) => ScenarioComparison {
+            (None, Some(_)) => ScenarioComparison {
                 name: name.clone(),
                 deltas: None,
                 presence: Presence::AfterOnly,
                 before_clusters: None,
-                after_clusters: clusters(b_scenario),
+                after_clusters: None,
             },
             (None, None) => unreachable!("name came from the union of both maps' own keys"),
         })
@@ -757,6 +760,19 @@ mod tests {
         assert_eq!(row.after_clusters.map(|c| (c.lower.size, c.upper.size)), Some((2, 3)));
         assert!(!cmp.has_regression(5.0, None));
         assert_eq!(cmp.ungated().map(|s| s.name.as_str()).collect::<Vec<_>>(), vec!["route-copy"]);
+    }
+
+    #[test]
+    fn a_scenario_bimodal_in_its_only_file_is_listed_not_ungated() {
+        let before = BTreeMap::from([(
+            "route-copy".to_string(),
+            repeats_report(&[1.0, 1.01, 2.0, 2.01, 2.02]),
+        )]);
+        let cmp = compare(&report("h", "c", before), &report("h", "c", BTreeMap::new()));
+        let row = &cmp.scenarios[0];
+        assert_eq!(row.presence, Presence::BeforeOnly);
+        assert!(row.is_gated(), "{row:?}");
+        assert_eq!(cmp.ungated().count(), 0);
     }
 
     #[test]
