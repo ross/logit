@@ -352,7 +352,7 @@
 //! (`{"apiKey","events":{"<source>":[...]},"internalHostname"}`); any other object is one public
 //! event. Both shapes accept both field spellings (`msg_title`/`title`, `msg_text`/`text`,
 //! `timestamp`/`date_happened`). An empty optional string means the same as an absent one, because
-//! the Agent omits empty fields.
+//! the Agent omits empty fields, but for `host`, which the Agent always writes.
 //!
 //! | Wire | Model | Counter / diag |
 //! |---|---|---|
@@ -365,6 +365,7 @@
 //! | `msg_text`/`text` | `LogRecord::message` = `Str`, `body_format: Raw`, `event_name: None` | -- |
 //! | `timestamp`/`date_happened` seconds | `Event::timestamp`; absent or `0` → `received_at` | -- |
 //! | `host`, non-empty | [`ATTR_HOST_NAME`], displacing a `host.name` tag | `logit.input.tags.omitted{reason="reserved_key"}` for a displaced tag |
+//! | `host`, `""` (the Agent always writes it, so this is its hostless event) | [`ATTR_HOSTLESS`] `Bool(true)`, displacing a `host.name` tag, as a series' `"host":""` | as above |
 //! | `priority`, `aggregation_key` | `_logit.statsd.event.priority`, `.aggregation_key` | -- |
 //! | `tags` | attributes, by [`tags`]'s rule; a key under the private `_logit.` prefix omitted | `logit.input.tags.omitted{reason="reserved_prefix"}` for an omitted tag |
 //! | `alert_type` | `_logit.statsd.event.alert_type`, verbatim; `severity`: `error` → `Error`, `warning` → `Warn`, `success`/`info` → `Info`, else `None` | -- |
@@ -383,6 +384,7 @@
 //! | `status` 0 to 3 | `MetricKind::Gauge(status)`, and `_logit.statsd.service_check.status` = `U64` | -- |
 //! | `status` absent, negative, above 3, or not an integer | dropped | `logit.input.metrics.dropped{reason="invalid_status"}` |
 //! | `host_name`, non-empty | [`ATTR_HOST_NAME`], displacing a `host.name` tag | `logit.input.tags.omitted{reason="reserved_key"}` for a displaced tag |
+//! | `host_name`, `""` (the Agent always writes it, so this is its hostless check) | [`ATTR_HOSTLESS`] `Bool(true)`, displacing a `host.name` tag, as a series' `"host":""` | as above |
 //! | `message`, non-empty | `_logit.statsd.service_check.message` | -- |
 //! | `tags`, an array or `null` | attributes, by [`tags`]'s rule; a key under the private `_logit.` prefix omitted | `logit.input.tags.omitted{reason="reserved_prefix"}` for an omitted tag |
 //! | `timestamp` seconds | `Event::timestamp`; absent or `0` → `received_at` | -- |
@@ -414,11 +416,11 @@
 //! | `LogRecord::trace`, when no `trace_id` or `span_id` attribute is present | `trace_id` (32 lowercase hex) and, when the ref has one, `span_id` (16 lowercase hex), after the attributes: the OTel form Datadog's log intake detects. An attribute of either name suppresses both, so a relayed intake log re-encodes unchanged | -- |
 //! | **events** ([`DatadogEncoder::encode_events`]): an event with a `log` carrying `_logit.statsd.event.title` | [`events::EventFormat::AgentEnvelope`] (the default): one envelope for the batch, `apiKey` `""`, groups keyed by `_logit.statsd.event.source_type` (else `api`) in sorted order; [`events::EventFormat::PublicV1`]: one object per event | -- |
 //! | resource [`RESOURCE_ATTR_AGENT_HOSTNAME`] | envelope `internalHostname`, `""` when absent | -- |
-//! | the event fields | Agent item keys in the Agent's order: `msg_title`, `msg_text`, `timestamp` (seconds), `priority`, `host` (always, `""` when absent), `tags`, `alert_type`, `aggregation_key`, `source_type_name`, `event_type`, then `device_name`, `related_event_id`; the public form uses `title`, `text`, `date_happened` and omits an absent `host`. Empty optional fields are omitted | -- |
-//! | `host.name` other than an empty `Str`, else [`ATTR_HOSTLESS`] (an empty DogStatsD `host:` tag), never filled, else the default host | `host`: `""` in the Agent form and omitted in the public form when hostless or with no default. `host.name`, empty or not, is never a tag; a `host` is an ordinary tag | -- |
+//! | the event fields | Agent item keys in the Agent's order: `msg_title`, `msg_text`, `timestamp` (seconds), `priority`, `host`, `tags`, `alert_type`, `aggregation_key`, `source_type_name`, `event_type`, then `device_name`, `related_event_id`; the public form uses `title`, `text`, `date_happened` and omits an absent `host`. Empty optional fields are omitted | -- |
+//! | `host.name` other than an empty `Str`, else [`ATTR_HOSTLESS`] (an empty DogStatsD `host:` tag), never filled, else the default host | `host`. Hostless: `""` in the Agent form, which `datadog_in` reads back as the mark, and omitted in the public form, which has no hostless spelling. With no host, no mark, and no default host: omitted in both. `host.name`, empty or not, is never a tag; a `host` is an ordinary tag | -- |
 //! | no `_logit.statsd.event.alert_type` | `alert_type` from `severity`: `Error`/`Fatal` → `error`, `Warn` → `warning`, `Info` → `info`, else omitted | -- |
-//! | **service checks** ([`DatadogEncoder::encode_service_checks`]): an event carrying `_logit.statsd.service_check.name` whose first metric is a `Gauge` | one array item with every key: `check`, `host_name` (`""`), `timestamp` (seconds), `status`, `message` (`""`), `tags` (`[]`) | -- |
-//! | `host.name` other than an empty `Str`, else [`ATTR_HOSTLESS`] (an empty DogStatsD `host:` tag), never filled, else the default host | `host_name`; `""` when hostless or with no default. `host.name`, empty or not, is never a tag; a `host` is an ordinary tag | -- |
+//! | **service checks** ([`DatadogEncoder::encode_service_checks`]): an event carrying `_logit.statsd.service_check.name` whose first metric is a `Gauge` | one array item with every key: `check`, `host_name` (below), `timestamp` (seconds), `status`, `message` (`""`), `tags` (`[]`) | -- |
+//! | `host.name` other than an empty `Str`, else [`ATTR_HOSTLESS`] (an empty DogStatsD `host:` tag), never filled, else the default host | `host_name`: `""` when hostless, which `datadog_in` reads back as the mark; omitted with no host, no mark, and no default host. `host.name`, empty or not, is never a tag; a `host` is an ordinary tag | -- |
 //! | `_logit.statsd.service_check.status` `U64` 0 to 3, else the gauge when it is an integer 0 to 3 | `status` | otherwise dropped: `logit.output.metrics.dropped{reason="invalid_status"}` |
 //! | every attribute not consumed above (events and checks) | `tags`, by [`tags::render_tags`]; a private `_logit.` key is never rendered | `logit.output.tags.omitted{reason="unrepresentable"}` for a `Map`/`Bytes`/`Null` |
 //!
@@ -439,8 +441,10 @@
 //!    key or tag beside it, omitted and counted at decode;
 //! 6. tags reorder by attribute order, and an exact duplicate tag is dropped;
 //! 7. a log with no `hostname` (or an empty one) and none of `host.name`, `syslog.hostname`, or
-//!    `host`, and an event or service check with no host of its own (or an empty one), leaves with
-//!    the relay's process hostname (`datadog_out`'s default host);
+//!    `host`, and an event or service check with no host of its own, leaves with the relay's
+//!    process hostname (`datadog_out`'s default host); an event's empty `host` or a check's empty
+//!    `host_name` is hostless and stays so, though a public v1 event leaves with no `host`, which
+//!    a later hop fills;
 //! 8. an event or service check with no host of its own takes a `host.name:<h>` tag as its host,
 //!    which leaves as the host and not a tag.
 //! 9. an event's or check's tag whose key is under the private `_logit.` prefix is omitted and

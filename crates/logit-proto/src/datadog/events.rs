@@ -181,9 +181,9 @@ impl DatadogDecoder {
             };
             attributes.insert(ATTR_EVENT_ALERT_TYPE, Value::str(alert_type));
         }
-        // The event's own host displaces a `host.name` tag. An empty one is no host, as the Agent
-        // omits an empty optional field.
-        let displaced = insert_wire_host(&mut attributes, non_empty_str(obj, "host"));
+        // The event's own host displaces a `host.name` tag. The Agent always writes `host`, so an
+        // empty one is its hostless event, as an empty series `host` is a hostless sample.
+        let displaced = insert_wire_host(&mut attributes, str_of(obj, "host"));
         self.displaced_host_names(displaced);
         for (wire, attr) in [
             ("priority", ATTR_EVENT_PRIORITY),
@@ -354,10 +354,12 @@ impl DatadogEncoder {
             None if hostless => None,
             None => self.default_host.as_deref().map(Cow::Borrowed),
         };
-        // The Agent always writes `host`, empty or not; the public form only when set.
+        // The Agent writes `""` for a hostless event, which `datadog_in` reads back as the mark;
+        // the public form has no hostless spelling. With no host, no mark, and no default host,
+        // `host` is omitted, so an absent host stays absent.
         match host {
             Some(host) => write_str(obj.key("host"), &host),
-            None if agent => write_str(obj.key("host"), ""),
+            None if agent && hostless => write_str(obj.key("host"), ""),
             None => {}
         }
         if !tags.is_empty() {
@@ -457,6 +459,7 @@ mod tests {
         let second = &batch.events[1];
         assert_eq!(attr(second, "_logit.statsd.event.source_type"), Some("nagios"));
         assert_eq!(attr(second, "host.name"), None);
+        assert_eq!(second.attributes.get("_logit.datadog.hostless"), Some(&Value::Bool(true)));
         assert_eq!(second.log.as_ref().unwrap().severity, None);
     }
 
@@ -546,7 +549,7 @@ mod tests {
         let out = encoder.encode_events(&batch, EventFormat::AgentEnvelope);
         assert_eq!(
             String::from_utf8(out[0].to_vec()).unwrap(),
-            r#"{"apiKey":"","events":{"api":[{"msg_title":"from a transform","msg_text":"x","timestamp":5,"host":"","alert_type":"error"}]},"internalHostname":""}"#
+            r#"{"apiKey":"","events":{"api":[{"msg_title":"from a transform","msg_text":"x","timestamp":5,"alert_type":"error"}]},"internalHostname":""}"#
         );
         assert_eq!(
             counted(&registry, "logit.output.tags.omitted", ("reason", "unrepresentable")),
@@ -657,6 +660,10 @@ mod tests {
         );
         assert_eq!(counted(&registry, "logit.input.tags.omitted", ("reason", "reserved_key")), 1.0);
 
+        // The Agent's empty `host` is its hostless event: the mark, never filled.
+        let empty = decode(r#"{"title":"t","text":"x","date_happened":5,"host":""}"#);
+        assert_eq!(empty.events[0].attributes.get(ATTR_HOSTLESS), Some(&Value::Bool(true)));
+        assert_eq!(empty.events[0].attributes.get(ATTR_HOST_NAME), None);
         let mut hostless = decode(r#"{"title":"t","text":"x","date_happened":5}"#);
         hostless.events[0].attributes.insert(ATTR_HOSTLESS, Value::Bool(true));
         let encode_with = |format| -> Vec<String> {

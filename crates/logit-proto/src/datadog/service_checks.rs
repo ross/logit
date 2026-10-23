@@ -110,8 +110,10 @@ impl DatadogDecoder {
         if let Some(message) = non_empty_str(obj, "message") {
             attributes.insert(ATTR_SERVICE_CHECK_MESSAGE, Value::str(message));
         }
-        // The check's own host displaces a `host.name` tag. An empty one is no host.
-        let displaced = insert_wire_host(&mut attributes, non_empty_str(obj, "host_name"));
+        // The check's own host displaces a `host.name` tag. The Agent always writes `host_name`,
+        // so an empty one is its hostless check, as an empty series `host` is a hostless sample.
+        let displaced =
+            insert_wire_host(&mut attributes, obj.get("host_name").and_then(Json::as_str));
         self.displaced_host_names(displaced);
         Some(Event::metric(
             or_received(timestamp, received_at),
@@ -179,12 +181,17 @@ impl DatadogEncoder {
             let mut obj = JsonObject::begin(&mut out);
             write_str(obj.key("check"), &value_text(name));
             let host = match host_name {
-                Some(host) => value_text(host),
-                // Marked hostless (an empty DogStatsD `host:` tag), never filled.
-                None if hostless => Cow::Borrowed(""),
-                None => Cow::Borrowed(self.default_host.as_deref().unwrap_or_default()),
+                Some(host) => Some(value_text(host)),
+                // Marked hostless (an empty DogStatsD `host:` tag), never filled; `datadog_in`
+                // reads the `""` back as the mark.
+                None if hostless => Some(Cow::Borrowed("")),
+                // With no host, no mark, and no default host, `host_name` is omitted, so an
+                // absent host stays absent.
+                None => self.default_host.as_deref().map(Cow::Borrowed),
             };
-            write_str(obj.key("host_name"), &host);
+            if let Some(host) = host {
+                write_str(obj.key("host_name"), &host);
+            }
             write_i64(obj.key("timestamp"), nanos_to_seconds(event.timestamp));
             write_i64(obj.key("status"), status as i64);
             write_str(obj.key("message"), &find(keys.message).map(value_text).unwrap_or_default());
@@ -245,7 +252,9 @@ mod tests {
         );
         let event = &batch.events[0];
         assert_eq!(event.timestamp, RECEIVED_AT);
-        assert_eq!(event.attributes.len(), 2);
+        // Name, status, and the hostless mark for the empty `host_name`.
+        assert_eq!(event.attributes.len(), 3);
+        assert_eq!(event.attributes.get(ATTR_HOSTLESS), Some(&Value::Bool(true)));
     }
 
     #[test]
@@ -371,6 +380,13 @@ mod tests {
         );
         assert_eq!(counted(&registry, "logit.input.tags.omitted", ("reason", "reserved_key")), 1.0);
 
+        // The Agent's empty `host_name` is its hostless check: the mark, never filled.
+        let empty = decode(r#"[{"check":"c","host_name":"","timestamp":1700000000,"status":0}]"#);
+        assert_eq!(empty.events[0].attributes.get(ATTR_HOSTLESS), Some(&Value::Bool(true)));
+        assert_eq!(
+            String::from_utf8(encoder.encode_service_checks(&empty).unwrap().to_vec()).unwrap(),
+            check("", "[]")
+        );
         let mut hostless = decode(r#"[{"check":"c","timestamp":1700000000,"status":0}]"#);
         hostless.events[0].attributes.insert(ATTR_HOSTLESS, Value::Bool(true));
         assert_eq!(
