@@ -12,8 +12,9 @@
 #
 # Labels per series is wire labels plus a small constant. Scrape mode puts its own identity
 # (`instance`, `_logit.prometheus.target`) on the resource, which `resource: drop` removes, so an
-# event's attributes are the exposition line's labels plus at most `_logit.prometheus.type` (on a
-# family whose wire type the model has no kind for; node_exporter's `node_netstat_*`/`node_vmstat_*`
+# event's attributes are the exposition line's labels plus at most one type attribute (on a
+# family whose wire type the model has no kind for: `_logit.prometheus.type` for `untyped` or
+# `unknown`, `_logit.metrics.type` for `info`, `stateset`, or `gaugehistogram`; node_exporter's `node_netstat_*`/`node_vmstat_*`
 # families are untyped, so about 2% of its series carry it: docs/design/data-shapes.md §3, "Labels
 # per series") and the `_logit.metrics.closed` flag (when the line carried a timestamp; these
 # exporters don't).

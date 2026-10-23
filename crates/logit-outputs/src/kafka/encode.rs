@@ -1228,6 +1228,53 @@ mod tests {
         }
     }
 
+    /// The OTLP formats share `otlp_out`'s encoder, so they read the neutral type flag: an `info`
+    /// gauge is a non-monotonic `Sum` named `_info`, a flagged gauge histogram is skipped, and
+    /// `prometheus_in`'s own carrier changes nothing.
+    #[test]
+    fn the_otlp_formats_read_the_neutral_type_flag_and_not_the_prometheus_carrier() {
+        use logit_core::attrs::METRICS_TYPE;
+        use logit_core::{Histogram, MetricKind, MetricRecord, Temporality};
+        let metric = |name: &str, key: &str, kind: MetricKind| {
+            let mut attributes = AttrMap::new();
+            attributes.insert(key, Value::str(if name == "h" { "gaugehistogram" } else { "info" }));
+            Event::metric(0, attributes, MetricRecord::new(intern(name), kind))
+        };
+        let histogram = MetricKind::Histogram(Histogram {
+            buckets: vec![(1.0, 2), (f64::INFINITY, 1)],
+            temporality: Temporality::Cumulative,
+            sum: Some(3.0),
+            min: None,
+            max: None,
+        });
+        let b = batch(
+            AttrMap::new(),
+            vec![
+                metric("flagged", METRICS_TYPE, MetricKind::gauge(1.0)),
+                metric("carried", logit_proto::prometheus::ATTR_TYPE, MetricKind::gauge(1.0)),
+                metric("h", METRICS_TYPE, histogram),
+            ],
+        );
+        let (out, _) =
+            records(&mut encoder(RecordFormat::OtlpJson, RecordMode::Request, usize::MAX), &b);
+        assert_eq!(out.len(), 1, "one metrics request");
+        let request: serde_json::Value = serde_json::from_slice(&out[0].0).unwrap();
+        let metrics = request["resourceMetrics"][0]["scopeMetrics"][0]["metrics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| {
+                let data = ["gauge", "sum", "histogram"].into_iter().find(|k| m.get(*k).is_some());
+                (m["name"].as_str().unwrap().to_string(), data.unwrap())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            metrics,
+            [("flagged_info".to_string(), "sum"), ("carried".to_string(), "gauge")],
+            "the gauge histogram is skipped"
+        );
+    }
+
     /// The soak harness's protobuf walker (`tools/soak/soaklib/otlp.py`) is checked against
     /// this batch's `otlp_proto` record, committed as hex. The hex must be what the encoder
     /// writes; on a mismatch the message holds the encoder's hex to commit in its place.

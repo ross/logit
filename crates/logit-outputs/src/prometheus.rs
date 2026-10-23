@@ -1415,7 +1415,7 @@ mod tests {
         Resource, Sum, Summary, Temporality, Value,
     };
     use logit_pipeline::Fault;
-    use logit_proto::prometheus::{ATTR_TYPE, LABEL_INSTANCE};
+    use logit_proto::prometheus::LABEL_INSTANCE;
     // The vendored prompb types, so a sender test asserts against the *message* a receiver would
     // decode rather than against this codec's own view of it (`crates/logit-proto/proto/`).
     use logit_proto::prometheus::generated::io::prometheus::write::v2 as pb2;
@@ -1489,7 +1489,10 @@ mod tests {
                 metric_event(
                     "build",
                     MetricKind::gauge(1.0),
-                    &[(ATTR_TYPE, Value::str("info")), ("version", Value::str("1.2.3"))],
+                    &[
+                        (logit_core::attrs::METRICS_TYPE, Value::str("info")),
+                        ("version", Value::str("1.2.3")),
+                    ],
                 ),
                 Event::metric(
                     1_700_000_000_500_000_000,

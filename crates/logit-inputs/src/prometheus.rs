@@ -3952,9 +3952,9 @@ mod tests {
             "three wire series, one model record: {:#?}",
             batch.events
         );
-        // No `_logit.prometheus.type` marker: `MetricKind::Histogram` *is* the type, and the marker
-        // exists only for the family types the model has no kind of its own for.
+        // No type carrier and no type flag: `MetricKind::Histogram` *is* the type.
         assert_eq!(batch.events[0].attributes.get(ATTR_TYPE), None);
+        assert_eq!(batch.events[0].attributes.get(logit_core::attrs::METRICS_TYPE), None);
 
         let events = registry.drain(0);
         assert_eq!(

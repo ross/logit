@@ -60,14 +60,14 @@
 //! | `counter` sample (name verbatim, `_total` included) | `Sum { value, Cumulative, monotonic: true }` |
 //! | `gauge` | `Gauge(v)` |
 //! | `histogram` (`_bucket{le}` cumulative, `_sum`, `_count`) | `Histogram { buckets: per-bucket counts by successive difference, trailing `(+Inf, n)`, Cumulative, sum, min/max: None }` |
-//! | `gaugehistogram` (OM, `_gsum`/`_gcount`) | the same `Histogram`, plus `_logit.prometheus.type: "gaugehistogram"` |
+//! | `gaugehistogram` (OM, `_gsum`/`_gcount`) | the same `Histogram`, plus the flag `_logit.metrics.type: "gaugehistogram"` |
 //! | `summary` (`{quantile}`, `_sum`, `_count`) | `Summary { quantiles, count, sum }`, `Cumulative` |
 //! | `untyped` (text) / `unknown` (OM) / no `# TYPE` | `Gauge(v)` + `_logit.prometheus.type: "untyped"` \| `"unknown"` |
-//! | `info` (OM, `X_info{...} 1`) | `Gauge(1)` + `_logit.prometheus.type: "info"`, `name = X` (`_info` stripped) |
-//! | `stateset` (OM) | one `Gauge(0\|1)` per state line + `_logit.prometheus.type: "stateset"` |
+//! | `info` (OM, `X_info{...} 1`) | `Gauge(1)` + the flag `_logit.metrics.type: "info"`, `name = X` (`_info` stripped) |
+//! | `stateset` (OM) | one `Gauge(0\|1)` per state line, each + the flag `_logit.metrics.type: "stateset"` |
 //! | `# HELP` / `# UNIT` | `description` / `unit` (interned) |
 //! | `_created` (OM) | `start_timestamp` (seconds → nanos) |
-//! | [`Point::Stale`] (remote-write's stale-marker NaN) | the family type's own kind with an empty payload -- `counter` → `Sum{NaN, Cumulative, monotonic}`, `gauge`/`unknown`/`untyped`/`info`/`stateset` → `Gauge(NaN)`, `histogram`/`gaugehistogram` → a bucket-less `Histogram`, `summary` → an empty `Summary` -- and **`flags = FLAG_NO_RECORDED_VALUE`**, which carries the meaning ([`logit_core::MetricRecord::flags`]). The `_logit.prometheus.type` marker is unchanged |
+//! | [`Point::Stale`] (remote-write's stale-marker NaN) | the family type's own kind with an empty payload -- `counter` → `Sum{NaN, Cumulative, monotonic}`, `gauge`/`unknown`/`untyped`/`info`/`stateset` → `Gauge(NaN)`, `histogram`/`gaugehistogram` → a bucket-less `Histogram`, `summary` → an empty `Summary` -- and **`flags = FLAG_NO_RECORDED_VALUE`**, which carries the meaning ([`logit_core::MetricRecord::flags`]). The `_logit.prometheus.type` carrier or `_logit.metrics.type` flag is unchanged |
 //! | sample timestamp | `Event::timestamp` + the flag `_logit.metrics.closed: "timestamped"`, which tells `aggregate` the sample has its own time and the encode side to write it back (`docs/adr/metric-flags.md`, "The flags"); absent → `received_at_nanos`, no flag. The flag says *the producer chose to expose a timestamp on this line*, so a transport that mandates one turns it off with [`PrometheusDecoder::with_timestamp_marker`]`(false)` and sets only the timestamp |
 //! | OM exemplar | `Exemplar { value, timestamp, trace, filtered_attributes }` -- `trace_id`/`span_id` labels become a [`logit_core::TraceRef`] when both are valid hex (consumed); every other exemplar label, and an invalid id, stays in `filtered_attributes`. Bucket exemplars all collect onto the one record. |
 //!
@@ -97,7 +97,7 @@
 //! | `sum/i64` | normalized | `f64_value` | A sample is a double, so an integer is written as its nearest `f64` and reads back as a float, rounded beyond 2^53. |
 //! | `sum/u64` | normalized | `f64_value` | A sample is a double, so an integer is written as its nearest `f64` and reads back as a float, rounded beyond 2^53. |
 //! | `sum/bool` | normalized | `bool_value`; `logit.output.metrics.normalized{reason=bool_value}` | A boolean is the sample `1` or `0` and reads back as that number. |
-//! | `gauge/f64` | exact | -- | A `gauge` family, or the family type the `_logit.prometheus.type` carrier names (`untyped`, `unknown`, `info`, `stateset`). |
+//! | `gauge/f64` | exact | -- | A `gauge` family, or the family type the `_logit.metrics.type` flag (`info`, `stateset`) or the `_logit.prometheus.type` carrier (`untyped`, `unknown`) names. |
 //! | `gauge/i64` | normalized | `f64_value` | A sample is a double, so an integer is written as its nearest `f64` and reads back as a float, rounded beyond 2^53. |
 //! | `gauge/u64` | normalized | `f64_value` | A sample is a double, so an integer is written as its nearest `f64` and reads back as a float, rounded beyond 2^53. |
 //! | `gauge/bool` | normalized | `bool_value`; `logit.output.metrics.normalized{reason=bool_value}` | A boolean is the sample `1` or `0` and reads back as that number. |
@@ -171,14 +171,16 @@
 //! | `attributes/map_value` | lost | `logit.output.labels.omitted{reason=unrepresentable}` | A map has no label form and is left off, counted. |
 //! | `attributes/bytes_value` | lost | `logit.output.labels.omitted{reason=unrepresentable}` | A bytes value has no label form and is left off, counted. |
 //! | `attributes/timestamp_value` | lost | `logit.output.labels.omitted{reason=unrepresentable}` | A timestamp value has no label form and is left off, counted. |
-//! | `attributes/private_carrier` | normalized | `dialect` | The family type carrier is consumed into the wire form and a scrape stamps it back; OpenMetrics has no `untyped`, so that type reads back as `unknown`. |
+//! | `attributes/private_carrier` | normalized | `dialect` | The family type carrier, `untyped` or `unknown`, is consumed into the wire form and a scrape stamps it back; OpenMetrics has no `untyped`, so that type reads back as `unknown`. |
 //! | `attributes/prometheus_target` | normalized | `retargeted` | The resource's `_logit.prometheus.target` isn't written. A scrape of prometheus_out stamps prometheus_out's own URL, and a remote-write receiver stamps none. Only the original target's host:port survives, as the `instance` label; its scheme and path are lost. |
-//! | `attributes/foreign_carrier` | lost | structural | Another protocol's `_logit.` carrier is private and isn't a label, so it's left off. A `_logit.metrics.*` flag is left off too; the `timestamped`, `rate`, and `interval` rows have `_logit.metrics.closed: timestamped`, `_logit.metrics.type: rate`, and `_logit.metrics.interval`. |
+//! | `attributes/foreign_carrier` | lost | structural | Another protocol's `_logit.` carrier is private and isn't a label, so it's left off. A `_logit.metrics.*` flag is left off too; the `timestamped`, `rate`, `family_type`, and `interval` rows have `_logit.metrics.closed: timestamped`, `_logit.metrics.type`, and `_logit.metrics.interval`. |
 //! | `attributes/timestamped`, with `bind:` unset | lost | structural | Remote-write gives every sample its timestamp, so the timestamp survives, but a remote-write receiver can't tell it from one the producer didn't choose and sets no flag. |
 //! | `attributes/timestamped`, otherwise | exact | -- | The event's timestamp is written as the sample's timestamp, and a scrape sets the flag again. A statsd `\|T` line leaves with a sample timestamp too. |
 //! | `attributes/rate` | lost | structural | The flag is private and isn't a label, so it's left off. The sink reads it to count a same-millisecond pair of rates `dropped` rather than `normalized`, and writes no wire form for it. |
 //! | `attributes/interval` | lost | structural | The flag is private and isn't a label, so it's left off. |
 //! | `attributes/rate_on_non_gauge` | lost | structural | The flag is private and isn't a label, so it's left off. |
+//! | `attributes/family_type` | exact | -- | The flag is consumed into the family's `# TYPE` line, and prometheus_in sets it again. An info or stateset gauge a script or a `set` flagged exposes with its type line too. |
+//! | `attributes/family_type_on_other_kind` | lost | structural | The value names another kind, so it's ignored: the record takes its own kind's family type, and the flag is private and isn't a label. |
 //! | `attributes/interval_on_distribution` | lost | structural | The flag is private and isn't a label, so it's left off. |
 //! | `attributes/interval_on_histogram` | lost | structural | The flag is private and isn't a label, so it's left off. |
 //! | `attributes/resource_attribute` | normalized | `resource_merged`; `logit.output.labels.normalized{reason=name_sanitized}` | A label, the event's value winning on a shared key, read back as an event attribute. A name outside the label-name grammar is sanitized, counted once per label it renames. |
@@ -201,6 +203,7 @@
 //! | an event with no metric record (a log, a span, or neither) | nothing -- `logit.output.events.skipped{reason="no_metrics"}` |
 //! | a flagged delta monotonic `Sum` under [`PrometheusEncoder::with_stale_markers`]`(true)` | a stale marker on a `counter`, which reads back as a cumulative counter -- `logit.output.metrics.degraded{metric_kind="delta_sum"}`; a flagged non-monotonic one is a `gauge`'s marker, `{metric_kind="non_monotonic_sum"}` |
 //! | `Event::timestamp` | emitted only when the event is flagged `_logit.metrics.closed: "timestamped"`, on the event or else the resource ([`logit_core::attrs::is_closed_timestamped`]; `bucketed`, any other value, and `Bool(true)` emit none), whichever decoder set it, so a `statsd_in` `\|T` line gets a sample timestamp too -- or on every series, flag or not, under [`PrometheusEncoder::with_timestamps_always`]`(true)`, which is what a transport with no way to omit a timestamp needs |
+//! | a `Gauge`'s or cumulative `Histogram`'s family type | `info` or `stateset` for a `Gauge`, and `gaugehistogram` for a `Histogram`, when the event is flagged `_logit.metrics.type` with that value, on the event or else the resource ([`logit_core::attrs::metric_type`]); else, for a `Gauge`, `untyped` or `unknown` when the event carries that [`ATTR_TYPE`]; else `gauge` or `histogram`. Any other value of either key is ignored, so a carrier spelling `info` exposes a plain gauge |
 //! | labels | `Value::Str/I64/U64/F64/Bool` stringified; `Null/Bytes/Timestamp/Map` dropped -- `logit.output.labels.omitted{reason="unrepresentable"}`. An `Array` (a repeated DogStatsD tag key, `crate::statsd::decode::insert_tags`) renders its **last** representable element -- a Prometheus label set is a map, so there is no multi-value label -- counted `logit.output.labels.normalized{reason="multi_value"}`; an empty or entirely unrepresentable one stays on the `omitted{reason="unrepresentable"}` path |
 //! | names | sanitized ([`sanitize_metric_name`], [`sanitize_label_name`]), each record written under a rewritten name counted `logit.output.metrics.normalized{reason="name_sanitized"}` and each label, a written exemplar's included, `logit.output.labels.normalized{reason="name_sanitized"}`; labels are ordered and collision-checked on their **rendered** names, and on a collision the one whose *original* attribute name sorts first wins -- `logit.output.labels.omitted{reason="collision"}`; a label sanitizing onto a generated one (`le` on a histogram, `quantile` on a summary) is omitted -- `logit.output.labels.omitted{reason="reserved"}`. An exemplar's attribute keys follow the same rule, and one sanitizing onto the `trace_id`/`span_id` its trace is written as is `reserved` |
 //! | two names sanitizing onto one wire name | within one batch, the family whose *model* name sorts first is exposed, the rest are **dropped** -- `logit.output.metrics.dropped{reason="name_collision"}`. Both cannot be exposed: a second `# TYPE` line for one name makes Prometheus reject the whole scrape, so one clash would poison every other metric in the body. The tie-break is on model names, which means a name that needed no sanitizing can lose to one that did (`a.b` sorts before `a_b`) -- deterministic and counted, but worth knowing before reading it as a bug. **Across batches nothing resolves it**: the registry keys a family by its wire name, and a receiver a series by its labels, so `a.b` in one batch and `a_b` in the next merge into one series, uncounted beyond the rewrite's `name_sanitized` (`docs/known-gaps/prometheus.md`) |
@@ -221,7 +224,8 @@
 //! whole-event render keeps it; that ADR's "The ignore rule" lists the renders. An attribute
 //! spelled `prometheus.<name>` without the prefix is an ordinary label.
 //! `docs/design/data-model.md`'s well-known-attribute table is the canonical list; in short:
-//! [`ATTR_TYPE`] (`Value::Str`) names the wire family type the model has no distinct kind for;
+//! [`ATTR_TYPE`] (`Value::Str`) is `untyped` or `unknown`, the family type of a family that
+//! declared none;
 //! [`ATTR_TARGET`] (`Value::Str`, a **resource** attribute stamped by `prometheus_in`) is the full
 //! scrape URL.
 //!
@@ -292,7 +296,10 @@ pub mod text;
 pub use text::Dialect;
 
 use crate::otlp::metrics::SUMMARY_QUANTILES;
-use logit_core::attrs::{is_closed_timestamped, is_private, CLOSED_TIMESTAMPED, METRICS_CLOSED};
+use logit_core::attrs::{
+    is_closed_timestamped, is_private, metric_type, CLOSED_TIMESTAMPED, METRICS_CLOSED,
+    METRICS_TYPE, TYPE_GAUGE_HISTOGRAM, TYPE_INFO, TYPE_STATESET,
+};
 use logit_core::interner::{intern, resolve};
 use logit_core::{
     AttrMap, DdSketch, Diagnostics, Event, Exemplar, Histogram, MetricKind, MetricRecord,
@@ -302,8 +309,9 @@ use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 
-/// The wire family type the model has no distinct kind for (`untyped`, `unknown`, `info`,
-/// `stateset`, `gaugehistogram`) -- see the module doc's well-known-attribute section.
+/// The wire family type when the source declared none: `untyped` (text 0.0.4) or `unknown`
+/// (OpenMetrics). `info`, `stateset`, and `gaugehistogram` ride as the neutral
+/// [`METRICS_TYPE`] flag instead -- see the module doc's well-known-attribute section.
 pub const ATTR_TYPE: &str = "_logit.prometheus.type";
 /// The full scrape URL -- a **resource** attribute stamped by `prometheus_in`, private like every
 /// other `_logit.prometheus.*` attribute.
@@ -354,8 +362,9 @@ pub enum FamilyType {
 }
 
 impl FamilyType {
-    /// The `# TYPE` keyword for this type in its own dialect -- also the `_logit.prometheus.type`
-    /// attribute value for the five types the model has no distinct kind for.
+    /// The `# TYPE` keyword for this type in its own dialect -- also the [`ATTR_TYPE`] value for
+    /// `untyped` and `unknown`, and the [`METRICS_TYPE`] value for `info`, `stateset`, and
+    /// `gaugehistogram`.
     pub fn as_str(self) -> &'static str {
         match self {
             FamilyType::Counter => "counter",
@@ -387,18 +396,21 @@ impl FamilyType {
         })
     }
 
-    /// Whether this type needs a `_logit.prometheus.type` marker attribute to survive the model:
-    /// the five types that all decode onto a plain `Gauge`/`Histogram` and would otherwise be
-    /// indistinguishable from one on the way back out.
+    /// Whether this type needs the [`ATTR_TYPE`] carrier to survive the model: the two spellings
+    /// of "no type declared", which decode onto a plain `Gauge` and have no neutral meaning.
     fn needs_marker(self) -> bool {
-        matches!(
-            self,
-            FamilyType::Untyped
-                | FamilyType::Unknown
-                | FamilyType::Info
-                | FamilyType::StateSet
-                | FamilyType::GaugeHistogram
-        )
+        matches!(self, FamilyType::Untyped | FamilyType::Unknown)
+    }
+
+    /// The [`METRICS_TYPE`] value this type rides as: the three types that decode onto a plain
+    /// `Gauge` or `Histogram` and name a kind of reading any producer can make.
+    fn neutral_type(self) -> Option<&'static str> {
+        match self {
+            FamilyType::Info => Some(TYPE_INFO),
+            FamilyType::StateSet => Some(TYPE_STATESET),
+            FamilyType::GaugeHistogram => Some(TYPE_GAUGE_HISTOGRAM),
+            _ => None,
+        }
     }
 
     /// Whether this type carries a `_created` sample (OpenMetrics): counter, histogram and summary
@@ -740,7 +752,7 @@ impl PrometheusEncoder {
     /// marker, and a bare NaN sample would read as a real reading of NaN.
     ///
     /// A remote-write sender sets this `true`. Only single-series kinds convert (`Gauge`, `Sum`,
-    /// and a `_logit.prometheus.type`-marked gauge); a flagged `Histogram`, `Summary` or sketch
+    /// and a gauge of any family type); a flagged `Histogram`, `Summary` or sketch
     /// kind stays skipped and counted, for the reason the module doc's encode table gives.
     pub fn with_stale_markers(mut self, stale: bool) -> Self {
         self.stale_markers = stale;
@@ -901,6 +913,8 @@ pub fn families_to_events_with(
             }
             if family.kind.needs_marker() {
                 attributes.insert(ATTR_TYPE, Value::str(family.kind.as_str()));
+            } else if let Some(neutral) = family.kind.neutral_type() {
+                attributes.insert(METRICS_TYPE, Value::static_str(neutral));
             }
             let timestamp = match series.timestamp {
                 Some(ts) => {
@@ -1100,9 +1114,9 @@ pub fn events_to_families_pending<'a>(
             }
             encoder.capture();
             let converted = if stale {
-                stale_point(record, event, encoder)
+                stale_point(record, resource, event, encoder)
             } else {
-                record_to_point(record, event, encoder)
+                record_to_point(record, resource, event, encoder)
             };
             let Some((kind, point)) = converted else {
                 let counts = encoder.release();
@@ -1371,10 +1385,10 @@ struct FamilyEntry {
 /// carry (counted, see the module doc's encode table).
 fn record_to_point(
     record: &MetricRecord,
+    resource: &Resource,
     event: &Event,
     encoder: &mut PrometheusEncoder,
 ) -> Option<(FamilyType, Point)> {
-    let declared = declared_type(event);
     Some(match &record.kind {
         MetricKind::Sum(s) => match (s.temporality, s.monotonic) {
             (Temporality::Cumulative, true) => {
@@ -1390,13 +1404,11 @@ fn record_to_point(
                 return None;
             }
         },
-        MetricKind::Gauge(v) => match declared {
-            Some(FamilyType::Untyped) => (FamilyType::Untyped, Point::Unknown(encoder.scalar(*v))),
-            Some(FamilyType::Unknown) => (FamilyType::Unknown, Point::Unknown(encoder.scalar(*v))),
-            Some(FamilyType::Info) => (FamilyType::Info, Point::Info),
-            Some(FamilyType::StateSet) => {
-                (FamilyType::StateSet, Point::StateSet(v.as_f64() != 0.0))
-            }
+        MetricKind::Gauge(v) => match gauge_family_type(resource, event) {
+            FamilyType::Untyped => (FamilyType::Untyped, Point::Unknown(encoder.scalar(*v))),
+            FamilyType::Unknown => (FamilyType::Unknown, Point::Unknown(encoder.scalar(*v))),
+            FamilyType::Info => (FamilyType::Info, Point::Info),
+            FamilyType::StateSet => (FamilyType::StateSet, Point::StateSet(v.as_f64() != 0.0)),
             _ => (FamilyType::Gauge, Point::Gauge(encoder.scalar(*v))),
         },
         MetricKind::GaugeDelta(_) => {
@@ -1416,11 +1428,7 @@ fn record_to_point(
                 warn_delta(encoder, resolve(record.name));
                 return None;
             }
-            let kind = if declared == Some(FamilyType::GaugeHistogram) {
-                FamilyType::GaugeHistogram
-            } else {
-                FamilyType::Histogram
-            };
+            let kind = histogram_family_type(resource, event);
             let (buckets, count) = cumulative_counts(&h.buckets);
             if h.buckets.iter().any(|(bound, _)| bound.is_nan()) {
                 encoder.degraded_reason("non_finite_component");
@@ -1488,11 +1496,31 @@ fn record_to_point(
     })
 }
 
-/// The wire family type a `_logit.prometheus.type` attribute names, when the event carries one this
-/// codec recognizes -- the five types the model has no distinct kind for (see the module doc's
-/// well-known attribute section).
-fn declared_type(event: &Event) -> Option<FamilyType> {
-    event.attributes.get(ATTR_TYPE).and_then(|v| v.as_str()).and_then(FamilyType::from_keyword)
+/// A `Gauge` record's family type: `info` or `stateset` when the event is flagged
+/// [`METRICS_TYPE`] with that value, on the event or else the resource; else `untyped` or
+/// `unknown` when the event carries that [`ATTR_TYPE`]; else `gauge`. Any other value of either
+/// key is ignored, so a carrier spelling `info` exposes a plain gauge.
+fn gauge_family_type(resource: &Resource, event: &Event) -> FamilyType {
+    match metric_type(resource, event) {
+        Some(TYPE_INFO) => return FamilyType::Info,
+        Some(TYPE_STATESET) => return FamilyType::StateSet,
+        _ => {}
+    }
+    match event.attributes.get(ATTR_TYPE).and_then(Value::as_str) {
+        Some("untyped") => FamilyType::Untyped,
+        Some("unknown") => FamilyType::Unknown,
+        _ => FamilyType::Gauge,
+    }
+}
+
+/// A cumulative `Histogram` record's family type: `gaugehistogram` when the event is flagged
+/// [`METRICS_TYPE`] `gaugehistogram`, on the event or else the resource, else `histogram`.
+fn histogram_family_type(resource: &Resource, event: &Event) -> FamilyType {
+    if metric_type(resource, event) == Some(TYPE_GAUGE_HISTOGRAM) {
+        FamilyType::GaugeHistogram
+    } else {
+        FamilyType::Histogram
+    }
 }
 
 /// A record carrying `FLAG_NO_RECORDED_VALUE` → the family its stale marker belongs on, under
@@ -1505,6 +1533,7 @@ fn declared_type(event: &Event) -> Option<FamilyType> {
 /// lands on the same family it was on while it had values.
 fn stale_point(
     record: &MetricRecord,
+    resource: &Resource,
     event: &Event,
     encoder: &mut PrometheusEncoder,
 ) -> Option<(FamilyType, Point)> {
@@ -1522,13 +1551,7 @@ fn stale_point(
                 FamilyType::Gauge
             }
         }
-        MetricKind::Gauge(_) => match declared_type(event) {
-            Some(FamilyType::Untyped) => FamilyType::Untyped,
-            Some(FamilyType::Unknown) => FamilyType::Unknown,
-            Some(FamilyType::Info) => FamilyType::Info,
-            Some(FamilyType::StateSet) => FamilyType::StateSet,
-            _ => FamilyType::Gauge,
-        },
+        MetricKind::Gauge(_) => gauge_family_type(resource, event),
         _ => {
             encoder.not_encoded(NotEncoded::NoRecordedValue);
             return None;
@@ -1923,7 +1946,7 @@ mod tests {
     }
 
     #[test]
-    fn a_gaugehistogram_decodes_as_a_histogram_plus_a_type_marker() {
+    fn a_gaugehistogram_decodes_as_a_histogram_flagged_with_the_neutral_type() {
         let point = Point::Histogram {
             buckets: vec![(0.01, 20), (f64::INFINITY, 42)],
             sum: Some(3289.3),
@@ -1933,7 +1956,8 @@ mod tests {
             vec![family("h", FamilyType::GaugeHistogram, vec![Series::new(vec![], point)])];
         let events = decode(&families);
         assert!(matches!(events[0].metrics[0].kind, MetricKind::Histogram(_)));
-        assert_eq!(events[0].attributes.get(ATTR_TYPE), Some(&Value::from("gaugehistogram")));
+        assert_eq!(events[0].attributes.get(METRICS_TYPE), Some(&Value::from("gaugehistogram")));
+        assert_eq!(events[0].attributes.get(ATTR_TYPE), None, "the flag alone");
     }
 
     #[test]
@@ -1982,6 +2006,7 @@ mod tests {
             let events = decode(&families);
             assert_eq!(events[0].metrics[0].kind, MetricKind::gauge(12.47));
             assert_eq!(events[0].attributes.get(ATTR_TYPE), Some(&Value::from(expected)));
+            assert_eq!(events[0].attributes.get(METRICS_TYPE), None, "the carrier alone");
         }
     }
 
@@ -1995,7 +2020,8 @@ mod tests {
         let events = decode(&families);
         assert_eq!(resolve(events[0].metrics[0].name), "target");
         assert_eq!(events[0].metrics[0].kind, MetricKind::gauge(1.0));
-        assert_eq!(events[0].attributes.get(ATTR_TYPE), Some(&Value::from("info")));
+        assert_eq!(events[0].attributes.get(METRICS_TYPE), Some(&Value::from("info")));
+        assert_eq!(events[0].attributes.get(ATTR_TYPE), None, "the flag alone");
         assert_eq!(events[0].attributes.get("env"), Some(&Value::from("prod")));
     }
 
@@ -2013,7 +2039,10 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].metrics[0].kind, MetricKind::gauge(0.0));
         assert_eq!(events[1].metrics[0].kind, MetricKind::gauge(1.0));
-        assert_eq!(events[1].attributes.get(ATTR_TYPE), Some(&Value::from("stateset")));
+        for event in &events {
+            assert_eq!(event.attributes.get(METRICS_TYPE), Some(&Value::from("stateset")));
+            assert_eq!(event.attributes.get(ATTR_TYPE), None, "the flag alone");
+        }
     }
 
     #[test]
@@ -2181,25 +2210,50 @@ mod tests {
         assert!(counted(&diag, "logit.component.diagnostics", ("key", "delta_summary_unresolved")));
     }
 
+    /// `untyped` and `unknown` come from the carrier, `info` and `stateset` from the neutral flag,
+    /// on the event or else the resource.
     #[test]
-    fn a_gauges_family_type_follows_its_prometheus_type_attribute() {
-        for (marker, expected_kind, expected_point) in [
-            ("untyped", FamilyType::Untyped, Point::Unknown(2.0)),
-            ("unknown", FamilyType::Unknown, Point::Unknown(2.0)),
-            ("info", FamilyType::Info, Point::Info),
-            ("stateset", FamilyType::StateSet, Point::StateSet(true)),
+    fn a_gauges_family_type_follows_the_carrier_or_the_neutral_type() {
+        let gauge = || record("m", MetricKind::gauge(2.0));
+        for (key, value, expected_kind, expected_point) in [
+            (ATTR_TYPE, "untyped", FamilyType::Untyped, Point::Unknown(2.0)),
+            (ATTR_TYPE, "unknown", FamilyType::Unknown, Point::Unknown(2.0)),
+            (METRICS_TYPE, "info", FamilyType::Info, Point::Info),
+            (METRICS_TYPE, "stateset", FamilyType::StateSet, Point::StateSet(true)),
         ] {
-            let event = event_with(
-                &[(ATTR_TYPE, Value::from(marker))],
-                record("m", MetricKind::gauge(2.0)),
-            );
+            let event = event_with(&[(key, Value::from(value))], gauge());
             let families = encode(&Resource::default(), &event);
-            assert_eq!(families[0].kind, expected_kind, "marker {marker}");
-            assert_eq!(families[0].series[0].point, expected_point, "marker {marker}");
+            assert_eq!(families[0].kind, expected_kind, "{key}: {value}");
+            assert_eq!(families[0].series[0].point, expected_point, "{key}: {value}");
             assert!(
                 families[0].series[0].labels.is_empty(),
-                "`_logit.prometheus.*` attributes are consumed, never rendered as labels"
+                "private attributes are consumed, never rendered as labels"
             );
+        }
+        for value in ["info", "stateset"] {
+            let mut resource = Resource::default();
+            resource.attributes.insert(METRICS_TYPE, value);
+            let families = encode(&resource, &event_with(&[], gauge()));
+            assert_eq!(families[0].kind.as_str(), value, "the resource's {value}");
+        }
+    }
+
+    /// The carrier spells only `untyped` and `unknown`, and the neutral flag only `info`,
+    /// `stateset`, and `gaugehistogram`, so each key's other values expose a plain gauge.
+    #[test]
+    fn a_gauge_ignores_a_type_its_key_does_not_carry() {
+        for (key, value) in [
+            (ATTR_TYPE, "info"),
+            (ATTR_TYPE, "stateset"),
+            (METRICS_TYPE, "untyped"),
+            (METRICS_TYPE, "gaugehistogram"),
+            (METRICS_TYPE, "rate"),
+        ] {
+            let event =
+                event_with(&[(key, Value::from(value))], record("m", MetricKind::gauge(2.0)));
+            let families = encode(&Resource::default(), &event);
+            assert_eq!(families[0].kind, FamilyType::Gauge, "{key}: {value}");
+            assert_eq!(families[0].series[0].point, Point::Gauge(2.0), "{key}: {value}");
         }
     }
 
@@ -2259,8 +2313,10 @@ mod tests {
         assert_eq!(encode_kind(with), encode_kind(without));
     }
 
+    /// A histogram flagged `gaugehistogram` on the event or the resource exposes as one; the
+    /// carrier spelling it exposes a plain histogram.
     #[test]
-    fn a_histogram_with_a_gaugehistogram_marker_encodes_as_a_gaugehistogram() {
+    fn a_histogram_flagged_gaugehistogram_encodes_as_a_gaugehistogram() {
         let kind = MetricKind::Histogram(Histogram {
             buckets: vec![(1.0, 2), (f64::INFINITY, 1)],
             temporality: Temporality::Cumulative,
@@ -2268,8 +2324,16 @@ mod tests {
             min: None,
             max: None,
         });
-        let event = event_with(&[(ATTR_TYPE, Value::from("gaugehistogram"))], record("m", kind));
-        assert_eq!(encode(&Resource::default(), &event)[0].kind, FamilyType::GaugeHistogram);
+        let flagged = |key: &'static str| {
+            event_with(&[(key, Value::from("gaugehistogram"))], record("m", kind.clone()))
+        };
+        let bare = Resource::default();
+        assert_eq!(encode(&bare, &flagged(METRICS_TYPE))[0].kind, FamilyType::GaugeHistogram);
+        assert_eq!(encode(&bare, &flagged(ATTR_TYPE))[0].kind, FamilyType::Histogram);
+        let mut resource = Resource::default();
+        resource.attributes.insert(METRICS_TYPE, "gaugehistogram");
+        let event = event_with(&[], record("m", kind.clone()));
+        assert_eq!(encode(&resource, &event)[0].kind, FamilyType::GaugeHistogram);
     }
 
     /// A model histogram whose highest bound is finite (nothing forbids it) still gets a `+Inf`
@@ -3096,14 +3160,17 @@ mod tests {
                 _ => false,
             };
             assert!(shaped, "{kind:?} got {:?}", record.kind);
-            // The five marker types still say what they were on the wire.
-            if kind.needs_marker() {
-                assert_eq!(
-                    events[0].attributes.get(ATTR_TYPE).and_then(|v| v.as_str()),
-                    Some(kind.as_str()),
-                    "{kind:?}"
-                );
-            }
+            // The carrier and the neutral types still say what they were on the wire.
+            let (key, expected) = if kind.needs_marker() {
+                (ATTR_TYPE, Some(kind.as_str()))
+            } else {
+                (METRICS_TYPE, kind.neutral_type())
+            };
+            assert_eq!(
+                events[0].attributes.get(key).and_then(|v| v.as_str()),
+                expected,
+                "{kind:?}"
+            );
         }
     }
 
@@ -3179,16 +3246,16 @@ mod tests {
             // the `unresolved_delta` drop that would apply to a *valued* record does not apply here.
             (None, sum(Temporality::Delta), FamilyType::Counter),
             (None, MetricKind::gauge(0.0), FamilyType::Gauge),
-            (Some("unknown"), MetricKind::gauge(0.0), FamilyType::Unknown),
-            (Some("untyped"), MetricKind::gauge(0.0), FamilyType::Untyped),
-            (Some("info"), MetricKind::gauge(0.0), FamilyType::Info),
-            (Some("stateset"), MetricKind::gauge(0.0), FamilyType::StateSet),
+            (Some((ATTR_TYPE, "unknown")), MetricKind::gauge(0.0), FamilyType::Unknown),
+            (Some((ATTR_TYPE, "untyped")), MetricKind::gauge(0.0), FamilyType::Untyped),
+            (Some((METRICS_TYPE, "info")), MetricKind::gauge(0.0), FamilyType::Info),
+            (Some((METRICS_TYPE, "stateset")), MetricKind::gauge(0.0), FamilyType::StateSet),
         ];
         for (declared, kind, expected) in cases {
             let mut rec = record("m", kind.clone());
             rec.flags = MetricRecord::FLAG_NO_RECORDED_VALUE;
             let attrs: Vec<(&str, Value)> =
-                declared.into_iter().map(|d| (ATTR_TYPE, Value::str(d))).collect();
+                declared.into_iter().map(|(key, d)| (key, Value::str(d))).collect();
             let (families, _) = encode_stale(&event_with(&attrs, rec));
             assert_eq!(families.len(), 1, "{kind:?} {declared:?}");
             assert_eq!(families[0].kind, expected, "{kind:?} {declared:?}");
