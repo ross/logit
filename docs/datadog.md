@@ -318,7 +318,8 @@ upstream with `set`, which overrides the sender's. A host the data carries is ne
 A `host` attribute that reaches `datadog_out`, from a `set`, a script, or another protocol such as
 an InfluxDB `host` tag, is an ordinary `host:` tag, not the host. A log's `hostname` attribute
 from such a source is left off, counted `logit.output.tags.omitted{reason="reserved_key"}`,
-because it would be a second `hostname` key. To make either the host, rename it to `host.name`.
+because it would be a second `hostname` key. To make either the host, copy it to `host.name` upstream, as
+[deploying.md's "Hostname"](deploying.md#hostname) shows.
 
 A sample a client made hostless with an empty `host:` tag stays hostless, and so does a sample an
 Agent sends hostless: a v2 `host` resource with no name, or `"host":""` on the v1,

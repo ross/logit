@@ -530,6 +530,26 @@ writes it there, read by its protocol's own rules: `collectd_in`, `syslog_in`, `
 `datadog_in`, and `splunk_hec_in`. A sink that writes a host reads `host.name`, and no protocol's
 host field. To set or override a host, stamp `host.name` with `set`.
 
+A tailed log line, a plain line, and a carbon path have no standard host field, so `tail_in`,
+`lines_in`, and `graphite_in` write no `host.name`. A host inside the data, such as pino's or
+bunyan's `hostname`, reaches a sink only once a transform puts it in `host.name`: `set` for a
+constant, or `lua` to copy a parsed attribute:
+
+```yaml
+  host_from_log:
+    type: lua
+    sources: [parse]
+    script: |
+      function process(event)
+        event.attributes["host.name"] = event.attributes.hostname
+        event.attributes.hostname = nil
+        return event
+      end
+```
+
+`datadog_out` leaves a log's `hostname` attribute off, counted, because that key is Datadog's own
+field and the sink fills it from `host.name`, so the copy is what gets the file's host to Datadog.
+
 Three sinks also send it as the host of any event that carries none of its own. They never
 replace a host an event or its resource carries:
 

@@ -212,6 +212,13 @@ wire form: a wire form that names the same fact is decoded onto the common key, 
 doesn't survive as a carrier. Where the protocol has its own rule for which of several wire forms
 names the host, the source applies it, so a sink sees one answer.
 
+**Where the wire has no standard host field, the operator fills `host.name`.** An input whose
+protocol defines a host field writes `host.name` from it. Where the wire has none, as for a tailed
+or piped log line, a carbon path, or a plain line, a host inside the data is whatever an
+operator's transform puts in `host.name` (`set` for a constant, `lua` to copy a parsed
+attribute), and no sink reads any other key for it. That's settled behavior, not a gap: the input
+can't know which of the data's fields, if any, names a host.
+
 For the host, the Datadog family's decoders now apply that rule:
 
 | Wire host | Decodes to |
@@ -257,19 +264,20 @@ The common keys today, and who writes each:
 `replay_in` and `logit_in` deliver whatever a source upstream wrote; `generate_in` writes what
 its template says.
 
-**Not yet applied.** These sources have a host-like wire form and don't write `host.name`; each
-is its own follow-up, not part of this amendment:
+**Not yet applied.** These sources have a host field in their protocol and don't write
+`host.name`; each is its own follow-up, not part of this amendment:
 
 - `influxdb_in`: a line-protocol tag named `host`, which Telegraf adds to every point by default,
   stays the tag `host`.
-- `prometheus_in`: the `instance` and `job` labels are Prometheus target identity, not a host,
-  and stay labels. That's settled, not a follow-up.
-- `graphite_in`, `lines_in`, `tail_in`: their wires carry no host field; a host inside a metric
-  path or a line is a transform's to extract.
 - `docker_in`: a container's `config.v2.json` names its `Config.Hostname`, which isn't read.
 - `datadog_in`'s and `datadog_trace_in`'s trace and APM stats payloads: the `TracerPayload` and
   `ClientStatsPayload` `hostname` (`_logit.datadog.tracer.hostname`) and the Agent's own
   `hostName`/`internalHostname` (`_logit.datadog.agent.hostname`, also an events envelope's) are
   payload metadata the trace sinks restore verbatim for the Agent's trace processing, and the
   Agent's is the relaying Agent's identity, not a sender's host. They stay carriers.
+
+Settled, and not follow-ups: `prometheus_in`'s `instance` and `job` labels are Prometheus target
+identity, not a host, and stay labels; `graphite_in`, `lines_in`, and `tail_in` have no standard
+host field, so a host inside a metric path or a line is an operator's transform's to put in
+`host.name`, as the rule above says.
 

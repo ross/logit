@@ -115,7 +115,8 @@ resource of each object's batch, and `internal` on its resource. A sink that nee
 non-empty `host.name` off the event, else the resource, then its family's hostless mark where it
 has one, and falls back to the process hostname or its own `hostname:`. No sink reads another
 family's host key ([ADR `process-hostname`](../adr/process-hostname.md)'s "Amendment: a source
-fills the common keys (2026-10-23)").
+fills the common keys (2026-10-23)"). Where the wire has no standard host field (a tailed or
+plain log line, a carbon path), `host.name` is an operator's transform's to fill.
 
 **The private namespace `_logit.`: a carrier lives under `_logit.<protocol>.`**
 (`_logit.statsd.type`). A carrier is a protocol's raw wire spelling of something the model
