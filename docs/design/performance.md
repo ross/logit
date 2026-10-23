@@ -734,7 +734,8 @@ Since 2026-10-23, `run` records three more things per scenario. Read them before
   undercount its run time; `user_s`/`sys_s` stay the CPU total.
 - **`bimodal`.** With five or more repeats, `run` splits their CPU µs/event into the two clusters
   with the smallest within-cluster sum of squares, and calls the scenario bimodal when both hold
-  at least two repeats and the gap between them is wider than either cluster's range. A bimodal
+  at least two repeats and the gap between them is wider than either cluster's range and than 10%
+  of the lower cluster's median. A bimodal
   scenario's `cpu_clusters` holds each mode's size and median, and `run` prints both. Its pooled
   median describes neither mode, so don't record it as a row; record the modes, or find out what
   sets the mode. `bimodal` is `null` under five repeats: too few to tell, not a clean bill.

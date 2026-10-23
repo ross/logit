@@ -290,7 +290,8 @@ repeat ran in. Three changes close that:
   is `perf record`.
 - **A bimodal scenario isn't gated.** With five or more repeats, exact one-dimensional two-means
   over their CPU µs/event (`crates/logit-perf/src/bimodal.rs`) flags a scenario bimodal when both
-  clusters hold at least two repeats and the gap between them exceeds the wider cluster's range.
+  clusters hold at least two repeats and the gap between them exceeds both the wider cluster's
+  range and 10% of the lower cluster's median.
   `run` prints both modes and records `bimodal` and `cpu_clusters`; `bimodal` is `null` under five
   repeats, not `false`. `compare` decides it from each file's repeats, reports such a row as
   "bimodal, not gated" instead of diffing pooled medians, and exits 2 when that left a row ungated

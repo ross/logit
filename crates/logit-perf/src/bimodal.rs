@@ -8,13 +8,20 @@
 //! The test is exact one-dimensional two-means: sort the values, try every split point, and keep
 //! the split with the smallest within-cluster sum of squares. The split is bimodal when both
 //! clusters hold at least two repeats and the gap between them, the upper cluster's minimum less
-//! the lower cluster's maximum, exceeds the wider cluster's range. One outlier is never a mode:
-//! it's a cluster of one. Fewer than [`MIN_REPEATS`] repeats can't support the call either way.
+//! the lower cluster's maximum, exceeds both the wider cluster's range and [`MIN_GAP_FRACTION`] of
+//! the lower cluster's median. One outlier is never a mode: it's a cluster of one. Without the
+//! relative floor, two tight sub-groups a hair apart (`0.188` and `0.189`) would pass, since their
+//! ranges are near zero. Fewer than [`MIN_REPEATS`] repeats can't support the call either way.
 
 use serde::{Deserialize, Serialize};
 
 /// The fewest repeats the test runs on; below it the verdict is [`Verdict::TooFew`].
 pub const MIN_REPEATS: usize = 5;
+
+/// The smallest gap between modes, as a fraction of the lower mode's median, that counts as two
+/// modes. The slow mode seen so far sits 40% to 108% above the fast one, and run-to-run noise on a
+/// quiet box is under 3%.
+pub const MIN_GAP_FRACTION: f64 = 0.10;
 
 /// One mode of a bimodal scenario.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -87,9 +94,10 @@ pub fn detect(values: &[f64]) -> Verdict {
     }
     let range = |cluster: &[f64]| cluster[cluster.len() - 1] - cluster[0];
     let gap = upper[0] - lower[lower.len() - 1];
-    if gap > range(lower).max(range(upper)) {
+    let lower_median = median_sorted(lower);
+    if gap > range(lower).max(range(upper)) && gap > MIN_GAP_FRACTION * lower_median {
         Verdict::Bimodal(Clusters {
-            lower: Cluster { size: lower.len(), median: median_sorted(lower) },
+            lower: Cluster { size: lower.len(), median: lower_median },
             upper: Cluster { size: upper.len(), median: median_sorted(upper) },
         })
     } else {
@@ -153,6 +161,26 @@ mod tests {
     fn a_gap_no_wider_than_a_cluster_is_unimodal() {
         // Gap 0.20, upper range 0.30.
         assert_eq!(detect(&[1.0, 1.05, 1.25, 1.40, 1.55]), Verdict::Unimodal);
+    }
+
+    #[test]
+    fn tight_sub_groups_a_hair_apart_are_unimodal() {
+        // Six-repeat sets a real run flagged before the relative floor: 2@0.399/4@0.401,
+        // 3@0.188/3@0.189, and 3@0.513/3@0.526.
+        assert_eq!(detect(&[0.399, 0.399, 0.401, 0.401, 0.401, 0.401]), Verdict::Unimodal);
+        assert_eq!(detect(&[0.188, 0.188, 0.188, 0.189, 0.189, 0.189]), Verdict::Unimodal);
+        assert_eq!(detect(&[0.513, 0.513, 0.513, 0.526, 0.526, 0.526]), Verdict::Unimodal);
+    }
+
+    #[test]
+    fn a_twelve_percent_gap_is_bimodal() {
+        let clusters = detect(&[1.00, 1.00, 1.01, 1.13, 1.14, 1.14]).clusters().expect("bimodal");
+        assert_eq!((clusters.lower.size, clusters.upper.size), (3, 3));
+    }
+
+    #[test]
+    fn an_eight_percent_gap_is_unimodal() {
+        assert_eq!(detect(&[1.00, 1.00, 1.01, 1.09, 1.09, 1.10]), Verdict::Unimodal);
     }
 
     #[test]
