@@ -158,7 +158,7 @@ is an ordinary attribute. Other sinks render collectd's host under the standard 
 
 ## Amendment: `host.name` ranks first everywhere (2026-10-23)
 
-The amendment above let a sink's own wire host form rank ahead of `host.name`: a Datadog log's
+Before this amendment, a sink's own wire host form ranked ahead of `host.name`: a Datadog log's
 `hostname`, a Datadog event's or service check's `h:` field (`_logit.statsd.*.host`), and at
 `statsd_out` a `host` attribute. So an operator's `set` of `host.name`, or a resource `host.name`
 from `internal` or an OTLP sender, reached some records and not others, by protocol. One rule
@@ -170,7 +170,7 @@ row of the 2026-10-14 table above.
 |---|---|
 | every sink that writes a host | `host.name` (event, else resource), then the sink's own forms below, then its fallback |
 | `datadog_out` | then a log's `hostname`, an event's or check's `h:` field, a DogStatsD `host:` tag, and the hostless marks; then the process hostname. A hostless mark is never filled by the process hostname, and a `host.name` fills it. A log carrying `syslog.hostname` or `host` gets no default: both are Datadog's own reserved log attributes |
-| `statsd_out` (`format: dogstatsd`) | then an event's or check's non-empty `h:` field, a `host` attribute, and the hostless mark, as the `host:` tag; no fallback, since the Agent stamps its own |
+| `statsd_out` (`format: dogstatsd`) | then an event's or check's non-empty `h:` field, written as its own field, and a `host` attribute, written as the `host:` tag, both written when present; then, with no `host` attribute and no non-empty `h:` field, the hostless mark as an empty `host:` tag; no fallback, since the Agent stamps its own |
 | `collectd_out` | then `hostname:`; with neither, the list drops (`no_host`) |
 | `syslog_out` | then `hostname:`, then the process hostname |
 | `splunk_hec_out` | then the process hostname |

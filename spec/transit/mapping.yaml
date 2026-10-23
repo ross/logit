@@ -2046,12 +2046,8 @@ rows:
             A non-empty `host.name` is the line's `host:` tag, so a `host` beside it, a second
             `host:` tag the Agent would consume, is left off, counted once per wire tag.
       prometheus_out:
-        class: normalized
-        reason: label_sanitized
-        counter: logit.output.labels.normalized{reason=name_sanitized}
-        text: >-
-          A label; its name is forced into `[a-zA-Z_][a-zA-Z0-9_]*`, so a key holding `.` or another
-          character reads back under the sanitized name, counted once per label it renames.
+        class: exact
+        text: A `host` label, read back as `host`.
       otlp_out:
         class: exact
         text: A string attribute.

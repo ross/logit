@@ -880,7 +880,10 @@ can't tell a DogStatsD sender's ordinary tag from a host. A `host.name:` tag on 
 downstream takes it as the host. This was chosen over marking the tag's origin: a sender writing
 `host.name:` names a host, and the Agent was dropping it in favor of its own. It joins the pair's
 list in `crates/logit-cli/tests/statsd_round_trip.rs` as (10), and
-[ADR `lossless-transit`](lossless-transit.md)'s amendment of the same date.
+[ADR `lossless-transit`](lossless-transit.md)'s amendment of the same date. Superseded in part by
+[ADR `process-hostname`](process-hostname.md)'s "Amendment: `host.name` ranks first everywhere
+(2026-10-23)" and "Amendment (2026-10-23): `host.name` ranks first" below: the `host.name:` tag is
+now the `host:` tag on every line, and a `host:` tag beside it is omitted, counted.
 
 **An event or a service check keeps its `h:` field from the carrier alone.** With no non-empty
 `h:` field, the Agent reads the `host:` tag on an event or check as it does on a metric, so the tag

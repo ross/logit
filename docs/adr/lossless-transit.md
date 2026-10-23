@@ -374,6 +374,10 @@ relay sends it where the destination reads one. [ADR `statsd-output`](statsd-out
 amendment of the same date records the decision, and the transit spec's `string_value` row the
 class.
 
+Superseded in part by [ADR `process-hostname`](process-hostname.md)'s "Amendment: `host.name`
+ranks first everywhere (2026-10-23)": the `host.name:` tag is now the `host:` tag on every line,
+and a `host:` tag beside it is omitted, counted `logit.output.tags.omitted{reason="unrepresentable"}`.
+
 ## Amendment: a bucketless OTLP histogram keeps its count (2026-10-21)
 
 `logit_core::Histogram` has no `count` field; its population is the sum of its buckets. An OTLP
