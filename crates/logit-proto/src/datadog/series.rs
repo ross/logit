@@ -2870,8 +2870,7 @@ mod tests {
         let gauge = || MetricKind::gauge(0.5);
         assert_eq!(series(Resource::default(), neutral(), gauge()), ("rate".into(), 10));
 
-        let mut resource = Resource::default();
-        resource.attributes = neutral();
+        let resource = Resource { attributes: neutral(), ..Resource::default() };
         assert_eq!(series(resource, AttrMap::new(), gauge()), ("rate".into(), 10), "the resource");
 
         let mut retired = AttrMap::new();

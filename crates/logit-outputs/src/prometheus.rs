@@ -3597,7 +3597,8 @@ mod tests {
         let flag = logit_core::attrs::METRICS_TYPE;
         let on_resource = [(flag, Value::str("rate"))];
         // (on the event, on the resource, kind, counted dropped)
-        let cases: [(Option<&str>, &[(&str, Value)], &MetricKind, bool); 4] = [
+        type Case<'a> = (Option<&'a str>, &'a [(&'a str, Value)], &'a MetricKind, bool);
+        let cases: [Case; 4] = [
             (Some(flag), &[], &gauge, true),
             (None, &on_resource, &gauge, true),
             (Some("_logit.datadog.type"), &[], &gauge, false),
