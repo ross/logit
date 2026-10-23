@@ -94,6 +94,9 @@
 //! | `attributes/timestamped` | lost | structural | The flag is private and isn't an OTLP attribute, so it's left off. The point's time carries the timestamp. |
 //! | `attributes/rate` | lost | structural | The flag is private and isn't an OTLP attribute, so it's left off. |
 //! | `attributes/interval` | lost | structural | The flag is private and isn't an OTLP attribute, so it's left off. |
+//! | `attributes/rate_on_non_gauge` | lost | structural | The flag is private and isn't an OTLP attribute, so it's left off. |
+//! | `attributes/interval_on_distribution` | lost | structural | The flag is private and isn't an OTLP attribute, so it's left off. |
+//! | `attributes/interval_on_histogram` | lost | structural | The flag is private and isn't an OTLP attribute, so it's left off. |
 //! | `attributes/resource_attribute` | exact | -- | A resource attribute. |
 //! | `attributes/scope` | exact | -- | The `InstrumentationScope` of the batch. |
 //! | `attributes/datadog_carrier_log` | lost | structural | A `_logit.` carrier is private and isn't an OTLP attribute, so it's left off. |

@@ -208,8 +208,13 @@
 //! | `attributes/prometheus_target` | lost | structural | The scrape target is private and never a tag, so it's left off. |
 //! | `attributes/foreign_carrier` | lost | structural | Another protocol's `_logit.` carrier is private and never a tag, so it's left off. The `_logit.statsd.event.*` and `_logit.statsd.service_check.*` carriers are read as the Datadog fields they name. |
 //! | `attributes/timestamped` | lost | structural | The flag is private and never a tag, so it's left off. The point carries its timestamp, in whole seconds. |
-//! | `attributes/rate` | exact | -- | A flagged gauge is written as a series `rate` point, and datadog_in sets the flag again. The flag on any other kind is ignored. |
-//! | `attributes/interval` | exact | -- | The series `interval` of a series point of any type, and datadog_in sets the flag again. The distribution-points and sketches routes have no interval field, so there a nonzero interval is left off, counted `logit.output.tags.omitted{reason=no_wire_form}`. |
+//! | `attributes/rate` | exact | -- | A flagged gauge is written as a series `rate` point, and datadog_in sets the flag again. |
+//! | `attributes/interval` | exact | -- | The series `interval` of a series point of any type, and datadog_in sets the flag again. |
+//! | `attributes/rate_on_non_gauge` | lost | structural | The flag applies to a gauge alone, so on any other kind it's ignored: the point keeps the type its kind gives it, and datadog_in sets no flag. |
+//! | `attributes/interval_on_distribution` | lost | `logit.output.tags.omitted{reason=no_wire_form}` | The distribution-points and sketches routes have no interval field, so a nonzero interval is left off, counted. |
+//! | `attributes/interval_on_histogram`, under `histograms: {"mode":"counters","send_aggregation_metrics":true}` | exact | -- | Under `histograms.mode: counters`, the `interval` of each series the histogram writes, and datadog_in sets the flag again. |
+//! | `attributes/interval_on_histogram`, under `histograms: {"mode":"nobuckets","send_aggregation_metrics":true}` | exact | -- | Under `histograms.mode: nobuckets`, the `interval` of each series the histogram writes, and datadog_in sets the flag again. |
+//! | `attributes/interval_on_histogram`, otherwise | lost | `logit.output.tags.omitted{reason=no_wire_form}` | The sketches route has no interval field, so a nonzero interval is left off, counted. |
 //! | `attributes/resource_attribute` | normalized | `resource_as_tag` | Merged into the record's tags, so it reads back as an event attribute. |
 //! | `attributes/scope` | lost | structural | Datadog has no instrumentation scope, so none is written. |
 //! | `attributes/datadog_carrier_log` | lost | uncounted | A `_logit.datadog.*` carrier on a log, a Datadog event, or a service check that the route has no field for is left off, uncounted, where the metrics routes count one as `no_wire_form`; the events route's public form has no field for the Agent envelope's `_logit.datadog.agent.hostname`. |

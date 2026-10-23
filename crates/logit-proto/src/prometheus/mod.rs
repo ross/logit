@@ -178,6 +178,9 @@
 //! | `attributes/timestamped`, otherwise | exact | -- | The event's timestamp is written as the sample's timestamp, and a scrape sets the flag again. A statsd `\|T` line leaves with a sample timestamp too. |
 //! | `attributes/rate` | lost | structural | The flag is private and isn't a label, so it's left off. The sink reads it to count a same-millisecond pair of rates `dropped` rather than `normalized`, and writes no wire form for it. |
 //! | `attributes/interval` | lost | structural | The flag is private and isn't a label, so it's left off. |
+//! | `attributes/rate_on_non_gauge` | lost | structural | The flag is private and isn't a label, so it's left off. |
+//! | `attributes/interval_on_distribution` | lost | structural | The flag is private and isn't a label, so it's left off. |
+//! | `attributes/interval_on_histogram` | lost | structural | The flag is private and isn't a label, so it's left off. |
 //! | `attributes/resource_attribute` | normalized | `resource_merged`; `logit.output.labels.normalized{reason=name_sanitized}` | A label, the event's value winning on a shared key, read back as an event attribute. A name outside the label-name grammar is sanitized, counted once per label it renames. |
 //! | `attributes/scope` | lost | structural | Prometheus has no instrumentation scope, so none is written. |
 //! | `attributes/datadog_carrier_log` | lost | structural | Another protocol's `_logit.` carrier is private and isn't a label, so it's left off. |

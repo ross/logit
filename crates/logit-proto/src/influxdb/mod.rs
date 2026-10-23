@@ -192,6 +192,9 @@
 //! | `attributes/timestamped` | lost | structural | The flag is private and isn't a tag, so it's left off. Every point carries its timestamp, so influxdb_in can't tell the source's own from any other and sets no flag. |
 //! | `attributes/rate` | lost | structural | The flag is private and isn't a tag, so it's left off. |
 //! | `attributes/interval` | lost | structural | The flag is private and isn't a tag, so it's left off. |
+//! | `attributes/rate_on_non_gauge` | lost | structural | The flag is private and isn't a tag, so it's left off. |
+//! | `attributes/interval_on_distribution` | lost | structural | The flag is private and isn't a tag, so it's left off. |
+//! | `attributes/interval_on_histogram` | lost | structural | The flag is private and isn't a tag, so it's left off. |
 //! | `attributes/resource_attribute` | normalized | `resource_merged` | A tag, the event's value winning on a shared key, read back as an event attribute. |
 //! | `attributes/scope` | lost | structural | Line protocol has no instrumentation scope, so none is written. |
 //! | `attributes/datadog_carrier_log` | lost | structural | Another protocol's `_logit.` carrier is private and isn't a tag, so it's left off. |

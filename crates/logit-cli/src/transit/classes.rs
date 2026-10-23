@@ -39,8 +39,11 @@
 //! It reaches an
 //! `attributes` row for each attribute, event or resource: a `_logit.<protocol>.` carrier of the
 //! sink's own protocol is `private_carrier`, `_logit.prometheus.target` `prometheus_target` and
-//! `_logit.metrics.closed: "timestamped"` `timestamped`, `_logit.metrics.type: "rate"` `rate`, and
-//! `_logit.metrics.interval` `interval` at every sink, a `_logit.datadog.` carrier on a log, a Datadog
+//! `_logit.metrics.closed: "timestamped"` `timestamped` at every sink, on a metric record
+//! `_logit.metrics.type: "rate"` `rate` on a `gauge` and `rate_on_non_gauge` on any other kind,
+//! and `_logit.metrics.interval` `interval_on_distribution` on a `samples`, `distribution`, or
+//! delta `exponential_histogram`, `interval_on_histogram` on a delta `histogram`, and `interval`
+//! on any other kind, at every sink, a `_logit.datadog.` carrier on a log, a Datadog
 //! event, or a service check `datadog_carrier_log`, any other `_logit.` key `foreign_carrier`, an
 //! event
 //! attribute by its value (`string_value`, `bool_value`, `number_value`, `array_value`,
@@ -1396,6 +1399,20 @@ fn same_millisecond(rec: &Rec, later: &Rec) -> bool {
     millis(rec).is_some() && millis(rec) == millis(later)
 }
 
+/// The `attributes` row `_logit.metrics.interval` reaches on metric record `rec`: datadog_out
+/// writes the interval on its series routes, which have the field, and not on the
+/// distribution-points and sketches routes, which don't. A delta histogram takes the sketches route
+/// under one `histograms.mode` and the series route under the others, so it has a row of its own.
+fn interval_row(rec: &Rec) -> &'static str {
+    let delta = rec.body["temporality"] == "delta";
+    match rec.kind.as_str() {
+        "samples" | "distribution" => "interval_on_distribution",
+        "exponential_histogram" if delta => "interval_on_distribution",
+        "histogram" if delta => "interval_on_histogram",
+        _ => "interval",
+    }
+}
+
 /// Whether `rec` and `later`, two points of one series, are one state: each a kind a later
 /// reading fully replaces ([`is_state`]), with the same metric object, attributes, and resource,
 /// private carriers included.
@@ -1515,10 +1532,10 @@ fn field_rows(rec: &Rec, protocol: &str) -> Vec<(String, Option<String>, Field)>
     let carrier = |key: &str, value: &Value| {
         if key == METRICS_CLOSED && value.as_str() == Some(CLOSED_TIMESTAMPED) {
             Some("timestamped")
-        } else if key == METRICS_TYPE && value.as_str() == Some(TYPE_RATE) {
-            Some("rate")
-        } else if key == METRICS_INTERVAL {
-            Some("interval")
+        } else if key == METRICS_TYPE && value.as_str() == Some(TYPE_RATE) && rec.is_metric() {
+            Some(if rec.kind == "gauge" { "rate" } else { "rate_on_non_gauge" })
+        } else if key == METRICS_INTERVAL && rec.is_metric() {
+            Some(interval_row(rec))
         } else if key == ATTR_TARGET {
             Some("prometheus_target")
         } else if key.starts_with("_logit.datadog.") && json_route {
@@ -2878,6 +2895,33 @@ mod tests {
         };
         assert_eq!(unit_row(&ins[0]).as_deref(), Some("unit_on_distribution"));
         assert_eq!(unit_row(&ins[1]).as_deref(), Some("unit"));
+    }
+
+    /// The rate and interval flags reach a row named for the record's kind.
+    #[test]
+    fn the_rate_and_interval_flags_have_rows_by_kind() {
+        let flags = r#""attributes":{"_logit.metrics.type":"rate","_logit.metrics.interval":10}"#;
+        let lines = [
+            r#"{{T},"metrics":[{"name":"g","kind":"gauge","value":1.0}],FLAGS}"#,
+            r#"{{T},"metrics":[{"name":"s","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],FLAGS}"#,
+            r#"{{T},"metrics":[{"name":"t","kind":"samples","values":[1.0],"sample_rate":1.0}],FLAGS}"#,
+            r#"{{T},"metrics":[{"name":"h","kind":"histogram","temporality":"delta","buckets":[{"bound":1.0,"count":1},{"bound":"inf","count":0}],"sum":1.0}],FLAGS}"#,
+        ]
+        .map(|line| line.replace("FLAGS", flags));
+        let ins = recs(&lines.each_ref().map(String::as_str));
+        let flag_rows = |rec: &Rec| {
+            let mut rows: Vec<String> = field_rows(rec, "statsd")
+                .into_iter()
+                .filter_map(|(_, f, _)| f)
+                .filter(|f| f.starts_with("rate") || f.starts_with("interval"))
+                .collect();
+            rows.sort();
+            rows
+        };
+        assert_eq!(flag_rows(&ins[0]), ["interval", "rate"]);
+        assert_eq!(flag_rows(&ins[1]), ["interval", "rate_on_non_gauge"]);
+        assert_eq!(flag_rows(&ins[2]), ["interval_on_distribution", "rate_on_non_gauge"]);
+        assert_eq!(flag_rows(&ins[3]), ["interval_on_histogram", "rate_on_non_gauge"]);
     }
 
     /// The log encoder takes any `host.name`, an empty one included, as the host, so a log with

@@ -311,6 +311,9 @@
 //! | `attributes/timestamped`, otherwise | exact | -- | The event's timestamp is written as `\|T<seconds>` (`d:<seconds>` on an event or a service check), truncated to whole seconds, and statsd_in sets the flag again. A scraped Prometheus sample with its own timestamp leaves with a `\|T` too. A timestamp before 1970 has no unsigned seconds to write, so it's omitted, counted `logit.output.fields.omitted{reason=invalid_value}` once per line. |
 //! | `attributes/rate` | lost | structural | The flag is private and isn't a tag, so it's left off. |
 //! | `attributes/interval` | lost | structural | The flag is private and isn't a tag, so it's left off. |
+//! | `attributes/rate_on_non_gauge` | lost | structural | The flag is private and isn't a tag, so it's left off. |
+//! | `attributes/interval_on_distribution` | lost | structural | The flag is private and isn't a tag, so it's left off. |
+//! | `attributes/interval_on_histogram` | lost | structural | The flag is private and isn't a tag, so it's left off. |
 //! | `attributes/resource_attribute`, under `format: statsd` | lost | `logit.output.tags.omitted{reason=dialect}` | Plain statsd has no tags. |
 //! | `attributes/resource_attribute`, otherwise | normalized | `resource_merged` | A resource attribute is written as a tag, the event's value winning on a shared key, and reads back as an event attribute. |
 //! | `attributes/scope` | lost | structural | statsd has no instrumentation scope, so none is written. |

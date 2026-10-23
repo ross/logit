@@ -99,13 +99,17 @@ is one nothing checks: add a case or a flow that reaches it.
   `sample_rate`, `non_finite`, `superseded`, `same_instant`, `same_instant_equal`,
   `same_millisecond`, `same_millisecond_equal`): `exact`, `normalized`, `degraded`, `skipped`, or `dropped`, best to worst.
 - **Field level**, for the `record` rows `unit`, `description`, `start_timestamp`, `exemplars`,
-  `exemplars_on_summary`, `unit_on_distribution`, `min_max`, and `sample_rate_unweighted`, every `attributes` row, and a log or span beside metrics
+  `exemplars_on_summary`, `unit_on_distribution`, `min_max`, and `sample_rate_unweighted`, every `attributes` row (`rate`,
+  `rate_on_non_gauge`, `interval`, `interval_on_distribution`, and `interval_on_histogram` among them), and a log or span beside metrics
   (`beside_metrics`), which is a field of its event: `exact`, `normalized`, or `lost`.
 
 Where a sink's outcome depends on the record's kind, the kind is in the feature's name, since a
 `when:` key names sink config only: `no_recorded_value` is a flagged cumulative `sum` or
 `gauge`, `no_recorded_value_delta_sum` a flagged delta `sum`, `exemplars_on_summary` a
-summary's exemplars, `unit_on_distribution` a `samples` or `distribution` record's unit, and
+summary's exemplars, `unit_on_distribution` a `samples` or `distribution` record's unit,
+`rate_on_non_gauge` a `_logit.metrics.type: rate` flag on a record that isn't a `gauge`,
+`interval_on_distribution` a `_logit.metrics.interval` flag on a `samples`, `distribution`, or
+delta `exponential_histogram` record and `interval_on_histogram` one on a delta `histogram`, and
 `exemplar_key_unsafe` and `exemplar_key_unsafe_histogram` a monotonic `sum` and a `histogram`
 whose written exemplar has an attribute key `prometheus_out` sanitizes into a label name, the only sink that writes an exemplar's keys under a name rule. Some
 rows name a shape one sink treats apart, and every sink that compares the record reaches them: `record/sample_rate` (a

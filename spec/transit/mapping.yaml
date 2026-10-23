@@ -2474,7 +2474,6 @@ rows:
         class: exact
         text: >-
           A flagged gauge is written as a series `rate` point, and datadog_in sets the flag again.
-          The flag on any other kind is ignored.
       graphite_out:
         class: lost
         reason: structural
@@ -2503,9 +2502,113 @@ rows:
         class: exact
         text: >-
           The series `interval` of a series point of any type, and datadog_in sets the flag
-          again. The distribution-points and sketches routes have no interval field, so there a
-          nonzero interval is left off, counted
-          `logit.output.tags.omitted{reason=no_wire_form}`.
+          again.
+      graphite_out:
+        class: lost
+        reason: structural
+        text: >-
+          The flag is private and isn't a tag, so it's left off, under either `tags:` mode.
+  # `_logit.metrics.type: rate` on a record that isn't a gauge: the flag applies to gauges only.
+  - kind: attributes
+    feature: rate_on_non_gauge
+    cells:
+      statsd_out:
+        class: lost
+        reason: structural
+        text: The flag is private and isn't a tag, so it's left off.
+      prometheus_out:
+        class: lost
+        reason: structural
+        text: The flag is private and isn't a label, so it's left off.
+      influxdb_out:
+        class: lost
+        reason: structural
+        text: The flag is private and isn't a tag, so it's left off.
+      otlp_out:
+        class: lost
+        reason: structural
+        text: The flag is private and isn't an OTLP attribute, so it's left off.
+      datadog_out:
+        class: lost
+        reason: structural
+        text: >-
+          The flag applies to a gauge alone, so on any other kind it's ignored: the point keeps
+          the type its kind gives it, and datadog_in sets no flag.
+      graphite_out:
+        class: lost
+        reason: structural
+        text: >-
+          The flag is private and isn't a tag, so it's left off, under either `tags:` mode.
+  # `_logit.metrics.interval` on a record that takes datadog_out's distribution-points or
+  # sketches route, neither of which has an interval field: a `samples`, `distribution`, or delta
+  # `exponential_histogram` record.
+  - kind: attributes
+    feature: interval_on_distribution
+    cells:
+      statsd_out:
+        class: lost
+        reason: structural
+        text: The flag is private and isn't a tag, so it's left off.
+      prometheus_out:
+        class: lost
+        reason: structural
+        text: The flag is private and isn't a label, so it's left off.
+      influxdb_out:
+        class: lost
+        reason: structural
+        text: The flag is private and isn't a tag, so it's left off.
+      otlp_out:
+        class: lost
+        reason: structural
+        text: The flag is private and isn't an OTLP attribute, so it's left off.
+      datadog_out:
+        class: lost
+        counter: logit.output.tags.omitted{reason=no_wire_form}
+        text: >-
+          The distribution-points and sketches routes have no interval field, so a nonzero
+          interval is left off, counted.
+      graphite_out:
+        class: lost
+        reason: structural
+        text: >-
+          The flag is private and isn't a tag, so it's left off, under either `tags:` mode.
+  # `_logit.metrics.interval` on a delta `histogram`, which datadog_out sends as a sketch under
+  # the default `histograms.mode: distributions` and as series under the other modes.
+  - kind: attributes
+    feature: interval_on_histogram
+    cells:
+      statsd_out:
+        class: lost
+        reason: structural
+        text: The flag is private and isn't a tag, so it's left off.
+      prometheus_out:
+        class: lost
+        reason: structural
+        text: The flag is private and isn't a label, so it's left off.
+      influxdb_out:
+        class: lost
+        reason: structural
+        text: The flag is private and isn't a tag, so it's left off.
+      otlp_out:
+        class: lost
+        reason: structural
+        text: The flag is private and isn't an OTLP attribute, so it's left off.
+      datadog_out:
+        - when: {histograms: {mode: counters, send_aggregation_metrics: true}}
+          class: exact
+          text: >-
+            Under `histograms.mode: counters`, the `interval` of each series the histogram
+            writes, and datadog_in sets the flag again.
+        - when: {histograms: {mode: nobuckets, send_aggregation_metrics: true}}
+          class: exact
+          text: >-
+            Under `histograms.mode: nobuckets`, the `interval` of each series the histogram
+            writes, and datadog_in sets the flag again.
+        - class: lost
+          counter: logit.output.tags.omitted{reason=no_wire_form}
+          text: >-
+            The sketches route has no interval field, so a nonzero interval is left off,
+            counted.
       graphite_out:
         class: lost
         reason: structural
