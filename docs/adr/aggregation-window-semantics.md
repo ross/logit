@@ -1011,7 +1011,10 @@ The two sections' consequences change with it:
 - The pass-through check is one binary search of the event's attributes for each flag, on symbols
   interned once, and the `_logit.field.` scan runs only on a flagged event.
 - To summarize a timestamped point or a stats group anyway, `remove` `_logit.metrics.closed`
-  ahead of `aggregate`. Removing the protocol carrier no longer changes what `aggregate` does.
+  ahead of `aggregate`, and for a DogStatsD point `_logit.statsd.timestamp` too: that carrier
+  would otherwise stay in the series key, one series per source second, and `statsd_out` writes
+  `|T` from it. Removing a carrier alone no longer changes whether `aggregate` passes the event
+  through.
 - A `keep` ahead of `aggregate` strips the flags under its default `private: drop`, as it stripped
   the carriers, so the outcome there is unchanged.
 - A Lua script or a `set` can close an event, or announce a string field, with the same flags.

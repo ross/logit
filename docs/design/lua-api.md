@@ -985,8 +985,9 @@ function process(event)
 end
 ```
 
-A value outside `"bucketed"` and `"timestamped"` still closes the event, and `aggregate` counts it
-`passed_through{reason="flagged"}`, so a script's own text never becomes a telemetry tag.
+Any other string, or `true`, still closes the event, and `aggregate` counts it
+`passed_through{reason="flagged"}`, so a script's own text never becomes a telemetry tag. Any
+other type, `false` included, leaves the event to aggregate.
 
 ## Reading `event.span`
 

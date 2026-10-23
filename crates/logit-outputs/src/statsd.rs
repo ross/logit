@@ -430,7 +430,8 @@
 //! wire seconds `statsd_in` stamps alongside setting `Event::timestamp`) renders as `|T<secs>`
 //! **from the carrier, never from `event.timestamp`**: a stage that rebuilds `Event::timestamp`
 //! after decode (a `timestamp` transform, or a Lua script) can't fabricate or collapse a `|T`.
-//! `aggregate` passes a record carrying it through unmerged, with its own timestamp. A
+//! `aggregate` passes such a record through unmerged, with its own timestamp, on the
+//! `_logit.metrics.closed` flag `statsd_in` sets beside the carrier, not on the carrier. A
 //! `_logit.statsd.timestamp` that isn't a
 //! `Value::U64` (reachable from a cross-protocol relay or Lua, never from `statsd_in`) isn't
 //! emitted.

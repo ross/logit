@@ -1,6 +1,6 @@
 ---
 created: 2026-09-10
-updated: 2026-10-19
+updated: 2026-10-22
 ---
 
 # statsd/DogStatsD egress: dialect, transport, packing, and the v1 metric-kind deferral
