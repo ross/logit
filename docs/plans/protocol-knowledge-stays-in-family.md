@@ -97,7 +97,7 @@ regression test (a `_logit.datadog.type: rate` with no neutral key is a state), 
 
 ## C3: `_logit.prometheus.type` in `otlp_out` and `kafka_out`
 
-**Done** in `carry/w3` (PR #PRNUM), as the remedy below describes. The open design questions
+**Done** in `carry/w3` (PR #841), as the remedy below describes. The open design questions
 were settled: an attribute, `_logit.metrics.type`, not a model field; `prometheus_out` reads it
 too; and no other sink honors it. The section below records the reads as they were.
 
