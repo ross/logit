@@ -116,16 +116,15 @@ delta `Sum` reads in Splunk as a series of samples, not a running total: put `ag
 `splunk_hec_out` has no per-sink `index` or `sourcetype` field. It writes each object's envelope
 from the batch's resource attributes `com.splunk.index`, `com.splunk.source`,
 `com.splunk.sourcetype`, and `host.name`, so stamp them upstream with a `set` component, as
-`splunk-hec-send.yaml` does. An event without them takes the token's defaults in Splunk, except
-`host`: an event with no `host.name` goes out with `logit`'s process hostname
+`splunk-hec-send.yaml` does. An event without them takes the token's defaults in Splunk, except `host`: a batch whose
+resource has no `host.name` goes out with `logit`'s process hostname
 ([deploying.md's "Hostname"](deploying.md#hostname)), so senders relayed through one `logit` with
-no host of their own all show its host. That holds for `collectd_in` and `syslog_in` too: their
-per-event `host.name` doesn't reach the envelope
-([known gap](known-gaps/splunk.md)). An index
-the token isn't allowed to write draws a `400` code 7 naming the object after it; `splunk_hec_out`
-drops the bad object and resends the ones after it (below); keep the `index` you stamp in the token's
-allowed list. Every other
-resource and event attribute goes out as an indexed field in `fields`, flattened to dotted keys.
+no host of their own all show its host. That includes `collectd_in` and `syslog_in`, which carry
+the sender's host as an event `host.name` that `splunk_hec_out` doesn't read
+([known gap](known-gaps/splunk.md)). An index the token isn't allowed to write draws a `400` code 7
+naming the object after it; `splunk_hec_out` drops the bad object and resends the ones after it
+(below); keep the `index` you stamp in the token's allowed list. Every other resource and event
+attribute goes out as an indexed field in `fields`, flattened to dotted keys.
 
 `splunk_hec_in` puts the same four values on the resource, so a relay keeps them.
 

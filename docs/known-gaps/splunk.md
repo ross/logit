@@ -107,7 +107,7 @@ Entry format and the other areas: [the known-gaps index](README.md).
   - **Revisit trigger:** a `Retry-After`-carrying sink that needs it honored, which would give
     `Fault` or `deliver_with_retry` a delay hint every HTTP sink could use.
 - **`splunk_hec_out` writes the envelope `host` from the batch resource only.** It reads the
-  resource's `host.name`, then the process hostname, and ignores an event's `host.name`. A
+  resource's `host.name`, then the process hostname, and doesn't read an event's `host.name` for the envelope `host`. A
   source that learns the sender's host per value list or per line, `collectd_in` and
   `syslog_in`, writes it on the event.
   - **Consequence:** in a `collectd_in -> splunk_hec_out` or `syslog_in -> splunk_hec_out` relay,
@@ -115,9 +115,10 @@ Entry format and the other areas: [the known-gaps index](README.md).
     as an event field in `fields`.
   - **Workaround:** when a pipeline carries one sender, stamp a resource `host.name` with a `set`
     stage.
-  - **Revisit trigger:** a relay that carries several senders into Splunk. The remedy is to group
-    a batch's events by `host.name` and write one envelope per group, as `splunk_hec_in`
-    already decodes one batch per distinct envelope.
+  - **Revisit trigger:** a relay that carries several senders into Splunk. HEC writes the envelope
+    on every object, so the remedy is to write each object's `host` from its event's `host.name`,
+    then the resource's, then the process hostname. `splunk_hec_in` would read that host back
+    onto the resource, one batch per host, a normalization the codec's list would name.
 - **Four `splunk_hec_out` behaviors Vector's HEC sinks have are deferred.** A comparison with
   Vector's `splunk_hec_logs` and `splunk_hec_metrics` sinks on 2026-09-25 found them, and none
   has a user yet:
