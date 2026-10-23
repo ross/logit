@@ -1,6 +1,6 @@
 ---
 created: 2026-09-23
-updated: 2026-10-20
+updated: 2026-10-23
 ---
 
 # Datadog: two lossless pairs, the Agent's own protocols, and a Datadog-mapped `DdSketch`
@@ -110,14 +110,16 @@ Three facts from the survey drive the shape of the decision:
    rejection of hand-rolled protobuf to decoding, and to families without maps.
 
 8. **Attribute vocabulary.** `_logit.datadog.*` for raw encodings (`_logit.datadog.type`,
-   `_logit.datadog.interval`, `_logit.datadog.resources`, `_logit.datadog.source_type_name`,
+   `_logit.datadog.resources`, `_logit.datadog.source_type_name`,
    `_logit.datadog.origin.*`, `_logit.datadog.chunk.*`, `_logit.datadog.tracer.*`,
    `_logit.datadog.agent.*`, `_logit.datadog.stats.*`); Datadog's own OTLP-honored names for span
    fields (`service.name`, `resource.name`, `span.type`); `meta`/`metrics` keys verbatim;
    `_logit.statsd.event.*`/`_logit.statsd.service_check.*` for events and service checks, which
-   are the same Datadog concepts DogStatsD carries. A Datadog `rate` is a `Gauge` with
-   `_logit.datadog.type: rate`, not a `Sum`, because folding a per-second value into a delta
-   multiplies and rounds.
+   are the same Datadog concepts DogStatsD carries; the neutral metric flags
+   `_logit.metrics.type` and `_logit.metrics.interval` for a rate and a series interval. A Datadog
+   `rate` is a `Gauge` flagged `_logit.metrics.type: rate`, not a `Sum`, because folding a
+   per-second value into a delta multiplies and rounds. `_logit.datadog.type` carries only
+   `unspecified`, the one series type with no neutral meaning (the 2026-10-23 amendment below).
 
 9. **Trace ids** are built from a uint64 and `_dd.p.tid` on decode, and emitted as the low 64
    bits plus `_dd.p.tid` when the high bits are nonzero.
@@ -626,3 +628,35 @@ monotonicity as a `count`, a cumulative non-monotonic `Sum` as a `gauge`, a delt
 A cumulative kind the exporter would difference is counted, skipped until the transform exists
 and then dropped, and left to the `cumulative_to_delta` transform ([ADR `cumulative-to-delta-transform`](cumulative-to-delta-transform.md)),
 so decision 10's rule that `datadog_out` derives everything from the batch stands.
+
+## Amendment: the rate and the interval are neutral flags (2026-10-23)
+
+[ADR `protocol-knowledge-stays-in-family`](protocol-knowledge-stays-in-family.md)'s "Amendment:
+move, don't mirror (2026-10-23)" retires two of the series carriers for neutral metric flags
+([ADR `metric-flags`](metric-flags.md)'s "The flags"):
+
+- **A `rate` point** decodes as a `Gauge` flagged `_logit.metrics.type: rate`, with no
+  `_logit.datadog.type` beside it. `_logit.datadog.type` keeps only `unspecified`.
+- **A nonzero `interval`**, on a series of any type, decodes as `_logit.metrics.interval` (`I64`
+  seconds). `_logit.datadog.interval` is retired.
+
+`datadog_out` reads the flags: a `Gauge` flagged `rate`, on the event or the batch resource,
+leaves as a `rate` series point, and `_logit.metrics.interval` as the series `interval` of any
+type. A `rate` flag on any other kind is ignored. A `_logit.datadog.type: rate` or a
+`_logit.datadog.interval` from before this amendment, in a spool, a replayed file, or a `set`,
+says nothing to it: the point leaves as a `gauge` with no interval, and the `rate` value counts
+`logit.output.tags.omitted{reason="unrepresentable"}`, as any carrier value it can't read does.
+
+Two things follow:
+
+- **A rate from any producer reaches Datadog as a `rate`.** A Lua script or a `set` that flags a
+  `Gauge` `_logit.metrics.type: rate` gets a Datadog `rate` with no Datadog vocabulary, and the
+  same flag makes `dedup_timestamps` sum it and `prometheus_out` count a same-millisecond pair as
+  loss ([ADR `dedup-timestamps-transform`](dedup-timestamps-transform.md)'s 2026-10-23
+  amendment).
+- **An operator stamps a window with the neutral key.** `fixtures/datadog-direct.yaml` and the
+  Datadog soak scenarios stamp `_logit.metrics.interval` after `aggregate`, where the 2026-10-13
+  amendment's example stamped `_logit.datadog.interval`.
+
+A tag still can't spell either flag: a series tag under `_logit.` is omitted and counted, so a
+`_logit.metrics.type:rate` tag never turns a `GAUGE` into a `RATE`.

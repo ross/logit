@@ -134,7 +134,7 @@ private, which stay public, and why. The prefix has one definition,
   retains the whole namespace. **`flatten`'s `all`** never selects a private key; a named one still
   flattens. **`aggregate`** keys series on private keys like any attribute. `remove`, `route`,
   `has_attributes`, `drop_attributes`, `set`, and Lua name private keys explicitly, so a private
-  key may appear in operator config (`set` stamping `_logit.datadog.interval`).
+  key may appear in operator config (`set` stamping `_logit.metrics.interval`).
 - **The five tag-bearing metric wires refuse the prefix.** DogStatsD `|#` tags, Datadog intake
   tags (series, sketches, events, service checks), InfluxDB tags, Prometheus remote-write labels,
   and carbon `;k=v` tags drop a key under `_logit.` and count it as
@@ -165,6 +165,8 @@ else its batch resource. Their values, producers, and readers are
 |---|---|---|
 | `_logit.metrics.closed` | `Value::Str`, or `Value::Bool(true)` | Every metric record on the event summarizes a time span its source closed, so `aggregate` forwards the event whole. The value `timestamped` also says the event's timestamp is its source's own: `statsd_out` writes it as `\|T` (`d:` on an event or a service check) and `prometheus_out` as a sample timestamp, whichever decoder set the flag. `statsd_in` sets it for a `\|T` or `d:`, and `prometheus_in`'s scrape for a sample with its own timestamp; neither writes a protocol carrier beside it ([ADR `protocol-knowledge-stays-in-family`](../adr/protocol-knowledge-stays-in-family.md), "Amendment: move, don't mirror (2026-10-23)"). |
 | `_logit.metrics.fields` | `Value::Bool(true)` | The event carries `_logit.field.*` keys, which `aggregate` scans for and leaves out of a series key. |
+| `_logit.metrics.type` | `Value::Str`; the one value is `rate` | Every `Gauge` record on the event holds a per-second rate over `_logit.metrics.interval` seconds, an increment rather than a state: `dedup_timestamps` sums two of one interval, `prometheus_out` counts a same-millisecond pair `dropped`, and `datadog_out` writes a `rate` series point. Ignored on any other kind, and a value with no rule is ignored. `datadog_in` sets it for a `rate` series point, with no Datadog carrier beside it. |
+| `_logit.metrics.interval` | `Value::I64`, whole seconds, only when nonzero | The span the event's readings cover: a rate's divisor, a delta count's window. `datadog_in` sets it from a series' `interval`; `datadog_out` writes it as the series `interval`, so a `set` after `aggregate` stamps the window there. |
 
 A key under [ADR `lossless-transit`](../adr/lossless-transit.md)'s rule (c), such as
 `logit.body_format`, is the opposite case: public, and meant to cross a foreign wire.

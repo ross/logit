@@ -57,7 +57,9 @@ protocol carriers stay where they are, because each protocol's own sink still re
 where a carrier only repeated a flag: [ADR
 `protocol-knowledge-stays-in-family`](protocol-knowledge-stays-in-family.md)'s "Amendment: move,
 don't mirror (2026-10-23)" retired `_logit.statsd.timestamp` and `_logit.prometheus.timestamp`,
-and `statsd_out` and `prometheus_out` read the flag instead.
+and `statsd_out` and `prometheus_out` read the flag instead. The same amendment's next
+applications retired `_logit.datadog.interval` and the `rate` value of `_logit.datadog.type` for
+`_logit.metrics.interval` and `_logit.metrics.type`, which `datadog_out` reads instead.
 
 ### The flags
 
@@ -65,6 +67,8 @@ and `statsd_out` and `prometheus_out` read the flag instead.
 |---|---|---|---|---|
 | `_logit.metrics.closed` | `Str`, one of `bucketed` or `timestamped` | Every metric record on this event summarizes a time span its source closed. Forward the event whole, unmerged, with its timestamp and attributes intact, and count each record `logit.transform.metrics.passed_through{reason=<value>}`. Any other `Str`, or a `Bool(true)`, means the same and counts `reason="flagged"`, so a script can't put free text into a telemetry tag. | `datadog_in` and `datadog_trace_in` on each APM stats group event (`bucketed`); `statsd_in` on a `\|T` line or an event's or service check's `d:` field, and `prometheus_in`'s scrape on an exposition sample with its own timestamp (`timestamped`); Lua or `set` | `aggregate`; `statsd_out` and `prometheus_out`, which write `Event::timestamp` as a `\|T`, a `d:`, or a sample timestamp for the value `timestamped` only |
 | `_logit.metrics.fields` | `Bool(true)` | This event carries attributes under `_logit.field.`. The reader scans for them only when this flag is set, and `aggregate` leaves the flag itself out of the series key and the flushed series too, so readings of one series with and without a string field stay one series. | `influxdb_in` and `line_protocol` on an event with at least one string field; Lua or `set` when they add one | `aggregate` |
+| `_logit.metrics.type` | `Str`; the one value is `rate` | Every `Gauge` record on this event holds a per-second rate computed over `_logit.metrics.interval` seconds: an increment over that interval, not a state. A stage that collapses same-instant readings of one series sums two rates with equal intervals rather than keeping one. The flag applies to `Gauge` records only; on any other kind it's ignored. A reader ignores a value it has no rule for. | `datadog_in` on a `rate` series point; Lua or `set` | `dedup_timestamps`, which sums rates of one interval; `prometheus_out`, which counts a same-millisecond rate collision `dropped` rather than collapsing it as an equal state; `datadog_out`, which writes a flagged `Gauge` as a `rate` series point |
+| `_logit.metrics.interval` | `I64`, whole seconds; written only when nonzero | The span the event's readings cover: a rate's divisor, a delta count's window. Seconds, Datadog's unit, because Datadog's series `interval` is the one wire that carries it. | `datadog_in` on a series point with a nonzero `interval`, of any type; Lua or `set`, such as a `set` after `aggregate` stamping its window | `dedup_timestamps`, which sums two rates only when their intervals are equal; `datadog_out`, which writes it as the series `interval` of any type |
 | `_logit.field.<key>` | any `Value` | Data about the point, never series identity. `aggregate` leaves it out of the series key and out of the flushed series; a record that passes through keeps it. `influxdb_out` writes a `Str` under it as the string field `<key>`, and skips a non-`Str` value under it uncounted, since a non-`Str` isn't a string field. Replaces `_logit.influxdb.field.<key>`. | `influxdb_in` and `line_protocol` for each string field; Lua or `set` | `aggregate`, `influxdb_out` |
 
 A flag is read as every private carrier is read: the event's value, else the batch resource's

@@ -94,12 +94,8 @@ crosses a family.
 
 ## Consequences
 
-- **Four cross-family reads are recorded debt**, each with a remedy in
+- **Two cross-family reads are recorded debt**, each with a remedy in
   [the in-family plan](../plans/protocol-knowledge-stays-in-family.md):
-  - C1: `dedup_timestamps` sums a `Gauge` carrying `_logit.datadog.type: rate` as an increment
-    ([ADR `dedup-timestamps-transform`](dedup-timestamps-transform.md)'s "Which reading survives").
-  - C2: `prometheus_out` counts a same-millisecond Datadog rate as an increment
-    (the same ADR's "The sink-side counter").
   - C3: `otlp_out`, and `kafka_out`'s OTLP formats through the same encoder, read
     `_logit.prometheus.type` to skip a `gaugehistogram` and to write `info` and `stateset` as a
     non-monotonic `Sum`
@@ -109,7 +105,9 @@ crosses a family.
     ([ADR `process-hostname`](process-hostname.md)'s "Amendment: `datadog_out` reads
     `collectd.host` (2026-10-22)").
 
-  `docs/known-gaps/runtime.md` lists them as one gap until the plan closes them.
+  `docs/known-gaps/runtime.md` lists them as one gap until the plan closes them. C1 and C2, the
+  Datadog rate carrier `dedup_timestamps` and `prometheus_out` read, are closed: both read the
+  neutral rate flag ("Amendment: move, don't mirror (2026-10-23)"'s "The next applications").
 - **Four reads are in family and allowed:** C4, `statsd_out` writing an empty DogStatsD `host:` tag
   for `_logit.datadog.hostless`; C5, `datadog_out` and `statsd_out` reading the
   `_logit.statsd.event.*` and `_logit.statsd.service_check.*` carriers `statsd_in` and
@@ -172,9 +170,23 @@ timestamp now leaves `statsd_out` with a `|T`, and a `statsd_in` `|T` line now l
 protocol's carrier. Both are the same fact on two wires, which is what a neutral flag is for. The
 transit spec's `attributes/timestamped` row in `spec/transit/mapping.yaml` states it per sink.
 
-### The next applications
+### The next applications: the Datadog rate and interval carriers
 
 [The in-family plan](../plans/protocol-knowledge-stays-in-family.md)'s C1 and C2 remedy takes the
-same form: `datadog_in` writes the neutral `_logit.metrics.type: rate` and
-`_logit.metrics.interval` instead of mirroring them, and `_logit.datadog.type` keeps only
-`unspecified`, the one value with no neutral meaning.
+same form, and closes both reads. `datadog_in` writes the neutral `_logit.metrics.type: rate` and
+`_logit.metrics.interval` instead of `_logit.datadog.type: rate` and `_logit.datadog.interval`,
+and `_logit.datadog.type` keeps only `unspecified`, the one value with no neutral meaning
+([ADR `metric-flags`](metric-flags.md)'s "The flags" defines both keys).
+
+- **`dedup_timestamps` and `prometheus_out`** read the flags through `logit_core::attrs::is_rate`
+  and `logit_core::attrs::interval` and import nothing from `logit_proto::datadog`
+  ([ADR `dedup-timestamps-transform`](dedup-timestamps-transform.md)'s "Amendment: a rate is a
+  neutral flag (2026-10-23)").
+- **`datadog_out`** reads the flags too: a `Gauge` flagged `rate` leaves as a `rate`, and
+  `_logit.metrics.interval` as the series `interval` of any type. A rate a Lua script or a `set`
+  flags therefore reaches Datadog as a `rate`, which is the creator-decides rule working, not a
+  leak ([ADR `datadog-agent-and-intake-relay`](datadog-agent-and-intake-relay.md)'s "Amendment:
+  the rate and the interval are neutral flags (2026-10-23)").
+- **A retired carrier says nothing.** A `Gauge` carrying only `_logit.datadog.type: rate` and
+  `_logit.datadog.interval` is a state at `dedup_timestamps` and `prometheus_out`, and leaves
+  `datadog_out` as a `gauge` with no interval.

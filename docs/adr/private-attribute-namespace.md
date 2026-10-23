@@ -134,7 +134,7 @@ reading a private key is in-family (2026-10-23)").
 - `aggregate` keys series on private keys unchanged, as on any attribute.
 - `remove`, `route`, `has_attributes`, `drop_attributes`, `set`, and Lua name private keys
   explicitly, with no prefix matching. A private key may therefore appear in operator config:
-  `set` stamping `_logit.datadog.interval`, or a `route` on `_logit.influxdb.bucket`.
+  `set` stamping `_logit.metrics.interval`, or a `route` on `_logit.influxdb.bucket`.
 
 ### The inbound guard
 
@@ -219,7 +219,7 @@ a key under it isn't a carrier of any protocol. The prefix has one definition,
 `_logit.metrics.` joins `_logit.field.` as a segment that names the signal a key describes rather
 than a protocol. Its keys are flags: the component that creates an event sets one, and a reader
 such as `aggregate` acts on it instead of on a protocol carrier. `_logit.metrics.closed` and
-`_logit.metrics.fields` are the two today; their values and readers are
+`_logit.metrics.fields` were the first two; every flag's values and readers are
 [ADR `metric-flags`](metric-flags.md)'s "The flags". The ignore rule covers them like any private
 key, so no protocol sink renders a flag, and `keep` under its default `private: drop` strips them.
 The constants live in `logit_core::attrs` beside `PRIVATE_PREFIX` and `FIELD_PREFIX`.

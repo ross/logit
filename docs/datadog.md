@@ -115,6 +115,18 @@ Sending directly needs no Agent: it's one hop, and it works wherever HTTPS does.
   and Datadog's OTLP mapping loses parts of a Datadog span
   ([the ADR's "Context"](adr/datadog-agent-and-intake-relay.md#context)).
 
+### A series' `rate` type and `interval`
+
+`datadog_out` has no field for either. A `Gauge` whose event or batch resource sets
+`_logit.metrics.type: rate` leaves as a Datadog `rate`, and `_logit.metrics.interval`, in whole
+seconds, leaves as the `interval` of a series of any type. `datadog_in` sets both from what it
+receives, so a relayed `rate` stays a `rate`. For the `count` points an `aggregate` window
+produces, stamp the window's length with a `set` after it, as
+[fixtures/datadog-direct.yaml](../fixtures/datadog-direct.yaml) does. A Lua script that computes a
+per-second rate sets both keys to send a `rate`; the same flag makes `dedup_timestamps` sum two
+rates of one interval instead of keeping the later
+([ADR `metric-flags`](adr/metric-flags.md)'s "The flags").
+
 ### OTel metrics to Datadog: `otlp_in` into `datadog_out`
 
 An OpenTelemetry SDK or Collector can send its metrics to `otlp_in`, and `datadog_out` writes

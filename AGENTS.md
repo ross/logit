@@ -311,12 +311,13 @@ and codecs carry for them:
   [docs/design/data-model.md](docs/design/data-model.md)'s "Well-known attribute names" is the
   canonical statement). A decoder that needs another component to treat an event specially sets a
   `_logit.metrics.*` flag ([ADR `metric-flags`](docs/adr/metric-flags.md)): in place of a carrier
-  when the flag says the whole fact, as `statsd_in`'s and `prometheus_in`'s timestamps do, and
+  when the flag says the whole fact, as `statsd_in`'s and `prometheus_in`'s timestamps and
+  `datadog_in`'s rate and interval do, and
   beside one only for a fact the flag doesn't carry
   ([ADR `protocol-knowledge-stays-in-family`](docs/adr/protocol-knowledge-stays-in-family.md)'s
   "Amendment: move, don't mirror (2026-10-23)"). A component outside a carrier's family doesn't
-  act on the carrier itself, apart from the four cross-family reads (C1 to C3 and C6) that ADR
-  records as debt.
+  act on the carrier itself, apart from the two cross-family reads (C3 and C6) that ADR records
+  as debt.
 - **Model v2**: `Sum`/`Samples`/`SetMembers`/`ExponentialHistogram`, `SpanExt`, batch-level
   `Scope`, `MetricRecord.flags`.
 - **OTLP**: scope grouping, start time, description, exemplars, a `NO_RECORDED_VALUE` point
@@ -325,8 +326,9 @@ and codecs carry for them:
 - **syslog**: structured data as `syslog.sd`, timestamp precedence, bytes MSG, and opt-in
   structured-data emission.
 - **statsd**: raw timers/sets, `|c:`/`|e:`/`|card:`/`|T`, and events/service checks.
-- **Datadog**: `_logit.datadog.*` carriers for every raw field without a typed home (a `rate`'s
-  type, a count's interval, resources, origin, trace chunk, tracer, and Agent fields), `DdSketch`
+- **Datadog**: `_logit.datadog.*` carriers for every raw field without a typed home (an
+  `unspecified` type, resources, origin, trace chunk, tracer, and Agent fields), a `rate` and a
+  series interval as the neutral `_logit.metrics.type` and `_logit.metrics.interval`, `DdSketch`
   under `Mapping::agent` for the Agent's metrics sketches and `Mapping::logarithmic` for APM stats
   sketches, 128-bit trace ids through `_dd.p.tid`, and APM stats as metric events.
 - **Splunk**: the OTel `splunk_hec` exporter's vocabulary (`com.splunk.*` and `host.name` on the
@@ -1148,7 +1150,7 @@ not a style preference:
   `buffer.disk:` spool). Everything else reads neutral `_logit.metrics.` and `_logit.field.` flags
   its creator set, public vocabulary, or its own config (provenance ids included); an exception needs
   its own ADR ([ADR `protocol-knowledge-stays-in-family`](docs/adr/protocol-knowledge-stays-in-family.md),
-  whose plan lists the four reads that break it today).
+  whose plan lists the two reads that break it today).
 - **The wire encoding is decided: hand-rolled, shipped as `logit_proto::native`** — a four-arm
   bake-off (`crates/logit-bench/src/bakeoff/`) settled it against `rkyv`, `postcard`, and OTLP
   itself; see [ADR `native-wire-format-encoding`](docs/adr/native-wire-format-encoding.md) and

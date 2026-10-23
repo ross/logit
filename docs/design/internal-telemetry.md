@@ -1655,9 +1655,9 @@ here is loss: a passed-through record reaches the sink, which counts it if it dr
 
 | Name | Kind | Meaning |
 |---|---|---|
-| `logit.transform.metrics.merged` | count | a reading added or combined into the surviving one: a delta `Sum`, a Datadog `rate` (a `Gauge` carrying `_logit.datadog.type: rate`) of the survivor's interval, a delta `Histogram` or `ExponentialHistogram` with the survivor's layout, `Samples` at its rate, `SetMembers`, a `Distribution` (re-binned when its mapping differs), or a `Set` |
-| `logit.transform.metrics.absorbed` | count | a reading superseded by a later one under last write wins: a `Gauge` other than a Datadog `rate`, or a cumulative kind, a `NO_RECORDED_VALUE` marker on one included. Narrower than `aggregate`'s `absorbed`: the survivor isn't counted |
-| `logit.transform.metrics.passed_through{reason="non_finite"\|"overflow"\|"mixed_type"\|"layout_mismatch"\|"no_merge_rule"\|"no_recorded_value"}` | count | a colliding record forwarded untouched beside the survivor: a `NaN` or infinite increment, a total past its type's range, a value type other than the survivor's (`I64` beside `F64`, `U64` beside `I64`), other histogram bounds or sample rate, a Datadog `rate` of another interval or beside a gauge that isn't one, a `GaugeDelta`, a delta `Summary`, or a delta `Sum` or a Datadog rate of `Bool`s, or a marker beside delta values. When no record of a set can merge, every one but the first counts |
+| `logit.transform.metrics.merged` | count | a reading added or combined into the surviving one: a delta `Sum`, a rate (a `Gauge` flagged `_logit.metrics.type: rate`, such as a Datadog `rate`) of the survivor's interval, a delta `Histogram` or `ExponentialHistogram` with the survivor's layout, `Samples` at its rate, `SetMembers`, a `Distribution` (re-binned when its mapping differs), or a `Set` |
+| `logit.transform.metrics.absorbed` | count | a reading superseded by a later one under last write wins: a `Gauge` other than a rate, or a cumulative kind, a `NO_RECORDED_VALUE` marker on one included. Narrower than `aggregate`'s `absorbed`: the survivor isn't counted |
+| `logit.transform.metrics.passed_through{reason="non_finite"\|"overflow"\|"mixed_type"\|"layout_mismatch"\|"no_merge_rule"\|"no_recorded_value"}` | count | a colliding record forwarded untouched beside the survivor: a `NaN` or infinite increment, a total past its type's range, a value type other than the survivor's (`I64` beside `F64`, `U64` beside `I64`), other histogram bounds or sample rate, a rate of another interval or beside a gauge that isn't one, a `GaugeDelta`, a delta `Summary`, or a delta `Sum` or a Datadog rate of `Bool`s, or a marker beside delta values. When no record of a set can merge, every one but the first counts |
 
 An event left with no metric, log, or span counts `logit.component.events.discarded`. No
 `Diagnostics` keys.
@@ -2604,8 +2604,8 @@ Some reasons exist only on one path:
   a later reading shares a millisecond with, at the same nanosecond or another, once per reading
   (a histogram reading counts once, not once per wire sample), with a throttled
   `duplicate_timestamp` diagnostic naming `dedup_timestamps` (`precision: 1ms`), or `aggregate`
-  for a live delta flow. The later reading is sent. A removed state (a gauge other than a
-  Datadog `rate`, or a cumulative kind) equal to the one sent (the point, each `f64` by its bits,
+  for a live delta flow. The later reading is sent. A removed state (a gauge not flagged
+  `_logit.metrics.type: rate`, or a cumulative kind) equal to the one sent (the point, each `f64` by its bits,
   the created timestamp, and the exemplars) loses nothing, and counts
   `normalized{reason="duplicate_timestamp"}` instead, with no diagnostic. A `samples` or
   distribution summary, a set's size gauge, or a `rate` stays `dropped` when equal: two equal

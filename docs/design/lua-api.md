@@ -964,7 +964,7 @@ above). `trace_flags` is `nil` exactly when
 `trace_id` is, the same rule `event.log.trace_flags` follows. Lua can't add, remove, or mutate an
 individual exemplar in place, only read the whole list or rebuild the record with `Event.new`.
 
-### Flagging an event for `aggregate`
+### Flagging an event
 
 `aggregate` acts on two private attributes a script can set like any other, never on a protocol's
 carriers. To have `aggregate` forward an event's metrics whole, with their timestamp, set
@@ -988,6 +988,21 @@ end
 Any other string, or `true`, still closes the event, and `aggregate` counts it
 `passed_through{reason="flagged"}`, so a script's own text never becomes a telemetry tag. Any
 other type, `false` included, leaves the event to aggregate.
+
+A gauge that holds a per-second rate over an interval is an increment, not a state. To say so, set
+`_logit.metrics.type` to `"rate"` and `_logit.metrics.interval` to the interval in whole seconds:
+`dedup_timestamps` then sums two same-instant rates of one interval instead of keeping the later,
+`prometheus_out` counts a same-millisecond pair as loss, and `datadog_out` sends a `rate` series
+point with that `interval`. The flag applies to gauges only.
+
+```lua
+function process(event)
+  -- Requests per second, averaged over the last 10 s.
+  event.attributes["_logit.metrics.type"] = "rate"
+  event.attributes["_logit.metrics.interval"] = 10
+  return event
+end
+```
 
 ## Reading `event.span`
 

@@ -10,8 +10,8 @@ updated: 2026-10-23
 [ADR `protocol-knowledge-stays-in-family`](../adr/protocol-knowledge-stays-in-family.md) decides
 that a component keys behavior on another component's internals only within a lossless family.
 Outside one, it reads neutral meaning segments, public vocabulary, or its own config. Four
-production reads break that rule today. This plan lists each one with its remedy, so a later
-session can pick one up without redoing the survey.
+production reads broke that rule when the ADR landed. This plan lists each one with its remedy, so
+a later session can pick one up without redoing the survey. C1 and C2 are done; C3 and C6 remain.
 
 None of this is scheduled. Each section is a future workstream with its own stream key, picked
 when the work starts.
@@ -38,7 +38,10 @@ what its own config names, a component id in `has_provenance`, `drop_provenance`
 
 ## C1 and C2: the Datadog rate carrier in `dedup_timestamps` and `prometheus_out`
 
-**Future workstream, not scheduled.**
+**Done** in `carry/w2` (PR #PRNUM), as the remedy below describes. The open design questions
+were settled for Datadog's form: `_logit.metrics.interval` is an `I64` of whole seconds, and a
+rate stays a flagged `Gauge`, not a model kind. The section below records the reads as they
+were.
 
 **What reads what.** `datadog_in` decodes a Datadog `rate` as a `Gauge` with
 `_logit.datadog.type: rate` and its interval as `_logit.datadog.interval`
