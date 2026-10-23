@@ -959,7 +959,7 @@ rows:
         reason: inf_bucket
         text: >-
           A `histogram` family of running-sum buckets and `_sum` when it has one, or a
-          `gaugehistogram` under the type carrier. `+Inf` states the total, so a histogram whose
+          `gaugehistogram` under the type flag. `+Inf` states the total, so a histogram whose
           last bound is finite reads back with an empty `+Inf` bucket. `min` and `max` are
           `record/min_max`'s.
       datadog_out:
