@@ -14,7 +14,6 @@
 //! graph rule runs (a syslog `sd_id`), so those fail only at `run`.
 
 use crate::admin::AdminListener;
-use crate::config;
 use crate::signals::Signals;
 use anyhow::Context;
 use logit_config::{BufferConfig, Config, StdioTarget};
@@ -122,11 +121,12 @@ fn severity_for_logs(logs: logit_config::InternalLogs) -> Option<logit_core::Sev
     }
 }
 
-/// Loads `path`, resolves its component graph, and runs it until the first component fails or a
+/// Resolves `config`'s component graph (loaded from `path`, which only locates relative files and
+/// names the config in the `starting` log), and runs it until the first component fails or a
 /// shutdown signal is received.
 ///
-/// On Unix the signal handlers ([`Signals::install`]) go in before the config loads, so a signal
-/// during startup is handled, not defaulted. SIGTERM/SIGINT (Ctrl-C on non-Unix) starts a
+/// On Unix the signal handlers ([`Signals::install_detached`]) go in before `main` loads the
+/// config, so a signal during startup is handled, not defaulted. SIGTERM/SIGINT (Ctrl-C on non-Unix) starts a
 /// graceful drain, after `shutdown.delay` when set: every listener stops, closing its downstream
 /// inboxes and triggering each node's close-time flush, so an in-flight `aggregate` window is
 /// emitted rather than lost. A second SIGTERM/SIGINT before the drain finishes exits at once with
@@ -146,11 +146,10 @@ fn severity_for_logs(logs: logit_config::InternalLogs) -> Option<logit_core::Sev
 /// once the config's `internal` component is known.
 pub async fn run_pipelines(
     path: PathBuf,
+    config: Config,
+    signals: Signals,
     telemetry_layer: logit_core::TelemetryLayer,
 ) -> Result<(), RunError> {
-    let signals = Signals::install();
-    let config = config::load(&path).map_err(RunError::Startup)?;
-
     // `starting`/`exiting` are stable lifecycle event names for log-based alerting
     // (`docs/deploying.md`'s "Self-logging"). Logged before `prepare`, which can still reject the
     // config, so a config that fails resolution still leaves a `starting` line.
