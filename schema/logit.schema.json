@@ -1520,7 +1520,7 @@
           "additionalProperties": false
         },
         {
-          "description": "The windowed aggregator (counters, gauges, sets, distributions). Flushes every `interval`; `0s` is rejected.\n\nA series is a metric's name, unit, and attributes. InfluxDB string fields are the exception: they don't split a series, and an aggregated series doesn't carry them.\n\nA metric that carries its own source timestamp, a DogStatsD `|T` line or a Prometheus exposition sample with a timestamp, passes through unaggregated and keeps that timestamp. So does a Datadog APM stats group, which already summarizes its own time bucket, and a counter increment, gauge, or gauge adjustment whose value is NaN or infinite. None is dropped.",
+          "description": "The windowed aggregator (counters, gauges, sets, distributions). Flushes every `interval`; `0s` is rejected.\n\nA series is a metric's name, unit, and attributes. InfluxDB string fields are the exception: they don't split a series, and an aggregated series doesn't carry them.\n\nA metric that carries its own source timestamp, a DogStatsD `|T` line or a Prometheus exposition sample with a timestamp, passes through unaggregated and keeps that timestamp. So does a Datadog APM stats group, which already summarizes its own time bucket, and a counter increment, gauge, or gauge adjustment whose value is NaN or infinite. None is dropped. A `lua` or `set` stage can ask for the same pass-through for any event by setting the attribute `_logit.metrics.closed`, and removing it from a decoded event lets that event aggregate.",
           "type": "object",
           "required": [
             "interval",

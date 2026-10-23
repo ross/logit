@@ -124,18 +124,20 @@ Entry format and the other areas: [the known-gaps index](README.md).
 - **`aggregate` doesn't summarize a point that carries its own source time.** A DogStatsD `|T`
   line or a Prometheus sample with a timestamp passes through unmerged
   (`passed_through{reason="timestamped"}`), as the Datadog Agent does, because a wall-clock window
-  would replace that time with the flush time. Points from a wire where every point has a time
-  (OTLP, InfluxDB, Graphite, collectd, Datadog series, Prometheus remote-write) carry no marker,
-  so they merge and take the flush time.
+  would replace that time with the flush time. The input that decodes such a point flags it
+  `_logit.metrics.closed` ([ADR `metric-flags`](../adr/metric-flags.md)). Points from a wire where
+  every point has a time (OTLP, InfluxDB, Graphite, collectd, Datadog series, Prometheus
+  remote-write) carry no flag, so they merge and take the flush time.
   - **Workaround:** to summarize a timestamped point anyway, `remove` its
-    `_logit.statsd.timestamp` or `_logit.prometheus.timestamp` attribute ahead of `aggregate`. To
+    `_logit.metrics.closed` attribute ahead of `aggregate`. To
     keep source timestamps and still leave one point per series per instant, as remote-write and
     `datadog_out` need, use `dedup_timestamps` in place of `aggregate`
     ([ADR `dedup-timestamps-transform`](../adr/dedup-timestamps-transform.md)).
 - **A `keep` ahead of `aggregate` turns Datadog APM stats into ordinary metrics.** `aggregate`
-  passes a stats group through whole (`passed_through{reason="bucketed"}`), detected by its
-  `_logit.datadog.stats.name` marker. `keep` drops `_logit.*` attributes unless `private: keep`
-  is set, so the marker goes, the groups merge across buckets, and no stats route sends them.
+  passes a stats group through whole (`passed_through{reason="bucketed"}`), because `datadog_in`
+  and `datadog_trace_in` flag it `_logit.metrics.closed`. `keep` drops `_logit.*` attributes unless
+  `private: keep` is set, so the flag goes, the groups merge across buckets, and no stats route
+  sends them.
   - **Workaround:** set `private: keep` on that `keep`.
 - **Nothing bounds how many series one window holds.** `max_retained_series` caps only what
   survives a flush. Within a window every distinct `(name, unit, attribute set)` opens a series,

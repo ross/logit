@@ -174,7 +174,10 @@ Details an agent needs beyond the table:
   "Temporality is `aggregate`'s job" section and the
   [ADR `aggregation-window-semantics`](docs/adr/aggregation-window-semantics.md) cumulative
   amendment. Its raw-retention modes keep exact values, with a real HyperLogLog backing
-  `sets: estimate` and the overflow fallback.
+  `sets: estimate` and the overflow fallback. It reads two flags and no protocol carrier: an
+  event flagged `_logit.metrics.closed` passes through whole, and `_logit.field.*` keys leave the
+  series key only on an event flagged `_logit.metrics.fields`. The decoder that stamps a carrier
+  sets the flag beside it ([ADR `metric-flags`](docs/adr/metric-flags.md)).
 - **`lua`**: `Event.new(t)` makes every payload constructible from Lua as the inverse of
   `event:to_table()`, with `flush(now)` supplying a flush-driven emission's timestamp. The Lua
   surface covers `event.metrics`, `event.span`, `scope`, and the log/resource fields. See
@@ -186,7 +189,9 @@ Details an agent needs beyond the table:
   A component's `vars:` map is the script's `vars` global, plain tables built into each VM before
   its source runs, so a copied example script stays unedited while each deployment sets its
   values in config; `logit validate` rejects a `null` or an integer past 2^53 anywhere in it
-  ([ADR `lua-script-vars`](docs/adr/lua-script-vars.md)).
+  ([ADR `lua-script-vars`](docs/adr/lua-script-vars.md)). A script sets the `_logit.metrics.*`
+  flags to steer `aggregate` as a decoder does (`docs/design/lua-api.md`'s "Flagging an event
+  for `aggregate`").
 - **`cumulative_to_delta`** takes each point through the ADR's six rules in order: a first
   point (`initial_value: auto | keep | drop`), a resent or overtaken point (skipped), a reset (a
   decrease, or a start moved past the previous point, emitted whole), a layout change (dropped),
@@ -300,7 +305,9 @@ and codecs carry for them:
   and every other protocol sink ignores them, uncounted, when it renders attributes
   ([ADR `private-attribute-namespace`](docs/adr/private-attribute-namespace.md);
   [docs/design/data-model.md](docs/design/data-model.md)'s "Well-known attribute names" is the
-  canonical statement).
+  canonical statement). A shared transform never reads another protocol's carrier: a decoder
+  that needs `aggregate` to treat an event specially sets a `_logit.metrics.*` flag beside the
+  carrier ([ADR `metric-flags`](docs/adr/metric-flags.md)).
 - **Model v2**: `Sum`/`Samples`/`SetMembers`/`ExponentialHistogram`, `SpanExt`, batch-level
   `Scope`, `MetricRecord.flags`.
 - **OTLP**: scope grouping, start time, description, exemplars, a `NO_RECORDED_VALUE` point

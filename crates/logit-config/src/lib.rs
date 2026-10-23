@@ -2677,7 +2677,9 @@ pub enum ComponentKind {
     /// exposition sample with a timestamp, passes through unaggregated and keeps that timestamp.
     /// So does a Datadog APM stats group, which already summarizes its own time bucket, and a
     /// counter increment, gauge, or gauge adjustment whose value is NaN or infinite.
-    /// None is dropped.
+    /// None is dropped. A `lua` or `set` stage can ask for the same pass-through for any event by
+    /// setting the attribute `_logit.metrics.closed`, and removing it from a decoded event lets
+    /// that event aggregate.
     Aggregate {
         #[serde(with = "humantime_serde_duration")]
         #[schemars(with = "String")]

@@ -211,3 +211,13 @@ a key under it isn't a carrier of any protocol. The prefix has one definition,
 `logit_core::attrs::FIELD_PREFIX`, tested by `logit_core::attrs::is_field`. See
 [ADR `metric-flags`](metric-flags.md) and
 [ADR `influxdb-line-protocol-relay`](influxdb-line-protocol-relay.md)'s 2026-10-22 amendment.
+
+## Amendment: the `_logit.metrics.` flag segment (2026-10-22)
+
+`_logit.metrics.` joins `_logit.field.` as a segment that names the signal a key describes rather
+than a protocol. Its keys are flags: the component that creates an event sets one, and a reader
+such as `aggregate` acts on it instead of on a protocol carrier. `_logit.metrics.closed` and
+`_logit.metrics.fields` are the two today; their values and readers are
+[ADR `metric-flags`](metric-flags.md)'s "The flags". The ignore rule covers them like any private
+key, so no protocol sink renders a flag, and `keep` under its default `private: drop` strips them.
+The constants live in `logit_core::attrs` beside `PRIVATE_PREFIX` and `FIELD_PREFIX`.

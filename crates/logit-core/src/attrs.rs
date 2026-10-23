@@ -161,7 +161,7 @@ pub fn is_private(key: &str) -> bool {
 /// never part of the identity of the series a point belongs to.
 ///
 /// `influxdb_out` writes a `Str` under it as the string field `<key>`, and `aggregate` leaves it
-/// out of a series' identity. It is a private key ([`is_private`]), so every other protocol sink
+/// out of a series' identity on an event flagged [`METRICS_FIELDS`]. It is a private key ([`is_private`]), so every other protocol sink
 /// ignores it. See ADR `metric-flags` (`docs/adr/metric-flags.md`) and
 /// `docs/design/data-model.md`'s "Well-known attribute names".
 pub const FIELD_PREFIX: &str = "_logit.field.";

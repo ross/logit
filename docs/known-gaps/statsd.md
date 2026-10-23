@@ -53,7 +53,8 @@ Entry format and the other areas: [the known-gaps index](README.md).
     sets `Event::timestamp` from it and stamps a `_logit.statsd.timestamp: Value::U64(secs)` carrier
     with the raw wire value. `statsd_out` re-emits `|T<secs>` from that carrier, never from
     `Event::timestamp`, so a stage that rewrites `Event::timestamp` can't fabricate or collapse a
-    `|T`. `aggregate` passes a `|T` record through unmerged with its own timestamp. The classic
+    `|T`. `aggregate` passes a `|T` record through unmerged with its own timestamp, on the
+    `_logit.metrics.closed` flag `statsd_in` sets beside the carrier. The classic
     grammar has no timestamp segment, so `format: statsd` omits `|T` and counts it
     (`fields.omitted{reason="dialect"}`).
   - **Unit:** `MetricRecord::unit` has no statsd wire representation and is dropped.

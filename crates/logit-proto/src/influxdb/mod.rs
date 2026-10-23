@@ -62,7 +62,8 @@
 //! its wire, uncounted; a whole-event render carries them, as it carries every private key (that
 //! ADR's "The ignore rule" lists the renders). A string field's value is free text, and as a tag
 //! or label at another sink each distinct value would start a series. Lua and transforms still
-//! read a string field by its full key, and `aggregate` leaves it out of a series.
+//! read a string field by its full key, and `aggregate` leaves it out of a series on the
+//! `_logit.metrics.fields` flag the table names.
 //!
 //! **A point whose fields are all strings carries no signal.** Its event has no log, no metrics,
 //! and no span, only the carriers, and `influxdb_out` still writes its line. A component that

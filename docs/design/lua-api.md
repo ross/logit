@@ -964,6 +964,30 @@ above). `trace_flags` is `nil` exactly when
 `trace_id` is, the same rule `event.log.trace_flags` follows. Lua can't add, remove, or mutate an
 individual exemplar in place, only read the whole list or rebuild the record with `Event.new`.
 
+### Flagging an event for `aggregate`
+
+`aggregate` acts on two private attributes a script can set like any other, never on a protocol's
+carriers. To have `aggregate` forward an event's metrics whole, with their timestamp, set
+`_logit.metrics.closed` to `"timestamped"` (or `"bucketed"`) or to `true`. To add a string field
+an InfluxDB point carries without it splitting the series, write it under `_logit.field.<key>` and
+set `_logit.metrics.fields` to `true`; without that flag, `aggregate` keys the series on the
+field like any attribute. The values and what each reader does are
+[ADR `metric-flags`](../adr/metric-flags.md)'s "The flags".
+
+```lua
+function process(event)
+  -- The producer already closed this reading's time span: keep its timestamp.
+  event.attributes["_logit.metrics.closed"] = "timestamped"
+  -- A free-text note rides as an InfluxDB string field, outside the series key.
+  event.attributes["_logit.field.note"] = "rebooted"
+  event.attributes["_logit.metrics.fields"] = true
+  return event
+end
+```
+
+A value outside `"bucketed"` and `"timestamped"` still closes the event, and `aggregate` counts it
+`passed_through{reason="flagged"}`, so a script's own text never becomes a telemetry tag.
+
 ## Reading `event.span`
 
 `event.span` is read-only in place; build a new span with `Event.new`. It is `nil` on an event with
