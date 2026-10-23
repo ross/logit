@@ -38,7 +38,7 @@ what its own config names, a component id in `has_provenance`, `drop_provenance`
 
 ## C1 and C2: the Datadog rate carrier in `dedup_timestamps` and `prometheus_out`
 
-**Done** in `carry/w2` (PR #PRNUM), as the remedy below describes. The open design questions
+**Done** in `carry/w2` (PR #838), as the remedy below describes. The open design questions
 were settled for Datadog's form: `_logit.metrics.interval` is an `I64` of whole seconds, and a
 rate stays a flagged `Gauge`, not a model kind. The section below records the reads as they
 were.
