@@ -849,11 +849,15 @@ impl Aggregator {
                     SmallVec::new()
                 }
             });
-            let mut attributes = event.attributes.clone();
-            for &key in string_fields.iter() {
-                attributes.remove_sym(key);
+            // Cloned into the key, then pruned: a local map moved in afterward copies it again per record.
+            let mut key = SeriesKey {
+                name: record.name,
+                unit: record.unit,
+                attributes: event.attributes.clone(),
+            };
+            for &field in string_fields.iter() {
+                key.attributes.remove_sym(field);
             }
-            let key = SeriesKey { name: record.name, unit: record.unit, attributes };
             let open_seq = self.next_open_seq;
             let gi = match group_index {
                 Some(gi) => gi,
