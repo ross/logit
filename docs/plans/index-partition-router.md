@@ -145,8 +145,8 @@ review. Allocation pins in `crates/logit-bench/tests/allocations.rs` and the mat
 
 | # | Branch | PR title | Size | Depends on | Status |
 |---|---|---|---|---|---|
-| W5 | `cores/w5` | `cores/w5: plan for the index-partition router` | S | — | in review |
-| W6 | `cores/w6` | `cores/w6: ADR index-partition-router` | S | W5 | — |
+| W5 | `cores/w5` | `cores/w5: plan for the index-partition router` | S | — | approved |
+| W6 | `cores/w6` | `cores/w6: ADR index-partition-router` | S | W5 | in review |
 | W7 | `cores/w7` | `cores/w7: a routed batch is a view` | L | W6 | — |
 | W8a–c | `cores/w8a`, `cores/w8b`, `cores/w8c` | `cores/w8<x>: <crate>'s encoders read a view` | M each | W7 | — |
 | W9 | `cores/w9` | `cores/w9: operator docs for views and the pinned-batch bound` | S | W8a–c (all merged) | — |
@@ -157,9 +157,8 @@ review. Allocation pins in `crates/logit-bench/tests/allocations.rs` and the mat
   [ADR `target-components`](../adr/target-components.md), which says an event is moved with one
   destination and shared or cloned with several, and the `strip: true` rules of
   [ADR `route-signals`](../adr/route-signals.md): rule 1 (cleared before routing), rule 4
-  (attributes cloned, payloads moved per part), and rule 7 (no shared path out). It also amends
-  two restatements: AGENTS.md's `route`/`target` and `route_signals` bullets, and the module doc
-  of `crates/logit-pipeline/src/route_signals.rs`, which moves in W7 with the code.
+  (attributes cloned, payloads moved per part), and rule 7 (no shared path out). The ADR and
+  those two amendments are W6; the restatements of shipped behavior move in W7 with the code.
 - **W7, the pipeline layer.** `BatchView` and the masked event; `Delivered` carrying a view;
   `route_batch` and `route_signals_batch` emitting views (index lists, signal masks, no in-place
   strip, index composition for a router behind a router); `Output::send` and `Output::submit` taking
@@ -178,7 +177,9 @@ review. Allocation pins in `crates/logit-bench/tests/allocations.rs` and the mat
   `schema/logit.schema.json`), and the module doc of `crates/logit-pipeline/src/router.rs`. `grep
   -rln 'events\.copied'` finds the set; plans that record history, such as
   `docs/plans/soak-harness.md` and `critical-sections-inventory.md`, stay as written. Also in W7:
-  the allocation pins and `memory.md`'s "Routing" rows. The prototype's
+  the allocation pins and `memory.md`'s "Routing" rows, and the restatements of the routing
+  behavior: AGENTS.md's `route`/`target` and `route_signals` bullets and the module doc of
+  `crates/logit-pipeline/src/route_signals.rs`. The prototype's
   `crates/logit-pipeline/src/view.rs` is the starting point; its materializing default and
   `unwrap_batch` arm are the shapes to keep.
 - **W8, the encoder sweep.** The three trait signatures and every impl, split by crate into

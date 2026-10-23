@@ -1,6 +1,6 @@
 ---
 created: 2026-09-13
-updated: 2026-10-21
+updated: 2026-10-23
 ---
 
 # `target` components: named destinations a router directs events into, beside `sources:`
@@ -439,3 +439,14 @@ Rule 49 is unchanged, but its reason is restated above. A target no router feeds
 its consumers waiting: the runtime drops its own copy of each target's `Fanout` at startup
 (`drop(target_fanouts)` in `crates/logit-pipeline/src/runtime.rs`), so the target's edges close
 at once. The rule stands because such a target is a wiring mistake.
+
+## Amendment (2026-10-23): a routed batch is a view
+
+[ADR `index-partition-router`](index-partition-router.md) replaces the 2026-10-16 amendment's rule
+that an event is moved when it has one destination and shared or cloned when it has several. A
+router now sends each destination a view of the incoming batch: the one shared `Arc<EventBatch>`,
+the ascending indices of the events that destination gets, and no event moved or cloned. A sink
+reads its view in place; a mutating consumer copies its slice through `unwrap_batch`, the clone the
+router used to pay for it. Rule 51, the list-valued `routes:` value, and the router invariant stand.
+`logit.component.events.copied` is renamed `logit.component.events.multicast`, with the same
+arithmetic.

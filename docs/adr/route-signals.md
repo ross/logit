@@ -1,6 +1,6 @@
 ---
 created: 2026-10-16
-updated: 2026-10-21
+updated: 2026-10-23
 ---
 
 # `route_signals`: a native signal router that splits a mixed event into one part per target
@@ -226,3 +226,15 @@ listed signal, so every event is discarded and counted as `logit.component.event
 Validation rejects a config only when it can't run, or when it would lose or duplicate data the
 operator didn't ask to lose or duplicate; this loss is one the config states. Rule 92 keeps its
 empty-id, `sources:`, and `strip: false` reconvergence clauses.
+
+## Amendment: a part is a view, not a new event (2026-10-23)
+
+[ADR `index-partition-router`](index-partition-router.md) replaces `strip: true` rules 1, 4, and 7.
+Nothing is cleared before routing: each target receives a view of the shared batch, an index list
+plus a signal mask, so a part clones no attributes and moves no payloads, and a batch arriving
+shared goes out shared with no `unwrap_batch` clone first. The masked event that a view's iterator
+yields is where the unlisted-signal contract lives: its `log()`, `metrics()`, and `span()` show
+only the target's signals, and the payload fields aren't reachable through it.
+`logit.transform.payloads.stripped{signal}` still counts each payload a mask hides, and
+`logit.component.events.copied` is renamed `logit.component.events.multicast`, with the same
+arithmetic.
