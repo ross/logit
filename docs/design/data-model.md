@@ -139,6 +139,14 @@ private, which stay public, and why. The prefix has one definition,
   `_logit.*` key they admit is read as the carrier it names at that carrier's own sink, and
   skipped everywhere else (`docs/known-gaps/mappings.md`).
 
+**The field namespace `_logit.field.<key>` isn't a protocol's.** An attribute under it
+(`logit_core::attrs::FIELD_PREFIX`, tested by `logit_core::attrs::is_field`) is data about its
+point, never identity of the series the point belongs to: `aggregate` leaves it out of a series
+key, and a sink that can carry a non-identity string writes a `Str` under it, as `influxdb_out`
+does for a string field `<key>`. It is a private key, so every other protocol sink ignores it
+under the rules above. `influxdb_in` and the `line_protocol` transform stamp it
+([ADR `metric-flags`](../adr/metric-flags.md)).
+
 A key under [ADR `lossless-transit`](../adr/lossless-transit.md)'s rule (c), such as
 `logit.body_format`, is the opposite case: public, and meant to cross a foreign wire.
 

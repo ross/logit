@@ -1,6 +1,6 @@
 ---
 created: 2026-10-13
-updated: 2026-10-19
+updated: 2026-10-22
 ---
 
 # Private attribute namespace: protocol carriers live under `_logit.<protocol>.`, and every other protocol's sink ignores them
@@ -198,3 +198,14 @@ that makes it a documented gap rather than a guard to add.
   point.
 - A new decoder that stamps a carrier spells it `_logit.<protocol>.<name>`, and a new sink calls
   `is_private` at its render site. Neither needs a change anywhere else.
+
+## Amendment: a segment that names the key's meaning (2026-10-22)
+
+The namespace has a second kind of segment. `_logit.field.<key>` names what the key is, data about
+a point and not identity of its series, instead of a protocol. Any sink that can carry a
+non-identity string may read it: `influxdb_out` writes a `Str` under it as a string field. The
+ignore rule covers it like any private key, so every other protocol sink skips it silently, and
+a key under it isn't a carrier of any protocol. The prefix has one definition,
+`logit_core::attrs::FIELD_PREFIX`, tested by `logit_core::attrs::is_field`. See
+[ADR `metric-flags`](metric-flags.md) and
+[ADR `influxdb-line-protocol-relay`](influxdb-line-protocol-relay.md)'s 2026-10-22 amendment.

@@ -469,7 +469,7 @@ Per pair:
   measurement as the private attribute `_logit.influxdb.measurement`, tags as event attributes,
   each numeric or boolean field as a typed `Gauge` named `<measurement>.<field>` ([ADR
   `typed-metric-scalar`](docs/adr/typed-metric-scalar.md)), and each string field as the private
-  `_logit.influxdb.field.<key>`. `org`, `orgID`, and `bucket` ride on the resource as
+  `_logit.field.<key>`. `org`, `orgID`, and `bucket` ride on the resource as
   `_logit.influxdb.org`, `_logit.influxdb.org_id`, and `_logit.influxdb.bucket`. `influxdb_out` writes
   each batch there unless its own `bucket:` or `org:` overrides the matching carrier. The presence of `_logit.influxdb.measurement` selects the carrier path on
   `influxdb_out`. Every other protocol sink ignores the private carriers, string fields included, since a

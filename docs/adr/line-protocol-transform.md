@@ -1,6 +1,6 @@
 ---
 created: 2026-10-16
-updated: 2026-10-19
+updated: 2026-10-22
 ---
 
 # `line_protocol`: parse a log message as InfluxDB line protocol into one event per point, skipping bad lines
@@ -54,7 +54,7 @@ as `json` treats one.
   `logit.transform.tags.omitted{reason="reserved_prefix"}`.
 - Each numeric or boolean field becomes a typed `Gauge` named `<measurement>.<field>`, in wire
   order.
-- Each string field becomes the private attribute `_logit.influxdb.field.<key>`.
+- Each string field becomes the private attribute `_logit.field.<key>`.
 - Points in one message with the same measurement, tag set, and timestamp merge into one event,
   field by field, as `influxdb_in` merges them within one body (that ADR's normalization 2).
   Points in different messages never merge.
@@ -141,7 +141,7 @@ writes its points to its configured `bucket:` and `org:`, else its `default_buck
   `syslog.tag` from `syslog_in`, for example, and a nil RFC 5424 TIMESTAMP's `Value::Null`
   `syslog.timestamp`, which `influxdb_out` omits and counts. An operator places `keep`, `remove`,
   or a Lua stage to choose the tags.
-- A child's attribute under `_logit.influxdb.field.` inherited from the parent leaves
+- A child's attribute under `_logit.field.` inherited from the parent leaves
   `influxdb_out` as a string field.
 - The existing `influxdb_line` fuzz target covers the shared construction path, and the skip mode
   joins it.

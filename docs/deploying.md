@@ -3388,7 +3388,7 @@ pipeline didn't take the body within 5 seconds and nothing of it was taken, coun
 **What arrives.** Each point becomes one event with its tags as attributes and the private
 attribute `_logit.influxdb.measurement` naming the measurement. Each numeric or boolean field
 becomes a gauge named `MEASUREMENT.FIELD`, and each string field the private attribute
-`_logit.influxdb.field.FIELD`. `org`, `orgID`, and `bucket` become the private resource
+`_logit.field.FIELD`. `org`, `orgID`, and `bucket` become the private resource
 attributes `_logit.influxdb.org`, `_logit.influxdb.org_id`, and `_logit.influxdb.bucket`. No
 protocol sink but `influxdb_out` writes a `_logit.influxdb.` attribute, and none writes one as a
 tag or label.

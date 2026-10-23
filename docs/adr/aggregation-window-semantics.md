@@ -1,6 +1,6 @@
 ---
 created: 2026-08-29
-updated: 2026-10-19
+updated: 2026-10-22
 ---
 
 # `aggregate` transform: tumbling windows, pass-through, and the flush-tick contract
@@ -541,7 +541,7 @@ contract.
 ### Series identity
 
 **A series is `(name, unit, attribute set)`, compared structurally, not by IEEE-754 `==`.**
-The attribute set leaves out InfluxDB string fields (`_logit.influxdb.field.*`); see
+The attribute set leaves out InfluxDB string fields (`_logit.field.*`); see
 "Amendment: InfluxDB string fields aren't series identity (2026-10-19)" below.
 `SeriesKey`'s `PartialEq` and `Hash` walk the attribute set through `value_key_eq` and
 `hash_value`, and the rules are:
@@ -870,7 +870,7 @@ because a config with a cumulative `aggregate` upstream would have delivered it
 
 ## Amendment: InfluxDB string fields aren't series identity (2026-10-19)
 
-`aggregate` leaves every `_logit.influxdb.field.*` attribute out of a series' key and out of what
+`aggregate` leaves every `_logit.field.*` attribute out of a series' key and out of what
 it flushes. Every other attribute, private ones included, stays in the key.
 
 [ADR `influxdb-line-protocol-relay`](influxdb-line-protocol-relay.md)'s "Amendment: string fields
