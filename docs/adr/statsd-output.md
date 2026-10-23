@@ -437,7 +437,8 @@ unescape); `severity` maps `t:error`/`t:warning`/`t:success`/`t:info` to
 model has no normalized field for) rather than a `LogRecord` field: `_logit.statsd.event.title`
 (always), `_logit.statsd.event.priority`/`_logit.statsd.event.alert_type` (only when sent, raw wire
 value), `_logit.statsd.event.aggregation_key`, `_logit.statsd.event.source_type`,
-`_logit.statsd.event.host` — plus the same timestamp flag, `_logit.statsd.container_id`, and
+`_logit.statsd.event.host` (superseded: `h:` now decodes to `host.name` and the carrier is retired,
+see the 2026-10-23 amendment) — plus the same timestamp flag, `_logit.statsd.container_id`, and
 `#tags` handling every metric line already gets, with `d:<secs>` (not `|T<secs>`) playing the
 timestamp segment's role here.
 
@@ -449,7 +450,8 @@ rendering) handles a service check with no special-casing. `_logit.statsd.servic
 `_logit.statsd.service_check.status` (always, `Value::U64`), `_logit.statsd.service_check.message`
 (`m:`, only if present, verbatim including any `|` it contains — `m:` is always the *last* field on
 the wire, so it can consume the rest of the line; superseded: `m:` now ends at the next `|`, see the
-2026-09-24 amendment), `_logit.statsd.service_check.host` (`h:`, only if present),
+2026-09-24 amendment), `_logit.statsd.service_check.host` (`h:`, only if present; superseded: `h:`
+now decodes to `host.name` and the carrier is retired, see the 2026-10-23 amendment),
 the timestamp flag, `_logit.statsd.container_id`, and `#tags` round out the set.
 
 **`event_name` stays `None`, deliberately.** An event title is free text an operator or their

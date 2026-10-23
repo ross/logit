@@ -3509,13 +3509,13 @@ pub enum ComponentKind {
         #[serde(default)]
         tls: TlsClientConfig,
     },
-    /// Sends logs, metrics, events, service checks, APM traces, and APM stats straight to
-    /// Datadog's intake API, one request per route a batch needs. Host, service, source, and tags
-    /// come from each event's attributes and resource, so stamp them upstream with `set`; the
-    /// host is `host.name`, and a `host` attribute is an ordinary tag. A metric, log, event, or
-    /// service check with no host goes out with the process hostname, so hostless senders
-    /// relayed through one `logit` report as one Datadog host. One its sender marked hostless (an
-    /// empty DogStatsD `host:` tag, or an Agent's empty host) stays hostless.
+    /// Sends logs, metrics, events, service checks, APM traces, and APM stats straight to Datadog's
+    /// intake API, one request per route a batch needs. Host, service, source, and tags come from
+    /// each event's attributes and resource, so stamp them upstream with `set`; the host is
+    /// `host.name`, and a `host` attribute is an ordinary tag. A metric, log, event, or service
+    /// check with no host goes out with the process hostname, so hostless senders relayed through
+    /// one `logit` report as one Datadog host. A record its sender marked hostless (an empty
+    /// DogStatsD `host:` tag, or an Agent's empty host) stays hostless.
     /// Points older than Datadog accepts (1h for metrics, 18h for logs and events, 10m for
     /// service checks) are dropped and counted before sending. Traces go out only once a Datadog
     /// Agent has processed them: send `datadog_trace_in`'s output to `datadog_trace_out` instead.

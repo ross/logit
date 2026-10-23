@@ -218,8 +218,8 @@ For the host, the Datadog family's decoders now apply that rule:
 |---|---|
 | `datadog_in` series, distribution point, or sketch `host` | `host.name`; `""` is the hostless mark (unchanged) |
 | `datadog_in` log `hostname` | `host.name`; `""` is no host |
-| `datadog_in` event `host` (the Agent's `/intake/` envelope and public v1) | `host.name`; `""` is no host |
-| `datadog_in` service check `host_name` | `host.name`; `""` is no host |
+| `datadog_in` event `host` (the Agent's `/intake/` envelope and public v1) | `host.name`; `""` is the hostless mark, as for a series |
+| `datadog_in` service check `host_name` | `host.name`; `""` is the hostless mark, as for a series |
 | `statsd_in` metric line, event, or service check `host:` tag | `host.name`, the last one when there are several, never a tag; an empty one is the hostless mark |
 | `statsd_in` event or service check `h:` field | `host.name`, ahead of a `host:` tag; an empty one is no host, and the tag applies |
 
@@ -250,7 +250,7 @@ The common keys today, and who writes each:
 | Key | Written by, from |
 |---|---|
 | `host.name` | `collectd_in` from each value list's host part, on the event; `syslog_in` from HOSTNAME, on the event; `statsd_in` and `datadog_in` from the wire hosts above, on the event; `splunk_hec_in` from each object's `host`, on the resource; `internal` from the process hostname, on the resource; `otlp_in` passes the sender's resource and record attributes through, which already use the standard key |
-| `service.name` | `internal`; `otlp_in` passes it through; otherwise an operator's `set` |
+| `service.name` | `internal`, on the resource; `datadog_in` (its traces route) and `datadog_trace_in` from each span's `service`, on the span's event; `otlp_in` passes it through; otherwise an operator's `set`. A Datadog log's `service` stays the attribute `service`, which `datadog_out` writes back as the log's `service` |
 | `network.peer.*`, `client.*` | every network listener but `logit_in`, opt-in ([ADR `listener-peer-address`](listener-peer-address.md)) |
 | the `_logit.metrics.*` flags | decoders, where the flag says the whole fact ([ADR `metric-flags`](metric-flags.md)) |
 

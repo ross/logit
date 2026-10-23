@@ -576,7 +576,10 @@ carries always wins. Trace and stats payloads keep their tracer and Agent hostna
 - **A log with a host Datadog reads isn't filled.** Datadog's log preprocessing takes the host
   from `host`, `hostname`, or `syslog.hostname`. A log carrying `hostname`, `host.name`,
   `syslog.hostname`, or `host` gets no default `hostname`, and the last two leave as the
-  attributes they were.
+  attributes they were. Superseded (2026-10-23): `datadog_in` decodes a log's `hostname` to
+  `host.name`, a `hostname` attribute from any other source is omitted and counted, and a log
+  carrying `host.name`, `syslog.hostname`, or `host` gets no default ("Amendment: sources write
+  `host.name` (2026-10-23)" below).
 - **An Agent's hostless sample stays hostless.** On v2 the Agent writes a hostless series as a
   `host` resource with no name, which decodes into `_logit.datadog.resources`. A series carrying
   such an entry is never filled, and the entry is kept, so the relay stays a fixed point. The v1,
@@ -703,7 +706,9 @@ record's own host as `host.name`, and `datadog_out` reads nothing else as a host
   decodes a DogStatsD `host:` tag, and an event's or check's `h:` field, the same way, and an empty
   `host:` tag to `_logit.datadog.hostless`. A record's own host displaces a `host.name:` tag or a
   log's `host.name` key, counted `logit.input.tags.omitted{reason="reserved_key"}`. An empty log
-  `hostname`, event `host`, or check `host_name` is no host.
+  `hostname` is no host. An empty event `host` or check `host_name` is the hostless mark, as an
+  empty series `host` is: the Agent's serializer always writes both fields, so `""` is the
+  Agent's hostless item.
 - **The two host carriers are retired.** `_logit.statsd.event.host` and
   `_logit.statsd.service_check.host` aren't written or read anywhere.
 - **The `host` tag is a tag.** No decoder writes a `host` attribute, so one is the operator's, and
