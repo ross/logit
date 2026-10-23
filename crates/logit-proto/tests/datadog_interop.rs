@@ -397,7 +397,7 @@ fn the_agent_service_check_ends_its_message_at_the_next_pipe() {
     for check in checks {
         assert_eq!(check.metrics[0].kind, MetricKind::gauge(1.0), "status WARNING");
         assert_eq!(str_attr(check, "_logit.statsd.service_check.message"), Some("slow upstream"));
-        assert_eq!(str_attr(check, "_logit.statsd.service_check.host"), Some("record-host"));
+        assert_eq!(str_attr(check, "host.name"), Some("record-host"));
     }
     assert!(events(&batches).any(|e| metric_name(e) == "datadog.agent.up"));
 }

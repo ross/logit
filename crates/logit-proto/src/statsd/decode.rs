@@ -20,8 +20,8 @@ use std::sync::{Arc, LazyLock};
 /// diagnostic. Every other line of its datagram or packet still decodes.
 const MESSAGES_DROPPED: &str = "logit.input.messages.dropped";
 
-/// A `|#` tag left off a delivered line because its key is private, by `reason`:
-/// `reserved_prefix`.
+/// A `|#` tag left off a delivered line, by `reason`: `reserved_prefix` for a private key,
+/// `reserved_key` for a `host.name` tag beside the line's own host.
 const TAGS_OMITTED: &str = "logit.input.tags.omitted";
 
 /// Decodes statsd/DogStatsD bytes into events; testable without a socket.
@@ -86,8 +86,8 @@ impl Decoder for StatsdDecoder {
     ) -> Result<(Arc<Resource>, Option<Arc<Scope>>), CodecError> {
         let text = std::str::from_utf8(&bytes)
             .map_err(|e| CodecError::Malformed(format!("invalid utf-8: {e}")))?;
-        // Private tags omitted from lines that decoded; a rejected line's tags count nothing.
-        let mut reserved = 0;
+        // Tags omitted from lines that decoded; a rejected line's tags count nothing.
+        let mut omitted = Omitted::default();
         for line in text.split('\n') {
             // Trailing whitespace is payload on an `_e{`/`_sc|` line (`super`'s module doc,
             // "DogStatsD events and service checks"), so only other lines are trimmed at the end.
@@ -102,10 +102,11 @@ impl Decoder for StatsdDecoder {
             }
             // Per-line isolation: clients pack independent metrics into one datagram, so a bad
             // line is reported and dropped without discarding the others.
-            let mut line_reserved = 0;
-            match parse_line(&bytes, line, received_at, &mut self.keys, &mut line_reserved) {
+            let mut line_omitted = Omitted::default();
+            match parse_line(&bytes, line, received_at, &mut self.keys, &mut line_omitted) {
                 Ok(mut line_events) => {
-                    reserved += line_reserved;
+                    omitted.reserved_prefix += line_omitted.reserved_prefix;
+                    omitted.reserved_key += line_omitted.reserved_key;
                     out.append(&mut line_events);
                 }
                 Err(err) => {
@@ -114,15 +115,19 @@ impl Decoder for StatsdDecoder {
                 }
             }
         }
-        if reserved > 0 {
-            self.telemetry.count(TAGS_OMITTED, reserved as f64, &[("reason", "reserved_prefix")]);
+        for (count, reason) in
+            [(omitted.reserved_prefix, "reserved_prefix"), (omitted.reserved_key, "reserved_key")]
+        {
+            if count > 0 {
+                self.telemetry.count(TAGS_OMITTED, count as f64, &[("reason", reason)]);
+            }
         }
         // statsd has no instrumentation scope.
         Ok((self.resource.clone(), None))
     }
 }
 
-/// The `_logit.statsd.*` carrier keys, interned once per process so each line pays a sorted
+/// The `_logit.statsd.*` carrier keys and the host keys, interned once per process so each line pays a sorted
 /// `insert_sym`, not an interner hash and shard lock. A `LazyLock` rather than a decoder field
 /// because the parsers are free functions; `KEYS.x` is one acquire load after first use.
 static KEYS: LazyLock<StatsdKeys> = LazyLock::new(|| StatsdKeys {
@@ -132,13 +137,13 @@ static KEYS: LazyLock<StatsdKeys> = LazyLock::new(|| StatsdKeys {
     metrics_closed: intern(logit_core::attrs::METRICS_CLOSED),
     type_: intern("_logit.statsd.type"),
     event_title: intern("_logit.statsd.event.title"),
-    event_host: intern("_logit.statsd.event.host"),
     event_priority: intern("_logit.statsd.event.priority"),
     event_aggregation_key: intern("_logit.statsd.event.aggregation_key"),
     event_source_type: intern("_logit.statsd.event.source_type"),
     service_check_name: intern("_logit.statsd.service_check.name"),
     service_check_status: intern("_logit.statsd.service_check.status"),
-    service_check_host: intern("_logit.statsd.service_check.host"),
+    host_name: intern(logit_core::attrs::HOST_NAME),
+    hostless: intern(crate::datadog::ATTR_HOSTLESS),
 });
 
 struct StatsdKeys {
@@ -148,13 +153,22 @@ struct StatsdKeys {
     metrics_closed: Symbol,
     type_: Symbol,
     event_title: Symbol,
-    event_host: Symbol,
     event_priority: Symbol,
     event_aggregation_key: Symbol,
     event_source_type: Symbol,
     service_check_name: Symbol,
     service_check_status: Symbol,
-    service_check_host: Symbol,
+    host_name: Symbol,
+    hostless: Symbol,
+}
+
+/// Tags a line leaves off, counted `logit.input.tags.omitted` by reason once the line decodes.
+#[derive(Default)]
+struct Omitted {
+    /// A key under the private `_logit.` prefix.
+    reserved_prefix: usize,
+    /// A `host.name` tag on a line that names its own host ([`insert_host`]).
+    reserved_key: usize,
 }
 
 /// Stamps the `_logit.metrics.closed: "timestamped"` flag, which says the event's timestamp is
@@ -174,22 +188,28 @@ fn insert_source_timestamp(attributes: &mut AttrMap) {
 /// remove-then-insert per token is two binary searches over the sorted map, the same two-step
 /// `syslog_in`'s `insert_param` uses.
 ///
-/// A key under the private `_logit.` prefix is skipped and added to `reserved`, so a sender's tag
-/// never reads back as a carrier.
-fn insert_tags(
+/// A key under the private `_logit.` prefix is skipped and counted in `omitted`, so a sender's
+/// tag never reads back as a carrier. A valued `host:` tag isn't an attribute: the last one's
+/// value lands in `host_tag` for [`insert_host`], as the Agent consumes every one.
+fn insert_tags<'a>(
     attributes: &mut AttrMap,
     bytes: &Bytes,
-    tags: &str,
+    tags: &'a str,
     keys: &mut KeyCache,
-    reserved: &mut usize,
+    omitted: &mut Omitted,
+    host_tag: &mut Option<&'a str>,
 ) {
     for tag in tags.split(',').filter(|t| !t.is_empty()) {
         let (key, value) = match tag.split_once(':') {
+            Some(("host", v)) => {
+                *host_tag = Some(v);
+                continue;
+            }
             Some((k, v)) => (k, Value::Str(subslice::share(bytes, v.as_bytes()))),
             None => (tag, Value::Bool(true)),
         };
         if is_private(key) {
-            *reserved += 1;
+            omitted.reserved_prefix += 1;
             continue;
         }
         let key = keys.get_or_intern(key);
@@ -217,6 +237,33 @@ fn tag_element_eq(a: &Value, b: &Value) -> bool {
         (Value::Str(a), Value::Str(b)) => a == b,
         (Value::Bool(a), Value::Bool(b)) => a == b,
         _ => false,
+    }
+}
+
+/// Writes a line's host as the Agent reads it (`super`'s module doc, "The host"): an event's or
+/// service check's non-empty `h:` field, else the last `host:` tag. A non-empty host is
+/// `host.name`; an empty `host:` tag is the hostless mark. Either way a sender's `host.name` tag
+/// would collide with the line's own host, so it's removed and counted per wire tag.
+fn insert_host(
+    attributes: &mut AttrMap,
+    bytes: &Bytes,
+    h: Option<&str>,
+    host_tag: Option<&str>,
+    omitted: &mut Omitted,
+) {
+    let Some(host) = h.filter(|h| !h.is_empty()).or(host_tag) else {
+        return;
+    };
+    if let Some(tag) = attributes.remove_sym(KEYS.host_name) {
+        omitted.reserved_key += match tag {
+            Value::Array(elements) => elements.len(),
+            _ => 1,
+        };
+    }
+    if host.is_empty() {
+        attributes.insert_sym(KEYS.hostless, Value::Bool(true));
+    } else {
+        attributes.insert_sym(KEYS.host_name, Value::Str(subslice::share(bytes, host.as_bytes())));
     }
 }
 
@@ -269,15 +316,14 @@ fn parse_line(
     line: &str,
     timestamp: i64,
     keys: &mut KeyCache,
-    reserved: &mut usize,
+    omitted: &mut Omitted,
 ) -> Result<Vec<Event>, CodecError> {
     // Only these two sigils are special; a legal `_`-prefixed metric name falls through.
     if line.starts_with("_e{") {
-        return parse_event(bytes, line, timestamp, keys, reserved).map(|event| vec![event]);
+        return parse_event(bytes, line, timestamp, keys, omitted).map(|event| vec![event]);
     }
     if line.starts_with("_sc|") {
-        return parse_service_check(bytes, line, timestamp, keys, reserved)
-            .map(|event| vec![event]);
+        return parse_service_check(bytes, line, timestamp, keys, omitted).map(|event| vec![event]);
     }
 
     let malformed = || CodecError::Malformed(format!("malformed statsd line: {line:?}"));
@@ -295,6 +341,7 @@ fn parse_line(
     let mut attributes = AttrMap::new();
     // Receipt time unless `|T<secs>` overrides it.
     let mut line_timestamp = timestamp;
+    let mut host_tag = None;
     for extra in segments {
         if let Some(rate) = extra.strip_prefix('@') {
             let parsed: f64 = rate.parse().map_err(|_| malformed())?;
@@ -305,7 +352,7 @@ fn parse_line(
             }
             sample_rate = parsed;
         } else if let Some(tags) = extra.strip_prefix('#') {
-            insert_tags(&mut attributes, bytes, tags, keys, reserved);
+            insert_tags(&mut attributes, bytes, tags, keys, omitted, &mut host_tag);
         } else if let Some(container_id) = extra.strip_prefix("c:") {
             // Carried verbatim, `ci-`/`in-` prefixes included, on every metric type.
             insert_container_id(&mut attributes, bytes, container_id);
@@ -318,6 +365,7 @@ fn parse_line(
         }
         // Any other segment is ignored, for forward compatibility.
     }
+    insert_host(&mut attributes, bytes, None, host_tag, omitted);
 
     match type_part {
         "c" | "g" => values_part
@@ -371,7 +419,7 @@ fn parse_event(
     line: &str,
     timestamp: i64,
     keys: &mut KeyCache,
-    reserved: &mut usize,
+    omitted: &mut Omitted,
 ) -> Result<Event, CodecError> {
     let malformed = || CodecError::Malformed(format!("malformed dogstatsd event: {line:?}"));
 
@@ -394,12 +442,13 @@ fn parse_event(
 
     let mut line_timestamp = timestamp;
     let mut severity = None;
+    let (mut h, mut host_tag) = (None, None);
 
     if !after_text.is_empty() {
         let fields = after_text.strip_prefix('|').ok_or_else(malformed)?;
         for field in fields.split('|') {
             if let Some(tags) = field.strip_prefix('#') {
-                insert_tags(&mut attributes, bytes, tags, keys, reserved);
+                insert_tags(&mut attributes, bytes, tags, keys, omitted, &mut host_tag);
             } else if let Some(container_id) = field.strip_prefix("c:") {
                 insert_container_id(&mut attributes, bytes, container_id);
             } else if insert_origin_field(&mut attributes, bytes, field) {
@@ -408,10 +457,7 @@ fn parse_event(
                 line_timestamp = parse_wire_seconds(secs, line)?;
                 insert_source_timestamp(&mut attributes);
             } else if let Some(host) = field.strip_prefix("h:") {
-                attributes.insert_sym(
-                    KEYS.event_host,
-                    Value::Str(subslice::share(bytes, host.as_bytes())),
-                );
+                h = Some(host);
             } else if let Some(priority) = field.strip_prefix("p:") {
                 if priority != "normal" && priority != "low" {
                     return Err(malformed());
@@ -445,6 +491,7 @@ fn parse_event(
             // Any other field, `|T` included, is ignored.
         }
     }
+    insert_host(&mut attributes, bytes, h, host_tag, omitted);
 
     Ok(Event::log(
         line_timestamp,
@@ -491,7 +538,7 @@ fn parse_service_check(
     line: &str,
     timestamp: i64,
     keys: &mut KeyCache,
-    reserved: &mut usize,
+    omitted: &mut Omitted,
 ) -> Result<Event, CodecError> {
     let malformed =
         || CodecError::Malformed(format!("malformed dogstatsd service check: {line:?}"));
@@ -515,6 +562,7 @@ fn parse_service_check(
     attributes.insert_sym(KEYS.service_check_status, Value::U64(status as u64));
 
     let mut line_timestamp = timestamp;
+    let (mut h, mut host_tag) = (None, None);
 
     if let Some(fields) = parts.next() {
         for field in fields.split('|') {
@@ -524,7 +572,7 @@ fn parse_service_check(
                     Value::Str(subslice::share(bytes, message.as_bytes())),
                 );
             } else if let Some(tags) = field.strip_prefix('#') {
-                insert_tags(&mut attributes, bytes, tags, keys, reserved);
+                insert_tags(&mut attributes, bytes, tags, keys, omitted, &mut host_tag);
             } else if let Some(container_id) = field.strip_prefix("c:") {
                 insert_container_id(&mut attributes, bytes, container_id);
             } else if insert_origin_field(&mut attributes, bytes, field) {
@@ -533,14 +581,12 @@ fn parse_service_check(
                 line_timestamp = parse_wire_seconds(secs, line)?;
                 insert_source_timestamp(&mut attributes);
             } else if let Some(host) = field.strip_prefix("h:") {
-                attributes.insert_sym(
-                    KEYS.service_check_host,
-                    Value::Str(subslice::share(bytes, host.as_bytes())),
-                );
+                h = Some(host);
             }
             // Any other field, `|T` included, is ignored.
         }
     }
+    insert_host(&mut attributes, bytes, h, host_tag, omitted);
 
     Ok(Event::metric(
         line_timestamp,
@@ -660,7 +706,7 @@ mod tests {
     fn parse_err(line: &str) -> CodecError {
         let bytes = Bytes::from(line.to_string());
         let text = std::str::from_utf8(&bytes).unwrap();
-        parse_line(&bytes, text, 0, &mut KeyCache::new(), &mut 0)
+        parse_line(&bytes, text, 0, &mut KeyCache::new(), &mut Omitted::default())
             .expect_err("expected this line to be rejected")
     }
 
@@ -805,7 +851,7 @@ mod tests {
         assert!(
             matches!(event.metrics[0].kind, MetricKind::GaugeDelta(v) if v == MetricValue::F64(-5.0))
         );
-        assert_eq!(event.attributes.get("host").and_then(|v| v.as_str()), Some("web1"));
+        assert_eq!(event.attributes.get("host.name").and_then(|v| v.as_str()), Some("web1"));
     }
 
     /// Mixed signs on one multi-value gauge line decode as independent deltas.
@@ -911,8 +957,84 @@ mod tests {
         let events = decode("page.views:1|c|#env:prod,host:web1,urgent");
         let event = &events[0];
         assert_eq!(event.attributes.get("env").and_then(|v| v.as_str()), Some("prod"));
-        assert_eq!(event.attributes.get("host").and_then(|v| v.as_str()), Some("web1"));
+        assert_eq!(event.attributes.get("host.name").and_then(|v| v.as_str()), Some("web1"));
         assert!(matches!(event.attributes.get("urgent"), Some(logit_core::Value::Bool(true))));
+    }
+
+    /// A metric line's `host:` tag is its host, consumed as the Agent consumes it: `host.name`,
+    /// no `host` attribute, the last of several, and an empty one the hostless mark. A bare
+    /// `host` token isn't a host tag.
+    #[test]
+    fn a_host_tag_is_host_name_and_never_a_tag() {
+        let host_name = |event: &Event| event.attributes.get("host.name").cloned();
+        let one = &decode("a:1|c|#host:web1")[0];
+        assert_eq!(host_name(one), Some(Value::str("web1")));
+        assert_eq!(one.attributes.get("host"), None);
+        assert_eq!(one.attributes.len(), 1);
+
+        let last = &decode("a:1|c|#host:web1,env:prod|#host:web2")[0];
+        assert_eq!(host_name(last), Some(Value::str("web2")));
+        assert_eq!(last.attributes.get("host"), None);
+
+        let empty = &decode("a:1|c|#host:web1,host:")[0];
+        assert_eq!(host_name(empty), None);
+        assert_eq!(empty.attributes.get("_logit.datadog.hostless"), Some(&Value::Bool(true)));
+        assert_eq!(empty.attributes.get("host"), None);
+
+        let bare = &decode("a:1|c|#host")[0];
+        assert_eq!(bare.attributes.get("host"), Some(&Value::Bool(true)));
+        assert_eq!(host_name(bare), None);
+    }
+
+    /// An event's or a check's non-empty `h:` field is its host and outranks a `host:` tag,
+    /// which is consumed either way; an empty `h:` is no host, so the tag applies.
+    #[test]
+    fn an_h_field_is_host_name_ahead_of_a_host_tag() {
+        for (line, host) in [
+            ("_e{1,1}:t|x|h:web1", "web1"),
+            ("_sc|c|0|h:web1", "web1"),
+            ("_e{1,1}:t|x|h:web1|#host:web2", "web1"),
+            ("_sc|c|0|#host:web2|h:web1", "web1"),
+            ("_e{1,1}:t|x|h:|#host:web2", "web2"),
+            ("_sc|c|0|h:|#host:web2", "web2"),
+        ] {
+            let event = &decode(line)[0];
+            assert_eq!(event.attributes.get("host.name"), Some(&Value::str(host)), "{line}");
+            assert_eq!(event.attributes.get("host"), None, "{line}");
+            for carrier in ["_logit.statsd.event.host", "_logit.statsd.service_check.host"] {
+                assert_eq!(event.attributes.get(carrier), None, "{line}");
+            }
+        }
+        for line in ["_e{1,1}:t|x|h:", "_sc|c|0|h:"] {
+            let event = &decode(line)[0];
+            assert_eq!(event.attributes.get("host.name"), None, "{line}");
+            assert_eq!(event.attributes.get("_logit.datadog.hostless"), None, "{line}");
+        }
+        let hostless = &decode("_e{1,1}:t|x|h:|#host:")[0];
+        assert_eq!(hostless.attributes.get("_logit.datadog.hostless"), Some(&Value::Bool(true)));
+    }
+
+    /// A `host.name` tag beside the line's own host is omitted and counted once per wire tag;
+    /// on a line that names no host it's an ordinary tag.
+    #[test]
+    fn a_host_name_tag_beside_a_host_is_omitted_and_counted() {
+        let registry = logit_core::Registry::new();
+        let mut decoder = StatsdDecoder::new(Arc::new(Resource::default()))
+            .with_telemetry(registry.telemetry_for("statsd_in", "statsd_in", "listener"));
+        let datagram = "a:1|c|#host.name:x,host:y
+                        b:1|c|#host.name:x,host.name:z,host:
+                        _e{1,1}:t|x|h:y|#host.name:x
+                        c:1|c|#host.name:x
+                        _sc|c|0|h:|#host.name:x";
+        let events = decoder.decode(Bytes::from(datagram)).unwrap().events;
+        let host_name = |i: usize| events[i].attributes.get("host.name").cloned();
+        assert_eq!(host_name(0), Some(Value::str("y")));
+        assert_eq!(host_name(1), None);
+        assert_eq!(events[1].attributes.get("_logit.datadog.hostless"), Some(&Value::Bool(true)));
+        assert_eq!(host_name(2), Some(Value::str("y")));
+        assert_eq!(host_name(3), Some(Value::str("x")));
+        assert_eq!(host_name(4), Some(Value::str("x")));
+        assert_eq!(input_counter(&registry, "logit.input.tags.omitted", "reserved_key"), 4.0);
     }
 
     /// A repeat line with the same tag names in another order (one repeated, so the merge runs)
@@ -1382,10 +1504,7 @@ mod tests {
             event.attributes.get("_logit.statsd.event.source_type").and_then(|v| v.as_str()),
             Some("src1")
         );
-        assert_eq!(
-            event.attributes.get("_logit.statsd.event.host").and_then(|v| v.as_str()),
-            Some("host1")
-        );
+        assert_eq!(event.attributes.get("host.name").and_then(|v| v.as_str()), Some("host1"));
         assert_eq!(event.attributes.get("env").and_then(|v| v.as_str()), Some("prod"));
         assert_eq!(
             event.attributes.get("_logit.statsd.container_id").and_then(|v| v.as_str()),

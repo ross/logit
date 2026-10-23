@@ -13,8 +13,8 @@ use super::logs::{new_batch, parse_json};
 use super::tags::{insert_tags, render_tags};
 use super::time::{nanos_to_seconds, or_received, seconds_f64_to_nanos, seconds_to_nanos};
 use super::{
-    host_tag, is_datadog_event, DatadogDecoder, DatadogEncoder, ATTR_EVENT_DEVICE_NAME,
-    ATTR_EVENT_RELATED_EVENT_ID, ATTR_EVENT_TYPE, ATTR_HOST_NAME, ATTR_HOST_TAG,
+    insert_wire_host, is_datadog_event, DatadogDecoder, DatadogEncoder, ATTR_EVENT_DEVICE_NAME,
+    ATTR_EVENT_RELATED_EVENT_ID, ATTR_EVENT_TYPE, ATTR_HOSTLESS, ATTR_HOST_NAME,
     RESOURCE_ATTR_AGENT_HOSTNAME,
 };
 use crate::json::{json_to_value, value_text, write_i64, write_str, write_value, JsonObject};
@@ -34,7 +34,6 @@ use std::sync::LazyLock;
 /// verbatim.
 pub const ATTR_EVENT_TITLE: &str = "_logit.statsd.event.title";
 pub const ATTR_EVENT_PRIORITY: &str = "_logit.statsd.event.priority";
-pub const ATTR_EVENT_HOST: &str = "_logit.statsd.event.host";
 pub const ATTR_EVENT_ALERT_TYPE: &str = "_logit.statsd.event.alert_type";
 pub const ATTR_EVENT_AGGREGATION_KEY: &str = "_logit.statsd.event.aggregation_key";
 pub const ATTR_EVENT_SOURCE_TYPE: &str = "_logit.statsd.event.source_type";
@@ -56,7 +55,6 @@ pub enum EventFormat {
 struct EventKeys {
     title: Symbol,
     priority: Symbol,
-    host: Symbol,
     alert_type: Symbol,
     aggregation_key: Symbol,
     source_type: Symbol,
@@ -65,16 +63,15 @@ struct EventKeys {
     related_event_id: Symbol,
     agent_hostname: Symbol,
     host_name: Symbol,
-    host_tag: Symbol,
+    hostless: Symbol,
 }
 
 impl EventKeys {
     /// Every key an encoder writes into a field of its own, so never as a tag.
-    fn consumed(&self) -> [Symbol; 10] {
+    fn consumed(&self) -> [Symbol; 9] {
         [
             self.title,
             self.priority,
-            self.host,
             self.alert_type,
             self.aggregation_key,
             self.source_type,
@@ -89,7 +86,6 @@ impl EventKeys {
 static KEYS: LazyLock<EventKeys> = LazyLock::new(|| EventKeys {
     title: intern(ATTR_EVENT_TITLE),
     priority: intern(ATTR_EVENT_PRIORITY),
-    host: intern(ATTR_EVENT_HOST),
     alert_type: intern(ATTR_EVENT_ALERT_TYPE),
     aggregation_key: intern(ATTR_EVENT_AGGREGATION_KEY),
     source_type: intern(ATTR_EVENT_SOURCE_TYPE),
@@ -98,7 +94,7 @@ static KEYS: LazyLock<EventKeys> = LazyLock::new(|| EventKeys {
     related_event_id: intern(ATTR_EVENT_RELATED_EVENT_ID),
     agent_hostname: intern(RESOURCE_ATTR_AGENT_HOSTNAME),
     host_name: intern(ATTR_HOST_NAME),
-    host_tag: intern(ATTR_HOST_TAG),
+    hostless: intern(ATTR_HOSTLESS),
 });
 
 impl DatadogDecoder {
@@ -185,9 +181,12 @@ impl DatadogDecoder {
             };
             attributes.insert(ATTR_EVENT_ALERT_TYPE, Value::str(alert_type));
         }
+        // The event's own host displaces a `host.name` tag. An empty one is no host, as the Agent
+        // omits an empty optional field.
+        let displaced = insert_wire_host(&mut attributes, non_empty_str(obj, "host"));
+        self.displaced_host_names(displaced);
         for (wire, attr) in [
             ("priority", ATTR_EVENT_PRIORITY),
-            ("host", ATTR_EVENT_HOST),
             ("aggregation_key", ATTR_EVENT_AGGREGATION_KEY),
             ("event_type", ATTR_EVENT_TYPE),
             ("device_name", ATTR_EVENT_DEVICE_NAME),
@@ -320,18 +319,12 @@ impl DatadogEncoder {
         // An optional field: written only when present and not an empty string.
         let optional = |key: Symbol| find(key).filter(|v| v.as_str() != Some(""));
         let agent = format == EventFormat::AgentEnvelope;
-        // `host.name`, else `statsd.event.host`, else a DogStatsD `#host:` tag, else the default.
-        // A `host.name` or `host` read this way leaves as the host and not a tag; the Agent
-        // consumes a `host:` tag even when `h:` wins. A carrier `host.name` outranks is private,
-        // so it's never a tag either.
+        // `host.name`, else the hostless mark, else the default. `host.name` is never a tag, an
+        // empty one included, which is no host.
         let host_name = optional(keys.host_name);
-        let own_host = if host_name.is_none() { optional(keys.host) } else { None };
-        let host_tag = host_tag(resource, event);
+        let hostless = find(keys.hostless) == Some(&Value::Bool(true));
         let mut skip = keys.consumed().to_vec();
-        // An empty `host.name` is no host, so it isn't a tag either.
-        let empty_host_name = find(keys.host_name).is_some_and(|v| v.as_str() == Some(""));
-        skip.extend((host_name.is_some() || empty_host_name).then_some(keys.host_name));
-        skip.extend(host_tag.map(|_| keys.host_tag));
+        skip.push(keys.host_name);
 
         let mut tags = Vec::new();
         let dropped = render_tags(attrs.iter().map(|(k, v)| (*k, *v)), &skip, &mut tags);
@@ -355,11 +348,11 @@ impl DatadogEncoder {
         if let Some(priority) = optional(keys.priority) {
             write_str(obj.key("priority"), &value_text(priority));
         }
-        let host = match (host_name.or(own_host), host_tag) {
-            (Some(host), _) => Some(value_text(host)),
-            // An empty `#host:` tag: marked hostless, never filled.
-            (None, Some(tag)) => (!tag.is_empty()).then_some(Cow::Borrowed(tag)),
-            (None, None) => self.default_host.as_deref().map(Cow::Borrowed),
+        let host = match host_name {
+            Some(host) => Some(value_text(host)),
+            // Marked hostless (an empty DogStatsD `host:` tag), never filled.
+            None if hostless => None,
+            None => self.default_host.as_deref().map(Cow::Borrowed),
         };
         // The Agent always writes `host`, empty or not; the public form only when set.
         match host {
@@ -451,7 +444,8 @@ mod tests {
         assert_eq!(log.event_name, None);
         assert_eq!(attr(event, "_logit.statsd.event.title"), Some("deploy"));
         assert_eq!(attr(event, "_logit.statsd.event.priority"), Some("low"));
-        assert_eq!(attr(event, "_logit.statsd.event.host"), Some("web1"));
+        assert_eq!(attr(event, "host.name"), Some("web1"));
+        assert_eq!(attr(event, "_logit.statsd.event.host"), None);
         assert_eq!(attr(event, "_logit.statsd.event.alert_type"), Some("warning"));
         assert_eq!(attr(event, "_logit.statsd.event.aggregation_key"), Some("agg"));
         assert_eq!(attr(event, "_logit.datadog.event_type"), Some("deploy_event"));
@@ -462,7 +456,7 @@ mod tests {
 
         let second = &batch.events[1];
         assert_eq!(attr(second, "_logit.statsd.event.source_type"), Some("nagios"));
-        assert_eq!(attr(second, "_logit.statsd.event.host"), None);
+        assert_eq!(attr(second, "host.name"), None);
         assert_eq!(second.log.as_ref().unwrap().severity, None);
     }
 
@@ -565,8 +559,7 @@ mod tests {
             .is_empty());
     }
 
-    /// `host.name` (then no tag of that name), then `statsd.event.host`, then the default host,
-    /// in both forms. A carrier `host.name` outranks is left off.
+    /// `host.name`, the event's own over the resource's, then the default host, in both forms.
     #[test]
     fn encode_fills_a_missing_host_with_host_name_then_the_default_host() {
         let encoder = DatadogEncoder::new().with_default_host(Some(Arc::from("relay")));
@@ -600,7 +593,7 @@ mod tests {
         own_and_stamped.resource = stamped.resource.clone();
         assert_eq!(
             encode_with(&own_and_stamped, EventFormat::PublicV1),
-            [r#"{"title":"t","text":"x","date_happened":5,"host":"web-1"}"#]
+            [r#"{"title":"t","text":"x","date_happened":5,"host":"h"}"#]
         );
         assert_eq!(
             encode_with(&own, EventFormat::PublicV1),
@@ -624,56 +617,58 @@ mod tests {
         );
     }
 
-    /// A DogStatsD `#host:` tag (`statsd_in`'s `host`) is the host after `host.name` and `h:`,
-    /// and is consumed, not tagged, whenever there's no `host.name`; an empty one stays hostless.
+    /// An event's own `host` decodes to `host.name` and displaces a `host.name` tag, counted; a
+    /// `host` tag is an ordinary tag both ways; the hostless mark leaves the event hostless.
     #[test]
-    fn a_host_tag_is_the_host_after_host_name_and_h() {
+    fn the_host_is_host_name_and_a_host_tag_is_a_tag() {
+        let registry = Registry::new();
+        let mut decoder = DatadogDecoder::new().with_telemetry(registry.telemetry_for(
+            "datadog_in",
+            "datadog_in",
+            "listener",
+        ));
         let encoder = DatadogEncoder::new().with_default_host(Some(Arc::from("relay")));
-        let encode_with = |body: &str, format| -> Vec<String> {
-            let out = encoder.encode_events(&decode(body), format);
+        let mut round_trip = |body: &str, format| -> Vec<String> {
+            let batch = decoder.decode_events(body.as_bytes(), RECEIVED_AT).unwrap();
+            let out = encoder.encode_events(&batch, format);
             out.iter().map(|b| String::from_utf8(b.to_vec()).unwrap()).collect()
         };
         let public = EventFormat::PublicV1;
         assert_eq!(
-            encode_with(
+            round_trip(
                 r#"{"title":"t","text":"x","date_happened":5,"tags":["host:web1"]}"#,
                 public
             ),
-            [r#"{"title":"t","text":"x","date_happened":5,"host":"web1"}"#]
+            [r#"{"title":"t","text":"x","date_happened":5,"host":"relay","tags":["host:web1"]}"#]
         );
         assert_eq!(
-            encode_with(
-                r#"{"title":"t","text":"x","date_happened":5,"tags":["host:web1","host.name:"]}"#,
-                public
-            ),
-            [r#"{"title":"t","text":"x","date_happened":5,"host":"web1"}"#]
-        );
-        assert_eq!(
-            encode_with(r#"{"title":"t","text":"x","date_happened":5,"tags":["host:"]}"#, public),
-            [r#"{"title":"t","text":"x","date_happened":5}"#]
-        );
-        assert_eq!(
-            encode_with(
-                r#"{"title":"t","text":"x","date_happened":5,"tags":["host:"]}"#,
-                EventFormat::AgentEnvelope
-            ),
-            [
-                r#"{"apiKey":"","events":{"api":[{"msg_title":"t","msg_text":"x","timestamp":5,"host":""}]},"internalHostname":""}"#
-            ]
-        );
-        assert_eq!(
-            encode_with(
-                r#"{"title":"t","text":"x","date_happened":5,"host":"h","tags":["host:web1"]}"#,
+            round_trip(
+                r#"{"title":"t","text":"x","date_happened":5,"host":"h","tags":["host.name:m"]}"#,
                 public
             ),
             [r#"{"title":"t","text":"x","date_happened":5,"host":"h"}"#]
         );
         assert_eq!(
-            encode_with(
+            round_trip(
                 r#"{"title":"t","text":"x","date_happened":5,"tags":["host:web1","host.name:m"]}"#,
                 public
             ),
             [r#"{"title":"t","text":"x","date_happened":5,"host":"m","tags":["host:web1"]}"#]
+        );
+        assert_eq!(counted(&registry, "logit.input.tags.omitted", ("reason", "reserved_key")), 1.0);
+
+        let mut hostless = decode(r#"{"title":"t","text":"x","date_happened":5}"#);
+        hostless.events[0].attributes.insert(ATTR_HOSTLESS, Value::Bool(true));
+        let encode_with = |format| -> Vec<String> {
+            let out = encoder.encode_events(&hostless, format);
+            out.iter().map(|b| String::from_utf8(b.to_vec()).unwrap()).collect()
+        };
+        assert_eq!(encode_with(public), [r#"{"title":"t","text":"x","date_happened":5}"#]);
+        assert_eq!(
+            encode_with(EventFormat::AgentEnvelope),
+            [
+                r#"{"apiKey":"","events":{"api":[{"msg_title":"t","msg_text":"x","timestamp":5,"host":""}]},"internalHostname":""}"#
+            ]
         );
     }
 }

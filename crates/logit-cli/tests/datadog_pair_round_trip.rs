@@ -97,14 +97,13 @@ fn dropped(points: &[Event], reason: &str) -> f64 {
 }
 
 /// `batch` as `datadog_in` receives it from [`sink`]: the codec's permitted normalization that
-/// gives a hostless metric its `host.name`, and a hostless log its `hostname`, from the default
-/// host. Every other route's fixture carries a host of its own.
+/// gives a hostless metric or log its `host.name` from the default host. Every other route's
+/// fixture carries a host of its own.
 fn relayed(batch: &EventBatch) -> EventBatch {
     let mut batch = batch.clone();
     for event in &mut batch.events {
-        let key = if event.log.is_some() { "hostname" } else { ATTR_HOST_NAME };
-        if event.attributes.get(key).is_none() {
-            event.attributes.insert(key, Value::str(RELAY_HOST));
+        if event.attributes.get(ATTR_HOST_NAME).is_none() {
+            event.attributes.insert(ATTR_HOST_NAME, Value::str(RELAY_HOST));
         }
     }
     batch

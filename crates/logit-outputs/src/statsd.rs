@@ -107,32 +107,30 @@
 //!
 //! ## The host
 //!
-//! Under `Format::DogStatsd`, the tag segment carries the host as a DogStatsD Agent reads it: the
-//! Agent takes a line's host from its `host:` tag (an empty one included, which leaves the sample
-//! hostless), the last one when there are several, consumes every `host:` tag, and stamps its own
-//! hostname on a line without one. An event's or service check's non-empty `h:` field outranks the
-//! tag; the Agent reads an empty `h:` as none. [`build_tag_suffix`] writes, on the merged
-//! resource⊕event view:
+//! Under `Format::DogStatsd`, each line carries the host as a DogStatsD Agent reads it: the Agent
+//! takes a line's host from an event's or service check's non-empty `h:` field, else its `host:`
+//! tag (an empty one included, which leaves the sample hostless), the last one when there are
+//! several; it consumes every `host:` tag, and stamps its own hostname on a line without one.
+//! [`build_tag_suffix`] reads the merged resource⊕event view and writes:
 //!
-//! 1. A `host.name` that's a non-empty string as the `host:` tag, after the other tags, whatever
-//!    else the record carries. A `host` attribute beside it would be a second `host:` tag, so it's
-//!    omitted, counted `tags.omitted{reason="unrepresentable"}` once per wire tag; a non-empty
-//!    `h:` carrier beside it is private and left unwritten, uncounted. `statsd_in` reads the tag
-//!    back as `host`, so a `statsd_in -> statsd_out` relay turns a `host.name:` tag into the
-//!    `host:` tag, a permitted normalization of the pair
-//!    (`crates/logit-cli/tests/statsd_round_trip.rs`'s list, (10)).
-//! 2. With no such `host.name`, any `host` attribute as an ordinary tag, `host:<v>` for a string,
-//!    so a DogStatsD `host:` tag relays as itself, and an event's or check's `h:` field as its own.
-//! 3. With no such `host.name`, no `host` attribute, and no non-empty `h:` field, `datadog_in`'s
-//!    hostless mark (`_logit.datadog.hostless`, `Bool(true)`) as an empty `host:` tag.
-//!    `statsd_in` reads it back as an empty `host`, which `datadog_out` reads as a hostless
-//!    sample.
+//! 1. A `host.name` that's a non-empty string as the host: a metric line's `host:` tag, after the
+//!    other tags, and an event's or service check's `|h:` field, with no `host:` tag. `statsd_in`
+//!    reads either back as `host.name`.
+//! 2. With no such `host.name`, `datadog_in`'s and `statsd_in`'s hostless mark
+//!    (`_logit.datadog.hostless`, `Bool(true)`) as an empty `host:` tag on every line kind, since
+//!    the Agent reads an empty `h:` as no host and stamps its own. `statsd_in` reads it back as the
+//!    mark.
+//! 3. With neither, no host: the Agent stamps its own.
 //!
-//! Any other `host.name` (empty, or not a string) is an ordinary tag in its place, and
-//! `Format::Statsd` writes no tags at all. The order is `datadog_out`'s: `host.name` is the
-//! standard host key and ranks first at every sink (`docs/adr/process-hostname.md`'s "Amendment:
-//! `host.name` ranks first everywhere (2026-10-23)").
-//!
+//! Where either of the first two applies, a `host` attribute would be a second `host:` tag the
+//! Agent consumes, so it's omitted, counted `tags.omitted{reason="unrepresentable"}` once per wire
+//! tag. Otherwise a `host` attribute is an ordinary tag, `host:<v>`, which the Agent reads as the
+//! host: `statsd_in` never decodes one, so it's the operator's own, from a `set`, a script, or
+//! another protocol. Any other `host.name` (empty, or not a string) is an ordinary tag in its
+//! place, and `Format::Statsd` writes no tags at all. `host.name` is the standard host key, which a
+//! source fills from its own wire host and every sink ranks first (`docs/adr/process-hostname.md`'s
+//! "Amendment: a source fills the common keys (2026-10-23)").
+
 //! ## Metric-kind coverage
 //!
 //! Each written as its own native line: a delta, monotonic `Sum` (`MetricKind::counter`, `|c`),
@@ -292,9 +290,9 @@
 //! | `record/unit_on_distribution` | lost | structural | statsd has no unit, so none is written. |
 //! | `record/sample_rate_unweighted` | exact | -- | The rate is written as `@rate` on the line. |
 //! | `attributes/string_value`, under `format: statsd` | lost | `logit.output.tags.omitted{reason=dialect}` | Plain statsd has no tags; each is counted once per wire tag. |
-//! | `attributes/string_value`, otherwise | normalized | `tag_rewritten`; `logit.output.tags.normalized` | A DogStatsD `key:value` tag. Each `:`, `\|`, `@`, `#`, `,`, control, and whitespace character in the key, and each but `:` in the value, is written as `_`, counted once per wire tag as `name_sanitized` for a key and `value_sanitized` for a value. A non-empty `host.name` is the `host:` tag, which statsd_in reads back as `host`. |
+//! | `attributes/string_value`, otherwise | normalized | `tag_rewritten`; `logit.output.tags.normalized` | A DogStatsD `key:value` tag. Each `:`, `\|`, `@`, `#`, `,`, control, and whitespace character in the key, and each but `:` in the value, is written as `_`, counted once per wire tag as `name_sanitized` for a key and `value_sanitized` for a value. A `host` on a line with no host of its own is its `host:` tag, which statsd_in reads back as `host.name`. |
 //! | `attributes/host_beside_host_name`, under `format: statsd` | lost | `logit.output.tags.omitted{reason=dialect}` | Plain statsd has no tags; each is counted once per wire tag. |
-//! | `attributes/host_beside_host_name`, otherwise | lost | `logit.output.tags.omitted{reason=unrepresentable}` | A non-empty `host.name` is the line's `host:` tag, so a `host` beside it, a second `host:` tag the Agent would consume, is left off, counted once per wire tag. |
+//! | `attributes/host_beside_host_name`, otherwise | lost | `logit.output.tags.omitted{reason=unrepresentable}` | A non-empty `host.name` or the hostless mark is the line's own host, so a `host` beside it, a second `host:` tag the Agent would consume, is left off, counted once per wire tag. |
 //! | `attributes/bool_value`, under `format: statsd` | lost | `logit.output.tags.omitted{reason=dialect}` | Plain statsd has no tags. |
 //! | `attributes/bool_value`, otherwise | normalized | `bool_tag` | `true` is a bare tag and reads back `true`; `false` is `key:false` and reads back as the string. |
 //! | `attributes/number_value`, under `format: statsd` | lost | `logit.output.tags.omitted{reason=dialect}` | Plain statsd has no tags. |
@@ -310,7 +308,7 @@
 //! | `attributes/private_carrier`, under `format: statsd` | lost | `logit.output.fields.omitted{reason=dialect}` | Plain statsd has no `\|c:`, `\|e:`, or `\|card:` segment, so those carriers are omitted, counted once per carrier per line; the type carrier survives as the line's type, `h` and `d` as `ms`. |
 //! | `attributes/private_carrier`, otherwise | exact | -- | A `_logit.statsd.*` carrier is written as its own segment or field and statsd_in stamps it back. |
 //! | `attributes/prometheus_target` | lost | structural | The scrape target is private and isn't a tag, so it's left off. |
-//! | `attributes/foreign_carrier` | lost | structural | Another protocol's `_logit.` carrier is private and isn't a tag, so it's left off. Under `format: dogstatsd`, `_logit.datadog.hostless` on a record with no `host`, no non-empty `host.name`, and no non-empty `h:` field is an empty `host:` tag, which statsd_in reads back as an empty `host`. A `_logit.metrics.*` flag is left off too; the `timestamped`, `rate`, `family_type`, and `interval` rows have `_logit.metrics.closed: timestamped`, `_logit.metrics.type`, and `_logit.metrics.interval`. |
+//! | `attributes/foreign_carrier` | lost | structural | Another protocol's `_logit.` carrier is private and isn't a tag, so it's left off. Under `format: dogstatsd`, `_logit.datadog.hostless` on a record with no non-empty `host.name` is an empty `host:` tag, which statsd_in reads back as the mark. A `_logit.metrics.*` flag is left off too; the `timestamped`, `rate`, `family_type`, and `interval` rows have `_logit.metrics.closed: timestamped`, `_logit.metrics.type`, and `_logit.metrics.interval`. |
 //! | `attributes/timestamped`, under `format: statsd` | lost | `logit.output.fields.omitted{reason=dialect}` | Plain statsd has no `\|T` segment, so the event's timestamp is omitted, counted. |
 //! | `attributes/timestamped`, otherwise | exact | -- | The event's timestamp is written as `\|T<seconds>` (`d:<seconds>` on an event or a service check), truncated to whole seconds, and statsd_in sets the flag again. A scraped Prometheus sample with its own timestamp leaves with a `\|T` too. A timestamp before 1970 has no unsigned seconds to write, so it's omitted, counted `logit.output.fields.omitted{reason=invalid_value}` once per line. |
 //! | `attributes/rate` | lost | structural | The flag is private and isn't a tag, so it's left off. |
@@ -496,9 +494,8 @@
 //!
 //! **Event wire form**, one line: `_e{tlen,xlen}:title|text`, then, in this order and only when
 //! present and valid: `|d:<secs>` (for a `timestamped` event, as for `|T`; `d:`, never `|T`,
-//! since an event's timestamp is a named field of its own grammar), `|h:<host>` (from the
-//! `_logit.statsd.event.host` carrier only, and not beside a non-empty `host.name`, which goes in
-//! the tag segment, under "The host"), `|p:<priority>`
+//! since an event's timestamp is a named field of its own grammar), `|h:<host>` (a usable
+//! `host.name`, under "The host"), `|p:<priority>`
 //! (`normal`/`low` only), `|t:<alert_type>` (`info`/`success`/`warning`/`error` only),
 //! `|k:<aggregation_key>`, `|s:<source_type>`, the `|#...` tag segment (via
 //! [`build_tag_suffix`]/[`append_tags`], as for a metric line), then `|c:<container id>`,
@@ -512,8 +509,8 @@
 //! carrier outranks the normalized field on this protocol's own egress, and an absent carrier means
 //! an absent wire field.
 //!
-//! **Service-check wire form**, one line: `_sc|<name>|<status>`, then `|d:<secs>`, `|h:<host>`,
-//! the `|#...` tag segment, `|c:<container id>`, `|e:<external data>`, `|card:<cardinality>`, and
+//! **Service-check wire form**, one line: `_sc|<name>|<status>`, then `|d:<secs>`, `|h:<host>`
+//! (as for an event), the `|#...` tag segment, `|c:<container id>`, `|e:<external data>`, `|card:<cardinality>`, and
 //! last `|m:<message>`, the reference order. The event's **first** metric is the check and must be
 //! a `Gauge`; otherwise the whole event is dropped and counted
 //! (`EncodeStats::dropped_invalid_service_check`) rather than falling through to a `name:v|g` line,
@@ -524,7 +521,7 @@
 //! `U64` in `0..=3`, else the gauge's value if finite and rounding into `0..=3`, else the check is
 //! dropped and counted (`dropped_invalid_service_check`) rather than written with a status
 //! DogStatsD's own decoder would reject. Metrics after the first render as ordinary lines
-//! (`render_metric`) right after the `_sc` line.
+//! (`render_metric`) right after the `_sc` line, each with the host as its `host:` tag.
 //!
 //! **Sanitization**, one rule per field, all substitution:
 //!
@@ -532,7 +529,8 @@
 //!   length prefix delimits the field.
 //! - Event text: a real newline becomes the two-byte escape `\n`; any other control byte -> `_`
 //!   ([`append_event_text`]).
-//! - Event host/aggregation key/source, service-check name/host: `|` and control bytes -> `_`
+//! - Event or service-check host, event aggregation key/source, service-check name: `|` and
+//!   control bytes -> `_`
 //!   ([`is_forbidden_in_extended_field`]). Each sits in a `|letter:value` field a decode ends at
 //!   the next `|`, as for a tag value, but none has a tag value's colon-splitting ambiguity.
 //! - Event priority/alert type: never sanitized. A value in the fixed set is written verbatim; any
@@ -1073,12 +1071,17 @@ struct Carriers<'a> {
     event_alert_type: Option<&'a str>,
     event_aggregation_key: Option<&'a str>,
     event_source_type: Option<&'a str>,
-    event_host: Option<&'a str>,
     /// `_logit.statsd.service_check.name`; its presence is the service-check detection rule.
     service_check_name: Option<&'a str>,
     service_check_status: Option<u64>,
     service_check_message: Option<&'a str>,
-    service_check_host: Option<&'a str>,
+    /// A usable `host.name` ([`is_usable_host`]) under `Format::DogStatsd`: an event's or
+    /// service check's `h:` field, and the trailing `host:` tag of a metric line.
+    host: Option<&'a str>,
+    /// Where that trailing `host:` tag starts in the tag segment, separator excluded: an event or
+    /// service check line writes only the segment before it. The segment's length when there's
+    /// no such tag.
+    host_tag_at: usize,
 }
 
 impl Carriers<'_> {
@@ -1111,16 +1114,18 @@ fn build_tag_suffix<'a>(
     carriers: &mut Carriers<'a>,
 ) {
     suffix.clear();
-    let mut has_host = false;
-    let mut host_name: Option<&Value> = None;
-    let mut hostless = false;
-    // A usable `host.name` is the line's host, so a `host` attribute would be a second `host:`
-    // tag, which the Agent consumes (module doc's "The host").
-    let host_name_wins = format == Format::DogStatsd && {
-        let key = *HOST_NAME_KEY;
-        event.attributes.get_sym(key).or_else(|| resource.attributes.get_sym(key))
-    }
-    .is_some_and(is_usable_host);
+    // The line's host (module doc's "The host"): a usable `host.name`, else the hostless mark.
+    // Either way a `host` attribute would be a second `host:` tag, which the Agent consumes.
+    let (host_name, hostless) = if format == Format::DogStatsd {
+        let get = |key: logit_core::Symbol| {
+            event.attributes.get_sym(key).or_else(|| resource.attributes.get_sym(key))
+        };
+        let host_name = get(*HOST_NAME_KEY).filter(|v| is_usable_host(v));
+        (host_name, host_name.is_none() && get(*HOSTLESS_KEY) == Some(&Value::Bool(true)))
+    } else {
+        (None, false)
+    };
+    let line_names_host = host_name.is_some() || hostless;
     for (key, value) in crate::attrs::merged(resource, event) {
         let key_str = logit_core::interner::resolve(key);
         // This sink's own carriers, which `statsd_in` stamps from a line's own segments and this
@@ -1155,9 +1160,6 @@ fn build_tag_suffix<'a>(
                 ("_logit.statsd.event.source_type", Value::Str(s)) => {
                     carriers.event_source_type = std::str::from_utf8(s).ok();
                 }
-                ("_logit.statsd.event.host", Value::Str(s)) => {
-                    carriers.event_host = std::str::from_utf8(s).ok();
-                }
                 ("_logit.statsd.service_check.name", Value::Str(s)) => {
                     carriers.service_check_name = std::str::from_utf8(s).ok();
                 }
@@ -1167,17 +1169,10 @@ fn build_tag_suffix<'a>(
                 ("_logit.statsd.service_check.message", Value::Str(s)) => {
                     carriers.service_check_message = std::str::from_utf8(s).ok();
                 }
-                ("_logit.statsd.service_check.host", Value::Str(s)) => {
-                    carriers.service_check_host = std::str::from_utf8(s).ok();
-                }
                 // A wrong-typed carrier or an unknown `_logit.statsd.*` key is ignored, not an
                 // error.
                 _ => {}
             }
-            continue;
-        }
-        if key_str == ATTR_HOSTLESS {
-            hostless = matches!(value, Value::Bool(true));
             continue;
         }
         if key_str == METRICS_CLOSED {
@@ -1198,7 +1193,7 @@ fn build_tag_suffix<'a>(
         }
 
         match key_str {
-            "host" if host_name_wins => {
+            "host" if line_names_host => {
                 // Per wire tag, as an `Array` would write one `host:` tag per element.
                 stats.tags_omitted_unrepresentable += match value {
                     Value::Array(elements) => elements.len(),
@@ -1206,11 +1201,7 @@ fn build_tag_suffix<'a>(
                 };
                 continue;
             }
-            "host" => has_host = true,
-            ATTR_HOST_NAME if is_usable_host(value) => {
-                host_name = Some(value);
-                continue;
-            }
+            ATTR_HOST_NAME if host_name.is_some() => continue,
             _ => {}
         }
 
@@ -1227,39 +1218,25 @@ fn build_tag_suffix<'a>(
             }
         }
     }
-    if format == Format::DogStatsd {
-        // Only the line's own non-empty `h:` field outranks a `host:` tag where the Agent reads
-        // the host; the Agent reads an empty `h:` as none.
-        let line_host = if event.metrics.is_empty() {
-            carriers.event_host
-        } else if carriers.service_check_name.is_some() {
-            carriers.service_check_host
-        } else {
-            None
-        };
-        let tag_is_host = !has_host && line_host.is_none_or(str::is_empty);
-        match host_name {
-            Some(value) => {
-                // `host.name` is the host, so a non-empty `h:` carrier, which the Agent would read
-                // ahead of the tag, is left unwritten. An empty one is no host and stays.
-                carriers.event_host = carriers.event_host.filter(|h| h.is_empty());
-                carriers.service_check_host = carriers.service_check_host.filter(|h| h.is_empty());
-                push_one_tag(suffix, scratch, "host", value, stats);
-            }
-            None if tag_is_host && hostless => {
-                // An empty `host:` tag keeps the Agent from stamping its own hostname.
-                if !suffix.is_empty() {
-                    suffix.push(',');
-                }
-                suffix.push_str("host:");
-            }
-            None => {}
+    carriers.host_tag_at = suffix.len();
+    if let Some(value) = host_name {
+        carriers.host = value.as_str();
+        push_one_tag(suffix, scratch, "host", value, stats);
+    } else if hostless {
+        // An empty `host:` tag keeps the Agent from stamping its own hostname, on every line
+        // kind: an empty `h:` would be no host, which the Agent fills.
+        if !suffix.is_empty() {
+            suffix.push(',');
         }
+        suffix.push_str("host:");
+        carriers.host_tag_at = suffix.len();
     }
 }
 
 static HOST_NAME_KEY: LazyLock<logit_core::Symbol> =
     LazyLock::new(|| logit_core::interner::intern(ATTR_HOST_NAME));
+static HOSTLESS_KEY: LazyLock<logit_core::Symbol> =
+    LazyLock::new(|| logit_core::interner::intern(ATTR_HOSTLESS));
 
 /// Whether `host.name` holds a host this sink writes as the DogStatsD `host:` tag: a non-empty,
 /// UTF-8 `Str`. Any other `host.name` is an ordinary tag.
@@ -1440,7 +1417,7 @@ fn render_event(
     line.push_str(text_buf);
 
     append_wire_time(line, "|d:", ctx);
-    if let Some(host) = carriers.event_host {
+    if let Some(host) = carriers.host {
         line.push_str("|h:");
         sanitize_into(line, host, is_forbidden_in_extended_field);
     }
@@ -1486,7 +1463,7 @@ fn render_event(
         line.push_str("|s:");
         sanitize_into(line, source, is_forbidden_in_extended_field);
     }
-    append_tags(line, ctx.tag_suffix);
+    append_tags(line, &ctx.tag_suffix[..carriers.host_tag_at]);
     append_origin_fields(line, ctx);
 
     push_line(line, ctx.max_packet_bytes, ctx.stats, ctx.diag, ctx.out);
@@ -1549,11 +1526,11 @@ fn render_service_check(
     let _ = write!(line, "|{status}");
 
     append_wire_time(line, "|d:", ctx);
-    if let Some(host) = carriers.service_check_host {
+    if let Some(host) = carriers.host {
         line.push_str("|h:");
         sanitize_into(line, host, is_forbidden_in_extended_field);
     }
-    append_tags(line, ctx.tag_suffix);
+    append_tags(line, &ctx.tag_suffix[..carriers.host_tag_at]);
     append_origin_fields(line, ctx);
     if let Some(message) = carriers.service_check_message {
         line.push_str("|m:");
@@ -4359,9 +4336,9 @@ mod tests {
         assert_eq!(stats.tags_omitted_unrepresentable, 2);
     }
 
-    /// With no usable `host.name`, a `host` attribute is the `host:` tag as it arrived.
+    /// With no usable `host.name` and no hostless mark, a `host` attribute is an ordinary tag.
     #[test]
-    fn a_host_attribute_is_the_host_tag_without_host_name() {
+    fn a_host_attribute_is_an_ordinary_tag_without_host_name() {
         let (dog, stats) = encode(vec![metric_event(
             "hits",
             MetricKind::counter(1.0),
@@ -4386,8 +4363,8 @@ mod tests {
         assert_eq!(stats.tags_omitted_dialect, 2);
     }
 
-    /// The resource's `host.name` outranks the event's `host`; an event's own unusable
-    /// `host.name` hides the resource's, as the merged walk has it.
+    /// The resource's `host.name` is the host of every event, and an event's own unusable
+    /// `host.name` hides it, as the merged walk has it.
     #[test]
     fn a_resource_host_name_is_the_host_tag() {
         let mut resource = Resource::default();
@@ -4407,6 +4384,8 @@ mod tests {
         assert_eq!(tags, ["host.name:", "host:web1"]);
     }
 
+    /// The hostless mark with no usable `host.name` is an empty `host:` tag, which outranks a
+    /// `host` attribute as `host.name` does.
     #[test]
     fn a_hostless_mark_with_no_host_is_an_empty_host_tag() {
         let hostless = ("_logit.datadog.hostless", Value::Bool(true));
@@ -4419,92 +4398,66 @@ mod tests {
         assert_eq!(plain, vec!["hits:1|c"]);
         assert_eq!(stats.tags_omitted_dialect, 1, "the mark is a carrier, not a tag");
 
-        // A host or a usable `host.name` outranks the mark, and a false mark is none.
-        for (attrs, want) in [
-            (vec![hostless.clone(), ("host", "web1".into())], "hits:1|c|#host:web1"),
-            (vec![hostless.clone(), ("host.name", "h1".into())], "hits:1|c|#host:h1"),
-            (vec![("_logit.datadog.hostless", Value::Bool(false))], "hits:1|c"),
+        // A usable `host.name` outranks the mark, the mark a `host`, and a false mark is none.
+        for (attrs, want, omitted) in [
+            (vec![hostless.clone(), ("host", "web1".into())], "hits:1|c|#host:", 1),
+            (vec![hostless.clone(), ("host.name", "h1".into())], "hits:1|c|#host:h1", 0),
+            (vec![("_logit.datadog.hostless", Value::Bool(false))], "hits:1|c", 0),
         ] {
-            let (dog, _) = encode(vec![metric_event("hits", MetricKind::counter(1.0), &attrs)]);
+            let (dog, stats) = encode(vec![metric_event("hits", MetricKind::counter(1.0), &attrs)]);
             assert_eq!(dog, vec![want], "{attrs:?}");
+            assert_eq!(stats.tags_omitted_unrepresentable, omitted, "{attrs:?}");
         }
     }
 
-    /// `statsd_in` reads the empty tag back as an empty `Str` `host`, which `datadog_out` reads
-    /// as a hostless sample.
+    /// `statsd_in` reads `host.name` back from the `host:` tag and the hostless mark from an empty
+    /// one.
     #[test]
-    fn an_empty_host_tag_reads_back_as_an_empty_host() {
-        let event = metric_event(
-            "hits",
-            MetricKind::counter(1.0),
-            &[("_logit.datadog.hostless", Value::Bool(true))],
-        );
-        let (msgs, _) = encode(vec![event]);
-        let back = decode_one(&msgs[0]);
-        assert_eq!(back[0].attributes.get("host"), Some(&Value::str("")));
+    fn the_host_tag_reads_back_as_host_name_or_the_mark() {
+        for (attr, value) in
+            [("host.name", Value::str("h1")), ("_logit.datadog.hostless", Value::Bool(true))]
+        {
+            let event = metric_event("hits", MetricKind::counter(1.0), &[(attr, value.clone())]);
+            let (msgs, _) = encode(vec![event]);
+            let back = decode_one(&msgs[0]);
+            assert_eq!(back[0].attributes.get(attr), Some(&value));
+            assert_eq!(back[0].attributes.get("host"), None);
+        }
     }
 
+    /// An event's or a service check's host is its `|h:` field, with no `host:` tag, and a
+    /// `host` attribute beside it is omitted, counted; the check's later metric lines carry it as
+    /// their `host:` tag.
     #[test]
-    fn host_name_on_an_event_or_check_with_no_h_field_is_the_host_tag() {
+    fn host_name_on_an_event_or_check_is_the_h_field() {
         let host_name = ("host.name", Value::str("h1"));
-        let event = event_line_event("t", "x", std::slice::from_ref(&host_name));
-        let check = service_check_event("c", MetricKind::gauge(0.0), &[host_name]);
-        let (dog, plain, stats) = encode_both(vec![event, check]);
-        assert_eq!(dog, vec!["_e{1,1}:t|x|#host:h1", "_sc|c|0|#host:h1"]);
+        let event = event_line_event("t", "x", &[host_name.clone(), ("env", "prod".into())]);
+        let mut check = service_check_event(
+            "c",
+            MetricKind::gauge(0.0),
+            &[host_name.clone(), ("host", "web1".into())],
+        );
+        check.metrics.push(MetricRecord::new(intern("extra"), MetricKind::gauge(2.0)));
+        let (dog, plain, stats) = encode_both(vec![event.clone(), check.clone()]);
+        assert_eq!(dog, vec!["_e{1,1}:t|x|h:h1|#env:prod", "_sc|c|0|h:h1", "extra:2|g|#host:h1"]);
         assert!(plain.is_empty());
         assert_eq!(stats.skipped_dialect_events, 2);
+        let (_, dog_stats) = encode(vec![check]);
+        assert_eq!(dog_stats.tags_omitted_unrepresentable, 1);
+
+        let back = decode_one(&dog[0]);
+        assert_eq!(back[0].attributes.get("host.name"), Some(&host_name.1));
     }
 
-    /// A usable `host.name` outranks the line's own `h:` field: it's the `host:` tag, and the
-    /// `h:` carrier, private, is left unwritten. Without one, the `h:` field is the host at the
-    /// Agent, so a hostless mark writes no `host:` tag.
+    /// The hostless mark is an empty `host:` tag on an event or a check too, since an empty `h:`
+    /// is no host at the Agent.
     #[test]
-    fn host_name_outranks_an_h_field() {
-        let event = event_line_event(
-            "t",
-            "x",
-            &[("_logit.statsd.event.host", Value::str("e1")), ("host.name", Value::str("h1"))],
-        );
-        let check = service_check_event(
-            "c",
-            MetricKind::gauge(0.0),
-            &[
-                ("_logit.statsd.service_check.host", Value::str("s1")),
-                ("_logit.datadog.hostless", Value::Bool(true)),
-            ],
-        );
+    fn a_hostless_event_or_check_is_an_empty_host_tag() {
+        let hostless = ("_logit.datadog.hostless", Value::Bool(true));
+        let event = event_line_event("t", "x", std::slice::from_ref(&hostless));
+        let check = service_check_event("c", MetricKind::gauge(0.0), &[hostless]);
         let (dog, _) = encode(vec![event, check]);
-        assert_eq!(dog, vec!["_e{1,1}:t|x|#host:h1", "_sc|c|0|h:s1"]);
-        let check = service_check_event(
-            "c",
-            MetricKind::gauge(0.0),
-            &[
-                ("_logit.statsd.service_check.host", Value::str("s1")),
-                ("host.name", Value::str("h1")),
-            ],
-        );
-        let (dog, _) = encode(vec![check]);
-        assert_eq!(dog, vec!["_sc|c|0|#host:h1"]);
-    }
-
-    /// An empty `h:` field is no host at the Agent, so the `host:` tag still carries one.
-    #[test]
-    fn an_empty_h_field_leaves_the_host_to_the_tag() {
-        let event = event_line_event(
-            "t",
-            "x",
-            &[("_logit.statsd.event.host", Value::str("")), ("host.name", Value::str("h1"))],
-        );
-        let check = service_check_event(
-            "c",
-            MetricKind::gauge(0.0),
-            &[
-                ("_logit.statsd.service_check.host", Value::str("")),
-                ("_logit.datadog.hostless", Value::Bool(true)),
-            ],
-        );
-        let (dog, _) = encode(vec![event, check]);
-        assert_eq!(dog, vec!["_e{1,1}:t|x|h:|#host:h1", "_sc|c|0|h:|#host:"]);
+        assert_eq!(dog, vec!["_e{1,1}:t|x|#host:", "_sc|c|0|#host:"]);
     }
 
     #[test]
@@ -4554,7 +4507,7 @@ mod tests {
                 "héllo",
                 "world",
                 &[
-                    ("_logit.statsd.event.host", Value::str("web1")),
+                    ("host.name", Value::str("web1")),
                     ("_logit.statsd.event.priority", Value::str("low")),
                     ("_logit.statsd.event.alert_type", Value::str("error")),
                     ("_logit.statsd.event.aggregation_key", Value::str("key1")),
@@ -4666,10 +4619,10 @@ mod tests {
         let event = event_line_event(
             "t",
             "x",
-            &[("_logit.statsd.event.host", Value::str("web1")), ("env", "prod".into())],
+            &[("_logit.statsd.event.priority", Value::str("low")), ("env", "prod".into())],
         );
         let (msgs, _) = encode(vec![event]);
-        assert_eq!(msgs, vec!["_e{1,1}:t|x|h:web1|#env:prod"]);
+        assert_eq!(msgs, vec!["_e{1,1}:t|x|p:low|#env:prod"]);
     }
 
     #[test]
@@ -4728,7 +4681,7 @@ mod tests {
                 "my.check",
                 MetricKind::gauge(1.0),
                 &[
-                    ("_logit.statsd.service_check.host", Value::str("web1")),
+                    ("host.name", Value::str("web1")),
                     ("env", "prod".into()),
                     ("_logit.statsd.container_id", Value::str("cid1")),
                 ],
@@ -6129,7 +6082,7 @@ mod tests {
             matches!(relayed[0].metrics[0].kind, MetricKind::Sum(s) if s.value == MetricValue::F64(3.0))
         );
         assert_eq!(relayed[0].attributes.get("env").and_then(|v| v.as_str()), Some("prod"));
-        assert_eq!(relayed[0].attributes.get("host").and_then(|v| v.as_str()), Some("web1"));
+        assert_eq!(relayed[0].attributes.get("host.name").and_then(|v| v.as_str()), Some("web1"));
     }
 
     /// Multi-value, `@rate`, and tags all survive a timer line's relay.
@@ -6148,7 +6101,7 @@ mod tests {
                 if s.values.as_slice() == [12.5, 34.0, 56.0] && s.sample_rate == 0.5
         ));
         assert_eq!(relayed[0].attributes.get("env").and_then(|v| v.as_str()), Some("prod"));
-        assert_eq!(relayed[0].attributes.get("host").and_then(|v| v.as_str()), Some("web1"));
+        assert_eq!(relayed[0].attributes.get("host.name").and_then(|v| v.as_str()), Some("web1"));
         assert_eq!(
             relayed[0].attributes.get("_logit.statsd.type").and_then(|v| v.as_str()),
             Some("ms")

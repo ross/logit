@@ -4,7 +4,7 @@
 
 use super::time::{millis_to_nanos, nanos_to_millis, or_received};
 use super::{
-    is_datadog_event, DatadogDecoder, DatadogEncoder, ATTR_HOST_NAME, ATTR_HOST_TAG, ATTR_SOURCE,
+    insert_wire_host, is_datadog_event, DatadogDecoder, DatadogEncoder, ATTR_HOST_NAME, ATTR_SOURCE,
 };
 use crate::json::{json_to_value, value_text, write_i64, write_str, write_value, JsonObject};
 use crate::CodecError;
@@ -21,8 +21,10 @@ use std::sync::{Arc, LazyLock};
 
 /// `status`: a log's raw Datadog status, kept verbatim beside the normalized severity.
 pub const ATTR_STATUS: &str = "status";
-/// `hostname`, `service`, `ddsource`, `ddtags`: a decoded log's reserved fields, kept verbatim.
+/// `hostname`: a log's wire host, which decodes to `host.name`; never an attribute of a decoded
+/// log but one whose value isn't a string.
 pub const ATTR_HOSTNAME: &str = "hostname";
+/// `service`, `ddsource`, `ddtags`: a decoded log's reserved fields, kept verbatim.
 pub const ATTR_SERVICE: &str = "service";
 pub const ATTR_DDSOURCE: &str = "ddsource";
 pub const ATTR_DDTAGS: &str = "ddtags";
@@ -43,7 +45,7 @@ struct LogKeys {
     /// Hosts Datadog's log preprocessing reads from a top-level attribute, so a log carrying one
     /// has a host of its own and never gets the default.
     syslog_hostname: Symbol,
-    host_tag: Symbol,
+    host: Symbol,
     service_name: Symbol,
     source: Symbol,
     message: Symbol,
@@ -61,7 +63,7 @@ static KEYS: LazyLock<LogKeys> = LazyLock::new(|| LogKeys {
     host_name: intern(ATTR_HOST_NAME),
     // Datadog's reserved log host attribute, not a syslog-family key.
     syslog_hostname: intern("syslog.hostname"),
-    host_tag: intern(ATTR_HOST_TAG),
+    host: intern("host"),
     service_name: intern(ATTR_SERVICE_NAME),
     source: intern(ATTR_SOURCE),
     message: intern("message"),
@@ -127,6 +129,12 @@ impl DatadogDecoder {
                     attributes.insert(key, json_to_value(value));
                 }
             }
+        }
+        // The log's own host displaces a `host.name` key. An empty one is no host.
+        if let Some(host) = obj.get(ATTR_HOSTNAME).and_then(Json::as_str) {
+            attributes.remove(ATTR_HOSTNAME);
+            let displaced = insert_wire_host(&mut attributes, Some(host).filter(|h| !h.is_empty()));
+            self.displaced_host_names(displaced);
         }
         Some(Event::log(
             or_received(timestamp, received_at),
@@ -227,8 +235,14 @@ impl DatadogEncoder {
         let keys = &*KEYS;
         let attrs: Vec<(Symbol, &Value)> = merged(resource, event).collect();
         let find = |key: Symbol| attrs.iter().find(|(k, _)| *k == key).map(|(_, v)| *v);
-        let mut consumed =
-            vec![keys.status, keys.hostname, keys.service, keys.ddsource, keys.ddtags];
+        let mut consumed = vec![
+            keys.status,
+            keys.hostname,
+            keys.host_name,
+            keys.service,
+            keys.ddsource,
+            keys.ddtags,
+        ];
 
         let mut obj = JsonObject::begin(out);
         write_str(obj.key("message"), &value_text(&log.message));
@@ -238,29 +252,26 @@ impl DatadogEncoder {
             write_str(obj.key("status"), severity.as_str());
         }
         write_i64(obj.key("timestamp"), nanos_to_millis(event.timestamp));
-        // A non-empty `host.name` is the log's `hostname`, ahead of a `hostname` attribute, which
-        // then has no key of its own on the wire.
-        let host_name = find(keys.host_name).filter(|v| v.as_str() != Some(""));
-        if let Some(host) = host_name {
-            write_value(obj.key("hostname"), host);
-            consumed.push(keys.host_name);
-            if find(keys.hostname).is_some() {
-                self.telemetry.count(
-                    "logit.output.tags.omitted",
-                    1.0,
-                    &[("reason", "reserved_key")],
-                );
+        // `host.name` is the log's `hostname`, else the default host, unless the log carries a
+        // host Datadog's log preprocessing reads. An empty `host.name` is no host. A `hostname`
+        // attribute would collide with the wire's own key, so it's omitted.
+        match find(keys.host_name).filter(|v| v.as_str() != Some("")) {
+            Some(host) => write_value(obj.key("hostname"), host),
+            None if find(keys.syslog_hostname).is_some() || find(keys.host).is_some() => {}
+            None => {
+                if let Some(host) = &self.default_host {
+                    write_str(obj.key("hostname"), host);
+                }
             }
         }
+        if find(keys.hostname).is_some() {
+            self.telemetry.count("logit.output.tags.omitted", 1.0, &[("reason", "reserved_key")]);
+        }
         for (key, primary, fallback) in [
-            ("hostname", keys.hostname, Some(keys.host_name)),
             ("service", keys.service, Some(keys.service_name)),
             ("ddsource", keys.ddsource, Some(keys.source)),
             ("ddtags", keys.ddtags, None),
         ] {
-            if primary == keys.hostname && host_name.is_some() {
-                continue;
-            }
             if let Some(value) = find(primary) {
                 write_value(obj.key(key), value);
             } else if let Some(value) = fallback.and_then(find) {
@@ -269,13 +280,6 @@ impl DatadogEncoder {
             } else if primary == keys.ddsource {
                 if let Some(source) = &self.default_source {
                     write_str(obj.key(key), source);
-                }
-            } else if primary == keys.hostname
-                && find(keys.syslog_hostname).is_none()
-                && find(keys.host_tag).is_none()
-            {
-                if let Some(host) = &self.default_host {
-                    write_str(obj.key(key), host);
                 }
             }
         }
@@ -372,7 +376,8 @@ pub(super) mod tests {
         assert_eq!(log.severity, Some(Severity::Warn));
         assert_eq!(log.body_format, BodyFormat::Raw);
         assert_eq!(event.attributes.get("status"), Some(&Value::str("warning")));
-        assert_eq!(event.attributes.get("hostname"), Some(&Value::str("myhost")));
+        assert_eq!(event.attributes.get("host.name"), Some(&Value::str("myhost")));
+        assert_eq!(event.attributes.get("hostname"), None);
         assert_eq!(event.attributes.get("service"), Some(&Value::str("svc")));
         assert_eq!(event.attributes.get("ddsource"), Some(&Value::str("nginx")));
         // Not expanded: that is a transform's job.
@@ -537,44 +542,65 @@ pub(super) mod tests {
         assert!(item.get("service.name").is_none());
     }
 
-    /// A non-empty `host.name` is the log's `hostname` ahead of a `hostname` attribute, which has
-    /// no key of its own on the wire and is counted `reserved_key`. An empty `host.name` is no
-    /// host, so the `hostname` attribute is.
+    /// A log's `hostname` decodes to `host.name`, displacing a `host.name` key, counted; an empty
+    /// one is no host. On encode, `host.name` is the `hostname`, and a `hostname` attribute from
+    /// any other source would collide with it, so it's omitted, counted, `host.name` or not.
     #[test]
-    fn host_name_outranks_a_hostname_attribute() {
+    fn hostname_is_host_name_both_ways() {
         let registry = Registry::new();
+        let mut decoder = DatadogDecoder::new().with_telemetry(registry.telemetry_for(
+            "datadog_in",
+            "datadog_in",
+            "listener",
+        ));
+        let batch = decoder
+            .decode_logs(br#"[{"message":"a","hostname":"h","host.name":"m"}]"#, RECEIVED_AT)
+            .unwrap();
+        assert_eq!(batch.events[0].attributes.get(ATTR_HOST_NAME), Some(&Value::str("h")));
+        assert_eq!(batch.events[0].attributes.get("hostname"), None);
+        assert_eq!(counted(&registry, "logit.input.tags.omitted", ("reason", "reserved_key")), 1.0);
+        let empty = decode(r#"[{"message":"a","hostname":""}]"#);
+        assert!(empty.events[0].attributes.is_empty(), "{:?}", empty.events[0].attributes);
+
         let encoder = DatadogEncoder::new()
             .with_default_host(Some(Arc::from("relay")))
             .with_telemetry(registry.telemetry_for("datadog_out", "datadog_out", "sink"));
-        let out = encoder.encode_logs(&decode(r#"[{"message":"a","hostname":"h"}]"#)).unwrap();
+        let out = encoder.encode_logs(&batch).unwrap();
         assert_eq!(
             std::str::from_utf8(&out).unwrap(),
             r#"[{"message":"a","timestamp":1690000000000,"hostname":"h"}]"#
         );
-
-        let mut batch = decode(r#"[{"message":"a","hostname":"h"}]"#);
-        let mut resource = Resource::default();
-        resource.attributes.insert(ATTR_HOST_NAME, Value::str("web-1"));
-        batch.resource = Arc::new(resource);
-        let out = encoder.encode_logs(&batch).unwrap();
-        assert_eq!(
-            std::str::from_utf8(&out).unwrap(),
-            r#"[{"message":"a","timestamp":1690000000000,"hostname":"web-1"}]"#
-        );
+        let attributed = |host_name: Option<&str>| {
+            let mut attrs = AttrMap::new();
+            attrs.insert("hostname", Value::str("x"));
+            if let Some(host) = host_name {
+                attrs.insert(ATTR_HOST_NAME, Value::str(host));
+            }
+            let log = LogRecord {
+                message: Value::str("a"),
+                severity: None,
+                body_format: BodyFormat::Raw,
+                trace: None,
+                event_name: None,
+                observed_timestamp: 0,
+                dropped_attributes_count: 0,
+            };
+            new_batch(Resource::default(), vec![Event::log(RECEIVED_AT, attrs, log)])
+        };
+        for (host_name, want) in [(Some("web-1"), "web-1"), (None, "relay"), (Some(""), "relay")] {
+            let out = encoder.encode_logs(&attributed(host_name)).unwrap();
+            assert_eq!(
+                std::str::from_utf8(&out).unwrap(),
+                format!(r#"[{{"message":"a","timestamp":1690000000000,"hostname":"{want}"}}]"#)
+            );
+        }
         assert_eq!(
             counted(&registry, "logit.output.tags.omitted", ("reason", "reserved_key")),
-            1.0
-        );
-
-        let empty = decode(r#"[{"message":"a","hostname":"h","host.name":""}]"#);
-        let out = encoder.encode_logs(&empty).unwrap();
-        assert_eq!(
-            std::str::from_utf8(&out).unwrap(),
-            r#"[{"message":"a","timestamp":1690000000000,"hostname":"h","host.name":""}]"#
+            3.0
         );
     }
 
-    /// `host.name`, then `hostname`, then the default host.
+    /// `host.name` (a decoded `hostname`), then the default host.
     #[test]
     fn encode_fills_a_missing_hostname_with_the_default_host() {
         let encoder = DatadogEncoder::new().with_default_host(Some(Arc::from("relay")));

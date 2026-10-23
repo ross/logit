@@ -12,7 +12,8 @@ use super::outcomes::{MetricIn, MetricOut};
 use super::tags::{insert_tags, render_tags};
 use super::time::{nanos_to_seconds, or_received};
 use super::{
-    host_tag, is_service_check, DatadogDecoder, DatadogEncoder, ATTR_HOST_NAME, ATTR_HOST_TAG,
+    insert_wire_host, is_service_check, DatadogDecoder, DatadogEncoder, ATTR_HOSTLESS,
+    ATTR_HOST_NAME,
 };
 use crate::json::{value_text, write_i64, write_str, JsonObject};
 use crate::CodecError;
@@ -29,7 +30,6 @@ use std::sync::LazyLock;
 pub const ATTR_SERVICE_CHECK_NAME: &str = "_logit.statsd.service_check.name";
 pub const ATTR_SERVICE_CHECK_STATUS: &str = "_logit.statsd.service_check.status";
 pub const ATTR_SERVICE_CHECK_MESSAGE: &str = "_logit.statsd.service_check.message";
-pub const ATTR_SERVICE_CHECK_HOST: &str = "_logit.statsd.service_check.host";
 
 /// The highest valid status: 0 OK, 1 WARNING, 2 CRITICAL, 3 UNKNOWN.
 const MAX_STATUS: u64 = 3;
@@ -38,18 +38,16 @@ struct CheckKeys {
     name: Symbol,
     status: Symbol,
     message: Symbol,
-    host: Symbol,
     host_name: Symbol,
-    host_tag: Symbol,
+    hostless: Symbol,
 }
 
 static KEYS: LazyLock<CheckKeys> = LazyLock::new(|| CheckKeys {
     name: intern(ATTR_SERVICE_CHECK_NAME),
     status: intern(ATTR_SERVICE_CHECK_STATUS),
     message: intern(ATTR_SERVICE_CHECK_MESSAGE),
-    host: intern(ATTR_SERVICE_CHECK_HOST),
     host_name: intern(ATTR_HOST_NAME),
-    host_tag: intern(ATTR_HOST_TAG),
+    hostless: intern(ATTR_HOSTLESS),
 });
 
 impl DatadogDecoder {
@@ -112,9 +110,9 @@ impl DatadogDecoder {
         if let Some(message) = non_empty_str(obj, "message") {
             attributes.insert(ATTR_SERVICE_CHECK_MESSAGE, Value::str(message));
         }
-        if let Some(host) = non_empty_str(obj, "host_name") {
-            attributes.insert(ATTR_SERVICE_CHECK_HOST, Value::str(host));
-        }
+        // The check's own host displaces a `host.name` tag. An empty one is no host.
+        let displaced = insert_wire_host(&mut attributes, non_empty_str(obj, "host_name"));
+        self.displaced_host_names(displaced);
         Some(Event::metric(
             or_received(timestamp, received_at),
             attributes,
@@ -159,19 +157,11 @@ impl DatadogEncoder {
                 continue;
             };
 
-            // `host.name`, else `statsd.service_check.host`, else a DogStatsD `#host:` tag, else
-            // the default. A `host.name` or `host` read this way leaves as the host and not a
-            // tag; the Agent consumes a `host:` tag even when `h:` wins. A carrier `host.name`
-            // outranks is private, so it's never a tag either.
-            let non_empty = |key: Symbol| find(key).filter(|v| v.as_str() != Some(""));
-            let host_name = non_empty(keys.host_name);
-            let own_host = if host_name.is_none() { non_empty(keys.host) } else { None };
-            let host_tag = host_tag(&batch.resource, event);
-            let mut skip = vec![keys.name, keys.status, keys.message, keys.host];
-            // An empty `host.name` is no host, so it isn't a tag either.
-            let empty_host_name = find(keys.host_name).is_some_and(|v| v.as_str() == Some(""));
-            skip.extend((host_name.is_some() || empty_host_name).then_some(keys.host_name));
-            skip.extend(host_tag.map(|_| keys.host_tag));
+            // `host.name`, else the hostless mark, else the default. `host.name` is never a tag,
+            // an empty one included, which is no host.
+            let host_name = find(keys.host_name).filter(|v| v.as_str() != Some(""));
+            let hostless = find(keys.hostless) == Some(&Value::Bool(true));
+            let skip = [keys.name, keys.status, keys.message, keys.host_name];
             let mut tags = Vec::new();
             let dropped = render_tags(attrs.iter().map(|(k, v)| (*k, *v)), &skip, &mut tags);
             if dropped.unrepresentable > 0 {
@@ -188,11 +178,11 @@ impl DatadogEncoder {
             any = true;
             let mut obj = JsonObject::begin(&mut out);
             write_str(obj.key("check"), &value_text(name));
-            let host = match (host_name.or(own_host), host_tag) {
-                (Some(host), _) => value_text(host),
-                // An empty `#host:` tag: marked hostless, never filled.
-                (None, Some(tag)) => Cow::Borrowed(tag),
-                (None, None) => Cow::Borrowed(self.default_host.as_deref().unwrap_or_default()),
+            let host = match host_name {
+                Some(host) => value_text(host),
+                // Marked hostless (an empty DogStatsD `host:` tag), never filled.
+                None if hostless => Cow::Borrowed(""),
+                None => Cow::Borrowed(self.default_host.as_deref().unwrap_or_default()),
             };
             write_str(obj.key("host_name"), &host);
             write_i64(obj.key("timestamp"), nanos_to_seconds(event.timestamp));
@@ -243,7 +233,8 @@ mod tests {
         assert_eq!(event.attributes.get(ATTR_SERVICE_CHECK_NAME), Some(&Value::str("app.ok")));
         assert_eq!(event.attributes.get(ATTR_SERVICE_CHECK_STATUS), Some(&Value::U64(2)));
         assert_eq!(event.attributes.get(ATTR_SERVICE_CHECK_MESSAGE), Some(&Value::str("down")));
-        assert_eq!(event.attributes.get(ATTR_SERVICE_CHECK_HOST), Some(&Value::str("web1")));
+        assert_eq!(event.attributes.get(ATTR_HOST_NAME), Some(&Value::str("web1")));
+        assert_eq!(event.attributes.get("_logit.statsd.service_check.host"), None);
         assert_eq!(event.attributes.get("env"), Some(&Value::str("prod")));
     }
 
@@ -290,8 +281,7 @@ mod tests {
         );
     }
 
-    /// `host.name` (then no tag of that name), then `statsd.service_check.host`, then the
-    /// default host. A carrier `host.name` outranks is left off.
+    /// `host.name`, the check's own over the resource's, then the default host.
     #[test]
     fn encode_fills_a_missing_host_with_host_name_then_the_default_host() {
         let encoder = DatadogEncoder::new().with_default_host(Some(Arc::from("relay")));
@@ -318,7 +308,7 @@ mod tests {
         own.resource = stamped.resource.clone();
         assert_eq!(
             encode_with(&own),
-            r#"[{"check":"app.ok","host_name":"web-1","timestamp":1700000000,"status":1,"message":"","tags":[]}]"#
+            r#"[{"check":"app.ok","host_name":"h","timestamp":1700000000,"status":1,"message":"","tags":[]}]"#
         );
         let own =
             decode(r#"[{"check":"app.ok","host_name":"h","timestamp":1700000000,"status":1}]"#);
@@ -342,14 +332,21 @@ mod tests {
         );
     }
 
-    /// A DogStatsD `#host:` tag (`statsd_in`'s `host`) is the host after `host.name` and `h:`,
-    /// and is consumed, not tagged, whenever there's no `host.name`; an empty one stays hostless.
+    /// A check's own `host_name` decodes to `host.name` and displaces a `host.name` tag,
+    /// counted; a `host` tag is an ordinary tag both ways; the hostless mark leaves the check
+    /// hostless.
     #[test]
-    fn a_host_tag_is_the_host_after_host_name_and_h() {
+    fn the_host_is_host_name_and_a_host_tag_is_a_tag() {
+        let registry = Registry::new();
+        let mut decoder = DatadogDecoder::new().with_telemetry(registry.telemetry_for(
+            "datadog_in",
+            "datadog_in",
+            "listener",
+        ));
         let encoder = DatadogEncoder::new().with_default_host(Some(Arc::from("relay")));
-        let encode_with = |body: &str| {
-            String::from_utf8(encoder.encode_service_checks(&decode(body)).unwrap().to_vec())
-                .unwrap()
+        let mut round_trip = |body: &str| {
+            let batch = decoder.decode_service_checks(body.as_bytes(), RECEIVED_AT).unwrap();
+            String::from_utf8(encoder.encode_service_checks(&batch).unwrap().to_vec()).unwrap()
         };
         let check = |host: &str, tags: &str| {
             format!(
@@ -357,32 +354,28 @@ mod tests {
             )
         };
         assert_eq!(
-            encode_with(
-                r#"[{"check":"c","timestamp":1700000000,"status":0,"tags":["host:web1"]}]"#
-            ),
-            check("web1", "[]")
+            round_trip(r#"[{"check":"c","timestamp":1700000000,"status":0,"tags":["host:web1"]}]"#),
+            check("relay", r#"["host:web1"]"#)
         );
         assert_eq!(
-            encode_with(
-                r#"[{"check":"c","timestamp":1700000000,"status":0,"tags":["host:web1","host.name:"]}]"#
-            ),
-            check("web1", "[]")
-        );
-        assert_eq!(
-            encode_with(r#"[{"check":"c","timestamp":1700000000,"status":0,"tags":["host:"]}]"#),
-            check("", "[]")
-        );
-        assert_eq!(
-            encode_with(
-                r#"[{"check":"c","host_name":"h","timestamp":1700000000,"status":0,"tags":["host:web1"]}]"#
+            round_trip(
+                r#"[{"check":"c","host_name":"h","timestamp":1700000000,"status":0,"tags":["host.name:m"]}]"#
             ),
             check("h", "[]")
         );
         assert_eq!(
-            encode_with(
+            round_trip(
                 r#"[{"check":"c","timestamp":1700000000,"status":0,"tags":["host:web1","host.name:m"]}]"#
             ),
             check("m", r#"["host:web1"]"#)
+        );
+        assert_eq!(counted(&registry, "logit.input.tags.omitted", ("reason", "reserved_key")), 1.0);
+
+        let mut hostless = decode(r#"[{"check":"c","timestamp":1700000000,"status":0}]"#);
+        hostless.events[0].attributes.insert(ATTR_HOSTLESS, Value::Bool(true));
+        assert_eq!(
+            String::from_utf8(encoder.encode_service_checks(&hostless).unwrap().to_vec()).unwrap(),
+            check("", "[]")
         );
     }
 
