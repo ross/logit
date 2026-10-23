@@ -629,7 +629,9 @@ mod statsd {
     }
 
     /// Whether a `host` attribute holding `value` is left off: the line names its own host,
-    /// and `value` isn't a bare `host` token (`true`), which no Agent reads as a host.
+    /// and `value` isn't a bare `host` token (`true`), which no Agent reads as a host. An array
+    /// mixing `true` with strings reads as omitted whole, where the sink keeps its `true`
+    /// elements; no case reaches one.
     pub(super) fn host_is_omitted(rec: &Rec, value: &Value) -> bool {
         names_host(rec) && *value != Value::Bool(true)
     }
@@ -1607,8 +1609,8 @@ fn observe_field(field: &Field, input: &Rec, out: &Rec, spelling: Spelling) -> C
             // A key the sink respells reads back under its wire spelling, which is a change.
             let wire = spelling.key_for(key, input);
             let respelled = wire != *key;
-            // A key respelled into a private carrier (`datadog_out`'s host of an event or a check)
-            // is outside every public comparison, so its value is compared here.
+            // A key respelled into a private carrier (`statsd_out`'s empty `host`, read back as the
+            // hostless mark) is outside every public comparison, so its value is compared here.
             if respelled && wire.starts_with("_logit.") {
                 let found = either_side(out, &wire, *resource);
                 // An empty `host` read back as the hostless mark says the same thing.

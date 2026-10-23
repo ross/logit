@@ -438,9 +438,9 @@ model has no normalized field for) rather than a `LogRecord` field: `_logit.stat
 (always), `_logit.statsd.event.priority`/`_logit.statsd.event.alert_type` (only when sent, raw wire
 value), `_logit.statsd.event.aggregation_key`, `_logit.statsd.event.source_type`,
 `_logit.statsd.event.host` (superseded: `h:` now decodes to `host.name` and the carrier is retired,
-see the 2026-10-23 amendment) — plus the same timestamp flag, `_logit.statsd.container_id`, and
-`#tags` handling every metric line already gets, with `d:<secs>` (not `|T<secs>`) playing the
-timestamp segment's role here.
+see "Amendment (2026-10-23): the host is `host.name`, in each line's own form") — plus the
+same timestamp flag, `_logit.statsd.container_id`, and `#tags` handling every metric line already
+gets, with `d:<secs>` (not `|T<secs>`) playing the timestamp segment's role here.
 
 A service check decodes to one `Event::metric`, `MetricKind::Gauge(status as f64)` under the
 check's own (interned) name — deliberately the same metric shape a plain `name:v|g` line produces,
@@ -451,7 +451,8 @@ rendering) handles a service check with no special-casing. `_logit.statsd.servic
 (`m:`, only if present, verbatim including any `|` it contains — `m:` is always the *last* field on
 the wire, so it can consume the rest of the line; superseded: `m:` now ends at the next `|`, see the
 2026-09-24 amendment), `_logit.statsd.service_check.host` (`h:`, only if present; superseded: `h:`
-now decodes to `host.name` and the carrier is retired, see the 2026-10-23 amendment),
+now decodes to `host.name` and the carrier is retired, see "Amendment (2026-10-23): the host is
+`host.name`, in each line's own form"),
 the timestamp flag, `_logit.statsd.container_id`, and `#tags` round out the set.
 
 **`event_name` stays `None`, deliberately.** An event title is free text an operator or their
@@ -964,8 +965,9 @@ carrier. `_logit.statsd.event.host` and `_logit.statsd.service_check.host` are r
   to the Agent, which stamps its own.
 - **A `host` attribute is an ordinary tag**, written as `host:<v>`, which the Agent then reads as
   the host. No decoder writes one, so it's the operator's. Beside a usable `host.name` or the
-  hostless mark it's still omitted, counted `tags.omitted{reason="unrepresentable"}` once per
-  wire tag: it would be a second `host:` tag, and the Agent would silently take the last one.
+  hostless mark a valued one is still omitted, counted `tags.omitted{reason="unrepresentable"}`
+  once per wire tag: it would be a second `host:` tag, and the Agent would silently take the last
+  one. A bare `host` token isn't a `host:` tag and stays.
 
 Normalization (10) of the like pair changes with it (`crates/logit-cli/tests/statsd_round_trip.rs`):
 `#host:web-2,host.name:web-1` now relays as `#host:web-2`, reversing the ranks-first amendment

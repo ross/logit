@@ -237,7 +237,7 @@ After `host.name`, a sink reads only its family's hostless mark, then its fallba
 | Sink | Host, in order |
 |---|---|
 | `datadog_out` | `host.name` (event, else resource) in each route's own field; then the hostless mark (`_logit.datadog.hostless`, or a v2 `host` resource with no name), never filled; then the process hostname. A log carrying `syslog.hostname` or `host` gets no default: both are Datadog's own reserved log attributes |
-| `statsd_out` (`format: dogstatsd`) | `host.name` as a metric line's `host:` tag and an event's or service check's `h:` field; then the hostless mark as an empty `host:` tag; no fallback, since the Agent stamps its own. A `host` attribute beside either is omitted, counted, since the Agent would consume it as a second `host:` tag |
+| `statsd_out` (`format: dogstatsd`) | `host.name` as a metric line's `host:` tag and an event's or service check's `h:` field; then the hostless mark as an empty `host:` tag; no fallback, since the Agent stamps its own. A valued `host` attribute beside either is omitted, counted, since the Agent would consume it as a second `host:` tag; a bare `host` token stays |
 
 The other rows of the ranks-first table are unchanged. The like-pair relays stay fixed points
 modulo their lists; `crates/logit-cli/tests/statsd_round_trip.rs`'s (10) and
@@ -250,7 +250,7 @@ The common keys today, and who writes each:
 | Key | Written by, from |
 |---|---|
 | `host.name` | `collectd_in` from each value list's host part, on the event; `syslog_in` from HOSTNAME, on the event; `statsd_in` and `datadog_in` from the wire hosts above, on the event; `splunk_hec_in` from each object's `host`, on the resource; `internal` from the process hostname, on the resource; `otlp_in` passes the sender's resource and record attributes through, which already use the standard key |
-| `service.name` | `internal`, on the resource; `datadog_in` (its traces route) and `datadog_trace_in` from each span's `service`, on the span's event; `otlp_in` passes it through; otherwise an operator's `set`. A Datadog log's `service` stays the attribute `service`, which `datadog_out` writes back as the log's `service` |
+| `service.name` | `internal`, on the resource; `datadog_in` (its traces route) and `datadog_trace_in` from each span's `service`, on the span's event, and their APM stats routes (`datadog_in`'s stats route, `datadog_trace_in`'s `/v0.6/stats`) from each `ClientGroupedStats`' `Service`, on the group's event; `otlp_in` passes it through; otherwise an operator's `set`. A Datadog log's `service` stays the attribute `service`, which `datadog_out` writes back as the log's `service` |
 | `network.peer.*`, `client.*` | every network listener but `logit_in`, opt-in ([ADR `listener-peer-address`](listener-peer-address.md)) |
 | the `_logit.metrics.*` flags | decoders, where the flag says the whole fact ([ADR `metric-flags`](metric-flags.md)) |
 
