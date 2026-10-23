@@ -118,7 +118,10 @@ rows name a shape one sink treats apart, and every sink that compares the record
 `samples` record whose rate rounds to a weight above 1) and `record/sample_rate_unweighted` (a
 rate below 1 that rounds to weight 1), `span/no_wire_form` (a span field a Datadog span has no
 form for), `attributes/datadog_carrier_log` (a `_logit.datadog.*` carrier on a log, a Datadog
-event, or a service check), and the attributes `datadog_out` writes from a record's own fields,
+event, or a service check), `attributes/host_beside_host_name` (a `host` attribute beside a
+non-empty string `host.name`) and `attributes/hostname_beside_host_name` (a log's `hostname`
+beside a `host.name` other than an empty string), each a host form the `host.name` outranks, and
+the attributes `datadog_out` writes from a record's own fields,
 `attributes/no_host`, `log_status`, `span_kind`, and `trace_id_high`. A flagged record's `no_recorded_value` row goes ahead of its kind's counted
 loss where that loss's counter didn't move, since most sinks test the flag first
 (`classes.rs`'s "Counters").

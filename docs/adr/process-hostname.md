@@ -141,22 +141,10 @@ read, and every sink that writes a host takes a per-event `host.name`, `splunk_h
   identity. `collectd_in` writes it on each event, because collectd's host varies per value list,
   and `syslog_in` writes each line's HOSTNAME on its event for the same reason; `internal` writes
   the process hostname on its resource.
-- **A sink** that needs a host reads `host.name` off the event, else the resource, beside its own
-  family's wire forms, and falls back to the process hostname or its own `hostname:`. The table
-  gives each sink's order.
+- **A sink** that needs a host reads `host.name` off the event, else the resource, first, and
+  falls back to its own family's wire forms, then the process hostname or its own `hostname:`
+  ("Amendment: `host.name` ranks first everywhere (2026-10-23)" below).
 - **No sink reads another family's host key**, and no sink ranks a foreign key against its own.
-
-| Sink | Host, in order |
-|---|---|
-| `collectd_out` | `host.name`, then `hostname:`; with neither, the list drops (`no_host`) |
-| `datadog_out` | for a metric, `host.name`, then a DogStatsD `host:` tag; for an event or service check, `statsd.*.host` first; for a log, `hostname` first; then the process hostname. A hostless mark is never filled. A log carrying `syslog.hostname` or `host` gets no default: both are Datadog's own reserved log attributes, which its log preprocessing reads as the host, not syslog-family keys |
-| `splunk_hec_out` | `host.name` (event, else resource), then the process hostname, as each object's envelope `host` |
-| `statsd_out` (`format: dogstatsd`) | an event's or check's `h:` field; else a `host` attribute, then a non-empty `host.name`, written as the `host:` tag |
-| `syslog_out` | `host.name` (event, else resource), then `hostname:`, then the process hostname |
-
-Where a sink's own wire carries a host field, that field ranks first: a Datadog log's `hostname`,
-an event's or check's `h:` field, and at `statsd_out` a `host` attribute, `statsd_in`'s reading
-of a DogStatsD `host:` tag, so a DogStatsD relay keeps its tag. None reads another family's key.
 
 `syslog_in` writes HOSTNAME as `host.name` and no longer writes `syslog.hostname`, and
 `syslog_out` reads `host.name` as HOSTNAME
@@ -167,3 +155,36 @@ That changes `syslog_out`'s row of the 2026-10-14 table above: its own host is n
 `collectd_in` no longer writes `collectd.host`, and nothing reads it: an attribute of that name
 is an ordinary attribute. Other sinks render collectd's host under the standard name, so
 `prometheus_out` labels it `host_name`, and `influxdb_out` and `graphite_out` tag it `host.name`.
+
+## Amendment: `host.name` ranks first everywhere (2026-10-23)
+
+The amendment above let a sink's own wire host form rank ahead of `host.name`: a Datadog log's
+`hostname`, a Datadog event's or service check's `h:` field (`_logit.statsd.*.host`), and at
+`statsd_out` a `host` attribute. So an operator's `set` of `host.name`, or a resource `host.name`
+from `internal` or an OTLP sender, reached some records and not others, by protocol. One rule
+replaces that order: `host.name` (event, else resource), when present and not empty, is the host at
+every sink. A sink's own wire forms apply only when there is none. This also changes `datadog_out`'s
+row of the 2026-10-14 table above.
+
+| Sink | Host, in order |
+|---|---|
+| every sink that writes a host | `host.name` (event, else resource), then the sink's own forms below, then its fallback |
+| `datadog_out` | then a log's `hostname`, an event's or check's `h:` field, a DogStatsD `host:` tag, and the hostless marks; then the process hostname. A hostless mark is never filled by the process hostname, and a `host.name` fills it. A log carrying `syslog.hostname` or `host` gets no default: both are Datadog's own reserved log attributes |
+| `statsd_out` (`format: dogstatsd`) | then an event's or check's non-empty `h:` field, a `host` attribute, and the hostless mark, as the `host:` tag; no fallback, since the Agent stamps its own |
+| `collectd_out` | then `hostname:`; with neither, the list drops (`no_host`) |
+| `syslog_out` | then `hostname:`, then the process hostname |
+| `splunk_hec_out` | then the process hostname |
+
+Where `host.name` wins, the form it outranks doesn't reach the wire. A private carrier (`h:`, the
+hostless mark) is left off, uncounted, as every private key is. A public attribute that would put a
+second host on the wire is omitted and counted: a Datadog log's `hostname` attribute
+(`tags.omitted{reason="reserved_key"}`, as a `message` attribute is), and at `statsd_out` a `host`
+attribute, which would be a second `host:` tag that a DogStatsD Agent consumes
+(`tags.omitted{reason="unrepresentable"}`).
+
+A Datadog-family source writes `host.name` only from a sender's own key spelled that way: a
+DogStatsD `host.name:` tag, a Datadog API event's or check's `host.name:` tag, or a Datadog log's
+`host.name` attribute. A relay of such a record beside the protocol's own host form now sends
+`host.name` as the host. Each like pair names that a permitted normalization
+(`crates/logit-cli/tests/statsd_round_trip.rs`'s (10), and `logit_proto::datadog`'s permitted
+normalizations for logs, events, and service checks). Every other relay round trip is unchanged.

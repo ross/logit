@@ -565,9 +565,10 @@ carries always wins. Trace and stats payloads keep their tracer and Agent hostna
   `extractTagsMetadata` (datadog-agent 7.83.3, `comp/dogstatsd/server/impl/enrich.go`) reads it.
   An empty one marks a sample hostless, and it is never filled. With `host.name`
   present, `host` stays an ordinary tag.
-- **Events and service checks read `host.name` and `host`.** Their host is `_logit.statsd.event.host` or
-  `_logit.statsd.service_check.host` (the `h:` field), else `host.name`, else `host`, else the process
-  hostname. A `host.name` or `host` used this way leaves as the host and not as a tag.
+- **Events and service checks read `host.name` and `host`.** Their host is `host.name`, else
+  `_logit.statsd.event.host` or `_logit.statsd.service_check.host` (the `h:` field), else `host`,
+  else the process hostname ("Amendment: `host.name` ranks first (2026-10-23)" below). A
+  `host.name` or `host` used this way leaves as the host and not as a tag.
 - **A log with a host Datadog reads isn't filled.** Datadog's log preprocessing takes the host
   from `host`, `hostname`, or `syslog.hostname`. A log carrying `hostname`, `host.name`,
   `syslog.hostname`, or `host` gets no default `hostname`, and the last two leave as the
@@ -614,10 +615,10 @@ of the codec's permitted-normalization lists (`crates/logit-proto/src/datadog/mo
 ## Amendment: `statsd_out` writes the DogStatsD host (2026-10-19)
 
 `statsd_out` under `format: dogstatsd` now writes the host as an Agent reads it, so a sample sent
-through a local Agent keeps its host. With no `host` attribute and no non-empty `h:` field, a non-empty
-`host.name` leaves as the `host:` tag, and `_logit.datadog.hostless` as an empty `host:` tag. A
-`host` attribute wins over `host.name` there, the reverse of `datadog_out`'s order above.
-[ADR `statsd-output`](statsd-output.md)'s amendment of the same date records the rule and why.
+through a local Agent keeps its host. A non-empty `host.name` leaves as the `host:` tag, and, with
+no `host` attribute and no non-empty `h:` field, `_logit.datadog.hostless` as an empty `host:`
+tag. [ADR `statsd-output`](statsd-output.md)'s amendment of the same date records the rule and
+why, and its "Amendment (2026-10-23): `host.name` ranks first" the order it has now.
 
 ## Amendment: OTLP metric kinds (2026-10-20)
 
@@ -660,3 +661,25 @@ Two things follow:
 
 A tag still can't spell either flag: a series tag under `_logit.` is omitted and counted, so a
 `_logit.metrics.type:rate` tag never turns a `GAUGE` into a `RATE`.
+
+## Amendment: `host.name` ranks first (2026-10-23)
+
+[ADR `process-hostname`](process-hostname.md)'s "Amendment: `host.name` ranks first everywhere
+(2026-10-23)" makes a non-empty `host.name` (event, else resource) the host at every sink. At
+`datadog_out` it now outranks every wire form: a log's `hostname` attribute, an event's or service
+check's `h:` field, a DogStatsD `host:` tag, and the hostless marks. Those apply only with no
+`host.name`. Where `host.name` wins:
+
+- **A log's `hostname` attribute is omitted**, counted `logit.output.tags.omitted{reason="reserved_key"}`,
+  since it would be a second `hostname` key in the object.
+- **An event's or check's `h:` carrier is left unwritten**, uncounted: it's private and never a
+  tag.
+- **A hostless mark is filled by `host.name`**, and the mark, private, is left unwritten. The
+  process hostname still never fills it.
+
+The relay stays lossless modulo its named list. `datadog_in` writes `host.name` only from a
+sender's own key spelled that way: a series' or sketch's `host`, which ranks first already, an
+event's or check's `host.name:` tag, or a log's `host.name` attribute. The last two, beside the
+item's own host field, now send `host.name` as the host. The codec's permitted normalizations for
+logs, events, and service checks name both (`crates/logit-proto/src/datadog/mod.rs`, (5) and
+(8)). `crates/logit-proto/src/datadog/mod.rs`'s encode tables are the canonical statement.

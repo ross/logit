@@ -108,11 +108,11 @@ as `Value::U64`, because RFC 5424's PROCID is free-form PRINTUSASCII. `syslog.ti
 **`host.name` is the standard host key** (`logit_core::attrs::HOST_NAME`, the OpenTelemetry
 semantic-conventions name). A source that learns a sender's host writes it as `host.name` at the
 scope where it is identity: `collectd_in` and `syslog_in` on each event, since a collectd or
-syslog sender's host varies per value list or line, and `internal` on its resource. A sink that needs a host reads `host.name` off the event,
-else the resource, beside its own family's wire forms, and falls back to the process hostname or
-its own `hostname:`. No sink reads another family's host key
-([ADR `process-hostname`](../adr/process-hostname.md)'s "Amendment: `host.name` is the standard
-host key (2026-10-23)").
+syslog sender's host varies per value list or line, and `internal` on its resource. A sink that
+needs a host reads a non-empty `host.name` off the event, else the resource, ahead of its own
+family's wire forms, and falls back to the process hostname or its own `hostname:`. No sink reads
+another family's host key ([ADR `process-hostname`](../adr/process-hostname.md)'s "Amendment:
+`host.name` ranks first everywhere (2026-10-23)").
 
 **The private namespace `_logit.`: a carrier lives under `_logit.<protocol>.`**
 (`_logit.statsd.type`). A carrier is a protocol's raw wire spelling of something the model

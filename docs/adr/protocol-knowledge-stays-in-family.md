@@ -218,8 +218,10 @@ standard host key, instead of `collectd.host`, and `collectd_out` reads `host.na
 producer's does ([ADR `process-hostname`](process-hostname.md)'s "Amendment: `host.name` is the
 standard host key (2026-10-23)").
 
-- **No sink reads another family's host key.** Each reads `host.name` beside its own family's
-  wire forms, and falls back to the process hostname or its own `hostname:`.
+- **No sink reads another family's host key.** Each reads `host.name` first, then its own
+  family's wire forms, and falls back to the process hostname or its own `hostname:`
+  ([ADR `process-hostname`](process-hostname.md)'s "Amendment: `host.name` ranks first
+  everywhere (2026-10-23)").
 - **A retired key says nothing.** An attribute named `collectd.host` is an ordinary attribute at
   every sink, `collectd_out` and `datadog_out` included.
 

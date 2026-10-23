@@ -869,11 +869,9 @@ So a non-empty `host.name` is now the `host:` tag, and the hostless mark an empt
 a line with no `host` attribute and no non-empty `h:` field. `format: statsd` writes no tags and is
 unchanged. `statsd_out`'s module doc section "The host" is the canonical statement of the rules.
 
-**The precedence is the reverse of `datadog_out`'s.** There, `host.name` is the host and a `host`
-attribute stays a tag (the process-hostname amendment of
-[ADR `datadog-agent-and-intake-relay`](datadog-agent-and-intake-relay.md)). Here `host` wins,
-because it's the value `statsd_in` decoded from this protocol's own `host:` tag, so a `host:` tag
-relays as itself. A DogStatsD line has one host either way, and the other value stays a tag.
+**The precedence was the reverse of `datadog_out`'s**, superseded by "Amendment (2026-10-23):
+`host.name` ranks first" below. Here `host` won, because it's the value `statsd_in` decoded from
+this protocol's own `host:` tag, so a `host:` tag relayed as itself.
 
 **The like pair gains a permitted normalization.** `statsd_in` decodes a `host.name:` tag to the
 `host.name` attribute, the same key `datadog_in` and OTLP sources use for a host, so the encoder
@@ -914,3 +912,30 @@ it asked for. The flag says the timestamp is the source's, and the event's times
 time. A scraped `prometheus_in` sample with its own timestamp now leaves with a `|T` too, since
 the scrape sets the same flag. The relay stays a fixed point: `statsd_in` sets the flag and the
 timestamp from the `|T` it reads back.
+
+## Amendment (2026-10-23): `host.name` ranks first
+
+[ADR `process-hostname`](process-hostname.md)'s "Amendment: `host.name` ranks first everywhere
+(2026-10-23)" makes a non-empty `host.name` (event, else resource) the host at every sink, ahead of
+the sink's own wire forms. Under `format: dogstatsd`, `statsd_out` now writes a non-empty string
+`host.name` as the `host:` tag on every line, whatever else the record carries:
+
+- **A `host` attribute beside it is omitted**, counted
+  `logit.output.tags.omitted{reason="unrepresentable"}` once per wire tag. Written, it would be a
+  second `host:` tag. The Agent's `extractTagsMetadata` (datadog-agent 7.83.3,
+  `comp/dogstatsd/server/impl/enrich.go`) takes the last `host:` tag as the host and consumes
+  every one, so the value would be lost at the Agent uncounted, and `statsd_in` would read the
+  pair back as an `Array`. "Multi-value tags" in the sink's module doc keeps a repeated key as
+  live tags, but a `host:` tag is no tag at the Agent, so that rule doesn't cover it.
+- **A non-empty `h:` carrier beside it is left unwritten**, uncounted: it's private, and the
+  Agent would read it ahead of the tag. An empty `h:` is no host at the Agent and is still
+  written.
+
+With no usable `host.name`, the 2026-10-19 rules stand: the `h:` field, then a `host` attribute as
+an ordinary `host:` tag, then the hostless mark as an empty one.
+
+The like pair's normalization (10) grows to match: a `host.name:` tag is the `host:` tag beside a
+`host:` tag or an `h:` field too (`crates/logit-cli/tests/statsd_round_trip.rs`,
+`host-name-tag-beside-host`). A DogStatsD sender that writes both a `host:` and a `host.name:` tag
+names two hosts; the relay sends the `host.name:` one, which an Agent reading the original line
+would have kept as a tag. `statsd_out`'s module doc section "The host" is the canonical statement.

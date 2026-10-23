@@ -653,10 +653,10 @@ the operator-facing account of all of this.
   the top-level `hostname:`, else the kernel hostname through `rustix`'s `uname`, never `$HOSTNAME`
   or DNS. `prepare` passes it to `build_spec`, and `internal` stamps it as `host.name` beside
   `service.name`. `host.name` is the one standard host key: a source writes a sender's host
-  there, and a sink reads it beside its own family's forms and never reads another family's.
-  `syslog_out`, `splunk_hec_out`, and `datadog_out` send the process hostname as the host of an
-  event that carries none, never over one it carries; each relay pair names that a permitted
-  normalization. `logit validate` doesn't resolve it. `collectd_out` doesn't fall back to it
+  there, and a sink reads it first, ahead of its own family's forms, and never reads another
+  family's. `syslog_out`, `splunk_hec_out`, and `datadog_out` send the process hostname as the
+  host of an event that carries none, never over one it carries; each relay pair names that a
+  permitted normalization. `logit validate` doesn't resolve it. `collectd_out` doesn't fall back to it
   ([ADR `process-hostname`](docs/adr/process-hostname.md),
   [docs/deploying.md](docs/deploying.md)'s "Hostname").
 - **Self-logging**: leveled, structured, through `tracing` (`--log-level`/`LOGIT_LOG`,

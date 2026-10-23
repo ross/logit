@@ -145,9 +145,9 @@ pub fn merged<'a>(
 
 /// The standard host key: the host a sender named, at the scope where it is identity (an event
 /// attribute when it varies per record, else the resource). A sink reads it off the event, else
-/// the resource, beside its own family's wire forms, and falls back to its process hostname or
+/// the resource, ahead of its own family's wire forms, and falls back to its process hostname or
 /// its own `hostname:`. No sink reads another family's host key. See ADR `process-hostname`
-/// (`docs/adr/process-hostname.md`), "Amendment: `host.name` is the standard host key".
+/// (`docs/adr/process-hostname.md`), "Amendment: `host.name` ranks first everywhere".
 pub const HOST_NAME: &str = "host.name";
 
 /// The prefix of the private attribute namespace, which protocol codecs reserve for their own use.

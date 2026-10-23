@@ -313,15 +313,23 @@ To keep a host per sender, stamp `host.name` upstream with `set`, or have each D
 send a `host:` tag (or `h:` on an event or check). A host the data carries is never replaced. A
 `host:` tag is the host, and isn't sent as a tag, as the Agent reads it. `collectd_in` stamps
 `host.name` from each value list's and notification's host, so a collectd sender keeps its own.
+
+A non-empty `host.name` is the host ahead of every Datadog form: a log's `hostname`, an event's or
+check's `h:` field, a `host:` tag, and a hostless mark. So a `set` of `host.name` overrides them
+all. A log's `hostname` attribute beside it is left off, counted
+`logit.output.tags.omitted{reason="reserved_key"}`.
+
 A sample a client made hostless with an empty `host:` tag stays hostless, and so does a sample an Agent sends hostless:
 a v2 `host` resource with no name, or `"host":""` on the v1, distribution-point, and sketch
 routes. An empty sketch `host` always reads as hostless, because protobuf can't tell it from a
 missing one.
 
 Through a local Agent, `statsd_out` under `format: dogstatsd` sends the host where the Agent
-reads it: a `host` attribute as the `host:` tag, else a non-empty `host.name`, else an empty
-`host:` tag for a sample `datadog_in` read as hostless. A line with none of them gets the Agent's
-own hostname.
+reads it: a non-empty `host.name` as the `host:` tag, else an event's or check's `h:` field, else
+a `host` attribute as the `host:` tag, else an empty `host:` tag for a sample `datadog_in` read as
+hostless. A line with none of them gets the Agent's own hostname. Beside a `host.name`, a `host`
+attribute is left off, counted `logit.output.tags.omitted{reason="unrepresentable"}`, since the
+Agent consumes every `host:` tag and keeps only the last.
 
 ### `at_least_once` can duplicate a request, and everything but series is stored twice
 
