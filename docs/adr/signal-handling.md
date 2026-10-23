@@ -119,9 +119,12 @@ TLS certificate check; see the 2026-10-07 amendment below.
   load per write and keeps every reopen on the task that owns the handle.
 
 ## Consequences
-- `crates/logit-cli/src/pipeline.rs` installs the SIGTERM, SIGINT, and SIGHUP handlers before
-  `config::load` and owns the generation counter. The second-signal exit counts only SIGTERM and
-  SIGINT, starting from the handlers' installation, so a second one during startup exits `130`.
+- `crates/logit-cli/src/main.rs`'s `Command::Run` arm installs the SIGTERM, SIGINT, and SIGHUP
+  handlers through `Signals::install_detached` (`crates/logit-cli/src/signals.rs`, on the
+  `logit-signals` thread) before `config::load`, then passes the config and the `Signals` into
+  `run_pipelines`. `signals.rs` owns the generation counter and the second-signal count. The
+  second-signal exit counts only SIGTERM and SIGINT, starting from the handlers' installation, so
+  a second one during startup exits `130`.
 - `crates/logit-outputs/src/file.rs`'s `FileTarget` and `crates/logit-outputs/src/stdio.rs`'s sink
   take a receiver for the generation, check it first in the file-target arm of `send`, before
   `should_rotate` and `rotate`, and count

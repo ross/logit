@@ -600,6 +600,11 @@ once its inbox closes, or a panic caught at the top of the thread) is reported o
 a small `JoinSet` task awaits for the node (`runtime.rs`'s `watch_lua_thread`), so readiness, the
 failure-triggered drain, and the exit code treat a Lua node as they treat any task.
 
+Every other node is a task on the Tokio multi-thread runtime. Its worker count defaults to one per
+CPU in the process's affinity mask, and the top-level `runtime.workers` sets it
+([ADR `runtime-worker-count`](../adr/runtime-worker-count.md)). Lua threads are outside that
+count.
+
 That watcher task also bounds a script that never returns
 ([ADR `lua-runaway-script-bounds`](../adr/lua-runaway-script-bounds.md)):
 

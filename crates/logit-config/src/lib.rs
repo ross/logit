@@ -15,6 +15,7 @@
 use schemars::{gen::SchemaGenerator, schema::Schema, JsonSchema};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -32,6 +33,10 @@ pub struct Config {
     /// block keeps the default: the drain starts as soon as the signal arrives.
     #[serde(default)]
     pub shutdown: ShutdownConfig,
+    /// How the process schedules its work. Process-level, not per component. Omitting the block
+    /// keeps the defaults.
+    #[serde(default)]
+    pub runtime: RuntimeConfig,
     /// How often the certificate, key, and CA files of every TLS listener, sink, and scrape client
     /// are checked for new content. A file whose content changed is loaded and used for the next
     /// connection, with no restart and no effect on open connections; a file that fails to load
@@ -61,10 +66,27 @@ impl Default for Config {
             components: HashMap::new(),
             admin: AdminConfig::default(),
             shutdown: ShutdownConfig::default(),
+            runtime: RuntimeConfig::default(),
             tls_reload_interval: default_tls_reload_interval(),
             hostname: None,
         }
     }
+}
+
+/// The `runtime:` block. Every field defaults, so omitting the block leaves the runtime as the
+/// process would start without it.
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct RuntimeConfig {
+    /// The number of worker threads that run the pipeline's tasks. Must be at least 1. Omitted
+    /// (the default) means one worker per CPU the process may run on, which follows the CPU
+    /// affinity mask and a container's CPU limit where the kernel reports one; the
+    /// `TOKIO_WORKER_THREADS` environment variable overrides that default, and applies only when
+    /// this field is unset. Fewer workers cost less CPU per event and less memory, because a
+    /// batch stays on one core, but one busy pipeline can use no more cores than there are
+    /// workers. A `lua` component runs on its own thread, outside this count.
+    #[schemars(range(min = 1))]
+    pub workers: Option<NonZeroUsize>,
 }
 
 /// `tls_reload_interval`'s default.
@@ -6171,6 +6193,26 @@ mod tests {
         let off: Config =
             serde_json::from_str(r#"{"components": {}, "tls_reload_interval": "0s"}"#).unwrap();
         assert_eq!(off.tls_reload_interval, Duration::ZERO);
+    }
+
+    #[test]
+    fn runtime_workers_takes_a_positive_count_and_rejects_zero() {
+        let omitted: Config = serde_json::from_str(r#"{"components": {}}"#).unwrap();
+        assert_eq!(omitted.runtime.workers, None);
+        let two: Config =
+            serde_json::from_str(r#"{"components": {}, "runtime": {"workers": 2}}"#).unwrap();
+        assert_eq!(two.runtime.workers, NonZeroUsize::new(2));
+        let err =
+            serde_json::from_str::<Config>(r#"{"components": {}, "runtime": {"workers": 0}}"#)
+                .unwrap_err();
+        assert!(err.to_string().contains("nonzero"), "{err}");
+    }
+
+    #[test]
+    fn runtime_rejects_an_unknown_key() {
+        let err = serde_json::from_str::<Config>(r#"{"components": {}, "runtime": {"worker": 2}}"#)
+            .unwrap_err();
+        assert!(err.to_string().contains("unknown field"), "{err}");
     }
 
     fn socket_mode_of(json_value: &str) -> Result<Option<SocketMode>, String> {
