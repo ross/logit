@@ -5,8 +5,14 @@
 //! `a` is "before", `b` is "after". An `events_per_s` drop or a `cpu_us_per_event` rise past
 //! `--threshold` percent is a regression. `max_rss_bytes` is always reported but gates the exit
 //! code only when `--rss-threshold` is given.
+//!
+//! A scenario whose repeats are bimodal on either side (`crate::bimodal`, decided from the
+//! repeats, not from the file's own `bimodal` field, so an older file is judged too) isn't gated:
+//! its pooled median moves with the mix of modes, not the code. `main.rs` exits 2 when that left a
+//! row ungated and nothing regressed.
 
-use crate::result::{BoxState, RunReport, Sample};
+use crate::bimodal::{self, Clusters};
+use crate::result::{BoxState, RunReport, Sample, ScenarioReport};
 use std::collections::BTreeSet;
 
 /// One scenario's before/after comparison.
@@ -16,6 +22,23 @@ pub struct ScenarioComparison {
     /// `None` when the scenario is in only one file: listed, not compared. [`Presence`] says which.
     pub deltas: Option<Deltas>,
     pub presence: Presence,
+    /// Each side's two modes, when its repeats are bimodal; `None` on both for a scenario in only
+    /// one file.
+    pub before_clusters: Option<Clusters>,
+    pub after_clusters: Option<Clusters>,
+}
+
+impl ScenarioComparison {
+    /// Whether this row's deltas may gate: false when either side is bimodal.
+    pub fn is_gated(&self) -> bool {
+        self.before_clusters.is_none() && self.after_clusters.is_none()
+    }
+}
+
+/// `scenario`'s two modes of CPU µs/event, if its repeats have two.
+fn clusters(scenario: &ScenarioReport) -> Option<Clusters> {
+    let values: Vec<f64> = scenario.repeats.iter().map(|s| s.cpu_us_per_event).collect();
+    bimodal::detect(&values).clusters()
 }
 
 /// Which of the two compared files a scenario appears in.
@@ -122,13 +145,20 @@ pub struct CompareReport {
 }
 
 impl CompareReport {
-    /// Whether any compared scenario regressed past the given thresholds; `main.rs`'s exit code.
+    /// Whether any gated scenario regressed past the given thresholds; `main.rs`'s exit code.
     pub fn has_regression(&self, threshold_pct: f64, rss_threshold_pct: Option<f64>) -> bool {
-        self.scenarios.iter().any(|scenario| {
+        self.scenarios.iter().filter(|scenario| scenario.is_gated()).any(|scenario| {
             scenario
                 .deltas
                 .is_some_and(|deltas| deltas.is_regression(threshold_pct, rss_threshold_pct))
         })
+    }
+
+    /// The scenarios in both files that a bimodal side kept from gating.
+    pub fn ungated(&self) -> impl Iterator<Item = &ScenarioComparison> {
+        self.scenarios
+            .iter()
+            .filter(|scenario| scenario.presence == Presence::Both && !scenario.is_gated())
     }
 }
 
@@ -169,6 +199,14 @@ pub fn compare(a: &RunReport, b: &RunReport) -> CompareReport {
         warnings.push(format!(
             "comparing different build profiles: `{}` vs `{}`",
             a.profile, b.profile
+        ));
+    }
+    // The child's arm: a delta between two arms measures the arm, not the code.
+    if a.workers != b.workers || a.pin_child != b.pin_child || a.env != b.env {
+        warnings.push(format!(
+            "the two runs set the child up differently: workers {:?} vs {:?}, pin-child {:?} vs \
+             {:?}, env {:?} vs {:?}",
+            a.workers, b.workers, a.pin_child, b.pin_child, a.env, b.env
         ));
     }
     if a.rustc != b.rustc {
@@ -218,17 +256,25 @@ pub fn compare(a: &RunReport, b: &RunReport) -> CompareReport {
                     name: name.clone(),
                     deltas: Some(Deltas::between(&a_scenario.median, &b_scenario.median)),
                     presence: Presence::Both,
+                    before_clusters: clusters(a_scenario),
+                    after_clusters: clusters(b_scenario),
                 }
             }
+            // No clusters on a one-sided row: there is no comparison for them to withhold, and
+            // `main.rs` must list it as "only in", not as an ungated comparison.
             (Some(_), None) => ScenarioComparison {
                 name: name.clone(),
                 deltas: None,
                 presence: Presence::BeforeOnly,
+                before_clusters: None,
+                after_clusters: None,
             },
             (None, Some(_)) => ScenarioComparison {
                 name: name.clone(),
                 deltas: None,
                 presence: Presence::AfterOnly,
+                before_clusters: None,
+                after_clusters: None,
             },
             (None, None) => unreachable!("name came from the union of both maps' own keys"),
         })
@@ -262,6 +308,7 @@ mod tests {
             events_per_s,
             cpu_us_per_event,
             udp: None,
+            threads: None,
         }
     }
 
@@ -284,7 +331,14 @@ mod tests {
             kernel_rcvbuf_utilization_max: 0.9,
             effective_rate: Some(90_000),
         });
-        ScenarioReport { count: 10_000, repeats: vec![sample], median: sample, min: sample }
+        ScenarioReport {
+            count: 10_000,
+            repeats: vec![sample.clone()],
+            median: sample.clone(),
+            min: sample,
+            bimodal: None,
+            cpu_clusters: None,
+        }
     }
 
     fn scenario_report(
@@ -293,7 +347,14 @@ mod tests {
         max_rss_bytes: u64,
     ) -> ScenarioReport {
         let sample = sample(events_per_s, cpu_us_per_event, max_rss_bytes);
-        ScenarioReport { count: 1_000_000, repeats: vec![sample], median: sample, min: sample }
+        ScenarioReport {
+            count: 1_000_000,
+            repeats: vec![sample.clone()],
+            median: sample.clone(),
+            min: sample,
+            bimodal: None,
+            cpu_clusters: None,
+        }
     }
 
     fn scenario_report_with_startup(
@@ -303,7 +364,14 @@ mod tests {
         startup_s: Option<f64>,
     ) -> ScenarioReport {
         let sample = sample_with_startup(events_per_s, cpu_us_per_event, max_rss_bytes, startup_s);
-        ScenarioReport { count: 1_000_000, repeats: vec![sample], median: sample, min: sample }
+        ScenarioReport {
+            count: 1_000_000,
+            repeats: vec![sample.clone()],
+            median: sample.clone(),
+            min: sample,
+            bimodal: None,
+            cpu_clusters: None,
+        }
     }
 
     fn report(
@@ -322,6 +390,9 @@ mod tests {
             label: None,
             box_state: None,
             binary: binary(&"a".repeat(64)),
+            workers: None,
+            pin_child: None,
+            env: BTreeMap::new(),
             scenarios,
         }
     }
@@ -657,5 +728,72 @@ mod tests {
         let mut b = report("box-a", "cpu-a", scenarios);
         b.binary = binary(&"b".repeat(64));
         assert!(compare(&a, &b).warnings.is_empty());
+    }
+
+    /// A scenario with one repeat per CPU µs/event value, its median the values' median.
+    fn repeats_report(cpu: &[f64]) -> ScenarioReport {
+        let repeats: Vec<Sample> = cpu.iter().map(|&c| sample(1_000_000.0, c, 1024)).collect();
+        ScenarioReport {
+            count: 1_000_000,
+            median: crate::result::median_sample(&repeats),
+            min: crate::result::min_sample(&repeats),
+            repeats,
+            bimodal: None,
+            cpu_clusters: None,
+        }
+    }
+
+    #[test]
+    fn a_bimodal_side_is_not_gated_even_past_the_threshold() {
+        let before = BTreeMap::from([(
+            "route-copy".to_string(),
+            repeats_report(&[1.0, 1.01, 1.02, 1.03, 1.04]),
+        )]);
+        let after = BTreeMap::from([(
+            "route-copy".to_string(),
+            repeats_report(&[1.0, 1.01, 2.0, 2.01, 2.02]),
+        )]);
+        let cmp = compare(&report("h", "c", before), &report("h", "c", after));
+        let row = &cmp.scenarios[0];
+        assert!(row.deltas.unwrap().cpu_us_per_event_pct > 5.0, "the pooled median rose");
+        assert!(row.before_clusters.is_none());
+        assert_eq!(row.after_clusters.map(|c| (c.lower.size, c.upper.size)), Some((2, 3)));
+        assert!(!cmp.has_regression(5.0, None));
+        assert_eq!(cmp.ungated().map(|s| s.name.as_str()).collect::<Vec<_>>(), vec!["route-copy"]);
+    }
+
+    #[test]
+    fn a_scenario_bimodal_in_its_only_file_is_listed_not_ungated() {
+        let before = BTreeMap::from([(
+            "route-copy".to_string(),
+            repeats_report(&[1.0, 1.01, 2.0, 2.01, 2.02]),
+        )]);
+        let cmp = compare(&report("h", "c", before), &report("h", "c", BTreeMap::new()));
+        let row = &cmp.scenarios[0];
+        assert_eq!(row.presence, Presence::BeforeOnly);
+        assert!(row.is_gated(), "{row:?}");
+        assert_eq!(cmp.ungated().count(), 0);
+    }
+
+    #[test]
+    fn a_unimodal_scenario_with_five_repeats_still_gates() {
+        let before =
+            BTreeMap::from([("p".to_string(), repeats_report(&[1.0, 1.01, 1.02, 1.03, 1.04]))]);
+        let after =
+            BTreeMap::from([("p".to_string(), repeats_report(&[1.5, 1.51, 1.52, 1.53, 1.54]))]);
+        let cmp = compare(&report("h", "c", before), &report("h", "c", after));
+        assert!(cmp.has_regression(5.0, None));
+        assert_eq!(cmp.ungated().count(), 0);
+    }
+
+    #[test]
+    fn different_worker_counts_warn() {
+        let mut a = report("h", "c", BTreeMap::new());
+        let mut b = report("h", "c", BTreeMap::new());
+        a.binary = binary(&"a".repeat(64));
+        b.binary = binary(&"b".repeat(64));
+        b.workers = Some(1);
+        let cmp = compare(&a, &b);
+        assert!(cmp.warnings.iter().any(|w| w.contains("workers None vs Some(1)")), "{cmp:?}");
     }
 }

@@ -570,6 +570,32 @@ components:
 In Docker, pass `--hostname NAME` (or `hostname:` in Compose) to name the container, or set
 `hostname:` in the config.
 
+## Runtime threads
+
+`logit` runs its listeners, transforms, and sinks as tasks on a pool of worker threads. By default
+the pool has one worker per CPU the process may run on, which follows the CPU affinity mask. The
+`TOKIO_WORKER_THREADS` environment variable overrides that default. To set the count in the
+config, use the top-level `runtime:` block, which takes precedence over the variable:
+
+```yaml
+runtime:
+  workers: 1
+components:
+  # ...
+```
+
+`workers` must be at least 1. `workers: 1` is still a multi-thread runtime with one worker, not a
+single-threaded one. A `lua` component runs on its own thread and is not counted.
+
+Fewer workers trade peak throughput for efficiency. An event handed from one core to another
+costs CPU and cache, so a pipeline pinned to one worker spends less CPU per event and holds less
+memory. In one router benchmark, one worker used 0.58 µs of CPU per event against 1.1 to 2.3 µs
+across 8 workers, and resident memory fell from 80 MiB to 36 MiB, for a throughput loss of 10 to
+20%. A pipeline can then use no more cores than it has workers, so a single hot pipeline is
+capped at that many. An edge agent that relays a trickle usually wants one or two workers; a
+central collector aggregating many sources wants the default. `logit` never picks the count from
+the config or the host; the default stays one per CPU until real-traffic measurements say otherwise.
+
 ## Self-logging
 
 `logit run` emits leveled, structured self-diagnostics through `tracing`
