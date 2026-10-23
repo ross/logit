@@ -8,7 +8,9 @@ updated: 2026-10-22
 ## Status
 Accepted. On 2026-10-19, [ADR `influxdb-line-protocol-relay`](influxdb-line-protocol-relay.md)'s
 "Amendment: string fields are private (2026-10-19)" moved InfluxDB string fields from the public
-`influxdb.field.<key>` to `_logit.influxdb.field.<key>`; the lists below are amended to match.
+`influxdb.field.<key>` to `_logit.influxdb.field.<key>`; the lists below are amended to match. On 2026-10-22, "Amendment: a segment that names the key's
+meaning (2026-10-22)" moved that key to the protocol-free `_logit.field.<key>`, which the lists
+below don't cover.
 
 ## Context
 
@@ -69,7 +71,7 @@ By protocol, these move under `_logit.`:
 | Prometheus | every `prometheus.*` attribute: `type`, `timestamp`, and the resource attribute `target` |
 | collectd | `plugin`, `type`, `interval`, and `severity` |
 | Datadog | every `datadog.*` attribute: series, events, service checks, Agent fields, trace chunk, stats, tracer headers, `span.error`, and `source` |
-| InfluxDB | `influxdb.measurement`, `influxdb.field.<key>` (since 2026-10-19), and the resource attributes `influxdb.org`, `influxdb.org_id`, and `influxdb.bucket` |
+| InfluxDB | `influxdb.measurement` and the resource attributes `influxdb.org`, `influxdb.org_id`, and `influxdb.bucket`; string fields live under `field.<key>`, no longer a protocol segment (the 2026-10-22 amendment) |
 | syslog | `syslog.severity` |
 | OTLP | `otel.severity_number` and `otel.severity_text` |
 
