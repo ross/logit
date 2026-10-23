@@ -151,6 +151,7 @@
 
 use super::mapping::{self, Class, Lookup, Mapping, Series};
 use super::Traced;
+use logit_core::attrs::is_field;
 use logit_core::EventBatch;
 use logit_outputs::ndjson::render_ndjson;
 use logit_outputs::statsd::is_forbidden_in_name;
@@ -1522,7 +1523,9 @@ fn field_rows(rec: &Rec, protocol: &str) -> Vec<(String, Option<String>, Field)>
             Some("prometheus_target")
         } else if key.starts_with("_logit.datadog.") && json_route {
             Some("datadog_carrier_log")
-        } else if key.starts_with(&own) {
+        } else if key.starts_with(&own) || (protocol == "influxdb" && is_field(key)) {
+            // The field namespace isn't protocol-owned, so the own-prefix test misses it, and
+            // `influxdb_out` is the one sink that writes it.
             Some("private_carrier")
         } else if key.starts_with("_logit.") {
             Some("foreign_carrier")

@@ -13,12 +13,14 @@ unless its config fixes them, and reads a `403` or `404` about a carried bucket 
 Amended the same day by "Amendment: `influxdb_out`'s `default_org:` (2026-10-15)", which gives a
 batch that carries no org a configured fallback.
 Amended on 2026-10-19 by "Amendment: string fields are private (2026-10-19)": a string field
-rides as `_logit.field.<key>`, so `influxdb_out` is the only protocol sink that writes
+rides as `_logit.influxdb.field.<key>`, so `influxdb_out` is the only protocol sink that writes
 it, and `aggregate` leaves it out of a series. The sections above that amendment describe the
 amended form.
 Amended on 2026-10-20 by [ADR `influxdb-histogram-summary-shape`](influxdb-histogram-summary-shape.md):
 `influxdb_out` writes a histogram, summary, or sketch in Telegraf's `prometheus-v1` shape, and a
 `Histogram`'s temporality joins normalization 10.
+Amended on 2026-10-22 by "Amendment: string fields move to the `_logit.field.` namespace
+(2026-10-22)": the key becomes `_logit.field.<key>`, and nothing else about it changes.
 
 ## Context
 

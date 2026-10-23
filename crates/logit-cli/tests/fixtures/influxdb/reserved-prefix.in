@@ -1,1 +1,1 @@
-cpu,host=a,_logit.influxdb.measurement=fake,_logit.influxdb.field.g=y,influxdb.field.f=x,influxdb.foo=b f=1i 1700000000000000000
+cpu,host=a,_logit.influxdb.measurement=fake,_logit.field.g=y,influxdb.field.f=x,influxdb.foo=b f=1i 1700000000000000000
