@@ -2906,6 +2906,9 @@ mod tests {
             r#"{{T},"metrics":[{"name":"s","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],FLAGS}"#,
             r#"{{T},"metrics":[{"name":"t","kind":"samples","values":[1.0],"sample_rate":1.0}],FLAGS}"#,
             r#"{{T},"metrics":[{"name":"h","kind":"histogram","temporality":"delta","buckets":[{"bound":1.0,"count":1},{"bound":"inf","count":0}],"sum":1.0}],FLAGS}"#,
+            r#"{{T},"metrics":[{"name":"c","kind":"histogram","temporality":"cumulative","buckets":[{"bound":1.0,"count":1},{"bound":"inf","count":0}],"sum":1.0}],FLAGS}"#,
+            r#"{{T},"metrics":[{"name":"e","kind":"exponential_histogram","scale":2,"temporality":"delta","count":1,"zero_count":0,"zero_threshold":0.0,"positive":{"offset":0,"counts":[1]},"negative":{"offset":0,"counts":[]},"sum":1.0}],FLAGS}"#,
+            r#"{{T},"metrics":[{"name":"x","kind":"exponential_histogram","scale":2,"temporality":"cumulative","count":1,"zero_count":0,"zero_threshold":0.0,"positive":{"offset":0,"counts":[1]},"negative":{"offset":0,"counts":[]},"sum":1.0}],FLAGS}"#,
         ]
         .map(|line| line.replace("FLAGS", flags));
         let ins = recs(&lines.each_ref().map(String::as_str));
@@ -2922,6 +2925,9 @@ mod tests {
         assert_eq!(flag_rows(&ins[1]), ["interval", "rate_on_non_gauge"]);
         assert_eq!(flag_rows(&ins[2]), ["interval_on_distribution", "rate_on_non_gauge"]);
         assert_eq!(flag_rows(&ins[3]), ["interval_on_histogram", "rate_on_non_gauge"]);
+        assert_eq!(flag_rows(&ins[4]), ["interval", "rate_on_non_gauge"]);
+        assert_eq!(flag_rows(&ins[5]), ["interval_on_distribution", "rate_on_non_gauge"]);
+        assert_eq!(flag_rows(&ins[6]), ["interval", "rate_on_non_gauge"]);
     }
 
     /// The log encoder takes any `host.name`, an empty one included, as the host, so a log with

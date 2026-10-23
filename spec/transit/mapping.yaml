@@ -2599,6 +2599,11 @@ rows:
           text: >-
             Under `histograms.mode: counters`, the `interval` of each series the histogram
             writes, and datadog_in sets the flag again.
+        - when: {histograms: {mode: counters, send_aggregation_metrics: false}}
+          class: exact
+          text: >-
+            Under `histograms.mode: counters`, the `interval` of each `<name>.bucket` series, and
+            datadog_in sets the flag again.
         - when: {histograms: {mode: nobuckets, send_aggregation_metrics: true}}
           class: exact
           text: >-
@@ -2607,8 +2612,8 @@ rows:
         - class: lost
           counter: logit.output.tags.omitted{reason=no_wire_form}
           text: >-
-            The sketches route has no interval field, so a nonzero interval is left off,
-            counted.
+            Under `histograms.mode: distributions`, the default, the sketches route has no
+            interval field, so a nonzero interval is left off, counted.
       graphite_out:
         class: lost
         reason: structural
