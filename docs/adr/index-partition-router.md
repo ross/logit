@@ -142,8 +142,9 @@ that word. There's no alias, because `logit` is pre-release.
   than today.
 - **A wide signature change.** `Delivered`, `Output::send` and `Output::submit`, the three encoder
   traits and every impl, `prometheus`'s pair, `datadog`'s `encode_routes`, `datadog_trace_out`'s
-  two encoders, and `native::encode_hop_batch` take a view. It lands over the plan's W7 to W10: the pipeline layer
-  first, with each sink materializing a partial view until its encoder PR removes the call.
+  two encoders, and `native::encode_hop_batch` take a view. It lands over the plan's W7 to W10:
+  the pipeline layer first, with each sink materializing a partial view until its encoder PR
+  removes the call.
 - **Pins move with the code.** Allocation pins in `crates/logit-bench/tests/allocations.rs` and the
   matching `docs/design/memory.md` rows change in the PR that changes them.
 - **Operator docs.** `docs/deploying.md`, `docs/design/memory.md`, and
