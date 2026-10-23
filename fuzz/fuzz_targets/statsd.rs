@@ -9,9 +9,10 @@
 //! - the model: every metric has a non-empty name; every `Sum`, `Gauge`, `GaugeDelta`, and sample
 //!   value is finite; `Samples` and `SetMembers` are non-empty, and a sample rate is in `(0, 1]`;
 //!   only those five kinds and a log record appear; every `Value::Str` is valid UTF-8;
-//! - time: an event's timestamp is `received_at`, unless the line carried `|T`/`d:`, and a
-//!   `_logit.statsd.timestamp` of `U64(secs)` means a timestamp of `secs` seconds;
-//! - provenance: every `Value::Str` attribute, tag values and array elements included, and every
+//! - time: an event flagged `_logit.metrics.closed: "timestamped"` carried `|T`/`d:`, and its
+//!   timestamp is a whole, non-negative wire second; any other event's timestamp is `received_at`;
+//! - provenance: every `Value::Str` attribute but that flag's static value, tag values and array
+//!   elements included, and every
 //!   set member, is a slice of the datagram. An event's message is too, unless its text had a
 //!   `\n` escape to unescape, the one copy path (`crates/logit-proto/src/statsd/mod.rs`'s
 //!   "DogStatsD events and service checks"): a message is a slice if and only if it holds no
@@ -20,7 +21,8 @@
 
 use bytes::Bytes;
 use libfuzzer_sys::fuzz_target;
-use logit_core::interner::resolve;
+use logit_core::attrs::{CLOSED_TIMESTAMPED, METRICS_CLOSED};
+use logit_core::interner::{intern, resolve};
 use logit_core::{subslice, AttrMap, Event, MetricKind, MetricValue, Resource, Value};
 use logit_proto::statsd::StatsdDecoder;
 use logit_proto::{CodecError, Decoder};
@@ -56,22 +58,21 @@ fn check_str(datagram: &Bytes, value: &Value) {
 }
 
 fn check_event(datagram: &Bytes, event: &Event) {
-    for (_, value) in event.attributes.iter() {
+    let closed = intern(METRICS_CLOSED);
+    for (key, value) in event.attributes.iter() {
+        if key == closed {
+            assert_eq!(value.as_str(), Some(CLOSED_TIMESTAMPED), "model: the only flag value");
+            continue;
+        }
         check_str(datagram, value);
     }
-    match event.attributes.get("_logit.statsd.timestamp") {
-        Some(Value::U64(secs)) => assert_eq!(
-            u128::from(*secs) * 1_000_000_000,
-            event.timestamp as u128,
-            "time: _logit.statsd.timestamp names the event's timestamp"
-        ),
-        _ => assert!(
-            event.timestamp == RECEIVED_AT || event.timestamp % 1_000_000_000 == 0,
-            "time: a timestamp is received_at or a whole wire second"
-        ),
-    }
-    if event.timestamp != RECEIVED_AT {
-        assert!(event.timestamp >= 0, "time: a wire timestamp is never negative");
+    if event.attributes.get_sym(closed).is_some() {
+        assert!(
+            event.timestamp >= 0 && event.timestamp % 1_000_000_000 == 0,
+            "time: a flagged timestamp is a whole, non-negative wire second"
+        );
+    } else {
+        assert_eq!(event.timestamp, RECEIVED_AT, "time: an unflagged event is received_at");
     }
     assert!(event.span.is_none(), "model: statsd decodes no span");
     if let Some(log) = &event.log {

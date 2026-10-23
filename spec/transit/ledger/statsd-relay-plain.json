@@ -12,6 +12,7 @@
     {"sink":"statsd_out","row":"attributes/scope","cell":0,"observed":["lost"]},
     {"sink":"statsd_out","row":"attributes/string_value","cell":0,"observed":["lost"]},
     {"sink":"statsd_out","row":"attributes/timestamp_value","cell":0,"observed":["lost"]},
+    {"sink":"statsd_out","row":"attributes/timestamped","cell":0,"observed":["lost"]},
     {"sink":"statsd_out","row":"distribution","cell":1,"observed":["degraded"]},
     {"sink":"statsd_out","row":"exponential_histogram/cumulative","cell":1,"observed":["degraded"]},
     {"sink":"statsd_out","row":"exponential_histogram/delta","cell":1,"observed":["degraded"]},

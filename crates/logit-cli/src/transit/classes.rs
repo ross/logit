@@ -38,8 +38,8 @@
 //! to weight 1 the field row `record/sample_rate_unweighted` for its rate, left out the same way.
 //! It reaches an
 //! `attributes` row for each attribute, event or resource: a `_logit.<protocol>.` carrier of the
-//! sink's own protocol is `private_carrier`, `_logit.prometheus.target` `prometheus_target` at
-//! every sink, a `_logit.datadog.` carrier on a log, a Datadog
+//! sink's own protocol is `private_carrier`, `_logit.prometheus.target` `prometheus_target` and
+//! `_logit.metrics.closed: "timestamped"` `timestamped` at every sink, a `_logit.datadog.` carrier on a log, a Datadog
 //! event, or a service check `datadog_carrier_log`, any other `_logit.` key `foreign_carrier`, an
 //! event
 //! attribute by its value (`string_value`, `bool_value`, `number_value`, `array_value`,
@@ -101,9 +101,8 @@
 //! registry, and reads at its expected class when that's `normalized` or `degraded`. A read-back
 //! record no input claims fails the check with both sides printed.
 //!
-//! The check compares a timestamp in two places: a `same_instant` record paired `exact` whose
-//! read-back instant differs from its twin's reads `normalized`, since the sink moved them apart,
-//! and `prometheus_out`'s timestamp marker (under "Field level").
+//! The check compares a timestamp in one place: a `same_instant` record paired `exact` whose
+//! read-back instant differs from its twin's reads `normalized`, since the sink moved them apart.
 //!
 //! **Record level.** The expected class is the worst (`exact < normalized < degraded < skipped
 //! < dropped`) over the record-level cells it reaches, and the observed class must equal it; a
@@ -114,11 +113,9 @@
 //! input's field with its first pairing's: the same value in the same place is `exact`, present
 //! but changed, moved (a resource attribute read back as an event attribute), or under the
 //! sink's spelling of its key is `normalized`,
-//! and absent is `lost`. `prometheus_out` has two exceptions, each of which compares a value:
+//! and absent is `lost`. `prometheus_out` has one exception, which compares a value:
 //! `_logit.prometheus.target` absent reads `normalized` when the read-back's `instance` equals the
-//! input's, and `_logit.prometheus.timestamp` absent reads `normalized` when the record's
-//! timestamp reads back unchanged, as a remote-write receiver stamps no marker. Either is `lost`
-//! otherwise. The observed class may be better than the cell's but never worse. A
+//! input's, and `lost` otherwise. The observed class may be better than the cell's but never worse. A
 //! degraded, skipped, or dropped record's field rows aren't looked up, so they're neither reached
 //! nor unspecified there: the carriers that describe its wire form describe a shape that's gone.
 //!
@@ -151,7 +148,7 @@
 
 use super::mapping::{self, Class, Lookup, Mapping, Series};
 use super::Traced;
-use logit_core::attrs::is_field;
+use logit_core::attrs::{is_field, CLOSED_TIMESTAMPED, METRICS_CLOSED};
 use logit_core::EventBatch;
 use logit_outputs::ndjson::render_ndjson;
 use logit_outputs::statsd::is_forbidden_in_name;
@@ -161,9 +158,7 @@ use logit_proto::graphite::encode::{
 };
 use logit_proto::influxdb::ATTR_MEASUREMENT;
 use logit_proto::prometheus::text::exposed_exemplar_keys;
-use logit_proto::prometheus::{
-    sanitize_label_name, sanitize_metric_name, ATTR_TARGET, ATTR_TIMESTAMP,
-};
+use logit_proto::prometheus::{sanitize_label_name, sanitize_metric_name, ATTR_TARGET};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -1518,8 +1513,10 @@ fn field_rows(rec: &Rec, protocol: &str) -> Vec<(String, Option<String>, Field)>
             datadog::Route::of(rec),
             datadog::Route::Log | datadog::Route::Event | datadog::Route::Check
         );
-    let carrier = |key: &str| {
-        if key == ATTR_TARGET {
+    let carrier = |key: &str, value: &Value| {
+        if key == METRICS_CLOSED && value.as_str() == Some(CLOSED_TIMESTAMPED) {
+            Some("timestamped")
+        } else if key == ATTR_TARGET {
             Some("prometheus_target")
         } else if key.starts_with("_logit.datadog.") && json_route {
             Some("datadog_carrier_log")
@@ -1535,7 +1532,7 @@ fn field_rows(rec: &Rec, protocol: &str) -> Vec<(String, Option<String>, Field)>
     };
     for (key, value) in &rec.attributes {
         let tags = rec.attribute_types.get(key).map(String::as_str).unwrap_or("");
-        let feature = if let Some(feature) = carrier(key) {
+        let feature = if let Some(feature) = carrier(key, value) {
             feature
         } else if tags.contains("=bytes") {
             "bytes_value"
@@ -1554,8 +1551,8 @@ fn field_rows(rec: &Rec, protocol: &str) -> Vec<(String, Option<String>, Field)>
         let field = Field::Attribute { key: key.clone(), resource: false };
         rows.push(("attributes".to_string(), Some(feature.to_string()), field));
     }
-    for key in rec.resource.keys() {
-        let feature = carrier(key).unwrap_or("resource_attribute");
+    for (key, value) in &rec.resource {
+        let feature = carrier(key, value).unwrap_or("resource_attribute");
         let field = Field::Attribute { key: key.clone(), resource: true };
         rows.push(("attributes".to_string(), Some(feature.to_string()), field));
     }
@@ -1612,15 +1609,6 @@ fn observe_field(field: &Field, input: &Rec, out: &Rec, spelling: Spelling) -> C
                     ) {
                         (Some(read), Some(want)) if read == want => Class::Normalized,
                         _ => Class::Lost,
-                    };
-                }
-                // Remote-write sends every sample's timestamp, so the receiver stamps no marker;
-                // the marker's meaning survives as the record's own timestamp.
-                if !*resource && key == ATTR_TIMESTAMP && either_side(out, key, false).is_none() {
-                    return if out.timestamp == input.timestamp {
-                        Class::Normalized
-                    } else {
-                        Class::Lost
                     };
                 }
             }
@@ -2999,25 +2987,6 @@ mod tests {
         );
         assert_eq!(observe_field(target, &ins[0], &outs[1], Spelling::Prometheus), Class::Lost);
         assert_eq!(observe_field(target, &ins[0], &outs[0], Spelling::Otlp), Class::Lost);
-    }
-
-    /// A remote-write receiver stamps no timestamp marker, so the marker reads `normalized` only
-    /// when the record's timestamp came back unchanged.
-    #[test]
-    fn a_prometheus_timestamp_marker_reads_normalized_when_the_timestamp_survives() {
-        let ins = recs(&[
-            r#"{{T},"metrics":[{"name":"g","kind":"gauge","value":1.0}],"attributes":{"_logit.prometheus.timestamp":true}}"#,
-        ]);
-        let outs = recs(&[
-            r#"{{T},"metrics":[{"name":"g","kind":"gauge","value":1.0}]}"#,
-            r#"{"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"g","kind":"gauge","value":1.0}]}"#,
-        ]);
-        let marker = Field::Attribute { key: ATTR_TIMESTAMP.to_string(), resource: false };
-        assert_eq!(
-            observe_field(&marker, &ins[0], &outs[0], Spelling::Prometheus),
-            Class::Normalized
-        );
-        assert_eq!(observe_field(&marker, &ins[0], &outs[1], Spelling::Prometheus), Class::Lost);
     }
 
     /// A histogram's `min` and `max` are `record/min_max`'s to compare, so a sink that drops them

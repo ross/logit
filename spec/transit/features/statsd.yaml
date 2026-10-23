@@ -46,7 +46,7 @@
 - name: timestamp_T
   text: >-
     A `|T<unix-seconds>` segment (or an event's or service check's `d:`), which sets the event
-    timestamp and stamps the `_logit.statsd.timestamp` carrier.
+    timestamp and stamps the `_logit.metrics.closed: timestamped` flag.
 - name: service_check
   text: A DogStatsD `_sc` service check, decoded to a gauge of its status with its carriers.
 - name: event

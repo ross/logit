@@ -15,7 +15,8 @@
 # event's attributes are the exposition line's labels plus at most `_logit.prometheus.type` (on a
 # family whose wire type the model has no kind for; node_exporter's `node_netstat_*`/`node_vmstat_*`
 # families are untyped, so about 2% of its series carry it: docs/design/data-shapes.md §3, "Labels
-# per series") and `_logit.prometheus.timestamp` (when the line carried one; these exporters don't).
+# per series") and the `_logit.metrics.closed` flag (when the line carried a timestamp; these
+# exporters don't).
 # A histogram's `le` and a summary's `quantile` are structure inside the metric record, not labels,
 # so a histogram family contributes one event rather than one per bucket.
 #

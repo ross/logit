@@ -2284,9 +2284,9 @@ rows:
           class: lost
           counter: logit.output.fields.omitted{reason=dialect}
           text: >-
-            Plain statsd has no `|c:`, `|e:`, `|card:`, or `|T` segment, so those carriers are
-            omitted, counted once per carrier per line; the type carrier survives as the line's
-            type, `h` and `d` as `ms`.
+            Plain statsd has no `|c:`, `|e:`, or `|card:` segment, so those carriers are omitted,
+            counted once per carrier per line; the type carrier survives as the line's type, `h`
+            and `d` as `ms`.
         - class: exact
           text: >-
             A `_logit.statsd.*` carrier is written as its own segment or field and statsd_in
@@ -2300,10 +2300,8 @@ rows:
         class: normalized
         reason: dialect
         text: >-
-          The family type and timestamp carriers are consumed into the wire form and a scrape
-          stamps them back; OpenMetrics has no `untyped`, so that type reads back as `unknown`.
-          Remote-write gives every sample a timestamp, so prometheus_in stamps no timestamp
-          carrier; the sample's own timestamp reads back unchanged.
+          The family type carrier is consumed into the wire form and a scrape stamps it back;
+          OpenMetrics has no `untyped`, so that type reads back as `unknown`.
       datadog_out:
         class: lost
         counter: logit.output.tags.omitted{reason=no_wire_form}
@@ -2355,15 +2353,15 @@ rows:
           Another protocol's `_logit.` carrier is private and isn't a tag, so it's left off. Under
           `format: dogstatsd`, `_logit.datadog.hostless` on a record with no `host`, no non-empty
           `host.name`, and no non-empty `h:` field is an empty `host:` tag, which statsd_in reads
-          back as an empty `host`. A `_logit.metrics.*` flag is left off too, and statsd_in sets
-          `_logit.metrics.closed` again on a `|T` line it reads back.
+          back as an empty `host`. A `_logit.metrics.*` flag is left off too; the `timestamped`
+          row has `_logit.metrics.closed: timestamped`.
       prometheus_out:
         class: lost
         reason: structural
         text: >-
           Another protocol's `_logit.` carrier is private and isn't a label, so it's left off. A
-          `_logit.metrics.*` flag is left off too, and a scrape sets `_logit.metrics.closed` again
-          on a sample with its own timestamp; remote-write doesn't.
+          `_logit.metrics.*` flag is left off too; the `timestamped` row has
+          `_logit.metrics.closed: timestamped`.
       influxdb_out:
         class: lost
         reason: structural
@@ -2388,6 +2386,58 @@ rows:
         text: >-
           Another protocol's `_logit.` carrier is private and isn't a tag, so it's left off, under
           either `tags:` mode.
+  # `_logit.metrics.closed: timestamped`, the neutral flag that says the event's timestamp is its
+  # source's own. statsd_in and prometheus_in's scrape set it, and statsd_out and prometheus_out
+  # read it, whichever decoder set it.
+  - kind: attributes
+    feature: timestamped
+    cells:
+      statsd_out:
+        - when: {format: statsd}
+          class: lost
+          counter: logit.output.fields.omitted{reason=dialect}
+          text: Plain statsd has no `|T` segment, so the event's timestamp is omitted, counted.
+        - class: exact
+          text: >-
+            The event's timestamp is written as `|T<seconds>` (`d:<seconds>` on an event or a
+            service check), truncated to whole seconds, and statsd_in sets the flag again. A
+            scraped Prometheus sample with its own timestamp leaves with a `|T` too.
+      prometheus_out:
+        - when: {bind: null}
+          class: lost
+          reason: structural
+          text: >-
+            Remote-write gives every sample its timestamp, so the timestamp survives, but a
+            remote-write receiver can't tell it from one the producer didn't choose and sets no
+            flag.
+        - class: exact
+          text: >-
+            The event's timestamp is written as the sample's timestamp, and a scrape sets the flag
+            again. A statsd `|T` line leaves with a sample timestamp too.
+      influxdb_out:
+        class: lost
+        reason: structural
+        text: >-
+          The flag is private and isn't a tag, so it's left off. Every point carries its
+          timestamp, so influxdb_in can't tell the source's own from any other and sets no flag.
+      otlp_out:
+        class: lost
+        reason: structural
+        text: >-
+          The flag is private and isn't an OTLP attribute, so it's left off. The point's time
+          carries the timestamp.
+      datadog_out:
+        class: lost
+        reason: structural
+        text: >-
+          The flag is private and never a tag, so it's left off. The point carries its timestamp,
+          in whole seconds.
+      graphite_out:
+        class: lost
+        reason: structural
+        text: >-
+          The flag is private and isn't a tag, so it's left off, under either `tags:` mode. Every
+          datapoint carries its timestamp.
   - kind: attributes
     feature: resource_attribute
     cells:

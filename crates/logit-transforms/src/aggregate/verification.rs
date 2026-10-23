@@ -845,8 +845,6 @@ fn event_attributes(i: usize) -> AttrMap {
         4 => attrs.insert("_logit.metrics.closed", Value::Bool(true)),
         5 => attrs.insert("_logit.metrics.closed", Value::str("bucketed")),
         _ => {
-            attrs.insert("_logit.statsd.timestamp", Value::U64(1));
-            attrs.insert("_logit.prometheus.timestamp", Value::Bool(true));
             attrs.insert("_logit.datadog.stats.name", Value::str("web.request"));
         }
     }

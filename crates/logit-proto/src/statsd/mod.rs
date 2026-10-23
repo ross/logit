@@ -48,15 +48,16 @@
 //! forward-compatible superset. `|c:<id>` (v1.2+; v1.4+'s `ci-`/`in-`-prefixed forms land verbatim)
 //! stamps `_logit.statsd.container_id: Value::Str`, a zero-copy datagram slice. `|T<secs>` sets
 //! [`Event::timestamp`](logit_core::Event::timestamp) to `secs * 1_000_000_000` in place of the
-//! receipt time `decode_into`'s `received_at` supplies, and stamps
-//! `_logit.statsd.timestamp: Value::U64(secs)`, the raw wire value. The carrier is what survives a
-//! stage that rebuilds `Event::timestamp` (`aggregate`'s flush), and it tells a wire timestamp from
-//! a receipt-time one. A `|T` that isn't an unsigned integer (the form is under the rejection rules
-//! below), or whose nanoseconds overflow `i64`, rejects only that line as `bad_line`. Both
-//! attributes are protocol-namespaced carriers (`docs/adr/lossless-transit.md`). Beside the
-//! timestamp carrier, `|T` stamps the flag `_logit.metrics.closed: "timestamped"`, which tells
-//! `aggregate` the point has its own time (`docs/adr/metric-flags.md`, "The flags"). Every other
-//! unrecognized `|` segment is accepted and ignored, for forward compatibility.
+//! receipt time `decode_into`'s `received_at` supplies, and stamps the flag
+//! `_logit.metrics.closed: "timestamped"`, which tells a wire timestamp from a receipt-time one:
+//! `aggregate` passes the point through unwindowed, and a sink that can write a point's own time
+//! (`statsd_out`'s `|T`, `prometheus_out`'s sample timestamp) writes `Event::timestamp` back
+//! (`docs/adr/metric-flags.md`, "The flags"). There's no `_logit.statsd.*` timestamp carrier
+//! (`docs/adr/protocol-knowledge-stays-in-family.md`, "Amendment: move, don't mirror"). A `|T`
+//! that isn't an unsigned integer (the form is under the rejection rules below), or whose
+//! nanoseconds overflow `i64`, rejects only that line as `bad_line`. `_logit.statsd.container_id`
+//! is a protocol-namespaced carrier (`docs/adr/lossless-transit.md`). Every other unrecognized `|`
+//! segment is accepted and ignored, for forward compatibility.
 //!
 //! **`|e:<external-data>` (v1.5, Agent 7.57+) and `|card:<cardinality>` (v1.6, Agent 7.64+)** stamp
 //! `_logit.statsd.external_data` and `_logit.statsd.cardinality`, both `Value::Str` zero-copy
@@ -142,10 +143,10 @@
 //! - Attributes (all `Value::Str`, zero-copy where possible): `_logit.statsd.event.title` (always),
 //!   `_logit.statsd.event.priority` (`p:`, raw), `_logit.statsd.event.alert_type` (`t:`, raw),
 //!   `_logit.statsd.event.aggregation_key` (`k:`), `_logit.statsd.event.source_type` (`s:`),
-//!   `_logit.statsd.event.host` (`h:`), each only if present, plus `_logit.statsd.timestamp`,
-//!   `_logit.statsd.container_id`, `_logit.statsd.external_data`, `_logit.statsd.cardinality` and
-//!   `#tags` as on a metric line. `d:<secs>` plays `|T`'s role (same checked parse, same event
-//!   timestamp, carrier, and flag); `|T` itself is an unrecognized field here and is ignored.
+//!   `_logit.statsd.event.host` (`h:`), each only if present, plus `_logit.statsd.container_id`,
+//!   `_logit.statsd.external_data`, `_logit.statsd.cardinality` and `#tags` as on a metric line.
+//!   `d:<secs>` plays `|T`'s role (same checked parse, same event timestamp and flag); `|T` itself
+//!   is an unrecognized field here and is ignored.
 //!
 //! **Service check**: `_sc|<NAME>|<STATUS>|d:<secs>|h:<hostname>|#<tags>|c:<container_id>|
 //! e:<external_data>|card:<cardinality>|m:<message>`. `NAME` must be non-empty and `STATUS` an
@@ -158,7 +159,7 @@
 //! `_logit.statsd.service_check.name` (always, `Value::Str`: `MetricRecord` has nowhere else to
 //! carry it), `_logit.statsd.service_check.status` (always, `Value::U64`),
 //! `_logit.statsd.service_check.message` (`m:`, verbatim) and `_logit.statsd.service_check.host`
-//! (`h:`), plus `_logit.statsd.timestamp` and its flag, `_logit.statsd.container_id`,
+//! (`h:`), plus the `d:` timestamp and its flag, `_logit.statsd.container_id`,
 //! `_logit.statsd.external_data`, `_logit.statsd.cardinality` and `#tags` as above.
 //!
 //! **Tag values, `|c:<id>`, and set members are zero-copy slices of the datagram**, like every

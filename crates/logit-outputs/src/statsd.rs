@@ -303,10 +303,12 @@
 //! | `attributes/bytes_value`, otherwise | lost | `logit.output.tags.omitted{reason=unrepresentable}` | A bytes value has no tag form and is left off, counted. |
 //! | `attributes/timestamp_value`, under `format: statsd` | lost | `logit.output.tags.omitted{reason=dialect}` | Plain statsd has no tags. |
 //! | `attributes/timestamp_value`, otherwise | lost | `logit.output.tags.omitted{reason=unrepresentable}` | A timestamp value has no tag form and is left off, counted. |
-//! | `attributes/private_carrier`, under `format: statsd` | lost | `logit.output.fields.omitted{reason=dialect}` | Plain statsd has no `\|c:`, `\|e:`, `\|card:`, or `\|T` segment, so those carriers are omitted, counted once per carrier per line; the type carrier survives as the line's type, `h` and `d` as `ms`. |
+//! | `attributes/private_carrier`, under `format: statsd` | lost | `logit.output.fields.omitted{reason=dialect}` | Plain statsd has no `\|c:`, `\|e:`, or `\|card:` segment, so those carriers are omitted, counted once per carrier per line; the type carrier survives as the line's type, `h` and `d` as `ms`. |
 //! | `attributes/private_carrier`, otherwise | exact | -- | A `_logit.statsd.*` carrier is written as its own segment or field and statsd_in stamps it back. |
 //! | `attributes/prometheus_target` | lost | structural | The scrape target is private and isn't a tag, so it's left off. |
-//! | `attributes/foreign_carrier` | lost | structural | Another protocol's `_logit.` carrier is private and isn't a tag, so it's left off. Under `format: dogstatsd`, `_logit.datadog.hostless` on a record with no `host`, no non-empty `host.name`, and no non-empty `h:` field is an empty `host:` tag, which statsd_in reads back as an empty `host`. A `_logit.metrics.*` flag is left off too, and statsd_in sets `_logit.metrics.closed` again on a `\|T` line it reads back. |
+//! | `attributes/foreign_carrier` | lost | structural | Another protocol's `_logit.` carrier is private and isn't a tag, so it's left off. Under `format: dogstatsd`, `_logit.datadog.hostless` on a record with no `host`, no non-empty `host.name`, and no non-empty `h:` field is an empty `host:` tag, which statsd_in reads back as an empty `host`. A `_logit.metrics.*` flag is left off too; the `timestamped` row has `_logit.metrics.closed: timestamped`. |
+//! | `attributes/timestamped`, under `format: statsd` | lost | `logit.output.fields.omitted{reason=dialect}` | Plain statsd has no `\|T` segment, so the event's timestamp is omitted, counted. |
+//! | `attributes/timestamped`, otherwise | exact | -- | The event's timestamp is written as `\|T<seconds>` (`d:<seconds>` on an event or a service check), truncated to whole seconds, and statsd_in sets the flag again. A scraped Prometheus sample with its own timestamp leaves with a `\|T` too. |
 //! | `attributes/resource_attribute`, under `format: statsd` | lost | `logit.output.tags.omitted{reason=dialect}` | Plain statsd has no tags. |
 //! | `attributes/resource_attribute`, otherwise | normalized | `resource_merged` | A resource attribute is written as a tag, the event's value winning on a shared key, and reads back as an event attribute. |
 //! | `attributes/scope` | lost | structural | statsd has no instrumentation scope, so none is written. |
@@ -426,15 +428,16 @@
 //!
 //! Both are DogStatsD-only line extensions this sink round-trips. `_logit.statsd.container_id` (a
 //! `Value::Str` `statsd_in` stamps from an incoming `|c:<id>`) renders as `|c:<id>`, sanitized like
-//! a tag value so an embedded `:` survives. `_logit.statsd.timestamp == Value::U64(secs)` (the raw
-//! wire seconds `statsd_in` stamps alongside setting `Event::timestamp`) renders as `|T<secs>`
-//! **from the carrier, never from `event.timestamp`**: a stage that rebuilds `Event::timestamp`
-//! after decode (a `timestamp` transform, or a Lua script) can't fabricate or collapse a `|T`.
-//! `aggregate` passes such a record through unmerged, with its own timestamp, on the
-//! `_logit.metrics.closed` flag `statsd_in` sets beside the carrier, not on the carrier. A
-//! `_logit.statsd.timestamp` that isn't a
-//! `Value::U64` (reachable from a cross-protocol relay or Lua, never from `statsd_in`) isn't
-//! emitted.
+//! a tag value so an embedded `:` survives. `|T<secs>` is written for an event flagged
+//! `_logit.metrics.closed: "timestamped"` (on the event, else the resource; the flag's other values
+//! write none), with `secs` the whole seconds of `Event::timestamp`, truncated. `statsd_in` sets
+//! that flag and `Event::timestamp` from an incoming `|T`, and so does `prometheus_in` for a scraped
+//! sample with its own timestamp. The flag says the timestamp is the source's; `Event::timestamp`
+//! says what it is now, so a `timestamp` transform or a Lua script that rewrites it moves the `|T`
+//! with it, and a script that sets the flag gets the `|T` it asked for
+//! (`docs/adr/protocol-knowledge-stays-in-family.md`, "Amendment: move, don't mirror").
+//! `aggregate` passes a flagged record through unmerged, with its own timestamp. A flagged event
+//! stamped before 1970 gets no `|T`, which carries unsigned seconds.
 //!
 //! `_logit.statsd.external_data` and `_logit.statsd.cardinality` (DogStatsD v1.5's `|e:` and v1.6's
 //! `|card:`) round-trip the same way as `|c:`: a `Value::Str` carrier. Cardinality is sanitized
@@ -449,8 +452,8 @@
 //! order. Under `Format::Statsd` none has
 //! anywhere to go, so each is omitted and counted (`EncodeStats::omitted_dialect_fields`).
 //!
-//! `_logit.statsd.*` attributes (`_logit.statsd.type`, `_logit.statsd.container_id`,
-//! `_logit.statsd.timestamp`, and the rest) are this sink's own carriers, not tags:
+//! `_logit.statsd.*` attributes (`_logit.statsd.type`, `_logit.statsd.container_id`, and the
+//! rest) are this sink's own carriers, not tags:
 //! `build_tag_suffix` reads them by exact name and keeps them out of the `|#k:v,...` segment, as it
 //! keeps out every other private `_logit.` attribute, uncounted under either dialect (ADR
 //! `private-attribute-namespace`). The same merged resource⊕event walk captures every carrier into
@@ -475,11 +478,11 @@
 //!   walk, and service-check detection reads `Carriers::service_check_name` off it.
 //!
 //! Either way the full walk into [`Carriers`] is where
-//! `_logit.statsd.type`/`_logit.statsd.container_id`/`_logit.statsd.timestamp` are captured too,
+//! `_logit.statsd.type`/`_logit.statsd.container_id` and the `timestamped` flag are captured too,
 //! so `event.attributes` is never read a second time.
 //!
 //! **Event wire form**, one line: `_e{tlen,xlen}:title|text`, then, in this order and only when
-//! present and valid: `|d:<secs>` (from the `_logit.statsd.timestamp` carrier; `d:`, never `|T`,
+//! present and valid: `|d:<secs>` (for a `timestamped` event, as for `|T`; `d:`, never `|T`,
 //! since an event's timestamp is a named field of its own grammar), `|h:<host>` (from the
 //! `_logit.statsd.event.host` carrier only; a `host.name` goes in the tag segment, under "The
 //! host"), `|p:<priority>`
@@ -548,6 +551,7 @@ use crate::datagram::{
 use crate::stream::{Dial, PooledStream, Target, TlsTarget};
 use crate::Output;
 use anyhow::Context;
+use logit_core::attrs::{CLOSED_TIMESTAMPED, METRICS_CLOSED};
 use logit_core::{
     Diagnostics, Event, EventBatch, MetricKind, MetricRecord, MetricValue, Resource, Telemetry,
     Temporality, Value,
@@ -631,7 +635,7 @@ pub struct EncodeStats {
     /// once per value.
     pub bool_values: usize,
     /// `_logit.statsd.container_id`, `_logit.statsd.external_data`, `_logit.statsd.cardinality`,
-    /// and `_logit.statsd.timestamp` omitted under `Format::Statsd` (`append_dialect_extras`), from
+    /// and a `timestamped` event's `|T` omitted under `Format::Statsd` (`append_dialect_extras`), from
     /// a line that is still sent. Counted once per field per emitted line, so a negative-gauge pair
     /// or a multi-member `SetMembers` record counts once per physical line.
     pub omitted_dialect_fields: usize,
@@ -894,7 +898,7 @@ impl StatsdEncoder {
                 container_id: carriers.container_id,
                 external_data: carriers.external_data,
                 cardinality: carriers.cardinality,
-                timestamp_secs: carriers.timestamp_secs,
+                timestamp_secs: carriers.wire_seconds(event),
                 max_packet_bytes: self.max_packet_bytes,
                 stats,
                 diag: &mut self.diag,
@@ -940,7 +944,7 @@ impl StatsdEncoder {
             container_id: carriers.container_id,
             external_data: carriers.external_data,
             cardinality: carriers.cardinality,
-            timestamp_secs: carriers.timestamp_secs,
+            timestamp_secs: carriers.wire_seconds(event),
             max_packet_bytes: self.max_packet_bytes,
             stats,
             diag: &mut self.diag,
@@ -1038,7 +1042,9 @@ struct Carriers<'a> {
     container_id: Option<&'a str>,
     external_data: Option<&'a str>,
     cardinality: Option<&'a str>,
-    timestamp_secs: Option<u64>,
+    /// `_logit.metrics.closed` is `timestamped`: the event's timestamp is its source's own, so it
+    /// goes out as `|T`/`d:` ([`Carriers::wire_seconds`]).
+    timestamped: bool,
     /// `_logit.statsd.event.title`, present only if valid UTF-8. [`is_dogstatsd_event`] detects an
     /// event by the raw attribute, so this can be `None` on a detected event.
     event_title: Option<&'a str>,
@@ -1054,6 +1060,18 @@ struct Carriers<'a> {
     service_check_host: Option<&'a str>,
 }
 
+impl Carriers<'_> {
+    /// The whole seconds of `event.timestamp` (truncated) when the event is flagged `timestamped`,
+    /// for `|T`/`d:`; `None` for an unflagged event and for one before 1970, which the wire's
+    /// unsigned seconds can't hold.
+    fn wire_seconds(&self, event: &Event) -> Option<u64> {
+        if !self.timestamped {
+            return None;
+        }
+        u64::try_from(event.timestamp).ok().map(|nanos| nanos / 1_000_000_000)
+    }
+}
+
 /// Builds this event's DogStatsD tag segment into `suffix` (cleared first, **no** leading `|#`;
 /// [`append_tags`] adds that only if `suffix` is non-empty), walking [`crate::attrs::merged`]
 /// (event attributes override the resource's on key collision). Under [`Format::Statsd`] `suffix`
@@ -1061,7 +1079,7 @@ struct Carriers<'a> {
 ///
 /// Each tag goes through [`push_one_tag`], once per scalar attribute and once per **element** of a
 /// `Value::Array` (module doc's "Multi-value tags"). The same walk captures the `_logit.statsd.*`
-/// carriers into `carriers`.
+/// carriers and the `_logit.metrics.closed` flag into `carriers`.
 fn build_tag_suffix<'a>(
     suffix: &mut String,
     scratch: &mut String,
@@ -1093,9 +1111,6 @@ fn build_tag_suffix<'a>(
                 }
                 ("_logit.statsd.cardinality", Value::Str(s)) => {
                     carriers.cardinality = std::str::from_utf8(s).ok();
-                }
-                ("_logit.statsd.timestamp", Value::U64(secs)) => {
-                    carriers.timestamp_secs = Some(*secs);
                 }
                 ("_logit.statsd.event.title", Value::Str(s)) => {
                     carriers.event_title = std::str::from_utf8(s).ok();
@@ -1135,6 +1150,10 @@ fn build_tag_suffix<'a>(
         }
         if key_str == ATTR_HOSTLESS {
             hostless = matches!(value, Value::Bool(true));
+            continue;
+        }
+        if key_str == METRICS_CLOSED {
+            carriers.timestamped = value.as_str() == Some(CLOSED_TIMESTAMPED);
             continue;
         }
         if crate::attrs::is_private(key_str) {
@@ -1270,8 +1289,8 @@ fn append_tags(line: &mut String, tag_suffix: &str) {
 /// `|T<timestamp>` under [`Format::DogStatsd`], or counts each present field into
 /// `EncodeStats::omitted_dialect_fields` under [`Format::Statsd`]. Called after [`append_tags`] on
 /// every physical metric line, both lines of a negative-gauge pair included, since each is its own
-/// statsd line on the wire. `|T` is the carrier's wire seconds, never `event.timestamp` (module
-/// doc's "`|c:<container-id>` and `|T<timestamp>`").
+/// statsd line on the wire. `|T` is `event.timestamp`'s seconds, written only for an event flagged
+/// `timestamped` (module doc's "`|c:<container-id>` and `|T<timestamp>`").
 fn append_dialect_extras(line: &mut String, ctx: &mut EncodeCtx) {
     match ctx.format {
         Format::DogStatsd => {
@@ -2537,6 +2556,7 @@ mod tests {
         server_tls_config, sum_of, sums_through_write_loop, testdata_dir, tls_settings, Collector,
         DialStep, FakeStream, ReadMode, ScriptedDest, ScriptedDial, SendStep, WriteStep,
     };
+    use logit_core::attrs::CLOSED_BUCKETED;
     use logit_core::{interner::intern, AttrMap, BodyFormat, LogRecord, MetricRecord, Resource};
     use logit_pipeline::test_util::{TelemetryProbe, RECV_TIMEOUT};
     use logit_pipeline::Fault;
@@ -2552,6 +2572,14 @@ mod tests {
 
     fn metric_event(name: &str, kind: MetricKind, attrs: &[(&str, Value)]) -> Event {
         metric_event_at(0, name, kind, attrs)
+    }
+
+    /// `event` flagged `_logit.metrics.closed: "timestamped"` and stamped `secs` seconds, as
+    /// `statsd_in` decodes a `|T<secs>` or `d:<secs>`.
+    fn stamped(mut event: Event, secs: i64) -> Event {
+        event.attributes.insert(METRICS_CLOSED, CLOSED_TIMESTAMPED);
+        event.timestamp = secs * 1_000_000_000;
+        event
     }
 
     fn metric_event_at(ts: i64, name: &str, kind: MetricKind, attrs: &[(&str, Value)]) -> Event {
@@ -2653,7 +2681,7 @@ mod tests {
     }
 
     #[test]
-    fn no_timestamp_segment_is_ever_emitted() {
+    fn an_unflagged_event_emits_no_timestamp_segment() {
         let (msgs, _) = encode(vec![metric_event("hits", MetricKind::counter(3.0), &[])]);
         assert!(!msgs[0].contains('T'));
     }
@@ -3266,11 +3294,12 @@ mod tests {
         let attrs = [
             ("env", Value::str("prod")),
             ("_logit.statsd.container_id", Value::str("abc")),
-            ("_logit.statsd.timestamp", Value::U64(1_700_000_000)),
             ("_logit.statsd.type", Value::str("h")),
         ];
-        let (msgs, _) =
-            encode(vec![metric_event("d", MetricKind::Distribution(sketch.clone()), &attrs)]);
+        let (msgs, _) = encode(vec![stamped(
+            metric_event("d", MetricKind::Distribution(sketch.clone()), &attrs),
+            1_700_000_000,
+        )]);
         let tail = "|#env:prod|c:abc|T1700000000";
         let mut expected = vec![
             format!("d.count:2|c{tail}"),
@@ -3286,13 +3315,13 @@ mod tests {
     #[test]
     fn expanded_lines_under_format_statsd_drop_tags_once_and_extras_per_line() {
         let sketch = sketch_of(&[1.0, 2.0]);
-        let attrs = [
-            ("env", Value::str("prod")),
-            ("_logit.statsd.container_id", Value::str("abc")),
-            ("_logit.statsd.timestamp", Value::U64(1_700_000_000)),
-        ];
+        let attrs =
+            [("env", Value::str("prod")), ("_logit.statsd.container_id", Value::str("abc"))];
         let (msgs, stats) = encode_with_format(
-            vec![metric_event("d", MetricKind::Distribution(sketch.clone()), &attrs)],
+            vec![stamped(
+                metric_event("d", MetricKind::Distribution(sketch.clone()), &attrs),
+                1_700_000_000,
+            )],
             Format::Statsd,
         );
         let mut expected =
@@ -3944,14 +3973,38 @@ mod tests {
         assert_eq!(msgs, vec!["hits:1|c|c:res-id"]);
     }
 
+    /// `|T` is `Event::timestamp`'s whole seconds, truncated, on an event flagged `timestamped`
+    /// with no `_logit.statsd.*` carrier at all: whichever decoder set the flag, and after a stage
+    /// rewrote the timestamp, the event's current time is the one written.
     #[test]
-    fn a_timestamp_marker_appends_pipe_t_seconds_under_dogstatsd() {
-        let (msgs, _) = encode(vec![metric_event(
-            "hits",
-            MetricKind::counter(1.0),
-            &[("_logit.statsd.timestamp", Value::U64(5))],
-        )]);
-        assert_eq!(msgs, vec!["hits:1|c|T5"]);
+    fn a_timestamped_event_appends_pipe_t_seconds_from_its_timestamp_under_dogstatsd() {
+        let flagged = |ts: i64| {
+            metric_event_at(
+                ts,
+                "hits",
+                MetricKind::counter(1.0),
+                &[(METRICS_CLOSED, CLOSED_TIMESTAMPED.into())],
+            )
+        };
+        let (msgs, _) = encode(vec![flagged(5_000_000_000), flagged(5_999_999_999)]);
+        assert_eq!(msgs, vec!["hits:1|c|T5", "hits:1|c|T5"]);
+
+        let mut rewritten = decode_one("hits:1|c|T5").remove(0);
+        rewritten.timestamp = 1_700_000_000_000_000_000;
+        let (msgs, _) = encode(vec![rewritten]);
+        assert_eq!(msgs, vec!["hits:1|c|T1700000000"], "the rewritten timestamp moves the `|T`");
+
+        // The flag on the resource stamps every event of the batch.
+        let mut resource = Resource::default();
+        resource.attributes.insert(METRICS_CLOSED, CLOSED_TIMESTAMPED);
+        let batch = EventBatch {
+            resource: Arc::new(resource),
+            scope: None,
+            events: vec![metric_event_at(7_000_000_000, "hits", MetricKind::counter(1.0), &[])],
+        };
+        let mut out = MessageBuf::default();
+        StatsdEncoder::new(Format::DogStatsd).encode_into(&batch, &mut out);
+        assert_eq!(out.iter().collect::<Vec<_>>(), vec![b"hits:1|c|T7".as_slice()]);
     }
 
     #[test]
@@ -3962,21 +4015,32 @@ mod tests {
             &[
                 ("env", "prod".into()),
                 ("_logit.statsd.container_id", Value::str("abcd1234")),
-                ("_logit.statsd.timestamp", Value::U64(5)),
+                (METRICS_CLOSED, CLOSED_TIMESTAMPED.into()),
             ],
         )]);
-        assert_eq!(msgs, vec!["hits:1|c|#env:prod|c:abcd1234|T5"]);
+        assert_eq!(msgs, vec!["hits:1|c|#env:prod|c:abcd1234|T0"]);
     }
 
-    /// A non-`U64` `_logit.statsd.timestamp` (a Lua or cross-protocol attribute) emits no `|T`.
+    /// Only the flag's `timestamped` value writes `|T`: `bucketed`, any other value, and
+    /// `Bool(true)` close a span for `aggregate` but don't say the timestamp is the source's. Nor
+    /// does a flagged event stamped before 1970, which unsigned seconds can't hold.
     #[test]
-    fn a_non_u64_statsd_timestamp_value_is_not_emitted() {
-        let (msgs, _) = encode(vec![metric_event(
-            "hits",
-            MetricKind::counter(1.0),
-            &[("_logit.statsd.timestamp", true.into())],
-        )]);
-        assert!(!msgs[0].contains('T'));
+    fn a_closed_flag_other_than_timestamped_writes_no_pipe_t() {
+        let at = 5_000_000_000;
+        let events = [Value::from(CLOSED_BUCKETED), Value::from("other"), Value::Bool(true)]
+            .into_iter()
+            .map(|value| {
+                metric_event_at(at, "hits", MetricKind::counter(1.0), &[(METRICS_CLOSED, value)])
+            })
+            .chain([metric_event_at(
+                -1_000_000_000,
+                "hits",
+                MetricKind::counter(1.0),
+                &[(METRICS_CLOSED, CLOSED_TIMESTAMPED.into())],
+            )])
+            .collect();
+        let (msgs, _) = encode(events);
+        assert_eq!(msgs, vec!["hits:1|c"; 4]);
     }
 
     #[test]
@@ -3987,7 +4051,7 @@ mod tests {
                 MetricKind::counter(1.0),
                 &[
                     ("_logit.statsd.container_id", Value::str("abcd1234")),
-                    ("_logit.statsd.timestamp", Value::U64(5)),
+                    (METRICS_CLOSED, CLOSED_TIMESTAMPED.into()),
                 ],
             )],
             Format::Statsd,
@@ -4004,7 +4068,7 @@ mod tests {
             &[
                 ("_logit.statsd.type", Value::str("ms")),
                 ("_logit.statsd.container_id", Value::str("abcd1234")),
-                ("_logit.statsd.timestamp", Value::U64(0)),
+                (METRICS_CLOSED, CLOSED_TIMESTAMPED.into()),
                 ("env", "prod".into()),
             ],
         )]);
@@ -4058,13 +4122,13 @@ mod tests {
                 ("_logit.statsd.container_id", Value::str("abcd1234")),
                 ("_logit.statsd.external_data", Value::str("it-false,cn-web,pu-abc")),
                 ("_logit.statsd.cardinality", Value::str("high")),
-                ("_logit.statsd.timestamp", Value::U64(5)),
+                (METRICS_CLOSED, CLOSED_TIMESTAMPED.into()),
             ],
         )]);
         assert_eq!(stats, EncodeStats::default());
         assert_eq!(
             msgs,
-            vec!["hits:1|c|#env:prod|c:abcd1234|e:it-false,cn-web,pu-abc|card:high|T5"]
+            vec!["hits:1|c|#env:prod|c:abcd1234|e:it-false,cn-web,pu-abc|card:high|T0"]
         );
     }
 
@@ -4097,7 +4161,7 @@ mod tests {
                     ("_logit.statsd.container_id", Value::str("abcd1234")),
                     ("_logit.statsd.external_data", Value::str("ext")),
                     ("_logit.statsd.cardinality", Value::str("high")),
-                    ("_logit.statsd.timestamp", Value::U64(5)),
+                    (METRICS_CLOSED, CLOSED_TIMESTAMPED.into()),
                 ],
             )],
             Format::Statsd,
@@ -4354,19 +4418,21 @@ mod tests {
     #[test]
     fn an_event_with_every_field_renders_the_canonical_line_with_byte_lengths() {
         // "héllo" is 6 UTF-8 bytes but 5 chars, so `tlen` must count bytes.
-        let event = event_line_event(
-            "héllo",
-            "world",
-            &[
-                ("_logit.statsd.timestamp", Value::U64(1_700_000_000)),
-                ("_logit.statsd.event.host", Value::str("web1")),
-                ("_logit.statsd.event.priority", Value::str("low")),
-                ("_logit.statsd.event.alert_type", Value::str("error")),
-                ("_logit.statsd.event.aggregation_key", Value::str("key1")),
-                ("_logit.statsd.event.source_type", Value::str("my_app")),
-                ("_logit.statsd.container_id", Value::str("cid1")),
-                ("env", "prod".into()),
-            ],
+        let event = stamped(
+            event_line_event(
+                "héllo",
+                "world",
+                &[
+                    ("_logit.statsd.event.host", Value::str("web1")),
+                    ("_logit.statsd.event.priority", Value::str("low")),
+                    ("_logit.statsd.event.alert_type", Value::str("error")),
+                    ("_logit.statsd.event.aggregation_key", Value::str("key1")),
+                    ("_logit.statsd.event.source_type", Value::str("my_app")),
+                    ("_logit.statsd.container_id", Value::str("cid1")),
+                    ("env", "prod".into()),
+                ],
+            ),
+            1_700_000_000,
         );
         let (msgs, stats) = encode(vec![event]);
         assert_eq!(stats, EncodeStats::default());
@@ -4526,15 +4592,17 @@ mod tests {
 
     #[test]
     fn a_service_check_renders_the_canonical_line() {
-        let event = service_check_event(
-            "my.check",
-            MetricKind::gauge(1.0),
-            &[
-                ("_logit.statsd.timestamp", Value::U64(1_700_000_000)),
-                ("_logit.statsd.service_check.host", Value::str("web1")),
-                ("env", "prod".into()),
-                ("_logit.statsd.container_id", Value::str("cid1")),
-            ],
+        let event = stamped(
+            service_check_event(
+                "my.check",
+                MetricKind::gauge(1.0),
+                &[
+                    ("_logit.statsd.service_check.host", Value::str("web1")),
+                    ("env", "prod".into()),
+                    ("_logit.statsd.container_id", Value::str("cid1")),
+                ],
+            ),
+            1_700_000_000,
         );
         let (msgs, stats) = encode(vec![event]);
         assert_eq!(stats, EncodeStats::default());
@@ -5990,8 +6058,8 @@ mod tests {
             Some("abcd1234")
         );
         assert_eq!(
-            relayed[0].attributes.get("_logit.statsd.timestamp"),
-            Some(&Value::U64(1_700_000_000))
+            relayed[0].attributes.get(METRICS_CLOSED).and_then(Value::as_str),
+            Some(CLOSED_TIMESTAMPED)
         );
     }
 
@@ -6013,10 +6081,7 @@ mod tests {
             relayed[0].attributes.get("_logit.statsd.event.title").and_then(|v| v.as_str()),
             Some("title")
         );
-        assert_eq!(
-            relayed[0].attributes.get("_logit.statsd.timestamp"),
-            Some(&Value::U64(1_700_000_000))
-        );
+        assert_eq!(relayed[0].timestamp, 1_700_000_000_000_000_000);
         assert_eq!(relayed[0].attributes.get("env").and_then(|v| v.as_str()), Some("prod"));
     }
 

@@ -51,7 +51,7 @@
 - name: sample_timestamp
   text: >-
     A sample's own timestamp, which sets the event timestamp and stamps the
-    `_logit.prometheus.timestamp` carrier.
+    `_logit.metrics.closed: timestamped` flag.
 - name: non_finite
   text: A `NaN`, `+Inf`, or `-Inf` sample value.
 - name: label_escaping

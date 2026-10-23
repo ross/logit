@@ -129,7 +129,6 @@ static KEYS: LazyLock<StatsdKeys> = LazyLock::new(|| StatsdKeys {
     container_id: intern("_logit.statsd.container_id"),
     external_data: intern("_logit.statsd.external_data"),
     cardinality: intern("_logit.statsd.cardinality"),
-    timestamp: intern("_logit.statsd.timestamp"),
     metrics_closed: intern(logit_core::attrs::METRICS_CLOSED),
     type_: intern("_logit.statsd.type"),
     event_title: intern("_logit.statsd.event.title"),
@@ -146,7 +145,6 @@ struct StatsdKeys {
     container_id: Symbol,
     external_data: Symbol,
     cardinality: Symbol,
-    timestamp: Symbol,
     metrics_closed: Symbol,
     type_: Symbol,
     event_title: Symbol,
@@ -159,10 +157,10 @@ struct StatsdKeys {
     service_check_host: Symbol,
 }
 
-/// Stamps the `_logit.statsd.timestamp` carrier and, beside it, the `_logit.metrics.closed` flag
-/// that tells `aggregate` the point has its own time (ADR `metric-flags`, "The flags").
-fn insert_source_timestamp(attributes: &mut AttrMap, secs: u64) {
-    attributes.insert_sym(KEYS.timestamp, Value::U64(secs));
+/// Stamps the `_logit.metrics.closed: "timestamped"` flag, which says the event's timestamp is
+/// the sender's own: `aggregate` passes the point through, and `statsd_out` writes it back as
+/// `|T`/`d:` (ADR `metric-flags`, "The flags").
+fn insert_source_timestamp(attributes: &mut AttrMap) {
     attributes
         .insert_sym(KEYS.metrics_closed, Value::static_str(logit_core::attrs::CLOSED_TIMESTAMPED));
 }
@@ -253,20 +251,15 @@ fn insert_origin_field(attributes: &mut AttrMap, bytes: &Bytes, field: &str) -> 
     }
 }
 
-/// Parses a `|T<unix-seconds>`/`d:<unix-seconds>` value into `(nanos, secs)`: `nanos` for
-/// `Event::timestamp`, `secs` for the `_logit.statsd.timestamp` carrier.
+/// Parses a `|T<unix-seconds>`/`d:<unix-seconds>` value into nanoseconds for `Event::timestamp`.
 ///
 /// Anything `u64::from_str` refuses, or seconds whose nanosecond conversion overflows `i64`,
 /// rejects the line rather than falling back to receipt time. `from_str` takes a leading `+`
 /// (`super`'s module doc has why that stays).
-fn parse_wire_seconds(secs: &str, line: &str) -> Result<(i64, u64), CodecError> {
+fn parse_wire_seconds(secs: &str, line: &str) -> Result<i64, CodecError> {
     let malformed = || CodecError::Malformed(format!("malformed statsd line: {line:?}"));
     let secs: u64 = secs.parse().map_err(|_| malformed())?;
-    let nanos = secs
-        .checked_mul(1_000_000_000)
-        .and_then(|n| i64::try_from(n).ok())
-        .ok_or_else(malformed)?;
-    Ok((nanos, secs))
+    secs.checked_mul(1_000_000_000).and_then(|n| i64::try_from(n).ok()).ok_or_else(malformed)
 }
 
 /// Parses one line. `bytes` is the whole datagram, threaded down so every field shares it;
@@ -320,11 +313,8 @@ fn parse_line(
             // `|e:`/`|card:`, stamped by the call itself.
         } else if let Some(secs) = extra.strip_prefix('T') {
             // DogStatsD v1.3+ point timestamp, accepted on every type.
-            let (nanos, secs) = parse_wire_seconds(secs, line)?;
-            line_timestamp = nanos;
-            // `statsd_out` emits `|T` from this carrier, not `event.timestamp`, which a later
-            // stage may rewrite; so a `|T` the wire never sent can't be fabricated.
-            insert_source_timestamp(&mut attributes, secs);
+            line_timestamp = parse_wire_seconds(secs, line)?;
+            insert_source_timestamp(&mut attributes);
         }
         // Any other segment is ignored, for forward compatibility.
     }
@@ -415,9 +405,8 @@ fn parse_event(
             } else if insert_origin_field(&mut attributes, bytes, field) {
                 // `e:`/`card:`, stamped by the call itself.
             } else if let Some(secs) = field.strip_prefix("d:") {
-                let (nanos, secs) = parse_wire_seconds(secs, line)?;
-                line_timestamp = nanos;
-                insert_source_timestamp(&mut attributes, secs);
+                line_timestamp = parse_wire_seconds(secs, line)?;
+                insert_source_timestamp(&mut attributes);
             } else if let Some(host) = field.strip_prefix("h:") {
                 attributes.insert_sym(
                     KEYS.event_host,
@@ -541,9 +530,8 @@ fn parse_service_check(
             } else if insert_origin_field(&mut attributes, bytes, field) {
                 // `e:`/`card:`, stamped by the call itself.
             } else if let Some(secs) = field.strip_prefix("d:") {
-                let (nanos, secs) = parse_wire_seconds(secs, line)?;
-                line_timestamp = nanos;
-                insert_source_timestamp(&mut attributes, secs);
+                line_timestamp = parse_wire_seconds(secs, line)?;
+                insert_source_timestamp(&mut attributes);
             } else if let Some(host) = field.strip_prefix("h:") {
                 attributes.insert_sym(
                     KEYS.service_check_host,
@@ -1216,18 +1204,13 @@ mod tests {
     }
 
     #[test]
-    fn timestamp_segment_sets_the_event_timestamp_and_marker() {
+    fn timestamp_segment_sets_the_event_timestamp_and_flag() {
         let events = decode("hits:1|c|T1700000000");
         let event = &events[0];
         assert_eq!(event.timestamp, 1_700_000_000 * 1_000_000_000);
         assert_eq!(
-            event.attributes.get("_logit.statsd.timestamp"),
-            Some(&Value::U64(1_700_000_000))
-        );
-        assert_eq!(
             event.attributes.get(logit_core::attrs::METRICS_CLOSED).and_then(|v| v.as_str()),
-            Some("timestamped"),
-            "the flag rides beside the carrier"
+            Some("timestamped")
         );
         let untimed = &decode("hits:1|c")[0];
         assert_eq!(untimed.attributes.get(logit_core::attrs::METRICS_CLOSED), None);
@@ -1255,14 +1238,10 @@ mod tests {
         for line in ["hits:1|c|T+1700000000", "hits:1|c|T01700000000"] {
             let events = decode(line);
             assert_eq!(events.len(), 1, "{line}");
-            assert_eq!(
-                events[0].attributes.get("_logit.statsd.timestamp"),
-                Some(&Value::U64(1_700_000_000)),
-                "{line}"
-            );
+            assert_eq!(events[0].timestamp, 1_700_000_000 * 1_000_000_000, "{line}");
         }
         let event = &decode("_e{+2,+4}:hi|body|d:+5")[0];
-        assert_eq!(event.attributes.get("_logit.statsd.timestamp"), Some(&Value::U64(5)));
+        assert_eq!(event.timestamp, 5_000_000_000);
         assert_eq!(event.log.as_ref().unwrap().message.as_str(), Some("body"));
         let check = &decode("_sc|check|+1")[0];
         assert_eq!(
@@ -1296,8 +1275,8 @@ mod tests {
                 "line: {line:?}"
             );
             assert_eq!(
-                event.attributes.get("_logit.statsd.timestamp"),
-                Some(&Value::U64(1_700_000_000)),
+                event.attributes.get(logit_core::attrs::METRICS_CLOSED).and_then(|v| v.as_str()),
+                Some("timestamped"),
                 "line: {line:?}"
             );
             match &event.metrics[0].kind {
@@ -1413,8 +1392,8 @@ mod tests {
             Some("cid1")
         );
         assert_eq!(
-            event.attributes.get("_logit.statsd.timestamp"),
-            Some(&Value::U64(1_700_000_000))
+            event.attributes.get(logit_core::attrs::METRICS_CLOSED).and_then(|v| v.as_str()),
+            Some("timestamped")
         );
     }
 
@@ -1467,18 +1446,13 @@ mod tests {
     }
 
     #[test]
-    fn event_d_field_sets_the_timestamp_and_the_carrier() {
+    fn event_d_field_sets_the_timestamp_and_the_flag() {
         let events = decode("_e{5,4}:title|text|d:1700000000");
         let event = only_log_event(events);
         assert_eq!(event.timestamp, 1_700_000_000 * 1_000_000_000);
         assert_eq!(
-            event.attributes.get("_logit.statsd.timestamp"),
-            Some(&Value::U64(1_700_000_000))
-        );
-        assert_eq!(
             event.attributes.get(logit_core::attrs::METRICS_CLOSED).and_then(|v| v.as_str()),
-            Some("timestamped"),
-            "the flag rides beside the carrier"
+            Some("timestamped")
         );
     }
 
@@ -1493,19 +1467,14 @@ mod tests {
     }
 
     #[test]
-    fn service_check_d_field_sets_the_timestamp_and_the_carrier() {
+    fn service_check_d_field_sets_the_timestamp_and_the_flag() {
         let events = decode("_sc|check|0|d:1700000000");
         assert_eq!(events.len(), 1);
         let event = &events[0];
         assert_eq!(event.timestamp, 1_700_000_000 * 1_000_000_000);
         assert_eq!(
-            event.attributes.get("_logit.statsd.timestamp"),
-            Some(&Value::U64(1_700_000_000))
-        );
-        assert_eq!(
             event.attributes.get(logit_core::attrs::METRICS_CLOSED).and_then(|v| v.as_str()),
-            Some("timestamped"),
-            "the flag rides beside the carrier"
+            Some("timestamped")
         );
     }
 
@@ -1930,10 +1899,7 @@ mod tests {
             ["low", "high", "low", "low", "low", "low", "low", "orchestrator", "low"]
         );
         // `|T` last on the line, and its value the client's own.
-        assert_eq!(
-            decoded[6].attributes.get("_logit.statsd.timestamp"),
-            Some(&Value::U64(1_790_000_000))
-        );
+        assert_eq!(attr_str(&decoded[6], logit_core::attrs::METRICS_CLOSED), Some("timestamped"));
         assert_eq!(decoded[6].timestamp, 1_790_000_000_000_000_000);
         // The event and the service check: no `e:` on either from this client.
         assert_eq!(attr_str(&decoded[7], "_logit.statsd.event.title"), Some("Deploy finished"));

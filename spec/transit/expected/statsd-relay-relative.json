@@ -1,7 +1,7 @@
 {
   "carriers": {"events": [
-    {"timestamp":"2027-01-15T07:59:30.000000000Z","metrics":[{"name":"requests","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"_logit.metrics.closed":"timestamped","_logit.statsd.cardinality":"high","_logit.statsd.container_id":"in-82046","_logit.statsd.external_data":"it-false,cn-web","_logit.statsd.timestamp":1799999970,"env":"prod"},"types":{"/attributes/_logit.statsd.timestamp":"u64"}},
-    {"timestamp":"2027-01-15T07:59:30.000000000Z","metrics":[{"name":"temperature","kind":"gauge","value":20.0}],"attributes":{"_logit.metrics.closed":"timestamped","_logit.statsd.container_id":"ci-abc","_logit.statsd.timestamp":1799999970},"types":{"/attributes/_logit.statsd.timestamp":"u64"}},
+    {"timestamp":"2027-01-15T07:59:30.000000000Z","metrics":[{"name":"requests","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"_logit.metrics.closed":"timestamped","_logit.statsd.cardinality":"high","_logit.statsd.container_id":"in-82046","_logit.statsd.external_data":"it-false,cn-web","env":"prod"}},
+    {"timestamp":"2027-01-15T07:59:30.000000000Z","metrics":[{"name":"temperature","kind":"gauge","value":20.0}],"attributes":{"_logit.metrics.closed":"timestamped","_logit.statsd.container_id":"ci-abc"}},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"latency","kind":"samples","values":[5.0],"sample_rate":1.0}],"attributes":{"_logit.statsd.cardinality":"low","_logit.statsd.container_id":"in-1","_logit.statsd.type":"ms"}}
   ], "counters": {}},
   "counter": {"events": [
@@ -97,7 +97,7 @@
     "logit.output.events.skipped{component=out,kind=statsd_out,reason=no_metrics,role=sink}": 1
   }},
   "mixed": {"events": [
-    {"timestamp":"2027-01-15T07:59:30.000000000Z","metrics":[{"name":"queue.depth","kind":"gauge","value":7.0}],"attributes":{"_logit.metrics.closed":"timestamped","_logit.statsd.cardinality":"low","_logit.statsd.container_id":"in-82046","_logit.statsd.external_data":"it-false","_logit.statsd.timestamp":1799999970},"types":{"/attributes/_logit.statsd.timestamp":"u64"}},
+    {"timestamp":"2027-01-15T07:59:30.000000000Z","metrics":[{"name":"queue.depth","kind":"gauge","value":7.0}],"attributes":{"_logit.metrics.closed":"timestamped","_logit.statsd.cardinality":"low","_logit.statsd.container_id":"in-82046","_logit.statsd.external_data":"it-false"}},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","log":{"severity":"info","format":"raw","message":"v1.2"},"attributes":{"_logit.statsd.event.alert_type":"info","_logit.statsd.event.title":"Deploy"}},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"bytes","kind":"samples","values":[60196.0],"sample_rate":0.5}],"attributes":{"_logit.statsd.type":"d"}},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"connections","kind":"gauge_delta","delta":2.0}]},
@@ -135,7 +135,7 @@
     "logit.output.messages.skipped{component=out,kind=statsd_out,reason=no_recorded_value,role=sink}": 1
   }},
   "service-check": {"events": [
-    {"timestamp":"2027-01-15T07:59:30.000000000Z","metrics":[{"name":"db.up","kind":"gauge","value":0.0}],"attributes":{"_logit.metrics.closed":"timestamped","_logit.statsd.service_check.host":"web-07","_logit.statsd.service_check.message":"all good","_logit.statsd.service_check.name":"db.up","_logit.statsd.service_check.status":0,"_logit.statsd.timestamp":1799999970,"env":"prod"},"types":{"/attributes/_logit.statsd.service_check.status":"u64","/attributes/_logit.statsd.timestamp":"u64"}},
+    {"timestamp":"2027-01-15T07:59:30.000000000Z","metrics":[{"name":"db.up","kind":"gauge","value":0.0}],"attributes":{"_logit.metrics.closed":"timestamped","_logit.statsd.service_check.host":"web-07","_logit.statsd.service_check.message":"all good","_logit.statsd.service_check.name":"db.up","_logit.statsd.service_check.status":0,"env":"prod"},"types":{"/attributes/_logit.statsd.service_check.status":"u64"}},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"cache.up","kind":"gauge","value":2.0}],"attributes":{"_logit.statsd.service_check.message":"down","_logit.statsd.service_check.name":"cache.up","_logit.statsd.service_check.status":2},"types":{"/attributes/_logit.statsd.service_check.status":"u64"}}
   ], "counters": {}},
   "set": {"events": [
@@ -246,10 +246,10 @@
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"api.latency","kind":"samples","values":[12.0],"sample_rate":0.8}],"attributes":{"_logit.statsd.type":"ms"}}
   ], "counters": {}},
   "timestamped": {"events": [
-    {"timestamp":"2027-01-15T07:59:30.000000000Z","metrics":[{"name":"queue.depth","kind":"gauge","value":7.0}],"attributes":{"_logit.metrics.closed":"timestamped","_logit.statsd.timestamp":1799999970},"types":{"/attributes/_logit.statsd.timestamp":"u64"}},
-    {"timestamp":"2027-01-15T07:59:30.000000000Z","metrics":[{"name":"requests","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"_logit.metrics.closed":"timestamped","_logit.statsd.timestamp":1799999970},"types":{"/attributes/_logit.statsd.timestamp":"u64"}},
-    {"timestamp":"2027-01-15T07:59:30.000000000Z","metrics":[{"name":"requests","kind":"sum","value":2.0,"temporality":"delta","monotonic":true}],"attributes":{"_logit.metrics.closed":"timestamped","_logit.statsd.timestamp":1799999970},"types":{"/attributes/_logit.statsd.timestamp":"u64"}},
-    {"timestamp":"2027-01-15T07:59:40.000000000Z","metrics":[{"name":"queue.depth","kind":"gauge","value":9.0}],"attributes":{"_logit.metrics.closed":"timestamped","_logit.statsd.timestamp":1799999980},"types":{"/attributes/_logit.statsd.timestamp":"u64"}},
+    {"timestamp":"2027-01-15T07:59:30.000000000Z","metrics":[{"name":"queue.depth","kind":"gauge","value":7.0}],"attributes":{"_logit.metrics.closed":"timestamped"}},
+    {"timestamp":"2027-01-15T07:59:30.000000000Z","metrics":[{"name":"requests","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"_logit.metrics.closed":"timestamped"}},
+    {"timestamp":"2027-01-15T07:59:30.000000000Z","metrics":[{"name":"requests","kind":"sum","value":2.0,"temporality":"delta","monotonic":true}],"attributes":{"_logit.metrics.closed":"timestamped"}},
+    {"timestamp":"2027-01-15T07:59:40.000000000Z","metrics":[{"name":"queue.depth","kind":"gauge","value":9.0}],"attributes":{"_logit.metrics.closed":"timestamped"}},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"queue.depth","kind":"gauge","value":5.0}]},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"requests","kind":"sum","value":4.0,"temporality":"delta","monotonic":true}]}
   ], "counters": {}},

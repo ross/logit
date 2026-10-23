@@ -6,7 +6,7 @@
 //! after the check, plus the same `_logit.statsd.service_check.*` attributes, so either one
 //! re-encodes on either route.
 
-use super::events::{non_empty_str, seconds, ATTR_STATSD_TIMESTAMP};
+use super::events::{non_empty_str, seconds};
 use super::logs::{new_batch, parse_json};
 use super::outcomes::{MetricIn, MetricOut};
 use super::tags::{insert_tags, render_tags};
@@ -40,7 +40,6 @@ struct CheckKeys {
     status: Symbol,
     message: Symbol,
     host: Symbol,
-    statsd_timestamp: Symbol,
     host_name: Symbol,
     host_tag: Symbol,
 }
@@ -50,7 +49,6 @@ static KEYS: LazyLock<CheckKeys> = LazyLock::new(|| CheckKeys {
     status: intern(ATTR_SERVICE_CHECK_STATUS),
     message: intern(ATTR_SERVICE_CHECK_MESSAGE),
     host: intern(ATTR_SERVICE_CHECK_HOST),
-    statsd_timestamp: intern(ATTR_STATSD_TIMESTAMP),
     host_name: intern(ATTR_HOST_NAME),
     host_tag: intern(ATTR_HOST_TAG),
 });
@@ -172,8 +170,7 @@ impl DatadogEncoder {
             let host_tag = host_tag(&batch.resource, event);
             let collectd =
                 if own_host.is_none() { collectd_host(&batch.resource, event) } else { None };
-            let mut skip =
-                vec![keys.name, keys.status, keys.message, keys.host, keys.statsd_timestamp];
+            let mut skip = vec![keys.name, keys.status, keys.message, keys.host];
             skip.extend(collectd.map(|_| *COLLECTD_HOST_KEY));
             // An empty `host.name` is no host, so it isn't a tag either.
             let empty_host_name = find(keys.host_name).is_some_and(|v| v.as_str() == Some(""));

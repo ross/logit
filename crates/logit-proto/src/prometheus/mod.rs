@@ -68,7 +68,7 @@
 //! | `# HELP` / `# UNIT` | `description` / `unit` (interned) |
 //! | `_created` (OM) | `start_timestamp` (seconds → nanos) |
 //! | [`Point::Stale`] (remote-write's stale-marker NaN) | the family type's own kind with an empty payload -- `counter` → `Sum{NaN, Cumulative, monotonic}`, `gauge`/`unknown`/`untyped`/`info`/`stateset` → `Gauge(NaN)`, `histogram`/`gaugehistogram` → a bucket-less `Histogram`, `summary` → an empty `Summary` -- and **`flags = FLAG_NO_RECORDED_VALUE`**, which carries the meaning ([`logit_core::MetricRecord::flags`]). The `_logit.prometheus.type` marker is unchanged |
-//! | sample timestamp | `Event::timestamp` + `_logit.prometheus.timestamp: true` + the flag `_logit.metrics.closed: "timestamped"`, which tells `aggregate` the sample has its own time (`docs/adr/metric-flags.md`, "The flags"); absent → `received_at_nanos`, no marker and no flag. The marker says *the producer chose to expose a timestamp on this line*, so a transport that mandates one turns marker and flag off with [`PrometheusDecoder::with_timestamp_marker`]`(false)` and sets only the timestamp |
+//! | sample timestamp | `Event::timestamp` + the flag `_logit.metrics.closed: "timestamped"`, which tells `aggregate` the sample has its own time and the encode side to write it back (`docs/adr/metric-flags.md`, "The flags"); absent → `received_at_nanos`, no flag. The flag says *the producer chose to expose a timestamp on this line*, so a transport that mandates one turns it off with [`PrometheusDecoder::with_timestamp_marker`]`(false)` and sets only the timestamp |
 //! | OM exemplar | `Exemplar { value, timestamp, trace, filtered_attributes }` -- `trace_id`/`span_id` labels become a [`logit_core::TraceRef`] when both are valid hex (consumed); every other exemplar label, and an invalid id, stays in `filtered_attributes`. Bucket exemplars all collect onto the one record. |
 //!
 //! ## Encode: events → families ([`events_to_families`])
@@ -171,9 +171,11 @@
 //! | `attributes/map_value` | lost | `logit.output.labels.omitted{reason=unrepresentable}` | A map has no label form and is left off, counted. |
 //! | `attributes/bytes_value` | lost | `logit.output.labels.omitted{reason=unrepresentable}` | A bytes value has no label form and is left off, counted. |
 //! | `attributes/timestamp_value` | lost | `logit.output.labels.omitted{reason=unrepresentable}` | A timestamp value has no label form and is left off, counted. |
-//! | `attributes/private_carrier` | normalized | `dialect` | The family type and timestamp carriers are consumed into the wire form and a scrape stamps them back; OpenMetrics has no `untyped`, so that type reads back as `unknown`. Remote-write gives every sample a timestamp, so prometheus_in stamps no timestamp carrier; the sample's own timestamp reads back unchanged. |
+//! | `attributes/private_carrier` | normalized | `dialect` | The family type carrier is consumed into the wire form and a scrape stamps it back; OpenMetrics has no `untyped`, so that type reads back as `unknown`. |
 //! | `attributes/prometheus_target` | normalized | `retargeted` | The resource's `_logit.prometheus.target` isn't written. A scrape of prometheus_out stamps prometheus_out's own URL, and a remote-write receiver stamps none. Only the original target's host:port survives, as the `instance` label; its scheme and path are lost. |
-//! | `attributes/foreign_carrier` | lost | structural | Another protocol's `_logit.` carrier is private and isn't a label, so it's left off. A `_logit.metrics.*` flag is left off too, and a scrape sets `_logit.metrics.closed` again on a sample with its own timestamp; remote-write doesn't. |
+//! | `attributes/foreign_carrier` | lost | structural | Another protocol's `_logit.` carrier is private and isn't a label, so it's left off. A `_logit.metrics.*` flag is left off too; the `timestamped` row has `_logit.metrics.closed: timestamped`. |
+//! | `attributes/timestamped`, with `bind:` unset | lost | structural | Remote-write gives every sample its timestamp, so the timestamp survives, but a remote-write receiver can't tell it from one the producer didn't choose and sets no flag. |
+//! | `attributes/timestamped`, otherwise | exact | -- | The event's timestamp is written as the sample's timestamp, and a scrape sets the flag again. A statsd `\|T` line leaves with a sample timestamp too. |
 //! | `attributes/resource_attribute` | normalized | `resource_merged`; `logit.output.labels.normalized{reason=name_sanitized}` | A label, the event's value winning on a shared key, read back as an event attribute. A name outside the label-name grammar is sanitized, counted once per label it renames. |
 //! | `attributes/scope` | lost | structural | Prometheus has no instrumentation scope, so none is written. |
 //! | `attributes/datadog_carrier_log` | lost | structural | Another protocol's `_logit.` carrier is private and isn't a label, so it's left off. |
@@ -193,7 +195,7 @@
 //! | a `Histogram` bound | sorted ascending, equal bounds merged into one `le`; a `NaN` bound has no `le` bucket, its count reaching only `+Inf` and `_count` -- `logit.output.metrics.degraded{reason="non_finite_component"}`, once per record. `-Inf` is an ordinary bound, `le="-Inf"` |
 //! | an event with no metric record (a log, a span, or neither) | nothing -- `logit.output.events.skipped{reason="no_metrics"}` |
 //! | a flagged delta monotonic `Sum` under [`PrometheusEncoder::with_stale_markers`]`(true)` | a stale marker on a `counter`, which reads back as a cumulative counter -- `logit.output.metrics.degraded{metric_kind="delta_sum"}`; a flagged non-monotonic one is a `gauge`'s marker, `{metric_kind="non_monotonic_sum"}` |
-//! | `Event::timestamp` | emitted only when `_logit.prometheus.timestamp: true` is present (consumed) -- or on every series, marker or not, under [`PrometheusEncoder::with_timestamps_always`]`(true)`, which is what a transport with no way to omit a timestamp needs |
+//! | `Event::timestamp` | emitted only when the event is flagged `_logit.metrics.closed: "timestamped"`, on the event or else the resource ([`logit_core::attrs::is_closed_timestamped`]; `bucketed`, any other value, and `Bool(true)` emit none), whichever decoder set it, so a `statsd_in` `\|T` line gets a sample timestamp too -- or on every series, flag or not, under [`PrometheusEncoder::with_timestamps_always`]`(true)`, which is what a transport with no way to omit a timestamp needs |
 //! | labels | `Value::Str/I64/U64/F64/Bool` stringified; `Null/Bytes/Timestamp/Map` dropped -- `logit.output.labels.omitted{reason="unrepresentable"}`. An `Array` (a repeated DogStatsD tag key, `crate::statsd::decode::insert_tags`) renders its **last** representable element -- a Prometheus label set is a map, so there is no multi-value label -- counted `logit.output.labels.normalized{reason="multi_value"}`; an empty or entirely unrepresentable one stays on the `omitted{reason="unrepresentable"}` path |
 //! | names | sanitized ([`sanitize_metric_name`], [`sanitize_label_name`]), each record written under a rewritten name counted `logit.output.metrics.normalized{reason="name_sanitized"}` and each label, a written exemplar's included, `logit.output.labels.normalized{reason="name_sanitized"}`; labels are ordered and collision-checked on their **rendered** names, and on a collision the one whose *original* attribute name sorts first wins -- `logit.output.labels.omitted{reason="collision"}`; a label sanitizing onto a generated one (`le` on a histogram, `quantile` on a summary) is omitted -- `logit.output.labels.omitted{reason="reserved"}`. An exemplar's attribute keys follow the same rule, and one sanitizing onto the `trace_id`/`span_id` its trace is written as is `reserved` |
 //! | two names sanitizing onto one wire name | within one batch, the family whose *model* name sorts first is exposed, the rest are **dropped** -- `logit.output.metrics.dropped{reason="name_collision"}`. Both cannot be exposed: a second `# TYPE` line for one name makes Prometheus reject the whole scrape, so one clash would poison every other metric in the body. The tie-break is on model names, which means a name that needed no sanitizing can lose to one that did (`a.b` sorts before `a_b`) -- deterministic and counted, but worth knowing before reading it as a bug. **Across batches nothing resolves it**: the registry keys a family by its wire name, and a receiver a series by its labels, so `a.b` in one batch and `a_b` in the next merge into one series, uncounted beyond the rewrite's `name_sanitized` (`docs/known-gaps/prometheus.md`) |
@@ -215,7 +217,6 @@
 //! spelled `prometheus.<name>` without the prefix is an ordinary label.
 //! `docs/design/data-model.md`'s well-known-attribute table is the canonical list; in short:
 //! [`ATTR_TYPE`] (`Value::Str`) names the wire family type the model has no distinct kind for;
-//! [`ATTR_TIMESTAMP`] (`Value::Bool(true)`) means "this sample carried its own timestamp";
 //! [`ATTR_TARGET`] (`Value::Str`, a **resource** attribute stamped by `prometheus_in`) is the full
 //! scrape URL.
 //!
@@ -237,8 +238,8 @@
 //! - the scrape target re-stamped: `_logit.prometheus.target` isn't written, so a scrape of the
 //!   relay stamps the relay's URL and a remote-write receiver stamps none, and only the original
 //!   target's host:port survives, as `instance`;
-//! - the remote-write receiver's missing `_logit.prometheus.timestamp` marker: every sample keeps
-//!   its timestamp, but the receiver stamps no marker
+//! - the remote-write receiver's missing `_logit.metrics.closed: "timestamped"` flag: every sample
+//!   keeps its timestamp, but the receiver stamps no flag
 //!   ([`PrometheusDecoder::with_timestamp_marker`]);
 //! - float formatting: shortest round-trip (`1.0` → `1`, `1.458255915e9` → `1458255915`);
 //! - a counter's value sample gains `_total` when the model name lacks it (both dialects), and the
@@ -286,7 +287,7 @@ pub mod text;
 pub use text::Dialect;
 
 use crate::otlp::metrics::SUMMARY_QUANTILES;
-use logit_core::attrs::{is_private, CLOSED_TIMESTAMPED, METRICS_CLOSED};
+use logit_core::attrs::{is_closed_timestamped, is_private, CLOSED_TIMESTAMPED, METRICS_CLOSED};
 use logit_core::interner::{intern, resolve};
 use logit_core::{
     AttrMap, DdSketch, Diagnostics, Event, Exemplar, Histogram, MetricKind, MetricRecord,
@@ -299,9 +300,6 @@ use std::collections::{BTreeMap, BTreeSet};
 /// The wire family type the model has no distinct kind for (`untyped`, `unknown`, `info`,
 /// `stateset`, `gaugehistogram`) -- see the module doc's well-known-attribute section.
 pub const ATTR_TYPE: &str = "_logit.prometheus.type";
-/// `Value::Bool(true)`: this sample carried its own timestamp on the wire, so the encode side
-/// re-emits one on that line (and only on that line).
-pub const ATTR_TIMESTAMP: &str = "_logit.prometheus.timestamp";
 /// The full scrape URL -- a **resource** attribute stamped by `prometheus_in`, private like every
 /// other `_logit.prometheus.*` attribute.
 pub const ATTR_TARGET: &str = "_logit.prometheus.target";
@@ -526,12 +524,13 @@ impl PrometheusDecoder {
         Self::default()
     }
 
-    /// Whether [`families_to_events`] stamps `_logit.prometheus.timestamp: true`, and the
-    /// `_logit.metrics.closed` flag beside it, on a series that carried its own timestamp. Default `true`, for a scrape: an exposition sample's timestamp is
-    /// optional, so its presence is a producer choice worth preserving across a round trip.
+    /// Whether [`families_to_events`] stamps the flag `_logit.metrics.closed: "timestamped"` on a
+    /// series that carried its own timestamp. Default `true`, for a scrape: an exposition sample's
+    /// timestamp is optional, so its presence is a producer choice worth preserving across a round
+    /// trip.
     ///
     /// A remote-write receiver sets this `false`. Every remote-write sample carries a timestamp, so
-    /// the marker would record a choice nobody made, and a remote-write → exposition relay would
+    /// the flag would record a choice nobody made, and a remote-write → exposition relay would
     /// then stamp a timestamp on every line it writes, which no scrape of the same data would.
     /// `Event::timestamp` is set from the sample either way.
     pub fn with_timestamp_marker(mut self, marker: bool) -> Self {
@@ -721,7 +720,7 @@ impl PrometheusEncoder {
     }
 
     /// Whether every series gets `Series::timestamp = Some(event.timestamp)` regardless of the
-    /// `_logit.prometheus.timestamp` marker. Default `false`, the mirror of
+    /// `_logit.metrics.closed: "timestamped"` flag. Default `false`, the mirror of
     /// [`PrometheusDecoder::with_timestamp_marker`]: exposition timestamps are optional, so only a
     /// sample that arrived with one gets one back.
     ///
@@ -901,7 +900,6 @@ pub fn families_to_events_with(
             let timestamp = match series.timestamp {
                 Some(ts) => {
                     if decoder.timestamp_marker {
-                        attributes.insert(ATTR_TIMESTAMP, Value::Bool(true));
                         attributes.insert(METRICS_CLOSED, Value::static_str(CLOSED_TIMESTAMPED));
                     }
                     ts
@@ -1118,10 +1116,7 @@ pub fn events_to_families_pending<'a>(
             let timestamp = if encoder.timestamps_always {
                 Some(event.timestamp)
             } else {
-                match event.attributes.get(ATTR_TIMESTAMP) {
-                    Some(Value::Bool(true)) => Some(event.timestamp),
-                    _ => None,
-                }
+                is_closed_timestamped(resource, event).then_some(event.timestamp)
             };
             let created = if kind.has_created() && record.start_timestamp != 0 {
                 Some(record.start_timestamp)
@@ -1738,6 +1733,7 @@ fn sanitize(name: &str, colon_ok: bool) -> Cow<'_, str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use logit_core::attrs::CLOSED_BUCKETED;
     use logit_core::telemetry::Registry;
     use logit_core::{ExpHistogram, HyperLogLog, Samples, Sum, TraceRef};
     use std::sync::Arc;
@@ -2039,25 +2035,23 @@ mod tests {
     }
 
     #[test]
-    fn a_sample_timestamp_becomes_the_events_timestamp_and_is_marked() {
+    fn a_sample_timestamp_becomes_the_events_timestamp_and_is_flagged() {
         let mut series = Series::new(vec![], Point::Gauge(1.0));
         series.timestamp = Some(1_395_066_363_000_000_000);
         let events = decode(&[family("m", FamilyType::Gauge, vec![series])]);
         assert_eq!(events[0].timestamp, 1_395_066_363_000_000_000);
-        assert_eq!(events[0].attributes.get(ATTR_TIMESTAMP), Some(&Value::Bool(true)));
         assert_eq!(
             events[0].attributes.get(METRICS_CLOSED).and_then(Value::as_str),
-            Some(CLOSED_TIMESTAMPED),
-            "the flag rides beside the marker"
+            Some(CLOSED_TIMESTAMPED)
         );
+        assert_eq!(events[0].attributes.len(), 1, "the flag alone, no protocol carrier beside it");
     }
 
     #[test]
-    fn a_sample_with_no_timestamp_takes_the_scrape_time_and_no_marker() {
+    fn a_sample_with_no_timestamp_takes_the_scrape_time_and_no_flag() {
         let events =
             decode(&[family("m", FamilyType::Gauge, vec![Series::new(vec![], Point::Gauge(1.0))])]);
         assert_eq!(events[0].timestamp, RECEIVED_AT);
-        assert_eq!(events[0].attributes.get(ATTR_TIMESTAMP), None);
         assert_eq!(events[0].attributes.get(METRICS_CLOSED), None);
     }
 
@@ -2585,14 +2579,33 @@ mod tests {
         ));
     }
 
+    /// The `timestamped` flag alone asks for a sample timestamp, on the event or else the resource,
+    /// whichever decoder wrote it; the flag's other values close a span for `aggregate` but don't
+    /// say the timestamp is the source's.
     #[test]
-    fn a_timestamp_is_emitted_only_when_the_marker_attribute_is_present() {
-        let marked =
-            event_with(&[(ATTR_TIMESTAMP, Value::Bool(true))], record("m", MetricKind::gauge(1.0)));
-        assert_eq!(encode(&Resource::default(), &marked)[0].series[0].timestamp, Some(RECEIVED_AT));
+    fn a_timestamp_is_emitted_only_for_an_event_flagged_timestamped() {
+        let gauge = || record("m", MetricKind::gauge(1.0));
+        let flagged = |value: Value| {
+            event_with(&[(METRICS_CLOSED, value)], record("m", MetricKind::gauge(1.0)))
+        };
+        let timestamp =
+            |resource: &Resource, event: &Event| encode(resource, event)[0].series[0].timestamp;
+        let bare = Resource::default();
 
-        let plain = event_with(&[], record("m", MetricKind::gauge(1.0)));
-        assert_eq!(encode(&Resource::default(), &plain)[0].series[0].timestamp, None);
+        assert_eq!(timestamp(&bare, &flagged(Value::from(CLOSED_TIMESTAMPED))), Some(RECEIVED_AT));
+        for other in [Value::from(CLOSED_BUCKETED), Value::from("other"), Value::Bool(true)] {
+            assert_eq!(timestamp(&bare, &flagged(other.clone())), None, "{other:?}");
+        }
+        assert_eq!(timestamp(&bare, &event_with(&[], gauge())), None);
+
+        let mut stamped = Resource::default();
+        stamped.attributes.insert(METRICS_CLOSED, CLOSED_TIMESTAMPED);
+        assert_eq!(timestamp(&stamped, &event_with(&[], gauge())), Some(RECEIVED_AT), "resource");
+
+        // A rewritten `Event::timestamp` is the one written.
+        let mut moved = flagged(Value::from(CLOSED_TIMESTAMPED));
+        moved.timestamp = 7_000_000_000;
+        assert_eq!(timestamp(&bare, &moved), Some(7_000_000_000));
     }
 
     #[test]
@@ -3099,8 +3112,7 @@ mod tests {
         assert!(!is_stale_nan(f64::INFINITY));
     }
 
-    /// `with_timestamp_marker(false)`: the timestamp still lands on the event, the marker and the
-    /// flag don't.
+    /// `with_timestamp_marker(false)`: the timestamp still lands on the event, the flag doesn't.
     #[test]
     fn the_timestamp_marker_can_be_turned_off_without_losing_the_timestamp() {
         let stamped = [family(
@@ -3111,25 +3123,27 @@ mod tests {
 
         let marked = families_to_events(&stamped, RECEIVED_AT, &mut PrometheusDecoder::new());
         assert_eq!(marked[0].timestamp, 42);
-        assert_eq!(marked[0].attributes.get(ATTR_TIMESTAMP), Some(&Value::Bool(true)));
+        assert_eq!(
+            marked[0].attributes.get(METRICS_CLOSED).and_then(Value::as_str),
+            Some(CLOSED_TIMESTAMPED)
+        );
 
         let mut decoder = PrometheusDecoder::new().with_timestamp_marker(false);
         let bare = families_to_events(&stamped, RECEIVED_AT, &mut decoder);
         assert_eq!(bare[0].timestamp, 42);
-        assert_eq!(bare[0].attributes.get(ATTR_TIMESTAMP), None);
-        assert_eq!(bare[0].attributes.get(METRICS_CLOSED), None, "nor does the flag");
+        assert_eq!(bare[0].attributes.get(METRICS_CLOSED), None);
 
         // A series with no timestamp of its own is unaffected either way.
         let unstamped =
             [family("m", FamilyType::Gauge, vec![Series::new(vec![], Point::Gauge(1.0))])];
         let events = families_to_events(&unstamped, RECEIVED_AT, &mut decoder);
         assert_eq!(events[0].timestamp, RECEIVED_AT);
-        assert_eq!(events[0].attributes.get(ATTR_TIMESTAMP), None);
+        assert_eq!(events[0].attributes.get(METRICS_CLOSED), None);
     }
 
-    /// `with_timestamps_always(true)`: every series gets one, marker or not.
+    /// `with_timestamps_always(true)`: every series gets one, flagged or not.
     #[test]
-    fn timestamps_always_fills_a_timestamp_the_marker_did_not_ask_for() {
+    fn timestamps_always_fills_a_timestamp_the_flag_did_not_ask_for() {
         let event = event_with(&[], record("m", MetricKind::gauge(1.0)));
         assert_eq!(encode(&Resource::default(), &event)[0].series[0].timestamp, None);
 

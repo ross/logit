@@ -1,7 +1,7 @@
 {
   "carriers": {"events": [
-    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"latency","kind":"summary","temporality":"cumulative","count":1,"sum":5.0,"quantiles":[{"quantile":0.0,"value":5.0},{"quantile":0.5,"value":5.0},{"quantile":0.75,"value":5.0},{"quantile":0.9,"value":5.0},{"quantile":0.95,"value":5.0},{"quantile":0.99,"value":5.0},{"quantile":1.0,"value":5.0}]}]},
-    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"temperature","kind":"gauge","value":20.0}]}
+    {"timestamp":"2027-01-15T07:59:30.000000000Z","metrics":[{"name":"temperature","kind":"gauge","value":20.0}],"attributes":{"_logit.metrics.closed":"timestamped"}},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"latency","kind":"summary","temporality":"cumulative","count":1,"sum":5.0,"quantiles":[{"quantile":0.0,"value":5.0},{"quantile":0.5,"value":5.0},{"quantile":0.75,"value":5.0},{"quantile":0.9,"value":5.0},{"quantile":0.95,"value":5.0},{"quantile":0.99,"value":5.0},{"quantile":1.0,"value":5.0}]}]}
   ], "counters": {
     "logit.output.metrics.degraded{component=out,kind=prometheus_out,metric_kind=samples,role=sink}": 1,
     "logit.output.metrics.dropped{component=out,kind=prometheus_out,reason=unresolved_delta,role=sink}": 1
@@ -87,10 +87,10 @@
     "logit.output.events.skipped{component=out,kind=prometheus_out,reason=no_metrics,role=sink}": 1
   }},
   "mixed": {"events": [
+    {"timestamp":"2027-01-15T07:59:30.000000000Z","metrics":[{"name":"queue_depth","kind":"gauge","value":7.0}],"attributes":{"_logit.metrics.closed":"timestamped"}},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"bytes","kind":"summary","temporality":"cumulative","count":2,"sum":120392.0,"quantiles":[{"quantile":0.0,"value":60196.0},{"quantile":0.5,"value":60196.0},{"quantile":0.75,"value":60196.0},{"quantile":0.9,"value":60196.0},{"quantile":0.95,"value":60196.0},{"quantile":0.99,"value":60196.0},{"quantile":1.0,"value":60196.0}]}]},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"db_up","kind":"gauge","value":1.0}]},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"latency","kind":"summary","temporality":"cumulative","count":2,"sum":27.0,"quantiles":[{"quantile":0.0,"value":12.0},{"quantile":0.5,"value":12.0},{"quantile":0.75,"value":15.0},{"quantile":0.9,"value":15.0},{"quantile":0.95,"value":15.0},{"quantile":0.99,"value":15.0},{"quantile":1.0,"value":15.0}]}],"attributes":{"route":"/api"}},
-    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"queue_depth","kind":"gauge","value":7.0}]},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"size","kind":"summary","temporality":"cumulative","count":1,"sum":512.0,"quantiles":[{"quantile":0.0,"value":512.0},{"quantile":0.5,"value":512.0},{"quantile":0.75,"value":512.0},{"quantile":0.9,"value":512.0},{"quantile":0.95,"value":512.0},{"quantile":0.99,"value":512.0},{"quantile":1.0,"value":512.0}]}]},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"temperature","kind":"gauge","value":21.5}],"attributes":{"room":"lab"}},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"users","kind":"gauge","value":2.0}]}
@@ -128,8 +128,8 @@
     "logit.output.metrics.skipped{component=out,kind=prometheus_out,reason=no_recorded_value,role=sink}": 1
   }},
   "service-check": {"events": [
-    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"cache_up","kind":"gauge","value":2.0}]},
-    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"db_up","kind":"gauge","value":0.0}],"attributes":{"env":"prod"}}
+    {"timestamp":"2027-01-15T07:59:30.000000000Z","metrics":[{"name":"db_up","kind":"gauge","value":0.0}],"attributes":{"_logit.metrics.closed":"timestamped","env":"prod"}},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"cache_up","kind":"gauge","value":2.0}]}
   ], "counters": {
     "logit.output.metrics.normalized{component=out,kind=prometheus_out,reason=name_sanitized,role=sink}": 2
   }},

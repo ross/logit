@@ -38,9 +38,6 @@ pub const ATTR_EVENT_HOST: &str = "_logit.statsd.event.host";
 pub const ATTR_EVENT_ALERT_TYPE: &str = "_logit.statsd.event.alert_type";
 pub const ATTR_EVENT_AGGREGATION_KEY: &str = "_logit.statsd.event.aggregation_key";
 pub const ATTR_EVENT_SOURCE_TYPE: &str = "_logit.statsd.event.source_type";
-/// `_logit.statsd.timestamp`: `statsd_in`'s raw `d:`/`|T` carrier. The event's own timestamp
-/// already says it, so the encoders never render it as a tag.
-pub const ATTR_STATSD_TIMESTAMP: &str = "_logit.statsd.timestamp";
 
 /// The envelope's `events` map key for an event with no `source_type_name`.
 const NO_SOURCE: &str = "api";
@@ -67,14 +64,13 @@ struct EventKeys {
     device_name: Symbol,
     related_event_id: Symbol,
     agent_hostname: Symbol,
-    statsd_timestamp: Symbol,
     host_name: Symbol,
     host_tag: Symbol,
 }
 
 impl EventKeys {
     /// Every key an encoder writes into a field of its own, so never as a tag.
-    fn consumed(&self) -> [Symbol; 11] {
+    fn consumed(&self) -> [Symbol; 10] {
         [
             self.title,
             self.priority,
@@ -86,7 +82,6 @@ impl EventKeys {
             self.device_name,
             self.related_event_id,
             self.agent_hostname,
-            self.statsd_timestamp,
         ]
     }
 }
@@ -102,7 +97,6 @@ static KEYS: LazyLock<EventKeys> = LazyLock::new(|| EventKeys {
     device_name: intern(ATTR_EVENT_DEVICE_NAME),
     related_event_id: intern(ATTR_EVENT_RELATED_EVENT_ID),
     agent_hostname: intern(RESOURCE_ATTR_AGENT_HOSTNAME),
-    statsd_timestamp: intern(ATTR_STATSD_TIMESTAMP),
     host_name: intern(ATTR_HOST_NAME),
     host_tag: intern(ATTR_HOST_TAG),
 });

@@ -163,13 +163,13 @@ fn expected_bytes(name: &str, input: &[u8]) -> Vec<u8> {
 }
 
 /// Zeroes each event's receipt-time `timestamp`, the one field two independent decodes of the
-/// same bytes legitimately disagree on. An event with a `_logit.statsd.timestamp` `Value::U64`
-/// carrier keeps its timestamp: that came from a wire `|T<secs>` segment, so both decodes agree on
+/// same bytes legitimately disagree on. An event flagged `_logit.metrics.closed: "timestamped"`
+/// keeps its timestamp: that came from a wire `|T<secs>` or `d:<secs>`, so both decodes agree on
 /// it.
 fn normalize_receipt_time(batch: &mut EventBatch) {
     for event in &mut batch.events {
-        let has_wire_timestamp =
-            matches!(event.attributes.get("_logit.statsd.timestamp"), Some(Value::U64(_)));
+        let has_wire_timestamp = event.attributes.get(logit_core::attrs::METRICS_CLOSED)
+            == Some(&Value::from(logit_core::attrs::CLOSED_TIMESTAMPED));
         if !has_wire_timestamp {
             event.timestamp = 0;
         }

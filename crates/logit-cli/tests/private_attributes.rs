@@ -4,7 +4,9 @@
 //! Each case decodes one carrier-bearing input with the real decoder, then encodes the result
 //! through every protocol encoder. No wire output may contain the bytes `_logit.` or, sanitized,
 //! `_logit_`, and each cross-protocol encoder's counts (its stats struct and the telemetry it
-//! emits) must equal what it counts for the same batch with every top-level private key removed. `datadog_out` reads
+//! emits) must equal what it counts for the same batch with every top-level protocol carrier
+//! removed. The neutral `_logit.metrics.*` flags stay on both sides, since any sink may read them
+//! (`statsd_out` writes `|T` for a `timestamped` event, whichever decoder flagged it). `datadog_out` reads
 //! statsd's event carriers, as the ADR permits, and its counts still match; a sink whose reading of
 //! another protocol's carriers changes a count needs an exemption here. The whole-event renders,
 //! `stdio_out`'s `format: json` and the native frame, must keep every private key. The rule is
@@ -218,12 +220,13 @@ fn private_pairs(batch: &EventBatch) -> Vec<String> {
 }
 
 fn strip_attrs(attrs: &mut AttrMap) {
-    for key in private_keys(attrs) {
+    for key in private_keys(attrs).into_iter().filter(|key| !key.starts_with("_logit.metrics.")) {
         attrs.remove(&key);
     }
 }
 
-/// `batch` with every top-level private key removed from its resource and its events.
+/// `batch` with every top-level protocol carrier removed from its resource and its events, and
+/// the neutral `_logit.metrics.*` flags kept.
 fn stripped(batch: &EventBatch) -> EventBatch {
     let mut resource = (*batch.resource).clone();
     strip_attrs(&mut resource.attributes);

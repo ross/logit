@@ -198,10 +198,48 @@ pub const CLOSED_TIMESTAMPED: &str = "timestamped";
 /// flags".
 pub const CLOSED_FLAGGED: &str = "flagged";
 
+/// Whether `event` is flagged [`METRICS_CLOSED`] with the value [`CLOSED_TIMESTAMPED`], read off
+/// the event, else the batch resource: its timestamp is its source's own, so a sink that can write
+/// a point's time (`statsd_out`'s `|T`, `prometheus_out`'s exposition timestamp) writes
+/// `Event::timestamp`. [`CLOSED_BUCKETED`], any other `Str`, and `Bool(true)` don't count: each
+/// closes a span for `aggregate`, but none says the timestamp is the source's. An event value
+/// shadows the resource's, as [`merged`] does.
+pub fn is_closed_timestamped(resource: &Resource, event: &Event) -> bool {
+    let value =
+        event.attributes.get(METRICS_CLOSED).or_else(|| resource.attributes.get(METRICS_CLOSED));
+    value.and_then(Value::as_str) == Some(CLOSED_TIMESTAMPED)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::interner;
+
+    #[test]
+    fn is_closed_timestamped_reads_the_event_else_the_resource_and_only_timestamped() {
+        let flagged = |value: Value| {
+            let mut attributes = AttrMap::new();
+            attributes.insert(METRICS_CLOSED, value);
+            Event::empty(0, attributes)
+        };
+        let bare = Resource::default();
+        assert!(is_closed_timestamped(&bare, &flagged(Value::from(CLOSED_TIMESTAMPED))));
+        for other in [Value::from(CLOSED_BUCKETED), Value::from("other"), Value::Bool(true)] {
+            assert!(!is_closed_timestamped(&bare, &flagged(other.clone())), "{other:?}");
+        }
+        assert!(!is_closed_timestamped(&bare, &Event::empty(0, AttrMap::new())));
+
+        let mut stamped = Resource::default();
+        stamped.attributes.insert(METRICS_CLOSED, CLOSED_TIMESTAMPED);
+        assert!(
+            is_closed_timestamped(&stamped, &Event::empty(0, AttrMap::new())),
+            "the resource's flag"
+        );
+        assert!(
+            !is_closed_timestamped(&stamped, &flagged(Value::from(CLOSED_BUCKETED))),
+            "an event value shadows the resource's"
+        );
+    }
 
     #[test]
     fn is_field_matches_only_keys_under_the_field_prefix() {

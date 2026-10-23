@@ -12,6 +12,7 @@
     {"sink":"prometheus_out","row":"attributes/scope","cell":0,"observed":["lost"]},
     {"sink":"prometheus_out","row":"attributes/string_value","cell":0,"observed":["exact"]},
     {"sink":"prometheus_out","row":"attributes/timestamp_value","cell":0,"observed":["lost"]},
+    {"sink":"prometheus_out","row":"attributes/timestamped","cell":0,"observed":["lost"]},
     {"sink":"prometheus_out","row":"distribution","cell":0,"observed":["degraded"]},
     {"sink":"prometheus_out","row":"exponential_histogram/cumulative","cell":0,"observed":["dropped"]},
     {"sink":"prometheus_out","row":"exponential_histogram/delta","cell":0,"observed":["dropped"]},

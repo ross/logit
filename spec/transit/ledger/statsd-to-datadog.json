@@ -13,6 +13,7 @@
     {"sink":"datadog_out","row":"attributes/span_kind","cell":0,"observed":["normalized"]},
     {"sink":"datadog_out","row":"attributes/string_value","cell":0,"observed":["exact","normalized"]},
     {"sink":"datadog_out","row":"attributes/timestamp_value","cell":0,"observed":["normalized"]},
+    {"sink":"datadog_out","row":"attributes/timestamped","cell":0,"observed":["lost"]},
     {"sink":"datadog_out","row":"attributes/trace_id_high","cell":0,"observed":["normalized"]},
     {"sink":"datadog_out","row":"distribution","cell":0,"observed":["exact"]},
     {"sink":"datadog_out","row":"exponential_histogram/cumulative","cell":0,"observed":["dropped"]},
