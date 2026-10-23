@@ -473,7 +473,7 @@ impl Spelling {
     /// [`Spelling::key`] for attribute `key` of `rec`, where the spelling depends on the record:
     /// `datadog_out` writes a non-empty `Str` `host` as the host of a metric, Datadog event, or
     /// service check that carries no other, and `host.name` as the host of an event, check, or
-    /// log with none of its own ([`datadog::host_name_is_carried_host`]), and `datadog_in` reads
+    /// log ahead of its own ([`datadog::host_name_is_carried_host`]), and `datadog_in` reads
     /// that host back under the route's host key ([`datadog::Route::host_key`]; `logit_proto::datadog`'s encode tables and
     /// permitted normalizations). `statsd_out` under `format: dogstatsd` writes `host.name` or
     /// the hostless mark as the `host:` tag where [`statsd`] says so, which `statsd_in` reads back
@@ -500,8 +500,18 @@ impl Spelling {
 
     /// [`Spelling::value`] for attribute `key` of `rec`: the hostless mark `statsd_out` writes
     /// as the `host:` tag reads back empty. `None` where the sink writes no tag for the value
-    /// (`graphite_out`'s omitted values).
+    /// (`graphite_out`'s omitted values, and a host attribute `host.name` outranks:
+    /// `statsd_out`'s `host` and `datadog_out`'s log `hostname`).
     fn value_for(self, key: &str, value: &Value, tags: &str, rec: &Rec) -> Option<String> {
+        if self == (Spelling::Statsd { dogstatsd: true })
+            && key == "host"
+            && statsd::host_name_is_host(rec)
+        {
+            return None;
+        }
+        if self == Spelling::Datadog && key == "hostname" && datadog::hostname_is_outranked(rec) {
+            return None;
+        }
         if self == (Spelling::Statsd { dogstatsd: true })
             && key == statsd::HOSTLESS
             && statsd::hostless_is_host(rec)
@@ -612,9 +622,10 @@ fn mark_tid_due(recs: &mut [Rec]) {
 }
 
 /// Where `statsd_out` under `format: dogstatsd` writes a record's host (its module doc's "The
-/// host"): a usable `host.name` (a non-empty `Str`) as the `host:` tag, and else the hostless
-/// mark as an empty one, each only on a record with no `host` attribute whose line has no `h:`
-/// field of its own. `statsd_in` reads the tag back as `host`.
+/// host"): a usable `host.name` (a non-empty `Str`) as the `host:` tag, ahead of a `host`
+/// attribute and the line's `h:` field, and else the hostless mark as an empty one, only on a
+/// record with no `host` attribute whose line has no `h:` field of its own. `statsd_in` reads the
+/// tag back as `host`.
 mod statsd {
     use super::Rec;
     use serde_json::Value;
@@ -649,7 +660,7 @@ mod statsd {
 
     /// Whether `host.name` leaves as the `host:` tag.
     pub(super) fn host_name_is_host(rec: &Rec) -> bool {
-        usable_name(rec) && tag_is_host(rec)
+        usable_name(rec)
     }
 
     /// Whether the hostless mark leaves as an empty `host:` tag.
@@ -711,7 +722,7 @@ mod datadog {
         get(rec, "host.name").is_some_and(|v| v.as_str() != Some(""))
     }
 
-    /// The route's own host carrier, ahead of `host.name`, on an event or a check.
+    /// The route's own host carrier, after `host.name`, on an event or a check.
     fn carrier(route: Route) -> Option<&'static str> {
         match route {
             Route::Event | Route::Check => Some(route.host_key()),
@@ -725,15 +736,23 @@ mod datadog {
         carrier(route).is_some_and(|key| get(rec, key).is_some_and(|v| v.as_str() != Some("")))
     }
 
-    /// Whether `host.name` is the host of an event or a check with no host carrier of its own
-    /// ([`named`]), or of a log with no `hostname` (any `host.name`, as the log encoder takes
-    /// it), which `datadog_in` reads back as that route's host key.
+    /// Whether `host.name` is the host of an event or a check ([`named`]), or of a log (a named
+    /// one, else any `host.name` on a log with no `hostname`, as the log encoder takes it), which
+    /// `datadog_in` reads back as that route's host key.
     pub(super) fn host_name_is_carried_host(rec: &Rec) -> bool {
         match Route::of(rec) {
-            route @ (Route::Event | Route::Check) => !own_host(rec, route) && named(rec),
-            Route::Log => get(rec, "hostname").is_none() && get(rec, "host.name").is_some(),
+            Route::Event | Route::Check => named(rec),
+            Route::Log => {
+                named(rec) || (get(rec, "hostname").is_none() && get(rec, "host.name").is_some())
+            }
             Route::Metric | Route::Span => false,
         }
+    }
+
+    /// Whether a log's `hostname` attribute is left off because a named `host.name` is the
+    /// log's `hostname`.
+    pub(super) fn hostname_is_outranked(rec: &Rec) -> bool {
+        Route::of(rec) == Route::Log && named(rec) && get(rec, "hostname").is_some()
     }
 
     /// Whether a `Str` `host` attribute is the host of `rec`, and so not written as a tag.
@@ -1539,9 +1558,21 @@ fn field_rows(rec: &Rec, protocol: &str) -> Vec<(String, Option<String>, Field)>
             None
         }
     };
+    // A host attribute a `host.name` outranks: `statsd_out` and `datadog_out` leave it off.
+    let outranked = |key: &str| {
+        if key == "host" && statsd::host_name_is_host(rec) {
+            Some("host_beside_host_name")
+        } else if key == "hostname" && datadog::hostname_is_outranked(rec) {
+            Some("hostname_beside_host_name")
+        } else {
+            None
+        }
+    };
     for (key, value) in &rec.attributes {
         let tags = rec.attribute_types.get(key).map(String::as_str).unwrap_or("");
         let feature = if let Some(feature) = carrier(key, value) {
+            feature
+        } else if let Some(feature) = outranked(key) {
             feature
         } else if tags.contains("=bytes") {
             "bytes_value"
@@ -1561,7 +1592,8 @@ fn field_rows(rec: &Rec, protocol: &str) -> Vec<(String, Option<String>, Field)>
         rows.push(("attributes".to_string(), Some(feature.to_string()), field));
     }
     for (key, value) in &rec.resource {
-        let feature = carrier(key, value).unwrap_or("resource_attribute");
+        let feature =
+            carrier(key, value).or_else(|| outranked(key)).unwrap_or("resource_attribute");
         let field = Field::Attribute { key: key.clone(), resource: true };
         rows.push(("attributes".to_string(), Some(feature.to_string()), field));
     }
@@ -1626,6 +1658,18 @@ fn observe_field(field: &Field, input: &Rec, out: &Rec, spelling: Spelling) -> C
             } else {
                 (&input.attributes[key], input.attribute_types.get(key))
             };
+            // A host attribute `host.name` outranks is left off: what reads back under its key
+            // is `host.name`'s value.
+            let outranked = match spelling {
+                Spelling::Datadog => key == "hostname" && datadog::hostname_is_outranked(input),
+                Spelling::Statsd { dogstatsd: true } => {
+                    key == "host" && statsd::host_name_is_host(input)
+                }
+                _ => false,
+            };
+            if outranked {
+                return Class::Lost;
+            }
             // A key the sink respells reads back under its wire spelling, which is a change.
             let wire = spelling.key_for(key, input);
             let respelled = wire != *key;
@@ -2532,8 +2576,8 @@ mod tests {
         }
     }
 
-    /// A `host.name` on a log with no `hostname` is the Datadog `hostname`, read back as
-    /// `hostname`; beside a `hostname` it stays an attribute.
+    /// A `host.name` on a log is the Datadog `hostname`, read back as `hostname`, ahead of a
+    /// `hostname` attribute, which is lost.
     #[test]
     fn datadog_pairs_a_logs_host_name_read_back_as_hostname() {
         let log = |attributes: &str| {
@@ -2544,7 +2588,11 @@ mod tests {
         let read = recs(&[&log(r#"{"hostname":"web-1"}"#)]);
         assert_eq!(observe_field(&host, &ins[0], &read[0], Spelling::Datadog), Class::Normalized);
         let both = recs(&[&log(r#"{"host.name":"web-1","hostname":"h"}"#)]);
-        assert_eq!(pair(&both, &both, Spelling::Datadog).seen, [Some(Class::Exact)]);
+        assert_eq!(pair(&both, &read, Spelling::Datadog).seen, [Some(Class::Exact)]);
+        assert_eq!(pair(&both, &both, Spelling::Datadog).seen, [None]);
+        assert_eq!(observe_field(&host, &both[0], &read[0], Spelling::Datadog), Class::Normalized);
+        let hostname = Field::Attribute { key: "hostname".to_string(), resource: false };
+        assert_eq!(observe_field(&hostname, &both[0], &read[0], Spelling::Datadog), Class::Lost);
     }
 
     /// A `host` attribute on a metric with no `host.name` is the Datadog host, read back as
@@ -2607,24 +2655,27 @@ mod tests {
         assert_eq!(observe_field(&field, &ins[0], &same[0], DOGSTATSD), Class::Normalized);
     }
 
-    /// With a `host` attribute, `host.name` stays an ordinary tag, and an empty one is never the
-    /// host.
+    /// `host.name` is the `host:` tag ahead of a `host` attribute, which is lost, and an empty
+    /// one is never the host.
     #[test]
-    fn dogstatsd_keeps_host_name_a_tag_beside_a_host_or_when_empty() {
+    fn dogstatsd_pairs_host_name_as_host_beside_a_host_or_keeps_an_empty_one() {
         let both = recs(&[&statsd_gauge(r#"{"host":"web-1","host.name":"h"}"#)]);
         let kept = recs(&[&statsd_gauge(r#"{"host":"web-1","host.name":"h"}"#)]);
         let moved = recs(&[&statsd_gauge(r#"{"host":"h"}"#)]);
-        assert_eq!(pair(&both, &kept, DOGSTATSD).seen, [Some(Class::Exact)]);
-        assert_eq!(pair(&both, &moved, DOGSTATSD).seen, [None]);
+        assert_eq!(pair(&both, &moved, DOGSTATSD).seen, [Some(Class::Exact)]);
+        assert_eq!(pair(&both, &kept, DOGSTATSD).seen, [None]);
+        let host = Field::Attribute { key: "host".to_string(), resource: false };
+        assert_eq!(observe_field(&host, &both[0], &moved[0], DOGSTATSD), Class::Lost);
         let empty = recs(&[&statsd_gauge(r#"{"host.name":""}"#)]);
         let read_empty = recs(&[&statsd_gauge(r#"{"host":""}"#)]);
         assert_eq!(pair(&empty, &empty, DOGSTATSD).seen, [Some(Class::Exact)]);
         assert_eq!(pair(&empty, &read_empty, DOGSTATSD).seen, [None]);
     }
 
-    /// A Datadog event's own `h:` field is its host, so its `host.name` stays a tag.
+    /// A Datadog event's `host.name` is the `host:` tag ahead of its own `h:` field, which is
+    /// left off.
     #[test]
-    fn dogstatsd_keeps_host_name_a_tag_beside_an_event_host_carrier() {
+    fn dogstatsd_pairs_host_name_as_host_beside_an_event_host_carrier() {
         let event = |attributes: &str| {
             format!(r#"{{{{T}},"log":{{"format":"raw","message":"m"}},"attributes":{attributes}}}"#)
         };
@@ -2633,10 +2684,8 @@ mod tests {
         let bare = r#"{"_logit.statsd.event.title":"t","host.name":"h"}"#;
         let read_bare = r#"{"_logit.statsd.event.title":"t","host":"h"}"#;
         let ins = recs(&[&event(carried)]);
-        assert_eq!(pair(&ins, &recs(&[&event(carried)]), DOGSTATSD).seen, [Some(Class::Exact)]);
-        let moved =
-            r#"{"_logit.statsd.event.title":"t","_logit.statsd.event.host":"e","host":"h"}"#;
-        assert_eq!(pair(&ins, &recs(&[&event(moved)]), DOGSTATSD).seen, [None]);
+        assert_eq!(pair(&ins, &recs(&[&event(read_bare)]), DOGSTATSD).seen, [Some(Class::Exact)]);
+        assert_eq!(pair(&ins, &recs(&[&event(carried)]), DOGSTATSD).seen, [None]);
         let ins = recs(&[&event(bare)]);
         assert_eq!(pair(&ins, &recs(&[&event(read_bare)]), DOGSTATSD).seen, [Some(Class::Exact)]);
     }
@@ -2677,9 +2726,9 @@ mod tests {
         assert_eq!(pair(&unmarked, &empty, DOGSTATSD).seen, [None]);
     }
 
-    /// A Datadog event with no host carrier, or an empty one, leaves its `host.name` as the host,
-    /// which `datadog_in` reads back as the event's host carrier; with a non-empty carrier,
-    /// `host.name` stays a tag, so a read-back without it lost it.
+    /// A Datadog event leaves its `host.name` as the host ahead of any host carrier, which
+    /// `datadog_in` reads back as the event's host carrier; a read-back holding the carrier's
+    /// value lost it.
     #[test]
     fn datadog_pairs_an_events_host_name_read_back_as_its_host_carrier() {
         let event = |attributes: &str| {
@@ -2706,7 +2755,10 @@ mod tests {
             r#"{"_logit.statsd.event.title":"t","_logit.statsd.event.host":"e","host.name":"h"}"#,
         )]);
         let field = Field::Attribute { key: "host.name".to_string(), resource: false };
-        assert_eq!(observe_field(&field, &own[0], &read[0], Spelling::Datadog), Class::Lost);
+        assert_eq!(observe_field(&field, &own[0], &read[0], Spelling::Datadog), Class::Normalized);
+        let read_own =
+            recs(&[&event(r#"{"_logit.statsd.event.title":"t","_logit.statsd.event.host":"e"}"#)]);
+        assert_eq!(observe_field(&field, &own[0], &read_own[0], Spelling::Datadog), Class::Lost);
     }
 
     /// A host read back under a Datadog event's or check's host carrier must hold the input's

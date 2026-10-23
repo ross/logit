@@ -83,6 +83,8 @@
 //! | `record/exemplars_on_summary` | lost | structural | A `SummaryDataPoint` has no exemplars field, so a summary's exemplars are left off. |
 //! | `record/min_max` | exact | -- | The data point's `min` and `max`. |
 //! | `attributes/string_value` | exact | -- | A string attribute. |
+//! | `attributes/host_beside_host_name` | exact | -- | A string attribute. |
+//! | `attributes/hostname_beside_host_name` | exact | -- | A log attribute. |
 //! | `attributes/bool_value` | exact | -- | A boolean attribute. |
 //! | `attributes/number_value` | normalized | `u64_as_int`; `logit.output.attributes.normalized{reason=u64_as_double}` | An integer or double attribute. A `u64` reads back as an `i64`, or, above `i64::MAX`, as a double, approximate beyond 2^53, counted once per such value. |
 //! | `attributes/array_value` | exact | -- | An array attribute. |

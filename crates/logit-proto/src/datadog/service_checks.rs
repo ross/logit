@@ -159,12 +159,13 @@ impl DatadogEncoder {
                 continue;
             };
 
-            // `statsd.service_check.host`, else `host.name`, else a DogStatsD `#host:` tag, else
+            // `host.name`, else `statsd.service_check.host`, else a DogStatsD `#host:` tag, else
             // the default. A `host.name` or `host` read this way leaves as the host and not a
-            // tag; the Agent consumes a `host:` tag even when `h:` wins.
+            // tag; the Agent consumes a `host:` tag even when `h:` wins. A carrier `host.name`
+            // outranks is private, so it's never a tag either.
             let non_empty = |key: Symbol| find(key).filter(|v| v.as_str() != Some(""));
-            let own_host = non_empty(keys.host);
-            let host_name = if own_host.is_none() { non_empty(keys.host_name) } else { None };
+            let host_name = non_empty(keys.host_name);
+            let own_host = if host_name.is_none() { non_empty(keys.host) } else { None };
             let host_tag = host_tag(&batch.resource, event);
             let mut skip = vec![keys.name, keys.status, keys.message, keys.host];
             // An empty `host.name` is no host, so it isn't a tag either.
@@ -187,7 +188,7 @@ impl DatadogEncoder {
             any = true;
             let mut obj = JsonObject::begin(&mut out);
             write_str(obj.key("check"), &value_text(name));
-            let host = match (own_host.or(host_name), host_tag) {
+            let host = match (host_name.or(own_host), host_tag) {
                 (Some(host), _) => value_text(host),
                 // An empty `#host:` tag: marked hostless, never filled.
                 (None, Some(tag)) => Cow::Borrowed(tag),
@@ -289,8 +290,8 @@ mod tests {
         );
     }
 
-    /// `statsd.service_check.host`, then `host.name` (then no tag of that name), then the
-    /// default host.
+    /// `host.name` (then no tag of that name), then `statsd.service_check.host`, then the
+    /// default host. A carrier `host.name` outranks is left off.
     #[test]
     fn encode_fills_a_missing_host_with_host_name_then_the_default_host() {
         let encoder = DatadogEncoder::new().with_default_host(Some(Arc::from("relay")));
@@ -317,7 +318,13 @@ mod tests {
         own.resource = stamped.resource.clone();
         assert_eq!(
             encode_with(&own),
-            r#"[{"check":"app.ok","host_name":"h","timestamp":1700000000,"status":1,"message":"","tags":["host.name:web-1"]}]"#
+            r#"[{"check":"app.ok","host_name":"web-1","timestamp":1700000000,"status":1,"message":"","tags":[]}]"#
+        );
+        let own =
+            decode(r#"[{"check":"app.ok","host_name":"h","timestamp":1700000000,"status":1}]"#);
+        assert_eq!(
+            encode_with(&own),
+            r#"[{"check":"app.ok","host_name":"h","timestamp":1700000000,"status":1,"message":"","tags":[]}]"#
         );
     }
 
@@ -335,10 +342,10 @@ mod tests {
         );
     }
 
-    /// A DogStatsD `#host:` tag (`statsd_in`'s `host`) is the host after `h:` and `host.name`,
+    /// A DogStatsD `#host:` tag (`statsd_in`'s `host`) is the host after `host.name` and `h:`,
     /// and is consumed, not tagged, whenever there's no `host.name`; an empty one stays hostless.
     #[test]
-    fn a_host_tag_is_the_host_after_h_and_host_name() {
+    fn a_host_tag_is_the_host_after_host_name_and_h() {
         let encoder = DatadogEncoder::new().with_default_host(Some(Arc::from("relay")));
         let encode_with = |body: &str| {
             String::from_utf8(encoder.encode_service_checks(&decode(body)).unwrap().to_vec())

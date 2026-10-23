@@ -1992,8 +1992,7 @@ rows:
             A DogStatsD `key:value` tag. Each `:`, `|`, `@`, `#`, `,`, control, and whitespace
             character in the key, and each but `:` in the value, is written as `_`, counted once per
             wire tag as `name_sanitized` for a key and `value_sanitized` for a value. A non-empty
-            `host.name` on a record with no `host` and no non-empty `h:` field is the `host:` tag,
-            which statsd_in reads back as `host`.
+            `host.name` is the `host:` tag, which statsd_in reads back as `host`.
       prometheus_out:
         class: normalized
         reason: label_sanitized
@@ -2015,10 +2014,10 @@ rows:
         reason: host_tag
         text: >-
           A `key:value` tag. A `host` attribute on a metric with no `host.name` is the host and not
-          a tag, which datadog_in reads back as `host.name`. On a Datadog event or service check
-          with no non-empty host carrier, `host.name`, else `host`, is the host and not a tag,
-          which datadog_in reads back as that carrier. A `host.name` on a log with no `hostname` is
-          the log's `hostname`, which datadog_in reads back as `hostname`.
+          a tag, which datadog_in reads back as `host.name`. On a Datadog event or service check,
+          `host.name`, else a non-empty host carrier, else `host`, is the host and not a tag, which
+          datadog_in reads back as that carrier. A `host.name` on a log is the log's `hostname`,
+          which datadog_in reads back as `hostname`.
       graphite_out:
         - when: {tags: drop}
           class: lost
@@ -2033,6 +2032,67 @@ rows:
             A `;name=value` tag. Each `;`, `!`, `^`, `=`, whitespace, and control character in the
             name, and each `;`, whitespace, and control character and a leading `~` in the value, is
             written as `_`, counted once per record.
+  - kind: attributes
+    feature: host_beside_host_name
+    cells:
+      statsd_out:
+        - when: {format: statsd}
+          class: lost
+          counter: logit.output.tags.omitted{reason=dialect}
+          text: Plain statsd has no tags; each is counted once per wire tag.
+        - class: lost
+          counter: logit.output.tags.omitted{reason=unrepresentable}
+          text: >-
+            A non-empty `host.name` is the line's `host:` tag, so a `host` beside it, a second
+            `host:` tag the Agent would consume, is left off, counted once per wire tag.
+      prometheus_out:
+        class: normalized
+        reason: label_sanitized
+        counter: logit.output.labels.normalized{reason=name_sanitized}
+        text: >-
+          A label; its name is forced into `[a-zA-Z_][a-zA-Z0-9_]*`, so a key holding `.` or another
+          character reads back under the sanitized name, counted once per label it renames.
+      otlp_out:
+        class: exact
+        text: A string attribute.
+      influxdb_out:
+        class: lost
+        counter: logit.output.tags.omitted{reason=unencodable}
+        text: >-
+          A tag. A value holding a line break, ending in `\`, or with `\` before a space has no
+          spelling and is left off, counted.
+      datadog_out:
+        class: exact
+        text: >-
+          `host.name` is the host, so `host` is an ordinary `host:` tag, which datadog_in reads
+          back as `host`.
+      graphite_out:
+        - when: {tags: drop}
+          class: lost
+          counter: logit.output.tags.omitted{reason=dialect}
+          text: >-
+            Under `tags: drop`, no tag is written, counted once per attribute.
+        - class: normalized
+          reason: tag_sanitized
+          counter: logit.output.metrics.normalized{reason=tag_sanitized}
+          text: >-
+            A `;name=value` tag. Each `;`, `!`, `^`, `=`, whitespace, and control character in the
+            name, and each `;`, whitespace, and control character and a leading `~` in the value, is
+            written as `_`, counted once per record.
+  # statsd_out, prometheus_out, influxdb_out, and graphite_out don't write a log on an event with
+  # no metrics, so its fields are never compared there and none of them has a cell.
+  - kind: attributes
+    feature: hostname_beside_host_name
+    cells:
+      otlp_out:
+        class: exact
+        text: A log attribute.
+      datadog_out:
+        class: lost
+        counter: logit.output.tags.omitted{reason=reserved_key}
+        text: >-
+          `host.name` is the log's `hostname`, so a `hostname` attribute beside it has no key of
+          its own on the wire and is left off, counted.
   - kind: attributes
     feature: bool_value
     cells:

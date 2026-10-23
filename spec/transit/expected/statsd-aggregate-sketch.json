@@ -89,9 +89,10 @@
   "host-name-tag": {"events": [
     {"timestamp":"2027-01-15T08:00:01.000000000Z","log":{"format":"raw","message":"v2.1"},"attributes":{"_logit.statsd.event.host":"","_logit.statsd.event.title":"deploy","host":"web-1"}},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"requests","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"env":"prod","host":"web-1"}},
-    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"requests.tagged","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"host":"web-2","host.name":"web-1"}}
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"requests.tagged","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"host":"web-1"}}
   ], "counters": {
-    "logit.component.events.discarded{component=window,kind=aggregate,role=transform}": 2
+    "logit.component.events.discarded{component=window,kind=aggregate,role=transform}": 2,
+    "logit.output.tags.omitted{component=out,kind=statsd_out,reason=unrepresentable,role=sink}": 1
   }},
   "interop-dogstatsd-buffered": {"events": [
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app.db.query.duration_ms.count","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"_logit.statsd.container_id":"in-82046","db":"primary","env":"prod","host":"web-07","query":"select_user","region":"us-east-1","service":"checkout-api"}},

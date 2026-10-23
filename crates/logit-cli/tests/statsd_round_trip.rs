@@ -97,12 +97,12 @@
 //!    `service-check-origin-fields-after-message`, a service check in the order the `datadog`
 //!    Python client writes it (`c:`/`card:` after `m:`,
 //!    `testdata/interop/datadog/dogstatsd-unix-008.raw`).
-//! 10. **Under `format: dogstatsd`, a `host.name:` tag is the `host:` tag on a line with no
-//!     `host:` tag and no non-empty `h:` field**: `#host.name:web-1` relays as `#host:web-1`. A
-//!     DogStatsD Agent takes a line's host from its `host:` tag, so the relay sends a `host.name`
-//!     from any source as the host the Agent reads (`logit_outputs::statsd`'s "The host"). A
-//!     `host.name:` tag beside a `host:` tag stays a tag. Fixtures: `host-name-tag-as-host`,
-//!     `host-name-tag-beside-host` ([`SAME_AS_INPUT`]).
+//! 10. **Under `format: dogstatsd`, a `host.name:` tag is the `host:` tag**: `#host.name:web-1`
+//!     relays as `#host:web-1`. A DogStatsD Agent takes a line's host from its `host:` tag, so the
+//!     relay sends a `host.name` from any source as the host the Agent reads
+//!     (`logit_outputs::statsd`'s "The host"). A `host:` tag beside it is omitted, counted
+//!     `logit.output.tags.omitted{reason="unrepresentable"}`, and an event's or service check's
+//!     `h:` field is left off. Fixtures: `host-name-tag-as-host`, `host-name-tag-beside-host`.
 //!
 //! Everything else relays byte for byte, modulo (3), (4), and (9): the raw `Samples`/`SetMembers`
 //! kinds, `|c:`/`|T` under DogStatsD, relative-gauge deltas, and the negative-absolute-gauge
@@ -379,14 +379,19 @@ async fn a_host_name_tag_with_no_host_tag_relays_as_the_host_tag() {
     assert_eq!(attributes.get("host.name"), None);
 }
 
-/// Normalization (10)'s contrasting case: beside a `host:` tag, `host.name:` stays a tag.
+/// Normalization (10) beside a `host:` tag: `host.name:` is the one `host:` tag, and the `host:`
+/// tag is omitted.
 #[tokio::test]
-async fn a_host_name_tag_beside_a_host_tag_round_trips_byte_for_byte() {
+async fn a_host_name_tag_beside_a_host_tag_relays_as_the_only_host_tag() {
     let mut harness = Harness::new().await;
-    assert_byte_for_byte(&mut harness, "host-name-tag-beside-host", || {
-        StatsdEncoder::new(Format::DogStatsd)
-    })
-    .await;
+    let fixture = "host-name-tag-beside-host";
+    let batch = direct_batch(&read_fixture(fixture, "in"));
+    let (captured, decoded) =
+        harness.round_trip(&batch, || StatsdEncoder::new(Format::DogStatsd)).await;
+    assert_eq!(captured, read_fixture(fixture, "expected"), "{fixture}: normalization (10)");
+    let attributes = &decoded.events[0].attributes;
+    assert_eq!(attributes.get("host"), Some(&Value::str("web-1")));
+    assert_eq!(attributes.get("host.name"), None);
 }
 
 /// Normalization (5)'s contrasting case: a space in a set member isn't substituted, so this is a
