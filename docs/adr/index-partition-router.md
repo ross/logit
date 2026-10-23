@@ -33,7 +33,8 @@ the run's conditions; every cell sinks into `null_out`. The router rows:
 | `route` | 0.734 | 0.514 | −30% |
 | Share-only paths (`fanout`, `route-copy-all2`, `route-signals-nostrip`) | | | +1 to 2% |
 
-The five router scenarios land at or near the share floor (`route-copy-all2` at 0.456).
+The five router scenarios land at or near the share floor (`route-copy-all2` at 0.456 and
+`route-signals-nostrip` at 0.374).
 
 ## Decision
 
@@ -44,7 +45,10 @@ events copies them.**
 ### The view
 
 `BatchView { batch: Arc<EventBatch>, indices: Option<Arc<[u32]>>, signals: Option<u8> }` in
-`logit-pipeline` is the one payload a `Delivered` carries.
+`logit-core`, beside `EventBatch`, is the one payload a `Delivered` carries; `logit-pipeline`
+re-exports it. It lives in `logit-core` because the three encoder traits,
+`native::encode_hop_batch`, and the Datadog trace encoders are in `logit-proto`, which depends only
+on `logit-core`.
 
 - `indices` lists the events in view as ascending indices into `batch.events`; `None` is every
   event.
@@ -72,7 +76,8 @@ Ownership decides, not reading:
   `&BatchView`. Counting reads `view.len()`.
 - **Narrows, no copy.** A router. `route` emits one index list per destination. `route_signals`
   emits index lists plus a signal mask per target and never strips in place; it still counts
-  `logit.transform.payloads.stripped{signal}` for each payload its masks hide. A router fed a
+  `logit.transform.payloads.stripped{signal}` for each payload of an unlisted signal (one no
+  target's mask shows), as `strip: true` counts it today. A router fed a
   partial view composes indices (its lists index the parent's list), so a router behind a router
   costs what one does.
 - **Mutates, so owns.** Every `Transform::process` and `ScriptWorker::process` takes its batch
@@ -140,9 +145,8 @@ that word. There's no alias, because `logit` is pre-release.
   list. Payloads `route_signals` masks out stay alive until the last target drops the batch,
   bounded by the backlogged-sink rule. A transform behind a router still copies its slice, no worse
   than today.
-- **A wide signature change.** `Delivered`, `Output::send` and `Output::submit`, the three encoder
-  traits and every impl, `prometheus`'s pair, `datadog`'s `encode_routes`, `datadog_trace_out`'s
-  two encoders, and `native::encode_hop_batch` take a view. It lands over the plan's W7 to W10:
+- **A wide signature change.** `Delivered`, `Output::send` and `Output::submit`, the encoder
+  traits and functions listed under "Who copies" take a view. It lands over the plan's W7 and W8:
   the pipeline layer first, with each sink materializing a partial view until its encoder PR
   removes the call.
 - **Pins move with the code.** Allocation pins in `crates/logit-bench/tests/allocations.rs` and the

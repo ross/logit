@@ -235,6 +235,15 @@ plus a signal mask, so a part clones no attributes and moves no payloads, and a 
 shared goes out shared with no `unwrap_batch` clone first. The masked event that a view's iterator
 yields is where the unlisted-signal contract lives: its `log()`, `metrics()`, and `span()` show
 only the target's signals, and the payload fields aren't reachable through it.
-`logit.transform.payloads.stripped{signal}` still counts each payload a mask hides, and
+`logit.transform.payloads.stripped{signal}` still counts each payload of an unlisted signal (one
+no target's mask shows), as `strip: true` counts it today, and
 `logit.component.events.copied` is renamed `logit.component.events.multicast`, with the same
 arithmetic.
+
+The amendment covers both `strip:` values. Under either, each target receives a view, so these
+statements above no longer hold: the `strip: false` paragraph's "cloned into each but the highest
+slot", "A batch whose every event goes to one target stays on the move path either way", the
+Runtime section's reason that `route_signals` is not a `Router` because it mutates, and the
+Telemetry bullet's "A part is a new event sharing the original's attributes". A part is a view,
+and `route_signals` clones and moves nothing. The node arm stays its own `NodeSpec` because it
+fills targets with no ordinary edge.

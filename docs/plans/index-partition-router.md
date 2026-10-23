@@ -64,7 +64,9 @@ Non-goals:
 ### The view
 
 `BatchView { batch: Arc<EventBatch>, indices: Option<Arc<[u32]>>, signals: Option<u8> }` in
-`logit-pipeline` is the one thing a `Delivered` carries. `indices` is the events in view, as
+`logit-core`, beside `EventBatch`, is the one thing a `Delivered` carries, and `logit-pipeline`
+re-exports it. It lives in `logit-core` because the encoder traits and functions are in
+`logit-proto`, which depends only on `logit-core`. `indices` is the events in view, as
 ascending indices into `batch.events`, or `None` for every event; `signals` is the payloads in
 view as `signal_index` bits, or `None` for every payload. An event in view always shows its
 timestamp and attributes. Today's `Delivered::Owned` and `Delivered::Shared` collapse into a
