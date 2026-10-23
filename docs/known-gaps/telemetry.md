@@ -152,14 +152,15 @@ Entry format and the other areas: [the known-gaps index](README.md).
 
 ## Load-test harness and perf tooling
 
-- **`script/perf compare` has no cross-run noise model.** It diffs two results files' medians
-  directly against `--threshold`, ignoring the run-to-run variance each file's own `repeats:`
-  already show.
-  - **Consequence:** a scenario whose repeats spread more than `--threshold` can trip a
+- **`script/perf compare` has no cross-run noise model beyond bimodality.** It diffs two results
+  files' medians directly against `--threshold`. The one spread it reads from each file's own
+  `repeats:` is two modes: a scenario whose five or more repeats split into two clusters of CPU
+  µs/event isn't gated at all (`crates/logit-perf/src/bimodal.rs`).
+  - **Consequence:** a unimodal scenario whose repeats spread more than `--threshold` can trip a
     "regression" on scheduling luck, and a real regression smaller than its noise floor can pass
-    silently. `compare` warns on host, CPU model, THP, `rmem_max`, profile, rustc, count, and
-    pacing mismatches, but not on "this scenario's own repeats disagree by more than the
-    threshold you're gating on".
+    silently. `compare` warns on host, CPU model, THP, `rmem_max`, profile, rustc, count, pacing,
+    and child-setup (`--workers`, `--pin-child`, `--env`) mismatches, but not on "this scenario's
+    own repeats disagree by more than the threshold you're gating on".
   - The motivating case (`aggregate` spreading about ±25% between laptop repeats) doesn't
     reproduce on the perf VM, where two independent 5-repeat samples agree within 0.7%
     ([performance.md](../design/performance.md) §1, "Noise").
