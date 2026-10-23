@@ -2531,6 +2531,21 @@ mod tests {
         }
     }
 
+    /// A `host.name` on a log with no `hostname` is the Datadog `hostname`, read back as
+    /// `hostname`; beside a `hostname` it stays an attribute.
+    #[test]
+    fn datadog_pairs_a_logs_host_name_read_back_as_hostname() {
+        let log = |attributes: &str| {
+            format!(r#"{{{{T}},"log":{{"format":"raw","message":"m"}},"attributes":{attributes}}}"#)
+        };
+        let host = Field::Attribute { key: "host.name".to_string(), resource: false };
+        let ins = recs(&[&log(r#"{"host.name":"web-1"}"#)]);
+        let read = recs(&[&log(r#"{"hostname":"web-1"}"#)]);
+        assert_eq!(observe_field(&host, &ins[0], &read[0], Spelling::Datadog), Class::Normalized);
+        let both = recs(&[&log(r#"{"host.name":"web-1","hostname":"h"}"#)]);
+        assert_eq!(pair(&both, &both, Spelling::Datadog).seen, [Some(Class::Exact)]);
+    }
+
     /// A `host` attribute on a metric with no `host.name` is the Datadog host, read back as
     /// `host.name` with the same value.
     #[test]
