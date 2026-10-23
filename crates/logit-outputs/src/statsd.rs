@@ -122,15 +122,19 @@
 //!    mark.
 //! 3. With neither, no host: the Agent stamps its own.
 //!
-//! Where either of the first two applies, a `host` attribute would be a second `host:` tag the
-//! Agent consumes, so it's omitted, counted `tags.omitted{reason="unrepresentable"}` once per wire
-//! tag. Otherwise a `host` attribute is an ordinary tag, `host:<v>`, which the Agent reads as the
-//! host: `statsd_in` never decodes one, so it's the operator's own, from a `set`, a script, or
-//! another protocol. Any other `host.name` (empty, or not a string) is an ordinary tag in its
-//! place, and `Format::Statsd` writes no tags at all. `host.name` is the standard host key, which a
-//! source fills from its own wire host and every sink ranks first (`docs/adr/process-hostname.md`'s
-//! "Amendment: a source fills the common keys (2026-10-23)").
-
+//! Where either of the first two applies, a valued `host` attribute would be a second `host:` tag
+//! the Agent consumes, so it's omitted, counted `tags.omitted{reason="unrepresentable"}` once per
+//! wire tag; a bare `host` (`Bool(true)`) isn't a `host:` tag and stays. The `host:` tag's value is
+//! sanitized as any tag value is, so a check with trailing metric lines carries `|h:web 1` on its
+//! own line and `#host:web_1` on the others, counted `tags.normalized{reason="value_sanitized"}`
+//! for those; an event or a check with none counts nothing for `|h:`. Otherwise a `host` attribute
+//! is an ordinary tag, `host:<v>`, which the Agent reads as the host: `statsd_in` never decodes
+//! one, so it's the operator's own, from a `set`, a script, or another protocol. Any other
+//! `host.name` (empty, or not a string) is an ordinary tag in its place, and `Format::Statsd`
+//! writes no tags at all. `host.name` is the standard host key, which a source fills from its own
+//! wire host and every sink ranks first (`docs/adr/process-hostname.md`'s "Amendment: a source
+//! fills the common keys (2026-10-23)").
+//!
 //! ## Metric-kind coverage
 //!
 //! Each written as its own native line: a delta, monotonic `Sum` (`MetricKind::counter`, `|c`),
@@ -919,6 +923,8 @@ impl StatsdEncoder {
                 diag: &mut self.diag,
                 out: &mut *out,
             };
+            // The line writes the host as `|h:`, never the `host:` tag.
+            ctx.stats.pending_tag_values -= carriers.host_tag_values;
             render_event(
                 &mut self.line,
                 &mut self.title_buf,
@@ -971,6 +977,9 @@ impl StatsdEncoder {
             match event.metrics.first() {
                 Some(first) if matches!(first.kind, MetricKind::Gauge(_)) => {
                     render_service_check(&mut self.line, &carriers, first, &mut ctx);
+                    // The check's line writes the host as `|h:`; only a trailing metric line
+                    // writes the `host:` tag.
+                    let after_check = ctx.out.len();
                     for metric in &event.metrics[1..] {
                         render_metric_counted(
                             &mut self.line,
@@ -981,6 +990,9 @@ impl StatsdEncoder {
                             metric,
                             &mut ctx,
                         );
+                    }
+                    if ctx.out.len() == after_check {
+                        ctx.stats.pending_tag_values -= carriers.host_tag_values;
                     }
                 }
                 _ => {
@@ -1082,6 +1094,10 @@ struct Carriers<'a> {
     /// service check line writes only the segment before it. The segment's length when there's
     /// no such tag.
     host_tag_at: usize,
+    /// The value rewrites the trailing `host:` tag counted into
+    /// `EncodeStats::pending_tag_values`, which an event's or service check's own line, writing
+    /// `|h:` in its place, takes back.
+    host_tag_values: usize,
 }
 
 impl Carriers<'_> {
@@ -1194,11 +1210,19 @@ fn build_tag_suffix<'a>(
 
         match key_str {
             "host" if line_names_host => {
-                // Per wire tag, as an `Array` would write one `host:` tag per element.
-                stats.tags_omitted_unrepresentable += match value {
-                    Value::Array(elements) => elements.len(),
-                    _ => 1,
+                // Per wire tag. Only a valued `host:<v>` tag is a host to the Agent; a bare
+                // `host` token (`Bool(true)`) is an ordinary tag and stays.
+                let elements = match value {
+                    Value::Array(elements) => elements.as_slice(),
+                    _ => std::slice::from_ref(value),
                 };
+                for element in elements {
+                    if matches!(element, Value::Bool(true)) {
+                        push_one_tag(suffix, scratch, key_str, element, stats);
+                    } else {
+                        stats.tags_omitted_unrepresentable += 1;
+                    }
+                }
                 continue;
             }
             ATTR_HOST_NAME if host_name.is_some() => continue,
@@ -1221,7 +1245,9 @@ fn build_tag_suffix<'a>(
     carriers.host_tag_at = suffix.len();
     if let Some(value) = host_name {
         carriers.host = value.as_str();
+        let before = stats.pending_tag_values;
         push_one_tag(suffix, scratch, "host", value, stats);
+        carriers.host_tag_values = stats.pending_tag_values - before;
     } else if hostless {
         // An empty `host:` tag keeps the Agent from stamping its own hostname, on every line
         // kind: an empty `h:` would be no host, which the Agent fills.
@@ -4447,6 +4473,49 @@ mod tests {
 
         let back = decode_one(&dog[0]);
         assert_eq!(back[0].attributes.get("host.name"), Some(&host_name.1));
+    }
+
+    /// A bare `host` token isn't a `host:` tag, so it stays beside the line's own host, while a
+    /// valued one is omitted, counted.
+    #[test]
+    fn a_bare_host_tag_stays_beside_the_lines_host() {
+        let hosts = Value::Array(vec![Value::Bool(true), Value::str("web2")]);
+        for (attrs, want) in [
+            (
+                vec![("host", Value::Bool(true)), ("host.name", "web1".into())],
+                "a:1|c|#host,host:web1",
+            ),
+            (
+                vec![("host", Value::Bool(true)), ("_logit.datadog.hostless", Value::Bool(true))],
+                "a:1|c|#host,host:",
+            ),
+            (vec![("host", hosts), ("host.name", "web1".into())], "a:1|c|#host,host:web1"),
+        ] {
+            let (dog, stats) = encode(vec![metric_event("a", MetricKind::counter(1.0), &attrs)]);
+            assert_eq!(dog, vec![want], "{attrs:?}");
+            let omitted = usize::from(attrs.iter().any(|(_, v)| matches!(v, Value::Array(_))));
+            assert_eq!(stats.tags_omitted_unrepresentable, omitted, "{attrs:?}");
+        }
+    }
+
+    /// A host the line writes as `|h:` is never sanitized as a tag value, so it counts no
+    /// rewrite; a check's trailing metric line writes the `host:` tag, sanitized and counted.
+    #[test]
+    fn an_h_field_counts_no_tag_value_rewrite() {
+        let host_name = ("host.name", Value::str("web 1"));
+        let event = event_line_event("t", "x", std::slice::from_ref(&host_name));
+        let check =
+            service_check_event("c", MetricKind::gauge(0.0), std::slice::from_ref(&host_name));
+        for (event, want) in [(event, "_e{1,1}:t|x|h:web 1"), (check.clone(), "_sc|c|0|h:web 1")] {
+            let (dog, stats) = encode(vec![event]);
+            assert_eq!(dog, vec![want]);
+            assert_eq!(stats.tag_values_sanitized, 0, "{want}");
+        }
+        let mut trailing = check;
+        trailing.metrics.push(MetricRecord::new(intern("extra"), MetricKind::gauge(2.0)));
+        let (dog, stats) = encode(vec![trailing]);
+        assert_eq!(dog, vec!["_sc|c|0|h:web 1", "extra:2|g|#host:web_1"]);
+        assert_eq!(stats.tag_values_sanitized, 1);
     }
 
     /// The hostless mark is an empty `host:` tag on an event or a check too, since an empty `h:`

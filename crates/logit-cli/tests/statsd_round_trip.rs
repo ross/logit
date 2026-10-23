@@ -109,8 +109,9 @@
 //!     - a `host.name:` tag on a line with no host of its own relays as the line's host:
 //!       `#host.name:web-1` leaves as `#host:web-1`.
 //!
+//!     A bare `host` token isn't a `host:` tag: it relays as itself beside the line's host.
 //!     Fixtures: `host-name-tag-as-host`, `host-name-tag-beside-host`, `host-tags-last-wins`,
-//!     `host-tag-on-event-or-check`.
+//!     `host-tag-on-event-or-check`, `bare-host-beside-host-tag`.
 //!
 //! Everything else relays byte for byte, modulo (3), (4), and (9): the raw `Samples`/`SetMembers`
 //! kinds, `|c:`/`|T` under DogStatsD, relative-gauge deltas, and the negative-absolute-gauge
@@ -381,6 +382,7 @@ async fn the_host_relays_in_its_lines_own_form() {
         "host-name-tag-beside-host",
         "host-tags-last-wins",
         "host-tag-on-event-or-check",
+        "bare-host-beside-host-tag",
     ] {
         assert_byte_for_byte(&mut harness, name, || StatsdEncoder::new(Format::DogStatsd)).await;
     }

@@ -83,19 +83,20 @@
 //! the earlier point is the one left over.
 //!
 //! [`Spelling`] holds each sink's rewrites, from its codec's module doc: `statsd_out`'s reserved
-//! characters as `_` in a name, a tag key, and a tag value (`:` allowed there), and under
-//! `format: dogstatsd` a `host.name` or hostless mark read back as `host` ([`statsd`]); `prometheus_out`'s `sanitize_metric_name`, `_total` on a counter, a label
-//! key's `sanitize_label_name`, and an array's last element; `influxdb_out`'s `<name>.value` for
-//! a `sum`, `gauge`, or `set` off the carrier path, and an array's last element; `otlp_out`'s
-//! timestamp value as an integer of nanoseconds, and an OpenMetrics `info` or `stateset` gauge
-//! read back as a cumulative non-monotonic sum, an `info` one under `<name>_info`; `datadog_out`'s `host` attribute
-//! on a record with no other host, read back under its route's host key, and the attributes it writes from a record's own fields
-//! ([`Spelling::derived`]: the run's hostname on a record with no host, a log's `status`, a
-//! span's `span.kind` and `_dd.p.tid`), each accepted only with the value derived for it;
-//! `graphite_out`'s forbidden characters as `_` in a path, a tag name, and a tag value (and a tag
-//! value's leading `~`), a tag value in the encoder's rendering, and the values it omits as no
-//! tag ([`graphite_value`]). Each name, key, and value set is the encoder's own predicate. A
-//! candidate's public attributes (no `_logit.`
+//! characters as `_` in a name, a tag key, and a tag value (`:` allowed there), and under `format:
+//! dogstatsd` a valued `host` attribute on a line with no host of its own read back as `host.name`,
+//! or, empty, as the hostless mark ([`statsd`]); `prometheus_out`'s `sanitize_metric_name`,
+//! `_total` on a counter, a label key's `sanitize_label_name`, and an array's last element;
+//! `influxdb_out`'s `<name>.value` for a `sum`, `gauge`, or `set` off the carrier path, and an
+//! array's last element; `otlp_out`'s timestamp value as an integer of nanoseconds, and an
+//! OpenMetrics `info` or `stateset` gauge read back as a cumulative non-monotonic sum, an `info`
+//! one under `<name>_info`; `datadog_out`'s hostless mark read back as a v2 `host` resource with no
+//! name, and the attributes it writes from a record's own fields ([`Spelling::derived`]: the run's
+//! hostname on a record with no host, a log's `status`, a span's `span.kind` and `_dd.p.tid`), each
+//! accepted only with the value derived for it; `graphite_out`'s forbidden characters as `_` in a
+//! path, a tag name, and a tag value (and a tag value's leading `~`), a tag value in the encoder's
+//! rendering, and the values it omits as no tag ([`graphite_value`]). Each name, key, and value set
+//! is the encoder's own predicate. A candidate's public attributes (no `_logit.`
 //! key, values compared as text, each key and value as the sink writes it) must equal the
 //! input's, or failing any that do, be a subset of them; a `datadog_out` series under `<name>.`
 //! may also carry the `lower_bound`, `upper_bound`, or `quantile` tag of the bucket or quantile it
@@ -317,7 +318,8 @@ impl Rec {
 enum Spelling {
     /// `statsd_out`: a name and a tag key with each of `statsd_out`'s reserved characters as
     /// `_`, the name on both sides, and a tag value the same but for `:`. Under
-    /// `format: dogstatsd` (`dogstatsd`), also the host as the `host:` tag ([`statsd`]).
+    /// `format: dogstatsd` (`dogstatsd`), also a valued `host` attribute read back as the line's
+    /// host ([`statsd`]).
     Statsd { dogstatsd: bool },
     /// `prometheus_out`: `sanitize_metric_name`, plus `_total` on a counter that lacks it;
     /// `sanitize_label_name` on every key; an array's last element as its label value.
@@ -330,9 +332,10 @@ enum Spelling {
     /// suffix; an `info` or `stateset` gauge as a cumulative non-monotonic sum; a timestamp value
     /// as an integer of Unix nanoseconds.
     Otlp,
-    /// `datadog_out`: names as written; a `host` attribute the encoder takes
-    /// as the host under its route's host key; and the attributes [`Spelling::derived`] lists, which the encoder writes from
-    /// a record's own fields and `datadog_in` reads back as attributes the input lacks.
+    /// `datadog_out`: names and keys as written, a `host` attribute an ordinary tag; the hostless
+    /// mark read back, on the v2 series route, as a `host` resource with no name; and the
+    /// attributes [`Spelling::derived`] lists, which the encoder writes from a record's own fields
+    /// and `datadog_in` reads back as attributes the input lacks.
     Datadog,
     /// `graphite_out`: each character carbon forbids in a path, a tag name, or a tag value as
     /// `_`, and a tag value's leading `~`; a tag value as the encoder renders it (an `f64` in
@@ -478,7 +481,7 @@ impl Spelling {
         if self == (Spelling::Statsd { dogstatsd: true }) && key == "host" {
             let value = rec.attributes.get(key).or_else(|| rec.resource.get(key));
             if let Some(read) = value.and_then(statsd::host_read_back) {
-                if !statsd::host_is_omitted(rec) {
+                if !value.is_some_and(|v| statsd::host_is_omitted(rec, v)) {
                     return read.to_string();
                 }
             }
@@ -492,7 +495,7 @@ impl Spelling {
     fn value_for(self, key: &str, value: &Value, tags: &str, rec: &Rec) -> Option<String> {
         if self == (Spelling::Statsd { dogstatsd: true })
             && key == "host"
-            && statsd::host_is_omitted(rec)
+            && statsd::host_is_omitted(rec, value)
         {
             return None;
         }
@@ -625,9 +628,10 @@ mod statsd {
         usable || get(rec, HOSTLESS) == Some(&Value::Bool(true))
     }
 
-    /// Whether a `host` attribute is left off: the line names its own host.
-    pub(super) fn host_is_omitted(rec: &Rec) -> bool {
-        names_host(rec)
+    /// Whether a `host` attribute holding `value` is left off: the line names its own host,
+    /// and `value` isn't a bare `host` token (`true`), which no Agent reads as a host.
+    pub(super) fn host_is_omitted(rec: &Rec, value: &Value) -> bool {
+        names_host(rec) && *value != Value::Bool(true)
     }
 
     /// The key `statsd_in` reads a `host` attribute's `host:` tag back under, where it's written:
@@ -1480,8 +1484,8 @@ fn field_rows(rec: &Rec, protocol: &str) -> Vec<(String, Option<String>, Field)>
     };
     // A host attribute a sink leaves off for the record's own host: `statsd_out`'s `host` beside
     // the line's host, and `datadog_out`'s log `hostname`.
-    let outranked = |key: &str| {
-        if key == "host" && statsd::host_is_omitted(rec) {
+    let outranked = |key: &str, value: &Value| {
+        if key == "host" && statsd::host_is_omitted(rec, value) {
             Some("host_beside_host_name")
         } else if key == "hostname" && datadog::hostname_is_omitted(rec) {
             Some("hostname")
@@ -1493,7 +1497,7 @@ fn field_rows(rec: &Rec, protocol: &str) -> Vec<(String, Option<String>, Field)>
         let tags = rec.attribute_types.get(key).map(String::as_str).unwrap_or("");
         let feature = if let Some(feature) = carrier(key, value) {
             feature
-        } else if let Some(feature) = outranked(key) {
+        } else if let Some(feature) = outranked(key, value) {
             feature
         } else if tags.contains("=bytes") {
             "bytes_value"
@@ -1514,7 +1518,7 @@ fn field_rows(rec: &Rec, protocol: &str) -> Vec<(String, Option<String>, Field)>
     }
     for (key, value) in &rec.resource {
         let feature =
-            carrier(key, value).or_else(|| outranked(key)).unwrap_or("resource_attribute");
+            carrier(key, value).or_else(|| outranked(key, value)).unwrap_or("resource_attribute");
         let field = Field::Attribute { key: key.clone(), resource: true };
         rows.push(("attributes".to_string(), Some(feature.to_string()), field));
     }
@@ -1584,7 +1588,7 @@ fn observe_field(field: &Field, input: &Rec, out: &Rec, spelling: Spelling) -> C
             let outranked = match spelling {
                 Spelling::Datadog => key == "hostname" && datadog::hostname_is_omitted(input),
                 Spelling::Statsd { dogstatsd: true } => {
-                    key == "host" && statsd::host_is_omitted(input)
+                    key == "host" && statsd::host_is_omitted(input, want)
                 }
                 _ => false,
             };
