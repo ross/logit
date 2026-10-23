@@ -1364,12 +1364,12 @@ mod tests {
     #[test]
     fn collectd_public_identity_renders_and_its_private_carrier_is_skipped() {
         let ev = tagged(&[
-            ("collectd.host", Value::from("web-1")),
+            ("host.name", Value::from("web-1")),
             ("_logit.collectd.plugin", Value::from("cpu")),
             ("env", Value::from("prod")),
         ]);
         let (lines, _, stats, _) = encode_with(&batch(vec![ev]), |e| e);
-        assert_eq!(lines, vec!["sys.cpu;collectd.host=web-1;env=prod 1 1700000000"]);
+        assert_eq!(lines, vec!["sys.cpu;env=prod;host.name=web-1 1 1700000000"]);
         assert_eq!(stats.tags_omitted_dialect, 0);
         assert_eq!(stats.tags_omitted_unrepresentable, 0);
     }

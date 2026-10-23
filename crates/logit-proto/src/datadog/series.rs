@@ -16,7 +16,7 @@ use super::tags::{count_tags, insert_tags, render_tags};
 use super::time::{nanos_to_seconds, seconds_to_nanos};
 use super::units;
 use super::{
-    collectd_host, host_tag, is_datadog_stats, is_service_check, units_are_datadog, DatadogDecoder,
+    host_tag, is_datadog_stats, is_service_check, units_are_datadog, DatadogDecoder,
     DatadogEncoder, HistogramMode, HistogramOptions, ATTR_DEVICE, ATTR_HOSTLESS, ATTR_HOST_NAME,
     ATTR_HOST_TAG, ATTR_ORIGIN_CATEGORY, ATTR_ORIGIN_METRIC_TYPE, ATTR_ORIGIN_PRODUCT,
     ATTR_ORIGIN_SERVICE, ATTR_RESOURCES, ATTR_SOURCE_TYPE_NAME, ATTR_TYPE, ATTR_UNITS,
@@ -963,10 +963,6 @@ impl DatadogEncoder {
                 }
                 // The v1, distribution, and sketch spelling: `"host":""`.
                 None if c.hostless => {}
-                // collectd's own host, below the hostless marks above.
-                None if collectd_host(resource, event).is_some() => {
-                    c.host = collectd_host(resource, event).map(str::to_string);
-                }
                 None => c.host = self.default_host.as_deref().map(str::to_string),
             }
         }
@@ -1943,28 +1939,24 @@ fn go_shortest_g(f: f64) -> String {
     }
 }
 
-/// [`CONSUMED`] and [`CONSUMED_WITH_CHECK`], each plus the attribute read as the host: `host`
-/// for an event whose `host` is its host ([`host_tag`]), else `collectd.host` for one whose
-/// collectd host is ([`collectd_host`]).
-static CONSUMED_WITH_HOST: LazyLock<[[Vec<Symbol>; 2]; 2]> = LazyLock::new(|| {
-    let with = |keys: &[Symbol], host: &str| {
+/// [`CONSUMED`] and [`CONSUMED_WITH_CHECK`], each plus `host`, for an event whose `host` is its
+/// host ([`host_tag`]).
+static CONSUMED_WITH_HOST: LazyLock<[Vec<Symbol>; 2]> = LazyLock::new(|| {
+    let with = |keys: &[Symbol]| {
         let mut keys = keys.to_vec();
-        keys.push(intern(host));
+        keys.push(intern(ATTR_HOST_TAG));
         keys
     };
-    [ATTR_HOST_TAG, crate::collectd::ATTR_HOST]
-        .map(|host| [with(&*CONSUMED, host), with(&CONSUMED_WITH_CHECK, host)])
+    [with(&*CONSUMED), with(&CONSUMED_WITH_CHECK)]
 });
 
 /// The attributes a metrics route never renders as a tag for `event`: the carriers it reads into
 /// wire fields of their own, a service check's `_logit.statsd.service_check.*` too, and a `host`
-/// or `collectd.host` read as the host.
+/// read as the host.
 fn tag_skip(resource: &Resource, event: &Event) -> &'static [Symbol] {
     let check = usize::from(is_service_check(resource, event));
     if host_tag(resource, event).is_some() {
-        &CONSUMED_WITH_HOST[0][check]
-    } else if collectd_host(resource, event).is_some() {
-        &CONSUMED_WITH_HOST[1][check]
+        &CONSUMED_WITH_HOST[check]
     } else if check == 1 {
         &CONSUMED_WITH_CHECK
     } else {
@@ -2620,48 +2612,25 @@ mod tests {
         }
     }
 
-    /// A `collectd.host` is the host of a metric with no `host.name` (or an empty one) and no
-    /// `host` tag, on every series route and the distribution points, and then not a tag; a
-    /// `host.name` or a `host` tag outranks it, and it stays a tag.
+    /// A `collectd.host` is another family's key: it leaves as a tag on every series route and
+    /// the distribution points, and the default host fills.
     #[test]
-    fn a_collectd_host_is_the_host_below_host_name_and_the_host_tag() {
+    fn a_collectd_host_is_an_ordinary_tag() {
         let mut e = DatadogEncoder::new().with_default_host(Some(Arc::from("relay")));
-        let attrs = |pairs: &[(&str, &str)]| {
-            let mut attrs = AttrMap::new();
-            for (k, v) in pairs {
-                attrs.insert(k, Value::str(*v));
-            }
-            attrs
-        };
-        let collectd = crate::collectd::ATTR_HOST;
-        for (pairs, host, tags) in [
-            (&[(collectd, "web1"), ("env", "prod")][..], "web1", json!(["env:prod"])),
-            (&[(collectd, "web1"), (ATTR_HOST_NAME, "")][..], "web1", json!([])),
-            (&[(collectd, "web1"), (ATTR_HOST_NAME, "h")][..], "h", json!(["collectd.host:web1"])),
-            (&[(collectd, "web1"), ("host", "t")][..], "t", json!(["collectd.host:web1"])),
-            // An empty one is no host: the default fills, and it stays a tag.
-            (&[(collectd, "")][..], "relay", json!(["collectd.host:"])),
-            // An empty `host:` tag marks the sample hostless, which `collectd.host` doesn't fill.
-            (&[(collectd, "web1"), ("host", "")][..], "", json!(["collectd.host:web1"])),
-        ] {
-            let b = one_event_batch(attrs(pairs), MetricKind::gauge(1.0));
-            let v1: JsonValue = serde_json::from_slice(&e.encode_series_v1(&b).unwrap()).unwrap();
-            assert_eq!(v1["series"][0]["host"], host, "{pairs:?}");
-            assert_eq!(v1["series"][0]["tags"], tags, "{pairs:?}");
-            assert_eq!(
-                metric_tag_count(&b.resource, &b.events[0]),
-                tags.as_array().unwrap().len(),
-                "{pairs:?}"
-            );
-            let v2: JsonValue =
-                serde_json::from_slice(&e.encode_series_v2_json(&b).unwrap()).unwrap();
-            assert_eq!(v2["series"][0]["resources"], json!([{ "type": "host", "name": host }]));
-            let samples = one_event_batch(attrs(pairs), MetricKind::Samples(Samples::new([1.0])));
-            let points: JsonValue =
-                serde_json::from_slice(&e.encode_distribution_points(&samples).unwrap()).unwrap();
-            assert_eq!(points["series"][0]["host"], host, "{pairs:?}");
-            assert_eq!(points["series"][0]["tags"], tags, "{pairs:?}");
-        }
+        let mut attrs = AttrMap::new();
+        attrs.insert("collectd.host", Value::str("web1"));
+        let b = one_event_batch(attrs.clone(), MetricKind::gauge(1.0));
+        let v1: JsonValue = serde_json::from_slice(&e.encode_series_v1(&b).unwrap()).unwrap();
+        assert_eq!(v1["series"][0]["host"], "relay");
+        assert_eq!(v1["series"][0]["tags"], json!(["collectd.host:web1"]));
+        assert_eq!(metric_tag_count(&b.resource, &b.events[0]), 1);
+        let v2: JsonValue = serde_json::from_slice(&e.encode_series_v2_json(&b).unwrap()).unwrap();
+        assert_eq!(v2["series"][0]["resources"], json!([{ "type": "host", "name": "relay" }]));
+        let samples = one_event_batch(attrs, MetricKind::Samples(Samples::new([1.0])));
+        let points: JsonValue =
+            serde_json::from_slice(&e.encode_distribution_points(&samples).unwrap()).unwrap();
+        assert_eq!(points["series"][0]["host"], "relay");
+        assert_eq!(points["series"][0]["tags"], json!(["collectd.host:web1"]));
     }
 
     /// A series carries its unit as Datadog names it on every series route: a UCUM unit mapped, a
@@ -2738,28 +2707,6 @@ mod tests {
             let points: JsonValue =
                 serde_json::from_slice(&e.encode_distribution_points(&samples).unwrap()).unwrap();
             assert_eq!(points["series"][0]["host"], want);
-        }
-    }
-
-    /// A hostless mark outranks `collectd.host`: the sample stays hostless and `collectd.host`
-    /// leaves as a tag.
-    #[test]
-    fn a_hostless_mark_keeps_a_collectd_host_a_tag() {
-        let mut e = DatadogEncoder::new().with_default_host(Some(Arc::from("relay")));
-        let mut marked = AttrMap::new();
-        marked.insert(ATTR_HOSTLESS, Value::Bool(true));
-        let mut resource = AttrMap::new();
-        let mut entry = AttrMap::new();
-        entry.insert("type", Value::str("host"));
-        entry.insert("name", Value::str(""));
-        resource.insert(ATTR_RESOURCES, Value::Array(vec![Value::Map(Box::new(entry))]));
-        for mut attrs in [marked, resource] {
-            attrs.insert(crate::collectd::ATTR_HOST, Value::str("web1"));
-            let b = one_event_batch(attrs, MetricKind::gauge(1.0));
-            let v1: JsonValue = serde_json::from_slice(&e.encode_series_v1(&b).unwrap()).unwrap();
-            assert_eq!(v1["series"][0]["host"], "");
-            assert_eq!(v1["series"][0]["tags"], json!(["collectd.host:web1"]));
-            assert_eq!(metric_tag_count(&b.resource, &b.events[0]), 1);
         }
     }
 

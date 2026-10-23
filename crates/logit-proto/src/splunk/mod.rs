@@ -145,7 +145,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, LazyLock};
 
 /// `host.name`: the envelope's `host`.
-pub const RESOURCE_ATTR_HOST_NAME: &str = "host.name";
+pub const RESOURCE_ATTR_HOST_NAME: &str = logit_core::attrs::HOST_NAME;
 /// `com.splunk.source`: the envelope's `source`.
 pub const RESOURCE_ATTR_SOURCE: &str = "com.splunk.source";
 /// `com.splunk.sourcetype`: the envelope's `sourcetype`.

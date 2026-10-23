@@ -359,7 +359,7 @@ fn sinks() -> Vec<Sink> {
             name: "collectd",
             protocol: "collectd",
             encode: |b, t, d| {
-                // A fallback host, so an event with no `collectd.host` still reaches the wire.
+                // A fallback host, so an event with no `host.name` still reaches the wire.
                 let mut encoder = collectd::CollectdEncoder::new()
                     .with_telemetry(t)
                     .with_diagnostics(d)

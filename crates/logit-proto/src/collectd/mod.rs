@@ -74,7 +74,7 @@
 //!
 //! | Condition | Outcome |
 //! |---|---|
-//! | sticky severity ∈ {1 FAILURE, 2 WARNING, 4 OKAY} and the message is non-empty and a host is set | one [`logit_core::Event::log`], `timestamp` = TimeHR/Time/`received_at` exactly as a value list's, [`logit_core::LogRecord::message`] = the wire bytes (`Str` if UTF-8, `Bytes` if not -- collectd's own strings are bytes, not text), `severity` = 1→`Error`/2→`Warn`/4→`Info`, plus [`ATTR_HOST`]/[`ATTR_PLUGIN`]/[`ATTR_PLUGIN_INSTANCE`]/[`ATTR_TYPE`]/[`ATTR_TYPE_INSTANCE`] (each present only when sticky) and [`ATTR_SEVERITY`] = `Value::U64` of the raw severity |
+//! | sticky severity ∈ {1 FAILURE, 2 WARNING, 4 OKAY} and the message is non-empty and a host is set | one [`logit_core::Event::log`], `timestamp` = TimeHR/Time/`received_at` exactly as a value list's, [`logit_core::LogRecord::message`] = the wire bytes (`Str` if UTF-8, `Bytes` if not -- collectd's own strings are bytes, not text), `severity` = 1→`Error`/2→`Warn`/4→`Info`, plus [`ATTR_HOST_NAME`]/[`ATTR_PLUGIN`]/[`ATTR_PLUGIN_INSTANCE`]/[`ATTR_TYPE`]/[`ATTR_TYPE_INSTANCE`] (each present only when sticky) and [`ATTR_SEVERITY`] = `Value::U64` of the raw severity |
 //! | sticky severity outside {1, 2, 4} | dropped, nothing pushed | `notification_dropped` |
 //! | the message is empty | dropped | `notification_dropped` |
 //! | no host is set | dropped | `notification_dropped` |
@@ -89,7 +89,8 @@
 //! The decoded [`logit_core::Resource`] is always the decoder's own shared one and the
 //! [`logit_core::Scope`] is always `None`: `logit_pipeline::BatchAccumulator::absorb` keys
 //! accumulation on `Arc::ptr_eq`, so a per-host resource would split every batch by sender. The
-//! host rides on `collectd.host` instead.
+//! host rides on the event as `host.name` instead, the standard host key (ADR `process-hostname`'s
+//! "Amendment: `host.name` is the standard host key").
 //!
 //! **Record names are display/cross-protocol only.** `collectd_out` re-encodes a list from the
 //! attributes below, the `MetricList`'s order, and each record's kind, and never
@@ -123,11 +124,11 @@
 //! | `_logit.collectd.interval` `F64`, finite, `> 0` | IntervalHR = `round(v * 2³⁰)` | -- |
 //! | `_logit.collectd.interval` absent | IntervalHR `0` (collectd's own "unspecified") | -- |
 //! | `_logit.collectd.interval` present but not a finite positive `F64` | IntervalHR `0` | `logit.output.tags.omitted{reason="unrepresentable"}` |
-//! | host | `collectd.host`, else `host.name`, else the encoder's [`CollectdEncoder::with_hostname`] value -- the first that survives sanitizing non-empty | -- |
-//! | none of those three present | the whole event is dropped | `logit.output.metrics.dropped{reason="no_host"}` + diag `no_host`. collectd's receiver rejects an empty host, and there is no honest substitute: this codec neither reads the OS hostname (`internal` stamps the process hostname as `host.name` instead, `docs/adr/process-hostname.md`) nor invents a placeholder, since one made-up name would silently merge every unlabelled sender into a single host's metrics. |
+//! | host | `host.name` (`Str` or `Bytes`, event else resource), else the encoder's [`CollectdEncoder::with_hostname`] value -- the first that survives sanitizing non-empty | -- |
+//! | neither present | the whole event is dropped | `logit.output.metrics.dropped{reason="no_host"}` + diag `no_host`. collectd's receiver rejects an empty host, and there is no honest substitute: this codec neither reads the OS hostname (`internal` stamps the process hostname as `host.name` instead, `docs/adr/process-hostname.md`) nor invents a placeholder, since one made-up name would silently merge every unlabelled sender into a single host's metrics. |
 //! | collectd identity attributes, `Str` or `Bytes` | verbatim after sanitizing; a `Bytes` is byte-verbatim (collectd's own strings are bytes, not UTF-8) | `logit.output.identity.sanitized{reason="substituted"\|"truncated"}` |
 //! | collectd identity attributes of any other `Value` type | treated as absent | `logit.output.tags.omitted{reason="unrepresentable"}` |
-//! | every attribute that is neither a carrier below nor under the private `_logit.` prefix (a `_logit.` key outside `_logit.collectd.` is skipped uncounted) | dropped -- collectd has no tag concept at all, and `host.name` is counted here too even though the host resolution above reads it | `logit.output.tags.omitted{reason="no_wire_form"}`, once per attribute per event |
+//! | every attribute that is neither a carrier below nor under the private `_logit.` prefix (a `_logit.` key outside `_logit.collectd.` is skipped uncounted) | dropped -- collectd has no tag concept at all | `logit.output.tags.omitted{reason="no_wire_form"}`, once per attribute per event |
 //! | plugin or type empty after sanitizing | the list is dropped | `logit.output.metrics.dropped{reason="empty_name"}` |
 //! | a like-relay event carrying more than [`MAX_VALUES_PER_LIST`] records | the list is dropped whole | `logit.output.metrics.dropped{reason="too_many_values"}` + diag `too_many_values`. The cap is pair-wide: a longer list fits comfortably under the byte cap, but the decode side of this very codec rejects it as a malformed part -- and that abandons every unrelated list packed behind it in the same datagram. `aggregate`/`kv_metrics` can both put far more than 64 records on one event. |
 //! | a list that alone exceeds `max_packet_bytes` | dropped whole, never split | `logit.output.metrics.dropped{reason="oversize_value_list"}` + diag `oversize_value_list` |
@@ -160,13 +161,13 @@
 //! something else). The four under `_logit.collectd.` are private
 //! ([ADR `private-attribute-namespace`](../../../../docs/adr/private-attribute-namespace.md)):
 //! every other sink ignores them, because the record name or a typed field already carries what
-//! `plugin`, `type`, and `severity` say, and only `collectd_out` reads `interval`. `collectd.host`, `collectd.plugin_instance`, and `collectd.type_instance` are public
-//! identity with no other home, so every other sink renders them as ordinary tags.
+//! `plugin`, `type`, and `severity` say, and only `collectd_out` reads `interval`. `host.name`, `collectd.plugin_instance`, and `collectd.type_instance` are public
+//! identity, so every other sink renders them as ordinary tags, or `host.name` as its own host.
 //! `docs/design/data-model.md`'s well-known-attribute table is the canonical list.
 //!
 //! | Attribute | Value | Meaning |
 //! |---|---|---|
-//! | [`ATTR_HOST`] | `Str` (`Bytes` when not UTF-8) | the wire Host; absent when the wire carried an empty one; outranks `host.name` on collectd egress |
+//! | [`ATTR_HOST_NAME`] | `Str` (`Bytes` when not UTF-8) | the wire Host, under the standard host key; absent when the wire carried an empty one |
 //! | [`ATTR_PLUGIN`] | `Str`/`Bytes` | the wire Plugin; required for like-relay encoding |
 //! | [`ATTR_PLUGIN_INSTANCE`] | `Str`/`Bytes` | the wire PluginInstance, only when non-empty |
 //! | [`ATTR_TYPE`] | `Str`/`Bytes` | the wire Type; **its presence is what selects like-relay encoding** |
@@ -273,8 +274,8 @@ pub const NOTIF_MAX_MSG_LEN: usize = 256;
 /// its Plugin and Type parts are.
 pub const MAX_VALUES_PER_LIST: usize = 64;
 
-/// The wire Host. See this module doc's well-known-attribute table.
-pub const ATTR_HOST: &str = "collectd.host";
+/// The wire Host, under the standard host key. See this module doc's well-known-attribute table.
+pub const ATTR_HOST_NAME: &str = logit_core::attrs::HOST_NAME;
 /// The wire Plugin.
 pub const ATTR_PLUGIN: &str = "_logit.collectd.plugin";
 /// The wire PluginInstance, present only when non-empty.

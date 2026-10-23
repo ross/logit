@@ -40,7 +40,7 @@ use logit_core::{
 };
 use logit_proto::collectd::types_db::TEST_TYPES_DB;
 use logit_proto::collectd::{
-    CollectdDecoder, CollectdEncoder, TypesDb, ATTR_HOST, ATTR_INTERVAL, ATTR_PLUGIN,
+    CollectdDecoder, CollectdEncoder, TypesDb, ATTR_HOST_NAME, ATTR_INTERVAL, ATTR_PLUGIN,
     ATTR_PLUGIN_INSTANCE, ATTR_TYPE, ATTR_TYPE_INSTANCE, DEFAULT_MAX_PACKET_BYTES,
 };
 use logit_proto::{Decoder, FramedEncoder, MessageBuf};
@@ -182,7 +182,7 @@ fn assert_wire_fixed_point(packet: Bytes, expected_events: usize) {
 
 fn identity(type_instance: Option<&str>) -> AttrMap {
     let mut attrs = AttrMap::new();
-    attrs.insert(ATTR_HOST, Value::from("web-1"));
+    attrs.insert(ATTR_HOST_NAME, Value::from("web-1"));
     attrs.insert(ATTR_PLUGIN, Value::from("load"));
     attrs.insert(ATTR_PLUGIN_INSTANCE, Value::from("0"));
     attrs.insert(ATTR_TYPE, Value::from("load"));

@@ -76,7 +76,7 @@ impl CollectdDecoder {
             telemetry: Telemetry::default(),
             name: String::new(),
             keys: AttrKeys {
-                host: intern(super::ATTR_HOST),
+                host: intern(super::ATTR_HOST_NAME),
                 plugin: intern(super::ATTR_PLUGIN),
                 plugin_instance: intern(super::ATTR_PLUGIN_INSTANCE),
                 type_: intern(super::ATTR_TYPE),
@@ -626,7 +626,7 @@ fn push_lossy(out: &mut String, bytes: &[u8]) {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::super::{
-        ATTR_HOST, ATTR_INTERVAL, ATTR_PLUGIN, ATTR_PLUGIN_INSTANCE, ATTR_SEVERITY, ATTR_TYPE,
+        ATTR_HOST_NAME, ATTR_INTERVAL, ATTR_PLUGIN, ATTR_PLUGIN_INSTANCE, ATTR_SEVERITY, ATTR_TYPE,
         ATTR_TYPE_INSTANCE,
     };
     use super::*;
@@ -822,7 +822,7 @@ pub(crate) mod tests {
         assert_eq!(event.metrics.len(), 1);
         assert_eq!(resolve(event.metrics[0].name), "memory.memory");
         assert_eq!(event.metrics[0].kind, MetricKind::gauge(1.5));
-        assert_eq!(attr(event, ATTR_HOST), Some(Value::from("web-1")));
+        assert_eq!(attr(event, ATTR_HOST_NAME), Some(Value::from("web-1")));
         assert_eq!(attr(event, ATTR_PLUGIN), Some(Value::from("memory")));
         assert_eq!(attr(event, ATTR_TYPE), Some(Value::from("memory")));
         assert_eq!(attr(event, ATTR_TYPE_INSTANCE), Some(Value::from("used")));
@@ -937,7 +937,7 @@ pub(crate) mod tests {
         );
         assert_eq!(events.len(), 2);
         for event in &events {
-            assert_eq!(attr(event, ATTR_HOST), Some(Value::from("web-1")));
+            assert_eq!(attr(event, ATTR_HOST_NAME), Some(Value::from("web-1")));
             assert_eq!(attr(event, ATTR_PLUGIN), Some(Value::from("cpu")));
         }
         assert_eq!(attr(&events[0], ATTR_TYPE_INSTANCE), Some(Value::from("user")));
@@ -1035,7 +1035,7 @@ pub(crate) mod tests {
                 .build(),
         );
         assert_eq!(
-            attr(&events[0], ATTR_HOST),
+            attr(&events[0], ATTR_HOST_NAME),
             Some(Value::Bytes(Bytes::from_static(&[0xFF, 0xFE, b'h'])))
         );
         // The record *name* must be text, so it is lossy; the attribute keeps the raw bytes.
@@ -1177,7 +1177,7 @@ pub(crate) mod tests {
             assert_eq!(log.severity, Some(expected), "severity {wire}");
             assert_eq!(log.message, Value::from("threshold exceeded"));
             assert_eq!(events[0].timestamp, 1_700_000_000_000_000_000);
-            assert_eq!(attr(&events[0], ATTR_HOST), Some(Value::from("web-1")));
+            assert_eq!(attr(&events[0], ATTR_HOST_NAME), Some(Value::from("web-1")));
             assert_eq!(attr(&events[0], ATTR_PLUGIN), Some(Value::from("load")));
             assert_eq!(attr(&events[0], ATTR_TYPE), Some(Value::from("load")));
             assert_eq!(events[0].attributes.get(ATTR_SEVERITY), Some(&Value::U64(wire)));
@@ -1352,7 +1352,7 @@ pub(crate) mod tests {
         assert_eq!(events.len(), 2);
         assert!(events[0].log.is_none() && !events[0].metrics.is_empty(), "the value list first");
         assert!(events[1].log.is_some() && events[1].metrics.is_empty(), "the notification second");
-        assert_eq!(attr(&events[1], ATTR_HOST), Some(Value::from("web-1")));
+        assert_eq!(attr(&events[1], ATTR_HOST_NAME), Some(Value::from("web-1")));
         assert_eq!(attr(&events[1], ATTR_PLUGIN), Some(Value::from("load")));
         assert_eq!(attr(&events[1], ATTR_TYPE), Some(Value::from("load")));
     }

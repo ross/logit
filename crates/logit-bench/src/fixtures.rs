@@ -1728,13 +1728,13 @@ pub fn remote_write_request_v2() -> Vec<u8> {
     pb::Request { symbols, timeseries }.encode_to_vec()
 }
 
-/// A collectd like-relay event: `collectd.host`, `_logit.collectd.plugin`/`type`/`interval`, and
+/// A collectd like-relay event: `host.name`, `_logit.collectd.plugin`/`type`/`interval`, and
 /// one gauge record. `collectd_out`'s encoder fast-paths this into one Values part
 /// (`logit_proto::collectd`'s module doc, the "like-relay" row); an event without
 /// `_logit.collectd.type` takes the per-record fallback.
 pub fn collectd_event() -> Event {
     let mut attributes = AttrMap::new();
-    attributes.insert(logit_proto::collectd::ATTR_HOST, Value::str("fixture-host"));
+    attributes.insert(logit_proto::collectd::ATTR_HOST_NAME, Value::str("fixture-host"));
     attributes.insert(logit_proto::collectd::ATTR_PLUGIN, sstr("load"));
     attributes.insert(logit_proto::collectd::ATTR_TYPE, sstr("load"));
     attributes.insert(logit_proto::collectd::ATTR_INTERVAL, Value::F64(10.0));
@@ -2126,7 +2126,7 @@ pub fn wide_server_span_event() -> Event {
 /// should know the sixth key is the fixture's, not collectd's.
 pub fn collectd_three_record_event() -> Event {
     let mut attributes = AttrMap::new();
-    attributes.insert(logit_proto::collectd::ATTR_HOST, sstr("web-1"));
+    attributes.insert(logit_proto::collectd::ATTR_HOST_NAME, sstr("web-1"));
     attributes.insert(logit_proto::collectd::ATTR_PLUGIN, sstr("load"));
     attributes.insert(logit_proto::collectd::ATTR_PLUGIN_INSTANCE, sstr("0"));
     attributes.insert(logit_proto::collectd::ATTR_TYPE, sstr("load"));

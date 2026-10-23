@@ -34,9 +34,9 @@ use logit_core::{
 };
 use logit_proto::collectd::part::{self, TYPE_ENCRYPTION, TYPE_SIGNATURE};
 use logit_proto::collectd::{
-    CollectdDecoder, CollectdEncoder, ATTR_HOST, ATTR_INTERVAL, ATTR_PLUGIN, ATTR_PLUGIN_INSTANCE,
-    ATTR_SEVERITY, ATTR_TYPE, ATTR_TYPE_INSTANCE, DATA_MAX_NAME_LEN, DEFAULT_MAX_PACKET_BYTES,
-    MAX_VALUES_PER_LIST,
+    CollectdDecoder, CollectdEncoder, ATTR_HOST_NAME, ATTR_INTERVAL, ATTR_PLUGIN,
+    ATTR_PLUGIN_INSTANCE, ATTR_SEVERITY, ATTR_TYPE, ATTR_TYPE_INSTANCE, DATA_MAX_NAME_LEN,
+    DEFAULT_MAX_PACKET_BYTES, MAX_VALUES_PER_LIST,
 };
 use logit_proto::{CodecError, Decoder, FramedEncoder, MessageBuf};
 use std::sync::Arc;
@@ -106,7 +106,8 @@ fn check_event(datagram: &Bytes, event: &Event) {
     for (key, value) in event.attributes.iter() {
         let key = resolve(key);
         match key {
-            ATTR_HOST | ATTR_PLUGIN | ATTR_PLUGIN_INSTANCE | ATTR_TYPE | ATTR_TYPE_INSTANCE => {
+            ATTR_HOST_NAME | ATTR_PLUGIN | ATTR_PLUGIN_INSTANCE | ATTR_TYPE
+            | ATTR_TYPE_INSTANCE => {
                 strings.insert(key, check_string(datagram, key, value));
             }
             ATTR_INTERVAL => {
@@ -120,7 +121,7 @@ fn check_event(datagram: &Bytes, event: &Event) {
             other => panic!("model: an attribute collectd never writes: {other}"),
         }
     }
-    assert!(strings.contains_key(ATTR_HOST), "model: every event has a host");
+    assert!(strings.contains_key(ATTR_HOST_NAME), "model: every event has a host");
 
     if let Some(log) = &event.log {
         assert!(event.metrics.is_empty(), "model: a notification carries no metric");
