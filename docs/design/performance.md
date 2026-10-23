@@ -431,7 +431,10 @@ decimal.
   stats groups through as bucketed"), the next commit in the same stack, steps `aggregate-groups`
   +4.4% (0.299 → 0.313, the second cell's 15 repeats within 0.311–0.314) and `aggregate` +1.3%,
   testing each event for an APM stats group. The merges after it, #782 through n, don't move
-  either scenario by more than 1.1%.
+  either scenario by more than 1.1%. The 2026-10-23 subtraction leaves the probes together at
+  roughly 0 on `aggregate` and +2% on `aggregate-groups`, less than this step alone suggests; see
+  "[`aggregate`: the flag reads and the series-key copy
+  (2026-10-23)](#aggregate-the-flag-reads-and-the-series-key-copy-2026-10-23)".
 - **`native-relay` is 7.7% faster on events/s and 3.3% cheaper on CPU, and `lua` 3.5% cheaper.**
   Neither was bisected; read `native-relay`'s with "`native-relay` is code-layout-sensitive" below.
 - **`buffered-small-segments`' −42.3% events/s is wall-clock noise, not a change.** Its CPU
@@ -480,14 +483,15 @@ cell and reversed on even rounds, so each leads 3 of the 12 cells. One throwaway
 
 CPU µs/event, pooled median of 15, `+` = slower. Bold marks a delta past 2%, the ladder's own
 threshold; the suite's gate is 5%. b→n is the probes' cost, n→f the flags against the probes,
-fl→f the flag reads' cost, and b→fl the gap the flags don't explain. Per-round medians agree to the
-third decimal on every tag. Ranges (min–max of 15): `aggregate` b 0.334–0.339, n 0.351–0.356,
+fl→f the flag reads' cost, and b→fl the gap the flags don't explain. Each tag's three per-round
+medians lie within 0.004 of each other, the widest `passthrough` n (0.338–0.342). Ranges (min–max
+of 15): `aggregate` b 0.334–0.339, n 0.351–0.356,
 f 0.349–0.360, fl 0.349–0.354; `aggregate-groups` b 0.287–0.298, n 0.308–0.315, f 0.300–0.305,
 fl 0.303–0.310. Median events/s: `aggregate` b 2,999,803, n 2,857,190, f 2,864,808;
 `aggregate-groups` b 3,517,146, n 3,279,736, f 3,364,772.
 
-fl→f is inside the spread on all four rows, so the one attribute lookup per event and the resource
-lookup per batch cost nothing the ladder can see. f still sits +4.7% and +4.1% above b, and fl sits
+fl→f is inside the spread on all four rows, so the two attribute lookups per event and the two
+resource lookups per batch cost nothing the ladder can see. f still sits +4.7% and +4.1% above b, and fl sits
 there too (+4.5% and +5.5%). fl has neither the flags nor the probes, so the gap is something else
 `1f30eb3c` changed that the flag build kept.
 
@@ -516,7 +520,8 @@ Two patches on f test that, under the same protocol on the two `aggregate` scena
 
 - **fk** clones the map into the key and prunes `key.attributes` in place. `flags/w1b` commits it
   as `1ceca584` ("perf(transforms): build the series key in place").
-- **fk2** is fk plus skipping the string-field machinery when the fields flag isn't set.
+- **fk2** skips the string-field scan and pruning when the fields flag isn't set, cloning the map
+  straight into the key on that path only; the flagged path keeps f's clone-then-move.
 
 | Scenario | b | f | fk | fk2 | b→f | b→fk | b→fk2 |
 |---|---:|---:|---:|---:|---:|---:|---:|
@@ -528,8 +533,9 @@ f 0.349–0.354, fk 0.333–0.338, fk2 0.331–0.336; `aggregate-groups` b 0.287
 fk 0.283–0.291, fk2 0.282–0.298. Median events/s: `aggregate` b 3,008,170, f 2,869,012,
 fk 3,010,361; `aggregate-groups` b 3,516,967, f 3,365,735, fk 3,576,148.
 
-fk recovers the whole gap: b and fk read the same on both scenarios. fk2 is inside fk's spread and
-isn't taken.
+fk recovers the whole gap: b and fk read the same on both scenarios. fk2 is inside fk's spread,
+since neither scenario sets the fields flag and the two builds take the same path, and isn't
+taken.
 
 The final ladder reruns the first table's four scenarios under the same protocol on the
 `flags/w1b` head: f is `1ceca584`, and fl is `1ceca584` plus the floor patch.
@@ -541,9 +547,9 @@ The final ladder reruns the first table's four scenarios under the same protocol
 | `json-parse` | 0.867 | 0.882 | 0.883 | 0.874 | +1.71% | +1.79% | +0.08% | +0.96% | +0.83% |
 | `passthrough` | 0.341 | 0.339 | 0.339 | 0.337 | −0.68% | −0.76% | −0.07% | +0.43% | −1.19% |
 
-CPU µs/event, pooled median of 15, `+` = slower, bold past 2%. Per-round medians agree to the
-third decimal on every tag except `aggregate-groups` b (0.287, 0.291, 0.292). Ranges (min–max of
-15): `aggregate` b 0.333–0.336, n 0.350–0.354, f 0.332–0.337, fl 0.336–0.342; `aggregate-groups`
+CPU µs/event, pooled median of 15, `+` = slower, bold past 2%. Each tag's three per-round medians
+lie within 0.004 of each other except `aggregate-groups` b (0.287, 0.291, 0.292). Ranges (min–max
+of 15): `aggregate` b 0.333–0.336, n 0.350–0.354, f 0.332–0.337, fl 0.336–0.342; `aggregate-groups`
 b 0.286–0.296, n 0.308–0.312, f 0.282–0.298, fl 0.289–0.330 (one high repeat; its per-round
 medians are 0.291–0.293). Median events/s: `aggregate` b 3,012,453, n 2,864,220, f 3,015,714;
 `aggregate-groups` b 3,516,543, n 3,279,818, f 3,572,500. The run's verify pass found 0 problems
@@ -551,9 +557,9 @@ in its 52 results files.
 
 On the W1b head, f reads at b on all four scenarios (−0.1%, −1.9%, +1.8%, −0.8%) and 5.0% and
 7.9% under n on the two `aggregate` scenarios. The floor is no longer faster than the flag build:
-fl reads +1.1% and +2.9% above f, inside the spread on `aggregate` and, on `aggregate-groups`,
-carried by one 0.330 repeat and the layout difference a patched build brings. With the key copy
-gone, taking the flag reads out buys nothing the ladder can resolve.
+fl reads +1.1% and +2.9% above f, inside the spread on `aggregate`. On `aggregate-groups` the gap
+holds in all three rounds (fl 0.291, 0.293, 0.293 against f 0.285, 0.285, 0.284), and is the
+layout difference a patched build brings. With the key copy gone, taking the flag reads out buys nothing the ladder can resolve.
 
 What the session concludes:
 
