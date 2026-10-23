@@ -303,6 +303,7 @@ async fn statsd_through_cumulative_aggregate_renders_a_cumulative_counter_with_c
             .expect("the Fanout channel should not have closed");
         let batch = logit_pipeline::unwrap_batch(delivered);
         let resource = batch.resource.clone();
+        aggregator.begin_batch(&resource);
         for mut event in batch.events {
             absorbed_events += 1;
             let forwarded = aggregator.process(&resource, &mut event);
@@ -401,6 +402,7 @@ async fn first_drain_through_cumulative_aggregate(mut input: InternalInput) -> S
         .with_series_retention(5, 10_000);
 
     let mut passthrough = Vec::new();
+    aggregator.begin_batch(&batch.resource);
     for mut event in batch.events {
         if aggregator.process(&batch.resource, &mut event) {
             passthrough.push(event);

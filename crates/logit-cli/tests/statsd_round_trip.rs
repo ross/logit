@@ -479,6 +479,7 @@ async fn statsd_in_aggregate_statsd_out_relay_preserves_a_multi_valued_tag() {
 
     let mut aggregator = Aggregator::new(Duration::from_secs(10));
     let resource = batch.resource.clone();
+    aggregator.begin_batch(&resource);
     let mut forwarded = Vec::new();
     for mut event in batch.events {
         if aggregator.process(&resource, &mut event) {
@@ -670,6 +671,7 @@ async fn statsd_in_aggregate_statsd_out_relay_is_exact() {
         .with_sets(Sets::Members, 1000);
 
     let resource = batch.resource.clone();
+    aggregator.begin_batch(&resource);
     let mut forwarded = Vec::new();
     for mut event in batch.events {
         if aggregator.process(&resource, &mut event) {
@@ -731,6 +733,7 @@ async fn relay_through_a_default_aggregate(
 
     let mut aggregator = Aggregator::new(Duration::from_secs(10));
     let resource = batch.resource.clone();
+    aggregator.begin_batch(&resource);
     for mut event in batch.events {
         assert!(!aggregator.process(&resource, &mut event), "every metric is absorbed");
     }
@@ -861,6 +864,7 @@ async fn relay_timestamped_through_aggregate(raw: &[u8]) -> String {
 
     let mut aggregator = Aggregator::new(Duration::from_secs(10));
     let mut forwarded = Vec::new();
+    aggregator.begin_batch(&batch.resource);
     for mut event in batch.events.clone() {
         if aggregator.process(&batch.resource, &mut event) {
             forwarded.push(event);

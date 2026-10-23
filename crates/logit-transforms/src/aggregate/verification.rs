@@ -473,6 +473,7 @@ proptest! {
             match op {
                 Op::Batch(r, s, n) => {
                     agg.observe_scope(scopes[s].clone());
+                    agg.begin_batch(&resources[r]);
                     for _ in 0..n {
                         let mut event = Event::metric(
                             now,
@@ -832,28 +833,35 @@ fn record_spec() -> impl Strategy<Value = RecordSpec> {
 }
 
 /// Attribute sets an event draws from: two distinct series keys, a `NaN` one, one per
-/// source-timestamp carrier, and an APM stats group's marker.
+/// `_logit.metrics.closed` reason, and every protocol carrier with no flag, which is an ordinary
+/// series key.
 fn event_attributes(i: usize) -> AttrMap {
     let mut attrs = AttrMap::new();
     match i {
         0 => {}
         1 => attrs.insert("k0", Value::Str(Bytes::from_static(b"a"))),
         2 => attrs.insert("k0", Value::F64(f64::NAN)),
-        3 => attrs.insert("_logit.statsd.timestamp", Value::U64(1)),
-        4 => attrs.insert("_logit.prometheus.timestamp", Value::Bool(true)),
-        _ => attrs.insert("_logit.datadog.stats.name", Value::str("web.request")),
+        3 => attrs.insert("_logit.metrics.closed", Value::str("timestamped")),
+        4 => attrs.insert("_logit.metrics.closed", Value::Bool(true)),
+        5 => attrs.insert("_logit.metrics.closed", Value::str("bucketed")),
+        _ => {
+            attrs.insert("_logit.statsd.timestamp", Value::U64(1));
+            attrs.insert("_logit.prometheus.timestamp", Value::Bool(true));
+            attrs.insert("_logit.datadog.stats.name", Value::str("web.request"));
+        }
     }
     attrs
 }
 
-/// Whether `event_attributes(i)` carries a source timestamp: the ADR's carriers, restated.
-fn timestamped(i: usize) -> bool {
-    i == 3 || i == 4
-}
-
-/// Whether `event_attributes(i)` marks a Datadog APM stats group.
-fn bucketed(i: usize) -> bool {
-    i == 5
+/// The `passed_through` reason `event_attributes(i)`'s flag gives, restating ADR `metric-flags`'s
+/// "The flags": `None` when the event isn't flagged closed.
+fn closed_reason(i: usize) -> Option<&'static str> {
+    match i {
+        3 => Some("timestamped"),
+        4 => Some("flagged"),
+        5 => Some("bucketed"),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -887,8 +895,8 @@ fn event_spec() -> impl Strategy<Value = EventSpec> {
     (
         // 1000 runs ahead of every flush clock a run reaches, for the start-time clamp.
         prop_oneof![1 => Just(i64::MIN), 6 => 0..=5i64, 1 => Just(1_000)],
-        // The two carrier sets are rarer, so most events still reach a series.
-        prop_oneof![6 => 0..3usize, 1 => 3..6usize],
+        // The flagged and carrier sets are rarer, so most events still reach a series.
+        prop_oneof![6 => 0..3usize, 1 => 3..6usize, 1 => Just(6usize)],
         prop::collection::vec(record_spec(), 0..=3),
         prop::bool::weighted(0.2),
     )
@@ -1179,11 +1187,8 @@ impl Model {
         spec: &RecordSpec,
     ) -> Fate {
         let kind = spec.kind.build();
-        if bucketed(event.attributes) {
-            return Fate::Passed("bucketed");
-        }
-        if timestamped(event.attributes) {
-            return Fate::Passed("timestamped");
+        if let Some(reason) = closed_reason(event.attributes) {
+            return Fate::Passed(reason);
         }
         if spec.no_recorded_value {
             return Fate::Passed("no_recorded_value");
@@ -1623,9 +1628,10 @@ fn telemetry_gauge(events: &[Event], name: &str) -> Option<f64> {
 }
 
 /// Tag values the tagged counters are read under.
-const TAG_VALUES: [&str; 10] = [
+const TAG_VALUES: [&str; 11] = [
     "bucketed",
     "timestamped",
+    "flagged",
     "no_recorded_value",
     "no_merge_rule",
     "kind_conflict",
@@ -1676,6 +1682,7 @@ fn run_model(config: ModelConfig, ops: &[ModelOp]) -> Result<(), TestCaseError> 
             ModelOp::Batch { resource, scope, context: ctx, events } => {
                 agg.observe_scope(scopes[*scope].clone());
                 agg.observe_batch_context(context(*ctx));
+                agg.begin_batch(&resources[*resource]);
                 for spec in events {
                     metrics_in += spec.records.len() as u64;
                     let original = spec.build();

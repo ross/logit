@@ -440,6 +440,7 @@ async fn statsd_through_cumulative_aggregate_writes_a_cumulative_counter_over_th
             .expect("the Fanout channel should not have closed");
         let batch = logit_pipeline::unwrap_batch(delivered);
         let resource = batch.resource.clone();
+        aggregator.begin_batch(&resource);
         for mut event in batch.events {
             absorbed_events += 1;
             let forwarded = aggregator.process(&resource, &mut event);
