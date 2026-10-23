@@ -1,2 +1,2 @@
 wire: service-check.statsd
-exercises: [service_check, tags, timestamp_T]
+exercises: [service_check, tags, timestamp_T, host]

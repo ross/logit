@@ -1,4 +1,5 @@
-# A DogStatsD `host.name:` tag with no `host:` tag, one beside a `host:` tag, and an event whose
-# `h:` field is empty, which the Agent reads as no host.
+# A DogStatsD `host.name:` tag with no `host:` tag, one beside a `host:` tag, an event whose
+# `h:` field is empty, which the Agent reads as no host, an empty `host:` tag, the hostless mark,
+# and an event and a service check whose `host:` tag is their host.
 wire: host-name-tag.statsd
-exercises: [counter, tags, tags_host_name, event]
+exercises: [counter, tags, tags_host_name, host, hostless, event, service_check]

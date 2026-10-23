@@ -4,7 +4,6 @@
     {"sink":"statsd_out","row":"attributes/bool_value","cell":0,"observed":["lost"]},
     {"sink":"statsd_out","row":"attributes/bytes_value","cell":0,"observed":["lost"]},
     {"sink":"statsd_out","row":"attributes/foreign_carrier","cell":0,"observed":["lost"]},
-    {"sink":"statsd_out","row":"attributes/host_beside_host_name","cell":0,"observed":["lost"]},
     {"sink":"statsd_out","row":"attributes/map_value","cell":0,"observed":["lost"]},
     {"sink":"statsd_out","row":"attributes/no_host","cell":0,"observed":["exact"]},
     {"sink":"statsd_out","row":"attributes/number_value","cell":0,"observed":["lost"]},

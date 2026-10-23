@@ -1991,8 +1991,9 @@ rows:
           text: >-
             A DogStatsD `key:value` tag. Each `:`, `|`, `@`, `#`, `,`, control, and whitespace
             character in the key, and each but `:` in the value, is written as `_`, counted once per
-            wire tag as `name_sanitized` for a key and `value_sanitized` for a value. A non-empty
-            `host.name` is the `host:` tag, which statsd_in reads back as `host`.
+            wire tag as `name_sanitized` for a key and `value_sanitized` for a value. A `host` on a
+            line with no host of its own is its `host:` tag, which statsd_in reads back as
+            `host.name`.
       prometheus_out:
         class: normalized
         reason: label_sanitized
@@ -2010,14 +2011,10 @@ rows:
           A tag. A value holding a line break, ending in `\`, or with `\` before a space has no
           spelling and is left off, counted.
       datadog_out:
-        class: normalized
-        reason: host_tag
+        class: exact
         text: >-
-          A `key:value` tag. A `host` attribute on a metric with no `host.name` is the host and not
-          a tag, which datadog_in reads back as `host.name`. On a Datadog event or service check,
-          `host.name`, else a non-empty host carrier, else `host`, is the host and not a tag, which
-          datadog_in reads back as that carrier. A `host.name` on a log is the log's `hostname`,
-          which datadog_in reads back as `hostname`.
+          A `key:value` tag, `host` included. `host.name` is the record's host, which datadog_in
+          reads back as `host.name` on every route.
       graphite_out:
         - when: {tags: drop}
           class: lost
@@ -2043,8 +2040,9 @@ rows:
         - class: lost
           counter: logit.output.tags.omitted{reason=unrepresentable}
           text: >-
-            A non-empty `host.name` is the line's `host:` tag, so a `host` beside it, a second
-            `host:` tag the Agent would consume, is left off, counted once per wire tag.
+            A non-empty `host.name` or the hostless mark is the line's own host, so a `host`
+            beside it, a second `host:` tag the Agent would consume, is left off, counted once per
+            wire tag.
       prometheus_out:
         class: exact
         text: A `host` label, read back as `host`.
@@ -2059,9 +2057,7 @@ rows:
           spelling and is left off, counted.
       datadog_out:
         class: exact
-        text: >-
-          `host.name` is the host, so `host` is an ordinary `host:` tag, which datadog_in reads
-          back as `host`.
+        text: A `host:` tag, which datadog_in reads back as `host`.
       graphite_out:
         - when: {tags: drop}
           class: lost
@@ -2078,7 +2074,7 @@ rows:
   # statsd_out, prometheus_out, influxdb_out, and graphite_out don't write a log on an event with
   # no metrics, so its fields are never compared there and none of them has a cell.
   - kind: attributes
-    feature: hostname_beside_host_name
+    feature: hostname
     cells:
       otlp_out:
         class: exact
@@ -2087,8 +2083,8 @@ rows:
         class: lost
         counter: logit.output.tags.omitted{reason=reserved_key}
         text: >-
-          `host.name` is the log's `hostname`, so a `hostname` attribute beside it has no key of
-          its own on the wire and is left off, counted.
+          A log's `hostname` is `host.name`, so a `hostname` attribute has no key of its own on
+          the wire and is left off, counted.
   - kind: attributes
     feature: bool_value
     cells:
@@ -2368,7 +2364,8 @@ rows:
           A `_logit.datadog.*` carrier rides in its own wire field; one the route has no field for
           is left off, counted. `_logit.datadog.units`, which marks a decoded batch's units as
           Datadog names, is read and not written; datadog_in stamps it again on every series
-          batch.
+          batch. The v2 series route writes `_logit.datadog.hostless` as a `host` resource with no
+          name, which datadog_in reads into `_logit.datadog.resources`.
   - kind: attributes
     feature: prometheus_target
     cells:
@@ -2410,11 +2407,11 @@ rows:
         reason: structural
         text: >-
           Another protocol's `_logit.` carrier is private and isn't a tag, so it's left off. Under
-          `format: dogstatsd`, `_logit.datadog.hostless` on a record with no `host`, no non-empty
-          `host.name`, and no non-empty `h:` field is an empty `host:` tag, which statsd_in reads
-          back as an empty `host`. A `_logit.metrics.*` flag is left off too; the `timestamped`,
-          `rate`, `family_type`, and `interval` rows have `_logit.metrics.closed: timestamped`,
-          `_logit.metrics.type`, and `_logit.metrics.interval`.
+          `format: dogstatsd`, `_logit.datadog.hostless` on a record with no non-empty `host.name`
+          is an empty `host:` tag, which statsd_in reads back as the mark. A `_logit.metrics.*`
+          flag is left off too; the `timestamped`, `rate`, `family_type`, and `interval` rows have
+          `_logit.metrics.closed: timestamped`, `_logit.metrics.type`, and
+          `_logit.metrics.interval`.
       prometheus_out:
         class: lost
         reason: structural
@@ -2876,8 +2873,7 @@ rows:
         reason: default_host
         text: >-
           A record with no host and no hostless mark leaves with the process hostname as its host,
-          which datadog_in reads back as `host.name`, a log's `hostname`, or an event's or service
-          check's host carrier; a span keeps its own hostnames.
+          which datadog_in reads back as `host.name`; a span keeps its own hostnames.
       graphite_out:
         class: exact
         text: A record with no host leaves with none.

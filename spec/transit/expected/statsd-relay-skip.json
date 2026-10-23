@@ -26,7 +26,7 @@
   }},
   "event": {"events": [
     {"timestamp":"2027-01-15T08:00:01.000000000Z","log":{"format":"raw","message":"abc"},"attributes":{"_logit.statsd.event.title":"Plain"}},
-    {"timestamp":"2027-01-15T08:00:01.000000000Z","log":{"severity":"warn","format":"raw","message":"first\nline"},"attributes":{"_logit.statsd.event.aggregation_key":"deploy","_logit.statsd.event.alert_type":"warning","_logit.statsd.event.host":"web-07","_logit.statsd.event.priority":"low","_logit.statsd.event.source_type":"ci","_logit.statsd.event.title":"Hello","env":"prod"}}
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","log":{"severity":"warn","format":"raw","message":"first\nline"},"attributes":{"_logit.statsd.event.aggregation_key":"deploy","_logit.statsd.event.alert_type":"warning","_logit.statsd.event.priority":"low","_logit.statsd.event.source_type":"ci","_logit.statsd.event.title":"Hello","env":"prod","host.name":"web-07"}}
   ], "counters": {}},
   "flagged-histogram": {"events": [], "counters": {
     "logit.output.messages.skipped{component=out,kind=statsd_out,reason=no_recorded_value,role=sink}": 1
@@ -45,24 +45,25 @@
     "logit.output.messages.dropped{component=out,kind=statsd_out,reason=unresolved_gauge_delta,role=sink}": 3
   }},
   "host-name-tag": {"events": [
-    {"timestamp":"2027-01-15T08:00:01.000000000Z","log":{"format":"raw","message":"v2.1"},"attributes":{"_logit.statsd.event.host":"","_logit.statsd.event.title":"deploy","host":"web-1"}},
-    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"requests","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"env":"prod","host":"web-1"}},
-    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"requests.tagged","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"host":"web-1"}}
-  ], "counters": {
-    "logit.output.tags.omitted{component=out,kind=statsd_out,reason=unrepresentable,role=sink}": 1
-  }},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","log":{"format":"raw","message":"v2.1"},"attributes":{"_logit.statsd.event.title":"deploy","host.name":"web-1"}},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","log":{"format":"raw","message":"v2.2"},"attributes":{"_logit.statsd.event.title":"deploy","host.name":"web-3"}},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"db.up","kind":"gauge","value":0.0}],"attributes":{"_logit.statsd.service_check.name":"db.up","_logit.statsd.service_check.status":0,"host.name":"web-4"},"types":{"/attributes/_logit.statsd.service_check.status":"u64"}},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"requests","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"env":"prod","host.name":"web-1"}},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"requests.hostless","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"_logit.datadog.hostless":true,"env":"prod"}},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"requests.tagged","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"host.name":"web-2"}}
+  ], "counters": {}},
   "interop-dogstatsd-buffered": {"events": [
-    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app.db.query.duration_ms","kind":"samples","values":[0.33313615206930347],"sample_rate":1.0}],"attributes":{"_logit.statsd.container_id":"in-82046","_logit.statsd.type":"ms","db":"primary","env":"prod","host":"web-07","query":"select_user","region":"us-east-1","service":"checkout-api"}},
-    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app.http.request.duration_ms","kind":"samples","values":[0.05],"sample_rate":1.0}],"attributes":{"_logit.statsd.container_id":"in-82046","_logit.statsd.type":"h","endpoint":"/api/v1/orders","env":"prod","host":"web-07","region":"us-east-1","service":"checkout-api","status":"200"}},
-    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app.http.request.duration_ms","kind":"samples","values":[23.483176616760144],"sample_rate":1.0}],"attributes":{"_logit.statsd.container_id":"in-82046","_logit.statsd.type":"h","endpoint":"/healthz","env":"prod","host":"web-07","region":"us-east-1","service":"checkout-api","status":"200"}},
-    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app.http.requests.count","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"_logit.statsd.container_id":"in-82046","endpoint":"/api/v1/orders","env":"prod","host":"web-07","region":"us-east-1","service":"checkout-api","status":"200"}},
-    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app.http.requests.count","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"_logit.statsd.container_id":"in-82046","endpoint":"/healthz","env":"prod","host":"web-07","region":"us-east-1","service":"checkout-api","status":"200"}},
-    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app.http.response.size_bytes","kind":"samples","values":[60196.0],"sample_rate":1.0}],"attributes":{"_logit.statsd.container_id":"in-82046","_logit.statsd.type":"d","endpoint":"/api/v1/orders","env":"prod","host":"web-07","region":"us-east-1","service":"checkout-api","status":"200"}},
-    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app.render.calls.count","kind":"sum","value":2.0,"temporality":"delta","monotonic":true}],"attributes":{"_logit.statsd.container_id":"in-82046","endpoint":"/api/v1/orders","env":"prod","host":"web-07","region":"us-east-1","service":"checkout-api","status":"200"}},
-    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app.users.active","kind":"set_members","members":["2665"]}],"attributes":{"_logit.statsd.container_id":"in-82046","env":"prod","host":"web-07","region":"us-east-1","service":"checkout-api"}},
-    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app.worker.queue.depth","kind":"gauge","value":110.0}],"attributes":{"_logit.statsd.container_id":"in-82046","env":"prod","host":"web-07","queue":"email","region":"us-east-1","service":"checkout-api"}},
-    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app.worker.queue.depth","kind":"gauge","value":210.0}],"attributes":{"_logit.statsd.container_id":"in-82046","env":"prod","host":"web-07","queue":"reindex","region":"us-east-1","service":"checkout-api"}},
-    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app.worker.queue.depth","kind":"gauge","value":90.0}],"attributes":{"_logit.statsd.container_id":"in-82046","env":"prod","host":"web-07","queue":"webhooks","region":"us-east-1","service":"checkout-api"}}
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app.db.query.duration_ms","kind":"samples","values":[0.33313615206930347],"sample_rate":1.0}],"attributes":{"_logit.statsd.container_id":"in-82046","_logit.statsd.type":"ms","db":"primary","env":"prod","host.name":"web-07","query":"select_user","region":"us-east-1","service":"checkout-api"}},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app.http.request.duration_ms","kind":"samples","values":[0.05],"sample_rate":1.0}],"attributes":{"_logit.statsd.container_id":"in-82046","_logit.statsd.type":"h","endpoint":"/api/v1/orders","env":"prod","host.name":"web-07","region":"us-east-1","service":"checkout-api","status":"200"}},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app.http.request.duration_ms","kind":"samples","values":[23.483176616760144],"sample_rate":1.0}],"attributes":{"_logit.statsd.container_id":"in-82046","_logit.statsd.type":"h","endpoint":"/healthz","env":"prod","host.name":"web-07","region":"us-east-1","service":"checkout-api","status":"200"}},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app.http.requests.count","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"_logit.statsd.container_id":"in-82046","endpoint":"/api/v1/orders","env":"prod","host.name":"web-07","region":"us-east-1","service":"checkout-api","status":"200"}},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app.http.requests.count","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"_logit.statsd.container_id":"in-82046","endpoint":"/healthz","env":"prod","host.name":"web-07","region":"us-east-1","service":"checkout-api","status":"200"}},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app.http.response.size_bytes","kind":"samples","values":[60196.0],"sample_rate":1.0}],"attributes":{"_logit.statsd.container_id":"in-82046","_logit.statsd.type":"d","endpoint":"/api/v1/orders","env":"prod","host.name":"web-07","region":"us-east-1","service":"checkout-api","status":"200"}},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app.render.calls.count","kind":"sum","value":2.0,"temporality":"delta","monotonic":true}],"attributes":{"_logit.statsd.container_id":"in-82046","endpoint":"/api/v1/orders","env":"prod","host.name":"web-07","region":"us-east-1","service":"checkout-api","status":"200"}},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app.users.active","kind":"set_members","members":["2665"]}],"attributes":{"_logit.statsd.container_id":"in-82046","env":"prod","host.name":"web-07","region":"us-east-1","service":"checkout-api"}},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app.worker.queue.depth","kind":"gauge","value":110.0}],"attributes":{"_logit.statsd.container_id":"in-82046","env":"prod","host.name":"web-07","queue":"email","region":"us-east-1","service":"checkout-api"}},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app.worker.queue.depth","kind":"gauge","value":210.0}],"attributes":{"_logit.statsd.container_id":"in-82046","env":"prod","host.name":"web-07","queue":"reindex","region":"us-east-1","service":"checkout-api"}},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app.worker.queue.depth","kind":"gauge","value":90.0}],"attributes":{"_logit.statsd.container_id":"in-82046","env":"prod","host.name":"web-07","queue":"webhooks","region":"us-east-1","service":"checkout-api"}}
   ], "counters": {}},
   "interop-plain-pipeline": {"events": [
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app.checkout_api.web_07.us_east_1.cache.lookups","kind":"sum","value":10.0,"temporality":"delta","monotonic":true}]},
@@ -113,14 +114,14 @@
     "logit.output.metrics.normalized{component=out,kind=statsd_out,reason=name_sanitized,role=sink}": 2
   }},
   "record-fields": {"events": [
-    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"cpu.usage","kind":"gauge","value":0.5}],"attributes":{"host":"web-07"}},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"cpu.usage","kind":"gauge","value":0.5}],"attributes":{"host.name":"web-07"}},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"hits","kind":"sum","value":4.0,"temporality":"delta","monotonic":true}]},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"request.duration","kind":"gauge","value":0.25}],"attributes":{"service.name":"checkout"}}
   ], "counters": {
     "logit.output.messages.skipped{component=out,kind=statsd_out,reason=no_recorded_value,role=sink}": 1
   }},
   "service-check": {"events": [
-    {"timestamp":"2027-01-15T07:59:30.000000000Z","metrics":[{"name":"db.up","kind":"gauge","value":0.0}],"attributes":{"_logit.metrics.closed":"timestamped","_logit.statsd.service_check.host":"web-07","_logit.statsd.service_check.message":"all good","_logit.statsd.service_check.name":"db.up","_logit.statsd.service_check.status":0,"env":"prod"},"types":{"/attributes/_logit.statsd.service_check.status":"u64"}},
+    {"timestamp":"2027-01-15T07:59:30.000000000Z","metrics":[{"name":"db.up","kind":"gauge","value":0.0}],"attributes":{"_logit.metrics.closed":"timestamped","_logit.statsd.service_check.message":"all good","_logit.statsd.service_check.name":"db.up","_logit.statsd.service_check.status":0,"env":"prod","host.name":"web-07"},"types":{"/attributes/_logit.statsd.service_check.status":"u64"}},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"cache.up","kind":"gauge","value":2.0}],"attributes":{"_logit.statsd.service_check.message":"down","_logit.statsd.service_check.name":"cache.up","_logit.statsd.service_check.status":2},"types":{"/attributes/_logit.statsd.service_check.status":"u64"}}
   ], "counters": {}},
   "set": {"events": [

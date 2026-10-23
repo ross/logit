@@ -119,8 +119,8 @@ rows name a shape one sink treats apart, and every sink that compares the record
 rate below 1 that rounds to weight 1), `span/no_wire_form` (a span field a Datadog span has no
 form for), `attributes/datadog_carrier_log` (a `_logit.datadog.*` carrier on a log, a Datadog
 event, or a service check), `attributes/host_beside_host_name` (a `host` attribute beside a
-non-empty string `host.name`) and `attributes/hostname_beside_host_name` (a log's `hostname`
-beside a `host.name` other than an empty string), each a host form the `host.name` outranks, and
+non-empty string `host.name` or the hostless mark, which `statsd_out` leaves off) and
+`attributes/hostname` (a log's `hostname` attribute, which `datadog_out` leaves off), and
 the attributes `datadog_out` writes from a record's own fields,
 `attributes/no_host`, `log_status`, `span_kind`, and `trace_id_high`. A flagged record's `no_recorded_value` row goes ahead of its kind's counted
 loss where that loss's counter didn't move, since most sinks test the flag first
@@ -163,10 +163,10 @@ records that reach it, and doesn't fail. The table's kinds, features, and rules 
 ## The class check
 
 For each flow and case, the check pairs every record that reached the sink with the records read
-back, reading names, attribute keys, and values as that sink writes them (`statsd_out`'s
-`host.name` and hostless mark read back as the DogStatsD `host`, `prometheus_out`'s
+back, reading names, attribute keys, and values as that sink writes them (`statsd_out`'s `host`
+attribute read back as `host.name`, `prometheus_out`'s
 sanitized names and `_total`, `influxdb_out`'s `<name>.value` field, `otlp_out`'s integer
-timestamps and an OpenMetrics `info` or `stateset` gauge read back as a non-monotonic sum, `datadog_out`'s `host` tag read back as `host.name` and the attributes it writes from a
+timestamps and an OpenMetrics `info` or `stateset` gauge read back as a non-monotonic sum, `datadog_out`'s hostless mark read back as a v2 `host` resource with no name, and the attributes it writes from a
 record's own fields), then compares what it observed with the table. A record that pairs only by
 name, in any metric kind (its own included) or as a dotted expansion, reads `degraded`. When both
 sides are histograms, that pairing also needs the same total count, and the same sum where both

@@ -11,7 +11,7 @@
     {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"load.load.2","kind":"gauge","value":0.75}],"attributes":{"host.name":"logit-fixture"},"resource":{"attributes":{"_logit.datadog.units":"datadog"}}}
   ], "counters": {}},
   "notification": {"events": [
-    {"timestamp":"2026-09-12T20:55:07.895000000Z","log":{"severity":"error","format":"raw","message":"Host logit-fixture, plugin load type load: Data source \"shortterm\" is currently 1.089844. That is above the failure threshold of 0.000000."},"attributes":{"hostname":"logit-fixture","status":"error"}}
+    {"timestamp":"2026-09-12T20:55:07.895000000Z","log":{"severity":"error","format":"raw","message":"Host logit-fixture, plugin load type load: Data source \"shortterm\" is currently 1.089844. That is above the failure threshold of 0.000000."},"attributes":{"host.name":"logit-fixture","status":"error"}}
   ], "counters": {}},
   "types-db": {"events": [
     {"timestamp":"2026-09-12T18:22:53.000000000Z","metrics":[{"name":"interface.if_dropped.rx","kind":"gauge","value":0.0}],"attributes":{"collectd.plugin_instance":"eth0","host.name":"logit-fixture"},"resource":{"attributes":{"_logit.datadog.units":"datadog"}}},

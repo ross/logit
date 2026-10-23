@@ -1,2 +1,2 @@
 wire: event.statsd
-exercises: [event, tags]
+exercises: [event, tags, host]

@@ -11,7 +11,7 @@
     {"timestamp":"2026-09-21T14:13:20.000000000Z","metrics":[{"name":"record.batch.lag","kind":"gauge","value":2.5}],"attributes":{"env":"record","host.name":"record-fixtures","service":"record-fixtures","team":"obs","version":"1.2.3"}}
   ], "counters": {}},
   "agent-service-check": {"events": [
-    {"timestamp":"2026-09-24T22:41:05.000000000Z","metrics":[{"name":"datadog.agent.up","kind":"gauge","value":0.0}]}
+    {"timestamp":"2026-09-24T22:41:05.000000000Z","metrics":[{"name":"datadog.agent.up","kind":"gauge","value":0.0}],"attributes":{"host.name":"record-fixtures"}}
   ], "counters": {}},
   "agent-sketches": {"events": [], "counters": {
     "logit.output.metrics.skipped{component=out,kind=graphite_out,metric_kind=distribution,role=sink}": 1
@@ -50,6 +50,6 @@
     "logit.output.metrics.degraded{component=out,kind=graphite_out,metric_kind=monotonic_delta_sum,role=sink}": 1
   }},
   "service-check-carrier": {"events": [
-    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"app.ready","kind":"gauge","value":0.0}]}
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"app.ready","kind":"gauge","value":0.0}],"attributes":{"host.name":"web-07"}}
   ], "counters": {}}
 }

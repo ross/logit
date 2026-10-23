@@ -29,10 +29,19 @@
   text: >-
     A tag key or value holding a space, `@`, or another character the line grammar doesn't split
     a tag on, read as written.
+- name: host
+  text: >-
+    A `host:` tag, or an event's or service check's `h:` field, decoded to `host.name` as a
+    DogStatsD Agent reads it: a non-empty `h:` first, else the last `host:` tag, never a tag.
+- name: hostless
+  text: >-
+    An empty `host:` tag, the Agent's hostless sample, decoded to the `_logit.datadog.hostless`
+    mark.
 - name: tags_host_name
   text: >-
-    A `host.name:` tag, which a DogStatsD Agent stores as an ordinary tag beside the host it takes
-    from a `host:` tag or stamps itself.
+    A `host.name:` tag: beside the line's own host it's omitted at decode and counted
+    `logit.input.tags.omitted{reason="reserved_key"}`, and on a line with no host of its own it's
+    `host.name`.
 - name: tags_repeated_key
   text: A tag key given more than once, folded into an array in wire order.
 - name: tags_duplicate
