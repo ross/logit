@@ -311,13 +311,14 @@ and codecs carry for them:
   [docs/design/data-model.md](docs/design/data-model.md)'s "Well-known attribute names" is the
   canonical statement). A decoder that needs another component to treat an event specially sets a
   `_logit.metrics.*` flag ([ADR `metric-flags`](docs/adr/metric-flags.md)): in place of a carrier
-  when the flag says the whole fact, as `statsd_in`'s and `prometheus_in`'s timestamps and
-  `datadog_in`'s rate and interval do, and
+  when the flag says the whole fact, as `statsd_in`'s and `prometheus_in`'s timestamps,
+  `prometheus_in`'s `info`, `stateset`, and `gaugehistogram` family types, and `datadog_in`'s
+  rate and interval do, and
   beside one only for a fact the flag doesn't carry
   ([ADR `protocol-knowledge-stays-in-family`](docs/adr/protocol-knowledge-stays-in-family.md)'s
   "Amendment: move, don't mirror (2026-10-23)"). A component outside a carrier's family doesn't
-  act on the carrier itself, apart from the two cross-family reads (C3 and C6) that ADR records
-  as debt.
+  act on the carrier itself, apart from the one cross-family read (C6) that ADR records as
+  debt.
 - **Model v2**: `Sum`/`Samples`/`SetMembers`/`ExponentialHistogram`, `SpanExt`, batch-level
   `Scope`, `MetricRecord.flags`.
 - **OTLP**: scope grouping, start time, description, exemplars, a `NO_RECORDED_VALUE` point
@@ -1150,7 +1151,7 @@ not a style preference:
   `buffer.disk:` spool). Everything else reads neutral `_logit.metrics.` and `_logit.field.` flags
   its creator set, public vocabulary, or its own config (provenance ids included); an exception needs
   its own ADR ([ADR `protocol-knowledge-stays-in-family`](docs/adr/protocol-knowledge-stays-in-family.md),
-  whose plan lists the two reads that break it today).
+  whose plan lists the one read that breaks it today).
 - **The wire encoding is decided: hand-rolled, shipped as `logit_proto::native`** — a four-arm
   bake-off (`crates/logit-bench/src/bakeoff/`) settled it against `rkyv`, `postcard`, and OTLP
   itself; see [ADR `native-wire-format-encoding`](docs/adr/native-wire-format-encoding.md) and

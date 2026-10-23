@@ -993,13 +993,27 @@ A gauge that holds a per-second rate over an interval is an increment, not a sta
 `_logit.metrics.type` to `"rate"` and `_logit.metrics.interval` to the interval in whole seconds:
 `dedup_timestamps` then sums two same-instant rates of one interval instead of keeping the later,
 `prometheus_out` counts a same-millisecond pair as loss, and `datadog_out` sends a `rate` series
-point with that `interval`. The flag applies to gauges only.
+point with that `interval`. A `"rate"` flag applies to gauges only.
 
 ```lua
 function process(event)
   -- Requests per second, averaged over the last 10 s.
   event.attributes["_logit.metrics.type"] = "rate"
   event.attributes["_logit.metrics.interval"] = 10
+  return event
+end
+```
+
+The same flag names the OpenMetrics shapes the model has no kind for: `"info"` on a gauge of `1`
+whose attributes are the payload, `"stateset"` on a gauge of `0` or `1` that is one state of a set,
+and `"gaugehistogram"` on a histogram of a quantity that can go down. `prometheus_out` writes each
+as that family's `# TYPE`, and `otlp_out` writes an info or stateset gauge as a non-monotonic sum,
+an info one named `<name>_info`, and skips a gauge histogram. A value on another kind is ignored.
+
+```lua
+function process(event)
+  -- A build-info gauge: `prometheus_out` exposes `# TYPE build info` and `build_info{...} 1`.
+  event.attributes["_logit.metrics.type"] = "info"
   return event
 end
 ```

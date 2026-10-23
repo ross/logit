@@ -94,20 +94,15 @@ crosses a family.
 
 ## Consequences
 
-- **Two cross-family reads are recorded debt**, each with a remedy in
-  [the in-family plan](../plans/protocol-knowledge-stays-in-family.md):
-  - C3: `otlp_out`, and `kafka_out`'s OTLP formats through the same encoder, read
-    `_logit.prometheus.type` to skip a `gaugehistogram` and to write `info` and `stateset` as a
-    non-monotonic `Sum`
-    ([ADR `prometheus-scrape-and-exposition`](prometheus-scrape-and-exposition.md)'s 2026-10-21
-    amendment).
-  - C6: `datadog_out` takes `collectd.host` as the host
-    ([ADR `process-hostname`](process-hostname.md)'s "Amendment: `datadog_out` reads
-    `collectd.host` (2026-10-22)").
-
-  `docs/known-gaps/runtime.md` lists them as one gap until the plan closes them. C1 and C2, the
-  Datadog rate carrier `dedup_timestamps` and `prometheus_out` read, are closed: both read the
-  neutral rate flag ("Amendment: move, don't mirror (2026-10-23)"'s "The next applications").
+- **One cross-family read is recorded debt**, with a remedy in
+  [the in-family plan](../plans/protocol-knowledge-stays-in-family.md): C6, `datadog_out` taking
+  `collectd.host` as the host
+  ([ADR `process-hostname`](process-hostname.md)'s "Amendment: `datadog_out` reads
+  `collectd.host` (2026-10-22)"). `docs/known-gaps/runtime.md` lists it until the plan closes
+  it. Three are closed, each by a neutral flag ("Amendment: move, don't mirror (2026-10-23)"):
+  C1 and C2, the Datadog rate carrier `dedup_timestamps` and `prometheus_out` read ("The next
+  applications"), and C3, the Prometheus family-type carrier `otlp_out` read ("The third
+  application").
 - **Four reads are in family and allowed:** C4, `statsd_out` writing an empty DogStatsD `host:` tag
   for `_logit.datadog.hostless`; C5, `datadog_out` and `statsd_out` reading the
   `_logit.statsd.event.*` and `_logit.statsd.service_check.*` carriers `statsd_in` and
@@ -190,3 +185,28 @@ and `_logit.datadog.type` keeps only `unspecified`, the one value with no neutra
 - **A retired carrier says nothing.** A `Gauge` carrying only `_logit.datadog.type: rate` and
   `_logit.datadog.interval` is a state at `dedup_timestamps` and `prometheus_out`, and leaves
   `datadog_out` as a `gauge` with no interval.
+
+### The third application: the Prometheus family types
+
+[The in-family plan](../plans/protocol-knowledge-stays-in-family.md)'s C3 remedy takes the same
+form. `prometheus_in` writes `_logit.metrics.type: info`, `stateset`, or `gaugehistogram` for
+those three OpenMetrics family types, instead of `_logit.prometheus.type`, and
+`_logit.prometheus.type` keeps only `untyped` and `unknown`: "the family declared no type" has
+no neutral meaning. No event carries both keys. An attribute, not a field on `MetricRecord`, so
+`Event` doesn't grow and Lua and `set` can write it
+([ADR `metric-flags`](metric-flags.md)'s "The flags" defines the values).
+
+- **`otlp_out`**, and `kafka_out`'s OTLP formats through the same encoder, read the flag through
+  `logit_core::attrs::metric_type` and import nothing from `logit_proto::prometheus`: a
+  `Histogram` flagged `gaugehistogram` is skipped, counted, and a `Gauge` flagged `info` or
+  `stateset` is a cumulative non-monotonic `Sum`, `info` named `<name>_info`
+  ([ADR `prometheus-scrape-and-exposition`](prometheus-scrape-and-exposition.md)'s "Amendment
+  (2026-10-23): the family types are a neutral flag").
+- **`prometheus_out`** reads the flag for the three types and its own carrier for `untyped` and
+  `unknown`, so an info or stateset gauge a Lua script or a `set` flags exposes with its
+  `# TYPE` line.
+- **Each reader keeps its kind rule.** `info` and `stateset` act on a `Gauge` and
+  `gaugehistogram` on a `Histogram`; a value on another kind is ignored.
+- **A retired value says nothing.** A record carrying only `_logit.prometheus.type: info`,
+  `stateset`, or `gaugehistogram` is an ordinary gauge or histogram at `otlp_out` and
+  `prometheus_out`.

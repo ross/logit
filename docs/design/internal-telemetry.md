@@ -2323,8 +2323,9 @@ under one component id, as for `collectd_out`. The sink adds only what a socket 
   or `-Inf` bound, whose count joins a neighboring bucket, once per record,
   `logit.output.metrics.skipped{metric_kind="set_members"|"set"|"gauge_histogram"}`, each with a
   throttled diagnostic (`otlp_set_members_metric_skipped`, `otlp_set_metric_skipped`,
-  `otlp_gauge_histogram_skipped`), the last for an OpenMetrics `gaugehistogram`, which the OTel
-  Prometheus compatibility spec drops, and
+  `otlp_gauge_histogram_skipped`), the last for a histogram flagged
+  `_logit.metrics.type: "gaugehistogram"`, as `prometheus_in` decodes an OpenMetrics
+  `gaugehistogram`, which the OTel Prometheus compatibility spec drops, and
   `logit.output.metrics.dropped{reason="unresolved_gauge_delta"}` for a relative gauge no
   `aggregate` resolved, with the shared `gauge_delta_unresolved` diagnostic, and
   `logit.output.metrics.dropped{reason="unresolved_delta"}` for a delta `Summary`, which OTLP

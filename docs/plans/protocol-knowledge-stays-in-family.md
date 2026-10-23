@@ -11,7 +11,7 @@ updated: 2026-10-23
 that a component keys behavior on another component's internals only within a lossless family.
 Outside one, it reads neutral meaning segments, public vocabulary, or its own config. Four
 production reads broke that rule when the ADR landed. This plan lists each one with its remedy, so
-a later session can pick one up without redoing the survey. C1 and C2 are done; C3 and C6 remain.
+a later session can pick one up without redoing the survey. C1, C2, and C3 are done; C6 remains.
 
 None of this is scheduled. Each section is a future workstream with its own stream key, picked
 when the work starts.
@@ -97,7 +97,9 @@ regression test (a `_logit.datadog.type: rate` with no neutral key is a state), 
 
 ## C3: `_logit.prometheus.type` in `otlp_out` and `kafka_out`
 
-**Future workstream, not scheduled.**
+**Done** in `carry/w3` (PR #PRNUM), as the remedy below describes. The open design questions
+were settled: an attribute, `_logit.metrics.type`, not a model field; `prometheus_out` reads it
+too; and no other sink honors it. The section below records the reads as they were.
 
 **What reads what.** `prometheus_in` stamps `_logit.prometheus.type` on a `gaugehistogram`,
 `info`, `stateset`, `untyped`, or `unknown` family. `prometheus_out` reads it as its own carrier.
