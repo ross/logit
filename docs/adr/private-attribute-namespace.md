@@ -1,6 +1,6 @@
 ---
 created: 2026-10-13
-updated: 2026-10-22
+updated: 2026-10-23
 ---
 
 # Private attribute namespace: protocol carriers live under `_logit.<protocol>.`, and every other protocol's sink ignores them
@@ -10,7 +10,8 @@ Accepted. On 2026-10-19, [ADR `influxdb-line-protocol-relay`](influxdb-line-prot
 "Amendment: string fields are private (2026-10-19)" moved InfluxDB string fields from the public
 `influxdb.field.<key>` to `_logit.influxdb.field.<key>`; the lists below are amended to match. On 2026-10-22, "Amendment: a segment that names the key's
 meaning (2026-10-22)" moved that key to the protocol-free `_logit.field.<key>`, which the lists
-below don't cover.
+below don't cover. On 2026-10-23, "Amendment: reading a private key is in-family (2026-10-23)"
+narrowed "Any component may read the private namespace" to visibility, rewritten below to match.
 
 ## Context
 
@@ -117,11 +118,10 @@ rule as `otlp_out` does.
 
 ### Any component may read the private namespace
 
-The ignore rule governs generic rendering only. Any component, sinks included, may read any
-private key for information another protocol left there. `datadog_out` reading the statsd event
-carriers (`_logit.statsd.event.*`) to send a DogStatsD event to Datadog's events API is the
-standing example, and `collectd_out` could read `_logit.prometheus.type`. This is a permission, not a mandate: nothing requires a
-component to look.
+The ignore rule governs generic rendering only. No component is kept from seeing a private key:
+Lua, `set`, `keep`, `route`, and the whole-event renders above see every one. Keying behavior on
+another component's carrier is narrower, and is allowed only within a lossless family ("Amendment:
+reading a private key is in-family (2026-10-23)").
 
 ### Transforms
 
@@ -221,3 +221,19 @@ such as `aggregate` acts on it instead of on a protocol carrier. `_logit.metrics
 [ADR `metric-flags`](metric-flags.md)'s "The flags". The ignore rule covers them like any private
 key, so no protocol sink renders a flag, and `keep` under its default `private: drop` strips them.
 The constants live in `logit_core::attrs` beside `PRIVATE_PREFIX` and `FIELD_PREFIX`.
+
+## Amendment: reading a private key is in-family (2026-10-23)
+
+"Any component may read the private namespace" meant that the keys aren't protected or hidden:
+Lua, `set`, `keep`, `route`, and a whole-event render see every private key. It didn't mean that a
+component may drive logic off another protocol's carrier, and its two examples read as if it did.
+
+[ADR `protocol-knowledge-stays-in-family`](protocol-knowledge-stays-in-family.md) states the rule.
+A component keys behavior on another component's carriers only within a lossless family: one
+like-protocol pair, or the Datadog family of DogStatsD (`statsd_in`, `statsd_out`), `datadog_in`
+and `datadog_out`, and `datadog_trace_in` and `datadog_trace_out`. `datadog_out` reading the
+`_logit.statsd.event.*` carriers that `statsd_in` and `datadog_in` both write is in family.
+Outside a family, a component reads the neutral segments (`_logit.metrics.`, `_logit.field.`),
+public vocabulary, and its own config. `collectd_out` reading `_logit.prometheus.type` would be
+outside one, and the reads of that kind that exist today are listed as debt in
+[the in-family plan](../plans/protocol-knowledge-stays-in-family.md).

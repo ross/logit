@@ -122,9 +122,14 @@ private, which stay public, and why. The prefix has one definition,
 - **Whole-event renders carry everything**, private keys included. The
   [private-namespace ADR](../adr/private-attribute-namespace.md#the-ignore-rule)'s "The ignore
   rule" lists them, and the `kafka_out` formats that follow the rule instead.
-- **Any component may read any private key**, sinks included, for information another protocol
-  left there: `datadog_out` reads `_logit.statsd.event.*` to send a DogStatsD event to Datadog's
-  events API. The ignore rule governs generic rendering only.
+- **Every component can see a private key; only a family keys behavior on one.** Lua, `set`,
+  `keep`, `route`, and whole-event renders see every private key, and the ignore rule governs
+  generic rendering only. A component acts on another component's carrier only within a lossless
+  family: a like-protocol pair, or the Datadog family of DogStatsD, `datadog`, and
+  `datadog_trace`, where `datadog_out` reads `_logit.statsd.event.*` to send a DogStatsD event to
+  Datadog's events API. Outside a family it reads the neutral segments below, public vocabulary,
+  and its own config
+  ([ADR `protocol-knowledge-stays-in-family`](../adr/protocol-knowledge-stays-in-family.md)).
 - **`keep` drops private keys** like any key not in `fields`, unless `private: keep`, which
   retains the whole namespace. **`flatten`'s `all`** never selects a private key; a named one still
   flattens. **`aggregate`** keys series on private keys like any attribute. `remove`, `route`,

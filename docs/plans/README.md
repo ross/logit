@@ -10,7 +10,8 @@ branches and PRs are its record. See [Branches and PR titles](../../AGENTS.md#br
 
 | Plan | Created | Updated |
 |---|---|---|
-| [Enabling plan: metric flags — producers set `_logit.metrics.*`, and `aggregate` reads flags, not protocols](metric-flags.md) | 2026-10-22 | 2026-10-22 |
+| [Enabling plan: protocol knowledge stays in family — the remaining cross-family reads](protocol-knowledge-stays-in-family.md) | 2026-10-23 | 2026-10-23 |
+| [Enabling plan: metric flags — producers set `_logit.metrics.*`, and `aggregate` reads flags, not protocols](metric-flags.md) | 2026-10-22 | 2026-10-23 |
 | [Enabling plan: OTLP metric kinds into `datadog_out`, and a `cumulative_to_delta` transform](ddotlp.md) | 2026-10-20 | 2026-10-20 |
 | [Enabling plan: a transit spec — reference inputs, flows, and a mapping table that generates the docs](transit-spec.md) | 2026-10-19 | 2026-10-19 |
 | [Enabling plan: native encode without per-field scratch buffers](native-encode-allocations.md) | 2026-10-15 | 2026-10-15 |

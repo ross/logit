@@ -305,9 +305,11 @@ and codecs carry for them:
   and every other protocol sink ignores them, uncounted, when it renders attributes
   ([ADR `private-attribute-namespace`](docs/adr/private-attribute-namespace.md);
   [docs/design/data-model.md](docs/design/data-model.md)'s "Well-known attribute names" is the
-  canonical statement). A shared transform never reads another protocol's carrier: a decoder
-  that needs `aggregate` to treat an event specially sets a `_logit.metrics.*` flag beside the
-  carrier ([ADR `metric-flags`](docs/adr/metric-flags.md)).
+  canonical statement). A decoder that needs `aggregate` to treat an event specially sets a
+  `_logit.metrics.*` flag beside the carrier ([ADR `metric-flags`](docs/adr/metric-flags.md)), and
+  a component outside the carrier's family doesn't act on the carrier itself, apart from the four
+  reads [ADR `protocol-knowledge-stays-in-family`](docs/adr/protocol-knowledge-stays-in-family.md)
+  records as debt.
 - **Model v2**: `Sum`/`Samples`/`SetMembers`/`ExponentialHistogram`, `SpanExt`, batch-level
   `Scope`, `MetricRecord.flags`.
 - **OTLP**: scope grouping, start time, description, exemplars, a `NO_RECORDED_VALUE` point
@@ -1132,6 +1134,13 @@ not a style preference:
   (`docs/known-gaps/`), not an accepted codec limitation — don't add a new lossy mapping without
   checking the ADR's [Realization](docs/adr/lossless-transit.md#realization-2026-09-12) and the
   survey it's built on ([`docs/design/telemetry-landscape.md`](docs/design/telemetry-landscape.md)) first.
+- **Protocol knowledge stays in its family.** A component keys behavior on another component's
+  internals (its `_logit.<protocol>.` carriers, wire-specific attribute names, hop identity, or a
+  batch's provenance) only within a lossless family: one like pair above, or the Datadog family of
+  DogStatsD, `datadog`, and `datadog_trace`. Everything else reads neutral `_logit.metrics.` and
+  `_logit.field.` flags its creator set, public vocabulary, or its own config; an exception needs
+  its own ADR ([ADR `protocol-knowledge-stays-in-family`](docs/adr/protocol-knowledge-stays-in-family.md),
+  whose plan lists the four reads that break it today).
 - **The wire encoding is decided: hand-rolled, shipped as `logit_proto::native`** — a four-arm
   bake-off (`crates/logit-bench/src/bakeoff/`) settled it against `rkyv`, `postcard`, and OTLP
   itself; see [ADR `native-wire-format-encoding`](docs/adr/native-wire-format-encoding.md) and

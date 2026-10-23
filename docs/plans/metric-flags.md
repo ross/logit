@@ -1,6 +1,6 @@
 ---
 created: 2026-10-22
-updated: 2026-10-22
+updated: 2026-10-23
 ---
 
 # Enabling plan: metric flags — producers set `_logit.metrics.*`, and `aggregate` reads flags, not protocols
@@ -61,6 +61,7 @@ The ADR holds the vocabulary. The pieces this plan adds to it:
 | W1a | `flags/w1a` | `flags/w1a: string fields move to the _logit.field. namespace` | M | W0 | planned |
 | W1b | `flags/w1b` | `flags/w1b: decoders set _logit.metrics.* flags, and aggregate reads flags only` | L | W1a | planned |
 | W2 | — | VM measurement, recorded in `docs/design/performance.md` as a docs PR | S | W1b | planned |
+| W3 | `flags/w3` | `flags/w3: ADR and plan for keeping protocol knowledge in family` | S | W1b | in review |
 
 - **W1a.** `FIELD_PREFIX`/`is_field` in `logit_core::attrs`; the InfluxDB decoder and encoder,
   `line_protocol`, and `aggregate`'s scan under the new name (no behavior change);
@@ -82,6 +83,10 @@ The ADR holds the vocabulary. The pieces this plan adds to it:
   [lua-api.md](../design/lua-api.md) with an example.
 - **W2.** Not a PR. The protocol is below; the numbers land in `performance.md`'s "What moved"
   section as a docs PR.
+- **W3.** [ADR `protocol-knowledge-stays-in-family`](../adr/protocol-knowledge-stays-in-family.md)
+  generalizes this stream's rule to every component, and
+  [its plan](protocol-knowledge-stays-in-family.md) lists the four cross-family reads left after
+  W1b, each a future workstream outside this stream.
 
 ## Measurement
 

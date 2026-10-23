@@ -285,6 +285,16 @@ Entry format and the other areas: [the known-gaps index](README.md).
     on an empty incoming sketch.
   - A `HyperLogLog` whose harmonic sum (`data[1]`) is wrong estimates wrong. The sum is an `f32`
     accumulated per register update, so recomputing it on decode wouldn't reproduce the bytes.
+- **Four reads outside a lossless family key behavior on another protocol's internals**,
+  against [ADR `protocol-knowledge-stays-in-family`](../adr/protocol-knowledge-stays-in-family.md):
+  `dedup_timestamps` and `prometheus_out` treat a `Gauge` carrying `_logit.datadog.type: rate` as
+  an increment; `otlp_out`, and `kafka_out`'s OTLP formats, read `_logit.prometheus.type` to skip
+  a `gaugehistogram` and write `info` and `stateset` as a non-monotonic `Sum`; and `datadog_out`
+  takes `collectd.host` as the host. No other producer can ask for these handlings: a Lua script
+  or a `set` gets one only by writing that protocol's key, which that protocol's own sink then
+  reads too. **Revisit** through
+  [the in-family plan](../plans/protocol-knowledge-stays-in-family.md), which has a remedy and an
+  estimate for each.
 
 ## Config and CLI
 

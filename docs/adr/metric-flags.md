@@ -1,6 +1,6 @@
 ---
 created: 2026-10-22
-updated: 2026-10-22
+updated: 2026-10-23
 ---
 
 # Metric flags: producers set `_logit.metrics.*` flags, and `aggregate` reads flags instead of protocol carriers
@@ -68,6 +68,9 @@ per event.
 A producer that writes `_logit.field.*` keys without `_logit.metrics.fields` gets those keys in
 the series identity, and one that builds a closed bucket without `_logit.metrics.closed` gets it
 windowed. That is the rule: the creator decides, and the consumer does what the flags say.
+[ADR `protocol-knowledge-stays-in-family`](protocol-knowledge-stays-in-family.md) generalizes
+the rule past `aggregate`: outside a lossless family, no component keys behavior on another
+protocol's carrier.
 
 ### The segments
 

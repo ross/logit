@@ -10,7 +10,8 @@ the same date, write the record, then add a row here.
 
 | ADR | Created | Updated |
 |---|---|---|
-| [Metric flags: producers set `_logit.metrics.*` flags, and `aggregate` reads flags instead of protocol carriers](metric-flags.md) | 2026-10-22 | 2026-10-22 |
+| [Protocol knowledge stays in family: a component keys behavior on another component's internals only within a lossless family](protocol-knowledge-stays-in-family.md) | 2026-10-23 | 2026-10-23 |
+| [Metric flags: producers set `_logit.metrics.*` flags, and `aggregate` reads flags instead of protocol carriers](metric-flags.md) | 2026-10-22 | 2026-10-23 |
 | [`dedup_timestamps`: collapse readings of one series that share a timestamp, within a batch, before a sink that can't hold both](dedup-timestamps-transform.md) | 2026-10-21 | 2026-10-21 |
 | [Lua `vars`: a component's `vars:` map reaches its script as a plain-table global](lua-script-vars.md) | 2026-10-21 | 2026-10-21 |
 | [Full-buffer diagnostics: a full sink buffer or receive queue logs once a minute, and a gauge reads a blocked push live](buffer-full-diagnostics.md) | 2026-10-21 | 2026-10-21 |
@@ -29,7 +30,7 @@ the same date, write the record, then add a row here.
 | [Process hostname: one resolved name, `host.name` on `internal`'s resource](process-hostname.md) | 2026-10-14 | 2026-10-22 |
 | [CI saves the cargo cache from `main` only, and every run restores it with a prefix fallback](ci-cargo-cache-saved-on-main.md) | 2026-10-14 | 2026-10-14 |
 | [CI runs no advisory check: Dependabot files the bump PRs, and `script/audit` checks locally](advisories-off-ci.md) | 2026-10-14 | 2026-10-14 |
-| [Private attribute namespace: protocol carriers live under `_logit.<protocol>.`, and every other protocol's sink ignores them](private-attribute-namespace.md) | 2026-10-13 | 2026-10-22 |
+| [Private attribute namespace: protocol carriers live under `_logit.<protocol>.`, and every other protocol's sink ignores them](private-attribute-namespace.md) | 2026-10-13 | 2026-10-23 |
 | [Stale events are filtered by a `drop_stale`/`has_stale` transform pair](stale-event-filtering.md) | 2026-10-13 | 2026-10-13 |
 | [InfluxDB line-protocol relay: fields as typed `Gauge` records under a measurement carrier, strings as attributes, and an all-or-nothing write](influxdb-line-protocol-relay.md) | 2026-10-13 | 2026-10-22 |
 | [Typed metric scalar: `MetricValue { F64, I64, U64, Bool }` replaces the `f64` in `Gauge`, `GaugeDelta`, and `Sum`](typed-metric-scalar.md) | 2026-10-13 | 2026-10-18 |
