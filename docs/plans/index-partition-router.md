@@ -7,21 +7,21 @@ updated: 2026-10-23
 
 ## Context
 
-A router pays for every event it touches. `route_batch` moves each event into a destination
-buffer (0.4 µs per event on the perf VM) and clones one a `routes:` list sends to several
-destinations (0.75 µs); `route_signals_batch` under `strip: true` splits each event into parts
-at the same cost. Sharing the batch behind one `Arc` costs 0.04 to 0.12 µs per event, and that's
-what a destination that only reads needs. The worker-count session recorded in
-[`docs/design/performance.md`](../design/performance.md)'s "11. Runtime worker count
-(2026-10-23)" section (PR #840) measured the ladder: `route-copy-all2` at 0.456 against
-`route-copy` and `route`, the only difference being whether the router copies. The four variant
-scenarios it uses (`route-copy-all2`, `route-copy-half2`, `route-2t`, `route-signals-nostrip`)
-are that session's variants of the shipped `route`, `route-copy`, and `route-signals` scenarios and don't
-ship under `perf/scenarios/`. A prototype that sends each destination the shared batch plus an
-index list confirmed it on the same VM on 2026-10-23 (prototype branch `cores/e6b-prototype` at
-`6a306c9b`, against `main` at `5d5a0429`, both sinking into `null_out`, 5 repeats per cell, free
-runtime). The `main` column is that E6 run, so its `route-copy` and `route` figures (1.181 and
-0.734) differ slightly from the section's:
+A router pays for every event it touches. `route_batch` moves each event into a destination buffer
+(0.4 µs per event on the perf VM) and clones one a `routes:` list sends to several destinations
+(0.75 µs); `route_signals_batch` under `strip: true` splits each event into parts at the same cost.
+Sharing the batch behind one `Arc` costs 0.04 to 0.12 µs per event, and that's what a destination
+that only reads needs. The worker-count session recorded in
+[`docs/design/performance.md`](../design/performance.md)'s "11. Runtime worker count (2026-10-23)"
+section (PR #840) measured the ladder: `route-copy-all2` at 0.456 against `route-copy` and `route`,
+the only difference being whether the router copies. The four variant scenarios it uses
+(`route-copy-all2`, `route-copy-half2`, `route-2t`, `route-signals-nostrip`) are that session's
+variants of the shipped `route`, `route-copy`, and `route-signals` scenarios and don't ship under
+`perf/scenarios/`. A prototype that sends each destination the shared batch plus an index list
+confirmed it on the same VM on 2026-10-23 (prototype branch `cores/e6b-prototype` at `6a306c9b`,
+against `main` at `5d5a0429`, both sinking into `null_out`, 5 repeats per cell, free runtime). The
+`main` column is that E6 run, so its `route-copy` and `route` figures (1.181 and 0.734) differ
+slightly from the section's:
 
 | Scenario | `main` µs/event | Prototype µs/event | CPU | Throughput |
 |---|---:|---:|---:|---:|
@@ -34,10 +34,9 @@ runtime). The `main` column is that E6 run, so its `route-copy` and `route` figu
 | General suite (no router: parse, relay, tail, encode) | | | 0 to 2% | 0 to 2% |
 
 The five router scenarios land at 0.38 to 0.51, at or just above the share floor (`route-copy-all2`
-0.456, `route-signals-nostrip` 0.374). `route` and `route-2t`
-were bound by the generator, so their gain shows on CPU alone. The raw results and the session's
-findings live outside the repository, in `~/lib/logit/tmp/perf/vm-2026-10f/`, as every VM
-session's do.
+0.456, `route-signals-nostrip` 0.374). `route` and `route-2t` were bound by the generator, so their
+gain shows on CPU alone. The raw results and the session's findings live outside the repository, in
+`~/lib/logit/tmp/perf/vm-2026-10f/`, as every VM session's do.
 
 Stream key: `cores` (continuing from `cores/w5`, this plan).
 
