@@ -30,6 +30,12 @@ impl Value {
         Value::Str(Bytes::from(s.into()))
     }
 
+    /// [`Value::str`] for a `'static` string, with no allocation: for a constant a decoder stamps
+    /// on every event.
+    pub fn static_str(s: &'static str) -> Self {
+        Value::Str(Bytes::from_static(s.as_bytes()))
+    }
+
     pub fn as_str(&self) -> Option<&str> {
         match self {
             // Constructed only from valid UTF-8 (see `str`/`From<&str>`), so this cannot panic.

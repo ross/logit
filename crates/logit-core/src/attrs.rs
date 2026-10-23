@@ -171,6 +171,33 @@ pub fn is_field(key: &str) -> bool {
     key.starts_with(FIELD_PREFIX)
 }
 
+/// The flag that says every metric record on its event summarizes a time span its source closed,
+/// so `aggregate` forwards the event whole instead of windowing it. Its value is one of
+/// [`CLOSED_BUCKETED`] or [`CLOSED_TIMESTAMPED`]; any other `Str`, or a `Bool(true)`, means the
+/// same and counts as [`CLOSED_FLAGGED`].
+///
+/// Read off the event, else the batch resource. See ADR `metric-flags`
+/// (`docs/adr/metric-flags.md`), "The flags".
+pub const METRICS_CLOSED: &str = "_logit.metrics.closed";
+
+/// The flag that says its event carries attributes under [`FIELD_PREFIX`]; a reader scans for them
+/// only when it is `Bool(true)`. Read off the event, else the batch resource. See ADR
+/// `metric-flags` (`docs/adr/metric-flags.md`), "The flags".
+pub const METRICS_FIELDS: &str = "_logit.metrics.fields";
+
+/// [`METRICS_CLOSED`]'s value for an event whose records each summarize a time bucket the source
+/// closed, such as a Datadog APM stats group. See ADR `metric-flags`, "The flags".
+pub const CLOSED_BUCKETED: &str = "bucketed";
+
+/// [`METRICS_CLOSED`]'s value for an event whose timestamp is its source's own, such as a
+/// DogStatsD `|T` line. See ADR `metric-flags`, "The flags".
+pub const CLOSED_TIMESTAMPED: &str = "timestamped";
+
+/// The reason a reader counts for a [`METRICS_CLOSED`] value outside the closed set, so free text
+/// never becomes a telemetry tag. Not a value a producer writes. See ADR `metric-flags`, "The
+/// flags".
+pub const CLOSED_FLAGGED: &str = "flagged";
+
 #[cfg(test)]
 mod tests {
     use super::*;
