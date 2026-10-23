@@ -187,7 +187,7 @@
 //! | `attributes/timestamp_value` | lost | `logit.output.tags.omitted{reason=unrepresentable}` | A timestamp value has no tag form and is left off, counted. |
 //! | `attributes/private_carrier` | exact | -- | A `_logit.influxdb.*` carrier is consumed into the wire form (the measurement, the string fields, the write's org and bucket) and influxdb_in stamps it back. |
 //! | `attributes/prometheus_target` | lost | structural | The scrape target is private and isn't a tag, so it's left off. |
-//! | `attributes/foreign_carrier` | lost | structural | Another protocol's `_logit.` carrier is private and isn't a tag, so it's left off. |
+//! | `attributes/foreign_carrier` | lost | structural | Another protocol's `_logit.` carrier is private and isn't a tag, so it's left off. A `_logit.metrics.*` flag is left off too, and influxdb_in sets `_logit.metrics.fields` again on a point with a string field. |
 //! | `attributes/resource_attribute` | normalized | `resource_merged` | A tag, the event's value winning on a shared key, read back as an event attribute. |
 //! | `attributes/scope` | lost | structural | Line protocol has no instrumentation scope, so none is written. |
 //! | `attributes/datadog_carrier_log` | lost | structural | Another protocol's `_logit.` carrier is private and isn't a tag, so it's left off. |

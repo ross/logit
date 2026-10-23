@@ -2355,15 +2355,22 @@ rows:
           Another protocol's `_logit.` carrier is private and isn't a tag, so it's left off. Under
           `format: dogstatsd`, `_logit.datadog.hostless` on a record with no `host`, no non-empty
           `host.name`, and no non-empty `h:` field is an empty `host:` tag, which statsd_in reads
-          back as an empty `host`.
+          back as an empty `host`. A `_logit.metrics.*` flag is left off too, and statsd_in sets
+          `_logit.metrics.closed` again on a `|T` line it reads back.
       prometheus_out:
         class: lost
         reason: structural
-        text: Another protocol's `_logit.` carrier is private and isn't a label, so it's left off.
+        text: >-
+          Another protocol's `_logit.` carrier is private and isn't a label, so it's left off. A
+          `_logit.metrics.*` flag is left off too, and a scrape sets `_logit.metrics.closed` again
+          on a sample with its own timestamp; remote-write doesn't.
       influxdb_out:
         class: lost
         reason: structural
-        text: Another protocol's `_logit.` carrier is private and isn't a tag, so it's left off.
+        text: >-
+          Another protocol's `_logit.` carrier is private and isn't a tag, so it's left off. A
+          `_logit.metrics.*` flag is left off too, and influxdb_in sets `_logit.metrics.fields`
+          again on a point with a string field.
       otlp_out:
         class: lost
         reason: structural
