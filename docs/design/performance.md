@@ -2558,10 +2558,10 @@ and `splunk-hec-relay` (−2%, at 10% less CPU) do not.
 
 Two workers is within 5% of `free` on throughput everywhere but the router family, `native-relay`
 (−12%), and `json-parse-x3` (−31%). On `route-signals`, `route-copy`, `route`, and `fanout` it
-beats `free` on both axes. Peak RSS on one worker is usually about half of `free`'s (36 against 78 MiB on
-`passthrough`, 125 against 352 on `native-relay`), and two workers usually sit between. `json-parse`
-is the exception for one worker (87 against 112 MiB), and on `json-parse` (48.5 MiB) and `fanout`
-(27.8 against 31.8) two workers hold less than one.
+beats `free` on both axes. Peak RSS on one worker is a third to three fifths of `free`'s on these 16 scenarios (36 against
+78 MiB on `passthrough`, 125 against 352 on `native-relay`, 35 against 107 on `route`), and 78%
+on `json-parse` (87 against 112 MiB). Two workers usually sit between, apart from `json-parse` (48.5 MiB) and `fanout`
+(27.8 against 31.8), where they hold less than one.
 
 ### At a fixed rate, one worker saves 9 to 37% CPU
 
