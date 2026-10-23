@@ -355,8 +355,9 @@ committed counts differ from the rows below.
 | `splunk-hec-relay` | 3M | 240,297 | 236,922 – 241,657 | 4.775 | 73.8 MiB | 12.48 s |
 | `timestamp-strftime` | 36M | 3,817,410 | 3,798,796 – 3,834,510 | 0.440 | 93.3 MiB | 9.43 s |
 
-- **`route-copy` and `route-signals` have no row.** Their router node's per-run time varies on
-  identical work, by up to 2.4× under pinning, and the cause is under investigation.
+- **`route-copy` and `route-signals` have no row.** On the 2026-10-22 VM their router node's
+  per-run time varied on identical work, by up to 2.4× under pinning. The 2026-10-23 VM, whose
+  vCPUs measure as one host L3, showed no spread; §11 has the numbers and the topology reading.
 - **`otlp-relay-grpc`'s events/s is set by a transport stall, not by CPU.** PR #824 traced it to
   Nagle's algorithm on the listener's accepted connection: hyper's h2 server writes a response's
   trailers separately, and they wait on the client's delayed ACK. #824 sets `TCP_NODELAY` on the
@@ -877,6 +878,9 @@ Since 2026-10-23, `run` records three more things per scenario. Read them before
   scenario's `cpu_clusters` holds each mode's size and median, and `run` prints both. Its pooled
   median describes neither mode, so don't record it as a row; record the modes, or find out what
   sets the mode. `bimodal` is `null` under five repeats: too few to tell, not a clean bill.
+  Whether a VM is bimodal depends on where the host places its vCPUs, not on the VM size: §11
+  records a VM with one host L3 that showed no slow mode and a desktop whose two L3s did. Record
+  `core-to-core-latency` before reading a VM's numbers.
 
 The readings below cross-reference each `perf/scenarios/*.yaml`'s own comments. **The top-line
 numbers are from the 2026-10-22 session.** The flamegraph shares below come from the 2026-10-02
@@ -2509,6 +2513,133 @@ on decode
 ([ADR `untrusted-input-bounds`](../adr/untrusted-input-bounds.md),
 [ADR `deployment-threat-model`](../adr/deployment-threat-model.md)); this session didn't attribute
 `json-parse`'s +1.1%. The cost is accepted.
+
+## 11. Runtime worker count (2026-10-23)
+
+What `runtime.workers:` buys, measured on the disposable perf VM on 2026-10-23 with `main` at
+`50f8c46e` (the merge of the `runtime.workers:` knob and the harness's thread accounting). This
+VM's 8 vCPUs measure as one host L3: `core-to-core-latency` reads 25 to 33 ns on every pair
+(mean 27.4 ns), where a pair across two Genoa CCDs reads about 100 ns or more. CPU is µs/event,
+the median of 5 repeats (8 for the router ladder); `free` is the default runtime (8 workers),
+`w1` is `runtime.workers: 1`, and `w2` is `runtime.workers: 2`. None of the 92 cells of the
+generality ladder was bimodal.
+
+### One worker is not a default
+
+Throughput is the change against `free` (negative is slower). Each shape is a separate run of the
+scenario, free-running: the generator pushes as fast as the pipeline accepts.
+
+| Scenario | free CPU | w1 CPU | w1 throughput | w2 CPU | w2 throughput |
+|---|---:|---:|---:|---:|---:|
+| `passthrough` | 0.335 | 0.290 | −6% | 0.335 | 0% |
+| `json-parse` | 0.879 | 0.665 | −36% | 0.805 | −1% |
+| `json-parse-x3` | 2.271 | 1.528 | −59% | 1.787 | −31% |
+| `aggregate` | 0.352 | 0.350 | 0% | 0.352 | 0% |
+| `aggregate-groups` | 0.309 | 0.306 | 0% | 0.312 | +1% |
+| `fanout` | 0.661 | 0.326 | +22% | 0.526 | +4% |
+| `route` | 0.742 | 0.441 | −30% | 0.481 | +11% |
+| `route-copy` | 1.180 | 0.643 | −23% | 0.750 | +26% |
+| `route-signals` | 1.091 | 0.579 | −12% | 0.691 | +47% |
+| `lua` | 2.143 | 2.129 | 0% | 2.170 | 0% |
+| `lua-edit` | 6.289 | 6.318 | −1% | 6.293 | 0% |
+| `native-relay` | 0.983 | 0.809 | −36% | 0.986 | −12% |
+| `otlp-relay-grpc` | 2.456 | 1.748 | +7% | 2.119 | +5% |
+| `otlp-relay-http` | 2.183 | 1.570 | +9% | 2.012 | +1% |
+| `splunk-hec-relay` | 4.673 | 4.191 | −2% | 4.682 | −4% |
+| `prometheus-remote-write-relay` | 2.911 | 2.272 | +9% | 2.761 | 0% |
+
+The experiment's kill criterion for making one worker the default failed on 10 of these 16
+scenarios (the six that pass are `fanout`, `route-copy`, `route-signals`, and the three
+OTLP and remote-write relays, which get both cheaper and faster). The parse- and encode-heavy ones lose 30 to 59% of their throughput
+(`json-parse-x3` −59%, `json-parse` and `native-relay` −36%, `route` −30%). The ones that
+already run on one busy thread (`aggregate`, `aggregate-groups`, `lua`, `lua-edit`,
+`splunk-hec-relay`) gain 0 to 10% CPU. `fanout` and the relays run faster on one worker.
+
+Two workers is within 1% of `free` on throughput everywhere but the router family, `native-relay`
+(−12%), and `json-parse-x3` (−31%). On `route-signals`, `route-copy`, `route`, and `fanout` it
+beats `free` on both axes. Peak RSS on one worker is about half of `free`'s (36 against 78 MiB on
+`passthrough`, 125 against 352 on `native-relay`), and two workers sit between.
+
+### At a fixed rate, one worker saves 10 to 37% CPU
+
+The paced cells hold the same event rate in every shape (`generate_in` `rate:`), and
+`native-relay-lz4` and `otlp-relay-grpc-gzip` add compression to their base scenarios, so CPU is
+the whole result.
+
+| Cell | free CPU | w1 CPU | w1 saves | w1 throughput |
+|---|---:|---:|---:|---|
+| `passthrough` at 20k events/s | 0.781 | 0.609 | 22% | same |
+| `passthrough` at 200k events/s | 0.362 | 0.330 | 9% | same |
+| `json-parse-x3` at 20k events/s | 3.002 | 1.896 | 37% | same |
+| `json-parse-x3` at 200k events/s | 2.245 | 1.560 | 31% | same |
+| `native-relay`, `compression: lz4` | 1.012 | 0.805 | 20% | −31% |
+| `otlp-relay-grpc`, `compression: gzip` | 4.884 | 3.977 | 19% | +4% |
+
+Pinning the child to one CPU (`--pin-child 0`) matches `w1` within 2% on most scenarios, but it is
+not the knob. `pin0` also confines the threads that live outside the runtime: on
+`buffered-small-segments` it loses 40% of throughput because the sinks' write loops and the
+generator share the one core, and on `lua` it costs 7% throughput because the Lua thread competes
+with the worker. `runtime.workers: 1` leaves those threads free.
+
+### What the router costs
+
+Every shape of the router family, free-running, 8 repeats each. The shipped `route-copy` sends
+8 of 10 hosts to two targets (a clone) and 2 to the unrouted consumer (a move); `route` moves each
+event to one of three targets.
+
+| Scenario | CPU | events/s | What happens to the event |
+|---|---:|---:|---|
+| `passthrough` | 0.335 | 3.66M | Nothing: the batch is handed on whole. |
+| `route-signals-nostrip` | 0.373 | 3.70M | Nothing: both targets share the `Arc`. |
+| `route-copy-all2` | 0.456 | 3.25M | Nothing: every event goes to both targets, shared. |
+| `route` | 0.738 | 3.23M | One memcpy per event into a target batch. |
+| `route-2t` | 0.795 | 3.08M | The same, with two targets. |
+| `route-copy-half2` | 1.014 | 2.40M | Half shared, half moved. |
+| `route-signals` | 1.090 | 1.96M | `strip: true`: a part per target, attributes cloned. |
+| `route-copy` | 1.182 | 2.03M | 80% cloned to two targets, 20% moved. |
+
+The router's cost is per event touched, not per destination. Sharing an event costs 0.04 to 0.12
+µs/event over `passthrough`, moving it costs 0.40, and cloning or stripping it costs 0.75. Two
+targets instead of three changes `route` by 8%. None of the eight was bimodal.
+
+### Queue depth, batch size, and allocator
+
+- **Channel capacity does not move the router.** At capacity 4, 16, and 64, `route-signals` reads
+  1.098, 1.092, and 1.086, within 1%; `passthrough` pays 5 to 12% at the shallow depths. The
+  router's inbox reads 63 of 64 full for the whole run and the sinks' inboxes read 0, so the
+  generator waits on the router and the sinks wait on the router, never the reverse.
+- **Batch size trades memory for CPU.** `route-signals` reads 1.307, 1.088, and 0.733 µs/event at
+  `batch:` 10, 100, and 1000, at 77 MiB for the default and 347 MiB for 1000.
+- **One jemalloc arena is cheaper than the default.** On `route-signals`, `narenas:1` reads 1.050
+  µs/event at 2.34M events/s and 24 MiB, against 1.089 at 1.96M and 75 MiB; `tcache:false` reads
+  1.187. This was measured on two scenarios, not the suite, and changes no default.
+
+### Where the 2026-10-22 spread went
+
+The VM of 2026-10-22 showed `route-copy` and `route-signals` spreading 37 to 108% run to run on
+one binary, which the preamble to "Reading the rows" and the harness ADR record. The VM of
+2026-10-23 did not: 73 runs of `route-signals` all sat at 1.08 to 1.10 µs/event (5 in the
+ladder, 8 in the router ladder, 18 in the queue-depth arms, 36 in the queue-interval arms, and 6 bare),
+whatever the placement, migration count, or tokio's `global_queue_interval`. Under `perf sched
+record`, 4 of 6 runs sat at 1.12 to 1.14 and 2 were slow (2.4 and 1.5), and the slow runs ran
+within two minutes of each other, which reads as a slow window of the host and not as a mode.
+
+The desktop (Ryzen AI MAX+ 395, two CCDs, one L3 each) reproduces the spread with a producer and
+consumer alone. On `route-signals`, two workers on two CCDs read 0.40 to 0.86 µs/event
+(median 0.560), and the same two workers on one L3 read 0.399 to 0.401. One worker free to move
+across both L3s reads 0.383, the same as one pinned core. A thread migrating costs nothing; a
+producer and a consumer on different L3s cost up to double. The 2026-10-22 VM was most likely two
+host L3s; it no longer exists, so that remains an inference. The spread is a property of where
+the host places a VM's vCPUs, so record a VM's core-to-core latency matrix before reading its
+numbers.
+
+### Conclusion
+
+One worker is not a default. Set `runtime.workers: 1` on a node whose event rate is fixed by its
+producers: it saves 10 to 37% CPU per event at the same rate and about half the RSS. It is wrong
+for a node that must keep up with a flood of parse- or encode-heavy work. Set `runtime.workers: 2`
+on a node whose work is mostly routing: `route-signals` costs 37% less CPU per event at 47% more
+throughput. Leave the default for parsing, encoding, and relays.
 
 ## Open questions
 
