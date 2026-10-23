@@ -159,8 +159,9 @@ review. Allocation pins in `crates/logit-bench/tests/allocations.rs` and the mat
   [ADR `target-components`](../adr/target-components.md), which says an event is moved with one
   destination and shared or cloned with several, and the `strip: true` rules of
   [ADR `route-signals`](../adr/route-signals.md): rule 1 (cleared before routing), rule 4
-  (attributes cloned, payloads moved per part), and rule 7 (no shared path out). The ADR and
-  those two amendments are W6; the restatements of shipped behavior move in W7 with the code.
+  (attributes cloned, payloads moved per part), and rule 7 (no shared path out), with the clone,
+  move, and mutate statements under both `strip:` values. The ADR and those two amendments are
+  W6; the restatements of shipped behavior move in W7 with the code.
 - **W7, the pipeline layer.** `BatchView` and the masked event; `Delivered` carrying a view;
   `route_batch` and `route_signals_batch` emitting views (index lists, signal masks, no in-place
   strip, index composition for a router behind a router); `Output::send` and `Output::submit` taking

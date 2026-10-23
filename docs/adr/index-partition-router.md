@@ -69,11 +69,11 @@ missing a check, because there's no check to miss.
 
 Ownership decides, not reading:
 
-- **Reads, no copy.** A sink and its encoder: `Output::send`, `Output::submit` (which
-  `window_round` calls), and the three encoder traits (`Encoder`, `FramedEncoder`,
-  `SignalEncoder`), `prometheus`'s own pair, `datadog`'s `encode_routes`, and
-  `datadog_trace_out`'s `encode_tracer_api_traces` and `encode_client_stats_v06`, take
-  `&BatchView`. Counting reads `view.len()`.
+- **Reads, no copy.** A sink and its encoder: `Output::send`, `Output::submit` (which `window_round`
+  calls), the three encoder traits (`Encoder`, `FramedEncoder`, `SignalEncoder`), `prometheus`'s own
+  pair, `datadog`'s `encode_routes`, `datadog_trace_out`'s `encode_tracer_api_traces` and
+  `encode_client_stats_v06`, and `native::encode_hop_batch`, take `&BatchView`. Counting reads
+  `view.len()`.
 - **Narrows, no copy.** A router. `route` emits one index list per destination. `route_signals`
   emits index lists plus a signal mask per target and never strips in place; it still counts
   `logit.transform.payloads.stripped{signal}` for each payload of an unlisted signal (one no
@@ -155,6 +155,6 @@ that word. There's no alias, because `logit` is pre-release.
   `docs/known-gaps/runtime.md` carry the pinned-batch bound and the threshold.
 - **Measured basis.** The decision rests on the router's own saving, measured into `null_out`. The
   plan's W10 records what a real sink gains.
-- **Amended.** [ADR `target-components`](target-components.md) (the move-or-share-or-clone rule)
-  and [ADR `route-signals`](route-signals.md) (`strip: true` rules 1, 4, and 7), each in a
-  2026-10-23 amendment.
+- **Amended.** [ADR `target-components`](target-components.md) (the move-or-share-or-clone rule) and
+  [ADR `route-signals`](route-signals.md) (`strip: true` rules 1, 4, and 7, and the clone, move, and
+  mutate statements under both `strip:` values), each in a 2026-10-23 amendment.
