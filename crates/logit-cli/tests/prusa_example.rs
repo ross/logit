@@ -378,7 +378,7 @@ fn only_a_lone_v_field_is_renamed_to_value() {
           pair v=1i,w=2i 5\n",
     );
     assert_eq!(measured_at(&points), [("fw_version", RECEIVED_AT - 5_000), ("pair", RECEIVED_AT)]);
-    assert_eq!(attr(&points[0], "_logit.influxdb.field.value"), Some("7.0.0+16903"));
+    assert_eq!(attr(&points[0], "_logit.field.value"), Some("7.0.0+16903"));
     assert_eq!(gauge(&points[1], "pair.v"), MetricValue::I64(1));
     assert_eq!(gauge(&points[1], "pair.w"), MetricValue::I64(2));
 }

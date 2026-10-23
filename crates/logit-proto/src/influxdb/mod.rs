@@ -46,7 +46,8 @@
 //! | tag key under the private `_logit.` prefix | omitted (normalization 12) | `logit.input.tags.omitted{reason="reserved_prefix"}` |
 //! | float / integer / unsigned / boolean field `f` | a [`logit_core::MetricRecord`] named `<measurement>.f`, `Gauge(F64 \| I64 \| U64 \| Bool)` | -- |
 //! | N numeric or boolean fields | N records on the one event, in wire order | -- |
-//! | string field `f="x"` | event attribute `_logit.influxdb.field.f` ([`FIELD_ATTR_PREFIX`]), `Value::Str` | -- |
+//! | string field `f="x"` | event attribute `_logit.field.f` ([`logit_core::attrs::FIELD_PREFIX`]), `Value::Str` | -- |
+//! | at least one string field on the event | the flag `_logit.metrics.fields: true`, which tells `aggregate` to look for `_logit.field.*` keys ([ADR `metric-flags`](../../../../docs/adr/metric-flags.md), "The flags") | -- |
 //! | timestamp | `event.timestamp`, scaled to nanoseconds by [`Precision`] | -- |
 //! | no timestamp | the request's arrival time truncated to [`Precision`], one instant for the body (normalization 14) | -- |
 //! | a later point with the same measurement, tag set, and timestamp | merged into the earlier event: each field overwrites its namesake, across types too, or is appended (normalizations 2 and 4) | -- |
@@ -61,7 +62,8 @@
 //! its wire, uncounted; a whole-event render carries them, as it carries every private key (that
 //! ADR's "The ignore rule" lists the renders). A string field's value is free text, and as a tag
 //! or label at another sink each distinct value would start a series. Lua and transforms still
-//! read a string field by its full key, and `aggregate` leaves it out of a series.
+//! read a string field by its full key, and `aggregate` leaves it out of a series on the
+//! `_logit.metrics.fields` flag the table names.
 //!
 //! **A point whose fields are all strings carries no signal.** Its event has no log, no metrics,
 //! and no span, only the carriers, and `influxdb_out` still writes its line. A component that
@@ -100,13 +102,13 @@
 //!   measurement, and the kind's fields from the table below.
 //! - **Carrier path**: one line per event, the carrier as the measurement. A `Gauge` or `Sum`
 //!   record named `<measurement>.<key>`, with a non-empty key, becomes field `<key>` in its own
-//!   type, in record order. Each event attribute `_logit.influxdb.field.<key>`
-//!   ([`FIELD_ATTR_PREFIX`]) whose value is a `Str` then becomes a quoted string field `<key>`, in
+//!   type, in record order. Each event attribute `_logit.field.<key>`
+//!   ([`logit_core::attrs::FIELD_PREFIX`]) whose value is a `Str` then becomes a quoted string field `<key>`, in
 //!   attribute order; a non-`Str` value there is ignored. Any other record leaves on its own per-record line after
 //!   the carrier line, counted `logit.output.metrics.normalized{reason="carrier_mismatch"}`. A
 //!   carrier event with only string fields still writes its line; one with no field writes none.
 //! - **Both paths**: the tags are the same, from the attribute table below, and every key under
-//!   the private `_logit.` namespace is skipped as a tag, uncounted, [`FIELD_ATTR_PREFIX`] too
+//!   the private `_logit.` namespace is skipped as a tag, uncounted, [`logit_core::attrs::FIELD_PREFIX`] too
 //!   ([ADR `private-attribute-namespace`](../../../../docs/adr/private-attribute-namespace.md)).
 //!
 //! The tables below are generated from `influxdb_out`'s column of `spec/transit/mapping.yaml`,
@@ -167,7 +169,7 @@
 //! | `span/alone` | skipped | `logit.output.events.skipped{reason=no_metrics}` | A span has no line-protocol form and isn't written. |
 //! | `span/no_wire_form` | exact | -- | Nothing beyond `span/alone`'s outcome. |
 //! | `event/attributes_only` | skipped | `logit.output.events.skipped{reason=no_metrics}` | An event with no metric, log, or span and no `_logit.influxdb.measurement` carrier has no measurement to write under and isn't written. A stage that drops the carrier leaves an InfluxDB point whose fields are all strings this way: a `remove` of it, or a `keep` under `private: drop`, which drops the string fields too. |
-//! | `event/string_only` | exact | -- | A line of the event's `_logit.influxdb.field.*` string fields under the measurement its `_logit.influxdb.measurement` carrier names, read back as the same event. |
+//! | `event/string_only` | exact | -- | A line of the event's `_logit.field.*` string fields under the measurement its `_logit.influxdb.measurement` carrier names, read back as the same event. |
 //!
 //! Per field of a record that reaches the wire, attribute shape, and payload beside metrics:
 //!
@@ -186,7 +188,7 @@
 //! | `attributes/timestamp_value` | lost | `logit.output.tags.omitted{reason=unrepresentable}` | A timestamp value has no tag form and is left off, counted. |
 //! | `attributes/private_carrier` | exact | -- | A `_logit.influxdb.*` carrier is consumed into the wire form (the measurement, the string fields, the write's org and bucket) and influxdb_in stamps it back. |
 //! | `attributes/prometheus_target` | lost | structural | The scrape target is private and isn't a tag, so it's left off. |
-//! | `attributes/foreign_carrier` | lost | structural | Another protocol's `_logit.` carrier is private and isn't a tag, so it's left off. |
+//! | `attributes/foreign_carrier` | lost | structural | Another protocol's `_logit.` carrier is private and isn't a tag, so it's left off. A `_logit.metrics.*` flag is left off too, and influxdb_in sets `_logit.metrics.fields` again on a point with a string field. |
 //! | `attributes/resource_attribute` | normalized | `resource_merged` | A tag, the event's value winning on a shared key, read back as an event attribute. |
 //! | `attributes/scope` | lost | structural | Line protocol has no instrumentation scope, so none is written. |
 //! | `attributes/datadog_carrier_log` | lost | structural | Another protocol's `_logit.` carrier is private and isn't a tag, so it's left off. |
@@ -286,10 +288,6 @@ pub use line::LineError;
 /// The event attribute carrying a point's measurement, so the encoder can rebuild the line and
 /// cross-protocol egress keeps the measurement in the record name (`<measurement>.<field>`).
 pub const ATTR_MEASUREMENT: &str = "_logit.influxdb.measurement";
-/// A string field rides as `_logit.influxdb.field.<key>` (`Value::Str`); strings are not metrics.
-/// The key is private, so the decoder refuses a tag under it and no protocol sink writes one as a
-/// tag, and a tag and a string field can't trade places.
-pub const FIELD_ATTR_PREFIX: &str = "_logit.influxdb.field.";
 pub const RESOURCE_ATTR_ORG: &str = "_logit.influxdb.org";
 pub const RESOURCE_ATTR_ORG_ID: &str = "_logit.influxdb.org_id";
 pub const RESOURCE_ATTR_BUCKET: &str = "_logit.influxdb.bucket";

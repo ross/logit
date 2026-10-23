@@ -425,12 +425,18 @@ decimal.
   key against the private string-field carriers. `927f7733`, in the same stack, memoizes which keys
   are string fields and wins most of it back: at `92b6b708`, the merge inside #782's stack that
   joins the two, they read +4.2% and +3.1% over `72191ead`. Both steps clear the 10-repeat ranges
-  of the cells on either side.
+  of the cells on either side. The 2026-10-23 session puts the part that outlived the
+  memoization in how the commit builds the series key, not in the scan; see
+  "[`aggregate`: the flag reads and the series-key copy
+  (2026-10-23)](#aggregate-the-flag-reads-and-the-series-key-copy-2026-10-23)".
 - **The rest of `aggregate-groups`' rise is Datadog's APM stats.** `118cc7e1` ("pass Datadog APM
   stats groups through as bucketed"), the next commit in the same stack, steps `aggregate-groups`
   +4.4% (0.299 → 0.313, the second cell's 15 repeats within 0.311–0.314) and `aggregate` +1.3%,
   testing each event for an APM stats group. The merges after it, #782 through n, don't move
-  either scenario by more than 1.1%.
+  either scenario by more than 1.1%. The 2026-10-23 subtraction leaves the probes together at
+  roughly 0 on `aggregate` and +2% on `aggregate-groups`, less than this step alone suggests; see
+  "[`aggregate`: the flag reads and the series-key copy
+  (2026-10-23)](#aggregate-the-flag-reads-and-the-series-key-copy-2026-10-23)".
 - **`native-relay` is 7.7% faster on events/s and 3.3% cheaper on CPU, and `lua` 3.5% cheaper.**
   Neither was bisected; read `native-relay`'s with "`native-relay` is code-layout-sensitive" below.
 - **`buffered-small-segments`' −42.3% events/s is wall-clock noise, not a change.** Its CPU
@@ -444,6 +450,138 @@ decimal.
   overlapping ranges. Their `tail*` self-checks held on every repeat.
 - **UDP intake didn't regress.** §7's "2026-10-22 regression check" has the numbers: kernel drops at
   the shipped rates move less between m and n than one binary moves between its two passes.
+
+### `aggregate`: the flag reads and the series-key copy (2026-10-23)
+
+This sub-section is from the 2026-10-23 session, the A/B that
+[docs/plans/metric-flags.md](../plans/metric-flags.md)'s "Measurement" section prescribes: does
+reading `_logit.metrics.*` flags instead of protocol carriers return `aggregate` to where it was
+before the probes, and if not, does a flags byte on `Event` close the gap?
+
+The box is a fresh VM of the same class as the 2026-10-22 session's (`AMD EPYC 9V74`, `nproc` 8,
+kernel `6.12.113+deb13-cloud-amd64`, Docker 29.9.2, no cpufreq governor). Each binary was
+release-built on the VM from a `git archive` extract of its commit
+(`cargo build --profile release -p logit-cli`) and run through a `logit-perf` built from its own
+commit, the rule this file's opening note states. The floor is the flag build's source plus a
+patch to `crates/logit-transforms/src/aggregate.rs` alone, so it runs through the flag build's
+harness. The four scenarios' text is identical across the commits. Each (binary, scenario) cell is
+3 rounds of `--repeat 5`, pooled to 15; within a round the binaries run in an order rotated per
+cell and reversed on even rounds, so each leads 3 of the 12 cells. One throwaway `--repeat 1` of
+`passthrough` per binary ran first and is excluded.
+
+| Tag | Binary | Role |
+|---|---|---|
+| b | `72191ead` | before both probes (`1f30eb3c`'s parent, the 2026-10-22 ladder's reference) |
+| n | `a1c275b6` | `main` at W1b's merge base, with the four protocol probes |
+| f | `639edaed` | `flags/w1b` before the series-key fix: the flag reads |
+| fl | f + a floor patch | no flag read at all: `begin_batch` stores the unflagged state without reading the resource, and `process` looks up neither `_logit.metrics.closed` nor `_logit.metrics.fields` |
+
+| Scenario | b | n | f | fl | b→n | b→f | n→f | fl→f | b→fl |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `aggregate` | 0.335 | 0.352 | 0.351 | 0.351 | **+5.03%** | **+4.74%** | −0.28% | +0.23% | **+4.50%** |
+| `aggregate-groups` | 0.290 | 0.309 | 0.302 | 0.306 | **+6.77%** | **+4.08%** | **−2.52%** | −1.33% | **+5.48%** |
+| `json-parse` | 0.868 | 0.881 | 0.887 | 0.882 | +1.41% | **+2.09%** | +0.67% | +0.52% | +1.56% |
+| `passthrough` | 0.337 | 0.339 | 0.341 | 0.340 | +0.72% | +1.21% | +0.48% | +0.22% | +0.98% |
+
+CPU µs/event, pooled median of 15, `+` = slower. Bold marks a delta past 2%, the ladder's own
+threshold; the suite's gate is 5%. b→n is the probes' cost, n→f the flags against the probes, fl→f
+the flag reads' cost, and b→fl the gap the flags don't explain. Each tag's three per-round medians
+lie within 0.004 of each other, the widest `passthrough` n (0.338–0.342). Ranges (min–max of 15):
+`aggregate` b 0.334–0.339, n 0.351–0.356, f 0.349–0.360, fl 0.349–0.354; `aggregate-groups` b
+0.287–0.298, n 0.308–0.315, f 0.300–0.305, fl 0.303–0.310. Median events/s: `aggregate` b 2,999,803,
+n 2,857,190, f 2,864,808; `aggregate-groups` b 3,517,146, n 3,279,736, f 3,364,772.
+
+fl→f is inside the spread on all four rows, so the two attribute lookups per event and the two
+resource lookups per batch cost nothing the ladder can see. f still sits +4.7% and +4.1% above b,
+and fl sits there too (+4.5% and +5.5%). fl has neither the flags nor the probes, so the gap is
+something else `1f30eb3c` changed that the flag build kept.
+
+`logit-perf flamegraph` on b and fl, with `--no-build` and the measured release binary in the
+profiling binary's place, two captures each, folded stacks, each share multiplied by the ladder's
+µs/event:
+
+| Where (µs/event, two captures) | b `aggregate` | fl `aggregate` | b `aggregate-groups` | fl `aggregate-groups` |
+|---|---:|---:|---:|---:|
+| the `aggregate` node (`run_transform` subtree) | 0.229 / 0.228 | 0.243 / 0.243 | 0.178 / 0.175 | 0.194 / 0.193 |
+| `generate_in` node | 0.104 / 0.104 | 0.105 / 0.105 | 0.111 / 0.113 | 0.109 / 0.110 |
+| `Aggregator::process` self | 0.055 / 0.053 | 0.058 / 0.059 | 0.038 / 0.041 | 0.045 / 0.045 |
+| `process` → an unresolved libc leaf (memcpy) | 0.056 / 0.056 | 0.066 / 0.067 | 0.062 / 0.055 | 0.066 / 0.067 |
+| jemalloc, all nodes | 0.021 / 0.017 | 0.020 / 0.022 | 0.008 / 0.004 | 0.004 / 0.004 |
+
+The whole +0.015 on `aggregate` is inside the `aggregate` node; the generator, `null_out`, the
+runtime, `begin_batch`, and the allocator are flat. Two thirds of it is a leaf call from `process`
+into libc, an unresolved symbol that is `memcpy` by its position and size, and the rest is
+`process`'s self time. That points at the hunk of `1f30eb3c` that builds the series key. Before
+it, the event's attribute map was cloned straight into `SeriesKey`; after it, the map is cloned
+into a local binding, pruned of string-field keys, and then moved into the key. `AttrMap` is a
+`SmallVec<[(Symbol, Value); 8]>`, about 400 bytes inline, so the move is a second copy of it per
+record.
+
+Two patches on f test that, under the same protocol on the two `aggregate` scenarios:
+
+- **fk** clones the map into the key and prunes `key.attributes` in place. `flags/w1b` commits it
+  as `1ceca584` ("perf(transforms): build the series key in place").
+- **fk2** skips the string-field scan and pruning when the fields flag isn't set, cloning the map
+  straight into the key on that path only; the flagged path keeps f's clone-then-move.
+
+| Scenario | b | f | fk | fk2 | b→f | b→fk | b→fk2 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `aggregate` | 0.335 | 0.351 | 0.334 | 0.333 | **+4.83%** | −0.05% | −0.57% |
+| `aggregate-groups` | 0.288 | 0.302 | 0.284 | 0.284 | **+4.65%** | −1.42% | −1.67% |
+
+CPU µs/event, pooled median of 15, `+` = slower, bold past 2%. Ranges: `aggregate` b 0.333–0.338,
+f 0.349–0.354, fk 0.333–0.338, fk2 0.331–0.336; `aggregate-groups` b 0.287–0.294, f 0.300–0.312,
+fk 0.283–0.291, fk2 0.282–0.298. Median events/s: `aggregate` b 3,008,170, f 2,869,012,
+fk 3,010,361; `aggregate-groups` b 3,516,967, f 3,365,735, fk 3,576,148.
+
+fk recovers the whole gap: b and fk read the same on both scenarios. fk2 is inside fk's spread,
+since neither scenario sets the fields flag and the two builds take the same path, and isn't
+taken.
+
+The final ladder reruns the first table's four scenarios under the same protocol on the
+`flags/w1b` head: f is `1ceca584`, and fl is `1ceca584` plus the floor patch.
+
+| Scenario | b | n | f | fl | b→n | b→f | n→f | fl→f | b→fl |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `aggregate` | 0.334 | 0.351 | 0.334 | 0.337 | **+5.21%** | −0.06% | **−5.01%** | −1.06% | +1.01% |
+| `aggregate-groups` | 0.290 | 0.309 | 0.285 | 0.293 | **+6.55%** | −1.91% | **−7.94%** | **−2.79%** | +0.91% |
+| `json-parse` | 0.867 | 0.882 | 0.883 | 0.874 | +1.71% | +1.79% | +0.08% | +0.96% | +0.83% |
+| `passthrough` | 0.341 | 0.339 | 0.339 | 0.337 | −0.68% | −0.76% | −0.07% | +0.43% | −1.19% |
+
+CPU µs/event, pooled median of 15, `+` = slower, bold past 2%. Each tag's three per-round medians
+lie within 0.004 of each other except `aggregate-groups` b (0.287, 0.291, 0.292). Ranges (min–max
+of 15): `aggregate` b 0.333–0.336, n 0.350–0.354, f 0.332–0.337, fl 0.336–0.342; `aggregate-groups`
+b 0.286–0.296, n 0.308–0.312, f 0.282–0.298, fl 0.289–0.330 (one high repeat; its per-round
+medians are 0.291–0.293). Median events/s: `aggregate` b 3,012,453, n 2,864,220, f 3,015,714;
+`aggregate-groups` b 3,516,543, n 3,279,818, f 3,572,500. The run's verify pass found 0 problems
+in its 52 results files.
+
+On the W1b head, f reads at b on all four scenarios (−0.1%, −1.9%, +1.8%, −0.8%) and 5.0% and 7.9%
+under n on the two `aggregate` scenarios. The floor is no longer faster than the flag build: fl
+reads +1.1% and +2.9% above f, inside the spread on `aggregate`. On `aggregate-groups` the gap holds
+in all three rounds (fl 0.291, 0.293, 0.293 against f 0.285, 0.285, 0.284), and is the layout
+difference a patched build brings. With the key copy gone, taking the flag reads out buys nothing
+the ladder can resolve.
+
+What the session concludes:
+
+- **The flag reads cost nothing the ladder resolves**: fl→f is within the spread on all four
+  scenarios before the key fix, and the floor isn't faster than the flag build after it. The
+  ADR's fallback, a flags byte on `Event`, isn't built.
+- **The 2026-10-22 bisect over-credited `1f30eb3c`'s probes.** Of that commit's +11.6% and +11.5%
+  step, the part that outlived `927f7733`'s memoization (+4.2% and +3.1% at `92b6b708`) was the
+  series-key copy. The probes cost what b→n shows, +5.0% and +6.8%; the key copy explains +4.8%
+  and +4.7% of it (b→f with fk at b's level), which leaves the probes themselves at roughly 0 on
+  `aggregate` and +2% on `aggregate-groups`.
+- **`json-parse` and `passthrough` move by 2.1% or less across all four binaries**, inside the
+  box's spread; nothing attributes them.
+- **`SeriesKey` still clones the event's attribute map once per record**
+  ([docs/plans/metric-flags.md](../plans/metric-flags.md)'s "Findings"). A borrowed-key lookup
+  would remove it; nothing measures that yet.
+
+The raw results and flamegraphs are under `~/lib/logit/tmp/perf/vm-2026-10e/` and
+`~/lib/logit/tmp/perf/vm-2026-10e-final/`, with the session tooling under
+`~/lib/logit/tmp/perf-sessions/2026-10e-flags/`, outside the repository.
 
 ### `tail_in`: before and after the read-path fix
 

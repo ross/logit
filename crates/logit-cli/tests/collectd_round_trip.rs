@@ -1448,6 +1448,7 @@ async fn collectd_in_aggregate_collectd_out_relay_is_exact_for_cumulative_sums()
 
     let mut aggregator = Aggregator::new(Duration::from_secs(10));
     let resource = batch.resource.clone();
+    aggregator.begin_batch(&resource);
     let forwarded: Vec<logit_core::Event> = batch
         .events
         .iter()

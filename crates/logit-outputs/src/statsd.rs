@@ -306,7 +306,7 @@
 //! | `attributes/private_carrier`, under `format: statsd` | lost | `logit.output.fields.omitted{reason=dialect}` | Plain statsd has no `\|c:`, `\|e:`, `\|card:`, or `\|T` segment, so those carriers are omitted, counted once per carrier per line; the type carrier survives as the line's type, `h` and `d` as `ms`. |
 //! | `attributes/private_carrier`, otherwise | exact | -- | A `_logit.statsd.*` carrier is written as its own segment or field and statsd_in stamps it back. |
 //! | `attributes/prometheus_target` | lost | structural | The scrape target is private and isn't a tag, so it's left off. |
-//! | `attributes/foreign_carrier` | lost | structural | Another protocol's `_logit.` carrier is private and isn't a tag, so it's left off. Under `format: dogstatsd`, `_logit.datadog.hostless` on a record with no `host`, no non-empty `host.name`, and no non-empty `h:` field is an empty `host:` tag, which statsd_in reads back as an empty `host`. |
+//! | `attributes/foreign_carrier` | lost | structural | Another protocol's `_logit.` carrier is private and isn't a tag, so it's left off. Under `format: dogstatsd`, `_logit.datadog.hostless` on a record with no `host`, no non-empty `host.name`, and no non-empty `h:` field is an empty `host:` tag, which statsd_in reads back as an empty `host`. A `_logit.metrics.*` flag is left off too, and statsd_in sets `_logit.metrics.closed` again on a `\|T` line it reads back. |
 //! | `attributes/resource_attribute`, under `format: statsd` | lost | `logit.output.tags.omitted{reason=dialect}` | Plain statsd has no tags. |
 //! | `attributes/resource_attribute`, otherwise | normalized | `resource_merged` | A resource attribute is written as a tag, the event's value winning on a shared key, and reads back as an event attribute. |
 //! | `attributes/scope` | lost | structural | statsd has no instrumentation scope, so none is written. |
@@ -430,7 +430,8 @@
 //! wire seconds `statsd_in` stamps alongside setting `Event::timestamp`) renders as `|T<secs>`
 //! **from the carrier, never from `event.timestamp`**: a stage that rebuilds `Event::timestamp`
 //! after decode (a `timestamp` transform, or a Lua script) can't fabricate or collapse a `|T`.
-//! `aggregate` passes a record carrying it through unmerged, with its own timestamp. A
+//! `aggregate` passes such a record through unmerged, with its own timestamp, on the
+//! `_logit.metrics.closed` flag `statsd_in` sets beside the carrier, not on the carrier. A
 //! `_logit.statsd.timestamp` that isn't a
 //! `Value::U64` (reachable from a cross-protocol relay or Lua, never from `statsd_in`) isn't
 //! emitted.

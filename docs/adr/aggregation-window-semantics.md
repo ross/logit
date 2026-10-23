@@ -1,6 +1,6 @@
 ---
 created: 2026-08-29
-updated: 2026-10-19
+updated: 2026-10-22
 ---
 
 # `aggregate` transform: tumbling windows, pass-through, and the flush-tick contract
@@ -541,7 +541,7 @@ contract.
 ### Series identity
 
 **A series is `(name, unit, attribute set)`, compared structurally, not by IEEE-754 `==`.**
-The attribute set leaves out InfluxDB string fields (`_logit.influxdb.field.*`); see
+The attribute set leaves out InfluxDB string fields (`_logit.field.*`); see
 "Amendment: InfluxDB string fields aren't series identity (2026-10-19)" below.
 `SeriesKey`'s `PartialEq` and `Hash` walk the attribute set through `value_key_eq` and
 `hash_value`, and the rules are:
@@ -870,7 +870,7 @@ because a config with a cumulative `aggregate` upstream would have delivered it
 
 ## Amendment: InfluxDB string fields aren't series identity (2026-10-19)
 
-`aggregate` leaves every `_logit.influxdb.field.*` attribute out of a series' key and out of what
+`aggregate` leaves every `_logit.field.*` attribute out of a series' key and out of what
 it flushes. Every other attribute, private ones included, stays in the key.
 
 [ADR `influxdb-line-protocol-relay`](influxdb-line-protocol-relay.md)'s "Amendment: string fields
@@ -987,3 +987,34 @@ bounded-error, as `DdSketch::merge` documents.
   point's time at the sink, and `statsd_out` re-emits the `|T` from the carrier.
 - A pipeline that wants such points summarized has to remove the carrier first, for example with
   `remove`, and accept the flush time in place of the source time.
+
+## Amendment: the decoders set flags, and `aggregate` reads them (2026-10-22)
+
+The two 2026-10-19 amendments keep their outcomes and lose their detection. `aggregate` no longer
+reads `_logit.statsd.timestamp`, `_logit.prometheus.timestamp`, `_logit.datadog.stats.name`, or any
+`_logit.field.*` key on its own. The decoder that stamps each carrier stamps a flag beside it, and
+`aggregate` reads only the flags ([ADR `metric-flags`](metric-flags.md), "The flags"):
+
+- An event flagged `_logit.metrics.closed` passes through whole, before every other reason. The
+  flag's value is the reason it counts, `timestamped` or `bucketed`. Any other `Str`, or
+  `Bool(true)`, counts `flagged`, an eighth reason, so a script can't put free text into a tag.
+- An event flagged `_logit.metrics.fields` has its `_logit.field.*` keys, and the flag, left out
+  of the series key and the flushed series. An unflagged event's attributes are its series
+  identity whole, so a `_logit.field.*` key on it splits series like any other attribute.
+
+Each flag is the event's value, else the batch resource's, which `aggregate` reads once per batch
+in `Transform::begin_batch`. An event that carries every carrier and no flag is windowed; a
+regression test in `crates/logit-transforms/src/aggregate.rs` pins that.
+
+The two sections' consequences change with it:
+
+- The pass-through check is one binary search of the event's attributes for each flag, on symbols
+  interned once, and the `_logit.field.` scan runs only on a flagged event.
+- To summarize a timestamped point or a stats group anyway, `remove` `_logit.metrics.closed`
+  ahead of `aggregate`, and for a DogStatsD point `_logit.statsd.timestamp` too: that carrier
+  would otherwise stay in the series key, one series per source second, and `statsd_out` writes
+  `|T` from it. Removing a carrier alone no longer changes whether `aggregate` passes the event
+  through.
+- A `keep` ahead of `aggregate` strips the flags under its default `private: drop`, as it stripped
+  the carriers, so the outcome there is unchanged.
+- A Lua script or a `set` can close an event, or announce a string field, with the same flags.

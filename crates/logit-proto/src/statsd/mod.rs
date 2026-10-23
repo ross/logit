@@ -53,7 +53,9 @@
 //! stage that rebuilds `Event::timestamp` (`aggregate`'s flush), and it tells a wire timestamp from
 //! a receipt-time one. A `|T` that isn't an unsigned integer (the form is under the rejection rules
 //! below), or whose nanoseconds overflow `i64`, rejects only that line as `bad_line`. Both
-//! attributes are protocol-namespaced carriers (`docs/adr/lossless-transit.md`). Every other
+//! attributes are protocol-namespaced carriers (`docs/adr/lossless-transit.md`). Beside the
+//! timestamp carrier, `|T` stamps the flag `_logit.metrics.closed: "timestamped"`, which tells
+//! `aggregate` the point has its own time (`docs/adr/metric-flags.md`, "The flags"). Every other
 //! unrecognized `|` segment is accepted and ignored, for forward compatibility.
 //!
 //! **`|e:<external-data>` (v1.5, Agent 7.57+) and `|card:<cardinality>` (v1.6, Agent 7.64+)** stamp
@@ -143,7 +145,7 @@
 //!   `_logit.statsd.event.host` (`h:`), each only if present, plus `_logit.statsd.timestamp`,
 //!   `_logit.statsd.container_id`, `_logit.statsd.external_data`, `_logit.statsd.cardinality` and
 //!   `#tags` as on a metric line. `d:<secs>` plays `|T`'s role (same checked parse, same event
-//!   timestamp and carrier); `|T` itself is an unrecognized field here and is ignored.
+//!   timestamp, carrier, and flag); `|T` itself is an unrecognized field here and is ignored.
 //!
 //! **Service check**: `_sc|<NAME>|<STATUS>|d:<secs>|h:<hostname>|#<tags>|c:<container_id>|
 //! e:<external_data>|card:<cardinality>|m:<message>`. `NAME` must be non-empty and `STATUS` an
@@ -156,7 +158,7 @@
 //! `_logit.statsd.service_check.name` (always, `Value::Str`: `MetricRecord` has nowhere else to
 //! carry it), `_logit.statsd.service_check.status` (always, `Value::U64`),
 //! `_logit.statsd.service_check.message` (`m:`, verbatim) and `_logit.statsd.service_check.host`
-//! (`h:`), plus `_logit.statsd.timestamp`, `_logit.statsd.container_id`,
+//! (`h:`), plus `_logit.statsd.timestamp` and its flag, `_logit.statsd.container_id`,
 //! `_logit.statsd.external_data`, `_logit.statsd.cardinality` and `#tags` as above.
 //!
 //! **Tag values, `|c:<id>`, and set members are zero-copy slices of the datagram**, like every

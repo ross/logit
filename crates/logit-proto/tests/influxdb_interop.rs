@@ -12,10 +12,11 @@
 //! identifiable values, never on whole-file bytes.
 
 use bytes::Bytes;
+use logit_core::attrs::FIELD_PREFIX;
 use logit_core::interner::resolve;
 use logit_core::{Event, EventBatch, MetricKind, MetricValue, Resource, Value};
 use logit_proto::influxdb::encode::InfluxLineEncoder;
-use logit_proto::influxdb::{InfluxDecoder, Precision, ATTR_MEASUREMENT, FIELD_ATTR_PREFIX};
+use logit_proto::influxdb::{InfluxDecoder, Precision, ATTR_MEASUREMENT};
 use logit_proto::Encoder;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
@@ -100,13 +101,13 @@ fn with_field<'a>(batch: &'a EventBatch, name: &str, f: &str) -> &'a Event {
     events_of(batch, name)
         .into_iter()
         .find(|e| {
-            field(e, f).is_some() || e.attributes.get(&format!("{FIELD_ATTR_PREFIX}{f}")).is_some()
+            field(e, f).is_some() || e.attributes.get(&format!("{FIELD_PREFIX}{f}")).is_some()
         })
         .unwrap_or_else(|| panic!("no {name} event with field {f}"))
 }
 
 fn string_field<'a>(event: &'a Event, f: &str) -> Option<&'a str> {
-    event.attributes.get(&format!("{FIELD_ATTR_PREFIX}{f}")).and_then(Value::as_str)
+    event.attributes.get(&format!("{FIELD_PREFIX}{f}")).and_then(Value::as_str)
 }
 
 fn each_batch(mut check: impl FnMut(&Capture, &EventBatch)) {

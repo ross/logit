@@ -2699,7 +2699,9 @@ pub enum ComponentKind {
     /// exposition sample with a timestamp, passes through unaggregated and keeps that timestamp.
     /// So does a Datadog APM stats group, which already summarizes its own time bucket, and a
     /// counter increment, gauge, or gauge adjustment whose value is NaN or infinite.
-    /// None is dropped.
+    /// None is dropped. A `lua` or `set` stage can ask for the same pass-through for any event by
+    /// setting the attribute `_logit.metrics.closed`, and removing it from a decoded event lets
+    /// that event aggregate.
     Aggregate {
         #[serde(with = "humantime_serde_duration")]
         #[schemars(with = "String")]
@@ -3320,14 +3322,14 @@ pub enum ComponentKind {
     /// Parses a log message as InfluxDB line protocol and emits one event per point, in the shape
     /// `influxdb_in` gives one: the measurement as `_logit.influxdb.measurement`, tags as
     /// attributes, each numeric or boolean field as a gauge named `<measurement>.<field>`, and
-    /// each string field as the attribute `_logit.influxdb.field.<key>`, which `influxdb_out`
+    /// each string field as the attribute `_logit.field.<key>`, which `influxdb_out`
     /// writes and every other protocol sink leaves off. Every sink that renders the whole event
     /// carries it. Points in one message with the same measurement, tag set, and timestamp merge into
     /// one event.
     ///
     /// Each point's event starts from a copy of the parent's attributes, with the point's own
     /// tags winning a collision. `influxdb_out` writes each inherited attribute outside `_logit.`
-    /// as a tag, and an inherited `_logit.influxdb.field.<key>` as the string field `<key>`; place
+    /// as a tag, and an inherited `_logit.field.<key>` as the string field `<key>`; place
     /// `keep` or `remove` to choose them. A point with no timestamp takes the parent's.
     ///
     /// A line that doesn't parse, or whose timestamp is out of range, is skipped and counted, and

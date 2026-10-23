@@ -1,6 +1,6 @@
 ---
 created: 2026-10-13
-updated: 2026-10-21
+updated: 2026-10-22
 ---
 
 # InfluxDB line-protocol relay: fields as typed `Gauge` records under a measurement carrier, strings as attributes, and an all-or-nothing write
@@ -19,6 +19,8 @@ amended form.
 Amended on 2026-10-20 by [ADR `influxdb-histogram-summary-shape`](influxdb-histogram-summary-shape.md):
 `influxdb_out` writes a histogram, summary, or sketch in Telegraf's `prometheus-v1` shape, and a
 `Histogram`'s temporality joins normalization 10.
+Amended on 2026-10-22 by "Amendment: string fields move to the `_logit.field.` namespace
+(2026-10-22)": the key becomes `_logit.field.<key>`, and nothing else about it changes.
 
 ## Context
 
@@ -85,7 +87,7 @@ One point decodes to one `Event`:
 | integer field `f=1i` | `<measurement>.f`, `Gauge(I64(1))` |
 | unsigned field `f=1u` | `<measurement>.f`, `Gauge(U64(1))` |
 | boolean field `f=true` | `<measurement>.f`, `Gauge(Bool(true))` |
-| string field `f="x"` | event attribute `_logit.influxdb.field.f`, `Value::Str("x")` |
+| string field `f="x"` | event attribute `_logit.field.f`, `Value::Str("x")` |
 | N numeric or boolean fields | N records on the one `Event`, in wire order |
 | timestamp | `event.timestamp`, scaled to nanoseconds by `precision` |
 | no timestamp | `event.timestamp` = the request's receipt time |
@@ -119,7 +121,7 @@ are private carriers under `_logit.influxdb.`, which every other sink leaves off
 | Attribute | Scope | Value | Meaning |
 |---|---|---|---|
 | `_logit.influxdb.measurement` | event | `Str` | the point's measurement; its presence selects the carrier path on `influxdb_out` |
-| `_logit.influxdb.field.<key>` | event | `Str` | a string field named `<key>` |
+| `_logit.field.<key>` | event | `Str` | a string field named `<key>` |
 | `_logit.influxdb.org` | resource | `Str` | the request's `org` query parameter |
 | `_logit.influxdb.org_id` | resource | `Str` | the request's `orgID` query parameter |
 | `_logit.influxdb.bucket` | resource | `Str` | the request's `bucket` query parameter |
@@ -135,7 +137,7 @@ is an ordinary tag.
 **With `_logit.influxdb.measurement`**, `influxdb_out` writes one line per event. The measurement
 comes from the carrier. Each record whose name starts with `<measurement>.` becomes a field whose
 key is the rest of the name, in record order, with its typed suffix
-([ADR `typed-metric-scalar`](typed-metric-scalar.md)). Each `_logit.influxdb.field.<key>`
+([ADR `typed-metric-scalar`](typed-metric-scalar.md)). Each `_logit.field.<key>`
 attribute becomes a string field `<key>`, never a tag. Every private `_logit.` attribute is
 skipped as a tag, uncounted. An event with string fields and no
 metrics still writes a line. A record that
@@ -161,7 +163,7 @@ point carries no signal (2026-10-21)".]
 
 ### Strings are attributes, not metrics
 
-A string field decodes to the event attribute `_logit.influxdb.field.<key>` and leaves
+A string field decodes to the event attribute `_logit.field.<key>` and leaves
 `influxdb_out` as a string field. No other sink's metric wire can carry a string value, and
 `aggregate` can't merge one, so a string metric variant would cost every metric sink and
 transform a skip arm. See
@@ -716,3 +718,15 @@ Signal selectors gain an opt-in `none`
 `influxdb_out`, usually the metrics target. No generic component reads the `_logit.influxdb.*`
 carriers to decide this. The codec's module doc (`crates/logit-proto/src/influxdb/mod.rs`) holds
 the canonical statement.
+
+## Amendment: string fields move to the `_logit.field.` namespace (2026-10-22)
+
+A string field decodes to the attribute `_logit.field.<key>`, not `_logit.influxdb.field.<key>`,
+and `influxdb_out` reads that prefix. The namespace names what the key is, data about a point
+and not identity of its series, rather than the protocol that produced it, so a later source of
+such strings needs no InfluxDB-specific key. Behavior is otherwise unchanged: the key is private,
+the decoder omits and counts a tag under it, every other protocol sink ignores it, and `aggregate`
+leaves it out of a series' identity. `logit` is pre-release, so there is no alias and no decode
+path for the old name. [ADR `metric-flags`](metric-flags.md) records the namespace rule, and
+[ADR `private-attribute-namespace`](private-attribute-namespace.md)'s 2026-10-22 amendment its
+place in the private namespace.

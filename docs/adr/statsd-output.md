@@ -1,6 +1,6 @@
 ---
 created: 2026-09-10
-updated: 2026-10-19
+updated: 2026-10-22
 ---
 
 # statsd/DogStatsD egress: dialect, transport, packing, and the v1 metric-kind deferral
@@ -302,7 +302,9 @@ carrier is present and holds a `Value::U64` (a wire `|T<secs>` segment always pr
 that), never derived from `Event::timestamp` — a receipt-time stamp is not a wire-supplied
 timestamp, and a stage that rewrites `Event::timestamp` after decode can't fabricate or collapse
 a `|T` this way. (`aggregate` passes a `|T` record through unmerged, per
-[ADR `aggregation-window-semantics`](aggregation-window-semantics.md)'s 2026-10-19 amendment.) A `_logit.statsd.timestamp` present but not a `Value::U64` (never produced
+[ADR `aggregation-window-semantics`](aggregation-window-semantics.md)'s 2026-10-19 amendment, on
+the `_logit.metrics.closed` flag `statsd_in` sets beside the carrier,
+[ADR `metric-flags`](metric-flags.md).) A `_logit.statsd.timestamp` present but not a `Value::U64` (never produced
 by `statsd_in` itself, but reachable from a cross-protocol relay or a Lua-authored attribute) is
 simply not emitted (`a_non_u64_statsd_timestamp_value_is_not_emitted`). Under `format: statsd`,
 neither field has anywhere to go — both are dropped and counted once per field per emitted

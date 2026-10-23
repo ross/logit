@@ -6,8 +6,8 @@
 //!
 //! 1. **`decode(encode(b)) == b`**, whole-event `PartialEq`. Every fixture has the shape a real
 //!    decode produces (the measurement carrier, `Value::Str` tags, typed `Gauge`s named
-//!    `<measurement>.<field>`, string fields as `_logit.influxdb.field.*`), so the check isn't a
-//!    tautology.
+//!    `<measurement>.<field>`, string fields as `_logit.field.*` with the
+//!    `_logit.metrics.fields` flag), so the check isn't a tautology.
 //! 2. **`encode(decode(encode(b))) == encode(b)`** on bytes, which catches a codec that writes two
 //!    byte strings for one batch.
 //!
@@ -25,6 +25,7 @@
 //!   and instant (normalization 2 would merge them).
 
 use bytes::Bytes;
+use logit_core::attrs::{FIELD_PREFIX, METRICS_FIELDS};
 use logit_core::interner::{intern, resolve};
 use logit_core::{
     AttrMap, Event, EventBatch, MetricKind, MetricRecord, MetricValue, Resource, Value,
@@ -33,8 +34,8 @@ use logit_proto::graphite::GraphiteEncoder;
 use logit_proto::influxdb::encode::InfluxLineEncoder;
 use logit_proto::influxdb::line::{MAX_TIMESTAMP_NS, MIN_TIMESTAMP_NS};
 use logit_proto::influxdb::{
-    InfluxDecoder, Precision, ATTR_MEASUREMENT, FIELD_ATTR_PREFIX, RESOURCE_ATTR_BUCKET,
-    RESOURCE_ATTR_ORG, RESOURCE_ATTR_ORG_ID,
+    InfluxDecoder, Precision, ATTR_MEASUREMENT, RESOURCE_ATTR_BUCKET, RESOURCE_ATTR_ORG,
+    RESOURCE_ATTR_ORG_ID,
 };
 use logit_proto::prometheus::{events_to_families, PrometheusEncoder};
 use logit_proto::{Encoder, FramedEncoder, MessageBuf};
@@ -95,7 +96,10 @@ fn point(
     }
     attributes.insert(ATTR_MEASUREMENT, Value::from(measurement));
     for (key, value) in strings {
-        attributes.insert(&format!("{FIELD_ATTR_PREFIX}{key}"), Value::from(*value));
+        attributes.insert(&format!("{FIELD_PREFIX}{key}"), Value::from(*value));
+    }
+    if !strings.is_empty() {
+        attributes.insert(METRICS_FIELDS, Value::Bool(true));
     }
     let mut event = Event::empty(timestamp, attributes);
     for (key, value) in fields {

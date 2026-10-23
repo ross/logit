@@ -773,6 +773,7 @@ async fn statsd_in_to_aggregate_to_graphite_out_expands_a_timer_into_the_documen
 
     let mut aggregator = Aggregator::new(Duration::from_secs(10));
     let resource = batch.resource.clone();
+    aggregator.begin_batch(&resource);
     let forwarded: Vec<Event> = batch
         .events
         .into_iter()

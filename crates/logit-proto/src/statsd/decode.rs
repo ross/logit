@@ -130,6 +130,7 @@ static KEYS: LazyLock<StatsdKeys> = LazyLock::new(|| StatsdKeys {
     external_data: intern("_logit.statsd.external_data"),
     cardinality: intern("_logit.statsd.cardinality"),
     timestamp: intern("_logit.statsd.timestamp"),
+    metrics_closed: intern(logit_core::attrs::METRICS_CLOSED),
     type_: intern("_logit.statsd.type"),
     event_title: intern("_logit.statsd.event.title"),
     event_host: intern("_logit.statsd.event.host"),
@@ -146,6 +147,7 @@ struct StatsdKeys {
     external_data: Symbol,
     cardinality: Symbol,
     timestamp: Symbol,
+    metrics_closed: Symbol,
     type_: Symbol,
     event_title: Symbol,
     event_host: Symbol,
@@ -155,6 +157,14 @@ struct StatsdKeys {
     service_check_name: Symbol,
     service_check_status: Symbol,
     service_check_host: Symbol,
+}
+
+/// Stamps the `_logit.statsd.timestamp` carrier and, beside it, the `_logit.metrics.closed` flag
+/// that tells `aggregate` the point has its own time (ADR `metric-flags`, "The flags").
+fn insert_source_timestamp(attributes: &mut AttrMap, secs: u64) {
+    attributes.insert_sym(KEYS.timestamp, Value::U64(secs));
+    attributes
+        .insert_sym(KEYS.metrics_closed, Value::static_str(logit_core::attrs::CLOSED_TIMESTAMPED));
 }
 
 /// Folds a `#<tag>[:<value>],...` payload (the text after `#`) into `attributes`, for a metric
@@ -313,9 +323,8 @@ fn parse_line(
             let (nanos, secs) = parse_wire_seconds(secs, line)?;
             line_timestamp = nanos;
             // `statsd_out` emits `|T` from this carrier, not `event.timestamp`, which a later
-            // stage may rewrite; so a `|T` the wire never sent can't be fabricated. `aggregate`
-            // reads it as "this point has its own time" and passes the record through.
-            attributes.insert_sym(KEYS.timestamp, Value::U64(secs));
+            // stage may rewrite; so a `|T` the wire never sent can't be fabricated.
+            insert_source_timestamp(&mut attributes, secs);
         }
         // Any other segment is ignored, for forward compatibility.
     }
@@ -408,7 +417,7 @@ fn parse_event(
             } else if let Some(secs) = field.strip_prefix("d:") {
                 let (nanos, secs) = parse_wire_seconds(secs, line)?;
                 line_timestamp = nanos;
-                attributes.insert_sym(KEYS.timestamp, Value::U64(secs));
+                insert_source_timestamp(&mut attributes, secs);
             } else if let Some(host) = field.strip_prefix("h:") {
                 attributes.insert_sym(
                     KEYS.event_host,
@@ -534,7 +543,7 @@ fn parse_service_check(
             } else if let Some(secs) = field.strip_prefix("d:") {
                 let (nanos, secs) = parse_wire_seconds(secs, line)?;
                 line_timestamp = nanos;
-                attributes.insert_sym(KEYS.timestamp, Value::U64(secs));
+                insert_source_timestamp(&mut attributes, secs);
             } else if let Some(host) = field.strip_prefix("h:") {
                 attributes.insert_sym(
                     KEYS.service_check_host,
@@ -1215,6 +1224,13 @@ mod tests {
             event.attributes.get("_logit.statsd.timestamp"),
             Some(&Value::U64(1_700_000_000))
         );
+        assert_eq!(
+            event.attributes.get(logit_core::attrs::METRICS_CLOSED).and_then(|v| v.as_str()),
+            Some("timestamped"),
+            "the flag rides beside the carrier"
+        );
+        let untimed = &decode("hits:1|c")[0];
+        assert_eq!(untimed.attributes.get(logit_core::attrs::METRICS_CLOSED), None);
     }
 
     #[test]
@@ -1459,6 +1475,11 @@ mod tests {
             event.attributes.get("_logit.statsd.timestamp"),
             Some(&Value::U64(1_700_000_000))
         );
+        assert_eq!(
+            event.attributes.get(logit_core::attrs::METRICS_CLOSED).and_then(|v| v.as_str()),
+            Some("timestamped"),
+            "the flag rides beside the carrier"
+        );
     }
 
     #[test]
@@ -1480,6 +1501,11 @@ mod tests {
         assert_eq!(
             event.attributes.get("_logit.statsd.timestamp"),
             Some(&Value::U64(1_700_000_000))
+        );
+        assert_eq!(
+            event.attributes.get(logit_core::attrs::METRICS_CLOSED).and_then(|v| v.as_str()),
+            Some("timestamped"),
+            "the flag rides beside the carrier"
         );
     }
 

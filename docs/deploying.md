@@ -2642,19 +2642,26 @@ sample or set member doesn't share (see
 ## Metrics `aggregate` doesn't merge
 
 `aggregate` forwards some metrics unmerged instead of dropping them, each counted under
-`logit.transform.metrics.passed_through{reason}`. Three reasons depend on what a producer sends:
+`logit.transform.metrics.passed_through{reason}`. Four reasons depend on what a producer sends.
+The first three come from the `_logit.metrics.closed` flag, which the input that decoded the
+metric sets and `aggregate` reads
+([ADR `metric-flags`](adr/metric-flags.md)):
 
 - **`bucketed`**: a Datadog APM stats group passes through whole, with its bucket's start,
   duration, and grouping key, because it already summarizes its own time bucket. A `keep` ahead of
-  `aggregate` needs `private: keep`, or it removes the `_logit.datadog.stats.name` marker and the
-  stats merge as ordinary metrics that no stats route sends.
+  `aggregate` needs `private: keep`, or it removes the flag and the stats merge as ordinary
+  metrics that no stats route sends.
 
 - **`timestamped`**: a metric that carries its own source timestamp, a DogStatsD `|T` line (or a
   service check's `d:`) or a Prometheus exposition sample with a timestamp, passes through with
   that timestamp, as the Datadog Agent leaves a `|T` metric unaggregated. A window would replace
   the producer's time with the flush time and split the series by timestamp. If you want such
-  metrics summarized anyway, drop the `_logit.statsd.timestamp` or `_logit.prometheus.timestamp`
-  attribute with `remove` ahead of `aggregate`, and they take the flush time.
+  metrics summarized anyway, drop both the `_logit.metrics.closed` flag and the protocol's
+  timestamp carrier (`_logit.statsd.timestamp` for DogStatsD) with `remove` ahead of `aggregate`,
+  and they take the flush time. The carrier would otherwise stay in the series key, one series per
+  source second, and `statsd_out` writes `|T` from it.
+- **`flagged`**: a metric whose `_logit.metrics.closed` is any other string, or `true`, set by a
+  `lua` script or a `set`, passes through whole the same way.
 - **`non_finite`**: a counter increment, gauge, or gauge adjustment whose value is `NaN` or
   infinite passes through, so a running total or a held gauge stays finite. The throttled
   `sum_non_finite` and `gauge_non_finite` diagnostics name the metric.
@@ -3414,7 +3421,7 @@ pipeline didn't take the body within 5 seconds and nothing of it was taken, coun
 **What arrives.** Each point becomes one event with its tags as attributes and the private
 attribute `_logit.influxdb.measurement` naming the measurement. Each numeric or boolean field
 becomes a gauge named `MEASUREMENT.FIELD`, and each string field the private attribute
-`_logit.influxdb.field.FIELD`. `org`, `orgID`, and `bucket` become the private resource
+`_logit.field.FIELD`. `org`, `orgID`, and `bucket` become the private resource
 attributes `_logit.influxdb.org`, `_logit.influxdb.org_id`, and `_logit.influxdb.bucket`. No
 protocol sink but `influxdb_out` writes a `_logit.influxdb.` attribute, and none writes one as a
 tag or label.

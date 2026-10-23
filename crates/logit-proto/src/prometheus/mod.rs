@@ -68,7 +68,7 @@
 //! | `# HELP` / `# UNIT` | `description` / `unit` (interned) |
 //! | `_created` (OM) | `start_timestamp` (seconds → nanos) |
 //! | [`Point::Stale`] (remote-write's stale-marker NaN) | the family type's own kind with an empty payload -- `counter` → `Sum{NaN, Cumulative, monotonic}`, `gauge`/`unknown`/`untyped`/`info`/`stateset` → `Gauge(NaN)`, `histogram`/`gaugehistogram` → a bucket-less `Histogram`, `summary` → an empty `Summary` -- and **`flags = FLAG_NO_RECORDED_VALUE`**, which carries the meaning ([`logit_core::MetricRecord::flags`]). The `_logit.prometheus.type` marker is unchanged |
-//! | sample timestamp | `Event::timestamp` + `_logit.prometheus.timestamp: true`; absent → `received_at_nanos`, no marker. The marker says *the producer chose to expose a timestamp on this line*, so a transport that mandates one turns it off with [`PrometheusDecoder::with_timestamp_marker`]`(false)` and sets only the timestamp |
+//! | sample timestamp | `Event::timestamp` + `_logit.prometheus.timestamp: true` + the flag `_logit.metrics.closed: "timestamped"`, which tells `aggregate` the sample has its own time (`docs/adr/metric-flags.md`, "The flags"); absent → `received_at_nanos`, no marker and no flag. The marker says *the producer chose to expose a timestamp on this line*, so a transport that mandates one turns marker and flag off with [`PrometheusDecoder::with_timestamp_marker`]`(false)` and sets only the timestamp |
 //! | OM exemplar | `Exemplar { value, timestamp, trace, filtered_attributes }` -- `trace_id`/`span_id` labels become a [`logit_core::TraceRef`] when both are valid hex (consumed); every other exemplar label, and an invalid id, stays in `filtered_attributes`. Bucket exemplars all collect onto the one record. |
 //!
 //! ## Encode: events → families ([`events_to_families`])
@@ -173,7 +173,7 @@
 //! | `attributes/timestamp_value` | lost | `logit.output.labels.omitted{reason=unrepresentable}` | A timestamp value has no label form and is left off, counted. |
 //! | `attributes/private_carrier` | normalized | `dialect` | The family type and timestamp carriers are consumed into the wire form and a scrape stamps them back; OpenMetrics has no `untyped`, so that type reads back as `unknown`. Remote-write gives every sample a timestamp, so prometheus_in stamps no timestamp carrier; the sample's own timestamp reads back unchanged. |
 //! | `attributes/prometheus_target` | normalized | `retargeted` | The resource's `_logit.prometheus.target` isn't written. A scrape of prometheus_out stamps prometheus_out's own URL, and a remote-write receiver stamps none. Only the original target's host:port survives, as the `instance` label; its scheme and path are lost. |
-//! | `attributes/foreign_carrier` | lost | structural | Another protocol's `_logit.` carrier is private and isn't a label, so it's left off. |
+//! | `attributes/foreign_carrier` | lost | structural | Another protocol's `_logit.` carrier is private and isn't a label, so it's left off. A `_logit.metrics.*` flag is left off too, and a scrape sets `_logit.metrics.closed` again on a sample with its own timestamp; remote-write doesn't. |
 //! | `attributes/resource_attribute` | normalized | `resource_merged`; `logit.output.labels.normalized{reason=name_sanitized}` | A label, the event's value winning on a shared key, read back as an event attribute. A name outside the label-name grammar is sanitized, counted once per label it renames. |
 //! | `attributes/scope` | lost | structural | Prometheus has no instrumentation scope, so none is written. |
 //! | `attributes/datadog_carrier_log` | lost | structural | Another protocol's `_logit.` carrier is private and isn't a label, so it's left off. |
@@ -286,7 +286,7 @@ pub mod text;
 pub use text::Dialect;
 
 use crate::otlp::metrics::SUMMARY_QUANTILES;
-use logit_core::attrs::is_private;
+use logit_core::attrs::{is_private, CLOSED_TIMESTAMPED, METRICS_CLOSED};
 use logit_core::interner::{intern, resolve};
 use logit_core::{
     AttrMap, DdSketch, Diagnostics, Event, Exemplar, Histogram, MetricKind, MetricRecord,
@@ -526,8 +526,8 @@ impl PrometheusDecoder {
         Self::default()
     }
 
-    /// Whether [`families_to_events`] stamps `_logit.prometheus.timestamp: true` on a series that
-    /// carried its own timestamp. Default `true`, for a scrape: an exposition sample's timestamp is
+    /// Whether [`families_to_events`] stamps `_logit.prometheus.timestamp: true`, and the
+    /// `_logit.metrics.closed` flag beside it, on a series that carried its own timestamp. Default `true`, for a scrape: an exposition sample's timestamp is
     /// optional, so its presence is a producer choice worth preserving across a round trip.
     ///
     /// A remote-write receiver sets this `false`. Every remote-write sample carries a timestamp, so
@@ -902,6 +902,7 @@ pub fn families_to_events_with(
                 Some(ts) => {
                     if decoder.timestamp_marker {
                         attributes.insert(ATTR_TIMESTAMP, Value::Bool(true));
+                        attributes.insert(METRICS_CLOSED, Value::static_str(CLOSED_TIMESTAMPED));
                     }
                     ts
                 }
@@ -2044,6 +2045,11 @@ mod tests {
         let events = decode(&[family("m", FamilyType::Gauge, vec![series])]);
         assert_eq!(events[0].timestamp, 1_395_066_363_000_000_000);
         assert_eq!(events[0].attributes.get(ATTR_TIMESTAMP), Some(&Value::Bool(true)));
+        assert_eq!(
+            events[0].attributes.get(METRICS_CLOSED).and_then(Value::as_str),
+            Some(CLOSED_TIMESTAMPED),
+            "the flag rides beside the marker"
+        );
     }
 
     #[test]
@@ -2052,6 +2058,7 @@ mod tests {
             decode(&[family("m", FamilyType::Gauge, vec![Series::new(vec![], Point::Gauge(1.0))])]);
         assert_eq!(events[0].timestamp, RECEIVED_AT);
         assert_eq!(events[0].attributes.get(ATTR_TIMESTAMP), None);
+        assert_eq!(events[0].attributes.get(METRICS_CLOSED), None);
     }
 
     #[test]
@@ -3092,7 +3099,8 @@ mod tests {
         assert!(!is_stale_nan(f64::INFINITY));
     }
 
-    /// `with_timestamp_marker(false)`: the timestamp still lands on the event, the marker doesn't.
+    /// `with_timestamp_marker(false)`: the timestamp still lands on the event, the marker and the
+    /// flag don't.
     #[test]
     fn the_timestamp_marker_can_be_turned_off_without_losing_the_timestamp() {
         let stamped = [family(
@@ -3109,6 +3117,7 @@ mod tests {
         let bare = families_to_events(&stamped, RECEIVED_AT, &mut decoder);
         assert_eq!(bare[0].timestamp, 42);
         assert_eq!(bare[0].attributes.get(ATTR_TIMESTAMP), None);
+        assert_eq!(bare[0].attributes.get(METRICS_CLOSED), None, "nor does the flag");
 
         // A series with no timestamp of its own is unaffected either way.
         let unstamped =

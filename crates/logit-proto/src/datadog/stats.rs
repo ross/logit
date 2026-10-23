@@ -30,6 +30,7 @@ use crate::datadog::generated::trace::{
 use crate::msgpack::{MsgpackError, Reader, Type, Writer};
 use crate::CodecError;
 use bytes::Bytes;
+use logit_core::attrs::{CLOSED_BUCKETED, METRICS_CLOSED};
 use logit_core::interner::{intern, resolve};
 use logit_core::{
     AttrMap, Bin, DdSketch, Event, EventBatch, Mapping, MappingKind, MetricKind, MetricRecord,
@@ -658,6 +659,9 @@ impl DatadogDecoder {
             _ => self.stats_degraded("unknown_trilean"),
         }
         attrs.insert(ATTR_BUCKET_DURATION, Value::U64(bucket.duration));
+        // The group summarizes a bucket the tracer or Agent closed, so `aggregate` must forward it
+        // unmerged (`docs/adr/metric-flags.md`, "The flags").
+        attrs.insert(METRICS_CLOSED, Value::static_str(CLOSED_BUCKETED));
         if bucket.agent_time_shift != 0 {
             attrs.insert(ATTR_BUCKET_AGENT_TIME_SHIFT, Value::I64(bucket.agent_time_shift));
         }
@@ -1426,6 +1430,7 @@ mod tests {
         assert_eq!(a.get(ATTR_SPAN_DERIVED_PRIMARY_TAGS), Some(&strs(&["region:eu"])));
         assert_eq!(a.get(ATTR_BUCKET_DURATION), Some(&Value::U64(10_000_000_000)));
         assert_eq!(a.get(ATTR_BUCKET_AGENT_TIME_SHIFT), Some(&Value::I64(-5)));
+        assert_eq!(s(METRICS_CLOSED), Some(CLOSED_BUCKETED), "the flag rides beside the carriers");
         let names: Vec<&str> = e.metrics.iter().map(|m| resolve(m.name)).collect();
         assert_eq!(
             names,
@@ -1487,7 +1492,8 @@ mod tests {
         let a = &batch.events[0].attributes;
         assert_eq!(a.get(ATTR_STATS_NAME), Some(&Value::str("")));
         assert_eq!(a.get(ATTR_BUCKET_DURATION), Some(&Value::U64(0)));
-        assert_eq!(a.len(), 2, "{a:?}");
+        assert_eq!(a.get(METRICS_CLOSED), Some(&Value::str(CLOSED_BUCKETED)));
+        assert_eq!(a.len(), 3, "{a:?}");
         assert_eq!(batch.events[0].metrics.len(), 4, "no summaries for empty bytes");
     }
 

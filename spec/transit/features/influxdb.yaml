@@ -16,7 +16,7 @@
 - name: string_field
   text: >-
     A quoted string field, stamped as the private event attribute
-    `_logit.influxdb.field.<key>`.
+    `_logit.field.<key>`.
 - name: multi_field
   text: Several fields on one line, one gauge record each on the one event, in wire order.
 - name: escaped_names

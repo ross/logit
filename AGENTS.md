@@ -174,7 +174,10 @@ Details an agent needs beyond the table:
   "Temporality is `aggregate`'s job" section and the
   [ADR `aggregation-window-semantics`](docs/adr/aggregation-window-semantics.md) cumulative
   amendment. Its raw-retention modes keep exact values, with a real HyperLogLog backing
-  `sets: estimate` and the overflow fallback.
+  `sets: estimate` and the overflow fallback. It reads two flags and no protocol carrier: an
+  event flagged `_logit.metrics.closed` passes through whole, and `_logit.field.*` keys leave the
+  series key only on an event flagged `_logit.metrics.fields`. The decoder that stamps a carrier
+  sets the flag beside it ([ADR `metric-flags`](docs/adr/metric-flags.md)).
 - **`lua`**: `Event.new(t)` makes every payload constructible from Lua as the inverse of
   `event:to_table()`, with `flush(now)` supplying a flush-driven emission's timestamp. The Lua
   surface covers `event.metrics`, `event.span`, `scope`, and the log/resource fields. See
@@ -186,7 +189,9 @@ Details an agent needs beyond the table:
   A component's `vars:` map is the script's `vars` global, plain tables built into each VM before
   its source runs, so a copied example script stays unedited while each deployment sets its
   values in config; `logit validate` rejects a `null` or an integer past 2^53 anywhere in it
-  ([ADR `lua-script-vars`](docs/adr/lua-script-vars.md)).
+  ([ADR `lua-script-vars`](docs/adr/lua-script-vars.md)). A script sets the `_logit.metrics.*`
+  flags to steer `aggregate` as a decoder does (`docs/design/lua-api.md`'s "Flagging an event
+  for `aggregate`").
 - **`cumulative_to_delta`** takes each point through the ADR's six rules in order: a first
   point (`initial_value: auto | keep | drop`), a resent or overtaken point (skipped), a reset (a
   decrease, or a start moved past the previous point, emitted whole), a layout change (dropped),
@@ -296,11 +301,16 @@ holds the evidence, and the matching `docs/known-gaps/` file the residual debt. 
 and codecs carry for them:
 
 - **Carriers**: a protocol's raw wire facts with no typed home ride as attributes under the
-  private `_logit.<protocol>.` prefix (`_logit.statsd.type`). That protocol's own sink reads them,
+  private `_logit.<protocol>.` prefix (`_logit.statsd.type`). That protocol's family reads them,
   and every other protocol sink ignores them, uncounted, when it renders attributes
   ([ADR `private-attribute-namespace`](docs/adr/private-attribute-namespace.md);
   [docs/design/data-model.md](docs/design/data-model.md)'s "Well-known attribute names" is the
-  canonical statement).
+  canonical statement). A decoder that needs `aggregate` to treat an event specially sets a
+  `_logit.metrics.*` flag beside the carrier ([ADR `metric-flags`](docs/adr/metric-flags.md)), and
+  a component outside the carrier's family doesn't act on the carrier itself, apart from the three
+  carrier reads (C1 to C3) that
+  [ADR `protocol-knowledge-stays-in-family`](docs/adr/protocol-knowledge-stays-in-family.md)
+  records as debt.
 - **Model v2**: `Sum`/`Samples`/`SetMembers`/`ExponentialHistogram`, `SpanExt`, batch-level
   `Scope`, `MetricRecord.flags`.
 - **OTLP**: scope grouping, start time, description, exemplars, a `NO_RECORDED_VALUE` point
@@ -469,7 +479,7 @@ Per pair:
   measurement as the private attribute `_logit.influxdb.measurement`, tags as event attributes,
   each numeric or boolean field as a typed `Gauge` named `<measurement>.<field>` ([ADR
   `typed-metric-scalar`](docs/adr/typed-metric-scalar.md)), and each string field as the private
-  `_logit.influxdb.field.<key>`. `org`, `orgID`, and `bucket` ride on the resource as
+  `_logit.field.<key>`. `org`, `orgID`, and `bucket` ride on the resource as
   `_logit.influxdb.org`, `_logit.influxdb.org_id`, and `_logit.influxdb.bucket`. `influxdb_out` writes
   each batch there unless its own `bucket:` or `org:` overrides the matching carrier. The presence of `_logit.influxdb.measurement` selects the carrier path on
   `influxdb_out`. Every other protocol sink ignores the private carriers, string fields included, since a
@@ -1125,6 +1135,14 @@ not a style preference:
   (`docs/known-gaps/`), not an accepted codec limitation — don't add a new lossy mapping without
   checking the ADR's [Realization](docs/adr/lossless-transit.md#realization-2026-09-12) and the
   survey it's built on ([`docs/design/telemetry-landscape.md`](docs/design/telemetry-landscape.md)) first.
+- **Protocol knowledge stays in its family.** A component keys behavior on another component's
+  internals (its `_logit.<protocol>.` carriers, wire-specific attribute names, hop identity, or a
+  batch's provenance) only within a lossless family: one like pair above, the Datadog family of
+  DogStatsD, `datadog`, and `datadog_trace`, or the native hop's (`logit_out`, `logit_in`, and the
+  `buffer.disk:` spool). Everything else reads neutral `_logit.metrics.` and `_logit.field.` flags
+  its creator set, public vocabulary, or its own config (provenance ids included); an exception needs
+  its own ADR ([ADR `protocol-knowledge-stays-in-family`](docs/adr/protocol-knowledge-stays-in-family.md),
+  whose plan lists the four reads that break it today).
 - **The wire encoding is decided: hand-rolled, shipped as `logit_proto::native`** — a four-arm
   bake-off (`crates/logit-bench/src/bakeoff/`) settled it against `rkyv`, `postcard`, and OTLP
   itself; see [ADR `native-wire-format-encoding`](docs/adr/native-wire-format-encoding.md) and
