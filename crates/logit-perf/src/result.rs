@@ -4,6 +4,8 @@
 //! `Sample` is one repeat's derived numbers. `ScenarioReport` holds every repeat plus a `median`
 //! and `min` computed independently per field, so neither is any single repeat.
 
+use crate::bimodal::Clusters;
+use crate::threads::ThreadSummary;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -43,6 +45,16 @@ pub struct RunReport {
     pub box_state: Option<BoxState>,
     /// The binary that was spawned, recorded with or without `--logit-bin`.
     pub binary: BinaryInfo,
+    /// `--workers`: the `TOKIO_WORKER_THREADS` the child ran with, `null` when the harness set
+    /// none (a worker count the config sets wins over it).
+    #[serde(default)]
+    pub workers: Option<u32>,
+    /// `--pin-child`'s CPU list, `null` when the child ran unpinned.
+    #[serde(default)]
+    pub pin_child: Option<String>,
+    /// Every `--env KEY=VALUE` set on the child, beside `workers`.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
     pub scenarios: BTreeMap<String, ScenarioReport>,
 }
 
@@ -145,10 +157,17 @@ pub struct ScenarioReport {
     pub repeats: Vec<Sample>,
     pub median: Sample,
     pub min: Sample,
+    /// Whether the repeats' CPU µs/event split into two modes (`crate::bimodal`): `null` under
+    /// five repeats, too few to tell. When `true`, `median` pools both modes and describes neither.
+    #[serde(default)]
+    pub bimodal: Option<bool>,
+    /// The two modes when `bimodal` is `true`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_clusters: Option<Clusters>,
 }
 
 /// The numbers derived from one repeat's wall time and `wait4` rusage.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Sample {
     /// Wall time from the `ready` line to the end of the load (see
     /// `crate::run::spawn_and_measure`). Falls back to spawn-to-completion, with a warning, when
@@ -170,6 +189,11 @@ pub struct Sample {
     /// scenario.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub udp: Option<UdpSample>,
+    /// The child's per-thread accounting (`crate::threads`), on a repeat only: `median` and `min`
+    /// carry none, since no field-by-field reduction of it describes a run. Absent under a
+    /// `perf record` wrapper, whose threads aren't the child's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub threads: Option<ThreadSummary>,
 }
 
 /// What a real-socket repeat's datagrams did: how many were sent, how many the listener
@@ -253,6 +277,7 @@ impl Sample {
             events_per_s: count_f / wall_s,
             cpu_us_per_event: cpu_s * 1_000_000.0 / count_f,
             udp: None,
+            threads: None,
         }
     }
 }
@@ -322,6 +347,7 @@ pub fn median_sample(samples: &[Sample]) -> Sample {
             &samples.iter().map(|s| s.cpu_us_per_event).collect::<Vec<_>>(),
         ),
         udp: reduce_udp(samples, median_u64, median_f64),
+        threads: None,
     }
 }
 
@@ -336,6 +362,7 @@ pub fn min_sample(samples: &[Sample]) -> Sample {
         events_per_s: min_f64(&samples.iter().map(|s| s.events_per_s).collect::<Vec<_>>()),
         cpu_us_per_event: min_f64(&samples.iter().map(|s| s.cpu_us_per_event).collect::<Vec<_>>()),
         udp: reduce_udp(samples, min_u64, min_f64),
+        threads: None,
     }
 }
 
@@ -391,6 +418,7 @@ mod tests {
             events_per_s: 1.0 / wall_s,
             cpu_us_per_event,
             udp: None,
+            threads: None,
         }
     }
 
@@ -525,6 +553,8 @@ mod tests {
                 median: median_sample(&repeats),
                 min: min_sample(&repeats),
                 repeats,
+                bimodal: None,
+                cpu_clusters: None,
             },
         );
         let report = RunReport {
@@ -544,6 +574,9 @@ mod tests {
                 source_sha: Some("abc123".to_string()),
                 built_at: Some("2026-09-18T00:00:00Z".to_string()),
             },
+            workers: Some(2),
+            pin_child: Some("2-3".to_string()),
+            env: BTreeMap::from([("A".to_string(), "1=2".to_string())]),
             scenarios,
         };
 
@@ -561,7 +594,9 @@ mod tests {
         let mut c = sample(3.0, 30.0, 300);
         c.udp = Some(udp(1_000, 20, 980, 0.60));
 
-        let median = median_sample(&[a, b, c]).udp.expect("every repeat carried one");
+        let median = median_sample(&[a.clone(), b.clone(), c.clone()])
+            .udp
+            .expect("every repeat carried one");
         assert_eq!(median.kernel_dropped, 20);
         assert_eq!(median.events_delivered, 980);
         assert!((median.kernel_rcvbuf_utilization_max - 0.80).abs() < 1e-9);
@@ -600,7 +635,7 @@ mod tests {
         a.udp = Some(udp(1_000, 10, 990, 0.8));
         let mut b = sample(2.0, 20.0, 200);
         b.udp = Some(udp(1_000, 10, 990, 0.8));
-        assert_eq!(median_sample(&[a, b]).udp.unwrap().effective_rate, Some(100_000));
+        assert_eq!(median_sample(&[a.clone(), b]).udp.unwrap().effective_rate, Some(100_000));
 
         // A hand-merged file mixing two paces must not report either of them as if it were both.
         let mut c = sample(3.0, 30.0, 300);
@@ -645,6 +680,9 @@ mod tests {
                 source_sha: None,
                 built_at: None,
             },
+            workers: None,
+            pin_child: None,
+            env: BTreeMap::new(),
             scenarios: BTreeMap::new(),
         };
         let json = serde_json::to_string(&report).unwrap();

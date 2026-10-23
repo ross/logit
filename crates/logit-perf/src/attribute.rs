@@ -57,6 +57,8 @@ pub struct AttributeArgs {
     /// Sender CPU pinning; only a driven scenario has a sender. See [`crate::load::CpuSet`].
     pub pin_sender: Option<CpuSet>,
     pub pin_child: Option<CpuSet>,
+    /// `--env` and `--workers`, set on the child.
+    pub child_env: crate::child_env::ChildEnv,
 }
 
 pub fn attribute(root: &Path, args: AttributeArgs) -> anyhow::Result<()> {
@@ -132,10 +134,11 @@ fn attribute_in(
     };
 
     println!(
-        "-- {} ({}, internal interval={})",
+        "-- {} ({}, internal interval={}{})",
         scenario.name,
         scenario.workload.describe(),
-        telemetry_leg::format_interval(args.interval)
+        telemetry_leg::format_interval(args.interval),
+        args.child_env.describe(),
     );
     let measured = run::spawn_and_measure(SpawnConfig {
         logit_bin,
@@ -143,6 +146,7 @@ fn attribute_in(
         config: &config_path,
         drive,
         pin_child: args.pin_child.as_ref(),
+        env: &args.child_env,
         // The appended `internal`'s drain loop runs until shutdown.
         needs_sigterm: true,
         settle: args.settle,
@@ -177,6 +181,13 @@ fn attribute_in(
         measured.cpu_us_per_event(delivered),
         measured.usage.max_rss_bytes as f64 / (1024.0 * 1024.0),
     );
+
+    if let Some(threads) = &measured.threads {
+        println!("   {}", threads.describe().trim_start_matches(", "));
+        for line in threads.table("   ") {
+            println!("{line}");
+        }
+    }
 
     print_table(&nodes);
     println!();

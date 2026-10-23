@@ -1,13 +1,15 @@
 #!/bin/bash
-# Usage: script/perf run [--scenario NAME]... [--repeat N] [--label TEXT] [--settle 1s] [--no-build] [--profile release] [--logit-bin PATH]
+# Usage: script/perf run [--scenario NAME]... [--repeat N] [--label TEXT] [--settle 1s] [--no-build] [--profile release] [--logit-bin PATH] [--pin-child CPUS] [--workers N] [--env KEY=VALUE]...
 #        script/perf compare <a.json> <b.json> [--threshold 5.0] [--rss-threshold PCT]
-#        script/perf attribute --scenario NAME [--interval 1s] [--settle 1s] [--no-build] [--profile release] [--logit-bin PATH]
-#        script/perf flamegraph --scenario NAME [--out perf/results/NAME.svg] [--freq 999] [--no-build]
+#        script/perf attribute --scenario NAME [--interval 1s] [--settle 1s] [--no-build] [--profile release] [--logit-bin PATH] [--pin-child CPUS] [--workers N] [--env KEY=VALUE]...
+#        script/perf flamegraph --scenario NAME [--out perf/results/NAME.svg] [--freq 999] [--no-build] [--pin-child CPUS] [--workers N] [--env KEY=VALUE]...
 #        script/perf list
 # Load-test harness (crates/logit-perf): runs the release `logit` binary against
-# perf/scenarios/*.yaml and measures throughput, CPU per event, and peak RSS. `--logit-bin PATH`
-# (relative to the repo root) measures a stashed binary instead of building one. See
-# docs/adr/load-test-harness.md.
+# perf/scenarios/*.yaml and measures throughput, CPU per event, peak RSS, and per-thread CPU.
+# `--logit-bin PATH` (relative to the repo root) measures a stashed binary instead of building one.
+# `--workers N` sets the child's TOKIO_WORKER_THREADS and `--env KEY=VALUE` any other variable;
+# the harness spawns the child itself, so neither crosses `docker run`. `compare` exits 1 on a
+# regression, or 2 when it left a bimodal scenario ungated. See docs/adr/load-test-harness.md.
 #
 # Not part of script/cibuild: it loads the machine heavily, and on a shared runner its numbers
 # measure the runner (ADR `load-test-harness`).
