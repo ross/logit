@@ -3912,8 +3912,8 @@ pub enum ComponentKind {
         /// `tls:` under `transport: udp` is rejected.
         #[serde(default)]
         tls: Option<TlsClientConfig>,
-        /// Opt-in RFC 5424 STRUCTURED-DATA element built from an event's own non-`syslog.*`
-        /// attributes. Absent (the default) emits no such element; a `syslog.sd` attribute
+        /// Opt-in RFC 5424 STRUCTURED-DATA element built from an event's own attributes other
+        /// than `syslog.*` and `host.name` (which HOSTNAME carries). Absent (the default) emits no such element; a `syslog.sd` attribute
         /// (round-tripped from `syslog_in`) still renders regardless. Ignored under `format:
         /// rfc3164`, which has no STRUCTURED-DATA field.
         #[serde(default)]
