@@ -219,9 +219,10 @@ producer's does ([ADR `process-hostname`](process-hostname.md)'s "Amendment: `ho
 standard host key (2026-10-23)").
 
 - **No sink reads another family's host key.** Each reads `host.name` first, then its own
-  family's wire forms, and falls back to the process hostname or its own `hostname:`
-  ([ADR `process-hostname`](process-hostname.md)'s "Amendment: `host.name` ranks first
-  everywhere (2026-10-23)").
+  family's hostless mark where it has one, and falls back to the process hostname or its own
+  `hostname:` ([ADR `process-hostname`](process-hostname.md)'s "Amendment: a source fills the
+  common keys (2026-10-23)", which retired the reads of the family's own wire forms after
+  `host.name` that its "Amendment: `host.name` ranks first everywhere (2026-10-23)" kept).
 - **A retired key says nothing.** An attribute named `collectd.host` is an ordinary attribute at
   every sink, `collectd_out` and `datadog_out` included.
 
@@ -233,3 +234,11 @@ producer's host reaches `syslog_out` with no syslog key set. An attribute named 
 is ordinary at `syslog_out`. `datadog_out` still reads one on a log, because `syslog.hostname` is
 Datadog's own reserved log attribute: public vocabulary under the Decision's second item, not a
 syslog-family key.
+
+The Datadog family follows too (2026-10-23). `statsd_in` and `datadog_in` write every wire host,
+a DogStatsD `host:` tag or `h:` field, a log's `hostname`, an event's `host`, and a check's
+`host_name`, as `host.name`, and the `_logit.statsd.event.host` and
+`_logit.statsd.service_check.host` carriers are retired. `datadog_out` and `statsd_out` read
+`host.name`, then `_logit.datadog.hostless` (C4 stands), and nothing else; a `host` attribute is
+an ordinary tag at both. [ADR `process-hostname`](process-hostname.md)'s "Amendment: a source
+fills the common keys (2026-10-23)" states the rule for every source.

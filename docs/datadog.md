@@ -300,36 +300,37 @@ the rest of the request was stored.
 ([deploying.md's "Hostname"](deploying.md#hostname)) as the host of anything that carries none of
 its own:
 
-- a metric with no `host.name` and no DogStatsD `host:` tag;
-- an event or service check with no `h:` field, no `host.name`, and no `host:` tag;
-- a log with none of `hostname`, `host.name`, `syslog.hostname`, or `host`.
+- a metric, event, or service check with no `host.name` and no hostless mark;
+- a log with no `host.name`, `syslog.hostname`, or `host`.
 
 That's what an Agent does for a DogStatsD client that names no host, so a `logit` on each host
 behaves as the Agent it replaces. A central `logit` receiving from many hosts is different: every
 hostless sender reports under the relay's one host, their series merge under it, and the per-host
 view of them is lost. Datadog bills per host, so the cost matches one Agent.
 
-To keep a host per sender, stamp `host.name` upstream with `set`, or have each DogStatsD client
-send a `host:` tag (or `h:` on an event or check). A host the data carries is never replaced. A
-`host:` tag is the host, and isn't sent as a tag, as the Agent reads it. `collectd_in` stamps
-`host.name` from each value list's and notification's host, so a collectd sender keeps its own.
+`logit`'s inputs read each sender's own host into `host.name`: `statsd_in` a DogStatsD `host:`
+tag (the last one) or an event's or check's `h:` field, `datadog_in` a series' or sketch's
+`host`, a log's `hostname`, an event's `host`, or a check's `host_name`, and `collectd_in` each
+value list's and notification's host. A `host:` tag is the host, and isn't kept as a tag, as the
+Agent reads it. So to keep a host per sender, have each client send one, or stamp `host.name`
+upstream with `set`, which overrides the sender's. A host the data carries is never replaced.
 
-A non-empty `host.name` is the host ahead of every Datadog form: a log's `hostname`, an event's or
-check's `h:` field, a `host:` tag, and a hostless mark. So a `set` of `host.name` overrides them
-all. A log's `hostname` attribute beside it is left off, counted
-`logit.output.tags.omitted{reason="reserved_key"}`.
+A `host` attribute that reaches `datadog_out`, from a `set`, a script, or another protocol such as
+an InfluxDB `host` tag, is an ordinary `host:` tag, not the host. A log's `hostname` attribute
+from such a source is left off, counted `logit.output.tags.omitted{reason="reserved_key"}`,
+because it would be a second `hostname` key. To make either the host, rename it to `host.name`.
 
-A sample a client made hostless with an empty `host:` tag stays hostless, and so does a sample an Agent sends hostless:
-a v2 `host` resource with no name, or `"host":""` on the v1, distribution-point, and sketch
-routes. An empty sketch `host` always reads as hostless, because protobuf can't tell it from a
-missing one.
+A sample a client made hostless with an empty `host:` tag stays hostless, and so does a sample an
+Agent sends hostless: a v2 `host` resource with no name, or `"host":""` on the v1,
+distribution-point, and sketch routes. An empty sketch `host` always reads as hostless, because
+protobuf can't tell it from a missing one. A non-empty `host.name` fills a hostless sample.
 
 Through a local Agent, `statsd_out` under `format: dogstatsd` sends the host where the Agent
-reads it: a non-empty `host.name` as the `host:` tag, else an event's or check's `h:` field, else
-a `host` attribute as the `host:` tag, else an empty `host:` tag for a sample `datadog_in` read as
-hostless. A line with none of them gets the Agent's own hostname. Beside a `host.name`, a `host`
-attribute is left off, counted `logit.output.tags.omitted{reason="unrepresentable"}`, since the
-Agent consumes every `host:` tag and keeps only the last.
+reads it: a non-empty `host.name` as a metric line's `host:` tag and an event's or check's `h:`
+field, else an empty `host:` tag for a hostless sample. A line with neither gets the Agent's own
+hostname. Beside either, a `host` attribute is left off, counted
+`logit.output.tags.omitted{reason="unrepresentable"}`, since the Agent consumes every `host:` tag
+and keeps only the last.
 
 ### `at_least_once` can duplicate a request, and everything but series is stored twice
 

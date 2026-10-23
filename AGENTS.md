@@ -318,8 +318,9 @@ and codecs carry for them:
   ([ADR `protocol-knowledge-stays-in-family`](docs/adr/protocol-knowledge-stays-in-family.md)'s
   "Amendment: move, don't mirror (2026-10-23)"). A component outside a carrier's family doesn't
   act on the carrier itself. A sender's host rides on the standard `host.name`, never a
-  protocol's own key ([ADR `process-hostname`](docs/adr/process-hostname.md)'s "Amendment:
-  `host.name` is the standard host key (2026-10-23)").
+  protocol's own key: the decoder writes it there from the wire's own host forms, and no
+  carrier keeps them ([ADR `process-hostname`](docs/adr/process-hostname.md)'s "Amendment: a
+  source fills the common keys (2026-10-23)").
 - **Model v2**: `Sum`/`Samples`/`SetMembers`/`ExponentialHistogram`, `SpanExt`, batch-level
   `Scope`, `MetricRecord.flags`.
 - **OTLP**: scope grouping, start time, description, exemplars, a `NO_RECORDED_VALUE` point
@@ -327,12 +328,16 @@ and codecs carry for them:
   status-message field, and dropped-attribute counts.
 - **syslog**: structured data as `syslog.sd`, timestamp precedence, bytes MSG, and opt-in
   structured-data emission.
-- **statsd**: raw timers/sets, `|c:`/`|e:`/`|card:`/`|T`, and events/service checks.
+- **statsd**: raw timers/sets, `|c:`/`|e:`/`|card:`/`|T`, events/service checks, and the
+  DogStatsD host (a `host:` tag or an `h:` field) as `host.name`, an empty `host:` tag as
+  `_logit.datadog.hostless`.
 - **Datadog**: `_logit.datadog.*` carriers for every raw field without a typed home (an
   `unspecified` type, resources, origin, trace chunk, tracer, and Agent fields), a `rate` and a
   series interval as the neutral `_logit.metrics.type` and `_logit.metrics.interval`, `DdSketch`
   under `Mapping::agent` for the Agent's metrics sketches and `Mapping::logarithmic` for APM stats
-  sketches, 128-bit trace ids through `_dd.p.tid`, and APM stats as metric events.
+  sketches, 128-bit trace ids through `_dd.p.tid`, APM stats as metric events, and every record's
+  own host (a series' `host`, a log's `hostname`, an event's `host`, a check's `host_name`) as
+  `host.name`.
 - **Splunk**: the OTel `splunk_hec` exporter's vocabulary (`com.splunk.*` and `host.name` on the
   resource, `otel.log.*` into typed log fields), `time` parsed without an `f64`, and the
   exporter's span object decoded back to a `SpanRecord`.
@@ -652,9 +657,9 @@ the operator-facing account of all of this.
 - **Hostname**: `logit run` resolves one process hostname at startup (`logit_pipeline::host`):
   the top-level `hostname:`, else the kernel hostname through `rustix`'s `uname`, never `$HOSTNAME`
   or DNS. `prepare` passes it to `build_spec`, and `internal` stamps it as `host.name` beside
-  `service.name`. `host.name` is the one standard host key: a source writes a sender's host
-  there, and a sink reads it first, ahead of its own family's forms, and never reads another
-  family's. `syslog_out`, `splunk_hec_out`, and `datadog_out` send the process hostname as the
+  `service.name`. `host.name` is the one standard host key: a source fills it from its own wire
+  host forms, by its protocol's rule, and a sink reads it, then its family's hostless mark where
+  it has one, and never a wire form of any family. `syslog_out`, `splunk_hec_out`, and `datadog_out` send the process hostname as the
   host of an event that carries none, never over one it carries; each relay pair names that a
   permitted normalization. `logit validate` doesn't resolve it. `collectd_out` doesn't fall back to it
   ([ADR `process-hostname`](docs/adr/process-hostname.md),

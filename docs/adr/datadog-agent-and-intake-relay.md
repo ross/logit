@@ -564,11 +564,15 @@ carries always wins. Trace and stats payloads keep their tracer and Agent hostna
   `host`. With no `host.name`, or an empty one, a `Str` `host` is the host and isn't sent as a tag, as the Agent's
   `extractTagsMetadata` (datadog-agent 7.83.3, `comp/dogstatsd/server/impl/enrich.go`) reads it.
   An empty one marks a sample hostless, and it is never filled. With `host.name`
-  present, `host` stays an ordinary tag.
+  present, `host` stays an ordinary tag. Superseded (2026-10-23): `statsd_in` decodes the tag to
+  `host.name`, and `host` is an ordinary tag ("Amendment: sources write `host.name` (2026-10-23)"
+  below).
 - **Events and service checks read `host.name` and `host`.** Their host is `host.name`, else
   `_logit.statsd.event.host` or `_logit.statsd.service_check.host` (the `h:` field), else `host`,
   else the process hostname ("Amendment: `host.name` ranks first (2026-10-23)" below). A
-  `host.name` or `host` used this way leaves as the host and not as a tag.
+  `host.name` or `host` used this way leaves as the host and not as a tag. Superseded
+  (2026-10-23): their host is `host.name`, else the hostless mark, else the process hostname
+  ("Amendment: sources write `host.name` (2026-10-23)" below).
 - **A log with a host Datadog reads isn't filled.** Datadog's log preprocessing takes the host
   from `host`, `hostname`, or `syslog.hostname`. A log carrying `hostname`, `host.name`,
   `syslog.hostname`, or `host` gets no default `hostname`, and the last two leave as the
@@ -683,3 +687,36 @@ event's or check's `host.name:` tag, or a log's `host.name` attribute. The last 
 item's own host field, now send `host.name` as the host. The codec's permitted normalizations for
 logs, events, and service checks name both (`crates/logit-proto/src/datadog/mod.rs`, (5) and
 (8)). `crates/logit-proto/src/datadog/mod.rs`'s encode tables are the canonical statement.
+
+Superseded (2026-10-23): the sources now write those wire forms as `host.name`, and `datadog_out`
+reads only `host.name`, then the hostless marks ("Amendment: sources write `host.name`
+(2026-10-23)" below).
+
+## Amendment: sources write `host.name` (2026-10-23)
+
+[ADR `process-hostname`](process-hostname.md)'s "Amendment: a source fills the common keys
+(2026-10-23)" puts the host's wire forms at the source. `datadog_in` and `statsd_in` write every
+record's own host as `host.name`, and `datadog_out` reads nothing else as a host:
+
+- **Decode.** A log's `hostname`, an event's `host`, and a service check's `host_name`, each when
+  non-empty, decode to `host.name`, as a series' and a sketch's `host` already did. `statsd_in`
+  decodes a DogStatsD `host:` tag, and an event's or check's `h:` field, the same way, and an empty
+  `host:` tag to `_logit.datadog.hostless`. A record's own host displaces a `host.name:` tag or a
+  log's `host.name` key, counted `logit.input.tags.omitted{reason="reserved_key"}`. An empty log
+  `hostname`, event `host`, or check `host_name` is no host.
+- **The two host carriers are retired.** `_logit.statsd.event.host` and
+  `_logit.statsd.service_check.host` aren't written or read anywhere.
+- **The `host` tag is a tag.** No decoder writes a `host` attribute, so one is the operator's, and
+  `datadog_out` writes it as an ordinary `host:<v>` tag on every route.
+- **Encode.** Each route writes `host.name` in its own field: a series' `host` resource, a v1,
+  distribution, or sketch `host`, a log's `hostname`, an event's `host`, and a check's
+  `host_name`. Else the hostless mark, never filled, now on events and checks too (an empty
+  DogStatsD `host:` tag on one), else the process hostname. A log's `hostname` attribute is
+  omitted, counted `logit.output.tags.omitted{reason="reserved_key"}`, `host.name` or not: it would
+  be a second `hostname` key. A log carrying `syslog.hostname` or `host` still gets no default.
+
+The relay stays a fixed point modulo the codec's lists, which name the change
+(`crates/logit-proto/src/datadog/mod.rs`'s permitted normalizations): an item's `host.name:` tag
+or key beside its own host no longer relays as the host. Events, checks, and logs now read back
+with `host.name` where they had the carrier or the `hostname` attribute.
+

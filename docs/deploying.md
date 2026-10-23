@@ -525,10 +525,10 @@ was considered.
 own `internal` telemetry, so several instances writing to one metrics backend stay
 distinguishable. The startup log records it as `hostname resolved`.
 
-`host.name` is the one host key every component shares. `collectd_in` and `syslog_in` write each
-sender's host there, and a sink that writes a host reads `host.name` first, then its own
-protocol's host fields, never another protocol's. To set or override a host, stamp `host.name` with
-`set`: a non-empty one outranks every protocol's own host field.
+`host.name` is the one host key every component shares. Each input that receives a sender's host
+writes it there, read by its protocol's own rules: `collectd_in`, `syslog_in`, `statsd_in`,
+`datadog_in`, and `splunk_hec_in`. A sink that writes a host reads `host.name`, and no protocol's
+host field. To set or override a host, stamp `host.name` with `set`.
 
 Three sinks also send it as the host of any event that carries none of its own. They never
 replace a host an event or its resource carries:
@@ -537,7 +537,7 @@ replace a host an event or its resource carries:
 |---|---|---|
 | `syslog_out` | `host.name` on the event, else on the resource | HOSTNAME, unless the sink sets its own `hostname:` |
 | `splunk_hec_out` | `host.name` on the event, else on the resource | each object's envelope `host` |
-| `datadog_out` | `host.name` on the event, else on the resource; else a metric's DogStatsD `host:` tag, an event's or check's `h:` field or `host:` tag, or a log's `hostname`, `syslog.hostname`, or `host` | the host of a metric, log, event, or service check |
+| `datadog_out` | `host.name` on the event, else on the resource; else a hostless mark on a metric, event, or check, which stays hostless, or a log's `syslog.hostname` or `host`, which Datadog reads itself | the host of a metric, log, event, or service check |
 
 So a relay sends the relay's hostname for whatever arrived without one. Through `datadog_out`,
 that means every DogStatsD sender that names no host reports as one Datadog host, as it would

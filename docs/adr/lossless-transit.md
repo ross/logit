@@ -378,6 +378,14 @@ Superseded in part by [ADR `process-hostname`](process-hostname.md)'s "Amendment
 ranks first everywhere (2026-10-23)": the `host.name:` tag is now the `host:` tag on every line,
 and a `host:` tag beside it is omitted, counted `logit.output.tags.omitted{reason="unrepresentable"}`.
 
+Superseded again by that ADR's "Amendment: a source fills the common keys (2026-10-23)":
+`statsd_in` decodes a line's `host:` tag, or an event's or check's `h:` field, to `host.name`, and
+omits a `host.name:` tag beside it, counted `logit.input.tags.omitted{reason="reserved_key"}`. So
+`#host:web-2,host.name:web-1` relays as `#host:web-2`. A `host.name:` tag on a line with no host
+of its own is still the line's host, and relays as `#host:web-1` on a metric line and as `h:web-1`
+on an event or a service check. `crates/logit-cli/tests/statsd_round_trip.rs`'s (10) lists the
+pair's host normalizations.
+
 ## Amendment: a bucketless OTLP histogram keeps its count (2026-10-21)
 
 `logit_core::Histogram` has no `count` field; its population is the sum of its buckets. An OTLP

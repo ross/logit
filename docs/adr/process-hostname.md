@@ -143,7 +143,10 @@ read, and every sink that writes a host takes a per-event `host.name`, `splunk_h
   the process hostname on its resource.
 - **A sink** that needs a host reads `host.name` off the event, else the resource, first, and
   falls back to its own family's wire forms, then the process hostname or its own `hostname:`
-  ("Amendment: `host.name` ranks first everywhere (2026-10-23)" below).
+  ("Amendment: `host.name` ranks first everywhere (2026-10-23)" below). Superseded (2026-10-23):
+  no sink reads its family's wire forms as a fallback; after `host.name` comes only its own
+  hostless mark, where the family has one, then the process hostname or `hostname:` ("Amendment:
+  a source fills the common keys (2026-10-23)" below).
 - **No sink reads another family's host key**, and no sink ranks a foreign key against its own.
 
 `syslog_in` writes HOSTNAME as `host.name` and no longer writes `syslog.hostname`, and
@@ -164,7 +167,10 @@ Before this amendment, a sink's own wire host form ranked ahead of `host.name`: 
 from `internal` or an OTLP sender, reached some records and not others, by protocol. One rule
 replaces that order: `host.name` (event, else resource), when present and not empty, is the host at
 every sink. A sink's own wire forms apply only when there is none. This also changes `datadog_out`'s
-row of the 2026-10-14 table above.
+row of the 2026-10-14 table above. Superseded (2026-10-23): the Datadog family's sources now write
+every wire host as `host.name`, so `datadog_out` and `statsd_out` read no wire form after it,
+only the hostless mark ("Amendment: a source fills the common keys (2026-10-23)" below, whose
+table replaces this one's two rows).
 
 | Sink | Host, in order |
 |---|---|
@@ -188,3 +194,82 @@ DogStatsD `host.name:` tag, a Datadog API event's or check's `host.name:` tag, o
 `host.name` as the host. Each like pair names that a permitted normalization
 (`crates/logit-cli/tests/statsd_round_trip.rs`'s (10), and `logit_proto::datadog`'s permitted
 normalizations for logs, events, and service checks). Every other relay round trip is unchanged.
+
+## Amendment: a source fills the common keys (2026-10-23)
+
+The ranks-first amendment left each Datadog-family sink reading its family's wire host forms
+after `host.name`: a log's `hostname` attribute, an event's or service check's `h:` field (the
+`_logit.statsd.event.host` and `_logit.statsd.service_check.host` carriers), and a DogStatsD
+`host:` tag (a `host` attribute). Each existed only because the source that decoded the wire host
+didn't write `host.name`. So one host could reach the model in four spellings, and every sink that
+cared reread all four. The fix belongs at the source.
+
+**A source fills the common keys; a sink uses them.** A source (a listener's decoder, `internal`,
+`replay_in`, or `generate_in`'s template) is responsible for writing the common keys from its
+incoming data, with logic appropriate to its protocol, at the scope where the value is identity.
+A sink is responsible for using them. A sink never reconstructs a common key from a protocol's
+wire form: a wire form that names the same fact is decoded onto the common key, and the wire form
+doesn't survive as a carrier. Where the protocol has its own rule for which of several wire forms
+names the host, the source applies it, so a sink sees one answer.
+
+For the host, the Datadog family's decoders now apply that rule:
+
+| Wire host | Decodes to |
+|---|---|
+| `datadog_in` series, distribution point, or sketch `host` | `host.name`; `""` is the hostless mark (unchanged) |
+| `datadog_in` log `hostname` | `host.name`; `""` is no host |
+| `datadog_in` event `host` (the Agent's `/intake/` envelope and public v1) | `host.name`; `""` is no host |
+| `datadog_in` service check `host_name` | `host.name`; `""` is no host |
+| `statsd_in` metric line, event, or service check `host:` tag | `host.name`, the last one when there are several, never a tag; an empty one is the hostless mark |
+| `statsd_in` event or service check `h:` field | `host.name`, ahead of a `host:` tag; an empty one is no host, and the tag applies |
+
+That is how a DogStatsD Agent reads a line (datadog-agent 7.83.3,
+`comp/dogstatsd/server/impl/enrich.go`, `extractTagsMetadata` and `enrichEvent`). A record's own
+host displaces a `host.name` the sender spelled as a tag or a log key, counted
+`logit.input.tags.omitted{reason="reserved_key"}`; with no host of its own, such a tag is the
+record's `host.name`. The two `_logit.statsd.*.host` carriers are retired. A `host` attribute is
+an ordinary tag at every sink: no decoder writes one now, so it comes from an operator's `set`, a
+script, or another protocol. A Datadog log's `hostname` attribute, from any of those, would be a
+second `hostname` key in the object, so `datadog_out` omits it, counted.
+
+After `host.name`, a sink reads only its family's hostless mark, then its fallback:
+
+| Sink | Host, in order |
+|---|---|
+| `datadog_out` | `host.name` (event, else resource) in each route's own field; then the hostless mark (`_logit.datadog.hostless`, or a v2 `host` resource with no name), never filled; then the process hostname. A log carrying `syslog.hostname` or `host` gets no default: both are Datadog's own reserved log attributes |
+| `statsd_out` (`format: dogstatsd`) | `host.name` as a metric line's `host:` tag and an event's or service check's `h:` field; then the hostless mark as an empty `host:` tag; no fallback, since the Agent stamps its own. A `host` attribute beside either is omitted, counted, since the Agent would consume it as a second `host:` tag |
+
+The other rows of the ranks-first table are unchanged. The like-pair relays stay fixed points
+modulo their lists; `crates/logit-cli/tests/statsd_round_trip.rs`'s (10) and
+`logit_proto::datadog`'s permitted normalizations name what changed: a DogStatsD `host.name:` tag
+beside a `host:` tag no longer relays as the host, reversing the ranks-first amendment's reading,
+since the source now decides and the wire's own host is the Agent's.
+
+The common keys today, and who writes each:
+
+| Key | Written by, from |
+|---|---|
+| `host.name` | `collectd_in` from each value list's host part, on the event; `syslog_in` from HOSTNAME, on the event; `statsd_in` and `datadog_in` from the wire hosts above, on the event; `splunk_hec_in` from each object's `host`, on the resource; `internal` from the process hostname, on the resource; `otlp_in` passes the sender's resource and record attributes through, which already use the standard key |
+| `service.name` | `internal`; `otlp_in` passes it through; otherwise an operator's `set` |
+| `network.peer.*`, `client.*` | every network listener but `logit_in`, opt-in ([ADR `listener-peer-address`](listener-peer-address.md)) |
+| the `_logit.metrics.*` flags | decoders, where the flag says the whole fact ([ADR `metric-flags`](metric-flags.md)) |
+
+`replay_in` and `logit_in` deliver whatever a source upstream wrote; `generate_in` writes what
+its template says.
+
+**Not yet applied.** These sources have a host-like wire form and don't write `host.name`; each
+is its own follow-up, not part of this amendment:
+
+- `influxdb_in`: a line-protocol tag named `host`, which Telegraf adds to every point by default,
+  stays the tag `host`.
+- `prometheus_in`: the `instance` and `job` labels are Prometheus target identity, not a host,
+  and stay labels. That's settled, not a follow-up.
+- `graphite_in`, `lines_in`, `tail_in`: their wires carry no host field; a host inside a metric
+  path or a line is a transform's to extract.
+- `docker_in`: a container's `config.v2.json` names its `Config.Hostname`, which isn't read.
+- `datadog_in`'s and `datadog_trace_in`'s trace and APM stats payloads: the `TracerPayload` and
+  `ClientStatsPayload` `hostname` (`_logit.datadog.tracer.hostname`) and the Agent's own
+  `hostName`/`internalHostname` (`_logit.datadog.agent.hostname`, also an events envelope's) are
+  payload metadata the trace sinks restore verbatim for the Agent's trace processing, and the
+  Agent's is the relaying Agent's identity, not a sender's host. They stay carriers.
+

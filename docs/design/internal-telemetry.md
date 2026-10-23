@@ -934,8 +934,10 @@ datagram or packet still decodes. The driver's `bad_datagram`/`bad_frame` key, w
 `frames.dropped{reason="undecodable"}`, fires only for the single whole-frame failure
 `StatsdDecoder::decode_into` can return: a frame that isn't valid UTF-8. A `|#` tag whose key
 starts with `_logit.`, the private carrier prefix, is left off its metric, event, or service check
-and counted `logit.input.tags.omitted{reason="reserved_prefix"}`; the line is delivered, and a
-line rejected for another reason counts none. The decoder carries a
+and counted `logit.input.tags.omitted{reason="reserved_prefix"}`, and a `host.name:` tag beside
+the line's own host (a `host:` tag or a non-empty `h:` field) is left off and counted
+`logit.input.tags.omitted{reason="reserved_key"}`; the line is delivered, and a line rejected for
+another reason counts none. The decoder carries a
 sampled `ms`/`h`/`d` line's `@<rate>` verbatim and clamps nothing; `aggregate` bounds the weight a
 rate implies at `Samples::MAX_WEIGHT` and reports a clamp as
 `logit.transform.samples.weight_clamped` and a `sample_rate_clamped` diagnostic under its own
@@ -2659,6 +2661,7 @@ The module doc of `logit_proto::datadog` has the full mapping-to-counter tables.
 | `logit.input.metrics.skipped{reason="empty_sketch"}` | count | a `Dogsketch` with no bins and zero count |
 | `logit.input.metrics.degraded{reason="no_timestamp"}` | count | a point or sketch with no timestamp, stamped with `received_at` |
 | `logit.input.tags.omitted{reason="reserved_prefix"}` | count | a tag whose key starts with `_logit.`, the private carrier prefix, left off a delivered series, sketch, event, or service check, counted per tag: once per series or sketch however many points it delivers |
+| `logit.input.tags.omitted{reason="reserved_key"}` | count | a `host.name` tag, or a log's `host.name` key, left off a delivered record because the record's own host (a series' or sketch's `host`, an empty one included, a log's `hostname`, an event's `host`, or a check's `host_name`) is its `host.name`; counted as `reserved_prefix` is |
 | `logit.output.metrics.dropped{reason="unresolved_cumulative"}` | count | a cumulative monotonic `Sum`, `Histogram`, or `ExponentialHistogram`, which Datadog's exporter differences into a delta first, with no `cumulative_to_delta` upstream to do it; counted by the series encoders only, with an `unresolved_cumulative` diagnostic |
 | `logit.output.metrics.skipped{metric_kind="set_members"}` | count | a kind no Datadog route carries; counted by the series encoders only |
 | `logit.output.fields.dropped{reason="unresolved_cumulative"}` | count | a cumulative `Summary`'s `.count` and `.sum`, running totals that need differencing first, left off while its `.quantile` gauges go out; once per summary, with an `unresolved_cumulative` diagnostic. A delta `Summary`, which `cumulative_to_delta` makes, sends both |

@@ -143,10 +143,11 @@ Entry format and the other areas: [the known-gaps index](README.md).
   - **Workaround:** keep one series' readings of one second in one batch: an `aggregate` upstream
     leaves one point per series per window.
 - **`datadog_out` reports every hostless sender under the relay's hostname.** It sends the
-  process hostname for a metric with no `host.name` and no DogStatsD `host:` tag, an event or
-  service check with no `h:` field, no `host.name`, and no `host:` tag, and a log with none of
-  `hostname`, `host.name`, `syslog.hostname`, or `host`. An Agent does the same for a DogStatsD
-  client that names no host.
+  process hostname for a metric, event, or service check with no `host.name` and no hostless
+  mark, and a log with none of `host.name`, `syslog.hostname`, or `host`. `statsd_in` and
+  `datadog_in` decode a sender's own host (a DogStatsD `host:` tag or `h:` field, a log's
+  `hostname`) to `host.name`, so only a sender that names none reaches this. An Agent does the
+  same for a DogStatsD client that names no host.
   - **Consequence:** many senders behind one central `logit` show in Datadog as one host, with
     their series merged under it. Datadog bills per host, so this costs what one Agent would.
   - **Workaround:** stamp `host.name` per sender upstream with `set`, or have each DogStatsD

@@ -942,3 +942,35 @@ The like pair's normalization (10) grows to match: a `host.name:` tag is the `ho
 `host-name-tag-beside-host`). A DogStatsD sender that writes both a `host:` and a `host.name:` tag
 names two hosts; the relay sends the `host.name:` one, which an Agent reading the original line
 would have kept as a tag. `statsd_out`'s module doc section "The host" is the canonical statement.
+
+## Amendment (2026-10-23): the host is `host.name`, in each line's own form
+
+[ADR `process-hostname`](process-hostname.md)'s "Amendment: a source fills the common keys
+(2026-10-23)" moves the DogStatsD host onto `host.name` at the source: `statsd_in` decodes a
+line's last `host:` tag, and an event's or service check's non-empty `h:` field ahead of it, to
+`host.name`, an empty `host:` tag to `_logit.datadog.hostless`, and keeps neither as a tag or a
+carrier. `_logit.statsd.event.host` and `_logit.statsd.service_check.host` are retired. So
+`statsd_out` writes the host from `host.name` alone, in the form the Agent reads for each line:
+
+- **A metric line's host is its `host:` tag**, last among the tags, as before.
+- **An event's or service check's host is its `h:` field**, with no `host:` tag. This replaces
+  the 2026-10-19 choice of a `host:` tag on those lines: with the carrier gone, `h:` is the one
+  form that round-trips through `statsd_in` to the same `host.name`, and it's the form the Agent
+  reads first. A check's trailing metric lines still carry the host as their `host:` tag, since
+  the encoder writes the check's line from its tag segment less that tag.
+- **The hostless mark is an empty `host:` tag on every line kind**, since an empty `h:` is no host
+  to the Agent, which stamps its own.
+- **A `host` attribute is an ordinary tag**, written as `host:<v>`, which the Agent then reads as
+  the host. No decoder writes one, so it's the operator's. Beside a usable `host.name` or the
+  hostless mark it's still omitted, counted `tags.omitted{reason="unrepresentable"}` once per
+  wire tag: it would be a second `host:` tag, and the Agent would silently take the last one.
+
+Normalization (10) of the like pair changes with it (`crates/logit-cli/tests/statsd_round_trip.rs`):
+`#host:web-2,host.name:web-1` now relays as `#host:web-2`, reversing the ranks-first amendment
+above, because the source reads the line as the Agent does and omits the `host.name:` tag,
+counted `logit.input.tags.omitted{reason="reserved_key"}`. Of several `host:` tags only the last
+relays, an event's or check's `host:` tag relays as its `h:` field, and a `host.name:` tag on a
+line with no host of its own still relays as the line's host. The transit spec's
+`Spelling::Statsd` reads `host.name` and the mark back as themselves, and a `host` attribute the
+line's own host doesn't omit back as `host.name` (`crates/logit-cli/src/transit/classes.rs`).
+`statsd_out`'s module doc section "The host" is the canonical statement.
