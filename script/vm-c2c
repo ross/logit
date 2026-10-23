@@ -1,0 +1,54 @@
+#!/bin/bash
+# Runs on the VM, fed on stdin by `script/vm metadata`. Replaces the `c2c:` lines of
+# ~/logit-vm-metadata.txt with the core-to-core latency matrix of this VM's vCPUs and one
+# summary line.
+#
+# The host chooses per VM whether its vCPUs share an L3, and a VM that straddles two put a 2x
+# spread into one scenario's numbers. A pair across two L3s reads about 100 ns against 25 to 35
+# ns inside one.
+#
+# Runs in a pinned official rust image so it needs neither logit-dev:local nor a toolchain on the
+# VM. The install takes about 10 s. Any failure writes `c2c: unavailable (<reason>)`.
+set -u
+
+CRATE_VERSION=1.2.0
+RUST_IMAGE=rust:1.98.1-slim
+META="${HOME}/logit-vm-metadata.txt"
+
+p() { printf '%-16s %s\n' "c2c:" "$1"; }
+
+capture() {
+    local raw
+    raw="$(docker run --rm "${RUST_IMAGE}" sh -c \
+        "cargo install -q core-to-core-latency --version ${CRATE_VERSION} --locked >&2 \
+         && /usr/local/cargo/bin/core-to-core-latency 5000 300" 2>&1 </dev/null)" || {
+        p "unavailable (docker run failed: $(printf '%s' "${raw}" | tail -n 1))"
+        return
+    }
+    raw="$(printf '%s\n' "${raw}" | sed 's/\x1b\[[0-9;]*m//g')"
+    local min max mean
+    min="$(printf '%s\n' "${raw}" | sed -n 's/^ *Min  latency: \([0-9.]*\)ns.*/\1/p')"
+    max="$(printf '%s\n' "${raw}" | sed -n 's/^ *Max  latency: \([0-9.]*\)ns.*/\1/p')"
+    mean="$(printf '%s\n' "${raw}" | sed -n 's/^ *Mean latency: \([0-9.]*\)ns.*/\1/p')"
+    if [ -z "${min}" ] || [ -z "${max}" ] || [ -z "${mean}" ]; then
+        p "unavailable (no Min/Max/Mean lines in the tool's output)"
+        return
+    fi
+    p "core-to-core-latency ${CRATE_VERSION} in ${RUST_IMAGE}, 5000 iterations, 300 samples, ns per vCPU pair"
+    printf '%s\n' "${raw}" | grep -v '^$' | while IFS= read -r line; do p "${line}"; done
+    if awk -v a="${min}" -v b="${max}" 'BEGIN{exit !(b < 2 * a)}'; then
+        p "min ${min} ns max ${max} ns mean ${mean} ns (every pair under 2x the minimum: one L3)"
+    else
+        p "min ${min} ns max ${max} ns mean ${mean} ns (a pair above 2x the minimum: more than one L3)"
+    fi
+}
+
+out="$(capture)"
+touch "${META}"
+# Drop the lines a previous run wrote, so a re-run replaces them.
+tmp="$(mktemp)"
+grep -v '^c2c:' "${META}" > "${tmp}" || true
+printf '%s\n' "${out}" >> "${tmp}"
+cat "${tmp}" > "${META}"
+rm -f "${tmp}"
+printf '%s\n' "${out}"
