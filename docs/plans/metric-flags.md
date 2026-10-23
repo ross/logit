@@ -64,12 +64,15 @@ The ADR holds the vocabulary. The pieces this plan adds to it:
 
 - **W1a.** `FIELD_PREFIX`/`is_field` in `logit_core::attrs`; the InfluxDB decoder and encoder,
   `line_protocol`, and `aggregate`'s scan under the new name (no behavior change);
-  `logit-config` field docs and `script/schema`; `fuzz/seedgen`; the soak `http-ingress`
-  generator config; `script/transit gen`; the amendments to
+  `logit-config` field docs and `script/schema`; the soak `http-ingress` generator config;
+  `script/transit gen`; the amendments to
   [ADR `influxdb-line-protocol-relay`](../adr/influxdb-line-protocol-relay.md) and
   [ADR `private-attribute-namespace`](../adr/private-attribute-namespace.md); every doc that
   names the old prefix (`data-model.md`, `deploying.md`, `AGENTS.md`, `known-gaps/mappings.md`
   through `mapping.yaml`).
+  `fuzz/seedgen` stays as is: its one use of the old prefix is a wire-level tag key that the
+  reserved-prefix guard omits under either name, and regenerating committed seeds needs the
+  nightly image.
 - **W1b.** The decoders set both flags beside the carriers they already stamp; `aggregate` reads
   flags only, through `begin_batch` for the resource half, and drops its `logit_proto` imports;
   the `passed_through` reasons, `flagged` included; the regression test; `script/transit gen`
