@@ -568,6 +568,7 @@
 //! | a summary that isn't a DDSketch, has no mapping, or has a `gamma`/`indexOffset` no mapping can use | that record dropped | `dropped{reason="bad_sketch"}` + diag `bad_stats_sketch` |
 //! | `Service`, `Resource`, `Type`, `SpanKind` | `service.name`, `resource.name`, `span.type`, `span.kind` (ADR decision 8), when non-empty | -- |
 //! | `Name` | [`stats::ATTR_STATS_NAME`], always, even empty: it is what marks the event as APM stats | -- |
+//! | (the group as a whole) | the flag `_logit.metrics.closed: "bucketed"`, always, so `aggregate` forwards the group unmerged (`docs/adr/metric-flags.md`, "The flags") | -- |
 //! | `DBType`, `GRPCStatusCode`, `HTTPMethod`, `HTTPEndpoint`, `srv_src` | `_logit.datadog.stats.db_type`, `.grpc_status_code`, `.http_method`, `.http_endpoint`, `.service_source`, when non-empty | -- |
 //! | `HTTPStatusCode` | `_logit.datadog.stats.http_status_code` (`U64`), when nonzero | -- |
 //! | `Synthetics` | `_logit.datadog.stats.synthetics` = `Bool(true)`, when true | -- |
@@ -921,8 +922,7 @@ pub fn is_datadog_stats(resource: &Resource, event: &Event) -> bool {
 }
 
 /// [`is_datadog_stats`] by `stats_name`, the interned [`stats::ATTR_STATS_NAME`], for a caller
-/// that tests every event and interns the key once (`aggregate`): two binary searches, no
-/// interner probe.
+/// that tests every event and interns the key once: two binary searches, no interner probe.
 pub fn is_datadog_stats_sym(resource: &Resource, event: &Event, stats_name: Symbol) -> bool {
     event.attributes.get_sym(stats_name).is_some()
         || resource.attributes.get_sym(stats_name).is_some()

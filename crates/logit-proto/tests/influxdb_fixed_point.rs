@@ -6,8 +6,8 @@
 //!
 //! 1. **`decode(encode(b)) == b`**, whole-event `PartialEq`. Every fixture has the shape a real
 //!    decode produces (the measurement carrier, `Value::Str` tags, typed `Gauge`s named
-//!    `<measurement>.<field>`, string fields as `_logit.field.*`), so the check isn't a
-//!    tautology.
+//!    `<measurement>.<field>`, string fields as `_logit.field.*` with the
+//!    `_logit.metrics.fields` flag), so the check isn't a tautology.
 //! 2. **`encode(decode(encode(b))) == encode(b)`** on bytes, which catches a codec that writes two
 //!    byte strings for one batch.
 //!
@@ -25,7 +25,7 @@
 //!   and instant (normalization 2 would merge them).
 
 use bytes::Bytes;
-use logit_core::attrs::FIELD_PREFIX;
+use logit_core::attrs::{FIELD_PREFIX, METRICS_FIELDS};
 use logit_core::interner::{intern, resolve};
 use logit_core::{
     AttrMap, Event, EventBatch, MetricKind, MetricRecord, MetricValue, Resource, Value,
@@ -97,6 +97,9 @@ fn point(
     attributes.insert(ATTR_MEASUREMENT, Value::from(measurement));
     for (key, value) in strings {
         attributes.insert(&format!("{FIELD_PREFIX}{key}"), Value::from(*value));
+    }
+    if !strings.is_empty() {
+        attributes.insert(METRICS_FIELDS, Value::Bool(true));
     }
     let mut event = Event::empty(timestamp, attributes);
     for (key, value) in fields {

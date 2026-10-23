@@ -307,6 +307,12 @@ mod tests {
         let version = &events[4];
         assert!(version.metrics.is_empty(), "a string field isn't a metric");
         assert_eq!(str_attr(version, "_logit.field.v"), Some("7.0.0+16903"));
+        assert_eq!(
+            version.attributes.get(logit_core::attrs::METRICS_FIELDS),
+            Some(&Value::Bool(true)),
+            "the decoder's field flag comes with the string field"
+        );
+        assert_eq!(events[3].attributes.get(logit_core::attrs::METRICS_FIELDS), None);
 
         assert_eq!(run.discarded(), 1.0, "the parent, with nothing left, is discarded");
         assert_eq!(run.sum("logit.transform.lines.dropped", "malformed"), 0.0);

@@ -47,6 +47,7 @@
 //! | float / integer / unsigned / boolean field `f` | a [`logit_core::MetricRecord`] named `<measurement>.f`, `Gauge(F64 \| I64 \| U64 \| Bool)` | -- |
 //! | N numeric or boolean fields | N records on the one event, in wire order | -- |
 //! | string field `f="x"` | event attribute `_logit.field.f` ([`logit_core::attrs::FIELD_PREFIX`]), `Value::Str` | -- |
+//! | at least one string field on the event | the flag `_logit.metrics.fields: true`, which tells `aggregate` to look for `_logit.field.*` keys ([ADR `metric-flags`](../../../../docs/adr/metric-flags.md), "The flags") | -- |
 //! | timestamp | `event.timestamp`, scaled to nanoseconds by [`Precision`] | -- |
 //! | no timestamp | the request's arrival time truncated to [`Precision`], one instant for the body (normalization 14) | -- |
 //! | a later point with the same measurement, tag set, and timestamp | merged into the earlier event: each field overwrites its namesake, across types too, or is appended (normalizations 2 and 4) | -- |

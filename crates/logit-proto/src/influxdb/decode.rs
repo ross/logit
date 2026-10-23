@@ -23,7 +23,7 @@ use super::line::{
 };
 use super::{Precision, ATTR_MEASUREMENT};
 use bytes::Bytes;
-use logit_core::attrs::{is_private, FIELD_PREFIX};
+use logit_core::attrs::{is_private, FIELD_PREFIX, METRICS_FIELDS};
 use logit_core::interner::{intern, KeyCache, Symbol};
 use logit_core::subslice;
 use logit_core::{
@@ -59,6 +59,8 @@ pub struct InfluxDecoder {
     keys: KeyCache,
     /// `_logit.influxdb.measurement`, interned once.
     measurement_key: Symbol,
+    /// `_logit.metrics.fields`, interned once: set on an event that carries a string field.
+    fields_flag: Symbol,
     /// Scratch for `<measurement>.<field>` and `_logit.field.<key>`.
     name: String,
     hasher: RandomState,
@@ -88,6 +90,7 @@ impl InfluxDecoder {
             telemetry: Telemetry::default(),
             keys: KeyCache::new(),
             measurement_key: intern(ATTR_MEASUREMENT),
+            fields_flag: intern(METRICS_FIELDS),
             name: String::new(),
             hasher: RandomState::new(),
             index: HashMap::new(),
@@ -269,6 +272,7 @@ impl InfluxDecoder {
                 FieldValue::Str(s) => {
                     let sym = self.field_attr(key);
                     event.attributes.insert_sym(sym, Value::Str(share(body, s)));
+                    event.attributes.insert_sym(self.fields_flag, Value::Bool(true));
                 }
                 _ => {
                     let name = self.metric_name(&line.measurement, key);
@@ -292,6 +296,7 @@ impl InfluxDecoder {
                     }
                     let sym = self.field_attr(key);
                     event.attributes.insert_sym(sym, Value::Str(share(body, s)));
+                    event.attributes.insert_sym(self.fields_flag, Value::Bool(true));
                 }
                 _ => {
                     let sym = self.field_attr(key);
@@ -394,7 +399,8 @@ mod tests {
         assert_eq!(str_attr(e, "dc"), Some("iad"));
         assert_eq!(str_attr(e, ATTR_MEASUREMENT), Some("cpu"));
         assert_eq!(str_attr(e, "_logit.field.note"), Some("hi"));
-        assert_eq!(e.attributes.len(), 4);
+        assert_eq!(e.attributes.get(METRICS_FIELDS), Some(&Value::Bool(true)), "the field flag");
+        assert_eq!(e.attributes.len(), 5);
     }
 
     #[test]
@@ -402,6 +408,25 @@ mod tests {
         let events = decode("log msg=\"started\" 1");
         assert!(events[0].metrics.is_empty());
         assert_eq!(str_attr(&events[0], "_logit.field.msg"), Some("started"));
+        assert_eq!(events[0].attributes.get(METRICS_FIELDS), Some(&Value::Bool(true)));
+    }
+
+    /// The flag marks an event with a string field and no other, so `aggregate` scans only those.
+    #[test]
+    fn only_a_point_with_a_string_field_carries_the_fields_flag() {
+        let events = decode(
+            "m x=1i 5
+m y=\"s\" 6",
+        );
+        assert_eq!(events[0].attributes.get(METRICS_FIELDS), None);
+        assert_eq!(events[1].attributes.get(METRICS_FIELDS), Some(&Value::Bool(true)));
+        // A merge that adds a string field flags the merged event.
+        let merged = decode(
+            "m x=1i 5
+m s=\"a\" 5",
+        );
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].attributes.get(METRICS_FIELDS), Some(&Value::Bool(true)));
     }
 
     // influxd 2.9.1, item 9
