@@ -2175,8 +2175,9 @@ itself. The sink emits each once per batch, however many attempts the runtime ma
   `no_recorded_value` is a `NO_RECORDED_VALUE`-flagged point, which statsd has no way to mark.
 - `logit.output.fields.omitted{reason=...}`, a field left off a line that is still sent: `dialect`
   is a `|c:`/`|e:`/`|card:`/`|T` field with nowhere to go under `format: statsd`, once per field
-  per line, and `invalid_value` is an event's `p:`/`t:` field with an out-of-set value or a
-  `Samples` `sample_rate` outside `(0, 1]`, written without `@rate`.
+  per line, and `invalid_value` is an event's `p:`/`t:` field with an out-of-set value, a
+  `Samples` `sample_rate` outside `(0, 1]`, written without `@rate`, or a `timestamped` event's
+  pre-1970 timestamp, written without `|T` or `d:`, once per line.
 - `logit.output.metrics.degraded{metric_kind=...}` and `logit.output.metrics.skipped{metric_kind=...}`,
   with `metric_kind` one of `"distribution"|"set"|"histogram"|"exponential_histogram"|"summary"|
   "cumulative_sum"|"non_monotonic_delta_sum"`: a summarized kind written as per-component lines

@@ -308,7 +308,7 @@
 //! | `attributes/prometheus_target` | lost | structural | The scrape target is private and isn't a tag, so it's left off. |
 //! | `attributes/foreign_carrier` | lost | structural | Another protocol's `_logit.` carrier is private and isn't a tag, so it's left off. Under `format: dogstatsd`, `_logit.datadog.hostless` on a record with no `host`, no non-empty `host.name`, and no non-empty `h:` field is an empty `host:` tag, which statsd_in reads back as an empty `host`. A `_logit.metrics.*` flag is left off too; the `timestamped` row has `_logit.metrics.closed: timestamped`. |
 //! | `attributes/timestamped`, under `format: statsd` | lost | `logit.output.fields.omitted{reason=dialect}` | Plain statsd has no `\|T` segment, so the event's timestamp is omitted, counted. |
-//! | `attributes/timestamped`, otherwise | exact | -- | The event's timestamp is written as `\|T<seconds>` (`d:<seconds>` on an event or a service check), truncated to whole seconds, and statsd_in sets the flag again. A scraped Prometheus sample with its own timestamp leaves with a `\|T` too. |
+//! | `attributes/timestamped`, otherwise | exact | -- | The event's timestamp is written as `\|T<seconds>` (`d:<seconds>` on an event or a service check), truncated to whole seconds, and statsd_in sets the flag again. A scraped Prometheus sample with its own timestamp leaves with a `\|T` too. A timestamp before 1970 has no unsigned seconds to write, so it's omitted, counted `logit.output.fields.omitted{reason=invalid_value}` once per line. |
 //! | `attributes/resource_attribute`, under `format: statsd` | lost | `logit.output.tags.omitted{reason=dialect}` | Plain statsd has no tags. |
 //! | `attributes/resource_attribute`, otherwise | normalized | `resource_merged` | A resource attribute is written as a tag, the event's value winning on a shared key, and reads back as an event attribute. |
 //! | `attributes/scope` | lost | structural | statsd has no instrumentation scope, so none is written. |
@@ -437,7 +437,9 @@
 //! with it, and a script that sets the flag gets the `|T` it asked for
 //! (`docs/adr/protocol-knowledge-stays-in-family.md`, "Amendment: move, don't mirror").
 //! `aggregate` passes a flagged record through unmerged, with its own timestamp. A flagged event
-//! stamped before 1970 gets no `|T`, which carries unsigned seconds.
+//! stamped before 1970 gets no `|T` or `d:`, which carry unsigned seconds; the line is still sent,
+//! counted `logit.output.fields.omitted{reason="invalid_value"}` once per line under `format:
+//! dogstatsd`, and `{reason="dialect"}` under `format: statsd`, as every flagged line is there.
 //!
 //! `_logit.statsd.external_data` and `_logit.statsd.cardinality` (DogStatsD v1.5's `|e:` and v1.6's
 //! `|card:`) round-trip the same way as `|c:`: a `Value::Str` carrier. Cardinality is sanitized
@@ -650,8 +652,10 @@ pub struct EncodeStats {
     /// [`render_service_check`].
     pub dropped_invalid_service_check: usize,
     /// A field omitted from a line that is still emitted because its value is out of range: an
-    /// event priority/alert type outside its fixed set ([`render_event`]), or a `Samples`
-    /// `sample_rate` outside `(0, 1]`, written without `@rate`. Not `dropped_unencodable_value`,
+    /// event priority/alert type outside its fixed set ([`render_event`]), a `Samples`
+    /// `sample_rate` outside `(0, 1]`, written without `@rate`, or a `timestamped` event's
+    /// pre-1970 `Event::timestamp`, written without `|T`/`d:` under `Format::DogStatsd`, once per
+    /// line. Not `dropped_unencodable_value`,
     /// whose `logit.output.messages.dropped{reason="unencodable_value"}` would claim the whole
     /// message was dropped.
     pub omitted_invalid_values: usize,
@@ -899,6 +903,7 @@ impl StatsdEncoder {
                 external_data: carriers.external_data,
                 cardinality: carriers.cardinality,
                 timestamp_secs: carriers.wire_seconds(event),
+                timestamped: carriers.timestamped,
                 max_packet_bytes: self.max_packet_bytes,
                 stats,
                 diag: &mut self.diag,
@@ -945,6 +950,7 @@ impl StatsdEncoder {
             external_data: carriers.external_data,
             cardinality: carriers.cardinality,
             timestamp_secs: carriers.wire_seconds(event),
+            timestamped: carriers.timestamped,
             max_packet_bytes: self.max_packet_bytes,
             stats,
             diag: &mut self.diag,
@@ -1026,6 +1032,9 @@ struct EncodeCtx<'a> {
     external_data: Option<&'a str>,
     cardinality: Option<&'a str>,
     timestamp_secs: Option<u64>,
+    /// The event is flagged `timestamped`, so a `None` [`Self::timestamp_secs`] is a pre-1970
+    /// timestamp the wire can't hold, not an absent one.
+    timestamped: bool,
     max_packet_bytes: usize,
     stats: &'a mut EncodeStats,
     diag: &'a mut Diagnostics,
@@ -1285,6 +1294,20 @@ fn append_tags(line: &mut String, tag_suffix: &str) {
     }
 }
 
+/// Appends `prefix` and the event's wire seconds for a `timestamped` event. A flagged event stamped
+/// before 1970 has no unsigned seconds to write, so the field is omitted from a line that's still
+/// sent, counted `EncodeStats::omitted_invalid_values`.
+fn append_wire_time(line: &mut String, prefix: &str, ctx: &mut EncodeCtx) {
+    match ctx.timestamp_secs {
+        Some(secs) => {
+            line.push_str(prefix);
+            let _ = write!(line, "{secs}");
+        }
+        None if ctx.timestamped => ctx.stats.omitted_invalid_values += 1,
+        None => {}
+    }
+}
+
 /// Appends `|c:<container-id>`, `|e:<external-data>`, `|card:<cardinality>`, then
 /// `|T<timestamp>` under [`Format::DogStatsd`], or counts each present field into
 /// `EncodeStats::omitted_dialect_fields` under [`Format::Statsd`]. Called after [`append_tags`] on
@@ -1295,16 +1318,16 @@ fn append_dialect_extras(line: &mut String, ctx: &mut EncodeCtx) {
     match ctx.format {
         Format::DogStatsd => {
             append_origin_fields(line, ctx);
-            if let Some(secs) = ctx.timestamp_secs {
-                let _ = write!(line, "|T{secs}");
-            }
+            append_wire_time(line, "|T", ctx);
         }
         Format::Statsd => {
+            // The flag, not `timestamp_secs`: a pre-1970 timestamp has no slot in this dialect
+            // either, so it counts `dialect` like every other flagged line.
             let present = [
                 ctx.container_id.is_some(),
                 ctx.external_data.is_some(),
                 ctx.cardinality.is_some(),
-                ctx.timestamp_secs.is_some(),
+                ctx.timestamped,
             ];
             ctx.stats.omitted_dialect_fields += present.iter().filter(|&&p| p).count();
         }
@@ -1383,9 +1406,7 @@ fn render_event(
     line.push('|');
     line.push_str(text_buf);
 
-    if let Some(secs) = ctx.timestamp_secs {
-        let _ = write!(line, "|d:{secs}");
-    }
+    append_wire_time(line, "|d:", ctx);
     if let Some(host) = carriers.event_host {
         line.push_str("|h:");
         sanitize_into(line, host, is_forbidden_in_extended_field);
@@ -1494,9 +1515,7 @@ fn render_service_check(
     }
     let _ = write!(line, "|{status}");
 
-    if let Some(secs) = ctx.timestamp_secs {
-        let _ = write!(line, "|d:{secs}");
-    }
+    append_wire_time(line, "|d:", ctx);
     if let Some(host) = carriers.service_check_host {
         line.push_str("|h:");
         sanitize_into(line, host, is_forbidden_in_extended_field);
@@ -4032,15 +4051,41 @@ mod tests {
             .map(|value| {
                 metric_event_at(at, "hits", MetricKind::counter(1.0), &[(METRICS_CLOSED, value)])
             })
-            .chain([metric_event_at(
-                -1_000_000_000,
-                "hits",
-                MetricKind::counter(1.0),
-                &[(METRICS_CLOSED, CLOSED_TIMESTAMPED.into())],
-            )])
             .collect();
-        let (msgs, _) = encode(events);
-        assert_eq!(msgs, vec!["hits:1|c"; 4]);
+        let (msgs, stats) = encode(events);
+        assert_eq!(msgs, vec!["hits:1|c"; 3]);
+        assert_eq!(stats, EncodeStats::default(), "no timestamp was asked for, so none is lost");
+    }
+
+    /// A flagged event stamped before 1970 has no unsigned seconds for `|T` or `d:`: the line is
+    /// sent without one, counted `invalid_value` once per line under DogStatsD. Under plain statsd
+    /// it counts `dialect` as every flagged line does, and not `invalid_value` too.
+    #[test]
+    fn a_flagged_pre_1970_timestamp_is_omitted_and_counted() {
+        let flag = [(METRICS_CLOSED, Value::from(CLOSED_TIMESTAMPED))];
+        let before_1970 = || {
+            vec![
+                // A negative absolute gauge is two lines.
+                metric_event_at(-1_000_000_000, "g", MetricKind::gauge(-2.0), &flag),
+                stamped(service_check_event("chk", MetricKind::gauge(0.0), &[]), -1),
+                stamped(event_line_event("t", "x", &[]), -1),
+            ]
+        };
+        let (msgs, stats) = encode(before_1970());
+        assert_eq!(msgs, vec!["g:0|g\ng:-2|g", "_sc|chk|0", "_e{1,1}:t|x"]);
+        assert_eq!(
+            stats,
+            EncodeStats {
+                omitted_invalid_values: 4,
+                degraded_negative_gauges: 1,
+                ..EncodeStats::default()
+            }
+        );
+
+        let (msgs, stats) = encode_with_format(before_1970()[..1].to_vec(), Format::Statsd);
+        assert_eq!(msgs, vec!["g:0|g\ng:-2|g"]);
+        assert_eq!(stats.omitted_dialect_fields, 2, "once per line, as any flagged line");
+        assert_eq!(stats.omitted_invalid_values, 0);
     }
 
     #[test]

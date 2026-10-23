@@ -901,9 +901,10 @@ check's `d:`, `_logit.metrics.closed: "timestamped"` and sets `Event::timestamp`
 carrier beside the flag. `statsd_out` under `format: dogstatsd` writes `|T<secs>` on a metric line,
 and `d:<secs>` on an event or a service-check line, for an event so flagged, on the event or else
 the resource, with `secs` the whole seconds of `Event::timestamp`, truncated. A flagged event
-stamped before 1970 gets none, since the wire's seconds are unsigned. Under `format: statsd` the
-omission is counted as before, `logit.output.fields.omitted{reason="dialect"}`, once for the
-timestamp. ([ADR `protocol-knowledge-stays-in-family`](protocol-knowledge-stays-in-family.md),
+stamped before 1970 gets none, since the wire's seconds are unsigned, and the line is still sent,
+counted `logit.output.fields.omitted{reason="invalid_value"}` once per line. Under `format:
+statsd` the omission is counted as before, `logit.output.fields.omitted{reason="dialect"}`, once
+for the timestamp, pre-1970 or not. ([ADR `protocol-knowledge-stays-in-family`](protocol-knowledge-stays-in-family.md),
 "Amendment: move, don't mirror (2026-10-23)".)
 
 This reverses one decision above: `|T` was the carrier's wire value so that a stage rewriting

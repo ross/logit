@@ -176,8 +176,12 @@ Details an agent needs beyond the table:
   amendment. Its raw-retention modes keep exact values, with a real HyperLogLog backing
   `sets: estimate` and the overflow fallback. It reads two flags and no protocol carrier: an
   event flagged `_logit.metrics.closed` passes through whole, and `_logit.field.*` keys leave the
-  series key only on an event flagged `_logit.metrics.fields`. The decoder that stamps a carrier
-  sets the flag beside it ([ADR `metric-flags`](docs/adr/metric-flags.md)).
+  series key only on an event flagged `_logit.metrics.fields`. A decoder writes the flag in place
+  of a carrier when the flag says the whole fact, as `statsd_in`'s and `prometheus_in`'s
+  timestamps do, and keeps a carrier beside it only for a fact the flag doesn't carry
+  ([ADR `metric-flags`](docs/adr/metric-flags.md),
+  [ADR `protocol-knowledge-stays-in-family`](docs/adr/protocol-knowledge-stays-in-family.md)'s
+  "Amendment: move, don't mirror (2026-10-23)").
 - **`lua`**: `Event.new(t)` makes every payload constructible from Lua as the inverse of
   `event:to_table()`, with `flush(now)` supplying a flush-driven emission's timestamp. The Lua
   surface covers `event.metrics`, `event.span`, `scope`, and the log/resource fields. See
@@ -305,11 +309,13 @@ and codecs carry for them:
   and every other protocol sink ignores them, uncounted, when it renders attributes
   ([ADR `private-attribute-namespace`](docs/adr/private-attribute-namespace.md);
   [docs/design/data-model.md](docs/design/data-model.md)'s "Well-known attribute names" is the
-  canonical statement). A decoder that needs `aggregate` to treat an event specially sets a
-  `_logit.metrics.*` flag beside the carrier ([ADR `metric-flags`](docs/adr/metric-flags.md)), and
-  a component outside the carrier's family doesn't act on the carrier itself, apart from the three
-  carrier reads (C1 to C3) that
-  [ADR `protocol-knowledge-stays-in-family`](docs/adr/protocol-knowledge-stays-in-family.md)
+  canonical statement). A decoder that needs another component to treat an event specially sets a
+  `_logit.metrics.*` flag ([ADR `metric-flags`](docs/adr/metric-flags.md)): in place of a carrier
+  when the flag says the whole fact, as `statsd_in`'s and `prometheus_in`'s timestamps do, and
+  beside one only for a fact the flag doesn't carry
+  ([ADR `protocol-knowledge-stays-in-family`](docs/adr/protocol-knowledge-stays-in-family.md)'s
+  "Amendment: move, don't mirror (2026-10-23)"). A component outside a carrier's family doesn't
+  act on the carrier itself, apart from the four cross-family reads (C1 to C3 and C6) that ADR
   records as debt.
 - **Model v2**: `Sum`/`Samples`/`SetMembers`/`ExponentialHistogram`, `SpanExt`, batch-level
   `Scope`, `MetricRecord.flags`.

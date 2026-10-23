@@ -2401,7 +2401,9 @@ rows:
           text: >-
             The event's timestamp is written as `|T<seconds>` (`d:<seconds>` on an event or a
             service check), truncated to whole seconds, and statsd_in sets the flag again. A
-            scraped Prometheus sample with its own timestamp leaves with a `|T` too.
+            scraped Prometheus sample with its own timestamp leaves with a `|T` too. A timestamp
+            before 1970 has no unsigned seconds to write, so it's omitted, counted
+            `logit.output.fields.omitted{reason=invalid_value}` once per line.
       prometheus_out:
         - when: {bind: null}
           class: lost
