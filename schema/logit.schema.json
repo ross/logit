@@ -32,6 +32,17 @@
         "null"
       ]
     },
+    "runtime": {
+      "description": "How the process schedules its work. Process-level, not per component. Omitting the block keeps the defaults.",
+      "default": {
+        "workers": null
+      },
+      "allOf": [
+        {
+          "$ref": "#/definitions/RuntimeConfig"
+        }
+      ]
+    },
     "shutdown": {
       "description": "How the process stops on SIGTERM or SIGINT. Process-level, not per component. Omitting the block keeps the default: the drain starts as soon as the signal arrives.",
       "default": {
@@ -5664,6 +5675,23 @@
           }
         }
       ]
+    },
+    "RuntimeConfig": {
+      "description": "The `runtime:` block. Every field defaults, so omitting the block leaves the runtime as the process would start without it.",
+      "type": "object",
+      "properties": {
+        "workers": {
+          "description": "The number of worker threads that run the pipeline's tasks. Must be at least 1. Omitted (the default) means one worker per CPU the process may run on, which follows the CPU affinity mask and a container's CPU limit where the kernel reports one; the `TOKIO_WORKER_THREADS` environment variable overrides that default, and applies only when this field is unset. Fewer workers cost less CPU per event and less memory, because a batch stays on one core, but one busy pipeline can use no more cores than there are workers. A `lua` component runs on its own thread, outside this count.",
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 1.0
+        }
+      },
+      "additionalProperties": false
     },
     "SampleKey": {
       "description": "What `sample` hashes to reach its keep/drop verdict. Written `key: trace_id`, `key: {attribute: request_id}`, or `key: {resource: service.name}`.",
