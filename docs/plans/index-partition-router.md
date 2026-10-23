@@ -14,7 +14,7 @@ at the same cost. Sharing the batch behind one `Arc` costs 0.04 to 0.12 µs per 
 what a destination that only reads needs. The worker-count session recorded in
 [`docs/design/performance.md`](../design/performance.md)'s "Runtime worker count" section
 measured the ladder (`route-copy-all2` at 0.456 against `route-copy` at 1.181 and `route` at
-0.738, the only difference being whether the router copies), and a prototype that sends each
+0.734, the only difference being whether the router copies), and a prototype that sends each
 destination the shared batch plus an index list confirmed it on the same VM on 2026-10-23
 (prototype branch `cores/e6b-prototype` at `6a306c9b`, against `main` at `5d5a0429`, both sinking
 into `null_out`, 5 repeats per cell, free runtime):
@@ -97,7 +97,9 @@ The rule is ownership, not reading:
 encoder's event loop iterates the view's masked events. Nothing on the delivery path
 materializes: the sink queue stores views (`StoreItem` carries one), a retry resends the same
 view, `logit_out`'s window round encodes a hop frame from it, and the disk spool encodes its
-record from it (a replayed record is an owned batch, as today).
+record from it and drops the view once the record is written (a replayed record is an owned
+batch, as today), so a `buffer.disk:` sink never pins a shared batch and the backlogged-sink
+rule below applies to the memory store alone.
 
 ### The backlogged-sink rule
 
@@ -154,14 +156,15 @@ later one.
   bullet, which repeats that.
 - **W7, the pipeline layer.** `BatchView` and the masked event; `Delivered` carrying a view;
   `route_batch` and `route_signals_batch` emitting views (index lists, signal masks, no in-place
-  strip, index composition for a router behind a router); `Output::send_view` with `null_out`
-  native and every other sink materializing by default, so the PR is shippable on its own (a
-  materializing sink pays what the router paid, a shift, not a loss); the sink queue storing
+  strip, index composition for a router behind a router); `Output::send` taking `&BatchView`,
+  with `null_out` reading it and every other sink's body opening with one helper call that
+  materializes a partial view until its W8 PR removes the call, so the PR is shippable on its
+  own (a materializing sink pays what the router paid, a shift, not a loss); the sink queue storing
   views with the backlogged-sink rule and its default; the `multicast` rename across the code,
   `tools/soak/soaklib` (`checks.py`, `selftest.py`), the two `route-*` scenario TOML files,
-  [`docs/design/internal-telemetry.md`](../design/internal-telemetry.md), the two ADRs, and
-  AGENTS.md; the allocation pins and `memory.md`'s "Routing" rows. The prototype's
-  `crates/logit-pipeline/src/view.rs` is the starting point; its `send_view` default and
+  [`docs/design/internal-telemetry.md`](../design/internal-telemetry.md), the two ADRs,
+  [ADR `telemetry-loss-vocabulary`](../adr/telemetry-loss-vocabulary.md), and AGENTS.md; the allocation pins and `memory.md`'s "Routing" rows. The prototype's
+  `crates/logit-pipeline/src/view.rs` is the starting point; its materializing default and
   `unwrap_batch` arm are the shapes to keep.
 - **W8, the encoder sweep.** The three trait signatures and every impl, split by crate into
   sibling PRs off W7: `logit-proto`'s `SplunkEncoder`, `OtlpEncoder`, `NativeEncoder`,
@@ -177,8 +180,8 @@ later one.
   [`docs/known-gaps/runtime.md`](../known-gaps/runtime.md) (the bytes a slow target pins below
   the threshold aren't in its own accounting).
 - **W10, the measurement.** New `perf/scenarios/` cells that route into a real sink (`route`
-  and `route-signals` into the JSON encoder, say), run on the VM against `main` before W7, and
-  recorded in `performance.md`. The decision didn't need this run; the record of what a real
+  and `route-signals` into the JSON encoder, say), run on the VM with W8's head against `main`,
+  and recorded in `performance.md`. The decision didn't need this run; the record of what a real
   sink gains does, since every number above sinks into `null_out`.
 
 ## Settled questions
