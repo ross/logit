@@ -161,7 +161,7 @@ Identity — host, plugin, plugin instance, type, type instance — lives on the
   [`docs/design/pipeline-graph.md`](../design/pipeline-graph.md) and the accumulator's own module
   doc describe the batching contract this depends on.
 - `syslog_in` already sets this precedent: RFC 3164/5424's HOSTNAME is stamped as an event attribute
-  (`syslog.hostname`), not folded into a per-message `Resource`, for the identical reason — a shared
+  (`host.name`), not folded into a per-message `Resource`, for the identical reason — a shared
   listener receiving from many hosts keeps one `Resource` and lets identity ride on the event.
   `collectd_in` follows the same shape rather than inventing a second one for a structurally
   identical situation.
@@ -455,7 +455,7 @@ unchanged.
   keys its in-flight-batch decision on `Arc::ptr_eq` of the resource, not on its value, so a
   per-host (or, worse, per-list) `Resource` would silently defeat batch accumulation for a shared
   listener receiving from many hosts — exactly the traffic shape collectd relays produce the most
-  of. `syslog_in`'s `syslog.hostname` precedent already answers this the same way for a structurally
+  of. `syslog_in`'s per-event HOSTNAME precedent already answers this the same way for a structurally
   identical situation.
 - **A raw `_logit.collectd.time` cdtime attribute**, carrying the original bits alongside the
   normalized `Event::timestamp`, the way `host.name`/`_logit.collectd.plugin`/etc. carry

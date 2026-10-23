@@ -372,7 +372,8 @@ Per pair:
   private CAs and mutual TLS included) on both transports, selected by the endpoint's scheme
   ([ADR `otlp-tls-and-pooled-grpc-client`](docs/adr/otlp-tls-and-pooled-grpc-client.md)).
 - **`syslog_in -> syslog_out`**: `syslog_out` speaks RFC 3164/5424 over UDP, TCP, or TLS (RFC
-  5425), round-tripping header fields from an event's `syslog.*` attributes
+  5425), round-tripping header fields from an event's `syslog.*` attributes and HOSTNAME from
+  `host.name`
   ([ADR `syslog-output`](docs/adr/syslog-output.md),
   [ADR `syslog-tcp-ingress-and-tls`](docs/adr/syslog-tcp-ingress-and-tls.md)).
 - **`prometheus_in -> prometheus_out`**: built lossless against the model from its first PR

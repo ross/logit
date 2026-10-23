@@ -222,3 +222,12 @@ standard host key (2026-10-23)").
   wire forms, and falls back to the process hostname or its own `hostname:`.
 - **A retired key says nothing.** An attribute named `collectd.host` is an ordinary attribute at
   every sink, `collectd_out` and `datadog_out` included.
+
+The syslog family follows on the same key. `syslog_in` writes each line's HOSTNAME as the event
+attribute `host.name`, and `syslog_out` reads it off the event, else the batch resource, as
+HOSTNAME ([ADR `syslog-output`](syslog-output.md)'s "Amendment: HOSTNAME is `host.name`
+(2026-10-23)"). A syslog line's host reaches every other sink as any producer's does, and any
+producer's host reaches `syslog_out` with no syslog key set. An attribute named `syslog.hostname`
+is ordinary at `syslog_out`. `datadog_out` still reads one on a log, because `syslog.hostname` is
+Datadog's own reserved log attribute: public vocabulary under the Decision's second item, not a
+syslog-family key.

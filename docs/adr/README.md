@@ -24,7 +24,7 @@ the same date, write the record, then add a row here.
 | [`route_signals`: a native signal router that splits a mixed event into one part per target](route-signals.md) | 2026-10-16 | 2026-10-21 |
 | [LuaJIT's trace compiler is off by default, and `jit: true` turns it on per component](lua-jit-opt-in.md) | 2026-10-16 | 2026-10-22 |
 | [Lua in-place edits: writable log fields, `= nil` deletes an attribute, and `pairs` enumerates a proxy](lua-in-place-edits.md) | 2026-10-16 | 2026-10-18 |
-| [`line_protocol`: parse a log message as InfluxDB line protocol into one event per point, skipping bad lines](line-protocol-transform.md) | 2026-10-16 | 2026-10-22 |
+| [`line_protocol`: parse a log message as InfluxDB line protocol into one event per point, skipping bad lines](line-protocol-transform.md) | 2026-10-16 | 2026-10-23 |
 | [Native transform fan-out: `Transform::process_into` emits extra events into the same batch](transform-fan-out.md) | 2026-10-16 | 2026-10-18 |
 | [`syslog_in` UDP framing: `framing: lines \| datagram`, with today's per-line split as the default](syslog-udp-datagram-framing.md) | 2026-10-16 | 2026-10-18 |
 | [Native hop trace context: the hop trailer carries a sampled batch's trace context, and `logit_in` continues it](native-hop-trace-context.md) | 2026-10-15 | 2026-10-15 |
@@ -102,7 +102,7 @@ the same date, write the record, then add a row here.
 | [collectd binary-protocol relay: identity as attributes, value types as `Sum`/`Gauge`, and a packing encoder](collectd-binary-relay.md) | 2026-09-12 | 2026-10-23 |
 | [Prometheus scrape ingestion and exposition: transports, dialects, and the model mapping](prometheus-scrape-and-exposition.md) | 2026-09-11 | 2026-10-23 |
 | [Metrics model v2: `Sum` replaces `Counter`, raw/summarized pairs, boxed span fidelity, batch-level `Scope`](metrics-model-v2.md) | 2026-09-11 | 2026-10-18 |
-| [RFC 5424 structured-data convention: nested `syslog.sd`, strict parsing, opt-in PEN-qualified emission](syslog-structured-data-convention.md) | 2026-09-11 | 2026-10-18 |
+| [RFC 5424 structured-data convention: nested `syslog.sd`, strict parsing, opt-in PEN-qualified emission](syslog-structured-data-convention.md) | 2026-09-11 | 2026-10-23 |
 | [A shared build cache and one-container check execution for the local development loop](fast-local-development-loop.md) | 2026-09-11 | 2026-09-11 |
 | [statsd/DogStatsD egress: dialect, transport, packing, and the v1 metric-kind deferral](statsd-output.md) | 2026-09-10 | 2026-10-23 |
 | [Lossless like-protocol transit: the internal model is a superset of every supported wire protocol](lossless-transit.md) | 2026-09-10 | 2026-10-23 |
@@ -130,7 +130,7 @@ the same date, write the record, then add a row here.
 | [Operator-declared resource attributes: a `set` transform, not a per-input config field](operator-declared-resource-attributes.md) | 2026-09-03 | 2026-10-21 |
 | [`otlp_out`/`otlp_in` gzip: client never accepts a compressed response, server bounds decompressed size](otlp-compression-and-decompression-bounds.md) | 2026-09-03 | 2026-10-18 |
 | [Signal filtering is two transform components, not a sink field](signal-filtering-components.md) | 2026-09-03 | 2026-10-21 |
-| [Syslog egress: format, transport, and header-field precedence](syslog-output.md) | 2026-09-02 | 2026-10-18 |
+| [Syslog egress: format, transport, and header-field precedence](syslog-output.md) | 2026-09-02 | 2026-10-23 |
 | [Decoupled listener I/O](decoupled-listener-io.md) | 2026-09-02 | 2026-10-07 |
 | [Relative gauge adjustments (`+`/`-` in statsd)](relative-gauge-adjustments.md) | 2026-09-02 | 2026-10-13 |
 | [Committed, pre-generated OTLP protobuf types; no `protoc` in any build path](committed-pregenerated-otlp-protobuf.md) | 2026-09-02 | 2026-09-11 |

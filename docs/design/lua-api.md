@@ -521,7 +521,7 @@ local BUCKET = vars.bucket or "prusa"
 local NAMES = vars.names or {}
 
 function process(event)
-  local mac = event.attributes["syslog.hostname"]
+  local mac = event.attributes["host.name"]
   event.attributes.printer = NAMES[mac] or mac
   resource["_logit.influxdb.bucket"] = BUCKET
   return event

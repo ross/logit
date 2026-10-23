@@ -132,15 +132,16 @@ was the one read left that broke
 [ADR `protocol-knowledge-stays-in-family`](protocol-knowledge-stays-in-family.md): a Lua script or
 `set` that wrote `collectd.host` steered `datadog_out`, and `splunk_hec_out` never read it, so one
 relay sent collectd's host to Datadog and not to Splunk. One shared key ends the cross-family read;
-`splunk_hec_out` still takes only a resource `host.name`, so collectd's per-event host doesn't
-reach its envelope.
+`splunk_hec_out` still takes only a resource `host.name`, so collectd's and syslog's per-event
+hosts don't reach its envelope.
 
 `host.name`, the OpenTelemetry semantic-conventions name, is the one documented host key, spelled
 `logit_core::attrs::HOST_NAME`:
 
 - **A source** that learns a sender's host writes it as `host.name`, at the scope where it is
-  identity. `collectd_in` writes it on each event, because collectd's host varies per value list;
-  `internal` writes the process hostname on its resource.
+  identity. `collectd_in` writes it on each event, because collectd's host varies per value list,
+  and `syslog_in` writes each line's HOSTNAME on its event for the same reason; `internal` writes
+  the process hostname on its resource.
 - **A sink** that needs a host reads `host.name` off the event, else the resource, beside its own
   family's wire forms, and falls back to the process hostname or its own `hostname:`. The table
   gives each sink's order.
@@ -149,15 +150,20 @@ reach its envelope.
 | Sink | Host, in order |
 |---|---|
 | `collectd_out` | `host.name`, then `hostname:`; with neither, the list drops (`no_host`) |
-| `datadog_out` | for a metric, `host.name`, then a DogStatsD `host:` tag; for an event or service check, `statsd.*.host` first; for a log, `hostname` first; then the process hostname. A hostless mark is never filled |
+| `datadog_out` | for a metric, `host.name`, then a DogStatsD `host:` tag; for an event or service check, `statsd.*.host` first; for a log, `hostname` first; then the process hostname. A hostless mark is never filled. A log carrying `syslog.hostname` or `host` gets no default: both are Datadog's own reserved log attributes, which its log preprocessing reads as the host, not syslog-family keys |
 | `splunk_hec_out` | the resource's `host.name`, then the process hostname: the envelope is per batch |
 | `statsd_out` (`format: dogstatsd`) | an event's or check's `h:` field; else a `host` attribute, then a non-empty `host.name`, written as the `host:` tag |
-| `syslog_out` | `syslog.hostname`, then `hostname:`, then the process hostname. It doesn't read `host.name` |
+| `syslog_out` | `host.name` (event, else resource), then `hostname:`, then the process hostname |
 
 Where a sink's own wire carries a host field, that field ranks first: a Datadog log's `hostname`,
 an event's or check's `h:` field, and at `statsd_out` a `host` attribute, `statsd_in`'s reading
-of a DogStatsD `host:` tag, so a DogStatsD relay keeps its tag. `syslog_out` reads only
-`syslog.hostname`. None reads another family's key.
+of a DogStatsD `host:` tag, so a DogStatsD relay keeps its tag. None reads another family's key.
+
+`syslog_in` writes HOSTNAME as `host.name` and no longer writes `syslog.hostname`, and
+`syslog_out` reads `host.name` as HOSTNAME
+([ADR `syslog-output`](syslog-output.md)'s "Amendment: HOSTNAME is `host.name` (2026-10-23)").
+That changes `syslog_out`'s row of the 2026-10-14 table above: its own host is now `host.name`.
+`datadog_out`'s log row there still lists `syslog.hostname`, as Datadog's reserved attribute.
 
 `collectd_in` no longer writes `collectd.host`, and nothing reads it: an attribute of that name
 is an ordinary attribute. Other sinks render collectd's host under the standard name, so

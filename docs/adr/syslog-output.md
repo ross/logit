@@ -1,6 +1,6 @@
 ---
 created: 2026-09-02
-updated: 2026-10-18
+updated: 2026-10-23
 ---
 
 # Syslog egress: format, transport, and header-field precedence
@@ -320,3 +320,26 @@ is absent only when sanitizing empties it.
 
 The precedence above is unchanged: an event's own `syslog.hostname` wins, so a relayed line keeps
 its origin's hostname. A line that arrived with none leaves with the relay's.
+
+## Amendment: HOSTNAME is `host.name` (2026-10-23)
+
+`host.name` is the standard host key
+([ADR `process-hostname`](process-hostname.md)'s "Amendment: `host.name` is the standard host key
+(2026-10-23)"), so the syslog family carries HOSTNAME on it. `syslog_in` writes HOSTNAME as the
+event attribute `host.name`, on both dialects, and writes no `syslog.hostname`. The other header
+facts keep their `syslog.*` keys.
+
+`syslog_out` takes HOSTNAME from, in order:
+
+1. a non-empty `host.name` on the event;
+2. a non-empty `host.name` on the batch resource;
+3. the sink's `hostname:`, else the process hostname.
+
+An empty `host.name` counts as absent at each step, as an empty `syslog.*` attribute does. A
+relayed line still keeps its origin's hostname, and a line that arrived with none still leaves
+with the relay's. Any producer's host now reaches HOSTNAME with no `set` of a syslog key:
+`collectd_in`'s per-event host, or the `host.name` an OTLP sender puts on its resource.
+
+An attribute named `syslog.hostname` is ordinary: `syslog_out` doesn't read it, and the opt-in
+`structured_data` element skips it as it skips every `syslog.*` key. That element also skips
+`host.name`, since HOSTNAME carries it.

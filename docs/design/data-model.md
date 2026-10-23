@@ -96,8 +96,8 @@ optimizations exploit that. Both are hard to retrofit once scripts and codecs de
 
 When data belongs on an event but doesn't warrant a core-model field, a codec stamps it as a
 dotted, `service.name`-style attribute. `syslog_in` stamps the public
-`syslog.facility`/`.timestamp`/`.hostname`/`.tag`/`.pid`/`.msgid`/`.sd` and the private
-`_logit.syslog.severity`, and the OTLP codec stamps the private
+`syslog.facility`/`.timestamp`/`.tag`/`.pid`/`.msgid`/`.sd`, HOSTNAME as the standard
+`host.name` (below), and the private `_logit.syslog.severity`, and the OTLP codec stamps the private
 `_logit.otel.severity_number`/`_logit.otel.severity_text`. `syslog.pid` may be `Value::Str` as well
 as `Value::U64`, because RFC 5424's PROCID is free-form PRINTUSASCII. `syslog.timestamp` may be
 `Value::Null` (a nil `-` RFC 5424 TIMESTAMP) as well as `Value::Timestamp`/`Value::Str`. The
@@ -107,8 +107,8 @@ as `Value::U64`, because RFC 5424's PROCID is free-form PRINTUSASCII. `syslog.ti
 
 **`host.name` is the standard host key** (`logit_core::attrs::HOST_NAME`, the OpenTelemetry
 semantic-conventions name). A source that learns a sender's host writes it as `host.name` at the
-scope where it is identity: `collectd_in` on each event, since collectd's host varies per value
-list, and `internal` on its resource. A sink that needs a host reads `host.name` off the event,
+scope where it is identity: `collectd_in` and `syslog_in` on each event, since a collectd or
+syslog sender's host varies per value list or line, and `internal` on its resource. A sink that needs a host reads `host.name` off the event,
 else the resource, beside its own family's wire forms, and falls back to the process hostname or
 its own `hostname:`. No sink reads another family's host key
 ([ADR `process-hostname`](../adr/process-hostname.md)'s "Amendment: `host.name` is the standard
@@ -284,7 +284,7 @@ instances' lists into one series.
 
 These are **event** attributes, never resource ones. `logit_pipeline::BatchAccumulator::absorb`
 keys accumulation on `Arc::ptr_eq`, so a per-host resource would split every batch by sender; the
-same reasoning keeps `syslog.hostname` on the event. The presence of `_logit.collectd.type` selects
+same reasoning keeps `syslog_in`'s `host.name` on the event. The presence of `_logit.collectd.type` selects
 like-relay encoding at `collectd_out`; an event without it goes through that sink's fallback naming
 path. `crates/logit-proto/src/collectd/mod.rs`'s module doc has the full mapping table.
 
