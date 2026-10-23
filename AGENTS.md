@@ -301,7 +301,7 @@ holds the evidence, and the matching `docs/known-gaps/` file the residual debt. 
 and codecs carry for them:
 
 - **Carriers**: a protocol's raw wire facts with no typed home ride as attributes under the
-  private `_logit.<protocol>.` prefix (`_logit.statsd.type`). That protocol's own sink reads them,
+  private `_logit.<protocol>.` prefix (`_logit.statsd.type`). That protocol's family reads them,
   and every other protocol sink ignores them, uncounted, when it renders attributes
   ([ADR `private-attribute-namespace`](docs/adr/private-attribute-namespace.md);
   [docs/design/data-model.md](docs/design/data-model.md)'s "Well-known attribute names" is the
