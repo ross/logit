@@ -345,7 +345,7 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | [DISK-14](#disk-14--config--spool-wiring-path-resolution-graph-rule-35-and-the-exclusive-lock) | P2 | Config → spool wiring: path resolution, graph rule 35, and the exclusive lock | `crates/logit-cli/src/pipeline.rs` (`queue_config`) | unreviewed |
 | [RT-09](#rt-09--process_batch-in-place-retain_mut-per-event-loop-and-absorbed-accounting) | P2 | `process_batch`: in-place `retain_mut` per-event loop and absorbed accounting | `runtime.rs` (`process_batch`) | unreviewed |
 | [RT-13](#rt-13--readiness-monotonic-phase-transitions-under-concurrent-writers) | P2 | `Readiness`: monotonic phase transitions under concurrent writers | `crates/logit-pipeline/src/readiness.rs` (`Readiness`) | unreviewed |
-| [RT-15](#rt-15--logit-clipipeline-process-lifecycle-the-double-signal-kill-switch-and-configruntime-knob-mapping) | P2 | `logit-cli::pipeline`: process lifecycle, the double-signal kill switch, and config→runtime knob mapping | `crates/logit-cli/src/pipeline.rs` (`run_pipelines`, `write_config`), `crates/logit-cli/src/signals.rs` | unreviewed |
+| [RT-15](#rt-15--logit-clipipeline-process-lifecycle-the-double-signal-kill-switch-and-configruntime-knob-mapping) | P2 | `logit-cli::pipeline`: process lifecycle, the double-signal kill switch, and config→runtime knob mapping | `crates/logit-cli/src/main.rs` (`Command::Run`), `crates/logit-cli/src/pipeline.rs` (`run_pipelines`, `write_config`), `crates/logit-cli/src/signals.rs` | unreviewed |
 | [WIRE-20](#wire-20--prometheus_out-remote-write-sender-timestamp-partition-one-post-per-batch-duplicate-safety) | P2 | `prometheus_out` remote-write sender: timestamp partition, one POST per batch, duplicate safety | `crates/logit-outputs/src/prometheus.rs` (`RemoteWriteOutput`) | unreviewed |
 | [CODEC-04](#codec-04--carbon-plaintextpickle-encoder-tag-sanitization-multi-value-expansion-frame-packing) | P2 | Carbon plaintext/pickle encoder: tag sanitization, multi-value expansion, frame packing | `crates/logit-proto/src/graphite/encode.rs` (`encode_record`, `Sink::emit`, `sanitize_into`) | unreviewed |
 | [CODEC-06](#codec-06--statsddogstatsd-encoder--service-check-status-coercion-and-multi-value-rendering) | P2 | statsd/DogStatsD encoder — service-check status coercion and multi-value rendering | `crates/logit-outputs/src/statsd.rs` (`render_service_check`) | unreviewed |
@@ -3996,12 +3996,14 @@ and out of scope. The only `unsafe` in `logit-pipeline` is in `sockstat.rs` (`me
 ---
 
 ### RT-15 — `logit-cli::pipeline`: process lifecycle, the double-signal kill switch, and config→runtime knob mapping
-- **Location:** `crates/logit-cli/src/pipeline.rs` (`run_pipelines` and its admin bind, `prepare`,
+- **Location:** `crates/logit-cli/src/main.rs` (`Command::Run`), then
+  `crates/logit-cli/src/pipeline.rs` (`run_pipelines` and its admin bind, `prepare`,
   `queue_config`, `write_config`, `input_runtime_config`, `overflow_policy`, `delivery_posture`,
   `build_spec`'s `internal` arm, its `lua_file` read, and its `target`/`route` arms), then
   `crates/logit-cli/src/signals.rs` (`Signals`).
-- **What it does:** Installs the signal handlers (`Signals::install`) and their tasks, then loads and resolves
-  the config, activates the `TelemetryLayer` once the `internal` component's `logs` threshold is known, binds
+- **What it does:** `main.rs` runs `Signals::install_detached` (on the `logit-signals` thread), then
+  `config::load`, then builds the runtime from `runtime.workers`; `run_pipelines` receives `config`, `signals`,
+  and `telemetry_layer` and loads nothing. It resolves the config, activates the `TelemetryLayer` once the `internal` component's `logs` threshold is known, binds
   the admin listener synchronously (a bind failure is `Startup`), and runs the graph. `signals.rs`'s counting
   task fires the drain on the first SIGTERM/SIGINT and `std::process::exit(130)`s on the second; a second task
   bumps the SIGHUP reopen generation. `queue_config`/`write_config`/`input_runtime_config` are the only places
@@ -4015,7 +4017,7 @@ and out of scope. The only `unsafe` in `logit-pipeline` is in `sockstat.rs` (`me
   `ComponentKind` → constructor plumbing and is **not** sensitive.
 - **Invariants to verify:**
   - On Unix, every signal stream exists before `config::load`, so no signal reaches its default disposition
-    after `Signals::install` returns.
+    after `Signals::install_detached` returns.
   - The kill switch's `process::exit(130)` can only fire on a genuine *second* signal, never on a duplicate
     wakeup of the first.
   - The signal tasks (`Signals`' drop) and `admin_server.abort()` stop after `run_with_telemetry` returns, on

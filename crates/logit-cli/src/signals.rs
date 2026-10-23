@@ -2,8 +2,9 @@
 //! drain and a second one exits 130; SIGHUP bumps the reopen generation that file targets and the
 //! TLS reloader watch, and never exits.
 //!
-//! [`Signals::install`] runs before the config loads, on a runtime of its own ([`Signals::install_detached`]). On Unix it creates
-//! every tokio `Signal` stream before it returns. Once a stream exists, the signal's default
+//! [`Signals::install_detached`] installs the handlers before the config loads, on a runtime of
+//! its own. It calls [`Signals::install`], which on Unix creates every tokio `Signal` stream
+//! before it returns. Once a stream exists, the signal's default
 //! disposition is gone for the life of the process and a delivery waits for the stream's next
 //! poll, so a signal that arrives during startup is handled rather than killing the process. Off
 //! Unix, `ctrl_c()` registers when its task first polls it, so a Ctrl-C before then still gets the
