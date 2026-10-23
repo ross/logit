@@ -133,7 +133,7 @@ was the one read left that broke
 `set` that wrote `collectd.host` steered `datadog_out`, and `splunk_hec_out` never read it, so one
 relay sent collectd's host to Datadog and not to Splunk. One shared key ends the cross-family read;
 `splunk_hec_out` still takes only a resource `host.name`, so collectd's and syslog's per-event
-hosts don't reach its envelope.
+hosts don't reach its envelope (the known gap "`splunk_hec_out` writes the envelope `host` from the batch resource only" in [`docs/known-gaps/splunk.md`](../known-gaps/splunk.md)).
 
 `host.name`, the OpenTelemetry semantic-conventions name, is the one documented host key, spelled
 `logit_core::attrs::HOST_NAME`:
@@ -151,7 +151,7 @@ hosts don't reach its envelope.
 |---|---|
 | `collectd_out` | `host.name`, then `hostname:`; with neither, the list drops (`no_host`) |
 | `datadog_out` | for a metric, `host.name`, then a DogStatsD `host:` tag; for an event or service check, `statsd.*.host` first; for a log, `hostname` first; then the process hostname. A hostless mark is never filled. A log carrying `syslog.hostname` or `host` gets no default: both are Datadog's own reserved log attributes, which its log preprocessing reads as the host, not syslog-family keys |
-| `splunk_hec_out` | the resource's `host.name`, then the process hostname: the envelope is per batch |
+| `splunk_hec_out` | the resource's `host.name`, then the process hostname: the envelope is per batch (known gap: [`docs/known-gaps/splunk.md`](../known-gaps/splunk.md)) |
 | `statsd_out` (`format: dogstatsd`) | an event's or check's `h:` field; else a `host` attribute, then a non-empty `host.name`, written as the `host:` tag |
 | `syslog_out` | `host.name` (event, else resource), then `hostname:`, then the process hostname |
 
