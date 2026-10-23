@@ -1,6 +1,6 @@
 ---
 created: 2026-09-11
-updated: 2026-10-21
+updated: 2026-10-23
 ---
 
 # Prometheus scrape ingestion and exposition: transports, dialects, and the model mapping
@@ -99,7 +99,7 @@ MetricRecord] }` per series; labels become `Value::Str` attributes verbatim.
 | `stateset` (OM) | one `Gauge(0\|1)` per state line + `_logit.prometheus.type: "stateset"` |
 | `# HELP` / `# UNIT` | `description` / `unit` (interned) |
 | `_created` (OM) | `start_timestamp` (seconds → ns) |
-| sample timestamp | `Event::timestamp` + marker attr `_logit.prometheus.timestamp: true`; absent → scrape start time, no marker |
+| sample timestamp | `Event::timestamp` + the flag `_logit.metrics.closed: "timestamped"`; absent → scrape start time, no flag |
 | OM exemplar | `Exemplar { value, timestamp, trace: TraceRef when trace_id/span_id labels are valid hex (consumed), filtered_attributes: remaining labels }`; histogram bucket exemplars collect onto the record |
 
 **The `+Inf` bucket is a successive difference like every other bucket, not a separate total.**
@@ -132,8 +132,8 @@ can't carry natively:
 | `ExponentialHistogram` | skipped, `skipped{metric_kind="exponential_histogram"}` (text has no native-histogram syntax) |
 | `flags & NO_RECORDED_VALUE` | skipped, `skipped{reason="no_recorded_value"}` |
 | exemplars | OM only, on `_total`/`_bucket` lines (bucket chosen by value); text mode drops them (dialect choice, not counted) |
-| `Event::timestamp` | emitted only when `_logit.prometheus.timestamp: true` is present (consumed); ms in text, float s in OM |
-| labels | `logit_core::attrs::merged(resource, event)` (event wins), skipping every private `_logit.*` attribute, `_logit.prometheus.type`/`_logit.prometheus.timestamp`/`_logit.prometheus.target` among them; `Value::Str/I64/U64/F64/Bool` stringified; a multi-valued `Array` (a relayed, repeated DogStatsD tag key, `docs/adr/statsd-output.md`'s amendment) renders its **last** representable element, counted `logit.output.labels.normalized{reason="multi_value"}` once per attribute; `Null/Bytes/Timestamp/Map`, and an `Array` with no representable element, dropped — `logit.output.labels.dropped{reason="unrepresentable"}` |
+| `Event::timestamp` | emitted only for an event flagged `_logit.metrics.closed: "timestamped"`, whichever decoder set it; ms in text, float s in OM |
+| labels | `logit_core::attrs::merged(resource, event)` (event wins), skipping every private `_logit.*` attribute, `_logit.prometheus.type`/`_logit.prometheus.target` and the `_logit.metrics.*` flags among them; `Value::Str/I64/U64/F64/Bool` stringified; a multi-valued `Array` (a relayed, repeated DogStatsD tag key, `docs/adr/statsd-output.md`'s amendment) renders its **last** representable element, counted `logit.output.labels.normalized{reason="multi_value"}` once per attribute; `Null/Bytes/Timestamp/Map`, and an `Array` with no representable element, dropped — `logit.output.labels.dropped{reason="unrepresentable"}` |
 | names | see "Names and sanitization" below |
 | `unit` / `description` | `# UNIT` (OM only) / `# HELP` |
 | `EventBatch::scope`, `Resource.schema_url`, `dropped_attributes_count` | dropped (known-gaps rows) |
@@ -199,15 +199,12 @@ an ordinary label there:
 
 - `_logit.prometheus.type` (`Value::Str`): the wire family type when the model has no distinct kind
   for it (`untyped`, `unknown`, `info`, `stateset`, `gaugehistogram`).
-- `_logit.prometheus.timestamp` (`Value::Bool(true)`): the sample carried its own timestamp on the
-  wire; `prometheus_out` re-emits one on that line only. Same shape as
-  `_logit.statsd.timestamp`.
-
-Plus the resource-level `_logit.prometheus.target` above, consumed the same way.
+Plus the resource-level `_logit.prometheus.target` above, consumed the same way. A sample that
+carried its own timestamp has no carrier: it's flagged `_logit.metrics.closed: "timestamped"`, and
+`prometheus_out` writes a timestamp on that line only (the 2026-10-23 amendment below).
 `_logit.prometheus.target` is factual, like `docker_in`'s `container.*` attributes and `instance`
-above (none is an invented `service.name`); `_logit.prometheus.type` and
-`_logit.prometheus.timestamp` instead record how to re-encode a sample, not a fact about it. All
-three are private ([ADR `private-attribute-namespace`](private-attribute-namespace.md)): every
+above (none is an invented `service.name`); `_logit.prometheus.type` instead records how to
+re-encode a sample, not a fact about it. Both are private ([ADR `private-attribute-namespace`](private-attribute-namespace.md)): every
 other protocol sink leaves them off its tags, labels, and fields, uncounted, the way it leaves off
 any `_logit.*` attribute. A whole-event render keeps them; that ADR's "The ignore rule" lists
 the renders.
@@ -269,8 +266,8 @@ equality modulo:
 - **The scrape target is re-stamped.** `prometheus_out` doesn't write `_logit.prometheus.target`,
   so a scrape of the relay stamps the relay's own URL, and a remote-write receiver stamps none.
   Only the original target's `host:port` survives, as `instance`; its scheme and path are lost.
-- **A remote-write receiver stamps no `_logit.prometheus.timestamp` marker.** Every sample keeps
-  its timestamp; only the marker is absent
+- **A remote-write receiver stamps no `_logit.metrics.closed: "timestamped"` flag.** Every sample
+  keeps its timestamp; only the flag is absent
   ([ADR `prometheus-remote-write`](prometheus-remote-write.md)'s "Timestamps: received without the
   marker, sent always").
 - **A counter sample name gains a `_total` suffix if it lacked one**, in either dialect — see the
@@ -646,3 +643,15 @@ and `max`, so the summary keeps the exact extremes the sketch holds. Prometheus 
 minimum and maximum observed. The cost is two more series per distribution. Graphite's and
 statsd's dotted expansion keep `DISTRIBUTION_QUANTILES`, since they write `.min` and `.max`
 already.
+
+## Amendment (2026-10-23): the timestamp carrier is retired
+
+`_logit.prometheus.timestamp` is gone. A scrape flags a sample with its own timestamp
+`_logit.metrics.closed: "timestamped"` and writes no carrier, and `prometheus_out` writes a
+sample timestamp for an event so flagged, on the event or else the resource, whichever decoder set
+the flag ([ADR `protocol-knowledge-stays-in-family`](protocol-knowledge-stays-in-family.md),
+"Amendment: move, don't mirror (2026-10-23)"). The flag's other values (`bucketed`, any other
+`Str`, `Bool(true)`) write none. The relay is the same fixed point. A `statsd_in` `|T` line now
+leaves `prometheus_out` with a sample timestamp too, since `statsd_in` sets the same flag. The
+sections above use the flag; the 2026-10-13 amendment and "Alternatives considered" keep the old
+name as history.

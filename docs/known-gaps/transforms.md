@@ -128,10 +128,9 @@ Entry format and the other areas: [the known-gaps index](README.md).
   `_logit.metrics.closed` ([ADR `metric-flags`](../adr/metric-flags.md)). Points from a wire where
   every point has a time (OTLP, InfluxDB, Graphite, collectd, Datadog series, Prometheus
   remote-write) carry no flag, so they merge and take the flush time.
-  - **Workaround:** to summarize a timestamped point anyway, `remove` both its
-    `_logit.metrics.closed` flag and its timestamp carrier (`_logit.statsd.timestamp`) ahead of
-    `aggregate`: the carrier would otherwise stay in the series key, one series per source
-    second, and `statsd_out` writes `|T` from it. To
+  - **Workaround:** to summarize a timestamped point anyway, `remove` its
+    `_logit.metrics.closed` flag ahead of `aggregate`; the flushed series then carries the flush
+    time and leaves `statsd_out` with no `|T`. To
     keep source timestamps and still leave one point per series per instant, as remote-write and
     `datadog_out` need, use `dedup_timestamps` in place of `aggregate`
     ([ADR `dedup-timestamps-transform`](../adr/dedup-timestamps-transform.md)).

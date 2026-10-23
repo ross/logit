@@ -1,6 +1,6 @@
 ---
 created: 2026-09-29
-updated: 2026-10-21
+updated: 2026-10-23
 ---
 
 # Delivery semantics: at-least-once per hop, duplicates absorbed by the data model, and an effectively-once native hop
@@ -173,7 +173,8 @@ the hook:
   that sink.
 
 `statsd_out` is the one exception. The classic statsd grammar has no timestamp, and `statsd_out`
-writes a DogStatsD `|T` only when the event arrived with one, so a resent counter usually has
+writes a DogStatsD `|T` only for an event flagged `timestamped`, one that arrived with its own
+timestamp, so a resent counter usually has
 no identity at its destination, and the remedy above doesn't exist for it. It defaults to
 `at_most_once` on every transport: a datagram send that fails after earlier datagrams landed is
 `Ambiguous` too, and item 6 bounds what a successful send proves, not the posture.

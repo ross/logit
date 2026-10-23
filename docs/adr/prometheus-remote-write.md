@@ -1,6 +1,6 @@
 ---
 created: 2026-09-17
-updated: 2026-10-21
+updated: 2026-10-23
 ---
 
 # Prometheus remote-write: a receiver on `prometheus_in`, a sender on `prometheus_out`
@@ -201,18 +201,19 @@ component or Lua, which is where a decision about *this* deployment's topology b
 
 Every remote-write sample carries a timestamp — it is not optional the way an exposition sample's
 is. The receiver sets `Event::timestamp` from it and **does not set the
-`_logit.prometheus.timestamp: true` marker attribute**. That marker means "the producer chose to
+`_logit.metrics.closed: "timestamped"` flag**, the marker a scrape sets (the 2026-10-23 amendment
+below). That marker means "the producer chose to
 expose a timestamp on this line," which is a fact worth preserving across an exposition round trip;
 a transport that mandates one is not that choice. Setting it would make a remote-write → exposition
 relay stamp an explicit timestamp on *every* line it writes, which no scrape of that same data would
 have produced.
 
 Suppressing the marker takes a decoder-side switch, because the marker is not the receiver's to
-omit today: `families_to_events` inserts `_logit.prometheus.timestamp: true` whenever
+omit today: `families_to_events` inserts the flag whenever
 `Series.timestamp` is `Some` (`crates/logit-proto/src/prometheus/mod.rs`), and on this transport it
 always is. `PrometheusDecoder::with_timestamp_marker(bool)` defaults to **`true`**, which is exactly
 today's behaviour for the scrape path, and the receiver passes `false`: `Event::timestamp` is still
-set from the sample, only the marker attribute is omitted. The missing marker is one of the
+set from the sample, only the flag is omitted. The missing marker is one of the
 pair's permitted normalizations
 ([ADR `prometheus-scrape-and-exposition`](prometheus-scrape-and-exposition.md)'s "Permitted
 normalizations for this pair").
@@ -658,3 +659,14 @@ So the sender collapses a pair to send the later reading and to count the loss, 
 ([ADR `dedup-timestamps-transform`](dedup-timestamps-transform.md)), or `aggregate` for a live
 delta flow. The exposition registry's overwrite of one series' value between scrapes is the pull
 model working, and stays uncounted.
+
+## Amendment (2026-10-23): the marker is the `timestamped` flag
+
+`_logit.prometheus.timestamp` is retired. A scrape marks a sample with its own timestamp with the
+neutral flag `_logit.metrics.closed: "timestamped"` alone, and `prometheus_out` reads that flag
+([ADR `protocol-knowledge-stays-in-family`](protocol-knowledge-stays-in-family.md), "Amendment:
+move, don't mirror (2026-10-23)"). The decisions here hold with the flag in the marker's place:
+the receiver sets no flag, through `with_timestamp_marker(false)`, so a remote-write →
+exposition relay still writes no line timestamps, and `aggregate` windows remote-write samples as
+before. The sender still writes a timestamp on every sample. "Alternatives considered" and the
+2026-10-13 amendment keep the old name as history.

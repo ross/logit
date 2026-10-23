@@ -47,7 +47,8 @@ The ADR holds the vocabulary. The pieces this plan adds to it:
   that stamps the stats mark on the resource is the one that catches it.
 - **The regression test** feeds `aggregate` an event carrying every protocol carrier
   (`_logit.datadog.stats.name`, `_logit.statsd.timestamp`, `_logit.prometheus.timestamp`, a
-  `_logit.field.*` key) and no flag, and asserts it is windowed with the field key in its
+  `_logit.field.*` key; the two timestamp carriers were later retired, ADR
+  `protocol-knowledge-stays-in-family`'s "Amendment: move, don't mirror (2026-10-23)") and no flag, and asserts it is windowed with the field key in its
   series identity. It fails on main, which still reads the carriers.
 - **Transit.** `script/transit gen` rewrites the InfluxDB cases and every flow's expectations
   for the rename, and the aggregate flows' ledgers for the flags. A flow's class doesn't change;

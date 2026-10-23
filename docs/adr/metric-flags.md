@@ -53,13 +53,17 @@ it made.
 
 `aggregate` reads flags, never protocol carriers. The handling it can apply is named, each kind
 has a flag in the private namespace, and the component that creates an event sets the flag. The
-protocol carriers stay where they are, because each protocol's own sink still reads them.
+protocol carriers stay where they are, because each protocol's own sink still reads them, except
+where a carrier only repeated a flag: [ADR
+`protocol-knowledge-stays-in-family`](protocol-knowledge-stays-in-family.md)'s "Amendment: move,
+don't mirror (2026-10-23)" retired `_logit.statsd.timestamp` and `_logit.prometheus.timestamp`,
+and `statsd_out` and `prometheus_out` read the flag instead.
 
 ### The flags
 
 | Key | Value | Meaning | Set by | Read by |
 |---|---|---|---|---|
-| `_logit.metrics.closed` | `Str`, one of `bucketed` or `timestamped` | Every metric record on this event summarizes a time span its source closed. Forward the event whole, unmerged, with its timestamp and attributes intact, and count each record `logit.transform.metrics.passed_through{reason=<value>}`. Any other `Str`, or a `Bool(true)`, means the same and counts `reason="flagged"`, so a script can't put free text into a telemetry tag. | `datadog_in` and `datadog_trace_in` on each APM stats group event (`bucketed`); `statsd_in` on a `\|T` line or an event's or service check's `d:` field, and `prometheus_in`'s scrape on an exposition sample with its own timestamp (`timestamped`); Lua or `set` | `aggregate` |
+| `_logit.metrics.closed` | `Str`, one of `bucketed` or `timestamped` | Every metric record on this event summarizes a time span its source closed. Forward the event whole, unmerged, with its timestamp and attributes intact, and count each record `logit.transform.metrics.passed_through{reason=<value>}`. Any other `Str`, or a `Bool(true)`, means the same and counts `reason="flagged"`, so a script can't put free text into a telemetry tag. | `datadog_in` and `datadog_trace_in` on each APM stats group event (`bucketed`); `statsd_in` on a `\|T` line or an event's or service check's `d:` field, and `prometheus_in`'s scrape on an exposition sample with its own timestamp (`timestamped`); Lua or `set` | `aggregate`; `statsd_out` and `prometheus_out`, which write `Event::timestamp` as a `\|T`, a `d:`, or a sample timestamp for the value `timestamped` only |
 | `_logit.metrics.fields` | `Bool(true)` | This event carries attributes under `_logit.field.`. The reader scans for them only when this flag is set, and `aggregate` leaves the flag itself out of the series key and the flushed series too, so readings of one series with and without a string field stay one series. | `influxdb_in` and `line_protocol` on an event with at least one string field; Lua or `set` when they add one | `aggregate` |
 | `_logit.field.<key>` | any `Value` | Data about the point, never series identity. `aggregate` leaves it out of the series key and out of the flushed series; a record that passes through keeps it. `influxdb_out` writes a `Str` under it as the string field `<key>`, and skips a non-`Str` value under it uncounted, since a non-`Str` isn't a string field. Replaces `_logit.influxdb.field.<key>`. | `influxdb_in` and `line_protocol` for each string field; Lua or `set` | `aggregate`, `influxdb_out` |
 
@@ -116,11 +120,14 @@ a non-finite delta `Sum`, `Gauge`, or `GaugeDelta` (`non_finite`). After this ch
 
 ## Consequences
 
-- **Two sources of truth per flagged event.** The protocol carrier (`_logit.statsd.timestamp`,
-  which `statsd_out` re-emits as `|T`) and the flag are written by the same decoder at the same
-  point. A `remove` of one and not the other now gives a different result than before. The
-  transit spec's aggregate flows pin the decoders' side, and a regression test pins
-  `aggregate`'s: an event carrying every protocol carrier and no flag is windowed.
+- **Two sources of truth only where a carrier says something the flag doesn't.** A flagged
+  event's protocol carriers, such as `_logit.datadog.stats.name` beside `bucketed`, and the flag
+  are written by the same decoder at the same point, and a `remove` of one and not the other
+  gives a different result than before. Where a carrier only repeated the flag, the carrier is
+  retired instead ([ADR `protocol-knowledge-stays-in-family`](protocol-knowledge-stays-in-family.md),
+  "Amendment: move, don't mirror (2026-10-23)"). The transit spec's aggregate flows pin the
+  decoders' side, and a regression test pins `aggregate`'s: an event carrying every protocol
+  carrier and no flag is windowed.
 - **One more attribute per flagged event.** Metric events run 0 to 6 attributes against an
   inline capacity of 8 ([data-shapes.md](../design/data-shapes.md)), so a flag rarely spills.
   `crates/logit-bench/tests/allocations.rs` says which fixtures move.

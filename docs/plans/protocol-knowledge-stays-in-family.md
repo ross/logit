@@ -63,34 +63,34 @@ reaches `datadog_out`, which writes the point as a Datadog `rate`. A `set` of
 `_logit.datadog.type: rate` on a non-Datadog batch does the same. The handling is a property of
 the reading, not of Datadog, and nothing outside the Datadog family can ask for it by name.
 
-**Remedy.** `datadog_in` sets a neutral flag beside the carrier: an increment flag and its
-interval under `_logit.metrics.` (for example `_logit.metrics.increment` and
-`_logit.metrics.interval`). `dedup_timestamps` and `prometheus_out` read the flag and import
-nothing from `logit_proto::datadog`. `datadog_out` keeps reading `_logit.datadog.type` and
-`_logit.datadog.interval`, its own family's carriers. Lua and `set` can write the flag.
+**Remedy.** Move, don't mirror ([ADR
+`protocol-knowledge-stays-in-family`](../adr/protocol-knowledge-stays-in-family.md)'s
+"Amendment: move, don't mirror (2026-10-23)"). `datadog_in` writes `_logit.metrics.type: rate`
+and `_logit.metrics.interval` instead of `_logit.datadog.type: rate` and
+`_logit.datadog.interval`. `_logit.datadog.type` keeps only `unspecified`, the one value with no
+neutral meaning. `dedup_timestamps` and `prometheus_out` read the neutral keys and import nothing
+from `logit_proto::datadog`. `datadog_out` reads the neutral keys for a rate and its own carrier
+for `unspecified`. Lua and `set` can write the neutral keys.
 
 Open design questions:
 
-- The key names and values: a `Bool` increment flag, or a `Str` naming the gauge's kind
-  (`rate`), and whether the interval is a separate key or part of the value.
 - Whether the interval's value type and unit follow Datadog's (integer seconds) or a neutral
   duration.
 - Whether a rate should instead become a typed model kind, which
   [ADR `datadog-agent-and-intake-relay`](../adr/datadog-agent-and-intake-relay.md)'s decision 8
   rejected as a delta `Sum` because folding a per-second value multiplies and rounds.
-- The metric-flags consequence applies: the carrier and the flag become two sources of truth,
-  and a `remove` of one changes the result.
 
 **What else moves.** An amendment to
 [ADR `dedup-timestamps-transform`](../adr/dedup-timestamps-transform.md) ("Which reading
-survives", "The sink-side counter") and to [ADR `metric-flags`](../adr/metric-flags.md)'s flag
-table; [data-model.md](../design/data-model.md)'s flag table; the transit spec's
+survives", "The sink-side counter"), to [ADR `metric-flags`](../adr/metric-flags.md)'s flag
+table, and to [ADR `datadog-agent-and-intake-relay`](../adr/datadog-agent-and-intake-relay.md)'s
+decision 8; [data-model.md](../design/data-model.md)'s flag table; the transit spec's
 `same_instant`, `same_instant_equal`, and `same_millisecond` rows in `spec/transit/mapping.yaml`
 where their text names the carrier, and `script/transit gen`; the Lua capability in
 [lua-api.md](../design/lua-api.md); the known-gaps row's C1 and C2.
 
 **Estimate.** Two PRs: an ADR amendment and plan row (S), then the decoder, both readers, the
-regression test (a rate carrier with no flag is a state), and the docs (M).
+regression test (a `_logit.datadog.type: rate` with no neutral key is a state), and the docs (M).
 
 ## C3: `_logit.prometheus.type` in `otlp_out` and `kafka_out`
 

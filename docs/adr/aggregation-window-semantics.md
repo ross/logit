@@ -1,6 +1,6 @@
 ---
 created: 2026-08-29
-updated: 2026-10-22
+updated: 2026-10-23
 ---
 
 # `aggregate` transform: tumbling windows, pass-through, and the flush-tick contract
@@ -1018,3 +1018,14 @@ The two sections' consequences change with it:
 - A `keep` ahead of `aggregate` strips the flags under its default `private: drop`, as it stripped
   the carriers, so the outcome there is unchanged.
 - A Lua script or a `set` can close an event, or announce a string field, with the same flags.
+
+## Amendment: the timestamp carriers are retired (2026-10-23)
+
+`_logit.statsd.timestamp` and `_logit.prometheus.timestamp` are gone: `statsd_in` and
+`prometheus_in`'s scrape write only `_logit.metrics.closed: "timestamped"`, and `statsd_out` and
+`prometheus_out` write a timestamp for that flag from `Event::timestamp`
+([ADR `protocol-knowledge-stays-in-family`](protocol-knowledge-stays-in-family.md), "Amendment:
+move, don't mirror (2026-10-23)"). The 2026-10-22 amendment's remedy shrinks to one step: to
+summarize a timestamped point anyway, `remove` `_logit.metrics.closed` ahead of `aggregate`. No
+carrier stays behind to split the series key by source second, and the flushed series leaves
+`statsd_out` with no `|T` and `prometheus_out` with no sample timestamp.

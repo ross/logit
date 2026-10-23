@@ -46,15 +46,15 @@ Entry format and the other areas: [the known-gaps index](README.md).
 
 - **`statsd_out` has no `unit` and no metric renaming/prefixing, and carries an egress timestamp
   only on a `|T`-marked line.**
-  - **Timestamp:** `statsd_out` stamps any event without a `_logit.statsd.timestamp` `U64` carrier
-    (everything but a relayed `|T`-carrying line) with the receiver's receipt time, like
+  - **Timestamp:** `statsd_out` writes no timestamp for an event that isn't flagged
+    `_logit.metrics.closed: "timestamped"`, so the receiver stamps its receipt time, like
     `syslog_out`.
     DogStatsD's `|T<unix-seconds>` segment (`format: dogstatsd` only) round-trips: `statsd_in`
-    sets `Event::timestamp` from it and stamps a `_logit.statsd.timestamp: Value::U64(secs)` carrier
-    with the raw wire value. `statsd_out` re-emits `|T<secs>` from that carrier, never from
-    `Event::timestamp`, so a stage that rewrites `Event::timestamp` can't fabricate or collapse a
-    `|T`. `aggregate` passes a `|T` record through unmerged with its own timestamp, on the
-    `_logit.metrics.closed` flag `statsd_in` sets beside the carrier. The classic
+    sets `Event::timestamp` from it and flags the event `timestamped`, and `statsd_out` writes
+    `|T<secs>` from `Event::timestamp`, truncated to whole seconds, for any event so flagged. A
+    stage that rewrites `Event::timestamp` moves the `|T` with it, and a scraped Prometheus
+    sample with its own timestamp leaves with one too, since the scrape sets the same flag.
+    `aggregate` passes a flagged record through unmerged with its own timestamp. The classic
     grammar has no timestamp segment, so `format: statsd` omits `|T` and counts it
     (`fields.omitted{reason="dialect"}`).
   - **Unit:** `MetricRecord::unit` has no statsd wire representation and is dropped.

@@ -1,6 +1,6 @@
 ---
 created: 2026-09-10
-updated: 2026-10-21
+updated: 2026-10-23
 ---
 
 # Lossless like-protocol transit: the internal model is a superset of every supported wire protocol
@@ -220,8 +220,9 @@ keeps its skip-unknown TLV framing as hygiene, not because anything reads an old
 
 - **`statsd_in -> statsd_out`.** Timers and sets decode to `Samples` and `SetMembers` with the
   sample rate carried verbatim, and round-trip byte for byte under `format: dogstatsd`; under
-  `format: statsd` multi-value lines split and `h`/`d` normalize to `ms`. `|c:` and `|T` ride
-  carriers and round-trip under `format: dogstatsd`. DogStatsD events and service checks relay
+  `format: statsd` multi-value lines split and `h`/`d` normalize to `ms`. `|c:` rides a carrier
+  and `|T` the neutral `_logit.metrics.closed: "timestamped"` flag, and both round-trip under
+  `format: dogstatsd`. DogStatsD events and service checks relay
   ([ADR `statsd-output`](statsd-output.md)'s "DogStatsD events and service checks relay"), and a
   repeated tag key decodes to a `Value::Array` and re-expands.
 - **`otlp_in -> otlp_out`.** Every metric, log, and span field the model gained above round-trips.

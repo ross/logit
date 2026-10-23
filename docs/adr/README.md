@@ -63,7 +63,7 @@ the same date, write the record, then add a row here.
 | [Native hop send window: several frames in flight, acknowledged in frame order](native-hop-send-window.md) | 2026-10-01 | 2026-10-18 |
 | [Native hop identity and sequence: a per-store sender identity and sequence on every hop frame, and a high-water mark at `logit_in`](native-hop-identity-and-sequence.md) | 2026-10-01 | 2026-10-18 |
 | [Sink send path and attempt accounting: counters that say what they count, one pooled-stream driver, and TLS writes that are flushed](sink-send-path-and-attempt-accounting.md) | 2026-09-29 | 2026-10-13 |
-| [Delivery semantics: at-least-once per hop, duplicates absorbed by the data model, and an effectively-once native hop](delivery-semantics.md) | 2026-09-29 | 2026-10-20 |
+| [Delivery semantics: at-least-once per hop, duplicates absorbed by the data model, and an effectively-once native hop](delivery-semantics.md) | 2026-09-29 | 2026-10-23 |
 | [Tail discovery failure and resume identity: a failed listing is no information, and a resume verifies the file's head](tail-discovery-failure-and-resume-identity.md) | 2026-09-28 | 2026-10-18 |
 | [Process-level metrics from procfs and the allocator](process-level-metrics.md) | 2026-09-28 | 2026-10-13 |
 | [`stdio_out`/`file_out`'s human render: an exhaustive, sectioned block per event](human-render-block-format.md) | 2026-09-28 | 2026-10-02 |
@@ -87,7 +87,7 @@ the same date, write the record, then add a row here.
 | [`shape`: an observer component that turns each event into measurements of its own shape](shape-observer-component.md) | 2026-09-20 | 2026-10-21 |
 | [A disposable Azure VM for perf measurement: `up`/`down` only, no stop and no snapshot](disposable-azure-perf-vm.md) | 2026-09-18 | 2026-10-18 |
 | [UDP intake batching and socket visibility](udp-intake-batching-and-socket-visibility.md) | 2026-09-18 | 2026-10-21 |
-| [Prometheus remote-write: a receiver on `prometheus_in`, a sender on `prometheus_out`](prometheus-remote-write.md) | 2026-09-17 | 2026-10-21 |
+| [Prometheus remote-write: a receiver on `prometheus_in`, a sender on `prometheus_out`](prometheus-remote-write.md) | 2026-09-17 | 2026-10-23 |
 | [`docker_in`: live container identity, and a minimal `inotify` watch set](docker-container-identity-and-minimal-watches.md) | 2026-09-17 | 2026-10-18 |
 | [`Transform::process` transforms in place: `&mut Event -> bool`, not `Event -> Option<Event>`](in-place-transform-process.md) | 2026-09-17 | 2026-10-16 |
 | [`keep_values`: an attribute-value allowlist, and an optional normalize-before-compare step](value-allowlist-cardinality-clamp.md) | 2026-09-15 | 2026-10-21 |
@@ -100,12 +100,12 @@ the same date, write the record, then add a row here.
 | [A load-test harness: the real binary, a declarative event template, and CPU per event as the signal](load-test-harness.md) | 2026-09-12 | 2026-10-18 |
 | [`FramedEncoder`: a third codec trait for sinks that need per-message framing, over a shared `MessageBuf`](framed-encoder.md) | 2026-09-12 | 2026-10-18 |
 | [collectd binary-protocol relay: identity as attributes, value types as `Sum`/`Gauge`, and a packing encoder](collectd-binary-relay.md) | 2026-09-12 | 2026-10-18 |
-| [Prometheus scrape ingestion and exposition: transports, dialects, and the model mapping](prometheus-scrape-and-exposition.md) | 2026-09-11 | 2026-10-21 |
+| [Prometheus scrape ingestion and exposition: transports, dialects, and the model mapping](prometheus-scrape-and-exposition.md) | 2026-09-11 | 2026-10-23 |
 | [Metrics model v2: `Sum` replaces `Counter`, raw/summarized pairs, boxed span fidelity, batch-level `Scope`](metrics-model-v2.md) | 2026-09-11 | 2026-10-18 |
 | [RFC 5424 structured-data convention: nested `syslog.sd`, strict parsing, opt-in PEN-qualified emission](syslog-structured-data-convention.md) | 2026-09-11 | 2026-10-18 |
 | [A shared build cache and one-container check execution for the local development loop](fast-local-development-loop.md) | 2026-09-11 | 2026-09-11 |
-| [statsd/DogStatsD egress: dialect, transport, packing, and the v1 metric-kind deferral](statsd-output.md) | 2026-09-10 | 2026-10-22 |
-| [Lossless like-protocol transit: the internal model is a superset of every supported wire protocol](lossless-transit.md) | 2026-09-10 | 2026-10-21 |
+| [statsd/DogStatsD egress: dialect, transport, packing, and the v1 metric-kind deferral](statsd-output.md) | 2026-09-10 | 2026-10-23 |
+| [Lossless like-protocol transit: the internal model is a superset of every supported wire protocol](lossless-transit.md) | 2026-09-10 | 2026-10-23 |
 | [Browser tracing: the real OTel-JS SDK, `addLink` for sub-resources, and living with document-load's parent (not link) behaviour](browser-tracing-sdk.md) | 2026-09-10 | 2026-10-18 |
 | [OTLP/JSON decoding: hand-written against `serde_json::Value`, not generated](otlp-json-decoding.md) | 2026-09-10 | 2026-10-18 |
 | [Provenance filtering is two transform components, combining has_attributes' and has_signal's shapes](provenance-filtering-components.md) | 2026-09-10 | 2026-10-21 |
@@ -148,7 +148,7 @@ the same date, write the record, then add a row here.
 | [`Event` carries a log, metrics, and a span at once, not one of the three](multi-payload-events.md) | 2026-08-30 | 2026-10-18 |
 | [`kv_metrics`: skip rules, numeric coercion, and no `tags:` field](kv-metrics-semantics.md) | 2026-08-30 | 2026-10-21 |
 | [Configuration: a component graph, not inputs/outputs/pipelines](component-graph-configuration.md) | 2026-08-29 | 2026-09-13 |
-| [`aggregate` transform: tumbling windows, pass-through, and the flush-tick contract](aggregation-window-semantics.md) | 2026-08-29 | 2026-10-22 |
+| [`aggregate` transform: tumbling windows, pass-through, and the flush-tick contract](aggregation-window-semantics.md) | 2026-08-29 | 2026-10-23 |
 | [`json` transform: structured attributes, additive, pass-through on failure](json-parsing-into-attributes.md) | 2026-08-29 | 2026-09-22 |
 | [Secrets in config: a general `!env` YAML tag, not per-field `*_env` indirection](env-yaml-tag.md) | 2026-08-29 | 2026-10-21 |
 | [Preserving `Value` variant identity across a Lua round-trip](lua-value-identity-preservation.md) | 2026-08-29 | 2026-10-16 |

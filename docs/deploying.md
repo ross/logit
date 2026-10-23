@@ -2656,10 +2656,9 @@ metric sets and `aggregate` reads
   service check's `d:`) or a Prometheus exposition sample with a timestamp, passes through with
   that timestamp, as the Datadog Agent leaves a `|T` metric unaggregated. A window would replace
   the producer's time with the flush time and split the series by timestamp. If you want such
-  metrics summarized anyway, drop both the `_logit.metrics.closed` flag and the protocol's
-  timestamp carrier (`_logit.statsd.timestamp` for DogStatsD) with `remove` ahead of `aggregate`,
-  and they take the flush time. The carrier would otherwise stay in the series key, one series per
-  source second, and `statsd_out` writes `|T` from it.
+  metrics summarized anyway, drop the `_logit.metrics.closed` flag with `remove` ahead of
+  `aggregate`, and they take the flush time. With the flag gone, `statsd_out` writes no `|T` and
+  `prometheus_out` no sample timestamp for them.
 - **`flagged`**: a metric whose `_logit.metrics.closed` is any other string, or `true`, set by a
   `lua` script or a `set`, passes through whole the same way.
 - **`non_finite`**: a counter increment, gauge, or gauge adjustment whose value is `NaN` or

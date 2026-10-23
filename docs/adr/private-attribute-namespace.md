@@ -44,7 +44,7 @@ the case of a key that must never cross one.
 ## Decision
 
 **Carriers live under one private prefix, `_logit.`, with the protocol segment kept:
-`_logit.statsd.type`, `_logit.prometheus.timestamp`, `_logit.influxdb.measurement`.** Every
+`_logit.statsd.type`, `_logit.prometheus.type`, `_logit.influxdb.measurement`.** Every
 protocol sink ignores `_logit.*` when it renders tags, labels, fields, or attributes, except its
 own `_logit.<protocol>.*` keys, which it reads by exact name. There is no list to maintain.
 
