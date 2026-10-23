@@ -2017,9 +2017,7 @@ rows:
           A `key:value` tag. A `host` attribute on a metric with no `host.name` is the host and not
           a tag, which datadog_in reads back as `host.name`. On a Datadog event or service check
           with no non-empty host carrier, `host.name`, else `host`, is the host and not a tag,
-          which datadog_in reads back as that carrier. A `collectd.host` on a record with none of
-          those, or on a log with no `hostname`, `host.name`, `syslog.hostname`, or `host`, is the
-          host and not a tag or log attribute, read back where that route's host reads back.
+          which datadog_in reads back as that carrier.
       graphite_out:
         - when: {tags: drop}
           class: lost
@@ -2820,8 +2818,7 @@ rows:
         class: normalized
         reason: default_host
         text: >-
-          A record with no host, no `collectd.host`, and no hostless mark leaves with the process
-          hostname as its host,
+          A record with no host and no hostless mark leaves with the process hostname as its host,
           which datadog_in reads back as `host.name`, a log's `hostname`, or an event's or service
           check's host carrier; a span keeps its own hostnames.
       graphite_out:

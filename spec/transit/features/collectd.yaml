@@ -21,8 +21,8 @@
   text: A list of several data sources, one record each on the one event.
 - name: identity
   text: >-
-    The Host, Plugin, and Type, stamped as `collectd.host`, `_logit.collectd.plugin`, and
-    `_logit.collectd.type`.
+    The Host, Plugin, and Type, stamped as the standard host key `host.name`,
+    `_logit.collectd.plugin`, and `_logit.collectd.type`.
 - name: plugin_instance
   text: A PluginInstance, stamped as the public event attribute `collectd.plugin_instance`.
 - name: type_instance
