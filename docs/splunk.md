@@ -111,21 +111,29 @@ A `Sum` goes out as its value with `metric_type` `Sum`. HEC has no carrier for t
 delta `Sum` reads in Splunk as a series of samples, not a running total: put `aggregate` with
 `temporality: cumulative` in front if a dashboard expects a counter.
 
-### `index`, `source`, `sourcetype`, and `host` come from the resource
+### `index`, `source`, `sourcetype`, and `host` come from attributes
 
 `splunk_hec_out` has no per-sink `index` or `sourcetype` field. It writes each object's envelope
 from the batch's resource attributes `com.splunk.index`, `com.splunk.source`,
 `com.splunk.sourcetype`, and `host.name`, so stamp them upstream with a `set` component, as
-`splunk-hec-send.yaml` does. An event without them takes the token's defaults in Splunk, except
-`host`: an event with no `host.name` goes out with `logit`'s process hostname
-([deploying.md's "Hostname"](deploying.md#hostname)), so senders relayed through one `logit` with
-no host of their own all show its host. An index
-the token isn't allowed to write draws a `400` code 7 naming the object after it; `splunk_hec_out`
-drops the bad object and resends the ones after it (below); keep the `index` you stamp in the token's
-allowed list. Every other
-resource and event attribute goes out as an indexed field in `fields`, flattened to dotted keys.
+`splunk-hec-send.yaml` does. An object without them takes the token's defaults in Splunk, except
+`host`, which is chosen per object:
 
-`splunk_hec_in` puts the same four values on the resource, so a relay keeps them.
+1. the event's own `host.name`, as `collectd_in` and `syslog_in` write each sender's host;
+2. else the resource's `host.name`;
+3. else `logit`'s process hostname ([deploying.md's "Hostname"](deploying.md#hostname)), so
+   senders relayed through one `logit` with no host of their own all show its host.
+
+An event's `host.name` that becomes the `host` isn't also sent as a field. One that is empty, or
+isn't a string, isn't a host: the object takes the next one, and the attribute goes out as a
+field. An index the token isn't allowed to write draws a `400` code 7 naming the object after it;
+`splunk_hec_out` drops the bad object and resends the ones after it (below); keep the `index` you
+stamp in the token's allowed list. Every other resource and event attribute goes out as an indexed
+field in `fields`, flattened to dotted keys.
+
+`splunk_hec_in` puts the same four values on the resource, so a relay keeps them. An object whose
+`fields` carry `host.name` leaves a relay with that value as its `host`, replacing any `host` it
+arrived with.
 
 ### Acknowledgment is off by default, and your Splunk Cloud stack may not offer it
 

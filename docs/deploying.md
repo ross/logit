@@ -535,7 +535,7 @@ replace a host an event or its resource carries:
 | Sink | The event's own host | Where the hostname goes otherwise |
 |---|---|---|
 | `syslog_out` | `host.name` on the event, else on the resource | HOSTNAME, unless the sink sets its own `hostname:` |
-| `splunk_hec_out` | resource `host.name` | the envelope `host` |
+| `splunk_hec_out` | `host.name` on the event, else on the resource | each object's envelope `host` |
 | `datadog_out` | a metric's `host.name` or DogStatsD `host:` tag; an event's or check's `h:` field, `host.name`, or `host:` tag; a log's `hostname`, `host.name`, `syslog.hostname`, or `host` | the host of a metric, log, event, or service check |
 
 So a relay sends the relay's hostname for whatever arrived without one. Through `datadog_out`,
@@ -3530,11 +3530,12 @@ serves HEC at `https://<stack>.splunkcloud.com:8088/services/collector` instead.
 A Splunk Cloud trial stack presents that same certificate, whose name doesn't match the host, so
 it needs `tls: {insecure_skip_verify: true}`.
 
-**Index, source, sourcetype, and host come from the resource.** There are no per-sink fields for
+**Index, source, sourcetype, and host come from attributes.** There are no per-sink fields for
 them: the sink reads `com.splunk.index`, `com.splunk.source`, `com.splunk.sourcetype`, and
-`host.name` from the batch resource, so stamp them upstream with `set`, as the example does. A
-batch with no `host.name` goes out with the process hostname ([Hostname](#hostname)) as its
-`host`. Every other attribute goes out in `fields`, as an indexed field, a nested one flattened to
+`host.name` from the batch resource, so stamp them upstream with `set`, as the example does. An
+event's own `host.name` is its object's `host` ahead of the resource's, so `collectd_in`'s and
+`syslog_in`'s per-sender hosts reach Splunk. An object with neither goes out with the process
+hostname ([Hostname](#hostname)) as its `host`. Every other attribute goes out in `fields`, as an indexed field, a nested one flattened to
 dotted keys.
 
 **Metrics.** A gauge or a sum goes out as one `metric_name:<name>` field with a `metric_type`

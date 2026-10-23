@@ -23,10 +23,10 @@
 //! ```
 //!
 //! There are no per-sink `index`, `source`, `sourcetype`, or `host` fields (ADR decision 2): the
-//! encoder reads them from the batch resource, so an upstream `set` stamps them. A batch whose
-//! resource has no `host.name` gets the process hostname as its `host`
-//! ([`SplunkHecOutput::with_default_host`]), never replacing one it carries. Graph rule 70
-//! validates the block.
+//! encoder reads them from the batch resource, so an upstream `set` stamps them. Each object's
+//! `host` is its event's `host.name`, else the resource's, else the process hostname
+//! ([`SplunkHecOutput::with_default_host`]), which never replaces a host the event or resource
+//! carries. Graph rule 70 validates the block.
 //!
 //! ## Requests
 //!
@@ -438,8 +438,8 @@ impl SplunkHecOutput {
         self
     }
 
-    /// The envelope `host` of a batch whose resource has no `host.name`: `logit run` passes the
-    /// process hostname.
+    /// The envelope `host` of an object whose event and resource have no `host.name`: `logit run`
+    /// passes the process hostname.
     pub fn with_default_host(mut self, host: impl Into<Arc<str>>) -> Self {
         self.default_host = Some(host.into());
         self.encoder = self.new_encoder();

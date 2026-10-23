@@ -555,8 +555,9 @@ amendment's public `collectd.host` is now `host.name`.
   decodes to `host.name` and encodes from it.
 - **The host stays on the event**, for the `Arc::ptr_eq` reason above.
 - **Every other sink reads the host under one name.** `prometheus_out` labels it `host_name`,
-  `influxdb_out` and `graphite_out` tag it `host.name`, `datadog_out` takes it as the host, and
-  `statsd_out` under `format: dogstatsd` writes it as the `host:` tag.
+  `influxdb_out` and `graphite_out` tag it `host.name`, `datadog_out` takes it as the host,
+  `splunk_hec_out` writes it as each object's `host`, and `statsd_out` under `format: dogstatsd`
+  writes it as the `host:` tag.
 - **`collectd_out` no longer counts `host.name` as an omitted tag**: it is the Host part. There is
   no alias and no decode path for `collectd.host`; an attribute of that name is an ordinary
   attribute, counted `tags.omitted{reason="no_wire_form"}` like any other.

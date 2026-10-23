@@ -461,7 +461,8 @@ Per pair:
   `logs`, `metrics`, and `spans` submodules. The vocabulary is the OTel Collector's `splunk_hec`
   exporter's, not a `splunk.*` namespace, so `otlp_out` to a Splunk Collector and
   `splunk_hec_out` put the same names in Splunk. `index`/`source`/`sourcetype`/`host` ride on the
-  resource, set upstream with `set`; a body decodes into one batch per distinct envelope.
+  resource, set upstream with `set`, and an event's own `host.name` is its object's `host`; a body
+  decodes into one batch per distinct envelope.
   Metrics are one number per name, so multi-number kinds follow `graphite_out`'s
   `multi_value: skip | expand` (`logit_proto::MultiValue`, shared with `graphite_out` and
   `statsd_out`, which share the dotted table in `logit_proto::multi_value`), with
