@@ -40,6 +40,7 @@ pub mod sockstat;
 pub mod test_util;
 pub mod tls;
 pub mod transform;
+pub mod view;
 
 pub use accumulator::{BatchAccumulator, FlushReason};
 pub use buffer_full::FullLabels;
@@ -62,3 +63,4 @@ pub use runtime::{
     RunOptions, WriteLoopConfig,
 };
 pub use transform::{FlushOutput, FlushedEvent, Transform};
+pub use view::BatchView;

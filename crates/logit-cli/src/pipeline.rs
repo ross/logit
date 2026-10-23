@@ -3441,7 +3441,7 @@ mod tests {
         assert_eq!(*routed_to, slot, "routed to remote_metrics");
 
         let mut encoder = logit_proto::influxdb::encode::InfluxLineEncoder::default();
-        let body = encoder.encode(part).unwrap();
+        let body = encoder.encode(&part.materialize()).unwrap();
         assert_eq!(&body[..], b"filament v=\"PLA\" 1700000000000000000\n");
     }
 

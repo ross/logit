@@ -1967,6 +1967,7 @@ mod tests {
         match rx.try_recv().expect("expected a batch to have been sent") {
             Delivered::Owned(batch, _ctx) => batch,
             Delivered::Shared(shared, _ctx) => (*shared).clone(),
+            Delivered::View(view, _ctx) => view.materialize(),
         }
     }
 

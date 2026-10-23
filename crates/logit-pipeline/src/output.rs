@@ -4,6 +4,7 @@
 //! `docs/adr/sink-fault-classes.md`.
 
 use crate::fanout::BatchContext;
+use crate::view::BatchView;
 use logit_core::EventBatch;
 use logit_proto::native::SeqId;
 
@@ -76,6 +77,18 @@ pub trait Output {
     /// - **A failure carries a [`Fault`]**; one with none classifies `Fault::Rejected`
     ///   ([`classify`]).
     async fn send(&mut self, batch: &EventBatch) -> anyhow::Result<()>;
+
+    /// [`Output::send`] for a [`BatchView`], which `write_loop` calls. The default sends the
+    /// view's batch as is when the view is whole, else materializes it (cloning the events in
+    /// view) on every attempt. A sink that can read a view directly overrides it.
+    async fn send_view(&mut self, view: &BatchView) -> anyhow::Result<()> {
+        if view.is_whole() {
+            self.send(&view.batch).await
+        } else {
+            let batch = view.materialize();
+            self.send(&batch).await
+        }
+    }
 
     /// Called once per batch by `write_loop`, before the batch's first attempt or submission,
     /// never between its retries or resubmissions: the place a sink resets per-batch state. A

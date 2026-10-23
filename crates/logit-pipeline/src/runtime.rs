@@ -18,6 +18,7 @@ use crate::queue::{SinkStore, SinkStoreConfig, StoreItem};
 use crate::readiness::{NodeState, Phase};
 use crate::route_signals::{route_signals_batch, SignalRoutes};
 use crate::router::{Destinations, Router, RouterScratch};
+use crate::view::BatchView;
 use crate::{Edge, Fanout, Input, InputRuntimeConfig, Output, Readiness, Transform};
 use anyhow::Context;
 use logit_core::{Diagnostics, Event, EventBatch, Resource, Scope, SpanKind, Telemetry};
@@ -757,7 +758,7 @@ async fn run_output(
     let parked = in_hand.lock().unwrap_or_else(|p| p.into_inner()).take();
     if let Some((batch, ctx)) = parked {
         abandoned_batches += 1;
-        abandoned_events += batch.events.len() as u64;
+        abandoned_events += batch.len() as u64;
         if matches!(store.as_ref(), SinkStore::Disk(_)) {
             store.push((batch, ctx)).await;
         }
@@ -769,8 +770,8 @@ async fn run_output(
     let sweep_deadline = tokio::time::Instant::now() + SWEEP_DRAIN_TIMEOUT;
     while let Ok(Some(delivered)) = tokio::time::timeout_at(sweep_deadline, inbox.recv()).await {
         let ctx = delivered.batch_context();
-        let batch = unwrap_batch_arc(delivered);
-        let events = batch.events.len() as u64;
+        let batch = into_view(delivered);
+        let events = batch.len() as u64;
         telemetry.count("logit.component.batches.received", 1.0, &[]);
         telemetry.count("logit.component.events.received", events as f64, &[]);
         abandoned_batches += 1;
@@ -846,14 +847,14 @@ pub async fn drain_inbox(
 ) {
     while let Some(delivered) = inbox.recv().await {
         sample_inbox_depth(inbox, &telemetry);
-        // Read before `unwrap_batch_arc` consumes `delivered`. The store carries it with the
+        // Read before `into_view` consumes `delivered`. The store carries it with the
         // batch so `write_loop`'s sink span has a parent and `Output::observe_batch` gets the
         // batch's provenance.
         let ctx = delivered.batch_context();
-        let batch = unwrap_batch_arc(delivered);
+        let batch = into_view(delivered);
         telemetry.count("logit.component.batches.received", 1.0, &[]);
-        telemetry.count("logit.component.events.received", batch.events.len() as f64, &[]);
-        *in_hand.lock().unwrap_or_else(|p| p.into_inner()) = Some((Arc::clone(&batch), ctx));
+        telemetry.count("logit.component.events.received", batch.len() as f64, &[]);
+        *in_hand.lock().unwrap_or_else(|p| p.into_inner()) = Some((batch.clone(), ctx));
         store.push((batch, ctx)).await;
         *in_hand.lock().unwrap_or_else(|p| p.into_inner()) = None;
     }
@@ -872,17 +873,16 @@ fn sample_inbox_depth(inbox: &mpsc::Receiver<Delivered>, telemetry: &Telemetry) 
 
 /// The batch [`drain_inbox`] is pushing into its store, if a push is in progress. `run_output`
 /// owns it and sweeps it at shutdown.
-pub type InHand = std::sync::Mutex<Option<(Arc<EventBatch>, BatchContext)>>;
+pub type InHand = std::sync::Mutex<Option<(BatchView, BatchContext)>>;
 
-/// Converts a `Delivered` into the store's `Arc<EventBatch>`: one `Arc::new` for
-/// `Delivered::Owned`, a move for `Delivered::Shared`.
-///
-/// Discards the `BatchContext`; callers read it with `Delivered::batch_context` first
-/// (`docs/design/pipeline-graph.md`'s "Trace context propagation" section).
-fn unwrap_batch_arc(delivered: Delivered) -> Arc<EventBatch> {
+/// Converts a `Delivered` into the sink store's [`BatchView`]: an `Owned` or `Shared` batch as a
+/// whole view (one `Arc::new` for `Owned`), a router's view as is, with
+/// no event touched.
+fn into_view(delivered: Delivered) -> BatchView {
     match delivered {
-        Delivered::Owned(batch, _ctx) => Arc::new(batch),
-        Delivered::Shared(shared, _ctx) => shared,
+        Delivered::Owned(batch, _ctx) => BatchView::whole(Arc::new(batch)),
+        Delivered::Shared(shared, _ctx) => BatchView::whole(shared),
+        Delivered::View(view, _ctx) => view,
     }
 }
 
@@ -1075,7 +1075,7 @@ impl Drop for Retrying {
 #[allow(clippy::too_many_arguments)]
 async fn deliver_with_retry(
     output: &mut (dyn Output + Send),
-    batch: &EventBatch,
+    batch: &BatchView,
     store: &SinkStore,
     posture: DeliveryPosture,
     retry: &RetryConfig,
@@ -1094,7 +1094,7 @@ async fn deliver_with_retry(
         attempt = attempt.saturating_add(1);
         let timer = telemetry.timer("logit.component.send.duration");
         *sending = true;
-        let result = output.send(batch).await;
+        let result = output.send_view(batch).await;
         *sending = false;
         drop(timer);
 
@@ -1229,7 +1229,15 @@ async fn window_round(
             state.observed = position + 1;
         }
         state.submitting = true;
-        let result = output.submit(&batch, ctx, seq).await;
+        // A windowed sink (`logit_out`) takes an owned batch: a partial view is materialized.
+        let owned;
+        let whole: &EventBatch = if batch.is_whole() {
+            &batch.batch
+        } else {
+            owned = batch.materialize();
+            &owned
+        };
+        let result = output.submit(whole, ctx, seq).await;
         state.submitting = false;
         match result {
             Ok(()) => state.outstanding += 1,
@@ -1278,7 +1286,7 @@ fn drop_cut_off_at_shutdown(
     for _ in 0..n {
         if let Some((batch, ..)) = store.commit() {
             batches += 1;
-            events += batch.events.len() as u64;
+            events += batch.len() as u64;
         }
     }
     count_shutdown_drop(telemetry, shutdown_dropped, batches, events);
@@ -1460,7 +1468,7 @@ pub(crate) async fn write_loop(
         // `deliver_with_retry` future already borrows it mutably, and the borrow checker rejects
         // a second overlapping borrow inside the macro.
         enum NextBatch {
-            Batch(Arc<EventBatch>, BatchContext, SeqId),
+            Batch(BatchView, BatchContext, SeqId),
             Closed,
             ShutdownExpired,
         }
@@ -1511,7 +1519,7 @@ pub(crate) async fn write_loop(
             span_ctx.span_id,
             Some(ctx.trace.span_id),
         );
-        span.events(batch.events.len() as u64);
+        span.events(batch.len() as u64);
 
         enum DeliverStep {
             Outcome(Delivery),
@@ -1550,7 +1558,7 @@ pub(crate) async fn write_loop(
                 )) => DeliverStep::ShutdownExpired,
             }
         } else {
-            let head = (Arc::clone(&batch), ctx, seq);
+            let head = (batch.clone(), ctx, seq);
             tokio::select! {
                 biased;
                 outcome = deliver_window(
@@ -1622,7 +1630,7 @@ pub(crate) async fn write_loop(
                 in_flight.outstanding = in_flight.outstanding.saturating_sub(1);
                 in_flight.observed = in_flight.observed.saturating_sub(1);
                 telemetry.count("logit.component.batches.delivered", 1.0, &[]);
-                telemetry.count("logit.component.events.delivered", batch.events.len() as f64, &[]);
+                telemetry.count("logit.component.events.delivered", batch.len() as f64, &[]);
                 last_success = Some(tokio::time::Instant::now());
                 if degraded || retrying.is_retrying() {
                     degraded = false;
@@ -1650,13 +1658,13 @@ pub(crate) async fn write_loop(
                         0
                     };
                 let mut dropped_batches = 1u64;
-                let mut dropped_events = batch.events.len() as u64;
+                let mut dropped_events = batch.len() as u64;
                 store.commit();
                 in_flight.observed = in_flight.observed.saturating_sub(1);
                 for _ in 0..also_in_flight {
                     if let Some((other, ..)) = store.commit() {
                         dropped_batches += 1;
-                        dropped_events += other.events.len() as u64;
+                        dropped_events += other.len() as u64;
                     }
                     in_flight.observed = in_flight.observed.saturating_sub(1);
                 }
@@ -1707,9 +1715,14 @@ pub async fn send_batch(
     delivered: &Delivered,
     telemetry: &Telemetry,
 ) -> anyhow::Result<()> {
+    let materialized;
     let batch: &EventBatch = match delivered {
         Delivered::Owned(batch, _ctx) => batch,
         Delivered::Shared(shared, _ctx) => shared,
+        Delivered::View(view, _ctx) => {
+            materialized = view.materialize();
+            &materialized
+        }
     };
     telemetry.count("logit.component.batches.received", 1.0, &[]);
     telemetry.count("logit.component.events.received", batch.events.len() as f64, &[]);
@@ -1891,7 +1904,7 @@ async fn run_router(
         // `observe_scope` and `map_resource` run inside `route_batch`, as in `process_batch`, so
         // the allocation suite measuring `route_batch` measures the node's real path.
         let partitions = route_batch(&mut *router, &mut scratch, batch, &telemetry);
-        span.events(partitions.iter().map(|(_, batch)| batch.events.len() as u64).sum());
+        span.events(partitions.iter().map(|(_, batch)| batch.len() as u64).sum());
 
         for (slot, out) in partitions {
             // Slot 0 is this router's own outbound edge; slot n + 1 is target n.
@@ -1915,6 +1928,7 @@ async fn run_router(
                 Partition::Shared(batch) => {
                     destination.send_shared_with_own_context(batch, ctx).await
                 }
+                Partition::View(view) => destination.send_view_with_own_context(view, ctx).await,
             };
         }
     }
@@ -1945,7 +1959,7 @@ async fn run_route_signals(
         );
         let batch = unwrap_batch(batch);
         let partitions = route_signals_batch(&routes, &mut scratch, batch, &telemetry);
-        span.events(partitions.iter().map(|(_, batch)| batch.events.len() as u64).sum());
+        span.events(partitions.iter().map(|(_, batch)| batch.len() as u64).sum());
 
         for (slot, out) in partitions {
             // Slot n + 1 is target n. Slot 0 is never marked: the table has no `Forward`.
@@ -1961,6 +1975,7 @@ async fn run_route_signals(
                 Partition::Shared(batch) => {
                     destination.send_shared_with_own_context(batch, ctx).await
                 }
+                Partition::View(view) => destination.send_view_with_own_context(view, ctx).await,
             };
         }
     }
@@ -1979,15 +1994,41 @@ pub enum Partition {
     /// mutating consumer pays its copy-on-write clone only while another destination still holds
     /// it (`docs/adr/arc-eventbatch-copy-on-write.md`).
     Shared(Arc<EventBatch>),
+    /// The index-partition prototype's share: the incoming batch behind one `Arc` every
+    /// destination holds, with this destination's event indices and, for `route_signals`, the
+    /// signals it may see. Sent as `Delivered::View`; no event is moved or cloned.
+    View(BatchView),
 }
 
-impl std::ops::Deref for Partition {
-    type Target = EventBatch;
-
-    fn deref(&self) -> &EventBatch {
+impl Partition {
+    /// Events in this partition.
+    pub fn len(&self) -> usize {
         match self {
-            Partition::Owned(batch) => batch,
-            Partition::Shared(batch) => batch,
+            Partition::Owned(batch) => batch.events.len(),
+            Partition::Shared(batch) => batch.events.len(),
+            Partition::View(view) => view.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The partition's events, whole (a signal view's left-out payloads included).
+    pub fn events(&self) -> Box<dyn Iterator<Item = &Event> + '_> {
+        match self {
+            Partition::Owned(batch) => Box::new(batch.events.iter()),
+            Partition::Shared(batch) => Box::new(batch.events.iter()),
+            Partition::View(view) => Box::new(view.events()),
+        }
+    }
+
+    /// The partition as an owned batch, a consumer that materializes would see.
+    pub fn materialize(&self) -> EventBatch {
+        match self {
+            Partition::Owned(batch) => batch.clone(),
+            Partition::Shared(batch) => (**batch).clone(),
+            Partition::View(view) => view.materialize(),
         }
     }
 }
@@ -2057,36 +2098,71 @@ pub fn route_batch(
     }
 
     let events = batch.events;
+    let shared = Arc::new(EventBatch { resource, scope, events });
     if let Some(&first) = scratch.marks.first() {
-        if first.len() > 1 && scratch.marks.iter().all(|mark| *mark == first) {
+        if scratch.marks.iter().all(|mark| *mark == first) {
             drop(process_timer);
-            telemetry.count(
-                "logit.component.events.copied",
-                ((first.len() - 1) * events.len()) as f64,
-                &[],
-            );
-            let shared = Arc::new(EventBatch { resource, scope, events });
+            if first.len() > 1 {
+                telemetry.count(
+                    "logit.component.events.copied",
+                    ((first.len() - 1) * shared.events.len()) as f64,
+                    &[],
+                );
+            }
             return first.slots().map(|slot| (slot, Partition::Shared(shared.clone()))).collect();
         }
     }
 
-    let (copies, used) = count_and_reserve(scratch);
-
-    // Pass 4: move. A router never absorbs (`crate::router`: no drop), and `checked_mark` left
-    // every mark non-empty.
-    for (event, mark) in events.into_iter().zip(&scratch.marks) {
-        let Some(last) = mark.highest_slot() else { continue };
-        for slot in mark.without_slot(last).slots() {
-            scratch.dests[slot].push(event.clone());
-        }
-        scratch.dests[last].push(event);
-    }
+    // The index-partition prototype: each used slot gets the shared batch and its event indices;
+    // no event is moved or cloned. A router never absorbs (`crate::router`: no drop), and
+    // `checked_mark` left every mark non-empty.
+    let copies = index_marks(scratch);
     drop(process_timer);
     if copies > 0 {
         telemetry.count("logit.component.events.copied", copies as f64, &[]);
     }
+    take_views(scratch, &shared, |_| None)
+}
 
-    take_partitions(scratch, used, &resource, &scope)
+/// Fills `scratch.indices` from `scratch.marks`: each slot's list of the events whose mark names
+/// it, in arrival order. Returns the deliveries past each event's first (`events.copied`). An
+/// empty mark (an event `route_signals` discards) is listed nowhere.
+pub(crate) fn index_marks(scratch: &mut RouterScratch) -> usize {
+    for list in &mut scratch.indices {
+        list.clear();
+    }
+    let mut copies = 0usize;
+    for (i, mark) in scratch.marks.iter().enumerate() {
+        copies += mark.len().saturating_sub(1);
+        for slot in mark.slots() {
+            scratch.indices[slot].push(i as u32);
+        }
+    }
+    copies
+}
+
+/// One [`Partition::View`] per non-empty `scratch.indices` list, in slot order, each holding
+/// `shared` and that slot's indices, with `signals(slot)` as its signal set.
+pub(crate) fn take_views(
+    scratch: &mut RouterScratch,
+    shared: &Arc<EventBatch>,
+    signals: impl Fn(usize) -> Option<u8>,
+) -> Vec<(usize, Partition)> {
+    let used = scratch.indices.iter().filter(|list| !list.is_empty()).count();
+    let mut out = Vec::with_capacity(used);
+    for (slot, list) in scratch.indices.iter_mut().enumerate() {
+        if list.is_empty() {
+            continue;
+        }
+        let view = BatchView {
+            batch: shared.clone(),
+            indices: Some(Arc::from(&list[..])),
+            signals: signals(slot),
+        };
+        list.clear();
+        out.push((slot, Partition::View(view)));
+    }
+    out
 }
 
 /// Passes 2 and 3 of [`route_batch`] and [`crate::route_signals_batch`]: counts each slot's
@@ -2422,7 +2498,7 @@ async fn revoke_lua_io(io: LuaIo, telemetry: &Telemetry, shutdown_dropped: &Atom
     let _ = tokio::time::timeout(REVOKE_DRAIN_TIMEOUT, async {
         while let Some(delivered) = inbox.recv().await {
             batches += 1;
-            events += unwrap_batch_arc(delivered).events.len() as u64;
+            events += into_view(delivered).len() as u64;
         }
     })
     .await;
@@ -3079,7 +3155,7 @@ fn send_lua_partitions(
 
 /// Turns the channel payload back into an owned `EventBatch` for `Transform::process` or
 /// `ScriptWorker::process`, which mutate or consume owned events. `run_output` never calls this:
-/// it keeps the batch as an `Arc` (`unwrap_batch_arc`) and `Output::send` borrows it
+/// it keeps the batch as a `BatchView` (`into_view`) and `Output::send` borrows it
 /// (`docs/adr/arc-eventbatch-copy-on-write.md`).
 ///
 /// `Delivered::Owned` (a single-consumer edge) is free. `Delivered::Shared` (a fan-out) uses
@@ -3103,6 +3179,8 @@ pub fn unwrap_batch(batch: Delivered) -> EventBatch {
         Delivered::Shared(shared, _ctx) => {
             Arc::try_unwrap(shared).unwrap_or_else(|shared| (*shared).clone())
         }
+        // A router's index-partition: the events in view are cloned (`BatchView::into_batch`).
+        Delivered::View(view, _ctx) => view.into_batch(),
     }
 }
 
@@ -12000,6 +12078,7 @@ mod tests {
         let batch = match delivered {
             Delivered::Owned(batch, _) => batch,
             Delivered::Shared(batch, _) => (*batch).clone(),
+            Delivered::View(view, _) => view.materialize(),
         };
         assert_eq!(
             batch.scope,
@@ -12820,15 +12899,16 @@ mod tests {
             .iter()
             .map(|(slot, out)| {
                 let owned = matches!(out, Partition::Owned(_));
-                (*slot, owned, out.events.iter().map(stream_tag).collect())
+                (*slot, owned, out.events().map(stream_tag).collect())
             })
             .collect();
         assert_eq!(
             shape,
             vec![
-                (0, true, vec![None]),
-                (1, true, vec![Some("both"), Some("a"), Some("both")]),
-                (2, true, vec![Some("both"), Some("both")]),
+                // The index-partition prototype: every mixed-mark partition is a view, not owned.
+                (0, false, vec![None]),
+                (1, false, vec![Some("both"), Some("a"), Some("both")]),
+                (2, false, vec![Some("both"), Some("both")]),
             ]
         );
         let totals = Totals::of(probe.registry().drain(0));
@@ -12881,7 +12961,8 @@ mod tests {
             &telemetry,
         );
 
-        assert!(matches!(partitions.as_slice(), [(1, Partition::Owned(_))]));
+        // The index-partition prototype shares a uniform single-slot batch instead of moving it.
+        assert!(matches!(partitions.as_slice(), [(1, Partition::Shared(_))]));
         let totals = Totals::of(probe.registry().drain(0));
         assert_eq!(totals.sum("logit.component.events.copied", &[]), 0.0);
     }
@@ -12924,7 +13005,7 @@ mod tests {
 
         let shape: Vec<(usize, Vec<Option<&str>>)> = partitions
             .iter()
-            .map(|(slot, batch)| (*slot, batch.events.iter().map(stream_tag).collect()))
+            .map(|(slot, batch)| (*slot, batch.events().map(stream_tag).collect()))
             .collect();
         assert_eq!(
             shape,

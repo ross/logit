@@ -39,7 +39,8 @@
 //! shared `Arc`. Only an event carrying no listed signal is discarded, and nothing is stripped.
 
 use crate::router::{signal_index, signal_masks, Destinations, RouterScratch};
-use crate::runtime::{count_and_reserve, take_partitions, Partition};
+use crate::runtime::{count_and_reserve, index_marks, take_partitions, take_views, Partition};
+use crate::view::BatchView;
 use logit_config::SignalTargets;
 use logit_core::{Event, EventBatch, MetricList, Telemetry};
 use std::sync::Arc;
@@ -105,6 +106,12 @@ impl SignalRoutes {
         self.targets
     }
 
+    /// The [`signal_index`] bits of the signals mapped to `slot`: what a `strip: true` view for
+    /// that target shows.
+    fn signals_of(&self, slot: usize) -> u8 {
+        (0..3).filter(|&bit| self.slots[bit] == Some(slot)).fold(0u8, |mask, bit| mask | 1 << bit)
+    }
+
     /// The part of `event` bound for `slot`: the payloads of the signals mapped there, moved out
     /// of `event`, with its timestamp and a clone of its attributes.
     fn split_off(&self, event: &mut Event, slot: usize) -> Event {
@@ -121,6 +128,7 @@ impl SignalRoutes {
 
 /// Clears the payloads whose [`signal_index`] bits are set in `unlisted`, tallying each in
 /// `stripped`.
+#[allow(dead_code)]
 fn strip_unlisted(event: &mut Event, unlisted: usize, stripped: &mut [u64; 3]) {
     if unlisted & 1 != 0 {
         event.log = None;
@@ -160,7 +168,7 @@ pub fn route_signals_batch(
     telemetry.count("logit.component.events.received", batch.events.len() as f64, &[]);
     debug_assert_eq!(scratch.destinations(), routes.targets + 1, "scratch sized for this table");
 
-    let EventBatch { resource, scope, mut events } = batch;
+    let EventBatch { resource, scope, events } = batch;
     let process_timer = telemetry.timer("logit.component.process.duration");
     scratch.marks.clear();
     scratch.marks.reserve(events.len());
@@ -168,13 +176,18 @@ pub fn route_signals_batch(
     scratch.counts.resize(scratch.dests.len(), 0);
 
     // Pass 1: strip, then mark. The mark comes from the signals carried before the strip, which
-    // gives the same mark: an unlisted signal adds no slot.
+    // gives the same mark: an unlisted signal adds no slot. Under `strip: true` the index-partition
+    // prototype strips nothing in place: each target's view shows only its own signals, so the
+    // unlisted payloads are counted as stripped here and left in the shared batch.
     let mut stripped = [0u64; 3];
     let mut discarded = 0u64;
-    for event in &mut events {
+    for event in &events {
         let carried = signal_index(event);
-        if routes.strip && carried & !routes.listed != 0 {
-            strip_unlisted(event, carried & !routes.listed, &mut stripped);
+        let unlisted = carried & !routes.listed;
+        if routes.strip && unlisted != 0 {
+            for (bit, count) in stripped.iter_mut().enumerate() {
+                *count += u64::from(unlisted & (1 << bit) != 0);
+            }
         }
         let mark = routes.masks[carried];
         discarded += u64::from(mark.is_empty());
@@ -212,9 +225,48 @@ pub fn route_signals_batch(
         }
     }
 
+    // `strip: true`: one view per used target over one shared batch, each showing only the
+    // signals mapped to its slot. Nothing moves or clones an event.
+    if routes.strip {
+        if discarded as usize == events.len() {
+            return Vec::new();
+        }
+        let shared = Arc::new(EventBatch { resource, scope, events });
+        let uniform =
+            scratch.marks.first().copied().filter(|first| {
+                !first.is_empty() && scratch.marks.iter().all(|mark| mark == first)
+            });
+        drop(process_timer);
+        if let Some(first) = uniform {
+            if first.len() > 1 {
+                telemetry.count(
+                    "logit.component.events.copied",
+                    ((first.len() - 1) * shared.events.len()) as f64,
+                    &[],
+                );
+            }
+            return first
+                .slots()
+                .map(|slot| {
+                    let view = BatchView {
+                        batch: shared.clone(),
+                        indices: None,
+                        signals: Some(routes.signals_of(slot)),
+                    };
+                    (slot, Partition::View(view))
+                })
+                .collect();
+        }
+        let copies = index_marks(scratch);
+        if copies > 0 {
+            telemetry.count("logit.component.events.copied", copies as f64, &[]);
+        }
+        return take_views(scratch, &shared, |slot| Some(routes.signals_of(slot)));
+    }
+
     let (copies, used) = count_and_reserve(scratch);
 
-    // Pass 4: move, splitting or cloning for every slot but the highest.
+    // Pass 4 (`strip: false`): move, cloning for every slot but the highest.
     for (mut event, mark) in events.into_iter().zip(&scratch.marks) {
         let Some(last) = mark.highest_slot() else { continue };
         for slot in mark.without_slot(last).slots() {
@@ -349,7 +401,7 @@ mod tests {
             .iter()
             .map(|(slot, out)| {
                 let shared = matches!(out, Partition::Shared(_));
-                (*slot, shared, out.events.iter().map(shape).collect())
+                (*slot, shared, out.materialize().events.iter().map(shape).collect())
             })
             .collect();
         (out, Totals::of(probe.registry().drain(0)))
@@ -395,6 +447,7 @@ mod tests {
             &Telemetry::default(),
         );
         let [(1, logs), (2, metrics)] = out.as_slice() else { panic!("expected two parts") };
+        let (logs, metrics) = (logs.materialize(), metrics.materialize());
         for part in [&logs.events[0], &metrics.events[0]] {
             assert_eq!(part.timestamp, 7);
             assert_eq!(

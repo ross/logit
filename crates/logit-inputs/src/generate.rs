@@ -563,6 +563,7 @@ mod tests {
         match delivered {
             Delivered::Owned(batch, _ctx) => batch,
             Delivered::Shared(shared, _ctx) => (*shared).clone(),
+            Delivered::View(view, _ctx) => view.materialize(),
         }
     }
 

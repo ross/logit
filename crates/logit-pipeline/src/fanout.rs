@@ -53,6 +53,7 @@
 //! client refuses the batch on `false`, which is the input's half of
 //! `docs/design/pipeline-graph.md`'s "Open question: a closed downstream".
 
+use crate::view::BatchView;
 use logit_core::interner::intern;
 use logit_core::random_id_bytes;
 use logit_core::telemetry::Timer;
@@ -152,6 +153,10 @@ pub enum Delivered {
     /// branch is privileged: whichever handle is unwrapped last reclaims the batch without
     /// cloning, and under concurrent consumption more than one can clone (see `unwrap_batch`).
     Shared(Arc<EventBatch>, BatchContext),
+    /// A router's partition as an index list into one shared batch
+    /// (`Fanout::send_view_with_own_context`): a sink reads it as is, anything else materializes
+    /// the indexed events (`crate::view`).
+    View(BatchView, BatchContext),
 }
 
 impl Delivered {
@@ -173,6 +178,7 @@ impl Delivered {
         match self {
             Delivered::Owned(_, ctx) => *ctx,
             Delivered::Shared(_, ctx) => *ctx,
+            Delivered::View(_, ctx) => *ctx,
         }
     }
 }
@@ -385,6 +391,32 @@ impl Fanout {
         self.record_send(n);
         let timer = self.telemetry.timer("logit.component.send.blocked.duration");
         let taken = self.offer_shared(rest, last, batch, ctx, n).await;
+        drop(timer);
+        taken
+    }
+
+    /// [`Fanout::send_shared_with_own_context`] for a router's index-partition
+    /// (`crate::runtime::Partition::View`): every consumer gets a [`Delivered::View`] holding a
+    /// clone of `view` (two refcount bumps). Stamps and counts `view.len()` events.
+    pub async fn send_view_with_own_context(&self, view: BatchView, ctx: BatchContext) -> bool {
+        let ctx = self.stamp(ctx);
+        let Some((last, rest)) = self.consumers.split_last() else { return false };
+        let n = view.len();
+        self.record_send(n);
+        let timer = self.telemetry.timer("logit.component.send.blocked.duration");
+        let mut taken = false;
+        for edge in rest {
+            if edge.offer(Delivered::View(view.clone(), ctx)).await.is_err() {
+                self.record_dropped_on_close(n);
+            } else {
+                taken = true;
+            }
+        }
+        if last.offer(Delivered::View(view, ctx)).await.is_err() {
+            self.record_dropped_on_close(n);
+        } else {
+            taken = true;
+        }
         drop(timer);
         taken
     }

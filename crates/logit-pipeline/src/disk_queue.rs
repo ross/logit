@@ -555,7 +555,7 @@ struct ReadAhead {
 
 impl ReadAhead {
     fn item(&self) -> StoreItem {
-        (Arc::clone(&self.batch), self.ctx, self.seq)
+        (crate::view::BatchView::whole(Arc::clone(&self.batch)), self.ctx, self.seq)
     }
 }
 
@@ -1005,9 +1005,11 @@ impl DiskQueue {
     /// write-path `.await` keeps the write handle (see [`HeldWriteFile`]) and leaves at most a
     /// tail past [`State::needs_repair`], which the next push waits out and truncates before it
     /// writes anything.
-    pub async fn push(&self, item: (Arc<EventBatch>, BatchContext)) {
+    pub async fn push<B: Into<crate::view::BatchView>>(&self, item: (B, BatchContext)) {
         let seq = self.numbering.next();
-        let (batch, ctx) = item;
+        // A partial view (a router's index-partition) is materialized before encoding.
+        let batch = item.0.into().into_batch_arc();
+        let ctx = item.1;
 
         // No trace field: the record prefix holds the context, and `logit_out` re-encodes the
         // frame under its own sampling gate on every attempt.
@@ -1797,7 +1799,7 @@ impl DiskQueue {
                 "the commit cursor is always at the head's start"
             );
             state.queued_records = state.queued_records.saturating_sub(1);
-            ((head.batch, head.ctx, head.seq), head.len)
+            ((crate::view::BatchView::whole(head.batch), head.ctx, head.seq), head.len)
         };
         self.advance_read_cursor(record_len);
         let utilization = self.after_change();
@@ -2261,10 +2263,13 @@ mod tests {
 
         let (first, ..) = q.peek().await.unwrap();
         let (second, ..) = q.peek().await.unwrap();
-        assert!(Arc::ptr_eq(&first, &second), "repeated peeks before commit should be cached");
+        assert!(
+            Arc::ptr_eq(&first.batch, &second.batch),
+            "repeated peeks before commit should be cached"
+        );
 
         let (committed, ..) = q.commit().unwrap();
-        assert!(Arc::ptr_eq(&committed, &first));
+        assert!(Arc::ptr_eq(&committed.batch, &first.batch));
         assert!(q.commit().is_none(), "nothing left to commit");
         std::fs::remove_dir_all(&dir).ok();
     }

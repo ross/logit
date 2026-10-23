@@ -7,6 +7,7 @@
 
 use crate::buffer_full::{Bound, FullLabels, FullWatch, Waiting, WatchConfig};
 use crate::fanout::BatchContext;
+use crate::view::BatchView;
 use logit_core::{Diagnostics, EventBatch, Telemetry};
 use logit_proto::buffer::{Buffer, InMemoryBuffer, OverflowPolicy as DropPolicy, PushOutcome};
 use logit_proto::native::SeqId;
@@ -33,6 +34,24 @@ impl Queued for Arc<EventBatch> {
     }
     fn units(&self) -> u64 {
         self.events.len() as u64
+    }
+}
+
+impl Queued for BatchView {
+    fn weight(&self) -> u64 {
+        self.estimated_heap_bytes()
+    }
+    fn units(&self) -> u64 {
+        self.len() as u64
+    }
+}
+
+impl Queued for (BatchView, BatchContext, SeqId) {
+    fn weight(&self) -> u64 {
+        self.0.weight()
+    }
+    fn units(&self) -> u64 {
+        self.0.units()
     }
 }
 
@@ -746,7 +765,7 @@ impl<T: Queued + Clone> BoundedQueue<T> {
 /// What a [`SinkStore`] hands its consumer: a batch, the [`BatchContext`] it arrived with, and
 /// its native-hop sender identity and number. Every store numbers every batch it holds
 /// (`docs/adr/native-hop-no-compatibility.md`, decision 2).
-pub type StoreItem = (Arc<EventBatch>, BatchContext, SeqId);
+pub type StoreItem = (BatchView, BatchContext, SeqId);
 
 /// One store's sender identity and its next sequence number
 /// (`docs/adr/native-hop-identity-and-sequence.md`, decisions 2 and 3). Minted when the store
@@ -797,9 +816,9 @@ impl SinkQueue {
 
     /// Numbers the batch, then admits it under the configured overflow policy. The number is
     /// taken before `Block`'s wait, so a push that `DropNewest` rejects still consumes one.
-    pub async fn push(&self, (batch, ctx): (Arc<EventBatch>, BatchContext)) {
+    pub async fn push<B: Into<BatchView>>(&self, (batch, ctx): (B, BatchContext)) {
         let seq = self.numbering.next();
-        self.queue.push((batch, ctx, seq)).await
+        self.queue.push((batch.into(), ctx, seq)).await
     }
 
     /// See [`BoundedQueue::peek`], including its one-consumer rule.
@@ -875,7 +894,7 @@ impl SinkStore {
         }
     }
 
-    pub async fn push(&self, item: (Arc<EventBatch>, BatchContext)) {
+    pub async fn push<B: Into<BatchView>>(&self, item: (B, BatchContext)) {
         match self {
             SinkStore::Memory(q) => q.push(item).await,
             SinkStore::Disk(q) => q.push(item).await,
@@ -955,7 +974,7 @@ impl SinkStore {
                 let mut dropped_events = 0u64;
                 while let Some((batch, ..)) = q.commit() {
                     dropped_batches += 1;
-                    dropped_events += batch.events.len() as u64;
+                    dropped_events += batch.len() as u64;
                 }
                 (dropped_batches, dropped_events)
             }
@@ -1027,7 +1046,7 @@ mod tests {
         q.push((Arc::clone(&sent), sent_ctx)).await;
 
         let (peeked, peeked_ctx, _) = q.peek().await.expect("should peek the pushed batch");
-        assert!(Arc::ptr_eq(&peeked, &sent));
+        assert!(Arc::ptr_eq(&peeked.batch, &sent));
         assert_eq!(
             peeked_ctx, sent_ctx,
             "the context (trace and provenance alike) pushed with a batch should come back \
@@ -1035,7 +1054,7 @@ mod tests {
         );
 
         let (committed, ..) = q.commit().expect("should commit the pushed batch");
-        assert!(Arc::ptr_eq(&committed, &sent));
+        assert!(Arc::ptr_eq(&committed.batch, &sent));
         assert!(q.commit().is_none(), "nothing left to commit");
     }
 
@@ -1047,8 +1066,8 @@ mod tests {
 
         let (first, ..) = q.peek().await.expect("should peek");
         let (second, ..) = q.peek().await.expect("should peek again");
-        assert!(Arc::ptr_eq(&first, &sent));
-        assert!(Arc::ptr_eq(&second, &sent));
+        assert!(Arc::ptr_eq(&first.batch, &sent));
+        assert!(Arc::ptr_eq(&second.batch, &sent));
     }
 
     #[tokio::test(start_paused = true)]
@@ -1085,9 +1104,9 @@ mod tests {
         q.push((Arc::clone(&c), ctx())).await; // evicts `a`
 
         let (first, ..) = q.commit().expect("should commit");
-        assert!(Arc::ptr_eq(&first, &b), "the oldest batch (a) should never appear");
+        assert!(Arc::ptr_eq(&first.batch, &b), "the oldest batch (a) should never appear");
         let (second, ..) = q.commit().expect("should commit");
-        assert!(Arc::ptr_eq(&second, &c));
+        assert!(Arc::ptr_eq(&second.batch, &c));
         assert!(q.commit().is_none());
     }
 
@@ -1103,18 +1122,18 @@ mod tests {
         q.push((Arc::clone(&b), ctx())).await;
 
         let (peeked, ..) = q.peek().await.expect("should peek a"); // reserves `a`
-        assert!(Arc::ptr_eq(&peeked, &a));
+        assert!(Arc::ptr_eq(&peeked.batch, &a));
 
         q.push((Arc::clone(&c), ctx())).await; // must evict `b`, never the reserved `a`
 
         let (committed, ..) =
             q.commit().expect("should commit the batch that was actually peeked/sent");
         assert!(
-            Arc::ptr_eq(&committed, &a),
+            Arc::ptr_eq(&committed.batch, &a),
             "commit must return the exact batch that was peeked, not whatever is now at the front"
         );
         let (next, ..) = q.commit().expect("should commit");
-        assert!(Arc::ptr_eq(&next, &c), "b should have been the one evicted, not delivered");
+        assert!(Arc::ptr_eq(&next.batch, &c), "b should have been the one evicted, not delivered");
         assert!(q.commit().is_none());
     }
 
@@ -1157,9 +1176,9 @@ mod tests {
         q.push((c, ctx())).await; // rejected -- queue contents unchanged
 
         let (first, ..) = q.commit().expect("should commit");
-        assert!(Arc::ptr_eq(&first, &a));
+        assert!(Arc::ptr_eq(&first.batch, &a));
         let (second, ..) = q.commit().expect("should commit");
-        assert!(Arc::ptr_eq(&second, &b));
+        assert!(Arc::ptr_eq(&second.batch, &b));
         assert!(q.commit().is_none());
     }
 
@@ -1224,7 +1243,7 @@ mod tests {
             .expect("peek should resolve once a batch is pushed")
             .expect("the spawned task should not panic")
             .expect("peek should return the pushed batch");
-        assert!(Arc::ptr_eq(&peeked, &sent));
+        assert!(Arc::ptr_eq(&peeked.batch, &sent));
     }
 
     #[tokio::test]
@@ -1468,7 +1487,7 @@ mod tests {
         let sent = tiny_batch();
         let mut push = std::pin::pin!(q.push((Arc::clone(&sent), ctx())));
         assert!(push.as_mut().poll(&mut cx).is_ready(), "room for one: the push never waits");
-        assert!(Arc::ptr_eq(&poll_now(0, &mut cx).expect("the pushed batch"), &sent));
+        assert!(Arc::ptr_eq(&poll_now(0, &mut cx).expect("the pushed batch").batch, &sent));
         assert!(poll_now(1, &mut cx).is_none(), "one past the last item");
     }
 
@@ -1480,13 +1499,13 @@ mod tests {
             q.push((Arc::clone(sent), ctx())).await;
         }
         let (peeked, ..) = q.peek_at(1).expect("b is queued"); // reserves a and b
-        assert!(Arc::ptr_eq(&peeked, &b));
+        assert!(Arc::ptr_eq(&peeked.batch, &b));
 
         q.push((Arc::clone(&d), ctx())).await; // must evict c, the oldest unreserved batch
 
         for expected in [&a, &b, &d] {
             let (committed, ..) = q.commit().expect("should commit");
-            assert!(Arc::ptr_eq(&committed, expected), "a and b survive, c was evicted");
+            assert!(Arc::ptr_eq(&committed.batch, expected), "a and b survive, c was evicted");
         }
         assert!(q.commit().is_none());
     }
@@ -2874,7 +2893,7 @@ mod full_buffer_tests {
         let q2 = Arc::clone(&q);
         let pushing = tokio::spawn(async move {
             let mut items: Vec<StoreItem> =
-                (0..5u64).map(|n| (batch(), ctx(), SeqId { id: [0; 16], seq: n })).collect();
+                (0..5u64).map(|n| (batch().into(), ctx(), SeqId { id: [0; 16], seq: n })).collect();
             q2.push_many(&mut items).await;
         });
         probe.wait_for("the blocked gauge at 1", |t| t.gauge(BLOCKED, &[]) == Some(1.0)).await;

@@ -373,6 +373,7 @@ mod tests {
         let batch = match delivered {
             logit_pipeline::Delivered::Owned(batch, _ctx) => batch,
             logit_pipeline::Delivered::Shared(shared, _ctx) => (*shared).clone(),
+            logit_pipeline::Delivered::View(view, _ctx) => view.materialize(),
         };
         assert_eq!(batch.events.len(), 1);
         assert_eq!(
@@ -397,6 +398,7 @@ mod tests {
         let batch = match delivered {
             logit_pipeline::Delivered::Owned(batch, _ctx) => batch,
             logit_pipeline::Delivered::Shared(shared, _ctx) => (*shared).clone(),
+            logit_pipeline::Delivered::View(view, _ctx) => view.materialize(),
         };
         let names: Vec<&str> = batch
             .events
@@ -590,6 +592,7 @@ mod tests {
         let batch = match delivered {
             logit_pipeline::Delivered::Owned(batch, _ctx) => batch,
             logit_pipeline::Delivered::Shared(shared, _ctx) => (*shared).clone(),
+            logit_pipeline::Delivered::View(view, _ctx) => view.materialize(),
         };
         assert_eq!(
             batch.resource.attributes.get("service.name").and_then(|v| v.as_str()),
@@ -617,6 +620,7 @@ mod tests {
         let batch = match delivered {
             logit_pipeline::Delivered::Owned(batch, _ctx) => batch,
             logit_pipeline::Delivered::Shared(shared, _ctx) => (*shared).clone(),
+            logit_pipeline::Delivered::View(view, _ctx) => view.materialize(),
         };
         let scope = batch.scope.expect("internal should stamp a Scope on every batch");
         assert_eq!(&scope.name[..], b"logit");
@@ -643,6 +647,7 @@ mod tests {
             let batch = match delivered {
                 logit_pipeline::Delivered::Owned(batch, _ctx) => batch,
                 logit_pipeline::Delivered::Shared(shared, _ctx) => (*shared).clone(),
+                logit_pipeline::Delivered::View(view, _ctx) => view.materialize(),
             };
             for event in &batch.events {
                 for metric in &event.metrics {
@@ -687,6 +692,7 @@ mod tests {
             let batch = match delivered {
                 logit_pipeline::Delivered::Owned(batch, _ctx) => batch,
                 logit_pipeline::Delivered::Shared(shared, _ctx) => (*shared).clone(),
+                logit_pipeline::Delivered::View(view, _ctx) => view.materialize(),
             };
             for event in &batch.events {
                 for metric in &event.metrics {
@@ -732,6 +738,7 @@ mod tests {
             let batch = match delivered {
                 logit_pipeline::Delivered::Owned(batch, _ctx) => batch,
                 logit_pipeline::Delivered::Shared(shared, _ctx) => (*shared).clone(),
+                logit_pipeline::Delivered::View(view, _ctx) => view.materialize(),
             };
             for event in &batch.events {
                 for metric in &event.metrics {
@@ -751,6 +758,7 @@ mod tests {
         match delivered {
             logit_pipeline::Delivered::Owned(batch, _ctx) => batch,
             logit_pipeline::Delivered::Shared(shared, _ctx) => (*shared).clone(),
+            logit_pipeline::Delivered::View(view, _ctx) => view.materialize(),
         }
     }
 

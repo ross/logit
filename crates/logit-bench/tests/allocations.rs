@@ -2032,6 +2032,7 @@ fn unwrap_delivered(delivered: Delivered) -> EventBatch {
         Delivered::Shared(shared, _ctx) => {
             Arc::try_unwrap(shared).unwrap_or_else(|shared| (*shared).clone())
         }
+        Delivered::View(view, _ctx) => view.into_batch(),
     }
 }
 
@@ -2041,6 +2042,7 @@ fn borrow_delivered(delivered: &Delivered) -> &EventBatch {
     match delivered {
         Delivered::Owned(batch, _ctx) => batch,
         Delivered::Shared(shared, _ctx) => shared,
+        Delivered::View(view, _ctx) => &view.batch,
     }
 }
 
@@ -2105,6 +2107,7 @@ fn drain_inbox_single_consumer_owned_batch_costs_exactly_the_arc() {
         let warmed = match rx.recv().await.expect("should receive") {
             Delivered::Owned(batch, _ctx) => Arc::new(batch),
             Delivered::Shared(shared, _ctx) => shared,
+            Delivered::View(view, _ctx) => view.batch,
         };
         store.push((warmed, BatchContext::default())).await;
         store.commit();
@@ -2162,9 +2165,10 @@ fn route_batch_two_targets_costs_one_vec_per_used_destination() {
     let batch = fixtures::nginx_batch_alternating_stream(64);
     let (out, stats) = measure(|| route_batch(&mut route, &mut scratch, batch, &telemetry));
     assert_eq!(out.len(), 2, "both host_stream and app_stream should receive events");
-    let total: usize = out.iter().map(|(_, batch)| batch.events.len()).sum();
+    let total: usize = out.iter().map(|(_, batch)| batch.len()).sum();
     assert_eq!(total, 64);
-    expect_allocs("route_batch: 64 events, 2 targets both used", stats, 3);
+    // The index-partition prototype's count: the returned `Vec`, the shared batch's `Arc`, and one index list per used target.
+    expect_allocs("route_batch: 64 events, 2 targets both used", stats, 4);
 }
 
 /// The same partition with `host` and `app` both mapped to one target (many-to-one): one
@@ -2185,7 +2189,7 @@ fn route_batch_all_to_one_target_costs_two() {
     let batch = fixtures::nginx_batch_alternating_stream(64);
     let (out, stats) = measure(|| route_batch(&mut route, &mut scratch, batch, &telemetry));
     assert_eq!(out.len(), 1);
-    assert_eq!(out[0].1.events.len(), 64);
+    assert_eq!(out[0].1.len(), 64);
     expect_allocs("route_batch: 64 events, 1 target used (many-to-one)", stats, 2);
 }
 
@@ -2209,7 +2213,7 @@ fn route_batch_all_unrouted_costs_two() {
     let (out, stats) = measure(|| route_batch(&mut route, &mut scratch, batch, &telemetry));
     assert_eq!(out.len(), 1, "only the Forward partition should be non-empty");
     assert_eq!(out[0].0, 0, "slot 0 is Destinations::FORWARD");
-    assert_eq!(out[0].1.events.len(), 64);
+    assert_eq!(out[0].1.len(), 64);
     expect_allocs("route_batch: 64 events, all unrouted (Forward only)", stats, 2);
 }
 
@@ -2267,10 +2271,10 @@ fn route_batch_mixed_marks_clone_only_the_multi_target_events() {
 
     let batch = fixtures::nginx_batch_alternating_stream(64);
     let (out, stats) = measure(|| route_batch(&mut route, &mut scratch, batch, &telemetry));
-    let sizes: Vec<(usize, usize)> =
-        out.iter().map(|(slot, batch)| (*slot, batch.events.len())).collect();
+    let sizes: Vec<(usize, usize)> = out.iter().map(|(slot, batch)| (*slot, batch.len())).collect();
     assert_eq!(sizes, vec![(1, 32), (2, 64)]);
-    expect_allocs("route_batch: 64 events, 32 marked for 2 targets (mixed)", stats, 99);
+    // The index-partition prototype's count: no event cloned: the `Vec`, the `Arc`, and two index lists.
+    expect_allocs("route_batch: 64 events, 32 marked for 2 targets (mixed)", stats, 4);
 }
 
 /// A `route_signals` table over targets `a` and `b`.
@@ -2304,7 +2308,8 @@ fn route_signals_batch_single_signal_moves_into_one_target() {
 
     let batch = fixtures::statsd_batch(64);
     let (out, stats) = measure(|| route_signals_batch(&routes, &mut scratch, batch, &telemetry));
-    assert!(matches!(out.as_slice(), [(1, Partition::Owned(b))] if b.events.len() == 64));
+    // The index-partition prototype: one `Arc` for the shared batch, one for the returned `Vec`.
+    assert!(matches!(out.as_slice(), [(1, Partition::View(v))] if v.len() == 64));
     expect_allocs("route_signals_batch: 64 metric-only events, strip, 1 target", stats, 2);
 }
 
@@ -2328,10 +2333,10 @@ fn route_signals_batch_log_and_metrics_split_into_two_targets() {
 
     let batch = fixtures::nginx_batch(64);
     let (out, stats) = measure(|| route_signals_batch(&routes, &mut scratch, batch, &telemetry));
-    let sizes: Vec<(usize, usize)> =
-        out.iter().map(|(slot, batch)| (*slot, batch.events.len())).collect();
+    let sizes: Vec<(usize, usize)> = out.iter().map(|(slot, batch)| (*slot, batch.len())).collect();
     assert_eq!(sizes, vec![(1, 64), (2, 64)]);
-    expect_allocs("route_signals_batch: 64 log+metrics events, strip, split to 2", stats, 67);
+    // The index-partition prototype's count: a uniform mark: the `Vec` and the `Arc`, two signal views over it.
+    expect_allocs("route_signals_batch: 64 log+metrics events, strip, split to 2", stats, 2);
 }
 
 /// `strip: false` with the same table: every event carries both signals, so one mark names both

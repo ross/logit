@@ -31,7 +31,7 @@
 //! [`NullOutput::send`] never fails, so its delivery posture, the default, never comes into play.
 
 use logit_core::EventBatch;
-use logit_pipeline::Output;
+use logit_pipeline::{BatchView, Output};
 
 /// `logit_pipeline::Output` for `null_out`. Stateless, so no builder.
 #[derive(Debug, Default, Clone, Copy)]
@@ -41,6 +41,11 @@ pub struct NullOutput;
 impl Output for NullOutput {
     /// Drops `batch` and returns `Ok`.
     async fn send(&mut self, _batch: &EventBatch) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Drops `view` without reading or materializing it.
+    async fn send_view(&mut self, _view: &BatchView) -> anyhow::Result<()> {
         Ok(())
     }
 }

@@ -206,6 +206,9 @@ pub struct RouterScratch {
     /// Per-destination event buffers, `dests[0]` being `Forward` and `dests[n + 1]` being
     /// target `n`. Always left empty (and capacity-0) when `route_batch` returns.
     pub(crate) dests: Vec<Vec<Event>>,
+    /// Per-destination index lists for the index-partition path (`crate::view`), cleared and
+    /// refilled in place, so they amortize to zero once grown.
+    pub(crate) indices: Vec<Vec<u32>>,
 }
 
 impl RouterScratch {
@@ -217,6 +220,7 @@ impl RouterScratch {
             marks: Vec::new(),
             counts: vec![0; targets + 1],
             dests: (0..targets + 1).map(|_| Vec::new()).collect(),
+            indices: (0..targets + 1).map(|_| Vec::new()).collect(),
         }
     }
 
