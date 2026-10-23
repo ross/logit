@@ -360,7 +360,7 @@ vm_up() {
     # Last, so the matrix is measured on a quiet VM. A failure writes `c2c: unavailable (...)`
     # and never fails `up`.
     echo "recording the core-to-core latency matrix..."
-    vm_metadata_remote "${ip}" || echo "warning: core-to-core capture failed; see ~/logit-vm-metadata.txt" >&2
+    vm_metadata_remote "${ip}" || echo "warning: the core-to-core capture could not reach the VM; run script/vm metadata to retry" >&2
 
     cat <<EOF
 
@@ -377,6 +377,7 @@ logit perf VM is up and warm.
   script/vm build <ref|dir|tarball>...   build another binary to measure (perf/bins/<slug>/logit)
   script/vm push / pull                  copy files to/from the VM (uncommitted work, results)
   script/vm shell                        a login shell in ~/logit, with DOCKER=docker already set
+  script/vm metadata                     re-record the core-to-core latency matrix (c2c: lines)
   script/vm status                       power state, uptime, running cost
   script/vm down                         DELETES the resource group -- the only way back to \$0
 
@@ -385,7 +386,7 @@ This session created the VM, so this session's prompt is the one that should end
 what" section for why an agent won't run this or 'up' for you.
 
 Cite ~/logit-vm-metadata.txt on the VM alongside any number you record. It has the CPU model,
-kernel, image version, and the exact sysctl values this run saw.
+kernel, image version, the exact sysctl values this run saw, and the core-to-core latency matrix.
 EOF
 }
 

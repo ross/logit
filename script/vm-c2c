@@ -3,9 +3,8 @@
 # ~/logit-vm-metadata.txt with the core-to-core latency matrix of this VM's vCPUs and one
 # summary line.
 #
-# The host chooses per VM whether its vCPUs share an L3, and a VM that straddles two put a 2x
-# spread into one scenario's numbers. A pair across two L3s reads about 100 ns against 25 to 35
-# ns inside one.
+# The host chooses per VM whether its vCPUs share an L3. A pair across two L3s reads about 100 ns
+# against 25 to 35 ns inside one.
 #
 # Runs in a pinned official rust image so it needs neither logit-dev:local nor a toolchain on the
 # VM. The install takes about 10 s. Any failure writes `c2c: unavailable (<reason>)`.
@@ -18,13 +17,19 @@ META="${HOME}/logit-vm-metadata.txt"
 p() { printf '%-16s %s\n' "c2c:" "$1"; }
 
 capture() {
-    local raw
+    # The tool prints its matrix on stderr, so the container folds it into stdout. docker's pull
+    # progress and cargo's output stay on stderr, out of the matrix; only its last line reaches a
+    # failure reason.
+    local raw errf
+    errf="$(mktemp)"
     raw="$(docker run --rm "${RUST_IMAGE}" sh -c \
         "cargo install -q core-to-core-latency --version ${CRATE_VERSION} --locked >&2 \
-         && /usr/local/cargo/bin/core-to-core-latency 5000 300" 2>&1 </dev/null)" || {
-        p "unavailable (docker run failed: $(printf '%s' "${raw}" | tail -n 1))"
+         && /usr/local/cargo/bin/core-to-core-latency 5000 300 2>&1" 2>"${errf}" </dev/null)" || {
+        p "unavailable (docker run failed: $(tail -n 1 "${errf}"))"
+        rm -f "${errf}"
         return
     }
+    rm -f "${errf}"
     raw="$(printf '%s\n' "${raw}" | sed 's/\x1b\[[0-9;]*m//g')"
     local min max mean
     min="$(printf '%s\n' "${raw}" | sed -n 's/^ *Min  latency: \([0-9.]*\)ns.*/\1/p')"

@@ -34,10 +34,11 @@ harness by hand, and this change supplies a better *machine* for that, not a sch
 
 ## Decision
 
-`script/vm` is a new host-side script with four subcommands: `up`, `shell`, `status`, `down`.
+`script/vm` is a new host-side script. Its first four subcommands are `up`, `shell`, `status`, and `down`;
+later amendments add `build`, `push`, `pull`, and `metadata`.
 `up` provisions a VM and warms it to the point of having already run one scenario; `shell` opens a
 session on it; `status` reports what's running and its cost so far; `down` deletes every billable
-resource. There is no fifth verb.
+resource. Nothing else creates or deletes the VM.
 
 **Amended 2026-09-19** to add three more: `build`, `push`, `pull` -- see "Who runs what" and
 "Multiple sources, one VM" below. The four original verbs, and the cost/lifecycle model around
