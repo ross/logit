@@ -9,10 +9,10 @@
 //! **Which rows a record reaches.** A metric record reaches its kind's rows: for a `sum`, its
 //! temporality and monotonicity and its scalar type; for a `gauge` or `gauge_delta`, its scalar
 //! type, `negative` for a gauge below zero, and `prometheus_info` or `prometheus_stateset` for a
-//! gauge whose `_logit.prometheus.type` is `info` or `stateset`; for a `histogram`,
-//! `exponential_histogram`, or `summary`, its temporality, and for a `histogram` `nan_bound` and
-//! `neg_inf_bound` for each such bound it holds and `gauge_histogram` when its
-//! `_logit.prometheus.type` is `gaugehistogram`; any other kind, its kind's one row. It also reaches a `record` row for each of
+//! gauge whose `_logit.metrics.type`, the event's else the resource's, is `info` or `stateset`;
+//! for a `histogram`, `exponential_histogram`, or `summary`, its temporality, and for a
+//! `histogram` `nan_bound` and `neg_inf_bound` for each such bound it holds and `gauge_histogram`
+//! when its `_logit.metrics.type` is `gaugehistogram`; any other kind, its kind's one row. It also reaches a `record` row for each of
 //! `unit` (`unit_on_distribution` for a `samples` or `distribution`), `description`,
 //! `start_timestamp`, `exemplars` (`exemplars_on_summary` for a `summary`), and `no_recorded_value` (`no_recorded_value_delta_sum` for a delta `sum`,
 //! `no_recorded_value_other_kind` for a kind other than `sum` and `gauge`) it carries,
@@ -41,6 +41,8 @@
 //! sink's own protocol is `private_carrier`, `_logit.prometheus.target` `prometheus_target` and
 //! `_logit.metrics.closed: "timestamped"` `timestamped` at every sink, on a metric record
 //! `_logit.metrics.type: "rate"` `rate` on a `gauge` and `rate_on_non_gauge` on any other kind,
+//! `_logit.metrics.type: "info"` or `"stateset"` on a `gauge` and `"gaugehistogram"` on a
+//! `histogram` `family_type`, and any of the three on another kind `family_type_on_other_kind`,
 //! and `_logit.metrics.interval` `interval_on_distribution` on a `samples`, `distribution`, or
 //! delta `exponential_histogram`, `interval_on_histogram` on a delta `histogram`, and `interval`
 //! on any other kind, at every sink, a `_logit.datadog.` carrier on a log, a Datadog
@@ -153,7 +155,8 @@
 use super::mapping::{self, Class, Lookup, Mapping, Series};
 use super::Traced;
 use logit_core::attrs::{
-    is_field, CLOSED_TIMESTAMPED, METRICS_CLOSED, METRICS_INTERVAL, METRICS_TYPE, TYPE_RATE,
+    is_field, CLOSED_TIMESTAMPED, METRICS_CLOSED, METRICS_INTERVAL, METRICS_TYPE,
+    TYPE_GAUGE_HISTOGRAM, TYPE_INFO, TYPE_RATE, TYPE_STATESET,
 };
 use logit_core::EventBatch;
 use logit_outputs::ndjson::render_ndjson;
@@ -423,7 +426,7 @@ impl Spelling {
                     rec.name.clone()
                 }
             }
-            Spelling::Otlp if rec.kind == "gauge" && prometheus_type(rec) == Some("info") => {
+            Spelling::Otlp if rec.kind == "gauge" && metric_type(rec) == Some(TYPE_INFO) => {
                 format!("{}_info", rec.name)
             }
             _ => self.sanitize(&rec.name),
@@ -431,11 +434,10 @@ impl Spelling {
     }
 
     /// The [`Rec::identity`] the sink's pair decoder reads `rec`, a sink input, back under:
-    /// `otlp_out` writes an OpenMetrics `info` or `stateset` gauge as a cumulative non-monotonic
-    /// sum.
+    /// `otlp_out` writes a gauge flagged `info` or `stateset` as a cumulative non-monotonic sum.
     fn written_identity(self, rec: &Rec) -> String {
         let respelled =
-            rec.kind == "gauge" && matches!(prometheus_type(rec), Some("info" | "stateset"));
+            rec.kind == "gauge" && matches!(metric_type(rec), Some(TYPE_INFO | TYPE_STATESET));
         if self == Spelling::Otlp && respelled {
             "sum/\"cumulative\"/false".to_string()
         } else {
@@ -1287,9 +1289,9 @@ fn kind_features(rec: &Rec) -> Vec<Option<String>> {
             if number(&rec.body["value"]).is_some_and(|v| v < 0.0) {
                 features.push(Some("negative".to_string()));
             }
-            match prometheus_type(rec) {
-                Some("info") => features.push(Some("prometheus_info".to_string())),
-                Some("stateset") => features.push(Some("prometheus_stateset".to_string())),
+            match metric_type(rec) {
+                Some(TYPE_INFO) => features.push(Some("prometheus_info".to_string())),
+                Some(TYPE_STATESET) => features.push(Some("prometheus_stateset".to_string())),
                 _ => {}
             }
             features
@@ -1310,7 +1312,7 @@ fn kind_features(rec: &Rec) -> Vec<Option<String>> {
             if bounds.contains(&"-inf") {
                 features.push(Some("neg_inf_bound".to_string()));
             }
-            if prometheus_type(rec) == Some("gaugehistogram") {
+            if metric_type(rec) == Some(TYPE_GAUGE_HISTOGRAM) {
                 features.push(Some("gauge_histogram".to_string()));
             }
             features
@@ -1339,9 +1341,25 @@ fn kind_features(rec: &Rec) -> Vec<Option<String>> {
     }
 }
 
-/// The OpenMetrics family type `prometheus_in` carried on `rec`, if any.
-fn prometheus_type(rec: &Rec) -> Option<&str> {
-    rec.attributes.get(logit_proto::prometheus::ATTR_TYPE).and_then(Value::as_str)
+/// `rec`'s [`METRICS_TYPE`] flag, the event's value else the resource's, as
+/// `logit_core::attrs::metric_type` reads it.
+fn metric_type(rec: &Rec) -> Option<&str> {
+    rec.attributes
+        .get(METRICS_TYPE)
+        .or_else(|| rec.resource.get(METRICS_TYPE))
+        .and_then(Value::as_str)
+}
+
+/// The `attributes` row a [`METRICS_TYPE`] `value` on `rec` reaches, other than `rate`'s: `info`
+/// and `stateset` name a gauge and `gaugehistogram` a histogram, and on another kind each is
+/// ignored.
+fn family_type_row(rec: &Rec, value: &Value) -> Option<&'static str> {
+    let kind = match value.as_str()? {
+        TYPE_INFO | TYPE_STATESET => "gauge",
+        TYPE_GAUGE_HISTOGRAM => "histogram",
+        _ => return None,
+    };
+    Some(if rec.kind == kind { "family_type" } else { "family_type_on_other_kind" })
 }
 
 /// `rec`'s metric record in the model, read back from its `format: json` body.
@@ -1431,11 +1449,7 @@ fn same_reading(rec: &Rec, later: &Rec) -> bool {
 /// [`METRICS_TYPE`], the event's value else the resource's, is
 /// `rate` (`logit_core::attrs::is_rate`).
 fn is_state(rec: &Rec) -> bool {
-    let flag = METRICS_TYPE;
-    let rate = rec.kind == "gauge"
-        && rec.attributes.get(flag).or_else(|| rec.resource.get(flag)).and_then(Value::as_str)
-            == Some(TYPE_RATE);
-    if rate {
+    if rec.kind == "gauge" && metric_type(rec) == Some(TYPE_RATE) {
         return false;
     }
     match rec.kind.as_str() {
@@ -1534,6 +1548,8 @@ fn field_rows(rec: &Rec, protocol: &str) -> Vec<(String, Option<String>, Field)>
             Some("timestamped")
         } else if key == METRICS_TYPE && value.as_str() == Some(TYPE_RATE) && rec.is_metric() {
             Some(if rec.kind == "gauge" { "rate" } else { "rate_on_non_gauge" })
+        } else if key == METRICS_TYPE && rec.is_metric() && family_type_row(rec, value).is_some() {
+            family_type_row(rec, value)
         } else if key == METRICS_INTERVAL && rec.is_metric() {
             Some(interval_row(rec))
         } else if key == ATTR_TARGET {
@@ -2298,12 +2314,13 @@ mod tests {
         assert_eq!(verbatim.seen, [None, None]);
     }
 
-    /// `otlp_out` writes an OpenMetrics `info` or `stateset` gauge as a cumulative non-monotonic
-    /// sum, an `info` one under `<name>_info`; with no carrier, the same sum pairs nothing.
+    /// `otlp_out` writes a gauge flagged `info` or `stateset` as a cumulative non-monotonic sum,
+    /// an `info` one under `<name>_info`, the stateset's flag on the resource; with no flag, the
+    /// same sum pairs nothing.
     #[test]
     fn otlp_pairs_an_info_and_a_stateset_gauge_with_their_sums() {
-        let info = r#"{{T},"metrics":[{"name":"build","kind":"gauge","value":1.0}],"attributes":{"_logit.prometheus.type":"info","version":"1"}}"#;
-        let state = r#"{{T},"metrics":[{"name":"feature","kind":"gauge","value":0.0}],"attributes":{"_logit.prometheus.type":"stateset","feature":"a"}}"#;
+        let info = r#"{{T},"metrics":[{"name":"build","kind":"gauge","value":1.0}],"attributes":{"_logit.metrics.type":"info","version":"1"}}"#;
+        let state = r#"{{T},"metrics":[{"name":"feature","kind":"gauge","value":0.0}],"attributes":{"feature":"a"},"resource":{"attributes":{"_logit.metrics.type":"stateset"}}}"#;
         let outs = recs(&[
             r#"{{T},"metrics":[{"name":"build_info","kind":"sum","value":1.0,"temporality":"cumulative","monotonic":false}],"attributes":{"version":"1"}}"#,
             r#"{{T},"metrics":[{"name":"feature","kind":"sum","value":0.0,"temporality":"cumulative","monotonic":false}],"attributes":{"feature":"a"}}"#,
@@ -2928,6 +2945,42 @@ mod tests {
         assert_eq!(flag_rows(&ins[4]), ["interval", "rate_on_non_gauge"]);
         assert_eq!(flag_rows(&ins[5]), ["interval_on_distribution", "rate_on_non_gauge"]);
         assert_eq!(flag_rows(&ins[6]), ["interval", "rate_on_non_gauge"]);
+    }
+
+    /// `info` and `stateset` reach `family_type` on a gauge and `gaugehistogram` on a histogram,
+    /// each on the event or the resource; any of the three on another kind reaches
+    /// `family_type_on_other_kind`, and `prometheus_in`'s carrier reaches `foreign_carrier`.
+    #[test]
+    fn the_family_type_flags_have_rows_by_kind() {
+        let gauge = r#"{{T},"metrics":[{"name":"g","kind":"gauge","value":1.0}],AT}"#;
+        let sum = r#"{{T},"metrics":[{"name":"s","kind":"sum","value":1.0,"temporality":"cumulative","monotonic":true}],AT}"#;
+        let histogram = r#"{{T},"metrics":[{"name":"h","kind":"histogram","temporality":"cumulative","buckets":[{"bound":1.0,"count":1},{"bound":"inf","count":0}],"sum":1.0}],AT}"#;
+        let flag = |at: &str, value: &str| {
+            let flag = format!(r#"{{"_logit.metrics.type":"{value}"}}"#);
+            match at {
+                "resource" => format!(r#""resource":{{"attributes":{flag}}}"#),
+                _ => format!(r#""attributes":{flag}"#),
+            }
+        };
+        let carrier = r#""attributes":{"_logit.prometheus.type":"info"}"#.to_string();
+        let lines = [
+            (gauge, flag("attributes", "info"), "family_type"),
+            (gauge, flag("resource", "stateset"), "family_type"),
+            (histogram, flag("attributes", "gaugehistogram"), "family_type"),
+            (histogram, flag("resource", "info"), "family_type_on_other_kind"),
+            (gauge, flag("attributes", "gaugehistogram"), "family_type_on_other_kind"),
+            (sum, flag("attributes", "stateset"), "family_type_on_other_kind"),
+            (gauge, carrier, "foreign_carrier"),
+        ];
+        for (line, at, expected) in lines {
+            let rec = &recs(&[line.replace("AT", &at).as_str()])[0];
+            let rows: Vec<String> = field_rows(rec, "otlp")
+                .into_iter()
+                .filter_map(|(_, f, _)| f)
+                .filter(|f| f.starts_with("family_type") || f.ends_with("carrier"))
+                .collect();
+            assert_eq!(rows, [expected], "{at}");
+        }
     }
 
     /// The log encoder takes any `host.name`, an empty one included, as the host, so a log with

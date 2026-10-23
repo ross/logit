@@ -24,16 +24,16 @@
   text: An OpenMetrics `unknown` family, decoded to a gauge with the type carrier `unknown`.
 - name: info
   text: >-
-    An OpenMetrics `info` family, decoded to a gauge of 1 named without `_info`, with the type
-    carrier `info`.
+    An OpenMetrics `info` family, decoded to a gauge of 1 named without `_info`, flagged
+    `_logit.metrics.type: info`.
 - name: stateset
   text: >-
-    An OpenMetrics `stateset` family, decoded to one gauge of 0 or 1 per state, with the type
-    carrier `stateset`.
+    An OpenMetrics `stateset` family, decoded to one gauge of 0 or 1 per state, each flagged
+    `_logit.metrics.type: stateset`.
 - name: gaugehistogram
   text: >-
-    An OpenMetrics `gaugehistogram` family's `_gcount` and `_gsum`, decoded to a histogram with
-    the type carrier `gaugehistogram`.
+    An OpenMetrics `gaugehistogram` family's `_gcount` and `_gsum`, decoded to a histogram
+    flagged `_logit.metrics.type: gaugehistogram`.
 - name: help
   text: A `# HELP` line, decoded to the record's description.
 - name: unit

@@ -100,7 +100,7 @@ is one nothing checks: add a case or a flow that reaches it.
   `same_millisecond`, `same_millisecond_equal`): `exact`, `normalized`, `degraded`, `skipped`, or `dropped`, best to worst.
 - **Field level**, for the `record` rows `unit`, `description`, `start_timestamp`, `exemplars`,
   `exemplars_on_summary`, `unit_on_distribution`, `min_max`, and `sample_rate_unweighted`, every `attributes` row (`rate`,
-  `rate_on_non_gauge`, `interval`, `interval_on_distribution`, and `interval_on_histogram` among them), and a log or span beside metrics
+  `rate_on_non_gauge`, `family_type`, `family_type_on_other_kind`, `interval`, `interval_on_distribution`, and `interval_on_histogram` among them), and a log or span beside metrics
   (`beside_metrics`), which is a field of its event: `exact`, `normalized`, or `lost`.
 
 Where a sink's outcome depends on the record's kind, the kind is in the feature's name, since a
@@ -108,6 +108,8 @@ Where a sink's outcome depends on the record's kind, the kind is in the feature'
 `gauge`, `no_recorded_value_delta_sum` a flagged delta `sum`, `exemplars_on_summary` a
 summary's exemplars, `unit_on_distribution` a `samples` or `distribution` record's unit,
 `rate_on_non_gauge` a `_logit.metrics.type: rate` flag on a record that isn't a `gauge`,
+`family_type_on_other_kind` a `_logit.metrics.type` of `info` or `stateset` on a record that
+isn't a `gauge`, or of `gaugehistogram` on one that isn't a `histogram`,
 `interval_on_distribution` a `_logit.metrics.interval` flag on a `samples`, `distribution`, or
 delta `exponential_histogram` record and `interval_on_histogram` one on a delta `histogram`, and
 `exemplar_key_unsafe` and `exemplar_key_unsafe_histogram` a monotonic `sum` and a `histogram`

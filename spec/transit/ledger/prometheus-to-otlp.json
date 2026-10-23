@@ -1,6 +1,7 @@
 {
   "cells": [
     {"sink":"otlp_out","row":"attributes/bytes_value","cell":0,"observed":["exact"]},
+    {"sink":"otlp_out","row":"attributes/family_type","cell":0,"observed":["lost"]},
     {"sink":"otlp_out","row":"attributes/foreign_carrier","cell":0,"observed":["lost"]},
     {"sink":"otlp_out","row":"attributes/map_value","cell":0,"observed":["exact"]},
     {"sink":"otlp_out","row":"attributes/no_host","cell":0,"observed":["exact"]},

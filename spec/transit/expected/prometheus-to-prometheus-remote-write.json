@@ -25,11 +25,11 @@
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"escaped","kind":"gauge","value":1.0}],"attributes":{"instance":"transit:9100","nl":"a\nb","path":"C:\\dir","quote":"say \"hi\""}}
   ], "counters": {}},
   "mixed": {"events": [
-    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"build","kind":"gauge","value":1.0}],"attributes":{"_logit.prometheus.type":"info","instance":"transit:9100","version":"1.2.3"}},
-    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"feature","kind":"gauge","value":0.0}],"attributes":{"_logit.prometheus.type":"stateset","feature":"b","instance":"transit:9100"}},
-    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"feature","kind":"gauge","value":1.0}],"attributes":{"_logit.prometheus.type":"stateset","feature":"a","instance":"transit:9100"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"build","kind":"gauge","value":1.0}],"attributes":{"_logit.metrics.type":"info","instance":"transit:9100","version":"1.2.3"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"feature","kind":"gauge","value":0.0}],"attributes":{"_logit.metrics.type":"stateset","feature":"b","instance":"transit:9100"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"feature","kind":"gauge","value":1.0}],"attributes":{"_logit.metrics.type":"stateset","feature":"a","instance":"transit:9100"}},
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"mystery","kind":"gauge","value":3.0}],"attributes":{"_logit.prometheus.type":"unknown","instance":"transit:9100"}},
-    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"queue","kind":"histogram","temporality":"cumulative","buckets":[{"bound":1.0,"count":2},{"bound":"inf","count":3}],"sum":7.5}],"attributes":{"_logit.prometheus.type":"gaugehistogram","instance":"transit:9100"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"queue","kind":"histogram","temporality":"cumulative","buckets":[{"bound":1.0,"count":2},{"bound":"inf","count":3}],"sum":7.5}],"attributes":{"_logit.metrics.type":"gaugehistogram","instance":"transit:9100"}},
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"reqs_total","kind":"sum","value":5.0,"temporality":"cumulative","monotonic":true}],"attributes":{"instance":"transit:9100"}},
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"up","kind":"gauge","value":1.0}],"attributes":{"instance":"transit:9100"}}
   ], "counters": {}},

@@ -93,8 +93,8 @@
 //! | `gauge/u64` | normalized | `f64_value` | Plaintext writes every digit and pickle the nearest `f64`, and graphite_in reads either back as a float, rounded beyond 2^53. |
 //! | `gauge/bool` | normalized | `bool_value`; `logit.output.metrics.normalized{reason=bool_value}` | A boolean is written as `1` or `0` and reads back as that number. |
 //! | `gauge/negative` | exact | -- | A negative value, written as is. |
-//! | `gauge/prometheus_info` | exact | -- | As any other gauge; the type carrier isn't written. |
-//! | `gauge/prometheus_stateset` | exact | -- | As any other gauge; the type carrier isn't written. |
+//! | `gauge/prometheus_info` | exact | -- | As any other gauge; the type flag isn't written. |
+//! | `gauge/prometheus_stateset` | exact | -- | As any other gauge; the type flag isn't written. |
 //! | `gauge_delta/f64` | dropped | `logit.output.metrics.dropped{reason=unresolved_gauge_delta}` | Carbon has no relative gauge, so an unresolved adjustment is dropped, with a throttled `gauge_delta_unresolved` warning; an `aggregate` upstream resolves it into a gauge. |
 //! | `gauge_delta/i64` | dropped | `logit.output.metrics.dropped{reason=unresolved_gauge_delta}` | Dropped, as for a float adjustment. |
 //! | `gauge_delta/u64` | dropped | `logit.output.metrics.dropped{reason=unresolved_gauge_delta}` | Dropped, as for a float adjustment. |
@@ -115,7 +115,7 @@
 //! | `histogram/nan_bound`, otherwise | skipped | `logit.output.metrics.skipped{metric_kind=histogram}` | Under `multi_value: skip`, the default, no datapoint is written. |
 //! | `histogram/neg_inf_bound`, under `multi_value: expand` | degraded | `logit.output.metrics.degraded{metric_kind=histogram}` | Under `multi_value: expand`, each bucket is its own dotted datapoint, as for any other bound: `.bucket_-inf` holds that bucket's own count. |
 //! | `histogram/neg_inf_bound`, otherwise | skipped | `logit.output.metrics.skipped{metric_kind=histogram}` | Under `multi_value: skip`, the default, no datapoint is written. |
-//! | `histogram/gauge_histogram` | exact | -- | As `histogram/cumulative`; the type carrier isn't written. |
+//! | `histogram/gauge_histogram` | exact | -- | As `histogram/cumulative`; the type flag isn't written. |
 //! | `exponential_histogram/delta`, under `multi_value: expand` | degraded | `logit.output.metrics.degraded{metric_kind=exponential_histogram}` | Under `multi_value: expand`, dotted `.count`, `.sum`, `.min`, `.max`, and `.zero_count` datapoints. Its buckets aren't written, since each scale would mint its own paths. |
 //! | `exponential_histogram/delta`, otherwise | skipped | `logit.output.metrics.skipped{metric_kind=exponential_histogram}` | Under `multi_value: skip`, the default, no datapoint is written. |
 //! | `exponential_histogram/cumulative`, under `multi_value: expand` | degraded | `logit.output.metrics.degraded{metric_kind=exponential_histogram}` | Under `multi_value: expand`, the same dotted datapoints as a delta one's, and no buckets. |
@@ -171,6 +171,8 @@
 //! | `attributes/rate` | lost | structural | The flag is private and isn't a tag, so it's left off, under either `tags:` mode. |
 //! | `attributes/interval` | lost | structural | The flag is private and isn't a tag, so it's left off, under either `tags:` mode. |
 //! | `attributes/rate_on_non_gauge` | lost | structural | The flag is private and isn't a tag, so it's left off, under either `tags:` mode. |
+//! | `attributes/family_type` | lost | structural | The flag is private and isn't a tag, so it's left off, under either `tags:` mode. |
+//! | `attributes/family_type_on_other_kind` | lost | structural | The flag is private and isn't a tag, so it's left off, under either `tags:` mode. |
 //! | `attributes/interval_on_distribution` | lost | structural | The flag is private and isn't a tag, so it's left off, under either `tags:` mode. |
 //! | `attributes/interval_on_histogram` | lost | structural | The flag is private and isn't a tag, so it's left off, under either `tags:` mode. |
 //! | `attributes/resource_attribute`, under `tags: drop` | lost | `logit.output.tags.omitted{reason=dialect}` | Under `tags: drop`, no tag is written, counted once per attribute. |

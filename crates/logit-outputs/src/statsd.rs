@@ -224,8 +224,8 @@
 //! | `gauge/u64` | normalized | `f64_value` | statsd_out writes every digit, and statsd_in reads the number back as an f64, so an integer reads back as a float and one beyond 2^53 rounds. |
 //! | `gauge/bool` | normalized | `bool_value`; `logit.output.metrics.normalized{reason=bool_value}` | A boolean is written as `1` or `0` and reads back as that number. |
 //! | `gauge/negative` | degraded | `logit.output.metrics.degraded{reason=negative_gauge}` | statsd has no negative absolute gauge, so statsd_out writes `0\|g` then `-v\|g` in one datagram, counted once per record. A statsd server ends at the right value, but statsd_in reads the pair as a gauge of 0 and a relative adjustment. |
-//! | `gauge/prometheus_info` | exact | -- | As any other gauge; the type carrier isn't written. |
-//! | `gauge/prometheus_stateset` | exact | -- | As any other gauge; the type carrier isn't written. |
+//! | `gauge/prometheus_info` | exact | -- | As any other gauge; the type flag isn't written. |
+//! | `gauge/prometheus_stateset` | exact | -- | As any other gauge; the type flag isn't written. |
 //! | `gauge_delta/f64`, under `relative_gauges: true` | exact | -- | A relative `+v\|g` or `-v\|g` line. |
 //! | `gauge_delta/f64`, otherwise | dropped | `logit.output.messages.dropped{reason=unresolved_gauge_delta}` | An unresolved relative adjustment is dropped unless `relative_gauges: true`, with a throttled `gauge_delta_unresolved` warning; an `aggregate` upstream resolves it into a gauge. |
 //! | `gauge_delta/i64`, under `relative_gauges: true` | normalized | `f64_value` | A relative line, read back as an f64. |
@@ -249,7 +249,7 @@
 //! | `histogram/nan_bound`, otherwise | degraded | `logit.output.metrics.degraded{metric_kind=histogram}` | Each bucket is its own dotted series, as for any other bound: `.bucket_NaN` holds that bucket's own count. |
 //! | `histogram/neg_inf_bound`, under `multi_value: skip` | skipped | `logit.output.metrics.skipped{metric_kind=histogram}` | Under `multi_value: skip`, no line is written. |
 //! | `histogram/neg_inf_bound`, otherwise | degraded | `logit.output.metrics.degraded{metric_kind=histogram}` | Each bucket is its own dotted series, as for any other bound: `.bucket_-inf` holds that bucket's own count. |
-//! | `histogram/gauge_histogram` | exact | -- | As `histogram/cumulative`; the type carrier isn't written. |
+//! | `histogram/gauge_histogram` | exact | -- | As `histogram/cumulative`; the type flag isn't written. |
 //! | `exponential_histogram/delta`, under `multi_value: skip` | skipped | `logit.output.metrics.skipped{metric_kind=exponential_histogram}` | Under `multi_value: skip`, no line is written. |
 //! | `exponential_histogram/delta`, otherwise | degraded | `logit.output.metrics.degraded{metric_kind=exponential_histogram}` | Dotted `.count`, `.sum`, and `.zero_count` counters and `.min` and `.max` gauges. Its buckets aren't written, since each scale would mint its own series names. |
 //! | `exponential_histogram/cumulative`, under `multi_value: skip` | skipped | `logit.output.metrics.skipped{metric_kind=exponential_histogram}` | Under `multi_value: skip`, no line is written. |
@@ -306,12 +306,14 @@
 //! | `attributes/private_carrier`, under `format: statsd` | lost | `logit.output.fields.omitted{reason=dialect}` | Plain statsd has no `\|c:`, `\|e:`, or `\|card:` segment, so those carriers are omitted, counted once per carrier per line; the type carrier survives as the line's type, `h` and `d` as `ms`. |
 //! | `attributes/private_carrier`, otherwise | exact | -- | A `_logit.statsd.*` carrier is written as its own segment or field and statsd_in stamps it back. |
 //! | `attributes/prometheus_target` | lost | structural | The scrape target is private and isn't a tag, so it's left off. |
-//! | `attributes/foreign_carrier` | lost | structural | Another protocol's `_logit.` carrier is private and isn't a tag, so it's left off. Under `format: dogstatsd`, `_logit.datadog.hostless` on a record with no `host`, no non-empty `host.name`, and no non-empty `h:` field is an empty `host:` tag, which statsd_in reads back as an empty `host`. A `_logit.metrics.*` flag is left off too; the `timestamped`, `rate`, and `interval` rows have `_logit.metrics.closed: timestamped`, `_logit.metrics.type: rate`, and `_logit.metrics.interval`. |
+//! | `attributes/foreign_carrier` | lost | structural | Another protocol's `_logit.` carrier is private and isn't a tag, so it's left off. Under `format: dogstatsd`, `_logit.datadog.hostless` on a record with no `host`, no non-empty `host.name`, and no non-empty `h:` field is an empty `host:` tag, which statsd_in reads back as an empty `host`. A `_logit.metrics.*` flag is left off too; the `timestamped`, `rate`, `family_type`, and `interval` rows have `_logit.metrics.closed: timestamped`, `_logit.metrics.type`, and `_logit.metrics.interval`. |
 //! | `attributes/timestamped`, under `format: statsd` | lost | `logit.output.fields.omitted{reason=dialect}` | Plain statsd has no `\|T` segment, so the event's timestamp is omitted, counted. |
 //! | `attributes/timestamped`, otherwise | exact | -- | The event's timestamp is written as `\|T<seconds>` (`d:<seconds>` on an event or a service check), truncated to whole seconds, and statsd_in sets the flag again. A scraped Prometheus sample with its own timestamp leaves with a `\|T` too. A timestamp before 1970 has no unsigned seconds to write, so it's omitted, counted `logit.output.fields.omitted{reason=invalid_value}` once per line. |
 //! | `attributes/rate` | lost | structural | The flag is private and isn't a tag, so it's left off. |
 //! | `attributes/interval` | lost | structural | The flag is private and isn't a tag, so it's left off. |
 //! | `attributes/rate_on_non_gauge` | lost | structural | The flag is private and isn't a tag, so it's left off. |
+//! | `attributes/family_type` | lost | structural | The flag is private and isn't a tag, so it's left off. |
+//! | `attributes/family_type_on_other_kind` | lost | structural | The flag is private and isn't a tag, so it's left off. |
 //! | `attributes/interval_on_distribution` | lost | structural | The flag is private and isn't a tag, so it's left off. |
 //! | `attributes/interval_on_histogram` | lost | structural | The flag is private and isn't a tag, so it's left off. |
 //! | `attributes/resource_attribute`, under `format: statsd` | lost | `logit.output.tags.omitted{reason=dialect}` | Plain statsd has no tags. |
