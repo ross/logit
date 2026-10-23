@@ -2017,7 +2017,8 @@ rows:
           A `key:value` tag. A `host` attribute on a metric with no `host.name` is the host and not
           a tag, which datadog_in reads back as `host.name`. On a Datadog event or service check
           with no non-empty host carrier, `host.name`, else `host`, is the host and not a tag,
-          which datadog_in reads back as that carrier.
+          which datadog_in reads back as that carrier. A `host.name` on a log with no `hostname` is
+          the log's `hostname`, which datadog_in reads back as `hostname`.
       graphite_out:
         - when: {tags: drop}
           class: lost

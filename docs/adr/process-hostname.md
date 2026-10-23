@@ -131,7 +131,9 @@ The 2026-10-22 amendment made `datadog_out` read another family's host key, `col
 was the one read left that broke
 [ADR `protocol-knowledge-stays-in-family`](protocol-knowledge-stays-in-family.md): a Lua script or
 `set` that wrote `collectd.host` steered `datadog_out`, and `splunk_hec_out` never read it, so one
-relay sent collectd's host to Datadog and not to Splunk. One shared key ends both problems.
+relay sent collectd's host to Datadog and not to Splunk. One shared key ends the cross-family read;
+`splunk_hec_out` still takes only a resource `host.name`, so collectd's per-event host doesn't
+reach its envelope.
 
 `host.name`, the OpenTelemetry semantic-conventions name, is the one documented host key, spelled
 `logit_core::attrs::HOST_NAME`:

@@ -548,7 +548,8 @@ the private four. There are no aliases and no decode path for the old private na
 `host.name`, the standard host key, instead of `collectd.host`, and `collectd_out` reads
 `host.name` as the Host part, then its `hostname:`
 ([ADR `process-hostname`](process-hostname.md)'s "Amendment: `host.name` is the standard host key
-(2026-10-23)"). The tables above state the current form.
+(2026-10-23)"). The encode and attribute tables above state the current form; the 2026-10-13
+amendment's public `collectd.host` is now `host.name`.
 
 - **The relay is unchanged.** `collectd_in -> collectd_out` stays a fixed point: the Host part
   decodes to `host.name` and encodes from it.
