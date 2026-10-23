@@ -138,8 +138,8 @@
 //! gauge or a cumulative kind, with the same value, wire type, unit, interval, source type, and
 //! origin), since Datadog stores the same point, and otherwise
 //! `logit.output.metrics.dropped{reason="duplicate_timestamp"}`, with a throttled
-//! `duplicate_timestamp` diagnostic. Two equal delta counts or `rate`s (a `Gauge` carrying
-//! `_logit.datadog.type: rate`) are two increments, so the one left off counts `dropped`. Each point left off comes out of its event's weight, so no request cut
+//! `duplicate_timestamp` diagnostic. Two equal delta counts or `rate`s (a `Gauge` flagged
+//! `_logit.metrics.type: rate`) are two increments, so the one left off counts `dropped`. Each point left off comes out of its event's weight, so no request cut
 //! or bisection splits a pair, and `logit.output.records` and
 //! an `at_most_once` drop count only the points sent. Distribution points aren't collapsed:
 //! Datadog keeps both. Two points of one series in one second in two batches are both sent, and
@@ -3381,7 +3381,7 @@ mod tests {
     async fn an_equal_rate_sharing_its_second_is_counted_dropped() {
         let rate = |ts: i64| {
             let mut attributes = AttrMap::new();
-            attributes.insert(logit_proto::datadog::ATTR_TYPE, Value::str("rate"));
+            attributes.insert(logit_core::attrs::METRICS_TYPE, Value::str("rate"));
             Event::metric(ts, attributes, MetricRecord::new(intern("m"), MetricKind::gauge(0.5)))
         };
         let b = batch(vec![rate(NOW), rate(NOW + 500_000_000)]);

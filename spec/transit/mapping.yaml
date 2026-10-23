@@ -61,7 +61,7 @@ rows:
       datadog_out:
         class: exact
         text: >-
-          A series `count` point, its `interval` from the `_logit.datadog.interval` carrier or 0,
+          A series `count` point, its `interval` from the `_logit.metrics.interval` flag or 0,
           which datadog_in reads back as a delta monotonic sum.
       graphite_out:
         class: degraded
@@ -329,7 +329,8 @@ rows:
       datadog_out:
         class: exact
         text: >-
-          A series `gauge` point, or `rate` or unspecified under the `_logit.datadog.type` carrier.
+          A series `gauge` point, a `rate` under the `_logit.metrics.type` flag, or unspecified
+          under the `_logit.datadog.type` carrier.
       graphite_out:
         class: exact
         text: A `path value timestamp` line, or a pickled datapoint.

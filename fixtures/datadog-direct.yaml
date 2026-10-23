@@ -35,7 +35,7 @@ components:
       host.name: web-1
     attributes:
       # A count's interval, in seconds: the aggregation window above.
-      _logit.datadog.interval: 10
+      _logit.metrics.interval: 10
 
   datadog:
     type: datadog_out

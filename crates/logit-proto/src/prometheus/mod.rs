@@ -1130,7 +1130,7 @@ pub fn events_to_families_pending<'a>(
                 created,
                 exemplars: record.exemplars.clone(),
                 increment: !crate::replaced_by_a_later_reading(&record.kind)
-                    || crate::datadog::is_rate(resource, event, &record.kind),
+                    || logit_core::attrs::is_rate(resource, event, &record.kind),
             });
 
             // One map probe on the steady-state path (a family this record already belongs to); the

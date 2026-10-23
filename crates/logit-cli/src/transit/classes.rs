@@ -1407,18 +1407,14 @@ fn same_reading(rec: &Rec, later: &Rec) -> bool {
 /// Whether a later reading of `rec`'s series fully replaces it: a `gauge`, or a cumulative `sum`,
 /// `histogram`, `exponential_histogram`, or `summary`. Any other kind, a set included, is an
 /// increment or an observation set, so two equal ones are two sets of events (`logit_proto`'s
-/// `replaced_by_a_later_reading`), and so is a Datadog `rate`: a `gauge` whose
-/// `_logit.datadog.type`, the event's value else the resource's, is `rate` (`logit_proto`'s
-/// `datadog::is_rate`).
+/// `replaced_by_a_later_reading`), and so is a rate: a `gauge` whose
+/// [`METRICS_TYPE`](logit_core::attrs::METRICS_TYPE), the event's value else the resource's, is
+/// `rate` (`logit_core::attrs::is_rate`).
 fn is_state(rec: &Rec) -> bool {
-    let carrier = "_logit.datadog.type";
+    let flag = logit_core::attrs::METRICS_TYPE;
     let rate = rec.kind == "gauge"
-        && rec
-            .attributes
-            .get(carrier)
-            .or_else(|| rec.resource.get(carrier))
-            .and_then(Value::as_str)
-            == Some("rate");
+        && rec.attributes.get(flag).or_else(|| rec.resource.get(flag)).and_then(Value::as_str)
+            == Some(logit_core::attrs::TYPE_RATE);
     if rate {
         return false;
     }

@@ -57,7 +57,7 @@
 //! |---|---|---|
 //! | `COUNT` / `1` / `"count"` | `MetricKind::counter(v)` (delta, monotonic) | -- |
 //! | `GAUGE` / `3` / `"gauge"`; a v1 series with no `type` | `Gauge(v)` | -- |
-//! | `RATE` / `2` / `"rate"` | `Gauge(v)` + [`ATTR_TYPE`] `rate` | -- |
+//! | `RATE` / `2` / `"rate"` | `Gauge(v)` + [`METRICS_TYPE`](logit_core::attrs::METRICS_TYPE) `rate` | -- |
 //! | `UNSPECIFIED` / `0` / `""`; a v2 JSON series with no `type` | `Gauge(v)` + [`ATTR_TYPE`] `unspecified` | -- |
 //! | an unknown type, no `metric`, no `points` array, or a field of the wrong JSON type | the series is dropped; the rest of the request decodes | `logit.input.metrics.dropped{reason="bad_series"}` + diag `bad_series` |
 //! | a point that isn't `[ts, value]` / `{timestamp, value}` / `[ts, [values]]` | the point is dropped | `dropped{reason="bad_point"}` |
@@ -73,7 +73,7 @@
 //! | the first named `device` resource; v1 `device` | [`ATTR_DEVICE`] (the Agent's v2 serializer sends a v1 `device` as that resource, UNVERIFIED: the recorded Agent ran no check that sets one) | -- |
 //! | every other resource, including an empty-named or second `host` | [`ATTR_RESOURCES`]: `Array` of `Map{type, name}`, in wire order | -- |
 //! | `source_type_name` | [`ATTR_SOURCE_TYPE_NAME`] when non-empty | -- |
-//! | `interval` | [`ATTR_INTERVAL`] (`I64`) when nonzero | -- |
+//! | `interval` | [`METRICS_INTERVAL`](logit_core::attrs::METRICS_INTERVAL) (`I64`) when nonzero, on any series type | -- |
 //! | protobuf `metadata.origin` | [`ATTR_ORIGIN_PRODUCT`] / [`ATTR_ORIGIN_CATEGORY`] / [`ATTR_ORIGIN_SERVICE`] (`U64`), each when nonzero | -- |
 //! | JSON `metadata.origin` `product` / `service` / `metric_type` | [`ATTR_ORIGIN_PRODUCT`] / [`ATTR_ORIGIN_SERVICE`] / [`ATTR_ORIGIN_METRIC_TYPE`], each when nonzero | -- |
 //! | distribution point `[ts, [v, ...]]` | `MetricKind::Samples(Samples::new(values))`, rate 1.0; the series' `type` is ignored | -- |
@@ -82,8 +82,13 @@
 //! | an object with no `series` member (the Agent's `{}` connectivity probe, which the intake answers `202`) | an empty batch | -- |
 //!
 //! A tag spelled like a carrier (`host.name:x`) loses to the wire field it names. A tag can't spell
-//! a Datadog carrier: every one is under the private `_logit.` prefix, which the row above omits,
-//! so a `_logit.datadog.type:rate` tag never turns a GAUGE or COUNT series into a RATE.
+//! a carrier or a flag: every one is under the private `_logit.` prefix, which the row above
+//! omits, so a `_logit.metrics.type:rate` tag never turns a GAUGE or COUNT series into a RATE.
+//!
+//! A rate and an interval are neutral metric flags, not Datadog carriers (ADR
+//! `protocol-knowledge-stays-in-family`'s "Amendment: move, don't mirror (2026-10-23)"), so a
+//! stage outside the Datadog family reads them, and a `Gauge` a script or a `set` flags as a rate
+//! leaves `datadog_out` as a `rate`.
 //!
 //! ## Decode: sketches → events
 //!
@@ -126,7 +131,7 @@
 //!
 //! | Row | Class | Reason or counter | What a consumer sees |
 //! |---|---|---|---|
-//! | `sum/delta_monotonic` | exact | -- | A series `count` point, its `interval` from the `_logit.datadog.interval` carrier or 0, which datadog_in reads back as a delta monotonic sum. |
+//! | `sum/delta_monotonic` | exact | -- | A series `count` point, its `interval` from the `_logit.metrics.interval` flag or 0, which datadog_in reads back as a delta monotonic sum. |
 //! | `sum/delta_nonmonotonic` | degraded | `logit.output.metrics.degraded{metric_kind=non_monotonic_sum}` | A series `count` point of the raw value, as Datadog's exporter sends any delta sum, which datadog_in reads back as a monotonic delta sum. |
 //! | `sum/cumulative_monotonic` | dropped | `logit.output.metrics.dropped{reason=unresolved_cumulative}` | Datadog's exporter differences a running total into a delta first, so it's dropped, with a throttled `unresolved_cumulative` warning; a `cumulative_to_delta` upstream makes it a delta `count`. |
 //! | `sum/cumulative_nonmonotonic` | degraded | `logit.output.metrics.degraded{metric_kind=non_monotonic_sum}` | A series `gauge` point of the running value, as Datadog's exporter sends it, which datadog_in reads back as a gauge; a `cumulative_to_delta` upstream with `non_monotonic: difference` or `reset_on_decrease` makes it a delta `count`. |
@@ -134,7 +139,7 @@
 //! | `sum/i64` | normalized | `integer_as_double` | The point's double, the integer's nearest `f64`, read back as a float. |
 //! | `sum/u64` | normalized | `integer_as_double` | The point's double, the integer's nearest `f64`, read back as a float. |
 //! | `sum/bool` | normalized | `bool_as_double`; `logit.output.metrics.normalized{reason=bool_value}` | The point's double, `1` or `0`, read back as a float. |
-//! | `gauge/f64` | exact | -- | A series `gauge` point, or `rate` or unspecified under the `_logit.datadog.type` carrier. |
+//! | `gauge/f64` | exact | -- | A series `gauge` point, a `rate` under the `_logit.metrics.type` flag, or unspecified under the `_logit.datadog.type` carrier. |
 //! | `gauge/i64` | normalized | `integer_as_double` | The point's double, the integer's nearest `f64`, read back as a float. |
 //! | `gauge/u64` | normalized | `integer_as_double` | The point's double, the integer's nearest `f64`, read back as a float. |
 //! | `gauge/bool` | normalized | `bool_as_double`; `logit.output.metrics.normalized{reason=bool_value}` | The point's double, `1` or `0`, read back as a float. |
@@ -739,12 +744,10 @@ pub(crate) fn units_are_datadog(resource: &Resource, event: &Event) -> bool {
     value.and_then(Value::as_str) == Some(UNITS_DATADOG)
 }
 
-/// `_logit.datadog.type`: `rate` or `unspecified`; absent for `count` and `gauge`, whose model
-/// kinds say so themselves.
+/// `_logit.datadog.type`: `unspecified`, the one series type with no neutral meaning; absent for
+/// `count` and `gauge`, whose model kinds say so themselves, and for `rate`, which is the neutral
+/// flag [`METRICS_TYPE`](logit_core::attrs::METRICS_TYPE).
 pub const ATTR_TYPE: &str = "_logit.datadog.type";
-/// `_logit.datadog.interval`: a count's or rate's interval in seconds (I64), present only when
-/// nonzero.
-pub const ATTR_INTERVAL: &str = "_logit.datadog.interval";
 /// `_logit.datadog.source_type_name`: the check or integration that produced a series.
 pub const ATTR_SOURCE_TYPE_NAME: &str = "_logit.datadog.source_type_name";
 /// `_logit.datadog.device`: the v1 series `device` field.
@@ -884,20 +887,6 @@ pub const ATTR_SPAN_KIND: &str = "span.kind";
 /// [`logit_core::attrs::merged`] resolves it, without the full merged walk.
 fn merged_get<'a>(resource: &'a Resource, event: &'a Event, key: &str) -> Option<&'a Value> {
     event.attributes.get(key).or_else(|| resource.attributes.get(key))
-}
-
-/// Whether `kind` on `event` is a Datadog `rate`: a `Gauge` whose [`ATTR_TYPE`], the event's value
-/// winning over the resource's, is `rate`, the form `datadog_in` decodes a rate to. A rate is an
-/// increment over its [`ATTR_INTERVAL`], not a state, so a stage that collapses readings of one
-/// series at one timestamp sums it rather than keeping the later one.
-pub fn is_rate(resource: &Resource, event: &Event, kind: &MetricKind) -> bool {
-    matches!(kind, MetricKind::Gauge(_))
-        && merged_get(resource, event, ATTR_TYPE).and_then(Value::as_str) == Some(series::TYPE_RATE)
-}
-
-/// [`ATTR_INTERVAL`], the event's value winning over the resource's.
-pub fn interval<'a>(resource: &'a Resource, event: &'a Event) -> Option<&'a Value> {
-    merged_get(resource, event, ATTR_INTERVAL)
 }
 
 /// A service check: `_logit.statsd.service_check.name` present and a `Gauge` first metric, the

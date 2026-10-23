@@ -1741,7 +1741,7 @@ mod tests {
         let mut batch = stats_batch(
             vec![MetricRecord::new(intern(METRIC_HITS), MetricKind::counter(1.0))],
             &[
-                (super::super::ATTR_INTERVAL, Value::I64(10)),
+                (logit_core::attrs::METRICS_INTERVAL, Value::I64(10)),
                 ("_logit.statsd.type", Value::str("c")),
                 ("env", Value::str("prod")),
             ],

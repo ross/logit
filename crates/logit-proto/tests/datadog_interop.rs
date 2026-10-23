@@ -21,12 +21,13 @@
 //! groups), never on bytes, which change on every re-record.
 
 use bytes::Bytes;
+use logit_core::attrs::{METRICS_INTERVAL, METRICS_TYPE};
 use logit_core::interner::resolve;
 use logit_core::{Diagnostics, Event, EventBatch, MetricKind, Registry, Value};
 use logit_proto::datadog::events::EventFormat;
 use logit_proto::datadog::stats::ATTR_STATS_NAME;
 use logit_proto::datadog::{
-    DatadogDecoder, DatadogEncoder, ATTR_HOST_NAME, ATTR_INTERVAL, ATTR_TYPE, METRIC_TOP_LEVEL,
+    DatadogDecoder, DatadogEncoder, ATTR_HOST_NAME, ATTR_TYPE, METRIC_TOP_LEVEL,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
@@ -335,8 +336,9 @@ fn the_agent_series_carry_the_dogstatsd_clients_metrics() {
 
     let rate = by_name["record.requests.count"];
     assert!(matches!(rate.metrics[0].kind, MetricKind::Gauge(_)), "{rate:?}");
-    assert_eq!(str_attr(rate, ATTR_TYPE), Some("rate"));
-    assert_eq!(rate.attributes.get(ATTR_INTERVAL), Some(&Value::I64(10)));
+    assert_eq!(str_attr(rate, METRICS_TYPE), Some("rate"));
+    assert_eq!(rate.attributes.get(METRICS_INTERVAL), Some(&Value::I64(10)));
+    assert_eq!(str_attr(rate, ATTR_TYPE), None, "a rate is the neutral flag alone");
     assert_eq!(str_attr(rate, ATTR_HOST_NAME), Some("record-fixtures"));
     assert_eq!(str_attr(rate, "endpoint"), Some("/checkout"));
     // The client's `env:record` twice (its own tag and `DD_ENV`'s) is one tag by the time the
@@ -346,6 +348,7 @@ fn the_agent_series_carry_the_dogstatsd_clients_metrics() {
     let gauge = by_name["record.queue.depth"];
     assert_eq!(gauge.metrics[0].kind, MetricKind::gauge(17.0));
     assert_eq!(str_attr(gauge, ATTR_TYPE), None, "a plain gauge carries no type carrier");
+    assert_eq!(str_attr(gauge, METRICS_TYPE), None, "a plain gauge carries no type flag");
 
     for aggregate in ["avg", "count", "max", "median", "95percentile"] {
         for timer in ["record.request.duration", "record.db.query.duration"] {

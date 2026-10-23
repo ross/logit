@@ -3105,13 +3105,13 @@ pub enum ComponentKind {
     /// A series is the metric's name, unit, and kind, the resource, the instrumentation scope,
     /// and the event's attributes. In each colliding set the latest reading survives with its
     /// own timestamp. A gauge or cumulative reading before it is replaced by it. Delta sums,
-    /// Datadog rates of one interval, delta histograms, raw samples, set members, sketches, and
-    /// set estimates are merged into it, always keeping the value's type. A Datadog rate is a
-    /// gauge whose `_logit.datadog.type` is `rate`, an increment over its interval, so it's summed
-    /// rather than replaced. A reading that can't merge is forwarded untouched, and the
+    /// rates of one interval, delta histograms, raw samples, set members, sketches, and set
+    /// estimates are merged into it, always keeping the value's type. A rate is a gauge whose
+    /// `_logit.metrics.type` is `rate`, such as a Datadog `rate` series point, an increment over
+    /// its `_logit.metrics.interval`, so it's summed rather than replaced. A reading that can't merge is forwarded untouched, and the
     /// sink may still drop it as a duplicate: a `NaN` increment, a delta of another value type
     /// than the survivor's (`i64` beside `f64`, or `u64` beside `i64`), a total that would
-    /// overflow, a gauge delta, a delta summary, a delta sum or a Datadog rate of booleans, or a
+    /// overflow, a gauge delta, a delta summary, a delta sum or a rate of booleans, or a
     /// histogram with other buckets. An event left with no metric, log, or span is discarded. It
     /// keeps no state between batches, so two batches' readings of one instant both reach the
     /// sink.
@@ -4294,8 +4294,8 @@ pub enum ComponentKind {
         /// A remote-write series holds one sample per millisecond, so of two readings of one
         /// series in one millisecond of a batch, the sink sends the later and leaves the earlier
         /// off, counted `logit.output.metrics.dropped{reason="duplicate_timestamp"}`. When the
-        /// earlier is a state (a gauge other than a Datadog `rate`, or a cumulative kind) equal
-        /// to the later, nothing is lost, and it counts
+        /// earlier is a state (a gauge not flagged `_logit.metrics.type: rate`, or a cumulative
+        /// kind) equal to the later, nothing is lost, and it counts
         /// `logit.output.metrics.normalized{reason="duplicate_timestamp"}` instead; two equal
         /// increments or sets of observations, a set's size included, are still two. To merge or
         /// collapse such readings first, put a `dedup_timestamps` with `precision: 1ms` last

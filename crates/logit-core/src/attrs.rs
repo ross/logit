@@ -8,7 +8,7 @@
 
 use crate::interner::{intern, lookup, Symbol};
 use crate::value::Value;
-use crate::{Event, Resource};
+use crate::{Event, MetricKind, Resource};
 use smallvec::SmallVec;
 use std::cmp::Ordering;
 
@@ -210,6 +210,41 @@ pub fn is_closed_timestamped(resource: &Resource, event: &Event) -> bool {
     value.and_then(Value::as_str) == Some(CLOSED_TIMESTAMPED)
 }
 
+/// The flag that names what kind of reading its event's records are, where the model kind alone
+/// doesn't say. Its one value is [`TYPE_RATE`]; a reader ignores any value it has no rule for.
+/// Read off the event, else the batch resource. See ADR `metric-flags`
+/// (`docs/adr/metric-flags.md`), "The flags".
+pub const METRICS_TYPE: &str = "_logit.metrics.type";
+
+/// [`METRICS_TYPE`]'s value for an event whose `Gauge` records each hold a per-second rate over
+/// [`METRICS_INTERVAL`] seconds, such as a Datadog `rate` series point. A rate is an increment
+/// over its interval, not a state. See ADR `metric-flags`, "The flags".
+pub const TYPE_RATE: &str = "rate";
+
+/// The flag that holds the span, in whole seconds (`I64`), its event's readings cover: a rate's
+/// divisor, a delta count's window. Written only when nonzero. Read off the event, else the batch
+/// resource. See ADR `metric-flags` (`docs/adr/metric-flags.md`), "The flags".
+pub const METRICS_INTERVAL: &str = "_logit.metrics.interval";
+
+/// Whether `kind` on `event` is a rate: a `Gauge` whose event is flagged [`METRICS_TYPE`]
+/// [`TYPE_RATE`], read off the event, else the batch resource. A stage that collapses readings of
+/// one series at one instant sums a rate as an increment rather than keeping the later one. The
+/// flag applies to `Gauge` records only, so a rate flag on any other kind is ignored.
+pub fn is_rate(resource: &Resource, event: &Event, kind: &MetricKind) -> bool {
+    matches!(kind, MetricKind::Gauge(_))
+        && event
+            .attributes
+            .get(METRICS_TYPE)
+            .or_else(|| resource.attributes.get(METRICS_TYPE))
+            .and_then(Value::as_str)
+            == Some(TYPE_RATE)
+}
+
+/// [`METRICS_INTERVAL`]'s value, read off the event, else the batch resource.
+pub fn interval<'a>(resource: &'a Resource, event: &'a Event) -> Option<&'a Value> {
+    event.attributes.get(METRICS_INTERVAL).or_else(|| resource.attributes.get(METRICS_INTERVAL))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -239,6 +274,36 @@ mod tests {
             !is_closed_timestamped(&stamped, &flagged(Value::from(CLOSED_BUCKETED))),
             "an event value shadows the resource's"
         );
+    }
+
+    #[test]
+    fn is_rate_reads_a_gauge_flagged_rate_on_the_event_else_the_resource() {
+        let gauge = MetricKind::gauge(1.0);
+        let flagged = |value: Value| {
+            let mut attributes = AttrMap::new();
+            attributes.insert(METRICS_TYPE, value);
+            attributes.insert(METRICS_INTERVAL, Value::I64(10));
+            Event::empty(0, attributes)
+        };
+        let bare = Resource::default();
+        let rate = flagged(Value::from(TYPE_RATE));
+        assert!(is_rate(&bare, &rate, &gauge));
+        assert_eq!(interval(&bare, &rate), Some(&Value::I64(10)));
+        assert!(!is_rate(&bare, &rate, &MetricKind::counter(1.0)), "a rate flag on a Sum");
+        assert!(!is_rate(&bare, &flagged(Value::from("other")), &gauge), "an unknown type");
+        assert!(!is_rate(&bare, &Event::empty(0, AttrMap::new()), &gauge));
+
+        let mut stamped = Resource::default();
+        stamped.attributes.insert(METRICS_TYPE, TYPE_RATE);
+        stamped.attributes.insert(METRICS_INTERVAL, Value::I64(20));
+        let bare_event = Event::empty(0, AttrMap::new());
+        assert!(is_rate(&stamped, &bare_event, &gauge), "the resource's flag");
+        assert_eq!(interval(&stamped, &bare_event), Some(&Value::I64(20)));
+        assert!(
+            !is_rate(&stamped, &flagged(Value::from("other")), &gauge),
+            "an event value shadows"
+        );
+        assert_eq!(interval(&stamped, &rate), Some(&Value::I64(10)), "an event value shadows");
     }
 
     #[test]

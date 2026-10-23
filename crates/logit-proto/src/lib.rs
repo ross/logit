@@ -39,8 +39,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// or a cumulative `Sum`, `Histogram`, `ExponentialHistogram`, or `Summary`). Every other kind is
 /// an increment or an observation set, so two equal readings of it in one bucket are two sets of
 /// events: a set's among them, since `{alice}` and `{bob}` both have size 1 and their union 2. A
-/// Datadog `rate` decodes as a `Gauge` carrying [`datadog::ATTR_TYPE`] `rate` but is an increment
-/// too; [`datadog::is_rate`] tells it apart. A sink that collapses same-timestamp readings counts
+/// rate, a `Gauge` flagged [`METRICS_TYPE`](logit_core::attrs::METRICS_TYPE) `rate`, is an
+/// increment too; [`is_rate`](logit_core::attrs::is_rate) tells it apart. A sink that collapses same-timestamp readings counts
 /// an equal state it leaves off as normalized and anything else as lost
 /// ([ADR `dedup-timestamps-transform`](../../../docs/adr/dedup-timestamps-transform.md)'s "The
 /// sink-side counter").

@@ -18,15 +18,15 @@ use super::units;
 use super::{
     collectd_host, host_tag, is_datadog_stats, is_service_check, units_are_datadog, DatadogDecoder,
     DatadogEncoder, HistogramMode, HistogramOptions, ATTR_DEVICE, ATTR_HOSTLESS, ATTR_HOST_NAME,
-    ATTR_HOST_TAG, ATTR_INTERVAL, ATTR_ORIGIN_CATEGORY, ATTR_ORIGIN_METRIC_TYPE,
-    ATTR_ORIGIN_PRODUCT, ATTR_ORIGIN_SERVICE, ATTR_RESOURCES, ATTR_SOURCE_TYPE_NAME, ATTR_TYPE,
-    ATTR_UNITS, MAX_METRIC_TAGS, RESOURCE_ATTR_AGENT_EPOCH, RESOURCE_ATTR_AGENT_INTERNAL_IP,
+    ATTR_HOST_TAG, ATTR_ORIGIN_CATEGORY, ATTR_ORIGIN_METRIC_TYPE, ATTR_ORIGIN_PRODUCT,
+    ATTR_ORIGIN_SERVICE, ATTR_RESOURCES, ATTR_SOURCE_TYPE_NAME, ATTR_TYPE, ATTR_UNITS,
+    MAX_METRIC_TAGS, RESOURCE_ATTR_AGENT_EPOCH, RESOURCE_ATTR_AGENT_INTERNAL_IP,
     RESOURCE_ATTR_AGENT_PUBLIC_IP, RESOURCE_ATTR_AGENT_TIMEZONE, RESOURCE_ATTR_AGENT_VERSION,
     UNITS_DATADOG,
 };
 use crate::CodecError;
 use bytes::Bytes;
-use logit_core::attrs::merged;
+use logit_core::attrs::{merged, METRICS_INTERVAL, METRICS_TYPE, TYPE_RATE};
 use logit_core::interner::{intern, resolve};
 use logit_core::sketch::from_otlp::{exp_histogram_oversized, otlp_buckets};
 use logit_core::{
@@ -41,8 +41,8 @@ use std::sync::{Arc, LazyLock};
 
 type JsonMap = Map<String, JsonValue>;
 
-/// `_logit.datadog.type`'s two values; `count` and `gauge` are said by the model kind itself.
-pub(super) const TYPE_RATE: &str = "rate";
+/// `_logit.datadog.type`'s one value; `count` and `gauge` are said by the model kind itself, and
+/// `rate` by the neutral flag [`METRICS_TYPE`].
 const TYPE_UNSPECIFIED: &str = "unspecified";
 
 /// The resource `type` the Agent's v2 serializer gives a series' `device`.
@@ -104,10 +104,11 @@ impl WireType {
         }
     }
 
-    fn type_attr(self) -> Option<&'static str> {
+    /// The attribute and value that say this type where the model kind doesn't.
+    fn type_attr(self) -> Option<(&'static str, &'static str)> {
         match self {
-            WireType::Rate => Some(TYPE_RATE),
-            WireType::Unspecified => Some(TYPE_UNSPECIFIED),
+            WireType::Rate => Some((METRICS_TYPE, TYPE_RATE)),
+            WireType::Unspecified => Some((ATTR_TYPE, TYPE_UNSPECIFIED)),
             WireType::Count | WireType::Gauge => None,
         }
     }
@@ -198,16 +199,14 @@ impl<'a> WireSeries<'a> {
             attrs.insert(ATTR_SOURCE_TYPE_NAME, Value::str(name));
         }
         if self.interval != 0 {
-            attrs.insert(ATTR_INTERVAL, Value::I64(self.interval));
+            attrs.insert(METRICS_INTERVAL, Value::I64(self.interval));
         }
-        // A route that carries a type always decides `_logit.datadog.type`, from the wire type
-        // alone.
+        // A route that carries a type always decides both type keys, from the wire type alone.
         if let Some(wire_type) = self.wire_type {
-            match wire_type.type_attr() {
-                Some(t) => attrs.insert(ATTR_TYPE, Value::str(t)),
-                None => {
-                    attrs.remove(ATTR_TYPE);
-                }
+            attrs.remove(METRICS_TYPE);
+            attrs.remove(ATTR_TYPE);
+            if let Some((key, value)) = wire_type.type_attr() {
+                attrs.insert(key, Value::str(value));
             }
         }
         for (key, code) in [
@@ -655,12 +654,13 @@ fn distribution_point(point: &JsonValue) -> Option<(Option<i64>, Vec<f64>)> {
 // -- encode ---------------------------------------------------------------------------------------
 
 /// Every attribute a metrics route reads into a wire field of its own; never rendered as a tag.
-static CONSUMED: LazyLock<[Symbol; 16]> = LazyLock::new(|| {
+static CONSUMED: LazyLock<[Symbol; 17]> = LazyLock::new(|| {
     [
         intern(ATTR_HOST_NAME),
         intern(ATTR_HOSTLESS),
         intern(ATTR_TYPE),
-        intern(ATTR_INTERVAL),
+        intern(METRICS_TYPE),
+        intern(METRICS_INTERVAL),
         intern(ATTR_SOURCE_TYPE_NAME),
         intern(ATTR_DEVICE),
         intern(ATTR_RESOURCES),
@@ -706,9 +706,12 @@ pub(super) struct Carriers {
     pub device: Option<String>,
     pub resources: Vec<(String, String)>,
     pub source_type_name: Option<String>,
+    /// [`METRICS_INTERVAL`], else 0.
     pub interval: i64,
     /// `_logit.datadog.type`'s value, when it is one this codec knows.
     pub wire_type: Option<WireType>,
+    /// [`METRICS_TYPE`] is `rate`: a `Gauge` record leaves as a `rate`.
+    pub rate: bool,
     pub origin: OriginCodes,
     /// How many `_logit.datadog.agent.*` carriers (a sketch payload's `CommonMetadata`) are
     /// present; only the sketches route writes them, from the batch resource.
@@ -897,17 +900,18 @@ impl DatadogEncoder {
                     non_empty_str(value).map(|s| c.source_type_name = s).is_some()
                 }
                 ATTR_TYPE => match value.as_str() {
-                    Some(TYPE_RATE) => {
-                        c.wire_type = Some(WireType::Rate);
-                        true
-                    }
                     Some(TYPE_UNSPECIFIED) => {
                         c.wire_type = Some(WireType::Unspecified);
                         true
                     }
                     _ => false,
                 },
-                ATTR_INTERVAL => match value {
+                // A type value with no rule here is ignored, as every reader of the flag does.
+                METRICS_TYPE => {
+                    c.rate = value.as_str() == Some(TYPE_RATE);
+                    true
+                }
+                METRICS_INTERVAL => match value {
                     Value::I64(n) => {
                         c.interval = *n;
                         true
@@ -1542,7 +1546,8 @@ pub(super) struct SeriesPoint {
     suffix: &'static str,
     /// Tags after the event's own.
     tag: Option<Vec<String>>,
-    /// `None` takes the `_logit.datadog.type` carrier's type, else a gauge.
+    /// `None` takes `rate` under the [`METRICS_TYPE`] flag, else the `_logit.datadog.type`
+    /// carrier's type, else a gauge.
     wire_type: Option<WireType>,
     value: f64,
     /// Whether the series carries the record's unit; a count of observations doesn't.
@@ -1568,7 +1573,8 @@ impl SeriesPoint {
     }
 
     fn wire_type(&self, c: &Carriers) -> WireType {
-        self.wire_type.unwrap_or(c.wire_type.unwrap_or(WireType::Gauge))
+        let carried = if c.rate { Some(WireType::Rate) } else { c.wire_type };
+        self.wire_type.unwrap_or(carried.unwrap_or(WireType::Gauge))
     }
 
     /// The record's unit as Datadog names it: as it is under [`ATTR_UNITS`], else through
@@ -1728,7 +1734,8 @@ fn plan_series(record: &MetricRecord, histograms: HistogramOptions) -> SeriesPla
             out.push(point(wire_type, scalar(sum.value, &mut notes)));
         }
         MetricKind::Gauge(v) => {
-            // `None`: the `_logit.datadog.type` carrier's type, else a gauge.
+            // `None`: a rate under the neutral flag, else the `_logit.datadog.type` carrier's
+            // type, else a gauge.
             out.push(SeriesPoint {
                 wire_type: None,
                 ..point(WireType::Gauge, scalar(*v, &mut notes))
@@ -2104,8 +2111,9 @@ mod tests {
         assert_eq!(a.get("urgent"), Some(&Value::Bool(true)));
         assert_eq!(a.get(ATTR_HOST_NAME), Some(&Value::str("myhost")));
         assert_eq!(a.get(ATTR_DEVICE), Some(&Value::str("/dev/sda1")));
-        assert_eq!(a.get(ATTR_TYPE), Some(&Value::str("rate")));
-        assert_eq!(a.get(ATTR_INTERVAL), Some(&Value::I64(20)));
+        assert_eq!(a.get(METRICS_TYPE), Some(&Value::str("rate")));
+        assert_eq!(a.get(METRICS_INTERVAL), Some(&Value::I64(20)));
+        assert_eq!(a.get(ATTR_TYPE), None, "a rate is the neutral flag alone");
         assert_eq!(a.get(ATTR_SOURCE_TYPE_NAME), Some(&Value::str("my_check")));
     }
 
@@ -2117,7 +2125,7 @@ mod tests {
         let (mut d, registry) = decoder();
         let series = br#"{"series":[
             {"metric":"m","points":[[1700000000,1],[1700000001,2]],
-             "tags":["env:prod","_logit.datadog.interval:5","logit.x:1","_logitx"]},
+             "tags":["env:prod","_logit.metrics.interval:5","logit.x:1","_logitx"]},
             {"metric":"m","points":[[1700000000,null]],"tags":["_logit.y:1"]}]}"#;
         let batch = d.decode_series_v1(series, RECEIVED_AT).unwrap();
         assert_eq!(batch.events.len(), 2);
@@ -2249,7 +2257,7 @@ mod tests {
         assert_eq!(a.get(ATTR_ORIGIN_SERVICE), Some(&Value::U64(7)));
         assert_eq!(a.get(ATTR_ORIGIN_METRIC_TYPE), Some(&Value::U64(2)));
         assert_eq!(a.get(ATTR_ORIGIN_CATEGORY), None);
-        assert_eq!(a.get(ATTR_INTERVAL), Some(&Value::I64(10)));
+        assert_eq!(a.get(METRICS_INTERVAL), Some(&Value::I64(10)));
         assert_eq!(a.get("team"), Some(&Value::Array(vec![Value::str("a"), Value::str("b")])));
     }
 
@@ -2378,7 +2386,7 @@ mod tests {
         let (mut e, registry) = encoder();
         let at = |offset_ms: i64, value: f64, interval: i64| {
             let mut attrs = AttrMap::new();
-            attrs.insert(super::super::ATTR_INTERVAL, Value::I64(interval));
+            attrs.insert(METRICS_INTERVAL, Value::I64(interval));
             Event::metric(
                 TS + offset_ms * 1_000_000,
                 attrs,
@@ -2425,7 +2433,7 @@ mod tests {
         assert_eq!(total(&c, "logit.output.metrics.dropped", "duplicate_timestamp"), 7.0);
     }
 
-    /// A Datadog `rate` decodes as a `Gauge` carrying `_logit.datadog.type: rate`, but it's an
+    /// A Datadog `rate` decodes as a `Gauge` flagged `_logit.metrics.type: rate`, but it's an
     /// increment over its interval: two equal rates in one second are two, so the one left off
     /// counts `dropped`, as two equal gauges wouldn't.
     #[test]
@@ -2433,8 +2441,8 @@ mod tests {
         let (mut e, registry) = encoder();
         let at = |offset_ms: i64| {
             let mut attrs = AttrMap::new();
-            attrs.insert(super::super::ATTR_TYPE, Value::str("rate"));
-            attrs.insert(super::super::ATTR_INTERVAL, Value::I64(10));
+            attrs.insert(METRICS_TYPE, Value::str("rate"));
+            attrs.insert(METRICS_INTERVAL, Value::I64(10));
             Event::metric(
                 TS + offset_ms * 1_000_000,
                 attrs,
@@ -2834,6 +2842,47 @@ mod tests {
         );
     }
 
+    /// A rate is the neutral flag: a `Gauge` flagged `_logit.metrics.type: rate` leaves as a `rate`
+    /// with its `_logit.metrics.interval`, from the event or the batch resource, whoever flagged
+    /// it. The retired `_logit.datadog.type: rate` and `_logit.datadog.interval` carriers say
+    /// nothing: a `Gauge` carrying only them leaves as a `gauge` with no interval. A `rate` flag on
+    /// a `Sum` is ignored.
+    #[test]
+    fn the_neutral_rate_flag_writes_a_rate_and_the_retired_carriers_do_not() {
+        let series = |resource: Resource, attrs: AttrMap, kind: MetricKind| {
+            let (mut e, _) = encoder();
+            let b = EventBatch {
+                resource: Arc::new(resource),
+                scope: None,
+                events: vec![Event::metric(TS, attrs, MetricRecord::new(intern("r"), kind))],
+            };
+            let body = e.encode_series_v1(&b).unwrap();
+            let json: JsonValue = serde_json::from_slice(&body).unwrap();
+            let s = &json["series"][0];
+            (s["type"].as_str().unwrap().to_string(), s["interval"].as_i64().unwrap())
+        };
+        let neutral = || {
+            let mut attrs = AttrMap::new();
+            attrs.insert(METRICS_TYPE, Value::str("rate"));
+            attrs.insert(METRICS_INTERVAL, Value::I64(10));
+            attrs
+        };
+        let gauge = || MetricKind::gauge(0.5);
+        assert_eq!(series(Resource::default(), neutral(), gauge()), ("rate".into(), 10));
+
+        let mut resource = Resource::default();
+        resource.attributes = neutral();
+        assert_eq!(series(resource, AttrMap::new(), gauge()), ("rate".into(), 10), "the resource");
+
+        let mut retired = AttrMap::new();
+        retired.insert("_logit.datadog.type", Value::str("rate"));
+        retired.insert("_logit.datadog.interval", Value::I64(10));
+        assert_eq!(series(Resource::default(), retired, gauge()), ("gauge".into(), 0));
+
+        let counter = MetricKind::counter(2.0);
+        assert_eq!(series(Resource::default(), neutral(), counter), ("count".into(), 10));
+    }
+
     #[test]
     fn nothing_to_send_is_none() {
         let (mut e, _) = encoder();
@@ -2849,8 +2898,8 @@ mod tests {
         let (mut e, _) = encoder();
         let mut attrs = AttrMap::new();
         attrs.insert(ATTR_HOST_NAME, Value::str("h"));
-        attrs.insert(ATTR_TYPE, Value::str("rate"));
-        attrs.insert(ATTR_INTERVAL, Value::I64(10));
+        attrs.insert(METRICS_TYPE, Value::str("rate"));
+        attrs.insert(METRICS_INTERVAL, Value::I64(10));
         attrs.insert(ATTR_ORIGIN_SERVICE, Value::U64(5));
         let mut record = MetricRecord::new(intern("r"), MetricKind::gauge(0.5));
         record.unit = Some(intern("second"));
@@ -2889,7 +2938,7 @@ mod tests {
         let (mut e, registry) = encoder();
         let mut attrs = AttrMap::new();
         attrs.insert(ATTR_ORIGIN_PRODUCT, Value::U64(1));
-        attrs.insert(ATTR_INTERVAL, Value::str("ten"));
+        attrs.insert(METRICS_INTERVAL, Value::str("ten"));
         let b = one_event_batch(attrs, MetricKind::gauge(1.0));
         e.encode_series_v1(&b).unwrap();
         let drained = registry.drain(0);

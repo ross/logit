@@ -200,8 +200,9 @@
 //! **Duplicate timestamps.** One series holds one sample per millisecond. Given two in one
 //! request, Prometheus and Mimir answer `2xx`, keep the first, and drop the second silently, so
 //! the sink sends only the later reading of each series and millisecond in a batch. It counts
-//! each earlier one that's a state (a gauge other than a Datadog `rate`, or a cumulative kind)
-//! equal to the reading sent `logit.output.metrics.normalized{reason="duplicate_timestamp"}`,
+//! each earlier one that's a state (a gauge not flagged `_logit.metrics.type: rate`, or a
+//! cumulative kind) equal to the reading sent
+//! `logit.output.metrics.normalized{reason="duplicate_timestamp"}`,
 //! since the receiver stores the same sample, and every other one, a `samples` record's equal
 //! summary, a set's equal size gauge, and an equal `rate` included,
 //! `logit.output.metrics.dropped{reason="duplicate_timestamp"}`, with a throttled
@@ -3570,30 +3571,55 @@ mod tests {
         }
     }
 
-    /// A Datadog `rate` relayed to remote-write is a gauge carrying `_logit.datadog.type: rate`,
-    /// an increment over its interval: two equal rates at one instant are two, so the earlier
-    /// counts `dropped`.
+    /// A rate relayed to remote-write is a gauge flagged `_logit.metrics.type: rate`, on the event
+    /// or the batch resource, an increment over its interval: two equal rates at one instant are
+    /// two, so the earlier counts `dropped`. The retired `_logit.datadog.type: rate` carrier says
+    /// nothing, and the flag on a `Sum` is ignored: each such pair is an equal state, normalized.
     #[tokio::test]
-    async fn an_equal_datadog_rate_is_counted_dropped() {
-        let rate = |timestamp: i64| {
+    async fn an_equal_rate_is_counted_dropped_and_only_under_the_neutral_flag() {
+        let event = |timestamp: i64, key: Option<&str>, kind: &MetricKind| {
             let mut attributes = AttrMap::new();
-            attributes.insert("_logit.datadog.type", logit_core::Value::str("rate"));
+            if let Some(key) = key {
+                attributes.insert(key, logit_core::Value::str("rate"));
+            }
             Event::metric(
                 timestamp,
                 attributes,
-                MetricRecord::new(
-                    intern("requests"),
-                    MetricKind::Gauge(logit_core::MetricValue::F64(0.5)),
-                ),
+                MetricRecord::new(intern("requests"), kind.clone()),
             )
         };
+        let gauge = MetricKind::Gauge(logit_core::MetricValue::F64(0.5));
+        let sum = MetricKind::Sum(logit_core::Sum {
+            value: logit_core::MetricValue::F64(0.5),
+            temporality: logit_core::Temporality::Cumulative,
+            monotonic: true,
+        });
+        let flag = logit_core::attrs::METRICS_TYPE;
+        let on_resource = [(flag, Value::str("rate"))];
+        // (on the event, on the resource, kind, counted dropped)
+        let cases: [(Option<&str>, &[(&str, Value)], &MetricKind, bool); 4] = [
+            (Some(flag), &[], &gauge, true),
+            (None, &on_resource, &gauge, true),
+            (Some("_logit.datadog.type"), &[], &gauge, false),
+            (Some(flag), &[], &sum, false),
+        ];
         let at = 1_700_000_000_000_000_000;
-        for later in [at, at + 1] {
-            let (sums, samples) = retried_remote_write(batch(vec![rate(at), rate(later)])).await;
-            assert_eq!(samples, [(0.5, at / 1_000_000)], "{later}");
-            let reason = [("reason", "duplicate_timestamp")];
-            assert_eq!(sum_of(&sums, "logit.output.metrics.normalized", &reason), 0.0, "{later}");
-            assert_eq!(sum_of(&sums, DUPLICATE.0, DUPLICATE.1), 1.0, "{later}");
+        for (key, resource, kind, rate) in cases {
+            for later in [at, at + 1] {
+                let events = vec![event(at, key, kind), event(later, key, kind)];
+                let (sums, samples) =
+                    retried_remote_write(batch_with_resource(resource, events)).await;
+                let case = format!("{key:?} {resource:?} {kind:?} {later}");
+                assert_eq!(samples, [(0.5, at / 1_000_000)], "{case}");
+                let reason = [("reason", "duplicate_timestamp")];
+                let (normalized, dropped) = if rate { (0.0, 1.0) } else { (1.0, 0.0) };
+                assert_eq!(
+                    sum_of(&sums, "logit.output.metrics.normalized", &reason),
+                    normalized,
+                    "{case}"
+                );
+                assert_eq!(sum_of(&sums, DUPLICATE.0, DUPLICATE.1), dropped, "{case}");
+            }
         }
     }
 

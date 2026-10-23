@@ -14,7 +14,7 @@
 - name: count
   text: A `count` series, decoded to a delta monotonic sum.
 - name: rate
-  text: A `rate` series, decoded to a gauge with the `_logit.datadog.type` carrier `rate`.
+  text: A `rate` series, decoded to a gauge flagged `_logit.metrics.type` `rate`.
 - name: gauge
   text: A `gauge` series, or a v1 series with no `type`, decoded to a gauge.
 - name: unspecified
@@ -54,7 +54,7 @@
 - name: source_type_name
   text: A `source_type_name`, stamped as the `_logit.datadog.source_type_name` carrier.
 - name: interval
-  text: A nonzero `interval`, stamped as the `_logit.datadog.interval` carrier.
+  text: A nonzero `interval`, stamped as the `_logit.metrics.interval` flag.
 - name: unit
   text: A series' `unit`, decoded to the record's unit.
 - name: origin

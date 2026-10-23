@@ -654,17 +654,17 @@ fn no_state_carries_across_batches() {
 
 fn rate(ts: i64, value: f64, interval: Option<i64>) -> Event {
     let mut attributes = AttrMap::new();
-    attributes.insert(datadog::ATTR_TYPE, Value::str("rate"));
+    attributes.insert(attrs::METRICS_TYPE, Value::str("rate"));
     if let Some(interval) = interval {
-        attributes.insert(datadog::ATTR_INTERVAL, Value::I64(interval));
+        attributes.insert(attrs::METRICS_INTERVAL, Value::I64(interval));
     }
     Event::metric(ts, attributes, record(MetricKind::gauge(value)))
 }
 
-/// A Datadog `rate` is a `Gauge` carrying `_logit.datadog.type: rate`, but it's an increment over
-/// its interval: two in one bucket sum, counted `merged`, where two gauges would keep the later.
+/// A rate is a `Gauge` flagged `_logit.metrics.type: rate`, but it's an increment over its
+/// interval: two in one bucket sum, counted `merged`, where two gauges would keep the later.
 #[test]
-fn datadog_rates_of_one_interval_sum() {
+fn rates_of_one_interval_sum() {
     let mut rig = Rig::new();
     let out = rig.run(vec![rate(T, 1.5, Some(10)), rate(T + 1, 2.0, Some(10))]);
     assert_eq!(kinds(&out), [&MetricKind::gauge(3.5)]);
@@ -678,13 +678,13 @@ fn datadog_rates_of_one_interval_sum() {
     assert_eq!(rig.merged(), 1.0);
 }
 
-/// The type carrier is read the way `datadog_out` reads it, the event's value winning over the
-/// resource's: a rate marked on the resource sums too.
+/// The flag is read as every flag is, the event's value winning over the resource's: a rate
+/// flagged on the resource sums too.
 #[test]
-fn a_rate_marked_on_the_resource_sums() {
+fn a_rate_flagged_on_the_resource_sums() {
     let mut rig = Rig::new();
     let mut resource = Resource::default();
-    resource.attributes.insert(datadog::ATTR_TYPE, Value::str("rate"));
+    resource.attributes.insert(attrs::METRICS_TYPE, Value::str("rate"));
     let batch = EventBatch {
         resource: Arc::new(resource),
         scope: None,
@@ -695,6 +695,47 @@ fn a_rate_marked_on_the_resource_sums() {
         .unwrap_or_default();
     assert_eq!(kinds(&out), [&MetricKind::gauge(3.0)]);
     assert_eq!(rig.merged(), 1.0);
+}
+
+/// The retired Datadog carriers, `_logit.datadog.type: rate` and `_logit.datadog.interval`, say
+/// nothing here: a `Gauge` carrying only them is a state, so the later reading is kept.
+#[test]
+fn a_gauge_with_the_retired_datadog_carriers_is_a_state() {
+    let retired = |ts: i64, value: f64| {
+        let mut attributes = AttrMap::new();
+        attributes.insert("_logit.datadog.type", Value::str("rate"));
+        attributes.insert("_logit.datadog.interval", Value::I64(10));
+        Event::metric(ts, attributes, record(MetricKind::gauge(value)))
+    };
+    let mut rig = Rig::new();
+    let out = rig.run(vec![retired(T, 1.5), retired(T + 1, 2.0)]);
+    assert_eq!(kinds(&out), [&MetricKind::gauge(2.0)]);
+    assert_eq!(rig.absorbed(), 1.0);
+    assert_eq!(rig.merged(), 0.0);
+}
+
+/// The rate flag applies to a `Gauge` alone: on a cumulative `Sum`, a state, it's ignored, so the
+/// later reading is kept rather than the two summed.
+#[test]
+fn a_rate_flag_on_a_sum_is_ignored() {
+    let flagged = |ts: i64, value: f64| {
+        let mut event = rate(ts, 0.0, Some(10));
+        event.metrics[0].kind = MetricKind::Sum(Sum {
+            value: MetricValue::F64(value),
+            temporality: Temporality::Cumulative,
+            monotonic: true,
+        });
+        event
+    };
+    let mut rig = Rig::new();
+    let out = rig.run(vec![flagged(T, 1.5), flagged(T + 1, 2.0)]);
+    assert_eq!(out.len(), 1);
+    assert!(
+        matches!(&out[0].metrics[0].kind, MetricKind::Sum(s) if s.value == MetricValue::F64(2.0)),
+        "{out:?}"
+    );
+    assert_eq!(rig.absorbed(), 1.0);
+    assert_eq!(rig.merged(), 0.0);
 }
 
 /// A rate sums only with a rate of its own interval, and never with a gauge that isn't one: each
