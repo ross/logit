@@ -211,9 +211,10 @@ pub fn is_closed_timestamped(resource: &Resource, event: &Event) -> bool {
 }
 
 /// The flag that names what kind of reading its event's records are, where the model kind alone
-/// doesn't say. Its one value is [`TYPE_RATE`]; a reader ignores any value it has no rule for.
-/// Read off the event, else the batch resource. See ADR `metric-flags`
-/// (`docs/adr/metric-flags.md`), "The flags".
+/// doesn't say. Its values are [`TYPE_RATE`], [`TYPE_INFO`], [`TYPE_STATESET`], and
+/// [`TYPE_GAUGE_HISTOGRAM`], each for one model kind; a reader ignores a value it has no rule for,
+/// and a value on a kind it doesn't name. Read off the event, else the batch resource, through
+/// [`metric_type`]. See ADR `metric-flags` (`docs/adr/metric-flags.md`), "The flags".
 pub const METRICS_TYPE: &str = "_logit.metrics.type";
 
 /// [`METRICS_TYPE`]'s value for an event whose `Gauge` records each hold a per-second rate over
@@ -221,23 +222,42 @@ pub const METRICS_TYPE: &str = "_logit.metrics.type";
 /// over its interval, not a state. See ADR `metric-flags`, "The flags".
 pub const TYPE_RATE: &str = "rate";
 
+/// [`METRICS_TYPE`]'s value for an event whose `Gauge` records are each an info metric: a `1`
+/// whose labels are the payload, such as an OpenMetrics `info` family. See ADR `metric-flags`,
+/// "The flags".
+pub const TYPE_INFO: &str = "info";
+
+/// [`METRICS_TYPE`]'s value for an event whose `Gauge` records are each one state of a state set,
+/// `1` when the state holds and `0` when it doesn't, such as an OpenMetrics `stateset` family. See
+/// ADR `metric-flags`, "The flags".
+pub const TYPE_STATESET: &str = "stateset";
+
+/// [`METRICS_TYPE`]'s value for an event whose `Histogram` records each count a quantity that can
+/// go down, so no bucket is a running count, such as an OpenMetrics `gaugehistogram` family. See
+/// ADR `metric-flags`, "The flags".
+pub const TYPE_GAUGE_HISTOGRAM: &str = "gaugehistogram";
+
 /// The flag that holds the span, in whole seconds (`I64`), its event's readings cover: a rate's
 /// divisor, a delta count's window. Written only when nonzero. Read off the event, else the batch
 /// resource. See ADR `metric-flags` (`docs/adr/metric-flags.md`), "The flags".
 pub const METRICS_INTERVAL: &str = "_logit.metrics.interval";
 
+/// [`METRICS_TYPE`]'s value as a `Str`, read off the event, else the batch resource. An event
+/// value shadows the resource's, as [`merged`] does. The caller applies the value's kind rule.
+pub fn metric_type<'a>(resource: &'a Resource, event: &'a Event) -> Option<&'a str> {
+    event
+        .attributes
+        .get(METRICS_TYPE)
+        .or_else(|| resource.attributes.get(METRICS_TYPE))
+        .and_then(Value::as_str)
+}
+
 /// Whether `kind` on `event` is a rate: a `Gauge` whose event is flagged [`METRICS_TYPE`]
 /// [`TYPE_RATE`], read off the event, else the batch resource. A stage that collapses readings of
 /// one series at one instant sums a rate as an increment rather than keeping the later one. The
-/// flag applies to `Gauge` records only, so a rate flag on any other kind is ignored.
+/// rate value applies to `Gauge` records only, so a rate flag on any other kind is ignored.
 pub fn is_rate(resource: &Resource, event: &Event, kind: &MetricKind) -> bool {
-    matches!(kind, MetricKind::Gauge(_))
-        && event
-            .attributes
-            .get(METRICS_TYPE)
-            .or_else(|| resource.attributes.get(METRICS_TYPE))
-            .and_then(Value::as_str)
-            == Some(TYPE_RATE)
+    matches!(kind, MetricKind::Gauge(_)) && metric_type(resource, event) == Some(TYPE_RATE)
 }
 
 /// [`METRICS_INTERVAL`]'s value, read off the event, else the batch resource.
@@ -304,6 +324,29 @@ mod tests {
             "an event value shadows"
         );
         assert_eq!(interval(&stamped, &rate), Some(&Value::I64(10)), "an event value shadows");
+    }
+
+    #[test]
+    fn metric_type_reads_the_event_else_the_resource() {
+        let flagged = |value: Value| {
+            let mut attributes = AttrMap::new();
+            attributes.insert(METRICS_TYPE, value);
+            Event::empty(0, attributes)
+        };
+        let bare = Resource::default();
+        assert_eq!(metric_type(&bare, &flagged(Value::from(TYPE_INFO))), Some(TYPE_INFO));
+        assert_eq!(metric_type(&bare, &flagged(Value::Bool(true))), None, "not a Str");
+        assert_eq!(metric_type(&bare, &Event::empty(0, AttrMap::new())), None);
+
+        let mut stamped = Resource::default();
+        stamped.attributes.insert(METRICS_TYPE, TYPE_STATESET);
+        let bare_event = Event::empty(0, AttrMap::new());
+        assert_eq!(metric_type(&stamped, &bare_event), Some(TYPE_STATESET), "the resource's");
+        assert_eq!(
+            metric_type(&stamped, &flagged(Value::from(TYPE_GAUGE_HISTOGRAM))),
+            Some(TYPE_GAUGE_HISTOGRAM),
+            "an event value shadows the resource's"
+        );
     }
 
     #[test]
