@@ -672,7 +672,7 @@ pub const LINE_PROTOCOL_MESSAGE: &str = "ttemp_noz,n=0,a=1 value=0i 179216782776
 /// A `Bytes` built from a `String` would instead allocate once on its first clone.
 pub fn line_protocol_event() -> Event {
     let mut attributes = AttrMap::new();
-    attributes.insert("syslog.hostname", Value::Str(Bytes::from_static(b"10:9c:70:2d:d5:c4")));
+    attributes.insert("host.name", Value::Str(Bytes::from_static(b"10:9c:70:2d:d5:c4")));
     attributes.insert("syslog.appname", Value::Str(Bytes::from_static(b"buddy")));
     attributes.insert("syslog.facility", Value::U64(1));
     Event::log(

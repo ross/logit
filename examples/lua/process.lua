@@ -120,7 +120,7 @@ local function alert_for(event, route, status)
   return Event.new{
     timestamp = event.timestamp,
     attributes = {
-      ["syslog.hostname"] = a["syslog.hostname"],
+      ["host.name"] = a["host.name"],
       ["syslog.tag"] = a["syslog.tag"],
       ["http.route"] = route,
       ["http.request.method"] = a.method,
@@ -183,7 +183,7 @@ function process(event)
   if alert_count >= MAX_ALERTS then
     return event
   end
-  alerted[key] = {route = route, status = status, host = a["syslog.hostname"], repeats = 0}
+  alerted[key] = {route = route, status = status, host = a["host.name"], repeats = 0}
   alert_count = alert_count + 1
 
   -- Fan-out: the first server error per route and status becomes two events, an alert marked
@@ -239,7 +239,7 @@ function flush(now)
       out[#out + 1] = Event.new{
         timestamp = now,
         attributes = {
-          ["syslog.hostname"] = held.host,
+          ["host.name"] = held.host,
           ["http.route"] = held.route,
           ["http.response.status_code"] = held.status,
           repeats = held.repeats,

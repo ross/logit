@@ -369,7 +369,7 @@ mod tests {
         assert_eq!(events.len(), 1);
         let event = &events[0];
         assert_eq!(
-            event.attributes.get("syslog.hostname").and_then(Value::as_str),
+            event.attributes.get("host.name").and_then(Value::as_str),
             Some("10:9c:70:2d:d5:c4")
         );
         assert_eq!(event.attributes.get("syslog.tag").and_then(Value::as_str), Some("buddy"));

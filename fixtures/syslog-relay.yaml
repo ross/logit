@@ -44,7 +44,7 @@ components:
     # format: rfc5424            # rfc3164 | rfc5424 -- rfc3164's TIMESTAMP has no year or timezone
     # facility: local0           # PRI facility used only when the event carries no syslog.facility attribute
     # hostname: null              # HOSTNAME/APP-NAME fallbacks, used only when the event carries
-    # app_name: null              # no syslog.hostname/syslog.tag attribute
+    # app_name: null              # no host.name/syslog.tag attribute
     # max_message_bytes: "8192"   # bounds one encoded message (PRI + header + MSG)
     # connect_timeout: 5s         # tcp only -- also bounds the tls: handshake, same budget
     # tls:                       # presence turns TLS on and makes it required, even an empty

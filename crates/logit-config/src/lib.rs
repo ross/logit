@@ -3879,9 +3879,9 @@ pub enum ComponentKind {
         /// to `local0`.
         #[serde(default)]
         facility: SyslogFacility,
-        /// HOSTNAME fallback, used only when the event carries no `syslog.hostname` attribute
-        /// (one that never passed through `syslog_in`, say), so a relayed line's origin is never
-        /// silently overwritten. Defaults to the top-level `hostname:`, else the kernel
+        /// HOSTNAME fallback, used only when neither the event nor its batch resource carries a
+        /// `host.name` attribute (a line that never passed through `syslog_in`, say), so a
+        /// relayed line's origin is never silently overwritten. Defaults to the top-level `hostname:`, else the kernel
         /// hostname.
         #[serde(default)]
         hostname: Option<String>,

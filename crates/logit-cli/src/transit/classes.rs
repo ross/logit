@@ -771,6 +771,7 @@ mod datadog {
         let own = own_host(rec, route);
         match route {
             // The log encoder takes any `host.name`, an empty one included, as the host.
+            // `syslog.hostname` and `host` are Datadog's reserved log host attributes.
             Route::Log => {
                 has("hostname") || has("host.name") || has("syslog.hostname") || has("host")
             }

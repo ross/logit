@@ -38,7 +38,8 @@
 //! ## Header-field precedence
 //!
 //! Per event, per field, first hit wins: the `syslog.*` attribute (`_logit.syslog.severity` for
-//! severity), then the configured default, then a format-appropriate absence (`-` for RFC 5424's
+//! severity; for HOSTNAME, the standard host key `host.name` on the event, else on the batch
+//! resource), then the configured default, then a format-appropriate absence (`-` for RFC 5424's
 //! NILVALUE, an omitted token for RFC 3164). `logit run` always sets a hostname default: the sink's
 //! `hostname:`, else the process hostname (`logit_pipeline::host`), so HOSTNAME is absent only when
 //! sanitizing empties it. `_logit.syslog.severity` outranks `log.severity`
@@ -76,8 +77,8 @@
 //!   [`render_sd_value`]; the `syslog.sd` contract constrains only the outer two `Map` layers.
 //!
 //! **Opt-in `structured_data`**: when [`SyslogEncoder::with_structured_data`] sets an SD-ID and the
-//! output is 5424, every event attribute whose key doesn't start with `syslog.` and isn't private
-//! (ADR `private-attribute-namespace`) is emitted as one extra SD-ELEMENT under that SD-ID
+//! output is 5424, every event attribute whose key doesn't start with `syslog.`, isn't `host.name`
+//! (HOSTNAME's key), and isn't private (ADR `private-attribute-namespace`) is emitted as one extra SD-ELEMENT under that SD-ID
 //! (PARAM-NAME = attribute key; same validation, skip, and count rule; the element is omitted when
 //! no attribute qualifies). This closes the `syslog_in -> json -> syslog_out` gap: an attribute a
 //! transform added still reaches the wire. A relayed multi-valued statsd tag
@@ -193,6 +194,7 @@ use crate::human::render_value_inline;
 use crate::stream::{Dial, PooledStream, Target, TlsTarget};
 use crate::Output;
 use anyhow::Context;
+use logit_core::attrs::HOST_NAME;
 use logit_core::time::{format_rfc3339_utc, write_rfc3164_utc};
 use logit_core::{interner, AttrMap, Diagnostics, Event, EventBatch, Severity, Telemetry, Value};
 use logit_pipeline::{BatchContext, DeliveryPosture, SeqId};
@@ -356,7 +358,7 @@ impl FramedEncoder for SyslogEncoder {
         let mut stats = EncodeStats::default();
         for event in &batch.events {
             self.line.clear();
-            self.encode_event(event, &mut stats, out);
+            self.encode_event(&batch.resource.attributes, event, &mut stats, out);
         }
         stats
     }
@@ -366,7 +368,13 @@ impl SyslogEncoder {
     /// Encodes one event's header into `self.line` (cleared by the caller), then its message,
     /// pushed as raw bytes ([`MessageBuf::push_bytes`]) for `Value::Bytes` and as `self.line`
     /// ([`MessageBuf::push`]) otherwise. A skipped or dropped event pushes nothing.
-    fn encode_event(&mut self, event: &Event, stats: &mut EncodeStats, out: &mut MessageBuf) {
+    fn encode_event(
+        &mut self,
+        resource: &AttrMap,
+        event: &Event,
+        stats: &mut EncodeStats,
+        out: &mut MessageBuf,
+    ) {
         let Some(log) = &event.log else {
             stats.skipped_no_log += 1;
             return;
@@ -376,7 +384,9 @@ impl SyslogEncoder {
         let facility = resolve_facility(attrs, self.default_facility);
         let severity = resolve_severity(attrs, log.severity);
         let pri = facility * 8 + severity;
-        let hostname = resolve_str(attrs, "syslog.hostname").or(self.default_hostname.as_deref());
+        let hostname = resolve_str(attrs, HOST_NAME)
+            .or_else(|| resolve_str(resource, HOST_NAME))
+            .or(self.default_hostname.as_deref());
         let app_name = resolve_str(attrs, "syslog.tag").or(self.default_app_name.as_deref());
         let pid = resolve_pid(attrs);
         let msgid = resolve_str(attrs, "syslog.msgid");
@@ -553,8 +563,8 @@ fn syslog_severity_of(severity: Severity) -> u8 {
     }
 }
 
-/// A non-empty string attribute, or `None`. Empty counts as absent, so a blank
-/// `syslog.hostname` falls through to the configured default instead of an empty header field.
+/// A non-empty string attribute, or `None`. Empty counts as absent, so a blank `host.name`
+/// falls through to the resource's, then the configured default, instead of an empty header field.
 fn resolve_str<'a>(attrs: &'a AttrMap, key: &str) -> Option<&'a str> {
     attrs.get(key).and_then(Value::as_str).filter(|s| !s.is_empty())
 }
@@ -861,7 +871,10 @@ fn write_structured_data(
         }
     }
     if let Some(cfg) = structured_data {
-        let is_extra = |key: &str| !key.starts_with("syslog.") && !crate::attrs::is_private(key);
+        // `host.name` is HOSTNAME's key, so it's a header field like `syslog.*`, not an SD-PARAM.
+        let is_extra = |key: &str| {
+            !key.starts_with("syslog.") && key != HOST_NAME && !crate::attrs::is_private(key)
+        };
         // Checked before the collision, so an event with only `syslog.*` and private attributes,
         // which would emit no opt-in element anyway, isn't counted as a drop.
         let has_extra_attrs = attrs.iter().any(|(sym, _)| is_extra(interner::resolve(sym)));
@@ -1512,7 +1525,7 @@ mod tests {
     #[test]
     fn rfc3164_encodes_hostname_and_tag_with_pid() {
         let mut attrs = AttrMap::new();
-        attrs.insert("syslog.hostname", Value::str("myhost"));
+        attrs.insert(HOST_NAME, Value::str("myhost"));
         attrs.insert("syslog.tag", Value::str("myapp"));
         attrs.insert("syslog.pid", Value::U64(1234));
         let event = Event::log(
@@ -1614,7 +1627,7 @@ mod tests {
     #[test]
     fn configured_hostname_used_only_when_attribute_absent() {
         let mut attrs = AttrMap::new();
-        attrs.insert("syslog.hostname", Value::str("from-attr"));
+        attrs.insert(HOST_NAME, Value::str("from-attr"));
         let event = Event::log(
             0,
             attrs,
@@ -1632,6 +1645,53 @@ mod tests {
         let (msgs, _) = encode_with(&mut encoder, vec![event]);
         assert!(msgs[0].contains("from-attr"));
         assert!(!msgs[0].contains("from-config"));
+    }
+
+    /// The HOSTNAME field of one RFC 5424 message from an encoder whose `hostname:` is
+    /// `from-config`, for a batch whose resource carries `resource_attrs`.
+    fn hostname_field(resource_attrs: AttrMap, event_attrs: AttrMap) -> String {
+        let mut encoder = SyslogEncoder::new(Format::Rfc5424, 16).with_hostname("from-config");
+        let batch = EventBatch {
+            resource: Arc::new(Resource { attributes: resource_attrs, ..Resource::default() }),
+            scope: None,
+            events: vec![log_event_with_attrs(0, Value::str("x"), None, event_attrs)],
+        };
+        let mut out = MessageBuf::default();
+        encoder.encode_into(&batch, &mut out);
+        let msg = String::from_utf8_lossy(out.iter().next().unwrap()).into_owned();
+        msg.split(' ').nth(2).unwrap().to_owned()
+    }
+
+    fn host_attrs(host: &str) -> AttrMap {
+        let mut attrs = AttrMap::new();
+        attrs.insert(HOST_NAME, Value::str(host));
+        attrs
+    }
+
+    #[test]
+    fn hostname_reads_the_event_then_the_resource_then_the_configured_default() {
+        assert_eq!(
+            hostname_field(host_attrs("from-resource"), host_attrs("from-event")),
+            "from-event"
+        );
+        assert_eq!(hostname_field(host_attrs("from-resource"), AttrMap::new()), "from-resource");
+        assert_eq!(hostname_field(AttrMap::new(), AttrMap::new()), "from-config");
+    }
+
+    /// A blank `host.name` counts as absent at each scope, so it falls through rather than
+    /// write an empty HOSTNAME.
+    #[test]
+    fn a_blank_host_name_falls_through_to_the_next_scope() {
+        assert_eq!(hostname_field(host_attrs("from-resource"), host_attrs("")), "from-resource");
+        assert_eq!(hostname_field(host_attrs(""), host_attrs("")), "from-config");
+    }
+
+    /// HOSTNAME's key is `host.name`: an attribute named `syslog.hostname` is ordinary.
+    #[test]
+    fn a_syslog_hostname_attribute_is_not_read_as_hostname() {
+        let mut attrs = AttrMap::new();
+        attrs.insert("syslog.hostname", Value::str("old-key"));
+        assert_eq!(hostname_field(AttrMap::new(), attrs), "from-config");
     }
 
     // -- A real syslog_in -> syslog_out relay, using the actual decoder --------------------
@@ -1691,7 +1751,7 @@ mod tests {
     #[test]
     fn a_hostname_with_space_and_non_ascii_is_sanitized() {
         let mut attrs = AttrMap::new();
-        attrs.insert("syslog.hostname", Value::str("bad host\u{00e9}"));
+        attrs.insert(HOST_NAME, Value::str("bad host\u{00e9}"));
         let event = Event::log(
             0,
             attrs,
@@ -1712,7 +1772,7 @@ mod tests {
     #[test]
     fn rfc3164_hostname_with_trailing_colon_is_sanitized() {
         let mut attrs = AttrMap::new();
-        attrs.insert("syslog.hostname", Value::str("host:"));
+        attrs.insert(HOST_NAME, Value::str("host:"));
         let event = Event::log(
             0,
             attrs,
@@ -1756,7 +1816,7 @@ mod tests {
     #[test]
     fn an_all_non_printable_hostname_becomes_nilvalue() {
         let mut attrs = AttrMap::new();
-        attrs.insert("syslog.hostname", Value::str("\u{0001}\u{0002}"));
+        attrs.insert(HOST_NAME, Value::str("\u{0001}\u{0002}"));
         // Despite the name: this sanitizes to the non-empty "__", which renders; "-" needs an
         // absent or empty attribute.
         let event = Event::log(
@@ -2761,7 +2821,7 @@ mod tests {
     #[test]
     fn a_non_numeric_pid_renders_as_tag_pid_on_3164() {
         let mut attrs = AttrMap::new();
-        attrs.insert("syslog.hostname", Value::str("h"));
+        attrs.insert(HOST_NAME, Value::str("h"));
         attrs.insert("syslog.tag", Value::str("app"));
         attrs.insert("syslog.pid", Value::str("worker-1"));
         let event = log_event_with_attrs(0, Value::str("hi"), None, attrs);
@@ -3033,16 +3093,18 @@ mod tests {
     }
 
     #[test]
-    fn structured_data_excludes_syslog_prefixed_keys() {
+    fn structured_data_excludes_syslog_prefixed_keys_and_host_name() {
         let mut attrs = AttrMap::new();
-        attrs.insert("syslog.hostname", Value::str("h"));
+        attrs.insert(HOST_NAME, Value::str("h"));
+        attrs.insert("syslog.tag", Value::str("app"));
         attrs.insert("env", Value::str("prod"));
         let event = log_event_with_attrs(0, Value::str("x"), None, attrs);
         let mut encoder =
             SyslogEncoder::new(Format::Rfc5424, 16).with_structured_data("myapp@12345").unwrap();
         let (msgs, _) = encode_with(&mut encoder, vec![event]);
         assert!(msgs[0].contains(r#"env="prod""#));
-        assert!(!msgs[0].contains("syslog.hostname"));
+        assert!(!msgs[0].contains("host.name"), "got: {}", msgs[0]);
+        assert!(!msgs[0].contains("syslog.tag"), "got: {}", msgs[0]);
     }
 
     /// A private attribute never becomes an opt-in SD-PARAM, and an event with only private and

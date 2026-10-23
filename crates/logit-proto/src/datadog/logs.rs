@@ -59,6 +59,7 @@ static KEYS: LazyLock<LogKeys> = LazyLock::new(|| LogKeys {
     ddsource: intern(ATTR_DDSOURCE),
     ddtags: intern(ATTR_DDTAGS),
     host_name: intern(ATTR_HOST_NAME),
+    // Datadog's reserved log host attribute, not a syslog-family key.
     syslog_hostname: intern("syslog.hostname"),
     host_tag: intern(ATTR_HOST_TAG),
     service_name: intern(ATTR_SERVICE_NAME),

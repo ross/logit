@@ -201,7 +201,7 @@ fn canonical_pid(token: &[u8]) -> Option<u64> {
     std::str::from_utf8(token).ok()?.parse().ok()
 }
 
-/// The `syslog.*` and `_logit.syslog.severity` keys, interned once per process so each line pays
+/// The `syslog.*`, `host.name`, and `_logit.syslog.severity` keys, interned once per process so each line pays
 /// a sorted `insert_sym`, not an interner hash and shard lock. A `LazyLock` rather than a decoder
 /// field (as collectd's `AttrKeys` is) because the parsers are free functions; `KEYS.x` is one
 /// acquire load after first use.
@@ -209,7 +209,7 @@ static KEYS: LazyLock<SyslogKeys> = LazyLock::new(|| SyslogKeys {
     facility: intern("syslog.facility"),
     severity: intern("_logit.syslog.severity"),
     timestamp: intern("syslog.timestamp"),
-    hostname: intern("syslog.hostname"),
+    hostname: intern(logit_core::attrs::HOST_NAME),
     tag: intern("syslog.tag"),
     pid: intern("syslog.pid"),
     msgid: intern("syslog.msgid"),
@@ -414,7 +414,7 @@ fn parse_3164(
                     "hostname_not_utf8",
                     format_args!(
                         "syslog_in: RFC 3164 HOSTNAME token {:?} is not valid UTF-8; skipping \
-                         the syslog.hostname attribute",
+                         the host.name attribute",
                         String::from_utf8_lossy(host)
                     ),
                 );
@@ -871,7 +871,7 @@ mod tests {
         assert_eq!(event.log.as_ref().unwrap().severity, Some(Severity::Info)); // 134 % 8 = 6
         assert_eq!(event.attributes.get("syslog.facility"), Some(&Value::U64(134 / 8)));
         assert_eq!(event.attributes.get("_logit.syslog.severity"), Some(&Value::U64(6)));
-        assert_eq!(event.attributes.get("syslog.hostname").and_then(Value::as_str), Some("myhost"));
+        assert_eq!(event.attributes.get("host.name").and_then(Value::as_str), Some("myhost"));
         assert_eq!(
             event.attributes.get("syslog.tag").and_then(Value::as_str),
             Some("nginx_access")
@@ -886,7 +886,7 @@ mod tests {
     fn rfc3164_without_hostname_decodes_with_tag_identified_and_no_hostname_attribute() {
         let event = only_event(decode(r#"<134>Aug 30 10:00:00 nginx_access: {"status":200}"#));
         assert_eq!(message_str(&event), r#"{"status":200}"#);
-        assert!(event.attributes.get("syslog.hostname").is_none());
+        assert!(event.attributes.get("host.name").is_none());
         assert_eq!(
             event.attributes.get("syslog.tag").and_then(Value::as_str),
             Some("nginx_access")
@@ -910,7 +910,7 @@ mod tests {
             .expect("RFC 3164 parsing never fails outright over a bad HOSTNAME");
         assert_eq!(batch.events.len(), 1);
         assert!(
-            batch.events[0].attributes.get("syslog.hostname").is_none(),
+            batch.events[0].attributes.get("host.name").is_none(),
             "a non-UTF-8 HOSTNAME token must not be stamped as an attribute"
         );
         assert_eq!(
@@ -933,7 +933,7 @@ mod tests {
         let event = only_event(decode(line));
         assert_eq!(message_str(&event), r#"{"status": 200, "path": "/foo: bar"}"#);
         assert!(event.attributes.get("syslog.tag").is_none());
-        assert!(event.attributes.get("syslog.hostname").is_none());
+        assert!(event.attributes.get("host.name").is_none());
     }
 
     #[test]
@@ -976,7 +976,7 @@ mod tests {
 
         // Same hazard one token later: the empty MSG this time comes from `after2`.
         let event = only_event(decode("<13>myhost nginx:"));
-        assert_eq!(event.attributes.get("syslog.hostname").and_then(Value::as_str), Some("myhost"));
+        assert_eq!(event.attributes.get("host.name").and_then(Value::as_str), Some("myhost"));
         assert_eq!(event.attributes.get("syslog.tag").and_then(Value::as_str), Some("nginx"));
         assert_eq!(message_str(&event), "");
     }
@@ -987,7 +987,7 @@ mod tests {
             "<134>1 2003-10-11T22:14:15.003Z myhost app 1234 ID47 - some message",
         ));
         assert_eq!(message_str(&event), "some message");
-        assert_eq!(event.attributes.get("syslog.hostname").and_then(Value::as_str), Some("myhost"));
+        assert_eq!(event.attributes.get("host.name").and_then(Value::as_str), Some("myhost"));
         assert_eq!(event.attributes.get("syslog.tag").and_then(Value::as_str), Some("app"));
         assert_eq!(event.attributes.get("syslog.pid"), Some(&Value::U64(1234)));
         assert_eq!(event.attributes.get("syslog.msgid").and_then(Value::as_str), Some("ID47"));
@@ -1003,7 +1003,7 @@ mod tests {
             "a nil (`-`) TIMESTAMP now stamps an explicit Value::Null rather than omitting the \
              attribute entirely"
         );
-        assert!(event.attributes.get("syslog.hostname").is_none());
+        assert!(event.attributes.get("host.name").is_none());
         assert!(event.attributes.get("syslog.tag").is_none());
         assert!(event.attributes.get("syslog.pid").is_none());
         assert!(event.attributes.get("syslog.msgid").is_none());
@@ -1073,7 +1073,7 @@ mod tests {
                 "expected timestamp {ts:?} to be omitted, not attached"
             );
             // The rest of the line parsed fine and must still be kept.
-            assert_eq!(event.attributes.get("syslog.hostname").and_then(Value::as_str), Some("h"));
+            assert_eq!(event.attributes.get("host.name").and_then(Value::as_str), Some("h"));
             assert_eq!(event.attributes.get("syslog.tag").and_then(Value::as_str), Some("a"));
             assert_eq!(event.attributes.get("syslog.pid"), Some(&Value::U64(1)));
             assert_eq!(message_str(&event), "msg");
@@ -1094,7 +1094,7 @@ mod tests {
         let event = only_event(decode("<13>4 requests failed"));
         assert_eq!(message_str(&event), "4 requests failed");
         assert!(event.attributes.get("syslog.tag").is_none());
-        assert!(event.attributes.get("syslog.hostname").is_none());
+        assert!(event.attributes.get("host.name").is_none());
     }
 
     #[test]
@@ -1183,7 +1183,7 @@ mod tests {
         datagram.extend_from_slice(b"<134>1 2003-10-11T22:14:15.003Z myhost app 123 - - ");
         datagram.extend_from_slice(&[0xff, 0xfe, b'x']);
         let event = only_event(decode_bytes(datagram));
-        assert_eq!(event.attributes.get("syslog.hostname").and_then(Value::as_str), Some("myhost"));
+        assert_eq!(event.attributes.get("host.name").and_then(Value::as_str), Some("myhost"));
         assert_eq!(event.attributes.get("syslog.tag").and_then(Value::as_str), Some("app"));
         assert_eq!(event.attributes.get("syslog.pid"), Some(&Value::U64(123)));
         match message_val(&event) {
@@ -1283,7 +1283,7 @@ mod tests {
         assert_eq!(event.attributes.get("syslog.facility"), Some(&Value::U64(4)));
         assert_eq!(event.attributes.get("_logit.syslog.severity"), Some(&Value::U64(2)));
         assert_eq!(
-            event.attributes.get("syslog.hostname").and_then(Value::as_str),
+            event.attributes.get("host.name").and_then(Value::as_str),
             Some("mymachine.example.com")
         );
         assert_eq!(event.attributes.get("syslog.tag").and_then(Value::as_str), Some("su"));
@@ -1304,10 +1304,7 @@ mod tests {
         assert_eq!(message_str(&event), "%% It's time to make the do-nuts.");
         assert_eq!(event.attributes.get("syslog.facility"), Some(&Value::U64(20)));
         assert_eq!(event.attributes.get("_logit.syslog.severity"), Some(&Value::U64(5)));
-        assert_eq!(
-            event.attributes.get("syslog.hostname").and_then(Value::as_str),
-            Some("192.0.2.1")
-        );
+        assert_eq!(event.attributes.get("host.name").and_then(Value::as_str), Some("192.0.2.1"));
         assert_eq!(event.attributes.get("syslog.tag").and_then(Value::as_str), Some("myproc"));
         assert_eq!(event.attributes.get("syslog.pid"), Some(&Value::U64(8710)));
         assert!(event.attributes.get("syslog.msgid").is_none());
@@ -1323,7 +1320,7 @@ mod tests {
         let event = only_event(decode(line));
         assert_eq!(message_str(&event), "An application event log entry...");
         assert_eq!(
-            event.attributes.get("syslog.hostname").and_then(Value::as_str),
+            event.attributes.get("host.name").and_then(Value::as_str),
             Some("mymachine.example.com")
         );
         assert_eq!(event.attributes.get("syslog.tag").and_then(Value::as_str), Some("evntslog"));
@@ -1455,7 +1452,7 @@ mod tests {
         let event = falls_back("<14>1 worker died");
         assert_eq!(event.attributes.get("_logit.syslog.severity"), Some(&Value::U64(6)));
         assert!(event.attributes.get("syslog.tag").is_none());
-        assert!(event.attributes.get("syslog.hostname").is_none());
+        assert!(event.attributes.get("host.name").is_none());
         falls_back("<13>1 2 3 msg");
     }
 

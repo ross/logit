@@ -30,7 +30,7 @@ fn worker() -> ScriptWorker {
 /// through the real `logfmt` transform.
 fn request_event(line: &str) -> Event {
     let mut attrs = AttrMap::new();
-    attrs.insert("syslog.hostname", "web-1");
+    attrs.insert("host.name", "web-1");
     attrs.insert("syslog.tag", "shop-api");
     let log = LogRecord {
         message: Value::str(line),
@@ -202,7 +202,7 @@ fn a_server_error_fans_out_to_an_alert_and_the_archive() {
     assert_eq!(*alert_mark, Some(0));
     assert_eq!(severity(alert), Some(Severity::Error));
     assert_eq!(message(alert), "POST /api/checkout returned 502: payment gateway timeout");
-    assert_eq!(alert.attributes.get("syslog.hostname").and_then(Value::as_str), Some("web-1"));
+    assert_eq!(alert.attributes.get("host.name").and_then(Value::as_str), Some("web-1"));
     assert_eq!(alert.attributes.get("http.route").and_then(Value::as_str), Some("/api/checkout"));
 
     let (archived, archived_mark) = &events[1];
@@ -233,7 +233,7 @@ fn a_repeated_server_error_is_archived_and_summarized_at_flush() {
     assert_eq!(*summary_mark, Some(0));
     assert!(message(summary).contains("1 more times"), "got: {}", message(summary));
     assert_eq!(number(summary, "repeats"), Some(1.0));
-    assert_eq!(summary.attributes.get("syslog.hostname").and_then(Value::as_str), Some("web-1"));
+    assert_eq!(summary.attributes.get("host.name").and_then(Value::as_str), Some("web-1"));
 }
 
 #[test]
