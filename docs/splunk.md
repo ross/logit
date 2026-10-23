@@ -132,8 +132,8 @@ stamp in the token's allowed list. Every other resource and event attribute goes
 field in `fields`, flattened to dotted keys.
 
 `splunk_hec_in` puts the same four values on the resource, so a relay keeps them. An object whose
-`fields` carry `host.name` leaves a relay with that value as its `host`, replacing any `host` it
-arrived with.
+`fields` carry `host.name` (a span object, whose `attributes` carry it) leaves a relay with that
+value as its `host`, replacing any `host` it arrived with.
 
 ### Acknowledgment is off by default, and your Splunk Cloud stack may not offer it
 

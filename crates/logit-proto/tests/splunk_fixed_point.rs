@@ -108,12 +108,20 @@ fn an_event_host_name_returns_on_the_resource_one_batch_per_host() {
     assert_eq!(encode(&d2), e1.to_vec());
 }
 
-/// Normalization 11's one replacement: a `fields` `host.name` is an event attribute, so it
-/// becomes the object's `host` over the `host` the object carried.
+/// Normalization 11's one replacement: a `fields` `host.name` (a span object's `attributes`
+/// `host.name`) is an event attribute, so it becomes the object's `host` over the `host` the
+/// object carried.
 #[test]
 fn a_fields_host_name_leaves_as_the_object_host() {
     let d1 = decode(br#"{"time":1,"host":"a","event":"x","fields":{"host.name":"b"}}"#);
     assert_eq!(encode(&d1), br#"{"time":1,"host":"b","event":"x"}"#.to_vec());
+
+    let span = decode(
+        br#"{"time":1,"host":"a","event":{"trace_id":"4bf92f3577b34da6a3ce929d0e0e4736","span_id":"00f067aa0ba902b7","start_time":1,"end_time":2,"attributes":{"host.name":"b","k":"v"}}}"#,
+    );
+    let out = String::from_utf8(encode(&span)).unwrap();
+    assert!(out.starts_with(r#"{"time":0.000000001,"host":"b","event":"#), "{out}");
+    assert!(out.contains(r#""attributes":{"k":"v"}"#), "{out}");
 }
 
 /// A relay of HEC objects that carry no `fields` `host.name` writes every object's own `host`:

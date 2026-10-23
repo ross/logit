@@ -3171,7 +3171,7 @@
           "additionalProperties": false
         },
         {
-          "description": "Sends logs, metrics, and spans to Splunk's HTTP Event Collector (HEC) as `/event` JSON, in the shape the OpenTelemetry Collector's `splunk_hec` exporter writes, so a Splunk index fed by both sees one schema. Spans go out as ordinary events: Splunk has no trace store. Each event's `index`, `source`, `sourcetype`, and `host` come from the batch's resource attributes `com.splunk.index`, `com.splunk.source`, `com.splunk.sourcetype`, and `host.name`: set them upstream with `set`. A batch with no `host.name` goes out with the process hostname as its `host`. Every other attribute goes out as an indexed field. A failure Splunk may have partly applied (a `5xx`, a timeout) resends the batch, which Splunk may index twice; `buffer.delivery: at_most_once` drops it instead.",
+          "description": "Sends logs, metrics, and spans to Splunk's HTTP Event Collector (HEC) as `/event` JSON, in the shape the OpenTelemetry Collector's `splunk_hec` exporter writes, so a Splunk index fed by both sees one schema. Spans go out as ordinary events: Splunk has no trace store. Each event's `index`, `source`, and `sourcetype` come from the batch's resource attributes `com.splunk.index`, `com.splunk.source`, and `com.splunk.sourcetype`: set them upstream with `set`. Its `host` is the event's own `host.name`, else the resource's `host.name`, else the process hostname. Every other attribute goes out as an indexed field. A failure Splunk may have partly applied (a `5xx`, a timeout) resends the batch, which Splunk may index twice; `buffer.delivery: at_most_once` drops it instead.",
           "type": "object",
           "required": [
             "endpoint",
