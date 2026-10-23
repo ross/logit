@@ -25,7 +25,11 @@ capture() {
     raw="$(docker run --rm "${RUST_IMAGE}" sh -c \
         "cargo install -q core-to-core-latency --version ${CRATE_VERSION} --locked >&2 \
          && /usr/local/cargo/bin/core-to-core-latency 5000 300 2>&1" 2>"${errf}" </dev/null)" || {
-        p "unavailable (docker run failed: $(tail -n 1 "${errf}"))"
+        # The tool's own error is in raw; docker's and cargo's are in errf.
+        local reason
+        reason="$(printf '%s\n' "${raw}" | sed 's/\x1b\[[0-9;]*m//g' | grep -v '^[[:space:]]*$' | tail -n 1)"
+        [ -n "${reason}" ] || reason="$(tail -n 1 "${errf}")"
+        p "unavailable (docker run failed: ${reason})"
         rm -f "${errf}"
         return
     }
