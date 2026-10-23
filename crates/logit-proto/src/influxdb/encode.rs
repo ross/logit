@@ -48,9 +48,10 @@
 //! warm encode allocates only the body, a key per new series, and the series maps' growth
 //! (`docs/design/memory.md`'s `influx_encode_100_events` row).
 
-use super::{ATTR_MEASUREMENT, FIELD_ATTR_PREFIX};
+use super::ATTR_MEASUREMENT;
 use crate::{CodecError, Encoder};
 use bytes::Bytes;
+use logit_core::attrs::FIELD_PREFIX;
 use logit_core::interner::{intern, resolve, Symbol};
 use logit_core::{
     DdSketch, Diagnostics, Event, EventBatch, Histogram, MetricKind, MetricRecord, MetricValue,
@@ -143,7 +144,7 @@ pub struct EncodeStats {
 
 /// Encodes an [`EventBatch`] as InfluxDB line protocol.
 ///
-/// Only `metrics` and `_logit.influxdb.field.*` string fields have a line-protocol mapping; a log body or
+/// Only `metrics` and `_logit.field.*` string fields have a line-protocol mapping; a log body or
 /// span is skipped, since InfluxDB has no established convention for either. Without the
 /// `_logit.influxdb.measurement` carrier, each metric on an event becomes its own line sharing
 /// that event's tags (`docs/adr/multi-payload-events.md`); with it, the event is one multi-field
@@ -392,7 +393,7 @@ impl Ctx<'_> {
             }
         }
         for (key, value) in event.attributes.iter() {
-            let Some(field) = resolve(key).strip_prefix(FIELD_ATTR_PREFIX) else {
+            let Some(field) = resolve(key).strip_prefix(FIELD_PREFIX) else {
                 continue;
             };
             // A non-`Str` value under the prefix isn't a string field (`super`'s "Encode").
@@ -609,7 +610,7 @@ impl Ctx<'_> {
 /// be represented is omitted alone, counted in `stats`, rather than failing the point.
 ///
 /// Every private `_logit.` key is skipped, uncounted: it's a carrier
-/// (`docs/adr/private-attribute-namespace.md`), not a tag. A `_logit.influxdb.field.` key among
+/// (`docs/adr/private-attribute-namespace.md`), not a tag. A `_logit.field.` key among
 /// them is a string field, which the carrier path writes as a field.
 ///
 /// The maps are merge-joined ([`logit_core::attrs::merged`]) rather than cloned and re-inserted:
@@ -1393,7 +1394,7 @@ mod tests {
                 ("_logit.statsd.event.title", "deploy"),
                 ("_logit.statsd.service_check.message", "a|b"),
                 ("statsd.container_id", "abcd1234"),
-                ("_logit.influxdb.field.note", "hello"),
+                ("_logit.field.note", "hello"),
                 ("influxdb.field.tag", "t"),
                 ("influxdb.foo", "bar"),
                 ("env", "prod"),
@@ -1534,7 +1535,7 @@ mod tests {
     #[test]
     fn a_field_key_escapes_a_quote_and_skips_a_backslash_before_an_escape() {
         let mut event = carrier_event("m", &[("q\"k", MetricValue::I64(1))]);
-        event.attributes.insert("_logit.influxdb.field.s\"t", "v");
+        event.attributes.insert("_logit.field.s\"t", "v");
         assert_eq!(encode(vec![event]), "m q\\\"k=1i,s\\\"t=\"v\" 1700000000000000000\n");
 
         let (out, stats) = encode_stats(vec![carrier_event(
@@ -1556,8 +1557,8 @@ mod tests {
     #[test]
     fn a_string_field_escapes_backslash_and_quote_only() {
         let mut event = carrier_event("p03a", &[]);
-        event.attributes.insert("_logit.influxdb.field.f", "a\"b\\c, d=e");
-        event.attributes.insert("_logit.influxdb.field.g", "trail\\");
+        event.attributes.insert("_logit.field.f", "a\"b\\c, d=e");
+        event.attributes.insert("_logit.field.g", "trail\\");
         assert_eq!(
             encode(vec![event]),
             "p03a f=\"a\\\"b\\\\c, d=e\",g=\"trail\\\\\" 1700000000000000000\n"
@@ -1985,7 +1986,7 @@ mod tests {
             ],
         );
         event.attributes.insert("host", "a");
-        event.attributes.insert("_logit.influxdb.field.state", "running");
+        event.attributes.insert("_logit.field.state", "running");
         let (out, stats) = encode_stats(vec![event]);
         assert_eq!(
             out,
@@ -1999,7 +2000,7 @@ mod tests {
     #[test]
     fn a_string_only_carrier_event_still_writes_its_line() {
         let mut event = carrier_event("syslog", &[]);
-        event.attributes.insert("_logit.influxdb.field.message", "hello world");
+        event.attributes.insert("_logit.field.message", "hello world");
         event.attributes.insert("appname", "sshd");
         let out = encode(vec![event]);
         assert_eq!(out, "syslog,appname=sshd message=\"hello world\" 1700000000000000000\n");
@@ -2086,9 +2087,7 @@ mod tests {
     #[test]
     fn an_oversize_string_field_is_dropped_and_counted() {
         let mut event = carrier_event("m", &[("f", MetricValue::I64(1))]);
-        event
-            .attributes
-            .insert("_logit.influxdb.field.big", "a".repeat(MAX_FIELD_VALUE_BYTES + 1).as_str());
+        event.attributes.insert("_logit.field.big", "a".repeat(MAX_FIELD_VALUE_BYTES + 1).as_str());
         let (out, stats) = encode_stats(vec![event]);
         assert_eq!(out, "m f=1i 1700000000000000000\n");
         assert_eq!(stats.dropped_oversize_value, 1);
@@ -2098,7 +2097,7 @@ mod tests {
     #[test]
     fn a_string_field_keeps_a_raw_newline() {
         let mut event = carrier_event("p03d", &[]);
-        event.attributes.insert("_logit.influxdb.field.f", "line1\nline2");
+        event.attributes.insert("_logit.field.f", "line1\nline2");
         assert_eq!(encode(vec![event]), "p03d f=\"line1\nline2\" 1700000000000000000\n");
     }
 }

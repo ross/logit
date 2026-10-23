@@ -2802,7 +2802,7 @@ rows:
       influxdb_out:
         class: exact
         text: >-
-          A line of the event's `_logit.influxdb.field.*` string fields under the measurement
+          A line of the event's `_logit.field.*` string fields under the measurement
           its `_logit.influxdb.measurement` carrier names, read back as the same event.
       otlp_out:
         class: skipped

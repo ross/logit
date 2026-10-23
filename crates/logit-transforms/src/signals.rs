@@ -250,7 +250,7 @@ mod tests {
     fn string_only_event() -> Event {
         let mut attributes = AttrMap::new();
         attributes.insert("_logit.influxdb.measurement", Value::str("filament"));
-        attributes.insert("_logit.influxdb.field.v", Value::str("PLA"));
+        attributes.insert("_logit.field.v", Value::str("PLA"));
         Event::empty(0, attributes)
     }
 

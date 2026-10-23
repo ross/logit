@@ -58,9 +58,9 @@
 //!
 //! # Series identity
 //!
-//! A series is its record's name and unit and its event's attributes, minus InfluxDB string
-//! fields (`_logit.influxdb.field.*`, [`StringFieldKeys`]), which a flushed series doesn't
-//! carry either. Every other private attribute is identity and stays. A record that passes
+//! A series is its record's name and unit and its event's attributes, minus the attributes
+//! under the field namespace (`_logit.field.*`, [`StringFieldKeys`]), which a flushed series
+//! doesn't carry either. Every other private attribute is identity and stays. A record that passes
 //! through keeps its event's attributes whole. The ADR's "Amendment: InfluxDB string fields aren't
 //! series identity (2026-10-19)" has the reasoning.
 
@@ -74,7 +74,6 @@ use logit_pipeline::{FlushOutput, TraceContext, Transform};
 use logit_proto::datadog::events::ATTR_STATSD_TIMESTAMP;
 use logit_proto::datadog::is_datadog_stats_sym;
 use logit_proto::datadog::stats::ATTR_STATS_NAME;
-use logit_proto::influxdb::FIELD_ATTR_PREFIX;
 use logit_proto::prometheus::ATTR_TIMESTAMP as PROMETHEUS_ATTR_TIMESTAMP;
 use smallvec::SmallVec;
 use std::collections::hash_map::DefaultHasher;
@@ -1449,9 +1448,9 @@ fn record_temporality(temporality: AggregateTemporality) -> Temporality {
     }
 }
 
-/// Which attribute keys are InfluxDB string fields (`_logit.influxdb.field.*`), which a series key
-/// leaves out: a string field isn't series identity at InfluxDB, where it's a field of the point,
-/// and an aggregate summarizes numbers. Keyed on them, two readings of one series that differ only
+/// Which attribute keys are in the field namespace (`_logit.field.*`), which a series key leaves
+/// out: such a key is data about a point, not identity of its series, and an aggregate summarizes
+/// numbers. Keyed on them, two readings of one series that differ only
 /// in a string such as Telegraf's `uptime_format` would flush as two series that every protocol
 /// sink but `influxdb_out` renders with the same labels. Every other private key stays in the key:
 /// `_logit.influxdb.measurement` and other protocols' carriers are identity that a sink reads after
@@ -1482,7 +1481,7 @@ impl StringFieldKeys {
             self.seen.resize(i + 1, UNSEEN);
         }
         if self.seen[i] == UNSEEN {
-            let field = logit_core::interner::resolve(key).starts_with(FIELD_ATTR_PREFIX);
+            let field = logit_core::attrs::is_field(logit_core::interner::resolve(key));
             self.seen[i] = if field { STRING_FIELD } else { OTHER_KEY };
         }
         self.seen[i] == STRING_FIELD
@@ -2356,7 +2355,7 @@ mod tests {
             let mut event = metric_event("system.uptime", MetricKind::gauge(value), at);
             event.attributes.insert("host", "a");
             event.attributes.insert("_logit.influxdb.measurement", "system");
-            event.attributes.insert("_logit.influxdb.field.uptime_format", uptime);
+            event.attributes.insert("_logit.field.uptime_format", uptime);
             feed(&mut agg, &resource, event);
         }
 
@@ -2365,7 +2364,7 @@ mod tests {
         assert_eq!(events.len(), 1, "a string field shouldn't split the series");
         assert_eq!(*kind_of(&events[0]), MetricKind::gauge(2.0), "the later reading wins");
         let attributes = &events[0].attributes;
-        assert_eq!(attributes.get("_logit.influxdb.field.uptime_format"), None);
+        assert_eq!(attributes.get("_logit.field.uptime_format"), None);
         assert_eq!(attributes.get("host").and_then(Value::as_str), Some("a"));
         assert_eq!(
             attributes.get("_logit.influxdb.measurement").and_then(Value::as_str),

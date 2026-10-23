@@ -2477,7 +2477,7 @@ mod tests {
     /// reaching `event/attributes_only`.
     #[test]
     fn an_event_with_attributes_only_is_an_event_record() {
-        let ins = recs(&[r#"{{T},"attributes":{"_logit.influxdb.field.s":"x"}}"#]);
+        let ins = recs(&[r#"{{T},"attributes":{"_logit.field.s":"x"}}"#]);
         assert_eq!(ins.len(), 1);
         assert_eq!((ins[0].kind.as_str(), ins[0].family()), ("event", "event"));
         assert_eq!(kind_features(&ins[0]), [Some("attributes_only".to_string())]);
@@ -2488,7 +2488,7 @@ mod tests {
     #[test]
     fn an_event_with_a_measurement_is_string_only() {
         let ins = recs(&[
-            r#"{{T},"attributes":{"_logit.influxdb.measurement":"m","_logit.influxdb.field.s":"x"}}"#,
+            r#"{{T},"attributes":{"_logit.influxdb.measurement":"m","_logit.field.s":"x"}}"#,
         ]);
         assert_eq!(kind_features(&ins[0]), [Some("string_only".to_string())]);
     }

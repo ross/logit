@@ -157,10 +157,34 @@ pub fn is_private(key: &str) -> bool {
     key.starts_with(PRIVATE_PREFIX)
 }
 
+/// The prefix of the field namespace: an attribute `_logit.field.<key>` is data about its point,
+/// never part of the identity of the series a point belongs to.
+///
+/// `influxdb_out` writes a `Str` under it as the string field `<key>`, and `aggregate` leaves it
+/// out of a series' identity. It is a private key ([`is_private`]), so every other protocol sink
+/// ignores it. See ADR `metric-flags` (`docs/adr/metric-flags.md`) and
+/// `docs/design/data-model.md`'s "Well-known attribute names".
+pub const FIELD_PREFIX: &str = "_logit.field.";
+
+/// Whether `key` is in the field namespace, [`FIELD_PREFIX`].
+pub fn is_field(key: &str) -> bool {
+    key.starts_with(FIELD_PREFIX)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::interner;
+
+    #[test]
+    fn is_field_matches_only_keys_under_the_field_prefix() {
+        assert!(is_field("_logit.field.note"));
+        assert!(is_field("_logit.field."));
+        assert!(!is_field("_logit.field"));
+        assert!(!is_field("_logit.influxdb.measurement"));
+        assert!(!is_field("field.note"));
+        assert!(is_private("_logit.field.note"));
+    }
 
     #[test]
     fn get_present_key_returns_the_value() {

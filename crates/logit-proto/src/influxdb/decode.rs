@@ -21,9 +21,9 @@
 use super::line::{
     lines, parse_line, FieldValue, Line, LineError, MAX_TIMESTAMP_NS, MIN_TIMESTAMP_NS,
 };
-use super::{Precision, ATTR_MEASUREMENT, FIELD_ATTR_PREFIX};
+use super::{Precision, ATTR_MEASUREMENT};
 use bytes::Bytes;
-use logit_core::attrs::is_private;
+use logit_core::attrs::{is_private, FIELD_PREFIX};
 use logit_core::interner::{intern, KeyCache, Symbol};
 use logit_core::subslice;
 use logit_core::{
@@ -59,7 +59,7 @@ pub struct InfluxDecoder {
     keys: KeyCache,
     /// `_logit.influxdb.measurement`, interned once.
     measurement_key: Symbol,
-    /// Scratch for `<measurement>.<field>` and `_logit.influxdb.field.<key>`.
+    /// Scratch for `<measurement>.<field>` and `_logit.field.<key>`.
     name: String,
     hasher: RandomState,
     /// Series-and-time hash to the latest event with that hash.
@@ -314,10 +314,10 @@ impl InfluxDecoder {
         intern(&self.name)
     }
 
-    /// `_logit.influxdb.field.<key>`, interned.
+    /// `_logit.field.<key>`, interned.
     fn field_attr(&mut self, key: &str) -> Symbol {
         self.name.clear();
-        self.name.push_str(FIELD_ATTR_PREFIX);
+        self.name.push_str(FIELD_PREFIX);
         self.name.push_str(key);
         self.keys.get_or_intern(&self.name)
     }
@@ -393,7 +393,7 @@ mod tests {
         assert_eq!(str_attr(e, "host"), Some("a"));
         assert_eq!(str_attr(e, "dc"), Some("iad"));
         assert_eq!(str_attr(e, ATTR_MEASUREMENT), Some("cpu"));
-        assert_eq!(str_attr(e, "_logit.influxdb.field.note"), Some("hi"));
+        assert_eq!(str_attr(e, "_logit.field.note"), Some("hi"));
         assert_eq!(e.attributes.len(), 4);
     }
 
@@ -401,7 +401,7 @@ mod tests {
     fn a_string_only_point_has_no_metrics() {
         let events = decode("log msg=\"started\" 1");
         assert!(events[0].metrics.is_empty());
-        assert_eq!(str_attr(&events[0], "_logit.influxdb.field.msg"), Some("started"));
+        assert_eq!(str_attr(&events[0], "_logit.field.msg"), Some("started"));
     }
 
     // influxd 2.9.1, item 9
@@ -419,7 +419,7 @@ mod tests {
             metrics(&events[0]),
             [("m.x", g(MetricValue::I64(9))), ("m.y", g(MetricValue::I64(2)))]
         );
-        assert_eq!(str_attr(&events[0], "_logit.influxdb.field.s"), Some("a"));
+        assert_eq!(str_attr(&events[0], "_logit.field.s"), Some("a"));
         assert_eq!(str_attr(&events[1], "t"), Some("2"));
         assert_eq!(events[2].timestamp, 6);
     }
@@ -437,8 +437,8 @@ mod tests {
         let events = decode("m f=1i,g=\"s\" 5\nm f=\"now a string\",g=2.5 5");
         assert_eq!(events.len(), 1);
         assert_eq!(metrics(&events[0]), [("m.g", g(MetricValue::F64(2.5)))]);
-        assert_eq!(str_attr(&events[0], "_logit.influxdb.field.f"), Some("now a string"));
-        assert_eq!(events[0].attributes.get("_logit.influxdb.field.g"), None);
+        assert_eq!(str_attr(&events[0], "_logit.field.f"), Some("now a string"));
+        assert_eq!(events[0].attributes.get("_logit.field.g"), None);
     }
 
     // influxd 2.9.1, item 7
@@ -539,21 +539,21 @@ mod tests {
             "listener",
         ));
         let body = Bytes::from_static(
-            b"m,_logit.influxdb.measurement=x,_logit.influxdb.field.f=y,host=a,\
+            b"m,_logit.influxdb.measurement=x,_logit.field.f=y,host=a,\
               _logit.influxdb.bucket=b f=1i 1\n\
               n,influxdb.z=1,logit.x=c,_logitx=d,influxdb.field.x=e,influxdb.measurement=v f=1i 1",
         );
         let batch =
             decoder.decode_body(body, Precision::Ns, 0, Arc::new(Resource::default())).unwrap();
         assert_eq!(str_attr(&batch.events[0], ATTR_MEASUREMENT), Some("m"));
-        assert_eq!(batch.events[0].attributes.get("_logit.influxdb.field.f"), None);
+        assert_eq!(batch.events[0].attributes.get("_logit.field.f"), None);
         assert_eq!(str_attr(&batch.events[0], "host"), Some("a"));
         assert_eq!(batch.events[0].attributes.get("_logit.influxdb.bucket"), None);
         let second = &batch.events[1];
         assert_eq!(str_attr(second, "logit.x"), Some("c"), "only `_logit.` is private");
         assert_eq!(str_attr(second, "_logitx"), Some("d"), "the prefix ends in a dot");
         assert_eq!(str_attr(second, "influxdb.field.x"), Some("e"), "not a string field");
-        assert_eq!(second.attributes.get("_logit.influxdb.field.x"), None);
+        assert_eq!(second.attributes.get("_logit.field.x"), None);
         assert_eq!(str_attr(second, "influxdb.z"), Some("1"), "the rest of `influxdb.` is public");
         assert_eq!(str_attr(second, "influxdb.measurement"), Some("v"), "not the carrier");
         assert_eq!(str_attr(second, ATTR_MEASUREMENT), Some("n"));
@@ -598,11 +598,11 @@ mod tests {
         };
         assert!(inside(&attr("host")));
         assert!(inside(&attr(ATTR_MEASUREMENT)));
-        assert!(inside(&attr("_logit.influxdb.field.s")));
+        assert!(inside(&attr("_logit.field.s")));
         assert!(!inside(&attr("esc")), "an unescaped value is a copy");
         assert_eq!(attr("esc"), Bytes::from_static(b"a b"));
-        assert!(!inside(&attr("_logit.influxdb.field.t")));
-        assert_eq!(attr("_logit.influxdb.field.t"), Bytes::from_static(b"q\""));
+        assert!(!inside(&attr("_logit.field.t")));
+        assert_eq!(attr("_logit.field.t"), Bytes::from_static(b"q\""));
     }
 
     #[test]
@@ -712,7 +712,7 @@ mod tests {
         assert_eq!(str_attr(e, "host"), Some("parent"));
         assert_eq!(str_attr(e, "t"), Some("1"));
         assert_eq!(str_attr(e, ATTR_MEASUREMENT), Some("m"));
-        assert_eq!(str_attr(e, "_logit.influxdb.field.s"), Some("x"));
+        assert_eq!(str_attr(e, "_logit.field.s"), Some("x"));
         assert_eq!(e.timestamp, RECEIVED_AT, "the default timestamp, not truncated");
     }
 
