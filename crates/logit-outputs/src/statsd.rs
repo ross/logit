@@ -298,7 +298,7 @@
 //! | `attributes/host_beside_host_name`, under `format: statsd` | lost | `logit.output.tags.omitted{reason=dialect}` | Plain statsd has no tags; each is counted once per wire tag. |
 //! | `attributes/host_beside_host_name`, otherwise | lost | `logit.output.tags.omitted{reason=unrepresentable}` | A non-empty `host.name` or the hostless mark is the line's own host, so a `host` beside it, a second `host:` tag the Agent would consume, is left off, counted once per wire tag. |
 //! | `attributes/container_id`, under `format: statsd` | lost | `logit.output.fields.omitted{reason=dialect}` | Plain statsd has no `\|c:` segment, so the container id is omitted, counted once per line. |
-//! | `attributes/container_id`, otherwise | exact | -- | The line's `\|c:` segment, never a tag, which statsd_in reads back as `container.id`. |
+//! | `attributes/container_id`, otherwise | exact | -- | A non-empty one is the line's `\|c:` segment, never a tag, and an empty one an ordinary tag; statsd_in reads either back as `container.id`. |
 //! | `attributes/bool_value`, under `format: statsd` | lost | `logit.output.tags.omitted{reason=dialect}` | Plain statsd has no tags. |
 //! | `attributes/bool_value`, otherwise | normalized | `bool_tag` | `true` is a bare tag and reads back `true`; `false` is `key:false` and reads back as the string. |
 //! | `attributes/number_value`, under `format: statsd` | lost | `logit.output.tags.omitted{reason=dialect}` | Plain statsd has no tags. |
@@ -447,15 +447,16 @@
 //! `_logit.statsd.cgroup_inode` carrier:
 //!
 //! - a container id alone is `|c:<id>`, bare, the form every Agent version reads, so a received
-//!   `ci-<id>` or `cid-<id>` relays as `<id>`;
+//!   `ci-<id>` or `cid-<id>` relays as `<id>`; an id that itself starts with `ci-`, `cid-`, or
+//!   `in-` is `|c:ci-<id>`, since the Agent strips one `ci-` from a single item and would read
+//!   the bare form as a prefix;
 //! - an inode alone is `|c:in-<inode>`;
 //! - both are the list `|c:ci-<id>,in-<inode>`, since the Agent reads only prefixed items in a
 //!   list.
 //!
 //! Each item is sanitized like a tag value, `,` included, so it can't split the list.
-//! `container.id` is never also a tag; one that isn't a usable `Str` has no `|c:` form and is left
-//! off, counted `logit.output.tags.omitted{reason="unrepresentable"}` (`{reason="dialect"}` under
-//! `format: statsd`). `|T<secs>` is written for an event flagged
+//! A usable `container.id` is never also a tag; any other value (an `Array` from a repeated
+//! `container.id:` tag, a bare `Bool(true)`) is an ordinary tag, one per element. `|T<secs>` is written for an event flagged
 //! `_logit.metrics.closed: "timestamped"` (on the event, else the resource; the flag's other values
 //! write none), with `secs` the whole seconds of `Event::timestamp`, truncated. `statsd_in` sets
 //! that flag and `Event::timestamp` from an incoming `|T`, and so does `prometheus_in` for a scraped
@@ -1218,17 +1219,16 @@ fn build_tag_suffix<'a>(
         if crate::attrs::is_private(key_str) {
             continue;
         }
-        // The line's own `|c:` (module doc's "`|c:<container-id>` and `|T<timestamp>`"), never a
-        // tag: a usable one is captured, and any other has no `|c:` form and is left off.
+        // A usable `container.id` is the line's own `|c:` (module doc's "`|c:<container-id>` and
+        // `|T<timestamp>`"), never a tag; any other value is an ordinary tag, as a `host.name`
+        // that isn't usable is.
         if key_str == CONTAINER_ID {
-            match value {
-                Value::Str(s) if !s.is_empty() && std::str::from_utf8(s).is_ok() => {
+            if let Value::Str(s) = value {
+                if !s.is_empty() && std::str::from_utf8(s).is_ok() {
                     carriers.container_id = value.as_str();
+                    continue;
                 }
-                _ if format == Format::Statsd => stats.tags_omitted_dialect += 1,
-                _ => stats.tags_omitted_unrepresentable += 1,
             }
-            continue;
         }
 
         if format == Format::Statsd {
@@ -1416,6 +1416,11 @@ fn append_origin_fields(line: &mut String, ctx: &EncodeCtx) {
         (None, None) => {}
         (Some(id), None) => {
             line.push_str("|c:");
+            // A bare id the Agent would read as a prefixed item needs the `ci-` prefix, which a
+            // single item loses once on the way back.
+            if ["ci-", "cid-", "in-"].iter().any(|p| id.starts_with(p)) {
+                line.push_str("ci-");
+            }
             sanitize_into(line, id, is_forbidden_in_local_data_item);
         }
         (id, Some(inode)) => {
@@ -4081,8 +4086,42 @@ mod tests {
             line(&[("container.id", Value::str("abc")), ("env", Value::str("prod"))]),
             ("hits:1|c|#env:prod|c:abc".to_string(), 0)
         );
-        assert_eq!(line(&[("container.id", Value::I64(7))]), ("hits:1|c".to_string(), 1));
-        assert_eq!(line(&[("container.id", Value::str(""))]), ("hits:1|c".to_string(), 1));
+        for (id, wire) in [
+            ("ci-abc", "hits:1|c|c:ci-ci-abc"),
+            ("cid-abc", "hits:1|c|c:ci-cid-abc"),
+            ("in-7", "hits:1|c|c:ci-in-7"),
+            ("abc-in-7", "hits:1|c|c:abc-in-7"),
+        ] {
+            assert_eq!(line(&[("container.id", Value::str(id))]), (wire.to_string(), 0), "{id}");
+        }
+    }
+
+    /// A `container.id` that isn't a usable `Str` is an ordinary tag, one per element, and reads
+    /// back as itself.
+    #[test]
+    fn a_container_id_that_isnt_a_usable_str_is_an_ordinary_tag() {
+        let line = |value: Value| {
+            let (msgs, stats) = encode(vec![metric_event(
+                "hits",
+                MetricKind::counter(1.0),
+                &[("container.id", value)],
+            )]);
+            (msgs[0].clone(), stats.tags_omitted_unrepresentable)
+        };
+        let array = Value::Array(vec![Value::str("a"), Value::str("b")]);
+        assert_eq!(line(array), ("hits:1|c|#container.id:a,container.id:b".to_string(), 0));
+        assert_eq!(line(Value::Bool(true)), ("hits:1|c|#container.id".to_string(), 0));
+        assert_eq!(line(Value::I64(7)), ("hits:1|c|#container.id:7".to_string(), 0));
+        let (msgs, stats) = encode_with_format(
+            vec![metric_event(
+                "hits",
+                MetricKind::counter(1.0),
+                &[("container.id", Value::Array(vec![Value::str("a"), Value::str("b")]))],
+            )],
+            Format::Statsd,
+        );
+        assert_eq!(msgs, vec!["hits:1|c"]);
+        assert_eq!(stats.tags_omitted_dialect, 2, "per element");
     }
 
     /// An event's `container.id` wins over the resource's, as every attribute does.

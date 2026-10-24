@@ -987,8 +987,10 @@ standard `container.id` on the event, and its cgroup inode (`in-<inode>`, what t
 `datadog` Python client sends) the carrier `_logit.statsd.cgroup_inode`. `_logit.statsd.container_id`
 no longer exists ([ADR `process-hostname`](process-hostname.md)'s "Amendment: container identity
 (2026-10-24)"). `statsd_out` writes `|c:<id>` bare for a lone id, the form every Agent version
-reads, `|c:in-<inode>` for a lone inode, and `|c:ci-<id>,in-<inode>` for both, since the Agent
-reads only prefixed items in a list. `container.id` is never also a tag. The relay stays a fixed
+reads (`|c:ci-<id>` for an id that itself starts with `ci-`, `cid-`, or `in-`, which the bare
+form would misread), `|c:in-<inode>` for a lone inode, and `|c:ci-<id>,in-<inode>` for both, since the Agent
+reads only prefixed items in a list. A usable `container.id` (a non-empty `Str`) is never also a
+tag; any other value is an ordinary tag. The relay stays a fixed
 point modulo one more normalization (`crates/logit-cli/tests/statsd_round_trip.rs`'s (11)): a
 `ci-<id>` or `cid-<id>` relays as `<id>`, a list relays as `ci-<id>,in-<inode>`, and a list item
 the Agent doesn't read is dropped at decode, counted `logit.input.fields.dropped{reason="malformed"}`.
