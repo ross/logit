@@ -147,6 +147,23 @@ fn log_service_identity_entries() {
     }
 }
 
+/// A top-level `service.name` that isn't a string leaves as the log's `service`, which reads back
+/// as the attribute `service` (permitted normalization (5)), so only the wire is a fixed point;
+/// the empty or bare `service` entry beside it is left off at the first hop, not the second.
+#[test]
+fn a_non_string_service_name_field_beside_an_empty_service_entry() {
+    for body in [
+        r#"[{"message":"a","service.name":5,"ddtags":"team:a,service"}]"#,
+        r#"[{"message":"a","service.name":5,"ddtags":"service:"}]"#,
+    ] {
+        let d1 = DatadogDecoder::new().decode_logs(body.as_bytes(), RECEIVED_AT).unwrap();
+        let e1 = DatadogEncoder::new().encode_logs(&d1).unwrap();
+        let d2 = DatadogDecoder::new().decode_logs(&e1, RECEIVED_AT).unwrap();
+        let e2 = DatadogEncoder::new().encode_logs(&d2).unwrap();
+        assert_eq!(e1, e2, "wire fixed point; first encode: {}", String::from_utf8_lossy(&e1));
+    }
+}
+
 #[test]
 fn public_log_item_with_nested_attributes_and_extra_keys() {
     assert_logs_fixed_point(

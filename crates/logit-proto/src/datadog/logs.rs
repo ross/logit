@@ -177,8 +177,8 @@ impl DatadogDecoder {
 
     /// Writes the log's `service` and its `ddtags` `env:`, `version:`, and `service:` entries
     /// onto [`LIFTED`]'s keys. Per key, the winner is the log's own `service` for `service.name`,
-    /// else the first entry with a non-empty value, else a non-empty `Str` the log already
-    /// carries under the key's name, which stays as it is. A string `service` or a winning entry
+    /// else the first entry with a non-empty value, else a field the log already carries under
+    /// the key's name with a value the encoder writes, which stays as it is. A string `service` or a winning entry
     /// displaces a field of the key's name. Every other entry naming a key with a winner is left
     /// out of `ddtags`, and each loser is counted. A `ddtags` with nothing left out stays as it
     /// came, and one emptied is no attribute.
@@ -215,10 +215,18 @@ impl DatadogDecoder {
             }
         }
         let mut omitted = 0;
+        // A field the log carries under a key's name has a value the encoder writes: any but an
+        // empty `Str` for `service.name`, which becomes the `service` field, and a non-empty
+        // `Str` for the other two, which become `ddtags` entries.
         let won: [bool; 3] = std::array::from_fn(|at| {
+            let field = attrs.get(LIFTED[at].1);
             winners[at].is_some()
                 || (at == 2 && service_kept)
-                || attrs.get(LIFTED[at].1).and_then(Value::as_str).is_some_and(|v| !v.is_empty())
+                || if at == 2 {
+                    field.is_some_and(|v| v.as_str() != Some(""))
+                } else {
+                    field.and_then(Value::as_str).is_some_and(|v| !v.is_empty())
+                }
         });
         let mut rewritten = false;
         let mut rest: Vec<&str> = Vec::new();

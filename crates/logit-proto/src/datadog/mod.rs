@@ -372,7 +372,7 @@
 //! | `service`, a non-empty string | `service.name`, displacing a `service.name` key | `logit.input.tags.omitted{reason="reserved_key"}` for a displaced key |
 //! | `service`, not a string | the attribute `service`, verbatim (`service.name` is a string); it still wins over a `service:` entry in `ddtags` and a `service.name` key, both left off | as above, per left-off entry or key |
 //! | `service`, an empty string | nothing: no service | -- |
-//! | `ddtags` `env:<v>`, `version:<v>`, `service:<v>` entries with a non-empty value (Unified Service Tagging's three tags) | `deployment.environment.name`, `service.version`, `service.name`, from the first such entry per key, but the log's own `service` wins for `service.name`; each displaces a key of its name. With no such entry and no `service`, a key the log carries as a non-empty string field wins and stays as it is. Every other entry naming a key with a winner (a later one, an empty or bare one, the `service:` beside a `service` field) is left out of `ddtags` | one `logit.input.tags.omitted{reason="reserved_key"}` per left-out entry and displaced key |
+//! | `ddtags` `env:<v>`, `version:<v>`, `service:<v>` entries with a non-empty value (Unified Service Tagging's three tags) | `deployment.environment.name`, `service.version`, `service.name`, from the first such entry per key, but the log's own `service` wins for `service.name`; each displaces a key of its name. With no such entry and no `service`, a field of the key's name the log carries wins and stays as it is: a non-empty string, or for `service.name` anything but an empty string. Every other entry naming a key with a winner (a later one, an empty or bare one, the `service:` beside a `service` field) is left out of `ddtags` | one `logit.input.tags.omitted{reason="reserved_key"}` per left-out entry and displaced key |
 //! | `ddtags`, a string | `ddtags`, verbatim when no entry is lifted; else its other entries joined with `,` in their order, empty tokens left out, and no attribute when none remains. Splitting it further is a transform's job | -- |
 //! | `ddsource`, a `ddtags` that isn't a string, and a `hostname` that isn't a string | attributes of the same names, verbatim | -- |
 //! | any other key | an attribute of the same name: object → `Map`, array → `Array`, integer → `I64` (`U64` above `i64::MAX`), other number → `F64`, string → `Str`, bool, `null` → `Null` | -- |
@@ -472,7 +472,8 @@
 //! 5. a log with `_logit.datadog.source` but no `ddsource` leaves under the Datadog name, and
 //!    one with a top-level `service.name` field leaves with it as its `service`, a top-level
 //!    `deployment.environment.name` or `service.version` as an `env:` or `version:` entry in
-//!    `ddtags` (the next hop reads back each key as it was); a log's, an event's, or a check's
+//!    `ddtags` (the next hop reads back each key as it was, but a `service.name` that isn't a
+//!    string, which it reads back as the attribute `service`); a log's, an event's, or a check's
 //!    own host displaces a `host.name` key or tag beside it, and a log's own `service` a
 //!    `service.name` key, omitted and counted at decode; a log's `hostname` that isn't a string
 //!    is decoded as the attribute `hostname` and left off at encode, counted, so the relay loses

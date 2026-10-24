@@ -357,7 +357,7 @@ A Datadog log's service, environment, and version decode onto `service.name`,
 | Wire form | Writes |
 |---|---|
 | a log's `service`, a non-empty string | `service.name`; an empty one is no service, and a non-string one stays the attribute `service`, which still wins over the entries and fields below |
-| a log's `ddtags` `env:<v>`, `version:<v>`, and `service:<v>` entries (Unified Service Tagging's three tags) | `deployment.environment.name`, `service.version`, and `service.name`, each from the first entry with a non-empty value, else from a non-empty string field of the key's name the log already carries. The entries naming a key with a value leave `ddtags`; every other entry stays in the one string, in order |
+| a log's `ddtags` `env:<v>`, `version:<v>`, and `service:<v>` entries (Unified Service Tagging's three tags) | `deployment.environment.name`, `service.version`, and `service.name`, each from the first entry with a non-empty value, else from a field of the key's name the log already carries (a non-empty string, or for `service.name` anything but an empty string). The entries naming a key with a value leave `ddtags`; every other entry stays in the one string, in order |
 
 A protocol's own form beats a sender's: the log's `service` field beats a `ddtags` `service:`
 entry, the first valued entry a later one of the same key, and either a top-level field spelled
