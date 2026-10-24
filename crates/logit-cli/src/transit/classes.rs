@@ -1559,7 +1559,16 @@ fn observe_field(field: &Field, input: &Rec, out: &Rec, spelling: Spelling) -> C
         // An attribute the input lacks, read back with the value derived for it, is the sink's
         // rewrite of a field the record already holds.
         Field::Derived { key, value } => {
-            match out.attributes.get(*key).or(out.resource.get(*key)) {
+            // A span's derived host is its tracer payload's, on the resource, ahead of any
+            // `host.name` span tag; every other derived field is the record's own.
+            let span_host =
+                *key == "host.name" && datadog::Route::of(input) == datadog::Route::Span;
+            let read = if span_host {
+                out.resource.get(*key).or(out.attributes.get(*key))
+            } else {
+                out.attributes.get(*key).or(out.resource.get(*key))
+            };
+            match read {
                 Some(read) if text(read) == *value => Class::Normalized,
                 _ => Class::Lost,
             }
@@ -2709,6 +2718,24 @@ mod tests {
         assert_eq!(pair(&ins, &same, Spelling::Datadog).seen, [Some(Class::Exact)]);
         assert_eq!(pair(&ins, &same, Spelling::Verbatim).seen, [None]);
         assert_eq!(pair(&ins, &wrong_kind, Spelling::Datadog).seen, [None]);
+    }
+
+    /// A span's derived host is read from the resource, where the tracer payload's hostname reads
+    /// back, ahead of the span's own `host.name` tag.
+    #[test]
+    fn datadog_reads_a_spans_derived_host_from_the_resource_first() {
+        let span = |rest: &str| {
+            format!(
+                r#"{{{{T}},"span":{{"name":"s","trace_id":"0a0b0c0d0e0f10110102030405060708","span_id":"1112131415161718","kind":"internal","status":"unset","start":"2027-01-15T08:00:00.000000000Z","end":"2027-01-15T08:00:00.000000000Z","duration_ns":0}},"attributes":{{"host.name":"span-host"}}{rest}}}"#
+            )
+        };
+        let ins = recs(&[&span("")]);
+        let filled =
+            format!(r#","resource":{{"attributes":{{"host.name":"{}"}}}}"#, super::super::HOSTNAME);
+        let out = recs(&[&span(&filled)]);
+        let rows = field_rows(&ins[0], "datadog");
+        let (_, _, field) = rows.iter().find(|(_, f, _)| f.as_deref() == Some("no_host")).unwrap();
+        assert_eq!(observe_field(field, &ins[0], &out[0], Spelling::Datadog), Class::Normalized);
     }
 
     /// A `_dd.p.tid` other than the trace id's high 64 bits doesn't pair.

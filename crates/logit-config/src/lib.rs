@@ -3605,8 +3605,9 @@ pub enum ComponentKind {
         socket: Option<String>,
         /// The trace form to send: `v0.4` (the default) or `v0.7`. `v0.4` is what most tracers
         /// send; it has no room for trace chunk fields (sampling priority, origin, chunk tags) or
-        /// a tracer's hostname, environment, and tags, which are dropped and counted. `v0.7`
-        /// carries all of them.
+        /// a tracer's environment and tags, which are dropped and counted. A resource `host.name`,
+        /// the tracer's hostname, goes out as a tag on every span instead. `v0.7` carries all of
+        /// them, the hostname in its payload.
         #[serde(default)]
         version: DatadogTraceVersion,
         /// How request bodies are compressed: `none` (the default, what tracers send) or `gzip`,

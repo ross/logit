@@ -144,7 +144,8 @@ Entry format and the other areas: [the known-gaps index](README.md).
     leaves one point per series per window.
 - **`datadog_out` reports every hostless sender under the relay's hostname.** It sends the
   process hostname for a metric, event, or service check with no `host.name` and no hostless
-  mark, and a log with none of `host.name`, `syslog.hostname`, or `host`. `statsd_in` and
+  mark, a log with none of `host.name`, `syslog.hostname`, or `host`, and a trace or APM stats
+  payload with no resource `host.name` and no relaying Agent's hostname. `statsd_in` and
   `datadog_in` decode a sender's own host (a DogStatsD `host:` tag or `h:` field, a log's
   `hostname`) to `host.name`, so only a sender that names none reaches this. An Agent does the
   same for a DogStatsD client that names no host.
@@ -157,7 +158,8 @@ Entry format and the other areas: [the known-gaps index](README.md).
   dropped flag, tags) or for the tracer payload fields no request header carries
   (`_logit.datadog.tracer.runtime_id`, `.env`, `.app_version`, `.tags`, `.container_debug`).
   Each is counted `logit.output.spans.degraded{reason="no_wire_form"}`. The payload's hostname,
-  the resource's `host.name`, goes out as every span's `host.name` tag instead.
+  the resource's `host.name`, goes out as every span's `host.name` tag instead, unless the span
+  carries its own `host.name`, which wins as any event attribute does, counted the same way.
   - **Consequence:** only a v0.7-origin batch loses anything, and the Agent derives a chunk's
     priority and origin from the root span again on its side.
   - **Workaround:** `version: v0.7`, which carries all of them.

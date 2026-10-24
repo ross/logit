@@ -527,7 +527,8 @@ distinguishable. The startup log records it as `hostname resolved`.
 
 `host.name` is the one host key every component shares. Each input that receives a sender's host
 writes it there, read by its protocol's own rules: `collectd_in`, `syslog_in`, `statsd_in`,
-`datadog_in`, and `splunk_hec_in`. A sink that writes a host reads `host.name`, and no protocol's
+`datadog_in`, `datadog_trace_in` (a `/v0.7/traces` or `/v0.6/stats` payload's hostname), and
+`splunk_hec_in`. A sink that writes a host reads `host.name`, and no protocol's
 host field. To set or override a host, stamp `host.name` with `set`.
 
 Every other host is yours to put in `host.name`: a parsed log field, a carbon path segment, a
@@ -3300,8 +3301,9 @@ socket (`receiver_socket`, `/var/run/datadog/apm.socket` by default), always pla
 every Agent accepts. It has no room for a trace chunk's fields (its sampling priority, origin, and
 tags) or for a tracer payload's environment, runtime ID, app version, and tags. Those are dropped
 and counted `logit.output.spans.degraded{reason="no_wire_form"}`; the payload's hostname, the
-resource's `host.name`, goes out as every span's `host.name` tag. A tracer that sent
-v0.4 never had them, so v0.4 relays its spans with nothing lost. If your tracers send `/v0.7/traces`,
+resource's `host.name`, goes out as every span's `host.name` tag, unless the span carries its own,
+which wins, counted the same way. A tracer that sent v0.4 never had them, so v0.4 relays its spans
+with nothing lost. If your tracers send `/v0.7/traces`,
 set `version: v0.7`, which carries all of them. The tracer's language, versions, container ID, and
 the rest of its request headers go out as the same headers under either version.
 

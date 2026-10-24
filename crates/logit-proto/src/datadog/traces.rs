@@ -737,6 +737,17 @@ impl DatadogEncoder {
         let mut fields = ChunkFields::default();
         let mut error_attr = None;
         let mut lost = 0;
+        // With no payload field, a resource `host.name` rides as a span tag, and a span's own
+        // `host.name` replaces it there as any event attribute does; the resource's is lost.
+        if !form.has_chunks() {
+            let resource_host = resource.attributes.get(ATTR_HOST_NAME);
+            let own = event.attributes.get(ATTR_HOST_NAME);
+            if matches!(resource_host, Some(v @ Value::Str(_)) if v.as_str() != Some(""))
+                && own.is_some_and(|own| Some(own) != resource_host)
+            {
+                lost += 1;
+            }
+        }
         for (sym, value) in logit_core::attrs::merged(resource, event) {
             let key = resolve(sym);
             if !is_carrier(key, value, event, form) {
@@ -1241,8 +1252,9 @@ mod tests {
         assert_eq!(deg("bad_attribute_type"), 1.0);
     }
 
-    /// The payload's `hostname` is the resource's `host.name` both ways, never the retired
-    /// `_logit.datadog.tracer.hostname` carrier, and never a span tag in a form that has the field.
+    /// The payload's `hostname` is the resource's `host.name` both ways, no
+    /// `_logit.datadog.tracer.hostname` attribute exists on any resource or event, and the host is
+    /// never a span tag in a form that has the field.
     #[test]
     fn the_tracer_hostname_is_the_resource_host_name() {
         let d = DatadogDecoder::new();
@@ -1274,6 +1286,19 @@ mod tests {
 
         let mut own = event;
         own.attributes.insert(ATTR_HOST_NAME, Value::str("span-host"));
+        let shadowed = EventBatch { events: vec![own.clone()], ..b.clone() };
+        for form in [Form::V04, Form::V05, Form::V07] {
+            let chunk = only_chunk(&e, &shadowed, form);
+            assert!(chunk.spans[0].meta.contains(&(ATTR_HOST_NAME.into(), "span-host".into())));
+        }
+        let lost = counted(&registry, "logit.output.spans.degraded", ("reason", "no_wire_form"));
+        assert_eq!(lost, 2.0, "v0.4 and v0.5 lose the resource's host to the span's, once each");
+        let mut same = own.clone();
+        same.attributes.insert(ATTR_HOST_NAME, Value::str("web-1"));
+        only_chunk(&e, &EventBatch { events: vec![same], ..b.clone() }, Form::V04);
+        let lost = counted(&registry, "logit.output.spans.degraded", ("reason", "no_wire_form"));
+        assert_eq!(lost, 0.0, "a span's host equal to the resource's loses nothing");
+
         let b = batch(Resource::default(), vec![own]);
         let chunk = only_chunk(&e, &b, Form::V07);
         assert!(chunk.spans[0].meta.contains(&(ATTR_HOST_NAME.into(), "span-host".into())));

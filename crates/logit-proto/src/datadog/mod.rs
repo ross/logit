@@ -533,7 +533,7 @@
 //! | links; events (a scalar or an array of scalars natively, anything else as a string) | `span_links`, `span_events` | `int_as_f64` for a `U64` event value above `i64::MAX`; `json_text`; `timestamp_range` for a negative event time |
 //! | `_logit.datadog.chunk.*` of a chunk's first span | v0.7/`AgentPayload` chunk `priority` (`-128` when absent), `origin`, `dropped_trace`, `tags` | -- |
 //! | batch resource `_logit.datadog.tracer.*` / `_logit.datadog.agent.*` | v0.7: one `TracerPayload`; `AgentPayload`: one payload around one `TracerPayload` | -- |
-//! | batch resource [`ATTR_HOST_NAME`], a non-empty `Str` | v0.7 and `AgentPayload`: the `TracerPayload`'s `hostname`, not a span tag; v0.4 and v0.5, which have no such field: a `meta` entry on every span, as any resource attribute. An event's own `host.name` is always a `meta` entry | -- |
+//! | batch resource [`ATTR_HOST_NAME`], a non-empty `Str` | v0.7 and `AgentPayload`: the `TracerPayload`'s `hostname`, not a span tag; v0.4 and v0.5, which have no such field: a `meta` entry on every span, as any resource attribute, unless the span carries its own `host.name`, which wins as any event attribute does. An event's own `host.name` is always a `meta` entry | v0.4/v0.5, a span whose own `host.name` differs: `degraded{reason="no_wire_form"}`, once per span |
 //! | no resource [`ATTR_HOST_NAME`] | `AgentPayload`: the default host ([`DatadogEncoder::with_default_host`]) as `hostname` when the resource has no [`RESOURCE_ATTR_AGENT_HOSTNAME`] either; with one, `""`, as that Agent sent it. v0.7: `""`, which the Agent behind `datadog_trace_out` fills from the root span's `_dd.hostname` as for any tracer | -- |
 //! | a carrier the form has no field for: `_logit.datadog.chunk.*` in v0.4/v0.5 (per span), `_logit.datadog.tracer.*` in v0.4/v0.5 and `_logit.datadog.agent.*` below `AgentPayload` (per body), `meta_struct`/links/events in v0.5 | dropped | `degraded{reason="no_wire_form"}`, one per item |
 //! | a tracer header's carrier ([`TRACER_STR_HEADERS`], [`TRACER_FLAG_HEADERS`], [`TRACER_U64_HEADERS`]) on the batch resource | never a span tag: a payload field where the form has one (v0.7's `language_name`, say), else dropped | `no_wire_form`, per body, except under [`DatadogEncoder::encode_tracer_api_traces`], whose caller sends each as its request header |
@@ -565,7 +565,8 @@
 //!    it (`priority` `-128` in no chunk, `nil` as the zero value);
 //! 6. a 128-bit trace id with no `_dd.p.tid` gains one on its chunk's first span;
 //! 7. across forms, a field the target has no home for is dropped and counted `no_wire_form`;
-//!    a resource `host.name` going to v0.4 or v0.5 lands in every span's `meta` instead;
+//!    a resource `host.name` going to v0.4 or v0.5 lands in every span's `meta` instead, unless
+//!    the span carries its own `host.name`, which wins as any event attribute does, counted;
 //! 8. `datadog_out` only: a `TracerPayload` with no `hostname` and no `AgentPayload` `hostName`
 //!    leaves with the process hostname (`datadog_out`'s default host) as its `hostname`.
 //!
@@ -1150,8 +1151,10 @@ impl DatadogEncoder {
     }
 
     /// The host written for a series, sketch, log, event, or service check that carries no host
-    /// of its own (the module doc's encode tables say which attributes count); `datadog_out`
-    /// passes the process hostname. Never replaces a host the event carries.
+    /// of its own, and for an `AgentPayload`'s or intake `StatsPayload`'s tracer payload with no
+    /// resource `host.name` and no relaying Agent's hostname (the module doc's encode tables say
+    /// which attributes count); `datadog_out` passes the process hostname. Never replaces a host
+    /// the event carries.
     pub fn with_default_host(mut self, host: Option<Arc<str>>) -> Self {
         self.default_host = host;
         self
