@@ -48,8 +48,14 @@
 //! the raw attribute keeps a relay byte-faithful; [`syslog_severity_of`] is the fallback for a log
 //! record that didn't come from `syslog_in`.
 //!
-//! **PROCID** (`syslog.pid`) is a `Value::U64`, or a `Value::Str` when the origin's PROCID wasn't
-//! numeric; [`resolve_pid`] returns the [`Pid`] enum covering both. On a 5424 output a `Pid::Str`
+//! **PROCID** is the standard `process.pid` on the event, else on the batch resource, rendered as
+//! decimal; else the `syslog.pid` string `syslog_in` leaves for a PROCID that wasn't canonical
+//! decimal. [`resolve_pid`] returns the [`Pid`] enum covering both. A `process.pid` renders when
+//! it is an `I64` or `U64` of 0 or more, or a string of ASCII digits (written as the string is,
+//! so `007` stays `007`); any other value is omitted and counted
+//! ([`EncodeStats::omitted_invalid_pid`]), and the lookup moves on to the next scope. A
+//! `syslog.pid` beside a `process.pid` that renders loses to it and is counted
+//! ([`EncodeStats::omitted_pid_beside_process_pid`]). On a 5424 output a `Pid::Str`
 //! is sanitized with [`sanitize_5424_field`] and capped at RFC 5424's 128-byte PROCID maximum. On
 //! a 3164 output it renders as `tag[pid]` after [`sanitize_3164_token`], under the same 128-byte
 //! cap for consistency (3164 defines none).
@@ -194,7 +200,7 @@ use crate::human::render_value_inline;
 use crate::stream::{Dial, PooledStream, Target, TlsTarget};
 use crate::Output;
 use anyhow::Context;
-use logit_core::attrs::HOST_NAME;
+use logit_core::attrs::{HOST_NAME, PROCESS_PID};
 use logit_core::time::{format_rfc3339_utc, write_rfc3164_utc};
 use logit_core::{interner, AttrMap, Diagnostics, Event, EventBatch, Severity, Telemetry, Value};
 use logit_pipeline::{BatchContext, DeliveryPosture, SeqId};
@@ -243,6 +249,10 @@ pub struct EncodeStats {
     /// Opt-in `structured_data` SD-ELEMENTs omitted because the event's `syslog.sd` already
     /// carries their SD-ID.
     pub omitted_sd_id_collision: usize,
+    /// A `process.pid` that is neither a non-negative integer nor a string of digits.
+    pub omitted_invalid_pid: usize,
+    /// A `syslog.pid` left off because a `process.pid` supplied PROCID.
+    pub omitted_pid_beside_process_pid: usize,
 }
 
 /// The validated `sd_id` behind [`SyslogEncoder::with_structured_data`].
@@ -388,7 +398,7 @@ impl SyslogEncoder {
             .or_else(|| resolve_str(resource, HOST_NAME))
             .or(self.default_hostname.as_deref());
         let app_name = resolve_str(attrs, "syslog.tag").or(self.default_app_name.as_deref());
-        let pid = resolve_pid(attrs);
+        let pid = resolve_pid(attrs, resource, stats);
         let msgid = resolve_str(attrs, "syslog.msgid");
 
         match self.format {
@@ -569,19 +579,54 @@ fn resolve_str<'a>(attrs: &'a AttrMap, key: &str) -> Option<&'a str> {
     attrs.get(key).and_then(Value::as_str).filter(|s| !s.is_empty())
 }
 
-/// `syslog.pid` in either shape the decoder leaves it in (module doc's "PROCID" note).
+/// A PROCID: a decimal number, or the text of a non-numeric one (module doc's "PROCID" note).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Pid<'a> {
     U64(u64),
     Str(&'a str),
 }
 
-fn resolve_pid(attrs: &AttrMap) -> Option<Pid<'_>> {
-    match attrs.get("syslog.pid") {
+/// `process.pid` on `attrs` as a [`Pid`]; `Err` for a present value that has no PROCID form.
+/// An empty string is absent, as for the other header fields.
+fn process_pid_of(attrs: &AttrMap) -> Result<Option<Pid<'_>>, ()> {
+    match attrs.get(PROCESS_PID) {
+        None => Ok(None),
+        Some(Value::I64(n)) if *n >= 0 => Ok(Some(Pid::U64(*n as u64))),
+        Some(Value::U64(n)) => Ok(Some(Pid::U64(*n))),
+        Some(Value::Str(_)) => match resolve_str(attrs, PROCESS_PID) {
+            None => Ok(None),
+            Some(s) if s.bytes().all(|b| b.is_ascii_digit()) => Ok(Some(Pid::Str(s))),
+            Some(_) => Err(()),
+        },
+        Some(_) => Err(()),
+    }
+}
+
+fn resolve_pid<'a>(
+    attrs: &'a AttrMap,
+    resource: &'a AttrMap,
+    stats: &mut EncodeStats,
+) -> Option<Pid<'a>> {
+    let mut process_pid = None;
+    for scope in [attrs, resource] {
+        match process_pid_of(scope) {
+            Ok(Some(pid)) => {
+                process_pid = Some(pid);
+                break;
+            }
+            Ok(None) => {}
+            Err(()) => stats.omitted_invalid_pid += 1,
+        }
+    }
+    let syslog_pid = match attrs.get("syslog.pid") {
         Some(Value::U64(n)) => Some(Pid::U64(*n)),
         Some(Value::Str(_)) => resolve_str(attrs, "syslog.pid").map(Pid::Str),
         _ => None,
+    };
+    if process_pid.is_some() && syslog_pid.is_some() {
+        stats.omitted_pid_beside_process_pid += 1;
     }
+    process_pid.or(syslog_pid)
 }
 
 /// `HEADER SP STRUCTURED-DATA`. The caller appends `[SP MSG]` only for a non-empty MSG, per the
@@ -871,9 +916,13 @@ fn write_structured_data(
         }
     }
     if let Some(cfg) = structured_data {
-        // `host.name` is HOSTNAME's key, so it's a header field like `syslog.*`, not an SD-PARAM.
+        // `host.name` and `process.pid` are HOSTNAME's and PROCID's keys, so they're header fields like
+        // `syslog.*`, not SD-PARAMs.
         let is_extra = |key: &str| {
-            !key.starts_with("syslog.") && key != HOST_NAME && !crate::attrs::is_private(key)
+            !key.starts_with("syslog.")
+                && key != HOST_NAME
+                && key != PROCESS_PID
+                && !crate::attrs::is_private(key)
         };
         // Checked before the collision, so an event with only `syslog.*` and private attributes,
         // which would emit no opt-in element anyway, isn't counted as a drop.
@@ -1274,6 +1323,16 @@ fn report_encode_stats(telemetry: &Telemetry, stats: &EncodeStats) {
         stats.omitted_sd_id_collision as f64,
         &[("reason", "sd_id_collision")],
     );
+    telemetry.count(
+        "logit.output.attributes.omitted",
+        stats.omitted_invalid_pid as f64,
+        &[("reason", "invalid_pid")],
+    );
+    telemetry.count(
+        "logit.output.attributes.omitted",
+        stats.omitted_pid_beside_process_pid as f64,
+        &[("reason", "pid_beside_process_pid")],
+    );
 }
 
 impl SyslogOutput {
@@ -1527,7 +1586,7 @@ mod tests {
         let mut attrs = AttrMap::new();
         attrs.insert(HOST_NAME, Value::str("myhost"));
         attrs.insert("syslog.tag", Value::str("myapp"));
-        attrs.insert("syslog.pid", Value::U64(1234));
+        attrs.insert("process.pid", Value::I64(1234));
         let event = Event::log(
             0,
             attrs,
@@ -2830,6 +2889,106 @@ mod tests {
         assert_eq!(msgs[0], "<134>Jan  1 00:00:00 h app[worker-1]: hi");
     }
 
+    /// Encodes one event under `format` with `resource_attrs` on the batch resource, returning the
+    /// message and the stats.
+    fn encode_pid(
+        format: Format,
+        resource_attrs: AttrMap,
+        event_attrs: AttrMap,
+    ) -> (String, EncodeStats) {
+        let mut encoder = SyslogEncoder::new(format, 16);
+        let batch = EventBatch {
+            resource: Arc::new(Resource { attributes: resource_attrs, ..Resource::default() }),
+            scope: None,
+            events: vec![log_event_with_attrs(0, Value::str("x"), None, event_attrs)],
+        };
+        let mut out = MessageBuf::default();
+        let stats = encoder.encode_into(&batch, &mut out);
+        let msg = String::from_utf8_lossy(out.iter().next().unwrap()).into_owned();
+        (msg, stats)
+    }
+
+    fn pid_attrs(value: Value) -> AttrMap {
+        let mut attrs = AttrMap::new();
+        attrs.insert(PROCESS_PID, value);
+        attrs
+    }
+
+    #[test]
+    fn process_pid_on_the_event_renders_as_procid_on_5424() {
+        let (msg, stats) = encode_pid(Format::Rfc5424, AttrMap::new(), pid_attrs(Value::I64(4821)));
+        assert_eq!(msg.split(' ').nth(4), Some("4821"), "{msg}");
+        assert_eq!(stats, EncodeStats::default());
+    }
+
+    #[test]
+    fn process_pid_on_the_resource_renders_when_the_event_has_none() {
+        let (msg, _) = encode_pid(Format::Rfc5424, pid_attrs(Value::I64(77)), AttrMap::new());
+        assert_eq!(msg.split(' ').nth(4), Some("77"), "{msg}");
+
+        let mut event_attrs = pid_attrs(Value::I64(5));
+        event_attrs.insert("syslog.tag", Value::str("app"));
+        let (msg, _) = encode_pid(Format::Rfc3164, pid_attrs(Value::I64(77)), event_attrs);
+        assert!(msg.contains("app[5]:"), "the event's process.pid outranks the resource's: {msg}");
+    }
+
+    #[test]
+    fn a_syslog_pid_beside_a_process_pid_loses_and_is_counted() {
+        let mut attrs = pid_attrs(Value::I64(1234));
+        attrs.insert("syslog.pid", Value::str("worker-1"));
+        let (msg, stats) = encode_pid(Format::Rfc5424, AttrMap::new(), attrs);
+        assert_eq!(msg.split(' ').nth(4), Some("1234"), "{msg}");
+        assert_eq!(stats.omitted_pid_beside_process_pid, 1);
+        assert_eq!(stats.omitted_invalid_pid, 0);
+    }
+
+    #[test]
+    fn a_process_pid_with_no_procid_form_is_omitted_counted_and_falls_through() {
+        for value in
+            [Value::I64(-1), Value::str("12a"), Value::Bool(true), Value::Null, Value::F64(1.5)]
+        {
+            let (msg, stats) =
+                encode_pid(Format::Rfc5424, AttrMap::new(), pid_attrs(value.clone()));
+            assert_eq!(msg.split(' ').nth(4), Some("-"), "{value:?}: {msg}");
+            assert_eq!(stats.omitted_invalid_pid, 1, "{value:?}");
+        }
+
+        // An invalid event value doesn't hide the resource's valid one or the legacy string.
+        let (msg, stats) =
+            encode_pid(Format::Rfc5424, pid_attrs(Value::I64(9)), pid_attrs(Value::I64(-1)));
+        assert_eq!(msg.split(' ').nth(4), Some("9"), "{msg}");
+        assert_eq!(stats.omitted_invalid_pid, 1);
+        let mut attrs = pid_attrs(Value::str("x y"));
+        attrs.insert("syslog.pid", Value::str("worker-1"));
+        let (msg, stats) = encode_pid(Format::Rfc5424, AttrMap::new(), attrs);
+        assert_eq!(msg.split(' ').nth(4), Some("worker-1"), "{msg}");
+        assert_eq!(stats.omitted_invalid_pid, 1);
+        assert_eq!(stats.omitted_pid_beside_process_pid, 0);
+    }
+
+    #[test]
+    fn a_digit_string_and_an_unsigned_process_pid_render_as_written() {
+        let (msg, stats) =
+            encode_pid(Format::Rfc5424, AttrMap::new(), pid_attrs(Value::str("007")));
+        assert_eq!(msg.split(' ').nth(4), Some("007"), "{msg}");
+        assert_eq!(stats, EncodeStats::default());
+        let (msg, _) = encode_pid(Format::Rfc5424, AttrMap::new(), pid_attrs(Value::U64(42)));
+        assert_eq!(msg.split(' ').nth(4), Some("42"), "{msg}");
+    }
+
+    /// `process.pid` is PROCID's key, a header field, so the opt-in element doesn't repeat it.
+    #[test]
+    fn process_pid_is_not_an_opt_in_structured_data_param() {
+        let mut encoder = SyslogEncoder::new(Format::Rfc5424, 16)
+            .with_structured_data("myapp@12345")
+            .expect("valid sd_id");
+        let mut attrs = pid_attrs(Value::I64(1));
+        attrs.insert("k", Value::str("v"));
+        let event = log_event_with_attrs(0, Value::str("x"), None, attrs);
+        let (msgs, _) = encode_with(&mut encoder, vec![event]);
+        assert!(msgs[0].contains(r#"[myapp@12345 k="v"]"#), "{}", msgs[0]);
+    }
+
     // -- STRUCTURED-DATA (module doc's "STRUCTURED-DATA" section) ----------------------------
 
     #[test]
@@ -3234,6 +3393,8 @@ mod tests {
             omitted_invalid_sd_name: 1,
             omitted_sd_not_map: 1,
             omitted_sd_id_collision: 1,
+            omitted_invalid_pid: 1,
+            omitted_pid_beside_process_pid: 1,
             ..EncodeStats::default()
         };
         report_encode_stats(&telemetry, &stats);
@@ -3254,6 +3415,10 @@ mod tests {
         for reason in ["invalid_sd_name", "not_a_map", "sd_id_collision"] {
             assert_eq!(counted("logit.output.structured_data.omitted", reason), 1.0, "{reason}");
             assert_eq!(counted("logit.output.structured_data.dropped", reason), 0.0, "{reason}");
+        }
+        for reason in ["invalid_pid", "pid_beside_process_pid"] {
+            assert_eq!(counted("logit.output.attributes.omitted", reason), 1.0, "{reason}");
+            assert_eq!(counted("logit.output.attributes.dropped", reason), 0.0, "{reason}");
         }
     }
 

@@ -87,7 +87,8 @@ These stay public:
 - `syslog.timestamp`: the sender's own stamp. `Event.timestamp` is receipt time until a
   `timestamp` component resolves it, so the attribute duplicates nothing, and an operator names it
   in that component's config.
-- `syslog.tag`, `syslog.pid`, `syslog.msgid`, `syslog.sd`, and `syslog.facility`: header facts
+- `syslog.tag`, `syslog.pid` (a PROCID that isn't canonical decimal), `syslog.msgid`, `syslog.sd`,
+  and `syslog.facility`: header facts
   with no typed home that any destination can use. HOSTNAME rides on the standard `host.name`
   ([ADR `syslog-output`](syslog-output.md)'s "Amendment: HOSTNAME is `host.name` (2026-10-23)").
 - `com.splunk.*` and `otel.log.*`: the OpenTelemetry `splunk_hec` exporter's public vocabulary,

@@ -2142,6 +2142,10 @@ itself. The sink emits each once per batch, however many attempts the runtime ma
   isn't a valid RFC 5424 `SD-NAME` (an invalid SD-ID omits the element, an invalid PARAM-NAME that
   param); a `syslog.sd` element whose value isn't a map of PARAM-NAME to value; the opt-in element
   colliding with an SD-ID the event already carries.
+- `logit.output.attributes.omitted{reason="invalid_pid"|"pid_beside_process_pid"}`: a PROCID
+  source left off a message that is still sent. A `process.pid` with no PROCID form (a negative
+  integer, or a value that isn't an integer or a string of digits); a `syslog.pid` beside a
+  `process.pid` that renders, which wins.
 - `logit.output.reconnects` (count, TCP only): every connect *after* the first. A climbing count in
   steady state means the peer or the network, not this sink, is unstable. Counted on plaintext and
   TLS (RFC 5425) connections alike, because both go through the pooled-stream driver
