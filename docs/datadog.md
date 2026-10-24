@@ -355,6 +355,22 @@ cgroup inode (`|c:in-<inode>`, what most clients send), which only the sender's 
 To get the container's tags, send DogStatsD through a local Agent with `statsd_out`, which writes
 `|c:` back in the form the Agent reads.
 
+### A trace's `env` and `version` are `deployment.environment.name` and `service.version`
+
+`datadog_in` and `datadog_trace_in` write a span's `env` and `version` meta as
+`deployment.environment.name` and `service.version` on its event, and a tracer payload's `env`
+and `app_version`, or a stats payload's `Env` and `Version`, as the same keys on the batch
+resource, with a stats payload's `Service` as the resource's `service.name`. `datadog_out` and
+`datadog_trace_out` write them back where they came from: the event's as span meta, the
+resource's in the payload. A `version: v0.4` `datadog_trace_out` has no payload field, so the
+resource's values go out as every span's `env` and `version` meta, and a span's own value wins,
+counted `logit.output.spans.degraded{reason="no_wire_form"}`.
+
+So an OTLP span's `deployment.environment.name` reaches Datadog as its `env`, and a transform
+that reads or sets a trace's environment names the key, not `env` or a `_logit.` carrier. A bare `env` or `version`
+attribute beside the key that fills a span's `env` or `version` is left off, counted
+`logit.output.tags.omitted{reason="unrepresentable"}`.
+
 ### `at_least_once` can duplicate a request, and everything but series is stored twice
 
 The default posture is `at_least_once`, so a `5xx` or a timeout is retried. One batch goes out

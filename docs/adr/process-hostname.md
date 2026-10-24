@@ -263,8 +263,10 @@ The common keys today, and who writes each:
 | Key | Written by, from |
 |---|---|
 | `host.name` | `collectd_in` from each value list's host part, on the event; `syslog_in` from HOSTNAME, on the event; `statsd_in` and `datadog_in` from the wire hosts above, on the event; `datadog_in`'s traces and stats routes and `datadog_trace_in` from each tracer or stats payload's hostname, on the resource; `splunk_hec_in` from each object's `host`, on the resource; `docker_in` under `host_name: container` from the container's `Config.Hostname`, on the resource, and otherwise not at all; `internal` from the process hostname, on the resource; `otlp_in` passes the sender's resource and record attributes through, which already use the standard key |
-| `service.name` | `internal`, on the resource; `datadog_in` (its traces route) and `datadog_trace_in` from each span's `service`, on the span's event, and their APM stats routes (`datadog_in`'s stats route, `datadog_trace_in`'s `/v0.6/stats`) from each `ClientGroupedStats`' `Service`, on the group's event; `otlp_in` passes it through; otherwise an operator's `set`. A Datadog log's `service` stays the attribute `service`, which `datadog_out` writes back as the log's `service` |
+| `service.name` | `internal`, on the resource; `datadog_in` (its traces route) and `datadog_trace_in` from each span's `service`, on the span's event, and their APM stats routes (`datadog_in`'s stats route, `datadog_trace_in`'s `/v0.6/stats`) from each `ClientGroupedStats`' `Service`, on the group's event, and from the `ClientStatsPayload`'s `Service`, on the resource; `otlp_in` passes it through; otherwise an operator's `set`. A Datadog log's `service` stays the attribute `service`, which `datadog_out` writes back as the log's `service` |
 | `container.id` | `statsd_in` from a DogStatsD line's `\|c:` container id, on the event; `datadog_in`'s traces and stats routes and `datadog_trace_in` from each tracer or stats payload's container id or the `Datadog-Container-ID` header, on the resource; `docker_in` from the container's directory name, on the resource; `otlp_in` passes it through ("Amendment: container identity (2026-10-24)") |
+| `deployment.environment.name` | `datadog_in`'s traces route and `datadog_trace_in` from a span's `env` meta, on the event, and from a `TracerPayload`'s `env`, on the resource; their APM stats routes from a `ClientStatsPayload`'s `Env`, on the resource; `otlp_in` passes it through ("Amendment: a trace's environment, version, and service (2026-10-24)") |
+| `service.version` | the same routes from a span's `version` meta, on the event, and from a `TracerPayload`'s `app_version` or a `ClientStatsPayload`'s `Version`, on the resource; `otlp_in` passes it through |
 | `container.image.tags` | `docker_in` from the image reference's tag, on the resource; `datadog_in`'s stats route and `datadog_trace_in`'s `/v0.6/stats` from a `ClientStatsPayload`'s `ImageTag`, on the resource; each a one-element array; `otlp_in` passes it through |
 | `network.peer.*`, `client.*` | every network listener but `logit_in`, opt-in ([ADR `listener-peer-address`](listener-peer-address.md)) |
 | the `_logit.metrics.*` flags | decoders, where the flag says the whole fact ([ADR `metric-flags`](metric-flags.md)) |
@@ -346,3 +348,33 @@ already in a log's `ddtags` is omitted, counted `{reason="reserved_key"}`.
 container identity is `container.id` (2026-10-24)" has the Agent and exporter sources, and
 [ADR `statsd-output`](statsd-output.md)'s "Amendment (2026-10-24): `|c:` is the Agent's local
 data" the DogStatsD relay's normalization.
+
+## Amendment: a trace's environment, version, and service (2026-10-24)
+
+A Datadog trace's environment and version, and an APM stats payload's service, are the standard
+keys, by the rule `host.name` and `container.id` follow: from a field the protocol defines, at the
+scope where the value is identity, with no carrier left for the wire form.
+
+| Source | Wire form | Writes |
+|---|---|---|
+| `datadog_in` (traces), `datadog_trace_in` | a span's `env` and `version` meta | `deployment.environment.name`, `service.version` on the span's event |
+| the same | a `TracerPayload`'s `env` and `app_version` | `deployment.environment.name`, `service.version` on the resource |
+| `datadog_in` (stats), `datadog_trace_in` (`/v0.6/stats`) | a `ClientStatsPayload`'s `Env`, `Version`, and `Service` | `deployment.environment.name`, `service.version`, `service.name` on the resource |
+
+A protocol's own form beats a sender's tag: a span key spelled `deployment.environment.name` or
+`service.version` beside that key's `env` or `version` meta is omitted, counted
+`logit.input.tags.omitted{reason="reserved_key"}`. `_logit.datadog.tracer.env`,
+`_logit.datadog.tracer.app_version`, and `_logit.datadog.stats.service` no longer exist. An
+`AgentPayload`'s `env` and a `StatsPayload`'s `AgentEnv` stay `_logit.datadog.agent.env`: they're
+the relaying Agent's.
+
+| Sink | Environment, version, and service |
+|---|---|
+| `datadog_out` | on a span, the event's keys as `env` and `version` meta; the resource's as the `TracerPayload`'s `env` and `app_version`; on stats, the resource's as `ClientStatsPayload`'s `Env`, `Version`, and `Service`, and a group's `Service` from its event's `service.name` alone |
+| `datadog_trace_out` | the same, under `version: v0.7` and on `/v0.6/stats`; under `version: v0.4`, which has no payload field, the resource's as every span's `env` and `version` meta, a span's own value winning, counted `logit.output.spans.degraded{reason="no_wire_form"}` |
+| `otlp_out`, `splunk_hec_out`, and the other sinks | the keys as ordinary attributes |
+
+A bare `env` or `version` attribute the key displaces from a span's `meta` is omitted, counted
+`logit.output.tags.omitted{reason="unrepresentable"}`.
+[ADR `datadog-agent-and-intake-relay`](datadog-agent-and-intake-relay.md)'s "Amendment: a
+trace's environment and version are the common keys (2026-10-24)" has the Agent sources.

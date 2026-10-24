@@ -129,6 +129,14 @@ resource; a sink reads the event, else the resource, and writes its own wire's f
 ([ADR `process-hostname`](../adr/process-hostname.md)'s "Amendment: container identity
 (2026-10-24)").
 
+**`deployment.environment.name` and `service.version` are the standard environment and version
+keys** (`logit_core::attrs::DEPLOYMENT_ENVIRONMENT_NAME` and `SERVICE_VERSION`, the OpenTelemetry
+names, each a `Str`). They follow `host.name`'s rule: `datadog_in` and `datadog_trace_in` write a
+span's `env` and `version` meta on its event, and a tracer or stats payload's environment and
+version on the batch resource, beside a stats payload's `Service` as the resource's
+`service.name` ([ADR `process-hostname`](../adr/process-hostname.md)'s "Amendment: a trace's
+environment, version, and service (2026-10-24)").
+
 **The private namespace `_logit.`: a carrier lives under `_logit.<protocol>.`**
 (`_logit.statsd.type`). A carrier is a protocol's raw wire spelling of something the model
 normalizes, or a payload field only that protocol's family reads. The tables below list every

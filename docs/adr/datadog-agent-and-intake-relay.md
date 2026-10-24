@@ -821,3 +821,54 @@ The like pairs stay fixed points: a tracer's container id relays through `contai
 ways, and `datadog_in` reads a series' `container_id:` tag back as an attribute of that name,
 which `datadog_out` writes back unchanged. `datadog_out` writes no `container.id` it wasn't given,
 so the Datadog-to-Datadog relay sends nothing new.
+
+## Amendment: a trace's environment and version are the common keys (2026-10-24)
+
+A span's `env` and `version` meta, a `TracerPayload`'s `env` and `app_version`, and a
+`ClientStatsPayload`'s `Env`, `Version`, and `Service` are the standard
+`deployment.environment.name`, `service.version`, and `service.name`
+([ADR `process-hostname`](process-hostname.md)'s "Amendment: a trace's environment, version, and
+service (2026-10-24)" has the tables). The carriers `_logit.datadog.tracer.env`,
+`_logit.datadog.tracer.app_version`, and `_logit.datadog.stats.service` are gone. What
+datadog-agent 7.83.3 does with each form decided the mapping:
+
+- **The span's own meta is the identity.** `pkg/trace/agent/agent.go`, `setPayloadAttributes`,
+  fills an empty `TracerPayload.Env` from `traceutil.GetEnv` (`pkg/trace/traceutil/trace.go`:
+  the root span's `env` meta, else the first other span's in the chunk) and an empty
+  `AppVersion` from `version.GetAppVersionFromTrace` (`pkg/trace/version/version.go`, the same
+  search for `version`). It never fills them from the Agent's own `env`: `Process` only
+  normalizes `Env`. So the payload field and the span meta name the same fact at two scopes, and
+  each decodes at its own: the meta on the span's event, the field on the batch resource.
+  `datadog_trace_in` doesn't apply `setPayloadAttributes`, as for the hostname: that's Agent
+  processing, left to the Agent behind `datadog_trace_out`.
+- **Stats.** `processStats` in `agent.go` fills an empty `ClientStatsPayload.Env` from the
+  Agent's `DefaultEnv`; a tracer's own `Env`, `Version`, and `Service` pass through. Each decodes
+  onto the batch resource, as the payload's `Hostname` does. A group's `Service` stays the group
+  event's `service.name`, and on encode a group reads `service.name` off its event alone, since
+  the resource's is the payload's `Service`: a group that left `Service` empty relays empty.
+- **The OTLP receiver's spellings.** `pkg/trace/api/otlp.go`, `receiveResourceSpansV1`, fills
+  `TracerPayload.Env` from the resource's `deployment.environment.name`, else
+  `deployment.environment`, else `DefaultEnv` (`receiveResourceSpansV2` reads the same concept
+  through `semantics.ConceptDeploymentEnv`), and `convertSpan` writes a span's `env` meta from
+  its own `deployment.environment.name` and its `version` meta from the resource's
+  `service.version`, each only where the span has none. It sets no `AppVersion`;
+  `setPayloadAttributes` then fills it from that `version` meta. So `env` and `version` are
+  Datadog's spellings of the two keys, and `datadog_out` and `datadog_trace_out` write each in
+  its own field: the event's as span meta, the resource's as the payload's `env` and
+  `app_version` (v0.7, `AgentPayload`) or, in v0.4 and v0.5, which have no payload field, as
+  every span's `env` and `version` meta, which a span's own value replaces, counted
+  `logit.output.spans.degraded{reason="no_wire_form"}`, as `host.name` does. Unlike the OTLP
+  receiver, a resource `service.version` leaves as `app_version`, not also as span meta, on a
+  form with a payload field.
+
+Two collisions, each by the stream's rule. On decode, a span key spelled
+`deployment.environment.name` or `service.version` beside that key's `meta` name loses to the
+meta, counted `logit.input.tags.omitted{reason="reserved_key"}`; the OTLP receiver keeps both,
+but one key has one value here. With no `meta` name beside it, the key spelling lands as the key
+and leaves as `env` or `version`, a named normalization of the traces pair. On encode, a bare
+`env` or `version` attribute the key displaces from `meta` is omitted, counted
+`logit.output.tags.omitted{reason="unrepresentable"}`. A `meta` entry and a `metrics` entry of
+one name each keep their value now, since the `meta` one is a common key and the other isn't.
+
+The like pairs stay fixed points with and without each field: a span's meta relays through the
+event's key and a payload's field through the resource's.
