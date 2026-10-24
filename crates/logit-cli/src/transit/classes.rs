@@ -2724,11 +2724,11 @@ mod tests {
         };
         assert_eq!(feature(&both[0]).as_deref(), Some("log_service"));
         assert_eq!(feature(&alone[0]).as_deref(), Some("log_service_field"));
-        // On a metric, `service` is an ordinary tag.
+        // On a metric, `service` is the tag `service.name` also writes.
         let gauge = recs(&[
             r#"{{T},"metrics":[{"name":"g","kind":"gauge","value":1.0}],"attributes":{"service.name":"x","service":"s"}}"#,
         ]);
-        assert_eq!(feature(&gauge[0]).as_deref(), Some("string_value"));
+        assert_eq!(feature(&gauge[0]).as_deref(), Some("service_tag_beside_key"));
     }
 
     /// A `host` attribute is an ordinary tag at `datadog_out`, read back as `host`, and the
