@@ -387,7 +387,9 @@ differently from a comma list:
   which no neutral key names, so it will decode to the carrier `_logit.statsd.cgroup_inode`.
 - In a comma list, the Agent reads only `ci-` and `in-` items, so `statsd_in` will too: a `ci-`
   item is `container.id`, an `in-` item is the carrier, and any other item will be dropped,
-  counted `reason="malformed"`, the reason the decoder gives input it can't read.
+  counted `logit.input.fields.dropped{reason="malformed"}`. It's loss, and none of the decoder's
+  counters counts part of a line, so W1 will add this per-field counter and document it in
+  [internal-telemetry.md](../design/internal-telemetry.md).
 
 `statsd_out` will write a container id alone as `|c:<id>`, bare, and with the carrier as
 `|c:ci-<id>,in-<inode>`, the only list form in which the Agent reads the id; the carrier alone
