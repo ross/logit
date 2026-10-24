@@ -8,6 +8,7 @@
     {"sink":"influxdb_out","row":"attributes/number_value","cell":0,"observed":["normalized"]},
     {"sink":"influxdb_out","row":"attributes/resource_attribute","cell":0,"observed":["normalized"]},
     {"sink":"influxdb_out","row":"attributes/scope","cell":0,"observed":["lost"]},
+    {"sink":"influxdb_out","row":"attributes/service_tag","cell":0,"observed":["exact"]},
     {"sink":"influxdb_out","row":"attributes/string_value","cell":0,"observed":["exact"]},
     {"sink":"influxdb_out","row":"exponential_histogram/cumulative","cell":0,"observed":["skipped"]},
     {"sink":"influxdb_out","row":"exponential_histogram/delta","cell":0,"observed":["skipped"]},

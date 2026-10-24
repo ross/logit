@@ -127,13 +127,25 @@
 //! wire tag; a bare `host` (`Bool(true)`) isn't a `host:` tag and stays. The `host:` tag's value is
 //! sanitized as any tag value is, so a check with trailing metric lines carries `|h:web 1` on its
 //! own line and `#host:web_1` on the others, counted `tags.normalized{reason="value_sanitized"}`
-//! for those; an event or a check with none counts nothing for `|h:`. Otherwise a `host` attribute
+//! for those. The `|h:` field rewrites only `|` and control characters (`|h:web_1` for `web|1`),
+//! counted the same way once per line; `web 1` is written as is and counts nothing. Otherwise a `host` attribute
 //! is an ordinary tag, `host:<v>`, which the Agent reads as the host: `statsd_in` never decodes
 //! one, so it's the operator's own, from a `set`, a script, or another protocol. Any other
 //! `host.name` (empty, or not a string) is an ordinary tag in its place, and `Format::Statsd`
 //! writes no tags at all. `host.name` is the standard host key, which a source fills from its own
 //! wire host and every sink ranks first (`docs/adr/process-hostname.md`'s "Amendment: a source
 //! fills the common keys (2026-10-23)").
+//!
+//! ## Service identity
+//!
+//! Under `Format::DogStatsd`, `deployment.environment.name`, `service.version`, and
+//! `service.name` (the event's, else the resource's) leave as Datadog's Unified Service Tagging
+//! tags, `env:`, `version:`, and `service:`, one per element of an `Array`; `statsd_in` reads each
+//! back as the key. A bare `Bool(true)` among a key's values names no value, so it leaves as a
+//! bare token under the key's own name. Beside a key that writes a valued tag, a valued `env`, `version`, or `service` attribute would be a second tag for the same key,
+//! so it's omitted, counted `tags.omitted{reason="unrepresentable"}` once per wire tag; a bare one
+//! (`Bool(true)`) names no value and stays. Without the key, an `env`, `version`, or `service`
+//! attribute is an ordinary tag.
 //!
 //! ## Metric-kind coverage
 //!
@@ -298,7 +310,13 @@
 //! | `attributes/host_beside_host_name`, under `format: statsd` | lost | `logit.output.tags.omitted{reason=dialect}` | Plain statsd has no tags; each is counted once per wire tag. |
 //! | `attributes/host_beside_host_name`, otherwise | lost | `logit.output.tags.omitted{reason=unrepresentable}` | A non-empty `host.name` or the hostless mark is the line's own host, so a `host` beside it, a second `host:` tag the Agent would consume, is left off, counted once per wire tag. |
 //! | `attributes/container_id`, under `format: statsd` | lost | `logit.output.fields.omitted{reason=dialect}` | Plain statsd has no `\|c:` segment, so the container id is omitted, counted once per line. |
-//! | `attributes/container_id`, otherwise | exact | -- | The line's `\|c:` segment, never a tag, which statsd_in reads back as `container.id`. |
+//! | `attributes/container_id`, otherwise | exact | -- | A non-empty one is the line's `\|c:` segment, never a tag, and an empty one an ordinary tag; statsd_in reads either back as `container.id`. |
+//! | `attributes/service_identity`, under `format: statsd` | lost | `logit.output.tags.omitted{reason=dialect}` | Plain statsd has no tags; each is counted once per wire tag. |
+//! | `attributes/service_identity`, otherwise | exact | -- | `deployment.environment.name`, `service.version`, and `service.name` are Datadog's `env:`, `version:`, and `service:` tags, which statsd_in reads back as the key. |
+//! | `attributes/service_tag`, under `format: statsd` | lost | `logit.output.tags.omitted{reason=dialect}` | Plain statsd has no tags; each is counted once per wire tag. |
+//! | `attributes/service_tag`, otherwise | normalized | `respelled` | A valued `env`, `version`, or `service` is the DogStatsD tag of that name, which statsd_in reads back as `deployment.environment.name`, `service.version`, or `service.name`. |
+//! | `attributes/service_tag_beside_key`, under `format: statsd` | lost | `logit.output.tags.omitted{reason=dialect}` | Plain statsd has no tags; each is counted once per wire tag. |
+//! | `attributes/service_tag_beside_key`, otherwise | lost | `logit.output.tags.omitted{reason=unrepresentable}` | Beside its standard key, which leaves as the same tag, a valued `env`, `version`, or `service` would be a second value for the key, so it's left off, counted once per wire tag. |
 //! | `attributes/bool_value`, under `format: statsd` | lost | `logit.output.tags.omitted{reason=dialect}` | Plain statsd has no tags. |
 //! | `attributes/bool_value`, otherwise | normalized | `bool_tag` | `true` is a bare tag and reads back `true`; `false` is `key:false` and reads back as the string. |
 //! | `attributes/number_value`, under `format: statsd` | lost | `logit.output.tags.omitted{reason=dialect}` | Plain statsd has no tags. |
@@ -447,15 +465,16 @@
 //! `_logit.statsd.cgroup_inode` carrier:
 //!
 //! - a container id alone is `|c:<id>`, bare, the form every Agent version reads, so a received
-//!   `ci-<id>` or `cid-<id>` relays as `<id>`;
+//!   `ci-<id>` or `cid-<id>` relays as `<id>`; an id that itself starts with `ci-`, `cid-`, or
+//!   `in-` is `|c:ci-<id>`, since the Agent strips one `ci-` from a single item and would read
+//!   the bare form as a prefix;
 //! - an inode alone is `|c:in-<inode>`;
 //! - both are the list `|c:ci-<id>,in-<inode>`, since the Agent reads only prefixed items in a
 //!   list.
 //!
 //! Each item is sanitized like a tag value, `,` included, so it can't split the list.
-//! `container.id` is never also a tag; one that isn't a usable `Str` has no `|c:` form and is left
-//! off, counted `logit.output.tags.omitted{reason="unrepresentable"}` (`{reason="dialect"}` under
-//! `format: statsd`). `|T<secs>` is written for an event flagged
+//! A usable `container.id` is never also a tag; any other value (an `Array` from a repeated
+//! `container.id:` tag, a bare `Bool(true)`) is an ordinary tag, one per element. `|T<secs>` is written for an event flagged
 //! `_logit.metrics.closed: "timestamped"` (on the event, else the resource; the flag's other values
 //! write none), with `secs` the whole seconds of `Event::timestamp`, truncated. `statsd_in` sets
 //! that flag and `Event::timestamp` from an incoming `|T`, and so does `prometheus_in` for a scraped
@@ -580,7 +599,7 @@ use crate::datagram::{
 use crate::stream::{Dial, PooledStream, Target, TlsTarget};
 use crate::Output;
 use anyhow::Context;
-use logit_core::attrs::{CLOSED_TIMESTAMPED, CONTAINER_ID, METRICS_CLOSED};
+use logit_core::attrs::{CLOSED_TIMESTAMPED, CONTAINER_ID, METRICS_CLOSED, UNIFIED_SERVICE_TAGS};
 use logit_core::{
     Diagnostics, Event, EventBatch, MetricKind, MetricRecord, MetricValue, Resource, Telemetry,
     Temporality, Value,
@@ -693,7 +712,8 @@ pub struct EncodeStats {
     /// wrote a line.
     pub tag_names_sanitized: usize,
     /// A wire tag whose value [`is_forbidden_in_tag_value_only`] rewrote, once per tag of an event
-    /// that wrote a line.
+    /// that wrote a line, and an event's or service check's `|h:` field that
+    /// [`is_forbidden_in_extended_field`] rewrote, once per line that was written.
     pub tag_values_sanitized: usize,
     /// A negative `Gauge` written as a `0|g` line and a `-v|g` adjustment, once per record:
     /// statsd_in reads the pair back as a gauge of 0 and a relative adjustment.
@@ -1162,6 +1182,19 @@ fn build_tag_suffix<'a>(
         (None, false)
     };
     let line_names_host = host_name.is_some() || hostless;
+    // Per `UNIFIED_SERVICE_TAGS` row: whether the standard key writes an `env:`, `version:`, or
+    // `service:` tag here, so a valued attribute already named for that tag is a second one.
+    let keyed = if format == Format::DogStatsd {
+        UNIFIED_KEYS.map(|key| {
+            event
+                .attributes
+                .get_sym(key)
+                .or_else(|| resource.attributes.get_sym(key))
+                .is_some_and(renders_tag)
+        })
+    } else {
+        [false; 3]
+    };
     for (key, value) in crate::attrs::merged(resource, event) {
         let key_str = logit_core::interner::resolve(key);
         // This sink's own carriers, which `statsd_in` stamps from a line's own segments and this
@@ -1218,17 +1251,16 @@ fn build_tag_suffix<'a>(
         if crate::attrs::is_private(key_str) {
             continue;
         }
-        // The line's own `|c:` (module doc's "`|c:<container-id>` and `|T<timestamp>`"), never a
-        // tag: a usable one is captured, and any other has no `|c:` form and is left off.
+        // A usable `container.id` is the line's own `|c:` (module doc's "`|c:<container-id>` and
+        // `|T<timestamp>`"), never a tag; any other value is an ordinary tag, as a `host.name`
+        // that isn't usable is.
         if key_str == CONTAINER_ID {
-            match value {
-                Value::Str(s) if !s.is_empty() && std::str::from_utf8(s).is_ok() => {
+            if let Value::Str(s) = value {
+                if !s.is_empty() && std::str::from_utf8(s).is_ok() {
                     carriers.container_id = value.as_str();
+                    continue;
                 }
-                _ if format == Format::Statsd => stats.tags_omitted_dialect += 1,
-                _ => stats.tags_omitted_unrepresentable += 1,
             }
-            continue;
         }
 
         if format == Format::Statsd {
@@ -1260,6 +1292,38 @@ fn build_tag_suffix<'a>(
             ATTR_HOST_NAME if host_name.is_some() => continue,
             _ => {}
         }
+        // Service identity (module doc's "Service identity"): a standard key leaves in
+        // Datadog's spelling, and beside it a valued attribute of that spelling would be a
+        // second tag for the same key, so it's left off per wire tag; a bare token stays.
+        if let Some(i) = UNIFIED_SERVICE_TAGS.iter().position(|(dd, _)| *dd == key_str) {
+            if keyed[i] {
+                let elements = match value {
+                    Value::Array(elements) => elements.as_slice(),
+                    _ => std::slice::from_ref(value),
+                };
+                for element in elements {
+                    if matches!(element, Value::Bool(true)) {
+                        push_one_tag(suffix, scratch, key_str, element, stats);
+                    } else {
+                        stats.tags_omitted_unrepresentable += 1;
+                    }
+                }
+                continue;
+            }
+        } else if let Some((dd, _)) =
+            UNIFIED_SERVICE_TAGS.iter().find(|(_, standard)| *standard == key_str)
+        {
+            // A bare token stays under the key's own name: a bare `env` names no environment.
+            let elements = match value {
+                Value::Array(elements) => elements.as_slice(),
+                _ => std::slice::from_ref(value),
+            };
+            for element in elements {
+                let name = if matches!(element, Value::Bool(true)) { key_str } else { dd };
+                push_one_tag(suffix, scratch, name, element, stats);
+            }
+            continue;
+        }
 
         match value {
             // A repeated tag key, folded at decode; one token per element, in array order, no
@@ -1290,6 +1354,26 @@ fn build_tag_suffix<'a>(
         carriers.host_tag_at = suffix.len();
     }
 }
+
+/// Whether a service identity key's `value` writes at least one valued DogStatsD tag through
+/// [`push_one_tag`]: a value (or an `Array` element) [`tag_value`] renders, other than a bare
+/// `Bool(true)`, which stays under the key's own name.
+fn renders_tag(value: &Value) -> bool {
+    let scalar = |v: &Value| match v {
+        Value::Str(s) => std::str::from_utf8(s).is_ok(),
+        Value::Bool(b) => !b,
+        Value::I64(_) | Value::U64(_) | Value::F64(_) => true,
+        _ => false,
+    };
+    match value {
+        Value::Array(elements) => elements.iter().any(scalar),
+        _ => scalar(value),
+    }
+}
+
+/// [`UNIFIED_SERVICE_TAGS`]' standard keys, in its order.
+static UNIFIED_KEYS: LazyLock<[logit_core::Symbol; 3]> =
+    LazyLock::new(|| UNIFIED_SERVICE_TAGS.map(|(_, key)| logit_core::interner::intern(key)));
 
 static HOST_NAME_KEY: LazyLock<logit_core::Symbol> =
     LazyLock::new(|| logit_core::interner::intern(ATTR_HOST_NAME));
@@ -1416,6 +1500,11 @@ fn append_origin_fields(line: &mut String, ctx: &EncodeCtx) {
         (None, None) => {}
         (Some(id), None) => {
             line.push_str("|c:");
+            // A bare id the Agent would read as a prefixed item needs the `ci-` prefix, which a
+            // single item loses once on the way back.
+            if ["ci-", "cid-", "in-"].iter().any(|p| id.starts_with(p)) {
+                line.push_str("ci-");
+            }
             sanitize_into(line, id, is_forbidden_in_local_data_item);
         }
         (id, Some(inode)) => {
@@ -1490,9 +1579,10 @@ fn render_event(
     line.push_str(text_buf);
 
     append_wire_time(line, "|d:", ctx);
+    let mut h_rewritten = false;
     if let Some(host) = carriers.host {
         line.push_str("|h:");
-        sanitize_into(line, host, is_forbidden_in_extended_field);
+        h_rewritten = sanitize_into(line, host, is_forbidden_in_extended_field);
     }
     match carriers.event_priority {
         Some(p @ ("normal" | "low")) => {
@@ -1539,7 +1629,12 @@ fn render_event(
     append_tags(line, &ctx.tag_suffix[..carriers.host_tag_at]);
     append_origin_fields(line, ctx);
 
+    let before = ctx.out.len();
     push_line(line, ctx.max_packet_bytes, ctx.stats, ctx.diag, ctx.out);
+    // A line dropped as oversize never carried its rewritten host.
+    if h_rewritten && ctx.out.len() > before {
+        ctx.stats.pending_tag_values += 1;
+    }
 }
 
 /// Renders one `_sc|name|status[...]` service-check line and pushes it. `metric` is the event's
@@ -1599,9 +1694,10 @@ fn render_service_check(
     let _ = write!(line, "|{status}");
 
     append_wire_time(line, "|d:", ctx);
+    let mut h_rewritten = false;
     if let Some(host) = carriers.host {
         line.push_str("|h:");
-        sanitize_into(line, host, is_forbidden_in_extended_field);
+        h_rewritten = sanitize_into(line, host, is_forbidden_in_extended_field);
     }
     append_tags(line, &ctx.tag_suffix[..carriers.host_tag_at]);
     append_origin_fields(line, ctx);
@@ -1610,7 +1706,12 @@ fn render_service_check(
         sanitize_into(line, message, is_forbidden_in_service_check_message);
     }
 
+    let before = ctx.out.len();
     push_line(line, ctx.max_packet_bytes, ctx.stats, ctx.diag, ctx.out);
+    // A line dropped as oversize never carried its rewritten host.
+    if h_rewritten && ctx.out.len() > before {
+        ctx.stats.pending_tag_values += 1;
+    }
 }
 
 /// Pushes `line` to `out`, or drops and counts it if longer than `max_packet_bytes`. Every
@@ -3420,6 +3521,71 @@ mod tests {
         assert!(msgs.iter().all(|m| !m.contains("|@")), "no expanded line carries a rate");
     }
 
+    /// The service identity keys leave as `env:`, `version:`, and `service:` tags and read back
+    /// as the keys; beside a key, a valued `env` attribute is omitted and counted once per wire
+    /// tag and a bare one stays; without the key, it's an ordinary tag.
+    #[test]
+    fn service_identity_keys_write_datadog_tags_and_shadow_valued_tag_attributes() {
+        let attrs = [
+            ("deployment.environment.name", Value::str("prod")),
+            ("service.version", Value::str("1.2")),
+            ("service.name", Value::Array(vec![Value::str("api"), Value::str("web")])),
+            ("env", Value::Array(vec![Value::str("dev"), Value::Bool(true), Value::str("qa")])),
+        ];
+        let (msgs, stats) = encode(vec![metric_event("hits", MetricKind::counter(1.0), &attrs)]);
+        let (_, tags) = msgs[0].split_once("|#").expect("a tag segment");
+        let mut tags: Vec<&str> = tags.split(',').collect();
+        tags.sort_unstable();
+        assert_eq!(tags, ["env", "env:prod", "service:api", "service:web", "version:1.2"]);
+        assert_eq!(stats.tags_omitted_unrepresentable, 2, "env:dev and env:qa");
+        let back = decode_one(&msgs[0]);
+        assert_eq!(
+            back[0].attributes.get("deployment.environment.name"),
+            Some(&Value::str("prod"))
+        );
+        assert_eq!(back[0].attributes.get("service.version"), Some(&Value::str("1.2")));
+        assert_eq!(
+            back[0].attributes.get("service.name"),
+            Some(&Value::Array(vec![Value::str("api"), Value::str("web")]))
+        );
+
+        let (msgs, stats) = encode(vec![metric_event(
+            "hits",
+            MetricKind::counter(1.0),
+            &[("env", Value::str("dev")), ("service", Value::str("api"))],
+        )]);
+        assert!(msgs[0].contains("env:dev") && msgs[0].contains("service:api"), "{msgs:?}");
+        assert_eq!(stats.tags_omitted_unrepresentable, 0);
+
+        // A bare token under a key stays under the key's own name and shadows nothing.
+        let (msgs, stats) = encode(vec![metric_event(
+            "hits",
+            MetricKind::counter(1.0),
+            &[
+                ("service.name", Value::Array(vec![Value::Bool(true), Value::str("api")])),
+                ("deployment.environment.name", Value::Bool(true)),
+                ("env", Value::str("dev")),
+            ],
+        )]);
+        let (_, tags) = msgs[0].split_once("|#").expect("a tag segment");
+        let mut tags: Vec<&str> = tags.split(',').collect();
+        tags.sort_unstable();
+        assert_eq!(tags, ["deployment.environment.name", "env:dev", "service.name", "service:api"]);
+        assert_eq!(stats.tags_omitted_unrepresentable, 0);
+
+        // A key that writes no tag shadows nothing.
+        let (msgs, stats) = encode(vec![metric_event(
+            "hits",
+            MetricKind::counter(1.0),
+            &[
+                ("deployment.environment.name", Value::Map(Box::default())),
+                ("env", Value::str("dev")),
+            ],
+        )]);
+        assert_eq!(msgs, ["hits:1|c|#env:dev"]);
+        assert_eq!(stats.tags_omitted_unrepresentable, 1, "the map");
+    }
+
     #[test]
     fn expanded_lines_under_format_statsd_drop_tags_once_and_extras_per_line() {
         let sketch = sketch_of(&[1.0, 2.0]);
@@ -4061,10 +4227,9 @@ mod tests {
         assert_eq!(msgs, vec!["hits:1|c|c:abcd1234"]);
     }
 
-    /// `|c:` is the Agent's local-data field: a lone container id bare, a lone cgroup inode as
-    /// `in-<inode>`, and both as the list `ci-<id>,in-<inode>`, since a list's bare item isn't
-    /// read. `container.id` is never also a tag; one that isn't a non-empty `Str` has no `|c:`
-    /// form and is left off, counted.
+    /// `|c:` is the Agent's local-data field: a lone container id bare (`ci-<id>` when the id
+    /// itself starts with `ci-`, `cid-`, or `in-`), a lone cgroup inode as `in-<inode>`, and both
+    /// as the list `ci-<id>,in-<inode>`, since a list's bare item isn't read.
     #[test]
     fn container_id_and_cgroup_inode_write_the_agents_local_data_forms() {
         let line = |attrs: &[(&str, Value)]| {
@@ -4081,8 +4246,42 @@ mod tests {
             line(&[("container.id", Value::str("abc")), ("env", Value::str("prod"))]),
             ("hits:1|c|#env:prod|c:abc".to_string(), 0)
         );
-        assert_eq!(line(&[("container.id", Value::I64(7))]), ("hits:1|c".to_string(), 1));
-        assert_eq!(line(&[("container.id", Value::str(""))]), ("hits:1|c".to_string(), 1));
+        for (id, wire) in [
+            ("ci-abc", "hits:1|c|c:ci-ci-abc"),
+            ("cid-abc", "hits:1|c|c:ci-cid-abc"),
+            ("in-7", "hits:1|c|c:ci-in-7"),
+            ("abc-in-7", "hits:1|c|c:abc-in-7"),
+        ] {
+            assert_eq!(line(&[("container.id", Value::str(id))]), (wire.to_string(), 0), "{id}");
+        }
+    }
+
+    /// A `container.id` that isn't a usable `Str` is an ordinary tag, one per element, and reads
+    /// back as itself.
+    #[test]
+    fn a_container_id_that_isnt_a_usable_str_is_an_ordinary_tag() {
+        let line = |value: Value| {
+            let (msgs, stats) = encode(vec![metric_event(
+                "hits",
+                MetricKind::counter(1.0),
+                &[("container.id", value)],
+            )]);
+            (msgs[0].clone(), stats.tags_omitted_unrepresentable)
+        };
+        let array = Value::Array(vec![Value::str("a"), Value::str("b")]);
+        assert_eq!(line(array), ("hits:1|c|#container.id:a,container.id:b".to_string(), 0));
+        assert_eq!(line(Value::Bool(true)), ("hits:1|c|#container.id".to_string(), 0));
+        assert_eq!(line(Value::I64(7)), ("hits:1|c|#container.id:7".to_string(), 0));
+        let (msgs, stats) = encode_with_format(
+            vec![metric_event(
+                "hits",
+                MetricKind::counter(1.0),
+                &[("container.id", Value::Array(vec![Value::str("a"), Value::str("b")]))],
+            )],
+            Format::Statsd,
+        );
+        assert_eq!(msgs, vec!["hits:1|c"]);
+        assert_eq!(stats.tags_omitted_dialect, 2, "per element");
     }
 
     /// An event's `container.id` wins over the resource's, as every attribute does.
@@ -4597,10 +4796,10 @@ mod tests {
         }
     }
 
-    /// A host the line writes as `|h:` is never sanitized as a tag value, so it counts no
-    /// rewrite; a check's trailing metric line writes the `host:` tag, sanitized and counted.
+    /// A host the line writes as `|h:` keeps a space, which the `host:` tag rewrites, so it counts
+    /// no rewrite; a check's trailing metric line writes the `host:` tag, sanitized and counted.
     #[test]
-    fn an_h_field_counts_no_tag_value_rewrite() {
+    fn an_h_field_keeping_its_value_counts_no_rewrite() {
         let host_name = ("host.name", Value::str("web 1"));
         let event = event_line_event("t", "x", std::slice::from_ref(&host_name));
         let check =
@@ -4614,6 +4813,44 @@ mod tests {
         trailing.metrics.push(MetricRecord::new(intern("extra"), MetricKind::gauge(2.0)));
         let (dog, stats) = encode(vec![trailing]);
         assert_eq!(dog, vec!["_sc|c|0|h:web 1", "extra:2|g|#host:web_1"]);
+        assert_eq!(stats.tag_values_sanitized, 1);
+    }
+
+    /// A `|` in the host is rewritten to `_` in the `|h:` field, which the wire form forces, so
+    /// it counts as a sanitized value once per line that carries it.
+    #[test]
+    fn a_sanitized_h_field_is_counted() {
+        let host_name = ("host.name", Value::str("web|1"));
+        let event = event_line_event("t", "x", std::slice::from_ref(&host_name));
+        let check =
+            service_check_event("c", MetricKind::gauge(0.0), std::slice::from_ref(&host_name));
+        for (event, want) in [(event, "_e{1,1}:t|x|h:web_1"), (check.clone(), "_sc|c|0|h:web_1")] {
+            let (dog, stats) = encode(vec![event]);
+            assert_eq!(dog, vec![want]);
+            assert_eq!(stats.tag_values_sanitized, 1, "{want}");
+        }
+        let mut trailing = check;
+        trailing.metrics.push(MetricRecord::new(intern("extra"), MetricKind::gauge(2.0)));
+        let (dog, stats) = encode(vec![trailing]);
+        assert_eq!(dog, vec!["_sc|c|0|h:web_1", "extra:2|g|#host:web_1"]);
+        assert_eq!(stats.tag_values_sanitized, 2);
+    }
+
+    /// A check line dropped as oversize never carried its rewritten `|h:` host, so only the
+    /// trailing metric line's `host:` tag counts.
+    #[test]
+    fn an_oversize_check_line_counts_no_h_rewrite() {
+        let host_name = ("host.name", Value::str("web|1"));
+        let mut check = service_check_event(
+            "a_long_check_name",
+            MetricKind::gauge(0.0),
+            std::slice::from_ref(&host_name),
+        );
+        check.metrics.push(MetricRecord::new(intern("extra"), MetricKind::gauge(2.0)));
+        let mut encoder = StatsdEncoder::new(Format::DogStatsd).with_max_packet_bytes(24);
+        let (dog, stats) = encode_with(&mut encoder, vec![check]);
+        assert_eq!(dog, vec!["extra:2|g|#host:web_1"]);
+        assert_eq!(stats.dropped_oversize_line, 1);
         assert_eq!(stats.tag_values_sanitized, 1);
     }
 
@@ -6135,7 +6372,10 @@ mod tests {
         assert!(
             matches!(events[0].metrics[0].kind, MetricKind::Sum(s) if s.value == MetricValue::F64(3.0))
         );
-        assert_eq!(events[0].attributes.get("env").and_then(|v| v.as_str()), Some("prod"));
+        assert_eq!(
+            events[0].attributes.get("deployment.environment.name").and_then(|v| v.as_str()),
+            Some("prod")
+        );
     }
 
     #[test]
@@ -6249,7 +6489,10 @@ mod tests {
         assert!(
             matches!(relayed[0].metrics[0].kind, MetricKind::Sum(s) if s.value == MetricValue::F64(3.0))
         );
-        assert_eq!(relayed[0].attributes.get("env").and_then(|v| v.as_str()), Some("prod"));
+        assert_eq!(
+            relayed[0].attributes.get("deployment.environment.name").and_then(|v| v.as_str()),
+            Some("prod")
+        );
         assert_eq!(relayed[0].attributes.get("host.name").and_then(|v| v.as_str()), Some("web1"));
     }
 
@@ -6268,7 +6511,10 @@ mod tests {
             MetricKind::Samples(s)
                 if s.values.as_slice() == [12.5, 34.0, 56.0] && s.sample_rate == 0.5
         ));
-        assert_eq!(relayed[0].attributes.get("env").and_then(|v| v.as_str()), Some("prod"));
+        assert_eq!(
+            relayed[0].attributes.get("deployment.environment.name").and_then(|v| v.as_str()),
+            Some("prod")
+        );
         assert_eq!(relayed[0].attributes.get("host.name").and_then(|v| v.as_str()), Some("web1"));
         assert_eq!(
             relayed[0].attributes.get("_logit.statsd.type").and_then(|v| v.as_str()),
@@ -6334,7 +6580,10 @@ mod tests {
             Some("title")
         );
         assert_eq!(relayed[0].timestamp, 1_700_000_000_000_000_000);
-        assert_eq!(relayed[0].attributes.get("env").and_then(|v| v.as_str()), Some("prod"));
+        assert_eq!(
+            relayed[0].attributes.get("deployment.environment.name").and_then(|v| v.as_str()),
+            Some("prod")
+        );
     }
 
     /// Every optional field survives the relay.
@@ -6360,7 +6609,10 @@ mod tests {
                 .and_then(|v| v.as_str()),
             Some("a b")
         );
-        assert_eq!(relayed[0].attributes.get("env").and_then(|v| v.as_str()), Some("prod"));
+        assert_eq!(
+            relayed[0].attributes.get("deployment.environment.name").and_then(|v| v.as_str()),
+            Some("prod")
+        );
     }
 
     // -- Fixed-point property: decode/encode agree with each other -----------------------------

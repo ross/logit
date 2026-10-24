@@ -96,10 +96,12 @@ optimizations exploit that. Both are hard to retrofit once scripts and codecs de
 
 When data belongs on an event but doesn't warrant a core-model field, a codec stamps it as a
 dotted, `service.name`-style attribute. `syslog_in` stamps the public
-`syslog.facility`/`.timestamp`/`.tag`/`.pid`/`.msgid`/`.sd`, HOSTNAME as the standard
-`host.name` (below), and the private `_logit.syslog.severity`, and the OTLP codec stamps the private
-`_logit.otel.severity_number`/`_logit.otel.severity_text`. `syslog.pid` may be `Value::Str` as well
-as `Value::U64`, because RFC 5424's PROCID is free-form PRINTUSASCII. `syslog.timestamp` may be
+`syslog.facility`/`.timestamp`/`.tag`/`.msgid`/`.sd`, HOSTNAME as the standard
+`host.name` (below), a canonical decimal PROCID or `tag[pid]` as the standard `process.pid`
+(`Value::U64`, below), and the private `_logit.syslog.severity`, and the OTLP codec stamps the
+private `_logit.otel.severity_number`/`_logit.otel.severity_text`. Any other PROCID is the
+`Value::Str` `syslog.pid`, because RFC 5424's PROCID is free-form PRINTUSASCII; an event has
+`process.pid` or `syslog.pid`, never both. `syslog.timestamp` may be
 `Value::Null` (a nil `-` RFC 5424 TIMESTAMP) as well as `Value::Timestamp`/`Value::Str`. The
 `timestamp` component resolves it onto `event.timestamp`
 ([ADR `timestamp-transform`](../adr/timestamp-transform.md)). See
@@ -129,12 +131,18 @@ resource; a sink reads the event, else the resource, and writes its own wire's f
 ([ADR `process-hostname`](../adr/process-hostname.md)'s "Amendment: container identity
 (2026-10-24)").
 
-**`deployment.environment.name` and `service.version` are the standard environment and version
-keys** (`logit_core::attrs::DEPLOYMENT_ENVIRONMENT_NAME` and `SERVICE_VERSION`, the OpenTelemetry
-names, each a `Str`). They follow `host.name`'s rule: `datadog_in` and `datadog_trace_in` write a
-span's `env` and `version` meta on its event, and a tracer or stats payload's environment and
-version on the batch resource, beside a stats payload's `Service` as the resource's
-`service.name` ([ADR `process-hostname`](../adr/process-hostname.md)'s "Amendment: a trace's
+**`service.name`, `deployment.environment.name`, and `service.version` are the standard service
+identity keys** (`logit_core::attrs::SERVICE_NAME`, `DEPLOYMENT_ENVIRONMENT_NAME`, and
+`SERVICE_VERSION`, each a `Str`, the OpenTelemetry names). They follow `host.name`'s rule.
+`statsd_in` and `datadog_in` write a valued DogStatsD or Datadog `service:`, `env:`, or `version:`
+tag on a metric, event, or service check onto them, on the event, and a Datadog-family sink writes
+them back as those tags ([ADR `process-hostname`](../adr/process-hostname.md)'s "Amendment:
+service identity on tags (2026-10-24)"). `datadog_in` writes a log's `service` and its `ddtags`
+`env:`, `version:`, and `service:` entries on the log's event, and `datadog_out` writes them back
+as the log's `service` and `ddtags` entries (the same ADR's "Amendment: Datadog log service identity
+(2026-10-24)"). `datadog_in` and `datadog_trace_in` write a span's `env` and `version` meta on its
+event, and a tracer or stats payload's environment and version on the batch resource, beside a
+stats payload's `Service` as the resource's `service.name` (the same ADR's "Amendment: a trace's
 environment, version, and service (2026-10-24)").
 
 **The private namespace `_logit.`: a carrier lives under `_logit.<protocol>.`**

@@ -21,7 +21,8 @@
 //!   nothing else on it; facility is at most 23 and severity at most 7, and `log.severity` is
 //!   severity's mapping; every SD-ID and PARAM-NAME is 1 to 32 PRINTUSASCII bytes
 //!   without `=`, `]`, `"`, or a space; a PARAM-VALUE is a `Str`, or an `Array` of two `Str`s or
-//!   more; `syslog.pid` is a `U64`, or a `Str` that isn't canonical decimal fitting a `u64`; every
+//!   more; `process.pid` is a `U64`, `syslog.pid` is a `Str` that isn't canonical decimal
+//!   fitting a `u64`, and an event never has both; every
 //!   `Str` is valid UTF-8, and a `Bytes` message isn't;
 //! - provenance: every header field and every message is a slice of the input. A PARAM-VALUE is
 //!   the one copy, built as its escapes are read, so it isn't checked.
@@ -88,7 +89,7 @@ fn is_sd_name(name: &str) -> bool {
         && name.bytes().all(|b| (33..=126).contains(&b) && !matches!(b, b'=' | b']' | b'"'))
 }
 
-/// `Some` for canonical decimal fitting a `u64`: what the decoder makes a `U64` PID.
+/// `Some` for canonical decimal fitting a `u64`: what the decoder makes a `process.pid`.
 fn canonical_u64(s: &str) -> Option<u64> {
     let canonical = !s.is_empty()
         && s.bytes().all(|b| b.is_ascii_digit())
@@ -167,13 +168,15 @@ fn check_event(input: &Bytes, event: &Event) {
             key @ ("host.name" | "syslog.tag" | "syslog.msgid") => {
                 check_field(input, key, value);
             }
+            "process.pid" => {
+                assert!(matches!(value, Value::U64(_)), "model: process.pid {value:?}");
+                assert!(event.attributes.get("syslog.pid").is_none(), "model: both PID forms");
+            }
             "syslog.pid" => {
-                if !matches!(value, Value::U64(_)) {
-                    let pid = check_field(input, "syslog.pid", value);
-                    let pid = std::str::from_utf8(&pid).unwrap();
-                    assert!(pid.bytes().all(|b| (33..=126).contains(&b)), "model: PID {pid:?}");
-                    assert!(canonical_u64(pid).is_none(), "model: a decimal PID {pid:?} is a U64");
-                }
+                let pid = check_field(input, "syslog.pid", value);
+                let pid = std::str::from_utf8(&pid).unwrap();
+                assert!(pid.bytes().all(|b| (33..=126).contains(&b)), "model: PID {pid:?}");
+                assert!(canonical_u64(pid).is_none(), "model: a decimal PID {pid:?} is a U64");
             }
             "syslog.sd" => check_sd(value),
             other => panic!("model: an attribute syslog never writes: {other}"),

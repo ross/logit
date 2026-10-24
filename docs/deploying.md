@@ -3130,8 +3130,9 @@ logged: a `403` is reported as a throttled `api_key_rejected` warning that names
 response text quoted in a log line or error has the key replaced with `<redacted>`.
 
 **Host, service, and tags come from the data.** There's no `host:` or `tags:` field on the sink.
-Each route's encoder reads `host.name`, `service`, `ddsource`, and the rest from event attributes
-and the batch resource, so stamp them upstream with `set`, as the example does for `host.name`. A
+Each route's encoder reads `host.name`, `service.name`, `ddsource`, and the rest from event
+attributes and the batch resource, so stamp them upstream with `set`, as the example does for
+`host.name`. A
 metric, log, event, or service check with no host goes out under the process hostname
 ([Hostname](#hostname)), so senders with no host of their own all report as the relay's host.
 

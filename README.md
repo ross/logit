@@ -35,7 +35,8 @@ Published images are at `ghcr.io/ross/logit`. Only the `latest` tag exists, it's
 it moves whenever a maintainer publishes a new build, so don't treat it as a pinned version.
 
 1. Save this config as `logit.yaml`. It reads statsd metrics, sums them over 10-second windows,
-   adds an `env` tag in Lua, and prints the result:
+   defaults each series' `deployment.environment.name` (a DogStatsD `env:` tag) in
+   Lua, and prints the result:
 
    ```yaml
    components:
@@ -51,7 +52,8 @@ it moves whenever a maintainer publishes a new build, so don't treat it as a pin
        sources: [windowed]
        script: |
          function process(event)
-           event.attributes.env = event.attributes.env or "dev"
+           local key = "deployment.environment.name"
+           event.attributes[key] = event.attributes[key] or "dev"
            return event
          end
      out:

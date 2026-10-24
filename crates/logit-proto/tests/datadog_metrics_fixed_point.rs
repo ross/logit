@@ -553,7 +553,16 @@ fn sketch_payload_common_metadata_relays_on_the_resource() {
 // -- generated payloads --------------------------------------------------------------------------
 
 fn tag() -> impl Strategy<Value = String> {
-    let key = prop::sample::select(vec!["env", "team", "urgent", "a", "svc"]);
+    let key = prop::sample::select(vec![
+        "env",
+        "team",
+        "urgent",
+        "a",
+        "svc",
+        "version",
+        "service",
+        "service.name",
+    ]);
     prop_oneof![
         key.clone().prop_map(String::from),
         (key, "[a-z0-9:/._-]{0,6}").prop_map(|(k, v)| format!("{k}:{v}")),

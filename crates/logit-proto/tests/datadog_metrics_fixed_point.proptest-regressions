@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 03082497e21c2746cfdd743f67b725c56cead35ce70499b7a47b658182ea8e86 # shrinks to series = [GenSeries { metric: "a", type_code: 0, tags: ["service.name"], host: None, device: None, resources: [], unit: "", source_type_name: "", interval: 0, origin: (0, 0, 0), points: [(1, 0.0)] }]
+cc e234a877cedb283d6190c0d9f16efdb7a0e3e3de840693a3b2284ef6e6cd1321 # shrinks to payload = [GenSketch { metric: "a", host: "", tags: ["service.name"], origin: (0, 0, 0), dogs: [(1, [(0, 1)], 0.0, 0.0, 0.0)] }]

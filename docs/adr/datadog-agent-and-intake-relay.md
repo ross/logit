@@ -822,15 +822,85 @@ ways, and `datadog_in` reads a series' `container_id:` tag back as an attribute 
 which `datadog_out` writes back unchanged. `datadog_out` writes no `container.id` it wasn't given,
 so the Datadog-to-Datadog relay sends nothing new.
 
-## Amendment: a trace's environment and version are the common keys (2026-10-24)
+## Amendment: service identity is on the standard keys (2026-10-24)
+
+A sender's service, environment, and version are `service.name`, `deployment.environment.name`,
+and `service.version` ([ADR `process-hostname`](process-hostname.md) has the tables). What
+datadog-agent 7.83.3 does with each form decided the mapping.
+
+### Tags
+
+On a metric, a Datadog event, or a service check, a valued `env:`, `version:`, or `service:`
+tag is the standard key, on both sides of the relay (ADR `process-hostname`'s "Amendment:
+service identity on tags (2026-10-24)" has the tables).
+
+- **DogStatsD.** The Agent passes the three tags through as ordinary client tags:
+  `comp/dogstatsd/server/impl/enrich.go`'s `extractTagsMetadata` consumes only `host:`,
+  `dd.internal.entity_id:`, the cardinality tag, and `dd.internal.jmx_check_name:`, and keeps the
+  rest in order. The server then appends its configured `dogstatsd_tags`
+  (`comp/dogstatsd/server/impl/server.go`), and the aggregator adds the origin's tagger tags in a
+  separate buffer (`pkg/aggregator/context_resolver.go`, `trackContext`, through the tagger's
+  `EnrichTags` in `comp/core/tagger/impl/tagger.go`), which can hold a second `env:` from a
+  container's Unified Service Tagging labels. No step reads, rewrites, or dedupes the three
+  tags against each other, so a line's own tags are the sender's statement of its identity, and
+  `statsd_in` writes them as the keys.
+- **Datadog spellings.** `datadog_out` and `statsd_out` write the keys back as `env`,
+  `version`, and `service` tags, the mapping the Datadog OTLP exporter applies to a resource's
+  attributes (`pkg/opentelemetry-mapping-go/otlp/attributes/attributes.go`,
+  `TagsFromAttributes` through `coreMapping`, which also maps the older
+  `deployment.environment` to `env`). That table reads only a non-empty string; this relay writes
+  every value a tag can carry, so a relayed `env:` with an empty value round-trips.
+
+A valueless `env` token stays a tag of that name: it carries no environment. The like pairs stay
+fixed points modulo tag order: a tag decodes onto its key and leaves as the same tag.
+
+### Logs
+
+- **What the Agent sends.** The Agent's logs encoder writes every log with the same seven keys
+  and no `omitempty`, `service` from `Origin.Service()` and `ddtags` from `Origin.TagsToString()`
+  (`comp/logs-library/processor/json.go`, `jsonEncoder.Encode`), so a log with neither arrives
+  as `"service":""` and `"ddtags":""`. `Origin.Service` is the log source's configured service,
+  else the origin's own (`pkg/logs/message/origin.go`), and the origin's tags are the tagger's
+  tags for the entity the log came from, then `sourcecategory:` and the source's configured tags
+  (`tagsToStringArray`; the tagger's through `pkg/logs/internal/tag/provider.go`, `GetTags`,
+  from `pkg/logs/tailers/container/tailer.go`, `buildMessage`, and
+  `pkg/logs/tailers/file/tailer.go`, `forwardMessages`). The tagger's tags for a container that
+  sets Unified Service Tagging include `env:`, `version:`, and `service:`, so a container's log
+  can carry its service twice, as the field and as a `ddtags` entry.
+- **The decode.** `datadog_in` writes a log's non-empty `service` as `service.name`, and lifts
+  `ddtags`' `env:`, `version:`, and `service:` entries onto the three keys, keeping every other
+  entry in the one string. The field beats the entry, so a container's twice-carried service is
+  one `service.name`, and the entry is omitted, counted
+  `logit.input.tags.omitted{reason="reserved_key"}`. An empty `service` is no service, as an
+  empty `hostname` is no host.
+- **Not a full split.** A tag and a top-level field are different things in Datadog, and
+  `datadog_out` writes every other attribute as a top-level field, so splitting every `ddtags` entry
+  would turn each relayed tag into a field. The three lifted entries are the ones every route
+  has a standard key for.
+- **The encode.** `datadog_out` writes `service.name` as the log's `service` and
+  `deployment.environment.name` and `service.version` as `env:` and `version:` entries appended
+  to `ddtags`, before `container_id:`, whatever source wrote them. An `otlp_in -> datadog_out`
+  log whose resource carries `deployment.environment.name` or `service.version` now reaches
+  Datadog tagged `env:` and `version:`, the tags Datadog's OTLP mapping gives those keys
+  (`pkg/opentelemetry-mapping-go/otlp/attributes/attributes.go`, `coreMapping`). A `service`
+  attribute beside `service.name` is omitted, counted
+  `logit.output.tags.omitted{reason="reserved_key"}`: it would be a second `service` key in the
+  object. Alone, it is the log's `service`, so a `service` that isn't a string, which
+  `service.name` can't hold, relays as it came.
+
+The logs relay stays a fixed point from the first hop on, modulo `logit_proto::datadog`'s
+permitted normalizations (5) and (10): the lifted entries rejoin at the end of `ddtags`, a
+`service:` entry beside the log's own `service` doesn't come back, and an empty or bare entry
+beside a key the log already carries is left off at the first decode.
+
+### Traces and APM stats
 
 A span's `env` and `version` meta, a `TracerPayload`'s `env` and `app_version`, and a
 `ClientStatsPayload`'s `Env`, `Version`, and `Service` are the standard
-`deployment.environment.name`, `service.version`, and `service.name`
-([ADR `process-hostname`](process-hostname.md)'s "Amendment: a trace's environment, version, and
-service (2026-10-24)" has the tables). The carriers `_logit.datadog.tracer.env`,
-`_logit.datadog.tracer.app_version`, and `_logit.datadog.stats.service` are gone. What
-datadog-agent 7.83.3 does with each form decided the mapping:
+`deployment.environment.name`, `service.version`, and `service.name` ([ADR
+`process-hostname`](process-hostname.md)'s "Amendment: a trace's environment, version, and service
+(2026-10-24)" has the tables). The carriers `_logit.datadog.tracer.env`,
+`_logit.datadog.tracer.app_version`, and `_logit.datadog.stats.service` are gone.
 
 - **The span's own meta is the identity.** `pkg/trace/agent/agent.go`, `setPayloadAttributes`,
   fills an empty `TracerPayload.Env` from `traceutil.GetEnv` (`pkg/trace/traceutil/trace.go`:

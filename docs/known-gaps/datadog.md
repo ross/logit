@@ -163,6 +163,16 @@ Entry format and the other areas: [the known-gaps index](README.md).
     Agent would add, and one that named only an inode carries no container at all.
   - **Workaround:** send DogStatsD through a local Agent with `statsd_out`, which writes `|c:` back
     in the form the Agent reads, or stamp the tags upstream with `set`.
+- **A relayed log keeps one value per service identity key.** `datadog_in` lifts a log's `ddtags`
+  `env:`, `version:`, and `service:` entries onto one `deployment.environment.name`,
+  `service.version`, and `service.name` each, the log's own `service` field first. A `service:`
+  entry beside that field, and a second valued entry of any of the three, is left off, counted
+  `logit.input.tags.omitted{reason="reserved_key"}`.
+  - **Consequence:** an Agent-tailed container log that carries its service as both the field
+    and a tag reaches Datadog through the relay with the field alone, and a log tagged with two
+    environments keeps the first.
+  - **Workaround:** none needed for the twice-carried service, since Datadog reads the field as
+    the log's service. Give a log one value per tag upstream.
 - **`datadog_trace_out` under `version: v0.4` drops the trace chunk and tracer payload fields.**
   v0.4 has no field for a chunk's `_logit.datadog.chunk.*` fields (sampling priority, origin,
   dropped flag, tags) or for the tracer payload fields no request header carries

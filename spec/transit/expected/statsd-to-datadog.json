@@ -1,6 +1,6 @@
 {
   "carriers": {"events": [
-    {"timestamp":"2027-01-15T07:59:30.000000000Z","metrics":[{"name":"requests","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"env":"prod","host.name":"transit"},"resource":{"attributes":{"_logit.datadog.units":"datadog"}}},
+    {"timestamp":"2027-01-15T07:59:30.000000000Z","metrics":[{"name":"requests","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"deployment.environment.name":"prod","host.name":"transit"},"resource":{"attributes":{"_logit.datadog.units":"datadog"}}},
     {"timestamp":"2027-01-15T07:59:30.000000000Z","metrics":[{"name":"temperature","kind":"gauge","value":20.0}],"attributes":{"container_id":"abc","host.name":"transit"},"resource":{"attributes":{"_logit.datadog.units":"datadog"}}},
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"latency","kind":"samples","values":[5.0],"sample_rate":1.0}],"attributes":{"host.name":"transit"}}
   ], "counters": {}},
@@ -24,7 +24,7 @@
   }},
   "event": {"events": [
     {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"format":"raw","message":"abc"},"attributes":{"_logit.statsd.event.title":"Plain","host.name":"transit"}},
-    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"severity":"warn","format":"raw","message":"first\nline"},"attributes":{"_logit.statsd.event.aggregation_key":"deploy","_logit.statsd.event.alert_type":"warning","_logit.statsd.event.priority":"low","_logit.statsd.event.source_type":"ci","_logit.statsd.event.title":"Hello","env":"prod","host.name":"web-07"}}
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"severity":"warn","format":"raw","message":"first\nline"},"attributes":{"_logit.statsd.event.aggregation_key":"deploy","_logit.statsd.event.alert_type":"warning","_logit.statsd.event.priority":"low","_logit.statsd.event.source_type":"ci","_logit.statsd.event.title":"Hello","deployment.environment.name":"prod","host.name":"web-07"}}
   ], "counters": {}},
   "flagged-histogram": {"events": [], "counters": {
     "logit.output.metrics.dropped{component=out,kind=datadog_out,reason=unresolved_cumulative,role=sink}": 1
@@ -48,21 +48,21 @@
     {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"format":"raw","message":"v2.1"},"attributes":{"_logit.statsd.event.title":"deploy","host.name":"web-1"}},
     {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"format":"raw","message":"v2.2"},"attributes":{"_logit.statsd.event.title":"deploy","host.name":"web-3"}},
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"db.up","kind":"gauge","value":0.0}],"attributes":{"_logit.statsd.service_check.name":"db.up","_logit.statsd.service_check.status":0,"host.name":"web-4"},"types":{"/attributes/_logit.statsd.service_check.status":"u64"}},
-    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"requests","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"env":"prod","host.name":"web-1"},"resource":{"attributes":{"_logit.datadog.units":"datadog"}}},
-    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"requests.hostless","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"_logit.datadog.resources":[{"name":"","type":"host"}],"env":"prod"},"resource":{"attributes":{"_logit.datadog.units":"datadog"}}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"requests","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"deployment.environment.name":"prod","host.name":"web-1"},"resource":{"attributes":{"_logit.datadog.units":"datadog"}}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"requests.hostless","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"_logit.datadog.resources":[{"name":"","type":"host"}],"deployment.environment.name":"prod"},"resource":{"attributes":{"_logit.datadog.units":"datadog"}}},
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"requests.tagged","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"host.name":"web-2"},"resource":{"attributes":{"_logit.datadog.units":"datadog"}}}
   ], "counters": {}},
   "interop-dogstatsd-buffered": {"events": [
-    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"app.db.query.duration_ms","kind":"samples","values":[0.33313615206930347],"sample_rate":1.0}],"attributes":{"db":"primary","env":"prod","host.name":"web-07","query":"select_user","region":"us-east-1","service":"checkout-api"}},
-    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"app.http.request.duration_ms","kind":"samples","values":[0.05],"sample_rate":1.0}],"attributes":{"endpoint":"/api/v1/orders","env":"prod","host.name":"web-07","region":"us-east-1","service":"checkout-api","status":"200"}},
-    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"app.http.request.duration_ms","kind":"samples","values":[23.483176616760144],"sample_rate":1.0}],"attributes":{"endpoint":"/healthz","env":"prod","host.name":"web-07","region":"us-east-1","service":"checkout-api","status":"200"}},
-    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"app.http.requests.count","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"endpoint":"/api/v1/orders","env":"prod","host.name":"web-07","region":"us-east-1","service":"checkout-api","status":"200"},"resource":{"attributes":{"_logit.datadog.units":"datadog"}}},
-    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"app.http.requests.count","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"endpoint":"/healthz","env":"prod","host.name":"web-07","region":"us-east-1","service":"checkout-api","status":"200"},"resource":{"attributes":{"_logit.datadog.units":"datadog"}}},
-    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"app.http.response.size_bytes","kind":"samples","values":[60196.0],"sample_rate":1.0}],"attributes":{"endpoint":"/api/v1/orders","env":"prod","host.name":"web-07","region":"us-east-1","service":"checkout-api","status":"200"}},
-    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"app.render.calls.count","kind":"sum","value":2.0,"temporality":"delta","monotonic":true}],"attributes":{"endpoint":"/api/v1/orders","env":"prod","host.name":"web-07","region":"us-east-1","service":"checkout-api","status":"200"},"resource":{"attributes":{"_logit.datadog.units":"datadog"}}},
-    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"app.worker.queue.depth","kind":"gauge","value":110.0}],"attributes":{"env":"prod","host.name":"web-07","queue":"email","region":"us-east-1","service":"checkout-api"},"resource":{"attributes":{"_logit.datadog.units":"datadog"}}},
-    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"app.worker.queue.depth","kind":"gauge","value":210.0}],"attributes":{"env":"prod","host.name":"web-07","queue":"reindex","region":"us-east-1","service":"checkout-api"},"resource":{"attributes":{"_logit.datadog.units":"datadog"}}},
-    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"app.worker.queue.depth","kind":"gauge","value":90.0}],"attributes":{"env":"prod","host.name":"web-07","queue":"webhooks","region":"us-east-1","service":"checkout-api"},"resource":{"attributes":{"_logit.datadog.units":"datadog"}}}
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"app.db.query.duration_ms","kind":"samples","values":[0.33313615206930347],"sample_rate":1.0}],"attributes":{"db":"primary","deployment.environment.name":"prod","host.name":"web-07","query":"select_user","region":"us-east-1","service.name":"checkout-api"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"app.http.request.duration_ms","kind":"samples","values":[0.05],"sample_rate":1.0}],"attributes":{"deployment.environment.name":"prod","endpoint":"/api/v1/orders","host.name":"web-07","region":"us-east-1","service.name":"checkout-api","status":"200"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"app.http.request.duration_ms","kind":"samples","values":[23.483176616760144],"sample_rate":1.0}],"attributes":{"deployment.environment.name":"prod","endpoint":"/healthz","host.name":"web-07","region":"us-east-1","service.name":"checkout-api","status":"200"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"app.http.requests.count","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"deployment.environment.name":"prod","endpoint":"/api/v1/orders","host.name":"web-07","region":"us-east-1","service.name":"checkout-api","status":"200"},"resource":{"attributes":{"_logit.datadog.units":"datadog"}}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"app.http.requests.count","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"deployment.environment.name":"prod","endpoint":"/healthz","host.name":"web-07","region":"us-east-1","service.name":"checkout-api","status":"200"},"resource":{"attributes":{"_logit.datadog.units":"datadog"}}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"app.http.response.size_bytes","kind":"samples","values":[60196.0],"sample_rate":1.0}],"attributes":{"deployment.environment.name":"prod","endpoint":"/api/v1/orders","host.name":"web-07","region":"us-east-1","service.name":"checkout-api","status":"200"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"app.render.calls.count","kind":"sum","value":2.0,"temporality":"delta","monotonic":true}],"attributes":{"deployment.environment.name":"prod","endpoint":"/api/v1/orders","host.name":"web-07","region":"us-east-1","service.name":"checkout-api","status":"200"},"resource":{"attributes":{"_logit.datadog.units":"datadog"}}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"app.worker.queue.depth","kind":"gauge","value":110.0}],"attributes":{"deployment.environment.name":"prod","host.name":"web-07","queue":"email","region":"us-east-1","service.name":"checkout-api"},"resource":{"attributes":{"_logit.datadog.units":"datadog"}}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"app.worker.queue.depth","kind":"gauge","value":210.0}],"attributes":{"deployment.environment.name":"prod","host.name":"web-07","queue":"reindex","region":"us-east-1","service.name":"checkout-api"},"resource":{"attributes":{"_logit.datadog.units":"datadog"}}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"app.worker.queue.depth","kind":"gauge","value":90.0}],"attributes":{"deployment.environment.name":"prod","host.name":"web-07","queue":"webhooks","region":"us-east-1","service.name":"checkout-api"},"resource":{"attributes":{"_logit.datadog.units":"datadog"}}}
   ], "counters": {
     "logit.output.metrics.skipped{component=out,kind=datadog_out,metric_kind=set_members,role=sink}": 1
   }},
@@ -119,7 +119,7 @@
     "logit.output.metrics.skipped{component=out,kind=datadog_out,reason=no_recorded_value,role=sink}": 1
   }},
   "service-check": {"events": [
-    {"timestamp":"2027-01-15T07:59:30.000000000Z","metrics":[{"name":"db.up","kind":"gauge","value":0.0}],"attributes":{"_logit.statsd.service_check.message":"all good","_logit.statsd.service_check.name":"db.up","_logit.statsd.service_check.status":0,"env":"prod","host.name":"web-07"},"types":{"/attributes/_logit.statsd.service_check.status":"u64"}},
+    {"timestamp":"2027-01-15T07:59:30.000000000Z","metrics":[{"name":"db.up","kind":"gauge","value":0.0}],"attributes":{"_logit.statsd.service_check.message":"all good","_logit.statsd.service_check.name":"db.up","_logit.statsd.service_check.status":0,"deployment.environment.name":"prod","host.name":"web-07"},"types":{"/attributes/_logit.statsd.service_check.status":"u64"}},
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"cache.up","kind":"gauge","value":2.0}],"attributes":{"_logit.statsd.service_check.message":"down","_logit.statsd.service_check.name":"cache.up","_logit.statsd.service_check.status":2,"host.name":"transit"},"types":{"/attributes/_logit.statsd.service_check.status":"u64"}}
   ], "counters": {}},
   "set": {"events": [], "counters": {
@@ -186,7 +186,7 @@
     "logit.output.fields.dropped{component=out,kind=datadog_out,reason=unresolved_cumulative,role=sink}": 1
   }},
   "tags": {"events": [
-    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"requests","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"env":"prod","host.name":"transit","service":"api","urgent":true},"resource":{"attributes":{"_logit.datadog.units":"datadog"}}}
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"requests","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"deployment.environment.name":"prod","host.name":"transit","service.name":"api","urgent":true},"resource":{"attributes":{"_logit.datadog.units":"datadog"}}}
   ], "counters": {}},
   "tags-array": {"events": [
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"requests","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"host.name":"transit","team":["a","b"],"urgent":[true,"1"]},"resource":{"attributes":{"_logit.datadog.units":"datadog"}}}
@@ -195,7 +195,7 @@
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"requests","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"host.name":"transit","team":"a","urgent":true},"resource":{"attributes":{"_logit.datadog.units":"datadog"}}}
   ], "counters": {}},
   "tags-reserved": {"events": [
-    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"requests","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"env":"a:b","host.name":"transit","my key":"a@b c"},"resource":{"attributes":{"_logit.datadog.units":"datadog"}}}
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"requests","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"deployment.environment.name":"a:b","host.name":"transit","my key":"a@b c"},"resource":{"attributes":{"_logit.datadog.units":"datadog"}}}
   ], "counters": {}},
   "timer-h-d": {"events": [
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"request.size","kind":"samples","values":[512.0],"sample_rate":1.0}],"attributes":{"host.name":"transit"}},

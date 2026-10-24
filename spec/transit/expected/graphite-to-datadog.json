@@ -41,7 +41,7 @@
   ], "counters": {}},
   "tagged": {"events": [
     {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"servers.web-1.cpu","kind":"gauge","value":0.25}],"attributes":{"dc":"us-east","host":"web-1","host.name":"transit"},"resource":{"attributes":{"_logit.datadog.units":"datadog"}}},
-    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"servers.web-1.cpu","kind":"gauge","value":0.5}],"attributes":{"env":"staging","host.name":"transit"},"resource":{"attributes":{"_logit.datadog.units":"datadog"}}},
+    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"servers.web-1.cpu","kind":"gauge","value":0.5}],"attributes":{"deployment.environment.name":"staging","host.name":"transit"},"resource":{"attributes":{"_logit.datadog.units":"datadog"}}},
     {"timestamp":"2027-01-15T07:59:52.000000000Z","metrics":[{"name":"servers.web-1.mem","kind":"gauge","value":1234.0}],"attributes":{"host.name":"transit","role":"db"},"resource":{"attributes":{"_logit.datadog.units":"datadog"}}},
     {"timestamp":"2027-01-15T07:59:53.000000000Z","metrics":[{"name":"sensor.reading","kind":"gauge","value":100000.0}],"attributes":{"host.name":"transit"},"resource":{"attributes":{"_logit.datadog.units":"datadog"}}},
     {"timestamp":"2027-01-15T07:59:54.000000000Z","metrics":[{"name":"sensor.offset","kind":"gauge","value":1.5}],"attributes":{"host.name":"transit"},"resource":{"attributes":{"_logit.datadog.units":"datadog"}}},

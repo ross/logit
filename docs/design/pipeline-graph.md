@@ -25,7 +25,8 @@ components:
     sources: [windowed]
     script: |
       function process(event)
-        event.attributes.env = event.attributes.env or "dev"
+        local key = "deployment.environment.name"
+        event.attributes[key] = event.attributes[key] or "dev"
         return event
       end
 

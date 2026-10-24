@@ -587,7 +587,7 @@ mod tests {
         let attrs = &events[0].attributes;
         assert_eq!(attrs.get(PEER_ADDRESS).and_then(Value::as_str), Some("127.0.0.1"));
         assert_eq!(attrs.get(PEER_PORT), Some(&Value::I64(i64::from(port))));
-        assert_eq!(attrs.get("env").and_then(Value::as_str), Some("prod"));
+        assert_eq!(attrs.get("deployment.environment.name").and_then(Value::as_str), Some("prod"));
 
         running.shutdown.send(true).ok();
         running.handle.abort();
@@ -613,7 +613,7 @@ mod tests {
         let attrs = &events[0].attributes;
         assert_eq!(attrs.get(CLIENT_ADDRESS).and_then(Value::as_str), Some("198.51.100.7"));
         assert_eq!(attrs.get(CLIENT_PORT), Some(&Value::I64(40000)));
-        assert_eq!(attrs.get("env").and_then(Value::as_str), Some("prod"));
+        assert_eq!(attrs.get("deployment.environment.name").and_then(Value::as_str), Some("prod"));
 
         running.shutdown.send(true).ok();
         running.handle.abort();
@@ -644,7 +644,7 @@ mod tests {
         let attrs = &events[0].attributes;
         assert_eq!(attrs.get(PEER_ADDRESS).and_then(Value::as_str), Some("127.0.0.1"));
         assert_eq!(attrs.get(PEER_PORT), Some(&Value::I64(i64::from(port))));
-        assert_eq!(attrs.get("env").and_then(Value::as_str), Some("prod"));
+        assert_eq!(attrs.get("deployment.environment.name").and_then(Value::as_str), Some("prod"));
         running.stop().await;
     }
 
@@ -765,7 +765,10 @@ mod tests {
         let events = running.next_events("the line sent over TLS").await;
         assert_eq!(events.len(), 1);
         assert_eq!(metric_name(&events[0]), "over.tls");
-        assert_eq!(events[0].attributes.get("env").and_then(Value::as_str), Some("prod"));
+        assert_eq!(
+            events[0].attributes.get("deployment.environment.name").and_then(Value::as_str),
+            Some("prod")
+        );
 
         running.shutdown.send(true).ok();
         running.handle.abort();

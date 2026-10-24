@@ -11,6 +11,7 @@
     {"sink":"otlp_out","row":"attributes/number_value","cell":0,"observed":["exact","normalized"]},
     {"sink":"otlp_out","row":"attributes/resource_attribute","cell":0,"observed":["exact"]},
     {"sink":"otlp_out","row":"attributes/scope","cell":0,"observed":["exact"]},
+    {"sink":"otlp_out","row":"attributes/service_identity","cell":0,"observed":["exact"]},
     {"sink":"otlp_out","row":"attributes/span_kind","cell":0,"observed":["exact"]},
     {"sink":"otlp_out","row":"attributes/string_value","cell":0,"observed":["exact"]},
     {"sink":"otlp_out","row":"attributes/timestamp_value","cell":0,"observed":["normalized"]},

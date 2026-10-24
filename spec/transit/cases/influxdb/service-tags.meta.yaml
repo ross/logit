@@ -1,0 +1,5 @@
+# A Telegraf-shaped point whose tags spell Unified Service Tagging names: influxdb_in writes none of
+# the standard keys from them, so `env` sits beside `deployment.environment.name` and `version` and
+# `service` stand alone, as a Datadog-family sink sees them from another family.
+wire: service-tags.lp
+exercises: [measurement, tags, float_field, carriers]

@@ -189,8 +189,8 @@ fn is_printusascii(b: &[u8]) -> bool {
 }
 
 /// A PROCID or `tag[pid]` token as a `u64` when it is canonical decimal: ASCII digits with no
-/// leading zero, or `0` (`super`'s module doc, `syslog.pid`). `u64::from_str` alone would also take
-/// `+5` and `007`, which `syslog_out` would then write as `5` and `7`.
+/// leading zero, or `0`, that fits (`super`'s module doc, `process.pid`). `u64::from_str` alone
+/// would also take `+5` and `007`, which `syslog_out` would then write as `5` and `7`.
 fn canonical_pid(token: &[u8]) -> Option<u64> {
     let canonical = !token.is_empty()
         && token.iter().all(u8::is_ascii_digit)
@@ -201,7 +201,7 @@ fn canonical_pid(token: &[u8]) -> Option<u64> {
     std::str::from_utf8(token).ok()?.parse().ok()
 }
 
-/// The `syslog.*`, `host.name`, and `_logit.syslog.severity` keys, interned once per process so each line pays
+/// The `syslog.*`, `host.name`, `process.pid`, and `_logit.syslog.severity` keys, interned once per process so each line pays
 /// a sorted `insert_sym`, not an interner hash and shard lock. A `LazyLock` rather than a decoder
 /// field (as collectd's `AttrKeys` is) because the parsers are free functions; `KEYS.x` is one
 /// acquire load after first use.
@@ -212,6 +212,7 @@ static KEYS: LazyLock<SyslogKeys> = LazyLock::new(|| SyslogKeys {
     hostname: intern(logit_core::attrs::HOST_NAME),
     tag: intern("syslog.tag"),
     pid: intern("syslog.pid"),
+    process_pid: intern(logit_core::attrs::PROCESS_PID),
     msgid: intern("syslog.msgid"),
     sd: intern("syslog.sd"),
 });
@@ -223,6 +224,7 @@ struct SyslogKeys {
     hostname: Symbol,
     tag: Symbol,
     pid: Symbol,
+    process_pid: Symbol,
     msgid: Symbol,
     sd: Symbol,
 }
@@ -429,7 +431,7 @@ fn parse_3164(
             let pid_bytes = &tag_body[open + 1..tag_body.len() - 1];
             attrs.insert_sym(KEYS.tag, Value::Str(subslice::share(line, name)));
             match canonical_pid(pid_bytes) {
-                Some(n) => attrs.insert_sym(KEYS.pid, Value::U64(n)),
+                Some(n) => attrs.insert_sym(KEYS.process_pid, Value::U64(n)),
                 // `is_tag_shaped` guarantees the PID is PRINTUSASCII, so valid UTF-8.
                 None => attrs.insert_sym(KEYS.pid, Value::Str(subslice::share(line, pid_bytes))),
             }
@@ -735,8 +737,8 @@ fn parse_5424(
         attrs.insert_sym(KEYS.tag, v);
     }
     if let Some(pid) = nil_or(procid_field) {
-        // Free-form PRINTUSASCII: `U64` when numeric, else `Str` (`super`'s module doc,
-        // `syslog.pid`).
+        // Free-form PRINTUSASCII: `process.pid` when numeric, else `syslog.pid` (`super`'s module
+        // doc, `process.pid`).
         if !is_printusascii(pid) {
             return Err(malformed(format!(
                 "PROCID {:?} is not PRINTUSASCII",
@@ -745,7 +747,7 @@ fn parse_5424(
         }
         match canonical_pid(pid) {
             Some(n) => {
-                attrs.insert_sym(KEYS.pid, Value::U64(n));
+                attrs.insert_sym(KEYS.process_pid, Value::U64(n));
             }
             None => {
                 attrs.insert_sym(KEYS.pid, Value::Str(subslice::share(line, pid)));
@@ -940,14 +942,15 @@ mod tests {
     fn rfc3164_tag_with_pid_splits_into_tag_and_pid() {
         let event = only_event(decode("<13>tag[1234]: hello"));
         assert_eq!(event.attributes.get("syslog.tag").and_then(Value::as_str), Some("tag"));
-        assert_eq!(event.attributes.get("syslog.pid"), Some(&Value::U64(1234)));
+        assert_eq!(event.attributes.get("process.pid"), Some(&Value::U64(1234)));
+        assert!(event.attributes.get("syslog.pid").is_none());
         assert_eq!(message_str(&event), "hello");
     }
 
     #[test]
     fn rfc3164_tag_with_an_overflowing_numeric_pid_becomes_a_str_pid_not_a_panic() {
         // A PID that overflows `u64` must not panic; it becomes `Value::Str` (`super`'s module doc,
-        // `syslog.pid`) and the `tag[pid]:` token stays out of the message.
+        // `process.pid`) and the `tag[pid]:` token stays out of the message.
         let line = "<13>tag[99999999999999999999]: hello";
         let event = only_event(decode(line));
         assert_eq!(event.attributes.get("syslog.tag").and_then(Value::as_str), Some("tag"));
@@ -972,6 +975,8 @@ mod tests {
         // the line, which must decode without a panic.
         let event = only_event(decode("<13>nginx:"));
         assert_eq!(event.attributes.get("syslog.tag").and_then(Value::as_str), Some("nginx"));
+        assert!(event.attributes.get("process.pid").is_none());
+        assert!(event.attributes.get("syslog.pid").is_none());
         assert_eq!(message_str(&event), "");
 
         // Same hazard one token later: the empty MSG this time comes from `after2`.
@@ -989,7 +994,7 @@ mod tests {
         assert_eq!(message_str(&event), "some message");
         assert_eq!(event.attributes.get("host.name").and_then(Value::as_str), Some("myhost"));
         assert_eq!(event.attributes.get("syslog.tag").and_then(Value::as_str), Some("app"));
-        assert_eq!(event.attributes.get("syslog.pid"), Some(&Value::U64(1234)));
+        assert_eq!(event.attributes.get("process.pid"), Some(&Value::U64(1234)));
         assert_eq!(event.attributes.get("syslog.msgid").and_then(Value::as_str), Some("ID47"));
         assert_eq!(
             event.attributes.get("syslog.timestamp"),
@@ -1006,6 +1011,7 @@ mod tests {
         assert!(event.attributes.get("host.name").is_none());
         assert!(event.attributes.get("syslog.tag").is_none());
         assert!(event.attributes.get("syslog.pid").is_none());
+        assert!(event.attributes.get("process.pid").is_none());
         assert!(event.attributes.get("syslog.msgid").is_none());
         assert!(event.attributes.get("syslog.sd").is_none());
         assert_eq!(message_str(&event), "nil fields");
@@ -1075,7 +1081,7 @@ mod tests {
             // The rest of the line parsed fine and must still be kept.
             assert_eq!(event.attributes.get("host.name").and_then(Value::as_str), Some("h"));
             assert_eq!(event.attributes.get("syslog.tag").and_then(Value::as_str), Some("a"));
-            assert_eq!(event.attributes.get("syslog.pid"), Some(&Value::U64(1)));
+            assert_eq!(event.attributes.get("process.pid"), Some(&Value::U64(1)));
             assert_eq!(message_str(&event), "msg");
         }
     }
@@ -1185,7 +1191,7 @@ mod tests {
         let event = only_event(decode_bytes(datagram));
         assert_eq!(event.attributes.get("host.name").and_then(Value::as_str), Some("myhost"));
         assert_eq!(event.attributes.get("syslog.tag").and_then(Value::as_str), Some("app"));
-        assert_eq!(event.attributes.get("syslog.pid"), Some(&Value::U64(123)));
+        assert_eq!(event.attributes.get("process.pid"), Some(&Value::U64(123)));
         match message_val(&event) {
             Value::Bytes(b) => assert_eq!(b.as_ref(), &[0xff, 0xfe, b'x']),
             other => panic!("expected Value::Bytes, got {other:?}"),
@@ -1199,7 +1205,7 @@ mod tests {
         datagram.extend_from_slice(&[0xff, 0xfe, b'x']);
         let event = only_event(decode_bytes(datagram));
         assert_eq!(event.attributes.get("syslog.tag").and_then(Value::as_str), Some("tag"));
-        assert_eq!(event.attributes.get("syslog.pid"), Some(&Value::U64(1)));
+        assert_eq!(event.attributes.get("process.pid"), Some(&Value::U64(1)));
         match message_val(&event) {
             Value::Bytes(b) => assert_eq!(b.as_ref(), &[0xff, 0xfe, b'x']),
             other => panic!("expected Value::Bytes, got {other:?}"),
@@ -1288,6 +1294,7 @@ mod tests {
         );
         assert_eq!(event.attributes.get("syslog.tag").and_then(Value::as_str), Some("su"));
         assert!(event.attributes.get("syslog.pid").is_none());
+        assert!(event.attributes.get("process.pid").is_none());
         assert_eq!(event.attributes.get("syslog.msgid").and_then(Value::as_str), Some("ID47"));
         assert!(event.attributes.get("syslog.sd").is_none());
         assert_eq!(
@@ -1306,7 +1313,7 @@ mod tests {
         assert_eq!(event.attributes.get("_logit.syslog.severity"), Some(&Value::U64(5)));
         assert_eq!(event.attributes.get("host.name").and_then(Value::as_str), Some("192.0.2.1"));
         assert_eq!(event.attributes.get("syslog.tag").and_then(Value::as_str), Some("myproc"));
-        assert_eq!(event.attributes.get("syslog.pid"), Some(&Value::U64(8710)));
+        assert_eq!(event.attributes.get("process.pid"), Some(&Value::U64(8710)));
         assert!(event.attributes.get("syslog.msgid").is_none());
         assert!(event.attributes.get("syslog.sd").is_none());
         assert!(event.attributes.get("syslog.timestamp").is_some());
@@ -1325,6 +1332,7 @@ mod tests {
         );
         assert_eq!(event.attributes.get("syslog.tag").and_then(Value::as_str), Some("evntslog"));
         assert!(event.attributes.get("syslog.pid").is_none());
+        assert!(event.attributes.get("process.pid").is_none());
         assert_eq!(event.attributes.get("syslog.msgid").and_then(Value::as_str), Some("ID47"));
 
         let mut params = AttrMap::new();
@@ -1505,8 +1513,9 @@ mod tests {
         );
     }
 
-    /// `syslog.pid` is `U64` only for canonical decimal, so a PID `u64::from_str` would rewrite
-    /// (`+5`, `007`) stays the `Str` the sender wrote and relays unchanged.
+    /// `process.pid` is written only for canonical decimal that fits a `u64`, so a PID
+    /// `u64::from_str` would rewrite (`+5`, `007`) or that overflows a `u64` stays the `Str` `syslog.pid` the
+    /// sender wrote and relays unchanged. A PID is one attribute or the other, never both.
     #[test]
     fn a_non_canonical_numeric_pid_stays_a_str() {
         for (line, pid) in [
@@ -1514,6 +1523,8 @@ mod tests {
             ("<134>1 - - - 007 - - msg", "007"),
             ("<13>app[+5]: msg", "+5"),
             ("<13>app[007]: msg", "007"),
+            ("<134>1 - - - 18446744073709551616 - - msg", "18446744073709551616"),
+            ("<13>app[18446744073709551616]: msg", "18446744073709551616"),
         ] {
             let event = only_event(decode(line));
             assert_eq!(
@@ -1521,6 +1532,7 @@ mod tests {
                 Some(pid),
                 "{line}"
             );
+            assert!(event.attributes.get("process.pid").is_none(), "{line}");
         }
         for (line, pid) in [
             ("<134>1 - - - 0 - - msg", 0),
@@ -1529,7 +1541,8 @@ mod tests {
             ("<13>app[42]: msg", 42),
         ] {
             let event = only_event(decode(line));
-            assert_eq!(event.attributes.get("syslog.pid"), Some(&Value::U64(pid)), "{line}");
+            assert_eq!(event.attributes.get("process.pid"), Some(&Value::U64(pid)), "{line}");
+            assert!(event.attributes.get("syslog.pid").is_none(), "{line}");
         }
     }
 
@@ -1680,6 +1693,7 @@ mod tests {
             Some("logit-fixture")
         );
         assert!(event.attributes.get("syslog.pid").is_none());
+        assert!(event.attributes.get("process.pid").is_none());
         assert!(event.attributes.get("syslog.msgid").is_none());
 
         let mut time_quality = AttrMap::new();

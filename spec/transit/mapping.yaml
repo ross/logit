@@ -2086,6 +2086,30 @@ rows:
           A log's `hostname` is `host.name`, so a `hostname` attribute has no key of its own on
           the wire and is left off, counted.
   - kind: attributes
+    feature: log_service
+    cells:
+      otlp_out:
+        class: exact
+        text: A log attribute.
+      datadog_out:
+        class: lost
+        counter: logit.output.tags.omitted{reason=reserved_key}
+        text: >-
+          A log's `service` is `service.name`, so a `service` attribute beside it has no key of
+          its own on the wire and is left off, counted.
+  - kind: attributes
+    feature: log_service_field
+    cells:
+      otlp_out:
+        class: exact
+        text: A log attribute.
+      datadog_out:
+        class: normalized
+        reason: respelled
+        text: >-
+          A log's string `service` attribute with no `service.name` is the log's `service` field,
+          which datadog_in reads back as `service.name`.
+  - kind: attributes
     feature: container_id
     cells:
       statsd_out:
@@ -2097,7 +2121,8 @@ rows:
             line.
         - class: exact
           text: >-
-            The line's `|c:` segment, never a tag, which statsd_in reads back as `container.id`.
+            A non-empty one is the line's `|c:` segment, never a tag, and an empty one an ordinary
+            tag; statsd_in reads either back as `container.id`.
       prometheus_out:
         class: normalized
         reason: label_sanitized
@@ -2125,6 +2150,119 @@ rows:
             Under `tags: drop`, no tag is written, counted once per attribute.
         - class: exact
           text: A `;container.id=<id>` tag.
+  - kind: attributes
+    feature: service_identity
+    cells:
+      statsd_out:
+        - when: {format: statsd}
+          class: lost
+          counter: logit.output.tags.omitted{reason=dialect}
+          text: Plain statsd has no tags; each is counted once per wire tag.
+        - class: exact
+          text: >-
+            `deployment.environment.name`, `service.version`, and `service.name` are Datadog's
+            `env:`, `version:`, and `service:` tags, which statsd_in reads back as the key.
+      prometheus_out:
+        class: normalized
+        reason: label_sanitized
+        counter: logit.output.labels.normalized{reason=name_sanitized}
+        text: >-
+          A label, read back with each `.` written as `_`, since a label name has no `.`; counted
+          once per label it renames.
+      otlp_out:
+        class: exact
+        text: A string attribute.
+      influxdb_out:
+        class: exact
+        text: A tag.
+      datadog_out:
+        class: exact
+        text: >-
+          On a metric, an event, or a service check, Datadog's `env`, `version`, or `service`
+          tag, the Datadog OTLP exporter's spelling, which datadog_in reads back as the key.
+      graphite_out:
+        - when: {tags: drop}
+          class: lost
+          counter: logit.output.tags.omitted{reason=dialect}
+          text: >-
+            Under `tags: drop`, no tag is written, counted once per attribute.
+        - class: exact
+          text: A `;name=value` tag.
+  - kind: attributes
+    feature: service_tag
+    cells:
+      statsd_out:
+        - when: {format: statsd}
+          class: lost
+          counter: logit.output.tags.omitted{reason=dialect}
+          text: Plain statsd has no tags; each is counted once per wire tag.
+        - class: normalized
+          reason: respelled
+          text: >-
+            A valued `env`, `version`, or `service` is the DogStatsD tag of that name, which
+            statsd_in reads back as `deployment.environment.name`, `service.version`, or
+            `service.name`.
+      prometheus_out:
+        class: exact
+        text: A label of that name.
+      otlp_out:
+        class: exact
+        text: A string attribute.
+      influxdb_out:
+        class: exact
+        text: A tag.
+      datadog_out:
+        class: normalized
+        reason: respelled
+        text: >-
+          On a metric, an event, or a service check, the tag of that name, which datadog_in reads
+          back as `deployment.environment.name`, `service.version`, or `service.name`.
+      graphite_out:
+        - when: {tags: drop}
+          class: lost
+          counter: logit.output.tags.omitted{reason=dialect}
+          text: >-
+            Under `tags: drop`, no tag is written, counted once per attribute.
+        - class: exact
+          text: A `;name=value` tag.
+  - kind: attributes
+    feature: service_tag_beside_key
+    cells:
+      statsd_out:
+        - when: {format: statsd}
+          class: lost
+          counter: logit.output.tags.omitted{reason=dialect}
+          text: Plain statsd has no tags; each is counted once per wire tag.
+        - class: lost
+          counter: logit.output.tags.omitted{reason=unrepresentable}
+          text: >-
+            Beside its standard key, which leaves as the same tag, a valued `env`, `version`, or
+            `service` would be a second value for the key, so it's left off, counted once per wire
+            tag.
+      prometheus_out:
+        class: exact
+        text: A label of that name.
+      otlp_out:
+        class: exact
+        text: A string attribute.
+      influxdb_out:
+        class: exact
+        text: A tag.
+      datadog_out:
+        class: lost
+        counter: logit.output.tags.omitted{reason=unrepresentable}
+        text: >-
+          On a metric, an event, or a service check, beside its standard key, which leaves as the
+          same tag, a valued `env`, `version`, or `service` would be a second value for the key,
+          so it's left off, counted once per wire tag.
+      graphite_out:
+        - when: {tags: drop}
+          class: lost
+          counter: logit.output.tags.omitted{reason=dialect}
+          text: >-
+            Under `tags: drop`, no tag is written, counted once per attribute.
+        - class: exact
+          text: A `;name=value` tag.
   - kind: attributes
     feature: bool_value
     cells:

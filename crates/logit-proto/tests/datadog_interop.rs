@@ -266,6 +266,22 @@ fn replay(capture: &Capture) -> Vec<EventBatch> {
             );
         }
     }
+    // A valued `env:`, `version:`, or `service:` tag on a metric, an event, or a service check is
+    // its standard key, so none of those names is a valued attribute there.
+    let tag_routes =
+        [Route::SeriesV2Protobuf, Route::Sketches, Route::ServiceChecks, Route::Events];
+    if tag_routes.contains(&route) {
+        for event in events(&first) {
+            for key in ["env", "version", "service"] {
+                let value = event.attributes.get(key);
+                assert!(
+                    value.is_none_or(|v| *v == Value::Bool(true)),
+                    "{}: a valued `{key}` attribute",
+                    capture.name
+                );
+            }
+        }
+    }
 
     for batch in &first {
         let (Some(encoded), duplicates) = route.encode(batch) else {
@@ -366,7 +382,8 @@ fn the_agent_series_carry_the_dogstatsd_clients_metrics() {
     assert_eq!(str_attr(rate, "endpoint"), Some("/checkout"));
     // The client's `env:record` twice (its own tag and `DD_ENV`'s) is one tag by the time the
     // Agent sends it; the decoder's own exact-duplicate dedupe agrees.
-    assert_eq!(str_attr(rate, "env"), Some("record"));
+    assert_eq!(str_attr(rate, "deployment.environment.name"), Some("record"));
+    assert_eq!(str_attr(rate, "env"), None, "`env:` is the standard key, never a bare attribute");
 
     let gauge = by_name["record.queue.depth"];
     assert_eq!(gauge.metrics[0].kind, MetricKind::gauge(17.0));
@@ -453,6 +470,13 @@ fn the_agent_logs_carry_the_tailed_lines() {
     assert!(messages[0].ends_with("record-fixtures started on port 5050"));
     assert!(messages[1].starts_with(r#"{"timestamp":"2026-09-24T10:00:01Z""#));
     assert!(messages[2].contains("request failed: status=500"));
+    // The log's `service` is `service.name`, and `ddtags`, holding no `env:`, `version:`, or
+    // `service:` entry, stays as the Agent wrote it.
+    for event in events(&batches) {
+        assert_eq!(str_attr(event, "service.name"), Some("record-fixtures"));
+        assert_eq!(event.attributes.get("service"), None);
+        assert_eq!(str_attr(event, "ddtags"), Some("filename:app.log,dirname:/var/log/record"));
+    }
 }
 
 /// The Agent's trace payload: three Flask traces, each root marked `_top_level` by the Agent,
