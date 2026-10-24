@@ -80,7 +80,7 @@ otherwise.
 
 | Input | Wire field | Before | Becomes | Code |
 |---|---|---|---|---|
-| `statsd_in` | `\|c:` on a metric line, event, or service check | `_logit.statsd.container_id`, event, the raw field | `container.id`, event | `insert_container_id` in `crates/logit-proto/src/statsd/decode.rs` |
+| `statsd_in` | `\|c:` on a metric line, event, or service check | `_logit.statsd.container_id`, event, the raw field | `container.id`, event | `insert_local_data` and `split_local_data` in `crates/logit-proto/src/statsd/decode.rs` |
 | `datadog_trace_in` | `Datadog-Container-ID` header | `_logit.datadog.tracer.container_id`, resource, filled only when the payload's own field is empty | `container.id`, resource | `apply_tracer_headers` (through `TRACER_STR_HEADERS` in `crates/logit-proto/src/datadog/mod.rs`) and `apply_stats_headers` (through `STATS_HEADERS`) in `crates/logit-inputs/src/datadog_trace.rs` |
 | `datadog_in` traces, `datadog_trace_in` `/v0.7/traces` | `TracerPayload.container_id` | `_logit.datadog.tracer.container_id`, resource | `container.id`, resource | `tracer_resource` in `crates/logit-proto/src/datadog/traces.rs` |
 | `datadog_in` stats, `datadog_trace_in` `/v0.6/stats` | `ClientStatsPayload.ContainerID` | `_logit.datadog.tracer.container_id`, resource (the tracer carrier, shared with traces) | `container.id`, resource | `PAYLOAD_STRINGS` and `payload_string_mut` in `crates/logit-proto/src/datadog/stats.rs` |

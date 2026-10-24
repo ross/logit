@@ -813,9 +813,9 @@ mapping:
   maps the singular `container.image.tag` to `image_tag`; writing `container.image.tags`' first
   element there is this relay's rule by analogy. On a trace payload the key is the
   `container_id` field, as the Agent's OTLP receiver fills it from a resource's `container.id`
-  (`pkg/trace/api/otlp.go`, `receiveResourceSpansV2`). On a log it's a `container_id:<id>`
-  entry in `ddtags`, the tag the Agent puts on a container's logs, whose tagger it queries at high
-  cardinality (`pkg/logs/internal/tag/provider.go`, `GetTags`).
+  (`pkg/trace/api/otlp.go`, `receiveResourceSpansV1` and `receiveResourceSpansV2`). On a log
+  it's a `container_id:<id>` entry in `ddtags`, the tag the Agent puts on a container's logs,
+  whose tagger it queries at high cardinality (`pkg/logs/internal/tag/provider.go`, `GetTags`).
 
 The like pairs stay fixed points: a tracer's container id relays through `container.id` both
 ways, and `datadog_in` reads a series' `container_id:` tag back as an attribute of that name,
