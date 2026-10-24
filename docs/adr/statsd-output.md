@@ -992,3 +992,15 @@ reads only prefixed items in a list. `container.id` is never also a tag. The rel
 point modulo one more normalization (`crates/logit-cli/tests/statsd_round_trip.rs`'s (11)): a
 `ci-<id>` or `cid-<id>` relays as `<id>`, a list relays as `ci-<id>,in-<inode>`, and a list item
 the Agent doesn't read is dropped at decode, counted `logit.input.fields.dropped{reason="malformed"}`.
+
+## Amendment (2026-10-24): service identity leaves as Unified Service Tagging tags
+
+`statsd_in` decodes a valued `env:`, `version:`, or `service:` tag onto
+`deployment.environment.name`, `service.version`, or `service.name`
+([ADR `process-hostname`](process-hostname.md)'s "Amendment: service identity on tags
+(2026-10-24)"), and under `format: dogstatsd` `statsd_out` writes each key back as that tag,
+never under the key's own name, so the relay stays a fixed point modulo tag order. A valued
+`env`, `version`, or `service` attribute beside its key would be a second tag for one key, so
+it's omitted, counted `logit.output.tags.omitted{reason="unrepresentable"}`, as a valued `host`
+beside `host.name` is; a bare token stays. `statsd_out`'s module doc section "Service identity"
+is the canonical statement.

@@ -139,9 +139,9 @@
 //!
 //! Under `Format::DogStatsd`, `deployment.environment.name`, `service.version`, and
 //! `service.name` (the event's, else the resource's) leave as Datadog's Unified Service Tagging
-//! tags, `env:`, `version:`, and `service:`, one per element of an `Array`, never under the
-//! standard key's own name; `statsd_in` reads each back as the key. Beside a key that writes a
-//! tag, a valued `env`, `version`, or `service` attribute would be a second tag for the same key,
+//! tags, `env:`, `version:`, and `service:`, one per element of an `Array`; `statsd_in` reads each
+//! back as the key. A bare `Bool(true)` among a key's values names no value, so it leaves as a
+//! bare token under the key's own name. Beside a key that writes a valued tag, a valued `env`, `version`, or `service` attribute would be a second tag for the same key,
 //! so it's omitted, counted `tags.omitted{reason="unrepresentable"}` once per wire tag; a bare one
 //! (`Bool(true)`) names no value and stays. Without the key, an `env`, `version`, or `service`
 //! attribute is an ordinary tag.
@@ -1293,7 +1293,6 @@ fn build_tag_suffix<'a>(
         // Service identity (module doc's "Service identity"): a standard key leaves in
         // Datadog's spelling, and beside it a valued attribute of that spelling would be a
         // second tag for the same key, so it's left off per wire tag; a bare token stays.
-        let mut key_str = key_str;
         if let Some(i) = UNIFIED_SERVICE_TAGS.iter().position(|(dd, _)| *dd == key_str) {
             if keyed[i] {
                 let elements = match value {
@@ -1312,7 +1311,16 @@ fn build_tag_suffix<'a>(
         } else if let Some((dd, _)) =
             UNIFIED_SERVICE_TAGS.iter().find(|(_, standard)| *standard == key_str)
         {
-            key_str = dd;
+            // A bare token stays under the key's own name: a bare `env` names no environment.
+            let elements = match value {
+                Value::Array(elements) => elements.as_slice(),
+                _ => std::slice::from_ref(value),
+            };
+            for element in elements {
+                let name = if matches!(element, Value::Bool(true)) { key_str } else { dd };
+                push_one_tag(suffix, scratch, name, element, stats);
+            }
+            continue;
         }
 
         match value {
@@ -1345,12 +1353,14 @@ fn build_tag_suffix<'a>(
     }
 }
 
-/// Whether `value` writes at least one DogStatsD tag through [`push_one_tag`]: a value (or an
-/// `Array` element) [`tag_value`] renders, `Bool(true)` as a bare token among them.
+/// Whether a service identity key's `value` writes at least one valued DogStatsD tag through
+/// [`push_one_tag`]: a value (or an `Array` element) [`tag_value`] renders, other than a bare
+/// `Bool(true)`, which stays under the key's own name.
 fn renders_tag(value: &Value) -> bool {
     let scalar = |v: &Value| match v {
         Value::Str(s) => std::str::from_utf8(s).is_ok(),
-        Value::Bool(_) | Value::I64(_) | Value::U64(_) | Value::F64(_) => true,
+        Value::Bool(b) => !b,
+        Value::I64(_) | Value::U64(_) | Value::F64(_) => true,
         _ => false,
     };
     match value {
@@ -3526,6 +3536,22 @@ mod tests {
             &[("env", Value::str("dev")), ("service", Value::str("api"))],
         )]);
         assert!(msgs[0].contains("env:dev") && msgs[0].contains("service:api"), "{msgs:?}");
+        assert_eq!(stats.tags_omitted_unrepresentable, 0);
+
+        // A bare token under a key stays under the key's own name and shadows nothing.
+        let (msgs, stats) = encode(vec![metric_event(
+            "hits",
+            MetricKind::counter(1.0),
+            &[
+                ("service.name", Value::Array(vec![Value::Bool(true), Value::str("api")])),
+                ("deployment.environment.name", Value::Bool(true)),
+                ("env", Value::str("dev")),
+            ],
+        )]);
+        let (_, tags) = msgs[0].split_once("|#").expect("a tag segment");
+        let mut tags: Vec<&str> = tags.split(',').collect();
+        tags.sort_unstable();
+        assert_eq!(tags, ["deployment.environment.name", "env:dev", "service.name", "service:api"]);
         assert_eq!(stats.tags_omitted_unrepresentable, 0);
 
         // A key that writes no tag shadows nothing.

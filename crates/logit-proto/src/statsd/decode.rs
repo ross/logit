@@ -216,9 +216,9 @@ fn insert_source_timestamp(attributes: &mut AttrMap) {
 /// value lands in `host_tag` for [`insert_host`], as the Agent consumes every one.
 ///
 /// A valued `env:`, `version:`, or `service:` tag folds into its standard key
-/// ([`logit_core::attrs::UNIFIED_SERVICE_TAGS`]); a valueless one stays an ordinary tag. A tag
-/// spelling the standard key itself is folded after the rest, and beside a Datadog-spelled tag for
-/// the same key it's omitted, counted per wire tag, as the protocol's own form wins.
+/// ([`logit_core::attrs::UNIFIED_SERVICE_TAGS`]); a valueless one stays an ordinary tag. A valued
+/// tag spelling the standard key itself is folded after the rest, and beside a Datadog-spelled tag
+/// for the same key it's omitted, counted per wire tag, as the protocol's own form wins.
 fn insert_tags<'a>(
     attributes: &mut AttrMap,
     bytes: &Bytes,
@@ -250,7 +250,7 @@ fn insert_tags<'a>(
                 unified[i] = true;
                 KEYS.unified[i]
             }
-            Some((i, (dd, _))) if *dd != key => {
+            Some((i, (dd, _))) if *dd != key && !matches!(value, Value::Bool(true)) => {
                 spelled.push((i, value));
                 continue;
             }
@@ -1516,9 +1516,9 @@ mod tests {
         );
     }
 
-    /// A tag spelling a standard service identity key beside the Datadog-spelled tag is omitted
-    /// and counted `reserved_key` once per wire tag, before or after it; alone, or beside a
-    /// valueless token, it's the key's value.
+    /// A valued tag spelling a standard service identity key beside the Datadog-spelled tag is
+    /// omitted and counted `reserved_key` once per wire tag, before or after it; alone, or beside a
+    /// valueless token, it's the key's value, and a valueless one is no collision.
     #[test]
     fn a_standard_service_key_tag_beside_its_datadog_tag_is_omitted_and_counted() {
         let registry = logit_core::Registry::new();
@@ -1528,7 +1528,8 @@ mod tests {
                         b:1|c|#service:api,service.name:x,service.name:y
                         _sc|c|0|#service.version:9,version:1.2
                         c:1|c|#deployment.environment.name:dev
-                        d:1|c|#env,deployment.environment.name:dev";
+                        d:1|c|#env,deployment.environment.name:dev
+                        e:1|c|#service:api,service.name";
         let events = decoder.decode(Bytes::from(datagram)).unwrap().events;
         assert_eq!(attr_str(&events[0], "deployment.environment.name"), Some("prod"));
         assert_eq!(attr_str(&events[1], "service.name"), Some("api"));
@@ -1536,6 +1537,11 @@ mod tests {
         assert_eq!(attr_str(&events[3], "deployment.environment.name"), Some("dev"));
         assert_eq!(attr_str(&events[4], "deployment.environment.name"), Some("dev"));
         assert_eq!(events[4].attributes.get("env"), Some(&Value::Bool(true)));
+        assert_eq!(
+            events[5].attributes.get("service.name"),
+            Some(&Value::Array(vec![Value::str("api"), Value::Bool(true)])),
+            "a valueless token names no service, so it's no collision"
+        );
         assert_eq!(input_counter(&registry, "logit.input.tags.omitted", "reserved_key"), 4.0);
     }
 
@@ -2115,6 +2121,14 @@ mod tests {
             let (decoded, diagnostics) = decode_interop(&bytes);
             assert!(diagnostics.is_empty(), "{name} raised {diagnostics:?}");
             assert!(!decoded.is_empty(), "{name} decoded to no events at all");
+            // A valued `env:`, `version:`, or `service:` tag is its standard key, never a
+            // valued attribute of the tag's name.
+            for event in &decoded {
+                for key in ["env", "version", "service"] {
+                    let value = event.attributes.get(key);
+                    assert!(value.is_none_or(|v| *v == Value::Bool(true)), "{name}: `{key}`");
+                }
+            }
             datagrams += 1;
             events += decoded.len();
         }
@@ -2240,6 +2254,14 @@ mod tests {
                 .is_some_and(|i| i.parse::<u64>().is_ok()));
             assert_eq!(event.attributes.get("container.id"), None, "packet {i}");
             assert_eq!(event.attributes.get("_logit.statsd.container_id"), None, "packet {i}");
+            // The client's `env:`, `service:`, and `version:` tags (its own and `DD_ENV`'s, one
+            // after the decoder's exact-duplicate dedupe) are the standard keys.
+            assert_eq!(attr_str(&event, "deployment.environment.name"), Some("record"));
+            assert_eq!(attr_str(&event, "service.name"), Some("record-fixtures"));
+            assert_eq!(attr_str(&event, "service.version"), Some("1.2.3"));
+            for key in ["env", "version", "service"] {
+                assert_eq!(event.attributes.get(key), None, "packet {i}: `{key}`");
+            }
             decoded.push(event);
         }
         let kinds: Vec<&str> = decoded

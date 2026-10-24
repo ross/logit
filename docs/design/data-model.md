@@ -129,6 +129,14 @@ resource; a sink reads the event, else the resource, and writes its own wire's f
 ([ADR `process-hostname`](../adr/process-hostname.md)'s "Amendment: container identity
 (2026-10-24)").
 
+**`service.name`, `deployment.environment.name`, and `service.version` are the standard service
+identity keys** (`logit_core::attrs::SERVICE_NAME`, `DEPLOYMENT_ENVIRONMENT_NAME`, and
+`SERVICE_VERSION`). `statsd_in` and `datadog_in` write a valued DogStatsD or Datadog `service:`,
+`env:`, or `version:` tag on a metric, event, or service check onto them, on the event, and a
+Datadog-family sink writes them back as those tags
+([ADR `process-hostname`](../adr/process-hostname.md)'s "Amendment: service identity on tags
+(2026-10-24)").
+
 **The private namespace `_logit.`: a carrier lives under `_logit.<protocol>.`**
 (`_logit.statsd.type`). A carrier is a protocol's raw wire spelling of something the model
 normalizes, or a payload field only that protocol's family reads. The tables below list every

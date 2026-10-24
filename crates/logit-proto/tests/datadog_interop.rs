@@ -262,6 +262,22 @@ fn replay(capture: &Capture) -> Vec<EventBatch> {
             );
         }
     }
+    // A valued `env:`, `version:`, or `service:` tag on a metric, an event, or a service check is
+    // its standard key, so none of those names is a valued attribute there.
+    let tag_routes =
+        [Route::SeriesV2Protobuf, Route::Sketches, Route::ServiceChecks, Route::Events];
+    if tag_routes.contains(&route) {
+        for event in events(&first) {
+            for key in ["env", "version", "service"] {
+                let value = event.attributes.get(key);
+                assert!(
+                    value.is_none_or(|v| *v == Value::Bool(true)),
+                    "{}: a valued `{key}` attribute",
+                    capture.name
+                );
+            }
+        }
+    }
 
     for batch in &first {
         let (Some(encoded), duplicates) = route.encode(batch) else {

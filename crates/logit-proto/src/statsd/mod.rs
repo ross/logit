@@ -143,7 +143,7 @@
 //!   repeated `env:` is an `Array`.
 //! - **A valueless `env`, `version`, or `service` token stays an ordinary `Bool(true)` tag**
 //!   under its own name: it names no value.
-//! - **A tag spelling the standard key beside the Datadog-spelled one is omitted**, counted
+//! - **A valued tag spelling the standard key beside the Datadog-spelled one is omitted**, counted
 //!   `logit.input.tags.omitted{reason="reserved_key"}` once per wire tag, so
 //!   `#env:prod,deployment.environment.name:dev` is `deployment.environment.name: "prod"`.
 //!   Without the Datadog-spelled tag, a `deployment.environment.name` tag is the key's value, as a

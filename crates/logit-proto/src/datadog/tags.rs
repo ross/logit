@@ -14,7 +14,8 @@
 //! ([`logit_core::attrs::UNIFIED_SERVICE_TAGS`]), both ways, as `statsd_in`'s module doc,
 //! "Service identity", has it for DogStatsD: a tag spelling the standard key beside the
 //! Datadog-spelled one is returned to count as `reason="reserved_key"`, and [`render_tags`] writes
-//! the key in Datadog's spelling.
+//! the key in Datadog's spelling. A valueless token names no value, so it keeps its own name both
+//! ways.
 
 use logit_core::attrs::{is_private, UNIFIED_SERVICE_TAGS};
 use logit_core::interner::{intern, resolve};
@@ -31,8 +32,9 @@ pub struct Omitted {
 }
 
 /// Folds every tag of a list into `attributes` under the shared rule. A valued `env:`,
-/// `version:`, or `service:` tag folds into its standard key; a tag spelling that key itself is
-/// folded after the rest, and beside a Datadog-spelled tag for the same key it's left off.
+/// `version:`, or `service:` tag folds into its standard key; a valued tag spelling that key
+/// itself is folded after the rest, and beside a Datadog-spelled tag for the same key it's left
+/// off.
 pub fn insert_tags<'a>(
     attributes: &mut AttrMap,
     tags: impl IntoIterator<Item = &'a str>,
@@ -60,7 +62,7 @@ pub fn insert_tags<'a>(
                 unified[i] = true;
                 intern(std)
             }
-            Some((i, (dd, _))) if *dd != key => {
+            Some((i, (dd, _))) if *dd != key && !matches!(value, Value::Bool(true)) => {
                 spelled.push((i, value));
                 continue;
             }
@@ -146,7 +148,8 @@ fn keeps_bare(row: usize) -> bool {
 ///
 /// `container.id` renders as `container_id`, `container.image.tags` as one `image_tag` from its
 /// first element, each further element counted unrepresentable, and `deployment.environment.name`,
-/// `service.version`, and `service.name` as `env`, `version`, and `service` ([`RESPELLED`]). A
+/// `service.version`, and `service.name` as `env`, `version`, and `service`, a bare token among
+/// their values under the key's own name ([`RESPELLED`]). A
 /// `container_id` or `image_tag` attribute beside the key that renders one is left off, every tag
 /// it would have written counted unrepresentable; an `env`, `version`, or `service` attribute
 /// beside its key loses its valued tags the same way and keeps its bare ones.
@@ -175,9 +178,15 @@ pub fn render_tags<'a>(
                     }
                     dropped.unrepresentable += items.len().saturating_sub(1);
                 }
+                Value::Array(items) if keeps_bare(i) => {
+                    for item in items {
+                        render_service(name, wire, item, out, &mut dropped);
+                    }
+                }
+                _ if keeps_bare(i) => render_service(name, wire, value, out, &mut dropped),
                 _ => render_one(wire, value, out, &mut dropped),
             }
-            keyed[i] |= out.len() > start;
+            keyed[i] |= out[start..].iter().any(|tag| tag.as_str() != name);
             continue;
         }
         render_one(name, value, out, &mut dropped);
@@ -197,6 +206,19 @@ pub fn render_tags<'a>(
         out.remove(at);
     }
     dropped
+}
+
+/// Renders one value of a service identity key: a bare token (`true`) under the key's own name,
+/// since a bare `env` would name no environment, and anything else under Datadog's `wire` name.
+fn render_service(
+    name: &str,
+    wire: &str,
+    value: &Value,
+    out: &mut Vec<String>,
+    dropped: &mut Dropped,
+) {
+    let key = if matches!(value, Value::Bool(true)) { name } else { wire };
+    render_one(key, value, out, dropped);
 }
 
 fn render_one(key: &str, value: &Value, out: &mut Vec<String>, dropped: &mut Dropped) {
@@ -237,7 +259,7 @@ pub fn count_tags<'a>(
                     Value::Array(items) if i == 1 => items.first().map_or(0, count_one),
                     _ => count_one(value),
                 };
-                keyed[i] |= n > 0;
+                keyed[i] |= if keeps_bare(i) { n > count_bare(value) } else { n > 0 };
                 n
             }
             None => {
@@ -373,6 +395,21 @@ mod tests {
         assert_eq!(out, ["env", "env:prod", "service:api", "service:web", "version:1.2"]);
         assert_eq!(dropped, Dropped { unrepresentable: 2 }, "env:dev and version:9");
         assert_eq!(count_tags(attrs.iter(), &[]), out.len());
+
+        // A bare token under a key stays under the key's own name and shadows nothing.
+        let mut bare = AttrMap::new();
+        bare.insert("service.name", Value::Array(vec![Value::Bool(true), Value::str("api")]));
+        bare.insert("deployment.environment.name", Value::Bool(true));
+        bare.insert("env", Value::str("dev"));
+        let mut out = Vec::new();
+        let dropped = render_tags(bare.iter(), &[], &mut out);
+        out.sort();
+        assert_eq!(out, ["deployment.environment.name", "env:dev", "service.name", "service:api"]);
+        assert_eq!(dropped, Dropped::default());
+        assert_eq!(count_tags(bare.iter(), &[]), out.len());
+        let mut back = AttrMap::new();
+        insert_tags(&mut back, out.iter().map(String::as_str));
+        assert_eq!(back.get("service.name"), bare.get("service.name"));
 
         let mut alone = AttrMap::new();
         alone.insert("env", Value::str("dev"));
