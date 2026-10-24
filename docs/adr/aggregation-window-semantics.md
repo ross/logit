@@ -1,6 +1,6 @@
 ---
 created: 2026-08-29
-updated: 2026-10-23
+updated: 2026-10-24
 ---
 
 # `aggregate` transform: tumbling windows, pass-through, and the flush-tick contract
@@ -645,7 +645,8 @@ Two identities hold for every `aggregate`:
   "`aggregate`" table. `absorbed` is `logit.transform.metrics.absorbed`, and each reason is
   `logit.transform.metrics.passed_through{reason}`, totaled per `process` call: one count per
   reason per event, carrying the number of records. The stream asserts this identity from
-  telemetry.
+  telemetry. "Amendment: two caps on the series one `aggregate` holds (2026-10-24)" below adds a
+  `dropped{reason}` term.
 - **Series:** `series_at_flush_start == emitted_and_removed + kept + evicted{idle} +
   evicted{cardinality}`. The terms partition the series, each counted once:
   - `series_at_flush_start` is `logit.transform.series.active` plus
@@ -1029,3 +1030,179 @@ move, don't mirror (2026-10-23)"). The 2026-10-22 amendment's remedy shrinks to 
 summarize a timestamped point anyway, `remove` `_logit.metrics.closed` ahead of `aggregate`. No
 carrier stays behind to split the series key by source second, and the flushed series leaves
 `statsd_out` with no `|T` and `prometheus_out` with no sample timestamp.
+
+## Amendment: two caps on the series one `aggregate` holds (2026-10-24)
+
+`max_retained_series` caps only the series that survive a flush. Within a window, every distinct
+`(name, unit, attribute set)` opens a series: `Aggregator::process` resolves the record's group
+with `group_for` and inserts through `self.groups[gi].series.entry(key)`, and before this
+amendment nothing between the two refused a new key. Memory grows with the window's series count
+until the flush drains it, and one unpruned high-cardinality attribute (a request id, a client
+port) grows it without bound. Two `aggregate` fields bound it, and they answer different
+questions:
+
+- **`max_series`** (default `100000`) is a hard memory bound. A record that would open a series
+  past it evicts the most idle retained series to make room, and is dropped and counted as loss
+  only when no held series has sat out a whole window.
+- **`max_series_per_metric`** (off by default, and recommended) is a per-name cardinality limit
+  in the shape of the OpenTelemetry SDK's. A record that would open a series past it folds into
+  one overflow series for its name, so the name's totals stay correct and its attribute detail is
+  given up.
+
+### `max_series`: a hard cap, and a counted drop
+
+`max_series` caps every series the stage holds at once: active and retained, across all
+`(resource, scope)` groups. Graph rule 39 rejects `0`, a cap that would drop every absorbable
+record.
+
+- **Only opening a series is checked.** A record for a series that already exists keeps absorbing
+  past the cap, so a full stage still aggregates every series it holds. A record that passes
+  through for a reason this ADR already names (`closed`, `no_recorded_value`, `no_merge_rule`,
+  `non_finite`) never reaches the series map and is unaffected.
+- **A full cap evicts idle retained series first.** When a new series would pass the cap and the
+  stage holds retained series that have sat out at least one whole window (`idle_windows > 0`),
+  the most idle are evicted in
+  the flush cap's order (most idle, then newest), counted as
+  `logit.transform.series.evicted{reason="cardinality", state="idle"}`, and the new series opens.
+  One scan evicts every series at the current highest idle tier, so a window makes at most
+  `series_retention` scans. The stage tracks how many idle series it holds, so a full cap with
+  none costs no scan.
+- **A record is dropped only when no held series has sat out a whole window.** It's counted as
+  `logit.transform.metrics.dropped{reason="series_limit"}`, with a throttled diagnostic that names
+  the cap and points at `keep`, `keep_values`, and raising `max_series`. The diagnostic prints the
+  cap and no other config.
+- **An active series is never evicted to make room.** `cumulative_to_delta`'s and
+  `prometheus_out`'s `max_series` evict the least recently updated series instead. They hold one
+  baseline or one exposed sample per series, which the next point rebuilds. An `aggregate` series
+  updated this window holds the window's only copy of what it absorbed, so evicting it would lose
+  a window of one series' data to admit one record.
+- **A refused record leaves no group behind.** `group_for` opens and memoizes a `ResourceGroup`
+  on a miss, and a group leaves only at flush, through
+  `self.groups.retain(|g| !g.series.is_empty())`. A record whose group doesn't exist opens a new
+  series by definition, so the lookup takes a path that creates nothing: at a full cap the record
+  is refused before any group opens or is memoized. Every group holds at least one series, and
+  `max_series` also bounds the group count.
+- **The existing-series path gains no allocation and no second hash.** The cap is read only on the
+  vacant-entry path, where a series is about to be built anyway. An allocation pin in
+  `crates/logit-bench/tests/allocations.rs` that moves for the cap is a defect, not a constant to
+  update.
+- **Retained series count toward `max_series`.** `max_retained_series` above `max_series` is
+  allowed: the stage holds no more than `max_series` series either way, so the larger retention cap
+  changes nothing. A cumulative stage at its defaults retains up to 10,000 series, leaving the rest
+  of `max_series` for the window's new ones.
+
+The "Accounting identities" records identity gains a term:
+
+`metrics_in == absorbed + passed_through{reason} + dropped{reason}`
+
+where `dropped{reason}` is `logit.transform.metrics.dropped{reason}`, whose one reason is
+`series_limit`. The series identity is unchanged, because a refused record never opens a series.
+
+### `max_series_per_metric`: an overflow series per name
+
+`max_series_per_metric` counts the series held for each metric **name** (the record's `name`
+symbol) across the whole stage, not per group, scope, or unit. It counts active and retained
+series, and a series removed at flush (emitted and removed, evicted as idle, or evicted by the
+cardinality cap) frees its name's slot. Graph rule 39 rejects `0`.
+
+Past the limit, a record that would open a new series folds into an **overflow series** instead:
+
+- **Its identity** is the record's name and unit, in the record's own `(resource, scope)` group,
+  with the attribute set replaced by `logit.overflow: true` plus the record's private `_logit.*`
+  keys (after the `_logit.field.*` pruning) and its `host.name`. The private keys carry the
+  protocol carriers and metric flags a sink in the record's family reads, and `host.name` is the
+  host every sink writes, so dropping either would change what the sink sends for the folded
+  point. One name can split into a few overflow series this way, one per distinct carrier set and
+  host, and `max_series` bounds them.
+- **`logit.overflow` is public**, a `logit.` attribute, not a private `_logit.` one: it reaches
+  the backend, where it marks the point as folded. A `keep` placed after `aggregate` strips it
+  unless `keep` lists it.
+- **An overflow series is known by its key, never by a flag.** In a two-tier topology, an upstream
+  stage's overflow series arrives downstream as an ordinary series carrying `logit.overflow`.
+- **It doesn't count against the per-name limit,** so a name over the limit always has somewhere
+  to fold. It counts against `max_series`: if opening the overflow series would pass `max_series`,
+  the record is dropped as `series_limit`.
+- **It merges by its kind's ordinary rules.** The first record to open it decides its kind, and a
+  histogram with other bounds takes `histogram_bounds_mismatch`, as for any series. A record whose
+  kind conflicts with its name's overflow series takes the `kind_conflict` pass-through for now;
+  whether it should instead open a second overflow series per kind is an open question.
+- **It sorts last for the flush-time `max_retained_series` eviction.** Opened after the name's
+  admitted series, it would otherwise be the newest of its idle tier and the first evicted, and
+  under `temporality: cumulative` it would restart with a new start time every window.
+
+What the folded value means depends on the kind:
+
+- `Sum`, `Histogram`, sketches, and sets stay correct as totals: the overflow series and the
+  name's admitted series together account for every record the name carried.
+- A `Gauge` is last-write-wins across unrelated series, and a `GaugeDelta` applies every series'
+  adjustment to one value, so an overflow gauge's value carries no meaning. The `logit.overflow`
+  marker flags it. The OpenTelemetry SDK's overflow behaves the same way.
+- Under `temporality: cumulative`, the overflow series' total stays monotonic while it's retained.
+  A series admitted later, once a slot frees, starts at zero with its own start time, and the
+  records that folded before it stay in the overflow total. Nothing counts twice.
+
+Folding is summarization the config asked for, not loss, so it never counts as `*.dropped`
+([ADR `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md)). Two signals report it, and
+neither carries a metric name in any tag:
+
+- `logit.transform.metrics.overflowed` counts records folded into an overflow series. It's a
+  subset of `absorbed`, so it adds no term to the records identity.
+- `logit.transform.metrics.overflowing` is a gauge of how many names are over the limit, sampled
+  at flush before any series is touched, as `logit.transform.series.active` is.
+
+Both carry only the component's usual tags, plus `host.name` through `internal`. Names appear only
+in a throttled diagnostic, a log event that reaches the pipeline through `internal`'s `logs:`. It
+names the overflowing name with the most series, the attribute key with the most distinct values
+among that name's series (keys only, never values), and how many other names are overflowing. The
+scan behind it runs only when the throttled diagnostic will emit.
+
+The name-to-count map is an allocation-strategy change, so it's measured with the existing
+`aggregate` benches and perf scenarios
+([ADR `event-sizing-and-allocation-strategy`](event-sizing-and-allocation-strategy.md)).
+
+### Why both, and why in `aggregate`
+
+`max_series_per_metric` is the cap to tune, because it keeps every name's totals correct. It
+doesn't bound memory on its own: a stream of never-repeating names opens one series per name, each
+under its limit. `max_series` is the backstop for that case and for a stage with no per-name limit,
+and its drop counts as loss because data is lost.
+
+Both live in `aggregate` because the series map is where a new series is detected. The check runs
+only on the vacant-entry path, and the window, retention, and group bookkeeping the caps need is
+already there.
+
+The limit is per name, not per group, because a resource doesn't reliably identify a sender:
+`prometheus_in` mints one per scrape target, an `otlp_in` sender sets its own, and a `set`
+upstream can make every resource equal. A per-group limit bounds different things on different
+flows.
+
+### The residual gap: first come, first served
+
+Admission is first come, first served within a window. Under churn that fills `max_series` with
+active series early in every window, a stable delta series whose first record arrives late is
+dropped every window, while a series that had a record earlier in the window keeps its slot. `max_series_per_metric` has the
+same shape per name: a late series of an overflowing name folds every window. The signals are
+`metrics.dropped{reason="series_limit"}` and `metrics.overflowed`, and the remedy is bounding
+cardinality upstream with `keep` or `keep_values`. `docs/known-gaps/transforms.md` tracks the gap.
+
+### Alternatives considered
+
+- **Pass the record through past `max_series`, instead of dropping it.** Under
+  `temporality: cumulative`, the passed-through delta reaches `prometheus_out` and is dropped there
+  as `unresolved_delta`, a reason that names the sink's input, not the cap. Under delta, the window
+  silently mixes aggregated and raw points for one name. And the volume reduction `aggregate`
+  exists for switches off when cardinality makes it most needed.
+- **A byte bound.** Per-series size is already bounded where it grows with records, by
+  `max_samples_per_series` and `max_set_members_per_series`, and counting bytes on every absorb
+  costs the hot path.
+- **Counting per `(resource, scope)` group.** Not every flow's resources identify a sender (see
+  above). A limiter configurable by resource or scope is heavier and belongs in a dedicated
+  component.
+- **A metric-name telemetry tag, or a top-k name tag.** A name tag is itself unbounded
+  cardinality, and a top-k is extra machinery that repeats what the overflow series and the
+  diagnostic already report.
+- **A standalone cardinality-limiter component.** It would hold a second copy of the series map,
+  hash every record a second time, and need a window that matches `aggregate`'s. It may still be
+  worth building for flows with no `aggregate`.
+- **A per-series tag-count limit**, like Datadog's 100 tags per point. It bounds a series' width,
+  not the series count, and would be a general component if ever built.
