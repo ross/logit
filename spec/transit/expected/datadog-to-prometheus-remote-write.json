@@ -6,9 +6,9 @@
     "logit.output.events.skipped{component=out,kind=prometheus_out,reason=no_metrics,role=sink}": 3
   }},
   "agent-series-timestamped": {"events": [
-    {"timestamp":"2026-09-21T14:13:20.000000000Z","metrics":[{"name":"record_batch_lag","kind":"gauge","value":2.5}],"attributes":{"env":"record","host_name":"record-fixtures","service":"record-fixtures","team":"obs","version":"1.2.3"}}
+    {"timestamp":"2026-09-21T14:13:20.000000000Z","metrics":[{"name":"record_batch_lag","kind":"gauge","value":2.5}],"attributes":{"deployment_environment_name":"record","host_name":"record-fixtures","service_name":"record-fixtures","service_version":"1.2.3","team":"obs"}}
   ], "counters": {
-    "logit.output.labels.normalized{component=out,kind=prometheus_out,reason=name_sanitized,role=sink}": 1,
+    "logit.output.labels.normalized{component=out,kind=prometheus_out,reason=name_sanitized,role=sink}": 4,
     "logit.output.metrics.normalized{component=out,kind=prometheus_out,reason=duplicate_timestamp,role=sink}": 2,
     "logit.output.metrics.normalized{component=out,kind=prometheus_out,reason=name_sanitized,role=sink}": 1
   }},
@@ -19,17 +19,17 @@
     "logit.output.metrics.normalized{component=out,kind=prometheus_out,reason=name_sanitized,role=sink}": 1
   }},
   "agent-sketches": {"events": [
-    {"timestamp":"2026-09-24T22:41:00.000000000Z","metrics":[{"name":"record_response_size","kind":"summary","temporality":"cumulative","count":3,"sum":5490.0,"quantiles":[{"quantile":0.0,"value":1830.0},{"quantile":0.5,"value":1830.0},{"quantile":0.75,"value":1830.0},{"quantile":0.9,"value":1830.0},{"quantile":0.95,"value":1830.0},{"quantile":0.99,"value":1830.0},{"quantile":1.0,"value":1830.0}]}],"attributes":{"env":"record","host_name":"record-fixtures","service":"record-fixtures","team":"obs","version":"1.2.3"}}
+    {"timestamp":"2026-09-24T22:41:00.000000000Z","metrics":[{"name":"record_response_size","kind":"summary","temporality":"cumulative","count":3,"sum":5490.0,"quantiles":[{"quantile":0.0,"value":1830.0},{"quantile":0.5,"value":1830.0},{"quantile":0.75,"value":1830.0},{"quantile":0.9,"value":1830.0},{"quantile":0.95,"value":1830.0},{"quantile":0.99,"value":1830.0},{"quantile":1.0,"value":1830.0}]}],"attributes":{"deployment_environment_name":"record","host_name":"record-fixtures","service_name":"record-fixtures","service_version":"1.2.3","team":"obs"}}
   ], "counters": {
-    "logit.output.labels.normalized{component=out,kind=prometheus_out,reason=name_sanitized,role=sink}": 1,
+    "logit.output.labels.normalized{component=out,kind=prometheus_out,reason=name_sanitized,role=sink}": 4,
     "logit.output.metrics.degraded{component=out,kind=prometheus_out,metric_kind=distribution,role=sink}": 1,
     "logit.output.metrics.normalized{component=out,kind=prometheus_out,reason=name_sanitized,role=sink}": 1
   }},
   "distribution-points": {"events": [
-    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"request_latency","kind":"summary","temporality":"cumulative","count":4,"sum":0.33,"quantiles":[{"quantile":0.0,"value":0.012},{"quantile":0.5,"value":0.03405042840434277},{"quantile":0.75,"value":0.03405042840434277},{"quantile":0.9,"value":0.25},{"quantile":0.95,"value":0.25},{"quantile":0.99,"value":0.25},{"quantile":1.0,"value":0.25}]}],"attributes":{"env":"prod","host_name":"web-1","route":"/orders"}},
-    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"request_size","kind":"summary","temporality":"cumulative","count":2,"sum":2560.0,"quantiles":[{"quantile":0.0,"value":512.0},{"quantile":0.5,"value":512.0},{"quantile":0.75,"value":2048.0},{"quantile":0.9,"value":2048.0},{"quantile":0.95,"value":2048.0},{"quantile":0.99,"value":2048.0},{"quantile":1.0,"value":2048.0}]}],"attributes":{"env":"prod"}}
+    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"request_latency","kind":"summary","temporality":"cumulative","count":4,"sum":0.33,"quantiles":[{"quantile":0.0,"value":0.012},{"quantile":0.5,"value":0.03405042840434277},{"quantile":0.75,"value":0.03405042840434277},{"quantile":0.9,"value":0.25},{"quantile":0.95,"value":0.25},{"quantile":0.99,"value":0.25},{"quantile":1.0,"value":0.25}]}],"attributes":{"deployment_environment_name":"prod","host_name":"web-1","route":"/orders"}},
+    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"request_size","kind":"summary","temporality":"cumulative","count":2,"sum":2560.0,"quantiles":[{"quantile":0.0,"value":512.0},{"quantile":0.5,"value":512.0},{"quantile":0.75,"value":2048.0},{"quantile":0.9,"value":2048.0},{"quantile":0.95,"value":2048.0},{"quantile":0.99,"value":2048.0},{"quantile":1.0,"value":2048.0}]}],"attributes":{"deployment_environment_name":"prod"}}
   ], "counters": {
-    "logit.output.labels.normalized{component=out,kind=prometheus_out,reason=name_sanitized,role=sink}": 1,
+    "logit.output.labels.normalized{component=out,kind=prometheus_out,reason=name_sanitized,role=sink}": 3,
     "logit.output.metrics.degraded{component=out,kind=prometheus_out,metric_kind=samples,role=sink}": 2,
     "logit.output.metrics.normalized{component=out,kind=prometheus_out,reason=name_sanitized,role=sink}": 2
   }},
@@ -44,25 +44,25 @@
     "logit.output.metrics.normalized{component=out,kind=prometheus_out,reason=name_sanitized,role=sink}": 1
   }},
   "series-v1": {"events": [
-    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"disk_used","kind":"gauge","value":0.42,"unit":"fraction"}],"attributes":{"env":"prod","host_name":"web-1"}},
-    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"legacy_unspecified","kind":"gauge","value":3.0}],"attributes":{"env":"prod","host_name":"web-1"}},
-    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"queue_depth","kind":"gauge","value":7.0}],"attributes":{"env":"prod","team":"b"}},
-    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"web_requests_rate","kind":"gauge","value":1.2}],"attributes":{"env":"prod","host_name":"web-1"}},
-    {"timestamp":"2027-01-15T07:59:55.000000000Z","metrics":[{"name":"queue_depth","kind":"gauge","value":9.0}],"attributes":{"env":"prod","team":"b"}}
+    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"disk_used","kind":"gauge","value":0.42,"unit":"fraction"}],"attributes":{"deployment_environment_name":"prod","host_name":"web-1"}},
+    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"legacy_unspecified","kind":"gauge","value":3.0}],"attributes":{"deployment_environment_name":"prod","host_name":"web-1"}},
+    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"queue_depth","kind":"gauge","value":7.0}],"attributes":{"deployment_environment_name":"prod","team":"b"}},
+    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"web_requests_rate","kind":"gauge","value":1.2}],"attributes":{"deployment_environment_name":"prod","host_name":"web-1"}},
+    {"timestamp":"2027-01-15T07:59:55.000000000Z","metrics":[{"name":"queue_depth","kind":"gauge","value":9.0}],"attributes":{"deployment_environment_name":"prod","team":"b"}}
   ], "counters": {
     "logit.output.labels.normalized{component=out,kind=prometheus_out,reason=multi_value,role=sink}": 2,
-    "logit.output.labels.normalized{component=out,kind=prometheus_out,reason=name_sanitized,role=sink}": 3,
+    "logit.output.labels.normalized{component=out,kind=prometheus_out,reason=name_sanitized,role=sink}": 8,
     "logit.output.metrics.dropped{component=out,kind=prometheus_out,reason=unresolved_delta,role=sink}": 1,
     "logit.output.metrics.normalized{component=out,kind=prometheus_out,reason=name_sanitized,role=sink}": 5
   }},
   "series-v2-json": {"events": [
-    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"app_heap","kind":"gauge","value":1048576.5,"unit":"byte"}],"attributes":{"env":"prod","host_name":"worker-2"}},
-    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"app_jobs_per_s","kind":"gauge","value":0.4}],"attributes":{"env":"prod","host_name":"worker-2"}},
-    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"app_temperature","kind":"gauge","value":-4.25}],"attributes":{"env":"prod","host_name":"worker-2"}},
-    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"app_unspecified","kind":"gauge","value":2.0}],"attributes":{"env":"prod"}},
-    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"app_late","kind":"gauge","value":5.0}],"attributes":{"env":"prod","host_name":"worker-2"}}
+    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"app_heap","kind":"gauge","value":1048576.5,"unit":"byte"}],"attributes":{"deployment_environment_name":"prod","host_name":"worker-2"}},
+    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"app_jobs_per_s","kind":"gauge","value":0.4}],"attributes":{"deployment_environment_name":"prod","host_name":"worker-2"}},
+    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"app_temperature","kind":"gauge","value":-4.25}],"attributes":{"deployment_environment_name":"prod","host_name":"worker-2"}},
+    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"app_unspecified","kind":"gauge","value":2.0}],"attributes":{"deployment_environment_name":"prod"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"app_late","kind":"gauge","value":5.0}],"attributes":{"deployment_environment_name":"prod","host_name":"worker-2"}}
   ], "counters": {
-    "logit.output.labels.normalized{component=out,kind=prometheus_out,reason=name_sanitized,role=sink}": 4,
+    "logit.output.labels.normalized{component=out,kind=prometheus_out,reason=name_sanitized,role=sink}": 9,
     "logit.output.metrics.dropped{component=out,kind=prometheus_out,reason=unresolved_delta,role=sink}": 1,
     "logit.output.metrics.normalized{component=out,kind=prometheus_out,reason=name_sanitized,role=sink}": 5
   }},

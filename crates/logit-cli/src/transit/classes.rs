@@ -477,7 +477,9 @@ impl Spelling {
     /// `statsd_out` under `format: dogstatsd` writes a `host` attribute the line's own host
     /// doesn't omit as a `host:` tag, which `statsd_in` reads back as the line's host
     /// ([`statsd::host_read_back`]), and `datadog_out` writes `container.id` as the
-    /// `container_id` tag on the routes that write tags ([`datadog::tags_container_id`]).
+    /// `container_id` tag on the routes that write tags ([`datadog::tags_container_id`]). Where a
+    /// sink writes Unified Service Tagging tags, a valued `env`, `version`, or `service` attribute
+    /// is that tag, which the pair decoder reads back under its standard key ([`unified::key`]).
     fn key_for(self, key: &str, rec: &Rec) -> String {
         if self == Spelling::Datadog
             && key == logit_core::attrs::CONTAINER_ID
@@ -487,6 +489,12 @@ impl Spelling {
         }
         if self == Spelling::Datadog && key == "service" && datadog::log_service_is_the_field(rec) {
             return "service.name".to_string();
+        }
+        if unified::writes_tags(self, rec) {
+            let value = rec.attributes.get(key).or_else(|| rec.resource.get(key));
+            if let Some(standard) = value.and_then(|value| unified::key(key, value)) {
+                return standard.to_string();
+            }
         }
         if self == (Spelling::Statsd { dogstatsd: true }) && key == "host" {
             let value = rec.attributes.get(key).or_else(|| rec.resource.get(key));
@@ -501,15 +509,17 @@ impl Spelling {
 
     /// [`Spelling::value`] for attribute `key` of `rec`. `None` where the sink writes no tag for
     /// the value: `graphite_out`'s omitted values, `statsd_out`'s `host` beside the line's own
-    /// host, and `datadog_out`'s log `hostname`.
+    /// host, `datadog_out`'s log `hostname`, and a valued `env`, `version`, or `service` beside its
+    /// standard key where the sink writes Unified Service Tagging tags.
     fn value_for(self, key: &str, value: &Value, tags: &str, rec: &Rec) -> Option<String> {
-        if self == (Spelling::Statsd { dogstatsd: true })
-            && key == "host"
-            && statsd::host_is_omitted(rec, value)
-        {
-            return None;
+        if self == (Spelling::Statsd { dogstatsd: true }) && key == "host" {
+            let kept = statsd::host_kept(rec, value)?;
+            return Some(self.value(&kept, tags));
         }
         if self == Spelling::Datadog && datadog::reserved_log_key_is_omitted(rec, key) {
+            return None;
+        }
+        if unified::tag_is_omitted(self, rec, key, value) {
             return None;
         }
         if self == Spelling::Graphite {
@@ -642,12 +652,39 @@ mod statsd {
         usable || get(rec, HOSTLESS) == Some(&Value::Bool(true))
     }
 
-    /// Whether a `host` attribute holding `value` is left off: the line names its own host,
-    /// and `value` isn't a bare `host` token (`true`), which no Agent reads as a host. An array
-    /// mixing `true` with strings reads as omitted whole, where the sink keeps its `true`
-    /// elements; no case reaches one.
+    /// The elements of a `host` attribute holding `value` that the sink leaves off: with the line
+    /// naming its own host, each valued element is a second `host:` tag the Agent consumes, and
+    /// only a bare `host` token (`true`) stays. An array is judged per element, as the sink
+    /// counts it.
+    fn omitted_elements<'a>(rec: &Rec, value: &'a Value) -> Vec<&'a Value> {
+        if !names_host(rec) {
+            return Vec::new();
+        }
+        let elements = match value {
+            Value::Array(elements) => elements.as_slice(),
+            _ => std::slice::from_ref(value),
+        };
+        elements.iter().filter(|e| **e != Value::Bool(true)).collect()
+    }
+
+    /// Whether any element of a `host` attribute holding `value` is left off.
     pub(super) fn host_is_omitted(rec: &Rec, value: &Value) -> bool {
-        names_host(rec) && *value != Value::Bool(true)
+        !omitted_elements(rec, value).is_empty()
+    }
+
+    /// What the sink writes of a `host` attribute holding `value`: the value less its omitted
+    /// elements, `None` when nothing is left.
+    pub(super) fn host_kept(rec: &Rec, value: &Value) -> Option<Value> {
+        let omitted = omitted_elements(rec, value);
+        match value {
+            Value::Array(elements) if !omitted.is_empty() => {
+                let kept: Vec<Value> =
+                    elements.iter().filter(|e| **e == Value::Bool(true)).cloned().collect();
+                (!kept.is_empty()).then_some(Value::Array(kept))
+            }
+            _ if omitted.is_empty() => Some(value.clone()),
+            _ => None,
+        }
     }
 
     /// The key `statsd_in` reads a `host` attribute's `host:` tag back under, where it's written:
@@ -658,6 +695,47 @@ mod statsd {
             Some(_) => Some(HOST_NAME),
             None => None,
         }
+    }
+}
+
+/// Datadog's Unified Service Tagging tags (`logit_core::attrs::UNIFIED_SERVICE_TAGS`):
+/// `statsd_out` under `format: dogstatsd` and `datadog_out` on its tag routes write the standard
+/// keys as `env:`, `version:`, and `service:` tags, which their pair decoders read back as the
+/// keys, and leave off a valued attribute of a tag's name beside its key.
+mod unified {
+    use super::{datadog, Rec, Spelling};
+    use logit_core::attrs::UNIFIED_SERVICE_TAGS;
+    use serde_json::Value;
+
+    /// Whether `spelling`'s sink writes `rec`'s service identity as Datadog tags.
+    pub(super) fn writes_tags(spelling: Spelling, rec: &Rec) -> bool {
+        spelling == (Spelling::Statsd { dogstatsd: true })
+            || (spelling == Spelling::Datadog && datadog::tags_container_id(rec))
+    }
+
+    /// The standard key a valued `env`, `version`, or `service` attribute's tag reads back
+    /// under; `None` for any other key and for a bare token (`true`), which names no value.
+    pub(super) fn key(key: &str, value: &Value) -> Option<&'static str> {
+        if *value == Value::Bool(true) {
+            return None;
+        }
+        UNIFIED_SERVICE_TAGS.iter().find(|(tag, _)| *tag == key).map(|(_, standard)| *standard)
+    }
+
+    /// Whether `rec` carries the standard key a valued `key` attribute's tag names, with a value
+    /// that writes a tag.
+    pub(super) fn beside_its_key(rec: &Rec, key: &str, value: &Value) -> bool {
+        self::key(key, value).is_some_and(|standard| {
+            rec.attributes
+                .get(standard)
+                .or_else(|| rec.resource.get(standard))
+                .is_some_and(|v| !v.is_null() && !v.is_object())
+        })
+    }
+
+    /// Whether `spelling`'s sink leaves `rec`'s `key` attribute off beside its standard key.
+    pub(super) fn tag_is_omitted(spelling: Spelling, rec: &Rec, key: &str, value: &Value) -> bool {
+        writes_tags(spelling, rec) && beside_its_key(rec, key, value)
     }
 }
 
@@ -1549,11 +1627,28 @@ fn field_rows(rec: &Rec, protocol: &str) -> Vec<(String, Option<String>, Field)>
             None
         }
     };
+    // An event's service identity: a standard key, or a valued attribute of a Unified Service
+    // Tagging tag's name, alone or beside its key. On the resource, each is a resource attribute.
+    let service = |key: &str, value: &Value| {
+        if value.is_string()
+            && logit_core::attrs::UNIFIED_SERVICE_TAGS.iter().any(|(_, standard)| key == *standard)
+        {
+            Some("service_identity")
+        } else if unified::beside_its_key(rec, key, value) {
+            Some("service_tag_beside_key")
+        } else if value.is_string() && unified::key(key, value).is_some() {
+            Some("service_tag")
+        } else {
+            None
+        }
+    };
     for (key, value) in &rec.attributes {
         let tags = rec.attribute_types.get(key).map(String::as_str).unwrap_or("");
         let feature = if let Some(feature) = carrier(key, value) {
             feature
         } else if let Some(feature) = outranked(key, value) {
+            feature
+        } else if let Some(feature) = service(key, value) {
             feature
         } else if tags.contains("=bytes") {
             "bytes_value"
@@ -1658,7 +1753,7 @@ fn observe_field(field: &Field, input: &Rec, out: &Rec, spelling: Spelling) -> C
                     key == "host" && statsd::host_is_omitted(input, want)
                 }
                 _ => false,
-            };
+            } || unified::tag_is_omitted(spelling, input, key, want);
             if outranked {
                 return Class::Lost;
             }
@@ -2652,6 +2747,29 @@ mod tests {
         assert_eq!(pair(&ins, &moved, Spelling::Datadog).seen, [None]);
         let host = Field::Attribute { key: "host".to_string(), resource: false };
         assert_eq!(observe_field(&host, &ins[0], &tagged[0], Spelling::Datadog), Class::Exact);
+    }
+
+    /// Beside the line's own host, `statsd_out` keeps a `host` array's bare `true` elements and
+    /// omits its valued ones, so a mixed array is partly omitted, not omitted whole.
+    #[test]
+    fn statsd_judges_a_mixed_host_array_per_element() {
+        let input = |host: &str| {
+            format!(
+                r#"{{{{T}},"metrics":[{{"name":"g","kind":"gauge","value":1.0}}],"attributes":{{"host":{host},"host.name":"h"}}}}"#
+            )
+        };
+        let mixed = recs(&[&input(r#"[true,"web-1"]"#)]);
+        let bare = recs(&[&input("[true]")]);
+        let valued = recs(&[&input(r#""web-1""#)]);
+        let value = |r: &Rec| r.attributes["host"].clone();
+        assert!(statsd::host_is_omitted(&mixed[0], &value(&mixed[0])));
+        assert_eq!(
+            statsd::host_kept(&mixed[0], &value(&mixed[0])),
+            Some(serde_json::json!([true]))
+        );
+        assert!(!statsd::host_is_omitted(&bare[0], &value(&bare[0])));
+        assert_eq!(statsd::host_kept(&bare[0], &value(&bare[0])), Some(serde_json::json!([true])));
+        assert_eq!(statsd::host_kept(&valued[0], &value(&valued[0])), None);
     }
 
     /// A Datadog event's or check's `host.name` is its host, read back as `host.name`.

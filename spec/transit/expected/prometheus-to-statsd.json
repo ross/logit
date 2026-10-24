@@ -44,7 +44,7 @@
     "logit.output.tags.normalized{component=out,kind=statsd_out,reason=value_sanitized,role=sink}": 2
   }},
   "mixed": {"events": [
-    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"build","kind":"gauge","value":1.0}],"attributes":{"instance":"transit:9100","version":"1.2.3"}},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"build","kind":"gauge","value":1.0}],"attributes":{"instance":"transit:9100","service.version":"1.2.3"}},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"feature","kind":"gauge","value":0.0}],"attributes":{"feature":"b","instance":"transit:9100"}},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"feature","kind":"gauge","value":1.0}],"attributes":{"feature":"a","instance":"transit:9100"}},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"mystery","kind":"gauge","value":3.0}],"attributes":{"instance":"transit:9100"}},

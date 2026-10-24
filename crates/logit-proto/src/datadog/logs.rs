@@ -5,7 +5,9 @@
 use super::tags::split_joined;
 use super::time::{millis_to_nanos, nanos_to_millis, or_received};
 use super::{
-    insert_wire_host, is_datadog_event, DatadogDecoder, DatadogEncoder, ATTR_HOST_NAME, ATTR_SOURCE,
+    insert_wire_host, is_datadog_event, DatadogDecoder, DatadogEncoder,
+    ATTR_DEPLOYMENT_ENVIRONMENT_NAME, ATTR_HOST_NAME, ATTR_SERVICE_NAME, ATTR_SERVICE_VERSION,
+    ATTR_SOURCE,
 };
 use crate::json::{json_to_value, value_text, write_i64, write_str, write_value, JsonObject};
 use crate::CodecError;
@@ -32,21 +34,10 @@ pub const ATTR_SERVICE: &str = "service";
 /// entries [`LIFTED`] names.
 pub const ATTR_DDSOURCE: &str = "ddsource";
 pub const ATTR_DDTAGS: &str = "ddtags";
-/// `service.name`: the log's `service`, both ways.
-pub const ATTR_SERVICE_NAME: &str = "service.name";
-/// `deployment.environment.name`: a log's `ddtags` `env:` entry, both ways.
-pub const ATTR_DEPLOYMENT_ENVIRONMENT_NAME: &str = "deployment.environment.name";
-/// `service.version`: a log's `ddtags` `version:` entry, both ways.
-pub const ATTR_SERVICE_VERSION: &str = "service.version";
-
 /// The `ddtags` entries the decoder lifts onto standard keys: Unified Service Tagging's three
-/// tags. The encoder writes the first two back as entries, in this order, and `service.name` as
-/// the log's `service` field.
-const LIFTED: [(&str, &str); 3] = [
-    ("env", ATTR_DEPLOYMENT_ENVIRONMENT_NAME),
-    ("version", ATTR_SERVICE_VERSION),
-    ("service", ATTR_SERVICE_NAME),
-];
+/// tags, `env`, `version`, then `service`. The encoder writes the first two back as entries, in
+/// this order, and `service.name` as the log's `service` field.
+const LIFTED: [(&str, &str); 3] = logit_core::attrs::UNIFIED_SERVICE_TAGS;
 /// `trace_id`/`span_id`: the OTel-form hex keys Datadog's log intake detects for trace
 /// correlation, which the encoder writes from `LogRecord.trace`.
 pub const WIRE_TRACE_ID: &str = "trace_id";

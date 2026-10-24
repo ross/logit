@@ -95,7 +95,11 @@ fn a_service_checks_later_metrics_still_leave_as_series() {
         // series wire, and `CONSUMED_WITH_CHECK` lists them as belt and braces.
         let attrs = &relayed.events[0].attributes;
         assert_eq!(attrs.get("_logit.statsd.service_check.name"), None, "{route}");
-        assert_eq!(attrs.get("env").and_then(|v| v.as_str()), Some("prod"), "{route}");
+        assert_eq!(
+            attrs.get("deployment.environment.name").and_then(|v| v.as_str()),
+            Some("prod"),
+            "{route}"
+        );
         let (_, again) =
             series_routes(&relayed).into_iter().find(|(r, _)| *r == route).expect("the same route");
         assert_eq!(again.as_deref(), Some(&body[..]), "{route}: relays again unchanged");

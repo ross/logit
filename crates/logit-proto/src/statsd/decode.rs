@@ -158,6 +158,7 @@ static KEYS: LazyLock<StatsdKeys> = LazyLock::new(|| StatsdKeys {
     service_check_status: intern("_logit.statsd.service_check.status"),
     host_name: intern(logit_core::attrs::HOST_NAME),
     hostless: intern(crate::datadog::ATTR_HOSTLESS),
+    unified: logit_core::attrs::UNIFIED_SERVICE_TAGS.map(|(_, key)| intern(key)),
 });
 
 struct StatsdKeys {
@@ -175,6 +176,8 @@ struct StatsdKeys {
     service_check_status: Symbol,
     host_name: Symbol,
     hostless: Symbol,
+    /// [`logit_core::attrs::UNIFIED_SERVICE_TAGS`]' standard keys, in its order.
+    unified: [Symbol; 3],
 }
 
 /// Tags a line leaves off, counted `logit.input.tags.omitted` by reason once the line decodes.
@@ -182,8 +185,10 @@ struct StatsdKeys {
 struct Omitted {
     /// A key under the private `_logit.` prefix.
     reserved_prefix: usize,
-    /// A `host.name` tag on a line that names its own host ([`insert_host`]), or a
-    /// `container.id` tag on one that names its own container id ([`insert_local_data`]).
+    /// A `host.name` tag on a line that names its own host ([`insert_host`]), a
+    /// `container.id` tag on one that names its own container id ([`insert_local_data`]), or a
+    /// `deployment.environment.name`, `service.version`, or `service.name` tag beside an `env:`,
+    /// `version:`, or `service:` tag ([`insert_tags`]).
     reserved_key: usize,
     /// A `|c:` list item that is neither `ci-` nor `in-` ([`split_local_data`]).
     unreadable: usize,
@@ -209,6 +214,11 @@ fn insert_source_timestamp(attributes: &mut AttrMap) {
 /// A key under the private `_logit.` prefix is skipped and counted in `omitted`, so a sender's
 /// tag never reads back as a carrier. A valued `host:` tag isn't an attribute: the last one's
 /// value lands in `host_tag` for [`insert_host`], as the Agent consumes every one.
+///
+/// A valued `env:`, `version:`, or `service:` tag folds into its standard key
+/// ([`logit_core::attrs::UNIFIED_SERVICE_TAGS`]); a valueless one stays an ordinary tag. A valued
+/// tag spelling the standard key itself is folded after the rest, and beside a Datadog-spelled tag
+/// for the same key it's omitted, counted per wire tag, as the protocol's own form wins.
 fn insert_tags<'a>(
     attributes: &mut AttrMap,
     bytes: &Bytes,
@@ -217,6 +227,10 @@ fn insert_tags<'a>(
     omitted: &mut Omitted,
     host_tag: &mut Option<&'a str>,
 ) {
+    // Per `UNIFIED_SERVICE_TAGS` row: whether a Datadog-spelled tag wrote the key.
+    let mut unified = [false; 3];
+    // Tags spelling a standard key, held until every Datadog-spelled one has been read.
+    let mut spelled: Vec<(usize, Value)> = Vec::new();
     for tag in tags.split(',').filter(|t| !t.is_empty()) {
         let (key, value) = match tag.split_once(':') {
             Some(("host", v)) => {
@@ -230,20 +244,44 @@ fn insert_tags<'a>(
             omitted.reserved_prefix += 1;
             continue;
         }
-        let key = keys.get_or_intern(key);
-        let merged = match attributes.remove_sym(key) {
-            None => value,
-            Some(Value::Array(mut arr)) => {
-                if !arr.iter().any(|e| tag_element_eq(e, &value)) {
-                    arr.push(value);
-                }
-                Value::Array(arr)
+        let rows = logit_core::attrs::UNIFIED_SERVICE_TAGS.iter();
+        let key = match rows.enumerate().find(|(_, (dd, std))| *dd == key || *std == key) {
+            Some((i, (dd, _))) if *dd == key && !matches!(value, Value::Bool(true)) => {
+                unified[i] = true;
+                KEYS.unified[i]
             }
-            Some(existing) if tag_element_eq(&existing, &value) => existing,
-            Some(existing) => Value::Array(vec![existing, value]),
+            Some((i, (dd, _))) if *dd != key && !matches!(value, Value::Bool(true)) => {
+                spelled.push((i, value));
+                continue;
+            }
+            _ => keys.get_or_intern(key),
         };
-        attributes.insert_sym(key, merged);
+        fold_tag(attributes, key, value);
     }
+    for (i, value) in spelled {
+        if unified[i] {
+            omitted.reserved_key += 1;
+        } else {
+            fold_tag(attributes, KEYS.unified[i], value);
+        }
+    }
+}
+
+/// Folds one tag's value into `attributes` under `key`: a repeated key becomes an `Array` in wire
+/// order, and an exact duplicate token is deduped ([`tag_element_eq`]).
+fn fold_tag(attributes: &mut AttrMap, key: Symbol, value: Value) {
+    let merged = match attributes.remove_sym(key) {
+        None => value,
+        Some(Value::Array(mut arr)) => {
+            if !arr.iter().any(|e| tag_element_eq(e, &value)) {
+                arr.push(value);
+            }
+            Value::Array(arr)
+        }
+        Some(existing) if tag_element_eq(&existing, &value) => existing,
+        Some(existing) => Value::Array(vec![existing, value]),
+    };
+    attributes.insert_sym(key, merged);
 }
 
 /// Exact-token equality for [`insert_tags`]'s dedupe: `Str`/`Str` by bytes (so two offsets into
@@ -1033,7 +1071,10 @@ mod tests {
     fn dogstatsd_tags_become_attributes() {
         let events = decode("page.views:1|c|#env:prod,host:web1,urgent");
         let event = &events[0];
-        assert_eq!(event.attributes.get("env").and_then(|v| v.as_str()), Some("prod"));
+        assert_eq!(
+            event.attributes.get("deployment.environment.name").and_then(|v| v.as_str()),
+            Some("prod")
+        );
         assert_eq!(event.attributes.get("host.name").and_then(|v| v.as_str()), Some("web1"));
         assert!(matches!(event.attributes.get("urgent"), Some(logit_core::Value::Bool(true))));
     }
@@ -1162,7 +1203,10 @@ mod tests {
         // The event and the service check keep the decoder's own private carriers; only a tag's
         // private key is omitted.
         for (event, tag_key) in events.iter().zip(["_logit.statsd.type", "_logit.y", "_logit.z"]) {
-            assert_eq!(event.attributes.get("env").and_then(|v| v.as_str()), Some("prod"));
+            assert_eq!(
+                event.attributes.get("deployment.environment.name").and_then(|v| v.as_str()),
+                Some("prod")
+            );
             assert_eq!(event.attributes.get(tag_key), None, "{tag_key} must not survive");
         }
         assert!(
@@ -1180,7 +1224,10 @@ mod tests {
         let events = decode("page.views:1:2:3|c|#env:prod");
         assert_eq!(events.len(), 3);
         for event in &events {
-            assert_eq!(event.attributes.get("env").and_then(|v| v.as_str()), Some("prod"));
+            assert_eq!(
+                event.attributes.get("deployment.environment.name").and_then(|v| v.as_str()),
+                Some("prod")
+            );
         }
     }
 
@@ -1193,7 +1240,7 @@ mod tests {
         let mut decoder = StatsdDecoder::new(Arc::new(Resource::default()));
         let event = only_metric_event(decoder.decode(datagram.clone()).unwrap().events);
 
-        let tag = event.attributes.get("env").expect("env tag");
+        let tag = event.attributes.get("deployment.environment.name").expect("env tag");
         let Value::Str(tag) = tag else { panic!("expected Value::Str, got {tag:?}") };
         assert_shares_datagram_allocation(&datagram, tag, "a scalar tag value");
 
@@ -1443,6 +1490,61 @@ mod tests {
         assert_eq!(input_counter(&registry, "logit.input.fields.dropped", "malformed"), 3.0);
     }
 
+    /// A valued `env:`, `version:`, or `service:` tag is its standard key on every line kind, a
+    /// valueless one an ordinary tag, and no bare `env`/`version`/`service` attribute survives a
+    /// valued tag.
+    #[test]
+    fn unified_service_tags_decode_onto_the_standard_keys() {
+        let lines = [
+            "a:1|c|#env:prod,version:1.2,service:api,env",
+            "_e{1,1}:t|x|#service:api,env:prod,version:1.2,env",
+            "_sc|c|0|#version:1.2,env:prod,service:api,env",
+        ];
+        for line in lines {
+            let event = &decode(line)[0];
+            assert_eq!(attr_str(event, "deployment.environment.name"), Some("prod"), "{line}");
+            assert_eq!(attr_str(event, "service.version"), Some("1.2"), "{line}");
+            assert_eq!(attr_str(event, "service.name"), Some("api"), "{line}");
+            assert_eq!(event.attributes.get("env"), Some(&Value::Bool(true)), "{line}");
+            assert_eq!(event.attributes.get("version"), None, "{line}");
+            assert_eq!(event.attributes.get("service"), None, "{line}");
+        }
+        let event = &decode("a:1|c|#env:prod,env:canary")[0];
+        assert_eq!(
+            event.attributes.get("deployment.environment.name"),
+            Some(&Value::Array(vec![Value::str("prod"), Value::str("canary")]))
+        );
+    }
+
+    /// A valued tag spelling a standard service identity key beside the Datadog-spelled tag is
+    /// omitted and counted `reserved_key` once per wire tag, before or after it; alone, or beside a
+    /// valueless token, it's the key's value, and a valueless one is no collision.
+    #[test]
+    fn a_standard_service_key_tag_beside_its_datadog_tag_is_omitted_and_counted() {
+        let registry = logit_core::Registry::new();
+        let mut decoder = StatsdDecoder::new(Arc::new(Resource::default()))
+            .with_telemetry(registry.telemetry_for("statsd_in", "statsd_in", "listener"));
+        let datagram = "a:1|c|#deployment.environment.name:dev,env:prod
+                        b:1|c|#service:api,service.name:x,service.name:y
+                        _sc|c|0|#service.version:9,version:1.2
+                        c:1|c|#deployment.environment.name:dev
+                        d:1|c|#env,deployment.environment.name:dev
+                        e:1|c|#service:api,service.name";
+        let events = decoder.decode(Bytes::from(datagram)).unwrap().events;
+        assert_eq!(attr_str(&events[0], "deployment.environment.name"), Some("prod"));
+        assert_eq!(attr_str(&events[1], "service.name"), Some("api"));
+        assert_eq!(attr_str(&events[2], "service.version"), Some("1.2"));
+        assert_eq!(attr_str(&events[3], "deployment.environment.name"), Some("dev"));
+        assert_eq!(attr_str(&events[4], "deployment.environment.name"), Some("dev"));
+        assert_eq!(events[4].attributes.get("env"), Some(&Value::Bool(true)));
+        assert_eq!(
+            events[5].attributes.get("service.name"),
+            Some(&Value::Array(vec![Value::str("api"), Value::Bool(true)])),
+            "a valueless token names no service, so it's no collision"
+        );
+        assert_eq!(input_counter(&registry, "logit.input.tags.omitted", "reserved_key"), 4.0);
+    }
+
     /// A `container.id` tag beside a container id the line's own `|c:` names is omitted and
     /// counted once per wire tag; beside an inode-only `|c:`, or with none, it's an ordinary tag.
     #[test]
@@ -1532,7 +1634,7 @@ mod tests {
                 "line: {line:?}"
             );
             assert_eq!(
-                event.attributes.get("env").and_then(|v| v.as_str()),
+                event.attributes.get("deployment.environment.name").and_then(|v| v.as_str()),
                 Some("prod"),
                 "line: {line:?}"
             );
@@ -1611,7 +1713,10 @@ mod tests {
             event.attributes.get("_logit.statsd.service_check.message").and_then(|v| v.as_str()),
             Some("Redis connection timed out after 10s")
         );
-        assert_eq!(event.attributes.get("env").and_then(|v| v.as_str()), Some("dev"));
+        assert_eq!(
+            event.attributes.get("deployment.environment.name").and_then(|v| v.as_str()),
+            Some("dev")
+        );
     }
 
     #[test]
@@ -1645,7 +1750,10 @@ mod tests {
             Some("src1")
         );
         assert_eq!(event.attributes.get("host.name").and_then(|v| v.as_str()), Some("host1"));
-        assert_eq!(event.attributes.get("env").and_then(|v| v.as_str()), Some("prod"));
+        assert_eq!(
+            event.attributes.get("deployment.environment.name").and_then(|v| v.as_str()),
+            Some("prod")
+        );
         assert_eq!(event.attributes.get("container.id").and_then(|v| v.as_str()), Some("cid1"));
         assert_eq!(
             event.attributes.get(logit_core::attrs::METRICS_CLOSED).and_then(|v| v.as_str()),
@@ -2013,6 +2121,14 @@ mod tests {
             let (decoded, diagnostics) = decode_interop(&bytes);
             assert!(diagnostics.is_empty(), "{name} raised {diagnostics:?}");
             assert!(!decoded.is_empty(), "{name} decoded to no events at all");
+            // A valued `env:`, `version:`, or `service:` tag is its standard key, never a
+            // valued attribute of the tag's name.
+            for event in &decoded {
+                for key in ["env", "version", "service"] {
+                    let value = event.attributes.get(key);
+                    assert!(value.is_none_or(|v| *v == Value::Bool(true)), "{name}: `{key}`");
+                }
+            }
             datagrams += 1;
             events += decoded.len();
         }
@@ -2060,11 +2176,14 @@ mod tests {
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
         let event = &events[0];
         assert_eq!(
-            event.attributes.get("env").and_then(Value::as_str),
+            event.attributes.get("deployment.environment.name").and_then(Value::as_str),
             Some("prod"),
             "the workload's own `env:prod` tag"
         );
-        assert_eq!(event.attributes.get("service").and_then(Value::as_str), Some("checkout-api"));
+        assert_eq!(
+            event.attributes.get("service.name").and_then(Value::as_str),
+            Some("checkout-api")
+        );
         assert!(
             event.attributes.get("endpoint").is_some(),
             "a per-request tag the client hung off the line"
@@ -2092,7 +2211,8 @@ mod tests {
             name.len()
         );
         assert!(
-            event.attributes.get("env").is_none() && event.attributes.get("container.id").is_none(),
+            event.attributes.get("deployment.environment.name").is_none()
+                && event.attributes.get("container.id").is_none(),
             "the plain-statsd dialect has no tag or container-id syntax at all"
         );
     }
@@ -2134,6 +2254,14 @@ mod tests {
                 .is_some_and(|i| i.parse::<u64>().is_ok()));
             assert_eq!(event.attributes.get("container.id"), None, "packet {i}");
             assert_eq!(event.attributes.get("_logit.statsd.container_id"), None, "packet {i}");
+            // The client's `env:`, `service:`, and `version:` tags (its own and `DD_ENV`'s, one
+            // after the decoder's exact-duplicate dedupe) are the standard keys.
+            assert_eq!(attr_str(&event, "deployment.environment.name"), Some("record"));
+            assert_eq!(attr_str(&event, "service.name"), Some("record-fixtures"));
+            assert_eq!(attr_str(&event, "service.version"), Some("1.2.3"));
+            for key in ["env", "version", "service"] {
+                assert_eq!(event.attributes.get(key), None, "packet {i}: `{key}`");
+            }
             decoded.push(event);
         }
         let kinds: Vec<&str> = decoded

@@ -45,6 +45,16 @@
 //! `datadog_in` reads a `container_id` tag back as an attribute of that name: a tag isn't a
 //! field the protocol defines as the container's identity.
 //!
+//! **Service identity on a tag list is the standard keys, both ways.** On a metric, a Datadog
+//! event, or a service check, a valued `env:`, `version:`, or `service:` tag decodes to
+//! `deployment.environment.name`, `service.version`, or `service.name` on the event, and every
+//! encoder writing a tag list writes each key back as that tag ([`tags`]), the Datadog OTLP
+//! exporter's spelling. A tag spelling the key itself beside the Datadog-spelled one is omitted,
+//! counted `logit.input.tags.omitted{reason="reserved_key"}`; on encode, a valued `env`,
+//! `version`, or `service` attribute beside its key is omitted, counted
+//! `logit.output.tags.omitted{reason="unrepresentable"}`. A valueless token stays a tag of its
+//! own name.
+//!
 //! **A log's service identity is on the standard keys, both ways.** A log's `service` is
 //! `service.name`, and its `ddtags` `env:` and `version:` entries are `deployment.environment.name`
 //! and `service.version`; `datadog_out` writes them back from those keys whatever source wrote
@@ -95,7 +105,8 @@
 //! | point timestamp (s) | `Event::timestamp`; a fractional v1 timestamp truncates to its second | -- |
 //! | timestamp absent, zero, or negative | `received_at`, truncated to its second | `logit.input.metrics.degraded{reason="no_timestamp"}` |
 //! | `unit` | `MetricRecord::unit` when non-empty; every series batch carries [`ATTR_UNITS`] on its resource | -- |
-//! | `tags` | attributes by [`tags`]'s rule | -- |
+//! | `tags` | attributes by [`tags`]'s rule; a valued `env:`, `version:`, or `service:` tag is `deployment.environment.name`, `service.version`, or `service.name` | -- |
+//! | a `deployment.environment.name:`, `service.version:`, or `service.name:` tag beside the `env:`, `version:`, or `service:` tag in the same list | omitted; counted once per series that delivers a point | `logit.input.tags.omitted{reason="reserved_key"}` |
 //! | a tag whose key is under the private `_logit.` prefix | omitted; counted once per series that delivers a point | `logit.input.tags.omitted{reason="reserved_prefix"}` |
 //! | the first named `host` resource; v1 and distribution `host` | [`ATTR_HOST_NAME`] | -- |
 //! | a v1 or distribution `"host":""` (present and empty: the Agent's hostless sample) | [`ATTR_HOSTLESS`] `Bool(true)`; an absent `host` decodes to neither | -- |
@@ -233,6 +244,9 @@
 //! | `attributes/log_service` | lost | `logit.output.tags.omitted{reason=reserved_key}` | A log's `service` is `service.name`, so a `service` attribute beside it has no key of its own on the wire and is left off, counted. |
 //! | `attributes/log_service_field` | normalized | `respelled` | A log's string `service` attribute with no `service.name` is the log's `service` field, which datadog_in reads back as `service.name`. |
 //! | `attributes/container_id` | normalized | `respelled` | On a metric, an event, or a service check, Datadog's `container_id` tag, the Datadog OTLP exporter's spelling, which datadog_in reads back as a `container_id` attribute. |
+//! | `attributes/service_identity` | exact | -- | On a metric, an event, or a service check, Datadog's `env`, `version`, or `service` tag, the Datadog OTLP exporter's spelling, which datadog_in reads back as the key. |
+//! | `attributes/service_tag` | normalized | `respelled` | On a metric, an event, or a service check, the tag of that name, which datadog_in reads back as `deployment.environment.name`, `service.version`, or `service.name`. |
+//! | `attributes/service_tag_beside_key` | lost | `logit.output.tags.omitted{reason=unrepresentable}` | On a metric, an event, or a service check, beside its standard key, which leaves as the same tag, a valued `env`, `version`, or `service` would be a second value for the key, so it's left off, counted once per wire tag. |
 //! | `attributes/bool_value` | normalized | `bool_tag` | `true` is a bare `key` tag and reads back `true`; `false` is `key:false` and reads back as the string. |
 //! | `attributes/number_value` | normalized | `stringified` | A `key:<number>` tag, read back as a string. |
 //! | `attributes/array_value` | normalized | `stringified` | One tag per element in order, which datadog_in folds back into an array of strings, so a number element reads back as its text. |
@@ -318,7 +332,9 @@
 //!    aren't a normalization: the earlier is dropped and counted (the encode table above), so a
 //!    relay of such a request isn't a fixed point;
 //! 3. v2 resources reorder to host, device, then the rest; tags reorder by attribute order, and an
-//!    exact duplicate tag is dropped;
+//!    exact duplicate tag is dropped. A `deployment.environment.name:`, `service.version:`, or
+//!    `service.name:` tag beside its `env:`, `version:`, or `service:` tag is omitted at decode,
+//!    counted, and the Datadog-spelled tag relays;
 //! 4. a zero `interval` or origin code, an empty `unit`/`source_type_name`/`device`, and a v1 `type`
 //!    of `gauge` or none all encode to the same wire;
 //! 5. a v1 point with a `null` value, a distribution point with no values, and an empty sketch are
@@ -398,7 +414,7 @@
 //! | `host`, non-empty | [`ATTR_HOST_NAME`], displacing a `host.name` tag | `logit.input.tags.omitted{reason="reserved_key"}` for a displaced tag |
 //! | `host`, `""` (the Agent always writes it, so this is its hostless event) | [`ATTR_HOSTLESS`] `Bool(true)`, displacing a `host.name` tag, as a series' `"host":""` | as above |
 //! | `priority`, `aggregation_key` | `_logit.statsd.event.priority`, `.aggregation_key` | -- |
-//! | `tags` | attributes, by [`tags`]'s rule; a key under the private `_logit.` prefix omitted | `logit.input.tags.omitted{reason="reserved_prefix"}` for an omitted tag |
+//! | `tags` | attributes, by [`tags`]'s rule; a key under the private `_logit.` prefix omitted; a valued `env:`, `version:`, or `service:` tag the standard key, and a valued tag spelling that key beside it omitted | `logit.input.tags.omitted{reason="reserved_prefix"}` for a private key, `{reason="reserved_key"}` for a standard key beside its Datadog tag |
 //! | `alert_type` | `_logit.statsd.event.alert_type`, verbatim; `severity`: `error` → `Error`, `warning` → `Warn`, `success`/`info` → `Info`, else `None` | -- |
 //! | `source_type_name`, else the envelope group key unless it is `api` | `_logit.statsd.event.source_type` | -- |
 //! | `event_type` (Agent) | [`ATTR_EVENT_TYPE`] | -- |
@@ -417,7 +433,7 @@
 //! | `host_name`, non-empty | [`ATTR_HOST_NAME`], displacing a `host.name` tag | `logit.input.tags.omitted{reason="reserved_key"}` for a displaced tag |
 //! | `host_name`, `""` (the Agent always writes it, so this is its hostless check) | [`ATTR_HOSTLESS`] `Bool(true)`, displacing a `host.name` tag, as a series' `"host":""` | as above |
 //! | `message`, non-empty | `_logit.statsd.service_check.message` | -- |
-//! | `tags`, an array or `null` | attributes, by [`tags`]'s rule; a key under the private `_logit.` prefix omitted | `logit.input.tags.omitted{reason="reserved_prefix"}` for an omitted tag |
+//! | `tags`, an array or `null` | attributes, by [`tags`]'s rule; a key under the private `_logit.` prefix omitted; a valued `env:`, `version:`, or `service:` tag the standard key, and a valued tag spelling that key beside it omitted | `logit.input.tags.omitted{reason="reserved_prefix"}` for a private key, `{reason="reserved_key"}` for a standard key beside its Datadog tag |
 //! | `timestamp` seconds | `Event::timestamp`; absent or `0` → `received_at` | -- |
 //!
 //! ## Encode: events → logs, events, service checks
@@ -455,7 +471,7 @@
 //! | **service checks** ([`DatadogEncoder::encode_service_checks`]): an event carrying `_logit.statsd.service_check.name` whose first metric is a `Gauge` | one array item with every key: `check`, `host_name` (below), `timestamp` (seconds), `status`, `message` (`""`), `tags` (`[]`) | -- |
 //! | `host.name` other than an empty `Str`, else [`ATTR_HOSTLESS`] (an empty DogStatsD `host:` tag), never filled, else the default host | `host_name`: `""` when hostless, which `datadog_in` reads back as the mark; omitted with no host, no mark, and no default host. `host.name`, empty or not, is never a tag; a `host` is an ordinary tag | -- |
 //! | `_logit.statsd.service_check.status` `U64` 0 to 3, else the gauge when it is an integer 0 to 3 | `status` | otherwise dropped: `logit.output.metrics.dropped{reason="invalid_status"}` |
-//! | every attribute not consumed above (events and checks) | `tags`, by [`tags::render_tags`]; a private `_logit.` key is never rendered; [`ATTR_CONTAINER_ID`] is the `container_id` tag and [`ATTR_CONTAINER_IMAGE_TAGS`]' first element the `image_tag` tag, as on a metric | `logit.output.tags.omitted{reason="unrepresentable"}` for a `Map`/`Bytes`/`Null`, a further `container.image.tags` element, and a `container_id` or `image_tag` attribute beside its key |
+//! | every attribute not consumed above (events and checks) | `tags`, by [`tags::render_tags`]; a private `_logit.` key is never rendered; [`ATTR_CONTAINER_ID`] is the `container_id` tag and [`ATTR_CONTAINER_IMAGE_TAGS`]' first element the `image_tag` tag, and `deployment.environment.name`, `service.version`, and `service.name` the `env`, `version`, and `service` tags, as on a metric | `logit.output.tags.omitted{reason="unrepresentable"}` for a `Map`/`Bytes`/`Null`, a further `container.image.tags` element, a `container_id` or `image_tag` attribute beside its key, and a valued `env`, `version`, or `service` attribute beside its key |
 //!
 //! ## Permitted normalizations (logs, events, service checks)
 //!
@@ -478,7 +494,10 @@
 //!    `service.name` key, omitted and counted at decode; a log's `hostname` that isn't a string
 //!    is decoded as the attribute `hostname` and left off at encode, counted, so the relay loses
 //!    it on the first hop (a `service` that isn't a string relays as the field);
-//! 6. tags reorder by attribute order, and an exact duplicate tag is dropped;
+//! 6. tags reorder by attribute order, and an exact duplicate tag is dropped. On an event or a
+//!    service check, a `deployment.environment.name:`, `service.version:`, or `service.name:` tag
+//!    beside its `env:`, `version:`, or `service:` tag is omitted at decode, counted, and the
+//!    Datadog-spelled tag relays;
 //! 7. a log with no `hostname` (or an empty one) and none of `host.name`, `syslog.hostname`, or
 //!    `host`, and an event or service check with no host of its own, leaves with the relay's
 //!    process hostname (`datadog_out`'s default host); an event's empty `host` or a check's empty
@@ -750,6 +769,10 @@ pub const ATTR_CONTAINER_ID: &str = logit_core::attrs::CONTAINER_ID;
 /// `container.image.tags`: an `Array` of `Str` whose first element is a `ClientStatsPayload`'s
 /// `ImageTag`, and on a metric, an event, or a service check Datadog's `image_tag` tag.
 pub const ATTR_CONTAINER_IMAGE_TAGS: &str = logit_core::attrs::CONTAINER_IMAGE_TAGS;
+/// `deployment.environment.name`: Datadog's `env`, a log's `ddtags` `env:` entry.
+pub const ATTR_DEPLOYMENT_ENVIRONMENT_NAME: &str = logit_core::attrs::DEPLOYMENT_ENVIRONMENT_NAME;
+/// `service.version`: Datadog's `version`, a log's `ddtags` `version:` entry.
+pub const ATTR_SERVICE_VERSION: &str = logit_core::attrs::SERVICE_VERSION;
 
 /// Writes a record's own wire host onto `attributes`: a non-empty one as [`ATTR_HOST_NAME`], an
 /// empty one as [`ATTR_HOSTLESS`], `None` as neither. A host either way displaces a `host.name`
@@ -922,7 +945,7 @@ pub fn is_tracer_header_attr(key: &str) -> bool {
 /// names Datadog's own OTLP receiver honors (ADR `datadog-agent-and-intake-relay` decision 8). An
 /// APM stats group's `Service`/`Resource`/`Type`/`SpanKind` carry the same names, so these live
 /// here rather than in [`traces`] or [`stats`] alone.
-pub const ATTR_SERVICE_NAME: &str = "service.name";
+pub const ATTR_SERVICE_NAME: &str = logit_core::attrs::SERVICE_NAME;
 pub const ATTR_RESOURCE_NAME: &str = "resource.name";
 pub const ATTR_SPAN_TYPE: &str = "span.type";
 pub const ATTR_SPAN_KIND: &str = "span.kind";
@@ -950,16 +973,18 @@ pub fn is_datadog_event(resource: &Resource, event: &Event) -> bool {
 /// APM stats: `_logit.datadog.stats.name` present (the event's, else the resource's), the events
 /// [`DatadogEncoder::encode_client_stats_v06`] and [`DatadogEncoder::encode_stats_payload`] send.
 /// Every metrics route skips such an event whole: its records are a stats group's, not series.
-pub fn is_datadog_stats(resource: &Resource, event: &Event) -> bool {
-    logit_core::interner::lookup(stats::ATTR_STATS_NAME)
-        .is_some_and(|name| is_datadog_stats_sym(resource, event, name))
+/// A caller that tests every event of a batch resolves `stats_name` once with
+/// [`datadog_stats_name`]; each test is then two binary searches with no interner probe.
+pub fn is_datadog_stats(resource: &Resource, event: &Event, stats_name: Option<Symbol>) -> bool {
+    stats_name.is_some_and(|name| {
+        event.attributes.get_sym(name).is_some() || resource.attributes.get_sym(name).is_some()
+    })
 }
 
-/// [`is_datadog_stats`] by `stats_name`, the interned [`stats::ATTR_STATS_NAME`], for a caller
-/// that tests every event and interns the key once: two binary searches, no interner probe.
-pub fn is_datadog_stats_sym(resource: &Resource, event: &Event, stats_name: Symbol) -> bool {
-    event.attributes.get_sym(stats_name).is_some()
-        || resource.attributes.get_sym(stats_name).is_some()
+/// The interned [`stats::ATTR_STATS_NAME`] for [`is_datadog_stats`], `None` while no attribute of
+/// that name has been interned, in which case no event carries it.
+pub fn datadog_stats_name() -> Option<Symbol> {
+    logit_core::interner::lookup(stats::ATTR_STATS_NAME)
 }
 
 /// `_top_level`: the span metric the Agent writes (`1`) on every root, orphan, and
@@ -1120,10 +1145,12 @@ impl DatadogDecoder {
         self
     }
 
-    /// `logit.input.tags.omitted{reason="reserved_prefix"}`: `n` tags [`tags::insert_tags`]
-    /// skipped for a private key, on a series, sketch, event, or check that was delivered.
-    pub(super) fn reserved_tags(&self, n: usize) {
-        self.omitted_tags(n, "reserved_prefix");
+    /// `logit.input.tags.omitted`: the tags [`tags::insert_tags`] left off a series, sketch,
+    /// event, or check that was delivered, `reason="reserved_prefix"` for a private key and
+    /// `reason="reserved_key"` for a standard service identity key beside its Datadog-spelled tag.
+    pub(super) fn reserved_tags(&self, omitted: tags::Omitted) {
+        self.omitted_tags(omitted.reserved_prefix, "reserved_prefix");
+        self.omitted_tags(omitted.reserved_key, "reserved_key");
     }
 
     /// `logit.input.tags.omitted{reason="reserved_key"}`: `n` `host.name` tags or keys

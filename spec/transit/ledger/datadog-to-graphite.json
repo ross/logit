@@ -6,6 +6,8 @@
     {"sink":"graphite_out","row":"attributes/interval","cell":0,"observed":["lost"]},
     {"sink":"graphite_out","row":"attributes/no_host","cell":0,"observed":["exact"]},
     {"sink":"graphite_out","row":"attributes/rate","cell":0,"observed":["lost"]},
+    {"sink":"graphite_out","row":"attributes/service_identity","cell":1,"observed":["exact"]},
+    {"sink":"graphite_out","row":"attributes/service_tag","cell":1,"observed":["exact"]},
     {"sink":"graphite_out","row":"attributes/string_value","cell":1,"observed":["exact"]},
     {"sink":"graphite_out","row":"distribution","cell":1,"observed":["skipped"]},
     {"sink":"graphite_out","row":"gauge/f64","cell":0,"observed":["exact"]},

@@ -165,6 +165,32 @@ pub const CONTAINER_ID: &str = "container.id";
 /// image tag.
 pub const CONTAINER_IMAGE_TAGS: &str = "container.image.tags";
 
+/// The standard OS process id key (semconv's `process.pid`), a `Value::U64`.
+///
+/// A source writes it from a field its protocol defines as a process id; `syslog_in` writes it
+/// from a syslog PROCID that is canonical decimal. A sink reads it on the event, else on the batch
+/// resource. See ADR `process-hostname` (`docs/adr/process-hostname.md`), "Amendment: a source
+/// fills the common keys".
+pub const PROCESS_PID: &str = "process.pid";
+/// The standard service key, a `Str`: a DogStatsD or Datadog `service:` tag decodes onto it.
+pub const SERVICE_NAME: &str = "service.name";
+
+/// The standard deployment environment key, a `Str`: a DogStatsD or Datadog `env:` tag decodes
+/// onto it.
+pub const DEPLOYMENT_ENVIRONMENT_NAME: &str = "deployment.environment.name";
+
+/// The standard service version key, a `Str`: a DogStatsD or Datadog `version:` tag decodes onto
+/// it.
+pub const SERVICE_VERSION: &str = "service.version";
+
+/// Datadog's Unified Service Tagging tags and the standard key each one names, in Datadog's
+/// spelling first: a Datadog-family source writes a valued `env:`, `version:`, or `service:` tag
+/// as the key, and a Datadog-family sink writes the key back as that tag. See ADR
+/// `process-hostname` (`docs/adr/process-hostname.md`), "Amendment: service identity on tags
+/// (2026-10-24)".
+pub const UNIFIED_SERVICE_TAGS: [(&str, &str); 3] =
+    [("env", DEPLOYMENT_ENVIRONMENT_NAME), ("version", SERVICE_VERSION), ("service", SERVICE_NAME)];
+
 /// The prefix of the private attribute namespace, which protocol codecs reserve for their own use.
 ///
 /// See ADR `private-attribute-namespace` (`docs/adr/private-attribute-namespace.md`) and

@@ -828,6 +828,32 @@ A sender's service, environment, and version are `service.name`, `deployment.env
 and `service.version` ([ADR `process-hostname`](process-hostname.md) has the tables). What
 datadog-agent 7.83.3 does with each form decided the mapping.
 
+### Tags
+
+On a metric, a Datadog event, or a service check, a valued `env:`, `version:`, or `service:`
+tag is the standard key, on both sides of the relay (ADR `process-hostname`'s "Amendment:
+service identity on tags (2026-10-24)" has the tables).
+
+- **DogStatsD.** The Agent passes the three tags through as ordinary client tags:
+  `comp/dogstatsd/server/impl/enrich.go`'s `extractTagsMetadata` consumes only `host:`,
+  `dd.internal.entity_id:`, the cardinality tag, and `dd.internal.jmx_check_name:`, and keeps the
+  rest in order. The server then appends its configured `dogstatsd_tags`
+  (`comp/dogstatsd/server/impl/server.go`), and the aggregator adds the origin's tagger tags in a
+  separate buffer (`pkg/aggregator/context_resolver.go`, `trackContext`, through the tagger's
+  `EnrichTags` in `comp/core/tagger/impl/tagger.go`), which can hold a second `env:` from a
+  container's Unified Service Tagging labels. No step reads, rewrites, or dedupes the three
+  tags against each other, so a line's own tags are the sender's statement of its identity, and
+  `statsd_in` writes them as the keys.
+- **Datadog spellings.** `datadog_out` and `statsd_out` write the keys back as `env`,
+  `version`, and `service` tags, the mapping the Datadog OTLP exporter applies to a resource's
+  attributes (`pkg/opentelemetry-mapping-go/otlp/attributes/attributes.go`,
+  `TagsFromAttributes` through `coreMapping`, which also maps the older
+  `deployment.environment` to `env`). That table reads only a non-empty string; this relay writes
+  every value a tag can carry, so a relayed `env:` with an empty value round-trips.
+
+A valueless `env` token stays a tag of that name: it carries no environment. The like pairs stay
+fixed points modulo tag order: a tag decodes onto its key and leaves as the same tag.
+
 ### Logs
 
 - **What the Agent sends.** The Agent's logs encoder writes every log with the same seven keys

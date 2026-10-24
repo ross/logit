@@ -3933,7 +3933,7 @@ pub enum ComponentKind {
         #[serde(default)]
         tls: Option<TlsClientConfig>,
         /// Opt-in RFC 5424 STRUCTURED-DATA element built from an event's own attributes other
-        /// than `syslog.*` and `host.name` (which HOSTNAME carries). Absent (the default) emits
+        /// than `syslog.*`, `host.name`, and `process.pid` (which HOSTNAME and PROCID carry). Absent (the default) emits
         /// no such element; a `syslog.sd` attribute (round-tripped from `syslog_in`) still
         /// renders regardless. Ignored under `format: rfc3164`, which has no STRUCTURED-DATA
         /// field.

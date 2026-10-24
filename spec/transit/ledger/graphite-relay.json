@@ -1,6 +1,7 @@
 {
   "cells": [
     {"sink":"graphite_out","row":"attributes/no_host","cell":0,"observed":["exact"]},
+    {"sink":"graphite_out","row":"attributes/service_tag","cell":1,"observed":["exact"]},
     {"sink":"graphite_out","row":"attributes/string_value","cell":1,"observed":["exact","normalized"]},
     {"sink":"graphite_out","row":"gauge/f64","cell":0,"observed":["exact"]},
     {"sink":"graphite_out","row":"gauge/negative","cell":0,"observed":["exact"]},

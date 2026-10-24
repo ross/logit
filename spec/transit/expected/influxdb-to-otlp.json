@@ -52,6 +52,9 @@
   "reserved-tag-key": {"events": [
     {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"cpu.usage","kind":"gauge","value":1.0}],"attributes":{"host":"web-01"}}
   ], "counters": {}},
+  "service-tags": {"events": [
+    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"app.requests","kind":"gauge","value":3.0}],"attributes":{"deployment.environment.name":"dev","env":"prod","service":"api","version":"1.2"}}
+  ], "counters": {}},
   "string-field": {"events": [
     {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"deploy.count","kind":"gauge","value":1}],"attributes":{"host":"web-01"}}
   ], "counters": {}},

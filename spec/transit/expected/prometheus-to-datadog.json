@@ -25,7 +25,7 @@
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"escaped","kind":"gauge","value":1.0}],"attributes":{"host.name":"transit","instance":"transit:9100","nl":"a\nb","path":"C:\\dir","quote":"say \"hi\""},"resource":{"attributes":{"_logit.datadog.units":"datadog"}}}
   ], "counters": {}},
   "mixed": {"events": [
-    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"build","kind":"gauge","value":1.0}],"attributes":{"host.name":"transit","instance":"transit:9100","version":"1.2.3"},"resource":{"attributes":{"_logit.datadog.units":"datadog"}}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"build","kind":"gauge","value":1.0}],"attributes":{"host.name":"transit","instance":"transit:9100","service.version":"1.2.3"},"resource":{"attributes":{"_logit.datadog.units":"datadog"}}},
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"feature","kind":"gauge","value":0.0}],"attributes":{"feature":"b","host.name":"transit","instance":"transit:9100"},"resource":{"attributes":{"_logit.datadog.units":"datadog"}}},
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"feature","kind":"gauge","value":1.0}],"attributes":{"feature":"a","host.name":"transit","instance":"transit:9100"},"resource":{"attributes":{"_logit.datadog.units":"datadog"}}},
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"mystery","kind":"gauge","value":3.0}],"attributes":{"host.name":"transit","instance":"transit:9100"},"resource":{"attributes":{"_logit.datadog.units":"datadog"}}},

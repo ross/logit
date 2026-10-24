@@ -355,6 +355,21 @@ cgroup inode (`|c:in-<inode>`, what most clients send), which only the sender's 
 To get the container's tags, send DogStatsD through a local Agent with `statsd_out`, which writes
 `|c:` back in the form the Agent reads.
 
+### `env`, `version`, and `service` tags are the service identity keys
+
+`statsd_in` and `datadog_in` read a valued `env:`, `version:`, or `service:` tag on a metric,
+event, or service check as the standard `deployment.environment.name`, `service.version`, or
+`service.name`, and `datadog_out` and `statsd_out` write each key back as that tag. So a stage
+between them reads and sets the standard key, not `env`: a `lua` default for a missing
+environment sets `deployment.environment.name`, and a `keep` before `aggregate` lists it. An
+OTLP sender's resource `service.name` reaches Datadog as `service` the same way.
+
+Beside a key, a valued `env`, `version`, or `service` attribute set by a transform or another
+family's source is left off, counted `logit.output.tags.omitted{reason="unrepresentable"}`, since
+it would be a second value for the same tag. Set the standard key instead. A
+`deployment.environment.name:` tag a sender writes beside its own `env:` tag is left off at
+decode, counted `logit.input.tags.omitted{reason="reserved_key"}`.
+
 ### A log's service, `env`, and `version` ride on the standard keys
 
 `datadog_in` writes a log's `service` as `service.name`, and moves its `ddtags` `env:`,

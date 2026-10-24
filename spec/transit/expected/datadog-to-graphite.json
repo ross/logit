@@ -6,9 +6,9 @@
     "logit.output.events.skipped{component=out,kind=graphite_out,reason=no_metrics,role=sink}": 3
   }},
   "agent-series-timestamped": {"events": [
-    {"timestamp":"2026-09-21T14:13:20.000000000Z","metrics":[{"name":"record.batch.lag","kind":"gauge","value":2.5}],"attributes":{"env":"record","host.name":"record-fixtures","service":"record-fixtures","team":"obs","version":"1.2.3"}},
-    {"timestamp":"2026-09-21T14:13:20.000000000Z","metrics":[{"name":"record.batch.lag","kind":"gauge","value":2.5}],"attributes":{"env":"record","host.name":"record-fixtures","service":"record-fixtures","team":"obs","version":"1.2.3"}},
-    {"timestamp":"2026-09-21T14:13:20.000000000Z","metrics":[{"name":"record.batch.lag","kind":"gauge","value":2.5}],"attributes":{"env":"record","host.name":"record-fixtures","service":"record-fixtures","team":"obs","version":"1.2.3"}}
+    {"timestamp":"2026-09-21T14:13:20.000000000Z","metrics":[{"name":"record.batch.lag","kind":"gauge","value":2.5}],"attributes":{"deployment.environment.name":"record","host.name":"record-fixtures","service.name":"record-fixtures","service.version":"1.2.3","team":"obs"}},
+    {"timestamp":"2026-09-21T14:13:20.000000000Z","metrics":[{"name":"record.batch.lag","kind":"gauge","value":2.5}],"attributes":{"deployment.environment.name":"record","host.name":"record-fixtures","service.name":"record-fixtures","service.version":"1.2.3","team":"obs"}},
+    {"timestamp":"2026-09-21T14:13:20.000000000Z","metrics":[{"name":"record.batch.lag","kind":"gauge","value":2.5}],"attributes":{"deployment.environment.name":"record","host.name":"record-fixtures","service.name":"record-fixtures","service.version":"1.2.3","team":"obs"}}
   ], "counters": {}},
   "agent-service-check": {"events": [
     {"timestamp":"2026-09-24T22:41:05.000000000Z","metrics":[{"name":"datadog.agent.up","kind":"gauge","value":0.0}],"attributes":{"host.name":"record-fixtures"}}
@@ -20,7 +20,7 @@
     "logit.output.metrics.skipped{component=out,kind=graphite_out,metric_kind=samples,role=sink}": 2
   }},
   "gzip": {"events": [
-    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"batch.records","kind":"gauge","value":250.0}],"attributes":{"env":"prod","host.name":"etl-1","pipeline":"nightly"}}
+    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"batch.records","kind":"gauge","value":250.0}],"attributes":{"deployment.environment.name":"prod","host.name":"etl-1","pipeline":"nightly"}}
   ], "counters": {
     "logit.output.metrics.degraded{component=out,kind=graphite_out,metric_kind=monotonic_delta_sum,role=sink}": 1
   }},
@@ -29,23 +29,23 @@
     {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"web.requests.rate","kind":"gauge","value":1.2}],"attributes":{"env":"prod","host.name":"web-1"}}
   ], "counters": {}},
   "series-v1": {"events": [
-    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"disk.used","kind":"gauge","value":0.42}],"attributes":{"env":"prod","host.name":"web-1"}},
-    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"legacy.unspecified","kind":"gauge","value":3.0}],"attributes":{"env":"prod","host.name":"web-1"}},
-    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"queue.depth","kind":"gauge","value":7.0}],"attributes":{"env":"prod","team":"b"}},
-    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"web.requests","kind":"gauge","value":12.0}],"attributes":{"canary":"true","env":"prod","host.name":"web-1","region":"us-east-1"}},
-    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"web.requests.rate","kind":"gauge","value":1.2}],"attributes":{"env":"prod","host.name":"web-1"}},
-    {"timestamp":"2027-01-15T07:59:55.000000000Z","metrics":[{"name":"queue.depth","kind":"gauge","value":9.0}],"attributes":{"env":"prod","team":"b"}}
+    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"disk.used","kind":"gauge","value":0.42}],"attributes":{"deployment.environment.name":"prod","host.name":"web-1"}},
+    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"legacy.unspecified","kind":"gauge","value":3.0}],"attributes":{"deployment.environment.name":"prod","host.name":"web-1"}},
+    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"queue.depth","kind":"gauge","value":7.0}],"attributes":{"deployment.environment.name":"prod","team":"b"}},
+    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"web.requests","kind":"gauge","value":12.0}],"attributes":{"canary":"true","deployment.environment.name":"prod","host.name":"web-1","region":"us-east-1"}},
+    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"web.requests.rate","kind":"gauge","value":1.2}],"attributes":{"deployment.environment.name":"prod","host.name":"web-1"}},
+    {"timestamp":"2027-01-15T07:59:55.000000000Z","metrics":[{"name":"queue.depth","kind":"gauge","value":9.0}],"attributes":{"deployment.environment.name":"prod","team":"b"}}
   ], "counters": {
     "logit.output.metrics.degraded{component=out,kind=graphite_out,metric_kind=monotonic_delta_sum,role=sink}": 1,
     "logit.output.tags.normalized{component=out,kind=graphite_out,reason=multi_value,role=sink}": 2
   }},
   "series-v2-json": {"events": [
-    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"app.heap","kind":"gauge","value":1048576.5}],"attributes":{"env":"prod","host.name":"worker-2"}},
-    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"app.jobs","kind":"gauge","value":4.0}],"attributes":{"env":"prod","host.name":"worker-2","service":"jobs"}},
-    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"app.jobs.per_s","kind":"gauge","value":0.4}],"attributes":{"env":"prod","host.name":"worker-2"}},
-    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"app.temperature","kind":"gauge","value":-4.25}],"attributes":{"env":"prod","host.name":"worker-2"}},
-    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"app.unspecified","kind":"gauge","value":2.0}],"attributes":{"env":"prod"}},
-    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"app.late","kind":"gauge","value":5.0}],"attributes":{"env":"prod","host.name":"worker-2"}}
+    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"app.heap","kind":"gauge","value":1048576.5}],"attributes":{"deployment.environment.name":"prod","host.name":"worker-2"}},
+    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"app.jobs","kind":"gauge","value":4.0}],"attributes":{"deployment.environment.name":"prod","host.name":"worker-2","service.name":"jobs"}},
+    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"app.jobs.per_s","kind":"gauge","value":0.4}],"attributes":{"deployment.environment.name":"prod","host.name":"worker-2"}},
+    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"app.temperature","kind":"gauge","value":-4.25}],"attributes":{"deployment.environment.name":"prod","host.name":"worker-2"}},
+    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"app.unspecified","kind":"gauge","value":2.0}],"attributes":{"deployment.environment.name":"prod"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"app.late","kind":"gauge","value":5.0}],"attributes":{"deployment.environment.name":"prod","host.name":"worker-2"}}
   ], "counters": {
     "logit.output.metrics.degraded{component=out,kind=graphite_out,metric_kind=monotonic_delta_sum,role=sink}": 1
   }},

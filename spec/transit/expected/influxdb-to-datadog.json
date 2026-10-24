@@ -52,6 +52,11 @@
   "reserved-tag-key": {"events": [
     {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"cpu.usage","kind":"gauge","value":1.0}],"attributes":{"host":"web-01","host.name":"transit"},"resource":{"attributes":{"_logit.datadog.units":"datadog"}}}
   ], "counters": {}},
+  "service-tags": {"events": [
+    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"app.requests","kind":"gauge","value":3.0}],"attributes":{"deployment.environment.name":"dev","host.name":"transit","service.name":"api","service.version":"1.2"},"resource":{"attributes":{"_logit.datadog.units":"datadog"}}}
+  ], "counters": {
+    "logit.output.tags.omitted{component=out,kind=datadog_out,reason=unrepresentable,role=sink}": 1
+  }},
   "string-field": {"events": [
     {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"deploy.count","kind":"gauge","value":1.0}],"attributes":{"host":"web-01","host.name":"transit"},"resource":{"attributes":{"_logit.datadog.units":"datadog"}}}
   ], "counters": {}},
