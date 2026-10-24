@@ -34,10 +34,11 @@ harness by hand, and this change supplies a better *machine* for that, not a sch
 
 ## Decision
 
-`script/vm` is a new host-side script with four subcommands: `up`, `shell`, `status`, `down`.
+`script/vm` is a new host-side script. Its first four subcommands are `up`, `shell`, `status`, and `down`;
+later amendments add `build`, `push`, `pull`, and `metadata`.
 `up` provisions a VM and warms it to the point of having already run one scenario; `shell` opens a
 session on it; `status` reports what's running and its cost so far; `down` deletes every billable
-resource. There is no fifth verb.
+resource. Nothing else creates or deletes the VM.
 
 **Amended 2026-09-19** to add three more: `build`, `push`, `pull` -- see "Who runs what" and
 "Multiple sources, one VM" below. The four original verbs, and the cost/lifecycle model around
@@ -371,3 +372,15 @@ set, and every subcommand prints the resolved subscription first.
   default** (2026-09-20, "The size, and why N vCPUs is N cores" above): ~$0.58/hour (VM $0.546 +
   the same disk/IP ~$0.032), verified against the Azure retail-price API rather than doubled on
   faith -- compute doubles with vCPU count, disk and IP don't.
+
+## Amendment (2026-10-23): the metadata records the core-to-core latency matrix
+
+`~/logit-vm-metadata.txt` now includes `c2c:` lines: the core-to-core latency matrix of the VM's
+vCPUs and a summary line saying whether every pair is under 2x the minimum (one L3) or not (more
+than one). The host decides per VM whether its vCPUs share an L3, and on 2026-10-22 a VM that
+straddled two produced a 2x run-to-run spread in one scenario's numbers, so read the matrix before
+reading any number from that VM.
+
+`up` captures it last, through `script/vm metadata`, which also re-captures on demand and replaces
+the earlier `c2c:` lines. The capture runs `core-to-core-latency` (pinned in `script/vm-c2c`) in
+a pinned `rust:*-slim` image. A failure writes `c2c: unavailable (<reason>)` and never fails `up`.
