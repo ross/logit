@@ -116,12 +116,18 @@
 //!     field's container id to `container.id` and its cgroup inode to
 //!     `_logit.statsd.cgroup_inode`, as the Agent reads them (`crates/logit-proto/src/statsd/mod.rs`'s
 //!     "The container id"), and `statsd_out` writes a lone container id bare, the form every Agent
-//!     version reads, and both as the list `ci-<id>,in-<inode>`. So a `ci-<id>` or `cid-<id>`
+//!     version reads, unless the id itself starts with `ci-`, `cid-`, or `in-`, which leaves as
+//!     `ci-<id>`; and both as the list `ci-<id>,in-<inode>`. So a `ci-<id>` or `cid-<id>`
 //!     relays as `<id>`, a list relays in that order, and a list item the Agent ignores doesn't
-//!     relay. Fixtures: `dogstatsd-external-data-cardinality`,
+//!     relay; `ci-ci-abc` relays as itself. A `container.id:` tag on a line whose `|c:` names no
+//!     container id decodes to `container.id`, so it relays as the line's `|c:`, as a `host.name:`
+//!     tag relays as `#host:` in (10): `#container.id:x` leaves as `|c:x`, and beside
+//!     `|c:in-7` as `|c:ci-x,in-7`. Fixtures: `dogstatsd-external-data-cardinality`,
 //!     `event-service-check-external-data-cardinality` (`ci-abc123` -> `abc123`),
 //!     `local-data-container-id-and-inode` (`in-7,ci-abc123` -> `ci-abc123,in-7`), and
-//!     `local-data-cgroup-inode` (a lone inode, [`SAME_AS_INPUT`]).
+//!     `local-data-cgroup-inode` (a lone inode, [`SAME_AS_INPUT`]), and `local-data-prefixed-id`
+//!     (an id that starts with `in-`, [`SAME_AS_INPUT`]), and `container-id-tag-as-local-data`
+//!     (a tag alone and beside an inode).
 //! 12. **Under `format: dogstatsd`, service identity leaves as Datadog's tags.** `statsd_in`
 //!     decodes a valued `env:`, `version:`, or `service:` tag to `deployment.environment.name`,
 //!     `service.version`, or `service.name`, and `statsd_out` writes each key back as that tag
@@ -348,6 +354,7 @@ async fn hand_written_dogstatsd_fixtures_round_trip_byte_for_byte() {
         "event-text-trailing-space",
         "service-check-message-trailing-space",
         "local-data-cgroup-inode",
+        "local-data-prefixed-id",
     ];
     for name in cases {
         assert_byte_for_byte(&mut harness, name, || StatsdEncoder::new(Format::DogStatsd)).await;
@@ -370,6 +377,7 @@ async fn explicit_normalizations_round_trip_byte_for_byte() {
         "local-data-container-id-and-inode",
         "service-key-tag-alone",
         "service-key-tag-beside-env",
+        "container-id-tag-as-local-data",
     ];
     for name in cases {
         assert_byte_for_byte(&mut harness, name, || StatsdEncoder::new(Format::DogStatsd)).await;
@@ -1077,6 +1085,8 @@ mod tcp {
             "event-service-check-external-data-cardinality",
             "local-data-cgroup-inode",
             "local-data-container-id-and-inode",
+            "local-data-prefixed-id",
+            "container-id-tag-as-local-data",
             // The `.expected`-differs-from-`.in` normalizations.
             "sampled-counter-rate-folded",
             "explicit-rate-one-omitted",

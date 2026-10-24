@@ -29,7 +29,7 @@ the same date, write the record, then add a row here.
 | [Native transform fan-out: `Transform::process_into` emits extra events into the same batch](transform-fan-out.md) | 2026-10-16 | 2026-10-18 |
 | [`syslog_in` UDP framing: `framing: lines \| datagram`, with today's per-line split as the default](syslog-udp-datagram-framing.md) | 2026-10-16 | 2026-10-18 |
 | [Native hop trace context: the hop trailer carries a sampled batch's trace context, and `logit_in` continues it](native-hop-trace-context.md) | 2026-10-15 | 2026-10-15 |
-| [Process hostname: one resolved name, `host.name` on `internal`'s resource](process-hostname.md) | 2026-10-14 | 2026-10-23 |
+| [Process hostname: one resolved name, `host.name` on `internal`'s resource](process-hostname.md) | 2026-10-14 | 2026-10-24 |
 | [CI saves the cargo cache from `main` only, and every run restores it with a prefix fallback](ci-cargo-cache-saved-on-main.md) | 2026-10-14 | 2026-10-14 |
 | [CI runs no advisory check: Dependabot files the bump PRs, and `script/audit` checks locally](advisories-off-ci.md) | 2026-10-14 | 2026-10-14 |
 | [Private attribute namespace: protocol carriers live under `_logit.<protocol>.`, and every other protocol's sink ignores them](private-attribute-namespace.md) | 2026-10-13 | 2026-10-23 |

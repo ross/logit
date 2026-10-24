@@ -10,6 +10,7 @@ branches and PRs are its record. See [Branches and PR titles](../../AGENTS.md#br
 
 | Plan | Created | Updated |
 |---|---|---|
+| [Enabling plan: the remaining common keys — service, deployment, container, and process identity](common-keys.md) | 2026-10-24 | 2026-10-24 |
 | [Enabling plan: protocol knowledge stays in family — the remaining cross-family reads](protocol-knowledge-stays-in-family.md) | 2026-10-23 | 2026-10-23 |
 | [Enabling plan: an index-partition router — a routed batch is a view, not a copy](index-partition-router.md) | 2026-10-23 | 2026-10-23 |
 | [Enabling plan: metric flags — producers set `_logit.metrics.*`, and `aggregate` reads flags, not protocols](metric-flags.md) | 2026-10-22 | 2026-10-23 |

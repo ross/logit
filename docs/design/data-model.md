@@ -96,10 +96,12 @@ optimizations exploit that. Both are hard to retrofit once scripts and codecs de
 
 When data belongs on an event but doesn't warrant a core-model field, a codec stamps it as a
 dotted, `service.name`-style attribute. `syslog_in` stamps the public
-`syslog.facility`/`.timestamp`/`.tag`/`.pid`/`.msgid`/`.sd`, HOSTNAME as the standard
-`host.name` (below), and the private `_logit.syslog.severity`, and the OTLP codec stamps the private
-`_logit.otel.severity_number`/`_logit.otel.severity_text`. `syslog.pid` may be `Value::Str` as well
-as `Value::U64`, because RFC 5424's PROCID is free-form PRINTUSASCII. `syslog.timestamp` may be
+`syslog.facility`/`.timestamp`/`.tag`/`.msgid`/`.sd`, HOSTNAME as the standard
+`host.name` (below), a canonical decimal PROCID or `tag[pid]` as the standard `process.pid`
+(`Value::U64`, below), and the private `_logit.syslog.severity`, and the OTLP codec stamps the
+private `_logit.otel.severity_number`/`_logit.otel.severity_text`. Any other PROCID is the
+`Value::Str` `syslog.pid`, because RFC 5424's PROCID is free-form PRINTUSASCII; an event has
+`process.pid` or `syslog.pid`, never both. `syslog.timestamp` may be
 `Value::Null` (a nil `-` RFC 5424 TIMESTAMP) as well as `Value::Timestamp`/`Value::Str`. The
 `timestamp` component resolves it onto `event.timestamp`
 ([ADR `timestamp-transform`](../adr/timestamp-transform.md)). See

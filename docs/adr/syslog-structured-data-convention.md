@@ -137,13 +137,15 @@ before an event reaches `syslog_out`.
 
 ### `syslog.pid`
 
-`Value::U64` when PROCID (5424) or a `tag[pid]` bracket (3164) is canonical decimal that fits a
-`u64` (no sign, no leading zero); `Value::Str` of the raw token otherwise, so `+5` and `007` relay
-as written. RFC 5424's PROCID is free-form PRINTUSASCII, not necessarily numeric, and this
-project now keeps a non-numeric one rather than dropping it. `resolve_pid` mirrors this on encode
-([`Pid::U64`]/[`Pid::Str`]): a `Pid::Str` is sanitized and capped at 128 bytes (5424's own PROCID
-maximum) on 5424 output, and rendered as `tag[pid]` after the same cap on 3164 output (3164 defines
-no PROCID length limit of its own; 128 is reused for consistency, not because the RFC requires it).
+The standard `process.pid` (`Value::U64`) when PROCID (5424) or a `tag[pid]` bracket (3164) is
+canonical decimal that fits a `u64` (no sign, no leading zero); the `Value::Str` `syslog.pid` of
+the raw token otherwise, so `+5` and `007` relay as written ([ADR `syslog-output`](syslog-output.md)'s
+"Amendment: PROCID is `process.pid` (2026-10-24)"). RFC 5424's PROCID is free-form PRINTUSASCII,
+not necessarily numeric, and this project keeps a non-numeric one rather than dropping it.
+`resolve_pid` mirrors this on encode ([`Pid::U64`]/[`Pid::Str`]): a `Pid::Str` is sanitized and
+capped at 128 bytes (5424's own PROCID maximum) on 5424 output, and rendered as `tag[pid]` after
+the same cap on 3164 output (3164 defines no PROCID length limit of its own; 128 is reused for
+consistency, not because the RFC requires it).
 
 ### Non-UTF-8 MSG
 

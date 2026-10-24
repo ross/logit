@@ -14,8 +14,9 @@ use super::outcomes::{MetricIn, MetricOut};
 use super::series::{first_metric, record_routes, OriginCodes, Route, WireSeries};
 use super::time::{nanos_to_seconds, seconds_to_nanos};
 use super::{
-    DatadogDecoder, DatadogEncoder, RESOURCE_ATTR_AGENT_EPOCH, RESOURCE_ATTR_AGENT_INTERNAL_IP,
-    RESOURCE_ATTR_AGENT_PUBLIC_IP, RESOURCE_ATTR_AGENT_TIMEZONE, RESOURCE_ATTR_AGENT_VERSION,
+    datadog_stats_name, DatadogDecoder, DatadogEncoder, RESOURCE_ATTR_AGENT_EPOCH,
+    RESOURCE_ATTR_AGENT_INTERNAL_IP, RESOURCE_ATTR_AGENT_PUBLIC_IP, RESOURCE_ATTR_AGENT_TIMEZONE,
+    RESOURCE_ATTR_AGENT_VERSION,
 };
 use crate::CodecError;
 use bytes::Bytes;
@@ -200,9 +201,10 @@ impl DatadogEncoder {
     /// is sent.
     pub fn encode_sketches(&mut self, batch: &EventBatch) -> Option<Bytes> {
         let mut sketches = Vec::new();
+        let stats_name = datadog_stats_name();
         for event in &batch.events {
             let mut carriers = None;
-            for record in &event.metrics[first_metric(&batch.resource, event)..] {
+            for record in &event.metrics[first_metric(&batch.resource, event, stats_name)..] {
                 if !record_routes(record, self.histograms).sketch {
                     continue;
                 }

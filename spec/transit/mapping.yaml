@@ -2097,7 +2097,8 @@ rows:
             line.
         - class: exact
           text: >-
-            The line's `|c:` segment, never a tag, which statsd_in reads back as `container.id`.
+            A non-empty one is the line's `|c:` segment, never a tag, and an empty one an ordinary
+            tag; statsd_in reads either back as `container.id`.
       prometheus_out:
         class: normalized
         reason: label_sanitized
