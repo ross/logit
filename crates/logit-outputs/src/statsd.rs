@@ -441,9 +441,21 @@
 //!
 //! ## `|c:<container-id>` and `|T<timestamp>`
 //!
-//! Both are DogStatsD-only line extensions this sink round-trips. `_logit.statsd.container_id` (a
-//! `Value::Str` `statsd_in` stamps from an incoming `|c:<id>`) renders as `|c:<id>`, sanitized like
-//! a tag value so an embedded `:` survives. `|T<secs>` is written for an event flagged
+//! Both are DogStatsD-only line extensions this sink round-trips. `|c:` is the Agent's
+//! origin-detection local data (`logit_proto::statsd`'s "The container id"), written from a
+//! usable `container.id` (a non-empty UTF-8 `Str`, the event's else the resource's) and the
+//! `_logit.statsd.cgroup_inode` carrier:
+//!
+//! - a container id alone is `|c:<id>`, bare, the form every Agent version reads, so a received
+//!   `ci-<id>` or `cid-<id>` relays as `<id>`;
+//! - an inode alone is `|c:in-<inode>`;
+//! - both are the list `|c:ci-<id>,in-<inode>`, since the Agent reads only prefixed items in a
+//!   list.
+//!
+//! Each item is sanitized like a tag value, `,` included, so it can't split the list.
+//! `container.id` is never also a tag; one that isn't a usable `Str` has no `|c:` form and is left
+//! off, counted `logit.output.tags.omitted{reason="unrepresentable"}` (`{reason="dialect"}` under
+//! `format: statsd`). `|T<secs>` is written for an event flagged
 //! `_logit.metrics.closed: "timestamped"` (on the event, else the resource; the flag's other values
 //! write none), with `secs` the whole seconds of `Event::timestamp`, truncated. `statsd_in` sets
 //! that flag and `Event::timestamp` from an incoming `|T`, and so does `prometheus_in` for a scraped
@@ -469,7 +481,7 @@
 //! order. Under `Format::Statsd` none has
 //! anywhere to go, so each is omitted and counted (`EncodeStats::omitted_dialect_fields`).
 //!
-//! `_logit.statsd.*` attributes (`_logit.statsd.type`, `_logit.statsd.container_id`, and the
+//! `_logit.statsd.*` attributes (`_logit.statsd.type`, `_logit.statsd.cgroup_inode`, and the
 //! rest) are this sink's own carriers, not tags:
 //! `build_tag_suffix` reads them by exact name and keeps them out of the `|#k:v,...` segment, as it
 //! keeps out every other private `_logit.` attribute, uncounted under either dialect (ADR
@@ -495,7 +507,7 @@
 //!   walk, and service-check detection reads `Carriers::service_check_name` off it.
 //!
 //! Either way the full walk into [`Carriers`] is where
-//! `_logit.statsd.type`/`_logit.statsd.container_id` and the `timestamped` flag are captured too,
+//! `_logit.statsd.type`, `container.id`, and the `timestamped` flag are captured too,
 //! so `event.attributes` is never read a second time.
 //!
 //! **Event wire form**, one line: `_e{tlen,xlen}:title|text`, then, in this order and only when
@@ -652,8 +664,8 @@ pub struct EncodeStats {
     /// A `Bool` metric value written as `1` or `0`: the statsd wire has no boolean. Counted
     /// once per value.
     pub bool_values: usize,
-    /// `_logit.statsd.container_id`, `_logit.statsd.external_data`, `_logit.statsd.cardinality`,
-    /// and a `timestamped` event's `|T` omitted under `Format::Statsd` (`append_dialect_extras`), from
+    /// A `|c:` (from `container.id` or `_logit.statsd.cgroup_inode`), `_logit.statsd.external_data`,
+    /// `_logit.statsd.cardinality`, and a `timestamped` event's `|T` omitted under `Format::Statsd` (`append_dialect_extras`), from
     /// a line that is still sent. Counted once per field per emitted line, so a negative-gauge pair
     /// or a multi-member `SetMembers` record counts once per physical line.
     pub omitted_dialect_fields: usize,

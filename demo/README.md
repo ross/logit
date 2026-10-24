@@ -117,7 +117,7 @@ over HTTP straight to Loki, with no relay service in between).
 Each tier's `set` (or, for `app`'s spans, its own OTel resource) stamps a real
 `service.name`/`service.namespace` (`haproxy`/`nginx`/`demo-app`, all under `demo`), so Loki gets
 real stream labels with no extra `loki.yaml` config. `nginx`'s resource also carries
-`container.id`/`container.name`/`container.image.name`/`container.image.tag` from `docker_in`
+`container.id`/`container.name`/`container.image.name`/`container.image.tags` from `docker_in`
 itself. They survive `nginx_identity`'s `set` untouched, because `set`'s `map_resource` overlays
 onto the resource it's handed rather than replacing it, and show up as Loki structured metadata on
 that tier's log lines. Loki's `derivedFields` (in

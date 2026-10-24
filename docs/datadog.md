@@ -337,6 +337,24 @@ hostname. Beside either, a `host` attribute is left off, counted
 `logit.output.tags.omitted{reason="unrepresentable"}`, since the Agent consumes every `host:` tag
 and keeps only the last.
 
+### A container id reaches Datadog as `container_id`, never resolved
+
+`logit` writes a sender's container as `container.id`: `statsd_in` from a DogStatsD `|c:` field's
+container id, `datadog_in` and `datadog_trace_in` from a tracer or stats payload's container id or
+the `Datadog-Container-ID` header, and `docker_in` from each container it tails. `datadog_out`
+sends it as a `container_id` tag on a metric, event, or service check, a `container_id` entry in a
+log's `ddtags`, and the `container_id` field of a trace or stats payload; `container.image.tags`'
+first element goes out as `image_tag`. A `container_id` or `image_tag` attribute beside the key
+is left off, counted `logit.output.tags.omitted{reason="unrepresentable"}`.
+
+An Agent does more: it resolves a container id through its tagger into the container's tags
+(image, name, orchestrator labels), and on a DogStatsD sample adds `container_id` itself only at
+high tag cardinality. `logit` has no tagger, so `statsd_in -> datadog_out` sends the bare
+`container_id` tag for a line that names a container id, and nothing for one that names only a
+cgroup inode (`|c:in-<inode>`, what most clients send), which only the sender's host can resolve.
+To get the container's tags, send DogStatsD through a local Agent with `statsd_out`, which writes
+`|c:` back in the form the Agent reads.
+
 ### `at_least_once` can duplicate a request, and everything but series is stored twice
 
 The default posture is `at_least_once`, so a `5xx` or a timeout is retried. One batch goes out

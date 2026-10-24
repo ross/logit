@@ -1,6 +1,6 @@
 ---
 created: 2026-09-23
-updated: 2026-10-23
+updated: 2026-10-24
 ---
 
 # Datadog: two lossless pairs, the Agent's own protocols, and a Datadog-mapped `DdSketch`
@@ -776,3 +776,48 @@ The relays stay fixed points modulo the codec's lists (`crates/logit-proto/src/d
 permitted normalizations for traces and APM stats), which name the fallback and the v0.4/v0.5
 span tag. Across families, `datadog_in`'s traces now reach `otlp_out` with resource `host.name`
 and `splunk_hec_out` with the tracer host as each object's `host`.
+
+## Amendment: container identity is `container.id` (2026-10-24)
+
+A sender's container is the standard `container.id`, and a stats image tag an element of
+`container.image.tags` ([ADR `process-hostname`](process-hostname.md)'s "Amendment: container
+identity (2026-10-24)" has the tables). What datadog-agent 7.83.3 does with each form decided the
+mapping:
+
+- **DogStatsD `|c:`.** The Agent reads the field as origin-detection local data
+  (`comp/dogstatsd/server/impl/parse.go`, `parseLocalData`, calling
+  `comp/core/tagger/origindetection/origindetection.go`, `ParseLocalData`): a single bare, `ci-`,
+  or `cid-` value is the container id, `in-<inode>` a cgroup inode, and a `,` list's `ci-` and
+  `in-` items each, the rest ignored. It never forwards the raw id: `enrich.go`'s
+  `extractTagsMetadata` hands it to the tagger, which adds the container's tags at the sample's
+  cardinality, `container_id` among them only at high cardinality
+  (`comp/core/tagger/collectors/workloadmeta_extract.go`, `AddHigh(tags.ContainerID, …)`;
+  `image_tag` is low). So `statsd_in -> datadog_out` now sends a `container_id:<id>` tag for a
+  line that named a container id, which an Agent sends under `dogstatsd_tag_cardinality: high`
+  or a `|card:high` line; a line that named only an inode sends none, since only the sender's
+  host can resolve one.
+- **Tracer payloads and headers.** The trace receiver fills `TracerPayload.ContainerID` on v0.3
+  to v0.5 from the request (`pkg/trace/api/api.go`, `decodeTracerPayload`, through
+  `pkg/trace/api/container_linux.go`'s `GetContainerID`: the `Datadog-Entity-ID` local data, then
+  the deprecated `Datadog-Container-ID` header), and on v0.7 keeps the payload's own, reading no
+  header. A `/v0.6/stats` payload gets the same lookup (`handleStats`), and
+  `pkg/trace/stats/client_stats_aggregator.go` keys on `ContainerID` and `ImageTag` (`add`,
+  `newPayloadAggregationKey`). So the
+  payload field and the header name one fact, the payload's winning where both are set, and
+  `datadog_trace_in` writes the resource's `container.id` from the payload, else the header.
+  `Datadog-Entity-ID` stays the carrier `_logit.datadog.tracer.entity_id`: its local data may be
+  an inode only the sender's host resolves.
+- **Datadog spellings.** `datadog_out` writes `container.id` as the `container_id` tag on a
+  metric, an event, or a service check, the Datadog OTLP exporter's mapping
+  (`pkg/opentelemetry-mapping-go/otlp/attributes/attributes.go`, `ContainerMappings`). That table
+  maps the singular `container.image.tag` to `image_tag`; writing `container.image.tags`' first
+  element there is this relay's rule by analogy. On a trace payload the key is the
+  `container_id` field, as the Agent's OTLP receiver fills it from a resource's `container.id`
+  (`pkg/trace/api/otlp.go`, `receiveResourceSpansV2`). On a log it's a `container_id:<id>`
+  entry in `ddtags`, the tag the Agent puts on a container's logs, whose tagger it queries at high
+  cardinality (`pkg/logs/internal/tag/provider.go`, `GetTags`).
+
+The like pairs stay fixed points: a tracer's container id relays through `container.id` both
+ways, and `datadog_in` reads a series' `container_id:` tag back as an attribute of that name,
+which `datadog_out` writes back unchanged. `datadog_out` writes no `container.id` it wasn't given,
+so the Datadog-to-Datadog relay sends nothing new.

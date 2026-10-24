@@ -1,6 +1,6 @@
 ---
 created: 2026-10-14
-updated: 2026-10-23
+updated: 2026-10-24
 ---
 
 # Process hostname: one resolved name, `host.name` on `internal`'s resource
@@ -264,6 +264,8 @@ The common keys today, and who writes each:
 |---|---|
 | `host.name` | `collectd_in` from each value list's host part, on the event; `syslog_in` from HOSTNAME, on the event; `statsd_in` and `datadog_in` from the wire hosts above, on the event; `datadog_in`'s traces and stats routes and `datadog_trace_in` from each tracer or stats payload's hostname, on the resource; `splunk_hec_in` from each object's `host`, on the resource; `docker_in` under `host_name: container` from the container's `Config.Hostname`, on the resource, and otherwise not at all; `internal` from the process hostname, on the resource; `otlp_in` passes the sender's resource and record attributes through, which already use the standard key |
 | `service.name` | `internal`, on the resource; `datadog_in` (its traces route) and `datadog_trace_in` from each span's `service`, on the span's event, and their APM stats routes (`datadog_in`'s stats route, `datadog_trace_in`'s `/v0.6/stats`) from each `ClientGroupedStats`' `Service`, on the group's event; `otlp_in` passes it through; otherwise an operator's `set`. A Datadog log's `service` stays the attribute `service`, which `datadog_out` writes back as the log's `service` |
+| `container.id` | `statsd_in` from a DogStatsD line's `\|c:` container id, on the event; `datadog_in`'s traces and stats routes and `datadog_trace_in` from each tracer or stats payload's container id or the `Datadog-Container-ID` header, on the resource; `docker_in` from the container's directory name, on the resource; `otlp_in` passes it through ("Amendment: container identity (2026-10-24)") |
+| `container.image.tags` | `docker_in` from the image reference's tag, on the resource; `datadog_in`'s stats route and `datadog_trace_in`'s `/v0.6/stats` from a `ClientStatsPayload`'s `ImageTag`, on the resource; each a one-element array; `otlp_in` passes it through |
 | `network.peer.*`, `client.*` | every network listener but `logit_in`, opt-in ([ADR `listener-peer-address`](listener-peer-address.md)) |
 | the `_logit.metrics.*` flags | decoders, where the flag says the whole fact ([ADR `metric-flags`](metric-flags.md)) |
 
@@ -304,3 +306,43 @@ Settled, and not follow-ups:
 
 Every source with a protocol host field now writes it, or is settled above as not having one.
 
+## Amendment: container identity (2026-10-24)
+
+A source writes the container a sender named as `container.id`, and an image tag as an element of
+`container.image.tags`, OpenTelemetry's semantic-convention keys, by the same rule as `host.name`:
+from a field its protocol defines, at the scope where the value is identity, with no carrier left
+for the wire form. A sink reads the key off the event, else the resource, and writes its own
+wire's form.
+
+| Source | Wire form | Writes |
+|---|---|---|
+| `statsd_in` | a DogStatsD `\|c:` field (`c:` on an event or service check), read as datadog-agent 7.83.3 reads it (`comp/core/tagger/origindetection/origindetection.go`, `ParseLocalData`): a single bare, `ci-`, or `cid-` value, or a list's `ci-` item | `container.id` on the event. A list's `in-<inode>` item, or a lone one, is the carrier `_logit.statsd.cgroup_inode`: an inode names a container only on the sender's host, so it isn't `container.id`. A list item the Agent doesn't read is dropped, counted `logit.input.fields.dropped{reason="malformed"}` |
+| `datadog_in` (traces, stats), `datadog_trace_in` | a `TracerPayload`'s or `ClientStatsPayload`'s `container_id`, else the `Datadog-Container-ID` header | `container.id` on the resource |
+| `datadog_in` (stats), `datadog_trace_in` (`/v0.6/stats`) | a `ClientStatsPayload`'s `ImageTag` | `container.image.tags`, one element, on the resource |
+| `docker_in` | the container directory name; the image reference's tag | `container.id`; `container.image.tags`, one element, on the resource |
+
+A protocol's own form beats a sender's tag: a `container.id:` DogStatsD tag beside a container id
+the line's `|c:` names is omitted, counted `logit.input.tags.omitted{reason="reserved_key"}`, as a
+`host.name:` tag beside the line's host is. `_logit.statsd.container_id`,
+`_logit.datadog.tracer.container_id`, `_logit.datadog.stats.image_tag`, and `docker_in`'s
+`container.image.tag` no longer exist. `datadog_in` reads a series' `container_id:` tag as an
+attribute of that name: a metric tag isn't a field the protocol defines as the container's
+identity.
+
+| Sink | Container identity |
+|---|---|
+| `statsd_out` (`format: dogstatsd`) | `\|c:<id>` bare from a usable `container.id`, the form every Agent version reads; `\|c:in-<inode>` from the carrier alone; `\|c:ci-<id>,in-<inode>` from both. `container.id` is never also a tag. Under `format: statsd`, the field is omitted, counted |
+| `datadog_out` | on a series, sketch, distribution point, event, or service check, the `container_id` tag and, from `container.image.tags`' first element, the `image_tag` tag; on a log, a `container_id:<id>` entry appended to `ddtags`; on a trace payload, the `TracerPayload`'s `container_id`; on stats, `ClientStatsPayload`'s `ContainerID` and `ImageTag` (the first element) |
+| `datadog_trace_out` | the `Datadog-Container-ID` header and, under `version: v0.7`, the payload's `container_id`, from resource `container.id`; on `/v0.6/stats`, `ContainerID` and `ImageTag` |
+| `otlp_out`, `splunk_hec_out`, and the other sinks | the keys as ordinary attributes |
+
+At a Datadog-family sink, a key's resource value fills the per-payload field, and an event's own
+`container.id` is an ordinary span tag, as for `host.name`. A further `container.image.tags`
+element, and a `container_id` or `image_tag` attribute beside the key that writes that tag, is
+omitted, counted `logit.output.tags.omitted{reason="unrepresentable"}`; a `container_id` entry
+already in a log's `ddtags` is omitted, counted `{reason="reserved_key"}`.
+
+[ADR `datadog-agent-and-intake-relay`](datadog-agent-and-intake-relay.md)'s "Amendment:
+container identity is `container.id` (2026-10-24)" has the Agent and exporter sources, and
+[ADR `statsd-output`](statsd-output.md)'s "Amendment (2026-10-24): `|c:` is the Agent's local
+data" the DogStatsD relay's normalization.

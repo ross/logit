@@ -153,6 +153,16 @@ Entry format and the other areas: [the known-gaps index](README.md).
     their series merged under it. Datadog bills per host, so this costs what one Agent would.
   - **Workaround:** stamp `host.name` per sender upstream with `set`, or have each DogStatsD
     client send a `host:` tag (or `h:` on an event or check).
+- **`datadog_out` sends a container id unresolved.** `container.id` leaves as a bare
+  `container_id` tag (a `ddtags` entry on a log, the payload field on a trace or stats payload).
+  An Agent resolves a container id through its tagger into the container's image, name, and
+  orchestrator tags, and a DogStatsD client's `|c:in-<inode>` through the cgroup; `logit` has no
+  tagger, so it sends neither the extra tags nor anything for an inode, which it carries as
+  `_logit.statsd.cgroup_inode`.
+  - **Consequence:** a DogStatsD sample relayed straight to the intake lacks the container tags an
+    Agent would add, and one that named only an inode carries no container at all.
+  - **Workaround:** send DogStatsD through a local Agent with `statsd_out`, which writes `|c:` back
+    in the form the Agent reads, or stamp the tags upstream with `set`.
 - **`datadog_trace_out` under `version: v0.4` drops the trace chunk and tracer payload fields.**
   v0.4 has no field for a chunk's `_logit.datadog.chunk.*` fields (sampling priority, origin,
   dropped flag, tags) or for the tracer payload fields no request header carries

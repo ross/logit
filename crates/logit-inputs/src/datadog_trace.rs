@@ -97,8 +97,9 @@
 //! in request headers. `Datadog-Meta-Lang`, `-Lang-Version`, `-Lang-Interpreter`,
 //! `-Lang-Interpreter-Vendor`, `-Tracer-Version`, `Datadog-Container-ID`, `Datadog-Entity-ID`,
 //! `Datadog-External-Env`, `Datadog-Client-Computed-Top-Level`, `Datadog-Client-Computed-Stats`,
-//! and `Datadog-Client-Dropped-P0-{Traces,Spans}` become `_logit.datadog.tracer.*` batch resource
-//! attributes, per the codec's Traces table. On v0.7 the payload's own fields win: a header fills a
+//! and `Datadog-Client-Dropped-P0-{Traces,Spans}` become batch resource attributes, per the
+//! codec's Traces table: `Datadog-Container-ID` the standard `container.id`, the rest
+//! `_logit.datadog.tracer.*` carriers. On v0.7 the payload's own fields win: a header fills a
 //! field only where the payload left it empty. `datadog_trace_out` restores the headers from the
 //! same attributes. `/v0.6/stats` takes three of them, `Datadog-Meta-Lang`, `-Tracer-Version`, and
 //! `Datadog-Container-ID`, each only where the `ClientStatsPayload` left `Lang`, `TracerVersion`,

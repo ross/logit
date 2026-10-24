@@ -68,7 +68,7 @@ By protocol, these move under `_logit.`:
 
 | Protocol | Private keys |
 |---|---|
-| statsd | every `statsd.*` attribute: `type`, `container_id`, `external_data`, `cardinality`, `timestamp`, `event.*`, `service_check.*` |
+| statsd | every `statsd.*` attribute: `type`, `container_id` (since `container.id` and `cgroup_inode`, [ADR `process-hostname`](process-hostname.md)'s "Amendment: container identity (2026-10-24)"), `external_data`, `cardinality`, `timestamp`, `event.*`, `service_check.*` |
 | Prometheus | every `prometheus.*` attribute: `type`, `timestamp`, and the resource attribute `target` |
 | collectd | `plugin`, `type`, `interval`, and `severity` |
 | Datadog | every `datadog.*` attribute: series, events, service checks, Agent fields, trace chunk, stats, tracer headers, `span.error`, and `source` |

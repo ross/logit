@@ -1,6 +1,6 @@
 ---
 created: 2026-09-10
-updated: 2026-10-23
+updated: 2026-10-24
 ---
 
 # statsd/DogStatsD egress: dialect, transport, packing, and the v1 metric-kind deferral
@@ -293,7 +293,7 @@ preserved. A member that comes out different from its raw bytes is counted
 
 ### `|c:`/`|T` carriage: dogstatsd only, dropped and counted under `format: statsd`
 
-`_logit.statsd.container_id` renders as `|c:<id>`, and an event flagged
+`_logit.statsd.container_id` renders as `|c:<id>` (superseded: `|c:` decodes to `container.id` and `_logit.statsd.cgroup_inode`, see "Amendment (2026-10-24): `|c:` is the Agent's local data"), and an event flagged
 `_logit.metrics.closed: "timestamped"` gets `|T<secs>`, the whole seconds of `Event::timestamp`,
 truncated (the 2026-10-23 amendment below) — both only under `Format::DogStatsd`
 (`append_dialect_extras`), appended after the tag segment to **every** physical line an event
@@ -310,7 +310,7 @@ physical line (`EncodeStats::dropped_dialect_fields`,
 
 ### `_logit.statsd.*` is never emitted as a tag, and is read off the merged resource⊕event view
 
-`_logit.statsd.type`/`_logit.statsd.container_id` are this sink's own carriers, which the decoder
+`_logit.statsd.type`/`_logit.statsd.container_id` (superseded: `|c:` decodes to `container.id` and `_logit.statsd.cgroup_inode`, see "Amendment (2026-10-24): `|c:` is the Agent's local data") are this sink's own carriers, which the decoder
 stamped from a line's own wire-type/`|c:` segments, not ordinary
 attributes. `build_tag_suffix` reads every key under its own prefix, `_logit.statsd.`, by exact
 name and keeps it out of the generic `|#k:v,...` segment, uncounted: the carrier is being read for
@@ -439,7 +439,7 @@ model has no normalized field for) rather than a `LogRecord` field: `_logit.stat
 value), `_logit.statsd.event.aggregation_key`, `_logit.statsd.event.source_type`,
 `_logit.statsd.event.host` (superseded: `h:` now decodes to `host.name` and the carrier is retired,
 see "Amendment (2026-10-23): the host is `host.name`, in each line's own form") — plus the
-same timestamp flag, `_logit.statsd.container_id`, and `#tags` handling every metric line already
+same timestamp flag, `|c:` (superseded: `|c:` decodes to `container.id` and `_logit.statsd.cgroup_inode`, see "Amendment (2026-10-24): `|c:` is the Agent's local data"), and `#tags` handling every metric line already
 gets, with `d:<secs>` (not `|T<secs>`) playing the timestamp segment's role here.
 
 A service check decodes to one `Event::metric`, `MetricKind::Gauge(status as f64)` under the
@@ -453,7 +453,7 @@ the wire, so it can consume the rest of the line; superseded: `m:` now ends at t
 2026-09-24 amendment), `_logit.statsd.service_check.host` (`h:`, only if present; superseded: `h:`
 now decodes to `host.name` and the carrier is retired, see "Amendment (2026-10-23): the host is
 `host.name`, in each line's own form"),
-the timestamp flag, `_logit.statsd.container_id`, and `#tags` round out the set.
+the timestamp flag, `|c:` (superseded: `|c:` decodes to `container.id` and `_logit.statsd.cgroup_inode`, see "Amendment (2026-10-24): `|c:` is the Agent's local data"), and `#tags` round out the set.
 
 **`event_name` stays `None`, deliberately.** An event title is free text an operator or their
 application chose at send time — not a fixed, bounded vocabulary the way a metric or tag name is —
@@ -978,3 +978,17 @@ line with no host of its own still relays as the line's host. The transit spec's
 `Spelling::Statsd` reads `host.name` and the mark back as themselves, and a `host` attribute the
 line's own host doesn't omit back as `host.name` (`crates/logit-cli/src/transit/classes.rs`).
 `statsd_out`'s module doc section "The host" is the canonical statement.
+
+## Amendment (2026-10-24): `|c:` is the Agent's local data
+
+`statsd_in` reads a `|c:` field as datadog-agent 7.83.3 does
+(`comp/core/tagger/origindetection/origindetection.go`, `ParseLocalData`): its container id is the
+standard `container.id` on the event, and its cgroup inode (`in-<inode>`, what the recorded
+`datadog` Python client sends) the carrier `_logit.statsd.cgroup_inode`. `_logit.statsd.container_id`
+no longer exists ([ADR `process-hostname`](process-hostname.md)'s "Amendment: container identity
+(2026-10-24)"). `statsd_out` writes `|c:<id>` bare for a lone id, the form every Agent version
+reads, `|c:in-<inode>` for a lone inode, and `|c:ci-<id>,in-<inode>` for both, since the Agent
+reads only prefixed items in a list. `container.id` is never also a tag. The relay stays a fixed
+point modulo one more normalization (`crates/logit-cli/tests/statsd_round_trip.rs`'s (11)): a
+`ci-<id>` or `cid-<id>` relays as `<id>`, a list relays as `ci-<id>,in-<inode>`, and a list item
+the Agent doesn't read is dropped at decode, counted `logit.input.fields.dropped{reason="malformed"}`.
