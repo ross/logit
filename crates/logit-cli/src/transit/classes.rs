@@ -2597,6 +2597,18 @@ mod tests {
         let alone = recs(&[&log(r#"{"service":"s"}"#)]);
         let none = recs(&[&log(r#"{}"#)]);
         assert_eq!(observe_field(&service, &alone[0], &none[0], Spelling::Datadog), Class::Lost);
+        let feature = |rec: &Rec| {
+            field_rows(rec, "datadog")
+                .into_iter()
+                .find(|(_, _, f)| matches!(f, Field::Attribute { key, .. } if key == "service"))
+                .and_then(|(_, feature, _)| feature)
+        };
+        assert_eq!(feature(&alone[0]).as_deref(), Some("log_service"));
+        // On a metric, `service` is an ordinary tag.
+        let gauge = recs(&[
+            r#"{{T},"metrics":[{"name":"g","kind":"gauge","value":1.0}],"attributes":{"service":"s"}}"#,
+        ]);
+        assert_eq!(feature(&gauge[0]).as_deref(), Some("string_value"));
     }
 
     /// A `host` attribute is an ordinary tag at `datadog_out`, read back as `host`, and the
