@@ -127,7 +127,8 @@
 //! wire tag; a bare `host` (`Bool(true)`) isn't a `host:` tag and stays. The `host:` tag's value is
 //! sanitized as any tag value is, so a check with trailing metric lines carries `|h:web 1` on its
 //! own line and `#host:web_1` on the others, counted `tags.normalized{reason="value_sanitized"}`
-//! for those; an event or a check with none counts nothing for `|h:`. Otherwise a `host` attribute
+//! for those. The `|h:` field rewrites only `|` and control characters (`|h:web_1` for `web|1`),
+//! counted the same way once per line; `web 1` is written as is and counts nothing. Otherwise a `host` attribute
 //! is an ordinary tag, `host:<v>`, which the Agent reads as the host: `statsd_in` never decodes
 //! one, so it's the operator's own, from a `set`, a script, or another protocol. Any other
 //! `host.name` (empty, or not a string) is an ordinary tag in its place, and `Format::Statsd`
@@ -1445,7 +1446,9 @@ fn render_event(
     append_wire_time(line, "|d:", ctx);
     if let Some(host) = carriers.host {
         line.push_str("|h:");
-        sanitize_into(line, host, is_forbidden_in_extended_field);
+        if sanitize_into(line, host, is_forbidden_in_extended_field) {
+            ctx.stats.pending_tag_values += 1;
+        }
     }
     match carriers.event_priority {
         Some(p @ ("normal" | "low")) => {
@@ -1554,7 +1557,9 @@ fn render_service_check(
     append_wire_time(line, "|d:", ctx);
     if let Some(host) = carriers.host {
         line.push_str("|h:");
-        sanitize_into(line, host, is_forbidden_in_extended_field);
+        if sanitize_into(line, host, is_forbidden_in_extended_field) {
+            ctx.stats.pending_tag_values += 1;
+        }
     }
     append_tags(line, &ctx.tag_suffix[..carriers.host_tag_at]);
     append_origin_fields(line, ctx);
@@ -4498,10 +4503,10 @@ mod tests {
         }
     }
 
-    /// A host the line writes as `|h:` is never sanitized as a tag value, so it counts no
-    /// rewrite; a check's trailing metric line writes the `host:` tag, sanitized and counted.
+    /// A host the line writes as `|h:` keeps a space, which the `host:` tag rewrites, so it counts
+    /// no rewrite; a check's trailing metric line writes the `host:` tag, sanitized and counted.
     #[test]
-    fn an_h_field_counts_no_tag_value_rewrite() {
+    fn an_h_field_keeping_its_value_counts_no_rewrite() {
         let host_name = ("host.name", Value::str("web 1"));
         let event = event_line_event("t", "x", std::slice::from_ref(&host_name));
         let check =
@@ -4516,6 +4521,26 @@ mod tests {
         let (dog, stats) = encode(vec![trailing]);
         assert_eq!(dog, vec!["_sc|c|0|h:web 1", "extra:2|g|#host:web_1"]);
         assert_eq!(stats.tag_values_sanitized, 1);
+    }
+
+    /// A `|` in the host is rewritten to `_` in the `|h:` field, which the wire form forces, so
+    /// it counts as a sanitized value once per line that carries it.
+    #[test]
+    fn a_sanitized_h_field_is_counted() {
+        let host_name = ("host.name", Value::str("web|1"));
+        let event = event_line_event("t", "x", std::slice::from_ref(&host_name));
+        let check =
+            service_check_event("c", MetricKind::gauge(0.0), std::slice::from_ref(&host_name));
+        for (event, want) in [(event, "_e{1,1}:t|x|h:web_1"), (check.clone(), "_sc|c|0|h:web_1")] {
+            let (dog, stats) = encode(vec![event]);
+            assert_eq!(dog, vec![want]);
+            assert_eq!(stats.tag_values_sanitized, 1, "{want}");
+        }
+        let mut trailing = check;
+        trailing.metrics.push(MetricRecord::new(intern("extra"), MetricKind::gauge(2.0)));
+        let (dog, stats) = encode(vec![trailing]);
+        assert_eq!(dog, vec!["_sc|c|0|h:web_1", "extra:2|g|#host:web_1"]);
+        assert_eq!(stats.tag_values_sanitized, 2);
     }
 
     /// The hostless mark is an empty `host:` tag on an event or a check too, since an empty `h:`
