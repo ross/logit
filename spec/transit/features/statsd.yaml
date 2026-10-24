@@ -47,7 +47,9 @@
 - name: tags_duplicate
   text: An exact duplicate tag token, deduplicated at decode.
 - name: container_id
-  text: A `|c:<container-id>` segment, stamped as the `_logit.statsd.container_id` carrier.
+  text: >-
+    A `|c:` local-data segment: its container id decodes to `container.id` and a cgroup inode to
+    the `_logit.statsd.cgroup_inode` carrier.
 - name: external_data
   text: A `|e:<external-data>` segment, stamped as the `_logit.statsd.external_data` carrier.
 - name: cardinality

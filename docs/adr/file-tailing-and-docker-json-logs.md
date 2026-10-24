@@ -1,6 +1,6 @@
 ---
 created: 2026-09-06
-updated: 2026-10-23
+updated: 2026-10-24
 ---
 
 # `tail_in`: generic file tailing, and `docker_in` on top of it for Docker's json-file logs
@@ -294,7 +294,8 @@ e.g. embedded newlines as `\n` two-character sequences, so `serde_json` cannot b
 the original buffer for it; see Consequences). `severity: None`, `body_format: Raw`, an event
 attribute `log.iostream` (`stdout`/`stderr`), and every other entry of the envelope's own `attrs`
 object copied verbatim (the 2026-09-28 amendment says why `log.iostream` wins). Resource carries `container.id`, `container.name`, `container.image.name`,
-`container.image.tag` (split on the image reference's last `:`, only when there's no `@` digest and
+`container.image.tag` (superseded: `container.image.tags`, see "Amendment: `container.image.tags`
+(2026-10-24)"; split on the image reference's last `:`, only when there's no `@` digest and
 no `/` after that colon — a registry port like `registry:5000/app` must not be misread as a tag),
 and `container.label.<key>` for every key named in `labels:` (default empty — a label's value is
 operator data, not `logit`'s to expose unasked, and every key becomes a permanent entry in the
@@ -648,3 +649,9 @@ the resource beside `container.id`, since a resource is per container, and a con
 another source of the host without renaming the field. The resource is rebuilt with the rest of
 the identity, so a `config.v2.json` rewrite that changes the hostname starts a new batch as a
 rename does.
+
+## Amendment: `container.image.tags` (2026-10-24)
+
+`docker_in` writes the image tag as `container.image.tags`, a one-element array, OpenTelemetry's
+semantic-convention key, in place of the string `container.image.tag`
+([ADR `process-hostname`](process-hostname.md)'s "Amendment: container identity (2026-10-24)").

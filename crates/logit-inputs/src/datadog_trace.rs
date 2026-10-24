@@ -97,8 +97,9 @@
 //! in request headers. `Datadog-Meta-Lang`, `-Lang-Version`, `-Lang-Interpreter`,
 //! `-Lang-Interpreter-Vendor`, `-Tracer-Version`, `Datadog-Container-ID`, `Datadog-Entity-ID`,
 //! `Datadog-External-Env`, `Datadog-Client-Computed-Top-Level`, `Datadog-Client-Computed-Stats`,
-//! and `Datadog-Client-Dropped-P0-{Traces,Spans}` become `_logit.datadog.tracer.*` batch resource
-//! attributes, per the codec's Traces table. On v0.7 the payload's own fields win: a header fills a
+//! and `Datadog-Client-Dropped-P0-{Traces,Spans}` become batch resource attributes, per the
+//! codec's Traces table: `Datadog-Container-ID` the standard `container.id`, the rest
+//! `_logit.datadog.tracer.*` carriers. On v0.7 the payload's own fields win: a header fills a
 //! field only where the payload left it empty. `datadog_trace_out` restores the headers from the
 //! same attributes. `/v0.6/stats` takes three of them, `Datadog-Meta-Lang`, `-Tracer-Version`, and
 //! `Datadog-Container-ID`, each only where the `ClientStatsPayload` left `Lang`, `TracerVersion`,
@@ -214,10 +215,10 @@ use logit_core::{Diagnostics, EventBatch, Resource, Telemetry, Value};
 use logit_pipeline::listen::BindOptions;
 use logit_pipeline::Fanout;
 use logit_proto::datadog::{
-    DatadogDecoder, HEADER_CLIENT_COMPUTED_STATS, HEADER_CLIENT_COMPUTED_TOP_LEVEL,
-    HEADER_CONTAINER_ID, HEADER_META_LANG, HEADER_META_TRACER_VERSION, HEADER_TRACE_COUNT,
-    RESOURCE_ATTR_TRACER_CLIENT_COMPUTED_STATS, RESOURCE_ATTR_TRACER_CLIENT_COMPUTED_TOP_LEVEL,
-    RESOURCE_ATTR_TRACER_CONTAINER_ID, RESOURCE_ATTR_TRACER_LANGUAGE_NAME,
+    DatadogDecoder, ATTR_CONTAINER_ID, HEADER_CLIENT_COMPUTED_STATS,
+    HEADER_CLIENT_COMPUTED_TOP_LEVEL, HEADER_CONTAINER_ID, HEADER_META_LANG,
+    HEADER_META_TRACER_VERSION, HEADER_TRACE_COUNT, RESOURCE_ATTR_TRACER_CLIENT_COMPUTED_STATS,
+    RESOURCE_ATTR_TRACER_CLIENT_COMPUTED_TOP_LEVEL, RESOURCE_ATTR_TRACER_LANGUAGE_NAME,
     RESOURCE_ATTR_TRACER_VERSION, TRACER_STR_HEADERS, TRACER_U64_HEADERS,
 };
 use logit_proto::forwarded::ForwardedHeader;
@@ -1244,7 +1245,7 @@ fn apply_tracer_headers(batch: &mut EventBatch, headers: &HeaderMap, diag: &Diag
 const STATS_HEADERS: [(&str, &str); 3] = [
     (HEADER_META_LANG, RESOURCE_ATTR_TRACER_LANGUAGE_NAME),
     (HEADER_META_TRACER_VERSION, RESOURCE_ATTR_TRACER_VERSION),
-    (HEADER_CONTAINER_ID, RESOURCE_ATTR_TRACER_CONTAINER_ID),
+    (HEADER_CONTAINER_ID, ATTR_CONTAINER_ID),
 ];
 
 /// Fills a stats batch's empty `Lang`, `TracerVersion`, and `ContainerID` carriers from the
@@ -1397,7 +1398,7 @@ mod tests {
     use logit_pipeline::test_util::{recv_batch, Totals};
     use logit_proto::datadog::traces::RESOURCE_ATTR_TRACER_LANGUAGE_VERSION;
     use logit_proto::datadog::{
-        RESOURCE_ATTR_TRACER_CONTAINER_ID, RESOURCE_ATTR_TRACER_DROPPED_P0_SPANS,
+        ATTR_CONTAINER_ID, RESOURCE_ATTR_TRACER_DROPPED_P0_SPANS,
         RESOURCE_ATTR_TRACER_DROPPED_P0_TRACES, RESOURCE_ATTR_TRACER_ENTITY_ID,
         RESOURCE_ATTR_TRACER_EXTERNAL_ENV, RESOURCE_ATTR_TRACER_LANGUAGE_INTERPRETER,
         RESOURCE_ATTR_TRACER_LANGUAGE_INTERPRETER_VENDOR, RESOURCE_ATTR_TRACER_LANGUAGE_NAME,
@@ -1765,7 +1766,7 @@ mod tests {
         apply_stats_headers(&mut batch, &headers);
         let attr = |key: &str| batch.resource.attributes.get(key).and_then(Value::as_str);
         assert_eq!(attr(RESOURCE_ATTR_TRACER_LANGUAGE_NAME), Some("go"));
-        assert_eq!(attr(RESOURCE_ATTR_TRACER_CONTAINER_ID), Some("abc"));
+        assert_eq!(attr(ATTR_CONTAINER_ID), Some("abc"));
     }
 
     /// `connection_limit` reports the configured cap, not the default.
@@ -1965,7 +1966,7 @@ mod tests {
                 (RESOURCE_ATTR_TRACER_LANGUAGE_INTERPRETER, Value::str("CPython")),
                 (RESOURCE_ATTR_TRACER_LANGUAGE_INTERPRETER_VENDOR, Value::str("python.org")),
                 (RESOURCE_ATTR_TRACER_VERSION, Value::str("2.14.0")),
-                (RESOURCE_ATTR_TRACER_CONTAINER_ID, Value::str("abc123")),
+                (ATTR_CONTAINER_ID, Value::str("abc123")),
                 (RESOURCE_ATTR_TRACER_ENTITY_ID, Value::str("ci-abc123")),
                 (RESOURCE_ATTR_TRACER_CLIENT_COMPUTED_TOP_LEVEL, Value::Bool(true)),
                 (RESOURCE_ATTR_TRACER_CLIENT_COMPUTED_STATS, Value::Bool(true)),

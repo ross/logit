@@ -22,12 +22,12 @@ use logit_proto::datadog::stats::{
 };
 use logit_proto::datadog::traces::RESOURCE_ATTR_TRACER_LANGUAGE_VERSION;
 use logit_proto::datadog::{
-    DatadogDecoder, DatadogEncoder, ATTR_HOST_NAME, ATTR_SERVICE_NAME,
+    DatadogDecoder, DatadogEncoder, ATTR_CONTAINER_ID, ATTR_HOST_NAME, ATTR_SERVICE_NAME,
     RESOURCE_ATTR_TRACER_CLIENT_COMPUTED_STATS, RESOURCE_ATTR_TRACER_CLIENT_COMPUTED_TOP_LEVEL,
-    RESOURCE_ATTR_TRACER_CONTAINER_ID, RESOURCE_ATTR_TRACER_DROPPED_P0_SPANS,
-    RESOURCE_ATTR_TRACER_DROPPED_P0_TRACES, RESOURCE_ATTR_TRACER_ENTITY_ID,
-    RESOURCE_ATTR_TRACER_LANGUAGE_INTERPRETER, RESOURCE_ATTR_TRACER_LANGUAGE_INTERPRETER_VENDOR,
-    RESOURCE_ATTR_TRACER_LANGUAGE_NAME, RESOURCE_ATTR_TRACER_VERSION,
+    RESOURCE_ATTR_TRACER_DROPPED_P0_SPANS, RESOURCE_ATTR_TRACER_DROPPED_P0_TRACES,
+    RESOURCE_ATTR_TRACER_ENTITY_ID, RESOURCE_ATTR_TRACER_LANGUAGE_INTERPRETER,
+    RESOURCE_ATTR_TRACER_LANGUAGE_INTERPRETER_VENDOR, RESOURCE_ATTR_TRACER_LANGUAGE_NAME,
+    RESOURCE_ATTR_TRACER_VERSION,
 };
 use prost::Message;
 use std::collections::HashMap;
@@ -213,7 +213,7 @@ fn with_headers(mut batch: EventBatch) -> EventBatch {
         (RESOURCE_ATTR_TRACER_LANGUAGE_INTERPRETER, Value::str("CPython")),
         (RESOURCE_ATTR_TRACER_LANGUAGE_INTERPRETER_VENDOR, Value::str("python.org")),
         (RESOURCE_ATTR_TRACER_VERSION, Value::str("2.14.0")),
-        (RESOURCE_ATTR_TRACER_CONTAINER_ID, Value::str("abc123")),
+        (ATTR_CONTAINER_ID, Value::str("abc123")),
         (RESOURCE_ATTR_TRACER_ENTITY_ID, Value::str("ci-abc123")),
         (RESOURCE_ATTR_TRACER_CLIENT_COMPUTED_TOP_LEVEL, Value::Bool(true)),
         (RESOURCE_ATTR_TRACER_CLIENT_COMPUTED_STATS, Value::Bool(true)),
@@ -293,7 +293,7 @@ fn with_stats_headers(mut batch: EventBatch) -> EventBatch {
     for (attr, value) in [
         (RESOURCE_ATTR_TRACER_LANGUAGE_NAME, "python"),
         (RESOURCE_ATTR_TRACER_VERSION, "2.14.0"),
-        (RESOURCE_ATTR_TRACER_CONTAINER_ID, "abc123"),
+        (ATTR_CONTAINER_ID, "abc123"),
     ] {
         assert!(resource.attributes.get(attr).is_none(), "{attr}: the payload left it empty");
         resource.attributes.insert(attr, Value::str(value));

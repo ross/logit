@@ -155,6 +155,14 @@
 //! | `attributes/string_value`, otherwise | normalized | `tag_sanitized`; `logit.output.metrics.normalized{reason=tag_sanitized}` | A `;name=value` tag. Each `;`, `!`, `^`, `=`, whitespace, and control character in the name, and each `;`, whitespace, and control character and a leading `~` in the value, is written as `_`, counted once per record. |
 //! | `attributes/host_beside_host_name`, under `tags: drop` | lost | `logit.output.tags.omitted{reason=dialect}` | Under `tags: drop`, no tag is written, counted once per attribute. |
 //! | `attributes/host_beside_host_name`, otherwise | normalized | `tag_sanitized`; `logit.output.metrics.normalized{reason=tag_sanitized}` | A `;name=value` tag. Each `;`, `!`, `^`, `=`, whitespace, and control character in the name, and each `;`, whitespace, and control character and a leading `~` in the value, is written as `_`, counted once per record. |
+//! | `attributes/container_id`, under `tags: drop` | lost | `logit.output.tags.omitted{reason=dialect}` | Under `tags: drop`, no tag is written, counted once per attribute. |
+//! | `attributes/container_id`, otherwise | exact | -- | A `;container.id=<id>` tag. |
+//! | `attributes/service_identity`, under `tags: drop` | lost | `logit.output.tags.omitted{reason=dialect}` | Under `tags: drop`, no tag is written, counted once per attribute. |
+//! | `attributes/service_identity`, otherwise | exact | -- | A `;name=value` tag. |
+//! | `attributes/service_tag`, under `tags: drop` | lost | `logit.output.tags.omitted{reason=dialect}` | Under `tags: drop`, no tag is written, counted once per attribute. |
+//! | `attributes/service_tag`, otherwise | exact | -- | A `;name=value` tag. |
+//! | `attributes/service_tag_beside_key`, under `tags: drop` | lost | `logit.output.tags.omitted{reason=dialect}` | Under `tags: drop`, no tag is written, counted once per attribute. |
+//! | `attributes/service_tag_beside_key`, otherwise | exact | -- | A `;name=value` tag. |
 //! | `attributes/bool_value`, under `tags: drop` | lost | `logit.output.tags.omitted{reason=dialect}` | Under `tags: drop`, no tag is written, counted once per attribute. |
 //! | `attributes/bool_value`, otherwise | normalized | `stringified`; `logit.output.metrics.normalized{reason=tag_sanitized}` | A tag of `true` or `false`, read back as the string. Its name is sanitized as the `string_value` row says, counted once per record as `tag_sanitized`. |
 //! | `attributes/number_value`, under `tags: drop` | lost | `logit.output.tags.omitted{reason=dialect}` | Under `tags: drop`, no tag is written, counted once per attribute. |

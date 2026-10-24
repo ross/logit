@@ -476,8 +476,26 @@ impl Spelling {
     /// [`Spelling::key`] for attribute `key` of `rec`, where the spelling depends on the record:
     /// `statsd_out` under `format: dogstatsd` writes a `host` attribute the line's own host
     /// doesn't omit as a `host:` tag, which `statsd_in` reads back as the line's host
-    /// ([`statsd::host_read_back`]).
+    /// ([`statsd::host_read_back`]), and `datadog_out` writes `container.id` as the
+    /// `container_id` tag on the routes that write tags ([`datadog::tags_container_id`]). Where a
+    /// sink writes Unified Service Tagging tags, a valued `env`, `version`, or `service` attribute
+    /// is that tag, which the pair decoder reads back under its standard key ([`unified::key`]).
     fn key_for(self, key: &str, rec: &Rec) -> String {
+        if self == Spelling::Datadog
+            && key == logit_core::attrs::CONTAINER_ID
+            && datadog::tags_container_id(rec)
+        {
+            return "container_id".to_string();
+        }
+        if self == Spelling::Datadog && key == "service" && datadog::log_service_is_the_field(rec) {
+            return "service.name".to_string();
+        }
+        if unified::writes_tags(self, rec) {
+            let value = rec.attributes.get(key).or_else(|| rec.resource.get(key));
+            if let Some(standard) = value.and_then(|value| unified::key(key, value)) {
+                return standard.to_string();
+            }
+        }
         if self == (Spelling::Statsd { dogstatsd: true }) && key == "host" {
             let value = rec.attributes.get(key).or_else(|| rec.resource.get(key));
             if let Some(read) = value.and_then(statsd::host_read_back) {
@@ -491,15 +509,17 @@ impl Spelling {
 
     /// [`Spelling::value`] for attribute `key` of `rec`. `None` where the sink writes no tag for
     /// the value: `graphite_out`'s omitted values, `statsd_out`'s `host` beside the line's own
-    /// host, and `datadog_out`'s log `hostname`.
+    /// host, `datadog_out`'s log `hostname`, and a valued `env`, `version`, or `service` beside its
+    /// standard key where the sink writes Unified Service Tagging tags.
     fn value_for(self, key: &str, value: &Value, tags: &str, rec: &Rec) -> Option<String> {
-        if self == (Spelling::Statsd { dogstatsd: true })
-            && key == "host"
-            && statsd::host_is_omitted(rec, value)
-        {
+        if self == (Spelling::Statsd { dogstatsd: true }) && key == "host" {
+            let kept = statsd::host_kept(rec, value)?;
+            return Some(self.value(&kept, tags));
+        }
+        if self == Spelling::Datadog && datadog::reserved_log_key_is_omitted(rec, key) {
             return None;
         }
-        if self == Spelling::Datadog && key == "hostname" && datadog::hostname_is_omitted(rec) {
+        if unified::tag_is_omitted(self, rec, key, value) {
             return None;
         }
         if self == Spelling::Graphite {
@@ -632,12 +652,39 @@ mod statsd {
         usable || get(rec, HOSTLESS) == Some(&Value::Bool(true))
     }
 
-    /// Whether a `host` attribute holding `value` is left off: the line names its own host,
-    /// and `value` isn't a bare `host` token (`true`), which no Agent reads as a host. An array
-    /// mixing `true` with strings reads as omitted whole, where the sink keeps its `true`
-    /// elements; no case reaches one.
+    /// The elements of a `host` attribute holding `value` that the sink leaves off: with the line
+    /// naming its own host, each valued element is a second `host:` tag the Agent consumes, and
+    /// only a bare `host` token (`true`) stays. An array is judged per element, as the sink
+    /// counts it.
+    fn omitted_elements<'a>(rec: &Rec, value: &'a Value) -> Vec<&'a Value> {
+        if !names_host(rec) {
+            return Vec::new();
+        }
+        let elements = match value {
+            Value::Array(elements) => elements.as_slice(),
+            _ => std::slice::from_ref(value),
+        };
+        elements.iter().filter(|e| **e != Value::Bool(true)).collect()
+    }
+
+    /// Whether any element of a `host` attribute holding `value` is left off.
     pub(super) fn host_is_omitted(rec: &Rec, value: &Value) -> bool {
-        names_host(rec) && *value != Value::Bool(true)
+        !omitted_elements(rec, value).is_empty()
+    }
+
+    /// What the sink writes of a `host` attribute holding `value`: the value less its omitted
+    /// elements, `None` when nothing is left.
+    pub(super) fn host_kept(rec: &Rec, value: &Value) -> Option<Value> {
+        let omitted = omitted_elements(rec, value);
+        match value {
+            Value::Array(elements) if !omitted.is_empty() => {
+                let kept: Vec<Value> =
+                    elements.iter().filter(|e| **e == Value::Bool(true)).cloned().collect();
+                (!kept.is_empty()).then_some(Value::Array(kept))
+            }
+            _ if omitted.is_empty() => Some(value.clone()),
+            _ => None,
+        }
     }
 
     /// The key `statsd_in` reads a `host` attribute's `host:` tag back under, where it's written:
@@ -648,6 +695,47 @@ mod statsd {
             Some(_) => Some(HOST_NAME),
             None => None,
         }
+    }
+}
+
+/// Datadog's Unified Service Tagging tags (`logit_core::attrs::UNIFIED_SERVICE_TAGS`):
+/// `statsd_out` under `format: dogstatsd` and `datadog_out` on its tag routes write the standard
+/// keys as `env:`, `version:`, and `service:` tags, which their pair decoders read back as the
+/// keys, and leave off a valued attribute of a tag's name beside its key.
+mod unified {
+    use super::{datadog, Rec, Spelling};
+    use logit_core::attrs::UNIFIED_SERVICE_TAGS;
+    use serde_json::Value;
+
+    /// Whether `spelling`'s sink writes `rec`'s service identity as Datadog tags.
+    pub(super) fn writes_tags(spelling: Spelling, rec: &Rec) -> bool {
+        spelling == (Spelling::Statsd { dogstatsd: true })
+            || (spelling == Spelling::Datadog && datadog::tags_container_id(rec))
+    }
+
+    /// The standard key a valued `env`, `version`, or `service` attribute's tag reads back
+    /// under; `None` for any other key and for a bare token (`true`), which names no value.
+    pub(super) fn key(key: &str, value: &Value) -> Option<&'static str> {
+        if *value == Value::Bool(true) {
+            return None;
+        }
+        UNIFIED_SERVICE_TAGS.iter().find(|(tag, _)| *tag == key).map(|(_, standard)| *standard)
+    }
+
+    /// Whether `rec` carries the standard key a valued `key` attribute's tag names, with a value
+    /// that writes a tag.
+    pub(super) fn beside_its_key(rec: &Rec, key: &str, value: &Value) -> bool {
+        self::key(key, value).is_some_and(|standard| {
+            rec.attributes
+                .get(standard)
+                .or_else(|| rec.resource.get(standard))
+                .is_some_and(|v| !v.is_null() && !v.is_object())
+        })
+    }
+
+    /// Whether `spelling`'s sink leaves `rec`'s `key` attribute off beside its standard key.
+    pub(super) fn tag_is_omitted(spelling: Spelling, rec: &Rec, key: &str, value: &Value) -> bool {
+        writes_tags(spelling, rec) && beside_its_key(rec, key, value)
     }
 }
 
@@ -694,10 +782,34 @@ mod datadog {
         get(rec, "host.name").is_some_and(|v| v.as_str() != Some(""))
     }
 
-    /// Whether a log's `hostname` attribute is left off: it would collide with the wire's own
-    /// `hostname`, which is `host.name`.
-    pub(super) fn hostname_is_omitted(rec: &Rec) -> bool {
-        Route::of(rec) == Route::Log && get(rec, "hostname").is_some()
+    /// Whether `container.id` leaves as Datadog's `container_id` tag, which `datadog_in` reads
+    /// back under that key: on a metric, a Datadog event, or a service check.
+    pub(super) fn tags_container_id(rec: &Rec) -> bool {
+        matches!(Route::of(rec), Route::Metric | Route::Event | Route::Check)
+    }
+
+    /// Whether a log's `hostname` attribute, or its `service` attribute beside a `service.name`
+    /// the encoder writes, is left off: it would collide with the wire's own field of that name.
+    pub(super) fn reserved_log_key_is_omitted(rec: &Rec, key: &str) -> bool {
+        let beside = match key {
+            "hostname" => true,
+            "service" => service_name_written(rec),
+            _ => false,
+        };
+        beside && Route::of(rec) == Route::Log && get(rec, key).is_some()
+    }
+
+    /// Whether a log's `service.name` is its `service` field: anything but an empty `Str`.
+    fn service_name_written(rec: &Rec) -> bool {
+        get(rec, "service.name").is_some_and(|v| v.as_str() != Some(""))
+    }
+
+    /// Whether a log's `service` attribute is its `service` field, which `datadog_in` reads back
+    /// as `service.name` when it's a string: one with no `service.name` the encoder writes.
+    pub(super) fn log_service_is_the_field(rec: &Rec) -> bool {
+        Route::of(rec) == Route::Log
+            && !service_name_written(rec)
+            && get(rec, "service").is_some_and(|v| v.as_str().is_some())
     }
 
     /// Whether a span carries a field a Datadog span has no form for: `status: ok`, a status
@@ -1496,12 +1608,36 @@ fn field_rows(rec: &Rec, protocol: &str) -> Vec<(String, Option<String>, Field)>
         }
     };
     // A host attribute a sink leaves off for the record's own host: `statsd_out`'s `host` beside
-    // the line's host, and `datadog_out`'s log `hostname`.
+    // the line's host, and `datadog_out`'s log `hostname`, and its log `service` for the log's
+    // `service.name`.
     let outranked = |key: &str, value: &Value| {
         if key == "host" && statsd::host_is_omitted(rec, value) {
             Some("host_beside_host_name")
-        } else if key == "hostname" && datadog::hostname_is_omitted(rec) {
+        } else if key == "hostname" && datadog::reserved_log_key_is_omitted(rec, key) {
             Some("hostname")
+        } else if key == "service" && datadog::reserved_log_key_is_omitted(rec, key) {
+            Some("log_service")
+        } else if key == "service" && datadog::log_service_is_the_field(rec) {
+            Some("log_service_field")
+        } else if key == logit_core::attrs::CONTAINER_ID && value.is_string() {
+            // The standard key a sink writes in its own wire's form: `statsd_out`'s `|c:`,
+            // `datadog_out`'s `container_id` tag.
+            Some("container_id")
+        } else {
+            None
+        }
+    };
+    // An event's service identity: a standard key, or a valued attribute of a Unified Service
+    // Tagging tag's name, alone or beside its key. On the resource, each is a resource attribute.
+    let service = |key: &str, value: &Value| {
+        if value.is_string()
+            && logit_core::attrs::UNIFIED_SERVICE_TAGS.iter().any(|(_, standard)| key == *standard)
+        {
+            Some("service_identity")
+        } else if unified::beside_its_key(rec, key, value) {
+            Some("service_tag_beside_key")
+        } else if value.is_string() && unified::key(key, value).is_some() {
+            Some("service_tag")
         } else {
             None
         }
@@ -1511,6 +1647,8 @@ fn field_rows(rec: &Rec, protocol: &str) -> Vec<(String, Option<String>, Field)>
         let feature = if let Some(feature) = carrier(key, value) {
             feature
         } else if let Some(feature) = outranked(key, value) {
+            feature
+        } else if let Some(feature) = service(key, value) {
             feature
         } else if tags.contains("=bytes") {
             "bytes_value"
@@ -1610,12 +1748,12 @@ fn observe_field(field: &Field, input: &Rec, out: &Rec, spelling: Spelling) -> C
             // A host attribute the sink leaves off for the record's own host: what reads back
             // under its key is that host.
             let outranked = match spelling {
-                Spelling::Datadog => key == "hostname" && datadog::hostname_is_omitted(input),
+                Spelling::Datadog => datadog::reserved_log_key_is_omitted(input, key),
                 Spelling::Statsd { dogstatsd: true } => {
                     key == "host" && statsd::host_is_omitted(input, want)
                 }
                 _ => false,
-            };
+            } || unified::tag_is_omitted(spelling, input, key, want);
             if outranked {
                 return Class::Lost;
             }
@@ -2559,6 +2697,40 @@ mod tests {
         assert_eq!(observe_field(&hostname, &alone[0], &filled[0], Spelling::Datadog), Class::Lost);
     }
 
+    /// A log's `service.name` is its Datadog `service`, read back as `service.name`; a `service`
+    /// attribute is lost beside it, and alone is the `service` field, read back as `service.name`.
+    #[test]
+    fn datadog_pairs_a_logs_service_name_and_loses_a_service_attribute() {
+        let log = |attributes: &str| {
+            format!(r#"{{{{T}},"log":{{"format":"raw","message":"m"}},"attributes":{attributes}}}"#)
+        };
+        let name = Field::Attribute { key: "service.name".to_string(), resource: false };
+        let service = Field::Attribute { key: "service".to_string(), resource: false };
+        let read = recs(&[&log(r#"{"service.name":"web"}"#)]);
+        assert_eq!(observe_field(&name, &read[0], &read[0], Spelling::Datadog), Class::Exact);
+        let both = recs(&[&log(r#"{"service.name":"web","service":"s"}"#)]);
+        assert_eq!(observe_field(&service, &both[0], &read[0], Spelling::Datadog), Class::Lost);
+        let alone = recs(&[&log(r#"{"service":"s"}"#)]);
+        let moved = recs(&[&log(r#"{"service.name":"s"}"#)]);
+        assert_eq!(
+            observe_field(&service, &alone[0], &moved[0], Spelling::Datadog),
+            Class::Normalized
+        );
+        let feature = |rec: &Rec| {
+            field_rows(rec, "datadog")
+                .into_iter()
+                .find(|(_, _, f)| matches!(f, Field::Attribute { key, .. } if key == "service"))
+                .and_then(|(_, feature, _)| feature)
+        };
+        assert_eq!(feature(&both[0]).as_deref(), Some("log_service"));
+        assert_eq!(feature(&alone[0]).as_deref(), Some("log_service_field"));
+        // On a metric, `service` is the tag `service.name` also writes.
+        let gauge = recs(&[
+            r#"{{T},"metrics":[{"name":"g","kind":"gauge","value":1.0}],"attributes":{"service.name":"x","service":"s"}}"#,
+        ]);
+        assert_eq!(feature(&gauge[0]).as_deref(), Some("service_tag_beside_key"));
+    }
+
     /// A `host` attribute is an ordinary tag at `datadog_out`, read back as `host`, and the
     /// default host fills; it's never read back as `host.name`.
     #[test]
@@ -2575,6 +2747,29 @@ mod tests {
         assert_eq!(pair(&ins, &moved, Spelling::Datadog).seen, [None]);
         let host = Field::Attribute { key: "host".to_string(), resource: false };
         assert_eq!(observe_field(&host, &ins[0], &tagged[0], Spelling::Datadog), Class::Exact);
+    }
+
+    /// Beside the line's own host, `statsd_out` keeps a `host` array's bare `true` elements and
+    /// omits its valued ones, so a mixed array is partly omitted, not omitted whole.
+    #[test]
+    fn statsd_judges_a_mixed_host_array_per_element() {
+        let input = |host: &str| {
+            format!(
+                r#"{{{{T}},"metrics":[{{"name":"g","kind":"gauge","value":1.0}}],"attributes":{{"host":{host},"host.name":"h"}}}}"#
+            )
+        };
+        let mixed = recs(&[&input(r#"[true,"web-1"]"#)]);
+        let bare = recs(&[&input("[true]")]);
+        let valued = recs(&[&input(r#""web-1""#)]);
+        let value = |r: &Rec| r.attributes["host"].clone();
+        assert!(statsd::host_is_omitted(&mixed[0], &value(&mixed[0])));
+        assert_eq!(
+            statsd::host_kept(&mixed[0], &value(&mixed[0])),
+            Some(serde_json::json!([true]))
+        );
+        assert!(!statsd::host_is_omitted(&bare[0], &value(&bare[0])));
+        assert_eq!(statsd::host_kept(&bare[0], &value(&bare[0])), Some(serde_json::json!([true])));
+        assert_eq!(statsd::host_kept(&valued[0], &value(&valued[0])), None);
     }
 
     /// A Datadog event's or check's `host.name` is its host, read back as `host.name`.

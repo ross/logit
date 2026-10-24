@@ -89,13 +89,20 @@ fn assert_fixed_point(form: Form, body: &[u8]) -> Vec<EventBatch> {
     d1
 }
 
-/// The payload's hostname decodes to `host.name`, and no `_logit.datadog.tracer.hostname`
-/// attribute exists on any resource or event.
+/// The payload's hostname, container id, env, and app version decode to `host.name`,
+/// `container.id`, `deployment.environment.name`, and `service.version`, and no carrier for any of
+/// them exists on any resource or event.
 fn assert_no_tracer_hostname_carrier(batch: &EventBatch) {
-    const CARRIER: &str = "_logit.datadog.tracer.hostname";
-    assert_eq!(batch.resource.attributes.get(CARRIER), None);
-    for event in &batch.events {
-        assert_eq!(event.attributes.get(CARRIER), None);
+    for carrier in [
+        "_logit.datadog.tracer.hostname",
+        "_logit.datadog.tracer.container_id",
+        "_logit.datadog.tracer.env",
+        "_logit.datadog.tracer.app_version",
+    ] {
+        assert_eq!(batch.resource.attributes.get(carrier), None);
+        for event in &batch.events {
+            assert_eq!(event.attributes.get(carrier), None);
+        }
     }
 }
 
@@ -375,7 +382,9 @@ fn minimal_v05_example() {
     let d = assert_fixed_point(Form::V05, &minimal_v05());
     assert_eq!(d[0].events.len(), 2);
     assert!(d[0].events[0].attributes.is_empty(), "the all-zero span carries nothing");
-    assert_eq!(d[0].events[1].attributes.get("env"), Some(&Value::str("prod")));
+    let attrs = &d[0].events[1].attributes;
+    assert_eq!(attrs.get("deployment.environment.name"), Some(&Value::str("prod")), "env meta");
+    assert_eq!(attrs.get("env"), None);
     assert_cross_form(&d[0]);
 }
 
@@ -454,6 +463,8 @@ fn key() -> impl Strategy<Value = String> {
         Just("span.kind".to_string()),
         Just("env".to_string()),
         Just("version".to_string()),
+        Just("deployment.environment.name".to_string()),
+        Just("service.version".to_string()),
         Just("service.name".to_string()),
         "[a-z][a-z0-9_.]{0,8}",
     ]

@@ -3068,8 +3068,8 @@ trace rather than dropping priority-0 ones, which would leave them out of the re
 
 **Tracer headers become resource attributes.** `Datadog-Meta-Lang`, `-Lang-Version`,
 `-Tracer-Version`, `Datadog-Container-ID`, and the tracer's other identity and client-computation
-headers land on the batch resource as `_logit.datadog.tracer.*`, which `datadog_trace_out` writes
-back as headers. For `/v0.7/traces`, the payload's own fields win over a header.
+headers land on the batch resource, `Datadog-Container-ID` as the standard `container.id` and the
+rest as `_logit.datadog.tracer.*`, which `datadog_trace_out` writes back as headers. For `/v0.7/traces`, the payload's own fields win over a header.
 
 **The Unix socket.** `socket:` binds a Unix stream socket, as the Agent's `receiver_socket` does.
 The directory must already exist. A stale socket file from an earlier run is replaced, but a path
@@ -3130,8 +3130,9 @@ logged: a `403` is reported as a throttled `api_key_rejected` warning that names
 response text quoted in a log line or error has the key replaced with `<redacted>`.
 
 **Host, service, and tags come from the data.** There's no `host:` or `tags:` field on the sink.
-Each route's encoder reads `host.name`, `service`, `ddsource`, and the rest from event attributes
-and the batch resource, so stamp them upstream with `set`, as the example does for `host.name`. A
+Each route's encoder reads `host.name`, `service.name`, `ddsource`, and the rest from event
+attributes and the batch resource, so stamp them upstream with `set`, as the example does for
+`host.name`. A
 metric, log, event, or service check with no host goes out under the process hostname
 ([Hostname](#hostname)), so senders with no host of their own all report as the relay's host.
 
@@ -3305,10 +3306,11 @@ socket (`receiver_socket`, `/var/run/datadog/apm.socket` by default), always pla
 
 **Pick `version` by where the spans came from.** `v0.4`, the default, is what most tracers send and
 every Agent accepts. It has no room for a trace chunk's fields (its sampling priority, origin, and
-tags) or for a tracer payload's environment, runtime ID, app version, and tags. Those are dropped
-and counted `logit.output.spans.degraded{reason="no_wire_form"}`; the payload's hostname, the
-resource's `host.name`, goes out as every span's `host.name` tag, unless the span carries a
-different `host.name`, which wins, counted the same way. A tracer that sent v0.4 never had them, so
+tags) or for a tracer payload's runtime ID and tags. Those are dropped and counted
+`logit.output.spans.degraded{reason="no_wire_form"}`. The payload's hostname, environment, and app
+version, the resource's `host.name`, `deployment.environment.name`, and `service.version`, go out
+as every span's `host.name`, `env`, and `version` tags, unless the span carries a different value
+of its own, which wins, counted the same way. A tracer that sent v0.4 never had them, so
 v0.4 relays its spans with nothing lost. If your tracers send `/v0.7/traces`, set `version: v0.7`,
 which carries all of them. The tracer's language, versions, container ID, and the rest of its
 request headers go out as the same headers under either version.

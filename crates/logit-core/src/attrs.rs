@@ -152,6 +152,50 @@ pub fn merged<'a>(
 /// keys".
 pub const HOST_NAME: &str = "host.name";
 
+/// The standard container key: the container a sender named, a `Str`, at the scope where it is
+/// identity (an event attribute for a DogStatsD line's `|c:`, the resource for a tracer's
+/// payload). A source fills it from its wire's own container-id forms and keeps no carrier for
+/// them; a sink reads it off the event, else the resource, and writes its own wire's form. See
+/// ADR `process-hostname` (`docs/adr/process-hostname.md`), "Amendment: a source fills the common
+/// keys".
+pub const CONTAINER_ID: &str = "container.id";
+
+/// The standard container image tags key: an `Array` of `Str`, as OpenTelemetry's semantic
+/// conventions type it, written as the resource attribute by the sources that know a container's
+/// image tag.
+pub const CONTAINER_IMAGE_TAGS: &str = "container.image.tags";
+
+/// The standard OS process id key (semconv's `process.pid`), a `Value::U64`.
+///
+/// A source writes it from a field its protocol defines as a process id; `syslog_in` writes it
+/// from a syslog PROCID that is canonical decimal. A sink reads it on the event, else on the batch
+/// resource. See ADR `process-hostname` (`docs/adr/process-hostname.md`), "Amendment: a source
+/// fills the common keys".
+pub const PROCESS_PID: &str = "process.pid";
+
+/// The standard service key, a `Str`: Datadog's `service`. A DogStatsD or Datadog `service:` tag,
+/// a Datadog log's `service`, a span's or APM stats group's `service`, and a stats payload's
+/// `Service` decode onto it.
+pub const SERVICE_NAME: &str = "service.name";
+
+/// The standard deployment environment key, a `Str`: Datadog's `env`. A source writes it at the
+/// scope where it is identity: on the event for an `env:` tag, a log's `ddtags` `env:` entry, or
+/// a span's own `env`; on the resource for a tracer's or stats payload's `env`. A sink reads the
+/// event's, else the resource's.
+pub const DEPLOYMENT_ENVIRONMENT_NAME: &str = "deployment.environment.name";
+
+/// The standard service version key, a `Str`: Datadog's `version`, written from the same forms as
+/// [`DEPLOYMENT_ENVIRONMENT_NAME`] and scoped as it is.
+pub const SERVICE_VERSION: &str = "service.version";
+
+/// Datadog's Unified Service Tagging tags and the standard key each one names, in Datadog's
+/// spelling first: a Datadog-family source writes a valued `env:`, `version:`, or `service:` tag
+/// as the key, and a Datadog-family sink writes the key back as that tag. See ADR
+/// `process-hostname` (`docs/adr/process-hostname.md`), "Amendment: service identity on tags
+/// (2026-10-24)".
+pub const UNIFIED_SERVICE_TAGS: [(&str, &str); 3] =
+    [("env", DEPLOYMENT_ENVIRONMENT_NAME), ("version", SERVICE_VERSION), ("service", SERVICE_NAME)];
+
 /// The prefix of the private attribute namespace, which protocol codecs reserve for their own use.
 ///
 /// See ADR `private-attribute-namespace` (`docs/adr/private-attribute-namespace.md`) and

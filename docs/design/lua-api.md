@@ -1420,7 +1420,8 @@ components:
     sources: [windowed]
     script: |
       function process(event)
-        event.attributes.env = event.attributes.env or "unknown"
+        local key = "deployment.environment.name"
+        event.attributes[key] = event.attributes[key] or "unknown"
         return event
       end
 

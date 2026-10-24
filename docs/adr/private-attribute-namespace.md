@@ -68,7 +68,7 @@ By protocol, these move under `_logit.`:
 
 | Protocol | Private keys |
 |---|---|
-| statsd | every `statsd.*` attribute: `type`, `container_id`, `external_data`, `cardinality`, `timestamp`, `event.*`, `service_check.*` |
+| statsd | every `statsd.*` attribute: `type`, `container_id` (since `container.id` and `cgroup_inode`, [ADR `process-hostname`](process-hostname.md)'s "Amendment: container identity (2026-10-24)"), `external_data`, `cardinality`, `timestamp`, `event.*`, `service_check.*` |
 | Prometheus | every `prometheus.*` attribute: `type`, `timestamp`, and the resource attribute `target` |
 | collectd | `plugin`, `type`, `interval`, and `severity` |
 | Datadog | every `datadog.*` attribute: series, events, service checks, Agent fields, trace chunk, stats, tracer headers, `span.error`, and `source` |
@@ -87,7 +87,8 @@ These stay public:
 - `syslog.timestamp`: the sender's own stamp. `Event.timestamp` is receipt time until a
   `timestamp` component resolves it, so the attribute duplicates nothing, and an operator names it
   in that component's config.
-- `syslog.tag`, `syslog.pid`, `syslog.msgid`, `syslog.sd`, and `syslog.facility`: header facts
+- `syslog.tag`, `syslog.pid` (a PROCID that isn't canonical decimal), `syslog.msgid`, `syslog.sd`,
+  and `syslog.facility`: header facts
   with no typed home that any destination can use. HOSTNAME rides on the standard `host.name`
   ([ADR `syslog-output`](syslog-output.md)'s "Amendment: HOSTNAME is `host.name` (2026-10-23)").
 - `com.splunk.*` and `otel.log.*`: the OpenTelemetry `splunk_hec` exporter's public vocabulary,

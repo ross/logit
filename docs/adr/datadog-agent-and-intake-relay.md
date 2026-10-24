@@ -1,6 +1,6 @@
 ---
 created: 2026-09-23
-updated: 2026-10-23
+updated: 2026-10-24
 ---
 
 # Datadog: two lossless pairs, the Agent's own protocols, and a Datadog-mapped `DdSketch`
@@ -776,3 +776,169 @@ The relays stay fixed points modulo the codec's lists (`crates/logit-proto/src/d
 permitted normalizations for traces and APM stats), which name the fallback and the v0.4/v0.5
 span tag. Across families, `datadog_in`'s traces now reach `otlp_out` with resource `host.name`
 and `splunk_hec_out` with the tracer host as each object's `host`.
+
+## Amendment: container identity is `container.id` (2026-10-24)
+
+A sender's container is the standard `container.id`, and a stats image tag an element of
+`container.image.tags` ([ADR `process-hostname`](process-hostname.md)'s "Amendment: container
+identity (2026-10-24)" has the tables). What datadog-agent 7.83.3 does with each form decided the
+mapping:
+
+- **DogStatsD `|c:`.** The Agent reads the field as origin-detection local data
+  (`comp/dogstatsd/server/impl/parse.go`, `parseLocalData`, calling
+  `comp/core/tagger/origindetection/origindetection.go`, `ParseLocalData`): a single bare, `ci-`,
+  or `cid-` value is the container id, `in-<inode>` a cgroup inode, and a `,` list's `ci-` and
+  `in-` items each, the rest ignored. It never forwards the raw id: `enrich.go`'s
+  `extractTagsMetadata` hands it to the tagger, which adds the container's tags at the sample's
+  cardinality, `container_id` among them only at high cardinality
+  (`comp/core/tagger/collectors/workloadmeta_extract.go`, `AddHigh(tags.ContainerID, …)`;
+  `image_tag` is low). So `statsd_in -> datadog_out` now sends a `container_id:<id>` tag for a
+  line that named a container id, which an Agent sends under `dogstatsd_tag_cardinality: high`
+  or a `|card:high` line; a line that named only an inode sends none, since only the sender's
+  host can resolve one.
+- **Tracer payloads and headers.** The trace receiver fills `TracerPayload.ContainerID` on v0.3
+  to v0.5 from the request (`pkg/trace/api/api.go`, `decodeTracerPayload`, through
+  `pkg/trace/api/container_linux.go`'s `GetContainerID`: the `Datadog-Entity-ID` local data, then
+  the deprecated `Datadog-Container-ID` header), and on v0.7 keeps the payload's own, reading no
+  header. A `/v0.6/stats` payload gets the same lookup (`handleStats`), and
+  `pkg/trace/stats/client_stats_aggregator.go` keys on `ContainerID` and `ImageTag` (`add`,
+  `newPayloadAggregationKey`). So the
+  payload field and the header name one fact, the payload's winning where both are set, and
+  `datadog_trace_in` writes the resource's `container.id` from the payload, else the header.
+  `Datadog-Entity-ID` stays the carrier `_logit.datadog.tracer.entity_id`: its local data may be
+  an inode only the sender's host resolves.
+- **Datadog spellings.** `datadog_out` writes `container.id` as the `container_id` tag on a
+  metric, an event, or a service check, the Datadog OTLP exporter's mapping
+  (`pkg/opentelemetry-mapping-go/otlp/attributes/attributes.go`, `ContainerMappings`). That table
+  maps the singular `container.image.tag` to `image_tag`; writing `container.image.tags`' first
+  element there is this relay's rule by analogy. On a trace payload the key is the
+  `container_id` field, as the Agent's OTLP receiver fills it from a resource's `container.id`
+  (`pkg/trace/api/otlp.go`, `receiveResourceSpansV1` and `receiveResourceSpansV2`). On a log
+  it's a `container_id:<id>` entry in `ddtags`, the tag the Agent puts on a container's logs,
+  whose tagger it queries at high cardinality (`pkg/logs/internal/tag/provider.go`, `GetTags`).
+
+The like pairs stay fixed points: a tracer's container id relays through `container.id` both
+ways, and `datadog_in` reads a series' `container_id:` tag back as an attribute of that name,
+which `datadog_out` writes back unchanged. `datadog_out` writes no `container.id` it wasn't given,
+so the Datadog-to-Datadog relay sends nothing new.
+
+## Amendment: service identity is on the standard keys (2026-10-24)
+
+A sender's service, environment, and version are `service.name`, `deployment.environment.name`,
+and `service.version` ([ADR `process-hostname`](process-hostname.md) has the tables). What
+datadog-agent 7.83.3 does with each form decided the mapping.
+
+### Tags
+
+On a metric, a Datadog event, or a service check, a valued `env:`, `version:`, or `service:`
+tag is the standard key, on both sides of the relay (ADR `process-hostname`'s "Amendment:
+service identity on tags (2026-10-24)" has the tables).
+
+- **DogStatsD.** The Agent passes the three tags through as ordinary client tags:
+  `comp/dogstatsd/server/impl/enrich.go`'s `extractTagsMetadata` consumes only `host:`,
+  `dd.internal.entity_id:`, the cardinality tag, and `dd.internal.jmx_check_name:`, and keeps the
+  rest in order. The server then appends its configured `dogstatsd_tags`
+  (`comp/dogstatsd/server/impl/server.go`), and the aggregator adds the origin's tagger tags in a
+  separate buffer (`pkg/aggregator/context_resolver.go`, `trackContext`, through the tagger's
+  `EnrichTags` in `comp/core/tagger/impl/tagger.go`), which can hold a second `env:` from a
+  container's Unified Service Tagging labels. No step reads, rewrites, or dedupes the three
+  tags against each other, so a line's own tags are the sender's statement of its identity, and
+  `statsd_in` writes them as the keys.
+- **Datadog spellings.** `datadog_out` and `statsd_out` write the keys back as `env`,
+  `version`, and `service` tags, the mapping the Datadog OTLP exporter applies to a resource's
+  attributes (`pkg/opentelemetry-mapping-go/otlp/attributes/attributes.go`,
+  `TagsFromAttributes` through `coreMapping`, which also maps the older
+  `deployment.environment` to `env`). That table reads only a non-empty string; this relay writes
+  every value a tag can carry, so a relayed `env:` with an empty value round-trips.
+
+A valueless `env` token stays a tag of that name: it carries no environment. The like pairs stay
+fixed points modulo tag order: a tag decodes onto its key and leaves as the same tag.
+
+### Logs
+
+- **What the Agent sends.** The Agent's logs encoder writes every log with the same seven keys
+  and no `omitempty`, `service` from `Origin.Service()` and `ddtags` from `Origin.TagsToString()`
+  (`comp/logs-library/processor/json.go`, `jsonEncoder.Encode`), so a log with neither arrives
+  as `"service":""` and `"ddtags":""`. `Origin.Service` is the log source's configured service,
+  else the origin's own (`pkg/logs/message/origin.go`), and the origin's tags are the tagger's
+  tags for the entity the log came from, then `sourcecategory:` and the source's configured tags
+  (`tagsToStringArray`; the tagger's through `pkg/logs/internal/tag/provider.go`, `GetTags`,
+  from `pkg/logs/tailers/container/tailer.go`, `buildMessage`, and
+  `pkg/logs/tailers/file/tailer.go`, `forwardMessages`). The tagger's tags for a container that
+  sets Unified Service Tagging include `env:`, `version:`, and `service:`, so a container's log
+  can carry its service twice, as the field and as a `ddtags` entry.
+- **The decode.** `datadog_in` writes a log's non-empty `service` as `service.name`, and lifts
+  `ddtags`' `env:`, `version:`, and `service:` entries onto the three keys, keeping every other
+  entry in the one string. The field beats the entry, so a container's twice-carried service is
+  one `service.name`, and the entry is omitted, counted
+  `logit.input.tags.omitted{reason="reserved_key"}`. An empty `service` is no service, as an
+  empty `hostname` is no host.
+- **Not a full split.** A tag and a top-level field are different things in Datadog, and
+  `datadog_out` writes every other attribute as a top-level field, so splitting every `ddtags` entry
+  would turn each relayed tag into a field. The three lifted entries are the ones every route
+  has a standard key for.
+- **The encode.** `datadog_out` writes `service.name` as the log's `service` and
+  `deployment.environment.name` and `service.version` as `env:` and `version:` entries appended
+  to `ddtags`, before `container_id:`, whatever source wrote them. An `otlp_in -> datadog_out`
+  log whose resource carries `deployment.environment.name` or `service.version` now reaches
+  Datadog tagged `env:` and `version:`, the tags Datadog's OTLP mapping gives those keys
+  (`pkg/opentelemetry-mapping-go/otlp/attributes/attributes.go`, `coreMapping`). A `service`
+  attribute beside `service.name` is omitted, counted
+  `logit.output.tags.omitted{reason="reserved_key"}`: it would be a second `service` key in the
+  object. Alone, it is the log's `service`, so a `service` that isn't a string, which
+  `service.name` can't hold, relays as it came.
+
+The logs relay stays a fixed point from the first hop on, modulo `logit_proto::datadog`'s
+permitted normalizations (5) and (10): the lifted entries rejoin at the end of `ddtags`, a
+`service:` entry beside the log's own `service` doesn't come back, and an empty or bare entry
+beside a key the log already carries is left off at the first decode.
+
+### Traces and APM stats
+
+A span's `env` and `version` meta, a `TracerPayload`'s `env` and `app_version`, and a
+`ClientStatsPayload`'s `Env`, `Version`, and `Service` are the standard
+`deployment.environment.name`, `service.version`, and `service.name` ([ADR
+`process-hostname`](process-hostname.md)'s "Amendment: a trace's environment, version, and service
+(2026-10-24)" has the tables). The carriers `_logit.datadog.tracer.env`,
+`_logit.datadog.tracer.app_version`, and `_logit.datadog.stats.service` are gone.
+
+- **The span's own meta is the identity.** `pkg/trace/agent/agent.go`, `setPayloadAttributes`,
+  fills an empty `TracerPayload.Env` from `traceutil.GetEnv` (`pkg/trace/traceutil/trace.go`:
+  the root span's `env` meta, else the first other span's in the chunk) and an empty
+  `AppVersion` from `version.GetAppVersionFromTrace` (`pkg/trace/version/version.go`, the same
+  search for `version`). It never fills them from the Agent's own `env`: `Process` only
+  normalizes `Env`. So the payload field and the span meta name the same fact at two scopes, and
+  each decodes at its own: the meta on the span's event, the field on the batch resource.
+  `datadog_trace_in` doesn't apply `setPayloadAttributes`, as for the hostname: that's Agent
+  processing, left to the Agent behind `datadog_trace_out`.
+- **Stats.** `processStats` in `agent.go` fills an empty `ClientStatsPayload.Env` from the
+  Agent's `DefaultEnv`; a tracer's own `Env`, `Version`, and `Service` pass through. Each decodes
+  onto the batch resource, as the payload's `Hostname` does. A group's `Service` stays the group
+  event's `service.name`, and on encode a group reads `service.name` off its event alone, since
+  the resource's is the payload's `Service`: a group that left `Service` empty relays empty.
+- **The OTLP receiver's spellings.** `pkg/trace/api/otlp.go`, `receiveResourceSpansV1`, fills
+  `TracerPayload.Env` from the resource's `deployment.environment.name`, else
+  `deployment.environment`, else `DefaultEnv` (`receiveResourceSpansV2` reads the same concept
+  through `semantics.ConceptDeploymentEnv`), and `convertSpan` writes a span's `env` meta from
+  its own `deployment.environment.name` and its `version` meta from the resource's
+  `service.version`, each only where the span has none. It sets no `AppVersion`;
+  `setPayloadAttributes` then fills it from that `version` meta. So `env` and `version` are
+  Datadog's spellings of the two keys, and `datadog_out` and `datadog_trace_out` write each in
+  its own field: the event's as span meta, the resource's as the payload's `env` and
+  `app_version` (v0.7, `AgentPayload`) or, in v0.4 and v0.5, which have no payload field, as
+  every span's `env` and `version` meta, which a span's own value replaces, counted
+  `logit.output.spans.degraded{reason="no_wire_form"}`, as `host.name` does. Unlike the OTLP
+  receiver, a resource `service.version` leaves as `app_version`, not also as span meta, on a
+  form with a payload field.
+
+Two collisions, each by the stream's rule. On decode, a span key spelled
+`deployment.environment.name` or `service.version` beside that key's `meta` name loses to the
+meta, counted `logit.input.tags.omitted{reason="reserved_key"}`; the OTLP receiver keeps both,
+but one key has one value here. With no `meta` name beside it, the key spelling lands as the key
+and leaves as `env` or `version`, a named normalization of the traces pair. On encode, a bare
+`env` or `version` attribute the key displaces from `meta` is omitted, counted
+`logit.output.tags.omitted{reason="unrepresentable"}`. A `meta` entry and a `metrics` entry of
+one name each keep their value now, since the `meta` one is a common key and the other isn't.
+
+The like pairs stay fixed points with and without each field: a span's meta relays through the
+event's key and a payload's field through the resource's.

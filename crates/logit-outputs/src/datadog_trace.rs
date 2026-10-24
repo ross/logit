@@ -43,14 +43,16 @@
 //!
 //! **`version`.** `v0.4` (the default) is what most tracers send and every Agent takes. It has no
 //! trace chunk and no tracer payload, so the chunk carriers (`_logit.datadog.chunk.*`) and the
-//! tracer payload carriers no request header carries (`_logit.datadog.tracer.runtime_id`, `.env`,
-//! `.app_version`, `.tags`, `.container_debug`) are dropped and counted by the encoder as
-//! `logit.output.spans.degraded{reason="no_wire_form"}`; a resource `host.name` lands in every
-//! span's `meta` instead, unless the span carries a different `host.name`, which wins as any event
-//! attribute does, counted the same way. `v0.7` carries all of them in its `TracerPayload`,
-//! `host.name` as its `hostname`, and leaves `hostname` empty with no `host.name`, as a tracer
-//! does, for the Agent to fill. A v0.4-origin batch (what most tracers send `datadog_trace_in`)
-//! relays through either with nothing lost.
+//! tracer payload carriers no request header carries (`_logit.datadog.tracer.runtime_id`, `.tags`,
+//! `.container_debug`) are dropped and counted by the encoder as
+//! `logit.output.spans.degraded{reason="no_wire_form"}`. A resource `host.name`,
+//! `deployment.environment.name`, and `service.version` land in every span's `meta` instead, as
+//! `host.name`, `env`, and `version`, unless the span carries a different value of its own, which
+//! wins as any event attribute does, counted the same way. `v0.7` carries all of them in its
+//! `TracerPayload`, `host.name` as its `hostname`, the other two as its `env` and `app_version`,
+//! and leaves `hostname` empty with no `host.name`, as a tracer does, for the Agent to fill. A
+//! v0.4-origin batch (what most tracers send `datadog_trace_in`) relays through either with
+//! nothing lost.
 //!
 //! **What isn't read from a reply.** The Agent answers a trace request with `rate_by_service`,
 //! the sampling rates a tracer's priority sampler applies. This sink samples nothing, so it
@@ -209,8 +211,8 @@ use logit_core::{redact, Diagnostics, EventBatch, Resource, Telemetry, Value};
 use logit_pipeline::{BatchContext, DeliveryPosture, Fault, Output, SeqId};
 pub use logit_proto::datadog::traces_msgpack::TracerApiForm;
 use logit_proto::datadog::{
-    is_datadog_stats, trace_chunks, DatadogEncoder, HEADER_TRACE_COUNT, TRACER_FLAG_HEADERS,
-    TRACER_STR_HEADERS, TRACER_U64_HEADERS,
+    datadog_stats_name, is_datadog_stats, trace_chunks, DatadogEncoder, HEADER_TRACE_COUNT,
+    TRACER_FLAG_HEADERS, TRACER_STR_HEADERS, TRACER_U64_HEADERS,
 };
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -461,8 +463,9 @@ async fn read_hyper_prefix(mut body: hyper::body::Incoming, max: usize) -> Strin
 
 /// The indices of `batch`'s APM stats events, the stats route's items.
 fn stats_items(batch: &EventBatch) -> Vec<usize> {
+    let stats_name = datadog_stats_name();
     (0..batch.events.len())
-        .filter(|&i| is_datadog_stats(&batch.resource, &batch.events[i]))
+        .filter(|&i| is_datadog_stats(&batch.resource, &batch.events[i], stats_name))
         .collect()
 }
 
@@ -674,10 +677,11 @@ impl DatadogTraceOutput {
         next_request: &mut u32,
     ) -> anyhow::Result<()> {
         let resource = &batch.resource;
+        let stats_name = datadog_stats_name();
         let chunks: Vec<Vec<usize>> = trace_chunks(batch)
             .into_iter()
             .map(|mut members| {
-                members.retain(|&i| !is_datadog_stats(resource, &batch.events[i]));
+                members.retain(|&i| !is_datadog_stats(resource, &batch.events[i], stats_name));
                 members
             })
             .filter(|members| !members.is_empty())
@@ -1069,11 +1073,10 @@ mod tests {
     use logit_proto::datadog::stats::{ATTR_BUCKET_DURATION, ATTR_STATS_NAME, METRIC_HITS};
     use logit_proto::datadog::traces::RESOURCE_ATTR_TRACER_LANGUAGE_VERSION;
     use logit_proto::datadog::{
-        DatadogDecoder, ATTR_RESOURCE_NAME, ATTR_SERVICE_NAME,
+        DatadogDecoder, ATTR_CONTAINER_ID, ATTR_RESOURCE_NAME, ATTR_SERVICE_NAME,
         RESOURCE_ATTR_TRACER_CLIENT_COMPUTED_STATS, RESOURCE_ATTR_TRACER_CLIENT_COMPUTED_TOP_LEVEL,
-        RESOURCE_ATTR_TRACER_CONTAINER_ID, RESOURCE_ATTR_TRACER_DROPPED_P0_SPANS,
-        RESOURCE_ATTR_TRACER_DROPPED_P0_TRACES, RESOURCE_ATTR_TRACER_ENTITY_ID,
-        RESOURCE_ATTR_TRACER_LANGUAGE_INTERPRETER,
+        RESOURCE_ATTR_TRACER_DROPPED_P0_SPANS, RESOURCE_ATTR_TRACER_DROPPED_P0_TRACES,
+        RESOURCE_ATTR_TRACER_ENTITY_ID, RESOURCE_ATTR_TRACER_LANGUAGE_INTERPRETER,
         RESOURCE_ATTR_TRACER_LANGUAGE_INTERPRETER_VENDOR, RESOURCE_ATTR_TRACER_LANGUAGE_NAME,
         RESOURCE_ATTR_TRACER_VERSION,
     };
@@ -1290,7 +1293,7 @@ mod tests {
             (RESOURCE_ATTR_TRACER_LANGUAGE_INTERPRETER, Value::str("CPython")),
             (RESOURCE_ATTR_TRACER_LANGUAGE_INTERPRETER_VENDOR, Value::str("python.org")),
             (RESOURCE_ATTR_TRACER_VERSION, Value::str("2.14.0")),
-            (RESOURCE_ATTR_TRACER_CONTAINER_ID, Value::str("abc123")),
+            (ATTR_CONTAINER_ID, Value::str("abc123")),
             (RESOURCE_ATTR_TRACER_ENTITY_ID, Value::str("ci-abc123")),
             (RESOURCE_ATTR_TRACER_CLIENT_COMPUTED_TOP_LEVEL, Value::Bool(true)),
             (RESOURCE_ATTR_TRACER_CLIENT_COMPUTED_STATS, Value::Bool(true)),

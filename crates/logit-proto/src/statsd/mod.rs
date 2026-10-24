@@ -45,8 +45,7 @@
 //!
 //! **`|c:<container-id>` and `|T<unix-seconds>` apply to every metric type**, not only the `c`/`g`
 //! the DogStatsD spec restricts them to (`docs/design/telemetry-landscape.md`): a
-//! forward-compatible superset. `|c:<id>` (v1.2+; v1.4+'s `ci-`/`in-`-prefixed forms land verbatim)
-//! stamps `_logit.statsd.container_id: Value::Str`, a zero-copy datagram slice. `|T<secs>` sets
+//! forward-compatible superset. `|c:` decodes as "The container id" below says. `|T<secs>` sets
 //! [`Event::timestamp`](logit_core::Event::timestamp) to `secs * 1_000_000_000` in place of the
 //! receipt time `decode_into`'s `received_at` supplies, and stamps the flag
 //! `_logit.metrics.closed: "timestamped"`, which tells a wire timestamp from a receipt-time one:
@@ -55,16 +54,14 @@
 //! (`docs/adr/metric-flags.md`, "The flags"). There's no `_logit.statsd.*` timestamp carrier
 //! (`docs/adr/protocol-knowledge-stays-in-family.md`, "Amendment: move, don't mirror"). A `|T`
 //! that isn't an unsigned integer (the form is under the rejection rules below), or whose
-//! nanoseconds overflow `i64`, rejects only that line as `bad_line`. `_logit.statsd.container_id`
-//! is a protocol-namespaced carrier (`docs/adr/lossless-transit.md`). Every other unrecognized `|`
+//! nanoseconds overflow `i64`, rejects only that line as `bad_line`. Every other unrecognized `|`
 //! segment is accepted and ignored, for forward compatibility.
 //!
 //! **`|e:<external-data>` (v1.5, Agent 7.57+) and `|card:<cardinality>` (v1.6, Agent 7.64+)** stamp
 //! `_logit.statsd.external_data` and `_logit.statsd.cardinality`, both `Value::Str` zero-copy
 //! slices, on every metric type and on events and service checks (as `e:`/`card:` fields). Both are
 //! carried verbatim: `card:` isn't checked against the Agent's `none`/`low`/`orchestrator`/`high`,
-//! since a relay carries what the client sent, and an empty `|e:` stamps an empty string, as an
-//! empty `|c:` does.
+//! since a relay carries what the client sent, and an empty `|e:` stamps an empty string.
 //!
 //! A line is rejected as `bad_line` when it has no `:` or an empty name, no `|<type>`, an unknown
 //! type, a `c`/`g`/`ms`/`h`/`d` value that doesn't parse or isn't finite (`NaN`/`inf` parse as
@@ -103,7 +100,8 @@
 //! attribute map (`|#a:1|#a:2` folds as `|#a:1,a:2` would), while `@`, `|c:` and `|T` are
 //! last-segment-wins. A repeated `|T`/`|c:`/type therefore never reaches `insert_tags`, and a tag
 //! can't spell a carrier key, because every carrier sits under the private prefix the next
-//! paragraph omits.
+//! paragraph omits. A tag can spell `container.id`, which "The container id" settles, or a
+//! service identity key, which "Service identity" settles.
 //!
 //! **A tag key under the private `_logit.` prefix is omitted**, on a metric line, an event, or a
 //! service check, so a sender's tag never reads back as a carrier
@@ -130,6 +128,50 @@
 //!   `logit.input.tags.omitted{reason="reserved_key"}` once per wire tag: it would collide with
 //!   the standard key the line's host fills. On a line with no `host:` tag and no non-empty `h:`,
 //!   a `host.name` tag is an ordinary tag, and the sinks read it as the host.
+//!
+//! ## Service identity
+//!
+//! Datadog's Unified Service Tagging tags decode onto the standard keys, on the event, on a metric
+//! line, an event, or a service check alike. The Agent passes all three through as ordinary
+//! client tags (datadog-agent 7.83.3, `comp/dogstatsd/server/impl/enrich.go`,
+//! `extractTagsMetadata`, which consumes only `host:`, `dd.internal.entity_id:`, the cardinality
+//! tag, and `dd.internal.jmx_check_name:`), and Datadog's OTLP mapping names the same three keys
+//! (`pkg/opentelemetry-mapping-go/otlp/attributes/attributes.go`, `coreMapping`).
+//!
+//! - **A valued `env:` tag is `deployment.environment.name`, `version:` is `service.version`, and
+//!   `service:` is `service.name`**, each a zero-copy datagram slice, folded as any tag is, so a
+//!   repeated `env:` is an `Array`.
+//! - **A valueless `env`, `version`, or `service` token stays an ordinary `Bool(true)` tag**
+//!   under its own name: it names no value.
+//! - **A valued tag spelling the standard key beside the Datadog-spelled one is omitted**, counted
+//!   `logit.input.tags.omitted{reason="reserved_key"}` once per wire tag, so
+//!   `#env:prod,deployment.environment.name:dev` is `deployment.environment.name: "prod"`.
+//!   Without the Datadog-spelled tag, a `deployment.environment.name` tag is the key's value, as a
+//!   `container.id` tag is on a line whose `|c:` names no container id.
+//!
+//! ## The container id
+//!
+//! A `|c:` segment (`c:` on an event or a service check) is the client's origin-detection local
+//! data, read as a DogStatsD Agent reads it (datadog-agent 7.83.3,
+//! `comp/dogstatsd/server/impl/parse.go`, `parseLocalData`, through
+//! `comp/core/tagger/origindetection/origindetection.go`, `ParseLocalData`), on a metric line, an
+//! event, or a service check alike. The last `|c:` on a line wins.
+//!
+//! - **Its container id is `container.id`**, a zero-copy datagram slice, on the event: the bare
+//!   value of a v1.2 `|c:<id>`, or the id after a v1.4+ `ci-` (or a single `cid-`) prefix.
+//! - **Its cgroup inode is `_logit.statsd.cgroup_inode`**, the text after `in-`, a
+//!   protocol-namespaced carrier (`docs/adr/lossless-transit.md`): a client that can't read its
+//!   own container id sends the inode instead (the recorded `datadog` Python client does), and
+//!   an inode names a container only on the host that sent it, so it isn't `container.id`.
+//! - **A `,`-separated list** (`ci-<id>,in-<inode>`) yields both, the last item of each kind
+//!   winning. Its other items, a bare id or a `cid-` one included, the Agent ignores, so they're
+//!   dropped, counted `logit.input.fields.dropped{reason="malformed"}` per item; the line is
+//!   delivered. An empty field, or an
+//!   empty id or inode, is nothing.
+//! - **A `container.id` tag beside a container id the field names is omitted**, counted
+//!   `logit.input.tags.omitted{reason="reserved_key"}` once per wire tag, as a `host.name` tag
+//!   beside the line's host is. On a line whose `|c:` names no container id, a `container.id` tag
+//!   is an ordinary tag, and the sinks read it as the container id.
 //!
 //! ## DogStatsD events and service checks
 //!
@@ -163,7 +205,7 @@
 //! - Attributes (all `Value::Str`, zero-copy where possible): `_logit.statsd.event.title` (always),
 //!   `_logit.statsd.event.priority` (`p:`, raw), `_logit.statsd.event.alert_type` (`t:`, raw),
 //!   `_logit.statsd.event.aggregation_key` (`k:`), `_logit.statsd.event.source_type` (`s:`), each
-//!   only if present, plus `_logit.statsd.container_id`, `_logit.statsd.external_data`,
+//!   only if present, plus `c:` ("The container id"), `_logit.statsd.external_data`,
 //!   `_logit.statsd.cardinality` and `#tags` as on a metric line. `h:` is the host ("The host").
 //!   `d:<secs>` plays `|T`'s role (same checked parse, same event timestamp and flag); `|T` itself
 //!   is an unrecognized field here and is ignored.
@@ -179,13 +221,13 @@
 //! `_logit.statsd.service_check.name` (always, `Value::Str`: `MetricRecord` has nowhere else to
 //! carry it), `_logit.statsd.service_check.status` (always, `Value::U64`),
 //! `_logit.statsd.service_check.message` (`m:`, verbatim), plus the `d:` timestamp and its flag,
-//! `_logit.statsd.container_id`, `_logit.statsd.external_data`, `_logit.statsd.cardinality` and
+//! `c:` ("The container id"), `_logit.statsd.external_data`, `_logit.statsd.cardinality` and
 //! `#tags` as above. `h:` is the host ("The host").
 //!
-//! **Tag values, `|c:<id>`, and set members are zero-copy slices of the datagram**, like every
-//! field `syslog_in`'s decoder extracts: [`logit_core::subslice::share`] rebuilds each `Bytes` as a
-//! slice of the datagram passed to [`decode_into`](crate::Decoder::decode_into), rather than
-//! copying through `impl From<&str> for Value`. Tag keys and the metric name don't need this: both
+//! **Tag values, a `|c:` container id, and set members are zero-copy slices of the datagram**,
+//! like every field `syslog_in`'s decoder extracts: [`logit_core::subslice::share`] rebuilds each
+//! `Bytes` as a slice of the datagram passed to [`decode_into`](crate::Decoder::decode_into),
+//! rather than copying through `impl From<&str> for Value`. Tag keys and the metric name don't need this: both
 //! only reach [`logit_core::interner::intern`], which copies into its own table regardless.
 //!
 //! ## Malformed input

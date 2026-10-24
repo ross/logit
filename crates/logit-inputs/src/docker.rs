@@ -9,7 +9,7 @@
 //!   prefix of at least 12 hex characters; `discover: true` follows every container, including
 //!   later ones. With neither set, the listener follows no container and sends nothing.
 //! - **Identity**: the resource carries `container.id`, `container.name`, `container.image.name`,
-//!   `container.image.tag`, and `container.label.<key>` for each key in `labels:`
+//!   `container.image.tags` (a one-element array), and `container.label.<key>` for each key in `labels:`
 //!   ([`ContainerMeta::resource`]), and under `host_name: container` the container's own
 //!   `Config.Hostname` as `host.name`. With no `host_name:` it writes no `host.name`, and a sink's
 //!   process-hostname fallback names the host (ADR `file-tailing-and-docker-json-logs`'s
@@ -119,13 +119,14 @@ impl ContainerMeta {
     }
 
     /// Builds this container's resource: `container.id`, `container.name`,
-    /// `container.image.name`, `container.image.tag` (when the reference has one), and
+    /// `container.image.name`, `container.image.tags` (a one-element array, when the reference has
+    /// a tag), and
     /// `container.label.<key>` for each key in `label_keys` the container carries. Labels are
     /// opt-in (the file-tailing ADR's "Event and resource shape"). With `host_name`, a non-empty
     /// `Config.Hostname` as `host.name`.
     pub(crate) fn resource(&self, label_keys: &[String], host_name: bool) -> Arc<Resource> {
         let mut attrs = AttrMap::new();
-        attrs.insert("container.id", self.id.as_str());
+        attrs.insert(logit_core::attrs::CONTAINER_ID, self.id.as_str());
         if host_name && !self.hostname.is_empty() {
             attrs.insert(logit_core::attrs::HOST_NAME, self.hostname.as_str());
         }
@@ -133,7 +134,8 @@ impl ContainerMeta {
         let (image_name, image_tag) = split_image_ref(&self.image);
         attrs.insert("container.image.name", image_name.as_str());
         if let Some(tag) = &image_tag {
-            attrs.insert("container.image.tag", tag.as_str());
+            let tags = Value::Array(vec![Value::str(tag.as_str())]);
+            attrs.insert(logit_core::attrs::CONTAINER_IMAGE_TAGS, tags);
         }
         for key in label_keys {
             if let Some(value) = self.labels.get(key) {
@@ -1256,9 +1258,10 @@ mod tests {
             Some("nginx")
         );
         assert_eq!(
-            resource.attributes.get("container.image.tag").and_then(|v| v.as_str()),
-            Some("1.25")
+            resource.attributes.get("container.image.tags"),
+            Some(&Value::Array(vec![Value::str("1.25")]))
         );
+        assert_eq!(resource.attributes.get("container.image.tag"), None);
         assert_eq!(
             resource.attributes.get("container.label.team").and_then(|v| v.as_str()),
             Some("infra")

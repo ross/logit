@@ -10,12 +10,11 @@
 //! two encodes of one batch differ byte for byte. The encoders sort every map by key instead.
 
 use super::{
-    merged_get, DatadogDecoder, DatadogEncoder, ATTR_HOST_NAME, ATTR_RESOURCE_NAME,
-    ATTR_SERVICE_NAME, ATTR_SPAN_KIND, ATTR_SPAN_TYPE, RESOURCE_ATTR_AGENT_ENV,
-    RESOURCE_ATTR_AGENT_HOSTNAME, RESOURCE_ATTR_AGENT_VERSION, RESOURCE_ATTR_TRACER_APP_VERSION,
-    RESOURCE_ATTR_TRACER_CONTAINER_ID, RESOURCE_ATTR_TRACER_ENV,
-    RESOURCE_ATTR_TRACER_LANGUAGE_NAME, RESOURCE_ATTR_TRACER_RUNTIME_ID,
-    RESOURCE_ATTR_TRACER_VERSION,
+    merged_get, DatadogDecoder, DatadogEncoder, ATTR_CONTAINER_ID,
+    ATTR_DEPLOYMENT_ENVIRONMENT_NAME, ATTR_HOST_NAME, ATTR_RESOURCE_NAME, ATTR_SERVICE_NAME,
+    ATTR_SERVICE_VERSION, ATTR_SPAN_KIND, ATTR_SPAN_TYPE, RESOURCE_ATTR_AGENT_ENV,
+    RESOURCE_ATTR_AGENT_HOSTNAME, RESOURCE_ATTR_AGENT_VERSION, RESOURCE_ATTR_TRACER_LANGUAGE_NAME,
+    RESOURCE_ATTR_TRACER_RUNTIME_ID, RESOURCE_ATTR_TRACER_VERSION,
 };
 use crate::json::value_text;
 use bytes::Bytes;
@@ -41,8 +40,9 @@ pub const ATTR_CHUNK_DROPPED_TRACE: &str = "_logit.datadog.chunk.dropped_trace";
 pub const ATTR_CHUNK_TAGS: &str = "_logit.datadog.chunk.tags";
 /// `_logit.datadog.tracer.language_version` / `.tags` / `.container_debug`: `TracerPayload` fields
 /// with no APM-stats counterpart, as batch resource attributes; the carriers shared with
-/// [`super::stats`] (`container_id`, `language_name`, `tracer_version`, `runtime_id`, `env`,
-/// `app_version`) live in [`super`]. The payload's `hostname` is the resource's `host.name`.
+/// [`super::stats`] (`language_name`, `tracer_version`, `runtime_id`) live in [`super`]. The
+/// payload's `hostname`, `container_id`, `env`, and `app_version` are the resource's `host.name`,
+/// `container.id`, `deployment.environment.name`, and `service.version`.
 pub const RESOURCE_ATTR_TRACER_LANGUAGE_VERSION: &str = "_logit.datadog.tracer.language_version";
 pub const RESOURCE_ATTR_TRACER_TAGS: &str = "_logit.datadog.tracer.tags";
 pub const RESOURCE_ATTR_TRACER_CONTAINER_DEBUG: &str = "_logit.datadog.tracer.container_debug";
@@ -62,25 +62,42 @@ pub const RESOURCE_ATTR_AGENT_TAGS: &str = "_logit.datadog.agent.tags";
 /// encodes to.
 pub const PRIORITY_NONE: i32 = -128;
 
-const TRACER_STR_CARRIERS: [&str; 7] = [
-    RESOURCE_ATTR_TRACER_CONTAINER_ID,
+/// `meta["env"]` and `meta["version"]`: a span's own environment and version, the event's
+/// [`ATTR_DEPLOYMENT_ENVIRONMENT_NAME`] and [`ATTR_SERVICE_VERSION`].
+pub const META_ENV: &str = "env";
+pub const META_VERSION: &str = "version";
+
+/// Each common key a span carries in `meta` under Datadog's name, beside that name.
+const META_KEYS: [(&str, &str); 2] =
+    [(ATTR_DEPLOYMENT_ENVIRONMENT_NAME, META_ENV), (ATTR_SERVICE_VERSION, META_VERSION)];
+
+/// The `TracerPayload` string fields [`DatadogDecoder::tracer_resource`] writes onto the resource
+/// when non-empty, in [`WireTracer`]'s order.
+const TRACER_STR_FIELDS: [&str; 7] = [
+    ATTR_CONTAINER_ID,
     RESOURCE_ATTR_TRACER_LANGUAGE_NAME,
     RESOURCE_ATTR_TRACER_LANGUAGE_VERSION,
     RESOURCE_ATTR_TRACER_VERSION,
     RESOURCE_ATTR_TRACER_RUNTIME_ID,
-    RESOURCE_ATTR_TRACER_ENV,
-    RESOURCE_ATTR_TRACER_APP_VERSION,
+    ATTR_DEPLOYMENT_ENVIRONMENT_NAME,
+    ATTR_SERVICE_VERSION,
 ];
 
+/// Whether `value` is a `container.id` a `TracerPayload`'s `container_id`, or the
+/// `Datadog-Container-ID` header, carries: a non-empty `Str`.
+fn is_resource_container_id(value: Option<&Value>) -> bool {
+    matches!(value, Some(Value::Str(s)) if !s.is_empty())
+}
+
 /// Every `TracerPayload` carrier, the order [`DatadogEncoder::resource_carriers_lost`] counts in.
-const TRACER_CARRIERS: [&str; 9] = [
-    RESOURCE_ATTR_TRACER_CONTAINER_ID,
+/// The payload's `hostname`, `env`, and `app_version` keys aren't among them: with no payload
+/// field they ride as span tags, so they're never lost.
+const TRACER_CARRIERS: [&str; 7] = [
+    ATTR_CONTAINER_ID,
     RESOURCE_ATTR_TRACER_LANGUAGE_NAME,
     RESOURCE_ATTR_TRACER_LANGUAGE_VERSION,
     RESOURCE_ATTR_TRACER_VERSION,
     RESOURCE_ATTR_TRACER_RUNTIME_ID,
-    RESOURCE_ATTR_TRACER_ENV,
-    RESOURCE_ATTR_TRACER_APP_VERSION,
     RESOURCE_ATTR_TRACER_TAGS,
     RESOURCE_ATTR_TRACER_CONTAINER_DEBUG,
 ];
@@ -371,6 +388,13 @@ impl DatadogDecoder {
         let mut attrs = AttrMap::new();
         let mut collisions = 0;
         let mut high = None;
+        // A key's own spelling beside its Datadog `meta` name loses to it, in any of the maps.
+        let displaced = |k: &str| {
+            META_KEYS
+                .iter()
+                .any(|&(key, name)| k == key && span.meta.iter().any(|(m, _)| m == name))
+        };
+        let mut omitted = 0;
         for (k, v) in &span.meta {
             if k == META_TRACE_ID_HIGH {
                 high = parse_trace_id_high(v);
@@ -378,14 +402,29 @@ impl DatadogDecoder {
                     self.span_degraded("bad_tid", 1);
                 }
             }
-            put(&mut attrs, &mut collisions, k, Value::str(v.as_str()));
+            if displaced(k) {
+                omitted += 1;
+                continue;
+            }
+            let key =
+                META_KEYS.iter().find(|(_, name)| name == k).map_or(k.as_str(), |(key, _)| key);
+            put(&mut attrs, &mut collisions, key, Value::str(v.as_str()));
         }
         for (k, v) in &span.metrics {
+            if displaced(k) {
+                omitted += 1;
+                continue;
+            }
             put(&mut attrs, &mut collisions, k, Value::F64(*v));
         }
         for (k, v) in span.meta_struct {
+            if displaced(&k) {
+                omitted += 1;
+                continue;
+            }
             put(&mut attrs, &mut collisions, &k, Value::Bytes(Bytes::from(v)));
         }
+        self.omitted_tags(omitted, "reserved_key");
         for (key, value) in [
             (ATTR_SERVICE_NAME, &span.service),
             (ATTR_RESOURCE_NAME, &span.resource),
@@ -470,7 +509,7 @@ impl DatadogDecoder {
     ) -> Resource {
         let mut resource = Resource::default();
         let attrs = &mut resource.attributes;
-        for (key, value) in TRACER_STR_CARRIERS.into_iter().zip([
+        for (key, value) in TRACER_STR_FIELDS.into_iter().zip([
             &tracer.container_id,
             &tracer.language_name,
             &tracer.language_version,
@@ -590,11 +629,19 @@ fn sort_map<V>(map: &mut [(String, V)]) {
 /// is skipped uncounted, like any private key. A payload carrier, or a tracer header's
 /// ([`super::is_tracer_header_attr`]), counts only on the resource. A resource's non-empty `Str`
 /// `host.name` is the `TracerPayload`'s `hostname` in a form that has one (v0.7, `AgentPayload`);
-/// in v0.4 and v0.5, or on the event, it is an ordinary attribute.
+/// in v0.4 and v0.5, or on the event, it is an ordinary attribute. A resource's non-empty `Str`
+/// `container.id` is the payload's `container_id`, or in v0.4 and v0.5 the `Datadog-Container-ID`
+/// header; on the event, or of another type, it is an ordinary attribute.
+/// `deployment.environment.name` and `service.version` follow `host.name`'s rule, as the payload's
+/// `env` and `app_version`.
 fn is_carrier(key: &str, value: &Value, event: &Event, form: Form) -> bool {
     match (key, value) {
-        (ATTR_HOST_NAME, Value::Str(s)) => {
-            form.has_chunks() && !s.is_empty() && event.attributes.get(key).is_none()
+        (
+            ATTR_HOST_NAME | ATTR_DEPLOYMENT_ENVIRONMENT_NAME | ATTR_SERVICE_VERSION,
+            Value::Str(s),
+        ) => form.has_chunks() && !s.is_empty() && event.attributes.get(key).is_none(),
+        (ATTR_CONTAINER_ID, _) => {
+            is_resource_container_id(Some(value)) && event.attributes.get(key).is_none()
         }
         // Empty isn't a carrier either: decode never makes one (the wire's `""` is no attribute),
         // so an empty one came from a `meta` entry and goes back there.
@@ -737,25 +784,34 @@ impl DatadogEncoder {
         let mut fields = ChunkFields::default();
         let mut error_attr = None;
         let mut lost = 0;
-        // With no payload field, a resource `host.name` rides as a span tag, and a span's own
-        // `host.name` replaces it there as any event attribute does; the resource's is lost.
+        // With no payload field, a resource `host.name` (and environment and version) rides as a
+        // span tag, and a span's own value replaces it there as any event attribute does; the
+        // resource's is lost.
         if !form.has_chunks() {
-            let resource_host = resource.attributes.get(ATTR_HOST_NAME);
-            let own = event.attributes.get(ATTR_HOST_NAME);
-            if matches!(resource_host, Some(v @ Value::Str(_)) if v.as_str() != Some(""))
-                && own.is_some_and(|own| Some(own) != resource_host)
-            {
-                lost += 1;
+            for key in [ATTR_HOST_NAME, ATTR_DEPLOYMENT_ENVIRONMENT_NAME, ATTR_SERVICE_VERSION] {
+                let from_resource = resource.attributes.get(key);
+                let own = event.attributes.get(key);
+                if matches!(from_resource, Some(v @ Value::Str(_)) if v.as_str() != Some(""))
+                    && own.is_some_and(|own| Some(own) != from_resource)
+                {
+                    lost += 1;
+                }
             }
         }
+        // `meta` entries spelled from a common key, which displace a bare `env` or `version`.
+        let mut key_meta: StrMap = Vec::new();
         for (sym, value) in logit_core::attrs::merged(resource, event) {
             let key = resolve(sym);
             if !is_carrier(key, value, event, form) {
                 if logit_core::attrs::is_private(key) {
                     continue;
                 }
+                let datadog_name = META_KEYS.iter().find(|(k, _)| *k == key).map(|(_, name)| name);
                 match self.slot(value) {
-                    Slot::Meta(s) => wire.meta.push((key.to_string(), s)),
+                    Slot::Meta(s) => match datadog_name {
+                        Some(name) => key_meta.push((name.to_string(), s)),
+                        None => wire.meta.push((key.to_string(), s)),
+                    },
                     Slot::Metric(f) => wire.metrics.push((key.to_string(), f)),
                     Slot::MetaStruct(b) => {
                         if form == Form::V05 {
@@ -788,6 +844,12 @@ impl DatadogEncoder {
                 // A batch-level carrier: `resource_carriers_lost` counts it once per body.
                 _ => {}
             }
+        }
+        for (name, value) in key_meta {
+            let before = wire.meta.len();
+            wire.meta.retain(|(k, _)| *k != name);
+            self.tags_omitted("unrepresentable", before - wire.meta.len());
+            wire.meta.push((name, value));
         }
         wire.error = error_attr.unwrap_or(if span.status == SpanStatus::Error { 1 } else { 0 });
         if span.kind != SpanKind::Internal && merged_get(resource, event, ATTR_SPAN_KIND).is_none()
@@ -904,8 +966,15 @@ impl DatadogEncoder {
     /// carrier is lost.
     pub(super) fn resource_carriers_lost(&self, resource: &Resource, form: Form, headers: bool) {
         let attrs = &resource.attributes;
-        let lost_here =
-            |key: &str| attrs.get(key).is_some() && !(headers && super::is_tracer_header_attr(key));
+        // A `container.id` that isn't a non-empty `Str` is no carrier: it rides as a span tag.
+        let lost_here = |key: &str| {
+            let carried = match attrs.get(key) {
+                None => false,
+                value if key == ATTR_CONTAINER_ID => is_resource_container_id(value),
+                Some(_) => true,
+            };
+            carried && !(headers && super::is_tracer_header_attr(key))
+        };
         let mut lost = 0;
         if form != Form::Agent {
             lost += AGENT_CARRIERS.iter().filter(|k| attrs.get(k).is_some()).count();
@@ -924,10 +993,16 @@ impl DatadogEncoder {
     }
 
     /// The batch resource's `_logit.datadog.tracer.*` carriers, and its non-empty `Str`
-    /// `host.name` as `hostname`, as a `TracerPayload` around `chunks`.
+    /// `host.name`, `container.id`, `deployment.environment.name`, and `service.version` as
+    /// `hostname`, `container_id`, `env`, and `app_version`, as a `TracerPayload` around `chunks`.
     pub(super) fn wire_tracer(&self, resource: &Resource, chunks: Vec<WireChunk>) -> WireTracer {
         let attrs = &resource.attributes;
         let text = |key: &str| attrs.get(key).map(|v| self.text(v)).unwrap_or_default();
+        // A common key fills its field only as a `Str`; any other type rode as a span tag.
+        let str_field = |key: &str| match attrs.get(key) {
+            Some(v @ Value::Str(_)) => v.as_str().unwrap_or_default().to_string(),
+            _ => String::new(),
+        };
         let container_debug = attrs.get(RESOURCE_ATTR_TRACER_CONTAINER_DEBUG).map(|v| {
             let Value::Map(map) = v else {
                 return WireContainerDebug::default();
@@ -948,19 +1023,16 @@ impl DatadogEncoder {
             }
         });
         WireTracer {
-            container_id: text(RESOURCE_ATTR_TRACER_CONTAINER_ID),
+            container_id: str_field(ATTR_CONTAINER_ID),
             language_name: text(RESOURCE_ATTR_TRACER_LANGUAGE_NAME),
             language_version: text(RESOURCE_ATTR_TRACER_LANGUAGE_VERSION),
             tracer_version: text(RESOURCE_ATTR_TRACER_VERSION),
             runtime_id: text(RESOURCE_ATTR_TRACER_RUNTIME_ID),
             chunks,
             tags: attrs.get(RESOURCE_ATTR_TRACER_TAGS).map(|v| self.str_map(v)).unwrap_or_default(),
-            env: text(RESOURCE_ATTR_TRACER_ENV),
-            hostname: match attrs.get(ATTR_HOST_NAME) {
-                Some(v @ Value::Str(_)) => v.as_str().unwrap_or_default().to_string(),
-                _ => String::new(),
-            },
-            app_version: text(RESOURCE_ATTR_TRACER_APP_VERSION),
+            env: str_field(ATTR_DEPLOYMENT_ENVIRONMENT_NAME),
+            hostname: str_field(ATTR_HOST_NAME),
+            app_version: str_field(ATTR_SERVICE_VERSION),
             container_debug,
         }
     }
@@ -1053,7 +1125,7 @@ mod tests {
         attrs.insert("list", Value::Array(vec![Value::I64(1), Value::str("a")]));
         let mut resource = Resource::default();
         resource.attributes.insert(ATTR_SERVICE_NAME, Value::str("checkout"));
-        resource.attributes.insert(RESOURCE_ATTR_TRACER_ENV, Value::str("prod"));
+        resource.attributes.insert(ATTR_DEPLOYMENT_ENVIRONMENT_NAME, Value::str("prod"));
         let b = batch(resource, vec![Event::span(1_000, attrs, otel_span([0; 16]))]);
         let s = &only_chunk(&e, &b, Form::V07).spans[0];
         let meta: HashMap<_, _> = s.meta.iter().cloned().collect();
@@ -1062,7 +1134,7 @@ mod tests {
         assert_eq!(meta["at"], "1970-01-01T00:00:00.000000000Z");
         assert_eq!(meta["list"], r#"[1,"a"]"#);
         assert_eq!(meta["span.kind"], "server", "synthesized from a non-internal kind");
-        assert!(!meta.contains_key(RESOURCE_ATTR_TRACER_ENV), "a payload carrier, not meta");
+        assert!(!meta.contains_key(META_ENV), "a payload field, not meta");
         let metrics: HashMap<_, _> = s.metrics.iter().cloned().collect();
         assert_eq!(metrics["f"], 0.5);
         assert_eq!(metrics["i"], 3.0);
@@ -1303,6 +1375,132 @@ mod tests {
         let chunk = only_chunk(&e, &b, Form::V07);
         assert!(chunk.spans[0].meta.contains(&(ATTR_HOST_NAME.into(), "span-host".into())));
         assert_eq!(e.wire_tracer(&b.resource, vec![chunk]).hostname, "", "an event's is a tag");
+    }
+
+    /// The payload's `container_id` is the resource's `container.id` both ways, and no
+    /// `_logit.datadog.tracer.container_id` exists. On the resource it's the payload field (v0.7,
+    /// `AgentPayload`) or, in v0.4 and v0.5, the header the tracer API sends, never a span tag;
+    /// a span's own `container.id` is a span tag and leaves the resource's in the field.
+    #[test]
+    fn the_tracer_container_id_is_the_resource_container_id() {
+        let d = DatadogDecoder::new();
+        let tracer = WireTracer { container_id: "c0ffee".into(), ..WireTracer::default() };
+        let resource = d.tracer_resource(&tracer, None);
+        assert_eq!(resource.attributes.get(ATTR_CONTAINER_ID), Some(&Value::str("c0ffee")));
+        assert_eq!(resource.attributes.get("_logit.datadog.tracer.container_id"), None);
+        let none = d.tracer_resource(&WireTracer::default(), None);
+        assert_eq!(none.attributes.get(ATTR_CONTAINER_ID), None, "an empty one is none");
+
+        let (e, registry) = encoder();
+        let event = Event::span(1_000, AttrMap::new(), otel_span([1; 16]));
+        let b = batch(resource, vec![event.clone()]);
+        for form in [Form::V04, Form::V05, Form::V07, Form::Agent] {
+            let chunk = only_chunk(&e, &b, form);
+            assert!(!chunk.spans[0].meta.iter().any(|(k, _)| k == ATTR_CONTAINER_ID), "{form:?}");
+        }
+        let chunk = only_chunk(&e, &b, Form::Agent);
+        assert_eq!(e.wire_tracer(&b.resource, vec![chunk]).container_id, "c0ffee");
+        e.resource_carriers_lost(&b.resource, Form::V04, true);
+        let lost = counted(&registry, "logit.output.spans.degraded", ("reason", "no_wire_form"));
+        assert_eq!(lost, 0.0, "the tracer API sends it as its header");
+
+        let mut own = event;
+        own.attributes.insert(ATTR_CONTAINER_ID, Value::str("span-cid"));
+        let shadowed = EventBatch { events: vec![own], ..b.clone() };
+        let chunk = only_chunk(&e, &shadowed, Form::Agent);
+        assert!(chunk.spans[0].meta.contains(&(ATTR_CONTAINER_ID.into(), "span-cid".into())));
+        assert_eq!(e.wire_tracer(&shadowed.resource, vec![chunk]).container_id, "c0ffee");
+
+        let mut odd = Resource::default();
+        odd.attributes.insert(ATTR_CONTAINER_ID, Value::I64(7));
+        let b = batch(odd, vec![Event::span(1_000, AttrMap::new(), otel_span([1; 16]))]);
+        let chunk = only_chunk(&e, &b, Form::Agent);
+        assert!(chunk.spans[0].metrics.iter().any(|(k, _)| k == ATTR_CONTAINER_ID), "not a Str");
+        assert_eq!(e.wire_tracer(&b.resource, vec![chunk]).container_id, "");
+    }
+
+    /// A span's `env` and `version` meta are the event's `deployment.environment.name` and
+    /// `service.version`, and a `TracerPayload`'s `env` and `app_version` the resource's, both
+    /// ways; a meta key spelled as the common key beside its Datadog name is omitted, counted.
+    #[test]
+    fn env_and_version_are_the_common_keys_on_the_span_and_the_payload() {
+        let registry = Registry::new();
+        let t = registry.telemetry_for("dd", "datadog", "listener");
+        let mut d = DatadogDecoder::new().with_telemetry(t);
+        let span = WireSpan {
+            meta: vec![
+                (META_ENV.into(), "prod".into()),
+                (ATTR_DEPLOYMENT_ENVIRONMENT_NAME.into(), "shadow".into()),
+                (META_VERSION.into(), "1.2.3".into()),
+            ],
+            metrics: vec![(ATTR_DEPLOYMENT_ENVIRONMENT_NAME.into(), 1.0)],
+            ..WireSpan::default()
+        };
+        let mut out = Vec::new();
+        d.chunk_events(WireChunk { spans: vec![span], ..WireChunk::default() }, false, &mut out);
+        let attrs = &out[0].attributes;
+        assert_eq!(attrs.get(ATTR_DEPLOYMENT_ENVIRONMENT_NAME), Some(&Value::str("prod")));
+        assert_eq!(attrs.get(ATTR_SERVICE_VERSION), Some(&Value::str("1.2.3")));
+        assert_eq!(attrs.get(META_ENV), None);
+        assert_eq!(attrs.get(META_VERSION), None);
+        let omitted = counted(&registry, "logit.input.tags.omitted", ("reason", "reserved_key"));
+        assert_eq!(omitted, 2.0, "the meta and the metrics entry spelled as the key");
+
+        let tracer = WireTracer {
+            env: "staging".into(),
+            app_version: "9.9".into(),
+            ..WireTracer::default()
+        };
+        let resource = d.tracer_resource(&tracer, None);
+        let r = &resource.attributes;
+        assert_eq!(r.get(ATTR_DEPLOYMENT_ENVIRONMENT_NAME), Some(&Value::str("staging")));
+        assert_eq!(r.get(ATTR_SERVICE_VERSION), Some(&Value::str("9.9")));
+        for carrier in ["_logit.datadog.tracer.env", "_logit.datadog.tracer.app_version"] {
+            assert_eq!(r.get(carrier), None);
+        }
+
+        let (e, registry) = encoder();
+        let b = batch(resource.clone(), out.clone());
+        for form in [Form::V07, Form::Agent] {
+            let chunk = only_chunk(&e, &b, form);
+            let meta = &chunk.spans[0].meta;
+            assert!(meta.contains(&(META_ENV.into(), "prod".into())), "{form:?}: {meta:?}");
+            assert!(meta.contains(&(META_VERSION.into(), "1.2.3".into())));
+            assert!(!meta.iter().any(|(k, _)| k == ATTR_DEPLOYMENT_ENVIRONMENT_NAME));
+            let tracer = e.wire_tracer(&b.resource, vec![chunk]);
+            assert_eq!((tracer.env.as_str(), tracer.app_version.as_str()), ("staging", "9.9"));
+        }
+        // With no payload field, the resource's values ride as every span's `env` and `version`,
+        // unless the span has its own, which wins, counted.
+        let bare = Event::span(1_000, AttrMap::new(), otel_span([1; 16]));
+        let b = batch(resource.clone(), vec![bare]);
+        let chunk = only_chunk(&e, &b, Form::V04);
+        assert!(chunk.spans[0].meta.contains(&(META_ENV.into(), "staging".into())));
+        assert!(chunk.spans[0].meta.contains(&(META_VERSION.into(), "9.9".into())));
+        e.resource_carriers_lost(&b.resource, Form::V04, false);
+        let lost =
+            |r: &Registry| counted(r, "logit.output.spans.degraded", ("reason", "no_wire_form"));
+        assert_eq!(lost(&registry), 0.0, "never lost");
+        let b = batch(resource, out);
+        let chunk = only_chunk(&e, &b, Form::V04);
+        assert!(chunk.spans[0].meta.contains(&(META_ENV.into(), "prod".into())));
+        assert_eq!(lost(&registry), 2.0, "the span's own env and version win");
+
+        // A bare `env` beside the key loses the `meta` slot to it, counted; a numeric one keeps
+        // its `metrics` entry.
+        let mut attrs = AttrMap::new();
+        attrs.insert(ATTR_DEPLOYMENT_ENVIRONMENT_NAME, Value::str("prod"));
+        attrs.insert(META_ENV, Value::str("bare"));
+        attrs.insert(META_VERSION, Value::F64(2.0));
+        attrs.insert(ATTR_SERVICE_VERSION, Value::str("1.2.3"));
+        let b = batch(Resource::default(), vec![Event::span(0, attrs, otel_span([1; 16]))]);
+        let s = &only_chunk(&e, &b, Form::V07).spans[0];
+        let envs: Vec<_> = s.meta.iter().filter(|(k, _)| k == META_ENV).collect();
+        assert_eq!(envs, vec![&(META_ENV.to_string(), "prod".to_string())]);
+        assert_eq!(s.metrics, vec![(META_VERSION.to_string(), 2.0)]);
+        let omitted =
+            counted(&registry, "logit.output.tags.omitted", ("reason", "unrepresentable"));
+        assert_eq!(omitted, 1.0);
     }
 
     #[test]

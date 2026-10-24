@@ -63,7 +63,7 @@
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"sensor.offset","kind":"gauge","value":1.5}]},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"sensor.reading","kind":"gauge","value":100000.0}]},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"servers.web-1.cpu","kind":"gauge","value":0.25}],"attributes":{"dc":"us-east","host.name":"web-1"}},
-    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"servers.web-1.cpu","kind":"gauge","value":0.5}],"attributes":{"env":"staging"}},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"servers.web-1.cpu","kind":"gauge","value":0.5}],"attributes":{"deployment.environment.name":"staging"}},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"servers.web-1.disk","kind":"gauge","value":42.0}]},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"servers.web-1.mem","kind":"gauge","value":1234.0}],"attributes":{"role":"db"}}
   ], "counters": {

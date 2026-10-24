@@ -14,8 +14,9 @@ use super::outcomes::{MetricIn, MetricOut};
 use super::series::{first_metric, record_routes, OriginCodes, Route, WireSeries};
 use super::time::{nanos_to_seconds, seconds_to_nanos};
 use super::{
-    DatadogDecoder, DatadogEncoder, RESOURCE_ATTR_AGENT_EPOCH, RESOURCE_ATTR_AGENT_INTERNAL_IP,
-    RESOURCE_ATTR_AGENT_PUBLIC_IP, RESOURCE_ATTR_AGENT_TIMEZONE, RESOURCE_ATTR_AGENT_VERSION,
+    datadog_stats_name, DatadogDecoder, DatadogEncoder, RESOURCE_ATTR_AGENT_EPOCH,
+    RESOURCE_ATTR_AGENT_INTERNAL_IP, RESOURCE_ATTR_AGENT_PUBLIC_IP, RESOURCE_ATTR_AGENT_TIMEZONE,
+    RESOURCE_ATTR_AGENT_VERSION,
 };
 use crate::CodecError;
 use bytes::Bytes;
@@ -200,9 +201,10 @@ impl DatadogEncoder {
     /// is sent.
     pub fn encode_sketches(&mut self, batch: &EventBatch) -> Option<Bytes> {
         let mut sketches = Vec::new();
+        let stats_name = datadog_stats_name();
         for event in &batch.events {
             let mut carriers = None;
-            for record in &event.metrics[first_metric(&batch.resource, event)..] {
+            for record in &event.metrics[first_metric(&batch.resource, event, stats_name)..] {
                 if !record_routes(record, self.histograms).sketch {
                     continue;
                 }
@@ -491,7 +493,7 @@ mod tests {
         let e = &batch.events[0];
         assert_eq!(e.timestamp, seconds_to_nanos(TS_S));
         assert_eq!(e.attributes.get(ATTR_HOST_NAME), Some(&Value::str("h")));
-        assert_eq!(e.attributes.get("env"), Some(&Value::str("prod")));
+        assert_eq!(e.attributes.get("deployment.environment.name"), Some(&Value::str("prod")));
         let MetricKind::Distribution(s) = &e.metrics[0].kind else { panic!() };
         assert_eq!(*s.mapping(), Mapping::agent());
         assert_eq!(s.negative_bins(), &[Bin { key: 2, count: 3.0 }, Bin { key: 5, count: 3.0 }]);

@@ -337,6 +337,77 @@ hostname. Beside either, a `host` attribute is left off, counted
 `logit.output.tags.omitted{reason="unrepresentable"}`, since the Agent consumes every `host:` tag
 and keeps only the last.
 
+### A container id reaches Datadog as `container_id`, never resolved
+
+`logit` writes a sender's container as `container.id`: `statsd_in` from a DogStatsD `|c:` field's
+container id, `datadog_in` and `datadog_trace_in` from a tracer or stats payload's container id or
+the `Datadog-Container-ID` header, and `docker_in` from each container it tails. `datadog_out`
+sends it as a `container_id` tag on a metric, event, or service check, a `container_id` entry in a
+log's `ddtags`, and the `container_id` field of a trace or stats payload; `container.image.tags`'
+first element goes out as `image_tag`. A `container_id` or `image_tag` attribute beside the key
+is left off, counted `logit.output.tags.omitted{reason="unrepresentable"}`.
+
+An Agent does more: it resolves a container id through its tagger into the container's tags
+(image, name, orchestrator labels), and on a DogStatsD sample adds `container_id` itself only at
+high tag cardinality. `logit` has no tagger, so `statsd_in -> datadog_out` sends the bare
+`container_id` tag for a line that names a container id, and nothing for one that names only a
+cgroup inode (`|c:in-<inode>`, what most clients send), which only the sender's host can resolve.
+To get the container's tags, send DogStatsD through a local Agent with `statsd_out`, which writes
+`|c:` back in the form the Agent reads.
+
+### `env`, `version`, and `service` tags are the service identity keys
+
+`statsd_in` and `datadog_in` read a valued `env:`, `version:`, or `service:` tag on a metric,
+event, or service check as the standard `deployment.environment.name`, `service.version`, or
+`service.name`, and `datadog_out` and `statsd_out` write each key back as that tag. So a stage
+between them reads and sets the standard key, not `env`: a `lua` default for a missing
+environment sets `deployment.environment.name`, and a `keep` before `aggregate` lists it. An
+OTLP sender's resource `service.name` reaches Datadog as `service` the same way.
+
+Beside a key, a valued `env`, `version`, or `service` attribute set by a transform or another
+family's source is left off, counted `logit.output.tags.omitted{reason="unrepresentable"}`, since
+it would be a second value for the same tag. Set the standard key instead. A
+`deployment.environment.name:` tag a sender writes beside its own `env:` tag is left off at
+decode, counted `logit.input.tags.omitted{reason="reserved_key"}`.
+
+### A log's service, `env`, and `version` ride on the standard keys
+
+`datadog_in` writes a log's `service` as `service.name`, and moves its `ddtags` `env:`,
+`version:`, and `service:` entries onto `deployment.environment.name`, `service.version`, and
+`service.name`. Every other `ddtags` entry stays in the one string, in order. `datadog_out` writes
+them back for any log, whatever source wrote the keys: `service.name` as the log's `service`, and
+the other two as `env:` and `version:` entries at the end of `ddtags`. So an OTLP log whose
+resource carries `deployment.environment.name` reaches Datadog tagged `env:`.
+
+Two cases lose a value, counted `logit.input.tags.omitted{reason="reserved_key"}` at
+`datadog_in`:
+
+- A log carrying its service twice, as the `service` field and a `service:` entry (an Agent
+  tailing a container that sets Unified Service Tagging sends both), keeps the field. The relay
+  sends no `service:` entry back.
+- A second valued `env:`, `version:`, or `service:` entry loses to the first.
+
+A `service` attribute on a log reaching `datadog_out`, from a `json` transform's parse or a
+`set`, is the log's `service` when the log has no `service.name`. Beside a `service.name`, it's
+left off, counted `logit.output.tags.omitted{reason="reserved_key"}`, since it would be a second
+`service` key in the object.
+
+### A trace's `env` and `version` are `deployment.environment.name` and `service.version`
+
+`datadog_in` and `datadog_trace_in` write a span's `env` and `version` meta as
+`deployment.environment.name` and `service.version` on its event, and a tracer payload's `env`
+and `app_version`, or a stats payload's `Env` and `Version`, as the same keys on the batch
+resource, with a stats payload's `Service` as the resource's `service.name`. `datadog_out` and
+`datadog_trace_out` write them back where they came from: the event's as span meta, the
+resource's in the payload. A `version: v0.4` `datadog_trace_out` has no payload field, so the
+resource's values go out as every span's `env` and `version` meta, and a span's own value wins,
+counted `logit.output.spans.degraded{reason="no_wire_form"}`.
+
+So an OTLP span's `deployment.environment.name` reaches Datadog as its `env`, and a transform
+that reads or sets a trace's environment names the key, not `env` or a `_logit.` carrier. A bare `env` or `version`
+attribute beside the key that fills a span's `env` or `version` is left off, counted
+`logit.output.tags.omitted{reason="unrepresentable"}`.
+
 ### `at_least_once` can duplicate a request, and everything but series is stored twice
 
 The default posture is `at_least_once`, so a `5xx` or a timeout is retried. One batch goes out

@@ -96,10 +96,12 @@ optimizations exploit that. Both are hard to retrofit once scripts and codecs de
 
 When data belongs on an event but doesn't warrant a core-model field, a codec stamps it as a
 dotted, `service.name`-style attribute. `syslog_in` stamps the public
-`syslog.facility`/`.timestamp`/`.tag`/`.pid`/`.msgid`/`.sd`, HOSTNAME as the standard
-`host.name` (below), and the private `_logit.syslog.severity`, and the OTLP codec stamps the private
-`_logit.otel.severity_number`/`_logit.otel.severity_text`. `syslog.pid` may be `Value::Str` as well
-as `Value::U64`, because RFC 5424's PROCID is free-form PRINTUSASCII. `syslog.timestamp` may be
+`syslog.facility`/`.timestamp`/`.tag`/`.msgid`/`.sd`, HOSTNAME as the standard
+`host.name` (below), a canonical decimal PROCID or `tag[pid]` as the standard `process.pid`
+(`Value::U64`, below), and the private `_logit.syslog.severity`, and the OTLP codec stamps the
+private `_logit.otel.severity_number`/`_logit.otel.severity_text`. Any other PROCID is the
+`Value::Str` `syslog.pid`, because RFC 5424's PROCID is free-form PRINTUSASCII; an event has
+`process.pid` or `syslog.pid`, never both. `syslog.timestamp` may be
 `Value::Null` (a nil `-` RFC 5424 TIMESTAMP) as well as `Value::Timestamp`/`Value::Str`. The
 `timestamp` component resolves it onto `event.timestamp`
 ([ADR `timestamp-transform`](../adr/timestamp-transform.md)). See
@@ -119,6 +121,29 @@ has one, and falls back to the process hostname or its own `hostname:`. No sink 
 family's host key ([ADR `process-hostname`](../adr/process-hostname.md)'s "Amendment: a source
 fills the common keys (2026-10-23)"). Every other host (a parsed log field, a carbon path
 segment, a line's text, a Lua-built event) is an operator's transform's to put in `host.name`.
+
+**`container.id` is the standard container key, and `container.image.tags` the image tags key**
+(`logit_core::attrs::CONTAINER_ID` and `CONTAINER_IMAGE_TAGS`, the OpenTelemetry names; the second
+an `Array` of `Str`). They follow `host.name`'s rule: `statsd_in` writes a DogStatsD `|c:`
+container id on the event, `datadog_in` and `datadog_trace_in` a tracer's or stats payload's
+container id and stats image tag on the batch resource, and `docker_in` both on each container's
+resource; a sink reads the event, else the resource, and writes its own wire's form
+([ADR `process-hostname`](../adr/process-hostname.md)'s "Amendment: container identity
+(2026-10-24)").
+
+**`service.name`, `deployment.environment.name`, and `service.version` are the standard service
+identity keys** (`logit_core::attrs::SERVICE_NAME`, `DEPLOYMENT_ENVIRONMENT_NAME`, and
+`SERVICE_VERSION`, each a `Str`, the OpenTelemetry names). They follow `host.name`'s rule.
+`statsd_in` and `datadog_in` write a valued DogStatsD or Datadog `service:`, `env:`, or `version:`
+tag on a metric, event, or service check onto them, on the event, and a Datadog-family sink writes
+them back as those tags ([ADR `process-hostname`](../adr/process-hostname.md)'s "Amendment:
+service identity on tags (2026-10-24)"). `datadog_in` writes a log's `service` and its `ddtags`
+`env:`, `version:`, and `service:` entries on the log's event, and `datadog_out` writes them back
+as the log's `service` and `ddtags` entries (the same ADR's "Amendment: Datadog log service identity
+(2026-10-24)"). `datadog_in` and `datadog_trace_in` write a span's `env` and `version` meta on its
+event, and a tracer or stats payload's environment and version on the batch resource, beside a
+stats payload's `Service` as the resource's `service.name` (the same ADR's "Amendment: a trace's
+environment, version, and service (2026-10-24)").
 
 **The private namespace `_logit.`: a carrier lives under `_logit.<protocol>.`**
 (`_logit.statsd.type`). A carrier is a protocol's raw wire spelling of something the model
@@ -249,7 +274,7 @@ repeated tag key) produce this shape; see
 | `syslog.sd` | `Value::Map { "<SD-ID>" -> Value::Map { "<PARAM-NAME>" -> Value::Str \| Value::Array<Value::Str> } }` | `syslog_in`'s parsed RFC 5424 STRUCTURED-DATA (absent when the wire carried the nil `-`); a repeated PARAM-NAME within one SD-ELEMENT becomes the `Array` form, in order. `syslog_out` re-emits every element, escaped per RFC 5424 §6.3.3; see [ADR `syslog-structured-data-convention`](../adr/syslog-structured-data-convention.md). |
 | *(any DogStatsD tag key)* | `Value::Str`\|`Value::Bool`, or `Value::Array` of either when the key repeated | `statsd_in`'s `insert_tags` folds a repeated `\|#` tag key into a `Value::Array` in wire order (`#team:a,team:b` -> `Array[Str("a"), Str("b")]`), the same multiset fold `syslog.sd` above uses; an exact-duplicate token dedupes at decode instead, so a non-repeated tag's shape is unchanged (`Value::Str` for `key:value`, `Value::Bool(true)` for a bare `key`). `statsd_out` expands an `Array` back into one wire tag per element. See [ADR `statsd-output`](../adr/statsd-output.md)'s amendment. |
 | `_logit.statsd.type` | `Value::Str`: `ms`\|`h`\|`d` | `statsd_in`'s wire-type letter for a timer/histogram/distribution line, stamped on the `MetricKind::Samples` record it decodes to since all three land on the same shape; `statsd_out` reads it to pick the wire-type letter it re-emits, defaulting to `ms` when absent or unrecognized. See [ADR `statsd-output`](../adr/statsd-output.md)'s amendment. |
-| `_logit.statsd.container_id` | `Value::Str` | `statsd_in`'s `\|c:<container-id>` segment (DogStatsD v1.2+, accepted here on every metric type, not only `c`/`g`), round-tripped by `statsd_out` under `format: dogstatsd` only. |
+| `_logit.statsd.cgroup_inode` | `Value::Str` | the inode of a `statsd_in` `\|c:in-<inode>` item (DogStatsD v1.4+, accepted on every metric type), which names a container only on the sender's host; the field's container id is `container.id`. Round-tripped by `statsd_out` under `format: dogstatsd` only, as `\|c:in-<inode>` or beside the id as `\|c:ci-<id>,in-<inode>`. |
 | `_logit.statsd.external_data`, `_logit.statsd.cardinality` | `Value::Str` | `statsd_in`'s `\|e:` (DogStatsD v1.5) and `\|card:` (v1.6) segments, or the `e:`/`card:` fields of an event or service check, carried verbatim; round-tripped by `statsd_out` under `format: dogstatsd` only. |
 | `_logit.statsd.event.title` | `Value::Str` | `statsd_in`'s decode of a DogStatsD event (`_e{TITLE_LEN,TEXT_LEN}:title\|text\|...`) -- always present. `statsd_out` renders it as the line's `title`, sanitized (control bytes only; a bare `\|` is fine, since the byte-length prefix delimits the field). See [ADR `statsd-output`](../adr/statsd-output.md)'s "DogStatsD events and service checks" amendment. |
 | `_logit.statsd.event.priority` | `Value::Str`: `normal`\|`low` | `statsd_in`'s `p:` field, only when sent. `statsd_out` writes it verbatim when it's exactly `normal`/`low`; any other value is omitted and counted (`logit.output.fields.omitted{reason="invalid_value"}`), not synthesized or substituted. |
@@ -354,7 +379,7 @@ event attributes and a set of resource attributes:
 | `log.iostream` | `Value::Str`: `stdout`\|`stderr` | `docker_in` only. Which of the container's two streams this line came from. `docker_in` has no per-stream filter; a downstream stage, such as a `lua` component reading this attribute, does that. |
 
 `docker_in`'s resource carries `container.id`, `container.name`, `container.image.name`,
-`container.image.tag` (absent for an untagged or digest reference), and `container.label.<key>` for
+`container.image.tags` (a one-element array, absent for an untagged or digest reference), and `container.label.<key>` for
 every key named in its `labels:` config (opt-in, never every label; see the ADR's event/resource
 shape section). `docker_in` reads these from the sibling `config.v2.json` once per container, when
 it opens the log, and never re-reads them, so a `docker rename` after that point is not picked up,

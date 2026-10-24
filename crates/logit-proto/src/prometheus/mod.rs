@@ -166,6 +166,10 @@
 //! | `record/min_max` | lost | structural | A histogram's `min` and `max` have no Prometheus series, so they aren't written. |
 //! | `attributes/string_value` | normalized | `label_sanitized`; `logit.output.labels.normalized{reason=name_sanitized}` | A label; its name is forced into `[a-zA-Z_][a-zA-Z0-9_]*`, so a key holding `.` or another character reads back under the sanitized name, counted once per label it renames. |
 //! | `attributes/host_beside_host_name` | exact | -- | A `host` label, read back as `host`. |
+//! | `attributes/container_id` | normalized | `label_sanitized`; `logit.output.labels.normalized{reason=name_sanitized}` | A label, read back as `container_id`, since a label name has no `.`; counted once per label it renames. |
+//! | `attributes/service_identity` | normalized | `label_sanitized`; `logit.output.labels.normalized{reason=name_sanitized}` | A label, read back with each `.` written as `_`, since a label name has no `.`; counted once per label it renames. |
+//! | `attributes/service_tag` | exact | -- | A label of that name. |
+//! | `attributes/service_tag_beside_key` | exact | -- | A label of that name. |
 //! | `attributes/bool_value` | normalized | `stringified`; `logit.output.labels.normalized{reason=name_sanitized}` | A label of `true` or `false`, read back as the string. A name outside the label-name grammar is sanitized, counted once per label it renames. |
 //! | `attributes/number_value` | normalized | `stringified`; `logit.output.labels.normalized{reason=name_sanitized}` | A label of the number's decimal text, read back as the string. A name outside the label-name grammar is sanitized, counted once per label it renames. |
 //! | `attributes/array_value` | normalized | `multi_value`; `logit.output.labels.normalized{reason=multi_value}` | A label set is a map, so only the last representable element is written, counted. |

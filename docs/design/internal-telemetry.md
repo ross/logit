@@ -935,9 +935,13 @@ datagram or packet still decodes. The driver's `bad_datagram`/`bad_frame` key, w
 `StatsdDecoder::decode_into` can return: a frame that isn't valid UTF-8. A `|#` tag whose key
 starts with `_logit.`, the private carrier prefix, is left off its metric, event, or service check
 and counted `logit.input.tags.omitted{reason="reserved_prefix"}`, and a `host.name:` tag beside
-the line's own host (a `host:` tag or a non-empty `h:` field) is left off and counted
-`logit.input.tags.omitted{reason="reserved_key"}`; the line is delivered, and a line rejected for
-another reason counts none. The decoder carries a
+the line's own host (a `host:` tag or a non-empty `h:` field), or a `container.id:` tag beside a
+container id the line's `|c:` names, or a valued `deployment.environment.name:`, `service.version:`,
+or `service.name:` tag beside the line's own `env:`, `version:`, or `service:` tag, is left off and
+counted `logit.input.tags.omitted{reason="reserved_key"}`. An item of a `|c:` list the Agent doesn't read
+(neither `ci-<id>` nor `in-<inode>`) is dropped and counted
+`logit.input.fields.dropped{reason="malformed"}` per item. Either way the line is delivered, and a
+line rejected for another reason counts none. The decoder carries a
 sampled `ms`/`h`/`d` line's `@<rate>` verbatim and clamps nothing; `aggregate` bounds the weight a
 rate implies at `Samples::MAX_WEIGHT` and reports a clamp as
 `logit.transform.samples.weight_clamped` and a `sample_rate_clamped` diagnostic under its own
@@ -2142,6 +2146,9 @@ itself. The sink emits each once per batch, however many attempts the runtime ma
   isn't a valid RFC 5424 `SD-NAME` (an invalid SD-ID omits the element, an invalid PARAM-NAME that
   param); a `syslog.sd` element whose value isn't a map of PARAM-NAME to value; the opt-in element
   colliding with an SD-ID the event already carries.
+- `logit.output.fields.omitted{reason="invalid_value"}`: a `process.pid` with no PROCID form (a
+  negative integer, or a value that isn't an integer or a string of digits) left off a message that
+  is still sent.
 - `logit.output.reconnects` (count, TCP only): every connect *after* the first. A climbing count in
   steady state means the peer or the network, not this sink, is unstable. Counted on plaintext and
   TLS (RFC 5425) connections alike, because both go through the pooled-stream driver
@@ -2192,7 +2199,8 @@ itself. The sink emits each once per batch, however many attempts the runtime ma
 - `logit.output.events.skipped{reason="no_metrics"}`: an event with no metric record that isn't a
   DogStatsD event or service check, such as a plain log or a span, which has no statsd line.
 - `logit.output.tags.omitted{reason="dialect"|"unrepresentable"}`: `format: statsd` omitting the
-  whole tag segment, or an individual unrepresentable tag. Counted **per wire tag**, so a
+  whole tag segment, or an individual unrepresentable tag, including a valued `env`, `version`, or
+  `service` attribute beside the standard key that writes that tag. Counted **per wire tag**, so a
   multi-valued attribute (an `Array`, from a repeated DogStatsD tag key, `docs/adr/statsd-output.md`'s
   amendment) that expands to several tags on the wire counts once per element, not once per
   attribute.
@@ -2203,7 +2211,8 @@ itself. The sink emits each once per batch, however many attempts the runtime ma
   reserved characters became `_`, once per record. It reads back under the rewritten name.
 - `logit.output.tags.normalized{reason="name_sanitized"|"value_sanitized"}`: a DogStatsD tag whose
   key, or whose value, had a reserved character written as `_`, once per wire tag of an event that
-  wrote a line.
+  wrote a line; and an event's or service check's `|h:` host with `|` or a control character
+  written as `_`, once per line that was written.
 - `logit.output.reconnects` (count; `tcp`, `unix_stream`, and `unix`): every connect *after* the
   first, as for `syslog_out`. Counted on plaintext and TLS connections alike, because `tcp` and
   `unix_stream` both go through the shared pooled-stream driver.
@@ -2661,7 +2670,7 @@ The module doc of `logit_proto::datadog` has the full mapping-to-counter tables.
 | `logit.input.metrics.skipped{reason="empty_sketch"}` | count | a `Dogsketch` with no bins and zero count |
 | `logit.input.metrics.degraded{reason="no_timestamp"}` | count | a point or sketch with no timestamp, stamped with `received_at` |
 | `logit.input.tags.omitted{reason="reserved_prefix"}` | count | a tag whose key starts with `_logit.`, the private carrier prefix, left off a delivered series, sketch, event, or service check, counted per tag: once per series or sketch however many points it delivers |
-| `logit.input.tags.omitted{reason="reserved_key"}` | count | a `host.name` tag, or a log's `host.name` key, left off a delivered record because the record's own host (a series' or sketch's `host`, an event's `host`, or a check's `host_name`, an empty one of any of those included as the hostless mark, or a log's non-empty `hostname`) fills `host.name`; counted the way `reserved_prefix` is |
+| `logit.input.tags.omitted{reason="reserved_key"}` | count | a `host.name` tag, or a log's `host.name` key, left off a delivered record because the record's own host (a series' or sketch's `host`, an event's `host`, or a check's `host_name`, an empty one of any of those included as the hostless mark, or a log's non-empty `hostname`) fills `host.name`; a valued `deployment.environment.name:`, `service.version:`, or `service.name:` tag beside the `env:`, `version:`, or `service:` tag in the same list on a series, sketch, event, or service check; and on a log, a `ddtags` `env:`, `version:`, or `service:` entry, or a top-level `service.name`, `deployment.environment.name`, or `service.version` field, that loses to the log's `service` or to the key's first valued entry, and an empty or bare entry of a tag whose key has a value; counted the way `reserved_prefix` is: once per series or sketch however many points it delivers |
 | `logit.output.metrics.dropped{reason="unresolved_cumulative"}` | count | a cumulative monotonic `Sum`, `Histogram`, or `ExponentialHistogram`, which Datadog's exporter differences into a delta first, with no `cumulative_to_delta` upstream to do it; counted by the series encoders only, with an `unresolved_cumulative` diagnostic |
 | `logit.output.metrics.skipped{metric_kind="set_members"}` | count | a kind no Datadog route carries; counted by the series encoders only |
 | `logit.output.fields.dropped{reason="unresolved_cumulative"}` | count | a cumulative `Summary`'s `.count` and `.sum`, running totals that need differencing first, left off while its `.quantile` gauges go out; once per summary, with an `unresolved_cumulative` diagnostic. A delta `Summary`, which `cumulative_to_delta` makes, sends both |
@@ -2675,13 +2684,13 @@ The module doc of `logit_proto::datadog` has the full mapping-to-counter tables.
 | `logit.output.metrics.dropped{reason="non_finite_value"\|"oversized_sketch"}` | count | a non-finite value, a sketch whose counts split into more than `MAX_DOGSKETCH_ENTRIES` `k`/`n` entries, or a histogram or exponential histogram of more than 4,096 × 65,535 observations, which Datadog's exporter abandons too |
 | `logit.output.metrics.dropped{reason="non_monotonic_bounds"\|"sketch_range"}` | count | a delta `Histogram` with a bucket whose upper bound keys below its lower one, or a delta `ExponentialHistogram` whose scale or buckets fall outside the Agent sketch's range (a key past 32,766, or a boundary that overflows) |
 | `logit.output.metrics.degraded{reason="sample_rate_expanded"\|"sample_rate_rounded"\|"rebinned"\|"fractional_count"}` | count | a sampled `Samples` expanded into repeated values, a `Samples` whose rate below 1 rounds to weight 1 sent with no trace of it, a non-Agent sketch re-binned into the Agent mapping, or a fractional bin count rounded |
-| `logit.output.tags.omitted{reason="unrepresentable"\|"no_wire_form"}` | count | a tag value with no tag form (`Map`, `Bytes`, `Null`) or a carrier attribute of the wrong type; a `_logit.datadog.*` carrier the target route has no field for |
+| `logit.output.tags.omitted{reason="unrepresentable"\|"no_wire_form"}` | count | a tag value with no tag form (`Map`, `Bytes`, `Null`) or a carrier attribute of the wrong type, or a valued `env`, `version`, or `service` attribute beside the standard key that writes that tag, once per wire tag; a `_logit.datadog.*` carrier the target route has no field for |
 | `logit.output.events.skipped{reason="no_payload"}` | count | an event with no metric, log, or span, which takes no route; counted by `datadog_out`'s routing through the codec's handle, once per batch |
 | `logit.input.logs.dropped{reason="not_an_object"\|"no_message"}` | count | a log array element that isn't an object, or a log with no `message` |
 | `logit.input.events.dropped{reason="malformed"\|"no_title"}` | count | an events-envelope group that isn't an array or an item that isn't an object, or an event with neither a title nor a text |
 | `logit.input.metrics.dropped{reason="malformed"\|"no_name"\|"invalid_status"}` | count | a service check that isn't an object, has no `check` name, or has a status outside 0 to 3 |
 | `logit.output.metrics.dropped{reason="invalid_status"}` | count | a service-check event with no status in 0 to 3, on either its `_logit.statsd.service_check.status` or its gauge |
-| `logit.output.tags.omitted{reason="reserved_key"}` | count | a log attribute named `message` or `timestamp`, which would collide with the log's own wire fields |
+| `logit.output.tags.omitted{reason="reserved_key"}` | count | a log attribute that would collide with the log's own wire fields: one named `message`, `timestamp`, or `hostname`, or a `service` beside a `service.name` the sink writes as `service`; and a `ddtags` entry naming `env`, `version`, or `container_id` beside the key the sink appends that entry from |
 | `logit.input.stats.dropped{reason="malformed_payload"\|"malformed_bucket"\|"malformed_group"}` | count | an APM stats `ClientStatsPayload` (in an intake `StatsPayload`), bucket, or group that isn't a well-formed map, dropped while the rest decodes |
 | `logit.input.stats.skipped{reason="empty_bucket"}` | count | an APM stats bucket with no groups, which decodes to no events |
 | `logit.input.stats.dropped{reason="interpolation"\|"bad_sketch"}` | count | an `OkSummary`/`ErrorSummary` dropped from its group: an interpolated DDSketch mapping, which isn't implemented, or bytes that aren't a usable DDSketch |
@@ -2691,7 +2700,7 @@ The module doc of `logit_proto::datadog` has the full mapping-to-counter tables.
 | `logit.output.stats.degraded{reason="agent_mapping"\|"bin_limit"\|"exact_summary"}` | count | a stats summary sent under the Agent mapping's logarithmic reading, with a bin limit other than 2048, or with an exact summary the DDSketch protobuf can't carry |
 | `logit.input.spans.dropped{reason="malformed"\|"idx_payload"}` | count | a span, trace array, or chunk that doesn't parse (a v0.5 span of the wrong arity or with a dictionary index out of range included), dropped while the rest decodes; an `AgentPayload`'s v1.0 `idxTracerPayloads` entry, which isn't implemented |
 | `logit.input.spans.degraded{reason="bad_tid"\|"negative_duration"\|"key_collision"\|"timestamp_range"\|"bad_attribute_type"\|"invalid_utf8"}` | count | an unparseable `_dd.p.tid` (kept as an attribute, high half zero), a negative duration clamped to 0, one key in two of `meta`/`metrics`/`meta_struct` (or a field spelled like a carrier) keeping one value, a span event time above `i64::MAX` clamped, a span event attribute of unknown type dropped, or a non-UTF-8 string read lossily |
-| `logit.output.spans.degraded{reason="no_wire_form"}` | count | a span field the target form has no home for, one per item: `status: Ok`, span `flags`, a status message, `trace_state`, a dropped count; `_logit.datadog.chunk.*` in v0.4/v0.5; `_logit.datadog.tracer.*` in v0.4/v0.5 and `_logit.datadog.agent.*` below `AgentPayload` (once per request body); `meta_struct`, links, and events in v0.5 |
+| `logit.output.spans.degraded{reason="no_wire_form"}` | count | a span field the target form has no home for, one per item: `status: Ok`, span `flags`, a status message, `trace_state`, a dropped count; `_logit.datadog.chunk.*` in v0.4/v0.5; `_logit.datadog.tracer.*` in v0.4/v0.5 and `_logit.datadog.agent.*` below `AgentPayload` (once per request body); `meta_struct`, links, and events in v0.5; in v0.4/v0.5, a resource `host.name`, `deployment.environment.name`, or `service.version` that a span's own different value replaces (once per key, per span) |
 | `logit.output.spans.degraded{reason="int_as_f64"\|"json_text"\|"negative_duration"\|"timestamp_range"}` | count | an integer attribute sent as an inexact `metrics` double, an `Array`/`Map`/`Null` sent as JSON text, a span ending before it starts sent with duration 0, or a negative span event time sent as 0 |
 
 `Diagnostics` keys: `bad_series` and `bad_sketch`; `malformed_log`, `bad_timestamp` (a log

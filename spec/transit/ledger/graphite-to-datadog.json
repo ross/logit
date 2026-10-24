@@ -1,6 +1,7 @@
 {
   "cells": [
     {"sink":"datadog_out","row":"attributes/no_host","cell":0,"observed":["normalized"]},
+    {"sink":"datadog_out","row":"attributes/service_tag","cell":0,"observed":["normalized"]},
     {"sink":"datadog_out","row":"attributes/string_value","cell":0,"observed":["exact"]},
     {"sink":"datadog_out","row":"gauge/f64","cell":0,"observed":["exact"]},
     {"sink":"datadog_out","row":"gauge/negative","cell":0,"observed":["exact"]},

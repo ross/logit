@@ -153,13 +153,35 @@ Entry format and the other areas: [the known-gaps index](README.md).
     their series merged under it. Datadog bills per host, so this costs what one Agent would.
   - **Workaround:** stamp `host.name` per sender upstream with `set`, or have each DogStatsD
     client send a `host:` tag (or `h:` on an event or check).
+- **`datadog_out` sends a container id unresolved.** `container.id` leaves as a bare
+  `container_id` tag (a `ddtags` entry on a log, the payload field on a trace or stats payload).
+  An Agent resolves a container id through its tagger into the container's image, name, and
+  orchestrator tags, and a DogStatsD client's `|c:in-<inode>` through the cgroup; `logit` has no
+  tagger, so it sends neither the extra tags nor anything for an inode, which it carries as
+  `_logit.statsd.cgroup_inode`.
+  - **Consequence:** a DogStatsD sample relayed straight to the intake lacks the container tags an
+    Agent would add, and one that named only an inode carries no container at all.
+  - **Workaround:** send DogStatsD through a local Agent with `statsd_out`, which writes `|c:` back
+    in the form the Agent reads, or stamp the tags upstream with `set`.
+- **A relayed log keeps one value per service identity key.** `datadog_in` lifts a log's `ddtags`
+  `env:`, `version:`, and `service:` entries onto one `deployment.environment.name`,
+  `service.version`, and `service.name` each, the log's own `service` field first. A `service:`
+  entry beside that field, and a second valued entry of any of the three, is left off, counted
+  `logit.input.tags.omitted{reason="reserved_key"}`.
+  - **Consequence:** an Agent-tailed container log that carries its service as both the field
+    and a tag reaches Datadog through the relay with the field alone, and a log tagged with two
+    environments keeps the first.
+  - **Workaround:** none needed for the twice-carried service, since Datadog reads the field as
+    the log's service. Give a log one value per tag upstream.
 - **`datadog_trace_out` under `version: v0.4` drops the trace chunk and tracer payload fields.**
   v0.4 has no field for a chunk's `_logit.datadog.chunk.*` fields (sampling priority, origin,
   dropped flag, tags) or for the tracer payload fields no request header carries
-  (`_logit.datadog.tracer.runtime_id`, `.env`, `.app_version`, `.tags`, `.container_debug`).
+  (`_logit.datadog.tracer.runtime_id`, `.tags`, `.container_debug`).
   Each is counted `logit.output.spans.degraded{reason="no_wire_form"}`. The payload's hostname,
-  the resource's `host.name`, goes out as every span's `host.name` tag instead, unless the span
-  carries a different `host.name`, which wins as any event attribute does, counted the same way.
+  env, and app version, the resource's `host.name`, `deployment.environment.name`, and
+  `service.version`, go out as every span's `host.name`, `env`, and `version` tags instead,
+  unless the span carries a different value of its own, which wins as any event attribute does,
+  counted the same way.
   - **Consequence:** only a v0.7-origin batch loses anything, and the Agent derives a chunk's
     priority and origin from the root span again on its side.
   - **Workaround:** `version: v0.7`, which carries all of them.

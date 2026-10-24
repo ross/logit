@@ -7,6 +7,8 @@
     {"sink":"otlp_out","row":"attributes/interval","cell":0,"observed":["lost"]},
     {"sink":"otlp_out","row":"attributes/no_host","cell":0,"observed":["exact"]},
     {"sink":"otlp_out","row":"attributes/rate","cell":0,"observed":["lost"]},
+    {"sink":"otlp_out","row":"attributes/service_identity","cell":0,"observed":["exact"]},
+    {"sink":"otlp_out","row":"attributes/service_tag","cell":0,"observed":["exact"]},
     {"sink":"otlp_out","row":"attributes/string_value","cell":0,"observed":["exact"]},
     {"sink":"otlp_out","row":"distribution","cell":0,"observed":["degraded"]},
     {"sink":"otlp_out","row":"gauge/f64","cell":0,"observed":["exact"]},

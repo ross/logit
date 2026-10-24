@@ -9,6 +9,7 @@
     {"sink":"statsd_out","row":"attributes/prometheus_target","cell":0,"observed":["lost"]},
     {"sink":"statsd_out","row":"attributes/resource_attribute","cell":1,"observed":["normalized"]},
     {"sink":"statsd_out","row":"attributes/scope","cell":0,"observed":["lost"]},
+    {"sink":"statsd_out","row":"attributes/service_tag","cell":1,"observed":["normalized"]},
     {"sink":"statsd_out","row":"attributes/string_value","cell":1,"observed":["exact","normalized"]},
     {"sink":"statsd_out","row":"attributes/timestamp_value","cell":1,"observed":["lost"]},
     {"sink":"statsd_out","row":"attributes/timestamped","cell":1,"observed":["exact"]},

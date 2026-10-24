@@ -8213,7 +8213,7 @@ Test-module boundaries: `statsd.rs`, `syslog.rs`, `graphite.rs`, `collectd.rs`, 
 ### SINK-07 — statsd line-level drop rules: indivisible entries, oversize-whole-drop, and the multi-value timer
 - **Location:** `crates/logit-outputs/src/statsd.rs` (`push_line`; `render_metric`'s
   `MetricKind::Gauge` arm, the negative-absolute-gauge two-line pair as one entry;
-  `render_samples`; `render_set_members`; `append_dialect_extras`/`append_container_id`; and the
+  `render_samples`; `render_set_members`; `append_dialect_extras`/`append_origin_fields`; and the
   cap wiring in `StatsdOutput::encoder_cap`, `with_encoder` and `with_max_packet_bytes`).
 - **What it does:** Every rendered line funnels through `push_line`, which drops a line longer than
   `max_packet_bytes` **whole** (never truncating) and counts `dropped_oversize_line`. A negative

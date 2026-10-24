@@ -181,6 +181,10 @@
 //! | `record/exemplars` | lost | structural | Line protocol has no exemplars, so none are written, though the OTel Collector's InfluxDB exporter writes each as a point of a `<name>_exemplar` measurement; `docs/known-gaps/influxdb.md` has the gap. |
 //! | `attributes/string_value` | lost | `logit.output.tags.omitted{reason=unencodable}` | A tag. A value holding a line break, ending in `\`, or with `\` before a space has no spelling and is left off, counted. |
 //! | `attributes/host_beside_host_name` | lost | `logit.output.tags.omitted{reason=unencodable}` | A tag. A value holding a line break, ending in `\`, or with `\` before a space has no spelling and is left off, counted. |
+//! | `attributes/container_id` | exact | -- | A tag. |
+//! | `attributes/service_identity` | exact | -- | A tag. |
+//! | `attributes/service_tag` | exact | -- | A tag. |
+//! | `attributes/service_tag_beside_key` | exact | -- | A tag. |
 //! | `attributes/bool_value` | normalized | `stringified` | A tag of `true` or `false`, read back as the string. |
 //! | `attributes/number_value` | normalized | `stringified` | A tag of the number's decimal text, read back as the string. |
 //! | `attributes/array_value` | normalized | `multi_value`; `logit.output.tags.normalized{reason=multi_value}` | A tag holds one value, so only the last representable element is written, counted. |

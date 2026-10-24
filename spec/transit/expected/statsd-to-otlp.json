@@ -1,7 +1,7 @@
 {
   "carriers": {"events": [
-    {"timestamp":"2027-01-15T07:59:30.000000000Z","metrics":[{"name":"requests","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"env":"prod"}},
-    {"timestamp":"2027-01-15T07:59:30.000000000Z","metrics":[{"name":"temperature","kind":"gauge","value":20.0}]},
+    {"timestamp":"2027-01-15T07:59:30.000000000Z","metrics":[{"name":"requests","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"deployment.environment.name":"prod"}},
+    {"timestamp":"2027-01-15T07:59:30.000000000Z","metrics":[{"name":"temperature","kind":"gauge","value":20.0}],"attributes":{"container.id":"abc"}},
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"latency","kind":"summary","temporality":"cumulative","count":1,"sum":5.0,"quantiles":[{"quantile":0.0,"value":5.0},{"quantile":0.5,"value":5.0},{"quantile":0.75,"value":5.0},{"quantile":0.9,"value":5.0},{"quantile":0.95,"value":5.0},{"quantile":0.99,"value":5.0},{"quantile":1.0,"value":5.0}]}]}
   ], "counters": {
     "logit.output.metrics.degraded{component=out,kind=otlp_out,metric_kind=samples,role=sink}": 1
@@ -27,7 +27,7 @@
   }},
   "event": {"events": [
     {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"format":"raw","message":"abc","observed_timestamp":"2027-01-15T08:00:01.000000000Z"}},
-    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"severity":"warn","format":"raw","message":"first\nline","observed_timestamp":"2027-01-15T08:00:01.000000000Z"},"attributes":{"_logit.otel.severity_number":13,"_logit.otel.severity_text":"Warn","env":"prod","host.name":"web-07"}}
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"severity":"warn","format":"raw","message":"first\nline","observed_timestamp":"2027-01-15T08:00:01.000000000Z"},"attributes":{"_logit.otel.severity_number":13,"_logit.otel.severity_text":"Warn","deployment.environment.name":"prod","host.name":"web-07"}}
   ], "counters": {}},
   "flagged-histogram": {"events": [
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"response.size","kind":"histogram","temporality":"cumulative","buckets":[{"bound":100.0,"count":0},{"bound":1000.0,"count":0},{"bound":"inf","count":0}],"flags":1,"no_recorded_value":true}]}
@@ -52,21 +52,21 @@
     {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"format":"raw","message":"v2.1","observed_timestamp":"2027-01-15T08:00:01.000000000Z"},"attributes":{"host.name":"web-1"}},
     {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"format":"raw","message":"v2.2","observed_timestamp":"2027-01-15T08:00:01.000000000Z"},"attributes":{"host.name":"web-3"}},
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"db.up","kind":"gauge","value":0.0}],"attributes":{"host.name":"web-4"}},
-    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"requests","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"env":"prod","host.name":"web-1"}},
-    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"requests.hostless","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"env":"prod"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"requests","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"deployment.environment.name":"prod","host.name":"web-1"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"requests.hostless","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"deployment.environment.name":"prod"}},
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"requests.tagged","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"host.name":"web-2"}}
   ], "counters": {}},
   "interop-dogstatsd-buffered": {"events": [
-    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"app.db.query.duration_ms","kind":"summary","temporality":"cumulative","count":1,"sum":0.33313615206930347,"quantiles":[{"quantile":0.0,"value":0.33313615206930347},{"quantile":0.5,"value":0.33313615206930347},{"quantile":0.75,"value":0.33313615206930347},{"quantile":0.9,"value":0.33313615206930347},{"quantile":0.95,"value":0.33313615206930347},{"quantile":0.99,"value":0.33313615206930347},{"quantile":1.0,"value":0.33313615206930347}]}],"attributes":{"db":"primary","env":"prod","host.name":"web-07","query":"select_user","region":"us-east-1","service":"checkout-api"}},
-    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"app.http.request.duration_ms","kind":"summary","temporality":"cumulative","count":1,"sum":0.05,"quantiles":[{"quantile":0.0,"value":0.05},{"quantile":0.5,"value":0.05},{"quantile":0.75,"value":0.05},{"quantile":0.9,"value":0.05},{"quantile":0.95,"value":0.05},{"quantile":0.99,"value":0.05},{"quantile":1.0,"value":0.05}]}],"attributes":{"endpoint":"/api/v1/orders","env":"prod","host.name":"web-07","region":"us-east-1","service":"checkout-api","status":"200"}},
-    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"app.http.request.duration_ms","kind":"summary","temporality":"cumulative","count":1,"sum":23.483176616760144,"quantiles":[{"quantile":0.0,"value":23.483176616760144},{"quantile":0.5,"value":23.483176616760144},{"quantile":0.75,"value":23.483176616760144},{"quantile":0.9,"value":23.483176616760144},{"quantile":0.95,"value":23.483176616760144},{"quantile":0.99,"value":23.483176616760144},{"quantile":1.0,"value":23.483176616760144}]}],"attributes":{"endpoint":"/healthz","env":"prod","host.name":"web-07","region":"us-east-1","service":"checkout-api","status":"200"}},
-    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"app.http.requests.count","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"endpoint":"/api/v1/orders","env":"prod","host.name":"web-07","region":"us-east-1","service":"checkout-api","status":"200"}},
-    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"app.http.requests.count","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"endpoint":"/healthz","env":"prod","host.name":"web-07","region":"us-east-1","service":"checkout-api","status":"200"}},
-    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"app.http.response.size_bytes","kind":"summary","temporality":"cumulative","count":1,"sum":60196.0,"quantiles":[{"quantile":0.0,"value":60196.0},{"quantile":0.5,"value":60196.0},{"quantile":0.75,"value":60196.0},{"quantile":0.9,"value":60196.0},{"quantile":0.95,"value":60196.0},{"quantile":0.99,"value":60196.0},{"quantile":1.0,"value":60196.0}]}],"attributes":{"endpoint":"/api/v1/orders","env":"prod","host.name":"web-07","region":"us-east-1","service":"checkout-api","status":"200"}},
-    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"app.render.calls.count","kind":"sum","value":2.0,"temporality":"delta","monotonic":true}],"attributes":{"endpoint":"/api/v1/orders","env":"prod","host.name":"web-07","region":"us-east-1","service":"checkout-api","status":"200"}},
-    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"app.worker.queue.depth","kind":"gauge","value":110.0}],"attributes":{"env":"prod","host.name":"web-07","queue":"email","region":"us-east-1","service":"checkout-api"}},
-    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"app.worker.queue.depth","kind":"gauge","value":210.0}],"attributes":{"env":"prod","host.name":"web-07","queue":"reindex","region":"us-east-1","service":"checkout-api"}},
-    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"app.worker.queue.depth","kind":"gauge","value":90.0}],"attributes":{"env":"prod","host.name":"web-07","queue":"webhooks","region":"us-east-1","service":"checkout-api"}}
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"app.db.query.duration_ms","kind":"summary","temporality":"cumulative","count":1,"sum":0.33313615206930347,"quantiles":[{"quantile":0.0,"value":0.33313615206930347},{"quantile":0.5,"value":0.33313615206930347},{"quantile":0.75,"value":0.33313615206930347},{"quantile":0.9,"value":0.33313615206930347},{"quantile":0.95,"value":0.33313615206930347},{"quantile":0.99,"value":0.33313615206930347},{"quantile":1.0,"value":0.33313615206930347}]}],"attributes":{"db":"primary","deployment.environment.name":"prod","host.name":"web-07","query":"select_user","region":"us-east-1","service.name":"checkout-api"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"app.http.request.duration_ms","kind":"summary","temporality":"cumulative","count":1,"sum":0.05,"quantiles":[{"quantile":0.0,"value":0.05},{"quantile":0.5,"value":0.05},{"quantile":0.75,"value":0.05},{"quantile":0.9,"value":0.05},{"quantile":0.95,"value":0.05},{"quantile":0.99,"value":0.05},{"quantile":1.0,"value":0.05}]}],"attributes":{"deployment.environment.name":"prod","endpoint":"/api/v1/orders","host.name":"web-07","region":"us-east-1","service.name":"checkout-api","status":"200"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"app.http.request.duration_ms","kind":"summary","temporality":"cumulative","count":1,"sum":23.483176616760144,"quantiles":[{"quantile":0.0,"value":23.483176616760144},{"quantile":0.5,"value":23.483176616760144},{"quantile":0.75,"value":23.483176616760144},{"quantile":0.9,"value":23.483176616760144},{"quantile":0.95,"value":23.483176616760144},{"quantile":0.99,"value":23.483176616760144},{"quantile":1.0,"value":23.483176616760144}]}],"attributes":{"deployment.environment.name":"prod","endpoint":"/healthz","host.name":"web-07","region":"us-east-1","service.name":"checkout-api","status":"200"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"app.http.requests.count","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"deployment.environment.name":"prod","endpoint":"/api/v1/orders","host.name":"web-07","region":"us-east-1","service.name":"checkout-api","status":"200"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"app.http.requests.count","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"deployment.environment.name":"prod","endpoint":"/healthz","host.name":"web-07","region":"us-east-1","service.name":"checkout-api","status":"200"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"app.http.response.size_bytes","kind":"summary","temporality":"cumulative","count":1,"sum":60196.0,"quantiles":[{"quantile":0.0,"value":60196.0},{"quantile":0.5,"value":60196.0},{"quantile":0.75,"value":60196.0},{"quantile":0.9,"value":60196.0},{"quantile":0.95,"value":60196.0},{"quantile":0.99,"value":60196.0},{"quantile":1.0,"value":60196.0}]}],"attributes":{"deployment.environment.name":"prod","endpoint":"/api/v1/orders","host.name":"web-07","region":"us-east-1","service.name":"checkout-api","status":"200"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"app.render.calls.count","kind":"sum","value":2.0,"temporality":"delta","monotonic":true}],"attributes":{"deployment.environment.name":"prod","endpoint":"/api/v1/orders","host.name":"web-07","region":"us-east-1","service.name":"checkout-api","status":"200"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"app.worker.queue.depth","kind":"gauge","value":110.0}],"attributes":{"deployment.environment.name":"prod","host.name":"web-07","queue":"email","region":"us-east-1","service.name":"checkout-api"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"app.worker.queue.depth","kind":"gauge","value":210.0}],"attributes":{"deployment.environment.name":"prod","host.name":"web-07","queue":"reindex","region":"us-east-1","service.name":"checkout-api"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"app.worker.queue.depth","kind":"gauge","value":90.0}],"attributes":{"deployment.environment.name":"prod","host.name":"web-07","queue":"webhooks","region":"us-east-1","service.name":"checkout-api"}}
   ], "counters": {
     "logit.output.metrics.degraded{component=out,kind=otlp_out,metric_kind=samples,role=sink}": 4,
     "logit.output.metrics.skipped{component=out,kind=otlp_out,metric_kind=set_members,role=sink}": 1
@@ -128,7 +128,7 @@
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"stale.gauge","kind":"gauge","value":0.0,"flags":1,"no_recorded_value":true}]}
   ], "counters": {}},
   "service-check": {"events": [
-    {"timestamp":"2027-01-15T07:59:30.000000000Z","metrics":[{"name":"db.up","kind":"gauge","value":0.0}],"attributes":{"env":"prod","host.name":"web-07"}},
+    {"timestamp":"2027-01-15T07:59:30.000000000Z","metrics":[{"name":"db.up","kind":"gauge","value":0.0}],"attributes":{"deployment.environment.name":"prod","host.name":"web-07"}},
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"cache.up","kind":"gauge","value":2.0}]}
   ], "counters": {}},
   "set": {"events": [], "counters": {
@@ -177,7 +177,7 @@
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"rpc.latency","kind":"summary","temporality":"cumulative","count":4,"sum":2.0,"quantiles":[{"quantile":0.5,"value":0.4},{"quantile":0.99,"value":0.9}]}]}
   ], "counters": {}},
   "tags": {"events": [
-    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"requests","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"env":"prod","service":"api","urgent":true}}
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"requests","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"deployment.environment.name":"prod","service.name":"api","urgent":true}}
   ], "counters": {}},
   "tags-array": {"events": [
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"requests","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"team":["a","b"],"urgent":[true,"1"]}}
@@ -186,7 +186,7 @@
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"requests","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"team":"a","urgent":true}}
   ], "counters": {}},
   "tags-reserved": {"events": [
-    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"requests","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"env":"a:b","my key":"a@b c"}}
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"requests","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"deployment.environment.name":"a:b","my key":"a@b c"}}
   ], "counters": {}},
   "timer-h-d": {"events": [
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"request.size","kind":"summary","temporality":"cumulative","count":1,"sum":512.0,"quantiles":[{"quantile":0.0,"value":512.0},{"quantile":0.5,"value":512.0},{"quantile":0.75,"value":512.0},{"quantile":0.9,"value":512.0},{"quantile":0.95,"value":512.0},{"quantile":0.99,"value":512.0},{"quantile":1.0,"value":512.0}]}]},

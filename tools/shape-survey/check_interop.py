@@ -18,11 +18,12 @@ The mapping from wire to measurement is not 1:1:
                                 `receive.batch_max_events: 1` the accumulator never splits or
                                 merges a datagram's decode output, so one datagram is one batch.
 
-  logit.shape.attributes    <-> tags per line, plus the `_logit.statsd.*` carriers the decoder
-  (at tap_input)                stamps: `_logit.statsd.container_id` for a `|c:<id>` segment (the
-                                DogStatsD client emits one unprompted, having detected its own
-                                container), the `_logit.metrics.closed` flag for a `|T<secs>`
-                                segment, and
+  logit.shape.attributes    <-> tags per line, plus the attributes the decoder stamps from a
+  (at tap_input)                line's own segments: from a `|c:` segment, `container.id` for its
+                                container id and `_logit.statsd.cgroup_inode` for its `in-<inode>`
+                                (the DogStatsD client emits `|c:in-<inode>` unprompted, having
+                                detected its own cgroup), the `_logit.metrics.closed` flag for a
+                                `|T<secs>` segment, and
                                 `_logit.statsd.type` on `ms`/`h`/`d` lines only -- the wire type
                                 letter, which those three share one `Samples` shape for. Repeated
                                 tag keys merge into one attribute holding an array, so a tag count
@@ -78,7 +79,13 @@ def parse_line(line: str) -> tuple[int, int] | None:
                 if token:
                     tag_keys.add(token.split(":", 1)[0])
         elif extra.startswith("c:"):
-            carriers += 1  # _logit.statsd.container_id
+            # `container.id` and `_logit.statsd.cgroup_inode`: one for a single value, one per
+            # `ci-`/`in-` kind in a list.
+            items = extra[2:].split(",")
+            if len(items) == 1:
+                carriers += 1 if items[0] else 0
+            else:
+                carriers += len({i[:3] for i in items if i[:3] in ("ci-", "in-")})
         elif extra.startswith("T"):
             carriers += 1  # the `_logit.metrics.closed` flag
 
@@ -245,7 +252,7 @@ def check(corpus: pathlib.Path, shape_log: pathlib.Path) -> int:
 
 
 def self_test() -> None:
-    # A tagged DogStatsD counter with a container id: 6 tag keys + _logit.statsd.container_id = 7.
+    # A tagged DogStatsD counter with a cgroup inode: 6 tag keys + _logit.statsd.cgroup_inode = 7.
     assert parse_line(
         "app.http.requests.count:1|c|#env:prod,svc:api,endpoint:/,method:GET,status:200,"
         "region:eu|c:in-deadbeef"

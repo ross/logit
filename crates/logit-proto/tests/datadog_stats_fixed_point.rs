@@ -410,8 +410,23 @@ fn intake_stats_payload_with_two_clients_is_a_fixed_point() {
         assert_eq!(a.get("_logit.datadog.agent.hostname"), Some(&Value::str("agent-7")));
         assert_eq!(a.get("_logit.datadog.stats.client_computed"), Some(&Value::Bool(true)));
         assert_eq!(a.get("_logit.datadog.stats.split_payload"), None);
-        assert_eq!(a.get("_logit.datadog.tracer.hostname"), None, "no such attribute exists");
+        for carrier in [
+            "_logit.datadog.tracer.hostname",
+            "_logit.datadog.tracer.container_id",
+            "_logit.datadog.stats.image_tag",
+            "_logit.datadog.tracer.env",
+            "_logit.datadog.tracer.app_version",
+            "_logit.datadog.stats.service",
+        ] {
+            assert_eq!(a.get(carrier), None, "no {carrier} attribute exists");
+        }
     }
+    let a = &batches[0].resource.attributes;
+    assert_eq!(a.get("deployment.environment.name"), Some(&Value::str("prod")));
+    assert_eq!(a.get("service.version"), Some(&Value::str("2.4.1")));
+    let a = &batches[0].resource.attributes;
+    assert_eq!(a.get("container.id"), Some(&Value::str("3f0a8e")));
+    assert_eq!(a.get("container.image.tags"), Some(&Value::Array(vec![Value::str("v2.4.1")])));
     let host = |b: &EventBatch| b.resource.attributes.get("host.name").cloned();
     assert_eq!(host(&batches[0]), Some(Value::str("web-1")), "Hostname is host.name");
     assert_eq!(host(&batches[1]), Some(Value::str("worker-1")));

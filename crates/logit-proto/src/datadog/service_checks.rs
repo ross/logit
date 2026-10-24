@@ -242,7 +242,7 @@ mod tests {
         assert_eq!(event.attributes.get(ATTR_SERVICE_CHECK_MESSAGE), Some(&Value::str("down")));
         assert_eq!(event.attributes.get(ATTR_HOST_NAME), Some(&Value::str("web1")));
         assert_eq!(event.attributes.get("_logit.statsd.service_check.host"), None);
-        assert_eq!(event.attributes.get("env"), Some(&Value::str("prod")));
+        assert_eq!(event.attributes.get("deployment.environment.name"), Some(&Value::str("prod")));
     }
 
     #[test]
