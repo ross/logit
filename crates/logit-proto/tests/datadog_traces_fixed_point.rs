@@ -89,12 +89,13 @@ fn assert_fixed_point(form: Form, body: &[u8]) -> Vec<EventBatch> {
     d1
 }
 
-/// The payload's hostname decodes to `host.name`; the retired carrier appears nowhere.
+/// The payload's hostname decodes to `host.name`, and no `_logit.datadog.tracer.hostname`
+/// attribute exists on any resource or event.
 fn assert_no_tracer_hostname_carrier(batch: &EventBatch) {
-    const RETIRED: &str = "_logit.datadog.tracer.hostname";
-    assert_eq!(batch.resource.attributes.get(RETIRED), None);
+    const CARRIER: &str = "_logit.datadog.tracer.hostname";
+    assert_eq!(batch.resource.attributes.get(CARRIER), None);
     for event in &batch.events {
-        assert_eq!(event.attributes.get(RETIRED), None);
+        assert_eq!(event.attributes.get(CARRIER), None);
     }
 }
 

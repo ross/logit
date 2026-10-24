@@ -249,7 +249,7 @@ After `host.name`, a sink reads only its family's hostless mark, then its fallba
 
 | Sink | Host, in order |
 |---|---|
-| `datadog_out` | `host.name` (event, else resource) in each route's own field; then the hostless mark (`_logit.datadog.hostless`, or a v2 `host` resource with no name), never filled; then the process hostname. A log carrying `syslog.hostname` or `host` gets no default: both are Datadog's own reserved log attributes |
+| `datadog_out` | `host.name` (event, else resource) in each route's own field; then the hostless mark (`_logit.datadog.hostless`, or a v2 `host` resource with no name), never filled; then the process hostname. A log carrying `syslog.hostname` or `host` gets no default: both are Datadog's own reserved log attributes. A trace or APM stats payload reads the resource's `host.name` only, has no hostless mark, and gets the process hostname only with no `_logit.datadog.agent.hostname` beside it |
 | `statsd_out` (`format: dogstatsd`) | `host.name` as a metric line's `host:` tag and an event's or service check's `h:` field; then the hostless mark as an empty `host:` tag; no fallback, since the Agent stamps its own. A valued `host` attribute beside either is omitted, counted, since the Agent would consume it as a second `host:` tag; a bare `host` token stays |
 
 The other rows of the ranks-first table are unchanged. The like-pair relays stay fixed points

@@ -410,7 +410,7 @@ fn intake_stats_payload_with_two_clients_is_a_fixed_point() {
         assert_eq!(a.get("_logit.datadog.agent.hostname"), Some(&Value::str("agent-7")));
         assert_eq!(a.get("_logit.datadog.stats.client_computed"), Some(&Value::Bool(true)));
         assert_eq!(a.get("_logit.datadog.stats.split_payload"), None);
-        assert_eq!(a.get("_logit.datadog.tracer.hostname"), None, "the carrier is retired");
+        assert_eq!(a.get("_logit.datadog.tracer.hostname"), None, "no such attribute exists");
     }
     let host = |b: &EventBatch| b.resource.attributes.get("host.name").cloned();
     assert_eq!(host(&batches[0]), Some(Value::str("web-1")), "Hostname is host.name");

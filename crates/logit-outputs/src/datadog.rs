@@ -920,8 +920,9 @@ impl DatadogOutput {
         self
     }
 
-    /// The host of a series, sketch, log, event, or service check that carries none of its own:
-    /// `logit run` passes the process hostname.
+    /// The host of a series, sketch, log, event, or service check that carries none of its own,
+    /// and of a trace or APM stats payload with no resource `host.name` and no relaying Agent's
+    /// hostname: `logit run` passes the process hostname.
     pub fn with_default_host(mut self, host: impl Into<Arc<str>>) -> Self {
         self.default_host = Some(host.into());
         self.encoder = self.new_encoder();
