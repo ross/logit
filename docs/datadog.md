@@ -373,9 +373,9 @@ Two cases lose a value, counted `logit.input.tags.omitted{reason="reserved_key"}
 - A second valued `env:`, `version:`, or `service:` entry loses to the first.
 
 A `service` attribute on a log reaching `datadog_out`, from a `json` transform's parse or a
-`set`, is left off, counted `logit.output.tags.omitted{reason="reserved_key"}`, since it would be
-a second `service` key in the object. Put the value in `service.name` instead, with a `lua` stage
-or a `set`.
+`set`, is the log's `service` when the log has no `service.name`. Beside a `service.name`, it's
+left off, counted `logit.output.tags.omitted{reason="reserved_key"}`, since it would be a second
+`service` key in the object.
 
 ### `at_least_once` can duplicate a request, and everything but series is stored twice
 

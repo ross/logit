@@ -356,19 +356,19 @@ A Datadog log's service, environment, and version decode onto `service.name`,
 
 | Wire form | Writes |
 |---|---|
-| a log's `service`, a non-empty string | `service.name`; an empty one is no service, and a non-string one stays the attribute `service` |
-| a log's `ddtags` `env:<v>`, `version:<v>`, and `service:<v>` entries (Unified Service Tagging's three tags) | `deployment.environment.name`, `service.version`, and `service.name`, each from the first entry with a non-empty value. The entries leave `ddtags`; every other entry stays in the one string, in order |
+| a log's `service`, a non-empty string | `service.name`; an empty one is no service, and a non-string one stays the attribute `service`, which still wins over the entries and fields below |
+| a log's `ddtags` `env:<v>`, `version:<v>`, and `service:<v>` entries (Unified Service Tagging's three tags) | `deployment.environment.name`, `service.version`, and `service.name`, each from the first entry with a non-empty value, else from a non-empty string field of the key's name the log already carries. The entries naming a key with a value leave `ddtags`; every other entry stays in the one string, in order |
 
 A protocol's own form beats a sender's: the log's `service` field beats a `ddtags` `service:`
 entry, the first valued entry a later one of the same key, and either a top-level field spelled
 like the key. Each loser is omitted, counted `logit.input.tags.omitted{reason="reserved_key"}`, as
 a `host.name` key beside a log's `hostname` is. `ddtags` isn't split further: a tag and a
-top-level field are different things in Datadog, and `datadog_out` writes every attribute as a
-field, so a relay would turn each split tag into a field.
+top-level field are different things in Datadog, and `datadog_out` writes every other attribute
+as a field, so a relay would turn each split tag into a field.
 
 | Sink | Log service identity |
 |---|---|
-| `datadog_out` | `service.name` (event, else resource) as the log's `service`; `deployment.environment.name` and `service.version` as `env:` and `version:` entries appended to `ddtags`, before `container_id:`, for any log, an OTLP log included. An entry already in `ddtags` naming one of them is omitted, counted `reason="reserved_key"`. A `service` attribute is omitted, counted `reason="reserved_key"`, beside `service.name` or not, as a `hostname` attribute is |
+| `datadog_out` | `service.name` (event, else resource) as the log's `service`; `deployment.environment.name` and `service.version` as `env:` and `version:` entries appended to `ddtags`, before `container_id:`, for any log, an OTLP log included. An entry already in `ddtags` naming one of them is omitted, counted `reason="reserved_key"`. A `service` attribute beside `service.name` is omitted, counted `reason="reserved_key"`; alone, it is the log's `service`, so a non-string `service` relays |
 | `otlp_out`, `splunk_hec_out`, and the other sinks | the keys as ordinary attributes |
 
 An `env` or `version` attribute on a log is an ordinary top-level field at `datadog_out`, beside

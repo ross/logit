@@ -848,7 +848,7 @@ datadog-agent 7.83.3 does with each form decided the mapping.
   `logit.input.tags.omitted{reason="reserved_key"}`. An empty `service` is no service, as an
   empty `hostname` is no host.
 - **Not a full split.** A tag and a top-level field are different things in Datadog, and
-  `datadog_out` writes every attribute as a top-level field, so splitting every `ddtags` entry
+  `datadog_out` writes every other attribute as a top-level field, so splitting every `ddtags` entry
   would turn each relayed tag into a field. The three lifted entries are the ones every route
   has a standard key for.
 - **The encode.** `datadog_out` writes `service.name` as the log's `service` and
@@ -857,9 +857,12 @@ datadog-agent 7.83.3 does with each form decided the mapping.
   log whose resource carries `deployment.environment.name` or `service.version` now reaches
   Datadog tagged `env:` and `version:`, the tags Datadog's OTLP mapping gives those keys
   (`pkg/opentelemetry-mapping-go/otlp/attributes/attributes.go`, `coreMapping`). A `service`
-  attribute is omitted, counted `logit.output.tags.omitted{reason="reserved_key"}`, as a
-  `hostname` attribute is: it would be a second `service` key in the object.
+  attribute beside `service.name` is omitted, counted
+  `logit.output.tags.omitted{reason="reserved_key"}`: it would be a second `service` key in the
+  object. Alone, it is the log's `service`, so a `service` that isn't a string, which
+  `service.name` can't hold, relays as it came.
 
 The logs relay stays a fixed point from the first hop on, modulo `logit_proto::datadog`'s
-permitted normalization (10): the lifted entries rejoin at the end of `ddtags`, and a `service:`
-entry beside the log's own `service` doesn't come back.
+permitted normalizations (5) and (10): the lifted entries rejoin at the end of `ddtags`, a
+`service:` entry beside the log's own `service` doesn't come back, and an empty or bare entry
+beside a key the log already carries is left off at the first decode.
