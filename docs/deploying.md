@@ -551,6 +551,30 @@ host as a `hostname` attribute, which this stage moves to `host.name`:
 `datadog_out` leaves a log's `hostname` attribute off, counted, because that key is Datadog's own
 field and the sink fills it from `host.name`, so the copy is what gets the file's host to Datadog.
 
+Telegraf's `host` tag is another example. Telegraf adds it to every point it writes unless
+`omit_hostname = true`, but line protocol defines no host field, so `influxdb_in` keeps it as the
+attribute `host`; the same stage with `host` in place of `hostname` makes it the host. Likewise
+`docker_in` writes no `host.name` unless you set `host_name: container`, which names each
+container as its own host (see [The host of a container's lines](#the-host-of-a-containers-lines)).
+
+### Common mappings
+
+Producers whose host operators usually want as the host, and where each puts it. Each attribute
+row uses the stage above with that row's attribute name:
+
+| Producer | Arrives through | Where the host is | Recipe |
+|---|---|---|---|
+| Telegraf, `outputs.influxdb_v2` | `influxdb_in` | the `host` tag on every point, an attribute `host` | copy `host` |
+| pino, pino-http | `tail_in` or `docker_in`, then `json` | the `hostname` field, an attribute `hostname` | copy `hostname` |
+| bunyan | `tail_in` or `docker_in`, then `json` | the `hostname` field, an attribute `hostname` | copy `hostname` |
+| semantic_logger (Ruby), JSON format | `tail_in` or `docker_in`, then `json` | the `host` field, an attribute `host` | copy `host` |
+| collectd `write_graphite`, Telegraf `outputs.graphite` | `graphite_in` | the metric path's first segment (`<host>.<plugin>...`, or Telegraf's default template `host.tags.measurement.field`), after any `prefix` | split the segment off the metric name in a `lua` stage; to label the whole stream instead, `set` a constant `host.name` |
+
+python-json-logger, structlog, Go's `log/slog`, and zap write no host by default; a `set` of a
+constant `host.name` names the host for a stream from one machine. collectd's binary `network`
+protocol, syslog's HOSTNAME, and the Datadog, Splunk HEC, and OTLP protocols carry the host in
+their own field, which their inputs write as `host.name` already.
+
 Three sinks also send it as the host of any event that carries none of its own. They never
 replace a host an event or its resource carries:
 
@@ -558,7 +582,7 @@ replace a host an event or its resource carries:
 |---|---|---|
 | `syslog_out` | `host.name` on the event, else on the resource | HOSTNAME, unless the sink sets its own `hostname:` |
 | `splunk_hec_out` | `host.name` on the event, else on the resource | each object's envelope `host` |
-| `datadog_out` | `host.name` on the event, else on the resource; else a hostless mark on a metric, event, or check, which stays hostless, or a log's `syslog.hostname` or `host`, which Datadog reads itself | the host of a metric, log, event, or service check |
+| `datadog_out` | `host.name` on the event, else on the resource; else a hostless mark on a metric, event, or check, which stays hostless, or a log's `syslog.hostname` or `host`, which Datadog reads itself | the host of a metric, log, event, or service check, and of a trace or stats payload with no relaying Agent's hostname |
 
 So a relay sends the relay's hostname for whatever arrived without one. Through `datadog_out`,
 that means every DogStatsD sender that names no host reports as one Datadog host, as it would
@@ -2344,6 +2368,14 @@ relabel the Docker daemon's own live state, which this stack doesn't own.
 Docker Desktop's paths live inside its VM, and Podman uses a different log format. None of these
 match `docker_in`'s `root:` default, the only layout this driver understands.
 
+### The host of a container's lines
+
+`docker_in` writes no `host.name` by default, so a sink that fills a missing host uses `logit`'s
+own hostname, the Docker host when `logit` runs on it, or the top-level `hostname:`. Set
+`host_name: container` to write each container's own hostname (`Config.Hostname`, usually its
+short id) as `host.name` instead; every container then reports as a host of its own, which at
+`datadog_out` can register a Datadog host per container. See [Hostname](#hostname).
+
 ### `read_from`, and why a checkpoint matters more here than for a plain UDP listener
 
 `read_from: end` (the default) skips what a file already holds and tails only new lines;
@@ -2501,8 +2533,8 @@ see [ADR
   therefore picked up as soon as the rewrite lands. Either way, it fires once per failure, not once
   per tick while the failure persists.
 - `logit.input.files.identity_changed` / `.deselected` (count, `docker_in` only): a container's
-  identity (name, image, or a watched label) changed, or a tracked container was renamed out of
-  `containers:` and stopped flowing. The matching `container_renamed`/`container_deselected`
+  identity (name, image, a watched label, or, under `host_name: container`, the hostname) changed,
+  or a tracked container was renamed out of `containers:` and stopped flowing. The matching `container_renamed`/`container_deselected`
   diagnostics name the container. **A deselection is process-local:** if `logit` restarts before the
   container is renamed back, the retained resume offset is lost.
 
@@ -3266,8 +3298,9 @@ socket (`receiver_socket`, `/var/run/datadog/apm.socket` by default), always pla
 
 **Pick `version` by where the spans came from.** `v0.4`, the default, is what most tracers send and
 every Agent accepts. It has no room for a trace chunk's fields (its sampling priority, origin, and
-tags) or for a tracer payload's hostname, environment, runtime ID, app version, and tags. Those
-are dropped and counted `logit.output.spans.degraded{reason="no_wire_form"}`. A tracer that sent
+tags) or for a tracer payload's environment, runtime ID, app version, and tags. Those are dropped
+and counted `logit.output.spans.degraded{reason="no_wire_form"}`; the payload's hostname, the
+resource's `host.name`, goes out as every span's `host.name` tag. A tracer that sent
 v0.4 never had them, so v0.4 relays its spans with nothing lost. If your tracers send `/v0.7/traces`,
 set `version: v0.7`, which carries all of them. The tracer's language, versions, container ID, and
 the rest of its request headers go out as the same headers under either version.

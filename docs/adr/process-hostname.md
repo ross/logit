@@ -99,8 +99,10 @@ hostname amendment of [ADR `datadog-agent-and-intake-relay`](datadog-agent-and-i
 lists the hostless spellings. The Consequences' recipe for host-less `internal` events, a `remove` of
 `host.name` after `internal`, now holds only for `collectd_out`: the other three sinks fill the
 removed host back in with the same name. Trace and stats hostnames in `datadog_out` and everything in
-`datadog_trace_out` stay verbatim relay metadata. `collectd_out` is unchanged, for the reason in
-the Decision above.
+`datadog_trace_out` stay verbatim relay metadata. Superseded (2026-10-23): a trace or stats
+payload's hostname is the resource's `host.name`, and `datadog_out` fills a missing one only where
+no Agent hostname rides beside it ("Amendment: a source fills the common keys (2026-10-23)"
+below). `collectd_out` is unchanged, for the reason in the Decision above.
 
 ## Amendment: `datadog_out` reads `collectd.host` (2026-10-22)
 
@@ -231,6 +233,8 @@ For the host, the Datadog family's decoders now apply that rule:
 | `datadog_in` service check `host_name` | `host.name`; `""` is the hostless mark, as for a series |
 | `statsd_in` metric line, event, or service check `host:` tag | `host.name`, the last one when there are several, never a tag; an empty one is the hostless mark |
 | `statsd_in` event or service check `h:` field | `host.name`, ahead of a `host:` tag; an empty one is no host, and the tag applies |
+| `datadog_in` traces and `datadog_trace_in` `/v0.7/traces`: a `TracerPayload`'s `hostname` | `host.name` on the batch resource, one payload per batch; `""` is no host. v0.3 to v0.5 have no such field |
+| `datadog_in` and `datadog_trace_in` APM stats: a `ClientStatsPayload`'s `Hostname` | `host.name` on the batch resource, one payload per batch; `""` is no host |
 
 That is how a DogStatsD Agent reads a line (datadog-agent 7.83.3,
 `comp/dogstatsd/server/impl/enrich.go`, `extractTagsMetadata` and `enrichEvent`). A record's own
@@ -258,7 +262,7 @@ The common keys today, and who writes each:
 
 | Key | Written by, from |
 |---|---|
-| `host.name` | `collectd_in` from each value list's host part, on the event; `syslog_in` from HOSTNAME, on the event; `statsd_in` and `datadog_in` from the wire hosts above, on the event; `splunk_hec_in` from each object's `host`, on the resource; `internal` from the process hostname, on the resource; `otlp_in` passes the sender's resource and record attributes through, which already use the standard key |
+| `host.name` | `collectd_in` from each value list's host part, on the event; `syslog_in` from HOSTNAME, on the event; `statsd_in` and `datadog_in` from the wire hosts above, on the event; `datadog_in`'s traces and stats routes and `datadog_trace_in` from each tracer or stats payload's hostname, on the resource; `splunk_hec_in` from each object's `host`, on the resource; `docker_in` under `host_name: container` from the container's `Config.Hostname`, on the resource, and otherwise not at all; `internal` from the process hostname, on the resource; `otlp_in` passes the sender's resource and record attributes through, which already use the standard key |
 | `service.name` | `internal`, on the resource; `datadog_in` (its traces route) and `datadog_trace_in` from each span's `service`, on the span's event, and their APM stats routes (`datadog_in`'s stats route, `datadog_trace_in`'s `/v0.6/stats`) from each `ClientGroupedStats`' `Service`, on the group's event; `otlp_in` passes it through; otherwise an operator's `set`. A Datadog log's `service` stays the attribute `service`, which `datadog_out` writes back as the log's `service` |
 | `network.peer.*`, `client.*` | every network listener but `logit_in`, opt-in ([ADR `listener-peer-address`](listener-peer-address.md)) |
 | the `_logit.metrics.*` flags | decoders, where the flag says the whole fact ([ADR `metric-flags`](metric-flags.md)) |
@@ -266,20 +270,37 @@ The common keys today, and who writes each:
 `replay_in` and `logit_in` deliver whatever a source upstream wrote; `generate_in` writes what
 its template says.
 
-**Not yet applied.** These sources have a host field in their protocol and don't write
-`host.name`; each is its own follow-up, not part of this amendment:
+Settled, and not follow-ups:
 
-- `influxdb_in`: a line-protocol tag named `host`, which Telegraf adds to every point by default,
-  stays the tag `host`.
-- `docker_in`: a container's `config.v2.json` names its `Config.Hostname`, which isn't read.
-- `datadog_in`'s and `datadog_trace_in`'s trace and APM stats payloads: the `TracerPayload` and
-  `ClientStatsPayload` `hostname` (`_logit.datadog.tracer.hostname`) and the Agent's own
-  `hostName`/`internalHostname` (`_logit.datadog.agent.hostname`, also an events envelope's) are
-  payload metadata the trace sinks restore verbatim for the Agent's trace processing, and the
-  Agent's is the relaying Agent's identity, not a sender's host. They stay carriers.
+- `prometheus_in`'s `instance` and `job` labels are Prometheus target identity, not a host, and
+  stay labels.
+- `graphite_in`, `lines_in`, and `tail_in` have no protocol host field, so any host they carry is
+  the operator's to put in `host.name`, as the rule above says.
+- `influxdb_in` writes no `host.name`. Line protocol defines no host field: Telegraf's `host` tag,
+  which it adds to every point by default, is one producer's convention, and `influxdb_in` can't
+  know what every producer that speaks line protocol means by its tags. The tag stays the tag
+  `host`; an operator who wants it as the host copies it to `host.name` with a `lua` stage, as
+  for any other host.
+- `docker_in` writes no `host.name` by default. A container's `Config.Hostname` in
+  `config.v2.json` is the container's own hostname, usually its short id, so writing it by
+  default would make every container its own host, and at `datadog_out` a new Datadog host per
+  container. With none, a sink's process-hostname fallback names the host `logit` runs on, the
+  Docker host. `host_name: container` writes it, on the resource beside `container.id`, for an
+  operator who wants each container as a host
+  ([ADR `file-tailing-and-docker-json-logs`](file-tailing-and-docker-json-logs.md)'s
+  "Amendment: `host.name` is opt-in (2026-10-23)").
+- A tracer or stats payload's hostname is the host of its spans or stats, so `datadog_in` and
+  `datadog_trace_in` write it as the batch resource's `host.name`, and
+  `_logit.datadog.tracer.hostname` is retired. A datadog-agent 7.83.3 Agent sets
+  `TracerPayload.Hostname` from the tracer's payload, else from the root span's `_dd.hostname`
+  (`pkg/trace/agent/agent.go`, `setPayloadAttributes`), and never from its own hostname: it sends
+  its own beside the payloads, as `AgentPayload.HostName` (`pkg/trace/writer/trace.go`). So an
+  empty one has no hostless reading; it is no host. The Agent's own hostname
+  (`_logit.datadog.agent.hostname`, an `AgentPayload`'s `hostName`, a `StatsPayload`'s
+  `AgentHostname`, or an events envelope's `internalHostname`) is the relaying Agent's identity,
+  not a sender's host, and stays a carrier
+  ([ADR `datadog-agent-and-intake-relay`](datadog-agent-and-intake-relay.md)'s "Amendment: the
+  tracer hostname is `host.name` (2026-10-23)").
 
-Settled, and not follow-ups: `prometheus_in`'s `instance` and `job` labels are Prometheus target
-identity, not a host, and stay labels; and `graphite_in`, `lines_in`, and `tail_in` have no
-protocol host field, so any host they carry is the operator's to put in `host.name`, as the rule
-above says.
+Every source with a protocol host field now writes it, or is settled above as not having one.
 

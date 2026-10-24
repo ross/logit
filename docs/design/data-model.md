@@ -111,7 +111,9 @@ for which wire form names the host, and a sink uses it: no sink reconstructs a h
 form, and a wire host doesn't survive as a carrier beside `host.name`. A source writes it at the
 scope where it is identity: `collectd_in`, `syslog_in`, `statsd_in`, and `datadog_in` on each
 event, since their senders name a host per value list, line, or item, `splunk_hec_in` on the
-resource of each object's batch, and `internal` on its resource. A sink that needs a host reads a
+resource of each object's batch, `datadog_in` and `datadog_trace_in` on the resource of each
+tracer or stats payload's batch, `docker_in` on each container's resource only under
+`host_name: container`, and `internal` on its resource. A sink that needs a host reads a
 non-empty `host.name` off the event, else the resource, then its family's hostless mark where it
 has one, and falls back to the process hostname or its own `hostname:`. No sink reads another
 family's host key ([ADR `process-hostname`](../adr/process-hostname.md)'s "Amendment: a source
