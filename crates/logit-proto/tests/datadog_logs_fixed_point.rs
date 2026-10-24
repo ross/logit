@@ -125,8 +125,9 @@ fn agent_log_item() {
 }
 
 /// `ddtags`' `env:`, `version:`, and `service:` entries, lifted onto the standard keys, with
-/// and without a `service` field, a later entry of a lifted key, and no other entry. The lifted
-/// entries rejoin at the end of the string from the first hop on.
+/// and without a `service` field (a string or not), a later entry of a lifted key, no other
+/// entry, and a key the log carries as a field beside an empty or bare entry of its tag. The
+/// lifted entries rejoin at the end of the string from the first hop on.
 #[test]
 fn log_service_identity_entries() {
     for body in [
@@ -135,6 +136,12 @@ fn log_service_identity_entries() {
         r#"[{"message":"a","ddtags":"env:prod"}]"#,
         r#"[{"message":"a","ddtags":"env:,version,team:a,container_id:c1"}]"#,
         r#"[{"message":"a","service":"web"}]"#,
+        r#"[{"message":"a","service":7,"ddtags":"service:api,team:a"}]"#,
+        // A key already among the log's fields, beside an empty or bare entry of its tag.
+        r#"[{"message":"a","service.name":"x","ddtags":"team:a,service"}]"#,
+        r#"[{"message":"a","service.name":"x","ddtags":"service:"}]"#,
+        r#"[{"message":"a","deployment.environment.name":"p","ddtags":"env,team:a"}]"#,
+        r#"[{"message":"a","service.version":"v","ddtags":"version:"}]"#,
     ] {
         assert_logs_fixed_point(body.as_bytes());
     }
@@ -243,7 +250,7 @@ fn log_item() -> impl Strategy<Value = Json> {
         ])),
         log_timestamp(),
         opt("[a-z0-9.-]{0,10}"),
-        opt("[a-z_]{0,8}"),
+        opt(prop_oneof!["[a-z_]{0,8}".prop_map(Json::String), json_leaf()]),
         opt("[a-z]{0,8}"),
         opt(ddtags()),
         prop::collection::btree_map("x[a-z_.]{0,6}", json_value(), 0..5),
@@ -256,7 +263,7 @@ fn log_item() -> impl Strategy<Value = Json> {
                     ("status", status.map(|s| json!(s))),
                     ("timestamp", timestamp),
                     ("hostname", hostname.map(Json::String)),
-                    ("service", service.map(Json::String)),
+                    ("service", service),
                     ("ddsource", ddsource.map(Json::String)),
                     ("ddtags", ddtags.map(Json::String)),
                 ] {

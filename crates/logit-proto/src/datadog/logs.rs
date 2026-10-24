@@ -176,16 +176,26 @@ impl DatadogDecoder {
     }
 
     /// Writes the log's `service` and its `ddtags` `env:`, `version:`, and `service:` entries
-    /// onto [`LIFTED`]'s keys. Per key, the winner is the log's own `service` (a non-empty
-    /// string) for `service.name`, else the first entry with a non-empty value; it displaces a
-    /// key of the same name among the log's other fields. Every other entry naming the key is
-    /// left out of `ddtags`, and each loser is counted. A `ddtags` with nothing lifted stays as
-    /// it came, and one emptied by the lift is no attribute.
+    /// onto [`LIFTED`]'s keys. Per key, the winner is the log's own `service` for `service.name`,
+    /// else the first entry with a non-empty value, else a non-empty `Str` the log already
+    /// carries under the key's name, which stays as it is. A string `service` or a winning entry
+    /// displaces a field of the key's name. Every other entry naming a key with a winner is left
+    /// out of `ddtags`, and each loser is counted. A `ddtags` with nothing left out stays as it
+    /// came, and one emptied is no attribute.
+    ///
+    /// A `service` that isn't a string wins too but stays the attribute `service`, since
+    /// `service.name` is a string; the encoder writes it back as the `service` field. An empty
+    /// `service` is no service.
     fn lift_service_identity(&mut self, obj: &serde_json::Map<String, Json>, attrs: &mut AttrMap) {
         let mut winners: [Option<&str>; 3] = [None; 3];
-        if let Some(Json::String(service)) = obj.get(ATTR_SERVICE) {
-            attrs.remove(ATTR_SERVICE);
-            winners[2] = Some(service.as_str()).filter(|s| !s.is_empty());
+        let mut service_kept = false;
+        match obj.get(ATTR_SERVICE) {
+            Some(Json::String(service)) => {
+                attrs.remove(ATTR_SERVICE);
+                winners[2] = Some(service.as_str()).filter(|s| !s.is_empty());
+            }
+            Some(_) => service_kept = true,
+            None => {}
         }
         let ddtags = match obj.get(ATTR_DDTAGS) {
             Some(Json::String(ddtags)) => ddtags.as_str(),
@@ -198,18 +208,23 @@ impl DatadogDecoder {
         for (index, tag) in split_joined(ddtags).enumerate() {
             if let Some(at) = entry_key(tag) {
                 let value = tag.split_once(':').map_or("", |(_, value)| value);
-                if winners[at].is_none() && !value.is_empty() {
+                if winners[at].is_none() && !(at == 2 && service_kept) && !value.is_empty() {
                     winners[at] = Some(value);
                     lifted_entry[at] = Some(index);
                 }
             }
         }
         let mut omitted = 0;
+        let won: [bool; 3] = std::array::from_fn(|at| {
+            winners[at].is_some()
+                || (at == 2 && service_kept)
+                || attrs.get(LIFTED[at].1).and_then(Value::as_str).is_some_and(|v| !v.is_empty())
+        });
         let mut rewritten = false;
         let mut rest: Vec<&str> = Vec::new();
         for (index, tag) in split_joined(ddtags).enumerate() {
             match entry_key(tag) {
-                Some(at) if winners[at].is_some() => {
+                Some(at) if won[at] => {
                     rewritten = true;
                     if lifted_entry[at] != Some(index) {
                         omitted += 1;
@@ -224,6 +239,9 @@ impl DatadogDecoder {
             } else {
                 attrs.insert(ATTR_DDTAGS, Value::str(rest.join(",")));
             }
+        }
+        if service_kept && attrs.remove(ATTR_SERVICE_NAME).is_some() {
+            omitted += 1;
         }
         for ((_, key), winner) in LIFTED.iter().zip(winners) {
             if let Some(value) = winner {
@@ -352,14 +370,27 @@ impl DatadogEncoder {
         if find(keys.hostname).is_some() {
             self.telemetry.count("logit.output.tags.omitted", 1.0, &[("reason", "reserved_key")]);
         }
-        // `service.name` is the log's `service`. A `service` attribute would collide with it, so
-        // it's omitted, `service.name` or not, as a `hostname` attribute is.
+        // `service.name` is the log's `service`, and a `service` attribute beside it would be a
+        // second, so it's omitted. Alone, the attribute is the field: a decoded log's `service`
+        // that isn't a string is one.
         consumed.push(keys.service_name);
-        if let Some(service) = find(keys.service_name).filter(|v| v.as_str() != Some("")) {
-            write_value(obj.key("service"), service);
-        }
-        if find(keys.service).is_some() {
-            self.telemetry.count("logit.output.tags.omitted", 1.0, &[("reason", "reserved_key")]);
+        let service = find(keys.service);
+        match find(keys.service_name).filter(|v| v.as_str() != Some("")) {
+            Some(name) => {
+                write_value(obj.key("service"), name);
+                if service.is_some() {
+                    self.telemetry.count(
+                        "logit.output.tags.omitted",
+                        1.0,
+                        &[("reason", "reserved_key")],
+                    );
+                }
+            }
+            None => {
+                if let Some(service) = service {
+                    write_value(obj.key("service"), service);
+                }
+            }
         }
         if let Some(source) = find(keys.ddsource) {
             write_value(obj.key("ddsource"), source);
@@ -573,7 +604,7 @@ pub(super) mod tests {
     /// `deployment.environment.name` and `service.version`, from the event or the resource (an
     /// OTLP log's), leave as `env:` and `version:` entries appended to `ddtags` before
     /// `container_id:`, and an entry of either name already in the string loses, counted. A
-    /// `service` attribute is omitted, counted, beside `service.name` or not.
+    /// `service` attribute is omitted beside `service.name`, counted.
     #[test]
     fn service_identity_keys_leave_as_ddtags_entries_and_the_service_field() {
         let registry = Registry::new();
@@ -625,6 +656,36 @@ pub(super) mod tests {
         assert_eq!(
             once,
             r#"[{"message":"m","timestamp":1690000000000,"service":"web","ddtags":"team:a,env:prod,version:2"}]"#
+        );
+        assert_eq!(encode(&decode(&once)), once);
+    }
+
+    /// A `service` that isn't a string stays the attribute `service`, wins over a `service:`
+    /// entry and a `service.name` field, each counted, and relays as the `service` field; a
+    /// `service` attribute with no `service.name` beside it is the field.
+    #[test]
+    fn a_non_string_service_relays_as_the_service_field() {
+        let registry = Registry::new();
+        let mut decoder = DatadogDecoder::new().with_telemetry(registry.telemetry_for(
+            "datadog_in",
+            "datadog_in",
+            "listener",
+        ));
+        let batch = decoder
+            .decode_logs(
+                br#"[{"message":"m","service":7,"service.name":"x","ddtags":"service:a,team:b"}]"#,
+                RECEIVED_AT,
+            )
+            .unwrap();
+        let attrs = &batch.events[0].attributes;
+        assert_eq!(attrs.get("service"), Some(&Value::I64(7)));
+        assert_eq!(attrs.get(ATTR_SERVICE_NAME), None);
+        assert_eq!(attrs.get("ddtags"), Some(&Value::str("team:b")));
+        assert_eq!(counted(&registry, "logit.input.tags.omitted", ("reason", "reserved_key")), 2.0);
+        let once = encode(&batch);
+        assert_eq!(
+            once,
+            r#"[{"message":"m","timestamp":1690000000000,"service":7,"ddtags":"team:b"}]"#
         );
         assert_eq!(encode(&decode(&once)), once);
     }
