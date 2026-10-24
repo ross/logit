@@ -366,6 +366,13 @@ whatever source wrote it:
   receiver fills from `container.id` (`pkg/trace/api/otlp.go`, `receiveResourceSpansV1` and
   `receiveResourceSpansV2`), and as the tracer API's `Datadog-Container-ID` header at
   `datadog_trace_out`.
+- On traces and APM stats, each key in the payload's own field: `service.name` as a span's or
+  stats group's `service` and a stats payload's `Service`; `deployment.environment.name` as a
+  span's `env` meta, the `TracerPayload`'s `env`, and a stats payload's `Env`; `service.version`
+  as a span's `version` meta, the `TracerPayload`'s `app_version`, and a stats payload's
+  `Version`; `container.id` as a stats payload's `ContainerID`; and `container.image.tags` as a
+  stats payload's `ImageTag` (the first-element rule below). A span or group value is read
+  from the event, and a payload field from the resource, by the scope rule above.
 - On a log, `container.id` appended to `ddtags` as `container_id:<id>`, as the Agent tags a
   container's logs. A `container_id:` entry already in the log's `ddtags` loses to the key,
   removed and counted `reason="reserved_key"`, as a log's `hostname` beside `host.name` is.
