@@ -9,7 +9,7 @@
     {"sink":"datadog_out","row":"attributes/private_carrier","cell":0,"observed":["exact","lost"]},
     {"sink":"datadog_out","row":"attributes/rate","cell":0,"observed":["exact"]},
     {"sink":"datadog_out","row":"attributes/service_identity","cell":0,"observed":["exact"]},
-    {"sink":"datadog_out","row":"attributes/service_tag","cell":0,"observed":["exact","normalized"]},
+    {"sink":"datadog_out","row":"attributes/service_tag","cell":0,"observed":["normalized"]},
     {"sink":"datadog_out","row":"attributes/string_value","cell":0,"observed":["exact"]},
     {"sink":"datadog_out","row":"distribution","cell":0,"observed":["exact"]},
     {"sink":"datadog_out","row":"gauge/f64","cell":0,"observed":["exact"]},
