@@ -964,8 +964,8 @@ Each stats record already summarizes its own time bucket, so a window corrupts i
 So the event passes through whole, and each record counts `bucketed`. The name says the criterion:
 the record belongs to a time bucket its source closed and the sink rebuilds. `pre_aggregated` would
 overstate it, because `aggregate` still merges other summaries, such as the Agent's per-interval
-sketches. The check is `logit_proto::datadog::is_datadog_stats`, the
-predicate the stats routes use, so the two can't disagree about what's stats. It runs before the
+sketches. The detection is the `_logit.metrics.closed` flag
+(see "Amendment: the decoders set flags, and `aggregate` reads them" below), which runs before the
 timestamped check.
 
 Passing stats through doesn't change how sketches merge. A series opens with an empty sketch
