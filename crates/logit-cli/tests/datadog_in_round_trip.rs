@@ -26,9 +26,7 @@ use logit_proto::datadog::stats::{
     ATTR_BUCKET_DURATION, ATTR_STATS_NAME, METRIC_DURATION, METRIC_ERRORS, METRIC_HITS,
     METRIC_TOP_LEVEL_HITS,
 };
-use logit_proto::datadog::{
-    DatadogDecoder, DatadogEncoder, ATTR_SERVICE_NAME, RESOURCE_ATTR_TRACER_HOSTNAME,
-};
+use logit_proto::datadog::{DatadogDecoder, DatadogEncoder, ATTR_HOST_NAME, ATTR_SERVICE_NAME};
 use prost::Message;
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -328,7 +326,7 @@ fn traces() -> Vec<Case> {
 /// fixed point.
 fn stats() -> Case {
     let mut resource = Resource::default();
-    resource.attributes.insert(RESOURCE_ATTR_TRACER_HOSTNAME, Value::str("web-1"));
+    resource.attributes.insert(ATTR_HOST_NAME, Value::str("web-1"));
     let mut attributes = AttrMap::new();
     attributes.insert(ATTR_STATS_NAME, Value::str("http.request"));
     attributes.insert(ATTR_SERVICE_NAME, Value::str("checkout"));

@@ -31,8 +31,10 @@
 //! There are no per-sink host, service, source, or tag fields (ADR decision 10): the encoders read
 //! them from each event's attributes and the batch resource, so an upstream `set` stamps them. A
 //! series, sketch, log, event, or service check that carries no host gets the process hostname
-//! ([`DatadogOutput::with_default_host`]); trace and stats payloads keep their own hostnames
-//! verbatim. Graph rule 66 validates the block.
+//! ([`DatadogOutput::with_default_host`]). A trace or stats payload's hostname is its resource's
+//! `host.name`. It gets the process hostname only when it has neither that nor a relaying
+//! Agent's hostname: an Agent sends an empty one beside its own. Graph rule 66 validates the
+//! block.
 //!
 //! ## Routes
 //!

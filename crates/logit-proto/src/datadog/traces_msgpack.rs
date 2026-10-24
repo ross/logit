@@ -1390,14 +1390,14 @@ mod tests {
     }
 
     /// A tracer header's carrier never becomes a span tag. Under the tracer-API encoder its header
-    /// carries it, so only the carriers no header has (the hostname) count as lost; the plain
+    /// carries it, so only the carriers no header has (the runtime id) count as lost; the plain
     /// encoder counts every one.
     #[test]
     fn tracer_header_carriers_are_never_span_tags_and_count_only_when_no_header_carries_them() {
         use crate::datadog::traces::RESOURCE_ATTR_TRACER_LANGUAGE_VERSION;
         use crate::datadog::{
             RESOURCE_ATTR_TRACER_CLIENT_COMPUTED_STATS, RESOURCE_ATTR_TRACER_DROPPED_P0_SPANS,
-            RESOURCE_ATTR_TRACER_ENTITY_ID, RESOURCE_ATTR_TRACER_HOSTNAME,
+            RESOURCE_ATTR_TRACER_ENTITY_ID, RESOURCE_ATTR_TRACER_RUNTIME_ID,
         };
         let mut resource = Resource::default();
         for (key, value) in [
@@ -1406,7 +1406,7 @@ mod tests {
             (RESOURCE_ATTR_TRACER_ENTITY_ID, Value::str("ci-1")),
             (RESOURCE_ATTR_TRACER_CLIENT_COMPUTED_STATS, Value::Bool(true)),
             (RESOURCE_ATTR_TRACER_DROPPED_P0_SPANS, Value::U64(3)),
-            (RESOURCE_ATTR_TRACER_HOSTNAME, Value::str("web-1")),
+            (RESOURCE_ATTR_TRACER_RUNTIME_ID, Value::str("rt-1")),
         ] {
             resource.attributes.insert(key, value);
         }
@@ -1430,7 +1430,7 @@ mod tests {
         let again = d.decode_traces_v04(&out.body, 0).unwrap();
         assert!(again.events[0].attributes.is_empty(), "{:?}", again.events[0].attributes);
         let lost = counted(&registry, "logit.output.spans.degraded", ("reason", "no_wire_form"));
-        assert_eq!(lost, 1.0, "the hostname alone");
+        assert_eq!(lost, 1.0, "the runtime id alone");
 
         let (_, mut e, registry) = with_registry();
         reasons(&registry);
@@ -1445,7 +1445,7 @@ mod tests {
         let again = d.decode_tracer_payload_v07(&out.body, 0).unwrap();
         assert!(again.events[0].attributes.is_empty());
         let res = &again.resource.attributes;
-        assert_eq!(res.get(RESOURCE_ATTR_TRACER_HOSTNAME), Some(&Value::str("web-1")));
+        assert_eq!(res.get(RESOURCE_ATTR_TRACER_RUNTIME_ID), Some(&Value::str("rt-1")));
         assert_eq!(res.get(RESOURCE_ATTR_TRACER_ENTITY_ID), None, "no payload field");
         let lost = counted(&registry, "logit.output.spans.degraded", ("reason", "no_wire_form"));
         assert_eq!(lost, 0.0);

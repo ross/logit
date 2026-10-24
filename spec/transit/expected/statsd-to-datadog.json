@@ -129,22 +129,22 @@
     "logit.output.metrics.skipped{component=out,kind=datadog_out,metric_kind=set_members,role=sink}": 1
   }},
   "span-beside-metrics": {"events": [
-    {"timestamp":"2027-01-15T08:00:00.000000000Z","span":{"name":"GET /api","trace_id":"0102030405060708090a0b0c0d0e0f10","span_id":"0102030405060708","kind":"server","status":"unset","start":"2027-01-15T08:00:00.000000000Z","end":"2027-01-15T08:00:00.250000000Z","duration_ns":250000000},"attributes":{"_dd.p.tid":"0102030405060708","span.kind":"server"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","span":{"name":"GET /api","trace_id":"0102030405060708090a0b0c0d0e0f10","span_id":"0102030405060708","kind":"server","status":"unset","start":"2027-01-15T08:00:00.000000000Z","end":"2027-01-15T08:00:00.250000000Z","duration_ns":250000000},"attributes":{"_dd.p.tid":"0102030405060708","span.kind":"server"},"resource":{"attributes":{"host.name":"transit"}}},
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"requests.inflight","kind":"gauge","value":3.0}],"attributes":{"host.name":"transit"},"resource":{"attributes":{"_logit.datadog.units":"datadog"}}}
   ], "counters": {
     "logit.output.spans.degraded{component=out,kind=datadog_out,reason=no_wire_form,role=sink}": 1
   }},
   "span-client": {"events": [
-    {"timestamp":"2027-01-15T08:00:00.000000000Z","span":{"name":"GET /orders","trace_id":"0a0b0c0d0e0f10110102030405060708","span_id":"1112131415161718","kind":"client","status":"unset","start":"2027-01-15T08:00:00.000000000Z","end":"2027-01-15T08:00:00.100000000Z","duration_ns":100000000},"attributes":{"_dd.p.tid":"0a0b0c0d0e0f1011","span.kind":"client"}}
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","span":{"name":"GET /orders","trace_id":"0a0b0c0d0e0f10110102030405060708","span_id":"1112131415161718","kind":"client","status":"unset","start":"2027-01-15T08:00:00.000000000Z","end":"2027-01-15T08:00:00.100000000Z","duration_ns":100000000},"attributes":{"_dd.p.tid":"0a0b0c0d0e0f1011","span.kind":"client"},"resource":{"attributes":{"host.name":"transit"}}}
   ], "counters": {}},
   "span-only": {"events": [
-    {"timestamp":"2027-01-15T08:00:00.000000000Z","span":{"name":"GET /api","trace_id":"0102030405060708090a0b0c0d0e0f10","span_id":"0102030405060708","kind":"server","status":"unset","start":"2027-01-15T08:00:00.000000000Z","end":"2027-01-15T08:00:00.250000000Z","duration_ns":250000000},"attributes":{"_dd.p.tid":"0102030405060708","span.kind":"server"}}
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","span":{"name":"GET /api","trace_id":"0102030405060708090a0b0c0d0e0f10","span_id":"0102030405060708","kind":"server","status":"unset","start":"2027-01-15T08:00:00.000000000Z","end":"2027-01-15T08:00:00.250000000Z","duration_ns":250000000},"attributes":{"_dd.p.tid":"0102030405060708","span.kind":"server"},"resource":{"attributes":{"host.name":"transit"}}}
   ], "counters": {
     "logit.output.spans.degraded{component=out,kind=datadog_out,reason=no_wire_form,role=sink}": 1
   }},
   "span-pair": {"events": [
-    {"timestamp":"2027-01-15T08:00:00.000000000Z","span":{"name":"GET /cart","trace_id":"2122232425262728090a0b0c0d0e0f10","span_id":"3132333435363738","kind":"server","status":"unset","start":"2027-01-15T08:00:00.000000000Z","end":"2027-01-15T08:00:00.200000000Z","duration_ns":200000000},"attributes":{"_dd.p.tid":"2122232425262728","span.kind":"server"}},
-    {"timestamp":"2027-01-15T08:00:00.010000000Z","span":{"name":"SELECT cart","trace_id":"2122232425262728090a0b0c0d0e0f10","span_id":"4142434445464748","parent_span_id":"3132333435363738","kind":"client","status":"unset","start":"2027-01-15T08:00:00.010000000Z","end":"2027-01-15T08:00:00.050000000Z","duration_ns":40000000},"attributes":{"span.kind":"client"}}
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","span":{"name":"GET /cart","trace_id":"2122232425262728090a0b0c0d0e0f10","span_id":"3132333435363738","kind":"server","status":"unset","start":"2027-01-15T08:00:00.000000000Z","end":"2027-01-15T08:00:00.200000000Z","duration_ns":200000000},"attributes":{"_dd.p.tid":"2122232425262728","span.kind":"server"},"resource":{"attributes":{"host.name":"transit"}}},
+    {"timestamp":"2027-01-15T08:00:00.010000000Z","span":{"name":"SELECT cart","trace_id":"2122232425262728090a0b0c0d0e0f10","span_id":"4142434445464748","parent_span_id":"3132333435363738","kind":"client","status":"unset","start":"2027-01-15T08:00:00.010000000Z","end":"2027-01-15T08:00:00.050000000Z","duration_ns":40000000},"attributes":{"span.kind":"client"},"resource":{"attributes":{"host.name":"transit"}}}
   ], "counters": {}},
   "sub-millisecond": {"events": [
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"queue.depth","kind":"gauge","value":4.0}],"attributes":{"host.name":"transit"},"resource":{"attributes":{"_logit.datadog.units":"datadog"}}}

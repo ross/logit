@@ -558,7 +558,8 @@ decisions above use the new spelling. Four things follow for the Datadog pairs:
 host of a series, distribution point, sketch, log, event, or service check that carries none of
 its own. Decision 10 stands: there's no per-sink host field, and a host the event or its resource
 carries always wins. Trace and stats payloads keep their tracer and Agent hostnames verbatim, and
-`datadog_trace_out` is unchanged.
+`datadog_trace_out` is unchanged. Superseded (2026-10-23) for the tracer hostname: "Amendment: the
+tracer hostname is `host.name` (2026-10-23)" below.
 
 - **A DogStatsD `host:` tag is a host.** `statsd_in` decodes `#host:web1` to the attribute
   `host`. With no `host.name`, or an empty one, a `Str` `host` is the host and isn't sent as a tag, as the Agent's
@@ -725,3 +726,53 @@ The relay stays a fixed point modulo the codec's lists, which name the change
 or key beside its own host no longer relays as the host. Events, checks, and logs now read back
 with `host.name` where they had the carrier or the `hostname` attribute.
 
+## Amendment: the tracer hostname is `host.name` (2026-10-23)
+
+A `TracerPayload`'s `hostname` and a `ClientStatsPayload`'s `Hostname` name the host of the
+spans or stats they carry, so under [ADR `process-hostname`](process-hostname.md)'s "Amendment: a
+source fills the common keys (2026-10-23)" the source writes them as `host.name`. The carrier
+`_logit.datadog.tracer.hostname` is retired: nothing writes or reads it.
+
+What an Agent puts there, in datadog-agent 7.83.3:
+
+- `pkg/trace/api/api.go`, `decodeTracerPayload`: a v0.7 body is the tracer's own
+  `TracerPayload`, `hostname` included; a v0.1 to v0.5 body has no such field, and the Agent
+  builds a payload with an empty one.
+- `pkg/trace/agent/agent.go`, `setPayloadAttributes`: an empty `TracerPayload.Hostname` takes the
+  root span's `_dd.hostname` meta ("Older tracers set tracer hostname in the root span"). Nothing
+  fills it with the Agent's own hostname.
+- `pkg/trace/writer/trace.go`: the Agent's hostname goes beside the payloads, as
+  `AgentPayload.HostName`; `pkg/trace/stats/client_stats_aggregator.go` does the same for stats,
+  as `StatsPayload.AgentHostname`, keeping each `ClientStatsPayload`'s `Hostname` as its
+  aggregation key's. `stats.proto` describes `Hostname` as "the tracer hostname".
+
+So the field is the application host when a tracer names one, and empty otherwise; an empty one
+has no hostless reading. The mapping:
+
+- **Decode.** A non-empty `hostname` or `Hostname` is the batch resource's `host.name`, on
+  `datadog_in`'s traces and stats routes and on `datadog_trace_in`'s `/v0.7/traces` and
+  `/v0.6/stats`. A batch is one `TracerPayload` or one `ClientStatsPayload`, so the resource is
+  the scope where it is identity. An empty one writes nothing; v0.3 to v0.5 have nothing to write.
+  `datadog_trace_in` doesn't apply `setPayloadAttributes`'s `_dd.hostname` fallback: that is Agent
+  processing, which this relay leaves to the Agent behind `datadog_trace_out`, and the span tag
+  relays unchanged for it.
+- **The Agent's hostname stays a carrier.** `AgentPayload.hostName`, `StatsPayload.AgentHostname`,
+  and an events envelope's `internalHostname` (`_logit.datadog.agent.hostname`) are the relaying
+  Agent's identity, not a sender's host.
+- **Encode.** A v0.7 or `AgentPayload` `TracerPayload`'s `hostname`, and a `ClientStatsPayload`'s
+  `Hostname`, is the batch resource's `host.name` when it is a non-empty `Str`, which isn't also
+  sent as a span tag. The field is per payload, so only the resource counts: an event's own
+  `host.name` is an ordinary span tag (and has no wire form on a stats group). v0.4 and v0.5 have
+  no payload field, so there a resource `host.name` is a tag on every span, as any resource
+  attribute is.
+- **The fallback.** With no resource `host.name`, `datadog_out` writes the process hostname in the
+  field only when no `_logit.datadog.agent.hostname` rides beside it. An Agent sends an empty
+  tracer hostname beside its own, and filling it would move that Agent's spans to the relay's
+  host; a payload with no Agent hostname came from no Agent and gets the relay's, as every other
+  route's hostless item does. `datadog_trace_out` leaves the field empty, as a tracer does, for
+  the Agent behind it to fill.
+
+The relays stay fixed points modulo the codec's lists (`crates/logit-proto/src/datadog/mod.rs`'s
+permitted normalizations for traces and APM stats), which name the fallback and the v0.4/v0.5
+span tag. Across families, `datadog_in`'s traces now reach `otlp_out` with resource `host.name`
+and `splunk_hec_out` with the tracer host as each object's `host`.

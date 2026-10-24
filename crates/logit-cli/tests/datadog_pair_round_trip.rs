@@ -30,7 +30,7 @@ use logit_proto::datadog::stats::{
 };
 use logit_proto::datadog::{
     DatadogDecoder, DatadogEncoder, ATTR_HOSTLESS, ATTR_HOST_NAME, ATTR_RESOURCES,
-    ATTR_SERVICE_NAME, RESOURCE_ATTR_TRACER_HOSTNAME,
+    ATTR_SERVICE_NAME,
 };
 use prost::Message;
 use std::collections::HashMap;
@@ -254,7 +254,7 @@ fn traces(top_level: bool) -> EventBatch {
 /// Built on the model, encoded, and decoded once, so it is on the stats codec's fixed point.
 fn stats() -> EventBatch {
     let mut resource = Resource::default();
-    resource.attributes.insert(RESOURCE_ATTR_TRACER_HOSTNAME, Value::str("web-1"));
+    resource.attributes.insert(ATTR_HOST_NAME, Value::str("web-1"));
     let mut attributes = AttrMap::new();
     attributes.insert(ATTR_STATS_NAME, Value::str("http.request"));
     attributes.insert(ATTR_SERVICE_NAME, Value::str("checkout"));

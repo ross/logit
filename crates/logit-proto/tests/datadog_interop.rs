@@ -243,6 +243,16 @@ fn replay(capture: &Capture) -> Vec<EventBatch> {
     let first = route.decode(&mut probe.decoder, &capture.body);
     let problems = probe.problems();
     assert!(problems.is_empty(), "{}: {problems:?}", capture.name);
+    // A tracer or stats payload's hostname decodes to `host.name`; the old carrier is retired.
+    for batch in &first {
+        let retired = "_logit.datadog.tracer.hostname";
+        assert_eq!(batch.resource.attributes.get(retired), None, "{}", capture.name);
+        assert!(
+            batch.events.iter().all(|e| e.attributes.get(retired).is_none()),
+            "{}",
+            capture.name
+        );
+    }
 
     for batch in &first {
         let (Some(encoded), duplicates) = route.encode(batch) else {

@@ -33,7 +33,7 @@ use logit_proto::datadog::traces::{
     ATTR_CHUNK_DROPPED_TRACE, ATTR_CHUNK_ORIGIN, ATTR_CHUNK_PRIORITY, ATTR_CHUNK_TAGS,
 };
 use logit_proto::datadog::{
-    DatadogDecoder, DatadogEncoder, ATTR_SERVICE_NAME, RESOURCE_ATTR_AGENT_ENV,
+    DatadogDecoder, DatadogEncoder, ATTR_HOST_NAME, ATTR_SERVICE_NAME, RESOURCE_ATTR_AGENT_ENV,
     RESOURCE_ATTR_AGENT_HOSTNAME, RESOURCE_ATTR_TRACER_LANGUAGE_NAME,
 };
 use logit_proto::msgpack::Writer;
@@ -76,6 +76,7 @@ fn encode(form: Form, batch: &EventBatch) -> Option<Bytes> {
 fn assert_fixed_point(form: Form, body: &[u8]) -> Vec<EventBatch> {
     let d1 = decode(form, body);
     for batch in &d1 {
+        assert_no_tracer_hostname_carrier(batch);
         let Some(b1) = encode(form, batch) else {
             assert!(batch.events.is_empty(), "{form:?}: spans decoded but nothing re-encoded");
             continue;
@@ -86,6 +87,15 @@ fn assert_fixed_point(form: Form, body: &[u8]) -> Vec<EventBatch> {
         assert_eq!(b1, b2, "{form:?}: encode(decode(encode(d))) != encode(d)");
     }
     d1
+}
+
+/// The payload's hostname decodes to `host.name`; the retired carrier appears nowhere.
+fn assert_no_tracer_hostname_carrier(batch: &EventBatch) {
+    const RETIRED: &str = "_logit.datadog.tracer.hostname";
+    assert_eq!(batch.resource.attributes.get(RETIRED), None);
+    for event in &batch.events {
+        assert_eq!(event.attributes.get(RETIRED), None);
+    }
 }
 
 /// Every form's fixed point, starting from `batch` re-encoded in that form.
@@ -383,6 +393,8 @@ fn a_rich_tracer_payload_in_every_form() {
         batches[1].resource.attributes.get(RESOURCE_ATTR_TRACER_LANGUAGE_NAME),
         Some(&Value::str("go"))
     );
+    assert_eq!(batches[0].resource.attributes.get(ATTR_HOST_NAME), Some(&Value::str("web-1")));
+    assert_eq!(batches[1].resource.attributes.get(ATTR_HOST_NAME), None, "no hostname, no host");
     let rich = &batches[0];
     let root = &rich.events[0];
     let span = root.span.as_ref().unwrap();

@@ -301,7 +301,10 @@ the rest of the request was stored.
 its own:
 
 - a metric, event, or service check with no `host.name` and no hostless mark;
-- a log with no `host.name`, `syslog.hostname`, or `host`.
+- a log with no `host.name`, `syslog.hostname`, or `host`;
+- a trace or APM stats payload with no `host.name` on its batch resource and no relaying Agent's
+  hostname beside it. An Agent sends an empty tracer hostname beside its own, so an Agent's
+  payload keeps it empty.
 
 That's what an Agent does for a DogStatsD client that names no host, so a `logit` on each host
 behaves as the Agent it replaces. A central `logit` receiving from many hosts is different: every
@@ -310,8 +313,9 @@ view of them is lost. Datadog bills per host, so the cost matches one Agent.
 
 `logit`'s inputs read each sender's own host into `host.name`: `statsd_in` a DogStatsD `host:`
 tag (the last one) or an event's or check's `h:` field, `datadog_in` a series' or sketch's
-`host`, a log's `hostname`, an event's `host`, or a check's `host_name`, and `collectd_in` each
-value list's and notification's host. A `host:` tag is the host, and isn't kept as a tag, as the
+`host`, a log's `hostname`, an event's `host`, or a check's `host_name`, `datadog_in` and
+`datadog_trace_in` a tracer or stats payload's `hostname` (onto the batch resource), and
+`collectd_in` each value list's and notification's host. A `host:` tag is the host, and isn't kept as a tag, as the
 Agent reads it. So to keep a host per sender, have each client send one, or stamp `host.name`
 upstream with `set`, which overrides the sender's. A host the data carries is never replaced.
 

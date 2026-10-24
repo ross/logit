@@ -2873,7 +2873,8 @@ rows:
         reason: default_host
         text: >-
           A record with no host and no hostless mark leaves with the process hostname as its host,
-          which datadog_in reads back as `host.name`; a span keeps its own hostnames.
+          which datadog_in reads back as `host.name`; a span's host is its batch resource's
+          `host.name`, filled only when no relaying Agent's hostname rides beside it.
       graphite_out:
         class: exact
         text: A record with no host leaves with none.

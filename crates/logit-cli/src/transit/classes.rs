@@ -542,9 +542,10 @@ impl Spelling {
 /// that compares the record reaches the rows, chosen from the record alone; only
 /// [`Spelling::derived`] predicts the values (`logit_proto::datadog`'s encode tables):
 ///
-/// - `no_host`: the run's hostname, on a record but a span that carries no host and no hostless
-///   mark (the encoder's default host), under the key `datadog_in` reads the route's host back as
-///   (`host.name`);
+/// - `no_host`: the run's hostname, on a record that carries no host and no hostless mark (the
+///   encoder's default host), under the key `datadog_in` reads the route's host back as
+///   (`host.name`, on the resource for a span's tracer payload); a span's host is its resource's,
+///   and a relaying Agent's hostname leaves it unfilled;
 /// - `log_status`: `status` as the severity's name, on a log, not a Datadog event, with a severity
 ///   and no `status` attribute;
 /// - `span_kind`: `span.kind` as the kind's name, on a span whose kind isn't `internal` and that
@@ -561,6 +562,9 @@ fn derived(rec: &Rec) -> Vec<(&'static str, &'static str, String)> {
     let mut out = Vec::new();
     match datadog::Route::of(rec) {
         datadog::Route::Span => {
+            if !datadog::carries_host(rec, datadog::Route::Span) {
+                out.push(("no_host", "host.name", super::HOSTNAME.to_string()));
+            }
             let kind = rec.body["kind"].as_str().unwrap_or("internal");
             if kind != "internal" && !has("span.kind") {
                 out.push(("span_kind", "span.kind", kind.to_string()));
@@ -722,7 +726,14 @@ mod datadog {
             // `syslog.hostname` and `host` are Datadog's reserved log host attributes.
             Route::Log => named(rec) || has("syslog.hostname") || has("host"),
             Route::Event | Route::Check | Route::Metric => named(rec) || hostless_mark(rec),
-            Route::Span => true,
+            // A span's host is its tracer payload's, the resource's `host.name`; an Agent's own
+            // hostname beside an empty one stops the default host.
+            Route::Span => {
+                rec.resource
+                    .get("host.name")
+                    .is_some_and(|v| v.as_str().is_some_and(|h| !h.is_empty()))
+                    || rec.resource.contains_key("_logit.datadog.agent.hostname")
+            }
         }
     }
 }
@@ -1547,10 +1558,12 @@ fn observe_field(field: &Field, input: &Rec, out: &Rec, spelling: Spelling) -> C
         Field::Derived { .. } if spelling.derived(input).is_empty() => Class::Exact,
         // An attribute the input lacks, read back with the value derived for it, is the sink's
         // rewrite of a field the record already holds.
-        Field::Derived { key, value } => match out.attributes.get(*key) {
-            Some(read) if text(read) == *value => Class::Normalized,
-            _ => Class::Lost,
-        },
+        Field::Derived { key, value } => {
+            match out.attributes.get(*key).or(out.resource.get(*key)) {
+                Some(read) if text(read) == *value => Class::Normalized,
+                _ => Class::Lost,
+            }
+        }
         // A rate read back as 1 is the rate gone.
         Field::SampleRate => {
             let read = number(&out.body["sample_rate"]);
