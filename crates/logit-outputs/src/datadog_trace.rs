@@ -46,11 +46,11 @@
 //! tracer payload carriers no request header carries (`_logit.datadog.tracer.runtime_id`, `.env`,
 //! `.app_version`, `.tags`, `.container_debug`) are dropped and counted by the encoder as
 //! `logit.output.spans.degraded{reason="no_wire_form"}`; a resource `host.name` lands in every
-//! span's `meta` instead, unless the span carries its own `host.name`, which wins as any event
-//! attribute does, counted the same way. `v0.7` carries all of them in its `TracerPayload`, `host.name` as its
-//! `hostname`, and leaves `hostname` empty with no `host.name`, as a tracer does, for the Agent
-//! to fill. A v0.4-origin batch (what most tracers send `datadog_trace_in`) relays through either
-//! with nothing lost.
+//! span's `meta` instead, unless the span carries a different `host.name`, which wins as any event
+//! attribute does, counted the same way. `v0.7` carries all of them in its `TracerPayload`,
+//! `host.name` as its `hostname`, and leaves `hostname` empty with no `host.name`, as a tracer
+//! does, for the Agent to fill. A v0.4-origin batch (what most tracers send `datadog_trace_in`)
+//! relays through either with nothing lost.
 //!
 //! **What isn't read from a reply.** The Agent answers a trace request with `rate_by_service`,
 //! the sampling rates a tracer's priority sampler applies. This sink samples nothing, so it

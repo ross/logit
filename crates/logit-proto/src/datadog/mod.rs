@@ -566,7 +566,7 @@
 //! 6. a 128-bit trace id with no `_dd.p.tid` gains one on its chunk's first span;
 //! 7. across forms, a field the target has no home for is dropped and counted `no_wire_form`;
 //!    a resource `host.name` going to v0.4 or v0.5 lands in every span's `meta` instead, unless
-//!    the span carries its own `host.name`, which wins as any event attribute does, counted;
+//!    the span carries a different `host.name`, which wins as any event attribute does, counted;
 //! 8. `datadog_out` only: a `TracerPayload` with no `hostname` and no `AgentPayload` `hostName`
 //!    leaves with the process hostname (`datadog_out`'s default host) as its `hostname`.
 //!

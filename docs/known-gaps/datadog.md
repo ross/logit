@@ -159,7 +159,7 @@ Entry format and the other areas: [the known-gaps index](README.md).
   (`_logit.datadog.tracer.runtime_id`, `.env`, `.app_version`, `.tags`, `.container_debug`).
   Each is counted `logit.output.spans.degraded{reason="no_wire_form"}`. The payload's hostname,
   the resource's `host.name`, goes out as every span's `host.name` tag instead, unless the span
-  carries its own `host.name`, which wins as any event attribute does, counted the same way.
+  carries a different `host.name`, which wins as any event attribute does, counted the same way.
   - **Consequence:** only a v0.7-origin batch loses anything, and the Agent derives a chunk's
     priority and origin from the root span again on its side.
   - **Workaround:** `version: v0.7`, which carries all of them.
