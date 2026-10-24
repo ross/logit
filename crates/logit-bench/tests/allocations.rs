@@ -4170,7 +4170,7 @@ fn statsd_tag_values_share_the_datagram_allocation() {
     let batch = decoder.decode(datagram.clone()).expect("should decode");
     let event = batch.events.into_iter().next().expect("one event");
 
-    let env = event.attributes.get("env").expect("the env tag");
+    let env = event.attributes.get("deployment.environment.name").expect("the env tag");
     let Value::Str(env) = env else { panic!("the tag value should be a Str") };
     assert_eq!(env.as_ref(), b"prod");
     assert!(within(&datagram, env), "env tag value should slice the datagram, not copy it");

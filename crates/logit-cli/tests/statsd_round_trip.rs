@@ -764,7 +764,11 @@ async fn relay_through_a_default_aggregate(
 
     let mut by_name = std::collections::BTreeMap::new();
     for event in decoded.events {
-        let env = event.attributes.get("env").and_then(|v| v.as_str()).map(String::from);
+        let env = event
+            .attributes
+            .get("deployment.environment.name")
+            .and_then(|v| v.as_str())
+            .map(String::from);
         for metric in event.metrics {
             let name = logit_core::interner::resolve(metric.name).to_string();
             let previous = by_name.insert(name.clone(), (metric.kind, env.clone()));
@@ -1283,7 +1287,10 @@ mod tls {
 
         assert_eq!(decoded.events.len(), 1);
         assert_eq!(metric_name(&decoded), "over.tls");
-        assert_eq!(decoded.events[0].attributes.get("env").and_then(Value::as_str), Some("prod"));
+        assert_eq!(
+            decoded.events[0].attributes.get("deployment.environment.name").and_then(Value::as_str),
+            Some("prod")
+        );
         assert_eq!(decoded, sent, "TLS changes the transport, not the relayed batch");
     }
 

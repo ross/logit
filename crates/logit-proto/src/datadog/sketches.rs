@@ -491,7 +491,7 @@ mod tests {
         let e = &batch.events[0];
         assert_eq!(e.timestamp, seconds_to_nanos(TS_S));
         assert_eq!(e.attributes.get(ATTR_HOST_NAME), Some(&Value::str("h")));
-        assert_eq!(e.attributes.get("env"), Some(&Value::str("prod")));
+        assert_eq!(e.attributes.get("deployment.environment.name"), Some(&Value::str("prod")));
         let MetricKind::Distribution(s) = &e.metrics[0].kind else { panic!() };
         assert_eq!(*s.mapping(), Mapping::agent());
         assert_eq!(s.negative_bins(), &[Bin { key: 2, count: 3.0 }, Bin { key: 5, count: 3.0 }]);

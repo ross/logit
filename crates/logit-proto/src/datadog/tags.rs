@@ -8,25 +8,79 @@
 //! `logit.input.tags.omitted{reason="reserved_prefix"}`, so a sender's tag never reads back as a
 //! carrier
 //! ([ADR `private-attribute-namespace`](../../../../docs/adr/private-attribute-namespace.md)).
+//!
+//! Unified Service Tagging's valued `env:`, `version:`, and `service:` tags are the standard
+//! `deployment.environment.name`, `service.version`, and `service.name`
+//! ([`logit_core::attrs::UNIFIED_SERVICE_TAGS`]), both ways, as `statsd_in`'s module doc,
+//! "Service identity", has it for DogStatsD: a tag spelling the standard key beside the
+//! Datadog-spelled one is returned to count as `reason="reserved_key"`, and [`render_tags`] writes
+//! the key in Datadog's spelling.
 
-use logit_core::attrs::is_private;
+use logit_core::attrs::{is_private, UNIFIED_SERVICE_TAGS};
 use logit_core::interner::{intern, resolve};
 use logit_core::{AttrMap, Symbol, Value};
 
-/// Folds one tag into `attributes` under the shared rule. Returns `true` when the tag's key is
-/// private and the tag was skipped.
-pub fn insert_tag(attributes: &mut AttrMap, tag: &str) -> bool {
-    if tag.is_empty() {
-        return false;
+/// What [`insert_tags`] left off, for the caller to count as `logit.input.tags.omitted`.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Omitted {
+    /// A tag whose key is under the private `_logit.` prefix (`reason="reserved_prefix"`).
+    pub reserved_prefix: usize,
+    /// A tag spelling a standard service identity key beside the Datadog-spelled tag for it
+    /// (`reason="reserved_key"`).
+    pub reserved_key: usize,
+}
+
+/// Folds every tag of a list into `attributes` under the shared rule. A valued `env:`,
+/// `version:`, or `service:` tag folds into its standard key; a tag spelling that key itself is
+/// folded after the rest, and beside a Datadog-spelled tag for the same key it's left off.
+pub fn insert_tags<'a>(
+    attributes: &mut AttrMap,
+    tags: impl IntoIterator<Item = &'a str>,
+) -> Omitted {
+    let mut omitted = Omitted::default();
+    // Per `UNIFIED_SERVICE_TAGS` row: whether a Datadog-spelled tag wrote the key.
+    let mut unified = [false; 3];
+    // Tags spelling a standard key, held until every Datadog-spelled one has been read.
+    let mut spelled: Vec<(usize, Value)> = Vec::new();
+    for tag in tags {
+        if tag.is_empty() {
+            continue;
+        }
+        let (key, value) = match tag.split_once(':') {
+            Some((k, v)) => (k, Value::str(v)),
+            None => (tag, Value::Bool(true)),
+        };
+        if is_private(key) {
+            omitted.reserved_prefix += 1;
+            continue;
+        }
+        let mut rows = UNIFIED_SERVICE_TAGS.iter().enumerate();
+        let key = match rows.find(|(_, (dd, std))| *dd == key || *std == key) {
+            Some((i, (dd, std))) if *dd == key && !matches!(value, Value::Bool(true)) => {
+                unified[i] = true;
+                intern(std)
+            }
+            Some((i, (dd, _))) if *dd != key => {
+                spelled.push((i, value));
+                continue;
+            }
+            _ => intern(key),
+        };
+        fold_tag(attributes, key, value);
     }
-    let (key, value) = match tag.split_once(':') {
-        Some((k, v)) => (k, Value::str(v)),
-        None => (tag, Value::Bool(true)),
-    };
-    if is_private(key) {
-        return true;
+    for (i, value) in spelled {
+        if unified[i] {
+            omitted.reserved_key += 1;
+        } else {
+            fold_tag(attributes, intern(UNIFIED_SERVICE_TAGS[i].1), value);
+        }
     }
-    let key = intern(key);
+    omitted
+}
+
+/// Folds one tag's value into `attributes` under `key`: a repeated key becomes an `Array` in wire
+/// order, and only an exact duplicate token is deduped.
+fn fold_tag(attributes: &mut AttrMap, key: Symbol, value: Value) {
     let merged = match attributes.remove_sym(key) {
         None => value,
         Some(Value::Array(mut arr)) => {
@@ -39,12 +93,6 @@ pub fn insert_tag(attributes: &mut AttrMap, tag: &str) -> bool {
         Some(existing) => Value::Array(vec![existing, value]),
     };
     attributes.insert_sym(key, merged);
-    false
-}
-
-/// Folds every tag of a list into `attributes`. Returns how many were skipped for a private key.
-pub fn insert_tags<'a>(attributes: &mut AttrMap, tags: impl IntoIterator<Item = &'a str>) -> usize {
-    tags.into_iter().filter(|tag| insert_tag(attributes, tag)).count()
 }
 
 /// Splits a comma-joined `ddtags` string into tags (empty tokens dropped).
@@ -68,28 +116,40 @@ pub struct Dropped {
 }
 
 /// The standard keys a Datadog tag spells another way, the Datadog OTLP exporter's mapping
-/// (`pkg/opentelemetry-mapping-go/otlp/attributes/attributes.go`, `ContainerMappings`):
-/// `container.id` is the `container_id` tag, and `container.image.tags`'s first element the
-/// `image_tag` tag. An attribute already named for the tag would be a second one beside the key,
-/// so it's left off, counted.
-const RESPELLED: [(&str, &str); 2] = [
+/// (`pkg/opentelemetry-mapping-go/otlp/attributes/attributes.go`, `ContainerMappings` and
+/// `coreMapping`): `container.id` is the `container_id` tag, `container.image.tags`'s first
+/// element the `image_tag` tag, and [`UNIFIED_SERVICE_TAGS`]' keys the `env`, `version`, and
+/// `service` tags. An attribute already named for the tag would be a second one beside the key,
+/// so it's left off, counted: every tag it writes for a container row, and only its valued tags
+/// for a service row, since a bare `env` token names no environment.
+const RESPELLED: [(&str, &str); 5] = [
     (logit_core::attrs::CONTAINER_ID, "container_id"),
     (logit_core::attrs::CONTAINER_IMAGE_TAGS, "image_tag"),
+    (UNIFIED_SERVICE_TAGS[0].1, UNIFIED_SERVICE_TAGS[0].0),
+    (UNIFIED_SERVICE_TAGS[1].1, UNIFIED_SERVICE_TAGS[1].0),
+    (UNIFIED_SERVICE_TAGS[2].1, UNIFIED_SERVICE_TAGS[2].0),
 ];
+
+/// Whether a [`RESPELLED`] row's tag-named attribute keeps its valueless tags beside the key.
+fn keeps_bare(row: usize) -> bool {
+    row >= 2
+}
 
 /// Renders attribute pairs as Datadog tags: `Str` → `k:v`, `Bool(true)` → `k`, `Bool(false)` →
 /// `k:false`, numbers → `k:<display>`, `Timestamp` → `k:<RFC 3339>`, `Array` → one tag per
 /// element under the same rules, `Map`/`Bytes`/`Null` → omitted and counted. A bare tag reads
-/// back as `true`, so `true` round-trips through [`insert_tag`] and `false` reads back as the
+/// back as `true`, so `true` round-trips through [`insert_tags`] and `false` reads back as the
 /// string `"false"`, as `statsd_out` writes and `statsd_in` reads it. Keys in `skip` are the ones a
 /// caller already consumed into a wire field of its own (`host.name`, the `_logit.datadog.*`
 /// carriers) and are never rendered, and neither is any other private `_logit.` key, which is
 /// never counted.
 ///
-/// `container.id` renders as `container_id`, and `container.image.tags` as one `image_tag` from
-/// its first element, each further element counted unrepresentable ([`RESPELLED`]). A
+/// `container.id` renders as `container_id`, `container.image.tags` as one `image_tag` from its
+/// first element, each further element counted unrepresentable, and `deployment.environment.name`,
+/// `service.version`, and `service.name` as `env`, `version`, and `service` ([`RESPELLED`]). A
 /// `container_id` or `image_tag` attribute beside the key that renders one is left off, every tag
-/// it would have written counted unrepresentable.
+/// it would have written counted unrepresentable; an `env`, `version`, or `service` attribute
+/// beside its key loses its valued tags the same way and keeps its bare ones.
 pub fn render_tags<'a>(
     pairs: impl IntoIterator<Item = (Symbol, &'a Value)>,
     skip: &[Symbol],
@@ -98,8 +158,8 @@ pub fn render_tags<'a>(
     let mut dropped = Dropped::default();
     // Per `RESPELLED` row: whether the standard key wrote a tag, and where the attribute already
     // named for that tag wrote its own.
-    let mut keyed = [false; 2];
-    let mut named: [Option<std::ops::Range<usize>>; 2] = [None, None];
+    let mut keyed = [false; RESPELLED.len()];
+    let mut named: [Option<std::ops::Range<usize>>; RESPELLED.len()] = Default::default();
     for (key, value) in pairs {
         let name = resolve(key);
         if skip.contains(&key) || logit_core::attrs::is_private(name) {
@@ -125,12 +185,16 @@ pub fn render_tags<'a>(
             named[i] = Some(start..out.len());
         }
     }
-    let mut shadowed: Vec<std::ops::Range<usize>> =
-        (0..2).filter(|&i| keyed[i]).filter_map(|i| named[i].clone()).collect();
-    shadowed.sort_by_key(|r| std::cmp::Reverse(r.start));
-    for range in shadowed {
-        dropped.unrepresentable += range.len();
-        out.drain(range);
+    let mut shadowed: Vec<usize> = Vec::new();
+    for i in (0..RESPELLED.len()).filter(|&i| keyed[i]) {
+        let Some(range) = named[i].clone() else { continue };
+        let bare = RESPELLED[i].1;
+        shadowed.extend(range.filter(|&at| !(keeps_bare(i) && out[at] == bare)));
+    }
+    shadowed.sort_unstable_by(|a, b| b.cmp(a));
+    for at in shadowed {
+        dropped.unrepresentable += 1;
+        out.remove(at);
     }
     dropped
 }
@@ -159,8 +223,8 @@ pub fn count_tags<'a>(
     pairs: impl IntoIterator<Item = (Symbol, &'a Value)>,
     skip: &[Symbol],
 ) -> usize {
-    let mut keyed = [false; 2];
-    let mut named = [0usize; 2];
+    let mut keyed = [false; RESPELLED.len()];
+    let mut named = [0usize; RESPELLED.len()];
     let mut total = 0;
     for (key, value) in pairs {
         let name = resolve(key);
@@ -179,14 +243,23 @@ pub fn count_tags<'a>(
             None => {
                 let n = count_one(value);
                 if let Some(i) = RESPELLED.iter().position(|(_, wire)| *wire == name) {
-                    named[i] = n;
+                    named[i] = if keeps_bare(i) { n - count_bare(value) } else { n };
                 }
                 n
             }
         };
         total += n;
     }
-    total - (0..2).filter(|&i| keyed[i]).map(|i| named[i]).sum::<usize>()
+    total - (0..RESPELLED.len()).filter(|&i| keyed[i]).map(|i| named[i]).sum::<usize>()
+}
+
+/// How many valueless tags (`Bool(true)`) a value renders.
+fn count_bare(value: &Value) -> usize {
+    match value {
+        Value::Bool(true) => 1,
+        Value::Array(items) => items.iter().map(count_bare).sum(),
+        _ => 0,
+    }
 }
 
 fn count_one(value: &Value) -> usize {
@@ -213,7 +286,7 @@ mod tests {
             &mut attrs,
             ["env:prod", "team:a", "team:b", "team:a", "urgent", "urgent:1", ""],
         );
-        assert_eq!(attrs.get("env"), Some(&Value::str("prod")));
+        assert_eq!(attrs.get("deployment.environment.name"), Some(&Value::str("prod")));
         assert_eq!(attrs.get("team"), Some(&Value::Array(vec![Value::str("a"), Value::str("b")])));
         assert_eq!(
             attrs.get("urgent"),
@@ -228,8 +301,8 @@ mod tests {
             &mut attrs,
             ["env:prod", "_logit.metrics.interval:10", "_logit.x", "logit.x:1", "_logitx"],
         );
-        assert_eq!(skipped, 2);
-        assert_eq!(attrs.get("env"), Some(&Value::str("prod")));
+        assert_eq!(skipped, Omitted { reserved_prefix: 2, reserved_key: 0 });
+        assert_eq!(attrs.get("deployment.environment.name"), Some(&Value::str("prod")));
         assert_eq!(attrs.get("logit.x"), Some(&Value::str("1")));
         assert_eq!(attrs.get("_logitx"), Some(&Value::Bool(true)));
         assert_eq!(attrs.len(), 3);
@@ -248,6 +321,76 @@ mod tests {
         out.sort();
         assert_eq!(out, ["env:prod", "n:3", "off:false", "team:a", "team:b", "urgent"]);
         assert_eq!(dropped, Dropped { unrepresentable: 1 }, "`nested`");
+    }
+
+    /// A valued `env:`, `version:`, or `service:` tag is its standard key and a valueless one an
+    /// ordinary tag; a tag spelling the key beside the Datadog-spelled one is left off and
+    /// counted, whichever comes first, and alone it's the key's value.
+    #[test]
+    fn unified_service_tags_fold_into_the_standard_keys() {
+        let mut attrs = AttrMap::new();
+        let omitted = insert_tags(
+            &mut attrs,
+            [
+                "deployment.environment.name:dev",
+                "env:prod",
+                "env:canary",
+                "env",
+                "version:1.2",
+                "service.version:9",
+                "service.version:8",
+                "service.name:api",
+                "service",
+            ],
+        );
+        assert_eq!(omitted, Omitted { reserved_prefix: 0, reserved_key: 3 });
+        assert_eq!(
+            attrs.get("deployment.environment.name"),
+            Some(&Value::Array(vec![Value::str("prod"), Value::str("canary")]))
+        );
+        assert_eq!(attrs.get("env"), Some(&Value::Bool(true)));
+        assert_eq!(attrs.get("service.version"), Some(&Value::str("1.2")));
+        assert_eq!(attrs.get("service.name"), Some(&Value::str("api")));
+        assert_eq!(attrs.get("service"), Some(&Value::Bool(true)));
+        assert_eq!(attrs.get("version"), None);
+        assert_eq!(attrs.len(), 5);
+    }
+
+    /// The service identity keys render in Datadog's spelling. Beside its key, an `env`,
+    /// `version`, or `service` attribute loses its valued tags, counted, and keeps its bare ones;
+    /// without the key it's an ordinary tag. Counting agrees.
+    #[test]
+    fn service_keys_render_in_datadog_spelling_and_shadow_their_valued_tag_attributes() {
+        let mut attrs = AttrMap::new();
+        attrs.insert("deployment.environment.name", Value::str("prod"));
+        attrs.insert("env", Value::Array(vec![Value::str("dev"), Value::Bool(true)]));
+        attrs.insert("service.version", Value::str("1.2"));
+        attrs.insert("version", Value::str("9"));
+        attrs.insert("service.name", Value::Array(vec![Value::str("api"), Value::str("web")]));
+        let mut out = Vec::new();
+        let dropped = render_tags(attrs.iter(), &[], &mut out);
+        out.sort();
+        assert_eq!(out, ["env", "env:prod", "service:api", "service:web", "version:1.2"]);
+        assert_eq!(dropped, Dropped { unrepresentable: 2 }, "env:dev and version:9");
+        assert_eq!(count_tags(attrs.iter(), &[]), out.len());
+
+        let mut alone = AttrMap::new();
+        alone.insert("env", Value::str("dev"));
+        alone.insert("service", Value::str("api"));
+        let mut out = Vec::new();
+        let dropped = render_tags(alone.iter(), &[], &mut out);
+        out.sort();
+        assert_eq!(out, ["env:dev", "service:api"]);
+        assert_eq!(dropped, Dropped::default());
+        assert_eq!(count_tags(alone.iter(), &[]), 2);
+
+        let mut back = AttrMap::new();
+        insert_tags(&mut back, ["env:prod", "service:api", "service:web", "version:1.2"]);
+        let mut keyed = AttrMap::new();
+        keyed.insert("deployment.environment.name", Value::str("prod"));
+        keyed.insert("service.version", Value::str("1.2"));
+        keyed.insert("service.name", Value::Array(vec![Value::str("api"), Value::str("web")]));
+        assert_eq!(back, keyed);
     }
 
     /// `count_tags` agrees with `render_tags` on every `Value` variant, nested arrays and

@@ -135,6 +135,17 @@
 //! wire host and every sink ranks first (`docs/adr/process-hostname.md`'s "Amendment: a source
 //! fills the common keys (2026-10-23)").
 //!
+//! ## Service identity
+//!
+//! Under `Format::DogStatsd`, `deployment.environment.name`, `service.version`, and
+//! `service.name` (the event's, else the resource's) leave as Datadog's Unified Service Tagging
+//! tags, `env:`, `version:`, and `service:`, one per element of an `Array`, never under the
+//! standard key's own name; `statsd_in` reads each back as the key. Beside a key that writes a
+//! tag, a valued `env`, `version`, or `service` attribute would be a second tag for the same key,
+//! so it's omitted, counted `tags.omitted{reason="unrepresentable"}` once per wire tag; a bare one
+//! (`Bool(true)`) names no value and stays. Without the key, an `env`, `version`, or `service`
+//! attribute is an ordinary tag.
+//!
 //! ## Metric-kind coverage
 //!
 //! Each written as its own native line: a delta, monotonic `Sum` (`MetricKind::counter`, `|c`),
@@ -299,6 +310,12 @@
 //! | `attributes/host_beside_host_name`, otherwise | lost | `logit.output.tags.omitted{reason=unrepresentable}` | A non-empty `host.name` or the hostless mark is the line's own host, so a `host` beside it, a second `host:` tag the Agent would consume, is left off, counted once per wire tag. |
 //! | `attributes/container_id`, under `format: statsd` | lost | `logit.output.fields.omitted{reason=dialect}` | Plain statsd has no `\|c:` segment, so the container id is omitted, counted once per line. |
 //! | `attributes/container_id`, otherwise | exact | -- | The line's `\|c:` segment, never a tag, which statsd_in reads back as `container.id`. |
+//! | `attributes/service_identity`, under `format: statsd` | lost | `logit.output.tags.omitted{reason=dialect}` | Plain statsd has no tags; each is counted once per wire tag. |
+//! | `attributes/service_identity`, otherwise | exact | -- | `deployment.environment.name`, `service.version`, and `service.name` are Datadog's `env:`, `version:`, and `service:` tags, which statsd_in reads back as the key. |
+//! | `attributes/service_tag`, under `format: statsd` | lost | `logit.output.tags.omitted{reason=dialect}` | Plain statsd has no tags; each is counted once per wire tag. |
+//! | `attributes/service_tag`, otherwise | normalized | `respelled` | A valued `env`, `version`, or `service` is the DogStatsD tag of that name, which statsd_in reads back as `deployment.environment.name`, `service.version`, or `service.name`. |
+//! | `attributes/service_tag_beside_key`, under `format: statsd` | lost | `logit.output.tags.omitted{reason=dialect}` | Plain statsd has no tags; each is counted once per wire tag. |
+//! | `attributes/service_tag_beside_key`, otherwise | lost | `logit.output.tags.omitted{reason=unrepresentable}` | Beside its standard key, which leaves as the same tag, a valued `env`, `version`, or `service` would be a second value for the key, so it's left off, counted once per wire tag. |
 //! | `attributes/bool_value`, under `format: statsd` | lost | `logit.output.tags.omitted{reason=dialect}` | Plain statsd has no tags. |
 //! | `attributes/bool_value`, otherwise | normalized | `bool_tag` | `true` is a bare tag and reads back `true`; `false` is `key:false` and reads back as the string. |
 //! | `attributes/number_value`, under `format: statsd` | lost | `logit.output.tags.omitted{reason=dialect}` | Plain statsd has no tags. |
@@ -580,7 +597,7 @@ use crate::datagram::{
 use crate::stream::{Dial, PooledStream, Target, TlsTarget};
 use crate::Output;
 use anyhow::Context;
-use logit_core::attrs::{CLOSED_TIMESTAMPED, CONTAINER_ID, METRICS_CLOSED};
+use logit_core::attrs::{CLOSED_TIMESTAMPED, CONTAINER_ID, METRICS_CLOSED, UNIFIED_SERVICE_TAGS};
 use logit_core::{
     Diagnostics, Event, EventBatch, MetricKind, MetricRecord, MetricValue, Resource, Telemetry,
     Temporality, Value,
@@ -1162,6 +1179,19 @@ fn build_tag_suffix<'a>(
         (None, false)
     };
     let line_names_host = host_name.is_some() || hostless;
+    // Per `UNIFIED_SERVICE_TAGS` row: whether the standard key writes an `env:`, `version:`, or
+    // `service:` tag here, so a valued attribute already named for that tag is a second one.
+    let keyed = if format == Format::DogStatsd {
+        UNIFIED_KEYS.map(|key| {
+            event
+                .attributes
+                .get_sym(key)
+                .or_else(|| resource.attributes.get_sym(key))
+                .is_some_and(renders_tag)
+        })
+    } else {
+        [false; 3]
+    };
     for (key, value) in crate::attrs::merged(resource, event) {
         let key_str = logit_core::interner::resolve(key);
         // This sink's own carriers, which `statsd_in` stamps from a line's own segments and this
@@ -1260,6 +1290,30 @@ fn build_tag_suffix<'a>(
             ATTR_HOST_NAME if host_name.is_some() => continue,
             _ => {}
         }
+        // Service identity (module doc's "Service identity"): a standard key leaves in
+        // Datadog's spelling, and beside it a valued attribute of that spelling would be a
+        // second tag for the same key, so it's left off per wire tag; a bare token stays.
+        let mut key_str = key_str;
+        if let Some(i) = UNIFIED_SERVICE_TAGS.iter().position(|(dd, _)| *dd == key_str) {
+            if keyed[i] {
+                let elements = match value {
+                    Value::Array(elements) => elements.as_slice(),
+                    _ => std::slice::from_ref(value),
+                };
+                for element in elements {
+                    if matches!(element, Value::Bool(true)) {
+                        push_one_tag(suffix, scratch, key_str, element, stats);
+                    } else {
+                        stats.tags_omitted_unrepresentable += 1;
+                    }
+                }
+                continue;
+            }
+        } else if let Some((dd, _)) =
+            UNIFIED_SERVICE_TAGS.iter().find(|(_, standard)| *standard == key_str)
+        {
+            key_str = dd;
+        }
 
         match value {
             // A repeated tag key, folded at decode; one token per element, in array order, no
@@ -1290,6 +1344,24 @@ fn build_tag_suffix<'a>(
         carriers.host_tag_at = suffix.len();
     }
 }
+
+/// Whether `value` writes at least one DogStatsD tag through [`push_one_tag`]: a value (or an
+/// `Array` element) [`tag_value`] renders, `Bool(true)` as a bare token among them.
+fn renders_tag(value: &Value) -> bool {
+    let scalar = |v: &Value| match v {
+        Value::Str(s) => std::str::from_utf8(s).is_ok(),
+        Value::Bool(_) | Value::I64(_) | Value::U64(_) | Value::F64(_) => true,
+        _ => false,
+    };
+    match value {
+        Value::Array(elements) => elements.iter().any(scalar),
+        _ => scalar(value),
+    }
+}
+
+/// [`UNIFIED_SERVICE_TAGS`]' standard keys, in its order.
+static UNIFIED_KEYS: LazyLock<[logit_core::Symbol; 3]> =
+    LazyLock::new(|| UNIFIED_SERVICE_TAGS.map(|(_, key)| logit_core::interner::intern(key)));
 
 static HOST_NAME_KEY: LazyLock<logit_core::Symbol> =
     LazyLock::new(|| logit_core::interner::intern(ATTR_HOST_NAME));
@@ -3418,6 +3490,55 @@ mod tests {
         expected.extend(quantile_lines("d", &sketch, tail));
         assert_eq!(msgs, expected);
         assert!(msgs.iter().all(|m| !m.contains("|@")), "no expanded line carries a rate");
+    }
+
+    /// The service identity keys leave as `env:`, `version:`, and `service:` tags and read back
+    /// as the keys; beside a key, a valued `env` attribute is omitted and counted once per wire
+    /// tag and a bare one stays; without the key, it's an ordinary tag.
+    #[test]
+    fn service_identity_keys_write_datadog_tags_and_shadow_valued_tag_attributes() {
+        let attrs = [
+            ("deployment.environment.name", Value::str("prod")),
+            ("service.version", Value::str("1.2")),
+            ("service.name", Value::Array(vec![Value::str("api"), Value::str("web")])),
+            ("env", Value::Array(vec![Value::str("dev"), Value::Bool(true), Value::str("qa")])),
+        ];
+        let (msgs, stats) = encode(vec![metric_event("hits", MetricKind::counter(1.0), &attrs)]);
+        let (_, tags) = msgs[0].split_once("|#").expect("a tag segment");
+        let mut tags: Vec<&str> = tags.split(',').collect();
+        tags.sort_unstable();
+        assert_eq!(tags, ["env", "env:prod", "service:api", "service:web", "version:1.2"]);
+        assert_eq!(stats.tags_omitted_unrepresentable, 2, "env:dev and env:qa");
+        let back = decode_one(&msgs[0]);
+        assert_eq!(
+            back[0].attributes.get("deployment.environment.name"),
+            Some(&Value::str("prod"))
+        );
+        assert_eq!(back[0].attributes.get("service.version"), Some(&Value::str("1.2")));
+        assert_eq!(
+            back[0].attributes.get("service.name"),
+            Some(&Value::Array(vec![Value::str("api"), Value::str("web")]))
+        );
+
+        let (msgs, stats) = encode(vec![metric_event(
+            "hits",
+            MetricKind::counter(1.0),
+            &[("env", Value::str("dev")), ("service", Value::str("api"))],
+        )]);
+        assert!(msgs[0].contains("env:dev") && msgs[0].contains("service:api"), "{msgs:?}");
+        assert_eq!(stats.tags_omitted_unrepresentable, 0);
+
+        // A key that writes no tag shadows nothing.
+        let (msgs, stats) = encode(vec![metric_event(
+            "hits",
+            MetricKind::counter(1.0),
+            &[
+                ("deployment.environment.name", Value::Map(Box::default())),
+                ("env", Value::str("dev")),
+            ],
+        )]);
+        assert_eq!(msgs, ["hits:1|c|#env:dev"]);
+        assert_eq!(stats.tags_omitted_unrepresentable, 1, "the map");
     }
 
     #[test]
@@ -6135,7 +6256,10 @@ mod tests {
         assert!(
             matches!(events[0].metrics[0].kind, MetricKind::Sum(s) if s.value == MetricValue::F64(3.0))
         );
-        assert_eq!(events[0].attributes.get("env").and_then(|v| v.as_str()), Some("prod"));
+        assert_eq!(
+            events[0].attributes.get("deployment.environment.name").and_then(|v| v.as_str()),
+            Some("prod")
+        );
     }
 
     #[test]
@@ -6249,7 +6373,10 @@ mod tests {
         assert!(
             matches!(relayed[0].metrics[0].kind, MetricKind::Sum(s) if s.value == MetricValue::F64(3.0))
         );
-        assert_eq!(relayed[0].attributes.get("env").and_then(|v| v.as_str()), Some("prod"));
+        assert_eq!(
+            relayed[0].attributes.get("deployment.environment.name").and_then(|v| v.as_str()),
+            Some("prod")
+        );
         assert_eq!(relayed[0].attributes.get("host.name").and_then(|v| v.as_str()), Some("web1"));
     }
 
@@ -6268,7 +6395,10 @@ mod tests {
             MetricKind::Samples(s)
                 if s.values.as_slice() == [12.5, 34.0, 56.0] && s.sample_rate == 0.5
         ));
-        assert_eq!(relayed[0].attributes.get("env").and_then(|v| v.as_str()), Some("prod"));
+        assert_eq!(
+            relayed[0].attributes.get("deployment.environment.name").and_then(|v| v.as_str()),
+            Some("prod")
+        );
         assert_eq!(relayed[0].attributes.get("host.name").and_then(|v| v.as_str()), Some("web1"));
         assert_eq!(
             relayed[0].attributes.get("_logit.statsd.type").and_then(|v| v.as_str()),
@@ -6334,7 +6464,10 @@ mod tests {
             Some("title")
         );
         assert_eq!(relayed[0].timestamp, 1_700_000_000_000_000_000);
-        assert_eq!(relayed[0].attributes.get("env").and_then(|v| v.as_str()), Some("prod"));
+        assert_eq!(
+            relayed[0].attributes.get("deployment.environment.name").and_then(|v| v.as_str()),
+            Some("prod")
+        );
     }
 
     /// Every optional field survives the relay.
@@ -6360,7 +6493,10 @@ mod tests {
                 .and_then(|v| v.as_str()),
             Some("a b")
         );
-        assert_eq!(relayed[0].attributes.get("env").and_then(|v| v.as_str()), Some("prod"));
+        assert_eq!(
+            relayed[0].attributes.get("deployment.environment.name").and_then(|v| v.as_str()),
+            Some("prod")
+        );
     }
 
     // -- Fixed-point property: decode/encode agree with each other -----------------------------

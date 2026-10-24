@@ -100,7 +100,8 @@
 //! attribute map (`|#a:1|#a:2` folds as `|#a:1,a:2` would), while `@`, `|c:` and `|T` are
 //! last-segment-wins. A repeated `|T`/`|c:`/type therefore never reaches `insert_tags`, and a tag
 //! can't spell a carrier key, because every carrier sits under the private prefix the next
-//! paragraph omits. A tag can spell `container.id`, which "The container id" settles.
+//! paragraph omits. A tag can spell `container.id`, which "The container id" settles, or a
+//! service identity key, which "Service identity" settles.
 //!
 //! **A tag key under the private `_logit.` prefix is omitted**, on a metric line, an event, or a
 //! service check, so a sender's tag never reads back as a carrier
@@ -127,6 +128,26 @@
 //!   `logit.input.tags.omitted{reason="reserved_key"}` once per wire tag: it would collide with
 //!   the standard key the line's host fills. On a line with no `host:` tag and no non-empty `h:`,
 //!   a `host.name` tag is an ordinary tag, and the sinks read it as the host.
+//!
+//! ## Service identity
+//!
+//! Datadog's Unified Service Tagging tags decode onto the standard keys, on the event, on a metric
+//! line, an event, or a service check alike. The Agent passes all three through as ordinary
+//! client tags (datadog-agent 7.83.3, `comp/dogstatsd/server/impl/enrich.go`,
+//! `extractTagsMetadata`, which consumes only `host:`, `dd.internal.entity_id:`, the cardinality
+//! tag, and `dd.internal.jmx_check_name:`), and Datadog's OTLP mapping names the same three keys
+//! (`pkg/opentelemetry-mapping-go/otlp/attributes/attributes.go`, `coreMapping`).
+//!
+//! - **A valued `env:` tag is `deployment.environment.name`, `version:` is `service.version`, and
+//!   `service:` is `service.name`**, each a zero-copy datagram slice, folded as any tag is, so a
+//!   repeated `env:` is an `Array`.
+//! - **A valueless `env`, `version`, or `service` token stays an ordinary `Bool(true)` tag**
+//!   under its own name: it names no value.
+//! - **A tag spelling the standard key beside the Datadog-spelled one is omitted**, counted
+//!   `logit.input.tags.omitted{reason="reserved_key"}` once per wire tag, so
+//!   `#env:prod,deployment.environment.name:dev` is `deployment.environment.name: "prod"`.
+//!   Without the Datadog-spelled tag, a `deployment.environment.name` tag is the key's value, as a
+//!   `container.id` tag is on a line whose `|c:` names no container id.
 //!
 //! ## The container id
 //!

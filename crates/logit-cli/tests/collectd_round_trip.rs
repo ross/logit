@@ -1367,7 +1367,10 @@ async fn a_sampled_statsd_counter_with_a_fractional_value_is_dropped_and_counted
 async fn a_tagged_statsd_gauge_relays_as_a_gauge_with_its_tag_counted_away() {
     let mut cross = CrossHarness::new().await;
     let batch = cross.statsd_decode(b"temp:21.5|g|#env:prod").await;
-    assert_eq!(batch.events[0].attributes.get("env").and_then(Value::as_str), Some("prod"));
+    assert_eq!(
+        batch.events[0].attributes.get("deployment.environment.name").and_then(Value::as_str),
+        Some("prod")
+    );
 
     let registry = Registry::new();
     let telemetry = registry.telemetry_for("out", "collectd_out", "sink");
@@ -1387,7 +1390,11 @@ async fn a_tagged_statsd_gauge_relays_as_a_gauge_with_its_tag_counted_away() {
     assert_eq!(attr(event, ATTR_TYPE), Some(Value::from("gauge")));
     assert_eq!(name_of(&event.metrics[0]), "temp.gauge");
     assert_eq!(event.metrics[0].kind, MetricKind::gauge(21.5));
-    assert_eq!(event.attributes.get("env"), None, "collectd has no wire form for a tag");
+    assert_eq!(
+        event.attributes.get("deployment.environment.name"),
+        None,
+        "collectd has no wire form for a tag"
+    );
 
     // Both sinks share one `Telemetry`, so the tag is counted once per sink.
     let totals = Totals::of(registry.drain(0));
@@ -1408,7 +1415,10 @@ async fn a_statsd_timer_counts_only_its_own_tag_as_having_no_wire_form() {
     let mut cross = CrossHarness::new().await;
     let batch = cross.statsd_decode(b"latency:12|ms|#env:prod").await;
     let event = &batch.events[0];
-    assert_eq!(event.attributes.get("env").and_then(Value::as_str), Some("prod"));
+    assert_eq!(
+        event.attributes.get("deployment.environment.name").and_then(Value::as_str),
+        Some("prod")
+    );
     assert_eq!(
         event.attributes.len(),
         2,

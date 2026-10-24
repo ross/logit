@@ -451,7 +451,7 @@ mod tests {
         assert_eq!(attr(event, "_logit.statsd.event.alert_type"), Some("warning"));
         assert_eq!(attr(event, "_logit.statsd.event.aggregation_key"), Some("agg"));
         assert_eq!(attr(event, "_logit.datadog.event_type"), Some("deploy_event"));
-        assert_eq!(attr(event, "env"), Some("prod"));
+        assert_eq!(attr(event, "deployment.environment.name"), Some("prod"));
         assert_eq!(event.attributes.get("urgent"), Some(&Value::Bool(true)));
         // `api` means no source.
         assert_eq!(attr(event, "_logit.statsd.event.source_type"), None);

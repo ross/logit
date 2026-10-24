@@ -72,6 +72,12 @@
   ], "counters": {
     "logit.output.metrics.normalized{component=out,kind=prometheus_out,reason=name_sanitized,role=sink}": 1
   }},
+  "service-tags": {"events": [
+    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"app_requests","kind":"gauge","value":3.0}],"attributes":{"deployment_environment_name":"dev","env":"prod","service":"api","version":"1.2"}}
+  ], "counters": {
+    "logit.output.labels.normalized{component=out,kind=prometheus_out,reason=name_sanitized,role=sink}": 1,
+    "logit.output.metrics.normalized{component=out,kind=prometheus_out,reason=name_sanitized,role=sink}": 1
+  }},
   "string-field": {"events": [
     {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"deploy_count","kind":"gauge","value":1.0}],"attributes":{"host":"web-01"}}
   ], "counters": {

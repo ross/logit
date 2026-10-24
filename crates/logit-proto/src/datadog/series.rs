@@ -167,10 +167,10 @@ impl<'a> WireSeries<'a> {
     }
 
     /// Tags first, then the wire's own fields, so a tag spelled like a carrier (`host.name:x`)
-    /// loses to the field it names. Also returns how many tags were skipped for a private key and
-    /// how many `host.name` tags the host displaced, for the caller to count once the series
-    /// delivers a point.
-    pub(super) fn attributes(&self) -> (AttrMap, usize, usize) {
+    /// loses to the field it names. Also returns the tags [`insert_tags`] left off and how many
+    /// `host.name` tags the host displaced, for the caller to count once the series delivers a
+    /// point.
+    pub(super) fn attributes(&self) -> (AttrMap, super::tags::Omitted, usize) {
         let mut attrs = AttrMap::new();
         let reserved = insert_tags(&mut attrs, self.tags.iter().copied());
         let displaced = insert_wire_host(&mut attrs, self.host);
@@ -2070,7 +2070,7 @@ mod tests {
         assert_eq!(m.unit.map(resolve), Some("byte"));
         assert_eq!(m.kind, MetricKind::gauge(1.5));
         let a = &e.attributes;
-        assert_eq!(a.get("env"), Some(&Value::str("prod")));
+        assert_eq!(a.get("deployment.environment.name"), Some(&Value::str("prod")));
         assert_eq!(a.get("urgent"), Some(&Value::Bool(true)));
         assert_eq!(a.get(ATTR_HOST_NAME), Some(&Value::str("myhost")));
         assert_eq!(a.get(ATTR_DEVICE), Some(&Value::str("/dev/sda1")));
@@ -2094,7 +2094,7 @@ mod tests {
         assert_eq!(batch.events.len(), 2);
         for event in &batch.events {
             let a = &event.attributes;
-            assert_eq!(a.get("env"), Some(&Value::str("prod")));
+            assert_eq!(a.get("deployment.environment.name"), Some(&Value::str("prod")));
             assert_eq!(a.get("logit.x"), Some(&Value::str("1")));
             assert_eq!(a.get("_logitx"), Some(&Value::Bool(true)));
             assert_eq!(a.len(), 3, "no private key survives: {a:?}");
@@ -2598,6 +2598,38 @@ mod tests {
         assert_eq!(batch.events[1].attributes.get(ATTR_HOSTLESS), Some(&Value::Bool(true)));
         assert_eq!(host_name(2), Some(Value::str("web1")));
         assert_eq!(counted(&registry, "logit.input.tags.omitted", ("reason", "reserved_key")), 3.0);
+    }
+
+    /// `env:`, `version:`, and `service:` tags are the service identity keys on a series, and a
+    /// tag spelling the key beside its Datadog tag is omitted, counted only once the series
+    /// delivers a point. The keys leave as the same tags on every series route.
+    #[test]
+    fn a_series_service_tags_are_the_standard_keys_and_round_trip() {
+        let (mut decoder, registry) = decoder();
+        let body = br#"{"series":[
+            {"metric":"a","points":[[1700000000,1]],"tags":["deployment.environment.name:dev","env:prod","version:1.2","service:api"]},
+            {"metric":"b","points":[[1700000000,null]],"tags":["service.name:x","service:api"]}]}"#;
+        let batch = decoder.decode_series_v1(body, 0).unwrap();
+        assert_eq!(batch.events.len(), 1);
+        let a = &batch.events[0].attributes;
+        assert_eq!(a.get("deployment.environment.name"), Some(&Value::str("prod")));
+        assert_eq!(a.get("service.version"), Some(&Value::str("1.2")));
+        assert_eq!(a.get("service.name"), Some(&Value::str("api")));
+        assert_eq!((a.get("env"), a.get("version"), a.get("service")), (None, None, None));
+        assert_eq!(counted(&registry, "logit.input.tags.omitted", ("reason", "reserved_key")), 1.0);
+
+        let sorted = |tags: &JsonValue| {
+            let mut tags: Vec<String> =
+                tags.as_array().unwrap().iter().map(|t| t.as_str().unwrap().to_string()).collect();
+            tags.sort();
+            tags
+        };
+        let mut e = DatadogEncoder::new();
+        let v1: JsonValue = serde_json::from_slice(&e.encode_series_v1(&batch).unwrap()).unwrap();
+        assert_eq!(sorted(&v1["series"][0]["tags"]), ["env:prod", "service:api", "version:1.2"]);
+        let v2: JsonValue =
+            serde_json::from_slice(&e.encode_series_v2_json(&batch).unwrap()).unwrap();
+        assert_eq!(sorted(&v2["series"][0]["tags"]), ["env:prod", "service:api", "version:1.2"]);
     }
 
     /// A `collectd.host` is another family's key: it leaves as a tag on every series route and

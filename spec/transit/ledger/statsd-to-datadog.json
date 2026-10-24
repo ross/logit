@@ -12,6 +12,7 @@
     {"sink":"datadog_out","row":"attributes/private_carrier","cell":0,"observed":["normalized"]},
     {"sink":"datadog_out","row":"attributes/resource_attribute","cell":0,"observed":["normalized"]},
     {"sink":"datadog_out","row":"attributes/scope","cell":0,"observed":["lost"]},
+    {"sink":"datadog_out","row":"attributes/service_identity","cell":0,"observed":["exact"]},
     {"sink":"datadog_out","row":"attributes/span_kind","cell":0,"observed":["normalized"]},
     {"sink":"datadog_out","row":"attributes/string_value","cell":0,"observed":["exact"]},
     {"sink":"datadog_out","row":"attributes/timestamp_value","cell":0,"observed":["normalized"]},

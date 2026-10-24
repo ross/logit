@@ -477,13 +477,21 @@ impl Spelling {
     /// `statsd_out` under `format: dogstatsd` writes a `host` attribute the line's own host
     /// doesn't omit as a `host:` tag, which `statsd_in` reads back as the line's host
     /// ([`statsd::host_read_back`]), and `datadog_out` writes `container.id` as the
-    /// `container_id` tag on the routes that write tags ([`datadog::tags_container_id`]).
+    /// `container_id` tag on the routes that write tags ([`datadog::tags_container_id`]). Where a
+    /// sink writes Unified Service Tagging tags, a valued `env`, `version`, or `service` attribute
+    /// is that tag, which the pair decoder reads back under its standard key ([`unified::key`]).
     fn key_for(self, key: &str, rec: &Rec) -> String {
         if self == Spelling::Datadog
             && key == logit_core::attrs::CONTAINER_ID
             && datadog::tags_container_id(rec)
         {
             return "container_id".to_string();
+        }
+        if unified::writes_tags(self, rec) {
+            let value = rec.attributes.get(key).or_else(|| rec.resource.get(key));
+            if let Some(standard) = value.and_then(|value| unified::key(key, value)) {
+                return standard.to_string();
+            }
         }
         if self == (Spelling::Statsd { dogstatsd: true }) && key == "host" {
             let value = rec.attributes.get(key).or_else(|| rec.resource.get(key));
@@ -498,7 +506,8 @@ impl Spelling {
 
     /// [`Spelling::value`] for attribute `key` of `rec`. `None` where the sink writes no tag for
     /// the value: `graphite_out`'s omitted values, `statsd_out`'s `host` beside the line's own
-    /// host, and `datadog_out`'s log `hostname`.
+    /// host, `datadog_out`'s log `hostname`, and a valued `env`, `version`, or `service` beside its
+    /// standard key where the sink writes Unified Service Tagging tags.
     fn value_for(self, key: &str, value: &Value, tags: &str, rec: &Rec) -> Option<String> {
         if self == (Spelling::Statsd { dogstatsd: true })
             && key == "host"
@@ -507,6 +516,9 @@ impl Spelling {
             return None;
         }
         if self == Spelling::Datadog && key == "hostname" && datadog::hostname_is_omitted(rec) {
+            return None;
+        }
+        if unified::tag_is_omitted(self, rec, key, value) {
             return None;
         }
         if self == Spelling::Graphite {
@@ -655,6 +667,47 @@ mod statsd {
             Some(_) => Some(HOST_NAME),
             None => None,
         }
+    }
+}
+
+/// Datadog's Unified Service Tagging tags (`logit_core::attrs::UNIFIED_SERVICE_TAGS`):
+/// `statsd_out` under `format: dogstatsd` and `datadog_out` on its tag routes write the standard
+/// keys as `env:`, `version:`, and `service:` tags, which their pair decoders read back as the
+/// keys, and leave off a valued attribute of a tag's name beside its key.
+mod unified {
+    use super::{datadog, Rec, Spelling};
+    use logit_core::attrs::UNIFIED_SERVICE_TAGS;
+    use serde_json::Value;
+
+    /// Whether `spelling`'s sink writes `rec`'s service identity as Datadog tags.
+    pub(super) fn writes_tags(spelling: Spelling, rec: &Rec) -> bool {
+        spelling == (Spelling::Statsd { dogstatsd: true })
+            || (spelling == Spelling::Datadog && datadog::tags_container_id(rec))
+    }
+
+    /// The standard key a valued `env`, `version`, or `service` attribute's tag reads back
+    /// under; `None` for any other key and for a bare token (`true`), which names no value.
+    pub(super) fn key(key: &str, value: &Value) -> Option<&'static str> {
+        if *value == Value::Bool(true) {
+            return None;
+        }
+        UNIFIED_SERVICE_TAGS.iter().find(|(tag, _)| *tag == key).map(|(_, standard)| *standard)
+    }
+
+    /// Whether `rec` carries the standard key a valued `key` attribute's tag names, with a value
+    /// that writes a tag.
+    pub(super) fn beside_its_key(rec: &Rec, key: &str, value: &Value) -> bool {
+        self::key(key, value).is_some_and(|standard| {
+            rec.attributes
+                .get(standard)
+                .or_else(|| rec.resource.get(standard))
+                .is_some_and(|v| !v.is_null() && !v.is_object())
+        })
+    }
+
+    /// Whether `spelling`'s sink leaves `rec`'s `key` attribute off beside its standard key.
+    pub(super) fn tag_is_omitted(spelling: Spelling, rec: &Rec, key: &str, value: &Value) -> bool {
+        writes_tags(spelling, rec) && beside_its_key(rec, key, value)
     }
 }
 
@@ -1523,11 +1576,28 @@ fn field_rows(rec: &Rec, protocol: &str) -> Vec<(String, Option<String>, Field)>
             None
         }
     };
+    // An event's service identity: a standard key, or a valued attribute of a Unified Service
+    // Tagging tag's name, alone or beside its key. On the resource, each is a resource attribute.
+    let service = |key: &str, value: &Value| {
+        if value.is_string()
+            && logit_core::attrs::UNIFIED_SERVICE_TAGS.iter().any(|(_, standard)| key == *standard)
+        {
+            Some("service_identity")
+        } else if unified::beside_its_key(rec, key, value) {
+            Some("service_tag_beside_key")
+        } else if value.is_string() && unified::key(key, value).is_some() {
+            Some("service_tag")
+        } else {
+            None
+        }
+    };
     for (key, value) in &rec.attributes {
         let tags = rec.attribute_types.get(key).map(String::as_str).unwrap_or("");
         let feature = if let Some(feature) = carrier(key, value) {
             feature
         } else if let Some(feature) = outranked(key, value) {
+            feature
+        } else if let Some(feature) = service(key, value) {
             feature
         } else if tags.contains("=bytes") {
             "bytes_value"
@@ -1632,7 +1702,7 @@ fn observe_field(field: &Field, input: &Rec, out: &Rec, spelling: Spelling) -> C
                     key == "host" && statsd::host_is_omitted(input, want)
                 }
                 _ => false,
-            };
+            } || unified::tag_is_omitted(spelling, input, key, want);
             if outranked {
                 return Class::Lost;
             }

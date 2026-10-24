@@ -86,6 +86,9 @@
 //! | `attributes/host_beside_host_name` | exact | -- | A string attribute. |
 //! | `attributes/hostname` | exact | -- | A log attribute. |
 //! | `attributes/container_id` | exact | -- | A string attribute. |
+//! | `attributes/service_identity` | exact | -- | A string attribute. |
+//! | `attributes/service_tag` | exact | -- | A string attribute. |
+//! | `attributes/service_tag_beside_key` | exact | -- | A string attribute. |
 //! | `attributes/bool_value` | exact | -- | A boolean attribute. |
 //! | `attributes/number_value` | normalized | `u64_as_int`; `logit.output.attributes.normalized{reason=u64_as_double}` | An integer or double attribute. A `u64` reads back as an `i64`, or, above `i64::MAX`, as a double, approximate beyond 2^53, counted once per such value. |
 //! | `attributes/array_value` | exact | -- | An array attribute. |

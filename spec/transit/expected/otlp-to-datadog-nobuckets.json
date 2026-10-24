@@ -1,6 +1,6 @@
 {
   "attributes": {"events": [
-    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"build.info","kind":"gauge","value":1.0}],"attributes":{"debug":"false","host.name":"web-1","regions":["us-east","2"],"service.name":"checkout","shard":"12","version":"2.4.1","weight":"0.75"},"resource":{"attributes":{"_logit.datadog.units":"datadog"}}}
+    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"build.info","kind":"gauge","value":1.0}],"attributes":{"debug":"false","host.name":"web-1","regions":["us-east","2"],"service.name":"checkout","service.version":"2.4.1","shard":"12","weight":"0.75"},"resource":{"attributes":{"_logit.datadog.units":"datadog"}}}
   ], "counters": {
     "logit.output.tags.omitted{component=out,kind=datadog_out,reason=unrepresentable,role=sink}": 2
   }},

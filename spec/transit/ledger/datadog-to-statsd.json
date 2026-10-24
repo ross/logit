@@ -8,6 +8,8 @@
     {"sink":"statsd_out","row":"attributes/no_host","cell":0,"observed":["exact"]},
     {"sink":"statsd_out","row":"attributes/private_carrier","cell":1,"observed":["exact"]},
     {"sink":"statsd_out","row":"attributes/rate","cell":0,"observed":["lost"]},
+    {"sink":"statsd_out","row":"attributes/service_identity","cell":1,"observed":["exact"]},
+    {"sink":"statsd_out","row":"attributes/service_tag","cell":1,"observed":["normalized"]},
     {"sink":"statsd_out","row":"attributes/string_value","cell":1,"observed":["exact"]},
     {"sink":"statsd_out","row":"distribution","cell":1,"observed":["degraded"]},
     {"sink":"statsd_out","row":"gauge/f64","cell":0,"observed":["exact"]},

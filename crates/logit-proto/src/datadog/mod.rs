@@ -223,6 +223,9 @@
 //! | `attributes/host_beside_host_name` | exact | -- | A `host:` tag, which datadog_in reads back as `host`. |
 //! | `attributes/hostname` | lost | `logit.output.tags.omitted{reason=reserved_key}` | A log's `hostname` is `host.name`, so a `hostname` attribute has no key of its own on the wire and is left off, counted. |
 //! | `attributes/container_id` | normalized | `respelled` | On a metric, an event, or a service check, Datadog's `container_id` tag, the Datadog OTLP exporter's spelling, which datadog_in reads back as a `container_id` attribute. |
+//! | `attributes/service_identity` | exact | -- | On a metric, an event, or a service check, Datadog's `env`, `version`, or `service` tag, the Datadog OTLP exporter's spelling, which datadog_in reads back as the key. |
+//! | `attributes/service_tag` | normalized | `respelled` | On a metric, an event, or a service check, the tag of that name, which datadog_in reads back as `deployment.environment.name`, `service.version`, or `service.name`. |
+//! | `attributes/service_tag_beside_key` | lost | `logit.output.tags.omitted{reason=unrepresentable}` | On a metric, an event, or a service check, beside its standard key, which leaves as the same tag, a valued `env`, `version`, or `service` would be a second value for the key, so it's left off, counted once per wire tag. |
 //! | `attributes/bool_value` | normalized | `bool_tag` | `true` is a bare `key` tag and reads back `true`; `false` is `key:false` and reads back as the string. |
 //! | `attributes/number_value` | normalized | `stringified` | A `key:<number>` tag, read back as a string. |
 //! | `attributes/array_value` | normalized | `stringified` | One tag per element in order, which datadog_in folds back into an array of strings, so a number element reads back as its text. |
@@ -1089,10 +1092,12 @@ impl DatadogDecoder {
         self
     }
 
-    /// `logit.input.tags.omitted{reason="reserved_prefix"}`: `n` tags [`tags::insert_tags`]
-    /// skipped for a private key, on a series, sketch, event, or check that was delivered.
-    pub(super) fn reserved_tags(&self, n: usize) {
-        self.omitted_tags(n, "reserved_prefix");
+    /// `logit.input.tags.omitted`: the tags [`tags::insert_tags`] left off a series, sketch,
+    /// event, or check that was delivered, `reason="reserved_prefix"` for a private key and
+    /// `reason="reserved_key"` for a standard service identity key beside its Datadog-spelled tag.
+    pub(super) fn reserved_tags(&self, omitted: tags::Omitted) {
+        self.omitted_tags(omitted.reserved_prefix, "reserved_prefix");
+        self.omitted_tags(omitted.reserved_key, "reserved_key");
     }
 
     /// `logit.input.tags.omitted{reason="reserved_key"}`: `n` `host.name` tags or keys

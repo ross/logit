@@ -362,7 +362,8 @@ fn the_agent_series_carry_the_dogstatsd_clients_metrics() {
     assert_eq!(str_attr(rate, "endpoint"), Some("/checkout"));
     // The client's `env:record` twice (its own tag and `DD_ENV`'s) is one tag by the time the
     // Agent sends it; the decoder's own exact-duplicate dedupe agrees.
-    assert_eq!(str_attr(rate, "env"), Some("record"));
+    assert_eq!(str_attr(rate, "deployment.environment.name"), Some("record"));
+    assert_eq!(str_attr(rate, "env"), None, "`env:` is the standard key, never a bare attribute");
 
     let gauge = by_name["record.queue.depth"];
     assert_eq!(gauge.metrics[0].kind, MetricKind::gauge(17.0));
