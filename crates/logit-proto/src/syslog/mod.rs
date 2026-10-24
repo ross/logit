@@ -107,7 +107,7 @@
 //!
 //! **`process.pid`** is a `Value::U64` when PROCID or a `tag[pid]` bracket is a canonical decimal
 //! that fits a `u64` (ASCII digits with no leading zero, or `0`; no sign). Any other token, such
-//! as `web.1`, `+5`, `007`, or `9223372036854775808`, is the `Value::Str` `syslog.pid` of the raw
+//! as `web.1`, `+5`, `007`, or `18446744073709551616`, is the `Value::Str` `syslog.pid` of the raw
 //! token, so it relays as written: RFC 5424's PROCID is free-form PRINTUSASCII, and a value that
 //! doesn't round-trip through decimal formatting must not change. A PID is one attribute or the
 //! other, never both, and a nil PROCID writes neither. For RFC 3164, `is_tag_shaped` accepts

@@ -349,10 +349,10 @@ async fn a_pid_keeps_its_attribute_and_type_through_the_relay() {
     }
 }
 
-/// Across the recorded sender captures, `syslog.pid` appears only for a PID that isn't canonical
-/// decimal, and `process.pid` only as a `U64`.
+/// No recorded sender writes a PID, so no capture decodes to a `process.pid` or a `syslog.pid`.
+/// The numeric and non-numeric shapes are covered by the hand-written fixtures above.
 #[test]
-fn recorded_captures_carry_syslog_pid_only_for_a_non_canonical_pid() {
+fn no_recorded_sender_writes_a_pid() {
     for name in [
         "logger-rfc3164-basic-000.raw",
         "logger-rfc3164-unicode-000.raw",
@@ -362,16 +362,8 @@ fn recorded_captures_carry_syslog_pid_only_for_a_non_canonical_pid() {
         "rsyslog-000.raw",
     ] {
         let event = decode_one(&read_testdata(name));
-        if let Some(pid) = event.attributes.get("syslog.pid") {
-            let text = pid.as_str().unwrap_or_else(|| panic!("{name}: syslog.pid is {pid:?}"));
-            assert!(
-                text.parse::<u64>().map_or(true, |n| n.to_string() != text),
-                "{name}: canonical decimal {text} must be process.pid"
-            );
-        }
-        if let Some(pid) = event.attributes.get("process.pid") {
-            assert!(matches!(pid, Value::U64(_)), "{name}: process.pid is {pid:?}");
-        }
+        assert!(event.attributes.get("process.pid").is_none(), "{name}: process.pid");
+        assert!(event.attributes.get("syslog.pid").is_none(), "{name}: syslog.pid");
     }
 }
 

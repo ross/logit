@@ -364,10 +364,9 @@ the other, never both. A nil PROCID writes neither.
 A `process.pid` renders when it is an `I64` or `U64` of 0 or more, or a string of ASCII digits
 (written as the string is, so `007` stays `007`). Any other value (a negative integer, a float, a
 boolean, a string with other characters) has no PROCID form. It is left off and counted
-`logit.output.attributes.omitted{reason="invalid_pid"}`, and the lookup continues with the next
-step. A `syslog.pid` beside a `process.pid` that renders loses to it and is counted
-`logit.output.attributes.omitted{reason="pid_beside_process_pid"}`; only an operator's transform or
-another source can produce the pair. The opt-in `structured_data` element no longer carries
+`logit.output.fields.omitted{reason="invalid_value"}`, and the lookup continues with the next
+step. A `syslog.pid` beside a `process.pid` that renders loses to it, uncounted, as every other
+shadowed attribute does; only an operator's transform or another source can produce the pair. The opt-in `structured_data` element no longer carries
 `process.pid`, since it is a header field.
 
 A relay stays a fixed point: a canonical decimal PROCID decodes to `process.pid` and encodes back
