@@ -229,6 +229,9 @@ async fn rfc5424_fixtures_round_trip_byte_for_byte() {
         "rfc5424-sd-dotted-id",
         "rfc5424-nil-timestamp-full",
         "rfc5424-non-numeric-procid",
+        "rfc5424-numeric-procid",
+        "rfc5424-leading-zero-procid",
+        "rfc5424-overflow-procid",
         "rfc5424-non-utf8-msg",
     ];
     for name in cases {
@@ -284,7 +287,12 @@ async fn oversize_sd_name_falls_back_to_rfc3164_with_the_whole_line_as_its_messa
 #[tokio::test]
 async fn rfc3164_fixtures_round_trip_byte_for_byte() {
     let mut harness = Harness::new().await;
-    let cases: &[&str] = &["rfc3164-nonnumeric-pid", "rfc3164-non-utf8-msg"];
+    let cases: &[&str] = &[
+        "rfc3164-nonnumeric-pid",
+        "rfc3164-numeric-pid",
+        "rfc3164-no-pid",
+        "rfc3164-non-utf8-msg",
+    ];
     for name in cases {
         let raw = read_fixture(name, "in");
         assert_byte_for_byte(&mut harness, name, Format::Rfc3164, &raw).await;
@@ -300,6 +308,62 @@ async fn rfc3164_fixtures_round_trip_byte_for_byte() {
     for (testdata_name, fixture_name) in deterministic {
         let raw = read_testdata(testdata_name);
         assert_byte_for_byte(&mut harness, fixture_name, Format::Rfc3164, &raw).await;
+    }
+}
+
+/// A canonical decimal PROCID or `tag[pid]` is a `U64` `process.pid` and any other is a `Str`
+/// `syslog.pid`, never both, and each keeps its attribute through a relay on either dialect.
+#[tokio::test]
+async fn a_pid_keeps_its_attribute_and_type_through_the_relay() {
+    let mut harness = Harness::new().await;
+    let cases: &[(&str, Format, Option<u64>, Option<&str>)] = &[
+        ("rfc5424-numeric-procid", Format::Rfc5424, Some(1234), None),
+        ("rfc5424-leading-zero-procid", Format::Rfc5424, None, Some("007")),
+        ("rfc5424-overflow-procid", Format::Rfc5424, None, Some("18446744073709551616")),
+        ("rfc5424-non-numeric-procid", Format::Rfc5424, None, Some("notanumber")),
+        ("rfc5424-nil-timestamp-full", Format::Rfc5424, Some(42), None),
+        ("rfc5424-example1", Format::Rfc5424, None, None),
+        ("rfc3164-numeric-pid", Format::Rfc3164, Some(1234), None),
+        ("rfc3164-nonnumeric-pid", Format::Rfc3164, None, Some("abc")),
+        ("rfc3164-no-pid", Format::Rfc3164, None, None),
+    ];
+    for (name, format, numeric, text) in cases {
+        let raw = read_fixture(name, "in");
+        let batch = direct_batch(&raw);
+        let (_, decoded) = harness.round_trip(&batch, || SyslogEncoder::new(*format, 16)).await;
+        for event in [&batch.events[0], &decoded.events[0]] {
+            assert_eq!(
+                event.attributes.get("process.pid").and_then(|v| match v {
+                    Value::U64(n) => Some(*n),
+                    _ => None,
+                }),
+                *numeric,
+                "{name}: process.pid"
+            );
+            assert_eq!(
+                event.attributes.get("syslog.pid").and_then(Value::as_str),
+                *text,
+                "{name}: syslog.pid"
+            );
+        }
+    }
+}
+
+/// No recorded sender writes a PID, so no capture decodes to a `process.pid` or a `syslog.pid`.
+/// The numeric and non-numeric shapes are covered by the hand-written fixtures above.
+#[test]
+fn no_recorded_sender_writes_a_pid() {
+    for name in [
+        "logger-rfc3164-basic-000.raw",
+        "logger-rfc3164-unicode-000.raw",
+        "logger-rfc5424-basic-000.raw",
+        "python-syslog-handler-000.raw",
+        "python-syslog-handler-001.raw",
+        "rsyslog-000.raw",
+    ] {
+        let event = decode_one(&read_testdata(name));
+        assert!(event.attributes.get("process.pid").is_none(), "{name}: process.pid");
+        assert!(event.attributes.get("syslog.pid").is_none(), "{name}: syslog.pid");
     }
 }
 
@@ -660,6 +724,9 @@ mod tcp {
             "rfc5424-sd-dotted-id",
             "rfc5424-nil-timestamp-full",
             "rfc5424-non-numeric-procid",
+            "rfc5424-numeric-procid",
+            "rfc5424-leading-zero-procid",
+            "rfc5424-overflow-procid",
             "rfc5424-non-utf8-msg",
         ];
         for name in rfc5424_cases {
@@ -675,7 +742,12 @@ mod tcp {
         )
         .await;
 
-        let rfc3164_cases: &[&str] = &["rfc3164-nonnumeric-pid", "rfc3164-non-utf8-msg"];
+        let rfc3164_cases: &[&str] = &[
+            "rfc3164-nonnumeric-pid",
+            "rfc3164-numeric-pid",
+            "rfc3164-no-pid",
+            "rfc3164-non-utf8-msg",
+        ];
         for name in rfc3164_cases {
             let raw = read_fixture(name, "in");
             assert_byte_for_byte_tcp(&mut harness, name, Format::Rfc3164, &raw).await;

@@ -15,12 +15,13 @@ use super::tags::{count_tags, insert_tags, render_tags};
 use super::time::{nanos_to_seconds, seconds_to_nanos};
 use super::units;
 use super::{
-    insert_wire_host, is_datadog_stats, is_service_check, units_are_datadog, DatadogDecoder,
-    DatadogEncoder, HistogramMode, HistogramOptions, ATTR_DEVICE, ATTR_HOSTLESS, ATTR_HOST_NAME,
-    ATTR_ORIGIN_CATEGORY, ATTR_ORIGIN_METRIC_TYPE, ATTR_ORIGIN_PRODUCT, ATTR_ORIGIN_SERVICE,
-    ATTR_RESOURCES, ATTR_SOURCE_TYPE_NAME, ATTR_TYPE, ATTR_UNITS, MAX_METRIC_TAGS,
-    RESOURCE_ATTR_AGENT_EPOCH, RESOURCE_ATTR_AGENT_INTERNAL_IP, RESOURCE_ATTR_AGENT_PUBLIC_IP,
-    RESOURCE_ATTR_AGENT_TIMEZONE, RESOURCE_ATTR_AGENT_VERSION, UNITS_DATADOG,
+    datadog_stats_name, insert_wire_host, is_datadog_stats, is_service_check, units_are_datadog,
+    DatadogDecoder, DatadogEncoder, HistogramMode, HistogramOptions, ATTR_DEVICE, ATTR_HOSTLESS,
+    ATTR_HOST_NAME, ATTR_ORIGIN_CATEGORY, ATTR_ORIGIN_METRIC_TYPE, ATTR_ORIGIN_PRODUCT,
+    ATTR_ORIGIN_SERVICE, ATTR_RESOURCES, ATTR_SOURCE_TYPE_NAME, ATTR_TYPE, ATTR_UNITS,
+    MAX_METRIC_TAGS, RESOURCE_ATTR_AGENT_EPOCH, RESOURCE_ATTR_AGENT_INTERNAL_IP,
+    RESOURCE_ATTR_AGENT_PUBLIC_IP, RESOURCE_ATTR_AGENT_TIMEZONE, RESOURCE_ATTR_AGENT_VERSION,
+    UNITS_DATADOG,
 };
 use crate::CodecError;
 use bytes::Bytes;
@@ -1035,11 +1036,12 @@ impl DatadogEncoder {
         let mut carriers: Vec<Option<(Carriers, Omitted)>> =
             (0..batch.events.len()).map(|_| None).collect();
         let mut records = Vec::new();
+        let stats_name = datadog_stats_name();
         for index in events {
             let event = &batch.events[index];
             // The tags `carriers` renders, counted without counting what it omits.
             let base = metric_tag_count(&batch.resource, event);
-            let first = first_metric(&batch.resource, event);
+            let first = first_metric(&batch.resource, event, stats_name);
             for (record_index, record) in event.metrics.iter().enumerate().skip(first) {
                 if !on_series_route(record) {
                     continue;
@@ -1300,9 +1302,10 @@ impl DatadogEncoder {
     /// left to its own route, uncounted here.
     pub fn encode_distribution_points(&mut self, batch: &EventBatch) -> Option<Bytes> {
         let mut series = Vec::new();
+        let stats_name = datadog_stats_name();
         for event in &batch.events {
             let mut carriers = None;
-            for record in &event.metrics[first_metric(&batch.resource, event)..] {
+            for record in &event.metrics[first_metric(&batch.resource, event, stats_name)..] {
                 let MetricKind::Samples(samples) = &record.kind else { continue };
                 if record.is_no_recorded_value() {
                     self.metric_not_sent(MetricOut::NoRecordedValue);
@@ -1947,8 +1950,12 @@ pub fn metric_tag_count(resource: &Resource, event: &Event) -> usize {
 /// else `0`. For APM stats ([`is_datadog_stats`]), which belong wholly to the stats routes, it is
 /// `metrics.len()`: `each_series`, `encode_distribution_points`, and `encode_sketches` then skip
 /// the event silently.
-pub(super) fn first_metric(resource: &Resource, event: &Event) -> usize {
-    if is_datadog_stats(resource, event) {
+pub(super) fn first_metric(
+    resource: &Resource,
+    event: &Event,
+    stats_name: Option<Symbol>,
+) -> usize {
+    if is_datadog_stats(resource, event, stats_name) {
         return event.metrics.len();
     }
     usize::from(is_service_check(resource, event))

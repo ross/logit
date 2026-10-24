@@ -259,10 +259,10 @@ now rendered on a 5424 output, plus an opt-in extra element (`structured_data: {
 from an event's non-`syslog.*` attributes. `-` is now only what's written when neither produces
 anything, not the unconditional case this ADR's Decision section describes.
 
-**PROCID may be a string, not only a decimal number.** `syslog.pid` is `Value::U64` or `Value::Str`
-(RFC 5424's PROCID is free-form PRINTUSASCII, not necessarily numeric); `resolve_pid` and
-`write_rfc5424_header`/`write_rfc3164_header` render either shape — see the new ADR's `syslog.pid`
-section.
+**PROCID may be a string, not only a decimal number.** RFC 5424's PROCID is free-form
+PRINTUSASCII, not necessarily numeric; `resolve_pid` and
+`write_rfc5424_header`/`write_rfc3164_header` render either shape (see the amendment below for
+which attribute carries which).
 
 **MSG may be raw bytes.** A non-UTF-8 `log.message` (`Value::Bytes`) is written raw, sanitized at
 the byte level, rather than requiring `Value::Str` as this ADR's "Message body" discussion (and
@@ -343,3 +343,33 @@ with the relay's. Any producer's host now reaches HOSTNAME with no `set` of a sy
 An attribute named `syslog.hostname` is ordinary: `syslog_out` doesn't read it, and the opt-in
 `structured_data` element skips it as it skips every `syslog.*` key. That element also skips
 `host.name`, since HOSTNAME carries it.
+
+## Amendment: PROCID is `process.pid` (2026-10-24)
+
+PROCID, and RFC 3164's `tag[pid]`, is the standard `process.pid`
+([ADR `process-hostname`](process-hostname.md)'s "Amendment: a source fills the common keys").
+`syslog_in` writes it as a `U64` when the token is canonical decimal that fits a `u64` (ASCII
+digits, no sign, no leading zero except `0`). Any other token, such as `web.1`, `+5`, `007`, or
+`18446744073709551616`, stays the string `syslog.pid`, because RFC 5424 calls PROCID opaque and a
+value that doesn't round-trip through decimal formatting must relay as written. An event has one or
+the other, never both. A nil PROCID writes neither.
+
+`syslog_out` resolves PROCID in this order:
+
+1. a `process.pid` on the event that renders;
+2. a `process.pid` on the batch resource that renders;
+3. the event's `syslog.pid` string;
+4. `-` (RFC 5424) or no bracket (RFC 3164).
+
+A `process.pid` renders when it is an `I64` or `U64` of 0 or more, or a string of ASCII digits
+(written as the string is, so `007` stays `007`). Any other value (a negative integer, a float, a
+boolean, a string with other characters) has no PROCID form. It is left off and counted
+`logit.output.fields.omitted{reason="invalid_value"}`, and the lookup continues with the next
+step. A `syslog.pid` beside a `process.pid` that renders loses to it, uncounted, as every other
+shadowed attribute does; only an operator's transform or another source can produce the pair. The opt-in `structured_data` element no longer carries
+`process.pid`, since it is a header field.
+
+A relay stays a fixed point: a canonical decimal PROCID decodes to `process.pid` and encodes back
+to the same digits, and every other token keeps its attribute and its bytes. No permitted
+normalization is added. `otlp_out` and `splunk_hec_out` send `process.pid` as an integer attribute,
+and the Datadog log encoder treats it as an ordinary attribute.

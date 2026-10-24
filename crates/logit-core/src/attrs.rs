@@ -165,6 +165,14 @@ pub const CONTAINER_ID: &str = "container.id";
 /// image tag.
 pub const CONTAINER_IMAGE_TAGS: &str = "container.image.tags";
 
+/// The standard OS process id key (semconv's `process.pid`), a `Value::U64`.
+///
+/// A source writes it from a field its protocol defines as a process id; `syslog_in` writes it
+/// from a syslog PROCID that is canonical decimal. A sink reads it on the event, else on the batch
+/// resource. See ADR `process-hostname` (`docs/adr/process-hostname.md`), "Amendment: a source
+/// fills the common keys".
+pub const PROCESS_PID: &str = "process.pid";
+
 /// The prefix of the private attribute namespace, which protocol codecs reserve for their own use.
 ///
 /// See ADR `private-attribute-namespace` (`docs/adr/private-attribute-namespace.md`) and

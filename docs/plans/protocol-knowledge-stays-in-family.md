@@ -203,7 +203,5 @@ These read another component's internals inside the Datadog family and stay as t
 - **C8**: `datadog_out` and `datadog_trace_out` route APM stats on `_logit.datadog.stats.name`
   (`is_datadog_stats`).
 
-Follow-up, not a rule question: `is_datadog_stats` does an `interner::lookup` per call, per event,
-in `datadog_out` and `datadog/series.rs`. `is_datadog_stats_sym` takes the symbol once and has no
-caller outside `mod.rs` now that `aggregate` doesn't use it
-([metric-flags plan](metric-flags.md)'s "Findings").
+`is_datadog_stats` takes the interned symbol, which each encoder resolves once per batch with
+`datadog_stats_name`.

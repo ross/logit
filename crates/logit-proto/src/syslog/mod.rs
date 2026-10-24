@@ -44,7 +44,7 @@
 //! - `syslog.timestamp`: the sender's TIMESTAMP (below).
 //! - `host.name`: HOSTNAME, under the standard host key (ADR `process-hostname`).
 //! - `syslog.tag`: RFC 3164's TAG name or RFC 5424's APP-NAME.
-//! - `syslog.pid`: RFC 3164's `tag[pid]` bracket or RFC 5424's PROCID (below).
+//! - `process.pid`, or `syslog.pid`: RFC 3164's `tag[pid]` bracket or RFC 5424's PROCID (below).
 //! - `syslog.msgid`: RFC 5424's MSGID.
 //! - `syslog.sd`: RFC 5424's STRUCTURED-DATA (below).
 //!
@@ -105,11 +105,14 @@
 //! and invalid UTF-8 becomes `Value::Bytes` rather than rejecting the line, since RFC 5424 allows
 //! arbitrary binary MSG-ANY.
 //!
-//! **`syslog.pid`** is `Value::U64` when PROCID or a `tag[pid]` bracket is a canonical decimal
-//! that fits a `u64` (ASCII digits with no leading zero, or `0`), and `Value::Str` of the raw token
-//! otherwise, so `+5` and `007` relay as written: RFC 5424's PROCID is free-form PRINTUSASCII. For
-//! RFC 3164, `is_tag_shaped` accepts bracket content that is PRINTUSASCII without `]` (so the
-//! bracket still balances), so the `[...]` isn't absorbed into the message body.
+//! **`process.pid`** is a `Value::U64` when PROCID or a `tag[pid]` bracket is a canonical decimal
+//! that fits a `u64` (ASCII digits with no leading zero, or `0`; no sign). Any other token, such
+//! as `web.1`, `+5`, `007`, or `18446744073709551616`, is the `Value::Str` `syslog.pid` of the raw
+//! token, so it relays as written: RFC 5424's PROCID is free-form PRINTUSASCII, and a value that
+//! doesn't round-trip through decimal formatting must not change. A PID is one attribute or the
+//! other, never both, and a nil PROCID writes neither. For RFC 3164, `is_tag_shaped` accepts
+//! bracket content that is PRINTUSASCII without `]` (so the bracket still balances), so the
+//! `[...]` isn't absorbed into the message body.
 //!
 //! **Every header field and MSG is a slice of the input; a PARAM-VALUE is a copy**, since it is
 //! built byte by byte as its escapes are read.

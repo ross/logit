@@ -500,11 +500,9 @@ impl Spelling {
     /// the value: `graphite_out`'s omitted values, `statsd_out`'s `host` beside the line's own
     /// host, and `datadog_out`'s log `hostname`.
     fn value_for(self, key: &str, value: &Value, tags: &str, rec: &Rec) -> Option<String> {
-        if self == (Spelling::Statsd { dogstatsd: true })
-            && key == "host"
-            && statsd::host_is_omitted(rec, value)
-        {
-            return None;
+        if self == (Spelling::Statsd { dogstatsd: true }) && key == "host" {
+            let kept = statsd::host_kept(rec, value)?;
+            return Some(self.value(&kept, tags));
         }
         if self == Spelling::Datadog && key == "hostname" && datadog::hostname_is_omitted(rec) {
             return None;
@@ -639,12 +637,39 @@ mod statsd {
         usable || get(rec, HOSTLESS) == Some(&Value::Bool(true))
     }
 
-    /// Whether a `host` attribute holding `value` is left off: the line names its own host,
-    /// and `value` isn't a bare `host` token (`true`), which no Agent reads as a host. An array
-    /// mixing `true` with strings reads as omitted whole, where the sink keeps its `true`
-    /// elements; no case reaches one.
+    /// The elements of a `host` attribute holding `value` that the sink leaves off: with the line
+    /// naming its own host, each valued element is a second `host:` tag the Agent consumes, and
+    /// only a bare `host` token (`true`) stays. An array is judged per element, as the sink
+    /// counts it.
+    fn omitted_elements<'a>(rec: &Rec, value: &'a Value) -> Vec<&'a Value> {
+        if !names_host(rec) {
+            return Vec::new();
+        }
+        let elements = match value {
+            Value::Array(elements) => elements.as_slice(),
+            _ => std::slice::from_ref(value),
+        };
+        elements.iter().filter(|e| **e != Value::Bool(true)).collect()
+    }
+
+    /// Whether any element of a `host` attribute holding `value` is left off.
     pub(super) fn host_is_omitted(rec: &Rec, value: &Value) -> bool {
-        names_host(rec) && *value != Value::Bool(true)
+        !omitted_elements(rec, value).is_empty()
+    }
+
+    /// What the sink writes of a `host` attribute holding `value`: the value less its omitted
+    /// elements, `None` when nothing is left.
+    pub(super) fn host_kept(rec: &Rec, value: &Value) -> Option<Value> {
+        let omitted = omitted_elements(rec, value);
+        match value {
+            Value::Array(elements) if !omitted.is_empty() => {
+                let kept: Vec<Value> =
+                    elements.iter().filter(|e| **e == Value::Bool(true)).cloned().collect();
+                (!kept.is_empty()).then_some(Value::Array(kept))
+            }
+            _ if omitted.is_empty() => Some(value.clone()),
+            _ => None,
+        }
     }
 
     /// The key `statsd_in` reads a `host` attribute's `host:` tag back under, where it's written:
@@ -2592,6 +2617,29 @@ mod tests {
         assert_eq!(pair(&ins, &moved, Spelling::Datadog).seen, [None]);
         let host = Field::Attribute { key: "host".to_string(), resource: false };
         assert_eq!(observe_field(&host, &ins[0], &tagged[0], Spelling::Datadog), Class::Exact);
+    }
+
+    /// Beside the line's own host, `statsd_out` keeps a `host` array's bare `true` elements and
+    /// omits its valued ones, so a mixed array is partly omitted, not omitted whole.
+    #[test]
+    fn statsd_judges_a_mixed_host_array_per_element() {
+        let input = |host: &str| {
+            format!(
+                r#"{{{{T}},"metrics":[{{"name":"g","kind":"gauge","value":1.0}}],"attributes":{{"host":{host},"host.name":"h"}}}}"#
+            )
+        };
+        let mixed = recs(&[&input(r#"[true,"web-1"]"#)]);
+        let bare = recs(&[&input("[true]")]);
+        let valued = recs(&[&input(r#""web-1""#)]);
+        let value = |r: &Rec| r.attributes["host"].clone();
+        assert!(statsd::host_is_omitted(&mixed[0], &value(&mixed[0])));
+        assert_eq!(
+            statsd::host_kept(&mixed[0], &value(&mixed[0])),
+            Some(serde_json::json!([true]))
+        );
+        assert!(!statsd::host_is_omitted(&bare[0], &value(&bare[0])));
+        assert_eq!(statsd::host_kept(&bare[0], &value(&bare[0])), Some(serde_json::json!([true])));
+        assert_eq!(statsd::host_kept(&valued[0], &value(&valued[0])), None);
     }
 
     /// A Datadog event's or check's `host.name` is its host, read back as `host.name`.
