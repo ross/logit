@@ -4066,10 +4066,9 @@ mod tests {
         assert_eq!(msgs, vec!["hits:1|c|c:abcd1234"]);
     }
 
-    /// `|c:` is the Agent's local-data field: a lone container id bare, a lone cgroup inode as
-    /// `in-<inode>`, and both as the list `ci-<id>,in-<inode>`, since a list's bare item isn't
-    /// read. `container.id` is never also a tag; one that isn't a non-empty `Str` has no `|c:`
-    /// form and is left off, counted.
+    /// `|c:` is the Agent's local-data field: a lone container id bare (`ci-<id>` when the id
+    /// itself starts with `ci-`, `cid-`, or `in-`), a lone cgroup inode as `in-<inode>`, and both
+    /// as the list `ci-<id>,in-<inode>`, since a list's bare item isn't read.
     #[test]
     fn container_id_and_cgroup_inode_write_the_agents_local_data_forms() {
         let line = |attrs: &[(&str, Value)]| {

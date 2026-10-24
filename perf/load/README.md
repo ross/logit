@@ -108,7 +108,7 @@ them apart.
 | Buffered DogStatsD datagram size | 1,341–1,418 B, 10–11 lines each | `max_bytes: 1432` is the client's own ceiling, and it never splits a line — so the model packs to a ceiling rather than to a line count |
 | Buffered plain-statsd datagram size | 467–507 B, 7–8 lines each | Confirms a second, independent client cuts at *its* own buffer (512 B), not at an MTU — which is why `datagram_mix` is a weighted list rather than one number |
 | Unbuffered datagram size | 95–165 B (tagged), 53–76 B (tagless) | `single: true` datagrams land in the same band without being told to; the model's line lengths are what put them there |
-| Line length | 94–164 B tagged (median 139), 53–76 B tagless (median 61) | Model: 33–134 B, median 116 over all templates. Slightly shorter at the top end — the capture's longest lines carry a `\|c:in-<id>` container-id segment this model omits (see below) |
+| Line length | 94–164 B tagged (median 139), 53–76 B tagless (median 61) | Model: 33–134 B, median 116 over all templates. Slightly shorter at the top end — the capture's longest lines carry a `\|c:in-<inode>` cgroup-inode segment this model omits (see below) |
 | Tags per line | 4–6, median 6 | Model: 3–8, median 6. Widened on purpose, to exercise the decoder's tag loop either side of what this one app happened to emit |
 | Tag keys | `env`, `service`, `region`, `host`, `endpoint`, `status`, `queue`, `query`, `db` | The model uses these plus `tier`, `payment_method`, `priority`, `shard`, `dc`, `component`, `upstream`, `job`, `pool`, `node_role`, `az` — ~20 distinct keys, which is what exercises the decoder's `KeyCache` |
 | Metric name length | 16–28 B tagged (median 23), 46–64 B tagless (median 55) | The model keeps that split: a tagged client's cardinality lives in tags and its names stay short; a tagless one has to put everything in the name |
@@ -144,8 +144,8 @@ capture's and ~55 B longer than the tagless one's.
   at `1 - rate`. So the capture contains very few `|@0.1` lines by construction, which understates
   how often a real hot path is configured to sample. 13% makes sure the decoder's sample-rate
   extrapolation path is exercised.
-- **No `|c:<container-id>` segment.** The captured DogStatsD lines carry one, because the client
-  detected the recording container and volunteered it. It's in the capture (and asserted by
+- **No `|c:` segment.** The captured DogStatsD lines carry a `|c:in-<inode>` cgroup-inode
+  segment, because the client read its own cgroup inode and volunteered it. It's in the capture (and asserted by
   `crates/logit-proto/src/statsd/decode.rs`'s interop tests) but deliberately not in the load model:
   it would add a constant ~11 B to 80% of lines on the strength of one recording environment's
   accident.
