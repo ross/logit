@@ -363,17 +363,18 @@ mapping gives it, whatever source wrote it: `service.name` as `service`,
 the Agent tags a container's logs, and a `container_id:` entry already in the log's `ddtags` loses
 to the key, removed and counted `reason="reserved_key"`, as a log's `hostname` beside `host.name`
 is. Datadog's `image_tag` holds one value, so a Datadog-family sink writes the first element of
-`container.image.tags` as the `image_tag` tag or stats `ImageTag` and omits the rest, counted.
+`container.image.tags` as the `image_tag` tag or stats `ImageTag` and omits the rest, counted
+`reason="unrepresentable"`, as for any value the wire has no place for.
 `statsd_out` under `format: dogstatsd` writes `env:`, `version:`, and `service:` tags and `|c:`.
 `otlp_out` and `splunk_hec_out` pass the keys through as attributes.
 
 **DogStatsD `|c:`.** The Agent reads `|c:` as origin-detection local data (datadog-agent 7.83.3,
-`comp/core/tagger/origindetection/origindetection.go`, `ParseLocalData`). A bare or `ci-` prefixed
-value is the container id, so `statsd_in` will write it as `container.id` with the prefix stripped.
+`comp/core/tagger/origindetection/origindetection.go`, `ParseLocalData`). Every form it reads as a
+container id (bare, `ci-`, and `cid-`) is the container id, so `statsd_in` will write it as `container.id` with the prefix stripped.
 An `in-<inode>` is a cgroup v2 inode, which no neutral key names, so it will decode to the carrier
 `_logit.statsd.cgroup_inode`; a comma pair yields both. `statsd_out` will write `|c:<id>` bare,
-appending `,in-<inode>` when the carrier is present. A `ci-` prefix relaying as the bare id is a
-named normalization of the DogStatsD pair, since the bare form is the one every Agent version
+appending `,in-<inode>` when the carrier is present. A `ci-` or `cid-` prefix relaying as the bare id is
+a named normalization of the DogStatsD pair, since the bare form is the one every Agent version
 reads.
 
 **Datadog logs: `ddtags` is lifted, not split.** `datadog_in` lifts a log's `ddtags` `env:`,

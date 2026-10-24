@@ -113,7 +113,9 @@ the name Datadog's OTLP mapping uses (datadog-agent 7.83.3,
 `otlp_out` and `splunk_hec_out` send the keys as attributes under their semconv names.
 
 Datadog's `image_tag` holds one value, so a Datadog-family sink writes the first element of
-`container.image.tags` and omits the rest, counted. On a log, `container.id` is appended to
+`container.image.tags` and omits the rest, counted
+`logit.output.tags.omitted{reason="unrepresentable"}`, the reason the sinks use for a value the
+wire has no place for. On a log, `container.id` is appended to
 `ddtags` as `container_id:<id>`, as the Agent tags a container's logs; a `container_id:` entry
 already in the log's `ddtags` string loses to the key, removed and counted
 `logit.output.tags.omitted{reason="reserved_key"}`, as a log's `hostname` beside `host.name` is.
@@ -174,10 +176,11 @@ its scope; "Becomes" is the key it moves to, on the same scope unless the row sa
 (datadog-agent 7.83.3, `comp/core/tagger/origindetection/origindetection.go`, `ParseLocalData`):
 a bare id or a `cid-` or `ci-` prefixed one is a container id, an `in-` prefixed one is a cgroup v2
 inode, and a comma pair holds one of each. Today the decoder keeps the whole field verbatim. W1
-will decode a bare or `ci-` prefixed value to `container.id`, with the prefix stripped, and an
+will decode every form `ParseLocalData` reads as a container id (bare, `ci-`, and `cid-`) to
+`container.id`, with the prefix stripped, and an
 `in-<inode>` to the carrier `_logit.statsd.cgroup_inode`, since no neutral key names a cgroup
 inode; a comma pair yields both. `statsd_out` will write `|c:<id>` bare, appending `,in-<inode>`
-when the carrier is present. A `ci-` prefix relaying as the bare id is a named normalization of
+when the carrier is present. A `ci-` or `cid-` prefix relaying as the bare id is a named normalization of
 the DogStatsD pair: the bare form is the one every Agent version reads. W1 records this in the
 DogStatsD relay ADR.
 
