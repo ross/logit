@@ -639,13 +639,19 @@ components:
 single-threaded one. A `lua` component runs on its own thread and is not counted.
 
 Fewer workers trade peak throughput for efficiency. An event handed from one core to another
-costs CPU and cache, so a pipeline pinned to one worker spends less CPU per event and holds less
-memory. In one router benchmark, one worker used 0.58 µs of CPU per event against 1.1 to 2.3 µs
-across 8 workers, and resident memory fell from 80 MiB to 36 MiB, for a throughput loss of 10 to
-20%. A pipeline can then use no more cores than it has workers, so a single hot pipeline is
-capped at that many. An edge agent that relays a trickle usually wants one or two workers; a
-central collector aggregating many sources wants the default. `logit` never picks the count from
-the config or the host; the default stays one per CPU until real-traffic measurements say otherwise.
+costs CPU and cache, so a pipeline on fewer workers spends less CPU per event and holds less
+memory. A pipeline can use no more cores than it has workers. `logit` never picks the count from
+the config or the host, and the default stays one per CPU. These figures come from an 8-core VM
+and move with the host's cache layout, so measure your own traffic before you change it.
+
+| Node | Set | What to expect |
+|---|---|---|
+| Its event rate is set by its producers, such as an edge agent relaying a trickle | `workers: 1` | 9 to 37% less CPU per event at the same rate, and usually about half the memory. |
+| Its work is mostly routing (`route`, `route_signals`) | `workers: 2` | `route_signals` used 37% less CPU per event and ran 47% faster than the default. |
+| It parses, encodes, relays natively or to Splunk, or must keep up with a flood | the default | One worker lost up to 59% of the throughput of a parse-heavy pipeline, and two lost up to 31%. |
+
+A pipeline that runs on one busy thread anyway (`aggregate`, `lua`) gains nothing from fewer
+workers, so leave it at the default.
 
 ## Self-logging
 
