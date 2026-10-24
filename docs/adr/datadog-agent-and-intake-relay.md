@@ -821,3 +821,45 @@ The like pairs stay fixed points: a tracer's container id relays through `contai
 ways, and `datadog_in` reads a series' `container_id:` tag back as an attribute of that name,
 which `datadog_out` writes back unchanged. `datadog_out` writes no `container.id` it wasn't given,
 so the Datadog-to-Datadog relay sends nothing new.
+
+## Amendment: service identity is on the standard keys (2026-10-24)
+
+A sender's service, environment, and version are `service.name`, `deployment.environment.name`,
+and `service.version` ([ADR `process-hostname`](process-hostname.md) has the tables). What
+datadog-agent 7.83.3 does with each form decided the mapping.
+
+### Logs
+
+- **What the Agent sends.** The Agent's logs encoder writes every log with the same seven keys
+  and no `omitempty`, `service` from `Origin.Service()` and `ddtags` from `Origin.TagsToString()`
+  (`comp/logs-library/processor/json.go`, `jsonEncoder.Encode`), so a log with neither arrives
+  as `"service":""` and `"ddtags":""`. `Origin.Service` is the log source's configured service,
+  else the origin's own (`pkg/logs/message/origin.go`), and the origin's tags are the tagger's
+  tags for the entity the log came from, then `sourcecategory:` and the source's configured tags
+  (`tagsToStringArray`; the tagger's through `pkg/logs/internal/tag/provider.go`, `GetTags`,
+  from `pkg/logs/tailers/container/tailer.go`, `buildMessage`, and
+  `pkg/logs/tailers/file/tailer.go`, `forwardMessages`). The tagger's tags for a container that
+  sets Unified Service Tagging include `env:`, `version:`, and `service:`, so a container's log
+  can carry its service twice, as the field and as a `ddtags` entry.
+- **The decode.** `datadog_in` writes a log's non-empty `service` as `service.name`, and lifts
+  `ddtags`' `env:`, `version:`, and `service:` entries onto the three keys, keeping every other
+  entry in the one string. The field beats the entry, so a container's twice-carried service is
+  one `service.name`, and the entry is omitted, counted
+  `logit.input.tags.omitted{reason="reserved_key"}`. An empty `service` is no service, as an
+  empty `hostname` is no host.
+- **Not a full split.** A tag and a top-level field are different things in Datadog, and
+  `datadog_out` writes every attribute as a top-level field, so splitting every `ddtags` entry
+  would turn each relayed tag into a field. The three lifted entries are the ones every route
+  has a standard key for.
+- **The encode.** `datadog_out` writes `service.name` as the log's `service` and
+  `deployment.environment.name` and `service.version` as `env:` and `version:` entries appended
+  to `ddtags`, before `container_id:`, whatever source wrote them. An `otlp_in -> datadog_out`
+  log whose resource carries `deployment.environment.name` or `service.version` now reaches
+  Datadog tagged `env:` and `version:`, the tags Datadog's OTLP mapping gives those keys
+  (`pkg/opentelemetry-mapping-go/otlp/attributes/attributes.go`, `coreMapping`). A `service`
+  attribute is omitted, counted `logit.output.tags.omitted{reason="reserved_key"}`, as a
+  `hostname` attribute is: it would be a second `service` key in the object.
+
+The logs relay stays a fixed point from the first hop on, modulo `logit_proto::datadog`'s
+permitted normalization (10): the lifted entries rejoin at the end of `ddtags`, and a `service:`
+entry beside the log's own `service` doesn't come back.

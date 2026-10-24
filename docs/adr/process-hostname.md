@@ -263,7 +263,9 @@ The common keys today, and who writes each:
 | Key | Written by, from |
 |---|---|
 | `host.name` | `collectd_in` from each value list's host part, on the event; `syslog_in` from HOSTNAME, on the event; `statsd_in` and `datadog_in` from the wire hosts above, on the event; `datadog_in`'s traces and stats routes and `datadog_trace_in` from each tracer or stats payload's hostname, on the resource; `splunk_hec_in` from each object's `host`, on the resource; `docker_in` under `host_name: container` from the container's `Config.Hostname`, on the resource, and otherwise not at all; `internal` from the process hostname, on the resource; `otlp_in` passes the sender's resource and record attributes through, which already use the standard key |
-| `service.name` | `internal`, on the resource; `datadog_in` (its traces route) and `datadog_trace_in` from each span's `service`, on the span's event, and their APM stats routes (`datadog_in`'s stats route, `datadog_trace_in`'s `/v0.6/stats`) from each `ClientGroupedStats`' `Service`, on the group's event; `otlp_in` passes it through; otherwise an operator's `set`. A Datadog log's `service` stays the attribute `service`, which `datadog_out` writes back as the log's `service` |
+| `service.name` | `internal`, on the resource; `datadog_in` (its traces route) and `datadog_trace_in` from each span's `service`, on the span's event, and their APM stats routes (`datadog_in`'s stats route, `datadog_trace_in`'s `/v0.6/stats`) from each `ClientGroupedStats`' `Service`, on the group's event; `otlp_in` passes it through; `datadog_in`'s logs route from each log's `service`, else its `ddtags` `service:` entry, on the log's event ("Amendment: Datadog log service identity (2026-10-24)"); otherwise an operator's `set` |
+| `deployment.environment.name` | `datadog_in`'s logs route from each log's `ddtags` `env:` entry, on the log's event; `otlp_in` passes it through |
+| `service.version` | `datadog_in`'s logs route from each log's `ddtags` `version:` entry, on the log's event; `otlp_in` passes it through |
 | `container.id` | `statsd_in` from a DogStatsD line's `\|c:` container id, on the event; `datadog_in`'s traces and stats routes and `datadog_trace_in` from each tracer or stats payload's container id or the `Datadog-Container-ID` header, on the resource; `docker_in` from the container's directory name, on the resource; `otlp_in` passes it through ("Amendment: container identity (2026-10-24)") |
 | `container.image.tags` | `docker_in` from the image reference's tag, on the resource; `datadog_in`'s stats route and `datadog_trace_in`'s `/v0.6/stats` from a `ClientStatsPayload`'s `ImageTag`, on the resource; each a one-element array; `otlp_in` passes it through |
 | `network.peer.*`, `client.*` | every network listener but `logit_in`, opt-in ([ADR `listener-peer-address`](listener-peer-address.md)) |
@@ -346,3 +348,30 @@ already in a log's `ddtags` is omitted, counted `{reason="reserved_key"}`.
 container identity is `container.id` (2026-10-24)" has the Agent and exporter sources, and
 [ADR `statsd-output`](statsd-output.md)'s "Amendment (2026-10-24): `|c:` is the Agent's local
 data" the DogStatsD relay's normalization.
+
+## Amendment: Datadog log service identity (2026-10-24)
+
+A Datadog log's service, environment, and version decode onto `service.name`,
+`deployment.environment.name`, and `service.version`, by the rule above, on the log's event.
+
+| Wire form | Writes |
+|---|---|
+| a log's `service`, a non-empty string | `service.name`; an empty one is no service, and a non-string one stays the attribute `service` |
+| a log's `ddtags` `env:<v>`, `version:<v>`, and `service:<v>` entries (Unified Service Tagging's three tags) | `deployment.environment.name`, `service.version`, and `service.name`, each from the first entry with a non-empty value. The entries leave `ddtags`; every other entry stays in the one string, in order |
+
+A protocol's own form beats a sender's: the log's `service` field beats a `ddtags` `service:`
+entry, the first valued entry a later one of the same key, and either a top-level field spelled
+like the key. Each loser is omitted, counted `logit.input.tags.omitted{reason="reserved_key"}`, as
+a `host.name` key beside a log's `hostname` is. `ddtags` isn't split further: a tag and a
+top-level field are different things in Datadog, and `datadog_out` writes every attribute as a
+field, so a relay would turn each split tag into a field.
+
+| Sink | Log service identity |
+|---|---|
+| `datadog_out` | `service.name` (event, else resource) as the log's `service`; `deployment.environment.name` and `service.version` as `env:` and `version:` entries appended to `ddtags`, before `container_id:`, for any log, an OTLP log included. An entry already in `ddtags` naming one of them is omitted, counted `reason="reserved_key"`. A `service` attribute is omitted, counted `reason="reserved_key"`, beside `service.name` or not, as a `hostname` attribute is |
+| `otlp_out`, `splunk_hec_out`, and the other sinks | the keys as ordinary attributes |
+
+An `env` or `version` attribute on a log is an ordinary top-level field at `datadog_out`, beside
+its key or not: it doesn't collide with a `ddtags` entry. [ADR
+`datadog-agent-and-intake-relay`](datadog-agent-and-intake-relay.md)'s "Amendment: service
+identity is on the standard keys (2026-10-24)" has the Agent's source.

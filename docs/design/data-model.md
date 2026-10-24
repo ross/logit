@@ -129,6 +129,13 @@ resource; a sink reads the event, else the resource, and writes its own wire's f
 ([ADR `process-hostname`](../adr/process-hostname.md)'s "Amendment: container identity
 (2026-10-24)").
 
+**`service.name`, `deployment.environment.name`, and `service.version` are the service identity
+keys** (the OpenTelemetry names, each a `Str`). They follow `host.name`'s rule: `datadog_in`
+writes a log's `service` and its `ddtags` `env:`, `version:`, and `service:` entries on the log's
+event, and `datadog_out` writes them back as the log's `service` and `ddtags` entries
+([ADR `process-hostname`](../adr/process-hostname.md)'s "Amendment: Datadog log service identity
+(2026-10-24)").
+
 **The private namespace `_logit.`: a carrier lives under `_logit.<protocol>.`**
 (`_logit.statsd.type`). A carrier is a protocol's raw wire spelling of something the model
 normalizes, or a payload field only that protocol's family reads. The tables below list every

@@ -44,6 +44,14 @@
 //! OTLP exporter spells them; on a log, `container.id` is a `container_id` entry in `ddtags`.
 //! `datadog_in` reads a `container_id` tag back as an attribute of that name: a tag isn't a
 //! field the protocol defines as the container's identity.
+//!
+//! **A log's service identity is on the standard keys, both ways.** A log's `service` is
+//! `service.name`, and its `ddtags` `env:` and `version:` entries are `deployment.environment.name`
+//! and `service.version`; `datadog_out` writes them back from those keys whatever source wrote
+//! them, an OTLP log's resource included ("Logs, events, service checks" below). Only the three
+//! Unified Service Tagging entries leave `ddtags`: a tag and a top-level field are different
+//! things in Datadog, and every attribute leaves a log as a field.
+//!
 //! Events and service checks reuse
 //! `crates/logit-proto/src/statsd/decode.rs`'s `_logit.statsd.event.*` /
 //! `_logit.statsd.service_check.*` names: they are the same Datadog concepts DogStatsD carries.
@@ -360,7 +368,11 @@
 //! | `timestamp` another type, or an unparseable string | `received_at` | diag `bad_timestamp` |
 //! | `hostname`, a non-empty string | [`ATTR_HOST_NAME`], displacing a `host.name` key | `logit.input.tags.omitted{reason="reserved_key"}` for a displaced key |
 //! | `hostname`, an empty string | nothing: no host | -- |
-//! | `service`, `ddsource`, `ddtags`, and a `hostname` that isn't a string | attributes of the same names, verbatim (`ddtags` stays one comma-joined string; expanding it is a transform's job) | -- |
+//! | `service`, a non-empty string | `service.name`, displacing a `service.name` key | `logit.input.tags.omitted{reason="reserved_key"}` for a displaced key |
+//! | `service`, an empty string | nothing: no service | -- |
+//! | `ddtags` `env:<v>`, `version:<v>`, `service:<v>` entries with a non-empty value (Unified Service Tagging's three tags) | `deployment.environment.name`, `service.version`, `service.name`, from the first such entry per key, but the log's own `service` wins for `service.name`; each displaces a key of its name. Every other entry naming one of those keys (a later one, an empty or bare one, the `service:` beside a `service` field) is left out of `ddtags` | one `logit.input.tags.omitted{reason="reserved_key"}` per left-out entry and displaced key |
+//! | `ddtags`, a string | `ddtags`, verbatim when no entry is lifted; else its other entries joined with `,` in their order, empty tokens left out, and no attribute when none remains. Splitting it further is a transform's job | -- |
+//! | `ddsource`, a `ddtags` that isn't a string, and a `hostname` or `service` that isn't a string | attributes of the same names, verbatim | -- |
 //! | any other key | an attribute of the same name: object → `Map`, array → `Array`, integer → `I64` (`U64` above `i64::MAX`), other number → `F64`, string → `Str`, bool, `null` → `Null` | -- |
 //!
 //! ## Decode: events (`/api/v2/events` envelope, `/api/v1/events`) → events
@@ -425,10 +437,11 @@
 //! | `Event::timestamp` | `timestamp`, integer milliseconds | -- |
 //! | `host.name` other than an empty `Str`, else, unless the log carries `syslog.hostname` or `host` (Datadog's own reserved host attributes, which its log preprocessing reads and which leave as attributes; `syslog_in` writes neither), the default host | `hostname`, omitted when none; `host.name` itself is never an attribute | -- |
 //! | a `hostname` attribute | omitted: it would collide with the wire's own | `logit.output.tags.omitted{reason="reserved_key"}` |
-//! | `service`, else `service.name` | `service` | -- |
+//! | `service.name` other than an empty `Str` | `service`, omitted when none; `service.name` itself is never an attribute | -- |
+//! | a `service` attribute | omitted, beside `service.name` or not: it would collide with the wire's own | `logit.output.tags.omitted{reason="reserved_key"}` |
 //! | `ddsource`, else [`ATTR_SOURCE`], else [`DatadogEncoder::with_default_source`] | `ddsource`, omitted when none | -- |
 //! | `ddtags` | `ddtags`, verbatim, but for the next row | -- |
-//! | [`ATTR_CONTAINER_ID`], a non-empty `Str`, beside a text `ddtags` or none | `container_id:<id>` appended to `ddtags`, the tag the Agent gives a container's logs; a `container_id` entry already in the string is left off. Beside a `ddtags` that isn't text, the key leaves as an attribute | the left-off entry: `logit.output.tags.omitted{reason="reserved_key"}` |
+//! | `deployment.environment.name`, `service.version`, [`ATTR_CONTAINER_ID`], each a non-empty `Str`, beside a text `ddtags` or none | `env:<v>`, `version:<v>`, and `container_id:<id>` (the tag the Agent gives a container's logs) appended to `ddtags` in that order, after its other entries; an entry already in the string naming one of the three tags written is left off. Beside a `ddtags` that isn't text, each key leaves as an attribute | the left-off entry: `logit.output.tags.omitted{reason="reserved_key"}` |
 //! | every other attribute | a top-level key: `Map`/`Array` nested, `Bytes` → base64, `Timestamp` → RFC 3339, non-finite `F64` → `null` | -- |
 //! | an attribute named `message` or `timestamp` | omitted: it would collide with the wire's own | `logit.output.tags.omitted{reason="reserved_key"}` |
 //! | `LogRecord::trace`, when no `trace_id` or `span_id` attribute is present | `trace_id` (32 lowercase hex) and, when the ref has one, `span_id` (16 lowercase hex), after the attributes: the OTel form Datadog's log intake detects. An attribute of either name suppresses both, so a relayed intake log re-encodes unchanged | -- |
@@ -454,9 +467,9 @@
 //! 3. a non-string log `message` leaves as its JSON text;
 //! 4. an envelope item's `source_type_name` is restated from its group key; the Agent's
 //!    `tags: null` on a check leaves as `[]`; an empty optional event field is omitted;
-//! 5. a log with `service.name` or `_logit.datadog.source` but no `service` or `ddsource` leaves
-//!    under the Datadog name; a log's, an event's, or a check's own host displaces a `host.name`
-//!    key or tag beside it, omitted and counted at decode;
+//! 5. a log with `_logit.datadog.source` but no `ddsource` leaves under the Datadog name; a
+//!    log's, an event's, or a check's own host displaces a `host.name` key or tag beside it, and
+//!    a log's own `service` a `service.name` key, omitted and counted at decode;
 //! 6. tags reorder by attribute order, and an exact duplicate tag is dropped;
 //! 7. a log with no `hostname` (or an empty one) and none of `host.name`, `syslog.hostname`, or
 //!    `host`, and an event or service check with no host of its own, leaves with the relay's
@@ -467,6 +480,13 @@
 //!    which leaves as the host and not a tag.
 //! 9. an event's or check's tag whose key is under the private `_logit.` prefix is omitted and
 //!    counted.
+//! 10. a log's `ddtags` `env:`, `version:`, and `service:` entries are lifted at decode (the
+//!     decode table above): `env:` and `version:` rejoin at the end of `ddtags`, in that order
+//!     and before a `container_id:` the relay writes, and `service:` leaves as the `service`
+//!     field, or not at all beside a `service` field of the log's own. Every other entry naming
+//!     a lifted tag (a repeat, an empty or bare one) is left off, counted, and a rewritten string
+//!     has no empty tokens; an empty or bare entry with no valued one beside it stays. A `ddtags`
+//!     emptied by the lift leaves with no `ddtags`, and an empty `service` with no `service`.
 //!
 //! # Traces (`traces`, `traces_msgpack`, `traces_proto`)
 //!
