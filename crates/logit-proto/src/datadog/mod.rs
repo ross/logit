@@ -230,7 +230,8 @@
 //! | `attributes/string_value` | exact | -- | A `key:value` tag, `host` included. `host.name` is the record's host, which datadog_in reads back as `host.name` on every route. |
 //! | `attributes/host_beside_host_name` | exact | -- | A `host:` tag, which datadog_in reads back as `host`. |
 //! | `attributes/hostname` | lost | `logit.output.tags.omitted{reason=reserved_key}` | A log's `hostname` is `host.name`, so a `hostname` attribute has no key of its own on the wire and is left off, counted. |
-//! | `attributes/log_service` | lost | `logit.output.tags.omitted{reason=reserved_key}` | A log's `service` is `service.name`, so a `service` attribute has no key of its own on the wire and is left off, counted. |
+//! | `attributes/log_service` | lost | `logit.output.tags.omitted{reason=reserved_key}` | A log's `service` is `service.name`, so a `service` attribute beside it has no key of its own on the wire and is left off, counted. |
+//! | `attributes/log_service_field` | normalized | `respelled` | A log's string `service` attribute with no `service.name` is the log's `service` field, which datadog_in reads back as `service.name`. |
 //! | `attributes/container_id` | normalized | `respelled` | On a metric, an event, or a service check, Datadog's `container_id` tag, the Datadog OTLP exporter's spelling, which datadog_in reads back as a `container_id` attribute. |
 //! | `attributes/bool_value` | normalized | `bool_tag` | `true` is a bare `key` tag and reads back `true`; `false` is `key:false` and reads back as the string. |
 //! | `attributes/number_value` | normalized | `stringified` | A `key:<number>` tag, read back as a string. |

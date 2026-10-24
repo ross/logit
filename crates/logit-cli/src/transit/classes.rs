@@ -485,6 +485,9 @@ impl Spelling {
         {
             return "container_id".to_string();
         }
+        if self == Spelling::Datadog && key == "service" && datadog::log_service_is_the_field(rec) {
+            return "service.name".to_string();
+        }
         if self == (Spelling::Statsd { dogstatsd: true }) && key == "host" {
             let value = rec.attributes.get(key).or_else(|| rec.resource.get(key));
             if let Some(read) = value.and_then(statsd::host_read_back) {
@@ -707,12 +710,28 @@ mod datadog {
         matches!(Route::of(rec), Route::Metric | Route::Event | Route::Check)
     }
 
-    /// Whether a log's `hostname` or `service` attribute is left off: it would collide with the
-    /// wire's own field of that name, which is `host.name` or `service.name`.
+    /// Whether a log's `hostname` attribute, or its `service` attribute beside a `service.name`
+    /// the encoder writes, is left off: it would collide with the wire's own field of that name.
     pub(super) fn reserved_log_key_is_omitted(rec: &Rec, key: &str) -> bool {
-        matches!(key, "hostname" | "service")
-            && Route::of(rec) == Route::Log
-            && get(rec, key).is_some()
+        let beside = match key {
+            "hostname" => true,
+            "service" => service_name_written(rec),
+            _ => false,
+        };
+        beside && Route::of(rec) == Route::Log && get(rec, key).is_some()
+    }
+
+    /// Whether a log's `service.name` is its `service` field: anything but an empty `Str`.
+    fn service_name_written(rec: &Rec) -> bool {
+        get(rec, "service.name").is_some_and(|v| v.as_str() != Some(""))
+    }
+
+    /// Whether a log's `service` attribute is its `service` field, which `datadog_in` reads back
+    /// as `service.name` when it's a string: one with no `service.name` the encoder writes.
+    pub(super) fn log_service_is_the_field(rec: &Rec) -> bool {
+        Route::of(rec) == Route::Log
+            && !service_name_written(rec)
+            && get(rec, "service").is_some_and(|v| v.as_str().is_some())
     }
 
     /// Whether a span carries a field a Datadog span has no form for: `status: ok`, a status
@@ -1520,6 +1539,8 @@ fn field_rows(rec: &Rec, protocol: &str) -> Vec<(String, Option<String>, Field)>
             Some("hostname")
         } else if key == "service" && datadog::reserved_log_key_is_omitted(rec, key) {
             Some("log_service")
+        } else if key == "service" && datadog::log_service_is_the_field(rec) {
+            Some("log_service_field")
         } else if key == logit_core::attrs::CONTAINER_ID && value.is_string() {
             // The standard key a sink writes in its own wire's form: `statsd_out`'s `|c:`,
             // `datadog_out`'s `container_id` tag.
@@ -2582,7 +2603,7 @@ mod tests {
     }
 
     /// A log's `service.name` is its Datadog `service`, read back as `service.name`; a `service`
-    /// attribute is lost, beside `service.name` or not.
+    /// attribute is lost beside it, and alone is the `service` field, read back as `service.name`.
     #[test]
     fn datadog_pairs_a_logs_service_name_and_loses_a_service_attribute() {
         let log = |attributes: &str| {
@@ -2595,18 +2616,22 @@ mod tests {
         let both = recs(&[&log(r#"{"service.name":"web","service":"s"}"#)]);
         assert_eq!(observe_field(&service, &both[0], &read[0], Spelling::Datadog), Class::Lost);
         let alone = recs(&[&log(r#"{"service":"s"}"#)]);
-        let none = recs(&[&log(r#"{}"#)]);
-        assert_eq!(observe_field(&service, &alone[0], &none[0], Spelling::Datadog), Class::Lost);
+        let moved = recs(&[&log(r#"{"service.name":"s"}"#)]);
+        assert_eq!(
+            observe_field(&service, &alone[0], &moved[0], Spelling::Datadog),
+            Class::Normalized
+        );
         let feature = |rec: &Rec| {
             field_rows(rec, "datadog")
                 .into_iter()
                 .find(|(_, _, f)| matches!(f, Field::Attribute { key, .. } if key == "service"))
                 .and_then(|(_, feature, _)| feature)
         };
-        assert_eq!(feature(&alone[0]).as_deref(), Some("log_service"));
+        assert_eq!(feature(&both[0]).as_deref(), Some("log_service"));
+        assert_eq!(feature(&alone[0]).as_deref(), Some("log_service_field"));
         // On a metric, `service` is an ordinary tag.
         let gauge = recs(&[
-            r#"{{T},"metrics":[{"name":"g","kind":"gauge","value":1.0}],"attributes":{"service":"s"}}"#,
+            r#"{{T},"metrics":[{"name":"g","kind":"gauge","value":1.0}],"attributes":{"service.name":"x","service":"s"}}"#,
         ]);
         assert_eq!(feature(&gauge[0]).as_deref(), Some("string_value"));
     }

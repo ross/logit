@@ -2095,8 +2095,20 @@ rows:
         class: lost
         counter: logit.output.tags.omitted{reason=reserved_key}
         text: >-
-          A log's `service` is `service.name`, so a `service` attribute has no key of its own on
-          the wire and is left off, counted.
+          A log's `service` is `service.name`, so a `service` attribute beside it has no key of
+          its own on the wire and is left off, counted.
+  - kind: attributes
+    feature: log_service_field
+    cells:
+      otlp_out:
+        class: exact
+        text: A log attribute.
+      datadog_out:
+        class: normalized
+        reason: respelled
+        text: >-
+          A log's string `service` attribute with no `service.name` is the log's `service` field,
+          which datadog_in reads back as `service.name`.
   - kind: attributes
     feature: container_id
     cells:
