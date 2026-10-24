@@ -895,16 +895,18 @@ pub fn is_datadog_event(resource: &Resource, event: &Event) -> bool {
 /// APM stats: `_logit.datadog.stats.name` present (the event's, else the resource's), the events
 /// [`DatadogEncoder::encode_client_stats_v06`] and [`DatadogEncoder::encode_stats_payload`] send.
 /// Every metrics route skips such an event whole: its records are a stats group's, not series.
-pub fn is_datadog_stats(resource: &Resource, event: &Event) -> bool {
-    logit_core::interner::lookup(stats::ATTR_STATS_NAME)
-        .is_some_and(|name| is_datadog_stats_sym(resource, event, name))
+/// A caller that tests every event of a batch resolves `stats_name` once with
+/// [`datadog_stats_name`]; each test is then two binary searches with no interner probe.
+pub fn is_datadog_stats(resource: &Resource, event: &Event, stats_name: Option<Symbol>) -> bool {
+    stats_name.is_some_and(|name| {
+        event.attributes.get_sym(name).is_some() || resource.attributes.get_sym(name).is_some()
+    })
 }
 
-/// [`is_datadog_stats`] by `stats_name`, the interned [`stats::ATTR_STATS_NAME`], for a caller
-/// that tests every event and interns the key once: two binary searches, no interner probe.
-pub fn is_datadog_stats_sym(resource: &Resource, event: &Event, stats_name: Symbol) -> bool {
-    event.attributes.get_sym(stats_name).is_some()
-        || resource.attributes.get_sym(stats_name).is_some()
+/// The interned [`stats::ATTR_STATS_NAME`] for [`is_datadog_stats`], `None` while no attribute of
+/// that name has been interned, in which case no event carries it.
+pub fn datadog_stats_name() -> Option<Symbol> {
+    logit_core::interner::lookup(stats::ATTR_STATS_NAME)
 }
 
 /// `_top_level`: the span metric the Agent writes (`1`) on every root, orphan, and

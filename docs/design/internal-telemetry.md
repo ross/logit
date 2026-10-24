@@ -2206,7 +2206,8 @@ itself. The sink emits each once per batch, however many attempts the runtime ma
   reserved characters became `_`, once per record. It reads back under the rewritten name.
 - `logit.output.tags.normalized{reason="name_sanitized"|"value_sanitized"}`: a DogStatsD tag whose
   key, or whose value, had a reserved character written as `_`, once per wire tag of an event that
-  wrote a line.
+  wrote a line; and an event's or service check's `|h:` host with `|` or a control character
+  written as `_`, once per line that was written.
 - `logit.output.reconnects` (count; `tcp`, `unix_stream`, and `unix`): every connect *after* the
   first, as for `syslog_out`. Counted on plaintext and TLS connections alike, because `tcp` and
   `unix_stream` both go through the shared pooled-stream driver.

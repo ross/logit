@@ -794,8 +794,9 @@ impl DatadogEncoder {
         let resource = &*batch.resource;
         let mut buckets: Vec<ClientStatsBucket> = Vec::new();
         let mut index: HashMap<(i64, u64, i64), usize> = HashMap::new();
+        let stats_name = super::datadog_stats_name();
         for event in &batch.events {
-            if !super::is_datadog_stats(resource, event) {
+            if !super::is_datadog_stats(resource, event, stats_name) {
                 continue;
             }
             let (group, duration, shift) = self.group(resource, event);

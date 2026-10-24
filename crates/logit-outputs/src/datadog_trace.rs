@@ -209,8 +209,8 @@ use logit_core::{redact, Diagnostics, EventBatch, Resource, Telemetry, Value};
 use logit_pipeline::{BatchContext, DeliveryPosture, Fault, Output, SeqId};
 pub use logit_proto::datadog::traces_msgpack::TracerApiForm;
 use logit_proto::datadog::{
-    is_datadog_stats, trace_chunks, DatadogEncoder, HEADER_TRACE_COUNT, TRACER_FLAG_HEADERS,
-    TRACER_STR_HEADERS, TRACER_U64_HEADERS,
+    datadog_stats_name, is_datadog_stats, trace_chunks, DatadogEncoder, HEADER_TRACE_COUNT,
+    TRACER_FLAG_HEADERS, TRACER_STR_HEADERS, TRACER_U64_HEADERS,
 };
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -461,8 +461,9 @@ async fn read_hyper_prefix(mut body: hyper::body::Incoming, max: usize) -> Strin
 
 /// The indices of `batch`'s APM stats events, the stats route's items.
 fn stats_items(batch: &EventBatch) -> Vec<usize> {
+    let stats_name = datadog_stats_name();
     (0..batch.events.len())
-        .filter(|&i| is_datadog_stats(&batch.resource, &batch.events[i]))
+        .filter(|&i| is_datadog_stats(&batch.resource, &batch.events[i], stats_name))
         .collect()
 }
 
@@ -674,10 +675,11 @@ impl DatadogTraceOutput {
         next_request: &mut u32,
     ) -> anyhow::Result<()> {
         let resource = &batch.resource;
+        let stats_name = datadog_stats_name();
         let chunks: Vec<Vec<usize>> = trace_chunks(batch)
             .into_iter()
             .map(|mut members| {
-                members.retain(|&i| !is_datadog_stats(resource, &batch.events[i]));
+                members.retain(|&i| !is_datadog_stats(resource, &batch.events[i], stats_name));
                 members
             })
             .filter(|members| !members.is_empty())
