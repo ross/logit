@@ -2,6 +2,7 @@
 # Usage: script/vm up
 #        script/vm shell [remote command...]
 #        script/vm status
+#        script/vm metadata
 #        script/vm down [-y|--yes]
 #        script/vm build <ref|dir|tarball>... [--allow-identical]
 #        script/vm push <local-path>... [--to <remote-dir>]
@@ -11,6 +12,8 @@
 # needs the Azure CLI; with no subcommand, runs `status`. The operator runs `up` and `down`, and an
 # agent runs everything else. `down` deletes the resource group, the only way back to $0: there is
 # no stop, deallocate, or snapshot path. Each LOGIT_VM_* variable overrides a default.
+# `up` ends with `metadata`, which adds the VM's core-to-core latency matrix to
+# ~/logit-vm-metadata.txt as `c2c:` lines; run it again any time to replace them.
 # See docs/adr/disposable-azure-perf-vm.md.
 
 set -e
@@ -23,6 +26,7 @@ usage() {
 Usage: script/vm up
        script/vm shell [remote command...]
        script/vm status
+       script/vm metadata
        script/vm down [-y|--yes]
        script/vm build <ref|dir|tarball>... [--allow-identical]
        script/vm push <local-path>... [--to <remote-dir>]
@@ -32,6 +36,8 @@ Creates, uses, and destroys a disposable Azure VM for perf measurement. Runs on 
 needs the Azure CLI; with no subcommand, runs `status`. The operator runs `up` and `down`, and an
 agent runs everything else. `down` deletes the resource group, the only way back to $0: there is
 no stop, deallocate, or snapshot path. Each LOGIT_VM_* variable overrides a default.
+`up` ends with `metadata`, which adds the VM's core-to-core latency matrix to
+~/logit-vm-metadata.txt as `c2c:` lines; run it again any time to replace them.
 See docs/adr/disposable-azure-perf-vm.md.
 EOF
 }
@@ -351,6 +357,11 @@ vm_up() {
         vm_build_remote "${ip}" "${extra_refs[@]}"
     fi
 
+    # Last, so the matrix is measured on a quiet VM. A failure writes `c2c: unavailable (...)`
+    # and never fails `up`.
+    echo "recording the core-to-core latency matrix..."
+    vm_metadata_remote "${ip}" || echo "warning: the core-to-core capture could not reach the VM; run script/vm metadata to retry" >&2
+
     cat <<EOF
 
 logit perf VM is up and warm.
@@ -366,6 +377,7 @@ logit perf VM is up and warm.
   script/vm build <ref|dir|tarball>...   build another binary to measure (perf/bins/<slug>/logit)
   script/vm push / pull                  copy files to/from the VM (uncommitted work, results)
   script/vm shell                        a login shell in ~/logit, with DOCKER=docker already set
+  script/vm metadata                     re-record the core-to-core latency matrix (c2c: lines)
   script/vm status                       power state, uptime, running cost
   script/vm down                         DELETES the resource group -- the only way back to \$0
 
@@ -374,7 +386,7 @@ This session created the VM, so this session's prompt is the one that should end
 what" section for why an agent won't run this or 'up' for you.
 
 Cite ~/logit-vm-metadata.txt on the VM alongside any number you record. It has the CPU model,
-kernel, image version, and the exact sysctl values this run saw.
+kernel, image version, the exact sysctl values this run saw, and the core-to-core latency matrix.
 EOF
 }
 
@@ -449,6 +461,19 @@ vm_build_remote() {
         remote_cmd+=" $(printf '%q' "${arg}")"
     done
     ssh "${SSH_OPTS[@]}" "${LOGIT_VM_ADMIN_USER}@${ip}" "${remote_cmd}" < "${SCRIPT_PATH}/vm-build-refs"
+}
+
+# Runs script/vm-c2c on the VM at `ip`, fed on stdin like vm-build-refs. Docker is usable once
+# cloud-init finishes, so this works from the end of `up` onward.
+vm_metadata_remote() {
+    ssh "${SSH_OPTS[@]}" "${LOGIT_VM_ADMIN_USER}@$1" bash -s < "${SCRIPT_PATH}/vm-c2c"
+}
+
+vm_metadata() {
+    preflight
+    local ip
+    ip="$(public_ip_or_die)"
+    vm_metadata_remote "${ip}"
 }
 
 vm_build() {
@@ -585,6 +610,7 @@ case "${COMMAND}" in
     pull)   vm_pull "$@" ;;
     shell)  vm_shell "$@" ;;
     status) vm_status "$@" ;;
+    metadata) vm_metadata "$@" ;;
     -h|--help|help) usage; exit 0 ;;
     *) echo "script/vm: unknown subcommand '${COMMAND}'" >&2; usage >&2; exit 2 ;;
 esac
