@@ -244,15 +244,19 @@ fn replay(capture: &Capture) -> Vec<EventBatch> {
     let problems = probe.problems();
     assert!(problems.is_empty(), "{}: {problems:?}", capture.name);
     // A tracer or stats payload's hostname decodes to `host.name`, its container id to
-    // `container.id`, a stats image tag to `container.image.tags`, and a DogStatsD `|c:` to
-    // `container.id` or `_logit.statsd.cgroup_inode`: no carrier for any of them exists on any
-    // resource or event.
+    // `container.id`, its env, version, and stats service to `deployment.environment.name`,
+    // `service.version`, and `service.name`, a stats image tag to `container.image.tags`, and a
+    // DogStatsD `|c:` to `container.id` or `_logit.statsd.cgroup_inode`: no carrier for any of
+    // them exists on any resource or event.
     for batch in &first {
         for carrier in [
             "_logit.datadog.tracer.hostname",
             "_logit.datadog.tracer.container_id",
             "_logit.datadog.stats.image_tag",
             "_logit.statsd.container_id",
+            "_logit.datadog.tracer.env",
+            "_logit.datadog.tracer.app_version",
+            "_logit.datadog.stats.service",
         ] {
             assert_eq!(batch.resource.attributes.get(carrier), None, "{}", capture.name);
             assert!(

@@ -10,10 +10,10 @@
 //! two encodes of one batch differ byte for byte. The encoders sort every map by key instead.
 
 use super::{
-    merged_get, DatadogDecoder, DatadogEncoder, ATTR_CONTAINER_ID, ATTR_DEPLOYMENT_ENVIRONMENT_NAME,
-    ATTR_HOST_NAME, ATTR_RESOURCE_NAME, ATTR_SERVICE_NAME, ATTR_SERVICE_VERSION, ATTR_SPAN_KIND,
-    ATTR_SPAN_TYPE, RESOURCE_ATTR_AGENT_ENV, RESOURCE_ATTR_AGENT_HOSTNAME,
-    RESOURCE_ATTR_AGENT_VERSION, RESOURCE_ATTR_TRACER_LANGUAGE_NAME,
+    merged_get, DatadogDecoder, DatadogEncoder, ATTR_CONTAINER_ID,
+    ATTR_DEPLOYMENT_ENVIRONMENT_NAME, ATTR_HOST_NAME, ATTR_RESOURCE_NAME, ATTR_SERVICE_NAME,
+    ATTR_SERVICE_VERSION, ATTR_SPAN_KIND, ATTR_SPAN_TYPE, RESOURCE_ATTR_AGENT_ENV,
+    RESOURCE_ATTR_AGENT_HOSTNAME, RESOURCE_ATTR_AGENT_VERSION, RESOURCE_ATTR_TRACER_LANGUAGE_NAME,
     RESOURCE_ATTR_TRACER_RUNTIME_ID, RESOURCE_ATTR_TRACER_VERSION,
 };
 use crate::json::value_text;
@@ -406,7 +406,8 @@ impl DatadogDecoder {
                 omitted += 1;
                 continue;
             }
-            let key = META_KEYS.iter().find(|(_, name)| name == k).map_or(k.as_str(), |(key, _)| key);
+            let key =
+                META_KEYS.iter().find(|(_, name)| name == k).map_or(k.as_str(), |(key, _)| key);
             put(&mut attrs, &mut collisions, key, Value::str(v.as_str()));
         }
         for (k, v) in &span.metrics {
@@ -635,9 +636,10 @@ fn sort_map<V>(map: &mut [(String, V)]) {
 /// `env` and `app_version`.
 fn is_carrier(key: &str, value: &Value, event: &Event, form: Form) -> bool {
     match (key, value) {
-        (ATTR_HOST_NAME | ATTR_DEPLOYMENT_ENVIRONMENT_NAME | ATTR_SERVICE_VERSION, Value::Str(s)) => {
-            form.has_chunks() && !s.is_empty() && event.attributes.get(key).is_none()
-        }
+        (
+            ATTR_HOST_NAME | ATTR_DEPLOYMENT_ENVIRONMENT_NAME | ATTR_SERVICE_VERSION,
+            Value::Str(s),
+        ) => form.has_chunks() && !s.is_empty() && event.attributes.get(key).is_none(),
         (ATTR_CONTAINER_ID, _) => {
             is_resource_container_id(Some(value)) && event.attributes.get(key).is_none()
         }
@@ -1476,7 +1478,8 @@ mod tests {
         assert!(chunk.spans[0].meta.contains(&(META_ENV.into(), "staging".into())));
         assert!(chunk.spans[0].meta.contains(&(META_VERSION.into(), "9.9".into())));
         e.resource_carriers_lost(&b.resource, Form::V04, false);
-        let lost = |r: &Registry| counted(r, "logit.output.spans.degraded", ("reason", "no_wire_form"));
+        let lost =
+            |r: &Registry| counted(r, "logit.output.spans.degraded", ("reason", "no_wire_form"));
         assert_eq!(lost(&registry), 0.0, "never lost");
         let b = batch(resource, out);
         let chunk = only_chunk(&e, &b, Form::V04);
@@ -1495,7 +1498,8 @@ mod tests {
         let envs: Vec<_> = s.meta.iter().filter(|(k, _)| k == META_ENV).collect();
         assert_eq!(envs, vec![&(META_ENV.to_string(), "prod".to_string())]);
         assert_eq!(s.metrics, vec![(META_VERSION.to_string(), 2.0)]);
-        let omitted = counted(&registry, "logit.output.tags.omitted", ("reason", "unrepresentable"));
+        let omitted =
+            counted(&registry, "logit.output.tags.omitted", ("reason", "unrepresentable"));
         assert_eq!(omitted, 1.0);
     }
 

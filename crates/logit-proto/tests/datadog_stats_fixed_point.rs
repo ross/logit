@@ -414,10 +414,16 @@ fn intake_stats_payload_with_two_clients_is_a_fixed_point() {
             "_logit.datadog.tracer.hostname",
             "_logit.datadog.tracer.container_id",
             "_logit.datadog.stats.image_tag",
+            "_logit.datadog.tracer.env",
+            "_logit.datadog.tracer.app_version",
+            "_logit.datadog.stats.service",
         ] {
             assert_eq!(a.get(carrier), None, "no {carrier} attribute exists");
         }
     }
+    let a = &batches[0].resource.attributes;
+    assert_eq!(a.get("deployment.environment.name"), Some(&Value::str("prod")));
+    assert_eq!(a.get("service.version"), Some(&Value::str("2.4.1")));
     let a = &batches[0].resource.attributes;
     assert_eq!(a.get("container.id"), Some(&Value::str("3f0a8e")));
     assert_eq!(a.get("container.image.tags"), Some(&Value::Array(vec![Value::str("v2.4.1")])));
