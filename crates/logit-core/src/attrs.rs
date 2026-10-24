@@ -179,7 +179,8 @@ pub const SERVICE_VERSION: &str = "service.version";
 /// Datadog's Unified Service Tagging tags and the standard key each one names, in Datadog's
 /// spelling first: a Datadog-family source writes a valued `env:`, `version:`, or `service:` tag
 /// as the key, and a Datadog-family sink writes the key back as that tag. See ADR
-/// `process-hostname` (`docs/adr/process-hostname.md`), "Amendment: the remaining common keys".
+/// `process-hostname` (`docs/adr/process-hostname.md`), "Amendment: service identity on tags
+/// (2026-10-24)".
 pub const UNIFIED_SERVICE_TAGS: [(&str, &str); 3] =
     [("env", DEPLOYMENT_ENVIRONMENT_NAME), ("version", SERVICE_VERSION), ("service", SERVICE_NAME)];
 

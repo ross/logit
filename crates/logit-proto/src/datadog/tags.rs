@@ -178,11 +178,6 @@ pub fn render_tags<'a>(
                     }
                     dropped.unrepresentable += items.len().saturating_sub(1);
                 }
-                Value::Array(items) if keeps_bare(i) => {
-                    for item in items {
-                        render_service(name, wire, item, out, &mut dropped);
-                    }
-                }
                 _ if keeps_bare(i) => render_service(name, wire, value, out, &mut dropped),
                 _ => render_one(wire, value, out, &mut dropped),
             }
@@ -210,6 +205,8 @@ pub fn render_tags<'a>(
 
 /// Renders one value of a service identity key: a bare token (`true`) under the key's own name,
 /// since a bare `env` would name no environment, and anything else under Datadog's `wire` name.
+/// An `Array` recurses, so a nested bare token stays under the key's name too, as [`count_bare`]
+/// counts it.
 fn render_service(
     name: &str,
     wire: &str,
@@ -217,8 +214,15 @@ fn render_service(
     out: &mut Vec<String>,
     dropped: &mut Dropped,
 ) {
-    let key = if matches!(value, Value::Bool(true)) { name } else { wire };
-    render_one(key, value, out, dropped);
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                render_service(name, wire, item, out, dropped);
+            }
+        }
+        Value::Bool(true) => render_one(name, value, out, dropped),
+        _ => render_one(wire, value, out, dropped),
+    }
 }
 
 fn render_one(key: &str, value: &Value, out: &mut Vec<String>, dropped: &mut Dropped) {
@@ -395,6 +399,21 @@ mod tests {
         assert_eq!(out, ["env", "env:prod", "service:api", "service:web", "version:1.2"]);
         assert_eq!(dropped, Dropped { unrepresentable: 2 }, "env:dev and version:9");
         assert_eq!(count_tags(attrs.iter(), &[]), out.len());
+
+        // A nested bare token stays under the key's own name too, so it shadows nothing and
+        // counting agrees.
+        let mut nested = AttrMap::new();
+        nested.insert(
+            "deployment.environment.name",
+            Value::Array(vec![Value::Array(vec![Value::Bool(true)])]),
+        );
+        nested.insert("env", Value::str("dev"));
+        let mut out = Vec::new();
+        let dropped = render_tags(nested.iter(), &[], &mut out);
+        out.sort();
+        assert_eq!(out, ["deployment.environment.name", "env:dev"]);
+        assert_eq!(dropped, Dropped::default());
+        assert_eq!(count_tags(nested.iter(), &[]), out.len());
 
         // A bare token under a key stays under the key's own name and shadows nothing.
         let mut bare = AttrMap::new();
