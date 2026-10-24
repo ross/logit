@@ -402,7 +402,7 @@ mod tests {
         ATTR_CHUNK_PRIORITY, RESOURCE_ATTR_AGENT_RARE_SAMPLER_ENABLED,
         RESOURCE_ATTR_AGENT_TARGET_TPS,
     };
-    use crate::datadog::{RESOURCE_ATTR_AGENT_HOSTNAME, RESOURCE_ATTR_TRACER_ENV};
+    use crate::datadog::{ATTR_DEPLOYMENT_ENVIRONMENT_NAME, RESOURCE_ATTR_AGENT_HOSTNAME};
     use logit_core::interner::resolve;
     use logit_core::{Registry, Value};
     use std::sync::Arc;
@@ -524,7 +524,7 @@ mod tests {
             assert_eq!(r.get(RESOURCE_ATTR_AGENT_RARE_SAMPLER_ENABLED), Some(&Value::Bool(true)));
         }
         assert_eq!(
-            batches[0].resource.attributes.get(RESOURCE_ATTR_TRACER_ENV),
+            batches[0].resource.attributes.get(ATTR_DEPLOYMENT_ENVIRONMENT_NAME),
             Some(&Value::str("staging"))
         );
         assert!(batches[1].events.is_empty());

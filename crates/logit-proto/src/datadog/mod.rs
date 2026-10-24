@@ -719,6 +719,12 @@ pub const ATTR_CONTAINER_ID: &str = logit_core::attrs::CONTAINER_ID;
 /// `container.image.tags`: an `Array` of `Str` whose first element is a `ClientStatsPayload`'s
 /// `ImageTag`, and on a metric, an event, or a service check Datadog's `image_tag` tag.
 pub const ATTR_CONTAINER_IMAGE_TAGS: &str = logit_core::attrs::CONTAINER_IMAGE_TAGS;
+/// `deployment.environment.name`: Datadog's `env`. A span's `env` meta on the event, a
+/// `TracerPayload`'s `env` or a `ClientStatsPayload`'s `Env` on the batch resource.
+pub const ATTR_DEPLOYMENT_ENVIRONMENT_NAME: &str = logit_core::attrs::DEPLOYMENT_ENVIRONMENT_NAME;
+/// `service.version`: Datadog's `version`. A span's `version` meta on the event, a
+/// `TracerPayload`'s `app_version` or a `ClientStatsPayload`'s `Version` on the batch resource.
+pub const ATTR_SERVICE_VERSION: &str = logit_core::attrs::SERVICE_VERSION;
 
 /// Writes a record's own wire host onto `attributes`: a non-empty one as [`ATTR_HOST_NAME`], an
 /// empty one as [`ATTR_HOSTLESS`], `None` as neither. A host either way displaces a `host.name`
@@ -808,8 +814,6 @@ pub const RESOURCE_ATTR_AGENT_ENV: &str = "_logit.datadog.agent.env";
 pub const RESOURCE_ATTR_TRACER_LANGUAGE_NAME: &str = "_logit.datadog.tracer.language_name";
 pub const RESOURCE_ATTR_TRACER_VERSION: &str = "_logit.datadog.tracer.tracer_version";
 pub const RESOURCE_ATTR_TRACER_RUNTIME_ID: &str = "_logit.datadog.tracer.runtime_id";
-pub const RESOURCE_ATTR_TRACER_ENV: &str = "_logit.datadog.tracer.env";
-pub const RESOURCE_ATTR_TRACER_APP_VERSION: &str = "_logit.datadog.tracer.app_version";
 /// `_logit.datadog.tracer.language_interpreter` / `.language_interpreter_vendor` / `.entity_id` /
 /// `.external_env`: a tracer's `Datadog-Meta-Lang-Interpreter`,
 /// `Datadog-Meta-Lang-Interpreter-Vendor`, `Datadog-Entity-ID`, and `Datadog-External-Env` request

@@ -165,6 +165,15 @@ pub const CONTAINER_ID: &str = "container.id";
 /// image tag.
 pub const CONTAINER_IMAGE_TAGS: &str = "container.image.tags";
 
+/// The standard deployment environment key (`Str`): Datadog's `env`. A source writes it at the
+/// scope where it is identity, an event attribute for a span's own `env`, the resource for a
+/// tracer's payload; a sink reads the event's, else the resource's.
+pub const DEPLOYMENT_ENVIRONMENT_NAME: &str = "deployment.environment.name";
+
+/// The standard service version key (`Str`): Datadog's `version`, scoped as
+/// [`DEPLOYMENT_ENVIRONMENT_NAME`] is.
+pub const SERVICE_VERSION: &str = "service.version";
+
 /// The prefix of the private attribute namespace, which protocol codecs reserve for their own use.
 ///
 /// See ADR `private-attribute-namespace` (`docs/adr/private-attribute-namespace.md`) and

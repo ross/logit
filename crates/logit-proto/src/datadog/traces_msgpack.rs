@@ -1243,7 +1243,7 @@ mod tests {
         let body = span_bytes(|w| {
             w.write_array_len(2);
             w.write_array_len(4);
-            for s in ["", "web", "env", "prod"] {
+            for s in ["", "web", "region", "eu"] {
                 w.write_str(s);
             }
             w.write_array_len(1);
@@ -1276,8 +1276,8 @@ mod tests {
         assert_eq!(e.attributes.get(ATTR_SERVICE_NAME), Some(&Value::str("web")));
         assert_eq!(e.attributes.get(ATTR_SPAN_TYPE), Some(&Value::str("web")));
         assert_eq!(e.attributes.get(ATTR_RESOURCE_NAME), None, "index 0 is the empty string");
-        // `env` is both a meta key and a metrics key here: the metric wins, counted.
-        assert_eq!(e.attributes.get("env"), Some(&Value::F64(0.5)));
+        // `region` is both a meta key and a metrics key here: the metric wins, counted.
+        assert_eq!(e.attributes.get("region"), Some(&Value::F64(0.5)));
         let r = reasons(&registry);
         assert!(r.contains(&"malformed".to_string()));
         assert!(r.contains(&"key_collision".to_string()));
