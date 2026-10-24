@@ -41,7 +41,7 @@
 //! 5. **A relay's STRUCTURED-DATA is `-` when the event carries no `syslog.sd`**, as on any
 //!    3164 -> 5424 relay. Same test as (4).
 //! 6. **The header hostname and app-name can come from `syslog_out`'s configured defaults**
-//!    (`with_hostname`/`with_app_name`) when the event has no `syslog.hostname`/`syslog.tag`. The
+//!    (`with_hostname`/`with_app_name`) when the event has no `host.name`/`syslog.tag`. The
 //!    round-trip encoders here leave both unset so no byte-for-byte case exercises this by
 //!    accident; no test in this file depends on it.
 //! 7. **SD-ELEMENTs and SD-PARAMs are ordered by name, not by wire position.**
@@ -58,7 +58,7 @@
 //!    `a_bare_backslash_param_value_is_re_emitted_in_canonical_escaped_form`.
 //! 9. **A non-UTF-8 RFC 3164 HOSTNAME is dropped.** `parse_3164` never fails a line over its
 //!    HOSTNAME, because `parse_line`'s version-sniff fallback depends on that, so it skips the
-//!    `syslog.hostname` attribute and reports a throttled `hostname_not_utf8` diagnostic. Pinned by
+//!    `host.name` attribute and reports a throttled `hostname_not_utf8` diagnostic. Pinned by
 //!    a unit test in `logit_proto::syslog`:
 //!    `a_non_utf8_rfc3164_hostname_is_skipped_with_a_throttled_diagnostic`.
 //!
@@ -422,7 +422,7 @@ async fn a_3164_to_5424_relay_falls_the_timestamp_to_receipt_time() {
 
     // Dialect-independent fields still round-trip.
     assert_eq!(
-        decoded.events[0].attributes.get("syslog.hostname").and_then(Value::as_str),
+        decoded.events[0].attributes.get("host.name").and_then(Value::as_str),
         Some("myhost")
     );
     assert_eq!(decoded.events[0].attributes.get("syslog.tag").and_then(Value::as_str), Some("app"));
@@ -715,7 +715,7 @@ mod tcp {
         let batch = recv_batch(&mut rx).await;
         assert_eq!(batch.events.len(), 1);
         let event = &batch.events[0];
-        assert_eq!(event.attributes.get("syslog.hostname").and_then(Value::as_str), Some("myhost"));
+        assert_eq!(event.attributes.get("host.name").and_then(Value::as_str), Some("myhost"));
         assert_eq!(event.attributes.get("syslog.tag").and_then(Value::as_str), Some("app"));
         assert_eq!(event.log.as_ref().unwrap().message.as_str(), Some("hello over raw tcp"));
     }

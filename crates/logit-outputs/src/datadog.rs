@@ -31,8 +31,10 @@
 //! There are no per-sink host, service, source, or tag fields (ADR decision 10): the encoders read
 //! them from each event's attributes and the batch resource, so an upstream `set` stamps them. A
 //! series, sketch, log, event, or service check that carries no host gets the process hostname
-//! ([`DatadogOutput::with_default_host`]); trace and stats payloads keep their own hostnames
-//! verbatim. Graph rule 66 validates the block.
+//! ([`DatadogOutput::with_default_host`]). A trace or stats payload's hostname is its resource's
+//! `host.name`. It gets the process hostname only when it has neither that nor a relaying
+//! Agent's hostname: an Agent sends an empty one beside its own. Graph rule 66 validates the
+//! block.
 //!
 //! ## Routes
 //!
@@ -138,8 +140,8 @@
 //! gauge or a cumulative kind, with the same value, wire type, unit, interval, source type, and
 //! origin), since Datadog stores the same point, and otherwise
 //! `logit.output.metrics.dropped{reason="duplicate_timestamp"}`, with a throttled
-//! `duplicate_timestamp` diagnostic. Two equal delta counts or `rate`s (a `Gauge` carrying
-//! `_logit.datadog.type: rate`) are two increments, so the one left off counts `dropped`. Each point left off comes out of its event's weight, so no request cut
+//! `duplicate_timestamp` diagnostic. Two equal delta counts or `rate`s (a `Gauge` flagged
+//! `_logit.metrics.type: rate`) are two increments, so the one left off counts `dropped`. Each point left off comes out of its event's weight, so no request cut
 //! or bisection splits a pair, and `logit.output.records` and
 //! an `at_most_once` drop count only the points sent. Distribution points aren't collapsed:
 //! Datadog keeps both. Two points of one series in one second in two batches are both sent, and
@@ -918,8 +920,9 @@ impl DatadogOutput {
         self
     }
 
-    /// The host of a series, sketch, log, event, or service check that carries none of its own:
-    /// `logit run` passes the process hostname.
+    /// The host of a series, sketch, log, event, or service check that carries none of its own,
+    /// and of a trace or APM stats payload with no resource `host.name` and no relaying Agent's
+    /// hostname: `logit run` passes the process hostname.
     pub fn with_default_host(mut self, host: impl Into<Arc<str>>) -> Self {
         self.default_host = Some(host.into());
         self.encoder = self.new_encoder();
@@ -3381,7 +3384,7 @@ mod tests {
     async fn an_equal_rate_sharing_its_second_is_counted_dropped() {
         let rate = |ts: i64| {
             let mut attributes = AttrMap::new();
-            attributes.insert(logit_proto::datadog::ATTR_TYPE, Value::str("rate"));
+            attributes.insert(logit_core::attrs::METRICS_TYPE, Value::str("rate"));
             Event::metric(ts, attributes, MetricRecord::new(intern("m"), MetricKind::gauge(0.5)))
         };
         let b = batch(vec![rate(NOW), rate(NOW + 500_000_000)]);

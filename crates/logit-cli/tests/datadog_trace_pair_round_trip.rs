@@ -25,7 +25,7 @@ use logit_proto::datadog::stats::{
 };
 use logit_proto::datadog::traces::ATTR_CHUNK_PRIORITY;
 use logit_proto::datadog::{
-    DatadogDecoder, DatadogEncoder, ATTR_SERVICE_NAME, RESOURCE_ATTR_TRACER_HOSTNAME,
+    DatadogDecoder, DatadogEncoder, ATTR_HOST_NAME, ATTR_SERVICE_NAME,
     RESOURCE_ATTR_TRACER_LANGUAGE_NAME,
 };
 use prost::Message;
@@ -175,7 +175,7 @@ fn v07_body() -> Bytes {
 
 fn stats_body() -> Bytes {
     let mut resource = Resource::default();
-    resource.attributes.insert(RESOURCE_ATTR_TRACER_HOSTNAME, Value::str("web-1"));
+    resource.attributes.insert(ATTR_HOST_NAME, Value::str("web-1"));
     let mut attributes = AttrMap::new();
     attributes.insert(ATTR_STATS_NAME, Value::str("http.request"));
     attributes.insert(ATTR_SERVICE_NAME, Value::str("checkout"));
@@ -290,8 +290,9 @@ async fn a_stats_batch_relays_equal() {
 }
 
 /// Under `version: v0.4` a v0.7-origin batch loses what v0.4 has no field for, the chunk
-/// priorities and the tracer payload's hostname, and says so: one `no_wire_form` per span's
-/// chunk carrier and one for the hostname. The language, which a header carries, survives.
+/// priorities, and says so: one `no_wire_form` per span's chunk carrier. The language, which a
+/// header carries, survives, and the tracer payload's hostname, the resource's `host.name`,
+/// arrives as every span's `host.name` tag, since v0.4 has no payload field for it.
 #[tokio::test]
 async fn a_v07_origin_batch_through_v04_counts_what_it_cannot_carry() {
     let (addr, mut rx) = tcp_listener().await;
@@ -302,9 +303,11 @@ async fn a_v07_origin_batch_through_v04_counts_what_it_cannot_carry() {
     let relayed = recv_batch(&mut rx).await;
 
     let mut expected = batch.clone();
-    Arc::make_mut(&mut expected.resource).attributes.remove(RESOURCE_ATTR_TRACER_HOSTNAME);
+    let host = Arc::make_mut(&mut expected.resource).attributes.remove(ATTR_HOST_NAME);
+    assert_eq!(host, Some(Value::str("web-1")), "the v0.7 hostname decodes as host.name");
     for event in &mut expected.events {
         event.attributes.remove(ATTR_CHUNK_PRIORITY);
+        event.attributes.insert(ATTR_HOST_NAME, Value::str("web-1"));
     }
     assert_eq!(relayed, expected);
     assert_eq!(
@@ -313,7 +316,7 @@ async fn a_v07_origin_batch_through_v04_counts_what_it_cannot_carry() {
     );
     let points = registry.drain(0);
     let lost = counted(&points, "logit.output.spans.degraded", "no_wire_form");
-    assert_eq!(lost, batch.events.len() as f64 + 1.0, "a priority per span, and the hostname");
+    assert_eq!(lost, batch.events.len() as f64, "a priority per span");
 }
 
 /// A fresh directory under the system temp dir, removed on drop. Short, because a Unix socket

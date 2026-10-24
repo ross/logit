@@ -42,8 +42,8 @@
   "pickle-tagged-path": {"events": [
     {"timestamp":"2023-11-14T22:13:24.000000000Z","metrics":[{"name":"base.cpu.user","kind":"gauge","value":0.0}]},
     {"timestamp":"2023-11-14T22:13:24.000000000Z","metrics":[{"name":"base.cpu.user","kind":"gauge","value":1.5}]},
-    {"timestamp":"2023-11-14T22:13:24.000000000Z","metrics":[{"name":"base.load","kind":"gauge","value":0.0}],"attributes":{"host":"web-1"}},
-    {"timestamp":"2023-11-14T22:13:24.000000000Z","metrics":[{"name":"base.load","kind":"gauge_delta","delta":-2.0}],"attributes":{"host":"web-1"}},
+    {"timestamp":"2023-11-14T22:13:24.000000000Z","metrics":[{"name":"base.load","kind":"gauge","value":0.0}],"attributes":{"host.name":"web-1"}},
+    {"timestamp":"2023-11-14T22:13:24.000000000Z","metrics":[{"name":"base.load","kind":"gauge_delta","delta":-2.0}],"attributes":{"host.name":"web-1"}},
     {"timestamp":"2023-11-14T22:13:24.000000000Z","metrics":[{"name":"base.mem","kind":"gauge","value":1234567.0}]}
   ], "counters": {
     "logit.output.metrics.degraded{component=out,kind=statsd_out,reason=negative_gauge,role=sink}": 1
@@ -62,7 +62,7 @@
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"sensor.delta","kind":"gauge_delta","delta":-2.75}]},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"sensor.offset","kind":"gauge","value":1.5}]},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"sensor.reading","kind":"gauge","value":100000.0}]},
-    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"servers.web-1.cpu","kind":"gauge","value":0.25}],"attributes":{"dc":"us-east","host":"web-1"}},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"servers.web-1.cpu","kind":"gauge","value":0.25}],"attributes":{"dc":"us-east","host.name":"web-1"}},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"servers.web-1.cpu","kind":"gauge","value":0.5}],"attributes":{"env":"staging"}},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"servers.web-1.disk","kind":"gauge","value":42.0}]},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"servers.web-1.mem","kind":"gauge","value":1234.0}],"attributes":{"role":"db"}}

@@ -115,6 +115,18 @@ Sending directly needs no Agent: it's one hop, and it works wherever HTTPS does.
   and Datadog's OTLP mapping loses parts of a Datadog span
   ([the ADR's "Context"](adr/datadog-agent-and-intake-relay.md#context)).
 
+### A series' `rate` type and `interval`
+
+`datadog_out` has no field for either. A `Gauge` whose event or batch resource sets
+`_logit.metrics.type: rate` leaves as a Datadog `rate`, and `_logit.metrics.interval`, in whole
+seconds, leaves as the `interval` of a series of any type. `datadog_in` sets both from what it
+receives, so a relayed `rate` stays a `rate`. For the `count` points an `aggregate` window
+produces, stamp the window's length with a `set` after it, as
+[fixtures/datadog-direct.yaml](../fixtures/datadog-direct.yaml) does. A Lua script that computes a
+per-second rate sets both keys to send a `rate`; the same flag makes `dedup_timestamps` sum two
+rates of one interval instead of keeping the later
+([ADR `metric-flags`](adr/metric-flags.md)'s "The flags").
+
 ### OTel metrics to Datadog: `otlp_in` into `datadog_out`
 
 An OpenTelemetry SDK or Collector can send its metrics to `otlp_in`, and `datadog_out` writes
@@ -161,9 +173,9 @@ overwrites at its series and timestamp.
 
 ### collectd to Datadog: `collectd_in` into `datadog_out`
 
-A collectd fleet's `network` plugin can send to `collectd_in`. `datadog_out` sends each value
-list and notification under its collectd host (`collectd.host`) unless it carries a `host.name`,
-so every collectd sender keeps its own Datadog host, and writes each data-source type as follows
+A collectd fleet's `network` plugin can send to `collectd_in`, which writes each value list's and
+notification's host as `host.name`. `datadog_out` sends each one under that host, so every
+collectd sender keeps its own Datadog host, and writes each data-source type as follows
 ([fixtures/collectd-to-datadog.yaml](../fixtures/collectd-to-datadog.yaml)):
 
 | collectd type | `logit` model | What Datadog gets |
@@ -288,30 +300,42 @@ the rest of the request was stored.
 ([deploying.md's "Hostname"](deploying.md#hostname)) as the host of anything that carries none of
 its own:
 
-- a metric with no `host.name`, no DogStatsD `host:` tag, and no `collectd.host`;
-- an event or service check with no `h:` field, no `host.name`, no `host:` tag, and no
-  `collectd.host`;
-- a log with none of `hostname`, `host.name`, `syslog.hostname`, `host`, or `collectd.host`.
+- a metric, event, or service check with no `host.name` and no hostless mark;
+- a log with no `host.name`, `syslog.hostname`, or `host`;
+- a trace or APM stats payload with no `host.name` on its batch resource and no relaying Agent's
+  hostname beside it. An Agent sends an empty tracer hostname beside its own, so an Agent's
+  payload keeps it empty.
 
 That's what an Agent does for a DogStatsD client that names no host, so a `logit` on each host
 behaves as the Agent it replaces. A central `logit` receiving from many hosts is different: every
 hostless sender reports under the relay's one host, their series merge under it, and the per-host
 view of them is lost. Datadog bills per host, so the cost matches one Agent.
 
-To keep a host per sender, stamp `host.name` upstream with `set`, or have each DogStatsD client
-send a `host:` tag (or `h:` on an event or check). A host the data carries is never replaced. A
-`host:` tag is the host, and isn't sent as a tag, as the Agent reads it. So is a `collectd.host`,
-which `collectd_in` stamps from each value list's and notification's host, unless the sample is
-marked hostless as below. A sample a client made
-hostless with an empty `host:` tag stays hostless, and so does a sample an Agent sends hostless:
-a v2 `host` resource with no name, or `"host":""` on the v1, distribution-point, and sketch
-routes. An empty sketch `host` always reads as hostless, because protobuf can't tell it from a
-missing one.
+`logit`'s inputs read each sender's own host into `host.name`: `statsd_in` a DogStatsD `host:`
+tag (the last one) or an event's or check's `h:` field, `datadog_in` a series' or sketch's
+`host`, a log's `hostname`, an event's `host`, or a check's `host_name`, `datadog_in` and
+`datadog_trace_in` a tracer or stats payload's `hostname` (onto the batch resource), and
+`collectd_in` each value list's and notification's host. A `host:` tag is the host, and isn't kept as a tag, as the
+Agent reads it. So to keep a host per sender, have each client send one, or stamp `host.name`
+upstream with `set`, which overrides the sender's. A host the data carries is never replaced.
+
+A `host` attribute that reaches `datadog_out`, from a `set`, a script, or another protocol such as
+an InfluxDB `host` tag, is an ordinary `host:` tag, not the host. A log's `hostname` attribute
+from such a source is left off, counted `logit.output.tags.omitted{reason="reserved_key"}`,
+because it would be a second `hostname` key. To make either the host, copy it to `host.name` upstream, as
+[deploying.md's "Hostname"](deploying.md#hostname) shows.
+
+A sample a client made hostless with an empty `host:` tag stays hostless, and so does a sample an
+Agent sends hostless: a v2 `host` resource with no name, or `"host":""` on the v1,
+distribution-point, and sketch routes. An empty sketch `host` always reads as hostless, because
+protobuf can't tell it from a missing one. A non-empty `host.name` fills a hostless sample.
 
 Through a local Agent, `statsd_out` under `format: dogstatsd` sends the host where the Agent
-reads it: a `host` attribute as the `host:` tag, else a non-empty `host.name`, else an empty
-`host:` tag for a sample `datadog_in` read as hostless. A line with none of them gets the Agent's
-own hostname.
+reads it: a non-empty `host.name` as a metric line's `host:` tag and an event's or check's `h:`
+field, else an empty `host:` tag for a hostless sample. A line with neither gets the Agent's own
+hostname. Beside either, a `host` attribute is left off, counted
+`logit.output.tags.omitted{reason="unrepresentable"}`, since the Agent consumes every `host:` tag
+and keeps only the last.
 
 ### `at_least_once` can duplicate a request, and everything but series is stored twice
 

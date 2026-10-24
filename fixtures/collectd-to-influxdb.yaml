@@ -11,8 +11,8 @@
 # This direction is lossy where the relay isn't (a `collectd_in -> collectd_out` pair keeps all of
 # it):
 #
-#   * `collectd.host`, `collectd.plugin_instance`, and `collectd.type_instance` become InfluxDB
-#     tags, one per attribute. The plugin, type, and interval ride on private `_logit.collectd.*`
+#   * `host.name` (collectd's host), `collectd.plugin_instance`, and `collectd.type_instance`
+#     become InfluxDB tags, one per attribute. The plugin, type, and interval ride on private `_logit.collectd.*`
 #     attributes that never reach InfluxDB; the plugin and type are already in the measurement
 #     name.
 #   * a multi-data-source value list becomes N measurements named `plugin.type.ds`

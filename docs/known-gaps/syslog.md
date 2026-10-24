@@ -35,7 +35,7 @@ Entry format and the other areas: [the known-gaps index](README.md).
   Consequences and `crates/logit-cli/tests/syslog_round_trip.rs`'s normalization list.
 - **`syslog_out`'s opt-in `structured_data:` element can't carry a log's trace context.** The
   element (`structured_data: { sd_id: "<name>@<PEN>" }`, `write_structured_data`) carries every
-  non-`syslog.*` attribute, but a log's native trace context (`log.trace`,
+  attribute except `syslog.*` and `host.name`, but a log's native trace context (`log.trace`,
   [ADR `log-record-trace-context`](../adr/log-record-trace-context.md)) isn't an `event.attribute`.
   - **Consequence:** a `trace_context`-enriched log relayed through `syslog_out` loses its trace
     and span ids.

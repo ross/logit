@@ -132,9 +132,13 @@ impl SignalEncoder for OtlpEncoder {
                 written = true;
             }
             for metric in &event.metrics {
-                if let Some(m) =
-                    metrics::encode_metric(event, metric, &self.telemetry, &mut self.diagnostics)
-                {
+                if let Some(m) = metrics::encode_metric(
+                    &batch.resource,
+                    event,
+                    metric,
+                    &self.telemetry,
+                    &mut self.diagnostics,
+                ) {
                     metric_points.push(m);
                     written = true;
                 }

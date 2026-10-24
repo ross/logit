@@ -10,8 +10,9 @@ updated: 2026-10-23
 [ADR `protocol-knowledge-stays-in-family`](../adr/protocol-knowledge-stays-in-family.md) decides
 that a component keys behavior on another component's internals only within a lossless family.
 Outside one, it reads neutral meaning segments, public vocabulary, or its own config. Four
-production reads break that rule today. This plan lists each one with its remedy, so a later
-session can pick one up without redoing the survey.
+production reads broke that rule when the ADR landed. This plan lists each one with its remedy, so
+a later session can pick one up without redoing the survey. C1, C2, C3, and C6 are done, so no
+cross-family read remains.
 
 None of this is scheduled. Each section is a future workstream with its own stream key, picked
 when the work starts.
@@ -26,7 +27,7 @@ Goals:
 Non-goals:
 
 - Changing what a family's own members read. C4, C5, C7, and C8 below stay as they are.
-- A native copy or rename component. C6's remedy may want one; it gets its own ADR if so.
+- A native copy or rename component.
 - Honoring the new neutral flags anywhere they aren't needed to replace a cross-family read.
 
 ## The rule
@@ -38,7 +39,10 @@ what its own config names, a component id in `has_provenance`, `drop_provenance`
 
 ## C1 and C2: the Datadog rate carrier in `dedup_timestamps` and `prometheus_out`
 
-**Future workstream, not scheduled.**
+**Done** in `carry/w2` (PR #838), as the remedy below describes. The open design questions
+were settled for Datadog's form: `_logit.metrics.interval` is an `I64` of whole seconds, and a
+rate stays a flagged `Gauge`, not a model kind. The section below records the reads as they
+were.
 
 **What reads what.** `datadog_in` decodes a Datadog `rate` as a `Gauge` with
 `_logit.datadog.type: rate` and its interval as `_logit.datadog.interval`
@@ -63,38 +67,40 @@ reaches `datadog_out`, which writes the point as a Datadog `rate`. A `set` of
 `_logit.datadog.type: rate` on a non-Datadog batch does the same. The handling is a property of
 the reading, not of Datadog, and nothing outside the Datadog family can ask for it by name.
 
-**Remedy.** `datadog_in` sets a neutral flag beside the carrier: an increment flag and its
-interval under `_logit.metrics.` (for example `_logit.metrics.increment` and
-`_logit.metrics.interval`). `dedup_timestamps` and `prometheus_out` read the flag and import
-nothing from `logit_proto::datadog`. `datadog_out` keeps reading `_logit.datadog.type` and
-`_logit.datadog.interval`, its own family's carriers. Lua and `set` can write the flag.
+**Remedy.** Move, don't mirror ([ADR
+`protocol-knowledge-stays-in-family`](../adr/protocol-knowledge-stays-in-family.md)'s
+"Amendment: move, don't mirror (2026-10-23)"). `datadog_in` writes `_logit.metrics.type: rate`
+and `_logit.metrics.interval` instead of `_logit.datadog.type: rate` and
+`_logit.datadog.interval`. `_logit.datadog.type` keeps only `unspecified`, the one value with no
+neutral meaning. `dedup_timestamps` and `prometheus_out` read the neutral keys and import nothing
+from `logit_proto::datadog`. `datadog_out` reads the neutral keys for a rate and its own carrier
+for `unspecified`. Lua and `set` can write the neutral keys.
 
 Open design questions:
 
-- The key names and values: a `Bool` increment flag, or a `Str` naming the gauge's kind
-  (`rate`), and whether the interval is a separate key or part of the value.
 - Whether the interval's value type and unit follow Datadog's (integer seconds) or a neutral
   duration.
 - Whether a rate should instead become a typed model kind, which
   [ADR `datadog-agent-and-intake-relay`](../adr/datadog-agent-and-intake-relay.md)'s decision 8
   rejected as a delta `Sum` because folding a per-second value multiplies and rounds.
-- The metric-flags consequence applies: the carrier and the flag become two sources of truth,
-  and a `remove` of one changes the result.
 
 **What else moves.** An amendment to
 [ADR `dedup-timestamps-transform`](../adr/dedup-timestamps-transform.md) ("Which reading
-survives", "The sink-side counter") and to [ADR `metric-flags`](../adr/metric-flags.md)'s flag
-table; [data-model.md](../design/data-model.md)'s flag table; the transit spec's
+survives", "The sink-side counter"), to [ADR `metric-flags`](../adr/metric-flags.md)'s flag
+table, and to [ADR `datadog-agent-and-intake-relay`](../adr/datadog-agent-and-intake-relay.md)'s
+decision 8; [data-model.md](../design/data-model.md)'s flag table; the transit spec's
 `same_instant`, `same_instant_equal`, and `same_millisecond` rows in `spec/transit/mapping.yaml`
 where their text names the carrier, and `script/transit gen`; the Lua capability in
 [lua-api.md](../design/lua-api.md); the known-gaps row's C1 and C2.
 
 **Estimate.** Two PRs: an ADR amendment and plan row (S), then the decoder, both readers, the
-regression test (a rate carrier with no flag is a state), and the docs (M).
+regression test (a `_logit.datadog.type: rate` with no neutral key is a state), and the docs (M).
 
 ## C3: `_logit.prometheus.type` in `otlp_out` and `kafka_out`
 
-**Future workstream, not scheduled.**
+**Done** in `carry/w3` (PR #841), as the remedy below describes. The open design questions
+were settled: an attribute, `_logit.metrics.type`, not a model field; `prometheus_out` reads it
+too; and no other sink honors it. The section below records the reads as they were.
 
 **What reads what.** `prometheus_in` stamps `_logit.prometheus.type` on a `gaugehistogram`,
 `info`, `stateset`, `untyped`, or `unknown` family. `prometheus_out` reads it as its own carrier.
@@ -137,7 +143,12 @@ model field instead of an attribute adds a VM measurement.
 
 ## C6: `collectd.host` in `datadog_out`
 
-**Future workstream, not scheduled.**
+**Done** in `carry/w4`, by the second remedy below with `host.name` as the key. The open design
+questions were settled: `host.name` is the one documented host key, written by a source at the
+scope where the host is identity, so `collectd_in` writes it on the event and not the resource,
+and every other sink renders it under that one name. No copy or rename component was needed ([ADR `process-hostname`](../adr/process-hostname.md)'s "Amendment:
+`host.name` is the standard host key (2026-10-23)"). The section below records the read as it
+was.
 
 **What reads what.** `collectd_in` stamps each value list's and notification's host as the public
 `collectd.host`. `datadog_out` takes it as the host of a series, event, service check, or log,

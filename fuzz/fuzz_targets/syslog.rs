@@ -164,7 +164,7 @@ fn check_event(input: &Bytes, event: &Event) {
                 }
                 other => panic!("model: syslog.timestamp {other:?}"),
             },
-            key @ ("syslog.hostname" | "syslog.tag" | "syslog.msgid") => {
+            key @ ("host.name" | "syslog.tag" | "syslog.msgid") => {
                 check_field(input, key, value);
             }
             "syslog.pid" => {

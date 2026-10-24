@@ -1,6 +1,6 @@
 ---
 created: 2026-10-20
-updated: 2026-10-22
+updated: 2026-10-23
 ---
 
 # `datadog_out` maps OTLP metric kinds as Datadog's OTel exporter does, statelessly
@@ -189,7 +189,7 @@ nowhere to say what it is. `logit` is pre-release, so the field is a plain addit
 - **Exemplars** are ignored: the translator has no exemplar code. A record's exemplars are left
   off, uncounted, as for every metric route today.
 - **Timestamps** are whole seconds, truncated, as `datadog_out` writes every series and sketch.
-- **Interval** is the `_logit.datadog.interval` carrier where present, else `0`. The exporter
+- **Interval** is the neutral `_logit.metrics.interval` flag where present, else `0`. The exporter
   sends `0` unless its alpha `InferIntervalForDeltaMetrics` gate is on.
 - **Units.** The exporter's `AddUnits` gate is on by default, so a series carries the record's
   unit, as `datadog_out` already writes it; `.count` and `.bucket` drop it. The
@@ -199,9 +199,9 @@ nowhere to say what it is. `logit` is pre-release, so the field is a plain addit
   exporter's `DisableAllMetricRemapping` gate is beta, so on by default, and skips both.
 - **`datadog.metric.as_type`** isn't honored. The translator sends a delta `Sum` carrying
   `datadog.metric.as_type: rate` as a `RATE`; the Collector's `datadogreceiver` sets it on a
-  Datadog rate. `logit`'s carrier for that is the private `_logit.datadog.type`, which
-  `datadog_out` already reads and which `datadog_in` sets on a rate (as a `Gauge`, not a `Sum`). A
-  public attribute that changes a wire type is what
+  Datadog rate. `logit`'s private key for that is the neutral flag `_logit.metrics.type: rate`,
+  which `datadog_out` reads on a `Gauge` and which `datadog_in` sets on a rate (as a `Gauge`, not
+  a `Sum`); on a `Sum` it's ignored. A public attribute that changes a wire type is what
   [ADR `private-attribute-namespace`](private-attribute-namespace.md) keeps carriers out of, so the
   attribute is a tag like any other, as the translator also leaves it.
 - **`NO_RECORDED_VALUE`** points are skipped and non-finite number points dropped, each counted

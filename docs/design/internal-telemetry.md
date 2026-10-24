@@ -934,8 +934,10 @@ datagram or packet still decodes. The driver's `bad_datagram`/`bad_frame` key, w
 `frames.dropped{reason="undecodable"}`, fires only for the single whole-frame failure
 `StatsdDecoder::decode_into` can return: a frame that isn't valid UTF-8. A `|#` tag whose key
 starts with `_logit.`, the private carrier prefix, is left off its metric, event, or service check
-and counted `logit.input.tags.omitted{reason="reserved_prefix"}`; the line is delivered, and a
-line rejected for another reason counts none. The decoder carries a
+and counted `logit.input.tags.omitted{reason="reserved_prefix"}`, and a `host.name:` tag beside
+the line's own host (a `host:` tag or a non-empty `h:` field) is left off and counted
+`logit.input.tags.omitted{reason="reserved_key"}`; the line is delivered, and a line rejected for
+another reason counts none. The decoder carries a
 sampled `ms`/`h`/`d` line's `@<rate>` verbatim and clamps nothing; `aggregate` bounds the weight a
 rate implies at `Samples::MAX_WEIGHT` and reports a clamp as
 `logit.transform.samples.weight_clamped` and a `sample_rate_clamped` diagnostic under its own
@@ -1655,9 +1657,9 @@ here is loss: a passed-through record reaches the sink, which counts it if it dr
 
 | Name | Kind | Meaning |
 |---|---|---|
-| `logit.transform.metrics.merged` | count | a reading added or combined into the surviving one: a delta `Sum`, a Datadog `rate` (a `Gauge` carrying `_logit.datadog.type: rate`) of the survivor's interval, a delta `Histogram` or `ExponentialHistogram` with the survivor's layout, `Samples` at its rate, `SetMembers`, a `Distribution` (re-binned when its mapping differs), or a `Set` |
-| `logit.transform.metrics.absorbed` | count | a reading superseded by a later one under last write wins: a `Gauge` other than a Datadog `rate`, or a cumulative kind, a `NO_RECORDED_VALUE` marker on one included. Narrower than `aggregate`'s `absorbed`: the survivor isn't counted |
-| `logit.transform.metrics.passed_through{reason="non_finite"\|"overflow"\|"mixed_type"\|"layout_mismatch"\|"no_merge_rule"\|"no_recorded_value"}` | count | a colliding record forwarded untouched beside the survivor: a `NaN` or infinite increment, a total past its type's range, a value type other than the survivor's (`I64` beside `F64`, `U64` beside `I64`), other histogram bounds or sample rate, a Datadog `rate` of another interval or beside a gauge that isn't one, a `GaugeDelta`, a delta `Summary`, or a delta `Sum` or a Datadog rate of `Bool`s, or a marker beside delta values. When no record of a set can merge, every one but the first counts |
+| `logit.transform.metrics.merged` | count | a reading added or combined into the surviving one: a delta `Sum`, a rate (a `Gauge` flagged `_logit.metrics.type: rate`, such as a Datadog `rate`) of the survivor's interval, a delta `Histogram` or `ExponentialHistogram` with the survivor's layout, `Samples` at its rate, `SetMembers`, a `Distribution` (re-binned when its mapping differs), or a `Set` |
+| `logit.transform.metrics.absorbed` | count | a reading superseded by a later one under last write wins: a `Gauge` other than a rate, or a cumulative kind, a `NO_RECORDED_VALUE` marker on one included. Narrower than `aggregate`'s `absorbed`: the survivor isn't counted |
+| `logit.transform.metrics.passed_through{reason="non_finite"\|"overflow"\|"mixed_type"\|"layout_mismatch"\|"no_merge_rule"\|"no_recorded_value"}` | count | a colliding record forwarded untouched beside the survivor: a `NaN` or infinite increment, a total past its type's range, a value type other than the survivor's (`I64` beside `F64`, `U64` beside `I64`), other histogram bounds or sample rate, a rate of another interval or beside a gauge that isn't one, a `GaugeDelta`, a delta `Summary`, or a delta `Sum` or a rate of `Bool`s, or a marker beside delta values. When no record of a set can merge, every one but the first counts |
 
 An event left with no metric, log, or span counts `logit.component.events.discarded`. No
 `Diagnostics` keys.
@@ -2175,8 +2177,9 @@ itself. The sink emits each once per batch, however many attempts the runtime ma
   `no_recorded_value` is a `NO_RECORDED_VALUE`-flagged point, which statsd has no way to mark.
 - `logit.output.fields.omitted{reason=...}`, a field left off a line that is still sent: `dialect`
   is a `|c:`/`|e:`/`|card:`/`|T` field with nowhere to go under `format: statsd`, once per field
-  per line, and `invalid_value` is an event's `p:`/`t:` field with an out-of-set value or a
-  `Samples` `sample_rate` outside `(0, 1]`, written without `@rate`.
+  per line, and `invalid_value` is an event's `p:`/`t:` field with an out-of-set value, a
+  `Samples` `sample_rate` outside `(0, 1]`, written without `@rate`, or a `timestamped` event's
+  pre-1970 timestamp, written without `|T` or `d:`, once per line.
 - `logit.output.metrics.degraded{metric_kind=...}` and `logit.output.metrics.skipped{metric_kind=...}`,
   with `metric_kind` one of `"distribution"|"set"|"histogram"|"exponential_histogram"|"summary"|
   "cumulative_sum"|"non_monotonic_delta_sum"`: a summarized kind written as per-component lines
@@ -2322,8 +2325,9 @@ under one component id, as for `collectd_out`. The sink adds only what a socket 
   or `-Inf` bound, whose count joins a neighboring bucket, once per record,
   `logit.output.metrics.skipped{metric_kind="set_members"|"set"|"gauge_histogram"}`, each with a
   throttled diagnostic (`otlp_set_members_metric_skipped`, `otlp_set_metric_skipped`,
-  `otlp_gauge_histogram_skipped`), the last for an OpenMetrics `gaugehistogram`, which the OTel
-  Prometheus compatibility spec drops, and
+  `otlp_gauge_histogram_skipped`), the last for a histogram flagged
+  `_logit.metrics.type: "gaugehistogram"`, as `prometheus_in` decodes an OpenMetrics
+  `gaugehistogram`, which the OTel Prometheus compatibility spec drops, and
   `logit.output.metrics.dropped{reason="unresolved_gauge_delta"}` for a relative gauge no
   `aggregate` resolved, with the shared `gauge_delta_unresolved` diagnostic, and
   `logit.output.metrics.dropped{reason="unresolved_delta"}` for a delta `Summary`, which OTLP
@@ -2603,8 +2607,8 @@ Some reasons exist only on one path:
   a later reading shares a millisecond with, at the same nanosecond or another, once per reading
   (a histogram reading counts once, not once per wire sample), with a throttled
   `duplicate_timestamp` diagnostic naming `dedup_timestamps` (`precision: 1ms`), or `aggregate`
-  for a live delta flow. The later reading is sent. A removed state (a gauge other than a
-  Datadog `rate`, or a cumulative kind) equal to the one sent (the point, each `f64` by its bits,
+  for a live delta flow. The later reading is sent. A removed state (a gauge not flagged
+  `_logit.metrics.type: rate`, or a cumulative kind) equal to the one sent (the point, each `f64` by its bits,
   the created timestamp, and the exemplars) loses nothing, and counts
   `normalized{reason="duplicate_timestamp"}` instead, with no diagnostic. A `samples` or
   distribution summary, a set's size gauge, or a `rate` stays `dropped` when equal: two equal
@@ -2657,6 +2661,7 @@ The module doc of `logit_proto::datadog` has the full mapping-to-counter tables.
 | `logit.input.metrics.skipped{reason="empty_sketch"}` | count | a `Dogsketch` with no bins and zero count |
 | `logit.input.metrics.degraded{reason="no_timestamp"}` | count | a point or sketch with no timestamp, stamped with `received_at` |
 | `logit.input.tags.omitted{reason="reserved_prefix"}` | count | a tag whose key starts with `_logit.`, the private carrier prefix, left off a delivered series, sketch, event, or service check, counted per tag: once per series or sketch however many points it delivers |
+| `logit.input.tags.omitted{reason="reserved_key"}` | count | a `host.name` tag, or a log's `host.name` key, left off a delivered record because the record's own host (a series' or sketch's `host`, an event's `host`, or a check's `host_name`, an empty one of any of those included as the hostless mark, or a log's non-empty `hostname`) fills `host.name`; counted the way `reserved_prefix` is |
 | `logit.output.metrics.dropped{reason="unresolved_cumulative"}` | count | a cumulative monotonic `Sum`, `Histogram`, or `ExponentialHistogram`, which Datadog's exporter differences into a delta first, with no `cumulative_to_delta` upstream to do it; counted by the series encoders only, with an `unresolved_cumulative` diagnostic |
 | `logit.output.metrics.skipped{metric_kind="set_members"}` | count | a kind no Datadog route carries; counted by the series encoders only |
 | `logit.output.fields.dropped{reason="unresolved_cumulative"}` | count | a cumulative `Summary`'s `.count` and `.sum`, running totals that need differencing first, left off while its `.quantile` gauges go out; once per summary, with an `unresolved_cumulative` diagnostic. A delta `Summary`, which `cumulative_to_delta` makes, sends both |

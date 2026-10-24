@@ -913,7 +913,7 @@ pub(crate) fn build_spec(
                 input_runtime_config(&component.receive),
             )
         }
-        DockerIn { root, containers, discover, labels, tail } => {
+        DockerIn { root, containers, discover, labels, host_name, tail } => {
             let root = base_dir.join(root);
             let filter = ContainerFilter::new(containers.clone(), *discover);
             NodeSpec::Input(
@@ -924,6 +924,10 @@ pub(crate) fn build_spec(
                         labels.clone(),
                         tail_config(tail, &component.receive, base_dir),
                     )
+                    .with_container_host_name(matches!(
+                        host_name,
+                        Some(logit_config::DockerHostName::Container)
+                    ))
                     .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
                     .with_telemetry(telemetry.clone()),
                 ),
@@ -1489,7 +1493,7 @@ pub(crate) fn build_spec(
                     SyslogOutput::tcp(endpoint.clone(), *connect_timeout)
                 }
             };
-            // Filled only where an event has no `syslog.hostname` of its own.
+            // Filled only where neither an event nor its resource carries a `host.name`.
             let default_hostname = configured_hostname.as_deref().unwrap_or(&**hostname);
             let mut encoder = SyslogEncoder::new(syslog_format(*format), facility.as_u8())
                 .with_max_message_bytes(*max_message_bytes as usize)
@@ -2947,7 +2951,7 @@ mod tests {
     }
 
     /// `syslog_out`'s HOSTNAME default is its `hostname:`, else the process hostname, and an
-    /// event's own `syslog.hostname` beats either.
+    /// event's own `host.name` beats either.
     #[tokio::test]
     async fn build_spec_gives_syslog_out_the_process_hostname_unless_it_configures_one() {
         use logit_core::{AttrMap, BodyFormat, Event, EventBatch, LogRecord, Resource, Value};
@@ -2966,7 +2970,7 @@ mod tests {
             Event::log(1_700_000_000_000_000_000, attributes, record)
         };
         let mut own = AttrMap::new();
-        own.insert("syslog.hostname", Value::str("own"));
+        own.insert(logit_core::attrs::HOST_NAME, Value::str("own"));
         let batch = EventBatch {
             resource: Arc::new(Resource::default()),
             scope: None,
@@ -3834,6 +3838,7 @@ mod tests {
                 containers: vec!["nginx".to_string()],
                 discover: false,
                 labels: vec!["team".to_string()],
+                host_name: Some(logit_config::DockerHostName::Container),
                 tail: logit_config::TailOptions::default(),
             },
         };

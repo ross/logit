@@ -78,7 +78,8 @@ whose `value` is NaN is skipped, and a format-3 point tagged `_seq` is skipped. 
 ## Name the printers
 
 The `printer` tag is the name `vars.names` gives the printer's MAC address, which is the
-datagram's syslog hostname. A printer missing from `vars.names` is tagged with its MAC address,
+datagram's syslog hostname, read as `host.name`. The script removes `host.name` and the other
+syslog attributes, so no point carries the MAC address as a tag of its own. A printer missing from `vars.names` is tagged with its MAC address,
 so a new printer shows up at once, under its MAC address until you name it. Naming a printer
 starts a new series for it: points written before the change keep the MAC address.
 

@@ -1,6 +1,6 @@
 ---
 created: 2026-10-16
-updated: 2026-10-22
+updated: 2026-10-23
 ---
 
 # `line_protocol`: parse a log message as InfluxDB line protocol into one event per point, skipping bad lines
@@ -65,7 +65,7 @@ truncating it to `precision`: `influxdb_in` truncates a request's arrival time b
 does, but the parent's timestamp is a recorded time, not an arrival.
 
 **Inherited attributes.** Each child starts from a copy of every parent attribute, so
-`syslog.hostname` rides along. The point's own tags, its measurement carrier, and its string fields
+`syslog_in`'s `host.name` rides along. The point's own tags, its measurement carrier, and its string fields
 are written over that copy, so the point wins on a key collision. The parent's log, metrics, and
 span aren't copied. The resource, scope, trace context, and provenance are the parent batch's
 ([ADR `transform-fan-out`](transform-fan-out.md)).

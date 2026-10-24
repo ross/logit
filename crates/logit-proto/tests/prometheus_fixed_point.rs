@@ -190,6 +190,54 @@ fn a_hand_built_family_list_is_a_model_fixed_point() {
     assert_model_fixed_point(&[counter]);
 }
 
+/// An event a script or a `set` built, with no decoder in between, exposes `info`, `stateset`,
+/// and `gaugehistogram` from the neutral `_logit.metrics.type` flag, and `untyped` and `unknown`
+/// from `_logit.prometheus.type`; the carrier spelling `info` exposes a plain gauge.
+#[test]
+fn a_built_event_takes_its_type_line_from_the_neutral_flag_or_the_carrier() {
+    use logit_core::attrs::METRICS_TYPE;
+    use logit_core::interner::intern;
+    use logit_core::{Event, Histogram, MetricKind, MetricRecord, Temporality};
+    use logit_proto::prometheus::ATTR_TYPE;
+    let event = |name: &str, key: &str, value: &str, kind: MetricKind| {
+        let mut attributes = AttrMap::new();
+        attributes.insert(key, Value::str(value));
+        Event::metric(0, attributes, MetricRecord::new(intern(name), kind))
+    };
+    let histogram = MetricKind::Histogram(Histogram {
+        buckets: vec![(1.0, 2), (f64::INFINITY, 1)],
+        temporality: Temporality::Cumulative,
+        sum: Some(3.0),
+        min: None,
+        max: None,
+    });
+    let events = [
+        event("build", METRICS_TYPE, "info", MetricKind::gauge(1.0)),
+        event("state", METRICS_TYPE, "stateset", MetricKind::gauge(1.0)),
+        event("sizes", METRICS_TYPE, "gaugehistogram", histogram),
+        event("bare", ATTR_TYPE, "unknown", MetricKind::gauge(2.0)),
+        event("carried", ATTR_TYPE, "info", MetricKind::gauge(1.0)),
+    ];
+    let resource = Resource::default();
+    let families =
+        events_to_families(events.iter().map(|e| (&resource, e)), &mut PrometheusEncoder::new());
+    let body = rendered(&families, Dialect::OpenMetrics1_0);
+    let types: Vec<&str> = body.lines().filter(|line| line.starts_with("# TYPE")).collect();
+    assert_eq!(
+        types,
+        [
+            "# TYPE bare unknown",
+            "# TYPE build info",
+            "# TYPE carried gauge",
+            "# TYPE sizes gaugehistogram",
+            "# TYPE state stateset",
+        ],
+        "{body}"
+    );
+    let text = rendered(&families, Dialect::Text0_0_4);
+    assert!(text.contains("# TYPE bare untyped\n"), "{text}");
+}
+
 /// `Stale` families round-trip under the remote-write switches; the default encoder skips them,
 /// which is why the proptest generators below never produce a `Point::Stale`.
 #[test]

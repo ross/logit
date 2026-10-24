@@ -9,24 +9,22 @@
 use super::generated::agentpayload::{metric_payload, Metadata, MetricPayload, Origin};
 use super::outcomes::{MetricIn, MetricOut};
 use super::service_checks::{
-    ATTR_SERVICE_CHECK_HOST, ATTR_SERVICE_CHECK_MESSAGE, ATTR_SERVICE_CHECK_NAME,
-    ATTR_SERVICE_CHECK_STATUS,
+    ATTR_SERVICE_CHECK_MESSAGE, ATTR_SERVICE_CHECK_NAME, ATTR_SERVICE_CHECK_STATUS,
 };
 use super::tags::{count_tags, insert_tags, render_tags};
 use super::time::{nanos_to_seconds, seconds_to_nanos};
 use super::units;
 use super::{
-    collectd_host, host_tag, is_datadog_stats, is_service_check, units_are_datadog, DatadogDecoder,
+    insert_wire_host, is_datadog_stats, is_service_check, units_are_datadog, DatadogDecoder,
     DatadogEncoder, HistogramMode, HistogramOptions, ATTR_DEVICE, ATTR_HOSTLESS, ATTR_HOST_NAME,
-    ATTR_HOST_TAG, ATTR_INTERVAL, ATTR_ORIGIN_CATEGORY, ATTR_ORIGIN_METRIC_TYPE,
-    ATTR_ORIGIN_PRODUCT, ATTR_ORIGIN_SERVICE, ATTR_RESOURCES, ATTR_SOURCE_TYPE_NAME, ATTR_TYPE,
-    ATTR_UNITS, MAX_METRIC_TAGS, RESOURCE_ATTR_AGENT_EPOCH, RESOURCE_ATTR_AGENT_INTERNAL_IP,
-    RESOURCE_ATTR_AGENT_PUBLIC_IP, RESOURCE_ATTR_AGENT_TIMEZONE, RESOURCE_ATTR_AGENT_VERSION,
-    UNITS_DATADOG,
+    ATTR_ORIGIN_CATEGORY, ATTR_ORIGIN_METRIC_TYPE, ATTR_ORIGIN_PRODUCT, ATTR_ORIGIN_SERVICE,
+    ATTR_RESOURCES, ATTR_SOURCE_TYPE_NAME, ATTR_TYPE, ATTR_UNITS, MAX_METRIC_TAGS,
+    RESOURCE_ATTR_AGENT_EPOCH, RESOURCE_ATTR_AGENT_INTERNAL_IP, RESOURCE_ATTR_AGENT_PUBLIC_IP,
+    RESOURCE_ATTR_AGENT_TIMEZONE, RESOURCE_ATTR_AGENT_VERSION, UNITS_DATADOG,
 };
 use crate::CodecError;
 use bytes::Bytes;
-use logit_core::attrs::merged;
+use logit_core::attrs::{merged, METRICS_INTERVAL, METRICS_TYPE, TYPE_RATE};
 use logit_core::interner::{intern, resolve};
 use logit_core::sketch::from_otlp::{exp_histogram_oversized, otlp_buckets};
 use logit_core::{
@@ -41,8 +39,8 @@ use std::sync::{Arc, LazyLock};
 
 type JsonMap = Map<String, JsonValue>;
 
-/// `_logit.datadog.type`'s two values; `count` and `gauge` are said by the model kind itself.
-pub(super) const TYPE_RATE: &str = "rate";
+/// `_logit.datadog.type`'s one value; `count` and `gauge` are said by the model kind itself, and
+/// `rate` by the neutral flag [`METRICS_TYPE`].
 const TYPE_UNSPECIFIED: &str = "unspecified";
 
 /// The resource `type` the Agent's v2 serializer gives a series' `device`.
@@ -104,10 +102,11 @@ impl WireType {
         }
     }
 
-    fn type_attr(self) -> Option<&'static str> {
+    /// The attribute and value that say this type where the model kind doesn't.
+    fn type_attr(self) -> Option<(&'static str, &'static str)> {
         match self {
-            WireType::Rate => Some(TYPE_RATE),
-            WireType::Unspecified => Some(TYPE_UNSPECIFIED),
+            WireType::Rate => Some((METRICS_TYPE, TYPE_RATE)),
+            WireType::Unspecified => Some((ATTR_TYPE, TYPE_UNSPECIFIED)),
             WireType::Count | WireType::Gauge => None,
         }
     }
@@ -168,16 +167,13 @@ impl<'a> WireSeries<'a> {
     }
 
     /// Tags first, then the wire's own fields, so a tag spelled like a carrier (`host.name:x`)
-    /// loses to the field it names. Also returns how many tags were skipped for a private key,
-    /// for the caller to count once the series delivers a point.
-    pub(super) fn attributes(&self) -> (AttrMap, usize) {
+    /// loses to the field it names. Also returns how many tags were skipped for a private key and
+    /// how many `host.name` tags the host displaced, for the caller to count once the series
+    /// delivers a point.
+    pub(super) fn attributes(&self) -> (AttrMap, usize, usize) {
         let mut attrs = AttrMap::new();
         let reserved = insert_tags(&mut attrs, self.tags.iter().copied());
-        match self.host {
-            Some("") => attrs.insert(ATTR_HOSTLESS, Value::Bool(true)),
-            Some(host) => attrs.insert(ATTR_HOST_NAME, Value::str(host)),
-            None => {}
-        }
+        let displaced = insert_wire_host(&mut attrs, self.host);
         if let Some(device) = self.device.filter(|d| !d.is_empty()) {
             attrs.insert(ATTR_DEVICE, Value::str(device));
         }
@@ -198,16 +194,14 @@ impl<'a> WireSeries<'a> {
             attrs.insert(ATTR_SOURCE_TYPE_NAME, Value::str(name));
         }
         if self.interval != 0 {
-            attrs.insert(ATTR_INTERVAL, Value::I64(self.interval));
+            attrs.insert(METRICS_INTERVAL, Value::I64(self.interval));
         }
-        // A route that carries a type always decides `_logit.datadog.type`, from the wire type
-        // alone.
+        // A route that carries a type always decides both type keys, from the wire type alone.
         if let Some(wire_type) = self.wire_type {
-            match wire_type.type_attr() {
-                Some(t) => attrs.insert(ATTR_TYPE, Value::str(t)),
-                None => {
-                    attrs.remove(ATTR_TYPE);
-                }
+            attrs.remove(METRICS_TYPE);
+            attrs.remove(ATTR_TYPE);
+            if let Some((key, value)) = wire_type.type_attr() {
+                attrs.insert(key, Value::str(value));
             }
         }
         for (key, code) in [
@@ -220,7 +214,7 @@ impl<'a> WireSeries<'a> {
                 attrs.insert(key, Value::U64(code));
             }
         }
-        (attrs, reserved)
+        (attrs, reserved, displaced)
     }
 }
 
@@ -372,7 +366,7 @@ impl DatadogDecoder {
         let name = intern(metric);
         let unit = unit.filter(|u| !u.is_empty()).map(intern);
         let wire_type = series.wire_type.unwrap_or(WireType::Gauge);
-        let (attrs, reserved) = series.attributes();
+        let (attrs, reserved, displaced) = series.attributes();
         let first = out.len();
         for (seconds, value) in points {
             if !value.is_finite() {
@@ -389,6 +383,7 @@ impl DatadogDecoder {
         }
         if out.len() > first {
             self.reserved_tags(reserved);
+            self.displaced_host_names(displaced);
         }
     }
 
@@ -509,7 +504,7 @@ impl DatadogDecoder {
                 }
             };
             let name = intern(metric);
-            let (attrs, reserved) = series.attributes();
+            let (attrs, reserved, displaced) = series.attributes();
             let first = out.len();
             for point in points {
                 let Some((seconds, values)) = distribution_point(point) else {
@@ -529,6 +524,7 @@ impl DatadogDecoder {
             }
             if out.len() > first {
                 self.reserved_tags(reserved);
+                self.displaced_host_names(displaced);
             }
         }
         Ok(batch(out))
@@ -655,12 +651,13 @@ fn distribution_point(point: &JsonValue) -> Option<(Option<i64>, Vec<f64>)> {
 // -- encode ---------------------------------------------------------------------------------------
 
 /// Every attribute a metrics route reads into a wire field of its own; never rendered as a tag.
-static CONSUMED: LazyLock<[Symbol; 16]> = LazyLock::new(|| {
+static CONSUMED: LazyLock<[Symbol; 17]> = LazyLock::new(|| {
     [
         intern(ATTR_HOST_NAME),
         intern(ATTR_HOSTLESS),
         intern(ATTR_TYPE),
-        intern(ATTR_INTERVAL),
+        intern(METRICS_TYPE),
+        intern(METRICS_INTERVAL),
         intern(ATTR_SOURCE_TYPE_NAME),
         intern(ATTR_DEVICE),
         intern(ATTR_RESOURCES),
@@ -682,13 +679,8 @@ static CONSUMED: LazyLock<[Symbol; 16]> = LazyLock::new(|| {
 static CONSUMED_WITH_CHECK: LazyLock<Vec<Symbol>> = LazyLock::new(|| {
     let mut keys = CONSUMED.to_vec();
     keys.extend(
-        [
-            ATTR_SERVICE_CHECK_NAME,
-            ATTR_SERVICE_CHECK_STATUS,
-            ATTR_SERVICE_CHECK_MESSAGE,
-            ATTR_SERVICE_CHECK_HOST,
-        ]
-        .map(intern),
+        [ATTR_SERVICE_CHECK_NAME, ATTR_SERVICE_CHECK_STATUS, ATTR_SERVICE_CHECK_MESSAGE]
+            .map(intern),
     );
     keys
 });
@@ -699,16 +691,19 @@ static CONSUMED_WITH_CHECK: LazyLock<Vec<Symbol>> = LazyLock::new(|| {
 pub(super) struct Carriers {
     pub tags: Vec<String>,
     pub host: Option<String>,
-    /// The sender marked the sample hostless: [`ATTR_HOSTLESS`] is `true`, the DogStatsD `#host:`
-    /// tag is empty, or [`ATTR_RESOURCES`] holds a `host` entry. Never filled with the default
-    /// host.
+    /// The sender marked the sample hostless: [`ATTR_HOSTLESS`] is `true` (`datadog_in`'s reading
+    /// of an empty `host`, `statsd_in`'s of an empty `host:` tag), or [`ATTR_RESOURCES`] holds a
+    /// `host` entry. Never filled with the default host.
     pub hostless: bool,
     pub device: Option<String>,
     pub resources: Vec<(String, String)>,
     pub source_type_name: Option<String>,
+    /// [`METRICS_INTERVAL`], else 0.
     pub interval: i64,
     /// `_logit.datadog.type`'s value, when it is one this codec knows.
     pub wire_type: Option<WireType>,
+    /// [`METRICS_TYPE`] is `rate`: a `Gauge` record leaves as a `rate`.
+    pub rate: bool,
     pub origin: OriginCodes,
     /// How many `_logit.datadog.agent.*` carriers (a sketch payload's `CommonMetadata`) are
     /// present; only the sketches route writes them, from the batch resource.
@@ -897,17 +892,18 @@ impl DatadogEncoder {
                     non_empty_str(value).map(|s| c.source_type_name = s).is_some()
                 }
                 ATTR_TYPE => match value.as_str() {
-                    Some(TYPE_RATE) => {
-                        c.wire_type = Some(WireType::Rate);
-                        true
-                    }
                     Some(TYPE_UNSPECIFIED) => {
                         c.wire_type = Some(WireType::Unspecified);
                         true
                     }
                     _ => false,
                 },
-                ATTR_INTERVAL => match value {
+                // A type value with no rule here is ignored, as every reader of the flag does.
+                METRICS_TYPE => {
+                    c.rate = value.as_str() == Some(TYPE_RATE);
+                    true
+                }
+                METRICS_INTERVAL => match value {
                     Value::I64(n) => {
                         c.interval = *n;
                         true
@@ -949,21 +945,11 @@ impl DatadogEncoder {
         }
         let omitted = Omitted { unrepresentable, no_wire_form: c.unwritable(route) };
         if c.host.is_none() && !own_host_unwritable {
-            match host_tag(resource, event) {
-                Some(tag) if !tag.is_empty() => c.host = Some(tag.to_string()),
-                // An empty `#host:` tag: marked hostless, as the Agent reads it.
-                Some(_) => c.hostless = true,
+            if c.resources.iter().any(|(kind, _)| *kind == RESOURCE_HOST) {
                 // The Agent's v2 spelling of a hostless series: a `host` resource with no name.
-                None if c.resources.iter().any(|(kind, _)| *kind == RESOURCE_HOST) => {
-                    c.hostless = true;
-                }
-                // The v1, distribution, and sketch spelling: `"host":""`.
-                None if c.hostless => {}
-                // collectd's own host, below the hostless marks above.
-                None if collectd_host(resource, event).is_some() => {
-                    c.host = collectd_host(resource, event).map(str::to_string);
-                }
-                None => c.host = self.default_host.as_deref().map(str::to_string),
+                c.hostless = true;
+            } else if !c.hostless {
+                c.host = self.default_host.as_deref().map(str::to_string);
             }
         }
         (c, omitted)
@@ -1542,7 +1528,8 @@ pub(super) struct SeriesPoint {
     suffix: &'static str,
     /// Tags after the event's own.
     tag: Option<Vec<String>>,
-    /// `None` takes the `_logit.datadog.type` carrier's type, else a gauge.
+    /// `None` takes `rate` under the [`METRICS_TYPE`] flag, else the `_logit.datadog.type`
+    /// carrier's type, else a gauge.
     wire_type: Option<WireType>,
     value: f64,
     /// Whether the series carries the record's unit; a count of observations doesn't.
@@ -1568,7 +1555,8 @@ impl SeriesPoint {
     }
 
     fn wire_type(&self, c: &Carriers) -> WireType {
-        self.wire_type.unwrap_or(c.wire_type.unwrap_or(WireType::Gauge))
+        let carried = if c.rate { Some(WireType::Rate) } else { c.wire_type };
+        self.wire_type.unwrap_or(carried.unwrap_or(WireType::Gauge))
     }
 
     /// The record's unit as Datadog names it: as it is under [`ATTR_UNITS`], else through
@@ -1728,7 +1716,8 @@ fn plan_series(record: &MetricRecord, histograms: HistogramOptions) -> SeriesPla
             out.push(point(wire_type, scalar(sum.value, &mut notes)));
         }
         MetricKind::Gauge(v) => {
-            // `None`: the `_logit.datadog.type` carrier's type, else a gauge.
+            // `None`: a rate under the neutral flag, else the `_logit.datadog.type` carrier's
+            // type, else a gauge.
             out.push(SeriesPoint {
                 wire_type: None,
                 ..point(WireType::Gauge, scalar(*v, &mut notes))
@@ -1936,32 +1925,13 @@ fn go_shortest_g(f: f64) -> String {
     }
 }
 
-/// [`CONSUMED`] and [`CONSUMED_WITH_CHECK`], each plus the attribute read as the host: `host`
-/// for an event whose `host` is its host ([`host_tag`]), else `collectd.host` for one whose
-/// collectd host is ([`collectd_host`]).
-static CONSUMED_WITH_HOST: LazyLock<[[Vec<Symbol>; 2]; 2]> = LazyLock::new(|| {
-    let with = |keys: &[Symbol], host: &str| {
-        let mut keys = keys.to_vec();
-        keys.push(intern(host));
-        keys
-    };
-    [ATTR_HOST_TAG, crate::collectd::ATTR_HOST]
-        .map(|host| [with(&*CONSUMED, host), with(&CONSUMED_WITH_CHECK, host)])
-});
-
 /// The attributes a metrics route never renders as a tag for `event`: the carriers it reads into
-/// wire fields of their own, a service check's `_logit.statsd.service_check.*` too, and a `host`
-/// or `collectd.host` read as the host.
+/// wire fields of their own, and a service check's `_logit.statsd.service_check.*` too.
 fn tag_skip(resource: &Resource, event: &Event) -> &'static [Symbol] {
-    let check = usize::from(is_service_check(resource, event));
-    if host_tag(resource, event).is_some() {
-        &CONSUMED_WITH_HOST[0][check]
-    } else if collectd_host(resource, event).is_some() {
-        &CONSUMED_WITH_HOST[1][check]
-    } else if check == 1 {
-        &CONSUMED_WITH_CHECK
+    if is_service_check(resource, event) {
+        &CONSUMED_WITH_CHECK[..]
     } else {
-        &*CONSUMED
+        &CONSUMED[..]
     }
 }
 
@@ -2104,8 +2074,9 @@ mod tests {
         assert_eq!(a.get("urgent"), Some(&Value::Bool(true)));
         assert_eq!(a.get(ATTR_HOST_NAME), Some(&Value::str("myhost")));
         assert_eq!(a.get(ATTR_DEVICE), Some(&Value::str("/dev/sda1")));
-        assert_eq!(a.get(ATTR_TYPE), Some(&Value::str("rate")));
-        assert_eq!(a.get(ATTR_INTERVAL), Some(&Value::I64(20)));
+        assert_eq!(a.get(METRICS_TYPE), Some(&Value::str("rate")));
+        assert_eq!(a.get(METRICS_INTERVAL), Some(&Value::I64(20)));
+        assert_eq!(a.get(ATTR_TYPE), None, "a rate is the neutral flag alone");
         assert_eq!(a.get(ATTR_SOURCE_TYPE_NAME), Some(&Value::str("my_check")));
     }
 
@@ -2117,7 +2088,7 @@ mod tests {
         let (mut d, registry) = decoder();
         let series = br#"{"series":[
             {"metric":"m","points":[[1700000000,1],[1700000001,2]],
-             "tags":["env:prod","_logit.datadog.interval:5","logit.x:1","_logitx"]},
+             "tags":["env:prod","_logit.metrics.interval:5","logit.x:1","_logitx"]},
             {"metric":"m","points":[[1700000000,null]],"tags":["_logit.y:1"]}]}"#;
         let batch = d.decode_series_v1(series, RECEIVED_AT).unwrap();
         assert_eq!(batch.events.len(), 2);
@@ -2249,7 +2220,7 @@ mod tests {
         assert_eq!(a.get(ATTR_ORIGIN_SERVICE), Some(&Value::U64(7)));
         assert_eq!(a.get(ATTR_ORIGIN_METRIC_TYPE), Some(&Value::U64(2)));
         assert_eq!(a.get(ATTR_ORIGIN_CATEGORY), None);
-        assert_eq!(a.get(ATTR_INTERVAL), Some(&Value::I64(10)));
+        assert_eq!(a.get(METRICS_INTERVAL), Some(&Value::I64(10)));
         assert_eq!(a.get("team"), Some(&Value::Array(vec![Value::str("a"), Value::str("b")])));
     }
 
@@ -2378,7 +2349,7 @@ mod tests {
         let (mut e, registry) = encoder();
         let at = |offset_ms: i64, value: f64, interval: i64| {
             let mut attrs = AttrMap::new();
-            attrs.insert(super::super::ATTR_INTERVAL, Value::I64(interval));
+            attrs.insert(METRICS_INTERVAL, Value::I64(interval));
             Event::metric(
                 TS + offset_ms * 1_000_000,
                 attrs,
@@ -2425,7 +2396,7 @@ mod tests {
         assert_eq!(total(&c, "logit.output.metrics.dropped", "duplicate_timestamp"), 7.0);
     }
 
-    /// A Datadog `rate` decodes as a `Gauge` carrying `_logit.datadog.type: rate`, but it's an
+    /// A Datadog `rate` decodes as a `Gauge` flagged `_logit.metrics.type: rate`, but it's an
     /// increment over its interval: two equal rates in one second are two, so the one left off
     /// counts `dropped`, as two equal gauges wouldn't.
     #[test]
@@ -2433,8 +2404,8 @@ mod tests {
         let (mut e, registry) = encoder();
         let at = |offset_ms: i64| {
             let mut attrs = AttrMap::new();
-            attrs.insert(super::super::ATTR_TYPE, Value::str("rate"));
-            attrs.insert(super::super::ATTR_INTERVAL, Value::I64(10));
+            attrs.insert(METRICS_TYPE, Value::str("rate"));
+            attrs.insert(METRICS_INTERVAL, Value::I64(10));
             Event::metric(
                 TS + offset_ms * 1_000_000,
                 attrs,
@@ -2552,108 +2523,102 @@ mod tests {
         }
     }
 
-    /// A DogStatsD `#host:` tag (`statsd_in`'s `host` attribute) with no `host.name`: used as the
-    /// host and not rendered as a tag, as the Agent's `extractTagsMetadata` does; an empty
-    /// `host.name` counts as none. Empty, `host` is a hostless sample: no fill and no tag, a
-    /// `host` of `""`, and on v2 the Agent's `host` resource with no name. With a non-empty
-    /// `host.name`, `host` stays a tag.
+    /// The host is `host.name`, else the hostless mark, else the default host, and a `host`
+    /// attribute is an ordinary tag on every series route, empty or not, with or without
+    /// `host.name`: `statsd_in` reads a DogStatsD `host:` tag as `host.name`, so a `host`
+    /// attribute is the operator's own tag.
     #[test]
-    fn a_host_tag_is_the_host_only_without_host_name() {
+    fn a_host_attribute_is_an_ordinary_tag() {
         let mut e = DatadogEncoder::new().with_default_host(Some(Arc::from("relay")));
-        let attrs = |pairs: &[(&str, &str)]| {
+        let attrs = |pairs: &[(&str, Value)]| {
             let mut attrs = AttrMap::new();
             for (k, v) in pairs {
-                attrs.insert(k, Value::str(*v));
+                attrs.insert(k, v.clone());
             }
             attrs
         };
-        for (pairs, host, v2_resources, tags) in [
+        let sorted = |tags: &JsonValue| {
+            let mut tags: Vec<String> =
+                tags.as_array().unwrap().iter().map(|t| t.as_str().unwrap().to_string()).collect();
+            tags.sort();
+            tags
+        };
+        let hostless = (ATTR_HOSTLESS, Value::Bool(true));
+        for (pairs, host, tags) in [
             (
-                &[("host", "web1"), ("env", "prod")][..],
-                "web1",
-                json!([{ "type": "host", "name": "web1" }]),
-                json!(["env:prod"]),
+                vec![("host", Value::str("web1")), ("env", Value::str("prod"))],
+                "relay",
+                vec!["env:prod", "host:web1"],
             ),
             (
-                &[("host", ""), ("env", "prod")][..],
-                "",
-                json!([{ "type": "host", "name": "" }]),
-                json!(["env:prod"]),
+                vec![("host", Value::str("")), ("env", Value::str("prod"))],
+                "relay",
+                vec!["env:prod", "host:"],
             ),
             (
-                &[("host", "web1"), (ATTR_HOST_NAME, "")][..],
-                "web1",
-                json!([{ "type": "host", "name": "web1" }]),
-                json!([]),
-            ),
-            (
-                &[("host", "web1"), (ATTR_HOST_NAME, "h")][..],
+                vec![("host", Value::str("web1")), (ATTR_HOST_NAME, Value::str("h"))],
                 "h",
-                json!([{ "type": "host", "name": "h" }]),
-                json!(["host:web1"]),
+                vec!["host:web1"],
             ),
+            (vec![("host", Value::str("web1")), hostless.clone()], "", vec!["host:web1"]),
+            (vec![(ATTR_HOST_NAME, Value::str("h")), hostless.clone()], "h", vec![]),
         ] {
-            let b = one_event_batch(attrs(pairs), MetricKind::gauge(1.0));
+            let b = one_event_batch(attrs(&pairs), MetricKind::gauge(1.0));
             let v1: JsonValue = serde_json::from_slice(&e.encode_series_v1(&b).unwrap()).unwrap();
             assert_eq!(v1["series"][0]["host"], host, "{pairs:?}");
-            assert_eq!(v1["series"][0]["tags"], tags, "{pairs:?}");
-            assert_eq!(
-                metric_tag_count(&b.resource, &b.events[0]),
-                tags.as_array().unwrap().len(),
-                "{pairs:?}"
-            );
+            assert_eq!(sorted(&v1["series"][0]["tags"]), tags, "{pairs:?}");
+            assert_eq!(metric_tag_count(&b.resource, &b.events[0]), tags.len(), "{pairs:?}");
             let v2: JsonValue =
                 serde_json::from_slice(&e.encode_series_v2_json(&b).unwrap()).unwrap();
-            assert_eq!(v2["series"][0]["resources"], v2_resources, "{pairs:?}");
-            let samples = one_event_batch(attrs(pairs), MetricKind::Samples(Samples::new([1.0])));
+            assert_eq!(
+                v2["series"][0]["resources"],
+                json!([{ "type": "host", "name": host }]),
+                "{pairs:?}"
+            );
+            let samples = one_event_batch(attrs(&pairs), MetricKind::Samples(Samples::new([1.0])));
             let points: JsonValue =
                 serde_json::from_slice(&e.encode_distribution_points(&samples).unwrap()).unwrap();
             assert_eq!(points["series"][0]["host"], host, "{pairs:?}");
         }
     }
 
-    /// A `collectd.host` is the host of a metric with no `host.name` (or an empty one) and no
-    /// `host` tag, on every series route and the distribution points, and then not a tag; a
-    /// `host.name` or a `host` tag outranks it, and it stays a tag.
+    /// A series' own `host` displaces a `host.name` tag, counted once per wire tag, and an empty
+    /// one does too, as the hostless mark; with no `host`, the tag is the host.
     #[test]
-    fn a_collectd_host_is_the_host_below_host_name_and_the_host_tag() {
+    fn a_series_host_displaces_a_host_name_tag() {
+        let (mut decoder, registry) = decoder();
+        let body = br#"{"series":[
+            {"metric":"a","points":[[1700000000,1]],"host":"web2","tags":["host.name:web1"]},
+            {"metric":"b","points":[[1700000000,1]],"host":"","tags":["host.name:web1","host.name:x"]},
+            {"metric":"c","points":[[1700000000,1]],"tags":["host.name:web1"]}]}"#;
+        let batch = decoder.decode_series_v1(body, 0).unwrap();
+        let host_name = |i: usize| batch.events[i].attributes.get(ATTR_HOST_NAME).cloned();
+        assert_eq!(host_name(0), Some(Value::str("web2")));
+        assert_eq!(host_name(1), None);
+        assert_eq!(batch.events[1].attributes.get(ATTR_HOSTLESS), Some(&Value::Bool(true)));
+        assert_eq!(host_name(2), Some(Value::str("web1")));
+        assert_eq!(counted(&registry, "logit.input.tags.omitted", ("reason", "reserved_key")), 3.0);
+    }
+
+    /// A `collectd.host` is another family's key: it leaves as a tag on every series route and
+    /// the distribution points, and the default host fills.
+    #[test]
+    fn a_collectd_host_is_an_ordinary_tag() {
         let mut e = DatadogEncoder::new().with_default_host(Some(Arc::from("relay")));
-        let attrs = |pairs: &[(&str, &str)]| {
-            let mut attrs = AttrMap::new();
-            for (k, v) in pairs {
-                attrs.insert(k, Value::str(*v));
-            }
-            attrs
-        };
-        let collectd = crate::collectd::ATTR_HOST;
-        for (pairs, host, tags) in [
-            (&[(collectd, "web1"), ("env", "prod")][..], "web1", json!(["env:prod"])),
-            (&[(collectd, "web1"), (ATTR_HOST_NAME, "")][..], "web1", json!([])),
-            (&[(collectd, "web1"), (ATTR_HOST_NAME, "h")][..], "h", json!(["collectd.host:web1"])),
-            (&[(collectd, "web1"), ("host", "t")][..], "t", json!(["collectd.host:web1"])),
-            // An empty one is no host: the default fills, and it stays a tag.
-            (&[(collectd, "")][..], "relay", json!(["collectd.host:"])),
-            // An empty `host:` tag marks the sample hostless, which `collectd.host` doesn't fill.
-            (&[(collectd, "web1"), ("host", "")][..], "", json!(["collectd.host:web1"])),
-        ] {
-            let b = one_event_batch(attrs(pairs), MetricKind::gauge(1.0));
-            let v1: JsonValue = serde_json::from_slice(&e.encode_series_v1(&b).unwrap()).unwrap();
-            assert_eq!(v1["series"][0]["host"], host, "{pairs:?}");
-            assert_eq!(v1["series"][0]["tags"], tags, "{pairs:?}");
-            assert_eq!(
-                metric_tag_count(&b.resource, &b.events[0]),
-                tags.as_array().unwrap().len(),
-                "{pairs:?}"
-            );
-            let v2: JsonValue =
-                serde_json::from_slice(&e.encode_series_v2_json(&b).unwrap()).unwrap();
-            assert_eq!(v2["series"][0]["resources"], json!([{ "type": "host", "name": host }]));
-            let samples = one_event_batch(attrs(pairs), MetricKind::Samples(Samples::new([1.0])));
-            let points: JsonValue =
-                serde_json::from_slice(&e.encode_distribution_points(&samples).unwrap()).unwrap();
-            assert_eq!(points["series"][0]["host"], host, "{pairs:?}");
-            assert_eq!(points["series"][0]["tags"], tags, "{pairs:?}");
-        }
+        let mut attrs = AttrMap::new();
+        attrs.insert("collectd.host", Value::str("web1"));
+        let b = one_event_batch(attrs.clone(), MetricKind::gauge(1.0));
+        let v1: JsonValue = serde_json::from_slice(&e.encode_series_v1(&b).unwrap()).unwrap();
+        assert_eq!(v1["series"][0]["host"], "relay");
+        assert_eq!(v1["series"][0]["tags"], json!(["collectd.host:web1"]));
+        assert_eq!(metric_tag_count(&b.resource, &b.events[0]), 1);
+        let v2: JsonValue = serde_json::from_slice(&e.encode_series_v2_json(&b).unwrap()).unwrap();
+        assert_eq!(v2["series"][0]["resources"], json!([{ "type": "host", "name": "relay" }]));
+        let samples = one_event_batch(attrs, MetricKind::Samples(Samples::new([1.0])));
+        let points: JsonValue =
+            serde_json::from_slice(&e.encode_distribution_points(&samples).unwrap()).unwrap();
+        assert_eq!(points["series"][0]["host"], "relay");
+        assert_eq!(points["series"][0]["tags"], json!(["collectd.host:web1"]));
     }
 
     /// A series carries its unit as Datadog names it on every series route: a UCUM unit mapped, a
@@ -2730,28 +2695,6 @@ mod tests {
             let points: JsonValue =
                 serde_json::from_slice(&e.encode_distribution_points(&samples).unwrap()).unwrap();
             assert_eq!(points["series"][0]["host"], want);
-        }
-    }
-
-    /// A hostless mark outranks `collectd.host`: the sample stays hostless and `collectd.host`
-    /// leaves as a tag.
-    #[test]
-    fn a_hostless_mark_keeps_a_collectd_host_a_tag() {
-        let mut e = DatadogEncoder::new().with_default_host(Some(Arc::from("relay")));
-        let mut marked = AttrMap::new();
-        marked.insert(ATTR_HOSTLESS, Value::Bool(true));
-        let mut resource = AttrMap::new();
-        let mut entry = AttrMap::new();
-        entry.insert("type", Value::str("host"));
-        entry.insert("name", Value::str(""));
-        resource.insert(ATTR_RESOURCES, Value::Array(vec![Value::Map(Box::new(entry))]));
-        for mut attrs in [marked, resource] {
-            attrs.insert(crate::collectd::ATTR_HOST, Value::str("web1"));
-            let b = one_event_batch(attrs, MetricKind::gauge(1.0));
-            let v1: JsonValue = serde_json::from_slice(&e.encode_series_v1(&b).unwrap()).unwrap();
-            assert_eq!(v1["series"][0]["host"], "");
-            assert_eq!(v1["series"][0]["tags"], json!(["collectd.host:web1"]));
-            assert_eq!(metric_tag_count(&b.resource, &b.events[0]), 1);
         }
     }
 
@@ -2834,6 +2777,46 @@ mod tests {
         );
     }
 
+    /// A rate is the neutral flag: a `Gauge` flagged `_logit.metrics.type: rate` leaves as a `rate`
+    /// with its `_logit.metrics.interval`, from the event or the batch resource, whoever flagged
+    /// it. `_logit.datadog.type: rate` and `_logit.datadog.interval` are not rate flags: a `Gauge`
+    /// carrying only them leaves as a `gauge` with no interval. A `rate` flag on a `Sum` is
+    /// ignored.
+    #[test]
+    fn the_neutral_rate_flag_writes_a_rate_and_the_retired_carriers_do_not() {
+        let series = |resource: Resource, attrs: AttrMap, kind: MetricKind| {
+            let (mut e, _) = encoder();
+            let b = EventBatch {
+                resource: Arc::new(resource),
+                scope: None,
+                events: vec![Event::metric(TS, attrs, MetricRecord::new(intern("r"), kind))],
+            };
+            let body = e.encode_series_v1(&b).unwrap();
+            let json: JsonValue = serde_json::from_slice(&body).unwrap();
+            let s = &json["series"][0];
+            (s["type"].as_str().unwrap().to_string(), s["interval"].as_i64().unwrap())
+        };
+        let neutral = || {
+            let mut attrs = AttrMap::new();
+            attrs.insert(METRICS_TYPE, Value::str("rate"));
+            attrs.insert(METRICS_INTERVAL, Value::I64(10));
+            attrs
+        };
+        let gauge = || MetricKind::gauge(0.5);
+        assert_eq!(series(Resource::default(), neutral(), gauge()), ("rate".into(), 10));
+
+        let resource = Resource { attributes: neutral(), ..Resource::default() };
+        assert_eq!(series(resource, AttrMap::new(), gauge()), ("rate".into(), 10), "the resource");
+
+        let mut retired = AttrMap::new();
+        retired.insert("_logit.datadog.type", Value::str("rate"));
+        retired.insert("_logit.datadog.interval", Value::I64(10));
+        assert_eq!(series(Resource::default(), retired, gauge()), ("gauge".into(), 0));
+
+        let counter = MetricKind::counter(2.0);
+        assert_eq!(series(Resource::default(), neutral(), counter), ("count".into(), 10));
+    }
+
     #[test]
     fn nothing_to_send_is_none() {
         let (mut e, _) = encoder();
@@ -2849,8 +2832,8 @@ mod tests {
         let (mut e, _) = encoder();
         let mut attrs = AttrMap::new();
         attrs.insert(ATTR_HOST_NAME, Value::str("h"));
-        attrs.insert(ATTR_TYPE, Value::str("rate"));
-        attrs.insert(ATTR_INTERVAL, Value::I64(10));
+        attrs.insert(METRICS_TYPE, Value::str("rate"));
+        attrs.insert(METRICS_INTERVAL, Value::I64(10));
         attrs.insert(ATTR_ORIGIN_SERVICE, Value::U64(5));
         let mut record = MetricRecord::new(intern("r"), MetricKind::gauge(0.5));
         record.unit = Some(intern("second"));
@@ -2889,7 +2872,7 @@ mod tests {
         let (mut e, registry) = encoder();
         let mut attrs = AttrMap::new();
         attrs.insert(ATTR_ORIGIN_PRODUCT, Value::U64(1));
-        attrs.insert(ATTR_INTERVAL, Value::str("ten"));
+        attrs.insert(METRICS_INTERVAL, Value::str("ten"));
         let b = one_event_batch(attrs, MetricKind::gauge(1.0));
         e.encode_series_v1(&b).unwrap();
         let drained = registry.drain(0);

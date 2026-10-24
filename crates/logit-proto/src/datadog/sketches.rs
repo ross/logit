@@ -60,7 +60,7 @@ impl DatadogDecoder {
                 continue;
             }
             let name = intern(&s.metric);
-            let (attrs, reserved) = WireSeries {
+            let (attrs, reserved, displaced) = WireSeries {
                 tags: s.tags.iter().map(String::as_str).collect(),
                 host: Some(&s.host),
                 origin: OriginCodes::from_proto(s.metadata.as_ref()),
@@ -95,6 +95,7 @@ impl DatadogDecoder {
             }
             if out.len() > first {
                 self.reserved_tags(reserved);
+                self.displaced_host_names(displaced);
             }
         }
         let resource = common_metadata_resource(payload.metadata.as_ref());
@@ -602,17 +603,17 @@ mod tests {
         assert!(out.sketches[0].tags.is_empty(), "{:?}", out.sketches[0].tags);
     }
 
-    /// A `host` attribute is a hostless sketch's host and not a tag; an empty one stays hostless.
+    /// A `host` attribute is an ordinary tag, never the sketch's host, which the default fills.
     #[test]
-    fn a_sketch_takes_its_host_from_a_host_tag() {
+    fn a_host_attribute_is_a_sketch_tag() {
         let mut e = DatadogEncoder::new().with_default_host(Some(Arc::from("relay")));
-        for (tag, want) in [("web1", "web1"), ("", "")] {
+        for tag in ["web1", ""] {
             let mut b = batch_of(heavy(1, 1.0));
             b.events[0].attributes.insert("host", Value::str(tag));
             let sketch =
                 &SketchPayload::decode(e.encode_sketches(&b).unwrap()).unwrap().sketches[0];
-            assert_eq!(sketch.host, want);
-            assert!(sketch.tags.is_empty(), "{:?}", sketch.tags);
+            assert_eq!(sketch.host, "relay");
+            assert_eq!(sketch.tags, [format!("host:{tag}")]);
         }
     }
 

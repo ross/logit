@@ -1,2 +1,2 @@
 wire: ../../../../testdata/interop/statsd/statsd-dogstatsd-buffered-000.raw
-exercises: [counter, counter_sample_rate, gauge, timer_ms, timer_h, timer_d, set, tags, container_id]
+exercises: [counter, counter_sample_rate, gauge, timer_ms, timer_h, timer_d, set, tags, container_id, host]

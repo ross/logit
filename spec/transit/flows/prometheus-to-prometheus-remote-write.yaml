@@ -1,5 +1,5 @@
 # prometheus_in's scrape cases sent by prometheus_out as remote-write 1.0, with nothing between:
-# every sample timestamped, so the receiver stamps no timestamp marker, and the scrape target
+# every sample timestamped, so the receiver sets no `timestamped` flag, and the scrape target
 # carried as the `instance` label.
 # `path:` names one case so `logit run` can run this by hand; the transit spec runs every case in
 # that file's directory (spec/transit/README.md).

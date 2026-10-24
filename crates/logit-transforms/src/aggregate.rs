@@ -4931,8 +4931,6 @@ mod tests {
         let resource = default_resource();
         let mut event = metric_event("g", MetricKind::gauge(7.0), 1_799_999_970_000_000_000);
         event.attributes.insert("_logit.datadog.stats.name", "web.request");
-        event.attributes.insert("_logit.statsd.timestamp", Value::U64(1_799_999_970));
-        event.attributes.insert("_logit.prometheus.timestamp", Value::Bool(true));
         event.attributes.insert("_logit.field.x", "note");
 
         assert!(feed(&mut agg, &resource, event).is_none(), "absorbed, not passed through");

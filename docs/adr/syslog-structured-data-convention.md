@@ -1,6 +1,6 @@
 ---
 created: 2026-09-11
-updated: 2026-10-18
+updated: 2026-10-23
 ---
 
 # RFC 5424 structured-data convention: nested `syslog.sd`, strict parsing, opt-in PEN-qualified emission
@@ -95,8 +95,8 @@ has:
   plan's permitted normalizations (a sink-configured dialect change), not data loss this sink is
   expected to work around.
 - **Opt-in `structured_data: { sd_id: "<name>@<PEN>" }`.** When `syslog_out` is configured with
-  this (5424 output only), every event attribute whose key does *not* start with `syslog.` is
-  emitted as one extra SD-ELEMENT under `sd_id`, PARAM-NAME = attribute key, same
+  this (5424 output only), every event attribute whose key does *not* start with `syslog.`, and
+  isn't `host.name` (HOSTNAME's key), is emitted as one extra SD-ELEMENT under `sd_id`, PARAM-NAME = attribute key, same
   validate/skip/count rule as above; the element is omitted entirely when no attribute qualifies.
   This is what closes the `syslog_in -> json -> syslog_out` gap — an attribute a transform added
   along the way still reaches the wire when an operator opts in. `syslog_in` decodes this element
@@ -209,7 +209,7 @@ at all.
 - **`syslog_in -> syslog_out` is byte-faithful for 5424→5424 and 3164→3164**, modulo the following
   enumerated normalizations:
   - A leading MSG BOM is stripped on decode and never re-emitted on encode.
-  - A configured sink `hostname`/`app_name` fills only an *absent* `syslog.hostname`/`syslog.tag`
+  - A configured sink `hostname`/`app_name` fills only an *absent* `host.name`/`syslog.tag`
     attribute — it never overrides one the origin actually sent, but it does mean a relay through a
     sink configured with defaults is not byte-identical for a message that omitted those fields.
   - A 3164 output drops `syslog.sd` and the opt-in `structured_data` element entirely (3164 has no

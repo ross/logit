@@ -1,6 +1,6 @@
 ---
 created: 2026-09-10
-updated: 2026-10-22
+updated: 2026-10-23
 ---
 
 # statsd/DogStatsD egress: dialect, transport, packing, and the v1 metric-kind deferral
@@ -293,28 +293,25 @@ preserved. A member that comes out different from its raw bytes is counted
 
 ### `|c:`/`|T` carriage: dogstatsd only, dropped and counted under `format: statsd`
 
-`_logit.statsd.container_id` renders as `|c:<id>` and the per-line `_logit.statsd.timestamp ==
-Value::U64(secs)` carrier renders as `|T<secs>`, using that carrier's own value verbatim — both
-only under `Format::DogStatsd` (`append_dialect_extras`), appended after the tag segment to
-**every** physical line an event produces, so a negative-absolute-gauge's two-line pair or a
-multi-line `Samples`/`SetMembers` record carries them on each line. `|T` renders **only** when the
-carrier is present and holds a `Value::U64` (a wire `|T<secs>` segment always produces exactly
-that), never derived from `Event::timestamp` — a receipt-time stamp is not a wire-supplied
-timestamp, and a stage that rewrites `Event::timestamp` after decode can't fabricate or collapse
-a `|T` this way. (`aggregate` passes a `|T` record through unmerged, per
-[ADR `aggregation-window-semantics`](aggregation-window-semantics.md)'s 2026-10-19 amendment, on
-the `_logit.metrics.closed` flag `statsd_in` sets beside the carrier,
-[ADR `metric-flags`](metric-flags.md).) A `_logit.statsd.timestamp` present but not a `Value::U64` (never produced
-by `statsd_in` itself, but reachable from a cross-protocol relay or a Lua-authored attribute) is
-simply not emitted (`a_non_u64_statsd_timestamp_value_is_not_emitted`). Under `format: statsd`,
-neither field has anywhere to go — both are dropped and counted once per field per emitted
+`_logit.statsd.container_id` renders as `|c:<id>`, and an event flagged
+`_logit.metrics.closed: "timestamped"` gets `|T<secs>`, the whole seconds of `Event::timestamp`,
+truncated (the 2026-10-23 amendment below) — both only under `Format::DogStatsd`
+(`append_dialect_extras`), appended after the tag segment to **every** physical line an event
+produces, so a negative-absolute-gauge's two-line pair or a multi-line `Samples`/`SetMembers`
+record carries them on each line. `|T` renders **only** for the flag's `timestamped` value: an
+unflagged event's timestamp may be receipt time, which isn't a wire-supplied timestamp, and the
+flag's other values (`bucketed`, any other `Str`, `Bool(true)`) don't say the timestamp is the
+source's (`a_closed_flag_other_than_timestamped_writes_no_pipe_t`). (`aggregate` passes a `|T`
+record through unmerged on the same flag, per
+[ADR `aggregation-window-semantics`](aggregation-window-semantics.md)'s 2026-10-19 amendment and
+[ADR `metric-flags`](metric-flags.md).) Under `format: statsd`, neither field has anywhere to go — both are dropped and counted once per field per emitted
 physical line (`EncodeStats::dropped_dialect_fields`,
 `container_id_and_timestamp_are_dropped_and_counted_under_plain_statsd`).
 
 ### `_logit.statsd.*` is never emitted as a tag, and is read off the merged resource⊕event view
 
-`_logit.statsd.type`/`_logit.statsd.container_id`/`_logit.statsd.timestamp` are this sink's own
-carriers, which the decoder stamped from a line's own wire-type/`|c:`/`|T` segments, not ordinary
+`_logit.statsd.type`/`_logit.statsd.container_id` are this sink's own carriers, which the decoder
+stamped from a line's own wire-type/`|c:` segments, not ordinary
 attributes. `build_tag_suffix` reads every key under its own prefix, `_logit.statsd.`, by exact
 name and keeps it out of the generic `|#k:v,...` segment, uncounted: the carrier is being read for
 its real purpose, not dropped. Every other private `_logit.` key is skipped after that arm, also
@@ -396,9 +393,9 @@ both new segments: `a_single_value_samples_metric_encodes_as_name_colon_value_pi
 `an_empty_set_members_list_emits_nothing_and_is_counted` for `SetMembers`;
 `a_container_id_attribute_appends_pipe_c_under_dogstatsd`,
 `a_container_id_on_the_resource_is_emitted_as_pipe_c_under_dogstatsd`,
-`a_timestamp_marker_appends_pipe_t_seconds_under_dogstatsd`,
+`a_timestamped_event_appends_pipe_t_seconds_from_its_timestamp_under_dogstatsd`,
 `container_id_and_timestamp_come_after_the_tag_segment`,
-`a_non_u64_statsd_timestamp_value_is_not_emitted`, and
+`a_closed_flag_other_than_timestamped_writes_no_pipe_t`, and
 `container_id_and_timestamp_are_dropped_and_counted_under_plain_statsd` for `|c:`/`|T`; plus
 `a_container_id_and_timestamp_line_round_trips_through_the_real_statsd_decoder` and a `proptest`
 fixed point (`mod fixed_point::decode_encode_decode_is_a_fixed_point`, 200 generated cases over
@@ -414,7 +411,7 @@ fixed point (`mod fixed_point::decode_encode_decode_is_a_fixed_point`, 200 gener
 `statsd_type_is_stamped_for_each_timer_type`, `set_type_becomes_set_members`,
 `multi_value_set_produces_one_event_with_all_members`,
 `container_id_segment_becomes_an_attribute`/`container_id_segment_applies_to_every_metric_type`,
-`timestamp_segment_sets_the_event_timestamp_and_marker`/
+`timestamp_segment_sets_the_event_timestamp_and_flag`/
 `malformed_timestamp_segment_rejects_only_that_line`, and
 `container_id_timestamp_rate_and_tags_combine_in_any_order`.
 `crates/logit-cli/tests/statsd_round_trip.rs` (mirroring `syslog_round_trip.rs`'s real-UDP-socket
@@ -440,8 +437,9 @@ unescape); `severity` maps `t:error`/`t:warning`/`t:success`/`t:info` to
 model has no normalized field for) rather than a `LogRecord` field: `_logit.statsd.event.title`
 (always), `_logit.statsd.event.priority`/`_logit.statsd.event.alert_type` (only when sent, raw wire
 value), `_logit.statsd.event.aggregation_key`, `_logit.statsd.event.source_type`,
-`_logit.statsd.event.host` — plus the same
-`_logit.statsd.timestamp`/`_logit.statsd.container_id`/`#tags` handling every metric line already
+`_logit.statsd.event.host` (superseded: `h:` now decodes to `host.name` and the carrier is retired,
+see "Amendment (2026-10-23): the host is `host.name`, in each line's own form") — plus the
+same timestamp flag, `_logit.statsd.container_id`, and `#tags` handling every metric line already
 gets, with `d:<secs>` (not `|T<secs>`) playing the timestamp segment's role here.
 
 A service check decodes to one `Event::metric`, `MetricKind::Gauge(status as f64)` under the
@@ -452,8 +450,10 @@ rendering) handles a service check with no special-casing. `_logit.statsd.servic
 `_logit.statsd.service_check.status` (always, `Value::U64`), `_logit.statsd.service_check.message`
 (`m:`, only if present, verbatim including any `|` it contains — `m:` is always the *last* field on
 the wire, so it can consume the rest of the line; superseded: `m:` now ends at the next `|`, see the
-2026-09-24 amendment), `_logit.statsd.service_check.host` (`h:`, only if present),
-`_logit.statsd.timestamp`/`_logit.statsd.container_id`/`#tags` round out the carrier set.
+2026-09-24 amendment), `_logit.statsd.service_check.host` (`h:`, only if present; superseded: `h:`
+now decodes to `host.name` and the carrier is retired, see "Amendment (2026-10-23): the host is
+`host.name`, in each line's own form"),
+the timestamp flag, `_logit.statsd.container_id`, and `#tags` round out the set.
 
 **`event_name` stays `None`, deliberately.** An event title is free text an operator or their
 application chose at send time — not a fixed, bounded vocabulary the way a metric or tag name is —
@@ -472,8 +472,8 @@ consumes the rest of the line on decode; the order stands, the reason is superse
 2026-09-24 amendment) — the same "tags in `AttrMap` order, not wire order"
 normalization this ADR's previous amendment already permits by name for an ordinary metric line's
 segments, applied to these two grammars' own named fields instead of a generic `|` segment order.
-`d:<secs>` (never `|T<secs>`) renders from the `_logit.statsd.timestamp` carrier's own `U64` value
-on both shapes — an event/service-check line's timestamp is a *named* field of its own grammar, not
+`d:<secs>` (never `|T<secs>`) renders from `Event::timestamp` for a `timestamped` event on both
+shapes — an event/service-check line's timestamp is a *named* field of its own grammar, not
 the generic `|T` extension `append_dialect_extras` emits on an ordinary metric line, so it gets its
 own dedicated field rather than borrowing that path. Severity is never re-derived from
 `LogRecord.severity` to synthesize a `t:` field when `_logit.statsd.event.alert_type` is absent: the
@@ -532,8 +532,8 @@ check.
 `event_missing_pipe_after_title_is_rejected`,
 `event_title_length_landing_mid_char_boundary_is_rejected`,
 `event_unknown_priority_or_alert_type_is_rejected`,
-`event_d_field_sets_the_timestamp_and_the_carrier`, `event_container_id_becomes_an_attribute`,
-`service_check_d_field_sets_the_timestamp_and_the_carrier`,
+`event_d_field_sets_the_timestamp_and_the_flag`, `event_container_id_becomes_an_attribute`,
+`service_check_d_field_sets_the_timestamp_and_the_flag`,
 `service_check_container_id_becomes_an_attribute`,
 `service_check_message_ends_at_the_next_pipe`,
 `service_check_out_of_range_or_non_numeric_status_is_rejected`,
@@ -872,11 +872,9 @@ So a non-empty `host.name` is now the `host:` tag, and the hostless mark an empt
 a line with no `host` attribute and no non-empty `h:` field. `format: statsd` writes no tags and is
 unchanged. `statsd_out`'s module doc section "The host" is the canonical statement of the rules.
 
-**The precedence is the reverse of `datadog_out`'s.** There, `host.name` is the host and a `host`
-attribute stays a tag (the process-hostname amendment of
-[ADR `datadog-agent-and-intake-relay`](datadog-agent-and-intake-relay.md)). Here `host` wins,
-because it's the value `statsd_in` decoded from this protocol's own `host:` tag, so a `host:` tag
-relays as itself. A DogStatsD line has one host either way, and the other value stays a tag.
+**The precedence was the reverse of `datadog_out`'s**, superseded by "Amendment (2026-10-23):
+`host.name` ranks first" below. Here `host` won, because it's the value `statsd_in` decoded from
+this protocol's own `host:` tag, so a `host:` tag relayed as itself.
 
 **The like pair gains a permitted normalization.** `statsd_in` decodes a `host.name:` tag to the
 `host.name` attribute, the same key `datadog_in` and OTLP sources use for a host, so the encoder
@@ -885,7 +883,10 @@ can't tell a DogStatsD sender's ordinary tag from a host. A `host.name:` tag on 
 downstream takes it as the host. This was chosen over marking the tag's origin: a sender writing
 `host.name:` names a host, and the Agent was dropping it in favor of its own. It joins the pair's
 list in `crates/logit-cli/tests/statsd_round_trip.rs` as (10), and
-[ADR `lossless-transit`](lossless-transit.md)'s amendment of the same date.
+[ADR `lossless-transit`](lossless-transit.md)'s amendment of the same date. Superseded in part by
+[ADR `process-hostname`](process-hostname.md)'s "Amendment: `host.name` ranks first everywhere
+(2026-10-23)" and "Amendment (2026-10-23): `host.name` ranks first" below: the `host.name:` tag is
+now the `host:` tag on every line, and a `host:` tag beside it is omitted, counted.
 
 **An event or a service check keeps its `h:` field from the carrier alone.** With no non-empty
 `h:` field, the Agent reads the `host:` tag on an event or check as it does on a metric, so the tag
@@ -896,3 +897,84 @@ read back as a carrier the input didn't have.
 
 The transit spec's `Spelling::Statsd` reads `host.name` and the hostless mark back as `host` under
 `format: dogstatsd` (`crates/logit-cli/src/transit/classes.rs`).
+
+## Amendment (2026-10-23): `|T` comes from the `timestamped` flag and `Event::timestamp`
+
+`_logit.statsd.timestamp` is retired. `statsd_in` flags a `|T` line, or an event's or service
+check's `d:`, `_logit.metrics.closed: "timestamped"` and sets `Event::timestamp` from it, with no
+carrier beside the flag. `statsd_out` under `format: dogstatsd` writes `|T<secs>` on a metric line,
+and `d:<secs>` on an event or a service-check line, for an event so flagged, on the event or else
+the resource, with `secs` the whole seconds of `Event::timestamp`, truncated. A flagged event
+stamped before 1970 gets none, since the wire's seconds are unsigned, and the line is still sent,
+counted `logit.output.fields.omitted{reason="invalid_value"}` once per line. Under `format:
+statsd` the omission is counted as before, `logit.output.fields.omitted{reason="dialect"}`, once
+for the timestamp, pre-1970 or not. ([ADR `protocol-knowledge-stays-in-family`](protocol-knowledge-stays-in-family.md),
+"Amendment: move, don't mirror (2026-10-23)".)
+
+This reverses one decision above: `|T` was the carrier's wire value so that a stage rewriting
+`Event::timestamp` couldn't move or fabricate it. Now a `timestamp` transform or a Lua script that
+rewrites `Event::timestamp` moves the `|T` with it, and a script that sets the flag gets the `|T`
+it asked for. The flag says the timestamp is the source's, and the event's timestamp is the point's
+time. A scraped `prometheus_in` sample with its own timestamp now leaves with a `|T` too, since
+the scrape sets the same flag. The relay stays a fixed point: `statsd_in` sets the flag and the
+timestamp from the `|T` it reads back.
+
+## Amendment (2026-10-23): `host.name` ranks first
+
+[ADR `process-hostname`](process-hostname.md)'s "Amendment: `host.name` ranks first everywhere
+(2026-10-23)" makes a non-empty `host.name` (event, else resource) the host at every sink, ahead of
+the sink's own wire forms. Under `format: dogstatsd`, `statsd_out` now writes a non-empty string
+`host.name` as the `host:` tag on every line, whatever else the record carries:
+
+- **A `host` attribute beside it is omitted**, counted
+  `logit.output.tags.omitted{reason="unrepresentable"}` once per wire tag. Written, it would be a
+  second `host:` tag. The Agent's `extractTagsMetadata` (datadog-agent 7.83.3,
+  `comp/dogstatsd/server/impl/enrich.go`) takes the last `host:` tag as the host and consumes
+  every one, so the value would be lost at the Agent uncounted, and `statsd_in` would read the
+  pair back as an `Array`. "Multi-value tags" in the sink's module doc keeps a repeated key as
+  live tags, but a `host:` tag is no tag at the Agent, so that rule doesn't cover it.
+- **A non-empty `h:` carrier beside it is left unwritten**, uncounted: it's private, and the
+  Agent would read it ahead of the tag. An empty `h:` is no host at the Agent and is still
+  written.
+
+With no usable `host.name`, the 2026-10-19 rules stand: the `h:` field, then a `host` attribute as
+an ordinary `host:` tag, then the hostless mark as an empty one.
+
+The like pair's normalization (10) grows to match: a `host.name:` tag is the `host:` tag beside a
+`host:` tag or an `h:` field too (`crates/logit-cli/tests/statsd_round_trip.rs`,
+`host-name-tag-beside-host`). A DogStatsD sender that writes both a `host:` and a `host.name:` tag
+names two hosts; the relay sends the `host.name:` one, which an Agent reading the original line
+would have kept as a tag. `statsd_out`'s module doc section "The host" is the canonical statement.
+
+## Amendment (2026-10-23): the host is `host.name`, in each line's own form
+
+[ADR `process-hostname`](process-hostname.md)'s "Amendment: a source fills the common keys
+(2026-10-23)" moves the DogStatsD host onto `host.name` at the source: `statsd_in` decodes a
+line's last `host:` tag, and an event's or service check's non-empty `h:` field ahead of it, to
+`host.name`, an empty `host:` tag to `_logit.datadog.hostless`, and keeps neither as a tag or a
+carrier. `_logit.statsd.event.host` and `_logit.statsd.service_check.host` are retired. So
+`statsd_out` writes the host from `host.name` alone, in the form the Agent reads for each line:
+
+- **A metric line's host is its `host:` tag**, last among the tags, as before.
+- **An event's or service check's host is its `h:` field**, with no `host:` tag. This replaces
+  the 2026-10-19 choice of a `host:` tag on those lines: with the carrier gone, `h:` is the one
+  form that round-trips through `statsd_in` to the same `host.name`, and it's the form the Agent
+  reads first. A check's trailing metric lines still carry the host as their `host:` tag, since
+  the encoder writes the check's line from its tag segment less that tag.
+- **The hostless mark is an empty `host:` tag on every line kind**, since an empty `h:` is no host
+  to the Agent, which stamps its own.
+- **A `host` attribute is an ordinary tag**, written as `host:<v>`, which the Agent then reads as
+  the host. No decoder writes one, so it's the operator's. Beside a usable `host.name` or the
+  hostless mark a valued one is still omitted, counted `tags.omitted{reason="unrepresentable"}`
+  once per wire tag: it would be a second `host:` tag, and the Agent would silently take the last
+  one. A bare `host` token isn't a `host:` tag and stays.
+
+Normalization (10) of the like pair changes with it (`crates/logit-cli/tests/statsd_round_trip.rs`):
+`#host:web-2,host.name:web-1` now relays as `#host:web-2`, reversing the ranks-first amendment
+above, because the source reads the line as the Agent does and omits the `host.name:` tag,
+counted `logit.input.tags.omitted{reason="reserved_key"}`. Of several `host:` tags only the last
+relays, an event's or check's `host:` tag relays as its `h:` field, and a `host.name:` tag on a
+line with no host of its own still relays as the line's host. The transit spec's
+`Spelling::Statsd` reads `host.name` and the mark back as themselves, and a `host` attribute the
+line's own host doesn't omit back as `host.name` (`crates/logit-cli/src/transit/classes.rs`).
+`statsd_out`'s module doc section "The host" is the canonical statement.

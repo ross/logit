@@ -33,7 +33,7 @@
 //! | `Event::timestamp` | envelope `time` (seconds) and `start_time` (ns) | -- |
 //! | the ids | lowercase hex; no parent → `parent_span_id` `""` | -- |
 //! | `name` | a string (a non-`Str` name as its text) | -- |
-//! | event attributes | `attributes`, omitted when empty | -- |
+//! | event attributes but a `host.name` the envelope `host` took ([`super`]'s "Envelope") | `attributes`, omitted when empty | -- |
 //! | `kind`, `status` | the exporter's enum names (`SPAN_KIND_*`, `STATUS_CODE_*`); `status` always written, `{"message":"","code":"STATUS_CODE_UNSET"}` at its emptiest | -- |
 //! | `events`, `links` | omitted when empty | -- |
 //! | the resource's non-carrier attributes | `fields`, flattened | -- |
@@ -47,7 +47,7 @@ use crate::{MessageBuf, Signal};
 use logit_core::interner::resolve;
 use logit_core::trace::{parse_span_id, parse_trace_id, to_hex};
 use logit_core::{
-    AttrMap, Event, SpanEvent, SpanExt, SpanKind, SpanLink, SpanRecord, SpanStatus, Value,
+    AttrMap, Event, SpanEvent, SpanExt, SpanKind, SpanLink, SpanRecord, SpanStatus, Symbol, Value,
 };
 use serde_json::{Map, Value as Json};
 
@@ -290,9 +290,11 @@ fn has_unwritable_fields(span: &SpanRecord) -> bool {
         || span.links.iter().any(|l| l.flags != 0 || l.dropped_attributes_count != 0)
 }
 
-fn write_attributes(obj: &mut JsonObject<'_>, attributes: &AttrMap) {
+/// Writes `attributes` but `skip` and the private ones as an `attributes` member, when any remain.
+fn write_attributes(obj: &mut JsonObject<'_>, attributes: &AttrMap, skip: Option<Symbol>) {
     let mut public = attributes
         .iter()
+        .filter(|(key, _)| Some(*key) != skip)
         .map(|(key, value)| (resolve(key), value))
         .filter(|(key, _)| !logit_core::attrs::is_private(key))
         .peekable();
@@ -327,7 +329,8 @@ impl SplunkEncoder {
         }
 
         self.scratch.clear();
-        let mut obj = begin_object(&mut self.scratch, event.timestamp, ctx);
+        let host = ctx.host(event);
+        let mut obj = begin_object(&mut self.scratch, event.timestamp, ctx, host);
         {
             let mut hec = JsonObject::begin(obj.key("event"));
             write_str(hec.key("trace_id"), &to_hex(&span.trace_id));
@@ -335,7 +338,7 @@ impl SplunkEncoder {
             let parent = span.parent_span_id.map(|p| to_hex(&p)).unwrap_or_default();
             write_str(hec.key("parent_span_id"), &parent);
             write_str(hec.key("name"), &value_text(&span.name));
-            write_attributes(&mut hec, &event.attributes);
+            write_attributes(&mut hec, &event.attributes, host.consumed());
             write_i64(hec.key("end_time"), span.end_timestamp);
             write_str(hec.key("kind"), span_kind_name(span.kind));
             {
@@ -359,7 +362,7 @@ impl SplunkEncoder {
                         slot.push(b',');
                     }
                     let mut item = JsonObject::begin(slot);
-                    write_attributes(&mut item, &span_event.attributes);
+                    write_attributes(&mut item, &span_event.attributes, None);
                     write_str(item.key("name"), &value_text(&span_event.name));
                     write_i64(item.key("timestamp"), span_event.timestamp);
                     item.finish();
@@ -374,7 +377,7 @@ impl SplunkEncoder {
                         slot.push(b',');
                     }
                     let mut item = JsonObject::begin(slot);
-                    write_attributes(&mut item, &link.attributes);
+                    write_attributes(&mut item, &link.attributes, None);
                     write_str(item.key("trace_id"), &to_hex(&link.trace_id));
                     write_str(item.key("span_id"), &to_hex(&link.span_id));
                     let state = link

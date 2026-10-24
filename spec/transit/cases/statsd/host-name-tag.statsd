@@ -1,3 +1,6 @@
 requests:1|c|#env:prod,host.name:web-1
 requests.tagged:1|c|#host:web-2,host.name:web-1
 _e{6,4}:deploy|v2.1|h:|#host.name:web-1
+requests.hostless:1|c|#env:prod,host:
+_e{6,4}:deploy|v2.2|#host:web-3
+_sc|db.up|0|#host:web-4

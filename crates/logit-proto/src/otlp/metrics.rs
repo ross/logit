@@ -83,6 +83,8 @@
 //! | `record/exemplars_on_summary` | lost | structural | A `SummaryDataPoint` has no exemplars field, so a summary's exemplars are left off. |
 //! | `record/min_max` | exact | -- | The data point's `min` and `max`. |
 //! | `attributes/string_value` | exact | -- | A string attribute. |
+//! | `attributes/host_beside_host_name` | exact | -- | A string attribute. |
+//! | `attributes/hostname` | exact | -- | A log attribute. |
 //! | `attributes/bool_value` | exact | -- | A boolean attribute. |
 //! | `attributes/number_value` | normalized | `u64_as_int`; `logit.output.attributes.normalized{reason=u64_as_double}` | An integer or double attribute. A `u64` reads back as an `i64`, or, above `i64::MAX`, as a double, approximate beyond 2^53, counted once per such value. |
 //! | `attributes/array_value` | exact | -- | An array attribute. |
@@ -90,7 +92,15 @@
 //! | `attributes/bytes_value` | exact | -- | A bytes attribute. |
 //! | `attributes/timestamp_value` | normalized | `timestamp_as_int` | OTLP has no timestamp value, so it's an integer of Unix nanoseconds. |
 //! | `attributes/prometheus_target` | lost | structural | The scrape target is private and isn't an OTLP attribute, so it's left off. |
-//! | `attributes/foreign_carrier` | lost | structural | A `_logit.` carrier is private and isn't an OTLP attribute, so it's left off. |
+//! | `attributes/foreign_carrier` | lost | structural | A `_logit.` carrier is private and isn't an OTLP attribute, so it's left off. The `_logit.prometheus.type` carrier changes nothing; the `family_type` row has the `_logit.metrics.type` values the sink reads. |
+//! | `attributes/timestamped` | lost | structural | The flag is private and isn't an OTLP attribute, so it's left off. The point's time carries the timestamp. |
+//! | `attributes/rate` | lost | structural | The flag is private and isn't an OTLP attribute, so it's left off. |
+//! | `attributes/interval` | lost | structural | The flag is private and isn't an OTLP attribute, so it's left off. |
+//! | `attributes/rate_on_non_gauge` | lost | structural | The flag is private and isn't an OTLP attribute, so it's left off. |
+//! | `attributes/family_type` | lost | structural | The flag is private and isn't an OTLP attribute, so it's left off. The sink reads it, writing an info or stateset gauge as a non-monotonic `Sum` and skipping a gauge histogram, by the `prometheus_info`, `prometheus_stateset`, and `gauge_histogram` rows. |
+//! | `attributes/family_type_on_other_kind` | lost | structural | The value names another kind, so it's ignored: the record keeps its own kind's OTLP type, and the flag is private and isn't an OTLP attribute. |
+//! | `attributes/interval_on_distribution` | lost | structural | The flag is private and isn't an OTLP attribute, so it's left off. |
+//! | `attributes/interval_on_histogram` | lost | structural | The flag is private and isn't an OTLP attribute, so it's left off. |
 //! | `attributes/resource_attribute` | exact | -- | A resource attribute. |
 //! | `attributes/scope` | exact | -- | The `InstrumentationScope` of the batch. |
 //! | `attributes/datadog_carrier_log` | lost | structural | A `_logit.` carrier is private and isn't an OTLP attribute, so it's left off. |
@@ -131,13 +141,16 @@
 //!   `false`, i.e. the sketch's stats were derived from its bins). Its exemplars are left off,
 //!   as a `Summary`'s are (`record/exemplars_on_summary` above): the wire type has no field for
 //!   them, a structural loss with no counter.
-//! - An OpenMetrics type `prometheus_in` carried as `_logit.prometheus.type` follows the OTel
+//! - The neutral flag `_logit.metrics.type`, on the event or else the resource, follows the OTel
 //!   Prometheus and OpenMetrics compatibility spec's "Prometheus/OpenMetrics to OTLP": a
-//!   `gaugehistogram` `Histogram` isn't written, counted
-//!   `logit.output.metrics.skipped{metric_kind="gauge_histogram"}`, and an `info` or `stateset`
-//!   `Gauge` is a cumulative non-monotonic `Sum`, an `info` one named `<name>_info`. The spec marks
-//!   its Info and StateSet sections Development. Its `target_info` exception, resource attributes
-//!   in place of a metric, isn't implemented (`docs/known-gaps/otlp.md`).
+//!   `Histogram` flagged `gaugehistogram` isn't written, counted
+//!   `logit.output.metrics.skipped{metric_kind="gauge_histogram"}`, and a `Gauge` flagged `info` or
+//!   `stateset` is a cumulative non-monotonic `Sum`, an `info` one named `<name>_info`. A value on
+//!   another kind is ignored. `prometheus_in` sets the flag for those three OpenMetrics family
+//!   types, and Lua or `set` can too; `_logit.prometheus.type` is Prometheus's own carrier and
+//!   changes nothing here. The spec marks its Info and StateSet sections Development. Its
+//!   `target_info` exception, resource attributes in place of a metric, isn't implemented
+//!   (`docs/known-gaps/otlp.md`).
 //!
 //! **Lossy metric kinds.** OTLP has no mergeable-sketch type. `ExponentialHistogram` is the nearest
 //! shape, but its base is `2^(2^-scale)` and a `DdSketch`'s γ isn't (1.015625 under
@@ -182,10 +195,11 @@
 
 use crate::otlp::common;
 use crate::otlp::generated::opentelemetry::proto::metrics::v1 as pb;
+use logit_core::attrs::{metric_type, TYPE_GAUGE_HISTOGRAM, TYPE_INFO, TYPE_STATESET};
 use logit_core::interner::{intern, resolve};
 use logit_core::{
     AttrMap, DdSketch, Diagnostics, Event, Exemplar, ExpHistogram, Histogram, MetricKind,
-    MetricRecord, MetricValue, Sum, Summary, Telemetry, Temporality, TraceRef,
+    MetricRecord, MetricValue, Resource, Sum, Summary, Telemetry, Temporality, TraceRef,
 };
 
 /// The quantiles every sketch-to-quantiles degradation in this crate reports. `crate::prometheus`
@@ -334,9 +348,10 @@ fn number_value(value: Option<pb::number_data_point::Value>) -> MetricValue {
 }
 
 /// Encodes one `(Event, MetricRecord)` pair into one OTLP `Metric`, or `None` for a skipped
-/// `Set`/`SetMembers` or OpenMetrics gaugehistogram, or a dropped `GaugeDelta` or delta `Summary`
-/// (counted; see the module doc).
+/// `Set`/`SetMembers` or gauge histogram, or a dropped `GaugeDelta` or delta `Summary` (counted;
+/// see the module doc). `resource` is the batch's, read only for the `_logit.metrics.type` flag.
 pub(crate) fn encode_metric(
+    resource: &Resource,
     event: &Event,
     record: &MetricRecord,
     telemetry: &Telemetry,
@@ -351,13 +366,12 @@ pub(crate) fn encode_metric(
     // Only the four kinds below carry exemplars on the wire, so only they count a normalization.
     let exemplars = || encode_exemplars(&record.exemplars, telemetry);
 
-    let prometheus_type =
-        event.attributes.get(crate::prometheus::ATTR_TYPE).and_then(|v| v.as_str());
+    let reading = metric_type(resource, event);
 
     let data = match &record.kind {
         // The OTel Prometheus compatibility spec ("Prometheus/OpenMetrics to OTLP") drops a
         // GaugeHistogram, and OTLP has no histogram that isn't a running count.
-        MetricKind::Histogram(_) if prometheus_type == Some("gaugehistogram") => {
+        MetricKind::Histogram(_) if reading == Some(TYPE_GAUGE_HISTOGRAM) => {
             telemetry.count(
                 "logit.output.metrics.skipped",
                 1.0,
@@ -366,7 +380,7 @@ pub(crate) fn encode_metric(
             diagnostics.warn_throttled(
                 "otlp_gauge_histogram_skipped",
                 format_args!(
-                    "metric '{name}' is an OpenMetrics gaugehistogram, which the OTel Prometheus \
+                    "metric '{name}' is flagged a gauge histogram, which the OTel Prometheus \
                      compatibility spec drops -- skipped"
                 ),
             );
@@ -376,8 +390,8 @@ pub(crate) fn encode_metric(
         // non-monotonic Sum, so the `1` sums when a label is aggregated away. `prometheus_in`
         // strips an info family's `_info` suffix from the name; the OTLP name keeps it, as the
         // Collector's Prometheus receiver does.
-        MetricKind::Gauge(v) if matches!(prometheus_type, Some("info" | "stateset")) => {
-            if prometheus_type == Some("info") {
+        MetricKind::Gauge(v) if matches!(reading, Some(TYPE_INFO | TYPE_STATESET)) => {
+            if reading == Some(TYPE_INFO) {
                 name.push_str("_info");
             }
             pb::metric::Data::Sum(pb::Sum {
@@ -852,7 +866,13 @@ mod tests {
 
     fn encode(kind: MetricKind) -> Option<pb::Metric> {
         let mut diag = Diagnostics::default();
-        encode_metric(&event(), &record(kind), &Telemetry::default(), &mut diag)
+        encode_metric(
+            &Resource::default(),
+            &event(),
+            &record(kind),
+            &Telemetry::default(),
+            &mut diag,
+        )
     }
 
     #[test]
@@ -884,9 +904,14 @@ mod tests {
         ];
         for (value, expected, reason) in cases {
             let mut diag = Diagnostics::default();
-            let metric =
-                encode_metric(&event(), &record(MetricKind::Gauge(value)), &telemetry, &mut diag)
-                    .unwrap();
+            let metric = encode_metric(
+                &Resource::default(),
+                &event(),
+                &record(MetricKind::Gauge(value)),
+                &telemetry,
+                &mut diag,
+            )
+            .unwrap();
             let Some(pb::metric::Data::Gauge(gauge)) = metric.data else { panic!("not a Gauge") };
             assert_eq!(gauge.data_points[0].value, Some(expected), "{value:?}");
             let counted: Vec<String> = registry
@@ -1037,7 +1062,9 @@ mod tests {
             max: None,
         });
         let mut diag = Diagnostics::default();
-        let metric = encode_metric(&event(), &record(kind), &telemetry, &mut diag).unwrap();
+        let metric =
+            encode_metric(&Resource::default(), &event(), &record(kind), &telemetry, &mut diag)
+                .unwrap();
         let Some(pb::metric::Data::Histogram(hist)) = metric.data else {
             panic!("not a Histogram")
         };
@@ -1138,9 +1165,14 @@ mod tests {
         let metric = encode(MetricKind::ExponentialHistogram(e.clone())).unwrap();
         let events = decode_metric(metric.clone(), &AttrMap::new(), &Telemetry::default());
         let mut diag = Diagnostics::default();
-        let re_metric =
-            encode_metric(&events[0], &events[0].metrics[0], &Telemetry::default(), &mut diag)
-                .unwrap();
+        let re_metric = encode_metric(
+            &Resource::default(),
+            &events[0],
+            &events[0].metrics[0],
+            &Telemetry::default(),
+            &mut diag,
+        )
+        .unwrap();
 
         let extract = |m: &pb::Metric| match &m.data {
             Some(pb::metric::Data::ExponentialHistogram(eh)) => eh.data_points[0].clone(),
@@ -1180,9 +1212,14 @@ mod tests {
         let registry = Registry::new();
         let telemetry = registry.telemetry_for("otlp_out", "otlp_out", "sink");
         let mut diag = Diagnostics::default();
-        let metric =
-            encode_metric(&event(), &record(MetricKind::Samples(samples)), &telemetry, &mut diag)
-                .unwrap();
+        let metric = encode_metric(
+            &Resource::default(),
+            &event(),
+            &record(MetricKind::Samples(samples)),
+            &telemetry,
+            &mut diag,
+        )
+        .unwrap();
         match metric.data.unwrap() {
             pb::metric::Data::Summary(s) => {
                 let quantiles: Vec<(f64, f64)> = s.data_points[0]
@@ -1214,9 +1251,14 @@ mod tests {
         let registry = Registry::new();
         let telemetry = registry.telemetry_for("otlp_out", "otlp_out", "sink");
         let mut diag = Diagnostics::default();
-        let metric =
-            encode_metric(&event(), &record(MetricKind::Samples(samples)), &telemetry, &mut diag)
-                .unwrap();
+        let metric = encode_metric(
+            &Resource::default(),
+            &event(),
+            &record(MetricKind::Samples(samples)),
+            &telemetry,
+            &mut diag,
+        )
+        .unwrap();
         match metric.data.unwrap() {
             pb::metric::Data::Summary(s) => {
                 assert_eq!(s.data_points[0].count, 2);
@@ -1236,6 +1278,7 @@ mod tests {
         let telemetry = registry.telemetry_for("otlp_out", "otlp_out", "sink");
         let mut diag = Diagnostics::default();
         let metric = encode_metric(
+            &Resource::default(),
             &event(),
             &record(MetricKind::Distribution(sketch)),
             &telemetry,
@@ -1270,6 +1313,7 @@ mod tests {
         let telemetry = registry.telemetry_for("otlp_out", "otlp_out", "sink");
         let mut diag = Diagnostics::default();
         let result = encode_metric(
+            &Resource::default(),
             &event(),
             &record(MetricKind::SetMembers(vec![bytes::Bytes::from_static(b"alice")])),
             &telemetry,
@@ -1289,6 +1333,7 @@ mod tests {
         let telemetry = registry.telemetry_for("otlp_out", "otlp_out", "sink");
         let mut diag = Diagnostics::default();
         let result = encode_metric(
+            &Resource::default(),
             &event(),
             &record(MetricKind::Set(HyperLogLog::default())),
             &telemetry,
@@ -1312,6 +1357,7 @@ mod tests {
         let mut diag = Diagnostics::new("otlp_out")
             .with_telemetry(diag_registry.telemetry_for("otlp_out", "otlp_out", "diag"));
         let result = encode_metric(
+            &Resource::default(),
             &event(),
             &record(MetricKind::GaugeDelta(MetricValue::F64(5.0))),
             &telemetry,
@@ -1352,7 +1398,14 @@ mod tests {
             sum: 3.0,
             temporality: Temporality::Delta,
         });
-        assert!(encode_metric(&event(), &record(kind), &telemetry, &mut diag).is_none());
+        assert!(encode_metric(
+            &Resource::default(),
+            &event(),
+            &record(kind),
+            &telemetry,
+            &mut diag
+        )
+        .is_none());
         assert_eq!(diag.occurrences("delta_summary_unresolved"), 1);
         let dropped = registry.drain(0).iter().any(|e| {
             e.attributes.get("reason").and_then(|v| v.as_str()) == Some("unresolved_delta")
@@ -1371,65 +1424,132 @@ mod tests {
         })
     }
 
-    /// An event `prometheus_in` marked with OpenMetrics family type `family`.
-    fn prometheus_event(family: &str) -> Event {
+    /// An event carrying `value` under `key`, the neutral type flag or `prometheus_in`'s carrier.
+    fn typed_event(key: &str, value: &str) -> Event {
         let mut attrs = AttrMap::new();
-        attrs.insert(crate::prometheus::ATTR_TYPE, family);
+        attrs.insert(key, value);
         Event::empty(1000, attrs)
     }
 
-    /// The OTel Prometheus compatibility spec drops a GaugeHistogram.
-    #[test]
-    fn a_gaugehistogram_is_skipped_and_counted() {
-        let registry = Registry::new();
-        let telemetry = registry.telemetry_for("otlp_out", "otlp_out", "sink");
-        let mut diag = Diagnostics::new("otlp_out");
-        let rec = record(MetricKind::Histogram(histogram(Temporality::Cumulative)));
-        let event = prometheus_event("gaugehistogram");
-        assert!(encode_metric(&event, &rec, &telemetry, &mut diag).is_none());
-        assert_eq!(diag.occurrences("otlp_gauge_histogram_skipped"), 1);
-        assert!(counted_in(
-            &registry,
-            "logit.output.metrics.skipped",
-            ("metric_kind", "gauge_histogram")
-        ));
+    /// A batch resource carrying the neutral type flag `value`.
+    fn typed_resource(value: &str) -> Resource {
+        let mut resource = Resource::default();
+        resource.attributes.insert(logit_core::attrs::METRICS_TYPE, value);
+        resource
     }
 
-    /// An OpenMetrics info or stateset is a cumulative non-monotonic `Sum`, and an info metric
-    /// gets back the `_info` suffix `prometheus_in` strips.
+    const NEUTRAL: &str = logit_core::attrs::METRICS_TYPE;
+    const CARRIER: &str = crate::prometheus::ATTR_TYPE;
+
+    /// The OTel Prometheus compatibility spec drops a GaugeHistogram: a `Histogram` flagged
+    /// `gaugehistogram`, on the event or else the resource.
     #[test]
-    fn an_info_or_stateset_gauge_encodes_as_a_non_monotonic_sum() {
-        for (family, name) in [("info", "m_info"), ("stateset", "m")] {
-            let mut diag = Diagnostics::default();
-            let rec = record(MetricKind::gauge(1.0));
-            let metric =
-                encode_metric(&prometheus_event(family), &rec, &Telemetry::default(), &mut diag)
-                    .unwrap();
-            assert_eq!(metric.name, name, "{family}");
-            match metric.data {
-                Some(pb::metric::Data::Sum(sum)) => {
-                    assert!(!sum.is_monotonic, "{family}");
-                    assert_eq!(
-                        sum.aggregation_temporality,
-                        pb::AggregationTemporality::Cumulative as i32
-                    );
-                    assert_eq!(number_value(sum.data_points[0].value), MetricValue::F64(1.0));
+    fn a_histogram_flagged_gaugehistogram_is_skipped_and_counted() {
+        let rec = record(MetricKind::Histogram(histogram(Temporality::Cumulative)));
+        for (resource, event) in [
+            (Resource::default(), typed_event(NEUTRAL, "gaugehistogram")),
+            (typed_resource("gaugehistogram"), event()),
+        ] {
+            let registry = Registry::new();
+            let telemetry = registry.telemetry_for("otlp_out", "otlp_out", "sink");
+            let mut diag = Diagnostics::new("otlp_out");
+            assert!(encode_metric(&resource, &event, &rec, &telemetry, &mut diag).is_none());
+            assert_eq!(diag.occurrences("otlp_gauge_histogram_skipped"), 1);
+            assert!(counted_in(
+                &registry,
+                "logit.output.metrics.skipped",
+                ("metric_kind", "gauge_histogram")
+            ));
+        }
+    }
+
+    /// The `gaugehistogram` value names a `Histogram`; on a `Gauge` it's ignored.
+    #[test]
+    fn a_gaugehistogram_flag_on_a_gauge_is_ignored() {
+        let mut diag = Diagnostics::default();
+        let rec = record(MetricKind::gauge(2.0));
+        let event = typed_event(NEUTRAL, "gaugehistogram");
+        let metric =
+            encode_metric(&Resource::default(), &event, &rec, &Telemetry::default(), &mut diag)
+                .unwrap();
+        assert_eq!(metric.name, "m");
+        assert!(matches!(metric.data, Some(pb::metric::Data::Gauge(_))));
+    }
+
+    /// An info or stateset `Gauge` is a cumulative non-monotonic `Sum`, and an info metric gets
+    /// back the `_info` suffix `prometheus_in` strips, from the flag on the event or the resource.
+    #[test]
+    fn a_gauge_flagged_info_or_stateset_encodes_as_a_non_monotonic_sum() {
+        for (value, name) in [("info", "m_info"), ("stateset", "m")] {
+            for (resource, event) in [
+                (Resource::default(), typed_event(NEUTRAL, value)),
+                (typed_resource(value), event()),
+            ] {
+                let mut diag = Diagnostics::default();
+                let rec = record(MetricKind::gauge(1.0));
+                let metric =
+                    encode_metric(&resource, &event, &rec, &Telemetry::default(), &mut diag)
+                        .unwrap();
+                assert_eq!(metric.name, name, "{value}");
+                match metric.data {
+                    Some(pb::metric::Data::Sum(sum)) => {
+                        assert!(!sum.is_monotonic, "{value}");
+                        assert_eq!(
+                            sum.aggregation_temporality,
+                            pb::AggregationTemporality::Cumulative as i32
+                        );
+                        assert_eq!(number_value(sum.data_points[0].value), MetricValue::F64(1.0));
+                    }
+                    other => panic!("{value}: expected Sum, got {other:?}"),
                 }
-                other => panic!("{family}: expected Sum, got {other:?}"),
             }
         }
     }
 
-    /// A family type the spec maps like its kind changes nothing.
+    /// `info` and `stateset` name a `Gauge`; on a cumulative monotonic `Sum` they're ignored.
     #[test]
-    fn an_unknown_family_gauge_stays_a_gauge() {
-        let mut diag = Diagnostics::default();
-        let rec = record(MetricKind::gauge(3.0));
-        let metric =
-            encode_metric(&prometheus_event("unknown"), &rec, &Telemetry::default(), &mut diag)
-                .unwrap();
-        assert_eq!(metric.name, "m");
-        assert!(matches!(metric.data, Some(pb::metric::Data::Gauge(_))));
+    fn an_info_or_stateset_flag_on_a_sum_is_ignored() {
+        for value in ["info", "stateset"] {
+            let mut diag = Diagnostics::default();
+            let rec = record(MetricKind::counter(2.0));
+            let event = typed_event(NEUTRAL, value);
+            let metric =
+                encode_metric(&Resource::default(), &event, &rec, &Telemetry::default(), &mut diag)
+                    .unwrap();
+            assert_eq!(metric.name, "m", "{value}");
+            match metric.data {
+                Some(pb::metric::Data::Sum(sum)) => assert!(sum.is_monotonic, "{value}"),
+                other => panic!("{value}: expected Sum, got {other:?}"),
+            }
+        }
+    }
+
+    /// `prometheus_in`'s carrier is Prometheus's own: a record carrying only it, under any
+    /// value, encodes as its kind does, with no rename, no `Sum`, and no skip.
+    #[test]
+    fn the_prometheus_type_carrier_alone_changes_nothing() {
+        for value in ["info", "stateset", "unknown", "untyped"] {
+            let mut diag = Diagnostics::default();
+            let rec = record(MetricKind::gauge(3.0));
+            let metric = encode_metric(
+                &Resource::default(),
+                &typed_event(CARRIER, value),
+                &rec,
+                &Telemetry::default(),
+                &mut diag,
+            )
+            .unwrap();
+            assert_eq!(metric.name, "m", "{value}");
+            assert!(matches!(metric.data, Some(pb::metric::Data::Gauge(_))), "{value}");
+        }
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("otlp_out", "otlp_out", "sink");
+        let mut diag = Diagnostics::new("otlp_out");
+        let rec = record(MetricKind::Histogram(histogram(Temporality::Cumulative)));
+        let event = typed_event(CARRIER, "gaugehistogram");
+        let metric = encode_metric(&Resource::default(), &event, &rec, &telemetry, &mut diag);
+        assert!(matches!(metric.and_then(|m| m.data), Some(pb::metric::Data::Histogram(_))));
+        assert_eq!(diag.occurrences("otlp_gauge_histogram_skipped"), 0);
     }
 
     fn histogram_metric(dp: pb::HistogramDataPoint) -> pb::Metric {
@@ -1458,9 +1578,14 @@ mod tests {
         let events = decode_metric(histogram_metric(dp), &AttrMap::new(), &Telemetry::default());
         assert_eq!(decoded_buckets(&events), vec![(f64::INFINITY, 12)]);
         let mut diag = Diagnostics::default();
-        let metric =
-            encode_metric(&events[0], &events[0].metrics[0], &Telemetry::default(), &mut diag)
-                .unwrap();
+        let metric = encode_metric(
+            &Resource::default(),
+            &events[0],
+            &events[0].metrics[0],
+            &Telemetry::default(),
+            &mut diag,
+        )
+        .unwrap();
         match metric.data {
             Some(pb::metric::Data::Histogram(h)) => {
                 let dp = &h.data_points[0];
@@ -1633,7 +1758,14 @@ mod tests {
         for kind in kinds {
             let rec = MetricRecord { flags, ..MetricRecord::new(intern("m"), kind.clone()) };
             let mut diag = Diagnostics::default();
-            let metric = encode_metric(&event(), &rec, &Telemetry::default(), &mut diag).unwrap();
+            let metric = encode_metric(
+                &Resource::default(),
+                &event(),
+                &rec,
+                &Telemetry::default(),
+                &mut diag,
+            )
+            .unwrap();
             let dp_flags = match &metric.data {
                 Some(pb::metric::Data::Sum(s)) => s.data_points[0].flags,
                 Some(pb::metric::Data::Gauge(g)) => g.data_points[0].flags,
@@ -1657,7 +1789,9 @@ mod tests {
         let mut rec = record(MetricKind::gauge(1.0));
         rec.start_timestamp = 500;
         let mut diag = Diagnostics::default();
-        let metric = encode_metric(&event(), &rec, &Telemetry::default(), &mut diag).unwrap();
+        let metric =
+            encode_metric(&Resource::default(), &event(), &rec, &Telemetry::default(), &mut diag)
+                .unwrap();
         match &metric.data {
             Some(pb::metric::Data::Gauge(g)) => {
                 assert_eq!(g.data_points[0].start_time_unix_nano, 500);
@@ -1672,7 +1806,9 @@ mod tests {
     fn a_zero_start_timestamp_stays_zero_on_the_wire() {
         let rec = record(MetricKind::gauge(1.0)); // start_timestamp: 0 (unknown)
         let mut diag = Diagnostics::default();
-        let metric = encode_metric(&event(), &rec, &Telemetry::default(), &mut diag).unwrap();
+        let metric =
+            encode_metric(&Resource::default(), &event(), &rec, &Telemetry::default(), &mut diag)
+                .unwrap();
         match &metric.data {
             Some(pb::metric::Data::Gauge(g)) => {
                 assert_eq!(
@@ -1690,15 +1826,23 @@ mod tests {
         let mut rec = record(MetricKind::gauge(1.0));
         rec.description = Some(intern("a metric description"));
         let mut diag = Diagnostics::default();
-        let metric = encode_metric(&event(), &rec, &Telemetry::default(), &mut diag).unwrap();
+        let metric =
+            encode_metric(&Resource::default(), &event(), &rec, &Telemetry::default(), &mut diag)
+                .unwrap();
         assert_eq!(metric.description, "a metric description");
         let events = decode_metric(metric, &AttrMap::new(), &Telemetry::default());
         assert_eq!(events[0].metrics[0].description.map(resolve), Some("a metric description"));
 
         let no_description = record(MetricKind::gauge(1.0));
         let mut diag = Diagnostics::default();
-        let metric =
-            encode_metric(&event(), &no_description, &Telemetry::default(), &mut diag).unwrap();
+        let metric = encode_metric(
+            &Resource::default(),
+            &event(),
+            &no_description,
+            &Telemetry::default(),
+            &mut diag,
+        )
+        .unwrap();
         assert_eq!(metric.description, "");
         let events = decode_metric(metric, &AttrMap::new(), &Telemetry::default());
         assert_eq!(events[0].metrics[0].description, None);
@@ -1730,7 +1874,14 @@ mod tests {
                 ..MetricRecord::new(intern("m"), kind.clone())
             };
             let mut diag = Diagnostics::default();
-            let metric = encode_metric(&event(), &rec, &Telemetry::default(), &mut diag).unwrap();
+            let metric = encode_metric(
+                &Resource::default(),
+                &event(),
+                &rec,
+                &Telemetry::default(),
+                &mut diag,
+            )
+            .unwrap();
             let events = decode_metric(metric, &AttrMap::new(), &Telemetry::default());
             assert_eq!(
                 events[0].metrics[0].exemplars,
@@ -1754,7 +1905,14 @@ mod tests {
         for v in [i64::MAX, (1i64 << 53) + 1, -7, 0] {
             let rec = gauge_with_exemplar_value(MetricValue::I64(v));
             let mut diag = Diagnostics::default();
-            let metric = encode_metric(&event(), &rec, &Telemetry::default(), &mut diag).unwrap();
+            let metric = encode_metric(
+                &Resource::default(),
+                &event(),
+                &rec,
+                &Telemetry::default(),
+                &mut diag,
+            )
+            .unwrap();
             let Some(pb::metric::Data::Gauge(gauge)) = &metric.data else { panic!("not a Gauge") };
             assert_eq!(
                 gauge.data_points[0].exemplars[0].value,
@@ -1782,7 +1940,8 @@ mod tests {
         for (value, expected, reason) in cases {
             let rec = gauge_with_exemplar_value(value);
             let mut diag = Diagnostics::default();
-            let metric = encode_metric(&event(), &rec, &telemetry, &mut diag).unwrap();
+            let metric =
+                encode_metric(&Resource::default(), &event(), &rec, &telemetry, &mut diag).unwrap();
             let Some(pb::metric::Data::Gauge(gauge)) = metric.data else { panic!("not a Gauge") };
             assert_eq!(gauge.data_points[0].exemplars[0].value, Some(expected), "{value:?}");
             let counted: Vec<String> = registry
@@ -1808,7 +1967,9 @@ mod tests {
             ..MetricRecord::new(intern("m"), MetricKind::Summary(s))
         };
         let mut diag = Diagnostics::default();
-        let metric = encode_metric(&event(), &rec, &Telemetry::default(), &mut diag).unwrap();
+        let metric =
+            encode_metric(&Resource::default(), &event(), &rec, &Telemetry::default(), &mut diag)
+                .unwrap();
         let events = decode_metric(metric, &AttrMap::new(), &Telemetry::default());
         assert!(
             events[0].metrics[0].exemplars.is_empty(),
@@ -1838,7 +1999,7 @@ mod tests {
                     ..MetricRecord::new(intern("m"), kind.clone())
                 };
                 let mut diag = Diagnostics::default();
-                let _ = encode_metric(&event(), &rec, &telemetry, &mut diag);
+                let _ = encode_metric(&Resource::default(), &event(), &rec, &telemetry, &mut diag);
                 let normalized = registry
                     .drain(0)
                     .iter()
@@ -1974,7 +2135,7 @@ mod tests {
             fn decode_of_encode_is_the_identity(record in arb_metric_record()) {
                 let event = Event::empty(0, AttrMap::new());
                 let mut diag = Diagnostics::default();
-                let metric = encode_metric(&event, &record, &Telemetry::default(), &mut diag)
+                let metric = encode_metric(&Resource::default(), &event, &record, &Telemetry::default(), &mut diag)
                     .expect("Sum/Gauge/Histogram/Summary always encode to Some");
                 let events = decode_metric(metric, &AttrMap::new(), &Telemetry::default());
                 prop_assert_eq!(events.len(), 1);

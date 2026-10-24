@@ -143,11 +143,12 @@ Entry format and the other areas: [the known-gaps index](README.md).
   - **Workaround:** keep one series' readings of one second in one batch: an `aggregate` upstream
     leaves one point per series per window.
 - **`datadog_out` reports every hostless sender under the relay's hostname.** It sends the
-  process hostname for a metric with no `host.name`, no DogStatsD `host:` tag, and no
-  `collectd.host`, an event or service check with no `h:` field, no `host.name`, no `host:` tag,
-  and no `collectd.host`, and a log with none of `hostname`, `host.name`, `syslog.hostname`,
-  `host`, or `collectd.host`. An Agent does the same for a DogStatsD
-  client that names no host.
+  process hostname for a metric, event, or service check with no `host.name` and no hostless
+  mark, a log with none of `host.name`, `syslog.hostname`, or `host`, and a trace or APM stats
+  payload with no resource `host.name` and no relaying Agent's hostname. `statsd_in` and
+  `datadog_in` decode a sender's own host (a DogStatsD `host:` tag or `h:` field, a log's
+  `hostname`) to `host.name`, so only a sender that names none reaches this. An Agent does the
+  same for a DogStatsD client that names no host.
   - **Consequence:** many senders behind one central `logit` show in Datadog as one host, with
     their series merged under it. Datadog bills per host, so this costs what one Agent would.
   - **Workaround:** stamp `host.name` per sender upstream with `set`, or have each DogStatsD
@@ -155,8 +156,10 @@ Entry format and the other areas: [the known-gaps index](README.md).
 - **`datadog_trace_out` under `version: v0.4` drops the trace chunk and tracer payload fields.**
   v0.4 has no field for a chunk's `_logit.datadog.chunk.*` fields (sampling priority, origin,
   dropped flag, tags) or for the tracer payload fields no request header carries
-  (`_logit.datadog.tracer.runtime_id`, `.env`, `.hostname`, `.app_version`, `.tags`,
-  `.container_debug`). Each is counted `logit.output.spans.degraded{reason="no_wire_form"}`.
+  (`_logit.datadog.tracer.runtime_id`, `.env`, `.app_version`, `.tags`, `.container_debug`).
+  Each is counted `logit.output.spans.degraded{reason="no_wire_form"}`. The payload's hostname,
+  the resource's `host.name`, goes out as every span's `host.name` tag instead, unless the span
+  carries a different `host.name`, which wins as any event attribute does, counted the same way.
   - **Consequence:** only a v0.7-origin batch loses anything, and the Agent derives a chunk's
     priority and origin from the root span again on its side.
   - **Workaround:** `version: v0.7`, which carries all of them.

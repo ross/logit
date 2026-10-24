@@ -36,11 +36,11 @@
 //! # Envelope
 //!
 //! Every object carries its own `time`, `host`, `source`, `sourcetype`, and `index`. The last
-//! four are the batch [`Resource`]'s carriers:
+//! four are the batch [`Resource`]'s carriers on decode. On encode, `host` is chosen per object:
 //!
 //! | Wire | Model |
 //! |---|---|
-//! | `host` | resource [`RESOURCE_ATTR_HOST_NAME`] (`Str`); on encode, when the resource has no `host.name`, [`SplunkEncoder::with_default_host`]'s value (`splunk_hec_out`'s process hostname) |
+//! | `host` | decode: resource [`RESOURCE_ATTR_HOST_NAME`] (`Str`). Encode: the event's own [`RESOURCE_ATTR_HOST_NAME`], a non-empty `Str`, which then isn't also written as a field or span attribute; else the resource's, when a `Str`; else, when the resource has no `host.name`, [`SplunkEncoder::with_default_host`]'s value (`splunk_hec_out`'s process hostname). An event `host.name` that is empty or not a `Str` (a `Bytes` included) isn't a host and stays an attribute |
 //! | `source` | resource [`RESOURCE_ATTR_SOURCE`] |
 //! | `sourcetype` | resource [`RESOURCE_ATTR_SOURCETYPE`] |
 //! | `index` | resource [`RESOURCE_ATTR_INDEX`] |
@@ -76,14 +76,15 @@
 //! ## Encode: events → HEC
 //!
 //! One object per payload: an event carrying a log, metrics, and a span writes a log object, one
-//! or more metric objects, and a span object, in that order. Every object writes `time`, then
-//! each carrier present as a `Str` on the resource, then `event`, then `fields` when non-empty.
+//! or more metric objects, and a span object, in that order. Every object writes `time`, then its
+//! `host` and each other carrier present as a `Str` on the resource, then `event`, then `fields`
+//! when non-empty.
 //!
 //! | Model | Wire | Counter |
 //! |---|---|---|
 //! | `Event::timestamp` (a span's: its start) | `time`, seconds with up to nine decimals ([`time::write_hec_time`]) | -- |
 //! | a carrier that isn't a `Str` | omitted | `logit.output.tags.omitted{reason="unrepresentable"}`, once per batch |
-//! | every other resource attribute, then every event attribute (the event's winning on a key) | `fields`, a `Map` flattened to dotted keys by [`crate::json::flatten_into`] (a span's event attributes go in its `attributes` instead) | -- |
+//! | every other resource attribute, then every event attribute but a `host.name` the object's `host` took (the event's winning on a key) | `fields`, a `Map` flattened to dotted keys by [`crate::json::flatten_into`] (a span's event attributes go in its `attributes` instead) | -- |
 //! | a private `_logit.` attribute, on the resource or the event, a span event, or a link | omitted ([ADR `private-attribute-namespace`](../../../../docs/adr/private-attribute-namespace.md)); a `_logit.` key nested inside a map is data and flattens | -- |
 //! | an event with no log, metric, or span | nothing | `logit.output.events.skipped{reason="no_payload"}` |
 //!
@@ -121,7 +122,12 @@
 //! 9. a hex id (a span's, parent's, or link's `trace_id`/`span_id`, and a log's `trace_id`/`span_id`
 //!    fields when they parse) is read in either case and leaves lowercase;
 //! 10. an object that arrived with no `host` leaves with the relay's process hostname as its
-//!     `host` ([`SplunkEncoder::with_default_host`]); a `host` it carries is never replaced.
+//!     `host` ([`SplunkEncoder::with_default_host`]); a `host` it carries is never replaced, except
+//!     by its own `fields` `host.name` (a span object's `attributes` `host.name`) (11);
+//! 11. an object's `fields` `host.name` (a span object's `attributes` `host.name`), a non-empty
+//!     string, is an event attribute that leaves as the object's `host` and not as an attribute,
+//!     so it returns on the resource, in a batch of its own per host; when the object also carried
+//!     a `host`, that `host` is replaced.
 //!
 //! The model-side losses (a resource attribute returning as an event attribute, `Sum`
 //! temporality, the multi-number kinds under `MultiValue`) are in [`metrics`], [`logs`], and
@@ -145,7 +151,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, LazyLock};
 
 /// `host.name`: the envelope's `host`.
-pub const RESOURCE_ATTR_HOST_NAME: &str = "host.name";
+pub const RESOURCE_ATTR_HOST_NAME: &str = logit_core::attrs::HOST_NAME;
 /// `com.splunk.source`: the envelope's `source`.
 pub const RESOURCE_ATTR_SOURCE: &str = "com.splunk.source";
 /// `com.splunk.sourcetype`: the envelope's `sourcetype`.
@@ -786,7 +792,7 @@ pub struct SplunkEncoder {
     telemetry: Telemetry,
     diagnostics: Diagnostics,
     multi_value: MultiValue,
-    /// The `host` of a batch whose resource has no `host.name`.
+    /// The `host` of an object whose event and resource have no `host.name`.
     default_host: Option<Arc<str>>,
     /// One object's bytes, reused across objects.
     scratch: Vec<u8>,
@@ -799,6 +805,35 @@ struct BatchContext<'a> {
     /// [`SplunkEncoder::with_default_host`]'s value, set only when the resource has no
     /// `host.name`. Shared rather than copied into `envelope`, so filling costs no allocation.
     default_host: Option<Arc<str>>,
+}
+
+impl BatchContext<'_> {
+    /// `event`'s object `host`: its own non-empty `Str` `host.name`, else the resource's, else the
+    /// default. A `host.name` of another type, a `Bytes` included, isn't a host and stays a field.
+    fn host<'e>(&'e self, event: &'e Event) -> ObjectHost<'e> {
+        match event.attributes.get_sym(CARRIERS.host).and_then(Value::as_str) {
+            Some(host) if !host.is_empty() => ObjectHost { host: Some(host), from_event: true },
+            _ => ObjectHost {
+                host: self.envelope.host.as_deref().or(self.default_host.as_deref()),
+                from_event: false,
+            },
+        }
+    }
+}
+
+/// One object's `host`, and whether the event's `host.name` supplied it. That attribute is then
+/// the envelope's, so the object doesn't also write it among its attributes.
+#[derive(Clone, Copy)]
+struct ObjectHost<'a> {
+    host: Option<&'a str>,
+    from_event: bool,
+}
+
+impl ObjectHost<'_> {
+    /// The event attribute the envelope consumed, if any.
+    fn consumed(self) -> Option<Symbol> {
+        self.from_event.then(|| CARRIERS.host)
+    }
 }
 
 impl SplunkEncoder {
@@ -823,8 +858,9 @@ impl SplunkEncoder {
         self
     }
 
-    /// The `host` written for a batch whose resource carries no `host.name`. A `host.name` that
-    /// isn't a `Str` is still the batch's own, so it's omitted and counted, never replaced.
+    /// The `host` written for an object whose event and resource carry no `host.name`. A resource
+    /// `host.name` that isn't a `Str` is still the batch's own: an object without its own host
+    /// omits `host`, counted, and never takes this one.
     pub fn with_default_host(mut self, host: Option<Arc<str>>) -> Self {
         self.default_host = host;
         self
@@ -864,8 +900,8 @@ impl SplunkEncoder {
     }
 
     /// `fields` for a log or metric object: every non-carrier resource attribute, then every
-    /// event attribute, flattened, the event's value winning on a key.
-    fn object_fields(resource: &Resource, event: &Event) -> AttrMap {
+    /// event attribute but the one `host` consumed, flattened, the event's value winning on a key.
+    fn object_fields(resource: &Resource, event: &Event, host: ObjectHost<'_>) -> AttrMap {
         let mut fields = AttrMap::new();
         for (key, value) in resource.attributes.iter() {
             let name = resolve(key);
@@ -873,9 +909,10 @@ impl SplunkEncoder {
                 flatten_into(name, value, &mut fields);
             }
         }
+        let consumed = host.consumed();
         for (key, value) in event.attributes.iter() {
             let name = resolve(key);
-            if !logit_core::attrs::is_private(name) {
+            if Some(key) != consumed && !logit_core::attrs::is_private(name) {
                 flatten_into(name, value, &mut fields);
             }
         }
@@ -898,18 +935,19 @@ impl SplunkEncoder {
     }
 }
 
-/// Writes an object's envelope (`time` and every carrier present, `host` falling back to the
-/// default) and returns it open, for the caller to add `event` and `fields`.
+/// Writes an object's envelope (`time`, `host` from [`BatchContext::host`], and every other
+/// carrier present) and returns it open, for the caller to add `event` and `fields`.
 fn begin_object<'a>(
     out: &'a mut Vec<u8>,
     timestamp: i64,
     ctx: &BatchContext<'_>,
+    host: ObjectHost<'_>,
 ) -> JsonObject<'a> {
     let mut obj = JsonObject::begin(out);
     time::write_hec_time(obj.key("time"), timestamp);
     let envelope = &ctx.envelope;
     for (key, value) in [
-        ("host", envelope.host.as_deref().or(ctx.default_host.as_deref())),
+        ("host", host.host),
         ("source", envelope.source.as_deref()),
         ("sourcetype", envelope.sourcetype.as_deref()),
         ("index", envelope.index.as_deref()),
@@ -1274,6 +1312,88 @@ pub(crate) mod tests {
             .with_default_host(Some(Arc::from("relay")))
             .encode_objects(&batch, &mut out);
         assert_eq!(out.iter().next().unwrap(), br#"{"time":1,"event":"a"}"#);
+    }
+
+    /// `body`'s first batch, its resource carrying `host.name` `res` when `resource_host` is set,
+    /// encoded with `relay` as the default host, one string per object.
+    fn encode_hosts(body: &str, resource_host: bool) -> Vec<String> {
+        let mut batch = decode(body).remove(0);
+        if resource_host {
+            let mut resource = (*batch.resource).clone();
+            resource.attributes.insert("host.name", Value::str("res"));
+            batch.resource = Arc::new(resource);
+        }
+        let mut out = MessageBuf::default();
+        SplunkEncoder::new()
+            .with_default_host(Some(Arc::from("relay")))
+            .encode_objects(&batch, &mut out);
+        out.iter().map(|o| String::from_utf8(o.to_vec()).unwrap()).collect()
+    }
+
+    #[test]
+    fn an_event_host_name_is_the_object_host_of_every_signal_and_not_a_field() {
+        let objects = encode_hosts(
+            concat!(
+                r#"{"time":1,"event":"a","fields":{"host.name":"web-1","k":"v"}}"#,
+                r#"{"time":1,"event":"metric","fields":{"metric_name:m":1,"host.name":"web-1"}}"#,
+                r#"{"time":1,"event":{"trace_id":"4bf92f3577b34da6a3ce929d0e0e4736","span_id":"00f067aa0ba902b7","start_time":1,"end_time":2,"attributes":{"host.name":"web-1","k":"v"}}}"#,
+            ),
+            true,
+        );
+        assert_eq!(
+            objects,
+            [
+                r#"{"time":1,"host":"web-1","event":"a","fields":{"k":"v"}}"#,
+                r#"{"time":1,"host":"web-1","event":"metric","fields":{"metric_type":"Gauge","metric_name:m":1.0}}"#,
+                r#"{"time":0.000000001,"host":"web-1","event":{"trace_id":"4bf92f3577b34da6a3ce929d0e0e4736","span_id":"00f067aa0ba902b7","parent_span_id":"","name":"","attributes":{"k":"v"},"end_time":2,"kind":"SPAN_KIND_INTERNAL","status":{"message":"","code":"STATUS_CODE_UNSET"},"start_time":1}}"#,
+            ]
+        );
+    }
+
+    #[test]
+    fn each_object_takes_its_own_event_host_else_the_resource_else_the_default() {
+        let body = concat!(
+            r#"{"time":1,"event":"a","fields":{"host.name":"web-1"}}"#,
+            r#"{"time":1,"event":"b"}"#,
+            r#"{"time":1,"event":"c","fields":{"host.name":"web-2"}}"#,
+        );
+        assert_eq!(
+            encode_hosts(body, true),
+            [
+                r#"{"time":1,"host":"web-1","event":"a"}"#,
+                r#"{"time":1,"host":"res","event":"b"}"#,
+                r#"{"time":1,"host":"web-2","event":"c"}"#,
+            ]
+        );
+        assert_eq!(encode_hosts(body, false)[1], r#"{"time":1,"host":"relay","event":"b"}"#);
+    }
+
+    /// An empty `Str` and a `Bytes` aren't a host: the object takes the next one, and the
+    /// attribute stays a field.
+    #[test]
+    fn an_empty_or_bytes_event_host_name_falls_through_and_stays_a_field() {
+        let empty = r#"{"time":1,"event":"a","fields":{"host.name":""}}"#;
+        assert_eq!(
+            encode_hosts(empty, true),
+            [r#"{"time":1,"host":"res","event":"a","fields":{"host.name":""}}"#]
+        );
+        assert_eq!(
+            encode_hosts(empty, false),
+            [r#"{"time":1,"host":"relay","event":"a","fields":{"host.name":""}}"#]
+        );
+
+        let mut batch = decode(r#"{"time":1,"event":"a"}"#).remove(0);
+        batch.events[0]
+            .attributes
+            .insert("host.name", Value::Bytes(bytes::Bytes::from_static(b"web-1")));
+        let mut out = MessageBuf::default();
+        SplunkEncoder::new()
+            .with_default_host(Some(Arc::from("relay")))
+            .encode_objects(&batch, &mut out);
+        assert_eq!(
+            out.iter().next().unwrap(),
+            br#"{"time":1,"host":"relay","event":"a","fields":{"host.name":"d2ViLTE="}}"#
+        );
     }
 
     #[test]

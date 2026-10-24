@@ -1,6 +1,6 @@
 ---
 created: 2026-09-10
-updated: 2026-10-21
+updated: 2026-10-23
 ---
 
 # Lossless like-protocol transit: the internal model is a superset of every supported wire protocol
@@ -220,8 +220,9 @@ keeps its skip-unknown TLV framing as hygiene, not because anything reads an old
 
 - **`statsd_in -> statsd_out`.** Timers and sets decode to `Samples` and `SetMembers` with the
   sample rate carried verbatim, and round-trip byte for byte under `format: dogstatsd`; under
-  `format: statsd` multi-value lines split and `h`/`d` normalize to `ms`. `|c:` and `|T` ride
-  carriers and round-trip under `format: dogstatsd`. DogStatsD events and service checks relay
+  `format: statsd` multi-value lines split and `h`/`d` normalize to `ms`. `|c:` rides a carrier
+  and `|T` the neutral `_logit.metrics.closed: "timestamped"` flag, and both round-trip under
+  `format: dogstatsd`. DogStatsD events and service checks relay
   ([ADR `statsd-output`](statsd-output.md)'s "DogStatsD events and service checks relay"), and a
   repeated tag key decodes to a `Value::Array` and re-expands.
 - **`otlp_in -> otlp_out`.** Every metric, log, and span field the model gained above round-trips.
@@ -372,6 +373,18 @@ from that tag. A `statsd_in -> statsd_out` relay therefore sends `#host.name:web
 relay sends it where the destination reads one. [ADR `statsd-output`](statsd-output.md)'s
 amendment of the same date records the decision, and the transit spec's `string_value` row the
 class.
+
+Superseded in part by [ADR `process-hostname`](process-hostname.md)'s "Amendment: `host.name`
+ranks first everywhere (2026-10-23)": the `host.name:` tag is now the `host:` tag on every line,
+and a `host:` tag beside it is omitted, counted `logit.output.tags.omitted{reason="unrepresentable"}`.
+
+Superseded again by that ADR's "Amendment: a source fills the common keys (2026-10-23)":
+`statsd_in` decodes a line's `host:` tag, or an event's or check's `h:` field, to `host.name`, and
+omits a `host.name:` tag beside it, counted `logit.input.tags.omitted{reason="reserved_key"}`. So
+`#host:web-2,host.name:web-1` relays as `#host:web-2`. A `host.name:` tag on a line with no host
+of its own is still the line's host, and relays as `#host:web-1` on a metric line and as `h:web-1`
+on an event or a service check. `crates/logit-cli/tests/statsd_round_trip.rs`'s (10) lists the
+pair's host normalizations.
 
 ## Amendment: a bucketless OTLP histogram keeps its count (2026-10-21)
 

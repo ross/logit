@@ -17,8 +17,8 @@ use logit_core::{
     MetricRecord, Provenance, Resource, Severity, Sum, Temporality, Value,
 };
 use logit_proto::collectd::{
-    CollectdEncoder, ATTR_HOST, ATTR_INTERVAL, ATTR_PLUGIN, ATTR_PLUGIN_INSTANCE, ATTR_SEVERITY,
-    ATTR_TYPE, ATTR_TYPE_INSTANCE, DEFAULT_MAX_PACKET_BYTES, MAX_VALUES_PER_LIST,
+    CollectdEncoder, ATTR_HOST_NAME, ATTR_INTERVAL, ATTR_PLUGIN, ATTR_PLUGIN_INSTANCE,
+    ATTR_SEVERITY, ATTR_TYPE, ATTR_TYPE_INSTANCE, DEFAULT_MAX_PACKET_BYTES, MAX_VALUES_PER_LIST,
 };
 use logit_proto::frame::{write_frame, write_frame_with_flags, Compression, FLAG_CONTROL};
 use logit_proto::graphite::pickle::write_datapoints;
@@ -910,7 +910,7 @@ fn collectd_seeds(testdata: &Path) -> std::io::Result<Vec<(String, Vec<u8>)>> {
     let identity =
         |plugin: &str, instance: Option<&str>, type_: &str, type_instance: Option<&str>| {
             let mut attrs = AttrMap::new();
-            attrs.insert(ATTR_HOST, "seed-host");
+            attrs.insert(ATTR_HOST_NAME, "seed-host");
             attrs.insert(ATTR_PLUGIN, plugin);
             if let Some(instance) = instance {
                 attrs.insert(ATTR_PLUGIN_INSTANCE, instance);

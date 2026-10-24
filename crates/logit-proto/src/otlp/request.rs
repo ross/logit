@@ -126,6 +126,7 @@ impl OtlpEncoder {
                 for event in events {
                     for metric in &event.metrics {
                         points.extend(metrics::encode_metric(
+                            resource,
                             event,
                             metric,
                             &self.telemetry,

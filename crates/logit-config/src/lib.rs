@@ -407,6 +407,14 @@ pub struct UserAgentRule {
     pub class: String,
 }
 
+/// Where `docker_in` reads each event's `host.name` from: `container`, the container's own
+/// hostname.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DockerHostName {
+    Container,
+}
+
 /// The forwarding header a component reads the client's address from: `x_forwarded_for`
 /// (`X-Forwarded-For`), `forwarded` (RFC 7239's `Forwarded`), or `x_real_ip` (`X-Real-IP`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -2515,6 +2523,16 @@ pub enum ComponentKind {
         /// empty entry is rejected.
         #[serde(default)]
         labels: Vec<String>,
+        /// Where each event's `host.name` comes from. Absent by default: no `host.name` is
+        /// written, so a sink that fills a missing host fills `logit`'s own hostname: the Docker
+        /// host's when `logit` runs on it directly, or whatever the top-level `hostname:` names. `container` writes the
+        /// container's own hostname (`Config.Hostname` in `config.v2.json`, usually the short
+        /// container id unless the container was started with `--hostname`) as `host.name` on the
+        /// resource, beside `container.id`; a container with no hostname gets none. With
+        /// `container`, every container is its own host at any sink that reads the host, such as
+        /// Datadog, which can register a new host per container.
+        #[serde(default)]
+        host_name: Option<DockerHostName>,
         #[serde(flatten)]
         tail: TailOptions,
     },
@@ -3105,13 +3123,13 @@ pub enum ComponentKind {
     /// A series is the metric's name, unit, and kind, the resource, the instrumentation scope,
     /// and the event's attributes. In each colliding set the latest reading survives with its
     /// own timestamp. A gauge or cumulative reading before it is replaced by it. Delta sums,
-    /// Datadog rates of one interval, delta histograms, raw samples, set members, sketches, and
-    /// set estimates are merged into it, always keeping the value's type. A Datadog rate is a
-    /// gauge whose `_logit.datadog.type` is `rate`, an increment over its interval, so it's summed
-    /// rather than replaced. A reading that can't merge is forwarded untouched, and the
+    /// rates of one interval, delta histograms, raw samples, set members, sketches, and set
+    /// estimates are merged into it, always keeping the value's type. A rate is a gauge whose
+    /// `_logit.metrics.type` is `rate`, such as a Datadog `rate` series point, an increment over
+    /// its `_logit.metrics.interval`, so it's summed rather than replaced. A reading that can't merge is forwarded untouched, and the
     /// sink may still drop it as a duplicate: a `NaN` increment, a delta of another value type
     /// than the survivor's (`i64` beside `f64`, or `u64` beside `i64`), a total that would
-    /// overflow, a gauge delta, a delta summary, a delta sum or a Datadog rate of booleans, or a
+    /// overflow, a gauge delta, a delta summary, a delta sum or a rate of booleans, or a
     /// histogram with other buckets. An event left with no metric, log, or span is discarded. It
     /// keeps no state between batches, so two batches' readings of one instant both reach the
     /// sink.
@@ -3509,12 +3527,13 @@ pub enum ComponentKind {
         #[serde(default)]
         tls: TlsClientConfig,
     },
-    /// Sends logs, metrics, events, service checks, APM traces, and APM stats straight to
-    /// Datadog's intake API, one request per route a batch needs. Host, service, source, and tags
-    /// come from each event's attributes and resource, so stamp them upstream with `set`. A
-    /// metric, log, event, or service check with no host goes out with the process hostname, so
-    /// hostless senders relayed through one `logit` report as one Datadog host. A metric its
-    /// sender marked hostless (an empty `host:` tag, or an Agent's empty host) stays hostless.
+    /// Sends logs, metrics, events, service checks, APM traces, and APM stats straight to Datadog's
+    /// intake API, one request per route a batch needs. Host, service, source, and tags come from
+    /// each event's attributes and resource, so stamp them upstream with `set`; the host is
+    /// `host.name`, and a `host` attribute is an ordinary tag. A metric, log, event, or service
+    /// check with no host goes out with the process hostname, so hostless senders relayed through
+    /// one `logit` report as one Datadog host. A record its sender marked hostless (an empty
+    /// DogStatsD `host:` tag, or an Agent's empty host) stays hostless.
     /// Points older than Datadog accepts (1h for metrics, 18h for logs and events, 10m for
     /// service checks) are dropped and counted before sending. Traces go out only once a Datadog
     /// Agent has processed them: send `datadog_trace_in`'s output to `datadog_trace_out` instead.
@@ -3586,8 +3605,9 @@ pub enum ComponentKind {
         socket: Option<String>,
         /// The trace form to send: `v0.4` (the default) or `v0.7`. `v0.4` is what most tracers
         /// send; it has no room for trace chunk fields (sampling priority, origin, chunk tags) or
-        /// a tracer's hostname, environment, and tags, which are dropped and counted. `v0.7`
-        /// carries all of them.
+        /// a tracer's environment and tags, which are dropped and counted. A resource `host.name`,
+        /// the tracer's hostname, goes out as a tag on every span instead. `v0.7` carries all of
+        /// them, the hostname in its payload.
         #[serde(default)]
         version: DatadogTraceVersion,
         /// How request bodies are compressed: `none` (the default, what tracers send) or `gzip`,
@@ -3614,10 +3634,10 @@ pub enum ComponentKind {
     /// Sends logs, metrics, and spans to Splunk's HTTP Event Collector (HEC) as `/event` JSON, in
     /// the shape the OpenTelemetry Collector's `splunk_hec` exporter writes, so a Splunk index fed
     /// by both sees one schema. Spans go out as ordinary events: Splunk has no trace store. Each
-    /// event's `index`, `source`, `sourcetype`, and `host` come from the batch's resource
-    /// attributes `com.splunk.index`, `com.splunk.source`, `com.splunk.sourcetype`, and
-    /// `host.name`: set them upstream with `set`. A batch with no `host.name` goes out with the
-    /// process hostname as its `host`. Every other attribute goes out as an indexed field. A
+    /// event's `index`, `source`, and `sourcetype` come from the batch's resource attributes
+    /// `com.splunk.index`, `com.splunk.source`, and `com.splunk.sourcetype`: set them upstream
+    /// with `set`. Its `host` is the event's own `host.name`, else the resource's `host.name`,
+    /// else the process hostname. Every other attribute goes out as an indexed field. A
     /// failure Splunk may have partly applied (a `5xx`, a timeout) resends the batch,
     /// which Splunk may index twice; `buffer.delivery: at_most_once` drops it instead.
     SplunkHecOut {
@@ -3879,9 +3899,9 @@ pub enum ComponentKind {
         /// to `local0`.
         #[serde(default)]
         facility: SyslogFacility,
-        /// HOSTNAME fallback, used only when the event carries no `syslog.hostname` attribute
-        /// (one that never passed through `syslog_in`, say), so a relayed line's origin is never
-        /// silently overwritten. Defaults to the top-level `hostname:`, else the kernel
+        /// HOSTNAME fallback, used only when neither the event nor its batch resource carries a
+        /// `host.name` attribute (a line that never passed through `syslog_in`, say), so a
+        /// relayed line's origin is never silently overwritten. Defaults to the top-level `hostname:`, else the kernel
         /// hostname.
         #[serde(default)]
         hostname: Option<String>,
@@ -3912,10 +3932,11 @@ pub enum ComponentKind {
         /// `tls:` under `transport: udp` is rejected.
         #[serde(default)]
         tls: Option<TlsClientConfig>,
-        /// Opt-in RFC 5424 STRUCTURED-DATA element built from an event's own non-`syslog.*`
-        /// attributes. Absent (the default) emits no such element; a `syslog.sd` attribute
-        /// (round-tripped from `syslog_in`) still renders regardless. Ignored under `format:
-        /// rfc3164`, which has no STRUCTURED-DATA field.
+        /// Opt-in RFC 5424 STRUCTURED-DATA element built from an event's own attributes other
+        /// than `syslog.*` and `host.name` (which HOSTNAME carries). Absent (the default) emits
+        /// no such element; a `syslog.sd` attribute (round-tripped from `syslog_in`) still
+        /// renders regardless. Ignored under `format: rfc3164`, which has no STRUCTURED-DATA
+        /// field.
         #[serde(default)]
         structured_data: Option<SyslogStructuredData>,
     },
@@ -4012,8 +4033,8 @@ pub enum ComponentKind {
         #[serde(default = "default_collectd_max_packet_bytes", with = "human_bytes")]
         #[schemars(with = "String")]
         max_packet_bytes: u64,
-        /// Used only when an event carries neither `collectd.host` nor `host.name` (one that
-        /// never passed through `collectd_in`, say). No default, so a relayed list's origin is
+        /// Used only when an event carries no `host.name` (one that never passed through
+        /// `collectd_in`, say). No default, so a relayed list's origin is
         /// never silently overwritten. With nothing configured and nothing on the event, the list
         /// is dropped and counted (`logit.output.metrics.dropped{reason="no_host"}`): collectd's
         /// receiver rejects an empty host.
@@ -4294,8 +4315,8 @@ pub enum ComponentKind {
         /// A remote-write series holds one sample per millisecond, so of two readings of one
         /// series in one millisecond of a batch, the sink sends the later and leaves the earlier
         /// off, counted `logit.output.metrics.dropped{reason="duplicate_timestamp"}`. When the
-        /// earlier is a state (a gauge other than a Datadog `rate`, or a cumulative kind) equal
-        /// to the later, nothing is lost, and it counts
+        /// earlier is a state (a gauge not flagged `_logit.metrics.type: rate`, or a cumulative
+        /// kind) equal to the later, nothing is lost, and it counts
         /// `logit.output.metrics.normalized{reason="duplicate_timestamp"}` instead; two equal
         /// increments or sets of observations, a set's size included, are still two. To merge or
         /// collapse such readings first, put a `dedup_timestamps` with `precision: 1ms` last

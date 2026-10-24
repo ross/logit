@@ -42,7 +42,7 @@
 //! `private-attribute-namespace`). The other attributes:
 //!
 //! - `syslog.timestamp`: the sender's TIMESTAMP (below).
-//! - `syslog.hostname`: HOSTNAME.
+//! - `host.name`: HOSTNAME, under the standard host key (ADR `process-hostname`).
 //! - `syslog.tag`: RFC 3164's TAG name or RFC 5424's APP-NAME.
 //! - `syslog.pid`: RFC 3164's `tag[pid]` bracket or RFC 5424's PROCID (below).
 //! - `syslog.msgid`: RFC 5424's MSGID.

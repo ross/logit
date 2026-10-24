@@ -134,8 +134,8 @@
 //! | `gauge/u64` | normalized | `value_field` | An `<n>u` `value` field, read back as a `u64` gauge named `<name>.value`. |
 //! | `gauge/bool` | normalized | `value_field` | A `true` or `false` `value` field, read back as a gauge named `<name>.value`. |
 //! | `gauge/negative` | normalized | `value_field` | A negative `value` field, read back as a gauge named `<name>.value`. |
-//! | `gauge/prometheus_info` | exact | -- | As any other gauge; the type carrier isn't written. |
-//! | `gauge/prometheus_stateset` | exact | -- | As any other gauge; the type carrier isn't written. |
+//! | `gauge/prometheus_info` | exact | -- | As any other gauge; the type flag isn't written. |
+//! | `gauge/prometheus_stateset` | exact | -- | As any other gauge; the type flag isn't written. |
 //! | `gauge_delta/f64` | dropped | `logit.output.metrics.dropped{reason=unresolved_gauge_delta}` | An unresolved relative adjustment is dropped, with a throttled `gauge_delta_unresolved` warning; an `aggregate` upstream resolves it into a gauge. |
 //! | `gauge_delta/i64` | dropped | `logit.output.metrics.dropped{reason=unresolved_gauge_delta}` | Dropped, as for a float adjustment. |
 //! | `gauge_delta/u64` | dropped | `logit.output.metrics.dropped{reason=unresolved_gauge_delta}` | Dropped, as for a float adjustment. |
@@ -148,7 +148,7 @@
 //! | `histogram/cumulative` | degraded | `logit.output.metrics.degraded{metric_kind=histogram}` | Telegraf's shape: float `count`, `sum`, `min`, and `max` fields, a field per finite bound named by the bound and holding the cumulative count up to it, and `+Inf` holding the total, each read back as a gauge under `<name>.`, its temporality dropped, counted once per record. A non-finite `sum`, `min`, or `max` is left off the line, and the record also counts `logit.output.metrics.degraded{reason=non_finite_component}`. |
 //! | `histogram/nan_bound` | degraded | `logit.output.metrics.degraded{reason=non_finite_component}` | No field key spells a `NaN` bound, so none is written, and its count reaches only `count` and `+Inf`. |
 //! | `histogram/neg_inf_bound` | degraded | `logit.output.metrics.degraded{reason=non_finite_component}` | No field key spells a `-Inf` bound, so none is written, and its count reaches every finite bound's field. |
-//! | `histogram/gauge_histogram` | exact | -- | As `histogram/cumulative`; the type carrier isn't written. |
+//! | `histogram/gauge_histogram` | exact | -- | As `histogram/cumulative`; the type flag isn't written. |
 //! | `exponential_histogram/delta` | skipped | `logit.output.metrics.skipped{metric_kind=exponential_histogram}` | Neither Telegraf nor the OTel Collector's InfluxDB exporter has a line-protocol form for an exponential histogram, so none is written, with a throttled `encode_error` warning. |
 //! | `exponential_histogram/cumulative` | skipped | `logit.output.metrics.skipped{metric_kind=exponential_histogram}` | Neither Telegraf nor the OTel Collector's InfluxDB exporter has a line-protocol form for an exponential histogram, so none is written, with a throttled `encode_error` warning. |
 //! | `summary/delta` | degraded | `logit.output.metrics.degraded{metric_kind=summary}` | Telegraf's shape: float `count` and `sum` fields and a field per quantile named by the quantile (`0.5`, `0.99`), each read back as a gauge under `<name>.`, counted once per record. Line protocol has no temporality, so a delta summary writes as a cumulative one does. A non-finite `sum`, quantile, or quantile value is left off the line, and the record also counts `logit.output.metrics.degraded{reason=non_finite_component}`. |
@@ -180,6 +180,7 @@
 //! | `record/start_timestamp` | lost | structural | Line protocol has no start time, so none is written, though the OTel Collector's InfluxDB exporter writes a `start_time_unix_nano` field; `docs/known-gaps/influxdb.md` has the gap. |
 //! | `record/exemplars` | lost | structural | Line protocol has no exemplars, so none are written, though the OTel Collector's InfluxDB exporter writes each as a point of a `<name>_exemplar` measurement; `docs/known-gaps/influxdb.md` has the gap. |
 //! | `attributes/string_value` | lost | `logit.output.tags.omitted{reason=unencodable}` | A tag. A value holding a line break, ending in `\`, or with `\` before a space has no spelling and is left off, counted. |
+//! | `attributes/host_beside_host_name` | lost | `logit.output.tags.omitted{reason=unencodable}` | A tag. A value holding a line break, ending in `\`, or with `\` before a space has no spelling and is left off, counted. |
 //! | `attributes/bool_value` | normalized | `stringified` | A tag of `true` or `false`, read back as the string. |
 //! | `attributes/number_value` | normalized | `stringified` | A tag of the number's decimal text, read back as the string. |
 //! | `attributes/array_value` | normalized | `multi_value`; `logit.output.tags.normalized{reason=multi_value}` | A tag holds one value, so only the last representable element is written, counted. |
@@ -188,7 +189,15 @@
 //! | `attributes/timestamp_value` | lost | `logit.output.tags.omitted{reason=unrepresentable}` | A timestamp value has no tag form and is left off, counted. |
 //! | `attributes/private_carrier` | exact | -- | A `_logit.influxdb.*` carrier is consumed into the wire form (the measurement, the string fields, the write's org and bucket) and influxdb_in stamps it back. |
 //! | `attributes/prometheus_target` | lost | structural | The scrape target is private and isn't a tag, so it's left off. |
-//! | `attributes/foreign_carrier` | lost | structural | Another protocol's `_logit.` carrier is private and isn't a tag, so it's left off. A `_logit.metrics.*` flag is left off too, and influxdb_in sets `_logit.metrics.fields` again on a point with a string field. |
+//! | `attributes/foreign_carrier` | lost | structural | Another protocol's `_logit.` carrier is private and isn't a tag, so it's left off. A `_logit.metrics.*` flag is left off too, and influxdb_in sets `_logit.metrics.fields` again on a point with a string field; the `timestamped`, `rate`, `family_type`, and `interval` rows have `_logit.metrics.closed: timestamped`, `_logit.metrics.type`, and `_logit.metrics.interval`. |
+//! | `attributes/timestamped` | lost | structural | The flag is private and isn't a tag, so it's left off. Every point carries its timestamp, so influxdb_in can't tell the source's own from any other and sets no flag. |
+//! | `attributes/rate` | lost | structural | The flag is private and isn't a tag, so it's left off. |
+//! | `attributes/interval` | lost | structural | The flag is private and isn't a tag, so it's left off. |
+//! | `attributes/rate_on_non_gauge` | lost | structural | The flag is private and isn't a tag, so it's left off. |
+//! | `attributes/family_type` | lost | structural | The flag is private and isn't a tag, so it's left off. |
+//! | `attributes/family_type_on_other_kind` | lost | structural | The flag is private and isn't a tag, so it's left off. |
+//! | `attributes/interval_on_distribution` | lost | structural | The flag is private and isn't a tag, so it's left off. |
+//! | `attributes/interval_on_histogram` | lost | structural | The flag is private and isn't a tag, so it's left off. |
 //! | `attributes/resource_attribute` | normalized | `resource_merged` | A tag, the event's value winning on a shared key, read back as an event attribute. |
 //! | `attributes/scope` | lost | structural | Line protocol has no instrumentation scope, so none is written. |
 //! | `attributes/datadog_carrier_log` | lost | structural | Another protocol's `_logit.` carrier is private and isn't a tag, so it's left off. |

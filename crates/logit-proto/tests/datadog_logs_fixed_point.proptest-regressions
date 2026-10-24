@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 9311e823ae0857abb0203a291636756b8e5eebcd2119f5af3d85c9ce2609b0b7 # shrinks to body = Object {"apiKey": String(""), "events": Object {"api": Array [Object {"msg_text": String("")}]}}
+cc 94acf536da9079c8a7f6e03a1397cf018a943da5814f9be14a20cdbe0fc647c6 # shrinks to body = Object {"host": String(""), "text": String("")}

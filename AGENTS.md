@@ -176,8 +176,12 @@ Details an agent needs beyond the table:
   amendment. Its raw-retention modes keep exact values, with a real HyperLogLog backing
   `sets: estimate` and the overflow fallback. It reads two flags and no protocol carrier: an
   event flagged `_logit.metrics.closed` passes through whole, and `_logit.field.*` keys leave the
-  series key only on an event flagged `_logit.metrics.fields`. The decoder that stamps a carrier
-  sets the flag beside it ([ADR `metric-flags`](docs/adr/metric-flags.md)).
+  series key only on an event flagged `_logit.metrics.fields`. A decoder writes the flag in place
+  of a carrier when the flag says the whole fact, as `statsd_in`'s and `prometheus_in`'s
+  timestamps do, and keeps a carrier beside it only for a fact the flag doesn't carry
+  ([ADR `metric-flags`](docs/adr/metric-flags.md),
+  [ADR `protocol-knowledge-stays-in-family`](docs/adr/protocol-knowledge-stays-in-family.md)'s
+  "Amendment: move, don't mirror (2026-10-23)").
 - **`lua`**: `Event.new(t)` makes every payload constructible from Lua as the inverse of
   `event:to_table()`, with `flush(now)` supplying a flush-driven emission's timestamp. The Lua
   surface covers `event.metrics`, `event.span`, `scope`, and the log/resource fields. See
@@ -305,12 +309,18 @@ and codecs carry for them:
   and every other protocol sink ignores them, uncounted, when it renders attributes
   ([ADR `private-attribute-namespace`](docs/adr/private-attribute-namespace.md);
   [docs/design/data-model.md](docs/design/data-model.md)'s "Well-known attribute names" is the
-  canonical statement). A decoder that needs `aggregate` to treat an event specially sets a
-  `_logit.metrics.*` flag beside the carrier ([ADR `metric-flags`](docs/adr/metric-flags.md)), and
-  a component outside the carrier's family doesn't act on the carrier itself, apart from the three
-  carrier reads (C1 to C3) that
-  [ADR `protocol-knowledge-stays-in-family`](docs/adr/protocol-knowledge-stays-in-family.md)
-  records as debt.
+  canonical statement). A decoder that needs another component to treat an event specially sets a
+  `_logit.metrics.*` flag ([ADR `metric-flags`](docs/adr/metric-flags.md)): in place of a carrier
+  when the flag says the whole fact, as `statsd_in`'s and `prometheus_in`'s timestamps,
+  `prometheus_in`'s `info`, `stateset`, and `gaugehistogram` family types, and `datadog_in`'s
+  rate and interval do, and
+  beside one only for a fact the flag doesn't carry
+  ([ADR `protocol-knowledge-stays-in-family`](docs/adr/protocol-knowledge-stays-in-family.md)'s
+  "Amendment: move, don't mirror (2026-10-23)"). A component outside a carrier's family doesn't
+  act on the carrier itself. A sender's host rides on the standard `host.name`, never a
+  protocol's own key: the decoder writes it there from the wire's own host forms, and no
+  carrier keeps them ([ADR `process-hostname`](docs/adr/process-hostname.md)'s "Amendment: a
+  source fills the common keys (2026-10-23)").
 - **Model v2**: `Sum`/`Samples`/`SetMembers`/`ExponentialHistogram`, `SpanExt`, batch-level
   `Scope`, `MetricRecord.flags`.
 - **OTLP**: scope grouping, start time, description, exemplars, a `NO_RECORDED_VALUE` point
@@ -318,11 +328,16 @@ and codecs carry for them:
   status-message field, and dropped-attribute counts.
 - **syslog**: structured data as `syslog.sd`, timestamp precedence, bytes MSG, and opt-in
   structured-data emission.
-- **statsd**: raw timers/sets, `|c:`/`|e:`/`|card:`/`|T`, and events/service checks.
-- **Datadog**: `_logit.datadog.*` carriers for every raw field without a typed home (a `rate`'s
-  type, a count's interval, resources, origin, trace chunk, tracer, and Agent fields), `DdSketch`
+- **statsd**: raw timers/sets, `|c:`/`|e:`/`|card:`/`|T`, events/service checks, and the
+  DogStatsD host (a `host:` tag or an `h:` field) as `host.name`, an empty `host:` tag as
+  `_logit.datadog.hostless`.
+- **Datadog**: `_logit.datadog.*` carriers for every raw field without a typed home (an
+  `unspecified` type, resources, origin, trace chunk, tracer, and Agent fields), a `rate` and a
+  series interval as the neutral `_logit.metrics.type` and `_logit.metrics.interval`, `DdSketch`
   under `Mapping::agent` for the Agent's metrics sketches and `Mapping::logarithmic` for APM stats
-  sketches, 128-bit trace ids through `_dd.p.tid`, and APM stats as metric events.
+  sketches, 128-bit trace ids through `_dd.p.tid`, APM stats as metric events, and every record's
+  own host (a series' `host`, a log's `hostname`, an event's `host`, a check's `host_name`) as
+  `host.name`.
 - **Splunk**: the OTel `splunk_hec` exporter's vocabulary (`com.splunk.*` and `host.name` on the
   resource, `otel.log.*` into typed log fields), `time` parsed without an `f64`, and the
   exporter's span object decoded back to a `SpanRecord`.
@@ -362,7 +377,8 @@ Per pair:
   private CAs and mutual TLS included) on both transports, selected by the endpoint's scheme
   ([ADR `otlp-tls-and-pooled-grpc-client`](docs/adr/otlp-tls-and-pooled-grpc-client.md)).
 - **`syslog_in -> syslog_out`**: `syslog_out` speaks RFC 3164/5424 over UDP, TCP, or TLS (RFC
-  5425), round-tripping header fields from an event's `syslog.*` attributes
+  5425), round-tripping header fields from an event's `syslog.*` attributes and HOSTNAME from
+  `host.name`
   ([ADR `syslog-output`](docs/adr/syslog-output.md),
   [ADR `syslog-tcp-ingress-and-tls`](docs/adr/syslog-tcp-ingress-and-tls.md)).
 - **`prometheus_in -> prometheus_out`**: built lossless against the model from its first PR
@@ -450,7 +466,8 @@ Per pair:
   `logs`, `metrics`, and `spans` submodules. The vocabulary is the OTel Collector's `splunk_hec`
   exporter's, not a `splunk.*` namespace, so `otlp_out` to a Splunk Collector and
   `splunk_hec_out` put the same names in Splunk. `index`/`source`/`sourcetype`/`host` ride on the
-  resource, set upstream with `set`; a body decodes into one batch per distinct envelope.
+  resource, set upstream with `set`, and an event's own `host.name` is its object's `host`; a body
+  decodes into one batch per distinct envelope.
   Metrics are one number per name, so multi-number kinds follow `graphite_out`'s
   `multi_value: skip | expand` (`logit_proto::MultiValue`, shared with `graphite_out` and
   `statsd_out`, which share the dotted table in `logit_proto::multi_value`), with
@@ -640,9 +657,11 @@ the operator-facing account of all of this.
 - **Hostname**: `logit run` resolves one process hostname at startup (`logit_pipeline::host`):
   the top-level `hostname:`, else the kernel hostname through `rustix`'s `uname`, never `$HOSTNAME`
   or DNS. `prepare` passes it to `build_spec`, and `internal` stamps it as `host.name` beside
-  `service.name`. `syslog_out`, `splunk_hec_out`, and `datadog_out` send it as the host of an
-  event that carries none, never over one it carries; each relay pair names that a permitted
-  normalization. `logit validate` doesn't resolve it. `collectd_out` doesn't fall back to it
+  `service.name`. `host.name` is the one standard host key: a source fills it from its own wire
+  host forms, by its protocol's rule, and a sink reads it, then its family's hostless mark where
+  it has one, and never a wire form of any family. `syslog_out`, `splunk_hec_out`, and `datadog_out` send the process hostname as the
+  host of an event that carries none, never over one it carries; each relay pair names that a
+  permitted normalization. `logit validate` doesn't resolve it. `collectd_out` doesn't fall back to it
   ([ADR `process-hostname`](docs/adr/process-hostname.md),
   [docs/deploying.md](docs/deploying.md)'s "Hostname").
 - **Self-logging**: leveled, structured, through `tracing` (`--log-level`/`LOGIT_LOG`,
@@ -1141,8 +1160,8 @@ not a style preference:
   DogStatsD, `datadog`, and `datadog_trace`, or the native hop's (`logit_out`, `logit_in`, and the
   `buffer.disk:` spool). Everything else reads neutral `_logit.metrics.` and `_logit.field.` flags
   its creator set, public vocabulary, or its own config (provenance ids included); an exception needs
-  its own ADR ([ADR `protocol-knowledge-stays-in-family`](docs/adr/protocol-knowledge-stays-in-family.md),
-  whose plan lists the four reads that break it today).
+  its own ADR ([ADR `protocol-knowledge-stays-in-family`](docs/adr/protocol-knowledge-stays-in-family.md);
+  its plan closed every cross-family read it found).
 - **The wire encoding is decided: hand-rolled, shipped as `logit_proto::native`** — a four-arm
   bake-off (`crates/logit-bench/src/bakeoff/`) settled it against `rkyv`, `postcard`, and OTLP
   itself; see [ADR `native-wire-format-encoding`](docs/adr/native-wire-format-encoding.md) and

@@ -69,7 +69,13 @@ fn assert_events_fixed_point(body: &[u8], format: EventFormat) {
     }
     match format {
         EventFormat::PublicV1 => {
-            assert_eq!(d1.events, d2_events, "model fixed point; first encode: {e1:?}")
+            // The public form has no hostless spelling, so a hostless event leaves with no
+            // `host` (permitted normalization (7)).
+            let mut d1_events = d1.events.clone();
+            for event in &mut d1_events {
+                event.attributes.remove("_logit.datadog.hostless");
+            }
+            assert_eq!(d1_events, d2_events, "model fixed point; first encode: {e1:?}")
         }
         EventFormat::AgentEnvelope => {
             // The envelope regroups an item whose `source_type_name` differs from its wire group,

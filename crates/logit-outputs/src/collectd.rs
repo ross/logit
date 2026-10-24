@@ -17,8 +17,7 @@
 //! - `max_packet_bytes`: default `1452` (collectd's `MaxPacketSize`,
 //!   [`logit_proto::collectd::DEFAULT_MAX_PACKET_BYTES`]), bounded to `1024..=65507` by graph
 //!   rule 38: collectd's own floor, and the largest UDP payload.
-//! - `hostname:`: optional, used only when an event carries neither `collectd.host` nor
-//!   `host.name`. With neither, the list is dropped and counted (`no_host`); the sink never reads
+//! - `hostname:`: optional, used only when an event carries no `host.name`. With neither, the list is dropped and counted (`no_host`); the sink never reads
 //!   the OS hostname or invents one (`CollectdEncoder::with_hostname`).
 //!
 //! UDP only: collectd's `network` plugin has no TCP mode.
@@ -210,7 +209,7 @@ mod tests {
     use logit_pipeline::test_util::TelemetryProbe;
     use logit_pipeline::Fault;
     use logit_proto::collectd::{
-        CollectdDecoder, ATTR_HOST, ATTR_INTERVAL, ATTR_PLUGIN, ATTR_TYPE,
+        CollectdDecoder, ATTR_HOST_NAME, ATTR_INTERVAL, ATTR_PLUGIN, ATTR_TYPE,
     };
     use logit_proto::Decoder;
     use std::sync::Arc;
@@ -236,7 +235,7 @@ mod tests {
         let mut event = Event::empty(
             TS,
             attrs(&[
-                (ATTR_HOST, Value::from(host)),
+                (ATTR_HOST_NAME, Value::from(host)),
                 (ATTR_PLUGIN, Value::from(plugin)),
                 (ATTR_TYPE, Value::from(plugin)),
                 (ATTR_INTERVAL, Value::F64(10.0)),

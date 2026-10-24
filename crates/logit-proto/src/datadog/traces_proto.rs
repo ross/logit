@@ -15,7 +15,7 @@ use super::traces::{
     Form, StrMap, WireAgent, WireAny, WireChunk, WireContainerDebug, WireLink, WireSpan,
     WireSpanEvent, WireTracer, ANY_ARRAY,
 };
-use super::{DatadogDecoder, DatadogEncoder};
+use super::{DatadogDecoder, DatadogEncoder, RESOURCE_ATTR_AGENT_HOSTNAME};
 use crate::CodecError;
 use bytes::Bytes;
 use logit_core::EventBatch;
@@ -379,7 +379,16 @@ impl DatadogEncoder {
             return None;
         }
         self.resource_carriers_lost(&batch.resource, Form::Agent, false);
-        let tracer = self.wire_tracer(&batch.resource, chunks);
+        let mut tracer = self.wire_tracer(&batch.resource, chunks);
+        // An Agent sends an empty tracer `hostname` beside its own `hostName`, so the default host
+        // fills it only where no Agent hostname rides along: the payload didn't come from one.
+        if tracer.hostname.is_empty()
+            && batch.resource.attributes.get(RESOURCE_ATTR_AGENT_HOSTNAME).is_none()
+        {
+            if let Some(host) = &self.default_host {
+                tracer.hostname = host.to_string();
+            }
+        }
         let agent = self.wire_agent(&batch.resource, tracer);
         Some(Bytes::from(pb_agent(&agent)))
     }
@@ -396,6 +405,7 @@ mod tests {
     use crate::datadog::{RESOURCE_ATTR_AGENT_HOSTNAME, RESOURCE_ATTR_TRACER_ENV};
     use logit_core::interner::resolve;
     use logit_core::{Registry, Value};
+    use std::sync::Arc;
 
     fn full_span() -> Span {
         Span {
@@ -541,6 +551,29 @@ mod tests {
         let has = |c: &str| counters.contains(&c.to_string());
         assert!(has("logit.input.spans.dropped{idx_payload}"), "{counters:?}");
         assert!(has("logit.input.spans.degraded{negative_duration}"), "{counters:?}");
+    }
+
+    /// `datadog_out`'s default host fills an empty tracer `hostname` only where no Agent's
+    /// `hostName` rides along; a resource `host.name` always wins.
+    #[test]
+    fn the_default_host_fills_a_tracer_hostname_only_without_an_agent_hostname() {
+        let mut d = DatadogDecoder::new();
+        let mut batch = d.decode_agent_payload(&payload().encode_to_vec(), 0).unwrap().remove(0);
+        let mut e = DatadogEncoder::new().with_default_host(Some(Arc::from("relay")));
+        let hostname = |e: &mut DatadogEncoder, b: &EventBatch| {
+            let bytes = e.encode_agent_payload(b).unwrap();
+            AgentPayload::decode(bytes.as_ref()).unwrap().tracer_payloads[0].hostname.clone()
+        };
+        let resource = Arc::make_mut(&mut batch.resource);
+        resource.attributes.insert(logit_core::attrs::HOST_NAME, Value::str("web-1"));
+        assert_eq!(hostname(&mut e, &batch), "web-1");
+        let resource = Arc::make_mut(&mut batch.resource);
+        resource.attributes.remove(logit_core::attrs::HOST_NAME);
+        assert_eq!(hostname(&mut e, &batch), "", "an Agent's payload keeps its empty hostname");
+        let resource = Arc::make_mut(&mut batch.resource);
+        resource.attributes.remove(RESOURCE_ATTR_AGENT_HOSTNAME);
+        assert_eq!(hostname(&mut e, &batch), "relay");
+        assert_eq!(hostname(&mut DatadogEncoder::new(), &batch), "", "no default host");
     }
 
     #[test]

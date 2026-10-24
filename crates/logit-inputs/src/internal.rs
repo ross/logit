@@ -50,7 +50,7 @@ impl InternalInput {
     pub fn new(interval: Duration, registry: Arc<Registry>, hostname: &str) -> Self {
         let mut attributes = AttrMap::new();
         attributes.insert("service.name", "logit");
-        attributes.insert("host.name", hostname);
+        attributes.insert(logit_core::attrs::HOST_NAME, hostname);
         Self {
             interval,
             registry,

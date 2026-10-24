@@ -10,14 +10,14 @@
 //!
 //! **Which record survives.** In a colliding set, a record that can't merge on its own passes
 //! through, counted `passed_through{reason}`: a `GaugeDelta`, a delta `Summary`, or a delta `Sum`
-//! or a Datadog rate of `Bool`s, whose sum is a count of another type (`no_merge_rule`); a flagged
+//! or a rate of `Bool`s, whose sum is a count of another type (`no_merge_rule`); a flagged
 //! `NO_RECORDED_VALUE` record of a delta or observation kind (`no_recorded_value`); and a
 //! non-finite delta value or histogram `sum` (`non_finite`). The survivor is the
 //! latest-timestamp record among the rest, the later in batch order on a tie. The rest of the set
 //! folds into it in batch order:
 //!
-//! - a `Gauge` or a cumulative kind, flagged or not, is superseded (`absorbed`), except a Datadog
-//!   `rate` ([`logit_proto::datadog::is_rate`]), an increment over its interval, which sums as a
+//! - a `Gauge` or a cumulative kind, flagged or not, is superseded (`absorbed`), except a rate
+//!   ([`logit_core::attrs::is_rate`]), an increment over its interval, which sums as a
 //!   delta `Sum` does when its interval equals the survivor's, and otherwise passes through
 //!   (`no_merge_rule`), as does a rate beside a gauge that isn't one;
 //! - a delta `Sum`, `Histogram`, or `ExponentialHistogram`, `Samples`, `SetMembers`,
@@ -43,12 +43,12 @@ use crate::aggregate::{
     attr_map_key_eq, bucket_bounds_match, fold_extreme, hash_attr_map, observed,
 };
 use bytes::Bytes;
+use logit_core::attrs;
 use logit_core::{
     Event, ExpHistogram, Histogram, MetricKind, MetricRecord, MetricValue, Resource, Scope,
     Telemetry, Temporality, Value,
 };
 use logit_pipeline::Transform;
-use logit_proto::datadog;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
@@ -142,7 +142,7 @@ fn kind_key(kind: &MetricKind) -> (u8, u8, bool) {
 }
 
 /// Whether a record can be merged or superseded at all, before it's compared with a survivor. A
-/// Datadog `rate` (`rate`) is an increment, so it takes the delta rules.
+/// rate (`rate`) is an increment, so it takes the delta rules.
 fn alone(record: &MetricRecord, rate: bool) -> Result<Class, Reason> {
     let class = if rate { Class::Delta } else { class(&record.kind) };
     let finite = |v: Option<f64>| v.is_none_or(f64::is_finite);
@@ -289,7 +289,7 @@ fn merge(
             a.value = add_value(a.value, b.value)?;
             Ok(())
         }
-        // Only a Datadog `rate` reaches a merge as a `Gauge`; any other gauge is last write wins.
+        // Only a rate reaches a merge as a `Gauge`; any other gauge is last write wins.
         (MetricKind::Gauge(a), MetricKind::Gauge(b)) => {
             *a = add_value(*a, *b)?;
             Ok(())
@@ -348,7 +348,7 @@ fn apply_prefix(kind: &mut MetricKind, prefix: Prefix) {
     }
 }
 
-/// A record's Datadog `rate` carrier: whether it's a rate, and the interval of one that is.
+/// A record's rate flag: whether it's a rate, and the interval of one that is.
 type Rate = (bool, Option<Value>);
 
 /// One keyed record of the batch: `(key hash, event index, record index)`.
@@ -415,15 +415,14 @@ impl DedupTimestamps {
 
     /// Resolves one colliding set, its entries in batch order.
     fn resolve(&mut self, resource: &Resource, events: &mut [Event], set: &[Entry]) {
-        // Each entry's verdict beside its Datadog `rate` carrier, read the way `datadog_out` reads
-        // it: whether it's a rate, and its interval. One vector, so a collision allocates once.
+        // Each entry's verdict beside its rate flag: whether it's a rate, and its interval. One vector, so a collision allocates once.
         let verdicts: Vec<(Result<Class, Reason>, Rate)> = set
             .iter()
             .map(|e| {
                 let event = &events[e.1 as usize];
                 let record = &event.metrics[e.2 as usize];
-                let rate = datadog::is_rate(resource, event, &record.kind);
-                let interval = rate.then(|| datadog::interval(resource, event).cloned()).flatten();
+                let rate = attrs::is_rate(resource, event, &record.kind);
+                let interval = rate.then(|| attrs::interval(resource, event).cloned()).flatten();
                 (alone(record, rate), (rate, interval))
             })
             .collect();

@@ -8,7 +8,7 @@
 
 use crate::interner::{intern, lookup, Symbol};
 use crate::value::Value;
-use crate::{Event, Resource};
+use crate::{Event, MetricKind, Resource};
 use smallvec::SmallVec;
 use std::cmp::Ordering;
 
@@ -143,6 +143,15 @@ pub fn merged<'a>(
     })
 }
 
+/// The standard host key: the host a sender named, at the scope where it is identity (an event
+/// attribute when it varies per record, else the resource). A source fills it from its wire's
+/// own host forms, by its protocol's rule, and keeps no carrier for them. A sink reads it off the
+/// event, else the resource, then its family's hostless mark where it has one, and falls back to
+/// its process hostname or its own `hostname:`; no sink reads a wire host form. See ADR
+/// `process-hostname` (`docs/adr/process-hostname.md`), "Amendment: a source fills the common
+/// keys".
+pub const HOST_NAME: &str = "host.name";
+
 /// The prefix of the private attribute namespace, which protocol codecs reserve for their own use.
 ///
 /// See ADR `private-attribute-namespace` (`docs/adr/private-attribute-namespace.md`) and
@@ -198,10 +207,156 @@ pub const CLOSED_TIMESTAMPED: &str = "timestamped";
 /// flags".
 pub const CLOSED_FLAGGED: &str = "flagged";
 
+/// Whether `event` is flagged [`METRICS_CLOSED`] with the value [`CLOSED_TIMESTAMPED`], read off
+/// the event, else the batch resource: its timestamp is its source's own, so a sink that can write
+/// a point's time (`statsd_out`'s `|T`, `prometheus_out`'s exposition timestamp) writes
+/// `Event::timestamp`. [`CLOSED_BUCKETED`], any other `Str`, and `Bool(true)` don't count: each
+/// closes a span for `aggregate`, but none says the timestamp is the source's. An event value
+/// shadows the resource's, as [`merged`] does.
+pub fn is_closed_timestamped(resource: &Resource, event: &Event) -> bool {
+    let value =
+        event.attributes.get(METRICS_CLOSED).or_else(|| resource.attributes.get(METRICS_CLOSED));
+    value.and_then(Value::as_str) == Some(CLOSED_TIMESTAMPED)
+}
+
+/// The flag that names what kind of reading its event's records are, where the model kind alone
+/// doesn't say. Its values are [`TYPE_RATE`], [`TYPE_INFO`], [`TYPE_STATESET`], and
+/// [`TYPE_GAUGE_HISTOGRAM`], each for one model kind; a reader ignores a value it has no rule for,
+/// and a value on a kind it doesn't name. Read off the event, else the batch resource, through
+/// [`metric_type`]. See ADR `metric-flags` (`docs/adr/metric-flags.md`), "The flags".
+pub const METRICS_TYPE: &str = "_logit.metrics.type";
+
+/// [`METRICS_TYPE`]'s value for an event whose `Gauge` records each hold a per-second rate over
+/// [`METRICS_INTERVAL`] seconds, such as a Datadog `rate` series point. A rate is an increment
+/// over its interval, not a state. See ADR `metric-flags`, "The flags".
+pub const TYPE_RATE: &str = "rate";
+
+/// [`METRICS_TYPE`]'s value for an event whose `Gauge` records are each an info metric: a `1`
+/// whose labels are the payload, such as an OpenMetrics `info` family. See ADR `metric-flags`,
+/// "The flags".
+pub const TYPE_INFO: &str = "info";
+
+/// [`METRICS_TYPE`]'s value for an event whose `Gauge` records are each one state of a state set,
+/// `1` when the state holds and `0` when it doesn't, such as an OpenMetrics `stateset` family. See
+/// ADR `metric-flags`, "The flags".
+pub const TYPE_STATESET: &str = "stateset";
+
+/// [`METRICS_TYPE`]'s value for an event whose `Histogram` records each count a quantity that can
+/// go down, so no bucket is a running count, such as an OpenMetrics `gaugehistogram` family. See
+/// ADR `metric-flags`, "The flags".
+pub const TYPE_GAUGE_HISTOGRAM: &str = "gaugehistogram";
+
+/// The flag that holds the span, in whole seconds (`I64`), its event's readings cover: a rate's
+/// divisor, a delta count's window. Written only when nonzero. Read off the event, else the batch
+/// resource. See ADR `metric-flags` (`docs/adr/metric-flags.md`), "The flags".
+pub const METRICS_INTERVAL: &str = "_logit.metrics.interval";
+
+/// [`METRICS_TYPE`]'s value as a `Str`, read off the event, else the batch resource. An event
+/// value shadows the resource's, as [`merged`] does. The caller applies the value's kind rule.
+pub fn metric_type<'a>(resource: &'a Resource, event: &'a Event) -> Option<&'a str> {
+    event
+        .attributes
+        .get(METRICS_TYPE)
+        .or_else(|| resource.attributes.get(METRICS_TYPE))
+        .and_then(Value::as_str)
+}
+
+/// Whether `kind` on `event` is a rate: a `Gauge` whose event is flagged [`METRICS_TYPE`]
+/// [`TYPE_RATE`], read off the event, else the batch resource. A stage that collapses readings of
+/// one series at one instant sums a rate as an increment rather than keeping the later one. The
+/// rate value applies to `Gauge` records only, so a rate flag on any other kind is ignored.
+pub fn is_rate(resource: &Resource, event: &Event, kind: &MetricKind) -> bool {
+    matches!(kind, MetricKind::Gauge(_)) && metric_type(resource, event) == Some(TYPE_RATE)
+}
+
+/// [`METRICS_INTERVAL`]'s value, read off the event, else the batch resource.
+pub fn interval<'a>(resource: &'a Resource, event: &'a Event) -> Option<&'a Value> {
+    event.attributes.get(METRICS_INTERVAL).or_else(|| resource.attributes.get(METRICS_INTERVAL))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::interner;
+
+    #[test]
+    fn is_closed_timestamped_reads_the_event_else_the_resource_and_only_timestamped() {
+        let flagged = |value: Value| {
+            let mut attributes = AttrMap::new();
+            attributes.insert(METRICS_CLOSED, value);
+            Event::empty(0, attributes)
+        };
+        let bare = Resource::default();
+        assert!(is_closed_timestamped(&bare, &flagged(Value::from(CLOSED_TIMESTAMPED))));
+        for other in [Value::from(CLOSED_BUCKETED), Value::from("other"), Value::Bool(true)] {
+            assert!(!is_closed_timestamped(&bare, &flagged(other.clone())), "{other:?}");
+        }
+        assert!(!is_closed_timestamped(&bare, &Event::empty(0, AttrMap::new())));
+
+        let mut stamped = Resource::default();
+        stamped.attributes.insert(METRICS_CLOSED, CLOSED_TIMESTAMPED);
+        assert!(
+            is_closed_timestamped(&stamped, &Event::empty(0, AttrMap::new())),
+            "the resource's flag"
+        );
+        assert!(
+            !is_closed_timestamped(&stamped, &flagged(Value::from(CLOSED_BUCKETED))),
+            "an event value shadows the resource's"
+        );
+    }
+
+    #[test]
+    fn is_rate_reads_a_gauge_flagged_rate_on_the_event_else_the_resource() {
+        let gauge = MetricKind::gauge(1.0);
+        let flagged = |value: Value| {
+            let mut attributes = AttrMap::new();
+            attributes.insert(METRICS_TYPE, value);
+            attributes.insert(METRICS_INTERVAL, Value::I64(10));
+            Event::empty(0, attributes)
+        };
+        let bare = Resource::default();
+        let rate = flagged(Value::from(TYPE_RATE));
+        assert!(is_rate(&bare, &rate, &gauge));
+        assert_eq!(interval(&bare, &rate), Some(&Value::I64(10)));
+        assert!(!is_rate(&bare, &rate, &MetricKind::counter(1.0)), "a rate flag on a Sum");
+        assert!(!is_rate(&bare, &flagged(Value::from("other")), &gauge), "an unknown type");
+        assert!(!is_rate(&bare, &Event::empty(0, AttrMap::new()), &gauge));
+
+        let mut stamped = Resource::default();
+        stamped.attributes.insert(METRICS_TYPE, TYPE_RATE);
+        stamped.attributes.insert(METRICS_INTERVAL, Value::I64(20));
+        let bare_event = Event::empty(0, AttrMap::new());
+        assert!(is_rate(&stamped, &bare_event, &gauge), "the resource's flag");
+        assert_eq!(interval(&stamped, &bare_event), Some(&Value::I64(20)));
+        assert!(
+            !is_rate(&stamped, &flagged(Value::from("other")), &gauge),
+            "an event value shadows"
+        );
+        assert_eq!(interval(&stamped, &rate), Some(&Value::I64(10)), "an event value shadows");
+    }
+
+    #[test]
+    fn metric_type_reads_the_event_else_the_resource() {
+        let flagged = |value: Value| {
+            let mut attributes = AttrMap::new();
+            attributes.insert(METRICS_TYPE, value);
+            Event::empty(0, attributes)
+        };
+        let bare = Resource::default();
+        assert_eq!(metric_type(&bare, &flagged(Value::from(TYPE_INFO))), Some(TYPE_INFO));
+        assert_eq!(metric_type(&bare, &flagged(Value::Bool(true))), None, "not a Str");
+        assert_eq!(metric_type(&bare, &Event::empty(0, AttrMap::new())), None);
+
+        let mut stamped = Resource::default();
+        stamped.attributes.insert(METRICS_TYPE, TYPE_STATESET);
+        let bare_event = Event::empty(0, AttrMap::new());
+        assert_eq!(metric_type(&stamped, &bare_event), Some(TYPE_STATESET), "the resource's");
+        assert_eq!(
+            metric_type(&stamped, &flagged(Value::from(TYPE_GAUGE_HISTOGRAM))),
+            Some(TYPE_GAUGE_HISTOGRAM),
+            "an event value shadows the resource's"
+        );
+    }
 
     #[test]
     fn is_field_matches_only_keys_under_the_field_prefix() {

@@ -27,7 +27,7 @@
 //!
 //! - **Explicit sample timestamps are dropped.** The sender always writes one
 //!   (`PrometheusEncoder::with_timestamps_always(true)`), but the receiver never sets the
-//!   `_logit.prometheus.timestamp` marker (`PrometheusDecoder::with_timestamp_marker(false)`): a
+//!   `_logit.metrics.closed: "timestamped"` flag (`PrometheusDecoder::with_timestamp_marker(false)`): a
 //!   transport that mandates a timestamp isn't a producer choosing to expose one (the ADR's
 //!   "Timestamps: received without the marker, sent always" section). Clearing timestamps on both
 //!   sides keeps the fixtures that carry one in the sweep, with their values still compared.
@@ -104,8 +104,8 @@ fn canonicalize(body: &str, dialect: Dialect, version: Version) -> String {
     families.retain(|family| !SYNTHETIC_FAMILIES.contains(&family.name.as_str()));
     for family in &mut families {
         for series in &mut family.series {
-            // The receiver never sets the `_logit.prometheus.timestamp` marker, so an exposition of
-            // a received request writes no line timestamps.
+            // The receiver never sets the `timestamped` flag, so an exposition of a received
+            // request writes no line timestamps.
             series.timestamp = None;
             // 1.0 has no created-timestamp field.
             if version == Version::V1 {

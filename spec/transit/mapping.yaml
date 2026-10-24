@@ -61,7 +61,7 @@ rows:
       datadog_out:
         class: exact
         text: >-
-          A series `count` point, its `interval` from the `_logit.datadog.interval` carrier or 0,
+          A series `count` point, its `interval` from the `_logit.metrics.interval` flag or 0,
           which datadog_in reads back as a delta monotonic sum.
       graphite_out:
         class: degraded
@@ -314,8 +314,8 @@ rows:
       prometheus_out:
         class: exact
         text: >-
-          A `gauge` family, or the family type the `_logit.prometheus.type` carrier names
-          (`untyped`, `unknown`, `info`, `stateset`).
+          A `gauge` family, or the family type the `_logit.metrics.type` flag (`info`,
+          `stateset`) or the `_logit.prometheus.type` carrier (`untyped`, `unknown`) names.
       influxdb_out:
         class: normalized
         reason: value_field
@@ -329,7 +329,8 @@ rows:
       datadog_out:
         class: exact
         text: >-
-          A series `gauge` point, or `rate` or unspecified under the `_logit.datadog.type` carrier.
+          A series `gauge` point, a `rate` under the `_logit.metrics.type` flag, or unspecified
+          under the `_logit.datadog.type` carrier.
       graphite_out:
         class: exact
         text: A `path value timestamp` line, or a pickled datapoint.
@@ -464,20 +465,21 @@ rows:
         class: exact
         text: A negative value, written as is.
 
-  # An OpenMetrics `info` or `stateset` family, which prometheus_in decodes as gauges under the
-  # `_logit.prometheus.type` carrier. A sink's other outcomes for the gauge are its scalar row's.
+  # A gauge flagged `_logit.metrics.type: info` or `stateset`, as prometheus_in decodes an
+  # OpenMetrics `info` or `stateset` family. A sink's other outcomes for the gauge are its scalar
+  # row's, and the flag's are the `family_type` row's.
   - kind: gauge
     feature: prometheus_info
     cells:
       statsd_out:
         class: exact
-        text: As any other gauge; the type carrier isn't written.
+        text: As any other gauge; the type flag isn't written.
       prometheus_out:
         class: exact
         text: An `info` family, its sample named `<name>_info`.
       influxdb_out:
         class: exact
-        text: As any other gauge; the type carrier isn't written.
+        text: As any other gauge; the type flag isn't written.
       otlp_out:
         class: normalized
         reason: prometheus_info_sum
@@ -486,22 +488,22 @@ rows:
           compatibility spec's Info section (marked Development) has it, read back as that sum.
       datadog_out:
         class: exact
-        text: As any other gauge; the type carrier isn't written.
+        text: As any other gauge; the type flag isn't written.
       graphite_out:
         class: exact
-        text: As any other gauge; the type carrier isn't written.
+        text: As any other gauge; the type flag isn't written.
   - kind: gauge
     feature: prometheus_stateset
     cells:
       statsd_out:
         class: exact
-        text: As any other gauge; the type carrier isn't written.
+        text: As any other gauge; the type flag isn't written.
       prometheus_out:
         class: exact
         text: A `stateset` family, one sample per state.
       influxdb_out:
         class: exact
-        text: As any other gauge; the type carrier isn't written.
+        text: As any other gauge; the type flag isn't written.
       otlp_out:
         class: normalized
         reason: prometheus_stateset_sum
@@ -510,10 +512,10 @@ rows:
           StateSet section (marked Development) has it, read back as that sum.
       datadog_out:
         class: exact
-        text: As any other gauge; the type carrier isn't written.
+        text: As any other gauge; the type flag isn't written.
       graphite_out:
         class: exact
-        text: As any other gauge; the type carrier isn't written.
+        text: As any other gauge; the type flag isn't written.
 
   # --- gauge_delta -----------------------------------------------------------------------------
   - kind: gauge_delta
@@ -957,7 +959,7 @@ rows:
         reason: inf_bucket
         text: >-
           A `histogram` family of running-sum buckets and `_sum` when it has one, or a
-          `gaugehistogram` under the type carrier. `+Inf` states the total, so a histogram whose
+          `gaugehistogram` under the type flag. `+Inf` states the total, so a histogram whose
           last bound is finite reads back with an empty `+Inf` bucket. `min` and `max` are
           `record/min_max`'s.
       datadog_out:
@@ -1103,20 +1105,21 @@ rows:
           counter: logit.output.metrics.skipped{metric_kind=histogram}
           text: >-
             Under `multi_value: skip`, the default, no datapoint is written.
-  # An OpenMetrics `gaugehistogram`, which prometheus_in decodes as a cumulative histogram under
-  # the `_logit.prometheus.type` carrier. A sink's other outcomes are its temporality row's.
+  # A histogram flagged `_logit.metrics.type: gaugehistogram`, as prometheus_in decodes an
+  # OpenMetrics `gaugehistogram` family. A sink's other outcomes are its temporality row's, and the
+  # flag's are the `family_type` row's.
   - kind: histogram
     feature: gauge_histogram
     cells:
       statsd_out:
         class: exact
-        text: As `histogram/cumulative`; the type carrier isn't written.
+        text: As `histogram/cumulative`; the type flag isn't written.
       prometheus_out:
         class: exact
         text: A `gaugehistogram` family, with `_gsum` and `_gcount`.
       influxdb_out:
         class: exact
-        text: As `histogram/cumulative`; the type carrier isn't written.
+        text: As `histogram/cumulative`; the type flag isn't written.
       otlp_out:
         class: skipped
         counter: logit.output.metrics.skipped{metric_kind=gauge_histogram}
@@ -1126,10 +1129,10 @@ rows:
           `otlp_gauge_histogram_skipped` warning.
       datadog_out:
         class: exact
-        text: As `histogram/cumulative`; the type carrier isn't written.
+        text: As `histogram/cumulative`; the type flag isn't written.
       graphite_out:
         class: exact
-        text: As `histogram/cumulative`; the type carrier isn't written.
+        text: As `histogram/cumulative`; the type flag isn't written.
   - kind: exponential_histogram
     feature: delta
     cells:
@@ -1988,9 +1991,9 @@ rows:
           text: >-
             A DogStatsD `key:value` tag. Each `:`, `|`, `@`, `#`, `,`, control, and whitespace
             character in the key, and each but `:` in the value, is written as `_`, counted once per
-            wire tag as `name_sanitized` for a key and `value_sanitized` for a value. A non-empty
-            `host.name` on a record with no `host` and no non-empty `h:` field is the `host:` tag,
-            which statsd_in reads back as `host`.
+            wire tag as `name_sanitized` for a key and `value_sanitized` for a value. A `host` on a
+            line with no host of its own is its `host:` tag, which statsd_in reads back as
+            `host.name`.
       prometheus_out:
         class: normalized
         reason: label_sanitized
@@ -2008,15 +2011,10 @@ rows:
           A tag. A value holding a line break, ending in `\`, or with `\` before a space has no
           spelling and is left off, counted.
       datadog_out:
-        class: normalized
-        reason: host_tag
+        class: exact
         text: >-
-          A `key:value` tag. A `host` attribute on a metric with no `host.name` is the host and not
-          a tag, which datadog_in reads back as `host.name`. On a Datadog event or service check
-          with no non-empty host carrier, `host.name`, else `host`, is the host and not a tag,
-          which datadog_in reads back as that carrier. A `collectd.host` on a record with none of
-          those, or on a log with no `hostname`, `host.name`, `syslog.hostname`, or `host`, is the
-          host and not a tag or log attribute, read back where that route's host reads back.
+          A `key:value` tag, `host` included. `host.name` is the record's host, which datadog_in
+          reads back as `host.name` on every route.
       graphite_out:
         - when: {tags: drop}
           class: lost
@@ -2031,6 +2029,62 @@ rows:
             A `;name=value` tag. Each `;`, `!`, `^`, `=`, whitespace, and control character in the
             name, and each `;`, whitespace, and control character and a leading `~` in the value, is
             written as `_`, counted once per record.
+  - kind: attributes
+    feature: host_beside_host_name
+    cells:
+      statsd_out:
+        - when: {format: statsd}
+          class: lost
+          counter: logit.output.tags.omitted{reason=dialect}
+          text: Plain statsd has no tags; each is counted once per wire tag.
+        - class: lost
+          counter: logit.output.tags.omitted{reason=unrepresentable}
+          text: >-
+            A non-empty `host.name` or the hostless mark is the line's own host, so a `host`
+            beside it, a second `host:` tag the Agent would consume, is left off, counted once per
+            wire tag.
+      prometheus_out:
+        class: exact
+        text: A `host` label, read back as `host`.
+      otlp_out:
+        class: exact
+        text: A string attribute.
+      influxdb_out:
+        class: lost
+        counter: logit.output.tags.omitted{reason=unencodable}
+        text: >-
+          A tag. A value holding a line break, ending in `\`, or with `\` before a space has no
+          spelling and is left off, counted.
+      datadog_out:
+        class: exact
+        text: A `host:` tag, which datadog_in reads back as `host`.
+      graphite_out:
+        - when: {tags: drop}
+          class: lost
+          counter: logit.output.tags.omitted{reason=dialect}
+          text: >-
+            Under `tags: drop`, no tag is written, counted once per attribute.
+        - class: normalized
+          reason: tag_sanitized
+          counter: logit.output.metrics.normalized{reason=tag_sanitized}
+          text: >-
+            A `;name=value` tag. Each `;`, `!`, `^`, `=`, whitespace, and control character in the
+            name, and each `;`, whitespace, and control character and a leading `~` in the value, is
+            written as `_`, counted once per record.
+  # statsd_out, prometheus_out, influxdb_out, and graphite_out don't write a log on an event with
+  # no metrics, so its fields are never compared there and none of them has a cell.
+  - kind: attributes
+    feature: hostname
+    cells:
+      otlp_out:
+        class: exact
+        text: A log attribute.
+      datadog_out:
+        class: lost
+        counter: logit.output.tags.omitted{reason=reserved_key}
+        text: >-
+          A log's `hostname` is `host.name`, so a `hostname` attribute has no key of its own on
+          the wire and is left off, counted.
   - kind: attributes
     feature: bool_value
     cells:
@@ -2284,9 +2338,9 @@ rows:
           class: lost
           counter: logit.output.fields.omitted{reason=dialect}
           text: >-
-            Plain statsd has no `|c:`, `|e:`, `|card:`, or `|T` segment, so those carriers are
-            omitted, counted once per carrier per line; the type carrier survives as the line's
-            type, `h` and `d` as `ms`.
+            Plain statsd has no `|c:`, `|e:`, or `|card:` segment, so those carriers are omitted,
+            counted once per carrier per line; the type carrier survives as the line's type, `h`
+            and `d` as `ms`.
         - class: exact
           text: >-
             A `_logit.statsd.*` carrier is written as its own segment or field and statsd_in
@@ -2300,10 +2354,9 @@ rows:
         class: normalized
         reason: dialect
         text: >-
-          The family type and timestamp carriers are consumed into the wire form and a scrape
-          stamps them back; OpenMetrics has no `untyped`, so that type reads back as `unknown`.
-          Remote-write gives every sample a timestamp, so prometheus_in stamps no timestamp
-          carrier; the sample's own timestamp reads back unchanged.
+          The family type carrier, `untyped` or `unknown`, is consumed into the wire form and a
+          scrape stamps it back; OpenMetrics has no `untyped`, so that type reads back as
+          `unknown`.
       datadog_out:
         class: lost
         counter: logit.output.tags.omitted{reason=no_wire_form}
@@ -2311,7 +2364,8 @@ rows:
           A `_logit.datadog.*` carrier rides in its own wire field; one the route has no field for
           is left off, counted. `_logit.datadog.units`, which marks a decoded batch's units as
           Datadog names, is read and not written; datadog_in stamps it again on every series
-          batch.
+          batch. The v2 series route writes `_logit.datadog.hostless` as a `host` resource with no
+          name, which datadog_in reads into `_logit.datadog.resources`.
   - kind: attributes
     feature: prometheus_target
     cells:
@@ -2353,28 +2407,35 @@ rows:
         reason: structural
         text: >-
           Another protocol's `_logit.` carrier is private and isn't a tag, so it's left off. Under
-          `format: dogstatsd`, `_logit.datadog.hostless` on a record with no `host`, no non-empty
-          `host.name`, and no non-empty `h:` field is an empty `host:` tag, which statsd_in reads
-          back as an empty `host`. A `_logit.metrics.*` flag is left off too, and statsd_in sets
-          `_logit.metrics.closed` again on a `|T` line it reads back.
+          `format: dogstatsd`, `_logit.datadog.hostless` on a record with no non-empty `host.name`
+          is an empty `host:` tag, which statsd_in reads back as the mark. A `_logit.metrics.*`
+          flag is left off too; the `timestamped`, `rate`, `family_type`, and `interval` rows have
+          `_logit.metrics.closed: timestamped`, `_logit.metrics.type`, and
+          `_logit.metrics.interval`.
       prometheus_out:
         class: lost
         reason: structural
         text: >-
           Another protocol's `_logit.` carrier is private and isn't a label, so it's left off. A
-          `_logit.metrics.*` flag is left off too, and a scrape sets `_logit.metrics.closed` again
-          on a sample with its own timestamp; remote-write doesn't.
+          `_logit.metrics.*` flag is left off too; the `timestamped`, `rate`, `family_type`, and
+          `interval` rows have `_logit.metrics.closed: timestamped`, `_logit.metrics.type`, and
+          `_logit.metrics.interval`.
       influxdb_out:
         class: lost
         reason: structural
         text: >-
           Another protocol's `_logit.` carrier is private and isn't a tag, so it's left off. A
           `_logit.metrics.*` flag is left off too, and influxdb_in sets `_logit.metrics.fields`
-          again on a point with a string field.
+          again on a point with a string field; the `timestamped`, `rate`, `family_type`, and
+          `interval` rows have `_logit.metrics.closed: timestamped`, `_logit.metrics.type`, and
+          `_logit.metrics.interval`.
       otlp_out:
         class: lost
         reason: structural
-        text: A `_logit.` carrier is private and isn't an OTLP attribute, so it's left off.
+        text: >-
+          A `_logit.` carrier is private and isn't an OTLP attribute, so it's left off. The
+          `_logit.prometheus.type` carrier changes nothing; the `family_type` row has the
+          `_logit.metrics.type` values the sink reads.
       datadog_out:
         class: lost
         reason: structural
@@ -2388,6 +2449,303 @@ rows:
         text: >-
           Another protocol's `_logit.` carrier is private and isn't a tag, so it's left off, under
           either `tags:` mode.
+  # `_logit.metrics.closed: timestamped`, the neutral flag that says the event's timestamp is its
+  # source's own. statsd_in and prometheus_in's scrape set it, and statsd_out and prometheus_out
+  # read it, whichever decoder set it.
+  - kind: attributes
+    feature: timestamped
+    cells:
+      statsd_out:
+        - when: {format: statsd}
+          class: lost
+          counter: logit.output.fields.omitted{reason=dialect}
+          text: Plain statsd has no `|T` segment, so the event's timestamp is omitted, counted.
+        - class: exact
+          text: >-
+            The event's timestamp is written as `|T<seconds>` (`d:<seconds>` on an event or a
+            service check), truncated to whole seconds, and statsd_in sets the flag again. A
+            scraped Prometheus sample with its own timestamp leaves with a `|T` too. A timestamp
+            before 1970 has no unsigned seconds to write, so it's omitted, counted
+            `logit.output.fields.omitted{reason=invalid_value}` once per line.
+      prometheus_out:
+        - when: {bind: null}
+          class: lost
+          reason: structural
+          text: >-
+            Remote-write gives every sample its timestamp, so the timestamp survives, but a
+            remote-write receiver can't tell it from one the producer didn't choose and sets no
+            flag.
+        - class: exact
+          text: >-
+            The event's timestamp is written as the sample's timestamp, and a scrape sets the flag
+            again. A statsd `|T` line leaves with a sample timestamp too.
+      influxdb_out:
+        class: lost
+        reason: structural
+        text: >-
+          The flag is private and isn't a tag, so it's left off. Every point carries its
+          timestamp, so influxdb_in can't tell the source's own from any other and sets no flag.
+      otlp_out:
+        class: lost
+        reason: structural
+        text: >-
+          The flag is private and isn't an OTLP attribute, so it's left off. The point's time
+          carries the timestamp.
+      datadog_out:
+        class: lost
+        reason: structural
+        text: >-
+          The flag is private and never a tag, so it's left off. The point carries its timestamp,
+          in whole seconds.
+      graphite_out:
+        class: lost
+        reason: structural
+        text: >-
+          The flag is private and isn't a tag, so it's left off, under either `tags:` mode. Every
+          datapoint carries its timestamp.
+  # `_logit.metrics.type: rate` and `_logit.metrics.interval`, the neutral flags that say a gauge
+  # is a per-second rate over an interval. datadog_in sets them, and datadog_out reads them,
+  # whichever producer set them.
+  - kind: attributes
+    feature: rate
+    cells:
+      statsd_out:
+        class: lost
+        reason: structural
+        text: The flag is private and isn't a tag, so it's left off.
+      prometheus_out:
+        class: lost
+        reason: structural
+        text: >-
+          The flag is private and isn't a label, so it's left off. The sink reads it to count a
+          same-millisecond pair of rates `dropped` rather than `normalized`, and writes no wire
+          form for it.
+      influxdb_out:
+        class: lost
+        reason: structural
+        text: The flag is private and isn't a tag, so it's left off.
+      otlp_out:
+        class: lost
+        reason: structural
+        text: The flag is private and isn't an OTLP attribute, so it's left off.
+      datadog_out:
+        class: exact
+        text: >-
+          A flagged gauge is written as a series `rate` point, and datadog_in sets the flag again.
+      graphite_out:
+        class: lost
+        reason: structural
+        text: >-
+          The flag is private and isn't a tag, so it's left off, under either `tags:` mode.
+  - kind: attributes
+    feature: interval
+    cells:
+      statsd_out:
+        class: lost
+        reason: structural
+        text: The flag is private and isn't a tag, so it's left off.
+      prometheus_out:
+        class: lost
+        reason: structural
+        text: The flag is private and isn't a label, so it's left off.
+      influxdb_out:
+        class: lost
+        reason: structural
+        text: The flag is private and isn't a tag, so it's left off.
+      otlp_out:
+        class: lost
+        reason: structural
+        text: The flag is private and isn't an OTLP attribute, so it's left off.
+      datadog_out:
+        class: exact
+        text: >-
+          The series `interval` of a series point of any type, and datadog_in sets the flag
+          again.
+      graphite_out:
+        class: lost
+        reason: structural
+        text: >-
+          The flag is private and isn't a tag, so it's left off, under either `tags:` mode.
+  # `_logit.metrics.type: rate` on a record that isn't a gauge: the flag applies to gauges only.
+  - kind: attributes
+    feature: rate_on_non_gauge
+    cells:
+      statsd_out:
+        class: lost
+        reason: structural
+        text: The flag is private and isn't a tag, so it's left off.
+      prometheus_out:
+        class: lost
+        reason: structural
+        text: The flag is private and isn't a label, so it's left off.
+      influxdb_out:
+        class: lost
+        reason: structural
+        text: The flag is private and isn't a tag, so it's left off.
+      otlp_out:
+        class: lost
+        reason: structural
+        text: The flag is private and isn't an OTLP attribute, so it's left off.
+      datadog_out:
+        class: lost
+        reason: structural
+        text: >-
+          The flag applies to a gauge alone, so on any other kind it's ignored: the point keeps
+          the type its kind gives it, and datadog_in sets no flag.
+      graphite_out:
+        class: lost
+        reason: structural
+        text: >-
+          The flag is private and isn't a tag, so it's left off, under either `tags:` mode.
+  # `_logit.metrics.type: info` or `stateset` on a gauge, or `gaugehistogram` on a histogram, the
+  # neutral flag that names an OpenMetrics family type the model has no kind for. prometheus_in
+  # sets it, and prometheus_out and otlp_out read it, whichever producer set it.
+  - kind: attributes
+    feature: family_type
+    cells:
+      statsd_out:
+        class: lost
+        reason: structural
+        text: The flag is private and isn't a tag, so it's left off.
+      prometheus_out:
+        class: exact
+        text: >-
+          The flag is consumed into the family's `# TYPE` line, and prometheus_in sets it again. An
+          info or stateset gauge a script or a `set` flagged exposes with its type line too.
+      influxdb_out:
+        class: lost
+        reason: structural
+        text: The flag is private and isn't a tag, so it's left off.
+      otlp_out:
+        class: lost
+        reason: structural
+        text: >-
+          The flag is private and isn't an OTLP attribute, so it's left off. The sink reads it,
+          writing an info or stateset gauge as a non-monotonic `Sum` and skipping a gauge
+          histogram, by the `prometheus_info`, `prometheus_stateset`, and `gauge_histogram` rows.
+      datadog_out:
+        class: lost
+        reason: structural
+        text: The flag is private and never a tag, so it's left off.
+      graphite_out:
+        class: lost
+        reason: structural
+        text: >-
+          The flag is private and isn't a tag, so it's left off, under either `tags:` mode.
+  # `_logit.metrics.type: info`, `stateset`, or `gaugehistogram` on a record of a kind the value
+  # doesn't name: each reader ignores it.
+  - kind: attributes
+    feature: family_type_on_other_kind
+    cells:
+      statsd_out:
+        class: lost
+        reason: structural
+        text: The flag is private and isn't a tag, so it's left off.
+      prometheus_out:
+        class: lost
+        reason: structural
+        text: >-
+          The value names another kind, so it's ignored: the record takes its own kind's family
+          type, and the flag is private and isn't a label.
+      influxdb_out:
+        class: lost
+        reason: structural
+        text: The flag is private and isn't a tag, so it's left off.
+      otlp_out:
+        class: lost
+        reason: structural
+        text: >-
+          The value names another kind, so it's ignored: the record keeps its own kind's OTLP
+          type, and the flag is private and isn't an OTLP attribute.
+      datadog_out:
+        class: lost
+        reason: structural
+        text: The flag is private and never a tag, so it's left off.
+      graphite_out:
+        class: lost
+        reason: structural
+        text: >-
+          The flag is private and isn't a tag, so it's left off, under either `tags:` mode.
+  # `_logit.metrics.interval` on a record that takes datadog_out's distribution-points or
+  # sketches route, neither of which has an interval field: a `samples`, `distribution`, or delta
+  # `exponential_histogram` record.
+  - kind: attributes
+    feature: interval_on_distribution
+    cells:
+      statsd_out:
+        class: lost
+        reason: structural
+        text: The flag is private and isn't a tag, so it's left off.
+      prometheus_out:
+        class: lost
+        reason: structural
+        text: The flag is private and isn't a label, so it's left off.
+      influxdb_out:
+        class: lost
+        reason: structural
+        text: The flag is private and isn't a tag, so it's left off.
+      otlp_out:
+        class: lost
+        reason: structural
+        text: The flag is private and isn't an OTLP attribute, so it's left off.
+      datadog_out:
+        class: lost
+        counter: logit.output.tags.omitted{reason=no_wire_form}
+        text: >-
+          The distribution-points and sketches routes have no interval field, so a nonzero
+          interval is left off, counted.
+      graphite_out:
+        class: lost
+        reason: structural
+        text: >-
+          The flag is private and isn't a tag, so it's left off, under either `tags:` mode.
+  # `_logit.metrics.interval` on a delta `histogram`, which datadog_out sends as a sketch under
+  # the default `histograms.mode: distributions` and as series under the other modes.
+  - kind: attributes
+    feature: interval_on_histogram
+    cells:
+      statsd_out:
+        class: lost
+        reason: structural
+        text: The flag is private and isn't a tag, so it's left off.
+      prometheus_out:
+        class: lost
+        reason: structural
+        text: The flag is private and isn't a label, so it's left off.
+      influxdb_out:
+        class: lost
+        reason: structural
+        text: The flag is private and isn't a tag, so it's left off.
+      otlp_out:
+        class: lost
+        reason: structural
+        text: The flag is private and isn't an OTLP attribute, so it's left off.
+      datadog_out:
+        - when: {histograms: {mode: counters, send_aggregation_metrics: true}}
+          class: exact
+          text: >-
+            Under `histograms.mode: counters`, the `interval` of each series the histogram
+            writes, and datadog_in sets the flag again.
+        - when: {histograms: {mode: counters, send_aggregation_metrics: false}}
+          class: exact
+          text: >-
+            Under `histograms.mode: counters`, the `interval` of each `<name>.bucket` series, and
+            datadog_in sets the flag again.
+        - when: {histograms: {mode: nobuckets, send_aggregation_metrics: true}}
+          class: exact
+          text: >-
+            Under `histograms.mode: nobuckets`, the `interval` of each series the histogram
+            writes, and datadog_in sets the flag again.
+        - class: lost
+          counter: logit.output.tags.omitted{reason=no_wire_form}
+          text: >-
+            Under `histograms.mode: distributions`, the default, the sketches route has no
+            interval field, so a nonzero interval is left off, counted.
+      graphite_out:
+        class: lost
+        reason: structural
+        text: >-
+          The flag is private and isn't a tag, so it's left off, under either `tags:` mode.
   - kind: attributes
     feature: resource_attribute
     cells:
@@ -2514,10 +2872,9 @@ rows:
         class: normalized
         reason: default_host
         text: >-
-          A record with no host, no `collectd.host`, and no hostless mark leaves with the process
-          hostname as its host,
-          which datadog_in reads back as `host.name`, a log's `hostname`, or an event's or service
-          check's host carrier; a span keeps its own hostnames.
+          A record with no host and no hostless mark leaves with the process hostname as its host,
+          which datadog_in reads back as `host.name`; a span's host is its batch resource's
+          `host.name`, filled only when no relaying Agent's hostname rides beside it.
       graphite_out:
         class: exact
         text: A record with no host leaves with none.

@@ -14,10 +14,10 @@
 
 use super::outcomes::StatsIn;
 use super::{
-    merged_get, DatadogDecoder, DatadogEncoder, ATTR_RESOURCE_NAME, ATTR_SERVICE_NAME,
-    ATTR_SPAN_KIND, ATTR_SPAN_TYPE, RESOURCE_ATTR_AGENT_ENV, RESOURCE_ATTR_AGENT_HOSTNAME,
-    RESOURCE_ATTR_AGENT_VERSION, RESOURCE_ATTR_TRACER_APP_VERSION,
-    RESOURCE_ATTR_TRACER_CONTAINER_ID, RESOURCE_ATTR_TRACER_ENV, RESOURCE_ATTR_TRACER_HOSTNAME,
+    merged_get, DatadogDecoder, DatadogEncoder, ATTR_HOST_NAME, ATTR_RESOURCE_NAME,
+    ATTR_SERVICE_NAME, ATTR_SPAN_KIND, ATTR_SPAN_TYPE, RESOURCE_ATTR_AGENT_ENV,
+    RESOURCE_ATTR_AGENT_HOSTNAME, RESOURCE_ATTR_AGENT_VERSION, RESOURCE_ATTR_TRACER_APP_VERSION,
+    RESOURCE_ATTR_TRACER_CONTAINER_ID, RESOURCE_ATTR_TRACER_ENV,
     RESOURCE_ATTR_TRACER_LANGUAGE_NAME, RESOURCE_ATTR_TRACER_RUNTIME_ID,
     RESOURCE_ATTR_TRACER_VERSION,
 };
@@ -73,9 +73,10 @@ pub const ATTR_SPAN_DERIVED_PRIMARY_TAGS: &str = "_logit.datadog.stats.span_deri
 pub const ATTR_BUCKET_DURATION: &str = "_logit.datadog.stats.bucket.duration";
 pub const ATTR_BUCKET_AGENT_TIME_SHIFT: &str = "_logit.datadog.stats.bucket.agent_time_shift";
 
-/// `ClientStatsPayload` fields, as batch resource attributes. `RESOURCE_ATTR_TRACER_HOSTNAME` /
-/// `_ENV` / `_APP_VERSION` / `_LANGUAGE_NAME` / `_VERSION` / `_RUNTIME_ID` / `_CONTAINER_ID` are
-/// [`super`]'s constants, shared with [`super::traces`]'s `TracerPayload` fields.
+/// `ClientStatsPayload` fields, as batch resource attributes. `RESOURCE_ATTR_TRACER_ENV` /
+/// `_APP_VERSION` / `_LANGUAGE_NAME` / `_VERSION` / `_RUNTIME_ID` / `_CONTAINER_ID` are
+/// [`super`]'s constants, shared with [`super::traces`]'s `TracerPayload` fields, and `Hostname`
+/// is the resource's `host.name` ([`ATTR_HOST_NAME`]), as a `TracerPayload`'s is.
 pub const RESOURCE_ATTR_STATS_SEQUENCE: &str = "_logit.datadog.stats.sequence";
 pub const RESOURCE_ATTR_STATS_AGENT_AGGREGATION: &str = "_logit.datadog.stats.agent_aggregation";
 pub const RESOURCE_ATTR_STATS_SERVICE: &str = "_logit.datadog.stats.service";
@@ -151,7 +152,7 @@ const GROUP_SCALARS: [&str; 5] = [
 ];
 
 const PAYLOAD_STRINGS: [&str; 12] = [
-    RESOURCE_ATTR_TRACER_HOSTNAME,
+    ATTR_HOST_NAME,
     RESOURCE_ATTR_TRACER_ENV,
     RESOURCE_ATTR_TRACER_APP_VERSION,
     RESOURCE_ATTR_TRACER_LANGUAGE_NAME,
@@ -167,7 +168,7 @@ const PAYLOAD_STRINGS: [&str; 12] = [
 
 fn payload_string_mut<'p>(p: &'p mut ClientStatsPayload, key: &str) -> &'p mut String {
     match key {
-        RESOURCE_ATTR_TRACER_HOSTNAME => &mut p.hostname,
+        ATTR_HOST_NAME => &mut p.hostname,
         RESOURCE_ATTR_TRACER_ENV => &mut p.env,
         RESOURCE_ATTR_TRACER_APP_VERSION => &mut p.version,
         RESOURCE_ATTR_TRACER_LANGUAGE_NAME => &mut p.lang,
@@ -743,8 +744,15 @@ impl DatadogEncoder {
     /// The intake's `/api/v0.2/stats` body: one msgpack `StatsPayload` wrapping the batch's one
     /// `ClientStatsPayload`, its envelope from the batch resource; `None` when nothing is stats.
     pub fn encode_stats_payload(&mut self, batch: &EventBatch) -> Option<Bytes> {
-        let client = self.client_payload(batch, true)?;
+        let mut client = self.client_payload(batch, true)?;
         let attrs = &batch.resource.attributes;
+        // As for a `TracerPayload`: an Agent sends an empty `Hostname` beside its own
+        // `AgentHostname`, so the default host fills it only where no Agent hostname rides along.
+        if client.hostname.is_empty() && attrs.get(RESOURCE_ATTR_AGENT_HOSTNAME).is_none() {
+            if let Some(host) = &self.default_host {
+                client.hostname = host.to_string();
+            }
+        }
         let text = |key| self.carrier_str(attrs.get(key)).unwrap_or_default();
         let flag = |key| matches!(attrs.get(key), Some(Value::Bool(true)));
         let envelope = StatsPayload {
@@ -1459,7 +1467,8 @@ mod tests {
             decoder().0.decode_client_stats_v06(&body(&client(vec![full_group()])), 0).unwrap();
         let a = &batch.resource.attributes;
         let s = |k| a.get(k).and_then(Value::as_str);
-        assert_eq!(s(RESOURCE_ATTR_TRACER_HOSTNAME), Some("host1"));
+        assert_eq!(s(ATTR_HOST_NAME), Some("host1"), "the payload's Hostname is the host");
+        assert_eq!(s("_logit.datadog.tracer.hostname"), None);
         assert_eq!(s(RESOURCE_ATTR_TRACER_ENV), Some("prod"));
         assert_eq!(s(RESOURCE_ATTR_TRACER_APP_VERSION), Some("1.2.3"));
         assert_eq!(s(RESOURCE_ATTR_TRACER_LANGUAGE_NAME), Some("go"));
@@ -1578,6 +1587,39 @@ mod tests {
         w.into_inner()
     }
 
+    /// `Hostname` is the resource's `host.name` on the way out, and only `/api/v0.2/stats` fills
+    /// a missing one with the default host, and only with no `AgentHostname` to name the host.
+    #[test]
+    fn the_payload_hostname_is_the_resource_host_name_and_the_default_fills_it_only_unrelayed() {
+        let decode = |bytes: &[u8]| {
+            let mut d = DatadogDecoder::new();
+            d.decode_stats_payload(bytes, 0).unwrap().remove(0)
+        };
+        let hostname = |batch: &EventBatch| {
+            let mut e = DatadogEncoder::new().with_default_host(Some(Arc::from("relay")));
+            let bytes = e.encode_stats_payload(batch).unwrap();
+            let back = decode(&bytes);
+            let v06 = e.encode_client_stats_v06(batch).unwrap();
+            let mut d = DatadogDecoder::new();
+            let v06 = d.decode_client_stats_v06(&v06, 0).unwrap();
+            let get = |b: &EventBatch| {
+                b.resource.attributes.get(ATTR_HOST_NAME).and_then(Value::as_str).map(str::to_owned)
+            };
+            (get(&back), get(&v06))
+        };
+        let mut batch =
+            decoder().0.decode_client_stats_v06(&body(&client(vec![full_group()])), 0).unwrap();
+        assert_eq!(hostname(&batch), (Some("host1".into()), Some("host1".into())));
+
+        let resource = Arc::make_mut(&mut batch.resource);
+        resource.attributes.remove(ATTR_HOST_NAME);
+        assert_eq!(hostname(&batch), (Some("relay".into()), None), "/v0.6/stats isn't filled");
+
+        let resource = Arc::make_mut(&mut batch.resource);
+        resource.attributes.insert(RESOURCE_ATTR_AGENT_HOSTNAME, Value::str("agent-host"));
+        assert_eq!(hostname(&batch), (None, None), "an Agent's empty Hostname stays empty");
+    }
+
     #[test]
     fn a_malformed_group_is_dropped_and_the_rest_decodes() {
         let (mut d, registry) = decoder();
@@ -1591,10 +1633,7 @@ mod tests {
         assert_eq!(batch.events[0].timestamp, 1_000);
         assert_eq!(batch.events[0].metrics[0].kind, count(3));
         assert_eq!(batch.events[0].attributes.get(ATTR_SERVICE_NAME), None, "nil is empty");
-        assert_eq!(
-            batch.resource.attributes.get(RESOURCE_ATTR_TRACER_HOSTNAME),
-            Some(&Value::str("h"))
-        );
+        assert_eq!(batch.resource.attributes.get(ATTR_HOST_NAME), Some(&Value::str("h")));
         let drained = registry.drain(0);
         let reasons: Vec<_> = drained
             .iter()
@@ -1741,7 +1780,7 @@ mod tests {
         let mut batch = stats_batch(
             vec![MetricRecord::new(intern(METRIC_HITS), MetricKind::counter(1.0))],
             &[
-                (super::super::ATTR_INTERVAL, Value::I64(10)),
+                (logit_core::attrs::METRICS_INTERVAL, Value::I64(10)),
                 ("_logit.statsd.type", Value::str("c")),
                 ("env", Value::str("prod")),
             ],

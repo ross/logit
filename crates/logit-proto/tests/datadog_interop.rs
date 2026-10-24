@@ -21,12 +21,13 @@
 //! groups), never on bytes, which change on every re-record.
 
 use bytes::Bytes;
+use logit_core::attrs::{METRICS_INTERVAL, METRICS_TYPE};
 use logit_core::interner::resolve;
 use logit_core::{Diagnostics, Event, EventBatch, MetricKind, Registry, Value};
 use logit_proto::datadog::events::EventFormat;
 use logit_proto::datadog::stats::ATTR_STATS_NAME;
 use logit_proto::datadog::{
-    DatadogDecoder, DatadogEncoder, ATTR_HOST_NAME, ATTR_INTERVAL, ATTR_TYPE, METRIC_TOP_LEVEL,
+    DatadogDecoder, DatadogEncoder, ATTR_HOST_NAME, ATTR_TYPE, METRIC_TOP_LEVEL,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
@@ -242,6 +243,17 @@ fn replay(capture: &Capture) -> Vec<EventBatch> {
     let first = route.decode(&mut probe.decoder, &capture.body);
     let problems = probe.problems();
     assert!(problems.is_empty(), "{}: {problems:?}", capture.name);
+    // A tracer or stats payload's hostname decodes to `host.name`, and no
+    // `_logit.datadog.tracer.hostname` attribute exists on any resource or event.
+    for batch in &first {
+        let carrier = "_logit.datadog.tracer.hostname";
+        assert_eq!(batch.resource.attributes.get(carrier), None, "{}", capture.name);
+        assert!(
+            batch.events.iter().all(|e| e.attributes.get(carrier).is_none()),
+            "{}",
+            capture.name
+        );
+    }
 
     for batch in &first {
         let (Some(encoded), duplicates) = route.encode(batch) else {
@@ -335,8 +347,9 @@ fn the_agent_series_carry_the_dogstatsd_clients_metrics() {
 
     let rate = by_name["record.requests.count"];
     assert!(matches!(rate.metrics[0].kind, MetricKind::Gauge(_)), "{rate:?}");
-    assert_eq!(str_attr(rate, ATTR_TYPE), Some("rate"));
-    assert_eq!(rate.attributes.get(ATTR_INTERVAL), Some(&Value::I64(10)));
+    assert_eq!(str_attr(rate, METRICS_TYPE), Some("rate"));
+    assert_eq!(rate.attributes.get(METRICS_INTERVAL), Some(&Value::I64(10)));
+    assert_eq!(str_attr(rate, ATTR_TYPE), None, "a rate is the neutral flag alone");
     assert_eq!(str_attr(rate, ATTR_HOST_NAME), Some("record-fixtures"));
     assert_eq!(str_attr(rate, "endpoint"), Some("/checkout"));
     // The client's `env:record` twice (its own tag and `DD_ENV`'s) is one tag by the time the
@@ -346,6 +359,7 @@ fn the_agent_series_carry_the_dogstatsd_clients_metrics() {
     let gauge = by_name["record.queue.depth"];
     assert_eq!(gauge.metrics[0].kind, MetricKind::gauge(17.0));
     assert_eq!(str_attr(gauge, ATTR_TYPE), None, "a plain gauge carries no type carrier");
+    assert_eq!(str_attr(gauge, METRICS_TYPE), None, "a plain gauge carries no type flag");
 
     for aggregate in ["avg", "count", "max", "median", "95percentile"] {
         for timer in ["record.request.duration", "record.db.query.duration"] {
@@ -394,7 +408,7 @@ fn the_agent_service_check_ends_its_message_at_the_next_pipe() {
     for check in checks {
         assert_eq!(check.metrics[0].kind, MetricKind::gauge(1.0), "status WARNING");
         assert_eq!(str_attr(check, "_logit.statsd.service_check.message"), Some("slow upstream"));
-        assert_eq!(str_attr(check, "_logit.statsd.service_check.host"), Some("record-host"));
+        assert_eq!(str_attr(check, "host.name"), Some("record-host"));
     }
     assert!(events(&batches).any(|e| metric_name(e) == "datadog.agent.up"));
 }

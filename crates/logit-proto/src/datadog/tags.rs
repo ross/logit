@@ -159,7 +159,7 @@ mod tests {
         let mut attrs = AttrMap::new();
         let skipped = insert_tags(
             &mut attrs,
-            ["env:prod", "_logit.datadog.interval:10", "_logit.x", "logit.x:1", "_logitx"],
+            ["env:prod", "_logit.metrics.interval:10", "_logit.x", "logit.x:1", "_logitx"],
         );
         assert_eq!(skipped, 2);
         assert_eq!(attrs.get("env"), Some(&Value::str("prod")));

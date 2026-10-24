@@ -78,7 +78,7 @@
 //! ## Synthetic scrape metrics
 //!
 //! Every tick, every target, scrape failures included, gets exactly three synthetic series
-//! appended to its batch, on that target's resource, with no wire timestamp marker: `up`
+//! appended to its batch, on that target's resource, with no `timestamped` flag: `up`
 //! (`Gauge(0|1)`), `scrape_duration_seconds` (`Gauge`, wall-clock seconds for that target's
 //! request), and `scrape_samples_scraped` (`Gauge`, the number of series decoded, `0` on any
 //! failure). The ADR's "Synthetic scrape metrics" section says why these three, and why they're
@@ -172,11 +172,12 @@
 //! samples by timestamp and returns one family list per distinct timestamp in ascending order
 //! (`logit_proto::prometheus::remote_write`'s own doc), and this receiver concatenates them into
 //! one batch: N events per series, in timestamp order. `Event::timestamp` comes from the sample,
-//! and the decoder runs with `with_timestamp_marker(false)`, so **no `_logit.prometheus.timestamp:
-//! true` attribute is set**: that marker records a *producer's choice* to expose a timestamp on an
-//! exposition line, and a transport that mandates one is not that choice. Setting it would make a
-//! remote-write → exposition relay stamp an explicit timestamp on every line it writes, which no
-//! scrape of the same data would have produced.
+//! and the decoder runs with `with_timestamp_marker(false)`, so **no `_logit.metrics.closed:
+//! "timestamped"` flag is set**: on a scrape, that flag records a *producer's choice* to expose a
+//! timestamp on an exposition line, and a transport that mandates one is not that choice. Setting
+//! it would make a remote-write → exposition relay stamp an explicit timestamp on every line it
+//! writes, which no scrape of the same data would have produced, and would make `aggregate` pass
+//! every remote-write sample through unwindowed.
 //!
 //! ## Metadata cache
 //!
@@ -2521,7 +2522,7 @@ mod tests {
     // connection open across requests, as the idle-timeout and backpressure cases need.
 
     use logit_proto::prometheus::{
-        FamilyType, MetricFamily, Point, PrometheusEncoder, Series, ATTR_TIMESTAMP, ATTR_TYPE,
+        FamilyType, MetricFamily, Point, PrometheusEncoder, Series, ATTR_TYPE,
     };
 
     /// A bound receiver plus its address. `Input::bind` makes the port live before `run` is
@@ -3051,9 +3052,9 @@ mod tests {
     }
 
     /// Three samples of one series become **one** batch of three events in ascending timestamp
-    /// order, none carrying the `_logit.prometheus.timestamp` marker.
+    /// order, none carrying the `_logit.metrics.closed` flag.
     #[tokio::test]
-    async fn a_multi_timestamp_request_becomes_one_ordered_batch_with_no_timestamp_marker() {
+    async fn a_multi_timestamp_request_becomes_one_ordered_batch_with_no_timestamp_flag() {
         let (receiver, addr) = bound_receiver("/api/v1/write").await;
         let mut rx = spawn_receiver(receiver, 4);
         let groups: Vec<Vec<MetricFamily>> =
@@ -3079,8 +3080,8 @@ mod tests {
         );
         for event in &batch.events {
             assert!(
-                event.attributes.get(ATTR_TIMESTAMP).is_none(),
-                "no timestamp marker on a transport that mandates timestamps"
+                event.attributes.get(logit_core::attrs::METRICS_CLOSED).is_none(),
+                "no timestamp flag on a transport that mandates timestamps"
             );
         }
         assert!(rx.try_recv().is_err(), "three timestamps are still one request, so one batch");
@@ -3951,9 +3952,9 @@ mod tests {
             "three wire series, one model record: {:#?}",
             batch.events
         );
-        // No `_logit.prometheus.type` marker: `MetricKind::Histogram` *is* the type, and the marker
-        // exists only for the family types the model has no kind of its own for.
+        // No type carrier and no type flag: `MetricKind::Histogram` *is* the type.
         assert_eq!(batch.events[0].attributes.get(ATTR_TYPE), None);
+        assert_eq!(batch.events[0].attributes.get(logit_core::attrs::METRICS_TYPE), None);
 
         let events = registry.drain(0);
         assert_eq!(

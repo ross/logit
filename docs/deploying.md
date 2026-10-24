@@ -525,14 +525,65 @@ was considered.
 own `internal` telemetry, so several instances writing to one metrics backend stay
 distinguishable. The startup log records it as `hostname resolved`.
 
+`host.name` is the one host key every component shares. Each input that receives a sender's host
+writes it there, read by its protocol's own rules: `collectd_in`, `syslog_in`, `statsd_in`,
+`datadog_in`, `datadog_trace_in` (a `/v0.7/traces` or `/v0.6/stats` payload's hostname), and
+`splunk_hec_in`. A sink that writes a host reads `host.name`, and no protocol's host field. To set
+or override a host, stamp `host.name` with `set`.
+
+Every other host is yours to put in `host.name`: a parsed log field, a carbon path segment, a
+line's text, an event a script builds, or a relay from a protocol with no host field. A transform
+does it, `set` for a constant or `lua` to copy an attribute, and no sink reads any other key for
+the host. For example, a pino or bunyan log tailed by `tail_in` and parsed by `json` carries its
+host as a `hostname` attribute, which this stage moves to `host.name`:
+
+```yaml
+  host_from_log:
+    type: lua
+    sources: [parse]
+    script: |
+      function process(event)
+        event.attributes["host.name"] = event.attributes.hostname
+        event.attributes.hostname = nil
+        return event
+      end
+```
+
+`datadog_out` leaves a log's `hostname` attribute off, counted, because that key is Datadog's own
+field and the sink fills it from `host.name`, so the copy is what gets the file's host to Datadog.
+
+Telegraf's `host` tag is another example. Telegraf adds it to every point it writes unless
+`omit_hostname = true`, but line protocol defines no host field, so `influxdb_in` keeps it as the
+attribute `host`; the same stage with `host` in place of `hostname` makes it the host. Likewise
+`docker_in` writes no `host.name` unless you set `host_name: container`, which names each
+container as its own host (see [The host of a container's lines](#the-host-of-a-containers-lines)).
+
+### Common mappings
+
+Producers whose host operators usually want as the host, and where each puts it. Each attribute
+row uses the stage above with that row's attribute name:
+
+| Producer | Arrives through | Where the host is | Recipe |
+|---|---|---|---|
+| Telegraf, `outputs.influxdb_v2` | `influxdb_in` | the `host` tag on every point, an attribute `host` | copy `host` |
+| pino, pino-http | `tail_in` or `docker_in`, then `json` | the `hostname` field, an attribute `hostname` | copy `hostname` |
+| bunyan | `tail_in` or `docker_in`, then `json` | the `hostname` field, an attribute `hostname` | copy `hostname` |
+| semantic_logger (Ruby), JSON format | `tail_in` or `docker_in`, then `json` | the `host` field, an attribute `host` | copy `host` |
+| collectd `write_graphite`, Telegraf `outputs.graphite` | `graphite_in` | the metric path's first segment (`<host>.<plugin>...`, or Telegraf's default template `host.tags.measurement.field`), after any `prefix` | split the segment off the metric name in a `lua` stage; to label the whole stream instead, `set` a constant `host.name` |
+
+python-json-logger, structlog, Go's `log/slog`, and zap write no host by default; a `set` of a
+constant `host.name` names the host for a stream from one machine. collectd's binary `network`
+protocol, syslog's HOSTNAME, and the Datadog, Splunk HEC, and OTLP protocols carry the host in
+their own field, which their inputs write as `host.name` already.
+
 Three sinks also send it as the host of any event that carries none of its own. They never
 replace a host an event or its resource carries:
 
 | Sink | The event's own host | Where the hostname goes otherwise |
 |---|---|---|
-| `syslog_out` | `syslog.hostname` | HOSTNAME, unless the sink sets its own `hostname:` |
-| `splunk_hec_out` | resource `host.name` | the envelope `host` |
-| `datadog_out` | a metric's `host.name`, DogStatsD `host:` tag, or `collectd.host`; an event's or check's `h:` field, `host.name`, `host:` tag, or `collectd.host`; a log's `hostname`, `host.name`, `syslog.hostname`, `host`, or `collectd.host` | the host of a metric, log, event, or service check |
+| `syslog_out` | `host.name` on the event, else on the resource | HOSTNAME, unless the sink sets its own `hostname:` |
+| `splunk_hec_out` | `host.name` on the event, else on the resource | each object's envelope `host` |
+| `datadog_out` | `host.name` on the event, else on the resource; else a hostless mark on a metric, event, or check, which stays hostless, or a log's `syslog.hostname` or `host`, which Datadog reads itself | the host of a metric, log, event, or service check, and of a trace or stats payload with no relaying Agent's hostname |
 
 So a relay sends the relay's hostname for whatever arrived without one. Through `datadog_out`,
 that means every DogStatsD sender that names no host reports as one Datadog host, as it would
@@ -1796,8 +1847,8 @@ above as commented alternatives. **Don't put an `aggregate` between them.** Unli
 [`fixtures/statsd-to-influxdb.yaml`](../fixtures/statsd-to-influxdb.yaml), it has none, because a
 collectd value list is already one pre-aggregated reading per `Interval` with its own timestamp;
 re-windowing it would average averages and re-stamp them with the flush time. The file's header
-comment lists what the cross-protocol hop costs. `collectd.host`, `collectd.plugin_instance`, and
-`collectd.type_instance` become InfluxDB tags, so lists from different hosts or instances stay
+comment lists what the cross-protocol hop costs. `host.name` (collectd's host),
+`collectd.plugin_instance`, and `collectd.type_instance` become InfluxDB tags, so lists from different hosts or instances stay
 apart. The plugin, type, interval, and severity ride on private `_logit.collectd.*` attributes that
 only `collectd_out` writes; the plugin and type already make up the measurement name. One
 N-data-source list becomes N measurements named `plugin.type.ds` sharing a tag set and a timestamp.
@@ -2077,8 +2128,8 @@ reference. Before deploying one:
   list too large to fit alone is dropped whole and counted
   `logit.output.metrics.dropped{reason="oversize_value_list"}`, not split.
 - **Set `hostname:` if the pipeline carries metrics that didn't come from `collectd_in`.** A relayed
-  list already carries its origin's host on `collectd.host`, so a pure relay never needs it. Metrics
-  from a `statsd_in` with no `collectd.host` or `host.name`, and no `hostname:` set, are
+  list already carries its origin's host on `host.name`, so a pure relay never needs it. Metrics
+  from a `statsd_in` with no `host.name`, and no `hostname:` set, are
   dropped and counted `logit.output.metrics.dropped{reason="no_host"}` with a `no_host` diagnostic.
   That is deliberate: collectd's receiver rejects an empty host, and inventing one would merge every
   unlabeled sender into one host's metrics. `internal` is the exception: it stamps the process
@@ -2324,6 +2375,14 @@ relabel the Docker daemon's own live state, which this stack doesn't own.
 Docker Desktop's paths live inside its VM, and Podman uses a different log format. None of these
 match `docker_in`'s `root:` default, the only layout this driver understands.
 
+### The host of a container's lines
+
+`docker_in` writes no `host.name` by default, so a sink that fills a missing host uses `logit`'s
+own hostname, the Docker host when `logit` runs on it, or the top-level `hostname:`. Set
+`host_name: container` to write each container's own hostname (`Config.Hostname`, usually its
+short id) as `host.name` instead; every container then reports as a host of its own, which at
+`datadog_out` can register a Datadog host per container. See [Hostname](#hostname).
+
 ### `read_from`, and why a checkpoint matters more here than for a plain UDP listener
 
 `read_from: end` (the default) skips what a file already holds and tails only new lines;
@@ -2481,8 +2540,8 @@ see [ADR
   therefore picked up as soon as the rewrite lands. Either way, it fires once per failure, not once
   per tick while the failure persists.
 - `logit.input.files.identity_changed` / `.deselected` (count, `docker_in` only): a container's
-  identity (name, image, or a watched label) changed, or a tracked container was renamed out of
-  `containers:` and stopped flowing. The matching `container_renamed`/`container_deselected`
+  identity (name, image, a watched label, or, under `host_name: container`, the hostname) changed,
+  or a tracked container was renamed out of `containers:` and stopped flowing. The matching `container_renamed`/`container_deselected`
   diagnostics name the container. **A deselection is process-local:** if `logit` restarts before the
   container is renamed back, the retained resume offset is lost.
 
@@ -2662,10 +2721,9 @@ metric sets and `aggregate` reads
   service check's `d:`) or a Prometheus exposition sample with a timestamp, passes through with
   that timestamp, as the Datadog Agent leaves a `|T` metric unaggregated. A window would replace
   the producer's time with the flush time and split the series by timestamp. If you want such
-  metrics summarized anyway, drop both the `_logit.metrics.closed` flag and the protocol's
-  timestamp carrier (`_logit.statsd.timestamp` for DogStatsD) with `remove` ahead of `aggregate`,
-  and they take the flush time. The carrier would otherwise stay in the series key, one series per
-  source second, and `statsd_out` writes `|T` from it.
+  metrics summarized anyway, drop the `_logit.metrics.closed` flag with `remove` ahead of
+  `aggregate`, and they take the flush time. With the flag gone, `statsd_out` writes no `|T` and
+  `prometheus_out` no sample timestamp for them.
 - **`flagged`**: a metric whose `_logit.metrics.closed` is any other string, or `true`, set by a
   `lua` script or a `set`, passes through whole the same way.
 - **`non_finite`**: a counter increment, gauge, or gauge adjustment whose value is `NaN` or
@@ -2693,7 +2751,7 @@ An equal state loses nothing: the destination stores the same sample either way,
 retry resending identical points raises no loss alarm. Equal means the whole reading as the sink
 writes it: for remote-write, the sample or every bucket and quantile, the created timestamp, and
 the exemplars; for `datadog_out`, the value, type, unit, interval, source type, and origin. An
-increment or a set of observations (a delta count, a Datadog `rate`, a delta histogram,
+increment or a set of observations (a delta count, a rate such as a Datadog `rate`, a delta histogram,
 `samples`, a distribution, a set) counts `dropped` even when equal: two equal ones are two sets of events, and
 only one is sent. Two sets `{alice}` and `{bob}` both write a size of 1, and their union is 2.
 
@@ -3247,11 +3305,13 @@ socket (`receiver_socket`, `/var/run/datadog/apm.socket` by default), always pla
 
 **Pick `version` by where the spans came from.** `v0.4`, the default, is what most tracers send and
 every Agent accepts. It has no room for a trace chunk's fields (its sampling priority, origin, and
-tags) or for a tracer payload's hostname, environment, runtime ID, app version, and tags. Those
-are dropped and counted `logit.output.spans.degraded{reason="no_wire_form"}`. A tracer that sent
-v0.4 never had them, so v0.4 relays its spans with nothing lost. If your tracers send `/v0.7/traces`,
-set `version: v0.7`, which carries all of them. The tracer's language, versions, container ID, and
-the rest of its request headers go out as the same headers under either version.
+tags) or for a tracer payload's environment, runtime ID, app version, and tags. Those are dropped
+and counted `logit.output.spans.degraded{reason="no_wire_form"}`; the payload's hostname, the
+resource's `host.name`, goes out as every span's `host.name` tag, unless the span carries a
+different `host.name`, which wins, counted the same way. A tracer that sent v0.4 never had them, so
+v0.4 relays its spans with nothing lost. If your tracers send `/v0.7/traces`, set `version: v0.7`,
+which carries all of them. The tracer's language, versions, container ID, and the rest of its
+request headers go out as the same headers under either version.
 
 **It relays; it doesn't process.** Spans go to the Agent as they arrived, and the Agent does the
 obfuscation, normalization, sampling, and stats computation. The Agent's reply carries sampling
@@ -3533,11 +3593,12 @@ serves HEC at `https://<stack>.splunkcloud.com:8088/services/collector` instead.
 A Splunk Cloud trial stack presents that same certificate, whose name doesn't match the host, so
 it needs `tls: {insecure_skip_verify: true}`.
 
-**Index, source, sourcetype, and host come from the resource.** There are no per-sink fields for
+**Index, source, sourcetype, and host come from attributes.** There are no per-sink fields for
 them: the sink reads `com.splunk.index`, `com.splunk.source`, `com.splunk.sourcetype`, and
-`host.name` from the batch resource, so stamp them upstream with `set`, as the example does. A
-batch with no `host.name` goes out with the process hostname ([Hostname](#hostname)) as its
-`host`. Every other attribute goes out in `fields`, as an indexed field, a nested one flattened to
+`host.name` from the batch resource, so stamp them upstream with `set`, as the example does. An
+event's own `host.name` is its object's `host` ahead of the resource's, so `collectd_in`'s and
+`syslog_in`'s per-sender hosts reach Splunk. An object with neither goes out with the process
+hostname ([Hostname](#hostname)) as its `host`. Every other attribute goes out in `fields`, as an indexed field, a nested one flattened to
 dotted keys.
 
 **Metrics.** A gauge or a sum goes out as one `metric_name:<name>` field with a `metric_type`

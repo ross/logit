@@ -1,6 +1,6 @@
 ---
 created: 2026-09-25
-updated: 2026-10-18
+updated: 2026-10-23
 ---
 
 # Splunk HEC: a lossless pair in the OpenTelemetry exporter's vocabulary, spans as HEC events, and opt-in acknowledgment
@@ -793,3 +793,38 @@ replaced.
 A relayed object that arrived with no `host` now leaves with the relay's hostname, which joins the
 codec's permitted normalizations (`crates/logit-proto/src/splunk/mod.rs`). Without it, Splunk
 assigns the HEC input's default host, which is the Splunk server's name, not the sender's.
+
+## Amendment (2026-10-23): the object host is the event's `host.name`
+
+Decision 2 amended: `host` no longer comes from the resource alone. `host.name` is the standard
+host key ([ADR `process-hostname`](process-hostname.md)'s "Amendment: `host.name` is the standard
+host key (2026-10-23)"), and `collectd_in` and `syslog_in` write each sender's host as an event
+`host.name`. A batch-level envelope sent those senders to Splunk under the relay's hostname.
+
+`splunk_hec_out` takes each object's `host`, for a log, metric, or span alike, from:
+
+1. the event's `host.name`, when it is a non-empty string;
+2. the resource's `host.name`, as the 2026-10-14 amendment states it, a non-string still omitted
+   and counted;
+3. the process hostname.
+
+An event `host.name` that becomes the `host` isn't also written in `fields` or a span's
+`attributes`, as the resource carriers aren't. One that is empty, or isn't a string (`collectd_in`
+writes a `Bytes` for a non-UTF-8 host), isn't a host: the object takes the next, and the attribute
+leaves as any other.
+
+`source`, `sourcetype`, and `index` stay resource-only. No source writes them per event, and
+reading them per event would add three more cases for no producer.
+
+The relay gains one permitted normalization (`crates/logit-proto/src/splunk/mod.rs`'s list): an
+object's `fields` `host.name` (a span object's `attributes` `host.name`) is an event attribute,
+so it leaves as the object's `host` and returns on the resource, in a batch of its own per host.
+When that object also carried a `host`, the `host` is replaced. A span object's `fields` go to the
+resource, so a `fields` `host.name` there is the resource's, under normalizations 3 and 8, as
+before. The four
+recorded HEC clients (`testdata/interop/splunk/`), the OpenTelemetry exporter among them, write
+no event-level `host.name`, so a relay of their traffic is unchanged
+(`crates/logit-proto/tests/splunk_interop.rs`).
+
+The 2026-10-14 amendment's "a `host.name` the batch carries always wins" now reads: a host the
+event or the batch carries always beats the process hostname.

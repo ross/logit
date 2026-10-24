@@ -11,6 +11,7 @@
     {"sink":"graphite_out","row":"attributes/scope","cell":0,"observed":["lost"]},
     {"sink":"graphite_out","row":"attributes/string_value","cell":1,"observed":["exact"]},
     {"sink":"graphite_out","row":"attributes/timestamp_value","cell":1,"observed":["lost"]},
+    {"sink":"graphite_out","row":"attributes/timestamped","cell":0,"observed":["lost"]},
     {"sink":"graphite_out","row":"distribution","cell":1,"observed":["skipped"]},
     {"sink":"graphite_out","row":"exponential_histogram/cumulative","cell":1,"observed":["skipped"]},
     {"sink":"graphite_out","row":"exponential_histogram/delta","cell":1,"observed":["skipped"]},

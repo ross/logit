@@ -99,20 +99,29 @@ is one nothing checks: add a case or a flow that reaches it.
   `sample_rate`, `non_finite`, `superseded`, `same_instant`, `same_instant_equal`,
   `same_millisecond`, `same_millisecond_equal`): `exact`, `normalized`, `degraded`, `skipped`, or `dropped`, best to worst.
 - **Field level**, for the `record` rows `unit`, `description`, `start_timestamp`, `exemplars`,
-  `exemplars_on_summary`, `unit_on_distribution`, `min_max`, and `sample_rate_unweighted`, every `attributes` row, and a log or span beside metrics
+  `exemplars_on_summary`, `unit_on_distribution`, `min_max`, and `sample_rate_unweighted`, every `attributes` row (`rate`,
+  `rate_on_non_gauge`, `family_type`, `family_type_on_other_kind`, `interval`, `interval_on_distribution`, and `interval_on_histogram` among them), and a log or span beside metrics
   (`beside_metrics`), which is a field of its event: `exact`, `normalized`, or `lost`.
 
 Where a sink's outcome depends on the record's kind, the kind is in the feature's name, since a
 `when:` key names sink config only: `no_recorded_value` is a flagged cumulative `sum` or
 `gauge`, `no_recorded_value_delta_sum` a flagged delta `sum`, `exemplars_on_summary` a
-summary's exemplars, `unit_on_distribution` a `samples` or `distribution` record's unit, and
+summary's exemplars, `unit_on_distribution` a `samples` or `distribution` record's unit,
+`rate_on_non_gauge` a `_logit.metrics.type: rate` flag on a record that isn't a `gauge`,
+`family_type_on_other_kind` a `_logit.metrics.type` of `info` or `stateset` on a record that
+isn't a `gauge`, or of `gaugehistogram` on one that isn't a `histogram`,
+`interval_on_distribution` a `_logit.metrics.interval` flag on a `samples`, `distribution`, or
+delta `exponential_histogram` record and `interval_on_histogram` one on a delta `histogram`, and
 `exemplar_key_unsafe` and `exemplar_key_unsafe_histogram` a monotonic `sum` and a `histogram`
 whose written exemplar has an attribute key `prometheus_out` sanitizes into a label name, the only sink that writes an exemplar's keys under a name rule. Some
 rows name a shape one sink treats apart, and every sink that compares the record reaches them: `record/sample_rate` (a
 `samples` record whose rate rounds to a weight above 1) and `record/sample_rate_unweighted` (a
 rate below 1 that rounds to weight 1), `span/no_wire_form` (a span field a Datadog span has no
 form for), `attributes/datadog_carrier_log` (a `_logit.datadog.*` carrier on a log, a Datadog
-event, or a service check), and the attributes `datadog_out` writes from a record's own fields,
+event, or a service check), `attributes/host_beside_host_name` (a `host` attribute beside a
+non-empty string `host.name` or the hostless mark, which `statsd_out` leaves off) and
+`attributes/hostname` (a log's `hostname` attribute, which `datadog_out` leaves off), and
+the attributes `datadog_out` writes from a record's own fields,
 `attributes/no_host`, `log_status`, `span_kind`, and `trace_id_high`. A flagged record's `no_recorded_value` row goes ahead of its kind's counted
 loss where that loss's counter didn't move, since most sinks test the flag first
 (`classes.rs`'s "Counters").
@@ -154,10 +163,10 @@ records that reach it, and doesn't fail. The table's kinds, features, and rules 
 ## The class check
 
 For each flow and case, the check pairs every record that reached the sink with the records read
-back, reading names, attribute keys, and values as that sink writes them (`statsd_out`'s
-`host.name` and hostless mark read back as the DogStatsD `host`, `prometheus_out`'s
+back, reading names, attribute keys, and values as that sink writes them (`statsd_out`'s `host`
+attribute read back as `host.name`, `prometheus_out`'s
 sanitized names and `_total`, `influxdb_out`'s `<name>.value` field, `otlp_out`'s integer
-timestamps and an OpenMetrics `info` or `stateset` gauge read back as a non-monotonic sum, `datadog_out`'s `host` tag read back as `host.name` and the attributes it writes from a
+timestamps and an OpenMetrics `info` or `stateset` gauge read back as a non-monotonic sum, `datadog_out`'s hostless mark read back as a v2 `host` resource with no name, and the attributes it writes from a
 record's own fields), then compares what it observed with the table. A record that pairs only by
 name, in any metric kind (its own included) or as a dotted expansion, reads `degraded`. When both
 sides are histograms, that pairing also needs the same total count, and the same sum where both

@@ -48,15 +48,16 @@
 //! forward-compatible superset. `|c:<id>` (v1.2+; v1.4+'s `ci-`/`in-`-prefixed forms land verbatim)
 //! stamps `_logit.statsd.container_id: Value::Str`, a zero-copy datagram slice. `|T<secs>` sets
 //! [`Event::timestamp`](logit_core::Event::timestamp) to `secs * 1_000_000_000` in place of the
-//! receipt time `decode_into`'s `received_at` supplies, and stamps
-//! `_logit.statsd.timestamp: Value::U64(secs)`, the raw wire value. The carrier is what survives a
-//! stage that rebuilds `Event::timestamp` (`aggregate`'s flush), and it tells a wire timestamp from
-//! a receipt-time one. A `|T` that isn't an unsigned integer (the form is under the rejection rules
-//! below), or whose nanoseconds overflow `i64`, rejects only that line as `bad_line`. Both
-//! attributes are protocol-namespaced carriers (`docs/adr/lossless-transit.md`). Beside the
-//! timestamp carrier, `|T` stamps the flag `_logit.metrics.closed: "timestamped"`, which tells
-//! `aggregate` the point has its own time (`docs/adr/metric-flags.md`, "The flags"). Every other
-//! unrecognized `|` segment is accepted and ignored, for forward compatibility.
+//! receipt time `decode_into`'s `received_at` supplies, and stamps the flag
+//! `_logit.metrics.closed: "timestamped"`, which tells a wire timestamp from a receipt-time one:
+//! `aggregate` passes the point through unwindowed, and a sink that can write a point's own time
+//! (`statsd_out`'s `|T`, `prometheus_out`'s sample timestamp) writes `Event::timestamp` back
+//! (`docs/adr/metric-flags.md`, "The flags"). There's no `_logit.statsd.*` timestamp carrier
+//! (`docs/adr/protocol-knowledge-stays-in-family.md`, "Amendment: move, don't mirror"). A `|T`
+//! that isn't an unsigned integer (the form is under the rejection rules below), or whose
+//! nanoseconds overflow `i64`, rejects only that line as `bad_line`. `_logit.statsd.container_id`
+//! is a protocol-namespaced carrier (`docs/adr/lossless-transit.md`). Every other unrecognized `|`
+//! segment is accepted and ignored, for forward compatibility.
 //!
 //! **`|e:<external-data>` (v1.5, Agent 7.57+) and `|card:<cardinality>` (v1.6, Agent 7.64+)** stamp
 //! `_logit.statsd.external_data` and `_logit.statsd.cardinality`, both `Value::Str` zero-copy
@@ -110,6 +111,26 @@
 //! counts `logit.input.tags.omitted{reason="reserved_prefix"}`; a line rejected for another
 //! reason counts none.
 //!
+//! ## The host
+//!
+//! A line's host decodes to the standard `host.name`, read as a DogStatsD Agent reads it
+//! (datadog-agent 7.83.3, `comp/dogstatsd/server/impl/enrich.go`, `extractTagsMetadata` and
+//! `enrichEvent`), on a metric line, an event, or a service check alike:
+//!
+//! - **A valued `host:` tag is the host, not a tag.** The Agent consumes every one, so none is an
+//!   attribute, and the last one wins. A bare `host` token has no `:` and stays an ordinary
+//!   `Bool(true)` tag, as the Agent keeps it.
+//! - **An event's or service check's non-empty `h:` field outranks the tag**; an empty `h:` is no
+//!   host, and the tag applies.
+//! - **A non-empty host is `host.name`**, a zero-copy datagram slice, on the event.
+//! - **An empty `host:` tag is the hostless mark**, `_logit.datadog.hostless: Bool(true)`: the
+//!   Agent leaves such a sample hostless rather than stamping its own hostname, and `datadog_out`
+//!   and `statsd_out` keep it so.
+//! - **A `host.name` tag beside a line's own host is omitted**, counted
+//!   `logit.input.tags.omitted{reason="reserved_key"}` once per wire tag: it would collide with
+//!   the standard key the line's host fills. On a line with no `host:` tag and no non-empty `h:`,
+//!   a `host.name` tag is an ordinary tag, and the sinks read it as the host.
+//!
 //! ## DogStatsD events and service checks
 //!
 //! Two more line shapes, picked out by their leading sigil before the grammar above applies: `_e{`
@@ -141,11 +162,11 @@
 //!   interner without bound.
 //! - Attributes (all `Value::Str`, zero-copy where possible): `_logit.statsd.event.title` (always),
 //!   `_logit.statsd.event.priority` (`p:`, raw), `_logit.statsd.event.alert_type` (`t:`, raw),
-//!   `_logit.statsd.event.aggregation_key` (`k:`), `_logit.statsd.event.source_type` (`s:`),
-//!   `_logit.statsd.event.host` (`h:`), each only if present, plus `_logit.statsd.timestamp`,
-//!   `_logit.statsd.container_id`, `_logit.statsd.external_data`, `_logit.statsd.cardinality` and
-//!   `#tags` as on a metric line. `d:<secs>` plays `|T`'s role (same checked parse, same event
-//!   timestamp, carrier, and flag); `|T` itself is an unrecognized field here and is ignored.
+//!   `_logit.statsd.event.aggregation_key` (`k:`), `_logit.statsd.event.source_type` (`s:`), each
+//!   only if present, plus `_logit.statsd.container_id`, `_logit.statsd.external_data`,
+//!   `_logit.statsd.cardinality` and `#tags` as on a metric line. `h:` is the host ("The host").
+//!   `d:<secs>` plays `|T`'s role (same checked parse, same event timestamp and flag); `|T` itself
+//!   is an unrecognized field here and is ignored.
 //!
 //! **Service check**: `_sc|<NAME>|<STATUS>|d:<secs>|h:<hostname>|#<tags>|c:<container_id>|
 //! e:<external_data>|card:<cardinality>|m:<message>`. `NAME` must be non-empty and `STATUS` an
@@ -157,9 +178,9 @@
 //! as f64)` under the check's name (interned, like a metric name), with attributes
 //! `_logit.statsd.service_check.name` (always, `Value::Str`: `MetricRecord` has nowhere else to
 //! carry it), `_logit.statsd.service_check.status` (always, `Value::U64`),
-//! `_logit.statsd.service_check.message` (`m:`, verbatim) and `_logit.statsd.service_check.host`
-//! (`h:`), plus `_logit.statsd.timestamp` and its flag, `_logit.statsd.container_id`,
-//! `_logit.statsd.external_data`, `_logit.statsd.cardinality` and `#tags` as above.
+//! `_logit.statsd.service_check.message` (`m:`, verbatim), plus the `d:` timestamp and its flag,
+//! `_logit.statsd.container_id`, `_logit.statsd.external_data`, `_logit.statsd.cardinality` and
+//! `#tags` as above. `h:` is the host ("The host").
 //!
 //! **Tag values, `|c:<id>`, and set members are zero-copy slices of the datagram**, like every
 //! field `syslog_in`'s decoder extracts: [`logit_core::subslice::share`] rebuilds each `Bytes` as a

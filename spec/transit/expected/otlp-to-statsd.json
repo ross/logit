@@ -1,48 +1,48 @@
 {
   "attributes": {"events": [
-    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"build.info","kind":"gauge","value":1.0}],"attributes":{"debug":"false","host":"web-1","regions":["us-east","2"],"service.name":"checkout","shard":"12","version":"2.4.1","weight":"0.75"}}
+    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"build.info","kind":"gauge","value":1.0}],"attributes":{"debug":"false","host.name":"web-1","regions":["us-east","2"],"service.name":"checkout","shard":"12","version":"2.4.1","weight":"0.75"}}
   ], "counters": {
     "logit.output.tags.omitted{component=out,kind=statsd_out,reason=unrepresentable,role=sink}": 2
   }},
   "exemplars": {"events": [
-    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"cart.value","kind":"gauge","value":42.5}],"attributes":{"host":"web-1","service.name":"checkout"}},
-    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"orders.placed","kind":"gauge","value":118.0}],"attributes":{"host":"web-1","service.name":"checkout"}}
+    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"cart.value","kind":"gauge","value":42.5}],"attributes":{"host.name":"web-1","service.name":"checkout"}},
+    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"orders.placed","kind":"gauge","value":118.0}],"attributes":{"host.name":"web-1","service.name":"checkout"}}
   ], "counters": {
     "logit.output.metrics.degraded{component=out,kind=statsd_out,metric_kind=cumulative_sum,role=sink}": 1
   }},
   "exemplars-unwritten": {"events": [
-    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"orders.shipped","kind":"gauge","value":64.0}],"attributes":{"host":"web-1","service.name":"checkout"}},
-    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"queue.wait.bucket_10","kind":"gauge","value":3.0}],"attributes":{"host":"web-1","service.name":"checkout"}},
-    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"queue.wait.bucket_inf","kind":"gauge","value":4.0}],"attributes":{"host":"web-1","service.name":"checkout"}},
-    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"queue.wait.count","kind":"gauge","value":7.0}],"attributes":{"host":"web-1","service.name":"checkout"}},
-    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"queue.wait.sum","kind":"gauge","value":140.0}],"attributes":{"host":"web-1","service.name":"checkout"}}
+    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"orders.shipped","kind":"gauge","value":64.0}],"attributes":{"host.name":"web-1","service.name":"checkout"}},
+    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"queue.wait.bucket_10","kind":"gauge","value":3.0}],"attributes":{"host.name":"web-1","service.name":"checkout"}},
+    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"queue.wait.bucket_inf","kind":"gauge","value":4.0}],"attributes":{"host.name":"web-1","service.name":"checkout"}},
+    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"queue.wait.count","kind":"gauge","value":7.0}],"attributes":{"host.name":"web-1","service.name":"checkout"}},
+    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"queue.wait.sum","kind":"gauge","value":140.0}],"attributes":{"host.name":"web-1","service.name":"checkout"}}
   ], "counters": {
     "logit.output.metrics.degraded{component=out,kind=statsd_out,metric_kind=cumulative_sum,role=sink}": 1,
     "logit.output.metrics.degraded{component=out,kind=statsd_out,metric_kind=histogram,role=sink}": 1
   }},
   "exponential-histograms": {"events": [
-    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"messaging.payload.size.count","kind":"gauge","value":5.0}],"attributes":{"host":"web-1","messaging.system":"kafka","service.name":"checkout"}},
-    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"messaging.payload.size.sum","kind":"gauge","value":40.0}],"attributes":{"host":"web-1","messaging.system":"kafka","service.name":"checkout"}},
-    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"messaging.payload.size.zero_count","kind":"gauge","value":0.0}],"attributes":{"host":"web-1","messaging.system":"kafka","service.name":"checkout"}},
-    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"rpc.server.duration.count","kind":"sum","value":6.0,"temporality":"delta","monotonic":true}],"attributes":{"host":"web-1","rpc.method":"GetCart","service.name":"checkout"}},
-    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"rpc.server.duration.max","kind":"gauge","value":3.4}],"attributes":{"host":"web-1","rpc.method":"GetCart","service.name":"checkout"}},
-    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"rpc.server.duration.min","kind":"gauge","value":0.0}],"attributes":{"host":"web-1","rpc.method":"GetCart","service.name":"checkout"}},
-    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"rpc.server.duration.min","kind":"gauge_delta","delta":-1.6}],"attributes":{"host":"web-1","rpc.method":"GetCart","service.name":"checkout"}},
-    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"rpc.server.duration.sum","kind":"sum","value":12.3,"temporality":"delta","monotonic":true}],"attributes":{"host":"web-1","rpc.method":"GetCart","service.name":"checkout"}},
-    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"rpc.server.duration.zero_count","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"host":"web-1","rpc.method":"GetCart","service.name":"checkout"}}
+    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"messaging.payload.size.count","kind":"gauge","value":5.0}],"attributes":{"host.name":"web-1","messaging.system":"kafka","service.name":"checkout"}},
+    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"messaging.payload.size.sum","kind":"gauge","value":40.0}],"attributes":{"host.name":"web-1","messaging.system":"kafka","service.name":"checkout"}},
+    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"messaging.payload.size.zero_count","kind":"gauge","value":0.0}],"attributes":{"host.name":"web-1","messaging.system":"kafka","service.name":"checkout"}},
+    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"rpc.server.duration.count","kind":"sum","value":6.0,"temporality":"delta","monotonic":true}],"attributes":{"host.name":"web-1","rpc.method":"GetCart","service.name":"checkout"}},
+    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"rpc.server.duration.max","kind":"gauge","value":3.4}],"attributes":{"host.name":"web-1","rpc.method":"GetCart","service.name":"checkout"}},
+    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"rpc.server.duration.min","kind":"gauge","value":0.0}],"attributes":{"host.name":"web-1","rpc.method":"GetCart","service.name":"checkout"}},
+    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"rpc.server.duration.min","kind":"gauge_delta","delta":-1.6}],"attributes":{"host.name":"web-1","rpc.method":"GetCart","service.name":"checkout"}},
+    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"rpc.server.duration.sum","kind":"sum","value":12.3,"temporality":"delta","monotonic":true}],"attributes":{"host.name":"web-1","rpc.method":"GetCart","service.name":"checkout"}},
+    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"rpc.server.duration.zero_count","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"host.name":"web-1","rpc.method":"GetCart","service.name":"checkout"}}
   ], "counters": {
     "logit.output.metrics.degraded{component=out,kind=statsd_out,metric_kind=exponential_histogram,role=sink}": 2
   }},
   "gauges": {"events": [
-    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"jvm.thread.count","kind":"gauge","value":42.0}],"attributes":{"host":"web-1","service.name":"checkout"}},
-    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"room.temperature.offset","kind":"gauge","value":0.0}],"attributes":{"host":"web-1","room":"lab","service.name":"checkout"}},
-    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"room.temperature.offset","kind":"gauge_delta","delta":-4.5}],"attributes":{"host":"web-1","room":"lab","service.name":"checkout"}},
-    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"system.memory.utilization","kind":"gauge","value":0.625}],"attributes":{"host":"web-1","service.name":"checkout","state":"used"}}
+    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"jvm.thread.count","kind":"gauge","value":42.0}],"attributes":{"host.name":"web-1","service.name":"checkout"}},
+    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"room.temperature.offset","kind":"gauge","value":0.0}],"attributes":{"host.name":"web-1","room":"lab","service.name":"checkout"}},
+    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"room.temperature.offset","kind":"gauge_delta","delta":-4.5}],"attributes":{"host.name":"web-1","room":"lab","service.name":"checkout"}},
+    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"system.memory.utilization","kind":"gauge","value":0.625}],"attributes":{"host.name":"web-1","service.name":"checkout","state":"used"}}
   ], "counters": {
     "logit.output.metrics.degraded{component=out,kind=statsd_out,reason=negative_gauge,role=sink}": 1
   }},
   "gzip": {"events": [
-    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"uploads.completed","kind":"sum","value":5.0,"temporality":"delta","monotonic":true}],"attributes":{"host":"web-1","service.name":"checkout"}}
+    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"uploads.completed","kind":"sum","value":5.0,"temporality":"delta","monotonic":true}],"attributes":{"host.name":"web-1","service.name":"checkout"}}
   ], "counters": {}},
   "histogram-count": {"events": [
     {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"queue.wait.bucket_1","kind":"gauge","value":3.0}],"attributes":{"queue.name":"orders","service.name":"checkout"}},
@@ -56,38 +56,38 @@
     "logit.output.metrics.degraded{component=out,kind=statsd_out,metric_kind=histogram,role=sink}": 2
   }},
   "histogram-neg-inf-bound": {"events": [
-    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"http.server.duration.bucket_-inf","kind":"gauge","value":8.0}],"attributes":{"host":"web-1","http.route":"/cart","service.name":"checkout"}},
-    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"http.server.duration.bucket_1","kind":"gauge","value":1.0}],"attributes":{"host":"web-1","http.route":"/cart","service.name":"checkout"}},
-    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"http.server.duration.bucket_5","kind":"gauge","value":2.0}],"attributes":{"host":"web-1","http.route":"/cart","service.name":"checkout"}},
-    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"http.server.duration.bucket_inf","kind":"gauge","value":16.0}],"attributes":{"host":"web-1","http.route":"/cart","service.name":"checkout"}},
-    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"http.server.duration.count","kind":"gauge","value":27.0}],"attributes":{"host":"web-1","http.route":"/cart","service.name":"checkout"}}
+    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"http.server.duration.bucket_-inf","kind":"gauge","value":8.0}],"attributes":{"host.name":"web-1","http.route":"/cart","service.name":"checkout"}},
+    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"http.server.duration.bucket_1","kind":"gauge","value":1.0}],"attributes":{"host.name":"web-1","http.route":"/cart","service.name":"checkout"}},
+    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"http.server.duration.bucket_5","kind":"gauge","value":2.0}],"attributes":{"host.name":"web-1","http.route":"/cart","service.name":"checkout"}},
+    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"http.server.duration.bucket_inf","kind":"gauge","value":16.0}],"attributes":{"host.name":"web-1","http.route":"/cart","service.name":"checkout"}},
+    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"http.server.duration.count","kind":"gauge","value":27.0}],"attributes":{"host.name":"web-1","http.route":"/cart","service.name":"checkout"}}
   ], "counters": {
     "logit.output.metrics.degraded{component=out,kind=statsd_out,metric_kind=histogram,role=sink}": 1
   }},
   "histogram-non-finite-bounds": {"events": [
-    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"http.server.duration.bucket_-inf","kind":"gauge","value":8.0}],"attributes":{"host":"web-1","http.route":"/cart","service.name":"checkout"}},
-    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"http.server.duration.bucket_1","kind":"gauge","value":1.0}],"attributes":{"host":"web-1","http.route":"/cart","service.name":"checkout"}},
-    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"http.server.duration.bucket_5","kind":"gauge","value":2.0}],"attributes":{"host":"web-1","http.route":"/cart","service.name":"checkout"}},
-    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"http.server.duration.bucket_NaN","kind":"gauge","value":4.0}],"attributes":{"host":"web-1","http.route":"/cart","service.name":"checkout"}},
-    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"http.server.duration.bucket_inf","kind":"gauge","value":16.0}],"attributes":{"host":"web-1","http.route":"/cart","service.name":"checkout"}},
-    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"http.server.duration.count","kind":"gauge","value":31.0}],"attributes":{"host":"web-1","http.route":"/cart","service.name":"checkout"}}
+    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"http.server.duration.bucket_-inf","kind":"gauge","value":8.0}],"attributes":{"host.name":"web-1","http.route":"/cart","service.name":"checkout"}},
+    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"http.server.duration.bucket_1","kind":"gauge","value":1.0}],"attributes":{"host.name":"web-1","http.route":"/cart","service.name":"checkout"}},
+    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"http.server.duration.bucket_5","kind":"gauge","value":2.0}],"attributes":{"host.name":"web-1","http.route":"/cart","service.name":"checkout"}},
+    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"http.server.duration.bucket_NaN","kind":"gauge","value":4.0}],"attributes":{"host.name":"web-1","http.route":"/cart","service.name":"checkout"}},
+    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"http.server.duration.bucket_inf","kind":"gauge","value":16.0}],"attributes":{"host.name":"web-1","http.route":"/cart","service.name":"checkout"}},
+    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"http.server.duration.count","kind":"gauge","value":31.0}],"attributes":{"host.name":"web-1","http.route":"/cart","service.name":"checkout"}}
   ], "counters": {
     "logit.output.metrics.degraded{component=out,kind=statsd_out,metric_kind=histogram,role=sink}": 1
   }},
   "histograms": {"events": [
-    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"db.client.operation.duration.bucket_10","kind":"gauge","value":4.0}],"attributes":{"db.system":"postgresql","host":"web-1","service.name":"checkout"}},
-    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"db.client.operation.duration.bucket_100","kind":"gauge","value":5.0}],"attributes":{"db.system":"postgresql","host":"web-1","service.name":"checkout"}},
-    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"db.client.operation.duration.bucket_inf","kind":"gauge","value":1.0}],"attributes":{"db.system":"postgresql","host":"web-1","service.name":"checkout"}},
-    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"db.client.operation.duration.count","kind":"gauge","value":10.0}],"attributes":{"db.system":"postgresql","host":"web-1","service.name":"checkout"}},
-    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"db.client.operation.duration.sum","kind":"gauge","value":420.0}],"attributes":{"db.system":"postgresql","host":"web-1","service.name":"checkout"}},
-    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"http.server.request.duration.bucket_0_1","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"host":"web-1","http.route":"/cart","service.name":"checkout"}},
-    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"http.server.request.duration.bucket_0_25","kind":"sum","value":2.0,"temporality":"delta","monotonic":true}],"attributes":{"host":"web-1","http.route":"/cart","service.name":"checkout"}},
-    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"http.server.request.duration.bucket_0_5","kind":"sum","value":2.0,"temporality":"delta","monotonic":true}],"attributes":{"host":"web-1","http.route":"/cart","service.name":"checkout"}},
-    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"http.server.request.duration.bucket_inf","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"host":"web-1","http.route":"/cart","service.name":"checkout"}},
-    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"http.server.request.duration.count","kind":"sum","value":6.0,"temporality":"delta","monotonic":true}],"attributes":{"host":"web-1","http.route":"/cart","service.name":"checkout"}},
-    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"http.server.request.duration.max","kind":"gauge","value":0.9}],"attributes":{"host":"web-1","http.route":"/cart","service.name":"checkout"}},
-    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"http.server.request.duration.min","kind":"gauge","value":0.05}],"attributes":{"host":"web-1","http.route":"/cart","service.name":"checkout"}},
-    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"http.server.request.duration.sum","kind":"sum","value":1.9,"temporality":"delta","monotonic":true}],"attributes":{"host":"web-1","http.route":"/cart","service.name":"checkout"}}
+    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"db.client.operation.duration.bucket_10","kind":"gauge","value":4.0}],"attributes":{"db.system":"postgresql","host.name":"web-1","service.name":"checkout"}},
+    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"db.client.operation.duration.bucket_100","kind":"gauge","value":5.0}],"attributes":{"db.system":"postgresql","host.name":"web-1","service.name":"checkout"}},
+    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"db.client.operation.duration.bucket_inf","kind":"gauge","value":1.0}],"attributes":{"db.system":"postgresql","host.name":"web-1","service.name":"checkout"}},
+    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"db.client.operation.duration.count","kind":"gauge","value":10.0}],"attributes":{"db.system":"postgresql","host.name":"web-1","service.name":"checkout"}},
+    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"db.client.operation.duration.sum","kind":"gauge","value":420.0}],"attributes":{"db.system":"postgresql","host.name":"web-1","service.name":"checkout"}},
+    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"http.server.request.duration.bucket_0_1","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"host.name":"web-1","http.route":"/cart","service.name":"checkout"}},
+    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"http.server.request.duration.bucket_0_25","kind":"sum","value":2.0,"temporality":"delta","monotonic":true}],"attributes":{"host.name":"web-1","http.route":"/cart","service.name":"checkout"}},
+    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"http.server.request.duration.bucket_0_5","kind":"sum","value":2.0,"temporality":"delta","monotonic":true}],"attributes":{"host.name":"web-1","http.route":"/cart","service.name":"checkout"}},
+    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"http.server.request.duration.bucket_inf","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"host.name":"web-1","http.route":"/cart","service.name":"checkout"}},
+    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"http.server.request.duration.count","kind":"sum","value":6.0,"temporality":"delta","monotonic":true}],"attributes":{"host.name":"web-1","http.route":"/cart","service.name":"checkout"}},
+    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"http.server.request.duration.max","kind":"gauge","value":0.9}],"attributes":{"host.name":"web-1","http.route":"/cart","service.name":"checkout"}},
+    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"http.server.request.duration.min","kind":"gauge","value":0.05}],"attributes":{"host.name":"web-1","http.route":"/cart","service.name":"checkout"}},
+    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"http.server.request.duration.sum","kind":"sum","value":1.9,"temporality":"delta","monotonic":true}],"attributes":{"host.name":"web-1","http.route":"/cart","service.name":"checkout"}}
   ], "counters": {
     "logit.output.metrics.degraded{component=out,kind=statsd_out,metric_kind=histogram,role=sink}": 2
   }},
@@ -104,31 +104,31 @@
     {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"payments.pending","kind":"gauge","value":4.0}],"attributes":{"service.instance.id":"3","service.name":"billing"}}
   ], "counters": {}},
   "summary": {"events": [
-    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"rpc.client.duration.count","kind":"gauge","value":100.0}],"attributes":{"host":"web-1","rpc.service":"inventory","service.name":"checkout"}},
-    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"rpc.client.duration.q0","kind":"gauge","value":0.01}],"attributes":{"host":"web-1","rpc.service":"inventory","service.name":"checkout"}},
-    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"rpc.client.duration.q0_5","kind":"gauge","value":0.2}],"attributes":{"host":"web-1","rpc.service":"inventory","service.name":"checkout"}},
-    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"rpc.client.duration.q0_99","kind":"gauge","value":1.2}],"attributes":{"host":"web-1","rpc.service":"inventory","service.name":"checkout"}},
-    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"rpc.client.duration.q1","kind":"gauge","value":2.5}],"attributes":{"host":"web-1","rpc.service":"inventory","service.name":"checkout"}},
-    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"rpc.client.duration.sum","kind":"gauge","value":25.5}],"attributes":{"host":"web-1","rpc.service":"inventory","service.name":"checkout"}}
+    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"rpc.client.duration.count","kind":"gauge","value":100.0}],"attributes":{"host.name":"web-1","rpc.service":"inventory","service.name":"checkout"}},
+    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"rpc.client.duration.q0","kind":"gauge","value":0.01}],"attributes":{"host.name":"web-1","rpc.service":"inventory","service.name":"checkout"}},
+    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"rpc.client.duration.q0_5","kind":"gauge","value":0.2}],"attributes":{"host.name":"web-1","rpc.service":"inventory","service.name":"checkout"}},
+    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"rpc.client.duration.q0_99","kind":"gauge","value":1.2}],"attributes":{"host.name":"web-1","rpc.service":"inventory","service.name":"checkout"}},
+    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"rpc.client.duration.q1","kind":"gauge","value":2.5}],"attributes":{"host.name":"web-1","rpc.service":"inventory","service.name":"checkout"}},
+    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"rpc.client.duration.sum","kind":"gauge","value":25.5}],"attributes":{"host.name":"web-1","rpc.service":"inventory","service.name":"checkout"}}
   ], "counters": {
     "logit.output.metrics.degraded{component=out,kind=statsd_out,metric_kind=summary,role=sink}": 1
   }},
   "sums": {"events": [
-    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"db.client.connections.usage","kind":"gauge","value":7.0}],"attributes":{"host":"web-1","pool.name":"primary","service.name":"checkout"}},
-    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"http.server.requests","kind":"sum","value":12.5,"temporality":"delta","monotonic":true}],"attributes":{"host":"web-1","http.route":"/cart","service.name":"checkout"}},
-    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"process.cpu.time","kind":"gauge","value":81.25}],"attributes":{"cpu.mode":"user","host":"web-1","service.name":"checkout"}},
-    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"process.cpu.time","kind":"gauge","value":9.75}],"attributes":{"cpu.mode":"system","host":"web-1","service.name":"checkout"}},
-    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"queue.depth.change","kind":"sum","value":-3.0,"temporality":"delta","monotonic":true}],"attributes":{"host":"web-1","queue":"orders","service.name":"checkout"}}
+    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"db.client.connections.usage","kind":"gauge","value":7.0}],"attributes":{"host.name":"web-1","pool.name":"primary","service.name":"checkout"}},
+    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"http.server.requests","kind":"sum","value":12.5,"temporality":"delta","monotonic":true}],"attributes":{"host.name":"web-1","http.route":"/cart","service.name":"checkout"}},
+    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"process.cpu.time","kind":"gauge","value":81.25}],"attributes":{"cpu.mode":"user","host.name":"web-1","service.name":"checkout"}},
+    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"process.cpu.time","kind":"gauge","value":9.75}],"attributes":{"cpu.mode":"system","host.name":"web-1","service.name":"checkout"}},
+    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"queue.depth.change","kind":"sum","value":-3.0,"temporality":"delta","monotonic":true}],"attributes":{"host.name":"web-1","queue":"orders","service.name":"checkout"}}
   ], "counters": {
     "logit.output.metrics.degraded{component=out,kind=statsd_out,metric_kind=cumulative_sum,role=sink}": 3,
     "logit.output.metrics.degraded{component=out,kind=statsd_out,metric_kind=non_monotonic_delta_sum,role=sink}": 1
   }},
   "sums-protobuf": {"events": [
-    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"db.client.connections.usage","kind":"gauge","value":7.0}],"attributes":{"host":"web-1","pool.name":"primary","service.name":"checkout"}},
-    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"http.server.requests","kind":"sum","value":12.5,"temporality":"delta","monotonic":true}],"attributes":{"host":"web-1","http.route":"/cart","service.name":"checkout"}},
-    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"process.cpu.time","kind":"gauge","value":81.25}],"attributes":{"cpu.mode":"user","host":"web-1","service.name":"checkout"}},
-    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"process.cpu.time","kind":"gauge","value":9.75}],"attributes":{"cpu.mode":"system","host":"web-1","service.name":"checkout"}},
-    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"queue.depth.change","kind":"sum","value":-3.0,"temporality":"delta","monotonic":true}],"attributes":{"host":"web-1","queue":"orders","service.name":"checkout"}}
+    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"db.client.connections.usage","kind":"gauge","value":7.0}],"attributes":{"host.name":"web-1","pool.name":"primary","service.name":"checkout"}},
+    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"http.server.requests","kind":"sum","value":12.5,"temporality":"delta","monotonic":true}],"attributes":{"host.name":"web-1","http.route":"/cart","service.name":"checkout"}},
+    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"process.cpu.time","kind":"gauge","value":81.25}],"attributes":{"cpu.mode":"user","host.name":"web-1","service.name":"checkout"}},
+    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"process.cpu.time","kind":"gauge","value":9.75}],"attributes":{"cpu.mode":"system","host.name":"web-1","service.name":"checkout"}},
+    {"timestamp":"2027-01-15T07:59:51.000000000Z","metrics":[{"name":"queue.depth.change","kind":"sum","value":-3.0,"temporality":"delta","monotonic":true}],"attributes":{"host.name":"web-1","queue":"orders","service.name":"checkout"}}
   ], "counters": {
     "logit.output.metrics.degraded{component=out,kind=statsd_out,metric_kind=cumulative_sum,role=sink}": 3,
     "logit.output.metrics.degraded{component=out,kind=statsd_out,metric_kind=non_monotonic_delta_sum,role=sink}": 1

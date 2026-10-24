@@ -92,7 +92,7 @@ function process(event)
   if log == nil or event.attributes["syslog.tag"] ~= "buddy" then
     return event
   end
-  local mac = event.attributes["syslog.hostname"]
+  local mac = event.attributes["host.name"]
   local message = log.message
   if type(mac) ~= "string" or type(message) ~= "string" then
     return event
@@ -174,10 +174,10 @@ function process(event)
     return nil
   end
 
-  -- Every `syslog.*` attribute would become an InfluxDB tag on every point, so remove them and
-  -- tag the points with the printer instead.
+  -- Every `syslog.*` attribute, and the MAC address in `host.name`, would become an InfluxDB tag
+  -- on every point, so remove them and tag the points with the printer instead.
   for key in pairs(event.attributes) do
-    if string.sub(key, 1, 7) == "syslog." then
+    if string.sub(key, 1, 7) == "syslog." or key == "host.name" then
       event.attributes[key] = nil
     end
   end

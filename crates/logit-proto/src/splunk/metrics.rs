@@ -276,7 +276,8 @@ impl SplunkEncoder {
         event_index: usize,
         out: &mut MessageBuf<ObjectMeta>,
     ) {
-        let mut dims = SplunkEncoder::object_fields(ctx.resource, event);
+        let host = ctx.host(event);
+        let mut dims = SplunkEncoder::object_fields(ctx.resource, event, host);
         let reserved: Vec<Symbol> = dims
             .iter()
             .map(|(key, _)| key)
@@ -354,7 +355,7 @@ impl SplunkEncoder {
                 fields.insert(dim, Value::str(value.as_str()));
             }
             self.scratch.clear();
-            let mut obj = begin_object(&mut self.scratch, event.timestamp, ctx);
+            let mut obj = begin_object(&mut self.scratch, event.timestamp, ctx, host);
             write_str(obj.key("event"), METRIC_EVENT);
             let mut key = String::new();
             write_fields(&mut obj, &fields, |inner| {

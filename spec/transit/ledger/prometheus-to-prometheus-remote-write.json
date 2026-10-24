@@ -1,7 +1,7 @@
 {
   "cells": [
     {"sink":"prometheus_out","row":"attributes/bytes_value","cell":0,"observed":["lost"]},
-    {"sink":"prometheus_out","row":"attributes/foreign_carrier","cell":0,"observed":["lost"]},
+    {"sink":"prometheus_out","row":"attributes/family_type","cell":0,"observed":["exact"]},
     {"sink":"prometheus_out","row":"attributes/map_value","cell":0,"observed":["lost"]},
     {"sink":"prometheus_out","row":"attributes/no_host","cell":0,"observed":["exact"]},
     {"sink":"prometheus_out","row":"attributes/number_value","cell":0,"observed":["normalized"]},
@@ -11,6 +11,7 @@
     {"sink":"prometheus_out","row":"attributes/scope","cell":0,"observed":["lost"]},
     {"sink":"prometheus_out","row":"attributes/string_value","cell":0,"observed":["exact"]},
     {"sink":"prometheus_out","row":"attributes/timestamp_value","cell":0,"observed":["lost"]},
+    {"sink":"prometheus_out","row":"attributes/timestamped","cell":0,"observed":["lost"]},
     {"sink":"prometheus_out","row":"gauge/f64","cell":0,"observed":["exact"]},
     {"sink":"prometheus_out","row":"gauge/negative","cell":0,"observed":["exact"]},
     {"sink":"prometheus_out","row":"gauge/prometheus_info","cell":0,"observed":["exact"]},

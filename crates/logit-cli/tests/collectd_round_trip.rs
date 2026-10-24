@@ -112,7 +112,7 @@ use logit_outputs::collectd::CollectdOutput;
 use logit_pipeline::test_util::{recv_batch, Totals, RECV_TIMEOUT};
 use logit_pipeline::{Delivered, Fanout, Input, Output};
 use logit_proto::collectd::{
-    CollectdDecoder, CollectdEncoder, ATTR_HOST, ATTR_PLUGIN, ATTR_PLUGIN_INSTANCE, ATTR_TYPE,
+    CollectdDecoder, CollectdEncoder, ATTR_HOST_NAME, ATTR_PLUGIN, ATTR_PLUGIN_INSTANCE, ATTR_TYPE,
     ATTR_TYPE_INSTANCE, DEFAULT_MAX_PACKET_BYTES,
 };
 use logit_proto::Decoder;
@@ -1319,7 +1319,7 @@ async fn a_statsd_counter_relays_as_one_absolute_list() {
 
     assert_eq!(decoded.events.len(), 1, "one record, one single-data-source value list");
     let event = &decoded.events[0];
-    assert_eq!(attr(event, ATTR_HOST), Some(Value::from("relay-host")));
+    assert_eq!(attr(event, ATTR_HOST_NAME), Some(Value::from("relay-host")));
     assert_eq!(attr(event, ATTR_PLUGIN), Some(Value::from("hits")));
     assert_eq!(attr(event, ATTR_TYPE), Some(Value::from("absolute")));
     assert_eq!(attr(event, ATTR_PLUGIN_INSTANCE), None);
@@ -1481,7 +1481,7 @@ async fn collectd_in_aggregate_collectd_out_relay_is_exact_for_cumulative_sums()
 }
 
 /// `collectd_in -> prometheus_out`: the private `_logit.collectd.*` carriers (plugin, type,
-/// interval) never become labels, while the public `collectd.host` and `collectd.type_instance`
+/// interval) never become labels, while the public `host.name` and `collectd.type_instance`
 /// do, since no other part of the series carries them.
 #[test]
 fn a_value_list_relayed_to_prometheus_labels_only_public_collectd_identity() {
@@ -1503,7 +1503,7 @@ fn a_value_list_relayed_to_prometheus_labels_only_public_collectd_identity() {
     assert!(!labels.contains(&"collectd_plugin"), "a private carrier became a label: {labels:?}");
     assert_eq!(
         labels,
-        vec!["collectd_host", "collectd_type_instance"],
+        vec!["collectd_type_instance", "host_name"],
         "the public identity fields, and nothing else, are labels"
     );
 

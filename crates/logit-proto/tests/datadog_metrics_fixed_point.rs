@@ -402,11 +402,11 @@ fn dogsketch_with_negative_zero_positive_and_large_counts() {
 }
 
 #[test]
-fn a_datadog_type_tag_never_rewrites_a_gauge_or_count() {
-    // A tag spelled like the type carrier is under the private prefix, so the decoder omits it: a
-    // GAUGE or COUNT tagged `_logit.datadog.type:rate` (or `:unspecified`) relays as itself, and
-    // the tag is gone.
-    for tag in ["_logit.datadog.type:rate", "_logit.datadog.type:unspecified"] {
+fn a_type_tag_never_rewrites_a_gauge_or_count() {
+    // A tag spelled like the rate flag or the type carrier is under the private prefix, so the
+    // decoder omits it: a GAUGE or COUNT tagged `_logit.metrics.type:rate` (or
+    // `_logit.datadog.type:unspecified`) relays as itself, and the tag is gone.
+    for tag in ["_logit.metrics.type:rate", "_logit.datadog.type:unspecified"] {
         for (proto_type, v1_type) in [(3, "gauge"), (1, "count")] {
             let tags = vec![tag.to_string(), "env:prod".to_string()];
             let protobuf = MetricPayload {
@@ -424,11 +424,9 @@ fn a_datadog_type_tag_never_rewrites_a_gauge_or_count() {
             ]}));
             for (route, body) in [(Route::V2Protobuf, protobuf), (Route::V1, v1)] {
                 let events = assert_fixed_point(route, &body);
-                assert_eq!(
-                    events[0].attributes.get("_logit.datadog.type"),
-                    None,
-                    "{route:?} {tag}"
-                );
+                for key in ["_logit.metrics.type", "_logit.datadog.type"] {
+                    assert_eq!(events[0].attributes.get(key), None, "{route:?} {tag}");
+                }
                 let out = encode(route, &decode(route, &body)).unwrap();
                 let (wire_type, wire_tags) = match route {
                     Route::V2Protobuf => {

@@ -7,7 +7,7 @@
 
 use super::part::{self, DsValue};
 use super::{
-    nanos_to_cdtime, ATTR_HOST, ATTR_PLUGIN_INSTANCE, ATTR_PREFIX, ATTR_SEVERITY,
+    nanos_to_cdtime, ATTR_HOST_NAME, ATTR_PLUGIN_INSTANCE, ATTR_PREFIX, ATTR_SEVERITY,
     ATTR_TYPE_INSTANCE, CDTIME_ONE_SECOND, DATA_MAX_NAME_LEN, MAX_VALUES_PER_LIST,
     NOTIF_MAX_MSG_LEN,
 };
@@ -54,8 +54,7 @@ pub struct EncodeStats {
     /// Counted once per value **list** the event would have produced (1 for like-relay, one per
     /// record for fallback), so it means what every other sink's `metrics.dropped` means.
     pub dropped_unencodable_timestamp: usize,
-    /// An event with no `collectd.host`, no `host.name`, and no
-    /// [`CollectdEncoder::with_hostname`]. Counted per value list, like
+    /// An event with no `host.name` and no [`CollectdEncoder::with_hostname`]. Counted per value list, like
     /// [`Self::dropped_unencodable_timestamp`].
     pub dropped_no_host: usize,
     /// A like-relay event carrying more than [`MAX_VALUES_PER_LIST`] records. Counted once per
@@ -67,8 +66,7 @@ pub struct EncodeStats {
     /// datagrams (a split list would be dispatched against the wrong identity).
     pub dropped_oversize_list: usize,
     /// An attribute that is neither a collectd carrier nor under the private `_logit.` prefix
-    /// (collectd has no tags), once per attribute per event, including `host.name`, which host
-    /// resolution reads but can't carry as itself.
+    /// (collectd has no tags), once per attribute per event.
     pub tags_omitted_no_wire_form: usize,
     /// A collectd carrier with no wire form here: an identity field that isn't `Str`/`Bytes`, an
     /// interval that isn't a finite positive `F64`, a `_logit.collectd.severity` that isn't `U64`
@@ -222,8 +220,7 @@ impl CollectdEncoder {
         self
     }
 
-    /// The host written when neither `collectd.host` nor `host.name` is present
-    /// (`collectd_out`'s `hostname:`).
+    /// The host written when no `host.name` is present (`collectd_out`'s `hostname:`).
     ///
     /// **Operator-supplied, with no default.** The encoder neither reads the OS hostname
     /// (`docs/adr/process-hostname.md`) nor invents a placeholder: a receiver keys every series on
@@ -544,10 +541,9 @@ impl Ctx<'_> {
         );
         self.diag.warn_throttled(
             "no_host",
-            "collectd_out: no host to write -- the event carries neither `collectd.host` \
-             nor `host.name`, and this sink has no `hostname:` configured; dropping. Set \
-             `hostname:` on the sink, or stamp `host.name` with a `set` transform: collectd's \
-             receiver rejects an empty host, and inventing one would merge every unlabelled sender \
+            "collectd_out: no host to write -- the event carries no `host.name`, and this sink \
+             has no `hostname:` configured; dropping. Set `hostname:` on the sink, or stamp \
+             `host.name` with a `set` transform: collectd's receiver rejects an empty host, and inventing one would merge every unlabelled sender \
              into one host's metrics",
         );
     }
@@ -655,7 +651,7 @@ impl Ctx<'_> {
     }
 }
 
-/// The collectd carriers (plus `host.name`) read off one event's merged attributes.
+/// The collectd carriers and `host.name` read off one event's merged attributes.
 #[derive(Default, Clone, Copy)]
 struct Carriers<'a> {
     host: Option<&'a Value>,
@@ -665,8 +661,6 @@ struct Carriers<'a> {
     type_instance: Option<&'a Value>,
     /// In ticks; `0` means absent, collectd's "unspecified".
     interval_cdtime: u64,
-    /// The normalized host attribute, used only when `collectd.host` is absent.
-    host_name: Option<&'a Value>,
     /// Whether a [`super::ATTR_SEVERITY`] attribute was present in **any** `Value` type, which
     /// makes a `log`-only event an *attempted* notification.
     severity_present: bool,
@@ -684,7 +678,7 @@ fn collect_carriers<'a>(resource: &'a Resource, event: &'a Event, ctx: &mut Ctx)
         let key = logit_core::interner::resolve(key);
         // The three public identity fields, read by exact name.
         let public = match key {
-            ATTR_HOST => Some(&mut carriers.host),
+            ATTR_HOST_NAME => Some(&mut carriers.host),
             ATTR_PLUGIN_INSTANCE => Some(&mut carriers.plugin_instance),
             ATTR_TYPE_INSTANCE => Some(&mut carriers.type_instance),
             _ => None,
@@ -724,17 +718,13 @@ fn collect_carriers<'a>(resource: &'a Resource, event: &'a Event, ctx: &mut Ctx)
         if logit_core::attrs::is_private(key) {
             continue;
         }
-        if key == "host.name" && matches!(value, Value::Str(_) | Value::Bytes(_)) {
-            carriers.host_name = Some(value);
-        }
-        // Counted even for `host.name`: host resolution reads it, but it has no wire form itself.
         ctx.tag_omitted_no_wire_form();
     }
     carriers
 }
 
-/// This event's host: `collectd.host`, else `host.name`, else
-/// [`CollectdEncoder::with_hostname`], the first that sanitizes non-empty. `false` means none, and
+/// This event's host: `host.name`, else [`CollectdEncoder::with_hostname`], the first that
+/// sanitizes non-empty. `false` means none, and
 /// the event is dropped (counted `no_host`).
 fn resolve_host(
     out: &mut Vec<u8>,
@@ -743,12 +733,10 @@ fn resolve_host(
     lists: usize,
     ctx: &mut Ctx,
 ) -> bool {
-    for candidate in [carriers.host, carriers.host_name] {
-        if let Some((raw, is_utf8)) = candidate.and_then(text_of) {
-            sanitize_into(out, raw, is_utf8, ctx);
-            if !out.is_empty() {
-                return true;
-            }
+    if let Some((raw, is_utf8)) = carriers.host.and_then(text_of) {
+        sanitize_into(out, raw, is_utf8, ctx);
+        if !out.is_empty() {
+            return true;
         }
     }
     // Sanitized and non-empty since `with_hostname`.
@@ -1205,7 +1193,7 @@ mod tests {
     use super::*;
     use crate::collectd::decode::tests::{single_gauge_packet, PacketBuilder, GAUGE_1_5};
     use crate::collectd::{
-        CollectdDecoder, ATTR_HOST, ATTR_INTERVAL, ATTR_PLUGIN, ATTR_PLUGIN_INSTANCE,
+        CollectdDecoder, ATTR_HOST_NAME, ATTR_INTERVAL, ATTR_PLUGIN, ATTR_PLUGIN_INSTANCE,
         ATTR_SEVERITY, ATTR_TYPE, ATTR_TYPE_INSTANCE, DEFAULT_MAX_PACKET_BYTES,
     };
     use crate::Decoder;
@@ -1246,7 +1234,7 @@ mod tests {
         let mut event = Event::empty(
             TS,
             attrs(&[
-                (ATTR_HOST, Value::from("web-1")),
+                (ATTR_HOST_NAME, Value::from("web-1")),
                 (ATTR_PLUGIN, Value::from("load")),
                 (ATTR_TYPE, Value::from("load")),
                 (ATTR_INTERVAL, Value::F64(10.0)),
@@ -1366,7 +1354,7 @@ mod tests {
 
         let events = decode_all(&packets);
         assert_eq!(events.len(), 1);
-        assert_eq!(attr(&events[0], ATTR_HOST), Some(Value::from("web-1")));
+        assert_eq!(attr(&events[0], ATTR_HOST_NAME), Some(Value::from("web-1")));
         assert_eq!(attr(&events[0], ATTR_PLUGIN), Some(Value::from("load")));
         assert_eq!(attr(&events[0], ATTR_TYPE), Some(Value::from("load")));
         assert_eq!(attr(&events[0], ATTR_INTERVAL), Some(Value::F64(10.0)));
@@ -1465,7 +1453,7 @@ mod tests {
         let list_bytes = single.total_bytes();
 
         let mut second = one.clone();
-        second.attributes.insert(ATTR_HOST, Value::from("web-1"));
+        second.attributes.insert(ATTR_HOST_NAME, Value::from("web-1"));
         second.metrics[0] = record("load.load", MetricKind::gauge(0.75));
         let (packets, stats) = encode(&batch(vec![one, second]), list_bytes);
 
@@ -1914,26 +1902,23 @@ mod tests {
     }
 
     #[test]
-    fn the_host_falls_back_from_collectd_host_to_host_name_to_the_configured_hostname() {
-        // `collectd.host` wins.
-        let mut event = relay_event(vec![record("load.load", MetricKind::gauge(0.5))]);
-        event.attributes.insert("host.name", Value::from("ignored"));
-        let (packets, _) = encode(&batch(vec![event]), DEFAULT_MAX_PACKET_BYTES);
-        assert_eq!(attr(&decode_all(&packets)[0], ATTR_HOST), Some(Value::from("web-1")));
-
-        // `host.name` next.
-        let mut event = relay_event(vec![record("load.load", MetricKind::gauge(0.5))]);
-        event.attributes.remove(ATTR_HOST);
-        event.attributes.insert("host.name", Value::from("from-host-name"));
+    fn the_host_is_host_name_else_the_configured_hostname() {
+        // `host.name` is the Host part, and not an omitted tag.
+        let event = relay_event(vec![record("load.load", MetricKind::gauge(0.5))]);
         let (packets, stats) = encode(&batch(vec![event]), DEFAULT_MAX_PACKET_BYTES);
-        assert_eq!(attr(&decode_all(&packets)[0], ATTR_HOST), Some(Value::from("from-host-name")));
-        assert_eq!(stats.tags_omitted_no_wire_form, 1, "`host.name` is read but still dropped");
+        assert_eq!(attr(&decode_all(&packets)[0], ATTR_HOST_NAME), Some(Value::from("web-1")));
+        assert_eq!(stats.tags_omitted_no_wire_form, 0);
 
-        // Then the configured hostname.
+        // A `collectd.host` is an ordinary attribute: no wire form, and not the host.
         let mut event = relay_event(vec![record("load.load", MetricKind::gauge(0.5))]);
-        event.attributes.remove(ATTR_HOST);
-        let (packets, _) = encode(&batch(vec![event]), DEFAULT_MAX_PACKET_BYTES);
-        assert_eq!(attr(&decode_all(&packets)[0], ATTR_HOST), Some(Value::from("fixture-host")));
+        event.attributes.remove(ATTR_HOST_NAME);
+        event.attributes.insert("collectd.host", Value::from("ignored"));
+        let (packets, stats) = encode(&batch(vec![event]), DEFAULT_MAX_PACKET_BYTES);
+        assert_eq!(
+            attr(&decode_all(&packets)[0], ATTR_HOST_NAME),
+            Some(Value::from("fixture-host"))
+        );
+        assert_eq!(stats.tags_omitted_no_wire_form, 1);
     }
 
     /// A whole-event drop is counted per value **list** the event would have produced.
@@ -1958,7 +1943,7 @@ mod tests {
             ),
         ] {
             // No host anywhere and no configured hostname.
-            event.attributes.remove(ATTR_HOST);
+            event.attributes.remove(ATTR_HOST_NAME);
             let registry = Registry::new();
             let mut encoder = CollectdEncoder::new()
                 .with_max_packet_bytes(DEFAULT_MAX_PACKET_BYTES)
@@ -1975,7 +1960,7 @@ mod tests {
 
             // The same rule for the other whole-event drop.
             event.timestamp = 0;
-            event.attributes.insert(ATTR_HOST, Value::from("web-1"));
+            event.attributes.insert(ATTR_HOST_NAME, Value::from("web-1"));
             let (packets, stats, registry, _) =
                 encode_counted(&batch(vec![event]), DEFAULT_MAX_PACKET_BYTES);
             assert!(packets.is_empty(), "{label}");
@@ -2020,7 +2005,7 @@ mod tests {
     #[test]
     fn an_event_with_no_host_and_no_configured_hostname_is_dropped_and_counted() {
         let mut event = relay_event(vec![record("load.load", MetricKind::gauge(0.5))]);
-        event.attributes.remove(ATTR_HOST);
+        event.attributes.remove(ATTR_HOST_NAME);
 
         let registry = Registry::new();
         let diag_registry = Registry::new();
@@ -2044,7 +2029,7 @@ mod tests {
     fn an_empty_or_substituted_away_hostname_counts_as_unconfigured() {
         for hostname in ["", "\0"] {
             let mut event = relay_event(vec![record("load.load", MetricKind::gauge(0.5))]);
-            event.attributes.insert(ATTR_HOST, Value::from(""));
+            event.attributes.insert(ATTR_HOST_NAME, Value::from(""));
             let mut encoder = CollectdEncoder::new()
                 .with_hostname(hostname)
                 .with_max_packet_bytes(DEFAULT_MAX_PACKET_BYTES);
@@ -2055,7 +2040,7 @@ mod tests {
                 assert_eq!(stats.dropped_no_host, 1);
             } else {
                 // Substitution never deletes, so `\0` stays configured, as `_`.
-                assert_eq!(attr(&decode_all(&packets)[0], ATTR_HOST), Some(Value::from("_")));
+                assert_eq!(attr(&decode_all(&packets)[0], ATTR_HOST_NAME), Some(Value::from("_")));
             }
         }
     }
@@ -2168,7 +2153,7 @@ mod tests {
 
     #[test]
     fn an_event_with_no_metrics_is_skipped_without_being_counted_as_a_loss() {
-        let event = Event::empty(TS, attrs(&[(ATTR_HOST, Value::from("web-1"))]));
+        let event = Event::empty(TS, attrs(&[(ATTR_HOST_NAME, Value::from("web-1"))]));
         let (packets, stats) = encode(&batch(vec![event]), DEFAULT_MAX_PACKET_BYTES);
         assert!(packets.is_empty());
         assert_eq!(stats, EncodeStats { skipped_no_metrics: 1, ..EncodeStats::default() });
@@ -2178,7 +2163,7 @@ mod tests {
     #[test]
     fn resource_carriers_apply_and_event_carriers_win() {
         let mut resource_attrs = AttrMap::new();
-        resource_attrs.insert(ATTR_HOST, Value::from("from-resource"));
+        resource_attrs.insert(ATTR_HOST_NAME, Value::from("from-resource"));
         resource_attrs.insert(ATTR_PLUGIN, Value::from("from-resource"));
         let resource = Arc::new(Resource { attributes: resource_attrs, ..Resource::default() });
 
@@ -2190,7 +2175,7 @@ mod tests {
         let batch = EventBatch { resource, scope: None, events: vec![event] };
         let (packets, _) = encode(&batch, DEFAULT_MAX_PACKET_BYTES);
         let decoded = decode_all(&packets);
-        assert_eq!(attr(&decoded[0], ATTR_HOST), Some(Value::from("from-resource")));
+        assert_eq!(attr(&decoded[0], ATTR_HOST_NAME), Some(Value::from("from-resource")));
         assert_eq!(attr(&decoded[0], ATTR_PLUGIN), Some(Value::from("from-event")));
     }
 
@@ -2260,7 +2245,7 @@ mod tests {
     /// ignores.
     fn notification_event(wire_severity: Value, log_severity: Severity, message: &str) -> Event {
         let mut attrs = attrs(&[
-            (ATTR_HOST, Value::from("web-1")),
+            (ATTR_HOST_NAME, Value::from("web-1")),
             (ATTR_PLUGIN, Value::from("load")),
             (ATTR_TYPE, Value::from("load")),
         ]);
@@ -2282,7 +2267,7 @@ mod tests {
             let log = decoded[0].log.as_ref().expect("must decode back to a log record");
             assert_eq!(log.severity, Some(severity), "severity {wire}");
             assert_eq!(log.message, Value::from("threshold exceeded"));
-            assert_eq!(attr(&decoded[0], ATTR_HOST), Some(Value::from("web-1")));
+            assert_eq!(attr(&decoded[0], ATTR_HOST_NAME), Some(Value::from("web-1")));
             assert_eq!(attr(&decoded[0], ATTR_PLUGIN), Some(Value::from("load")));
             assert_eq!(attr(&decoded[0], ATTR_TYPE), Some(Value::from("load")));
             assert_eq!(decoded[0].attributes.get(ATTR_SEVERITY), Some(&Value::U64(wire)));
@@ -2360,7 +2345,7 @@ mod tests {
     fn a_log_event_without_collectd_severity_is_not_a_notification() {
         let event = Event::log(
             TS,
-            attrs(&[(ATTR_HOST, Value::from("web-1"))]),
+            attrs(&[(ATTR_HOST_NAME, Value::from("web-1"))]),
             log_record(Value::from("just a log line"), Severity::Info),
         );
         let (packets, stats) = encode(&batch(vec![event]), DEFAULT_MAX_PACKET_BYTES);
@@ -2382,7 +2367,7 @@ mod tests {
     #[test]
     fn a_notification_with_no_host_and_no_configured_hostname_is_dropped() {
         let mut event = notification_event(Value::U64(1), Severity::Error, "x");
-        event.attributes.remove(ATTR_HOST);
+        event.attributes.remove(ATTR_HOST_NAME);
 
         let mut encoder = CollectdEncoder::new().with_max_packet_bytes(DEFAULT_MAX_PACKET_BYTES);
         let mut packets = MessageBuf::default();
@@ -2393,12 +2378,14 @@ mod tests {
 
     /// A notification's host falls back as a value list's does.
     #[test]
-    fn a_notification_falls_back_from_host_name_to_the_configured_hostname() {
+    fn a_notification_falls_back_to_the_configured_hostname() {
         let mut event = notification_event(Value::U64(1), Severity::Error, "x");
-        event.attributes.remove(ATTR_HOST);
-        event.attributes.insert("host.name", Value::from("from-host-name"));
+        event.attributes.remove(ATTR_HOST_NAME);
         let (packets, _) = encode(&batch(vec![event]), DEFAULT_MAX_PACKET_BYTES);
-        assert_eq!(attr(&decode_all(&packets)[0], ATTR_HOST), Some(Value::from("from-host-name")));
+        assert_eq!(
+            attr(&decode_all(&packets)[0], ATTR_HOST_NAME),
+            Some(Value::from("fixture-host"))
+        );
     }
 
     /// A message longer than 255 bytes truncates on a character boundary and is counted; a

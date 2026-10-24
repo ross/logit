@@ -410,6 +410,30 @@ fn intake_stats_payload_with_two_clients_is_a_fixed_point() {
         assert_eq!(a.get("_logit.datadog.agent.hostname"), Some(&Value::str("agent-7")));
         assert_eq!(a.get("_logit.datadog.stats.client_computed"), Some(&Value::Bool(true)));
         assert_eq!(a.get("_logit.datadog.stats.split_payload"), None);
+        assert_eq!(a.get("_logit.datadog.tracer.hostname"), None, "no such attribute exists");
+    }
+    let host = |b: &EventBatch| b.resource.attributes.get("host.name").cloned();
+    assert_eq!(host(&batches[0]), Some(Value::str("web-1")), "Hostname is host.name");
+    assert_eq!(host(&batches[1]), Some(Value::str("worker-1")));
+}
+
+/// A payload with no `Hostname` decodes to no `host.name` and relays with none, on both forms.
+#[test]
+fn a_client_payload_with_no_hostname_is_a_fixed_point_with_no_host() {
+    let mut client = two_bucket_client();
+    client.hostname = String::new();
+    let v06 = assert_v06_fixed_point(&client_body(&client));
+    assert_eq!(v06.resource.attributes.get("host.name"), None);
+    let payload = StatsPayload {
+        agent_hostname: "agent-7".into(),
+        agent_env: String::new(),
+        stats: vec![client],
+        agent_version: String::new(),
+        client_computed: false,
+        split_payload: false,
+    };
+    for batch in assert_intake_fixed_point(&stats_body(&payload)) {
+        assert_eq!(batch.resource.attributes.get("host.name"), None);
     }
 }
 

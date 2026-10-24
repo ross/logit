@@ -169,7 +169,7 @@ fn a_datagram_becomes_one_anchored_point_per_line() {
     let mut probe = TelemetryProbe::new();
     let w = worker(&probe);
     let (resource, event) = decode(DATAGRAM_1, RECEIVED_AT);
-    assert_eq!(attr(&event, "syslog.hostname"), Some(MAC));
+    assert_eq!(attr(&event, "host.name"), Some(MAC));
 
     let (resource, rewritten) = run_script(&w, resource, event);
     assert_eq!(
@@ -208,6 +208,7 @@ fn a_datagram_becomes_one_anchored_point_per_line() {
         );
         assert_eq!(attr(child, "printer"), Some(NAME), "point {i}'s printer");
         assert_eq!(attr(child, "mac_address"), None, "point {i} carries no mac_address");
+        assert_eq!(attr(child, "host.name"), None, "point {i} carries no host.name");
         for (key, _) in child.attributes.iter() {
             let key = interner::resolve(key);
             assert!(!key.starts_with("syslog."), "point {i} still carries {key}");

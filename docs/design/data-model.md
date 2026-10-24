@@ -96,14 +96,29 @@ optimizations exploit that. Both are hard to retrofit once scripts and codecs de
 
 When data belongs on an event but doesn't warrant a core-model field, a codec stamps it as a
 dotted, `service.name`-style attribute. `syslog_in` stamps the public
-`syslog.facility`/`.timestamp`/`.hostname`/`.tag`/`.pid`/`.msgid`/`.sd` and the private
-`_logit.syslog.severity`, and the OTLP codec stamps the private
+`syslog.facility`/`.timestamp`/`.tag`/`.pid`/`.msgid`/`.sd`, HOSTNAME as the standard
+`host.name` (below), and the private `_logit.syslog.severity`, and the OTLP codec stamps the private
 `_logit.otel.severity_number`/`_logit.otel.severity_text`. `syslog.pid` may be `Value::Str` as well
 as `Value::U64`, because RFC 5424's PROCID is free-form PRINTUSASCII. `syslog.timestamp` may be
 `Value::Null` (a nil `-` RFC 5424 TIMESTAMP) as well as `Value::Timestamp`/`Value::Str`. The
 `timestamp` component resolves it onto `event.timestamp`
 ([ADR `timestamp-transform`](../adr/timestamp-transform.md)). See
 [ADR `syslog-structured-data-convention`](../adr/syslog-structured-data-convention.md).
+
+**`host.name` is the standard host key** (`logit_core::attrs::HOST_NAME`, the OpenTelemetry
+semantic-conventions name). A source fills it from its incoming data, with its protocol's own rule
+for which wire form names the host, and a sink uses it: no sink reconstructs a host from a wire
+form, and a wire host doesn't survive as a carrier beside `host.name`. A source writes it at the
+scope where it is identity: `collectd_in`, `syslog_in`, `statsd_in`, and `datadog_in` on each
+event, since their senders name a host per value list, line, or item, `splunk_hec_in` on the
+resource of each object's batch, `datadog_in` and `datadog_trace_in` on the resource of each
+tracer or stats payload's batch, `docker_in` on each container's resource only under
+`host_name: container`, and `internal` on its resource. A sink that needs a host reads a
+non-empty `host.name` off the event, else the resource, then its family's hostless mark where it
+has one, and falls back to the process hostname or its own `hostname:`. No sink reads another
+family's host key ([ADR `process-hostname`](../adr/process-hostname.md)'s "Amendment: a source
+fills the common keys (2026-10-23)"). Every other host (a parsed log field, a carbon path
+segment, a line's text, a Lua-built event) is an operator's transform's to put in `host.name`.
 
 **The private namespace `_logit.`: a carrier lives under `_logit.<protocol>.`**
 (`_logit.statsd.type`). A carrier is a protocol's raw wire spelling of something the model
@@ -134,17 +149,15 @@ private, which stay public, and why. The prefix has one definition,
   retains the whole namespace. **`flatten`'s `all`** never selects a private key; a named one still
   flattens. **`aggregate`** keys series on private keys like any attribute. `remove`, `route`,
   `has_attributes`, `drop_attributes`, `set`, and Lua name private keys explicitly, so a private
-  key may appear in operator config (`set` stamping `_logit.datadog.interval`).
+  key may appear in operator config (`set` stamping `_logit.metrics.interval`).
 - **The five tag-bearing metric wires refuse the prefix.** DogStatsD `|#` tags, Datadog intake
   tags (series, sketches, events, service checks), InfluxDB tags, Prometheus remote-write labels,
   and carbon `;k=v` tags drop a key under `_logit.` and count it as
   `logit.input.tags.omitted{reason="reserved_prefix"}`; the point itself is kept. Every other
   decoder admits the key uncounted: OTLP and Splunk HEC metrics included, the log and span
   decoders, and the parsing transforms (`json`, `logfmt`, `kv`, `csv`, `regex`). A top-level
-  `_logit.*` key they admit is read as the carrier it names by that carrier's family and by the
-  cross-family reads
-  [ADR `protocol-knowledge-stays-in-family`](../adr/protocol-knowledge-stays-in-family.md) records
-  as debt, and skipped everywhere else (`docs/known-gaps/mappings.md`).
+  `_logit.*` key they admit is read as the carrier it names by that carrier's family, and skipped
+  everywhere else (`docs/known-gaps/mappings.md`).
 
 **The field namespace `_logit.field.<key>` isn't a protocol's.** An attribute under it
 (`logit_core::attrs::FIELD_PREFIX`, tested by `logit_core::attrs::is_field`) is data about its
@@ -163,8 +176,10 @@ else its batch resource. Their values, producers, and readers are
 
 | Attribute | Value | Meaning |
 |---|---|---|
-| `_logit.metrics.closed` | `Value::Str`, or `Value::Bool(true)` | Every metric record on the event summarizes a time span its source closed, so `aggregate` forwards the event whole. |
+| `_logit.metrics.closed` | `Value::Str`, or `Value::Bool(true)` | Every metric record on the event summarizes a time span its source closed, so `aggregate` forwards the event whole. The value `timestamped` also says the event's timestamp is its source's own: `statsd_out` writes it as `\|T` (`d:` on an event or a service check) and `prometheus_out` as a sample timestamp, whichever decoder set the flag. `statsd_in` sets it for a `\|T` or `d:`, and `prometheus_in`'s scrape for a sample with its own timestamp; neither writes a protocol carrier beside it ([ADR `protocol-knowledge-stays-in-family`](../adr/protocol-knowledge-stays-in-family.md), "Amendment: move, don't mirror (2026-10-23)"). |
 | `_logit.metrics.fields` | `Value::Bool(true)` | The event carries `_logit.field.*` keys, which `aggregate` scans for and leaves out of a series key. |
+| `_logit.metrics.type` | `Value::Str`: `rate`\|`info`\|`stateset`\|`gaugehistogram` | What kind of reading every metric record on the event is, where the model kind doesn't say. Each value names one kind and is ignored on any other, and a value with no rule is ignored. `rate`: a `Gauge` holds a per-second rate over `_logit.metrics.interval` seconds, an increment rather than a state; `dedup_timestamps` sums two of one interval, `prometheus_out` counts a same-millisecond pair `dropped`, and `datadog_out` writes a `rate` series point. `datadog_in` sets it for a `rate` series point. `info`: a `Gauge(1)` whose labels are the payload. `stateset`: a `Gauge(0\|1)`, one state of a set. `gaugehistogram`: a `Histogram` of a quantity that can go down. `prometheus_in` sets those three for the OpenMetrics family types of the same names; `prometheus_out` writes each as that family's `# TYPE`, and `otlp_out` (and `kafka_out`'s OTLP formats) writes an `info` or `stateset` gauge as a non-monotonic `Sum`, `info` named `<name>_info`, and skips a gauge histogram, as the OTel Prometheus compatibility spec says. No decoder writes a protocol carrier beside it. |
+| `_logit.metrics.interval` | `Value::I64`, whole seconds, only when nonzero | The span the event's readings cover: a rate's divisor, a delta count's window. `datadog_in` sets it from a series' `interval`; `datadog_out` writes it as the series `interval`, so a `set` after `aggregate` stamps the window there. |
 
 A key under [ADR `lossless-transit`](../adr/lossless-transit.md)'s rule (c), such as
 `logit.body_format`, is the opposite case: public, and meant to cross a foreign wire.
@@ -184,15 +199,17 @@ on decode, so the raw number travels as a private attribute.
 **The Prometheus codec follows the same rule** (`crates/logit-proto/src/prometheus/`,
 [ADR `prometheus-scrape-and-exposition`](../adr/prometheus-scrape-and-exposition.md)). The
 exposition format distinguishes cases this model has one kind for: an `untyped` sample from a
-`gauge`, and a sample that carried its own timestamp from one that didn't. `prometheus_out`
-**consumes** every `_logit.prometheus.*` attribute (never renders it as a label), and every other
-sink ignores it as private. That is what makes `prometheus_in -> prometheus_out` an exact fixed
-point.
+`gauge`, an `info` or `stateset` sample from a `gauge` and a `gaugehistogram` from a `histogram`,
+and a sample that carried its own timestamp from one that didn't. The `info`, `stateset`, and
+`gaugehistogram` types are the `_logit.metrics.type` flag above, and a timestamp the
+`_logit.metrics.closed: "timestamped"` flag, each with no Prometheus carrier beside it.
+`prometheus_out` **consumes** every `_logit.prometheus.*` attribute (never renders it as a label),
+and every other sink ignores it as private. That is what makes `prometheus_in -> prometheus_out`
+an exact fixed point.
 
 | Attribute | Value | Meaning |
 |---|---|---|
-| `_logit.prometheus.type` | `Value::Str`: `untyped`\|`unknown`\|`info`\|`stateset`\|`gaugehistogram` | The wire family type for the five cases the model has no distinct kind for: `untyped`/`unknown` (both a `Gauge`, one spelling per dialect), `info` (a `Gauge(1)` whose labels are the payload), `stateset` (one `Gauge(0\|1)` per state), `gaugehistogram` (a `Histogram` of a quantity that can decrease). Stamped by `prometheus_in`; read and consumed by `prometheus_out`, which re-emits that exact family type, and read by `otlp_out`, which skips a `gaugehistogram` and writes an `info` or `stateset` as a non-monotonic `Sum`, as the OTel Prometheus compatibility spec says. |
-| `_logit.prometheus.timestamp` | `Value::Bool(true)` | The sample carried its own timestamp on the wire (most don't; a scrape stamps them all with its own start time). `prometheus_out` re-emits a timestamp on that line only, in the output dialect's own unit. `prometheus_in`'s scrape sets `_logit.metrics.closed: "timestamped"` beside it, which `aggregate` reads. This is the "the wire carried its own timestamp" convention `_logit.statsd.timestamp` below uses for DogStatsD's `|T` segment, reduced to a boolean: the sample's timestamp already is the event's own, so only the fact that it was sent needs carrying. |
+| `_logit.prometheus.type` | `Value::Str`: `untyped`\|`unknown` | The family type of a `Gauge` whose family declared none, in each dialect's spelling: `untyped` (text 0.0.4) or `unknown` (OpenMetrics). It has no neutral meaning, so it stays Prometheus's own. Stamped by `prometheus_in`; read and consumed by `prometheus_out`, which re-emits that family type. Any other value is ignored. |
 | `_logit.prometheus.target` | `Value::Str`, a **resource** attribute | The full scrape URL of the target this batch came from (`http://node-exporter:9100/metrics`), stamped once per target by `prometheus_in`. Factual, like `docker_in`'s `container.*`, not an invented `service.name`. Consumed by `prometheus_out`. |
 | `instance` | `Value::Str`, a **resource** attribute | `host:port` of the scraped target. Deliberately **unprefixed**, so it renders as a label like any other resource attribute: the same `instance` label Prometheus's own scrape adds. Without it, two targets running the same exporter would collapse onto one series through a relay. An event-level `instance` wins over the resource's (`honor_labels` semantics), which falls out of the ordinary resource/event attribute merge. `job` is operator identity, not a scrape fact, and comes from a downstream `set`. |
 
@@ -234,17 +251,14 @@ repeated tag key) produce this shape; see
 | `_logit.statsd.type` | `Value::Str`: `ms`\|`h`\|`d` | `statsd_in`'s wire-type letter for a timer/histogram/distribution line, stamped on the `MetricKind::Samples` record it decodes to since all three land on the same shape; `statsd_out` reads it to pick the wire-type letter it re-emits, defaulting to `ms` when absent or unrecognized. See [ADR `statsd-output`](../adr/statsd-output.md)'s amendment. |
 | `_logit.statsd.container_id` | `Value::Str` | `statsd_in`'s `\|c:<container-id>` segment (DogStatsD v1.2+, accepted here on every metric type, not only `c`/`g`), round-tripped by `statsd_out` under `format: dogstatsd` only. |
 | `_logit.statsd.external_data`, `_logit.statsd.cardinality` | `Value::Str` | `statsd_in`'s `\|e:` (DogStatsD v1.5) and `\|card:` (v1.6) segments, or the `e:`/`card:` fields of an event or service check, carried verbatim; round-tripped by `statsd_out` under `format: dogstatsd` only. |
-| `_logit.statsd.timestamp` | `Value::U64` | The raw seconds off an incoming `\|T<unix-seconds>` segment, stamped by `statsd_in` alongside moving the same value onto `Event::timestamp` (as `secs * 1_000_000_000`) -- carrying the wire value itself, not just a marker bit, so a stage that rewrites `Event::timestamp` after decode (a `timestamp` transform or a Lua script) can't fabricate or collapse a `\|T` on the way back out; `statsd_in` sets `_logit.metrics.closed: "timestamped"` beside it, which `aggregate` reads ([ADR `metric-flags`](../adr/metric-flags.md)); `statsd_out` re-emits `\|T<secs>` from this attribute's own `U64` value (never from `Event::timestamp`) under `format: dogstatsd` only, and not at all when the attribute is absent or not a `U64`. Also stamped, with the identical value/round-trip contract, from a DogStatsD event's or service check's own `d:<unix-seconds>` field -- `statsd_out` re-emits it as `d:<secs>` (never `\|T`) on those two line shapes. |
 | `_logit.statsd.event.title` | `Value::Str` | `statsd_in`'s decode of a DogStatsD event (`_e{TITLE_LEN,TEXT_LEN}:title\|text\|...`) -- always present. `statsd_out` renders it as the line's `title`, sanitized (control bytes only; a bare `\|` is fine, since the byte-length prefix delimits the field). See [ADR `statsd-output`](../adr/statsd-output.md)'s "DogStatsD events and service checks" amendment. |
 | `_logit.statsd.event.priority` | `Value::Str`: `normal`\|`low` | `statsd_in`'s `p:` field, only when sent. `statsd_out` writes it verbatim when it's exactly `normal`/`low`; any other value is omitted and counted (`logit.output.fields.omitted{reason="invalid_value"}`), not synthesized or substituted. |
 | `_logit.statsd.event.alert_type` | `Value::Str`: `info`\|`success`\|`warning`\|`error` | `statsd_in`'s `t:` field, only when sent -- also what `t:warning`/`t:error`/`t:success`/`t:info` map onto `LogRecord.severity` (`Warn`/`Error`/`Info`/`Info`) at decode time. `statsd_out` never re-derives this from `LogRecord.severity`: an absent carrier means an absent `t:` field, never an invented one. Same omit-and-count treatment as `_logit.statsd.event.priority` for an out-of-set value. |
 | `_logit.statsd.event.aggregation_key` | `Value::Str` | `statsd_in`'s `k:` field, only when sent; round-tripped as `k:` verbatim (`\|`/control bytes substituted). |
 | `_logit.statsd.event.source_type` | `Value::Str` | `statsd_in`'s `s:` field, only when sent; round-tripped as `s:` the same way as `_logit.statsd.event.aggregation_key`. |
-| `_logit.statsd.event.host` | `Value::Str` | `statsd_in`'s `h:` field on an event line, only when sent; round-tripped as `h:` the same way. |
-| `_logit.statsd.service_check.name` | `Value::Str` | `statsd_in`'s decode of a DogStatsD service check (`_sc\|name\|status\|...`) -- always present; the raw wire spelling, kept separately from the metric's own (normalized, interned) name since `MetricRecord` has nowhere else for it to land (rule (b), [ADR `lossless-transit`](../adr/lossless-transit.md)). `statsd_out` renders it as `name`, sanitized with the same `\|`/control-byte rule as `_logit.statsd.event.host` (not the metric-name sanitizer), so `.` and spaces survive as sent. |
+| `_logit.statsd.service_check.name` | `Value::Str` | `statsd_in`'s decode of a DogStatsD service check (`_sc\|name\|status\|...`) -- always present; the raw wire spelling, kept separately from the metric's own (normalized, interned) name since `MetricRecord` has nowhere else for it to land (rule (b), [ADR `lossless-transit`](../adr/lossless-transit.md)). `statsd_out` renders it as `name`, sanitized with the same `\|`/control-byte rule as `_logit.statsd.event.aggregation_key` (not the metric-name sanitizer), so `.` and spaces survive as sent. |
 | `_logit.statsd.service_check.status` | `Value::U64`: `0..=3` | `statsd_in`'s `STATUS` field -- always present, and also what the event's own `MetricKind::Gauge` value is set to. `statsd_out` prefers this carrier for the wire `status`, falling back to the gauge's own value (finite, rounding into `0..=3`) only when the carrier is absent or out of range; a service check with neither is dropped whole and counted (`EncodeStats::dropped_invalid_service_check`). |
 | `_logit.statsd.service_check.message` | `Value::Str` | `statsd_in`'s `m:` field, only when sent. It ends at the next `\|`, as every other field does and as the Datadog Agent reads it: a real client writes `c:` and `card:` after `m:`. `statsd_out` re-emits it last, with control bytes (including a real newline) substituted and a `\|` written as `_`. |
-| `_logit.statsd.service_check.host` | `Value::Str` | `statsd_in`'s `h:` field on a service-check line, only when sent; round-tripped the same way as `_logit.statsd.event.host`/`_logit.statsd.event.aggregation_key`. |
 
 Rules for the trace/span rows (`syslog.sd` follows its own ADR's rules instead):
 
@@ -264,27 +278,23 @@ Rules for the trace/span rows (`syslog.sd` follows its own ADR's rules instead):
 list by a five-tuple (host, plugin, plugin instance, type, type instance) where this model has one
 `MetricRecord.name`, and carries a per-list reporting interval the model has no field for. The raw
 wire facts ride alongside as attributes and win on the way back out. `collectd_out` **consumes**
-all seven (never re-emits one as anything else). That is what makes `collectd_in -> collectd_out` a
+all seven (never re-emits one as anything else); the host rides on the standard `host.name`. That is what makes `collectd_in -> collectd_out` a
 fixed point. The four under `_logit.collectd.` are private, and every other sink ignores them:
 the record name or a typed field already says what `plugin`, `type`, and `severity` carry, and
-only `collectd_out` reads `interval`. `collectd.host`,
-`collectd.plugin_instance`, and `collectd.type_instance` are public identity with no other home,
-and every other sink renders them as ordinary tags; hiding them would merge different hosts' and
-instances' lists into one series. One exception: `datadog_out` takes a non-empty `Str`
-`collectd.host` as the Datadog host, and then doesn't send it as a tag, when nothing outranks it.
-It ranks below `host.name`, a DogStatsD `host` tag, an event's or check's own host, a log's
-`hostname`, `syslog.hostname`, or `host`, and a Datadog hostless mark, and above the process
-hostname (`crates/logit-proto/src/datadog/mod.rs`'s encode tables).
+only `collectd_out` reads `interval`. `host.name`, `collectd.plugin_instance`, and
+`collectd.type_instance` are public identity, and every other sink renders them as ordinary tags,
+or `host.name` as its own host where it has one; hiding them would merge different hosts' and
+instances' lists into one series.
 
 These are **event** attributes, never resource ones. `logit_pipeline::BatchAccumulator::absorb`
 keys accumulation on `Arc::ptr_eq`, so a per-host resource would split every batch by sender; the
-same reasoning keeps `syslog.hostname` on the event. The presence of `_logit.collectd.type` selects
+same reasoning keeps `syslog_in`'s `host.name` on the event. The presence of `_logit.collectd.type` selects
 like-relay encoding at `collectd_out`; an event without it goes through that sink's fallback naming
 path. `crates/logit-proto/src/collectd/mod.rs`'s module doc has the full mapping table.
 
 | Attribute | Value | Meaning |
 |---|---|---|
-| `collectd.host` | `Value::Str`, or `Value::Bytes` when the wire bytes aren't UTF-8 | The wire Host. Absent when the wire carried an empty one (an empty string part is how a sender *clears* a sticky field). Outranks `host.name` on `collectd_out`, which then falls back to `host.name` and finally to the sink's own `hostname:` — with none of the three, the value list is dropped and counted (`logit.output.metrics.dropped{reason="no_host"}`), since collectd's receiver rejects an empty host and inventing one would merge every unlabelled sender into a single host's metrics. On `datadog_out`, the host when nothing outranks it, as above. |
+| `host.name` | `Value::Str`, or `Value::Bytes` when the wire bytes aren't UTF-8 | The wire Host, under the standard host key. Absent when the wire carried an empty one (an empty string part is how a sender *clears* a sticky field). `collectd_out` reads it off the event, else the resource, then falls back to the sink's own `hostname:` — with neither, the value list is dropped and counted (`logit.output.metrics.dropped{reason="no_host"}`), since collectd's receiver rejects an empty host and inventing one would merge every unlabelled sender into a single host's metrics. |
 | `_logit.collectd.plugin` | `Value::Str`/`Value::Bytes` | The wire Plugin (`cpu`, `load`, `df`). Required for like-relay encoding: a list whose plugin or type sanitizes to nothing is dropped (`{reason="empty_name"}`). |
 | `collectd.plugin_instance` | `Value::Str`/`Value::Bytes`, only when non-empty | The wire PluginInstance (a CPU number, a mount point). |
 | `_logit.collectd.type` | `Value::Str`/`Value::Bytes` | The wire Type — a `types.db` entry name (`cpu`, `if_octets`, `df_complex`) naming the data-source layout the list's values follow. **Its presence is what selects like-relay encoding** on `collectd_out`. |

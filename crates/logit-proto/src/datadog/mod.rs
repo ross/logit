@@ -16,14 +16,25 @@
 //!
 //! Raw Datadog fields the model has no typed home for live in event attributes under
 //! `_logit.datadog.*` ([ADR `lossless-transit`](../../../../docs/adr/lossless-transit.md)'s carrier
-//! rule); the constants below are the only spelling. `host.name` carries a series' `host` resource,
-//! a sketch's `host`, or a log's `hostname` fallback, and an event's or service check's host when it
-//! has no `_logit.statsd.*.host`. On encode, a `Str` [`ATTR_HOST_TAG`] (`statsd_in`'s reading of a
-//! DogStatsD `#host:` tag) is the host when `host.name` is absent or empty, and is then never a tag,
-//! as the Agent's `extractTagsMetadata` reads it (`host_tag`). Below both, a non-empty `Str`
-//! `collectd.host` (`collectd_in`'s Host part) is the host, and then not a tag
-//! (`collectd_host`). [`DatadogEncoder::with_default_host`] (`datadog_out`'s process hostname)
-//! fills the host of anything that carries none and isn't marked hostless. Events and service checks reuse
+//! rule); the constants below are the only spelling.
+//!
+//! **The host is `host.name`, both ways.** Every decoder writes a record's own wire host, a
+//! series' or sketch's `host`, a log's `hostname`, an event's `host`, or a service check's
+//! `host_name`, as `host.name` on the event, and the wire key doesn't survive as an attribute or
+//! a carrier ([`insert_wire_host`]). The host displaces a `host.name` the record's tags or keys
+//! spelled, counted `logit.input.tags.omitted{reason="reserved_key"}`; with no host of its own, a
+//! `host.name` tag is the record's `host.name`. Every encoder writes `host.name` (a non-empty one)
+//! back in its route's own field, else the hostless mark ([`ATTR_HOSTLESS`], `datadog_in`'s and
+//! `statsd_in`'s reading of a sample the sender left hostless) as the route's empty host, else
+//! [`DatadogEncoder::with_default_host`] (`datadog_out`'s process hostname). A `host` attribute is
+//! an ordinary tag (`statsd_in` decodes a DogStatsD `host:` tag to `host.name`), and a log's
+//! `hostname` attribute would collide with the wire's own key, so it's omitted, counted. A
+//! `TracerPayload`'s or `ClientStatsPayload`'s `hostname` is the host of its spans or stats, so
+//! it is the batch resource's `host.name` both ways ("Traces" and "APM stats" below); the Agent's
+//! own `hostName`, the relaying Agent's identity, stays the carrier
+//! [`RESOURCE_ATTR_AGENT_HOSTNAME`]. ADR `process-hostname`'s "Amendment: a source fills the
+//! common keys (2026-10-23)" has the rule.
+//! Events and service checks reuse
 //! `crates/logit-proto/src/statsd/decode.rs`'s `_logit.statsd.event.*` /
 //! `_logit.statsd.service_check.*` names: they are the same Datadog concepts DogStatsD carries.
 //! Tags fold into attributes by [`tags`]'s rule; timestamps convert by [`time`]'s.
@@ -57,7 +68,7 @@
 //! |---|---|---|
 //! | `COUNT` / `1` / `"count"` | `MetricKind::counter(v)` (delta, monotonic) | -- |
 //! | `GAUGE` / `3` / `"gauge"`; a v1 series with no `type` | `Gauge(v)` | -- |
-//! | `RATE` / `2` / `"rate"` | `Gauge(v)` + [`ATTR_TYPE`] `rate` | -- |
+//! | `RATE` / `2` / `"rate"` | `Gauge(v)` + [`METRICS_TYPE`](logit_core::attrs::METRICS_TYPE) `rate` | -- |
 //! | `UNSPECIFIED` / `0` / `""`; a v2 JSON series with no `type` | `Gauge(v)` + [`ATTR_TYPE`] `unspecified` | -- |
 //! | an unknown type, no `metric`, no `points` array, or a field of the wrong JSON type | the series is dropped; the rest of the request decodes | `logit.input.metrics.dropped{reason="bad_series"}` + diag `bad_series` |
 //! | a point that isn't `[ts, value]` / `{timestamp, value}` / `[ts, [values]]` | the point is dropped | `dropped{reason="bad_point"}` |
@@ -73,7 +84,7 @@
 //! | the first named `device` resource; v1 `device` | [`ATTR_DEVICE`] (the Agent's v2 serializer sends a v1 `device` as that resource, UNVERIFIED: the recorded Agent ran no check that sets one) | -- |
 //! | every other resource, including an empty-named or second `host` | [`ATTR_RESOURCES`]: `Array` of `Map{type, name}`, in wire order | -- |
 //! | `source_type_name` | [`ATTR_SOURCE_TYPE_NAME`] when non-empty | -- |
-//! | `interval` | [`ATTR_INTERVAL`] (`I64`) when nonzero | -- |
+//! | `interval` | [`METRICS_INTERVAL`](logit_core::attrs::METRICS_INTERVAL) (`I64`) when nonzero, on any series type | -- |
 //! | protobuf `metadata.origin` | [`ATTR_ORIGIN_PRODUCT`] / [`ATTR_ORIGIN_CATEGORY`] / [`ATTR_ORIGIN_SERVICE`] (`U64`), each when nonzero | -- |
 //! | JSON `metadata.origin` `product` / `service` / `metric_type` | [`ATTR_ORIGIN_PRODUCT`] / [`ATTR_ORIGIN_SERVICE`] / [`ATTR_ORIGIN_METRIC_TYPE`], each when nonzero | -- |
 //! | distribution point `[ts, [v, ...]]` | `MetricKind::Samples(Samples::new(values))`, rate 1.0; the series' `type` is ignored | -- |
@@ -81,9 +92,15 @@
 //! | a body that isn't JSON (or protobuf), isn't a JSON object, or has a `series` that isn't an array | `CodecError::Malformed` | -- |
 //! | an object with no `series` member (the Agent's `{}` connectivity probe, which the intake answers `202`) | an empty batch | -- |
 //!
-//! A tag spelled like a carrier (`host.name:x`) loses to the wire field it names. A tag can't spell
-//! a Datadog carrier: every one is under the private `_logit.` prefix, which the row above omits,
-//! so a `_logit.datadog.type:rate` tag never turns a GAUGE or COUNT series into a RATE.
+//! A `host.name:x` tag loses to the series' own `host`, an empty one included, and is counted
+//! `logit.input.tags.omitted{reason="reserved_key"}`; with no `host`, it's the series'
+//! `host.name`. A tag can't spell a carrier or a flag: every one is under the private `_logit.` prefix, which the row above
+//! omits, so a `_logit.metrics.type:rate` tag never turns a GAUGE or COUNT series into a RATE.
+//!
+//! A rate and an interval are neutral metric flags, not Datadog carriers (ADR
+//! `protocol-knowledge-stays-in-family`'s "Amendment: move, don't mirror (2026-10-23)"), so a
+//! stage outside the Datadog family reads them, and a `Gauge` a script or a `set` flags as a rate
+//! leaves `datadog_out` as a `rate`.
 //!
 //! ## Decode: sketches → events
 //!
@@ -126,7 +143,7 @@
 //!
 //! | Row | Class | Reason or counter | What a consumer sees |
 //! |---|---|---|---|
-//! | `sum/delta_monotonic` | exact | -- | A series `count` point, its `interval` from the `_logit.datadog.interval` carrier or 0, which datadog_in reads back as a delta monotonic sum. |
+//! | `sum/delta_monotonic` | exact | -- | A series `count` point, its `interval` from the `_logit.metrics.interval` flag or 0, which datadog_in reads back as a delta monotonic sum. |
 //! | `sum/delta_nonmonotonic` | degraded | `logit.output.metrics.degraded{metric_kind=non_monotonic_sum}` | A series `count` point of the raw value, as Datadog's exporter sends any delta sum, which datadog_in reads back as a monotonic delta sum. |
 //! | `sum/cumulative_monotonic` | dropped | `logit.output.metrics.dropped{reason=unresolved_cumulative}` | Datadog's exporter differences a running total into a delta first, so it's dropped, with a throttled `unresolved_cumulative` warning; a `cumulative_to_delta` upstream makes it a delta `count`. |
 //! | `sum/cumulative_nonmonotonic` | degraded | `logit.output.metrics.degraded{metric_kind=non_monotonic_sum}` | A series `gauge` point of the running value, as Datadog's exporter sends it, which datadog_in reads back as a gauge; a `cumulative_to_delta` upstream with `non_monotonic: difference` or `reset_on_decrease` makes it a delta `count`. |
@@ -134,13 +151,13 @@
 //! | `sum/i64` | normalized | `integer_as_double` | The point's double, the integer's nearest `f64`, read back as a float. |
 //! | `sum/u64` | normalized | `integer_as_double` | The point's double, the integer's nearest `f64`, read back as a float. |
 //! | `sum/bool` | normalized | `bool_as_double`; `logit.output.metrics.normalized{reason=bool_value}` | The point's double, `1` or `0`, read back as a float. |
-//! | `gauge/f64` | exact | -- | A series `gauge` point, or `rate` or unspecified under the `_logit.datadog.type` carrier. |
+//! | `gauge/f64` | exact | -- | A series `gauge` point, a `rate` under the `_logit.metrics.type` flag, or unspecified under the `_logit.datadog.type` carrier. |
 //! | `gauge/i64` | normalized | `integer_as_double` | The point's double, the integer's nearest `f64`, read back as a float. |
 //! | `gauge/u64` | normalized | `integer_as_double` | The point's double, the integer's nearest `f64`, read back as a float. |
 //! | `gauge/bool` | normalized | `bool_as_double`; `logit.output.metrics.normalized{reason=bool_value}` | The point's double, `1` or `0`, read back as a float. |
 //! | `gauge/negative` | exact | -- | A negative double, as any other. |
-//! | `gauge/prometheus_info` | exact | -- | As any other gauge; the type carrier isn't written. |
-//! | `gauge/prometheus_stateset` | exact | -- | As any other gauge; the type carrier isn't written. |
+//! | `gauge/prometheus_info` | exact | -- | As any other gauge; the type flag isn't written. |
+//! | `gauge/prometheus_stateset` | exact | -- | As any other gauge; the type flag isn't written. |
 //! | `gauge_delta/f64` | dropped | `logit.output.metrics.dropped{reason=unresolved_gauge_delta}` | Nothing upstream resolved the relative gauge to an absolute one, so the series encoders drop it. |
 //! | `gauge_delta/i64` | dropped | `logit.output.metrics.dropped{reason=unresolved_gauge_delta}` | Nothing upstream resolved the relative gauge to an absolute one, so the series encoders drop it. |
 //! | `gauge_delta/u64` | dropped | `logit.output.metrics.dropped{reason=unresolved_gauge_delta}` | Nothing upstream resolved the relative gauge to an absolute one, so the series encoders drop it. |
@@ -159,7 +176,7 @@
 //! | `histogram/neg_inf_bound`, under `histograms: {"mode":"counters","send_aggregation_metrics":true}` | degraded | `logit.output.metrics.degraded{metric_kind=histogram}` | Under `histograms.mode: counters`, a `-Inf` bound is one more bucket's bound: the `<name>.bucket` counts beside it carry a `-inf` `lower_bound` or `upper_bound` tag, the exporter's `formatFloat` form. |
 //! | `histogram/neg_inf_bound`, under `histograms: {"mode":"nobuckets","send_aggregation_metrics":true}` | degraded | `logit.output.metrics.degraded{metric_kind=histogram}` | Under `histograms.mode: nobuckets`, no bucket is written, so the bound goes with the rest. |
 //! | `histogram/neg_inf_bound`, otherwise | degraded | `logit.output.metrics.degraded{metric_kind=histogram}` | In the sketch, as Datadog's exporter builds it on amd64: Go's `int(-Inf)` keys the bound at the Agent's key -1, so the `-Inf` bucket's count lands near `-1e-9` rather than below every other bucket, and the sketch's `min` is that bin's value. |
-//! | `histogram/gauge_histogram` | exact | -- | As `histogram/cumulative`; the type carrier isn't written. |
+//! | `histogram/gauge_histogram` | exact | -- | As `histogram/cumulative`; the type flag isn't written. |
 //! | `exponential_histogram/delta` | degraded | `logit.output.metrics.degraded{metric_kind=exponential_histogram}` | A sketch under every `histograms.mode`, its buckets re-mapped onto the Agent's bins as Datadog's exporter re-maps them, with the point's count, sum, and average, which datadog_in reads back as a distribution; with `send_aggregation_metrics`, the `.count`, `.sum`, `.min`, and `.max` series too. |
 //! | `exponential_histogram/cumulative` | dropped | `logit.output.metrics.dropped{reason=unresolved_cumulative}` | Datadog's exporter can't send a cumulative exponential histogram, so it's dropped, with a throttled `unresolved_cumulative` warning; a `cumulative_to_delta` upstream makes it a delta one. |
 //! | `summary/delta` | degraded | `logit.output.metrics.degraded{metric_kind=summary}` | A `<name>.quantile` gauge per quantile tagged `quantile:<q>`, and `.count` (no unit) and `.sum` as `count` points, as Datadog's exporter writes a summary it differenced, counted once per record; datadog_in reads them back as gauges and counts. |
@@ -192,20 +209,33 @@
 //! | `record/exemplars` | lost | structural | Datadog's intake has no exemplars, so none are written. |
 //! | `record/unit_on_distribution` | lost | structural | Distribution points and sketches have no unit field, so a `samples` or `distribution` record's unit is left off; only the series routes write one. |
 //! | `record/sample_rate_unweighted` | lost | `logit.output.metrics.degraded{reason=sample_rate_rounded}` | A rate below 1 that rounds to weight 1, such as 0.8, writes each value once on the distribution route, which has no rate, so datadog_in reads it back at rate 1, counted once per record. |
-//! | `attributes/string_value` | normalized | `host_tag` | A `key:value` tag. A `host` attribute on a metric with no `host.name` is the host and not a tag, which datadog_in reads back as `host.name`. On a Datadog event or service check with no non-empty host carrier, `host.name`, else `host`, is the host and not a tag, which datadog_in reads back as that carrier. A `collectd.host` on a record with none of those, or on a log with no `hostname`, `host.name`, `syslog.hostname`, or `host`, is the host and not a tag or log attribute, read back where that route's host reads back. |
+//! | `attributes/string_value` | exact | -- | A `key:value` tag, `host` included. `host.name` is the record's host, which datadog_in reads back as `host.name` on every route. |
+//! | `attributes/host_beside_host_name` | exact | -- | A `host:` tag, which datadog_in reads back as `host`. |
+//! | `attributes/hostname` | lost | `logit.output.tags.omitted{reason=reserved_key}` | A log's `hostname` is `host.name`, so a `hostname` attribute has no key of its own on the wire and is left off, counted. |
 //! | `attributes/bool_value` | normalized | `bool_tag` | `true` is a bare `key` tag and reads back `true`; `false` is `key:false` and reads back as the string. |
 //! | `attributes/number_value` | normalized | `stringified` | A `key:<number>` tag, read back as a string. |
 //! | `attributes/array_value` | normalized | `stringified` | One tag per element in order, which datadog_in folds back into an array of strings, so a number element reads back as its text. |
 //! | `attributes/map_value` | lost | `logit.output.tags.omitted{reason=unrepresentable}` | A tag has no nested form, so a map is left off, counted. |
 //! | `attributes/bytes_value` | lost | `logit.output.tags.omitted{reason=unrepresentable}` | A tag has no bytes form, so the value is left off, counted. |
 //! | `attributes/timestamp_value` | normalized | `stringified` | A `key:<RFC 3339>` tag, read back as a string. |
-//! | `attributes/private_carrier` | lost | `logit.output.tags.omitted{reason=no_wire_form}` | A `_logit.datadog.*` carrier rides in its own wire field; one the route has no field for is left off, counted. `_logit.datadog.units`, which marks a decoded batch's units as Datadog names, is read and not written; datadog_in stamps it again on every series batch. |
+//! | `attributes/private_carrier` | lost | `logit.output.tags.omitted{reason=no_wire_form}` | A `_logit.datadog.*` carrier rides in its own wire field; one the route has no field for is left off, counted. `_logit.datadog.units`, which marks a decoded batch's units as Datadog names, is read and not written; datadog_in stamps it again on every series batch. The v2 series route writes `_logit.datadog.hostless` as a `host` resource with no name, which datadog_in reads into `_logit.datadog.resources`. |
 //! | `attributes/prometheus_target` | lost | structural | The scrape target is private and never a tag, so it's left off. |
 //! | `attributes/foreign_carrier` | lost | structural | Another protocol's `_logit.` carrier is private and never a tag, so it's left off. The `_logit.statsd.event.*` and `_logit.statsd.service_check.*` carriers are read as the Datadog fields they name. |
+//! | `attributes/timestamped` | lost | structural | The flag is private and never a tag, so it's left off. The point carries its timestamp, in whole seconds. |
+//! | `attributes/rate` | exact | -- | A flagged gauge is written as a series `rate` point, and datadog_in sets the flag again. |
+//! | `attributes/interval` | exact | -- | The series `interval` of a series point of any type, and datadog_in sets the flag again. |
+//! | `attributes/rate_on_non_gauge` | lost | structural | The flag applies to a gauge alone, so on any other kind it's ignored: the point keeps the type its kind gives it, and datadog_in sets no flag. |
+//! | `attributes/family_type` | lost | structural | The flag is private and never a tag, so it's left off. |
+//! | `attributes/family_type_on_other_kind` | lost | structural | The flag is private and never a tag, so it's left off. |
+//! | `attributes/interval_on_distribution` | lost | `logit.output.tags.omitted{reason=no_wire_form}` | The distribution-points and sketches routes have no interval field, so a nonzero interval is left off, counted. |
+//! | `attributes/interval_on_histogram`, under `histograms: {"mode":"counters","send_aggregation_metrics":true}` | exact | -- | Under `histograms.mode: counters`, the `interval` of each series the histogram writes, and datadog_in sets the flag again. |
+//! | `attributes/interval_on_histogram`, under `histograms: {"mode":"counters","send_aggregation_metrics":false}` | exact | -- | Under `histograms.mode: counters`, the `interval` of each `<name>.bucket` series, and datadog_in sets the flag again. |
+//! | `attributes/interval_on_histogram`, under `histograms: {"mode":"nobuckets","send_aggregation_metrics":true}` | exact | -- | Under `histograms.mode: nobuckets`, the `interval` of each series the histogram writes, and datadog_in sets the flag again. |
+//! | `attributes/interval_on_histogram`, otherwise | lost | `logit.output.tags.omitted{reason=no_wire_form}` | Under `histograms.mode: distributions`, the default, the sketches route has no interval field, so a nonzero interval is left off, counted. |
 //! | `attributes/resource_attribute` | normalized | `resource_as_tag` | Merged into the record's tags, so it reads back as an event attribute. |
 //! | `attributes/scope` | lost | structural | Datadog has no instrumentation scope, so none is written. |
 //! | `attributes/datadog_carrier_log` | lost | uncounted | A `_logit.datadog.*` carrier on a log, a Datadog event, or a service check that the route has no field for is left off, uncounted, where the metrics routes count one as `no_wire_form`; the events route's public form has no field for the Agent envelope's `_logit.datadog.agent.hostname`. |
-//! | `attributes/no_host` | normalized | `default_host` | A record with no host, no `collectd.host`, and no hostless mark leaves with the process hostname as its host, which datadog_in reads back as `host.name`, a log's `hostname`, or an event's or service check's host carrier; a span keeps its own hostnames. |
+//! | `attributes/no_host` | normalized | `default_host` | A record with no host and no hostless mark leaves with the process hostname as its host, which datadog_in reads back as `host.name`; a span's host is its batch resource's `host.name`, filled only when no relaying Agent's hostname rides beside it. |
 //! | `attributes/log_status` | normalized | `status_from_severity` | A log with a severity and no `status` attribute leaves with `status` set to the severity's name, which datadog_in reads back as a `status` attribute beside the severity. |
 //! | `attributes/span_kind` | normalized | `span_kind_meta` | A span whose kind isn't internal, with no `span.kind` attribute, leaves with `meta["span.kind"]`, which datadog_in reads back as a `span.kind` attribute beside the kind. |
 //! | `attributes/trace_id_high` | normalized | `trace_id_high_tag` | On the first span of a trace in a batch, when no span of the trace carries `_dd.p.tid`, a 128-bit trace id's high 64 bits leave as `meta["_dd.p.tid"]`, which datadog_in reads back as a `_dd.p.tid` attribute beside the trace id. |
@@ -239,10 +269,8 @@
 //! | `Event::timestamp` | whole seconds, rounded toward negative infinity | -- |
 //! | two series points in one batch (under `datadog_out`, planned before its request cuts; [`series::SeriesDuplicates`]) with one metric name, one tag set (order and repeats aside), one host, device, and resources, in one second | the latest point is written, the later in batch order on a tie; Datadog would keep the higher of the two, not the later, and never sums two counts. The type, unit, interval, and origin aren't part of the key. Distribution points and sketches aren't collapsed | per point left off: `logit.output.metrics.normalized{reason="duplicate_timestamp"}` when both records are states (a gauge not written as a `rate`, or a cumulative kind) and it equals the point written (the value by its bits, and the type, unit, interval, source type, and origin), else `logit.output.metrics.dropped{reason="duplicate_timestamp"}` + diag `duplicate_timestamp` |
 //! | [`ATTR_HOST_NAME`] | v2: a `{type: "host"}` resource, first; v1, distribution, and sketch: `host` | -- |
-//! | no [`ATTR_HOST_NAME`] or an empty one, and a `Str` [`ATTR_HOST_TAG`] (a DogStatsD `#host:` tag) | the host, where [`ATTR_HOST_NAME`] would go, and not a tag. An empty one is a sample marked hostless: written as the hostless rows below, never filled | -- |
 //! | a `host`-typed entry in [`ATTR_RESOURCES`] and no host from the rows above (the Agent's hostless v2 series: a `host` resource with no name) | v2: that entry, in order; v1, distribution, and sketch: a `host` of `""` (the entry itself is omitted, per the `no_wire_form` row); never filled | -- |
-//! | [`ATTR_HOSTLESS`] `true` and no host from the rows above | v2: a `{type: "host", name: ""}` resource, the Agent's spelling; v1, distribution, and sketch: a `host` of `""`; never filled | -- |
-//! | no host and no hostless mark from the rows above, and a non-empty `Str` `collectd.host` (`collectd_in`'s Host part) | the host, where [`ATTR_HOST_NAME`] would go, and not a tag. Beside a hostless mark it stays a tag | -- |
+//! | [`ATTR_HOSTLESS`] `true` and no host from the rows above | v2: a `{type: "host", name: ""}` resource, the Agent's spelling; v1, distribution, and sketch: a `host` of `""`; never filled. Beside a host from the rows above, the mark is private and left unwritten, uncounted | -- |
 //! | no host from any row above ([`ATTR_HOST_NAME`] absent or empty) | the default host ([`DatadogEncoder::with_default_host`]) where [`ATTR_HOST_NAME`] would go; with none, no v2 resource, no v1 or distribution `host`, and a sketch `host` of `""`. A non-`Str` [`ATTR_HOST_NAME`] is counted `unrepresentable` and never replaced: no v2 resource, no v1 or distribution `host`, and a sketch `host` of `""` | -- |
 //! | [`ATTR_DEVICE`] | v1: `device`; v2: a `{type: "device"}` resource after the host | -- |
 //! | [`ATTR_RESOURCES`] | v2 resources after host and device, in order | -- |
@@ -282,13 +310,13 @@
 //!    routes (v2 protobuf, sketches) never go through that parser and carry values bit-exact
 //!    either way;
 //! 9. a series, distribution point, or sketch with no host of its own leaves with the relay's
-//!    process hostname (`datadog_out`'s default host). Its own host is a non-empty `host.name`,
-//!    else a `host:` tag, which leaves as the host and not a tag, as the Agent's `extractTagsMetadata`
-//!    reads it. A hostless sample is never filled: an empty `host:` tag, a v2 `host` resource with
-//!    no name, or a v1, distribution, or sketch `"host":""` ([`ATTR_HOSTLESS`]). Across routes it
+//!    process hostname (`datadog_out`'s default host). Its own host is a non-empty `host.name`. A
+//!    hostless sample is never filled: a v2 `host` resource with no name, or a v1, distribution,
+//!    or sketch `"host":""` ([`ATTR_HOSTLESS`]). A non-empty `host.name` outranks a hostless
+//!    mark, which it fills, and a `host.name:` tag beside the series' own host is omitted and
+//!    counted at decode. Across routes it
 //!    leaves in the target's hostless spelling: `""` on v1, distribution points, and sketches, and
-//!    a `host` resource with no name on v2. Below all of these, a `collectd.host:` tag on a sample
-//!    with no host and no hostless mark leaves as the host and not a tag;
+//!    a `host` resource with no name on v2;
 //! 10. a tag whose key is under the private `_logit.` prefix is omitted and counted.
 //! 11. every series batch carries [`ATTR_UNITS`] on its resource, so its units leave as they
 //!     arrived, whatever they spell. The UCUM mapping in the encode table applies only to other
@@ -317,7 +345,9 @@
 //! | `timestamp`: integer (or fractional) milliseconds, or an RFC 3339 string | `Event::timestamp` | -- |
 //! | `timestamp` absent, `null`, or `0` | `received_at` | -- |
 //! | `timestamp` another type, or an unparseable string | `received_at` | diag `bad_timestamp` |
-//! | `hostname`, `service`, `ddsource`, `ddtags` | attributes of the same names, verbatim (`ddtags` stays one comma-joined string; expanding it is a transform's job) | -- |
+//! | `hostname`, a non-empty string | [`ATTR_HOST_NAME`], displacing a `host.name` key | `logit.input.tags.omitted{reason="reserved_key"}` for a displaced key |
+//! | `hostname`, an empty string | nothing: no host | -- |
+//! | `service`, `ddsource`, `ddtags`, and a `hostname` that isn't a string | attributes of the same names, verbatim (`ddtags` stays one comma-joined string; expanding it is a transform's job) | -- |
 //! | any other key | an attribute of the same name: object → `Map`, array → `Array`, integer → `I64` (`U64` above `i64::MAX`), other number → `F64`, string → `Str`, bool, `null` → `Null` | -- |
 //!
 //! ## Decode: events (`/api/v2/events` envelope, `/api/v1/events`) → events
@@ -326,7 +356,7 @@
 //! (`{"apiKey","events":{"<source>":[...]},"internalHostname"}`); any other object is one public
 //! event. Both shapes accept both field spellings (`msg_title`/`title`, `msg_text`/`text`,
 //! `timestamp`/`date_happened`). An empty optional string means the same as an absent one, because
-//! the Agent omits empty fields.
+//! the Agent omits empty fields, but for `host`, which the Agent always writes.
 //!
 //! | Wire | Model | Counter / diag |
 //! |---|---|---|
@@ -338,7 +368,9 @@
 //! | `msg_title`/`title` | `_logit.statsd.event.title` (`""` when only a text arrived) | -- |
 //! | `msg_text`/`text` | `LogRecord::message` = `Str`, `body_format: Raw`, `event_name: None` | -- |
 //! | `timestamp`/`date_happened` seconds | `Event::timestamp`; absent or `0` → `received_at` | -- |
-//! | `priority`, `host`, `aggregation_key` | `_logit.statsd.event.priority`, `.host`, `.aggregation_key` | -- |
+//! | `host`, non-empty | [`ATTR_HOST_NAME`], displacing a `host.name` tag | `logit.input.tags.omitted{reason="reserved_key"}` for a displaced tag |
+//! | `host`, `""` (the Agent always writes it, so this is its hostless event) | [`ATTR_HOSTLESS`] `Bool(true)`, displacing a `host.name` tag, as a series' `"host":""` | as above |
+//! | `priority`, `aggregation_key` | `_logit.statsd.event.priority`, `.aggregation_key` | -- |
 //! | `tags` | attributes, by [`tags`]'s rule; a key under the private `_logit.` prefix omitted | `logit.input.tags.omitted{reason="reserved_prefix"}` for an omitted tag |
 //! | `alert_type` | `_logit.statsd.event.alert_type`, verbatim; `severity`: `error` → `Error`, `warning` → `Warn`, `success`/`info` → `Info`, else `None` | -- |
 //! | `source_type_name`, else the envelope group key unless it is `api` | `_logit.statsd.event.source_type` | -- |
@@ -355,7 +387,9 @@
 //! | `check` | the record's name, and `_logit.statsd.service_check.name` | -- |
 //! | `status` 0 to 3 | `MetricKind::Gauge(status)`, and `_logit.statsd.service_check.status` = `U64` | -- |
 //! | `status` absent, negative, above 3, or not an integer | dropped | `logit.input.metrics.dropped{reason="invalid_status"}` |
-//! | `message`, `host_name`, non-empty | `_logit.statsd.service_check.message`, `.host` | -- |
+//! | `host_name`, non-empty | [`ATTR_HOST_NAME`], displacing a `host.name` tag | `logit.input.tags.omitted{reason="reserved_key"}` for a displaced tag |
+//! | `host_name`, `""` (the Agent always writes it, so this is its hostless check) | [`ATTR_HOSTLESS`] `Bool(true)`, displacing a `host.name` tag, as a series' `"host":""` | as above |
+//! | `message`, non-empty | `_logit.statsd.service_check.message` | -- |
 //! | `tags`, an array or `null` | attributes, by [`tags`]'s rule; a key under the private `_logit.` prefix omitted | `logit.input.tags.omitted{reason="reserved_prefix"}` for an omitted tag |
 //! | `timestamp` seconds | `Event::timestamp`; absent or `0` → `received_at` | -- |
 //!
@@ -376,7 +410,8 @@
 //! | `LogRecord::message` | `message`: a `Str` as-is, `Bytes` as lossy UTF-8, anything else as its JSON text | -- |
 //! | attribute `status`, else `severity` | `status` (`severity.as_str()`), omitted when neither | -- |
 //! | `Event::timestamp` | `timestamp`, integer milliseconds | -- |
-//! | `hostname`, else `host.name`, else, unless the log carries `syslog.hostname` or `host` (hosts Datadog's log preprocessing reads, which leave as attributes), a non-empty `Str` `collectd.host` (a collectd notification's host), which then isn't an attribute, else the default host | `hostname`, omitted when none | -- |
+//! | `host.name` other than an empty `Str`, else, unless the log carries `syslog.hostname` or `host` (Datadog's own reserved host attributes, which its log preprocessing reads and which leave as attributes; `syslog_in` writes neither), the default host | `hostname`, omitted when none; `host.name` itself is never an attribute | -- |
+//! | a `hostname` attribute | omitted: it would collide with the wire's own | `logit.output.tags.omitted{reason="reserved_key"}` |
 //! | `service`, else `service.name` | `service` | -- |
 //! | `ddsource`, else [`ATTR_SOURCE`], else [`DatadogEncoder::with_default_source`] | `ddsource`, omitted when none | -- |
 //! | `ddtags` | `ddtags`, verbatim | -- |
@@ -385,13 +420,13 @@
 //! | `LogRecord::trace`, when no `trace_id` or `span_id` attribute is present | `trace_id` (32 lowercase hex) and, when the ref has one, `span_id` (16 lowercase hex), after the attributes: the OTel form Datadog's log intake detects. An attribute of either name suppresses both, so a relayed intake log re-encodes unchanged | -- |
 //! | **events** ([`DatadogEncoder::encode_events`]): an event with a `log` carrying `_logit.statsd.event.title` | [`events::EventFormat::AgentEnvelope`] (the default): one envelope for the batch, `apiKey` `""`, groups keyed by `_logit.statsd.event.source_type` (else `api`) in sorted order; [`events::EventFormat::PublicV1`]: one object per event | -- |
 //! | resource [`RESOURCE_ATTR_AGENT_HOSTNAME`] | envelope `internalHostname`, `""` when absent | -- |
-//! | the event fields | Agent item keys in the Agent's order: `msg_title`, `msg_text`, `timestamp` (seconds), `priority`, `host` (always, `""` when absent), `tags`, `alert_type`, `aggregation_key`, `source_type_name`, `event_type`, then `device_name`, `related_event_id`; the public form uses `title`, `text`, `date_happened` and omits an absent `host`. Empty optional fields are omitted | -- |
-//! | `_logit.statsd.event.host`, else `host.name`, else a `Str` `host` (a DogStatsD `#host:` tag), else a non-empty `Str` `collectd.host`, else the default host | `host`. An empty `host` marks the event hostless and is never filled: `""` in the Agent form, omitted in the public form. A `host.name` read as the host, or an empty one, is not a tag, and neither is a `host` whenever `host.name` is absent or empty, nor a `collectd.host` read as the host | -- |
+//! | the event fields | Agent item keys in the Agent's order: `msg_title`, `msg_text`, `timestamp` (seconds), `priority`, `host`, `tags`, `alert_type`, `aggregation_key`, `source_type_name`, `event_type`, then `device_name`, `related_event_id`; the public form uses `title`, `text`, `date_happened` and omits an absent `host`. Empty optional fields are omitted | -- |
+//! | `host.name` other than an empty `Str`, else [`ATTR_HOSTLESS`] (an empty DogStatsD `host:` tag), never filled, else the default host | `host`. Hostless: `""` in the Agent form, which `datadog_in` reads back as the mark, and omitted in the public form, which has no hostless spelling. With no host, no mark, and no default host: omitted in both. `host.name`, empty or not, is never a tag; a `host` is an ordinary tag | -- |
 //! | no `_logit.statsd.event.alert_type` | `alert_type` from `severity`: `Error`/`Fatal` → `error`, `Warn` → `warning`, `Info` → `info`, else omitted | -- |
-//! | **service checks** ([`DatadogEncoder::encode_service_checks`]): an event carrying `_logit.statsd.service_check.name` whose first metric is a `Gauge` | one array item with every key: `check`, `host_name` (`""`), `timestamp` (seconds), `status`, `message` (`""`), `tags` (`[]`) | -- |
-//! | `_logit.statsd.service_check.host`, else `host.name`, else a `Str` `host` (a DogStatsD `#host:` tag), else a non-empty `Str` `collectd.host`, else the default host | `host_name`; `""` when the `host` is empty (marked hostless, never filled) or nothing applies. A `host.name` read as the host, or an empty one, is not a tag, and neither is a `host` whenever `host.name` is absent or empty, nor a `collectd.host` read as the host | -- |
+//! | **service checks** ([`DatadogEncoder::encode_service_checks`]): an event carrying `_logit.statsd.service_check.name` whose first metric is a `Gauge` | one array item with every key: `check`, `host_name` (below), `timestamp` (seconds), `status`, `message` (`""`), `tags` (`[]`) | -- |
+//! | `host.name` other than an empty `Str`, else [`ATTR_HOSTLESS`] (an empty DogStatsD `host:` tag), never filled, else the default host | `host_name`: `""` when hostless, which `datadog_in` reads back as the mark; omitted with no host, no mark, and no default host. `host.name`, empty or not, is never a tag; a `host` is an ordinary tag | -- |
 //! | `_logit.statsd.service_check.status` `U64` 0 to 3, else the gauge when it is an integer 0 to 3 | `status` | otherwise dropped: `logit.output.metrics.dropped{reason="invalid_status"}` |
-//! | every attribute not consumed above (events and checks) | `tags`, by [`tags::render_tags`]; `_logit.statsd.timestamp` (DogStatsD's timestamp carrier) is never rendered | `logit.output.tags.omitted{reason="unrepresentable"}` for a `Map`/`Bytes`/`Null` |
+//! | every attribute not consumed above (events and checks) | `tags`, by [`tags::render_tags`]; a private `_logit.` key is never rendered | `logit.output.tags.omitted{reason="unrepresentable"}` for a `Map`/`Bytes`/`Null` |
 //!
 //! ## Permitted normalizations (logs, events, service checks)
 //!
@@ -405,16 +440,17 @@
 //! 3. a non-string log `message` leaves as its JSON text;
 //! 4. an envelope item's `source_type_name` is restated from its group key; the Agent's
 //!    `tags: null` on a check leaves as `[]`; an empty optional event field is omitted;
-//! 5. a log with `host.name`, `service.name`, or `_logit.datadog.source` but no `hostname`, `service`, or
-//!    `ddsource` leaves under the Datadog name;
+//! 5. a log with `service.name` or `_logit.datadog.source` but no `service` or `ddsource` leaves
+//!    under the Datadog name; a log's, an event's, or a check's own host displaces a `host.name`
+//!    key or tag beside it, omitted and counted at decode;
 //! 6. tags reorder by attribute order, and an exact duplicate tag is dropped;
-//! 7. a log with none of `hostname`, `host.name`, `syslog.hostname`, or `host`, and an event or
-//!    service check with no host of its own, leaves with its `collectd.host` field or tag as its
-//!    host, which then leaves as the host alone, else with the relay's process hostname
-//!    (`datadog_out`'s default host); an empty `host:` tag keeps an event or check hostless;
-//! 8. an event or service check with no `h:` field (`_logit.statsd.*.host`) takes a `host.name:<h>`
-//!    tag, else a `host:<h>` tag, as its host, which then leaves as the host and not a tag; a
-//!    `host:` tag is never written back while `host.name` is absent or empty, as the Agent consumes it.
+//! 7. a log with no `hostname` (or an empty one) and none of `host.name`, `syslog.hostname`, or
+//!    `host`, and an event or service check with no host of its own, leaves with the relay's
+//!    process hostname (`datadog_out`'s default host); an event's empty `host` or a check's empty
+//!    `host_name` is hostless and stays so, though a public v1 event leaves with no `host`, which
+//!    a later hop fills;
+//! 8. an event or service check with no host of its own takes a `host.name:<h>` tag as its host,
+//!    which leaves as the host and not a tag.
 //! 9. an event's or check's tag whose key is under the private `_logit.` prefix is omitted and
 //!    counted.
 //!
@@ -460,7 +496,8 @@
 //! | a string that isn't UTF-8 | lossy UTF-8 | `degraded{reason="invalid_utf8"}` |
 //! | v0.7/`AgentPayload` chunk `priority` | [`traces::ATTR_CHUNK_PRIORITY`] (`I64`) on every span of the chunk, omitted when `-128` (`PriorityNone`); a v0.7 chunk with no `priority` key is 0, as in Go | -- |
 //! | chunk `origin`, `dropped_trace`, `tags` | [`traces::ATTR_CHUNK_ORIGIN`] (non-empty), [`traces::ATTR_CHUNK_DROPPED_TRACE`] (`true`), [`traces::ATTR_CHUNK_TAGS`] (`Map` of `Str`, non-empty), on every span | -- |
-//! | `TracerPayload` fields | batch resource `_logit.datadog.tracer.container_id`, `.language_name`, `.language_version`, `.tracer_version`, `.runtime_id`, `.env`, `.hostname`, `.app_version` (`Str`), `.tags` (`Map`), each when non-empty; `.container_debug` (`Map` of its non-zero fields) whenever present | -- |
+//! | `TracerPayload` `hostname` | batch resource [`ATTR_HOST_NAME`], when non-empty; empty is no host (an Agent leaves it empty when neither the tracer's payload nor its root span's `_dd.hostname` named one, and sends it beside its own `hostName`). v0.3 to v0.5 have no such field, and a root span's `_dd.hostname` stays a span attribute | -- |
+//! | other `TracerPayload` fields | batch resource `_logit.datadog.tracer.container_id`, `.language_name`, `.language_version`, `.tracer_version`, `.runtime_id`, `.env`, `.app_version` (`Str`), `.tags` (`Map`), each when non-empty; `.container_debug` (`Map` of its non-zero fields) whenever present | -- |
 //! | tracer API request headers (read by `datadog_trace_in`, not by these decoders): `Datadog-Meta-Lang`, `-Lang-Version`, `-Tracer-Version`, `Datadog-Container-ID` | batch resource `_logit.datadog.tracer.language_name`, `.language_version`, `.tracer_version`, `.container_id` (`Str`), each when non-empty; on v0.7 only where the `TracerPayload` left the field empty | -- |
 //! | `Datadog-Meta-Lang-Interpreter`, `-Lang-Interpreter-Vendor`, `Datadog-Entity-ID`, `Datadog-External-Env` | [`RESOURCE_ATTR_TRACER_LANGUAGE_INTERPRETER`], [`RESOURCE_ATTR_TRACER_LANGUAGE_INTERPRETER_VENDOR`], [`RESOURCE_ATTR_TRACER_ENTITY_ID`], [`RESOURCE_ATTR_TRACER_EXTERNAL_ENV`] (`Str`), each when non-empty | -- |
 //! | `Datadog-Client-Computed-Top-Level` (any non-empty value); `Datadog-Client-Computed-Stats` (any non-empty value but a Go `false` spelling) | [`RESOURCE_ATTR_TRACER_CLIENT_COMPUTED_TOP_LEVEL`], [`RESOURCE_ATTR_TRACER_CLIENT_COMPUTED_STATS`] = `Bool(true)`; absent otherwise | -- |
@@ -496,6 +533,8 @@
 //! | links; events (a scalar or an array of scalars natively, anything else as a string) | `span_links`, `span_events` | `int_as_f64` for a `U64` event value above `i64::MAX`; `json_text`; `timestamp_range` for a negative event time |
 //! | `_logit.datadog.chunk.*` of a chunk's first span | v0.7/`AgentPayload` chunk `priority` (`-128` when absent), `origin`, `dropped_trace`, `tags` | -- |
 //! | batch resource `_logit.datadog.tracer.*` / `_logit.datadog.agent.*` | v0.7: one `TracerPayload`; `AgentPayload`: one payload around one `TracerPayload` | -- |
+//! | batch resource [`ATTR_HOST_NAME`], a non-empty `Str` | v0.7 and `AgentPayload`: the `TracerPayload`'s `hostname`, not a span tag; v0.4 and v0.5, which have no such field: a `meta` entry on every span, as any resource attribute, unless the span carries its own `host.name`, which wins as any event attribute does. An event's own `host.name` is always a `meta` entry | v0.4/v0.5, a span whose own `host.name` differs: `degraded{reason="no_wire_form"}`, once per span |
+//! | no resource [`ATTR_HOST_NAME`] | `AgentPayload`: the default host ([`DatadogEncoder::with_default_host`]) as `hostname` when the resource has no [`RESOURCE_ATTR_AGENT_HOSTNAME`] either; with one, `""`, as that Agent sent it. v0.7: `""`, which the Agent behind `datadog_trace_out` fills from the root span's `_dd.hostname` as for any tracer | -- |
 //! | a carrier the form has no field for: `_logit.datadog.chunk.*` in v0.4/v0.5 (per span), `_logit.datadog.tracer.*` in v0.4/v0.5 and `_logit.datadog.agent.*` below `AgentPayload` (per body), `meta_struct`/links/events in v0.5 | dropped | `degraded{reason="no_wire_form"}`, one per item |
 //! | a tracer header's carrier ([`TRACER_STR_HEADERS`], [`TRACER_FLAG_HEADERS`], [`TRACER_U64_HEADERS`]) on the batch resource | never a span tag: a payload field where the form has one (v0.7's `language_name`, say), else dropped | `no_wire_form`, per body, except under [`DatadogEncoder::encode_tracer_api_traces`], whose caller sends each as its request header |
 //! | `status: Ok`, span `flags`, `SpanExt` status message / `trace_state` / dropped counts, a link's or event's dropped-attribute count | dropped: Datadog has no field | `degraded{reason="no_wire_form"}`, one per field |
@@ -525,7 +564,11 @@
 //! 5. a negative `duration` leaves as 0; a zero-valued or absent field leaves as the Agent writes
 //!    it (`priority` `-128` in no chunk, `nil` as the zero value);
 //! 6. a 128-bit trace id with no `_dd.p.tid` gains one on its chunk's first span;
-//! 7. across forms, a field the target has no home for is dropped and counted `no_wire_form`.
+//! 7. across forms, a field the target has no home for is dropped and counted `no_wire_form`;
+//!    a resource `host.name` going to v0.4 or v0.5 lands in every span's `meta` instead, unless
+//!    the span carries a different `host.name`, which wins as any event attribute does, counted;
+//! 8. `datadog_out` only: a `TracerPayload` with no `hostname` and no `AgentPayload` `hostName`
+//!    leaves with the process hostname (`datadog_out`'s default host) as its `hostname`.
 //!
 //! ## Readiness for the intake
 //!
@@ -575,7 +618,8 @@
 //! | `IsTraceRoot` `1` / `2` / `0` | `_logit.datadog.stats.is_trace_root` `"true"` / `"false"` / absent | any other value: absent, `degraded{reason="unknown_trilean"}` |
 //! | `PeerTags`, `AdditionalMetricTags`, `SpanDerivedPrimaryTags` | `_logit.datadog.stats.peer_tags`, `.additional_metric_tags`, `.span_derived_primary_tags`: `Array` of `Str`, when non-empty | -- |
 //! | bucket `Duration`, `AgentTimeShift` | each of its groups' `_logit.datadog.stats.bucket.duration` (`U64`, always) and `.bucket.agent_time_shift` (`I64`, when nonzero) | -- |
-//! | `ClientStatsPayload` `Hostname`, `Env`, `Version`, `Lang`, `TracerVersion`, `RuntimeID`, `ContainerID` | batch resource `_logit.datadog.tracer.hostname`, `.env`, `.app_version`, `.language_name`, `.tracer_version`, `.runtime_id`, `.container_id`, when non-empty | -- |
+//! | `ClientStatsPayload` `Hostname` | batch resource [`ATTR_HOST_NAME`], when non-empty, as a `TracerPayload`'s `hostname` | -- |
+//! | `ClientStatsPayload` `Env`, `Version`, `Lang`, `TracerVersion`, `RuntimeID`, `ContainerID` | batch resource `_logit.datadog.tracer.env`, `.app_version`, `.language_name`, `.tracer_version`, `.runtime_id`, `.container_id`, when non-empty | -- |
 //! | `/v0.6/stats` request headers (read by `datadog_trace_in`, not by these decoders): `Datadog-Meta-Lang`, `-Tracer-Version`, `Datadog-Container-ID` | batch resource `_logit.datadog.tracer.language_name`, `.tracer_version`, `.container_id` (`Str`), each when non-empty and only where the payload's `Lang`, `TracerVersion`, or `ContainerID` left it unset, as the Agent's stats receiver fills them | -- |
 //! | `AgentAggregation`, `Service`, `GitCommitSha`, `ImageTag`, `ProcessTags` | resource `_logit.datadog.stats.agent_aggregation`, `.service`, `.git_commit_sha`, `.image_tag`, `.process_tags`, when non-empty | -- |
 //! | `Sequence`, `ProcessTagsHash`; `Tags` | resource `_logit.datadog.stats.sequence`, `.process_tags_hash` (`U64`), when nonzero; `_logit.datadog.stats.tags` (`Array` of `Str`), when non-empty | -- |
@@ -594,6 +638,7 @@
 //! | Model | Wire | Counter |
 //! |---|---|---|
 //! | a group attribute (the event's, else the resource's) | its field above; `""`, `0`, `false`, or `[]` when absent | a value of the wrong type: `logit.output.tags.omitted{reason="unrepresentable"}` |
+//! | a payload attribute (the resource's only), [`ATTR_HOST_NAME`] included | its `ClientStatsPayload` field above; `""` or `0` when absent, except that `/api/v0.2/stats` writes the default host ([`DatadogEncoder::with_default_host`]) as `Hostname` when the resource has neither [`ATTR_HOST_NAME`] nor [`RESOURCE_ATTR_AGENT_HOSTNAME`] | the same; an event's `host.name` has no wire form, counted as below |
 //! | any other event attribute; a resource attribute that is none of the fields above | omitted | `tags.omitted{reason="no_wire_form"}`, one per attribute (a resource's once per body); none for a private `_logit.` key, so the v0.6 route, which has no envelope, skips `_logit.datadog.agent.*` and the two envelope flags uncounted |
 //! | a delta `Sum` hits/errors/top-level-hits/duration | `uint64`: a `U64` or non-negative `I64` as is, a `Bool` as `1` or `0`, an `F64` rounded to the nearest integer | a `Bool`: `logit.output.metrics.normalized{reason="bool_value"}`; a negative `I64`: `0`, `degraded{reason="bad_count"}`; a fraction: `logit.output.stats.degraded{reason="fractional_count"}`; negative or non-finite: `0`, `degraded{reason="bad_count"}`; above 2^64: `u64::MAX`, `degraded{reason="count_overflow"}` |
 //! | an ok/error summary `Distribution` under a logarithmic mapping | a DDSketch protobuf: its `gamma` and `indexOffset`, `interpolation: NONE`, both stores as sparse `binCounts` in ascending key order, `zeroCount`. Hand-encoded, since prost's `HashMap` would order the bins at random | a bin limit other than 2048 (a receiver collapses at 2048): `degraded{reason="bin_limit"}`; a summary tracked from observations (`stats_exact`), which the protobuf has no field for: `degraded{reason="exact_summary"}` |
@@ -616,7 +661,9 @@
 //! 4. an intake `StatsPayload` leaves as one `StatsPayload` per `ClientStatsPayload` (batching),
 //!    its envelope restated on each;
 //! 5. on `/v0.6/stats`, a `Lang`, `TracerVersion`, or `ContainerID` the payload left empty leaves
-//!    in the payload when the request's matching header carried it, as it does behind an Agent.
+//!    in the payload when the request's matching header carried it, as it does behind an Agent;
+//! 6. `datadog_out` only: a `ClientStatsPayload` with no `Hostname` and no `StatsPayload`
+//!    `AgentHostname` leaves with the process hostname as its `Hostname`.
 
 pub mod generated;
 pub mod tags;
@@ -638,84 +685,33 @@ pub mod traces_proto;
 
 pub mod stats;
 
-use logit_core::attrs::merged;
 use logit_core::interner::{intern, resolve};
-use logit_core::{Diagnostics, Event, EventBatch, MetricKind, Resource, Symbol, Telemetry, Value};
+use logit_core::{
+    AttrMap, Diagnostics, Event, EventBatch, MetricKind, Resource, Symbol, Telemetry, Value,
+};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock};
 
-/// `host.name`: the Datadog host of a series/sketch/log, as an event attribute.
-pub const ATTR_HOST_NAME: &str = "host.name";
-/// `host`: a DogStatsD `#host:` tag, as `statsd_in` decodes it.
-pub const ATTR_HOST_TAG: &str = "host";
+/// `host.name`: the host of every Datadog record, as an event attribute.
+pub const ATTR_HOST_NAME: &str = logit_core::attrs::HOST_NAME;
 
-static HOST_KEYS: LazyLock<(Symbol, Symbol)> =
-    LazyLock::new(|| (intern(ATTR_HOST_NAME), intern(ATTR_HOST_TAG)));
-
-/// The DogStatsD `#host:` tag an event carries, read as the Agent's `extractTagsMetadata`
-/// (datadog-agent 7.83.3, `comp/dogstatsd/server/impl/enrich.go`) reads it: a `Str` `host`
-/// attribute, only when there's no `host.name` or an empty one. The encoders then consume it as
-/// the host, never as a tag. `Some("")` is a sample the sender marked hostless, which is never filled.
-pub(crate) fn host_tag<'a>(resource: &'a Resource, event: &'a Event) -> Option<&'a str> {
-    let (host_name, host) = *HOST_KEYS;
-    let mut tag = None;
-    for (key, value) in merged(resource, event) {
-        // An empty `host.name` is no host, as the encoders read it; any other value blocks the tag.
-        if key == host_name && value.as_str() != Some("") {
-            return None;
-        }
-        if key == host {
-            tag = value.as_str();
-        }
+/// Writes a record's own wire host onto `attributes`: a non-empty one as [`ATTR_HOST_NAME`], an
+/// empty one as [`ATTR_HOSTLESS`], `None` as neither. A host either way displaces a `host.name`
+/// the record's tags or keys spelled, which it removes; returns how many wire tags that was, for
+/// the caller to count as `logit.input.tags.omitted{reason="reserved_key"}`.
+pub(crate) fn insert_wire_host(attributes: &mut AttrMap, host: Option<&str>) -> usize {
+    let Some(host) = host else { return 0 };
+    let displaced = match attributes.remove(ATTR_HOST_NAME) {
+        None => 0,
+        Some(Value::Array(elements)) => elements.len(),
+        Some(_) => 1,
+    };
+    if host.is_empty() {
+        attributes.insert(ATTR_HOSTLESS, Value::Bool(true));
+    } else {
+        attributes.insert(ATTR_HOST_NAME, Value::str(host));
     }
-    tag
-}
-
-static HOSTLESS_KEYS: LazyLock<(Symbol, Symbol)> =
-    LazyLock::new(|| (intern(ATTR_HOSTLESS), intern(ATTR_RESOURCES)));
-
-/// Whether an [`ATTR_RESOURCES`] value holds a `host` entry: the Agent's hostless v2 series.
-fn has_host_resource(value: &Value) -> bool {
-    let Value::Array(items) = value else { return false };
-    items.iter().any(|item| match item {
-        Value::Map(m) => m.get("type").and_then(Value::as_str) == Some("host"),
-        _ => false,
-    })
-}
-
-pub(crate) static COLLECTD_HOST_KEY: LazyLock<Symbol> =
-    LazyLock::new(|| intern(crate::collectd::ATTR_HOST));
-
-/// The collectd host an event carries ([`crate::collectd::ATTR_HOST`], `collectd_in`'s reading of
-/// a value list's or notification's Host part), as the series, events, and service-check encoders
-/// read it: a non-empty `Str`, only when there's no `host.name` or an empty one, no [`host_tag`],
-/// and no hostless mark ([`ATTR_HOSTLESS`] `true`, or a `host` entry in [`ATTR_RESOURCES`]). It
-/// ranks below `host.name` because that's how an operator overrides a host with `set`, and below
-/// a hostless mark because the sender chose no host. The encoders then consume it as the host,
-/// never as a tag. The logs encoder reads it itself, after its own host attributes.
-pub(crate) fn collectd_host<'a>(resource: &'a Resource, event: &'a Event) -> Option<&'a str> {
-    if host_tag(resource, event).is_some() {
-        return None;
-    }
-    let (host_name, _) = *HOST_KEYS;
-    let collectd = *COLLECTD_HOST_KEY;
-    let (hostless, resources) = *HOSTLESS_KEYS;
-    let mut host = None;
-    for (key, value) in merged(resource, event) {
-        if key == host_name && value.as_str() != Some("") {
-            return None;
-        }
-        if key == hostless && *value == Value::Bool(true) {
-            return None;
-        }
-        if key == resources && has_host_resource(value) {
-            return None;
-        }
-        if key == collectd {
-            host = value.as_str().filter(|h| !h.is_empty());
-        }
-    }
-    host
+    displaced
 }
 
 /// `_logit.datadog.units`: `"datadog"` on the resource of every series batch `datadog_in` decodes
@@ -738,12 +734,10 @@ pub(crate) fn units_are_datadog(resource: &Resource, event: &Event) -> bool {
     value.and_then(Value::as_str) == Some(UNITS_DATADOG)
 }
 
-/// `_logit.datadog.type`: `rate` or `unspecified`; absent for `count` and `gauge`, whose model
-/// kinds say so themselves.
+/// `_logit.datadog.type`: `unspecified`, the one series type with no neutral meaning; absent for
+/// `count` and `gauge`, whose model kinds say so themselves, and for `rate`, which is the neutral
+/// flag [`METRICS_TYPE`](logit_core::attrs::METRICS_TYPE).
 pub const ATTR_TYPE: &str = "_logit.datadog.type";
-/// `_logit.datadog.interval`: a count's or rate's interval in seconds (I64), present only when
-/// nonzero.
-pub const ATTR_INTERVAL: &str = "_logit.datadog.interval";
 /// `_logit.datadog.source_type_name`: the check or integration that produced a series.
 pub const ATTR_SOURCE_TYPE_NAME: &str = "_logit.datadog.source_type_name";
 /// `_logit.datadog.device`: the v1 series `device` field.
@@ -791,7 +785,6 @@ pub const RESOURCE_ATTR_TRACER_LANGUAGE_NAME: &str = "_logit.datadog.tracer.lang
 pub const RESOURCE_ATTR_TRACER_VERSION: &str = "_logit.datadog.tracer.tracer_version";
 pub const RESOURCE_ATTR_TRACER_RUNTIME_ID: &str = "_logit.datadog.tracer.runtime_id";
 pub const RESOURCE_ATTR_TRACER_ENV: &str = "_logit.datadog.tracer.env";
-pub const RESOURCE_ATTR_TRACER_HOSTNAME: &str = "_logit.datadog.tracer.hostname";
 pub const RESOURCE_ATTR_TRACER_APP_VERSION: &str = "_logit.datadog.tracer.app_version";
 /// `_logit.datadog.tracer.language_interpreter` / `.language_interpreter_vendor` / `.entity_id` /
 /// `.external_env`: a tracer's `Datadog-Meta-Lang-Interpreter`,
@@ -883,20 +876,6 @@ pub const ATTR_SPAN_KIND: &str = "span.kind";
 /// [`logit_core::attrs::merged`] resolves it, without the full merged walk.
 fn merged_get<'a>(resource: &'a Resource, event: &'a Event, key: &str) -> Option<&'a Value> {
     event.attributes.get(key).or_else(|| resource.attributes.get(key))
-}
-
-/// Whether `kind` on `event` is a Datadog `rate`: a `Gauge` whose [`ATTR_TYPE`], the event's value
-/// winning over the resource's, is `rate`, the form `datadog_in` decodes a rate to. A rate is an
-/// increment over its [`ATTR_INTERVAL`], not a state, so a stage that collapses readings of one
-/// series at one timestamp sums it rather than keeping the later one.
-pub fn is_rate(resource: &Resource, event: &Event, kind: &MetricKind) -> bool {
-    matches!(kind, MetricKind::Gauge(_))
-        && merged_get(resource, event, ATTR_TYPE).and_then(Value::as_str) == Some(series::TYPE_RATE)
-}
-
-/// [`ATTR_INTERVAL`], the event's value winning over the resource's.
-pub fn interval<'a>(resource: &'a Resource, event: &'a Event) -> Option<&'a Value> {
-    merged_get(resource, event, ATTR_INTERVAL)
 }
 
 /// A service check: `_logit.statsd.service_check.name` present and a `Gauge` first metric, the
@@ -1089,12 +1068,18 @@ impl DatadogDecoder {
     /// `logit.input.tags.omitted{reason="reserved_prefix"}`: `n` tags [`tags::insert_tags`]
     /// skipped for a private key, on a series, sketch, event, or check that was delivered.
     pub(super) fn reserved_tags(&self, n: usize) {
+        self.omitted_tags(n, "reserved_prefix");
+    }
+
+    /// `logit.input.tags.omitted{reason="reserved_key"}`: `n` `host.name` tags or keys
+    /// [`insert_wire_host`] displaced with a record's own host, on a record that was delivered.
+    pub(super) fn displaced_host_names(&self, n: usize) {
+        self.omitted_tags(n, "reserved_key");
+    }
+
+    fn omitted_tags(&self, n: usize, reason: &'static str) {
         if n > 0 {
-            self.telemetry.count(
-                "logit.input.tags.omitted",
-                n as f64,
-                &[("reason", "reserved_prefix")],
-            );
+            self.telemetry.count("logit.input.tags.omitted", n as f64, &[("reason", reason)]);
         }
     }
 }
@@ -1166,8 +1151,10 @@ impl DatadogEncoder {
     }
 
     /// The host written for a series, sketch, log, event, or service check that carries no host
-    /// of its own (the module doc's encode tables say which attributes count); `datadog_out`
-    /// passes the process hostname. Never replaces a host the event carries.
+    /// of its own, and for an `AgentPayload`'s or intake `StatsPayload`'s tracer payload with no
+    /// resource `host.name` and no relaying Agent's hostname (the module doc's encode tables say
+    /// which attributes count); `datadog_out` passes the process hostname. Never replaces a host
+    /// the event carries.
     pub fn with_default_host(mut self, host: Option<Arc<str>>) -> Self {
         self.default_host = host;
         self

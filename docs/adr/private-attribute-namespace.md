@@ -44,7 +44,7 @@ the case of a key that must never cross one.
 ## Decision
 
 **Carriers live under one private prefix, `_logit.`, with the protocol segment kept:
-`_logit.statsd.type`, `_logit.prometheus.timestamp`, `_logit.influxdb.measurement`.** Every
+`_logit.statsd.type`, `_logit.prometheus.type`, `_logit.influxdb.measurement`.** Every
 protocol sink ignores `_logit.*` when it renders tags, labels, fields, or attributes, except its
 own `_logit.<protocol>.*` keys, which it reads by exact name. There is no list to maintain.
 
@@ -78,14 +78,18 @@ By protocol, these move under `_logit.`:
 
 These stay public:
 
-- `collectd.host`, `collectd.plugin_instance`, and `collectd.type_instance`: identity with no
+- collectd's host, `collectd.plugin_instance`, and `collectd.type_instance`: identity with no
   other home. The record name holds only the plugin and type, and the host stays off the
   resource, so hiding them would merge different hosts' and instances' lists into one series.
+  The host rides on the standard `host.name`
+  ([ADR `process-hostname`](process-hostname.md)'s "Amendment: `host.name` is the standard host
+  key (2026-10-23)").
 - `syslog.timestamp`: the sender's own stamp. `Event.timestamp` is receipt time until a
   `timestamp` component resolves it, so the attribute duplicates nothing, and an operator names it
   in that component's config.
-- `syslog.hostname`, `syslog.tag`, `syslog.pid`, `syslog.msgid`, `syslog.sd`, and
-  `syslog.facility`: header facts with no typed home that any destination can use.
+- `syslog.tag`, `syslog.pid`, `syslog.msgid`, `syslog.sd`, and `syslog.facility`: header facts
+  with no typed home that any destination can use. HOSTNAME rides on the standard `host.name`
+  ([ADR `syslog-output`](syslog-output.md)'s "Amendment: HOSTNAME is `host.name` (2026-10-23)").
 - `com.splunk.*` and `otel.log.*`: the OpenTelemetry `splunk_hec` exporter's public vocabulary,
   which [ADR `splunk-hec-relay`](splunk-hec-relay.md) adopts.
 - `http.*`: OpenTelemetry semantic conventions.
@@ -134,7 +138,7 @@ reading a private key is in-family (2026-10-23)").
 - `aggregate` keys series on private keys unchanged, as on any attribute.
 - `remove`, `route`, `has_attributes`, `drop_attributes`, `set`, and Lua name private keys
   explicitly, with no prefix matching. A private key may therefore appear in operator config:
-  `set` stamping `_logit.datadog.interval`, or a `route` on `_logit.influxdb.bucket`.
+  `set` stamping `_logit.metrics.interval`, or a `route` on `_logit.influxdb.bucket`.
 
 ### The inbound guard
 
@@ -152,9 +156,7 @@ Without the guard, a sender's tag would be read back as carrier data at that car
 Every other decoder admits the key uncounted: OTLP metric data-point attributes and Splunk HEC
 metric `fields` included, the log and span decoders, and the parsing transforms (`json`,
 `logfmt`, `kv`, `csv`, `regex`). A top-level `_logit.*` key they admit is taken as the carrier
-it names by that carrier's family, and by the cross-family reads
-[ADR `protocol-knowledge-stays-in-family`](protocol-knowledge-stays-in-family.md) records as
-debt. The guard generalizes a counter `influxdb_in` already keeps
+it names by that carrier's family. The guard generalizes a counter `influxdb_in` already keeps
 for its own prefix; the other decoders have no tag-omission counter, and a producer has to choose
 the `_logit.` prefix to reach a carrier. Under [ADR `deployment-threat-model`](deployment-threat-model.md),
 that makes it a documented gap rather than a guard to add.
@@ -219,7 +221,7 @@ a key under it isn't a carrier of any protocol. The prefix has one definition,
 `_logit.metrics.` joins `_logit.field.` as a segment that names the signal a key describes rather
 than a protocol. Its keys are flags: the component that creates an event sets one, and a reader
 such as `aggregate` acts on it instead of on a protocol carrier. `_logit.metrics.closed` and
-`_logit.metrics.fields` are the two today; their values and readers are
+`_logit.metrics.fields` were the first two; every flag's values and readers are
 [ADR `metric-flags`](metric-flags.md)'s "The flags". The ignore rule covers them like any private
 key, so no protocol sink renders a flag, and `keep` under its default `private: drop` strips them.
 The constants live in `logit_core::attrs` beside `PRIVATE_PREFIX` and `FIELD_PREFIX`.

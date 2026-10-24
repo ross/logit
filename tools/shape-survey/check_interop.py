@@ -21,7 +21,8 @@ The mapping from wire to measurement is not 1:1:
   logit.shape.attributes    <-> tags per line, plus the `_logit.statsd.*` carriers the decoder
   (at tap_input)                stamps: `_logit.statsd.container_id` for a `|c:<id>` segment (the
                                 DogStatsD client emits one unprompted, having detected its own
-                                container), `_logit.statsd.timestamp` for a `|T<secs>` segment, and
+                                container), the `_logit.metrics.closed` flag for a `|T<secs>`
+                                segment, and
                                 `_logit.statsd.type` on `ms`/`h`/`d` lines only -- the wire type
                                 letter, which those three share one `Samples` shape for. Repeated
                                 tag keys merge into one attribute holding an array, so a tag count
@@ -79,7 +80,7 @@ def parse_line(line: str) -> tuple[int, int] | None:
         elif extra.startswith("c:"):
             carriers += 1  # _logit.statsd.container_id
         elif extra.startswith("T"):
-            carriers += 1  # _logit.statsd.timestamp
+            carriers += 1  # the `_logit.metrics.closed` flag
 
     if type_part in ("c", "g"):
         events = len(values.split(":"))

@@ -170,7 +170,7 @@ out.append("")
 out.append("## Attributes per event")
 out.append("")
 out.append(
-    "collectd's identity fields (`collectd.host`, `_logit.collectd.plugin`,"
+    "collectd's identity fields (`host.name`, `_logit.collectd.plugin`,"
     " `collectd.plugin_instance`, `_logit.collectd.type`, `collectd.type_instance`)"
     " and Telegraf's own tags land as ordinary event attributes -- this is the width a"
     " `keep`/interner sizing decision on this leg would see."
