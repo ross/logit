@@ -331,7 +331,7 @@ identity.
 
 | Sink | Container identity |
 |---|---|
-| `statsd_out` (`format: dogstatsd`) | `\|c:<id>` bare from a usable `container.id` (a non-empty `Str`), the form every Agent version reads, or `\|c:ci-<id>` when the id itself starts with `ci-`, `cid-`, or `in-`; `\|c:in-<inode>` from the carrier alone; `\|c:ci-<id>,in-<inode>` from both. A usable `container.id` is never also a tag; any other value is an ordinary tag. Under `format: statsd`, the field is omitted, counted |
+| `statsd_out` (`format: dogstatsd`) | `\|c:<id>` bare from a usable `container.id` (a non-empty `Str`), the form every Agent version reads, or `\|c:ci-<id>` when the id itself starts with `ci-`, `cid-`, or `in-`; `\|c:in-<inode>` from the carrier alone; `\|c:ci-<id>,in-<inode>` from both. A usable `container.id` is never also a tag, whether it came from `\|c:`, a `container.id:` tag, or upstream: the Agent then resolves it through origin detection, which is what the common key means in this family. Any other value is an ordinary tag. Under `format: statsd`, the field is omitted, counted |
 | `datadog_out` | on a series, sketch, distribution point, event, or service check, the `container_id` tag and, from `container.image.tags`' first element, the `image_tag` tag; on a log, a `container_id:<id>` entry appended to `ddtags`; on a trace payload, the `TracerPayload`'s `container_id`; on stats, `ClientStatsPayload`'s `ContainerID` and `ImageTag` (the first element) |
 | `datadog_trace_out` | the `Datadog-Container-ID` header and, under `version: v0.7`, the payload's `container_id`, from resource `container.id`; on `/v0.6/stats`, `ContainerID` and `ImageTag` |
 | `otlp_out`, `splunk_hec_out`, and the other sinks | the keys as ordinary attributes |

@@ -994,3 +994,7 @@ tag; any other value is an ordinary tag. The relay stays a fixed
 point modulo one more normalization (`crates/logit-cli/tests/statsd_round_trip.rs`'s (11)): a
 `ci-<id>` or `cid-<id>` relays as `<id>`, a list relays as `ci-<id>,in-<inode>`, and a list item
 the Agent doesn't read is dropped at decode, counted `logit.input.fields.dropped{reason="malformed"}`.
+A `container.id:` tag on a line whose `|c:` names no container id decodes to `container.id`, and
+a `container.id` set upstream reads the same way, so either leaves as the line's `|c:`
+(`#container.id:x` as `|c:x`, beside `|c:in-7` as `|c:ci-x,in-7`), as a `host.name:` tag leaves
+as `#host:`.
