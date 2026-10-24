@@ -400,7 +400,7 @@
 //! | `host`, non-empty | [`ATTR_HOST_NAME`], displacing a `host.name` tag | `logit.input.tags.omitted{reason="reserved_key"}` for a displaced tag |
 //! | `host`, `""` (the Agent always writes it, so this is its hostless event) | [`ATTR_HOSTLESS`] `Bool(true)`, displacing a `host.name` tag, as a series' `"host":""` | as above |
 //! | `priority`, `aggregation_key` | `_logit.statsd.event.priority`, `.aggregation_key` | -- |
-//! | `tags` | attributes, by [`tags`]'s rule; a key under the private `_logit.` prefix omitted; a valued `env:`, `version:`, or `service:` tag the standard key, and a tag spelling that key beside it omitted | `logit.input.tags.omitted{reason="reserved_prefix"}` for a private key, `{reason="reserved_key"}` for a standard key beside its Datadog tag |
+//! | `tags` | attributes, by [`tags`]'s rule; a key under the private `_logit.` prefix omitted; a valued `env:`, `version:`, or `service:` tag the standard key, and a valued tag spelling that key beside it omitted | `logit.input.tags.omitted{reason="reserved_prefix"}` for a private key, `{reason="reserved_key"}` for a standard key beside its Datadog tag |
 //! | `alert_type` | `_logit.statsd.event.alert_type`, verbatim; `severity`: `error` → `Error`, `warning` → `Warn`, `success`/`info` → `Info`, else `None` | -- |
 //! | `source_type_name`, else the envelope group key unless it is `api` | `_logit.statsd.event.source_type` | -- |
 //! | `event_type` (Agent) | [`ATTR_EVENT_TYPE`] | -- |
@@ -419,7 +419,7 @@
 //! | `host_name`, non-empty | [`ATTR_HOST_NAME`], displacing a `host.name` tag | `logit.input.tags.omitted{reason="reserved_key"}` for a displaced tag |
 //! | `host_name`, `""` (the Agent always writes it, so this is its hostless check) | [`ATTR_HOSTLESS`] `Bool(true)`, displacing a `host.name` tag, as a series' `"host":""` | as above |
 //! | `message`, non-empty | `_logit.statsd.service_check.message` | -- |
-//! | `tags`, an array or `null` | attributes, by [`tags`]'s rule; a key under the private `_logit.` prefix omitted; a valued `env:`, `version:`, or `service:` tag the standard key, and a tag spelling that key beside it omitted | `logit.input.tags.omitted{reason="reserved_prefix"}` for a private key, `{reason="reserved_key"}` for a standard key beside its Datadog tag |
+//! | `tags`, an array or `null` | attributes, by [`tags`]'s rule; a key under the private `_logit.` prefix omitted; a valued `env:`, `version:`, or `service:` tag the standard key, and a valued tag spelling that key beside it omitted | `logit.input.tags.omitted{reason="reserved_prefix"}` for a private key, `{reason="reserved_key"}` for a standard key beside its Datadog tag |
 //! | `timestamp` seconds | `Event::timestamp`; absent or `0` → `received_at` | -- |
 //!
 //! ## Encode: events → logs, events, service checks
