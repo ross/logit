@@ -1268,6 +1268,18 @@
               "default": false,
               "type": "boolean"
             },
+            "host_name": {
+              "description": "Where each event's `host.name` comes from. Absent by default: no `host.name` is written, so a sink that fills a missing host fills `logit`'s own hostname: the Docker host's when `logit` runs on it directly, or whatever the top-level `hostname:` names. `container` writes the container's own hostname (`Config.Hostname` in `config.v2.json`, usually the short container id unless the container was started with `--hostname`) as `host.name` on the resource, beside `container.id`; a container with no hostname gets none. With `container`, every container is its own host at any sink that reads the host, such as Datadog, which can register a new host per container.",
+              "default": null,
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/DockerHostName"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "labels": {
               "description": "Container label keys to stamp as `container.label.<key>` resource attributes. Empty by default: a label's value is your data, and every key here becomes a permanent entry in the process-wide attribute interner, so this is an opt-in list, never \"all labels\". An empty entry is rejected.",
               "default": [],
@@ -4530,6 +4542,13 @@
             "samples"
           ]
         }
+      ]
+    },
+    "DockerHostName": {
+      "description": "Where `docker_in` reads each event's `host.name` from: `container`, the container's own hostname.",
+      "type": "string",
+      "enum": [
+        "container"
       ]
     },
     "FlattenArrays": {

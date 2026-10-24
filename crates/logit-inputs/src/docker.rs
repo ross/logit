@@ -10,7 +10,10 @@
 //!   later ones. With neither set, the listener follows no container and sends nothing.
 //! - **Identity**: the resource carries `container.id`, `container.name`, `container.image.name`,
 //!   `container.image.tag`, and `container.label.<key>` for each key in `labels:`
-//!   ([`ContainerMeta::resource`]). `config.v2.json` is re-read on a poll tick only when its stat
+//!   ([`ContainerMeta::resource`]), and under `host_name: container` the container's own
+//!   `Config.Hostname` as `host.name`. With no `host_name:` it writes no `host.name`, and a sink's
+//!   process-hostname fallback names the host (ADR `file-tailing-and-docker-json-logs`'s
+//!   "Amendment: `host.name` is opt-in (2026-10-23)"). `config.v2.json` is re-read on a poll tick only when its stat
 //!   changes ([`DockerDecoderFactory::refresh_cache`]). While it has never been read successfully
 //!   (missing or malformed), lines still flow with a `container.id`-only resource and a
 //!   `metadata_error` diagnostic.
@@ -70,6 +73,7 @@ pub(crate) struct ContainerMeta {
     id: String,
     name: String,
     image: String,
+    hostname: String,
     labels: BTreeMap<String, String>,
 }
 
@@ -85,6 +89,8 @@ struct ConfigV2 {
 struct ConfigV2Config {
     #[serde(rename = "Image")]
     image: String,
+    #[serde(rename = "Hostname", default)]
+    hostname: String,
     #[serde(rename = "Labels", default)]
     labels: BTreeMap<String, String>,
 }
@@ -99,7 +105,13 @@ impl ContainerMeta {
             .with_context(|| format!("parsing {}", path.display()))?;
         let id = dir.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_string();
         let name = doc.name.strip_prefix('/').unwrap_or(&doc.name).to_string();
-        Ok(Self { id, name, image: doc.config.image, labels: doc.config.labels })
+        Ok(Self {
+            id,
+            name,
+            image: doc.config.image,
+            hostname: doc.config.hostname,
+            labels: doc.config.labels,
+        })
     }
 
     fn name(&self) -> &str {
@@ -109,10 +121,14 @@ impl ContainerMeta {
     /// Builds this container's resource: `container.id`, `container.name`,
     /// `container.image.name`, `container.image.tag` (when the reference has one), and
     /// `container.label.<key>` for each key in `label_keys` the container carries. Labels are
-    /// opt-in (the file-tailing ADR's "Event and resource shape").
-    pub(crate) fn resource(&self, label_keys: &[String]) -> Arc<Resource> {
+    /// opt-in (the file-tailing ADR's "Event and resource shape"). With `host_name`, a non-empty
+    /// `Config.Hostname` as `host.name`.
+    pub(crate) fn resource(&self, label_keys: &[String], host_name: bool) -> Arc<Resource> {
         let mut attrs = AttrMap::new();
         attrs.insert("container.id", self.id.as_str());
+        if host_name && !self.hostname.is_empty() {
+            attrs.insert(logit_core::attrs::HOST_NAME, self.hostname.as_str());
+        }
         attrs.insert("container.name", self.name.as_str());
         let (image_name, image_tag) = split_image_ref(&self.image);
         attrs.insert("container.image.name", image_name.as_str());
@@ -471,6 +487,7 @@ fn id_only_resource(container_dir: &Path) -> Arc<Resource> {
 struct DockerDecoderFactory {
     filter: ContainerFilter,
     labels: Vec<String>,
+    host_name: bool,
     max_line_bytes: usize,
     diag: Diagnostics,
     telemetry: Telemetry,
@@ -495,7 +512,7 @@ impl DockerDecoderFactory {
         match ContainerMeta::read(dir) {
             Ok(meta) => {
                 entry.failed = false;
-                let resource = meta.resource(&self.labels);
+                let resource = meta.resource(&self.labels, self.host_name);
                 // Keep the existing `Arc` when the rebuilt `Resource` compares equal: the daemon
                 // rewrites `config.v2.json` for restart counts and healthchecks, and a fresh `Arc`
                 // each time would force a spurious `ResourceChange` flush.
@@ -573,7 +590,7 @@ impl DecoderFactory<DockerDecoder> for DockerDecoderFactory {
         self.diag.info(
             "container_renamed",
             format!(
-                "{}: container identity changed (name, image, or a watched label)",
+                "{}: container identity changed (name, image, a watched label, or the hostname)",
                 path.display()
             ),
         );
@@ -617,6 +634,7 @@ impl DockerInput {
         let factory = DockerDecoderFactory {
             filter,
             labels,
+            host_name: false,
             max_line_bytes: config.max_line_bytes,
             diag: Diagnostics::default(),
             telemetry: Telemetry::default(),
@@ -625,6 +643,13 @@ impl DockerInput {
         };
         let config = TailConfig { max_line_bytes: envelope_cap(config.max_line_bytes), ..config };
         Self { inner: Tailer::new(vec![pattern], factory, config) }
+    }
+
+    /// Writes each container's own hostname as the resource's `host.name` (`host_name:
+    /// container`).
+    pub fn with_container_host_name(mut self, on: bool) -> Self {
+        self.inner.factory_mut().host_name = on;
+        self
     }
 
     pub fn with_diagnostics(mut self, diag: Diagnostics) -> Self {
@@ -1223,7 +1248,7 @@ mod tests {
         )
         .unwrap();
         let meta = ContainerMeta::read(&container_dir).unwrap();
-        let resource = meta.resource(&["team".to_string()]);
+        let resource = meta.resource(&["team".to_string()], false);
         assert_eq!(resource.attributes.get("container.id").and_then(|v| v.as_str()), Some(id));
         assert_eq!(resource.attributes.get("container.name").and_then(|v| v.as_str()), Some("web"));
         assert_eq!(
@@ -1241,6 +1266,35 @@ mod tests {
         assert!(
             resource.attributes.get("container.label.secret").is_none(),
             "an unconfigured label must not be exposed"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn host_name_is_the_container_hostname_only_under_host_name_container() {
+        let dir = scratch_dir("docker-hostname");
+        let config = dir.join("config.v2.json");
+        std::fs::write(
+            &config,
+            r#"{"Name":"/web","Config":{"Hostname":"abc123def456","Image":"nginx:1.25"}}"#,
+        )
+        .unwrap();
+        let meta = ContainerMeta::read(&dir).unwrap();
+        assert!(
+            meta.resource(&[], false).attributes.get(logit_core::attrs::HOST_NAME).is_none(),
+            "with no host_name:, docker_in writes no host.name"
+        );
+        assert_eq!(
+            meta.resource(&[], true).attributes.get(logit_core::attrs::HOST_NAME),
+            Some(&Value::str("abc123def456"))
+        );
+
+        std::fs::write(&config, r#"{"Name":"/web","Config":{"Hostname":"","Image":"nginx"}}"#)
+            .unwrap();
+        let meta = ContainerMeta::read(&dir).unwrap();
+        assert!(
+            meta.resource(&[], true).attributes.get(logit_core::attrs::HOST_NAME).is_none(),
+            "an empty Config.Hostname writes nothing"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1287,6 +1341,7 @@ mod tests {
         let mut factory = DockerDecoderFactory {
             filter: ContainerFilter::new(vec![], true),
             labels: vec![],
+            host_name: false,
             max_line_bytes: 1024,
             diag: Diagnostics::new("test"),
             telemetry: Telemetry::default(),
@@ -1390,6 +1445,48 @@ mod tests {
         assert_eq!(msgs, vec!["from a", "from b"], "discover: true should follow every container");
         running2.stop().await;
 
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn host_name_container_stamps_the_container_hostname_on_the_resource() {
+        let root = scratch_dir("docker-host-name");
+        let id = "c".repeat(64);
+        let dir = root.join(&id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.v2.json"),
+            r#"{"Name":"/web","Config":{"Hostname":"cccccccccccc","Image":"nginx:1.25"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join(format!("{id}-json.log")),
+            format!(
+                "{}\n",
+                r#"{"log":"hello\n","stream":"stdout","time":"2026-08-17T19:35:46.000000000Z"}"#
+            ),
+        )
+        .unwrap();
+
+        for (on, want) in [(false, None), (true, Some(Value::str("cccccccccccc")))] {
+            let (fanout, mut rx) = fanout_channel(8);
+            let filter = ContainerFilter::new(vec!["web".to_string()], false);
+            let input = DockerInput::new(root.clone(), filter, vec![], fast_tail_config())
+                .with_container_host_name(on);
+            let running = spawn_input(input, fanout).await;
+            let batch = recv_batch(&mut rx).await;
+            assert_eq!(messages(&batch.events), vec!["hello"]);
+            assert_eq!(
+                batch.resource.attributes.get(logit_core::attrs::HOST_NAME),
+                want.as_ref(),
+                "host_name: container is {on}"
+            );
+            assert_eq!(
+                batch.resource.attributes.get("container.id").and_then(|v| v.as_str()),
+                Some(id.as_str())
+            );
+            running.stop().await;
+        }
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -2964,6 +3061,7 @@ mod tests {
         DockerDecoderFactory {
             filter: ContainerFilter::new(names.iter().map(|n| n.to_string()).collect(), false),
             labels: vec![],
+            host_name: false,
             max_line_bytes: 1024,
             diag: diag.clone(),
             telemetry: Telemetry::default(),

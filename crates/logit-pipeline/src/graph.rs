@@ -5058,6 +5058,7 @@ mod tests {
             containers: containers.into_iter().map(String::from).collect(),
             discover,
             labels: Vec::new(),
+            host_name: None,
             tail: logit_config::TailOptions::default(),
         }
     }
@@ -12102,6 +12103,7 @@ mod tests {
             containers: vec!["nginx".to_string()],
             discover: false,
             labels: Vec::new(),
+            host_name: None,
             tail: logit_config::TailOptions {
                 checkpoint_path: Some(checkpoint_path.to_string()),
                 ..logit_config::TailOptions::default()

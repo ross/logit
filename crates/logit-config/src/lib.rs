@@ -407,6 +407,14 @@ pub struct UserAgentRule {
     pub class: String,
 }
 
+/// Where `docker_in` reads each event's `host.name` from: `container`, the container's own
+/// hostname.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DockerHostName {
+    Container,
+}
+
 /// The forwarding header a component reads the client's address from: `x_forwarded_for`
 /// (`X-Forwarded-For`), `forwarded` (RFC 7239's `Forwarded`), or `x_real_ip` (`X-Real-IP`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -2515,6 +2523,16 @@ pub enum ComponentKind {
         /// empty entry is rejected.
         #[serde(default)]
         labels: Vec<String>,
+        /// Where each event's `host.name` comes from. Absent by default: no `host.name` is
+        /// written, so a sink that fills a missing host fills `logit`'s own hostname: the Docker
+        /// host's when `logit` runs on it directly, or whatever the top-level `hostname:` names. `container` writes the
+        /// container's own hostname (`Config.Hostname` in `config.v2.json`, usually the short
+        /// container id unless the container was started with `--hostname`) as `host.name` on the
+        /// resource, beside `container.id`; a container with no hostname gets none. With
+        /// `container`, every container is its own host at any sink that reads the host, such as
+        /// Datadog, which can register a new host per container.
+        #[serde(default)]
+        host_name: Option<DockerHostName>,
         #[serde(flatten)]
         tail: TailOptions,
     },

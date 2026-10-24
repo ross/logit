@@ -913,7 +913,7 @@ pub(crate) fn build_spec(
                 input_runtime_config(&component.receive),
             )
         }
-        DockerIn { root, containers, discover, labels, tail } => {
+        DockerIn { root, containers, discover, labels, host_name, tail } => {
             let root = base_dir.join(root);
             let filter = ContainerFilter::new(containers.clone(), *discover);
             NodeSpec::Input(
@@ -924,6 +924,10 @@ pub(crate) fn build_spec(
                         labels.clone(),
                         tail_config(tail, &component.receive, base_dir),
                     )
+                    .with_container_host_name(matches!(
+                        host_name,
+                        Some(logit_config::DockerHostName::Container)
+                    ))
                     .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
                     .with_telemetry(telemetry.clone()),
                 ),
@@ -3834,6 +3838,7 @@ mod tests {
                 containers: vec!["nginx".to_string()],
                 discover: false,
                 labels: vec!["team".to_string()],
+                host_name: Some(logit_config::DockerHostName::Container),
                 tail: logit_config::TailOptions::default(),
             },
         };

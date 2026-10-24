@@ -1,6 +1,6 @@
 ---
 created: 2026-09-06
-updated: 2026-10-21
+updated: 2026-10-23
 ---
 
 # `tail_in`: generic file tailing, and `docker_in` on top of it for Docker's json-file logs
@@ -630,3 +630,21 @@ nothing and stop cleanly on shutdown. Validation rejects a config only when it c
 it would lose or duplicate data the operator didn't ask to lose or duplicate, and an idle listener
 does neither. Rule 26 keeps its empty-entry and glob checks, and rule 27 keeps its empty-entry,
 duplicate-entry, and empty-`root` checks.
+
+## Amendment: `host.name` is opt-in (2026-10-23)
+
+[ADR `process-hostname`](process-hostname.md)'s "Amendment: a source fills the common keys
+(2026-10-23)" has an input write `host.name` from its protocol's host field. `config.v2.json`
+names one, `Config.Hostname`, and `docker_in` doesn't write it by default: it is the container's
+own hostname, usually its short id unless the container was started with `--hostname`. As the
+host, it would make every container a host of its own, and at `datadog_out` a new Datadog host per
+container. With no `host.name`, a sink's process-hostname fallback names the host `logit` runs on,
+which for a `logit` tailing the daemon's directory is the Docker host, the usual reading of a
+container log's host.
+
+`host_name: container` writes it for an operator who wants each container as a host. It lands on
+the resource beside `container.id`, since a resource is per container, and a container whose
+`Config.Hostname` is empty or missing gets none. An enum rather than a boolean leaves room for
+another source of the host without renaming the field. The resource is rebuilt with the rest of
+the identity, so a `config.v2.json` rewrite that changes the hostname starts a new batch as a
+rename does.
