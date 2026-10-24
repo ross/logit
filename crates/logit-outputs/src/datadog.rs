@@ -333,8 +333,8 @@ use logit_proto::datadog::series::{
     metric_tag_count, record_routes, series_over_tag_limit, SeriesDuplicates, SeriesPlanned,
 };
 use logit_proto::datadog::{
-    is_datadog_event, is_datadog_stats, is_service_check, trace_readiness, DatadogEncoder,
-    HistogramOptions, TraceReadiness, MAX_METRIC_TAGS,
+    datadog_stats_name, is_datadog_event, is_datadog_stats, is_service_check, trace_readiness,
+    DatadogEncoder, HistogramOptions, TraceReadiness, MAX_METRIC_TAGS,
 };
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -643,13 +643,14 @@ fn partition(batch: &EventBatch, histograms: HistogramOptions) -> Routing {
     let resource = &batch.resource;
     let mut routes: [Vec<Item>; 8] = Default::default();
     let mut unrouted = 0;
+    let stats_name = datadog_stats_name();
     for (index, event) in batch.events.iter().enumerate() {
         let mut routed = false;
         let mut push = |route: Route, weight: usize| {
             routes[route as usize].push(Item { index, weight });
             routed = true;
         };
-        if is_datadog_stats(resource, event) {
+        if is_datadog_stats(resource, event, stats_name) {
             push(Route::Stats, 1);
             continue;
         }
