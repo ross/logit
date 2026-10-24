@@ -331,59 +331,76 @@ lands.
 | `process.pid` | integer | a syslog PROCID or RFC 3164 `tag[pid]` that is canonical decimal |
 
 **Scope.** A tag or field on one line, record, or span is identity for that event, so the source
-writes the key there. A field of a whole payload (a `TracerPayload`, a `ClientStatsPayload`, a
-tracer's request headers) is identity for the batch, which is one payload, so the source writes
-it on the resource. A sink reads the event's value, else the resource's. A sink that writes a
-per-payload field reads the resource only, as `datadog_out` does for a `TracerPayload`'s
-`hostname` ([ADR `datadog-agent-and-intake-relay`](datadog-agent-and-intake-relay.md)'s
-"Amendment: the tracer hostname is `host.name` (2026-10-23)"): an event's own value is an ordinary
-span tag, and in a form with no payload field the resource's value rides as a span tag that a
-differing event value shadows, counted.
+will write the key there. A field of a whole payload (a `TracerPayload`, a `ClientStatsPayload`, a
+tracer's request headers) is identity for the batch, which is one payload, so the source will
+write it on the resource. A sink will read the event's value, else the resource's. A sink that
+writes a per-payload field will read the resource only, as the Datadog encoder that `datadog_out`
+and `datadog_trace_out` share does for a `TracerPayload`'s `hostname`
+([ADR `datadog-agent-and-intake-relay`](datadog-agent-and-intake-relay.md)'s "Amendment: the
+tracer hostname is `host.name` (2026-10-23)"): an event's own value is an ordinary span tag, and
+in a form with no payload field (`datadog_trace_out`'s v0.4) the resource's value rides as a span
+tag that a differing event value shadows, counted.
 
 **Collision at decode: the protocol's form wins.** When a protocol's own field and a sender's tag
 name the same fact (a span's `env` meta beside a `deployment.environment.name` meta key, `|c:`
 beside a `container.id:` tag, `env:` beside `deployment.environment.name:` in one tag list), the
-key takes the protocol's value, and the tag is dropped, counted
+key will take the protocol's value, and the tag will be dropped, counted
 `logit.input.tags.omitted{reason="reserved_key"}`, as a `host.name:` tag beside a line's own host
 is.
 
 **Collision at encode: the key wins.** A bare `env`, `version`, or `service` attribute beside its
-key comes only from an operator's transform or a source in another family. A sink omits it and
-counts `logit.output.tags.omitted`, as `statsd_out` omits a valued `host` beside `host.name`
+key comes only from an operator's transform or a source in another family. A sink will omit it and
+count `logit.output.tags.omitted`, as `statsd_out` omits a valued `host` beside `host.name`
 (`reason="unrepresentable"` in a tag list, and `reason="reserved_key"` for a key that would collide
 with a Datadog log's own field, as a log's `hostname` attribute does).
 
-**Datadog's spellings.** A Datadog-family sink writes each key under the name Datadog's OTLP
-mapping gives it, whatever source wrote it: `service.name` as `service`,
-`deployment.environment.name` as `env`, `service.version` as `version`, and `container.id` as a
-`container_id` tag on metrics, events, and checks and as the `container_id` payload field and
-`Datadog-Container-ID` header on traces (datadog-agent 7.83.3,
-`pkg/opentelemetry-mapping-go/otlp/attributes/attributes.go`, `coreMapping` and
-`ContainerMappings`). On a log, `container.id` is appended to `ddtags` as `container_id:<id>`, as
-the Agent tags a container's logs, and a `container_id:` entry already in the log's `ddtags` loses
-to the key, removed and counted `reason="reserved_key"`, as a log's `hostname` beside `host.name`
-is. Datadog's `image_tag` holds one value, so a Datadog-family sink writes the first element of
-`container.image.tags` as the `image_tag` tag or stats `ImageTag` and omits the rest, counted
-`reason="unrepresentable"`, as for any value the wire has no place for.
-`statsd_out` under `format: dogstatsd` writes `env:`, `version:`, and `service:` tags and `|c:`.
-`otlp_out` and `splunk_hec_out` pass the keys through as attributes.
+**Datadog's spellings.** A Datadog-family sink will write each key under Datadog's name for it,
+whatever source wrote it:
+
+- On metrics, events, and checks, `service.name` as a `service` tag,
+  `deployment.environment.name` as `env`, `service.version` as `version`, and `container.id` as
+  `container_id`: the tag spellings of Datadog's OTLP mapping (datadog-agent 7.83.3,
+  `pkg/opentelemetry-mapping-go/otlp/attributes/attributes.go`, `coreMapping` and
+  `ContainerMappings`).
+- On traces, `container.id` as the `TracerPayload`'s `container_id`, which the Agent's OTLP trace
+  receiver fills from `container.id` (`pkg/trace/api/otlp.go`, `receiveResourceSpansV1` and
+  `receiveResourceSpansV2`), and as the tracer API's `Datadog-Container-ID` header at
+  `datadog_trace_out`.
+- On a log, `container.id` appended to `ddtags` as `container_id:<id>`, as the Agent tags a
+  container's logs. A `container_id:` entry already in the log's `ddtags` loses to the key,
+  removed and counted `reason="reserved_key"`, as a log's `hostname` beside `host.name` is.
+- `container.image.tags`' first element as the `image_tag` tag or stats `ImageTag`.
+  `ContainerMappings` maps the deprecated singular `container.image.tag` to `image_tag` and reads
+  nothing for the array, so this is `logit`'s rule, by analogy. `image_tag` holds one value, so
+  further elements will be omitted, counted `reason="unrepresentable"`, as for any value the wire
+  has no place for.
+
+`statsd_out` under `format: dogstatsd` will write `env:`, `version:`, and `service:` tags and
+`|c:`. `otlp_out` and `splunk_hec_out` pass the keys through as attributes.
 
 **DogStatsD `|c:`.** The Agent reads `|c:` as origin-detection local data (datadog-agent 7.83.3,
-`comp/core/tagger/origindetection/origindetection.go`, `ParseLocalData`). Every form it reads as a
-container id (bare, `ci-`, and `cid-`) is the container id, so `statsd_in` will write it as `container.id` with the prefix stripped.
-An `in-<inode>` is a cgroup v2 inode, which no neutral key names, so it will decode to the carrier
-`_logit.statsd.cgroup_inode`; a comma pair yields both. `statsd_out` will write `|c:<id>` bare,
-appending `,in-<inode>` when the carrier is present. A `ci-` or `cid-` prefix relaying as the bare id is
-a named normalization of the DogStatsD pair, since the bare form is the one every Agent version
-reads.
+`comp/core/tagger/origindetection/origindetection.go`, `ParseLocalData`), and a single value reads
+differently from a comma list:
 
-**Datadog logs: `ddtags` is lifted, not split.** `datadog_in` lifts a log's `ddtags` `env:`,
-`version:`, and `service:` onto the three keys and keeps every other tag in the one `ddtags`
-string. A log's own `service` field wins over a `ddtags` `service:`, and the loser is dropped and
-counted as a decode collision. `datadog_out` writes `env:` and `version:` back into `ddtags` from
-the keys for any log, an OTLP log included, and `service.name` as the log's `service`. A full
-split was rejected: a tag and a top-level field are different things in Datadog, and
-`datadog_out` writes every attribute as a field, so a relay would turn each split tag into a
+- A single value that is bare or prefixed `ci-` or `cid-` is a container id, so `statsd_in` will
+  write it as `container.id` with the prefix stripped. A single `in-<inode>` is a cgroup v2 inode,
+  which no neutral key names, so it will decode to the carrier `_logit.statsd.cgroup_inode`.
+- In a comma list, the Agent reads only `ci-` and `in-` items, so `statsd_in` will too: a `ci-`
+  item is `container.id`, an `in-` item is the carrier, and any other item will be dropped,
+  counted `reason="malformed"`, the reason the decoder gives input it can't read.
+
+`statsd_out` will write a container id alone as `|c:<id>`, bare, and with the carrier as
+`|c:ci-<id>,in-<inode>`, the only list form in which the Agent reads the id; the carrier alone
+leaves as `|c:in-<inode>`. A single `ci-` or `cid-` value relaying as the bare id will be a named
+normalization of the DogStatsD pair: a bare single value is the form every Agent version reads.
+
+**Datadog logs: `ddtags` is lifted, not split.** `datadog_in` will lift a log's `ddtags` `env:`,
+`version:`, and `service:` onto the three keys and keep every other tag in the one `ddtags`
+string. A log's own `service` field wins over a `ddtags` `service:`, and the loser will be dropped
+and counted as a decode collision. `datadog_out` will write `env:` and `version:` back into
+`ddtags` from the keys for any log, an OTLP log included, and `service.name` as the log's
+`service`. A full split was rejected: a tag and a top-level field are different things in Datadog,
+and `datadog_out` writes every attribute as a field, so a relay would turn each split tag into a
 field. The three lifted tags are Unified Service Tagging's, which every route has a typed home
 for.
 

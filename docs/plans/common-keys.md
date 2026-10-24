@@ -20,7 +20,9 @@ landed.
 
 Goals:
 
-- Every input whose protocol defines one of the six keys in [The keys](#the-keys) writes it, at
+- Every input whose protocol defines one of the six keys in
+  [ADR `process-hostname`](../adr/process-hostname.md#amendment-the-remaining-common-keys-2026-10-24)
+  writes it, at
   the scope where it is identity, and the carrier or bare attribute it replaces is gone.
 - Every sink in that input's family writes the key back in its own wire form, so each like-pair
   relay stays a fixed point modulo its named normalizations.
@@ -32,7 +34,7 @@ Non-goals:
 - Any key an input would have to infer from a field its protocol doesn't define. A Telegraf
   `env` tag on `influxdb_in`, a parsed log's `service` field on `tail_in`, or a carbon path
   segment stays what it is, and an operator's transform puts it on a common key.
-- The Datadog fields listed in [What stays as it is](#what-stays-as-it-is).
+- The fields the same amendment lists under "What stays as it is".
 - `otlp_out` and `splunk_hec_out` changes beyond what a test shows is needed. Both pass the keys
   through as attributes today.
 
@@ -49,109 +51,25 @@ ambiguous, the default is to write nothing, with a config option. The rule and i
 
 ## Settled calls
 
-### The keys
+The decisions are recorded once, in ADR `process-hostname`'s "Amendment: the remaining common
+keys (2026-10-24)": the six keys and their types, the scope rule, the two collision rules,
+Datadog's spellings at a Datadog-family sink, the `ddtags` lift and why a full split was rejected,
+DogStatsD `|c:`, and what stays as it is, with a reason for each. This plan adds the code each
+decision lands in.
 
-| Key | Type | Written from (protocol-defined fields only) |
-|---|---|---|
-| `service.name` | string | a Datadog log's `service`; a `service:` tag on a DogStatsD line and on a Datadog series, sketch, event, or service check; a stats payload's `Service`. Spans and APM stats groups already write it |
-| `deployment.environment.name` | string | an `env:` tag (DogStatsD, Datadog metrics, events, and checks); a Datadog log's `ddtags` `env:`; a span's `env` meta; a `TracerPayload`'s `env`; a stats payload's `Env` |
-| `service.version` | string | a `version:` tag; a `ddtags` `version:`; a span's `version` meta; a `TracerPayload`'s `app_version`; a stats payload's `Version` |
-| `container.id` | string | DogStatsD `\|c:` on metrics, events, and checks; the `Datadog-Container-ID` header and a `TracerPayload`'s `container_id`; a stats payload's `ContainerID` |
-| `container.image.tags` | array of string | a stats payload's `ImageTag`, as one element; `docker_in`'s image reference tag, renamed from `container.image.tag` |
-| `process.pid` | integer | a syslog PROCID or RFC 3164 `tag[pid]` that is canonical decimal |
+Code the cross-cutting rules follow:
 
-The names are semconv's current ones. `deployment.environment` and `container.image.tag` are
-deprecated there, and pre-release `logit` keeps no alias for either. Each key joins
-[data-model.md](../design/data-model.md)'s "Well-known attribute names" in the PR that first
-writes it.
-
-### Scope
-
-A tag or field on one line, record, or span writes the key on that event. A field of a whole
-payload (a `TracerPayload`, a `ClientStatsPayload`, the tracer's request headers) writes it on the
-batch resource, because a batch is one payload. A sink reads the event's value, else the
-resource's.
-
-A sink that writes a per-payload field reads the resource only, and follows what `datadog_out`
-does for a `TracerPayload`'s `hostname` today: the field is the resource's value, an event's own
-value is an ordinary span tag, and in a form with no payload field (v0.4, v0.5) the resource value
-rides as a span tag that a differing event value shadows, counted lost (`is_carrier` and
-`DatadogEncoder::wire_span` in `crates/logit-proto/src/datadog/traces.rs`).
-
-### Collisions
-
-**At decode, the protocol's own form wins.** When a protocol's own field and a sender's tag name
-the same fact (a span's `env` meta beside a `deployment.environment.name` meta key, `|c:` beside a
-`container.id:` tag, or `env:` beside `deployment.environment.name:` in one tag list), the key takes
-the protocol's value and the tag is dropped, counted
-`logit.input.tags.omitted{reason="reserved_key"}` once per wire tag. That's the counter and reason
-a `host.name:` tag beside `#host:` uses (`insert_host` in `crates/logit-proto/src/statsd/decode.rs`,
-`insert_wire_host` in `crates/logit-proto/src/datadog/mod.rs`).
-
-**At encode, the key wins.** A bare `env`, `version`, or `service` attribute beside its key can
-only come from an operator's transform or a source in another family, and writing both would put
-two values of one tag on the wire. The bare one is omitted, counted
-`logit.output.tags.omitted`: `reason="unrepresentable"` in a tag list, as `statsd_out` counts a
-valued `host` beside `host.name`, and `reason="reserved_key"` for a Datadog log's top-level key, as
-`datadog_out` counts a log's `hostname` attribute.
-
-### Datadog's spellings at a Datadog-family sink
-
-`datadog_out`, `datadog_trace_out`, and `statsd_out` under `format: dogstatsd` write each key under
-the name Datadog's OTLP mapping uses (datadog-agent 7.83.3,
-`pkg/opentelemetry-mapping-go/otlp/attributes/attributes.go`, `coreMapping` and
-`ContainerMappings`):
-
-| Key | Metrics, events, checks | Logs | Traces and stats |
-|---|---|---|---|
-| `service.name` | `service:` tag | `service` field | the span's or group's `service`; a stats payload's `Service` |
-| `deployment.environment.name` | `env:` tag | `env:` in `ddtags` | `env` meta; `TracerPayload.env`; stats `Env` |
-| `service.version` | `version:` tag | `version:` in `ddtags` | `version` meta; `TracerPayload.app_version`; stats `Version` |
-| `container.id` | `container_id:` tag at `datadog_out`; `\|c:` at `statsd_out` | `container_id:<id>` appended to `ddtags` | `TracerPayload.container_id` and the `Datadog-Container-ID` header; stats `ContainerID` |
-| `container.image.tags` | the first element as an `image_tag:` tag | the first element as `image_tag:` in `ddtags` | the first element as stats `ImageTag` |
-
-`otlp_out` and `splunk_hec_out` send the keys as attributes under their semconv names.
-
-Datadog's `image_tag` holds one value, so a Datadog-family sink writes the first element of
-`container.image.tags` and omits the rest, counted
-`logit.output.tags.omitted{reason="unrepresentable"}`, the reason the sinks use for a value the
-wire has no place for. On a log, `container.id` is appended to
-`ddtags` as `container_id:<id>`, as the Agent tags a container's logs; a `container_id:` entry
-already in the log's `ddtags` string loses to the key, removed and counted
-`logit.output.tags.omitted{reason="reserved_key"}`, as a log's `hostname` beside `host.name` is.
-W1 writes this and records it in the Datadog relay ADR.
-
-### Datadog logs: `ddtags` is lifted, not split
-
-A Datadog log's `ddtags` is one comma-joined string. W4b lifts its `env:`, `version:`, and
-`service:` tags onto the three keys and leaves every other tag in the one `ddtags` string attribute,
-unchanged. A log's own `service` field wins over a `ddtags` `service:`, and the losing one is
-dropped, counted as a decode collision. `datadog_out` writes `env:` and `version:` back into
-`ddtags` from the keys for any log, an OTLP log included, and writes `service.name` as the log's
-`service` field.
-
-A full split, every tag to its own attribute, was rejected. A tag and a top-level JSON field are
-different things in Datadog, and `datadog_out` writes every attribute as a field. A split tag would come back from a relay as a
-field, so the round trip would change what Datadog stores. The three lifted tags are the
-exception because Unified Service Tagging defines them, and they have a typed home on every route.
-
-### What stays as it is
-
-- **`AgentPayload.env` and `agentVersion`, and a `StatsPayload`'s `agentEnv` and `agentVersion`**
-  (`_logit.datadog.agent.env`, `_logit.datadog.agent.version`). They're the relaying Agent's
-  identity, not the application's, as `_logit.datadog.agent.hostname` is.
-- **A stats payload's `GitCommitSha`** (`_logit.datadog.stats.git_commit_sha`). semconv's `vcs.*`
-  keys describe a repository change, not a deployed build, and nothing outside the Datadog family
-  reads it.
-- **Syslog APP-NAME** stays `syslog.tag`. It names a program (`sshd`, `nginx`), not a service, and
-  writing it as `service.name` would give every daemon on a host its own service.
-- **A tracer's `language_name`, `tracer_version`, and `runtime_id`** stay
-  `_logit.datadog.tracer.*` carriers. They describe the tracing library, and only
-  `datadog_trace_out` and `datadog_out` read them.
-- **A Datadog log's `ddsource`** stays `ddsource`. It names the log's integration, and semconv has
-  no key for it.
-- **`influxdb_in`, `graphite_in`, `lines_in`, and `tail_in`** write none of the six keys. Their
-  protocols define no such field, so a value they carry is an operator's to move with a transform.
+- **Scope on encode.** A per-payload field follows the Datadog encoder's `TracerPayload`
+  `hostname` rule, in `is_carrier` and `DatadogEncoder::wire_span` in
+  `crates/logit-proto/src/datadog/traces.rs`, which `datadog_out` and `datadog_trace_out` share.
+  The form with no payload field is `datadog_trace_out`'s v0.4.
+- **Collision at decode.** `logit.input.tags.omitted{reason="reserved_key"}` is what
+  `insert_host` in `crates/logit-proto/src/statsd/decode.rs` and `insert_wire_host` in
+  `crates/logit-proto/src/datadog/mod.rs` count for a `host.name:` tag beside a line's own host.
+- **Collision at encode.** `statsd_out` counts a valued `host` beside `host.name` as
+  `logit.output.tags.omitted{reason="unrepresentable"}`; the Datadog log encoder in
+  `crates/logit-proto/src/datadog/logs.rs` counts a log's `hostname` attribute as
+  `reason="reserved_key"`.
 
 ## Per-input mapping
 
@@ -163,26 +81,21 @@ its scope; "Becomes" is the key it moves to, on the same scope unless the row sa
 | Input | Wire field | Today | Becomes | Code |
 |---|---|---|---|---|
 | `statsd_in` | `\|c:` on a metric line, event, or service check | `_logit.statsd.container_id`, event, the raw field | `container.id`, event | `insert_container_id` in `crates/logit-proto/src/statsd/decode.rs` |
-| `datadog_trace_in` | `Datadog-Container-ID` header | `_logit.datadog.tracer.container_id`, resource, filled only when the payload's own field is empty | `container.id`, resource | `apply_tracer_headers` and `apply_stats_headers` in `crates/logit-inputs/src/datadog_trace.rs`, through `TRACER_STR_HEADERS` in `crates/logit-proto/src/datadog/mod.rs` |
+| `datadog_trace_in` | `Datadog-Container-ID` header | `_logit.datadog.tracer.container_id`, resource, filled only when the payload's own field is empty | `container.id`, resource | `apply_tracer_headers` (through `TRACER_STR_HEADERS` in `crates/logit-proto/src/datadog/mod.rs`) and `apply_stats_headers` (through `STATS_HEADERS`) in `crates/logit-inputs/src/datadog_trace.rs` |
 | `datadog_in` traces, `datadog_trace_in` `/v0.7/traces` | `TracerPayload.container_id` | `_logit.datadog.tracer.container_id`, resource | `container.id`, resource | `tracer_resource` in `crates/logit-proto/src/datadog/traces.rs` |
 | `datadog_in` stats, `datadog_trace_in` `/v0.6/stats` | `ClientStatsPayload.ContainerID` | `_logit.datadog.tracer.container_id`, resource (the tracer carrier, shared with traces) | `container.id`, resource | `PAYLOAD_STRINGS` and `payload_string_mut` in `crates/logit-proto/src/datadog/stats.rs` |
 | `datadog_in` stats, `datadog_trace_in` `/v0.6/stats` | `ClientStatsPayload.ImageTag` | `_logit.datadog.stats.image_tag`, resource | `container.image.tags`, a one-element array, resource | the same |
 | `docker_in` | the image reference's tag in `config.v2.json` | `container.image.tag`, resource | `container.image.tags`, a one-element array, resource | `resource` in `crates/logit-inputs/src/docker.rs` |
 
-`datadog_out` writes no container identity on any route today, so W1's `container_id:` and
-`image_tag:` tags are new output there. `statsd_out` writes `|c:` from the carrier.
+`datadog_out` writes no container identity on its metrics, events, checks, or logs routes today,
+so W1's `container_id:` and `image_tag:` tags are new output there. Its traces and stats routes
+write `container_id`, `ContainerID`, and `ImageTag` from the carriers (`wire_tracer` in
+`traces.rs`, `client_payload` in `stats.rs`), and W1 moves those reads to `container.id` and
+`container.image.tags`. `statsd_out` writes `|c:` from the carrier.
 
-**`|c:` isn't always a container id.** The Agent reads `|c:` as origin-detection local data
-(datadog-agent 7.83.3, `comp/core/tagger/origindetection/origindetection.go`, `ParseLocalData`):
-a bare id or a `cid-` or `ci-` prefixed one is a container id, an `in-` prefixed one is a cgroup v2
-inode, and a comma pair holds one of each. Today the decoder keeps the whole field verbatim. W1
-will decode every form `ParseLocalData` reads as a container id (bare, `ci-`, and `cid-`) to
-`container.id`, with the prefix stripped, and an
-`in-<inode>` to the carrier `_logit.statsd.cgroup_inode`, since no neutral key names a cgroup
-inode; a comma pair yields both. `statsd_out` will write `|c:<id>` bare, appending `,in-<inode>`
-when the carrier is present. A `ci-` or `cid-` prefix relaying as the bare id is a named normalization of
-the DogStatsD pair: the bare form is the one every Agent version reads. W1 records this in the
-DogStatsD relay ADR.
+**`|c:` isn't always a container id.** The Agent reads it as origin-detection local data, and
+today the decoder keeps the whole field verbatim. The ADR amendment's "DogStatsD `|c:`" says how W1
+will decode and write each form.
 
 ### Process identity (W2)
 
@@ -193,8 +106,8 @@ DogStatsD relay ADR.
 
 Canonical decimal is ASCII digits with no leading zero, or `0`. A PROCID that isn't (`-` aside,
 which writes nothing) stays the string `syslog.pid`, since it isn't a process id and `syslog_out`
-has to relay it unchanged. `syslog_out` reads both spellings back as PROCID (`resolve_pid` in
-`crates/logit-outputs/src/syslog.rs`).
+has to relay it unchanged. W2 makes `syslog_out` read both back as PROCID (`resolve_pid` in
+`crates/logit-outputs/src/syslog.rs`, which today reads `syslog.pid` alone).
 
 ### Service identity on tags (W4a)
 
