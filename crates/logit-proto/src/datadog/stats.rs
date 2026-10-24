@@ -14,12 +14,11 @@
 
 use super::outcomes::StatsIn;
 use super::{
-    merged_get, DatadogDecoder, DatadogEncoder, ATTR_HOST_NAME, ATTR_RESOURCE_NAME,
-    ATTR_SERVICE_NAME, ATTR_SPAN_KIND, ATTR_SPAN_TYPE, RESOURCE_ATTR_AGENT_ENV,
-    RESOURCE_ATTR_AGENT_HOSTNAME, RESOURCE_ATTR_AGENT_VERSION, RESOURCE_ATTR_TRACER_APP_VERSION,
-    RESOURCE_ATTR_TRACER_CONTAINER_ID, RESOURCE_ATTR_TRACER_ENV,
-    RESOURCE_ATTR_TRACER_LANGUAGE_NAME, RESOURCE_ATTR_TRACER_RUNTIME_ID,
-    RESOURCE_ATTR_TRACER_VERSION,
+    merged_get, DatadogDecoder, DatadogEncoder, ATTR_CONTAINER_ID, ATTR_CONTAINER_IMAGE_TAGS,
+    ATTR_HOST_NAME, ATTR_RESOURCE_NAME, ATTR_SERVICE_NAME, ATTR_SPAN_KIND, ATTR_SPAN_TYPE,
+    RESOURCE_ATTR_AGENT_ENV, RESOURCE_ATTR_AGENT_HOSTNAME, RESOURCE_ATTR_AGENT_VERSION,
+    RESOURCE_ATTR_TRACER_APP_VERSION, RESOURCE_ATTR_TRACER_ENV, RESOURCE_ATTR_TRACER_LANGUAGE_NAME,
+    RESOURCE_ATTR_TRACER_RUNTIME_ID, RESOURCE_ATTR_TRACER_VERSION,
 };
 use crate::datadog::generated::ddsketch::{
     index_mapping::Interpolation, DdSketch as PbSketch, Store,
@@ -74,15 +73,16 @@ pub const ATTR_BUCKET_DURATION: &str = "_logit.datadog.stats.bucket.duration";
 pub const ATTR_BUCKET_AGENT_TIME_SHIFT: &str = "_logit.datadog.stats.bucket.agent_time_shift";
 
 /// `ClientStatsPayload` fields, as batch resource attributes. `RESOURCE_ATTR_TRACER_ENV` /
-/// `_APP_VERSION` / `_LANGUAGE_NAME` / `_VERSION` / `_RUNTIME_ID` / `_CONTAINER_ID` are
-/// [`super`]'s constants, shared with [`super::traces`]'s `TracerPayload` fields, and `Hostname`
-/// is the resource's `host.name` ([`ATTR_HOST_NAME`]), as a `TracerPayload`'s is.
+/// `_APP_VERSION` / `_LANGUAGE_NAME` / `_VERSION` / `_RUNTIME_ID` are [`super`]'s constants,
+/// shared with [`super::traces`]'s `TracerPayload` fields; `Hostname` is the resource's
+/// `host.name` ([`ATTR_HOST_NAME`]) and `ContainerID` its `container.id` ([`ATTR_CONTAINER_ID`]),
+/// as a `TracerPayload`'s are; and `ImageTag` is the one element of its `container.image.tags`
+/// ([`ATTR_CONTAINER_IMAGE_TAGS`]).
 pub const RESOURCE_ATTR_STATS_SEQUENCE: &str = "_logit.datadog.stats.sequence";
 pub const RESOURCE_ATTR_STATS_AGENT_AGGREGATION: &str = "_logit.datadog.stats.agent_aggregation";
 pub const RESOURCE_ATTR_STATS_SERVICE: &str = "_logit.datadog.stats.service";
 pub const RESOURCE_ATTR_STATS_TAGS: &str = "_logit.datadog.stats.tags";
 pub const RESOURCE_ATTR_STATS_GIT_COMMIT_SHA: &str = "_logit.datadog.stats.git_commit_sha";
-pub const RESOURCE_ATTR_STATS_IMAGE_TAG: &str = "_logit.datadog.stats.image_tag";
 pub const RESOURCE_ATTR_STATS_PROCESS_TAGS_HASH: &str = "_logit.datadog.stats.process_tags_hash";
 pub const RESOURCE_ATTR_STATS_PROCESS_TAGS: &str = "_logit.datadog.stats.process_tags";
 /// `StatsPayload` envelope fields, as batch resource attributes (`agentHostname`, `agentEnv`, and
@@ -151,18 +151,17 @@ const GROUP_SCALARS: [&str; 5] = [
     ATTR_BUCKET_AGENT_TIME_SHIFT,
 ];
 
-const PAYLOAD_STRINGS: [&str; 12] = [
+const PAYLOAD_STRINGS: [&str; 11] = [
     ATTR_HOST_NAME,
     RESOURCE_ATTR_TRACER_ENV,
     RESOURCE_ATTR_TRACER_APP_VERSION,
     RESOURCE_ATTR_TRACER_LANGUAGE_NAME,
     RESOURCE_ATTR_TRACER_VERSION,
     RESOURCE_ATTR_TRACER_RUNTIME_ID,
-    RESOURCE_ATTR_TRACER_CONTAINER_ID,
+    ATTR_CONTAINER_ID,
     RESOURCE_ATTR_STATS_AGENT_AGGREGATION,
     RESOURCE_ATTR_STATS_SERVICE,
     RESOURCE_ATTR_STATS_GIT_COMMIT_SHA,
-    RESOURCE_ATTR_STATS_IMAGE_TAG,
     RESOURCE_ATTR_STATS_PROCESS_TAGS,
 ];
 
@@ -174,11 +173,10 @@ fn payload_string_mut<'p>(p: &'p mut ClientStatsPayload, key: &str) -> &'p mut S
         RESOURCE_ATTR_TRACER_LANGUAGE_NAME => &mut p.lang,
         RESOURCE_ATTR_TRACER_VERSION => &mut p.tracer_version,
         RESOURCE_ATTR_TRACER_RUNTIME_ID => &mut p.runtime_id,
-        RESOURCE_ATTR_TRACER_CONTAINER_ID => &mut p.container_id,
+        ATTR_CONTAINER_ID => &mut p.container_id,
         RESOURCE_ATTR_STATS_AGENT_AGGREGATION => &mut p.agent_aggregation,
         RESOURCE_ATTR_STATS_SERVICE => &mut p.service,
         RESOURCE_ATTR_STATS_GIT_COMMIT_SHA => &mut p.git_commit_sha,
-        RESOURCE_ATTR_STATS_IMAGE_TAG => &mut p.image_tag,
         _ => &mut p.process_tags,
     }
 }
@@ -580,6 +578,10 @@ impl DatadogDecoder {
                 attrs.insert(key, Value::str(v));
             }
         }
+        if !client.image_tag.is_empty() {
+            let tag = Value::str(std::mem::take(&mut client.image_tag));
+            attrs.insert(ATTR_CONTAINER_IMAGE_TAGS, Value::Array(vec![tag]));
+        }
         if client.sequence != 0 {
             attrs.insert(RESOURCE_ATTR_STATS_SEQUENCE, Value::U64(client.sequence));
         }
@@ -824,6 +826,7 @@ impl DatadogEncoder {
                 *payload_string_mut(&mut client, key) = v;
             }
         }
+        client.image_tag = self.image_tag(attrs.get(ATTR_CONTAINER_IMAGE_TAGS));
         client.sequence = self.carrier_u64(attrs.get(RESOURCE_ATTR_STATS_SEQUENCE));
         client.process_tags_hash =
             self.carrier_u64(attrs.get(RESOURCE_ATTR_STATS_PROCESS_TAGS_HASH));
@@ -835,6 +838,7 @@ impl DatadogEncoder {
             if !is_group_key(key)
                 && !logit_core::attrs::is_private(key)
                 && !PAYLOAD_STRINGS.contains(&key)
+                && key != ATTR_CONTAINER_IMAGE_TAGS
                 && !PAYLOAD_SCALARS.contains(&key)
                 && !(envelope && ENVELOPE_KEYS.contains(&key))
             {
@@ -987,6 +991,20 @@ impl DatadogEncoder {
                 self.tag_omitted("unrepresentable");
                 None
             }
+        }
+    }
+
+    /// `ImageTag` from `container.image.tags`: its first element, each further one omitted and
+    /// counted `unrepresentable`, since the field holds one tag. A lone `Str` is the tag itself.
+    fn image_tag(&self, v: Option<&Value>) -> String {
+        match v {
+            Some(Value::Array(items)) => {
+                for _ in items.iter().skip(1) {
+                    self.tag_omitted("unrepresentable");
+                }
+                self.carrier_str(items.first()).unwrap_or_default()
+            }
+            v => self.carrier_str(v).unwrap_or_default(),
         }
     }
 
@@ -1474,11 +1492,17 @@ mod tests {
         assert_eq!(s(RESOURCE_ATTR_TRACER_LANGUAGE_NAME), Some("go"));
         assert_eq!(s(RESOURCE_ATTR_TRACER_VERSION), Some("v1.60.0"));
         assert_eq!(s(RESOURCE_ATTR_TRACER_RUNTIME_ID), Some("rid"));
-        assert_eq!(s(RESOURCE_ATTR_TRACER_CONTAINER_ID), Some("cid"));
+        assert_eq!(s(ATTR_CONTAINER_ID), Some("cid"));
         assert_eq!(s(RESOURCE_ATTR_STATS_AGENT_AGGREGATION), Some("counts"));
         assert_eq!(s(RESOURCE_ATTR_STATS_SERVICE), Some("web"));
         assert_eq!(s(RESOURCE_ATTR_STATS_GIT_COMMIT_SHA), Some("abc"));
-        assert_eq!(s(RESOURCE_ATTR_STATS_IMAGE_TAG), Some("v9"));
+        assert_eq!(
+            batch.resource.attributes.get(ATTR_CONTAINER_IMAGE_TAGS),
+            Some(&Value::Array(vec![Value::str("v9")]))
+        );
+        for carrier in ["_logit.datadog.stats.image_tag", "_logit.datadog.tracer.container_id"] {
+            assert_eq!(batch.resource.attributes.get(carrier), None, "{carrier}");
+        }
         assert_eq!(s(RESOURCE_ATTR_STATS_PROCESS_TAGS), Some("entrypoint.name:web"));
         assert_eq!(a.get(RESOURCE_ATTR_STATS_SEQUENCE), Some(&Value::U64(42)));
         assert_eq!(a.get(RESOURCE_ATTR_STATS_PROCESS_TAGS_HASH), Some(&Value::U64(99)));
@@ -1589,6 +1613,30 @@ mod tests {
 
     /// `Hostname` is the resource's `host.name` on the way out, and only `/api/v0.2/stats` fills
     /// a missing one with the default host, and only with no `AgentHostname` to name the host.
+    /// `ContainerID` is the resource's `container.id` and `ImageTag` the first element of its
+    /// `container.image.tags`, both ways; each further element is left off, counted
+    /// `unrepresentable`.
+    #[test]
+    fn container_id_and_image_tag_round_trip_through_the_standard_keys() {
+        let (mut d, _) = decoder();
+        let mut batch = d.decode_client_stats_v06(&body(&client(vec![full_group()])), 0).unwrap();
+        let fields = |e: &mut DatadogEncoder, batch: &EventBatch| {
+            let bytes = e.encode_client_stats_v06(batch).unwrap();
+            let back = DatadogDecoder::new().decode_client_stats_v06(&bytes, 0).unwrap();
+            let a = &back.resource.attributes;
+            (a.get(ATTR_CONTAINER_ID).cloned(), a.get(ATTR_CONTAINER_IMAGE_TAGS).cloned())
+        };
+        let (mut e, registry) = encoder();
+        let tags = |v: &[&str]| Value::Array(v.iter().map(|s| Value::str(*s)).collect());
+        assert_eq!(fields(&mut e, &batch), (Some(Value::str("cid")), Some(tags(&["v9"]))));
+
+        let resource = Arc::make_mut(&mut batch.resource);
+        resource.attributes.insert(ATTR_CONTAINER_IMAGE_TAGS, tags(&["v1", "latest", "x"]));
+        assert_eq!(fields(&mut e, &batch).1, Some(tags(&["v1"])));
+        let omitted = counted(&registry, "logit.output.tags.omitted", "unrepresentable");
+        assert_eq!(omitted, 2.0, "latest and x");
+    }
+
     #[test]
     fn the_payload_hostname_is_the_resource_host_name_and_the_default_fills_it_only_unrelayed() {
         let decode = |bytes: &[u8]| {

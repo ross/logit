@@ -112,9 +112,19 @@
 //!     A bare `host` token isn't a `host:` tag: it relays as itself beside the line's host.
 //!     Fixtures: `host-name-tag-as-host`, `host-name-tag-beside-host`, `host-tags-last-wins`,
 //!     `host-tag-on-event-or-check`, `bare-host-beside-host-tag`.
+//! 11. **Under `format: dogstatsd`, `|c:` leaves in its canonical form.** `statsd_in` decodes the
+//!     field's container id to `container.id` and its cgroup inode to
+//!     `_logit.statsd.cgroup_inode`, as the Agent reads them (`crates/logit-proto/src/statsd/mod.rs`'s
+//!     "The container id"), and `statsd_out` writes a lone container id bare, the form every Agent
+//!     version reads, and both as the list `ci-<id>,in-<inode>`. So a `ci-<id>` or `cid-<id>`
+//!     relays as `<id>`, a list relays in that order, and a list item the Agent ignores doesn't
+//!     relay. Fixtures: `dogstatsd-external-data-cardinality`,
+//!     `event-service-check-external-data-cardinality` (`ci-abc123` -> `abc123`),
+//!     `local-data-container-id-and-inode` (`in-7,ci-abc123` -> `ci-abc123,in-7`), and
+//!     `local-data-cgroup-inode` (a lone inode, [`SAME_AS_INPUT`]).
 //!
-//! Everything else relays byte for byte, modulo (3), (4), and (9): the raw `Samples`/`SetMembers`
-//! kinds, `|c:`/`|T` under DogStatsD, relative-gauge deltas, and the negative-absolute-gauge
+//! Everything else relays byte for byte, modulo (3), (4), (9), and (11): the raw
+//! `Samples`/`SetMembers` kinds, `|c:`/`|T` under DogStatsD, relative-gauge deltas, and the negative-absolute-gauge
 //! two-line idiom.
 //!
 //! A summarized kind is no normalization either. `aggregate`'s defaults turn a timer into a
@@ -329,16 +339,15 @@ async fn hand_written_dogstatsd_fixtures_round_trip_byte_for_byte() {
         "packed-datagram-counter-event-service-check",
         "event-text-trailing-space",
         "service-check-message-trailing-space",
-        "dogstatsd-external-data-cardinality",
-        "event-service-check-external-data-cardinality",
+        "local-data-cgroup-inode",
     ];
     for name in cases {
         assert_byte_for_byte(&mut harness, name, || StatsdEncoder::new(Format::DogStatsd)).await;
     }
 }
 
-/// Normalizations (1), (2), (4), and (9): the wire bytes change, but the decode still round-trips
-/// equal, since each only re-spells the same information.
+/// Normalizations (1), (2), (4), (9), and (11): the wire bytes change, but the decode still
+/// round-trips equal, since each only re-spells the same information.
 #[tokio::test]
 async fn explicit_normalizations_round_trip_byte_for_byte() {
     let mut harness = Harness::new().await;
@@ -348,6 +357,9 @@ async fn explicit_normalizations_round_trip_byte_for_byte() {
         "number-formatting-trailing-zeros",
         "event-fields-reordered-canonicalized",
         "service-check-origin-fields-after-message",
+        "dogstatsd-external-data-cardinality",
+        "event-service-check-external-data-cardinality",
+        "local-data-container-id-and-inode",
     ];
     for name in cases {
         assert_byte_for_byte(&mut harness, name, || StatsdEncoder::new(Format::DogStatsd)).await;
@@ -1049,6 +1061,8 @@ mod tcp {
             "service-check-message-trailing-space",
             "dogstatsd-external-data-cardinality",
             "event-service-check-external-data-cardinality",
+            "local-data-cgroup-inode",
+            "local-data-container-id-and-inode",
             // The `.expected`-differs-from-`.in` normalizations.
             "sampled-counter-rate-folded",
             "explicit-rate-one-omitted",

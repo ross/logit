@@ -2,6 +2,7 @@
 //! The mapping table is in the parent module's doc ("Logs, events, service checks"). The JSON
 //! conversion and ordered writer it shares with the other JSON routes live in [`crate::json`].
 
+use super::tags::split_joined;
 use super::time::{millis_to_nanos, nanos_to_millis, or_received};
 use super::{
     insert_wire_host, is_datadog_event, DatadogDecoder, DatadogEncoder, ATTR_HOST_NAME, ATTR_SOURCE,
@@ -52,6 +53,7 @@ struct LogKeys {
     timestamp: Symbol,
     trace_id: Symbol,
     span_id: Symbol,
+    container_id: Symbol,
 }
 
 static KEYS: LazyLock<LogKeys> = LazyLock::new(|| LogKeys {
@@ -68,6 +70,7 @@ static KEYS: LazyLock<LogKeys> = LazyLock::new(|| LogKeys {
     source: intern(ATTR_SOURCE),
     message: intern("message"),
     timestamp: intern("timestamp"),
+    container_id: intern(super::ATTR_CONTAINER_ID),
     trace_id: intern(WIRE_TRACE_ID),
     span_id: intern(WIRE_SPAN_ID),
 });
@@ -270,7 +273,6 @@ impl DatadogEncoder {
         for (key, primary, fallback) in [
             ("service", keys.service, Some(keys.service_name)),
             ("ddsource", keys.ddsource, Some(keys.source)),
-            ("ddtags", keys.ddtags, None),
         ] {
             if let Some(value) = find(primary) {
                 write_value(obj.key(key), value);
@@ -280,6 +282,39 @@ impl DatadogEncoder {
             } else if primary == keys.ddsource {
                 if let Some(source) = &self.default_source {
                     write_str(obj.key(key), source);
+                }
+            }
+        }
+        // `container.id` is the `container_id` tag the Agent puts in a container's logs'
+        // `ddtags`, appended there; a `container_id` entry already in the string would be a second
+        // one, so it's left off, counted. A `ddtags` that isn't text leaves as it is, and the key
+        // as an attribute.
+        let ddtags = find(keys.ddtags);
+        let container_id =
+            find(keys.container_id).and_then(Value::as_str).filter(|id| !id.is_empty());
+        match (ddtags.map(Value::as_str), container_id) {
+            (None | Some(Some(_)), Some(id)) => {
+                let mut joined = String::new();
+                for tag in split_joined(ddtags.and_then(Value::as_str).unwrap_or_default()) {
+                    if tag.split(':').next() == Some("container_id") {
+                        self.telemetry.count(
+                            "logit.output.tags.omitted",
+                            1.0,
+                            &[("reason", "reserved_key")],
+                        );
+                        continue;
+                    }
+                    joined.push_str(tag);
+                    joined.push(',');
+                }
+                joined.push_str("container_id:");
+                joined.push_str(id);
+                write_str(obj.key("ddtags"), &joined);
+                consumed.push(keys.container_id);
+            }
+            _ => {
+                if let Some(value) = ddtags {
+                    write_value(obj.key("ddtags"), value);
                 }
             }
         }
@@ -744,5 +779,39 @@ pub(super) mod tests {
         assert_eq!(encode(&again), once, "and the bytes are stable");
         let json: Json = serde_json::from_str(&once).unwrap();
         assert_eq!(json, serde_json::from_str::<Json>(body).unwrap(), "same keys and values");
+    }
+
+    /// `container.id` is a `container_id` entry appended to `ddtags`, the Agent's tag for a
+    /// container's logs; a `container_id` entry already in the string loses to it, counted
+    /// `reserved_key`, and a log with no `container.id` keeps its `ddtags` as it came.
+    #[test]
+    fn a_logs_container_id_is_a_ddtags_entry() {
+        let registry = Registry::new();
+        let encoder = DatadogEncoder::new().with_telemetry(registry.telemetry_for(
+            "datadog_out",
+            "datadog_out",
+            "sink",
+        ));
+        let log = |body: &str, container_id: Option<&str>| {
+            let mut batch = decode(body);
+            if let Some(id) = container_id {
+                batch.events[0].attributes.insert("container.id", Value::str(id));
+            }
+            let body = encoder.encode_logs(&batch).expect("encodes");
+            let json: Json = serde_json::from_slice(&body).unwrap();
+            json[0].clone()
+        };
+        let both =
+            log(r#"[{"message":"m","ddtags":"env:prod,container_id:old,team:a"}]"#, Some("abc"));
+        assert_eq!(both["ddtags"], "env:prod,team:a,container_id:abc");
+        assert!(both.get("container.id").is_none());
+        assert_eq!(
+            counted(&registry, "logit.output.tags.omitted", ("reason", "reserved_key")),
+            1.0
+        );
+        let alone = log(r#"[{"message":"m"}]"#, Some("abc"));
+        assert_eq!(alone["ddtags"], "container_id:abc");
+        let untouched = log(r#"[{"message":"m","ddtags":"env:prod,container_id:old"}]"#, None);
+        assert_eq!(untouched["ddtags"], "env:prod,container_id:old");
     }
 }

@@ -935,9 +935,12 @@ datagram or packet still decodes. The driver's `bad_datagram`/`bad_frame` key, w
 `StatsdDecoder::decode_into` can return: a frame that isn't valid UTF-8. A `|#` tag whose key
 starts with `_logit.`, the private carrier prefix, is left off its metric, event, or service check
 and counted `logit.input.tags.omitted{reason="reserved_prefix"}`, and a `host.name:` tag beside
-the line's own host (a `host:` tag or a non-empty `h:` field) is left off and counted
-`logit.input.tags.omitted{reason="reserved_key"}`; the line is delivered, and a line rejected for
-another reason counts none. The decoder carries a
+the line's own host (a `host:` tag or a non-empty `h:` field), or a `container.id:` tag beside a
+container id the line's `|c:` names, is left off and counted
+`logit.input.tags.omitted{reason="reserved_key"}`. An item of a `|c:` list the Agent doesn't read
+(neither `ci-<id>` nor `in-<inode>`) is dropped and counted
+`logit.input.fields.dropped{reason="malformed"}` per item. Either way the line is delivered, and a
+line rejected for another reason counts none. The decoder carries a
 sampled `ms`/`h`/`d` line's `@<rate>` verbatim and clamps nothing; `aggregate` bounds the weight a
 rate implies at `Samples::MAX_WEIGHT` and reports a clamp as
 `logit.transform.samples.weight_clamped` and a `sample_rate_clamped` diagnostic under its own

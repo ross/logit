@@ -1,8 +1,9 @@
 {
   "carriers": {"events": [
-    {"timestamp":"2027-01-15T07:59:30.000000000Z","metrics":[{"name":"temperature","kind":"gauge","value":20.0}],"attributes":{"_logit.metrics.closed":"timestamped"}},
+    {"timestamp":"2027-01-15T07:59:30.000000000Z","metrics":[{"name":"temperature","kind":"gauge","value":20.0}],"attributes":{"_logit.metrics.closed":"timestamped","container_id":"abc"}},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"latency","kind":"summary","temporality":"cumulative","count":1,"sum":5.0,"quantiles":[{"quantile":0.0,"value":5.0},{"quantile":0.5,"value":5.0},{"quantile":0.75,"value":5.0},{"quantile":0.9,"value":5.0},{"quantile":0.95,"value":5.0},{"quantile":0.99,"value":5.0},{"quantile":1.0,"value":5.0}]}]}
   ], "counters": {
+    "logit.output.labels.normalized{component=out,kind=prometheus_out,reason=name_sanitized,role=sink}": 1,
     "logit.output.metrics.degraded{component=out,kind=prometheus_out,metric_kind=samples,role=sink}": 1,
     "logit.output.metrics.dropped{component=out,kind=prometheus_out,reason=unresolved_delta,role=sink}": 1
   }},

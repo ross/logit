@@ -243,16 +243,24 @@ fn replay(capture: &Capture) -> Vec<EventBatch> {
     let first = route.decode(&mut probe.decoder, &capture.body);
     let problems = probe.problems();
     assert!(problems.is_empty(), "{}: {problems:?}", capture.name);
-    // A tracer or stats payload's hostname decodes to `host.name`, and no
-    // `_logit.datadog.tracer.hostname` attribute exists on any resource or event.
+    // A tracer or stats payload's hostname decodes to `host.name`, its container id to
+    // `container.id`, a stats image tag to `container.image.tags`, and a DogStatsD `|c:` to
+    // `container.id` or `_logit.statsd.cgroup_inode`: no carrier for any of them exists on any
+    // resource or event.
     for batch in &first {
-        let carrier = "_logit.datadog.tracer.hostname";
-        assert_eq!(batch.resource.attributes.get(carrier), None, "{}", capture.name);
-        assert!(
-            batch.events.iter().all(|e| e.attributes.get(carrier).is_none()),
-            "{}",
-            capture.name
-        );
+        for carrier in [
+            "_logit.datadog.tracer.hostname",
+            "_logit.datadog.tracer.container_id",
+            "_logit.datadog.stats.image_tag",
+            "_logit.statsd.container_id",
+        ] {
+            assert_eq!(batch.resource.attributes.get(carrier), None, "{}", capture.name);
+            assert!(
+                batch.events.iter().all(|e| e.attributes.get(carrier).is_none()),
+                "{}",
+                capture.name
+            );
+        }
     }
 
     for batch in &first {

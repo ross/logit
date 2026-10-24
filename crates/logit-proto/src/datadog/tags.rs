@@ -67,6 +67,16 @@ pub struct Dropped {
     pub unrepresentable: usize,
 }
 
+/// The standard keys a Datadog tag spells another way, the Datadog OTLP exporter's mapping
+/// (`pkg/opentelemetry-mapping-go/otlp/attributes/attributes.go`, `ContainerMappings`):
+/// `container.id` is the `container_id` tag, and `container.image.tags`'s first element the
+/// `image_tag` tag. An attribute already named for the tag would be a second one beside the key,
+/// so it's left off, counted.
+const RESPELLED: [(&str, &str); 2] = [
+    (logit_core::attrs::CONTAINER_ID, "container_id"),
+    (logit_core::attrs::CONTAINER_IMAGE_TAGS, "image_tag"),
+];
+
 /// Renders attribute pairs as Datadog tags: `Str` → `k:v`, `Bool(true)` → `k`, `Bool(false)` →
 /// `k:false`, numbers → `k:<display>`, `Timestamp` → `k:<RFC 3339>`, `Array` → one tag per
 /// element under the same rules, `Map`/`Bytes`/`Null` → omitted and counted. A bare tag reads
@@ -75,18 +85,52 @@ pub struct Dropped {
 /// caller already consumed into a wire field of its own (`host.name`, the `_logit.datadog.*`
 /// carriers) and are never rendered, and neither is any other private `_logit.` key, which is
 /// never counted.
+///
+/// `container.id` renders as `container_id`, and `container.image.tags` as one `image_tag` from
+/// its first element, each further element counted unrepresentable ([`RESPELLED`]). A
+/// `container_id` or `image_tag` attribute beside the key that renders one is left off, every tag
+/// it would have written counted unrepresentable.
 pub fn render_tags<'a>(
     pairs: impl IntoIterator<Item = (Symbol, &'a Value)>,
     skip: &[Symbol],
     out: &mut Vec<String>,
 ) -> Dropped {
     let mut dropped = Dropped::default();
+    // Per `RESPELLED` row: whether the standard key wrote a tag, and where the attribute already
+    // named for that tag wrote its own.
+    let mut keyed = [false; 2];
+    let mut named: [Option<std::ops::Range<usize>>; 2] = [None, None];
     for (key, value) in pairs {
         let name = resolve(key);
         if skip.contains(&key) || logit_core::attrs::is_private(name) {
             continue;
         }
+        let start = out.len();
+        if let Some(i) = RESPELLED.iter().position(|(standard, _)| *standard == name) {
+            let wire = RESPELLED[i].1;
+            match value {
+                Value::Array(items) if i == 1 => {
+                    if let Some(first) = items.first() {
+                        render_one(wire, first, out, &mut dropped);
+                    }
+                    dropped.unrepresentable += items.len().saturating_sub(1);
+                }
+                _ => render_one(wire, value, out, &mut dropped),
+            }
+            keyed[i] |= out.len() > start;
+            continue;
+        }
         render_one(name, value, out, &mut dropped);
+        if let Some(i) = RESPELLED.iter().position(|(_, wire)| *wire == name) {
+            named[i] = Some(start..out.len());
+        }
+    }
+    let mut shadowed: Vec<std::ops::Range<usize>> =
+        (0..2).filter(|&i| keyed[i]).filter_map(|i| named[i].clone()).collect();
+    shadowed.sort_by_key(|r| std::cmp::Reverse(r.start));
+    for range in shadowed {
+        dropped.unrepresentable += range.len();
+        out.drain(range);
     }
     dropped
 }
@@ -115,11 +159,34 @@ pub fn count_tags<'a>(
     pairs: impl IntoIterator<Item = (Symbol, &'a Value)>,
     skip: &[Symbol],
 ) -> usize {
-    pairs
-        .into_iter()
-        .filter(|(key, _)| !skip.contains(key) && !logit_core::attrs::is_private(resolve(*key)))
-        .map(|(_, value)| count_one(value))
-        .sum()
+    let mut keyed = [false; 2];
+    let mut named = [0usize; 2];
+    let mut total = 0;
+    for (key, value) in pairs {
+        let name = resolve(key);
+        if skip.contains(&key) || logit_core::attrs::is_private(name) {
+            continue;
+        }
+        let n = match RESPELLED.iter().position(|(standard, _)| *standard == name) {
+            Some(i) => {
+                let n = match value {
+                    Value::Array(items) if i == 1 => items.first().map_or(0, count_one),
+                    _ => count_one(value),
+                };
+                keyed[i] |= n > 0;
+                n
+            }
+            None => {
+                let n = count_one(value);
+                if let Some(i) = RESPELLED.iter().position(|(_, wire)| *wire == name) {
+                    named[i] = n;
+                }
+                n
+            }
+        };
+        total += n;
+    }
+    total - (0..2).filter(|&i| keyed[i]).map(|i| named[i]).sum::<usize>()
 }
 
 fn count_one(value: &Value) -> usize {
@@ -214,6 +281,37 @@ mod tests {
         render_tags(attrs.iter(), &skip, &mut out);
         assert_eq!(count_tags(attrs.iter(), &skip), out.len());
         assert_eq!(out.len(), 12);
+    }
+
+    /// `container.id` is the `container_id` tag and `container.image.tags`'s first element the
+    /// `image_tag` tag, its others counted; a `container_id` or `image_tag` attribute beside the
+    /// key is left off and counted, and alone it's an ordinary tag. Counting agrees.
+    #[test]
+    fn container_keys_render_in_datadog_spelling_and_shadow_their_tag_attributes() {
+        let mut attrs = AttrMap::new();
+        attrs.insert("container.id", Value::str("abc"));
+        attrs.insert("container_id", Value::Array(vec![Value::str("x"), Value::str("y")]));
+        attrs.insert(
+            "container.image.tags",
+            Value::Array(vec![Value::str("v1"), Value::str("latest")]),
+        );
+        attrs.insert("env", Value::str("prod"));
+        let mut out = Vec::new();
+        let dropped = render_tags(attrs.iter(), &[], &mut out);
+        out.sort();
+        assert_eq!(out, ["container_id:abc", "env:prod", "image_tag:v1"]);
+        assert_eq!(dropped, Dropped { unrepresentable: 3 }, "x, y, and latest");
+        assert_eq!(count_tags(attrs.iter(), &[]), out.len());
+
+        let mut alone = AttrMap::new();
+        alone.insert("container_id", Value::str("x"));
+        alone.insert("image_tag", Value::str("v0"));
+        let mut out = Vec::new();
+        let dropped = render_tags(alone.iter(), &[], &mut out);
+        out.sort();
+        assert_eq!(out, ["container_id:x", "image_tag:v0"]);
+        assert_eq!(dropped, Dropped::default());
+        assert_eq!(count_tags(alone.iter(), &[]), 2);
     }
 
     /// `false` leaves as `key:false` and reads back as the string; `true` leaves bare and reads

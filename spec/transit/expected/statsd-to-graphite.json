@@ -1,7 +1,7 @@
 {
   "carriers": {"events": [
     {"timestamp":"2027-01-15T07:59:30.000000000Z","metrics":[{"name":"requests","kind":"gauge","value":1.0}],"attributes":{"env":"prod"}},
-    {"timestamp":"2027-01-15T07:59:30.000000000Z","metrics":[{"name":"temperature","kind":"gauge","value":20.0}]}
+    {"timestamp":"2027-01-15T07:59:30.000000000Z","metrics":[{"name":"temperature","kind":"gauge","value":20.0}],"attributes":{"container.id":"abc"}}
   ], "counters": {
     "logit.output.metrics.degraded{component=out,kind=graphite_out,metric_kind=monotonic_delta_sum,role=sink}": 1,
     "logit.output.metrics.skipped{component=out,kind=graphite_out,metric_kind=samples,role=sink}": 1

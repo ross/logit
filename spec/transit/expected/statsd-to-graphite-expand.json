@@ -1,7 +1,7 @@
 {
   "carriers": {"events": [
     {"timestamp":"2027-01-15T07:59:30.000000000Z","metrics":[{"name":"requests","kind":"gauge","value":1.0}],"attributes":{"env":"prod"}},
-    {"timestamp":"2027-01-15T07:59:30.000000000Z","metrics":[{"name":"temperature","kind":"gauge","value":20.0}]},
+    {"timestamp":"2027-01-15T07:59:30.000000000Z","metrics":[{"name":"temperature","kind":"gauge","value":20.0}],"attributes":{"container.id":"abc"}},
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"latency.count","kind":"gauge","value":1.0}]},
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"latency.max","kind":"gauge","value":5.0}]},
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"latency.min","kind":"gauge","value":5.0}]},

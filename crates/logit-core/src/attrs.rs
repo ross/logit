@@ -152,6 +152,19 @@ pub fn merged<'a>(
 /// keys".
 pub const HOST_NAME: &str = "host.name";
 
+/// The standard container key: the container a sender named, a `Str`, at the scope where it is
+/// identity (an event attribute for a DogStatsD line's `|c:`, the resource for a tracer's
+/// payload). A source fills it from its wire's own container-id forms and keeps no carrier for
+/// them; a sink reads it off the event, else the resource, and writes its own wire's form. See
+/// ADR `process-hostname` (`docs/adr/process-hostname.md`), "Amendment: a source fills the common
+/// keys".
+pub const CONTAINER_ID: &str = "container.id";
+
+/// The standard container image tags key: an `Array` of `Str`, as OpenTelemetry's semantic
+/// conventions type it, written as the resource attribute by the sources that know a container's
+/// image tag.
+pub const CONTAINER_IMAGE_TAGS: &str = "container.image.tags";
+
 /// The prefix of the private attribute namespace, which protocol codecs reserve for their own use.
 ///
 /// See ADR `private-attribute-namespace` (`docs/adr/private-attribute-namespace.md`) and

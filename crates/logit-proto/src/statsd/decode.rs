@@ -21,8 +21,13 @@ use std::sync::{Arc, LazyLock};
 const MESSAGES_DROPPED: &str = "logit.input.messages.dropped";
 
 /// A `|#` tag left off a delivered line, by `reason`: `reserved_prefix` for a private key,
-/// `reserved_key` for a `host.name` tag beside the line's own host.
+/// `reserved_key` for a `host.name` tag beside the line's own host or a `container.id` tag beside
+/// its own container id.
 const TAGS_OMITTED: &str = "logit.input.tags.omitted";
+
+/// A `|c:` list item the Agent doesn't read (neither `ci-` nor `in-`), left off a delivered line,
+/// by `reason`: `malformed`.
+const FIELDS_DROPPED: &str = "logit.input.fields.dropped";
 
 /// Decodes statsd/DogStatsD bytes into events; testable without a socket.
 ///
@@ -107,6 +112,7 @@ impl Decoder for StatsdDecoder {
                 Ok(mut line_events) => {
                     omitted.reserved_prefix += line_omitted.reserved_prefix;
                     omitted.reserved_key += line_omitted.reserved_key;
+                    omitted.unreadable += line_omitted.unreadable;
                     out.append(&mut line_events);
                 }
                 Err(err) => {
@@ -122,6 +128,13 @@ impl Decoder for StatsdDecoder {
                 self.telemetry.count(TAGS_OMITTED, count as f64, &[("reason", reason)]);
             }
         }
+        if omitted.unreadable > 0 {
+            self.telemetry.count(
+                FIELDS_DROPPED,
+                omitted.unreadable as f64,
+                &[("reason", "malformed")],
+            );
+        }
         // statsd has no instrumentation scope.
         Ok((self.resource.clone(), None))
     }
@@ -131,7 +144,8 @@ impl Decoder for StatsdDecoder {
 /// `insert_sym`, not an interner hash and shard lock. A `LazyLock` rather than a decoder field
 /// because the parsers are free functions; `KEYS.x` is one acquire load after first use.
 static KEYS: LazyLock<StatsdKeys> = LazyLock::new(|| StatsdKeys {
-    container_id: intern("_logit.statsd.container_id"),
+    container_id: intern(logit_core::attrs::CONTAINER_ID),
+    cgroup_inode: intern("_logit.statsd.cgroup_inode"),
     external_data: intern("_logit.statsd.external_data"),
     cardinality: intern("_logit.statsd.cardinality"),
     metrics_closed: intern(logit_core::attrs::METRICS_CLOSED),
@@ -148,6 +162,7 @@ static KEYS: LazyLock<StatsdKeys> = LazyLock::new(|| StatsdKeys {
 
 struct StatsdKeys {
     container_id: Symbol,
+    cgroup_inode: Symbol,
     external_data: Symbol,
     cardinality: Symbol,
     metrics_closed: Symbol,
@@ -167,8 +182,11 @@ struct StatsdKeys {
 struct Omitted {
     /// A key under the private `_logit.` prefix.
     reserved_prefix: usize,
-    /// A `host.name` tag on a line that names its own host ([`insert_host`]).
+    /// A `host.name` tag on a line that names its own host ([`insert_host`]), or a
+    /// `container.id` tag on one that names its own container id ([`insert_local_data`]).
     reserved_key: usize,
+    /// A `|c:` list item that is neither `ci-` nor `in-` ([`split_local_data`]).
+    unreadable: usize,
 }
 
 /// Stamps the `_logit.metrics.closed: "timestamped"` flag, which says the event's timestamp is
@@ -267,12 +285,68 @@ fn insert_host(
     }
 }
 
-/// Stamps `_logit.statsd.container_id`, a protocol-namespaced carrier
-/// (`docs/adr/lossless-transit.md`), as a zero-copy datagram slice, for a metric line's `|c:` and
-/// an event's or service check's `c:`.
-fn insert_container_id(attributes: &mut AttrMap, bytes: &Bytes, container_id: &str) {
-    attributes
-        .insert_sym(KEYS.container_id, Value::Str(subslice::share(bytes, container_id.as_bytes())));
+/// Writes a `|c:` field (`c:` on an event or service check) as the Agent's
+/// `origindetection.ParseLocalData` reads it (`super`'s module doc, "The container id"): its
+/// container id as `container.id`, and its cgroup inode as the carrier
+/// `_logit.statsd.cgroup_inode`. A sender's `container.id` tag beside a container id the field
+/// names would collide with it, so it's removed and counted per wire tag.
+fn insert_local_data(
+    attributes: &mut AttrMap,
+    bytes: &Bytes,
+    raw: Option<&str>,
+    omitted: &mut Omitted,
+) {
+    let Some(raw) = raw else {
+        return;
+    };
+    let (container_id, inode) = split_local_data(raw, &mut omitted.unreadable);
+    if let Some(id) = container_id {
+        if let Some(tag) = attributes.remove_sym(KEYS.container_id) {
+            omitted.reserved_key += match tag {
+                Value::Array(elements) => elements.len(),
+                _ => 1,
+            };
+        }
+        attributes.insert_sym(KEYS.container_id, Value::Str(subslice::share(bytes, id.as_bytes())));
+    }
+    if let Some(inode) = inode {
+        attributes
+            .insert_sym(KEYS.cgroup_inode, Value::Str(subslice::share(bytes, inode.as_bytes())));
+    }
+}
+
+/// Splits a `|c:` field into its container id and its cgroup inode (the text after `in-`), as
+/// datadog-agent 7.83.3's `comp/core/tagger/origindetection/origindetection.go` `ParseLocalData`
+/// reads it. A field holding a `,` is a list, whose `ci-<id>` and `in-<inode>` items are read,
+/// the last of each kind winning, and whose other items the Agent ignores, so they're dropped,
+/// counted into `unreadable`. A single item is `ci-<id>` or `cid-<id>` (the id), `in-<inode>`, or
+/// else the bare id itself. An empty field, or an empty id or inode, is nothing.
+fn split_local_data<'a>(
+    raw: &'a str,
+    unreadable: &mut usize,
+) -> (Option<&'a str>, Option<&'a str>) {
+    if !raw.contains(',') {
+        let (id, inode) = if let Some(inode) = raw.strip_prefix("in-") {
+            (None, Some(inode))
+        } else {
+            (
+                Some(raw.strip_prefix("ci-").or_else(|| raw.strip_prefix("cid-")).unwrap_or(raw)),
+                None,
+            )
+        };
+        return (id.filter(|s| !s.is_empty()), inode.filter(|s| !s.is_empty()));
+    }
+    let (mut id, mut inode) = (None, None);
+    for item in raw.split(',') {
+        if let Some(v) = item.strip_prefix("ci-") {
+            id = Some(v);
+        } else if let Some(v) = item.strip_prefix("in-") {
+            inode = Some(v);
+        } else if !item.is_empty() {
+            *unreadable += 1;
+        }
+    }
+    (id.filter(|s| !s.is_empty()), inode.filter(|s| !s.is_empty()))
 }
 
 /// Stamps `_logit.statsd.external_data` (`|e:`) or `_logit.statsd.cardinality` (`|card:`) when
@@ -341,7 +415,7 @@ fn parse_line(
     let mut attributes = AttrMap::new();
     // Receipt time unless `|T<secs>` overrides it.
     let mut line_timestamp = timestamp;
-    let mut host_tag = None;
+    let (mut host_tag, mut local_data) = (None, None);
     for extra in segments {
         if let Some(rate) = extra.strip_prefix('@') {
             let parsed: f64 = rate.parse().map_err(|_| malformed())?;
@@ -353,9 +427,9 @@ fn parse_line(
             sample_rate = parsed;
         } else if let Some(tags) = extra.strip_prefix('#') {
             insert_tags(&mut attributes, bytes, tags, keys, omitted, &mut host_tag);
-        } else if let Some(container_id) = extra.strip_prefix("c:") {
-            // Carried verbatim, `ci-`/`in-` prefixes included, on every metric type.
-            insert_container_id(&mut attributes, bytes, container_id);
+        } else if let Some(raw) = extra.strip_prefix("c:") {
+            // On every metric type; the last `|c:` wins.
+            local_data = Some(raw);
         } else if insert_origin_field(&mut attributes, bytes, extra) {
             // `|e:`/`|card:`, stamped by the call itself.
         } else if let Some(secs) = extra.strip_prefix('T') {
@@ -366,6 +440,7 @@ fn parse_line(
         // Any other segment is ignored, for forward compatibility.
     }
     insert_host(&mut attributes, bytes, None, host_tag, omitted);
+    insert_local_data(&mut attributes, bytes, local_data, omitted);
 
     match type_part {
         "c" | "g" => values_part
@@ -442,15 +517,15 @@ fn parse_event(
 
     let mut line_timestamp = timestamp;
     let mut severity = None;
-    let (mut h, mut host_tag) = (None, None);
+    let (mut h, mut host_tag, mut local_data) = (None, None, None);
 
     if !after_text.is_empty() {
         let fields = after_text.strip_prefix('|').ok_or_else(malformed)?;
         for field in fields.split('|') {
             if let Some(tags) = field.strip_prefix('#') {
                 insert_tags(&mut attributes, bytes, tags, keys, omitted, &mut host_tag);
-            } else if let Some(container_id) = field.strip_prefix("c:") {
-                insert_container_id(&mut attributes, bytes, container_id);
+            } else if let Some(raw) = field.strip_prefix("c:") {
+                local_data = Some(raw);
             } else if insert_origin_field(&mut attributes, bytes, field) {
                 // `e:`/`card:`, stamped by the call itself.
             } else if let Some(secs) = field.strip_prefix("d:") {
@@ -492,6 +567,7 @@ fn parse_event(
         }
     }
     insert_host(&mut attributes, bytes, h, host_tag, omitted);
+    insert_local_data(&mut attributes, bytes, local_data, omitted);
 
     Ok(Event::log(
         line_timestamp,
@@ -562,7 +638,7 @@ fn parse_service_check(
     attributes.insert_sym(KEYS.service_check_status, Value::U64(status as u64));
 
     let mut line_timestamp = timestamp;
-    let (mut h, mut host_tag) = (None, None);
+    let (mut h, mut host_tag, mut local_data) = (None, None, None);
 
     if let Some(fields) = parts.next() {
         for field in fields.split('|') {
@@ -573,8 +649,8 @@ fn parse_service_check(
                 );
             } else if let Some(tags) = field.strip_prefix('#') {
                 insert_tags(&mut attributes, bytes, tags, keys, omitted, &mut host_tag);
-            } else if let Some(container_id) = field.strip_prefix("c:") {
-                insert_container_id(&mut attributes, bytes, container_id);
+            } else if let Some(raw) = field.strip_prefix("c:") {
+                local_data = Some(raw);
             } else if insert_origin_field(&mut attributes, bytes, field) {
                 // `e:`/`card:`, stamped by the call itself.
             } else if let Some(secs) = field.strip_prefix("d:") {
@@ -587,6 +663,7 @@ fn parse_service_check(
         }
     }
     insert_host(&mut attributes, bytes, h, host_tag, omitted);
+    insert_local_data(&mut attributes, bytes, local_data, omitted);
 
     Ok(Event::metric(
         line_timestamp,
@@ -1065,10 +1142,7 @@ mod tests {
             Some(&Value::Array(vec![Value::str("dev"), Value::str("qa")]))
         );
         assert!(matches!(event.attributes.get("tc_urgent"), Some(Value::Bool(true))));
-        assert_eq!(
-            event.attributes.get("_logit.statsd.container_id").and_then(|v| v.as_str()),
-            Some("abc")
-        );
+        assert_eq!(event.attributes.get("container.id").and_then(|v| v.as_str()), Some("abc"));
     }
 
     /// A private tag on a metric, an event, or a service check is left off the delivered event and
@@ -1307,7 +1381,7 @@ mod tests {
     fn container_id_segment_becomes_an_attribute() {
         let events = decode("hits:1|c|c:abcdef0123456789");
         assert_eq!(
-            events[0].attributes.get("_logit.statsd.container_id").and_then(|v| v.as_str()),
+            events[0].attributes.get("container.id").and_then(|v| v.as_str()),
             Some("abcdef0123456789")
         );
     }
@@ -1318,11 +1392,77 @@ mod tests {
         for line in ["x:1|ms|c:cid", "x:1|s|c:cid", "x:1|g|c:cid"] {
             let events = decode(line);
             assert_eq!(
-                events[0].attributes.get("_logit.statsd.container_id").and_then(|v| v.as_str()),
+                events[0].attributes.get("container.id").and_then(|v| v.as_str()),
                 Some("cid"),
-                "expected _logit.statsd.container_id on {line:?}"
+                "expected container.id on {line:?}"
             );
         }
+    }
+
+    /// A `|c:` field reads as the Agent's `ParseLocalData` reads it: the container id is
+    /// `container.id`, an inode is the `_logit.statsd.cgroup_inode` carrier, a list's bare or
+    /// unknown item is ignored, and `_logit.statsd.container_id` exists on no event.
+    #[test]
+    fn a_c_field_splits_into_the_container_id_and_the_cgroup_inode() {
+        for (line, id, inode) in [
+            ("x:1|c|c:abc", Some("abc"), None),
+            ("x:1|c|c:ci-abc", Some("abc"), None),
+            ("x:1|c|c:cid-abc", Some("abc"), None),
+            ("x:1|c|c:in-82046", None, Some("82046")),
+            ("x:1|c|c:ci-abc,in-7", Some("abc"), Some("7")),
+            ("x:1|c|c:in-7,ci-abc", Some("abc"), Some("7")),
+            ("x:1|c|c:in-7,ci-old,ci-abc", Some("abc"), Some("7")),
+            ("x:1|c|c:in-7,cid-x,pu-9", None, Some("7")),
+            ("x:1|c|c:abc,in-7", None, Some("7")),
+            ("x:1|c|c:other|c:ci-last", Some("last"), None),
+            ("x:1|c|c:ci-", None, None),
+            ("_e{1,1}:t|x|c:ci-abc,in-7", Some("abc"), Some("7")),
+            ("_sc|c|0|c:in-7", None, Some("7")),
+        ] {
+            let event = &decode(line)[0];
+            assert_eq!(attr_str(event, "container.id"), id, "{line}");
+            assert_eq!(attr_str(event, "_logit.statsd.cgroup_inode"), inode, "{line}");
+            assert_eq!(event.attributes.get("_logit.statsd.container_id"), None, "{line}");
+        }
+    }
+
+    /// A `|c:` list item the Agent doesn't read is left off and counted
+    /// `logit.input.fields.dropped{reason="malformed"}`; a single unprefixed value is the id.
+    #[test]
+    fn an_unreadable_c_list_item_is_dropped_and_counted() {
+        let registry = logit_core::Registry::new();
+        let mut decoder = StatsdDecoder::new(Arc::new(Resource::default()))
+            .with_telemetry(registry.telemetry_for("statsd_in", "statsd_in", "listener"));
+        let datagram = "a:1|c|c:in-7,cid-x,pu-9
+                        b:1|c|c:abc,ci-def
+                        c:1|c|c:pu-9";
+        let events = decoder.decode(Bytes::from(datagram)).unwrap().events;
+        assert_eq!(attr_str(&events[0], "container.id"), None);
+        assert_eq!(attr_str(&events[1], "container.id"), Some("def"));
+        assert_eq!(attr_str(&events[2], "container.id"), Some("pu-9"));
+        assert_eq!(input_counter(&registry, "logit.input.fields.dropped", "malformed"), 3.0);
+    }
+
+    /// A `container.id` tag beside a container id the line's own `|c:` names is omitted and
+    /// counted once per wire tag; beside an inode-only `|c:`, or with none, it's an ordinary tag.
+    #[test]
+    fn a_container_id_tag_beside_a_c_field_id_is_omitted_and_counted() {
+        let registry = logit_core::Registry::new();
+        let mut decoder = StatsdDecoder::new(Arc::new(Resource::default()))
+            .with_telemetry(registry.telemetry_for("statsd_in", "statsd_in", "listener"));
+        let datagram = "a:1|c|#container.id:x|c:abc
+                        b:1|c|c:ci-abc|#container.id:x,container.id:y
+                        _e{1,1}:t|x|#container.id:x|c:abc
+                        c:1|c|#container.id:x|c:in-7
+                        d:1|c|#container.id:x";
+        let events = decoder.decode(Bytes::from(datagram)).unwrap().events;
+        let id = |i: usize| events[i].attributes.get("container.id").cloned();
+        assert_eq!(id(0), Some(Value::str("abc")));
+        assert_eq!(id(1), Some(Value::str("abc")));
+        assert_eq!(id(2), Some(Value::str("abc")));
+        assert_eq!(id(3), Some(Value::str("x")));
+        assert_eq!(id(4), Some(Value::str("x")));
+        assert_eq!(input_counter(&registry, "logit.input.tags.omitted", "reserved_key"), 4.0);
     }
 
     #[test]
@@ -1387,7 +1527,7 @@ mod tests {
             let event = &events[0];
             assert_eq!(event.timestamp, 1_700_000_000 * 1_000_000_000, "line: {line:?}");
             assert_eq!(
-                event.attributes.get("_logit.statsd.container_id").and_then(|v| v.as_str()),
+                event.attributes.get("container.id").and_then(|v| v.as_str()),
                 Some("abc123"),
                 "line: {line:?}"
             );
@@ -1506,10 +1646,7 @@ mod tests {
         );
         assert_eq!(event.attributes.get("host.name").and_then(|v| v.as_str()), Some("host1"));
         assert_eq!(event.attributes.get("env").and_then(|v| v.as_str()), Some("prod"));
-        assert_eq!(
-            event.attributes.get("_logit.statsd.container_id").and_then(|v| v.as_str()),
-            Some("cid1")
-        );
+        assert_eq!(event.attributes.get("container.id").and_then(|v| v.as_str()), Some("cid1"));
         assert_eq!(
             event.attributes.get(logit_core::attrs::METRICS_CLOSED).and_then(|v| v.as_str()),
             Some("timestamped")
@@ -1579,10 +1716,7 @@ mod tests {
     fn event_container_id_becomes_an_attribute() {
         let events = decode("_e{5,4}:title|text|c:cid1");
         let event = only_log_event(events);
-        assert_eq!(
-            event.attributes.get("_logit.statsd.container_id").and_then(|v| v.as_str()),
-            Some("cid1")
-        );
+        assert_eq!(event.attributes.get("container.id").and_then(|v| v.as_str()), Some("cid1"));
     }
 
     #[test]
@@ -1600,10 +1734,7 @@ mod tests {
     #[test]
     fn service_check_container_id_becomes_an_attribute() {
         let events = decode("_sc|check|0|c:cid2");
-        assert_eq!(
-            events[0].attributes.get("_logit.statsd.container_id").and_then(|v| v.as_str()),
-            Some("cid2")
-        );
+        assert_eq!(events[0].attributes.get("container.id").and_then(|v| v.as_str()), Some("cid2"));
     }
 
     fn attr_str<'a>(event: &'a Event, key: &str) -> Option<&'a str> {
@@ -1645,7 +1776,7 @@ mod tests {
     #[test]
     fn external_data_and_cardinality_become_attributes_on_an_event() {
         let event = only_log_event(decode("_e{5,4}:title|text|c:cid|e:ext1|card:low"));
-        assert_eq!(attr_str(&event, "_logit.statsd.container_id"), Some("cid"));
+        assert_eq!(attr_str(&event, "container.id"), Some("cid"));
         assert_eq!(attr_str(&event, "_logit.statsd.external_data"), Some("ext1"));
         assert_eq!(attr_str(&event, "_logit.statsd.cardinality"), Some("low"));
     }
@@ -1673,12 +1804,14 @@ mod tests {
         }
     }
 
-    /// An empty `|e:`/`|card:` stamps an empty string, as an empty `|c:` does.
+    /// An empty `|e:`/`|card:` stamps an empty string; an empty `|c:` is no local data at all,
+    /// as the Agent reads it.
     #[test]
-    fn an_empty_external_data_or_cardinality_is_an_empty_string_like_an_empty_container_id() {
+    fn an_empty_external_data_or_cardinality_is_an_empty_string_and_an_empty_c_is_nothing() {
         let events = decode("x:1|c|c:|e:|card:");
         let event = &events[0];
-        assert_eq!(attr_str(event, "_logit.statsd.container_id"), Some(""));
+        assert_eq!(event.attributes.get("container.id"), None);
+        assert_eq!(event.attributes.get("_logit.statsd.cgroup_inode"), None);
         assert_eq!(attr_str(event, "_logit.statsd.external_data"), Some(""));
         assert_eq!(attr_str(event, "_logit.statsd.cardinality"), Some(""));
     }
@@ -1703,7 +1836,8 @@ mod tests {
         let events = decode("_sc|check|0|m:slow upstream|c:in-7|card:low");
         let event = &events[0];
         assert_eq!(attr_str(event, "_logit.statsd.service_check.message"), Some("slow upstream"));
-        assert_eq!(attr_str(event, "_logit.statsd.container_id"), Some("in-7"));
+        assert_eq!(attr_str(event, "_logit.statsd.cgroup_inode"), Some("7"));
+        assert_eq!(event.attributes.get("container.id"), None);
         assert_eq!(attr_str(event, "_logit.statsd.cardinality"), Some("low"));
         let events = decode("_sc|check|0|m:a|b|c");
         assert_eq!(attr_str(&events[0], "_logit.statsd.service_check.message"), Some("a"));
@@ -1918,9 +2052,9 @@ mod tests {
     }
 
     #[test]
-    fn interop_fixture_a_real_dogstatsd_line_carries_its_tags_and_container_id() {
-        // The client detected its own container and sent `|c:<id>` unprompted, which a
-        // hand-written fixture wouldn't have included.
+    fn interop_fixture_a_real_dogstatsd_line_carries_its_tags_and_cgroup_inode() {
+        // The client detected its own cgroup and sent `|c:in-<inode>` unprompted, which a
+        // hand-written fixture wouldn't have included. An inode isn't a container id.
         let (events, diagnostics) =
             decode_interop(&interop_fixture("statsd-dogstatsd-unbuffered-000.raw"));
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
@@ -1936,9 +2070,10 @@ mod tests {
             "a per-request tag the client hung off the line"
         );
         assert!(
-            event.attributes.get("_logit.statsd.container_id").is_some(),
-            "DogStatsd volunteers `|c:<id>` when it can see its own container"
+            attr_str(event, "_logit.statsd.cgroup_inode").is_some_and(|i| i.parse::<u64>().is_ok()),
+            "DogStatsd volunteers `|c:in-<inode>` when it can see its own cgroup"
         );
+        assert_eq!(event.attributes.get("container.id"), None);
     }
 
     #[test]
@@ -1957,8 +2092,7 @@ mod tests {
             name.len()
         );
         assert!(
-            event.attributes.get("env").is_none()
-                && event.attributes.get("_logit.statsd.container_id").is_none(),
+            event.attributes.get("env").is_none() && event.attributes.get("container.id").is_none(),
             "the plain-statsd dialect has no tag or container-id syntax at all"
         );
     }
@@ -1996,8 +2130,10 @@ mod tests {
             assert!(diagnostics.is_empty(), "packet {i} raised {diagnostics:?}");
             assert_eq!(events.len(), 1, "packet {i}: one construct per unbuffered packet");
             let event = events.into_iter().next().unwrap();
-            assert!(attr_str(&event, "_logit.statsd.container_id")
-                .is_some_and(|c| c.starts_with("in-")));
+            assert!(attr_str(&event, "_logit.statsd.cgroup_inode")
+                .is_some_and(|i| i.parse::<u64>().is_ok()));
+            assert_eq!(event.attributes.get("container.id"), None, "packet {i}");
+            assert_eq!(event.attributes.get("_logit.statsd.container_id"), None, "packet {i}");
             decoded.push(event);
         }
         let kinds: Vec<&str> = decoded

@@ -212,6 +212,7 @@
 //! | `attributes/string_value` | exact | -- | A `key:value` tag, `host` included. `host.name` is the record's host, which datadog_in reads back as `host.name` on every route. |
 //! | `attributes/host_beside_host_name` | exact | -- | A `host:` tag, which datadog_in reads back as `host`. |
 //! | `attributes/hostname` | lost | `logit.output.tags.omitted{reason=reserved_key}` | A log's `hostname` is `host.name`, so a `hostname` attribute has no key of its own on the wire and is left off, counted. |
+//! | `attributes/container_id` | normalized | `respelled` | On a metric, an event, or a service check, Datadog's `container_id` tag, the Datadog OTLP exporter's spelling, which datadog_in reads back as a `container_id` attribute. |
 //! | `attributes/bool_value` | normalized | `bool_tag` | `true` is a bare `key` tag and reads back `true`; `false` is `key:false` and reads back as the string. |
 //! | `attributes/number_value` | normalized | `stringified` | A `key:<number>` tag, read back as a string. |
 //! | `attributes/array_value` | normalized | `stringified` | One tag per element in order, which datadog_in folds back into an array of strings, so a number element reads back as its text. |
@@ -694,6 +695,13 @@ use std::sync::{Arc, LazyLock};
 
 /// `host.name`: the host of every Datadog record, as an event attribute.
 pub const ATTR_HOST_NAME: &str = logit_core::attrs::HOST_NAME;
+/// `container.id`: a tracer's container (a `TracerPayload`'s or a `ClientStatsPayload`'s
+/// `container_id`, or the `Datadog-Container-ID` header), as a batch resource attribute; on a
+/// metric, an event, or a service check, Datadog's `container_id` tag.
+pub const ATTR_CONTAINER_ID: &str = logit_core::attrs::CONTAINER_ID;
+/// `container.image.tags`: an `Array` of `Str` whose first element is a `ClientStatsPayload`'s
+/// `ImageTag`, and on a metric, an event, or a service check Datadog's `image_tag` tag.
+pub const ATTR_CONTAINER_IMAGE_TAGS: &str = logit_core::attrs::CONTAINER_IMAGE_TAGS;
 
 /// Writes a record's own wire host onto `attributes`: a non-empty one as [`ATTR_HOST_NAME`], an
 /// empty one as [`ATTR_HOSTLESS`], `None` as neither. A host either way displaces a `host.name`
@@ -780,7 +788,6 @@ pub const RESOURCE_ATTR_AGENT_ENV: &str = "_logit.datadog.agent.env";
 /// `_logit.datadog.tracer.*`: a `TracerPayload`'s or a stats `ClientStatsPayload`'s fields, as
 /// batch resource attributes. Shared by [`traces`] and [`stats`], so they live here rather than in
 /// either; each module also has its own carriers with no counterpart in the other.
-pub const RESOURCE_ATTR_TRACER_CONTAINER_ID: &str = "_logit.datadog.tracer.container_id";
 pub const RESOURCE_ATTR_TRACER_LANGUAGE_NAME: &str = "_logit.datadog.tracer.language_name";
 pub const RESOURCE_ATTR_TRACER_VERSION: &str = "_logit.datadog.tracer.tracer_version";
 pub const RESOURCE_ATTR_TRACER_RUNTIME_ID: &str = "_logit.datadog.tracer.runtime_id";
@@ -836,7 +843,7 @@ pub const TRACER_STR_HEADERS: [(&str, &str); 8] = [
     (HEADER_META_LANG_INTERPRETER, RESOURCE_ATTR_TRACER_LANGUAGE_INTERPRETER),
     (HEADER_META_LANG_INTERPRETER_VENDOR, RESOURCE_ATTR_TRACER_LANGUAGE_INTERPRETER_VENDOR),
     (HEADER_META_TRACER_VERSION, RESOURCE_ATTR_TRACER_VERSION),
-    (HEADER_CONTAINER_ID, RESOURCE_ATTR_TRACER_CONTAINER_ID),
+    (HEADER_CONTAINER_ID, ATTR_CONTAINER_ID),
     (HEADER_ENTITY_ID, RESOURCE_ATTR_TRACER_ENTITY_ID),
     (HEADER_EXTERNAL_ENV, RESOURCE_ATTR_TRACER_EXTERNAL_ENV),
 ];

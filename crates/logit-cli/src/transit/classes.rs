@@ -476,8 +476,15 @@ impl Spelling {
     /// [`Spelling::key`] for attribute `key` of `rec`, where the spelling depends on the record:
     /// `statsd_out` under `format: dogstatsd` writes a `host` attribute the line's own host
     /// doesn't omit as a `host:` tag, which `statsd_in` reads back as the line's host
-    /// ([`statsd::host_read_back`]).
+    /// ([`statsd::host_read_back`]), and `datadog_out` writes `container.id` as the
+    /// `container_id` tag on the routes that write tags ([`datadog::tags_container_id`]).
     fn key_for(self, key: &str, rec: &Rec) -> String {
+        if self == Spelling::Datadog
+            && key == logit_core::attrs::CONTAINER_ID
+            && datadog::tags_container_id(rec)
+        {
+            return "container_id".to_string();
+        }
         if self == (Spelling::Statsd { dogstatsd: true }) && key == "host" {
             let value = rec.attributes.get(key).or_else(|| rec.resource.get(key));
             if let Some(read) = value.and_then(statsd::host_read_back) {
@@ -692,6 +699,12 @@ mod datadog {
     /// one is never replaced.
     fn named(rec: &Rec) -> bool {
         get(rec, "host.name").is_some_and(|v| v.as_str() != Some(""))
+    }
+
+    /// Whether `container.id` leaves as Datadog's `container_id` tag, which `datadog_in` reads
+    /// back under that key: on a metric, a Datadog event, or a service check.
+    pub(super) fn tags_container_id(rec: &Rec) -> bool {
+        matches!(Route::of(rec), Route::Metric | Route::Event | Route::Check)
     }
 
     /// Whether a log's `hostname` attribute is left off: it would collide with the wire's own
@@ -1502,6 +1515,10 @@ fn field_rows(rec: &Rec, protocol: &str) -> Vec<(String, Option<String>, Field)>
             Some("host_beside_host_name")
         } else if key == "hostname" && datadog::hostname_is_omitted(rec) {
             Some("hostname")
+        } else if key == logit_core::attrs::CONTAINER_ID && value.is_string() {
+            // The standard key a sink writes in its own wire's form: `statsd_out`'s `|c:`,
+            // `datadog_out`'s `container_id` tag.
+            Some("container_id")
         } else {
             None
         }

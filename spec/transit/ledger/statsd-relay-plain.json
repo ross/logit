@@ -3,6 +3,7 @@
     {"sink":"statsd_out","row":"attributes/array_value","cell":0,"observed":["lost"]},
     {"sink":"statsd_out","row":"attributes/bool_value","cell":0,"observed":["lost"]},
     {"sink":"statsd_out","row":"attributes/bytes_value","cell":0,"observed":["lost"]},
+    {"sink":"statsd_out","row":"attributes/container_id","cell":0,"observed":["lost"]},
     {"sink":"statsd_out","row":"attributes/foreign_carrier","cell":0,"observed":["lost"]},
     {"sink":"statsd_out","row":"attributes/map_value","cell":0,"observed":["lost"]},
     {"sink":"statsd_out","row":"attributes/no_host","cell":0,"observed":["exact"]},

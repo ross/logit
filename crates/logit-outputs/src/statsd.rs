@@ -297,6 +297,8 @@
 //! | `attributes/string_value`, otherwise | normalized | `tag_rewritten`; `logit.output.tags.normalized` | A DogStatsD `key:value` tag. Each `:`, `\|`, `@`, `#`, `,`, control, and whitespace character in the key, and each but `:` in the value, is written as `_`, counted once per wire tag as `name_sanitized` for a key and `value_sanitized` for a value. A `host` on a line with no host of its own is its `host:` tag, which statsd_in reads back as `host.name`. |
 //! | `attributes/host_beside_host_name`, under `format: statsd` | lost | `logit.output.tags.omitted{reason=dialect}` | Plain statsd has no tags; each is counted once per wire tag. |
 //! | `attributes/host_beside_host_name`, otherwise | lost | `logit.output.tags.omitted{reason=unrepresentable}` | A non-empty `host.name` or the hostless mark is the line's own host, so a `host` beside it, a second `host:` tag the Agent would consume, is left off, counted once per wire tag. |
+//! | `attributes/container_id`, under `format: statsd` | lost | `logit.output.fields.omitted{reason=dialect}` | Plain statsd has no `\|c:` segment, so the container id is omitted, counted once per line. |
+//! | `attributes/container_id`, otherwise | exact | -- | The line's `\|c:` segment, never a tag, which statsd_in reads back as `container.id`. |
 //! | `attributes/bool_value`, under `format: statsd` | lost | `logit.output.tags.omitted{reason=dialect}` | Plain statsd has no tags. |
 //! | `attributes/bool_value`, otherwise | normalized | `bool_tag` | `true` is a bare tag and reads back `true`; `false` is `key:false` and reads back as the string. |
 //! | `attributes/number_value`, under `format: statsd` | lost | `logit.output.tags.omitted{reason=dialect}` | Plain statsd has no tags. |
@@ -566,7 +568,7 @@ use crate::datagram::{
 use crate::stream::{Dial, PooledStream, Target, TlsTarget};
 use crate::Output;
 use anyhow::Context;
-use logit_core::attrs::{CLOSED_TIMESTAMPED, METRICS_CLOSED};
+use logit_core::attrs::{CLOSED_TIMESTAMPED, CONTAINER_ID, METRICS_CLOSED};
 use logit_core::{
     Diagnostics, Event, EventBatch, MetricKind, MetricRecord, MetricValue, Resource, Telemetry,
     Temporality, Value,
@@ -914,6 +916,7 @@ impl StatsdEncoder {
                 tag_suffix: &self.tag_suffix,
                 statsd_type: carriers.statsd_type,
                 container_id: carriers.container_id,
+                cgroup_inode: carriers.cgroup_inode,
                 external_data: carriers.external_data,
                 cardinality: carriers.cardinality,
                 timestamp_secs: carriers.wire_seconds(event),
@@ -963,6 +966,7 @@ impl StatsdEncoder {
             tag_suffix: &self.tag_suffix,
             statsd_type: carriers.statsd_type,
             container_id: carriers.container_id,
+            cgroup_inode: carriers.cgroup_inode,
             external_data: carriers.external_data,
             cardinality: carriers.cardinality,
             timestamp_secs: carriers.wire_seconds(event),
@@ -1051,6 +1055,7 @@ struct EncodeCtx<'a> {
     tag_suffix: &'a str,
     statsd_type: Option<&'a str>,
     container_id: Option<&'a str>,
+    cgroup_inode: Option<&'a str>,
     external_data: Option<&'a str>,
     cardinality: Option<&'a str>,
     timestamp_secs: Option<u64>,
@@ -1070,7 +1075,10 @@ struct EncodeCtx<'a> {
 #[derive(Debug, Default, Clone, Copy)]
 struct Carriers<'a> {
     statsd_type: Option<&'a str>,
+    /// A usable `container.id`, the event's else the resource's.
     container_id: Option<&'a str>,
+    /// `_logit.statsd.cgroup_inode`, non-empty.
+    cgroup_inode: Option<&'a str>,
     external_data: Option<&'a str>,
     cardinality: Option<&'a str>,
     /// `_logit.metrics.closed` is `timestamped`: the event's timestamp is its source's own, so it
@@ -1152,8 +1160,8 @@ fn build_tag_suffix<'a>(
                 ("_logit.statsd.type", Value::Str(s)) => {
                     carriers.statsd_type = std::str::from_utf8(s).ok();
                 }
-                ("_logit.statsd.container_id", Value::Str(s)) => {
-                    carriers.container_id = std::str::from_utf8(s).ok();
+                ("_logit.statsd.cgroup_inode", Value::Str(s)) => {
+                    carriers.cgroup_inode = std::str::from_utf8(s).ok().filter(|s| !s.is_empty());
                 }
                 ("_logit.statsd.external_data", Value::Str(s)) => {
                     carriers.external_data = std::str::from_utf8(s).ok();
@@ -1196,6 +1204,18 @@ fn build_tag_suffix<'a>(
             continue;
         }
         if crate::attrs::is_private(key_str) {
+            continue;
+        }
+        // The line's own `|c:` (module doc's "`|c:<container-id>` and `|T<timestamp>`"), never a
+        // tag: a usable one is captured, and any other has no `|c:` form and is left off.
+        if key_str == CONTAINER_ID {
+            match value {
+                Value::Str(s) if !s.is_empty() && std::str::from_utf8(s).is_ok() => {
+                    carriers.container_id = value.as_str();
+                }
+                _ if format == Format::Statsd => stats.tags_omitted_dialect += 1,
+                _ => stats.tags_omitted_unrepresentable += 1,
+            }
             continue;
         }
 
@@ -1360,7 +1380,7 @@ fn append_dialect_extras(line: &mut String, ctx: &mut EncodeCtx) {
             // The flag, not `timestamp_secs`: a pre-1970 timestamp has no slot in this dialect
             // either, so it counts `dialect` like every other flagged line.
             let present = [
-                ctx.container_id.is_some(),
+                ctx.container_id.is_some() || ctx.cgroup_inode.is_some(),
                 ctx.external_data.is_some(),
                 ctx.cardinality.is_some(),
                 ctx.timestamped,
@@ -1378,9 +1398,24 @@ fn append_dialect_extras(line: &mut String, ctx: &mut EncodeCtx) {
 /// does that for a metric line, and [`StatsdEncoder::encode_into`] drops both other shapes under
 /// `Format::Statsd` before rendering.
 fn append_origin_fields(line: &mut String, ctx: &EncodeCtx) {
-    if let Some(id) = ctx.container_id {
-        line.push_str("|c:");
-        sanitize_into(line, id, is_forbidden_in_tag_value_only);
+    // A lone container id goes bare, the form every Agent version reads; beside an inode it
+    // needs the `ci-` prefix, since the Agent reads only prefixed items in a list.
+    match (ctx.container_id, ctx.cgroup_inode) {
+        (None, None) => {}
+        (Some(id), None) => {
+            line.push_str("|c:");
+            sanitize_into(line, id, is_forbidden_in_local_data_item);
+        }
+        (id, Some(inode)) => {
+            line.push_str("|c:");
+            if let Some(id) = id {
+                line.push_str("ci-");
+                sanitize_into(line, id, is_forbidden_in_local_data_item);
+                line.push(',');
+            }
+            line.push_str("in-");
+            sanitize_into(line, inode, is_forbidden_in_local_data_item);
+        }
     }
     if let Some(data) = ctx.external_data {
         line.push_str("|e:");
@@ -2170,6 +2205,12 @@ fn is_forbidden_in_extended_field(c: char) -> bool {
 /// tag-value rule, which substitutes `,`: external data is itself a comma-separated list
 /// (`it-<bool>,cn-<container name>,pu-<pod uid>`), and the decoder ends the field only at the next
 /// `|` or line end. Whitespace goes because a metric line's trailing whitespace is trimmed at decode.
+/// A `|c:` item's characters: a tag value's set plus `,`, which would split the Agent's local-data
+/// list.
+fn is_forbidden_in_local_data_item(c: char) -> bool {
+    c == ',' || is_forbidden_in_tag_value_only(c)
+}
+
 fn is_forbidden_in_external_data(c: char) -> bool {
     c == '|' || c.is_control() || c.is_whitespace()
 }
@@ -3348,7 +3389,7 @@ mod tests {
         let sketch = sketch_of(&[1.0, 2.0]);
         let attrs = [
             ("env", Value::str("prod")),
-            ("_logit.statsd.container_id", Value::str("abc")),
+            ("container.id", Value::str("abc")),
             ("_logit.statsd.type", Value::str("h")),
         ];
         let (msgs, _) = encode(vec![stamped(
@@ -3370,8 +3411,7 @@ mod tests {
     #[test]
     fn expanded_lines_under_format_statsd_drop_tags_once_and_extras_per_line() {
         let sketch = sketch_of(&[1.0, 2.0]);
-        let attrs =
-            [("env", Value::str("prod")), ("_logit.statsd.container_id", Value::str("abc"))];
+        let attrs = [("env", Value::str("prod")), ("container.id", Value::str("abc"))];
         let (msgs, stats) = encode_with_format(
             vec![stamped(
                 metric_event("d", MetricKind::Distribution(sketch.clone()), &attrs),
@@ -4004,16 +4044,63 @@ mod tests {
         let (msgs, _) = encode(vec![metric_event(
             "hits",
             MetricKind::counter(1.0),
-            &[("_logit.statsd.container_id", Value::str("abcd1234"))],
+            &[("container.id", Value::str("abcd1234"))],
         )]);
         assert_eq!(msgs, vec!["hits:1|c|c:abcd1234"]);
+    }
+
+    /// `|c:` is the Agent's local-data field: a lone container id bare, a lone cgroup inode as
+    /// `in-<inode>`, and both as the list `ci-<id>,in-<inode>`, since a list's bare item isn't
+    /// read. `container.id` is never also a tag; one that isn't a non-empty `Str` has no `|c:`
+    /// form and is left off, counted.
+    #[test]
+    fn container_id_and_cgroup_inode_write_the_agents_local_data_forms() {
+        let line = |attrs: &[(&str, Value)]| {
+            let (msgs, stats) = encode(vec![metric_event("hits", MetricKind::counter(1.0), attrs)]);
+            (msgs[0].clone(), stats.tags_omitted_unrepresentable)
+        };
+        let inode = ("_logit.statsd.cgroup_inode", Value::str("82046"));
+        assert_eq!(line(std::slice::from_ref(&inode)), ("hits:1|c|c:in-82046".to_string(), 0));
+        assert_eq!(
+            line(&[("container.id", Value::str("abc")), inode]),
+            ("hits:1|c|c:ci-abc,in-82046".to_string(), 0)
+        );
+        assert_eq!(
+            line(&[("container.id", Value::str("abc")), ("env", Value::str("prod"))]),
+            ("hits:1|c|#env:prod|c:abc".to_string(), 0)
+        );
+        assert_eq!(line(&[("container.id", Value::I64(7))]), ("hits:1|c".to_string(), 1));
+        assert_eq!(line(&[("container.id", Value::str(""))]), ("hits:1|c".to_string(), 1));
+    }
+
+    /// An event's `container.id` wins over the resource's, as every attribute does.
+    #[test]
+    fn an_events_container_id_wins_over_the_resources() {
+        let mut resource_attrs = AttrMap::new();
+        resource_attrs.insert("container.id", Value::str("res-id"));
+        let resource = Arc::new(Resource { attributes: resource_attrs, ..Default::default() });
+        let batch = EventBatch {
+            resource,
+            scope: None,
+            events: vec![metric_event(
+                "hits",
+                MetricKind::counter(1.0),
+                &[("container.id", Value::str("own"))],
+            )],
+        };
+        let mut encoder = StatsdEncoder::new(Format::DogStatsd);
+        let mut out = MessageBuf::default();
+        encoder.encode_into(&batch, &mut out);
+        let msgs: Vec<String> =
+            out.iter().map(|b| std::str::from_utf8(b).unwrap().to_string()).collect();
+        assert_eq!(msgs, vec!["hits:1|c|c:own"]);
     }
 
     /// A resource-only carrier (a `set` transform's `resource:` block) reaches the wire too.
     #[test]
     fn a_container_id_on_the_resource_is_emitted_as_pipe_c_under_dogstatsd() {
         let mut resource_attrs = AttrMap::new();
-        resource_attrs.insert("_logit.statsd.container_id", Value::str("res-id"));
+        resource_attrs.insert("container.id", Value::str("res-id"));
         let resource = Arc::new(Resource { attributes: resource_attrs, ..Default::default() });
         let batch = EventBatch {
             resource,
@@ -4069,7 +4156,7 @@ mod tests {
             MetricKind::counter(1.0),
             &[
                 ("env", "prod".into()),
-                ("_logit.statsd.container_id", Value::str("abcd1234")),
+                ("container.id", Value::str("abcd1234")),
                 (METRICS_CLOSED, CLOSED_TIMESTAMPED.into()),
             ],
         )]);
@@ -4131,7 +4218,7 @@ mod tests {
                 "hits",
                 MetricKind::counter(1.0),
                 &[
-                    ("_logit.statsd.container_id", Value::str("abcd1234")),
+                    ("container.id", Value::str("abcd1234")),
                     (METRICS_CLOSED, CLOSED_TIMESTAMPED.into()),
                 ],
             )],
@@ -4148,7 +4235,7 @@ mod tests {
             MetricKind::counter(1.0),
             &[
                 ("_logit.statsd.type", Value::str("ms")),
-                ("_logit.statsd.container_id", Value::str("abcd1234")),
+                ("container.id", Value::str("abcd1234")),
                 (METRICS_CLOSED, CLOSED_TIMESTAMPED.into()),
                 ("env", "prod".into()),
             ],
@@ -4200,7 +4287,7 @@ mod tests {
             MetricKind::counter(1.0),
             &[
                 ("env", "prod".into()),
-                ("_logit.statsd.container_id", Value::str("abcd1234")),
+                ("container.id", Value::str("abcd1234")),
                 ("_logit.statsd.external_data", Value::str("it-false,cn-web,pu-abc")),
                 ("_logit.statsd.cardinality", Value::str("high")),
                 (METRICS_CLOSED, CLOSED_TIMESTAMPED.into()),
@@ -4239,7 +4326,7 @@ mod tests {
                 "hits",
                 MetricKind::counter(1.0),
                 &[
-                    ("_logit.statsd.container_id", Value::str("abcd1234")),
+                    ("container.id", Value::str("abcd1234")),
                     ("_logit.statsd.external_data", Value::str("ext")),
                     ("_logit.statsd.cardinality", Value::str("high")),
                     (METRICS_CLOSED, CLOSED_TIMESTAMPED.into()),
@@ -4273,7 +4360,7 @@ mod tests {
             "t",
             "x",
             &[
-                ("_logit.statsd.container_id", Value::str("cid1")),
+                ("container.id", Value::str("cid1")),
                 ("_logit.statsd.external_data", Value::str("ext1")),
                 ("_logit.statsd.cardinality", Value::str("low")),
                 ("env", "prod".into()),
@@ -4290,7 +4377,7 @@ mod tests {
             MetricKind::gauge(0.0),
             &[
                 ("_logit.statsd.service_check.status", Value::U64(0)),
-                ("_logit.statsd.container_id", Value::str("cid1")),
+                ("container.id", Value::str("cid1")),
                 ("_logit.statsd.external_data", Value::str("ext1")),
                 ("_logit.statsd.cardinality", Value::str("orchestrator")),
                 ("_logit.statsd.service_check.message", Value::str("all good")),
@@ -4581,7 +4668,7 @@ mod tests {
                     ("_logit.statsd.event.alert_type", Value::str("error")),
                     ("_logit.statsd.event.aggregation_key", Value::str("key1")),
                     ("_logit.statsd.event.source_type", Value::str("my_app")),
-                    ("_logit.statsd.container_id", Value::str("cid1")),
+                    ("container.id", Value::str("cid1")),
                     ("env", "prod".into()),
                 ],
             ),
@@ -4752,7 +4839,7 @@ mod tests {
                 &[
                     ("host.name", Value::str("web1")),
                     ("env", "prod".into()),
-                    ("_logit.statsd.container_id", Value::str("cid1")),
+                    ("container.id", Value::str("cid1")),
                 ],
             ),
             1_700_000_000,
@@ -6207,7 +6294,7 @@ mod tests {
         let relayed = decode_one(&msgs[0]);
         assert_eq!(relayed[0].timestamp, 1_700_000_000_000_000_000);
         assert_eq!(
-            relayed[0].attributes.get("_logit.statsd.container_id").and_then(|v| v.as_str()),
+            relayed[0].attributes.get("container.id").and_then(|v| v.as_str()),
             Some("abcd1234")
         );
         assert_eq!(
