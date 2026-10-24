@@ -449,6 +449,13 @@ fn the_agent_logs_carry_the_tailed_lines() {
     assert!(messages[0].ends_with("record-fixtures started on port 5050"));
     assert!(messages[1].starts_with(r#"{"timestamp":"2026-09-24T10:00:01Z""#));
     assert!(messages[2].contains("request failed: status=500"));
+    // The log's `service` is `service.name`, and `ddtags`, holding no `env:`, `version:`, or
+    // `service:` entry, stays as the Agent wrote it.
+    for event in events(&batches) {
+        assert_eq!(str_attr(event, "service.name"), Some("record-fixtures"));
+        assert_eq!(event.attributes.get("service"), None);
+        assert_eq!(str_attr(event, "ddtags"), Some("filename:app.log,dirname:/var/log/record"));
+    }
 }
 
 /// The Agent's trace payload: three Flask traces, each root marked `_top_level` by the Agent,

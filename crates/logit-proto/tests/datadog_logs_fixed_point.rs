@@ -21,10 +21,12 @@
 //! The `proptest`s generate bodies from a grammar rather than a model, so they reach every wire
 //! branch the decoder has: array and bare-object log bodies, integer and RFC 3339 timestamps,
 //! absent timestamps (stamped with a whole-second `RECEIVED_AT`), extra keys with nested objects
-//! and arrays, repeated and bare tags, both event shapes, and `null` check tags. Generated extra
-//! log keys start with `x` so none collides with a reserved wire field or with one of the model
-//! names the encoder falls back to (`host.name`, `service.name`, `_logit.datadog.source`); those
-//! fallbacks are a named normalization with their own unit test in `datadog/logs.rs`.
+//! and arrays, repeated and bare tags, `ddtags` entries the decoder lifts onto the standard keys,
+//! both event shapes, and `null` check tags. Generated extra log keys start with `x` so none
+//! collides with a reserved wire field or with one of the model names the encoder writes as one
+//! (`host.name`, `service.name`, `deployment.environment.name`, `service.version`,
+//! `_logit.datadog.source`); those are named normalizations with their own unit tests in
+//! `datadog/logs.rs`.
 
 use bytes::Bytes;
 use logit_core::{format_rfc3339_utc, Event};
@@ -120,6 +122,22 @@ fn agent_log_item() {
     assert_logs_fixed_point(
         br#"[{"message":"hello world","status":"info","timestamp":1700000000000,"hostname":"myhost","service":"myservice","ddsource":"nginx","ddtags":"env:prod,version:1"}]"#,
     );
+}
+
+/// `ddtags`' `env:`, `version:`, and `service:` entries, lifted onto the standard keys, with
+/// and without a `service` field, a later entry of a lifted key, and no other entry. The lifted
+/// entries rejoin at the end of the string from the first hop on.
+#[test]
+fn log_service_identity_entries() {
+    for body in [
+        r#"[{"message":"a","service":"web","ddtags":"version:2,team:a,env:prod,service:web"}]"#,
+        r#"[{"message":"a","service":"","ddtags":"service:api,env:prod,env:qa"}]"#,
+        r#"[{"message":"a","ddtags":"env:prod"}]"#,
+        r#"[{"message":"a","ddtags":"env:,version,team:a,container_id:c1"}]"#,
+        r#"[{"message":"a","service":"web"}]"#,
+    ] {
+        assert_logs_fixed_point(body.as_bytes());
+    }
 }
 
 #[test]
@@ -227,7 +245,7 @@ fn log_item() -> impl Strategy<Value = Json> {
         opt("[a-z0-9.-]{0,10}"),
         opt("[a-z_]{0,8}"),
         opt("[a-z]{0,8}"),
-        opt("[a-z:,0-9]{0,16}"),
+        opt(ddtags()),
         prop::collection::btree_map("x[a-z_.]{0,6}", json_value(), 0..5),
     )
         .prop_map(
@@ -250,6 +268,20 @@ fn log_item() -> impl Strategy<Value = Json> {
                 Json::Object(obj)
             },
         )
+}
+
+/// A `ddtags` string mixing ordinary entries with valued, empty, and bare `env`, `version`, and
+/// `service` entries, repeats included.
+fn ddtags() -> impl Strategy<Value = String> {
+    prop::collection::vec(
+        prop_oneof![
+            "[a-z:0-9]{0,6}",
+            (prop::sample::select(vec!["env", "version", "service"]), "(:[a-z0-9]{0,3})?")
+                .prop_map(|(key, value)| format!("{key}{value}")),
+        ],
+        0..5,
+    )
+    .prop_map(|entries| entries.join(","))
 }
 
 fn logs_body() -> impl Strategy<Value = Json> {

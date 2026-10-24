@@ -120,7 +120,8 @@ rate below 1 that rounds to weight 1), `span/no_wire_form` (a span field a Datad
 form for), `attributes/datadog_carrier_log` (a `_logit.datadog.*` carrier on a log, a Datadog
 event, or a service check), `attributes/host_beside_host_name` (a `host` attribute beside a
 non-empty string `host.name` or the hostless mark, which `statsd_out` leaves off) and
-`attributes/hostname` (a log's `hostname` attribute, which `datadog_out` leaves off), and
+`attributes/hostname` and `attributes/log_service` (a log's `hostname` or `service` attribute,
+which `datadog_out` leaves off), and
 the attributes `datadog_out` writes from a record's own fields,
 `attributes/no_host`, `log_status`, `span_kind`, and `trace_id_high`. A flagged record's `no_recorded_value` row goes ahead of its kind's counted
 loss where that loss's counter didn't move, since most sinks test the flag first

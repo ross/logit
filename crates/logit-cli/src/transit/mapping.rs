@@ -159,6 +159,7 @@ const KINDS: [(&str, &[&str]); 15] = [
             "string_value",
             "host_beside_host_name",
             "hostname",
+            "log_service",
             "container_id",
             "bool_value",
             "number_value",

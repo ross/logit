@@ -506,7 +506,7 @@ impl Spelling {
         {
             return None;
         }
-        if self == Spelling::Datadog && key == "hostname" && datadog::hostname_is_omitted(rec) {
+        if self == Spelling::Datadog && datadog::reserved_log_key_is_omitted(rec, key) {
             return None;
         }
         if self == Spelling::Graphite {
@@ -707,10 +707,12 @@ mod datadog {
         matches!(Route::of(rec), Route::Metric | Route::Event | Route::Check)
     }
 
-    /// Whether a log's `hostname` attribute is left off: it would collide with the wire's own
-    /// `hostname`, which is `host.name`.
-    pub(super) fn hostname_is_omitted(rec: &Rec) -> bool {
-        Route::of(rec) == Route::Log && get(rec, "hostname").is_some()
+    /// Whether a log's `hostname` or `service` attribute is left off: it would collide with the
+    /// wire's own field of that name, which is `host.name` or `service.name`.
+    pub(super) fn reserved_log_key_is_omitted(rec: &Rec, key: &str) -> bool {
+        matches!(key, "hostname" | "service")
+            && Route::of(rec) == Route::Log
+            && get(rec, key).is_some()
     }
 
     /// Whether a span carries a field a Datadog span has no form for: `status: ok`, a status
@@ -1509,12 +1511,15 @@ fn field_rows(rec: &Rec, protocol: &str) -> Vec<(String, Option<String>, Field)>
         }
     };
     // A host attribute a sink leaves off for the record's own host: `statsd_out`'s `host` beside
-    // the line's host, and `datadog_out`'s log `hostname`.
+    // the line's host, and `datadog_out`'s log `hostname`, and its log `service` for the log's
+    // `service.name`.
     let outranked = |key: &str, value: &Value| {
         if key == "host" && statsd::host_is_omitted(rec, value) {
             Some("host_beside_host_name")
-        } else if key == "hostname" && datadog::hostname_is_omitted(rec) {
+        } else if key == "hostname" && datadog::reserved_log_key_is_omitted(rec, key) {
             Some("hostname")
+        } else if key == "service" && datadog::reserved_log_key_is_omitted(rec, key) {
+            Some("log_service")
         } else if key == logit_core::attrs::CONTAINER_ID && value.is_string() {
             // The standard key a sink writes in its own wire's form: `statsd_out`'s `|c:`,
             // `datadog_out`'s `container_id` tag.
@@ -1627,7 +1632,7 @@ fn observe_field(field: &Field, input: &Rec, out: &Rec, spelling: Spelling) -> C
             // A host attribute the sink leaves off for the record's own host: what reads back
             // under its key is that host.
             let outranked = match spelling {
-                Spelling::Datadog => key == "hostname" && datadog::hostname_is_omitted(input),
+                Spelling::Datadog => datadog::reserved_log_key_is_omitted(input, key),
                 Spelling::Statsd { dogstatsd: true } => {
                     key == "host" && statsd::host_is_omitted(input, want)
                 }
@@ -2574,6 +2579,24 @@ mod tests {
         let filled = recs(&[&log(r#"{"host.name":"transit"}"#)]);
         assert_eq!(pair(&alone, &filled, Spelling::Datadog).seen, [Some(Class::Exact)]);
         assert_eq!(observe_field(&hostname, &alone[0], &filled[0], Spelling::Datadog), Class::Lost);
+    }
+
+    /// A log's `service.name` is its Datadog `service`, read back as `service.name`; a `service`
+    /// attribute is lost, beside `service.name` or not.
+    #[test]
+    fn datadog_pairs_a_logs_service_name_and_loses_a_service_attribute() {
+        let log = |attributes: &str| {
+            format!(r#"{{{{T}},"log":{{"format":"raw","message":"m"}},"attributes":{attributes}}}"#)
+        };
+        let name = Field::Attribute { key: "service.name".to_string(), resource: false };
+        let service = Field::Attribute { key: "service".to_string(), resource: false };
+        let read = recs(&[&log(r#"{"service.name":"web"}"#)]);
+        assert_eq!(observe_field(&name, &read[0], &read[0], Spelling::Datadog), Class::Exact);
+        let both = recs(&[&log(r#"{"service.name":"web","service":"s"}"#)]);
+        assert_eq!(observe_field(&service, &both[0], &read[0], Spelling::Datadog), Class::Lost);
+        let alone = recs(&[&log(r#"{"service":"s"}"#)]);
+        let none = recs(&[&log(r#"{}"#)]);
+        assert_eq!(observe_field(&service, &alone[0], &none[0], Spelling::Datadog), Class::Lost);
     }
 
     /// A `host` attribute is an ordinary tag at `datadog_out`, read back as `host`, and the
