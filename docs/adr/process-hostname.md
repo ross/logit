@@ -359,8 +359,22 @@ mapping gives it, whatever source wrote it: `service.name` as `service`,
 `container_id` tag on metrics, events, and checks and as the `container_id` payload field and
 `Datadog-Container-ID` header on traces (datadog-agent 7.83.3,
 `pkg/opentelemetry-mapping-go/otlp/attributes/attributes.go`, `coreMapping` and
-`ContainerMappings`). `statsd_out` under `format: dogstatsd` writes `env:`, `version:`, and
-`service:` tags and `|c:`. `otlp_out` and `splunk_hec_out` pass the keys through as attributes.
+`ContainerMappings`). On a log, `container.id` is appended to `ddtags` as `container_id:<id>`, as
+the Agent tags a container's logs, and a `container_id:` entry already in the log's `ddtags` loses
+to the key, removed and counted `reason="reserved_key"`, as a log's `hostname` beside `host.name`
+is. Datadog's `image_tag` holds one value, so a Datadog-family sink writes the first element of
+`container.image.tags` as the `image_tag` tag or stats `ImageTag` and omits the rest, counted.
+`statsd_out` under `format: dogstatsd` writes `env:`, `version:`, and `service:` tags and `|c:`.
+`otlp_out` and `splunk_hec_out` pass the keys through as attributes.
+
+**DogStatsD `|c:`.** The Agent reads `|c:` as origin-detection local data (datadog-agent 7.83.3,
+`comp/core/tagger/origindetection/origindetection.go`, `ParseLocalData`). A bare or `ci-` prefixed
+value is the container id, so `statsd_in` will write it as `container.id` with the prefix stripped.
+An `in-<inode>` is a cgroup v2 inode, which no neutral key names, so it will decode to the carrier
+`_logit.statsd.cgroup_inode`; a comma pair yields both. `statsd_out` will write `|c:<id>` bare,
+appending `,in-<inode>` when the carrier is present. A `ci-` prefix relaying as the bare id is a
+named normalization of the DogStatsD pair, since the bare form is the one every Agent version
+reads.
 
 **Datadog logs: `ddtags` is lifted, not split.** `datadog_in` lifts a log's `ddtags` `env:`,
 `version:`, and `service:` onto the three keys and keeps every other tag in the one `ddtags`

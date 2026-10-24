@@ -107,15 +107,17 @@ the name Datadog's OTLP mapping uses (datadog-agent 7.83.3,
 | `service.name` | `service:` tag | `service` field | the span's or group's `service`; a stats payload's `Service` |
 | `deployment.environment.name` | `env:` tag | `env:` in `ddtags` | `env` meta; `TracerPayload.env`; stats `Env` |
 | `service.version` | `version:` tag | `version:` in `ddtags` | `version` meta; `TracerPayload.app_version`; stats `Version` |
-| `container.id` | `container_id:` tag at `datadog_out`; `\|c:` at `statsd_out` | open, W1 decides | `TracerPayload.container_id` and the `Datadog-Container-ID` header; stats `ContainerID` |
-| `container.image.tags` | open, W1 decides | open, W1 decides | stats `ImageTag` |
+| `container.id` | `container_id:` tag at `datadog_out`; `\|c:` at `statsd_out` | `container_id:<id>` appended to `ddtags` | `TracerPayload.container_id` and the `Datadog-Container-ID` header; stats `ContainerID` |
+| `container.image.tags` | the first element as an `image_tag:` tag | the first element as `image_tag:` in `ddtags` | the first element as stats `ImageTag` |
 
 `otlp_out` and `splunk_hec_out` send the keys as attributes under their semconv names.
 
-The cells marked open aren't settled. Datadog's mapping turns the deprecated singular
-`container.image.tag` into an `image_tag` tag and has no rule for the plural array, so W1 picks the
-form for `container.image.tags` on metrics and logs, and for `container.id` on a log, and
-records it in the Datadog relay ADR.
+Datadog's `image_tag` holds one value, so a Datadog-family sink writes the first element of
+`container.image.tags` and omits the rest, counted. On a log, `container.id` is appended to
+`ddtags` as `container_id:<id>`, as the Agent tags a container's logs; a `container_id:` entry
+already in the log's `ddtags` string loses to the key, removed and counted
+`logit.output.tags.omitted{reason="reserved_key"}`, as a log's `hostname` beside `host.name` is.
+W1 writes this and records it in the Datadog relay ADR.
 
 ### Datadog logs: `ddtags` is lifted, not split
 
@@ -168,12 +170,16 @@ its scope; "Becomes" is the key it moves to, on the same scope unless the row sa
 `datadog_out` writes no container identity on any route today, so W1's `container_id:` and
 `image_tag:` tags are new output there. `statsd_out` writes `|c:` from the carrier.
 
-**Open for W1: `|c:` isn't always a container id.** The Agent reads `|c:` as origin-detection
-local data (datadog-agent 7.83.3, `comp/core/tagger/origindetection/origindetection.go`,
-`ParseLocalData`): a bare id or a `cid-` or `ci-` prefixed one is a container id, an `in-` prefixed
-one is a cgroup v2 inode, and a comma pair holds one of each. Today the decoder keeps the whole
-field verbatim. W1 decides how a `ci-`/`in-` form decodes so that `container.id` holds only an id
-and the relay stays byte-stable, and records the answer in the DogStatsD relay ADR.
+**`|c:` isn't always a container id.** The Agent reads `|c:` as origin-detection local data
+(datadog-agent 7.83.3, `comp/core/tagger/origindetection/origindetection.go`, `ParseLocalData`):
+a bare id or a `cid-` or `ci-` prefixed one is a container id, an `in-` prefixed one is a cgroup v2
+inode, and a comma pair holds one of each. Today the decoder keeps the whole field verbatim. W1
+will decode a bare or `ci-` prefixed value to `container.id`, with the prefix stripped, and an
+`in-<inode>` to the carrier `_logit.statsd.cgroup_inode`, since no neutral key names a cgroup
+inode; a comma pair yields both. `statsd_out` will write `|c:<id>` bare, appending `,in-<inode>`
+when the carrier is present. A `ci-` prefix relaying as the bare id is a named normalization of
+the DogStatsD pair: the bare form is the one every Agent version reads. W1 records this in the
+DogStatsD relay ADR.
 
 ### Process identity (W2)
 
