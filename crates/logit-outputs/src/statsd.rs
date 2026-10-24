@@ -680,7 +680,8 @@ pub struct EncodeStats {
     /// wrote a line.
     pub tag_names_sanitized: usize,
     /// A wire tag whose value [`is_forbidden_in_tag_value_only`] rewrote, once per tag of an event
-    /// that wrote a line.
+    /// that wrote a line, and an event's or service check's `|h:` field that
+    /// [`is_forbidden_in_extended_field`] rewrote, once per line that was written.
     pub tag_values_sanitized: usize,
     /// A negative `Gauge` written as a `0|g` line and a `-v|g` adjustment, once per record:
     /// statsd_in reads the pair back as a gauge of 0 and a relative adjustment.
@@ -1444,11 +1445,10 @@ fn render_event(
     line.push_str(text_buf);
 
     append_wire_time(line, "|d:", ctx);
+    let mut h_rewritten = false;
     if let Some(host) = carriers.host {
         line.push_str("|h:");
-        if sanitize_into(line, host, is_forbidden_in_extended_field) {
-            ctx.stats.pending_tag_values += 1;
-        }
+        h_rewritten = sanitize_into(line, host, is_forbidden_in_extended_field);
     }
     match carriers.event_priority {
         Some(p @ ("normal" | "low")) => {
@@ -1495,7 +1495,12 @@ fn render_event(
     append_tags(line, &ctx.tag_suffix[..carriers.host_tag_at]);
     append_origin_fields(line, ctx);
 
+    let before = ctx.out.len();
     push_line(line, ctx.max_packet_bytes, ctx.stats, ctx.diag, ctx.out);
+    // A line dropped as oversize never carried its rewritten host.
+    if h_rewritten && ctx.out.len() > before {
+        ctx.stats.pending_tag_values += 1;
+    }
 }
 
 /// Renders one `_sc|name|status[...]` service-check line and pushes it. `metric` is the event's
@@ -1555,11 +1560,10 @@ fn render_service_check(
     let _ = write!(line, "|{status}");
 
     append_wire_time(line, "|d:", ctx);
+    let mut h_rewritten = false;
     if let Some(host) = carriers.host {
         line.push_str("|h:");
-        if sanitize_into(line, host, is_forbidden_in_extended_field) {
-            ctx.stats.pending_tag_values += 1;
-        }
+        h_rewritten = sanitize_into(line, host, is_forbidden_in_extended_field);
     }
     append_tags(line, &ctx.tag_suffix[..carriers.host_tag_at]);
     append_origin_fields(line, ctx);
@@ -1568,7 +1572,12 @@ fn render_service_check(
         sanitize_into(line, message, is_forbidden_in_service_check_message);
     }
 
+    let before = ctx.out.len();
     push_line(line, ctx.max_packet_bytes, ctx.stats, ctx.diag, ctx.out);
+    // A line dropped as oversize never carried its rewritten host.
+    if h_rewritten && ctx.out.len() > before {
+        ctx.stats.pending_tag_values += 1;
+    }
 }
 
 /// Pushes `line` to `out`, or drops and counts it if longer than `max_packet_bytes`. Every
@@ -4541,6 +4550,24 @@ mod tests {
         let (dog, stats) = encode(vec![trailing]);
         assert_eq!(dog, vec!["_sc|c|0|h:web_1", "extra:2|g|#host:web_1"]);
         assert_eq!(stats.tag_values_sanitized, 2);
+    }
+
+    /// A check line dropped as oversize never carried its rewritten `|h:` host, so only the
+    /// trailing metric line's `host:` tag counts.
+    #[test]
+    fn an_oversize_check_line_counts_no_h_rewrite() {
+        let host_name = ("host.name", Value::str("web|1"));
+        let mut check = service_check_event(
+            "a_long_check_name",
+            MetricKind::gauge(0.0),
+            std::slice::from_ref(&host_name),
+        );
+        check.metrics.push(MetricRecord::new(intern("extra"), MetricKind::gauge(2.0)));
+        let mut encoder = StatsdEncoder::new(Format::DogStatsd).with_max_packet_bytes(24);
+        let (dog, stats) = encode_with(&mut encoder, vec![check]);
+        assert_eq!(dog, vec!["extra:2|g|#host:web_1"]);
+        assert_eq!(stats.dropped_oversize_line, 1);
+        assert_eq!(stats.tag_values_sanitized, 1);
     }
 
     /// The hostless mark is an empty `host:` tag on an event or a check too, since an empty `h:`
