@@ -280,8 +280,8 @@ def main(argv=None):
     parser.add_argument("--control-port", type=int, default=8081)
     # A client that writes on a pooled connection as this side's idle close reaches it sees a
     # reset, an ambiguous answer no cue gave. Over a delayed link that race window is the
-    # delay, so a scenario that delays the SUT's egress sets this above the client's own pool
-    # idle timeout (90 s for `reqwest`).
+    # delay, so a scenario that delays the SUT's egress keeps the sink's `idle_timeout:` below
+    # this less the delay.
     parser.add_argument("--idle-timeout", type=float, default=IDLE_TIMEOUT_S,
                         help="seconds a keep-alive connection may sit idle")
     args = parser.parse_args(argv)

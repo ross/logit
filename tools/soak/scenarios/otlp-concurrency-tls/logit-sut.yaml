@@ -1,6 +1,6 @@
 # The system under test in `script/soak`'s otlp-concurrency-tls scenario: otlp-fan-out's SUT
 # with `otlp_in` over TLS from the run's private CA, which offers `h2` and `http/1.1` through
-# ALPN. OTLP logs over HTTPS, each record's body parsed as InfluxDB line protocol into one event
+# ALPN, and closes a connection idle for 4 s. OTLP logs over HTTPS, each record's body parsed as InfluxDB line protocol into one event
 # per point, a counter per point, a 500 ms cumulative aggregate, and remote-write 1.0 (zstd) to
 # VictoriaMetrics behind a two-batch blocking queue. Its `internal` telemetry goes to stdout as
 # NDJSON for the harness to read; `script/soak` runs it with `--log-format json`.
@@ -13,6 +13,8 @@ components:
     tls:
       cert_file: /tls/otlp/live/cert.pem    # the override mounts <run>/tls here
       key_file: /tls/otlp/live/key.pem
+    # Below the generator's 30 s pool idle timeout, so this side closes an idle connection first.
+    idle_timeout: 4s
   points:
     # Each record's four points become four events, and the record itself, with no log left,
     # is discarded: the scenario's `fan_out = { points = 4 }`.

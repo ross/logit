@@ -231,7 +231,7 @@ Seven scenarios run a sink against a scripted stand-in in place of VictoriaMetri
 |---|---|---|
 | `standin-remote-write` | 37 minutes 25 seconds | `prometheus_out` (remote-write 1.0, Snappy) through every row of its sender-mode response-class table: twenty 20 s steps, 105 s apart, from `503`, `429`, and each `400` body the sink reads, through `401`, `403`, `404`, `405`, `407`, `409`, `413`, `415`, `422`, `501`, and `302`, to a connection reset, a stop of the stand-in, and a `408`, each step naming the class the sink must read |
 | `standin-at-most-once` | 8 minutes 55 seconds | the same sink under `buffer.delivery: at_most_once`: a `503` and a reset drop the batch, a `401` holds it, a `400` drops it |
-| `standin-concurrency` | 9 minutes 45 seconds | the same sink and posture at `concurrency: 8`, with a 250 ms `aggregate` window and a 1 s delay on the SUT's egress, so up to four batches are in flight. Each step's `count = 1` cues one write among them: a `401` holds that batch when it reaches the head while the batches behind it are answered, and its resend releases it; a `400` drops that batch alone; a reset drops it alone, `ambiguous_at_most_once`. The expectations count one drop for each |
+| `standin-concurrency` | 9 minutes 45 seconds | the same sink and posture at `concurrency: 8`, with a 250 ms `aggregate` window and a 1 s delay on the SUT's egress, so up to four batches are in flight. Each step's `count = 1` cues one write among them: a `401` holds that batch when it reaches the head while the batches behind it are answered, and its resend releases it; a `400` drops that batch alone; a reset drops it alone, `ambiguous_at_most_once`. The expectations count one drop for each. The stand-in closes a connection idle for 5 s and the sink's `idle_timeout: 1s` closes it first, so the reset is the only ambiguous drop |
 | `standin-datadog` | 30 minutes 25 seconds | `datadog_out` (series, gzip, delta counts) through every row of its response-class table: sixteen 20 s steps, 105 s apart, from a `202` whose body names two series dropped, through `400`, `401`, `403`, `404`, `405`, `408`, `413`, `429`, `500`, `501`, a `503` after storing (its resend a duplicate), `302`, and `422`, to a connection reset and a stop of the stand-in |
 | `standin-influxdb` | 35 minutes 40 seconds | `influxdb_out` (line protocol, delta) with `bucket:` and `org:` configured, through every row of its response-class table: nineteen 20 s steps, 105 s apart, from a `204` and each `400` body, through both `401` bodies, `403`, a `404` naming the bucket, the org, an orgID, and neither, `413`, `422`, `429`, `500`, a `503` after storing (its resend a rewrite), `408`, and `302`, to a connection reset and a stop of the stand-in. Every `403` and `404` holds, since every value is the operator's. The request timeout isn't cued: the sink's 10 s timeout isn't configurable |
 | `standin-influxdb-carried` | 35 minutes 40 seconds | the same steps with the bucket, org, and orgID carried on each batch by a `set`, as `influxdb_in` would carry them, and none configured: every `403` and `404` drops the batch |
@@ -357,9 +357,10 @@ SUT's pause, and no line dropped.
 that more than one request was in flight under the 200 ms delay and that the generator's queue
 didn't overflow there, where one request at a time overflowed. Its `fd_growth` is 24, not 8:
 the SUT keeps one connection per request the generator had in flight, plus the extras its pool
-dialed while requests waited, each open until the pool's 90 s idle timeout.
+dialed while requests waited, each open until the pool's idle timeout (the sink's
+`idle_timeout:`, 30 s by default).
 
-`otlp-concurrency-tls` (10 minutes 30 seconds) is `otlp-fan-out-conc`'s stream over TLS: the
+`otlp-concurrency-tls` (12 minutes) is `otlp-fan-out-conc`'s stream over TLS: the
 SUT's `otlp_in` serves a certificate the run's private CA signs (a `[tls]` table, mounted at
 `/tls` by the override), and the generator's `otlp_out` trusts that CA, so the handshake picks
 HTTP/2 through ALPN. Its cycle is `http-concurrency`'s: a 200 ms ± 50 ms delay on the SUT's
@@ -367,7 +368,11 @@ answers for 3.5 minutes, then a 90 s VictoriaMetrics stop that fills all eight s
 expectations assert more than one request in flight and no overflow under the delay, eight in
 flight during the stop, no sink drop and no line dropped, and that the listener's
 `logit.input.connections` stays at 1 through the stop: every request shares one connection,
-where `otlp-fan-out-conc`'s plaintext HTTP/1.1 opens one per request.
+where `otlp-fan-out-conc`'s plaintext HTTP/1.1 opens one per request. The listener's
+`idle_timeout: 4s` sits below the generator's 30 s default, and a closing 15 s pause of the
+generator leaves its connection idle past it, so the SUT closes it with a `GOAWAY` while the
+generator's pool still holds it. Two expectations assert that the listener closed a connection
+idle and that the resumed generator retried nothing.
 
 `sighup` (14 minutes 30 seconds) runs `statsd-vm`'s stream with a second SUT sink off the
 ledger, `archive`: a `stdio_out` writing one `format: json` line per statsd event, straight from
@@ -821,8 +826,9 @@ What changes for a stand-in target:
 - The stand-in closes a keep-alive connection idle for 5 s. A sink that writes on a pooled
   connection as that close reaches it reads a reset, an `Ambiguous` answer no step cued, and
   netem delay on the SUT's egress widens that race to the delay. A scenario that delays the
-  SUT's egress passes `--idle-timeout` above the sink's pool idle timeout (90 s for the
-  `reqwest` sinks) in a compose override's `command`, as `standin-concurrency` does.
+  SUT's egress sets the sink's `idle_timeout:` below 5 s less the delay, as
+  `standin-concurrency` sets `1s` under a 1 s delay; `--idle-timeout` in a compose override's
+  `command` changes the stand-in's side instead.
 - Under `remote_write`, V is every sample the stand-in stored, a later write of one
   `(label set, timestamp)` replacing an earlier one, as a remote-write receiver overwrites.
   `ledger.sent` SKIPs.

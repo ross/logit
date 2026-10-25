@@ -3,16 +3,19 @@
 # ALPN and every request in flight shares one connection, where plaintext HTTP/1.1 opens one per
 # request. A 200 ms delay on the SUT's answers keeps two or three requests in flight, and a
 # backend stop, which `otlp_in` answers by holding each request, fills all eight. The listener's
-# `logit.input.connections` shows how many connections carried them. The schema is
-# docs/plans/soak-harness.md's "The scenario schema".
+# `logit.input.connections` shows how many connections carried them. A 15 s pause of the
+# generator then leaves its connection idle past `otlp_in`'s 4 s `idle_timeout`, under the
+# generator's 30 s default, so the destination closes the idle h2 connection first, with a
+# `GOAWAY`: the resumed generator's next requests must find a new connection with no retry. The
+# schema is docs/plans/soak-harness.md's "The scenario schema".
 
 name = "otlp-concurrency-tls"
-description = "generator otlp_out concurrency 8 over TLS (h2) -> otlp_in (HTTPS) -> line_protocol (4 points per record) -> kv_metrics -> aggregate 500ms cumulative -> prometheus_out RW1 zstd -> VictoriaMetrics, a 200ms answer delay then a backend stop"
-duration = "10m30s"       # warmup + one cycle + cooldown; --duration overrides
+description = "generator otlp_out concurrency 8 over TLS (h2) -> otlp_in (HTTPS, idle_timeout 4s) -> line_protocol (4 points per record) -> kv_metrics -> aggregate 500ms cumulative -> prometheus_out RW1 zstd -> VictoriaMetrics, a 200ms answer delay, a backend stop, then a generator pause past the listener's idle close"
+duration = "12m"          # warmup + one cycle + cooldown; --duration overrides
 warmup = "60s"            # no faults: baseline rate, RSS, fds
 cooldown = "120s"         # no faults at the end; >= recovery_bound
 recovery_bound = "45s"    # the generator's retry_max_delay 1s, the sink's 10s, and a drain
-cycle = "7m30s"           # >= last recovery (6m30s) + 2 x progress_window
+cycle = "9m"              # >= last recovery (7m45s) + 2 x progress_window
 compose = "compose.override.yaml"
 
 [configs]
@@ -114,6 +117,38 @@ service = "logit"
 metric = "logit.component.batches.dropped"
 component = "victoria_metrics"
 step = "c0s2"
+window = "through"
+reduce = "delta"
+max = 0
+
+# c0s3: the generator's connection sits idle while it's paused, and `otlp_in` closes it after
+# 4 s with a `GOAWAY`. The generator's pool, at the 30 s default, still holds it when it resumes.
+[[step]]
+at = "6m45s"
+action = "pause"
+on = "generator"
+for = "15s"
+
+# The listener closed the idle connection: the case under test happened.
+[[expect]]
+name = "listener-closes-idle"
+service = "logit"
+metric = "logit.input.connections.closed"
+component = "otlp"
+attrs = { reason = "idle" }
+step = "c0s3"
+window = "through"
+reduce = "delta"
+min = 1
+
+# The resumed generator sends on a new connection: no request fails on the closed one, so no
+# batch is retried.
+[[expect]]
+name = "goaway-costs-no-retry"
+service = "generator"
+metric = "logit.component.retries"
+component = "otlp"
+step = "c0s3"
 window = "through"
 reduce = "delta"
 max = 0

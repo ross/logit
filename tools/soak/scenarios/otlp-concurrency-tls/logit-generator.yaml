@@ -26,6 +26,8 @@ components:
     tls: { ca_file: /tls/ca.pem }   # the override mounts <run>/tls here
     # Ten batches a second over the scenario's 200 ms round trip need two or three in flight.
     concurrency: 8
+    # `idle_timeout` stays at its 30 s default, above the SUT's 4 s, so the SUT closes the idle
+    # connection while this side is paused and this side meets the `GOAWAY` on resuming.
     # 50 batches is 5 s of load, so a SUT that answers nothing for longer overflows it and the
     # loss is counted here; never stall generate_in. The default posture, at_least_once,
     # resends a batch whose answer was lost.
