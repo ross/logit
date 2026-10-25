@@ -146,7 +146,7 @@ which scenario to read it against; §1 has each measured one's committed `count`
 | `fanout` | `passthrough`'s `generate_in` → 3 × `null_out` | `Arc` fan-out to several sinks, read against `passthrough` |
 | `route` | `passthrough`'s `generate_in` → `route` (by `host`) → 3 × `target` → 3 × `null_out`, plus an unrouted `null_out` | The router hop and `target` delivery, read against `passthrough` |
 | `native-relay` | `generate_in` → `logit_out` → `logit_in` → `null_out`, in one process | Native encode, decode, and ack round trip |
-| `native-relay-window1` | `native-relay` with `window: 1` on `logit_out` | The same round trip with one frame in flight |
+| `native-relay-window1` | `native-relay` with `concurrency: 1` on `logit_out` | The same round trip with one frame in flight |
 | `encode-human-devnull`, `encode-json-devnull`, `encode-native-devnull` | `generate_in` → `file_out` (`/dev/null`, `format: human`, `json`, or `native`) | Each encoder in situ |
 | `buffered` | `passthrough`'s graph with `buffer.disk:` on the sink | Disk spool cost |
 | `buffered-small-segments` | `buffered` with `segment_bytes: 1MiB` | Segment-roll cost (a durable cursor persist and an unlink per roll), read against `buffered` |

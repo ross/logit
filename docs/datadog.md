@@ -432,8 +432,8 @@ is the same: an Agent dedupes nothing.
 
 To drop the batch on an ambiguous failure instead, set `buffer: {delivery: at_most_once}` on the
 sink. It then drops only what Datadog didn't accept, and counts those entries
-`records.dropped{reason="ambiguous_at_most_once"}` per route. The count for a route the batch never
-reached is an upper bound.
+`records.dropped{reason="ambiguous_at_most_once"}` per route. Every route is encoded before the
+first request, so each route counts the entries its unsent requests carry.
 
 ### Events go uncompressed
 

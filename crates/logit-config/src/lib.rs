@@ -542,6 +542,14 @@ pub struct TlsClientConfig {
     /// `ca_file`.
     #[serde(default)]
     pub insecure_skip_verify: bool,
+    /// The name the server's certificate is verified against, in place of the endpoint's host: a
+    /// DNS name or an IP address. Use it to dial an endpoint by IP address, or through a proxy,
+    /// when its certificate names another host. It doesn't change SNI: the connection still sends
+    /// the endpoint's own host (none for an IP address), so it can't reach a front end that routes
+    /// on SNI. On `kafka_out`, every broker is verified against this one name. Ignored under
+    /// `insecure_skip_verify`. A name that doesn't parse fails startup.
+    #[serde(default)]
+    pub server_name: Option<String>,
 }
 
 impl TlsClientConfig {
@@ -552,6 +560,7 @@ impl TlsClientConfig {
             && self.cert_file.is_none()
             && self.key_file.is_none()
             && !self.insecure_skip_verify
+            && self.server_name.is_none()
     }
 }
 
@@ -3599,6 +3608,34 @@ pub enum ComponentKind {
         /// The API token. A plain string: write `!env INFLUXDB_TOKEN` to pull it from the
         /// environment rather than inlining it. `!env` works on every other field too.
         token: String,
+        /// How many batches may be in flight at once, each sent before the ones ahead of it are
+        /// answered. At `1` this sink sends one batch per round trip to the destination, which caps
+        /// its throughput on a high-latency link; raise it there. Above `1`, batches can land at
+        /// the destination out of order, and under `buffer.delivery: at_most_once` each batch
+        /// in flight is its own unknown outcome: one whose send fails that way is dropped alone.
+        /// Defaults to `1`; must be between `1` and `1024`.
+        ///
+        /// Of two writes of one point that land out of order, InfluxDB keeps the one that lands
+        /// last.
+        #[serde(default = "default_sink_concurrency")]
+        concurrency: u32,
+        /// How long a pooled connection may sit idle before this sink closes it instead of
+        /// reusing it. Keep it below the destination's keep-alive idle timeout, so this sink
+        /// closes an idle connection before the destination does: a write sent on a connection
+        /// the destination has already closed has an unknown outcome, resent under
+        /// `buffer.delivery: at_least_once` and dropped under `at_most_once`. Keep it above the
+        /// interval between this sink's batches if the connection should be reused; a sink that
+        /// sends less often opens a new connection, with its handshake, for each batch. Defaults
+        /// to `30s`: most destinations keep an idle connection at least 60 s. Lower it for a
+        /// destination that closes sooner, such as a Node.js, Apache, or uvicorn server at its
+        /// 5 s default. `0s` never reuses an idle connection: every request opens its own.
+        #[serde(default = "default_sink_idle_timeout", with = "humantime_serde_duration")]
+        #[schemars(with = "String")]
+        idle_timeout: Duration,
+        /// Tunes TLS for an `https://` url: a private CA, a client certificate, or no
+        /// verification. A non-default block with an `http://` url is rejected.
+        #[serde(default)]
+        tls: TlsClientConfig,
     },
     /// OTLP logs, metrics, and traces over OTLP/HTTP or OTLP/gRPC. TLS is selected by
     /// `endpoint`'s `https://` scheme.
@@ -3628,6 +3665,34 @@ pub enum ComponentKind {
         /// `http://`/`grpc://` endpoint is rejected.
         #[serde(default)]
         tls: TlsClientConfig,
+        /// How many batches may be in flight at once, each sent before the ones ahead of it are
+        /// answered. At `1` this sink sends one batch per round trip to the destination, which caps
+        /// its throughput on a high-latency link; raise it there. Above `1`, batches can land at
+        /// the destination out of order, and under `buffer.delivery: at_most_once` each batch
+        /// in flight is its own unknown outcome: one whose send fails that way is dropped alone.
+        /// Defaults to `1`; must be between `1` and `1024`.
+        ///
+        /// Logs and traces don't depend on order. Metrics sent to a Prometheus-backed receiver
+        /// need it to accept a series' samples out of timestamp order: VictoriaMetrics does with no
+        /// setting, while Prometheus and Mimir do only with their out-of-order time window open,
+        /// which is off by default, and reject a late sample otherwise.
+        #[serde(default = "default_sink_concurrency")]
+        concurrency: u32,
+        /// How long a pooled connection may sit idle before this sink closes it instead of
+        /// reusing it. Keep it below the destination's keep-alive idle timeout, so this sink
+        /// closes an idle connection before the destination does: a write sent on a connection
+        /// the destination has already closed has an unknown outcome, resent under
+        /// `buffer.delivery: at_least_once` and dropped under `at_most_once`. Keep it above the
+        /// interval between this sink's batches if the connection should be reused; a sink that
+        /// sends less often opens a new connection, with its handshake, for each batch. Defaults
+        /// to `30s`: most destinations keep an idle connection at least 60 s. Lower it for a
+        /// destination that closes sooner, such as a Node.js, Apache, or uvicorn server at its
+        /// 5 s default. `0s` never reuses an idle connection: every request opens its own.
+        ///
+        /// Applies to both `protocol`s.
+        #[serde(default = "default_sink_idle_timeout", with = "humantime_serde_duration")]
+        #[schemars(with = "String")]
+        idle_timeout: Duration,
     },
     /// Sends logs, metrics, events, service checks, APM traces, and APM stats straight to Datadog's
     /// intake API, one request per route a batch needs. Host, service, source, and tags come from
@@ -3688,6 +3753,30 @@ pub enum ComponentKind {
         /// for a histogram, so it's rejected, as the exporter rejects it.
         #[serde(default)]
         histograms: DatadogHistograms,
+        /// How many batches may be in flight at once, each sent before the ones ahead of it are
+        /// answered. At `1` this sink sends one batch per round trip to the destination, which caps
+        /// its throughput on a high-latency link; raise it there. Above `1`, batches can land at
+        /// the destination out of order, and under `buffer.delivery: at_most_once` each batch
+        /// in flight is its own unknown outcome: one whose send fails that way is dropped alone.
+        /// Defaults to `1`; must be between `1` and `1024`.
+        ///
+        /// Datadog keeps one series point per second: of two that land out of order, it keeps
+        /// the one that lands last.
+        #[serde(default = "default_sink_concurrency")]
+        concurrency: u32,
+        /// How long a pooled connection may sit idle before this sink closes it instead of
+        /// reusing it. Keep it below the destination's keep-alive idle timeout, so this sink
+        /// closes an idle connection before the destination does: a write sent on a connection
+        /// the destination has already closed has an unknown outcome, resent under
+        /// `buffer.delivery: at_least_once` and dropped under `at_most_once`. Keep it above the
+        /// interval between this sink's batches if the connection should be reused; a sink that
+        /// sends less often opens a new connection, with its handshake, for each batch. Defaults
+        /// to `30s`: most destinations keep an idle connection at least 60 s. Lower it for a
+        /// destination that closes sooner, such as a Node.js, Apache, or uvicorn server at its
+        /// 5 s default. `0s` never reuses an idle connection: every request opens its own.
+        #[serde(default = "default_sink_idle_timeout", with = "humantime_serde_duration")]
+        #[schemars(with = "String")]
+        idle_timeout: Duration,
     },
     /// Sends APM traces and tracer-computed stats to a Datadog Agent's trace API (port 8126, or
     /// its Unix socket), as a dd-trace tracer does: the sending half of `datadog_trace_in`, so a
@@ -3732,6 +3821,29 @@ pub enum ComponentKind {
         /// `socket`.
         #[serde(default)]
         tls: TlsClientConfig,
+        /// How many batches may be in flight at once, each sent before the ones ahead of it are
+        /// answered. At `1` this sink sends one batch per round trip to the destination, which caps
+        /// its throughput on a high-latency link; raise it there. Above `1`, batches can land at
+        /// the destination out of order, and under `buffer.delivery: at_most_once` each batch
+        /// in flight is its own unknown outcome: one whose send fails that way is dropped alone.
+        /// Defaults to `1`; must be between `1` and `1024`.
+        #[serde(default = "default_sink_concurrency")]
+        concurrency: u32,
+        /// How long a pooled connection may sit idle before this sink closes it instead of
+        /// reusing it. Keep it below the destination's keep-alive idle timeout, so this sink
+        /// closes an idle connection before the destination does: a write sent on a connection
+        /// the destination has already closed has an unknown outcome, resent under
+        /// `buffer.delivery: at_least_once` and dropped under `at_most_once`. Keep it above the
+        /// interval between this sink's batches if the connection should be reused; a sink that
+        /// sends less often opens a new connection, with its handshake, for each batch. Defaults
+        /// to `30s`: most destinations keep an idle connection at least 60 s. Lower it for a
+        /// destination that closes sooner, such as a Node.js, Apache, or uvicorn server at its
+        /// 5 s default. `0s` never reuses an idle connection: every request opens its own.
+        ///
+        /// Applies to the `socket` connection too.
+        #[serde(default = "default_sink_idle_timeout", with = "humantime_serde_duration")]
+        #[schemars(with = "String")]
+        idle_timeout: Duration,
     },
     /// Sends logs, metrics, and spans to Splunk's HTTP Event Collector (HEC) as `/event` JSON, in
     /// the shape the OpenTelemetry Collector's `splunk_hec` exporter writes, so a Splunk index fed
@@ -3797,6 +3909,27 @@ pub enum ComponentKind {
         #[serde(default = "default_splunk_max_body_bytes", with = "human_bytes")]
         #[schemars(with = "String")]
         max_body_bytes: u64,
+        /// How many batches may be in flight at once, each sent before the ones ahead of it are
+        /// answered. At `1` this sink sends one batch per round trip to the destination, which caps
+        /// its throughput on a high-latency link; raise it there. Above `1`, batches can land at
+        /// the destination out of order, and under `buffer.delivery: at_most_once` each batch
+        /// in flight is its own unknown outcome: one whose send fails that way is dropped alone.
+        /// Defaults to `1`; must be between `1` and `1024`.
+        #[serde(default = "default_sink_concurrency")]
+        concurrency: u32,
+        /// How long a pooled connection may sit idle before this sink closes it instead of
+        /// reusing it. Keep it below the destination's keep-alive idle timeout, so this sink
+        /// closes an idle connection before the destination does: a write sent on a connection
+        /// the destination has already closed has an unknown outcome, resent under
+        /// `buffer.delivery: at_least_once` and dropped under `at_most_once`. Keep it above the
+        /// interval between this sink's batches if the connection should be reused; a sink that
+        /// sends less often opens a new connection, with its handshake, for each batch. Defaults
+        /// to `30s`: most destinations keep an idle connection at least 60 s. Lower it for a
+        /// destination that closes sooner, such as a Node.js, Apache, or uvicorn server at its
+        /// 5 s default. `0s` never reuses an idle connection: every request opens its own.
+        #[serde(default = "default_sink_idle_timeout", with = "humantime_serde_duration")]
+        #[schemars(with = "String")]
+        idle_timeout: Duration,
     },
     /// Produces events to an Apache Kafka topic (3.x and 4.x, or anything that speaks the same
     /// protocol from Kafka 2.4 on) with the Java producer's defaults: `acks: all`, idempotence
@@ -3878,7 +4011,8 @@ pub enum ComponentKind {
         headers: std::collections::BTreeMap<String, String>,
         /// Turns on TLS to every broker when present, and makes it required: a `host:port` has
         /// no scheme to select TLS from, so even an empty `tls: {}` means TLS with the bundled
-        /// Mozilla roots. Each broker's certificate is checked against the host it advertises.
+        /// Mozilla roots. Each broker's certificate is checked against the host it advertises,
+        /// or against `server_name` when it's set.
         #[serde(default)]
         tls: Option<TlsClientConfig>,
         /// Authenticates every broker connection over SASL when present: `{mechanism: plain |
@@ -3916,11 +4050,13 @@ pub enum ComponentKind {
         /// How many batches may be sent before the oldest is acknowledged. Raise it on a
         /// high-latency link, where waiting for each acknowledgment before the next batch caps
         /// throughput at one batch per round trip. `1` keeps one batch in flight. The peer may
-        /// answer a smaller window. Under `buffer.delivery: at_most_once`, a fault whose outcome
-        /// is unknown drops every batch in flight, so `1` is the safer choice there. Defaults to
-        /// `32`; must be between `1` and `1024`.
-        #[serde(default = "default_logit_out_window")]
-        window: u32,
+        /// answer a smaller window; on a connection whose peer answered at or above this value,
+        /// the connection's window (`logit.output.window`) is this number. Under
+        /// `buffer.delivery: at_most_once`, a fault whose outcome is unknown drops every batch in
+        /// flight, so `1` is the safer choice there. Defaults to `32`; must be between `1` and
+        /// `1024`.
+        #[serde(default = "default_logit_out_concurrency")]
+        concurrency: u32,
     },
     /// A human-facing debug sink: writes every event as a readable text block to stdout (the
     /// default), stderr, or a file. The dev loop for seeing a whole pipeline's output without a
@@ -4496,6 +4632,34 @@ pub enum ComponentKind {
         /// until the old process exits.
         #[serde(default)]
         reuse_port: bool,
+        /// How many batches may be in flight at once, each sent before the ones ahead of it are
+        /// answered. At `1` this sink sends one batch per round trip to the destination, which caps
+        /// its throughput on a high-latency link; raise it there. Above `1`, batches can land at
+        /// the destination out of order, and under `buffer.delivery: at_most_once` each batch
+        /// in flight is its own unknown outcome: one whose send fails that way is dropped alone.
+        /// Defaults to `1`; must be between `1` and `1024`.
+        ///
+        /// A remote-write receiver expects each series' samples in timestamp order, and one with
+        /// no out-of-order window answers a batch that lands behind a newer one with `400`, which
+        /// drops that batch. VictoriaMetrics accepts out-of-order samples with no setting;
+        /// Prometheus (`storage.tsdb.out_of_order_time_window`) and Mimir
+        /// (`out_of_order_time_window`) accept them only with that window open, which is off by
+        /// default. Sender mode only.
+        #[serde(default = "default_sink_concurrency")]
+        concurrency: u32,
+        /// How long a pooled connection may sit idle before this sink closes it instead of
+        /// reusing it. Keep it below the destination's keep-alive idle timeout, so this sink
+        /// closes an idle connection before the destination does: a write sent on a connection
+        /// the destination has already closed has an unknown outcome, resent under
+        /// `buffer.delivery: at_least_once` and dropped under `at_most_once`. Keep it above the
+        /// interval between this sink's batches if the connection should be reused; a sink that
+        /// sends less often opens a new connection, with its handshake, for each batch. Defaults
+        /// to `30s`: most destinations keep an idle connection at least 60 s. Lower it for a
+        /// destination that closes sooner, such as a Node.js, Apache, or uvicorn server at its
+        /// 5 s default. `0s` never reuses an idle connection: every request opens its own. Sender mode only.
+        #[serde(default = "default_sink_idle_timeout", with = "humantime_serde_duration")]
+        #[schemars(with = "String")]
+        idle_timeout: Duration,
     },
     /// A sink that discards everything, as cheaply as the runtime allows, while the runtime's
     /// own telemetry still counts what it received. Name it as a consumer to discard events by
@@ -5039,8 +5203,20 @@ fn default_logit_out_request_timeout() -> Duration {
 }
 
 /// Mirrors `logit_outputs::logit::DEFAULT_WINDOW`, kept in sync by hand.
-fn default_logit_out_window() -> u32 {
+fn default_logit_out_concurrency() -> u32 {
     32
+}
+
+/// The `concurrency` default of every sink that waits for a response, `logit_out` apart: one
+/// batch in flight.
+pub fn default_sink_concurrency() -> u32 {
+    1
+}
+
+/// The `idle_timeout` default of every sink that waits for a response. Mirrors
+/// `logit_outputs::http::DEFAULT_IDLE_TIMEOUT`, kept in sync by hand.
+pub fn default_sink_idle_timeout() -> Duration {
+    Duration::from_secs(30)
 }
 
 /// Mirrors `logit_outputs::statsd::DEFAULT_MAX_PACKET_BYTES`, kept in sync by hand.
@@ -8154,6 +8330,35 @@ mod tests {
         assert!(matches!(component.kind, ComponentKind::InfluxDbOut { .. }));
     }
 
+    /// `tls:` defaults to an empty block and parses a private CA, a client certificate, and an
+    /// unknown key is refused.
+    #[test]
+    fn influxdb_out_tls_defaults_empty_and_parses() {
+        let parse = |tls: &str| {
+            serde_json::from_str::<Component>(&format!(
+                r#"{{"type": "influxdb_out", "sources": ["in"], "url": "https://localhost:8086",
+                    "token": "TOKEN"{tls}}}"#
+            ))
+        };
+        let ComponentKind::InfluxDbOut { tls, .. } = parse("").unwrap().kind else {
+            panic!("expected an influxdb_out");
+        };
+        assert!(tls.is_empty());
+
+        let ComponentKind::InfluxDbOut { tls, .. } =
+            parse(r#", "tls": {"ca_file": "ca.pem", "cert_file": "c.pem", "key_file": "c.key"}"#)
+                .unwrap()
+                .kind
+        else {
+            panic!("expected an influxdb_out");
+        };
+        assert_eq!(tls.ca_file.as_deref(), Some("ca.pem"));
+        assert_eq!(tls.cert_file.as_deref(), Some("c.pem"));
+        assert_eq!(tls.key_file.as_deref(), Some("c.key"));
+
+        assert!(parse(r#", "tls": {"bogus": true}"#).is_err());
+    }
+
     /// `org`, `default_org`, `bucket`, and `default_bucket` are optional; `url` and `token`
     /// aren't.
     #[test]
@@ -8187,6 +8392,22 @@ mod tests {
         assert!(missing_token.is_err(), "token stays required");
     }
 
+    /// `idle_timeout` takes a duration string, `0s` included.
+    #[test]
+    fn a_sink_idle_timeout_parses_as_a_duration() {
+        for (text, expected) in [("1s", Duration::from_secs(1)), ("0s", Duration::ZERO)] {
+            let component: Component = serde_json::from_str(&format!(
+                r#"{{"type": "influxdb_out", "sources": ["in"], "url": "http://localhost:8086",
+                    "token": "TOKEN", "idle_timeout": "{text}"}}"#
+            ))
+            .unwrap();
+            let ComponentKind::InfluxDbOut { idle_timeout, .. } = component.kind else {
+                panic!("expected an influxdb_out");
+            };
+            assert_eq!(idle_timeout, expected);
+        }
+    }
+
     #[test]
     fn otlp_out_without_protocol_defaults_to_http() {
         let component: Component = serde_json::from_str(
@@ -8194,7 +8415,18 @@ mod tests {
         )
         .unwrap();
         match component.kind {
-            ComponentKind::OtlpOut { endpoint, protocol, headers, paths, compression, tls } => {
+            ComponentKind::OtlpOut {
+                endpoint,
+                protocol,
+                headers,
+                paths,
+                compression,
+                tls,
+                concurrency,
+                idle_timeout,
+            } => {
+                assert_eq!(concurrency, 1);
+                assert_eq!(idle_timeout, Duration::from_secs(30));
                 assert_eq!(endpoint, "http://tempo:4318");
                 assert_eq!(protocol, OtlpProtocol::Http);
                 assert!(headers.is_empty());
@@ -8371,7 +8603,11 @@ mod tests {
                 headers,
                 tls,
                 histograms,
+                concurrency,
+                idle_timeout,
             } => {
+                assert_eq!(concurrency, 1);
+                assert_eq!(idle_timeout, Duration::from_secs(30));
                 assert_eq!(api_key, "k");
                 assert_eq!(site, "datadoghq.com");
                 assert_eq!(histograms.mode, DatadogHistogramMode::Distributions);
@@ -8420,7 +8656,11 @@ mod tests {
                 timeout,
                 headers,
                 tls,
+                concurrency,
+                idle_timeout,
             } => {
+                assert_eq!(concurrency, 1);
+                assert_eq!(idle_timeout, Duration::from_secs(30));
                 assert_eq!(endpoint.as_deref(), Some("http://127.0.0.1:8126"));
                 assert_eq!(socket, None);
                 assert_eq!(version, DatadogTraceVersion::V04);
@@ -8611,7 +8851,11 @@ mod tests {
                 timeout,
                 tls,
                 max_body_bytes,
+                concurrency,
+                idle_timeout,
             } => {
+                assert_eq!(concurrency, 1);
+                assert_eq!(idle_timeout, Duration::from_secs(30));
                 assert_eq!(endpoint, "https://splunk:8088/services/collector");
                 assert_eq!(token, "t");
                 assert_eq!(compression, SplunkCompression::Gzip);
@@ -8986,6 +9230,19 @@ mod tests {
     }
 
     #[test]
+    fn a_tls_client_server_name_parses_and_alone_makes_the_block_non_empty() {
+        let tls: TlsClientConfig =
+            serde_json::from_str(r#"{"server_name": "logit.test"}"#).unwrap();
+        assert_eq!(tls.server_name.as_deref(), Some("logit.test"));
+        assert!(!tls.is_empty());
+        assert!(TlsClientConfig::default().is_empty());
+
+        let err = serde_json::from_str::<TlsClientConfig>(r#"{"server_name_override": "x"}"#)
+            .unwrap_err();
+        assert!(err.to_string().contains("unknown field"), "{err}");
+    }
+
+    #[test]
     fn otlp_in_tls_defaults_to_none_and_can_be_set() {
         let component: Component = serde_json::from_str(
             r#"{"type": "otlp_in", "bind": "0.0.0.0:4317", "protocol": "grpc",
@@ -9250,21 +9507,27 @@ mod tests {
         )
         .unwrap();
         match component.kind {
-            ComponentKind::LogitOut { endpoint, compression, tls, request_timeout, window } => {
+            ComponentKind::LogitOut {
+                endpoint,
+                compression,
+                tls,
+                request_timeout,
+                concurrency,
+            } => {
                 assert_eq!(endpoint, "central:5140");
                 assert_eq!(compression, Compression::None);
                 assert_eq!(tls, None);
                 assert_eq!(request_timeout, Duration::from_secs(10));
-                assert_eq!(window, 32);
+                assert_eq!(concurrency, 32);
             }
             other => panic!("expected LogitOut, got {other:?}"),
         }
     }
 
     #[test]
-    fn logit_out_window_defaults_to_32() {
+    fn logit_out_concurrency_defaults_to_32() {
         let parse = |json: &str| match serde_json::from_str::<Component>(json).unwrap().kind {
-            ComponentKind::LogitOut { window, .. } => window,
+            ComponentKind::LogitOut { concurrency, .. } => concurrency,
             other => panic!("expected LogitOut, got {other:?}"),
         };
         assert_eq!(
@@ -9274,10 +9537,14 @@ mod tests {
         assert_eq!(
             parse(
                 r#"{"type": "logit_out", "sources": ["in"], "endpoint": "central:5140",
-                    "window": 1}"#
+                    "concurrency": 1}"#
             ),
             1
         );
+        let old_name = serde_json::from_str::<Component>(
+            r#"{"type": "logit_out", "sources": ["in"], "endpoint": "central:5140", "window": 1}"#,
+        );
+        assert!(old_name.is_err(), "'window' has no alias: {old_name:?}");
     }
 
     #[test]
@@ -9531,7 +9798,11 @@ mod tests {
                 headers,
                 endpoint_tls,
                 reuse_port,
+                concurrency,
+                idle_timeout,
             } => {
+                assert_eq!(concurrency, 1);
+                assert_eq!(idle_timeout, Duration::from_secs(30));
                 assert!(!reuse_port, "opt-in -- no SO_REUSEPORT unless asked for");
                 assert_eq!(bind_tls, None, "plaintext unless configured");
                 assert!(bind_auth.is_empty(), "opt-in -- no credential required unless configured");

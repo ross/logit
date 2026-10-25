@@ -17,6 +17,11 @@
 //! - `buffer_full_at_shutdown` (info): when the queue's owner finishes it with an announced
 //!   episode still open.
 //!
+//! On a sink's buffer, a `buffer_full` line written while the write loop has as many batches in
+//! flight as its concurrency allows also names that limit and the last send's duration
+//! ([`SendLimit`]): the round trip, not the destination's refusal, is what bounds the sink, and
+//! raising `concurrency:` is the remedy (`docs/adr/sink-request-concurrency.md`, decision 2).
+//!
 //! None of them increments `logit.component.diagnostics`: like `write_loop`'s `retrying`, they
 //! are paced by time, never suppressed by count. The `*.dropped` counters stay the record of
 //! loss; these lines sit beside them.
@@ -24,7 +29,7 @@
 use crate::queue::OverflowPolicy;
 use logit_core::{Diagnostics, Telemetry};
 use std::fmt::Write as _;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 use tokio::sync::futures::Notified;
@@ -68,6 +73,48 @@ pub(crate) struct WatchConfig {
     pub recover_below: f64,
     pub max_items: u64,
     pub max_weight: u64,
+}
+
+/// What a sink's write loop is waiting on, for the `buffer_full` line's cause: how many batches
+/// it may have in flight at once, how many it has, and how long the last one took from its send
+/// to its answer. `write_loop` writes it; the [`FullWatch`] reads it when it writes a line. A
+/// queue no write loop drains (a listener's receive queue) leaves it at zero, which adds nothing.
+#[derive(Debug, Default)]
+pub(crate) struct SendLimit {
+    limit: AtomicUsize,
+    in_flight: AtomicUsize,
+    /// The last answered send's duration in nanoseconds, 0 before the first.
+    last_send_nanos: AtomicU64,
+}
+
+impl SendLimit {
+    /// Records the loop's limit and the batches it's waiting on. A loop backing off before a
+    /// retry waits on none: the `retrying` line names that cause.
+    pub(crate) fn set(&self, limit: usize, in_flight: usize) {
+        self.limit.store(limit, Ordering::Relaxed);
+        self.in_flight.store(in_flight, Ordering::Relaxed);
+    }
+
+    /// Records one answered send's duration, its answer a success or a failure.
+    pub(crate) fn answered(&self, took: Duration) {
+        let nanos = u64::try_from(took.as_nanos()).unwrap_or(u64::MAX).max(1);
+        self.last_send_nanos.store(nanos, Ordering::Relaxed);
+    }
+
+    /// The `buffer_full` line's suffix when every batch the limit allows is in flight.
+    fn cause(&self) -> Option<String> {
+        let limit = self.limit.load(Ordering::Relaxed);
+        if limit == 0 || self.in_flight.load(Ordering::Relaxed) < limit {
+            return None;
+        }
+        Some(match self.last_send_nanos.load(Ordering::Relaxed) {
+            0 => format!("; sending at its concurrency of {limit}, no send answered yet"),
+            nanos => format!(
+                "; sending at its concurrency of {limit}, the last send took {}",
+                fmt_duration(Duration::from_nanos(nanos))
+            ),
+        })
+    }
 }
 
 /// Totals for one episode, or for the unannounced episodes since the last `buffer_full` line.
@@ -127,6 +174,7 @@ pub(crate) struct FullWatch {
     /// Pushes waiting for room. Production queues have one producer, so this is 0 or 1.
     waiters: AtomicUsize,
     state: Mutex<State>,
+    send_limit: SendLimit,
 }
 
 /// Held by a push for as long as it waits for room. Dropping it, on room, close, or the push
@@ -174,7 +222,13 @@ impl FullWatch {
             open: AtomicBool::new(false),
             waiters: AtomicUsize::new(0),
             state: Mutex::new(State::default()),
+            send_limit: SendLimit::default(),
         }
+    }
+
+    /// The write loop's side of the `buffer_full` line's cause.
+    pub(crate) fn send_limit(&self) -> &SendLimit {
+        &self.send_limit
     }
 
     pub(crate) fn set_diagnostics(&mut self, diag: Diagnostics) {
@@ -350,6 +404,9 @@ impl FullWatch {
                 self.config.policy.as_str(),
                 self.what_happened(episode, now, true)
             );
+        }
+        if let Some(cause) = self.send_limit.cause() {
+            msg.push_str(&cause);
         }
         let earlier = std::mem::take(&mut state.unannounced);
         if earlier.episodes > 0 {
@@ -544,6 +601,36 @@ mod tests {
         assert_eq!(fmt_duration(Duration::from_secs(45)), "45s");
         assert_eq!(fmt_duration(Duration::from_secs(150)), "2m30s");
         assert_eq!(fmt_duration(Duration::from_secs(15_300)), "4h15m0s");
+    }
+
+    /// With every batch the write loop may send at once in flight, the line names the limit and
+    /// the last send's duration; below the limit, or in a backoff, it names neither.
+    #[tokio::test]
+    async fn a_full_line_names_the_concurrency_only_when_every_send_is_in_flight() {
+        for (limit, in_flight, answered, cause) in [
+            (1, 1, Some(200), Some("; sending at its concurrency of 1, the last send took 200ms")),
+            (8, 8, Some(1500), Some("; sending at its concurrency of 8, the last send took 1s")),
+            (1, 1, None, Some("; sending at its concurrency of 1, no send answered yet")),
+            (8, 7, Some(200), None),
+            (1, 0, Some(200), None),
+            (0, 0, None, None),
+        ] {
+            let (lines, _guard) = capture();
+            let w = watch(OverflowPolicy::DropNewest, Telemetry::default());
+            w.send_limit().set(limit, in_flight);
+            if let Some(ms) = answered {
+                w.send_limit().answered(Duration::from_millis(ms));
+            }
+            w.dropped("overflow_newest", 1, Bound::Items);
+            let full = lines.with_key("buffer_full");
+            let base = "buffer full (buffer.max_batches 8); overflow drop_newest is shedding new \
+                        batch(es)";
+            assert_eq!(
+                full[0].1,
+                format!("{base}{}", cause.unwrap_or_default()),
+                "{limit}/{in_flight}"
+            );
+        }
     }
 
     /// `0.57 * 100.0` is `56.99999999999999` in `f64`; the line reads `57%`.

@@ -34,7 +34,8 @@
 //! `scrape_targets`, not `targets`: `Component.targets` (`docs/adr/target-components.md`) claims
 //! the bare name at the flattened top level. The TLS keys are `scrape_tls`/`bind_tls`, never a
 //! bare `tls`: each mode has its own TLS role (client TLS dialling out, server TLS terminating
-//! in), and each key names the socket it governs.
+//! in), and each key names the socket it governs. The scrape client negotiates HTTP/2 through ALPN
+//! on an `https://` target, with or without `scrape_tls:`, and falls back to HTTP/1.1.
 //!
 //! # Scrape mode
 //!
@@ -652,6 +653,7 @@ impl PrometheusInput {
             &self.diag,
             &self.telemetry,
         )?;
+        let cfg = logit_pipeline::tls::with_http_alpn(&cfg);
         self.client =
             reqwest::Client::builder().use_preconfigured_tls(cfg).build().map_err(|err| {
                 anyhow::anyhow!("prometheus_in: building a TLS-configured client: {err}")
@@ -2230,6 +2232,62 @@ mod tests {
             }
         });
         addr
+    }
+
+    /// A scrape under `scrape_tls:` offers h2 through ALPN, as one without it does, and takes it
+    /// from a target that picks it.
+    #[tokio::test]
+    async fn a_scrape_under_scrape_tls_negotiates_h2() {
+        use http_body_util::BodyExt;
+        let mut cfg = (*test_server_tls_config("server")).clone();
+        cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(cfg));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let versions: Arc<std::sync::Mutex<Vec<http::Version>>> = Arc::default();
+        let seen = Arc::clone(&versions);
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else { return };
+                let Ok(stream) = acceptor.accept(stream).await else { continue };
+                let seen = Arc::clone(&seen);
+                let service = hyper::service::service_fn(
+                    move |request: http::Request<hyper::body::Incoming>| {
+                        seen.lock().unwrap().push(request.version());
+                        async move {
+                            let _ = request.into_body().collect().await;
+                            let response = http::Response::builder()
+                                .header("content-type", "text/plain; version=0.0.4")
+                                .body(http_body_util::Full::new(text_0_0_4_body()))
+                                .unwrap();
+                            Ok::<_, std::convert::Infallible>(response)
+                        }
+                    },
+                );
+                tokio::spawn(async move {
+                    let builder = hyper_util::server::conn::auto::Builder::new(
+                        hyper_util::rt::TokioExecutor::new(),
+                    );
+                    let io = hyper_util::rt::TokioIo::new(stream);
+                    let _ = builder.serve_connection(io, service).await;
+                });
+            }
+        });
+        let mut input = input_for(&format!("https://{addr}/metrics"))
+            .with_tls(
+                &TlsClientSettings { ca_file: Some("ca.pem".to_string()), ..Default::default() },
+                &testdata_dir(),
+                &logit_pipeline::tls::TlsReloader::new(),
+            )
+            .expect("a well-formed tls: block should build fine");
+        let (tx, mut rx) = mpsc::channel(4);
+        let fanout = Fanout::new(vec![tx]);
+
+        input.tick(&fanout).await;
+
+        let batch = recv_batch(&mut rx).await;
+        assert_eq!(synthetic_value(&batch, "up"), 1.0);
+        assert_eq!(*versions.lock().unwrap(), vec![http::Version::HTTP_2]);
     }
 
     #[tokio::test]

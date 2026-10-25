@@ -1,6 +1,6 @@
 # Native encode + decode + ack round trip: one process, two disconnected chains sharing
 # one loopback connection, `gen -> relay_out` (logit_out, dialing) and `relay_in -> drop`
-# (logit_in, listening). The same graph as native-relay with `window: 1` on `relay_out`: each
+# (logit_in, listening). The same graph as native-relay with `concurrency: 1` on `relay_out`: each
 # batch waits for `relay_in`'s Ack before the next is sent. It is the one-frame-in-flight
 # comparison point for native-relay, which runs the default window
 # (docs/adr/native-hop-send-window.md). Scenario table: docs/design/performance.md,
@@ -29,7 +29,7 @@ components:
     type: logit_out
     sources: [gen]
     endpoint: 127.0.0.1:19001
-    window: 1
+    concurrency: 1
 
   relay_in:
     type: logit_in

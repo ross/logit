@@ -182,6 +182,9 @@ pub struct TlsClientSettings {
     pub key_file: Option<String>,
     /// Skips server-certificate verification: still encrypted, but any certificate is accepted.
     pub insecure_skip_verify: bool,
+    /// The name the server's certificate is verified against in place of the dialed host. SNI
+    /// still carries the dialed host. Ignored under `insecure_skip_verify`.
+    pub server_name: Option<String>,
 }
 
 impl TlsClientSettings {
@@ -192,7 +195,19 @@ impl TlsClientSettings {
             && self.cert_file.is_none()
             && self.key_file.is_none()
             && !self.insecure_skip_verify
+            && self.server_name.is_none()
     }
+}
+
+/// A copy of `cfg` offering `h2` and `http/1.1` through ALPN, the list `reqwest` sets on a config
+/// it builds itself. `reqwest` uses a config passed to `use_preconfigured_tls` as given and speaks
+/// h2 only when the server picks it through ALPN, so an HTTP client with a `tls:` block needs this
+/// to negotiate h2 as one without does. The cert resolver and verifier are shared with `cfg`, so a
+/// reload reaches the copy.
+pub fn with_http_alpn(cfg: &rustls::ClientConfig) -> rustls::ClientConfig {
+    let mut cfg = cfg.clone();
+    cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    cfg
 }
 
 /// Builds a `rustls::ClientConfig` from `settings`, with every path resolved against `base_dir`,
@@ -201,10 +216,16 @@ impl TlsClientSettings {
 /// Registers `ca_file` and the `cert_file`/`key_file` pair, whichever are set, and nothing when
 /// neither is. `insecure_skip_verify` ignores `ca_file`, and the default Mozilla roots are compiled
 /// in, so neither has anything to reload. ALPN stays empty: `otlp_out`'s gRPC connector panics on
-/// a config that sets it.
+/// a config that sets it. An HTTP client sets it on its own copy through [`with_http_alpn`].
 ///
-/// Fails on a file that's missing or doesn't parse, and on a key that doesn't match its
-/// certificate: at startup a bad file stops the process, where a reload keeps the old material.
+/// A `server_name` wraps whichever verifier applies in a [`VerifyAsServerName`], so the
+/// certificate is checked against that name while the caller's dialed name still goes out as SNI
+/// and keys the resumption cache (`docs/adr/tls-client-server-name.md`). With no `server_name`,
+/// the bundled-roots path keeps `with_root_certificates`.
+///
+/// Fails on a file that's missing or doesn't parse, on a key that doesn't match its certificate,
+/// and on a `server_name` that is neither a DNS name nor an IP address: at startup a bad file
+/// stops the process, where a reload keeps the old material.
 pub fn build_client_config(
     settings: &TlsClientSettings,
     base_dir: &Path,
@@ -221,6 +242,10 @@ pub fn build_client_config(
         files.push(WatchedFile::new("tls.cert_file", base_dir.join(cert_file)));
         files.push(WatchedFile::new("tls.key_file", base_dir.join(key_file)));
     }
+    let server_name = match settings.server_name.as_deref() {
+        Some(name) if !settings.insecure_skip_verify => Some(parse_server_name(name)?),
+        _ => None,
+    };
     let contents = files.iter().map(WatchedFile::read).collect::<anyhow::Result<Vec<_>>>()?;
 
     let provider = Arc::new(rustls::crypto::ring::default_provider());
@@ -234,17 +259,27 @@ pub fn build_client_config(
         .expect("the ring crypto provider always supports TLS 1.2/1.3");
     // The graph rejects `insecure_skip_verify` with `ca_file` for every client; with a client
     // certificate it's legal (mutual TLS, no server verification).
-    let builder = match &verifier {
+    let builder = match (&verifier, server_name) {
         _ if settings.insecure_skip_verify => builder
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(AcceptAnyServerCert((*provider).clone()))),
-        Some(verifier) => builder
+        (Some(verifier), None) => builder
             .dangerous()
             .with_custom_certificate_verifier(verifier.clone() as Arc<dyn ServerCertVerifier>),
-        None => {
-            let mut roots = rustls::RootCertStore::empty();
-            roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-            builder.with_root_certificates(roots)
+        (Some(verifier), Some(name)) => builder.dangerous().with_custom_certificate_verifier(
+            Arc::new(VerifyAsServerName::new(verifier.clone(), name)),
+        ),
+        (None, None) => builder.with_root_certificates(bundled_roots()),
+        (None, Some(name)) => {
+            let inner = WebPkiServerVerifier::builder_with_provider(
+                Arc::new(bundled_roots()),
+                provider.clone(),
+            )
+            .build()
+            .map_err(|e| anyhow::anyhow!("building a verifier over the bundled roots: {e}"))?;
+            builder
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(VerifyAsServerName::new(inner, name)))
         }
     };
     let cfg = match &cert {
@@ -274,6 +309,20 @@ pub fn build_client_config(
         });
     }
     Ok(cfg)
+}
+
+/// The bundled Mozilla root set a client trusts with no `ca_file`.
+fn bundled_roots() -> rustls::RootCertStore {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    roots
+}
+
+/// `tls.server_name` as a `ServerName`: a DNS name or an IP literal.
+fn parse_server_name(name: &str) -> anyhow::Result<ServerName<'static>> {
+    ServerName::try_from(name.to_owned()).map_err(|_| {
+        anyhow::anyhow!("tls.server_name {name:?} is neither a DNS name nor an IP address")
+    })
 }
 
 /// One parsed client file set: everything a swap needs, built before anything swaps.
@@ -579,6 +628,69 @@ impl ServerCertVerifier for ReloadingServerVerifier {
 
     fn requires_raw_public_keys(&self) -> bool {
         self.current().requires_raw_public_keys()
+    }
+}
+
+/// `tls.server_name`'s [`ServerCertVerifier`]: verifies the server's certificate against a
+/// configured name in place of the one the client dialed, and delegates everything else.
+///
+/// Only verification sees the configured name. rustls sends SNI and keys its resumption cache from
+/// the name passed to `connect`, which stays the dialed host. A resumed session skips
+/// verification, but every session in the cache was verified against this same name, since the
+/// cache belongs to this one config. `inner` is a [`ReloadingServerVerifier`] for a `ca_file`, so
+/// a rotated CA reaches this wrapper too.
+#[derive(Debug)]
+pub struct VerifyAsServerName {
+    inner: Arc<dyn ServerCertVerifier>,
+    name: ServerName<'static>,
+}
+
+impl VerifyAsServerName {
+    pub fn new(inner: Arc<dyn ServerCertVerifier>, name: ServerName<'static>) -> Self {
+        Self { inner, name }
+    }
+}
+
+impl ServerCertVerifier for VerifyAsServerName {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        ocsp_response: &[u8],
+        now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        self.inner.verify_server_cert(end_entity, intermediates, &self.name, ocsp_response, now)
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.inner.supported_verify_schemes()
+    }
+
+    fn requires_raw_public_keys(&self) -> bool {
+        self.inner.requires_raw_public_keys()
+    }
+
+    fn root_hint_subjects(&self) -> Option<&[DistinguishedName]> {
+        self.inner.root_hint_subjects()
     }
 }
 

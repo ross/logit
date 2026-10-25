@@ -2936,6 +2936,13 @@
               ]
             },
             "buffer": true,
+            "concurrency": {
+              "description": "How many batches may be in flight at once, each sent before the ones ahead of it are answered. At `1` this sink sends one batch per round trip to the destination, which caps its throughput on a high-latency link; raise it there. Above `1`, batches can land at the destination out of order, and under `buffer.delivery: at_most_once` each batch in flight is its own unknown outcome: one whose send fails that way is dropped alone. Defaults to `1`; must be between `1` and `1024`.\n\nOf two writes of one point that land out of order, InfluxDB keeps the one that lands last.",
+              "default": 1,
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
+            },
             "default_bucket": {
               "description": "The bucket for a batch that names none when `bucket` is absent: anything not received by an `influxdb_in`. With neither set, such a batch is dropped and counted.",
               "default": null,
@@ -2952,6 +2959,11 @@
                 "null"
               ]
             },
+            "idle_timeout": {
+              "description": "How long a pooled connection may sit idle before this sink closes it instead of reusing it. Keep it below the destination's keep-alive idle timeout, so this sink closes an idle connection before the destination does: a write sent on a connection the destination has already closed has an unknown outcome, resent under `buffer.delivery: at_least_once` and dropped under `at_most_once`. Keep it above the interval between this sink's batches if the connection should be reused; a sink that sends less often opens a new connection, with its handshake, for each batch. Defaults to `30s`: most destinations keep an idle connection at least 60 s. Lower it for a destination that closes sooner, such as a Node.js, Apache, or uvicorn server at its 5 s default. `0s` never reuses an idle connection: every request opens its own.",
+              "default": "30s",
+              "type": "string"
+            },
             "org": {
               "description": "The organization name sent with every write. When set, it replaces any organization an `influxdb_in` upstream received, by name or by ID. When absent, the sink forwards the organization `influxdb_in` received, else `default_org`. Setting this and `default_org` together is an error.",
               "default": null,
@@ -2963,6 +2975,21 @@
             "receive": true,
             "sources": true,
             "targets": true,
+            "tls": {
+              "description": "Tunes TLS for an `https://` url: a private CA, a client certificate, or no verification. A non-default block with an `http://` url is rejected.",
+              "default": {
+                "ca_file": null,
+                "cert_file": null,
+                "insecure_skip_verify": false,
+                "key_file": null,
+                "server_name": null
+              },
+              "allOf": [
+                {
+                  "$ref": "#/definitions/TlsClientConfig"
+                }
+              ]
+            },
             "token": {
               "description": "The API token. A plain string: write `!env INFLUXDB_TOKEN` to pull it from the environment rather than inlining it. `!env` works on every other field too.",
               "type": "string"
@@ -2997,6 +3024,13 @@
                 }
               ]
             },
+            "concurrency": {
+              "description": "How many batches may be in flight at once, each sent before the ones ahead of it are answered. At `1` this sink sends one batch per round trip to the destination, which caps its throughput on a high-latency link; raise it there. Above `1`, batches can land at the destination out of order, and under `buffer.delivery: at_most_once` each batch in flight is its own unknown outcome: one whose send fails that way is dropped alone. Defaults to `1`; must be between `1` and `1024`.\n\nLogs and traces don't depend on order. Metrics sent to a Prometheus-backed receiver need it to accept a series' samples out of timestamp order: VictoriaMetrics does with no setting, while Prometheus and Mimir do only with their out-of-order time window open, which is off by default, and reject a late sample otherwise.",
+              "default": 1,
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
+            },
             "endpoint": {
               "type": "string"
             },
@@ -3007,6 +3041,11 @@
               "additionalProperties": {
                 "type": "string"
               }
+            },
+            "idle_timeout": {
+              "description": "How long a pooled connection may sit idle before this sink closes it instead of reusing it. Keep it below the destination's keep-alive idle timeout, so this sink closes an idle connection before the destination does: a write sent on a connection the destination has already closed has an unknown outcome, resent under `buffer.delivery: at_least_once` and dropped under `at_most_once`. Keep it above the interval between this sink's batches if the connection should be reused; a sink that sends less often opens a new connection, with its handshake, for each batch. Defaults to `30s`: most destinations keep an idle connection at least 60 s. Lower it for a destination that closes sooner, such as a Node.js, Apache, or uvicorn server at its 5 s default. `0s` never reuses an idle connection: every request opens its own.\n\nApplies to both `protocol`s.",
+              "default": "30s",
+              "type": "string"
             },
             "paths": {
               "description": "Per-signal HTTP path overrides. `protocol: http` only; a non-empty value under `protocol: grpc` is rejected.",
@@ -3038,7 +3077,8 @@
                 "ca_file": null,
                 "cert_file": null,
                 "insecure_skip_verify": false,
-                "key_file": null
+                "key_file": null,
+                "server_name": null
               },
               "allOf": [
                 {
@@ -3077,6 +3117,13 @@
                 }
               ]
             },
+            "concurrency": {
+              "description": "How many batches may be in flight at once, each sent before the ones ahead of it are answered. At `1` this sink sends one batch per round trip to the destination, which caps its throughput on a high-latency link; raise it there. Above `1`, batches can land at the destination out of order, and under `buffer.delivery: at_most_once` each batch in flight is its own unknown outcome: one whose send fails that way is dropped alone. Defaults to `1`; must be between `1` and `1024`.\n\nDatadog keeps one series point per second: of two that land out of order, it keeps the one that lands last.",
+              "default": 1,
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
+            },
             "endpoints": {
               "description": "Base URLs that replace the hosts `site` derives, one per intake: for a proxy, or to point this sink at another `logit`'s `datadog_in`.",
               "default": {
@@ -3110,6 +3157,11 @@
                 }
               ]
             },
+            "idle_timeout": {
+              "description": "How long a pooled connection may sit idle before this sink closes it instead of reusing it. Keep it below the destination's keep-alive idle timeout, so this sink closes an idle connection before the destination does: a write sent on a connection the destination has already closed has an unknown outcome, resent under `buffer.delivery: at_least_once` and dropped under `at_most_once`. Keep it above the interval between this sink's batches if the connection should be reused; a sink that sends less often opens a new connection, with its handshake, for each batch. Defaults to `30s`: most destinations keep an idle connection at least 60 s. Lower it for a destination that closes sooner, such as a Node.js, Apache, or uvicorn server at its 5 s default. `0s` never reuses an idle connection: every request opens its own.",
+              "default": "30s",
+              "type": "string"
+            },
             "receive": true,
             "site": {
               "description": "The Datadog site your organization is on: `datadoghq.com` (the default), `datadoghq.eu`, `us3.datadoghq.com`, `us5.datadoghq.com`, `ap1.datadoghq.com`, `ap2.datadoghq.com`, `ddog-gov.com`, and so on. Requests go to `https://api.<site>`, `https://http-intake.logs.<site>`, and `https://trace.agent.<site>`. A bare domain: no scheme and no `/`.",
@@ -3129,7 +3181,8 @@
                 "ca_file": null,
                 "cert_file": null,
                 "insecure_skip_verify": false,
-                "key_file": null
+                "key_file": null,
+                "server_name": null
               },
               "allOf": [
                 {
@@ -3163,6 +3216,13 @@
                 }
               ]
             },
+            "concurrency": {
+              "description": "How many batches may be in flight at once, each sent before the ones ahead of it are answered. At `1` this sink sends one batch per round trip to the destination, which caps its throughput on a high-latency link; raise it there. Above `1`, batches can land at the destination out of order, and under `buffer.delivery: at_most_once` each batch in flight is its own unknown outcome: one whose send fails that way is dropped alone. Defaults to `1`; must be between `1` and `1024`.",
+              "default": 1,
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
+            },
             "endpoint": {
               "description": "The Agent's trace API as an absolute `http://` or `https://` URL: `http://127.0.0.1:8126` for an Agent on the same host.",
               "default": null,
@@ -3178,6 +3238,11 @@
               "additionalProperties": {
                 "type": "string"
               }
+            },
+            "idle_timeout": {
+              "description": "How long a pooled connection may sit idle before this sink closes it instead of reusing it. Keep it below the destination's keep-alive idle timeout, so this sink closes an idle connection before the destination does: a write sent on a connection the destination has already closed has an unknown outcome, resent under `buffer.delivery: at_least_once` and dropped under `at_most_once`. Keep it above the interval between this sink's batches if the connection should be reused; a sink that sends less often opens a new connection, with its handshake, for each batch. Defaults to `30s`: most destinations keep an idle connection at least 60 s. Lower it for a destination that closes sooner, such as a Node.js, Apache, or uvicorn server at its 5 s default. `0s` never reuses an idle connection: every request opens its own.\n\nApplies to the `socket` connection too.",
+              "default": "30s",
+              "type": "string"
             },
             "receive": true,
             "socket": {
@@ -3201,7 +3266,8 @@
                 "ca_file": null,
                 "cert_file": null,
                 "insecure_skip_verify": false,
-                "key_file": null
+                "key_file": null,
+                "server_name": null
               },
               "allOf": [
                 {
@@ -3259,8 +3325,20 @@
                 }
               ]
             },
+            "concurrency": {
+              "description": "How many batches may be in flight at once, each sent before the ones ahead of it are answered. At `1` this sink sends one batch per round trip to the destination, which caps its throughput on a high-latency link; raise it there. Above `1`, batches can land at the destination out of order, and under `buffer.delivery: at_most_once` each batch in flight is its own unknown outcome: one whose send fails that way is dropped alone. Defaults to `1`; must be between `1` and `1024`.",
+              "default": 1,
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
+            },
             "endpoint": {
               "description": "The collector's base URL, ending in `/services/collector`: `https://splunk.example.com:8088/services/collector`, or `https://http-inputs-<stack>.splunkcloud.com/services/collector` on Splunk Cloud. A Splunk Cloud trial stack serves HEC at `https://<stack>.splunkcloud.com:8088/services/collector` instead, with a self-signed certificate that needs `tls: {insecure_skip_verify: true}`. This sink appends `/event` and `/ack` itself, so a URL ending in a route (`/event`, `/raw`, `/ack`, `/health`) is rejected.",
+              "type": "string"
+            },
+            "idle_timeout": {
+              "description": "How long a pooled connection may sit idle before this sink closes it instead of reusing it. Keep it below the destination's keep-alive idle timeout, so this sink closes an idle connection before the destination does: a write sent on a connection the destination has already closed has an unknown outcome, resent under `buffer.delivery: at_least_once` and dropped under `at_most_once`. Keep it above the interval between this sink's batches if the connection should be reused; a sink that sends less often opens a new connection, with its handshake, for each batch. Defaults to `30s`: most destinations keep an idle connection at least 60 s. Lower it for a destination that closes sooner, such as a Node.js, Apache, or uvicorn server at its 5 s default. `0s` never reuses an idle connection: every request opens its own.",
+              "default": "30s",
               "type": "string"
             },
             "max_body_bytes": {
@@ -3291,7 +3369,8 @@
                 "ca_file": null,
                 "cert_file": null,
                 "insecure_skip_verify": false,
-                "key_file": null
+                "key_file": null,
+                "server_name": null
               },
               "allOf": [
                 {
@@ -3415,7 +3494,7 @@
               "type": "string"
             },
             "tls": {
-              "description": "Turns on TLS to every broker when present, and makes it required: a `host:port` has no scheme to select TLS from, so even an empty `tls: {}` means TLS with the bundled Mozilla roots. Each broker's certificate is checked against the host it advertises.",
+              "description": "Turns on TLS to every broker when present, and makes it required: a `host:port` has no scheme to select TLS from, so even an empty `tls: {}` means TLS with the bundled Mozilla roots. Each broker's certificate is checked against the host it advertises, or against `server_name` when it's set.",
               "default": null,
               "anyOf": [
                 {
@@ -3473,6 +3552,13 @@
                 }
               ]
             },
+            "concurrency": {
+              "description": "How many batches may be sent before the oldest is acknowledged. Raise it on a high-latency link, where waiting for each acknowledgment before the next batch caps throughput at one batch per round trip. `1` keeps one batch in flight. The peer may answer a smaller window; on a connection whose peer answered at or above this value, the connection's window (`logit.output.window`) is this number. Under `buffer.delivery: at_most_once`, a fault whose outcome is unknown drops every batch in flight, so `1` is the safer choice there. Defaults to `32`; must be between `1` and `1024`.",
+              "default": 32,
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
+            },
             "endpoint": {
               "description": "`host:port`. Resolved at connect time, never at config-load time: a peer that isn't up yet is not a config error.",
               "type": "string"
@@ -3502,13 +3588,6 @@
               "enum": [
                 "logit_out"
               ]
-            },
-            "window": {
-              "description": "How many batches may be sent before the oldest is acknowledged. Raise it on a high-latency link, where waiting for each acknowledgment before the next batch caps throughput at one batch per round trip. `1` keeps one batch in flight. The peer may answer a smaller window. Under `buffer.delivery: at_most_once`, a fault whose outcome is unknown drops every batch in flight, so `1` is the safer choice there. Defaults to `32`; must be between `1` and `1024`.",
-              "default": 32,
-              "type": "integer",
-              "format": "uint32",
-              "minimum": 0.0
             }
           },
           "additionalProperties": false
@@ -4051,7 +4130,8 @@
                 "ca_file": null,
                 "cert_file": null,
                 "insecure_skip_verify": false,
-                "key_file": null
+                "key_file": null,
+                "server_name": null
               },
               "allOf": [
                 {
@@ -4233,6 +4313,13 @@
                 }
               ]
             },
+            "concurrency": {
+              "description": "How many batches may be in flight at once, each sent before the ones ahead of it are answered. At `1` this sink sends one batch per round trip to the destination, which caps its throughput on a high-latency link; raise it there. Above `1`, batches can land at the destination out of order, and under `buffer.delivery: at_most_once` each batch in flight is its own unknown outcome: one whose send fails that way is dropped alone. Defaults to `1`; must be between `1` and `1024`.\n\nA remote-write receiver expects each series' samples in timestamp order, and one with no out-of-order window answers a batch that lands behind a newer one with `400`, which drops that batch. VictoriaMetrics accepts out-of-order samples with no setting; Prometheus (`storage.tsdb.out_of_order_time_window`) and Mimir (`out_of_order_time_window`) accept them only with that window open, which is off by default. Sender mode only.",
+              "default": 1,
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
+            },
             "endpoint": {
               "description": "An absolute `http://`/`https://` remote-write URL, path included (typically `/api/v1/write`): sender mode. Never resolved at config-load time, so a receiver that isn't up yet is not a config error.\n\nA remote-write series holds one sample per millisecond, so of two readings of one series in one millisecond of a batch, the sink sends the later and leaves the earlier off, counted `logit.output.metrics.dropped{reason=\"duplicate_timestamp\"}`. When the earlier is a state (a gauge not flagged `_logit.metrics.type: rate`, or a cumulative kind) equal to the later, nothing is lost, and it counts `logit.output.metrics.normalized{reason=\"duplicate_timestamp\"}` instead; two equal increments or sets of observations, a set's size included, are still two. To merge or collapse such readings first, put a `dedup_timestamps` with `precision: 1ms` last before this sink.",
               "default": null,
@@ -4247,7 +4334,8 @@
                 "ca_file": null,
                 "cert_file": null,
                 "insecure_skip_verify": false,
-                "key_file": null
+                "key_file": null,
+                "server_name": null
               },
               "allOf": [
                 {
@@ -4267,6 +4355,11 @@
               "additionalProperties": {
                 "type": "string"
               }
+            },
+            "idle_timeout": {
+              "description": "How long a pooled connection may sit idle before this sink closes it instead of reusing it. Keep it below the destination's keep-alive idle timeout, so this sink closes an idle connection before the destination does: a write sent on a connection the destination has already closed has an unknown outcome, resent under `buffer.delivery: at_least_once` and dropped under `at_most_once`. Keep it above the interval between this sink's batches if the connection should be reused; a sink that sends less often opens a new connection, with its handshake, for each batch. Defaults to `30s`: most destinations keep an idle connection at least 60 s. Lower it for a destination that closes sooner, such as a Node.js, Apache, or uvicorn server at its 5 s default. `0s` never reuses an idle connection: every request opens its own. Sender mode only.",
+              "default": "30s",
+              "type": "string"
             },
             "max_series": {
               "description": "A hard cap on distinct series held in the registry; over it, the least-recently-updated series is evicted to admit a new one, counted `logit.output.series.evicted{reason=\"cardinality\"}`. Defaults to `100000`; `0` is rejected. Registry mode only.",
@@ -6321,6 +6414,14 @@
         },
         "key_file": {
           "description": "Private key (PEM, PKCS#8/PKCS#1/SEC1) for `cert_file`. Requires `cert_file`.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "server_name": {
+          "description": "The name the server's certificate is verified against, in place of the endpoint's host: a DNS name or an IP address. Use it to dial an endpoint by IP address, or through a proxy, when its certificate names another host. It doesn't change SNI: the connection still sends the endpoint's own host (none for an IP address), so it can't reach a front end that routes on SNI. On `kafka_out`, every broker is verified against this one name. Ignored under `insecure_skip_verify`. A name that doesn't parse fails startup.",
           "default": null,
           "type": [
             "string",

@@ -150,7 +150,9 @@ impl Chain {
     }
 
     pub(crate) fn with(env: Env, endpoints: Endpoints, timeout: Duration) -> Self {
-        Self::with_clients(env, endpoints, timeout, || crate::http::client_builder(timeout, None))
+        Self::with_clients(env, endpoints, timeout, || {
+            crate::http::client_builder(timeout, crate::http::DEFAULT_IDLE_TIMEOUT, None)
+        })
     }
 
     /// The chain with its HTTP clients built from `base`. The container endpoint's and IMDS's
@@ -1189,7 +1191,7 @@ mod tests {
         let proxied = |vars: &[(&str, &str)], endpoints: Endpoints| {
             let url = proxy.url.clone();
             Chain::with_clients(env(vars), endpoints, RECV_TIMEOUT, move || {
-                crate::http::client_builder(RECV_TIMEOUT, None)
+                crate::http::client_builder(RECV_TIMEOUT, crate::http::DEFAULT_IDLE_TIMEOUT, None)
                     .proxy(reqwest::Proxy::all(&url).unwrap())
             })
         };

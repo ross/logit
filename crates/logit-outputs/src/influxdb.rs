@@ -43,6 +43,28 @@
 //! treats an identical `(measurement, tag set, timestamp)` write as an overwrite, not a second
 //! point.
 //!
+//! ## Concurrency
+//!
+//! `concurrency:` (default 1) bounds how many batches are in flight. At 1, [`InfluxDbOutput::send`]
+//! makes each request in turn. Above 1, each batch's request runs in its own task through
+//! [`crate::http::Slots`], and `write_loop` settles them oldest first: a fault on one batch
+//! resends or drops that batch alone, under the same response classes as `send`. Batches can
+//! land out of order. That's safe here: InfluxDB keeps the last write of a point by
+//! `(measurement, tag set, timestamp)`, so two batches writing one point with different values
+//! leave whichever landed later, the same outcome as a fan-in topology at concurrency 1.
+//! Over TLS to a server that picks h2 through ALPN, the batches in flight share one connection as
+//! concurrent streams; otherwise they open up to `concurrency` connections.
+//! `logit.output.in_flight` reads the batches in flight, and `logit.component.send.duration`
+//! times each batch's request from its send to its response.
+//!
+//! `tls:` tunes an `https://` url: a private `ca_file`, a client certificate, or
+//! `insecure_skip_verify` ([`InfluxDbOutput::with_tls`]). Empty, the client keeps `reqwest`'s
+//! default trust. The files reload without a restart, as every TLS sink's do.
+//!
+//! `idle_timeout:` (default `30s`) closes a pooled connection idle past it instead of reusing it,
+//! so the sink closes an idle connection before the destination can ([`crate::http::build_client`];
+//! `docs/adr/sink-request-concurrency.md`, decision 7).
+//!
 //! ## Response classes
 //!
 //! A non-2xx answer carries InfluxDB's error JSON (`code` and `message`; a parse error's message
@@ -99,7 +121,7 @@
 //! `Retry-After` is ignored: `write_loop`'s backoff applies.
 
 use crate::accounting::BatchAccounting;
-use crate::http::{body_snippet, read_body_prefix, ERROR_BODY_SNIPPET_BYTES};
+use crate::http::{body_snippet, Exchange, Reply, Slots, ERROR_BODY_SNIPPET_BYTES};
 use crate::Output;
 use anyhow::Context;
 use logit_core::{Diagnostics, EventBatch, Resource, Telemetry, Value};
@@ -107,7 +129,11 @@ use logit_pipeline::{BatchContext, DeliveryPosture, Fault, SeqId};
 pub use logit_proto::influxdb::encode::{EncodeStats, InfluxLineEncoder};
 use logit_proto::influxdb::{RESOURCE_ATTR_BUCKET, RESOURCE_ATTR_ORG, RESOURCE_ATTR_ORG_ID};
 use logit_proto::Encoder;
+use std::path::Path;
 use std::time::Duration;
+
+/// `tls:`: the shared `crate::tls` type, re-exported as the other sinks do.
+pub use crate::tls::TlsClientSettings;
 
 /// `reqwest` has no request timeout by default; without one, a server that accepts the connection
 /// but never responds hangs `send`, and the pipeline worker driving it, forever.
@@ -167,26 +193,8 @@ struct WriteParams<'a> {
 }
 
 impl WriteParams<'_> {
-    /// The class of a non-2xx answer to a write with these parameters (the module doc's
-    /// "Response classes"). A `403` or `404` is the batch's own, `Rejected`, only when the value
-    /// it names, or the org a bucket is looked up in, came from the batch's carriers; one naming
-    /// only configured values hits every batch, so it holds, as
-    /// [`crate::http::classify_status`] reads it.
-    fn classify(&self, status: reqwest::StatusCode, body: &str) -> Fault {
-        let carried = match status.as_u16() {
-            403 => self.bucket_carried || self.org_carried,
-            404 => match NotFound::of(body) {
-                NotFound::Bucket => self.bucket_carried || self.org_carried,
-                NotFound::Org => self.org_carried,
-                NotFound::Other => self.bucket_carried || self.org_carried,
-            },
-            _ => false,
-        };
-        if carried {
-            Fault::Rejected
-        } else {
-            crate::http::classify_status(status)
-        }
+    fn carried(&self) -> Carried {
+        Carried { bucket: self.bucket_carried, org: self.org_carried }
     }
 
     fn query(&self) -> Vec<(&str, &str)> {
@@ -200,6 +208,37 @@ impl WriteParams<'_> {
         query.push(("bucket", self.bucket));
         query.push(("precision", "ns"));
         query
+    }
+}
+
+/// Which of a write's values came from the batch's carriers: all its answer's class needs once
+/// the request has left the loop task.
+#[derive(Debug, Clone, Copy)]
+struct Carried {
+    bucket: bool,
+    org: bool,
+}
+
+impl Carried {
+    /// The class of a non-2xx answer to a write (the module doc's "Response classes"). A `403`
+    /// or `404` is the batch's own, `Rejected`, only when the value it names, or the org a
+    /// bucket is looked up in, came from the batch's carriers; one naming only configured
+    /// values hits every batch, so it holds, as [`crate::http::classify_status`] reads it.
+    fn classify(self, status: reqwest::StatusCode, body: &str) -> Fault {
+        let carried = match status.as_u16() {
+            403 => self.bucket || self.org,
+            404 => match NotFound::of(body) {
+                NotFound::Bucket => self.bucket || self.org,
+                NotFound::Org => self.org,
+                NotFound::Other => self.bucket || self.org,
+            },
+            _ => false,
+        };
+        if carried {
+            Fault::Rejected
+        } else {
+            crate::http::classify_status(status)
+        }
     }
 }
 
@@ -233,15 +272,8 @@ fn carried<'a>(resource: &'a Resource, key: &str) -> Option<&'a str> {
 }
 
 pub struct InfluxDbOutput {
-    url: String,
-    organization: Organization,
-    destination: Destination,
-    token: String,
-    client: reqwest::Client,
+    writer: Writer,
     encoder: InfluxLineEncoder,
-    /// Per-request timeout: what `with_timeout` set, else [`DEFAULT_TIMEOUT`]. `send` makes one
-    /// attempt, so there's no retry budget to clamp it against.
-    request_timeout: Duration,
     /// Layer-3 detail (`docs/design/internal-telemetry.md`): the response class, which
     /// `run_output`'s `logit.component.send.*` can't see inside one `send`. Ungated; the encoder's
     /// diagnostics are gated by `accounting` (`crate::accounting`).
@@ -249,7 +281,27 @@ pub struct InfluxDbOutput {
     /// The sink's own diagnostics: the `no_bucket` warning. A `no_bucket` drop returns `Ok`, a
     /// final send, so it's never repeated by a retry and needs no gate.
     diag: Diagnostics,
+    /// The `send` path's batch accounting, at a concurrency of 1.
     accounting: BatchAccounting,
+    /// The batches in flight above a concurrency of 1, each with its own accounting over
+    /// `accounting`'s gate (the module doc's "Concurrency").
+    slots: Slots<(Carried, Exchange)>,
+    /// The operator's `idle_timeout:` ([`crate::http::build_client`]).
+    idle_timeout: Duration,
+    /// Built by [`InfluxDbOutput::with_tls`]; `None` keeps `reqwest`'s default trust.
+    tls: Option<rustls::ClientConfig>,
+}
+
+/// Where and how a batch is written: everything a request needs from the config.
+struct Writer {
+    url: String,
+    organization: Organization,
+    destination: Destination,
+    token: String,
+    client: reqwest::Client,
+    /// Per-request timeout: what `with_timeout` set, else [`DEFAULT_TIMEOUT`]. `send` makes one
+    /// attempt, so there's no retry budget to clamp it against.
+    request_timeout: Duration,
 }
 
 impl InfluxDbOutput {
@@ -259,25 +311,89 @@ impl InfluxDbOutput {
         destination: Destination,
         token: String,
     ) -> Self {
+        let accounting = BatchAccounting::default();
         Self {
-            url,
-            organization,
-            destination,
-            token,
-            client: crate::http::build_client(DEFAULT_TIMEOUT, None),
+            writer: Writer {
+                url,
+                organization,
+                destination,
+                token,
+                client: crate::http::build_client(
+                    DEFAULT_TIMEOUT,
+                    crate::http::DEFAULT_IDLE_TIMEOUT,
+                    None,
+                ),
+                request_timeout: DEFAULT_TIMEOUT,
+            },
             encoder: InfluxLineEncoder::default(),
-            request_timeout: DEFAULT_TIMEOUT,
             telemetry: Telemetry::default(),
             diag: Diagnostics::default(),
-            accounting: BatchAccounting::default(),
+            slots: Slots::new(accounting.gate().clone()),
+            accounting,
+            idle_timeout: crate::http::DEFAULT_IDLE_TIMEOUT,
+            tls: None,
         }
+    }
+
+    /// Rebuilds the client from the timeouts and TLS config set so far.
+    fn rebuild_client(&mut self) {
+        self.writer.client = crate::http::build_client(
+            self.writer.request_timeout,
+            self.idle_timeout,
+            self.tls.as_ref(),
+        );
+    }
+
+    /// Sets how many batches may be in flight at once (`concurrency:` in config, default 1).
+    pub fn with_concurrency(mut self, concurrency: u32) -> Self {
+        self.slots.set_concurrency(concurrency);
+        self
+    }
+
+    /// How long a pooled connection may sit idle before it's closed instead of reused
+    /// (`idle_timeout:` in config, default [`crate::http::DEFAULT_IDLE_TIMEOUT`]). Rebuilds the
+    /// client.
+    pub fn with_idle_timeout(mut self, idle_timeout: Duration) -> Self {
+        self.idle_timeout = idle_timeout;
+        self.rebuild_client();
+        self
     }
 
     /// Overrides the default 10s request timeout. Rebuilds the underlying HTTP client.
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
-        self.client = crate::http::build_client(timeout, None);
-        self.request_timeout = timeout;
+        self.writer.request_timeout = timeout;
+        self.rebuild_client();
         self
+    }
+
+    /// Client TLS tuning (`tls:`) for an `https://` url. A no-op when `settings` is empty.
+    ///
+    /// Registers the files with `reloader` under this sink's diagnostics and telemetry as they are
+    /// when this runs, so call it after `with_diagnostics` and `with_telemetry`.
+    pub fn with_tls(
+        mut self,
+        settings: &TlsClientSettings,
+        base_dir: &Path,
+        reloader: &logit_pipeline::tls::TlsReloader,
+    ) -> anyhow::Result<Self> {
+        if settings.is_empty() {
+            return Ok(self);
+        }
+        if settings.insecure_skip_verify {
+            self.diag.warn(
+                "tls.insecure_skip_verify is set -- the connection is encrypted, but this output \
+                 will accept any certificate the peer presents, self-signed or otherwise",
+            );
+        }
+        self.tls = Some(logit_pipeline::tls::build_client_config(
+            settings,
+            base_dir,
+            reloader,
+            &self.diag,
+            &self.telemetry,
+        )?);
+        self.rebuild_client();
+        Ok(self)
     }
 
     /// Attaches the encoder's diagnostics handle (per-metric encode failures), gated by this
@@ -291,80 +407,71 @@ impl InfluxDbOutput {
 
     /// Attaches the layer-3 telemetry handle.
     pub fn with_telemetry(mut self, telemetry: Telemetry) -> Self {
+        self.slots.set_telemetry(telemetry.clone());
         self.telemetry = telemetry;
         self
     }
 }
 
-impl InfluxDbOutput {
-    /// One attempt per call, no loop or sleep: retry timing and budget belong to
-    /// `logit-pipeline`'s writer (`docs/adr/buffered-sink-delivery.md`). This classifies the
-    /// outcome and attaches it as `.context(fault)`.
-    async fn attempt(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
-        let Some(params) = resolve(&self.organization, &self.destination, &batch.resource) else {
-            drop_no_bucket(&self.telemetry, &mut self.diag, batch);
-            return Ok(());
-        };
-        let (first, body) = self.accounting.encode(0, || self.encoder.encode(batch));
-        let body = body?;
-        // Before the empty-body return: a batch whose every line was unencodable still counts
-        // what it dropped, omitted, or normalized, and an operator chasing a missing point needs
-        // to see it.
-        if first {
-            emit_encode_stats(&self.telemetry, self.encoder.stats());
+/// The encode half of one attempt, on the caller's task: the request to send and what its
+/// answer's class needs, or `None` when there's nothing to send. Encode-side counts go through
+/// `accounting`, so a retry of the same batch counts them once.
+fn prepare(
+    writer: &Writer,
+    encoder: &mut InfluxLineEncoder,
+    telemetry: &Telemetry,
+    diag: &mut Diagnostics,
+    accounting: &mut BatchAccounting,
+    batch: &EventBatch,
+) -> anyhow::Result<Option<(reqwest::RequestBuilder, Carried)>> {
+    let Some(params) = resolve(&writer.organization, &writer.destination, &batch.resource) else {
+        drop_no_bucket(telemetry, diag, batch);
+        return Ok(None);
+    };
+    let (first, body) = accounting.encode(0, || encoder.encode(batch));
+    let body = body?;
+    // Before the empty-body return: a batch whose every line was unencodable still counts what
+    // it dropped, omitted, or normalized, and an operator chasing a missing point needs to see
+    // it.
+    if first {
+        emit_encode_stats(telemetry, encoder.stats());
+    }
+    if body.is_empty() {
+        // Nothing had a line-protocol encoding (log- or span-only events, or every metric was
+        // dropped or skipped). Not an error; nothing to write.
+        return Ok(None);
+    }
+    if first {
+        telemetry.count("logit.output.batch.bytes", body.len() as f64, &[]);
+    }
+
+    let write_url = format!("{}/api/v2/write", writer.url.trim_end_matches('/'));
+    let request = writer
+        .client
+        .post(&write_url)
+        .query(&params.query())
+        .header("Authorization", format!("Token {}", writer.token))
+        .header("Content-Type", "text/plain; charset=utf-8")
+        .timeout(writer.request_timeout)
+        .body(body);
+    Ok(Some((request, params.carried())))
+}
+
+/// The answer half of one attempt, on the caller's task: counts the request and classifies its
+/// answer as `.context(fault)` (the module doc's "Response classes").
+fn settle(telemetry: &Telemetry, carried: Carried, exchange: Exchange) -> anyhow::Result<()> {
+    telemetry.timing("logit.output.request.duration", exchange.took, &[]);
+    telemetry.count("logit.output.requests", 1.0, &[("class", exchange.reply.class())]);
+    match exchange.reply {
+        Reply::Success(_) => Ok(()),
+        Reply::Failure { status, body, .. } => {
+            let fault = carried.classify(status, &body);
+            let text = body_snippet(&body, ERROR_BODY_SNIPPET_BYTES);
+            Err(anyhow::anyhow!("InfluxDB write failed ({status}): {text}")).context(fault)
         }
-        if body.is_empty() {
-            // Nothing had a line-protocol encoding (e.g. log- or span-only events, or every
-            // metric was dropped or skipped). Not an error; nothing to write.
-            return Ok(());
-        }
-
-        if first {
-            self.telemetry.count("logit.output.batch.bytes", body.len() as f64, &[]);
-        }
-
-        let write_url = format!("{}/api/v2/write", self.url.trim_end_matches('/'));
-
-        let request_timer = self.telemetry.timer("logit.output.request.duration");
-        let result = self
-            .client
-            .post(&write_url)
-            .query(&params.query())
-            .header("Authorization", format!("Token {}", self.token))
-            .header("Content-Type", "text/plain; charset=utf-8")
-            .timeout(self.request_timeout)
-            .body(body)
-            .send()
-            .await;
-        drop(request_timer);
-
-        match result {
-            Ok(resp) if resp.status().is_success() => {
-                self.telemetry.count(
-                    "logit.output.requests",
-                    1.0,
-                    &[("class", crate::http::status_class(resp.status()))],
-                );
-                Ok(())
-            }
-            Ok(resp) => {
-                let status = resp.status();
-                self.telemetry.count(
-                    "logit.output.requests",
-                    1.0,
-                    &[("class", crate::http::status_class(status))],
-                );
-                // A bounded read, not `text()`: see `crate::http::read_body_prefix`.
-                let body = read_body_prefix(resp, ERROR_BODY_SNIPPET_BYTES).await;
-                let fault = params.classify(status, &body);
-                let text = body_snippet(&body, ERROR_BODY_SNIPPET_BYTES);
-                Err(anyhow::anyhow!("InfluxDB write failed ({status}): {text}")).context(fault)
-            }
-            Err(err) => {
-                self.telemetry.count("logit.output.requests", 1.0, &[("class", "network_error")]);
-                let fault = crate::http::classify_reqwest_error(&err);
-                Err(anyhow::Error::new(err)).context(fault)
-            }
+        Reply::Transport(err) => {
+            let fault = crate::http::classify_reqwest_error(&err);
+            Err(anyhow::Error::new(err)).context(fault)
         }
     }
 }
@@ -424,21 +531,83 @@ fn resolve<'a>(
 
 #[async_trait::async_trait]
 impl Output for InfluxDbOutput {
-    /// Arms this sink's batch accounting (`crate::accounting`).
-    fn observe_batch(&mut self, _ctx: BatchContext, _seq: SeqId) {
-        self.accounting.observe();
+    /// Arms this sink's batch accounting (`crate::accounting`), or under a window above 1 the
+    /// batch's own slot.
+    fn observe_batch(&mut self, _ctx: BatchContext, seq: SeqId) {
+        if self.slots.window() > 1 {
+            self.slots.observe(seq);
+        } else {
+            self.accounting.observe();
+        }
     }
 
     fn observe_posture(&mut self, posture: DeliveryPosture) {
         self.accounting.observe_posture(posture);
+        self.slots.observe_posture(posture);
     }
 
-    /// One attempt ([`InfluxDbOutput::attempt`]). A final result (`Ok`, or a fault
-    /// `write_loop` won't retry) disarms the batch accounting on every path, a batch that encoded
-    /// to nothing included.
+    /// One attempt, one request, no retry: retry timing belongs to `logit-pipeline`'s writer
+    /// (`docs/adr/buffered-sink-delivery.md`). A final result (`Ok`, or a fault `write_loop`
+    /// won't retry) disarms the batch accounting on every path, a batch that encoded to nothing
+    /// included.
     async fn send(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
-        let result = self.attempt(batch).await;
+        let prepared = prepare(
+            &self.writer,
+            &mut self.encoder,
+            &self.telemetry,
+            &mut self.diag,
+            &mut self.accounting,
+            batch,
+        );
+        let result = match prepared {
+            Ok(Some((request, carried))) => {
+                settle(&self.telemetry, carried, crate::http::exchange(request).await)
+            }
+            Ok(None) => Ok(()),
+            Err(err) => Err(err),
+        };
         self.accounting.finish(result)
+    }
+
+    fn window(&self) -> usize {
+        self.slots.window()
+    }
+
+    fn send_duration_per_batch(&self) -> bool {
+        true
+    }
+
+    fn answered_send_duration(&self) -> Option<Duration> {
+        self.slots.answered()
+    }
+
+    /// Encodes `batch` into its slot and starts its request on a task of its own.
+    async fn submit(
+        &mut self,
+        batch: &EventBatch,
+        _ctx: BatchContext,
+        seq: SeqId,
+    ) -> anyhow::Result<()> {
+        let (writer, encoder, telemetry, diag) =
+            (&self.writer, &mut self.encoder, &self.telemetry, &mut self.diag);
+        self.slots.submit(seq, |accounting| {
+            let prepared = prepare(writer, encoder, telemetry, diag, accounting, batch)?;
+            Ok(prepared.map(|(request, carried)| async move {
+                (carried, crate::http::exchange(request).await)
+            }))
+        })
+    }
+
+    /// The oldest batch's answer, counted and classified as `send` does.
+    async fn await_ack(&mut self) -> anyhow::Result<()> {
+        let telemetry = &self.telemetry;
+        self.slots.ack(|(carried, exchange)| settle(telemetry, carried, exchange)).await
+    }
+
+    /// Aborts every request still in flight: the write loop has stopped.
+    async fn flush(&mut self) -> anyhow::Result<()> {
+        self.slots.cancel();
+        Ok(())
     }
 }
 
@@ -1625,5 +1794,246 @@ mod tests {
     async fn a_400_naming_no_organization_is_rejected() {
         let body = r#"{"code":"invalid","message":"Please provide either orgID or org"}"#;
         assert_eq!(carried_class_of(influx_error("400 Bad Request", body)).await, Fault::Rejected);
+    }
+
+    // -- tls: ----------------------------------------------------------------------------------
+
+    /// A receiver over TLS presenting `testdata/tls/server.pem`, answering every write `204`.
+    /// Returns the receiver and a sink dialing it, tuned by `settings`.
+    async fn tls_sink(
+        client_ca: Option<&str>,
+        settings: crate::tls::TlsClientSettings,
+    ) -> (crate::http::held::Mux, InfluxDbOutput) {
+        let server =
+            crate::test_support::fixture_server_config("server", client_ca, &[b"http/1.1"]);
+        let mux = crate::http::held::Mux::start(Some(server)).await;
+        mux.release();
+        let output = InfluxDbOutput::new(
+            mux.url().to_string(),
+            Organization::Fixed("org".into()),
+            Destination::Fixed("bucket".into()),
+            "token".into(),
+        )
+        .with_tls(
+            &settings,
+            &crate::test_support::testdata_dir(),
+            &logit_pipeline::tls::TlsReloader::new(),
+        )
+        .expect("the fixture files load");
+        (mux, output)
+    }
+
+    /// With the private CA in `ca_file`, the write completes over TLS.
+    #[tokio::test]
+    async fn a_ca_file_trusts_a_private_ca_receiver() {
+        let settings = crate::test_support::tls_settings(|s| s.ca_file = Some("ca.pem".into()));
+        let (mux, mut output) = tls_sink(None, settings).await;
+        output.send(&one_metric_batch()).await.expect("the write should verify and land");
+        assert_eq!(mux.carriers().len(), 1, "one request reached the receiver");
+    }
+
+    /// Without `ca_file`, `reqwest`'s default trust refuses the private CA's certificate.
+    #[tokio::test]
+    async fn no_tls_block_refuses_a_private_ca_receiver() {
+        let (mux, mut output) = tls_sink(None, Default::default()).await;
+        output.send(&one_metric_batch()).await.expect_err("the private CA isn't trusted");
+        assert!(mux.carriers().is_empty(), "no request got through the handshake");
+    }
+
+    /// `insecure_skip_verify` accepts the same certificate without a CA.
+    #[tokio::test]
+    async fn insecure_skip_verify_accepts_a_private_ca_receiver() {
+        let settings = crate::test_support::tls_settings(|s| s.insecure_skip_verify = true);
+        let (mux, mut output) = tls_sink(None, settings).await;
+        output.send(&one_metric_batch()).await.expect("verification is off");
+        assert_eq!(mux.carriers().len(), 1);
+    }
+
+    /// A receiver requiring a client certificate admits the sink only with `cert_file` and
+    /// `key_file` set.
+    #[tokio::test]
+    async fn a_client_certificate_satisfies_mutual_tls() {
+        let with_cert = crate::test_support::tls_settings(|s| {
+            s.ca_file = Some("ca.pem".into());
+            s.cert_file = Some("client.pem".into());
+            s.key_file = Some("client.key".into());
+        });
+        let (mux, mut output) = tls_sink(Some("ca"), with_cert).await;
+        output.send(&one_metric_batch()).await.expect("the client certificate is admitted");
+        assert_eq!(mux.carriers().len(), 1);
+
+        let without_cert = crate::test_support::tls_settings(|s| s.ca_file = Some("ca.pem".into()));
+        let (mux, mut output) = tls_sink(Some("ca"), without_cert).await;
+        output.send(&one_metric_batch()).await.expect_err("no client certificate is refused");
+        assert!(mux.carriers().is_empty());
+    }
+
+    /// The certificate in `server-named.pem` names only `logit.test`, so a client dialing
+    /// `127.0.0.1` verifies it only against a configured `server_name`.
+    #[tokio::test]
+    async fn server_name_verifies_the_certificate_against_that_name() {
+        let named = |server_name: Option<&str>| {
+            crate::test_support::tls_settings(|s| {
+                s.ca_file = Some("ca.pem".into());
+                s.server_name = server_name.map(String::from);
+            })
+        };
+        let server =
+            || crate::test_support::fixture_server_config("server-named", None, &[b"http/1.1"]);
+
+        let mux = crate::http::held::Mux::start(Some(server())).await;
+        mux.release();
+        let mut output = InfluxDbOutput::new(
+            mux.url().to_string(),
+            Organization::Fixed("org".into()),
+            Destination::Fixed("bucket".into()),
+            "token".into(),
+        )
+        .with_tls(
+            &named(None),
+            &crate::test_support::testdata_dir(),
+            &logit_pipeline::tls::TlsReloader::new(),
+        )
+        .unwrap();
+        output.send(&one_metric_batch()).await.expect_err("127.0.0.1 isn't in the certificate");
+        assert!(mux.carriers().is_empty());
+
+        let mux = crate::http::held::Mux::start(Some(server())).await;
+        mux.release();
+        let mut output = InfluxDbOutput::new(
+            mux.url().to_string(),
+            Organization::Fixed("org".into()),
+            Destination::Fixed("bucket".into()),
+            "token".into(),
+        )
+        .with_tls(
+            &named(Some("logit.test")),
+            &crate::test_support::testdata_dir(),
+            &logit_pipeline::tls::TlsReloader::new(),
+        )
+        .unwrap();
+        output.send(&one_metric_batch()).await.expect("logit.test is in the certificate");
+        assert_eq!(mux.carriers().len(), 1);
+    }
+
+    /// `with_tls` survives the later timeout and idle-timeout setters, which rebuild the client.
+    #[tokio::test]
+    async fn the_tls_config_survives_a_client_rebuild() {
+        let settings = crate::test_support::tls_settings(|s| s.ca_file = Some("ca.pem".into()));
+        let (mux, output) = tls_sink(None, settings).await;
+        let mut output =
+            output.with_timeout(Duration::from_secs(5)).with_idle_timeout(Duration::from_secs(1));
+        output.send(&one_metric_batch()).await.expect("the rebuilt client still trusts ca.pem");
+        assert_eq!(mux.carriers().len(), 1);
+    }
+
+    /// A reloaded `ca_file` reaches the next request: building the sink registers its files with
+    /// the reloader.
+    #[tokio::test]
+    async fn a_reloaded_ca_file_reaches_the_next_request() {
+        use crate::test_support::{fixture_server_config, rewrite_tls_file, scratch_tls_files};
+        let server = fixture_server_config("server-other", None, &[b"http/1.1"]);
+        let mux = crate::http::held::Mux::start(Some(server)).await;
+        mux.release();
+        let dir = scratch_tls_files("influxdb-out-ca-reload", &[("ca.pem", "ca.pem")]);
+        let reloader = logit_pipeline::tls::TlsReloader::new();
+        let mut output = InfluxDbOutput::new(
+            mux.url().to_string(),
+            Organization::Fixed("org".into()),
+            Destination::Fixed("bucket".into()),
+            "token".into(),
+        )
+        .with_tls(
+            &crate::test_support::tls_settings(|s| s.ca_file = Some("ca.pem".into())),
+            &dir,
+            &reloader,
+        )
+        .unwrap();
+        output.send(&one_metric_batch()).await.expect_err("ca.pem didn't sign server-other");
+
+        rewrite_tls_file(&dir, "ca.pem", "other-ca.pem");
+        reloader.check_now();
+
+        output.send(&one_metric_batch()).await.expect("the reloaded CA trusts the receiver");
+    }
+
+    // -- concurrency above 1 (`docs/adr/sink-request-concurrency.md`, decision 3) -----------
+
+    mod concurrency {
+        use super::*;
+        use crate::http::held::{self, Subject};
+
+        fn make(url: &str, concurrency: u32, telemetry: Telemetry) -> InfluxDbOutput {
+            InfluxDbOutput::new(
+                url.into(),
+                Organization::Fixed("org".into()),
+                Destination::Fixed("bucket".into()),
+                "token".into(),
+            )
+            .with_timeout(Duration::from_secs(60))
+            .with_concurrency(concurrency)
+            .with_telemetry(telemetry)
+        }
+
+        /// Batch `n` writes measurement `m<n>` and carries an event with no metrics, which the
+        /// encoder counts skipped.
+        fn batch(n: u64) -> EventBatch {
+            batch_with(vec![
+                metric_event(&format!("m{n}"), MetricKind::counter(1.0), &[]),
+                Event::empty(1_700_000_000_000_000_000, AttrMap::new()),
+            ])
+        }
+
+        fn id_of(body: &[u8]) -> u64 {
+            let text = String::from_utf8_lossy(body);
+            let measurement = text.split([' ', ',']).next().unwrap_or_default();
+            measurement.trim_start_matches('m').parse().expect("a body written by `batch`")
+        }
+
+        fn subject() -> Subject<InfluxDbOutput> {
+            Subject {
+                kind: "influxdb_out",
+                make,
+                batch,
+                id_of,
+                encoded: ("logit.output.events.skipped", &[("reason", "no_metrics")]),
+                refuse: held::RESP_401,
+            }
+        }
+
+        #[tokio::test]
+        async fn n_requests_in_flight_answered_out_of_order() {
+            held::n_requests_in_flight_answered_out_of_order(subject()).await;
+        }
+
+        #[tokio::test]
+        async fn a_500_on_one_slot_is_resent_alone() {
+            held::a_500_on_one_slot_is_resent_alone(subject()).await;
+        }
+
+        #[tokio::test]
+        async fn a_400_on_one_slot_is_dropped_alone() {
+            held::a_400_on_one_slot_is_dropped_alone(subject()).await;
+        }
+
+        #[tokio::test]
+        async fn a_401_head_holds_the_fill_at_one_window() {
+            held::a_401_head_holds_the_fill_at_one_window(subject()).await;
+        }
+
+        #[tokio::test]
+        async fn at_most_once_drops_one_ambiguous_slot_alone() {
+            held::at_most_once_drops_one_ambiguous_slot_alone(subject()).await;
+        }
+
+        #[tokio::test]
+        async fn a_grace_cut_aborts_the_requests_in_flight() {
+            held::a_grace_cut_aborts_the_requests_in_flight(subject()).await;
+        }
+
+        #[tokio::test]
+        async fn a_batch_behind_a_retried_head_times_its_own_request() {
+            held::a_batch_behind_a_retried_head_times_its_own_request(subject()).await;
+        }
     }
 }

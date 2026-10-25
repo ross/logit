@@ -28,8 +28,9 @@
 //!
 //! A send succeeds when any signal of the batch was accepted, on this attempt or an earlier one,
 //! and fails `Rejected` only when every signal sent was rejected. The memory lives beside the
-//! batch accounting ([`crate::accounting::BatchAccounting::settle`]): `observe_batch` clears it
-//! for each new batch, so it covers the retries of one batch and nothing else. A caller that never
+//! batch accounting ([`crate::accounting::BatchAccounting::settle`]), one per batch in flight:
+//! `observe_batch` clears it for each new batch, so it covers the retries of one batch and nothing
+//! else. A caller that never
 //! calls `observe_batch` gets no memory, and each `send` sends every signal. A disk-buffered batch
 //! replayed after a restart is a new batch and sends every signal again.
 //!
@@ -61,6 +62,24 @@
 //! refused request per batch. See `docs/adr/delivery-semantics.md`'s "Amendment: per-request
 //! verdicts (2026-10-04)" and `docs/adr/sink-fault-classes.md`'s "Amendment: `otlp_out` retries
 //! per signal (2026-10-05)".
+//!
+//! **Concurrency.** `concurrency:` (default 1) bounds how many batches are in flight. At 1, `send`
+//! makes each batch's requests in turn. Above 1, each batch's requests run in its own task
+//! through [`crate::http::Slots`], still one at a time and in signal order, and `write_loop`
+//! settles the batches oldest first: a fault on one batch resends or drops that batch alone, under
+//! the table below, and its resend skips the signals that batch already settled. Over gRPC every
+//! batch's calls share one HTTP/2 connection as concurrent streams. Over HTTP they do too when the
+//! endpoint is `https://` and the server picks h2 through ALPN; otherwise they open up to
+//! `concurrency` connections. Batches can land out of order.
+//! Logs and spans are stored as received. Metrics sent to a Prometheus-backed receiver can reach it
+//! out of timestamp order for one series, which a receiver without an out-of-order window rejects;
+//! [`crate::prometheus`]'s "Concurrency" table says which receivers accept it.
+//! `logit.output.in_flight` reads the batches in flight, and `logit.component.send.duration` times
+//! each batch's requests from the first send to the last response.
+//!
+//! `idle_timeout:` (default `30s`) closes a pooled connection idle past it instead of reusing it,
+//! so the sink closes an idle connection before the destination can, on both transports
+//! ([`crate::http::build_client`]; `docs/adr/sink-request-concurrency.md`, decision 7).
 //!
 //! **Delivery posture.** The default, `at_least_once` (`docs/adr/delivery-semantics.md`, item 5),
 //! resends the signal an `Ambiguous` answer named, and OTLP has no identity that makes a resend
@@ -132,6 +151,7 @@ use http_body_util::{BodyExt, Full};
 use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client as GrpcClient;
+#[cfg(test)]
 use hyper_util::rt::TokioExecutor;
 use logit_core::{redact, CountGate, Diagnostics, EventBatch, Telemetry};
 use logit_pipeline::{BatchContext, DeliveryPosture, Fault, SeqId};
@@ -145,7 +165,8 @@ use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 
 use crate::http::{
     body_snippet, build_client, classify_reqwest_error, classify_status, read_body_prefix,
-    read_varint, skip_field, status_class, Outcomes, ERROR_BODY_SNIPPET_BYTES,
+    read_varint, skip_field, status_class, Journal, Outcomes, Slots, DEFAULT_IDLE_TIMEOUT,
+    ERROR_BODY_SNIPPET_BYTES,
 };
 use std::collections::HashMap;
 use std::path::Path;
@@ -196,6 +217,8 @@ pub struct OtlpOutput {
     /// (`docs/adr/otlp-tls-and-pooled-grpc-client.md`): one HTTP/2 connection reused across
     /// requests instead of a connect and handshake per request, plaintext or TLS. Built against
     /// the default trust store and rebuilt when [`OtlpOutput::with_tls`] sets a non-empty `tls:`.
+    /// Batches in flight above a concurrency of 1 share it, each request a stream on that
+    /// connection.
     grpc_client: GrpcClient<HttpsConnector<HttpConnector>, Full<Bytes>>,
     request_timeout: Duration,
     /// Counts through views of `telemetry`/`diag` gated by `accounting` ([`new_encoder`]).
@@ -203,10 +226,10 @@ pub struct OtlpOutput {
     /// Ungated: the requests and partial successes a receiver's answer decides.
     telemetry: Telemetry,
     diag: Diagnostics,
+    /// The `send` path's batch accounting, at a concurrency of 1. Its posture
+    /// ([`Output::observe_posture`]) decides whether an `Ambiguous` stop counts the records of
+    /// every signal the destination hasn't settled.
     accounting: BatchAccounting,
-    /// The posture `write_loop` resolved ([`Output::observe_posture`]); under `AtMostOnce`, an
-    /// `Ambiguous` stop counts the records of every signal the destination hasn't settled.
-    posture: DeliveryPosture,
     /// Extra headers on every export request, both transports. Applied per request, never as
     /// `reqwest` `default_headers`: `with_timeout` rebuilds `client`, which would drop them if
     /// called afterward. `client` stays a function of timeout and TLS settings only.
@@ -216,6 +239,11 @@ pub struct OtlpOutput {
     /// `Some` once [`OtlpOutput::with_tls`] set a non-empty `tls:`. `None` means each transport's
     /// default TLS config, not "TLS off": the scheme decides TLS.
     tls: Option<rustls::ClientConfig>,
+    /// The batches in flight above a concurrency of 1, each with its own accounting over
+    /// `accounting`'s gate (the module doc's "Concurrency").
+    slots: Slots<Attempted>,
+    /// The operator's `idle_timeout:`, on both transports' pools ([`crate::http::build_client`]).
+    idle_timeout: Duration,
 }
 
 impl OtlpOutput {
@@ -225,14 +253,15 @@ impl OtlpOutput {
         Ok(Self {
             endpoint,
             transport,
-            client: build_client(DEFAULT_TIMEOUT, None),
-            grpc_client: build_grpc_client(&default_client_tls_config()),
+            client: build_client(DEFAULT_TIMEOUT, DEFAULT_IDLE_TIMEOUT, None),
+            grpc_client: build_grpc_client(&default_client_tls_config(), DEFAULT_IDLE_TIMEOUT),
+            idle_timeout: DEFAULT_IDLE_TIMEOUT,
             request_timeout: DEFAULT_TIMEOUT,
             encoder: new_encoder(&telemetry, &diag, accounting.gate()),
             telemetry,
             diag,
+            slots: Slots::new(accounting.gate().clone()),
             accounting,
-            posture: DeliveryPosture::AtLeastOnce,
             headers: HeaderMap::new(),
             paths: SignalPaths::default(),
             compression: OtlpCompression::default(),
@@ -240,11 +269,30 @@ impl OtlpOutput {
         })
     }
 
+    /// Sets how many batches may be in flight at once (`concurrency:` in config, default 1).
+    pub fn with_concurrency(mut self, concurrency: u32) -> Self {
+        self.slots.set_concurrency(concurrency);
+        self
+    }
+
+    /// How long a pooled connection may sit idle before it's closed instead of reused
+    /// (`idle_timeout:` in config, default [`crate::http::DEFAULT_IDLE_TIMEOUT`]). Rebuilds both
+    /// transports' clients.
+    pub fn with_idle_timeout(mut self, idle_timeout: Duration) -> Self {
+        self.idle_timeout = idle_timeout;
+        self.client = build_client(self.request_timeout, idle_timeout, self.tls.as_ref());
+        self.grpc_client = match &self.tls {
+            Some(cfg) => build_grpc_client(cfg, idle_timeout),
+            None => build_grpc_client(&default_client_tls_config(), idle_timeout),
+        };
+        self
+    }
+
     /// Overrides the default 10s request timeout. Over HTTP it's `reqwest`'s timeout; over gRPC
     /// it bounds the whole round trip (connect, handshake, request, response) with
     /// `tokio::time::timeout`, so `grpc_client` isn't rebuilt.
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
-        self.client = build_client(timeout, self.tls.as_ref());
+        self.client = build_client(timeout, self.idle_timeout, self.tls.as_ref());
         self.request_timeout = timeout;
         self
     }
@@ -281,8 +329,8 @@ impl OtlpOutput {
             &self.diag,
             &self.telemetry,
         )?;
-        self.client = build_client(self.request_timeout, Some(&cfg));
-        self.grpc_client = build_grpc_client(&cfg);
+        self.client = build_client(self.request_timeout, self.idle_timeout, Some(&cfg));
+        self.grpc_client = build_grpc_client(&cfg, self.idle_timeout);
         self.tls = Some(cfg);
         Ok(self)
     }
@@ -329,16 +377,6 @@ impl OtlpOutput {
         self
     }
 
-    /// The HTTP path for `signal`: the config override, else [`Signal::path`].
-    fn path_for(&self, signal: Signal) -> &str {
-        let override_path = match signal {
-            Signal::Logs => &self.paths.logs,
-            Signal::Metrics => &self.paths.metrics,
-            Signal::Traces => &self.paths.traces,
-        };
-        override_path.as_deref().unwrap_or_else(|| signal.path())
-    }
-
     /// Attaches the diagnostics handle, to this output and, gated, to its encoder's lossy-metric
     /// paths.
     pub fn with_diagnostics(mut self, diag: Diagnostics) -> Self {
@@ -350,29 +388,211 @@ impl OtlpOutput {
     /// Attaches the layer-3 telemetry handle, also threaded, gated, into the encoder for its
     /// lossy-metric-path counters (`logit-proto`'s `otlp::metrics` module doc).
     pub fn with_telemetry(mut self, telemetry: Telemetry) -> Self {
+        self.slots.set_telemetry(telemetry.clone());
         self.telemetry = telemetry;
         self.encoder = new_encoder(&self.telemetry, &self.diag, self.accounting.gate());
         self
     }
 
-    fn record_partial_success(&mut self, signal: Signal, rejected: i64, error_message: &str) {
-        if rejected > 0 {
-            self.telemetry.count(
-                "logit.output.records.dropped",
-                rejected as f64,
-                &[("signal", signal.as_str()), ("reason", "rejected")],
-            );
-            self.diag.warn_throttled(
-                "otlp_partial_success",
-                format_args!(
-                    "OTLP {} export partially rejected ({rejected} record(s)): {error_message}",
-                    signal.as_str()
-                ),
-            );
+    /// What one attempt's requests need from this sink, owned so they can run in a task of their
+    /// own.
+    fn sender(&self) -> Sender {
+        Sender {
+            transport: self.transport,
+            endpoint: self.endpoint.clone(),
+            client: self.client.clone(),
+            grpc_client: self.grpc_client.clone(),
+            request_timeout: self.request_timeout,
+            headers: self.headers.clone(),
+            paths: self.paths.clone(),
+            compression: self.compression,
+            telemetry: self.telemetry.clone(),
         }
     }
+}
 
-    async fn send_http(&mut self, signal: Signal, payload: Bytes) -> anyhow::Result<()> {
+/// Everything a batch's requests need, cloned from the sink: the clients are handles on the
+/// sink's own pools, and `telemetry` the ungated handle the attempt's [`Journal`] counts on.
+struct Sender {
+    transport: OtlpTransport,
+    endpoint: String,
+    client: reqwest::Client,
+    grpc_client: GrpcClient<HttpsConnector<HttpConnector>, Full<Bytes>>,
+    request_timeout: Duration,
+    headers: HeaderMap,
+    paths: SignalPaths,
+    compression: OtlpCompression,
+    telemetry: Telemetry,
+}
+
+/// One attempt at a batch: its signals the destination hasn't settled, in send order, and what
+/// [`run`] needs to fold their verdicts.
+struct Attempt {
+    sender: Sender,
+    requests: Vec<SignalPayload>,
+    /// Whether an earlier attempt at the batch had a signal accepted ([`Outcomes::new`]).
+    accepted_before: bool,
+    posture: DeliveryPosture,
+}
+
+struct SignalPayload {
+    signal: Signal,
+    records: usize,
+    bytes: Bytes,
+}
+
+/// What [`run`] did: the attempt's result and every count, warning, and settled signal it
+/// recorded, for [`settle`] to apply on the loop task.
+struct Attempted {
+    journal: Journal,
+    result: anyhow::Result<()>,
+}
+
+/// The encode half of one attempt, on the loop task: every signal is encoded as unit 0 of
+/// `accounting`, the settled ones included, and the attempt carries the rest. `None` when no
+/// signal is left to send.
+fn prepare(
+    sender: Sender,
+    encoder: &mut OtlpEncoder,
+    accounting: &mut BatchAccounting,
+    batch: &EventBatch,
+) -> anyhow::Result<Option<Attempt>> {
+    let (_, payloads) = accounting.encode(0, || encoder.encode_signals(batch));
+    let requests: Vec<SignalPayload> = payloads?
+        .into_iter()
+        .filter(|payload| !accounting.settled(signal_bit(payload.signal)))
+        .map(|payload| SignalPayload {
+            signal: payload.signal,
+            records: payload.records,
+            bytes: payload.bytes,
+        })
+        .collect();
+    if requests.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(Attempt {
+        sender,
+        requests,
+        accepted_before: accounting.any_accepted(),
+        posture: accounting.posture(),
+    }))
+}
+
+/// One request per signal the attempt carries, in order, no retry in the sink
+/// (`docs/adr/buffered-sink-delivery.md`), each verdict folded by [`Outcomes`]. An accepted
+/// signal is remembered and skipped on a retry of the same batch; a rejected one is counted
+/// `logit.output.records.dropped{signal, reason="rejected"}` by its record count, remembered, and
+/// the next signal is sent. A `Clean`, `Refused`, or `Ambiguous` failure stops the attempt with
+/// its own fault, and `write_loop` retries only the signals not yet settled. Under
+/// `at_most_once`, an `Ambiguous` stop drops the batch, so the records of the failed signal and
+/// every signal after it are counted `records.dropped{signal, reason="ambiguous_at_most_once"}`.
+///
+/// A 2xx or `OK` whose `partial_success` rejected every record counts as accepted: a resend of
+/// rejected records is only rejected again.
+///
+/// Touches nothing of the sink's, so it runs in a slot's task or inline in `send`: every effect
+/// goes to the returned journal.
+async fn run(attempt: Attempt) -> Attempted {
+    let Attempt { sender, requests, accepted_before, posture } = attempt;
+    let mut journal = Journal::new(sender.telemetry.clone());
+    let mut outcomes = Outcomes::new(accepted_before);
+    let mut requests = requests.into_iter();
+    while let Some(SignalPayload { signal, records, bytes }) = requests.next() {
+        let result = match sender.transport {
+            OtlpTransport::Http => sender.send_http(signal, bytes, &mut journal).await,
+            OtlpTransport::Grpc => sender.send_grpc(signal, bytes, &mut journal).await,
+        };
+        let accepted = result.is_ok();
+        let next = outcomes.note(result, |err| {
+            journal.count(
+                "logit.output.records.dropped",
+                records as f64,
+                &[("signal", signal.as_str()), ("reason", "rejected")],
+            );
+            journal.warn(
+                "signal_rejected",
+                format_args!(
+                    "OTLP {} export rejected, {records} record(s) dropped: {}; if the \
+                     destination or its credential accepts only some signals, place \
+                     `has_signal` or `keep_signals` ahead of this sink",
+                    signal.as_str(),
+                    err.root_cause(),
+                ),
+            );
+        });
+        match next {
+            Ok(()) => journal.settle(signal_bit(signal), accepted),
+            Err(err) => {
+                if posture == DeliveryPosture::AtMostOnce
+                    && logit_pipeline::classify(&err) == Fault::Ambiguous
+                {
+                    count_dropped_at_most_once(&mut journal, signal, records);
+                    for rest in requests {
+                        count_dropped_at_most_once(&mut journal, rest.signal, rest.records);
+                    }
+                }
+                return Attempted { journal, result: Err(err) };
+            }
+        }
+    }
+    Attempted { journal, result: outcomes.finish() }
+}
+
+/// The answer half of one attempt, on the loop task: applies what [`run`] recorded and returns
+/// the attempt's result.
+fn settle(
+    diag: &mut Diagnostics,
+    accounting: &mut BatchAccounting,
+    attempted: Attempted,
+) -> anyhow::Result<()> {
+    attempted.journal.replay(diag, accounting);
+    attempted.result
+}
+
+/// Counts `records` of `signal` lost to an at-most-once drop of an `Ambiguous` attempt.
+fn count_dropped_at_most_once(journal: &mut Journal, signal: Signal, records: usize) {
+    journal.count(
+        "logit.output.records.dropped",
+        records as f64,
+        &[("signal", signal.as_str()), ("reason", "ambiguous_at_most_once")],
+    );
+}
+
+/// Counts and warns about the records a `partial_success` rejected.
+fn record_partial_success(journal: &mut Journal, signal: Signal, rejected: i64, message: &str) {
+    if rejected > 0 {
+        journal.count(
+            "logit.output.records.dropped",
+            rejected as f64,
+            &[("signal", signal.as_str()), ("reason", "rejected")],
+        );
+        journal.warn(
+            "otlp_partial_success",
+            format_args!(
+                "OTLP {} export partially rejected ({rejected} record(s)): {message}",
+                signal.as_str()
+            ),
+        );
+    }
+}
+
+impl Sender {
+    /// The HTTP path for `signal`: the config override, else [`Signal::path`].
+    fn path_for(&self, signal: Signal) -> &str {
+        let override_path = match signal {
+            Signal::Logs => &self.paths.logs,
+            Signal::Metrics => &self.paths.metrics,
+            Signal::Traces => &self.paths.traces,
+        };
+        override_path.as_deref().unwrap_or_else(|| signal.path())
+    }
+
+    async fn send_http(
+        &self,
+        signal: Signal,
+        payload: Bytes,
+        journal: &mut Journal,
+    ) -> anyhow::Result<()> {
         let url = format!("{}{}", self.endpoint.trim_end_matches('/'), self.path_for(signal));
         // Custom headers first, protocol-owned ones inserted after: `HeaderMap::insert` replaces,
         // so the fixed headers win even if rule 22 were bypassed. One `.headers(..)` call, never
@@ -397,19 +617,19 @@ impl OtlpOutput {
 
         match result {
             Ok(resp) if resp.status().is_success() => {
-                self.telemetry.count(
+                journal.count(
                     "logit.output.requests",
                     1.0,
                     &[("signal", signal.as_str()), ("class", status_class(resp.status()))],
                 );
                 let body = resp.bytes().await.unwrap_or_default();
                 let (rejected, message) = parse_partial_success(&body);
-                self.record_partial_success(signal, rejected, &message);
+                record_partial_success(journal, signal, rejected, &message);
                 Ok(())
             }
             Ok(resp) => {
                 let status = resp.status();
-                self.telemetry.count(
+                journal.count(
                     "logit.output.requests",
                     1.0,
                     &[("signal", signal.as_str()), ("class", status_class(status))],
@@ -428,7 +648,7 @@ impl OtlpOutput {
                 Err(err)
             }
             Err(err) => {
-                self.telemetry.count(
+                journal.count(
                     "logit.output.requests",
                     1.0,
                     &[("signal", signal.as_str()), ("class", "network_error")],
@@ -439,7 +659,12 @@ impl OtlpOutput {
         }
     }
 
-    async fn send_grpc(&mut self, signal: Signal, payload: Bytes) -> anyhow::Result<()> {
+    async fn send_grpc(
+        &self,
+        signal: Signal,
+        payload: Bytes,
+        journal: &mut Journal,
+    ) -> anyhow::Result<()> {
         let base = normalize_grpc_endpoint(&self.endpoint);
         let outcome = tokio::time::timeout(
             self.request_timeout,
@@ -457,7 +682,7 @@ impl OtlpOutput {
         let (status, body) = match outcome {
             Ok(Ok(v)) => v,
             Ok(Err((fault, err))) => {
-                self.telemetry.count(
+                journal.count(
                     "logit.output.requests",
                     1.0,
                     &[("signal", signal.as_str()), ("class", "network_error")],
@@ -465,7 +690,7 @@ impl OtlpOutput {
                 return Err(err).context(fault);
             }
             Err(_) => {
-                self.telemetry.count(
+                journal.count(
                     "logit.output.requests",
                     1.0,
                     &[("signal", signal.as_str()), ("class", "network_error")],
@@ -480,7 +705,7 @@ impl OtlpOutput {
         };
 
         let code = status.code;
-        self.telemetry.count(
+        journal.count(
             "logit.output.requests",
             1.0,
             &[("signal", signal.as_str()), ("class", grpc_status_class(code))],
@@ -488,7 +713,7 @@ impl OtlpOutput {
 
         if code == 0 {
             let (rejected, err_msg) = parse_partial_success(&body);
-            self.record_partial_success(signal, rejected, &err_msg);
+            record_partial_success(journal, signal, rejected, &err_msg);
             Ok(())
         } else {
             let err = anyhow::anyhow!(
@@ -499,80 +724,6 @@ impl OtlpOutput {
             .context(grpc_fault(&status));
             Err(err)
         }
-    }
-
-    /// One request per signal the destination hasn't settled for this batch, no retry in the
-    /// sink (`docs/adr/buffered-sink-delivery.md`), each verdict folded by [`Outcomes`]. An
-    /// accepted signal is remembered and skipped on a retry of the same batch; a rejected one is
-    /// counted `logit.output.records.dropped{signal, reason="rejected"}` by its record count,
-    /// remembered, and the next signal is sent. A `Clean`, `Refused`, or
-    /// `Ambiguous` failure stops the attempt with its own fault, and `write_loop` retries only the
-    /// signals not yet settled. Under `at_most_once`, an `Ambiguous` stop drops the batch, so the
-    /// records of the failed signal and every signal not yet settled are counted
-    /// `records.dropped{signal, reason="ambiguous_at_most_once"}`. Every signal is encoded before
-    /// the first request, as unit 0 of the batch accounting, the settled ones included.
-    ///
-    /// A 2xx or `OK` whose `partial_success` rejected every record counts as accepted: a resend of
-    /// rejected records is only rejected again.
-    async fn attempt(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
-        let (_, payloads) = self.accounting.encode(0, || self.encoder.encode_signals(batch));
-        let mut outcomes = Outcomes::new(self.accounting.any_accepted());
-        let mut payloads = payloads?.into_iter();
-        while let Some(payload) = payloads.next() {
-            let (signal, records) = (payload.signal, payload.records);
-            if self.accounting.settled(signal_bit(signal)) {
-                continue;
-            }
-            let result = match self.transport {
-                OtlpTransport::Http => self.send_http(signal, payload.bytes).await,
-                OtlpTransport::Grpc => self.send_grpc(signal, payload.bytes).await,
-            };
-            let accepted = result.is_ok();
-            let (telemetry, diag) = (&self.telemetry, &mut self.diag);
-            let next = outcomes.note(result, |err| {
-                telemetry.count(
-                    "logit.output.records.dropped",
-                    records as f64,
-                    &[("signal", signal.as_str()), ("reason", "rejected")],
-                );
-                diag.warn_throttled(
-                    "signal_rejected",
-                    format_args!(
-                        "OTLP {} export rejected, {records} record(s) dropped: {}; if the \
-                         destination or its credential accepts only some signals, place \
-                         `has_signal` or `keep_signals` ahead of this sink",
-                        signal.as_str(),
-                        err.root_cause(),
-                    ),
-                );
-            });
-            match next {
-                Ok(()) => self.accounting.settle(signal_bit(signal), accepted),
-                Err(err) => {
-                    if self.posture == DeliveryPosture::AtMostOnce
-                        && logit_pipeline::classify(&err) == Fault::Ambiguous
-                    {
-                        self.count_dropped_at_most_once(signal, records);
-                        for rest in payloads {
-                            if !self.accounting.settled(signal_bit(rest.signal)) {
-                                self.count_dropped_at_most_once(rest.signal, rest.records);
-                            }
-                        }
-                    }
-                    return Err(err);
-                }
-            }
-        }
-        outcomes.finish()
-    }
-
-    /// Counts `records` of `signal` lost to an at-most-once drop of an `Ambiguous` attempt.
-    fn count_dropped_at_most_once(&self, signal: Signal, records: usize) {
-        self.telemetry.count(
-            "logit.output.records.dropped",
-            records as f64,
-            &[("signal", signal.as_str()), ("reason", "ambiguous_at_most_once")],
-        );
     }
 }
 
@@ -595,22 +746,69 @@ fn new_encoder(telemetry: &Telemetry, diag: &Diagnostics, gate: &CountGate) -> O
 #[async_trait::async_trait]
 impl Output for OtlpOutput {
     /// Arms this sink's batch accounting (`crate::accounting`), which clears the signals the
-    /// destination settled for the last batch.
-    fn observe_batch(&mut self, _ctx: BatchContext, _seq: SeqId) {
-        self.accounting.observe();
+    /// destination settled for the last batch, or under a window above 1 the batch's own slot.
+    fn observe_batch(&mut self, _ctx: BatchContext, seq: SeqId) {
+        if self.slots.window() > 1 {
+            self.slots.observe(seq);
+        } else {
+            self.accounting.observe();
+        }
     }
 
     fn observe_posture(&mut self, posture: DeliveryPosture) {
-        self.posture = posture;
         self.accounting.observe_posture(posture);
+        self.slots.observe_posture(posture);
     }
 
-    /// One attempt ([`OtlpOutput::attempt`]). A final result (`Ok`, or a fault
-    /// `write_loop` won't retry) disarms the batch accounting on every path,
-    /// a batch that encoded to nothing included.
+    /// One attempt ([`run`]). A final result (`Ok`, or a fault `write_loop` won't retry) disarms
+    /// the batch accounting on every path, a batch that encoded to nothing included.
     async fn send(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
-        let result = self.attempt(batch).await;
+        let result = match prepare(self.sender(), &mut self.encoder, &mut self.accounting, batch) {
+            Ok(Some(attempt)) => {
+                let attempted = run(attempt).await;
+                settle(&mut self.diag, &mut self.accounting, attempted)
+            }
+            Ok(None) => Outcomes::new(self.accounting.any_accepted()).finish(),
+            Err(err) => Err(err),
+        };
         self.accounting.finish(result)
+    }
+
+    fn window(&self) -> usize {
+        self.slots.window()
+    }
+
+    fn send_duration_per_batch(&self) -> bool {
+        true
+    }
+
+    fn answered_send_duration(&self) -> Option<Duration> {
+        self.slots.answered()
+    }
+
+    /// Encodes `batch` into its slot and starts its signals' requests on a task of its own.
+    async fn submit(
+        &mut self,
+        batch: &EventBatch,
+        _ctx: BatchContext,
+        seq: SeqId,
+    ) -> anyhow::Result<()> {
+        let sender = self.sender();
+        let encoder = &mut self.encoder;
+        self.slots
+            .submit(seq, |accounting| Ok(prepare(sender, encoder, accounting, batch)?.map(run)))
+    }
+
+    /// The oldest batch's answer, counted and classified as `send` does.
+    async fn await_ack(&mut self) -> anyhow::Result<()> {
+        let diag = &mut self.diag;
+        self.slots.ack_with(|attempted, accounting| settle(diag, accounting, attempted)).await
+    }
+
+    /// Aborts every request still in flight: the write loop has stopped.
+    async fn flush(&mut self) -> anyhow::Result<()> {
+        self.slots.cancel();
+        Ok(())
     }
 }
 
@@ -639,6 +837,7 @@ fn default_client_tls_config() -> rustls::ClientConfig {
 /// so the one connector still dials `https://`.
 fn build_grpc_client(
     tls: &rustls::ClientConfig,
+    idle_timeout: Duration,
 ) -> GrpcClient<HttpsConnector<HttpConnector>, Full<Bytes>> {
     let mut http = HttpConnector::new();
     http.enforce_http(false);
@@ -648,7 +847,7 @@ fn build_grpc_client(
         .https_or_http()
         .enable_http2()
         .wrap_connector(http);
-    let mut builder = GrpcClient::builder(TokioExecutor::new());
+    let mut builder = crate::http::hyper_client_builder(idle_timeout);
     builder.http2_only(true);
     builder.build(connector)
 }
@@ -1307,9 +1506,9 @@ mod tests {
 
     /// A response body yielding one data frame then one trailers frame; a test-only twin of
     /// `logit_inputs::otlp::GrpcBody`, since nothing else in this crate serves gRPC.
-    struct TestGrpcBody {
-        data: Option<Bytes>,
-        trailers: Option<HeaderMap>,
+    pub(super) struct TestGrpcBody {
+        pub(super) data: Option<Bytes>,
+        pub(super) trailers: Option<HeaderMap>,
     }
 
     impl hyper::body::Body for TestGrpcBody {
@@ -1854,7 +2053,10 @@ mod tests {
 
     /// A TLS peer answering `200 OK` to any request.
     async fn canned_tls_http_server(require_client_auth: bool) -> std::net::SocketAddr {
-        let acceptor = tokio_rustls::TlsAcceptor::from(test_server_tls_config(require_client_auth));
+        // It answers in HTTP/1.1, so it offers only that: the client would pick h2 if offered.
+        let mut cfg = (*test_server_tls_config(require_client_auth)).clone();
+        cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(cfg));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -2761,5 +2963,232 @@ mod tests {
         let rejected = [("reason", "rejected")];
         assert_eq!(sum_of(&sums, "logit.component.batches.dropped", &rejected), 1.0, "{sums:?}");
         assert_eq!(sum_of(&sums, DROPPED, &rejected), 3.0, "{sums:?}");
+    }
+}
+
+#[cfg(test)]
+mod concurrency {
+    use super::*;
+    use crate::http::held::{self, Answer, Held, Subject};
+    use logit_core::interner::intern;
+    use logit_core::{AttrMap, Event, MetricKind, MetricRecord, Resource};
+    use logit_pipeline::test_util::wait_until;
+
+    const TS: i64 = 1_700_000_000_000_000_000;
+
+    fn make(url: &str, concurrency: u32, telemetry: Telemetry) -> OtlpOutput {
+        OtlpOutput::new(url.into(), OtlpTransport::Http)
+            .unwrap()
+            .with_timeout(Duration::from_secs(60))
+            .with_concurrency(concurrency)
+            .with_telemetry(telemetry)
+    }
+
+    fn batch_of(events: Vec<Event>) -> EventBatch {
+        EventBatch { resource: Arc::new(Resource::default()), scope: None, events }
+    }
+
+    /// Batch `n` is one log marked `held::marker(n)` beside an event with no payload, which the
+    /// encoder counts skipped.
+    fn batch(n: u64) -> EventBatch {
+        batch_of(vec![held::marker_log(TS, n), Event::empty(TS, AttrMap::new())])
+    }
+
+    fn subject() -> Subject<OtlpOutput> {
+        Subject {
+            kind: "otlp_out",
+            make,
+            batch,
+            id_of: held::id_after_marker,
+            encoded: ("logit.output.events.skipped", &[("reason", "no_payload")]),
+            // A `401` is `Rejected` here (module doc's "Faults" table); a `405` is `Refused`.
+            refuse: held::RESP_405,
+        }
+    }
+
+    #[tokio::test]
+    async fn n_requests_in_flight_answered_out_of_order() {
+        held::n_requests_in_flight_answered_out_of_order(subject()).await;
+    }
+
+    #[tokio::test]
+    async fn a_500_on_one_slot_is_resent_alone() {
+        held::a_500_on_one_slot_is_resent_alone(subject()).await;
+    }
+
+    #[tokio::test]
+    async fn a_400_on_one_slot_is_dropped_alone() {
+        held::a_400_on_one_slot_is_dropped_alone(subject()).await;
+    }
+
+    #[tokio::test]
+    async fn a_refused_head_holds_the_fill_at_one_window() {
+        held::a_401_head_holds_the_fill_at_one_window(subject()).await;
+    }
+
+    #[tokio::test]
+    async fn at_most_once_drops_one_ambiguous_slot_alone() {
+        held::at_most_once_drops_one_ambiguous_slot_alone(subject()).await;
+    }
+
+    #[tokio::test]
+    async fn a_grace_cut_aborts_the_requests_in_flight() {
+        held::a_grace_cut_aborts_the_requests_in_flight(subject()).await;
+    }
+
+    #[tokio::test]
+    async fn a_batch_behind_a_retried_head_times_its_own_request() {
+        held::a_batch_behind_a_retried_head_times_its_own_request(subject()).await;
+    }
+
+    /// Batch `n` carries all three signals, each marked `held::marker(n)`.
+    fn every_signal(n: u64) -> EventBatch {
+        let metric = MetricRecord::new(intern(&held::marker(n)), MetricKind::gauge(1.0));
+        batch_of(vec![
+            held::marker_log(TS, n),
+            held::marker_span(TS, n, AttrMap::new()),
+            Event::metric(TS, AttrMap::new(), metric),
+        ])
+    }
+
+    /// Batch 1's logs are accepted and its traces answered `500` while batch 2 is held in
+    /// another slot: the head's resubmit sends traces and metrics, and not the accepted logs.
+    /// Both batches are held at once first, so a window of one can't pass.
+    #[tokio::test]
+    async fn a_resubmitted_head_skips_its_accepted_signals_with_another_slot_in_flight() {
+        let held = Held::start_by_path(held::id_after_marker, |batch, path, earlier| {
+            match (batch, path, earlier) {
+                (2, _, 0) => Answer::Hold,
+                (1, "/v1/traces", 1) => Answer::Hold,
+                _ => Answer::Now(held::RESP_204),
+            }
+        })
+        .await;
+        let subject = Subject { batch: every_signal, ..subject() };
+        let (mut output, mut probe, telemetry) = held::sink(&subject, &held, 2);
+        let control = async {
+            wait_until("both batches held", || held.held() == 2).await;
+            held.release(1, held::RESP_500);
+            wait_until("batch 1 resent behind a held batch 2", || {
+                held.paths(1).len() >= 4 && held.held() == 1
+            })
+            .await;
+            held.release(2, held::RESP_204);
+        };
+        let (totals, _) = held::run(
+            &mut output,
+            &mut probe,
+            telemetry,
+            vec![every_signal(1), every_signal(2)],
+            DeliveryPosture::AtLeastOnce,
+            std::future::pending(),
+            control,
+        )
+        .await;
+        assert_eq!(held.paths(1), ["/v1/logs", "/v1/traces", "/v1/traces", "/v1/metrics"]);
+        assert_eq!(held.paths(2), ["/v1/logs", "/v1/traces", "/v1/metrics"]);
+        assert_eq!(held::delivered(&totals), 2.0);
+    }
+
+    /// An HTTP/2 peer that holds every call until `n` are open at once, then answers each
+    /// `grpc-status: 0`; and how many connections it accepted.
+    async fn grpc_holding(n: usize) -> (std::net::SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+        use hyper::service::service_fn;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let connections = Arc::new(AtomicUsize::new(0));
+        let (open, _) = tokio::sync::watch::channel(0usize);
+        let open = Arc::new(open);
+        let counted = Arc::clone(&connections);
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else { return };
+                counted.fetch_add(1, Ordering::SeqCst);
+                let open = Arc::clone(&open);
+                tokio::spawn(async move {
+                    let svc = service_fn(move |req: http::Request<hyper::body::Incoming>| {
+                        let open = Arc::clone(&open);
+                        async move {
+                            let _ = req.into_body().collect().await;
+                            let mut seen = open.subscribe();
+                            open.send_modify(|calls| *calls += 1);
+                            let _ = seen.wait_for(|calls| *calls >= n).await;
+                            let mut trailers = HeaderMap::new();
+                            trailers.insert("grpc-status", HeaderValue::from_static("0"));
+                            let body = super::tests::TestGrpcBody {
+                                data: Some(Bytes::from(grpc_frame(&[], false))),
+                                trailers: Some(trailers),
+                            };
+                            Ok::<_, std::convert::Infallible>(
+                                http::Response::builder()
+                                    .status(200)
+                                    .header("content-type", "application/grpc+proto")
+                                    .body(body)
+                                    .unwrap(),
+                            )
+                        }
+                    });
+                    let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                        .serve_connection(hyper_util::rt::TokioIo::new(stream), svc)
+                        .await;
+                });
+            }
+        });
+        (addr, connections)
+    }
+
+    /// Over gRPC, four batches' calls are open at once on one HTTP/2 connection: the peer
+    /// answers none until all four arrive.
+    #[tokio::test]
+    async fn grpc_multiplexes_the_window_on_one_connection() {
+        let (addr, connections) = grpc_holding(4).await;
+        let mut probe = logit_pipeline::test_util::TelemetryProbe::new();
+        let telemetry = probe.telemetry("out", "otlp_out", "sink");
+        let mut output = OtlpOutput::new(addr.to_string(), OtlpTransport::Grpc)
+            .unwrap()
+            .with_timeout(Duration::from_secs(60))
+            .with_concurrency(4)
+            .with_telemetry(telemetry.clone());
+        let config = logit_pipeline::WriteLoopConfig {
+            delivery_override: Some(DeliveryPosture::AtLeastOnce),
+            ..logit_pipeline::WriteLoopConfig::default()
+        };
+        let stop = async {
+            wait_until("four batches delivered", || {
+                probe.poll().sum("logit.component.batches.delivered", &[]) == 4.0
+            })
+            .await;
+        };
+        logit_pipeline::test_util::drive_write_loop_until(
+            &mut output,
+            (1..=4).map(batch).collect(),
+            config,
+            telemetry,
+            stop,
+        )
+        .await;
+        assert_eq!(connections.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// Logs answered, traces held.
+    fn traces_held(batch: u64, path: &str, _: usize) -> Answer {
+        match (batch, path) {
+            (_, "/v1/traces") => Answer::Hold,
+            _ => Answer::Now(held::RESP_204),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_grace_cut_counts_the_requests_already_answered_on_send() {
+        let subject = Subject { batch: every_signal, ..subject() };
+        held::a_grace_cut_counts_the_requests_already_answered(subject, 1, traces_held).await;
+    }
+
+    #[tokio::test]
+    async fn a_grace_cut_counts_the_requests_already_answered_in_a_slot() {
+        let subject = Subject { batch: every_signal, ..subject() };
+        held::a_grace_cut_counts_the_requests_already_answered(subject, 2, traces_held).await;
     }
 }

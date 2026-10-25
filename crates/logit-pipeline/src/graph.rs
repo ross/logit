@@ -252,8 +252,8 @@
 //!     `transport: unix` `statsd_in`/`lines_in`, which has no connections. Compared against
 //!     `default_max_connections`, so the default stays legal everywhere
 //!     (`docs/adr/syslog-tcp-ingress-and-tls.md`, `docs/adr/native-hop-identity-and-sequence.md`).
-//! 75. A `logit_out` `window` of 0, which could send nothing, or past 1024, the largest window a
-//!     `logit_in` answers (`docs/adr/native-hop-send-window.md`).
+//! 75. A `logit_out` `concurrency` of 0, which could send nothing, or past 1024, the largest window
+//!     a `logit_in` answers (`docs/adr/native-hop-send-window.md`).
 //! 76. A `timestamp` with an empty `from`; a `max_skew` of `0s`; a `timezone` that doesn't resolve;
 //!     a `timezone` set under a format that never reads it (`unix_*`, `rfc3339`, or a pattern with
 //!     `%z`, `%:z`, or `%s`); or a pattern that is empty, has no hour and minute, uses `%Z`, `%Q`,
@@ -344,6 +344,11 @@
 //!     error names the key path, never the value (`docs/adr/lua-script-vars.md`).
 //! 96. A `dedup_timestamps` with a `precision` of `0s`, which has no bucket to put a timestamp in
 //!     (`docs/adr/dedup-timestamps-transform.md`).
+//! 97. A `concurrency` of 0, which could send nothing, or past 1024 on an `influxdb_out`,
+//!     `otlp_out`, `datadog_out`, `datadog_trace_out`, `splunk_hec_out`, or `prometheus_out`
+//!     (`docs/adr/sink-request-concurrency.md`, decision 1).
+//! 98. An `influxdb_out` whose `tls` fails rule 24's checks, the scheme one included: the `url`'s
+//!     scheme selects TLS, so a block under `http://` does nothing.
 //! 97. An `otlp_in` `auth`, `prometheus_in` `bind_auth`, or `prometheus_out` `bind_auth` with an
 //!     empty bearer token, username, or password, or a bearer token with leading or trailing
 //!     whitespace: none could match a request's credential. Also a basic username containing
@@ -375,6 +380,9 @@ use std::time::Duration;
 /// Rule 75's upper bound: `logit_in`'s `RECEIVER_MAX_WINDOW`, mirrored by hand since this crate
 /// can't depend on `logit-inputs`.
 const MAX_LOGIT_OUT_WINDOW: u32 = 1024;
+
+/// Rule 97's upper bound on an HTTP sink's `concurrency`, the same as `logit_out`'s.
+const MAX_SINK_CONCURRENCY: u32 = 1024;
 
 /// Rule 46's bound on a `graphite_in`/`graphite_out` `max_frame_bytes`. Below 1024 no real carbon
 /// pickle batch fits; above 16 MiB a frame's *declared* length is a larger allocation than any
@@ -2666,6 +2674,8 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
             headers,
             endpoint_tls,
             reuse_port,
+            concurrency,
+            idle_timeout,
         } = &component.kind
         else {
             continue;
@@ -2718,6 +2728,21 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                         "component '{id}': 'endpoint_tls' tunes the TLS of a remote-write request \
                          and only means anything with 'endpoint' -- a prometheus_out with 'bind' \
                          makes no requests; its server TLS is 'bind_tls'"
+                    );
+                }
+                if *concurrency != logit_config::default_sink_concurrency() {
+                    anyhow::bail!(
+                        "component '{id}': 'concurrency' bounds the remote-write requests in \
+                         flight and only means anything with 'endpoint' -- a prometheus_out with \
+                         'bind' serves an exposition and sends no requests"
+                    );
+                }
+                if *idle_timeout != logit_config::default_sink_idle_timeout() {
+                    anyhow::bail!(
+                        "component '{id}': 'idle_timeout' bounds how long the remote-write \
+                         sender's pooled connections sit idle and only means anything with \
+                         'endpoint' -- a prometheus_out with 'bind' serves an exposition and opens \
+                         no connections"
                     );
                 }
             }
@@ -4013,16 +4038,64 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 75: `logit_out`'s `window`. `logit_in` answers at most `RECEIVER_MAX_WINDOW`
-    // (`logit-inputs`), so a larger offer would never take effect.
+    // Rule 75: `logit_out`'s `concurrency`, the window it offers. `logit_in` answers at most
+    // `RECEIVER_MAX_WINDOW` (`logit-inputs`), so a larger offer would never take effect.
     for (id, component) in &components {
-        if let ComponentKind::LogitOut { window, .. } = &component.kind {
-            if !(1..=MAX_LOGIT_OUT_WINDOW).contains(window) {
+        if let ComponentKind::LogitOut { concurrency, .. } = &component.kind {
+            if !(1..=MAX_LOGIT_OUT_WINDOW).contains(concurrency) {
                 anyhow::bail!(
-                    "component '{id}': logit_out 'window' is {window} -- it must be between 1 \
-                     and {MAX_LOGIT_OUT_WINDOW}"
+                    "component '{id}': logit_out 'concurrency' is {concurrency} -- it must be \
+                     between 1 and {MAX_LOGIT_OUT_WINDOW}"
                 );
             }
+        }
+    }
+
+    // Rule 97: `concurrency` on a sink that waits for a response
+    // (`docs/adr/sink-request-concurrency.md`, decision 1). `0` would send nothing.
+    for (id, component) in &components {
+        let concurrency = match &component.kind {
+            ComponentKind::InfluxDbOut { concurrency, .. }
+            | ComponentKind::OtlpOut { concurrency, .. }
+            | ComponentKind::DatadogOut { concurrency, .. }
+            | ComponentKind::DatadogTraceOut { concurrency, .. }
+            | ComponentKind::SplunkHecOut { concurrency, .. }
+            | ComponentKind::PrometheusOut { concurrency, .. } => *concurrency,
+            _ => continue,
+        };
+        if !(1..=MAX_SINK_CONCURRENCY).contains(&concurrency) {
+            anyhow::bail!(
+                "component '{id}': {} 'concurrency' is {concurrency} -- it must be between 1 and \
+                 {MAX_SINK_CONCURRENCY}",
+                kind_name(&component.kind)
+            );
+        }
+    }
+
+    // Rule 98: `influxdb_out`'s `tls:` gets rule 24's checks, the `url`'s scheme selecting TLS.
+    for (id, component) in &components {
+        let ComponentKind::InfluxDbOut { url, tls, .. } = &component.kind else {
+            continue;
+        };
+        if tls.cert_file.is_some() != tls.key_file.is_some() {
+            anyhow::bail!(
+                "component '{id}': 'tls.cert_file' and 'tls.key_file' must both be set for \
+                 mutual TLS, or both omitted -- one alone can't be used"
+            );
+        }
+        if tls.insecure_skip_verify && tls.ca_file.is_some() {
+            anyhow::bail!(
+                "component '{id}': 'tls.insecure_skip_verify' and 'tls.ca_file' can't both be \
+                 set -- 'insecure_skip_verify' trusts any certificate, which makes a specific \
+                 trusted CA meaningless"
+            );
+        }
+        if !tls.is_empty() && !url.to_ascii_lowercase().starts_with("https://") {
+            anyhow::bail!(
+                "component '{id}': 'tls' is set, but 'url' ({url:?}) isn't 'https://' -- TLS is \
+                 selected by the url's scheme, so a 'tls:' block here would have no effect",
+                url = redact::url(url)
+            );
         }
     }
 
@@ -5214,6 +5287,9 @@ mod tests {
             default_bucket: None,
             default_org: None,
             token: "TOKEN".to_string(),
+            concurrency: 1,
+            idle_timeout: logit_config::default_sink_idle_timeout(),
+            tls: logit_config::TlsClientConfig::default(),
         }
     }
 
@@ -6178,6 +6254,8 @@ mod tests {
             paths: logit_config::OtlpPaths::default(),
             compression: logit_config::OtlpCompression::default(),
             tls: logit_config::TlsClientConfig::default(),
+            concurrency: 1,
+            idle_timeout: logit_config::default_sink_idle_timeout(),
         }
     }
 
@@ -6192,6 +6270,8 @@ mod tests {
             paths,
             compression: logit_config::OtlpCompression::default(),
             tls: logit_config::TlsClientConfig::default(),
+            concurrency: 1,
+            idle_timeout: logit_config::default_sink_idle_timeout(),
         }
     }
 
@@ -6203,6 +6283,8 @@ mod tests {
             paths: logit_config::OtlpPaths::default(),
             compression: logit_config::OtlpCompression::default(),
             tls,
+            concurrency: 1,
+            idle_timeout: logit_config::default_sink_idle_timeout(),
         }
     }
 
@@ -6327,6 +6409,7 @@ mod tests {
             cert_file: Some("client.pem".to_string()),
             key_file: Some("client.key".to_string()),
             insecure_skip_verify: false,
+            server_name: None,
         };
         resolve(cfg(vec![
             ("in", vec![], listener()),
@@ -8246,6 +8329,8 @@ mod tests {
             timeout: logit_config::default_splunk_timeout(),
             tls: logit_config::TlsClientConfig::default(),
             max_body_bytes: logit_config::default_splunk_max_body_bytes(),
+            concurrency: 1,
+            idle_timeout: logit_config::default_sink_idle_timeout(),
         }
     }
 
@@ -8561,6 +8646,42 @@ mod tests {
         }
     }
 
+    /// Rule 98: rule 24's `tls` checks on an `influxdb_out`, including a block under `http://`.
+    #[test]
+    fn an_influxdb_out_tls_block_that_cant_take_effect_is_rejected() {
+        let with = |url: &str, edit: fn(&mut logit_config::TlsClientConfig)| {
+            let mut kind = sink();
+            if let ComponentKind::InfluxDbOut { url: u, tls, .. } = &mut kind {
+                *u = url.to_string();
+                edit(tls);
+            }
+            expect_err(cfg(vec![("in", vec![], listener()), ("out", vec!["in"], kind)]))
+        };
+        let err = with("https://influx:8086", |t| t.cert_file = Some("client.pem".into()));
+        assert!(err.contains("must both be set"), "got: {err}");
+        let err = with("https://influx:8086", |t| {
+            t.insecure_skip_verify = true;
+            t.ca_file = Some("ca.pem".into());
+        });
+        assert!(err.contains("can't both be set"), "got: {err}");
+        let err = with("http://influx:8086", |t| t.insecure_skip_verify = true);
+        assert!(err.contains("isn't 'https://'"), "got: {err}");
+    }
+
+    /// Rule 98 passes a block under `https://` and an empty one under `http://`.
+    #[test]
+    fn an_influxdb_out_tls_block_under_https_validates() {
+        let mut kind = sink();
+        if let ComponentKind::InfluxDbOut { url, tls, .. } = &mut kind {
+            *url = "https://influx:8086".to_string();
+            tls.ca_file = Some("ca.pem".into());
+        }
+        resolve(cfg(vec![("in", vec![], listener()), ("out", vec!["in"], kind)]))
+            .expect("a tls block under https:// is valid");
+        resolve(cfg(vec![("in", vec![], listener()), ("out", vec!["in"], sink())]))
+            .expect("no tls block under http:// is valid");
+    }
+
     /// Rule 70: rule 24's `tls` checks, including a block under `http://`.
     #[test]
     fn a_splunk_hec_out_tls_block_that_cant_take_effect_is_rejected() {
@@ -8598,6 +8719,8 @@ mod tests {
             headers: HashMap::new(),
             tls: logit_config::TlsClientConfig::default(),
             histograms: logit_config::DatadogHistograms::default(),
+            concurrency: 1,
+            idle_timeout: logit_config::default_sink_idle_timeout(),
         }
     }
 
@@ -8747,6 +8870,8 @@ mod tests {
             timeout: logit_config::default_datadog_timeout(),
             headers: HashMap::new(),
             tls: logit_config::TlsClientConfig::default(),
+            concurrency: 1,
+            idle_timeout: logit_config::default_sink_idle_timeout(),
         }
     }
 
@@ -11525,7 +11650,7 @@ mod tests {
             compression: Compression::None,
             tls,
             request_timeout: Duration::from_secs(10),
-            window: 32,
+            concurrency: 32,
         }
     }
 
@@ -11738,6 +11863,7 @@ mod tests {
             cert_file: Some("client.pem".to_string()),
             key_file: Some("client.key".to_string()),
             insecure_skip_verify: false,
+            server_name: None,
         };
         resolve(cfg(vec![
             ("in", vec![], listener()),
@@ -13836,6 +13962,8 @@ mod tests {
             headers: HashMap::new(),
             endpoint_tls: logit_config::TlsClientConfig::default(),
             reuse_port: false,
+            concurrency: 1,
+            idle_timeout: logit_config::default_sink_idle_timeout(),
         }
     }
 
@@ -13855,6 +13983,8 @@ mod tests {
             headers: HashMap::new(),
             endpoint_tls: logit_config::TlsClientConfig::default(),
             reuse_port: false,
+            concurrency: 1,
+            idle_timeout: logit_config::default_sink_idle_timeout(),
         }
     }
 
@@ -13995,6 +14125,18 @@ mod tests {
             endpoint_tls.insecure_skip_verify = true;
         }));
         assert!(err.contains("'out'") && err.contains("'endpoint_tls'"), "got: {err}");
+
+        let err = expect_err(expose_cfg(|kind| {
+            let ComponentKind::PrometheusOut { concurrency, .. } = kind else { unreachable!() };
+            *concurrency = 8;
+        }));
+        assert!(err.contains("'out'") && err.contains("'concurrency'"), "got: {err}");
+
+        let err = expect_err(expose_cfg(|kind| {
+            let ComponentKind::PrometheusOut { idle_timeout, .. } = kind else { unreachable!() };
+            *idle_timeout = Duration::from_secs(1);
+        }));
+        assert!(err.contains("'out'") && err.contains("'idle_timeout'"), "got: {err}");
     }
 
     /// A *default* sender-only value stays legal under `bind:` -- rule 45's reason for comparing
@@ -14532,7 +14674,7 @@ mod tests {
             compression: Compression::None,
             tls: None,
             request_timeout: Duration::from_secs(10),
-            window: 32,
+            concurrency: 32,
         };
         let relay_in = ComponentKind::LogitIn {
             bind: "127.0.0.1:19001".to_string(),
@@ -15908,26 +16050,63 @@ mod tests {
         }
     }
 
-    // ---- Rule 75: `logit_out`'s `window` --------------------------------------------------------
+    // ---- Rule 75: `logit_out`'s `concurrency` ---------------------------------------------------
 
     /// Rule 75: a window of 0 could send nothing, and one past 1024 is more than any `logit_in`
     /// answers. The bounds themselves pass.
     #[test]
-    fn a_logit_out_window_of_zero_or_past_1024_is_rejected() {
-        let with_window = |window: u32| {
+    fn a_logit_out_concurrency_of_zero_or_past_1024_is_rejected() {
+        let with = |value: u32| {
             let mut kind = logit_out_with_tls(None);
-            if let ComponentKind::LogitOut { window: w, .. } = &mut kind {
-                *w = window;
+            if let ComponentKind::LogitOut { concurrency, .. } = &mut kind {
+                *concurrency = value;
             }
             cfg(vec![("in", vec![], listener()), ("out", vec!["in"], kind)])
         };
-        for window in [0, 1025, u32::MAX] {
-            let err = expect_err(with_window(window));
-            assert!(err.contains("'out'") && err.contains("'window'"), "{window}: {err}");
+        for value in [0, 1025, u32::MAX] {
+            let err = expect_err(with(value));
+            assert!(err.contains("'out'") && err.contains("'concurrency'"), "{value}: {err}");
         }
-        for window in [1, 32, 1024] {
-            resolve(with_window(window))
-                .unwrap_or_else(|err| panic!("window {window} should resolve, got: {err}"));
+        for value in [1, 32, 1024] {
+            resolve(with(value))
+                .unwrap_or_else(|err| panic!("concurrency {value} should resolve, got: {err}"));
+        }
+    }
+
+    // ---- Rule 97: `concurrency` on the sinks that wait for a response -------------------------
+
+    /// Rule 97: a `concurrency` of 0 could send nothing, and one past 1024 is rejected, on each of
+    /// the six sinks that carry it. The bounds themselves pass.
+    #[test]
+    fn a_sink_concurrency_of_zero_or_past_1024_is_rejected() {
+        let kinds = [
+            r#""type": "influxdb_out", "url": "http://localhost:8086", "bucket": "b", "token": "t""#,
+            r#""type": "otlp_out", "endpoint": "http://localhost:4318""#,
+            r#""type": "datadog_out", "api_key": "k""#,
+            r#""type": "datadog_trace_out", "endpoint": "http://localhost:8126""#,
+            r#""type": "splunk_hec_out", "endpoint": "http://localhost:8088/services/collector",
+                "token": "t""#,
+            r#""type": "prometheus_out", "endpoint": "http://localhost:9090/api/v1/write""#,
+        ];
+        for fields in kinds {
+            let with = |concurrency: u32| {
+                let kind = listener_from_json(&format!(
+                    r#"{{{fields}, "sources": ["in"], "concurrency": {concurrency}}}"#
+                ));
+                cfg(vec![("in", vec![], listener()), ("out", vec!["in"], kind)])
+            };
+            for concurrency in [0, 1025, u32::MAX] {
+                let err = expect_err(with(concurrency));
+                assert!(
+                    err.contains("'out'") && err.contains("'concurrency'"),
+                    "{fields}, {concurrency}: {err}"
+                );
+            }
+            for concurrency in [1, 8, 1024] {
+                resolve(with(concurrency)).unwrap_or_else(|err| {
+                    panic!("{fields}: concurrency {concurrency} should resolve, got: {err}")
+                });
+            }
         }
     }
 

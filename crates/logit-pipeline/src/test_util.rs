@@ -328,6 +328,19 @@ pub async fn drive_write_loop<O: crate::Output + Send>(
     config: crate::WriteLoopConfig,
     telemetry: Telemetry,
 ) {
+    drive_write_loop_until(output, batches, config, telemetry, std::future::pending()).await;
+}
+
+/// [`drive_write_loop`], also signalling shutdown once `stop` resolves, so the loop returns when
+/// the queue drains or `config.shutdown_grace` after the signal, whichever is first. Returns the
+/// batches the grace cut dropped (`shutdown_dropped`), which only an at-most-once loop counts.
+pub async fn drive_write_loop_until<O: crate::Output + Send>(
+    output: &mut O,
+    batches: Vec<EventBatch>,
+    config: crate::WriteLoopConfig,
+    telemetry: Telemetry,
+    stop: impl std::future::Future<Output = ()>,
+) -> u64 {
     let store = Arc::new(crate::SinkStore::Memory(crate::SinkQueue::new(
         crate::SinkQueueConfig::default(),
         telemetry.clone(),
@@ -336,21 +349,31 @@ pub async fn drive_write_loop<O: crate::Output + Send>(
         store.push((Arc::new(batch), crate::TraceContext::default().into())).await;
     }
     store.close();
-    let (_shutdown_tx, shutdown_rx) = watch::channel(false);
-    tokio::time::timeout(
-        RECV_TIMEOUT,
-        crate::runtime::write_loop(
-            "out".to_string(),
-            output,
-            store,
-            telemetry,
-            config,
-            shutdown_rx,
-            &AtomicU64::new(0),
-        ),
-    )
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let shutdown_dropped = AtomicU64::new(0);
+    let write = crate::runtime::write_loop(
+        "out".to_string(),
+        output,
+        store,
+        telemetry,
+        config,
+        shutdown_rx,
+        &shutdown_dropped,
+    );
+    let signal = async {
+        stop.await;
+        let _ = shutdown_tx.send(true);
+        std::future::pending::<()>().await;
+    };
+    tokio::time::timeout(RECV_TIMEOUT, async {
+        tokio::select! {
+            () = write => {}
+            () = signal => {}
+        }
+    })
     .await
-    .unwrap_or_else(|_| panic!("write_loop still running after {RECV_TIMEOUT:?}"))
+    .unwrap_or_else(|_| panic!("write_loop still running after {RECV_TIMEOUT:?}"));
+    shutdown_dropped.load(Ordering::Relaxed)
 }
 
 static SCRATCH_SEQ: AtomicU64 = AtomicU64::new(0);

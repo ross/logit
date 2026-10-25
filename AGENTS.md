@@ -122,7 +122,7 @@ Sinks live in `crates/logit-outputs`.
 
 | Kind | Code | What it does | Decision record |
 |---|---|---|---|
-| `influxdb_out` | `crates/logit-outputs/src/influxdb.rs` | InfluxDB 2.x line protocol over the write API, to its configured `bucket:` and `org:`, each else the one `influxdb_in` carried, else `default_bucket:` and `default_org:`; a `403`/`404` drops the batch when a carried value could be at fault; histograms, summaries, and sketches in Telegraf's `prometheus-v1` field shape | [ADR `service-lifecycle-and-output-retry`](docs/adr/service-lifecycle-and-output-retry.md), [ADR `sink-fault-classes`](docs/adr/sink-fault-classes.md), [ADR `influxdb-line-protocol-relay`](docs/adr/influxdb-line-protocol-relay.md), [ADR `influxdb-histogram-summary-shape`](docs/adr/influxdb-histogram-summary-shape.md) |
+| `influxdb_out` | `crates/logit-outputs/src/influxdb.rs` | InfluxDB 2.x line protocol over the write API, with an optional `tls:` block for an `https://` `url`, to its configured `bucket:` and `org:`, each else the one `influxdb_in` carried, else `default_bucket:` and `default_org:`; a `403`/`404` drops the batch when a carried value could be at fault; histograms, summaries, and sketches in Telegraf's `prometheus-v1` field shape | [ADR `service-lifecycle-and-output-retry`](docs/adr/service-lifecycle-and-output-retry.md), [ADR `sink-fault-classes`](docs/adr/sink-fault-classes.md), [ADR `influxdb-line-protocol-relay`](docs/adr/influxdb-line-protocol-relay.md), [ADR `influxdb-histogram-summary-shape`](docs/adr/influxdb-histogram-summary-shape.md) |
 | `stdio_out` | `crates/logit-outputs/src/stdio.rs`, render in `human.rs` | an exhaustive, sectioned text block per event (default, `message: escaped \| multiline`), `format: json` (one object per event per line, `ndjson.rs`, what every harness reader consumes, lossless and read back by `logit_proto::event_json`), or `format: native`; its file target is `file_out` with an empty rotation policy | [ADR `human-render-block-format`](docs/adr/human-render-block-format.md), [ADR `stream-json-format`](docs/adr/stream-json-format.md), [ADR `file-output-native-format`](docs/adr/file-output-native-format.md) |
 | `file_out` | `crates/logit-outputs/src/file.rs` | rotating file sink sharing `stdio_out`'s implementation | [ADR `rotating-file-output`](docs/adr/rotating-file-output.md) |
 | `syslog_out` | `crates/logit-outputs/src/syslog.rs` | RFC 3164/5424 over UDP, TCP, or TLS (RFC 5425) | [ADR `syslog-output`](docs/adr/syslog-output.md) |
@@ -862,6 +862,14 @@ the operator-facing account of all of this.
   `events.sent − (events.received − events.discarded)`, against 4 × its events received less
   its `lines.dropped`, and every row after it reads the listener's counts carried through the
   chain (W′).
+  `otlp-fan-out-conc` is that run with the generator at `concurrency: 8`,
+  `otlp-concurrency-tls` is that over TLS from a private CA per run, where HTTP/2 carries every
+  request in flight on one connection and a generator pause past the listener's `idle_timeout:`
+  meets the listener's `GOAWAY` with no retry, and `http-concurrency` and `http-concurrency-1` send
+  InfluxDB points from `influxdb_out` at `concurrency: 8` and `1` into `http-ingress`'s SUT under
+  a 200 ms delay on its answers: at 8, `[[expect]]` rows assert `logit.output.in_flight` and no
+  `overflow_newest` drop under the delay, and at 1, that the generator's queue overflowed there
+  ([plan `sink-request-concurrency`](docs/plans/sink-request-concurrency.md)'s "Findings").
   `tail-rotate` has a writer `generate_in -> file_out` rotate a file in a directory it shares
   with the SUT's `tail_in` (`wire = "file"`, `<run>/shared` mounted by an override): G is the
   writer's `events.delivered`, held to the lines the driver counts in that directory at the end
@@ -909,7 +917,12 @@ the operator-facing account of all of this.
   bucket and org configured, both carried by a `set`, and the bucket carried beside
   `default_org:`, cueing every row of its table with the class each configuration expects; V is
   the stored delta points' sum, one per series and timestamp, since InfluxDB overwrites a
-  resend, and `ledger.standin` holds a rejected step's points to the whole egress gap. See
+  resend, and `ledger.standin` holds a rejected step's points to the whole egress gap.
+  `standin-concurrency` points `prometheus_out` at `concurrency: 8` and `at_most_once` at the
+  remote-write stand-in with several batches in flight, and its `respond` steps' `count = 1`
+  lands a `401`, a `400`, and a reset on one write each: a held head, a batch dropped alone,
+  and one dropped alone `ambiguous_at_most_once`, the only one, since the sink's
+  `idle_timeout: 1s` closes an idle connection before the stand-in's 5 s close. See
   [tools/soak/README.md](tools/soak/README.md) and [ADR `soak-harness`](docs/adr/soak-harness.md).
 - **Differential corpora**: `script/differential <corpus>` regenerates a corpus of generated
   cases under `testdata/differential/`, each committed beside a reference implementation's

@@ -132,6 +132,9 @@ fn graph_and_topology(disk_dir: std::path::PathBuf) -> (graph::Graph, DiskQueueC
                 default_bucket: None,
                 default_org: None,
                 token: "TOKEN".to_string(),
+                concurrency: 1,
+                idle_timeout: logit_config::default_sink_idle_timeout(),
+                tls: logit_config::TlsClientConfig::default(),
             },
         },
     );

@@ -912,6 +912,14 @@ impl SinkStore {
         }
     }
 
+    /// The write loop's side of the `buffer_full` line's cause (`crate::buffer_full`).
+    pub(crate) fn send_limit(&self) -> &crate::buffer_full::SendLimit {
+        match self {
+            SinkStore::Memory(q) => q.queue.watch.send_limit(),
+            SinkStore::Disk(q) => q.send_limit(),
+        }
+    }
+
     /// Advances past the head, returning it. Production callers ignore the value; tests read it.
     pub fn commit(&self) -> Option<StoreItem> {
         match self {

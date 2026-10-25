@@ -1,0 +1,164 @@
+# otlp-fan-out-conc over TLS: the generator's `otlp_out` at `concurrency: 8` sends to an
+# `otlp_in` whose certificate the run's private CA signs, so the handshake picks `h2` through
+# ALPN and every request in flight shares one connection, where plaintext HTTP/1.1 opens one per
+# request. A 200 ms delay on the SUT's answers keeps two or three requests in flight, and a
+# backend stop, which `otlp_in` answers by holding each request, fills all eight. The listener's
+# `logit.input.connections` shows how many connections carried them. A 15 s pause of the
+# generator then leaves its connection idle past `otlp_in`'s 4 s `idle_timeout`, under the
+# generator's 30 s default, so the destination closes the idle h2 connection first, with a
+# `GOAWAY`: the resumed generator's next requests must find a new connection with no retry. The
+# schema is docs/plans/soak-harness.md's "The scenario schema".
+
+name = "otlp-concurrency-tls"
+description = "generator otlp_out concurrency 8 over TLS (h2) -> otlp_in (HTTPS, idle_timeout 4s) -> line_protocol (4 points per record) -> kv_metrics -> aggregate 500ms cumulative -> prometheus_out RW1 zstd -> VictoriaMetrics, a 200ms answer delay, a backend stop, then a generator pause past the listener's idle close"
+duration = "12m"          # warmup + one cycle + cooldown; --duration overrides
+warmup = "60s"            # no faults: baseline rate, RSS, fds
+cooldown = "120s"         # no faults at the end; >= recovery_bound
+recovery_bound = "45s"    # the generator's retry_max_delay 1s, the sink's 10s, and a drain
+cycle = "9m"              # >= last recovery (7m45s) + 2 x progress_window
+compose = "compose.override.yaml"
+
+[configs]
+sut = "logit-sut.yaml"
+generator = "logit-generator.yaml"
+
+[tls.cert.otlp]           # the SUT's server certificate, for the name the generator dials
+san = ["logit"]
+usage = "server"
+
+[ledger]                  # component ids the checker reads; no rates here
+sut_aggregate = "window"
+wire_loss_outside_faults = 0.0
+
+[[ledger.source]]
+service = "generator"
+generator_input = "load"
+generator_sink = "otlp"
+sut_listener = "otlp"
+wire = "http"             # G events.delivered, W the listener's events.sent: one per record
+sut_transforms = ["points", "count"]
+fan_out = { points = 4 }  # four points per record
+
+[[ledger.sink]]
+id = "victoria_metrics"
+backend = "victoria-metrics"
+vm_selector = '{__name__="soak_points_total"}'
+
+[thresholds]
+progress_window = "30s"
+rss_growth_mib_per_hour = 64   # WARN under 1h, FAIL above
+fd_growth = 8
+
+# The SUT's egress carries its answers, so each request's round trip is about 200 ms.
+[[step]]
+at = "0s"
+action = "netem"
+on = "logit"
+args = "delay 200ms 50ms"
+for = "3m30s"
+
+# The sink's queue and the inboxes behind it fill, and `otlp_in` holds each request until the
+# generator's 10 s timeout, so every slot fills; each timed-out request is resent.
+[[step]]
+at = "4m15s"
+action = "stop"
+on = "victoria-metrics"
+for = "90s"
+
+[[expect]]
+name = "in-flight-overlaps"
+service = "generator"
+metric = "logit.output.in_flight"
+component = "otlp"
+step = "c0s1"
+window = "during"
+reduce = "max"
+min = 2
+max = 8
+
+[[expect]]
+name = "no-overflow-under-delay"
+service = "generator"
+metric = "logit.component.batches.dropped"
+component = "otlp"
+attrs = { reason = "overflow_newest" }
+step = "c0s1"
+window = "during"
+reduce = "delta"
+max = 0
+
+[[expect]]
+name = "in-flight-reaches-concurrency"
+service = "generator"
+metric = "logit.output.in_flight"
+component = "otlp"
+step = "c0s2"
+window = "during"
+reduce = "max"
+min = 8
+max = 8
+
+# Eight requests in flight on one HTTP/2 connection: the listener holds one.
+[[expect]]
+name = "one-connection"
+service = "logit"
+metric = "logit.input.connections"
+component = "otlp"
+step = "c0s2"
+window = "during"
+reduce = "max"
+min = 1
+max = 1
+
+# Backpressure never reaches the sink as a drop: `block` holds every batch.
+[[expect]]
+name = "sink-never-drops"
+service = "logit"
+metric = "logit.component.batches.dropped"
+component = "victoria_metrics"
+step = "c0s2"
+window = "through"
+reduce = "delta"
+max = 0
+
+# c0s3: the generator's connection sits idle while it's paused, and `otlp_in` closes it after
+# 4 s with a `GOAWAY`. The generator's pool, at the 30 s default, still holds it when it resumes.
+[[step]]
+at = "6m45s"
+action = "pause"
+on = "generator"
+for = "15s"
+
+# The listener closed the idle connection: the case under test happened.
+[[expect]]
+name = "listener-closes-idle"
+service = "logit"
+metric = "logit.input.connections.closed"
+component = "otlp"
+attrs = { reason = "idle" }
+step = "c0s3"
+window = "through"
+reduce = "delta"
+min = 1
+
+# The resumed generator sends on a new connection: no request fails on the closed one, so no
+# batch is retried.
+[[expect]]
+name = "goaway-costs-no-retry"
+service = "generator"
+metric = "logit.component.retries"
+component = "otlp"
+step = "c0s3"
+window = "through"
+reduce = "delta"
+max = 0
+
+# Every body is well formed, so the fan-out term has no lines to take off.
+[[expect]]
+name = "no-lines-dropped"
+service = "logit"
+metric = "logit.transform.lines.dropped"
+component = "points"
+window = "run"
+reduce = "delta"
+max = 0

@@ -1238,22 +1238,47 @@ pub(crate) fn build_spec(
             DropProvenanceTransform::new(origin.clone(), previous.clone()),
         )),
 
-        InfluxDbOut { url, org, default_org, bucket, default_bucket, token } => NodeSpec::Output(
-            Box::new(
-                InfluxDbOutput::new(
-                    url.clone(),
-                    Organization::from_config(org.clone(), default_org.clone()),
-                    Destination::from_config(bucket.clone(), default_bucket.clone()),
-                    token.clone(),
-                )
-                .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
-                .with_telemetry(telemetry.clone()),
-            ),
-            queue_config(&component.buffer, base_dir),
-            write_config(&component.buffer),
-        ),
-        OtlpOut { endpoint, protocol, headers, paths, compression, tls } => {
+        InfluxDbOut {
+            url,
+            org,
+            default_org,
+            bucket,
+            default_bucket,
+            token,
+            concurrency,
+            idle_timeout,
+            tls,
+        } => {
+            let output = InfluxDbOutput::new(
+                url.clone(),
+                Organization::from_config(org.clone(), default_org.clone()),
+                Destination::from_config(bucket.clone(), default_bucket.clone()),
+                token.clone(),
+            )
+            .with_concurrency(*concurrency)
+            .with_idle_timeout(*idle_timeout)
+            .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
+            .with_telemetry(telemetry.clone())
+            .with_tls(&to_tls_client_settings(tls), base_dir, tls_reloader)?;
+            NodeSpec::Output(
+                Box::new(output),
+                queue_config(&component.buffer, base_dir),
+                write_config(&component.buffer),
+            )
+        }
+        OtlpOut {
+            endpoint,
+            protocol,
+            headers,
+            paths,
+            compression,
+            tls,
+            concurrency,
+            idle_timeout,
+        } => {
             let output = OtlpOutput::new(endpoint.clone(), otlp_out_transport(*protocol))?
+                .with_concurrency(*concurrency)
+                .with_idle_timeout(*idle_timeout)
                 .with_headers(headers)?
                 .with_paths(to_signal_paths(paths))
                 .with_compression(to_otlp_compression(*compression))
@@ -1266,8 +1291,21 @@ pub(crate) fn build_spec(
                 write_config(&component.buffer),
             )
         }
-        DatadogOut { api_key, site, endpoints, compression, timeout, headers, tls, histograms } => {
+        DatadogOut {
+            api_key,
+            site,
+            endpoints,
+            compression,
+            timeout,
+            headers,
+            tls,
+            histograms,
+            concurrency,
+            idle_timeout,
+        } => {
             let output = DatadogOutput::new(api_key)?
+                .with_concurrency(*concurrency)
+                .with_idle_timeout(*idle_timeout)
                 .with_site(site.clone())
                 .with_default_host(hostname.clone())
                 .with_histograms(to_datadog_histograms(histograms))
@@ -1291,7 +1329,17 @@ pub(crate) fn build_spec(
                 write_config(&component.buffer),
             )
         }
-        DatadogTraceOut { endpoint, socket, version, compression, timeout, headers, tls } => {
+        DatadogTraceOut {
+            endpoint,
+            socket,
+            version,
+            compression,
+            timeout,
+            headers,
+            tls,
+            concurrency,
+            idle_timeout,
+        } => {
             // Rule 67 has already required one of `endpoint`/`socket`, not both.
             let output = match (endpoint, socket) {
                 (Some(endpoint), _) => DatadogTraceOutput::http(endpoint.clone()),
@@ -1299,6 +1347,8 @@ pub(crate) fn build_spec(
                 (None, None) => anyhow::bail!("datadog_trace_out needs 'endpoint' or 'socket'"),
             };
             let output = output
+                .with_concurrency(*concurrency)
+                .with_idle_timeout(*idle_timeout)
                 .with_version(match version {
                     logit_config::DatadogTraceVersion::V04 => TracerApiForm::V04,
                     logit_config::DatadogTraceVersion::V07 => TracerApiForm::V07,
@@ -1328,8 +1378,12 @@ pub(crate) fn build_spec(
             timeout,
             tls,
             max_body_bytes,
+            concurrency,
+            idle_timeout,
         } => {
             let output = SplunkHecOutput::new(endpoint.clone(), token)?
+                .with_concurrency(*concurrency)
+                .with_idle_timeout(*idle_timeout)
                 .with_compression(splunk_compression(*compression))
                 .with_multi_value(splunk_multi_value(*multi_value))
                 // Rule 70 allows `ack_timeout` only with `ack`; the default applies under `ack`.
@@ -1432,11 +1486,11 @@ pub(crate) fn build_spec(
                 write_config(&component.buffer),
             )
         }
-        LogitOut { endpoint, compression, tls, request_timeout, window } => {
+        LogitOut { endpoint, compression, tls, request_timeout, concurrency } => {
             let mut output = LogitOutput::new(endpoint.clone())
                 .with_compression(to_native_compression(*compression))
                 .with_timeout(*request_timeout)
-                .with_window(*window)
+                .with_concurrency(*concurrency)
                 .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
                 .with_telemetry(telemetry.clone());
             if let Some(tls) = tls {
@@ -1635,6 +1689,8 @@ pub(crate) fn build_spec(
             headers,
             endpoint_tls,
             reuse_port,
+            concurrency,
+            idle_timeout,
         } => {
             // Graph rule 56 guarantees exactly one mode field; `PrometheusOutput` carries the
             // choice as a variant from here on.
@@ -1660,6 +1716,8 @@ pub(crate) fn build_spec(
                     output.into()
                 }
                 (None, Some(endpoint)) => RemoteWriteOutput::new(endpoint.clone())
+                    .with_concurrency(*concurrency)
+                    .with_idle_timeout(*idle_timeout)
                     .with_version(to_remote_write_version(*version))
                     .with_compression(to_remote_write_encoding(*compression))
                     .with_timeout(*timeout)
@@ -2320,6 +2378,7 @@ fn to_tls_client_settings(
         cert_file: tls.cert_file.clone(),
         key_file: tls.key_file.clone(),
         insecure_skip_verify: tls.insecure_skip_verify,
+        server_name: tls.server_name.clone(),
     }
 }
 
@@ -2718,6 +2777,9 @@ mod tests {
                 default_bucket: None,
                 default_org: None,
                 token: "test-token".to_string(),
+                concurrency: 1,
+                idle_timeout: logit_config::default_sink_idle_timeout(),
+                tls: logit_config::TlsClientConfig::default(),
             },
         }
     }
@@ -2764,6 +2826,8 @@ mod tests {
                         timeout: logit_config::default_splunk_timeout(),
                         tls: logit_config::TlsClientConfig::default(),
                         max_body_bytes: 800 * 1024 * 1024,
+                        concurrency: 1,
+                        idle_timeout: logit_config::default_sink_idle_timeout(),
                     },
                 },
             ),
@@ -2948,6 +3012,9 @@ mod tests {
                 default_bucket: None,
                 default_org: None,
                 token: "test-token".to_string(),
+                concurrency: 1,
+                idle_timeout: logit_config::default_sink_idle_timeout(),
+                tls: logit_config::TlsClientConfig::default(),
             },
         };
         assert!(matches!(
@@ -3245,6 +3312,8 @@ mod tests {
                 headers: HashMap::new(),
                 endpoint_tls: logit_config::TlsClientConfig::default(),
                 reuse_port: false,
+                concurrency: 1,
+                idle_timeout: logit_config::default_sink_idle_timeout(),
             },
         };
         assert!(matches!(
@@ -3281,6 +3350,8 @@ mod tests {
                     headers: HashMap::from([("X-Scope-OrgID".to_string(), "tenant-a".to_string())]),
                     endpoint_tls: logit_config::TlsClientConfig::default(),
                     reuse_port: false,
+                    concurrency: 1,
+                    idle_timeout: logit_config::default_sink_idle_timeout(),
                 },
             };
             assert!(
@@ -3965,6 +4036,8 @@ mod tests {
                     paths: logit_config::OtlpPaths::default(),
                     compression: logit_config::OtlpCompression::default(),
                     tls: logit_config::TlsClientConfig::default(),
+                    concurrency: 1,
+                    idle_timeout: logit_config::default_sink_idle_timeout(),
                 },
             };
             assert!(
@@ -3994,6 +4067,8 @@ mod tests {
                 paths: logit_config::OtlpPaths::default(),
                 compression: logit_config::OtlpCompression::default(),
                 tls: logit_config::TlsClientConfig::default(),
+                concurrency: 1,
+                idle_timeout: logit_config::default_sink_idle_timeout(),
             },
         };
         assert!(matches!(
@@ -4032,6 +4107,10 @@ mod tests {
         let sinks = [
             format!("type: otlp_out\n    endpoint: https://localhost:4318\n    tls: {client}"),
             format!("type: datadog_out\n    api_key: placeholder\n    tls: {client}"),
+            format!(
+                "type: influxdb_out\n    url: https://localhost:8086\n    token: placeholder\n    \
+                 tls: {client}"
+            ),
             format!("type: datadog_trace_out\n    endpoint: https://localhost:8126\n    tls: {client}"),
             format!(
                 "type: splunk_hec_out\n    endpoint: https://localhost:8088/services/collector\n    \
@@ -4090,6 +4169,8 @@ mod tests {
                     ca_file: Some("ca.pem".to_string()),
                     ..Default::default()
                 },
+                concurrency: 1,
+                idle_timeout: logit_config::default_sink_idle_timeout(),
             },
         };
         assert!(matches!(
@@ -4118,6 +4199,8 @@ mod tests {
                     ca_file: Some("does-not-exist.pem".to_string()),
                     ..Default::default()
                 },
+                concurrency: 1,
+                idle_timeout: logit_config::default_sink_idle_timeout(),
             },
         };
         let err = match build_spec("out", &component, &testdata_tls_dir(), None) {
@@ -4751,6 +4834,8 @@ mod tests {
             headers: HashMap::new(),
             endpoint_tls: logit_config::TlsClientConfig::default(),
             reuse_port: false,
+            concurrency: 1,
+            idle_timeout: logit_config::default_sink_idle_timeout(),
         };
         let component = resolved(kind, vec!["in".to_string()], vec![]);
         let (spec, _) = build_spec("out", &component, Path::new(""), None).unwrap();
@@ -5009,7 +5094,7 @@ mod tests {
                 compression: logit_config::Compression::Lz4,
                 tls: None,
                 request_timeout: Duration::from_secs(10),
-                window: 32,
+                concurrency: 32,
             },
         };
         assert!(matches!(
@@ -5034,7 +5119,7 @@ mod tests {
                     ..Default::default()
                 }),
                 request_timeout: Duration::from_secs(10),
-                window: 32,
+                concurrency: 32,
             },
         };
         assert!(matches!(
@@ -5068,6 +5153,9 @@ mod tests {
                 default_bucket: None,
                 default_org: None,
                 token: "test-token".to_string(),
+                concurrency: 1,
+                idle_timeout: logit_config::default_sink_idle_timeout(),
+                tls: logit_config::TlsClientConfig::default(),
             },
         };
         let NodeSpec::Output(_, store_config, write_config) =
@@ -5119,6 +5207,9 @@ mod tests {
                 default_bucket: None,
                 default_org: None,
                 token: "test-token".to_string(),
+                concurrency: 1,
+                idle_timeout: logit_config::default_sink_idle_timeout(),
+                tls: logit_config::TlsClientConfig::default(),
             },
         };
         let NodeSpec::Output(_, store_config, _) =
@@ -6553,7 +6644,7 @@ mod tests {
                         compression: logit_config::Compression::None,
                         tls: Some(logit_config::TlsClientConfig::default()),
                         request_timeout: Duration::from_secs(10),
-                        window: 32,
+                        concurrency: 32,
                     },
                 },
             ),
@@ -6564,6 +6655,40 @@ mod tests {
         };
         assert!(err.contains("component 'out'"), "got: {err}");
         assert!(err.contains(endpoint), "got: {err}");
+    }
+
+    /// `tls.server_name` reaches the sink through `to_tls_client_settings`: one that doesn't
+    /// parse fails startup naming the field and the component.
+    #[test]
+    fn an_unparsable_tls_server_name_fails_startup() {
+        let cfg = config(vec![
+            ("in", statsd_in()),
+            (
+                "out",
+                Component {
+                    buffer: logit_config::BufferConfig::default(),
+                    receive: logit_config::ReceiveConfig::default(),
+                    sources: vec!["in".to_string()],
+                    targets: Vec::new(),
+                    kind: ComponentKind::LogitOut {
+                        endpoint: "127.0.0.1:5140".to_string(),
+                        compression: logit_config::Compression::None,
+                        tls: Some(logit_config::TlsClientConfig {
+                            server_name: Some("not a name".to_string()),
+                            ..Default::default()
+                        }),
+                        request_timeout: Duration::from_secs(10),
+                        concurrency: 32,
+                    },
+                },
+            ),
+        ]);
+        let err = match prepare(cfg, testdata_tls_dir(), None, &TlsReloader::new()) {
+            Ok(_) => panic!("expected an unparsable server_name to fail startup"),
+            Err(err) => format!("{err:#}"),
+        };
+        assert!(err.contains("component 'out'"), "got: {err}");
+        assert!(err.contains("tls.server_name"), "got: {err}");
     }
 
     /// A TLS endpoint whose host is no valid server name is a startup error that names the

@@ -117,6 +117,9 @@ mod tests {
                     default_bucket: None,
                     default_org: None,
                     token: "T".to_string(),
+                    concurrency: 1,
+                    idle_timeout: logit_config::default_sink_idle_timeout(),
+                    tls: logit_config::TlsClientConfig::default(),
                 },
             },
         );
@@ -147,6 +150,9 @@ mod tests {
                     default_bucket: None,
                     default_org: None,
                     token: "T".to_string(),
+                    concurrency: 1,
+                    idle_timeout: logit_config::default_sink_idle_timeout(),
+                    tls: logit_config::TlsClientConfig::default(),
                 },
             },
         );

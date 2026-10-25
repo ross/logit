@@ -373,6 +373,7 @@ mod tls {
                     cert_file: Some("client.pem".to_string()),
                     key_file: Some("client.key".to_string()),
                     insecure_skip_verify: false,
+                    server_name: None,
                 },
                 &testdata_dir(),
                 &logit_pipeline::tls::TlsReloader::new(),
@@ -424,10 +425,60 @@ mod tls {
         let err = output.send(&sample_batch()).await.unwrap_err();
         assert_eq!(classify(&err), Fault::Clean);
     }
+
+    /// `server-named.pem` names only `logit.test`, and `logit_out` dials `127.0.0.1`: the send
+    /// goes through only with `server_name: logit.test` (`docs/adr/tls-client-server-name.md`).
+    #[tokio::test]
+    async fn a_server_name_reaches_a_server_whose_certificate_names_another_host() {
+        for (server_name, delivered) in [(None, false), (Some("logit.test"), true)] {
+            let (addr, mut input) = bound_input(|input| {
+                input
+                    .with_tls(
+                        &TlsServerSettings {
+                            cert_file: "server-named.pem".to_string(),
+                            key_file: "server-named.key".to_string(),
+                            client_ca_file: None,
+                        },
+                        &testdata_dir(),
+                        &logit_pipeline::tls::TlsReloader::new(),
+                    )
+                    .unwrap()
+            })
+            .await;
+            let output = LogitOutput::new(addr)
+                .with_timeout(Duration::from_millis(500))
+                .with_tls(
+                    &TlsClientSettings {
+                        ca_file: Some("ca.pem".to_string()),
+                        server_name: server_name.map(str::to_owned),
+                        ..Default::default()
+                    },
+                    &testdata_dir(),
+                    &logit_pipeline::tls::TlsReloader::new(),
+                )
+                .unwrap();
+
+            let batch = sample_batch();
+            if delivered {
+                let received = round_trip(input, output, &batch).await;
+                assert_round_tripped(&received, &batch);
+            } else {
+                let (tx, _rx) = mpsc::channel(16);
+                let sink = Fanout::new(vec![tx]);
+                tokio::spawn(async move {
+                    let _ = input.run(sink).await;
+                });
+                let mut output = output;
+                output.observe_batch(logit_pipeline::BatchContext::default(), ONE);
+                let err = output.send(&batch).await.unwrap_err();
+                assert_eq!(classify(&err), Fault::Clean, "{err:#}");
+            }
+        }
+    }
 }
 
 /// Through the node runtime with a send window (ADR `native-hop-send-window`): a `logit_out`
-/// with `window: 32` over a disk spool, driven by `write_loop`, in front of a real `logit_in`.
+/// with `concurrency: 32` over a disk spool, driven by `write_loop`, in front of a real `logit_in`.
 mod window {
     use super::*;
     use logit_config::{BufferConfig, Component, ComponentKind, Config, ReceiveConfig};
@@ -516,7 +567,7 @@ mod window {
                         compression: logit_config::Compression::None,
                         tls: None,
                         request_timeout: Duration::from_secs(10),
-                        window: 32,
+                        concurrency: 32,
                     },
                 ),
             ),
@@ -615,7 +666,7 @@ mod window {
     async fn a_window_of_32_through_the_runtime_forwards_every_spooled_batch_once_in_order() {
         let mut probe = TelemetryProbe::new();
         let (addr, marks) = spawn_listener(&probe).await;
-        let output = LogitOutput::new(addr).with_window(32).with_telemetry(probe.telemetry(
+        let output = LogitOutput::new(addr).with_concurrency(32).with_telemetry(probe.telemetry(
             "out",
             "logit_out",
             "sink",
@@ -643,7 +694,7 @@ mod window {
         let mut probe = TelemetryProbe::new();
         // A 1 KiB cap's decode budget is 4 KiB: five empty events exceed it in a few dozen bytes.
         let (addr, marks) = spawn_listener_capped(&probe, 1024).await;
-        let output = LogitOutput::new(addr).with_window(32).with_telemetry(probe.telemetry(
+        let output = LogitOutput::new(addr).with_concurrency(32).with_telemetry(probe.telemetry(
             "out",
             "logit_out",
             "sink",
@@ -831,7 +882,7 @@ mod window {
         let (listener_addr, marks) = spawn_listener(&probe).await;
         let relay = spawn_relay(listener_addr).await;
         let output = LogitOutput::new(relay.addr.clone())
-            .with_window(32)
+            .with_concurrency(32)
             .with_telemetry(probe.telemetry("out", "logit_out", "sink"));
         let dir = scratch_dir("logit-round-trip-window-cut");
         let (graph, specs) = specs(output, dir.clone());
