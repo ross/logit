@@ -121,8 +121,12 @@ pub trait Output {
     /// position, and its next [`Output::await_ack`] answers it first.
     ///
     /// A failure with nothing in flight is this batch's own, classified as a `send` failure is.
-    /// A failure with batches in flight is never classified: `write_loop` stops submitting and
-    /// reads the acknowledgments already owed through [`Output::await_ack`]. Cancellable at every
+    /// A failure of the oldest batch's resubmit after a [`HeadOnly`] fault is classified too, and
+    /// the sink says what it means as [`Output::await_ack`] does: one marked [`HeadOnly`] is that
+    /// batch's own, with every later submission still outstanding, and one without the mark means
+    /// the sink dropped its connection and nothing is outstanding. Any other failure with batches
+    /// in flight is never classified: `write_loop` stops submitting and reads the
+    /// acknowledgments already owed through [`Output::await_ack`]. Cancellable at every
     /// await, as `send` is; a cancelled `submit` means the sink dropped its connection and nothing
     /// is outstanding. The default calls `send`.
     async fn submit(

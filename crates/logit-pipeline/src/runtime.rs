@@ -1161,10 +1161,12 @@ impl InFlight {
 ///   it stay submitted.
 /// - **A retryable [`crate::HeadOnly`] fault** resubmits the head alone after the backoff: the
 ///   next round submits it at position 0 without observing it again, keeps `state.outstanding`,
-///   and goes on filling behind the batches still in flight. A failure of that resubmit is the
-///   head's own fault and keeps the batches behind it outstanding, as a [`crate::HeadOnly`]
-///   acknowledgment does. A grace cut while the head waits for its resubmit counts it with the
-///   items behind it, since `state.outstanding` still covers it.
+///   and goes on filling behind the batches still in flight. A failure of that resubmit marked
+///   [`crate::HeadOnly`] is the head's own fault and keeps the batches behind it outstanding, as
+///   a [`crate::HeadOnly`] acknowledgment does; one without the mark means the sink dropped its
+///   connection, as a failed `await_ack` does, and sets `state.outstanding` to 0. A grace cut
+///   while the head waits for its resubmit counts it with the items behind it, since
+///   `state.outstanding` still covers it.
 ///
 /// The shutdown grace is the one thing that cuts a round short (`write_loop`'s `DeliverStep`).
 /// Before returning `Delivery::Dropped` it has set `state.at_fault`; `write_loop` commits and
@@ -1222,12 +1224,18 @@ async fn window_round(
     resubmit_head: bool,
 ) -> anyhow::Result<()> {
     // The head's earlier fault was its own, and the batches behind it are still in flight. It
-    // stays counted in `state.outstanding` and was observed with its first submit.
+    // stays counted in `state.outstanding` and was observed with its first submit. The sink says
+    // what a failed resubmit means, as for an acknowledgment (`Output::submit`'s doc).
     if resubmit_head && state.outstanding > 0 {
         let (batch, ctx, seq) = head;
         if let Err(err) = output.submit(batch, *ctx, *seq).await {
-            state.at_fault = 1;
-            return Err(err.context(HeadOnly));
+            if is_head_only(&err) {
+                state.at_fault = 1;
+            } else {
+                state.at_fault = state.outstanding;
+                state.outstanding = 0;
+            }
+            return Err(err);
         }
     }
     loop {
@@ -7367,6 +7375,10 @@ mod tests {
         in_flight: std::collections::VecDeque<u64>,
         /// The batch a `HeadOnly` acknowledgment popped, which a resubmit puts back first.
         head_failed: Option<u64>,
+        /// One result per resubmit of `head_failed`, `(fault, head_only)`; success once the list
+        /// runs out. A failure marked `HeadOnly` keeps the batches in flight; one without the mark
+        /// drops the connection.
+        resubmit_script: std::collections::VecDeque<(Fault, bool)>,
         /// The `seq` the last `observe_batch` saw, for `send`.
         pending_seq: Option<SeqId>,
         /// One result per `submit` call, `None` succeeding; success once the list runs out.
@@ -7416,6 +7428,7 @@ mod tests {
                 broken: false,
                 in_flight: std::collections::VecDeque::new(),
                 head_failed: None,
+                resubmit_script: std::collections::VecDeque::new(),
                 pending_seq: None,
                 submit_script: std::collections::VecDeque::new(),
                 submit_fails: None,
@@ -7443,6 +7456,16 @@ mod tests {
         }
 
         fn submit_value(&mut self, value: u64) -> anyhow::Result<()> {
+            if self.head_failed == Some(value) {
+                if let Some((fault, head_only)) = self.resubmit_script.pop_front() {
+                    let err = Err(anyhow::anyhow!("simulated {fault:?} resubmit")).context(fault);
+                    if head_only {
+                        return err.context(HeadOnly);
+                    }
+                    self.drop_connection();
+                    return err;
+                }
+            }
             let scripted = self.submit_script.pop_front().flatten();
             let fault = match self.submit_fails {
                 Some((v, fault)) if v == value => Some(fault),
@@ -7972,6 +7995,77 @@ mod tests {
             assert_eq!(totals.sum("logit.component.errors", &[]), 1.0, "{at}");
             assert_eq!(totals.sum("logit.component.retries", &[]), 1.0, "{at}");
         }
+    }
+
+    /// The head's resubmit after a `HeadOnly` fault fails once, and the sink marks that failure
+    /// `HeadOnly` too: the head's own fault, so the loop backs off and resubmits it alone again,
+    /// and the batches still in flight deliver in order after it.
+    #[tokio::test(start_paused = true)]
+    async fn a_head_only_resubmit_failure_retries_the_head_alone() {
+        let (mut output, log) = windowed_output((4, 4));
+        output.ack_delay = Duration::from_millis(10);
+        output.ack_script = head_only(Some(2), Fault::Clean, 1);
+        output.resubmit_script = [(Fault::Clean, true)].into();
+        let totals = drive_windowed(&mut output, 4, 1024, DeliveryPosture::AtLeastOnce).await;
+        assert_eq!(
+            log.calls(),
+            vec![
+                Call::Observe(1),
+                Call::Submit(1, 1, 0),
+                Call::Observe(2),
+                Call::Submit(2, 2, 1),
+                Call::Observe(3),
+                Call::Submit(3, 3, 2),
+                Call::Observe(4),
+                Call::Submit(4, 4, 3),
+                Call::Ack(1),
+                Call::Submit(2, 2, 2),
+                Call::Submit(2, 2, 2),
+                Call::Ack(2),
+                Call::Ack(3),
+                Call::Ack(4),
+            ]
+        );
+        assert_eq!(totals.sum("logit.component.batches.delivered", &[]), 4.0);
+        assert_eq!(totals.sum("logit.component.retries", &[]), 2.0);
+        assert_eq!(sent_failed(&totals), 0.0);
+    }
+
+    /// The head's resubmit fails without `HeadOnly`: the sink dropped its connection and every
+    /// batch with it, so the loop resubmits the whole window from the head, as after a failed
+    /// `await_ack`, and never commits a batch the sink no longer holds.
+    #[tokio::test(start_paused = true)]
+    async fn a_resubmit_failure_without_head_only_resubmits_the_window_from_the_head() {
+        let (mut output, log) = windowed_output((4, 4));
+        output.ack_delay = Duration::from_millis(10);
+        output.ack_script = head_only(Some(2), Fault::Clean, 1);
+        output.resubmit_script = [(Fault::Clean, false)].into();
+        let totals = drive_windowed(&mut output, 4, 1024, DeliveryPosture::AtLeastOnce).await;
+        assert_eq!(
+            log.calls(),
+            vec![
+                Call::Observe(1),
+                Call::Submit(1, 1, 0),
+                Call::Observe(2),
+                Call::Submit(2, 2, 1),
+                Call::Observe(3),
+                Call::Submit(3, 3, 2),
+                Call::Observe(4),
+                Call::Submit(4, 4, 3),
+                Call::Ack(1),
+                Call::Submit(2, 2, 2),
+                // The connection dropped with 3 and 4: all three go out again from the head.
+                Call::Submit(2, 2, 0),
+                Call::Submit(3, 3, 1),
+                Call::Submit(4, 4, 2),
+                Call::Ack(2),
+                Call::Ack(3),
+                Call::Ack(4),
+            ]
+        );
+        assert_eq!(totals.sum("logit.component.batches.delivered", &[]), 4.0);
+        assert_eq!(totals.sum("logit.component.retries", &[]), 2.0);
+        assert_eq!(sent_failed(&totals), 0.0);
     }
 
     /// An `Ambiguous` fault marked `HeadOnly` under at-most-once drops the head alone, counted
