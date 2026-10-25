@@ -13,7 +13,9 @@ LuaJIT. Read these in order before changing anything:
    component graph, the native wire protocol, and internal telemetry. These five design docs are
    load-bearing; don't improvise around them without reading them first.
 4. [docs/known-gaps/](docs/known-gaps/README.md): check it before "fixing" something that looks
-   broken. It's likely a documented, deliberate gap, not an oversight.
+   broken. It lists only work still open. A limit that was decided lives in its ADR, with the
+   operator's workaround in [docs/deploying.md](docs/deploying.md) or the matching guide, so check
+   those too: what looks broken is likely a documented, deliberate limit, not an oversight.
 
 [docs/deploying.md](docs/deploying.md) is the operator-facing doc for running any of this outside
 the dev stack.
@@ -38,7 +40,8 @@ exists or a contract other `logit` processes depend on:
 - **`flatten` never deletes an attribute.** It removes a source attribute only once its leaves are
   written. Last write wins on a key collision, silently, and there is deliberately no cap on how
   many keys one value can expand into beyond a fixed internal recursion-depth bound. That's a
-  settled, documented gap (`docs/known-gaps/runtime.md`), not a missing guard.
+  settled, documented limit ([ADR `flatten-transform`](docs/adr/flatten-transform.md),
+  `docs/design/memory.md` §4), not a missing guard.
 - **`http_access` derives every value from config or a built-in table, never a capture.** It's
   best-effort per field, never drops an event, and emits no metrics (a stock `kv_metrics` + `keep`
   does that).
@@ -1268,8 +1271,8 @@ not a style preference:
 - **The threat model is accidental data, not a malicious peer.** A listener, decoder, or transform
   must survive a misconfigured sender, a wedged peer, or a corrupt file; a problem only crafted
   input can trigger is defended only when the defense is free (a branch, a counter, a timeout
-  wrapper), and is otherwise a documented non-goal in `docs/known-gaps/`
-  ([ADR `deployment-threat-model`](docs/adr/deployment-threat-model.md)).
+  wrapper), and is otherwise a documented non-goal, listed in
+  [ADR `deployment-threat-model`](docs/adr/deployment-threat-model.md).
 
 ## Where things live
 

@@ -57,17 +57,6 @@ Entry format and the other areas: [the known-gaps index](README.md).
   (`&'static str` values only) instead of letting it grow the process-wide interner. A dropped
   key is counted (`logit.internal.points.dropped{reason="cardinality"}`), never silent.
   **Revisit** if a legitimate component ever needs more than 1024 distinct points between drains.
-- **Lua-authored telemetry (`crates/logit-script/src/telemetry.rs`,
-  [ADR `lua-authored-telemetry-cardinality`](../adr/lua-authored-telemetry-cardinality.md)) trades the
-  type-system cardinality guarantee the rest of `internal-telemetry.md` relies on for a
-  convention-enforced one.** A script's metric name or tag value goes through the process interner
-  instead of being a Rust `&'static str`, so a script that builds one from per-event data leaks
-  the interner one entry at a time.
-  - **Accepted** for the same reason as "The attribute/metric-name interner never frees" (under
-    [Event model and interner](runtime.md#event-model-and-interner)): it's bounded in the
-    intended, documented use, a fixed literal in the script's source.
-  - **If that stops holding,** the fix is a bounded per-`ScriptWorker` cache instead of the
-    process-wide interner, which the ADR records as a considered-and-deferred alternative.
 - **Two self-telemetry candidates aren't built**, and each needs more than a
   `telemetry.count(...)` call:
   - **`json`'s parse-outcome counts.** Its two failure modes (`no_brace`, `parse_failure`) already
@@ -88,32 +77,6 @@ Entry format and the other areas: [the known-gaps index](README.md).
   the throttle (a lifecycle event, an unthrottled `Diagnostics::error`). It isn't built because
   nothing shipped needs it, and the throttle already covers the hot path (a malformed line, a
   parse failure).
-- **Shutdown-time counts never reach an exported pipeline when `internal`'s pipeline is mixed.**
-  A pipeline is mixed when any node reachable from `internal` is also reachable from another
-  input, such as one `otlp_out` carrying both data and `internal`'s output. `internal`'s
-  `run_until_shutdown` then does its final drain the moment the shutdown signal fires, and every
-  count recorded after that stays in the component buffers:
-  - the UDP listeners' `datagrams.dropped`/`bytes.dropped{reason="shutdown"}`
-    ([ADR `shutdown-accounting-and-cancellation-safety`](../adr/shutdown-accounting-and-cancellation-safety.md),
-    decision 4);
-  - the drops a sink or Lua node counts during the drain;
-  - the HTTP listeners' `connections.closed{reason="shutdown"}`.
-
-  A dedicated pipeline closes this part of the gap: `internal` and its pipeline shut down after
-  every other node and drain once more, so those counts are exported, except a shutdown drop
-  that a node in `internal`'s own pipeline counts while it shuts down (the same ADR's "Amendment:
-  internal drains last", decisions 10 to 16). Giving `internal` its own sinks, on the same backend
-  when needed, is the recommended setup
-  ([docs/deploying.md](../deploying.md)'s "Give `internal` a dedicated pipeline"), and
-  `logit validate` and `logit run` warn about a mixed one. In a mixed pipeline the counts reach a
-  test `Registry` but no `otlp_out` or `prometheus_out`. An operator sees them in the self-log
-  instead: each UDP guard that counts a nonzero remainder logs a `warn` naming the listener and
-  the count, `drain complete` logs the sinks' total, and `telemetry left undrained at exit` logs
-  every remaining point.
-
-  In both cases the final drain's own `logit.internal.*.emitted`/`drain.duration` are never
-  exported. They are recorded a tick behind, and no tick follows the final drain. Both cases log
-  them as `telemetry left undrained at exit`.
 - **A self-telemetry batch `internal` has drained is lost uncounted if the grace backstop drops it
   mid-send.** Each `tick` drains the registry, then awaits `Fanout::send`. A tick parked on a full
   downstream when shutdown fires keeps the `select!` from seeing the signal until the send
@@ -122,21 +85,6 @@ Entry format and the other areas: [the known-gaps index](README.md).
   counts them. This is the general dropped-send loss under
   [Pipeline runtime and graph](runtime.md#pipeline-runtime-and-graph), for the one listener
   whose data is `logit`'s own.
-- **A drop a kernel or a destination decided counts again on a retried batch.** Encode-side
-  counters count once per batch, but these repeat on every attempt that gets the same answer:
-  Splunk's code 6 (`records.dropped{reason="invalid_event"}`) and Splunk Cloud's oversize answer,
-  a datagram refused with `EMSGSIZE`, and the packer's skip of an entry over the datagram cap
-  (`oversize_datagram`). The verdict counters of `otlp_out`, `datadog_out`, and `datadog_trace_out` don't repeat: a
-  retry never resends a signal or request the destination already settled.
-  [internal-telemetry.md](../design/internal-telemetry.md)'s class table lists them.
-  - **Consequence:** on a sink that retries, these counters read high by the number of attempts
-    that met the verdict, and the batch's own retries account for the growth. A hold has no end
-    but success or shutdown, so a Splunk verdict re-counted on every retry is unbounded for as
-    long as the hold lasts.
-  - **Why it stays:** each attempt got its own answer, and a retry might get a different one, so
-    counting once would need the sink to remember what an earlier attempt learned
-    ([ADR `sink-send-path-and-attempt-accounting`](../adr/sink-send-path-and-attempt-accounting.md),
-    decision 1).
 - **The HTTP sinks' `logit.output.requests` doesn't use the four fault classes.** The stream and
   datagram sinks (`statsd_out`, `syslog_out`, `graphite_out`, `collectd_out`, `logit_out`) and
   `kafka_out` tag each attempt `class=ok|clean|ambiguous|rejected|refused`. `influxdb_out`, `otlp_out`,

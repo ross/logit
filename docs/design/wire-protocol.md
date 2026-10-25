@@ -187,8 +187,7 @@ Two caveats:
   `Samples`; the copy is transient and not charged.
 
 The dictionary's cost lands mostly in the process-wide interner, which never evicts and isn't a
-per-frame cost ([`docs/known-gaps/runtime.md`](../known-gaps/runtime.md#event-model-and-interner)'s
-interner entry).
+per-frame cost ([`memory.md`](memory.md#what-feeds-it)'s "What feeds it").
 
 **A real batch is charged 1.5 to 39 bytes of heap per wire byte.** The 864-byte event slot
 dominates a small event; a wide parsed log carries enough wire bytes to hide it. Measured on
@@ -456,7 +455,7 @@ decision record.
   reports `logit.input.batches.resends`, `logit.input.senders`, and
   `logit.input.senders.evicted`. No lock spans a forward, so a frame a connection still holds
   after a fault ends it can be forwarded beside the sender's resend of it on a new connection
-  (`docs/known-gaps/native-hop.md`, "A resend can race the frames an ended connection still holds").
+  ([ADR `native-hop-send-window`](../adr/native-hop-send-window.md)'s Consequences).
 - **Acknowledgement point:** for a frame above its sender's mark, after
   `Fanout::send` returns, not when it decodes. `Fanout::send` returns whether any consumer took
   the batch: if one did, the frame joins `logit_in`'s pending `Ack`; if none did, because every

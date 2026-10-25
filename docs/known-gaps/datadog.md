@@ -109,25 +109,6 @@ Entry format and the other areas: [the known-gaps index](README.md).
     overwrite. `buffer: {delivery: at_most_once}` drops that request's batch instead.
   - **Revisit trigger:** a measurement showing another route dedupes a resend, or an operator who
     needs the replay to be duplicate-free.
-- **`datadog_out` drops metric points older than 1 hour, which Datadog would store.** The sink
-  uses the documented series window, which is stricter than the intake;
-  [ADR `datadog-agent-and-intake-relay`'s "Timestamp windows and what a `202` drops"](../adr/datadog-agent-and-intake-relay.md#timestamp-windows-and-what-a-202-drops)
-  has what a trial org stored.
-  - **Consequence:** a `buffer.disk:` replay after an outage longer than 1 hour drops metrics
-    the intake might still have stored, counted `records.dropped{reason="stale"}`. To discard or archive old
-    events upstream of the sink, use `drop_stale` or `has_stale`
-    ([ADR `stale-event-filtering`](../adr/stale-event-filtering.md)).
-  - **Revisit trigger:** Datadog documents a longer window, or an operator needs the replay.
-- **`datadog_out` copies Datadog's 100-tag limit on metrics.** A series, distribution point, or
-  sketch whose `tags` list holds more than 100 strings is dropped before sending, counted
-  `records.dropped{reason="too_many_tags"}`, because the intake drops it and only the series
-  route says so (measured on a trial org on 2026-10-08;
-  [ADR `datadog-agent-and-intake-relay`'s "Timestamp windows and what a `202` drops"](../adr/datadog-agent-and-intake-relay.md#timestamp-windows-and-what-a-202-drops)).
-  - **Consequence:** if Datadog raises the limit, or an org has a higher one, the sink still drops
-    what Datadog would store.
-  - **Workaround:** keep metrics under 100 tags with `keep` or `remove` upstream.
-  - **Revisit trigger:** Datadog documents or answers a different limit; the series route's `202`
-    body states it (`limit=100`).
 - **`datadog_out` collapses a series' points in one second only within one batch.** Of the
   points of one series in one second in a batch, the sink sends the latest and leaves the rest
   off, counted `metrics.dropped{reason="duplicate_timestamp"}`, or
@@ -143,17 +124,6 @@ Entry format and the other areas: [the known-gaps index](README.md).
     holds no state between batches either.
   - **Workaround:** keep one series' readings of one second in one batch: an `aggregate` upstream
     leaves one point per series per window.
-- **`datadog_out` reports every hostless sender under the relay's hostname.** It sends the
-  process hostname for a metric, event, or service check with no `host.name` and no hostless
-  mark, a log with none of `host.name`, `syslog.hostname`, or `host`, and a trace or APM stats
-  payload with no resource `host.name` and no relaying Agent's hostname. `statsd_in` and
-  `datadog_in` decode a sender's own host (a DogStatsD `host:` tag or `h:` field, a log's
-  `hostname`) to `host.name`, so only a sender that names none reaches this. An Agent does the
-  same for a DogStatsD client that names no host.
-  - **Consequence:** many senders behind one central `logit` show in Datadog as one host, with
-    their series merged under it. Datadog bills per host, so this costs what one Agent would.
-  - **Workaround:** stamp `host.name` per sender upstream with `set`, or have each DogStatsD
-    client send a `host:` tag (or `h:` on an event or check).
 - **`datadog_out` sends a container id unresolved.** `container.id` leaves as a bare
   `container_id` tag (a `ddtags` entry on a log, the payload field on a trace or stats payload).
   An Agent resolves a container id through its tagger into the container's image, name, and

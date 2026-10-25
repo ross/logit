@@ -1,6 +1,6 @@
 ---
 created: 2026-09-20
-updated: 2026-10-11
+updated: 2026-10-25
 ---
 
 # Verification plan: critical sections inventory
@@ -6133,8 +6133,8 @@ socket/driver glue and the native wire format are out of scope (other surveys co
     `syslog_in`'s UDP arm reads at most a 65,507-byte datagram, and its TCP arm frames with
     `MAX_FRAME_BYTES` (64 KiB), which no config raises (`crates/logit-proto/src/framing.rs`'s
     `MAX_FRAME_BYTES` doc), so a `max_line_bytes` misconfiguration can't reach this parser. An
-    element or PARAM count cap would only stop crafted input, so `docs/known-gaps/syslog.md`
-    records it as a non-goal citing ADR `deployment-threat-model`, and
+    element or PARAM count cap would only stop crafted input, so ADR `deployment-threat-model`
+    lists it as a non-goal, and
     `syslog_a_64_kib_line_of_distinct_sd_names_decodes_whole` pins the worst case decoding whole.
   - *The 32-byte bound:* enforced where the name is cut. `parse_sd_name` scans the run of
     SD-NAME bytes once and rejects a name past 32 bytes before anything uses it, and a rejection
@@ -6463,7 +6463,7 @@ the telemetry buffers are `std::collections::HashMap`.
 - **Observed concerns (unverified):**
   - `interner::resolve` panicking plus `Symbol: Copy` means the documented retrofit cost is real; nothing enforces the "symbols are eternal" premise at a type level. Medium confidence this is exactly as documented, not worse.
   - Sorted-`Symbol` iteration order being insertion-order-dependent is stated as "deterministic" in `AttrMap::iter`'s doc comment (`crates/logit-core/src/attrs.rs`); it is deterministic *within* a process run but not across two processes that interned in different orders. Worth confirming no codec's fixed-point property (lossless-transit) depends on it. Medium confidence this is fine (codecs sort by name), but it is not argued anywhere I found.
-- **Existing coverage:** `crates/logit-core/src/interner.rs`'s `tests` module (5 unit tests, all `KeyCache`-focused); `crates/logit-core/tests/type_sizes.rs` (`symbol_is_a_niche_optimized_u32`). Governed by `docs/design/memory.md` §4 and [`docs/known-gaps/runtime.md`](../known-gaps/runtime.md#event-model-and-interner) ("The attribute/metric-name interner never frees" — documented, accepted, not a surprise).
+- **Existing coverage:** `crates/logit-core/src/interner.rs`'s `tests` module (5 unit tests, all `KeyCache`-focused); `crates/logit-core/tests/type_sizes.rs` (`symbol_is_a_niche_optimized_u32`). Governed by `docs/design/memory.md` §4 and [ADR `deployment-threat-model`](../adr/deployment-threat-model.md)'s non-goals amendment ("The attribute/metric-name interner never frees" — documented, accepted, not a surprise).
 - **Suggested verification approach:** targeted review of every `resolve` call site for a symbol that could have come from outside this process; a long-run soak (`json`/`otlp_in` against high-key-cardinality input) watching `interner::len()` and RSS; a contention microbench of `intern` across N worker threads.
 - **Priority:** P1 — documented and accepted gap, but it is global mutable state on the hottest path and the panic-on-unknown-symbol contract is load-bearing.
 

@@ -36,26 +36,6 @@ Entry format and the other areas: [the known-gaps index](README.md).
   - **Consequence:** none observed: every real client checked (including `opentelemetry-js`) reads
     only the HTTP status code on error, never the body's content-type.
   - **Revisit trigger:** a client that parses the error body.
-- **An OTLP/JSON request costs more peak memory per byte than a same-sized protobuf one, under the
-  same `MAX_REQUEST_BYTES` cap.** The JSON path parses into a `serde_json::Value` tree
-  (`crates/logit-proto/src/otlp/json/`) first, one `Map`/`Vec`/`String`/`Number` allocation per
-  node, where `prost::Message::decode` builds the target structs directly. Peak live heap bytes
-  per input byte, debug build, measured 2026-09-25:
-  - Ordinary OTLP/JSON structure (`testdata/interop/otlp/logs.json`, a real SDK export): about 19.
-    The same batch as protobuf: about 17.
-  - Crafted input, a body of tiny `{"":0}` objects under a key OTLP doesn't define, which
-    serde_json builds in full and the decoder then ignores: about 98, at both 1 MiB and 4 MiB. At
-    4 MiB that's about 400 MiB for one request.
-
-  `crates/logit-proto/tests/robustness.rs`'s `otlp_json_peak_memory_per_input_byte_is_documented`
-  asserts ceilings of 24 and 128 over these two shapes, so a change that moves either ratio fails
-  a test. The bound still holds: `OtlpInput::max_connections`'s field doc
-  (`crates/logit-inputs/src/otlp.rs`) states the worst case across all connections is a finite
-  multiple of the protobuf path's 1.6 TiB, itself a bound rather than a memory budget
-  (`MAX_CONCURRENT_STREAMS` in `crates/logit-inputs/src/http.rs` has the formula). There's no cap
-  and no streaming parser, because the 98× shape needs crafted input, a non-goal under
-  [ADR `deployment-threat-model`](../adr/deployment-threat-model.md).
-  - **Revisit trigger:** an OTLP listener that faces an untrusted network.
 - **VictoriaTraces's OTLP/gRPC listener fails a request that races its connection close.**
   VictoriaTraces v0.11.1 closes every gRPC connection about 5 seconds after it opens, with a TCP
   FIN and no HTTP/2 `GOAWAY`
@@ -76,13 +56,6 @@ Entry format and the other areas: [the known-gaps index](README.md).
   - **Revisit trigger:** VictoriaTraces sending a `GOAWAY` (the upstream fix). Whether `otlp_out`
     should retry a gRPC request that got no response frame before the connection closed is a
     larger question: without a `GOAWAY`, the request may have been processed.
-- **An OTLP timestamp past `i64::MAX` saturates to `i64::MAX`.** A wire timestamp
-  (`time_unix_nano`, `observed_time_unix_nano`, `start_time_unix_nano`, and the span, span event,
-  and exemplar times) past `i64::MAX` nanoseconds decodes as `i64::MAX` through one helper
-  (`wire_nanos`, `crates/logit-proto/src/otlp/common.rs`), and relays as
-  2262-04-11T23:47:16.854775807Z, not the original. It's listed under
-  [ADR `lossless-transit`](../adr/lossless-transit.md)'s "Permitted normalizations"
-  ([ADR `untrusted-input-bounds`](../adr/untrusted-input-bounds.md) has the rule).
 - **A `Histogram` carries no point `count`, so a `count` that disagrees with the buckets is
   lost.** `logit_core::Histogram`'s population is the sum of its buckets. `otlp_in` reads a point
   with only `count` and `sum` as one `+Inf` bucket holding `count`, but a point whose `count`

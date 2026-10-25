@@ -70,7 +70,7 @@
 //!   interning history): a relay that saw `[b@2 ..][a@1 ..]` re-emits `[a@1 ..][b@2 ..]`. A
 //!   repeated PARAM-NAME's occurrences, already grouped under one `Value::Array` by the decoder,
 //!   emit one `PARAM-NAME="..."` per item in order, so a wire `a b a` interleaving isn't preserved
-//!   (`docs/known-gaps/syslog.md`).
+//!   (`docs/deploying.md`'s `syslog_out` notes).
 //! - PARAM-VALUEs are escaped by [`push_sd_escaped`]: `"` -> `\"`, `\` -> `\\`, `]` -> `\]`, plus
 //!   every C0 control character and DEL (see "Injection safety").
 //! - SD-ID and PARAM-NAME must be RFC 5424 section 6.3.2 `SD-NAME`s ([`is_valid_sd_name`]: 1-32
@@ -128,7 +128,7 @@
 //! newline inside a string is already the two characters `\` `n`; escaping a backslash would
 //! double every one of them and break Loki's `| json` parsing on every line. The cost: a message
 //! that contained the literal two characters `\` `n` is indistinguishable on the wire from one
-//! with a real newline (`docs/known-gaps/syslog.md`).
+//! with a real newline (`docs/adr/syslog-output.md`).
 //!
 //! RFC 5424's HOSTNAME/APP-NAME/PROCID/MSGID are `PRINTUSASCII` with length caps
 //! ([`sanitize_5424_field`]). RFC 3164's HOSTNAME/TAG also forbid `:`/`[`/`]`

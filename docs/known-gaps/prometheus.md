@@ -2,41 +2,6 @@
 
 Entry format and the other areas: [the known-gaps index](README.md).
 
-- **1.0 remote-write typing depends on the metadata cache, which is bounded and therefore lapses**
-  ([ADR `prometheus-remote-write`](../adr/prometheus-remote-write.md)'s "The receiver is stateless";
-  `prometheus_in`'s "Metadata cache" module-doc section). An expired family decodes untyped again
-  (its samples are `unknown` and its derived series come apart) until the sender's next metadata
-  request re-declares it.
-
-  **Why a cache:** remote-write 1.0 carries a family's type, `# HELP`, and `# UNIT` in
-  `WriteRequest.metadata[]`, and Prometheus's 1.0 sender ships those in separate requests on its
-  own schedule (`metadata_config`, once a minute by default). Without a cache, nearly every family
-  decodes as `unknown`, and `http_request_duration_seconds_bucket`/`_sum`/`_count` arrive as three
-  unrelated series instead of one histogram. No sample is lost either way: only a declared family
-  name claims a suffix, so an undeclared `foo_sum` is its own family
-  (`crates/logit-proto/src/prometheus/assemble.rs`). The cache buys typing, not data. 2.0 needs
-  none of this: every request is fully typed.
-
-  **Configuration:** `metadata_cache:` defaults to `max_families: 10000` and `ttl: 10m`, evicting
-  the least recently seen family first over the cap. `max_families: 0` turns it off, the setting
-  for a pure-2.0 fleet. The default TTL is ten times Prometheus's metadata cadence, so a live
-  sender must miss ten refreshes in a row to lapse. A sender with a longer `metadata_config`
-  interval, or one that went quiet and came back, will lapse.
-
-  **What to watch:** `logit.input.metadata_cache.size` (gauge),
-  `.evicted{reason="expired"|"cardinality"}`, and `.replaced`. A steady `expired` stream against a
-  live sender means `ttl` is under that sender's cadence.
-
-  The same cache has two smaller bounds:
-  - A remembered `# HELP`/`# UNIT` is cut to a fixed byte cap (`MAX_METADATA_TEXT_BYTES`, counted
-    `logit.input.metadata_cache.truncated`), because the table outlives the request whose size cap
-    bounded it. The type is remembered in full; only description text is affected.
-  - A remembered type is advisory, never authoritative. Where a declaration carried in the request
-    itself would make the assembler discard a sample, a remembered one yields, and the sample opens
-    an implicit family of its own, counted `logit.input.metrics.degraded{reason="seed_mismatch"}`
-    (`crates/logit-proto/src/prometheus/assemble.rs`'s "A seeded type is advisory" table). A stale
-    memory costs typing, never data. A steady `seed_mismatch` stream means the table and the
-    senders disagree about a family's shape; chase it rather than tune it.
 - **The remote-write receiver's metadata table is shared by every sender that can reach it, and
   peers can evict each other's entries.** Each `prometheus_in(bind)` component has one table, not
   one per peer, evicted strictly by `last_seen` (`crates/logit-inputs/src/prometheus.rs`'s
@@ -45,26 +10,12 @@ Entry format and the other areas: [the known-gaps index](README.md).
   `.evicted{reason="cardinality"}` with no attribution.
   - **Consequence:** if this repeats faster than the victims' `metadata_config` cadence,
     well-behaved senders stay untyped permanently. Their samples still arrive, as flat families
-    (the remembered type is advisory; see "1.0 remote-write typing depends on the metadata
-    cache").
+    (the remembered type is advisory; see [Deploying `logit`](../deploying.md#prometheus-remote-write-receiving-sending-and-picking-a-version)'s
+    `metadata_cache:` notes).
   - **Workaround:** give each population of senders its own `bind:`, each with its own table.
     `bind_auth:` limits who can write, not what an accepted sender declares, so it doesn't stop
     one authenticated sender evicting another's families. `max_families: 0` turns off the sharing
     along with the typing.
-- **The remote-write sender does no cross-batch reordering, so a fan-in topology, or any
-  topology under `concurrency:` above 1, can draw out-of-order `400`s.** `prometheus_out(endpoint)`
-  sends samples in batch order ([ADR `prometheus-remote-write`](../adr/prometheus-remote-write.md)'s
-  "Sender behaviour"; the sink's module doc, "Concurrency"). Both specs require one series' samples
-  in timestamp order, so two upstream branches writing the same series into one `prometheus_out`
-  can send an older sample after a newer one. A single chain can too once `concurrency:` is above
-  1: batches in flight together can land in any order. At the default of 1, a single chain can't
-  hit this.
-  - **Consequence:** a receiver with no out-of-order window (stock Prometheus, Mimir without
-    `out_of_order_time_window`) answers `400`, which the sink classifies `Fault::Rejected` and
-    drops.
-  - **Workaround:** use a topology that doesn't split one series across branches and keep
-    `concurrency:` at 1, or a receiver with an out-of-order window. The sink won't buffer its way out: a reorder window is
-    `aggregate`-shaped state a sink doesn't hold.
 - **A later batch repeating a series and millisecond with a new value draws a `400` that drops
   the whole batch.** `prometheus_out(endpoint)` collapses readings of one series that share a
   millisecond within one batch, keeping the later and counting the rest

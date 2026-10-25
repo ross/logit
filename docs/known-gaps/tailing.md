@@ -10,29 +10,6 @@ Entry format and the other areas: [the known-gaps index](README.md).
   replaying, but only within this process. If `logit` restarts between the two renames, the
   container falls back to `read_from` like any file the process has never seen. See [ADR
   `docker-container-identity-and-minimal-watches`](../adr/docker-container-identity-and-minimal-watches.md).
-- **`docker_in` only watches `root` and the files it currently has open, so a log file's own
-  first appearance inside an already-existing container directory, a rotation, and a
-  `config.v2.json` change are all discovered on the next `poll_interval` tick, not instantly.**
-  Only a container directory arriving or leaving under `root` is `inotify`-fast, because Docker's
-  per-container state directories are direct children of `root`.
-  - **Consequence:** latency only; none of the three poll-bound cases loses data.
-  - **Workaround:** a shorter `poll_interval` is the only way to tighten them. A
-    per-container-directory watch would catch them near-instantly, but would cost
-    O(containers on the host) work per log line written anywhere on the host. See [ADR
-    `docker-container-identity-and-minimal-watches`](../adr/docker-container-identity-and-minimal-watches.md).
-- **`docker_in`'s timestamps are the one exception among the tailing decoders to "stamp receipt
-  time."** It uses the json-file envelope's own `time` field (the daemon's same-host clock),
-  because replaying a backlog (`read_from: beginning`, or a fresh container's already-written
-  history) as "now" would misstate when those lines happened. See the "docker_in timestamps"
-  section of [ADR `file-tailing-and-docker-json-logs`](../adr/file-tailing-and-docker-json-logs.md).
-  - `tail_in` keeps the general rule (read time, matching `syslog_in`), because a plain text line
-    carries no timestamp to trust. A `timestamp` component after `json`, `regex`, or `logfmt`
-    resolves it from the parsed field
-    ([ADR `timestamp-transform`](../adr/timestamp-transform.md)).
-  - Receipt time isn't a repo-wide invariant either: `otlp_in` prefers a record's own
-    `time_unix_nano` when set, falls back to `observed_time_unix_nano` only for the zero "unknown"
-    sentinel, and preserves `observed_time_unix_nano` both ways (`otlp/logs.rs`'s module doc,
-    [ADR `metrics-model-v2`](../adr/metrics-model-v2.md)).
 - **`tail_in`/`docker_in`'s checkpoint identity is `(dev, ino)`, which doesn't survive a bind
   mount or filesystem migration that preserves content but not inode numbers.** A restored backup,
   a volume moved to different storage, or a bind mount re-created from a snapshot resumes from the
@@ -98,20 +75,6 @@ Entry format and the other areas: [the known-gaps index](README.md).
   - **Workaround:** bound the rotator's retention. A pattern that matches only the active name
     (`app.log`) closes each rotated file once it's read, but loses the file's unread tail at a
     stop or a crash, counted only as far as the last checkpoint knew (the entry above).
-- **Under a pattern that matches rotated names, `copytruncate` re-emits the whole file on every
-  rotation, and `compress` tails `app.log.N.gz` as text.**
-  - The copy `copytruncate` writes is a new inode, so `app.log*` reads it from `0`; a recorded run
-    re-emitted about 1,600 to 2,000 lines per three rotations.
-  - A `.gz` file is read as lines of binary, diagnosed `invalid_utf8`.
-
-  `docs/deploying.md`'s "What to watch for file tailing" has the guidance. See [ADR
-  `file-tailing-and-docker-json-logs`](../adr/file-tailing-and-docker-json-logs.md)'s "Rotation and
-  truncation" section.
-- **Under an exact pattern, `copytruncate` loses the lines written after the tailer's last read
-  and before the truncate.** They exist only in the copy, which the pattern doesn't match. The
-  window is up to one `poll_interval` of writes (or one wake). See [ADR
-  `file-tailing-and-docker-json-logs`](../adr/file-tailing-and-docker-json-logs.md)'s 2026-09-28
-  amendment.
 - **`logit.input.files.rotated` misses a rotation when a scan lands in logrotate `create`'s
   rename-to-create gap.** logrotate renames the file away and creates its replacement afterward. A
   scan between the two finds nothing at the path, so it retires the old inode (which drains to its

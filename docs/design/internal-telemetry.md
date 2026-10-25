@@ -120,7 +120,7 @@ on `Option::None`.
 compile-time-constant strings: `("class", "5xx")`, never a raw path, peer address, or anything else
 derived from traffic. The type system enforces only `'static`; review enforces the rest, and every
 shipped component follows it. It matters more here than for ordinary event attributes: the
-process-wide interner never evicts (`docs/known-gaps/runtime.md`), so a runtime-derived tag *value*
+process-wide interner never evicts ([`memory.md`](memory.md) §4), so a runtime-derived tag *value*
 leaks for the life of the process, as a metric name embedding a request id would.
 
 ## The buffer: coalesce between drains, using the merges `aggregate` already performs
@@ -409,7 +409,7 @@ Without that handle, nothing is sampled.
 | `logit.process.fds` | gauge | Open file descriptors: the entries in `/proc/self/fd`, less the one the listing holds. |
 | `logit.process.fds.limit` | gauge | The soft `Max open files` limit from `/proc/self/limits`. Not emitted when it's `unlimited`. |
 | `logit.process.cpu.seconds{mode=user\|system}` | delta counter | CPU seconds since the previous tick: `/proc/self/stat` `utime`/`stime`, over `USER_HZ` (100). |
-| `logit.process.interner.strings` | gauge | The process-wide interner's size (`interner::len()`), which never shrinks: the observability hook `docs/known-gaps/runtime.md` names. |
+| `logit.process.interner.strings` | gauge | The process-wide interner's size (`interner::len()`), which never shrinks: the observability hook [`memory.md`](memory.md) §4 names. |
 | `logit.process.uptime` | gauge | Seconds since `internal` started. |
 
 **The procfs points are Linux-only**, and each of their four sources (`status`, `stat`, `fd`,

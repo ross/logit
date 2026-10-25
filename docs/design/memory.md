@@ -1075,6 +1075,46 @@ If that ships, revisit this section first, because the retrofit is expensive: `S
 and `resolve` *panics* on an unknown symbol, so `AttrMap`, `MetricRecord`, `SeriesKey`, the Lua
 proxy, and the native wire dictionary are all written against "symbols are eternal."
 
+### What feeds it
+
+Interned strings are attribute and resource keys, metric names, the symbol-typed metric and log
+fields (`unit`, `description`, `event_name`), and `telemetry`'s tag keys and values. Keys from
+`logit`'s own config or a fixed protocol grammar (statsd's `#tag:value`) are bounded. These take
+keys from a peer or a script, with no bound but the premise above
+([ADR `deployment-threat-model`](../adr/deployment-threat-model.md) lists each non-goal it
+decides):
+
+- **`syslog.sd`** interns every SD-ID and PARAM-NAME a peer sends, at both map levels
+  ([ADR `syslog-structured-data-convention`](../adr/syslog-structured-data-convention.md)). RFC
+  5424's grammar caps each at 32 PRINTUSASCII bytes, a length cap `json`'s arbitrary object keys
+  ([ADR `json-parsing-into-attributes`](../adr/json-parsing-into-attributes.md)) don't have.
+- **`otlp_in`** is the sharpest form: `key_values_into_attrs`
+  (`crates/logit-proto/src/otlp/common.rs`) interns every OTLP `KeyValue.key`, an arbitrary
+  peer-supplied string with no grammar and no length cap, so a never-repeating key could plausibly
+  come from something other than a user's naming mistake. [`docs/deploying.md`](../deploying.md)
+  recommends `keep` in front of `otlp_in` for this reason.
+- **`logit_in`'s native dictionary.** `Dict::read` (`crates/logit-proto/src/native/dict.rs`)
+  interns every dictionary string before the rest of the batch validates, so a batch the decoder
+  rejects still leaves its strings. The entry cap and the frame size bound each frame; nothing
+  budgets dictionary strings across frames, because `logit_in`'s peers are `logit` processes the
+  operator runs.
+- **`flatten`** adds path combinations of already-interned keys, bounded by its fixed recursion
+  depth rather than a key-count cap, and array indices, a key axis no other component mints: a
+  10,000-element array flattens into `tags.0`..`tags.9999`, ten thousand symbols retained. There's
+  no `max_keys` cap ([ADR `flatten-transform`](../adr/flatten-transform.md)'s Alternatives); a
+  narrowed `attributes:`/`resource:` list and `arrays: skip` are the levers. A map keyed by
+  request or user ids that `flatten` promotes to key position is the exposure `json` and
+  `otlp_in` already have, multiplied by every distinct path above it.
+- **`lua`/`lua_file`** feed it from five places, one guarded. `telemetry`'s metric names and tag
+  keys and values (`crates/logit-script/src/telemetry.rs`) are checked against
+  `Telemetry::is_enabled` first, so a disabled handle costs nothing
+  ([ADR `lua-authored-telemetry-cardinality`](../adr/lua-authored-telemetry-cardinality.md) accepts
+  the enabled case: a fixed literal costs one entry, a per-event string one per value). The other
+  four are unguarded: `MetricProxy`'s `__newindex` on `name`/`unit`/`description`, `LogProxy`'s
+  `__newindex` on `event_name`, `Event.new`'s symbol fields, and every attribute key a script
+  writes, top-level or nested
+  ([ADR `lua-runaway-script-bounds`](../adr/lua-runaway-script-bounds.md)).
+
 ### What was *not* the risk: failed lookups — fixed anyway
 
 `AttrMap::get` used to intern instead of probing, so in principle a miss added a key no event

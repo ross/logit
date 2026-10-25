@@ -15,36 +15,12 @@ Entry format and the other areas: [the known-gaps index](README.md).
   A `timestamp` component with `from: syslog.timestamp` and `format: rfc3164` ahead of
   `syslog_out` makes the fall-through render the sender's instant
   ([ADR `timestamp-transform`](../adr/timestamp-transform.md)).
-- **`syslog_out`'s control-character escaping is ambiguous with a message that already contained
-  the escape sequence literally.** The encoder (`sanitize_msg`) escapes an embedded newline as the
-  two characters `\`/`n` (likewise `\r`, NUL, and every other C0 control and DEL) so it can't
-  forge a second syslog message downstream. It leaves a literal backslash untouched, because
-  escaping it would double every backslash in a JSON message body and break a `| json` LogQL
-  filter on every line.
-  - **Consequence:** a message that contained the literal two characters `\`/`n` is
-    indistinguishable on the wire from one with a real newline. Accepted in
-    [ADR `syslog-output`](../adr/syslog-output.md).
-- **SD-ELEMENT/SD-PARAM order is canonicalized by name, not by wire position.**
-  `write_structured_data`/`write_sd_element` (`crates/logit-outputs/src/syslog.rs`) sort SD-IDs and
-  PARAM-NAMEs by name bytes rather than reproducing `AttrMap`/attribute iteration order, which is
-  process-global intern order, not wire order. A repeated PARAM-NAME's occurrences are emitted
-  grouped, so a wire `a b a` interleaving comes out as `a a b`. Permitted under
-  [ADR `lossless-transit`](../adr/lossless-transit.md)'s attribute-reordering normalization, and
-  recorded in
-  [ADR `syslog-structured-data-convention`](../adr/syslog-structured-data-convention.md)'s
-  Consequences and `crates/logit-cli/tests/syslog_round_trip.rs`'s normalization list.
 - **`syslog_out`'s opt-in `structured_data:` element can't carry a log's trace context.** The
   element (`structured_data: { sd_id: "<name>@<PEN>" }`, `write_structured_data`) carries every
   attribute except `syslog.*`, `host.name`, and `process.pid`, but a log's native trace context (`log.trace`,
   [ADR `log-record-trace-context`](../adr/log-record-trace-context.md)) isn't an `event.attribute`.
   - **Consequence:** a `trace_context`-enriched log relayed through `syslog_out` loses its trace
     and span ids.
-- **No RFC 6012 (DTLS, syslog over TLS over UDP).** `syslog_in` and `syslog_out` support only RFC
-  5425 (TLS over TCP); DTLS is out of scope for
-  [ADR `syslog-tcp-ingress-and-tls`](../adr/syslog-tcp-ingress-and-tls.md) (see its Alternatives).
-  A `tls:` block under `transport: udp` is a config error on both (graph rules 43 and 44), not
-  ignored.
-  - **Workaround:** `transport: tcp` with `tls:`.
 - **A binary syslog MSG with a `0x0A` byte is split on UDP.** A non-UTF-8 MSG decodes to a
   `Value::Bytes` message, but on `syslog_in`'s UDP transport `SyslogDecoder::decode_into`
   (`crates/logit-proto/src/syslog/decode.rs`) splits on `\n` before parsing, which cuts a binary
@@ -61,12 +37,3 @@ Entry format and the other areas: [the known-gaps index](README.md).
     ([ADR `syslog-tcp-ingress-and-tls`](../adr/syslog-tcp-ingress-and-tls.md)), so a `0x0A` inside
     an octet-counted MSG survives end to end. The HAProxy CBOR entry records why the decoder that
     would consume such a payload was measured and not built.
-- **Non-goal: no cap on STRUCTURED-DATA elements or PARAMs per line.** `parse_structured_data`
-  (`crates/logit-proto/src/syslog/decode.rs`) reads the line in one forward pass that never
-  recurses or backtracks, and the line is bounded by the frame cap (`MAX_FRAME_BYTES`, 64 KiB) or
-  the UDP datagram. Folding names into `AttrMap`'s sorted map is quadratic in the number of
-  distinct names when they arrive in an order the interner hasn't seen: a 64 KiB line of about
-  10,000 distinct SD-IDs costs about 17 ms in a release build. No real sender writes thousands of
-  elements or PARAMs on one line, so a count cap would only stop crafted input, and it isn't added,
-  per [ADR `deployment-threat-model`](../adr/deployment-threat-model.md). Pinned by
-  `crates/logit-proto/tests/robustness.rs`'s syslog section.

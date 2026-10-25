@@ -804,7 +804,7 @@ a string. Set both when a rewrite changes what the body is.
   vocabulary in the script's own source, never one built from event data.** This is the same
   cardinality caution `telemetry.count`'s metric name carries ("Emitting telemetry from a script"
   above): a name built from a request id or order id leaks one process-wide interner entry per
-  distinct value, forever (`docs/known-gaps/runtime.md`'s interner entry).
+  distinct value, forever ([`memory.md`](memory.md) §4).
 - `observed_timestamp` is read/write, a decimal-digit string, not a Lua number, for the same 2^53
   reason as `event.timestamp`. `0` (OTLP's "unset" convention) reads back as the string `"0"`, not
   `nil`: unlike `event.log` itself, this field has no "unset means absent" convention.
@@ -1578,8 +1578,7 @@ mechanism is at the citation, not restated here.
   `lua-runaway-script-bounds`](../adr/lua-runaway-script-bounds.md), decision 12.
 - **The interner.** Five feeders, one guarded (`telemetry`); every such string is interned for
   the life of the process, so derive names and keys from a bounded set, never from per-event data.
-  See [`known-gaps/runtime.md`](../known-gaps/runtime.md#event-model-and-interner)'s interner entry
-  for the full list.
+  See [`memory.md`](memory.md#what-feeds-it)'s "What feeds it" for the full list.
 - **Residuals.** A nonzero float under 2^-52 in magnitude reads back `0`; a `Value::Null`
   attribute/array element and an empty `Array` don't round-trip through `Event.new`
   ([ADR `lua-event-constructor`](../adr/lua-event-constructor.md)'s amendment). A table built by
