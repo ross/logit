@@ -1,6 +1,6 @@
 ---
 created: 2026-09-25
-updated: 2026-10-09
+updated: 2026-10-25
 ---
 
 # Untrusted-input bounds: one set of rules for every decoder and listener a peer can reach
@@ -145,25 +145,21 @@ defense is free, and is otherwise a documented non-goal (listed below). The deci
 
 ### Documented non-goals
 
-Each of these needs crafted input, and none has a free defense. Each is recorded in
-`docs/known-gaps/intake.md`:
+Each of these needs crafted input, and none has a free defense. [ADR
+`deployment-threat-model`](deployment-threat-model.md)'s non-goals amendment lists the first four:
 
 - **Interning a rejected batch's dictionary.** CRC-32C already rejects accidental corruption
-  before decode, so only a crafted frame interns strings from a batch that later fails ("Event
-  model and interner").
+  before decode, so only a crafted frame interns strings from a batch that later fails.
 - **Descending-key attribute-map inserts.** A native attribute map whose keys arrive in descending
-  dictionary order inserts in quadratic time ("Native wire format, `logit_in`/`logit_out`, and
-  buffering").
+  dictionary order inserts in quadratic time.
 - **OTLP/JSON peak heap under crafted tiny objects.** A body of tiny objects under an unknown key
-  peaks at about 98 bytes of heap per input byte, against about 16 for ordinary structure
-  ("OTLP").
+  peaks at about 98 bytes of heap per input byte, against about 16 for ordinary structure.
 - **Decoded sketch summaries.** `DdSketch::from_bytes` takes `count`/`min`/`max`/`sum` as
   written and `HyperLogLog::from_bytes` its harmonic sum; a wrong one skews answers without a
-  panic, and recomputing either from the bins or registers wouldn't reproduce the bytes ("Event
-  model and interner").
+  panic, and recomputing either from the bins or registers wouldn't reproduce the bytes.
 - **Compression-ratio amplification in general.** Each decompressed body is capped, but nothing
   bounds many connections each inflating a small body to its cap at once (the in-flight byte
-  budget entry under "TLS and connection lifecycle").
+  budget entry in `docs/known-gaps/intake.md`, which stays open work).
 
 ## Alternatives considered
 
@@ -181,7 +177,8 @@ Each of these needs crafted input, and none has a free defense. Each is recorded
   by default. With `idle_timeout` unset, a stalled or dribbled body is unbounded in time. With it
   set, a peer sending one byte per frame, each slightly under the bound, holds a request for up to
   `MAX_REQUEST_BYTES × idle_timeout` on an HTTP listener and `max_frame_bytes × idle_timeout` on
-  `logit_in`. Both costs are recorded in `docs/known-gaps/intake.md`.
+  `logit_in`. Both costs are stated in `docs/deploying.md`'s `idle_timeout` notes and listed in ADR
+  `deployment-threat-model`'s non-goals amendment.
 - **A lower default `max_frame_bytes`.** Declined. A relay that batches aggressively needs the
   headroom, and the per-frame decode budget scales with the configured value.
 - **A listener-wide request semaphore.** Declined. A shared count of in-flight requests lets one

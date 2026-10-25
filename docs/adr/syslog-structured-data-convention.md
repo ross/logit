@@ -1,6 +1,6 @@
 ---
 created: 2026-09-11
-updated: 2026-10-23
+updated: 2026-10-25
 ---
 
 # RFC 5424 structured-data convention: nested `syslog.sd`, strict parsing, opt-in PEN-qualified emission
@@ -224,7 +224,8 @@ at all.
     writing, since `AttrMap`/attribute iteration order is process-global intern order, not wire
     order — a relay that saw `[b@2 ..][a@1 ..]` re-emits `[a@1 ..][b@2 ..]`. A repeated
     PARAM-NAME's occurrences are emitted grouped (already grouped under one `Value::Array` by the
-    decoder), so a wire `a b a` interleaving is not preserved — see `docs/known-gaps/syslog.md`.
+    decoder), so a wire `a b a` interleaving is not preserved — see `docs/deploying.md`'s
+    `syslog_out` notes.
   - **A PARAM-VALUE's bare (non-escape) backslash is re-emitted in canonical escaped form.** RFC
     5424 section 6.3.3 declares only `\"`, `\\`, `\]` as escapes; a backslash before any other
     byte is a literal backslash followed by that byte, which `parse_param_value` keeps literally

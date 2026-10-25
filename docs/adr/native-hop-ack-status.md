@@ -172,7 +172,8 @@ trailer_bytes := (tag: u8, len: uvarint, value: [u8; len])*     -- tag 1 origin,
   `logit.component.batches.delivered`), while `logit_in` counted it
   `logit.input.batches.dropped{reason="rejected"}`. Raising the mark later wouldn't close this: a
   later forwarded frame raises it past the refused one anyway, and a mark resume never resends the
-  bytes that would be refused again. `docs/known-gaps/native-hop.md` tracks it.
+  bytes that would be refused again. The window is accepted; `docs/deploying.md`'s native-hop
+  telemetry notes state it for operators.
 
 ### 5. A `Hello` refusal is `Refused`
 

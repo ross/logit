@@ -1,6 +1,6 @@
 ---
 created: 2026-10-05
-updated: 2026-10-05
+updated: 2026-10-25
 ---
 
 # Forwarded-header parsing: one named header per component, the leftmost client, and a shared parser for the HTTP listeners and `http_access`
@@ -86,7 +86,8 @@ The operator asserts that the named header is set by their proxy. `logit` keeps 
 trusted proxy addresses and no hop count. A client that reaches the listener directly, or through a
 proxy that appends to a header the client sent, can name any address. Under ADR
 `deployment-threat-model`, that's crafted input whose defense isn't free (it needs the operator's
-proxy topology as config), so it's a documented non-goal in `docs/known-gaps/transforms.md`. Each
+proxy topology as config), so it's a documented non-goal, listed in ADR `deployment-threat-model`'s
+non-goals amendment. Each
 component's `forwarded:` field doc states the assertion, in the same words `proxy_protocol:`'s doc
 uses for reachability.
 

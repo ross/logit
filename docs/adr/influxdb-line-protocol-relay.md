@@ -1,6 +1,6 @@
 ---
 created: 2026-10-13
-updated: 2026-10-22
+updated: 2026-10-25
 ---
 
 # InfluxDB line-protocol relay: fields as typed `Gauge` records under a measurement carrier, strings as attributes, and an all-or-nothing write
@@ -213,8 +213,8 @@ drops that batch.]
 
 A producer writing through `logit` therefore never learns that its bucket doesn't exist or that a
 field changed type. An operator watches `influxdb_out`'s `batches.dropped{reason="rejected"}` and
-`logit.component.retrying` instead. `influx/w3` records this in `docs/known-gaps/influxdb.md` and in
-[`docs/deploying.md`](../deploying.md). Forwarding the destination's verdict would mean holding the
+`logit.component.retrying` instead. [`docs/deploying.md`](../deploying.md) states this for
+operators. Forwarding the destination's verdict would mean holding the
 producer's request open across the whole pipeline and every sink, which no `logit` input does.
 
 ### Listener responses

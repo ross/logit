@@ -825,7 +825,10 @@ the stage already sees, so this costs no syscall.
 A source timestamp alone isn't enough: the previous point carries the flush clock, so a re-opening
 event's source time can precede it, run ahead of the flush, or be 0, which OTLP reads as "unknown"
 and `prometheus_out` doesn't render as `_created`. The bound assumes the flush clock doesn't step
-backwards; it is `SystemTime`, which can (`docs/known-gaps/transforms.md`).
+backwards; it is `SystemTime`, which can. After a backwards step the new start can precede the
+previous point, and emitted points stop being monotonic in time; a consumer still sees a changed
+start and re-bases. A monotonic clock would need its own mapping to wall time on every emitted
+point, which nothing else in the pipeline does, so the stage stays on `SystemTime`.
 
 See `crates/logit-transforms/src/aggregate.rs`'s `SeriesKey`, `value_key_eq`, `scope_key_eq`,
 `group_for`, `fold_extreme`, and `Aggregator::flush` for the code this amendment describes, and

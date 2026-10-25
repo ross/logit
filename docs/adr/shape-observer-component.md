@@ -1,6 +1,6 @@
 ---
 created: 2026-09-20
-updated: 2026-10-21
+updated: 2026-10-25
 ---
 
 # `shape`: an observer component that turns each event into measurements of its own shape
@@ -163,3 +163,11 @@ every key or key-set it meets counts in `logit.transform.keys.untracked` or
 `logit.transform.keysets.untracked`. Validation rejects a config only when it can't run, or when it
 would lose or duplicate data the operator didn't ask to lose or duplicate; a pointless config runs
 as written. The number 58 is not reused, so the other rules keep theirs.
+
+## Amendment (2026-10-25): what a passed-through `Scope` carries
+
+Because the batch's `Scope` passes through `shape` unchanged, an `otlp_in` whose senders put
+identifying information in `Scope.attributes` passes it through the tap. That's a narrow exception
+to the counts-only property, accepted for the reason the Decision gives: a scope names an
+instrumentation library rather than carrying payload. `shape`'s flush output carries no scope at
+all, since a window spans many batches and there's no single one to keep.

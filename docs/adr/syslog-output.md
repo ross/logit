@@ -1,6 +1,6 @@
 ---
 created: 2026-09-02
-updated: 2026-10-23
+updated: 2026-10-25
 ---
 
 # Syslog egress: format, transport, and header-field precedence
@@ -135,7 +135,7 @@ message at the receiver. The encoder escapes `\n`/`\r`/NUL and every other C0 co
 transport is configured. A literal backslash is deliberately **not** escaped: the demo's message
 body is a JSON document, where a real newline inside a JSON string is already the two characters
 `\` `n` on the wire, and escaping a literal backslash would double every one of them and break
-Loki's `| json` LogQL parsing on every line. Consequence, recorded in `docs/known-gaps/syslog.md`: a
+Loki's `| json` LogQL parsing on every line. Consequence, stated in `docs/deploying.md`'s `syslog_out` notes: a
 message that already contained the literal two characters `\` `n` is indistinguishable on the wire
 from one that contained a real newline.
 

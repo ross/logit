@@ -1,6 +1,6 @@
 ---
 created: 2026-10-02
-updated: 2026-10-18
+updated: 2026-10-25
 ---
 
 # Native hop acks: a named cumulative `Ack`, coalesced at `logit_in`, and a resume mark in `HelloAck`
@@ -252,7 +252,7 @@ code accounts for it.
   case the send-window record sized `RECEIVER_MAX_WINDOW` by (1024 unread acks a peer leaves in
   the listener's send buffer) grows from about 47 KB to about 80 KB, still under the default
   `tcp_rmem`. Coalescing lowers the common case well below either. The constant stays 1024; its
-  doc and the `ack_write_stalled` reasoning in `docs/known-gaps/native-hop.md` carry the new
+  doc and the `ack_write_stalled` reasoning carry the new
   arithmetic.
 - **Known gaps.** A new residual: `Hello.senders` is capped at 16 identities, so a window
   spanning more than 16 store opens resends the rest.

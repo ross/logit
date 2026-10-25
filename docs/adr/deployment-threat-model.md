@@ -70,3 +70,68 @@ listener fit to face the internet. The bar for what a listener survives stays ac
 and an authenticated peer is held to it, not trusted further. The revisit trigger is unchanged,
 because a credential on a public endpoint doesn't defend the non-goals recorded against this ADR
 from a peer that holds one.
+
+## Amendment (2026-10-25): the non-goals are listed here, not in the known-gaps lists
+
+`docs/known-gaps/` holds only rough edges that are still open, and a non-goal this ADR decides
+isn't one. So a non-goal is recorded in an ADR or design doc, not in `docs/known-gaps/`, and this
+list replaces the decision's "recorded as a documented non-goal in `docs/known-gaps/`" and the
+consequence that each such entry cites this ADR. The revisit trigger reopens every item below.
+[`docs/deploying.md`](../deploying.md)'s "Trust boundary" section carries what an operator needs.
+
+- **The interner never frees.** A string in key or metric-name position that never repeats stays
+  for the life of the process. [`docs/design/memory.md`](../design/memory.md)'s "Interning: the
+  bargain, and its bounds" states the bargain and lists every component that feeds the interner a
+  peer's or a script's strings, among them `logit_in` interning a dictionary from a batch it then
+  rejects ([ADR `untrusted-input-bounds`](untrusted-input-bounds.md)'s "Documented non-goals").
+- **Lua-authored telemetry goes through the interner.** A script that builds a metric name or tag
+  value from event data grows it one entry per value
+  ([ADR `lua-authored-telemetry-cardinality`](lua-authored-telemetry-cardinality.md)).
+- **A Lua script has no time bound, and its residuals stand.** Interner growth from
+  script-derived strings, a shared-table DAG converting at 2^k nodes, a 128-deep value that
+  doesn't survive `otlp_out -> otlp_in`, recursion through Rust/C frames past the 8 MiB stack, an
+  `Event.new` loop that discards what it builds, and `max_memory` counting the Lua heap only
+  ([ADR `lua-runaway-script-bounds`](lua-runaway-script-bounds.md)'s decision 3 and
+  Consequences), and not the machine code `jit: true` compiles, up to 512 KB per VM
+  ([ADR `lua-jit-opt-in`](lua-jit-opt-in.md)). `docs/design/lua-api.md`'s "Limits and costs" is
+  the operator's account.
+- **A stalled or dribbled body holds its connection permit.** A body read's only time bound is a
+  per-frame stall bound, and that bound is the listener's `idle_timeout`, off by default
+  ([ADR `untrusted-input-bounds`](untrusted-input-bounds.md)'s "A total body deadline";
+  [ADR `idle-connection-timeout`](idle-connection-timeout.md)'s 2026-09-25 amendment). With enough
+  connections, such a peer holds the whole `max_connections` cap. If the trigger fires, the
+  candidates are a total deadline, a minimum transfer rate, or a per-peer connection cap, each
+  worth its false positives only on an untrusted network.
+- **A native attribute map with keys in descending dictionary order inserts in quadratic time.**
+  `read_attr_map` inserts each key into `AttrMap`'s sorted storage as it reads it. Measured:
+  80,000 keys take 3.4 s in descending order against 20 ms ascending, and real maps are far too
+  small to show it. The fix, collecting the keys and sorting once, changes the ordinary decode
+  path for a shape only crafted input produces
+  ([ADR `untrusted-input-bounds`](untrusted-input-bounds.md)'s "Documented non-goals").
+- **An OTLP/JSON body of crafted tiny objects peaks at about 98 bytes of heap per input byte.**
+  Ordinary OTLP/JSON peaks at about 19, and the same batch as protobuf at about 17, because the
+  JSON path builds a `serde_json::Value` tree first. At 4 MiB the crafted shape is about 400 MiB
+  for one request. `crates/logit-proto/tests/robustness.rs`'s
+  `otlp_json_peak_memory_per_input_byte_is_documented` pins ceilings of 24 and 128, and no cap or
+  streaming parser is built
+  ([ADR `untrusted-input-bounds`](untrusted-input-bounds.md)'s "Documented non-goals").
+- **A decoded sketch's or HyperLogLog's summary fields are taken as written.** `from_bytes`
+  bounds what a blob can allocate and rejects a zero-register count past the register count, and
+  trusts the rest. None of these panics: a `DdSketch` with `min > max` answers non-monotonic
+  quantiles; an infinite or `NaN` `min` or `max` lets a quantile answer `±∞`; `merge` skips a
+  sketch whose count and zero count are both 0 over populated bins, without a counter; and a
+  `HyperLogLog` with a wrong harmonic sum estimates wrong. No encoder `logit` ships writes any of
+  these, and recomputing a summary on decode wouldn't reproduce the bytes
+  ([ADR `untrusted-input-bounds`](untrusted-input-bounds.md)'s "Documented non-goals").
+- **No cap on syslog STRUCTURED-DATA elements or PARAMs per line.** `parse_structured_data` reads
+  a line, bounded by the 64 KiB frame cap or the datagram, in one forward pass, but folding names
+  into `AttrMap`'s sorted map is quadratic in distinct names arriving in an order the interner
+  hasn't seen: a 64 KiB line of about 10,000 distinct SD-IDs costs about 17 ms in a release
+  build. No real sender writes that many, so a count cap would stop only crafted input.
+  `crates/logit-proto/tests/robustness.rs`'s syslog section pins it.
+- **`forwarded:` trusts the header it names.** A client that reaches a listener or a web server
+  past the proxy, or through a proxy that appends to its header, can name any address as
+  `client.address` ([ADR `forwarded-header-parsing`](forwarded-header-parsing.md)). If the trigger
+  fires, the fix is a list of trusted proxy addresses with the rightmost untrusted entry taken as
+  the client. `proxy_protocol:`'s missing allowlist of trusted PROXY sources isn't part of this
+  non-goal: it's deferred work in `docs/known-gaps/intake.md`.

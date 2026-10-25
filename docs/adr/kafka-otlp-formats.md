@@ -1,6 +1,6 @@
 ---
 created: 2026-10-12
-updated: 2026-10-13
+updated: 2026-10-25
 ---
 
 # `kafka_out` OTLP formats: one export request per signal per record, a topic per signal, and a producer per topic behind a multi-topic facade
@@ -258,7 +258,7 @@ on both brokers; with `sticky_key` and the `murmur2` hasher it placed all 16 on 
   multi-topic producer replaces the facade's internals.
 - A refused signal topic holds every signal in the sink. Operators who need signals isolated run a
   sink per signal.
-- Known gaps, recorded in `docs/known-gaps/kafka.md` as the stream lands:
+- Limits an operator needs, stated in `docs/deploying.md`'s `kafka_out` section:
   - No `otelcol.signal` header. A consumer that tells signals apart by that header, rather than by
     topic, can't use `topic:` with several signals.
   - No byte parity with the exporter's `partition_*_by_resource_attributes` keys, so a `logit`

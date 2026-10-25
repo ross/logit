@@ -1,6 +1,6 @@
 ---
 created: 2026-08-29
-updated: 2026-10-21
+updated: 2026-10-25
 ---
 
 # Secrets in config: a general `!env` YAML tag, not per-field `*_env` indirection
@@ -113,13 +113,13 @@ uniformly to all three rather than needing to be threaded through three call sit
   env-specific field will exist in config at all.
 - `!env` is invisible to `schema/logit.schema.json`: resolution happens before serde, so the
   schema describes the *substituted* shape, not the tag. A schema-aware YAML editor will flag a
-  `!env`-tagged value it can't resolve against the schema. Documented in
-  `docs/known-gaps/runtime.md`.
+  `!env`-tagged value it can't resolve against the schema. Documented for operators in
+  `docs/deploying.md`.
 - Config deserialization errors lose line/column information: `serde_norway::from_value` (needed
   to deserialize the already-resolved tree) has no source location the way
   `serde_norway::from_str` does. Partly offset by `!env`'s own errors carrying a config path
   (`components.influx_out.token`), and by the note appended when a substitution's resolved type
-  likely caused the failure. Documented in `docs/known-gaps/runtime.md`.
+  likely caused the failure. Documented for operators in `docs/deploying.md`.
 - `crates/logit-pipeline/src/graph.rs` rule 8 (`is_implemented`) Debug-prints a whole
   `ComponentKind` on failure (`"kind {:?} is not implemented yet"`). Harmless today — no
   *unimplemented* kind carries a secret field — but with secrets inlined directly into fields
