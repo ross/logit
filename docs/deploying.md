@@ -928,7 +928,7 @@ An error the sink attaches no fault to is treated as `Rejected`.
 
 The status-only default for HTTP sinks is the `classify_status` table in
 [`crates/logit-outputs/src/http.rs`](../crates/logit-outputs/src/http.rs): `401`, `403`, `404`,
-`405`, `407`, and `501` are `Refused`; `429` and `5xx` are `Ambiguous`; other `4xx` and every
+`405`, `407`, and `501` are `Refused`; `408`, `429`, and `5xx` are `Ambiguous`; other `4xx` and every
 `3xx` are `Rejected`; a connect or DNS failure is `Clean`; a request timeout is `Ambiguous`. Each
 sink refines it from what its destination documents, in a table in its module doc that cites the
 evidence for every row:
@@ -4047,8 +4047,8 @@ Native histograms are skipped and counted on both wires regardless of version
   means the `max_connections` cap is binding.
 - Sender: `logit.output.requests{class}`, `logit.output.request.duration`, `logit.output.samples`.
   A `4xx` other than `401`, `403`, `404`, `405`, `407`, and `415`, or a `400` naming a failed
-  decompression (which hold the batch and retry it), and other than `429` (ambiguous, retried
-  under `at_least_once`), is `rejected` and the batch is dropped; the
+  decompression (which hold the batch and retry it), and other than `408` and `429` (ambiguous,
+  retried under `at_least_once`), is `rejected` and the batch is dropped; the
   throttled `remote_write_rejected` diagnostic
   quotes the receiver's message, which for Prometheus and Mimir names the offending series. A `3xx`
   means the endpoint is redirecting; this client deliberately doesn't follow redirects.
@@ -4219,11 +4219,11 @@ for the gap that leaves, which `otlp_in.idle_timeout` (off by default) closes: s
 ["`idle_timeout` on a TCP listener"](#idle_timeout-on-a-tcp-listener) above, including the note on
 a request that starts right at the idle deadline.
 
-**`tls.insecure_skip_verify`** (`otlp_out` only) disables server-certificate verification: the
-connection is still encrypted, but any certificate is accepted. `logit` logs a startup warning
-whenever it's set. Use it only for a throwaway or pre-production endpoint, not a real deployment.
-Validation rejects it together with `ca_file`, because a specific trusted CA and "trust nothing"
-contradict each other.
+**`tls.insecure_skip_verify`** disables server-certificate verification. Every client `tls:` block
+honors it, as does `prometheus_in`'s `scrape_tls:`. The connection is still encrypted, but any
+certificate is accepted. `logit` logs a startup warning whenever it's set. Use it only for a
+throwaway or pre-production endpoint, not a real deployment. Validation rejects it together with
+`ca_file`, because a specific trusted CA and "trust nothing" contradict each other.
 
 **What to watch.** A handshake failure on either side surfaces through the same
 `connection_error`/`network_error` diagnostics and `logit.output.requests{class="network_error"}`/
@@ -4382,7 +4382,7 @@ components:
 ```
 
 For mutual TLS, add `cert_file`/`key_file` together to `syslog_out`'s `tls:` block, as in
-`otlp_out`'s mutual TLS example above. `tls.insecure_skip_verify` (`syslog_out` only) behaves
+`otlp_out`'s mutual TLS example above. `tls.insecure_skip_verify` behaves
 identically too, including the rejection alongside `ca_file`. As for `statsd_out`, the TLS server
 name is `endpoint:`'s host, and a host that isn't an IP literal or a DNS name fails startup.
 

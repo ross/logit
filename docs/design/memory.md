@@ -1262,11 +1262,16 @@ holds under either allocator. Timings don't.
 
 Neither of these runs in CI; both are for a specific investigation.
 
-**jemalloc's own heap profiler** — available on the shipped binary, no rebuild:
+**jemalloc's own heap profiler**, which the shipped binary can't run: its jemalloc is built
+without `--enable-prof`, and a `prof:true` setting is ignored. Build with the `profiling` feature
+of `tikv-jemallocator`, and set the option through `_RJEM_MALLOC_CONF`, because the crate builds
+jemalloc with the `_rjem_` symbol prefix and so reads that variable, not `MALLOC_CONF`:
 
 ```
-MALLOC_CONF=prof:true,prof_prefix:/tmp/jeprof,lg_prof_interval:30 logit run config.yaml
-jeprof --show_bytes --pdf $(which logit) /tmp/jeprof.*.heap > heap.pdf
+cargo build --profile profiling -p logit-cli --features tikv-jemallocator/profiling
+_RJEM_MALLOC_CONF=prof:true,prof_prefix:/tmp/jeprof,lg_prof_interval:30 \
+    target/profiling/logit run config.yaml
+jeprof --show_bytes --pdf target/profiling/logit /tmp/jeprof.*.heap > heap.pdf
 ```
 
 **heaptrack**, for a full allocation trace with call stacks — heavier, better for "what is

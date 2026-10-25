@@ -132,7 +132,8 @@
 //! (`docs/adr/buffered-sink-delivery.md`); this sink classifies the outcome with
 //! `.context(fault)`. Both remote-write specifications define a `4xx` other than `429` as a write
 //! that "will never be able to succeed" and a `5xx` as one to retry; the rows below refine that
-//! where the receiver's answer is about the sink's config rather than the batch
+//! where the receiver's answer is about the sink's config rather than the batch, and for a `408`,
+//! a proxy giving up on the request's arrival, which a resend can beat
 //! (`remote_write_fault`, falling through to [`crate::http::classify_status`]):
 //!
 //! | Response | Class | Why | Evidence |
@@ -146,6 +147,7 @@
 //! | `409` (Thanos receive's conflict: an out-of-order or duplicate sample) | `Rejected` | about the samples, as a `400` is | Thanos's [`receive/handler.go`][thanos-handler] |
 //! | `413` (Thanos receive's request limits, `client_golang`'s size limit) | `Rejected` | "should not be retried without modifications"; a smaller batch would land | [Thanos receive][thanos-receive] |
 //! | `415` | `Refused` | "Receivers MUST return 415 ... if they don't support a given content type or encoding": the sink's `version:` or `compression:` is wrong for this receiver, the same for every batch | [2.0 spec][rw2], `client_golang`'s [`remote_api.go`][cg-remote] |
+//! | `408` | `Ambiguous` | the receiver or a proxy in front of it (nginx `client_body_timeout`, HAProxy `timeout http-request`) gave up waiting for the request to arrive, and RFC 9110 lets a client repeat it. The sink departs from the specifications, which count every `4xx` but `429` as never able to succeed: under `Rejected` a transient proxy timeout would drop the batch. A `408` that repeats every attempt holds the queue | [RFC 9110, 15.5.9](https://www.rfc-editor.org/rfc/rfc9110#name-408-request-timeout), [`crate::http::classify_status`] |
 //! | any other `3xx` or `4xx` | `Rejected` | "MUST NOT retry"; redirects are off ([`crate::http::build_client`]) | [1.0 spec][rw1] |
 //! | `429` (Mimir's `err-mimir-tenant-max-ingestion-rate`) | `Ambiguous` | "They MAY retry on HTTP 429 responses" | [1.0 spec][rw1], Mimir's [`distributor/errors.go`][mimir-errors] |
 //! | any `5xx` | `Ambiguous` | "MUST retry write requests on HTTP 5xx responses"; may have been partly applied | [1.0 spec][rw1] |
@@ -2834,6 +2836,12 @@ mod tests {
         assert_eq!(written_counts(&headers), " (the receiver wrote 3 samples, 0 exemplars)");
         assert_eq!(written_counts(&HeaderMap::new()), "");
         assert_eq!(remote_write_fault(StatusCode::BAD_REQUEST, "bad sample"), Fault::Rejected);
+    }
+
+    /// A `408` is a proxy giving up on the request's arrival, so a resend can land.
+    #[test]
+    fn a_408_request_timeout_is_ambiguous() {
+        assert_eq!(remote_write_fault(StatusCode::REQUEST_TIMEOUT, ""), Fault::Ambiguous);
     }
 
     /// Under zstd, a `415` or `400` names the remedy; a Snappy sender's `415`, and a zstd

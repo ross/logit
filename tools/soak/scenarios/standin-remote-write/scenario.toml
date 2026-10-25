@@ -9,11 +9,11 @@
 
 name = "standin-remote-write"
 description = "statsd-vm into prometheus_out RW1 Snappy, against a stand-in answering every row of the sink's response-class table in turn"
-duration = "35m40s"        # warmup + one cycle + cooldown
+duration = "37m25s"        # warmup + one cycle + cooldown
 warmup = "60s"
 cooldown = "60s"          # >= recovery_bound
 recovery_bound = "45s"    # retry_max_delay 10s + two aggregate windows + a drain
-cycle = "33m40s"           # the last step, its recovery, and two progress windows
+cycle = "35m25s"           # the last step, its recovery, and two progress windows
 
 [configs]
 sut = "logit-sut.yaml"
@@ -195,6 +195,14 @@ on = "standin"
 class = "clean"
 for = "20s"
 
+[[step]]                  # c0s20: 408, a request timeout: retried
+at = "33m15s"
+action = "respond"
+on = "standin"
+status = 408
+class = "ambiguous"
+for = "20s"
+
 # One expectation per class, beside ledger.standin's check of every step.
 [[expect]]
 name = "ambiguous-retries"
@@ -256,3 +264,13 @@ step = "c0s19"
 window = "after"
 reduce = "last"
 max = 0
+
+[[expect]]
+name = "request-timeout-retries"
+service = "logit"
+metric = "logit.component.retries"
+component = "remote_write"
+step = "c0s20"
+window = "during"
+reduce = "delta"
+min = 1
