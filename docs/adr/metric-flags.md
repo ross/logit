@@ -125,8 +125,8 @@ a non-finite delta `Sum`, `Gauge`, or `GaugeDelta` (`non_finite`). After this ch
 - **A flags byte on `Event`.** `Event` is 864 bytes with no padding
   (`crates/logit-core/tests/type_sizes.rs`), so a byte costs 8 per event and a measurement per
   signal class under [ADR `event-sizing-and-allocation-strategy`](event-sizing-and-allocation-strategy.md).
-  It is the fallback if the perf VM shows the one attribute lookup per event is expensive, not
-  the first form.
+  It is the fallback if the perf VM shows the two attribute lookups per event
+  (`_logit.metrics.closed` and `_logit.metrics.fields`) are expensive, not the first form.
 
 ## Consequences
 

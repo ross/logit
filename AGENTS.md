@@ -55,6 +55,19 @@ exists or a contract other `logit` processes depend on:
   makes must have one. `prometheus_out`'s, `datadog_out`'s, and `influxdb_out`'s tables are also
   restated as cued steps in the `standin-*` soak scenarios under `tools/soak/scenarios/`, and a
   change to any of them updates those scenarios' steps in the same PR.
+- **A sink counts encode-side outcomes only through its gated handles.** `write_loop` calls
+  `Output::send` once per attempt and every sink re-encodes on each, so a degraded, omitted, or
+  dropped record counted from an encode is counted again on every retry and every bisection
+  re-encode unless it goes through handles built with `Telemetry::gated`/`Diagnostics::gated`
+  over a `BatchAccounting`'s `CountGate` (`crates/logit-outputs/src/accounting.rs`). Only the
+  transport counters and a drop the destination's verdict decides stay on ungated handles
+  ([ADR `sink-send-path-and-attempt-accounting`](docs/adr/sink-send-path-and-attempt-accounting.md),
+  decisions 1 and 2).
+- **An `Output` that wraps another `Output` forwards `observe_batch`**, and `observe_posture` with
+  it. The trait's defaults are no-ops, so a wrapper that forwards `send` alone leaves the inner
+  sink's gate unarmed on every batch (and `logit_out` without its sender sequence), and a test
+  that drives the inner sink directly still passes. `PrometheusOutput` was such a wrapper (same
+  ADR, decision 14).
 - **Any nonzero `*.dropped` is loss someone should look into**, and it's always tagged `reason`.
   An outcome the config asked for never uses the word: it's `events.discarded`, `*.omitted`,
   `*.skipped`, `*.evicted`, or `input.batches.deferred`. A loss reported only by a diagnostic gets
