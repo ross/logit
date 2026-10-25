@@ -19,15 +19,17 @@ Entry format and the other areas: [the known-gaps index](README.md).
 - **No OTLP passthrough codec.** Whether the native protocol should carry OTLP-encoded payloads
   unmodified, so a relay forwards OTLP without re-encoding it into native, is undecided and
   undesigned; see [`design/wire-protocol.md`](../design/wire-protocol.md)'s "Open question".
-- **`logit_in`'s, `internal`'s, and the six HTTP listeners' shutdown grace is fixed at 5s, not
-  operator-tunable.** Graph rule 17 rejects a `receive:` block on all eight (`otlp_in`,
-  `datadog_in`, `datadog_trace_in`, `splunk_hec_in`, `influxdb_in`, and `prometheus_in`'s
-  remote-write receiver are the six), because none is a datagram, stream, or tail listener, so each always gets
-  `ReceiveConfig::default().shutdown_grace`. `LogitInput` uses it to close connections cleanly,
-  the HTTP listeners as the deadline at which `run_input` aborts any connection still open, and
-  `InternalInput` for its final drain of buffered self-telemetry
-  (`crates/logit-inputs/src/internal.rs`). It's a gap if a deployment needs a different number;
-  no `receive:`-shaped knob exists.
+- **`internal`'s and the six HTTP listeners' shutdown grace is fixed at 5s, not operator-tunable.**
+  Graph rule 17 rejects a `receive:` block on both and on `logit_in` (`otlp_in`, `datadog_in`,
+  `datadog_trace_in`, `splunk_hec_in`, `influxdb_in`, and `prometheus_in`'s remote-write receiver
+  are the six), because none is a datagram, stream, or tail listener, so each always gets
+  `ReceiveConfig::default().shutdown_grace`. The HTTP listeners use it as the deadline at which
+  `run_input` aborts any connection still open, and `InternalInput` for its final drain of
+  buffered self-telemetry (`crates/logit-inputs/src/internal.rs`). It's a gap if a deployment
+  needs a different number; no `receive:`-shaped knob exists. `logit_in` gets the same default
+  but doesn't use it: its accept loop returns when shutdown fires, and each connection, a task of
+  its own, answers `GOING_AWAY` and closes at the next frame boundary (see the module doc of
+  `crates/logit-inputs/src/logit.rs`, "Shutdown").
 - **`otlp_in`'s TLS-arm `handshake_timeout` bounds the TLS accept and nothing after it.** `hyper`'s
   `hyper_util::server::conn::auto::Builder` reads the first bytes itself to tell HTTP/1.1 from an
   h2 preface, a read `crate::otlp` can't wrap without reimplementing that sniff. The plaintext arm
@@ -93,6 +95,15 @@ Entry format and the other areas: [the known-gaps index](README.md).
   last cursor persist (every `checkpoint_interval`) whose bytes the power loss tore. A
   `disk.sync: every_push` knob that closes the window at a throughput cost is a plausible
   follow-up, not built.
+- **A disk-backed sink's shutdown `fsync`s have no bound.** `DiskQueue::finish` runs after the
+  shutdown grace has expired and waits for the persist worker, flushes and `fsync`s the active
+  segment, then `fsync`s the spool directory, with no timeout on any of them
+  (`crates/logit-pipeline/src/disk_queue.rs`; `finish_and_flush` in
+  `crates/logit-pipeline/src/runtime.rs` adds none). On a slow or stalled disk the process
+  outlives the grace by that long. Skipping the remaining `fsync`s after a bound would be safe:
+  a stale cursor costs duplicates on the next open, and the spool keeps what it wrote.
+  - **Revisit trigger:** a shutdown that runs past the grace on a slow disk, such as on the perf
+    VM.
 - **No spool sharing, compaction, or encryption for the disk-backed sink buffer.** Each sink gets
   one spool directory. Nothing rewrites written segments to reclaim space early: a segment is
   deleted whole once the read cursor crosses it. Nothing encrypts at rest. None of these blocks the
