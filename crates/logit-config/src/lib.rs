@@ -3553,10 +3553,9 @@ pub enum ComponentKind {
         /// `buffer.delivery: at_least_once` and dropped under `at_most_once`. Keep it above the
         /// interval between this sink's batches if the connection should be reused; a sink that
         /// sends less often opens a new connection, with its handshake, for each batch. Defaults
-        /// to `30s`, below the 60 s or longer idle timeout of most destinations
-        /// (`docs/deploying.md`, "Sink delivery buffering"); lower it for a destination that
-        /// closes sooner, such as a Node.js, Apache, or uvicorn server at its 5 s default. `0s`
-        /// never reuses an idle connection: every request opens its own.
+        /// to `30s`: most destinations keep an idle connection at least 60 s. Lower it for a
+        /// destination that closes sooner, such as a Node.js, Apache, or uvicorn server at its
+        /// 5 s default. `0s` never reuses an idle connection: every request opens its own.
         #[serde(default = "default_sink_idle_timeout", with = "humantime_serde_duration")]
         #[schemars(with = "String")]
         idle_timeout: Duration,
@@ -3609,10 +3608,9 @@ pub enum ComponentKind {
         /// `buffer.delivery: at_least_once` and dropped under `at_most_once`. Keep it above the
         /// interval between this sink's batches if the connection should be reused; a sink that
         /// sends less often opens a new connection, with its handshake, for each batch. Defaults
-        /// to `30s`, below the 60 s or longer idle timeout of most destinations
-        /// (`docs/deploying.md`, "Sink delivery buffering"); lower it for a destination that
-        /// closes sooner, such as a Node.js, Apache, or uvicorn server at its 5 s default. `0s`
-        /// never reuses an idle connection: every request opens its own.
+        /// to `30s`: most destinations keep an idle connection at least 60 s. Lower it for a
+        /// destination that closes sooner, such as a Node.js, Apache, or uvicorn server at its
+        /// 5 s default. `0s` never reuses an idle connection: every request opens its own.
         ///
         /// Applies to both `protocol`s.
         #[serde(default = "default_sink_idle_timeout", with = "humantime_serde_duration")]
@@ -3696,10 +3694,9 @@ pub enum ComponentKind {
         /// `buffer.delivery: at_least_once` and dropped under `at_most_once`. Keep it above the
         /// interval between this sink's batches if the connection should be reused; a sink that
         /// sends less often opens a new connection, with its handshake, for each batch. Defaults
-        /// to `30s`, below the 60 s or longer idle timeout of most destinations
-        /// (`docs/deploying.md`, "Sink delivery buffering"); lower it for a destination that
-        /// closes sooner, such as a Node.js, Apache, or uvicorn server at its 5 s default. `0s`
-        /// never reuses an idle connection: every request opens its own.
+        /// to `30s`: most destinations keep an idle connection at least 60 s. Lower it for a
+        /// destination that closes sooner, such as a Node.js, Apache, or uvicorn server at its
+        /// 5 s default. `0s` never reuses an idle connection: every request opens its own.
         #[serde(default = "default_sink_idle_timeout", with = "humantime_serde_duration")]
         #[schemars(with = "String")]
         idle_timeout: Duration,
@@ -3762,10 +3759,9 @@ pub enum ComponentKind {
         /// `buffer.delivery: at_least_once` and dropped under `at_most_once`. Keep it above the
         /// interval between this sink's batches if the connection should be reused; a sink that
         /// sends less often opens a new connection, with its handshake, for each batch. Defaults
-        /// to `30s`, below the 60 s or longer idle timeout of most destinations
-        /// (`docs/deploying.md`, "Sink delivery buffering"); lower it for a destination that
-        /// closes sooner, such as a Node.js, Apache, or uvicorn server at its 5 s default. `0s`
-        /// never reuses an idle connection: every request opens its own.
+        /// to `30s`: most destinations keep an idle connection at least 60 s. Lower it for a
+        /// destination that closes sooner, such as a Node.js, Apache, or uvicorn server at its
+        /// 5 s default. `0s` never reuses an idle connection: every request opens its own.
         ///
         /// Applies to the `socket` connection too.
         #[serde(default = "default_sink_idle_timeout", with = "humantime_serde_duration")]
@@ -3851,10 +3847,9 @@ pub enum ComponentKind {
         /// `buffer.delivery: at_least_once` and dropped under `at_most_once`. Keep it above the
         /// interval between this sink's batches if the connection should be reused; a sink that
         /// sends less often opens a new connection, with its handshake, for each batch. Defaults
-        /// to `30s`, below the 60 s or longer idle timeout of most destinations
-        /// (`docs/deploying.md`, "Sink delivery buffering"); lower it for a destination that
-        /// closes sooner, such as a Node.js, Apache, or uvicorn server at its 5 s default. `0s`
-        /// never reuses an idle connection: every request opens its own.
+        /// to `30s`: most destinations keep an idle connection at least 60 s. Lower it for a
+        /// destination that closes sooner, such as a Node.js, Apache, or uvicorn server at its
+        /// 5 s default. `0s` never reuses an idle connection: every request opens its own.
         #[serde(default = "default_sink_idle_timeout", with = "humantime_serde_duration")]
         #[schemars(with = "String")]
         idle_timeout: Duration,
@@ -4560,10 +4555,9 @@ pub enum ComponentKind {
         /// `buffer.delivery: at_least_once` and dropped under `at_most_once`. Keep it above the
         /// interval between this sink's batches if the connection should be reused; a sink that
         /// sends less often opens a new connection, with its handshake, for each batch. Defaults
-        /// to `30s`, below the 60 s or longer idle timeout of most destinations
-        /// (`docs/deploying.md`, "Sink delivery buffering"); lower it for a destination that
-        /// closes sooner, such as a Node.js, Apache, or uvicorn server at its 5 s default. `0s`
-        /// never reuses an idle connection: every request opens its own. Sender mode only.
+        /// to `30s`: most destinations keep an idle connection at least 60 s. Lower it for a
+        /// destination that closes sooner, such as a Node.js, Apache, or uvicorn server at its
+        /// 5 s default. `0s` never reuses an idle connection: every request opens its own. Sender mode only.
         #[serde(default = "default_sink_idle_timeout", with = "humantime_serde_duration")]
         #[schemars(with = "String")]
         idle_timeout: Duration,

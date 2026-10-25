@@ -138,7 +138,8 @@ Non-goals:
 - **Tests** in `crates/logit-outputs/src/http.rs` against `held::Mux`, which counts closed
   connections: a 200 ms `idle_timeout` closes an idle connection and the next request opens
   another; the default keeps it; `0s` opens one per request; the `hyper_util` pool closes one
-  too. Each fails with the settings removed.
+  too. The three closing tests fail with the settings removed; the reuse test pins the
+  default.
 - **Soak.** `standin-concurrency` drops its 120 s stand-in override and sets the sink's
   `idle_timeout: 1s` under the stand-in's 5 s close, so its one ambiguous drop is the cued reset.
   `otlp-concurrency-tls` sets `otlp_in`'s `idle_timeout: 4s` under the generator's 30 s default

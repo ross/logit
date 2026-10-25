@@ -227,13 +227,15 @@ them.
   rejects a non-default value, as graph rule 56 rejects `concurrency`). A pooled connection idle
   longer than this is closed instead of reused. `0s` keeps no idle connection, so every request
   opens its own. `crate::http::client_builder` applies it as `reqwest`'s `pool_idle_timeout`, or
-  `pool_max_idle_per_host(0)` at `0s`; `http::hyper_client_builder` applies the same settings,
-  with a timer, to `otlp_out`'s gRPC pool and `datadog_trace_out`'s Unix-socket pool.
+  `pool_max_idle_per_host(0)` at `0s`; `http::hyper_client_builder` applies the same settings
+  to `otlp_out`'s gRPC pool and `datadog_trace_out`'s Unix-socket pool. A `hyper-util` pool with
+  no pool timer drops an expired connection only at the next checkout, so its socket would stay
+  open; the builder sets `TokioTimer` for that reason.
 - **Default `30s`.** Two bounds decide it. Below the destination's keep-alive idle timeout, by
   more than a round trip, so the sink closes first; above the interval between a sink's batches,
   so a sink flushing on a 10 s or 15 s `aggregate` window reuses its connection instead of
-  redialing, handshake included, per batch. 30 s sits under every common destination below and
-  above both cadences. A destination that closes at 5 s is the case for lowering it, and the
+  redialing, handshake included, per batch. 30 s sits under every destination below except the
+  three 5 s servers, and above both cadences. A destination that closes at 5 s is the case for lowering it, and the
   field's doc says so.
 
   | Destination | Keep-alive idle timeout, by default |
@@ -242,13 +244,14 @@ them.
   | Apache httpd (`KeepAliveTimeout`) | 5 s |
   | uvicorn (`--timeout-keep-alive`) | 5 s |
   | VictoriaMetrics (`-http.idleConnTimeout`) | 60 s |
-  | OpenTelemetry Collector, `otlphttp` receiver (`idle_timeout`) | 60 s |
+  | OpenTelemetry Collector, `otlp` receiver over HTTP (`protocols.http.idle_timeout`) | 60 s |
   | AWS Application Load Balancer (`idle_timeout.timeout_seconds`) | 60 s |
   | nginx (`keepalive_timeout`) | 75 s |
   | Grafana Mimir (`-server.http-idle-timeout`) | 120 s |
   | InfluxDB 2.x (`http-idle-timeout`) | 180 s |
 
-  This table is the one copy; `docs/deploying.md` and the field's doc point here.
+  This table is the one copy; `docs/deploying.md` points here, and the field's doc points at
+  `docs/deploying.md`.
 - **What's left.** A destination that closes a kept-alive connection for any other reason (a
   restart, a per-connection request cap, an idle timeout below `idle_timeout:`) still races a
   write; `docs/known-gaps/sinks.md`'s "A kept-alive connection a destination closed first reads as
