@@ -212,6 +212,62 @@ measured at 1 and 8, the `otlp-fan-out` scenario at 8, and a stand-in scenario c
 head, a rejected slot, and an ambiguous slot while other slots are in flight. The plan names
 them.
 
+### 7. Idle pooled connections close first (2026-10-25)
+
+- **The race.** Above `concurrency: 1` a sink's pool keeps spare connections idle between
+  bursts. A destination that closes an idle connection sooner than the pool does can receive a
+  write on it after the close: the sink wrote it before the close reached it. The destination
+  resets the connection, and the sink reads `Ambiguous` ("connection closed before message
+  completed"), which `at_most_once` drops and `at_least_once` resends. A delay on the link widens
+  the window to the delay. The plan's W5 `standin-concurrency` run measured it: under a 1 s
+  delay, a stand-in closing idle connections at 5 s reset 12 writes no fault caused in about
+  2,300 batches, against the pool's 90 s default.
+- **The field.** `idle_timeout: Duration` on `influxdb_out`, `otlp_out`, `datadog_out`,
+  `datadog_trace_out`, `splunk_hec_out`, and `prometheus_out` (remote-write mode; exposition mode
+  rejects a non-default value, as graph rule 56 rejects `concurrency`). A pooled connection idle
+  longer than this is closed instead of reused. `0s` keeps no idle connection, so every request
+  opens its own. `crate::http::client_builder` applies it as `reqwest`'s `pool_idle_timeout`, or
+  `pool_max_idle_per_host(0)` at `0s`; `http::hyper_client_builder` applies the same settings,
+  with a timer, to `otlp_out`'s gRPC pool and `datadog_trace_out`'s Unix-socket pool.
+- **Default `30s`.** Two bounds decide it. Below the destination's keep-alive idle timeout, by
+  more than a round trip, so the sink closes first; above the interval between a sink's batches,
+  so a sink flushing on a 10 s or 15 s `aggregate` window reuses its connection instead of
+  redialing, handshake included, per batch. 30 s sits under every common destination below and
+  above both cadences. A destination that closes at 5 s is the case for lowering it, and the
+  field's doc says so.
+
+  | Destination | Keep-alive idle timeout, by default |
+  |---|---|
+  | Node.js `http.Server` (`keepAliveTimeout`) | 5 s |
+  | Apache httpd (`KeepAliveTimeout`) | 5 s |
+  | uvicorn (`--timeout-keep-alive`) | 5 s |
+  | VictoriaMetrics (`-http.idleConnTimeout`) | 60 s |
+  | OpenTelemetry Collector, `otlphttp` receiver (`idle_timeout`) | 60 s |
+  | AWS Application Load Balancer (`idle_timeout.timeout_seconds`) | 60 s |
+  | nginx (`keepalive_timeout`) | 75 s |
+  | Grafana Mimir (`-server.http-idle-timeout`) | 120 s |
+  | InfluxDB 2.x (`http-idle-timeout`) | 180 s |
+
+  This table is the one copy; `docs/deploying.md` and the field's doc point here.
+- **What's left.** A destination that closes a kept-alive connection for any other reason (a
+  restart, a per-connection request cap, an idle timeout below `idle_timeout:`) still races a
+  write; `docs/known-gaps/sinks.md`'s "A kept-alive connection a destination closed first reads as
+  `Ambiguous`" keeps that residual.
+- **h2's `GOAWAY` is the other mitigation.** A server closing an idle h2 connection sends
+  `GOAWAY` naming the last stream it processed, so the client knows which requests the server
+  never saw. `reqwest` 0.12 resends a request a graceful `GOAWAY` (`NO_ERROR`) or a
+  `REFUSED_STREAM` turned away on a new connection, and `hyper-util`'s pool resends one it
+  hadn't started on a reused connection that closed, so neither reaches the sink as a fault. The
+  `otlp-concurrency-tls` soak scenario pauses its generator past the listener's `idle_timeout:`
+  to exercise that path. HTTP/1.1 has no such signal for a request already written, which is
+  why the field is the remedy there.
+- **Rejected: resend a write that met a reused connection's close before any byte came back.**
+  Chromium resends a request that failed on a reused connection with zero bytes received, since
+  the server can't have answered it. `reqwest` doesn't expose whether a failed request's
+  connection was reused, so the sink can't apply the rule; owning connections through `hyper`
+  directly to learn it is a stream of its own. The rule also still resends a request the server
+  may have applied before closing, which `at_most_once` forbids.
+
 ## Alternatives considered
 
 - **Concurrency inside each sink's `send`.** A sink could run its own requests for several
@@ -265,3 +321,6 @@ them.
   flight on the closed connection.
 - **Measurement.** The plan's "Findings" records the soak numbers at 1 and 8, for the operator
   docs' guidance on raising the field.
+- **Idle connections.** Decision 7's `idle_timeout:` on the six sinks, its graph rule 56 check,
+  and the two soak scenarios that exercise it; `docs/known-gaps/sinks.md`'s idle-connection
+  entry narrows to the residual.
