@@ -2931,7 +2931,7 @@
               ]
             },
             "idle_timeout": {
-              "description": "How long a pooled connection may sit idle before this sink closes it instead of reusing it. Keep it below the destination's keep-alive idle timeout, so this sink closes an idle connection before the destination does: a write sent on a connection the destination has already closed has an unknown outcome, resent under `buffer.delivery: at_least_once` and dropped under `at_most_once`. Keep it above the interval between this sink's batches if the connection should be reused; a sink that sends less often opens a new connection, with its handshake, for each batch. Defaults to `30s`, below the 60 s or longer idle timeout of most destinations (`docs/deploying.md`, \"Sink delivery buffering\"); lower it for a destination that closes sooner, such as a Node.js, Apache, or uvicorn server at its 5 s default. `0s` never reuses an idle connection: every request opens its own.",
+              "description": "How long a pooled connection may sit idle before this sink closes it instead of reusing it. Keep it below the destination's keep-alive idle timeout, so this sink closes an idle connection before the destination does: a write sent on a connection the destination has already closed has an unknown outcome, resent under `buffer.delivery: at_least_once` and dropped under `at_most_once`. Keep it above the interval between this sink's batches if the connection should be reused; a sink that sends less often opens a new connection, with its handshake, for each batch. Defaults to `30s`: most destinations keep an idle connection at least 60 s. Lower it for a destination that closes sooner, such as a Node.js, Apache, or uvicorn server at its 5 s default. `0s` never reuses an idle connection: every request opens its own.",
               "default": "30s",
               "type": "string"
             },
@@ -3013,7 +3013,7 @@
               }
             },
             "idle_timeout": {
-              "description": "How long a pooled connection may sit idle before this sink closes it instead of reusing it. Keep it below the destination's keep-alive idle timeout, so this sink closes an idle connection before the destination does: a write sent on a connection the destination has already closed has an unknown outcome, resent under `buffer.delivery: at_least_once` and dropped under `at_most_once`. Keep it above the interval between this sink's batches if the connection should be reused; a sink that sends less often opens a new connection, with its handshake, for each batch. Defaults to `30s`, below the 60 s or longer idle timeout of most destinations (`docs/deploying.md`, \"Sink delivery buffering\"); lower it for a destination that closes sooner, such as a Node.js, Apache, or uvicorn server at its 5 s default. `0s` never reuses an idle connection: every request opens its own.\n\nApplies to both `protocol`s.",
+              "description": "How long a pooled connection may sit idle before this sink closes it instead of reusing it. Keep it below the destination's keep-alive idle timeout, so this sink closes an idle connection before the destination does: a write sent on a connection the destination has already closed has an unknown outcome, resent under `buffer.delivery: at_least_once` and dropped under `at_most_once`. Keep it above the interval between this sink's batches if the connection should be reused; a sink that sends less often opens a new connection, with its handshake, for each batch. Defaults to `30s`: most destinations keep an idle connection at least 60 s. Lower it for a destination that closes sooner, such as a Node.js, Apache, or uvicorn server at its 5 s default. `0s` never reuses an idle connection: every request opens its own.\n\nApplies to both `protocol`s.",
               "default": "30s",
               "type": "string"
             },
@@ -3047,7 +3047,8 @@
                 "ca_file": null,
                 "cert_file": null,
                 "insecure_skip_verify": false,
-                "key_file": null
+                "key_file": null,
+                "server_name": null
               },
               "allOf": [
                 {
@@ -3127,7 +3128,7 @@
               ]
             },
             "idle_timeout": {
-              "description": "How long a pooled connection may sit idle before this sink closes it instead of reusing it. Keep it below the destination's keep-alive idle timeout, so this sink closes an idle connection before the destination does: a write sent on a connection the destination has already closed has an unknown outcome, resent under `buffer.delivery: at_least_once` and dropped under `at_most_once`. Keep it above the interval between this sink's batches if the connection should be reused; a sink that sends less often opens a new connection, with its handshake, for each batch. Defaults to `30s`, below the 60 s or longer idle timeout of most destinations (`docs/deploying.md`, \"Sink delivery buffering\"); lower it for a destination that closes sooner, such as a Node.js, Apache, or uvicorn server at its 5 s default. `0s` never reuses an idle connection: every request opens its own.",
+              "description": "How long a pooled connection may sit idle before this sink closes it instead of reusing it. Keep it below the destination's keep-alive idle timeout, so this sink closes an idle connection before the destination does: a write sent on a connection the destination has already closed has an unknown outcome, resent under `buffer.delivery: at_least_once` and dropped under `at_most_once`. Keep it above the interval between this sink's batches if the connection should be reused; a sink that sends less often opens a new connection, with its handshake, for each batch. Defaults to `30s`: most destinations keep an idle connection at least 60 s. Lower it for a destination that closes sooner, such as a Node.js, Apache, or uvicorn server at its 5 s default. `0s` never reuses an idle connection: every request opens its own.",
               "default": "30s",
               "type": "string"
             },
@@ -3150,7 +3151,8 @@
                 "ca_file": null,
                 "cert_file": null,
                 "insecure_skip_verify": false,
-                "key_file": null
+                "key_file": null,
+                "server_name": null
               },
               "allOf": [
                 {
@@ -3208,7 +3210,7 @@
               }
             },
             "idle_timeout": {
-              "description": "How long a pooled connection may sit idle before this sink closes it instead of reusing it. Keep it below the destination's keep-alive idle timeout, so this sink closes an idle connection before the destination does: a write sent on a connection the destination has already closed has an unknown outcome, resent under `buffer.delivery: at_least_once` and dropped under `at_most_once`. Keep it above the interval between this sink's batches if the connection should be reused; a sink that sends less often opens a new connection, with its handshake, for each batch. Defaults to `30s`, below the 60 s or longer idle timeout of most destinations (`docs/deploying.md`, \"Sink delivery buffering\"); lower it for a destination that closes sooner, such as a Node.js, Apache, or uvicorn server at its 5 s default. `0s` never reuses an idle connection: every request opens its own.\n\nApplies to the `socket` connection too.",
+              "description": "How long a pooled connection may sit idle before this sink closes it instead of reusing it. Keep it below the destination's keep-alive idle timeout, so this sink closes an idle connection before the destination does: a write sent on a connection the destination has already closed has an unknown outcome, resent under `buffer.delivery: at_least_once` and dropped under `at_most_once`. Keep it above the interval between this sink's batches if the connection should be reused; a sink that sends less often opens a new connection, with its handshake, for each batch. Defaults to `30s`: most destinations keep an idle connection at least 60 s. Lower it for a destination that closes sooner, such as a Node.js, Apache, or uvicorn server at its 5 s default. `0s` never reuses an idle connection: every request opens its own.\n\nApplies to the `socket` connection too.",
               "default": "30s",
               "type": "string"
             },
@@ -3234,7 +3236,8 @@
                 "ca_file": null,
                 "cert_file": null,
                 "insecure_skip_verify": false,
-                "key_file": null
+                "key_file": null,
+                "server_name": null
               },
               "allOf": [
                 {
@@ -3304,7 +3307,7 @@
               "type": "string"
             },
             "idle_timeout": {
-              "description": "How long a pooled connection may sit idle before this sink closes it instead of reusing it. Keep it below the destination's keep-alive idle timeout, so this sink closes an idle connection before the destination does: a write sent on a connection the destination has already closed has an unknown outcome, resent under `buffer.delivery: at_least_once` and dropped under `at_most_once`. Keep it above the interval between this sink's batches if the connection should be reused; a sink that sends less often opens a new connection, with its handshake, for each batch. Defaults to `30s`, below the 60 s or longer idle timeout of most destinations (`docs/deploying.md`, \"Sink delivery buffering\"); lower it for a destination that closes sooner, such as a Node.js, Apache, or uvicorn server at its 5 s default. `0s` never reuses an idle connection: every request opens its own.",
+              "description": "How long a pooled connection may sit idle before this sink closes it instead of reusing it. Keep it below the destination's keep-alive idle timeout, so this sink closes an idle connection before the destination does: a write sent on a connection the destination has already closed has an unknown outcome, resent under `buffer.delivery: at_least_once` and dropped under `at_most_once`. Keep it above the interval between this sink's batches if the connection should be reused; a sink that sends less often opens a new connection, with its handshake, for each batch. Defaults to `30s`: most destinations keep an idle connection at least 60 s. Lower it for a destination that closes sooner, such as a Node.js, Apache, or uvicorn server at its 5 s default. `0s` never reuses an idle connection: every request opens its own.",
               "default": "30s",
               "type": "string"
             },
@@ -3336,7 +3339,8 @@
                 "ca_file": null,
                 "cert_file": null,
                 "insecure_skip_verify": false,
-                "key_file": null
+                "key_file": null,
+                "server_name": null
               },
               "allOf": [
                 {
@@ -3460,7 +3464,7 @@
               "type": "string"
             },
             "tls": {
-              "description": "Turns on TLS to every broker when present, and makes it required: a `host:port` has no scheme to select TLS from, so even an empty `tls: {}` means TLS with the bundled Mozilla roots. Each broker's certificate is checked against the host it advertises.",
+              "description": "Turns on TLS to every broker when present, and makes it required: a `host:port` has no scheme to select TLS from, so even an empty `tls: {}` means TLS with the bundled Mozilla roots. Each broker's certificate is checked against the host it advertises, or against `server_name` when it's set.",
               "default": null,
               "anyOf": [
                 {
@@ -4084,7 +4088,8 @@
                 "ca_file": null,
                 "cert_file": null,
                 "insecure_skip_verify": false,
-                "key_file": null
+                "key_file": null,
+                "server_name": null
               },
               "allOf": [
                 {
@@ -4263,7 +4268,8 @@
                 "ca_file": null,
                 "cert_file": null,
                 "insecure_skip_verify": false,
-                "key_file": null
+                "key_file": null,
+                "server_name": null
               },
               "allOf": [
                 {
@@ -4285,7 +4291,7 @@
               }
             },
             "idle_timeout": {
-              "description": "How long a pooled connection may sit idle before this sink closes it instead of reusing it. Keep it below the destination's keep-alive idle timeout, so this sink closes an idle connection before the destination does: a write sent on a connection the destination has already closed has an unknown outcome, resent under `buffer.delivery: at_least_once` and dropped under `at_most_once`. Keep it above the interval between this sink's batches if the connection should be reused; a sink that sends less often opens a new connection, with its handshake, for each batch. Defaults to `30s`, below the 60 s or longer idle timeout of most destinations (`docs/deploying.md`, \"Sink delivery buffering\"); lower it for a destination that closes sooner, such as a Node.js, Apache, or uvicorn server at its 5 s default. `0s` never reuses an idle connection: every request opens its own. Sender mode only.",
+              "description": "How long a pooled connection may sit idle before this sink closes it instead of reusing it. Keep it below the destination's keep-alive idle timeout, so this sink closes an idle connection before the destination does: a write sent on a connection the destination has already closed has an unknown outcome, resent under `buffer.delivery: at_least_once` and dropped under `at_most_once`. Keep it above the interval between this sink's batches if the connection should be reused; a sink that sends less often opens a new connection, with its handshake, for each batch. Defaults to `30s`: most destinations keep an idle connection at least 60 s. Lower it for a destination that closes sooner, such as a Node.js, Apache, or uvicorn server at its 5 s default. `0s` never reuses an idle connection: every request opens its own. Sender mode only.",
               "default": "30s",
               "type": "string"
             },
@@ -6319,6 +6325,14 @@
         },
         "key_file": {
           "description": "Private key (PEM, PKCS#8/PKCS#1/SEC1) for `cert_file`. Requires `cert_file`.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "server_name": {
+          "description": "The name the server's certificate is verified against, in place of the endpoint's host: a DNS name or an IP address. Use it to dial an endpoint by IP address, or through a proxy, when its certificate names another host. It doesn't change SNI: the connection still sends the endpoint's own host (none for an IP address), so it can't reach a front end that routes on SNI. On `kafka_out`, every broker is verified against this one name. Ignored under `insecure_skip_verify`. A name that doesn't parse fails startup.",
           "default": null,
           "type": [
             "string",

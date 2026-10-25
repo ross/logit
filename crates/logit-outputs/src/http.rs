@@ -194,9 +194,10 @@ pub(crate) fn hyper_client_builder(idle_timeout: Duration) -> hyper_util::client
     builder
 }
 
-/// The `idle_timeout:` default of every HTTP sink: below the 60 s and longer keep-alive idle
-/// timeouts of the common destinations, and above a 10 s or 15 s batch cadence, so such a sink
-/// reuses its connection (`docs/adr/sink-request-concurrency.md`, decision 7, has the table).
+/// The `idle_timeout:` default of every HTTP sink: below the keep-alive idle timeouts of the
+/// common destinations that close at 60 s and longer, and above a 10 s or 15 s batch cadence, so
+/// such a sink reuses its connection (`docs/adr/sink-request-concurrency.md`, decision 7, has the
+/// table).
 /// `logit_config`'s `default_sink_idle_timeout` mirrors it.
 pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 

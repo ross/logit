@@ -1,6 +1,6 @@
 ---
 created: 2026-10-11
-updated: 2026-10-18
+updated: 2026-10-25
 ---
 
 # `kafka_out`: a pure-Rust producer on `kafka-protocol`, with the Java producer's semantics and named divergences
@@ -336,7 +336,8 @@ won't create it, the topic stays missing and the sink reads it as `Refused` (ite
 
 A `tls:` block (`TlsClientConfig`) turns TLS on, as it does for the other sinks that take a bare
 `host:port`. Each connection's SNI and certificate check use the broker's advertised host, not the
-bootstrap address. Certificates reload through `logit_pipeline::tls` like every other TLS
+bootstrap address. A `tls.server_name` replaces the name every broker's certificate is checked
+against, and leaves SNI alone ([ADR `tls-client-server-name`](tls-client-server-name.md)). Certificates reload through `logit_pipeline::tls` like every other TLS
 component. mTLS uses the same block's client certificate.
 
 SASL isn't part of this stream (Consequences).
