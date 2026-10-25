@@ -367,15 +367,6 @@ Entry format and the other areas: [the known-gaps index](README.md).
 
 ## Admin endpoint, readiness, and release image
 
-- **The admin endpoint has no TLS and no auth** ([ADR
-  `admin-readiness-endpoint`](../adr/admin-readiness-endpoint.md)) — anyone who can reach `admin.bind`, or write to `admin.socket`, can
-  read the pipeline's lifecycle phase and every component's coarse state. It's not deferred:
-  `/readyz`/`/healthz` are loopback/pod-local by design, not meant to cross a real network
-  boundary. Either feature would
-  guard against a threat model this endpoint doesn't have, for a caller already inside the
-  process's own network namespace. `prometheus_out`'s exposition endpoint is the *deferred*
-  version of this gap; see "`prometheus_out` has no TLS and no auth either" under
-  [Prometheus](prometheus.md).
 - **Readiness is per-process, not per-sink.** A single sink holding its queue while its
   destination refuses it doesn't flip `/readyz` to unready; the sink's `buffer:` block bounds what
   the hold accumulates, and the `logit.component.retrying` gauge and the paced `retrying` error

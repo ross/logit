@@ -8,7 +8,8 @@
 //! (`UNIMPLEMENTED`: a non-`POST`, an unknown method, an unsupported `grpc-encoding`), `3`
 //! (`INVALID_ARGUMENT`: a malformed frame, gzip, or payload, or bytes after the one message a
 //! unary body carries), `8` (`RESOURCE_EXHAUSTED`: over
-//! [`MAX_REQUEST_BYTES`]), or `4` (`DEADLINE_EXCEEDED`: a stalled body).
+//! [`MAX_REQUEST_BYTES`]), `4` (`DEADLINE_EXCEEDED`: a stalled body), or `16`
+//! (`UNAUTHENTICATED`: a credential `auth:` doesn't accept).
 //!
 //! **One accept loop, one task per connection.** [`Input::run`] spawns a task per accepted
 //! connection, each holding its own [`Fanout`] clone. HTTP connections are served by
@@ -40,6 +41,14 @@
 //! hostile handshake stalls only its own connection, counts against the same bound as a slow
 //! request, and never blocks the accept loop
 //! (`docs/adr/otlp-tls-and-pooled-grpc-client.md`).
+//!
+//! **Authentication.** With `auth:` set ([`OtlpInput::with_auth`]), every request needs an
+//! `Authorization` header `logit_proto::auth::Credentials` accepts, checked through
+//! [`crate::http::AuthGate`] after routing and before any other header or the body, so a refused
+//! request is never decompressed or decoded. OTLP/HTTP answers `401` with a `WWW-Authenticate`
+//! challenge per configured scheme; gRPC answers status `16` in trailers, with no challenge. Both
+//! count `logit.input.requests.rejected{reason="auth"}` and the throttled `request_rejected`
+//! diagnostic. Empty, the default, accepts every request (ADR `listener-authentication`).
 //!
 //! **Connection limit: reject, don't queue.** A [`tokio::sync::Semaphore`] capped at
 //! [`OtlpInput::max_connections`] (`max_connections:`, 1024 by default), acquired with
@@ -201,7 +210,8 @@
 //! API change, tracked in `docs/known-gaps/otlp.md`.
 
 use crate::http::{
-    body_read_error_message, collect_with_stall_bound, drive_connection, Activity, BodyReadError,
+    body_read_error_message, collect_with_stall_bound, drive_connection, Activity, AuthGate,
+    BodyReadError,
 };
 use crate::listener::Prelude;
 use crate::peer::ConnectionPeer;
@@ -209,6 +219,7 @@ use crate::Input;
 use bytes::Bytes;
 use http::{HeaderMap, HeaderValue, Method, StatusCode};
 use http_body_util::{Full, Limited};
+use logit_proto::auth::Credentials;
 use logit_proto::forwarded::ForwardedHeader;
 // Only this module's tests collect a body directly; the lib path uses `collect_with_stall_bound`.
 #[cfg(test)]
@@ -295,6 +306,8 @@ pub struct OtlpInput {
     proxy_protocol: bool,
     /// `forwarded:` in config. See [`Self::with_forwarded`].
     forwarded: Option<ForwardedHeader>,
+    /// `auth:` in config. See [`Self::with_auth`].
+    auth: AuthGate,
 }
 
 impl OtlpInput {
@@ -313,6 +326,7 @@ impl OtlpInput {
             bind_options: BindOptions::default(),
             proxy_protocol: false,
             forwarded: None,
+            auth: AuthGate::default(),
         }
     }
 
@@ -410,6 +424,13 @@ impl OtlpInput {
         self.forwarded = header;
         self
     }
+
+    /// Requires every request, HTTP and gRPC alike, to carry one of `credentials` (`auth:` in
+    /// config). Empty, the default, accepts any request. See this module's "Authentication".
+    pub fn with_auth(mut self, credentials: Credentials) -> Self {
+        self.auth = AuthGate::new(credentials, "otlp_in", "request_rejected");
+        self
+    }
 }
 
 #[async_trait::async_trait]
@@ -497,6 +518,7 @@ impl Input for OtlpInput {
             let live_connections = live_connections.clone();
             let (record_peer, proxy_protocol) = (self.peer, self.proxy_protocol);
             let forwarded = self.forwarded;
+            let auth = self.auth.clone();
             let mut conn_shutdown = shutdown.clone();
             tasks.spawn(async move {
                 // Held for the connection's lifetime; released on drop.
@@ -586,6 +608,7 @@ impl Input for OtlpInput {
                             transport,
                             sink,
                             telemetry.clone(),
+                            Gate { auth: auth.clone(), diag: diag.clone() },
                             connection_peer,
                             idle_timeout,
                             handshake_timeout,
@@ -599,6 +622,7 @@ impl Input for OtlpInput {
                             transport,
                             sink,
                             telemetry.clone(),
+                            Gate { auth: auth.clone(), diag: diag.clone() },
                             connection_peer,
                             idle_timeout,
                             handshake_timeout,
@@ -648,6 +672,7 @@ async fn serve_connection<IO>(
     transport: OtlpTransport,
     sink: Fanout,
     telemetry: Telemetry,
+    gate: Gate,
     peer: ConnectionPeer,
     idle_timeout: Option<std::time::Duration>,
     grace: std::time::Duration,
@@ -664,16 +689,18 @@ where
         OtlpTransport::Http => {
             let svc = service_fn({
                 let activity = Arc::clone(&activity);
-                let (sink, telemetry) = (sink.clone(), telemetry.clone());
+                let (sink, telemetry, gate) = (sink.clone(), telemetry.clone(), gate.clone());
                 move |req| {
                     // `enter` here, not inside the returned future: hyper calls the service as
                     // soon as a request head is parsed, so the in-flight count rises then.
                     let in_flight = activity.enter();
                     let (sink, telemetry, peer) = (sink.clone(), telemetry.clone(), peer.clone());
+                    let gate = gate.clone();
                     let activity = Arc::clone(&activity);
                     async move {
                         let _in_flight = in_flight;
-                        handle_http(req, sink, telemetry, &peer, &activity, idle_timeout).await
+                        handle_http(req, sink, telemetry, &gate, &peer, &activity, idle_timeout)
+                            .await
                     }
                 }
             });
@@ -699,10 +726,12 @@ where
                 move |req| {
                     let in_flight = activity.enter();
                     let (sink, telemetry, peer) = (sink.clone(), telemetry.clone(), peer.clone());
+                    let gate = gate.clone();
                     let activity = Arc::clone(&activity);
                     async move {
                         let _in_flight = in_flight;
-                        handle_grpc(req, sink, telemetry, &peer, &activity, idle_timeout).await
+                        handle_grpc(req, sink, telemetry, &gate, &peer, &activity, idle_timeout)
+                            .await
                     }
                 }
             });
@@ -725,6 +754,7 @@ async fn handle_http(
     req: http::Request<Incoming>,
     sink: Fanout,
     telemetry: Telemetry,
+    gate: &Gate,
     peer: &ConnectionPeer,
     activity: &Activity,
     stall: Option<std::time::Duration>,
@@ -739,6 +769,13 @@ async fn handle_http(
     let Some(signal) = route_path(req.uri().path()) else {
         return Ok(text_response(StatusCode::NOT_FOUND, "not found"));
     };
+    // Before every other header and the body (this module's "Authentication").
+    if let Err(denied) = gate.auth.check(req.headers()) {
+        gate.auth.reject(denied, peer, &telemetry, &gate.diag);
+        let mut response = text_response(StatusCode::UNAUTHORIZED, "unauthorized");
+        gate.auth.challenge(response.headers_mut());
+        return Ok(response);
+    }
     let encoding = match request_encoding(req.headers()) {
         Ok(encoding) => encoding,
         Err(message) => return Ok(text_response(StatusCode::UNSUPPORTED_MEDIA_TYPE, &message)),
@@ -911,6 +948,7 @@ async fn handle_grpc(
     req: http::Request<Incoming>,
     sink: Fanout,
     telemetry: Telemetry,
+    gate: &Gate,
     peer: &ConnectionPeer,
     activity: &Activity,
     stall: Option<std::time::Duration>,
@@ -925,6 +963,12 @@ async fn handle_grpc(
     else {
         return Ok(grpc_response(12, &format!("unknown method {path}"), None));
     };
+    // gRPC metadata is HTTP/2 headers, so `authorization` reads as on the HTTP side. `16`,
+    // `UNAUTHENTICATED`, carries no challenge (this module's "Authentication").
+    if let Err(denied) = gate.auth.check(req.headers()) {
+        gate.auth.reject(denied, peer, &telemetry, &gate.diag);
+        return Ok(grpc_response(16, "unauthenticated", None));
+    }
     // The frame's compressed flag (`grpc::unframe`) drives decompression; this check only rejects
     // an undecodable encoding up front with a clear message.
     if let Some(enc) = req.headers().get("grpc-encoding") {
@@ -1003,6 +1047,13 @@ async fn handle_grpc(
         }
         Err(err) => Ok(grpc_response(3, &err.to_string(), None)),
     }
+}
+
+/// A connection's `auth:` check and the diagnostics a refusal reports under.
+#[derive(Clone)]
+struct Gate {
+    auth: AuthGate,
+    diag: Diagnostics,
 }
 
 /// The refusal's message, on both transports.
@@ -3704,6 +3755,200 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    // ---- authentication: `auth:` ----------------------------------------------------------------
+
+    /// A listener requiring bearer `token-a` or basic `alice`/`pa:ss`, reporting on `probe`.
+    async fn auth_input(
+        transport: OtlpTransport,
+        probe: &mut logit_pipeline::test_util::TelemetryProbe,
+    ) -> (String, OtlpInput) {
+        let telemetry = probe.telemetry("otlp_in", "otlp_in", "listener");
+        let (addr, input) = bound_input(transport).await;
+        let input = input
+            .with_diagnostics(Diagnostics::new("otlp_in").with_telemetry(telemetry.clone()))
+            .with_telemetry(telemetry)
+            .with_auth(Credentials::new(["token-a"], [("alice", "pa:ss")]));
+        (addr, input)
+    }
+
+    fn basic_header(username: &str, password: &str) -> String {
+        format!("Basic {}", logit_proto::auth::basic_credential(username, password))
+    }
+
+    /// The `WWW-Authenticate` values of a raw HTTP/1.1 response, in order.
+    fn challenges(response: &str) -> Vec<&str> {
+        response
+            .lines()
+            .take_while(|line| !line.is_empty())
+            .filter_map(|line| line.split_once(':'))
+            .filter(|(name, _)| name.eq_ignore_ascii_case("www-authenticate"))
+            .map(|(_, value)| value.trim())
+            .collect()
+    }
+
+    /// Either configured credential is accepted, the scheme in any case, a password holding `:`
+    /// included, and nothing is counted as a rejection.
+    #[tokio::test]
+    async fn an_http_request_with_a_configured_credential_is_accepted() {
+        let mut probe = logit_pipeline::test_util::TelemetryProbe::new();
+        let (addr, mut input) = auth_input(OtlpTransport::Http, &mut probe).await;
+        let (sink, mut rx) = fanout_into_channel();
+        tokio::spawn(async move { input.run(sink).await });
+
+        for authorization in [
+            "Bearer token-a".to_string(),
+            "bEaReR   token-a ".to_string(),
+            basic_header("alice", "pa:ss"),
+            basic_header("alice", "pa:ss").replacen("Basic", "BASIC", 1),
+        ] {
+            let headers = format!(
+                "Content-Type: application/json\r\nAuthorization: {authorization}\r\n\
+                 Connection: close\r\n"
+            );
+            let response = post_raw(&addr, "/v1/traces", &headers, &one_span_json()).await;
+            assert!(response.starts_with("HTTP/1.1 200"), "{authorization:?} got: {response}");
+            logit_pipeline::test_util::recv_batch(&mut rx).await;
+        }
+        assert_eq!(probe.sum("logit.input.requests.rejected", &[("reason", "auth")]), 0.0);
+    }
+
+    /// A missing, wrong, or other-scheme credential is a `401` naming both configured schemes,
+    /// counted and diagnosed, and nothing reaches the fanout.
+    #[tokio::test]
+    async fn an_http_request_without_a_configured_credential_is_401() {
+        let mut probe = logit_pipeline::test_util::TelemetryProbe::new();
+        let (addr, mut input) = auth_input(OtlpTransport::Http, &mut probe).await;
+        let (sink, mut rx) = fanout_into_channel();
+        tokio::spawn(async move { input.run(sink).await });
+
+        let cases = [
+            None,
+            Some("Bearer token-b".to_string()),
+            Some("Bearer".to_string()),
+            Some("Token token-a".to_string()),
+            Some(basic_header("alice", "pa")),
+            Some(basic_header("bob", "pa:ss")),
+        ];
+        for authorization in &cases {
+            let mut headers = "Content-Type: application/json\r\nConnection: close\r\n".to_string();
+            if let Some(authorization) = authorization {
+                headers.push_str(&format!("Authorization: {authorization}\r\n"));
+            }
+            let response = post_raw(&addr, "/v1/traces", &headers, &one_span_json()).await;
+            assert!(response.starts_with("HTTP/1.1 401"), "{authorization:?} got: {response}");
+            assert_eq!(challenges(&response), [r#"Basic realm="logit""#, "Bearer"], "{response}");
+        }
+        let rejected = cases.len() as f64;
+        assert_eq!(probe.sum("logit.input.requests.rejected", &[("reason", "auth")]), rejected);
+        assert_eq!(
+            probe.sum("logit.component.diagnostics", &[("key", "request_rejected")]),
+            rejected
+        );
+        assert!(rx.try_recv().is_err(), "a refused request delivered a batch");
+    }
+
+    /// The credential is checked before the body is read. A request declaring a body over the
+    /// cap and sending none of it gets its `401` at once, where reading the body would wait on it,
+    /// and a body that doesn't inflate is a `401`, never the `400` it earns. The connection is
+    /// kept alive, so the response is read before anything closes it.
+    #[tokio::test]
+    async fn an_http_request_is_authenticated_before_its_body_is_read() {
+        let mut probe = logit_pipeline::test_util::TelemetryProbe::new();
+        let (addr, mut input) = auth_input(OtlpTransport::Http, &mut probe).await;
+        let (sink, _rx) = fanout_into_channel();
+        tokio::spawn(async move { input.run(sink).await });
+
+        let mut stream = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        let head = format!(
+            "POST /v1/traces HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/x-protobuf\r\n\
+             Content-Length: {}\r\n\r\n",
+            MAX_REQUEST_BYTES + 1
+        );
+        stream.write_all(head.as_bytes()).await.unwrap();
+        let response = crate::http::read_response(&mut stream, "an unsent oversized body").await;
+        assert!(response.starts_with("HTTP/1.1 401"), "got: {response}");
+
+        let mut stream = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        let body = b"not gzip";
+        let request = format!(
+            "POST /v1/traces HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/x-protobuf\r\n\
+             Content-Encoding: gzip\r\nAuthorization: Bearer token-b\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+        stream.write_all(body).await.unwrap();
+        let response = crate::http::read_response(&mut stream, "a bad gzip body").await;
+        assert!(response.starts_with("HTTP/1.1 401"), "got: {response}");
+    }
+
+    /// A listener with no `auth:` ignores whatever `Authorization` a request carries.
+    #[tokio::test]
+    async fn a_listener_without_auth_accepts_any_credential() {
+        let (addr, mut input) = bound_input(OtlpTransport::Http).await;
+        let (sink, mut rx) = fanout_into_channel();
+        tokio::spawn(async move { input.run(sink).await });
+
+        let headers = "Content-Type: application/json\r\nAuthorization: Bearer anything\r\n\
+                       Connection: close\r\n";
+        let response = post_raw(&addr, "/v1/traces", headers, &one_span_json()).await;
+        assert!(response.starts_with("HTTP/1.1 200"), "got: {response}");
+        logit_pipeline::test_util::recv_batch(&mut rx).await;
+    }
+
+    /// Sends one unary `Export` carrying `authorization` metadata when given, returning the
+    /// response's HTTP status, its headers, and its trailers.
+    async fn grpc_export_authorized(
+        addr: &str,
+        authorization: Option<&str>,
+    ) -> (StatusCode, HeaderMap, HeaderMap) {
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (mut sender, conn) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
+            .handshake(TokioIo::new(stream))
+            .await
+            .unwrap();
+        tokio::spawn(conn);
+        let mut req = http::Request::builder()
+            .method(Method::POST)
+            .uri(Signal::Traces.grpc_method())
+            .header("content-type", "application/grpc+proto")
+            .header("te", "trailers");
+        if let Some(authorization) = authorization {
+            req = req.header("authorization", authorization);
+        }
+        let body = Full::new(Bytes::from(grpc_message(false, &one_span_payload())));
+        let res = sender.send_request(req.body(body).unwrap()).await.unwrap();
+        let (status, headers) = (res.status(), res.headers().clone());
+        let collected = res.into_body().collect().await.unwrap();
+        (status, headers, collected.trailers().expect("should carry trailers").clone())
+    }
+
+    /// Over gRPC a refusal is status `16`, `UNAUTHENTICATED`, in trailers on an HTTP `200` with no
+    /// `WWW-Authenticate`, counted as on the HTTP side; a configured credential in `authorization`
+    /// metadata is accepted.
+    #[tokio::test]
+    async fn a_grpc_call_without_a_configured_credential_is_unauthenticated() {
+        let mut probe = logit_pipeline::test_util::TelemetryProbe::new();
+        let (addr, mut input) = auth_input(OtlpTransport::Grpc, &mut probe).await;
+        let (sink, mut rx) = fanout_into_channel();
+        tokio::spawn(async move { input.run(sink).await });
+
+        for authorization in [None, Some("Bearer token-b")] {
+            let (status, headers, trailers) = grpc_export_authorized(&addr, authorization).await;
+            assert_eq!(status, StatusCode::OK, "{authorization:?}");
+            assert_eq!(headers.get(http::header::WWW_AUTHENTICATE), None, "{authorization:?}");
+            assert_eq!(trailers.get("grpc-status").unwrap(), "16", "{authorization:?}");
+        }
+        assert_eq!(probe.sum("logit.input.requests.rejected", &[("reason", "auth")]), 2.0);
+        assert!(rx.try_recv().is_err(), "a refused call delivered a batch");
+
+        let basic = basic_header("alice", "pa:ss");
+        for authorization in ["Bearer token-a", basic.as_str()] {
+            let (_, _, trailers) = grpc_export_authorized(&addr, Some(authorization)).await;
+            assert_eq!(trailers.get("grpc-status").unwrap(), "0", "{authorization:?}");
+            logit_pipeline::test_util::recv_batch(&mut rx).await;
         }
     }
 }

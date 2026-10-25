@@ -24,6 +24,8 @@
 //! path: /metrics           # default; must start with `/` (rule 41)
 //! expire_after: 5m         # a series not updated within this window stops being exposed; 0s off
 //! max_series: 100000       # hard cap, least-recently-updated evicted first; 0 rejected (rule 41)
+//! bind_tls: {}             # TlsServerConfig -- its presence turns server TLS on
+//! bind_auth: {}            # HttpAuthConfig -- bearer tokens and basic pairs; empty accepts any scrape
 //! ```
 //!
 //! Sender mode, [`RemoteWriteOutput`]:
@@ -64,10 +66,11 @@
 //! | `GET`/`HEAD` on the configured `path` | `200`, the rendered registry -- `logit.output.scrapes{class="ok"}` |
 //! | any method on any other path | `404` -- `logit.output.scrapes{class="not_found"}` |
 //! | any other method on `path` | `405` + `Allow: GET, HEAD` -- `logit.output.scrapes{class="method"}` |
+//! | `GET`/`HEAD` on `path` under `bind_auth:`, with no `Authorization` credential it accepts | `401` + a `WWW-Authenticate` challenge per configured scheme -- `logit.output.scrapes{class="unauthorized"}` |
 //!
 //! `HEAD` builds the same body as `GET`, so `content-length` matches (RFC 9110 §9.3.2); hyper
-//! drops the bytes. Path is matched before method, so an unknown path is a `404` whatever the
-//! method.
+//! drops the bytes. Path is matched before method, and method before credential, so an unknown
+//! path is a `404` whatever the method or credential.
 //!
 //! ## State: upsert, expiry, cardinality (registry mode)
 //!
@@ -245,7 +248,7 @@
 //!
 //! | Point | Meaning |
 //! |---|---|
-//! | `logit.output.scrapes{class="ok"\|"not_found"\|"method"}` | one per HTTP request, by outcome. `ok` means the response was *rendered*, not acknowledged: a `Full<Bytes>` response offers no body-completion hook, so a connection dropped mid-write still counts `ok` |
+//! | `logit.output.scrapes{class="ok"\|"not_found"\|"method"\|"unauthorized"}` | one per HTTP request, by outcome. `ok` means the response was *rendered*, not acknowledged: a `Full<Bytes>` response offers no body-completion hook, so a connection dropped mid-write still counts `ok` |
 //! | `logit.output.scrape.bytes` | response body bytes as rendered -- post-gzip when the client asked for it, so it measures transfer cost rather than exposition size. Counted when the body is built, same caveat as `ok` above |
 //! | `logit.output.series` (gauge) | series held after each `send` |
 //! | `logit.output.series.evicted{reason="expired"\|"cardinality"}` | see above |
@@ -292,20 +295,25 @@
 //! plain field, counting once per batch however many attempts it takes (`crate::accounting`);
 //! registry mode's `send` never fails, so it has no gate.
 //!
-//! ## Security posture: no TLS, no auth on `bind:`
+//! ## Security posture
 //!
-//! Registry mode serves the **entire registry**, every label on every series, to anything that
-//! connects to `bind:`, with no credential check and no transport encryption. That's the posture
-//! [ADR `admin-readiness-endpoint`](../../../docs/adr/admin-readiness-endpoint.md) accepted for
-//! `/readyz`, except the payload is a metric surface rather than a lifecycle word. So bind
-//! loopback or pod-local (`127.0.0.1:9464`, as every shipped example does) and front it with
-//! something that has TLS and auth. Exposing it off-host is an operator's explicit choice, not
-//! an example's default. Tracked in `docs/known-gaps/prometheus.md` next to `admin:`'s row.
+//! Registry mode serves the **entire registry**, every label on every series. `bind_tls:`
+//! ([`ExposeOutput::with_bind_tls`]) terminates TLS on the exposition, HTTP/1.1 only, built and
+//! reloaded as every listener's server TLS is, with its accept bounded by the header-read
+//! timeout. `bind_auth:` ([`ExposeOutput::with_auth`]) requires each scrape to carry an
+//! `Authorization` header `logit_proto::auth::Credentials` accepts, as a Prometheus scrape config's
+//! `authorization:` or `basic_auth:` sends. A refusal is a `401`, counted, and raises no
+//! diagnostic: a scraper retries on its interval, so a misconfigured one would log forever, and
+//! the `unauthorized` class is the signal. Nothing is rendered for a refused scrape (ADR
+//! `listener-authentication`). Without either, anything that connects reads the registry, so every
+//! shipped example binds loopback (`127.0.0.1:9464`) and exposing it off-host is an operator's
+//! explicit choice.
 //!
 //! Sender mode is the opposite: it dials out, an `https://` endpoint gets TLS with the bundled
 //! Mozilla roots by default, and `endpoint_tls:` adds a private CA, a client certificate for
-//! mutual TLS, or `insecure_skip_verify` (which logs a startup warning). None of that gives the
-//! exposition server TLS.
+//! mutual TLS, or `insecure_skip_verify` (which logs a startup warning). Graph rule 56 rejects
+//! `bind_tls:` and `bind_auth:` beside `endpoint:`, so the server and client TLS keys never
+//! share a mode.
 
 use crate::accounting::BatchAccounting;
 use crate::http::{
@@ -322,7 +330,10 @@ use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
 use logit_core::{redact, Diagnostics, Event, EventBatch, Exemplar, Telemetry};
 use logit_pipeline::listen::BindOptions;
+/// The exposition's `bind_tls:`, the server-side settings every TLS listener takes.
+pub use logit_pipeline::tls::TlsServerSettings;
 use logit_pipeline::{BatchContext, DeliveryPosture, Fault, Output, SeqId};
+use logit_proto::auth::Credentials;
 use logit_proto::prometheus::compression::{self, Encoding};
 use logit_proto::prometheus::{
     events_to_families, events_to_families_pending, remote_write, text, Destination, Dialect,
@@ -584,6 +595,8 @@ struct ServerState {
     response_timeout: Duration,
     telemetry: Telemetry,
     clock: Clock,
+    /// `bind_auth:`; empty accepts every scrape.
+    auth: Credentials,
 }
 
 /// `prometheus_out` in the mode the config selected (see the module doc). One enum, not two
@@ -723,6 +736,10 @@ pub struct ExposeOutput {
     clock: Clock,
     /// Socket options set before the bind (`reuse_port:`).
     bind_options: BindOptions,
+    /// Built by [`ExposeOutput::with_bind_tls`] from `bind_tls:`; `None` serves plaintext.
+    tls: Option<Arc<rustls::ServerConfig>>,
+    /// `bind_auth:`. See [`ExposeOutput::with_auth`].
+    auth: Credentials,
 }
 
 impl ExposeOutput {
@@ -741,6 +758,8 @@ impl ExposeOutput {
             telemetry: Telemetry::default(),
             clock: Arc::new(Instant::now),
             bind_options: BindOptions::default(),
+            tls: None,
+            auth: Credentials::default(),
         }
     }
 
@@ -768,9 +787,38 @@ impl ExposeOutput {
         self
     }
 
+    /// Requires every scrape to carry one of `credentials` (`bind_auth:` in config). Empty, the
+    /// default, accepts any scrape. See the module doc's "Security posture".
+    pub fn with_auth(mut self, credentials: Credentials) -> Self {
+        self.auth = credentials;
+        self
+    }
+
+    /// Turns on TLS for the exposition (`bind_tls:` in config), offering `http/1.1` by ALPN since
+    /// the server speaks nothing else. Paths in `settings` resolve against `base_dir`.
+    ///
+    /// Registers the files with `reloader` under this sink's diagnostics and telemetry as they are
+    /// when this runs, so call it after `with_diagnostics` and `with_telemetry`.
+    pub fn with_bind_tls(
+        mut self,
+        settings: &TlsServerSettings,
+        base_dir: &Path,
+        reloader: &logit_pipeline::tls::TlsReloader,
+    ) -> anyhow::Result<Self> {
+        self.tls = Some(Arc::new(logit_pipeline::tls::build_server_config(
+            settings,
+            base_dir,
+            &[b"http/1.1"],
+            reloader,
+            &self.diag,
+            &self.telemetry,
+        )?));
+        Ok(self)
+    }
+
     /// Reaches the codec's encoder, which reports the throttled
     /// `delta_temporality_unresolved`/`gauge_delta_unresolved` diagnostics, and the accept loop's
-    /// `prometheus_accept_failed`.
+    /// `prometheus_accept_failed` and `connection_error`.
     pub fn with_diagnostics(mut self, diag: Diagnostics) -> Self {
         self.diag = diag;
         self.rebuild_encoder();
@@ -836,8 +884,10 @@ impl Output for ExposeOutput {
             response_timeout: response_timeout(self.max_series),
             telemetry: self.telemetry.clone(),
             clock: Arc::clone(&self.clock),
+            auth: self.auth.clone(),
         });
-        self.server = Some(tokio::spawn(serve(listener, state, self.diag.clone())));
+        let tls = self.tls.clone().map(tokio_rustls::TlsAcceptor::from);
+        self.server = Some(tokio::spawn(serve(listener, state, tls, self.diag.clone())));
         Ok(())
     }
 
@@ -1412,9 +1462,16 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 /// The accept loop, as in `logit-cli::admin::serve_on`: a task per connection, the permit taken
-/// after accept so the kernel backlog absorbs a burst, and a per-connection timeout. Returns `()`:
-/// the task is only aborted, never joined, so an `Err` would go unread.
-async fn serve(listener: TcpListener, state: Arc<ServerState>, mut diag: Diagnostics) {
+/// after accept so the kernel backlog absorbs a burst, and a per-connection timeout. Under
+/// `bind_tls:` the handshake runs in the connection's task, bounded by [`HEADER_READ_TIMEOUT`]
+/// as the request head is. Returns `()`: the task is only aborted, never joined, so an `Err`
+/// would go unread.
+async fn serve(
+    listener: TcpListener,
+    state: Arc<ServerState>,
+    tls: Option<tokio_rustls::TlsAcceptor>,
+    mut diag: Diagnostics,
+) {
     let connection_limit = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
     loop {
         let stream = match listener.accept().await {
@@ -1440,23 +1497,54 @@ async fn serve(listener: TcpListener, state: Arc<ServerState>, mut diag: Diagnos
         let permit =
             connection_limit.clone().acquire_owned().await.expect("this semaphore is never closed");
         let state = Arc::clone(&state);
-        let response_deadline = state.response_timeout;
+        let tls = tls.clone();
+        let mut diag = diag.clone();
         tokio::spawn(async move {
             let _permit = permit; // held for the connection's lifetime; released on drop
-            let svc = service_fn(move |req| {
-                let state = Arc::clone(&state);
-                async move { handle(req, state) }
-            });
-            // Two deadlines: hyper's tight one on request headers (slowloris), and the outer one
-            // on the whole connection, which scales with `max_series` to outlast the scraper's
-            // `scrape_timeout`.
-            let serve = hyper::server::conn::http1::Builder::new()
-                .timer(hyper_util::rt::TokioTimer::new())
-                .header_read_timeout(HEADER_READ_TIMEOUT)
-                .serve_connection(TokioIo::new(stream), svc);
-            let _ = tokio::time::timeout(response_deadline, serve).await;
+            match tls {
+                None => serve_connection(stream, state).await,
+                Some(acceptor) => {
+                    match tokio::time::timeout(HEADER_READ_TIMEOUT, acceptor.accept(stream)).await {
+                        Ok(Ok(stream)) => serve_connection(stream, state).await,
+                        Ok(Err(err)) => {
+                            diag.warn_throttled(
+                                "connection_error",
+                                format_args!("a scrape connection's TLS handshake failed: {err}"),
+                            );
+                        }
+                        Err(_elapsed) => {
+                            diag.warn_throttled(
+                                "connection_error",
+                                format_args!(
+                                    "a scrape connection's TLS handshake did not complete \
+                                     within {HEADER_READ_TIMEOUT:?}"
+                                ),
+                            );
+                        }
+                    }
+                }
+            }
         });
     }
+}
+
+/// Serves one accepted (and, under `bind_tls:`, handshaken) connection. Two deadlines: hyper's
+/// tight one on request headers (slowloris), and the outer one on the whole connection, which
+/// scales with `max_series` to outlast the scraper's `scrape_timeout`.
+async fn serve_connection<IO>(io: IO, state: Arc<ServerState>)
+where
+    IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let response_deadline = state.response_timeout;
+    let svc = service_fn(move |req| {
+        let state = Arc::clone(&state);
+        async move { handle(req, state) }
+    });
+    let serve = hyper::server::conn::http1::Builder::new()
+        .timer(hyper_util::rt::TokioTimer::new())
+        .header_read_timeout(HEADER_READ_TIMEOUT)
+        .serve_connection(TokioIo::new(io), svc);
+    let _ = tokio::time::timeout(response_deadline, serve).await;
 }
 
 fn handle(
@@ -1475,6 +1563,18 @@ fn handle(
             .header("content-type", "text/plain; charset=utf-8")
             .body(Full::new(Bytes::from_static(b"method not allowed")))
             .expect("a well-formed response always builds"));
+    }
+    // After the route and method, as every listener orders it, and before any render.
+    let authorization = req.headers().get(http::header::AUTHORIZATION).map(HeaderValue::as_bytes);
+    if state.auth.check(authorization).is_err() {
+        state.telemetry.count(SCRAPES, 1.0, &[("class", "unauthorized")]);
+        let mut response = text_response(StatusCode::UNAUTHORIZED, "unauthorized");
+        for challenge in state.auth.challenges() {
+            response
+                .headers_mut()
+                .append(http::header::WWW_AUTHENTICATE, HeaderValue::from_static(challenge));
+        }
+        return Ok(response);
     }
 
     let dialect = negotiate(req.headers().get(http::header::ACCEPT).and_then(header_str));
@@ -3885,6 +3985,96 @@ mod tests {
             assert_eq!(sum_of(&sums, "logit.output.metrics.degraded", &degraded), 1.0, "{later}");
             assert_eq!(sum_of(&sums, DUPLICATE.0, DUPLICATE.1), 1.0, "{later}");
         }
+    }
+
+    // -- `bind_auth:` and `bind_tls:` --------------------------------------------------------
+
+    /// A registry requiring bearer `token-a` or basic `alice`/`pa:ss`, counting on `registry`.
+    fn auth_sink(registry: &logit_core::Registry) -> ExposeOutput {
+        ExposeOutput::new("127.0.0.1:0")
+            .with_auth(Credentials::new(["token-a"], [("alice", "pa:ss")]))
+            .with_telemetry(registry.telemetry_for("out", "prometheus_out", "sink"))
+    }
+
+    fn basic_header(username: &str, password: &str) -> String {
+        format!("Basic {}", logit_proto::auth::basic_credential(username, password))
+    }
+
+    /// Prometheus's `authorization:` and `basic_auth:` spellings each scrape; a missing, wrong,
+    /// or other-scheme credential is a `401` naming both schemes and counted `unauthorized`. The
+    /// route and method still answer first.
+    #[tokio::test]
+    async fn bind_auth_admits_a_configured_credential_and_refuses_the_rest() {
+        let registry = logit_core::Registry::new();
+        let (_sink, url) = bound(auth_sink(&registry)).await;
+        let metrics = format!("{url}/metrics");
+
+        let basic = basic_header("alice", "pa:ss");
+        for authorization in ["Bearer token-a", "bearer token-a", basic.as_str()] {
+            let response = get(&metrics, &[("authorization", authorization)]).await;
+            assert_eq!(response.status(), 200, "{authorization:?}");
+        }
+        let wrong = basic_header("alice", "pa");
+        let refused: [&[(&str, &str)]; 4] = [
+            &[],
+            &[("authorization", "Bearer token-b")],
+            &[("authorization", wrong.as_str())],
+            &[("authorization", "Token token-a")],
+        ];
+        for headers in refused {
+            let response = get(&metrics, headers).await;
+            assert_eq!(response.status(), 401, "{headers:?}");
+            let challenges: Vec<_> = response
+                .headers()
+                .get_all(http::header::WWW_AUTHENTICATE)
+                .iter()
+                .map(|value| value.to_str().unwrap())
+                .collect();
+            assert_eq!(challenges, [r#"Basic realm="logit""#, "Bearer"], "{headers:?}");
+        }
+        assert_eq!(get(&format!("{url}/nope"), &[]).await.status(), 404);
+        let posted = reqwest::Client::new().post(&metrics).send().await.unwrap();
+        assert_eq!(posted.status(), 405);
+
+        let drained = registry.drain(0);
+        assert_eq!(tagged(&drained, SCRAPES, "class", "ok"), 3.0);
+        assert_eq!(tagged(&drained, SCRAPES, "class", "unauthorized"), 4.0);
+        assert_eq!(tagged(&drained, SCRAPES, "class", "not_found"), 1.0);
+        assert_eq!(tagged(&drained, SCRAPES, "class", "method"), 1.0);
+    }
+
+    /// Under `bind_tls:` the exposition is served over TLS, with `bind_auth:` checked inside it.
+    #[tokio::test]
+    async fn bind_tls_serves_the_exposition_over_tls() {
+        let registry = logit_core::Registry::new();
+        let settings = TlsServerSettings {
+            cert_file: "server.pem".to_string(),
+            key_file: "server.key".to_string(),
+            client_ca_file: None,
+        };
+        let mut sink = auth_sink(&registry)
+            .with_expire_after(Duration::ZERO)
+            .with_bind_tls(&settings, &testdata_tls_dir(), &logit_pipeline::tls::TlsReloader::new())
+            .expect("the fixture certificate loads");
+        sink.send(&batch(vec![metric_event("hits", cumulative_counter(1.0), &[])])).await.unwrap();
+        sink.bind().await.expect("binding an ephemeral port should succeed");
+        let addr = sink.local_addr().expect("bind records the address");
+
+        let ca = std::fs::read(testdata_tls_dir().join("ca.pem")).unwrap();
+        let client = reqwest::Client::builder()
+            .add_root_certificate(reqwest::Certificate::from_pem(&ca).unwrap())
+            .resolve("localhost", addr)
+            .build()
+            .unwrap();
+        let url = format!("https://localhost:{}/metrics", addr.port());
+        let response = client.get(&url).bearer_auth("token-a").send().await.unwrap();
+        assert_eq!(response.status(), 200);
+        assert!(response.text().await.unwrap().contains("hits_total 1"));
+        let response = client.get(&url).send().await.unwrap();
+        assert_eq!(response.status(), 401);
+
+        let plaintext = reqwest::Client::new().get(format!("http://{addr}/metrics")).send().await;
+        assert!(plaintext.is_err(), "a plaintext scrape of a TLS exposition got an answer");
     }
 
     // -- concurrency above 1 (`docs/adr/sink-request-concurrency.md`, decision 3) -----------

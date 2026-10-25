@@ -174,14 +174,15 @@
 //!     is an empty `allow`, which clamps every value of its field
 //!     (`docs/adr/value-allowlist-cardinality-clamp.md`).
 //! 55. A `prometheus_in` with both or neither of `scrape_targets`/`bind`, a non-default field of
-//!     the other mode (`peer`/`proxy_protocol`/`forwarded`/`reuse_port` among the receiver's), a
-//!     bind-mode `path` not starting with `/`, or `metadata_cache.ttl: 0s` with
+//!     the other mode (`bind_auth`/`peer`/`proxy_protocol`/`forwarded`/`reuse_port` among the
+//!     receiver's), a bind-mode `path` not starting with `/`, or `metadata_cache.ttl: 0s` with
 //!     `max_families > 0` (`docs/adr/prometheus-remote-write.md`,
 //!     `docs/adr/listener-peer-address.md`).
 //! 56. A `prometheus_out` with both or neither of `bind`/`endpoint`, a non-default field of the
-//!     other mode (`reuse_port` among the registry's), `version: 2` with `compression: zstd` (2.0
-//!     mandates Snappy), or a sender fault in 40's shape: a non-absolute `endpoint`,
-//!     `timeout: 0s`, a reserved or colliding header, or a bad `endpoint_tls`
+//!     other mode (`bind_tls`/`bind_auth`/`reuse_port` among the registry's), `version: 2` with
+//!     `compression: zstd` (2.0 mandates Snappy), or a sender fault in 40's shape: a
+//!     non-absolute `endpoint`, `timeout: 0s`, a reserved or colliding header, or a bad
+//!     `endpoint_tls`
 //!     (`docs/adr/prometheus-remote-write.md`, `docs/adr/victoriametrics-interop.md`).
 //! 57. A datagram listener's `receive.read_batch` above `MAX_READ_BATCH`: the kernel doesn't clamp
 //!     `recvmmsg`'s `vlen`, so this bounds the receive slab and the shutdown-path loss
@@ -348,6 +349,11 @@
 //!     (`docs/adr/sink-request-concurrency.md`, decision 1).
 //! 98. An `influxdb_out` whose `tls` fails rule 24's checks, the scheme one included: the `url`'s
 //!     scheme selects TLS, so a block under `http://` does nothing.
+//! 99. An `otlp_in` `auth`, `prometheus_in` `bind_auth`, or `prometheus_out` `bind_auth` with an
+//!     empty bearer token, username, or password, or a bearer token with leading or trailing
+//!     whitespace: none could match a request's credential. Also a basic username containing
+//!     `:`, which RFC 7617 forbids and which would alias another entry's encoding. Empty lists
+//!     accept any request (`docs/adr/listener-authentication.md`).
 //!
 //! Not validated: that a `by: {provenance: ..}` route key names a component in this graph. Like
 //! 37's ids, it may name a component relayed from another process. Nor is `keep`'s empty `fields`:
@@ -2553,6 +2559,7 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
             bind,
             path,
             bind_tls,
+            bind_auth,
             idle_timeout,
             max_connections,
             metadata_cache,
@@ -2618,6 +2625,8 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                 Some("path")
             } else if bind_tls.is_some() {
                 Some("bind_tls")
+            } else if !bind_auth.is_empty() {
+                Some("bind_auth")
             } else if idle_timeout.is_some() {
                 Some("idle_timeout")
             } else if *max_connections != default_max_connections() {
@@ -2656,6 +2665,8 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
             path,
             expire_after,
             max_series,
+            bind_tls,
+            bind_auth,
             endpoint,
             version,
             compression,
@@ -2716,8 +2727,7 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                     anyhow::bail!(
                         "component '{id}': 'endpoint_tls' tunes the TLS of a remote-write request \
                          and only means anything with 'endpoint' -- a prometheus_out with 'bind' \
-                         serves plaintext HTTP and has no client TLS at all (see the ADR's \
-                         'Security posture')"
+                         makes no requests; its server TLS is 'bind_tls'"
                     );
                 }
                 if *concurrency != logit_config::default_sink_concurrency() {
@@ -2758,6 +2768,20 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                         "component '{id}': 'max_series' caps the exposition registry and only \
                          means anything with 'bind' -- a remote-write sender holds no series \
                          between batches"
+                    );
+                }
+                if bind_tls.is_some() {
+                    anyhow::bail!(
+                        "component '{id}': 'bind_tls' terminates TLS on the exposition and only \
+                         means anything with 'bind' -- a remote-write sender listens on nothing; \
+                         its client TLS is 'endpoint_tls'"
+                    );
+                }
+                if !bind_auth.is_empty() {
+                    anyhow::bail!(
+                        "component '{id}': 'bind_auth' checks the credentials a scrape carries \
+                         and only means anything with 'bind' -- a remote-write sender listens on \
+                         nothing; send a credential with 'headers'"
                     );
                 }
                 if *reuse_port {
@@ -4110,6 +4134,27 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
+    // Rule 99: an HTTP listener's credentials (`docs/adr/listener-authentication.md`). An empty
+    // token, username, or password reads as a request carrying none, so it would admit a request
+    // the operator meant to refuse or could never match; a token with leading or trailing
+    // whitespace could never match the trimmed header, a typo `!env` makes easy with a secret
+    // file's trailing newline. A basic username holding `:` is RFC 7617's one forbidden byte.
+    // Empty lists are the "accept any request" setting, not an error.
+    // Rule 55 and 56 reject `bind_auth` in the mode that serves nothing.
+    for (id, component) in &components {
+        let (kind, field, auth) = match &component.kind {
+            ComponentKind::OtlpIn { auth, .. } => ("otlp_in", "auth", auth),
+            ComponentKind::PrometheusIn { bind_auth, .. } => {
+                ("prometheus_in", "bind_auth", bind_auth)
+            }
+            ComponentKind::PrometheusOut { bind_auth, .. } => {
+                ("prometheus_out", "bind_auth", bind_auth)
+            }
+            _ => continue,
+        };
+        check_http_auth(id, kind, field, auth)?;
+    }
+
     // Rule 87: `has_stale`/`drop_stale` (`docs/adr/stale-event-filtering.md`). A zero bound would
     // call nearly every event stale.
     for (id, component) in &components {
@@ -4538,6 +4583,53 @@ fn is_host_port(entry: &str) -> bool {
         let host = host.trim_start_matches('[').trim_end_matches(']');
         !host.is_empty() && port.parse::<u16>().is_ok()
     })
+}
+
+/// Rule 99's checks on one `auth:` or `bind_auth:` block. The messages name the field and the
+/// entry's position, never a value.
+fn check_http_auth(
+    id: &str,
+    kind: &str,
+    field: &str,
+    auth: &logit_config::HttpAuthConfig,
+) -> anyhow::Result<()> {
+    for (index, token) in auth.bearer_tokens.iter().enumerate() {
+        if token.is_empty() {
+            anyhow::bail!(
+                "component '{id}': {kind} '{field}.bearer_tokens' entry {index} is empty -- it \
+                 could never match a request's token; omit '{field}' to accept any request"
+            );
+        }
+        if token.trim() != token {
+            anyhow::bail!(
+                "component '{id}': {kind} '{field}.bearer_tokens' entry {index} has leading or \
+                 trailing whitespace, which the Authorization header can't carry, so it could \
+                 never match -- check the value (a secret file's trailing newline, say)"
+            );
+        }
+    }
+    for (index, credential) in auth.basic.iter().enumerate() {
+        for (part, value) in
+            [("username", &credential.username), ("password", &credential.password)]
+        {
+            if value.is_empty() {
+                anyhow::bail!(
+                    "component '{id}': {kind} '{field}.basic' entry {index} has an empty \
+                     {part} -- give both a username and a password; omit '{field}' to accept \
+                     any request"
+                );
+            }
+        }
+        // RFC 7617 forbids it: `a:b` with password `c` encodes the same as `a` with `b:c`.
+        if credential.username.contains(':') {
+            anyhow::bail!(
+                "component '{id}': {kind} '{field}.basic' entry {index} has a username containing \
+                 ':', which basic authentication can't carry -- a server splits at the first ':', \
+                 so it would match another username's credential"
+            );
+        }
+    }
+    Ok(())
 }
 
 /// The largest integer magnitude a double holds without rounding, and so a Lua number: 2^53.
@@ -5253,6 +5345,7 @@ mod tests {
             bind: None,
             path: default_prometheus_write_path(),
             bind_tls: None,
+            bind_auth: Default::default(),
             idle_timeout: None,
             max_connections: default_max_connections(),
             metadata_cache: MetadataCacheConfig::default(),
@@ -5273,6 +5366,7 @@ mod tests {
             bind: Some(bind.to_string()),
             path: default_prometheus_write_path(),
             bind_tls: None,
+            bind_auth: Default::default(),
             idle_timeout: None,
             max_connections: default_max_connections(),
             metadata_cache: MetadataCacheConfig::default(),
@@ -11605,6 +11699,7 @@ mod tests {
             bind: "0.0.0.0:4317".to_string(),
             protocol: logit_config::OtlpProtocol::Http,
             tls: None,
+            auth: Default::default(),
             handshake_timeout,
             idle_timeout: None,
             max_connections: default_max_connections(),
@@ -11622,6 +11717,7 @@ mod tests {
             bind: "0.0.0.0:4317".to_string(),
             protocol: logit_config::OtlpProtocol::Http,
             tls: None,
+            auth: Default::default(),
             handshake_timeout: default_handshake_timeout(),
             idle_timeout,
             max_connections: default_max_connections(),
@@ -11852,6 +11948,7 @@ mod tests {
                 key_file: "server.key".to_string(),
                 client_ca_file: None,
             }),
+            auth: Default::default(),
             handshake_timeout: Duration::from_secs(30),
             idle_timeout: None,
             max_connections: default_max_connections(),
@@ -13856,6 +13953,8 @@ mod tests {
             path: path.to_string(),
             expire_after: Duration::from_secs(300),
             max_series,
+            bind_tls: None,
+            bind_auth: Default::default(),
             endpoint: None,
             version: logit_config::RemoteWriteVersion::default(),
             compression: logit_config::RemoteWriteCompression::default(),
@@ -13875,6 +13974,8 @@ mod tests {
             path: logit_config::default_prometheus_path(),
             expire_after: logit_config::default_prometheus_expire_after(),
             max_series: logit_config::default_prometheus_max_series(),
+            bind_tls: None,
+            bind_auth: Default::default(),
             endpoint: Some(endpoint.to_string()),
             version: logit_config::RemoteWriteVersion::default(),
             compression: logit_config::RemoteWriteCompression::default(),
@@ -15412,6 +15513,122 @@ mod tests {
         );
         let err = expect_err(cfg(vec![("in", vec![], listener()), ("out", vec!["in"], out)]));
         assert!(err.contains("'reuse_port' shares the exposition's listening port"), "got: {err}");
+    }
+
+    /// Rule 55: `bind_auth` belongs to the remote-write receiver; a scrape client serves nothing.
+    #[test]
+    fn rule_55_rejects_bind_auth_on_a_scrape_client() {
+        let kind = listener_from_json(
+            r#"{"type": "prometheus_in", "scrape_targets": ["http://node-exporter:9100/metrics"],
+                "bind_auth": {"bearer_tokens": ["t"]}}"#,
+        );
+        let err = expect_err(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]));
+        assert!(err.contains("'bind_auth' configures the remote-write receiver"), "got: {err}");
+    }
+
+    /// Rule 56: `bind_tls` and `bind_auth` belong to the exposition; a remote-write sender
+    /// listens on nothing.
+    #[test]
+    fn rule_56_rejects_bind_tls_and_bind_auth_on_a_remote_write_sender() {
+        for (field, value, expected) in [
+            ("bind_tls", r#"{"cert_file": "c.pem", "key_file": "k.pem"}"#, "'bind_tls' terminates"),
+            (
+                "bind_auth",
+                r#"{"basic": [{"username": "u", "password": "p"}]}"#,
+                "'bind_auth' checks",
+            ),
+        ] {
+            let out = listener_from_json(&format!(
+                r#"{{"type": "prometheus_out", "endpoint": "http://vm:8428/api/v1/write",
+                    "{field}": {value}}}"#
+            ));
+            let err = expect_err(cfg(vec![("in", vec![], listener()), ("out", vec!["in"], out)]));
+            assert!(err.contains(expected), "{field}: got: {err}");
+        }
+    }
+
+    /// Rule 56: an exposition takes `bind_tls` and `bind_auth`.
+    #[test]
+    fn rule_56_accepts_bind_tls_and_bind_auth_on_an_exposition() {
+        let out = listener_from_json(
+            r#"{"type": "prometheus_out", "bind": "127.0.0.1:9464",
+                "bind_tls": {"cert_file": "c.pem", "key_file": "k.pem"},
+                "bind_auth": {"bearer_tokens": ["t"], "basic": [{"username": "u", "password": "p"}]}}"#,
+        );
+        resolve(cfg(vec![("in", vec![], listener()), ("out", vec!["in"], out)]))
+            .expect("an exposition with TLS and credentials resolves");
+    }
+
+    /// Rule 99: an empty token, username, or password, or a whitespace-padded token, could never
+    /// match, on each kind that takes credentials. The message names the entry, never its value.
+    #[test]
+    fn rule_99_rejects_a_credential_that_could_never_match() {
+        let cases = [
+            (r#"{"bearer_tokens": ["good", ""]}"#, "'AUTH.bearer_tokens' entry 1 is empty"),
+            (r#"{"bearer_tokens": ["s3cret\n"]}"#, "leading or trailing whitespace"),
+            (r#"{"basic": [{"username": "", "password": "s3cret"}]}"#, "empty username"),
+            (r#"{"basic": [{"username": "u", "password": ""}]}"#, "empty password"),
+        ];
+        for (auth, expected) in cases {
+            let otlp_in =
+                format!(r#"{{"type": "otlp_in", "bind": "0.0.0.0:4318", "auth": {auth}}}"#);
+            let prometheus_in = format!(
+                r#"{{"type": "prometheus_in", "bind": "0.0.0.0:9090", "bind_auth": {auth}}}"#
+            );
+            for (json, field) in [(otlp_in, "auth"), (prometheus_in, "bind_auth")] {
+                let config = cfg(vec![
+                    ("in", vec![], listener_from_json(&json)),
+                    ("out", vec!["in"], sink()),
+                ]);
+                let err = expect_err(config);
+                assert!(err.contains(&expected.replace("AUTH", field)), "{json}: got: {err}");
+                assert!(!err.contains("s3cret"), "{json}: the message carries the value: {err}");
+            }
+            let out = listener_from_json(&format!(
+                r#"{{"type": "prometheus_out", "bind": "127.0.0.1:9464", "bind_auth": {auth}}}"#
+            ));
+            let err = expect_err(cfg(vec![("in", vec![], listener()), ("out", vec!["in"], out)]));
+            assert!(err.contains(&expected.replace("AUTH", "bind_auth")), "got: {err}");
+        }
+    }
+
+    /// Rule 99: a basic username holding `:` is rejected on every kind that takes credentials,
+    /// without the message naming it.
+    #[test]
+    fn rule_99_rejects_a_basic_username_containing_a_colon() {
+        let auth = r#"{"basic": [{"username": "s3cret:user", "password": "pw"}]}"#;
+        for json in [
+            format!(r#"{{"type": "otlp_in", "bind": "0.0.0.0:4318", "auth": {auth}}}"#),
+            format!(r#"{{"type": "prometheus_in", "bind": "0.0.0.0:9090", "bind_auth": {auth}}}"#),
+        ] {
+            let config =
+                cfg(vec![("in", vec![], listener_from_json(&json)), ("out", vec!["in"], sink())]);
+            let err = expect_err(config);
+            assert!(err.contains("entry 0 has a username containing ':'"), "{json}: got: {err}");
+            assert!(!err.contains("s3cret"), "{json}: the message carries the value: {err}");
+        }
+        let out = listener_from_json(&format!(
+            r#"{{"type": "prometheus_out", "bind": "127.0.0.1:9464", "bind_auth": {auth}}}"#
+        ));
+        let err = expect_err(cfg(vec![("in", vec![], listener()), ("out", vec!["in"], out)]));
+        assert!(err.contains("username containing ':'"), "got: {err}");
+    }
+
+    /// Rule 99: credentials with a password holding `:`, and empty lists, resolve.
+    #[test]
+    fn rule_99_accepts_well_formed_credentials_and_empty_lists() {
+        for auth in [
+            r#"{"bearer_tokens": ["t"], "basic": [{"username": "u", "password": "a:b"}]}"#,
+            r#"{"bearer_tokens": [], "basic": []}"#,
+            "{}",
+        ] {
+            let json = format!(r#"{{"type": "otlp_in", "bind": "0.0.0.0:4318", "auth": {auth}}}"#);
+            resolve(cfg(vec![
+                ("in", vec![], listener_from_json(&json)),
+                ("out", vec!["in"], sink()),
+            ]))
+            .unwrap_or_else(|err| panic!("{auth}: {err}"));
+        }
     }
 
     /// Rule 80: a Unix socket has no port to share.

@@ -48,8 +48,8 @@
 //! token, `Content-Encoding`, then `precision`, `bucket`, and `org` (influxd's order), then the
 //! body. Nothing here sends `403`, `422`, or `429`: there are no per-bucket permissions, no stored
 //! schema, and no rate limit. `Content-Type` is ignored and a chunked body is accepted, as at
-//! influxd. A token is compared in constant time ([`crate::http::matches_any_key`]) and never
-//! logged, counted, or kept on an event.
+//! influxd. A token is compared in constant time ([`logit_proto::auth::matches_any_key`]) and
+//! never logged, counted, or kept on an event.
 //!
 //! **One request, one batch, all or nothing.** The decoder parses the whole body before building
 //! any event, so a parse error delivers nothing. A decoded body is one batch, sent under one
@@ -80,8 +80,8 @@
 
 use crate::http::{
     body_read_error_message, collect_with_stall_bound, declared_length, decompress,
-    deliver_with_deadline, drive_connection, is_length_limit, json_response, matches_any_key,
-    now_nanos, Activity, BodyReadError, DecompressError, Encoding, Undelivered,
+    deliver_with_deadline, drive_connection, is_length_limit, json_response, now_nanos, Activity,
+    BodyReadError, DecompressError, Encoding, Undelivered,
 };
 use crate::listener::Prelude;
 use crate::peer::ConnectionPeer;
@@ -913,7 +913,7 @@ fn encoding(headers: &HeaderMap) -> Option<Encoding> {
 
 /// `true` when `tokens` is empty or the `Authorization` header is `Token <t>` or `Bearer <t>`,
 /// the scheme in any case, naming one of them. The comparison is constant-time per token length
-/// ([`matches_any_key`]), and the token never leaves this function.
+/// ([`logit_proto::auth::matches_any_key`]), and the token never leaves this function.
 fn authenticate(tokens: &[Box<[u8]>], headers: &HeaderMap) -> bool {
     if tokens.is_empty() {
         return true;
@@ -924,7 +924,7 @@ fn authenticate(tokens: &[Box<[u8]>], headers: &HeaderMap) -> bool {
     let (scheme, token) = (&value[..at], value[at + 1..].trim_ascii());
     let known_scheme =
         scheme.eq_ignore_ascii_case(b"token") || scheme.eq_ignore_ascii_case(b"bearer");
-    known_scheme && !token.is_empty() && matches_any_key(tokens, token)
+    known_scheme && !token.is_empty() && logit_proto::auth::matches_any_key(tokens, token)
 }
 
 /// What a write reads from its query string. The first occurrence of each key wins, as influxd

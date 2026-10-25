@@ -409,6 +409,13 @@ The InfluxDB line-protocol codec adds one more:
   seeds are the Telegraf-shaped body in `crates/logit-proto/tests/support/influxdb_lines.rs` and
   constructed lines.
 
+Listener authentication adds one more:
+
+- `http_auth`: one `Authorization` header value through `logit_proto::auth::Credentials::check`,
+  against a bearer token and basic pair taken from the input, with oracles that an accepted value
+  survives a flipped scheme case and surrounding whitespace and that a client's own spelling of
+  each configured credential is accepted.
+
 `prom_remote_write` also gains a structured mode, which builds a request from its input so the
 symbol-table rules are reachable, and a fixed-point oracle on every input.
 

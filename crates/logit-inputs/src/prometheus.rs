@@ -22,6 +22,7 @@
 //! bind: "0.0.0.0:9090"  # host:port to accept remote-write POSTs on
 //! path: /api/v1/write   # the one route POSTs are accepted on; default /api/v1/write
 //! bind_tls: {}          # TlsServerConfig -- its presence turns TLS on
+//! bind_auth: {}         # HttpAuthConfig -- bearer tokens and basic pairs; empty accepts any write
 //! idle_timeout: 60s     # optional; omitted means no idle timeout
 //! metadata_cache:       # what 1.0 metric types are remembered between requests
 //!   max_families: 10000 #   0 turns the cache off
@@ -115,6 +116,7 @@
 //! | `POST path`, `Content-Encoding: snappy` or `zstd`, recognised `Content-Type` | decode, then `204` |
 //! | any other path | `404` |
 //! | any other method on `path` | `405` + `Allow: POST` |
+//! | under `bind_auth:`, no `Authorization` credential it accepts (checked before any other header or the body) | `401` + a `WWW-Authenticate` challenge per configured scheme |
 //! | missing or other `Content-Encoding`, unrecognised or missing `Content-Type` | `415` |
 //! | a body, or its decompressed size, over [`MAX_REQUEST_BYTES`] | `413` |
 //! | a body that stops arriving mid-upload, **when `idle_timeout:` is set** (it is off by default, and the stall bound is derived from it) | `408`, and the connection closes |
@@ -226,10 +228,10 @@
 //! faster than the victims' own metadata cadence, that keeps well-behaved senders permanently
 //! untyped. The cache does not *drop* their samples (a remembered type gives way to a sample it
 //! cannot place rather than rejecting it, [`remote_write::decode_with`]), but flat families are
-//! what they get. Nothing here authenticates a sender, so this is the "Security posture" rule
-//! again: do not point this listener at untrusted senders. An operator who has to, and would
-//! rather have flat families than a table anyone can churn, sets `max_families: 0`, which turns
-//! the sharing off along with the typing.
+//! what they get. `bind_auth:` decides who may write, not what an accepted sender declares, so
+//! senders that shouldn't share a table get a `bind:` each. An operator who would rather have
+//! flat families than a shared table sets `max_families: 0`, which turns the sharing off along
+//! with the typing.
 //!
 //! **Concurrency, and what a request pays.** One `std::sync::Mutex` guards the table, taken to
 //! build the seed and again to learn, **never held across the decode**: a connection's requests
@@ -277,14 +279,19 @@
 //! connection through the same close sequence, as `otlp_in` does (`crate::otlp`'s "Idle
 //! timeout").
 //!
-//! ## Security posture
+//! ## Authentication
 //!
-//! `bind_tls:` gives transport security and nothing else. **The receiver has no authentication of
-//! any kind** (no bearer token, no basic auth, no mutual-TLS identity check beyond `rustls`
-//! accepting a client certificate chain when `client_ca_file` is set), so anything that can reach
-//! the socket can write series into the pipeline. `admin:` and `prometheus_out`'s exposition
-//! `bind:` carry the same gap, tracked in `docs/known-gaps/prometheus.md`: front it with something
-//! that authenticates, or keep it on a trusted network.
+//! With `bind_auth:` set ([`PrometheusReceiver::with_auth`]), every write needs an
+//! `Authorization` header `logit_proto::auth::Credentials` accepts, as Prometheus's
+//! `remote_write` `authorization:` or `basic_auth:` and vmagent's `-remoteWrite.bearerToken` or
+//! `-remoteWrite.basicAuth.*` send. [`crate::http::AuthGate`] checks it after the path and method
+//! and before `Content-Encoding` or the body, so a refused write is never read, decompressed, or
+//! decoded. A refusal is `401` with a challenge per configured scheme, carrying the `-Written`
+//! zeros when its `Content-Type` names 2.0, and counts `logit.input.writes{class="unauthorized"}`,
+//! `logit.input.requests.rejected{reason="auth"}`, and the `write_rejected` diagnostic. Empty, the
+//! default, accepts every write. `bind_tls:` is transport security; with `client_ca_file` it
+//! admits any client certificate that chains to that CA, and checks no subject
+//! (ADR `listener-authentication`).
 //!
 //! ## Sender address
 //!
@@ -301,7 +308,8 @@
 //! ## Counters
 //!
 //! `logit.input.writes{class}` -- one count per request, `class` one of `ok`, `not_found`,
-//! `method`, `unsupported`, `oversize`, `timeout`, `bad_request`, or `closed_consumer`. An `ok`
+//! `method`, `unauthorized`, `unsupported`, `oversize`, `timeout`, `bad_request`, or
+//! `closed_consumer`. An `ok`
 //! count also carries `encoding` (`snappy` or `zstd`), which is how to see whether a vmagent
 //! stayed on zstd. `logit.input.write.duration` -- a timing sample per request, recorded
 //! regardless of outcome. `logit.input.samples` -- reused from scrape mode, counting the wire
@@ -309,7 +317,9 @@
 //! mapping then dropped, the number the `-Written` header reports. A counter and a header
 //! disagreeing about one request would be a puzzle with no right answer.
 //! `logit.input.batches.dropped{reason="closed_consumer"}` -- the write's batch when no consumer
-//! took it, answered `503`.
+//! took it, answered `503`. `logit.input.requests.rejected{reason="auth"}` -- a write
+//! `bind_auth:` refused, also counted `writes{class="unauthorized"}`, as every HTTP listener that
+//! checks a credential counts it.
 //!
 //! `logit.input.metadata_cache.size` -- how many families are remembered, a gauge published
 //! whenever the table changes (a transition, like `logit.input.connections`, not a per-request
@@ -330,7 +340,8 @@
 //! `logit.input.metrics.dropped{reason}` counts what it stepped over, native histograms included.
 
 use crate::http::{
-    body_read_error_message, collect_with_stall_bound, drive_connection, Activity, BodyReadError,
+    body_read_error_message, collect_with_stall_bound, drive_connection, Activity, AuthGate,
+    BodyReadError,
 };
 use crate::listener::Prelude;
 use crate::peer::ConnectionPeer;
@@ -348,6 +359,7 @@ use logit_core::{
 };
 use logit_pipeline::listen::BindOptions;
 use logit_pipeline::Fanout;
+use logit_proto::auth::Credentials;
 use logit_proto::forwarded::ForwardedHeader;
 use logit_proto::prometheus::compression::{self, DecompressError, Encoding};
 use logit_proto::prometheus::{
@@ -1132,6 +1144,8 @@ pub struct PrometheusReceiver {
     proxy_protocol: bool,
     /// `forwarded:` in config. See [`Self::with_forwarded`].
     forwarded: Option<ForwardedHeader>,
+    /// `bind_auth:` in config. See [`Self::with_auth`].
+    auth: AuthGate,
     diag: Diagnostics,
     telemetry: Telemetry,
 }
@@ -1154,6 +1168,7 @@ impl PrometheusReceiver {
             bind_options: BindOptions::default(),
             proxy_protocol: false,
             forwarded: None,
+            auth: AuthGate::default(),
             diag: Diagnostics::default(),
             telemetry: Telemetry::default(),
         }
@@ -1247,6 +1262,13 @@ impl PrometheusReceiver {
     /// [`ConnectionPeer::request`]. Off by default.
     pub fn with_forwarded(mut self, header: Option<ForwardedHeader>) -> Self {
         self.forwarded = header;
+        self
+    }
+
+    /// Requires every write to carry one of `credentials` (`bind_auth:` in config). Empty, the
+    /// default, accepts any write. See this module's "Authentication".
+    pub fn with_auth(mut self, credentials: Credentials) -> Self {
+        self.auth = AuthGate::new(credentials, "prometheus_in", "write_rejected");
         self
     }
 
@@ -1357,6 +1379,7 @@ impl Input for PrometheusReceiver {
             let metadata_cache = metadata_cache.clone();
             let (record_peer, proxy_protocol) = (self.peer, self.proxy_protocol);
             let forwarded = self.forwarded;
+            let auth = self.auth.clone();
             let mut conn_shutdown = shutdown.clone();
             tasks.spawn(async move {
                 // Held for the connection's lifetime; released on drop.
@@ -1436,6 +1459,7 @@ impl Input for PrometheusReceiver {
                             path,
                             resource,
                             metadata_cache,
+                            auth,
                             sink,
                             telemetry.clone(),
                             diag.clone(),
@@ -1452,6 +1476,7 @@ impl Input for PrometheusReceiver {
                             path,
                             resource,
                             metadata_cache,
+                            auth,
                             sink,
                             telemetry.clone(),
                             diag.clone(),
@@ -1501,6 +1526,7 @@ async fn serve_write_connection<IO>(
     path: Arc<str>,
     resource: Arc<Resource>,
     metadata_cache: Option<Arc<MetadataCache>>,
+    auth: AuthGate,
     sink: Fanout,
     telemetry: Telemetry,
     diag: Diagnostics,
@@ -1526,7 +1552,7 @@ where
             let (sink, telemetry, diag) = (sink.clone(), telemetry.clone(), diag.clone());
             let (path, resource) = (Arc::clone(&path), Arc::clone(&resource));
             let metadata_cache = metadata_cache.clone();
-            let peer = peer.clone();
+            let (peer, auth) = (peer.clone(), auth.clone());
             let activity = Arc::clone(&activity);
             async move {
                 let _in_flight = in_flight;
@@ -1535,6 +1561,7 @@ where
                     &path,
                     resource,
                     metadata_cache.as_deref(),
+                    &auth,
                     &peer,
                     sink,
                     telemetry,
@@ -1571,6 +1598,7 @@ async fn handle_write(
     path: &str,
     resource: Arc<Resource>,
     metadata_cache: Option<&MetadataCache>,
+    auth: &AuthGate,
     peer: &ConnectionPeer,
     sink: Fanout,
     telemetry: Telemetry,
@@ -1584,6 +1612,7 @@ async fn handle_write(
         path,
         resource,
         metadata_cache,
+        auth,
         peer,
         &sink,
         &telemetry,
@@ -1612,6 +1641,7 @@ async fn write_response(
     path: &str,
     resource: Arc<Resource>,
     metadata_cache: Option<&MetadataCache>,
+    auth: &AuthGate,
     peer: &ConnectionPeer,
     sink: &Fanout,
     telemetry: &Telemetry,
@@ -1632,6 +1662,16 @@ async fn write_response(
         );
         response.headers_mut().insert(http::header::ALLOW, HeaderValue::from_static("POST"));
         return ("method", None, response);
+    }
+    // Before the other headers and the body (the module doc's "Authentication"). A 2.0 sender's
+    // `401` still carries the `-Written` zeros, so the version is read off `Content-Type` here.
+    if let Err(denied) = auth.check(req.headers()) {
+        auth.reject(denied, peer, telemetry, &diag);
+        let seen =
+            remote_write::Version::from_content_type(header_str(req.headers(), CONTENT_TYPE));
+        let mut response = text_response(seen, StatusCode::UNAUTHORIZED, "unauthorized");
+        auth.challenge(response.headers_mut());
+        return ("unauthorized", None, response);
     }
 
     // Both specs mandate Snappy *block* compression on every request, with no identity mode, so a
@@ -4896,5 +4936,123 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ---- bind mode: `bind_auth:` ----------------------------------------------------------------
+
+    /// A receiver requiring bearer `token-a` or basic `alice`/`pa:ss`, reporting on `probe`.
+    async fn auth_receiver(
+        probe: &mut logit_pipeline::test_util::TelemetryProbe,
+    ) -> (PrometheusReceiver, String) {
+        let telemetry = probe.telemetry("prometheus_in", "prometheus_in", "listener");
+        let (receiver, addr) = bound_receiver("/api/v1/write").await;
+        let receiver = receiver
+            .with_diagnostics(Diagnostics::new("prometheus_in").with_telemetry(telemetry.clone()))
+            .with_telemetry(telemetry)
+            .with_auth(Credentials::new(["token-a"], [("alice", "pa:ss")]));
+        (receiver, addr)
+    }
+
+    fn basic_header(username: &str, password: &str) -> String {
+        format!("Basic {}", logit_proto::auth::basic_credential(username, password))
+    }
+
+    fn one_gauge_body(version: remote_write::Version) -> Vec<u8> {
+        request_body(&[vec![gauge_family("up", ("job", "a"), 1.0, millis(1_000))]], version)
+    }
+
+    /// Prometheus's `authorization:` and `basic_auth:` spellings are both accepted, the scheme in
+    /// any case, a password holding `:` included.
+    #[tokio::test]
+    async fn a_write_with_a_configured_credential_is_accepted() {
+        let mut probe = logit_pipeline::test_util::TelemetryProbe::new();
+        let (receiver, addr) = auth_receiver(&mut probe).await;
+        let mut rx = spawn_receiver(receiver, 16);
+        let version = remote_write::Version::V1;
+
+        let basic = basic_header("alice", "pa:ss");
+        for authorization in ["Bearer token-a", "BEARER token-a", basic.as_str()] {
+            let headers = format!("{}Authorization: {authorization}\r\n", write_headers(version));
+            let response =
+                post_raw(&addr, "/api/v1/write", &headers, &one_gauge_body(version)).await;
+            assert!(response.starts_with("HTTP/1.1 204"), "{authorization:?} got: {response}");
+            recv_batch(&mut rx).await;
+        }
+        assert_eq!(probe.sum("logit.input.requests.rejected", &[("reason", "auth")]), 0.0);
+        assert_eq!(probe.sum("logit.input.writes", &[("class", "unauthorized")]), 0.0);
+    }
+
+    /// A missing, wrong, or other-scheme credential is a `401` naming both schemes, counted as a
+    /// rejection, as a write of class `unauthorized`, and under `write_rejected`, and delivers
+    /// nothing. A 2.0 write's `401` still reports what it stored: zero.
+    #[tokio::test]
+    async fn a_write_without_a_configured_credential_is_401() {
+        let mut probe = logit_pipeline::test_util::TelemetryProbe::new();
+        let (receiver, addr) = auth_receiver(&mut probe).await;
+        let mut rx = spawn_receiver(receiver, 16);
+
+        let cases = [
+            (remote_write::Version::V1, None),
+            (remote_write::Version::V1, Some("Bearer token-b".to_string())),
+            (remote_write::Version::V1, Some(basic_header("alice", "wrong"))),
+            (remote_write::Version::V1, Some("Token token-a".to_string())),
+            (remote_write::Version::V2, None),
+        ];
+        for (version, authorization) in &cases {
+            let mut headers = write_headers(*version);
+            if let Some(authorization) = authorization {
+                headers.push_str(&format!("Authorization: {authorization}\r\n"));
+            }
+            let response =
+                post_raw(&addr, "/api/v1/write", &headers, &one_gauge_body(*version)).await;
+            assert!(response.starts_with("HTTP/1.1 401"), "{authorization:?} got: {response}");
+            let lower = response.to_ascii_lowercase();
+            assert!(lower.contains("www-authenticate: basic realm=\"logit\""), "{response}");
+            assert!(lower.contains("www-authenticate: bearer"), "{response}");
+            let written =
+                lower.contains(&remote_write::HEADER_SAMPLES_WRITTEN.to_ascii_lowercase());
+            assert_eq!(written, *version == remote_write::Version::V2, "{response}");
+        }
+        let rejected = cases.len() as f64;
+        assert_eq!(probe.sum("logit.input.requests.rejected", &[("reason", "auth")]), rejected);
+        assert_eq!(probe.sum("logit.input.writes", &[("class", "unauthorized")]), rejected);
+        assert_eq!(
+            probe.sum("logit.component.diagnostics", &[("key", "write_rejected")]),
+            rejected
+        );
+        assert!(rx.try_recv().is_err(), "a refused write delivered a batch");
+    }
+
+    /// The credential is checked before the body is read: a write declaring a body over the cap
+    /// and sending none of it gets its `401` at once, and a body that isn't Snappy is a `401`,
+    /// never the `400` it earns.
+    #[tokio::test]
+    async fn a_write_is_authenticated_before_its_body_is_read() {
+        use tokio::io::AsyncWriteExt;
+        let mut probe = logit_pipeline::test_util::TelemetryProbe::new();
+        let (receiver, addr) = auth_receiver(&mut probe).await;
+        let _rx = spawn_receiver(receiver, 16);
+        let headers = keep_alive_write_headers(remote_write::Version::V1);
+
+        let mut stream = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        let head = format!(
+            "POST /api/v1/write HTTP/1.1\r\nHost: {addr}\r\nContent-Length: {}\r\n{headers}\r\n",
+            MAX_REQUEST_BYTES + 1
+        );
+        stream.write_all(head.as_bytes()).await.unwrap();
+        let response = crate::http::read_response(&mut stream, "an unsent oversized body").await;
+        assert!(response.starts_with("HTTP/1.1 401"), "got: {response}");
+
+        let mut stream = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        let body = b"not snappy";
+        let request = format!(
+            "POST /api/v1/write HTTP/1.1\r\nHost: {addr}\r\nContent-Length: {}\r\n{headers}\
+             Authorization: Bearer token-b\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+        stream.write_all(body).await.unwrap();
+        let response = crate::http::read_response(&mut stream, "a body that isn't Snappy").await;
+        assert!(response.starts_with("HTTP/1.1 401"), "got: {response}");
     }
 }

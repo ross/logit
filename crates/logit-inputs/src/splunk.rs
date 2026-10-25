@@ -9,8 +9,9 @@
 //!
 //! The accept loop, connection cap, handshake timeout, idle timeout, shutdown close, and
 //! sender-address handling are `otlp_in`'s ([`crate::otlp`]); `crate::otlp`'s module doc has the
-//! reasoning for each. The request helpers (`Content-Encoding`, bounded decompression, the constant-time token check,
-//! deadline-bounded delivery) are shared through [`crate::http`].
+//! reasoning for each. The request helpers (`Content-Encoding`, bounded decompression,
+//! deadline-bounded delivery) are shared through [`crate::http`], and the constant-time token
+//! check through [`logit_proto::auth`].
 //!
 //! **Sender address.** Under `peer:` and `proxy_protocol:` ([`SplunkHecInput::with_peer`],
 //! [`SplunkHecInput::with_proxy_protocol`]), each connection task builds one [`ConnectionPeer`],
@@ -145,7 +146,7 @@
 use crate::http::{
     body_read_error_message, collect_with_stall_bound, declared_length, decompress,
     deliver_detached, deliver_with_deadline, drive_connection, is_length_limit, json_response,
-    matches_any_key, now_nanos, Activity, BodyReadError, DecompressError, Encoding, Undelivered,
+    now_nanos, Activity, BodyReadError, DecompressError, Encoding, Undelivered,
 };
 use crate::listener::Prelude;
 use crate::peer::ConnectionPeer;
@@ -1261,8 +1262,8 @@ fn http_error(status: StatusCode, text: &str) -> http::Response<Full<Bytes>> {
 }
 
 /// Step 3 of this module's "Request handling": `Ok` when `tokens` is empty or the
-/// `Authorization` header carries one of them, else the status to answer. The token is compared in
-/// constant time ([`matches_any_key`]) and never leaves this function.
+/// `Authorization` header carries one of them, else the status to answer. The token is compared
+/// in constant time ([`logit_proto::auth::matches_any_key`]) and never leaves this function.
 fn authenticate(tokens: &[Box<[u8]>], headers: &HeaderMap) -> Result<(), HecStatus> {
     if tokens.is_empty() {
         return Ok(());
@@ -1292,7 +1293,7 @@ fn authenticate(tokens: &[Box<[u8]>], headers: &HeaderMap) -> Result<(), HecStat
     if token.is_empty() {
         return Err(HecStatus::TOKEN_REQUIRED);
     }
-    if matches_any_key(tokens, &token) {
+    if logit_proto::auth::matches_any_key(tokens, &token) {
         Ok(())
     } else {
         Err(HecStatus::INVALID_TOKEN)

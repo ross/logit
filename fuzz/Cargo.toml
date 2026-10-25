@@ -130,6 +130,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "http_auth"
+path = "fuzz_targets/http_auth.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "stream_framing"
 path = "fuzz_targets/stream_framing.rs"
 test = false

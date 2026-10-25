@@ -282,6 +282,10 @@ pub fn generate(testdata: &Path) -> std::io::Result<(Seeds, Vec<String>)> {
         add("forwarded", name.to_string(), bytes);
     }
 
+    for (name, bytes) in authorization_headers() {
+        add("http_auth", name.to_string(), bytes);
+    }
+
     for (name, bytes) in stream_framing_seeds(testdata)? {
         add("stream_framing", name, bytes);
     }
@@ -405,6 +409,32 @@ fn forwarding_headers() -> Vec<(&'static str, Vec<u8>)> {
         ("fwd-unquoted-v6", fwd("for=[2001:db8::1]:443")),
         ("real-ip", real(" 198.51.100.2 ")),
         ("real-ip-v6", real("2001:db8::1")),
+    ]
+}
+
+/// `Authorization` header values from `logit_proto::auth`'s unit vectors, each behind the
+/// length byte and secret the `http_auth` target reads: the secret is a bearer token and, split at
+/// its first `:`, a basic username and password.
+fn authorization_headers() -> Vec<(&'static str, Vec<u8>)> {
+    let seed = |secret: &str, value: &str| {
+        let mut bytes = vec![u8::try_from(secret.len()).expect("a seed's secret is short")];
+        bytes.extend_from_slice(secret.as_bytes());
+        bytes.extend_from_slice(value.as_bytes());
+        bytes
+    };
+    let basic = |secret: &str| {
+        let (username, password) = secret.split_once(':').unwrap_or((secret, ""));
+        format!("Basic {}", logit_proto::auth::basic_credential(username, password))
+    };
+    vec![
+        ("bearer", seed("token-a", "Bearer token-a")),
+        ("bearer-case", seed("token-a", "  bEaReR\ttoken-a ")),
+        ("bearer-wrong", seed("token-a", "Bearer token-b")),
+        ("basic", seed("alice:pa:ss", &basic("alice:pa:ss"))),
+        ("basic-wrong", seed("alice:pa:ss", &basic("alice:pa"))),
+        ("scheme-only", seed("token-a", "Bearer")),
+        ("other-scheme", seed("token-a", "Token token-a")),
+        ("empty", seed("token-a", "")),
     ]
 }
 
@@ -1425,6 +1455,7 @@ mod tests {
                 "graphite_pickle",
                 "graphite_plaintext",
                 "hll_bytes",
+                "http_auth",
                 "influxdb_line",
                 "message_csv",
                 "message_json",
