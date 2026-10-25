@@ -195,14 +195,24 @@ impl TlsClientSettings {
     }
 }
 
+/// A copy of `cfg` offering `h2` and `http/1.1` through ALPN, the list `reqwest` sets on a config
+/// it builds itself. `reqwest` uses a config passed to `use_preconfigured_tls` as given and speaks
+/// h2 only when the server picks it through ALPN, so an HTTP client with a `tls:` block needs this
+/// to negotiate h2 as one without does. The cert resolver and verifier are shared with `cfg`, so a
+/// reload reaches the copy.
+pub fn with_http_alpn(cfg: &rustls::ClientConfig) -> rustls::ClientConfig {
+    let mut cfg = cfg.clone();
+    cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    cfg
+}
+
 /// Builds a `rustls::ClientConfig` from `settings`, with every path resolved against `base_dir`,
 /// and registers its files with `reloader` under the owning component's `diag` and `telemetry`.
 ///
 /// Registers `ca_file` and the `cert_file`/`key_file` pair, whichever are set, and nothing when
 /// neither is. `insecure_skip_verify` ignores `ca_file`, and the default Mozilla roots are compiled
 /// in, so neither has anything to reload. ALPN stays empty: `otlp_out`'s gRPC connector panics on
-/// a config that sets it. An HTTP sink sets it on its own copy (`logit_outputs::http`'s
-/// `client_builder`).
+/// a config that sets it. An HTTP client sets it on its own copy through [`with_http_alpn`].
 ///
 /// Fails on a file that's missing or doesn't parse, and on a key that doesn't match its
 /// certificate: at startup a bad file stops the process, where a reload keeps the old material.

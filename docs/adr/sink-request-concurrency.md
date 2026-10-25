@@ -180,7 +180,9 @@ in flight on its own outcome, so a fault on one batch neither resends nor drops 
   No per-sink knob. The feature sets ALPN only on the config `reqwest` builds itself: a sink with
   a `tls:` block hands it a preconfigured config, used as given, and the shared client builder
   leaves ALPN empty for `otlp_out`'s gRPC connector, so the HTTP sinks' client builder sets
-  `h2` and `http/1.1` on its own copy.
+  `h2` and `http/1.1` on its own copy (`logit_pipeline::tls::with_http_alpn`). `prometheus_in`'s
+  scrape client does the same under `scrape_tls:`, so a target is scraped over h2 with or without
+  the block.
 - **A cold pool dials per request.** Until a handshake has shown h2, `hyper-util`'s pool dials
   a connection for each request waiting, so a burst of `concurrency` requests to an idle sink
   opens that many; the first to negotiate h2 carries them all and the rest close unused.

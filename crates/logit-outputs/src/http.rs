@@ -119,9 +119,8 @@ pub(crate) async fn exchange(request: reqwest::RequestBuilder) -> Exchange {
 /// `tls` is `None` when no `tls:` block is set: `reqwest`'s default already trusts the bundled
 /// Mozilla roots for an `https://` endpoint, and offers `h2` and `http/1.1` through ALPN. `Some`
 /// carries a config built from operator settings by `logit_pipeline::tls::build_client_config`,
-/// which leaves ALPN empty for `otlp_out`'s gRPC connector; `reqwest` uses a preconfigured config
-/// as given and speaks h2 only when the server picks it through ALPN, so [`client_builder`] sets
-/// the same two protocols on its own copy.
+/// which leaves ALPN empty for `otlp_out`'s gRPC connector; [`client_builder`] sets the same two
+/// protocols on its own copy (`logit_pipeline::tls::with_http_alpn`).
 ///
 /// `timeout` is the client-wide default; both callers also set a per-request `.timeout(..)`,
 /// which is what bounds each request.
@@ -152,10 +151,6 @@ pub(crate) fn build_client(
         .expect("reqwest client should build with the configured TLS settings")
 }
 
-/// The protocols an HTTP sink offers through ALPN, in `reqwest`'s own order for its default
-/// config: h2 when the server speaks it, else HTTP/1.1.
-const HTTP_ALPN: [&[u8]; 2] = [b"h2", b"http/1.1"];
-
 /// [`build_client`]'s settings, unbuilt, for a caller that changes one, such as the proxy.
 pub(crate) fn client_builder(
     timeout: Duration,
@@ -164,9 +159,7 @@ pub(crate) fn client_builder(
     let mut builder =
         reqwest::Client::builder().timeout(timeout).redirect(reqwest::redirect::Policy::none());
     if let Some(cfg) = tls {
-        let mut cfg = cfg.clone();
-        cfg.alpn_protocols = HTTP_ALPN.iter().map(|p| p.to_vec()).collect();
-        builder = builder.use_preconfigured_tls(cfg);
+        builder = builder.use_preconfigured_tls(logit_pipeline::tls::with_http_alpn(cfg));
     }
     builder
 }
