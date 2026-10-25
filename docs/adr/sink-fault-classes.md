@@ -462,10 +462,10 @@ failed request's own:
   is skipped. The gate mutes their encode-side counters on a repeat.
 - Under `at_most_once`, `logit.component.events.dropped{reason="ambiguous_at_most_once"}` counts
   every event of a dropped batch, including events whose requests were delivered; the per-route
-  `records.dropped` is the precise count. A later route's count is the plan's weight for `datadog_out`
-  and the stats group count for `datadog_trace_out`, an upper bound: it includes entries the encode
-  would have skipped or dropped `oversize`, which no reason counts because the batch dropped before
-  that route.
+  `records.dropped` is the precise count. [Amended on 2026-10-25 by [ADR
+  `sink-request-concurrency`](sink-request-concurrency.md): every route is encoded before the
+  first request, so each route counts the entries its unsent requests carry, and an entry the
+  encode skipped or dropped `oversize` keeps its own reason.]
 - A request's `rejected` drop, a `413`'s `oversize`, and `records` for an accepted request count
   once per batch, not once per attempt.
 - The memory is in-process, and the request that drew an `Ambiguous` answer is resent under
