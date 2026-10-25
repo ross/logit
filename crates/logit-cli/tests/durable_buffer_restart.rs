@@ -419,9 +419,9 @@ async fn a_disk_backed_sink_keeps_delivering_across_a_rotation_once_the_reader_h
     assert_eq!(
         delivered,
         (0..TOTAL).collect::<Vec<_>>(),
-        "all {TOTAL} markers should have been delivered, in order, exactly once -- pre-fix, the \
-         reader would park forever on `not_empty` the first time it caught up mid-active-segment \
-         and that segment later rotated away"
+        "all {TOTAL} markers should have been delivered, in order, exactly once -- a reader \
+         that parks on `not_empty` the first time it catches up mid-active-segment never wakes \
+         when that segment later rotates away"
     );
 
     std::fs::remove_dir_all(&dir).ok();
