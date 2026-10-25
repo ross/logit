@@ -195,7 +195,7 @@
 //!
 //! | Point | Meaning |
 //! |---|---|
-//! | `logit.output.requests{route, class}` | one per request; `route` is `traces` or `stats`, `class` [`crate::http::status_class`]'s or `network_error` |
+//! | `logit.output.requests{route, class}` | one per request; `route` is `traces` or `stats`, `class` [`crate::http::status_class`]'s or [`crate::http::transport_class`]'s |
 //! | `logit.output.request.duration{route}` | one timer per request |
 //! | `logit.output.request.bytes{route}` | the body as sent, after compression, for a request that got an answer or failed after it may have left; not for a refused connection or a missing socket file |
 //! | `logit.output.records{route}` | spans (`traces`) or stats groups (`stats`) in a request the Agent accepted |
@@ -216,7 +216,7 @@
 use crate::accounting::BatchAccounting;
 use crate::http::{
     body_snippet, build_client, classify_reqwest_error, read_body_prefix, split_encode,
-    status_class, Caps, Encoded, Journal, Outcomes, Slots, DEFAULT_IDLE_TIMEOUT,
+    status_class, transport_class, Caps, Encoded, Journal, Outcomes, Slots, DEFAULT_IDLE_TIMEOUT,
     ERROR_BODY_SNIPPET_BYTES,
 };
 /// `tls:`: the shared `crate::tls` type, re-exported as the other sinks do.
@@ -1153,7 +1153,7 @@ impl Poster {
                 journal.count(
                     REQUESTS,
                     1.0,
-                    &[("route", route.name()), ("class", "network_error")],
+                    &[("route", route.name()), ("class", transport_class(fault))],
                 );
                 return Err(err
                     .context(format!(
@@ -1946,7 +1946,7 @@ mod tests {
         assert_eq!(logit_pipeline::classify(&err), Fault::Clean);
         let points = registry.drain(0);
         assert_eq!(
-            total(&points, REQUESTS, &[("route", "traces"), ("class", "network_error")]),
+            total(&points, REQUESTS, &[("route", "traces"), ("class", "connect_error")]),
             1.0
         );
     }
@@ -2586,7 +2586,7 @@ mod tests {
             assert_eq!(logit_pipeline::classify(&err), Fault::Clean, "{err:#}");
             let points = registry.drain(0);
             assert_eq!(total(&points, REQUEST_BYTES, &[]), 0.0, "{err:#}");
-            let refused = [("route", "traces"), ("class", "network_error")];
+            let refused = [("route", "traces"), ("class", "connect_error")];
             assert_eq!(total(&points, REQUESTS, &refused), 1.0);
         }
     }

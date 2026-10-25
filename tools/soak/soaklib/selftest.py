@@ -6732,6 +6732,28 @@ def _http_ledger():
                "100-line batch)" in "\n".join(allowed["ledger.wire"].lines)
                and "2 transport-error attempt(s)" in allowed["ledger.wire"].detail,
                f"two transport-error attempts allow two batches, got {allowed['ledger.wire']}")
+        # Only an attempt the listener may have taken allows a batch: fifteen timeouts
+        # (`network_error`) allow fifteen, and fifteen refused dials (`connect_error`), which
+        # sent nothing, allow none.
+        timeouts = results("http-surplus-timeouts", steady_surplus=1650, timeline_extra=late,
+                           gen_edit=_at_offset("logit.output.requests", 230, 15, "out",
+                                               attrs={"class": "network_error"}))
+        expect(timeouts["ledger.wire"].status == checks.PASS
+               and "surplus allowed 1,700 (15 transport-error attempt(s) + 2 edge(s), x one "
+               "100-line batch)" in "\n".join(timeouts["ledger.wire"].lines),
+               f"fifteen timed-out attempts allow fifteen batches, got {timeouts['ledger.wire']}")
+        dials = results("http-surplus-connects", steady_surplus=1650, timeline_extra=late,
+                        gen_edit=_at_offset("logit.output.requests", 230, 15, "out",
+                                            attrs={"class": "connect_error"}))
+        expect(dials["ledger.wire"].status == checks.FAIL
+               and "W − X exceeds G by 1,650, over the 200 its 0 transport-error attempt(s) and "
+               "2 edge(s) allow" in dials["ledger.wire"].detail
+               and "surplus allowed 200 (0 transport-error attempt(s) + 2 edge(s), x one "
+               "100-line batch; 15 connect failure(s) allow none)"
+               in "\n".join(dials["ledger.wire"].lines)
+               and "0 transport-error attempt(s), 15 connect failure(s)"
+               in dials["ledger.wire"].detail,
+               f"fifteen refused dials allow no surplus, got {dials['ledger.wire']}")
         # A `503` isn't a transport error: it allows nothing.
         answered = _at_offset("logit.output.requests", 230, 2, "out", attrs={"class": "5xx"})
         refused = results("http-surplus-5xx", steady_surplus=350, timeline_extra=late,
@@ -11261,9 +11283,9 @@ def _idle_writer():
     """`ledger.wire` on an HTTP source whose writer delivers nothing for a while, a drain with
     no `events.delivered` point, and then its backlog at once, with a judged window's edge in
     the idle stretch: G holds flat to the burst, so no loss shows at the edge. And the boundary
-    rule between two judged runs: an opposite-signed pair nets up to the G that moved over the
-    generator interval straddling the boundary, and no further, and runs that don't touch never
-    net."""
+    rule at a boundary touching a judged run: an opposite-signed pair nets in full before the
+    surplus run's allowance applies, up to the G that moved over the generator interval
+    straddling the boundary and no further, and runs that don't touch never net."""
     idle = {_stamp(T0 + offset) for offset in range(160, 205, 5)}
     moved = {"in": 0, "out": 0}
 
@@ -11292,7 +11314,7 @@ def _idle_writer():
 
     # Judged windows that overlap, so their runs touch at +190 and +195, with W shifted between
     # drains: `shift` is `{offset: events}` added to the listener's `events.sent`.
-    def wire_with(name, shift):
+    def wire_with(name, shift, gen_edit=None):
         def edit(record):
             metric = record["metrics"][0]
             if (record["attributes"].get("component") == "in"
@@ -11305,19 +11327,29 @@ def _idle_writer():
                    + _http_fault("x2", "netem", "generator", 190, 200))
         with tempfile.TemporaryDirectory() as tmp:
             run_dir = _http_run(tmp, name, kind="otlp_in", timeline_extra=windows,
-                                sut_edit=edit)
+                                sut_edit=edit, gen_edit=gen_edit)
             return {r.id: r for r in checks.run_all(run_dir)}["ledger.wire"]
 
     # W 700 ahead of G at the boundary +195 and behind it at the next drain: an opposite-signed
-    # pair past the surplus run's allowance of 200 and inside the G that moved over the
-    # generator interval straddling it, 1,000. The 500 past the allowance nets; the 200 it
-    # excuses stays, as does the 200 of loss across from it, inside the pool's 500.
+    # pair inside the G that moved over the generator interval straddling it, 1,000, nets in
+    # full.
     within = wire_with("boundary-within", {195: 700, 200: -700})
     expect(within.status == checks.PASS
-           and any("500 netted across the boundary at +195s (G moved 1,000 over the generator "
-                   "interval straddling it), net gap -200" in line for line in within.lines),
+           and any("700 netted across the boundary at +195s (G moved 1,000 over the generator "
+                   "interval straddling it), net gap 0" in line for line in within.lines),
            f"an opposite-signed pair at a judged boundary nets inside the straddling G, got "
            f"{within}")
+    # The drain-skew case: a pair of 900 whose surplus run has six transport-error attempts,
+    # an allowance of 800. Netting only the surplus past the allowance would move 100 and leave
+    # 800 of loss, past the pool's 500; the pair nets in full first.
+    skew = wire_with("boundary-skew", {195: 900, 200: -900},
+                     gen_edit=_at_offset("logit.output.requests", 195, 6, "out",
+                                         attrs={"class": "network_error"}))
+    expect(skew.status == checks.PASS
+           and any("900 netted across the boundary at +195s" in line and "net gap 0" in line
+                   and "surplus allowed 800 (6 transport-error attempt(s)" in line
+                   for line in skew.lines),
+           f"a pair nets in full before the surplus run's allowance applies, got {skew}")
     # The same pair beyond that G: only 1,000 nets, and the rest FAILs both ways.
     beyond = wire_with("boundary-beyond", {195: 1400, 200: -1400})
     expect(beyond.status == checks.FAIL
@@ -11332,21 +11364,24 @@ def _idle_writer():
            and any(line.startswith("[+190s, +195s] judged") and "gap -60" in line
                    and "2 edge(s)" in line for line in edged.lines),
            f"a judged run between two others has two edges' allowance, got {edged}")
-    # A loss of 600 next to a surplus of 150 that its run's two edges excuse: the excused
-    # surplus nets nothing, so the loss stands past the pool's 500.
-    excused = wire_with("boundary-excused", {195: 150, 200: -600})
+    # A loss of 800 next to a surplus of 150 that its run's two edges would excuse: the
+    # surplus nets, and the 650 of loss left stands past the pool's 500.
+    excused = wire_with("boundary-excused", {195: 150, 200: -800})
     expect(excused.status == checks.FAIL
-           and not any("netted" in line for line in excused.lines)
-           and excused.detail.startswith("600 lost outside reported HTTP windows"),
-           f"a surplus inside its own allowance can't hide a loss next to it, got {excused}")
-    # A loss of 600 next to a surplus of 250, 50 past its run's allowance of 200: only the 50
-    # nets, so the 550 left stands past the pool's 500. Netting the excused 200 too would bring
-    # it to 350 and hide it.
-    past = wire_with("boundary-past", {195: 250, 200: -600})
-    expect(past.status == checks.FAIL
-           and any("50 netted across the boundary at +195s" in line for line in past.lines)
-           and past.detail.startswith("550 lost outside reported HTTP windows"),
-           f"only the surplus past its allowance nets against a loss next to it, got {past}")
+           and any("150 netted across the boundary at +195s" in line
+                   and "net gap 650" in line for line in excused.lines)
+           and excused.detail.startswith("650 lost outside reported HTTP windows"),
+           f"a surplus nets only itself against a loss next to it, got {excused}")
+    # A judged run's loss of 1,600 at the boundary +245 next to a steady run's surplus of 1,600:
+    # the steady surplus nets the loss only up to the 1,000 of G that moved over the generator
+    # interval straddling +245, so 600 of loss stands past the pool's 500.
+    steady = wire_with("boundary-steady", {245: -1600, 250: 1600})
+    expect(steady.status == checks.FAIL
+           and any(line.startswith("[+245s, +300s] steady")
+                   and "1,000 netted across the boundary at +245s" in line
+                   for line in steady.lines)
+           and steady.detail.startswith("600 lost outside reported HTTP windows"),
+           f"a steady surplus nets a judged loss only up to the straddling G, got {steady}")
     # A loss in one judged window and a surplus in another that doesn't touch it: nothing
     # nets, so the loss and the surplus each FAIL.
     apart = wire_with("boundary-apart", {150: -800, 220: 800})
@@ -11356,6 +11391,30 @@ def _idle_writer():
            in apart.lines[1]
            and apart.detail.startswith("800 lost outside reported HTTP windows"),
            f"a loss next to a surplus in another window FAILs, got {apart}")
+
+
+def _boundary_skew():
+    """`checks._boundary_nets` on the drain skew of `otlp-fan-out-conc`'s run
+    `20261025T212954Z`: a restart's backlog flush put −2,154 before the boundary at +665 and
+    +2,159 after it, with 4,950 of G moved over the generator interval straddling it. The pair
+    nets in full, whatever the surplus run's resend allowance."""
+    runs = [[629.0, 665.0, "judged", "pause, stop", 1196, 3350, 0],
+            [665.0, 670.0, "judged", "stop", 4659, 2500, 0]]
+    anchors = [(660.0, 100_000.0), (667.0, 104_950.0)]
+    nets, netted = checks._boundary_nets(runs, anchors)
+    expect([round(net) for net in nets] == [0, 5]
+           and netted.get(0) == [(2154, 665.0, 4950.0)],
+           f"the drain-skew pair nets 2,154 across +665, leaving 5 of loss, got {nets} {netted}")
+    # The same pair beside a straddling G of 1,000 nets only that far.
+    capped, _ = checks._boundary_nets(runs, [(660.0, 0.0), (667.0, 1000.0)])
+    expect([round(net) for net in capped] == [-1154, 1159],
+           f"the transfer stops at the straddling G, got {capped}")
+    # A steady run beside a judged one nets; a reported or end run never does.
+    for kind, want in (("steady", [0, 5]), ("fault", [-2154, 2159]), ("end", [-2154, 2159])):
+        mixed = [runs[0], [*runs[1][:2], kind, *runs[1][3:]]]
+        got, _ = checks._boundary_nets(mixed, anchors)
+        expect([round(net) for net in got] == want,
+               f"a judged run beside a {kind} run nets to {want}, got {got}")
 
 
 def _fan_out_rules(root):
@@ -11454,7 +11513,7 @@ def run(root, quiet=False):
                      _overlap_driver, _overlap_checks, _idp_rules, _refresh_checks,
                      _signal_rules, _signal_actions, _sighup_driver,
                      _reopen_checks, _tls_rules, _tls_actions, _tls_driver, _tls_checks,
-                     _fan_out_ledger, _idle_writer, _fan_out_rules, _shipped):
+                     _fan_out_ledger, _idle_writer, _boundary_skew, _fan_out_rules, _shipped):
             try:
                 takes_root = (_rules, _expect_rules, _expand, _random, _signals, _hung_inspect,
                               _stalled, _stall_abort,

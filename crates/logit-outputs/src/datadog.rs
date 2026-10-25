@@ -314,7 +314,7 @@
 //!
 //! | Point | Meaning |
 //! |---|---|
-//! | `logit.output.requests{route, class}` | one per request; `class` is [`crate::http::status_class`]'s, or `network_error` |
+//! | `logit.output.requests{route, class}` | one per request; `class` is [`crate::http::status_class`]'s, or [`crate::http::transport_class`]'s |
 //! | `logit.output.request.duration{route}` | one timer per request |
 //! | `logit.output.request.bytes{route}` | the body as sent, after compression, for a request that got an answer or failed after it may have left; not for a refused connection |
 //! | `logit.output.records{route}` | entries in a request Datadog accepted, less those its series `202` body names |
@@ -339,8 +339,8 @@ use crate::accounting::BatchAccounting;
 use crate::http::classify_status;
 use crate::http::{
     build_client, classify_reqwest_error, error_read_bytes, read_body_bytes, read_body_prefix,
-    read_varint, redacted_snippet, skip_field, split_encode, status_class, Caps, Encoded, Journal,
-    Outcomes, Slots, DEFAULT_IDLE_TIMEOUT,
+    read_varint, redacted_snippet, skip_field, split_encode, status_class, transport_class, Caps,
+    Encoded, Journal, Outcomes, Slots, DEFAULT_IDLE_TIMEOUT,
 };
 /// `tls:`: the shared `crate::tls` type, re-exported as the other sinks do.
 pub use crate::tls::TlsClientSettings;
@@ -1506,7 +1506,7 @@ impl Poster {
                 journal.count(
                     REQUESTS,
                     1.0,
-                    &[("route", route.name()), ("class", "network_error")],
+                    &[("route", route.name()), ("class", transport_class(fault))],
                 );
                 return Err(anyhow::Error::new(err)).context(fault);
             }
@@ -3559,7 +3559,7 @@ mod tests {
         assert_eq!(logit_pipeline::classify(&err), Fault::Clean);
         let points = registry.drain(0);
         assert_eq!(total(&points, REQUEST_BYTES, &[]), 0.0);
-        let refused = [("route", "series"), ("class", "network_error")];
+        let refused = [("route", "series"), ("class", "connect_error")];
         assert_eq!(total(&points, REQUESTS, &refused), 1.0);
     }
 

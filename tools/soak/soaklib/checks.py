@@ -1465,14 +1465,18 @@ AMBIGUOUS_DROP = "ambiguous_at_most_once"
 # their batch is in every inbox, after W counted it, so no window can lose a point G counted. A
 # SIGKILL or an exit loses up to one `internal` interval of the SUT's unexported W, so those
 # windows are reported. Every other window is judged with a surplus allowed of one generator
-# batch per attempt that ended in a transport error (`HTTP_AMBIGUOUS_CLASS`): the writer sends
-# one batch per request with one request in flight (crates/logit-outputs/src/influxdb.rs,
-# "Response classes"; crates/logit-outputs/src/otlp.rs) and resends the whole batch after such
-# an attempt, so each can leave at most one batch the listener took that G never counts. The
-# class also counts a refused dial, which takes nothing, so the allowance is an upper bound. A
-# `503` takes nothing or counts what it refused as X (`HTTP_LISTENERS`), and adds none.
+# batch per attempt that ended in an ambiguous transport error (`HTTP_AMBIGUOUS_CLASS`, a
+# timeout or a connection reset or closed before the answer): the writer sends one batch per
+# request with one request in flight (crates/logit-outputs/src/influxdb.rs, "Response classes";
+# crates/logit-outputs/src/otlp.rs) and resends the whole batch after such an attempt, so each
+# can leave at most one batch the listener took that G never counts. A connect failure
+# (`HTTP_CONNECT_CLASS`: a refused or failed dial, a DNS failure) sent nothing and adds none.
+# A writer built before the HTTP sinks split the two counts both as `network_error`, so on its
+# run the allowance is an upper bound. A `503` takes nothing or counts what it refused as X
+# (`HTTP_LISTENERS`), and adds none.
 HTTP_REPORTED_ACTIONS = ("kill", "exit")
 HTTP_AMBIGUOUS_CLASS = "network_error"
+HTTP_CONNECT_CLASS = "connect_error"
 
 
 def source_wire(source):
@@ -2969,36 +2973,39 @@ def check_ledger_wire(data):
     return Result("ledger.wire", worst(statuses), " | ".join(details), lines)
 
 
-def _boundary_nets(runs, anchors, allowances):
+def _boundary_nets(runs, anchors):
     """`(nets, netted)`: each run's gap, G − (W + K + F), after netting across every boundary
-    between two judged runs whose gaps have opposite signs, and `{index: [(moved, at,
-    straddled)]}` for each run a transfer touched. `allowances` is each judged run's surplus
-    allowance, by index.
+    that touches a judged run, judged or steady on its other side, where the two gaps have
+    opposite signs, and `{index: [(moved, at, straddled)]}` for each run a transfer touched.
 
     G is interpolated between generator drains, so at a SUT drain inside a generator interval
     its error is up to the G that moved in that interval: one batch while acknowledgments arrive
     steadily, but many when they bunch, as under netem with one request in flight or when a
-    restart flushes a backlog. The error moves G from one side of the boundary to the other, an
-    opposite-signed pair in the two runs that touch. A transfer is capped at the G that moved
-    over the generator anchor pair straddling the boundary, and at either gap, so neither run
-    changes sign. Only the part of a surplus past its run's own allowance nets: the part inside
-    it is excused already, and netting it too would let it hide a loss next door. A
-    judged-to-steady edge has its one-batch tolerance instead, and a steady run never nets with
-    a judged one."""
+    restart flushes a backlog, and a few tenths of a second's shift in where a drain lands
+    against that burst moves thousands of events across the boundary. The error moves G from one
+    side of the boundary to the other, an opposite-signed pair in the two runs that touch, and
+    nothing in the counts tells it from a resend beside a loss. So the pair nets in full before
+    `_wire_one` applies the surplus run's resend allowance to what's left. A transfer is capped
+    at the G that moved over the generator anchor pair straddling the boundary (`straddled`),
+    the most interpolation can move, and at either gap, so neither run changes sign. That cap is
+    what keeps a surplus from hiding a loss next door: a resend's surplus or a steady run's,
+    which otherwise counts at 0, nets a loss only as far as interpolation could explain it.
+    Runs that don't touch, and a reported or end run, never net."""
     nets = [g - wk for _, _, _, _, g, wk, _ in runs]
     netted = {}
     stamps = [t for t, _ in anchors]
     for index in range(len(runs) - 1):
-        left, right = runs[index], runs[index + 1]
-        if left[2] != "judged" or right[2] != "judged" or nets[index] * nets[index + 1] >= 0:
+        kinds = {runs[index][2], runs[index + 1][2]}
+        if ("judged" not in kinds or not kinds <= {"judged", "steady"}
+                or nets[index] * nets[index + 1] >= 0):
             continue
-        at = left[1]
+        at = runs[index][1]
         upper = bisect.bisect_left(stamps, at)
         if upper == 0 or upper >= len(anchors):
             continue
         straddled = anchors[upper][1] - anchors[upper - 1][1]
         loss, surplus = (index, index + 1) if nets[index] > 0 else (index + 1, index)
-        moved = min(-nets[surplus] - allowances[surplus], nets[loss], straddled)
+        moved = min(-nets[surplus], nets[loss], straddled)
         # An interpolated G leaves fractions; less than one event isn't worth a transfer.
         if moved < 1:
             continue
@@ -3014,9 +3021,10 @@ def _ambiguous_drops(led, source):
     """`[(timestamp, count)]` of what can leave one generator batch in W that G doesn't count,
     so `ledger.wire` and `_end_to_end` allow that much surplus per count: on a TCP wire the
     generator sink's `ambiguous_at_most_once` batch drops, each a write that failed partway, and
-    on an HTTP wire its attempts that ended in a transport error (`HTTP_AMBIGUOUS_CLASS`), each
-    a request the listener may have taken before the answer was lost. Empty on any other
-    wire."""
+    on an HTTP wire its attempts that ended in an ambiguous transport error
+    (`HTTP_AMBIGUOUS_CLASS`), each a request the listener may have taken before the answer was
+    lost; a connect failure (`HTTP_CONNECT_CLASS`) sent nothing and isn't one. Empty on any
+    other wire."""
     wire = source_wire(source)
     if wire == "tcp":
         name, attrs = "logit.component.batches.dropped", {"reason": AMBIGUOUS_DROP}
@@ -3083,14 +3091,17 @@ def _wire_one(data, led, source, instances=None):
             sides = sum(1 for other in (index - 1, index + 1) if 0 <= other < len(runs))
             drops = sum(v for ts, v in ambiguous if start < ts <= end)
             allowances[index] = (drops + sides) * batch
-    nets, netted = _boundary_nets(runs, anchors, allowances)
+    connects = (sorted((ts, v) for sink in source_ids(source, "generator_sink")
+                       for ts, v, _ in led.gens[service].counter_points(
+                           "logit.output.requests", component=sink,
+                           **{"class": HTTP_CONNECT_CLASS}))
+                if http else [])
     # Each steady or judged run counts at 0 when W + K + F exceeds G in it, so a surplus in one
-    # run can't net out loss in another. The one exception is a boundary between two judged
-    # runs (`_boundary_nets`). G is interpolated there, and when acknowledgments bunch, under
-    # one request in flight or a restart's backlog flush, its error is up to the G that moved
-    # in the generator interval straddling the boundary, an opposite-signed pair in the two runs
-    # that touch. So the part of a surplus past its run's allowance moves across, up to that G,
-    # and no further.
+    # run can't net out loss in another. The one exception is a boundary that touches a judged
+    # run, where an opposite-signed pair nets in full, up to the G that moved over the generator
+    # interval straddling it, before the surplus run's allowance applies to what's left
+    # (`_boundary_nets` says why).
+    nets, netted = _boundary_nets(runs, anchors)
     steady_lost = 0.0
     g_steady = 0.0
     edges = 0
@@ -3124,8 +3135,11 @@ def _wire_one(data, led, source, instances=None):
             sides = sum(1 for other in (index - 1, index + 1) if 0 <= other < len(runs))
             allowed = allowances[index]
             what = "transport-error attempt(s)" if http else "ambiguous drop(s)"
+            dials = sum(v for ts, v in connects if start < ts <= end)
             lines[-1] += (f", surplus allowed {_n(allowed)} ({_n(drops)} {what} + "
-                          f"{sides} edge(s), x one {_n(batch)}-line batch)")
+                          f"{sides} edge(s), x one {_n(batch)}-line batch"
+                          + (f"; {_n(dials)} connect failure(s) allow none" if dials else "")
+                          + ")")
             if -net > allowed:
                 took = "W − X" if http else "W + counted"
                 surplus.append(f"{span}: {took} exceeds G by {_n(round(-net))}, over "
@@ -3178,7 +3192,8 @@ def _wire_one(data, led, source, instances=None):
                   f"windows, {_n(round(sums['steady']))} steady, {_n(round(sums['end']))} at "
                   f"the end; loss judged {_n(round(steady_lost))}, each run at 0 or more, "
                   f"against limit {_n(round(allowed))}); the generator's requests: "
-                  f"{_n(sum(v for _, v in ambiguous))} transport-error attempt(s), {retries}; "
+                  f"{_n(sum(v for _, v in ambiguous))} transport-error attempt(s), "
+                  f"{_n(sum(v for _, v in connects))} connect failure(s), {retries}; "
                   f"its counted loss, not in G: {_n(stats['dropped_events'])} event(s) in "
                   f"{_n(stats['dropped_batches'])} batch(es)"
                   + (f" ({_reasons(stats['dropped_by'])})" if stats["dropped_by"] else ""))
@@ -5076,7 +5091,8 @@ def check_ledger_standin(data):
     hole that a rejected step's drop credit would let `ledger.egress` count; no resend stored a
     different value for a sample already stored; per SUT life, the
     record's requests by status class equal the sink's `logit.output.requests` for 2xx to 5xx,
-    and its resets are at most the sink's `network_error`, which a connect failure also counts;
+    and its resets are at most the sink's `network_error`; a refused or failed dial,
+    `connect_error`, never reaches the record;
     every answer other than the default carries the cue of a `respond` step and falls inside
     its span, and every write went to the stand-in's path; each step with a `count` answered
     that many writes to the path under its cue; and each step with a `class` shows
@@ -5165,7 +5181,8 @@ def check_ledger_standin(data):
                 cls = point.attributes.get("class", "?")
                 counted[cls] = counted.get(cls, 0) + point.value
         verdict = WARN if life in led.killed and life != led.final else FAIL
-        for cls in sorted((set(recorded) | set(counted)) - {"network_error"}):
+        unrecorded = {"network_error", HTTP_CONNECT_CLASS}
+        for cls in sorted((set(recorded) | set(counted)) - unrecorded):
             if recorded.get(cls, 0) != counted.get(cls, 0):
                 flag(verdict, f"life {life}: the stand-in answered {_n(recorded.get(cls, 0))} "
                               f"request(s) {cls}, {sink} counted {_n(counted.get(cls, 0))}")

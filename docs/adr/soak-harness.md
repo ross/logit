@@ -1,6 +1,6 @@
 ---
 created: 2026-10-08
-updated: 2026-10-18
+updated: 2026-10-25
 ---
 
 # A soak harness: real containers over ordinary config, one-shot netem, and a reset-aware ledger as the loss oracle
@@ -419,7 +419,8 @@ G counts an event only after the listener's batch was in every inbox and W had c
 only a `kill` or an `exit` of the SUT, which can lose its last unexported interval, is reported;
 every other window is judged. A judged window may show a surplus, W − X above G, of one
 generator batch per attempt the writer counted `logit.output.requests{class="network_error"}`
-in it, plus one per edge: the writer sends one batch per request, one request in flight, and
+in it, plus one per edge (a failed dial counts `connect_error` and allows none; see "a boundary
+pair nets in full" below): the writer sends one batch per request, one request in flight, and
 resends it after a transport error, when the listener may already have taken it. The same
 allowance, with X left out of the counted loss, bounds `ledger.summary`'s end to end.
 `influxdb_in`'s request identities are judged in `ledger.intake`.
@@ -543,3 +544,32 @@ every row's excusal, and the ledger and `recovery` need it tight.
 
 Growth across a whole run still FAILs under a settle window: a fixture of `cardinality`'s +73
 and +61 MiB/h leak FAILs with 60 s in force.
+
+## Amendment: a boundary pair nets in full, and only an attempt the listener may have taken allows a resend (2026-10-25)
+
+An `otlp-fan-out-conc` run FAILed `ledger.wire` with nothing lost. After the SUT's restart the
+generator's reconnect landed about 0.4 s later against its drain than in a passing run, so G's
+interpolation put the restart's backlog across a run boundary: −2,154 before it and +2,159 after
+it, with 4,950 of G moved over the generator interval straddling it. Under the rule above only
+the surplus past its run's allowance netted, and that allowance, 850, was mostly 15 transport
+errors that were refused dials and DNS failures, which take nothing. 855 of phantom loss stayed
+in the pool, past its limit of 650.
+
+- **A boundary pair nets in full.** At a boundary that touches a judged run, with a judged or a
+  steady run on the other side, an opposite-signed pair nets up to the G that moved over the
+  generator interval straddling it, before the surplus run's allowance applies to what's left.
+  The counts can't tell interpolation error from a resend beside a loss, and interpolation can
+  move that much G. The cap is what keeps a resend's surplus, or a steady run's, from hiding
+  more loss than interpolation explains. This replaces the previous amendment's rule that only
+  the surplus past the allowance nets.
+- **Only an ambiguous attempt allows a resend.** The HTTP sinks count a request whose dial
+  failed as `logit.output.requests{class="connect_error"}`, apart from `network_error`
+  ([ADR `sink-send-path-and-attempt-accounting`](sink-send-path-and-attempt-accounting.md)'s
+  amendment of the same date). Only `network_error`, a timeout or a reset after which the
+  listener may hold the batch, allows one batch of surplus. A run recorded before the split
+  counts both as `network_error`, and its allowance stays an upper bound.
+
+Re-scored, the failed run PASSes with 90 of loss judged against 650, and the passing run reads
+96 as before. A backend stop still opens no judged HTTP window: whether it reaches the wire
+depends on the listener (`otlp_in` holds a request past the writer's timeout, `influxdb_in`
+answers a busy `503`), so its resends' surplus counts 0 as steady state's does.

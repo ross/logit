@@ -165,8 +165,8 @@ use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 
 use crate::http::{
     body_snippet, build_client, classify_reqwest_error, classify_status, read_body_prefix,
-    read_varint, skip_field, status_class, Journal, Outcomes, Slots, DEFAULT_IDLE_TIMEOUT,
-    ERROR_BODY_SNIPPET_BYTES,
+    read_varint, skip_field, status_class, transport_class, Journal, Outcomes, Slots,
+    DEFAULT_IDLE_TIMEOUT, ERROR_BODY_SNIPPET_BYTES,
 };
 use std::collections::HashMap;
 use std::path::Path;
@@ -648,12 +648,12 @@ impl Sender {
                 Err(err)
             }
             Err(err) => {
+                let fault = classify_reqwest_error(&err);
                 journal.count(
                     "logit.output.requests",
                     1.0,
-                    &[("signal", signal.as_str()), ("class", "network_error")],
+                    &[("signal", signal.as_str()), ("class", transport_class(fault))],
                 );
-                let fault = classify_reqwest_error(&err);
                 Err(anyhow::Error::new(err)).context(fault)
             }
         }
@@ -685,7 +685,7 @@ impl Sender {
                 journal.count(
                     "logit.output.requests",
                     1.0,
-                    &[("signal", signal.as_str()), ("class", "network_error")],
+                    &[("signal", signal.as_str()), ("class", transport_class(fault))],
                 );
                 return Err(err).context(fault);
             }
@@ -1298,14 +1298,21 @@ mod tests {
         assert_eq!(logit_pipeline::classify(&err), Fault::Rejected);
     }
 
+    /// A refused dial is `Clean`, and its request counts `connect_error`, not `network_error`.
     #[tokio::test]
     async fn connect_refused_is_classified_clean() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         drop(listener);
-        let mut output = http_output(addr);
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("out", "otlp_out", "sink");
+        let mut output = http_output(addr).with_telemetry(telemetry);
         let err = output.send(&metric_batch()).await.expect_err("should fail");
         assert_eq!(logit_pipeline::classify(&err), Fault::Clean);
+        let totals = Totals::of(registry.drain(0));
+        let refused = [("signal", "metrics"), ("class", "connect_error")];
+        assert_eq!(totals.sum("logit.output.requests", &refused), 1.0);
+        assert!(!totals.has("logit.output.requests", &[("class", "network_error")]));
     }
 
     /// A connect failure after an accepted request stays `Clean`: a retry resends only the
@@ -1681,8 +1688,14 @@ mod tests {
     #[tokio::test]
     async fn grpc_connect_refused_is_clean() {
         let addr = crate::test_support::refused_addr().await;
-        let err = grpc_output(addr).send(&metric_batch()).await.unwrap_err();
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("out", "otlp_out", "sink");
+        let err =
+            grpc_output(addr).with_telemetry(telemetry).send(&metric_batch()).await.unwrap_err();
         assert_eq!(logit_pipeline::classify(&err), Fault::Clean, "{err:#}");
+        let totals = Totals::of(registry.drain(0));
+        let refused = [("signal", "metrics"), ("class", "connect_error")];
+        assert_eq!(totals.sum("logit.output.requests", &refused), 1.0);
     }
 
     /// An HTTP/2 peer that serves one connection and stops listening once it accepted it. It

@@ -86,11 +86,11 @@ pub(crate) enum Reply {
 }
 
 impl Reply {
-    /// The `class` tag on `logit.output.requests`: [`status_class`], or `network_error`.
+    /// The `class` tag on `logit.output.requests`: [`status_class`], or [`transport_class`].
     pub(crate) fn class(&self) -> &'static str {
         match self {
             Reply::Success(status) | Reply::Failure { status, .. } => status_class(*status),
-            Reply::Transport(_) => "network_error",
+            Reply::Transport(err) => transport_class(classify_reqwest_error(err)),
         }
     }
 }
@@ -311,8 +311,8 @@ fn strip_secret_remnant(snippet: String, secret: &str) -> String {
 /// A coarse HTTP response-status bucket: the `class` tag on `logit.output.requests`.
 ///
 /// Six values and no more. A `429` stays a `4xx`; [`classify_status`] is what reads it
-/// for the [`Fault`]. A timeout isn't a status, so each caller counts it as `"network_error"` on
-/// its own transport-error arm.
+/// for the [`Fault`]. A timeout isn't a status, so each caller counts a transport error with
+/// [`transport_class`] on its own transport-error arm.
 pub(crate) fn status_class(status: reqwest::StatusCode) -> &'static str {
     match status.as_u16() / 100 {
         1 => "1xx",
@@ -321,6 +321,19 @@ pub(crate) fn status_class(status: reqwest::StatusCode) -> &'static str {
         4 => "4xx",
         5 => "5xx",
         _ => "other",
+    }
+}
+
+/// The `class` tag on `logit.output.requests` of a request that got no response, from its
+/// transport error's [`Fault`]: `connect_error` for a [`Fault::Clean`] connect failure (a refused
+/// or failed dial, a DNS failure, a failed TLS handshake), which the destination never saw, and
+/// `network_error` for the rest (a timeout, a connection reset or closed before the response),
+/// which it may have taken. A soak or an operator reading resends counts only `network_error`.
+pub(crate) fn transport_class(fault: Fault) -> &'static str {
+    if fault == Fault::Clean {
+        "connect_error"
+    } else {
+        "network_error"
     }
 }
 
@@ -712,6 +725,40 @@ mod tests {
             snippet.trim_end_matches('.').chars().all(|c| c == 'é'),
             "no partial character survives the cut: {snippet}"
         );
+    }
+
+    /// A refused dial took nothing, so its class is `connect_error`, apart from the
+    /// `network_error` a request the destination may have taken counts.
+    #[tokio::test]
+    async fn a_refused_dial_counts_connect_error() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let client = build_client(Duration::from_secs(5), DEFAULT_IDLE_TIMEOUT, None);
+        let exchange = exchange(client.post(format!("http://{addr}/")).body("x")).await;
+        assert!(matches!(exchange.reply, Reply::Transport(_)), "{:?}", exchange.reply);
+        assert_eq!(exchange.reply.class(), "connect_error");
+    }
+
+    /// A request the destination accepted the connection for and never answered may have been
+    /// taken, so its timeout counts `network_error`.
+    #[tokio::test]
+    async fn a_timed_out_request_counts_network_error() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let held = tokio::spawn(async move {
+            // Holds the connection open with no answer until the test ends.
+            let _socket = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let client = build_client(Duration::from_millis(200), DEFAULT_IDLE_TIMEOUT, None);
+        let exchange = exchange(client.post(format!("http://{addr}/")).body("x")).await;
+        held.abort();
+        match &exchange.reply {
+            Reply::Transport(err) => assert!(err.is_timeout(), "{err:?}"),
+            other => panic!("expected a transport error, got {other:?}"),
+        }
+        assert_eq!(exchange.reply.class(), "network_error");
     }
 
     /// A `3xx` is its own class and is rejected, so a redirect surfaces as a misconfiguration.

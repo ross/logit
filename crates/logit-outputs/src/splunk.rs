@@ -155,7 +155,7 @@
 //!
 //! | Point | Meaning |
 //! |---|---|
-//! | `logit.output.requests{route, class}` | one per request; `route` is `event` or `ack`, `class` is [`crate::http::status_class`]'s, or `network_error` |
+//! | `logit.output.requests{route, class}` | one per request; `route` is `event` or `ack`, `class` is [`crate::http::status_class`]'s, or [`crate::http::transport_class`]'s |
 //! | `logit.output.request.duration{route}` | one timer per request |
 //! | `logit.output.request.bytes{route}` | the body as sent, after compression, for a request that got an answer or failed after it may have left; a refused connection counts none |
 //! | `logit.output.records` | records in a body Splunk accepted, and those ahead of a code-6 object |
@@ -171,7 +171,7 @@
 use crate::accounting::BatchAccounting;
 use crate::http::{
     after_delivery, build_client, classify_reqwest_error, error_read_bytes, read_body_prefix,
-    redacted_snippet, status_class, Journal, Slots, DEFAULT_IDLE_TIMEOUT,
+    redacted_snippet, status_class, transport_class, Journal, Slots, DEFAULT_IDLE_TIMEOUT,
 };
 /// `tls:`: the shared `crate::tls` type, re-exported as the other sinks do.
 pub use crate::tls::TlsClientSettings;
@@ -744,7 +744,11 @@ impl Poster {
                 if fault != Fault::Clean {
                     journal.count(REQUEST_BYTES, wire_len as f64, &tags);
                 }
-                journal.count(REQUESTS, 1.0, &[("route", route), ("class", "network_error")]);
+                journal.count(
+                    REQUESTS,
+                    1.0,
+                    &[("route", route), ("class", transport_class(fault))],
+                );
                 Err(anyhow::Error::new(err).context(fault))
             }
         }
@@ -1948,7 +1952,7 @@ mod tests {
         assert_eq!(logit_pipeline::classify(&err), Fault::Clean);
         let points = registry.drain(0);
         assert_eq!(total(&points, REQUEST_BYTES, &[]), 0.0);
-        let refused = [("route", "event"), ("class", "network_error")];
+        let refused = [("route", "event"), ("class", "connect_error")];
         assert_eq!(total(&points, REQUESTS, &refused), 1.0);
     }
 
@@ -1986,7 +1990,7 @@ mod tests {
         let points = registry.drain(0);
         assert!(total(&points, REQUEST_BYTES, &[("route", "event")]) > 0.0);
         assert_eq!(total(&points, REQUEST_BYTES, &[("route", "ack")]), 0.0);
-        let refused = [("route", "ack"), ("class", "network_error")];
+        let refused = [("route", "ack"), ("class", "connect_error")];
         assert!(total(&points, REQUESTS, &refused) >= 1.0, "every poll was refused");
     }
 
