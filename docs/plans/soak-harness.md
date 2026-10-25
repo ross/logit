@@ -1859,11 +1859,11 @@ to it, as on an external target. Under `remote_write` and `influxdb`, `ledger.se
 **The scenarios.**
 
 - `standin-remote-write`: `statsd-vm`'s generator and SUT, with `prometheus_out` sending
-  remote-write 1.0 under `compression: snappy` to the stand-in. Nineteen 20 s steps, 105 s apart,
+  remote-write 1.0 under `compression: snappy` to the stand-in. Twenty 20 s steps, 105 s apart,
   walk the sink's sender-mode table: `503`, a `503` after storing the write (its resend stores
   the same samples again), `429`, `400` with `out of order sample`, `400` with each
   decompression prefix, `401`, `403`, `407`, `404`, `405`, `501`, `409`, `413`, `415`, `422`,
-  `302`, a reset, and a `stop` of the stand-in, each with its `class`. Under cumulative
+  `302`, a reset, a `stop` of the stand-in, and a `408`, each with its `class`. Under cumulative
   temporality the next window's totals overwrite a rejected batch, so the egress gap stays 0.
 - `standin-at-most-once`: the same SUT with `buffer.delivery: at_most_once`; a `503` and a reset
   drop `ambiguous_at_most_once`, a `401` holds, a `400` drops `rejected`.

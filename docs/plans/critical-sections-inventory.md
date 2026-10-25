@@ -2819,6 +2819,14 @@ surveyor's.
   `unrecoverable_garbage_at_the_end_of_a_closed_segment_is_skipped_and_counted`). The over-count,
   the whole-remainder re-walk, and the `Unavailable` retry that never checks `closed()` are
   unchanged; this entry stays unreviewed.
+- **Re-checked at `af2cf525` (2026-10-24); the follow-up isn't done.** `peek` checks `closed()` only
+  when no data is available, so its `Unavailable` sleep-retry still never does. The
+  resync-to-a-record branch of `read_record_at` still walks the whole remainder of the segment and
+  counts `corrupt_skipped.max(1)` over it. `open` still counts each corrupt region as one
+  `units_dropped` where the read path counts zero events, and the sentence in
+  `docs/design/internal-telemetry.md` that would state that difference isn't there. Closing the row
+  takes all three changes and a closed-spool `peek` case in
+  `open_never_truncates_a_record_that_would_have_parsed`.
 - **Existing coverage:** `peek_is_cached_across_repeated_calls_until_commit`,
   `live_resync_past_corruption_advances_the_cursor_past_the_skipped_bytes`,
   `a_corrupted_length_field_does_not_silently_discard_the_rest_of_the_segment`;

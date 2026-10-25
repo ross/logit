@@ -151,14 +151,19 @@ Entry format and the other areas: [the known-gaps index](README.md).
     (`crates/logit-outputs/src/http.rs`) and the `submit`/`await_ack` split for it. Concurrent
     requests can arrive out of order, so each sink's posture and each destination's tolerance for
     that need checking first.
-- **A `Rejected` batch has no dead-letter path, and no sink splits an oversize batch.** A batch
-  the destination rejects for its own content drops at once
+- **A `Rejected` batch has no dead-letter path, and no sink splits a batch in reaction to a
+  `413`.** A batch the destination rejects for its own content drops at once
   ([ADR `sink-fault-classes`](../adr/sink-fault-classes.md)) and is visible only in
   `batches.dropped{reason="rejected"}` and a throttled log event carrying the destination's text.
-  Nothing keeps the batch for inspection or replay. A `413` or equivalent drops the whole batch,
-  where Telegraf and libbeat halve it and retry. Only `splunk_hec_out` splits, and only for Splunk
-  Cloud's oversize answer.
+  Nothing keeps the batch for inspection or replay. A `413` or equivalent drops the whole request,
+  where Telegraf and libbeat halve the batch and retry; `datadog_out` and `datadog_trace_out`
+  count it `oversize`. Three sinks do split, none of them on a `413`: `datadog_out` and
+  `datadog_trace_out` cut a batch into requests before sending, under the destination's entry
+  count and body size (`split_encode` in `crates/logit-outputs/src/http.rs`), and
+  `splunk_hec_out` splits a body once when Splunk Cloud answers it with its oversize code 6. In
+  `otlp_out`, `influxdb_out`, and the other HTTP sinks, a batch over the destination's limit
+  drops whole.
   - **Workaround:** size the listener's batch bounds below the destination's limit, and read the
     diagnostic for the rejection text.
-  - **To close:** a dead-letter sink for rejected batches and a split-and-retry step in the shared
-    HTTP driver, each with its own ADR.
+  - **To close:** a dead-letter sink for rejected batches and a split-on-`413` retry step in the
+    shared HTTP driver, each with its own ADR.

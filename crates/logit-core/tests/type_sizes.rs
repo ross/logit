@@ -106,9 +106,9 @@ fn metric_kind_is_sized_by_its_two_largest_variants() {
         size_of::<MetricRecord>(),
         224,
         "MetricKind (176) + name: Symbol (4) + unit: Option<Symbol> (4) + description: \
-         Option<Symbol> (4) + flags: u32 (4, fills what used to be padding to the next \
-         i64-aligned field -- docs/adr/metrics-model-v2.md's W4 amendment) + start_timestamp: i64 \
-         (8) + exemplars: Vec<Exemplar> (24)"
+         Option<Symbol> (4) + flags: u32 (4, fills the padding before the next \
+         i64-aligned field; see docs/adr/metrics-model-v2.md) + start_timestamp: i64 (8) + \
+         exemplars: Vec<Exemplar> (24)"
     );
     assert_eq!(
         size_of::<MetricList>(),
@@ -185,10 +185,10 @@ fn event_size() {
     assert_eq!(
         size_of::<Event>(),
         864,
-        "800 (pre-metrics-model-v2 baseline) + 16 (LogRecord 72 -> 88) + 40 (MetricList 192 -> \
-         232, via MetricRecord 184 -> 224) + 8 (SpanRecord 136 -> 144); the two records stay \
-         niche-free through their enclosing Option -- see docs/adr/metrics-model-v2.md and \
-         record_types/metric_kind_is_sized_by_the_inlined_ddsketch above"
+        "800 (the size before docs/adr/metrics-model-v2.md) + 16 (LogRecord 72 -> 88) + 40 \
+         (MetricList 192 -> 232, via MetricRecord 184 -> 224) + 8 (SpanRecord 136 -> 144); the \
+         two records stay niche-free through their enclosing Option -- see \
+         docs/adr/metrics-model-v2.md and metric_kind_is_sized_by_its_two_largest_variants above"
     );
 
     // The breakdown, so it can't drift from the total.
