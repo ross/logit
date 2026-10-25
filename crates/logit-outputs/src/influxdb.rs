@@ -52,6 +52,8 @@
 //! land out of order. That's safe here: InfluxDB keeps the last write of a point by
 //! `(measurement, tag set, timestamp)`, so two batches writing one point with different values
 //! leave whichever landed later, the same outcome as a fan-in topology at concurrency 1.
+//! Over TLS to a server that picks h2 through ALPN, the batches in flight share one connection as
+//! concurrent streams; otherwise they open up to `concurrency` connections.
 //! `logit.output.in_flight` reads the batches in flight, and `logit.component.send.duration`
 //! times each batch's request from its send to its response.
 //!

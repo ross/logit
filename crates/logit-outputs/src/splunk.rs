@@ -127,6 +127,8 @@
 //! answer is `Clean` until one of that batch's bodies was accepted, whatever another batch in
 //! flight got. Every batch uses the sink's one channel, so `/ack` ids from all of them share it.
 //! Batches can land out of order, and Splunk indexes each event as it receives it.
+//! Over TLS to a server that picks h2 through ALPN, the batches in flight share one connection as
+//! concurrent streams; otherwise they open up to `concurrency` connections.
 //! `logit.output.in_flight` reads the batches in flight, and `logit.component.send.duration` times
 //! each batch's requests from the first send to the last response.
 //!
@@ -2487,6 +2489,33 @@ mod concurrency {
     #[tokio::test]
     async fn a_batch_behind_a_retried_head_times_its_own_request() {
         held::a_batch_behind_a_retried_head_times_its_own_request(subject()).await;
+    }
+
+    /// [`make`] trusting `testdata/tls/ca.pem` through a `tls:` block.
+    fn make_tls(url: &str, concurrency: u32, telemetry: Telemetry) -> SplunkHecOutput {
+        let settings = crate::test_support::tls_settings(|s| s.ca_file = Some("ca.pem".into()));
+        make(url, concurrency, telemetry)
+            .with_tls(
+                &settings,
+                &crate::test_support::testdata_dir(),
+                &logit_pipeline::tls::TlsReloader::new(),
+            )
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn slots_share_one_connection_to_an_h2_server() {
+        let tls = crate::test_support::fixture_server_config("server", None, &[b"h2", b"http/1.1"]);
+        let mux = held::four_slots_at_mux(Subject { make: make_tls, ..subject() }, Some(tls)).await;
+        let carriers = mux.carriers();
+        assert_eq!(carriers.len(), 1, "four requests on one connection: {carriers:?}");
+        assert_eq!(carriers[0].1.as_deref(), Some(&b"h2"[..]));
+    }
+
+    #[tokio::test]
+    async fn slots_open_a_connection_each_over_plaintext() {
+        let mux = held::four_slots_at_mux(subject(), None).await;
+        assert_eq!(mux.carriers().len(), 4, "HTTP/1.1 carries one request at a time");
     }
 
     /// Batch `n` is three logs, each marked `held::marker(n)`: one body of three objects.

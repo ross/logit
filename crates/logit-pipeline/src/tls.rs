@@ -201,7 +201,8 @@ impl TlsClientSettings {
 /// Registers `ca_file` and the `cert_file`/`key_file` pair, whichever are set, and nothing when
 /// neither is. `insecure_skip_verify` ignores `ca_file`, and the default Mozilla roots are compiled
 /// in, so neither has anything to reload. ALPN stays empty: `otlp_out`'s gRPC connector panics on
-/// a config that sets it.
+/// a config that sets it. An HTTP sink sets it on its own copy (`logit_outputs::http`'s
+/// `client_builder`).
 ///
 /// Fails on a file that's missing or doesn't parse, and on a key that doesn't match its
 /// certificate: at startup a bad file stops the process, where a reload keeps the old material.

@@ -68,7 +68,9 @@
 //! through [`crate::http::Slots`], still one at a time and in signal order, and `write_loop`
 //! settles the batches oldest first: a fault on one batch resends or drops that batch alone, under
 //! the table below, and its resend skips the signals that batch already settled. Over gRPC every
-//! batch's calls share one HTTP/2 connection as concurrent streams. Batches can land out of order.
+//! batch's calls share one HTTP/2 connection as concurrent streams. Over HTTP they do too when the
+//! endpoint is `https://` and the server picks h2 through ALPN; otherwise they open up to
+//! `concurrency` connections. Batches can land out of order.
 //! Logs and spans are stored as received. Metrics sent to a Prometheus-backed receiver can reach it
 //! out of timestamp order for one series, which a receiver without an out-of-order window rejects;
 //! [`crate::prometheus`]'s "Concurrency" table says which receivers accept it.
@@ -2028,7 +2030,10 @@ mod tests {
 
     /// A TLS peer answering `200 OK` to any request.
     async fn canned_tls_http_server(require_client_auth: bool) -> std::net::SocketAddr {
-        let acceptor = tokio_rustls::TlsAcceptor::from(test_server_tls_config(require_client_auth));
+        // It answers in HTTP/1.1, so it offers only that: the client would pick h2 if offered.
+        let mut cfg = (*test_server_tls_config(require_client_auth)).clone();
+        cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(cfg));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {

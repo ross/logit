@@ -5,6 +5,9 @@
 //!
 //! Each request gets its own connection (`Connection: close`) and its own task, so a held request
 //! never delays another, and a request whose client goes away while it's held is marked closed.
+//!
+//! [`Mux`] is the receiver for what a slot's connection carries: it serves HTTP/1.1 and h2, over
+//! TLS when given a server config, and records which connection carried each request.
 
 use logit_core::{
     AttrMap, BodyFormat, Event, EventBatch, LogRecord, SpanKind, SpanRecord, SpanStatus, Telemetry,
@@ -567,4 +570,146 @@ pub(crate) async fn a_grace_cut_counts_the_requests_already_answered<O: Output +
     })
     .await;
     drop(output);
+}
+
+/// A receiver serving HTTP/1.1 and h2 (`hyper_util`'s `auto` server, as the HTTP listeners run
+/// it), over TLS when given a server config, whose ALPN list decides what a client can pick. It
+/// holds every request until [`Mux::release`], then answers each `204`, and records which
+/// connection carried each request.
+pub(crate) struct Mux {
+    url: String,
+    /// The connection each request arrived on, by accept order, with its negotiated ALPN protocol
+    /// (`None` over plaintext or when none was picked).
+    requests: Arc<Mutex<Vec<Carrier>>>,
+    open: Arc<std::sync::atomic::AtomicUsize>,
+    release: tokio::sync::watch::Sender<bool>,
+}
+
+/// A connection by accept order, with its negotiated ALPN protocol.
+pub(crate) type Carrier = (usize, Option<Vec<u8>>);
+
+/// What [`serve_mux`] records each request against.
+#[derive(Clone)]
+struct MuxConnection {
+    id: usize,
+    alpn: Option<Vec<u8>>,
+    requests: Arc<Mutex<Vec<Carrier>>>,
+    open: Arc<std::sync::atomic::AtomicUsize>,
+    release: tokio::sync::watch::Receiver<bool>,
+}
+
+impl Mux {
+    pub(crate) async fn start(tls: Option<Arc<rustls::ServerConfig>>) -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let scheme = if tls.is_some() { "https" } else { "http" };
+        let url = format!("{scheme}://{}", listener.local_addr().unwrap());
+        let (release, _) = tokio::sync::watch::channel(false);
+        let mux = Self { url, requests: Arc::default(), open: Arc::default(), release };
+        let (requests, open) = (Arc::clone(&mux.requests), Arc::clone(&mux.open));
+        let release = mux.release.subscribe();
+        let acceptor = tls.map(tokio_rustls::TlsAcceptor::from);
+        tokio::spawn(async move {
+            for id in 0.. {
+                let Ok((stream, _)) = listener.accept().await else { return };
+                let mut conn = MuxConnection {
+                    id,
+                    alpn: None,
+                    requests: Arc::clone(&requests),
+                    open: Arc::clone(&open),
+                    release: release.clone(),
+                };
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    match acceptor {
+                        Some(acceptor) => {
+                            let Ok(stream) = acceptor.accept(stream).await else { return };
+                            conn.alpn = stream.get_ref().1.alpn_protocol().map(<[u8]>::to_vec);
+                            serve_mux(stream, conn).await;
+                        }
+                        None => serve_mux(stream, conn).await,
+                    }
+                });
+            }
+        });
+        mux
+    }
+
+    pub(crate) fn url(&self) -> &str {
+        &self.url
+    }
+
+    /// Requests received and not yet answered.
+    pub(crate) fn open(&self) -> usize {
+        self.open.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Each connection that carried a request, by accept order, with its ALPN protocol.
+    pub(crate) fn carriers(&self) -> Vec<Carrier> {
+        let mut carriers = self.requests.lock().unwrap().clone();
+        carriers.sort();
+        carriers.dedup();
+        carriers
+    }
+
+    /// Answers every held request, and every later one at once.
+    pub(crate) fn release(&self) {
+        self.release.send_replace(true);
+    }
+}
+
+async fn serve_mux<S>(stream: S, conn: MuxConnection)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    use http_body_util::BodyExt;
+    use std::sync::atomic::Ordering;
+    let service =
+        hyper::service::service_fn(move |request: http::Request<hyper::body::Incoming>| {
+            let mut conn = conn.clone();
+            async move {
+                let _ = request.into_body().collect().await;
+                conn.requests.lock().unwrap().push((conn.id, conn.alpn.clone()));
+                conn.open.fetch_add(1, Ordering::SeqCst);
+                let _ = conn.release.wait_for(|released| *released).await;
+                conn.open.fetch_sub(1, Ordering::SeqCst);
+                let response = http::Response::builder()
+                    .status(204)
+                    .body(http_body_util::Empty::<bytes::Bytes>::new())
+                    .unwrap();
+                Ok::<_, std::convert::Infallible>(response)
+            }
+        });
+    let _ = hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
+        .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
+        .await;
+}
+
+/// Four batches in flight at once at [`Mux`], over TLS offering `h2` and `http/1.1` when `tls`
+/// is given, else plaintext. `make` builds the sink at the receiver's URL; over TLS it trusts
+/// `testdata/tls/ca.pem`. Returns the receiver once every batch is delivered.
+pub(crate) async fn four_slots_at_mux<O: Output + Send>(
+    subject: Subject<O>,
+    tls: Option<Arc<rustls::ServerConfig>>,
+) -> Mux {
+    let mux = Mux::start(tls).await;
+    let probe = TelemetryProbe::new();
+    let telemetry = probe.telemetry("out", subject.kind, "sink");
+    let mut output = (subject.make)(mux.url(), 4, telemetry.clone());
+    let mut probe = probe;
+    let control = async {
+        wait_until("four requests open at once", || mux.open() == 4).await;
+        mux.release();
+    };
+    let (totals, _) = run(
+        &mut output,
+        &mut probe,
+        telemetry,
+        (1..=4).map(subject.batch).collect(),
+        DeliveryPosture::AtLeastOnce,
+        std::future::pending(),
+        control,
+    )
+    .await;
+    assert_eq!(delivered(&totals), 4.0);
+    mux
 }
