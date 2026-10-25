@@ -113,6 +113,17 @@ pub trait Output {
         1
     }
 
+    /// Whether `write_loop` times each batch it submits, from its submit to its acknowledgment,
+    /// as one `logit.component.send.duration` sample per acknowledgment, rather than one sample
+    /// per windowed round (`docs/adr/sink-request-concurrency.md`, decision 2). Read only under a
+    /// window above 1; the `send` path times each attempt either way. The default, `false`, keeps
+    /// one sample per round, what `logit_out` reports. A sink on the HTTP slot helper, whose
+    /// batches each run as their own request, says `true`. A type that implements `Output` by
+    /// delegating to another must forward this.
+    fn send_duration_per_batch(&self) -> bool {
+        false
+    }
+
     /// Writes `batch` without waiting for its delivery, under a window above 1
     /// (`docs/adr/native-hop-send-window.md`, decision 4). `ctx` and `seq` are the batch's, as
     /// [`Output::observe_batch`] last saw them for it; a resubmitted batch isn't observed again.

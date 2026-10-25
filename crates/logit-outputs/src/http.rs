@@ -36,11 +36,75 @@
 //!
 //! [`split_encode`] is the request splitter `datadog_out` and `datadog_trace_out` share: both cut a
 //! batch into requests under a per-route entry count and body size.
+//!
+//! **Concurrency.** A sink whose `concurrency:` is above 1 keeps that many batches in flight
+//! through [`Slots`] (`slots.rs`'s module doc): one slot per batch, each encoded on the loop task
+//! and sent from its own spawned task, answered to `write_loop` in batch order, and each fault
+//! settled on its own batch (`docs/adr/sink-request-concurrency.md`). A sink that sends one
+//! request per batch builds the request on the loop task and hands it to [`exchange`], which
+//! gathers the answer for the sink to classify back on the loop task; its `send` does the same
+//! with no task. `influxdb_out` and `prometheus_out`'s remote-write sender use it.
+
+#[cfg(test)]
+pub(crate) mod held;
+mod slots;
+
+pub(crate) use slots::Slots;
 
 use bytes::Bytes;
 use logit_core::CountGate;
 use logit_pipeline::Fault;
 use std::time::Duration;
+
+/// One request's answer, gathered without touching the sink, so it can run in a spawned task.
+#[derive(Debug)]
+pub(crate) struct Exchange {
+    /// From the request's send to its response head or its transport error.
+    pub took: Duration,
+    pub reply: Reply,
+}
+
+#[derive(Debug)]
+pub(crate) enum Reply {
+    Success(reqwest::StatusCode),
+    /// A non-2xx answer, with its headers and its body read bounded ([`read_body_prefix`], to
+    /// [`ERROR_BODY_SNIPPET_BYTES`]).
+    Failure {
+        status: reqwest::StatusCode,
+        headers: reqwest::header::HeaderMap,
+        body: String,
+    },
+    Transport(reqwest::Error),
+}
+
+impl Reply {
+    /// The `class` tag on `logit.output.requests`: [`status_class`], or `network_error`.
+    pub(crate) fn class(&self) -> &'static str {
+        match self {
+            Reply::Success(status) | Reply::Failure { status, .. } => status_class(*status),
+            Reply::Transport(_) => "network_error",
+        }
+    }
+}
+
+/// Sends `request` and gathers its answer ([`Exchange`]). The request's own timeout bounds it.
+pub(crate) async fn exchange(request: reqwest::RequestBuilder) -> Exchange {
+    let started = std::time::Instant::now();
+    let result = request.send().await;
+    let took = started.elapsed();
+    let reply = match result {
+        Ok(response) if response.status().is_success() => Reply::Success(response.status()),
+        Ok(response) => {
+            let status = response.status();
+            let headers = response.headers().clone();
+            // A bounded read, not `text()`: see `read_body_prefix`.
+            let body = read_body_prefix(response, ERROR_BODY_SNIPPET_BYTES).await;
+            Reply::Failure { status, headers, body }
+        }
+        Err(err) => Reply::Transport(err),
+    };
+    Exchange { took, reply }
+}
 
 /// Builds an HTTP sink's client.
 ///

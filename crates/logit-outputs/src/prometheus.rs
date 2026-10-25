@@ -286,8 +286,8 @@
 
 use crate::accounting::BatchAccounting;
 use crate::http::{
-    body_snippet, build_client, classify_reqwest_error, classify_status, read_body_prefix,
-    status_class, ERROR_BODY_SNIPPET_BYTES,
+    body_snippet, build_client, classify_reqwest_error, classify_status, Exchange, Reply, Slots,
+    ERROR_BODY_SNIPPET_BYTES,
 };
 /// The sender's `endpoint_tls:`: the shared `crate::tls` type, re-exported as the other sinks do.
 pub use crate::tls::TlsClientSettings;
@@ -622,6 +622,13 @@ impl Output for PrometheusOutput {
         }
     }
 
+    fn send_duration_per_batch(&self) -> bool {
+        match self {
+            PrometheusOutput::Expose(output) => output.send_duration_per_batch(),
+            PrometheusOutput::Send(output) => output.send_duration_per_batch(),
+        }
+    }
+
     async fn submit(
         &mut self,
         batch: &EventBatch,
@@ -877,9 +884,12 @@ pub struct RemoteWriteOutput {
     /// Ungated: the requests, samples, and `remote_write_rejected` a receiver's answer decides.
     diag: Diagnostics,
     telemetry: Telemetry,
+    /// The `send` path's batch accounting, at a concurrency of 1.
     accounting: BatchAccounting,
-    /// The operator's `concurrency:`, which the HTTP slot helper reads as this sink's window.
-    concurrency: u32,
+    /// The batches in flight above a concurrency of 1, each with its own accounting over
+    /// `accounting`'s gate (the module doc's "Concurrency (sender mode)"). A task's outcome is
+    /// the samples its body carries and the receiver's answer.
+    slots: Slots<(u64, Exchange)>,
 }
 
 impl RemoteWriteOutput {
@@ -888,7 +898,7 @@ impl RemoteWriteOutput {
         let accounting = BatchAccounting::default();
         let (diag, telemetry) = (Diagnostics::default(), Telemetry::default());
         Self {
-            concurrency: 1,
+            slots: Slots::new(accounting.gate().clone()),
             endpoint: endpoint.into(),
             version: remote_write::Version::V1,
             encoding: Encoding::Snappy,
@@ -917,7 +927,7 @@ impl RemoteWriteOutput {
 
     /// Sets how many batches may be in flight at once (`concurrency:` in config, default 1).
     pub fn with_concurrency(mut self, concurrency: u32) -> Self {
-        self.concurrency = concurrency;
+        self.slots.set_concurrency(concurrency);
         self
     }
 
@@ -998,11 +1008,25 @@ impl RemoteWriteOutput {
     }
 
     pub fn with_telemetry(mut self, telemetry: Telemetry) -> Self {
+        self.slots.set_telemetry(telemetry.clone());
         self.telemetry = telemetry;
         self.encoder = new_sender_encoder(&self.telemetry, &self.diag, self.accounting.gate());
         self
     }
+}
 
+/// Where and how [`RemoteWriteOutput`] sends a batch, borrowed from it apart from its encoder,
+/// its accounting, and its slots.
+struct Target<'a> {
+    endpoint: &'a str,
+    version: remote_write::Version,
+    encoding: Encoding,
+    request_timeout: Duration,
+    client: &'a reqwest::Client,
+    headers: &'a HeaderMap,
+}
+
+impl Target<'_> {
     /// The operator's headers with the protocol's four `insert`ed over them, so a protocol name
     /// always wins. `insert` and one `.headers(..)` at the call site, never `RequestBuilder`'s
     /// appending `.header(..)`, which would undo that (`otlp_out::send_http` has the same).
@@ -1023,6 +1047,97 @@ impl RemoteWriteOutput {
         headers.insert(http::header::USER_AGENT, HeaderValue::from_static(USER_AGENT));
         headers
     }
+
+    /// The encode half of one attempt, on the caller's task: the request and the samples its
+    /// body carries, or `None` for a batch that produced nothing. The whole encode is unit 0 of
+    /// `accounting`.
+    fn prepare(
+        &self,
+        encoder: &mut PrometheusEncoder,
+        accounting: &mut BatchAccounting,
+        batch: &EventBatch,
+    ) -> anyhow::Result<Option<(reqwest::RequestBuilder, u64)>> {
+        let (version, encoding) = (self.version, self.encoding);
+        // An error is reported, not unwrapped, so an absurd batch fails alone.
+        let (_, encoded) =
+            accounting.encode(0, || encode_remote_write(batch, version, encoding, encoder));
+        let Some((compressed, samples)) = encoded? else {
+            return Ok(None);
+        };
+        let request = self
+            .client
+            .post(self.endpoint)
+            .headers(self.request_headers())
+            .timeout(self.request_timeout)
+            .body(compressed);
+        Ok(Some((request, samples)))
+    }
+
+    /// The answer half of one attempt, on the caller's task: counts the request and classifies
+    /// its answer as `.context(fault)` (module doc's "Faults, retries and duplicate safety").
+    fn settle(
+        &self,
+        telemetry: &Telemetry,
+        diag: &mut Diagnostics,
+        samples: u64,
+        exchange: Exchange,
+    ) -> anyhow::Result<()> {
+        telemetry.timing(REQUEST_DURATION, exchange.took, &[]);
+        telemetry.count(REQUESTS, 1.0, &[("class", exchange.reply.class())]);
+        match exchange.reply {
+            Reply::Success(_) => {
+                telemetry.count(SAMPLES, samples as f64, &[]);
+                Ok(())
+            }
+            Reply::Failure { status, headers, body } => {
+                let written = written_counts(&headers);
+                // The body names the offending series in a Prometheus-style `400` (`out of order
+                // sample`, a bad label): the only actionable part.
+                let fault = remote_write_fault(status, &body);
+                let snippet = format!("{}{written}", body_snippet(&body, ERROR_BODY_SNIPPET_BYTES));
+                // A receiver that doesn't take zstd answers `415` (Prometheus, Mimir) or `400`,
+                // the two statuses vmagent's own downgrade keys on. There is no fallback, so the
+                // operator gets the remedy instead.
+                let hint = if self.encoding == Encoding::Zstd
+                    && matches!(
+                        status,
+                        StatusCode::UNSUPPORTED_MEDIA_TYPE | StatusCode::BAD_REQUEST
+                    ) {
+                    " (the receiver may not accept zstd; set 'compression: snappy')"
+                } else {
+                    ""
+                };
+                diag.warn_throttled(
+                    "remote_write_rejected",
+                    format_args!(
+                        "remote-write to {} failed ({status}): {snippet}{hint}",
+                        redact::url(self.endpoint)
+                    ),
+                );
+                Err(anyhow::anyhow!("remote-write failed ({status}): {snippet}{hint}"))
+                    .context(fault)
+            }
+            Reply::Transport(err) => {
+                let fault = classify_reqwest_error(&err);
+                Err(anyhow::Error::new(err)).context(fault)
+            }
+        }
+    }
+}
+
+/// [`RemoteWriteOutput`]'s [`Target`], built from disjoint field borrows so a caller can hold
+/// its encoder, accounting, and slots mutably beside it.
+macro_rules! target {
+    ($output:expr) => {
+        Target {
+            endpoint: &$output.endpoint,
+            version: $output.version,
+            encoding: $output.encoding,
+            request_timeout: $output.request_timeout,
+            client: &$output.client,
+            headers: &$output.headers,
+        }
+    };
 }
 
 /// The sender's encoder, built in one place so `new` and the builders can't drift (module doc's
@@ -1116,76 +1231,6 @@ pub fn render_batches(
     registry.render(dialect, encoder)
 }
 
-impl RemoteWriteOutput {
-    /// One batch, one request, one attempt (module doc's "The wire" and "Faults, retries and
-    /// duplicate safety"). The whole encode is unit 0 of the batch accounting.
-    async fn attempt(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
-        let (version, encoding) = (self.version, self.encoding);
-        let encoder = &mut self.encoder;
-        // An error is reported, not unwrapped, so an absurd batch fails alone.
-        let (_, encoded) =
-            self.accounting.encode(0, || encode_remote_write(batch, version, encoding, encoder));
-        let Some((compressed, samples)) = encoded? else {
-            return Ok(());
-        };
-
-        let request_timer = self.telemetry.timer(REQUEST_DURATION);
-        let result = self
-            .client
-            .post(&self.endpoint)
-            .headers(self.request_headers())
-            .timeout(self.request_timeout)
-            .body(compressed)
-            .send()
-            .await;
-        drop(request_timer);
-
-        match result {
-            Ok(response) if response.status().is_success() => {
-                self.telemetry.count(REQUESTS, 1.0, &[("class", status_class(response.status()))]);
-                self.telemetry.count(SAMPLES, samples as f64, &[]);
-                Ok(())
-            }
-            Ok(response) => {
-                let status = response.status();
-                self.telemetry.count(REQUESTS, 1.0, &[("class", status_class(status))]);
-                let written = written_counts(response.headers());
-                // The body names the offending series in a Prometheus-style `400` (`out of order
-                // sample`, a bad label): the only actionable part. Read bounded.
-                let body = read_body_prefix(response, ERROR_BODY_SNIPPET_BYTES).await;
-                let fault = remote_write_fault(status, &body);
-                let snippet = format!("{}{written}", body_snippet(&body, ERROR_BODY_SNIPPET_BYTES));
-                // A receiver that doesn't take zstd answers `415` (Prometheus, Mimir) or `400`,
-                // the two statuses vmagent's own downgrade keys on. There is no fallback, so the
-                // operator gets the remedy instead.
-                let hint = if self.encoding == Encoding::Zstd
-                    && matches!(
-                        status,
-                        StatusCode::UNSUPPORTED_MEDIA_TYPE | StatusCode::BAD_REQUEST
-                    ) {
-                    " (the receiver may not accept zstd; set 'compression: snappy')"
-                } else {
-                    ""
-                };
-                self.diag.warn_throttled(
-                    "remote_write_rejected",
-                    format_args!(
-                        "remote-write to {} failed ({status}): {snippet}{hint}",
-                        redact::url(&self.endpoint)
-                    ),
-                );
-                Err(anyhow::anyhow!("remote-write failed ({status}): {snippet}{hint}"))
-                    .context(fault)
-            }
-            Err(err) => {
-                self.telemetry.count(REQUESTS, 1.0, &[("class", "network_error")]);
-                let fault = classify_reqwest_error(&err);
-                Err(anyhow::Error::new(err)).context(fault)
-            }
-        }
-    }
-}
-
 /// A remote-write receiver's non-2xx answer as a [`Fault`], per the module doc's "Faults, retries
 /// and duplicate safety" table: [`classify_status`], except a `415` and a `400` whose body says
 /// the receiver couldn't decompress the body, which are `Refused`. Both answer the sink's
@@ -1239,25 +1284,76 @@ impl Output for RemoteWriteOutput {
         Ok(())
     }
 
-    /// Arms this sink's batch accounting (`crate::accounting`).
-    fn observe_batch(&mut self, _ctx: BatchContext, _seq: SeqId) {
-        self.accounting.observe();
+    /// Arms this sink's batch accounting (`crate::accounting`), or under a window above 1 the
+    /// batch's own slot.
+    fn observe_batch(&mut self, _ctx: BatchContext, seq: SeqId) {
+        if self.slots.window() > 1 {
+            self.slots.observe(seq);
+        } else {
+            self.accounting.observe();
+        }
     }
 
     /// Lets a final `Ambiguous` under `at_most_once` disarm the batch accounting.
     fn observe_posture(&mut self, posture: DeliveryPosture) {
         self.accounting.observe_posture(posture);
+        self.slots.observe_posture(posture);
     }
 
-    /// One attempt ([`RemoteWriteOutput::attempt`]). A final result disarms the batch accounting
-    /// on every path, a batch that sent no request included.
+    /// One batch, one request, one attempt (module doc's "The wire" and "Faults, retries and
+    /// duplicate safety"). A final result disarms the batch accounting on every path, a batch
+    /// that sent no request included.
     async fn send(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
-        let result = self.attempt(batch).await;
+        let target = target!(self);
+        let result = match target.prepare(&mut self.encoder, &mut self.accounting, batch) {
+            Ok(Some((request, samples))) => {
+                let exchange = crate::http::exchange(request).await;
+                target.settle(&self.telemetry, &mut self.diag, samples, exchange)
+            }
+            Ok(None) => Ok(()),
+            Err(err) => Err(err),
+        };
         self.accounting.finish(result)
     }
 
-    /// Nothing is buffered: `send` has issued its request, if any, before returning.
+    fn window(&self) -> usize {
+        self.slots.window()
+    }
+
+    fn send_duration_per_batch(&self) -> bool {
+        true
+    }
+
+    /// Encodes `batch` into its slot and starts its request on a task of its own.
+    async fn submit(
+        &mut self,
+        batch: &EventBatch,
+        _ctx: BatchContext,
+        seq: SeqId,
+    ) -> anyhow::Result<()> {
+        let target = target!(self);
+        let encoder = &mut self.encoder;
+        self.slots.submit(seq, |accounting| {
+            let prepared = target.prepare(encoder, accounting, batch)?;
+            Ok(prepared.map(|(request, samples)| async move {
+                (samples, crate::http::exchange(request).await)
+            }))
+        })
+    }
+
+    /// The oldest batch's answer, counted and classified as `send` does.
+    async fn await_ack(&mut self) -> anyhow::Result<()> {
+        let target = target!(self);
+        let (telemetry, diag) = (&self.telemetry, &mut self.diag);
+        self.slots
+            .ack(|(samples, exchange)| target.settle(telemetry, diag, samples, exchange))
+            .await
+    }
+
+    /// Aborts every request still in flight: the write loop has stopped. Nothing else is
+    /// buffered.
     async fn flush(&mut self) -> anyhow::Result<()> {
+        self.slots.cancel();
         Ok(())
     }
 }
@@ -3742,6 +3838,75 @@ mod tests {
             let degraded = [("metric_kind", "samples")];
             assert_eq!(sum_of(&sums, "logit.output.metrics.degraded", &degraded), 1.0, "{later}");
             assert_eq!(sum_of(&sums, DUPLICATE.0, DUPLICATE.1), 1.0, "{later}");
+        }
+    }
+
+    // -- concurrency above 1 (`docs/adr/sink-request-concurrency.md`, decision 3) -----------
+
+    mod concurrency {
+        use super::*;
+        use crate::http::held::{self, Subject};
+
+        fn make(url: &str, concurrency: u32, telemetry: Telemetry) -> PrometheusOutput {
+            RemoteWriteOutput::new(url)
+                .with_timeout(Duration::from_secs(60))
+                .with_concurrency(concurrency)
+                .with_telemetry(telemetry)
+                .into()
+        }
+
+        /// Batch `n` is one counter sample of value `n`, beside an event with no metrics, which
+        /// the encoder counts skipped.
+        fn batch(n: u64) -> EventBatch {
+            let mut batch = counter_batch(1_000_000_000 * n as i64, n as f64);
+            batch.events.push(Event::empty(1_000_000_000, AttrMap::new()));
+            batch
+        }
+
+        fn id_of(body: &[u8]) -> u64 {
+            let raw = snap::raw::Decoder::new().decompress_vec(body).expect("a snappy block");
+            let request = pb1::WriteRequest::decode(raw.as_slice()).expect("a WriteRequest");
+            request.timeseries[0].samples[0].value as u64
+        }
+
+        fn subject() -> Subject<PrometheusOutput> {
+            Subject {
+                kind: "prometheus_out",
+                make,
+                batch,
+                id_of,
+                encoded: ("logit.output.events.skipped", &[("reason", "no_metrics")]),
+            }
+        }
+
+        #[tokio::test]
+        async fn n_requests_in_flight_answered_out_of_order() {
+            held::n_requests_in_flight_answered_out_of_order(subject()).await;
+        }
+
+        #[tokio::test]
+        async fn a_500_on_one_slot_is_resent_alone() {
+            held::a_500_on_one_slot_is_resent_alone(subject()).await;
+        }
+
+        #[tokio::test]
+        async fn a_400_on_one_slot_is_dropped_alone() {
+            held::a_400_on_one_slot_is_dropped_alone(subject()).await;
+        }
+
+        #[tokio::test]
+        async fn a_401_head_holds_the_fill_at_one_window() {
+            held::a_401_head_holds_the_fill_at_one_window(subject()).await;
+        }
+
+        #[tokio::test]
+        async fn at_most_once_drops_one_ambiguous_slot_alone() {
+            held::at_most_once_drops_one_ambiguous_slot_alone(subject()).await;
+        }
+
+        #[tokio::test]
+        async fn a_grace_cut_aborts_the_requests_in_flight() {
+            held::a_grace_cut_aborts_the_requests_in_flight(subject()).await;
         }
     }
 }

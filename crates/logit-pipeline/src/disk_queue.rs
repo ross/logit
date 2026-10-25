@@ -955,6 +955,11 @@ impl DiskQueue {
         self.watch.finish();
     }
 
+    /// See `SinkStore::send_limit`.
+    pub(crate) fn send_limit(&self) -> &crate::buffer_full::SendLimit {
+        self.watch.send_limit()
+    }
+
     fn count_dropped(&self, reason: &'static str, units: u64) {
         self.telemetry.count(SINK_QUEUE_METRICS.items_dropped, 1.0, &[("reason", reason)]);
         self.telemetry.count(SINK_QUEUE_METRICS.units_dropped, units as f64, &[("reason", reason)]);

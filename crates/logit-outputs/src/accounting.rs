@@ -97,6 +97,12 @@ impl RequestBits {
 }
 
 impl BatchAccounting {
+    /// Accounting over `gate`, shared with another: each of an HTTP sink's slots holds one over
+    /// the gate its encoder's handles were built on (`crate::http::Slots`).
+    pub(crate) fn sharing(gate: &CountGate) -> Self {
+        Self { gate: gate.clone(), ..Self::default() }
+    }
+
     /// The gate a sink builds its encoder's handles over.
     pub(crate) fn gate(&self) -> &CountGate {
         &self.gate
