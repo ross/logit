@@ -251,3 +251,26 @@ the pool's 90 s, with a 1 s egress delay, reset 12 writes on connections it had 
 The account is [`docs/known-gaps/sinks.md`](../known-gaps/sinks.md)'s "A kept-alive connection
 a destination closed first reads as `Ambiguous`". W5 raised the stand-in's idle timeout to 120 s;
 W6's `idle_timeout:` replaces that workaround (below).
+
+### W6: idle connections (2026-10-25)
+
+Each scenario ran once on the development host, on an image built from `conc/w6`, and every row
+of each run reads PASS or SKIP.
+
+**`standin-concurrency`** (run `20261025T203147Z`), with the stand-in back at its 5 s idle close
+and the sink at `idle_timeout: 1s`: the sink dropped two batches in the whole run, the cued `400`
+(`rejected`) and the cued reset (`ambiguous_at_most_once`), where W5's first run at the pool's
+90 s dropped 13 `ambiguous_at_most_once`. The `401` held its batch and one retry released it. The
+stand-in recorded 2,364 requests and stored 2,361, and V matched what `aggregate` absorbed,
+1,181,200 samples. `in_flight` reached 8 under the 1 s delay, where W5 read 4. The likely cause, not measured
+further: a connection idle past 1 s is closed, and a batch that dials anew waits a delayed
+handshake as well as its request.
+
+**`otlp-concurrency-tls`** (run `20261025T204451Z`), with `otlp_in` at `idle_timeout: 4s` and the
+generator at the 30 s default: during the generator's 15 s pause the listener closed one
+connection idle (`connections.closed{reason="idle"}` 1), and the resumed generator retried
+nothing (`logit.component.retries` 0 through the step and its recovery), so the `GOAWAY` cost no
+batch a fault. The rest matches W5: `in_flight` max 4 under the delay with no overflow, 8 with one
+connection through the backend stop, and G = 341,050 events acknowledged, carried to V =
+1,366,200 points with no uncounted loss.
+
