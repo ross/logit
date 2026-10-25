@@ -2745,7 +2745,8 @@ pub enum ComponentKind {
         /// one series survives, so a stream of never-repeating series names would otherwise hold
         /// unboundedly many. Defaults to `10000`. The most idle series are evicted first, and among
         /// equally idle ones the most recently created, so a series that has survived one flush
-        /// outlives one-off series created after it. A series that arrives after the one-off
+        /// outlives one-off series created after it; a `max_series_per_metric` overflow series
+        /// goes last. A series that arrives after the one-off
         /// series in every window is the newest every time and is evicted at every flush; a
         /// `logit.transform.series.evicted{reason="cardinality", state="active"}` count at every
         /// flush means more series are active than the cap holds, so raise this or bound
@@ -2754,6 +2755,43 @@ pub enum ComponentKind {
         /// instead.
         #[serde(default = "default_max_retained_series")]
         max_retained_series: usize,
+        /// A hard cap on how many series this component holds at once, across every resource:
+        /// the series filling the current window plus the ones retained from earlier windows; a
+        /// memory guard, not a tuning knob. Defaults to `100000`, and must be at least `1`.
+        /// Retained series count against this cap, so a `max_retained_series` above it changes
+        /// nothing. A metric for a series already held is always absorbed, so a full cap only
+        /// affects a new series. To make room for one, one retained series that hasn't received
+        /// data this window is evicted, the one that has gone the most flushes without data
+        /// first and a `max_series_per_metric` overflow series last, counted as `logit.transform.series.evicted{reason="series_limit"}`. A series
+        /// that received data this window is never evicted to make room, unlike
+        /// `cumulative_to_delta`'s and `prometheus_out`'s `max_series`, which evict the least
+        /// recently updated series. With none to evict, the new series' metric is dropped and
+        /// counted as `logit.transform.metrics.dropped{reason="series_limit"}`. Admission is
+        /// first come, first served within a window, and a flush frees the slot of every series
+        /// it drains or evicts. A nonzero drop count means the attributes reaching this stage
+        /// have too many distinct values: bound them upstream with `keep` or `keep_values`, or
+        /// raise this.
+        #[serde(default = "default_aggregate_max_series")]
+        max_series: usize,
+        /// A limit on how many series one metric name holds at once, across every resource,
+        /// in the shape of the OpenTelemetry SDK's cardinality limit. Off by default, must be at
+        /// least `1`, and recommended: it's the cap that keeps every metric's totals correct.
+        /// Past it, a metric that would open a new series for its name folds into one overflow
+        /// series instead, with the same name and unit and the attributes replaced by
+        /// `logit.overflow: true`, keeping only `host.name` and the private `_logit.*` keys. The
+        /// overflow series doesn't count against this limit but does count against
+        /// `max_series`. A flush frees the slot of every series it drains or evicts. Counters,
+        /// distributions, sets, and histograms stay correct as totals; an overflow gauge's
+        /// value is whichever unrelated series wrote last, so it carries no meaning beyond the
+        /// marker. Under `temporality: cumulative` an overflow total stays monotonic while it's
+        /// retained, and a series admitted later starts from zero. A folded metric counts in
+        /// `logit.transform.metrics.overflowed`, never as dropped, and
+        /// `logit.transform.metrics.overflowing` reports how many metric names had a metric
+        /// past the limit since the last flush; a throttled warning names the worst one and the
+        /// attribute key with the most distinct values among its series. A `keep` placed after
+        /// this component removes `logit.overflow` unless it lists it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_series_per_metric: Option<usize>,
         /// Whether a raw samples series (statsd `ms`/`h`/`d`) absorbs into this window as a
         /// sketch (`sketch`, the default: error-bounded quantiles, no raw values retained) or
         /// keeps its raw observations for the whole window (`samples`), falling back to a sketch,
@@ -4858,6 +4896,11 @@ fn default_max_retained_series() -> usize {
     10_000
 }
 
+/// `aggregate`'s `max_series` default.
+fn default_aggregate_max_series() -> usize {
+    100_000
+}
+
 /// `aggregate`'s `max_samples_per_series` default, on the order of
 /// `logit_core::Samples::MAX_WEIGHT`.
 fn default_max_samples_per_series() -> usize {
@@ -6504,6 +6547,8 @@ mod tests {
                 temporality,
                 series_retention,
                 max_retained_series,
+                max_series,
+                max_series_per_metric,
                 distributions,
                 max_samples_per_series,
                 sets,
@@ -6514,6 +6559,8 @@ mod tests {
                 assert_eq!(temporality, AggregateTemporality::Delta);
                 assert_eq!(series_retention, 5);
                 assert_eq!(max_retained_series, 10_000);
+                assert_eq!(max_series, 100_000);
+                assert_eq!(max_series_per_metric, None);
                 assert_eq!(distributions, Distributions::Sketch);
                 assert_eq!(max_samples_per_series, 1000);
                 assert_eq!(sets, Sets::Estimate);

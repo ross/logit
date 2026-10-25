@@ -1,0 +1,5 @@
+# What an `aggregate` overflow series looks like to the sinks after it: a counter and a gauge
+# whose attributes are the `logit.overflow: true` marker, one beside `host.name`. No statsd wire
+# produces the marker; `max_series_per_metric` writes it, so each sink shows how it renders a
+# boolean attribute named with a dot.
+exercises: []

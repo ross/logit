@@ -148,22 +148,37 @@ Entry format and the other areas: [the known-gaps index](README.md).
   `private: keep` is set, so the flag goes, the groups merge across buckets, and no stats route
   sends them.
   - **Workaround:** set `private: keep` on that `keep`.
-- **Nothing bounds how many series one window holds.** `max_retained_series` caps only what
-  survives a flush. Within a window every distinct `(name, unit, attribute set)` opens a series,
-  and memory grows with that count until the flush drains it.
-  - **Workaround:** bound it upstream. A `keep` ahead of `aggregate` limits which attributes reach
-    it, and `keep_values` limits the values one attribute can take.
-    `logit.transform.series.active` shows the peak each window.
-- **Nothing bounds how many `(resource, scope)` groups one window holds, and a lookup that misses
-  `group_for`'s memo walks all of them.** The memo answers every event of a batch after the first,
-  and the walk compares one stored 64-bit hash per group, about half a nanosecond each, before any
-  full compare. `logit.transform.resource.groups` shows the count.
+- **`max_series` admits series first come, first served within a window.** Once every series the
+  cap holds was updated this window, each new series is refused until the next flush frees slots.
+  Under churn that fills the cap early in each window, a stable delta series whose first record
+  arrives late is dropped every window, while one-off series that arrived first take its slot.
+  - **Signal:** `logit.transform.metrics.dropped{reason="series_limit"}` counts every refused
+    record, with a throttled `series_limit` diagnostic naming the metric.
+  - **Workaround:** bound cardinality upstream so the cap isn't reached. A `keep` ahead of
+    `aggregate` limits which attributes reach it, and `keep_values` limits the values one
+    attribute can take. `logit.transform.series.active` shows the peak each window.
+  - **`max_series_per_metric` has the same shape per name:** once a name holds its limit's
+    series, a series of it whose first record arrives later folds into the overflow series
+    every window, while the series that arrived first keep their slots.
+    `logit.transform.metrics.overflowed` counts the folds, and the same workaround applies.
+- **A lookup that misses `find_group`'s memo walks every `(resource, scope)` group.** `max_series`
+  bounds the group count at twice its value: every group but one emptied by an eviction holds a
+  series, and an emptied group stays until the flush, so a window holds at most `max_series` groups
+  plus one per eviction. The memo answers every event of a batch after the first, and the walk
+  compares one stored 64-bit hash per group, about half a nanosecond each, before any full compare.
+  `logit.transform.resource.groups` shows the count.
   - **Consequence:** absorb cost still grows with the group count once it reaches tens of
     thousands and batches are small. `docs/design/performance.md` §1's `aggregate-groups` row
     measures the 1000-group case on the perf VM (0.290 CPU µs/event), and
     [ADR `aggregation-window-semantics`](../adr/aggregation-window-semantics.md)'s "The groups
     bound" section has the mechanism and the measurements.
   - **To close,** if that shape shows up in a profile: a map from hash to group index.
+- **A folded record costs more than an absorbed one.** Each record of a series past
+  `max_series_per_metric` misses its own key, then builds the overflow key and looks that up, on
+  every arrival. On a laptop, with half of the `aggregate` scenario's series folding, that's about
+  0.17 µs per folded record (0.297 against 0.211 CPU µs/event). The cost lasts only while a name
+  is over its limit.
+  - **To close,** if it shows up in a profile: memoize the overflow key per name and group.
 - **`aggregate` keeps `U64(200)`, `I64(200)`, and `F64(200.0)` as three series, and text sinks
   render all three as `200`.** Series identity is the typed value. A non-negative `json` integer
   arrives `U64`, an OTLP or Lua integer `I64`, and a `scale`d one `F64`.

@@ -121,6 +121,10 @@
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"http:requests|total","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"route":"/api"}},
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"queue depth","kind":"gauge","value":3.0}]}
   ], "counters": {}},
+  "overflow-marker": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"queue.depth","kind":"gauge","value":4.0}],"attributes":{"logit.overflow":true}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"requests","kind":"sum","value":7.0,"temporality":"delta","monotonic":true}],"attributes":{"host.name":"web-1","logit.overflow":true}}
+  ], "counters": {}},
   "record-fields": {"events": [
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"cpu.usage","kind":"gauge","value":0.5}],"attributes":{"host":"web-07"}},
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"hits","kind":"sum","value":4.0,"temporality":"delta","monotonic":true,"exemplars":[{"timestamp":"2027-01-15T07:59:59.000000000Z","value":1.0,"trace_id":"0102030405060708090a0b0c0d0e0f10","span_id":"0102030405060708","trace_flags":0}]}]},

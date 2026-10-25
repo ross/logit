@@ -111,6 +111,10 @@
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"http:requests|total","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"host.name":"transit","route":"/api"},"resource":{"attributes":{"_logit.datadog.units":"datadog"}}},
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"queue depth","kind":"gauge","value":3.0}],"attributes":{"host.name":"transit"},"resource":{"attributes":{"_logit.datadog.units":"datadog"}}}
   ], "counters": {}},
+  "overflow-marker": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"queue.depth","kind":"gauge","value":4.0}],"attributes":{"host.name":"transit","logit.overflow":true},"resource":{"attributes":{"_logit.datadog.units":"datadog"}}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"requests","kind":"sum","value":7.0,"temporality":"delta","monotonic":true}],"attributes":{"host.name":"web-1","logit.overflow":true},"resource":{"attributes":{"_logit.datadog.units":"datadog"}}}
+  ], "counters": {}},
   "record-fields": {"events": [
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"cpu.usage","kind":"gauge","value":0.5}],"attributes":{"host":"web-07","host.name":"transit"},"resource":{"attributes":{"_logit.datadog.units":"datadog"}}},
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"hits","kind":"sum","value":4.0,"temporality":"delta","monotonic":true}],"attributes":{"host.name":"transit"},"resource":{"attributes":{"_logit.datadog.units":"datadog"}}},

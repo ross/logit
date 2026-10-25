@@ -128,6 +128,13 @@
     "logit.output.metrics.dropped{component=out,kind=prometheus_out,reason=unresolved_delta,role=sink}": 1,
     "logit.output.metrics.normalized{component=out,kind=prometheus_out,reason=name_sanitized,role=sink}": 1
   }},
+  "overflow-marker": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"queue_depth","kind":"gauge","value":4.0}],"attributes":{"logit_overflow":"true"}}
+  ], "counters": {
+    "logit.output.labels.normalized{component=out,kind=prometheus_out,reason=name_sanitized,role=sink}": 1,
+    "logit.output.metrics.dropped{component=out,kind=prometheus_out,reason=unresolved_delta,role=sink}": 1,
+    "logit.output.metrics.normalized{component=out,kind=prometheus_out,reason=name_sanitized,role=sink}": 1
+  }},
   "record-fields": {"events": [
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"cpu_usage","kind":"gauge","value":0.5}],"attributes":{"host":"web-07"}},
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"request_duration","kind":"gauge","value":0.25,"unit":"s","description":"Request time"}],"attributes":{"service_name":"checkout"}},
