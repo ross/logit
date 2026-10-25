@@ -28,9 +28,9 @@ sink drops (`overflow: drop_newest`) or stalls every source (`block`) with nothi
 round trip as the cause. The `otlp-fan-out` soak run recorded in
 [`docs/plans/soak-harness.md`](../plans/soak-harness.md)'s "Findings" showed it: 500 records a
 second in batches of 50 over OTLP/HTTP, the responses delayed 200 ms, and a fifth of the offered
-batches counted `overflow_newest`. [`docs/known-gaps/sinks.md`](../known-gaps/sinks.md)'s "Every
-sink that waits for a response, but `logit_out`, sends one request at a time" holds the full
-entry; its workaround is a `logit_out` hop to a `logit_in` near the destination.
+batches counted `overflow_newest`. `docs/known-gaps/sinks.md` listed it as a known gap, with a
+`logit_out` hop to a `logit_in` near the destination as the workaround, until the plan's W5
+closed the entry.
 
 What the code has, and what stands in the way:
 
@@ -253,8 +253,8 @@ them.
   ordering note; the remote-write and `otlp_out` docs carry the receiver table;
   `docs/design/pipeline-graph.md`'s rule table and "Cancellation points" row; the amended ADRs'
   Status lines.
-- **Known gaps.** `docs/known-gaps/sinks.md`'s one-request-at-a-time entry closes when the plan's
-  W5 lands. `docs/known-gaps/prometheus.md`'s fan-in entry gains the single-chain case under
+- **Known gaps.** `docs/known-gaps/sinks.md`'s one-request-at-a-time entry closes with the
+  plan's W5, whose soak runs are the evidence in the plan's "Findings". `docs/known-gaps/prometheus.md`'s fan-in entry gains the single-chain case under
   `concurrency > 1`. `docs/known-gaps/otlp.md`'s VictoriaTraces entry widens to every request in
   flight on the closed connection.
 - **Measurement.** The plan's "Findings" records the soak numbers at 1 and 8, for the operator
