@@ -5,7 +5,7 @@
 //!
 //! **Never deletes an attribute**: every source value it removes is written back, as leaves or
 //! whole. A key collision is last write wins, with no diagnostic. There is no cap on how many keys
-//! one value expands into; [`MAX_DEPTH`] is the only bound (`docs/known-gaps/runtime.md`).
+//! one value expands into; [`MAX_DEPTH`] is the only bound (`docs/adr/flatten-transform.md`).
 //!
 //! `all` never selects an attribute under the private `_logit.` prefix, which protocol codecs
 //! reserve for their own use; a named private attribute still flattens (ADR

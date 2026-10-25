@@ -28,13 +28,6 @@ Entry format and the other areas: [the known-gaps index](README.md).
     clock jumps backward across the restart, the sink learns the period fresh on the first write
     after open.
 
-- **`file_out` never fsyncs, by design.** Nothing in `crates/logit-outputs/src/file.rs` fsyncs
-  the active file, the `.rotating` staging file, or the directory after a rename, so a power loss
-  (not a process crash) can lose the most recent writes or leave a rotation half-applied. A
-  log-file sink doesn't pay per-batch fsyncs for a guarantee few deployments need; see the
-  "`file_out` makes no durability promise" amendment to
-  [ADR `rotating-file-output`](../adr/rotating-file-output.md#amendment-file_out-makes-no-durability-promise-2026-09-24).
-  There's no revisit trigger short of a deployment that needs a power-loss-safe log file.
 - **`stdio_out` to a stdout or stderr pipe has no write bound.** A pipe reader that stops
   reading (a stalled log shipper, a paused `less`) fills the pipe, and the write never returns.
   tokio writes stdout and stderr on a blocking thread: a timeout around the write would return,
@@ -55,22 +48,6 @@ Entry format and the other areas: [the known-gaps index](README.md).
   - **Why it stays a gap:** bounding the write needs a nonblocking stdout, and `O_NONBLOCK` is a
     flag on the file description `logit` shares with its parent and siblings, so setting it can
     break their writes.
-- **No runtime bound on a sink's attempt; each sink bounds its own.** The runtime wraps
-  `Output::send` in no timeout ([ADR `sink-fault-classes`](../adr/sink-fault-classes.md), "A
-  retryable fault retries until it succeeds"). The HTTP and gRPC sinks bound each request with
-  `request_timeout`, the stream sinks bound each write's progress with `connect_timeout`, the Unix
-  datagram send has its `send_timeout`, and `logit_out` bounds each write and acknowledgment wait
-  with `request_timeout`. `stdio_out` to a pipe has no bound (the entry above).
-  - **Consequence:** a sink whose write or acknowledgment wait has no transport timeout holds its
-    queue when the destination stops answering: no attempt fails, so `logit.component.retrying`
-    stays `0` and no `retrying` line is logged. Only the shutdown grace cuts it. Once the queue
-    fills behind the hold, its `buffer_full` warning is the first line that reports it.
-  - **Rule for a sink author:** give every write and acknowledgment wait a sink makes its own
-    timeout, and classify a timeout that fires as `Ambiguous` (or `Clean` when nothing left the
-    process).
-  - **Alternative declined:** a runtime backstop timeout above every sink's own. Each sink's
-    timeout is configurable per component, so a backstop set above it needs a graph rule tying the
-    two, for a case the per-sink rule already covers.
 - **The human render shows everything on the event but the batch's provenance.** `stdio_out`'s
   block (ADR `human-render-block-format`) is exhaustive over `Event`, `Resource`, and `Scope`.
   A batch's `origin`/`previous` reach a sink only through `Output::observe_batch`, which
@@ -100,8 +77,8 @@ Entry format and the other areas: [the known-gaps index](README.md).
   (2026-10-05)" and "Amendment: the Datadog sinks retry per request (2026-10-09)"). The memory
   lives in `BatchAccounting` (`crates/logit-outputs/src/accounting.rs`), not on disk.
   - **Consequence:** a `buffer.disk:` replay after a crash is a new batch and resends every
-    request, accepted ones included (`docs/known-gaps/native-hop.md`, "A disk-backed sink replays
-    delivered and dropped batches after a crash"). Under `at_least_once`, the request that drew an
+    request, accepted ones included ([Deploying `logit`](../deploying.md#durable-buffering)'s
+    "Durable buffering"). Under `at_least_once`, the request that drew an
     `Ambiguous` answer is resent too, and may have been applied. Whether either duplicates depends
     on the destination: Datadog stores a resent series point once and a resent log twice
     (`docs/known-gaps/datadog.md`).

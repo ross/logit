@@ -296,7 +296,7 @@ What the peers agree on:
   `at_most_once` for the `Ambiguous` case. Memory and disk cost follow `buffer:`, which already
   bounds them.
 - Readiness is unchanged: a sink holding its queue shows nowhere on `/readyz`
-  (`docs/known-gaps/runtime.md`, "Readiness is per-process, not per-sink").
+  ([ADR `admin-readiness-endpoint`](admin-readiness-endpoint.md), "Readiness is per-process, not per-sink").
 - A dead-letter path and an oversize split are the follow-ups this record points at and doesn't
   build. Until the first exists, a `Rejected` batch is visible in a counter and a log event and
   nowhere else.
@@ -493,3 +493,21 @@ Consequence: a `408` that repeats on every attempt, such as a proxy timeout shor
 time a large body takes to arrive, now holds the queue and retries with backoff where it used
 to drop each batch. `logit.component.retrying` reads `1` while it holds, and `at_most_once` still
 drops the batch. The `standin-remote-write` and `standin-influxdb*` soak scenarios cue a `408` as `ambiguous`.
+
+## Amendment: a sink's own timeout is the only bound on an attempt (2026-10-25)
+
+The runtime wraps `Output::send` in no timeout, so each sink bounds its own attempts: the HTTP
+and gRPC sinks with `request_timeout`, the stream sinks with `connect_timeout` on each write's
+progress, the Unix datagram send with `send_timeout`, and `logit_out` with `request_timeout` on
+each write and acknowledgment wait. `stdio_out` to a pipe has no bound, because a write to a
+stalled pipe can't be cancelled (`docs/known-gaps/sinks.md`).
+
+A sink author gives every write and acknowledgment wait its own timeout, and classifies one that
+fires as `Ambiguous`, or `Clean` when nothing left the process. A sink that doesn't holds its
+queue when the destination stops answering: no attempt fails, so `logit.component.retrying` stays
+`0` and no `retrying` line is logged, only the shutdown grace cuts it, and the first line that
+reports it is `buffer_full` once the queue fills.
+
+A runtime backstop timeout above every sink's own was declined. Each sink's timeout is set per
+component, so a backstop above it needs a graph rule tying the two, for a case the per-sink rule
+already covers.

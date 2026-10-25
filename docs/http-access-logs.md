@@ -378,7 +378,11 @@ wrapped in `"..."`. Getting it wrong either breaks the line's JSON or loses prec
   but `json`'s strict parse fails the whole line. `http_access` can't recover from that failure,
   because no attributes are left for it to normalize. Under `replace`, a parse that failed on
   invalid UTF-8 is retried on a copy with every invalid sequence replaced by U+FFFD, and a
-  well-formed line's cost is unchanged. The default is `reject`.
+  well-formed line's cost is unchanged, and each rescue counts
+  `logit.component.diagnostics{key="invalid_utf8"}`. The replaced bytes don't survive. The default
+  is `reject`, which fails the line with one throttled `parse_failure` and passes the event on
+  with none of its fields. Logging `$request_uri` instead of `$uri` removes the decoded-path
+  source of raw high bytes, but not a client's own non-ASCII header bytes.
 
 ## Emitters that can't write dotted keys
 
@@ -1202,7 +1206,9 @@ and the corpus of real user agents and paths they were checked against are `cons
 ## What it does not do
 
 [`docs/known-gaps/transforms.md`](known-gaps/transforms.md#http-access-logs-nginx-haproxy-and-http_access)
-tracks each of these:
+tracks the ones still open. `forwarded:`'s trust is a non-goal
+([ADR `forwarded-header-parsing`](adr/forwarded-header-parsing.md)), and a missing user agent
+follows the absent rule:
 
 - **No per-server presets.** `http_access` never learns a server's native variable names; you
   write the mapping in the server's own log-format language, or, for Caddy and Traefik, in a Lua
@@ -1222,4 +1228,6 @@ tracks each of these:
   bytes (a `lua` stage writing a non-UTF-8 string produces one) has no text to run a
   pattern over: a bytes user agent is `other`, a bytes path takes `route_other` (or no route).
 - **No `user_agent.class` without a user agent.** A format that doesn't log the header gets no
-  class at all, by the absent rule; [`demo/nginx/nginx.conf`](../demo/nginx/nginx.conf) is one.
+  class at all, by the absent rule; [`demo/nginx/nginx.conf`](../demo/nginx/nginx.conf) is one,
+  so the demo's nginx events carry no class while its HAProxy events do. To get one, log
+  `"user_agent.original":"$http_user_agent"`.

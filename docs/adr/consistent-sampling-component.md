@@ -1,6 +1,6 @@
 ---
 created: 2026-09-22
-updated: 2026-10-21
+updated: 2026-10-25
 ---
 
 # `sample`: consistent, keyed event sampling with an operator override
@@ -169,11 +169,13 @@ exists for the central-collector rates where per-event telemetry calls are the c
   conditions.
 - `always_keep` is per leg. An operator who wants a flagged request kept end to end places the
   same override on every sampler in the path — there is no propagated bit, by the same reasoning
-  that there is none for the rate. Recorded in `docs/known-gaps/transforms.md`.
+  that there is none for the rate.
 - No OTEP 235 interop; recorded in `docs/known-gaps/transforms.md` with the bit-convention
   difference, so a future adoption knows what it is changing.
 - `sample` is a per-event decision and never looks at a batch, so a resource-keyed sampler keeps
-  or drops every event of a resource — which is the point of keying on one.
+  or drops every event of a resource — which is the point of keying on one. At a low resource
+  count the kept fraction is lumpy, not `rate`: two services at `rate: 0.5` keep zero, one, or
+  both.
 - [`fixtures/sample-traces.yaml`](../../fixtures/sample-traces.yaml) is the runnable shape:
   `generate_in` → `trace_context` → `sample` (`key: trace_id`, an `always_keep` flag) →
   `stdio_out`, so "the same traces survive on every run, every span of each" can be seen rather
@@ -194,3 +196,11 @@ event. `rate: 0` discards every event that `always_keep` doesn't flag and `missi
 keep, counted in `logit.component.events.discarded`. Validation rejects a config only when it can't
 run, or when it would lose or duplicate data the operator didn't ask to lose or duplicate; a
 pointless config runs as written. The rule's other clauses stand.
+
+## Amendment (2026-10-25): a trace id carried as bytes
+
+A trace id carried as a 16-byte `Value::Bytes` attribute hashes as its raw bytes, not as hex text,
+so it gets a different verdict than the same id lifted by `trace_context`, as an uppercase-hex
+`Str` does. Raw bytes aren't hex-encoded for the same reason case isn't folded: the
+canonicalization table keeps one rule per `Value` variant. To agree with a lifted id, key on the
+lifted id (`key: trace_id`), or put the attribute in lowercase hex text upstream.

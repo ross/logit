@@ -41,15 +41,6 @@ Entry format and the other areas: [the known-gaps index](README.md).
     bound, closes a TLS connection that handshakes and then goes silent, or a plaintext one that
     sends its one peeked byte and goes silent.
 
-- **A native attribute map with keys in descending dictionary order inserts in quadratic time.**
-  `read_attr_map` inserts each key into `AttrMap`'s sorted storage (`AttrMap::insert_sym`, a
-  binary search and a `Vec::insert`) as it reads it, so a map whose keys arrive in descending
-  order of the receiver's interned symbols shifts every earlier entry on each insert. Measured:
-  80,000 keys take 3.4 s in descending order against 20 ms ascending. Real maps are far too small
-  for this to show ([`design/data-shapes.md`](../design/data-shapes.md)); only a map with tens of
-  thousands of keys in the worst order pays it. It's a non-goal under
-  [ADR `deployment-threat-model`](../adr/deployment-threat-model.md): the fix (collect, then sort
-  once) changes the ordinary decode path for a shape only crafted input produces.
 - **The native decode budget bounds only what arrives over `logit_in`.** The `buffer.disk:` spool
   decodes its records with no budget (`parse_record` in
   `crates/logit-pipeline/src/disk_queue.rs`), because each spooled batch was already that size in
@@ -108,26 +99,6 @@ Entry format and the other areas: [the known-gaps index](README.md).
   one spool directory. Nothing rewrites written segments to reclaim space early: a segment is
   deleted whole once the read cursor crosses it. Nothing encrypts at rest. None of these blocks the
   at-least-once contract; each is narrower future work if a deployment needs it.
-- **No out-of-order acknowledgment on the native hop.** `logit_in` forwards a connection's frames
-  in order, and `logit_out` commits its store's head on each `Ack`
-  ([ADR `native-hop-send-window`](../adr/native-hop-send-window.md)), so a batch slow to forward
-  holds up the ones behind it. Out-of-order acknowledgment is out of scope by decision: nothing
-  could be acknowledged out of order, and the spool would need a persisted acknowledged bit per
-  record.
-- **No end-to-end acknowledgment past the first hop.** `logit_out`'s `send` succeeds only after
-  `logit_in`'s own `Fanout::send` has accepted the batch into every one of its downstream inboxes
-  ([ADR `native-transport-handshake-and-ack`](../adr/native-transport-handshake-and-ack.md)'s "Ack
-  point" decision).
-  - **Consequence:** if `logit_in` forwards to a further sink (another `logit_out`, an
-    `influxdb_out`, and so on), nothing tracks whether the data survives that delivery, and any
-    non-`logit_out` sink's `send` means only "the immediate destination accepted the write". The
-    receive side is attributable (`logit.component.datagrams.dropped`,
-    `logit.input.kernel.dropped`;
-    [ADR `udp-intake-batching-and-socket-visibility`](../adr/udp-intake-batching-and-socket-visibility.md)).
-  - [ADR `delivery-semantics`](../adr/delivery-semantics.md), item 3, makes end-to-end
-    acknowledgment a non-goal: an input's acknowledgment means accepted into the pipeline, and
-    this entry states that limit.
-
 - **A TLS `logit_out` that dies inside the first record of a frame reads, at `logit_in`, as a clean
   close.** The frame's header travels in its first TLS record. If the sender's connection fails
   before that record is complete, `logit_in` has decrypted zero bytes of the header when the
@@ -141,7 +112,6 @@ Entry format and the other areas: [the known-gaps index](README.md).
     plaintext read
     ([ADR `sink-send-path-and-attempt-accounting`](../adr/sink-send-path-and-attempt-accounting.md),
     decision 12).
-
 - **A shutdown grace that cuts a `logit_out` `send` mid-write commits, and counts as dropped, a
   batch that provably never landed.** `write_loop` reads any cut-off send as `Fault::Ambiguous`,
   because it can't know how far the send got. On `logit_out`, a cut inside the frame's write or
@@ -155,32 +125,6 @@ Entry format and the other areas: [the known-gaps index](README.md).
     the row.
   - **Workaround:** to keep a queued batch across the restart, set `buffer.disk:` on the
     `logit_out` component, which persists it at the read cursor.
-
-- **A shutdown with a `logit_out` window in flight can count as dropped batches that `logit_in`
-  then forwards.** At a grace cut, each frame in flight is counted
-  `logit.component.batches.dropped{reason="shutdown"}`: under `at_most_once` the cut commits it,
-  and under the default `at_least_once` it stays reserved and a memory store's `finish` counts
-  it. Those frames were written whole, and when the connection is still pooled,
-  `Output::flush`'s `shutdown()` closes it cleanly, so `logit_in` reads and forwards them. The
-  over-count is at most `window` batches.
-  - **Why it isn't fixed:** the sink can't learn which of them `logit_in` forwarded without
-    waiting for `Ack`s past the grace.
-  - **Workaround:** under `at_least_once`, a `buffer.disk:` store doesn't count them. It replays
-    them on the next start, and `logit_in` acknowledges any it already forwarded without
-    forwarding them again ([ADR `native-hop-send-window`](../adr/native-hop-send-window.md),
-    decision 6).
-
-- **The native hop still forwards a duplicate after a `logit_in` restart, an evicted sender, or a
-  load balancer.** `logit_in` deduplicates a resend or a `buffer.disk:` replay against a
-  high-water mark per sender identity, held in memory and bounded at
-  `max_connections + max_connections / 4` identities, evicting the least recently seen. A
-  restarted `logit_in`, an identity evicted from a full table, and a second `logit_in` behind a
-  load balancer hold no mark for the sender, so each forwards the resend.
-  [ADR `native-hop-identity-and-sequence`](../adr/native-hop-identity-and-sequence.md), decisions
-  5 and 6, accepts this: the at-least-once target prefers the duplicate to a loss. A
-  resend that arrives after an eviction is usually old, so `drop_stale` after `logit_in` discards it
-  ([ADR `stale-event-filtering`](../adr/stale-event-filtering.md)).
-
 - **A resend can race the frames an ended connection still holds, and be forwarded twice.**
   `logit_in` holds no lock per sender identity across a forward, and it raises a sender's mark
   only once a consumer takes the frame or once it refuses the frame by name.
@@ -209,7 +153,6 @@ Entry format and the other areas: [the known-gaps index](README.md).
     lock per frame, to prevent a duplicate the at-least-once target tolerates.
     [ADR `native-hop-send-window`](../adr/native-hop-send-window.md), decision 6, keeps that with a
     window.
-
 - **A refused frame whose rejected `Ack` is lost is reported delivered by the sender.**
   `logit_in` raises a refused frame's mark before the sender reads the rejected `Ack`
   ([ADR `native-hop-ack-status`](../adr/native-hop-ack-status.md), decision 4). If the connection
@@ -223,7 +166,6 @@ Entry format and the other areas: [the known-gaps index](README.md).
     `logit.component.batches.delivered`. Nothing is lost beyond the drop itself.
   - **Possible fix, out of scope:** a bounded per-identity set of refused sequences that
     `HelloAck` names, so a resume commits them as dropped.
-
 - **A reconnect resumes at most 16 sender identities.** After a fault, `logit_out`'s next `Hello`
   lists the identities of the frames it will resend, so `logit_in` can answer their marks and the
   frames at or below them are committed without a send (`logit.output.batches.resumed`). The list
@@ -231,11 +173,11 @@ Entry format and the other areas: [the known-gaps index](README.md).
   opens, which takes a spool replaying records from that many earlier opens, resends the frames of
   the 17th identity on.
   - **Consequence:** `logit_in` recognizes each of those by its mark and doesn't forward it again,
-    so the cost is the encode and the bytes. The previous entry's duplicate cases are unchanged.
+    so the cost is the encode and the bytes. The duplicate cases
+    [`docs/deploying.md`](../deploying.md#forwarding-between-logit-nodes) lists are unchanged.
     [ADR `native-hop-named-acks`](../adr/native-hop-named-acks.md), decision 4, accepts this.
   - **Revisit trigger:** `logit.input.batches.resends` climbing after reconnects that the resume
     should have absorbed.
-
 - **Coalesced acks cost about 2 points of a window's ceiling under 10 ms RTT.** At `concurrency: 32`
   and a 10 ms round trip (`tc qdisc ... netem delay 5ms`), `logit_in`'s named acks
   ([ADR `native-hop-named-acks`](../adr/native-hop-named-acks.md)) reach 97.2% of the 3,174
@@ -250,20 +192,3 @@ Entry format and the other areas: [the known-gaps index](README.md).
     pre-named-ack binary to this one (1.150 → 1.177 µs/event), under the 5% gate.
   - **Numbers:** [`design/performance.md`](../design/performance.md) §1, "`native-relay` under a
     10 ms round trip".
-
-- **A disk-backed sink replays delivered and dropped batches after a crash, under either
-  posture.** `commit` moves the read cursor in memory. The cursor reaches disk on a commit once
-  `checkpoint_interval` (1 s by default) has passed since the last write, on a segment roll, or at
-  shutdown, with no timer.
-  - **Consequence:** after a crash, the spool replays the batches in flight and every batch
-    committed since the last cursor write, which after an idle period can be far older than the
-    interval. `logit.component.buffer.disk.replayed` counts every record resumed after the cursor,
-    so it can't separate those re-deliveries from the backlog that was never sent. Under
-    `at_most_once`, the re-deliveries include a batch the sink dropped as `Ambiguous` to avoid a
-    duplicate. A `statsd_out`, or a sink whose destination aggregates a resend, with
-    `buffer.disk:` can replay counters from that window after a crash.
-  - On the native hop, a `logit_in` that still holds the replayed records' sender identity acks
-    them without forwarding them
-    ([ADR `native-hop-identity-and-sequence`](../adr/native-hop-identity-and-sequence.md)).
-  - It isn't a gap to close: [ADR `delivery-semantics`](../adr/delivery-semantics.md), item 8,
-    keeps the combination valid and states the window.

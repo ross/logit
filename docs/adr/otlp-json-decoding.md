@@ -1,6 +1,6 @@
 ---
 created: 2026-09-10
-updated: 2026-10-18
+updated: 2026-10-25
 ---
 
 # OTLP/JSON decoding: hand-written against `serde_json::Value`, not generated
@@ -135,7 +135,7 @@ in JSON as in protobuf (`json/metrics.rs`), so both encodings carry them.
 - OTLP/JSON requests decode through a `serde_json::Value` tree before ever reaching the generated
   structs, which costs more peak memory per byte than protobuf's direct `prost::Message::decode`
   under the same request-size cap (`MAX_REQUEST_BYTES` in `crates/logit-inputs/src/otlp.rs`) —
-  tracked in `docs/known-gaps/otlp.md`.
+  a non-goal listed in ADR `deployment-threat-model`.
 - `otlp_in`'s 4xx/5xx error bodies stay `text/plain` on both encodings. The spec wants a
   protobuf-encoded `google.rpc.Status` message on every error response regardless of request
   encoding; `otlp_in` doesn't build one on the protobuf path today either, so this is a pre-existing

@@ -9,8 +9,7 @@
 //!
 //! [`Dict::read`] interns each string as it reads it, before the rest of the batch validates, so
 //! a batch rejected later still leaves its strings in the never-evicting interner. That is a
-//! documented non-goal: `docs/known-gaps/runtime.md`'s interner entry, "`logit_in`'s native
-//! dictionary".
+//! documented non-goal: `docs/design/memory.md` §4's "What feeds it".
 
 use std::collections::HashMap;
 

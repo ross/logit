@@ -778,7 +778,7 @@ What changes for a Kafka target:
   discards a resend, so a duplicate FAILs unless its life ended in a restart or kill, or the
   sink counted a drop that bumps the epoch there (`rejected`, `invalid_timestamp`,
   `invalid_record`, `ambiguous_at_most_once`). Those duplicates WARN, as
-  [`docs/known-gaps/kafka.md`](../../docs/known-gaps/kafka.md) permits. A run with a killed SUT
+  [`docs/deploying.md`](../../docs/deploying.md#kafka_out-producing-to-kafka) permits. A run with a killed SUT
   life WARNs, rather than FAILs, on a T − A difference in either direction, because a kill loses
   that life's last telemetry interval and a replayed spool batch counts twice in A.
 

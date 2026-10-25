@@ -825,7 +825,8 @@ the stage already sees, so this costs no syscall.
 A source timestamp alone isn't enough: the previous point carries the flush clock, so a re-opening
 event's source time can precede it, run ahead of the flush, or be 0, which OTLP reads as "unknown"
 and `prometheus_out` doesn't render as `_created`. The bound assumes the flush clock doesn't step
-backwards; it is `SystemTime`, which can (`docs/known-gaps/transforms.md`).
+backwards; it is `SystemTime`, which can ("Amendment: the flush clock stays `SystemTime`
+(2026-10-25)" below).
 
 See `crates/logit-transforms/src/aggregate.rs`'s `SeriesKey`, `value_key_eq`, `scope_key_eq`,
 `group_for`, `fold_extreme`, and `Aggregator::flush` for the code this amendment describes, and
@@ -1240,3 +1241,12 @@ cardinality upstream with `keep` or `keep_values`. `docs/known-gaps/transforms.m
   worth building for flows with no `aggregate`.
 - **A per-series tag-count limit**, like Datadog's 100 tags per point. It bounds a series' width,
   not the series count, and would be a general component if ever built.
+
+## Amendment: the flush clock stays `SystemTime` (2026-10-25)
+
+The start-time bound in "Start time after a cap eviction" assumes a flush clock that doesn't step
+backwards, and the stage's clock is `SystemTime`, which can. After a backwards step a retained
+series' new start can precede its previous point, and emitted points stop being monotonic in time;
+a consumer still sees a changed start and re-bases. The stage stays on `SystemTime`: a monotonic
+clock would need its own mapping to wall time on every emitted point, which nothing else in the
+pipeline does.

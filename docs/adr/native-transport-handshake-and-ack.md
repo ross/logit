@@ -1,6 +1,6 @@
 ---
 created: 2026-09-09
-updated: 2026-10-18
+updated: 2026-10-25
 ---
 
 # Native transport: handshake, implicit sequencing, and per-batch acknowledgement
@@ -340,7 +340,7 @@ rejection stands, on these grounds instead:
   surface, though several of its amendments live there.
 - **A long-lived stream gets little from L7 infrastructure.** A stream pins to one backend, so a
   load balancer can't balance it, and a second `logit_in` behind one holds no mark for the sender
-  either way (`docs/known-gaps/native-hop.md`). Cloud load balancers close an idle stream on their
+  either way ([ADR `native-hop-identity-and-sequence`](native-hop-identity-and-sequence.md)). Cloud load balancers close an idle stream on their
   own timer, often 60 s, which this ADR's idle-close design would have to track.
 - **The gRPC in tree is unary only** ([ADR `hand-rolled-grpc-over-hyper`](hand-rolled-grpc-over-hyper.md)).
   A bidirectional stream is new transport code, not a reuse.

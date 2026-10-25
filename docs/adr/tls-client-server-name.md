@@ -49,6 +49,7 @@ dialed host on every transport, and none for an IP endpoint.
 - On `kafka_out` every broker is verified against the one name.
 - The resumption cache stays keyed by the dialed name. A resumed session skips verification, but
   every session in a config's cache was verified against that config's one `server_name`.
+  A test dials twice with one config and asserts the second handshake is resumed.
 
 ## Alternatives considered
 - **Set SNI and the verification name, as OTel does.** The non-`reqwest` clients could do it

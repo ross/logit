@@ -12,8 +12,7 @@
 //!
 //! [`read_attr_map`] inserts each entry into `AttrMap`'s sorted storage as it reads it, which is
 //! quadratic for a large map whose keys arrive in descending symbol order. That is a documented
-//! non-goal: `docs/known-gaps/native-hop.md`, "A native attribute map with keys in descending
-//! dictionary order inserts in quadratic time".
+//! non-goal: `docs/adr/deployment-threat-model.md`'s non-goals amendment.
 
 use bytes::{Buf, Bytes, BytesMut};
 use logit_core::{AttrMap, Symbol, Value};

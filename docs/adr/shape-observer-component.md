@@ -1,6 +1,6 @@
 ---
 created: 2026-09-20
-updated: 2026-10-21
+updated: 2026-10-25
 ---
 
 # `shape`: an observer component that turns each event into measurements of its own shape
@@ -143,7 +143,8 @@ wire's grouping for `otlp_in` and `prometheus_in`, which bypass the accumulator.
   and remove the tap afterwards; the docs say so.
 - The stateful gauges are cumulative since process start, not windowed, and track top-level keys
   only — a nested map's keys are counted in its width, not added to the distinct-key set.
-  `docs/known-gaps/transforms.md` records both.
+  `docs/known-gaps/transforms.md` records the first, and `docs/deploying.md`'s `shape` section
+  the second.
 - `shape`'s output vocabulary (`logit.shape.*`, the `signal`/`source`/`tap` tags) is now something
   dashboards and the survey's capture harness depend on; renaming a metric is a breaking change to
   them, pre-release or not.
@@ -163,3 +164,11 @@ every key or key-set it meets counts in `logit.transform.keys.untracked` or
 `logit.transform.keysets.untracked`. Validation rejects a config only when it can't run, or when it
 would lose or duplicate data the operator didn't ask to lose or duplicate; a pointless config runs
 as written. The number 58 is not reused, so the other rules keep theirs.
+
+## Amendment (2026-10-25): what a passed-through `Scope` carries
+
+Because the batch's `Scope` passes through `shape` unchanged, an `otlp_in` whose senders put
+identifying information in `Scope.attributes` passes it through the tap. That's a narrow exception
+to the counts-only property, accepted for the reason the Decision gives: a scope names an
+instrumentation library rather than carrying payload. `shape`'s flush output carries no scope at
+all, since a window spans many batches and there's no single one to keep.

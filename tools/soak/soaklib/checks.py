@@ -1302,7 +1302,7 @@ REFUSAL_KEYS = ("api_key_rejected", "request_refused")
 # `kafka_out`'s `records.dropped` reasons for a partition batch settled without being appended,
 # each of which bumps the producer epoch (`crates/logit-outputs/src/kafka/producer.rs`'s module
 # doc). The broker's duplicate detection doesn't span an epoch bump, so a life that counted one
-# may store a record twice (docs/known-gaps/kafka.md). `oversize` drops a record before it gets a
+# may store a record twice (docs/deploying.md, "kafka_out"). `oversize` drops a record before it gets a
 # sequence, so it bumps nothing. The `MESSAGE_TOO_LARGE` split and `OUT_OF_ORDER_SEQUENCE_NUMBER`
 # bump the epoch with no drop counted, so a duplicate they cause FAILs `ledger.topic` and needs
 # reading by hand.
@@ -4323,7 +4323,7 @@ def check_ledger_hop(data):
     forwards again only if it restarted between that life's last delivery and the replay's,
     forgetting their marks; then the gap may fall by that many frames too. A kill or a pause of
     the far SUT can make it forward a resend twice: a kill forgets its marks, and a pause
-    leaves frames in an ended connection that a resend races (docs/known-gaps/native-hop.md),
+    leaves frames in an ended connection that a resend races (docs/deploying.md),
     each up to one send window of frames below 0. A partition or packet loss can't: the race
     needs a forward parked on a full inbox. Any other
     gap FAILs, as a surplus below the allowance or uncounted loss above it. Resends, resumed
@@ -4969,7 +4969,7 @@ def check_ledger_topic(data):
     is in A twice but stored once. A duplicate copy or a repeated point FAILs when the life
     it's credited to has no epoch-bumping event: it isn't the final life, so no later producer id
     resent it, and the sink counted no `EPOCH_BUMP_REASONS` drop in it. Within one epoch the
-    broker discards a resend. Duplicates after an epoch bump WARN, which docs/known-gaps/kafka.md
+    broker discards a resend. Duplicates after an epoch bump WARN, which docs/deploying.md
     permits. A topic not read back FAILs. Every other target SKIPs."""
     if not data.kafka:
         return Result("ledger.topic", SKIP, f"{data.target.get('kind')} target: no topic")

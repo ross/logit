@@ -72,18 +72,6 @@ Entry format and the other areas: [the known-gaps index](README.md).
 
   Either is real work. **Revisit** when the output path's allocation cost becomes worth chasing.
 
-- **A datagram in flight when SIGTERM/SIGINT lands is lost**
-  ([ADR `service-lifecycle-and-output-retry`](../adr/service-lifecycle-and-output-retry.md)).
-  Cancelling a listener's `run` future drops whatever it was mid-`recv_from`/decode on. The loss
-  is accepted, because UDP is lossy by contract already. A UDP listener counts those datagrams as
-  `datagrams.dropped{reason="shutdown"}`; the events it had already decoded are the uncounted
-  remainder under [UDP intake](intake.md#udp-intake).
-
-  The rest of shutdown is protected. A signal handler closes every listener's inbox normally
-  (`logit_pipeline::run_with_shutdown`, `crates/logit-pipeline/src/runtime.rs`), triggering the
-  same close-time flush a listener's natural completion has, so the aggregation window survives,
-  and each sink's `Output::flush` runs once `write_loop` stops delivering
-  ([ADR `buffered-sink-delivery`](../adr/buffered-sink-delivery.md)).
 - **A batch parked in `Fanout::send` when a listener's future is dropped is lost, already counted
   `sent`.** `Fanout::deliver` counts `batches.sent`/`events.sent` before it awaits the first
   consumer's channel. A send dropped while a full downstream parks it reaches no consumer, or only
@@ -182,91 +170,6 @@ Entry format and the other areas: [the known-gaps index](README.md).
 
 ## Event model and interner
 
-- **The attribute/metric-name interner never frees** (`crates/logit-core/src/interner.rs`) —
-  `lasso::ThreadedRodeo` has no eviction, so the process retains every distinct string it ever
-  interned, at a measured ~94-124 bytes each.
-
-  **Accepted, not planned work.** Re-interning a string the table already holds allocates nothing,
-  so a fixed schema reaches steady state and stays flat.
-  - **What's interned:** attribute and resource keys, metric names, the symbol-typed metric/log
-    fields (`unit`, `description`, `event_name`), and `telemetry`'s tag keys and values. An
-    attribute's *value* never is, so the usual cardinality explosion (host, request id, user
-    agent, path) never touches it.
-  - **What's left:** a real metric name that never repeats, from a user who embedded an id in a
-    metric name. That namespace is user-controlled, not attacker-controlled, because `logit`'s
-    listeners are private by deployment shape
-    ([ADR `deployment-threat-model`](../adr/deployment-threat-model.md)). The anti-pattern is well
-    known, and `logit` isn't what breaks first. The metric store fails well before: a million
-    distinct measurement names is a million-plus series, against 94 MB here. Even inside `logit`,
-    `aggregate`'s window costs ~600 bytes per series *per window* against the interner's ~94
-    bytes once, so it fails ~6× harder and sooner, and putting `keep` in front of it already
-    mitigates that.
-
-  Growth is observable: `internal`'s `logit.process.interner.strings` gauge
-  ([internal-telemetry.md](../design/internal-telemetry.md)) samples `interner::len()` on every
-  drain tick. Attach any sink to `internal` to watch it.
-
-  **Revisit trigger — re-check the premise, not the conclusion:** if a listener ever stops being
-  private (a public or multi-tenant ingest endpoint, a hosted aggregator). The retrofit is
-  expensive: `Symbol` is `Copy` and `resolve` panics on an unknown symbol, so `AttrMap`,
-  `MetricRecord`, `SeriesKey`, the Lua proxy, and the native wire dictionary all assume symbols are
-  eternal. See [memory.md](../design/memory.md)'s interner section.
-
-  These listeners and transforms feed it unbounded keys:
-  - **Bounded:** keys from `logit`'s own config or a fixed protocol grammar (statsd's `#tag:value`).
-  - **`syslog.sd` is not bounded.** `syslog.sd`
-    (`Value::Map { "<SD-ID>" -> Value::Map { "<PARAM-NAME>" -> ... } }`,
-    [ADR `syslog-structured-data-convention`](../adr/syslog-structured-data-convention.md)) interns
-    every SD-ID and PARAM-NAME a peer sends, at both map levels; nesting doesn't bound that. RFC
-    5424's grammar is the bound: 1 to 32 PRINTUSASCII bytes, excluding `=`, SP, `]`, and `"`. It's
-    the same exposure the `json` transform has for an arbitrary JSON object's keys
-    ([ADR `json-parsing-into-attributes`](../adr/json-parsing-into-attributes.md)), with a length
-    cap `json` doesn't have.
-  - **`otlp_in` is the sharpest form.** `crates/logit-proto/src/otlp/common.rs`'s
-    `key_values_into_attrs` interns every OTLP `KeyValue.key`, and those keys are arbitrary
-    peer-supplied strings with no `logit`-side grammar and no length cap. It's the listener where
-    a never-repeating key (the retrofit trigger) could plausibly come from something other than a
-    user's own naming mistake. **Mitigation:** [`docs/deploying.md`](../deploying.md) recommends
-    `keep` in front of `otlp_in` specifically, beyond the general `aggregate`-cardinality
-    recommendation [`fixtures/nginx-to-influxdb.yaml`](../../fixtures/nginx-to-influxdb.yaml)
-    demonstrates.
-  - **`logit_in`'s native dictionary.** `crates/logit-proto/src/native/dict.rs`'s `Dict::read`
-    interns every dictionary string a `logit_in` peer sends before the rest of the batch
-    validates, so its strings stay in the interner, even from a batch the decoder then rejects.
-    That's not defended, per the threat model in
-    [ADR `deployment-threat-model`](../adr/deployment-threat-model.md). Nothing budgets dictionary
-    strings across frames. The dictionary entry cap and the frame size bound each frame; the
-    process-lifetime bound is the same premise as every other feeder: `logit_in`'s peers are other
-    `logit` processes the operator runs.
-  - **`flatten` adds no new bound** (`crates/logit-transforms/src/flatten.rs`,
-    [ADR `flatten-transform`](../adr/flatten-transform.md)). Its marginal exposure over
-    `json`/`syslog_in`/`otlp_in` is twofold:
-    - path *combinations* of already-interned keys, a product bounded by the fixed internal
-      recursion-depth wall rather than a key-count cap;
-    - array indices, a new key axis no other component mints: a 10,000-element array attribute
-      flattens into `tags.0`..`tags.9999`, ten thousand symbols interned forever.
-
-    There is no `max_keys`-style cap (settled; see the ADR's Alternatives). The operator's levers
-    are a narrowed `attributes:`/`resource:` list and `arrays: skip`. A rotating key space in
-    *value* position that `flatten` promotes to *key* position (a map keyed by request or user
-    IDs) is the exposure `json`/`otlp_in` already have one level shallower, multiplied by every
-    distinct path above it.
-  - **`lua`/`lua_file` feed it from five feeders, one guarded.** `telemetry`'s tag keys/values
-    and metric names (`crates/logit-script/src/telemetry.rs`'s `static_str`/`static_metric_name`/
-    `read_tags`) are the guarded case: `install`'s `count`/`gauge` closures check
-    `Telemetry::is_enabled` before calling them, so a disabled handle costs nothing whatever a
-    script passes. The other four are unguarded, per this entry's accepted posture:
-    - `MetricProxy`'s `__newindex` on `name`/`unit`/`description`;
-    - `LogProxy`'s `__newindex` on `event_name`;
-    - `Event.new`'s symbol fields: `construct::metric_from_table`'s `name` directly, and its
-      `unit`/`description` and `construct::log_from_table`'s `event_name` through
-      `symbol_field`;
-    - every attribute key a script writes, top-level through `AttrsProxy::__newindex` and nested
-      through `value.rs`'s `lua_table_to_attrmap`.
-
-    See [ADR `lua-runaway-script-bounds`](../adr/lua-runaway-script-bounds.md) and the
-    [Lua](transforms.md#lua) section.
-
 - **`HyperLogLog::from_bytes` (`crates/logit-core/src/metric.rs`) works around an upstream
   allocation-layout bug in `cardinality-estimator` 1.0.3, not only a byte-shape mismatch.**
   - **The bug:** that crate's `Array::from_vec` rounds a deserialized `Vec<u32>`'s length up to
@@ -288,20 +191,6 @@ Entry format and the other areas: [the known-gaps index](README.md).
   - **Revisit** on any `cardinality-estimator` upgrade; it's pinned to 1.0.3. The upstream fix
     would be `into_boxed_slice`/`shrink_to_fit` in `Array::from_vec`, so the freed layout always
     matches the `Vec`'s capacity by construction.
-- **A decoded sketch's or HyperLogLog's summary fields are taken as written**
-  (`crates/logit-core/src/sketch.rs`'s module doc, `HyperLogLog::from_bytes`). `from_bytes`
-  bounds what a blob can allocate or make later operations cost, and rejects a zero-register
-  count past the register count, but trusts the rest of a peer's summary. That's a non-goal under
-  [ADR `deployment-threat-model`](../adr/deployment-threat-model.md) (accidental data from private
-  peers), and [ADR `untrusted-input-bounds`](../adr/untrusted-input-bounds.md) adds a check only
-  where it's free and would catch an accident. None of these panics:
-  - A `DdSketch` with `min > max` answers non-monotonic quantiles.
-  - A `DdSketch` with an infinite or `NaN` `min` or `max` hands it to `quantile`'s clamp, so a
-    decoded sketch can answer `±∞`.
-  - `merge` skips a `DdSketch` with a `count` of 0 over populated bins, because it returns early
-    on an empty incoming sketch.
-  - A `HyperLogLog` whose harmonic sum (`data[1]`) is wrong estimates wrong. The sum is an `f32`
-    accumulated per register update, so recomputing it on decode wouldn't reproduce the bytes.
 - **Nothing in the event model keeps a `Histogram` well formed, so each producer and each sink
   decides alone.** `logit_core::Histogram`'s `buckets` field is public, and the type promises no
   order, no single `+Inf` bucket, and no finite bound. A well-formed histogram has finite bounds in
@@ -333,23 +222,6 @@ Entry format and the other areas: [the known-gaps index](README.md).
 
 ## Config and CLI
 
-- **`logit graph` can't render a config with any secret left unset** — every command that loads a
-  config must resolve every `!env` reference (ADR `env-yaml-tag`), including `graph`, though it
-  reads only a component's `sources`/`type` to render topology and style nodes by role. A lenient
-  mode that substituted a placeholder for a missing variable was tried and reverted (ADR
-  `env-yaml-tag`'s Alternatives). **Workaround:** render a copy of the config with placeholder
-  values filled in.
-- **`!env` is invisible to `schema/logit.schema.json`**
-  ([ADR `env-yaml-tag`](../adr/env-yaml-tag.md)) — resolution happens on the parsed YAML tree
-  before serde sees it (`crates/logit-cli/src/config.rs`), so the schema describes the
-  substituted shape, never the tag. A schema-aware YAML editor flags a `!env`-tagged value it
-  can't resolve against the schema.
-- **Config deserialization errors lose line/column information** once `!env` is in the picture
-  (`crates/logit-cli/src/config.rs`) — resolving the tag means parsing to `serde_norway::Value`
-  first and deserializing from that, and `serde_norway::from_value` carries no source location
-  the way `serde_norway::from_str` on the raw file does. Two things partly offset it: `!env`'s own
-  errors name a config path (`components.influx_out.token`), and a note is appended when a
-  substitution's resolved type likely caused the failure.
 - **No config hot reload on SIGHUP.** A config change means a restart. A SIGHUP reopens
   `stdio_out`'s and `file_out`'s file targets and logs that the config wasn't reloaded
   ([ADR `signal-handling`](../adr/signal-handling.md)); `types_db:` and `lua_file` scripts are
@@ -367,18 +239,6 @@ Entry format and the other areas: [the known-gaps index](README.md).
 
 ## Admin endpoint, readiness, and release image
 
-- **Readiness is per-process, not per-sink.** A single sink holding its queue while its
-  destination refuses it doesn't flip `/readyz` to unready; the sink's `buffer:` block bounds what
-  the hold accumulates, and the `logit.component.retrying` gauge and the paced `retrying` error
-  line are what an alert watches ([ADR `sink-fault-classes`](../adr/sink-fault-classes.md)).
-  `/readyz`'s `degraded` is reserved for a node that has exited with an error, not one that's
-  behind.
-  - The one non-exited not-ready answer is `503 stalled`, for a `lua`/`lua_file` component inside
-    a script call with no progress
-    ([ADR `lua-runaway-script-bounds`](../adr/lua-runaway-script-bounds.md)). It clears when the
-    script resumes, with no phase change.
-  - A richer per-sink probe would be additive to `PipelineState.components`, already keyed by
-    component id. It isn't built because nothing has asked for it.
 - **The published `ghcr.io/ross/logit` image is `latest` only, amd64 only, unsigned, and
   unattested.** It has no version tags (the workspace version is still a pre-release
   placeholder), no arm64 build, no cosign signature, and no SBOM. Nothing in CI builds or
