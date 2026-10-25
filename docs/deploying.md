@@ -1032,14 +1032,20 @@ buffer full (buffer.max_batches 1024); overflow block is holding intake; sending
 
 That sink isn't refusing anything: each batch waits for the one before it to be answered, so the
 round trip bounds its throughput. On a sink with a `concurrency:` field, raising it keeps more
-batches in flight; see the sink's own docs for what that costs in ordering.
+batches in flight; see the sink's own docs for what that costs in ordering. Against a 200 ms
+round trip, a sink offered ten batches a second delivered five at 1 and all ten at 8, with two
+in flight on average.
 
 An HTTP sink offers HTTP/2 (h2) and HTTP/1.1 through TLS's ALPN on an `https://` endpoint, and
 its batches in flight share one connection when the server picks h2. That connection is one
 failure domain: a reset or a `GOAWAY` fails every request on it at once, each an ambiguous
 fault, and packet loss on it stalls every request (TCP head-of-line blocking). Over HTTP/1.1,
-including every `http://` endpoint, each batch in flight has its own connection, up to
-`concurrency`, and a fault reaches one. `otlp_out`'s gRPC transport already carries both costs.
+including every `http://` endpoint, each batch in flight has its own connection, and a fault
+reaches one. The pool can hold more connections than `concurrency`, since it dials one for each
+request waiting while none is free, and it keeps each idle for 90 s. A destination that closes
+idle connections sooner, behind a link with real delay, can close one while a request written on
+it is still on the way; the sink reads that as an ambiguous fault, resent under `at_least_once`
+and dropped under `at_most_once`. `otlp_out`'s gRPC transport already carries both costs of h2.
 
 While the buffer stays full, the warning repeats at most once a minute with the batches and events
 shed so far, or how long intake has been held. Once the buffer's utilization falls below

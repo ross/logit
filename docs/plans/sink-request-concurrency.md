@@ -8,9 +8,8 @@ updated: 2026-10-25
 ## Context
 
 Every sink that waits for a response, `logit_out` apart, sends one request per round trip, so
-over a slow link its buffer fills and it drops or stalls with nothing naming the cause
-([`docs/known-gaps/sinks.md`](../known-gaps/sinks.md), "Every sink that waits for a response,
-but `logit_out`, sends one request at a time"). [ADR
+over a slow link its buffer fills and it drops or stalls with nothing naming the cause. That was
+a [`docs/known-gaps/sinks.md`](../known-gaps/sinks.md) entry until W5 closed it. [ADR
 `sink-request-concurrency`](../adr/sink-request-concurrency.md) decides the fix: a
 `concurrency:` field on each HTTP sink, a write loop that settles each in-flight batch on its
 own outcome, a shared slot helper in the HTTP driver, and HTTP/2 through `reqwest`.
@@ -106,9 +105,13 @@ Non-goals:
 ### W5: soak, findings, and the known-gaps closing
 
 - **`http-concurrency`** (`tools/soak/scenarios/http-concurrency/`): `influxdb_out` into
-  `influxdb_in` over TLS, `wire = "http"` as `http-ingress` declares it, 200 ms ± 50 ms netem on
-  the responses, run at `concurrency: 1` and `8` from two SUT configs, with `[[expect]]` rows on
-  `logit.output.in_flight` and on `batches.dropped{reason="overflow_newest"}` at 0 under 8.
+  `influxdb_in`, `wire = "http"` as `http-ingress` declares it, 200 ms ± 50 ms netem on
+  the responses, run at `concurrency: 1` and `8` as two scenarios (`http-concurrency-1`), with
+  `[[expect]]` rows on `logit.output.in_flight` and on
+  `batches.dropped{reason="overflow_newest"}` at 0 under 8. It runs over plaintext:
+  `influxdb_out` has no `tls:` field, so it can't trust the run's private CA.
+  `otlp-concurrency-tls` runs `otlp_out` into `otlp_in` over TLS instead, where ALPN picks
+  HTTP/2.
 - **`otlp-fan-out`** at `concurrency: 8`, as a second config or a sibling scenario, judged by the
   same ledger as today's run, with its `overflow_newest` count compared with the run recorded
   in [`docs/plans/soak-harness.md`](soak-harness.md)'s "Findings".
@@ -155,3 +158,69 @@ observable through `logit_pipeline::test_util`, never a sleep.
 ## Findings
 
 Recorded per workstream as each lands.
+
+### W5: soak runs (2026-10-25)
+
+Each scenario ran once on the development host, `script/soak run`, and every row of each final
+run reads PASS or SKIP. `http-concurrency`, `http-concurrency-1`, and `otlp-fan-out-conc` ran on
+an image built from `conc/w3`, which speaks HTTP/1.1 over plaintext either way;
+`otlp-concurrency-tls` and `standin-concurrency` ran on one with W4 merged.
+
+**Throughput on a slow link.** The generator offers ten batches a second (500 events) to an
+HTTP sink, and the SUT's answers are delayed 200 ms ± 50 ms:
+
+| Run | Sink | Delivered under the delay | `send.duration` mean | `in_flight` max (mean) | Overflowed under the delay |
+|---|---|---|---|---|---|
+| `http-concurrency-1` | `influxdb_out`, 1 | 5.00 batches/s (250 events/s) | 200 ms | 1 | 999 batches in 205 s |
+| `http-concurrency` | `influxdb_out`, 8 | 10.00 batches/s (500 events/s) | 202 ms | 3 (2.0) | 0 |
+| `otlp-fan-out-conc` | `otlp_out`, 8 | 10.00 batches/s | 200 ms | 3 (2.0) | 0 |
+| `otlp-concurrency-tls` | `otlp_out`, 8, TLS | 9.99 batches/s | 208 ms | 4 (2.1) | 0 |
+
+At 1 the sink moves one batch per round trip, so it delivers half the offered rate and the
+50-batch queue overflows at the other half. At 8 two requests in flight on average carry the
+whole rate, and the round trip, unchanged, stops being the bound.
+
+**A stopped destination.** While VictoriaMetrics stops for 90 s, the SUT's listener holds or
+refuses each request, and all eight slots fill (`in_flight` 8 in `http-concurrency` and
+`otlp-concurrency-tls`). Concurrency doesn't help when nothing is answered: `http-concurrency`
+overflowed 518 batches around the stop and `http-concurrency-1` 501, each retrying the listener's
+busy `503`s (16 and 9) with no sink drop. Each run's ledger balances: G = W = V = 291,900 events
+at 8, and 242,850 at 1, with the overflow counted outside G (1,500 batches at 1, 518 at 8).
+
+**`otlp-fan-out` at 8.** The run overflowed 1,346 batches, against 2,033 in the run recorded at
+concurrency 1 in [`soak-harness.md`](soak-harness.md)'s "Findings" (W13b). None fell under the
+200 ms delay; the rest fell where no request is answered: 329 in the VictoriaMetrics stop, 257
+in the SUT's pause, 286 in its stop, 450 in the partition and its recovery, and 24 under 30 %
+packet loss.
+
+**One connection under HTTP/2.** Over TLS the listener's `logit.input.connections` read 1 from
+start to end, eight requests in flight included: ALPN picked `h2`, and every request shared the
+connection. Over plaintext HTTP/1.1, `otlp-fan-out-conc`'s listener read 8 during the
+VictoriaMetrics stop and up to 21 after the later faults, since a cold pool dials a connection
+for each waiting request and keeps the extras until its 90 s idle timeout. The SUT's file
+descriptors rose from 17 to 27 by the end of that run, which is why the scenario's `fd_growth`
+is 24.
+
+**Fault classes per slot.** `standin-concurrency` runs `prometheus_out` at 8, `at_most_once`,
+under a 1 s delay that keeps about three batches in flight (`in_flight` max 4, mean 2.75), with
+each cue spent on one write:
+
+| Cue | Class | What the sink counted |
+|---|---|---|
+| `401` | `Refused` | 1 retry, 0 drops: the batch held at the head and its resend landed |
+| `400` "out of order sample" | `Rejected` | 1 batch dropped, `reason="rejected"`; the batches in flight beside it landed |
+| connection reset | `Ambiguous` | 1 batch dropped, `reason="ambiguous_at_most_once"`, 0 retries |
+
+The stand-in recorded 2,365 requests and stored 2,362, and V matched what `aggregate` absorbed,
+1,181,300 samples, with only the cued batch rejected.
+
+**Idle keep-alive connections and a slow link.** The first `standin-concurrency` run dropped
+13 batches `ambiguous_at_most_once` where one was cued: 12 requests were reset with "connection
+closed before message completed". At concurrency above 1 the sink's pool holds spare
+connections idle between bursts. A request written on one shortly before the destination's
+keep-alive timeout (the stand-in's 5 s) arrives, 1 s later, after the destination closed it.
+`reqwest` keeps an idle connection for 90 s, so any destination with a shorter keep-alive
+timeout on a link with real delay reads some writes as `Ambiguous`: dropped under
+`at_most_once`, resent under `at_least_once`. The scenario now raises the stand-in's idle timeout
+to 120 s. The race needs both a destination idle timeout under the client's and a delay
+comparable to the gap between them; it isn't a `docs/known-gaps/` entry yet.
