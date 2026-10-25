@@ -7,8 +7,8 @@
 //! ([`collect_with_stall_bound`], which holds one buffer per body however many reads it arrives
 //! in). All six listeners build and read through these. The two Datadog listeners,
 //! `splunk_hec_in`, and `influxdb_in` also share their request helpers here: `Content-Encoding` and `Content-Type`
-//! parsing, bounded decompression, the JSON response shapes, the constant-time key check, and the
-//! deadline-bounded delivery.
+//! parsing, bounded decompression, the JSON response shapes and the
+//! deadline-bounded delivery. The constant-time key check is `logit_proto::auth`'s.
 //!
 //! The reasoning lives in `crate::otlp`'s module doc, "Idle timeout" section, and only there: why
 //! the clock is tracked at the service rather than around the socket, why it resets on request
@@ -672,21 +672,6 @@ pub(crate) async fn deliver_with_deadline(
     Ok(())
 }
 
-/// Whether `sent` equals one of `keys`: `datadog_in`'s `api_keys` and the `tokens` of `splunk_hec_in` and `influxdb_in`.
-/// Every key is compared, and each comparison runs over the whole key, so the time taken doesn't
-/// reveal which key matched or how much of a guess did.
-pub(crate) fn matches_any_key(keys: &[Box<[u8]>], sent: &[u8]) -> bool {
-    keys.iter().fold(false, |matched, key| matched | constant_time_eq(key, sent))
-}
-
-/// Byte equality whose time depends on the two lengths only, never on where the bytes differ.
-pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
-}
-
 /// Reads one HTTP/1.1 response, its head and its `Content-Length` body, off a keep-alive
 /// connection, where `read_to_end` would wait for the close. Panics after
 /// `logit_pipeline::test_util::RECV_TIMEOUT` or on a close mid-response.
@@ -736,22 +721,6 @@ pub(crate) async fn read_response<S: tokio::io::AsyncRead + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn constant_time_eq_compares_whole_keys() {
-        assert!(constant_time_eq(b"abc", b"abc"));
-        assert!(!constant_time_eq(b"abc", b"abd"));
-        assert!(!constant_time_eq(b"abc", b"ab"));
-    }
-
-    #[test]
-    fn matches_any_key_finds_any_entry_and_nothing_else() {
-        let keys: Vec<Box<[u8]>> = vec![Box::from(&b"one"[..]), Box::from(&b"two"[..])];
-        assert!(matches_any_key(&keys, b"one"));
-        assert!(matches_any_key(&keys, b"two"));
-        assert!(!matches_any_key(&keys, b"three"));
-        assert!(!matches_any_key(&[], b"one"));
-    }
 
     /// [`accept`] hands its caller a connection with `TCP_NODELAY` on, which a socket accepted
     /// on Linux doesn't start with.
