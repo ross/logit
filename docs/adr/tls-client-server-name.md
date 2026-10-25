@@ -67,4 +67,3 @@ dialed host on every transport, and none for an IP endpoint.
   sends no SNI for an IP, and the dialed host's otherwise. `docs/known-gaps/intake.md`'s "TLS and
   connection lifecycle" section tracks it, with the `reqwest` workaround above as the way to close
   it once there's a use case.
-- `influxdb_out` has no `tls:` block, so it has no `server_name` either.

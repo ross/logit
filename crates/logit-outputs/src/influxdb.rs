@@ -1868,6 +1868,54 @@ mod tests {
         assert!(mux.carriers().is_empty());
     }
 
+    /// The certificate in `server-named.pem` names only `logit.test`, so a client dialing
+    /// `127.0.0.1` verifies it only against a configured `server_name`.
+    #[tokio::test]
+    async fn server_name_verifies_the_certificate_against_that_name() {
+        let named = |server_name: Option<&str>| {
+            crate::test_support::tls_settings(|s| {
+                s.ca_file = Some("ca.pem".into());
+                s.server_name = server_name.map(String::from);
+            })
+        };
+        let server =
+            || crate::test_support::fixture_server_config("server-named", None, &[b"http/1.1"]);
+
+        let mux = crate::http::held::Mux::start(Some(server())).await;
+        mux.release();
+        let mut output = InfluxDbOutput::new(
+            mux.url().to_string(),
+            Organization::Fixed("org".into()),
+            Destination::Fixed("bucket".into()),
+            "token".into(),
+        )
+        .with_tls(
+            &named(None),
+            &crate::test_support::testdata_dir(),
+            &logit_pipeline::tls::TlsReloader::new(),
+        )
+        .unwrap();
+        output.send(&one_metric_batch()).await.expect_err("127.0.0.1 isn't in the certificate");
+        assert!(mux.carriers().is_empty());
+
+        let mux = crate::http::held::Mux::start(Some(server())).await;
+        mux.release();
+        let mut output = InfluxDbOutput::new(
+            mux.url().to_string(),
+            Organization::Fixed("org".into()),
+            Destination::Fixed("bucket".into()),
+            "token".into(),
+        )
+        .with_tls(
+            &named(Some("logit.test")),
+            &crate::test_support::testdata_dir(),
+            &logit_pipeline::tls::TlsReloader::new(),
+        )
+        .unwrap();
+        output.send(&one_metric_batch()).await.expect("logit.test is in the certificate");
+        assert_eq!(mux.carriers().len(), 1);
+    }
+
     /// `with_tls` survives the later timeout and idle-timeout setters, which rebuild the client.
     #[tokio::test]
     async fn the_tls_config_survives_a_client_rebuild() {

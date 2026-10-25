@@ -2952,7 +2952,8 @@
                 "ca_file": null,
                 "cert_file": null,
                 "insecure_skip_verify": false,
-                "key_file": null
+                "key_file": null,
+                "server_name": null
               },
               "allOf": [
                 {
