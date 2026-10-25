@@ -131,7 +131,7 @@ observable through `logit_pipeline::test_util`, never a sleep.
 | # | Branch | PR title | Size | Depends on | Status |
 |---|---|---|---|---|---|
 | W0 | `conc/w0` | `conc/w0: ADR and plan for per-sink request concurrency` | S | — | open |
-| W1 | `conc/w1` | `conc/w1: per-slot HeadOnly faults, the concurrency field, and the logit_out rename` | M | W0 | — |
+| W1 | `conc/w1` | `conc/w1: per-slot HeadOnly faults, the concurrency field, and the logit_out rename` | M | W0 | open (#870) |
 | W2 | `conc/w2` | `conc/w2: the HTTP slot helper, influxdb_out, remote write, and the buffer_full cause` | L | W1 | — |
 | W3 | `conc/w3` | `conc/w3: otlp_out, datadog_out, datadog_trace_out, and splunk_hec_out on the slot helper` | L | W2 | — |
 | W4 | `conc/w4` | `conc/w4: HTTP/2 through reqwest` | S | W3 | — |
