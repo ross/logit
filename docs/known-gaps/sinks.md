@@ -151,6 +151,10 @@ Entry format and the other areas: [the known-gaps index](README.md).
     (`crates/logit-outputs/src/http.rs`) and the `submit`/`await_ack` split for it. Concurrent
     requests can arrive out of order, so each sink's posture and each destination's tolerance for
     that need checking first.
+  - **To close:** [ADR `sink-request-concurrency`](../adr/sink-request-concurrency.md), a
+    `concurrency:` field per sink with each in-flight batch settled on its own, through
+    [`docs/plans/sink-request-concurrency.md`](../plans/sink-request-concurrency.md). This entry
+    closes with its W5.
 - **A `Rejected` batch has no dead-letter path, and no sink splits a batch in reaction to a
   `413`.** A batch the destination rejects for its own content drops at once
   ([ADR `sink-fault-classes`](../adr/sink-fault-classes.md)) and is visible only in

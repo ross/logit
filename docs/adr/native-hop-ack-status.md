@@ -1,12 +1,17 @@
 ---
 created: 2026-10-04
-updated: 2026-10-15
+updated: 2026-10-25
 ---
 
 # Native hop ack status: the sender pair leads the hop payload, and a rejected `Ack` settles one frame by name
 
 ## Status
-Accepted. Supersedes in part:
+Accepted. Superseded in part on 2026-10-25 by [ADR
+`sink-request-concurrency`](sink-request-concurrency.md): decision 4's "The marker is legal only
+beside `Fault::Rejected`" holds for `logit_out`, whose resubmitted head would land behind frames
+in flight; a sink whose requests settle on their own returns `HeadOnly` beside any class.
+
+Supersedes in part:
 
 - [ADR `native-hop-named-acks`](native-hop-named-acks.md): decision 1's `Ack` wire (two fields)
   and "Meaning" (every `Ack` covers a run), decision 2's flush point 4 (`FRAME_TOO_LARGE` for a

@@ -10,6 +10,7 @@ the same date, write the record, then add a row here.
 
 | ADR | Created | Updated |
 |---|---|---|
+| [Sink request concurrency: a per-sink `concurrency:` keeps several batches in flight, each settled on its own](sink-request-concurrency.md) | 2026-10-25 | 2026-10-25 |
 | [Index-partition router: a routed batch is a view of one shared batch, not a copy](index-partition-router.md) | 2026-10-23 | 2026-10-23 |
 | [Protocol knowledge stays in family: a component keys behavior on another component's internals only within a lossless family](protocol-knowledge-stays-in-family.md) | 2026-10-23 | 2026-10-23 |
 | [Runtime worker count: a top-level `runtime.workers` sets the Tokio worker threads](runtime-worker-count.md) | 2026-10-23 | 2026-10-23 |
@@ -52,8 +53,8 @@ the same date, write the record, then add a row here.
 | [Signal handling: SIGHUP reopens file targets and never exits, and every handler is installed before config load](signal-handling.md) | 2026-10-05 | 2026-10-07 |
 | [Listener peer address: opt-in `network.peer.*` on the shared drivers, and PROXY protocol on TCP](listener-peer-address.md) | 2026-10-05 | 2026-10-18 |
 | [`lines_in`: a plain-lines listener that emits one raw log event per line and parses nothing](plain-lines-listener.md) | 2026-10-05 | 2026-10-05 |
-| [Native hop ack status: the sender pair leads the hop payload, and a rejected `Ack` settles one frame by name](native-hop-ack-status.md) | 2026-10-04 | 2026-10-15 |
-| [Sink fault classes: a rejected batch drops, a refused destination holds, and the process never exits for a sink](sink-fault-classes.md) | 2026-10-04 | 2026-10-18 |
+| [Native hop ack status: the sender pair leads the hop payload, and a rejected `Ack` settles one frame by name](native-hop-ack-status.md) | 2026-10-04 | 2026-10-25 |
+| [Sink fault classes: a rejected batch drops, a refused destination holds, and the process never exits for a sink](sink-fault-classes.md) | 2026-10-04 | 2026-10-25 |
 | [jiff is the one calendar implementation, behind the codecs' strict RFC 5424 contract](jiff-for-calendar-time.md) | 2026-10-04 | 2026-10-04 |
 | [`timestamp`: resolving `event.timestamp` from an attribute, with jiff for calendar time](timestamp-transform.md) | 2026-10-04 | 2026-10-18 |
 | [Lua refusals: `Event.new` raises a refusal from a Lua shim, not as an mlua callback error](lua-refusals-raised-from-lua.md) | 2026-10-03 | 2026-10-03 |
@@ -61,7 +62,7 @@ the same date, write the record, then add a row here.
 | [Release profile: fat LTO and one codegen unit, measured against thin LTO and 16 units](release-build-profile.md) | 2026-10-03 | 2026-10-22 |
 | [Native hop acks: a named cumulative `Ack`, coalesced at `logit_in`, and a resume mark in `HelloAck`](native-hop-named-acks.md) | 2026-10-02 | 2026-10-18 |
 | [Native hop: two payload shapes named by shape, every hop frame sequenced, and strict control messages](native-hop-no-compatibility.md) | 2026-10-01 | 2026-10-18 |
-| [Native hop send window: several frames in flight, acknowledged in frame order](native-hop-send-window.md) | 2026-10-01 | 2026-10-18 |
+| [Native hop send window: several frames in flight, acknowledged in frame order](native-hop-send-window.md) | 2026-10-01 | 2026-10-25 |
 | [Native hop identity and sequence: a per-store sender identity and sequence on every hop frame, and a high-water mark at `logit_in`](native-hop-identity-and-sequence.md) | 2026-10-01 | 2026-10-18 |
 | [Sink send path and attempt accounting: counters that say what they count, one pooled-stream driver, and TLS writes that are flushed](sink-send-path-and-attempt-accounting.md) | 2026-09-29 | 2026-10-13 |
 | [Delivery semantics: at-least-once per hop, duplicates absorbed by the data model, and an effectively-once native hop](delivery-semantics.md) | 2026-09-29 | 2026-10-23 |

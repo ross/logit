@@ -1,6 +1,6 @@
 ---
 created: 2026-10-01
-updated: 2026-10-18
+updated: 2026-10-25
 ---
 
 # Native hop send window: several frames in flight, acknowledged in frame order
@@ -39,7 +39,12 @@ rejected alternative "`Ack` carrying the sequence". An `Ack` names an identity a
 one ack covers a run of frames, and the sender commits by name. Superseded in part on 2026-10-04
 by [ADR `native-hop-ack-status`](native-hop-ack-status.md): decision 4's "Every `Err` from `await_ack` ... means the sink dropped its
 connection" and decision 5's "Every `Err` drops the connection". A rejected `Ack` fails the head
-alone, marked `HeadOnly`, and the connection and the frames behind it stay.
+alone, marked `HeadOnly`, and the connection and the frames behind it stay. Superseded in part on 2026-10-25 by [ADR
+`sink-request-concurrency`](sink-request-concurrency.md): decision 2's `window` field on
+`logit_out` is renamed `concurrency` (the wire's `window` and the `logit.output.window` gauge keep
+their names), and decision 4's "Under `at_most_once` an `Ambiguous` fault also commits every other
+outstanding item" holds for a connection-level fault alone: a `HeadOnly` fault of any class settles
+the head alone.
 
 ## Context
 
@@ -138,7 +143,8 @@ head.
 
 ### 2. Config
 
-- **`window` on `logit_out`.** `LogitOut.window: u32`, default 32
+- **`window` on `logit_out`.** [Renamed `concurrency` on 2026-10-25 by [ADR
+  `sink-request-concurrency`](sink-request-concurrency.md).] `LogitOut.window: u32`, default 32
   (`default_logit_out_window`). The operator doc says it's the number of frames in flight before
   the oldest must be acknowledged, to raise it on a high-latency link, and that `1` keeps one
   frame in flight.
