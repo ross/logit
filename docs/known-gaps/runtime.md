@@ -149,6 +149,23 @@ Entry format and the other areas: [the known-gaps index](README.md).
   - **Revisit:** if a documented script runs `logit-outputs` tests under plain `cargo test`. The
     fix then is a test that doesn't depend on a thread-local subscriber, such as one reading
     `Diagnostics::occurrences`.
+- **Tests that pin the interner's size fail intermittently under plain `cargo test`.** They read
+  `interner::len()` before and after a region and assert it didn't move, to show a cache hit or a
+  missed lookup interned nothing: `crates/logit-core/src/interner.rs` (the `KeyCache` hit tests),
+  `crates/logit-core/src/attrs.rs` (a missed `get`/`remove`, and `get_sym`),
+  `crates/logit-transforms/src/json.rs` and `logfmt.rs`, `crates/logit-proto/src/graphite/decode.rs`
+  (`repeat_tag_keys_are_cache_hits_and_paths_are_not_cached`), and
+  `crates/logit-bench/tests/allocations.rs`'s `flatten_pino_http_event_cold_key_cache`.
+  - **Cause:** the interner is process-global and never frees. Plain `cargo test` runs a crate's
+    tests on threads of one process, so another test interning a new key between the two reads
+    moves `len()`. Each test's comment says it relies on `nextest` running every test in its own
+    process. `script/test`, `script/check`, and CI use `nextest`, so they're unaffected.
+  - **Not reproduced for this entry:** the cause is read from the tests, not from a failing run.
+  - **Workaround:** run these crates under `cargo nextest run`. Plain `cargo test` is also
+    unsupported for the allocation pins, which count per process.
+  - **Revisit:** if a documented script runs these crates under plain `cargo test`. The fix then
+    is a test that doesn't read the global count, such as one asserting on the `KeyCache`'s own
+    entries.
 - **`logit_in` doesn't record the sending peer's address.** Every other network listener takes
   `peer:` and, on TCP, `proxy_protocol:`: those on the shared socket drivers and the six HTTP
   listeners (`otlp_in`, `datadog_in`, `datadog_trace_in`, `splunk_hec_in`, `influxdb_in`, and
@@ -285,6 +302,34 @@ Entry format and the other areas: [the known-gaps index](README.md).
     on an empty incoming sketch.
   - A `HyperLogLog` whose harmonic sum (`data[1]`) is wrong estimates wrong. The sum is an `f32`
     accumulated per register update, so recomputing it on decode wouldn't reproduce the bytes.
+- **Nothing in the event model keeps a `Histogram` well formed, so each producer and each sink
+  decides alone.** `logit_core::Histogram`'s `buckets` field is public, and the type promises no
+  order, no single `+Inf` bucket, and no finite bound. A well-formed histogram has finite bounds in
+  strictly increasing order, at most one `+Inf` bound and it last, and `(bound, count)` pairs
+  that are each bucket's own count.
+  - **Producers:** the Lua constructor `Event.new` checks the rule (strictly increasing bounds,
+    `math.huge` only last, no `NaN` or `-math.huge`) and appends a missing `+Inf` bucket
+    ([ADR `lua-event-constructor`](../adr/lua-event-constructor.md)). `prometheus_in`'s text decoder
+    sorts bounds and drops a family whose cumulative counts decrease. `otlp_in` takes
+    `explicit_bounds` as the wire has them: it checks neither their order nor that they're finite,
+    and a `bucket_counts` longer than `explicit_bounds` plus one reads as several `+Inf`
+    buckets.
+  - **Sinks:** `otlp_out` sorts and merges equal finite bounds and folds `-Inf`, `NaN`, and
+    repeated `+Inf` into the first and overflow buckets. `prometheus_out` and `influxdb_out` share
+    `cumulative_counts`, which sorts, merges, and drops a `NaN` bound's bucket from the
+    cumulative series. Only a `NaN` or `-Inf` bound is counted
+    (`degraded{reason="non_finite_component"}`); a reorder or merge is silent. Every other
+    histogram encoder (`statsd_out`, `graphite_out`, and `splunk_hec_out` under
+    `multi_value: expand`, through `logit_proto::multi_value`) writes one series per stored
+    bucket in stored order, so a repeated bound writes the same name twice. `collectd_out` skips
+    the kind.
+  - **Consequence:** one malformed histogram reads differently per destination, and the repair is
+    copied into each encoder rather than stated once. This is separate from the
+    [`histogram_count_mismatch`](otlp.md) entry, which is about a point's `count`, not its bounds.
+  - **To close:** a `Histogram` check-and-normalize helper called at egress by every encoder, with
+    one counter for what it repaired. It changes what every sink writes for a malformed input, so
+    it needs its own ADR under [`lossless-transit`](../adr/lossless-transit.md). Revisit when a
+    producer is found sending unordered or repeated bounds.
 
 ## Config and CLI
 

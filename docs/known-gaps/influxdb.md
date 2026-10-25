@@ -85,6 +85,16 @@ the decoder differs from `influxd`.
     as a field type the corpus doesn't hold, would go unnoticed.
   - **Revisit trigger:** a change to the codec's typed fields or escaping, or a user report of a
     relayed table that differs from a direct one.
+- **`flatten` ahead of `influxdb_out` hasn't run against a real InfluxDB.**
+  [fixtures/nested-json-to-influxdb.yaml](../../fixtures/nested-json-to-influxdb.yaml) runs
+  `tail_in -> json -> flatten -> keep -> kv_metrics -> aggregate -> influxdb_out`, but
+  `script/server` and `compose.yaml` don't run it, and `script/validate` only loads it. That
+  dotted tags such as `req.method` reach InfluxDB is checked by unit and integration tests
+  against the encoder, not by a write to `influxd` and a query back.
+  - **Consequence:** a difference in how `influxd` stores or returns a dotted tag key, which the
+    encoder's tests can't see, would go unnoticed.
+  - **Revisit trigger:** a change to `flatten`'s key syntax or to `influxdb_out`'s tag escaping, or
+    a user report of a dotted tag missing at the destination.
 - **`influxdb_out` writes no start time.** `otel2influx`, the OTel Collector's InfluxDB exporter
   and Telegraf's `inputs.opentelemetry`, adds a `start_time_unix_nano=<n>i` field to a point whose
   start time is set. `influxdb_out` leaves a record's `start_timestamp` off, a structural loss
