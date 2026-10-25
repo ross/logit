@@ -1071,8 +1071,11 @@ record.
   `logit.transform.series.evicted{reason="series_limit"}`, with no `state` tag because the series
   is always idle. `reason="cardinality"` stays the flush-time `max_retained_series` cap's.
 - **The eviction order is built once per window, on the overload path.** The first full-cap
-  admission in a window scans and sorts the candidates, the only allocation the cap adds, and each
-  later admission pops the next one, skipping any that has absorbed since. The order is rebuilt
+  admission in a window scans and sorts the candidates, and each later admission pops the next
+  one, skipping any that has absorbed since. The order clones an owned group index and
+  `SeriesKey` per candidate, attribute set included, because a borrow into the series map can't
+  outlive the inserts and removals that follow. Those clones and the order's `Vec` are the cap's
+  allocations, made only on the overload path and at most once per window. The order is rebuilt
   only when it runs out while candidates may remain, and is discarded at flush.
 - **A record is dropped only when every held series has absorbed this window.** It's counted as
   `logit.transform.metrics.dropped{reason="series_limit"}`, with a throttled diagnostic that names
@@ -1091,9 +1094,13 @@ record.
   is refused before any group opens or is memoized.
 - **The group count is at most twice `max_series` within a window.** An admission eviction can
   empty a group, and the empty group stays until flush's `retain`, so `process`'s `group_index`
-  and the `last_group` memo stay valid. Every other group holds at least one series, so the count
-  is at most `max_series` plus the window's admission evictions, and each eviction admits one
-  series, which bounds both at `max_series`.
+  and the `last_group` memo stay valid. The two bounds are:
+  - series held ≤ `max_series`;
+  - groups ≤ `max_series` + that window's admission evictions ≤ 2 × `max_series`. A non-empty
+    group holds at least one series, and each emptied group took at least one admission eviction.
+    An eviction removes a series that was retained into the window and hasn't absorbed since, and
+    a series opened this window has absorbed, so the window's evictions are at most the retained
+    series it started with, which is at most `max_series`.
 - **The existing-series path gains no allocation and no second hash.** The cap is read only on the
   vacant-entry path, where a series is about to be built anyway. An allocation pin in
   `crates/logit-bench/tests/allocations.rs` that moves for the cap is a defect, not a constant to
@@ -1135,8 +1142,9 @@ Past the limit, a record that would open a new series folds into an **overflow s
 - **An overflow series is known by its key, never by a flag.** In a two-tier topology, an upstream
   stage's overflow series arrives downstream as an ordinary series carrying `logit.overflow`.
 - **It doesn't count against the per-name limit,** so a name over the limit always has somewhere
-  to fold. It counts against `max_series`: if opening the overflow series would pass `max_series`,
-  the record is dropped as `series_limit`.
+  to fold. It counts against `max_series` and is admitted by the same rule: if opening it would
+  pass `max_series`, it first evicts one retained series that hasn't absorbed this window, and
+  the record is dropped as `series_limit` only when every held series has absorbed this window.
 - **It merges by its kind's ordinary rules.** The first record to open it decides its kind, and a
   histogram with other bounds takes `histogram_bounds_mismatch`, as for any series. A record whose
   kind conflicts with its name's overflow series takes the `kind_conflict` pass-through for now;
