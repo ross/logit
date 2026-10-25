@@ -69,8 +69,8 @@ accepts an older sample after a newer one:
 
 | Sink | Batches landing out of order |
 |---|---|
-| `influxdb_out` | Safe. InfluxDB overwrites a point by `(measurement, tag set, timestamp)`, so two batches writing one point with different values leave the later write, whichever lands first. |
-| `datadog_out` | Series: Datadog keeps one point per series per second, the later write winning. Every other route stores what it receives. |
+| `influxdb_out` | Last to arrive wins. InfluxDB overwrites a point by `(measurement, tag set, timestamp)`, so when two batches write one point with different values, the batch that lands last leaves its value, which above 1 can be the older batch. |
+| `datadog_out` | Series: last to arrive wins, as for InfluxDB, at one point per series per second. Every other route stores what it receives. |
 | `datadog_trace_out`, `splunk_hec_out` | Safe. Nothing at the destination depends on order across requests. Splunk's `Clean`-before-acceptance rows depend on order within one `send`, which stays sequential. |
 | `otlp_out` | Logs and traces: safe. Metrics into a Prometheus-backed receiver: as remote write. |
 | `prometheus_out` remote write | Both specs require one series' samples in timestamp order. A receiver with no out-of-order window answers `400`, the sink reads `Rejected`, and the batch drops ([`docs/known-gaps/prometheus.md`](../known-gaps/prometheus.md), "The remote-write sender does no cross-batch reordering"). Which receivers accept out-of-order samples, and under what setting, is the receiver table in `crates/logit-outputs/src/prometheus.rs`'s module doc, "Concurrency". |
@@ -187,11 +187,13 @@ in flight on its own outcome, so a fault on one batch neither resends nor drops 
 - **Dependencies.** `h2` is already in the build through `hyper`'s `http2` feature, so the
   feature adds no crate.
 
-### 5. Default 1, revisited on soak evidence
+### 5. Default 1, and it stays
 
-Every sink defaults to `concurrency: 1`, so no behavior changes until an operator raises it. The
-soak scenarios in the plan measure the gain and the fault handling at 8; whether a reorder-safe
-sink's default moves above 1 is decided on those findings, not now.
+Every sink defaults to `concurrency: 1`, and the default doesn't move. Above 1, "last write
+wins" at a destination means the last to arrive, so an older batch landing after a newer one
+overwrites the newer value for every point the two share. An operator raises the field knowing
+that for their data; the soak scenarios in the plan measure the gain and the fault handling at 8
+and inform that choice, not the default.
 
 ### 6. Soak coverage is part of the change
 
@@ -215,8 +217,10 @@ them.
   reordering. It needs every encoder to take several batches with distinct resources and
   contexts, doesn't help a listener already assembling batches at the destination's size cap,
   and is orthogonal: an operator can raise the listener's batch bounds today.
-- **A default above 1 on the reorder-safe sinks.** Deferred to the soak findings (decision 5).
-  A changed default with no measurement would move a first deployment's behavior on a guess.
+- **A default above 1 on the sinks where reordering is harmless.** Rejected. No HTTP sink is
+  free of it: a destination that overwrites keeps the last to arrive, which above 1 can be the
+  older value, and a destination that appends stores what it receives in arrival order. Only the
+  operator knows whether their series repeat a point across batches, so the default stays 1.
 - **Refusing `concurrency > 1` on remote write in validation.** Declined. VictoriaMetrics, the
   main remote-write target here, accepts out-of-order samples, and a Prometheus or Mimir with its
   window open does too. The field's doc carries the warning; `logit validate` doesn't know the
@@ -245,5 +249,5 @@ them.
   W5 lands. `docs/known-gaps/prometheus.md`'s fan-in entry gains the single-chain case under
   `concurrency > 1`. `docs/known-gaps/otlp.md`'s VictoriaTraces entry widens to every request in
   flight on the closed connection.
-- **Measurement.** The plan's "Findings" records the soak numbers at 1 and 8 and decides
-  decision 5's revisit.
+- **Measurement.** The plan's "Findings" records the soak numbers at 1 and 8, for the operator
+  docs' guidance on raising the field.
