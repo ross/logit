@@ -222,7 +222,7 @@ pub(crate) fn status_class(status: reqwest::StatusCode) -> &'static str {
 /// | Status | Fault | Why |
 /// |---|---|---|
 /// | 401, 403, 404, 405, 407, 501 | [`Fault::Refused`] | credentials, a missing endpoint or tenant, a wrong method, or an unsupported feature: the same answer for every batch |
-/// | 429, any 5xx | [`Fault::Ambiguous`] | the request reached the server and may have been applied |
+/// | 408, 429, any 5xx | [`Fault::Ambiguous`] | the request reached the server and may have been applied; a 408 is the server or a proxy in front of it giving up on the request's arrival (nginx `client_body_timeout`, HAProxy `timeout http-request`), which RFC 9110 lets a client repeat |
 /// | any other 4xx, any 3xx | [`Fault::Rejected`] | about this request; redirects are off ([`build_client`]), so a 3xx is a misconfigured URL the sink won't follow |
 ///
 /// A 1xx or 2xx isn't a failure and no caller passes one; it reads as [`Fault::Rejected`], the
@@ -230,7 +230,7 @@ pub(crate) fn status_class(status: reqwest::StatusCode) -> &'static str {
 pub(crate) fn classify_status(status: reqwest::StatusCode) -> Fault {
     match status.as_u16() {
         401 | 403 | 404 | 405 | 407 | 501 => Fault::Refused,
-        429 | 500..=599 => Fault::Ambiguous,
+        408 | 429 | 500..=599 => Fault::Ambiguous,
         _ => Fault::Rejected,
     }
 }
@@ -510,11 +510,11 @@ mod tests {
             let status = reqwest::StatusCode::from_u16(code).unwrap();
             assert_eq!(classify_status(status), Fault::Refused, "{code}");
         }
-        for code in [429, 500, 502, 503, 504, 599] {
+        for code in [408, 429, 500, 502, 503, 504, 599] {
             let status = reqwest::StatusCode::from_u16(code).unwrap();
             assert_eq!(classify_status(status), Fault::Ambiguous, "{code}");
         }
-        for code in [300, 301, 307, 400, 402, 406, 408, 413, 415, 422] {
+        for code in [300, 301, 307, 400, 402, 406, 413, 415, 422] {
             let status = reqwest::StatusCode::from_u16(code).unwrap();
             assert_eq!(classify_status(status), Fault::Rejected, "{code}");
         }
