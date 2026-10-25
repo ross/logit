@@ -419,6 +419,7 @@ mod tls {
                     cert_file: Some("client.pem".to_string()),
                     key_file: Some("client.key".to_string()),
                     insecure_skip_verify: false,
+                    server_name: None,
                 },
                 &testdata_dir(),
                 &logit_pipeline::tls::TlsReloader::new(),
@@ -427,5 +428,63 @@ mod tls {
 
         let received = round_trip(input, output, &mixed_signal_batch()).await;
         assert_round_tripped(&received);
+    }
+
+    /// An `otlp_in` presenting `server-named.pem`, which names only `logit.test`, so a client
+    /// dialing `127.0.0.1` verifies it only against a configured `server_name`.
+    async fn named_input(transport: InTransport) -> (String, OtlpInput) {
+        bound_input(
+            OtlpInput::new("127.0.0.1:0", transport)
+                .with_tls(
+                    &TlsServerSettings {
+                        cert_file: "server-named.pem".to_string(),
+                        key_file: "server-named.key".to_string(),
+                        client_ca_file: None,
+                    },
+                    &testdata_dir(),
+                    &logit_pipeline::tls::TlsReloader::new(),
+                )
+                .unwrap(),
+        )
+        .await
+    }
+
+    fn named_output(addr: &str, transport: OutTransport, server_name: Option<&str>) -> OtlpOutput {
+        OtlpOutput::new(format!("https://{addr}"), transport)
+            .unwrap()
+            .with_tls(
+                &TlsClientSettings {
+                    ca_file: Some("ca.pem".to_string()),
+                    server_name: server_name.map(str::to_owned),
+                    ..Default::default()
+                },
+                &testdata_dir(),
+                &logit_pipeline::tls::TlsReloader::new(),
+            )
+            .unwrap()
+    }
+
+    /// `docs/adr/tls-client-server-name.md`, through the `reqwest` driver and the pooled gRPC
+    /// client: the send fails on the certificate without `server_name` and round-trips with it.
+    #[tokio::test]
+    async fn a_server_name_reaches_a_server_whose_certificate_names_another_host() {
+        for (in_transport, out_transport) in
+            [(InTransport::Http, OutTransport::Http), (InTransport::Grpc, OutTransport::Grpc)]
+        {
+            let (addr, mut input) = named_input(in_transport).await;
+            let (tx, _rx) = mpsc::channel(16);
+            let sink = Fanout::new(vec![tx]);
+            tokio::spawn(async move {
+                let _ = input.run(sink).await;
+            });
+            let mut output = named_output(&addr, out_transport, None);
+            let err = output.send(&mixed_signal_batch()).await.expect_err("a mismatched name sent");
+            assert!(format!("{err:#}").to_lowercase().contains("certificate"), "{err:#}");
+
+            let (addr, input) = named_input(in_transport).await;
+            let output = named_output(&addr, out_transport, Some("logit.test"));
+            let received = round_trip(input, output, &mixed_signal_batch()).await;
+            assert_round_tripped(&received);
+        }
     }
 }

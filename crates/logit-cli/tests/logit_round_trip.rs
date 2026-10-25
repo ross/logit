@@ -373,6 +373,7 @@ mod tls {
                     cert_file: Some("client.pem".to_string()),
                     key_file: Some("client.key".to_string()),
                     insecure_skip_verify: false,
+                    server_name: None,
                 },
                 &testdata_dir(),
                 &logit_pipeline::tls::TlsReloader::new(),
@@ -423,6 +424,56 @@ mod tls {
         output.observe_batch(logit_pipeline::BatchContext::default(), ONE);
         let err = output.send(&sample_batch()).await.unwrap_err();
         assert_eq!(classify(&err), Fault::Clean);
+    }
+
+    /// `server-named.pem` names only `logit.test`, and `logit_out` dials `127.0.0.1`: the send
+    /// goes through only with `server_name: logit.test` (`docs/adr/tls-client-server-name.md`).
+    #[tokio::test]
+    async fn a_server_name_reaches_a_server_whose_certificate_names_another_host() {
+        for (server_name, delivered) in [(None, false), (Some("logit.test"), true)] {
+            let (addr, mut input) = bound_input(|input| {
+                input
+                    .with_tls(
+                        &TlsServerSettings {
+                            cert_file: "server-named.pem".to_string(),
+                            key_file: "server-named.key".to_string(),
+                            client_ca_file: None,
+                        },
+                        &testdata_dir(),
+                        &logit_pipeline::tls::TlsReloader::new(),
+                    )
+                    .unwrap()
+            })
+            .await;
+            let output = LogitOutput::new(addr)
+                .with_timeout(Duration::from_millis(500))
+                .with_tls(
+                    &TlsClientSettings {
+                        ca_file: Some("ca.pem".to_string()),
+                        server_name: server_name.map(str::to_owned),
+                        ..Default::default()
+                    },
+                    &testdata_dir(),
+                    &logit_pipeline::tls::TlsReloader::new(),
+                )
+                .unwrap();
+
+            let batch = sample_batch();
+            if delivered {
+                let received = round_trip(input, output, &batch).await;
+                assert_round_tripped(&received, &batch);
+            } else {
+                let (tx, _rx) = mpsc::channel(16);
+                let sink = Fanout::new(vec![tx]);
+                tokio::spawn(async move {
+                    let _ = input.run(sink).await;
+                });
+                let mut output = output;
+                output.observe_batch(logit_pipeline::BatchContext::default(), ONE);
+                let err = output.send(&batch).await.unwrap_err();
+                assert_eq!(classify(&err), Fault::Clean, "{err:#}");
+            }
+        }
     }
 }
 

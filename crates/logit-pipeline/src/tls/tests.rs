@@ -553,6 +553,7 @@ impl ClientSet {
             cert_file: client.map(|_| "cert.pem".into()),
             key_file: client.map(|_| "key.pem".into()),
             insecure_skip_verify: false,
+            server_name: None,
         };
         Self { dir, settings }
     }
@@ -711,4 +712,129 @@ fn client_startup_names_the_file_it_couldnt_read() {
     let message = err.to_string();
     assert!(message.contains("tls.key_file") && message.contains("key.pem"), "{message}");
     assert!(reloader.is_empty(), "a failed build registered its files");
+}
+
+// --- server_name ---
+
+/// Whether a handshake with `addr`, dialing `dialed` as SNI and the default verification name,
+/// completes and a frame echoes.
+async fn handshakes_as(addr: SocketAddr, connector: &TlsConnector, dialed: &str) -> bool {
+    let tcp = TcpStream::connect(addr).await.unwrap();
+    let name = rustls_pki_types::ServerName::try_from(dialed.to_owned()).unwrap();
+    match tokio::time::timeout(RECV_TIMEOUT, connector.connect(name, tcp))
+        .await
+        .expect("handshake timed out")
+    {
+        Ok(mut stream) => round_trips(&mut stream).await,
+        Err(_) => false,
+    }
+}
+
+/// A client trusting `ca.pem` with `server_name` set as given.
+fn named_client(label: &str, server_name: Option<&str>) -> Client {
+    let mut set = ClientSet::new(label, None);
+    set.settings.server_name = server_name.map(str::to_owned);
+    Client::build(&set)
+}
+
+#[tokio::test]
+async fn a_server_name_verifies_a_certificate_that_doesnt_name_the_dialed_host() {
+    // `server-named.pem` names only `logit.test`.
+    let addr = serve_fixture("server-named", None).await;
+
+    let plain = named_client("tls-server-name-unset", None).connector();
+    assert!(!handshakes_as(addr, &plain, "localhost").await, "a mismatched name was accepted");
+    assert!(!handshakes_as(addr, &plain, "127.0.0.1").await, "a mismatched IP was accepted");
+
+    let named = named_client("tls-server-name-set", Some("logit.test")).connector();
+    assert!(handshakes_as(addr, &named, "localhost").await, "server_name wasn't verified against");
+    assert!(handshakes_as(addr, &named, "127.0.0.1").await, "server_name didn't cover an IP dial");
+
+    let wrong = named_client("tls-server-name-wrong", Some("other.test")).connector();
+    assert!(!handshakes_as(addr, &wrong, "localhost").await, "a wrong server_name was accepted");
+    assert!(
+        !handshakes_as(addr, &wrong, "logit.test").await,
+        "the dialed name won over server_name"
+    );
+}
+
+#[tokio::test]
+async fn a_server_name_follows_a_rotated_ca_file() {
+    let addr = serve_fixture("server-named", None).await;
+    let mut set = ClientSet::new("tls-server-name-rotated-ca", None);
+    set.write("ca.pem", "other-ca.pem");
+    set.settings.server_name = Some("logit.test".into());
+    let mut client = Client::build(&set);
+    let connector = client.connector();
+    assert!(
+        !handshakes_as(addr, &connector, "localhost").await,
+        "other-ca.pem trusted ca.pem's leaf"
+    );
+
+    set.write("ca.pem", "ca.pem");
+    client.reloader.check_now();
+
+    assert_eq!(client.probe.sum(RELOADS, &[("outcome", "reloaded")]), 1.0);
+    assert!(handshakes_as(addr, &connector, "localhost").await, "the rotated CA wasn't trusted");
+}
+
+#[test]
+fn an_unparsable_server_name_fails_startup_naming_the_field() {
+    let set = ClientSet::new("tls-server-name-invalid", None);
+    for ca_file in [Some("ca.pem".to_owned()), None] {
+        let settings = TlsClientSettings {
+            ca_file,
+            server_name: Some("not a name".into()),
+            ..Default::default()
+        };
+        let reloader = TlsReloader::new();
+        let err = build_client_config(
+            &settings,
+            &set.dir,
+            &reloader,
+            &Diagnostics::default(),
+            &Telemetry::default(),
+        )
+        .expect_err("an unparsable server_name built a config");
+        let message = err.to_string();
+        assert!(message.contains("tls.server_name"), "{message}");
+        assert!(reloader.is_empty(), "a failed build registered its files");
+    }
+}
+
+/// The verifier a config installed, read through `ClientConfig`'s `Debug`, since rustls has no
+/// getter for it.
+fn verifier_of(settings: &TlsClientSettings) -> String {
+    let cfg = build_client_config(
+        settings,
+        &fixture(""),
+        &TlsReloader::new(),
+        &Diagnostics::default(),
+        &Telemetry::default(),
+    )
+    .unwrap();
+    format!("{cfg:?}")
+}
+
+#[test]
+fn a_server_name_wraps_the_bundled_roots_and_is_ignored_under_insecure_skip_verify() {
+    let bundled = verifier_of(&TlsClientSettings::default());
+    assert!(bundled.contains("WebPkiServerVerifier"), "{bundled}");
+    assert!(!bundled.contains("VerifyAsServerName"), "{bundled}");
+
+    let settings =
+        TlsClientSettings { server_name: Some("logit.test".into()), ..Default::default() };
+    assert!(!settings.is_empty(), "a block with only server_name read as empty");
+    let named = verifier_of(&settings);
+    assert!(named.contains("VerifyAsServerName"), "no wrapper over the bundled roots");
+    assert!(named.contains("WebPkiServerVerifier"), "the wrapper lost the bundled roots");
+    assert!(named.contains("logit.test"), "the wrapper doesn't carry the configured name");
+
+    let insecure = verifier_of(&TlsClientSettings {
+        insecure_skip_verify: true,
+        server_name: Some("not a name".into()),
+        ..Default::default()
+    });
+    assert!(insecure.contains("AcceptAnyServerCert"), "{insecure}");
+    assert!(!insecure.contains("VerifyAsServerName"), "{insecure}");
 }
