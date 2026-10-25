@@ -2607,6 +2607,17 @@ opts out, giving strictly tumbling behavior. Both fields are optional, so an exi
 change. The same two bounds make `temporality: cumulative` possible (next section), which is why
 they're named for series in general, not for gauges.
 
+**`max_series` caps every series `aggregate` holds at once,** the active ones and the retained ones
+together (default `100,000`). At a full cap, each new series evicts one retained series that hasn't
+received data this window, the one that has gone the most flushes without data first, counted under
+`logit.transform.series.evicted{reason="series_limit"}`. A series that received data this window is
+never evicted to make room: with none left to evict, a record that would open a new series is
+dropped, counted under `logit.transform.metrics.dropped{reason="series_limit"}`. Admission is first
+come, first served within a window, so a series whose first record arrives after the cap fills is
+dropped until a flush frees a slot. Any nonzero drop count means more distinct attribute sets reach
+`aggregate` than the cap holds; bound them with `keep` or `keep_values` ahead of it, or raise
+`max_series`.
+
 **Retention doesn't cover eviction or restarts.** A delta against a series evicted by the
 cardinality cap, or sent after a process restart, resolves against `0.0`. It's reported
 (`logit.transform.gauge.delta.unseeded`,

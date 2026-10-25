@@ -76,7 +76,8 @@ Three rules hold across the vocabulary:
   `events.dropped{reason="absorbed"}` and `{reason="script_drop"}`. A reason would be constant
   per kind. For `aggregate`, a discarded event's metrics were folded into window state and
   reappear in a later flush; `logit.transform.metrics.absorbed` still counts the records it
-  folded.
+  folded, and `logit.transform.metrics.dropped{reason="series_limit"}` the ones `max_series`
+  refused, as `cumulative_to_delta` counts a record it drops.
 - **A component-specific counter exists only where it adds why or how.**
   `logit.transform.events.filtered` duplicates `events.discarded` on every filter and `sample`,
   so it's removed. `logit.transform.sample.decisions{outcome, by}` stays, because `by` says why,
