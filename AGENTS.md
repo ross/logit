@@ -13,7 +13,9 @@ LuaJIT. Read these in order before changing anything:
    component graph, the native wire protocol, and internal telemetry. These five design docs are
    load-bearing; don't improvise around them without reading them first.
 4. [docs/known-gaps/](docs/known-gaps/README.md): check it before "fixing" something that looks
-   broken. It's likely a documented, deliberate gap, not an oversight.
+   broken. It lists only work still open. A limit that was decided lives in its ADR, with the
+   operator's workaround in [docs/deploying.md](docs/deploying.md) or the matching guide, so check
+   those too: what looks broken is likely a documented, deliberate limit, not an oversight.
 
 [docs/deploying.md](docs/deploying.md) is the operator-facing doc for running any of this outside
 the dev stack.
@@ -38,7 +40,8 @@ exists or a contract other `logit` processes depend on:
 - **`flatten` never deletes an attribute.** It removes a source attribute only once its leaves are
   written. Last write wins on a key collision, silently, and there is deliberately no cap on how
   many keys one value can expand into beyond a fixed internal recursion-depth bound. That's a
-  settled, documented gap (`docs/known-gaps/runtime.md`), not a missing guard.
+  settled, documented limit ([ADR `flatten-transform`](docs/adr/flatten-transform.md),
+  `docs/design/memory.md` §4), not a missing guard.
 - **`http_access` derives every value from config or a built-in table, never a capture.** It's
   best-effort per field, never drops an event, and emits no metrics (a stock `kv_metrics` + `keep`
   does that).
@@ -980,7 +983,7 @@ usually aren't. Use `script/*`, not bare `cargo`:
 |---|---|
 | `script/bootstrap` | Build the dev container image (run first, or after touching `Dockerfile.dev`) |
 | `script/test [args]` | `cargo nextest run --workspace` |
-| `script/lint` | `cargo clippy --workspace --all-targets -- -D warnings`, then `cargo check` over `fuzz/`'s own workspace |
+| `script/lint` | `cargo clippy --workspace --all-targets -- -D warnings`, then `cargo check` over `fuzz/`'s own workspace and `seedgen --check`, which fails when the committed `fuzz/seeds/` no longer match what the encoders produce |
 | `script/format [--check]` | `cargo fmt --all` |
 | `script/check [test args]` | Routine format-check + lint + workspace tests, in one dev container |
 | `script/schema` | Regenerate `schema/logit.schema.json` — run after any `logit-config` type change, and commit the result |
@@ -1268,8 +1271,8 @@ not a style preference:
 - **The threat model is accidental data, not a malicious peer.** A listener, decoder, or transform
   must survive a misconfigured sender, a wedged peer, or a corrupt file; a problem only crafted
   input can trigger is defended only when the defense is free (a branch, a counter, a timeout
-  wrapper), and is otherwise a documented non-goal in `docs/known-gaps/`
-  ([ADR `deployment-threat-model`](docs/adr/deployment-threat-model.md)).
+  wrapper), and is otherwise a documented non-goal, listed in
+  [ADR `deployment-threat-model`](docs/adr/deployment-threat-model.md).
 
 ## Where things live
 
@@ -1302,7 +1305,7 @@ where `script/perf run`/`attribute`/`flamegraph` write their (gitignored) output
 
 `testdata/differential/` holds those corpora: generated and deterministic, unlike `testdata/interop/`'s captures, each case's bytes beside a JSON file with the reference's reading and the verdict `logit` must give, and a `divergence` on every case where the two differ. `prometheus-text/` differs in its inputs: its `cases/` are hand-built and committed as inputs, its readings sit under `reference/`, and it reads `testdata/interop/prometheus-scrape/`'s recorded bodies in place. `datadog-sketch/` holds no bytes: each case is a histogram and the translator's sketch as JSON. Its tests read it with `std::fs` and no reference installed, and `fuzz/seedgen` turns every `graphite-pickle` and `prometheus-text` case into a seed; [its README](testdata/differential/README.md) has the rest.
 
-`fuzz/` is the cargo-fuzz harness `script/unsafe-check fuzz` drives ([ADR `out-of-ci-fuzzing`](docs/adr/out-of-ci-fuzzing.md)), its own workspace outside the root one like `tools/protogen`, so `libfuzzer-sys` never enters the stable build: one target per file in `fuzz_targets/`, 27 today, each also a row of `script/unsafe-check`'s `FUZZ_TARGETS` (depending on `logit-core` and `logit-proto` only), `seedgen/` (a plain binary that writes `seeds/<target>/` deterministically from `testdata/interop/{otlp,prometheus,prometheus-scrape,statsd,syslog,graphite,collectd,datadog,influxdb}/`, the `graphite-pickle` and `prometheus-text` corpora under `testdata/differential/`, every `*.in` body under `crates/logit-cli/tests/fixtures/prometheus/`, `tools/record-fixtures/prometheus-metadata-target.prom`, `crates/logit-proto/tests/support/influxdb_lines.rs`, and encoder round trips), and the committed `seeds/`, where a `regress-*` file is a minimized crash input. `fuzz/corpus/`, `fuzz/artifacts/`, `fuzz/coverage/`, and `fuzz/target/` are gitignored; `script/format` covers the workspace and `script/lint` type-checks it on stable (`cargo check`), while clippy and `cargo-deny` don't.
+`fuzz/` is the cargo-fuzz harness `script/unsafe-check fuzz` drives ([ADR `out-of-ci-fuzzing`](docs/adr/out-of-ci-fuzzing.md)), its own workspace outside the root one like `tools/protogen`, so `libfuzzer-sys` never enters the stable build: one target per file in `fuzz_targets/`, 27 today, each also a row of `script/unsafe-check`'s `FUZZ_TARGETS` (depending on `logit-core` and `logit-proto` only), `seedgen/` (a plain binary that writes `seeds/<target>/` deterministically from `testdata/interop/{otlp,prometheus,prometheus-scrape,statsd,syslog,graphite,collectd,datadog,influxdb}/`, the `graphite-pickle` and `prometheus-text` corpora under `testdata/differential/`, every `*.in` body under `crates/logit-cli/tests/fixtures/prometheus/`, `tools/record-fixtures/prometheus-metadata-target.prom`, `crates/logit-proto/tests/support/influxdb_lines.rs`, and encoder round trips), and the committed `seeds/`, where a `regress-*` file is a minimized crash input. `fuzz/corpus/`, `fuzz/artifacts/`, `fuzz/coverage/`, and `fuzz/target/` are gitignored; `script/format` covers the workspace and `script/lint` type-checks it on stable (`cargo check`) and runs `seedgen --check`, which fails on a stale seed (regenerate with `script/unsafe-check fuzz-seed`), while clippy and `cargo-deny` don't.
 
 `perf/load/*.yaml` are the **sidecar load specs** for real-socket scenarios
 ([ADR `udp-intake-batching-and-socket-visibility`](docs/adr/udp-intake-batching-and-socket-visibility.md)):

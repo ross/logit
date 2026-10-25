@@ -6,7 +6,7 @@
 //! calls take `&'static str` names and tags so cardinality is bounded by code, not traffic. A
 //! Lua string can't satisfy that, so [`static_str`] round-trips it through the process interner
 //! (`logit_core::interner`): `resolve(intern(s))` returns the interner's permanent storage, and
-//! re-interning a held string allocates nothing (`docs/known-gaps/runtime.md`'s interner section).
+//! re-interning a held string allocates nothing (`docs/design/memory.md` §4).
 //! A script that builds a metric name or tag value from per-event data, rather than a literal in
 //! its source, leaks the interner one entry at a time, as a misused `kv_metrics` can. That's the
 //! author's responsibility; the ADR has the tradeoff.

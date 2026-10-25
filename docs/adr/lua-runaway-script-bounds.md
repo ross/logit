@@ -1,6 +1,6 @@
 ---
 created: 2026-09-26
-updated: 2026-10-16
+updated: 2026-10-25
 ---
 
 # Lua scripts: stall detection, a progress-based wedge check, opt-in `max_memory`, and a table-depth cap
@@ -163,7 +163,8 @@ sources, found:
      bytes while its payload stays in the Rust heap (10,000 retained 1 KiB events: 1.5 MB of VM,
      about 10 MB of Rust). Size the cap at least twice the script's steady working set, read from
      `logit.script.vm.memory`. A script that hoards events rather than Lua values is visible in
-     process RSS, not bounded by this cap; `docs/known-gaps/transforms.md`'s Lua entry records it.
+     process RSS, not bounded by this cap; ADR `deployment-threat-model`'s non-goals amendment
+     lists it.
 4. **A depth cap on Lua-to-Rust table conversion.** `MAX_TABLE_DEPTH = 128`, local to
    `logit-script`, matches native's `MAX_VALUE_DEPTH` so a value a script builds always decodes on
    a `logit_in` peer. A table nested past that depth is a clear conversion error, naming the
@@ -273,8 +274,8 @@ sources, found:
   in the PR that lands its artifact.
 - Interner growth from script-derived strings (`Event.new`'s and the proxy setters'
   `name`/`unit`/`description`/`event_name` fields, and nested attribute keys) stays a documented,
-  accepted residual in `docs/known-gaps/transforms.md`, citing [ADR
-  `deployment-threat-model`](deployment-threat-model.md), the way `telemetry`'s own tag values
+  accepted residual, listed in [ADR `deployment-threat-model`](deployment-threat-model.md)'s
+  non-goals amendment, the way `telemetry`'s own tag values
   already are. A `newproxy(true)` finalizer touching a stashed handle during collection is no
   longer possible to write at all: decision 8 removes `newproxy`, closing the class rather than
   defending each site against it.
@@ -307,9 +308,8 @@ sources, found:
   not its size, so a DAG a script builds by sharing table references (`t = {a = t, b = t}`
   repeated k times) still converts, at 2^k nodes. And pure-Lua recursion through Rust/C frames can
   still abort the process past the larger stack from decision 12, at a higher level than 233. The
-  last two, and the `Event.new`-loop residual above, are recorded in
-  `docs/known-gaps/transforms.md`'s Lua entry, citing [ADR
-  `deployment-threat-model`](deployment-threat-model.md).
+  last two, and the `Event.new`-loop residual above, are listed in [ADR
+  `deployment-threat-model`](deployment-threat-model.md)'s non-goals amendment.
 
 ## Running it
 

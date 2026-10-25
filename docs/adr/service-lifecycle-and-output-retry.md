@@ -1,6 +1,6 @@
 ---
 created: 2026-08-30
-updated: 2026-10-18
+updated: 2026-10-25
 ---
 
 # Service lifecycle: signal-driven shutdown and bounded output retry
@@ -70,7 +70,6 @@ once a restart policy, not a person at a terminal, is what's waiting on this pro
 **Accepted cost:** a datagram mid-`recv_from`/decode when the signal lands is dropped along with
 the cancelled future. This is the right trade — UDP is lossy by contract already; the aggregation
 window this change protects is not — but it is a real, deliberate behavior, not an oversight.
-Recorded in `docs/known-gaps/runtime.md`.
 
 ### Retry: a tight wall-clock budget, not an attempt count
 

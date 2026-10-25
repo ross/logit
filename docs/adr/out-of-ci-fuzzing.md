@@ -80,7 +80,7 @@ covers is described in prose under the "untrusted-input parsers" amendment below
   limits, because an allocation-limit crash reproduces only under `-malloc_limit_mb`. Any other
   crash gets none, because under the limit libFuzzer can minimize a panic down to an empty file
   that doesn't reproduce.
-- `fuzz-seed` runs `seedgen` to regenerate `fuzz/seeds/`.
+- `fuzz-seed` runs `seedgen` to regenerate `fuzz/seeds/`. `script/lint` runs `seedgen --check`, which writes nothing and fails on any added, removed, or changed generated seed, so an encoding change can't land with stale seeds.
 
 Every run passes the target's `-max_len` and `-malloc_limit_mb` from `FUZZ_TARGETS`, plus
 `-rss_limit_mb=4096`, `-timeout=10`, and `-max_total_time=${FUZZ_SECONDS:-600}`. Caller arguments
@@ -175,8 +175,8 @@ manual and nightly.
   lands. ADR `out-of-ci-unsafe-verification`'s deferral of `cargo-fuzz` is superseded by its
   amendment of the same date.
 - CI type-checks `fuzz/` but never runs a target, so a decoder change that breaks a target's
-  oracle passes CI. Run `script/unsafe-check fuzz-seed` and a short `fuzz-all` after changing a
-  decoder a target calls.
+  oracle passes CI. Run a short `fuzz-all` after changing a
+  decoder a target calls, and `script/unsafe-check fuzz-seed` after a change `script/lint` reports as stale seeds.
 - A new decoder of untrusted input should get a target: one `[[bin]]`, one `FUZZ_TARGETS` entry,
   and seeds from `seedgen`.
 - A target can only call code in `logit-core` or `logit-proto`. Parsing logic that lives in a
@@ -283,8 +283,9 @@ Two things the campaign turned up about the harness, not the decoders:
   argument. `fuzz/` is outside the cargo workspace, and no check built it then; `script/lint`
   now type-checks it (the 2026-10-11 amendment).
   Both targets now decode under `DecodeBudget::default()`, the budget `NativeDecoder` gives a
-  frame under the default cap. "Consequences" already says so: run `fuzz-seed` and a short
-  `fuzz-all` after changing a decoder a target calls.
+  frame under the default cap. At the time, "Consequences" said to run `fuzz-seed` and a short
+  `fuzz-all` after changing a decoder a target calls. The rule now lives in "Consequences", and
+  `script/lint` runs `seedgen --check` to catch stale seeds.
 - **A host suspend reads as a timeout.** The host suspended for about 2.8 hours during the last
   four targets. On resume, libFuzzer counted the whole suspend against the input in flight and
   reported `timeout-*` artifacts in `prom_decompress` and both batch targets, and a
@@ -490,8 +491,9 @@ and CI, where before it showed only at the next campaign's build.
 
 The check doesn't build under the sanitizer, run a target, or lint `fuzz/`. A change to what a
 decoder accepts can still break a target's oracle with every check green, so the
-"Consequences" advice stands: run `script/unsafe-check fuzz-seed` and a short `fuzz-all` after
-changing a decoder a target calls.
+"Consequences" advice stands: run a short `fuzz-all` after changing a decoder a target calls.
+`script/lint` also runs `seedgen --check`, which fails on a stale seed until
+`script/unsafe-check fuzz-seed` regenerates it.
 
 ## Amendment (2026-10-18): a run the host slept through is rerun, not kept awake
 

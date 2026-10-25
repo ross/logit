@@ -1,6 +1,6 @@
 ---
 created: 2026-09-14
-updated: 2026-10-11
+updated: 2026-10-25
 ---
 
 # Idle-connection timeouts on TCP listeners: an opt-in `idle_timeout`, a next-byte deadline, and a client-side pooled-connection probe
@@ -312,8 +312,8 @@ kept both:
   byte per frame slightly under the bound holds a connection permit for up to
   `MAX_REQUEST_BYTES × idle_timeout` on an HTTP listener, and `max_frame_bytes × idle_timeout` on
   `logit_in`. A total deadline was declined because a slow link sending a large legitimate body
-  looks the same. The cost is recorded under "TLS and connection lifecycle" in
-  [`docs/known-gaps/intake.md`](../known-gaps/intake.md#tls-and-connection-lifecycle).
+  looks the same. The cost is stated in `docs/deploying.md`'s `idle_timeout` notes and listed in
+  [ADR `deployment-threat-model`](deployment-threat-model.md)'s non-goals amendment.
 
 ## Amendment: the hyper derivation re-run, and one claim corrected (2026-09-25)
 

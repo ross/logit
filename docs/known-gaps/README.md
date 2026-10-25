@@ -10,6 +10,13 @@ trigger. When a gap closes, delete its entry and fix any doc or code comment tha
 git history keeps the old text. When only part of a gap closes, rewrite the entry to state what's
 still open.
 
+A limit that has a decision and a doc isn't a known gap, even when it costs an operator something.
+Its ADR is the record, and the operator's workaround goes in [Deploying `logit`](../deploying.md)
+or the matching guide ([Datadog](../datadog.md), [Splunk](../splunk.md),
+[HTTP access logs](../http-access-logs.md)); a non-goal under the threat model is listed in
+[ADR `deployment-threat-model`](../adr/deployment-threat-model.md). An entry here is work still
+open: a deferred fix, a revisit trigger, unverified behavior, or residual lossless-transit debt.
+
 | File | Covers |
 |---|---|
 | [runtime.md](runtime.md) | the pipeline runtime and graph, the event model and interner, config and CLI, and the admin endpoint and release image |
@@ -19,7 +26,7 @@ still open.
 | [statsd.md](statsd.md) | `statsd_in` and `statsd_out` |
 | [datadog.md](datadog.md) | `datadog_in`, `datadog_out`, `datadog_trace_in`, and `datadog_trace_out` |
 | [splunk.md](splunk.md) | `splunk_hec_in` and `splunk_hec_out` |
-| [influxdb.md](influxdb.md) | `influxdb_in` and `influxdb_out`: unsupported routes, faults the producer never sees, and what a carried bucket costs |
+| [influxdb.md](influxdb.md) | `influxdb_in` and `influxdb_out`: unsupported routes and what a carried bucket costs |
 | [kafka.md](kafka.md) | `kafka_out` |
 | [syslog.md](syslog.md) | `syslog_in` and `syslog_out` |
 | [otlp.md](otlp.md) | `otlp_in` and `otlp_out` |

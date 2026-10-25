@@ -1,6 +1,6 @@
 ---
 created: 2026-09-01
-updated: 2026-09-01
+updated: 2026-10-25
 ---
 
 # Lua-authored telemetry: cardinality is convention-enforced, not type-system-enforced
@@ -14,7 +14,7 @@ ADR `internal-telemetry-as-pipeline-events` built `logit_core::telemetry::Teleme
 is `&'static str` — a compile-time-constant string, not a runtime value. That's what bounds
 cardinality by *code* rather than by traffic, and it matters more here than in most systems: the
 process-wide attribute interner (`logit_core::interner`) never evicts
-(`docs/known-gaps/runtime.md`), so a runtime-derived string reaching it leaks for the life of the
+(`docs/design/memory.md` §4), so a runtime-derived string reaching it leaks for the life of the
 process.
 
 Extending telemetry to Lua scripts (`crates/logit-script/src/telemetry.rs`, letting a `process()`/
@@ -28,7 +28,7 @@ simply doesn't reach across that boundary.
 **Round-trip every Lua-provided name and tag value through the existing interner**:
 `interner::resolve(interner::intern(s))` genuinely returns a `&'static str` — the interner's own
 permanent storage — and re-interning a string it already holds allocates nothing (measured and
-documented in `docs/known-gaps/runtime.md`). This satisfies `Telemetry`'s type
+documented in `docs/design/memory.md` §4). This satisfies `Telemetry`'s type
 signature using infrastructure the codebase already has and already accepts the tradeoff on, rather
 than building a second, bespoke leak mechanism just for this path.
 
@@ -75,7 +75,7 @@ from, not by what the compiler will accept.
   for the audience that actually writes scripts — the ADR records the decision, the design doc is
   what a script author is expected to read.
 - If Lua-authored telemetry cardinality ever becomes a real operational problem (unlike the
-  Rust-side interner growth risk, which `docs/known-gaps/runtime.md` argues is unlikely to be hit
+  Rust-side interner growth risk, which `docs/design/memory.md` §4 argues is unlikely to be hit
   first), the fix is either the bounded-cache alternative above or a lint/review convention for
   scripts — not a change to `logit_core::telemetry` itself, which stays correctly agnostic about
   where a `&'static str` came from.

@@ -1793,9 +1793,9 @@ fn a_saturated_timestamp_relays_as_i64_max() {
 }
 
 /// OTLP/JSON parses into a whole `serde_json::Value` tree before any OTLP field is read, so its
-/// peak heap per input byte is higher than protobuf's. `docs/known-gaps/otlp.md`'s OTLP section
-/// records both measured ratios. The ceilings leave headroom over them, so a change that moves
-/// either ratio fails here instead of drifting from that entry.
+/// peak heap per input byte is higher than protobuf's. `docs/adr/deployment-threat-model.md`'s
+/// non-goals amendment records both measured ratios. The ceilings leave headroom over them, so a
+/// change that moves either ratio fails here instead of drifting from that record.
 #[test]
 fn otlp_json_peak_memory_per_input_byte_is_documented() {
     // A real OTel SDK export (`testdata/interop/otlp/README.md` has its provenance): ordinary
@@ -2435,7 +2435,7 @@ fn syslog_worst_case_datagram_stays_under_the_fuzz_malloc_limit() {
 /// A 64 KiB line of distinct SD-NAMEs, in the order that costs `AttrMap` the most: each name
 /// interned before the line in reverse, so every insert into the sorted map lands at its front.
 /// The parse is one forward pass, but that fold is quadratic in the name count; the frame cap
-/// bounds it, and no count cap is added (`docs/known-gaps/syslog.md`). This pins the result, not
+/// bounds it, and no count cap is added (`docs/adr/deployment-threat-model.md`). This pins the result, not
 /// the time, which the test prints: about 10 ms for the PARAMs and 17 ms for the SD-IDs in a
 /// release build, against 3 ms for the PARAMs in first-seen order.
 #[test]

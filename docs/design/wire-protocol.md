@@ -187,8 +187,7 @@ Two caveats:
   `Samples`; the copy is transient and not charged.
 
 The dictionary's cost lands mostly in the process-wide interner, which never evicts and isn't a
-per-frame cost ([`docs/known-gaps/runtime.md`](../known-gaps/runtime.md#event-model-and-interner)'s
-interner entry).
+per-frame cost ([`memory.md`](memory.md#what-feeds-it)'s "What feeds it").
 
 **A real batch is charged 1.5 to 39 bytes of heap per wire byte.** The 864-byte event slot
 dominates a small event; a wide parsed log carries enough wire bytes to hide it. Measured on

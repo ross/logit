@@ -296,7 +296,8 @@ pub struct OtlpInput {
     /// per node, several times the source bytes for a nested OTLP payload, where
     /// `prost::Message::decode` builds the target structs directly. The bound still holds (a JSON
     /// body is capped at `MAX_REQUEST_BYTES` before parsing), so the all-JSON worst case is a
-    /// finite multiple of it; `docs/known-gaps/otlp.md`'s OTLP section has the measured multiple.
+    /// finite multiple of it; `docs/adr/deployment-threat-model.md`'s non-goals amendment has the
+    /// measured multiple.
     max_connections: usize,
     /// `peer:` in config. See [`Self::with_peer`].
     peer: bool,

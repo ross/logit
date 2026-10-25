@@ -1,6 +1,6 @@
 ---
 created: 2026-10-08
-updated: 2026-10-18
+updated: 2026-10-25
 ---
 
 # Enabling plan: a soak harness — faults on a timeline, a watchdog, and a loss ledger
@@ -1704,7 +1704,7 @@ judges each SUT life's duplicate copies too. Within one producer epoch the broke
 duplicate FAILs in a life with no epoch bump, and WARNs in a life that ended in a restart or
 kill (the next life resends under a new producer id) or whose sink counted a drop that bumps
 the epoch (`rejected`, `invalid_timestamp`, `invalid_record`, `ambiguous_at_most_once`;
-`checks.py`'s `EPOCH_BUMP_REASONS`), as [`docs/known-gaps/kafka.md`](../known-gaps/kafka.md)
+`checks.py`'s `EPOCH_BUMP_REASONS`), as [`docs/deploying.md`](../deploying.md#kafka_out-producing-to-kafka)
 permits. Every other target's `ledger.topic` SKIPs.
 
 **An `otlp_proto` topic.** `load()` reads the `format:` of the `kafka_out` the sink names
@@ -1968,14 +1968,13 @@ the other.
   last cursor persist (its commit rate, `_commit_rate`'s highest delivered rate over its last
   three delivering drain intervals, × `checkpoint_interval`, plus one, in frames of the largest
   frame): its spool replays them under their old identity, and the restarted `collector` has no
-  mark for them ([`docs/known-gaps/native-hop.md`](../known-gaps/native-hop.md), "The native hop
-  still forwards a duplicate after a `logit_in` restart"); a `collector` that kept its marks
+  mark for them ([`docs/deploying.md`](../deploying.md#forwarding-between-logit-nodes)); a `collector` that kept its marks
   acknowledges the replay as resends instead. Each killed `collector` life allows + its last
   drain interval of E_B, which it forwarded but never exported, and − one send window of
   frames: its marks are gone, so it forwards a resend of what it had forwarded and not
   acknowledged. Each `pause` of `collector` allows − one send window: the resend can race the
   frames an ended connection still holds
-  ([`docs/known-gaps/native-hop.md`](../known-gaps/native-hop.md)). A partition or packet loss
+  ([`docs/deploying.md`](../deploying.md#forwarding-between-logit-nodes)). A partition or packet loss
   allows nothing: the race needs a forward parked on a full inbox. Any other gap FAILs, below
   the allowance as a surplus and above it as uncounted. A `rejected` or `disk_corrupt` batch
   drop at the hop sink FAILs too. Resends, resumed frames, and reconnects are shown beside it,
@@ -2167,8 +2166,7 @@ where it needs them, and a small check extension.
 
 1. **Lua in the path (built in W7a).** `statsd_in → lua → aggregate → prometheus_out`, which
    drives `run_lua` and `/readyz`'s `stalled`, the one not-ready answer for a node that hasn't
-   exited ([`docs/known-gaps/runtime.md`](../known-gaps/runtime.md), "Admin endpoint, readiness,
-   and release image"). Three scenarios
+   exited ([`docs/deploying.md`](../deploying.md#what-to-watch-on-readyz)). Three scenarios
    ([ADR `lua-runaway-script-bounds`](../adr/lua-runaway-script-bounds.md)):
    - `lua-path`: under the `statsd-vm` schedule in §2, the script rewrites each event, discards every
      53rd (`events.discarded`), fails on every 97th (`events.dropped{reason="script_error"}` beside
@@ -2238,7 +2236,7 @@ where it needs them, and a small check extension.
 6. **High cardinality over hours (built in W8c).** A second `generate_in` with `{seq%N}` in
    the metric name, N past any count the run reaches, at a low rate (`generate_in` rejects a
    bare `{seq}` in an interned field). The interner never frees
-   ([`docs/known-gaps/runtime.md`](../known-gaps/runtime.md), "Event model and interner"), so
+   ([`docs/design/memory.md`](../design/memory.md#4-interning-the-bargain-and-its-bounds)), so
    `rss_slope` should FAIL: the harness sees the documented growth and pins its rate. A short
    `series_retention` keeps `aggregate`'s state from masking it. Rows: `rss_slope` and the slope
    of `logit.process.interner.strings` on `logit`. The generator interns every name too, so its
@@ -4290,7 +4288,7 @@ at −2,400, −2,600, and −2,400 inside allowances of about [−76,000, 11,50
   can't be split by fault; it settled at −2,241 after the last fault. Two mechanisms fit: `collector`'s kill, which forgot its marks, and
   `logit`'s replay, after its kill inside `collector`'s stop, of frames committed in the second
   before the stop and never persisted, to a `collector` whose restart had forgotten their mark.
-  Both are `docs/known-gaps/native-hop.md`'s documented duplicates. An event-level reconciliation
+  Both are documented duplicates (`docs/deploying.md`'s "Forwarding between `logit` nodes"). An event-level reconciliation
   would need a per-frame count at `logit_in` of frames forwarded above a restarted mark, which
   `logit` doesn't export; this stops here rather than adding one.
 - `logit.input.batches.resends` was 3 (6 and 10 in the first two runs), all in `collector`'s
