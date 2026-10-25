@@ -2,30 +2,6 @@
 
 Entry format and the other areas: [the known-gaps index](README.md).
 
-- **`prometheus_out` has no TLS and no auth either** (ADR `prometheus-scrape-and-exposition`'s
-  "Security posture"). Anyone who can reach its `bind:` reads the whole registry: every label on
-  every series the sink holds. The admin endpoint's matching gap ("The admin endpoint has no TLS
-  and no auth" under
-  [Admin endpoint, readiness, and release image](runtime.md#admin-endpoint-readiness-and-release-image))
-  is a non-goal; this one is deferred, because every exposition-mode `prometheus_out` listens, and
-  its payload is the full metric surface, which reveals far more than a lifecycle phase.
-  - **Workaround:** `fixtures/prometheus-expose.yaml` binds `127.0.0.1`, and the field's doc
-    comment says to keep it loopback or pod-local behind something that provides both.
-  - **To close:** server-side TLS can reuse `logit-inputs`' existing builder (`otlp_in`'s
-    `tls:`). Auth has no in-tree precedent on any listener, so the kind (bearer, mTLS) needs a
-    decision before code.
-- **The remote-write receiver has TLS but no authentication** ([ADR
-  `prometheus-remote-write`](../adr/prometheus-remote-write.md)'s "Security posture";
-  `crates/logit-inputs/src/prometheus.rs`'s module doc). `prometheus_in`'s `bind_tls:` is transport
-  security, not identity: no bearer token, no basic auth, and no mutual-TLS identity check beyond
-  `rustls` accepting whatever chain a client presents when `client_ca_file` is set. Anything that
-  can reach the socket can write series into the pipeline. It's the same gap as `admin:` and
-  `prometheus_out`'s exposition `bind:` ("The admin endpoint has no TLS and no auth" and
-  "`prometheus_out` has no TLS and no auth either"), for the same reason: auth has no in-tree
-  precedent, so the kind (bearer, mTLS subject matching) needs deciding first.
-  - **Workaround:** bind loopback or pod-local and front it with something that authenticates
-    ([`fixtures/prometheus-remote-write-receive.yaml`](../../fixtures/prometheus-remote-write-receive.yaml);
-    `docs/deploying.md`'s "Prometheus remote-write" section).
 - **1.0 remote-write typing depends on the metadata cache, which is bounded and therefore lapses**
   ([ADR `prometheus-remote-write`](../adr/prometheus-remote-write.md)'s "The receiver is stateless";
   `prometheus_in`'s "Metadata cache" module-doc section). An expired family decodes untyped again
@@ -71,9 +47,10 @@ Entry format and the other areas: [the known-gaps index](README.md).
     well-behaved senders stay untyped permanently. Their samples still arrive, as flat families
     (the remembered type is advisory; see "1.0 remote-write typing depends on the metadata
     cache").
-  - **Workaround:** no sender is authenticated, so, as in "The remote-write receiver has TLS but
-    no authentication", don't point a `bind:` at senders you don't control. `max_families: 0`
-    turns off the sharing along with the typing.
+  - **Workaround:** give each population of senders its own `bind:`, each with its own table.
+    `bind_auth:` limits who can write, not what an accepted sender declares, so it doesn't stop
+    one authenticated sender evicting another's families. `max_families: 0` turns off the sharing
+    along with the typing.
 - **The remote-write sender does no cross-batch reordering, so a fan-in topology can draw
   out-of-order `400`s.** `prometheus_out(endpoint)` sends samples in batch order ([ADR
   `prometheus-remote-write`](../adr/prometheus-remote-write.md)'s "Sender behaviour"; the sink's

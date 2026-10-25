@@ -1,6 +1,6 @@
 ---
 created: 2026-09-11
-updated: 2026-10-23
+updated: 2026-10-25
 ---
 
 # Prometheus scrape ingestion and exposition: transports, dialects, and the model mapping
@@ -691,3 +691,11 @@ defines the values):
 The relay is the same fixed point: a scrape stamps the flag again, as a remote-write receiver does
 from the request's metadata. The sections above use the flag; the 2026-10-13 and 2026-10-21
 amendments and "Alternatives considered" keep the old reading as history.
+
+## Amendment (2026-10-25): the exposition takes TLS and credentials
+
+The "Security posture" above no longer holds. `prometheus_out`'s exposition takes `bind_tls:`
+(server TLS) and `bind_auth:` (bearer and basic credentials, refused with `401` before anything
+is rendered and counted `logit.output.scrapes{class="unauthorized"}`), each rejected beside
+`endpoint:` by graph rule 56 ([ADR `listener-authentication`](listener-authentication.md)). The
+example configs still bind `127.0.0.1`, for the reason that section gives.

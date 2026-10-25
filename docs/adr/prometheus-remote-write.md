@@ -1,6 +1,6 @@
 ---
 created: 2026-09-17
-updated: 2026-10-24
+updated: 2026-10-25
 ---
 
 # Prometheus remote-write: a receiver on `prometheus_in`, a sender on `prometheus_out`
@@ -677,3 +677,14 @@ the receiver sets no flag, through `with_timestamp_marker(false)`, so a remote-w
 exposition relay still writes no line timestamps, and `aggregate` windows remote-write samples as
 before. The sender still writes a timestamp on every sample. "Alternatives considered" and the
 2026-10-13 amendment keep the old name as history.
+
+## Amendment (2026-10-25): the receiver checks credentials
+
+The receiver takes `bind_auth:`, bearer and basic credentials as Prometheus's `remote_write` and
+vmagent send them, checked before the body and refused with `401`, rejected beside
+`scrape_targets:` by graph rule 55 ([ADR `listener-authentication`](listener-authentication.md)).
+The known-gaps row "The remote-write receiver has TLS but no authentication" this ADR's
+Consequences anticipated is closed. The exposition's TLS and auth gap that the rename paragraph
+under "Two additive fields, two mutual-exclusion rules, and mode-prefixed TLS keys" leaves
+untouched is closed by the same ADR, with a `bind_tls:` that follows this ADR's mode-prefixed
+naming.
