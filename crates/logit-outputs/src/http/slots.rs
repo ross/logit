@@ -54,25 +54,28 @@ enum State<O> {
     Empty,
 }
 
-struct Slot<O> {
+struct Slot<O, S> {
     seq: SeqId,
     accounting: BatchAccounting,
+    /// What the sink keeps per batch beside the accounting: `datadog_out`'s send time.
+    extra: S,
     state: State<O>,
 }
 
 /// The window of an HTTP sink's batches in flight (the module doc). `O` is what the sink's
-/// transport task returns for its batch.
-pub(crate) struct Slots<O> {
+/// transport task returns for its batch, and `S` what the sink keeps per batch beside its
+/// accounting, fixed when the batch is observed and kept across its resubmits.
+pub(crate) struct Slots<O, S = ()> {
     concurrency: usize,
     gate: CountGate,
     posture: DeliveryPosture,
     telemetry: Telemetry,
-    slots: VecDeque<Slot<O>>,
+    slots: VecDeque<Slot<O, S>>,
     /// How long the request behind the last `ack` took, `None` when it sent none.
     answered: Option<Duration>,
 }
 
-impl<O: Send + 'static> Slots<O> {
+impl<O: Send + 'static, S: Default> Slots<O, S> {
     /// A window of one, over the sink's `gate`, the one its encoder's handles are gated by.
     pub(crate) fn new(gate: CountGate) -> Self {
         Self {
@@ -108,8 +111,9 @@ impl<O: Send + 'static> Slots<O> {
         }
     }
 
-    /// `Output::observe_batch`: a slot for `seq` at the back, armed with nothing counted.
-    pub(crate) fn observe(&mut self, seq: SeqId) {
+    /// `Output::observe_batch`: a slot for `seq` at the back, armed with nothing counted. Returns
+    /// the slot's per-batch state, reset to its default, for the sink to fix.
+    pub(crate) fn observe(&mut self, seq: SeqId) -> &mut S {
         let index = match self.position(seq) {
             Some(index) => index,
             None => {
@@ -117,7 +121,10 @@ impl<O: Send + 'static> Slots<O> {
                 self.slots.len() - 1
             }
         };
-        self.slots[index].accounting.observe();
+        let slot = &mut self.slots[index];
+        slot.accounting.observe();
+        slot.extra = S::default();
+        &mut slot.extra
     }
 
     /// `Output::submit`: runs `prepare` on this task with the batch's accounting, then spawns the
@@ -135,6 +142,20 @@ impl<O: Send + 'static> Slots<O> {
     where
         F: Future<Output = O> + Send + 'static,
     {
+        self.submit_with(seq, |accounting, _| prepare(accounting))
+    }
+
+    /// [`Slots::submit`], with the slot's per-batch state beside its accounting. A sink that sends
+    /// a batch as several requests reads the accounting's settled requests here, so the task it
+    /// spawns sends only the rest.
+    pub(crate) fn submit_with<F>(
+        &mut self,
+        seq: SeqId,
+        prepare: impl FnOnce(&mut BatchAccounting, &mut S) -> anyhow::Result<Option<F>>,
+    ) -> anyhow::Result<()>
+    where
+        F: Future<Output = O> + Send + 'static,
+    {
         let index = match self.position(seq) {
             Some(index) => index,
             None => {
@@ -144,7 +165,7 @@ impl<O: Send + 'static> Slots<O> {
         };
         let slot = &mut self.slots[index];
         slot.state = State::Idle;
-        let result = match prepare(&mut slot.accounting) {
+        let result = match prepare(&mut slot.accounting, &mut slot.extra) {
             Ok(Some(request)) => {
                 let started = tokio::time::Instant::now();
                 let timed = async move {
@@ -179,6 +200,15 @@ impl<O: Send + 'static> Slots<O> {
         &mut self,
         apply: impl FnOnce(O) -> anyhow::Result<()>,
     ) -> anyhow::Result<()> {
+        self.ack_with(|outcome, _| apply(outcome)).await
+    }
+
+    /// [`Slots::ack`], with the front slot's accounting, so `apply` records the requests the
+    /// destination settled before the slot's `finish` reads them.
+    pub(crate) async fn ack_with(
+        &mut self,
+        apply: impl FnOnce(O, &mut BatchAccounting) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
         self.answered = None;
         let Some(front) = self.slots.front_mut() else {
             return Ok(());
@@ -190,12 +220,12 @@ impl<O: Send + 'static> Slots<O> {
             State::Running(task) => {
                 // Cancels every slot unless the wait completes, so a cancelled `ack` leaves
                 // nothing in flight.
-                struct OnCancel<'a, O> {
-                    slots: &'a mut Slots<O>,
+                struct OnCancel<'a, O, S> {
+                    slots: &'a mut Slots<O, S>,
                     task: Task<O>,
                     done: bool,
                 }
-                impl<O> Drop for OnCancel<'_, O> {
+                impl<O, S> Drop for OnCancel<'_, O, S> {
                     fn drop(&mut self) {
                         if !self.done {
                             self.slots.cancel_all();
@@ -209,7 +239,8 @@ impl<O: Send + 'static> Slots<O> {
                 match joined {
                     Ok((outcome, took)) => {
                         self.answered = Some(took);
-                        apply(outcome)
+                        let front = self.slots.front_mut().expect("the front slot is still there");
+                        apply(outcome, &mut front.accounting)
                     }
                     Err(err) if err.is_panic() => std::panic::resume_unwind(err.into_panic()),
                     Err(err) => Err(anyhow::Error::new(err)).context_fault(Fault::Ambiguous),
@@ -251,10 +282,10 @@ impl<O: Send + 'static> Slots<O> {
         self.slots.iter().position(|slot| slot.seq == seq)
     }
 
-    fn slot(&self, seq: SeqId) -> Slot<O> {
+    fn slot(&self, seq: SeqId) -> Slot<O, S> {
         let mut accounting = BatchAccounting::sharing(&self.gate);
         accounting.observe_posture(self.posture);
-        Slot { seq, accounting, state: State::Idle }
+        Slot { seq, accounting, extra: S::default(), state: State::Idle }
     }
 
     #[cfg(test)]
@@ -263,7 +294,7 @@ impl<O: Send + 'static> Slots<O> {
     }
 }
 
-impl<O> Slots<O> {
+impl<O, S> Slots<O, S> {
     fn cancel_all(&mut self) {
         for slot in &mut self.slots {
             slot.state = State::Idle;

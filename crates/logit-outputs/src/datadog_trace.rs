@@ -197,7 +197,7 @@
 use crate::accounting::BatchAccounting;
 use crate::http::{
     body_snippet, build_client, classify_reqwest_error, read_body_prefix, split_encode,
-    status_class, Caps, Encoded, Outcomes, ERROR_BODY_SNIPPET_BYTES,
+    status_class, Caps, Encoded, Journal, Outcomes, Slots, ERROR_BODY_SNIPPET_BYTES,
 };
 /// `tls:`: the shared `crate::tls` type, re-exported as the other sinks do.
 pub use crate::tls::TlsClientSettings;
@@ -348,7 +348,8 @@ impl tower_service::Service<http::Uri> for UnixConnector {
     }
 }
 
-/// The two transports (module doc's "Transports").
+/// The two transports (module doc's "Transports"). `Clone` shares the pool.
+#[derive(Clone)]
 enum Client {
     Http { client: reqwest::Client, base: String },
     Unix { client: Box<HyperClient<UnixConnector, Full<Bytes>>>, path: Arc<Path> },
@@ -504,8 +505,9 @@ pub struct DatadogTraceOutput {
     /// Replaces [`CAPS`], so a test can drop a small trace as oversize.
     #[cfg(test)]
     caps_override: Option<Caps>,
-    /// The operator's `concurrency:`, which the HTTP slot helper reads as this sink's window.
-    concurrency: u32,
+    /// The batches in flight above a concurrency of 1, each with its own accounting over
+    /// `accounting`'s gate (the module doc's "Concurrency").
+    slots: Slots<Attempted>,
 }
 
 /// The batch accounting's unit for the trace route's encode and tracer headers.
@@ -515,8 +517,9 @@ const STATS_UNIT: u32 = 1;
 
 impl DatadogTraceOutput {
     fn with_client(client: Client) -> Self {
+        let accounting = BatchAccounting::default();
         let mut output = Self {
-            concurrency: 1,
+            slots: Slots::new(accounting.gate().clone()),
             client,
             version: TracerApiForm::V04,
             compression: DatadogTraceCompression::default(),
@@ -526,7 +529,7 @@ impl DatadogTraceOutput {
             encoder: DatadogEncoder::new(),
             diag: Diagnostics::default(),
             telemetry: Telemetry::default(),
-            accounting: BatchAccounting::default(),
+            accounting,
             #[cfg(test)]
             caps_override: None,
         };
@@ -559,7 +562,7 @@ impl DatadogTraceOutput {
 
     /// Sets how many batches may be in flight at once (`concurrency:` in config, default 1).
     pub fn with_concurrency(mut self, concurrency: u32) -> Self {
-        self.concurrency = concurrency;
+        self.slots.set_concurrency(concurrency);
         self
     }
 
@@ -642,6 +645,7 @@ impl DatadogTraceOutput {
     }
 
     pub fn with_telemetry(mut self, telemetry: Telemetry) -> Self {
+        self.slots.set_telemetry(telemetry.clone());
         self.telemetry = telemetry;
         self.encoder = self.new_encoder();
         self
@@ -666,6 +670,93 @@ impl DatadogTraceOutput {
         CAPS
     }
 
+    /// What one attempt's requests need from this sink, owned so they can run in a task of their
+    /// own.
+    fn poster(&self) -> Poster {
+        Poster {
+            client: self.client.clone(),
+            version: self.version,
+            compression: self.compression,
+            request_timeout: self.request_timeout,
+            headers: self.headers.clone(),
+        }
+    }
+
+    /// One attempt: traces, then stats, every request's verdict folded into one [`Outcomes`]
+    /// ([`post_all`]).
+    ///
+    /// Requests are numbered `0, 1, 2, …` in send order across the two routes, one per
+    /// `split_encode` chunk, and a request the Agent settled for this batch (accepted or rejected)
+    /// is encoded again but not resent. The number names the same request on every attempt only
+    /// because each route's cuts are a pure function of the batch: anything that makes them
+    /// depend on per-attempt state breaks the memory.
+    ///
+    /// Under `at_most_once` an `Ambiguous` stop counts the failed request's records and those of
+    /// the route's unsettled requests after it `records.dropped{reason="ambiguous_at_most_once"}`.
+    /// A stop on the trace route drops the batch before the stats route was ever reached, on this
+    /// attempt or an earlier one, so every stats group in the batch is counted beside the trace
+    /// route's own count. That count is an upper bound: it includes a group its encode would have
+    /// dropped `oversize`.
+    async fn attempt(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
+        let (poster, caps, compression) = (self.poster(), self.caps(), self.compression);
+        let mut outcomes = Outcomes::new(self.accounting.any_accepted());
+        let mut next_request: u32 = 0;
+        for route in [Route::Traces, Route::Stats] {
+            let mut encoding = Encoding {
+                caps,
+                compression,
+                version: poster.version,
+                encoder: &mut self.encoder,
+                telemetry: &self.telemetry,
+                diag: &mut self.diag,
+            };
+            let postings = encoding.route(&mut self.accounting, route, batch, &mut next_request);
+            let mut journal = Journal::default();
+            let posted = post_all(&poster, postings, &mut outcomes, &mut journal).await;
+            if let Err(stopped) = posted {
+                if drops_ambiguous(self.accounting.posture(), &stopped.err) {
+                    let lost = stopped.records
+                        + stopped.rest.iter().map(|p| p.encoded.meta.records).sum::<usize>();
+                    dropped(&mut journal, route, "ambiguous_at_most_once", lost);
+                    if route == Route::Traces {
+                        let groups = stats_items(batch).len();
+                        dropped(&mut journal, Route::Stats, "ambiguous_at_most_once", groups);
+                    }
+                }
+                journal.replay(&self.telemetry, &mut self.diag, &mut self.accounting);
+                return Err(stopped.err);
+            }
+            journal.replay(&self.telemetry, &mut self.diag, &mut self.accounting);
+        }
+        outcomes.finish()
+    }
+}
+
+/// Counts `n` of `route`'s records dropped for `reason`, when there are any.
+fn dropped(journal: &mut Journal, route: Route, reason: &'static str, n: usize) {
+    if n > 0 {
+        journal.count(RECORDS_DROPPED, n as f64, &[("route", route.name()), ("reason", reason)]);
+    }
+}
+
+/// Whether `err` stops the send with a drop the sink counts `ambiguous_at_most_once`: an
+/// `Ambiguous` fault under `at_most_once`, which `write_loop` doesn't retry.
+fn drops_ambiguous(posture: DeliveryPosture, err: &anyhow::Error) -> bool {
+    posture == DeliveryPosture::AtMostOnce && logit_pipeline::classify(err) == Fault::Ambiguous
+}
+
+/// One attempt's encode, on the loop task: the sink's encoder and ungated handles, and the
+/// request limits.
+struct Encoding<'a> {
+    caps: Caps,
+    compression: DatadogTraceCompression,
+    version: TracerApiForm,
+    encoder: &'a mut DatadogEncoder,
+    telemetry: &'a Telemetry,
+    diag: &'a mut Diagnostics,
+}
+
+impl Encoding<'_> {
     fn dropped(&self, route: Route, reason: &'static str, n: usize) {
         if n > 0 {
             self.telemetry.count(
@@ -676,15 +767,38 @@ impl DatadogTraceOutput {
         }
     }
 
+    /// `route`'s requests for `batch`, numbered from `next_request`, leaving out those the Agent
+    /// settled for this batch.
+    fn route(
+        &mut self,
+        accounting: &mut BatchAccounting,
+        route: Route,
+        batch: &EventBatch,
+        next_request: &mut u32,
+    ) -> Vec<Posting> {
+        let requests = match route {
+            Route::Traces => self.traces(accounting, batch),
+            Route::Stats => self.stats(accounting, batch),
+        };
+        let mut postings = Vec::with_capacity(requests.len());
+        for (protocol, encoded) in requests {
+            let request = *next_request;
+            *next_request += 1;
+            if !accounting.settled(request) {
+                postings.push(Posting { request, route, protocol, encoded });
+            }
+        }
+        postings
+    }
+
     /// The trace route's requests: the batch's span events other than APM stats, one item per
     /// trace so a trace is never split. The encode and the tracer headers are [`TRACES_UNIT`]:
     /// the oversize drops and the `bad_header` diagnostic count on its first encode only.
-    async fn send_traces(
+    fn traces(
         &mut self,
+        accounting: &mut BatchAccounting,
         batch: &EventBatch,
-        outcomes: &mut Outcomes,
-        next_request: &mut u32,
-    ) -> anyhow::Result<()> {
+    ) -> Vec<(HeaderMap, Encoded<RequestMeta>)> {
         let resource = &batch.resource;
         let stats_name = datadog_stats_name();
         let chunks: Vec<Vec<usize>> = trace_chunks(batch)
@@ -696,13 +810,13 @@ impl DatadogTraceOutput {
             .filter(|members| !members.is_empty())
             .collect();
         if chunks.is_empty() {
-            return Ok(());
+            return Vec::new();
         }
         let items: Vec<usize> = (0..chunks.len()).collect();
-        let (version, compression, caps) = (self.version, self.compression, self.caps());
-        let gate = self.accounting.gate().clone();
-        let encoder = &mut self.encoder;
-        let (first, split) = self.accounting.encode(TRACES_UNIT, || {
+        let (version, compression, caps) = (self.version, self.compression, self.caps);
+        let gate = accounting.gate().clone();
+        let encoder = &mut *self.encoder;
+        let (first, split) = accounting.encode(TRACES_UNIT, || {
             split_encode(
                 &items,
                 caps,
@@ -736,30 +850,32 @@ impl DatadogTraceOutput {
             }
         }
         let headers = self.tracer_headers(resource, first);
-        let requests = split.requests.into_iter().map(|(_, encoded)| {
-            let mut headers = headers.clone();
-            headers.insert(HEADER_TRACE_COUNT, HeaderValue::from(encoded.meta.traces));
-            (headers, encoded)
-        });
-        self.post(Route::Traces, requests.collect(), outcomes, next_request).await
+        split
+            .requests
+            .into_iter()
+            .map(|(_, encoded)| {
+                let mut headers = headers.clone();
+                headers.insert(HEADER_TRACE_COUNT, HeaderValue::from(encoded.meta.traces));
+                (headers, encoded)
+            })
+            .collect()
     }
 
     /// The stats route's requests: one item per APM stats event (a stats group). The encode is
     /// [`STATS_UNIT`]: the oversize drops count on its first encode only.
-    async fn send_stats(
+    fn stats(
         &mut self,
+        accounting: &mut BatchAccounting,
         batch: &EventBatch,
-        outcomes: &mut Outcomes,
-        next_request: &mut u32,
-    ) -> anyhow::Result<()> {
+    ) -> Vec<(HeaderMap, Encoded<RequestMeta>)> {
         let items = stats_items(batch);
         if items.is_empty() {
-            return Ok(());
+            return Vec::new();
         }
-        let (compression, caps) = (self.compression, self.caps());
-        let gate = self.accounting.gate().clone();
-        let encoder = &mut self.encoder;
-        let (first, split) = self.accounting.encode(STATS_UNIT, || {
+        let (compression, caps) = (self.compression, self.caps);
+        let gate = accounting.gate().clone();
+        let encoder = &mut *self.encoder;
+        let (first, split) = accounting.encode(STATS_UNIT, || {
             split_encode(
                 &items,
                 caps,
@@ -787,8 +903,7 @@ impl DatadogTraceOutput {
                 );
             }
         }
-        let requests = split.requests.into_iter().map(|(_, encoded)| (HeaderMap::new(), encoded));
-        self.post(Route::Stats, requests.collect(), outcomes, next_request).await
+        split.requests.into_iter().map(|(_, encoded)| (HeaderMap::new(), encoded)).collect()
     }
 
     /// The tracer headers restored from `resource` (module doc's "The wire"). A carrier that
@@ -827,7 +942,127 @@ impl DatadogTraceOutput {
         }
         headers
     }
+}
 
+/// One request of an attempt: its number in the batch's send order, its route, its protocol
+/// headers, and its body.
+struct Posting {
+    request: u32,
+    route: Route,
+    protocol: HeaderMap,
+    encoded: Encoded<RequestMeta>,
+}
+
+/// Everything a batch's requests need, cloned from the sink: the client is a handle on the
+/// sink's own pool.
+struct Poster {
+    client: Client,
+    version: TracerApiForm,
+    compression: DatadogTraceCompression,
+    request_timeout: Duration,
+    headers: HeaderMap,
+}
+
+/// A stop [`post_all`] returns: the failed request's error, route, and records, and the requests
+/// after it, unsent.
+struct Stopped {
+    err: anyhow::Error,
+    route: Route,
+    records: usize,
+    rest: Vec<Posting>,
+}
+
+/// Sends `postings` in order, each verdict folded into `outcomes`: an accepted or rejected request
+/// (`Poster::request` counted the rejection) is settled in `journal` and the next is sent; any
+/// other fault stops the run with the request's own class.
+async fn post_all(
+    poster: &Poster,
+    postings: Vec<Posting>,
+    outcomes: &mut Outcomes,
+    journal: &mut Journal,
+) -> Result<(), Stopped> {
+    let mut postings = postings.into_iter();
+    while let Some(Posting { request, route, protocol, encoded }) = postings.next() {
+        let records = encoded.meta.records;
+        let result = poster.request(route, protocol, encoded, journal).await;
+        let accepted = result.is_ok();
+        if let Err(err) = outcomes.note(result, |_| {}) {
+            return Err(Stopped { err, route, records, rest: postings.collect() });
+        }
+        journal.settle(request, accepted);
+    }
+    Ok(())
+}
+
+/// One attempt above a concurrency of 1, both routes encoded on the loop task before the first
+/// request ([`prepare`]).
+struct SlotAttempt {
+    poster: Poster,
+    postings: Vec<Posting>,
+    /// Whether an earlier attempt at the batch had a request accepted ([`Outcomes::new`]).
+    accepted_before: bool,
+    posture: DeliveryPosture,
+}
+
+/// What [`run`] did: the attempt's result and every count, warning, and settled request it
+/// recorded, for [`DatadogTraceOutput::await_ack`] to apply on the loop task.
+struct Attempted {
+    journal: Journal,
+    result: anyhow::Result<()>,
+}
+
+/// The encode half of one attempt above a concurrency of 1, on the loop task: both routes'
+/// requests, leaving out those the Agent settled. `None` when no request is left to send.
+fn prepare(
+    poster: Poster,
+    mut encoding: Encoding<'_>,
+    accounting: &mut BatchAccounting,
+    batch: &EventBatch,
+) -> Option<SlotAttempt> {
+    let mut next_request: u32 = 0;
+    let mut postings = encoding.route(accounting, Route::Traces, batch, &mut next_request);
+    postings.extend(encoding.route(accounting, Route::Stats, batch, &mut next_request));
+    if postings.is_empty() {
+        return None;
+    }
+    Some(SlotAttempt {
+        poster,
+        postings,
+        accepted_before: accounting.any_accepted(),
+        posture: accounting.posture(),
+    })
+}
+
+/// Every request of the attempt in order ([`post_all`]). Under `at_most_once` an `Ambiguous` stop
+/// counts the failed request's records and every unsent request's, per route,
+/// `records.dropped{reason="ambiguous_at_most_once"}`: both routes were encoded before the first
+/// request, so each count is the records its requests carry.
+async fn run(attempt: SlotAttempt) -> Attempted {
+    let SlotAttempt { poster, postings, accepted_before, posture } = attempt;
+    let mut journal = Journal::default();
+    let mut outcomes = Outcomes::new(accepted_before);
+    match post_all(&poster, postings, &mut outcomes, &mut journal).await {
+        Ok(()) => Attempted { journal, result: outcomes.finish() },
+        Err(stopped) => {
+            if drops_ambiguous(posture, &stopped.err) {
+                let (mut traces, mut stats) = (0, 0);
+                let failed = std::iter::once((stopped.route, stopped.records));
+                let rest = stopped.rest.iter().map(|p| (p.route, p.encoded.meta.records));
+                for (route, records) in failed.chain(rest) {
+                    match route {
+                        Route::Traces => traces += records,
+                        Route::Stats => stats += records,
+                    }
+                }
+                dropped(&mut journal, Route::Traces, "ambiguous_at_most_once", traces);
+                dropped(&mut journal, Route::Stats, "ambiguous_at_most_once", stats);
+            }
+            Attempted { journal, result: Err(stopped.err) }
+        }
+    }
+}
+
+impl Poster {
     /// The operator's headers without any protocol-owned name, then `protocol` and the fixed
     /// ones `insert`ed over them. One `.headers(..)` at the call site, never
     /// `RequestBuilder::header`, which appends.
@@ -860,92 +1095,18 @@ impl DatadogTraceOutput {
         headers
     }
 
-    /// One attempt: traces, then stats, every request's verdict folded into one [`Outcomes`]
-    /// ([`DatadogTraceOutput::post`]).
-    ///
-    /// Requests are numbered `0, 1, 2, …` in send order across the two routes, one per
-    /// `split_encode` chunk, and a request the Agent settled for this batch (accepted or rejected)
-    /// is encoded again but not resent. The number names the same request on every attempt only
-    /// because each route's cuts are a pure function of the batch: anything that makes them
-    /// depend on per-attempt state breaks the memory.
-    ///
-    /// Under `at_most_once` an `Ambiguous` stop on the trace route drops the batch before the
-    /// stats route was ever reached, on this attempt or an earlier one, so every stats group in
-    /// the batch is counted `records.dropped{reason="ambiguous_at_most_once"}` beside the trace
-    /// route's own count. That count is an upper bound: it includes a group its encode would have
-    /// dropped `oversize`.
-    async fn attempt(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
-        let mut outcomes = Outcomes::new(self.accounting.any_accepted());
-        let mut next_request: u32 = 0;
-        if let Err(err) = self.send_traces(batch, &mut outcomes, &mut next_request).await {
-            if self.drops_ambiguous(&err) {
-                self.dropped(Route::Stats, "ambiguous_at_most_once", stats_items(batch).len());
-            }
-            return Err(err);
-        }
-        self.send_stats(batch, &mut outcomes, &mut next_request).await?;
-        outcomes.finish()
-    }
-
-    /// Whether `err` stops the send with a drop the sink counts `ambiguous_at_most_once`: an
-    /// `Ambiguous` fault under `at_most_once`, which `write_loop` doesn't retry.
-    fn drops_ambiguous(&self, err: &anyhow::Error) -> bool {
-        self.accounting.posture() == DeliveryPosture::AtMostOnce
-            && logit_pipeline::classify(err) == Fault::Ambiguous
-    }
-
-    /// One route's requests in order, numbered from `next_request`, each one's result folded into
-    /// `outcomes`, skipping a request the Agent settled on an earlier attempt at the batch. A
-    /// request that is accepted or rejected (`request` counted the rejection) is remembered and
-    /// the route goes on; any other fault stops it with its own class. Under `at_most_once` an
-    /// `Ambiguous` stop counts this request's records and those of the route's unsettled requests
-    /// after it `records.dropped{reason="ambiguous_at_most_once"}`.
-    async fn post(
-        &mut self,
-        route: Route,
-        requests: Vec<(HeaderMap, Encoded<RequestMeta>)>,
-        outcomes: &mut Outcomes,
-        next_request: &mut u32,
-    ) -> anyhow::Result<()> {
-        let mut requests = requests.into_iter();
-        while let Some((headers, encoded)) = requests.next() {
-            let request = *next_request;
-            *next_request += 1;
-            if self.accounting.settled(request) {
-                continue;
-            }
-            let records = encoded.meta.records;
-            let result = self.request(route, headers, encoded).await;
-            let accepted = result.is_ok();
-            if let Err(err) = outcomes.note(result, |_| {}) {
-                if self.drops_ambiguous(&err) {
-                    let mut lost = records;
-                    for (_, rest) in requests {
-                        let request = *next_request;
-                        *next_request += 1;
-                        if !self.accounting.settled(request) {
-                            lost += rest.meta.records;
-                        }
-                    }
-                    self.dropped(route, "ambiguous_at_most_once", lost);
-                }
-                return Err(err);
-            }
-            self.accounting.settle(request, accepted);
-        }
-        Ok(())
-    }
-
-    /// One request (module doc's "Faults, retries, and duplicate safety"). `request.bytes` counts
-    /// a request that may have left: any answer, and any error but a [`Fault::Clean`] one, which
-    /// never connected. A rejection counts the request's records dropped here, `oversize` for a
-    /// `413` and `rejected` for any other 1xx, 3xx, or 4xx; [`DatadogTraceOutput::post`] remembers
-    /// it, so a retry of the batch neither resends nor recounts it.
+    /// One request (module doc's "Faults, retries, and duplicate safety"), every count and
+    /// warning recorded in `journal`. `request.bytes` counts a request that may have left: any
+    /// answer, and any error but a [`Fault::Clean`] one, which never connected. A rejection
+    /// counts the request's records dropped here, `oversize` for a `413` and `rejected` for any
+    /// other 1xx, 3xx, or 4xx; [`post_all`] settles it, so a retry of the batch neither resends
+    /// nor recounts it.
     async fn request(
-        &mut self,
+        &self,
         route: Route,
         protocol: HeaderMap,
         encoded: Encoded<RequestMeta>,
+        journal: &mut Journal,
     ) -> anyhow::Result<()> {
         let path = route.path(self.version);
         let target = self.client.describe(path);
@@ -954,20 +1115,20 @@ impl DatadogTraceOutput {
         let wire_len = encoded.body.len();
         let records = encoded.meta.records;
         let headers = self.request_headers(protocol);
-        let timer = self.telemetry.timer(REQUEST_DURATION);
+        let started = std::time::Instant::now();
         let result = self
             .client
             .send(route.method(), path, headers, encoded.body, self.request_timeout)
             .await;
-        timer.stop(&tags);
+        journal.timing(REQUEST_DURATION, started.elapsed(), &tags);
 
         let reply = match result {
             Ok(reply) => reply,
             Err((fault, err)) => {
                 if fault != Fault::Clean {
-                    self.telemetry.count(REQUEST_BYTES, wire_len as f64, &tags);
+                    journal.count(REQUEST_BYTES, wire_len as f64, &tags);
                 }
-                self.telemetry.count(
+                journal.count(
                     REQUESTS,
                     1.0,
                     &[("route", route.name()), ("class", "network_error")],
@@ -980,15 +1141,11 @@ impl DatadogTraceOutput {
                     .context(fault));
             }
         };
-        self.telemetry.count(REQUEST_BYTES, wire_len as f64, &tags);
+        journal.count(REQUEST_BYTES, wire_len as f64, &tags);
         let status = reply.status;
-        self.telemetry.count(
-            REQUESTS,
-            1.0,
-            &[("route", route.name()), ("class", status_class(status))],
-        );
+        journal.count(REQUESTS, 1.0, &[("route", route.name()), ("class", status_class(status))]);
         if status.is_success() {
-            self.telemetry.count(RECORDS, records as f64, &tags);
+            journal.count(RECORDS, records as f64, &tags);
             return Ok(());
         }
         let snippet = body_snippet(&reply.body, ERROR_BODY_SNIPPET_BYTES);
@@ -997,7 +1154,7 @@ impl DatadogTraceOutput {
             429 => Fault::Clean,
             408 | 500..=599 => Fault::Ambiguous,
             415 => {
-                self.diag.warn_throttled(
+                journal.warn(
                     "request_refused",
                     format_args!(
                         "{target} answered 415: the Agent doesn't take this 'version:''s body: \
@@ -1007,8 +1164,8 @@ impl DatadogTraceOutput {
                 Fault::Refused
             }
             413 => {
-                self.dropped(route, "oversize", records);
-                self.diag.warn_throttled(
+                dropped(journal, route, "oversize", records);
+                journal.warn(
                     "request_rejected",
                     format_args!(
                         "{target} answered 413, request too large, {records} record(s) dropped: \
@@ -1019,15 +1176,15 @@ impl DatadogTraceOutput {
             }
             _ => match crate::http::classify_status(status) {
                 Fault::Refused => {
-                    self.diag.warn_throttled(
+                    journal.warn(
                         "request_refused",
                         format_args!("{target} answered {status}: {snippet}"),
                     );
                     Fault::Refused
                 }
                 _ => {
-                    self.dropped(route, "rejected", records);
-                    self.diag.warn_throttled(
+                    dropped(journal, route, "rejected", records);
+                    journal.warn(
                         "request_rejected",
                         format_args!(
                             "{target} answered {status}, {records} record(s) dropped: {snippet}"
@@ -1048,15 +1205,20 @@ impl DatadogTraceOutput {
 #[async_trait::async_trait]
 impl Output for DatadogTraceOutput {
     /// Arms this sink's batch accounting (`crate::accounting`), which clears the requests the
-    /// Agent settled for the last batch.
-    fn observe_batch(&mut self, _ctx: BatchContext, _seq: SeqId) {
-        self.accounting.observe();
+    /// Agent settled for the last batch, or under a window above 1 the batch's own slot.
+    fn observe_batch(&mut self, _ctx: BatchContext, seq: SeqId) {
+        if self.slots.window() > 1 {
+            self.slots.observe(seq);
+        } else {
+            self.accounting.observe();
+        }
     }
 
     /// Records the posture, which decides whether an `Ambiguous` stop counts
     /// `ambiguous_at_most_once` and is final, disarming the batch accounting.
     fn observe_posture(&mut self, posture: DeliveryPosture) {
         self.accounting.observe_posture(posture);
+        self.slots.observe_posture(posture);
     }
 
     /// Traces, then stats, one request at a time, skipping those the Agent settled on an earlier
@@ -1067,6 +1229,56 @@ impl Output for DatadogTraceOutput {
     async fn send(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
         let result = self.attempt(batch).await;
         self.accounting.finish(result)
+    }
+
+    fn window(&self) -> usize {
+        self.slots.window()
+    }
+
+    fn send_duration_per_batch(&self) -> bool {
+        true
+    }
+
+    fn answered_send_duration(&self) -> Option<Duration> {
+        self.slots.answered()
+    }
+
+    /// Encodes both routes of `batch` into its slot and starts its requests on a task of their
+    /// own.
+    async fn submit(
+        &mut self,
+        batch: &EventBatch,
+        _ctx: BatchContext,
+        seq: SeqId,
+    ) -> anyhow::Result<()> {
+        let (poster, caps, compression) = (self.poster(), self.caps(), self.compression);
+        let encoding = Encoding {
+            caps,
+            compression,
+            version: poster.version,
+            encoder: &mut self.encoder,
+            telemetry: &self.telemetry,
+            diag: &mut self.diag,
+        };
+        self.slots
+            .submit(seq, |accounting| Ok(prepare(poster, encoding, accounting, batch).map(run)))
+    }
+
+    /// The oldest batch's answer, counted and classified as `send` does.
+    async fn await_ack(&mut self) -> anyhow::Result<()> {
+        let (telemetry, diag) = (&self.telemetry, &mut self.diag);
+        self.slots
+            .ack_with(|attempted, accounting| {
+                attempted.journal.replay(telemetry, diag, accounting);
+                attempted.result
+            })
+            .await
+    }
+
+    /// Aborts every request still in flight: the write loop has stopped.
+    async fn flush(&mut self) -> anyhow::Result<()> {
+        self.slots.cancel();
+        Ok(())
     }
 }
 
@@ -2374,5 +2586,138 @@ mod tests {
         let err = out.send(&two_traces()).await.unwrap_err();
         assert_eq!(logit_pipeline::classify(&err), Fault::Ambiguous);
         assert!(total(&registry.drain(0), REQUEST_BYTES, &[("route", "traces")]) > 0.0);
+    }
+}
+
+#[cfg(test)]
+mod concurrency {
+    use super::*;
+    use crate::http::held::{self, Answer, Held, Subject};
+    use logit_core::interner::intern;
+    use logit_core::{AttrMap, Event, MetricKind, MetricRecord, Resource, Value};
+    use logit_proto::datadog::stats::{ATTR_BUCKET_DURATION, ATTR_STATS_NAME, METRIC_HITS};
+
+    const TS: i64 = 1_700_000_000_000_000_000;
+
+    fn make(url: &str, concurrency: u32, telemetry: Telemetry) -> DatadogTraceOutput {
+        DatadogTraceOutput::http(url)
+            .with_timeout(Duration::from_secs(60))
+            .with_concurrency(concurrency)
+            .with_telemetry(telemetry)
+    }
+
+    fn batch_of(events: Vec<Event>) -> EventBatch {
+        EventBatch { resource: Arc::new(Resource::default()), scope: None, events }
+    }
+
+    /// A span named `held::marker(n)` with a map attribute, which the trace codec writes as JSON text
+    /// and counts degraded.
+    fn marked_span(n: u64) -> Event {
+        let mut attributes = AttrMap::new();
+        let map = AttrMap::from_iter([("k", Value::str("v"))]);
+        attributes.insert("nested", Value::Map(Box::new(map)));
+        held::marker_span(TS, n, attributes)
+    }
+
+    /// Batch `n` is one trace of one span (see [`marked_span`]).
+    fn batch(n: u64) -> EventBatch {
+        batch_of(vec![marked_span(n)])
+    }
+
+    fn subject() -> Subject<DatadogTraceOutput> {
+        Subject {
+            kind: "datadog_trace_out",
+            make,
+            batch,
+            id_of: held::id_after_marker,
+            encoded: ("logit.output.spans.degraded", &[("reason", "json_text")]),
+            refuse: held::RESP_401,
+        }
+    }
+
+    #[tokio::test]
+    async fn n_requests_in_flight_answered_out_of_order() {
+        held::n_requests_in_flight_answered_out_of_order(subject()).await;
+    }
+
+    #[tokio::test]
+    async fn a_500_on_one_slot_is_resent_alone() {
+        held::a_500_on_one_slot_is_resent_alone(subject()).await;
+    }
+
+    #[tokio::test]
+    async fn a_400_on_one_slot_is_dropped_alone() {
+        held::a_400_on_one_slot_is_dropped_alone(subject()).await;
+    }
+
+    #[tokio::test]
+    async fn a_401_head_holds_the_fill_at_one_window() {
+        held::a_401_head_holds_the_fill_at_one_window(subject()).await;
+    }
+
+    #[tokio::test]
+    async fn at_most_once_drops_one_ambiguous_slot_alone() {
+        held::at_most_once_drops_one_ambiguous_slot_alone(subject()).await;
+    }
+
+    #[tokio::test]
+    async fn a_grace_cut_aborts_the_requests_in_flight() {
+        held::a_grace_cut_aborts_the_requests_in_flight(subject()).await;
+    }
+
+    #[tokio::test]
+    async fn a_batch_behind_a_retried_head_times_its_own_request() {
+        held::a_batch_behind_a_retried_head_times_its_own_request(subject()).await;
+    }
+
+    /// Batch `n` takes both routes: a trace (see [`marked_span`]) and a stats group named
+    /// `held::marker(n)`.
+    fn both_routes(n: u64) -> EventBatch {
+        let mut attrs = AttrMap::new();
+        attrs.insert(ATTR_STATS_NAME, Value::str(held::marker(n)));
+        attrs.insert(ATTR_BUCKET_DURATION, Value::U64(10_000_000_000));
+        let hits = MetricRecord::new(intern(METRIC_HITS), MetricKind::counter(4.0));
+        batch_of(vec![marked_span(n), Event::metric(TS, attrs, hits)])
+    }
+
+    /// Batch 1's traces are accepted and its stats answered `500` while batch 2 is held in
+    /// another slot: the head's resubmit sends stats alone. Both batches are held at once
+    /// first, so a window of one can't pass.
+    #[tokio::test]
+    async fn a_resubmitted_head_skips_its_accepted_traces_with_another_slot_in_flight() {
+        let held = Held::start_by_path(held::id_after_marker, |batch, path, earlier| {
+            match (batch, path, earlier) {
+                (2, _, 0) => Answer::Hold,
+                (1, "/v0.6/stats", 1) => Answer::Hold,
+                _ => Answer::Now(held::RESP_204),
+            }
+        })
+        .await;
+        let subject = Subject { batch: both_routes, ..subject() };
+        let (mut output, mut probe, telemetry) = held::sink(&subject, &held, 2);
+        let control = async {
+            logit_pipeline::test_util::wait_until("both batches held", || held.held() == 2).await;
+            held.release(1, held::RESP_500);
+            logit_pipeline::test_util::wait_until("batch 1 resent behind a held batch 2", || {
+                held.paths(1).len() >= 3 && held.held() == 1
+            })
+            .await;
+            held.release(2, held::RESP_204);
+        };
+        let (totals, _) = held::run(
+            &mut output,
+            &mut probe,
+            telemetry,
+            vec![both_routes(1), both_routes(2)],
+            DeliveryPosture::AtLeastOnce,
+            std::future::pending(),
+            control,
+        )
+        .await;
+        assert_eq!(held.paths(1), ["/v0.4/traces", "/v0.6/stats", "/v0.6/stats"]);
+        assert_eq!(held.paths(2), ["/v0.4/traces", "/v0.6/stats"]);
+        assert_eq!(held::delivered(&totals), 2.0);
+        let degraded = [("reason", "json_text")];
+        assert_eq!(totals.sum("logit.output.spans.degraded", &degraded), 2.0, "once per batch");
     }
 }

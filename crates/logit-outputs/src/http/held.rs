@@ -1,11 +1,15 @@
 //! Test support for [`super::Slots`]: [`Held`], an HTTP receiver that answers each request as a
-//! script says, now or when the test releases it, and the scenarios each single-request sink on
-//! the slot helper runs through the real write loop.
+//! script says, now or when the test releases it, and the scenarios each sink on the slot helper
+//! runs through the real write loop. A sink that sends a batch as several requests runs them on
+//! batches that each send one.
 //!
 //! Each request gets its own connection (`Connection: close`) and its own task, so a held request
 //! never delays another, and a request whose client goes away while it's held is marked closed.
 
-use logit_core::{EventBatch, Telemetry};
+use logit_core::{
+    AttrMap, BodyFormat, Event, EventBatch, LogRecord, SpanKind, SpanRecord, SpanStatus, Telemetry,
+    Value,
+};
 use logit_pipeline::test_util::{drive_write_loop_until, wait_until, TelemetryProbe, Totals};
 use logit_pipeline::{DeliveryPosture, Output, RetryConfig, WriteLoopConfig};
 use std::sync::{Arc, Mutex};
@@ -17,6 +21,8 @@ pub(crate) const RESP_400: &str =
     "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 pub(crate) const RESP_401: &str =
     "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+pub(crate) const RESP_405: &str =
+    "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 pub(crate) const RESP_500: &str =
     "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 
@@ -29,12 +35,15 @@ pub(crate) enum Answer {
 
 struct Arrival {
     batch: u64,
+    /// The request target's path.
+    path: String,
+    body: Vec<u8>,
     reply: Option<tokio::sync::oneshot::Sender<&'static str>>,
     /// The client closed the connection before an answer was written.
     closed: bool,
 }
 
-type Script = dyn Fn(u64, usize) -> Answer + Send + Sync;
+type Script = dyn Fn(u64, &str, usize) -> Answer + Send + Sync;
 
 pub(crate) struct Held {
     url: String,
@@ -46,6 +55,14 @@ impl Held {
     pub(crate) async fn start(
         id_of: fn(&[u8]) -> u64,
         script: impl Fn(u64, usize) -> Answer + Send + Sync + 'static,
+    ) -> Self {
+        Self::start_by_path(id_of, move |batch, _, earlier| script(batch, earlier)).await
+    }
+
+    /// [`Held::start`], whose script also reads the request's path.
+    pub(crate) async fn start_by_path(
+        id_of: fn(&[u8]) -> u64,
+        script: impl Fn(u64, &str, usize) -> Answer + Send + Sync + 'static,
     ) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -69,6 +86,18 @@ impl Held {
     /// Every request's batch, in arrival order.
     pub(crate) fn batches(&self) -> Vec<u64> {
         self.arrivals.lock().unwrap().iter().map(|a| a.batch).collect()
+    }
+
+    /// The bodies of `batch`'s requests, in arrival order.
+    pub(crate) fn bodies(&self, batch: u64) -> Vec<Vec<u8>> {
+        let arrivals = self.arrivals.lock().unwrap();
+        arrivals.iter().filter(|a| a.batch == batch).map(|a| a.body.clone()).collect()
+    }
+
+    /// The paths of `batch`'s requests, in arrival order.
+    pub(crate) fn paths(&self, batch: u64) -> Vec<String> {
+        let arrivals = self.arrivals.lock().unwrap();
+        arrivals.iter().filter(|a| a.batch == batch).map(|a| a.path.clone()).collect()
     }
 
     /// Requests waiting for [`Held::release`].
@@ -98,15 +127,15 @@ async fn serve(
     script: Arc<Script>,
     id_of: fn(&[u8]) -> u64,
 ) {
-    let Some(body) = read_request(&mut stream).await else { return };
+    let Some((path, body)) = read_request(&mut stream).await else { return };
     let batch = id_of(&body);
     let (tx, rx) = tokio::sync::oneshot::channel();
     let (index, answer) = {
         let mut arrivals = arrivals.lock().unwrap();
         let earlier = arrivals.iter().filter(|a| a.batch == batch).count();
-        let answer = script(batch, earlier);
+        let answer = script(batch, &path, earlier);
         let reply = matches!(answer, Answer::Hold).then_some(tx);
-        arrivals.push(Arrival { batch, reply, closed: false });
+        arrivals.push(Arrival { batch, path, body, reply, closed: false });
         (arrivals.len() - 1, answer)
     };
     let response = match answer {
@@ -129,8 +158,8 @@ async fn serve(
     let _ = stream.shutdown().await;
 }
 
-/// One request's body, read by its `Content-Length`.
-async fn read_request(stream: &mut tokio::net::TcpStream) -> Option<Vec<u8>> {
+/// One request's path and body, the body read by its `Content-Length`.
+async fn read_request(stream: &mut tokio::net::TcpStream) -> Option<(String, Vec<u8>)> {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 8192];
     let head_end = loop {
@@ -144,6 +173,7 @@ async fn read_request(stream: &mut tokio::net::TcpStream) -> Option<Vec<u8>> {
         buf.extend_from_slice(&chunk[..n]);
     };
     let head = String::from_utf8_lossy(&buf[..head_end]).to_ascii_lowercase();
+    let path = head.split(' ').nth(1).unwrap_or_default().to_string();
     let length: usize = head
         .lines()
         .find_map(|line| line.strip_prefix("content-length:"))
@@ -156,7 +186,67 @@ async fn read_request(stream: &mut tokio::net::TcpStream) -> Option<Vec<u8>> {
         }
         buf.extend_from_slice(&chunk[..n]);
     }
-    Some(buf[head_end..head_end + length].to_vec())
+    Some((path, buf[head_end..head_end + length].to_vec()))
+}
+
+/// The batch number a body carries as [`marker`]`(n)`, as each multi-request sink's test batches
+/// write it into a log message, a span name, or a metric name.
+pub(crate) fn id_after_marker(body: &[u8]) -> u64 {
+    const MARKER: &[u8] = b"batch-";
+    let at = body
+        .windows(MARKER.len())
+        .position(|w| w == MARKER)
+        .unwrap_or_else(|| panic!("no batch marker in {:?}", String::from_utf8_lossy(body)));
+    let digits: String = body[at + MARKER.len()..]
+        .iter()
+        .take_while(|b| b.is_ascii_digit())
+        .map(|&b| char::from(b))
+        .collect();
+    digits.parse().expect("a batch number after the marker")
+}
+
+/// `batch-<n>.`, the marker [`id_after_marker`] reads. The `.` ends the number, since a
+/// protobuf body's next byte can be an ASCII digit.
+pub(crate) fn marker(n: u64) -> String {
+    format!("batch-{n}.")
+}
+
+/// A log whose message is [`marker`]`(n)`.
+pub(crate) fn marker_log(timestamp: i64, n: u64) -> Event {
+    Event::log(
+        timestamp,
+        AttrMap::new(),
+        LogRecord {
+            message: Value::str(marker(n)),
+            severity: None,
+            body_format: BodyFormat::Raw,
+            trace: None,
+            event_name: None,
+            observed_timestamp: 0,
+            dropped_attributes_count: 0,
+        },
+    )
+}
+
+/// A span named [`marker`]`(n)`, carrying `attributes`.
+pub(crate) fn marker_span(timestamp: i64, n: u64, attributes: AttrMap) -> Event {
+    Event::span(
+        timestamp,
+        attributes,
+        SpanRecord {
+            trace_id: [1; 16],
+            span_id: [n as u8; 8],
+            parent_span_id: None,
+            name: Value::str(marker(n)),
+            kind: SpanKind::Internal,
+            status: SpanStatus::Unset,
+            events: Vec::new(),
+            links: Vec::new(),
+            end_timestamp: timestamp + 1_000,
+            flags: 0,
+            ext: None,
+        },
+    )
 }
 
 /// A sink on the slot helper, as each scenario builds and feeds it.
@@ -170,6 +260,8 @@ pub(crate) struct Subject<O> {
     pub id_of: fn(&[u8]) -> u64,
     /// An encode-side counter each batch counts once.
     pub encoded: (&'static str, &'static [(&'static str, &'static str)]),
+    /// A response the sink reads as `Refused` ([`RESP_401`] on most).
+    pub refuse: &'static str,
 }
 
 fn config(posture: DeliveryPosture) -> WriteLoopConfig {
@@ -186,7 +278,7 @@ fn config(posture: DeliveryPosture) -> WriteLoopConfig {
 
 /// Runs `batches` through `write_loop` beside `control`, signalling shutdown once `stop`
 /// resolves. Returns the sink's totals and the grace cut's drops, with the sink still alive.
-async fn run<O: Output + Send>(
+pub(crate) async fn run<O: Output + Send>(
     output: &mut O,
     probe: &mut TelemetryProbe,
     telemetry: Telemetry,
@@ -202,13 +294,17 @@ async fn run<O: Output + Send>(
     (probe.poll().clone(), dropped)
 }
 
-fn sink<O>(subject: &Subject<O>, held: &Held, concurrency: u32) -> (O, TelemetryProbe, Telemetry) {
+pub(crate) fn sink<O>(
+    subject: &Subject<O>,
+    held: &Held,
+    concurrency: u32,
+) -> (O, TelemetryProbe, Telemetry) {
     let probe = TelemetryProbe::new();
     let telemetry = probe.telemetry("out", subject.kind, "sink");
     ((subject.make)(held.url(), concurrency, telemetry.clone()), probe, telemetry)
 }
 
-fn delivered(totals: &Totals) -> f64 {
+pub(crate) fn delivered(totals: &Totals) -> f64 {
     totals.sum("logit.component.batches.delivered", &[])
 }
 
@@ -308,11 +404,13 @@ pub(crate) async fn a_400_on_one_slot_is_dropped_alone<O: Output + Send>(subject
     assert_eq!(delivered(&totals), 3.0);
 }
 
-/// A head the receiver refuses (`401`) three times holds the fill at one window: only the two
-/// batches the window holds reach the receiver until the head is answered `204`.
+/// A head the receiver refuses (`401`, or the subject's `refuse`) three times holds the fill at
+/// one window: only the two batches the window holds reach the receiver until the head is
+/// answered `204`.
 pub(crate) async fn a_401_head_holds_the_fill_at_one_window<O: Output + Send>(subject: Subject<O>) {
-    let held = Held::start(subject.id_of, |batch, earlier| match (batch, earlier) {
-        (1, 0..=2) => Answer::Now(RESP_401),
+    let refuse = subject.refuse;
+    let held = Held::start(subject.id_of, move |batch, earlier| match (batch, earlier) {
+        (1, 0..=2) => Answer::Now(refuse),
         _ => Answer::Now(RESP_204),
     })
     .await;

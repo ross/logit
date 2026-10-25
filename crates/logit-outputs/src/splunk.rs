@@ -151,7 +151,7 @@
 use crate::accounting::BatchAccounting;
 use crate::http::{
     after_delivery, build_client, classify_reqwest_error, error_read_bytes, read_body_prefix,
-    redacted_snippet, status_class,
+    redacted_snippet, status_class, Journal, Slots,
 };
 /// `tls:`: the shared `crate::tls` type, re-exported as the other sinks do.
 pub use crate::tls::TlsClientSettings;
@@ -386,8 +386,11 @@ pub struct SplunkHecOutput {
     diag: Diagnostics,
     telemetry: Telemetry,
     accounting: BatchAccounting,
-    /// The operator's `concurrency:`, which the HTTP slot helper reads as this sink's window.
-    concurrency: u32,
+    /// The batches in flight above a concurrency of 1, each with its own accounting over
+    /// `accounting`'s gate and its own object buffer (the module doc's "Concurrency").
+    slots: Slots<Attempted>,
+    /// Object buffers back from answered slots, for the next batches' encodes.
+    spare: Vec<MessageBuf<ObjectMeta>>,
 }
 
 impl SplunkHecOutput {
@@ -403,8 +406,10 @@ impl SplunkHecOutput {
             })?;
         authorization.set_sensitive(true);
         let endpoint = endpoint.into().trim_end_matches('/').to_string();
+        let accounting = BatchAccounting::default();
         let mut output = Self {
-            concurrency: 1,
+            slots: Slots::new(accounting.gate().clone()),
+            spare: Vec::new(),
             endpoint,
             token: token.to_string(),
             authorization,
@@ -423,7 +428,7 @@ impl SplunkHecOutput {
             objects: MessageBuf::default(),
             diag: Diagnostics::default(),
             telemetry: Telemetry::default(),
-            accounting: BatchAccounting::default(),
+            accounting,
         };
         output.encoder = output.new_encoder();
         Ok(output)
@@ -458,7 +463,7 @@ impl SplunkHecOutput {
 
     /// Sets how many batches may be in flight at once (`concurrency:` in config, default 1).
     pub fn with_concurrency(mut self, concurrency: u32) -> Self {
-        self.concurrency = concurrency;
+        self.slots.set_concurrency(concurrency);
         self
     }
 
@@ -514,6 +519,7 @@ impl SplunkHecOutput {
     }
 
     pub fn with_telemetry(mut self, telemetry: Telemetry) -> Self {
+        self.slots.set_telemetry(telemetry.clone());
         self.telemetry = telemetry;
         self.encoder = self.new_encoder();
         self
@@ -537,6 +543,125 @@ impl SplunkHecOutput {
         self.client.get_or_insert_with(|| build_client(timeout, tls)).clone()
     }
 
+    /// What one attempt's requests need from this sink, owned so they can run in a task of their
+    /// own: the client is a handle on the sink's own pool.
+    fn poster(&mut self) -> Poster {
+        Poster {
+            client: self.client(),
+            endpoint: self.endpoint.clone(),
+            token: self.token.clone(),
+            authorization: self.authorization.clone(),
+            channel: self.channel.clone(),
+            compression: self.compression,
+            ack: self.ack,
+            ack_timeout: self.ack_timeout,
+            ack_backoff: self.ack_backoff,
+            request_timeout: self.request_timeout,
+            max_body_bytes: self.max_body_bytes,
+        }
+    }
+
+    /// One attempt at a concurrency of 1: [`encode`], [`run`], and the journal's replay. The
+    /// object buffer is the sink's, reused across batches.
+    async fn attempt(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
+        let poster = self.poster();
+        let mut objects = std::mem::take(&mut self.objects);
+        let encoding = Encoding {
+            encoder: &mut self.encoder,
+            telemetry: &self.telemetry,
+            diag: &mut self.diag,
+            max_body_bytes: self.max_body_bytes,
+        };
+        encoding.encode(&mut self.accounting, batch, &mut objects);
+        let attempted = run(Attempt { poster, objects }).await;
+        self.objects = attempted.objects;
+        attempted.journal.replay(&self.telemetry, &mut self.diag, &mut self.accounting);
+        attempted.result
+    }
+}
+
+/// One attempt's encode, on the loop task: the sink's encoder and ungated handles.
+struct Encoding<'a> {
+    encoder: &'a mut SplunkEncoder,
+    telemetry: &'a Telemetry,
+    diag: &'a mut Diagnostics,
+    max_body_bytes: usize,
+}
+
+impl Encoding<'_> {
+    /// The batch's objects into `objects`, unit 0 of `accounting`. The `max_body_bytes` drop is
+    /// decided before the first request, so it is encode-side: counted and diagnosed only on the
+    /// batch's first encode.
+    fn encode(
+        self,
+        accounting: &mut BatchAccounting,
+        batch: &EventBatch,
+        objects: &mut MessageBuf<ObjectMeta>,
+    ) {
+        let encoder = self.encoder;
+        let (first, ()) = accounting.encode(0, || encoder.encode_objects(batch, objects));
+        if !first {
+            return;
+        }
+        for (bytes, meta) in objects.iter_with() {
+            if bytes.len() <= self.max_body_bytes {
+                continue;
+            }
+            self.telemetry.count(RECORDS_DROPPED, meta.records as f64, &[("reason", "oversize")]);
+            self.diag.warn_throttled(
+                "oversize",
+                format_args!(
+                    "dropped one HEC object of {} bytes, over 'max_body_bytes' ({})",
+                    bytes.len(),
+                    self.max_body_bytes
+                ),
+            );
+        }
+    }
+}
+
+/// One attempt at a batch: its encoded objects, and what its requests need.
+struct Attempt {
+    poster: Poster,
+    objects: MessageBuf<ObjectMeta>,
+}
+
+/// What [`run`] did: the attempt's result, every count and warning it recorded, and the object
+/// buffer, for reuse.
+struct Attempted {
+    journal: Journal,
+    result: anyhow::Result<()>,
+    objects: MessageBuf<ObjectMeta>,
+}
+
+/// Every body of the attempt sequentially, then acknowledgment; the first failure aborts the rest
+/// (module doc's "Faults, retries, and duplicate safety"). Touches nothing of the sink's, so it
+/// runs in a slot's task or inline in `send`: every effect goes to the returned journal.
+async fn run(attempt: Attempt) -> Attempted {
+    let Attempt { poster, objects } = attempt;
+    let mut journal = Journal::default();
+    let result = poster.send_objects(&objects, &mut journal).await;
+    Attempted { journal, result, objects }
+}
+
+/// Everything a batch's requests need, cloned from the sink.
+struct Poster {
+    client: reqwest::Client,
+    /// The base URL, trailing `/` dropped.
+    endpoint: String,
+    /// The bare token, only for scrubbing it from quoted response bodies.
+    token: String,
+    authorization: HeaderValue,
+    channel: HeaderValue,
+    compression: SplunkCompression,
+    ack: bool,
+    ack_timeout: Duration,
+    ack_backoff: [Duration; 4],
+    request_timeout: Duration,
+    max_body_bytes: usize,
+}
+
+impl Poster {
     fn headers(&self, gzipped: bool) -> HeaderMap {
         let mut headers = HeaderMap::with_capacity(5);
         headers.insert(http::header::AUTHORIZATION, self.authorization.clone());
@@ -553,41 +678,38 @@ impl SplunkHecOutput {
     /// counted and returned with its [`Fault`]. `request.bytes` counts a request that may have
     /// left: any answer, and any error but a [`Fault::Clean`] one, which never connected.
     async fn post(
-        &mut self,
+        &self,
         route: &'static str,
         url: &str,
         body: Bytes,
         gzipped: bool,
+        journal: &mut Journal,
     ) -> anyhow::Result<reqwest::Response> {
-        let client = self.client();
         let tags = [("route", route)];
         let wire_len = body.len();
-        let timer = self.telemetry.timer(REQUEST_DURATION);
-        let result = client
+        let started = std::time::Instant::now();
+        let result = self
+            .client
             .post(url)
             .headers(self.headers(gzipped))
             .timeout(self.request_timeout)
             .body(body)
             .send()
             .await;
-        timer.stop(&tags);
+        journal.timing(REQUEST_DURATION, started.elapsed(), &tags);
         match result {
             Ok(response) => {
-                self.telemetry.count(REQUEST_BYTES, wire_len as f64, &tags);
+                journal.count(REQUEST_BYTES, wire_len as f64, &tags);
                 let class = status_class(response.status());
-                self.telemetry.count(REQUESTS, 1.0, &[("route", route), ("class", class)]);
+                journal.count(REQUESTS, 1.0, &[("route", route), ("class", class)]);
                 Ok(response)
             }
             Err(err) => {
                 let fault = classify_reqwest_error(&err);
                 if fault != Fault::Clean {
-                    self.telemetry.count(REQUEST_BYTES, wire_len as f64, &tags);
+                    journal.count(REQUEST_BYTES, wire_len as f64, &tags);
                 }
-                self.telemetry.count(
-                    REQUESTS,
-                    1.0,
-                    &[("route", route), ("class", "network_error")],
-                );
+                journal.count(REQUESTS, 1.0, &[("route", route), ("class", "network_error")]);
                 Err(anyhow::Error::new(err).context(fault))
             }
         }
@@ -595,16 +717,20 @@ impl SplunkHecOutput {
 
     /// One `/event` request for `objects` (module doc's "Faults" table). A per-object code
     /// ([`OBJECT_CODES`]) naming an object is returned for the caller to act on; every other non-2xx is an error.
-    async fn post_event(&mut self, objects: &[Object<'_>]) -> anyhow::Result<EventReply> {
+    async fn post_event(
+        &self,
+        objects: &[Object<'_>],
+        journal: &mut Journal,
+    ) -> anyhow::Result<EventReply> {
         let raw: Vec<u8> = objects.iter().flat_map(|(bytes, _)| bytes.iter().copied()).collect();
         let gzipped = self.compression == SplunkCompression::Gzip;
         let body = if gzipped { gzip(&raw) } else { Bytes::from(raw) };
         let url = format!("{}/event", self.endpoint);
-        let response = self.post(ROUTE_EVENT, &url, body, gzipped).await?;
+        let response = self.post(ROUTE_EVENT, &url, body, gzipped, journal).await?;
         let status = response.status();
         if status.is_success() {
             let records: usize = objects.iter().map(|(_, records)| records).sum();
-            self.telemetry.count(RECORDS, records as f64, &[]);
+            journal.count(RECORDS, records as f64, &[]);
             let ack_id = if self.ack {
                 let body = read_body_prefix(response, REPLY_READ_BYTES).await;
                 parse_reply(body.as_bytes()).and_then(|reply| reply.ack_id)
@@ -621,7 +747,7 @@ impl SplunkHecOutput {
             code if is_busy(code, reply.as_ref()) => Fault::Clean,
             408 | 500..=599 => Fault::Ambiguous,
             code => {
-                self.telemetry.count(REQUESTS_REJECTED, 1.0, &[("code", code_tag(reply.as_ref()))]);
+                journal.count(REQUESTS_REJECTED, 1.0, &[("code", code_tag(reply.as_ref()))]);
                 let hec = reply.as_ref().map(|reply| reply.code);
                 if let (400, Some(HecReply { code, invalid_event_number: Some(n), .. })) =
                     (code, &reply)
@@ -631,7 +757,7 @@ impl SplunkHecOutput {
                     }
                 }
                 if matches!(code, 401 | 403) || hec.is_some_and(|c| TOKEN_CODES.contains(&c)) {
-                    self.diag.warn_throttled(
+                    journal.warn(
                         "token_rejected",
                         format_args!(
                             "Splunk refused the token: {url} answered {status}: {snippet} -- \
@@ -640,7 +766,7 @@ impl SplunkHecOutput {
                     );
                     Fault::Refused
                 } else if hec.is_some_and(|c| REQUEST_CODES.contains(&c)) {
-                    self.diag.warn_throttled(
+                    journal.warn(
                         "request_refused",
                         format_args!(
                             "Splunk refused every request of this sink: {url} answered {status}: \
@@ -649,7 +775,7 @@ impl SplunkHecOutput {
                     );
                     Fault::Refused
                 } else {
-                    self.diag.warn_throttled(
+                    journal.warn(
                         "request_rejected",
                         format_args!("{url} answered {status}: {snippet}"),
                     );
@@ -663,39 +789,31 @@ impl SplunkHecOutput {
 
     /// Keeps a 2xx's `ackId` under `ack: true`; a 2xx without one means the token doesn't
     /// acknowledge (module doc's "Acknowledgment").
-    fn keep_ack_id(&mut self, ack_id: Option<u64>, ack_ids: &mut Vec<u64>) {
+    fn keep_ack_id(&self, ack_id: Option<u64>, ack_ids: &mut Vec<u64>, journal: &mut Journal) {
         if !self.ack {
             return;
         }
         match ack_id {
             Some(id) => ack_ids.push(id),
-            None => self.ack_unsupported(1, "a 2xx answer carried no ackId"),
+            None => ack_unsupported(journal, 1, "a 2xx answer carried no ackId"),
         }
-    }
-
-    fn ack_unsupported(&mut self, requests: usize, why: &str) {
-        self.telemetry.count(ACKS, requests as f64, &[("result", "unsupported")]);
-        self.diag.warn_throttled(
-            "ack_unsupported",
-            format_args!(
-                "'ack' is on, but {why}: the token doesn't acknowledge (indexer acknowledgment \
-                 is off for it), so each accepted request counts as delivered"
-            ),
-        );
     }
 
     /// One body, split in two when Splunk Cloud answers it as over its cap, and each half's
     /// per-object resend (module doc's "Faults" table). `sent_any` says whether an earlier request of
     /// this `send` was accepted, and is set once one of these is.
     async fn send_body(
-        &mut self,
+        &self,
         objects: &[Object<'_>],
         ack_ids: &mut Vec<u64>,
         sent_any: &mut bool,
+        journal: &mut Journal,
     ) -> anyhow::Result<()> {
-        if self.send_once(objects, ack_ids, sent_any, true).await? == BodyOutcome::OverCloudCap {
+        if self.send_once(objects, ack_ids, sent_any, true, journal).await?
+            == BodyOutcome::OverCloudCap
+        {
             let mid = split_point(objects);
-            self.diag.warn_throttled(
+            journal.warn(
                 "oversize",
                 format_args!(
                     "Splunk refused a request of {} bytes as invalid (code 6) at object 0, its \
@@ -706,7 +824,7 @@ impl SplunkHecOutput {
                 ),
             );
             for half in [&objects[..mid], &objects[mid..]] {
-                self.send_once(half, ack_ids, sent_any, false).await?;
+                self.send_once(half, ack_ids, sent_any, false, journal).await?;
             }
         }
         Ok(())
@@ -718,23 +836,27 @@ impl SplunkHecOutput {
     /// object is dropped as `oversize`; several are [`BodyOutcome::OverCloudCap`] for the caller
     /// to split when `may_split`, and [`Fault::Rejected`] otherwise.
     async fn send_once(
-        &mut self,
+        &self,
         objects: &[Object<'_>],
         ack_ids: &mut Vec<u64>,
         sent_any: &mut bool,
         may_split: bool,
+        journal: &mut Journal,
     ) -> anyhow::Result<BodyOutcome> {
-        let reply = self.post_event(objects).await.map_err(|err| after_delivery(err, *sent_any))?;
+        let reply = self
+            .post_event(objects, journal)
+            .await
+            .map_err(|err| after_delivery(err, *sent_any))?;
         let (n, code) = match reply {
             EventReply::Accepted { ack_id } => {
                 *sent_any = true;
-                self.keep_ack_id(ack_id, ack_ids);
+                self.keep_ack_id(ack_id, ack_ids, journal);
                 return Ok(BodyOutcome::Done);
             }
             EventReply::InvalidEvent { n, code } => (n, code),
         };
         if code == 6 && n == 0 && body_len(objects) > SPLUNK_CLOUD_BODY_CAP {
-            return self.over_cloud_cap(objects, may_split);
+            return over_cloud_cap(objects, may_split, journal);
         }
         let Some((bad, rest)) = after_invalid_event(objects.len(), code, n) else {
             let message = format!(
@@ -742,17 +864,17 @@ impl SplunkHecOutput {
                  {n}, which isn't one of them",
                 objects.len()
             );
-            self.diag.warn_throttled("request_rejected", &message);
+            journal.warn("request_rejected", &message);
             return Err(anyhow::anyhow!("splunk_hec_out: {message}"))
                 .map_err(|err| err.context(Fault::Rejected));
         };
         // The objects ahead of `bad` count as indexed (`after_invalid_event`'s rule).
         *sent_any |= bad > 0;
         let ahead: usize = objects[..bad].iter().map(|(_, records)| records).sum();
-        self.telemetry.count(RECORDS, ahead as f64, &[]);
+        journal.count(RECORDS, ahead as f64, &[]);
         let dropped = objects[bad].1;
-        self.telemetry.count(RECORDS_DROPPED, dropped as f64, &[("reason", "invalid_event")]);
-        self.diag.warn_throttled(
+        journal.count(RECORDS_DROPPED, dropped as f64, &[("reason", "invalid_event")]);
+        journal.warn(
             "invalid_event",
             format_args!(
                 "Splunk rejected object {bad} of a request as invalid (code {code}); dropped it \
@@ -763,12 +885,14 @@ impl SplunkHecOutput {
         if rest.is_empty() {
             return Ok(BodyOutcome::Done);
         }
-        let reply =
-            self.post_event(&objects[rest]).await.map_err(|err| after_delivery(err, *sent_any))?;
+        let reply = self
+            .post_event(&objects[rest], journal)
+            .await
+            .map_err(|err| after_delivery(err, *sent_any))?;
         match reply {
             EventReply::Accepted { ack_id } => {
                 *sent_any = true;
-                self.keep_ack_id(ack_id, ack_ids);
+                self.keep_ack_id(ack_id, ack_ids, journal);
                 Ok(BodyOutcome::Done)
             }
             EventReply::InvalidEvent { n, code } => Err(anyhow::anyhow!(
@@ -779,44 +903,10 @@ impl SplunkHecOutput {
         }
     }
 
-    /// Splunk Cloud's oversize answer to `objects` (`send_once`).
-    fn over_cloud_cap(
-        &mut self,
-        objects: &[Object<'_>],
-        may_split: bool,
-    ) -> anyhow::Result<BodyOutcome> {
-        let bytes = body_len(objects);
-        if let [(_, records)] = objects {
-            self.telemetry.count(RECORDS_DROPPED, *records as f64, &[("reason", "oversize")]);
-            self.diag.warn_throttled(
-                "oversize",
-                format_args!(
-                    "Splunk refused one HEC object of {bytes} bytes as invalid (code 6), its \
-                     answer to a body over Splunk Cloud's {SPLUNK_CLOUD_BODY_CAP}-byte cap; \
-                     dropped it"
-                ),
-            );
-            return Ok(BodyOutcome::Done);
-        }
-        if may_split {
-            return Ok(BodyOutcome::OverCloudCap);
-        }
-        let message = format!(
-            "Splunk refused half of a split request, {bytes} bytes in {} objects, as invalid \
-             (code 6) at object 0, its answer to a body over Splunk Cloud's \
-             {SPLUNK_CLOUD_BODY_CAP}-byte cap -- lower 'max_body_bytes' to \
-             {SPLUNK_CLOUD_BODY_CAP} or less",
-            objects.len()
-        );
-        self.diag.warn_throttled("oversize", &message);
-        Err(anyhow::anyhow!("splunk_hec_out: {message}"))
-            .map_err(|err| err.context(Fault::Rejected))
-    }
-
     /// One `/ack` poll for `pending`.
-    async fn poll(&mut self, url: &str, pending: &[u64]) -> AckPoll {
+    async fn poll(&self, url: &str, pending: &[u64], journal: &mut Journal) -> AckPoll {
         let body = Bytes::from(encode_ack_request(pending));
-        let Ok(response) = self.post(ROUTE_ACK, url, body, false).await else {
+        let Ok(response) = self.post(ROUTE_ACK, url, body, false, journal).await else {
             return AckPoll::Retry;
         };
         let status = response.status();
@@ -832,23 +922,24 @@ impl SplunkHecOutput {
 
     /// Polls `/ack` until every id is acknowledged or `ack_timeout` passes (module doc's
     /// "Acknowledgment").
-    async fn await_acks(&mut self, mut pending: Vec<u64>) -> anyhow::Result<()> {
+    async fn await_acks(&self, mut pending: Vec<u64>, journal: &mut Journal) -> anyhow::Result<()> {
         let deadline = tokio::time::Instant::now() + self.ack_timeout;
         let url = format!("{}/ack", self.endpoint);
         for step in 0.. {
             let wait = self.ack_backoff[usize::min(step, self.ack_backoff.len() - 1)];
             tokio::time::sleep_until((tokio::time::Instant::now() + wait).min(deadline)).await;
-            match self.poll(&url, &pending).await {
+            match self.poll(&url, &pending, journal).await {
                 AckPoll::Answered(answers) => {
                     let before = pending.len();
                     pending.retain(|id| !answers.contains(&(*id, true)));
                     let acked = before - pending.len();
                     if acked > 0 {
-                        self.telemetry.count(ACKS, acked as f64, &[("result", "acked")]);
+                        journal.count(ACKS, acked as f64, &[("result", "acked")]);
                     }
                 }
                 AckPoll::Unsupported => {
-                    self.ack_unsupported(
+                    ack_unsupported(
+                        journal,
                         pending.len(),
                         "Splunk answered the poll 'ACK is disabled'",
                     );
@@ -863,8 +954,8 @@ impl SplunkHecOutput {
                 break;
             }
         }
-        self.telemetry.count(ACKS, pending.len() as f64, &[("result", "timeout")]);
-        self.diag.warn_throttled(
+        journal.count(ACKS, pending.len() as f64, &[("result", "timeout")]);
+        journal.warn(
             "ack_timeout",
             format_args!(
                 "Splunk hadn't acknowledged {} request(s) after {:?}; the batch may be resent",
@@ -880,54 +971,72 @@ impl SplunkHecOutput {
         .map_err(|err| err.context(Fault::Ambiguous))
     }
 
-    /// Packs `objects` into bodies and sends them (module doc's "Requests"). The `max_body_bytes`
-    /// drop is decided before the first request, so it is encode-side: counted and diagnosed
-    /// only on the batch's `first` encode.
+    /// Packs the objects at or under `max_body_bytes` into bodies and sends them, then polls for
+    /// their acknowledgment (module doc's "Requests"). `sent_any` is this attempt's own: a
+    /// `Clean` answer reads it to know whether Splunk holds part of the batch.
     async fn send_objects(
-        &mut self,
+        &self,
         objects: &MessageBuf<ObjectMeta>,
-        first: bool,
+        journal: &mut Journal,
     ) -> anyhow::Result<()> {
-        let mut sendable: Vec<Object<'_>> = Vec::with_capacity(objects.len());
-        for (bytes, meta) in objects.iter_with() {
-            if bytes.len() <= self.max_body_bytes {
-                sendable.push((bytes, meta.records));
-                continue;
-            }
-            if !first {
-                continue;
-            }
-            self.telemetry.count(RECORDS_DROPPED, meta.records as f64, &[("reason", "oversize")]);
-            self.diag.warn_throttled(
-                "oversize",
-                format_args!(
-                    "dropped one HEC object of {} bytes, over 'max_body_bytes' ({})",
-                    bytes.len(),
-                    self.max_body_bytes
-                ),
-            );
-        }
+        let sendable: Vec<Object<'_>> = objects
+            .iter_with()
+            .filter(|(bytes, _)| bytes.len() <= self.max_body_bytes)
+            .map(|(bytes, meta)| (bytes, meta.records))
+            .collect();
         let (mut ack_ids, mut sent_any) = (Vec::new(), false);
         for body in pack(sendable.iter().map(|(bytes, _)| bytes.len()), self.max_body_bytes) {
-            self.send_body(&sendable[body], &mut ack_ids, &mut sent_any).await?;
+            self.send_body(&sendable[body], &mut ack_ids, &mut sent_any, journal).await?;
         }
         if !ack_ids.is_empty() {
-            self.await_acks(ack_ids).await?;
+            self.await_acks(ack_ids, journal).await?;
         }
         Ok(())
     }
+}
 
-    /// Every body sequentially, then acknowledgment; the first failure aborts the rest (module
-    /// doc's "Faults, retries, and duplicate safety"). The encode is unit 0 of the batch
-    /// accounting.
-    async fn attempt(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
-        let mut objects = std::mem::take(&mut self.objects);
-        let (first, ()) =
-            self.accounting.encode(0, || self.encoder.encode_objects(batch, &mut objects));
-        let result = self.send_objects(&objects, first).await;
-        self.objects = objects;
-        result
+/// Splunk Cloud's oversize answer to `objects` ([`Poster::send_once`]).
+fn over_cloud_cap(
+    objects: &[Object<'_>],
+    may_split: bool,
+    journal: &mut Journal,
+) -> anyhow::Result<BodyOutcome> {
+    let bytes = body_len(objects);
+    if let [(_, records)] = objects {
+        journal.count(RECORDS_DROPPED, *records as f64, &[("reason", "oversize")]);
+        journal.warn(
+            "oversize",
+            format_args!(
+                "Splunk refused one HEC object of {bytes} bytes as invalid (code 6), its \
+                 answer to a body over Splunk Cloud's {SPLUNK_CLOUD_BODY_CAP}-byte cap; \
+                 dropped it"
+            ),
+        );
+        return Ok(BodyOutcome::Done);
     }
+    if may_split {
+        return Ok(BodyOutcome::OverCloudCap);
+    }
+    let message = format!(
+        "Splunk refused half of a split request, {bytes} bytes in {} objects, as invalid \
+         (code 6) at object 0, its answer to a body over Splunk Cloud's \
+         {SPLUNK_CLOUD_BODY_CAP}-byte cap -- lower 'max_body_bytes' to \
+         {SPLUNK_CLOUD_BODY_CAP} or less",
+        objects.len()
+    );
+    journal.warn("oversize", &message);
+    Err(anyhow::anyhow!("splunk_hec_out: {message}")).map_err(|err| err.context(Fault::Rejected))
+}
+
+fn ack_unsupported(journal: &mut Journal, requests: usize, why: &str) {
+    journal.count(ACKS, requests as f64, &[("result", "unsupported")]);
+    journal.warn(
+        "ack_unsupported",
+        format_args!(
+            "'ack' is on, but {why}: the token doesn't acknowledge (indexer acknowledgment \
+             is off for it), so each accepted request counts as delivered"
+        ),
+    );
 }
 
 #[async_trait::async_trait]
@@ -938,13 +1047,19 @@ impl Output for SplunkHecOutput {
         Ok(())
     }
 
-    /// Arms this sink's batch accounting (`crate::accounting`).
-    fn observe_batch(&mut self, _ctx: BatchContext, _seq: SeqId) {
-        self.accounting.observe();
+    /// Arms this sink's batch accounting (`crate::accounting`), or under a window above 1 the
+    /// batch's own slot.
+    fn observe_batch(&mut self, _ctx: BatchContext, seq: SeqId) {
+        if self.slots.window() > 1 {
+            self.slots.observe(seq);
+        } else {
+            self.accounting.observe();
+        }
     }
 
     fn observe_posture(&mut self, posture: DeliveryPosture) {
         self.accounting.observe_posture(posture);
+        self.slots.observe_posture(posture);
     }
 
     /// One attempt ([`SplunkHecOutput::attempt`]). A final result (`Ok`, or a fault
@@ -953,6 +1068,59 @@ impl Output for SplunkHecOutput {
     async fn send(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
         let result = self.attempt(batch).await;
         self.accounting.finish(result)
+    }
+
+    fn window(&self) -> usize {
+        self.slots.window()
+    }
+
+    fn send_duration_per_batch(&self) -> bool {
+        true
+    }
+
+    fn answered_send_duration(&self) -> Option<Duration> {
+        self.slots.answered()
+    }
+
+    /// Encodes `batch` into an object buffer of its own and starts its bodies, and their
+    /// acknowledgment under `ack: true`, on a task of their own.
+    async fn submit(
+        &mut self,
+        batch: &EventBatch,
+        _ctx: BatchContext,
+        seq: SeqId,
+    ) -> anyhow::Result<()> {
+        let poster = self.poster();
+        let mut objects = self.spare.pop().unwrap_or_default();
+        let encoding = Encoding {
+            encoder: &mut self.encoder,
+            telemetry: &self.telemetry,
+            diag: &mut self.diag,
+            max_body_bytes: self.max_body_bytes,
+        };
+        self.slots.submit(seq, |accounting| {
+            encoding.encode(accounting, batch, &mut objects);
+            Ok(Some(run(Attempt { poster, objects })))
+        })
+    }
+
+    /// The oldest batch's answer, counted and classified as `send` does. Its object buffer goes
+    /// back for the next batch.
+    async fn await_ack(&mut self) -> anyhow::Result<()> {
+        let (telemetry, diag, spare) = (&self.telemetry, &mut self.diag, &mut self.spare);
+        self.slots
+            .ack_with(|attempted, accounting| {
+                spare.push(attempted.objects);
+                attempted.journal.replay(telemetry, diag, accounting);
+                attempted.result
+            })
+            .await
+    }
+
+    /// Aborts every request still in flight: the write loop has stopped.
+    async fn flush(&mut self) -> anyhow::Result<()> {
+        self.slots.cancel();
+        Ok(())
     }
 }
 
@@ -2215,5 +2383,149 @@ mod tests {
         assert_eq!(log.lock().unwrap().len(), 2);
         assert_eq!(output.diag.occurrences("blank_event"), 1);
         assert_eq!(output.diag.occurrences("oversize"), 1);
+    }
+}
+
+#[cfg(test)]
+mod concurrency {
+    use super::*;
+    use crate::http::held::{self, Answer, Held, Subject};
+    use logit_core::{Event, Resource, Value};
+    use logit_proto::splunk::response::{encode_invalid_event, HecStatus};
+
+    const TS: i64 = 1_700_000_000_000_000_000;
+
+    fn make(url: &str, concurrency: u32, telemetry: Telemetry) -> SplunkHecOutput {
+        SplunkHecOutput::new(format!("{url}/services/collector/"), "token")
+            .unwrap()
+            .with_compression(SplunkCompression::None)
+            .with_timeout(Duration::from_secs(60))
+            .with_concurrency(concurrency)
+            .with_telemetry(telemetry)
+    }
+
+    fn batch_of(events: Vec<Event>) -> EventBatch {
+        EventBatch { resource: Arc::new(Resource::default()), scope: None, events }
+    }
+
+    /// A log with an empty message, which the codec drops and counts.
+    fn blank_log() -> Event {
+        let mut event = held::marker_log(TS, 0);
+        event.log.as_mut().expect("a log").message = Value::str("");
+        event
+    }
+
+    /// Batch `n` is one log marked `held::marker(n)` beside a blank log (see [`blank_log`]).
+    fn batch(n: u64) -> EventBatch {
+        batch_of(vec![held::marker_log(TS, n), blank_log()])
+    }
+
+    fn subject() -> Subject<SplunkHecOutput> {
+        Subject {
+            kind: "splunk_hec_out",
+            make,
+            batch,
+            id_of: held::id_after_marker,
+            encoded: ("logit.output.events.dropped", &[("reason", "blank_event")]),
+            refuse: held::RESP_401,
+        }
+    }
+
+    #[tokio::test]
+    async fn n_requests_in_flight_answered_out_of_order() {
+        held::n_requests_in_flight_answered_out_of_order(subject()).await;
+    }
+
+    #[tokio::test]
+    async fn a_500_on_one_slot_is_resent_alone() {
+        held::a_500_on_one_slot_is_resent_alone(subject()).await;
+    }
+
+    #[tokio::test]
+    async fn a_400_on_one_slot_is_dropped_alone() {
+        held::a_400_on_one_slot_is_dropped_alone(subject()).await;
+    }
+
+    #[tokio::test]
+    async fn a_401_head_holds_the_fill_at_one_window() {
+        held::a_401_head_holds_the_fill_at_one_window(subject()).await;
+    }
+
+    #[tokio::test]
+    async fn at_most_once_drops_one_ambiguous_slot_alone() {
+        held::at_most_once_drops_one_ambiguous_slot_alone(subject()).await;
+    }
+
+    #[tokio::test]
+    async fn a_grace_cut_aborts_the_requests_in_flight() {
+        held::a_grace_cut_aborts_the_requests_in_flight(subject()).await;
+    }
+
+    #[tokio::test]
+    async fn a_batch_behind_a_retried_head_times_its_own_request() {
+        held::a_batch_behind_a_retried_head_times_its_own_request(subject()).await;
+    }
+
+    /// Batch `n` is three logs, each marked `held::marker(n)`: one body of three objects.
+    fn three_objects(n: u64) -> EventBatch {
+        batch_of((0..3).map(|_| held::marker_log(TS, n)).collect())
+    }
+
+    /// A `400` code 6 naming object 1 of a body, as Splunk writes it.
+    fn invalid_object_1() -> &'static str {
+        let body = encode_invalid_event(HecStatus::INVALID_DATA_FORMAT, 1);
+        let response = format!(
+            "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n{}",
+            body.len(),
+            String::from_utf8(body).unwrap()
+        );
+        Box::leak(response.into_boxed_str())
+    }
+
+    fn markers(body: &[u8]) -> usize {
+        body.windows(b"batch-".len()).filter(|w| w == b"batch-").count()
+    }
+
+    /// Batch 1's body is answered code 6 naming object 1 while batch 2 is held in another slot:
+    /// the slot drops that object, resends object 2 alone, and delivers the batch once. Both
+    /// batches are held at once first, so a window of one can't pass.
+    #[tokio::test]
+    async fn a_code_6_drops_and_resends_within_its_slot_with_another_in_flight() {
+        let invalid = invalid_object_1();
+        let held = Held::start(held::id_after_marker, |batch, earlier| match (batch, earlier) {
+            (2, 0) => Answer::Hold,
+            (1, 0) => Answer::Hold,
+            _ => Answer::Now(held::RESP_204),
+        })
+        .await;
+        let subject = Subject { batch: three_objects, ..subject() };
+        let (mut output, mut probe, telemetry) = held::sink(&subject, &held, 2);
+        let control = async {
+            logit_pipeline::test_util::wait_until("both batches held", || held.held() == 2).await;
+            held.release(1, invalid);
+            logit_pipeline::test_util::wait_until("batch 1 resent behind a held batch 2", || {
+                held.paths(1).len() >= 2 && held.held() == 1
+            })
+            .await;
+            held.release(2, held::RESP_204);
+        };
+        let (totals, _) = held::run(
+            &mut output,
+            &mut probe,
+            telemetry,
+            vec![three_objects(1), three_objects(2)],
+            DeliveryPosture::AtLeastOnce,
+            std::future::pending(),
+            control,
+        )
+        .await;
+        let bodies = held.bodies(1);
+        assert_eq!(bodies.iter().map(|b| markers(b)).collect::<Vec<_>>(), [3, 1]);
+        assert_eq!(held.bodies(2).len(), 1);
+        assert_eq!(held::delivered(&totals), 2.0);
+        let invalid = [("reason", "invalid_event")];
+        assert_eq!(totals.sum(RECORDS_DROPPED, &invalid), 1.0);
+        assert_eq!(totals.sum(RECORDS, &[]), 5.0, "batch 1's objects 0 and 2, batch 2's three");
     }
 }

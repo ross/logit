@@ -1764,6 +1764,7 @@ mod tests {
                 batch,
                 id_of,
                 encoded: ("logit.output.events.skipped", &[("reason", "no_metrics")]),
+                refuse: held::RESP_401,
             }
         }
 

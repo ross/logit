@@ -318,7 +318,8 @@ use crate::accounting::BatchAccounting;
 use crate::http::classify_status;
 use crate::http::{
     build_client, classify_reqwest_error, error_read_bytes, read_body_bytes, read_body_prefix,
-    read_varint, redacted_snippet, skip_field, split_encode, status_class, Caps, Encoded, Outcomes,
+    read_varint, redacted_snippet, skip_field, split_encode, status_class, Caps, Encoded, Journal,
+    Outcomes, Slots,
 };
 /// `tls:`: the shared `crate::tls` type, re-exported as the other sinks do.
 pub use crate::tls::TlsClientSettings;
@@ -872,8 +873,9 @@ pub struct DatadogOutput {
     /// Replaces every route's [`Route::caps`], so a test can bisect a small body.
     #[cfg(test)]
     caps_override: Option<Caps>,
-    /// The operator's `concurrency:`, which the HTTP slot helper reads as this sink's window.
-    concurrency: u32,
+    /// The batches in flight above a concurrency of 1, each with its own accounting over
+    /// `accounting`'s gate and its own send time (the module doc's "Concurrency").
+    slots: Slots<Attempted, Option<i64>>,
 }
 
 impl DatadogOutput {
@@ -887,8 +889,9 @@ impl DatadogOutput {
             )
         })?;
         api_key.set_sensitive(true);
+        let accounting = BatchAccounting::default();
         let mut output = Self {
-            concurrency: 1,
+            slots: Slots::new(accounting.gate().clone()),
             api_key,
             site: DEFAULT_SITE.to_string(),
             endpoints: DatadogEndpoints::default(),
@@ -902,7 +905,7 @@ impl DatadogOutput {
             encoder: DatadogEncoder::new(),
             diag: Diagnostics::default(),
             telemetry: Telemetry::default(),
-            accounting: BatchAccounting::default(),
+            accounting,
             batch_now: None,
             clock: Box::new(now_nanos),
             #[cfg(test)]
@@ -948,7 +951,7 @@ impl DatadogOutput {
 
     /// Sets how many batches may be in flight at once (`concurrency:` in config, default 1).
     pub fn with_concurrency(mut self, concurrency: u32) -> Self {
-        self.concurrency = concurrency;
+        self.slots.set_concurrency(concurrency);
         self
     }
 
@@ -1023,6 +1026,7 @@ impl DatadogOutput {
     }
 
     pub fn with_telemetry(mut self, telemetry: Telemetry) -> Self {
+        self.slots.set_telemetry(telemetry.clone());
         self.telemetry = telemetry;
         self.encoder = self.new_encoder();
         self
@@ -1054,19 +1058,163 @@ impl DatadogOutput {
         self
     }
 
-    /// `route`'s URL: the `endpoints` base for its intake, else `https://<prefix>.<site>`.
-    fn url(&self, route: Route) -> String {
-        let base = match route.intake() {
-            Intake::Api => &self.endpoints.api,
-            Intake::Logs => &self.endpoints.logs,
-            Intake::Traces => &self.endpoints.traces,
-        };
-        match base {
-            Some(base) => format!("{}{}", base.trim_end_matches('/'), route.path()),
-            None => format!("https://{}.{}{}", route.intake().prefix(), self.site, route.path()),
+    /// `route`'s request limits: [`Route::caps`], or a test's override.
+    fn caps(&self, route: Route) -> Caps {
+        #[cfg(test)]
+        if let Some(caps) = self.caps_override {
+            return caps;
+        }
+        route.caps()
+    }
+
+    /// What one attempt's requests need from this sink, owned so they can run in a task of their
+    /// own.
+    fn poster(&self) -> Poster {
+        Poster {
+            api_key: self.api_key.clone(),
+            site: self.site.clone(),
+            endpoints: self.endpoints.clone(),
+            compression: self.compression,
+            request_timeout: self.request_timeout,
+            client: self.client.clone(),
+            headers: self.headers.clone(),
         }
     }
 
+    /// Every route's request limits, indexed by `Route as usize`.
+    fn route_caps(&self) -> [Caps; 8] {
+        ROUTES.map(|route| self.caps(route))
+    }
+
+    /// One attempt at send time `now`: the plan, then each route's requests in turn. The plan is
+    /// unit 0 of the batch accounting and route `r`'s `split_encode` unit `1 + r as u32`, each
+    /// counting encode-side only on the batch's first encode of it. A route is encoded only once
+    /// the routes before it were settled, so a route an earlier attempt never reached counts on the
+    /// attempt that first encodes it.
+    ///
+    /// Requests are numbered `0, 1, 2, …` in send order across routes, one per `split_encode`
+    /// chunk, and a request the destination settled for this batch (accepted or rejected) is
+    /// encoded again but not resent. The number names the same request on every attempt only
+    /// because the plan and the cuts are pure functions of the batch and the send time
+    /// `observe_batch` fixed: anything that makes either depend on per-attempt state breaks the
+    /// memory.
+    ///
+    /// Each request's result is folded by [`Outcomes`] ([`post_all`]): a rejected request
+    /// (counted by [`Poster::post`]) is remembered and the attempt goes on; a refused key, a
+    /// `Clean` failure, or an `Ambiguous` one ends it with its own fault. Under `at_most_once` an
+    /// `Ambiguous` stop drops the batch, so this request's entries, the rest of its route's
+    /// unsettled requests, and every later route's planned entries are counted
+    /// `records.dropped{reason="ambiguous_at_most_once"}`.
+    async fn attempt(&mut self, batch: &EventBatch, now: i64) -> anyhow::Result<()> {
+        let (poster, caps, compression) = (self.poster(), self.route_caps(), self.compression);
+        let mut plan = Encoding {
+            caps,
+            compression,
+            encoder: &mut self.encoder,
+            telemetry: &self.telemetry,
+            diag: &mut self.diag,
+        }
+        .plan(&mut self.accounting, batch, now);
+        let duplicates = Arc::clone(&plan.duplicates);
+        let mut outcomes = Outcomes::new(self.accounting.any_accepted());
+        let mut next_request: u32 = 0;
+        for route in ROUTES {
+            let items = std::mem::take(&mut plan.routes[route as usize]);
+            if items.is_empty() {
+                continue;
+            }
+            let mut encoding = Encoding {
+                caps,
+                compression,
+                encoder: &mut self.encoder,
+                telemetry: &self.telemetry,
+                diag: &mut self.diag,
+            };
+            let postings = encoding.route(
+                &mut self.accounting,
+                route,
+                &items,
+                batch,
+                &duplicates,
+                &mut next_request,
+            );
+            let mut journal = Journal::default();
+            let posted = post_all(&poster, postings, &mut outcomes, &mut journal).await;
+            if let Err(stopped) = posted {
+                if drops_ambiguous(self.accounting.posture(), &stopped.err) {
+                    let lost =
+                        stopped.entries + stopped.rest.iter().map(|p| p.entries).sum::<usize>();
+                    dropped(&mut journal, route, "ambiguous_at_most_once", lost);
+                    // A later route's planned weight is an upper bound: it includes entries its
+                    // encode would have skipped or dropped `oversize`.
+                    for &later in &ROUTES[route as usize + 1..] {
+                        let planned = weight(&plan.routes[later as usize]);
+                        dropped(&mut journal, later, "ambiguous_at_most_once", planned);
+                    }
+                }
+                journal.replay(&self.telemetry, &mut self.diag, &mut self.accounting);
+                return Err(stopped.err);
+            }
+            journal.replay(&self.telemetry, &mut self.diag, &mut self.accounting);
+        }
+        outcomes.finish()
+    }
+
+    /// One attempt at send time `now` ([`DatadogOutput::attempt`]). A final result (`Ok`, or a
+    /// fault `write_loop` won't retry) clears the batch's send time and disarms the batch
+    /// accounting, a batch that sent nothing included.
+    async fn send_at(&mut self, batch: &EventBatch, now: i64) -> anyhow::Result<()> {
+        let result = self.attempt(batch, now).await;
+        if self.accounting.is_final(&result) {
+            self.batch_now = None;
+        }
+        self.accounting.finish(result)
+    }
+
+    /// `route`'s URL: the `endpoints` base for its intake, else `https://<prefix>.<site>`.
+    #[cfg(test)]
+    fn url(&self, route: Route) -> String {
+        route_url(&self.site, &self.endpoints, route)
+    }
+}
+
+/// `route`'s URL: the `endpoints` base for its intake, else `https://<prefix>.<site>`.
+fn route_url(site: &str, endpoints: &DatadogEndpoints, route: Route) -> String {
+    let base = match route.intake() {
+        Intake::Api => &endpoints.api,
+        Intake::Logs => &endpoints.logs,
+        Intake::Traces => &endpoints.traces,
+    };
+    match base {
+        Some(base) => format!("{}{}", base.trim_end_matches('/'), route.path()),
+        None => format!("https://{}.{site}{}", route.intake().prefix(), route.path()),
+    }
+}
+
+/// Counts `n` of `route`'s records dropped for `reason`, when there are any.
+fn dropped(journal: &mut Journal, route: Route, reason: &'static str, n: usize) {
+    if n > 0 {
+        journal.count(RECORDS_DROPPED, n as f64, &[("route", route.name()), ("reason", reason)]);
+    }
+}
+
+/// Whether `err` stops the send with a drop the sink counts `ambiguous_at_most_once`: an
+/// `Ambiguous` fault under `at_most_once`, which `write_loop` doesn't retry.
+fn drops_ambiguous(posture: DeliveryPosture, err: &anyhow::Error) -> bool {
+    posture == DeliveryPosture::AtMostOnce && logit_pipeline::classify(err) == Fault::Ambiguous
+}
+
+/// One attempt's encode, on the loop task: the sink's encoder and ungated handles, and the
+/// per-route limits.
+struct Encoding<'a> {
+    caps: [Caps; 8],
+    compression: DatadogCompression,
+    encoder: &'a mut DatadogEncoder,
+    telemetry: &'a Telemetry,
+    diag: &'a mut Diagnostics,
+}
+
+impl Encoding<'_> {
     fn dropped(&self, route: Route, reason: &'static str, n: usize) {
         if n > 0 {
             self.telemetry.count(
@@ -1075,6 +1223,22 @@ impl DatadogOutput {
                 &[("route", route.name()), ("reason", reason)],
             );
         }
+    }
+
+    /// The batch's plan at send time `now`, unit 0 of `accounting`; what it dropped counts on the
+    /// batch's first encode of it only.
+    fn plan(&mut self, accounting: &mut BatchAccounting, batch: &EventBatch, now: i64) -> Plan {
+        let histograms = self.encoder.histograms();
+        let encoder = &*self.encoder;
+        let (first, plan) = accounting.encode(0, || {
+            let mut plan = plan(batch, now, histograms);
+            plan_duplicates(&mut plan, encoder, batch);
+            plan
+        });
+        if first {
+            self.count_plan_drops(&plan);
+        }
+        plan
     }
 
     /// Counts what [`plan`] dropped, per route and reason, and the events it routed nowhere, and
@@ -1102,143 +1266,201 @@ impl DatadogOutput {
         self.encoder.count_duplicates(plan.duplicates.differing(), plan.duplicates.equal());
     }
 
-    /// `route`'s request limits: [`Route::caps`], or a test's override.
-    fn caps(&self, route: Route) -> Caps {
-        #[cfg(test)]
-        if let Some(caps) = self.caps_override {
-            return caps;
-        }
-        route.caps()
-    }
-
-    /// One attempt at send time `now`: the plan, then each route's requests in turn. The plan is
-    /// unit 0 of the batch accounting and route `r`'s `split_encode` unit `1 + r as u32`, each
-    /// counting encode-side only on the batch's first encode of it. A route is encoded only once
-    /// the routes before it were settled, so a route an earlier attempt never reached counts on the
-    /// attempt that first encodes it.
-    ///
-    /// Requests are numbered `0, 1, 2, …` in send order across routes, one per `split_encode`
-    /// chunk, and a request the destination settled for this batch (accepted or rejected) is
-    /// encoded again but not resent. The number names the same request on every attempt only
-    /// because the plan and the cuts are pure functions of the batch and the send time
-    /// `observe_batch` fixed: anything that makes either depend on per-attempt state breaks the
-    /// memory.
-    ///
-    /// Each request's result is folded by [`Outcomes`]: a rejected request (counted by
-    /// [`DatadogOutput::post`]) is remembered and the attempt goes on; a refused key, a `Clean`
-    /// failure, or an `Ambiguous` one ends it with its own fault. Under `at_most_once` an
-    /// `Ambiguous` stop drops the batch, so this request's entries, the rest of its route's
-    /// unsettled requests, and every later route's planned entries are counted
-    /// `records.dropped{reason="ambiguous_at_most_once"}`.
-    async fn attempt(&mut self, batch: &EventBatch, now: i64) -> anyhow::Result<()> {
-        let histograms = self.encoder.histograms();
-        let encoder = &self.encoder;
-        let (first, mut plan) = self.accounting.encode(0, || {
-            let mut plan = plan(batch, now, histograms);
-            plan_duplicates(&mut plan, encoder, batch);
-            plan
+    /// `route`'s requests for `items`, unit `1 + route as u32` of `accounting`: the oversize drops
+    /// count on the batch's first encode of it only. Numbers each request from `next_request` and
+    /// leaves out those the destination settled for this batch.
+    fn route(
+        &mut self,
+        accounting: &mut BatchAccounting,
+        route: Route,
+        items: &[Item],
+        batch: &EventBatch,
+        duplicates: &Arc<SeriesDuplicates>,
+        next_request: &mut u32,
+    ) -> Vec<Posting> {
+        let (body_encoding, caps) =
+            (route.body_encoding(self.compression), self.caps[route as usize]);
+        let gate = accounting.gate().clone();
+        let encoder = &mut *self.encoder;
+        let (first, split) = accounting.encode(1 + route as u32, || {
+            split_encode(
+                items,
+                caps,
+                &gate,
+                |item| item.weight,
+                |chunk| {
+                    if route == Route::Series {
+                        encoder.with_series_plan(Some(SeriesPlanned {
+                            dropped: Arc::clone(duplicates),
+                            origin: chunk.iter().map(|item| item.index).collect(),
+                        }));
+                    }
+                    let raw = route.encode(encoder, &sub_batch(batch, chunk));
+                    encoder.with_series_plan(None);
+                    let raw = raw?;
+                    Some(Encoded { raw_len: raw.len(), body: body_encoding.apply(raw), meta: () })
+                },
+            )
         });
         if first {
-            self.count_plan_drops(&plan);
-        }
-        let gate = self.accounting.gate().clone();
-        let duplicates = Arc::clone(&plan.duplicates);
-        let mut outcomes = Outcomes::new(self.accounting.any_accepted());
-        let mut next_request: u32 = 0;
-        for route in ROUTES {
-            let items = std::mem::take(&mut plan.routes[route as usize]);
-            if items.is_empty() {
-                continue;
-            }
-            let (body_encoding, caps) = (route.body_encoding(self.compression), self.caps(route));
-            let encoder = &mut self.encoder;
-            let (first, split) = self.accounting.encode(1 + route as u32, || {
-                split_encode(
-                    &items,
-                    caps,
-                    &gate,
-                    |item| item.weight,
-                    |chunk| {
-                        if route == Route::Series {
-                            encoder.with_series_plan(Some(SeriesPlanned {
-                                dropped: Arc::clone(&duplicates),
-                                origin: chunk.iter().map(|item| item.index).collect(),
-                            }));
-                        }
-                        let raw = route.encode(encoder, &sub_batch(batch, chunk));
-                        encoder.with_series_plan(None);
-                        let raw = raw?;
-                        Some(Encoded {
-                            raw_len: raw.len(),
-                            body: body_encoding.apply(raw),
-                            meta: (),
-                        })
-                    },
-                )
-            });
-            if first {
-                for (item, raw_len, wire_len) in &split.oversize {
-                    self.dropped(route, "oversize", item.weight);
-                    self.diag.warn_throttled(
-                        "oversize",
-                        format_args!(
-                            "dropped one event on the {} route: it encodes to {raw_len} bytes \
-                             ({wire_len} compressed), over the route's per-request limit",
-                            route.name()
-                        ),
-                    );
-                }
-            }
-            let mut requests = split.requests.into_iter();
-            while let Some((chunk, encoded)) = requests.next() {
-                let request = next_request;
-                next_request += 1;
-                if self.accounting.settled(request) {
-                    continue;
-                }
-                let entries = weight(&chunk);
-                // `post` counts and diagnoses a rejection itself.
-                let result = self.post(route, encoded, entries).await;
-                let accepted = result.is_ok();
-                if let Err(err) = outcomes.note(result, |_| {}) {
-                    if self.accounting.posture() == DeliveryPosture::AtMostOnce
-                        && logit_pipeline::classify(&err) == Fault::Ambiguous
-                    {
-                        let mut lost = entries;
-                        for (rest, _) in requests {
-                            let request = next_request;
-                            next_request += 1;
-                            if !self.accounting.settled(request) {
-                                lost += weight(&rest);
-                            }
-                        }
-                        self.dropped(route, "ambiguous_at_most_once", lost);
-                        // A later route's planned weight is an upper bound: it includes entries
-                        // its encode would have skipped or dropped `oversize`.
-                        for &later in &ROUTES[route as usize + 1..] {
-                            let planned = weight(&plan.routes[later as usize]);
-                            self.dropped(later, "ambiguous_at_most_once", planned);
-                        }
-                    }
-                    return Err(err);
-                }
-                self.accounting.settle(request, accepted);
+            for (item, raw_len, wire_len) in &split.oversize {
+                self.dropped(route, "oversize", item.weight);
+                self.diag.warn_throttled(
+                    "oversize",
+                    format_args!(
+                        "dropped one event on the {} route: it encodes to {raw_len} bytes \
+                         ({wire_len} compressed), over the route's per-request limit",
+                        route.name()
+                    ),
+                );
             }
         }
-        outcomes.finish()
+        let mut postings = Vec::with_capacity(split.requests.len());
+        for (chunk, encoded) in split.requests {
+            let request = *next_request;
+            *next_request += 1;
+            if !accounting.settled(request) {
+                postings.push(Posting { request, route, entries: weight(&chunk), encoded });
+            }
+        }
+        postings
     }
+}
 
-    /// One attempt at send time `now` ([`DatadogOutput::attempt`]). A final result (`Ok`, or a
-    /// fault `write_loop` won't retry) clears the batch's send time and disarms the batch
-    /// accounting, a batch that sent nothing included.
-    async fn send_at(&mut self, batch: &EventBatch, now: i64) -> anyhow::Result<()> {
-        let result = self.attempt(batch, now).await;
-        if self.accounting.is_final(&result) {
-            self.batch_now = None;
+/// One request of an attempt: its number in the batch's send order, its route, the entries it
+/// carries, and its body.
+struct Posting {
+    request: u32,
+    route: Route,
+    entries: usize,
+    encoded: Encoded,
+}
+
+/// Everything a batch's requests need, cloned from the sink: the client is a handle on the
+/// sink's own pool.
+struct Poster {
+    api_key: HeaderValue,
+    site: String,
+    endpoints: DatadogEndpoints,
+    compression: DatadogCompression,
+    request_timeout: Duration,
+    client: reqwest::Client,
+    headers: HeaderMap,
+}
+
+/// A stop [`post_all`] returns: the failed request's error and entries, and the requests after
+/// it, unsent.
+struct Stopped {
+    err: anyhow::Error,
+    route: Route,
+    entries: usize,
+    rest: Vec<Posting>,
+}
+
+/// Sends `postings` in order, each verdict folded into `outcomes`: an accepted or rejected request
+/// is settled in `journal` and the next is sent; any other fault stops the run with the request's
+/// own class.
+async fn post_all(
+    poster: &Poster,
+    postings: Vec<Posting>,
+    outcomes: &mut Outcomes,
+    journal: &mut Journal,
+) -> Result<(), Stopped> {
+    let mut postings = postings.into_iter();
+    while let Some(Posting { request, route, entries, encoded }) = postings.next() {
+        // `post` counts and diagnoses a rejection itself.
+        let result = poster.post(route, encoded, entries, journal).await;
+        let accepted = result.is_ok();
+        if let Err(err) = outcomes.note(result, |_| {}) {
+            return Err(Stopped { err, route, entries, rest: postings.collect() });
         }
-        self.accounting.finish(result)
+        journal.settle(request, accepted);
     }
+    Ok(())
+}
 
+/// One attempt above a concurrency of 1, every route encoded on the loop task before the first
+/// request ([`prepare`]).
+struct SlotAttempt {
+    poster: Poster,
+    postings: Vec<Posting>,
+    /// Whether an earlier attempt at the batch had a request accepted ([`Outcomes::new`]).
+    accepted_before: bool,
+    posture: DeliveryPosture,
+}
+
+/// What [`run`] did: the attempt's result and every count, warning, and settled request it
+/// recorded, for [`DatadogOutput::await_ack`] to apply on the loop task.
+struct Attempted {
+    journal: Journal,
+    result: anyhow::Result<()>,
+}
+
+/// The encode half of one attempt above a concurrency of 1, on the loop task: the plan and every
+/// route's requests at send time `now`, leaving out those the destination settled. `None` when no
+/// request is left to send.
+fn prepare(
+    poster: Poster,
+    mut encoding: Encoding<'_>,
+    accounting: &mut BatchAccounting,
+    batch: &EventBatch,
+    now: i64,
+) -> Option<SlotAttempt> {
+    let mut plan = encoding.plan(accounting, batch, now);
+    let duplicates = Arc::clone(&plan.duplicates);
+    let mut postings = Vec::new();
+    let mut next_request: u32 = 0;
+    for route in ROUTES {
+        let items = std::mem::take(&mut plan.routes[route as usize]);
+        if !items.is_empty() {
+            postings.extend(encoding.route(
+                accounting,
+                route,
+                &items,
+                batch,
+                &duplicates,
+                &mut next_request,
+            ));
+        }
+    }
+    if postings.is_empty() {
+        return None;
+    }
+    Some(SlotAttempt {
+        poster,
+        postings,
+        accepted_before: accounting.any_accepted(),
+        posture: accounting.posture(),
+    })
+}
+
+/// Every request of the attempt in order ([`post_all`]). Under `at_most_once` an `Ambiguous` stop
+/// counts the failed request's entries and every unsent request's, per route,
+/// `records.dropped{reason="ambiguous_at_most_once"}`: every route was encoded before the first
+/// request, so each count is the entries its requests carry.
+async fn run(attempt: SlotAttempt) -> Attempted {
+    let SlotAttempt { poster, postings, accepted_before, posture } = attempt;
+    let mut journal = Journal::default();
+    let mut outcomes = Outcomes::new(accepted_before);
+    match post_all(&poster, postings, &mut outcomes, &mut journal).await {
+        Ok(()) => Attempted { journal, result: outcomes.finish() },
+        Err(stopped) => {
+            if drops_ambiguous(posture, &stopped.err) {
+                let mut lost = [0usize; 8];
+                for posting in &stopped.rest {
+                    lost[posting.route as usize] += posting.entries;
+                }
+                lost[stopped.route as usize] += stopped.entries;
+                for later in ROUTES {
+                    dropped(&mut journal, later, "ambiguous_at_most_once", lost[later as usize]);
+                }
+            }
+            Attempted { journal, result: Err(stopped.err) }
+        }
+    }
+}
+
+impl Poster {
     /// The operator's headers with the protocol's `insert`ed over them, so a protocol name
     /// always wins. One `.headers(..)` at the call site, never `RequestBuilder::header`, which
     /// appends and would undo that.
@@ -1258,17 +1480,24 @@ impl DatadogOutput {
         headers
     }
 
-    /// One request, one attempt (module doc's "Faults, retries, and duplicate safety").
-    /// `request.bytes` counts a request that may have left: any answer, and any error but a
-    /// [`Fault::Clean`] one, which never connected. A rejection counts the request's entries
-    /// dropped here, `oversize` for a `413` and `rejected` for any other 3xx or 4xx that
-    /// [`classify_status`] doesn't read as `Refused`. A series `2xx` counts the entries its body
-    /// names `rejected` as well ([`series_errors`]), and takes them out of `records`.
-    async fn post(&mut self, route: Route, encoded: Encoded, entries: usize) -> anyhow::Result<()> {
-        let url = self.url(route);
+    /// One request, one attempt (module doc's "Faults, retries, and duplicate safety"), every
+    /// count and warning recorded in `journal`. `request.bytes` counts a request that may have
+    /// left: any answer, and any error but a [`Fault::Clean`] one, which never connected. A
+    /// rejection counts the request's entries dropped here, `oversize` for a `413` and `rejected`
+    /// for any other 3xx or 4xx that [`classify_status`] doesn't read as `Refused`. A series
+    /// `2xx` counts the entries its body names `rejected` as well ([`series_errors`]), and takes
+    /// them out of `records`.
+    async fn post(
+        &self,
+        route: Route,
+        encoded: Encoded,
+        entries: usize,
+        journal: &mut Journal,
+    ) -> anyhow::Result<()> {
+        let url = route_url(&self.site, &self.endpoints, route);
         let tags = [("route", route.name())];
         let wire_len = encoded.body.len();
-        let timer = self.telemetry.timer(REQUEST_DURATION);
+        let started = std::time::Instant::now();
         let result = self
             .client
             .post(&url)
@@ -1277,16 +1506,16 @@ impl DatadogOutput {
             .body(encoded.body)
             .send()
             .await;
-        timer.stop(&tags);
+        journal.timing(REQUEST_DURATION, started.elapsed(), &tags);
 
         let response = match result {
             Ok(response) => response,
             Err(err) => {
                 let fault = classify_reqwest_error(&err);
                 if fault != Fault::Clean {
-                    self.telemetry.count(REQUEST_BYTES, wire_len as f64, &tags);
+                    journal.count(REQUEST_BYTES, wire_len as f64, &tags);
                 }
-                self.telemetry.count(
+                journal.count(
                     REQUESTS,
                     1.0,
                     &[("route", route.name()), ("class", "network_error")],
@@ -1294,13 +1523,9 @@ impl DatadogOutput {
                 return Err(anyhow::Error::new(err)).context(fault);
             }
         };
-        self.telemetry.count(REQUEST_BYTES, wire_len as f64, &tags);
+        journal.count(REQUEST_BYTES, wire_len as f64, &tags);
         let status = response.status();
-        self.telemetry.count(
-            REQUESTS,
-            1.0,
-            &[("route", route.name()), ("class", status_class(status))],
-        );
+        journal.count(REQUESTS, 1.0, &[("route", route.name()), ("class", status_class(status))]);
         let key = self.api_key.to_str().unwrap_or_default();
         if status.is_success() {
             let rejected = if route == Route::Series {
@@ -1309,8 +1534,8 @@ impl DatadogOutput {
                 let rejected = errors.len().min(entries);
                 if let Some(first) = errors.first() {
                     let first = redacted_snippet(&String::from_utf8_lossy(first), key);
-                    self.dropped(route, "rejected", rejected);
-                    self.diag.warn_throttled(
+                    dropped(journal, route, "rejected", rejected);
+                    journal.warn(
                         "series_rejected",
                         format_args!(
                             "{} accepted the request but dropped {rejected} of {entries} \
@@ -1323,7 +1548,7 @@ impl DatadogOutput {
             } else {
                 0
             };
-            self.telemetry.count(RECORDS, (entries - rejected) as f64, &tags);
+            journal.count(RECORDS, (entries - rejected) as f64, &tags);
             return Ok(());
         }
         let url = redact::url(&url);
@@ -1334,7 +1559,7 @@ impl DatadogOutput {
         let fault = match status.as_u16() {
             408 | 429 | 500..=599 => Fault::Ambiguous,
             403 => {
-                self.diag.warn_throttled(
+                journal.warn(
                     "api_key_rejected",
                     format_args!(
                         "Datadog refused the API key: {url} answered 403 -- check 'api_key', and \
@@ -1344,8 +1569,8 @@ impl DatadogOutput {
                 Fault::Refused
             }
             413 => {
-                self.dropped(route, "oversize", entries);
-                self.diag.warn_throttled(
+                dropped(journal, route, "oversize", entries);
+                journal.warn(
                     "request_rejected",
                     format_args!(
                         "{url} answered 413, request too large, {entries} record(s) dropped: \
@@ -1356,15 +1581,15 @@ impl DatadogOutput {
             }
             _ => match classify_status(status) {
                 Fault::Refused => {
-                    self.diag.warn_throttled(
+                    journal.warn(
                         "request_refused",
                         format_args!("{url} answered {status}: {snippet}"),
                     );
                     Fault::Refused
                 }
                 other => {
-                    self.dropped(route, "rejected", entries);
-                    self.diag.warn_throttled(
+                    dropped(journal, route, "rejected", entries);
+                    journal.warn(
                         "request_rejected",
                         format_args!(
                             "{url} answered {status}, {entries} record(s) dropped: {snippet}"
@@ -1416,10 +1641,15 @@ impl Output for DatadogOutput {
     /// Arms this sink's batch accounting (`crate::accounting`), which clears the requests the
     /// destination settled for the last batch, and fixes the batch's send time, so every attempt
     /// at it reaches the same stale verdict and cuts the same requests (module doc's "What is
-    /// never sent").
-    fn observe_batch(&mut self, _ctx: BatchContext, _seq: SeqId) {
-        self.accounting.observe();
-        self.batch_now = Some((self.clock)());
+    /// never sent"). Under a window above 1, both go to the batch's own slot.
+    fn observe_batch(&mut self, _ctx: BatchContext, seq: SeqId) {
+        let now = (self.clock)();
+        if self.slots.window() > 1 {
+            *self.slots.observe(seq) = Some(now);
+        } else {
+            self.accounting.observe();
+            self.batch_now = Some(now);
+        }
     }
 
     /// Records the posture, which decides whether an `Ambiguous` stop counts
@@ -1427,6 +1657,7 @@ impl Output for DatadogOutput {
     /// batch's send time.
     fn observe_posture(&mut self, posture: DeliveryPosture) {
         self.accounting.observe_posture(posture);
+        self.slots.observe_posture(posture);
     }
 
     /// One or more requests per route the batch needs, sequentially, skipping those the
@@ -1437,6 +1668,58 @@ impl Output for DatadogOutput {
     async fn send(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
         let now = self.batch_now.unwrap_or_else(|| (self.clock)());
         self.send_at(batch, now).await
+    }
+
+    fn window(&self) -> usize {
+        self.slots.window()
+    }
+
+    fn send_duration_per_batch(&self) -> bool {
+        true
+    }
+
+    fn answered_send_duration(&self) -> Option<Duration> {
+        self.slots.answered()
+    }
+
+    /// Plans and encodes every route of `batch` into its slot at the slot's send time, and
+    /// starts its requests on a task of their own.
+    async fn submit(
+        &mut self,
+        batch: &EventBatch,
+        _ctx: BatchContext,
+        seq: SeqId,
+    ) -> anyhow::Result<()> {
+        let (poster, caps, compression) = (self.poster(), self.route_caps(), self.compression);
+        let clock = &self.clock;
+        let encoding = Encoding {
+            caps,
+            compression,
+            encoder: &mut self.encoder,
+            telemetry: &self.telemetry,
+            diag: &mut self.diag,
+        };
+        self.slots.submit_with(seq, |accounting, batch_now| {
+            let now = *batch_now.get_or_insert_with(clock);
+            Ok(prepare(poster, encoding, accounting, batch, now).map(run))
+        })
+    }
+
+    /// The oldest batch's answer, counted and classified as `send` does.
+    async fn await_ack(&mut self) -> anyhow::Result<()> {
+        let (telemetry, diag) = (&self.telemetry, &mut self.diag);
+        self.slots
+            .ack_with(|attempted, accounting| {
+                attempted.journal.replay(telemetry, diag, accounting);
+                attempted.result
+            })
+            .await
+    }
+
+    /// Aborts every request still in flight: the write loop has stopped.
+    async fn flush(&mut self) -> anyhow::Result<()> {
+        self.slots.cancel();
+        Ok(())
     }
 }
 
@@ -3510,5 +3793,140 @@ mod tests {
         assert_eq!(sum_of(&sums, RECORDS_DROPPED, &ambiguous), 3.0);
         let duplicate = [("reason", "duplicate_timestamp")];
         assert_eq!(sum_of(&sums, "logit.output.metrics.dropped", &duplicate), 1.0);
+    }
+}
+
+#[cfg(test)]
+mod concurrency {
+    use super::*;
+    use crate::http::held::{self, Answer, Held, Subject};
+    use logit_core::interner::intern;
+    use logit_core::{AttrMap, Event, MetricKind, MetricRecord, Resource, Value};
+    use logit_proto::datadog::events::ATTR_EVENT_TITLE;
+
+    /// The sink's clock and every event's timestamp, so no point is stale.
+    const NOW: i64 = 1_790_000_000_000_000_000;
+
+    fn make(url: &str, concurrency: u32, telemetry: Telemetry) -> DatadogOutput {
+        DatadogOutput::new("key")
+            .unwrap()
+            .with_endpoints(DatadogEndpoints {
+                api: Some(url.into()),
+                logs: Some(url.into()),
+                traces: Some(url.into()),
+            })
+            .with_compression(DatadogCompression::None)
+            .with_timeout(Duration::from_secs(60))
+            .with_concurrency(concurrency)
+            .with_telemetry(telemetry)
+            .with_clock(|| NOW)
+    }
+
+    fn batch_of(events: Vec<Event>) -> EventBatch {
+        EventBatch { resource: Arc::new(Resource::default()), scope: None, events }
+    }
+
+    /// Batch `n` is one log marked `held::marker(n)` beside an event no route carries, which the
+    /// encoder counts skipped.
+    fn batch(n: u64) -> EventBatch {
+        batch_of(vec![held::marker_log(NOW, n), Event::empty(NOW, AttrMap::new())])
+    }
+
+    fn subject() -> Subject<DatadogOutput> {
+        Subject {
+            kind: "datadog_out",
+            make,
+            batch,
+            id_of: held::id_after_marker,
+            encoded: ("logit.output.events.skipped", &[("reason", "no_payload")]),
+            refuse: held::RESP_401,
+        }
+    }
+
+    #[tokio::test]
+    async fn n_requests_in_flight_answered_out_of_order() {
+        held::n_requests_in_flight_answered_out_of_order(subject()).await;
+    }
+
+    #[tokio::test]
+    async fn a_500_on_one_slot_is_resent_alone() {
+        held::a_500_on_one_slot_is_resent_alone(subject()).await;
+    }
+
+    #[tokio::test]
+    async fn a_400_on_one_slot_is_dropped_alone() {
+        held::a_400_on_one_slot_is_dropped_alone(subject()).await;
+    }
+
+    #[tokio::test]
+    async fn a_401_head_holds_the_fill_at_one_window() {
+        held::a_401_head_holds_the_fill_at_one_window(subject()).await;
+    }
+
+    #[tokio::test]
+    async fn at_most_once_drops_one_ambiguous_slot_alone() {
+        held::at_most_once_drops_one_ambiguous_slot_alone(subject()).await;
+    }
+
+    #[tokio::test]
+    async fn a_grace_cut_aborts_the_requests_in_flight() {
+        held::a_grace_cut_aborts_the_requests_in_flight(subject()).await;
+    }
+
+    #[tokio::test]
+    async fn a_batch_behind_a_retried_head_times_its_own_request() {
+        held::a_batch_behind_a_retried_head_times_its_own_request(subject()).await;
+    }
+
+    /// Batch `n` takes three routes, series, events, and logs, each request marked `held::marker(n)`.
+    fn three_routes(n: u64) -> EventBatch {
+        let gauge = MetricRecord::new(intern(&held::marker(n)), MetricKind::gauge(1.0));
+        let mut event = held::marker_log(NOW, n);
+        event.attributes.insert(ATTR_EVENT_TITLE, Value::str("deploy"));
+        batch_of(vec![Event::metric(NOW, AttrMap::new(), gauge), event, held::marker_log(NOW, n)])
+    }
+
+    /// Batch 1's series request is rejected, its event accepted, and its logs answered `500`
+    /// while batch 2 is held in another slot: the head's resubmit sends logs alone, skipping
+    /// both settled requests, and counts the rejected series once. Both batches are held at
+    /// once first, so a window of one can't pass.
+    #[tokio::test]
+    async fn a_resubmitted_head_skips_its_settled_requests_with_another_slot_in_flight() {
+        let held = Held::start_by_path(held::id_after_marker, |batch, path, earlier| {
+            match (batch, path, earlier) {
+                (2, _, 0) => Answer::Hold,
+                (1, "/api/v2/series", 0) => Answer::Now(held::RESP_400),
+                (1, "/api/v2/logs", 2) => Answer::Hold,
+                _ => Answer::Now(held::RESP_204),
+            }
+        })
+        .await;
+        let subject = Subject { batch: three_routes, ..subject() };
+        let (mut output, mut probe, telemetry) = held::sink(&subject, &held, 2);
+        let control = async {
+            logit_pipeline::test_util::wait_until("both batches held", || held.held() == 2).await;
+            held.release(1, held::RESP_500);
+            logit_pipeline::test_util::wait_until("batch 1 resent behind a held batch 2", || {
+                held.paths(1).len() >= 4 && held.held() == 1
+            })
+            .await;
+            held.release(2, held::RESP_204);
+        };
+        let (totals, _) = held::run(
+            &mut output,
+            &mut probe,
+            telemetry,
+            vec![three_routes(1), three_routes(2)],
+            DeliveryPosture::AtLeastOnce,
+            std::future::pending(),
+            control,
+        )
+        .await;
+        let paths = ["/api/v2/series", "/api/v1/events", "/api/v2/logs"];
+        assert_eq!(held.paths(1), [paths[0], paths[1], paths[2], paths[2]]);
+        assert_eq!(held.paths(2), paths);
+        assert_eq!(held::delivered(&totals), 2.0);
+        let rejected = [("route", "series"), ("reason", "rejected")];
+        assert_eq!(totals.sum(RECORDS_DROPPED, &rejected), 1.0);
     }
 }

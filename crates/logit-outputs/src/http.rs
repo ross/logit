@@ -47,8 +47,10 @@
 
 #[cfg(test)]
 pub(crate) mod held;
+mod journal;
 mod slots;
 
+pub(crate) use journal::Journal;
 pub(crate) use slots::Slots;
 
 use bytes::Bytes;
