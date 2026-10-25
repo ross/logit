@@ -299,7 +299,10 @@ use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
 use logit_core::{redact, Diagnostics, Event, EventBatch, Exemplar, Telemetry};
 use logit_pipeline::listen::BindOptions;
+/// The exposition's `bind_tls:`, the server-side settings every TLS listener takes.
+pub use logit_pipeline::tls::TlsServerSettings;
 use logit_pipeline::{BatchContext, DeliveryPosture, Fault, Output, SeqId};
+use logit_proto::auth::Credentials;
 use logit_proto::prometheus::compression::{self, Encoding};
 use logit_proto::prometheus::{
     events_to_families, events_to_families_pending, remote_write, text, Destination, Dialect,
@@ -561,6 +564,8 @@ struct ServerState {
     response_timeout: Duration,
     telemetry: Telemetry,
     clock: Clock,
+    /// `bind_auth:`; empty accepts every scrape.
+    auth: Credentials,
 }
 
 /// `prometheus_out` in the mode the config selected (see the module doc). One enum, not two
@@ -686,6 +691,10 @@ pub struct ExposeOutput {
     clock: Clock,
     /// Socket options set before the bind (`reuse_port:`).
     bind_options: BindOptions,
+    /// Built by [`ExposeOutput::with_bind_tls`] from `bind_tls:`; `None` serves plaintext.
+    tls: Option<Arc<rustls::ServerConfig>>,
+    /// `bind_auth:`. See [`ExposeOutput::with_auth`].
+    auth: Credentials,
 }
 
 impl ExposeOutput {
@@ -704,6 +713,8 @@ impl ExposeOutput {
             telemetry: Telemetry::default(),
             clock: Arc::new(Instant::now),
             bind_options: BindOptions::default(),
+            tls: None,
+            auth: Credentials::default(),
         }
     }
 
@@ -731,9 +742,38 @@ impl ExposeOutput {
         self
     }
 
+    /// Requires every scrape to carry one of `credentials` (`bind_auth:` in config). Empty, the
+    /// default, accepts any scrape. See the module doc's "Security posture".
+    pub fn with_auth(mut self, credentials: Credentials) -> Self {
+        self.auth = credentials;
+        self
+    }
+
+    /// Turns on TLS for the exposition (`bind_tls:` in config), offering `http/1.1` by ALPN since
+    /// the server speaks nothing else. Paths in `settings` resolve against `base_dir`.
+    ///
+    /// Registers the files with `reloader` under this sink's diagnostics and telemetry as they are
+    /// when this runs, so call it after `with_diagnostics` and `with_telemetry`.
+    pub fn with_bind_tls(
+        mut self,
+        settings: &TlsServerSettings,
+        base_dir: &Path,
+        reloader: &logit_pipeline::tls::TlsReloader,
+    ) -> anyhow::Result<Self> {
+        self.tls = Some(Arc::new(logit_pipeline::tls::build_server_config(
+            settings,
+            base_dir,
+            &[b"http/1.1"],
+            reloader,
+            &self.diag,
+            &self.telemetry,
+        )?));
+        Ok(self)
+    }
+
     /// Reaches the codec's encoder, which reports the throttled
     /// `delta_temporality_unresolved`/`gauge_delta_unresolved` diagnostics, and the accept loop's
-    /// `prometheus_accept_failed`.
+    /// `prometheus_accept_failed` and `connection_error`.
     pub fn with_diagnostics(mut self, diag: Diagnostics) -> Self {
         self.diag = diag;
         self.rebuild_encoder();
@@ -799,8 +839,10 @@ impl Output for ExposeOutput {
             response_timeout: response_timeout(self.max_series),
             telemetry: self.telemetry.clone(),
             clock: Arc::clone(&self.clock),
+            auth: self.auth.clone(),
         });
-        self.server = Some(tokio::spawn(serve(listener, state, self.diag.clone())));
+        let tls = self.tls.clone().map(tokio_rustls::TlsAcceptor::from);
+        self.server = Some(tokio::spawn(serve(listener, state, tls, self.diag.clone())));
         Ok(())
     }
 
@@ -1261,9 +1303,16 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 /// The accept loop, as in `logit-cli::admin::serve_on`: a task per connection, the permit taken
-/// after accept so the kernel backlog absorbs a burst, and a per-connection timeout. Returns `()`:
-/// the task is only aborted, never joined, so an `Err` would go unread.
-async fn serve(listener: TcpListener, state: Arc<ServerState>, mut diag: Diagnostics) {
+/// after accept so the kernel backlog absorbs a burst, and a per-connection timeout. Under
+/// `bind_tls:` the handshake runs in the connection's task, bounded by [`HEADER_READ_TIMEOUT`]
+/// as the request head is. Returns `()`: the task is only aborted, never joined, so an `Err`
+/// would go unread.
+async fn serve(
+    listener: TcpListener,
+    state: Arc<ServerState>,
+    tls: Option<tokio_rustls::TlsAcceptor>,
+    mut diag: Diagnostics,
+) {
     let connection_limit = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
     loop {
         let stream = match listener.accept().await {
@@ -1289,23 +1338,54 @@ async fn serve(listener: TcpListener, state: Arc<ServerState>, mut diag: Diagnos
         let permit =
             connection_limit.clone().acquire_owned().await.expect("this semaphore is never closed");
         let state = Arc::clone(&state);
-        let response_deadline = state.response_timeout;
+        let tls = tls.clone();
+        let mut diag = diag.clone();
         tokio::spawn(async move {
             let _permit = permit; // held for the connection's lifetime; released on drop
-            let svc = service_fn(move |req| {
-                let state = Arc::clone(&state);
-                async move { handle(req, state) }
-            });
-            // Two deadlines: hyper's tight one on request headers (slowloris), and the outer one
-            // on the whole connection, which scales with `max_series` to outlast the scraper's
-            // `scrape_timeout`.
-            let serve = hyper::server::conn::http1::Builder::new()
-                .timer(hyper_util::rt::TokioTimer::new())
-                .header_read_timeout(HEADER_READ_TIMEOUT)
-                .serve_connection(TokioIo::new(stream), svc);
-            let _ = tokio::time::timeout(response_deadline, serve).await;
+            match tls {
+                None => serve_connection(stream, state).await,
+                Some(acceptor) => {
+                    match tokio::time::timeout(HEADER_READ_TIMEOUT, acceptor.accept(stream)).await {
+                        Ok(Ok(stream)) => serve_connection(stream, state).await,
+                        Ok(Err(err)) => {
+                            diag.warn_throttled(
+                                "connection_error",
+                                format_args!("a scrape connection's TLS handshake failed: {err}"),
+                            );
+                        }
+                        Err(_elapsed) => {
+                            diag.warn_throttled(
+                                "connection_error",
+                                format_args!(
+                                    "a scrape connection's TLS handshake did not complete \
+                                     within {HEADER_READ_TIMEOUT:?}"
+                                ),
+                            );
+                        }
+                    }
+                }
+            }
         });
     }
+}
+
+/// Serves one accepted (and, under `bind_tls:`, handshaken) connection. Two deadlines: hyper's
+/// tight one on request headers (slowloris), and the outer one on the whole connection, which
+/// scales with `max_series` to outlast the scraper's `scrape_timeout`.
+async fn serve_connection<IO>(io: IO, state: Arc<ServerState>)
+where
+    IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let response_deadline = state.response_timeout;
+    let svc = service_fn(move |req| {
+        let state = Arc::clone(&state);
+        async move { handle(req, state) }
+    });
+    let serve = hyper::server::conn::http1::Builder::new()
+        .timer(hyper_util::rt::TokioTimer::new())
+        .header_read_timeout(HEADER_READ_TIMEOUT)
+        .serve_connection(TokioIo::new(io), svc);
+    let _ = tokio::time::timeout(response_deadline, serve).await;
 }
 
 fn handle(
@@ -1324,6 +1404,18 @@ fn handle(
             .header("content-type", "text/plain; charset=utf-8")
             .body(Full::new(Bytes::from_static(b"method not allowed")))
             .expect("a well-formed response always builds"));
+    }
+    // After the route and method, as every listener orders it, and before any render.
+    let authorization = req.headers().get(http::header::AUTHORIZATION).map(HeaderValue::as_bytes);
+    if state.auth.check(authorization).is_err() {
+        state.telemetry.count(SCRAPES, 1.0, &[("class", "unauthorized")]);
+        let mut response = text_response(StatusCode::UNAUTHORIZED, "unauthorized");
+        for challenge in state.auth.challenges() {
+            response
+                .headers_mut()
+                .append(http::header::WWW_AUTHENTICATE, HeaderValue::from_static(challenge));
+        }
+        return Ok(response);
     }
 
     let dialect = negotiate(req.headers().get(http::header::ACCEPT).and_then(header_str));

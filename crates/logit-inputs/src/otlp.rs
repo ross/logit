@@ -201,7 +201,8 @@
 //! API change, tracked in `docs/known-gaps/otlp.md`.
 
 use crate::http::{
-    body_read_error_message, collect_with_stall_bound, drive_connection, Activity, BodyReadError,
+    body_read_error_message, collect_with_stall_bound, drive_connection, Activity, AuthGate,
+    BodyReadError,
 };
 use crate::listener::Prelude;
 use crate::peer::ConnectionPeer;
@@ -209,6 +210,7 @@ use crate::Input;
 use bytes::Bytes;
 use http::{HeaderMap, HeaderValue, Method, StatusCode};
 use http_body_util::{Full, Limited};
+use logit_proto::auth::Credentials;
 use logit_proto::forwarded::ForwardedHeader;
 // Only this module's tests collect a body directly; the lib path uses `collect_with_stall_bound`.
 #[cfg(test)]
@@ -295,6 +297,8 @@ pub struct OtlpInput {
     proxy_protocol: bool,
     /// `forwarded:` in config. See [`Self::with_forwarded`].
     forwarded: Option<ForwardedHeader>,
+    /// `auth:` in config. See [`Self::with_auth`].
+    auth: AuthGate,
 }
 
 impl OtlpInput {
@@ -313,6 +317,7 @@ impl OtlpInput {
             bind_options: BindOptions::default(),
             proxy_protocol: false,
             forwarded: None,
+            auth: AuthGate::default(),
         }
     }
 
@@ -410,6 +415,13 @@ impl OtlpInput {
         self.forwarded = header;
         self
     }
+
+    /// Requires every request, HTTP and gRPC alike, to carry one of `credentials` (`auth:` in
+    /// config). Empty, the default, accepts any request. See this module's "Authentication".
+    pub fn with_auth(mut self, credentials: Credentials) -> Self {
+        self.auth = AuthGate::new(credentials, "otlp_in", "request_rejected");
+        self
+    }
 }
 
 #[async_trait::async_trait]
@@ -497,6 +509,7 @@ impl Input for OtlpInput {
             let live_connections = live_connections.clone();
             let (record_peer, proxy_protocol) = (self.peer, self.proxy_protocol);
             let forwarded = self.forwarded;
+            let auth = self.auth.clone();
             let mut conn_shutdown = shutdown.clone();
             tasks.spawn(async move {
                 // Held for the connection's lifetime; released on drop.
@@ -586,6 +599,7 @@ impl Input for OtlpInput {
                             transport,
                             sink,
                             telemetry.clone(),
+                            Gate { auth: auth.clone(), diag: diag.clone() },
                             connection_peer,
                             idle_timeout,
                             handshake_timeout,
@@ -599,6 +613,7 @@ impl Input for OtlpInput {
                             transport,
                             sink,
                             telemetry.clone(),
+                            Gate { auth: auth.clone(), diag: diag.clone() },
                             connection_peer,
                             idle_timeout,
                             handshake_timeout,
@@ -648,6 +663,7 @@ async fn serve_connection<IO>(
     transport: OtlpTransport,
     sink: Fanout,
     telemetry: Telemetry,
+    gate: Gate,
     peer: ConnectionPeer,
     idle_timeout: Option<std::time::Duration>,
     grace: std::time::Duration,
@@ -664,16 +680,18 @@ where
         OtlpTransport::Http => {
             let svc = service_fn({
                 let activity = Arc::clone(&activity);
-                let (sink, telemetry) = (sink.clone(), telemetry.clone());
+                let (sink, telemetry, gate) = (sink.clone(), telemetry.clone(), gate.clone());
                 move |req| {
                     // `enter` here, not inside the returned future: hyper calls the service as
                     // soon as a request head is parsed, so the in-flight count rises then.
                     let in_flight = activity.enter();
                     let (sink, telemetry, peer) = (sink.clone(), telemetry.clone(), peer.clone());
+                    let gate = gate.clone();
                     let activity = Arc::clone(&activity);
                     async move {
                         let _in_flight = in_flight;
-                        handle_http(req, sink, telemetry, &peer, &activity, idle_timeout).await
+                        handle_http(req, sink, telemetry, &gate, &peer, &activity, idle_timeout)
+                            .await
                     }
                 }
             });
@@ -699,10 +717,12 @@ where
                 move |req| {
                     let in_flight = activity.enter();
                     let (sink, telemetry, peer) = (sink.clone(), telemetry.clone(), peer.clone());
+                    let gate = gate.clone();
                     let activity = Arc::clone(&activity);
                     async move {
                         let _in_flight = in_flight;
-                        handle_grpc(req, sink, telemetry, &peer, &activity, idle_timeout).await
+                        handle_grpc(req, sink, telemetry, &gate, &peer, &activity, idle_timeout)
+                            .await
                     }
                 }
             });
@@ -725,6 +745,7 @@ async fn handle_http(
     req: http::Request<Incoming>,
     sink: Fanout,
     telemetry: Telemetry,
+    gate: &Gate,
     peer: &ConnectionPeer,
     activity: &Activity,
     stall: Option<std::time::Duration>,
@@ -739,6 +760,13 @@ async fn handle_http(
     let Some(signal) = route_path(req.uri().path()) else {
         return Ok(text_response(StatusCode::NOT_FOUND, "not found"));
     };
+    // Before every other header and the body (this module's "Authentication").
+    if let Err(denied) = gate.auth.check(req.headers()) {
+        gate.auth.reject(denied, peer, &telemetry, &gate.diag);
+        let mut response = text_response(StatusCode::UNAUTHORIZED, "unauthorized");
+        gate.auth.challenge(response.headers_mut());
+        return Ok(response);
+    }
     let encoding = match request_encoding(req.headers()) {
         Ok(encoding) => encoding,
         Err(message) => return Ok(text_response(StatusCode::UNSUPPORTED_MEDIA_TYPE, &message)),
@@ -911,6 +939,7 @@ async fn handle_grpc(
     req: http::Request<Incoming>,
     sink: Fanout,
     telemetry: Telemetry,
+    gate: &Gate,
     peer: &ConnectionPeer,
     activity: &Activity,
     stall: Option<std::time::Duration>,
@@ -925,6 +954,12 @@ async fn handle_grpc(
     else {
         return Ok(grpc_response(12, &format!("unknown method {path}"), None));
     };
+    // gRPC metadata is HTTP/2 headers, so `authorization` reads as on the HTTP side. `16`,
+    // `UNAUTHENTICATED`, carries no challenge (this module's "Authentication").
+    if let Err(denied) = gate.auth.check(req.headers()) {
+        gate.auth.reject(denied, peer, &telemetry, &gate.diag);
+        return Ok(grpc_response(16, "unauthenticated", None));
+    }
     // The frame's compressed flag (`grpc::unframe`) drives decompression; this check only rejects
     // an undecodable encoding up front with a clear message.
     if let Some(enc) = req.headers().get("grpc-encoding") {
@@ -1003,6 +1038,13 @@ async fn handle_grpc(
         }
         Err(err) => Ok(grpc_response(3, &err.to_string(), None)),
     }
+}
+
+/// A connection's `auth:` check and the diagnostics a refusal reports under.
+#[derive(Clone)]
+struct Gate {
+    auth: AuthGate,
+    diag: Diagnostics,
 }
 
 /// The refusal's message, on both transports.

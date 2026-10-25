@@ -662,6 +662,7 @@ pub(crate) fn build_spec(
             bind,
             protocol,
             tls,
+            auth,
             handshake_timeout,
             idle_timeout,
             max_connections,
@@ -681,7 +682,8 @@ pub(crate) fn build_spec(
                 .with_peer(*peer)
                 .with_proxy_protocol(*proxy_protocol)
                 .with_forwarded(forwarded.map(to_forwarded_header))
-                .with_reuse_port(*reuse_port);
+                .with_reuse_port(*reuse_port)
+                .with_auth(to_credentials(auth));
             if let Some(tls) = tls {
                 input = input.with_tls(&to_tls_server_settings(tls), base_dir, tls_reloader)?;
             }
@@ -836,6 +838,7 @@ pub(crate) fn build_spec(
             bind,
             path,
             bind_tls,
+            bind_auth,
             idle_timeout,
             max_connections,
             metadata_cache,
@@ -855,6 +858,7 @@ pub(crate) fn build_spec(
                         .with_proxy_protocol(*proxy_protocol)
                         .with_forwarded(forwarded.map(to_forwarded_header))
                         .with_reuse_port(*reuse_port)
+                        .with_auth(to_credentials(bind_auth))
                         // Unconditional: the receiver reads `max_families: 0` as off, and rule 55
                         // rejects a zero `ttl`.
                         .with_metadata_cache(metadata_cache.max_families, metadata_cache.ttl);
@@ -1622,6 +1626,8 @@ pub(crate) fn build_spec(
             path,
             expire_after,
             max_series,
+            bind_tls,
+            bind_auth,
             endpoint,
             version,
             compression,
@@ -1636,14 +1642,22 @@ pub(crate) fn build_spec(
                 (Some(bind), _) => {
                     // Not bound here: the runtime's pre-spawn `Output::bind` pass opens it, so an
                     // address in use is a startup failure naming this component.
-                    ExposeOutput::new(bind.clone())
+                    let mut output = ExposeOutput::new(bind.clone())
                         .with_path(path.clone())
                         .with_expire_after(*expire_after)
                         .with_max_series(*max_series)
                         .with_reuse_port(*reuse_port)
+                        .with_auth(to_credentials(bind_auth))
                         .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
-                        .with_telemetry(telemetry.clone())
-                        .into()
+                        .with_telemetry(telemetry.clone());
+                    if let Some(bind_tls) = bind_tls {
+                        output = output.with_bind_tls(
+                            &to_tls_server_settings(bind_tls),
+                            base_dir,
+                            tls_reloader,
+                        )?;
+                    }
+                    output.into()
                 }
                 (None, Some(endpoint)) => RemoteWriteOutput::new(endpoint.clone())
                     .with_version(to_remote_write_version(*version))
@@ -2340,6 +2354,14 @@ fn to_tls_server_settings(
         key_file: tls.key_file.clone(),
         client_ca_file: tls.client_ca_file.clone(),
     }
+}
+
+/// An `auth:` or `bind_auth:` block into the check its listener runs on every request.
+fn to_credentials(auth: &logit_config::HttpAuthConfig) -> logit_proto::auth::Credentials {
+    logit_proto::auth::Credentials::new(
+        auth.bearer_tokens.iter().map(String::as_str),
+        auth.basic.iter().map(|basic| (basic.username.as_str(), basic.password.as_str())),
+    )
 }
 
 /// Config's `MetricSpec` into the transform's identically shaped type.
@@ -3214,6 +3236,8 @@ mod tests {
                 path: "/metrics".to_string(),
                 expire_after: Duration::from_secs(300),
                 max_series: 100_000,
+                bind_tls: None,
+                bind_auth: Default::default(),
                 endpoint: None,
                 version: logit_config::RemoteWriteVersion::default(),
                 compression: logit_config::RemoteWriteCompression::default(),
@@ -3248,6 +3272,8 @@ mod tests {
                     path: logit_config::default_prometheus_path(),
                     expire_after: logit_config::default_prometheus_expire_after(),
                     max_series: logit_config::default_prometheus_max_series(),
+                    bind_tls: None,
+                    bind_auth: Default::default(),
                     endpoint: Some("http://mimir:8080/api/v1/push".to_string()),
                     version,
                     compression,
@@ -3517,6 +3543,7 @@ mod tests {
                     bind: "127.0.0.1:0".to_string(),
                     protocol,
                     tls: None,
+                    auth: Default::default(),
                     handshake_timeout: Duration::from_secs(5),
                     idle_timeout: None,
                     max_connections: logit_config::default_max_connections(),
@@ -3590,6 +3617,7 @@ mod tests {
                 bind: None,
                 path: "/api/v1/write".to_string(),
                 bind_tls: None,
+                bind_auth: Default::default(),
                 idle_timeout: None,
                 max_connections: logit_config::default_max_connections(),
                 metadata_cache: logit_config::MetadataCacheConfig::default(),
@@ -3623,6 +3651,7 @@ mod tests {
                 bind: Some("127.0.0.1:0".to_string()),
                 path: "/api/v1/write".to_string(),
                 bind_tls: None,
+                bind_auth: Default::default(),
                 idle_timeout: Some(Duration::from_secs(60)),
                 max_connections: logit_config::default_max_connections(),
                 metadata_cache: logit_config::MetadataCacheConfig::default(),
@@ -4114,6 +4143,7 @@ mod tests {
                     key_file: "server.key".to_string(),
                     client_ca_file: None,
                 }),
+                auth: Default::default(),
                 handshake_timeout: Duration::from_secs(5),
                 idle_timeout: None,
                 max_connections: logit_config::default_max_connections(),
@@ -4382,6 +4412,7 @@ mod tests {
                     key_file: "server.key".to_string(),
                     client_ca_file: None,
                 }),
+                auth: Default::default(),
                 handshake_timeout: Duration::from_millis(50),
                 idle_timeout: None,
                 max_connections: logit_config::default_max_connections(),
@@ -4599,6 +4630,7 @@ mod tests {
             bind: addr.clone(),
             protocol: logit_config::OtlpProtocol::Http,
             tls: None,
+            auth: Default::default(),
             handshake_timeout: logit_config::default_handshake_timeout(),
             idle_timeout: None,
             max_connections: 1,
@@ -4836,6 +4868,7 @@ mod tests {
                 bind: addr.clone(),
                 protocol: logit_config::OtlpProtocol::Http,
                 tls: None,
+                auth: Default::default(),
                 handshake_timeout: logit_config::default_handshake_timeout(),
                 idle_timeout: Some(Duration::from_millis(50)),
                 max_connections: logit_config::default_max_connections(),

@@ -35,7 +35,8 @@ use hyper::body::Incoming;
 use hyper::server::conn::http2;
 use hyper_util::rt::TokioExecutor;
 use hyper_util::server::conn::auto;
-use logit_core::Telemetry;
+use logit_core::{Diagnostics, Telemetry};
+use logit_proto::auth::{Credentials, Denied};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -670,6 +671,64 @@ pub(crate) async fn deliver_with_deadline(
         }
     }
     Ok(())
+}
+
+/// One listener's `auth:` or `bind_auth:` check ([`logit_proto::auth`]), with what it reports
+/// when it refuses a request: `logit.input.requests.rejected{reason="auth"}` and the throttled
+/// `diagnostic`, naming the peer and why, never the credential. Cloned per connection; the
+/// credentials are shared.
+#[derive(Clone)]
+pub(crate) struct AuthGate {
+    credentials: Arc<Credentials>,
+    /// The listener's kind, which opens the diagnostic's message.
+    kind: &'static str,
+    /// The throttled diagnostic's key: the one the listener reports its other rejections under.
+    diagnostic: &'static str,
+}
+
+impl AuthGate {
+    pub(crate) fn new(
+        credentials: Credentials,
+        kind: &'static str,
+        diagnostic: &'static str,
+    ) -> Self {
+        Self { credentials: Arc::new(credentials), kind, diagnostic }
+    }
+
+    /// Checks the request's first `Authorization` header. Always `Ok` with no credentials set.
+    pub(crate) fn check(&self, headers: &http::HeaderMap) -> Result<(), Denied> {
+        let value = headers.get(http::header::AUTHORIZATION).map(http::HeaderValue::as_bytes);
+        self.credentials.check(value)
+    }
+
+    /// Counts and reports one refusal.
+    pub(crate) fn reject(
+        &self,
+        denied: Denied,
+        peer: &dyn std::fmt::Display,
+        telemetry: &Telemetry,
+        diag: &Diagnostics,
+    ) {
+        telemetry.count("logit.input.requests.rejected", 1.0, &[("reason", "auth")]);
+        diag.clone().warn_throttled(
+            self.diagnostic,
+            format_args!("{}: rejecting a request from {peer}: {denied}", self.kind),
+        );
+    }
+
+    /// Adds a `WWW-Authenticate` challenge per configured scheme to a `401`'s headers.
+    pub(crate) fn challenge(&self, headers: &mut http::HeaderMap) {
+        for challenge in self.credentials.challenges() {
+            headers
+                .append(http::header::WWW_AUTHENTICATE, http::HeaderValue::from_static(challenge));
+        }
+    }
+}
+
+impl Default for AuthGate {
+    fn default() -> Self {
+        Self::new(Credentials::default(), "", "")
+    }
 }
 
 /// Reads one HTTP/1.1 response, its head and its `Content-Length` body, off a keep-alive

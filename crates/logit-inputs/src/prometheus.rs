@@ -329,7 +329,8 @@
 //! `logit.input.metrics.dropped{reason}` counts what it stepped over, native histograms included.
 
 use crate::http::{
-    body_read_error_message, collect_with_stall_bound, drive_connection, Activity, BodyReadError,
+    body_read_error_message, collect_with_stall_bound, drive_connection, Activity, AuthGate,
+    BodyReadError,
 };
 use crate::listener::Prelude;
 use crate::peer::ConnectionPeer;
@@ -347,6 +348,7 @@ use logit_core::{
 };
 use logit_pipeline::listen::BindOptions;
 use logit_pipeline::Fanout;
+use logit_proto::auth::Credentials;
 use logit_proto::forwarded::ForwardedHeader;
 use logit_proto::prometheus::compression::{self, DecompressError, Encoding};
 use logit_proto::prometheus::{
@@ -1130,6 +1132,8 @@ pub struct PrometheusReceiver {
     proxy_protocol: bool,
     /// `forwarded:` in config. See [`Self::with_forwarded`].
     forwarded: Option<ForwardedHeader>,
+    /// `bind_auth:` in config. See [`Self::with_auth`].
+    auth: AuthGate,
     diag: Diagnostics,
     telemetry: Telemetry,
 }
@@ -1152,6 +1156,7 @@ impl PrometheusReceiver {
             bind_options: BindOptions::default(),
             proxy_protocol: false,
             forwarded: None,
+            auth: AuthGate::default(),
             diag: Diagnostics::default(),
             telemetry: Telemetry::default(),
         }
@@ -1245,6 +1250,13 @@ impl PrometheusReceiver {
     /// [`ConnectionPeer::request`]. Off by default.
     pub fn with_forwarded(mut self, header: Option<ForwardedHeader>) -> Self {
         self.forwarded = header;
+        self
+    }
+
+    /// Requires every write to carry one of `credentials` (`bind_auth:` in config). Empty, the
+    /// default, accepts any write. See this module's "Authentication".
+    pub fn with_auth(mut self, credentials: Credentials) -> Self {
+        self.auth = AuthGate::new(credentials, "prometheus_in", "write_rejected");
         self
     }
 
@@ -1355,6 +1367,7 @@ impl Input for PrometheusReceiver {
             let metadata_cache = metadata_cache.clone();
             let (record_peer, proxy_protocol) = (self.peer, self.proxy_protocol);
             let forwarded = self.forwarded;
+            let auth = self.auth.clone();
             let mut conn_shutdown = shutdown.clone();
             tasks.spawn(async move {
                 // Held for the connection's lifetime; released on drop.
@@ -1434,6 +1447,7 @@ impl Input for PrometheusReceiver {
                             path,
                             resource,
                             metadata_cache,
+                            auth,
                             sink,
                             telemetry.clone(),
                             diag.clone(),
@@ -1450,6 +1464,7 @@ impl Input for PrometheusReceiver {
                             path,
                             resource,
                             metadata_cache,
+                            auth,
                             sink,
                             telemetry.clone(),
                             diag.clone(),
@@ -1499,6 +1514,7 @@ async fn serve_write_connection<IO>(
     path: Arc<str>,
     resource: Arc<Resource>,
     metadata_cache: Option<Arc<MetadataCache>>,
+    auth: AuthGate,
     sink: Fanout,
     telemetry: Telemetry,
     diag: Diagnostics,
@@ -1524,7 +1540,7 @@ where
             let (sink, telemetry, diag) = (sink.clone(), telemetry.clone(), diag.clone());
             let (path, resource) = (Arc::clone(&path), Arc::clone(&resource));
             let metadata_cache = metadata_cache.clone();
-            let peer = peer.clone();
+            let (peer, auth) = (peer.clone(), auth.clone());
             let activity = Arc::clone(&activity);
             async move {
                 let _in_flight = in_flight;
@@ -1533,6 +1549,7 @@ where
                     &path,
                     resource,
                     metadata_cache.as_deref(),
+                    &auth,
                     &peer,
                     sink,
                     telemetry,
@@ -1569,6 +1586,7 @@ async fn handle_write(
     path: &str,
     resource: Arc<Resource>,
     metadata_cache: Option<&MetadataCache>,
+    auth: &AuthGate,
     peer: &ConnectionPeer,
     sink: Fanout,
     telemetry: Telemetry,
@@ -1582,6 +1600,7 @@ async fn handle_write(
         path,
         resource,
         metadata_cache,
+        auth,
         peer,
         &sink,
         &telemetry,
@@ -1610,6 +1629,7 @@ async fn write_response(
     path: &str,
     resource: Arc<Resource>,
     metadata_cache: Option<&MetadataCache>,
+    auth: &AuthGate,
     peer: &ConnectionPeer,
     sink: &Fanout,
     telemetry: &Telemetry,
@@ -1630,6 +1650,16 @@ async fn write_response(
         );
         response.headers_mut().insert(http::header::ALLOW, HeaderValue::from_static("POST"));
         return ("method", None, response);
+    }
+    // Before the other headers and the body (the module doc's "Authentication"). A 2.0 sender's
+    // `401` still carries the `-Written` zeros, so the version is read off `Content-Type` here.
+    if let Err(denied) = auth.check(req.headers()) {
+        auth.reject(denied, peer, telemetry, &diag);
+        let seen =
+            remote_write::Version::from_content_type(header_str(req.headers(), CONTENT_TYPE));
+        let mut response = text_response(seen, StatusCode::UNAUTHORIZED, "unauthorized");
+        auth.challenge(response.headers_mut());
+        return ("unauthorized", None, response);
     }
 
     // Both specs mandate Snappy *block* compression on every request, with no identity mode, so a

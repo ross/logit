@@ -174,14 +174,15 @@
 //!     is an empty `allow`, which clamps every value of its field
 //!     (`docs/adr/value-allowlist-cardinality-clamp.md`).
 //! 55. A `prometheus_in` with both or neither of `scrape_targets`/`bind`, a non-default field of
-//!     the other mode (`peer`/`proxy_protocol`/`forwarded`/`reuse_port` among the receiver's), a
-//!     bind-mode `path` not starting with `/`, or `metadata_cache.ttl: 0s` with
+//!     the other mode (`bind_auth`/`peer`/`proxy_protocol`/`forwarded`/`reuse_port` among the
+//!     receiver's), a bind-mode `path` not starting with `/`, or `metadata_cache.ttl: 0s` with
 //!     `max_families > 0` (`docs/adr/prometheus-remote-write.md`,
 //!     `docs/adr/listener-peer-address.md`).
 //! 56. A `prometheus_out` with both or neither of `bind`/`endpoint`, a non-default field of the
-//!     other mode (`reuse_port` among the registry's), `version: 2` with `compression: zstd` (2.0
-//!     mandates Snappy), or a sender fault in 40's shape: a non-absolute `endpoint`,
-//!     `timeout: 0s`, a reserved or colliding header, or a bad `endpoint_tls`
+//!     other mode (`bind_tls`/`bind_auth`/`reuse_port` among the registry's), `version: 2` with
+//!     `compression: zstd` (2.0 mandates Snappy), or a sender fault in 40's shape: a
+//!     non-absolute `endpoint`, `timeout: 0s`, a reserved or colliding header, or a bad
+//!     `endpoint_tls`
 //!     (`docs/adr/prometheus-remote-write.md`, `docs/adr/victoriametrics-interop.md`).
 //! 57. A datagram listener's `receive.read_batch` above `MAX_READ_BATCH`: the kernel doesn't clamp
 //!     `recvmmsg`'s `vlen`, so this bounds the receive slab and the shutdown-path loss
@@ -343,6 +344,10 @@
 //!     error names the key path, never the value (`docs/adr/lua-script-vars.md`).
 //! 96. A `dedup_timestamps` with a `precision` of `0s`, which has no bucket to put a timestamp in
 //!     (`docs/adr/dedup-timestamps-transform.md`).
+//! 97. An `otlp_in` `auth`, `prometheus_in` `bind_auth`, or `prometheus_out` `bind_auth` with an
+//!     empty bearer token, username, or password, or a bearer token with leading or trailing
+//!     whitespace: none could match a request's credential. Empty lists accept any request
+//!     (`docs/adr/listener-authentication.md`).
 //!
 //! Not validated: that a `by: {provenance: ..}` route key names a component in this graph. Like
 //! 37's ids, it may name a component relayed from another process. Nor is `keep`'s empty `fields`:
@@ -2545,6 +2550,7 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
             bind,
             path,
             bind_tls,
+            bind_auth,
             idle_timeout,
             max_connections,
             metadata_cache,
@@ -2610,6 +2616,8 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                 Some("path")
             } else if bind_tls.is_some() {
                 Some("bind_tls")
+            } else if !bind_auth.is_empty() {
+                Some("bind_auth")
             } else if idle_timeout.is_some() {
                 Some("idle_timeout")
             } else if *max_connections != default_max_connections() {
@@ -2648,6 +2656,8 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
             path,
             expire_after,
             max_series,
+            bind_tls,
+            bind_auth,
             endpoint,
             version,
             compression,
@@ -2706,8 +2716,7 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                     anyhow::bail!(
                         "component '{id}': 'endpoint_tls' tunes the TLS of a remote-write request \
                          and only means anything with 'endpoint' -- a prometheus_out with 'bind' \
-                         serves plaintext HTTP and has no client TLS at all (see the ADR's \
-                         'Security posture')"
+                         makes no requests; its server TLS is 'bind_tls'"
                     );
                 }
             }
@@ -2733,6 +2742,20 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                         "component '{id}': 'max_series' caps the exposition registry and only \
                          means anything with 'bind' -- a remote-write sender holds no series \
                          between batches"
+                    );
+                }
+                if bind_tls.is_some() {
+                    anyhow::bail!(
+                        "component '{id}': 'bind_tls' terminates TLS on the exposition and only \
+                         means anything with 'bind' -- a remote-write sender listens on nothing; \
+                         its client TLS is 'endpoint_tls'"
+                    );
+                }
+                if !bind_auth.is_empty() {
+                    anyhow::bail!(
+                        "component '{id}': 'bind_auth' checks the credentials a scrape carries \
+                         and only means anything with 'bind' -- a remote-write sender listens on \
+                         nothing; send a credential with 'headers'"
                     );
                 }
                 if *reuse_port {
@@ -4037,6 +4060,26 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
+    // Rule 97: an HTTP listener's credentials (`docs/adr/listener-authentication.md`). An empty
+    // token, username, or password reads as a request carrying none, so it would admit a request
+    // the operator meant to refuse or could never match; a token with leading or trailing
+    // whitespace could never match the trimmed header, a typo `!env` makes easy with a secret
+    // file's trailing newline. Empty lists are the "accept any request" setting, not an error.
+    // Rule 55 and 56 reject `bind_auth` in the mode that serves nothing.
+    for (id, component) in &components {
+        let (kind, field, auth) = match &component.kind {
+            ComponentKind::OtlpIn { auth, .. } => ("otlp_in", "auth", auth),
+            ComponentKind::PrometheusIn { bind_auth, .. } => {
+                ("prometheus_in", "bind_auth", bind_auth)
+            }
+            ComponentKind::PrometheusOut { bind_auth, .. } => {
+                ("prometheus_out", "bind_auth", bind_auth)
+            }
+            _ => continue,
+        };
+        check_http_auth(id, kind, field, auth)?;
+    }
+
     // Rule 87: `has_stale`/`drop_stale` (`docs/adr/stale-event-filtering.md`). A zero bound would
     // call nearly every event stale.
     for (id, component) in &components {
@@ -4472,6 +4515,45 @@ const LUA_MAX_EXACT_INTEGER: i128 = 1 << 53;
 
 /// Rule 95 over one component's `vars:`, depth first. A list element's path is its 0-based
 /// index in brackets (`vars.hosts[0]`), as the YAML lists it. No message prints a value.
+/// Rule 97's checks on one `auth:` or `bind_auth:` block. The messages name the field and the
+/// entry's position, never a value.
+fn check_http_auth(
+    id: &str,
+    kind: &str,
+    field: &str,
+    auth: &logit_config::HttpAuthConfig,
+) -> anyhow::Result<()> {
+    for (index, token) in auth.bearer_tokens.iter().enumerate() {
+        if token.is_empty() {
+            anyhow::bail!(
+                "component '{id}': {kind} '{field}.bearer_tokens' entry {index} is empty -- it \
+                 could never match a request's token; omit '{field}' to accept any request"
+            );
+        }
+        if token.trim() != token {
+            anyhow::bail!(
+                "component '{id}': {kind} '{field}.bearer_tokens' entry {index} has leading or \
+                 trailing whitespace, which the Authorization header can't carry, so it could \
+                 never match -- check the value (a secret file's trailing newline, say)"
+            );
+        }
+    }
+    for (index, credential) in auth.basic.iter().enumerate() {
+        for (part, value) in
+            [("username", &credential.username), ("password", &credential.password)]
+        {
+            if value.is_empty() {
+                anyhow::bail!(
+                    "component '{id}': {kind} '{field}.basic' entry {index} has an empty \
+                     {part} -- give both a username and a password; omit '{field}' to accept \
+                     any request"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 fn check_lua_vars(id: &str, vars: &logit_config::LuaVars) -> anyhow::Result<()> {
     fn walk(id: &str, path: &mut String, value: &logit_config::LuaVar) -> anyhow::Result<()> {
         use logit_config::LuaVar;
@@ -5177,6 +5259,7 @@ mod tests {
             bind: None,
             path: default_prometheus_write_path(),
             bind_tls: None,
+            bind_auth: Default::default(),
             idle_timeout: None,
             max_connections: default_max_connections(),
             metadata_cache: MetadataCacheConfig::default(),
@@ -5197,6 +5280,7 @@ mod tests {
             bind: Some(bind.to_string()),
             path: default_prometheus_write_path(),
             bind_tls: None,
+            bind_auth: Default::default(),
             idle_timeout: None,
             max_connections: default_max_connections(),
             metadata_cache: MetadataCacheConfig::default(),
@@ -11480,6 +11564,7 @@ mod tests {
             bind: "0.0.0.0:4317".to_string(),
             protocol: logit_config::OtlpProtocol::Http,
             tls: None,
+            auth: Default::default(),
             handshake_timeout,
             idle_timeout: None,
             max_connections: default_max_connections(),
@@ -11497,6 +11582,7 @@ mod tests {
             bind: "0.0.0.0:4317".to_string(),
             protocol: logit_config::OtlpProtocol::Http,
             tls: None,
+            auth: Default::default(),
             handshake_timeout: default_handshake_timeout(),
             idle_timeout,
             max_connections: default_max_connections(),
@@ -11726,6 +11812,7 @@ mod tests {
                 key_file: "server.key".to_string(),
                 client_ca_file: None,
             }),
+            auth: Default::default(),
             handshake_timeout: Duration::from_secs(30),
             idle_timeout: None,
             max_connections: default_max_connections(),
@@ -13730,6 +13817,8 @@ mod tests {
             path: path.to_string(),
             expire_after: Duration::from_secs(300),
             max_series,
+            bind_tls: None,
+            bind_auth: Default::default(),
             endpoint: None,
             version: logit_config::RemoteWriteVersion::default(),
             compression: logit_config::RemoteWriteCompression::default(),
@@ -13747,6 +13836,8 @@ mod tests {
             path: logit_config::default_prometheus_path(),
             expire_after: logit_config::default_prometheus_expire_after(),
             max_series: logit_config::default_prometheus_max_series(),
+            bind_tls: None,
+            bind_auth: Default::default(),
             endpoint: Some(endpoint.to_string()),
             version: logit_config::RemoteWriteVersion::default(),
             compression: logit_config::RemoteWriteCompression::default(),
