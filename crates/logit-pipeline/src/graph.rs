@@ -4512,11 +4512,6 @@ fn is_host_port(entry: &str) -> bool {
     })
 }
 
-/// The largest integer magnitude a double holds without rounding, and so a Lua number: 2^53.
-const LUA_MAX_EXACT_INTEGER: i128 = 1 << 53;
-
-/// Rule 95 over one component's `vars:`, depth first. A list element's path is its 0-based
-/// index in brackets (`vars.hosts[0]`), as the YAML lists it. No message prints a value.
 /// Rule 97's checks on one `auth:` or `bind_auth:` block. The messages name the field and the
 /// entry's position, never a value.
 fn check_http_auth(
@@ -4564,6 +4559,11 @@ fn check_http_auth(
     Ok(())
 }
 
+/// The largest integer magnitude a double holds without rounding, and so a Lua number: 2^53.
+const LUA_MAX_EXACT_INTEGER: i128 = 1 << 53;
+
+/// Rule 95 over one component's `vars:`, depth first. A list element's path is its 0-based
+/// index in brackets (`vars.hosts[0]`), as the YAML lists it. No message prints a value.
 fn check_lua_vars(id: &str, vars: &logit_config::LuaVars) -> anyhow::Result<()> {
     fn walk(id: &str, path: &mut String, value: &logit_config::LuaVar) -> anyhow::Result<()> {
         use logit_config::LuaVar;
