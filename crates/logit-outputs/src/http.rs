@@ -396,9 +396,9 @@ pub(crate) fn status_class(status: reqwest::StatusCode) -> &'static str {
 /// The `class` tag on `logit.output.requests` of a request that got no response, from its
 /// transport error's [`Fault`]: `connect_error` for a [`Fault::Clean`] connect failure (a refused
 /// or failed dial, a DNS failure, a failed TLS handshake), which the destination never saw, and
-/// `network_error` for the rest (a timeout, a connection reset or closed before the response),
-/// which it may have taken. A dial `connect_timeout` ends is a connect failure; one the request's
-/// `timeout` ends first, when it is the shorter, is a timeout and counts `network_error`
+/// `network_error` for the rest (a request timeout, a connection reset or closed before the
+/// response), which it may have taken. A dial `connect_timeout` ends is a connect failure; one the
+/// request's `timeout` ends first, when it is the shorter, is a timeout and counts `network_error`
 /// (`docs/adr/sink-send-path-and-attempt-accounting.md`, "Amendment: a failed dial counts
 /// `connect_error`").
 pub(crate) fn transport_class(fault: Fault) -> &'static str {
@@ -432,8 +432,9 @@ pub(crate) fn classify_status(status: reqwest::StatusCode) -> Fault {
 }
 
 /// A `reqwest` transport failure's [`Fault`]. [`Fault::Clean`] is reserved for a *connect*
-/// failure, the one case where the destination provably never saw the request; everything else --
-/// a timeout, a connection reset mid-body, a TLS failure after the handshake started -- is
+/// failure, a dial `connect_timeout` ended included, the one case where the destination provably
+/// never saw the request; everything else -- a request timeout after the connection opened, a
+/// connection reset mid-body, a TLS failure after the handshake started -- is
 /// [`Fault::Ambiguous`], since the request may have been received and the response lost.
 pub(crate) fn classify_reqwest_error(err: &reqwest::Error) -> Fault {
     if err.is_connect() {

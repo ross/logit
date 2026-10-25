@@ -93,8 +93,8 @@
 //!
 //! `Clean` means Splunk didn't take the body. A connect failure, a `429` (codes 26 and 27), and a
 //! `503` code 9 ("Server is busy") each say so ([`is_busy`]); a `500` code 8 may have indexed, and
-//! a `408`, a timeout, or another `5xx` says nothing either way. `Clean` holds only while nothing
-//! of the batch has reached Splunk: `write_loop` retries `Clean` under every posture, and a retry
+//! a `408`, a request timeout, or another `5xx` says nothing either way. `Clean` holds only while
+//! nothing of the batch has reached Splunk: `write_loop` retries `Clean` under every posture, and a retry
 //! re-sends the bodies already indexed, so once one was accepted each of these, and a `Refused`
 //! answer, is `Ambiguous` instead ([`after_delivery`]). A `Retry-After` header is ignored; `write_loop`'s backoff applies.
 //!
