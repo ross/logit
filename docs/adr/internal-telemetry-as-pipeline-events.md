@@ -1,6 +1,6 @@
 ---
 created: 2026-08-31
-updated: 2026-10-18
+updated: 2026-10-25
 ---
 
 # Internal telemetry as ordinary pipeline events, drained from a component-level buffer
@@ -103,7 +103,7 @@ drop in its own telemetry (`datadog.dogstatsd.client.packets_dropped*`). A compo
 distinct `(name, tags)` keys at 1024; beyond that, a new key is dropped and the drop counted as
 `logit.internal.points.dropped{reason="cardinality"}` under that component's own identity — a
 misbehaving component (one that ignores the tag-cardinality convention: `&'static str` tag values
-only, since the process-wide interner never evicts, per `docs/known-gaps/runtime.md`) becomes
+only, since the process-wide interner never evicts, per `docs/design/memory.md` §4) becomes
 visible instead of quietly leaking.
 
 ## Alternatives considered

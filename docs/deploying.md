@@ -86,6 +86,14 @@ blocks, fails `validate` with the component's id and the key, such as
 ``component `scrape`: unknown field `tls` ``. Keys whose names are your data, such as `set`'s
 attributes or `headers`, take any name.
 
+**`!env` has three costs, each decided in [ADR `env-yaml-tag`](adr/env-yaml-tag.md).** `logit
+graph` also needs every reference to resolve, though it reads only `sources` and `type`; to render
+a config with secrets you don't have, render a copy with placeholder values filled in. The JSON
+Schema describes the substituted value, never the tag, so a schema-aware YAML editor flags a
+`!env` value. And a deserialization error carries no line or column, because the tag is resolved
+on the parsed tree; `!env`'s own errors name the config path (`components.influx_out.token`)
+instead, and a note is added when a substituted value's type likely caused the failure.
+
 **`validate` doesn't open referenced files.** `lua_file`, a `stdio_out`/`file_out` path, and
 `otlp_out`/`otlp_in`'s `tls.*_file` fields are read only when `run` constructs the component. A
 mistyped `tls.ca_file` path passes `validate` and fails at startup instead, with the path in the
@@ -322,6 +330,10 @@ fails the probe instead of holding it open.
 
 ### What to watch on `/readyz`
 
+- **Readiness is per process, not per sink.** A sink holding its queue while its destination
+  refuses it doesn't flip `/readyz`; its `buffer:` block bounds what the hold accumulates, and the
+  `logit.component.retrying` gauge and the paced `retrying` error line are what to alert on
+  ([ADR `admin-readiness-endpoint`](adr/admin-readiness-endpoint.md)).
 - **`/readyz` stuck at `503 degraded`** means a node has failed, not that a sink is retrying. See
   [Sink failure semantics](#sink-failure-semantics) for how a sink handles a failing
   destination without a node failing.
@@ -479,7 +491,8 @@ client already saw `connect()` succeed and may have sent data. With `net.ipv4.tc
 (Linux 5.14 and later), the kernel moves them to the surviving process instead. `logit` accepts
 through the delay, until the instant the drain drops a listener, so its queue is near empty at the
 close, and the sysctl matters only for connections that finish their handshake in that
-last instant. Every stream client `logit` serves reconnects after a reset.
+last instant. Every stream client `logit` serves reconnects after a reset, but a line it had sent
+into the reset connection is lost unless its protocol acknowledges.
 
 It's a node-level setting. A `hostNetwork` pod shares the node's network namespace and can't set
 network sysctls, so set it in the node image, from a privileged init DaemonSet, or through your
@@ -903,7 +916,10 @@ An error the sink attaches no fault to is treated as `Rejected`.
 - **An attempt has no runtime timeout.** The sink's own transport timeout bounds each one:
   `request_timeout`, the HTTP client's timeouts, or, on `syslog_out`, `statsd_out`, and
   `graphite_out` over a stream, `connect_timeout`, which also bounds each write's progress. The
-  shutdown grace cuts an attempt short.
+  shutdown grace cuts an attempt short. A write with no such timeout, such as `stdio_out`'s to a
+  pipe, holds the queue with no failed attempt, so `logit.component.retrying` stays `0`, and a
+  `buffer_full` warning is the first sign once the queue fills
+  ([ADR `sink-fault-classes`](adr/sink-fault-classes.md)'s 2026-10-25 amendment).
 - **`stdio_out` writing to a stdout or stderr pipe has no bound**
   ([`docs/known-gaps/sinks.md`](known-gaps/sinks.md)). A reader that stops reading, such as a
   stalled log shipper, a paused pager, or a Docker log driver in its default `mode: blocking`,
@@ -1008,10 +1024,13 @@ buffering:
   reads it.
   `buffer.push.blocked.duration` records a wait only once it ends, so during a stall read this one.
 - **A retried batch doesn't inflate a sink's encode-side drop counters, but a drop a peer or the
-  kernel decided repeats.** While a sink retries, counts such as
-  `logit.output.messages.dropped{reason="oversize_datagram"}`, a Splunk code 6, and an OTLP
-  partial success grow with each attempt that meets the same answer, so read them as attempts,
-  not batches. [Internal telemetry](design/internal-telemetry.md#outputs) has the class table
+  kernel decided can repeat.** While a sink retries, Splunk's code 6
+  (`records.dropped{reason="invalid_event"}`), Splunk Cloud's oversize answer, and
+  `logit.output.messages.dropped{reason="oversize_datagram"}` grow with each attempt that meets
+  the same answer, so read them as attempts, not batches; a hold has no end but success or
+  shutdown, so a Splunk verdict re-counted on each retry grows for as long as the hold lasts. The
+  verdict counters of `otlp_out`, `datadog_out`, and `datadog_trace_out`, an OTLP partial success
+  included, count once: a retry never resends what the destination already settled. [Internal telemetry](design/internal-telemetry.md#outputs) has the class table
   that lists every sink counter as once per batch, once per attempt, or repeating
   ([ADR `sink-send-path-and-attempt-accounting`](adr/sink-send-path-and-attempt-accounting.md),
   decision 1).
@@ -1124,6 +1143,9 @@ complete identity and sequence is corrupt and skipped, never replayed.
 A replay delivers events however old they are, and an `aggregate` downstream merges them into its
 current window. Put `drop_stale` before the `aggregate` to discard events older than `max_age`, or
 `has_stale` to route them to an archive ([ADR `stale-event-filtering`](adr/stale-event-filtering.md)).
+Under `temporality: cumulative` that's a trade-off: merging a late delta keeps the running total
+right (`increase()` is right, `rate()` spikes), while discarding it leaves the total low by the
+counted amount.
 
 ```yaml
 buffer:
@@ -1272,7 +1294,10 @@ you can see the kernel default before deciding whether to raise it.
 also how many the decode half takes off the receive queue at a time: one knob for both ends of one
 queue. `read_batch: 1` reads one datagram per syscall. See
 [ADR `udp-intake-batching-and-socket-visibility`](adr/udp-intake-batching-and-socket-visibility.md)
-for the design.
+for the design. Batching is Linux-only, and `logit` ships Linux containers only: another target
+reads one datagram per `recv_from`, still validates `read_batch` and sizes the decode half's take
+with it, and never counts `logit.component.datagrams.dropped{reason="truncated"}`, because a
+`recv_from` build can't see the kernel cut a datagram short and decodes the partial payload.
 
 ```yaml
 components:
@@ -1514,8 +1539,26 @@ socket. Only two things reset it: bytes read from the peer, and the listener fin
 on the connection (a batch handed downstream, a resend recognized, a response completed). Time spent
 blocked handing a batch to a full downstream never counts, because the clock isn't re-armed until
 that work returns. So a connection stalled on backpressure never looks idle, however long the
-stall. A periodic flush tick that finds nothing to send touches neither event, so it never re-arms
-the clock by itself.
+stall. On `otlp_in` and `prometheus_in`'s remote-write receiver, a request handler parked on a
+full downstream isn't closed by `idle_timeout` or the grace after it either: it holds its
+connection and its permit until the send completes or the client goes away, because closing it
+would drop a batch that never reached the fan-out. `datadog_in` and `influxdb_in` wait at most
+5 s, and `datadog_trace_in` 2 s, then answer `503` with `Retry-After: 1`. `splunk_hec_in` gives
+only a body's first batch the 5 s deadline, answering `503` code 9 when it passes; once that batch
+is in, the body's later batches wait with no deadline and hold the connection and its permit as
+`otlp_in` does, because a `503` would make the client resend the batch already delivered. A periodic
+flush tick that finds nothing to send touches neither event, so it never re-arms the clock by
+itself.
+
+**A request body is bounded per read, not in total.** `idle_timeout` is also the stall bound on
+each read of an HTTP request body or a `logit_in` frame. Without it, a body that stops arriving
+holds its request and its connection permit indefinitely. With it, a peer that sends one byte per
+read, each slightly under the bound, holds them for up to one `idle_timeout` per byte of the
+listener's request-size cap on an HTTP listener (`max_request_bytes` on `splunk_hec_in` and
+`influxdb_in`, fixed on the others), or `max_frame_bytes × idle_timeout` per frame on
+`logit_in`, and enough such peers hold the whole `max_connections` cap. There's no total body deadline, because a
+slow link sending a large legitimate body looks the same; keep untrusted peers out instead
+([Trust boundary](#trust-boundary)).
 
 **Per-kind notes:**
 
@@ -1533,7 +1576,11 @@ lost response or batch. A silent peer can't use this to hold the connection open
 flight the drop still happens when the grace ends, and a request body that stalls mid-upload is
 bounded by the per-frame stall timeout regardless.
 
-**An idle close is policy, not a fault.** All five kinds in the table end the connection task
+The other five HTTP listeners (`prometheus_in`'s remote-write receiver, `datadog_in`,
+`datadog_trace_in`, `splunk_hec_in`, and `influxdb_in`) drive their connections the same way, so
+the `otlp_in` row's reset rule, a request completing rather than bytes arriving, applies to all six.
+
+**An idle close is policy, not a fault.** Every listener in the table ends the connection task
 with `Ok(())`,
 the same success path as a graceful shutdown, so an idle close never reaches the `connection_error`
 diagnostic. It is counted as **`logit.input.connections.closed{reason="idle"}`** instead. A rising
@@ -1779,9 +1826,10 @@ hop count. Common configurations append rather than overwrite: nginx's
 `X-Forwarded-For` as the leftmost entry, so that client's claim is what `logit` reads. Set the
 header from the address the proxy saw, as the nginx example below does with
 `$proxy_protocol_addr` (`$remote_addr` without a PROXY header in front). Enforce the boundary with network policy, as for every listener
-([Trust boundary](#trust-boundary)). [Intake gaps](known-gaps/intake.md)' "`proxy_protocol:`
-accepts a PROXY header from any peer" and [transform gaps](known-gaps/transforms.md)'
-"`forwarded:` trusts the header it names" record what that leaves open.
+([Trust boundary](#trust-boundary)). `forwarded:` trusts the header it names, a non-goal [ADR
+`deployment-threat-model`](adr/deployment-threat-model.md) lists, and
+[Intake gaps](known-gaps/intake.md)' "`proxy_protocol:` accepts a PROXY header from any peer"
+records what's still open.
 
 **Health checks.** A load balancer's check reaches the listener as an ordinary connection, and
 whether it's diagnosed or counted depends on the port:
@@ -2286,7 +2334,12 @@ components:
   `max_packet_bytes:` above 65507, the largest UDP payload (rule 38). A name that resolves to both
   IPv4 and IPv6 addresses is sent to the first IPv4 one; an endpoint with only IPv6 addresses goes
   out over an IPv6 socket. `syslog_out`, `graphite_out`, and `collectd_out` resolve their UDP
-  endpoints the same way.
+  endpoints the same way. So a receiver that listens on IPv6 only, behind a name that also has an
+  IPv4 address, gets nothing while each send reports `ok`: write the IPv6 address in `endpoint:`
+  instead, such as `[::1]:8125`. Sending to the first resolved address would trade that for
+  silent loss where `localhost` resolves to `::1` first and the receiver listens on `127.0.0.1`
+  only ([ADR `sink-send-path-and-attempt-accounting`](adr/sink-send-path-and-attempt-accounting.md),
+  decision 9).
 
 ### `statsd_out`: sending to a DogStatsD Unix socket
 
@@ -2417,6 +2470,15 @@ own hostname, the Docker host when `logit` runs on it, or the top-level `hostnam
 `host_name: container` to write each container's own hostname (`Config.Hostname`, usually its
 short id) as `host.name` instead; every container then reports as a host of its own, which at
 `datadog_out` can register a Datadog host per container. See [Hostname](#hostname).
+
+### The time of a container's lines
+
+`docker_in` stamps each event with the json-file envelope's own `time` field, the daemon's clock on
+the same host, so a backlog read under `read_from: beginning`, or a new container's history,
+keeps when its lines happened. `tail_in` stamps read time instead, because a plain line carries no
+time to trust; put a `timestamp` stage after the parser to resolve one from a parsed field. See
+[ADR `file-tailing-and-docker-json-logs`](adr/file-tailing-and-docker-json-logs.md)'s
+"`docker_in` timestamps" section.
 
 ### `read_from`, and why a checkpoint matters more here than for a plain UDP listener
 
@@ -2800,7 +2862,11 @@ metric sets and `aggregate` reads
   the producer's time with the flush time and split the series by timestamp. If you want such
   metrics summarized anyway, drop the `_logit.metrics.closed` flag with `remove` ahead of
   `aggregate`, and they take the flush time. With the flag gone, `statsd_out` writes no `|T` and
-  `prometheus_out` no sample timestamp for them.
+  `prometheus_out` no sample timestamp for them. A wire where every point has a time (OTLP, InfluxDB,
+  Graphite, collectd, Datadog series, Prometheus remote-write) sets no flag, so its points merge
+  and take the flush time. To keep source timestamps and still leave one point per series per
+  instant, as remote-write and `datadog_out` need, use `dedup_timestamps` in place of `aggregate`
+  (see [Duplicate timestamps](#duplicate-timestamps)).
 - **`flagged`**: a metric whose `_logit.metrics.closed` is any other string, or `true`, set by a
   `lua` script or a `set`, passes through whole the same way.
 - **`non_finite`**: a counter increment, gauge, or gauge adjustment whose value is `NaN` or
@@ -2809,6 +2875,16 @@ metric sets and `aggregate` reads
 
 The full list of reasons is in [internal-telemetry.md](design/internal-telemetry.md)'s
 `aggregate` table.
+
+**`aggregate` keys a series by typed value.** `U64(200)`, `I64(200)`, and `F64(200.0)` are three
+series: a non-negative `json` integer arrives `U64`, an OTLP or Lua integer `I64`, and a `scale`d
+one `F64`. Text sinks render all three as `200`, so a mixed pipeline can send `prometheus_out`,
+`influxdb_out`, or `graphite_out` two or three samples under one label set in one window. To merge
+the variants, convert the tag to one type in a `lua` stage ahead of `aggregate`. `-0.0` and `0.0`
+are two series too, and stay apart downstream as `-0` and `0`.
+
+**`aggregate` drops every exemplar on the records it absorbs**, because a summarized window has no
+single observation to attach one to. To keep exemplars, route those records around `aggregate`.
 
 ## Duplicate timestamps
 
@@ -2893,6 +2969,10 @@ shape, not a sample of it. Two edges to know:
   to keep. For a per-service view of those, place one `shape` per source.
 - The batch's `Scope` passes through either way. A scope names an instrumentation library instead
   of carrying payload, and a transform has no hook to substitute one.
+- The distinct-key and key-set gauges track top-level attribute keys only. A nested map's keys
+  count toward its width (`logit.shape.nested_map_width`), never toward the key set, so a shop
+  whose width lives under a `k8s` or `labels` map reads narrow on the distinct-key gauges and wide
+  only on the nested ones. Read the two together.
 
 **Put an `aggregate` after it.** Every distribution-shaped quantity goes out raw (one
 `MetricKind::Samples` value per key, per value, per nested map, per batch), because summarization is
@@ -2939,7 +3019,7 @@ listener here (statsd's `#tag:value`, syslog's structured-data field names) has 
 fixed by `logit`'s own decoder; `otlp_in` takes whatever a remote OTLP exporter sends.
 `crates/logit-proto/src/otlp/common.rs`'s `key_values_into_attrs` interns every OTLP
 `KeyValue.key` it decodes into the process-wide interner (`crates/logit-core/src/interner.rs`),
-which never evicts (`docs/known-gaps/runtime.md`'s interner entry). A client that sends a
+which never evicts (`docs/design/memory.md` §4). A client that sends a
 *different* key on every request (an ID embedded in a key name, a misbehaving or malicious exporter)
 grows that table for the life of the process, and nothing else stops it.
 
@@ -2948,8 +3028,8 @@ every other listener's, the same reasoning
 [`fixtures/nginx-to-influxdb.yaml`](../fixtures/nginx-to-influxdb.yaml) applies ahead of `aggregate`,
 extended to cover interning as well as series cardinality. It matters most where `otlp_in` faces
 something other than `logit`'s own trusted fleet (a third-party exporter, a multi-tenant ingest
-path); see `docs/known-gaps/runtime.md`'s interner entry for when the underlying "listeners are
-private by deployment shape" premise is worth re-checking.
+path); see [ADR `deployment-threat-model`](adr/deployment-threat-model.md) for when the underlying
+"listeners are private by deployment shape" premise is worth re-checking.
 
 ## `otlp_in`: accepted `Content-Type`s, and what a browser client needs
 
@@ -3389,8 +3469,9 @@ tags) or for a tracer payload's runtime ID and tags. Those are dropped and count
 version, the resource's `host.name`, `deployment.environment.name`, and `service.version`, go out
 as every span's `host.name`, `env`, and `version` tags, unless the span carries a different value
 of its own, which wins, counted the same way. A tracer that sent v0.4 never had them, so
-v0.4 relays its spans with nothing lost. If your tracers send `/v0.7/traces`, set `version: v0.7`,
-which carries all of them. The tracer's language, versions, container ID, and the rest of its
+v0.4 relays its spans with nothing lost, and the Agent derives a chunk's priority and origin from
+the root span again on its side. If your tracers send `/v0.7/traces`, set `version: v0.7`, which
+carries all of them. The tracer's language, versions, container ID, and the rest of its
 request headers go out as the same headers under either version.
 
 **It relays; it doesn't process.** Spans go to the Agent as they arrived, and the Agent does the
@@ -3540,6 +3621,9 @@ components:
     # idle_timeout: 120s            # off by default
 ```
 
+`influxd` v2.9.1 enforces no body limit, so `max_request_bytes` is a `logit` choice: a body over
+it that `influxd` would take is refused with `413`. Raise it, or split the batch at the producer.
+
 `tls:`, `handshake_timeout:`, `max_connections:`, `peer:`, `proxy_protocol:`, `forwarded:`, and
 `reuse_port:` behave as on `otlp_in`. The generated schema, `schema/logit.schema.json`, has every
 field.
@@ -3548,7 +3632,9 @@ field.
 `precision` (`ns`, `us`, `ms`, `s`; nanoseconds when absent) in the query string. `GET` and `HEAD`
 on `/ping` and `/health` answer without a token, as `influxd` does. Any other path gets `404`,
 the v1 `/write` route and a trailing `/` included (`influxd` redirects the latter with `308`),
-and a known path with the wrong method gets `405`. Every error body is `influxd`'s
+and a known path with the wrong method gets `405`. There's no query or delete API (`/api/v2/query`,
+`/api/v2/delete`, the v1 `/query`): `logit` stores nothing, so a dashboard reads from the
+destination directly. Every error body is `influxd`'s
 `{"code","message"}`. The module doc of `crates/logit-inputs/src/influxdb.rs` has the response
 table, and the order the listener checks a request in.
 
@@ -3735,7 +3821,8 @@ settings on your stack. Against a token without it, each request counts as deliv
 
 `kafka_out` produces events to a Kafka topic, one per record by default, with the Java producer's defaults:
 `acks: all`, idempotence on, and keyed records on the partition a Java client picks for the same
-key. It speaks the Kafka protocol from Kafka 2.4 on; it's checked against Apache Kafka 4.2.
+key. It speaks the Kafka protocol from Kafka 2.4 on, and fails every connection to an older
+broker, because it sends `ApiVersions` at v3 only; it's checked against Apache Kafka 4.2.
 [`fixtures/kafka-out.yaml`](../fixtures/kafka-out.yaml) sends JSON lines from a TCP socket into
 it.
 
@@ -3871,6 +3958,11 @@ at the cluster's IAM bootstrap port (`9098` inside AWS, `9198` for public access
 `record: batch` packs as many of a batch's events into each record as fit under
 `max_request_bytes`: NDJSON lines for `json`, bodies joined by newlines for `text` (so a body
 that holds a newline reads as two), maps back to back for `msgpack`, and one frame for `native`.
+A `text` body is joined with no escaping, so to keep a multiline body such as a stack trace in
+one piece use `record: event`, or `format: json`, whose lines escape the newline. Finding how many
+`native` events fit a record takes several trial encodes, about twice the logarithm of the event
+count per record, so keep upstream batches under `max_request_bytes` where you can, or raise the cap
+([ADR `kafka-output`](adr/kafka-output.md)'s "Amendment: what W3 settled").
 A batch record has no key, and its timestamp is its first event's. So `key:` needs
 `record: event`, which `format: native` has to set explicitly; `logit validate` rejects a key
 with a batch record. Every record carries the `headers:` map, in name order.
@@ -3879,7 +3971,11 @@ with a batch record. Every record carries the `headers:` map, in name order.
 characters, as the OpenTelemetry Collector's Kafka exporter does, so both put one trace's records
 on one partition. `{attribute: NAME}` and `{resource: NAME}` key by that value as text. An event
 without the value is sent unkeyed and counted `logit.output.records.unkeyed`. Unkeyed records go
-to one partition per batch, picked at random among those with a leader.
+to one partition per batch, picked at random among those with a leader, where the Java producer
+switches partitions every 16 KiB. So a small, steady sink fills a topic's partitions less evenly
+over a short window, and a consumer group's members see uneven load. Set `key:` to a field with
+many values to spread it, or let the upstream batch size bound how much lands on one partition at
+a time ([ADR `kafka-output`](adr/kafka-output.md), item 2).
 
 **OTLP for a Collector.** `format: otlp_proto` writes what the OpenTelemetry Collector's Kafka
 exporter writes and its Kafka receiver reads (with `encoding: otlp_proto`, the receiver's
@@ -3918,6 +4014,10 @@ OTLP/JSON, in the form the Collector's own JSON marshaler writes, for a receiver
 - **Counting.** Every `records` counter counts Kafka records, so a rejected request holding 500
   spans counts 1 in `logit.output.records.dropped{reason="rejected"}`.
 
+`docs/known-gaps/kafka.md` lists what's still open for the OTLP formats: trace-id and resource
+placement against the Collector's exporter, the `otelcol.signal` header, a refused topic holding
+every signal, and a rejected record losing its whole request.
+
 [`fixtures/kafka-otlp.yaml`](../fixtures/kafka-otlp.yaml) relays OTLP into the default topics.
 
 **Topics.** The topic must exist, or the broker must create it (`auto.create.topics.enable`).
@@ -3934,15 +4034,20 @@ in two once, and a half still too large is dropped, counted `reason="rejected"`.
 **Timestamps.** Kafka 4.x rejects a record stamped more than an hour ahead of the broker's clock
 (`log.message.timestamp.after.max.ms`). The broker names it, and the sink drops it, counted
 `reason="invalid_timestamp"`, and delivers the rest of its batch. Fix the clock or the
-`timestamp` stage upstream; the record never reaches the topic. Under `format: otlp_proto` or `otlp_json` a
+`timestamp` stage upstream, or raise the topic's `log.message.timestamp.after.max.ms`; the record
+never reaches the topic. Under `format: otlp_proto` or `otlp_json` a
 record carries the time it was written, so this doesn't apply.
 
 **Delivery.** A retry resends only the partitions the broker hasn't settled, under the same
 producer id and sequence numbers, so the broker discards a resend of a batch it already
-appended. That dedup doesn't survive a `logit` restart, which starts a new producer id, or a batch
-dropped part-way, after which the producer moves to a new epoch: a batch whose first attempt
-landed before either and whose retry went after is stored twice. Downstream consumers that need
-no duplicates must deduplicate. A broker that answers every batch the same way (authorization, an
+appended. That dedup doesn't survive a `logit` restart, which starts a new producer id, or a
+partition batch that settles without being appended (a rejection, the named-record drop, the
+`MESSAGE_TOO_LARGE` split, or a drop under `at_most_once`), after which the producer moves to a
+new epoch: a batch whose first attempt
+landed before either and whose retry went after is stored twice, and a `buffer.disk:` batch
+replayed after a restart lands again if it had landed before
+([ADR `kafka-output`](adr/kafka-output.md), item 4). Downstream consumers that need no duplicates
+must deduplicate, or set `buffer.delivery: at_most_once` and take the loss instead. A broker that answers every batch the same way (authorization, an
 unsupported codec, a missing topic) is `refused`, and the sink holds its queue. The sink's module
 doc ([`kafka/mod.rs`](../crates/logit-outputs/src/kafka/mod.rs), "Response classes") has the
 table of every broker error it reads.
@@ -4022,6 +4127,19 @@ pure-2.0 fleet. **Watch `logit.input.metadata_cache.evicted{reason="expired"}` a
 sender:** a steady stream means `ttl` is shorter than that sender's metadata cadence, and families
 lapse back to untyped between refreshes.
 
+The cache is bounded, so typing can lapse: a family past `ttl` (10 minutes by default, ten of
+Prometheus's metadata intervals) or evicted past `max_families` (10,000, least recently seen
+first) decodes untyped until its sender declares it again
+([ADR `prometheus-remote-write`](adr/prometheus-remote-write.md)'s "The receiver is stateless").
+A sender with a longer `metadata_config` interval, or one that went quiet and came back, lapses.
+Two smaller bounds apply. A remembered `# HELP` or `# UNIT` is cut to a fixed byte cap, counted
+`logit.input.metadata_cache.truncated`; the type is kept whole. And a remembered type is advisory:
+where it would make the assembler discard a sample that a declaration in the request itself
+wouldn't, the sample opens a family of its own, counted
+`logit.input.metrics.degraded{reason="seed_mismatch"}`. A steady `seed_mismatch` stream means the
+cache and the senders disagree about a family's shape: chase the sender rather than tune the
+cache. `logit.input.metadata_cache.size` and `.replaced` complete the picture.
+
 **`--web.enable-remote-write-receiver` belongs to the other direction.** Set it on the Prometheus
 side when `logit` is the **sender**; a stock Prometheus doesn't accept remote-write until started
 with it:
@@ -4082,7 +4200,8 @@ Native histograms are skipped and counted on both wires regardless of version
 
 - Receiver: `logit.input.writes{class}` (`ok` against `bad_request`/`unsupported`/`oversize`; a
   nonzero `unsupported` usually means a sender whose `Content-Type` or `Content-Encoding` doesn't
-  match what it sends), `logit.input.write.duration`, `logit.input.samples`, and the
+  match what it sends), `logit.input.write.duration`, `logit.input.samples` (wire samples here,
+  where scrape mode counts series), and the
   `metadata_cache` metrics above. A nonzero `logit.input.connections.rejected{reason="limit"}`
   means the `max_connections` cap is binding.
 - Sender: `logit.output.requests{class}`, `logit.output.request.duration`, `logit.output.samples`.
@@ -4092,9 +4211,15 @@ Native histograms are skipped and counted on both wires regardless of version
   throttled `remote_write_rejected` diagnostic
   quotes the receiver's message, which for Prometheus and Mimir names the offending series. A `3xx`
   means the endpoint is redirecting; this client deliberately doesn't follow redirects.
-- A sender feeding one series from two upstream branches can draw out-of-order `400`s from a
-  receiver with no out-of-order window. That is the topology, not the sink;
-  `docs/known-gaps/prometheus.md` has the row. A later batch that repeats a series and millisecond
+- The sender sends samples in batch order and doesn't reorder across batches
+  ([ADR `prometheus-remote-write`](adr/prometheus-remote-write.md)'s "Sender behaviour"), and both
+  specs require one series' samples in timestamp order. So a sender feeding one series from two
+  upstream branches, or any sender under `concurrency:` above 1, whose batches in flight together
+  can land in any order, can draw out-of-order `400`s from a receiver with no out-of-order window
+  (stock Prometheus, Mimir without `out_of_order_time_window`). The sink reads that `400` as
+  `rejected` and drops the batch. Keep one series on one branch and `concurrency:` at 1, the
+  default, or use a receiver with an out-of-order window; a reorder window is `aggregate`-shaped
+  state the sink doesn't hold. A later batch that repeats a series and millisecond
   with a new value draws `400 duplicate sample for timestamp` the same way. Within one batch, the
   sink counts `logit.output.metrics.dropped{reason="duplicate_timestamp"}` instead, or
   `normalized` for a state equal to the one sent; see
@@ -4480,7 +4605,7 @@ your job. Your tools are:
 - a proxy in front of the listener, for anything else, such as OAuth2 or matching a client
   certificate's subject.
 
-See [ADR `deployment-threat-model`](adr/deployment-threat-model.md), and `docs/known-gaps/` for
+See [ADR `deployment-threat-model`](adr/deployment-threat-model.md): its non-goals amendment lists
 what isn't defended.
 
 ### `syslog_out` over UDP: the message-size bound
@@ -4493,6 +4618,14 @@ changes nothing over UDP. A longer message is truncated, never dropped, and coun
 `transport: tcp` only `max_message_bytes` applies. `syslog_out`'s UDP endpoint follows the same
 port and address-family rules as `statsd_out`'s (see
 ["`statsd_out`: `transport: tcp` and TLS"](#statsd_out-transport-tcp-and-tls)).
+
+`syslog_out` writes an embedded newline in a message as the two characters `\` and `n` (and `\r`,
+NUL, and every other C0 control character and DEL likewise), so one log can't read downstream as two. It
+leaves a literal backslash alone, because escaping it would double every backslash in a JSON
+body. So a message that held the literal characters `\` and `n` reads the same as one with a
+newline ([ADR `syslog-output`](adr/syslog-output.md)). Structured data leaves with its SD-IDs and
+PARAM-NAMEs sorted by name, not in wire order
+([ADR `syslog-structured-data-convention`](adr/syslog-structured-data-convention.md)).
 
 ### Syslog over TLS (RFC 5425)
 
@@ -4563,7 +4696,7 @@ listener"](#idle_timeout-on-a-tcp-listener) above.
   `logit.input.frames.dropped{reason="oversize"|"malformed"|"truncated"}`. There is no separate
   TLS-specific counter, as with `otlp_in`/`otlp_out`.
 
-`docs/known-gaps/` tracks what's still open: DTLS and no SNI override. Certificates
+`docs/known-gaps/intake.md` tracks what's still open for TLS: no client can set SNI. Certificates
 reload without a restart; see [Certificate rotation](#certificate-rotation). `idle_timeout`
 covers the post-handshake idle case.
 
@@ -4678,6 +4811,14 @@ whatever the hardware: about 100 batches/s on a link with a 10 ms round-trip tim
 offered value capped at `1024`, so it equals `concurrency` whenever `logit_in` answers at or above
 it. A memory buffer's `max_batches` also caps it, since a batch in flight stays in the sink's queue
 until its `Ack` arrives. `concurrency: 1` keeps one frame in flight.
+
+A shutdown with frames in flight can count up to `concurrency` batches as
+`logit.component.batches.dropped{reason="shutdown"}` that `logit_in` still forwards: the frames
+were written whole, and the sink closes a pooled connection cleanly, so `logit_in` reads them,
+but the sink can't learn which it forwarded without waiting for `Ack`s past its grace. Under
+`at_least_once`, a `buffer.disk:` store doesn't count them: it replays them on the next start,
+and `logit_in` acknowledges any it already forwarded without forwarding them again
+([ADR `native-hop-send-window`](adr/native-hop-send-window.md), decision 6).
 
 **What an `Ack` means.** An `Ack` names a sender identity and a sequence, and covers every frame of
 that identity up to the sequence that its connection carried, so one `Ack` can answer several
@@ -4870,13 +5011,19 @@ reconnecting doesn't show as `connection_error` on the far end.
   `logit.input.batches.dropped{reason="closed_consumer"}` (frames refused because every consumer
   directly downstream had closed; expected during a shutdown, a fault anywhere else), and
   `logit.input.batches.dropped{reason="rejected"}` (frames answered by a rejected `Ack`; each is
-  also counted under its `logit.proto.errors` reason, and dropped by the sender).
+  also counted under its `logit.proto.errors` reason, and dropped by the sender). A rejected
+  `Ack` lost before the sender reads it lets the reconnect's mark resume commit that frame as
+  delivered, so the sender counts a delivery where `logit_in` counted a drop. To reconcile,
+  compare `logit_in`'s `logit.input.batches.dropped{reason="rejected"}` with the sink's
+  `logit.component.batches.dropped{reason="rejected"}`: the excess at the input is batches the
+  sink counted under `logit.output.batches.resumed` and `logit.component.batches.delivered`.
 - Both sides: `logit.proto.frames{direction,compression}` and `logit.proto.frame.bytes` for
   throughput.
 
-`docs/known-gaps/native-hop.md` tracks what's still open: `logit_in` acknowledges frames in the
-order they arrive, so a batch slow to forward holds up the ones behind it, and `logit_in`'s shutdown
-grace, like the six HTTP listeners', is fixed at 5s with no `receive:`-shaped knob to change it.
+`logit_in` acknowledges frames in the order they arrive, so a batch slow to forward holds up the
+ones behind it ([ADR `native-hop-send-window`](adr/native-hop-send-window.md)).
+`docs/known-gaps/native-hop.md` tracks what's still open, such as `logit_in`'s shutdown grace,
+which, like the six HTTP listeners', is fixed at 5s with no `receive:`-shaped knob to change it.
 
 ### Operating a pair
 
@@ -4890,8 +5037,7 @@ receiver is up delivers its queue during its drain; one whose receiver already s
 loses its in-memory queue when its `buffer.shutdown_grace` ends (a `buffer.disk:` spool keeps it
 for the next start). Stopping the receiver loses whatever its own in-memory sinks still hold when
 their grace ends, and the senders never learn of it, because an `Ack` means the batch is in the
-receiver's inboxes, not delivered (`docs/known-gaps/native-hop.md`, "No end-to-end acknowledgment
-past the first hop"). In Compose, `depends_on: [central]` on each sender gives both orders.
+receiver's inboxes, not delivered ([ADR `delivery-semantics`](adr/delivery-semantics.md)). In Compose, `depends_on: [central]` on each sender gives both orders.
 
 **Kill deadlines add up.** With `internal` on a
 [dedicated pipeline](#give-internal-a-dedicated-pipeline), exit takes the data drain
@@ -4911,8 +5057,7 @@ and systemd.
 
 **A receiver restart forwards resends again.** `logit_in` keeps its sender marks in memory, so
 after it restarts, every frame a sender resends is forwarded a second time
-(`docs/known-gaps/native-hop.md`, "The native hop still forwards a duplicate after a `logit_in`
-restart, an evicted sender, or a load balancer"). At-least-once delivery prefers the duplicate to
+([ADR `native-hop-identity-and-sequence`](adr/native-hop-identity-and-sequence.md)). At-least-once delivery prefers the duplicate to
 a loss. To discard an old resend instead, put a `drop_stale` after `logit_in`.
 
 **A sender's `internal` telemetry arrives as data.** It comes in through `logit_in`, a listener,

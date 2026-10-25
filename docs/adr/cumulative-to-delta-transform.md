@@ -1,6 +1,6 @@
 ---
 created: 2026-10-20
-updated: 2026-10-21
+updated: 2026-10-25
 ---
 
 # `cumulative_to_delta`: a stateful transform that turns cumulative sums, histograms, and summaries into deltas
@@ -330,8 +330,7 @@ increment, and `influxdb_out` and `graphite_out` as a bare value. `prometheus_ou
 - [`docs/datadog.md`](../datadog.md)'s "collectd to Datadog" and
   [fixtures/collectd-to-datadog.yaml](../../fixtures/collectd-to-datadog.yaml) give the
   collectd recipe, `reset_on_decrease`, and
-  [`docs/known-gaps/transforms.md`](../known-gaps/transforms.md) records `difference`'s
-  reset gap.
+  [`docs/datadog.md`](../datadog.md) states `difference`'s reset cost for operators.
 
 ## Verified behavior
 Read from source on 2026-10-20; nothing was built or run.

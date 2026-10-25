@@ -144,7 +144,7 @@ client's murmur2. Against v0.162.0 on Apache Kafka 4.2.0 and Redpanda, 14 of 16 
 on a different partition from the exporter's default than from `kafka_out`, and none did with the
 exporter's `record_partitioner: {sticky_key: {hasher: murmur2}}`
 (`script/kafka-interop`'s `otlp-exporter-parity` leg;
-[known gaps](../known-gaps/kafka.md)). As in the exporter's log path, an all-zero trace id counts
+[`docs/deploying.md`](../deploying.md#kafka_out-producing-to-kafka) has the exporter setting). As in the exporter's log path, an all-zero trace id counts
 as no value.
 
 librdkafka's default partitioner, `consistent_random` (CRC32), doesn't match Java's: it placed 19
@@ -529,8 +529,8 @@ module doc (`crates/logit-outputs/src/kafka/encode.rs`) has the per-format table
    one dictionary across its events, so its size isn't the sum of theirs. The encoder tries the
    whole batch as one frame first, then, for each record, doubles and bisects over the run
    length. A frame only grows as events are added, so this finds the boundaries the in-order rule
-   above would, at the cost of extra encodes when a batch doesn't fit one record
-   (`docs/known-gaps/kafka.md`), with one exception: a frame can't skip an event, so an event
+   above would, at the cost of extra encodes when a batch doesn't fit one record, with one
+   exception: a frame can't skip an event, so an event
    over the cap ends the open record. The other formats drop that event and keep filling the
    record, so `native` can emit one more record than they do for the same batch.
 4. **A batch record has no key, and its timestamp is its first event's.** A key belongs to one
@@ -539,7 +539,7 @@ module doc (`crates/logit-outputs/src/kafka/encode.rs`) has the per-format table
    operator to set `record: event`. `KafkaOutput::new` refuses the same pair.
 5. **Batch record bodies, per format:** NDJSON for `json`, each line newline-terminated;
    the bodies joined by `\n` for `text`, with no newline after the last, so a body that holds a
-   newline can't be told from two bodies (`docs/known-gaps/kafka.md`); the MessagePack maps back
+   newline can't be told from two bodies; the MessagePack maps back
    to back for `msgpack`, which a MessagePack reader takes as a stream of values; one
    `CODEC_BATCH` frame for `native`.
 6. **`text` writes the log body by type.** A `Str` or `Bytes` body goes as its bytes, a `Map` or

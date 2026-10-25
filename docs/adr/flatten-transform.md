@@ -1,6 +1,6 @@
 ---
 created: 2026-09-21
-updated: 2026-10-21
+updated: 2026-10-25
 ---
 
 # `flatten`: dotted-key expansion as an opt-in, operator-placed transform
@@ -124,7 +124,7 @@ acceptable-not-ideal call, made explicitly rather than by default.
 
 **No cap on the number of keys a value can expand into**, beyond the depth bound above. Every
 distinct flattened path is interned for the life of the process (the interner never evicts); see
-Consequences and the accompanying `docs/known-gaps/runtime.md` entry.
+Consequences and `docs/design/memory.md` §4.
 
 **Containers touched:** `Event.attributes` always; `Resource.attributes` behind `resource:`, via
 `map_resource` and the same one-entry `Arc::ptr_eq` cache `keep_values`/`set` use, carrying
@@ -178,7 +178,7 @@ both of which carry nesting losslessly — flattening them would be pure loss fo
   An array of N elements mints up to N new symbols on its first occurrence (`tags.0`…`tags.N-1`),
   and a map keyed by rotating identifiers (user IDs, request IDs) mints one new symbol per distinct
   key ever seen, for the life of the process. This is a known, deliberate gap — see
-  `docs/known-gaps/runtime.md`'s interner-growth entry, extended to name `flatten`'s array-index
+  `docs/design/memory.md` §4's "What feeds it", which names `flatten`'s array-index
   axis as the one genuinely new exposure over what `json`/`syslog_in` already accept. `arrays: skip`
   and a narrowed `attributes:` list are the operator's levers; there is no automatic one.
 - **A flattened key can silently collide with a real attribute of the same literal name**, exactly

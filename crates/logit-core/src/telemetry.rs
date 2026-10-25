@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 
 /// A tag on a point. Both halves are `&'static str` by convention, not by type:
 /// `("class", "5xx")`, never a raw path or peer address. The process-wide interner never evicts
-/// (`docs/known-gaps/runtime.md`), so a runtime-derived tag value would leak for the life of the
+/// (`docs/design/memory.md` §4), so a runtime-derived tag value would leak for the life of the
 /// process.
 pub type Tag = (&'static str, &'static str);
 

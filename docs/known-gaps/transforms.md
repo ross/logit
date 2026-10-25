@@ -41,28 +41,16 @@ Entry format and the other areas: [the known-gaps index](README.md).
   **Revisit trigger:** sustained, *measured* central-collector throughput pressure against a real
   config. The ADR records a substantially designed native predicate grammar
   (total-by-construction, so it can't fail at runtime) as where to resume.
-- **`sample`'s consistency is `logit`'s own, not OTel's, and stops at the key.** It has four edges
-  ([ADR `consistent-sampling-component`](../adr/consistent-sampling-component.md)):
-  1. **No OTEP 235 / W3C `tracestate` `th:` interop.** An OTel SDK or collector sampling by
-     threshold compares the trace id's *low 56 bits* against a `th:` value it also writes into
-     `tracestate`; `logit` hashes the id's hex text with XXH64 and compares the hash's *top 53
-     bits*. So `logit`'s `sample` and an upstream OTel sampler at the same rate keep *different*
-     traces. Because `logit` neither reads nor writes `th:`, downstream can't recover the sampling
-     probability from a `logit`-sampled trace. Adopting OTEP 235 means a second bit convention for
-     `key: trace_id` only (no other key has a `tracestate`) and, because the hash is a frozen
-     cross-version contract, its own ADR.
-  2. **`always_keep` is per leg.** Nothing about an override hit propagates: a flagged event kept
-     by one sampler is unflagged at the next sampler unless that one has the same `always_keep`.
-     The reasoning is the rate's own: no propagated bit.
-  3. **Two spellings of one trace id that aren't lowercase hex don't agree.** `key: trace_id`
-     hashes a lifted id as its 32 lowercase hex characters, and `{attribute: ..}` hashes a `Str`
-     as-is. So an *uppercase*-hex attribute (off-spec: W3C mandates lowercase), or a trace id
-     carried as a 16-byte `Value::Bytes`, gets a different verdict than the same id lifted by
-     `trace_context`. Case isn't folded and raw bytes aren't hex-encoded, so the canonicalization
-     table (`logit_core::sampling`) stays one rule per `Value` variant.
-  4. **A resource key is all-or-nothing per resource.** `key: {resource: ..}` gives every event of
-     one resource the same verdict, which is the point of keying on one. At a low resource count
-     the kept fraction is lumpy, not `rate`: two services at `rate: 0.5` keep zero, one, or both.
+- **`sample` has no OTEP 235 / W3C `tracestate` `th:` interop.** An OTel SDK or collector
+  sampling by threshold compares the trace id's *low 56 bits* against a `th:` value it also writes
+  into `tracestate`; `logit` hashes the id's hex text with XXH64 and compares the hash's *top 53
+  bits* ([ADR `consistent-sampling-component`](../adr/consistent-sampling-component.md)).
+  - **Consequence:** `logit`'s `sample` and an upstream OTel sampler at the same rate keep
+    *different* traces. Because `logit` neither reads nor writes `th:`, downstream can't recover
+    the sampling probability from a `logit`-sampled trace.
+  - **To close:** adopting OTEP 235 means a second bit convention for `key: trace_id` only (no
+    other key has a `tracestate`) and, because the hash is a frozen cross-version contract, its
+    own ADR.
 - **`remove` matches whole attribute names only, with no prefix form.** It can't drop every
   attribute under `foo.`, such as the flat keys a `flatten` produced or a `json` parse wrote, so
   each name has to be listed, and a key that appears later isn't covered. `keep` is an allowlist of
@@ -86,24 +74,6 @@ Entry format and the other areas: [the known-gaps index](README.md).
   - **Workaround:** restart the process; that's the only reset.
   - **To close:** a windowed variant (a second set of gauges reset per flush, or a decaying
     table).
-- **`shape` tracks top-level attribute keys only.** A nested `Value::Map`'s keys count toward that
-  map's width (`logit.shape.nested_map_width`) and its values toward the per-type counters, but
-  they never enter the distinct-key set or the key-set hash. Two events with matching top-level
-  keys and entirely different nested maps are one key-set to `logit.shape.distinct_keysets`.
-  `AttrMap`'s sorted `Symbol` sequence gives this key-set identity for free, and the sizing
-  questions the survey feeds (`docs/design/memory.md` §8) are about the top-level map.
-  - **Consequence:** a shop whose width lives under a `k8s`/`labels` map reads as narrow on the
-    distinct-key gauges and wide only on the nested ones. Read the two together.
-- **A batch's `Scope` passes through `shape` untouched, unlike its `Resource`.** `resource: drop`
-  substitutes an empty `Resource` (through `Transform::map_resource`) so no resource attribute
-  value leaves the tap. `Scope` has no equivalent: `Transform` has no scope-substitution hook, and
-  [ADR `shape-observer-component`](../adr/shape-observer-component.md) judges one that every
-  implementer must carry, for this one component, not worth it. A scope names an
-  instrumentation library rather than carrying payload, so this is a narrow exception to the
-  counts-only property, not a hole in it.
-  - **Consequence:** an `otlp_in` whose senders put identifying information in
-    `Scope.attributes` passes it through the tap. `shape`'s *flush* output carries no scope at all
-    (a window spans many batches, so there's no single one to keep).
 - **Nothing bounds a single `shape` measurement event.** `logit.shape.key_bytes` and
   `.value_bytes` carry one value per top-level key and per string leaf, so an event with ten
   thousand attributes yields a ten-thousand-value `Samples`, bounded only by whatever bounded the
@@ -121,27 +91,6 @@ Entry format and the other areas: [the known-gaps index](README.md).
 
 ## `aggregate`
 
-- **`aggregate` has no late-data handling.** Its windows are wall-clock, so a replay after an
-  outage (a sender's `buffer.disk:` spool, or a `tail_in` backlog restamped by `timestamp`)
-  merges into the current window whatever the events' age. Put `drop_stale` before `aggregate` to discard what is older than
-  `max_age`, or `has_stale` to archive it
-  ([ADR `stale-event-filtering`](../adr/stale-event-filtering.md)).
-  - **Trade-off:** under `temporality: cumulative`, merging a late delta keeps the running total
-    correct (`increase()` is right, `rate()` spikes), while discarding it leaves the total low by
-    the counted amount.
-- **`aggregate` doesn't summarize a point that carries its own source time.** A DogStatsD `|T`
-  line or a Prometheus sample with a timestamp passes through unmerged
-  (`passed_through{reason="timestamped"}`), as the Datadog Agent does, because a wall-clock window
-  would replace that time with the flush time. The input that decodes such a point flags it
-  `_logit.metrics.closed` ([ADR `metric-flags`](../adr/metric-flags.md)). Points from a wire where
-  every point has a time (OTLP, InfluxDB, Graphite, collectd, Datadog series, Prometheus
-  remote-write) carry no flag, so they merge and take the flush time.
-  - **Workaround:** to summarize a timestamped point anyway, `remove` its
-    `_logit.metrics.closed` flag ahead of `aggregate`; the flushed series then carries the flush
-    time and leaves `statsd_out` with no `|T`. To
-    keep source timestamps and still leave one point per series per instant, as remote-write and
-    `datadog_out` need, use `dedup_timestamps` in place of `aggregate`
-    ([ADR `dedup-timestamps-transform`](../adr/dedup-timestamps-transform.md)).
 - **A `keep` ahead of `aggregate` turns Datadog APM stats into ordinary metrics.** `aggregate`
   passes a stats group through whole (`passed_through{reason="bucketed"}`), because `datadog_in`
   and `datadog_trace_in` flag it `_logit.metrics.closed`. `keep` drops `_logit.*` attributes unless
@@ -179,24 +128,6 @@ Entry format and the other areas: [the known-gaps index](README.md).
   0.17 µs per folded record (0.297 against 0.211 CPU µs/event). The cost lasts only while a name
   is over its limit.
   - **To close,** if it shows up in a profile: memoize the overflow key per name and group.
-- **`aggregate` keeps `U64(200)`, `I64(200)`, and `F64(200.0)` as three series, and text sinks
-  render all three as `200`.** Series identity is the typed value. A non-negative `json` integer
-  arrives `U64`, an OTLP or Lua integer `I64`, and a `scale`d one `F64`.
-  - **Consequence:** a mixed pipeline can send `prometheus_out`, `influxdb_out`, or
-    `graphite_out` two or three samples under one label set in one window. `-0.0` and `0.0` are
-    two series as well, but those sinks render them `-0` and `0`, so they stay apart downstream.
-  - **Workaround:** to merge the variants, convert the tag to one type in a `lua` stage ahead of
-    `aggregate`. See
-    [ADR `aggregation-window-semantics`](../adr/aggregation-window-semantics.md)'s "Amendment:
-    series identity, merge laws, and accounting as a stated contract (2026-09-26)", "Series
-    identity".
-- **`aggregate` drops every exemplar on the records it absorbs.** An exemplar is one observation,
-  and a summarized window has no per-observation data to attach it to. `aggregate` is the stage
-  that summarizes by stated purpose, so the loss falls under
-  [ADR `lossless-transit`](../adr/lossless-transit.md)'s "summarization is opt-in and named" rule.
-  - **Workaround:** to keep exemplars, route the records around `aggregate`. See
-    [ADR `aggregation-window-semantics`](../adr/aggregation-window-semantics.md)'s "Amendment:
-    series identity, merge laws, and accounting as a stated contract (2026-09-26)".
 - **A `GaugeDelta` whose series holds another kind is forwarded unresolved, and can reach a
   sink.** `aggregate` forwards any kind conflict untouched, counted
   `logit.transform.metrics.passed_through{reason="kind_conflict"}`.
@@ -211,40 +142,12 @@ Entry format and the other areas: [the known-gaps index](README.md).
   - **Workaround:** to see every clamp, run `distributions: sketch`, the default, where each
     record's weight is applied on absorb.
   - **Revisit trigger:** an encoder gains its own `sample_rate_clamped` report.
-- **`DdSketch::merge` treats a sketch whose count and zero count are both 0 as empty, even when it
-  carries bins.** Only a decoded sketch can be in that state (`DdSketch::from_parts` with summary
-  stats claiming a zero count over non-empty bins), and merging it into a series drops those bins
-  without a counter. No encoder `logit` ships writes that shape, and the threat model treats a
-  crafted one as a non-goal.
-  - **Revisit trigger:** a real producer's sketch carrying bins under a zero count.
 - **`series_retention` counts flushes, not wall time.** The runtime coalesces missed flush ticks,
   so a stalled or overloaded stage that flushes late stretches retention in wall time: a series
   idle across one late flush loses one flush of retention, however long the gap. The same holds
   for a cumulative series' lifetime between restarts.
-- **`aggregate`'s flush clock is `SystemTime`, which can step backwards.** A retained series' start
-  time is clamped between the previous flush's clock and this one's (ADR
-  `aggregation-window-semantics`'s "Start time after a cap eviction").
-  - **Consequence:** after a backwards step the new start can precede the previous point, and
-    emitted points stop being monotonic in time. A consumer still sees a changed start and
-    re-bases.
-  - **Why not a monotonic clock:** it would need its own mapping to wall time on every emitted
-    point, which nothing else in the pipeline does.
-
 ## `cumulative_to_delta`
 
-- **Under `non_monotonic: difference`, a counter that resets with no start time reads as one
-  large negative delta.** `difference` reads a decrease as the reading, not a restart, so only a
-  start time moved past the previous point marks a reset. A collectd value list has no start
-  time, so a DERIVE that restarts from 0 after a host reboot leaves as a delta of the new value
-  minus the previous total, and a Datadog `count` view of it dips by that total once.
-  - **Remedy:** `non_monotonic: reset_on_decrease` for a DERIVE whose `types.db` minimum is 0,
-    which is every stock one. It reads the decrease as a restart, as collectd does.
-  - **Trade-off:** under `reset_on_decrease`, a source that can go down for real reads each
-    decrease as a restart and over-counts by its new value. No single setting fits a listener
-    that receives both kinds; split them upstream with a `route` on an attribute that tells them
-    apart, and give each branch its own `cumulative_to_delta`
-    ([ADR `cumulative-to-delta-transform`](../adr/cumulative-to-delta-transform.md)'s
-    non-monotonic amendment).
 - **A collectd COUNTER that wraps reads as a reset, and the increase up to the wrap is lost.**
   collectd reads a COUNTER that went down as a wrap at 2^32 or 2^64 and adds that width to the
   rate. `cumulative_to_delta` can't tell a wrap from a restart, so it reads every decrease of a
@@ -267,23 +170,6 @@ Entry format and the other areas: [the known-gaps index](README.md).
     rename component (`set` only stamps constants).
   - **Revisit trigger:** either server turns out to matter; then build a native rename, or a
     preset.
-- **`forwarded:` trusts the header it names.** The six HTTP listeners (`otlp_in`, `datadog_in`,
-  `datadog_trace_in`, `splunk_hec_in`, `influxdb_in`, and `prometheus_in`'s remote-write receiver) and
-  `http_access` each read the client from the leftmost entry of the one forwarding header
-  `forwarded:` names, with no trusted-proxy list and no hop count
-  ([ADR `forwarded-header-parsing`](../adr/forwarded-header-parsing.md)). That's right behind one
-  proxy you control that overwrites the header.
-  - **Consequence:** a client that reaches the listener or web server directly, or through a proxy
-    that appends to a header the client sent, can name any address as `client.address`. Picking
-    the right hop needs to know which proxies are yours (the `set_real_ip_from`/`real_ip_recursive`
-    shape of nginx's realip module), config none of these components carry. That's crafted input
-    whose defense isn't free, so it's a non-goal under
-    [ADR `deployment-threat-model`](../adr/deployment-threat-model.md).
-  - **Workaround:** make the port reachable only through the proxy, and have the proxy overwrite
-    the header rather than append to it.
-  - **Revisit trigger:** a deployment where clients can reach the component past the proxy, or a
-    proxy chain whose first hop isn't the operator's. The fix is a list of trusted proxy
-    addresses, with the rightmost untrusted entry taken as the client.
 - **`http_access`'s route rules are regex-only, and matched O(rules) per event with no
   prefilter.** Each `routes:` entry is a regex (or a built-in set, itself one regex) tried in list
   order until one matches: no path-template syntax (`/users/:id`), no prefix trie, no `RegexSet`
@@ -323,12 +209,6 @@ Entry format and the other areas: [the known-gaps index](README.md).
     the corpus's one false positive, and `tool` catches it first. A non-crawler product whose name
     ends in `bot` is called a crawler.
   - **Workaround:** a `user_agent_rules:` entry pre-empts it.
-- **Not a gap, a consequence: an nginx line with no `$http_user_agent` gets no
-  `user_agent.class`.** By `http_access`'s absent rule, an absent header writes no class: absence
-  is silence, not `none` (which a logged-but-empty header gets). `demo/nginx/nginx.conf`'s format
-  doesn't log the user agent, so the demo's nginx events carry no class while its HAProxy events
-  do.
-  - **Workaround:** to get one, log `"user_agent.original":"$http_user_agent"`.
 - **A pathological Host header can truncate the syslog-bound JSON line, but nginx's own
   header-size limit makes that hard to trigger.** `$host` is unbounded and attacker-controlled
   behind a public IP, while the lean `access_semconv` format (`fixtures/nginx/nginx.conf`) sizes
@@ -404,18 +284,6 @@ Entry format and the other areas: [the known-gaps index](README.md).
   - A length header must never size an allocation directly.
   - Tag 1 (epoch time), decodable straight into `Value::Timestamp`, is the one thing the format
     offers that JSON doesn't. HAProxy doesn't emit it.
-- **`json`'s `invalid_utf8: replace` is opt-in and lossy.** nginx's `escape=json` escapes `"`,
-  `\`, and control bytes but passes bytes `>= 0x80` raw, so a Latin-1 `User-Agent`, or a
-  percent-*decoded* path logged via `$uri`, puts invalid UTF-8 into an otherwise valid-looking JSON
-  line.
-  - **Consequence:** under the default `invalid_utf8: reject`, `json` fails the line (one
-    throttled `parse_failure`, the event passed through with none of its fields), the one failure
-    `http_access` can't reach from behind `json`. `invalid_utf8: replace`
-    ([ADR `http-access-normalization`](../adr/http-access-normalization.md)) retries on a copy
-    with every invalid sequence replaced by U+FFFD and reports `logit.component.diagnostics
-    {key="invalid_utf8"}`, but the original bytes don't survive.
-  - **Workaround:** `docs/http-access-logs.md` tells nginx users to log `$request_uri`, never
-    `$uri`, which removes the decoded-path source but not a client's own non-ASCII header bytes.
 - **`json-parse-x3` and `logfmt-parse` move 5–9% with code layout, with no source-level
   handle.** At #457 (`d47a99b6`) `json-parse-x3` rose 2.264 → 2.444 µs/event on the perf VM and
   `logfmt-parse` fell 7.9%. A disassembly finds `JsonParser::process`, `parse_object`, the
@@ -468,49 +336,6 @@ Entry format and the other areas: [the known-gaps index](README.md).
   self-logging](telemetry.md#internal-telemetry-and-self-logging)).
   - **Workaround:** a script that wants that relationship tracks contributing contexts itself
     inside `process()`.
-- **A script has no time bound, and its memory bound is opt-in.** No instruction or time hook is
-  used, by design ([ADR `lua-runaway-script-bounds`](../adr/lua-runaway-script-bounds.md) and its
-  amendment). A script runs interpreted unless its component sets `jit: true`; interpreted, a
-  count hook would bound every loop for 0.4% to 13.6% more CPU per event, as measured. Under `jit: true`,
-  LuaJIT's compiled traces skip a count hook, because this build doesn't set
-  `LUAJIT_ENABLE_CHECKHOOK`, so no hook could bound a compiled loop
-  ([ADR `lua-jit-opt-in`](../adr/lua-jit-opt-in.md)).
-
-  What bounds a script instead:
-  - The table-depth cap (`MAX_TABLE_DEPTH`, 128) and raw table reads.
-  - `newproxy`'s removal.
-  - The stall heartbeat with progress-based wedge detection: a script inside one call with no
-    progress for 10 s reads `stalled`, and one still stuck 2 s into shutdown has its channels
-    revoked and fails the run.
-  - `max_memory`, only when the component sets it: a VM still over the cap after full garbage
-    collections fails the node, exit code 2.
-  - An 8 MiB stack per Lua thread (virtual, committed on touch), so pure-Lua recursion through C
-    frames (`string.gsub` callbacks a few hundred deep) doesn't abort the process.
-
-  Standing residuals, under [ADR `deployment-threat-model`](../adr/deployment-threat-model.md):
-  - Interner growth from script-derived strings (`Event.new`'s and the proxy setters'
-    `name`/`unit`/`description`/`event_name` fields, and nested attribute keys); the interner entry
-    under [Event model and interner](runtime.md#event-model-and-interner) lists every site.
-  - A shared-table DAG still converts at 2^k nodes, because the depth cap bounds nesting, not
-    size.
-  - A 128-deep value a script builds doesn't survive a relay through `otlp_out -> otlp_in`
-    (OTLP's own JSON and protobuf nesting limits, 41 and 49 levels, are both under the cap).
-  - Pure-Lua recursion through Rust/C frames can still abort the process past the larger stack.
-  - A loop that keeps constructing events with `Event.new` advances the stall heartbeat and is
-    never caught as a stall, because telling it from a large `flush()` would need a time limit.
-    `max_memory` bounds its memory-retaining form, and a refused call isn't progress, so a `pcall`
-    loop of refusals reads as a stall
-    ([ADR `lua-refusals-raised-from-lua`](../adr/lua-refusals-raised-from-lua.md)). What's left is
-    a loop that discards what it builds, or one with no `max_memory` set.
-  - `max_memory` bounds the Lua VM heap only: a retained event costs the VM about 150 bytes while
-    its payload stays in the Rust heap (10k retained 1 KiB events: 1.5 MB of VM, about 10 MB of
-    Rust), so a script that hoards events shows in process RSS long before it trips the cap. A cap
-    under about twice the working set forces a full collection on most batches; the verdict is
-    rate-limited to one a second, so that costs latency, not a failure.
-  - Under `jit: true`, `max_memory` doesn't count the compiled machine code, which LuaJIT maps
-    outside the Lua heap, up to 512 KB per VM. The trace data the compiler keeps on the heap,
-    about 45 KB per VM as measured, does count
-    ([ADR `lua-jit-opt-in`](../adr/lua-jit-opt-in.md)).
 - **A batch sent into a revoked Lua inbox after `REVOKE_DRAIN_TIMEOUT` is lost uncounted.**
   `revoke_lua_io`, run when the watcher revokes a wedged node or when the Lua thread's loop fails,
   closes the inbox and counts each batch it still receives as `batches.dropped{reason="shutdown"}`

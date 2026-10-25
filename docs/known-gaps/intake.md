@@ -63,13 +63,6 @@ Entry format and the other areas: [the known-gaps index](README.md).
     ([ADR `service-lifecycle-and-output-retry`](../adr/service-lifecycle-and-output-retry.md)),
     which assumes one `Fanout` per listener. The same work would settle "A UDP listener's read and
     decode loops share one task" (previous entry).
-- **UDP reads batch only on Linux.** On Linux, `read_loop` takes up to `receive.read_batch`
-  datagrams per `recvmmsg(2)` call. Other targets keep one `recv_from` per datagram behind the
-  same `BatchReader` interface (`crates/logit-inputs/src/udp.rs`), because `recvmmsg` has no
-  portable equivalent worth a second implementation, and `logit` ships Linux containers only. On
-  those targets, `read_batch` still validates and sizes the decode half's `pop_many`, but the read
-  half ignores it, and `logit.component.datagrams.dropped{reason="truncated"}` stays at zero: a
-  `recv_from` build can't see the kernel cut a datagram short, so it decodes the partial payload.
 - **No runtime `recvmmsg(2)` → `recvmsg(2)` fallback when a sandbox blocks the syscall.** On Linux
   a UDP listener always calls `recvmmsg(2)`. A seccomp profile (or an LSM) that refuses it returns
   `ENOSYS`/`EPERM` on the first call, which `read_loop` treats as fatal: the listener fails and the
@@ -198,17 +191,6 @@ Entry format and the other areas: [the known-gaps index](README.md).
     through a Service rather than from the node itself, `shutdown.delay` moves that traffic away
     before the close. Measured loss per close:
     [ADR `listener-port-sharing-and-shutdown-delay`](../adr/listener-port-sharing-and-shutdown-delay.md#what-the-kernel-does).
-- **A multicast UDP listener is delivered to every overlapping instance.** Every socket joined to
-  a multicast group receives every datagram, whatever `SO_REUSEADDR` or `SO_REUSEPORT` it sets
-  (measured: 1000 of 1000 at each of two members), and the multicast bind already sets
-  `SO_REUSEADDR`, so two overlapping `logit` instances with the same multicast `bind:`, such as a
-  `collectd_in` on collectd's default group, both bind and both receive.
-  - **Consequence:** during a rolling overlap, every datagram reaches both instances, and a
-    downstream count or sum doubles until the old one exits.
-  - **Workaround:** none beyond not overlapping multicast listeners: stop the old instance before
-    the new one starts, as a DaemonSet's default rolling update (`maxSurge: 0`) does.
-    `reuse_port` is refused on a multicast `bind:`, because there's nothing for it to share
-    ([ADR `listener-port-sharing-and-shutdown-delay`](../adr/listener-port-sharing-and-shutdown-delay.md)).
 - **UDP intake's drop headroom depends on code layout.** On the desktop, at rate scales that put
   the 2026-10-02 binary at 3–5% drops, `0c0b4c34` (the commit that brought the loss vocabulary to
   UDP intake) added 2.1 points of drop on `udp-statsd` and 2.4 on `udp-statsd-packed`, cost
@@ -276,37 +258,6 @@ Entry format and the other areas: [the known-gaps index](README.md).
   protocols give the sender no way to learn the write failed, so that batch is an unclassified
   loss. `logit_out` classifies the same race `Fault::Ambiguous` once the ack wait meets it, and
   `logit_in` deduplicates its resend.
-- **A hyper listener's `idle_timeout` resets on request completion, not on bytes.** `hyper` owns
-  the bytes on every HTTP listener (`otlp_in`, `prometheus_in`'s remote-write receiver,
-  `datadog_in`, `datadog_trace_in`, `splunk_hec_in`), so `crate::http::drive_connection` sees only
-  requests starting and finishing.
-  - **Consequence:** a request head that dribbles in more slowly than `idle_timeout` on an
-    otherwise-quiet keep-alive connection is closed. That's a documented cost, not a bug
-    (`crates/logit-inputs/src/otlp.rs`'s module doc, "Idle timeout";
-    [ADR `idle-connection-timeout`](../adr/idle-connection-timeout.md)).
-  - A request whose head arrives at the idle deadline is served to completion inside the bounded
-    grace (`graceful_shutdown`, then polling for up to `handshake_timeout`), and the grace runs
-    again so the response reaches the wire, because dropping it mid-flight would discard a batch
-    already handed to `Fanout::send`. The cost is at most a reconnect for the next request, never a
-    lost response or batch.
-- **A stalled or dribbled body holds a connection permit, without bound unless `idle_timeout` is
-  set.** A body read's only time bound is a per-frame stall bound (per `read` on `logit_in`), and
-  that bound is the listener's `idle_timeout`, which is off by default.
-  - With `idle_timeout` unset, a peer that stops sending mid-body, or sends one byte at a time,
-    holds its request and its connection permit indefinitely.
-  - With it set, a peer that sends one byte per frame, each slightly under `idle_timeout`, holds
-    them for up to `MAX_REQUEST_BYTES × idle_timeout` per request on an HTTP listener (`otlp_in`,
-    `prometheus_in`'s remote-write receiver, `datadog_in`, `datadog_trace_in`, `splunk_hec_in`),
-    and up to `max_frame_bytes × idle_timeout` per frame on `logit_in`.
-  - With enough connections, such a peer can hold the connection cap (`max_connections`).
-
-  This is a cost of the per-frame design, and a non-goal under
-  [ADR `deployment-threat-model`](../adr/deployment-threat-model.md): a total body deadline was
-  declined because a slow link sending a large legitimate body looks the same
-  ([ADR `untrusted-input-bounds`](../adr/untrusted-input-bounds.md),
-  [ADR `idle-connection-timeout`](../adr/idle-connection-timeout.md)'s 2026-09-25 amendments).
-  - **Revisit trigger:** a listener exposed to untrusted networks, where a total deadline, a
-    minimum transfer rate, or a per-peer connection cap is worth the false positives.
 - **`logit_in`'s `idle_timeout` bounds reads only; a blocked write is bounded by
   `handshake_timeout`.** `idle_timeout` can't reach a write that a peer has stopped reading, so
   `logit_in` writes every `HelloAck`, `Ack`, and `Reject` (`GOING_AWAY` included) within
@@ -337,27 +288,6 @@ Entry format and the other areas: [the known-gaps index](README.md).
     [ADR `deployment-threat-model`](../adr/deployment-threat-model.md).
   - **Revisit trigger:** a public listener, or an operator seeing memory pressure from concurrent
     large requests.
-- **A closing TCP listener resets its accept queue unless `net.ipv4.tcp_migrate_req=1`.** When a
-  stream listener under `reuse_port: true` closes, the kernel resets every connection sitting in
-  its accept queue, connections whose client already saw `connect()` succeed and may have sent
-  data. With `net.ipv4.tcp_migrate_req=1` (Linux 5.14 and later) the kernel moves them to a
-  surviving member of the group instead (measured: resets equal to the queue length, up to a full
-  backlog of 128, under `=0`; zero in 12 runs under `=1`). `logit` keeps accepting until the
-  instant it closes, so its queue is near empty and the exposure is the few connections that
-  complete a handshake in between
-  ([ADR `listener-port-sharing-and-shutdown-delay`](../adr/listener-port-sharing-and-shutdown-delay.md),
-  decision 2).
-  - **Consequence:** a client whose connection was reset reconnects and resends; a line it had sent
-    into the reset connection is lost unless its protocol acknowledges.
-  - **Workaround:** set `net.ipv4.tcp_migrate_req=1` on the node. A pod can't set it: under
-    `hostNetwork` it's the node's own network namespace, and a `hostNetwork` pod can't set network
-    sysctls. [Deploying `logit`](../deploying.md#tcp-listeners-and-tcp_migrate_req) names where
-    to set it.
-- **A request handler blocked forever in a `Fanout` send holds its connection and permit.** A
-  handler parked on a full downstream is backpressure, not idleness, so neither `idle_timeout` nor
-  the grace after it closes the connection. It ends when the send completes or the client goes
-  away ([ADR `idle-connection-timeout`](../adr/idle-connection-timeout.md)'s 2026-09-25 amendments).
-  Closing it would drop a batch that never reached the fanout.
 - **A connection in its prelude holds a TCP listener's shutdown for up to `handshake_timeout`
   per phase.** The shared TCP driver (`crates/logit-inputs/src/tcp.rs`, for `syslog_in`,
   `graphite_in`, `statsd_in`, and `lines_in` over TCP) and `logit_in` don't race the shutdown
@@ -382,6 +312,6 @@ Entry format and the other areas: [the known-gaps index](README.md).
     the listener. The fix is a list of trusted source addresses, with a header from any other peer
     refused.
   - **Forwarding headers:** an HTTP listener's `forwarded:` has the same exposure for a client
-    that writes its own forwarding header, recorded as a non-goal in
-    [transform gaps](transforms.md)' "`forwarded:` trusts the header it names" entry; the
-    trusted-source allowlist above stays deferred work, not part of that non-goal.
+    that writes its own forwarding header, a non-goal listed in
+    [ADR `deployment-threat-model`](../adr/deployment-threat-model.md); the trusted-source
+    allowlist above stays deferred work, not part of that non-goal.

@@ -1,6 +1,6 @@
 ---
 created: 2026-09-20
-updated: 2026-10-11
+updated: 2026-10-25
 ---
 
 # Verification plan: critical sections inventory
@@ -72,7 +72,7 @@ The surveyors' highest-value suspicions, roughly by blast radius. Each is detail
 | 14 | One hand-rolled pooled-TCP send machine in three drifting copies (statsd/syslog/graphite): graphite lacks the pre-delivery `flush()`, the `is_tls` guard, and `logit.output.reconnects` | SINK-01 | **Done** (findings → #450, #451): confirmed, and statsd and syslog classified an invalid TLS server name as `Clean`; one driver (`crates/logit-outputs/src/stream.rs`, #451) replaces the three copies, graphite gains the flush and `reconnects`, and a bad server name fails startup; the TLS write semantics it relies on are pinned by tests (#450) |
 | 15 | OTLP decode casts every wire `u64` timestamp `as i64` unguarded — ≥2^63 silently wraps negative (encode side has `.max(0)`) | CODEC-17 | findings → #366 |
 | 16 | `parse_traceparent` slices a `str` at fixed byte offsets after only a length check — non-ASCII input can panic | CORE-11 | open |
-| 17 | The process-wide interner never evicts and is fed from the network (native dictionary entries, trailer strings, Lua `telemetry` names) | CORE-01, WIRE-02, CORE-19 | CORE-19 half `reviewed`, #392: every Lua feeder is listed in `docs/known-gaps/`'s interner entry and `docs/design/lua-api.md`'s Limits list; the rest open |
+| 17 | The process-wide interner never evicts and is fed from the network (native dictionary entries, trailer strings, Lua `telemetry` names) | CORE-01, WIRE-02, CORE-19 | CORE-19 half `reviewed`, #392: every Lua feeder is listed in `docs/design/memory.md` §4 and `docs/design/lua-api.md`'s Limits list; the rest open |
 | 18 | `influxdb_out` keeps its own `reqwest` client: default redirect policy (credential-carrying 307/308 replay) and an unbounded error-body read | SINK-08 | Partly: error-body read bounded (#332); the redirect policy is open |
 | 19 | Aggregate has two "kept in sync by comment, not compiler" pairs guarded by `unreachable!` (`passes_through`/`Accumulator::new_for`; `flush`'s `retain`/`kind_for_retained`); each becomes one `Option`-returning function, `opener_for -> Option<Opener>` for pass-through and `Accumulator::retained_kind -> Option<MetricKind>` for retention, with no `unreachable!` arm | XFORM-02, XFORM-03 | **Done**: findings → #405 (`opener_for` and `Accumulator::retained_kind`, each pinned by a table test over every kind and mode) |
 | 20 | Under `DropOldest`, one spool `push` can decode-and-evict a whole segment in one loop, because `total_bytes` shrinks only on segment deletion | DISK-05 | **Done**: confirmed and documented (#331); the `Block` park it turned up is fixed (#333) |
@@ -1483,9 +1483,9 @@ against commit `2f387ee`; later paragraphs say which workstream they were writte
   decoder's own `bad_line`. That asymmetry between drivers and decoders is worth one shared check.
 - `docs/known-gaps/` documents, as deliberate: one reader per UDP listener (no `SO_REUSEPORT`
   fan-out); read and decode sharing one task; the `ReceiveQueue` being in-memory only (no
-  crash-recovery for intake, unlike the disk-backed *sink* buffer); `read_batch` being Linux-only;
-  and a connection still within its idle budget at shutdown. None of these should be reported as
-  surprises.
+  crash-recovery for intake, unlike the disk-backed *sink* buffer); and a connection still within
+  its idle budget at shutdown. `read_batch` being Linux-only is in `docs/deploying.md`'s
+  `read_batch` section. None of these should be reported as surprises.
 
 
 ---
@@ -3347,8 +3347,9 @@ and out of scope. The only `unsafe` in `logit-pipeline` is in `sockstat.rs` (`me
     simultaneously and tokio picks pseudo-randomly. Both arms map to `Ok(())`/the input's own result here, so it
     looks benign — but an input that returns `Err` at exactly the same instant can have that error swallowed by
     the grace arm. Low confidence this is reachable in practice; worth one look.
-  - **Context (documented, not a surprise):** `docs/known-gaps/` records that a datagram in flight at signal
-    time is lost uncounted, and that `logit_in`/`internal` grace is fixed at 5s.
+  - **Context (documented, not a surprise):** ADR `service-lifecycle-and-output-retry` accepts that a datagram in
+    flight at signal time is lost uncounted, and `docs/known-gaps/` records that `logit_in`/`internal`
+    grace is fixed at 5s.
 - **Existing coverage:** `run_with_shutdown_flushes_an_in_flight_window_before_exiting`,
   `a_non_overriding_input_returns_at_the_instant_shutdown_fires_not_after_the_grace`,
   `an_overriding_input_draining_within_its_grace_completes_and_delivers`,
@@ -4220,8 +4221,8 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
   - Re-interning an attacker-supplied dictionary cannot grow the process-global interner without
     bound across many connections (the interner never evicts — this is an unbounded-growth vector
     distinct from per-request memory caps). **Documented non-goal** under
-    [ADR `deployment-threat-model`](../adr/deployment-threat-model.md): `docs/known-gaps/`'s
-    interner entry names the native dictionary, and `dict.rs`'s module doc points there.
+    [ADR `deployment-threat-model`](../adr/deployment-threat-model.md): `docs/design/memory.md` §4
+    names the native dictionary, and `dict.rs`'s module doc points there.
   - ✅ `Str` is UTF-8-validated (the `TAG_STR` arm of `read_value_at`) and `Bytes` deliberately is
     not. **Holds.**
 - **Observed concerns:**
@@ -4237,12 +4238,12 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
   - ~~`Dict::read` interns every entry into the *global* interner before any of the batch has been
     validated (`Dict::read`).~~ **Documented non-goal**, not changed: CRC-32C rejects accidental
     corruption before the dictionary is read, and a lazy interner would change the ordinary decode
-    path for a case only crafted input produces. `docs/known-gaps/` names the native dictionary
+    path for a case only crafted input produces. `docs/design/memory.md` §4 names the native dictionary
     as an interner feeder; `dict.rs`'s module doc points there. The dictionary's per-frame
     strings are now charged to the decode budget (WIRE-03).
   - **New, documented non-goal:** `read_attr_map_at` inserts through `AttrMap::insert_sym`, which
     is quadratic for a large map whose keys arrive in descending symbol order (refuter measured
-    80,000 keys at 3.4 s descending against 20 ms ascending). `docs/known-gaps/` records it;
+    80,000 keys at 3.4 s descending against 20 ms ascending). ADR `deployment-threat-model` records it;
     `value.rs`'s module doc points there.
   - Unknown `Value` tag → `Value::Null` (the `_unknown` arm of `read_value_at`) is documented, but it means a lossy-transit
     failure that no counter records — no `logit.proto.errors` or skip counter fires.
@@ -5036,7 +5037,7 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
     That is the intended trade-off (better than losing the batch), but it means `idle_timeout` is
     not an upper bound on connection lifetime. **High confidence in the behavior; it is argued for
     in the comment, so this is a "confirm it's the intended contract" item.** **Holds** as the
-    contract: `docs/known-gaps/` ("TLS and connection lifecycle") records that a handler blocked
+    contract: ADR `idle-connection-timeout`'s 2026-09-25 amendments decide that a handler blocked
     forever in a send holds its connection and permit.
   - ~~`otlp_in`'s accept loop (`OtlpInput::run` in `otlp.rs`) does not race shutdown at all, and connections hold
     `Fanout` clones — already recorded in `docs/known-gaps/` ("`otlp_in` can hold the graph open
@@ -5261,9 +5262,8 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
   - The scrape client follows redirects — `reqwest::Client::new()` in `PrometheusInput::new` keeps `reqwest`'s
     `limited(10)` default, unlike `crate::http::build_client` on the sink side. **Documented in
     `docs/known-gaps/` and ADR `prometheus-remote-write`'s Consequences; context, not new.**
-  - `logit.input.samples` counts *series* here and *wire samples* in bind mode — a documented
-    gap ([`docs/known-gaps/prometheus.md`](../known-gaps/prometheus.md)'s "`logit.input.samples` means two
-    different things depending on `prometheus_in`'s mode"). **Context.**
+  - `logit.input.samples` counts *series* here and *wire samples* in bind mode — documented, by
+    design, in [`docs/design/internal-telemetry.md`](../design/internal-telemetry.md). **Context.**
 - **Existing coverage:** in-file `crates/logit-inputs/src/prometheus.rs` scrape tests
   (`a_successful_text_scrape_decodes_series_and_reports_up_one` through
   `two_unparseable_targets_get_distinct_resources`: dialect
@@ -5447,7 +5447,7 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
   seed not rebuilt on an identical re-declaration, the entry's own `Arc` preserved, and
   `a_request_before_the_watermark_does_not_sweep` (via the `#[cfg(test)] sweeps` counter on
   `MetadataCache`). ADR `prometheus-remote-write` ("The receiver is stateless; 1.0 typing waits for
-  a bounded metadata cache"); [`docs/known-gaps/prometheus.md`](../known-gaps/prometheus.md).
+  a bounded metadata cache"); [`docs/deploying.md`](../deploying.md)'s `metadata_cache:` notes.
 - **Suggested verification approach:** a loom or plain-threads stress test hammering `seed`/`learn`
   from N threads with overlapping and disjoint family sets, asserting
   `families.len() <= max_families` and gauge agreement at quiescence; a test that seeds a family
@@ -5750,8 +5750,8 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
    decoding". That makes `logit-core::metric`'s `HllBytesReader` a P0 for the `logit-core` surveyor,
    not a P2.
 2. **The process-global interner has no eviction and no budget**, and every decoded dictionary
-   entry, trailer string, and OTLP attribute key is interned into it permanently. `docs/known-gaps/`
-   discusses this for `otlp_in`/`json` cardinality; I did not find the native-path case named.
+   entry, trailer string, and OTLP attribute key is interned into it permanently. `docs/design/memory.md`
+   §4 lists what feeds it, the native dictionary included.
    Whoever surveys `logit-core::interner` should treat "a remote peer can grow it without bound"
    as in-scope.
 3. **A repeated, mechanical pattern: telemetry gauges decremented by a bare statement rather than a
@@ -6133,8 +6133,8 @@ socket/driver glue and the native wire format are out of scope (other surveys co
     `syslog_in`'s UDP arm reads at most a 65,507-byte datagram, and its TCP arm frames with
     `MAX_FRAME_BYTES` (64 KiB), which no config raises (`crates/logit-proto/src/framing.rs`'s
     `MAX_FRAME_BYTES` doc), so a `max_line_bytes` misconfiguration can't reach this parser. An
-    element or PARAM count cap would only stop crafted input, so `docs/known-gaps/syslog.md`
-    records it as a non-goal citing ADR `deployment-threat-model`, and
+    element or PARAM count cap would only stop crafted input, so ADR `deployment-threat-model`
+    lists it as a non-goal, and
     `syslog_a_64_kib_line_of_distinct_sd_names_decodes_whole` pins the worst case decoding whole.
   - *The 32-byte bound:* enforced where the name is cut. `parse_sd_name` scans the run of
     SD-NAME bytes once and rejects a name past 32 bytes before anything uses it, and a rejection
@@ -6154,7 +6154,7 @@ socket/driver glue and the native wire format are out of scope (other surveys co
 ### CODEC-09 — syslog encoder — structured-data escaping, header-field sanitization, and oversize/truncation handling
 - **Location:** `crates/logit-outputs/src/syslog.rs` (`encode_event`, `push_message_str`, `push_message_bytes`), `syslog.rs` (`resolve_facility`/`resolve_severity`/`write_rfc5424_header`/`write_rfc3164_header`/`sanitize_5424_field`/`sanitize_3164_token`/`is_valid_sd_name`), `syslog.rs` (`push_sd_escaped`, `write_structured_data`, `write_sd_element`, `write_sd_param`), `syslog.rs` (`sanitize_msg`/`sanitize_msg_bytes`/`truncate_on_char_boundary`/`truncate_bytes`/`frame_octet_counting`) — directly read line-by-line this pass (superseding a prior placeholder in this file that had not been).
 - **What it does:** The mirror of the syslog parser above — renders `Event`s back to RFC 3164/5424 wire lines over UDP/TCP/TLS. `resolve_facility`/`resolve_severity` reconstruct PRI from `syslog.facility`/`syslog.severity` attributes (each independently range-checked, `default_facility` clamped to `.min(23)` at construction, `SyslogEncoder::new`), so `pri = facility*8+severity` is arithmetically incapable of exceeding 191 or underflowing — the exact malformed shape the decoder rejects on ingest. Every header field (HOSTNAME/APP-NAME/PROCID/MSGID/TAG) is sanitized to `PRINTUSASCII` with a per-field byte cap (`sanitize_5424_field`/`sanitize_3164_token`, iterating `char`s but only ever pushing single-byte ASCII, so the `scratch.len() >= max_len` cap is exact, never off-by-a-multibyte-char). STRUCTURED-DATA (`write_structured_data`) sorts SD-IDs and PARAM-NAMEs by name bytes before writing (`AttrMap` iteration order is intern order, not wire order — sorting makes output a pure function of the data) and explicitly detects/avoids a collision between an origin's own `syslog.sd` element and the opt-in `structured_data` config block sharing an SD-ID (would otherwise emit a wire line the decoder's own duplicate-SD-ID rule reads as RFC 3164). Message bodies go through `sanitize_msg`/`sanitize_msg_bytes` (byte-level twin for non-UTF-8 `Value::Bytes`, avoiding lossy conversion) which neutralize `\n`/`\r`/NUL/other C0/DEL with backslash mnemonics — the framing-level defense (RFC 6587 octet-counting, `frame_octet_counting`) is a second, independent layer against the same message-forging class, not a redundant one. If the header alone exceeds `max_message_bytes` the whole message is dropped (counted `dropped_oversize_header`) rather than truncating a header field into something a receiver would misparse; the message body is truncated on a UTF-8 char boundary (`truncate_on_char_boundary`) or raw byte boundary (`truncate_bytes`) instead.
-- **Why sensitive:** custom, lossless-roundtrip (explicit ADR-level `syslog_in -> syslog_out` round-trip claim), data-loss (a field syslog's wire can carry but `Event` can't represent is tracked debt per AGENTS.md's "lossless-transit" rule; STRUCTURED-DATA's wire *order* for an interleaved repeated PARAM-NAME, e.g. `a b a`, is also normalized to grouped/sorted rather than preserved — documented in `docs/known-gaps/`, not a surprise).
+- **Why sensitive:** custom, lossless-roundtrip (explicit ADR-level `syslog_in -> syslog_out` round-trip claim), data-loss (a field syslog's wire can carry but `Event` can't represent is tracked debt per AGENTS.md's "lossless-transit" rule; STRUCTURED-DATA's wire *order* for an interleaved repeated PARAM-NAME, e.g. `a b a`, is also normalized to grouped/sorted rather than preserved — documented in ADR `syslog-structured-data-convention`'s Consequences, not a surprise).
 - **Invariants to verify:**
   - `push_sd_escaped` is the exact inverse of the decoder's `parse_param_value` unescaping: it escapes `"`/`\`/`]` per RFC 5424 §6.3.3, *and additionally* pre-converts `\n`/`\r`/NUL/other-C0/DEL to `sanitize_msg`'s own two-character mnemonics before that escaping pass runs — so a literal newline becomes the three wire bytes `\`,`\`,`n` (verified: Rust source `"\\\\n"` is literally backslash-backslash-n), which the decoder's `\\` rule folds back into two-character text `\n`, never a real newline; confirm this two-step composition is exactly symmetric with the decoder for every one of the 4 special mnemonic cases plus the generic `\xNN` case.
   - `push_message_str`/`push_message_bytes`'s budget arithmetic (`self.max_message_bytes - self.line.len()` after `self.line.push(' ')`, in both functions) can never underflow: the preceding `if self.line.len() >= self.max_message_bytes` branch (in each) already returned before the push, so post-push `line.len() <= max_message_bytes` always holds — re-derive this by hand rather than trusting the read, since it's a subtraction one line after a mutation.
@@ -6396,7 +6396,7 @@ socket/driver glue and the native wire format are out of scope (other surveys co
   `otlp_nesting_stays_under_the_native_depth_cap`), so a dependency bump that moves either fails
   a test. `otlp/common.rs`'s module doc records the rule. The same section's
   `otlp_json_peak_memory_per_input_byte_is_documented` pins OTLP/JSON's peak heap per input byte
-  (about 19 ordinary, 98 crafted; `docs/known-gaps/`'s OTLP section).
+  (about 19 ordinary, 98 crafted; ADR `deployment-threat-model`'s non-goals amendment).
 
 ### CODEC-17 — OTLP decode — unguarded `u64 as i64` timestamp cast on every wire timestamp field (logs/traces/metrics)
 - **Location:** `crates/logit-proto/src/otlp/logs.rs` (`decode_log_record`'s `time_unix_nano`/`observed_time_unix_nano`, including the `observed_timestamp` field it sets); `crates/logit-proto/src/otlp/traces.rs` (`decode_span`'s `start_time_unix_nano`/`end_time_unix_nano`); `crates/logit-proto/src/otlp/metrics.rs` (`decode_exemplar` and every data-point branch of `decode_metric`: `time_unix_nano`/`start_time_unix_nano`)
@@ -6463,7 +6463,7 @@ the telemetry buffers are `std::collections::HashMap`.
 - **Observed concerns (unverified):**
   - `interner::resolve` panicking plus `Symbol: Copy` means the documented retrofit cost is real; nothing enforces the "symbols are eternal" premise at a type level. Medium confidence this is exactly as documented, not worse.
   - Sorted-`Symbol` iteration order being insertion-order-dependent is stated as "deterministic" in `AttrMap::iter`'s doc comment (`crates/logit-core/src/attrs.rs`); it is deterministic *within* a process run but not across two processes that interned in different orders. Worth confirming no codec's fixed-point property (lossless-transit) depends on it. Medium confidence this is fine (codecs sort by name), but it is not argued anywhere I found.
-- **Existing coverage:** `crates/logit-core/src/interner.rs`'s `tests` module (5 unit tests, all `KeyCache`-focused); `crates/logit-core/tests/type_sizes.rs` (`symbol_is_a_niche_optimized_u32`). Governed by `docs/design/memory.md` §4 and [`docs/known-gaps/runtime.md`](../known-gaps/runtime.md#event-model-and-interner) ("The attribute/metric-name interner never frees" — documented, accepted, not a surprise).
+- **Existing coverage:** `crates/logit-core/src/interner.rs`'s `tests` module (5 unit tests, all `KeyCache`-focused); `crates/logit-core/tests/type_sizes.rs` (`symbol_is_a_niche_optimized_u32`). Governed by `docs/design/memory.md` §4 and [ADR `deployment-threat-model`](../adr/deployment-threat-model.md)'s non-goals amendment ("The interner never frees." — documented, accepted, not a surprise).
 - **Suggested verification approach:** targeted review of every `resolve` call site for a symbol that could have come from outside this process; a long-run soak (`json`/`otlp_in` against high-key-cardinality input) watching `interner::len()` and RSS; a contention microbench of `intern` across N worker threads.
 - **Priority:** P1 — documented and accepted gap, but it is global mutable state on the hottest path and the panic-on-unknown-symbol contract is load-bearing.
 
@@ -6556,7 +6556,7 @@ the telemetry buffers are `std::collections::HashMap`.
   outside `1..=AGENT_INF_KEY` are now malformed (`an_agent_key_outside_the_int16_range_is_malformed`).
   `datadog_out` also drops, counted, a sketch past `MAX_DOGSKETCH_ENTRIES` instead of expanding
   large counts into unbounded `k`/`n` entries. A decoded summary stays trusted, recorded in
-  `docs/known-gaps/`.
+  ADR `deployment-threat-model`'s non-goals amendment.
 
 ---
 
@@ -6842,10 +6842,10 @@ the telemetry buffers are `std::collections::HashMap`.
 - **Invariants to verify:**
   - A disabled handle costs *nothing*: `is_enabled()` is checked before `to_str()`, before `static_str`, before `read_tags` (in both the `count` and `gauge` closures of `install`). A pipeline without an `internal` component must never grow the interner from script activity.
   - The `logit.` prefix check is applied to the name before interning (it is — `static_metric_name` returns before `static_str`), so a rejected name doesn't leak either.
-  - ~~No other Lua-reachable path interns an arbitrary script string without a guard — `Event.new` and the `MetricProxy`/`LogProxy` `__newindex` `name`/`unit`/`description`/`event_name` writes do exactly that (`LogProxy`'s `event_name` write and `MetricProxy`'s `name`/`unit`/`description` writes in `proxy.rs`; `metric_from_table`'s `name` and `symbol_field` in `construct.rs`).~~ **Retired (#392):** they do, and that unguarded interning is now the documented, accepted posture rather than an open question — see the Verified line below and `docs/known-gaps/`'s interner entry.
+  - ~~No other Lua-reachable path interns an arbitrary script string without a guard — `Event.new` and the `MetricProxy`/`LogProxy` `__newindex` `name`/`unit`/`description`/`event_name` writes do exactly that (`LogProxy`'s `event_name` write and `MetricProxy`'s `name`/`unit`/`description` writes in `proxy.rs`; `metric_from_table`'s `name` and `symbol_field` in `construct.rs`).~~ **Retired (#392):** they do, and that unguarded interning is now the documented, accepted posture rather than an open question — see the Verified line below and `docs/design/memory.md` §4.
   - `read_tags` rejects reserved keys before interning them.
-- **Observed concerns (unverified):** ~~the guard here is thorough while the equivalent interning in `proxy.rs`/`construct.rs` has no `is_enabled`-style gate and no documented hazard note. Consistent with the interner's global "accepted" posture, but the asymmetry is worth a deliberate decision. Medium confidence.~~ **Decided, not a gap (`luab/w5`):** the asymmetry stands. `telemetry`'s guard exists because a disabled `internal` component is the common case and must cost nothing; the proxy/`construct.rs` sites always run when a script writes a name, unit, description, or attribute key, so there is no disabled state to guard. `docs/known-gaps/`'s interner entry now lists all five feeders under the interner's accepted posture, `telemetry` named as the guarded one.
-- **Existing coverage:** `crates/logit-script/src/telemetry.rs`'s `tests` module. Governed by `docs/adr/lua-authored-telemetry-cardinality.md`, `docs/design/lua-api.md`, [`docs/known-gaps/telemetry.md`](../known-gaps/telemetry.md#internal-telemetry-and-self-logging).
+- **Observed concerns (unverified):** ~~the guard here is thorough while the equivalent interning in `proxy.rs`/`construct.rs` has no `is_enabled`-style gate and no documented hazard note. Consistent with the interner's global "accepted" posture, but the asymmetry is worth a deliberate decision. Medium confidence.~~ **Decided, not a gap (`luab/w5`):** the asymmetry stands. `telemetry`'s guard exists because a disabled `internal` component is the common case and must cost nothing; the proxy/`construct.rs` sites always run when a script writes a name, unit, description, or attribute key, so there is no disabled state to guard. `docs/design/memory.md` §4 now lists all five feeders under the interner's accepted posture, `telemetry` named as the guarded one.
+- **Existing coverage:** `crates/logit-script/src/telemetry.rs`'s `tests` module. Governed by `docs/adr/lua-authored-telemetry-cardinality.md`, `docs/design/lua-api.md`, [`docs/design/memory.md`](../design/memory.md#what-feeds-it).
 - **Verified 2026-09-26 (#392):** the guard ordering in `telemetry.rs` is pinned by `a_disabled_telemetry_handle_never_touches_the_interner_even_with_dynamic_looking_input` and `a_disabled_handle_never_reads_the_lua_argument_as_a_str_either` — a disabled handle interns nothing and never even UTF-8-checks its argument. The unguarded feeders (`MetricProxy`/`LogProxy` `__newindex`, `construct::metric_from_table`'s `name` directly and `unit`/`description` and `log_from_table`'s `event_name` through `symbol_field`, and every attribute key via `AttrsProxy::__newindex` or, nested, `lua_table_to_attrmap`) are documented, by decision, under the interner's accepted posture rather than gated to match `telemetry`; `docs/design/lua-api.md`'s new "Limits" list and `docs/known-gaps/`'s interner entry are the operator-facing record.
 - **Priority:** P1 — a documented, accepted leak path whose guards must all stay in the right order.
 
@@ -6893,14 +6893,14 @@ interner's eternal-symbols premise, `DdSketch`'s single-config premise, `LogProx
 all correct today and all silently breakable by a plausible future change. Where a cheap guard test
 exists (as `hll_slice_len_matches_upstream_constant` does), it is worth adding one.
 
-**Nothing in this area is a surprise relative to `docs/known-gaps/`.** The interner never freeing
-(its "The attribute/metric-name interner never frees" entry), the `cardinality-estimator`
-allocation-layout workaround (the "`HyperLogLog::from_bytes` ... works around an upstream" entry), the
-statsd sample-rate extrapolation (the "Sample-rate extrapolation for distributions" entry), Lua's
-cost per event (the "Predicate-shaped work ... costs a Lua VM" entry), the listener span window and
-Lua `flush()`'s link-less root (the internal-telemetry entry's open items), and the Lua interner
-exposure (the "Lua-authored telemetry ... convention-enforced" entry) are all documented,
-deliberate, and listed above as context rather than as findings.
+**Nothing in this area is a surprise relative to what the docs record.** The interner never
+freeing (`docs/design/memory.md` §4), the `cardinality-estimator` allocation-layout workaround
+(`docs/known-gaps/`'s "`HyperLogLog::from_bytes` ... works around an upstream" entry), the statsd
+sample-rate handling (ADR `metrics-model-v2`), Lua's cost per event (`docs/known-gaps/`'s
+"Predicate-shaped work ... costs a Lua VM" entry), the listener span window and Lua `flush()`'s
+link-less root (`docs/known-gaps/`'s internal-spans entry), and the Lua interner exposure (ADR
+`lua-authored-telemetry-cardinality`) are all documented, deliberate, and listed above as context
+rather than as findings.
 
 
 ---
@@ -7167,8 +7167,8 @@ processing is synchronous CPU work called from the node runtime in `logit-pipeli
   never moves while the series lives. Rule 39 exists and is tested; it now also rejects retention
   with `max_retained_series: 0` and a zero `max_samples_per_series` or
   `max_set_members_per_series`, and `flush` `debug_assert!`s cumulative mode's bounds. Remaining,
-  in `docs/known-gaps/`: retention counts flushes, not wall time, and the `SystemTime` flush
-  clock can step backwards.
+  retention counts flushes, not wall time (`docs/known-gaps/`), and the `SystemTime` flush
+  clock can step backwards (ADR `aggregation-window-semantics`'s 2026-10-25 amendment).
 
 ### XFORM-05 — Aggregate: contributing-context span-link bookkeeping
 - **Location:** `aggregate.rs` (`ContributingContexts`, `MAX_CONTRIBUTING_CONTEXTS_PER_SERIES`)

@@ -1,5 +1,5 @@
 # Metric names that never repeat, at 200 a second, for over an hour. The interner never frees
-# (docs/known-gaps/runtime.md, "Event model and interner"), so each name stays interned in the
+# (docs/design/memory.md section 4), so each name stays interned in the
 # SUT and in the generator, which renders it, and both processes' interner strings and RSS grow
 # for the whole run. `aggregate` forgets each name three windows after it, so its state stays
 # flat and the growth is the interner's. The schema is docs/plans/soak-harness.md's "The

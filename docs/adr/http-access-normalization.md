@@ -1,6 +1,6 @@
 ---
 created: 2026-09-22
-updated: 2026-10-21
+updated: 2026-10-25
 ---
 
 # `http_access`: web-server access lines normalized to OTel semconv once, natively, from raw fields
@@ -279,7 +279,8 @@ everywhere.
   pre-release, that is the accepted cost of not prefixing them `logit.` and breaking the
   unit-suffix convention `span.duration_s` already set.
 - **Known gaps**, recorded in `docs/known-gaps/transforms.md`: no per-server presets; XFF trust is
-  all-or-nothing (no trusted-proxy list, no hop count); route rules are regex-only (no path
+  all-or-nothing (no trusted-proxy list, no hop count; now a non-goal, see ADR
+  `forwarded-header-parsing`); route rules are regex-only (no path
   templates, no prefix trie) and matched O(rules) per event with no prefilter; the UA table is a
   heuristic bucket classifier, not a parser (no `user_agent.name`/`.version`, and the built-in
   table cannot be disabled, only pre-empted); the percent-*decoded* form of a path is never

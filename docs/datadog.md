@@ -202,6 +202,9 @@ can't detect a DERIVE reset, so it can't promise the value never goes down.
   `difference` a counter reset after a host reboot reads as one large negative `count`: the
   previous total subtracted from the new one.
 
+No single setting fits a listener that receives both kinds. Split them upstream with a `route` on
+an attribute that tells them apart, and give each branch its own `cumulative_to_delta`.
+
 Without `cumulative_to_delta`, `datadog_out` drops COUNTER, counted
 `logit.output.metrics.dropped{reason="unresolved_cumulative"}`, and writes DERIVE as a `gauge` of
 its running total, counted `logit.output.metrics.degraded{metric_kind="non_monotonic_sum"}`. A
@@ -254,7 +257,11 @@ one and stricter than what the intake stored in testing
 ([the ADR's "Timestamp windows and what a `202` drops"](adr/datadog-agent-and-intake-relay.md#timestamp-windows-and-what-a-202-drops)). The windows are
 measured from one send time per batch, read when the batch is first tried, so every retry of it
 drops the same points and each counts once. A batch held across retries can therefore
-send a point that far past the end of its window.
+send a point that far past the end of its window. The sink follows the documented window, so it
+keeps dropping what the intake would still store until Datadog documents a longer one. To discard
+or archive old events upstream of the sink
+instead, use `drop_stale` or `has_stale`
+([ADR `stale-event-filtering`](adr/stale-event-filtering.md)).
 
 ### A metric with more than 100 tags is dropped
 
@@ -267,7 +274,9 @@ their own place on the wire don't. A histogram's `.bucket` series carries two mo
 bounds, so on a metric with 99 or 100 tags it's dropped; a summary's `.quantile` series carries
 one more, its quantile, so on a metric with 100 tags it's dropped. Each counts one, and the
 metric's other series go out. To keep a metric, cut
-its tags upstream with `keep` or `remove`.
+its tags upstream with `keep` or `remove`. The sink copies Datadog's limit, measured on a trial
+org on 2026-10-08, so if Datadog raises it, or an org has a higher one, the sink still drops what
+Datadog would store; the series route's `202` body states the limit (`limit=100`).
 
 ### Two points of one series in one second leave as one
 
