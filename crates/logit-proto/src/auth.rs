@@ -59,7 +59,8 @@ impl fmt::Display for Denied {
 
 impl Credentials {
     /// The tokens `Bearer` accepts and the `(username, password)` pairs `Basic` accepts.
-    /// Validation rejects an empty token, username, or password before it gets here.
+    /// Validation rejects an empty token, username, or password, and a username holding `:`,
+    /// before it gets here.
     pub fn new<'a>(
         bearer_tokens: impl IntoIterator<Item = &'a str>,
         basic: impl IntoIterator<Item = (&'a str, &'a str)>,
@@ -201,7 +202,7 @@ mod tests {
         let bob = format!("Basic {}", basic_credential("bob", "hunter2"));
         assert_eq!(check(&credentials, &alice), Ok(()));
         assert_eq!(check(&credentials, &bob), Ok(()));
-        // The same bytes split at the colon a server reads first: a different username.
+        // The same bytes split at another colon: why validation rejects a username holding `:`.
         let swapped = format!("Basic {}", basic_credential("alice:pa", "ss"));
         assert_eq!(check(&credentials, &swapped), Ok(()), "one encoding, however it's split");
         let wrong = format!("Basic {}", basic_credential("alice", "pa"));

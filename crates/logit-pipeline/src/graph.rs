@@ -346,8 +346,9 @@
 //!     (`docs/adr/dedup-timestamps-transform.md`).
 //! 97. An `otlp_in` `auth`, `prometheus_in` `bind_auth`, or `prometheus_out` `bind_auth` with an
 //!     empty bearer token, username, or password, or a bearer token with leading or trailing
-//!     whitespace: none could match a request's credential. Empty lists accept any request
-//!     (`docs/adr/listener-authentication.md`).
+//!     whitespace: none could match a request's credential. Also a basic username containing
+//!     `:`, which RFC 7617 forbids and which would alias another entry's encoding. Empty lists
+//!     accept any request (`docs/adr/listener-authentication.md`).
 //!
 //! Not validated: that a `by: {provenance: ..}` route key names a component in this graph. Like
 //! 37's ids, it may name a component relayed from another process. Nor is `keep`'s empty `fields`:
@@ -4064,7 +4065,8 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
     // token, username, or password reads as a request carrying none, so it would admit a request
     // the operator meant to refuse or could never match; a token with leading or trailing
     // whitespace could never match the trimmed header, a typo `!env` makes easy with a secret
-    // file's trailing newline. Empty lists are the "accept any request" setting, not an error.
+    // file's trailing newline. A basic username holding `:` is RFC 7617's one forbidden byte.
+    // Empty lists are the "accept any request" setting, not an error.
     // Rule 55 and 56 reject `bind_auth` in the mode that serves nothing.
     for (id, component) in &components {
         let (kind, field, auth) = match &component.kind {
@@ -4549,6 +4551,14 @@ fn check_http_auth(
                      any request"
                 );
             }
+        }
+        // RFC 7617 forbids it: `a:b` with password `c` encodes the same as `a` with `b:c`.
+        if credential.username.contains(':') {
+            anyhow::bail!(
+                "component '{id}': {kind} '{field}.basic' entry {index} has a username containing \
+                 ':', which basic authentication can't carry -- a server splits at the first ':', \
+                 so it would match another username's credential"
+            );
         }
     }
     Ok(())
@@ -15438,6 +15448,28 @@ mod tests {
             let err = expect_err(cfg(vec![("in", vec![], listener()), ("out", vec!["in"], out)]));
             assert!(err.contains(&expected.replace("AUTH", "bind_auth")), "got: {err}");
         }
+    }
+
+    /// Rule 97: a basic username holding `:` is rejected on every kind that takes credentials,
+    /// without the message naming it.
+    #[test]
+    fn rule_97_rejects_a_basic_username_containing_a_colon() {
+        let auth = r#"{"basic": [{"username": "s3cret:user", "password": "pw"}]}"#;
+        for json in [
+            format!(r#"{{"type": "otlp_in", "bind": "0.0.0.0:4318", "auth": {auth}}}"#),
+            format!(r#"{{"type": "prometheus_in", "bind": "0.0.0.0:9090", "bind_auth": {auth}}}"#),
+        ] {
+            let config =
+                cfg(vec![("in", vec![], listener_from_json(&json)), ("out", vec!["in"], sink())]);
+            let err = expect_err(config);
+            assert!(err.contains("entry 0 has a username containing ':'"), "{json}: got: {err}");
+            assert!(!err.contains("s3cret"), "{json}: the message carries the value: {err}");
+        }
+        let out = listener_from_json(&format!(
+            r#"{{"type": "prometheus_out", "bind": "127.0.0.1:9464", "bind_auth": {auth}}}"#
+        ));
+        let err = expect_err(cfg(vec![("in", vec![], listener()), ("out", vec!["in"], out)]));
+        assert!(err.contains("username containing ':'"), "got: {err}");
     }
 
     /// Rule 97: credentials with a password holding `:`, and empty lists, resolve.

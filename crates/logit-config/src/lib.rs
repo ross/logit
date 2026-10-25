@@ -587,8 +587,9 @@ pub struct HttpAuthConfig {
     #[serde(default)]
     pub bearer_tokens: Vec<String>,
     /// Username and password pairs accepted as HTTP basic authentication
-    /// (`Authorization: Basic ...`). An empty username or password is rejected. A password may
-    /// contain `:`.
+    /// (`Authorization: Basic ...`). An empty username or password is rejected, as is a
+    /// username containing `:`, which basic authentication can't carry. A password may contain
+    /// `:`.
     #[serde(default)]
     pub basic: Vec<BasicCredential>,
 }

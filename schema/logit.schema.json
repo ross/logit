@@ -4813,7 +4813,7 @@
       "type": "object",
       "properties": {
         "basic": {
-          "description": "Username and password pairs accepted as HTTP basic authentication (`Authorization: Basic ...`). An empty username or password is rejected. A password may contain `:`.",
+          "description": "Username and password pairs accepted as HTTP basic authentication (`Authorization: Basic ...`). An empty username or password is rejected, as is a username containing `:`, which basic authentication can't carry. A password may contain `:`.",
           "default": [],
           "type": "array",
           "items": {

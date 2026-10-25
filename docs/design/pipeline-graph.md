@@ -501,7 +501,8 @@ a black hole counts what it discards as `events.discarded`.
     depth.
 96. A `dedup_timestamps` with a `precision` of `0s`.
 97. An `otlp_in` `auth`, or a `prometheus_in` or `prometheus_out` `bind_auth`, with an empty bearer
-    token, username, or password, or a bearer token with leading or trailing whitespace.
+    token, username, or password, a bearer token with leading or trailing whitespace, or a basic
+    username containing `:`.
 
 **Deliberately not validated:** that a `by: {provenance: ..}` route key names a component in *this*
 graph — rule 37's reasoning; the key is as likely to name a component relayed from another process.
