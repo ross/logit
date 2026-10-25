@@ -236,6 +236,8 @@ pub struct Aggregator {
     /// group index; `Aggregator::evict_one`'s. Empty until a window's first eviction, and cleared
     /// at `flush`.
     eviction_order: Vec<(u32, u64, usize, SeriesKey)>,
+    /// Whether this window's `eviction_order` is built; it's never rebuilt before `flush`.
+    eviction_order_built: bool,
     /// Whether a flushed `Sum`/`Histogram` is this window's increment (the default) or a running
     /// total that survives the flush.
     temporality: AggregateTemporality,
@@ -723,6 +725,7 @@ impl Aggregator {
             max_retained_series: 0,
             budget: SeriesBudget { held: 0, idle: 0, max: 100_000 },
             eviction_order: Vec::new(),
+            eviction_order_built: false,
             temporality: AggregateTemporality::default(),
             distributions: Distributions::default(),
             max_samples_per_series: 1000,
@@ -1389,28 +1392,26 @@ impl Aggregator {
     /// removes it, so `group_index`, the memo, and the order's group indices stay valid; the
     /// groups a window holds are then at most `max_series` plus its evictions.
     fn evict_one(&mut self, tally: &mut Tally) {
-        loop {
-            if self.eviction_order.is_empty() {
-                for (gi, group) in self.groups.iter().enumerate() {
-                    for (key, state) in &group.series {
-                        if !state.updated_this_window {
-                            self.eviction_order.push((
-                                state.idle_windows,
-                                state.open_seq,
-                                gi,
-                                key.clone(),
-                            ));
-                        }
+        // Built once per window: no series becomes a candidate between flushes, so an exhausted
+        // order means none is left, which `budget.idle` already says.
+        if !self.eviction_order_built {
+            self.eviction_order_built = true;
+            for (gi, group) in self.groups.iter().enumerate() {
+                for (key, state) in &group.series {
+                    if !state.updated_this_window {
+                        self.eviction_order.push((
+                            state.idle_windows,
+                            state.open_seq,
+                            gi,
+                            key.clone(),
+                        ));
                     }
                 }
-                // Ascending, so `pop` takes the most idle, then the newest. `open_seq` is unique.
-                self.eviction_order.sort_unstable_by_key(|(idle, seq, _, _)| (*idle, *seq));
-                if self.eviction_order.is_empty() {
-                    debug_assert!(false, "budget.idle > 0 with no series to evict");
-                    return;
-                }
             }
-            let Some((_, _, gi, key)) = self.eviction_order.pop() else { continue };
+            // Ascending, so `pop` takes the most idle, then the newest. `open_seq` is unique.
+            self.eviction_order.sort_unstable_by_key(|(idle, seq, _, _)| (*idle, *seq));
+        }
+        while let Some((_, _, gi, key)) = self.eviction_order.pop() {
             let series = &mut self.groups[gi].series;
             if series.get(&key).is_none_or(|state| state.updated_this_window) {
                 continue; // absorbed since the order was built
@@ -1431,6 +1432,7 @@ impl Aggregator {
             );
             return;
         }
+        debug_assert!(false, "budget.idle > 0 with no series left in the eviction order");
     }
 
     /// The diagnostic for a record `max_series` refused; the caller counts it.
@@ -1590,6 +1592,7 @@ impl Aggregator {
         self.budget.held = survivors.len();
         self.budget.idle = survivors.len();
         self.eviction_order.clear();
+        self.eviction_order_built = false;
         for (gi, key, state) in survivors {
             self.groups[gi].series.insert(key, state);
         }
@@ -5786,6 +5789,23 @@ mod tests {
         assert_eq!(at_start, kept + idle + cardinality);
         assert_eq!(evicted_for_series_limit(&events), None, "counted when it happened, not here");
         assert_budget_matches_the_groups(&agg);
+    }
+
+    /// The eviction order lasts one window: the next window's first eviction builds it again
+    /// from the series that window holds.
+    #[test]
+    fn each_window_builds_its_own_eviction_order() {
+        let (mut agg, registry) = three_retained_gauges(3);
+        let resource = default_resource();
+        feed(&mut agg, &resource, metric_event("new1", MetricKind::gauge(1.0), 350));
+        assert_eq!(held_names(&agg), ["new1", "old1", "young"]);
+        agg.flush(400);
+        feed(&mut agg, &resource, metric_event("new2", MetricKind::gauge(1.0), 450));
+        assert_eq!(held_names(&agg), ["new1", "new2", "young"], "old1 is the most idle");
+        assert_budget_matches_the_groups(&agg);
+        let events = registry.drain(0);
+        assert_eq!(evicted_for_series_limit(&events), Some(2.0));
+        assert_eq!(series_limit_dropped(&events), None);
     }
 
     /// A series updated this window, retained or new, is never evicted to make room.
