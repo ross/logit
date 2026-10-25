@@ -133,6 +133,12 @@
   ], "counters": {
     "logit.output.metrics.degraded{component=out,kind=influxdb_out,metric_kind=monotonic_delta_sum,role=sink}": 1
   }},
+  "overflow-marker": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"queue.depth.value","kind":"gauge","value":4.0}],"attributes":{"_logit.influxdb.measurement":"queue.depth","logit.overflow":"true"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"requests.value","kind":"gauge","value":7.0}],"attributes":{"_logit.influxdb.measurement":"requests","host.name":"web-1","logit.overflow":"true"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}}}
+  ], "counters": {
+    "logit.output.metrics.degraded{component=out,kind=influxdb_out,metric_kind=monotonic_delta_sum,role=sink}": 1
+  }},
   "record-fields": {"events": [
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"cpu.usage","kind":"gauge","value":0.5}],"attributes":{"_logit.influxdb.measurement":"cpu","host":"web-07"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}}},
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"hits.value","kind":"gauge","value":4.0}],"attributes":{"_logit.influxdb.measurement":"hits"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}}},

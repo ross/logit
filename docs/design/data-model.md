@@ -145,6 +145,15 @@ event, and a tracer or stats payload's environment and version on the batch reso
 stats payload's `Service` as the resource's `service.name` (the same ADR's "Amendment: a trace's
 environment, version, and service (2026-10-24)").
 
+**`logit.overflow` marks an `aggregate` overflow series** (`logit_core::attrs::OVERFLOW`,
+`Bool(true)`). Past `max_series_per_metric`, a new series of a metric name folds into one series
+whose attributes are this marker, the private `_logit.*` keys, and `host.name`, so its value is a
+total over every series it absorbed. The key is public, not under `_logit.`, so every sink renders
+it and a backend can tell the folded point apart. `aggregate` knows an overflow series by that
+attribute shape, so one from an upstream stage is one downstream too
+([ADR `aggregation-window-semantics`](../adr/aggregation-window-semantics.md)'s "Amendment: two
+caps on the series one `aggregate` holds (2026-10-24)").
+
 **The private namespace `_logit.`: a carrier lives under `_logit.<protocol>.`**
 (`_logit.statsd.type`). A carrier is a protocol's raw wire spelling of something the model
 normalizes, or a payload field only that protocol's family reads. The tables below list every

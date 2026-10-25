@@ -1012,6 +1012,8 @@ pub(crate) fn build_spec(
             temporality,
             series_retention,
             max_retained_series,
+            max_series,
+            max_series_per_metric,
             distributions,
             max_samples_per_series,
             sets,
@@ -1020,6 +1022,8 @@ pub(crate) fn build_spec(
             Aggregator::new(*interval)
                 .with_temporality(to_temporality(*temporality))
                 .with_series_retention(*series_retention, *max_retained_series)
+                .with_max_series(*max_series)
+                .with_max_series_per_metric(*max_series_per_metric)
                 .with_distributions(to_distributions(*distributions), *max_samples_per_series)
                 .with_sets(to_sets(*sets), *max_set_members_per_series)
                 .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
@@ -2892,6 +2896,8 @@ mod tests {
                 temporality: logit_config::AggregateTemporality::default(),
                 series_retention: 5,
                 max_retained_series: 10_000,
+                max_series: 100_000,
+                max_series_per_metric: None,
                 distributions: logit_config::Distributions::default(),
                 max_samples_per_series: 1000,
                 sets: logit_config::Sets::default(),

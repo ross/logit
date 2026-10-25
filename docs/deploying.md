@@ -2607,11 +2607,41 @@ opts out, giving strictly tumbling behavior. Both fields are optional, so an exi
 change. The same two bounds make `temporality: cumulative` possible (next section), which is why
 they're named for series in general, not for gauges.
 
+**`max_series` caps every series `aggregate` holds at once,** the active ones and the retained ones
+together (default `100,000`). At a full cap, each new series evicts one retained series that hasn't
+received data this window, the one that has gone the most flushes without data first and a
+`max_series_per_metric` overflow series last, counted under
+`logit.transform.series.evicted{reason="series_limit"}`. A series that received data this window is
+never evicted to make room: with none left to evict, a record that would open a new series is
+dropped, counted under `logit.transform.metrics.dropped{reason="series_limit"}`. Admission is first
+come, first served within a window, so a series whose first record arrives after the cap fills is
+dropped until a flush frees a slot. Any nonzero drop count means more distinct attribute sets reach
+`aggregate` than the cap holds; bound them with `keep` or `keep_values` ahead of it, or raise
+`max_series`.
+
+**Set `max_series_per_metric` on every `aggregate`.** It's off by default. It limits how many series
+one metric name holds across every resource, in the shape of the OpenTelemetry SDK's cardinality
+limit. Past it, a record that would open a new series for its name folds into one overflow series,
+with the name and unit kept and the attributes replaced by `logit.overflow: true`, plus `host.name`
+and the private `_logit.*` keys. Unlike `max_series`, nothing is lost: counters, distributions,
+sets, and histograms stay correct as totals, and only the attribute detail of the folded series is
+given up. Two cases need care:
+
+- **An overflow gauge carries no meaning.** Its value is whichever unrelated series wrote last. The
+  `logit.overflow` attribute marks it, so a dashboard can filter it out.
+- **A `keep` after `aggregate` removes the marker** unless it lists `logit.overflow`, and the
+  overflow series then looks like an ordinary series with fewer attributes.
+
+The overflow series counts against `max_series`, so `max_series` stays the memory bound: a stream
+of never-repeating metric names opens one series per name, each under its per-name limit. Under
+`temporality: cumulative`, the overflow total stays monotonic while it's retained, and a series
+admitted later, once a flush frees a slot, starts from zero.
+
 **Retention doesn't cover eviction or restarts.** A delta against a series evicted by the
-cardinality cap, or sent after a process restart, resolves against `0.0`. It's reported
-(`logit.transform.gauge.delta.unseeded`,
-`logit.transform.series.evicted{reason="cardinality"}`), never silent, but not
-prevented. The restart case can't be fixed without durable aggregator state, which this project has
+`max_retained_series` cap or by a full `max_series`, or sent after a process restart, resolves
+against `0.0`. It's reported (`logit.transform.gauge.delta.unseeded`,
+`logit.transform.series.evicted{reason="cardinality"}` or `{reason="series_limit"}`), never
+silent, but not prevented. The restart case can't be fixed without durable aggregator state, which this project has
 deliberately not built (`docs/adr/aggregation-window-semantics.md`'s Alternatives). A cumulative
 series has the same exposure, which is why every cumulative record carries a `start_timestamp` from
 which a consumer can detect the restart. If an operator needs a gauge that receives relative
@@ -2629,6 +2659,18 @@ value, the mitigation is on the sending side: send an absolute value periodicall
   `max_retained_series` is undersized for the pipeline's gauge cardinality, and deltas are silently
   resolving against 0 as a result. Under `state="active"`, more series are updated per window than
   the cap holds: the cap keeps the longest-lived of them, and a cumulative series it drops restarts.
+- `logit.transform.series.evicted{reason="series_limit"}` and
+  `logit.transform.metrics.dropped{reason="series_limit"}`: `max_series` is full. An eviction
+  removes a retained series to admit a new one, with the same consequences as a `cardinality`
+  eviction, and a drop loses a record because every held series was updated this window. Either
+  one sustained means more distinct attribute sets reach `aggregate` than `max_series` holds;
+  bound them with `keep` or `keep_values`, or raise `max_series`.
+- `logit.transform.metrics.overflowed` and `logit.transform.metrics.overflowing` (gauge): records
+  folded into an overflow series, and how many metric names had a record past their limit this
+  window. Each process counts only its own folds, not records absorbed into an overflow series from
+  upstream. A fold isn't loss, but it gives up attribute detail. The throttled
+  `series_per_metric_overflow` warning names the worst metric and the attribute key with the most
+  distinct values among its series, which is usually the one to bound with `keep` or `keep_values`.
 
 ## Counter temporality (`delta` vs. `cumulative`)
 

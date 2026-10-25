@@ -494,7 +494,7 @@ config asked for never uses the word:
 | Name | Meaning | Tags |
 |---|---|---|
 | `*.dropped` | Loss: data that should have left `logit` and didn't, such as queue overflow, a destination's rejection, shutdown, a disk fault, an oversize item, malformed input, a closed consumer, a relative gauge or delta nothing upstream resolved, or a gap in `logit`'s own implementation. | Always `reason`, never `metric_kind`; `signal` or `route` where the counter needs one. |
-| `logit.component.events.discarded` | A filter, `sample`, `aggregate`, `cumulative_to_delta`, `dedup_timestamps`, `route_signals`, or Lua script removed an event because the config asked it to. A record `cumulative_to_delta` dropped is counted under its own `*.dropped` as well. | None. |
+| `logit.component.events.discarded` | A filter, `sample`, `aggregate`, `cumulative_to_delta`, `dedup_timestamps`, `route_signals`, or Lua script removed an event because the config asked it to. A record `aggregate` or `cumulative_to_delta` dropped is counted under its own `*.dropped` as well. | None. |
 | `logit.component.events.copied` | A router delivered an event to more than one destination, or `route_signals` split one into a part per target; counts the deliveries past each event's first. Nothing is lost. | None. |
 | `*.omitted` | A piece (a tag, label, attribute, field, structured-data element, link, sample value, or a metric record or span beside a log body) removed from a record that's still delivered. | `reason` where more than one cause exists. |
 | `*.skipped` | Nothing was there to carry, the operator chose to leave it out (`multi_value: skip`), or the destination format has no form for the kind. | `reason` or `metric_kind`. |
@@ -1592,13 +1592,16 @@ ordinary consumer.
 | `logit.transform.series.active` | gauge | series updated this window, sampled at the top of `flush` before it touches its own state: the peak-of-window series count, and the visible signal for the cardinality blow-up `crate::keep`'s module doc warns `aggregate` is exposed to |
 | `logit.transform.resource.groups` | gauge | resource groups, sampled with `.series.active` |
 | `logit.transform.series.retained` | gauge | the idle-but-carried population. `.active` keeps its "series updated this window" meaning and doesn't include these |
-| `logit.transform.series.evicted{reason="idle"\|"cardinality"}` | count | a TTL expiry versus the hard `max_retained_series` cap. A non-zero `cardinality` count means a later delta is about to resolve against 0.0, or a cumulative series is about to restart from zero with a new `start_timestamp`. `cardinality` also carries `state="active"\|"idle"`: `active` counts series updated this window, emitted and then dropped, so more active series arrive per window than the cap holds |
+| `logit.transform.series.evicted{reason="idle"\|"cardinality"\|"series_limit"}` | count | a TTL expiry, the hard `max_retained_series` cap at a flush, or a full `max_series` making room for a new series between flushes. A non-zero `cardinality` or `series_limit` count means a later delta is about to resolve against 0.0, or a cumulative series is about to restart from zero with a new `start_timestamp`. `cardinality` also carries `state="active"\|"idle"`: `active` counts series updated this window, emitted and then dropped, so more active series arrive per window than the cap holds. `series_limit` carries no `state`: it evicts only a retained series not updated this window, the most idle first, then the newest, a `max_series_per_metric` overflow series last, as `cardinality` does |
 | `logit.transform.gauge.delta.unseeded` | count | a `GaugeDelta` opened a brand-new series and resolved against 0.0 (statsd's own rule for an unseeded gauge), indistinguishable from a real 0.0 without this |
 | `logit.transform.samples.fallback{reason="rate_mismatch"\|"cap"}` | count | a `samples`-mode series gave up raw retention and became a sketch |
 | `logit.transform.set_members.fallback{reason="cap"}` | count | a `members`-mode series gave up raw retention and became an estimate |
 | `logit.transform.samples.weight_clamped` | count | a record's sample rate implied more than `Samples::MAX_WEIGHT` observations per value (`Samples::is_clamped`), counted when its weight is applied: on absorb into a sketch, or when a raw `distributions: samples` series falls back |
 | `logit.transform.samples.omitted{reason="non_finite"}` | count | `NaN` or infinite `Samples` values left out of a sketch, since they have no bin; the record's other values still merge |
-| `logit.transform.metrics.absorbed` | count | metric records merged into a series. With `.passed_through` it accounts for every record `process` receives: `metrics_in == absorbed + passed_through` summed over every reason |
+| `logit.transform.metrics.absorbed` | count | metric records merged into a series. With `.passed_through` and `.dropped` it accounts for every record `process` receives: `metrics_in == absorbed + passed_through + dropped`, each summed over every reason |
+| `logit.transform.metrics.dropped{reason="series_limit"}` | count | a record that would open a new series while `max_series` is full and every held series was updated this window, dropped. Loss: the attributes reaching `aggregate` have more distinct values than the cap holds, so bound them upstream with `keep` or `keep_values`, or raise `max_series`. A record for a held series is never refused |
+| `logit.transform.metrics.overflowed` | count | a record that would open a new series past `max_series_per_metric` and folded into its name's overflow series, the one marked `logit.overflow: true`. A subset of `.absorbed`, so it adds no term to the records identity, and summarization the config asked for, not loss. Only the throttled `series_per_metric_overflow` diagnostic names the metric |
+| `logit.transform.metrics.overflowing` | gauge | metric names that had a record past `max_series_per_metric` since the last flush, whether or not the fold then settled (`max_series` may refuse it, and a kind conflict passes through). A retained overflow series that absorbed nothing doesn't keep its name counted, and a record absorbed into an overflow series that arrived from upstream never reaches the limit here, so each process reports only its own folding. Sampled with `.series.active`, and reported only while `max_series_per_metric` is set |
 | `logit.transform.metrics.passed_through{reason="bucketed"}` | count | a record on an event flagged `_logit.metrics.closed: "bucketed"` (on the event or its resource), which `datadog_in` and `datadog_trace_in` set on a Datadog APM stats group: forwarded whole with its bucket start, duration, and grouping key, because it already summarizes its own time bucket ([ADR `metric-flags`](../adr/metric-flags.md)) |
 | `logit.transform.metrics.passed_through{reason="timestamped"}` | count | a record on an event flagged `_logit.metrics.closed: "timestamped"`, which `statsd_in` sets on a DogStatsD `\|T` line and `prometheus_in`'s scrape on a sample with its own timestamp: forwarded unmerged with that timestamp, whatever its kind |
 | `logit.transform.metrics.passed_through{reason="flagged"}` | count | a record on an event whose `_logit.metrics.closed` is any other `Str`, or `Bool(true)`, as a `lua` script or a `set` writes it: forwarded the same way, under one fixed reason so free text never becomes a tag |
@@ -1618,15 +1621,21 @@ amendment. A fold that changes a value's type counts
 [Typed metric values](#typed-metric-values).
 
 `Diagnostics` keys: `series_retention_full` and `gauge_delta_unseeded` (mirroring the eviction and
-unseeded counters); `samples_rate_mismatch`, `samples_cap_exceeded`, `set_members_cap_exceeded`,
-and `sample_rate_clamped` (mirroring the raw-retention counters); `kind_conflict` (a metric whose
-kind conflicts with an already-accumulating series under the same name/unit/tags, forwarded
-untouched); `histogram_bounds_mismatch` (a histogram whose bucket bounds differ from the
-accumulating series', also forwarded untouched, under its own key so an operator knows it's a
-producer that re-bucketed rather than two kinds colliding); `sum_non_finite` (a delta `Sum`
-whose value is `NaN` or infinite, forwarded untouched); and `gauge_non_finite` (the same for a
-`Gauge` or `GaugeDelta`). A bucketed or timestamped record has no diagnostic: it's the configured behavior,
-not a fault.
+unseeded counters); `series_limit` and `series_limit_evicted` (a full `max_series` dropping a
+record, and evicting a retained series to make room); `series_per_metric_overflow` (a record
+that reached `max_series_per_metric`, naming the overflowing metric with the most records past
+the limit since the last flush, the attribute key with the most distinct values among its series,
+never a value, and how many other names had a record past the limit; the text is built only when
+the throttle reports it);
+`samples_rate_mismatch`,
+`samples_cap_exceeded`, `set_members_cap_exceeded`, and `sample_rate_clamped` (mirroring the
+raw-retention counters); `kind_conflict` (a metric whose kind conflicts with an already-accumulating
+series under the same name/unit/tags, forwarded untouched); `histogram_bounds_mismatch` (a histogram
+whose bucket bounds differ from the accumulating series', also forwarded untouched, under its own
+key so an operator knows it's a producer that re-bucketed rather than two kinds colliding);
+`sum_non_finite` (a delta `Sum` whose value is `NaN` or infinite, forwarded untouched); and
+`gauge_non_finite` (the same for a `Gauge` or `GaugeDelta`). A bucketed or timestamped record has no
+diagnostic: it's the configured behavior, not a fault.
 
 ##### `cumulative_to_delta`
 

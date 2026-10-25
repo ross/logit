@@ -196,6 +196,14 @@ pub const SERVICE_VERSION: &str = "service.version";
 pub const UNIFIED_SERVICE_TAGS: [(&str, &str); 3] =
     [("env", DEPLOYMENT_ENVIRONMENT_NAME), ("version", SERVICE_VERSION), ("service", SERVICE_NAME)];
 
+/// The marker on an `aggregate` overflow series, `Bool(true)`: the series holds the records of
+/// every series its metric name opened past `max_series_per_metric`, so its value is a total, and
+/// its attributes are only this key, the private keys, and `host.name`. Public, not under
+/// [`PRIVATE_PREFIX`], so it reaches the backend. See ADR `aggregation-window-semantics`
+/// (`docs/adr/aggregation-window-semantics.md`), "`max_series_per_metric`: an overflow series per
+/// name".
+pub const OVERFLOW: &str = "logit.overflow";
+
 /// The prefix of the private attribute namespace, which protocol codecs reserve for their own use.
 ///
 /// See ADR `private-attribute-namespace` (`docs/adr/private-attribute-namespace.md`) and

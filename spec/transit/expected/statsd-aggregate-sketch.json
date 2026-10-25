@@ -249,6 +249,12 @@
     "logit.component.events.discarded{component=window,kind=aggregate,role=transform}": 2,
     "logit.output.metrics.normalized{component=out,kind=statsd_out,reason=name_sanitized,role=sink}": 2
   }},
+  "overflow-marker": {"events": [
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"queue.depth","kind":"gauge","value":4.0}],"attributes":{"logit.overflow":true}},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"requests","kind":"sum","value":7.0,"temporality":"delta","monotonic":true}],"attributes":{"host.name":"web-1","logit.overflow":true}}
+  ], "counters": {
+    "logit.component.events.discarded{component=window,kind=aggregate,role=transform}": 2
+  }},
   "record-fields": {"events": [
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"cpu.usage","kind":"gauge","value":0.5}],"attributes":{"host.name":"web-07"}},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"hits","kind":"sum","value":4.0,"temporality":"delta","monotonic":true}]},

@@ -238,6 +238,12 @@
     "logit.output.metrics.degraded{component=out,kind=graphite_out,metric_kind=monotonic_delta_sum,role=sink}": 1,
     "logit.output.metrics.normalized{component=out,kind=graphite_out,reason=path_sanitized,role=sink}": 1
   }},
+  "overflow-marker": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"queue.depth","kind":"gauge","value":4.0}],"attributes":{"logit.overflow":"true"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"requests","kind":"gauge","value":7.0}],"attributes":{"host.name":"web-1","logit.overflow":"true"}}
+  ], "counters": {
+    "logit.output.metrics.degraded{component=out,kind=graphite_out,metric_kind=monotonic_delta_sum,role=sink}": 1
+  }},
   "record-fields": {"events": [
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"cpu.usage","kind":"gauge","value":0.5}],"attributes":{"host":"web-07"}},
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"hits","kind":"gauge","value":4.0}]},
