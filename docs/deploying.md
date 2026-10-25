@@ -928,7 +928,7 @@ An error the sink attaches no fault to is treated as `Rejected`.
 
 The status-only default for HTTP sinks is the `classify_status` table in
 [`crates/logit-outputs/src/http.rs`](../crates/logit-outputs/src/http.rs): `401`, `403`, `404`,
-`405`, `407`, and `501` are `Refused`; `429` and `5xx` are `Ambiguous`; other `4xx` and every
+`405`, `407`, and `501` are `Refused`; `408`, `429`, and `5xx` are `Ambiguous`; other `4xx` and every
 `3xx` are `Rejected`; a connect or DNS failure is `Clean`; a request timeout is `Ambiguous`. Each
 sink refines it from what its destination documents, in a table in its module doc that cites the
 evidence for every row:
@@ -4005,8 +4005,8 @@ Native histograms are skipped and counted on both wires regardless of version
   means the `max_connections` cap is binding.
 - Sender: `logit.output.requests{class}`, `logit.output.request.duration`, `logit.output.samples`.
   A `4xx` other than `401`, `403`, `404`, `405`, `407`, and `415`, or a `400` naming a failed
-  decompression (which hold the batch and retry it), and other than `429` (ambiguous, retried
-  under `at_least_once`), is `rejected` and the batch is dropped; the
+  decompression (which hold the batch and retry it), and other than `408` and `429` (ambiguous,
+  retried under `at_least_once`), is `rejected` and the batch is dropped; the
   throttled `remote_write_rejected` diagnostic
   quotes the receiver's message, which for Prometheus and Mimir names the offending series. A `3xx`
   means the endpoint is redirecting; this client deliberately doesn't follow redirects.

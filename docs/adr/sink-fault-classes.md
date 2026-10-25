@@ -1,6 +1,6 @@
 ---
 created: 2026-10-04
-updated: 2026-10-18
+updated: 2026-10-24
 ---
 
 # Sink fault classes: a rejected batch drops, a refused destination holds, and the process never exits for a sink
@@ -126,7 +126,7 @@ status-only default:
 | `401`, `403`, `407` | `Refused` | credentials: the same answer for every batch |
 | `404` | `Refused` | a missing endpoint, an unknown tenant or bucket, or a wrong base path; a sink whose destination answers `404` per request overrides this |
 | `405`, `501` | `Refused` | a wrong method or an unsupported feature: a protocol mismatch |
-| `429`, any `5xx` | `Ambiguous` | the request reached the server and may have been applied; unchanged |
+| `408`, `429`, any `5xx` | `Ambiguous` | the request reached the server and may have been applied; unchanged for `429` and `5xx`, and a `408` joined them (see "Amendment: 408 is `Ambiguous` (2026-10-24)") |
 | any other `4xx`, any `3xx` | `Rejected` | about this request, as the remote-write and Loki specifications define it; `400`, `413`, `415`, `422` among them |
 | connect failure, DNS failure | `Clean` | unchanged |
 | request timeout | `Ambiguous` | unchanged |
@@ -464,3 +464,24 @@ failed request's own:
   `at_least_once` and may land twice. A `buffer.disk:` replay after a crash resends every request.
   Both are `docs/known-gaps/sinks.md`, "The per-request retry memory of `otlp_out` and the Datadog
   sinks is in-process".
+
+## Amendment: 408 is `Ambiguous` (2026-10-24)
+
+The shared default reads a `408 Request Timeout` as `Ambiguous`, where it read it as `Rejected`
+with the other `4xx`. A `408` means the server, or a proxy in front of it (nginx
+`client_body_timeout`, HAProxy `timeout http-request`), gave up waiting for the request to
+arrive. RFC 9110, section 15.5.9, lets a client repeat the request. `datadog_out`,
+`datadog_trace_out`, and `splunk_hec_out` already read it as `Ambiguous`. Under `Rejected`, one
+transient proxy timeout dropped a whole batch.
+
+The sinks that fall through to the default now read a `408` as `Ambiguous`: `influxdb_out`, and
+`prometheus_out` and `otlp_out` over HTTP, each with a row in its response-class table. Two
+specifications list the retryable statuses and omit `408`: OTLP/HTTP (`429`, `502`, `503`,
+`504`) and Prometheus remote-write (`5xx` and `429`). `otlp_out` and `prometheus_out` depart from
+them, and their tables say so, as `otlp_out` already does for a `5xx`. The gRPC mapping is
+unchanged. `kafka_out`'s token fetches have their own tables.
+
+Consequence: a `408` that repeats on every attempt, such as a proxy timeout shorter than the
+time a large body takes to arrive, now holds the queue and retries with backoff where it used
+to drop each batch. `logit.component.retrying` reads `1` while it holds, and `at_most_once` still
+drops the batch. The `standin-remote-write` and `standin-influxdb*` soak scenarios cue a `408` as `ambiguous`.
