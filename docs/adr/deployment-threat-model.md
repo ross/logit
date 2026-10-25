@@ -17,8 +17,9 @@ listeners are never exposed to an untrusted network.
 
 How far a decoder or listener should defend itself has been decided case by case until now:
 
-- `docs/known-gaps/runtime.md`'s interner entry accepts a never-evicting interner on the premise
-  that listeners are private, and cited no decision for that premise.
+- The interner's posture ([`memory.md`](../design/memory.md#what-feeds-it)'s "What feeds it")
+  accepts a never-evicting interner on the premise that listeners are private, and cited no
+  decision for that premise.
 - [ADR `otlp-compression-and-decompression-bounds`](otlp-compression-and-decompression-bounds.md)
   caps a decompressed body at the compressed-body limit, the "compression bomb" case, without
   saying whose bomb it defends against.

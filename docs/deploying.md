@@ -1542,9 +1542,11 @@ that work returns. So a connection stalled on backpressure never looks idle, how
 stall. On `otlp_in` and `prometheus_in`'s remote-write receiver, a request handler parked on a
 full downstream isn't closed by `idle_timeout` or the grace after it either: it holds its
 connection and its permit until the send completes or the client goes away, because closing it
-would drop a batch that never reached the fan-out. The other HTTP listeners don't park: a request
-still waiting on a full downstream after 5 s (`datadog_in`, `influxdb_in`, `splunk_hec_in`) or 2 s
-(`datadog_trace_in`) is answered `503` with `Retry-After: 1` and delivers nothing. A periodic
+would drop a batch that never reached the fan-out. `datadog_in` and `influxdb_in` wait at most
+5 s, and `datadog_trace_in` 2 s, then answer `503` with `Retry-After: 1`. `splunk_hec_in` gives
+only a body's first batch the 5 s deadline, answering `503` code 9 when it passes; once that batch
+is in, the body's later batches wait with no deadline and hold the connection and its permit as
+`otlp_in` does, because a `503` would make the client resend the batch already delivered. A periodic
 flush tick that finds nothing to send touches neither event, so it never re-arms the clock by
 itself.
 
