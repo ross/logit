@@ -9,7 +9,9 @@
 #   base      ca, other-ca, server, client: the original set every TLS test uses
 #   rotation  server-b, server-other, client-other, utctime: the reload tests' second set, signed
 #             by the existing ca and other-ca, so regenerating it leaves `base` untouched
-# With no GROUP, regenerates both. Regenerating `base` invalidates `rotation`, which it signs.
+#   named     server-named: a leaf under ca naming only logit.test, for `server_name` tests
+# With no GROUP, regenerates all three. Regenerating `base` invalidates `rotation` and `named`,
+# which it signs.
 #
 # 100-year validity, PKCS#8 keys, no passphrase -- same "generated once, committed" precedent as
 # docs/adr/committed-pregenerated-otlp-protobuf.md. Never rotate these for "expiry"; only
@@ -76,12 +78,18 @@ rotation() {
     rm -f utctime.key
 }
 
+named() {
+    # A server leaf from ca whose only SAN is a name no test dials, so a client reaches it only by
+    # verifying against a configured `server_name`.
+    leaf server-named ca "/O=logit test fixtures/CN=logit.test" "subjectAltName=DNS:logit.test"
+}
+
 groups=("$@")
-[ ${#groups[@]} -eq 0 ] && groups=(base rotation)
+[ ${#groups[@]} -eq 0 ] && groups=(base rotation named)
 for group in "${groups[@]}"; do
     case "$group" in
-        base | rotation) "$group" ;;
-        *) echo "unknown group '$group' (expected base or rotation)" >&2; exit 2 ;;
+        base | rotation | named) "$group" ;;
+        *) echo "unknown group '$group' (expected base, rotation, or named)" >&2; exit 2 ;;
     esac
 done
 
