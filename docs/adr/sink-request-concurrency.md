@@ -131,9 +131,11 @@ in flight on its own outcome, so a fault on one batch neither resends nor drops 
 - **A submit error past the head** stays unclassified and stops the fill, as today. A sink that
   can't start a request (the encode failed, or nothing could be spawned) reports it when that
   batch becomes the head.
-- **Telemetry.** `logit.component.send.duration` records one sample per batch, from its submit
-  to its acknowledgment, on a sink using the slot helper (decision 3); the hop keeps one sample
-  per windowed round. `logit.output.in_flight` becomes a gauge every sink above a concurrency of
+- **Telemetry.** `logit.component.send.duration` records one sample per batch on a sink using
+  the slot helper (decision 3): the batch's own request, from its send to its response, timed by
+  the helper. A batch answered behind a held head waits for the head's retries before the loop
+  reads its answer, so the loop's clock would count that wait. The hop keeps one sample per
+  windowed round. `logit.output.in_flight` becomes a gauge every sink above a concurrency of
   1 reports. The `buffer_full` warning on a sink whose `in_flight`
   equals its `concurrency` names the limit and the recent send duration, so an operator reading
   the line at the default sees the round trip as the cause and `concurrency:` as the remedy.
