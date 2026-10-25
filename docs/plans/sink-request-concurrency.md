@@ -27,7 +27,8 @@ Goals:
 
 Non-goals:
 
-- A default above 1 on any sink. The ADR's decision 5 defers it to this plan's findings.
+- A default above 1 on any sink. The ADR's decision 5 keeps 1: above it, a destination's
+  "last write wins" is the last to arrive, so the operator opts in.
 - Out-of-order commit in the sink store, or a per-record acknowledged mark in the spool.
 - Concurrency on `kafka_out` (its producer has its own in-flight model), on the datagram and
   stream sinks (no response to wait for), or on `logit_out` beyond the field's rename.
@@ -115,8 +116,8 @@ Non-goals:
   stand-in, `respond` steps cueing a `401` held head with slots behind it, a `400` on one slot,
   and a dropped response on one slot under `at_most_once`, each step naming the class and the
   count the sink must report, with the stand-in's log as V.
-- **Findings** below: the throughput at 1 and 8, the fault rows, and the decision on the ADR's
-  decision 5. `docs/known-gaps/sinks.md`'s entry closes.
+- **Findings** below: the throughput at 1 and 8 and the fault rows, feeding the operator docs'
+  guidance on raising the field. `docs/known-gaps/sinks.md`'s entry closes.
 
 ### Mechanics
 
@@ -141,8 +142,9 @@ observable through `logit_pipeline::test_util`, never a sleep.
 
 - **Field name: decided by the maintainer, 2026-10-25.** `concurrency`, on `logit_out` too, with
   no alias for `window`.
-- **Default: decided by the maintainer, 2026-10-25.** 1 on every sink, revisited on the soak
-  findings.
+- **Default: decided by the maintainer, 2026-10-25.** 1 on every sink, and it stays: above 1 a
+  destination's "last write wins" is the last to arrive, which can be the older batch, so
+  reordering is the operator's opt-in. The soak findings inform the docs, not the default.
 - **Remote write above 1: decided by the maintainer, 2026-10-25.** Allowed, with the field's doc
   naming the receivers that accept out-of-order samples.
 - **Where the head retries: decided by the maintainer, 2026-10-25.** In the loop, so backoff,
