@@ -852,8 +852,9 @@ the operator-facing account of all of this.
   `events.sent − (events.received − events.discarded)`, against 4 × its events received less
   its `lines.dropped`, and every row after it reads the listener's counts carried through the
   chain (W′).
-  `otlp-fan-out-conc` is that run with the generator at `concurrency: 8`, and
-  `http-concurrency` and `http-concurrency-1` send InfluxDB points from `influxdb_out` at
+  `otlp-fan-out-conc` is that run with the generator at `concurrency: 8`,
+  `otlp-concurrency-tls` is that over TLS from a private CA per run, where HTTP/2 carries every
+  request in flight on one connection, and `http-concurrency` and `http-concurrency-1` send InfluxDB points from `influxdb_out` at
   `concurrency: 8` and `1` into `http-ingress`'s SUT under a 200 ms delay on its answers, each
   with `[[expect]]` rows on `logit.output.in_flight` and the generator's `overflow_newest`
   drops ([plan `sink-request-concurrency`](docs/plans/sink-request-concurrency.md)'s

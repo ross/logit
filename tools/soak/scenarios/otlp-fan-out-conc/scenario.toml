@@ -39,7 +39,9 @@ vm_selector = '{__name__="soak_points_total"}'
 [thresholds]
 progress_window = "30s"
 rss_growth_mib_per_hour = 64   # WARN under 1h, FAIL above
-fd_growth = 8
+# The generator's pool holds a keep-alive HTTP/1.1 connection per slot, plus the extras a cold
+# pool dials while requests wait, each open on the SUT until 90 s idle.
+fd_growth = 24
 
 [[step]]
 at = "0s"

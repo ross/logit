@@ -1,0 +1,41 @@
+# The system under test in `script/soak`'s otlp-concurrency-tls scenario: otlp-fan-out's SUT
+# with `otlp_in` over TLS from the run's private CA, which offers `h2` and `http/1.1` through
+# ALPN. OTLP logs over HTTPS, each record's body parsed as InfluxDB line protocol into one event
+# per point, a counter per point, a 500 ms cumulative aggregate, and remote-write 1.0 (zstd) to
+# VictoriaMetrics behind a two-batch blocking queue. Its `internal` telemetry goes to stdout as
+# NDJSON for the harness to read; `script/soak` runs it with `--log-format json`.
+admin: { bind: 127.0.0.1:9600 }     # the image HEALTHCHECK's probe address
+components:
+  otlp:
+    type: otlp_in                   # a slow downstream holds the request; never 503 busy
+    bind: 0.0.0.0:4318
+    protocol: http
+    tls:
+      cert_file: /tls/otlp/live/cert.pem    # the override mounts <run>/tls here
+      key_file: /tls/otlp/live/key.pem
+  points:
+    # Each record's four points become four events, and the record itself, with no log left,
+    # is discarded: the scenario's `fan_out = { points = 4 }`.
+    type: line_protocol
+    sources: [otlp]
+  count:
+    type: kv_metrics
+    sources: [points]
+    counters: [{ name: soak_points }]   # no `field`: +1 per point
+  window:
+    type: aggregate
+    sources: [count]
+    # One batch per window: at 10 s, a backend stop would take over 10 minutes to fill the
+    # sink's 64-batch inbox and back up to the listener.
+    interval: 500ms
+    temporality: cumulative
+    series_retention: 7200          # an hour of windows: a fault must never evict a series
+  victoria_metrics:
+    type: prometheus_out
+    sources: [window]
+    endpoint: http://victoria-metrics:8428/api/v1/write
+    version: 1
+    compression: zstd
+    buffer: { max_batches: 2 }      # overflow: block, the default
+  self: { type: internal, interval: 5s, span_sample_rate: 0.0, logs: off }
+  telemetry: { type: stdio_out, sources: [self], format: json }

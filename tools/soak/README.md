@@ -286,7 +286,7 @@ settings of the generator's `influxdb_out` `concurrency:`, 8 and 1, measuring wh
 on a slow link. The generator sends 500 InfluxDB points a second, 50 to a request, into
 `http-ingress`'s SUT. The cycle delays the SUT's egress, which carries its answers, by
 200 ms ± 50 ms for 3.5 minutes, then stops VictoriaMetrics for 90 s, which backs up into the
-listener's busy `503`s. At 1 the generator moves about four batches a second against the ten
+listener's busy `503`s. At 1 the generator moves about five batches a second against the ten
 offered, and its 50-batch queue overflows, counted; at 8 two or three requests in flight keep up.
 At 8, the expectations assert that more than one request was in flight and none overflowed under
 the delay, and that all eight slots filled while the listener held its answers during the stop;
@@ -294,6 +294,7 @@ at 1, that the queue overflowed under the delay. Both assert the generator's `5x
 around the stop and no sink drop. Neither runs over TLS: `influxdb_out` has no `tls:` field and
 trusts only its built-in roots, so it can't reach a listener whose certificate the run's private
 CA signs, and over plaintext it speaks HTTP/1.1, one connection per request in flight.
+`otlp-concurrency-tls` covers TLS.
 
 `tail-rotate` (13 minutes 45 seconds) has the generator write 1,000 log lines a second with
 `file_out` (`format: json`) into a file rotated about every 44 s, keeping every file, in
@@ -354,7 +355,19 @@ SUT's pause, and no line dropped.
 `otlp-fan-out-conc` (16 minutes) is `otlp-fan-out` with the generator's `otlp_out` at
 `concurrency: 8`, judged by the same ledger. Beside `otlp-fan-out`'s expectations, it asserts
 that more than one request was in flight under the 200 ms delay and that the generator's queue
-didn't overflow there, where one request at a time overflowed.
+didn't overflow there, where one request at a time overflowed. Its `fd_growth` is 24, not 8:
+the SUT keeps one connection per request the generator had in flight, plus the extras its pool
+dialed while requests waited, each open until the pool's 90 s idle timeout.
+
+`otlp-concurrency-tls` (10 minutes 30 seconds) is `otlp-fan-out-conc`'s stream over TLS: the
+SUT's `otlp_in` serves a certificate the run's private CA signs (a `[tls]` table, mounted at
+`/tls` by the override), and the generator's `otlp_out` trusts that CA, so the handshake picks
+HTTP/2 through ALPN. Its cycle is `http-concurrency`'s: a 200 ms ± 50 ms delay on the SUT's
+answers for 3.5 minutes, then a 90 s VictoriaMetrics stop that fills all eight slots. Its
+expectations assert more than one request in flight and no overflow under the delay, eight in
+flight during the stop, no sink drop and no line dropped, and that the listener's
+`logit.input.connections` stays at 1 through the stop: every request shares one connection,
+where `otlp-fan-out-conc`'s plaintext HTTP/1.1 opens one per request.
 
 `sighup` (14 minutes 30 seconds) runs `statsd-vm`'s stream with a second SUT sink off the
 ledger, `archive`: a `stdio_out` writing one `format: json` line per statsd event, straight from
@@ -805,6 +818,11 @@ What changes for a stand-in target:
   default) or `none`. Point `datadog_out` at the stand-in with `endpoints: { api:
   http://standin:8080 }`, and `influxdb_out` with `url: http://standin:8080`; it sends no
   compression.
+- The stand-in closes a keep-alive connection idle for 5 s. A sink that writes on a pooled
+  connection as that close reaches it reads a reset, an `Ambiguous` answer no step cued, and
+  netem delay on the SUT's egress widens that race to the delay. A scenario that delays the
+  SUT's egress passes `--idle-timeout` above the sink's pool idle timeout (90 s for the
+  `reqwest` sinks) in a compose override's `command`, as `standin-concurrency` does.
 - Under `remote_write`, V is every sample the stand-in stored, a later write of one
   `(label set, timestamp)` replacing an earlier one, as a remote-write receiver overwrites.
   `ledger.sent` SKIPs.
