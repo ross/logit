@@ -637,7 +637,8 @@ impl ServerCertVerifier for ReloadingServerVerifier {
 /// Only verification sees the configured name. rustls sends SNI and keys its resumption cache from
 /// the name passed to `connect`, which stays the dialed host. A resumed session skips
 /// verification, but every session in the cache was verified against this same name, since the
-/// cache belongs to this one config. `inner` is a [`ReloadingServerVerifier`] for a `ca_file`, so
+/// cache belongs to this one config. `tls::tests::a_server_name_client_resumes_a_session` pins
+/// that a second connection resumes. `inner` is a [`ReloadingServerVerifier`] for a `ca_file`, so
 /// a rotated CA reaches this wrapper too.
 #[derive(Debug)]
 pub struct VerifyAsServerName {
