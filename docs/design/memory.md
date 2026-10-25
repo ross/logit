@@ -1114,7 +1114,11 @@ but not cached, after a bounded scan. The interner still retains every distinct 
 `Aggregator`'s per-resource `HashMap<SeriesKey, Accumulator>` grows with tag cardinality within a
 window, up to `max_series` (default `100000`) series across every group. Past that, a new series
 evicts a retained one that hasn't received data this window, and with none left its record is
-dropped and counted, so the cap bounds memory at the cost of data. The
+dropped and counted, so the cap bounds memory at the cost of data. With `max_series_per_metric`
+set, a name-to-count map, one entry per metric name held, rides beside the series maps, cleared
+and refilled from the survivors at every flush with its allocation kept; a vacant-entry
+admission pays a lookup in it and an existing series pays nothing. With the limit off the map
+stays empty and unallocated. The
 operator-facing mitigation the reference config uses keeps the cap out of reach: put `keep` in
 front of `aggregate`, so config, not input, bounds the tag set `SeriesKey` keys on.
 `logit_transforms::keep`'s module docs say so. It also saves allocations: with `keep`, absorbing an

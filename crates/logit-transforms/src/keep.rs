@@ -9,6 +9,8 @@
 //! full request path) that reaches `aggregate` explodes series cardinality until `aggregate`'s
 //! `max_series` cap refuses new series and drops their records. `keep` ahead of it is what bounds
 //! the tag set `aggregate` keys on, so the cap stays a memory guard rather than a source of loss.
+//! A `keep` after an `aggregate` with `max_series_per_metric` set strips the public
+//! `logit.overflow` marker from its overflow series unless `fields` lists it.
 //!
 //! **`keep` drops `_logit.*` attributes like any unnamed key** unless `private: keep`, which
 //! retains the whole private namespace (`logit_core::attrs::is_private`) alongside `fields`. See
