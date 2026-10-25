@@ -239,18 +239,6 @@ Entry format and the other areas: [the known-gaps index](README.md).
 
 ## Admin endpoint, readiness, and release image
 
-- **Readiness is per-process, not per-sink.** A single sink holding its queue while its
-  destination refuses it doesn't flip `/readyz` to unready; the sink's `buffer:` block bounds what
-  the hold accumulates, and the `logit.component.retrying` gauge and the paced `retrying` error
-  line are what an alert watches ([ADR `sink-fault-classes`](../adr/sink-fault-classes.md)).
-  `/readyz`'s `degraded` is reserved for a node that has exited with an error, not one that's
-  behind.
-  - The one non-exited not-ready answer is `503 stalled`, for a `lua`/`lua_file` component inside
-    a script call with no progress
-    ([ADR `lua-runaway-script-bounds`](../adr/lua-runaway-script-bounds.md)). It clears when the
-    script resumes, with no phase change.
-  - A richer per-sink probe would be additive to `PipelineState.components`, already keyed by
-    component id. It isn't built because nothing has asked for it.
 - **The published `ghcr.io/ross/logit` image is `latest` only, amd64 only, unsigned, and
   unattested.** It has no version tags (the workspace version is still a pre-release
   placeholder), no arm64 build, no cosign signature, and no SBOM. Nothing in CI builds or

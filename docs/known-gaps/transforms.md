@@ -74,14 +74,6 @@ Entry format and the other areas: [the known-gaps index](README.md).
   - **Workaround:** restart the process; that's the only reset.
   - **To close:** a windowed variant (a second set of gauges reset per flush, or a decaying
     table).
-- **`shape` tracks top-level attribute keys only.** A nested `Value::Map`'s keys count toward that
-  map's width (`logit.shape.nested_map_width`) and its values toward the per-type counters, but
-  they never enter the distinct-key set or the key-set hash. Two events with matching top-level
-  keys and entirely different nested maps are one key-set to `logit.shape.distinct_keysets`.
-  `AttrMap`'s sorted `Symbol` sequence gives this key-set identity for free, and the sizing
-  questions the survey feeds (`docs/design/memory.md` §8) are about the top-level map.
-  - **Consequence:** a shop whose width lives under a `k8s`/`labels` map reads as narrow on the
-    distinct-key gauges and wide only on the nested ones. Read the two together.
 - **Nothing bounds a single `shape` measurement event.** `logit.shape.key_bytes` and
   `.value_bytes` carry one value per top-level key and per string leaf, so an event with ten
   thousand attributes yields a ten-thousand-value `Samples`, bounded only by whatever bounded the
@@ -99,14 +91,6 @@ Entry format and the other areas: [the known-gaps index](README.md).
 
 ## `aggregate`
 
-- **`aggregate` has no late-data handling.** Its windows are wall-clock, so a replay after an
-  outage (a sender's `buffer.disk:` spool, or a `tail_in` backlog restamped by `timestamp`)
-  merges into the current window whatever the events' age. Put `drop_stale` before `aggregate` to discard what is older than
-  `max_age`, or `has_stale` to archive it
-  ([ADR `stale-event-filtering`](../adr/stale-event-filtering.md)).
-  - **Trade-off:** under `temporality: cumulative`, merging a late delta keeps the running total
-    correct (`increase()` is right, `rate()` spikes), while discarding it leaves the total low by
-    the counted amount.
 - **A `keep` ahead of `aggregate` turns Datadog APM stats into ordinary metrics.** `aggregate`
   passes a stats group through whole (`passed_through{reason="bucketed"}`), because `datadog_in`
   and `datadog_trace_in` flag it `_logit.metrics.closed`. `keep` drops `_logit.*` attributes unless

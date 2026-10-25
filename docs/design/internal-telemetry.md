@@ -1161,8 +1161,9 @@ bind mode it counts the **wire samples** of a delivered write: every decoded ser
 minus those of any series the model mapping then dropped. A write no consumer took counts none.
 That's the number the 2.0 `X-Prometheus-Remote-Write-Samples-Written` header reports for that
 request, by design: a counter and a header disagreeing about one request would be a puzzle with no
-right answer.
-`docs/known-gaps/prometheus.md` tracks the unit difference as its own row.
+right answer. So summing `logit.input.samples` across a deployment running both modes adds
+series to samples. There's no mode tag: which of `logit.input.scrapes` and `logit.input.writes` a
+component reports already tells the modes apart.
 
 **The bind-mode metadata cache** is the one piece of cross-request state on this kind, and it
 reports itself:

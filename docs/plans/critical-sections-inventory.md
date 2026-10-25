@@ -5261,9 +5261,8 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
   - The scrape client follows redirects — `reqwest::Client::new()` in `PrometheusInput::new` keeps `reqwest`'s
     `limited(10)` default, unlike `crate::http::build_client` on the sink side. **Documented in
     `docs/known-gaps/` and ADR `prometheus-remote-write`'s Consequences; context, not new.**
-  - `logit.input.samples` counts *series* here and *wire samples* in bind mode — a documented
-    gap ([`docs/known-gaps/prometheus.md`](../known-gaps/prometheus.md)'s "`logit.input.samples` means two
-    different things depending on `prometheus_in`'s mode"). **Context.**
+  - `logit.input.samples` counts *series* here and *wire samples* in bind mode — documented, by
+    design, in [`docs/design/internal-telemetry.md`](../design/internal-telemetry.md). **Context.**
 - **Existing coverage:** in-file `crates/logit-inputs/src/prometheus.rs` scrape tests
   (`a_successful_text_scrape_decodes_series_and_reports_up_one` through
   `two_unparseable_targets_get_distinct_resources`: dialect
@@ -5447,7 +5446,7 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
   seed not rebuilt on an identical re-declaration, the entry's own `Arc` preserved, and
   `a_request_before_the_watermark_does_not_sweep` (via the `#[cfg(test)] sweeps` counter on
   `MetadataCache`). ADR `prometheus-remote-write` ("The receiver is stateless; 1.0 typing waits for
-  a bounded metadata cache"); [`docs/known-gaps/prometheus.md`](../known-gaps/prometheus.md).
+  a bounded metadata cache"); [`docs/deploying.md`](../deploying.md)'s `metadata_cache:` notes.
 - **Suggested verification approach:** a loom or plain-threads stress test hammering `seed`/`learn`
   from N threads with overlapping and disjoint family sets, asserting
   `families.len() <= max_families` and gauge agreement at quiescence; a test that seeds a family
@@ -6845,7 +6844,7 @@ the telemetry buffers are `std::collections::HashMap`.
   - ~~No other Lua-reachable path interns an arbitrary script string without a guard — `Event.new` and the `MetricProxy`/`LogProxy` `__newindex` `name`/`unit`/`description`/`event_name` writes do exactly that (`LogProxy`'s `event_name` write and `MetricProxy`'s `name`/`unit`/`description` writes in `proxy.rs`; `metric_from_table`'s `name` and `symbol_field` in `construct.rs`).~~ **Retired (#392):** they do, and that unguarded interning is now the documented, accepted posture rather than an open question — see the Verified line below and `docs/known-gaps/`'s interner entry.
   - `read_tags` rejects reserved keys before interning them.
 - **Observed concerns (unverified):** ~~the guard here is thorough while the equivalent interning in `proxy.rs`/`construct.rs` has no `is_enabled`-style gate and no documented hazard note. Consistent with the interner's global "accepted" posture, but the asymmetry is worth a deliberate decision. Medium confidence.~~ **Decided, not a gap (`luab/w5`):** the asymmetry stands. `telemetry`'s guard exists because a disabled `internal` component is the common case and must cost nothing; the proxy/`construct.rs` sites always run when a script writes a name, unit, description, or attribute key, so there is no disabled state to guard. `docs/known-gaps/`'s interner entry now lists all five feeders under the interner's accepted posture, `telemetry` named as the guarded one.
-- **Existing coverage:** `crates/logit-script/src/telemetry.rs`'s `tests` module. Governed by `docs/adr/lua-authored-telemetry-cardinality.md`, `docs/design/lua-api.md`, [`docs/known-gaps/telemetry.md`](../known-gaps/telemetry.md#internal-telemetry-and-self-logging).
+- **Existing coverage:** `crates/logit-script/src/telemetry.rs`'s `tests` module. Governed by `docs/adr/lua-authored-telemetry-cardinality.md`, `docs/design/lua-api.md`, [`docs/design/memory.md`](../design/memory.md#what-feeds-it).
 - **Verified 2026-09-26 (#392):** the guard ordering in `telemetry.rs` is pinned by `a_disabled_telemetry_handle_never_touches_the_interner_even_with_dynamic_looking_input` and `a_disabled_handle_never_reads_the_lua_argument_as_a_str_either` — a disabled handle interns nothing and never even UTF-8-checks its argument. The unguarded feeders (`MetricProxy`/`LogProxy` `__newindex`, `construct::metric_from_table`'s `name` directly and `unit`/`description` and `log_from_table`'s `event_name` through `symbol_field`, and every attribute key via `AttrsProxy::__newindex` or, nested, `lua_table_to_attrmap`) are documented, by decision, under the interner's accepted posture rather than gated to match `telemetry`; `docs/design/lua-api.md`'s new "Limits" list and `docs/known-gaps/`'s interner entry are the operator-facing record.
 - **Priority:** P1 — a documented, accepted leak path whose guards must all stay in the right order.
 

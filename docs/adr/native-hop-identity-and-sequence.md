@@ -1,6 +1,6 @@
 ---
 created: 2026-10-01
-updated: 2026-10-25
+updated: 2026-10-18
 ---
 
 # Native hop identity and sequence: a per-store sender identity and sequence on every hop frame, and a high-water mark at `logit_in`
@@ -296,7 +296,6 @@ is unchanged.]
   ignores. [Superseded on 2026-10-01 by [ADR
   `native-hop-no-compatibility`](native-hop-no-compatibility.md): an `Ack` with a body is
   malformed, and neither direction across that boundary is a supported deployment.]
-- **The residual race** is accepted (decision 7) and stated for operators in `docs/deploying.md`'s
-  "Forwarding between `logit` nodes".
+- **The residual race** stays documented in `docs/known-gaps/native-hop.md` (decision 7).
 - **Operator docs (the plan's W6).** `docs/design/wire-protocol.md` and `docs/deploying.md`
   describe the native hop once the implementation lands.

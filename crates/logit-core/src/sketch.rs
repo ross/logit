@@ -36,8 +36,8 @@
 //! at `f64::MAX`, so `to_bytes` is a fixed point across `from_bytes`, which drops a non-finite
 //! count. It
 //! takes the summary as written. A decoded `min > max` makes quantiles non-monotonic, an infinite
-//! or `NaN` `min`/`max` reaches [`DdSketch::quantile`]'s clamp unchanged, and a `count` of 0 over
-//! populated bins makes [`DdSketch::merge`] skip the sketch. None of these panics;
+//! or `NaN` `min`/`max` reaches [`DdSketch::quantile`]'s clamp unchanged, and a `count` and a zero
+//! count both 0 over populated bins make [`DdSketch::merge`] skip the sketch. None of these panics;
 //! `docs/adr/deployment-threat-model.md`'s non-goals amendment records them as accepted.
 
 use std::fmt;

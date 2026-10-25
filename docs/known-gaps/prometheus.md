@@ -59,17 +59,6 @@ Entry format and the other areas: [the known-gaps index](README.md).
     turns redirects off; that helper's doc comment has the reasoning. `logit-inputs` doesn't
     depend on `logit-outputs`, so the scrape client needs its own copy of the policy, or a shared
     home for it.
-- **`logit.input.samples` means two different things depending on `prometheus_in`'s mode.**
-  - Scrape mode counts the series a scrape decoded (`events.len()`, one event per series,
-    `crates/logit-inputs/src/prometheus.rs`'s `tick`).
-  - Bind mode counts wire samples reaching the `Fanout`: for a classic histogram, one per
-    `_bucket` plus `_sum` plus `_count`. This matches the 2.0
-    `X-Prometheus-Remote-Write-Samples-Written` header; a counter that disagreed with that header
-    would have no right answer.
-
-  Summing `logit.input.samples` across a deployment running both modes adds series to samples.
-  There's no mode tag: which of `logit.input.scrapes`/`logit.input.writes` a component reports
-  already tells the modes apart.
 - **A remote-write lost at shutdown behind an open transform is still answered `204`.**
   `prometheus_in(bind)` answers `503` for a write no direct consumer took (counted
   `logit.input.writes{class="closed_consumer"}`), but still acknowledges a shutdown-time closure

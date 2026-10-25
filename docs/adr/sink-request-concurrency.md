@@ -73,11 +73,11 @@ accepts an older sample after a newer one:
 | `datadog_out` | Series: last to arrive wins, as for InfluxDB, at one point per series per second. Every other route stores what it receives. |
 | `datadog_trace_out`, `splunk_hec_out` | Safe. Nothing at the destination depends on order across requests. Splunk's `Clean`-before-acceptance rows depend on order within one `send`, which stays sequential. |
 | `otlp_out` | Logs and traces: safe. Metrics into a Prometheus-backed receiver: as remote write. |
-| `prometheus_out` remote write | Both specs require one series' samples in timestamp order. A receiver with no out-of-order window answers `400`, the sink reads `Rejected`, and the batch drops ([`docs/known-gaps/prometheus.md`](../known-gaps/prometheus.md), "The remote-write sender does no cross-batch reordering"). Which receivers accept out-of-order samples, and under what setting, is the receiver table in `crates/logit-outputs/src/prometheus.rs`'s module doc, "Concurrency". |
+| `prometheus_out` remote write | Both specs require one series' samples in timestamp order. A receiver with no out-of-order window answers `400`, the sink reads `Rejected`, and the batch drops ([`docs/deploying.md`](../deploying.md)'s remote-write sender notes). Which receivers accept out-of-order samples, and under what setting, is the receiver table in `crates/logit-outputs/src/prometheus.rs`'s module doc, "Concurrency". |
 
 A single chain into one `prometheus_out` can't draw an out-of-order `400` today, because
-batches leave in order. Concurrency would turn that chain into the fan-in case the known-gaps
-entry describes.
+batches leave in order. Concurrency would turn that chain into the fan-in case those notes
+describe.
 
 ## Decision
 

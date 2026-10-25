@@ -85,7 +85,8 @@ consequence that each such entry cites this ADR. The revisit trigger reopens eve
   peer's or a script's strings, among them `logit_in` interning a dictionary from a batch it then
   rejects ([ADR `untrusted-input-bounds`](untrusted-input-bounds.md)'s "Documented non-goals").
 - **Lua-authored telemetry goes through the interner.** A script that builds a metric name or tag
-  value from event data grows it one entry per value
+  value from event data grows it one entry per value; a disabled telemetry handle costs nothing,
+  whatever the script passes
   ([ADR `lua-authored-telemetry-cardinality`](lua-authored-telemetry-cardinality.md)).
 - **A Lua script has no time bound, and its residuals stand.** Interner growth from
   script-derived strings, a shared-table DAG converting at 2^k nodes, a 128-deep value that
@@ -109,8 +110,9 @@ consequence that each such entry cites this ADR. The revisit trigger reopens eve
   path for a shape only crafted input produces
   ([ADR `untrusted-input-bounds`](untrusted-input-bounds.md)'s "Documented non-goals").
 - **An OTLP/JSON body of crafted tiny objects peaks at about 98 bytes of heap per input byte.**
-  Ordinary OTLP/JSON peaks at about 19, and the same batch as protobuf at about 17, because the
-  JSON path builds a `serde_json::Value` tree first. At 4 MiB the crafted shape is about 400 MiB
+  Ordinary OTLP/JSON (`testdata/interop/otlp/logs.json`, a real SDK export) peaks at about 19, and
+  the same batch as protobuf at about 17 (debug build, measured 2026-09-25), because the JSON path
+  builds a `serde_json::Value` tree first. At 4 MiB the crafted shape is about 400 MiB
   for one request. `crates/logit-proto/tests/robustness.rs`'s
   `otlp_json_peak_memory_per_input_byte_is_documented` pins ceilings of 24 and 128, and no cap or
   streaming parser is built
@@ -122,7 +124,8 @@ consequence that each such entry cites this ADR. The revisit trigger reopens eve
   sketch whose count and zero count are both 0 over populated bins, without a counter; and a
   `HyperLogLog` with a wrong harmonic sum estimates wrong. No encoder `logit` ships writes any of
   these, and recomputing a summary on decode wouldn't reproduce the bytes
-  ([ADR `untrusted-input-bounds`](untrusted-input-bounds.md)'s "Documented non-goals").
+  ([ADR `untrusted-input-bounds`](untrusted-input-bounds.md)'s "Documented non-goals"). A real
+  producer's sketch carrying bins under a zero count would reopen the `merge` case.
 - **No cap on syslog STRUCTURED-DATA elements or PARAMs per line.** `parse_structured_data` reads
   a line, bounded by the 64 KiB frame cap or the datagram, in one forward pass, but folding names
   into `AttrMap`'s sorted map is quadratic in distinct names arriving in an order the interner

@@ -95,8 +95,7 @@ Entry format and the other areas: [the known-gaps index](README.md).
   request that drew an `Ambiguous` answer is resent under `at_least_once` and may have been
   applied, and a `buffer.disk:` replay after a crash resends every request of the batch because the
   memory is in-process (`docs/known-gaps/sinks.md`, "The per-request retry memory of `otlp_out` and
-  the Datadog sinks is in-process"; `docs/known-gaps/native-hop.md`, "A disk-backed sink replays
-  delivered and dropped batches after a crash"). A trial org received two resends:
+  the Datadog sinks is in-process"; `docs/deploying.md`'s "Durable buffering"). A trial org received two resends:
   - A series point resent at the same `(series, timestamp)` was stored once, the last write
     winning: a count sent twice read 5, not 10, and a gauge sent as 7 then 9 read 9.
   - An identical log posted twice was stored as two logs.
@@ -144,18 +143,6 @@ Entry format and the other areas: [the known-gaps index](README.md).
     environments keeps the first.
   - **Workaround:** none needed for the twice-carried service, since Datadog reads the field as
     the log's service. Give a log one value per tag upstream.
-- **`datadog_trace_out` under `version: v0.4` drops the trace chunk and tracer payload fields.**
-  v0.4 has no field for a chunk's `_logit.datadog.chunk.*` fields (sampling priority, origin,
-  dropped flag, tags) or for the tracer payload fields no request header carries
-  (`_logit.datadog.tracer.runtime_id`, `.tags`, `.container_debug`).
-  Each is counted `logit.output.spans.degraded{reason="no_wire_form"}`. The payload's hostname,
-  env, and app version, the resource's `host.name`, `deployment.environment.name`, and
-  `service.version`, go out as every span's `host.name`, `env`, and `version` tags instead,
-  unless the span carries a different value of its own, which wins as any event attribute does,
-  counted the same way.
-  - **Consequence:** only a v0.7-origin batch loses anything, and the Agent derives a chunk's
-    priority and origin from the root span again on its side.
-  - **Workaround:** `version: v0.7`, which carries all of them.
 - **`datadog_trace_out` derives no Datadog fields from an OTel span.** A span without
   `service.name`, `resource.name`, or `span.type` reaches the Agent with `service`, `resource`, or
   `type` empty, and the Agent computes no stats for it.

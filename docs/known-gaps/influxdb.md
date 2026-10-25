@@ -55,10 +55,6 @@ the decoder differs from `influxd`.
     for a corrupt gzip body, sees `404` or `400` instead.
   - **Workaround:** drop the `Content-Encoding` header or send `gzip`, and write to the route
     without a trailing `/`.
-- **`max_request_bytes` has no `influxd` counterpart.** `influxd` v2.9.1 enforces no body limit.
-  `influxdb_in` bounds the body with `max_request_bytes`, a `logit` choice.
-  - **Consequence:** a body larger than the limit that `influxd` would take is refused.
-  - **Workaround:** raise `max_request_bytes`, or split the batch at the producer.
 - **The pair hasn't been compared end to end against a real InfluxDB.** The evidence is a
   recorded Telegraf corpus, the fixed-point suite, and a probe of `influxd` 2.9.1. No run has
   sent one Telegraf through two `outputs.influxdb_v2`, one writing direct to a bucket `direct` and

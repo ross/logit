@@ -966,7 +966,7 @@ fn write_structured_data(
 ///
 /// PARAM-NAMEs are sorted by name bytes. They're already unique (the decoder groups a repeated
 /// one under a `Value::Array`), so sorting makes the element a function of its data; a wire
-/// `a b a` interleaving re-emits as `a a b` (`docs/known-gaps/syslog.md`).
+/// `a b a` interleaving re-emits as `a a b` (`docs/adr/syslog-structured-data-convention.md`).
 fn write_sd_element<'a>(
     out: &mut String,
     scratch: &mut String,

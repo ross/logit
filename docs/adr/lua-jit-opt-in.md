@@ -1,6 +1,6 @@
 ---
 created: 2026-10-16
-updated: 2026-10-22
+updated: 2026-10-25
 ---
 
 # LuaJIT's trace compiler is off by default, and `jit: true` turns it on per component
@@ -99,4 +99,5 @@ The trace compiler stays off by default. A `lua` or `lua_file` component that se
   4x slower than a tables-only one, against about 60% slower interpreted
   ([ADR `lua-in-place-edits`](lua-in-place-edits.md)'s amendment).
 - The default path is unchanged: a component without `jit:` builds the same VM it did before.
-- `docs/known-gaps/transforms.md` records that `max_memory` doesn't count compiled machine code.
+- ADR `deployment-threat-model`'s non-goals amendment records that `max_memory` doesn't count
+  compiled machine code.

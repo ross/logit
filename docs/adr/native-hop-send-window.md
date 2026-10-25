@@ -345,8 +345,8 @@ async fn await_ack(&mut self) -> anyhow::Result<()> { Ok(()) }
   in about one round trip after. The hard bound is the window it holds; under the sustained
   backpressure that parks a forward, the pace keeps it to one or two. Nothing is lost, and a
   batch's only copy never lands after a later batch, since a mark at or above a sequence exists
-  only once a copy of it landed. `docs/deploying.md`'s "Forwarding between `logit` nodes" states
-  this for operators.
+  only once a copy of it landed. The `docs/known-gaps/native-hop.md` entry "A resend can race the
+  frames an ended connection still holds, and be forwarded twice" says so.
 - **The shutdown count grows.** A memory store's `finish` counts outstanding frames as
   `dropped{reason="shutdown"}`, and `flush`'s `shutdown()` can then let `logit_in` forward them.
   The over-count is at most one batch today and at most `window` with this record.

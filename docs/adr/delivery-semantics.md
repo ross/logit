@@ -1,6 +1,6 @@
 ---
 created: 2026-09-29
-updated: 2026-10-25
+updated: 2026-10-23
 ---
 
 # Delivery semantics: at-least-once per hop, duplicates absorbed by the data model, and an effectively-once native hop
@@ -585,7 +585,7 @@ connection. That is a second native-hop exception to item 3 beside the at-or-bel
 and it isn't an acknowledgment of delivery: it tells the sender the batch was dropped, and the
 sender drops it as `Rejected` (item 2's permitted loss). A frame no consumer took still gets
 `Reject{GOING_AWAY}` and leaves the mark alone. A rejected `Ack` lost before the sender reads it
-lets a mark resume commit the frame as delivered, an accepted window `docs/deploying.md` states.
+lets a mark resume commit the frame as delivered; `docs/known-gaps/native-hop.md` tracks that.
 
 ## Amendment (2026-10-13): `prometheus_out` drops a delta
 

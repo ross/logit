@@ -1111,8 +1111,12 @@ decides):
   ([ADR `lua-authored-telemetry-cardinality`](../adr/lua-authored-telemetry-cardinality.md) accepts
   the enabled case: a fixed literal costs one entry, a per-event string one per value). The other
   four are unguarded: `MetricProxy`'s `__newindex` on `name`/`unit`/`description`, `LogProxy`'s
-  `__newindex` on `event_name`, `Event.new`'s symbol fields, and every attribute key a script
-  writes, top-level or nested
+  `__newindex` on `event_name`, `Event.new`'s symbol fields (`construct::metric_from_table`'s
+  `name` directly, and its `unit`/`description` and `construct::log_from_table`'s `event_name`
+  through `symbol_field`), and every attribute key a script writes, top-level through
+  `AttrsProxy::__newindex` and nested through `value.rs`'s `lua_table_to_attrmap`. The guarded
+  case goes through `telemetry.rs`'s `static_str`, `static_metric_name`, and `read_tags`, which
+  `install`'s `count`/`gauge` closures call only after `Telemetry::is_enabled`
   ([ADR `lua-runaway-script-bounds`](../adr/lua-runaway-script-bounds.md)).
 
 ### What was *not* the risk: failed lookups — fixed anyway

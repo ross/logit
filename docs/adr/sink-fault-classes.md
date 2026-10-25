@@ -296,7 +296,7 @@ What the peers agree on:
   `at_most_once` for the `Ambiguous` case. Memory and disk cost follow `buffer:`, which already
   bounds them.
 - Readiness is unchanged: a sink holding its queue shows nowhere on `/readyz`
-  (`docs/known-gaps/runtime.md`, "Readiness is per-process, not per-sink").
+  ([ADR `admin-readiness-endpoint`](admin-readiness-endpoint.md), "Readiness is per-process, not per-sink").
 - A dead-letter path and an oversize split are the follow-ups this record points at and doesn't
   build. Until the first exists, a `Rejected` batch is visible in a counter and a log event and
   nowhere else.

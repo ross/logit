@@ -330,6 +330,10 @@ fails the probe instead of holding it open.
 
 ### What to watch on `/readyz`
 
+- **Readiness is per process, not per sink.** A sink holding its queue while its destination
+  refuses it doesn't flip `/readyz`; its `buffer:` block bounds what the hold accumulates, and the
+  `logit.component.retrying` gauge and the paced `retrying` error line are what to alert on
+  ([ADR `admin-readiness-endpoint`](adr/admin-readiness-endpoint.md)).
 - **`/readyz` stuck at `503 degraded`** means a node has failed, not that a sink is retrying. See
   [Sink failure semantics](#sink-failure-semantics) for how a sink handles a failing
   destination without a node failing.
@@ -487,7 +491,8 @@ client already saw `connect()` succeed and may have sent data. With `net.ipv4.tc
 (Linux 5.14 and later), the kernel moves them to the surviving process instead. `logit` accepts
 through the delay, until the instant the drain drops a listener, so its queue is near empty at the
 close, and the sysctl matters only for connections that finish their handshake in that
-last instant. Every stream client `logit` serves reconnects after a reset.
+last instant. Every stream client `logit` serves reconnects after a reset, but a line it had sent
+into the reset connection is lost unless its protocol acknowledges.
 
 It's a node-level setting. A `hostNetwork` pod shares the node's network namespace and can't set
 network sysctls, so set it in the node image, from a privileged init DaemonSet, or through your
@@ -1019,10 +1024,13 @@ buffering:
   reads it.
   `buffer.push.blocked.duration` records a wait only once it ends, so during a stall read this one.
 - **A retried batch doesn't inflate a sink's encode-side drop counters, but a drop a peer or the
-  kernel decided repeats.** While a sink retries, counts such as
-  `logit.output.messages.dropped{reason="oversize_datagram"}`, a Splunk code 6, and an OTLP
-  partial success grow with each attempt that meets the same answer, so read them as attempts,
-  not batches. [Internal telemetry](design/internal-telemetry.md#outputs) has the class table
+  kernel decided can repeat.** While a sink retries, Splunk's code 6
+  (`records.dropped{reason="invalid_event"}`), Splunk Cloud's oversize answer, and
+  `logit.output.messages.dropped{reason="oversize_datagram"}` grow with each attempt that meets
+  the same answer, so read them as attempts, not batches; a hold has no end but success or
+  shutdown, so a Splunk verdict re-counted on each retry grows for as long as the hold lasts. The
+  verdict counters of `otlp_out`, `datadog_out`, and `datadog_trace_out`, an OTLP partial success
+  included, count once: a retry never resends what the destination already settled. [Internal telemetry](design/internal-telemetry.md#outputs) has the class table
   that lists every sink counter as once per batch, once per attempt, or repeating
   ([ADR `sink-send-path-and-attempt-accounting`](adr/sink-send-path-and-attempt-accounting.md),
   decision 1).
@@ -1135,6 +1143,9 @@ complete identity and sequence is corrupt and skipped, never replayed.
 A replay delivers events however old they are, and an `aggregate` downstream merges them into its
 current window. Put `drop_stale` before the `aggregate` to discard events older than `max_age`, or
 `has_stale` to route them to an archive ([ADR `stale-event-filtering`](adr/stale-event-filtering.md)).
+Under `temporality: cumulative` that's a trade-off: merging a late delta keeps the running total
+right (`increase()` is right, `rate()` spikes), while discarding it leaves the total low by the
+counted amount.
 
 ```yaml
 buffer:
@@ -1283,7 +1294,10 @@ you can see the kernel default before deciding whether to raise it.
 also how many the decode half takes off the receive queue at a time: one knob for both ends of one
 queue. `read_batch: 1` reads one datagram per syscall. See
 [ADR `udp-intake-batching-and-socket-visibility`](adr/udp-intake-batching-and-socket-visibility.md)
-for the design.
+for the design. Batching is Linux-only, and `logit` ships Linux containers only: another target
+reads one datagram per `recv_from`, still validates `read_batch` and sizes the decode half's take
+with it, and never counts `logit.component.datagrams.dropped{reason="truncated"}`, because a
+`recv_from` build can't see the kernel cut a datagram short and decodes the partial payload.
 
 ```yaml
 components:
@@ -1525,7 +1539,9 @@ socket. Only two things reset it: bytes read from the peer, and the listener fin
 on the connection (a batch handed downstream, a resend recognized, a response completed). Time spent
 blocked handing a batch to a full downstream never counts, because the clock isn't re-armed until
 that work returns. So a connection stalled on backpressure never looks idle, however long the
-stall. A periodic flush tick that finds nothing to send touches neither event, so it never re-arms
+stall. An HTTP request handler parked on a full downstream isn't closed by `idle_timeout` or the
+grace after it either: it holds its connection and its permit until the send completes or the
+client goes away, because closing it would drop a batch that never reached the fan-out. A periodic flush tick that finds nothing to send touches neither event, so it never re-arms
 the clock by itself.
 
 **A request body is bounded per read, not in total.** `idle_timeout` is also the stall bound on
@@ -1553,7 +1569,11 @@ lost response or batch. A silent peer can't use this to hold the connection open
 flight the drop still happens when the grace ends, and a request body that stalls mid-upload is
 bounded by the per-frame stall timeout regardless.
 
-**An idle close is policy, not a fault.** All five kinds in the table end the connection task
+The other five HTTP listeners (`prometheus_in`'s remote-write receiver, `datadog_in`,
+`datadog_trace_in`, `splunk_hec_in`, and `influxdb_in`) drive their connections the same way, so
+the `otlp_in` row's reset rule, a request completing rather than bytes arriving, applies to all six.
+
+**An idle close is policy, not a fault.** Every listener in the table ends the connection task
 with `Ok(())`,
 the same success path as a graceful shutdown, so an idle close never reaches the `connection_error`
 diagnostic. It is counted as **`logit.input.connections.closed{reason="idle"}`** instead. A rising
@@ -2942,6 +2962,10 @@ shape, not a sample of it. Two edges to know:
   to keep. For a per-service view of those, place one `shape` per source.
 - The batch's `Scope` passes through either way. A scope names an instrumentation library instead
   of carrying payload, and a transform has no hook to substitute one.
+- The distinct-key and key-set gauges track top-level attribute keys only. A nested map's keys
+  count toward its width (`logit.shape.nested_map_width`), never toward the key set, so a shop
+  whose width lives under a `k8s` or `labels` map reads narrow on the distinct-key gauges and wide
+  only on the nested ones. Read the two together.
 
 **Put an `aggregate` after it.** Every distribution-shaped quantity goes out raw (one
 `MetricKind::Samples` value per key, per value, per nested map, per batch), because summarization is
@@ -3438,8 +3462,9 @@ tags) or for a tracer payload's runtime ID and tags. Those are dropped and count
 version, the resource's `host.name`, `deployment.environment.name`, and `service.version`, go out
 as every span's `host.name`, `env`, and `version` tags, unless the span carries a different value
 of its own, which wins, counted the same way. A tracer that sent v0.4 never had them, so
-v0.4 relays its spans with nothing lost. If your tracers send `/v0.7/traces`, set `version: v0.7`,
-which carries all of them. The tracer's language, versions, container ID, and the rest of its
+v0.4 relays its spans with nothing lost, and the Agent derives a chunk's priority and origin from
+the root span again on its side. If your tracers send `/v0.7/traces`, set `version: v0.7`, which
+carries all of them. The tracer's language, versions, container ID, and the rest of its
 request headers go out as the same headers under either version.
 
 **It relays; it doesn't process.** Spans go to the Agent as they arrived, and the Agent does the
@@ -3588,6 +3613,9 @@ components:
     # max_request_bytes: 25MiB      # the default; as sent and after gzip
     # idle_timeout: 120s            # off by default
 ```
+
+`influxd` v2.9.1 enforces no body limit, so `max_request_bytes` is a `logit` choice: a body over
+it that `influxd` would take is refused with `413`. Raise it, or split the batch at the producer.
 
 `tls:`, `handshake_timeout:`, `max_connections:`, `peer:`, `proxy_protocol:`, `forwarded:`, and
 `reuse_port:` behave as on `otlp_in`. The generated schema, `schema/logit.schema.json`, has every
@@ -3926,7 +3954,7 @@ that holds a newline reads as two), maps back to back for `msgpack`, and one fra
 A `text` body is joined with no escaping, so to keep a multiline body such as a stack trace in
 one piece use `record: event`, or `format: json`, whose lines escape the newline. Finding how many
 `native` events fit a record takes several trial encodes, about twice the logarithm of the event
-count per record, so keep upstream batches under `max_request_bytes` where you can
+count per record, so keep upstream batches under `max_request_bytes` where you can, or raise the cap
 ([ADR `kafka-output`](adr/kafka-output.md)'s "Amendment: what W3 settled").
 A batch record has no key, and its timestamp is its first event's. So `key:` needs
 `record: event`, which `format: native` has to set explicitly; `logit validate` rejects a key
@@ -3938,8 +3966,9 @@ on one partition. `{attribute: NAME}` and `{resource: NAME}` key by that value a
 without the value is sent unkeyed and counted `logit.output.records.unkeyed`. Unkeyed records go
 to one partition per batch, picked at random among those with a leader, where the Java producer
 switches partitions every 16 KiB. So a small, steady sink fills a topic's partitions less evenly
-over a short window; set `key:` to a field with many values to spread it
-([ADR `kafka-output`](adr/kafka-output.md), item 2).
+over a short window, and a consumer group's members see uneven load. Set `key:` to a field with
+many values to spread it, or let the upstream batch size bound how much lands on one partition at
+a time ([ADR `kafka-output`](adr/kafka-output.md), item 2).
 
 **OTLP for a Collector.** `format: otlp_proto` writes what the OpenTelemetry Collector's Kafka
 exporter writes and its Kafka receiver reads (with `encoding: otlp_proto`, the receiver's
@@ -3969,17 +3998,6 @@ OTLP/JSON, in the form the Collector's own JSON marshaler writes, for a receiver
   `key: {resource: NAME}` keys every request of a batch with that resource attribute's value; it
   isn't the exporter's hash of every resource attribute, so the two place one resource on
   different partitions. `{attribute: NAME}` is rejected, because a request holds many events.
-  Don't mix `logit` and the exporter on one topic when consumers depend on a resource's records
-  sharing a partition.
-- **Trace ids against the Collector's exporter.** Its key bytes match `key: trace_id`'s, but its
-  default `record_partitioner` (`sticky_key` with an FNV-1a hasher) places most trace ids on a
-  different partition than `kafka_out`'s murmur2 does: 14 of 16 against Collector v0.162.0. Set
-  `record_partitioner: {sticky_key: {hasher: murmur2}}` on the exporter when both write one topic
-  ([ADR `kafka-otlp-formats`](adr/kafka-otlp-formats.md), item 9).
-- **No `otelcol.signal` header.** The sink tells signals apart by topic only, where the exporter
-  can add that header. A consumer that reads the signal from the header needs each signal on its
-  own topic, the default, or a sink per signal behind `has_signal` with the header set in
-  `headers:`.
 - **Size.** A request too large for `max_request_bytes` is split into several, each a valid
   request on its own, where the exporter would lose it. A consumer reading by trace id can see
   one trace's spans across several records. An event too large alone is dropped, counted
@@ -3987,9 +4005,11 @@ OTLP/JSON, in the form the Collector's own JSON marshaler writes, for a receiver
 - **Timestamps.** A record's timestamp is the time `logit` wrote it, as the exporter's are, not
   an event's; the events' times stay in the payload.
 - **Counting.** Every `records` counter counts Kafka records, so a rejected request holding 500
-  spans counts 1 in `logit.output.records.dropped{reason="rejected"}`, and loses all 500: the
-  broker rejects a record whole. A smaller `max_request_bytes` bounds how many events one request
-  holds.
+  spans counts 1 in `logit.output.records.dropped{reason="rejected"}`.
+
+`docs/known-gaps/kafka.md` lists what's still open for the OTLP formats: trace-id and resource
+placement against the Collector's exporter, the `otelcol.signal` header, a refused topic holding
+every signal, and a rejected record losing its whole request.
 
 [`fixtures/kafka-otlp.yaml`](../fixtures/kafka-otlp.yaml) relays OTLP into the default topics.
 
@@ -4013,8 +4033,10 @@ record carries the time it was written, so this doesn't apply.
 
 **Delivery.** A retry resends only the partitions the broker hasn't settled, under the same
 producer id and sequence numbers, so the broker discards a resend of a batch it already
-appended. That dedup doesn't survive a `logit` restart, which starts a new producer id, or a batch
-dropped part-way, after which the producer moves to a new epoch: a batch whose first attempt
+appended. That dedup doesn't survive a `logit` restart, which starts a new producer id, or a
+partition batch that settles without being appended (a rejection, the named-record drop, the
+`MESSAGE_TOO_LARGE` split, or a drop under `at_most_once`), after which the producer moves to a
+new epoch: a batch whose first attempt
 landed before either and whose retry went after is stored twice, and a `buffer.disk:` batch
 replayed after a restart lands again if it had landed before
 ([ADR `kafka-output`](adr/kafka-output.md), item 4). Downstream consumers that need no duplicates
@@ -4171,7 +4193,8 @@ Native histograms are skipped and counted on both wires regardless of version
 
 - Receiver: `logit.input.writes{class}` (`ok` against `bad_request`/`unsupported`/`oversize`; a
   nonzero `unsupported` usually means a sender whose `Content-Type` or `Content-Encoding` doesn't
-  match what it sends), `logit.input.write.duration`, `logit.input.samples`, and the
+  match what it sends), `logit.input.write.duration`, `logit.input.samples` (wire samples here,
+  where scrape mode counts series), and the
   `metadata_cache` metrics above. A nonzero `logit.input.connections.rejected{reason="limit"}`
   means the `max_connections` cap is binding.
 - Sender: `logit.output.requests{class}`, `logit.output.request.duration`, `logit.output.samples`.
@@ -4590,7 +4613,7 @@ port and address-family rules as `statsd_out`'s (see
 ["`statsd_out`: `transport: tcp` and TLS"](#statsd_out-transport-tcp-and-tls)).
 
 `syslog_out` writes an embedded newline in a message as the two characters `\` and `n` (and `\r`,
-NUL, and every other control character likewise), so one log can't read downstream as two. It
+NUL, and every other C0 control character and DEL likewise), so one log can't read downstream as two. It
 leaves a literal backslash alone, because escaping it would double every backslash in a JSON
 body. So a message that held the literal characters `\` and `n` reads the same as one with a
 newline ([ADR `syslog-output`](adr/syslog-output.md)). Structured data leaves with its SD-IDs and
@@ -4781,6 +4804,14 @@ whatever the hardware: about 100 batches/s on a link with a 10 ms round-trip tim
 offered value capped at `1024`, so it equals `concurrency` whenever `logit_in` answers at or above
 it. A memory buffer's `max_batches` also caps it, since a batch in flight stays in the sink's queue
 until its `Ack` arrives. `concurrency: 1` keeps one frame in flight.
+
+A shutdown with frames in flight can count up to `concurrency` batches as
+`logit.component.batches.dropped{reason="shutdown"}` that `logit_in` still forwards: the frames
+were written whole, and the sink closes a pooled connection cleanly, so `logit_in` reads them,
+but the sink can't learn which it forwarded without waiting for `Ack`s past its grace. Under
+`at_least_once`, a `buffer.disk:` store doesn't count them: it replays them on the next start,
+and `logit_in` acknowledges any it already forwarded without forwarding them again
+([ADR `native-hop-send-window`](adr/native-hop-send-window.md), decision 6).
 
 **What an `Ack` means.** An `Ack` names a sender identity and a sequence, and covers every frame of
 that identity up to the sequence that its connection carried, so one `Ack` can answer several
@@ -4975,7 +5006,10 @@ reconnecting doesn't show as `connection_error` on the far end.
   `logit.input.batches.dropped{reason="rejected"}` (frames answered by a rejected `Ack`; each is
   also counted under its `logit.proto.errors` reason, and dropped by the sender). A rejected
   `Ack` lost before the sender reads it lets the reconnect's mark resume commit that frame as
-  delivered, so the sender counts a delivery where `logit_in` counted a drop.
+  delivered, so the sender counts a delivery where `logit_in` counted a drop. To reconcile,
+  compare `logit_in`'s `logit.input.batches.dropped{reason="rejected"}` with the sink's
+  `logit.component.batches.dropped{reason="rejected"}`: the excess at the input is batches the
+  sink counted under `logit.output.batches.resumed` and `logit.component.batches.delivered`.
 - Both sides: `logit.proto.frames{direction,compression}` and `logit.proto.frame.bytes` for
   throughput.
 

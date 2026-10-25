@@ -79,6 +79,53 @@ Entry format and the other areas: [the known-gaps index](README.md).
     hour by default, as on Kafka.
   - **Revisit trigger:** Redpanda filling `record_errors`, or a decision to split a batch that a
     broker rejects without naming records.
+- **The OTLP formats write no `otelcol.signal` header.** The OpenTelemetry Collector's Kafka
+  exporter adds one naming the signal when its `signal_header` is on; `kafka_out` tells signals
+  apart by topic only ([ADR `kafka-otlp-formats`](../adr/kafka-otlp-formats.md),
+  Consequences).
+  - **Consequence:** a consumer that reads the signal from that header, rather than from the
+    topic, can't use a `topic:` that every signal shares.
+  - **Workaround:** keep each signal on its own topic, the default, or add the header with
+    `headers:` on a sink per signal, each behind `has_signal`.
+  - **Revisit trigger:** a consumer that needs the header on a shared topic.
+- **The OTLP formats have no byte parity with the exporter's resource keys.** The exporter's
+  `partition_metrics_by_resource_attributes` and `partition_logs_by_resource_attributes` key by a
+  hash of every resource attribute, computed by a package internal to the Collector.
+  `key: {resource: NAME}` keys by one attribute's text instead
+  ([ADR `kafka-otlp-formats`](../adr/kafka-otlp-formats.md), item 5).
+  - **Consequence:** a `logit` sink and an exporter writing one topic place the same resource on
+    different partitions.
+  - **Workaround:** don't mix the two writers on one topic when consumers depend on one
+    resource's records sharing a partition.
+  - **Revisit trigger:** an operator who needs that placement shared.
+- **The Collector's `kafkaexporter` places a trace id differently by default.** Its key bytes
+  match `kafka_out`'s (32 lowercase hex characters), but its `record_partitioner` defaults to
+  `sticky_key` with a Sarama-compatible FNV-1a hasher, where `kafka_out` hashes with the Java
+  client's murmur2. Measured against Collector v0.162.0 with `partition_traces_by_id: true`: 14 of
+  16 trace ids landed on a different partition, and with the exporter's `murmur2` hasher none did
+  ([ADR `kafka-otlp-formats`](../adr/kafka-otlp-formats.md), item 9; [ADR
+  `kafka-output`](../adr/kafka-output.md), item 3).
+  - **Consequence:** a `logit` sink and a default exporter writing one topic split one trace's
+    records across partitions.
+  - **Workaround:** set `record_partitioner: {sticky_key: {hasher: murmur2}}` on the exporter, or
+    don't mix the two writers on one topic when consumers depend on a trace sharing a partition.
+  - **Revisit trigger:** an operator who needs `kafka_out` to match the exporter's default.
+- **A refused signal topic holds every signal in the sink.** Each signal's topic settles on its
+  own, but the sink has one queue, so a topic the broker refuses (authorization, a missing topic)
+  holds the logs and spans behind it although their own topics accept writes
+  ([ADR `kafka-otlp-formats`](../adr/kafka-otlp-formats.md), item 4).
+  - **Consequence:** one misconfigured topic stops every signal of the sink until it's fixed.
+  - **Workaround:** run one `kafka_out` per signal, each behind `has_signal` (and `keep_signals`
+    when an event carries more than one signal). Each opens a producer for its own topic only.
+  - **Revisit trigger:** a multi-topic producer, or a per-signal queue.
+- **An OTLP record is lost whole.** The broker rejects a record whole, so a rejected
+  `otlp_proto` or `otlp_json` record drops every log record, span, or metric in its request, where the other
+  formats lose one event or one batch record
+  ([ADR `kafka-otlp-formats`](../adr/kafka-otlp-formats.md), Consequences).
+  - **Consequence:** `logit.output.records.dropped{reason="rejected"}` counts 1 for a request
+    that held hundreds of spans; the events behind it aren't counted.
+  - **Workaround:** a smaller `max_request_bytes` bounds how many events one request holds.
+  - **Revisit trigger:** an operator who needs the loss counted per event.
 - **A sink writing several signals holds a producer per topic.** Each signal's topic has its own
   producer, so a sink writing three signals holds up to three connections to each broker and
   three producer ids, and sends a broker three produce requests where one could carry every

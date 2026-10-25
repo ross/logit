@@ -63,13 +63,6 @@ Entry format and the other areas: [the known-gaps index](README.md).
     ([ADR `service-lifecycle-and-output-retry`](../adr/service-lifecycle-and-output-retry.md)),
     which assumes one `Fanout` per listener. The same work would settle "A UDP listener's read and
     decode loops share one task" (previous entry).
-- **UDP reads batch only on Linux.** On Linux, `read_loop` takes up to `receive.read_batch`
-  datagrams per `recvmmsg(2)` call. Other targets keep one `recv_from` per datagram behind the
-  same `BatchReader` interface (`crates/logit-inputs/src/udp.rs`), because `recvmmsg` has no
-  portable equivalent worth a second implementation, and `logit` ships Linux containers only. On
-  those targets, `read_batch` still validates and sizes the decode half's `pop_many`, but the read
-  half ignores it, and `logit.component.datagrams.dropped{reason="truncated"}` stays at zero: a
-  `recv_from` build can't see the kernel cut a datagram short, so it decodes the partial payload.
 - **No runtime `recvmmsg(2)` → `recvmsg(2)` fallback when a sandbox blocks the syscall.** On Linux
   a UDP listener always calls `recvmmsg(2)`. A seccomp profile (or an LSM) that refuses it returns
   `ENOSYS`/`EPERM` on the first call, which `read_loop` treats as fatal: the listener fails and the
@@ -134,6 +127,18 @@ Entry format and the other areas: [the known-gaps index](README.md).
   (`crates/logit-outputs/src/datagram.rs`'s module doc). `logit.component.errors` records the
   cancelled attempt.
   - **To close:** count each datagram as it goes, at a telemetry call per datagram.
+- **A UDP sink reaches only the IPv4 address of a name that resolves to both families.** Each
+  UDP sink (`statsd_out`, `syslog_out`, `graphite_out`, `collectd_out`) sends to the first IPv4
+  address its endpoint resolves to, and falls back to the first IPv6 one only when there's no
+  IPv4 address (`pick_addr`). Binding by the first resolved address instead would turn a loud
+  failure into silent loss where `localhost` resolves to `::1` first and the receiver listens on
+  `127.0.0.1` only.
+  - **Consequence:** a receiver that listens on IPv6 only, behind a name that also has an IPv4
+    address, gets nothing, and the send reports `ok`.
+  - **Workaround:** write the IPv6 address in `endpoint:`, for example `[::1]:8125`.
+  - **Revisit trigger:** an operator who needs the IPv6 address preferred
+    ([ADR `sink-send-path-and-attempt-accounting`](../adr/sink-send-path-and-attempt-accounting.md),
+    decision 9).
 - **The four IPv6 UDP sink tests skip where IPv6 loopback is unavailable.**
   `statsd::tests::an_ipv6_udp_endpoint_is_delivered` and its `syslog`, `graphite`, and `collectd`
   twins each bind a collector on `[::1]:0`, and print a reason and return when they can't. The dev

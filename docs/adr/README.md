@@ -26,7 +26,7 @@ the same date, write the record, then add a row here.
 | [`replay_in`: a finite input that reads a `format: json` or `format: native` file once and ends](replay-input.md) | 2026-10-19 | 2026-10-19 |
 | [Transit spec: a mapping table under `spec/transit/` is the canonical statement of every cross-protocol transition, checked by flows and rendered into the docs](transit-spec.md) | 2026-10-19 | 2026-10-21 |
 | [`route_signals`: a native signal router that splits a mixed event into one part per target](route-signals.md) | 2026-10-16 | 2026-10-23 |
-| [LuaJIT's trace compiler is off by default, and `jit: true` turns it on per component](lua-jit-opt-in.md) | 2026-10-16 | 2026-10-22 |
+| [LuaJIT's trace compiler is off by default, and `jit: true` turns it on per component](lua-jit-opt-in.md) | 2026-10-16 | 2026-10-25 |
 | [Lua in-place edits: writable log fields, `= nil` deletes an attribute, and `pairs` enumerates a proxy](lua-in-place-edits.md) | 2026-10-16 | 2026-10-18 |
 | [`line_protocol`: parse a log message as InfluxDB line protocol into one event per point, skipping bad lines](line-protocol-transform.md) | 2026-10-16 | 2026-10-23 |
 | [Native transform fan-out: `Transform::process_into` emits extra events into the same batch](transform-fan-out.md) | 2026-10-16 | 2026-10-18 |
@@ -40,14 +40,14 @@ the same date, write the record, then add a row here.
 | [InfluxDB line-protocol relay: fields as typed `Gauge` records under a measurement carrier, strings as attributes, and an all-or-nothing write](influxdb-line-protocol-relay.md) | 2026-10-13 | 2026-10-25 |
 | [Typed metric scalar: `MetricValue { F64, I64, U64, Bool }` replaces the `f64` in `Gauge`, `GaugeDelta`, and `Sum`](typed-metric-scalar.md) | 2026-10-13 | 2026-10-18 |
 | [Telemetry loss vocabulary: any nonzero `*.dropped` is loss, and intended outcomes use other words](telemetry-loss-vocabulary.md) | 2026-10-13 | 2026-10-22 |
-| [`kafka_out` OTLP formats: one export request per signal per record, a topic per signal, and a producer per topic behind a multi-topic facade](kafka-otlp-formats.md) | 2026-10-12 | 2026-10-25 |
+| [`kafka_out` OTLP formats: one export request per signal per record, a topic per signal, and a producer per topic behind a multi-topic facade](kafka-otlp-formats.md) | 2026-10-12 | 2026-10-13 |
 | [`kafka_out` SASL: PLAIN, SCRAM, OAUTHBEARER, and AWS MSK IAM, authenticated in the dialer and renewed by redial](kafka-sasl.md) | 2026-10-11 | 2026-10-17 |
 | [`kafka_out`: a pure-Rust producer on `kafka-protocol`, with the Java producer's semantics and named divergences](kafka-output.md) | 2026-10-11 | 2026-10-25 |
 | [Lua `random`: a global that mints trace ids, span ids, UUIDs, and ULIDs, with the time passed in](lua-random-ids.md) | 2026-10-11 | 2026-10-11 |
 | [`bucket`: a numeric-range classifier that writes a bounded attribute value](bucket-transform.md) | 2026-10-11 | 2026-10-21 |
 | [Run CI in an image prebaked from `Dockerfile.dev` and published to GHCR](ci-image-on-ghcr.md) | 2026-10-09 | 2026-10-09 |
 | [Parsers of producer bytes live in `logit-proto`, and listeners and transforms wrap them](parsers-live-in-logit-proto.md) | 2026-10-09 | 2026-10-09 |
-| [A soak harness: real containers over ordinary config, one-shot netem, and a reset-aware ledger as the loss oracle](soak-harness.md) | 2026-10-08 | 2026-10-25 |
+| [A soak harness: real containers over ordinary config, one-shot netem, and a reset-aware ledger as the loss oracle](soak-harness.md) | 2026-10-08 | 2026-10-18 |
 | [`statsd_out` multi-value expansion: summarized kinds leave as dotted counter and gauge lines by default](statsd-out-multi-value-expansion.md) | 2026-10-07 | 2026-10-21 |
 | [Listener port sharing with `SO_REUSEPORT`, a SIGTERM drain delay, and an admin Unix socket](listener-port-sharing-and-shutdown-delay.md) | 2026-10-07 | 2026-10-13 |
 | [TLS certificate reload: swappable resolvers and verifiers, triggered by a file poll and SIGHUP](tls-certificate-reload.md) | 2026-10-07 | 2026-10-07 |
@@ -62,12 +62,12 @@ the same date, write the record, then add a row here.
 | [Lua refusals: `Event.new` raises a refusal from a Lua shim, not as an mlua callback error](lua-refusals-raised-from-lua.md) | 2026-10-03 | 2026-10-03 |
 | [Crate layout: don't split crates to speed up the dev build](crate-layout-and-build-speed.md) | 2026-10-03 | 2026-10-11 |
 | [Release profile: fat LTO and one codegen unit, measured against thin LTO and 16 units](release-build-profile.md) | 2026-10-03 | 2026-10-22 |
-| [Native hop acks: a named cumulative `Ack`, coalesced at `logit_in`, and a resume mark in `HelloAck`](native-hop-named-acks.md) | 2026-10-02 | 2026-10-25 |
+| [Native hop acks: a named cumulative `Ack`, coalesced at `logit_in`, and a resume mark in `HelloAck`](native-hop-named-acks.md) | 2026-10-02 | 2026-10-18 |
 | [Native hop: two payload shapes named by shape, every hop frame sequenced, and strict control messages](native-hop-no-compatibility.md) | 2026-10-01 | 2026-10-18 |
 | [Native hop send window: several frames in flight, acknowledged in frame order](native-hop-send-window.md) | 2026-10-01 | 2026-10-25 |
-| [Native hop identity and sequence: a per-store sender identity and sequence on every hop frame, and a high-water mark at `logit_in`](native-hop-identity-and-sequence.md) | 2026-10-01 | 2026-10-25 |
+| [Native hop identity and sequence: a per-store sender identity and sequence on every hop frame, and a high-water mark at `logit_in`](native-hop-identity-and-sequence.md) | 2026-10-01 | 2026-10-18 |
 | [Sink send path and attempt accounting: counters that say what they count, one pooled-stream driver, and TLS writes that are flushed](sink-send-path-and-attempt-accounting.md) | 2026-09-29 | 2026-10-13 |
-| [Delivery semantics: at-least-once per hop, duplicates absorbed by the data model, and an effectively-once native hop](delivery-semantics.md) | 2026-09-29 | 2026-10-25 |
+| [Delivery semantics: at-least-once per hop, duplicates absorbed by the data model, and an effectively-once native hop](delivery-semantics.md) | 2026-09-29 | 2026-10-23 |
 | [Tail discovery failure and resume identity: a failed listing is no information, and a resume verifies the file's head](tail-discovery-failure-and-resume-identity.md) | 2026-09-28 | 2026-10-18 |
 | [Process-level metrics from procfs and the allocator](process-level-metrics.md) | 2026-09-28 | 2026-10-13 |
 | [`stdio_out`/`file_out`'s human render: an exhaustive, sectioned block per event](human-render-block-format.md) | 2026-09-28 | 2026-10-02 |
@@ -84,7 +84,7 @@ the same date, write the record, then add a row here.
 | [Datadog: two lossless pairs, the Agent's own protocols, and a Datadog-mapped `DdSketch`](datadog-agent-and-intake-relay.md) | 2026-09-23 | 2026-10-25 |
 | [`sample`: consistent, keyed event sampling with an operator override](consistent-sampling-component.md) | 2026-09-22 | 2026-10-25 |
 | [Publish the release image to GHCR, `latest` only, on manual dispatch](publish-release-image-to-ghcr.md) | 2026-09-22 | 2026-10-09 |
-| [`http_access`: web-server access lines normalized to OTel semconv once, natively, from raw fields](http-access-normalization.md) | 2026-09-22 | 2026-10-21 |
+| [`http_access`: web-server access lines normalized to OTel semconv once, natively, from raw fields](http-access-normalization.md) | 2026-09-22 | 2026-10-25 |
 | [Out-of-CI verification of raw-`libc` `unsafe`: a throwaway nightly image, not a Dockerfile.dev change](out-of-ci-unsafe-verification.md) | 2026-09-21 | 2026-09-25 |
 | [`flatten`: dotted-key expansion as an opt-in, operator-placed transform](flatten-transform.md) | 2026-09-21 | 2026-10-25 |
 | [Event sizing: `AttrMap`'s inline capacity stays 8, and attribute maps are not pre-sized](event-sizing-and-allocation-strategy.md) | 2026-09-21 | 2026-10-18 |

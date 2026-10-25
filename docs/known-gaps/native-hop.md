@@ -99,6 +99,19 @@ Entry format and the other areas: [the known-gaps index](README.md).
   one spool directory. Nothing rewrites written segments to reclaim space early: a segment is
   deleted whole once the read cursor crosses it. Nothing encrypts at rest. None of these blocks the
   at-least-once contract; each is narrower future work if a deployment needs it.
+- **A TLS `logit_out` that dies inside the first record of a frame reads, at `logit_in`, as a clean
+  close.** The frame's header travels in its first TLS record. If the sender's connection fails
+  before that record is complete, `logit_in` has decrypted zero bytes of the header when the
+  stream ends, so `read_header` takes the end as a close between frames and counts nothing, where
+  `logit.proto.errors{reason="truncated_header"}` would be truthful.
+  - **Consequence:** only the listener's count is off. Nothing is lost or duplicated: the
+    sender's write fails `Clean`, and the batch is resent on a new connection.
+  - **Why it isn't fixed:** the listener can't tell the two apart. rustls 0.23.45 marks
+    `has_seen_eof` on the transport EOF whatever its deframer still holds, so a record that never
+    completed and no record at all both reach `read_header` as the same `UnexpectedEof` with no
+    plaintext read
+    ([ADR `sink-send-path-and-attempt-accounting`](../adr/sink-send-path-and-attempt-accounting.md),
+    decision 12).
 - **A shutdown grace that cuts a `logit_out` `send` mid-write commits, and counts as dropped, a
   batch that provably never landed.** `write_loop` reads any cut-off send as `Fault::Ambiguous`,
   because it can't know how far the send got. On `logit_out`, a cut inside the frame's write or
@@ -112,7 +125,59 @@ Entry format and the other areas: [the known-gaps index](README.md).
     the row.
   - **Workaround:** to keep a queued batch across the restart, set `buffer.disk:` on the
     `logit_out` component, which persists it at the read cursor.
-
+- **A resend can race the frames an ended connection still holds, and be forwarded twice.**
+  `logit_in` holds no lock per sender identity across a forward, and it raises a sender's mark
+  only once a consumer takes the frame or once it refuses the frame by name.
+  - **The race:** a fault that ends a `logit_out` connection mid-window (a reset, a read error, a
+    message other than `Ack`, an ack timeout) can leave that connection's task holding whole frames
+    in its socket buffer. The task reads and forwards them while the sender resends the same window
+    on a new connection. For each sequence, whichever task checks it against the mark first
+    forwards it, and the other skips it as a resend once that forward raises the mark. Both forward
+    it when both check before either forward lands, most often when the old task's forward is
+    parked on a full inbox past the sender's ack timeout.
+  - **The bound:** each task forwards a given frame at most once per connection that held it, so
+    twice per fault, and one more time for each further connection that times out on the same
+    inbox. The old task ends at its first `Ack` write after the reset arrives: the sender has
+    closed that socket, so the write meets a reset within about a round trip. With acks coalesced,
+    that write comes when the task's next read would wait, at an identity change, or at the
+    32-frame cap. Before it, the task can forward the frame it was parked on plus every frame still
+    buffered on the closed socket, up to the cap. The hard bound is the window the old connection
+    held, and the cap keeps a run under 32. Under the sustained backpressure that parks a forward,
+    each of those forwards can race the resend of the same frame.
+  - **Consequence:** nothing is lost. A duplicate copy can reach the consumers after later
+    batches; a batch's only copy never does, because the mark reaches a sequence only after a copy
+    of it landed or `logit_in` refused it by name, and a refused frame is never forwarded by any
+    connection, since it fails the same way on each.
+  - [ADR `native-hop-identity-and-sequence`](../adr/native-hop-identity-and-sequence.md), decision
+    7, accepts the race: a per-sender lock held across the forward would close it at the cost of a
+    lock per frame, to prevent a duplicate the at-least-once target tolerates.
+    [ADR `native-hop-send-window`](../adr/native-hop-send-window.md), decision 6, keeps that with a
+    window.
+- **A refused frame whose rejected `Ack` is lost is reported delivered by the sender.**
+  `logit_in` raises a refused frame's mark before the sender reads the rejected `Ack`
+  ([ADR `native-hop-ack-status`](../adr/native-hop-ack-status.md), decision 4). If the connection
+  fails in between (a write failure, a stall, the sender's ack timeout), `logit_out` reads it as
+  `Ambiguous`, and the next `HelloAck.marks` covers the sequence, so the sink commits the frame
+  without resending it.
+  - **Consequence:** the batch was dropped, never forwarded, but the two ends disagree on why. To
+    reconcile, compare `logit_in`'s `logit.input.batches.dropped{reason="rejected"}` with the
+    sending sink's `logit.component.batches.dropped{reason="rejected"}`: the excess at the input is
+    batches the sink counted under `logit.output.batches.resumed` and
+    `logit.component.batches.delivered`. Nothing is lost beyond the drop itself.
+  - **Possible fix, out of scope:** a bounded per-identity set of refused sequences that
+    `HelloAck` names, so a resume commits them as dropped.
+- **A reconnect resumes at most 16 sender identities.** After a fault, `logit_out`'s next `Hello`
+  lists the identities of the frames it will resend, so `logit_in` can answer their marks and the
+  frames at or below them are committed without a send (`logit.output.batches.resumed`). The list
+  holds at most 16 identities (`MAX_HELLO_SENDERS`). A window whose frames span more than 16 store
+  opens, which takes a spool replaying records from that many earlier opens, resends the frames of
+  the 17th identity on.
+  - **Consequence:** `logit_in` recognizes each of those by its mark and doesn't forward it again,
+    so the cost is the encode and the bytes. The duplicate cases
+    [`docs/deploying.md`](../deploying.md#forwarding-between-logit-nodes) lists are unchanged.
+    [ADR `native-hop-named-acks`](../adr/native-hop-named-acks.md), decision 4, accepts this.
+  - **Revisit trigger:** `logit.input.batches.resends` climbing after reconnects that the resume
+    should have absorbed.
 - **Coalesced acks cost about 2 points of a window's ceiling under 10 ms RTT.** At `concurrency: 32`
   and a 10 ms round trip (`tc qdisc ... netem delay 5ms`), `logit_in`'s named acks
   ([ADR `native-hop-named-acks`](../adr/native-hop-named-acks.md)) reach 97.2% of the 3,174

@@ -1,6 +1,6 @@
 ---
 created: 2026-10-08
-updated: 2026-10-25
+updated: 2026-10-18
 ---
 
 # A soak harness: real containers over ordinary config, one-shot netem, and a reset-aware ledger as the loss oracle
@@ -334,7 +334,7 @@ received, less its counted drops, against the events the `logit_in` forwarded. I
 and a kill or a pause is allowed only what it can cause: a killed side's last drain interval of
 counts, and, for a kill or a pause of the receiving side, one send window of frames forwarded
 twice ([ADR `native-hop-named-acks`](native-hop-named-acks.md),
-[`docs/deploying.md`](../deploying.md#forwarding-between-logit-nodes)). A graceful stop of the
+[`docs/known-gaps/native-hop.md`](../known-gaps/native-hop.md)). A graceful stop of the
 receiving side is judged exact, because `logit_in` acknowledges everything it forwarded before
 it closes, except that a killed sender's spool replays the frames it committed after its last
 cursor persist, which a receiving side restarted since forwards again, so each killed sender
