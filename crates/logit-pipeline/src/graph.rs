@@ -139,7 +139,8 @@
 //!     one on a UDP `syslog_in`/`graphite_in`/`statsd_in`/`lines_in` or a `transport: unix`
 //!     `statsd_in`/`lines_in`, which has no handshake. Compared against
 //!     `default_handshake_timeout`, so the default stays legal everywhere
-//!     (`docs/adr/syslog-tcp-ingress-and-tls.md`).
+//!     (`docs/adr/syslog-tcp-ingress-and-tls.md`). Also an HTTP sink's `connect_timeout` of `0s`,
+//!     which would fail every dial.
 //! 46. A `graphite_in`/`graphite_out` `protocol: pickle` off TCP (its length prefix means nothing
 //!     in a datagram), a `max_line_bytes`/`max_frame_bytes`/`connect_timeout` of `0`, or a
 //!     `max_frame_bytes` outside `GRAPHITE_FRAME_BYTES_RANGE`
@@ -2373,6 +2374,26 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
             );
         }
     }
+    // Rule 45, continued: an HTTP sink's `connect_timeout` bounds its DNS lookup, TCP dial, and
+    // TLS handshake together, and no dial completes in zero time, so `0s` would fail every
+    // attempt as a `Clean` connect error and hold the queue forever.
+    for (id, component) in &components {
+        let connect_timeout = match &component.kind {
+            ComponentKind::InfluxDbOut { connect_timeout, .. }
+            | ComponentKind::OtlpOut { connect_timeout, .. }
+            | ComponentKind::DatadogOut { connect_timeout, .. }
+            | ComponentKind::DatadogTraceOut { connect_timeout, .. }
+            | ComponentKind::SplunkHecOut { connect_timeout, .. }
+            | ComponentKind::PrometheusOut { connect_timeout, .. } => *connect_timeout,
+            _ => continue,
+        };
+        if connect_timeout.is_zero() {
+            anyhow::bail!(
+                "component '{id}': 'connect_timeout: 0s' could never open a connection -- use a \
+                 positive duration"
+            );
+        }
+    }
 
     // Rule 53: `idle_timeout`, rule 45's checks one field over
     // (`docs/adr/idle-connection-timeout.md`), with two differences. The field is an `Option` whose
@@ -2676,6 +2697,7 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
             reuse_port,
             concurrency,
             idle_timeout,
+            connect_timeout,
         } = &component.kind
         else {
             continue;
@@ -2741,6 +2763,14 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                     anyhow::bail!(
                         "component '{id}': 'idle_timeout' bounds how long the remote-write \
                          sender's pooled connections sit idle and only means anything with \
+                         'endpoint' -- a prometheus_out with 'bind' serves an exposition and opens \
+                         no connections"
+                    );
+                }
+                if *connect_timeout != logit_config::default_sink_connect_timeout() {
+                    anyhow::bail!(
+                        "component '{id}': 'connect_timeout' bounds how long the remote-write \
+                         sender waits for a connection to open and only means anything with \
                          'endpoint' -- a prometheus_out with 'bind' serves an exposition and opens \
                          no connections"
                     );
@@ -5289,6 +5319,7 @@ mod tests {
             token: "TOKEN".to_string(),
             concurrency: 1,
             idle_timeout: logit_config::default_sink_idle_timeout(),
+            connect_timeout: logit_config::default_sink_connect_timeout(),
             tls: logit_config::TlsClientConfig::default(),
         }
     }
@@ -6256,6 +6287,7 @@ mod tests {
             tls: logit_config::TlsClientConfig::default(),
             concurrency: 1,
             idle_timeout: logit_config::default_sink_idle_timeout(),
+            connect_timeout: logit_config::default_sink_connect_timeout(),
         }
     }
 
@@ -6272,6 +6304,7 @@ mod tests {
             tls: logit_config::TlsClientConfig::default(),
             concurrency: 1,
             idle_timeout: logit_config::default_sink_idle_timeout(),
+            connect_timeout: logit_config::default_sink_connect_timeout(),
         }
     }
 
@@ -6285,6 +6318,7 @@ mod tests {
             tls,
             concurrency: 1,
             idle_timeout: logit_config::default_sink_idle_timeout(),
+            connect_timeout: logit_config::default_sink_connect_timeout(),
         }
     }
 
@@ -8331,6 +8365,7 @@ mod tests {
             max_body_bytes: logit_config::default_splunk_max_body_bytes(),
             concurrency: 1,
             idle_timeout: logit_config::default_sink_idle_timeout(),
+            connect_timeout: logit_config::default_sink_connect_timeout(),
         }
     }
 
@@ -8721,6 +8756,7 @@ mod tests {
             histograms: logit_config::DatadogHistograms::default(),
             concurrency: 1,
             idle_timeout: logit_config::default_sink_idle_timeout(),
+            connect_timeout: logit_config::default_sink_connect_timeout(),
         }
     }
 
@@ -8872,6 +8908,7 @@ mod tests {
             tls: logit_config::TlsClientConfig::default(),
             concurrency: 1,
             idle_timeout: logit_config::default_sink_idle_timeout(),
+            connect_timeout: logit_config::default_sink_connect_timeout(),
         }
     }
 
@@ -12660,6 +12697,16 @@ mod tests {
         }
     }
 
+    /// Rule 45: an HTTP sink's zero `connect_timeout` could never open a connection.
+    #[test]
+    fn a_zero_connect_timeout_http_sink_is_rejected() {
+        let mut out = sink();
+        let ComponentKind::InfluxDbOut { connect_timeout, .. } = &mut out else { unreachable!() };
+        *connect_timeout = Duration::ZERO;
+        let err = expect_err(cfg(vec![("in", vec![], listener()), ("out", vec!["in"], out)]));
+        assert!(err.contains("'out'") && err.contains("connect_timeout: 0s"), "got: {err}");
+    }
+
     /// Rule 46: a zero `connect_timeout` could never establish a TCP connection.
     #[test]
     fn a_zero_connect_timeout_graphite_out_is_rejected() {
@@ -13964,6 +14011,7 @@ mod tests {
             reuse_port: false,
             concurrency: 1,
             idle_timeout: logit_config::default_sink_idle_timeout(),
+            connect_timeout: logit_config::default_sink_connect_timeout(),
         }
     }
 
@@ -13985,6 +14033,7 @@ mod tests {
             reuse_port: false,
             concurrency: 1,
             idle_timeout: logit_config::default_sink_idle_timeout(),
+            connect_timeout: logit_config::default_sink_connect_timeout(),
         }
     }
 
@@ -14137,6 +14186,12 @@ mod tests {
             *idle_timeout = Duration::from_secs(1);
         }));
         assert!(err.contains("'out'") && err.contains("'idle_timeout'"), "got: {err}");
+
+        let err = expect_err(expose_cfg(|kind| {
+            let ComponentKind::PrometheusOut { connect_timeout, .. } = kind else { unreachable!() };
+            *connect_timeout = Duration::from_secs(1);
+        }));
+        assert!(err.contains("'out'") && err.contains("'connect_timeout'"), "got: {err}");
     }
 
     /// A *default* sender-only value stays legal under `bind:` -- rule 45's reason for comparing

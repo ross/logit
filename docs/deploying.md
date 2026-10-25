@@ -1058,6 +1058,14 @@ server that closes at 5 s, as Node.js, Apache, and uvicorn do by default. `0s` o
 per request. A destination that closes a connection for another reason, such as a restart or a
 per-connection request cap, can still reset a write; see [known gaps: sinks](known-gaps/sinks.md).
 
+An HTTP sink gives up on a new connection that doesn't open within its `connect_timeout:`, `5s`
+by default: the DNS lookup, the TCP dial, and the TLS handshake together. Nothing was sent, so
+the attempt counts `logit.output.requests{class="connect_error"}` and is retried under either
+`buffer.delivery`. Keep `connect_timeout:` below the request timeout, `timeout:`, or 10 s on
+`influxdb_out` and `otlp_out`, which have no `timeout:`. When the request timeout is shorter, it
+ends a stalled dial first as a timeout, `class="network_error"`, an attempt the destination may have
+taken, and `at_most_once` drops its batch.
+
 While the buffer stays full, the warning repeats at most once a minute with the batches and events
 shed so far, or how long intake has been held. Once the buffer's utilization falls below
 `buffer.recover_below` (default `0.75`), the sink logs one `buffer_recovered` line with the
@@ -4367,9 +4375,9 @@ neither a DNS name nor an IP address fails startup.
 
 **What to watch.** A handshake failure on either side surfaces through the same
 `connection_error`/`network_error` diagnostics and `logit.output.requests{class="connect_error"}`/
-listener-side `logit.component.diagnostics` counters as any other transport failure. A handshake
-that stalls past the sink's request timeout reads `class="network_error"` instead, since no HTTP
-sink sets a connect timeout of its own. Certificate
+listener-side `logit.component.diagnostics` counters as any other transport failure. On an HTTP
+sink, a handshake that stalls past `connect_timeout:` reads `class="connect_error"` too; it reads
+`class="network_error"` only when the sink's request timeout is the shorter of the two. Certificate
 rotation has its own counter, gauge, and diagnostics; see [Certificate rotation](#certificate-rotation).
 `docs/known-gaps/intake.md` tracks one open item: no TLS client can set SNI, so a front end that
 routes on SNI can't be reached by IP.

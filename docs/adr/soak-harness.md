@@ -419,8 +419,8 @@ G counts an event only after the listener's batch was in every inbox and W had c
 only a `kill` or an `exit` of the SUT, which can lose its last unexported interval, is reported;
 every other window is judged. A judged window may show a surplus, W − X above G, of one
 generator batch per attempt the writer counted `logit.output.requests{class="network_error"}`
-in it, plus one per edge (a failed dial counts `connect_error` and allows none, but one that
-outlasts the request timeout counts `network_error`; see "a boundary pair nets in full" below): the writer sends one batch per request, one request in flight, and
+in it, plus one per edge (a failed dial, one `connect_timeout:` ended included, counts
+`connect_error` and allows none; see "a boundary pair nets in full" below): the writer sends one batch per request, one request in flight, and
 resends it after a transport error, when the listener may already have taken it. The same
 allowance, with X left out of the counted loss, bounds `ledger.summary`'s end to end.
 `influxdb_in`'s request identities are judged in `ledger.intake`.
@@ -566,9 +566,10 @@ in the pool, past its limit of 650.
   failed as `logit.output.requests{class="connect_error"}`, apart from `network_error`
   ([ADR `sink-send-path-and-attempt-accounting`](sink-send-path-and-attempt-accounting.md)'s
   amendment of the same date). Only `network_error`, a timeout or a reset after which the
-  listener may hold the batch, allows one batch of surplus. A dial still pending when the
-  request times out counts `network_error` too, so the allowance stays an upper bound wherever
-  a dial can stall, as under netem delaying the SUT's egress past the writer's timeout
+  listener may hold the batch, allows one batch of surplus. A dial the writer's
+  `connect_timeout:` ends counts `connect_error`, so a dial stalled by netem allows nothing. The
+  allowance is loose only when the writer's request timeout is shorter than its `connect_timeout:`,
+  which counts a stalled dial `network_error`
   ([ADR `sink-send-path-and-attempt-accounting`](sink-send-path-and-attempt-accounting.md)'s "Amendment: a failed dial counts `connect_error`"). A run recorded before the split
   counts every failed dial as `network_error`, and its allowance is looser still.
 

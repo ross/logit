@@ -134,6 +134,13 @@ status-only default:
 | connect failure, DNS failure | `Clean` | unchanged |
 | request timeout | `Ambiguous` | unchanged |
 
+A dial the sink's `connect_timeout:` ends, the DNS lookup, TCP dial, and TLS handshake together,
+is a connect failure, `Clean`, so `at_most_once` retries it. The request-timeout row covers a
+request whose connection opened, and a stalled dial only when the request timeout is shorter
+than `connect_timeout:` and ends it first ([ADR
+`sink-send-path-and-attempt-accounting`](sink-send-path-and-attempt-accounting.md)'s "Amendment:
+a failed dial counts `connect_error`").
+
 A response a sink can't attribute (a bare `400` with no body it can read) is `Rejected`. Holding
 it would be safe when the destination is the fault and a wedge when a stream of bad batches is,
 and the specifications' definition and every peer's behavior read it as the request's fault.

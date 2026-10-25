@@ -149,16 +149,6 @@ Entry format and the other areas: [the known-gaps index](README.md).
   - **Revisit trigger:** aligning the vocabulary, which the ADR names as follow-up work
     ([ADR `sink-send-path-and-attempt-accounting`](../adr/sink-send-path-and-attempt-accounting.md),
     decision 4).
-- **An HTTP sink's stalled dial counts `network_error`.** No HTTP sink sets a connect timeout,
-  so a dial still pending when the request's timeout fires ends as a timeout: `Ambiguous`, and
-  `logit.output.requests{class="network_error"}`, though nothing was sent. Only a dial that fails
-  before the timeout counts `connect_error`
-  ([ADR `sink-send-path-and-attempt-accounting`](../adr/sink-send-path-and-attempt-accounting.md)'s
-  "Amendment: a failed dial counts `connect_error`").
-  - **Consequence:** `network_error` overstates the requests a destination may hold, and the
-    soak harness's HTTP resend allowance is loose by the stalled dials.
-  - **Revisit trigger:** a connect timeout on the HTTP clients, which would make a stalled dial
-    `Clean` and change what `delivery: at_most_once` drops, so it needs its own decision.
 
 ## Load-test harness and perf tooling
 

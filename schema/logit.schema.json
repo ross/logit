@@ -2943,6 +2943,11 @@
               "format": "uint32",
               "minimum": 0.0
             },
+            "connect_timeout": {
+              "description": "How long this sink waits for a new connection to open: the DNS lookup, the TCP dial, and the TLS handshake together. A connection that doesn't open in time sent nothing, so the attempt counts `logit.output.requests{class=\"connect_error\"}` and is retried under either `buffer.delivery`. Keep it below the sink's fixed 10 s request timeout: when that ends the attempt first, the stalled dial counts `network_error`, an attempt the destination may have taken, and `at_most_once` drops its batch. Defaults to `5s`.",
+              "default": "5s",
+              "type": "string"
+            },
             "default_bucket": {
               "description": "The bucket for a batch that names none when `bucket` is absent: anything not received by an `influxdb_in`. With neither set, such a batch is dropped and counted.",
               "default": null,
@@ -3030,6 +3035,11 @@
               "type": "integer",
               "format": "uint32",
               "minimum": 0.0
+            },
+            "connect_timeout": {
+              "description": "How long this sink waits for a new connection to open: the DNS lookup, the TCP dial, and the TLS handshake together. A connection that doesn't open in time sent nothing, so the attempt counts `logit.output.requests{class=\"connect_error\"}` and is retried under either `buffer.delivery`. Keep it below the sink's fixed 10 s request timeout: when that ends the attempt first, the stalled dial counts `network_error`, an attempt the destination may have taken, and `at_most_once` drops its batch. Defaults to `5s`.",
+              "default": "5s",
+              "type": "string"
             },
             "endpoint": {
               "type": "string"
@@ -3123,6 +3133,11 @@
               "type": "integer",
               "format": "uint32",
               "minimum": 0.0
+            },
+            "connect_timeout": {
+              "description": "How long this sink waits for a new connection to open: the DNS lookup, the TCP dial, and the TLS handshake together. A connection that doesn't open in time sent nothing, so the attempt counts `logit.output.requests{class=\"connect_error\"}` and is retried under either `buffer.delivery`. Keep it below `timeout`: when `timeout` ends the attempt first, the stalled dial counts `network_error`, an attempt the destination may have taken, and `at_most_once` drops its batch. Defaults to `5s`.",
+              "default": "5s",
+              "type": "string"
             },
             "endpoints": {
               "description": "Base URLs that replace the hosts `site` derives, one per intake: for a proxy, or to point this sink at another `logit`'s `datadog_in`.",
@@ -3222,6 +3237,11 @@
               "type": "integer",
               "format": "uint32",
               "minimum": 0.0
+            },
+            "connect_timeout": {
+              "description": "How long this sink waits for a new connection to open: the DNS lookup, the TCP dial, and the TLS handshake together. A connection that doesn't open in time sent nothing, so the attempt counts `logit.output.requests{class=\"connect_error\"}` and is retried under either `buffer.delivery`. Keep it below `timeout`: when `timeout` ends the attempt first, the stalled dial counts `network_error`, an attempt the destination may have taken, and `at_most_once` drops its batch. Defaults to `5s`.",
+              "default": "5s",
+              "type": "string"
             },
             "endpoint": {
               "description": "The Agent's trace API as an absolute `http://` or `https://` URL: `http://127.0.0.1:8126` for an Agent on the same host.",
@@ -3331,6 +3351,11 @@
               "type": "integer",
               "format": "uint32",
               "minimum": 0.0
+            },
+            "connect_timeout": {
+              "description": "How long this sink waits for a new connection to open: the DNS lookup, the TCP dial, and the TLS handshake together. A connection that doesn't open in time sent nothing, so the attempt counts `logit.output.requests{class=\"connect_error\"}` and is retried under either `buffer.delivery`. Keep it below `timeout`: when `timeout` ends the attempt first, the stalled dial counts `network_error`, an attempt the destination may have taken, and `at_most_once` drops its batch. Defaults to `5s`.",
+              "default": "5s",
+              "type": "string"
             },
             "endpoint": {
               "description": "The collector's base URL, ending in `/services/collector`: `https://splunk.example.com:8088/services/collector`, or `https://http-inputs-<stack>.splunkcloud.com/services/collector` on Splunk Cloud. A Splunk Cloud trial stack serves HEC at `https://<stack>.splunkcloud.com:8088/services/collector` instead, with a self-signed certificate that needs `tls: {insecure_skip_verify: true}`. This sink appends `/event` and `/ack` itself, so a URL ending in a route (`/event`, `/raw`, `/ack`, `/health`) is rejected.",
@@ -4319,6 +4344,11 @@
               "type": "integer",
               "format": "uint32",
               "minimum": 0.0
+            },
+            "connect_timeout": {
+              "description": "How long this sink waits for a new connection to open: the DNS lookup, the TCP dial, and the TLS handshake together. A connection that doesn't open in time sent nothing, so the attempt counts `logit.output.requests{class=\"connect_error\"}` and is retried under either `buffer.delivery`. Keep it below `timeout`: when `timeout` ends the attempt first, the stalled dial counts `network_error`, an attempt the destination may have taken, and `at_most_once` drops its batch. Defaults to `5s`. Sender mode only.",
+              "default": "5s",
+              "type": "string"
             },
             "endpoint": {
               "description": "An absolute `http://`/`https://` remote-write URL, path included (typically `/api/v1/write`): sender mode. Never resolved at config-load time, so a receiver that isn't up yet is not a config error.\n\nA remote-write series holds one sample per millisecond, so of two readings of one series in one millisecond of a batch, the sink sends the later and leaves the earlier off, counted `logit.output.metrics.dropped{reason=\"duplicate_timestamp\"}`. When the earlier is a state (a gauge not flagged `_logit.metrics.type: rate`, or a cumulative kind) equal to the later, nothing is lost, and it counts `logit.output.metrics.normalized{reason=\"duplicate_timestamp\"}` instead; two equal increments or sets of observations, a set's size included, are still two. To merge or collapse such readings first, put a `dedup_timestamps` with `precision: 1ms` last before this sink.",

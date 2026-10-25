@@ -30,7 +30,8 @@
 //! A fault's class follows `super::super`'s response-class table: an endpoint unreachable, timed
 //! out, or answering `429` or `5xx`, and STS's `Throttling` and `IDPCommunicationError`, are
 //! `Clean`; any other answer from an endpoint, and a source misconfigured on this host, are
-//! `Refused`. Every HTTP request is bounded by the sink's `timeout`. STS's request honors
+//! `Refused`. Every HTTP request is bounded by the sink's `timeout`, and its connection by a fixed
+//! 5 s (`crate::http::DEFAULT_CONNECT_TIMEOUT`). STS's request honors
 //! `HTTPS_PROXY` and the other proxy variables; the container endpoint's and IMDS's never go
 //! through a proxy, as the Java SDK's don't, because a proxy would see the container
 //! authorization token and the credentials. No message or `Debug` output
@@ -151,7 +152,12 @@ impl Chain {
 
     pub(crate) fn with(env: Env, endpoints: Endpoints, timeout: Duration) -> Self {
         Self::with_clients(env, endpoints, timeout, || {
-            crate::http::client_builder(timeout, crate::http::DEFAULT_IDLE_TIMEOUT, None)
+            crate::http::client_builder(
+                timeout,
+                crate::http::DEFAULT_CONNECT_TIMEOUT,
+                crate::http::DEFAULT_IDLE_TIMEOUT,
+                None,
+            )
         })
     }
 
@@ -1191,8 +1197,13 @@ mod tests {
         let proxied = |vars: &[(&str, &str)], endpoints: Endpoints| {
             let url = proxy.url.clone();
             Chain::with_clients(env(vars), endpoints, RECV_TIMEOUT, move || {
-                crate::http::client_builder(RECV_TIMEOUT, crate::http::DEFAULT_IDLE_TIMEOUT, None)
-                    .proxy(reqwest::Proxy::all(&url).unwrap())
+                crate::http::client_builder(
+                    RECV_TIMEOUT,
+                    crate::http::DEFAULT_CONNECT_TIMEOUT,
+                    crate::http::DEFAULT_IDLE_TIMEOUT,
+                    None,
+                )
+                .proxy(reqwest::Proxy::all(&url).unwrap())
             })
         };
 

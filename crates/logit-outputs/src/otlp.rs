@@ -81,6 +81,11 @@
 //! so the sink closes an idle connection before the destination can, on both transports
 //! ([`crate::http::build_client`]; `docs/adr/sink-request-concurrency.md`, decision 7).
 //!
+//! `connect_timeout:` (default `5s`) bounds a new connection's DNS lookup, TCP dial, and TLS
+//! handshake together. A dial it ends sent nothing: `Clean`, counted `connect_error`
+//! ([`crate::http::build_client`], and `otlp_out`'s gRPC client through [`crate::http::ConnectTimeout`]). Keep it below the sink's fixed 10 s
+//! request timeout, which otherwise ends a stalled dial first as a timeout.
+//!
 //! **Delivery posture.** The default, `at_least_once` (`docs/adr/delivery-semantics.md`, item 5),
 //! resends the signal an `Ambiguous` answer named, and OTLP has no identity that makes a resend
 //! overwrite. A resent delta `Sum` or `Histogram` adds at the receiver; the remedy is an upstream
@@ -165,8 +170,8 @@ use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 
 use crate::http::{
     body_snippet, build_client, classify_reqwest_error, classify_status, read_body_prefix,
-    read_varint, skip_field, status_class, transport_class, Journal, Outcomes, Slots,
-    DEFAULT_IDLE_TIMEOUT, ERROR_BODY_SNIPPET_BYTES,
+    read_varint, skip_field, status_class, transport_class, ConnectTimeout, Journal, Outcomes,
+    Slots, DEFAULT_IDLE_TIMEOUT, ERROR_BODY_SNIPPET_BYTES,
 };
 use std::collections::HashMap;
 use std::path::Path;
@@ -219,7 +224,7 @@ pub struct OtlpOutput {
     /// the default trust store and rebuilt when [`OtlpOutput::with_tls`] sets a non-empty `tls:`.
     /// Batches in flight above a concurrency of 1 share it, each request a stream on that
     /// connection.
-    grpc_client: GrpcClient<HttpsConnector<HttpConnector>, Full<Bytes>>,
+    grpc_client: GrpcClient<ConnectTimeout<HttpsConnector<HttpConnector>>, Full<Bytes>>,
     request_timeout: Duration,
     /// Counts through views of `telemetry`/`diag` gated by `accounting` ([`new_encoder`]).
     encoder: OtlpEncoder,
@@ -244,6 +249,9 @@ pub struct OtlpOutput {
     slots: Slots<Attempted>,
     /// The operator's `idle_timeout:`, on both transports' pools ([`crate::http::build_client`]).
     idle_timeout: Duration,
+    /// The operator's `connect_timeout:`, on both transports ([`crate::http::build_client`],
+    /// [`build_grpc_client`]).
+    connect_timeout: Duration,
 }
 
 impl OtlpOutput {
@@ -253,9 +261,19 @@ impl OtlpOutput {
         Ok(Self {
             endpoint,
             transport,
-            client: build_client(DEFAULT_TIMEOUT, DEFAULT_IDLE_TIMEOUT, None),
-            grpc_client: build_grpc_client(&default_client_tls_config(), DEFAULT_IDLE_TIMEOUT),
+            client: build_client(
+                DEFAULT_TIMEOUT,
+                crate::http::DEFAULT_CONNECT_TIMEOUT,
+                DEFAULT_IDLE_TIMEOUT,
+                None,
+            ),
+            grpc_client: build_grpc_client(
+                &default_client_tls_config(),
+                crate::http::DEFAULT_CONNECT_TIMEOUT,
+                DEFAULT_IDLE_TIMEOUT,
+            ),
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
+            connect_timeout: crate::http::DEFAULT_CONNECT_TIMEOUT,
             request_timeout: DEFAULT_TIMEOUT,
             encoder: new_encoder(&telemetry, &diag, accounting.gate()),
             telemetry,
@@ -280,10 +298,37 @@ impl OtlpOutput {
     /// transports' clients.
     pub fn with_idle_timeout(mut self, idle_timeout: Duration) -> Self {
         self.idle_timeout = idle_timeout;
-        self.client = build_client(self.request_timeout, idle_timeout, self.tls.as_ref());
+        self.client = build_client(
+            self.request_timeout,
+            self.connect_timeout,
+            idle_timeout,
+            self.tls.as_ref(),
+        );
         self.grpc_client = match &self.tls {
-            Some(cfg) => build_grpc_client(cfg, idle_timeout),
-            None => build_grpc_client(&default_client_tls_config(), idle_timeout),
+            Some(cfg) => build_grpc_client(cfg, self.connect_timeout, idle_timeout),
+            None => {
+                build_grpc_client(&default_client_tls_config(), self.connect_timeout, idle_timeout)
+            }
+        };
+        self
+    }
+
+    /// How long a new connection may take to open, DNS lookup, TCP dial, and TLS handshake
+    /// together (`connect_timeout:` in config, default [`crate::http::DEFAULT_CONNECT_TIMEOUT`]).
+    /// Rebuilds both transports' clients.
+    pub fn with_connect_timeout(mut self, connect_timeout: Duration) -> Self {
+        self.connect_timeout = connect_timeout;
+        self.client = build_client(
+            self.request_timeout,
+            connect_timeout,
+            self.idle_timeout,
+            self.tls.as_ref(),
+        );
+        self.grpc_client = match &self.tls {
+            Some(cfg) => build_grpc_client(cfg, connect_timeout, self.idle_timeout),
+            None => {
+                build_grpc_client(&default_client_tls_config(), connect_timeout, self.idle_timeout)
+            }
         };
         self
     }
@@ -292,7 +337,8 @@ impl OtlpOutput {
     /// it bounds the whole round trip (connect, handshake, request, response) with
     /// `tokio::time::timeout`, so `grpc_client` isn't rebuilt.
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
-        self.client = build_client(timeout, self.idle_timeout, self.tls.as_ref());
+        self.client =
+            build_client(timeout, self.connect_timeout, self.idle_timeout, self.tls.as_ref());
         self.request_timeout = timeout;
         self
     }
@@ -329,8 +375,9 @@ impl OtlpOutput {
             &self.diag,
             &self.telemetry,
         )?;
-        self.client = build_client(self.request_timeout, self.idle_timeout, Some(&cfg));
-        self.grpc_client = build_grpc_client(&cfg, self.idle_timeout);
+        self.client =
+            build_client(self.request_timeout, self.connect_timeout, self.idle_timeout, Some(&cfg));
+        self.grpc_client = build_grpc_client(&cfg, self.connect_timeout, self.idle_timeout);
         self.tls = Some(cfg);
         Ok(self)
     }
@@ -417,7 +464,7 @@ struct Sender {
     transport: OtlpTransport,
     endpoint: String,
     client: reqwest::Client,
-    grpc_client: GrpcClient<HttpsConnector<HttpConnector>, Full<Bytes>>,
+    grpc_client: GrpcClient<ConnectTimeout<HttpsConnector<HttpConnector>>, Full<Bytes>>,
     request_timeout: Duration,
     headers: HeaderMap,
     paths: SignalPaths,
@@ -835,10 +882,16 @@ fn default_client_tls_config() -> rustls::ClientConfig {
 /// Nagle's algorithm on, the DATA frame waits for the peer's delayed ACK of the HEADERS, which
 /// adds about 40 ms to every export on Linux. `enforce_http(false)` is what `build()` sets too,
 /// so the one connector still dials `https://`.
+///
+/// `connect_timeout` bounds the DNS lookup, the TCP dial, and the TLS handshake together
+/// ([`ConnectTimeout`]): `HttpConnector::set_connect_timeout` bounds the TCP dial alone, and
+/// `hyper_rustls` runs the handshake after it unbounded. A connect it ends reaches
+/// `grpc_roundtrip`'s connect-error arm, `Clean`.
 fn build_grpc_client(
     tls: &rustls::ClientConfig,
+    connect_timeout: Duration,
     idle_timeout: Duration,
-) -> GrpcClient<HttpsConnector<HttpConnector>, Full<Bytes>> {
+) -> GrpcClient<ConnectTimeout<HttpsConnector<HttpConnector>>, Full<Bytes>> {
     let mut http = HttpConnector::new();
     http.enforce_http(false);
     http.set_nodelay(true);
@@ -848,6 +901,7 @@ fn build_grpc_client(
         .enable_http2()
         .wrap_connector(http);
     let mut builder = crate::http::hyper_client_builder(idle_timeout);
+    let connector = ConnectTimeout::new(connector, connect_timeout);
     builder.http2_only(true);
     builder.build(connector)
 }
@@ -928,7 +982,7 @@ fn grpc_fault(status: &GrpcStatus) -> Fault {
 /// trailers (a normal unary response). No status at all is `Ambiguous`. Connect and TLS handshake
 /// failures surface through `client.request`'s `Err`. `send_grpc` turns an `Err` into telemetry.
 async fn grpc_roundtrip(
-    client: &GrpcClient<HttpsConnector<HttpConnector>, Full<Bytes>>,
+    client: &GrpcClient<ConnectTimeout<HttpsConnector<HttpConnector>>, Full<Bytes>>,
     base: &str,
     signal: Signal,
     payload: Bytes,
@@ -1696,6 +1750,51 @@ mod tests {
         let totals = Totals::of(registry.drain(0));
         let refused = [("signal", "metrics"), ("class", "connect_error")];
         assert_eq!(totals.sum("logit.output.requests", &refused), 1.0);
+    }
+
+    /// A TLS handshake the gRPC destination never answers ends at `connect_timeout`, long before
+    /// `timeout`, as a connect error: `Clean`, counted `connect_error`.
+    #[tokio::test]
+    async fn a_grpc_stalled_handshake_ends_at_the_connect_timeout_as_connect_error() {
+        let (addr, held) = crate::test_support::silent_listener().await;
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("out", "otlp_out", "sink");
+        let mut output = OtlpOutput::new(format!("https://{addr}"), OtlpTransport::Grpc)
+            .unwrap()
+            .with_timeout(Duration::from_secs(60))
+            .with_connect_timeout(Duration::from_millis(200))
+            .with_telemetry(telemetry);
+        let started = std::time::Instant::now();
+        let err = output.send(&metric_batch()).await.unwrap_err();
+        let took = started.elapsed();
+        held.abort();
+        assert_eq!(logit_pipeline::classify(&err), Fault::Clean, "{err:#}");
+        assert!(took < Duration::from_secs(10), "took {took:?}");
+        let totals = Totals::of(registry.drain(0));
+        let stalled = [("signal", "metrics"), ("class", "connect_error")];
+        assert_eq!(totals.sum("logit.output.requests", &stalled), 1.0);
+        assert!(!totals.has("logit.output.requests", &[("class", "network_error")]));
+    }
+
+    /// A gRPC TCP dial the kernel never completes, its `SYN` dropped by a full accept queue, ends
+    /// at `connect_timeout` as a connect error.
+    #[tokio::test]
+    async fn a_grpc_dial_to_a_full_accept_queue_ends_at_the_connect_timeout_as_connect_error() {
+        let (addr, _listener, _queued) = crate::test_support::full_backlog_listener().await;
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("out", "otlp_out", "sink");
+        let mut output = grpc_output(addr)
+            .with_timeout(Duration::from_secs(60))
+            .with_connect_timeout(Duration::from_millis(200))
+            .with_telemetry(telemetry);
+        let started = std::time::Instant::now();
+        let err = output.send(&metric_batch()).await.unwrap_err();
+        let took = started.elapsed();
+        assert_eq!(logit_pipeline::classify(&err), Fault::Clean, "{err:#}");
+        assert!(took < Duration::from_secs(10), "took {took:?}");
+        let totals = Totals::of(registry.drain(0));
+        let stalled = [("signal", "metrics"), ("class", "connect_error")];
+        assert_eq!(totals.sum("logit.output.requests", &stalled), 1.0);
     }
 
     /// An HTTP/2 peer that serves one connection and stops listening once it accepted it. It

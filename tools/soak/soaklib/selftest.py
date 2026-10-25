@@ -6945,7 +6945,7 @@ def _http_rules(root):
                "netem", "netem", "netem", "stop", "stop", "restart", "kill"]
            and [e.name for e in http.expectations] == [
                "listener-defers", "generator-retries-503s", "generator-resends",
-               "sink-never-drops"],
+               "generator-dials-time-out", "sink-never-drops"],
            f"http-ingress names an HTTP source, its seven faults, and its expects, got "
            f"{http.sources}")
 

@@ -20,6 +20,7 @@
 //! timeout: 10s                   # default; bounds one request
 //! concurrency: 1                 # default; batches in flight, see "Concurrency"
 //! idle_timeout: 30s              # default; how long a pooled connection idles
+//! connect_timeout: 5s            # default; how long a new connection may take to open
 //! max_body_bytes: 2MiB           # default; one request body, before compression
 //! tls: {}                        # tunes an https:// endpoint
 //! ```
@@ -136,6 +137,11 @@
 //! `idle_timeout:` (default `30s`) closes a pooled connection idle past it instead of reusing it,
 //! so the sink closes an idle connection before the destination can ([`crate::http::build_client`];
 //! `docs/adr/sink-request-concurrency.md`, decision 7).
+//!
+//! `connect_timeout:` (default `5s`) bounds a new connection's DNS lookup, TCP dial, and TLS
+//! handshake together. A dial it ends sent nothing: `Clean`, counted `connect_error`
+//! ([`crate::http::build_client`]). Keep it below `timeout:`, which
+//! otherwise ends a stalled dial first as a timeout.
 //!
 //! ## Acknowledgment
 //!
@@ -413,6 +419,8 @@ pub struct SplunkHecOutput {
     spare: Vec<MessageBuf<ObjectMeta>>,
     /// The operator's `idle_timeout:` ([`crate::http::build_client`]).
     idle_timeout: Duration,
+    /// The operator's `connect_timeout:` ([`crate::http::build_client`]).
+    connect_timeout: Duration,
 }
 
 impl SplunkHecOutput {
@@ -442,6 +450,7 @@ impl SplunkHecOutput {
             ack_backoff: ACK_BACKOFF,
             request_timeout: DEFAULT_TIMEOUT,
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
+            connect_timeout: crate::http::DEFAULT_CONNECT_TIMEOUT,
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             client: None,
             tls: None,
@@ -495,6 +504,15 @@ impl SplunkHecOutput {
     /// rebuilt on first use.
     pub fn with_idle_timeout(mut self, idle_timeout: Duration) -> Self {
         self.idle_timeout = idle_timeout;
+        self.client = None;
+        self
+    }
+
+    /// How long a new connection may take to open, DNS lookup, TCP dial, and TLS handshake
+    /// together (`connect_timeout:` in config, default [`crate::http::DEFAULT_CONNECT_TIMEOUT`]).
+    /// The client is rebuilt on first use.
+    pub fn with_connect_timeout(mut self, connect_timeout: Duration) -> Self {
+        self.connect_timeout = connect_timeout;
         self.client = None;
         self
     }
@@ -571,8 +589,9 @@ impl SplunkHecOutput {
 
     /// The client, built on first use when [`Output::bind`] wasn't called.
     fn client(&mut self) -> reqwest::Client {
-        let (timeout, idle, tls) = (self.request_timeout, self.idle_timeout, self.tls.as_ref());
-        self.client.get_or_insert_with(|| build_client(timeout, idle, tls)).clone()
+        let (timeout, connect, idle, tls) =
+            (self.request_timeout, self.connect_timeout, self.idle_timeout, self.tls.as_ref());
+        self.client.get_or_insert_with(|| build_client(timeout, connect, idle, tls)).clone()
     }
 
     /// What one attempt's requests need from this sink, owned so they can run in a task of their

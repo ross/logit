@@ -3632,6 +3632,15 @@ pub enum ComponentKind {
         #[serde(default = "default_sink_idle_timeout", with = "humantime_serde_duration")]
         #[schemars(with = "String")]
         idle_timeout: Duration,
+        /// How long this sink waits for a new connection to open: the DNS lookup, the TCP dial,
+        /// and the TLS handshake together. A connection that doesn't open in time sent nothing, so
+        /// the attempt counts `logit.output.requests{class="connect_error"}` and is retried under
+        /// either `buffer.delivery`. Keep it below the sink's fixed 10 s request timeout: when
+        /// that ends the attempt first, the stalled dial counts `network_error`, an attempt the
+        /// destination may have taken, and `at_most_once` drops its batch. Defaults to `5s`.
+        #[serde(default = "default_sink_connect_timeout", with = "humantime_serde_duration")]
+        #[schemars(with = "String")]
+        connect_timeout: Duration,
         /// Tunes TLS for an `https://` url: a private CA, a client certificate, or no
         /// verification. A non-default block with an `http://` url is rejected.
         #[serde(default)]
@@ -3693,6 +3702,15 @@ pub enum ComponentKind {
         #[serde(default = "default_sink_idle_timeout", with = "humantime_serde_duration")]
         #[schemars(with = "String")]
         idle_timeout: Duration,
+        /// How long this sink waits for a new connection to open: the DNS lookup, the TCP dial,
+        /// and the TLS handshake together. A connection that doesn't open in time sent nothing, so
+        /// the attempt counts `logit.output.requests{class="connect_error"}` and is retried under
+        /// either `buffer.delivery`. Keep it below the sink's fixed 10 s request timeout: when
+        /// that ends the attempt first, the stalled dial counts `network_error`, an attempt the
+        /// destination may have taken, and `at_most_once` drops its batch. Defaults to `5s`.
+        #[serde(default = "default_sink_connect_timeout", with = "humantime_serde_duration")]
+        #[schemars(with = "String")]
+        connect_timeout: Duration,
     },
     /// Sends logs, metrics, events, service checks, APM traces, and APM stats straight to Datadog's
     /// intake API, one request per route a batch needs. Host, service, source, and tags come from
@@ -3777,6 +3795,15 @@ pub enum ComponentKind {
         #[serde(default = "default_sink_idle_timeout", with = "humantime_serde_duration")]
         #[schemars(with = "String")]
         idle_timeout: Duration,
+        /// How long this sink waits for a new connection to open: the DNS lookup, the TCP dial,
+        /// and the TLS handshake together. A connection that doesn't open in time sent nothing, so
+        /// the attempt counts `logit.output.requests{class="connect_error"}` and is retried under
+        /// either `buffer.delivery`. Keep it below `timeout`: when `timeout` ends the attempt
+        /// first, the stalled dial counts `network_error`, an attempt the destination may have
+        /// taken, and `at_most_once` drops its batch. Defaults to `5s`.
+        #[serde(default = "default_sink_connect_timeout", with = "humantime_serde_duration")]
+        #[schemars(with = "String")]
+        connect_timeout: Duration,
     },
     /// Sends APM traces and tracer-computed stats to a Datadog Agent's trace API (port 8126, or
     /// its Unix socket), as a dd-trace tracer does: the sending half of `datadog_trace_in`, so a
@@ -3844,6 +3871,15 @@ pub enum ComponentKind {
         #[serde(default = "default_sink_idle_timeout", with = "humantime_serde_duration")]
         #[schemars(with = "String")]
         idle_timeout: Duration,
+        /// How long this sink waits for a new connection to open: the DNS lookup, the TCP dial,
+        /// and the TLS handshake together. A connection that doesn't open in time sent nothing, so
+        /// the attempt counts `logit.output.requests{class="connect_error"}` and is retried under
+        /// either `buffer.delivery`. Keep it below `timeout`: when `timeout` ends the attempt
+        /// first, the stalled dial counts `network_error`, an attempt the destination may have
+        /// taken, and `at_most_once` drops its batch. Defaults to `5s`.
+        #[serde(default = "default_sink_connect_timeout", with = "humantime_serde_duration")]
+        #[schemars(with = "String")]
+        connect_timeout: Duration,
     },
     /// Sends logs, metrics, and spans to Splunk's HTTP Event Collector (HEC) as `/event` JSON, in
     /// the shape the OpenTelemetry Collector's `splunk_hec` exporter writes, so a Splunk index fed
@@ -3930,6 +3966,15 @@ pub enum ComponentKind {
         #[serde(default = "default_sink_idle_timeout", with = "humantime_serde_duration")]
         #[schemars(with = "String")]
         idle_timeout: Duration,
+        /// How long this sink waits for a new connection to open: the DNS lookup, the TCP dial,
+        /// and the TLS handshake together. A connection that doesn't open in time sent nothing, so
+        /// the attempt counts `logit.output.requests{class="connect_error"}` and is retried under
+        /// either `buffer.delivery`. Keep it below `timeout`: when `timeout` ends the attempt
+        /// first, the stalled dial counts `network_error`, an attempt the destination may have
+        /// taken, and `at_most_once` drops its batch. Defaults to `5s`.
+        #[serde(default = "default_sink_connect_timeout", with = "humantime_serde_duration")]
+        #[schemars(with = "String")]
+        connect_timeout: Duration,
     },
     /// Produces events to an Apache Kafka topic (3.x and 4.x, or anything that speaks the same
     /// protocol from Kafka 2.4 on) with the Java producer's defaults: `acks: all`, idempotence
@@ -4660,6 +4705,15 @@ pub enum ComponentKind {
         #[serde(default = "default_sink_idle_timeout", with = "humantime_serde_duration")]
         #[schemars(with = "String")]
         idle_timeout: Duration,
+        /// How long this sink waits for a new connection to open: the DNS lookup, the TCP dial,
+        /// and the TLS handshake together. A connection that doesn't open in time sent nothing, so
+        /// the attempt counts `logit.output.requests{class="connect_error"}` and is retried under
+        /// either `buffer.delivery`. Keep it below `timeout`: when `timeout` ends the attempt
+        /// first, the stalled dial counts `network_error`, an attempt the destination may have
+        /// taken, and `at_most_once` drops its batch. Defaults to `5s`. Sender mode only.
+        #[serde(default = "default_sink_connect_timeout", with = "humantime_serde_duration")]
+        #[schemars(with = "String")]
+        connect_timeout: Duration,
     },
     /// A sink that discards everything, as cheaply as the runtime allows, while the runtime's
     /// own telemetry still counts what it received. Name it as a consumer to discard events by
@@ -5217,6 +5271,13 @@ pub fn default_sink_concurrency() -> u32 {
 /// `logit_outputs::http::DEFAULT_IDLE_TIMEOUT`, kept in sync by hand.
 pub fn default_sink_idle_timeout() -> Duration {
     Duration::from_secs(30)
+}
+
+/// The `connect_timeout` default of every sink that waits for a response, matching the stream
+/// sinks' `connect_timeout` defaults. Mirrors `logit_outputs::http::DEFAULT_CONNECT_TIMEOUT`, kept
+/// in sync by hand.
+pub fn default_sink_connect_timeout() -> Duration {
+    Duration::from_secs(5)
 }
 
 /// Mirrors `logit_outputs::statsd::DEFAULT_MAX_PACKET_BYTES`, kept in sync by hand.
@@ -8392,6 +8453,24 @@ mod tests {
         assert!(missing_token.is_err(), "token stays required");
     }
 
+    /// `connect_timeout` takes a duration string and defaults to 5 s.
+    #[test]
+    fn a_sink_connect_timeout_parses_as_a_duration_and_defaults_to_five_seconds() {
+        for (field, expected) in
+            [("", Duration::from_secs(5)), (r#", "connect_timeout": "1s""#, Duration::from_secs(1))]
+        {
+            let component: Component = serde_json::from_str(&format!(
+                r#"{{"type": "influxdb_out", "sources": ["in"], "url": "http://localhost:8086",
+                    "token": "TOKEN"{field}}}"#
+            ))
+            .unwrap();
+            let ComponentKind::InfluxDbOut { connect_timeout, .. } = component.kind else {
+                panic!("expected an influxdb_out");
+            };
+            assert_eq!(connect_timeout, expected);
+        }
+    }
+
     /// `idle_timeout` takes a duration string, `0s` included.
     #[test]
     fn a_sink_idle_timeout_parses_as_a_duration() {
@@ -8424,7 +8503,9 @@ mod tests {
                 tls,
                 concurrency,
                 idle_timeout,
+                connect_timeout,
             } => {
+                assert_eq!(connect_timeout, Duration::from_secs(5));
                 assert_eq!(concurrency, 1);
                 assert_eq!(idle_timeout, Duration::from_secs(30));
                 assert_eq!(endpoint, "http://tempo:4318");
@@ -8605,7 +8686,9 @@ mod tests {
                 histograms,
                 concurrency,
                 idle_timeout,
+                connect_timeout,
             } => {
+                assert_eq!(connect_timeout, Duration::from_secs(5));
                 assert_eq!(concurrency, 1);
                 assert_eq!(idle_timeout, Duration::from_secs(30));
                 assert_eq!(api_key, "k");
@@ -8658,7 +8741,9 @@ mod tests {
                 tls,
                 concurrency,
                 idle_timeout,
+                connect_timeout,
             } => {
+                assert_eq!(connect_timeout, Duration::from_secs(5));
                 assert_eq!(concurrency, 1);
                 assert_eq!(idle_timeout, Duration::from_secs(30));
                 assert_eq!(endpoint.as_deref(), Some("http://127.0.0.1:8126"));
@@ -8853,7 +8938,9 @@ mod tests {
                 max_body_bytes,
                 concurrency,
                 idle_timeout,
+                connect_timeout,
             } => {
+                assert_eq!(connect_timeout, Duration::from_secs(5));
                 assert_eq!(concurrency, 1);
                 assert_eq!(idle_timeout, Duration::from_secs(30));
                 assert_eq!(endpoint, "https://splunk:8088/services/collector");
@@ -9800,7 +9887,9 @@ mod tests {
                 reuse_port,
                 concurrency,
                 idle_timeout,
+                connect_timeout,
             } => {
+                assert_eq!(connect_timeout, Duration::from_secs(5));
                 assert_eq!(concurrency, 1);
                 assert_eq!(idle_timeout, Duration::from_secs(30));
                 assert!(!reuse_port, "opt-in -- no SO_REUSEPORT unless asked for");

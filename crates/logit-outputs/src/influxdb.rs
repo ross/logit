@@ -65,6 +65,11 @@
 //! so the sink closes an idle connection before the destination can ([`crate::http::build_client`];
 //! `docs/adr/sink-request-concurrency.md`, decision 7).
 //!
+//! `connect_timeout:` (default `5s`) bounds a new connection's DNS lookup, TCP dial, and TLS
+//! handshake together. A dial it ends sent nothing: `Clean`, counted `connect_error`
+//! ([`crate::http::build_client`]). Keep it below the sink's fixed 10 s
+//! request timeout, which otherwise ends a stalled dial first as a timeout.
+//!
 //! ## Response classes
 //!
 //! A non-2xx answer carries InfluxDB's error JSON (`code` and `message`; a parse error's message
@@ -288,6 +293,8 @@ pub struct InfluxDbOutput {
     slots: Slots<(Carried, Exchange)>,
     /// The operator's `idle_timeout:` ([`crate::http::build_client`]).
     idle_timeout: Duration,
+    /// The operator's `connect_timeout:` ([`crate::http::build_client`]).
+    connect_timeout: Duration,
     /// Built by [`InfluxDbOutput::with_tls`]; `None` keeps `reqwest`'s default trust.
     tls: Option<rustls::ClientConfig>,
 }
@@ -320,6 +327,7 @@ impl InfluxDbOutput {
                 token,
                 client: crate::http::build_client(
                     DEFAULT_TIMEOUT,
+                    crate::http::DEFAULT_CONNECT_TIMEOUT,
                     crate::http::DEFAULT_IDLE_TIMEOUT,
                     None,
                 ),
@@ -331,6 +339,7 @@ impl InfluxDbOutput {
             slots: Slots::new(accounting.gate().clone()),
             accounting,
             idle_timeout: crate::http::DEFAULT_IDLE_TIMEOUT,
+            connect_timeout: crate::http::DEFAULT_CONNECT_TIMEOUT,
             tls: None,
         }
     }
@@ -339,6 +348,7 @@ impl InfluxDbOutput {
     fn rebuild_client(&mut self) {
         self.writer.client = crate::http::build_client(
             self.writer.request_timeout,
+            self.connect_timeout,
             self.idle_timeout,
             self.tls.as_ref(),
         );
@@ -355,6 +365,15 @@ impl InfluxDbOutput {
     /// client.
     pub fn with_idle_timeout(mut self, idle_timeout: Duration) -> Self {
         self.idle_timeout = idle_timeout;
+        self.rebuild_client();
+        self
+    }
+
+    /// How long a new connection may take to open, DNS lookup, TCP dial, and TLS handshake
+    /// together (`connect_timeout:` in config, default [`crate::http::DEFAULT_CONNECT_TIMEOUT`]).
+    /// Rebuilds the client.
+    pub fn with_connect_timeout(mut self, connect_timeout: Duration) -> Self {
+        self.connect_timeout = connect_timeout;
         self.rebuild_client();
         self
     }

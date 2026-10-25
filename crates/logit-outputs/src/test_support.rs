@@ -186,6 +186,33 @@ async fn read_one<S: AsyncRead + Unpin>(
     let _ = tx.send(buf);
 }
 
+/// A listener that accepts every connection and never reads, writes, or closes one, so a TLS
+/// client's handshake stalls after its `ClientHello`. Aborting the task closes the held
+/// connections.
+pub(crate) async fn silent_listener() -> (SocketAddr, AbortHandle) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((socket, _)) = listener.accept().await {
+            held.push(socket);
+        }
+    });
+    (addr, task.abort_handle())
+}
+
+/// A listener with a backlog of 0 that never accepts, with its one accept-queue slot taken by
+/// the returned connection, so the kernel drops the next client's `SYN` and its TCP dial
+/// stalls. Keep both values alive for the test.
+pub(crate) async fn full_backlog_listener() -> (SocketAddr, TcpListener, tokio::net::TcpStream) {
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let listener = socket.listen(0).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let queued = tokio::net::TcpStream::connect(addr).await.unwrap();
+    (addr, listener, queued)
+}
+
 /// The OS error number of the first `io::Error` in `err`'s chain.
 pub(crate) fn errno_in(err: &anyhow::Error) -> Option<i32> {
     err.chain()

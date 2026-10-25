@@ -1178,12 +1178,12 @@ The rows:
   lost, so each such attempt leaves at most one batch in W that G never counts. A `503` is
   `Ambiguous` too, but the listener took nothing (busy) or counted what it refused in X
   (`closed_consumer`), so it allows none. A dial that failed, refused, a DNS failure, or a
-  failed TLS handshake, counts `class="connect_error"`: it sent nothing, so it allows none
-  either, and the detail counts it apart. A dial still pending when the request times out counts
-  `network_error`, though it sent nothing ([ADR
+  failed TLS handshake, or a dial the writer's `connect_timeout:` ended, counts
+  `class="connect_error"`: it sent nothing, so it allows none either, and the detail counts it
+  apart. The allowance is loose only for a writer whose request timeout is below its
+  `connect_timeout:`, which counts a stalled dial `network_error` ([ADR
   `sink-send-path-and-attempt-accounting`](../adr/sink-send-path-and-attempt-accounting.md)'s
-  "Amendment: a failed dial counts `connect_error`"), so the allowance stays an upper bound wherever a dial can stall, as
-  in `http-ingress`'s delay past the writer's timeout. A writer built before the HTTP sinks
+  "Amendment: a failed dial counts `connect_error`"). A writer built before the HTTP sinks
   split that class out counts every failed dial as `network_error`, looser still across a SUT
   stop.
 
