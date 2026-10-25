@@ -382,12 +382,13 @@ impl OtlpOutput {
             headers: self.headers.clone(),
             paths: self.paths.clone(),
             compression: self.compression,
+            telemetry: self.telemetry.clone(),
         }
     }
 }
 
 /// Everything a batch's requests need, cloned from the sink: the clients are handles on the
-/// sink's own pools.
+/// sink's own pools, and `telemetry` the ungated handle the attempt's [`Journal`] counts on.
 struct Sender {
     transport: OtlpTransport,
     endpoint: String,
@@ -397,6 +398,7 @@ struct Sender {
     headers: HeaderMap,
     paths: SignalPaths,
     compression: OtlpCompression,
+    telemetry: Telemetry,
 }
 
 /// One attempt at a batch: its signals the destination hasn't settled, in send order, and what
@@ -468,7 +470,7 @@ fn prepare(
 /// goes to the returned journal.
 async fn run(attempt: Attempt) -> Attempted {
     let Attempt { sender, requests, accepted_before, posture } = attempt;
-    let mut journal = Journal::default();
+    let mut journal = Journal::new(sender.telemetry.clone());
     let mut outcomes = Outcomes::new(accepted_before);
     let mut requests = requests.into_iter();
     while let Some(SignalPayload { signal, records, bytes }) = requests.next() {
@@ -515,12 +517,11 @@ async fn run(attempt: Attempt) -> Attempted {
 /// The answer half of one attempt, on the loop task: applies what [`run`] recorded and returns
 /// the attempt's result.
 fn settle(
-    telemetry: &Telemetry,
     diag: &mut Diagnostics,
     accounting: &mut BatchAccounting,
     attempted: Attempted,
 ) -> anyhow::Result<()> {
-    attempted.journal.replay(telemetry, diag, accounting);
+    attempted.journal.replay(diag, accounting);
     attempted.result
 }
 
@@ -741,7 +742,7 @@ impl Output for OtlpOutput {
         let result = match prepare(self.sender(), &mut self.encoder, &mut self.accounting, batch) {
             Ok(Some(attempt)) => {
                 let attempted = run(attempt).await;
-                settle(&self.telemetry, &mut self.diag, &mut self.accounting, attempted)
+                settle(&mut self.diag, &mut self.accounting, attempted)
             }
             Ok(None) => Outcomes::new(self.accounting.any_accepted()).finish(),
             Err(err) => Err(err),
@@ -776,10 +777,8 @@ impl Output for OtlpOutput {
 
     /// The oldest batch's answer, counted and classified as `send` does.
     async fn await_ack(&mut self) -> anyhow::Result<()> {
-        let (telemetry, diag) = (&self.telemetry, &mut self.diag);
-        self.slots
-            .ack_with(|attempted, accounting| settle(telemetry, diag, accounting, attempted))
-            .await
+        let diag = &mut self.diag;
+        self.slots.ack_with(|attempted, accounting| settle(diag, accounting, attempted)).await
     }
 
     /// Aborts every request still in flight: the write loop has stopped.
@@ -3143,5 +3142,25 @@ mod concurrency {
         )
         .await;
         assert_eq!(connections.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// Logs answered, traces held.
+    fn traces_held(batch: u64, path: &str, _: usize) -> Answer {
+        match (batch, path) {
+            (_, "/v1/traces") => Answer::Hold,
+            _ => Answer::Now(held::RESP_204),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_grace_cut_counts_the_requests_already_answered_on_send() {
+        let subject = Subject { batch: every_signal, ..subject() };
+        held::a_grace_cut_counts_the_requests_already_answered(subject, 1, traces_held).await;
+    }
+
+    #[tokio::test]
+    async fn a_grace_cut_counts_the_requests_already_answered_in_a_slot() {
+        let subject = Subject { batch: every_signal, ..subject() };
+        held::a_grace_cut_counts_the_requests_already_answered(subject, 2, traces_held).await;
     }
 }

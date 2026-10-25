@@ -536,3 +536,35 @@ pub(crate) async fn a_batch_behind_a_retried_head_times_its_own_request<O: Outpu
     let median = durations.quantile(0.5).expect("three samples");
     assert!(median < HEAD_WAIT.as_secs_f64() / 2.0, "median {median}s includes the head's wait");
 }
+
+/// The shutdown grace cuts a batch whose first request was answered `2xx` and whose second is
+/// held (`script` decides which), at `concurrency`: the answered request still counts in
+/// `logit.output.requests`, though the attempt never returned.
+pub(crate) async fn a_grace_cut_counts_the_requests_already_answered<O: Output + Send>(
+    subject: Subject<O>,
+    concurrency: u32,
+    script: impl Fn(u64, &str, usize) -> Answer + Send + Sync + 'static,
+) {
+    let held = Held::start_by_path(subject.id_of, script).await;
+    let (mut output, mut probe, telemetry) = sink(&subject, &held, concurrency);
+    let stop = async {
+        wait_until("the second request held", || held.held() == 1).await;
+    };
+    let (totals, _) = run(
+        &mut output,
+        &mut probe,
+        telemetry,
+        vec![(subject.batch)(1)],
+        DeliveryPosture::AtLeastOnce,
+        stop,
+        async {},
+    )
+    .await;
+    assert_eq!(delivered(&totals), 0.0);
+    // Above 1 the cut aborts the slot's task, which drops its journal once the runtime gets to it.
+    wait_until("the answered request counted", || {
+        probe.poll().sum("logit.output.requests", &[("class", "2xx")]) == 1.0
+    })
+    .await;
+    drop(output);
+}

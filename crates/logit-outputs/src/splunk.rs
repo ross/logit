@@ -571,6 +571,7 @@ impl SplunkHecOutput {
             ack_backoff: self.ack_backoff,
             request_timeout: self.request_timeout,
             max_body_bytes: self.max_body_bytes,
+            telemetry: self.telemetry.clone(),
         }
     }
 
@@ -588,7 +589,7 @@ impl SplunkHecOutput {
         encoding.encode(&mut self.accounting, batch, &mut objects);
         let attempted = run(Attempt { poster, objects }).await;
         self.objects = attempted.objects;
-        attempted.journal.replay(&self.telemetry, &mut self.diag, &mut self.accounting);
+        attempted.journal.replay(&mut self.diag, &mut self.accounting);
         attempted.result
     }
 }
@@ -652,13 +653,15 @@ struct Attempted {
 /// runs in a slot's task or inline in `send`: every effect goes to the returned journal.
 async fn run(attempt: Attempt) -> Attempted {
     let Attempt { poster, objects } = attempt;
-    let mut journal = Journal::default();
+    let mut journal = Journal::new(poster.telemetry.clone());
     let result = poster.send_objects(&objects, &mut journal).await;
     Attempted { journal, result, objects }
 }
 
-/// Everything a batch's requests need, cloned from the sink.
+/// Everything a batch's requests need, cloned from the sink, and the ungated handle the attempt's
+/// [`Journal`] counts on.
 struct Poster {
+    telemetry: Telemetry,
     client: reqwest::Client,
     /// The base URL, trailing `/` dropped.
     endpoint: String,
@@ -1096,7 +1099,8 @@ impl Output for SplunkHecOutput {
     }
 
     /// Encodes `batch` into an object buffer of its own and starts its bodies, and their
-    /// acknowledgment under `ack: true`, on a task of their own.
+    /// acknowledgment under `ack: true`, on a task of their own. A batch with no object at or under
+    /// `max_body_bytes` sends nothing and starts no task, so it records no send duration.
     async fn submit(
         &mut self,
         batch: &EventBatch,
@@ -1105,14 +1109,20 @@ impl Output for SplunkHecOutput {
     ) -> anyhow::Result<()> {
         let poster = self.poster();
         let mut objects = self.spare.pop().unwrap_or_default();
+        let max_body_bytes = self.max_body_bytes;
         let encoding = Encoding {
             encoder: &mut self.encoder,
             telemetry: &self.telemetry,
             diag: &mut self.diag,
-            max_body_bytes: self.max_body_bytes,
+            max_body_bytes,
         };
+        let spare = &mut self.spare;
         self.slots.submit(seq, |accounting| {
             encoding.encode(accounting, batch, &mut objects);
+            if !objects.iter_with().any(|(bytes, _)| bytes.len() <= max_body_bytes) {
+                spare.push(objects);
+                return Ok(None);
+            }
             Ok(Some(run(Attempt { poster, objects })))
         })
     }
@@ -1120,11 +1130,11 @@ impl Output for SplunkHecOutput {
     /// The oldest batch's answer, counted and classified as `send` does. Its object buffer goes
     /// back for the next batch.
     async fn await_ack(&mut self) -> anyhow::Result<()> {
-        let (telemetry, diag, spare) = (&self.telemetry, &mut self.diag, &mut self.spare);
+        let (diag, spare) = (&mut self.diag, &mut self.spare);
         self.slots
             .ack_with(|attempted, accounting| {
                 spare.push(attempted.objects);
-                attempted.journal.replay(telemetry, diag, accounting);
+                attempted.journal.replay(diag, accounting);
                 attempted.result
             })
             .await
@@ -2404,7 +2414,7 @@ mod concurrency {
     use super::*;
     use crate::http::held::{self, Answer, Held, Subject};
     use logit_core::{Event, Resource, Value};
-    use logit_proto::splunk::response::{encode_invalid_event, HecStatus};
+    use logit_proto::splunk::response::{encode_invalid_event, encode_success, HecStatus};
 
     const TS: i64 = 1_700_000_000_000_000_000;
 
@@ -2540,5 +2550,74 @@ mod concurrency {
         let invalid = [("reason", "invalid_event")];
         assert_eq!(totals.sum(RECORDS_DROPPED, &invalid), 1.0);
         assert_eq!(totals.sum(RECORDS, &[]), 5.0, "batch 1's objects 0 and 2, batch 2's three");
+    }
+
+    fn make_acked(url: &str, concurrency: u32, telemetry: Telemetry) -> SplunkHecOutput {
+        make(url, concurrency, telemetry).with_ack(true, Duration::from_secs(30))
+    }
+
+    /// The batch an `/event` body carries, and 1 for an `/ack` poll, which carries none.
+    fn id_or_ack(body: &[u8]) -> u64 {
+        if body.windows(b"batch-".len()).any(|w| w == b"batch-") {
+            held::id_after_marker(body)
+        } else {
+            1
+        }
+    }
+
+    /// The body accepted with an `ackId`, and every `/ack` poll held.
+    fn ack_held(_: u64, path: &str, _: usize) -> Answer {
+        if path.ends_with("/ack") {
+            return Answer::Hold;
+        }
+        let body = String::from_utf8(encode_success(Some(0))).unwrap();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n{body}",
+            body.len()
+        );
+        Answer::Now(Box::leak(response.into_boxed_str()))
+    }
+
+    fn acked() -> Subject<SplunkHecOutput> {
+        Subject { make: make_acked, id_of: id_or_ack, ..subject() }
+    }
+
+    #[tokio::test]
+    async fn a_grace_cut_counts_the_requests_already_answered_on_send() {
+        held::a_grace_cut_counts_the_requests_already_answered(acked(), 1, ack_held).await;
+    }
+
+    #[tokio::test]
+    async fn a_grace_cut_counts_the_requests_already_answered_in_a_slot() {
+        held::a_grace_cut_counts_the_requests_already_answered(acked(), 2, ack_held).await;
+    }
+
+    /// A batch whose every object is blank sends nothing and starts no task above a concurrency
+    /// of 1, so it records no send duration.
+    #[tokio::test]
+    async fn a_batch_with_nothing_to_send_records_no_send_duration() {
+        let held = Held::start(held::id_after_marker, |_, _| Answer::Now(held::RESP_204)).await;
+        let subject = Subject { batch: |_| batch_of(vec![blank_log()]), ..subject() };
+        let (mut output, mut probe, telemetry) = held::sink(&subject, &held, 2);
+        let (totals, _) = held::run(
+            &mut output,
+            &mut probe,
+            telemetry,
+            vec![(subject.batch)(1), (subject.batch)(2)],
+            DeliveryPosture::AtLeastOnce,
+            std::future::pending(),
+            async {},
+        )
+        .await;
+        assert_eq!(held::delivered(&totals), 2.0);
+        assert!(held.paths(1).is_empty(), "no request");
+        let samples = totals
+            .events
+            .iter()
+            .flat_map(|event| event.metrics.iter())
+            .filter(|m| logit_core::interner::resolve(m.name) == "logit.component.send.duration")
+            .count();
+        assert_eq!(samples, 0, "no send duration for a batch that sent nothing");
     }
 }
