@@ -854,7 +854,8 @@ the operator-facing account of all of this.
   chain (W′).
   `otlp-fan-out-conc` is that run with the generator at `concurrency: 8`,
   `otlp-concurrency-tls` is that over TLS from a private CA per run, where HTTP/2 carries every
-  request in flight on one connection, and `http-concurrency` and `http-concurrency-1` send
+  request in flight on one connection and a generator pause past the listener's `idle_timeout:`
+  meets the listener's `GOAWAY` with no retry, and `http-concurrency` and `http-concurrency-1` send
   InfluxDB points from `influxdb_out` at `concurrency: 8` and `1` into `http-ingress`'s SUT under
   a 200 ms delay on its answers: at 8, `[[expect]]` rows assert `logit.output.in_flight` and no
   `overflow_newest` drop under the delay, and at 1, that the generator's queue overflowed there
@@ -910,7 +911,8 @@ the operator-facing account of all of this.
   `standin-concurrency` points `prometheus_out` at `concurrency: 8` and `at_most_once` at the
   remote-write stand-in with several batches in flight, and its `respond` steps' `count = 1`
   lands a `401`, a `400`, and a reset on one write each: a held head, a batch dropped alone,
-  and one dropped alone `ambiguous_at_most_once`. See
+  and one dropped alone `ambiguous_at_most_once`, the only one, since the sink's
+  `idle_timeout: 1s` closes an idle connection before the stand-in's 5 s close. See
   [tools/soak/README.md](tools/soak/README.md) and [ADR `soak-harness`](docs/adr/soak-harness.md).
 - **Differential corpora**: `script/differential <corpus>` regenerates a corpus of generated
   cases under `testdata/differential/`, each committed beside a reference implementation's

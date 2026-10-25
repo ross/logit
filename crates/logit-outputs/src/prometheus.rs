@@ -37,6 +37,7 @@
 //!   X-Scope-OrgID: tenant-a
 //! endpoint_tls: {}                           # https:// only -- see `TlsClientConfig`
 //! concurrency: 1                             # default; batches in flight, see "Concurrency"
+//! idle_timeout: 30s                          # default; how long a pooled connection idles
 //! ```
 //!
 //! Setting the other mode's field is a config error, not a no-op (rule 56). `buffer:` works in
@@ -216,6 +217,10 @@
 //! concurrent streams; otherwise they open up to `concurrency` connections.
 //! `logit.output.in_flight` reads the batches in flight, and `logit.component.send.duration`
 //! times each batch's request from its send to its response.
+//!
+//! `idle_timeout:` (default `30s`) closes a pooled connection idle past it instead of reusing it,
+//! so the sink closes an idle connection before the destination can ([`crate::http::build_client`];
+//! `docs/adr/sink-request-concurrency.md`, decision 7).
 //!
 //! **Duplicate timestamps.** One series holds one sample per millisecond. Given two in one
 //! request, Prometheus and Mimir answer `2xx`, keep the first, and drop the second silently, so

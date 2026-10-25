@@ -77,6 +77,10 @@
 //! `logit.output.in_flight` reads the batches in flight, and `logit.component.send.duration` times
 //! each batch's requests from the first send to the last response.
 //!
+//! `idle_timeout:` (default `30s`) closes a pooled connection idle past it instead of reusing it,
+//! so the sink closes an idle connection before the destination can, on both transports
+//! ([`crate::http::build_client`]; `docs/adr/sink-request-concurrency.md`, decision 7).
+//!
 //! **Delivery posture.** The default, `at_least_once` (`docs/adr/delivery-semantics.md`, item 5),
 //! resends the signal an `Ambiguous` answer named, and OTLP has no identity that makes a resend
 //! overwrite. A resent delta `Sum` or `Histogram` adds at the receiver; the remedy is an upstream

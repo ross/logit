@@ -127,6 +127,27 @@ Non-goals:
 - **Findings** below: the throughput at 1 and 8 and the fault rows, feeding the operator docs'
   guidance on raising the field. `docs/known-gaps/sinks.md`'s entry closes.
 
+### W6: idle pooled connections close first
+
+- **The field.** `idle_timeout:` on the six HTTP sinks, default `30s`, `0s` for no idle
+  connection, rejected in `prometheus_out`'s exposition mode by graph rule 56 ([ADR
+  `sink-request-concurrency`](../adr/sink-request-concurrency.md), decision 7, which has the
+  destination table and the default's reasoning). `http::client_builder` applies it to every
+  `reqwest` client, and `http::hyper_client_builder` to `otlp_out`'s gRPC pool and
+  `datadog_trace_out`'s socket pool, with a timer that closes an expired connection.
+- **Tests** in `crates/logit-outputs/src/http.rs` against `held::Mux`, which counts closed
+  connections: a 200 ms `idle_timeout` closes an idle connection and the next request opens
+  another; the default keeps it; `0s` opens one per request; the `hyper_util` pool closes one
+  too. Each fails with the settings removed.
+- **Soak.** `standin-concurrency` drops its 120 s stand-in override and sets the sink's
+  `idle_timeout: 1s` under the stand-in's 5 s close, so its one ambiguous drop is the cued reset.
+  `otlp-concurrency-tls` sets `otlp_in`'s `idle_timeout: 4s` under the generator's 30 s default
+  and pauses the generator 15 s, so the listener closes the idle h2 connection with a `GOAWAY`
+  first, and expects no generator retry.
+- **Docs.** `docs/known-gaps/sinks.md`'s idle-connection entry narrows to a destination closing
+  for another reason; `docs/deploying.md`'s sink section and each sink's module doc gain a
+  sentence.
+
 ### Mechanics
 
 Per AGENTS.md "Workflow": each workstream is a PR stacked on the one before (`gh stack` from
@@ -145,6 +166,7 @@ observable through `logit_pipeline::test_util`, never a sleep.
 | W3 | `conc/w3` | `conc/w3: otlp_out, datadog_out, datadog_trace_out, and splunk_hec_out on the slot helper` | L | W2 | open (#873) |
 | W4 | `conc/w4` | `conc/w4: HTTP/2 through reqwest` | S | W3 | open (#874) |
 | W5 | `conc/w5` | `conc/w5: soak scenarios for request concurrency and the known-gaps closing` | M | W4 | open (#875) |
+| W6 | `conc/w6` | `conc/w6: a per-sink idle_timeout that closes idle pooled connections first` | S | W5 | in progress |
 
 ## Settled questions
 
@@ -159,6 +181,10 @@ observable through `logit_pipeline::test_util`, never a sleep.
   `retrying`, and the counters stay in one place.
 - **HTTP/2: decided by the maintainer, 2026-10-25.** Enabled, in its own PR, with the two
   trade-offs recorded.
+- **Idle connections: decided by the maintainer, 2026-10-25.** A per-sink `idle_timeout:`,
+  default `30s`: below the common destinations' keep-alive idle timeouts and above a 10 s or 15 s
+  batch cadence, so such a sink reuses its connection. Resending a write that met a reused
+  connection's close, Chromium's rule, is rejected: `reqwest` doesn't expose the reuse fact.
 
 ## Findings
 
@@ -222,6 +248,6 @@ The stand-in recorded 2,365 requests and stored 2,362, and V matched what `aggre
 **Idle keep-alive connections and a slow link.** The first `standin-concurrency` run dropped
 13 batches `ambiguous_at_most_once` where one was cued: a destination idle timeout of 5 s under
 the pool's 90 s, with a 1 s egress delay, reset 12 writes on connections it had already closed.
-The account is [`docs/known-gaps/sinks.md`](../known-gaps/sinks.md)'s "An idle pooled connection
-a destination closed first reads as `Ambiguous`". The scenario now raises the stand-in's idle
-timeout to 120 s.
+The account is [`docs/known-gaps/sinks.md`](../known-gaps/sinks.md)'s "A kept-alive connection
+a destination closed first reads as `Ambiguous`". W5 raised the stand-in's idle timeout to 120 s;
+W6's `idle_timeout:` replaces that workaround (below).

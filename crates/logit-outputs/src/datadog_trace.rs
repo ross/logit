@@ -24,6 +24,7 @@
 //! compression: none                 # default; or gzip
 //! timeout: 10s                      # default; bounds one request
 //! concurrency: 1                    # default; batches in flight, see "Concurrency"
+//! idle_timeout: 30s                 # default; how long a pooled connection idles
 //! headers: {}                       # extra headers; `!env` works on a value
 //! tls: {}                           # tunes an https:// endpoint
 //! ```
@@ -143,6 +144,10 @@
 //! concurrent streams; otherwise they open up to `concurrency` connections.
 //! `logit.output.in_flight` reads the batches in flight, and `logit.component.send.duration` times
 //! each batch's requests from the first send to the last response.
+//!
+//! `idle_timeout:` (default `30s`) closes a pooled connection idle past it instead of reusing it,
+//! so the sink closes an idle connection before the destination can, on the socket's pool too
+//! ([`crate::http::build_client`]; `docs/adr/sink-request-concurrency.md`, decision 7).
 //!
 //! The Agent's API has no credential, so only a status that says the endpoint or the body's format
 //! isn't served refuses the sink as a whole.

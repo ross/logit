@@ -22,6 +22,7 @@
 //! compression: gzip          # default; `none` sends every body uncompressed
 //! timeout: 10s               # default; bounds one request
 //! concurrency: 1             # default; batches in flight, see "Concurrency"
+//! idle_timeout: 30s          # default; how long a pooled connection idles
 //! headers: {}                # extra headers; `!env` works on a value
 //! tls: {}                    # tunes every https:// request
 //! histograms:                # how OTLP histograms are written, as Datadog's exporter's block
@@ -243,6 +244,10 @@
 //! connections. `logit.output.in_flight` reads the batches in flight, and
 //! `logit.component.send.duration` times each batch's requests from the first send to the last
 //! response.
+//!
+//! `idle_timeout:` (default `30s`) closes a pooled connection idle past it instead of reusing it,
+//! so the sink closes an idle connection before the destination can ([`crate::http::build_client`];
+//! `docs/adr/sink-request-concurrency.md`, decision 7).
 //!
 //! Datadog documents its intake statuses by HTTP code, the same on every route, with a free-text
 //! body; no documented body code changes a status's meaning, so the status decides the class.

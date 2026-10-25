@@ -19,6 +19,7 @@
 //! ack_timeout: 30s               # default with `ack: true`; only with it
 //! timeout: 10s                   # default; bounds one request
 //! concurrency: 1                 # default; batches in flight, see "Concurrency"
+//! idle_timeout: 30s              # default; how long a pooled connection idles
 //! max_body_bytes: 2MiB           # default; one request body, before compression
 //! tls: {}                        # tunes an https:// endpoint
 //! ```
@@ -131,6 +132,10 @@
 //! concurrent streams; otherwise they open up to `concurrency` connections.
 //! `logit.output.in_flight` reads the batches in flight, and `logit.component.send.duration` times
 //! each batch's requests from the first send to the last response.
+//!
+//! `idle_timeout:` (default `30s`) closes a pooled connection idle past it instead of reusing it,
+//! so the sink closes an idle connection before the destination can ([`crate::http::build_client`];
+//! `docs/adr/sink-request-concurrency.md`, decision 7).
 //!
 //! ## Acknowledgment
 //!

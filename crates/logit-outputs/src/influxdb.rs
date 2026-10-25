@@ -57,6 +57,10 @@
 //! `logit.output.in_flight` reads the batches in flight, and `logit.component.send.duration`
 //! times each batch's request from its send to its response.
 //!
+//! `idle_timeout:` (default `30s`) closes a pooled connection idle past it instead of reusing it,
+//! so the sink closes an idle connection before the destination can ([`crate::http::build_client`];
+//! `docs/adr/sink-request-concurrency.md`, decision 7).
+//!
 //! ## Response classes
 //!
 //! A non-2xx answer carries InfluxDB's error JSON (`code` and `message`; a parse error's message

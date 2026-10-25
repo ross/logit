@@ -1042,9 +1042,20 @@ failure domain: a reset or a `GOAWAY` fails every request on it at once, each an
 fault, and packet loss on it stalls every request (TCP head-of-line blocking). Over HTTP/1.1,
 including every `http://` endpoint, each batch in flight has its own connection, and a fault
 reaches one. The pool can hold more connections than `concurrency`, since it dials one for each
-request waiting while none is free, and it keeps each idle for 90 s. A destination that closes
-idle connections sooner can reset a write on one; see
-[known gaps: sinks](known-gaps/sinks.md). `otlp_out`'s gRPC transport already carries both costs of h2.
+request waiting while none is free, and it keeps each idle up to the sink's `idle_timeout:`.
+`otlp_out`'s gRPC transport already carries both costs of h2.
+
+An HTTP sink closes a pooled connection idle longer than its `idle_timeout:`, `30s` by default,
+instead of reusing it. Keep the value below the destination's keep-alive idle timeout: a
+destination that closes an idle connection first can receive a write on it as the close crosses,
+and resets it, which the sink reads as an ambiguous fault that `at_most_once` drops and
+`at_least_once` resends. Keep it above the interval between the sink's batches if the connection
+should be reused; a sink that sends less often opens a new connection, handshake included, for
+each batch. The default sits below the timeouts of the common destinations, tabled in
+[ADR `sink-request-concurrency`](adr/sink-request-concurrency.md)'s decision 7; lower it for a
+server that closes at 5 s, as Node.js, Apache, and uvicorn do by default. `0s` opens a connection
+per request. A destination that closes a connection for another reason, such as a restart or a
+per-connection request cap, can still reset a write; see [known gaps: sinks](known-gaps/sinks.md).
 
 While the buffer stays full, the warning repeats at most once a minute with the batches and events
 shed so far, or how long intake has been held. Once the buffer's utilization falls below

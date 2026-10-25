@@ -124,19 +124,23 @@ Entry format and the other areas: [the known-gaps index](README.md).
   - **To close:** a dead-letter sink for rejected batches and a split-on-`413` retry step in the
     shared HTTP driver, each with its own ADR.
 
-- **An idle pooled connection a destination closed first reads as `Ambiguous`.** Above
-  `concurrency: 1`, an HTTP sink's `reqwest` pool keeps spare connections idle between bursts,
-  each for its 90 s default. A destination that closes idle connections sooner, behind a link
-  with real delay, can receive a write on a connection it has already closed: the sink wrote it
-  before the close reached it, and it arrived after. The destination resets the connection, and
-  the sink reads that as `Ambiguous` ("connection closed before message completed"), so
-  `at_most_once` drops the batch, counted `batches.dropped{reason="ambiguous_at_most_once"}`, and
-  `at_least_once` resends it.
-  - **Measured:** under a 1 s delay on the sink's egress at `concurrency: 8`, a destination with a
-    5 s idle timeout reset 12 writes no fault caused in about 2,300 batches; with a 120 s idle
-    timeout, none ([plan `sink-request-concurrency`](../plans/sink-request-concurrency.md)'s
-    "Findings").
-  - **Workaround:** raise the destination's keep-alive idle timeout above 90 s where it's
-    configurable, or keep `at_least_once` so the batch is resent.
-  - **Candidate remedies, not decided:** a sink-side pool idle timeout below common server
-    defaults, or a config field for it. Either needs its own ADR.
+- **A kept-alive connection a destination closed first reads as `Ambiguous`.** An HTTP sink
+  closes a pooled connection idle past its `idle_timeout:` (30 s by default) before reusing it,
+  so a destination that closes idle connections later doesn't race a write
+  ([ADR `sink-request-concurrency`](../adr/sink-request-concurrency.md), decision 7). A
+  destination that closes a kept-alive connection for another reason still can: a restart, a
+  per-connection request cap, or an idle timeout shorter than the sink's `idle_timeout:`. A write
+  the sink sends as that close crosses it is reset, and the sink reads `Ambiguous` ("connection
+  closed before message completed"), so `at_most_once` drops the batch, counted
+  `batches.dropped{reason="ambiguous_at_most_once"}`, and `at_least_once` resends it. Delay on
+  the link widens the window to the delay. Over h2 a graceful `GOAWAY` tells the client which
+  requests the server never saw, and those are resent unseen; HTTP/1.1 has no such signal.
+  - **Measured:** under a 1 s delay on the sink's egress at `concurrency: 8`, a destination with
+    a 5 s idle timeout reset 12 writes no fault caused in about 2,300 batches under a 90 s pool
+    idle timeout, and none at `idle_timeout: 1s`
+    ([plan `sink-request-concurrency`](../plans/sink-request-concurrency.md)'s "Findings").
+  - **Workaround:** set `idle_timeout:` below the destination's idle timeout less the link's
+    delay, or keep `at_least_once` so the batch is resent.
+  - **Not pursued:** resending a write that failed on a reused connection with no byte received,
+    as Chromium does, which decision 7 rejects: `reqwest` doesn't say whether a failed request's
+    connection was reused.
