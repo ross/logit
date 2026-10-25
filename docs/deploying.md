@@ -2619,10 +2619,10 @@ dropped until a flush frees a slot. Any nonzero drop count means more distinct a
 `max_series`.
 
 **Retention doesn't cover eviction or restarts.** A delta against a series evicted by the
-cardinality cap, or sent after a process restart, resolves against `0.0`. It's reported
-(`logit.transform.gauge.delta.unseeded`,
-`logit.transform.series.evicted{reason="cardinality"}`), never silent, but not
-prevented. The restart case can't be fixed without durable aggregator state, which this project has
+`max_retained_series` cap or by a full `max_series`, or sent after a process restart, resolves
+against `0.0`. It's reported (`logit.transform.gauge.delta.unseeded`,
+`logit.transform.series.evicted{reason="cardinality"}` or `{reason="series_limit"}`), never
+silent, but not prevented. The restart case can't be fixed without durable aggregator state, which this project has
 deliberately not built (`docs/adr/aggregation-window-semantics.md`'s Alternatives). A cumulative
 series has the same exposure, which is why every cumulative record carries a `start_timestamp` from
 which a consumer can detect the restart. If an operator needs a gauge that receives relative
@@ -2640,6 +2640,12 @@ value, the mitigation is on the sending side: send an absolute value periodicall
   `max_retained_series` is undersized for the pipeline's gauge cardinality, and deltas are silently
   resolving against 0 as a result. Under `state="active"`, more series are updated per window than
   the cap holds: the cap keeps the longest-lived of them, and a cumulative series it drops restarts.
+- `logit.transform.series.evicted{reason="series_limit"}` and
+  `logit.transform.metrics.dropped{reason="series_limit"}`: `max_series` is full. An eviction
+  removes a retained series to admit a new one, with the same consequences as a `cardinality`
+  eviction, and a drop loses a record because every held series was updated this window. Either
+  one sustained means more distinct attribute sets reach `aggregate` than `max_series` holds;
+  bound them with `keep` or `keep_values`, or raise `max_series`.
 
 ## Counter temporality (`delta` vs. `cumulative`)
 
