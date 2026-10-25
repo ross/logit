@@ -3737,7 +3737,8 @@ components:
 leader at the address the cluster advertises (`advertised.listeners`), so every advertised
 address must resolve and be reachable from `logit`, not only the bootstrap ones. A `tls:` block
 turns TLS on for every connection, checking each broker's certificate against the host it
-advertises; `cert_file` and `key_file` add a client certificate for mutual TLS.
+advertises, or against `server_name` when it's set; `cert_file` and `key_file` add a client
+certificate for mutual TLS.
 
 **SASL.** A `sasl:` block authenticates every connection, with `mechanism: plain`,
 `scram_sha_256`, or `scram_sha_512`, a `username`, and a `password`. Give the password with
@@ -4245,12 +4246,29 @@ certificate is accepted. `logit` logs a startup warning whenever it's set. Use i
 throwaway or pre-production endpoint, not a real deployment. Validation rejects it together with
 `ca_file`, because a specific trusted CA and "trust nothing" contradict each other.
 
+**`tls.server_name`** sets the name the server's certificate is verified against, in place of the
+endpoint's host, on every client `tls:` block and on `scrape_tls:` and `endpoint_tls:`. Set it when
+you dial an endpoint by IP address, or through a proxy, and its certificate names another host:
+
+```yaml
+    endpoint: https://10.0.4.17:4317
+    tls:
+      ca_file: /etc/logit/tls/ca.pem
+      server_name: tempo.internal   # the name in the certificate
+```
+
+It doesn't change SNI: the client still sends the endpoint's own host, and no SNI for an IP
+address, so it doesn't help reach a front end that routes on SNI
+([ADR `tls-client-server-name`](adr/tls-client-server-name.md)). On `kafka_out` every broker is
+verified against the one name. It's ignored under `insecure_skip_verify`, and a value that's
+neither a DNS name nor an IP address fails startup.
+
 **What to watch.** A handshake failure on either side surfaces through the same
 `connection_error`/`network_error` diagnostics and `logit.output.requests{class="network_error"}`/
 listener-side `logit.component.diagnostics` counters as any other transport failure. Certificate
 rotation has its own counter, gauge, and diagnostics; see [Certificate rotation](#certificate-rotation).
-`docs/known-gaps/intake.md` tracks one open item: `otlp_out` has no `server_name` override for an
-endpoint reached by IP or through a proxy.
+`docs/known-gaps/intake.md` tracks one open item: no TLS client can set SNI, so a front end that
+routes on SNI can't be reached by IP.
 
 ### Certificate rotation
 
@@ -4434,7 +4452,7 @@ listener"](#idle_timeout-on-a-tcp-listener) above.
   `logit.input.frames.dropped{reason="oversize"|"malformed"|"truncated"}`. There is no separate
   TLS-specific counter, as with `otlp_in`/`otlp_out`.
 
-`docs/known-gaps/` tracks what's still open: DTLS and no `server_name` override. Certificates
+`docs/known-gaps/` tracks what's still open: DTLS and no SNI override. Certificates
 reload without a restart; see [Certificate rotation](#certificate-rotation). `idle_timeout`
 covers the post-handshake idle case.
 
@@ -4471,7 +4489,8 @@ Which component takes which block:
 | `otlp_in` | `TlsServerConfig` | the block's presence | both transports |
 | `syslog_in`, `graphite_in`, `statsd_in`, `lines_in` | `TlsServerConfig` | the block's presence | `transport: tcp` only (rule 43) |
 
-`TlsClientConfig` is `ca_file`/`cert_file`/`key_file`/`insecure_skip_verify`; `TlsServerConfig` is
+`TlsClientConfig` is `ca_file`/`cert_file`/`key_file`/`insecure_skip_verify`/`server_name`;
+`TlsServerConfig` is
 `cert_file`/`key_file`/`client_ca_file`. Every path resolves relative to the config file's own
 directory and accepts `!env`. There is no `collectd_out`/`graphite_out` row: collectd's `network`
 plugin is UDP-only, and carbon's own senders speak no TLS.

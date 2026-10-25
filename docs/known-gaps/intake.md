@@ -239,20 +239,19 @@ Entry format and the other areas: [the known-gaps index](README.md).
 
 ## TLS and connection lifecycle
 
-- **No TLS client has a `server_name` override.** Every TLS sink (`otlp_out`, `datadog_out`,
-  `datadog_trace_out`, `splunk_hec_out`, `prometheus_out`'s remote-write sender, `logit_out`,
-  `syslog_out`, `statsd_out`) and `prometheus_in`'s scrape client check the peer's certificate
-  against the configured endpoint's own host, and `kafka_out` against each broker's advertised
-  host. An endpoint reached by IP, or through a proxy whose
-  certificate names something else, can't be verified by name. OTel's equivalent knob is
-  `tls.server_name_override`.
-  - **To close:** it's cheap to add
-    ([ADR `otlp-tls-and-pooled-grpc-client`](../adr/otlp-tls-and-pooled-grpc-client.md),
-    [ADR `syslog-tcp-ingress-and-tls`](../adr/syslog-tcp-ingress-and-tls.md)):
-    `hyper-rustls`'s `HttpsConnectorBuilder::with_server_name_resolver` for `otlp_out`'s gRPC
-    transport, an equivalent `reqwest` override for the HTTP sinks and `prometheus_in`, and a plain
-    `ServerName` override ahead of `host_only(endpoint)` for the raw-TCP sinks (`logit_out`, and
-    `syslog_out`/`statsd_out` through `crates/logit-outputs/src/stream.rs`).
+- **No TLS client can set SNI.** `tls.server_name` sets the name every TLS client verifies the
+  server's certificate against, but each still sends SNI for the host it dialed, and none for an IP
+  address ([ADR `tls-client-server-name`](../adr/tls-client-server-name.md)). So a front end that
+  routes on SNI and is reached by IP can't be reached by name. OTel's `tls.server_name_override`
+  sets both. The HTTP clients are why: `reqwest` 0.12.28 (the shared HTTP driver and
+  `prometheus_in`'s scrape client) takes SNI from the connection URI's host, offers only
+  `tls_sni(bool)`, and gives no connector layer a way to rewrite the URI.
+  - **To close, once there's a use case:** on the `reqwest` clients, send the request to a URL whose
+    host is the `server_name`, with an explicit `Host` header carrying the real authority and a
+    custom `dns_resolver` mapping the `server_name` to the real endpoint. The other clients
+    (`otlp_out`'s gRPC transport, `kafka_out`, `logit_out`, and `syslog_out`/`statsd_out` through
+    `crates/logit-outputs/src/stream.rs`) can pass the name to `connect` directly. SNI has to change
+    on every client at once, so the field means the same thing on each.
 - **A write-only TLS sink (`syslog_out`, `statsd_out` over TCP) cannot observe a peer's
   post-handshake rejection.** Under TLS 1.3, the server sends its whole handshake flight,
   `Finished` included, before it sees the client's certificate. So a client-cert rejection (a
