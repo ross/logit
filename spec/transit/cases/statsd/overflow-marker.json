@@ -1,0 +1,2 @@
+{"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"requests","kind":"sum","value":7.0,"temporality":"delta","monotonic":true}],"attributes":{"host.name":"web-1","logit.overflow":true}}
+{"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"queue.depth","kind":"gauge","value":4.0}],"attributes":{"logit.overflow":true}}
