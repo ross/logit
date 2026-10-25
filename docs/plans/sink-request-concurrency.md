@@ -166,7 +166,7 @@ observable through `logit_pipeline::test_util`, never a sleep.
 | W3 | `conc/w3` | `conc/w3: otlp_out, datadog_out, datadog_trace_out, and splunk_hec_out on the slot helper` | L | W2 | open (#873) |
 | W4 | `conc/w4` | `conc/w4: HTTP/2 through reqwest` | S | W3 | open (#874) |
 | W5 | `conc/w5` | `conc/w5: soak scenarios for request concurrency and the known-gaps closing` | M | W4 | open (#875) |
-| W6 | `conc/w6` | `conc/w6: a per-sink idle_timeout that closes idle pooled connections first` | S | W5 | in progress |
+| W6 | `conc/w6` | `conc/w6: a per-sink idle_timeout that closes idle pooled connections first` | S | W5 | open (#877) |
 
 ## Settled questions
 
