@@ -16,8 +16,8 @@
 components:
   from_vmagent:
     type: prometheus_in
-    # Transport security at most, never authentication (docs/known-gaps/prometheus.md): bind
-    # loopback or pod-local and front it with something that authenticates.
+    # Loopback here. To take writes from another host, set `bind_tls:` and `bind_auth:` and start
+    # vmagent with `-remoteWrite.bearerToken` (docs/deploying.md's "Listener authentication").
     bind: 127.0.0.1:9201
     # Off by default. vmagent flushes on a fixed cadence (`-remoteWrite.flushInterval`), so a
     # connection quiet for a minute isn't coming back.
@@ -26,5 +26,5 @@ components:
   metrics:
     type: prometheus_out
     sources: [from_vmagent]
-    # No TLS and no auth on this endpoint: bind loopback or pod-local.
+    # Loopback here; `bind_tls:` and `bind_auth:` protect it if it must be reachable off-host.
     bind: 127.0.0.1:9464

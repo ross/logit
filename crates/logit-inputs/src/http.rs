@@ -7,8 +7,10 @@
 //! ([`collect_with_stall_bound`], which holds one buffer per body however many reads it arrives
 //! in). All six listeners build and read through these. The two Datadog listeners,
 //! `splunk_hec_in`, and `influxdb_in` also share their request helpers here: `Content-Encoding` and `Content-Type`
-//! parsing, bounded decompression, the JSON response shapes, the constant-time key check, and the
-//! deadline-bounded delivery.
+//! parsing, bounded decompression, the JSON response shapes and the
+//! deadline-bounded delivery. `otlp_in`'s `auth:` and the receiver's `bind_auth:` check, count,
+//! and challenge through [`AuthGate`]; the `Authorization` parse and the constant-time key check
+//! every listener shares are `logit_proto::auth`'s.
 //!
 //! The reasoning lives in `crate::otlp`'s module doc, "Idle timeout" section, and only there: why
 //! the clock is tracked at the service rather than around the socket, why it resets on request
@@ -35,7 +37,8 @@ use hyper::body::Incoming;
 use hyper::server::conn::http2;
 use hyper_util::rt::TokioExecutor;
 use hyper_util::server::conn::auto;
-use logit_core::Telemetry;
+use logit_core::{Diagnostics, Telemetry};
+use logit_proto::auth::{Credentials, Denied};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -672,19 +675,62 @@ pub(crate) async fn deliver_with_deadline(
     Ok(())
 }
 
-/// Whether `sent` equals one of `keys`: `datadog_in`'s `api_keys` and the `tokens` of `splunk_hec_in` and `influxdb_in`.
-/// Every key is compared, and each comparison runs over the whole key, so the time taken doesn't
-/// reveal which key matched or how much of a guess did.
-pub(crate) fn matches_any_key(keys: &[Box<[u8]>], sent: &[u8]) -> bool {
-    keys.iter().fold(false, |matched, key| matched | constant_time_eq(key, sent))
+/// One listener's `auth:` or `bind_auth:` check ([`logit_proto::auth`]), with what it reports
+/// when it refuses a request: `logit.input.requests.rejected{reason="auth"}` and the throttled
+/// `diagnostic`, naming the peer and why, never the credential. Cloned per connection; the
+/// credentials are shared.
+#[derive(Clone)]
+pub(crate) struct AuthGate {
+    credentials: Arc<Credentials>,
+    /// The listener's kind, which opens the diagnostic's message.
+    kind: &'static str,
+    /// The throttled diagnostic's key: the one the listener reports its other rejections under.
+    diagnostic: &'static str,
 }
 
-/// Byte equality whose time depends on the two lengths only, never on where the bytes differ.
-pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
+impl AuthGate {
+    pub(crate) fn new(
+        credentials: Credentials,
+        kind: &'static str,
+        diagnostic: &'static str,
+    ) -> Self {
+        Self { credentials: Arc::new(credentials), kind, diagnostic }
     }
-    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+
+    /// Checks the request's first `Authorization` header. Always `Ok` with no credentials set.
+    pub(crate) fn check(&self, headers: &http::HeaderMap) -> Result<(), Denied> {
+        let value = headers.get(http::header::AUTHORIZATION).map(http::HeaderValue::as_bytes);
+        self.credentials.check(value)
+    }
+
+    /// Counts and reports one refusal.
+    pub(crate) fn reject(
+        &self,
+        denied: Denied,
+        peer: &dyn std::fmt::Display,
+        telemetry: &Telemetry,
+        diag: &Diagnostics,
+    ) {
+        telemetry.count("logit.input.requests.rejected", 1.0, &[("reason", "auth")]);
+        diag.clone().warn_throttled(
+            self.diagnostic,
+            format_args!("{}: rejecting a request from {peer}: {denied}", self.kind),
+        );
+    }
+
+    /// Adds a `WWW-Authenticate` challenge per configured scheme to a `401`'s headers.
+    pub(crate) fn challenge(&self, headers: &mut http::HeaderMap) {
+        for challenge in self.credentials.challenges() {
+            headers
+                .append(http::header::WWW_AUTHENTICATE, http::HeaderValue::from_static(challenge));
+        }
+    }
+}
+
+impl Default for AuthGate {
+    fn default() -> Self {
+        Self::new(Credentials::default(), "", "")
+    }
 }
 
 /// Reads one HTTP/1.1 response, its head and its `Content-Length` body, off a keep-alive
@@ -736,22 +782,6 @@ pub(crate) async fn read_response<S: tokio::io::AsyncRead + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn constant_time_eq_compares_whole_keys() {
-        assert!(constant_time_eq(b"abc", b"abc"));
-        assert!(!constant_time_eq(b"abc", b"abd"));
-        assert!(!constant_time_eq(b"abc", b"ab"));
-    }
-
-    #[test]
-    fn matches_any_key_finds_any_entry_and_nothing_else() {
-        let keys: Vec<Box<[u8]>> = vec![Box::from(&b"one"[..]), Box::from(&b"two"[..])];
-        assert!(matches_any_key(&keys, b"one"));
-        assert!(matches_any_key(&keys, b"two"));
-        assert!(!matches_any_key(&keys, b"three"));
-        assert!(!matches_any_key(&[], b"one"));
-    }
 
     /// [`accept`] hands its caller a connection with `TCP_NODELAY` on, which a socket accepted
     /// on Linux doesn't start with.

@@ -1,6 +1,6 @@
 ---
 created: 2026-09-25
-updated: 2026-09-25
+updated: 2026-10-25
 ---
 
 # Deployment threat model: accidental data inside a trust boundary, not a malicious peer
@@ -59,3 +59,14 @@ Each time, the same question came up in a different form. This ADR answers it on
 - Every non-goal in `docs/known-gaps/` that rests on this premise cites this ADR, so the revisit
   trigger can find them all.
 - `docs/deploying.md` tells operators to keep listeners behind their own trust boundary.
+
+## Amendment (2026-10-25): a credential is one of the operator's tools
+
+[ADR `listener-authentication`](listener-authentication.md) gives `otlp_in`, `prometheus_in`'s
+remote-write receiver, and `prometheus_out`'s exposition static bearer and basic credentials,
+beside the protocol tokens `datadog_in`, `splunk_hec_in`, and `influxdb_in` already check. The
+trust boundary is still the operator's: a credential decides who may send, and it doesn't make a
+listener fit to face the internet. The bar for what a listener survives stays accidental data,
+and an authenticated peer is held to it, not trusted further. The revisit trigger is unchanged,
+because a credential on a public endpoint doesn't defend the non-goals recorded against this ADR
+from a peer that holds one.

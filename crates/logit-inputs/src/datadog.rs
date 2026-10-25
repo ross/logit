@@ -140,8 +140,8 @@
 use crate::http::{
     body_read_error_message, collect_with_stall_bound, declared_length, decompress,
     deliver_with_deadline, drive_connection, error_response, is_length_limit, json_response,
-    matches_any_key, media_type, now_nanos, Activity, BodyReadError, DecompressError, Encoding,
-    MediaType, Undelivered,
+    media_type, now_nanos, Activity, BodyReadError, DecompressError, Encoding, MediaType,
+    Undelivered,
 };
 use crate::listener::Prelude;
 use crate::peer::ConnectionPeer;
@@ -1012,8 +1012,8 @@ fn acknowledge(shared: &Shared, route: &'static str) {
 }
 
 /// Whether the request carries a `DD-API-KEY` header, or else a `query_key`, equal to one of
-/// `api_keys` ([`matches_any_key`]'s constant-time comparison); always `true` when none are
-/// configured.
+/// `api_keys` ([`logit_proto::auth::matches_any_key`]'s constant-time comparison); always `true`
+/// when none are configured.
 fn authorized(api_keys: &[Box<[u8]>], headers: &HeaderMap, query_key: Option<&[u8]>) -> bool {
     if api_keys.is_empty() {
         return true;
@@ -1021,7 +1021,7 @@ fn authorized(api_keys: &[Box<[u8]>], headers: &HeaderMap, query_key: Option<&[u
     let Some(sent) = headers.get("dd-api-key").map(HeaderValue::as_bytes).or(query_key) else {
         return false;
     };
-    matches_any_key(api_keys, sent)
+    logit_proto::auth::matches_any_key(api_keys, sent)
 }
 
 /// The first `api_key=` parameter of a query string, as sent: an API key is hex, so nothing in it

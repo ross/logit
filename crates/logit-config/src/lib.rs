@@ -581,6 +581,62 @@ pub struct TlsServerConfig {
     pub client_ca_file: Option<String>,
 }
 
+/// The credentials an HTTP listener requires on every request, from its `Authorization` header.
+/// Both lists empty, the default, accepts any request. With both set, a request carrying either
+/// kind is accepted. A request with no credential, or one that matches none listed, is refused
+/// with `401` before its body is read, and counted. Take each value from the environment
+/// (`!env ...`) rather than writing it into the file. Values are read once at startup: to rotate
+/// one, add the new value and restart, move the senders over, then remove the old value and
+/// restart again. A credential is never logged, counted, or kept on an event.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HttpAuthConfig {
+    /// Tokens accepted as `Authorization: Bearer <token>`. An empty entry, or one with leading
+    /// or trailing whitespace, is rejected.
+    #[serde(default)]
+    pub bearer_tokens: Vec<String>,
+    /// Username and password pairs accepted as HTTP basic authentication
+    /// (`Authorization: Basic ...`). An empty username or password is rejected, as is a
+    /// username containing `:`, which basic authentication can't carry. A password may contain
+    /// `:`.
+    #[serde(default)]
+    pub basic: Vec<BasicCredential>,
+}
+
+impl HttpAuthConfig {
+    /// `true` when no credential is configured, so the listener accepts any request.
+    pub fn is_empty(&self) -> bool {
+        self.bearer_tokens.is_empty() && self.basic.is_empty()
+    }
+}
+
+/// Counts only, so a credential never reaches an error or log line through `Debug`.
+impl std::fmt::Debug for HttpAuthConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpAuthConfig")
+            .field("bearer_tokens", &self.bearer_tokens.len())
+            .field("basic", &self.basic.len())
+            .finish()
+    }
+}
+
+/// One username and password an HTTP listener accepts as basic authentication.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BasicCredential {
+    pub username: String,
+    pub password: String,
+}
+
+impl std::fmt::Debug for BasicCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BasicCredential")
+            .field("username", &"<redacted>")
+            .field("password", &"<redacted>")
+            .finish()
+    }
+}
+
 /// Whether `otlp_out` gzips its request bodies, on both transports (HTTP `Content-Encoding:
 /// gzip`; gRPC's per-message compressed flag plus `grpc-encoding: gzip`). Default `none`. This
 /// only compresses what `otlp_out` sends; it never advertises accepting a compressed response.
@@ -1949,6 +2005,14 @@ pub enum ComponentKind {
         /// omitted.
         #[serde(default)]
         tls: Option<TlsServerConfig>,
+        /// The bearer tokens and basic credentials every request must carry, under either
+        /// `protocol`; omitted, any request is accepted. A refused OTLP/HTTP request gets `401`,
+        /// and a refused gRPC call status `16` (`UNAUTHENTICATED`). An OTLP exporter drops the
+        /// data of a refused request rather than retrying it, so check a credential change
+        /// against one sender before rolling it out. Don't set it on a listener a browser sends
+        /// to: a web page can't keep a secret.
+        #[serde(default)]
+        auth: HttpAuthConfig,
         /// How long one connection has, per pre-request phase, before this listener closes it
         /// and frees its connection-cap slot: the PROXY header when `proxy_protocol:` is on, then
         /// the TLS accept when `tls:` is set, or on a plaintext listener the wait for its first
@@ -4304,10 +4368,17 @@ pub enum ComponentKind {
         #[serde(default = "default_prometheus_write_path")]
         path: String,
         /// Server-side TLS for the receiver's listener; its presence turns TLS on. Receiver mode
-        /// only. Transport security only: the receiver has no authentication, so a listener
-        /// reachable from an untrusted network belongs behind something that does.
+        /// only. Prefixed `bind_` because this kind has two TLS roles: server TLS here, client TLS
+        /// for outbound scrapes in `scrape_tls`.
         #[serde(default)]
         bind_tls: Option<TlsServerConfig>,
+        /// The bearer tokens and basic credentials every remote-write request must carry, as
+        /// Prometheus's `remote_write` `authorization:` or `basic_auth:` and vmagent's
+        /// `-remoteWrite.bearerToken` or `-remoteWrite.basicAuth.*` send them; omitted, any
+        /// request is accepted. A refused request gets `401`. Prometheus drops a batch that gets
+        /// `401` rather than retrying it, where vmagent holds and retries it. Receiver mode only.
+        #[serde(default)]
+        bind_auth: HttpAuthConfig,
         /// How long a receiver connection may sit with no request in flight before it is closed
         /// and its connection-cap slot freed. Omitted (the default) means no idle timeout; `0s` is
         /// rejected. Receiver mode only.
@@ -4460,9 +4531,9 @@ pub enum ComponentKind {
         /// so an address already in use is a startup failure rather than a scrape that answers
         /// nothing.
         ///
-        /// There is no TLS and no auth on this endpoint, and it serves every label of every
-        /// series the registry holds to anything that connects: bind loopback or pod-local
-        /// (`127.0.0.1:9464`) and front it with something that has both.
+        /// The exposition serves every label of every series the registry holds to anything that
+        /// can scrape it. Without `bind_tls` and `bind_auth`, bind loopback or pod-local
+        /// (`127.0.0.1:9464`).
         #[serde(default)]
         bind: Option<String>,
         /// The HTTP path the exposition is served on; any other path is a `404`. Defaults to
@@ -4482,6 +4553,20 @@ pub enum ComponentKind {
         /// rejected. Registry mode only.
         #[serde(default = "default_prometheus_max_series")]
         max_series: usize,
+        /// Server-side TLS for the exposition; its presence turns TLS on, with no plaintext
+        /// fallback, and the certificate files reload like every other listener's. Point the
+        /// scraper's `scheme: https` and `tls_config:` at it. Registry mode only. Prefixed
+        /// `bind_` because this kind has two TLS roles: server TLS here, client TLS for
+        /// remote-write in `endpoint_tls`.
+        #[serde(default)]
+        bind_tls: Option<TlsServerConfig>,
+        /// The bearer tokens and basic credentials every scrape must carry, as a Prometheus
+        /// scrape config's `authorization:` or `basic_auth:` sends them; omitted, any scrape is
+        /// accepted. A refused scrape gets `401`, and the scraper records the target down, as
+        /// does a Kubernetes probe sent without the credential: point probes at `admin:`.
+        /// Registry mode only.
+        #[serde(default)]
+        bind_auth: HttpAuthConfig,
         /// An absolute `http://`/`https://` remote-write URL, path included (typically
         /// `/api/v1/write`): sender mode. Never resolved at config-load time, so a receiver that
         /// isn't up yet is not a config error.
@@ -4533,7 +4618,7 @@ pub enum ComponentKind {
         headers: HashMap<String, String>,
         /// Client-side TLS tuning for an `https://` `endpoint:`. A non-default block under a plain
         /// `http://` endpoint is rejected. Sender mode only. Prefixed `endpoint_`, matching
-        /// `prometheus_in`'s `scrape_tls`/`bind_tls`, because this kind has two modes.
+        /// `bind_tls`, because this kind has two TLS roles.
         #[serde(default)]
         endpoint_tls: TlsClientConfig,
         /// Sets `SO_REUSEPORT` on the listening socket, so a second `logit` process, such as an
@@ -4666,8 +4751,9 @@ pub fn default_prometheus_path() -> String {
 /// It is one table per component, shared by every sender that can reach the listener. That lets
 /// a 2.0 sender's declarations type a 1.0 sender's series, and it equally means a peer that
 /// declares a great many families evicts other peers' entries, leaving well-behaved senders
-/// untyped until their next metadata write. The receiver authenticates no one, so do not point
-/// it at untrusted senders. `max_families: 0` turns the table off along with the typing.
+/// untyped until their next metadata write. `bind_auth` limits who can write, not what an
+/// accepted sender declares, so every sender that holds a credential shares the table.
+/// `max_families: 0` turns the table off along with the typing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct MetadataCacheConfig {
@@ -8478,6 +8564,7 @@ mod tests {
                 bind,
                 protocol,
                 tls,
+                auth,
                 handshake_timeout,
                 idle_timeout,
                 max_connections,
@@ -8487,6 +8574,7 @@ mod tests {
                 reuse_port,
             } => {
                 assert!(!reuse_port, "opt-in -- no SO_REUSEPORT unless asked for");
+                assert!(auth.is_empty(), "opt-in -- no credential required unless configured");
                 assert_eq!(bind, "0.0.0.0:4317");
                 assert_eq!(protocol, OtlpProtocol::Grpc);
                 assert_eq!(tls, None);
@@ -9070,6 +9158,38 @@ mod tests {
             extensions: Default::default(),
         };
         assert!(!format!("{sasl:?}").contains("static-token-value"));
+    }
+
+    /// An `auth:` block parses both credential kinds, and its `Debug` prints counts only, so no
+    /// credential, username included, reaches a message built from a component.
+    #[test]
+    fn http_auth_parses_both_kinds_and_debug_redacts_every_credential() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "otlp_in", "bind": "0.0.0.0:4318", "auth": {
+                "bearer_tokens": ["token-secret"],
+                "basic": [{"username": "alice-name", "password": "pa:ss-secret"}]}}"#,
+        )
+        .unwrap();
+        let ComponentKind::OtlpIn { auth, .. } = &component.kind else { panic!("not otlp_in") };
+        assert_eq!(auth.bearer_tokens, ["token-secret"]);
+        assert_eq!(auth.basic[0].username, "alice-name");
+        assert_eq!(auth.basic[0].password, "pa:ss-secret");
+        assert!(!auth.is_empty());
+        let shown = format!("{component:?}");
+        for secret in ["token-secret", "alice-name", "pa:ss-secret"] {
+            assert!(!shown.contains(secret), "{shown}");
+        }
+        assert!(format!("{:?}", auth.basic[0]).contains("<redacted>"));
+    }
+
+    /// A typo inside `auth:` fails to parse rather than leaving the listener open.
+    #[test]
+    fn http_auth_rejects_an_unknown_field() {
+        for auth in [r#"{"bearer_token": ["t"]}"#, r#"{"basic": [{"user": "u", "password": "p"}]}"#]
+        {
+            let json = format!(r#"{{"type": "otlp_in", "bind": "0.0.0.0:4318", "auth": {auth}}}"#);
+            assert!(serde_json::from_str::<Component>(&json).is_err(), "{auth} parsed");
+        }
     }
 
     /// The password stays out of `Debug`, and so out of any message built from a component.
@@ -9669,6 +9789,8 @@ mod tests {
                 path,
                 expire_after,
                 max_series,
+                bind_tls,
+                bind_auth,
                 endpoint,
                 version,
                 compression,
@@ -9682,6 +9804,8 @@ mod tests {
                 assert_eq!(concurrency, 1);
                 assert_eq!(idle_timeout, Duration::from_secs(30));
                 assert!(!reuse_port, "opt-in -- no SO_REUSEPORT unless asked for");
+                assert_eq!(bind_tls, None, "plaintext unless configured");
+                assert!(bind_auth.is_empty(), "opt-in -- no credential required unless configured");
                 assert_eq!(bind.as_deref(), Some("127.0.0.1:9464"));
                 assert_eq!(path, "/metrics");
                 assert_eq!(
@@ -10380,6 +10504,7 @@ mod tests {
                 bind,
                 path,
                 bind_tls,
+                bind_auth,
                 idle_timeout,
                 max_connections,
                 metadata_cache,
@@ -10389,6 +10514,7 @@ mod tests {
                 reuse_port,
             } => {
                 assert!(!reuse_port, "opt-in -- no SO_REUSEPORT unless asked for");
+                assert!(bind_auth.is_empty(), "opt-in -- no credential required unless configured");
                 assert_eq!(max_connections, default_max_connections());
                 assert!(!peer, "opt-in -- no peer address unless asked for");
                 assert!(!proxy_protocol, "opt-in -- no PROXY header unless asked for");

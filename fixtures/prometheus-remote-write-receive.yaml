@@ -17,15 +17,17 @@
 components:
   remote_write_in:
     type: prometheus_in
-    # `bind_tls:` gives this listener transport security, not authentication
-    # (docs/known-gaps/prometheus.md): bind loopback or pod-local and front it with something that
-    # authenticates.
+    # Loopback here. To take writes from another host, set `bind_tls:` and `bind_auth:` below and
+    # give the sender the matching `authorization:` or `basic_auth:` (docs/deploying.md's
+    # "Listener authentication").
     bind: 127.0.0.1:9201
     # path: /api/v1/write         # the one path POSTs are accepted on
     # bind_tls:                   # presence turns server TLS on for this listener
     #   cert_file: server.pem     # resolved against this config file's directory
     #   key_file: server.key
     #   client_ca_file: ca.pem    # omit for server-auth-only TLS; set it to require a client cert
+    # bind_auth:                  # omitted, any request is accepted; refused requests get a 401
+    #   bearer_tokens: [!env REMOTE_WRITE_TOKEN]
     # Off by default, and set here because senders write on a fixed cadence: a connection quiet
     # for a minute is not coming back. It also bounds a request whose body stalls mid-upload,
     # which otherwise holds one of the listener's `max_connections` permits (1024 by default)
@@ -48,5 +50,6 @@ components:
     type: prometheus_out
     sources: [remote_write_in]
     # Exposition mode: received series are held and rendered on demand, in the dialect the
-    # scraper's `Accept` asks for. Loopback for the same reason as above: no TLS and no auth here.
+    # scraper's `Accept` asks for. Loopback for the same reason as above; this endpoint takes its
+    # own `bind_tls:` and `bind_auth:`.
     bind: 127.0.0.1:9464

@@ -30,9 +30,11 @@ exists or a contract other `logit` processes depend on:
   canonical byte form, in `logit_core::sampling`, pinned by test vectors. Changing it is a
   wire-breaking change that needs its own ADR, because every `logit` process must reach the same
   verdict for the same key with nothing propagated.
-- **`prometheus_in`'s TLS keys are prefixed by the mode they serve**: `scrape_tls:` for the scrape
-  client, `bind_tls:` for the remote-write server. There is no bare `tls:` key and no alias for
-  one; don't add either.
+- **The Prometheus kinds' TLS and auth keys are prefixed by the mode they serve**: on
+  `prometheus_in`, `scrape_tls:` for the scrape client and `bind_tls:` and `bind_auth:` for the
+  remote-write server; on `prometheus_out`, `bind_tls:` and `bind_auth:` for the exposition and
+  `endpoint_tls:` for the remote-write sender. There is no bare `tls:` or `auth:` key on either
+  kind and no alias for one; don't add either.
 - **`flatten` never deletes an attribute.** It removes a source attribute only once its leaves are
   written. Last write wins on a key collision, silently, and there is deliberately no cap on how
   many keys one value can expand into beyond a fixed internal recursion-depth bound. That's a
@@ -101,12 +103,12 @@ Listeners live in `crates/logit-inputs`, codecs in `crates/logit-proto`.
 | `graphite_in` | `crates/logit-inputs/src/graphite/` | carbon plaintext and pickle, UDP or TCP | [ADR `graphite-carbon-relay`](docs/adr/graphite-carbon-relay.md) |
 | `lines_in` | `crates/logit-inputs/src/lines.rs` | newline-delimited plain text over TCP (optionally TLS), UDP, or a Unix socket (`unix`, `unix_stream`); one raw log event per line, nothing parsed (compose `json`, `logfmt`, `kv`, `regex`) | [ADR `plain-lines-listener`](docs/adr/plain-lines-listener.md) |
 | `collectd_in` | `crates/logit-inputs/src/collectd.rs` | collectd's binary `network` protocol, unicast or multicast | [ADR `collectd-binary-relay`](docs/adr/collectd-binary-relay.md) |
-| `otlp_in` | `crates/logit-inputs/src/otlp.rs` | OTLP logs, metrics, and traces over OTLP/HTTP (protobuf and OTLP/JSON) and OTLP/gRPC | [ADR `otlp-json-decoding`](docs/adr/otlp-json-decoding.md) |
+| `otlp_in` | `crates/logit-inputs/src/otlp.rs` | OTLP logs, metrics, and traces over OTLP/HTTP (protobuf and OTLP/JSON) and OTLP/gRPC; optional `auth:` bearer and basic credentials | [ADR `otlp-json-decoding`](docs/adr/otlp-json-decoding.md), [ADR `listener-authentication`](docs/adr/listener-authentication.md) |
 | `datadog_in` | `crates/logit-inputs/src/datadog.rs` | Datadog's intake API over HTTP (series, sketches, checks, events, logs, APM traces and stats), gzip/deflate/zstd, `503` when busy | [ADR `datadog-agent-and-intake-relay`](docs/adr/datadog-agent-and-intake-relay.md) |
 | `datadog_trace_in` | `crates/logit-inputs/src/datadog_trace.rs` | the Datadog Agent's APM API for dd-trace tracers (`/v0.3`–`/v0.7/traces` msgpack, `/v0.6/stats`, `/info`) over TCP and/or a Unix socket; keeps every span, `503` (a tracer's loss) when busy | [ADR `datadog-agent-and-intake-relay`](docs/adr/datadog-agent-and-intake-relay.md) |
 | `splunk_hec_in` | `crates/logit-inputs/src/splunk.rs` | a stand-in for Splunk's HTTP Event Collector (HEC): `/event` JSON and `/raw` lines from any HEC client (Docker's `splunk` driver, Splunk's logging libraries, the OTel `splunk_hec` exporter, SC4S), gzip, an optional `tokens:` allowlist, the objects before a code 6 delivered as Splunk indexes them, per-channel `ackId`s that `/ack` answers `true` once, as a `useACK` token does, `503` code 9 only when nothing of the body was taken, and a `503` code 18 `/health` after it | [ADR `splunk-hec-relay`](docs/adr/splunk-hec-relay.md) |
 | `influxdb_in` | `crates/logit-inputs/src/influxdb.rs` (listener), `crates/logit-proto/src/influxdb/` (codec) | a stand-in for InfluxDB 2.x's write API: `POST /api/v2/write` line protocol from Telegraf's `outputs.influxdb_v2`, the InfluxDB client libraries, or `influxdb_out`, gzip, an optional `tokens:` allowlist, `/ping` and `/health`, `org`/`orgID`/`bucket` as `influxdb.*` resource attributes, a body with any bad line refused whole with `400`, `503` when busy; no v1 `/write`, no query API | [ADR `influxdb-line-protocol-relay`](docs/adr/influxdb-line-protocol-relay.md) |
-| `prometheus_in` | `crates/logit-inputs/src/prometheus.rs` | scrapes `/metrics` targets, or receives remote-write | [ADR `prometheus-scrape-and-exposition`](docs/adr/prometheus-scrape-and-exposition.md), [ADR `prometheus-remote-write`](docs/adr/prometheus-remote-write.md) |
+| `prometheus_in` | `crates/logit-inputs/src/prometheus.rs` | scrapes `/metrics` targets, or receives remote-write, with optional `bind_auth:` credentials | [ADR `prometheus-scrape-and-exposition`](docs/adr/prometheus-scrape-and-exposition.md), [ADR `prometheus-remote-write`](docs/adr/prometheus-remote-write.md), [ADR `listener-authentication`](docs/adr/listener-authentication.md) |
 | `tail_in` | `crates/logit-inputs/src/tail/` | rotation- and checkpoint-aware file tailing | [ADR `file-tailing-and-docker-json-logs`](docs/adr/file-tailing-and-docker-json-logs.md) |
 | `docker_in` | `crates/logit-inputs/src/docker.rs` | Docker json-file container logs, enriched from a sibling `config.v2.json`; no docker socket | same ADR as `tail_in` |
 | `logit_in` | `crates/logit-inputs/src/logit.rs` | the native `logit`-to-`logit` transport | [ADR `native-transport-handshake-and-ack`](docs/adr/native-transport-handshake-and-ack.md), [ADR `native-hop-identity-and-sequence`](docs/adr/native-hop-identity-and-sequence.md), [ADR `native-hop-named-acks`](docs/adr/native-hop-named-acks.md) |
@@ -130,7 +132,7 @@ Sinks live in `crates/logit-outputs`.
 | `datadog_trace_out` | `crates/logit-outputs/src/datadog_trace.rs` | a Datadog Agent's APM API (traces and `/v0.6/stats`), v0.4 or v0.7, over TCP or the Agent's Unix socket, restoring the tracer's request headers | [ADR `datadog-agent-and-intake-relay`](docs/adr/datadog-agent-and-intake-relay.md) |
 | `splunk_hec_out` | `crates/logit-outputs/src/splunk.rs` | Splunk's HEC as `/event` JSON in the OTel `splunk_hec` exporter's shape: logs, metrics (`multi_value: skip \| expand`), and spans as events; envelope from resource attributes, gzip, size-capped bodies, a code-6 drop-and-resend, Splunk Cloud's oversize code 6 split once, a busy `429`/`503` retried before any body is accepted, opt-in `ack:` | [ADR `splunk-hec-relay`](docs/adr/splunk-hec-relay.md) |
 | `kafka_out` | `crates/logit-outputs/src/kafka/` | produces to a Kafka topic, one event per record or, under `record: batch`, as many as fit (`format: json \| text \| msgpack \| native`: the `stdio_out` JSON object, the log body, that object as MessagePack, or a native frame); or under `format: otlp_proto \| otlp_json` (protobuf or OTLP/JSON), as the Collector's Kafka exporter does, one OTLP export request per signal per record to each signal's topic (`topics:`, defaulting to `otlp_logs`, `otlp_metrics`, `otlp_spans`), split by trace id and by size, through a multi-topic facade that opens a producer per topic on its first record and reads one verdict across topics; with the Java producer's defaults: `acks: all`, idempotence, murmur2 keyed partitioning (`key: trace_id \| {attribute} \| {resource}`), and a pending batch kept across retries so a resend reuses its sequences; all five codecs, TLS and mTLS, SASL PLAIN, SCRAM, OAUTHBEARER (a fixed token or the client-credentials grant), and AWS_MSK_IAM (SigV4 on `ring`, with a hand-rolled subset of the AWS default credential chain) | [ADR `kafka-output`](docs/adr/kafka-output.md), [ADR `kafka-sasl`](docs/adr/kafka-sasl.md), [ADR `kafka-otlp-formats`](docs/adr/kafka-otlp-formats.md) |
-| `prometheus_out` | `crates/logit-outputs/src/prometheus.rs` | serves an exposition endpoint, or sends remote-write | [ADR `prometheus-scrape-and-exposition`](docs/adr/prometheus-scrape-and-exposition.md), [ADR `prometheus-remote-write`](docs/adr/prometheus-remote-write.md) |
+| `prometheus_out` | `crates/logit-outputs/src/prometheus.rs` | serves an exposition endpoint, with optional `bind_tls:` and `bind_auth:`, or sends remote-write | [ADR `prometheus-scrape-and-exposition`](docs/adr/prometheus-scrape-and-exposition.md), [ADR `prometheus-remote-write`](docs/adr/prometheus-remote-write.md), [ADR `listener-authentication`](docs/adr/listener-authentication.md) |
 | `collectd_out` | `crates/logit-outputs/src/collectd.rs` | collectd's binary `network` protocol | [ADR `collectd-binary-relay`](docs/adr/collectd-binary-relay.md) |
 | `graphite_out` | `crates/logit-outputs/src/graphite.rs` | carbon plaintext and pickle | [ADR `graphite-carbon-relay`](docs/adr/graphite-carbon-relay.md) |
 | `logit_out` | `crates/logit-outputs/src/logit.rs` | the native `logit`-to-`logit` transport | [ADR `native-transport-handshake-and-ack`](docs/adr/native-transport-handshake-and-ack.md), [ADR `native-hop-identity-and-sequence`](docs/adr/native-hop-identity-and-sequence.md), [ADR `native-hop-send-window`](docs/adr/native-hop-send-window.md), [ADR `native-hop-named-acks`](docs/adr/native-hop-named-acks.md) |
@@ -407,13 +409,15 @@ Per pair:
   needs no edit ([ADR `prometheus-remote-write`](docs/adr/prometheus-remote-write.md)):
   - `prometheus_in` either scrapes `scrape_targets:` on an interval, or binds a remote-write
     **receiver** on `bind:`. The receiver accepts 1.0 and 2.0 on one listener, chosen per
-    request from its own `Content-Type`, with `bind_tls:` for server TLS. It decodes
+    request from its own `Content-Type`, with `bind_tls:` for server TLS and `bind_auth:` for
+    bearer and basic credentials. It decodes
     `Content-Encoding: snappy` or `zstd` (the VictoriaMetrics remote write protocol, vmagent's
     default, through `ruzstd`), so vmagent stays on zstd with no configuration. A bounded
     `metadata_cache:` (`max_families`/`ttl`) is what makes 1.0 typed at all, because
     Prometheus's own 1.0 sender ships `metadata[]` in separate requests from the samples it
     describes.
-  - `prometheus_out` either exposes a registry on `bind:`, or **sends** remote-write to an
+  - `prometheus_out` either exposes a registry on `bind:`, with `bind_tls:` and `bind_auth:`,
+    or **sends** remote-write to an
     `endpoint:` under an explicit `version: 1 | 2`. There's no negotiation and no fallback: the
     operator picks the one their receiver speaks, as they already pick an exposition dialect.
     `compression: snappy | zstd` is chosen the same way: `zstd` is the VictoriaMetrics remote
@@ -691,6 +695,12 @@ the operator-facing account of all of this.
   resumption stays on. The builders and the reloader are `logit_pipeline::tls`
   ([ADR `tls-certificate-reload`](docs/adr/tls-certificate-reload.md);
   [docs/deploying.md](docs/deploying.md)'s "Certificate rotation").
+- **Listener authentication**: `otlp_in`'s `auth:` and the two Prometheus kinds' `bind_auth:` take
+  static bearer tokens and basic pairs, checked through `logit_proto::auth` before the body and
+  refused with `401` (gRPC status `16`), never counted `*.dropped`. Anything stronger is a proxy's
+  job, and `admin:` and `datadog_trace_in` take no credential
+  ([ADR `listener-authentication`](docs/adr/listener-authentication.md);
+  [docs/deploying.md](docs/deploying.md)'s "Listener authentication").
 - **Readiness**: a top-level `admin:` block serves `/readyz`/`/healthz` on a TCP `bind:`, a Unix
   `socket:`, or both, and the `logit ready` probe helper that `Dockerfile`'s `HEALTHCHECK` uses
   ([ADR `admin-readiness-endpoint`](docs/adr/admin-readiness-endpoint.md)).
@@ -1292,7 +1302,7 @@ where `script/perf run`/`attribute`/`flamegraph` write their (gitignored) output
 
 `testdata/differential/` holds those corpora: generated and deterministic, unlike `testdata/interop/`'s captures, each case's bytes beside a JSON file with the reference's reading and the verdict `logit` must give, and a `divergence` on every case where the two differ. `prometheus-text/` differs in its inputs: its `cases/` are hand-built and committed as inputs, its readings sit under `reference/`, and it reads `testdata/interop/prometheus-scrape/`'s recorded bodies in place. `datadog-sketch/` holds no bytes: each case is a histogram and the translator's sketch as JSON. Its tests read it with `std::fs` and no reference installed, and `fuzz/seedgen` turns every `graphite-pickle` and `prometheus-text` case into a seed; [its README](testdata/differential/README.md) has the rest.
 
-`fuzz/` is the cargo-fuzz harness `script/unsafe-check fuzz` drives ([ADR `out-of-ci-fuzzing`](docs/adr/out-of-ci-fuzzing.md)), its own workspace outside the root one like `tools/protogen`, so `libfuzzer-sys` never enters the stable build: one target per file in `fuzz_targets/`, 26 today, each also a row of `script/unsafe-check`'s `FUZZ_TARGETS` (depending on `logit-core` and `logit-proto` only), `seedgen/` (a plain binary that writes `seeds/<target>/` deterministically from `testdata/interop/{otlp,prometheus,prometheus-scrape,statsd,syslog,graphite,collectd,datadog,influxdb}/`, the `graphite-pickle` and `prometheus-text` corpora under `testdata/differential/`, every `*.in` body under `crates/logit-cli/tests/fixtures/prometheus/`, `tools/record-fixtures/prometheus-metadata-target.prom`, `crates/logit-proto/tests/support/influxdb_lines.rs`, and encoder round trips), and the committed `seeds/`, where a `regress-*` file is a minimized crash input. `fuzz/corpus/`, `fuzz/artifacts/`, `fuzz/coverage/`, and `fuzz/target/` are gitignored; `script/format` covers the workspace and `script/lint` type-checks it on stable (`cargo check`), while clippy and `cargo-deny` don't.
+`fuzz/` is the cargo-fuzz harness `script/unsafe-check fuzz` drives ([ADR `out-of-ci-fuzzing`](docs/adr/out-of-ci-fuzzing.md)), its own workspace outside the root one like `tools/protogen`, so `libfuzzer-sys` never enters the stable build: one target per file in `fuzz_targets/`, 27 today, each also a row of `script/unsafe-check`'s `FUZZ_TARGETS` (depending on `logit-core` and `logit-proto` only), `seedgen/` (a plain binary that writes `seeds/<target>/` deterministically from `testdata/interop/{otlp,prometheus,prometheus-scrape,statsd,syslog,graphite,collectd,datadog,influxdb}/`, the `graphite-pickle` and `prometheus-text` corpora under `testdata/differential/`, every `*.in` body under `crates/logit-cli/tests/fixtures/prometheus/`, `tools/record-fixtures/prometheus-metadata-target.prom`, `crates/logit-proto/tests/support/influxdb_lines.rs`, and encoder round trips), and the committed `seeds/`, where a `regress-*` file is a minimized crash input. `fuzz/corpus/`, `fuzz/artifacts/`, `fuzz/coverage/`, and `fuzz/target/` are gitignored; `script/format` covers the workspace and `script/lint` type-checks it on stable (`cargo check`), while clippy and `cargo-deny` don't.
 
 `perf/load/*.yaml` are the **sidecar load specs** for real-socket scenarios
 ([ADR `udp-intake-batching-and-socket-visibility`](docs/adr/udp-intake-batching-and-socket-visibility.md)):

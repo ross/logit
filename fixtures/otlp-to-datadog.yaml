@@ -16,8 +16,8 @@
 components:
   otel:
     type: otlp_in
-    # No authentication on this listener: bind loopback or pod-local, or front it with something
-    # that authenticates.
+    # Loopback here. To take data from another host, set `tls:` and `auth:` (docs/deploying.md's
+    # "Listener authentication").
     bind: 127.0.0.1:4318
     protocol: http
 

@@ -253,8 +253,9 @@ admin:
   bind: 0.0.0.0:9600
 ```
 
-**The endpoint has no TLS and no auth.** It is meant to be loopback or pod-local, not exposed
-across a real network boundary.
+**The endpoint has no TLS and no auth, and won't get either.** It is meant to be loopback,
+pod-local, or a Unix socket, not exposed across a real network boundary, and a probe would have to
+carry any credential it required ([ADR `listener-authentication`](adr/listener-authentication.md)).
 
 To serve the same endpoints on a Unix socket, set `socket:` instead of `bind:`, or alongside it:
 
@@ -2964,7 +2965,8 @@ CORS support (`handle_http` returns 404 for an `OPTIONS` preflight and sets no
 `Access-Control-Allow-Origin`), so a **cross-origin** browser exporter, pointed at `otlp_in`
 directly from a page on a different origin, can't reach it at all. Put a reverse proxy in front that
 shares the page's origin instead of opening `otlp_in` to arbitrary browser origins
-(`docs/known-gaps/otlp.md`).
+(`docs/known-gaps/otlp.md`). Leave `auth:` off a listener a browser sends to: a web page can't keep a
+secret, so a token in it is a token anyone can read.
 
 ## `otlp_in`: a request no consumer took
 
@@ -3967,15 +3969,12 @@ the design and
 [`fixtures/prometheus-remote-write-send.yaml`](../fixtures/prometheus-remote-write-send.yaml) for
 runnable configs.
 
-**Bind the receiver to loopback or pod-local, and front it with something that authenticates.**
-`bind_tls:` gives it real server TLS, but that is transport security only: there is no bearer token,
-no basic auth, and no mutual-TLS identity check beyond `rustls` accepting whatever chain a client
-presents when `client_ca_file` is set. Anything that can reach the socket can write series into the
-pipeline. So bind `127.0.0.1:9201`, as
+**Without `bind_auth:`, anything that can reach the receiver can write series into the
+pipeline.** Bind `127.0.0.1:9201`, as
 [`fixtures/prometheus-remote-write-receive.yaml`](../fixtures/prometheus-remote-write-receive.yaml)
-does, and put an ingress, a service mesh, or an authenticating reverse proxy in front, the same
-posture as `admin:` and `prometheus_out`'s exposition `bind:`. Making it reachable from off-host is
-a deliberate choice, not one to inherit from an example. Tracked in `docs/known-gaps/prometheus.md`.
+does, or set `bind_tls:` and `bind_auth:` and give each sender the matching credential (see
+[Listener authentication](#listener-authentication)). Make it reachable from off-host by choice,
+not because an example did.
 
 ```yaml
 components:
@@ -4198,8 +4197,89 @@ times slower than libzstd. If that CPU matters more than bandwidth, start vmagen
 
 The receiver advice in
 [Prometheus remote-write](#prometheus-remote-write-receiving-sending-and-picking-a-version)
-applies unchanged: bind loopback or pod-local, front it with something that authenticates, and set
-`idle_timeout:`.
+applies unchanged: bind loopback or pod-local, or set `bind_tls:` and `bind_auth:` and start
+vmagent with `-remoteWrite.bearerToken` or `-remoteWrite.basicAuth.*`, and set `idle_timeout:`.
+
+## Listener authentication
+
+Three HTTP surfaces take a static credential: `otlp_in` (`auth:`, both transports),
+`prometheus_in`'s remote-write receiver (`bind_auth:`), and `prometheus_out`'s exposition
+(`bind_auth:`). Each accepts bearer tokens, HTTP basic username and password pairs, or both:
+
+```yaml
+components:
+  otel:
+    type: otlp_in
+    bind: 0.0.0.0:4318
+    tls:
+      cert_file: /etc/logit/tls/server.pem
+      key_file: /etc/logit/tls/server.key
+    auth:
+      bearer_tokens: [!env OTLP_TOKEN]
+      basic:
+        - username: collector
+          password: !env OTLP_PASSWORD
+```
+
+**Set TLS beside it.** A bearer token or a basic password crosses the wire in the clear without
+TLS, so anyone on the path can replay it. `otlp_in` and `prometheus_in`'s receiver take server TLS
+in `tls:` and `bind_tls:`; `prometheus_out`'s exposition takes `bind_tls:` too, and a scraper
+reaches it with `scheme: https`.
+
+Point each sender at the credential:
+
+| Sender | Setting |
+|---|---|
+| OTel SDK | `OTEL_EXPORTER_OTLP_HEADERS="Authorization=Bearer TOKEN"` |
+| OTel Collector `otlphttp`/`otlp` exporter | `headers: {Authorization: "Bearer TOKEN"}`, or the `bearertokenauth` or `basicauth` extension |
+| Prometheus `remote_write` | `authorization: {credentials: TOKEN}` or `basic_auth:` |
+| vmagent | `-remoteWrite.bearerToken` or `-remoteWrite.basicAuth.username` and `.password` |
+| Prometheus scrape config, against `prometheus_out` | `authorization: {credentials: TOKEN}` or `basic_auth:`, with `scheme: https` |
+
+Replace `TOKEN` with the configured value.
+
+**How a request is checked.** A request needs one `Authorization` header with the scheme
+`Bearer` or `Basic` (in any case) and a credential that matches one configured entry. Both lists
+empty, the default, accepts every request. The check runs before the body is read, so a refused
+sender costs a header read. `logit validate` rejects an empty token, a token with leading or
+trailing whitespace (a secret file's trailing newline, say), and an empty username or password,
+since no client could match them, and a username containing `:`, which basic authentication can't
+carry.
+
+**What a refused sender sees, and does:**
+
+- **OTLP/HTTP:** `401` with a `WWW-Authenticate` challenge. **OTLP/gRPC:** status `16`
+  (`UNAUTHENTICATED`). OTel exporters treat both as permanent and drop that request's data.
+- **Prometheus `remote_write`:** `401`, and Prometheus drops the batch. vmagent holds and retries
+  it.
+- **A scraper of `prometheus_out`:** `401`, and the target reads down. A Kubernetes probe aimed at
+  the exposition without the credential fails too; point probes at `admin:` instead.
+
+So check a credential change against one sender before rolling it out.
+
+**What to watch.** `otlp_in` and `prometheus_in` count
+`logit.input.requests.rejected{reason="auth"}` and log a throttled diagnostic
+(`request_rejected` and `write_rejected`) naming the peer and why: no credential, a scheme the
+listener isn't configured for, or a credential that matches none. `prometheus_in` also counts
+`logit.input.writes{class="unauthorized"}`. `prometheus_out` counts
+`logit.output.scrapes{class="unauthorized"}` and logs nothing, because a scraper retries forever
+on its interval. None of these is a `*.dropped`: the sender still holds the data. No credential
+is ever logged, counted, or kept on an event.
+
+**Rotating a credential.** Credentials are read once at startup. Take each one from the
+environment with `!env`, then rotate in two restarts:
+
+1. Add the new value beside the old one, and restart.
+2. Move every sender to the new value.
+3. Remove the old value, and restart.
+
+**What isn't built in.** OAuth2 and OIDC (including Prometheus's `oauth2:`, vmagent's
+`-remoteWrite.oauth2.*`, and the Collector's `oauth2client`, whose tokens change on every refresh),
+JWT validation, AWS SigV4, Azure AD, Google IAM, matching
+a client certificate's subject, and rate limiting all belong in a proxy or service mesh in front of
+the listener. `client_ca_file` admits any certificate that chains to its CA. `datadog_trace_in`
+takes no credential, because dd-trace tracers send none to a local Agent, and `admin:` takes none.
+See [ADR `listener-authentication`](adr/listener-authentication.md).
 
 ## TLS
 
@@ -4389,9 +4469,18 @@ a failed reload, and the old certificate stays in use until it expires.
 Keep every `logit` listener on a private network, and don't expose one to the internet or to
 peers you don't control. Each listener is built to survive accidental data, such as a
 misconfigured sender, a wedged peer, or a corrupt file, but not a malicious peer sending crafted
-input. Keeping untrusted peers out is your job: use network policy, TLS with `client_ca_file` so
-only peers with a certificate you issued can connect, or a proxy in front of the listener. See
-[ADR `deployment-threat-model`](adr/deployment-threat-model.md), and `docs/known-gaps/` for
+input, and a peer with a valid credential is held to the same bar. Keeping untrusted peers out is
+your job. Your tools are:
+
+- network policy;
+- TLS with `client_ca_file`, so only peers with a certificate you issued can connect;
+- a credential: `otlp_in`'s `auth:`, `prometheus_in`'s and `prometheus_out`'s `bind_auth:`, or
+  the protocol tokens `datadog_in`, `splunk_hec_in`, and `influxdb_in` check (see
+  [Listener authentication](#listener-authentication));
+- a proxy in front of the listener, for anything else, such as OAuth2 or matching a client
+  certificate's subject.
+
+See [ADR `deployment-threat-model`](adr/deployment-threat-model.md), and `docs/known-gaps/` for
 what isn't defended.
 
 ### `syslog_out` over UDP: the message-size bound
@@ -4505,17 +4594,22 @@ Which component takes which block:
 | Component | Block | Turned on by | Notes |
 |---|---|---|---|
 | `otlp_out` | `TlsClientConfig` | an `https://` `endpoint` | `tls:` under a plaintext endpoint is rule 24 |
+| `datadog_out`, `datadog_trace_out`, `splunk_hec_out` | `TlsClientConfig` | an `https://` endpoint | tunes TLS only; a set block with no `https://` endpoint (or `datadog_trace_out`'s `socket`) is rejected |
+| `prometheus_out` (`endpoint_tls:`) | `TlsClientConfig` | an `https://` `endpoint` | sender mode only (rule 56); a set block under an `http://` endpoint is rejected |
 | `influxdb_out` | `TlsClientConfig` | an `https://` `url` | `tls:` under an `http://` url is rule 98 |
 | `logit_out`, `syslog_out`, `statsd_out` | `TlsClientConfig` | the block's presence | bare `host:port`; stream transport only (rules 34/44/52) |
+| `kafka_out` | `TlsClientConfig` | the block's presence | brokers are `host:port`, so even `tls: {}` turns TLS on |
 | `prometheus_in` (`scrape_tls:`) | `TlsClientConfig` | an `https://` scrape target | scrape mode is a client, not a listener; a set block with no `https://` target is rule 40 |
 | `prometheus_in` (`bind_tls:`) | `TlsServerConfig` | the block's presence | the remote-write receiver's own listener; bind mode only (rule 55) |
+| `prometheus_out` (`bind_tls:`) | `TlsServerConfig` | the block's presence | the exposition's listener, HTTP/1.1; registry mode only (rule 56) |
 | `otlp_in` | `TlsServerConfig` | the block's presence | both transports |
+| `datadog_in`, `splunk_hec_in`, `influxdb_in`, `logit_in` | `TlsServerConfig` | the block's presence | |
+| `datadog_trace_in` | `TlsServerConfig` | the block's presence | the `bind` listener only; its Unix socket is always plaintext |
 | `syslog_in`, `graphite_in`, `statsd_in`, `lines_in` | `TlsServerConfig` | the block's presence | `transport: tcp` only (rule 43) |
 
 `TlsClientConfig` is `ca_file`/`cert_file`/`key_file`/`insecure_skip_verify`/`server_name`;
-`TlsServerConfig` is
-`cert_file`/`key_file`/`client_ca_file`. Every path resolves relative to the config file's own
-directory and accepts `!env`. There is no `collectd_out`/`graphite_out` row: collectd's `network`
+`TlsServerConfig` is `cert_file`/`key_file`/`client_ca_file`. Every path resolves relative to the
+config file's own directory and accepts `!env`. There is no `collectd_out`/`graphite_out` row: collectd's `network`
 plugin is UDP-only, and carbon's own senders speak no TLS.
 
 ## Forwarding between `logit` nodes

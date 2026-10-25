@@ -116,6 +116,23 @@
         }
       ]
     },
+    "BasicCredential": {
+      "description": "One username and password an HTTP listener accepts as basic authentication.",
+      "type": "object",
+      "required": [
+        "password",
+        "username"
+      ],
+      "properties": {
+        "password": {
+          "type": "string"
+        },
+        "username": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
     "BucketRange": {
       "description": "One class in a `bucket` field's `ranges` list: at most one upper bound, and the class name.",
       "type": "object",
@@ -679,6 +696,18 @@
             "type"
           ],
           "properties": {
+            "auth": {
+              "description": "The bearer tokens and basic credentials every request must carry, under either `protocol`; omitted, any request is accepted. A refused OTLP/HTTP request gets `401`, and a refused gRPC call status `16` (`UNAUTHENTICATED`). An OTLP exporter drops the data of a refused request rather than retrying it, so check a credential change against one sender before rolling it out. Don't set it on a listener a browser sends to: a web page can't keep a secret.",
+              "default": {
+                "basic": [],
+                "bearer_tokens": []
+              },
+              "allOf": [
+                {
+                  "$ref": "#/definitions/HttpAuthConfig"
+                }
+              ]
+            },
             "bind": {
               "type": "string"
             },
@@ -3989,8 +4018,20 @@
                 "null"
               ]
             },
+            "bind_auth": {
+              "description": "The bearer tokens and basic credentials every remote-write request must carry, as Prometheus's `remote_write` `authorization:` or `basic_auth:` and vmagent's `-remoteWrite.bearerToken` or `-remoteWrite.basicAuth.*` send them; omitted, any request is accepted. A refused request gets `401`. Prometheus drops a batch that gets `401` rather than retrying it, where vmagent holds and retries it. Receiver mode only.",
+              "default": {
+                "basic": [],
+                "bearer_tokens": []
+              },
+              "allOf": [
+                {
+                  "$ref": "#/definitions/HttpAuthConfig"
+                }
+              ]
+            },
             "bind_tls": {
-              "description": "Server-side TLS for the receiver's listener; its presence turns TLS on. Receiver mode only. Transport security only: the receiver has no authentication, so a listener reachable from an untrusted network belongs behind something that does.",
+              "description": "Server-side TLS for the receiver's listener; its presence turns TLS on. Receiver mode only. Prefixed `bind_` because this kind has two TLS roles: server TLS here, client TLS for outbound scrapes in `scrape_tls`.",
               "default": null,
               "anyOf": [
                 {
@@ -4231,11 +4272,35 @@
           ],
           "properties": {
             "bind": {
-              "description": "`host:port` to serve the exposition on: registry mode. Bound when the pipeline starts, so an address already in use is a startup failure rather than a scrape that answers nothing.\n\nThere is no TLS and no auth on this endpoint, and it serves every label of every series the registry holds to anything that connects: bind loopback or pod-local (`127.0.0.1:9464`) and front it with something that has both.",
+              "description": "`host:port` to serve the exposition on: registry mode. Bound when the pipeline starts, so an address already in use is a startup failure rather than a scrape that answers nothing.\n\nThe exposition serves every label of every series the registry holds to anything that can scrape it. Without `bind_tls` and `bind_auth`, bind loopback or pod-local (`127.0.0.1:9464`).",
               "default": null,
               "type": [
                 "string",
                 "null"
+              ]
+            },
+            "bind_auth": {
+              "description": "The bearer tokens and basic credentials every scrape must carry, as a Prometheus scrape config's `authorization:` or `basic_auth:` sends them; omitted, any scrape is accepted. A refused scrape gets `401`, and the scraper records the target down, as does a Kubernetes probe sent without the credential: point probes at `admin:`. Registry mode only.",
+              "default": {
+                "basic": [],
+                "bearer_tokens": []
+              },
+              "allOf": [
+                {
+                  "$ref": "#/definitions/HttpAuthConfig"
+                }
+              ]
+            },
+            "bind_tls": {
+              "description": "Server-side TLS for the exposition; its presence turns TLS on, with no plaintext fallback, and the certificate files reload like every other listener's. Point the scraper's `scheme: https` and `tls_config:` at it. Registry mode only. Prefixed `bind_` because this kind has two TLS roles: server TLS here, client TLS for remote-write in `endpoint_tls`.",
+              "default": null,
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/TlsServerConfig"
+                },
+                {
+                  "type": "null"
+                }
               ]
             },
             "buffer": true,
@@ -4264,7 +4329,7 @@
               ]
             },
             "endpoint_tls": {
-              "description": "Client-side TLS tuning for an `https://` `endpoint:`. A non-default block under a plain `http://` endpoint is rejected. Sender mode only. Prefixed `endpoint_`, matching `prometheus_in`'s `scrape_tls`/`bind_tls`, because this kind has two modes.",
+              "description": "Client-side TLS tuning for an `https://` `endpoint:`. A non-default block under a plain `http://` endpoint is rejected. Sender mode only. Prefixed `endpoint_`, matching `bind_tls`, because this kind has two TLS roles.",
               "default": {
                 "ca_file": null,
                 "cert_file": null,
@@ -4835,6 +4900,29 @@
         "tcp",
         "udp"
       ]
+    },
+    "HttpAuthConfig": {
+      "description": "The credentials an HTTP listener requires on every request, from its `Authorization` header. Both lists empty, the default, accepts any request. With both set, a request carrying either kind is accepted. A request with no credential, or one that matches none listed, is refused with `401` before its body is read, and counted. Take each value from the environment (`!env ...`) rather than writing it into the file. Values are read once at startup: to rotate one, add the new value and restart, move the senders over, then remove the old value and restart again. A credential is never logged, counted, or kept on an event.",
+      "type": "object",
+      "properties": {
+        "basic": {
+          "description": "Username and password pairs accepted as HTTP basic authentication (`Authorization: Basic ...`). An empty username or password is rejected, as is a username containing `:`, which basic authentication can't carry. A password may contain `:`.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/BasicCredential"
+          }
+        },
+        "bearer_tokens": {
+          "description": "Tokens accepted as `Authorization: Bearer <token>`. An empty entry, or one with leading or trailing whitespace, is rejected.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
     },
     "HttpRouteRule": {
       "description": "One entry of `http_access`'s `routes` list: either a `builtin` set, or a `match` regex with the literal `route` it assigns. Never both, and never a mix; `logit validate` names which half is missing or which key is extra. `match` is tested unanchored (unless the pattern anchors itself) against the capped `url.path`; `route` is written verbatim, never from a capture group, so every `http.route` value comes from config.",
@@ -5416,7 +5504,7 @@
       ]
     },
     "MetadataCacheConfig": {
-      "description": "What `prometheus_in`'s remote-write receiver remembers about metric types across requests (`metadata_cache:`), so a Prometheus 1.0 sender's writes decode as typed families.\n\n1.0 carries a family's type, `# HELP`, and `# UNIT` in `WriteRequest.metadata[]`, and Prometheus's own sender ships those in separate requests on their own schedule (by default once a minute) rather than with the samples they describe. A receiver that remembers nothing sees, for nearly every request, flat series with no type anywhere: every family decodes as `unknown`, and `http_request_duration_seconds_bucket`/`_sum`/`_count` arrive as three unrelated series instead of one histogram. Nothing is lost (samples and labels are exact, and a relay back out to remote-write is still a fixed point), but the kinds are flatter than the producer's.\n\nSo the receiver keeps a table of family name to (type, help, unit), fed by every declaration any request carries that names a type (1.0's `metadata[]` and 2.0's inline metadata alike, so a mixed fleet fills one table; an `UNKNOWN`/`UNSPECIFIED` entry declares nothing and is not learned) and consulted for a family whose own request declared nothing. The request always wins: a sender that retypes a family retypes it immediately. 2.0 senders need none of this, and neither does a 1.0 sender that attaches metadata to its own writes.\n\nIt is one table per component, shared by every sender that can reach the listener. That lets a 2.0 sender's declarations type a 1.0 sender's series, and it equally means a peer that declares a great many families evicts other peers' entries, leaving well-behaved senders untyped until their next metadata write. The receiver authenticates no one, so do not point it at untrusted senders. `max_families: 0` turns the table off along with the typing.",
+      "description": "What `prometheus_in`'s remote-write receiver remembers about metric types across requests (`metadata_cache:`), so a Prometheus 1.0 sender's writes decode as typed families.\n\n1.0 carries a family's type, `# HELP`, and `# UNIT` in `WriteRequest.metadata[]`, and Prometheus's own sender ships those in separate requests on their own schedule (by default once a minute) rather than with the samples they describe. A receiver that remembers nothing sees, for nearly every request, flat series with no type anywhere: every family decodes as `unknown`, and `http_request_duration_seconds_bucket`/`_sum`/`_count` arrive as three unrelated series instead of one histogram. Nothing is lost (samples and labels are exact, and a relay back out to remote-write is still a fixed point), but the kinds are flatter than the producer's.\n\nSo the receiver keeps a table of family name to (type, help, unit), fed by every declaration any request carries that names a type (1.0's `metadata[]` and 2.0's inline metadata alike, so a mixed fleet fills one table; an `UNKNOWN`/`UNSPECIFIED` entry declares nothing and is not learned) and consulted for a family whose own request declared nothing. The request always wins: a sender that retypes a family retypes it immediately. 2.0 senders need none of this, and neither does a 1.0 sender that attaches metadata to its own writes.\n\nIt is one table per component, shared by every sender that can reach the listener. That lets a 2.0 sender's declarations type a 1.0 sender's series, and it equally means a peer that declares a great many families evicts other peers' entries, leaving well-behaved senders untyped until their next metadata write. `bind_auth` limits who can write, not what an accepted sender declares, so every sender that holds a credential shares the table. `max_families: 0` turns the table off along with the typing.",
       "type": "object",
       "properties": {
         "max_families": {
