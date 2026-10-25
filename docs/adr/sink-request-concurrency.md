@@ -227,11 +227,13 @@ them.
   reordering. It needs every encoder to take several batches with distinct resources and
   contexts, doesn't help a listener already assembling batches at the destination's size cap,
   and is orthogonal: an operator can raise the listener's batch bounds today.
-- **A default above 1 on the sinks where reordering is harmless.** Rejected. A default is one
-  value for every sink, and the safe rows share a field with unsafe ones: `otlp_out` sends logs,
-  traces, and metrics through one `concurrency:`, so a default above 1 would reorder its metrics
-  into a Prometheus-backed receiver. Only the operator knows whether their series repeat a point
-  across batches, so the default stays 1.
+- **A default above 1 on the sinks where reordering is harmless.** Rejected. `datadog_trace_out`
+  and `splunk_hec_out` could default higher with no reordering a destination reads as wrong, and
+  `otlp_out` can't, since one `concurrency:` covers its logs, traces, and metrics. The default is
+  1 on every sink anyway, so an operator raising it reads the tolerance table for that sink once
+  instead of learning a different default per kind. The gain above 1 is throughput alone, and the
+  opt-in is one line. On the other sinks, only the operator knows whether their series repeat a
+  point across batches.
 - **Refusing `concurrency > 1` on remote write in validation.** Declined. VictoriaMetrics, the
   main remote-write target here, accepts out-of-order samples, and a Prometheus or Mimir with its
   window open does too. The field's doc carries the warning; `logit validate` doesn't know the

@@ -54,8 +54,8 @@ Non-goals:
   `script/schema`. `crates/logit-cli/src/pipeline.rs` passes each through `with_concurrency`.
   Every shipped config naming `window:` on a `logit_out` moves (`examples/`, `fixtures/`,
   `tools/soak/scenarios/`, `demo/`), and `script/validate` confirms it.
-- **Telemetry.** `send.duration` per batch on a sink using the slot helper, one per windowed
-  round on `logit_out`; `logit.output.in_flight` on `logit_out` is unchanged.
+- **Telemetry.** `send.duration` keeps one sample per windowed round, what `logit_out` reports;
+  `logit.output.in_flight` on `logit_out` is unchanged.
   [`docs/design/internal-telemetry.md`](../design/internal-telemetry.md)
   and [`docs/design/pipeline-graph.md`](../design/pipeline-graph.md)'s rule table and
   "Cancellation points" row.
@@ -69,7 +69,8 @@ Non-goals:
   reads the sink's `concurrency`; `submit` encodes on the loop task and spawns; `await_ack`
   awaits the front slot and applies its outcome (transport counters, throttled diagnostics,
   `finish`) on the loop task; drop aborts every task. `BatchAccounting` moves from the sink to
-  the slot, with `observe_batch` arming the slot.
+  the slot, with `observe_batch` arming the slot. The helper times each slot's request and
+  records one `send.duration` sample per batch.
 - **The two single-request sinks first**: `influxdb_out` and `prometheus_out`'s remote-write
   sender, each a `send` that becomes one slot's task. Their tests cover: N requests in flight
   against a canned receiver that answers out of order; a `500` on one slot resent alone while
@@ -101,8 +102,9 @@ Non-goals:
 - `reqwest`'s `http2` feature in `Cargo.toml`, `cargo deny` clean, and tests that the default
   TLS config offers `h2` (`the_default_tls_config_offers_h2` in
   `crates/logit-outputs/src/http.rs`) and that an h2-capable fixture TLS listener sees one
-  connection carrying several slots, where a plaintext listener sees several
-  (`slots_share_one_connection_to_an_h2_server` in `crates/logit-outputs/src/splunk.rs`).
+  connection carrying several slots (`slots_share_one_connection_to_an_h2_server` in
+  `crates/logit-outputs/src/splunk.rs`), where a plaintext listener sees several
+  (`slots_open_a_connection_each_over_plaintext`, in the same file).
 - The ADR's decision 4 trade-offs in `docs/deploying.md`'s sink section.
 
 ### W5: soak, findings, and the known-gaps closing
