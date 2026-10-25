@@ -158,7 +158,8 @@
 //! | `429` (Mimir's `err-mimir-tenant-max-ingestion-rate`) | `Ambiguous` | "They MAY retry on HTTP 429 responses" | [1.0 spec][rw1], Mimir's [`distributor/errors.go`][mimir-errors] |
 //! | any `5xx` | `Ambiguous` | "MUST retry write requests on HTTP 5xx responses"; may have been partly applied | [1.0 spec][rw1] |
 //! | connect failure | `Clean` | the destination provably never saw it | -- |
-//! | any other transport error, timeout included | `Ambiguous` | the request may have been applied | -- |
+//! | a dial `connect_timeout:` ended (the DNS lookup, TCP dial, and TLS handshake together) | `Clean` | the destination provably never saw it | `http::tests::a_stalled_handshake_ends_at_the_connect_timeout_as_connect_error`, `http::tests::a_dial_to_a_full_accept_queue_ends_at_the_connect_timeout_as_connect_error` |
+//! | a request timeout after the connection opened, or a stalled dial `timeout:` ended first because `connect_timeout:` is at or above it; any other transport error | `Ambiguous` | the request may have been applied | -- |
 //!
 //! Every non-2xx answer's status and first 256 bytes of body are in the error and in a throttled
 //! `remote_write_rejected` diagnostic, so a retried `503` reports once per attempt; Prometheus's

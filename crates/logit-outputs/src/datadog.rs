@@ -288,7 +288,8 @@
 //! | any `5xx`, `501` included | `Ambiguous` | "request should be retried after some time"; may have been applied | [send logs][logs-api] |
 //! | any other `3xx` or `4xx` | `Rejected` | about this request; redirects are off ([`crate::http::build_client`]) | [Agent retry guide][agent-retry] |
 //! | connect failure | `Clean` | nothing of this request left the process; a retry skips the requests already accepted | -- |
-//! | any other transport error, timeout included | `Ambiguous` | the request may have been applied | -- |
+//! | a dial `connect_timeout:` ended (the DNS lookup, TCP dial, and TLS handshake together) | `Clean` | nothing of this request left the process; a retry skips the requests already accepted | `http::tests::a_stalled_handshake_ends_at_the_connect_timeout_as_connect_error`, `http::tests::a_dial_to_a_full_accept_queue_ends_at_the_connect_timeout_as_connect_error` |
+//! | a request timeout after the connection opened, or a stalled dial `timeout:` ended first because `connect_timeout:` is at or above it; any other transport error | `Ambiguous` | the request may have been applied | -- |
 //!
 //! A refusal holds for every batch: the routes share one org-wide key, so a `401` or `403` refuses
 //! them all, and a `404` names a route the configured base will refuse next time too. So a route

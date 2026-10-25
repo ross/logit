@@ -334,9 +334,16 @@ impl Endpoint {
             .send()
             .await
             .map_err(|err| {
+                // reqwest's connect timeout also sets `is_timeout`, so the dial is checked first.
+                let connect_timed_out = err.is_connect() && err.is_timeout();
                 let timed_out = err.is_timeout();
                 let err = anyhow::Error::new(err.without_url());
-                if timed_out {
+                if connect_timed_out {
+                    err.context(format!(
+                        "token endpoint {shown} didn't connect within {:?}",
+                        crate::http::DEFAULT_CONNECT_TIMEOUT
+                    ))
+                } else if timed_out {
                     err.context(format!(
                         "token endpoint {shown} timed out after {:?}",
                         self.timeout

@@ -121,7 +121,8 @@
 //! | gRPC `UNAUTHENTICATED`, `PERMISSION_DENIED`, `UNIMPLEMENTED`, `NOT_FOUND` | `Rejected` | not retryable in the table; and they name one signal's request (above) | [OTLP/gRPC failures][grpc-failures] |
 //! | gRPC `INVALID_ARGUMENT`, `UNKNOWN`, `ALREADY_EXISTS`, `FAILED_PRECONDITION`, and any code the table doesn't list | `Rejected` | not retryable in the table; an unlisted code is never retried | [OTLP/gRPC failures][grpc-failures] |
 //! | connect refused, DNS failure, TLS handshake failure | `Clean` | no request left the process | [all other responses][other] |
-//! | timeout, a reset after the request left, a gRPC response with no `grpc-status` | `Ambiguous` | "If the server disconnects without returning a response, the client SHOULD retry" | [all other responses][other] |
+//! | a dial `connect_timeout:` ended (the DNS lookup, TCP dial, and TLS handshake together), on either transport | `Clean` | no request left the process | `http::tests::a_stalled_handshake_ends_at_the_connect_timeout_as_connect_error`, `http::tests::a_dial_to_a_full_accept_queue_ends_at_the_connect_timeout_as_connect_error` (HTTP); `a_grpc_stalled_handshake_ends_at_the_connect_timeout_as_connect_error`, `a_grpc_dial_to_a_full_accept_queue_ends_at_the_connect_timeout_as_connect_error` (gRPC) |
+//! | a request timeout after the connection opened, or a stalled dial the fixed 10 s request timeout ended first because `connect_timeout:` is at or above it, a reset after the request left, a gRPC response with no `grpc-status` | `Ambiguous` | "If the server disconnects without returning a response, the client SHOULD retry" | [all other responses][other] |
 //!
 //! The batch's class is the failed signal's own, whatever was accepted before it: a retry resends
 //! no accepted signal, so a `Clean` or `Refused` answer after an accepted one doesn't become

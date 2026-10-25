@@ -1,8 +1,9 @@
 # A destination slower than the sink's 2 s `timeout`: the first fault delays VictoriaMetrics's
 # responses by 3 s, so it applies each write and the sink never sees the acknowledgment; the
-# second throttles the SUT's egress so a request can't finish in 2 s. Either way the attempt is an
-# `Ambiguous` transport error, and the sink resends. Under the first, each new dial waits on a
-# SYN-ACK delayed past the sink's 1 s `connect_timeout`, a `Clean` connect error it retries. Under `temporality: cumulative` the resend
+# second throttles the SUT's egress so a request can't finish in 2 s. Either way a request on an
+# open connection times out, an `Ambiguous` transport error, and the sink resends. Under the
+# first, a new dial waits on a SYN-ACK delayed past the sink's 1 s `connect_timeout` instead,
+# and ends as a `Clean` connect error the sink retries. Under `temporality: cumulative` the resend
 # overwrites the same totals. The schema is docs/plans/soak-harness.md's "The scenario schema".
 
 name = "slow-destination"

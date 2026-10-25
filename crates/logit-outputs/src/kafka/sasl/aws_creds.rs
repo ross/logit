@@ -522,9 +522,16 @@ impl Chain {
         what: &str,
     ) -> anyhow::Result<(reqwest::StatusCode, Vec<u8>)> {
         let transport = |err: reqwest::Error| {
+            // reqwest's connect timeout also sets `is_timeout`, so the dial is checked first.
+            let connect_timed_out = err.is_connect() && err.is_timeout();
             let timed_out = err.is_timeout();
             let err = anyhow::Error::new(err.without_url());
-            if timed_out {
+            if connect_timed_out {
+                err.context(format!(
+                    "{what} didn't connect within {:?}",
+                    crate::http::DEFAULT_CONNECT_TIMEOUT
+                ))
+            } else if timed_out {
                 err.context(format!("{what} timed out after {:?}", self.timeout))
             } else {
                 err.context(format!("asking {what}"))

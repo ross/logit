@@ -176,7 +176,8 @@
 //! | any `5xx`, `501` included | `Ambiguous` | may have been applied; the Agent's own trace writer retries a `5xx` | the Agent's [`sender.go`][agent-sender] |
 //! | any other `1xx`, `3xx`, or `4xx` | `Rejected` | about this request | [`crate::http::classify_status`] |
 //! | connect failure (refused, no such socket file) | `Clean` | nothing of this request left the process; a retry skips the requests already accepted | -- |
-//! | any other transport error, timeout included | `Ambiguous` | the request may have been applied | -- |
+//! | a dial `connect_timeout:` ended (the DNS lookup, TCP dial, and TLS handshake together), over TCP or the Unix socket | `Clean` | nothing of this request left the process; a retry skips the requests already accepted | `http::tests::a_stalled_handshake_ends_at_the_connect_timeout_as_connect_error`, `http::tests::a_dial_to_a_full_accept_queue_ends_at_the_connect_timeout_as_connect_error` (TCP); the Unix connector shares [`crate::http::ConnectTimeout`] with `otlp_out`'s gRPC client |
+//! | a request timeout after the connection opened, or a stalled dial `timeout:` ended first because `connect_timeout:` is at or above it; any other transport error | `Ambiguous` | the request may have been applied | -- |
 //!
 //! A refused route is refused for every batch: a `404` or `415` answers the sink's `version:`. So
 //! a route answered `Refused` after the other route was accepted stays `Refused` and holds the

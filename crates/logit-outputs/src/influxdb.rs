@@ -121,7 +121,8 @@
 //! | any other status | [`crate::http::classify_status`]'s class | undocumented on this route | -- |
 //! | any `3xx` | `Rejected` | redirects are off: a moved endpoint is a config change | [`crate::http::build_client`] |
 //! | connect failure, DNS failure | `Clean` | nothing left the process | [`crate::http::classify_reqwest_error`] |
-//! | timeout, any other transport error | `Ambiguous` | the write may have reached the server | [`crate::http::classify_reqwest_error`] |
+//! | a dial `connect_timeout:` ended (the DNS lookup, TCP dial, and TLS handshake together) | `Clean` | nothing left the process | [`crate::http::classify_reqwest_error`]; `http::tests::a_stalled_handshake_ends_at_the_connect_timeout_as_connect_error`, `http::tests::a_dial_to_a_full_accept_queue_ends_at_the_connect_timeout_as_connect_error` |
+//! | a request timeout after the connection opened, or a stalled dial the fixed 10 s request timeout ended first because `connect_timeout:` is at or above it; any other transport error | `Ambiguous` | the write may have reached the server | [`crate::http::classify_reqwest_error`] |
 //!
 //! `Retry-After` is ignored: `write_loop`'s backoff applies.
 

@@ -85,7 +85,9 @@
 //! | any other `3xx` or `4xx` | `Rejected`, with a throttled `request_rejected` diagnostic | about this request; redirects are off | [`crate::http::classify_status`] |
 //! | connect failure, before any `/event` request of this `send` was accepted | `Clean` | nothing left the process | -- |
 //! | connect failure after one was (a 2xx, or a per-object answer whose objects ahead count as delivered) | `Ambiguous` | Splunk holds part of the batch | -- |
-//! | any other transport error, timeout included | `Ambiguous` | the request may have been indexed | -- |
+//! | a dial `connect_timeout:` ended (the DNS lookup, TCP dial, and TLS handshake together), before any `/event` request of this `send` was accepted | `Clean` | nothing left the process | `http::tests::a_stalled_handshake_ends_at_the_connect_timeout_as_connect_error`, `http::tests::a_dial_to_a_full_accept_queue_ends_at_the_connect_timeout_as_connect_error` |
+//! | a dial `connect_timeout:` ended (the DNS lookup, TCP dial, and TLS handshake together), after one was | `Ambiguous` | Splunk holds part of the batch | as the connect-failure row above |
+//! | a request timeout after the connection opened, or a stalled dial `timeout:` ended first because `connect_timeout:` is at or above it; any other transport error | `Ambiguous` | the request may have been indexed | -- |
 //!
 //! [hec-codes]: https://help.splunk.com/en/splunk-enterprise/get-data-in/collect-http-event-data/troubleshoot-http-event-collector
 //!
