@@ -135,7 +135,7 @@ observable through `logit_pipeline::test_util`, never a sleep.
 | W1 | `conc/w1` | `conc/w1: per-slot HeadOnly faults, the concurrency field, and the logit_out rename` | M | W0 | open (#870) |
 | W2 | `conc/w2` | `conc/w2: the HTTP slot helper, influxdb_out, remote write, and the buffer_full cause` | L | W1 | open (#872) |
 | W3 | `conc/w3` | `conc/w3: otlp_out, datadog_out, datadog_trace_out, and splunk_hec_out on the slot helper` | L | W2 | open (#873) |
-| W4 | `conc/w4` | `conc/w4: HTTP/2 through reqwest` | S | W3 | — |
+| W4 | `conc/w4` | `conc/w4: HTTP/2 through reqwest` | S | W3 | open (#874) |
 | W5 | `conc/w5` | `conc/w5: soak scenarios for request concurrency and the known-gaps closing` | M | W4 | — |
 
 ## Settled questions
