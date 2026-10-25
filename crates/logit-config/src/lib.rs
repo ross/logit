@@ -2754,6 +2754,24 @@ pub enum ComponentKind {
         /// instead.
         #[serde(default = "default_max_retained_series")]
         max_retained_series: usize,
+        /// A hard cap on how many series this component holds at once, across every resource:
+        /// the series filling the current window plus the ones retained from earlier windows; a
+        /// memory guard, not a tuning knob. Defaults to `100000`, and must be at least `1`.
+        /// Retained series count against this cap, so a `max_retained_series` above it changes
+        /// nothing. A metric for a series already held is always absorbed, so a full cap only
+        /// affects a new series. To make room for one, one retained series that hasn't received
+        /// data this window is evicted, the one that has gone the most flushes without data
+        /// first, counted as `logit.transform.series.evicted{reason="series_limit"}`. A series
+        /// that received data this window is never evicted to make room, unlike
+        /// `cumulative_to_delta`'s and `prometheus_out`'s `max_series`, which evict the least
+        /// recently updated series. With none to evict, the new series' metric is dropped and
+        /// counted as `logit.transform.metrics.dropped{reason="series_limit"}`. Admission is
+        /// first come, first served within a window, and a flush frees the slot of every series
+        /// it drains or evicts. A nonzero drop count means the attributes reaching this stage
+        /// have too many distinct values: bound them upstream with `keep` or `keep_values`, or
+        /// raise this.
+        #[serde(default = "default_aggregate_max_series")]
+        max_series: usize,
         /// Whether a raw samples series (statsd `ms`/`h`/`d`) absorbs into this window as a
         /// sketch (`sketch`, the default: error-bounded quantiles, no raw values retained) or
         /// keeps its raw observations for the whole window (`samples`), falling back to a sketch,
@@ -4858,6 +4876,11 @@ fn default_max_retained_series() -> usize {
     10_000
 }
 
+/// `aggregate`'s `max_series` default.
+fn default_aggregate_max_series() -> usize {
+    100_000
+}
+
 /// `aggregate`'s `max_samples_per_series` default, on the order of
 /// `logit_core::Samples::MAX_WEIGHT`.
 fn default_max_samples_per_series() -> usize {
@@ -6504,6 +6527,7 @@ mod tests {
                 temporality,
                 series_retention,
                 max_retained_series,
+                max_series,
                 distributions,
                 max_samples_per_series,
                 sets,
@@ -6514,6 +6538,7 @@ mod tests {
                 assert_eq!(temporality, AggregateTemporality::Delta);
                 assert_eq!(series_retention, 5);
                 assert_eq!(max_retained_series, 10_000);
+                assert_eq!(max_series, 100_000);
                 assert_eq!(distributions, Distributions::Sketch);
                 assert_eq!(max_samples_per_series, 1000);
                 assert_eq!(sets, Sets::Estimate);

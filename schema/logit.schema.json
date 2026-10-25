@@ -1577,6 +1577,13 @@
               "format": "uint",
               "minimum": 0.0
             },
+            "max_series": {
+              "description": "A hard cap on how many series this component holds at once, across every resource: the series filling the current window plus the ones retained from earlier windows; a memory guard, not a tuning knob. Defaults to `100000`, and must be at least `1`. Retained series count against this cap, so a `max_retained_series` above it changes nothing. A metric for a series already held is always absorbed, so a full cap only affects a new series. To make room for one, one retained series that hasn't received data this window is evicted, the one that has gone the most flushes without data first, counted as `logit.transform.series.evicted{reason=\"series_limit\"}`. A series that received data this window is never evicted to make room, unlike `cumulative_to_delta`'s and `prometheus_out`'s `max_series`, which evict the least recently updated series. With none to evict, the new series' metric is dropped and counted as `logit.transform.metrics.dropped{reason=\"series_limit\"}`. Admission is first come, first served within a window, and a flush frees the slot of every series it drains or evicts. A nonzero drop count means the attributes reaching this stage have too many distinct values: bound them upstream with `keep` or `keep_values`, or raise this.",
+              "default": 100000,
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0.0
+            },
             "max_set_members_per_series": {
               "description": "A hard cap on how many distinct members one series may retain in one window before `sets: members` falls back to an estimate; a memory guard, not a tuning knob. Defaults to `1000`, and must be at least `1`. Meaningless under `sets: estimate`.",
               "default": 1000,

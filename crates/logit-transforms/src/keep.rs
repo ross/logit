@@ -6,8 +6,9 @@
 //!
 //! **Place `keep` before `aggregate` in a pipeline.** `aggregate`'s `SeriesKey` includes all of
 //! `event.attributes`, so an unpruned high-cardinality attribute (client address, user agent, a
-//! full request path) that reaches `aggregate` explodes both series cardinality and per-window
-//! memory. `keep` ahead of it is what bounds the tag set `aggregate` keys on.
+//! full request path) that reaches `aggregate` explodes series cardinality until `aggregate`'s
+//! `max_series` cap refuses new series and drops their records. `keep` ahead of it is what bounds
+//! the tag set `aggregate` keys on, so the cap stays a memory guard rather than a source of loss.
 //!
 //! **`keep` drops `_logit.*` attributes like any unnamed key** unless `private: keep`, which
 //! retains the whole private namespace (`logit_core::attrs::is_private`) alongside `fields`. See

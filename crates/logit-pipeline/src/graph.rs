@@ -115,8 +115,9 @@
 //! 39. An `aggregate` bound that can hold nothing: under `temporality: cumulative`, a
 //!     `series_retention` or `max_retained_series` of `0` (nothing survives a flush, so each
 //!     window's increment would be labeled a running total); in either mode, `series_retention`
-//!     above `0` with `max_retained_series: 0` (every retained series evicted at every flush), and a
-//!     `max_samples_per_series` or `max_set_members_per_series` of `0` (every record falls back)
+//!     above `0` with `max_retained_series: 0` (every retained series evicted at every flush), a
+//!     `max_series` of `0` (every new series refused), and a `max_samples_per_series` or
+//!     `max_set_members_per_series` of `0` (every record falls back)
 //!     (`docs/adr/aggregation-window-semantics.md`).
 //! 40. A scrape-mode `prometheus_in` with a target that isn't an absolute `http(s)://` URL
 //!     (`is_absolute_http_url`), `timeout: 0s`, a `scrape_tls:` failing 24's checks or with no
@@ -2003,6 +2004,7 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
             temporality,
             series_retention,
             max_retained_series,
+            max_series,
             max_samples_per_series,
             max_set_members_per_series,
             ..
@@ -2023,6 +2025,12 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                     "component '{id}': series_retention: {series_retention} requires \
                      max_retained_series >= 1 -- with a cap of 0 every retained series is \
                      evicted at every flush; set series_retention: 0 to disable retention"
+                );
+            }
+            if *max_series == 0 {
+                anyhow::bail!(
+                    "component '{id}': max_series must be at least 1 -- at 0 every metric that \
+                     would open a series is dropped"
                 );
             }
             if *max_samples_per_series == 0 {
@@ -5494,6 +5502,7 @@ mod tests {
                     temporality: logit_config::AggregateTemporality::default(),
                     series_retention: 5,
                     max_retained_series: 10_000,
+                    max_series: 100_000,
                     distributions: logit_config::Distributions::default(),
                     max_samples_per_series: 1000,
                     sets: logit_config::Sets::default(),
@@ -10391,6 +10400,7 @@ mod tests {
                     temporality: logit_config::AggregateTemporality::default(),
                     series_retention: 5,
                     max_retained_series: 10_000,
+                    max_series: 100_000,
                     distributions: logit_config::Distributions::default(),
                     max_samples_per_series: 1000,
                     sets: logit_config::Sets::default(),
@@ -10568,6 +10578,7 @@ mod tests {
                     temporality: logit_config::AggregateTemporality::default(),
                     series_retention: 5,
                     max_retained_series: 10_000,
+                    max_series: 100_000,
                     distributions: logit_config::Distributions::default(),
                     max_samples_per_series: 1000,
                     sets: logit_config::Sets::default(),
@@ -12440,13 +12451,14 @@ mod tests {
         series_retention: u32,
         max_retained_series: usize,
     ) -> ComponentKind {
-        aggregate_with_caps(temporality, series_retention, max_retained_series, 1000, 1000)
+        aggregate_with_caps(temporality, series_retention, max_retained_series, 100_000, 1000, 1000)
     }
 
     fn aggregate_with_caps(
         temporality: logit_config::AggregateTemporality,
         series_retention: u32,
         max_retained_series: usize,
+        max_series: usize,
         max_samples_per_series: usize,
         max_set_members_per_series: usize,
     ) -> ComponentKind {
@@ -12455,6 +12467,7 @@ mod tests {
             temporality,
             series_retention,
             max_retained_series,
+            max_series,
             distributions: logit_config::Distributions::default(),
             max_samples_per_series,
             sets: logit_config::Sets::default(),
@@ -12531,12 +12544,54 @@ mod tests {
             {
                 let err = expect_err(cfg(vec![
                     ("in", vec![], listener()),
-                    ("agg", vec!["in"], aggregate_with_caps(temporality, 5, 10, samples, members)),
+                    (
+                        "agg",
+                        vec!["in"],
+                        aggregate_with_caps(temporality, 5, 10, 100_000, samples, members),
+                    ),
                     ("out", vec!["agg"], sink()),
                 ]));
                 assert!(err.contains("'agg'") && err.contains(field), "got: {err}");
             }
         }
+    }
+
+    /// Rule 39: a `max_series` of 0 refuses every series, in either mode.
+    #[test]
+    fn an_aggregate_with_a_zero_series_cap_is_rejected() {
+        for temporality in [
+            logit_config::AggregateTemporality::Delta,
+            logit_config::AggregateTemporality::Cumulative,
+        ] {
+            let err = expect_err(cfg(vec![
+                ("in", vec![], listener()),
+                ("agg", vec!["in"], aggregate_with_caps(temporality, 5, 10, 0, 1000, 1000)),
+                ("out", vec!["agg"], sink()),
+            ]));
+            assert!(err.contains("'agg'") && err.contains("max_series must be"), "got: {err}");
+        }
+    }
+
+    /// A `max_retained_series` above `max_series` is legal: the smaller cap bounds both.
+    #[test]
+    fn an_aggregate_retaining_more_than_its_series_cap_resolves() {
+        resolve(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "agg",
+                vec!["in"],
+                aggregate_with_caps(
+                    logit_config::AggregateTemporality::Cumulative,
+                    5,
+                    10_000,
+                    10,
+                    1000,
+                    1000,
+                ),
+            ),
+            ("out", vec!["agg"], sink()),
+        ]))
+        .expect("a retained-series cap above max_series changes nothing, and isn't an error");
     }
 
     /// The config defaults resolve, and so does every bound at its smallest accepted value.
@@ -12556,7 +12611,7 @@ mod tests {
         ] {
             resolve(cfg(vec![
                 ("in", vec![], listener()),
-                ("agg", vec!["in"], aggregate_with_caps(temporality, 1, 1, 1, 1)),
+                ("agg", vec!["in"], aggregate_with_caps(temporality, 1, 1, 1, 1, 1)),
                 ("out", vec!["agg"], sink()),
             ]))
             .expect("every bound at 1 holds something");

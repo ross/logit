@@ -22,8 +22,23 @@
 //! (`docs/adr/metric-flags.md`, "The flags"); a decoder sets it beside its protocol carriers (a
 //! DogStatsD `|T` line, a Prometheus sample with its own timestamp, a Datadog APM stats group), and
 //! this stage reads the flag, never a carrier ([`Flags`]). An event carrying a carrier and no flag
-//! is windowed. Every record is counted once, as `logit.transform.metrics.absorbed` or
-//! `logit.transform.metrics.passed_through{reason}` (see [`Tally`]).
+//! is windowed. Every record is counted once, as `logit.transform.metrics.absorbed`,
+//! `logit.transform.metrics.passed_through{reason}`, or `logit.transform.metrics.dropped{reason}`
+//! (see [`Tally`]).
+//!
+//! # The series cap
+//!
+//! `max_series` bounds every series the stage holds at once, active and retained, across all
+//! groups ([`SeriesBudget`]). It's checked only where a record would open a series: a record for a
+//! held series is always absorbed, and a pass-through record never reaches the check. At a full
+//! cap, one retained series not updated this window makes room for each new one, in the flush
+//! cap's order (most idle, then newest), counted
+//! `logit.transform.series.evicted{reason="series_limit"}`. A series updated this window is never
+//! evicted to make room: with none left, the record is dropped and counted
+//! `logit.transform.metrics.dropped{reason="series_limit"}`. A refused record creates no group. An
+//! emptied group stays until the flush, so a window holds at most `max_series` groups plus one per
+//! eviction, at most twice `max_series`. Admission is first come, first served within a window;
+//! `flush` frees the slot of every series it drains or evicts.
 //!
 //! # Temporality: what a flushed `Sum`/`Histogram` means
 //!
@@ -192,12 +207,13 @@ impl ContributingContexts {
 pub struct Aggregator {
     interval: Duration,
     groups: Vec<ResourceGroup>,
-    /// The last `group_for` answer, keyed by the `Arc`s it was asked with. It holds the incoming
-    /// `Arc`s, not the group's stored ones: `otlp_in`, `logit_in`, a Lua resource write, and `set`
-    /// hand every batch a fresh `Arc<Resource>` equal by value to an earlier one, so only the
-    /// incoming pointer repeats, across the events of one batch. Holding the clones keeps those
-    /// addresses from being reused by a different resource while memoized. Cleared at `flush`,
-    /// whose `retain` shifts or removes indices, which also releases a finished batch's `Arc`.
+    /// The last group `find_group` found or `open_group` opened, keyed by the `Arc`s it was asked
+    /// with. It holds the incoming `Arc`s, not the group's stored ones: `otlp_in`, `logit_in`, a
+    /// Lua resource write, and `set` hand every batch a fresh `Arc<Resource>` equal by value to an
+    /// earlier one, so only the incoming pointer repeats, across the events of one batch. Holding
+    /// the clones keeps those addresses from being reused by a different resource while memoized.
+    /// Cleared at `flush`, whose `retain` shifts or removes indices, which also releases a
+    /// finished batch's `Arc`.
     last_group: Option<GroupMemo>,
     diag: Diagnostics,
     telemetry: Telemetry,
@@ -214,6 +230,12 @@ pub struct Aggregator {
     /// at once, against a stream of never-repeating series names. Evicts the most idle first, then
     /// the newest among equally idle series. Meaningless while `series_retention` is `0`.
     max_retained_series: usize,
+    /// How many series are held and how many may be; see this module's "The series cap".
+    budget: SeriesBudget,
+    /// The series a full `max_series` evicts this window, last to evict first, with each one's
+    /// group index; `Aggregator::evict_one`'s. Empty until a window's first eviction, and cleared
+    /// at `flush`.
+    eviction_order: Vec<(u32, u64, usize, SeriesKey)>,
     /// Whether a flushed `Sum`/`Histogram` is this window's increment (the default) or a running
     /// total that survives the flush.
     temporality: AggregateTemporality,
@@ -290,7 +312,7 @@ impl Closed {
     }
 }
 
-/// `Aggregator::last_group`'s entry: the `Arc`s `group_for` was asked with, and the index of the
+/// `Aggregator::last_group`'s entry: the `Arc`s `find_group` was asked with, and the index of the
 /// group it answered.
 struct GroupMemo {
     resource: Arc<Resource>,
@@ -309,13 +331,13 @@ impl GroupMemo {
     }
 }
 
-/// Keyed by `(resource, scope)` value, not `Arc` identity (as `group_for` does for resource): two
+/// Keyed by `(resource, scope)` value, not `Arc` identity (as `find_group` does for resource): two
 /// batches that each build an equal `Scope` describe the same instrumentation scope and aggregate
 /// together.
 struct ResourceGroup {
     resource: Arc<Resource>,
     scope: Option<Arc<Scope>>,
-    /// [`group_hash`] of `resource` and `scope`, which `group_for` compares before the full field
+    /// [`group_hash`] of `resource` and `scope`, which `find_group` compares before the full field
     /// compare. It can't go stale: the group holds both `Arc`s, and the values behind them are
     /// immutable.
     hash: u64,
@@ -484,9 +506,11 @@ impl Opener<'_> {
     }
 }
 
-/// Per-`process`-call totals behind `logit.transform.metrics.absorbed` and
-/// `logit.transform.metrics.passed_through{reason}`: every record `process` receives lands in one
-/// field. Reported once per non-zero field after the loop, because `Telemetry::count` locks and
+/// Per-`process`-call totals behind `logit.transform.metrics.absorbed`,
+/// `logit.transform.metrics.passed_through{reason}`, and `logit.transform.metrics.dropped{reason}`:
+/// every record `process` receives lands in one field, except `widened` and
+/// `series_limit_evicted`, which count folds and series.
+/// Reported once per non-zero field after the loop, because `Telemetry::count` locks and
 /// hashes on every call.
 #[derive(Default)]
 struct Tally {
@@ -499,6 +523,10 @@ struct Tally {
     kind_conflict: u32,
     histogram_bounds_mismatch: u32,
     non_finite: u32,
+    /// Records dropped because opening their series would pass `max_series`.
+    series_limit: u32,
+    /// Series evicted to make room under `max_series`; not a record count.
+    series_limit_evicted: u32,
     /// Folds whose `MetricValue::checked_add` changed the type; not a pass-through.
     widened: u32,
 }
@@ -535,12 +563,67 @@ impl Tally {
                 );
             }
         }
+        if self.series_limit > 0 {
+            telemetry.count(
+                "logit.transform.metrics.dropped",
+                f64::from(self.series_limit),
+                &[("reason", "series_limit")],
+            );
+        }
+        if self.series_limit_evicted > 0 {
+            telemetry.count(
+                "logit.transform.series.evicted",
+                f64::from(self.series_limit_evicted),
+                &[("reason", "series_limit")],
+            );
+        }
         if self.widened > 0 {
             telemetry.count(
                 "logit.transform.metrics.normalized",
                 f64::from(self.widened),
                 &[("reason", "widened")],
             );
+        }
+    }
+}
+
+/// The `max_series` bound: how many series the stage holds, active and retained across every
+/// group, against how many it may. Kept as counts, so a full cap with nothing to evict answers
+/// without a scan of the groups: `admit`, `process`, and `Aggregator::evict_one` move them, and
+/// `flush` resets both from the series it keeps.
+struct SeriesBudget {
+    held: usize,
+    /// The held series not updated this window: retained across the last flush, and the
+    /// candidates a full cap evicts.
+    idle: usize,
+    max: usize,
+}
+
+/// [`SeriesBudget::admit`]'s answer for a record that would open a series.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Admission {
+    /// Open the series; its slot is already counted.
+    Open,
+    /// Evict one series not updated this window (`Aggregator::evict_one`), then open the series.
+    /// Its slot is already counted, one over `max` until the eviction.
+    EvictIdle,
+    /// Drop the record: the cap is full and every held series was updated this window.
+    Refused,
+}
+
+impl SeriesBudget {
+    /// Decides whether a record may open a new series, and counts the slot when it may. The one
+    /// place a new series is admitted: `process` asks only where a record would open a series,
+    /// so a held series never pays for it.
+    fn admit(&mut self) -> Admission {
+        if self.held < self.max {
+            self.held += 1;
+            Admission::Open
+        } else if self.idle > 0 {
+            self.held += 1;
+            Admission::EvictIdle
+        } else {
+            Admission::Refused
         }
     }
 }
@@ -638,6 +721,8 @@ impl Aggregator {
             current_batch_context: TraceContext::default(),
             series_retention: 0,
             max_retained_series: 0,
+            budget: SeriesBudget { held: 0, idle: 0, max: 100_000 },
+            eviction_order: Vec::new(),
             temporality: AggregateTemporality::default(),
             distributions: Distributions::default(),
             max_samples_per_series: 1000,
@@ -660,6 +745,14 @@ impl Aggregator {
     pub fn with_series_retention(mut self, retention: u32, max_retained: usize) -> Self {
         self.series_retention = retention;
         self.max_retained_series = max_retained;
+        self
+    }
+
+    /// Caps how many series the stage holds at once (this module's "The series cap"). Defaults to
+    /// `100_000`, matching `logit_config`'s default. Graph validation rejects `0`; this builder
+    /// doesn't check it.
+    pub fn with_max_series(mut self, max_series: usize) -> Self {
+        self.budget.max = max_series;
         self
     }
 
@@ -736,9 +829,10 @@ impl Aggregator {
     }
 
     /// Absorbs every mergeable metric off `event` into window state and leaves the rest on it:
-    /// pass-through kinds, a metric whose kind conflicts with its series, and any log or span.
-    /// Returns `false` only when nothing remains on the event. An event with no metrics never
-    /// touches window state.
+    /// pass-through kinds, a metric whose kind conflicts with its series, and any log or span. A
+    /// metric that would open a series past `max_series` is dropped (this module's "The series
+    /// cap"). Returns `false` only when nothing remains on the event. An event with no metrics
+    /// never touches window state.
     ///
     /// An event flagged `_logit.metrics.closed` is forwarded whole, and `_logit.metrics.fields`
     /// decides whether its `_logit.field.*` keys leave the series key (this module's doc). Each
@@ -747,8 +841,9 @@ impl Aggregator {
     ///
     /// Grouped by `(resource, scope)` value, not `Arc` identity: two inputs that each build an
     /// empty `Resource` describe the same origin and aggregate together. The group is resolved
-    /// once per call, on the first absorbable record, so a multi-record event pays one lookup.
-    /// `group_for` answers from `last_group` when the incoming `Arc`s are the ones it last saw,
+    /// once per call, on the first absorbable record, so a multi-record event pays one lookup
+    /// (again after a record `max_series` refused before its group existed).
+    /// `find_group` answers from `last_group` when the incoming `Arc`s are the ones it last saw,
     /// which holds for every event of a batch after the first. `statsd_in` holds one
     /// `Arc<Resource>` per listener, so its memo hits across batches too, until a flush clears it.
     /// `otlp_in` builds one `Arc` per `ResourceMetrics`, `logit_in` one per frame, and a Lua
@@ -794,8 +889,8 @@ impl Aggregator {
         let metrics = std::mem::take(&mut event.metrics);
         let mut tally = Tally::default();
         // An index, not a `&mut ResourceGroup`, so the loop's other `self` uses don't conflict.
-        // Only `group_for` pushes to `groups` and nothing in the loop removes one, so it stays
-        // valid for the whole call.
+        // Only `open_group` pushes to `groups` and nothing in the loop removes one (an eviction
+        // leaves an emptied group for `flush`), so it stays valid for the whole call.
         let mut group_index: Option<usize> = None;
         // Found on the event's first keyed record, and only under `_logit.metrics.fields`: an
         // unflagged event's attributes are its series identity whole.
@@ -859,16 +954,45 @@ impl Aggregator {
                 key.attributes.remove_sym(field);
             }
             let open_seq = self.next_open_seq;
-            let gi = match group_index {
-                Some(gi) => gi,
-                None => *group_index.insert(self.group_for(resource, &scope)),
+            // A record whose group doesn't exist opens a series by definition, so it's admitted
+            // before the group is: a refusal creates and memoizes nothing.
+            let (gi, admitted) = match group_index.or_else(|| self.find_group(resource, &scope)) {
+                Some(gi) => (gi, false),
+                None => {
+                    if !self.admit_new_series(&mut tally) {
+                        tally.series_limit += 1;
+                        self.refuse(record.name);
+                        continue;
+                    }
+                    (self.open_group(resource, &scope), true)
+                }
             };
+            group_index = Some(gi);
             let entry = self.groups[gi].series.entry(key);
             // Whether this metric opened a new series. Not derivable afterward: a real
             // `Gauge(0.0)` at `at: i64::MIN` looks identical to an unseeded delta's result. The
             // `Sum` and `GaugeDelta` arms seed the series' value from it, and `GaugeDelta`'s
             // unseeded count reads it.
             let was_vacant = matches!(entry, std::collections::hash_map::Entry::Vacant(_));
+            // `admit` is asked in place, beside the entry: only an eviction gives the entry up,
+            // so only an eviction pays a second hash.
+            let entry = match (was_vacant && !admitted).then(|| self.budget.admit()) {
+                None | Some(Admission::Open) => entry,
+                Some(Admission::Refused) => {
+                    drop(entry);
+                    tally.series_limit += 1;
+                    self.refuse(record.name);
+                    continue;
+                }
+                Some(Admission::EvictIdle) => {
+                    let std::collections::hash_map::Entry::Vacant(vacant) = entry else {
+                        unreachable!("admit is asked only of a vacant entry")
+                    };
+                    let key = vacant.into_key();
+                    self.evict_one(&mut tally);
+                    self.groups[gi].series.entry(key)
+                }
+            };
             let state = entry.or_insert_with(|| SeriesState {
                 accumulator: opener.open(),
                 contexts: ContributingContexts::default(),
@@ -1087,6 +1211,9 @@ impl Aggregator {
                 tally.absorbed += 1;
                 // Only on a real merge: a kind-conflicted metric isn't a contributor.
                 state.contexts.observe(ctx);
+                if !was_vacant && !state.updated_this_window {
+                    self.budget.idle -= 1; // no longer an eviction candidate this window
+                }
                 state.updated_this_window = true;
                 if was_vacant && matches!(record.kind, MetricKind::GaugeDelta(_)) {
                     // A delta that opened a new series resolved against 0.0 (statsd's rule for an
@@ -1204,33 +1331,120 @@ impl Aggregator {
         !(event.metrics.is_empty() && event.log.is_none() && event.span.is_none())
     }
 
-    /// The index in `groups` of the `(resource, scope)` group, opening it if absent.
-    fn group_for(&mut self, resource: &Arc<Resource>, scope: &Option<Arc<Scope>>) -> usize {
+    /// The index in `groups` of the `(resource, scope)` group, memoized, or `None` when no group
+    /// holds it. Opens nothing: a record with no group opens a series, which `max_series` may
+    /// refuse ([`Aggregator::open_group`] opens one).
+    fn find_group(
+        &mut self,
+        resource: &Arc<Resource>,
+        scope: &Option<Arc<Scope>>,
+    ) -> Option<usize> {
         if let Some(memo) = self.last_group.as_ref().filter(|m| m.matches(resource, scope)) {
-            return memo.index;
+            return Some(memo.index);
         }
         // The hash only rules a group out; a match still takes the full compare, so a collision
         // can't merge two groups.
         let hash = group_hash(resource, scope);
-        let index = match self.groups.iter().position(|g| {
+        let index = self.groups.iter().position(|g| {
             g.hash == hash
                 && resource_key_eq(&g.resource, resource)
                 && scope_key_eq(&g.scope, scope)
-        }) {
-            Some(i) => i,
-            None => {
-                self.groups.push(ResourceGroup {
-                    resource: resource.clone(),
-                    scope: scope.clone(),
-                    hash,
-                    series: HashMap::new(),
-                });
-                self.groups.len() - 1
-            }
-        };
+        })?;
+        self.last_group =
+            Some(GroupMemo { resource: resource.clone(), scope: scope.clone(), index });
+        Some(index)
+    }
+
+    /// Opens the `(resource, scope)` group, which `find_group` didn't find, and memoizes it.
+    fn open_group(&mut self, resource: &Arc<Resource>, scope: &Option<Arc<Scope>>) -> usize {
+        self.groups.push(ResourceGroup {
+            resource: resource.clone(),
+            scope: scope.clone(),
+            hash: group_hash(resource, scope),
+            series: HashMap::new(),
+        });
+        let index = self.groups.len() - 1;
         self.last_group =
             Some(GroupMemo { resource: resource.clone(), scope: scope.clone(), index });
         index
+    }
+
+    /// [`SeriesBudget::admit`] for a record whose group doesn't exist yet, making room when it
+    /// says to. Returns whether the series may open.
+    fn admit_new_series(&mut self, tally: &mut Tally) -> bool {
+        match self.budget.admit() {
+            Admission::Open => true,
+            Admission::EvictIdle => {
+                self.evict_one(tally);
+                true
+            }
+            Admission::Refused => false,
+        }
+    }
+
+    /// Makes room under a full `max_series` by evicting one held series not updated this window,
+    /// in the flush cap's order: the most idle first, then the newest. The order is built on the
+    /// window's first eviction, the one scan and sort this path pays, and each later eviction
+    /// pops it, skipping a series that absorbed since. A group this empties stays until `flush`
+    /// removes it, so `group_index`, the memo, and the order's group indices stay valid; the
+    /// groups a window holds are then at most `max_series` plus its evictions.
+    fn evict_one(&mut self, tally: &mut Tally) {
+        loop {
+            if self.eviction_order.is_empty() {
+                for (gi, group) in self.groups.iter().enumerate() {
+                    for (key, state) in &group.series {
+                        if !state.updated_this_window {
+                            self.eviction_order.push((
+                                state.idle_windows,
+                                state.open_seq,
+                                gi,
+                                key.clone(),
+                            ));
+                        }
+                    }
+                }
+                // Ascending, so `pop` takes the most idle, then the newest. `open_seq` is unique.
+                self.eviction_order.sort_unstable_by_key(|(idle, seq, _, _)| (*idle, *seq));
+                if self.eviction_order.is_empty() {
+                    debug_assert!(false, "budget.idle > 0 with no series to evict");
+                    return;
+                }
+            }
+            let Some((_, _, gi, key)) = self.eviction_order.pop() else { continue };
+            let series = &mut self.groups[gi].series;
+            if series.get(&key).is_none_or(|state| state.updated_this_window) {
+                continue; // absorbed since the order was built
+            }
+            series.remove(&key);
+            self.budget.held -= 1;
+            self.budget.idle -= 1;
+            tally.series_limit_evicted += 1;
+            // Warned like the flush cap's eviction, for the same two consequences.
+            self.diag.warn_throttled(
+                "series_limit_evicted",
+                format_args!(
+                    "max_series ({}) is full; evicted a series not updated this window to open \
+                     a new one -- a later gauge delta against an evicted series will resolve \
+                     against 0.0, and an evicted cumulative series restarts from zero",
+                    self.budget.max
+                ),
+            );
+            return;
+        }
+    }
+
+    /// The diagnostic for a record `max_series` refused; the caller counts it.
+    fn refuse(&mut self, name: Symbol) {
+        self.diag.warn_throttled(
+            "series_limit",
+            format_args!(
+                "max_series ({}) is full and no series held is idle; dropping metric '{}', which \
+                 would open a new series -- bound attribute cardinality upstream with keep \
+                 or keep_values, or raise max_series",
+                self.budget.max,
+                logit_core::interner::resolve(name)
+            ),
+        );
     }
 
     /// Emits one event per series updated this window, stamped with `now` and paired with its
@@ -1370,7 +1584,12 @@ impl Aggregator {
         }
         let evicted_cardinality = evicted_active + evicted_cardinality_idle;
 
-        // Survivors go back to their group; a group left empty is dropped.
+        // Survivors go back to their group; a group left empty is dropped. Every other series left
+        // the stage above, so the survivors are what the budget holds, none updated yet in the
+        // window this flush opens. The eviction order's group indices end here.
+        self.budget.held = survivors.len();
+        self.budget.idle = survivors.len();
+        self.eviction_order.clear();
         for (gi, key, state) in survivors {
             self.groups[gi].series.insert(key, state);
         }
@@ -1563,6 +1782,7 @@ impl StringFieldKeys {
 ///
 /// `AttrMap`/`Value` implement neither `Eq` nor `Hash`, so this compares and hashes `f64` by
 /// `to_bits()`: a `NaN` attribute then equals itself, instead of opening a new series per event.
+#[derive(Clone)]
 struct SeriesKey {
     name: Symbol,
     unit: Option<Symbol>,
@@ -1596,7 +1816,7 @@ impl Hash for SeriesKey {
     }
 }
 
-/// Field-wise equality for a `group_for` resource key, comparing `Value::F64` bitwise, the rule
+/// Field-wise equality for a `find_group` resource key, comparing `Value::F64` bitwise, the rule
 /// `SeriesKey` and [`scope_key_eq`] follow. `Resource`'s derived `PartialEq` judges a `NaN`
 /// attribute unequal to itself, even through one `Arc`, which would open a new `ResourceGroup` per
 /// metric carrying it; and it judges `-0.0` equal to `0.0`, which series identity keeps apart.
@@ -1609,7 +1829,7 @@ pub(crate) fn resource_key_eq(a: &Arc<Resource>, b: &Arc<Resource>) -> bool {
             && attr_map_key_eq(&a.attributes, &b.attributes))
 }
 
-/// Field-wise equality for a `group_for` scope key, comparing `Value::F64` bitwise. `Scope`'s
+/// Field-wise equality for a `find_group` scope key, comparing `Value::F64` bitwise. `Scope`'s
 /// derived `PartialEq` judges a `NaN` attribute unequal to itself, which would open a new
 /// `ResourceGroup` per event carrying it (the failure `SeriesKey` avoids the same way).
 ///
@@ -4081,7 +4301,7 @@ mod tests {
         assert_eq!(flush_events(&mut agg, 100).len(), 3);
     }
 
-    // -- `group_for`'s memo --------------------------------------------------------------------
+    // -- `find_group`'s memo --------------------------------------------------------------------
 
     /// A flush that removes the memoized group shifts the groups after it down; the memo must not
     /// send the next absorb under that group's `Arc` to whichever group took its index.
@@ -4723,6 +4943,16 @@ mod tests {
             let mut agg = Aggregator::new(Duration::from_secs(10)).with_sets(Sets::Members, 1);
             feed(&mut agg, &resource, metric_event("u", members(&[b"a", b"b"]), 0));
 
+            // series_limit, then series_limit_evicted.
+            let mut agg = Aggregator::new(Duration::from_secs(10))
+                .with_series_retention(5, 100)
+                .with_max_series(1);
+            feed(&mut agg, &resource, metric_event("a", MetricKind::gauge(1.0), 0));
+            feed(&mut agg, &resource, metric_event("b", MetricKind::gauge(1.0), 0));
+            agg.flush(100);
+            agg.flush(200);
+            feed(&mut agg, &resource, metric_event("b", MetricKind::gauge(1.0), 250));
+
             // histogram_bounds_mismatch, and series_retention_full from the flush.
             let mut agg = cumulative_agg().with_series_retention(5, 1);
             let h = |bounds: &[(f64, u64)]| delta_histogram_event("h", bounds, None, None, None, 0);
@@ -4733,7 +4963,7 @@ mod tests {
         });
 
         let messages = captured.0.lock().unwrap_or_else(|p| p.into_inner()).clone();
-        assert_eq!(messages.len(), 10, "one report per diagnostic key: {messages:#?}");
+        assert_eq!(messages.len(), 12, "one report per diagnostic key: {messages:#?}");
         for message in &messages {
             assert!(!message.contains("  "), "a run of spaces in {message:?}");
         }
@@ -5351,6 +5581,333 @@ mod tests {
         let widened =
             counter_with_tag(&events, "logit.transform.metrics.normalized", "reason", "widened");
         assert_eq!(widened, Some(1.0));
+    }
+
+    // -- `max_series` ---------------------------------------------------------------------------
+
+    fn series_limit_dropped(events: &[Event]) -> Option<f64> {
+        counter_with_tag(events, "logit.transform.metrics.dropped", "reason", "series_limit")
+    }
+
+    /// `series.evicted{reason="series_limit"}`: series a full `max_series` evicted to make room.
+    fn evicted_for_series_limit(events: &[Event]) -> Option<f64> {
+        counter_with_tag(events, "logit.transform.series.evicted", "reason", "series_limit")
+    }
+
+    /// The names of every series held, sorted.
+    fn held_names(agg: &Aggregator) -> Vec<String> {
+        let mut names: Vec<String> = agg
+            .groups
+            .iter()
+            .flat_map(|g| g.series.keys())
+            .map(|k| logit_core::interner::resolve(k.name).to_string())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// The budget's counts against a scan of every group.
+    fn assert_budget_matches_the_groups(agg: &Aggregator) {
+        let states: Vec<&SeriesState> = agg.groups.iter().flat_map(|g| g.series.values()).collect();
+        let idle = states.iter().filter(|s| !s.updated_this_window).count();
+        assert_eq!(agg.budget.held, states.len(), "held");
+        assert_eq!(agg.budget.idle, idle, "idle");
+    }
+
+    /// A gauge `aggregate` with retention and the given `max_series`, holding `old1` and `old2`
+    /// idle for two flushes and `young` for one, opened in that order.
+    fn three_retained_gauges(max_series: usize) -> (Aggregator, Arc<logit_core::Registry>) {
+        let (mut agg, registry) = with_registry(
+            Aggregator::new(Duration::from_secs(10))
+                .with_series_retention(5, 100)
+                .with_max_series(max_series),
+        );
+        let resource = default_resource();
+        feed(&mut agg, &resource, metric_event("old1", MetricKind::gauge(1.0), 0));
+        feed(&mut agg, &resource, metric_event("old2", MetricKind::gauge(1.0), 0));
+        agg.flush(100);
+        feed(&mut agg, &resource, metric_event("young", MetricKind::gauge(1.0), 150));
+        agg.flush(200); // old1 and old2 idle for 1, young for 0
+        agg.flush(300); // old1 and old2 idle for 2, young for 1
+        registry.drain(0);
+        (agg, registry)
+    }
+
+    /// Past `max_series`, a record that would open a series is dropped, counted, and diagnosed,
+    /// and the series already held flush as usual.
+    #[test]
+    fn past_max_series_a_new_series_is_dropped_and_counted() {
+        let (mut agg, registry) =
+            with_registry(Aggregator::new(Duration::from_secs(10)).with_max_series(2));
+        let resource = default_resource();
+        for name in ["a", "b", "c", "d"] {
+            let forwarded =
+                feed(&mut agg, &resource, metric_event(name, MetricKind::counter(1.0), 0));
+            assert!(forwarded.is_none());
+        }
+        let flushed = flush_events(&mut agg, 100);
+        let mut names: Vec<_> = flushed[0]
+            .1
+            .iter()
+            .map(|e| logit_core::interner::resolve(e.metrics[0].name).to_string())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["a", "b"], "the first two series opened");
+        let events = registry.drain(0);
+        assert_eq!(series_limit_dropped(&events), Some(2.0));
+        assert_eq!(diagnostic_count(&events, "series_limit"), Some(2.0));
+        assert_eq!(absorbed(&events), 2.0);
+    }
+
+    /// A full cap refuses only a new series: a held one keeps absorbing.
+    #[test]
+    fn at_max_series_a_held_series_keeps_absorbing() {
+        let (mut agg, registry) =
+            with_registry(Aggregator::new(Duration::from_secs(10)).with_max_series(1));
+        let resource = default_resource();
+        feed(&mut agg, &resource, metric_event("a", MetricKind::counter(1.0), 0));
+        feed(&mut agg, &resource, metric_event("b", MetricKind::counter(1.0), 0));
+        feed(&mut agg, &resource, metric_event("a", MetricKind::counter(2.0), 0));
+        let flushed = flush_events(&mut agg, 100);
+        assert_eq!(flushed[0].1.len(), 1);
+        assert_eq!(sum_of(&flushed[0].1[0]).value, MetricValue::F64(3.0));
+        let events = registry.drain(0);
+        assert_eq!(series_limit_dropped(&events), Some(1.0));
+        assert_eq!(absorbed(&events), 2.0);
+    }
+
+    /// A series retained across a flush holds its slot. At a full cap, a retained series not
+    /// updated this window makes room for a new one, the newest first among equally idle, and
+    /// one that absorbed this window doesn't.
+    #[test]
+    fn retained_series_count_toward_max_series_and_make_room() {
+        let (mut agg, registry) = with_registry(
+            Aggregator::new(Duration::from_secs(10))
+                .with_series_retention(5, 100)
+                .with_max_series(2),
+        );
+        let resource = default_resource();
+        feed(&mut agg, &resource, metric_event("g1", MetricKind::gauge(1.0), 0));
+        feed(&mut agg, &resource, metric_event("g2", MetricKind::gauge(1.0), 0));
+        agg.flush(100);
+        registry.drain(0);
+        assert_budget_matches_the_groups(&agg);
+
+        // Both are idle so far this window, at `idle_windows == 0`.
+        feed(&mut agg, &resource, metric_event("g1", MetricKind::gauge(2.0), 150));
+        feed(&mut agg, &resource, metric_event("g3", MetricKind::gauge(1.0), 150));
+        feed(&mut agg, &resource, metric_event("g4", MetricKind::gauge(1.0), 150));
+        let events = registry.drain(0);
+        assert_eq!(evicted_for_series_limit(&events), Some(1.0), "g2 makes room for g3");
+        assert_eq!(series_limit_dropped(&events), Some(1.0), "g4 finds both slots active");
+        assert_eq!(absorbed(&events), 2.0);
+        assert_eq!(held_names(&agg), ["g1", "g3"]);
+        assert_budget_matches_the_groups(&agg);
+    }
+
+    /// At a full cap, each new series evicts one held series, in the flush cap's order: the
+    /// most idle first, then the newest. Once every held series was updated this window, the
+    /// next new one is dropped.
+    #[test]
+    fn at_max_series_each_new_series_evicts_one_in_the_flush_caps_order() {
+        let (mut agg, registry) = three_retained_gauges(3);
+        let resource = default_resource();
+        assert_budget_matches_the_groups(&agg);
+
+        let mut evicted_after = Vec::new();
+        for (i, name) in ["new1", "new2", "new3", "new4"].into_iter().enumerate() {
+            feed(&mut agg, &resource, metric_event(name, MetricKind::gauge(1.0), 350 + i as i64));
+            evicted_after.push(held_names(&agg));
+            assert_budget_matches_the_groups(&agg);
+        }
+        assert_eq!(evicted_after[0], ["new1", "old1", "young"], "old2 is the newer of idle 2");
+        assert_eq!(evicted_after[1], ["new1", "new2", "young"]);
+        assert_eq!(evicted_after[2], ["new1", "new2", "new3"]);
+        assert_eq!(evicted_after[3], ["new1", "new2", "new3"], "nothing left to evict");
+
+        let events = registry.drain(0);
+        assert_eq!(evicted_for_series_limit(&events), Some(3.0));
+        assert_eq!(diagnostic_count(&events, "series_limit_evicted"), Some(3.0));
+        assert_eq!(series_limit_dropped(&events), Some(1.0));
+        assert_eq!(
+            counter_with_tag(&events, "logit.transform.series.evicted", "reason", "cardinality"),
+            None
+        );
+    }
+
+    /// A retained series that absorbs this window is never evicted to make room, even after the
+    /// window's eviction order listed it.
+    #[test]
+    fn a_retained_series_absorbing_this_window_is_never_evicted() {
+        let (mut agg, registry) = three_retained_gauges(3);
+        let resource = default_resource();
+        // Builds the order (old2, old1, young) and evicts old2.
+        feed(&mut agg, &resource, metric_event("new1", MetricKind::gauge(1.0), 350));
+        feed(&mut agg, &resource, metric_event("old1", MetricKind::gauge(2.0), 350));
+        assert_budget_matches_the_groups(&agg);
+        feed(&mut agg, &resource, metric_event("new2", MetricKind::gauge(1.0), 350));
+        assert_eq!(held_names(&agg), ["new1", "new2", "old1"], "old1 skipped, young evicted");
+        feed(&mut agg, &resource, metric_event("new3", MetricKind::gauge(1.0), 350));
+        assert_eq!(held_names(&agg), ["new1", "new2", "old1"]);
+        assert_budget_matches_the_groups(&agg);
+
+        let events = registry.drain(0);
+        assert_eq!(evicted_for_series_limit(&events), Some(2.0));
+        assert_eq!(series_limit_dropped(&events), Some(1.0), "new3: every series held is active");
+        let flushed = flush_events(&mut agg, 400);
+        let old1 = flushed[0]
+            .1
+            .iter()
+            .find(|e| logit_core::interner::resolve(e.metrics[0].name) == "old1")
+            .expect("old1 survived");
+        assert_eq!(kind_of(old1), &MetricKind::gauge(2.0));
+    }
+
+    /// An admission eviction happens between flushes, so the flush's series identity
+    /// (`series_at_flush_start == emitted_and_removed + kept + evicted{idle} +
+    /// evicted{cardinality}`) still holds with it counted under its own reason.
+    #[test]
+    fn the_flush_series_identity_holds_after_admission_evictions() {
+        let (mut agg, registry) = three_retained_gauges(3);
+        let resource = default_resource();
+        feed(&mut agg, &resource, metric_event("new1", MetricKind::gauge(1.0), 350));
+        feed(&mut agg, &resource, metric_event("new2", MetricKind::gauge(1.0), 350));
+        registry.drain(0);
+
+        agg.flush(400);
+        let events = registry.drain(0);
+        let at_start = gauge_value(&events, "logit.transform.series.active").unwrap()
+            + gauge_value(&events, "logit.transform.series.retained").unwrap();
+        assert_eq!(at_start, 3.0, "the evicted two aren't held at the flush");
+        // Gauges are retained, so nothing is emitted and removed.
+        let kept = agg.groups.iter().map(|g| g.series.len()).sum::<usize>() as f64;
+        let idle = evicted_count(&events, "idle").unwrap_or(0.0);
+        let cardinality = evicted_count(&events, "cardinality").unwrap_or(0.0);
+        assert_eq!(at_start, kept + idle + cardinality);
+        assert_eq!(evicted_for_series_limit(&events), None, "counted when it happened, not here");
+        assert_budget_matches_the_groups(&agg);
+    }
+
+    /// A series updated this window, retained or new, is never evicted to make room.
+    #[test]
+    fn an_idle_series_updated_this_window_is_not_evicted_to_make_room() {
+        let (mut agg, registry) = with_registry(
+            Aggregator::new(Duration::from_secs(10))
+                .with_series_retention(5, 100)
+                .with_max_series(1),
+        );
+        let resource = default_resource();
+        feed(&mut agg, &resource, metric_event("g", MetricKind::gauge(1.0), 0));
+        agg.flush(100);
+        agg.flush(200); // idle for 1
+        registry.drain(0);
+        feed(&mut agg, &resource, metric_event("g", MetricKind::gauge(2.0), 250));
+        assert_budget_matches_the_groups(&agg);
+        feed(&mut agg, &resource, metric_event("h", MetricKind::gauge(1.0), 250));
+        let events = registry.drain(0);
+        assert_eq!(series_limit_dropped(&events), Some(1.0));
+        assert_eq!(evicted_for_series_limit(&events), None);
+        assert_budget_matches_the_groups(&agg);
+    }
+
+    /// A flush frees the slot of every series it drains, and of a retained series it evicts
+    /// for idleness.
+    #[test]
+    fn a_flush_frees_the_slots_of_the_series_it_removes() {
+        let (mut agg, registry) =
+            with_registry(Aggregator::new(Duration::from_secs(10)).with_max_series(1));
+        let resource = default_resource();
+        feed(&mut agg, &resource, metric_event("a", MetricKind::counter(1.0), 0));
+        agg.flush(100);
+        feed(&mut agg, &resource, metric_event("b", MetricKind::counter(1.0), 150));
+        let flushed = flush_events(&mut agg, 200);
+        assert_eq!(logit_core::interner::resolve(flushed[0].1[0].metrics[0].name), "b");
+
+        let (mut agg, registry_retained) = with_registry(
+            Aggregator::new(Duration::from_secs(10))
+                .with_series_retention(1, 100)
+                .with_max_series(1),
+        );
+        feed(&mut agg, &resource, metric_event("g1", MetricKind::gauge(1.0), 0));
+        agg.flush(100); // retained
+        agg.flush(200); // idle past `series_retention: 1`, evicted
+        feed(&mut agg, &resource, metric_event("g2", MetricKind::gauge(1.0), 250));
+        let flushed = flush_events(&mut agg, 300);
+        assert_eq!(logit_core::interner::resolve(flushed[0].1[0].metrics[0].name), "g2");
+
+        for events in [registry.drain(0), registry_retained.drain(0)] {
+            assert_eq!(series_limit_dropped(&events), None);
+        }
+    }
+
+    /// A refused record opens no group: the cap bounds groups as well as series, and a held
+    /// group keeps absorbing after the refusal.
+    #[test]
+    fn a_refused_record_leaves_no_empty_group() {
+        let (mut agg, registry) =
+            with_registry(Aggregator::new(Duration::from_secs(10)).with_max_series(1));
+        let held = default_resource();
+        let other = Arc::new(Resource { dropped_attributes_count: 1, ..Resource::default() });
+        feed(&mut agg, &held, metric_event("a", MetricKind::counter(1.0), 0));
+        let mut two = metric_event("b", MetricKind::counter(1.0), 0);
+        two.metrics.push(MetricRecord::new(intern("c"), MetricKind::counter(1.0)));
+        assert!(feed(&mut agg, &other, two).is_none(), "both records dropped");
+        assert_eq!(agg.groups.len(), 1, "no group left behind for the refused resource");
+        assert!(agg.last_group.as_ref().is_none_or(|m| Arc::ptr_eq(&m.resource, &held)));
+        assert_budget_matches_the_groups(&agg);
+        feed(&mut agg, &held, metric_event("a", MetricKind::counter(1.0), 0));
+        assert_eq!(agg.flush(100).len(), 1);
+        let events = registry.drain(0);
+        assert_eq!(series_limit_dropped(&events), Some(2.0));
+        assert_eq!(absorbed(&events), 2.0);
+    }
+
+    /// At a full cap, every record still lands in one counter: absorbed, passed through, or
+    /// dropped, and a record that passes through is never refused. An event left with only its
+    /// pass-through records and its log is still forwarded.
+    #[test]
+    fn at_max_series_every_record_is_absorbed_passed_through_or_dropped_once() {
+        let (mut agg, registry) =
+            with_registry(Aggregator::new(Duration::from_secs(10)).with_max_series(1));
+        let resource = default_resource();
+        feed(&mut agg, &resource, metric_event("held", MetricKind::counter(1.0), 0));
+
+        let mut event = metric_event("new", MetricKind::counter(1.0), 0);
+        event.metrics.extend([
+            MetricRecord::new(intern("held"), MetricKind::counter(1.0)),
+            MetricRecord::new(intern("n"), MetricKind::counter(f64::NAN)),
+            MetricRecord::new(
+                intern("cum"),
+                MetricKind::Sum(Sum {
+                    value: MetricValue::F64(1.0),
+                    temporality: Temporality::Cumulative,
+                    monotonic: true,
+                }),
+            ),
+            MetricRecord::new(intern("other"), MetricKind::gauge(1.0)),
+        ]);
+        event.log = Some(logit_core::LogRecord {
+            message: Value::from("line"),
+            severity: None,
+            body_format: logit_core::BodyFormat::Raw,
+            trace: None,
+            event_name: None,
+            observed_timestamp: 0,
+            dropped_attributes_count: 0,
+        });
+        let metrics_in = 1.0 + event.metrics.len() as f64;
+        let forwarded = feed(&mut agg, &resource, event).expect("the log and pass-throughs stay");
+        assert_eq!(forwarded.metrics.len(), 2, "only the two pass-through records stay");
+        assert!(forwarded.log.is_some());
+
+        let events = registry.drain(0);
+        assert_eq!(absorbed(&events), 2.0);
+        assert_eq!(passed_through(&events, "non_finite"), 1.0);
+        assert_eq!(passed_through(&events, "no_merge_rule"), 1.0);
+        assert_eq!(series_limit_dropped(&events), Some(2.0));
+        let dropped = counter_total(&events, "logit.transform.metrics.dropped");
+        let passed = counter_total(&events, "logit.transform.metrics.passed_through");
+        assert_eq!(metrics_in, absorbed(&events) + passed + dropped);
     }
 
     /// An unseeded delta opens the series with its own type, as a `Sum`'s first record does.
