@@ -165,6 +165,12 @@ Entry format and the other areas: [the known-gaps index](README.md).
     [ADR `aggregation-window-semantics`](../adr/aggregation-window-semantics.md)'s "The groups
     bound" section has the mechanism and the measurements.
   - **To close,** if that shape shows up in a profile: a map from hash to group index.
+- **A folded record costs more than an absorbed one.** Each record of a series past
+  `max_series_per_metric` misses its own key, then builds the overflow key and looks that up, on
+  every arrival. On a laptop, with half of the `aggregate` scenario's series folding, that's about
+  0.17 µs per folded record (0.297 against 0.211 CPU µs/event). The cost lasts only while a name
+  is over its limit.
+  - **To close,** if it shows up in a profile: memoize the overflow key per name and group.
 - **`aggregate` keeps `U64(200)`, `I64(200)`, and `F64(200.0)` as three series, and text sinks
   render all three as `200`.** Series identity is the typed value. A non-negative `json` integer
   arrives `U64`, an OTLP or Lua integer `I64`, and a `scale`d one `F64`.

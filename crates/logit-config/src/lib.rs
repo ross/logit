@@ -2762,7 +2762,7 @@ pub enum ComponentKind {
         /// nothing. A metric for a series already held is always absorbed, so a full cap only
         /// affects a new series. To make room for one, one retained series that hasn't received
         /// data this window is evicted, the one that has gone the most flushes without data
-        /// first, counted as `logit.transform.series.evicted{reason="series_limit"}`. A series
+        /// first and a `max_series_per_metric` overflow series last, counted as `logit.transform.series.evicted{reason="series_limit"}`. A series
         /// that received data this window is never evicted to make room, unlike
         /// `cumulative_to_delta`'s and `prometheus_out`'s `max_series`, which evict the least
         /// recently updated series. With none to evict, the new series' metric is dropped and
@@ -2786,8 +2786,8 @@ pub enum ComponentKind {
         /// marker. Under `temporality: cumulative` an overflow total stays monotonic while it's
         /// retained, and a series admitted later starts from zero. A folded metric counts in
         /// `logit.transform.metrics.overflowed`, never as dropped, and
-        /// `logit.transform.metrics.overflowing` reports how many metric names are over the
-        /// limit; a throttled warning names the worst one and the attribute key with the most
+        /// `logit.transform.metrics.overflowing` reports how many metric names folded a metric
+        /// since the last flush; a throttled warning names the worst one and the attribute key with the most
         /// distinct values among its series. A `keep` placed after this component removes
         /// `logit.overflow` unless it lists it.
         #[serde(default, skip_serializing_if = "Option::is_none")]

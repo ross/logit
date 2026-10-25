@@ -2609,7 +2609,8 @@ they're named for series in general, not for gauges.
 
 **`max_series` caps every series `aggregate` holds at once,** the active ones and the retained ones
 together (default `100,000`). At a full cap, each new series evicts one retained series that hasn't
-received data this window, the one that has gone the most flushes without data first, counted under
+received data this window, the one that has gone the most flushes without data first and a
+`max_series_per_metric` overflow series last, counted under
 `logit.transform.series.evicted{reason="series_limit"}`. A series that received data this window is
 never evicted to make room: with none left to evict, a record that would open a new series is
 dropped, counted under `logit.transform.metrics.dropped{reason="series_limit"}`. Admission is first
@@ -2665,7 +2666,8 @@ value, the mitigation is on the sending side: send an absolute value periodicall
   one sustained means more distinct attribute sets reach `aggregate` than `max_series` holds;
   bound them with `keep` or `keep_values`, or raise `max_series`.
 - `logit.transform.metrics.overflowed` and `logit.transform.metrics.overflowing` (gauge): records
-  folded into an overflow series, and how many metric names are over `max_series_per_metric`. A
+  folded into an overflow series, and how many metric names folded one this window. Each
+  process counts only its own folds, not records absorbed into an overflow series from upstream. A
   fold isn't loss, but it gives up attribute detail. The throttled `series_per_metric_overflow`
   warning names the worst metric and the attribute key with the most distinct values among its
   series, which is usually the one to bound with `keep` or `keep_values`.

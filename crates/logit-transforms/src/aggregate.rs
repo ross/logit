@@ -51,9 +51,10 @@
 //! and it's evicted last by both the flush cap and an admission eviction. A record whose kind
 //! conflicts with the overflow series passes through as `kind_conflict`. A folded record counts as
 //! `absorbed` and `logit.transform.metrics.overflowed`, never `*.dropped`; `flush` reports how
-//! many names hold an overflow series or folded a record as `logit.transform.metrics.overflowing`,
-//! and only the throttled `series_per_metric_overflow` diagnostic names a metric. With the limit
-//! off, no name is counted and nothing on the hot path changes.
+//! many names folded a record that window as `logit.transform.metrics.overflowing`, and only the
+//! throttled `series_per_metric_overflow` diagnostic names a metric. A record absorbed into an
+//! upstream overflow series isn't a fold here and counts toward neither. With the limit off, no
+//! name is counted and nothing on the hot path changes.
 //!
 //! # Temporality: what a flushed `Sum`/`Histogram` means
 //!
@@ -232,6 +233,9 @@ pub struct Aggregator {
     /// finished batch's `Arc`.
     last_group: Option<GroupMemo>,
     diag: Diagnostics,
+    /// How many times `report_overflow` built its report, for the test that pins the throttle.
+    #[cfg(test)]
+    overflow_reports_built: u32,
     telemetry: Telemetry,
     /// The most recent batch's `TraceContext`, per `observe_batch_context`. Not reset by `flush`:
     /// it belongs to no one window. Default until the first batch arrives.
@@ -626,9 +630,9 @@ struct SeriesBudget {
     max: usize,
     /// `max_series_per_metric`; `None` leaves `names` empty and untouched.
     per_name: Option<usize>,
-    /// The held series per metric name, under `per_name` only. A name enters when it's admitted,
-    /// never when it's refused, so the map holds at most `max` names plus that window's admission
-    /// evictions. `flush` rebuilds it from its survivors, keeping the allocation.
+    /// The held series per metric name, overflow series excluded, under `per_name` only. A name
+    /// enters when one of its series is admitted, never when it's refused, so the map holds at
+    /// most `max` names plus that window's admission evictions. `flush` rebuilds it from its survivors, keeping the allocation.
     names: HashMap<Symbol, NameCount>,
 }
 
@@ -637,19 +641,11 @@ struct SeriesBudget {
 struct NameCount {
     /// Its held series, overflow series excluded: what `max_series_per_metric` limits.
     series: usize,
-    /// Its held overflow series, one per group, carrier set, and host it folded under.
-    overflow: usize,
-    /// Records that reached the limit since the last flush, folded or not; the diagnostic's
-    /// ranking.
+    /// Records that reached the limit since the last flush, folded or not: what
+    /// `logit.transform.metrics.overflowing` counts names by, and the diagnostic's ranking. A
+    /// record absorbed into an overflow series that arrived from upstream never reaches the limit
+    /// here, so each process reports only its own folding.
     folded: u32,
-}
-
-impl NameCount {
-    /// Whether the name is over its limit: it holds an overflow series, or a record reached the
-    /// limit this window. Read by `logit.transform.metrics.overflowing` and the diagnostic.
-    fn overflowing(&self) -> bool {
-        self.overflow > 0 || self.folded > 0
-    }
 }
 
 /// [`SeriesBudget::admit`]'s answer for a record that would open a series.
@@ -690,13 +686,8 @@ impl SeriesBudget {
             }
         }
         let admission = self.admit_slot();
-        if admission != Admission::Refused {
-            let count = self.names.entry(key.name).or_default();
-            if is_overflow {
-                count.overflow += 1;
-            } else {
-                count.series += 1;
-            }
+        if admission != Admission::Refused && !is_overflow {
+            self.names.entry(key.name).or_default().series += 1;
         }
         admission
     }
@@ -718,10 +709,8 @@ impl SeriesBudget {
     fn release(&mut self, name: Symbol, is_overflow: bool) {
         self.held -= 1;
         self.idle -= 1;
-        if let Some(count) = self.names.get_mut(&name) {
-            if is_overflow {
-                count.overflow -= 1;
-            } else {
+        if !is_overflow {
+            if let Some(count) = self.names.get_mut(&name) {
                 count.series -= 1;
             }
         }
@@ -740,20 +729,14 @@ impl SeriesBudget {
             return;
         }
         self.names.clear();
-        for key in survivors {
-            let overflow = is_overflow(key);
-            let count = self.names.entry(key.name).or_default();
-            if overflow {
-                count.overflow += 1;
-            } else {
-                count.series += 1;
-            }
+        for key in survivors.filter(|key| !is_overflow(key)) {
+            self.names.entry(key.name).or_default().series += 1;
         }
     }
 
-    /// How many names are over the per-name limit ([`NameCount::overflowing`]).
+    /// How many names folded a record since the last flush ([`NameCount::folded`]).
     fn overflowing(&self) -> usize {
-        self.names.values().filter(|count| count.overflowing()).count()
+        self.names.values().filter(|count| count.folded > 0).count()
     }
 }
 
@@ -875,6 +858,8 @@ impl Aggregator {
             groups: Vec::new(),
             last_group: None,
             diag: Diagnostics::default(),
+            #[cfg(test)]
+            overflow_reports_built: 0,
             telemetry: Telemetry::default(),
             current_batch_context: TraceContext::default(),
             series_retention: 0,
@@ -1644,6 +1629,10 @@ impl Aggregator {
     fn report_overflow(&mut self) {
         const KEY: &str = "series_per_metric_overflow";
         let report = self.diag.would_report(KEY).then(|| {
+            #[cfg(test)]
+            {
+                self.overflow_reports_built += 1;
+            }
             OverflowReport::of(&self.budget, &self.groups, self.overflow.marker).to_string()
         });
         self.diag.warn_throttled(KEY, format_args!("{}", report.as_deref().unwrap_or_default()));
@@ -2069,7 +2058,7 @@ struct OverflowReport {
 
 impl OverflowReport {
     fn of(budget: &SeriesBudget, groups: &[ResourceGroup], marker: Symbol) -> Self {
-        let overflowing = budget.names.iter().filter(|(_, count)| count.overflowing());
+        let overflowing = budget.names.iter().filter(|(_, count)| count.folded > 0);
         // Ties go to the earlier-interned name, so the report is deterministic.
         let (name, folded) = overflowing
             .clone()
@@ -6365,21 +6354,17 @@ mod tests {
             .filter(move |e| logit_core::interner::resolve(e.metrics[0].name) == name)
     }
 
-    /// The budget's per-name counts against a scan of every group, overflow series apart.
+    /// The budget's per-name counts against a scan of every group, overflow series excluded.
     fn assert_names_match_the_groups(agg: &mut Aggregator) {
         assert_budget_matches_the_groups(agg);
-        let mut expected: HashMap<Symbol, (usize, usize)> = HashMap::new();
+        let mut expected: HashMap<Symbol, usize> = HashMap::new();
         for key in agg.groups.iter().flat_map(|g| g.series.keys()) {
-            let entry = expected.entry(key.name).or_default();
-            if agg.overflow.is(key, &mut agg.key_classes) {
-                entry.1 += 1;
-            } else {
-                entry.0 += 1;
+            if !agg.overflow.is(key, &mut agg.key_classes) {
+                *expected.entry(key.name).or_default() += 1;
             }
         }
         for (name, count) in &agg.budget.names {
-            let (series, overflow) = expected.remove(name).unwrap_or_default();
-            assert_eq!((count.series, count.overflow), (series, overflow), "{name:?}");
+            assert_eq!(count.series, expected.remove(name).unwrap_or_default(), "{name:?}");
         }
         assert!(expected.is_empty(), "held names the budget doesn't count: {expected:?}");
     }
@@ -6539,7 +6524,6 @@ mod tests {
         agg.flush(100);
         assert_names_match_the_groups(&mut agg);
         assert_eq!(agg.budget.names[&intern("g")].series, 1);
-        assert_eq!(agg.budget.names[&intern("g")].overflow, 1);
 
         // A new name at the full cap evicts /a, the ordinary series, though the idle overflow
         // series is newer, and frees g's slot.
@@ -6666,8 +6650,8 @@ mod tests {
         assert_eq!(overflowed(&events), 0.0);
     }
 
-    /// `overflowing` counts the names over the limit at the flush, before any series is touched:
-    /// a name that only reached its limit isn't over it.
+    /// `overflowing` counts the names that folded a record this window: a name that only reached
+    /// its limit didn't fold.
     #[test]
     fn overflowing_counts_the_names_over_the_limit() {
         let (mut agg, registry) = with_registry(
@@ -6686,6 +6670,73 @@ mod tests {
         agg.flush(200);
         let events = registry.drain(0);
         assert_eq!(gauge_value(&events, "logit.transform.metrics.overflowing"), Some(0.0));
+    }
+
+    /// A retained overflow series that absorbed nothing this window doesn't keep its name in
+    /// `overflowing`, and a record absorbed into an upstream overflow series isn't a fold here, so
+    /// it counts toward neither `overflowing` nor `overflowed`.
+    #[test]
+    fn overflowing_counts_only_this_windows_folds() {
+        let (mut agg, registry) = with_registry(
+            Aggregator::new(Duration::from_secs(10))
+                .with_series_retention(5, 100)
+                .with_max_series_per_metric(Some(1)),
+        );
+        let resource = default_resource();
+        let gauge = |path: &str| {
+            metric_event_with_tags("g", MetricKind::gauge(1.0), 150, &[("path", path)])
+        };
+        feed(&mut agg, &resource, gauge("/a"));
+        feed(&mut agg, &resource, gauge("/b"));
+        agg.flush(100);
+        let events = registry.drain(0);
+        assert_eq!(gauge_value(&events, "logit.transform.metrics.overflowing"), Some(1.0));
+        assert!(agg.groups.iter().flat_map(|g| g.series.keys()).any(|k| is_marked(&k.attributes)));
+
+        // The overflow series is retained but idle.
+        agg.flush(200);
+        let events = registry.drain(0);
+        assert_eq!(gauge_value(&events, "logit.transform.metrics.overflowing"), Some(0.0));
+
+        // Records for another name's upstream overflow series absorb without folding.
+        for value in [1.0, 2.0] {
+            let mut upstream = tagged_counter("req", value, &[]);
+            upstream.attributes.insert(OVERFLOW, true);
+            feed(&mut agg, &resource, upstream);
+        }
+        agg.flush(300);
+        let events = registry.drain(0);
+        assert_eq!(gauge_value(&events, "logit.transform.metrics.overflowing"), Some(0.0));
+        assert_eq!(overflowed(&events), 0.0);
+    }
+
+    /// The overflow report's scan runs only when the throttle will let the warning out: at the
+    /// first, second, and fourth fold, and never while the diagnostics are muted.
+    #[test]
+    fn the_overflow_report_is_built_only_when_it_will_be_reported() {
+        let five_folds = |agg: &mut Aggregator| {
+            let resource = default_resource();
+            for path in ["/a", "/b", "/c", "/d", "/e", "/f"] {
+                feed(agg, &resource, tagged_counter("req", 1.0, &[("path", path)]));
+            }
+        };
+        let (mut agg, _registry) = with_registry(
+            Aggregator::new(Duration::from_secs(10)).with_max_series_per_metric(Some(1)),
+        );
+        five_folds(&mut agg);
+        assert_eq!(agg.overflow_reports_built, 3, "folds 1, 2, and 4 of 5");
+
+        let registry = logit_core::Registry::new();
+        let telemetry = registry.telemetry_for("windowed", "aggregate", "transform");
+        let gate = logit_core::CountGate::new();
+        gate.set_muted(true);
+        let diag = Diagnostics::default().with_telemetry(telemetry.clone()).gated(&gate);
+        let mut agg = Aggregator::new(Duration::from_secs(10))
+            .with_max_series_per_metric(Some(1))
+            .with_diagnostics(diag)
+            .with_telemetry(telemetry);
+        five_folds(&mut agg);
+        assert_eq!(agg.overflow_reports_built, 0, "muted");
     }
 
     /// The diagnostic names the name with the most folds and the attribute key whose values

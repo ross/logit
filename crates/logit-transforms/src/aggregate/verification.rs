@@ -1416,14 +1416,8 @@ impl Model {
     /// [`ref_eviction_order`].
     fn flush(&mut self, now: i64) -> RefFlush {
         let config = self.config;
-        let overflowing = config.max_series_per_metric.map(|_| {
-            let mut names = std::mem::take(&mut self.folded_names);
-            names.extend(
-                self.series.iter().filter(|s| ref_is_overflow(&s.key)).map(|s| s.key.name.clone()),
-            );
-            names.len()
-        });
-        self.folded_names.clear();
+        let folded_names = std::mem::take(&mut self.folded_names);
+        let overflowing = config.max_series_per_metric.map(|_| folded_names.len());
         let groups = self.groups.len();
         let evicted_for_limit = std::mem::take(&mut self.evicted_for_limit);
         let cumulative = config.temporality == AggregateTemporality::Cumulative;
@@ -1809,23 +1803,18 @@ fn check_budget(agg: &mut Aggregator, model: &Model) -> Result<(), TestCaseError
     prop_assert!(agg.budget.held <= config.max_series);
     prop_assert!(agg.groups.len() <= 2 * config.max_series);
     prop_assert_eq!(agg.groups.len(), model.groups.len());
-    let mut expected: std::collections::BTreeMap<String, (usize, usize)> = Default::default();
+    let mut expected: std::collections::BTreeMap<String, usize> = Default::default();
     if config.max_series_per_metric.is_some() {
-        for series in &model.series {
-            let count = expected.entry(series.key.name.clone()).or_default();
-            if ref_is_overflow(&series.key) {
-                count.1 += 1;
-            } else {
-                count.0 += 1;
-            }
+        for series in model.series.iter().filter(|s| !ref_is_overflow(&s.key)) {
+            *expected.entry(series.key.name.clone()).or_default() += 1;
         }
     }
-    let actual: std::collections::BTreeMap<String, (usize, usize)> = agg
+    let actual: std::collections::BTreeMap<String, usize> = agg
         .budget
         .names
         .iter()
-        .filter(|(_, c)| c.series + c.overflow > 0)
-        .map(|(name, c)| (resolve(*name).to_string(), (c.series, c.overflow)))
+        .filter(|(_, c)| c.series > 0)
+        .map(|(name, c)| (resolve(*name).to_string(), c.series))
         .collect();
     prop_assert_eq!(actual, expected);
     Ok(())
