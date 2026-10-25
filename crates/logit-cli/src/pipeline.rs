@@ -6481,7 +6481,7 @@ mod tests {
                             ..Default::default()
                         }),
                         request_timeout: Duration::from_secs(10),
-                        window: 32,
+                        concurrency: 32,
                     },
                 },
             ),
