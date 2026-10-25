@@ -11,7 +11,7 @@ components:
   window:
     type: aggregate
     sources: [statsd]
-    # Four batches a second: over a 1 s round trip, up to four in flight.
+    # Four batches a second: over a 1 s round trip, four or more in flight; see scenario.toml.
     interval: 250ms
     temporality: cumulative
     series_retention: 14400         # an hour of windows: a fault must never evict a series
