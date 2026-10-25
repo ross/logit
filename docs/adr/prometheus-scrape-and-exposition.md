@@ -388,8 +388,8 @@ metric surface rather than a coarse lifecycle phase — so this ADR states the g
 than leaving it implicit: an example config for this pair binds `127.0.0.1`, not `0.0.0.0`, so a
 first-time reader gets a safe default to start from rather than an accidental network-wide
 exposure, and an operator who needs `prometheus_out` reachable from outside the host is the one
-making that choice, not inheriting it from the example. Real TLS/auth support is tracked in
-`docs/known-gaps/prometheus.md` alongside `admin:`'s own entry, not designed here.
+making that choice, not inheriting it from the example. TLS and auth weren't designed here; see
+"Amendment (2026-10-25): the exposition takes TLS and credentials" below.
 
 ### `Output::bind`
 
@@ -512,7 +512,8 @@ scrape time; it remains the one sink outside all three codec traits, by design.)
   state.
 - Known-gaps rows: `min`/`max` dropped on encoded histograms; native (sparse exponential)
   histograms not supported (`ExponentialHistogram` is skipped, not down-converted); no TLS or auth
-  on `prometheus_out`'s server side in v1 (tracked alongside `admin:`'s own no-TLS/no-auth gap);
+  on `prometheus_out`'s server side in v1 (closed by
+  [ADR `listener-authentication`](listener-authentication.md), the 2026-10-25 amendment below);
   UTF-8 quoted names deferred; `EventBatch::scope`/`Resource.schema_url`/`dropped_attributes_count`
   dropped on encode.
 - [ADR `internal-telemetry-as-pipeline-events`](internal-telemetry-as-pipeline-events.md)'s

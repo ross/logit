@@ -109,7 +109,7 @@ the sender's client TLS, `endpoint_tls`. This is a breaking config rename with n
 shim and no alias, because `logit` is pre-release and carries none anywhere else; no `fixtures/*.yaml`
 uses `prometheus_in`'s `tls:` today. The exposition `bind:`'s no-TLS/no-auth posture and its
 known-gaps row are untouched — the receiver getting TLS does not retroactively give the exposition
-server any.
+server any. (Both are closed since; see "Amendment (2026-10-25): the receiver checks credentials".)
 
 ### The sender's wire version is explicit; the receiver accepts both
 
@@ -501,7 +501,7 @@ hand-written `generated/mod.rs` mirrors OTLP's `#[path]`/`#[rustfmt::skip]` nest
   `tools/protogen` is now table-driven. `snap` is a new workspace dependency.
 - **Known-gaps rows W6 added.** The four this ADR anticipated, all present: the receiver has TLS but
   no authentication (`bind_tls` gives transport security, not identity — the same gap `admin:` and
-  the exposition `bind:` already carry); 1.0 typing depends on the metadata cache, which is bounded
+  the exposition `bind:` already carry; closed by the 2026-10-25 amendment); 1.0 typing depends on the metadata cache, which is bounded
   and therefore lapses, so an expiry puts a family back to decoding untyped until the sender's next
   metadata request re-declares it (the row W5 turned from "until the cache lands" into a statement
   about the cache's own bounds); a `FLAG_NO_RECORDED_VALUE` record whose kind expands to several

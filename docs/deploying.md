@@ -4534,10 +4534,16 @@ Which component takes which block:
 | Component | Block | Turned on by | Notes |
 |---|---|---|---|
 | `otlp_out` | `TlsClientConfig` | an `https://` `endpoint` | `tls:` under a plaintext endpoint is rule 24 |
+| `datadog_out`, `datadog_trace_out`, `splunk_hec_out` | `TlsClientConfig` | an `https://` endpoint | tunes TLS only; a set block with no `https://` endpoint (or `datadog_trace_out`'s `socket`) is rejected |
+| `prometheus_out` (`endpoint_tls:`) | `TlsClientConfig` | an `https://` `endpoint` | sender mode only (rule 56); a set block under an `http://` endpoint is rejected |
 | `logit_out`, `syslog_out`, `statsd_out` | `TlsClientConfig` | the block's presence | bare `host:port`; stream transport only (rules 34/44/52) |
+| `kafka_out` | `TlsClientConfig` | the block's presence | brokers are `host:port`, so even `tls: {}` turns TLS on |
 | `prometheus_in` (`scrape_tls:`) | `TlsClientConfig` | an `https://` scrape target | scrape mode is a client, not a listener; a set block with no `https://` target is rule 40 |
 | `prometheus_in` (`bind_tls:`) | `TlsServerConfig` | the block's presence | the remote-write receiver's own listener; bind mode only (rule 55) |
+| `prometheus_out` (`bind_tls:`) | `TlsServerConfig` | the block's presence | the exposition's listener, HTTP/1.1; registry mode only (rule 56) |
 | `otlp_in` | `TlsServerConfig` | the block's presence | both transports |
+| `datadog_in`, `splunk_hec_in`, `influxdb_in`, `logit_in` | `TlsServerConfig` | the block's presence | |
+| `datadog_trace_in` | `TlsServerConfig` | the block's presence | the `bind` listener only; its Unix socket is always plaintext |
 | `syslog_in`, `graphite_in`, `statsd_in`, `lines_in` | `TlsServerConfig` | the block's presence | `transport: tcp` only (rule 43) |
 
 `TlsClientConfig` is `ca_file`/`cert_file`/`key_file`/`insecure_skip_verify`; `TlsServerConfig` is
