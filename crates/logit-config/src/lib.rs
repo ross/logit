@@ -542,6 +542,14 @@ pub struct TlsClientConfig {
     /// `ca_file`.
     #[serde(default)]
     pub insecure_skip_verify: bool,
+    /// The name the server's certificate is verified against, in place of the endpoint's host: a
+    /// DNS name or an IP address. Use it to dial an endpoint by IP address, or through a proxy,
+    /// when its certificate names another host. It doesn't change SNI: the connection still sends
+    /// the endpoint's own host (none for an IP address), so it can't reach a front end that routes
+    /// on SNI. On `kafka_out`, every broker is verified against this one name. Ignored under
+    /// `insecure_skip_verify`. A name that doesn't parse fails startup.
+    #[serde(default)]
+    pub server_name: Option<String>,
 }
 
 impl TlsClientConfig {
@@ -552,6 +560,7 @@ impl TlsClientConfig {
             && self.cert_file.is_none()
             && self.key_file.is_none()
             && !self.insecure_skip_verify
+            && self.server_name.is_none()
     }
 }
 
@@ -3865,7 +3874,8 @@ pub enum ComponentKind {
         headers: std::collections::BTreeMap<String, String>,
         /// Turns on TLS to every broker when present, and makes it required: a `host:port` has
         /// no scheme to select TLS from, so even an empty `tls: {}` means TLS with the bundled
-        /// Mozilla roots. Each broker's certificate is checked against the host it advertises.
+        /// Mozilla roots. Each broker's certificate is checked against the host it advertises,
+        /// or against `server_name` when it's set.
         #[serde(default)]
         tls: Option<TlsClientConfig>,
         /// Authenticates every broker connection over SASL when present: `{mechanism: plain |
@@ -8952,6 +8962,19 @@ mod tests {
             }
             other => panic!("expected OtlpOut, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_tls_client_server_name_parses_and_alone_makes_the_block_non_empty() {
+        let tls: TlsClientConfig =
+            serde_json::from_str(r#"{"server_name": "logit.test"}"#).unwrap();
+        assert_eq!(tls.server_name.as_deref(), Some("logit.test"));
+        assert!(!tls.is_empty());
+        assert!(TlsClientConfig::default().is_empty());
+
+        let err = serde_json::from_str::<TlsClientConfig>(r#"{"server_name_override": "x"}"#)
+            .unwrap_err();
+        assert!(err.to_string().contains("unknown field"), "{err}");
     }
 
     #[test]
