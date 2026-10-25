@@ -8,7 +8,9 @@
 //! in). All six listeners build and read through these. The two Datadog listeners,
 //! `splunk_hec_in`, and `influxdb_in` also share their request helpers here: `Content-Encoding` and `Content-Type`
 //! parsing, bounded decompression, the JSON response shapes and the
-//! deadline-bounded delivery. The constant-time key check is `logit_proto::auth`'s.
+//! deadline-bounded delivery. `otlp_in`'s `auth:` and the receiver's `bind_auth:` check, count,
+//! and challenge through [`AuthGate`]; the `Authorization` parse and the constant-time key check
+//! every listener shares are `logit_proto::auth`'s.
 //!
 //! The reasoning lives in `crate::otlp`'s module doc, "Idle timeout" section, and only there: why
 //! the clock is tracked at the service rather than around the socket, why it resets on request

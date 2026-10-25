@@ -24,6 +24,8 @@
 //! path: /metrics           # default; must start with `/` (rule 41)
 //! expire_after: 5m         # a series not updated within this window stops being exposed; 0s off
 //! max_series: 100000       # hard cap, least-recently-updated evicted first; 0 rejected (rule 41)
+//! bind_tls: {}             # TlsServerConfig -- its presence turns server TLS on
+//! bind_auth: {}            # HttpAuthConfig -- bearer tokens and basic pairs; empty accepts any scrape
 //! ```
 //!
 //! Sender mode, [`RemoteWriteOutput`]:
@@ -62,10 +64,11 @@
 //! | `GET`/`HEAD` on the configured `path` | `200`, the rendered registry -- `logit.output.scrapes{class="ok"}` |
 //! | any method on any other path | `404` -- `logit.output.scrapes{class="not_found"}` |
 //! | any other method on `path` | `405` + `Allow: GET, HEAD` -- `logit.output.scrapes{class="method"}` |
+//! | `GET`/`HEAD` on `path` under `bind_auth:`, with no `Authorization` credential it accepts | `401` + a `WWW-Authenticate` challenge per configured scheme -- `logit.output.scrapes{class="unauthorized"}` |
 //!
 //! `HEAD` builds the same body as `GET`, so `content-length` matches (RFC 9110 §9.3.2); hyper
-//! drops the bytes. Path is matched before method, so an unknown path is a `404` whatever the
-//! method.
+//! drops the bytes. Path is matched before method, and method before credential, so an unknown
+//! path is a `404` whatever the method or credential.
 //!
 //! ## State: upsert, expiry, cardinality (registry mode)
 //!
@@ -222,7 +225,7 @@
 //!
 //! | Point | Meaning |
 //! |---|---|
-//! | `logit.output.scrapes{class="ok"\|"not_found"\|"method"}` | one per HTTP request, by outcome. `ok` means the response was *rendered*, not acknowledged: a `Full<Bytes>` response offers no body-completion hook, so a connection dropped mid-write still counts `ok` |
+//! | `logit.output.scrapes{class="ok"\|"not_found"\|"method"\|"unauthorized"}` | one per HTTP request, by outcome. `ok` means the response was *rendered*, not acknowledged: a `Full<Bytes>` response offers no body-completion hook, so a connection dropped mid-write still counts `ok` |
 //! | `logit.output.scrape.bytes` | response body bytes as rendered -- post-gzip when the client asked for it, so it measures transfer cost rather than exposition size. Counted when the body is built, same caveat as `ok` above |
 //! | `logit.output.series` (gauge) | series held after each `send` |
 //! | `logit.output.series.evicted{reason="expired"\|"cardinality"}` | see above |
@@ -269,20 +272,25 @@
 //! plain field, counting once per batch however many attempts it takes (`crate::accounting`);
 //! registry mode's `send` never fails, so it has no gate.
 //!
-//! ## Security posture: no TLS, no auth on `bind:`
+//! ## Security posture
 //!
-//! Registry mode serves the **entire registry**, every label on every series, to anything that
-//! connects to `bind:`, with no credential check and no transport encryption. That's the posture
-//! [ADR `admin-readiness-endpoint`](../../../docs/adr/admin-readiness-endpoint.md) accepted for
-//! `/readyz`, except the payload is a metric surface rather than a lifecycle word. So bind
-//! loopback or pod-local (`127.0.0.1:9464`, as every shipped example does) and front it with
-//! something that has TLS and auth. Exposing it off-host is an operator's explicit choice, not
-//! an example's default. Tracked in `docs/known-gaps/prometheus.md` next to `admin:`'s row.
+//! Registry mode serves the **entire registry**, every label on every series. `bind_tls:`
+//! ([`ExposeOutput::with_bind_tls`]) terminates TLS on the exposition, HTTP/1.1 only, built and
+//! reloaded as every listener's server TLS is, with its accept bounded by the header-read
+//! timeout. `bind_auth:` ([`ExposeOutput::with_auth`]) requires each scrape to carry an
+//! `Authorization` header `logit_proto::auth::Credentials` accepts, as a Prometheus scrape config's
+//! `authorization:` or `basic_auth:` sends. A refusal is a `401`, counted, and raises no
+//! diagnostic: a scraper retries on its interval, so a misconfigured one would log forever, and
+//! the `unauthorized` class is the signal. Nothing is rendered for a refused scrape (ADR
+//! `listener-authentication`). Without either, anything that connects reads the registry, so every
+//! shipped example binds loopback (`127.0.0.1:9464`) and exposing it off-host is an operator's
+//! explicit choice.
 //!
 //! Sender mode is the opposite: it dials out, an `https://` endpoint gets TLS with the bundled
 //! Mozilla roots by default, and `endpoint_tls:` adds a private CA, a client certificate for
-//! mutual TLS, or `insecure_skip_verify` (which logs a startup warning). None of that gives the
-//! exposition server TLS.
+//! mutual TLS, or `insecure_skip_verify` (which logs a startup warning). Graph rule 56 rejects
+//! `bind_tls:` and `bind_auth:` beside `endpoint:`, so the server and client TLS keys never
+//! share a mode.
 
 use crate::accounting::BatchAccounting;
 use crate::http::{

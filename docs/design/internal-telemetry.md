@@ -1092,6 +1092,9 @@ idle close is
 
 There's no frame or request counter. This input's unit of arrival is an HTTP request or a gRPC
 call, and `Fanout` already sees one batch per accepted request, so a counter would only restate it.
+The one request-level point is a refusal no batch records:
+`logit.input.requests.rejected{reason="auth"}` (count), one per request `auth:` refused, HTTP
+`401` or gRPC status 16, before its body was read.
 
 `logit.input.batches.dropped{reason="closed_consumer"}` (count): every batch of a request that no
 consumer took, the refused one included, because every consumer of the listener has closed. The
@@ -1106,8 +1109,9 @@ whose `count` isn't the sum of its bucket counts, which keeps its buckets, as
 `logit.input.metrics.degraded{reason="histogram_count_mismatch"}`
 (`crates/logit-proto/src/otlp/metrics.rs`).
 
-`Diagnostics` keys: `bound`, `connection_error` (one connection's I/O failing, a TLS accept
-that failed or timed out, or a plaintext connection held open past `handshake_timeout` without a
+`Diagnostics` keys: `bound`, `request_rejected` (a request `auth:` refused; the peer address and
+why, never the credential, appear in the message text), `connection_error` (one connection's I/O
+failing, a TLS accept that failed or timed out, or a plaintext connection held open past `handshake_timeout` without a
 first byte, which then gave its permit back; never an idle close), `proxy_header` (any
 `connections.rejected{reason="proxy_header"}` refusal), and `forwarded` (under `forwarded:`, a request whose named header names no usable client; the header name and the reason appear in the message text, never the value; a request without the header isn't counted). A plaintext peer that *closes
 cleanly or resets* before sending a request byte, after a complete PROXY header under
@@ -1126,15 +1130,17 @@ would add one point per probe interval to this key forever.
 |---|---|---|---|
 | scrape | `logit.input.scrapes{class="2xx"\|"4xx"\|"5xx"\|"other"\|"network_error"\|"timeout"\|"parse_error"\|"oversize"}` | count | one per target per tick: the HTTP classes plus three ways a scrape fails before or after a status (`parse_error` is a 2xx body that wouldn't decode) |
 | scrape | `logit.input.scrape.duration` | timing | one per target per tick, recorded regardless of outcome |
-| bind | `logit.input.writes{class="ok"\|"not_found"\|"method"\|"unsupported"\|"oversize"\|"timeout"\|"bad_request"\|"closed_consumer"}`, plus `encoding="snappy"\|"zstd"` on `class="ok"` | count | one per request, one class per row of the module doc's routes table. See below. |
+| bind | `logit.input.writes{class="ok"\|"not_found"\|"method"\|"unauthorized"\|"unsupported"\|"oversize"\|"timeout"\|"bad_request"\|"closed_consumer"}`, plus `encoding="snappy"\|"zstd"` on `class="ok"` | count | one per request, one class per row of the module doc's routes table. See below. |
 | bind | `logit.input.write.duration` | timing | one per request, every exit included, which is why the count and the timer live in one wrapper around the routing itself |
 | both | `logit.input.samples` | count | a different unit in each mode. See below. |
 
-These are this component's own spellings, not `otlp_in`'s, which has no request-level counters to
-mirror. In `logit.input.writes`:
+These are this component's own spellings, not `otlp_in`'s, which counts only refused requests. In `logit.input.writes`:
 
 - `ok` carries the body's `encoding`, so a vmagent that stayed on its default zstd wire, rather
   than downgrading to Snappy, reads as `encoding="zstd"`.
+- `unauthorized` is a `401` from `bind_auth:`, checked before the body. It's also counted
+  `logit.input.requests.rejected{reason="auth"}`, the spelling every listener that checks a
+  credential shares.
 - `unsupported` is a `415` on `Content-Encoding` *or* `Content-Type`.
 - `oversize` is a `413` from either the compressed body or its decompressed size: Snappy's
   declared length, or for zstd a declared content size, a window, or a streaming decode past
@@ -1211,7 +1217,7 @@ in a label name.
 
 `Diagnostics` keys: `bound` (bind mode's listener), `scrape_failed` (scrape mode; the failing
 target's redacted URL appears in the message text only, never a tag), `write_rejected` (bind mode,
-every `400`/`408`/`413`/`415`; the peer address appears in the message text only, for the same
+every `400`/`401`/`408`/`413`/`415`; the peer address appears in the message text only, for the same
 tag-cardinality reason), `closed_consumer` (bind mode, a `503` for a write no consumer took),
 `connection_error` (never an idle close, nor a plaintext peer that closes cleanly or resets
 before sending a request byte, after a complete PROXY header under `proxy_protocol: true`; on a
@@ -2545,8 +2551,10 @@ but `requests` and `reconnects` is met once per batch.
 **Registry mode (`bind:`)** is the one pull sink, so it has no
 `requests`/`request.duration`/`batch.bytes`: nothing is pushed per batch. Instead:
 
-- `logit.output.scrapes{class="ok"|"not_found"|"method"}` (count, one per inbound HTTP request).
-  `ok` means *rendered*, not acknowledged, because a `Full<Bytes>` body has no completion hook.
+- `logit.output.scrapes{class="ok"|"not_found"|"method"|"unauthorized"}` (count, one per inbound
+  HTTP request). `ok` means *rendered*, not acknowledged, because a `Full<Bytes>` body has no
+  completion hook. `unauthorized` is a `401` from `bind_auth:`, with no diagnostic: a scraper
+  retries on its interval, so the count is the signal.
 - `logit.output.scrape.bytes`: post-gzip when negotiated, so it measures transfer cost rather than
   exposition size.
 - Registry state, which no push sink holds: `logit.output.series` (gauge, series held after each

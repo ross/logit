@@ -22,6 +22,7 @@
 //! bind: "0.0.0.0:9090"  # host:port to accept remote-write POSTs on
 //! path: /api/v1/write   # the one route POSTs are accepted on; default /api/v1/write
 //! bind_tls: {}          # TlsServerConfig -- its presence turns TLS on
+//! bind_auth: {}         # HttpAuthConfig -- bearer tokens and basic pairs; empty accepts any write
 //! idle_timeout: 60s     # optional; omitted means no idle timeout
 //! metadata_cache:       # what 1.0 metric types are remembered between requests
 //!   max_families: 10000 #   0 turns the cache off
@@ -114,6 +115,7 @@
 //! | `POST path`, `Content-Encoding: snappy` or `zstd`, recognised `Content-Type` | decode, then `204` |
 //! | any other path | `404` |
 //! | any other method on `path` | `405` + `Allow: POST` |
+//! | under `bind_auth:`, no `Authorization` credential it accepts (checked before any other header or the body) | `401` + a `WWW-Authenticate` challenge per configured scheme |
 //! | missing or other `Content-Encoding`, unrecognised or missing `Content-Type` | `415` |
 //! | a body, or its decompressed size, over [`MAX_REQUEST_BYTES`] | `413` |
 //! | a body that stops arriving mid-upload, **when `idle_timeout:` is set** (it is off by default, and the stall bound is derived from it) | `408`, and the connection closes |
@@ -225,10 +227,10 @@
 //! faster than the victims' own metadata cadence, that keeps well-behaved senders permanently
 //! untyped. The cache does not *drop* their samples (a remembered type gives way to a sample it
 //! cannot place rather than rejecting it, [`remote_write::decode_with`]), but flat families are
-//! what they get. Nothing here authenticates a sender, so this is the "Security posture" rule
-//! again: do not point this listener at untrusted senders. An operator who has to, and would
-//! rather have flat families than a table anyone can churn, sets `max_families: 0`, which turns
-//! the sharing off along with the typing.
+//! what they get. `bind_auth:` decides who may write, not what an accepted sender declares, so
+//! senders that shouldn't share a table get a `bind:` each. An operator who would rather have
+//! flat families than a shared table sets `max_families: 0`, which turns the sharing off along
+//! with the typing.
 //!
 //! **Concurrency, and what a request pays.** One `std::sync::Mutex` guards the table, taken to
 //! build the seed and again to learn, **never held across the decode**: a connection's requests
@@ -276,14 +278,19 @@
 //! connection through the same close sequence, as `otlp_in` does (`crate::otlp`'s "Idle
 //! timeout").
 //!
-//! ## Security posture
+//! ## Authentication
 //!
-//! `bind_tls:` gives transport security and nothing else. **The receiver has no authentication of
-//! any kind** (no bearer token, no basic auth, no mutual-TLS identity check beyond `rustls`
-//! accepting a client certificate chain when `client_ca_file` is set), so anything that can reach
-//! the socket can write series into the pipeline. `admin:` and `prometheus_out`'s exposition
-//! `bind:` carry the same gap, tracked in `docs/known-gaps/prometheus.md`: front it with something
-//! that authenticates, or keep it on a trusted network.
+//! With `bind_auth:` set ([`PrometheusReceiver::with_auth`]), every write needs an
+//! `Authorization` header `logit_proto::auth::Credentials` accepts, as Prometheus's
+//! `remote_write` `authorization:` or `basic_auth:` and vmagent's `-remoteWrite.bearerToken` or
+//! `-remoteWrite.basicAuth.*` send. [`crate::http::AuthGate`] checks it after the path and method
+//! and before `Content-Encoding` or the body, so a refused write is never read, decompressed, or
+//! decoded. A refusal is `401` with a challenge per configured scheme, carrying the `-Written`
+//! zeros when its `Content-Type` names 2.0, and counts `logit.input.writes{class="unauthorized"}`,
+//! `logit.input.requests.rejected{reason="auth"}`, and the `write_rejected` diagnostic. Empty, the
+//! default, accepts every write. `bind_tls:` is transport security; with `client_ca_file` it
+//! admits any client certificate that chains to that CA, and checks no subject
+//! (ADR `listener-authentication`).
 //!
 //! ## Sender address
 //!
@@ -300,7 +307,8 @@
 //! ## Counters
 //!
 //! `logit.input.writes{class}` -- one count per request, `class` one of `ok`, `not_found`,
-//! `method`, `unsupported`, `oversize`, `timeout`, `bad_request`, or `closed_consumer`. An `ok`
+//! `method`, `unauthorized`, `unsupported`, `oversize`, `timeout`, `bad_request`, or
+//! `closed_consumer`. An `ok`
 //! count also carries `encoding` (`snappy` or `zstd`), which is how to see whether a vmagent
 //! stayed on zstd. `logit.input.write.duration` -- a timing sample per request, recorded
 //! regardless of outcome. `logit.input.samples` -- reused from scrape mode, counting the wire
@@ -308,7 +316,9 @@
 //! mapping then dropped, the number the `-Written` header reports. A counter and a header
 //! disagreeing about one request would be a puzzle with no right answer.
 //! `logit.input.batches.dropped{reason="closed_consumer"}` -- the write's batch when no consumer
-//! took it, answered `503`.
+//! took it, answered `503`. `logit.input.requests.rejected{reason="auth"}` -- a write
+//! `bind_auth:` refused, also counted `writes{class="unauthorized"}`, as every HTTP listener that
+//! checks a credential counts it.
 //!
 //! `logit.input.metadata_cache.size` -- how many families are remembered, a gauge published
 //! whenever the table changes (a transition, like `logit.input.connections`, not a per-request

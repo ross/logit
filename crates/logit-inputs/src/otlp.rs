@@ -8,7 +8,8 @@
 //! (`UNIMPLEMENTED`: a non-`POST`, an unknown method, an unsupported `grpc-encoding`), `3`
 //! (`INVALID_ARGUMENT`: a malformed frame, gzip, or payload, or bytes after the one message a
 //! unary body carries), `8` (`RESOURCE_EXHAUSTED`: over
-//! [`MAX_REQUEST_BYTES`]), or `4` (`DEADLINE_EXCEEDED`: a stalled body).
+//! [`MAX_REQUEST_BYTES`]), `4` (`DEADLINE_EXCEEDED`: a stalled body), or `16`
+//! (`UNAUTHENTICATED`: a credential `auth:` doesn't accept).
 //!
 //! **One accept loop, one task per connection.** [`Input::run`] spawns a task per accepted
 //! connection, each holding its own [`Fanout`] clone. HTTP connections are served by
@@ -40,6 +41,14 @@
 //! hostile handshake stalls only its own connection, counts against the same bound as a slow
 //! request, and never blocks the accept loop
 //! (`docs/adr/otlp-tls-and-pooled-grpc-client.md`).
+//!
+//! **Authentication.** With `auth:` set ([`OtlpInput::with_auth`]), every request needs an
+//! `Authorization` header `logit_proto::auth::Credentials` accepts, checked through
+//! [`crate::http::AuthGate`] after routing and before any other header or the body, so a refused
+//! request is never decompressed or decoded. OTLP/HTTP answers `401` with a `WWW-Authenticate`
+//! challenge per configured scheme; gRPC answers status `16` in trailers, with no challenge. Both
+//! count `logit.input.requests.rejected{reason="auth"}` and the throttled `request_rejected`
+//! diagnostic. Empty, the default, accepts every request (ADR `listener-authentication`).
 //!
 //! **Connection limit: reject, don't queue.** A [`tokio::sync::Semaphore`] capped at
 //! [`OtlpInput::max_connections`] (`max_connections:`, 1024 by default), acquired with

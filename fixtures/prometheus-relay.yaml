@@ -17,6 +17,5 @@ components:
   metrics:
     type: prometheus_out
     sources: [node_exporter]
-    # No TLS and no auth on this endpoint (docs/known-gaps/prometheus.md): bind loopback or
-    # pod-local and front it with something that has both.
+    # Loopback here; `bind_tls:` and `bind_auth:` protect it if it must be reachable off-host.
     bind: 127.0.0.1:9464

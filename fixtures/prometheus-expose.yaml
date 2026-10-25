@@ -28,10 +28,9 @@ components:
   metrics:
     type: prometheus_out
     sources: [windowed]
-    # Loopback, not 0.0.0.0: the endpoint has no TLS and no auth and serves every label of every
-    # series to anything that connects. Bind loopback or pod-local and front it with something
-    # that has both (docs/adr/prometheus-scrape-and-exposition.md, "Security posture"). Change the
-    # port if 9464 is taken.
+    # Loopback, not 0.0.0.0: without `bind_auth:` the endpoint serves every label of every series
+    # to anything that connects. To expose it off-host, set `bind_tls:` and `bind_auth:` below
+    # (docs/deploying.md's "Listener authentication"). Change the port if 9464 is taken.
     bind: 127.0.0.1:9464
     # Every field below is its default; omit it for the same effect.
     # path: /metrics             # any other path is a 404; any other method on it is a 405
@@ -39,6 +38,11 @@ components:
     #                            # 0s disables expiry
     # max_series: 100000         # hard cap on distinct series; over it the least-recently-updated
     #                            # is evicted first and counted
+    # bind_tls:                  # presence turns server TLS on; point the scraper at https
+    #   cert_file: server.pem
+    #   key_file: server.key
+    # bind_auth:                 # omitted, any scrape is accepted; a refused scrape gets a 401
+    #   bearer_tokens: [!env SCRAPE_TOKEN]
     # buffer: (all defaults, docs/adr/buffered-sink-delivery.md -- max_batches 1024,
     #          max_bytes "64MiB", overflow block, retry_max_delay 10s,
     #          shutdown_grace 5s, plus an optional `disk:` sub-block for durable buffering.
