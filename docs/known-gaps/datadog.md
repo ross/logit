@@ -137,8 +137,9 @@ Entry format and the other areas: [the known-gaps index](README.md).
   [ADR `dedup-timestamps-transform`](../adr/dedup-timestamps-transform.md)'s "Verified destination
   behavior"). It plans that over the whole batch before cutting requests, so no cut splits a pair,
   but it holds no state between batches.
-  - **Consequence:** two such points in two batches are both sent, and Datadog keeps the later,
-    so the earlier one is lost, uncounted; for a `count`, that's an increment. `dedup_timestamps`
+  - **Consequence:** two such points in two batches are both sent, and Datadog keeps the one that
+    arrives later, so the other is lost, uncounted; for a `count`, that's an increment. Above
+    `concurrency: 1`, the one that arrives later can be the older batch's. `dedup_timestamps`
     holds no state between batches either.
   - **Workaround:** keep one series' readings of one second in one batch: an `aggregate` upstream
     leaves one point per series per window.

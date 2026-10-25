@@ -21,6 +21,7 @@
 //!   traces: http://127.0.0.1:8080
 //! compression: gzip          # default; `none` sends every body uncompressed
 //! timeout: 10s               # default; bounds one request
+//! concurrency: 1             # default; batches in flight, see "Concurrency"
 //! headers: {}                # extra headers; `!env` works on a value
 //! tls: {}                    # tunes every https:// request
 //! histograms:                # how OTLP histograms are written, as Datadog's exporter's block
@@ -213,8 +214,8 @@
 //! in the attempt's send order, which is the same on every attempt because the plan and the cuts
 //! depend only on the batch and the send time `observe_batch` fixed
 //! ([`DatadogOutput::attempt`]). The memory lives beside the batch accounting
-//! ([`crate::accounting::BatchAccounting::settle`]): `observe_batch` clears it for each new batch,
-//! so it covers the retries of one batch and nothing else. A caller that never calls
+//! ([`crate::accounting::BatchAccounting::settle`]), one per batch in flight: `observe_batch`
+//! clears it for each new batch, so it covers the retries of one batch and nothing else. A caller that never calls
 //! `observe_batch` gets no memory, and each `send` sends every request. A disk-buffered batch
 //! replayed after a restart is a new batch and sends every request again.
 //!
@@ -226,7 +227,21 @@
 //! - `Ambiguous` under `at_most_once` drops the batch. The sink counts the entries of the failed
 //!   request, of the rest of its route's unsent requests, and of every later route as
 //!   `logit.output.records.dropped{route, reason="ambiguous_at_most_once"}`, from the posture the
-//!   runtime hands it ([`Output::observe_posture`]); the runtime counts the batch.
+//!   runtime hands it ([`Output::observe_posture`]); the runtime counts the batch. At a
+//!   concurrency of 1 a later route counts the entries its plan holds, since `send` encodes a
+//!   route only when it reaches it; above 1 every route is encoded before the batch's task starts,
+//!   so a later route counts its requests' entries, less what its encode dropped and counted.
+//!
+//! **Concurrency.** `concurrency:` (default 1) bounds how many batches are in flight. At 1, `send`
+//! makes each batch's requests in turn. Above 1, each batch's plan and requests are encoded on the
+//! loop task, from the send time `observe_batch` fixed for that batch, and its requests run in
+//! route order in its own task through [`crate::http::Slots`]; `write_loop` settles the batches
+//! oldest first. A fault on one batch resends or drops that batch alone, under the table below,
+//! and its resend skips the requests that batch already settled. Batches can land out of order: a
+//! series point is the last to arrive per `(series, second)`, and the other routes store what
+//! they receive as it arrives. `logit.output.in_flight` reads the batches in flight, and
+//! `logit.component.send.duration` times each batch's requests from the first send to the last
+//! response.
 //!
 //! Datadog documents its intake statuses by HTTP code, the same on every route, with a free-text
 //! body; no documented body code changes a status's meaning, so the status decides the class.

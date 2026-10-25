@@ -28,8 +28,9 @@
 //!
 //! A send succeeds when any signal of the batch was accepted, on this attempt or an earlier one,
 //! and fails `Rejected` only when every signal sent was rejected. The memory lives beside the
-//! batch accounting ([`crate::accounting::BatchAccounting::settle`]): `observe_batch` clears it
-//! for each new batch, so it covers the retries of one batch and nothing else. A caller that never
+//! batch accounting ([`crate::accounting::BatchAccounting::settle`]), one per batch in flight:
+//! `observe_batch` clears it for each new batch, so it covers the retries of one batch and nothing
+//! else. A caller that never
 //! calls `observe_batch` gets no memory, and each `send` sends every signal. A disk-buffered batch
 //! replayed after a restart is a new batch and sends every signal again.
 //!
@@ -61,6 +62,18 @@
 //! refused request per batch. See `docs/adr/delivery-semantics.md`'s "Amendment: per-request
 //! verdicts (2026-10-04)" and `docs/adr/sink-fault-classes.md`'s "Amendment: `otlp_out` retries
 //! per signal (2026-10-05)".
+//!
+//! **Concurrency.** `concurrency:` (default 1) bounds how many batches are in flight. At 1, `send`
+//! makes each batch's requests in turn. Above 1, each batch's requests run in its own task
+//! through [`crate::http::Slots`], still one at a time and in signal order, and `write_loop`
+//! settles the batches oldest first: a fault on one batch resends or drops that batch alone, under
+//! the table below, and its resend skips the signals that batch already settled. Over gRPC every
+//! batch's calls share one HTTP/2 connection as concurrent streams. Batches can land out of order.
+//! Logs and spans are stored as received. Metrics sent to a Prometheus-backed receiver can reach it
+//! out of timestamp order for one series, which a receiver without an out-of-order window rejects;
+//! [`crate::prometheus`]'s "Concurrency" table says which receivers accept it.
+//! `logit.output.in_flight` reads the batches in flight, and `logit.component.send.duration` times
+//! each batch's requests from the first send to the last response.
 //!
 //! **Delivery posture.** The default, `at_least_once` (`docs/adr/delivery-semantics.md`, item 5),
 //! resends the signal an `Ambiguous` answer named, and OTLP has no identity that makes a resend

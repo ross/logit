@@ -18,6 +18,7 @@
 //! ack: false                     # default; `true` polls /ack before a batch counts as delivered
 //! ack_timeout: 30s               # default with `ack: true`; only with it
 //! timeout: 10s                   # default; bounds one request
+//! concurrency: 1                 # default; batches in flight, see "Concurrency"
 //! max_body_bytes: 2MiB           # default; one request body, before compression
 //! tls: {}                        # tunes an https:// endpoint
 //! ```
@@ -116,6 +117,18 @@
 //! `temporality: cumulative`, whose running total a resend repeats rather than adds. Whether a
 //! metrics index adds a resent running total or stores it as a second point is unmeasured.
 //! `buffer.delivery: at_most_once` drops the batch instead.
+//!
+//! **Concurrency.** `concurrency:` (default 1) bounds how many batches are in flight. At 1, `send`
+//! makes each batch's requests in turn. Above 1, each batch is encoded into an object buffer of its
+//! own on the loop task, and its task packs the bodies, sends them in order, drops and resends a
+//! code 6, splits Splunk Cloud's oversize answer, and polls `/ack`, all for that batch alone, through
+//! [`crate::http::Slots`]; `write_loop` settles the batches oldest first. A fault on one batch
+//! resends or drops that batch alone, under the table above. `sent_any` is the batch's own: a busy
+//! answer is `Clean` until one of that batch's bodies was accepted, whatever another batch in
+//! flight got. Every batch uses the sink's one channel, so `/ack` ids from all of them share it.
+//! Batches can land out of order, and Splunk indexes each event as it receives it.
+//! `logit.output.in_flight` reads the batches in flight, and `logit.component.send.duration` times
+//! each batch's requests from the first send to the last response.
 //!
 //! ## Acknowledgment
 //!

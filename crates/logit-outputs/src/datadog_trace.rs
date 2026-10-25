@@ -23,6 +23,7 @@
 //! version: v0.4                     # default; or v0.7
 //! compression: none                 # default; or gzip
 //! timeout: 10s                      # default; bounds one request
+//! concurrency: 1                    # default; batches in flight, see "Concurrency"
 //! headers: {}                       # extra headers; `!env` works on a value
 //! tls: {}                           # tunes an https:// endpoint
 //! ```
@@ -114,8 +115,8 @@
 //! and fails `Rejected` only when every request sent was rejected. A request is named by its place
 //! in the attempt's send order, which is the same on every attempt because the cuts depend only on
 //! the batch ([`DatadogTraceOutput::attempt`]). The memory lives beside the batch accounting
-//! ([`crate::accounting::BatchAccounting::settle`]): `observe_batch` clears it for each new batch,
-//! so it covers the retries of one batch and nothing else. A caller that never calls
+//! ([`crate::accounting::BatchAccounting::settle`]), one per batch in flight: `observe_batch`
+//! clears it for each new batch, so it covers the retries of one batch and nothing else. A caller that never calls
 //! `observe_batch` gets no memory, and each `send` sends every request. A disk-buffered batch
 //! replayed after a restart is a new batch and sends every request again.
 //!
@@ -128,7 +129,18 @@
 //!   request, of the rest of its route's unsent requests, and, when the trace route stopped, every
 //!   stats group in the batch as
 //!   `logit.output.records.dropped{route, reason="ambiguous_at_most_once"}`, from the posture the
-//!   runtime hands it ([`Output::observe_posture`]); the runtime counts the batch.
+//!   runtime hands it ([`Output::observe_posture`]); the runtime counts the batch. Above a
+//!   concurrency of 1 both routes are encoded before the batch's task starts, so the stats route
+//!   counts its requests' groups, less what its encode dropped and counted.
+//!
+//! **Concurrency.** `concurrency:` (default 1) bounds how many batches are in flight. At 1, `send`
+//! makes each batch's requests in turn. Above 1, each batch's requests are encoded on the loop
+//! task and run in route order in its own task through [`crate::http::Slots`]; `write_loop`
+//! settles the batches oldest first. A fault on one batch resends or drops that batch alone,
+//! under the table below, and its resend skips the requests that batch already settled. Batches
+//! can land out of order, and the Agent stores traces and stats as it receives them.
+//! `logit.output.in_flight` reads the batches in flight, and `logit.component.send.duration` times
+//! each batch's requests from the first send to the last response.
 //!
 //! The Agent's API has no credential, so only a status that says the endpoint or the body's format
 //! isn't served refuses the sink as a whole.

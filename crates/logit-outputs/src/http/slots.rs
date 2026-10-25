@@ -6,14 +6,18 @@
 //! helper does on each call:
 //!
 //! - **`observe`** (`Output::observe_batch`) adds a slot at the back with a fresh
-//!   [`BatchAccounting`] over the sink's one [`CountGate`]. Every encode runs on the loop task
-//!   with nothing awaited inside it, so one gate serves every slot.
+//!   [`BatchAccounting`] over the sink's one [`CountGate`], and the sink's own per-batch state
+//!   (`S`, such as `datadog_out`'s send time) reset to its default. Every encode runs on the loop
+//!   task with nothing awaited inside it, so one gate serves every slot.
 //! - **`submit`** finds the batch's slot, runs the sink's encode through that slot's accounting
-//!   on the loop task, and spawns the transport as a task holding the request. A resubmitted head
-//!   finds its slot again, so a unit an earlier attempt counted runs muted.
+//!   on the loop task, and spawns the transport as a task holding the requests. A resubmitted
+//!   head finds its slot again, so a unit an earlier attempt counted runs muted, and
+//!   (`submit_with`) a sink that sends a batch as several requests skips the ones the slot's
+//!   accounting has settled.
 //! - **`ack`** (`Output::await_ack`) awaits the front slot's task and hands its outcome to the
 //!   sink on the loop task, where the transport counters and the throttled diagnostics live, then
-//!   finishes the slot's accounting. `Ok` pops the slot. Every `Err` is marked [`HeadOnly`]: a
+//!   finishes the slot's accounting. `ack_with` also hands over that accounting, so a
+//!   multi-request sink records the requests the destination settled ([`super::Journal`]). `Ok` pops the slot. Every `Err` is marked [`HeadOnly`]: a
 //!   final one (`Rejected`, or `Ambiguous` under at-most-once) pops the slot, and a retryable one
 //!   keeps it for the head's resubmit. A slot behind the head whose request already failed keeps
 //!   its outcome in its task until it reaches the front; no task retries.
@@ -266,8 +270,8 @@ impl<O: Send + 'static, S: Default> Slots<O, S> {
         result
     }
 
-    /// `Output::answered_send_duration`: how long the request behind the last `ack` took, from
-    /// its spawn to its response.
+    /// `Output::answered_send_duration`: how long the requests behind the last `ack` took, from
+    /// the task's spawn to its last response.
     pub(crate) fn answered(&self) -> Option<Duration> {
         self.answered
     }

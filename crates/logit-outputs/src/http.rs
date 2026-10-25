@@ -44,6 +44,12 @@
 //! request per batch builds the request on the loop task and hands it to [`exchange`], which
 //! gathers the answer for the sink to classify back on the loop task; its `send` does the same
 //! with no task. `influxdb_out` and `prometheus_out`'s remote-write sender use it.
+//!
+//! A sink that sends a batch as several requests (`otlp_out`, `datadog_out`,
+//! `datadog_trace_out`, `splunk_hec_out`) encodes them all on the loop task, then sends them in
+//! order in the task, which counts and diagnoses each answer into a [`Journal`] the loop task
+//! replays when the slot is acknowledged. Its `send` runs the same task code inline and replays
+//! the journal before it returns, so both paths count the same points in the same order.
 
 #[cfg(test)]
 pub(crate) mod held;

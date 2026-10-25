@@ -60,11 +60,13 @@ Entry format and the other areas: [the known-gaps index](README.md).
   VictoriaTraces v0.11.1 closes every gRPC connection about 5 seconds after it opens, with a TCP
   FIN and no HTTP/2 `GOAWAY`
   ([`tools/victoria-interop/README.md`](../../tools/victoria-interop/README.md)'s "Recorded run",
-  leg 7). A request in flight at that moment gets no response frame and fails `Fault::Ambiguous`,
-  because the server may have processed it.
-  - **Consequence:** under the default posture, `at_least_once`, `otlp_out` retries it, at the cost
-    of a duplicate span when the first attempt was stored. Under `buffer.delivery: at_most_once` it
-    drops the batch. An isolated 20 s run at 1 batch/s under `at_most_once` saw 3 closes and 2
+  leg 7). Every request in flight on that connection at that moment gets no response frame and
+  fails `Fault::Ambiguous`, because the server may have processed it. Above `concurrency: 1`,
+  every batch in flight shares the one connection, so a close fails each of their requests, not
+  only one.
+  - **Consequence:** under the default posture, `at_least_once`, `otlp_out` retries each failed
+    batch, at the cost of a duplicate span when the first attempt was stored. Under
+    `buffer.delivery: at_most_once` it drops each one. An isolated 20 s run at 1 batch/s under `at_most_once` saw 3 closes and 2
     dropped batches. `script/victoria-interop`'s leg-7 row can pass a run in which no request
     raced a close; it counts `send_failed` lines but can't force the race.
   - **Workaround:** OTLP over HTTP to VictoriaTraces (`docs/deploying.md`'s "VictoriaMetrics,

@@ -140,7 +140,7 @@ trip. A sink's `buffer_full` line, the first and each repeat, gains one suffix:
 
 | Suffix | Written when |
 |---|---|
-| `; sending at its concurrency of N, the last send took D` | the write loop has `N` batches in flight and `N` is the most it may: `concurrency:`, or 1 on a sink without the field. `D` is the last answered send's duration, success or failure: one attempt's on the `send` path; above a window of 1, the request's own on a sink on the HTTP slot helper, from its send to its response, and the head frame's on `logit_out`, from its submit to its acknowledgment |
+| `; sending at its concurrency of N, the last send took D` | the write loop has `N` batches in flight and `N` is the most it may: `concurrency:`, or 1 on a sink without the field. `D` is the last answered send's duration, success or failure: one attempt's on the `send` path; above a window of 1, the batch's own requests on a sink on the HTTP slot helper, from the first send to the last response, and the head frame's on `logit_out`, from its submit to its acknowledgment |
 | `; sending at its concurrency of N, no send answered yet` | as above, before any send was answered |
 
 `write_loop` records the limit, the batches it waits on, and each answered send's duration in the

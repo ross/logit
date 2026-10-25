@@ -119,14 +119,14 @@ pub trait Output {
     /// windowed round (`docs/adr/sink-request-concurrency.md`, decision 2). Read only under a
     /// window above 1; the `send` path times each attempt either way. The default, `false`, keeps
     /// one sample per round, what `logit_out` reports. A sink on the HTTP slot helper, whose
-    /// batches each run as their own request, says `true`. A type that implements `Output` by
+    /// batches each run their requests in a task of their own, says `true`. A type that implements `Output` by
     /// delegating to another must forward this.
     fn send_duration_per_batch(&self) -> bool {
         false
     }
 
-    /// How long the request behind the last [`Output::await_ack`] answer took, from its send to
-    /// its response, or `None` when that batch sent no request. Read after each `await_ack`, only
+    /// How long the requests behind the last [`Output::await_ack`] answer took, from the first
+    /// one's send to the last one's response, or `None` when that batch sent no request. Read after each `await_ack`, only
     /// when [`Output::send_duration_per_batch`] says `true`. A batch behind a held head waits for
     /// the head's retries before its answer is read, so the loop can't measure this itself. A
     /// type that implements `Output` by delegating to another must forward this.
