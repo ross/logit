@@ -73,7 +73,8 @@
 //! **Response classes.** Each request's class, from the OTLP specification's failure rules
 //! ([OTLP/gRPC failures][grpc-failures], [OTLP/HTTP failures][http-failures]): a retryable answer
 //! is `Ambiguous`, and an answer the specification says a client "MUST NOT retry" is `Rejected`,
-//! except where it describes the path to the receiver rather than a signal, and except a server
+//! except where it describes the path to the receiver rather than a signal, except a `408`
+//! (a proxy giving up on the request's arrival, which a resend can beat), and except a server
 //! failure (HTTP `5xx`, gRPC `INTERNAL` and `RESOURCE_EXHAUSTED`), which stays `Ambiguous` (the
 //! rows below say why). The HTTP half is
 //! `http_status_fault`, overriding [`crate::http::classify_status`]; the gRPC half is

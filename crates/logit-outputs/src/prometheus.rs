@@ -132,7 +132,8 @@
 //! (`docs/adr/buffered-sink-delivery.md`); this sink classifies the outcome with
 //! `.context(fault)`. Both remote-write specifications define a `4xx` other than `429` as a write
 //! that "will never be able to succeed" and a `5xx` as one to retry; the rows below refine that
-//! where the receiver's answer is about the sink's config rather than the batch
+//! where the receiver's answer is about the sink's config rather than the batch, and for a `408`,
+//! a proxy giving up on the request's arrival, which a resend can beat
 //! (`remote_write_fault`, falling through to [`crate::http::classify_status`]):
 //!
 //! | Response | Class | Why | Evidence |

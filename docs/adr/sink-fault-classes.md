@@ -484,4 +484,4 @@ unchanged. `kafka_out`'s token fetches have their own tables.
 Consequence: a `408` that repeats on every attempt, such as a proxy timeout shorter than the
 time a large body takes to arrive, now holds the queue and retries with backoff where it used
 to drop each batch. `logit.component.retrying` reads `1` while it holds, and `at_most_once` still
-drops the batch. The `standin-influxdb*` soak scenarios cue a `408` as `ambiguous`.
+drops the batch. The `standin-remote-write` and `standin-influxdb*` soak scenarios cue a `408` as `ambiguous`.
