@@ -838,3 +838,50 @@ fn a_server_name_wraps_the_bundled_roots_and_is_ignored_under_insecure_skip_veri
     assert!(insecure.contains("AcceptAnyServerCert"), "{insecure}");
     assert!(!insecure.contains("VerifyAsServerName"), "{insecure}");
 }
+
+// --- session resumption ---
+
+/// The handshake kind of a connection to `addr` dialing `dialed`, after one echoed frame. A
+/// TLS 1.3 ticket arrives after the handshake, and the client stores it only once it reads, so
+/// the round trip is what makes the next connection resumable.
+async fn handshake_kind_of(
+    addr: SocketAddr,
+    config: &Arc<rustls::ClientConfig>,
+    dialed: &str,
+) -> rustls::HandshakeKind {
+    let tcp = TcpStream::connect(addr).await.unwrap();
+    let name = rustls_pki_types::ServerName::try_from(dialed.to_owned()).unwrap();
+    let mut stream = tokio::time::timeout(
+        RECV_TIMEOUT,
+        TlsConnector::from(Arc::clone(config)).connect(name, tcp),
+    )
+    .await
+    .expect("handshake timed out")
+    .expect("handshake");
+    assert!(round_trips(&mut stream).await, "the echo failed");
+    stream.get_ref().1.handshake_kind().expect("a completed handshake")
+}
+
+#[tokio::test]
+async fn a_server_name_client_resumes_a_session() {
+    let addr = serve_fixture("server-named", None).await;
+    let config = Arc::new(named_client("tls-resume-server-name", Some("logit.test")).cfg);
+
+    let first = handshake_kind_of(addr, &config, "127.0.0.1").await;
+    let second = handshake_kind_of(addr, &config, "127.0.0.1").await;
+
+    assert_eq!(first, rustls::HandshakeKind::Full);
+    assert_eq!(second, rustls::HandshakeKind::Resumed, "server_name defeated resumption");
+}
+
+#[tokio::test]
+async fn a_client_without_a_server_name_resumes_a_session() {
+    let addr = serve_fixture("server", None).await;
+    let config = Arc::new(named_client("tls-resume-no-server-name", None).cfg);
+
+    let first = handshake_kind_of(addr, &config, "localhost").await;
+    let second = handshake_kind_of(addr, &config, "localhost").await;
+
+    assert_eq!(first, rustls::HandshakeKind::Full);
+    assert_eq!(second, rustls::HandshakeKind::Resumed);
+}
