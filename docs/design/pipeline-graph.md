@@ -391,8 +391,8 @@ a black hole counts what it discards as `events.discarded`.
     `collectd_out` value below 1024.
 39. An `aggregate` bound that can hold nothing: under `temporality: cumulative`, a
     `series_retention` or `max_retained_series` of `0`; in either mode, `series_retention` above `0`
-    with `max_retained_series: 0`, a `max_series` of `0`, and a `max_samples_per_series` or
-    `max_set_members_per_series` of `0`.
+    with `max_retained_series: 0`, a `max_series` or `max_series_per_metric` of `0`, and a
+    `max_samples_per_series` or `max_set_members_per_series` of `0`.
 40. A scrape-mode `prometheus_in` with a bad target URL, `timeout: 0s`, a bad `scrape_tls:`, or a
     reserved or colliding header.
 41. A registry-mode `prometheus_out` `path` not starting with `/`, or `max_series: 0`.

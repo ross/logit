@@ -32,7 +32,7 @@
 //! groups ([`SeriesBudget`]). It's checked only where a record would open a series: a record for a
 //! held series is always absorbed, and a pass-through record never reaches the check. At a full
 //! cap, one retained series not updated this window makes room for each new one, in the flush
-//! cap's order (most idle, then newest), counted
+//! cap's order ([`EvictionRank`]: most idle, then newest, an overflow series last), counted
 //! `logit.transform.series.evicted{reason="series_limit"}`. A series updated this window is never
 //! evicted to make room: with none left, the record is dropped and counted
 //! `logit.transform.metrics.dropped{reason="series_limit"}`. A refused record creates no group. An
@@ -100,8 +100,8 @@
 
 use bytes::Bytes;
 use logit_core::attrs::{
-    CLOSED_BUCKETED, CLOSED_FLAGGED, CLOSED_TIMESTAMPED, HOST_NAME, METRICS_CLOSED,
-    METRICS_FIELDS, OVERFLOW,
+    CLOSED_BUCKETED, CLOSED_FLAGGED, CLOSED_TIMESTAMPED, HOST_NAME, METRICS_CLOSED, METRICS_FIELDS,
+    OVERFLOW,
 };
 use logit_core::interner::Symbol;
 use logit_core::{
@@ -243,8 +243,9 @@ pub struct Aggregator {
     series_retention: u32,
     /// Cap on retained series across all resource groups: a cardinality guard, not a tuning knob.
     /// `series_retention` bounds how long one series survives; this bounds how many can be retained
-    /// at once, against a stream of never-repeating series names. Evicts the most idle first, then
-    /// the newest among equally idle series. Meaningless while `series_retention` is `0`.
+    /// at once, against a stream of never-repeating series names. Evicts in [`EvictionRank`]'s
+    /// order: the most idle first, then the newest among equally idle series, an overflow series
+    /// last. Meaningless while `series_retention` is `0`.
     max_retained_series: usize,
     /// How many series are held and how many may be; see this module's "The series cap".
     budget: SeriesBudget,
@@ -671,7 +672,11 @@ impl SeriesBudget {
     /// one place a new series is admitted: `process` asks only where a record would open a
     /// series, so a held series never pays for it. `is_overflow` is asked only under the per-name
     /// limit.
-    fn admit(&mut self, key: &SeriesKey, is_overflow: impl FnOnce(&SeriesKey) -> bool) -> Admission {
+    fn admit(
+        &mut self,
+        key: &SeriesKey,
+        is_overflow: impl FnOnce(&SeriesKey) -> bool,
+    ) -> Admission {
         let Some(limit) = self.per_name else {
             return self.admit_slot();
         };
@@ -1134,8 +1139,7 @@ impl Aggregator {
                     None => {
                         let (overflow, classes) = (&self.overflow, &mut self.key_classes);
                         let admission = self.budget.admit(&key, |k| overflow.is(k, classes));
-                        let Some(settled) =
-                            self.settle_admission(None, admission, key, &mut tally)
+                        let Some(settled) = self.settle_admission(None, admission, key, &mut tally)
                         else {
                             continue;
                         };
@@ -1977,7 +1981,11 @@ impl KeyClasses {
     /// The field-namespace keys among `attributes`, plus `fields_flag` when present: the flag
     /// announces those keys, so it leaves the series key with them, and a series whose readings
     /// differ only in whether they carried a string field stays one series.
-    fn string_fields(&mut self, attributes: &AttrMap, fields_flag: Symbol) -> SmallVec<[Symbol; 4]> {
+    fn string_fields(
+        &mut self,
+        attributes: &AttrMap,
+        fields_flag: Symbol,
+    ) -> SmallVec<[Symbol; 4]> {
         attributes
             .iter()
             .map(|(key, _)| key)
@@ -2038,9 +2046,10 @@ impl OverflowKey {
     /// [`OverflowKey::of`] would remove. A key without the marker answers after one lookup.
     fn is(&self, key: &SeriesKey, classes: &mut KeyClasses) -> bool {
         matches!(key.attributes.get_sym(self.marker), Some(Value::Bool(true)))
-            && key.attributes.iter().all(|(k, _)| {
-                k == self.marker || k == self.host_name || classes.is_private(k)
-            })
+            && key
+                .attributes
+                .iter()
+                .all(|(k, _)| k == self.marker || k == self.host_name || classes.is_private(k))
     }
 }
 
@@ -5296,7 +5305,8 @@ mod tests {
             let mut agg =
                 Aggregator::new(Duration::from_secs(10)).with_max_series_per_metric(Some(1));
             for path in ["/a", "/b"] {
-                let event = metric_event_with_tags("p", MetricKind::counter(1.0), 0, &[("path", path)]);
+                let event =
+                    metric_event_with_tags("p", MetricKind::counter(1.0), 0, &[("path", path)]);
                 feed(&mut agg, &resource, event);
             }
 
@@ -6521,7 +6531,9 @@ mod tests {
                 .with_max_series_per_metric(Some(1)),
         );
         let resource = default_resource();
-        let gauge = |path: &str| metric_event_with_tags("g", MetricKind::gauge(1.0), 150, &[("path", path)]);
+        let gauge = |path: &str| {
+            metric_event_with_tags("g", MetricKind::gauge(1.0), 150, &[("path", path)])
+        };
         feed(&mut agg, &resource, gauge("/a"));
         feed(&mut agg, &resource, gauge("/b")); // opens the overflow series
         agg.flush(100);
@@ -6549,9 +6561,8 @@ mod tests {
     /// the one-off series opened before it.
     #[test]
     fn the_flush_cap_evicts_an_overflow_series_last() {
-        let mut agg = cumulative_agg()
-            .with_series_retention(5, 2)
-            .with_max_series_per_metric(Some(2));
+        let mut agg =
+            cumulative_agg().with_series_retention(5, 2).with_max_series_per_metric(Some(2));
         let resource = default_resource();
         for path in ["/a", "/b", "/c"] {
             feed(&mut agg, &resource, tagged_counter("req", 1.0, &[("path", path)]));
@@ -6569,7 +6580,8 @@ mod tests {
     /// series admitted once a slot frees starts at zero: nothing counts twice.
     #[test]
     fn a_cumulative_overflow_total_is_monotonic_and_a_later_series_starts_at_zero() {
-        let mut agg = cumulative_agg().with_series_retention(1, 100).with_max_series_per_metric(Some(1));
+        let mut agg =
+            cumulative_agg().with_series_retention(1, 100).with_max_series_per_metric(Some(1));
         let resource = default_resource();
         feed(&mut agg, &resource, tagged_counter("req", 1.0, &[("path", "/a")]));
         feed(&mut agg, &resource, tagged_counter("req", 2.0, &[("path", "/b")]));
@@ -6689,8 +6701,7 @@ mod tests {
                 Aggregator::new(Duration::from_secs(10)).with_max_series_per_metric(Some(2));
             let resource = default_resource();
             let feed_req = |agg: &mut Aggregator, name: &str, id: &str| {
-                let event =
-                    tagged_counter(name, 1.0, &[("region", "eu"), ("request_id", id)]);
+                let event = tagged_counter(name, 1.0, &[("region", "eu"), ("request_id", id)]);
                 feed(agg, &resource, event);
             };
             feed_req(&mut agg, "quiet", "q1");

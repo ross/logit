@@ -181,7 +181,9 @@ Details an agent needs beyond the table:
   timestamps do, and keeps a carrier beside it only for a fact the flag doesn't carry
   ([ADR `metric-flags`](docs/adr/metric-flags.md),
   [ADR `protocol-knowledge-stays-in-family`](docs/adr/protocol-knowledge-stays-in-family.md)'s
-  "Amendment: move, don't mirror (2026-10-23)").
+  "Amendment: move, don't mirror (2026-10-23)"). `max_series_per_metric`, off by default, folds a
+  name's new series past its limit into one series marked `logit.overflow: true`, known by its key
+  alone (`aggregate.rs`'s module doc, "The per-name limit").
 - **`lua`**: `Event.new(t)` makes every payload constructible from Lua as the inverse of
   `event:to_table()`, with `flush(now)` supplying a flush-driven emission's timestamp. The Lua
   surface covers `event.metrics`, `event.span`, `scope`, and the log/resource fields. See

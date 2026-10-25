@@ -15,7 +15,7 @@
 //!   design.
 //! - XFORM-03 and XFORM-04, retention: [`Model::flush`] keeps a retainable series across the
 //!   flush, evicts it after `series_retention` idle flushes or by the global `max_retained_series`
-//!   cap (most idle first, then newest), and clamps its start time into its window. The model
+//!   cap (most idle first, then newest, an overflow series last), and clamps its start time into its window. The model
 //!   checks every survivor's state and the series accounting identity. `aggregate`'s own tests
 //!   drive the cap at volume (`cap_soak`).
 //! - The series budget: [`Model::absorb`] restates `max_series` (an idle series evicted to make
@@ -1189,7 +1189,10 @@ struct Model {
 /// `host.name` beside it.
 fn ref_is_overflow(key: &RefKey) -> bool {
     key.attrs.iter().any(|(k, v)| k == OVERFLOW && matches!(v, Value::Bool(true)))
-        && key.attrs.iter().all(|(k, _)| k == OVERFLOW || k == HOST_NAME || k.starts_with("_logit."))
+        && key
+            .attrs
+            .iter()
+            .all(|(k, _)| k == OVERFLOW || k == HOST_NAME || k.starts_with("_logit."))
 }
 
 /// `key`'s overflow series: the private keys and `host.name`, plus the marker.

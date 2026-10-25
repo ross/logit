@@ -149,6 +149,10 @@ Entry format and the other areas: [the known-gaps index](README.md).
   - **Workaround:** bound cardinality upstream so the cap isn't reached. A `keep` ahead of
     `aggregate` limits which attributes reach it, and `keep_values` limits the values one
     attribute can take. `logit.transform.series.active` shows the peak each window.
+  - **`max_series_per_metric` has the same shape per name:** once a name holds its limit's
+    series, a series of it whose first record arrives later folds into the overflow series
+    every window, while the series that arrived first keep their slots.
+    `logit.transform.metrics.overflowed` counts the folds, and the same workaround applies.
 - **A lookup that misses `find_group`'s memo walks every `(resource, scope)` group.** `max_series`
   bounds the group count at twice its value: every group but one emptied by an eviction holds a
   series, and an emptied group stays until the flush, so a window holds at most `max_series` groups

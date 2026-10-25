@@ -2745,7 +2745,8 @@ pub enum ComponentKind {
         /// one series survives, so a stream of never-repeating series names would otherwise hold
         /// unboundedly many. Defaults to `10000`. The most idle series are evicted first, and among
         /// equally idle ones the most recently created, so a series that has survived one flush
-        /// outlives one-off series created after it. A series that arrives after the one-off
+        /// outlives one-off series created after it; a `max_series_per_metric` overflow series
+        /// goes last. A series that arrives after the one-off
         /// series in every window is the newest every time and is evicted at every flush; a
         /// `logit.transform.series.evicted{reason="cardinality", state="active"}` count at every
         /// flush means more series are active than the cap holds, so raise this or bound
