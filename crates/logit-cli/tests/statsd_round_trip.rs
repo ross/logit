@@ -1329,6 +1329,7 @@ mod tls {
                 cert_file: Some("client.pem".to_string()),
                 key_file: Some("client.key".to_string()),
                 insecure_skip_verify: false,
+                server_name: None,
             },
             &sent,
         )
