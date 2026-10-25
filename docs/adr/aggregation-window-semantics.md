@@ -739,9 +739,10 @@ rule that summarization is opt-in and named.
 ### The groups bound
 
 `max_retained_series` bounds series, not groups. The number of distinct `(resource, scope)`
-groups within one window is unbounded, and a realistic count reaches the thousands (an `otlp_in`
-gateway, or `prometheus_in` with a resource per scrape target). Finding a metric's group has to
-stay cheap as that count grows.
+groups within one window is bounded only by `max_series`, at most twice it ("Amendment: two caps
+on the series one `aggregate` holds (2026-10-24)" below), and a realistic count reaches the
+thousands (an `otlp_in` gateway, or `prometheus_in` with a resource per scrape target). Finding a
+metric's group has to stay cheap as that count grows.
 
 **`group_for` answers from a one-entry memo, and on a miss compares a stored hash before the full
 compare.** Three parts make that up:
@@ -1042,8 +1043,9 @@ port) grows it without bound. Two `aggregate` fields bound it, and they answer d
 questions:
 
 - **`max_series`** (default `100000`) is a hard memory bound. A record that would open a series
-  past it evicts the most idle retained series to make room, and is dropped and counted as loss
-  only when no held series has sat out a whole window.
+  past it evicts one retained series that hasn't absorbed this window, the most idle first, to
+  make room. It's dropped and counted as loss only when every held series has absorbed this
+  window.
 - **`max_series_per_metric`** (off by default, and recommended) is a per-name cardinality limit
   in the shape of the OpenTelemetry SDK's. A record that would open a series past it folds into
   one overflow series for its name, so the name's totals stay correct and its attribute detail is
@@ -1057,31 +1059,41 @@ record.
 
 - **Only opening a series is checked.** A record for a series that already exists keeps absorbing
   past the cap, so a full stage still aggregates every series it holds. A record that passes
-  through for a reason this ADR already names (`closed`, `no_recorded_value`, `no_merge_rule`,
+  through for a reason this ADR already names (a record on a `_logit.metrics.closed` event,
+  counted `bucketed`, `timestamped`, or `flagged`, and `no_recorded_value`, `no_merge_rule`, and
   `non_finite`) never reaches the series map and is unaffected.
-- **A full cap evicts idle retained series first.** When a new series would pass the cap and the
-  stage holds retained series that have sat out at least one whole window (`idle_windows > 0`),
-  the most idle are evicted in
-  the flush cap's order (most idle, then newest), counted as
-  `logit.transform.series.evicted{reason="cardinality", state="idle"}`, and the new series opens.
-  One scan evicts every series at the current highest idle tier, so a window makes at most
-  `series_retention` scans. The stage tracks how many idle series it holds, so a full cap with
-  none costs no scan.
-- **A record is dropped only when no held series has sat out a whole window.** It's counted as
+- **A full cap evicts one retained series that hasn't absorbed this window.** The candidates are
+  the held series with `updated_this_window` false, whatever their `idle_windows`, including a
+  series emitted at the last flush that hasn't absorbed since. `idle_windows` alone isn't the test:
+  `process` sets `updated_this_window` and never writes `idle_windows`, so a retained series that
+  absorbs this window still carries the count from before. Each admission evicts one candidate, in
+  the flush cap's order (`idle_windows` descending, then `open_seq` descending), counted as
+  `logit.transform.series.evicted{reason="series_limit"}`, with no `state` tag because the series
+  is always idle. `reason="cardinality"` stays the flush-time `max_retained_series` cap's.
+- **The eviction order is built once per window, on the overload path.** The first full-cap
+  admission in a window scans and sorts the candidates, the only allocation the cap adds, and each
+  later admission pops the next one, skipping any that has absorbed since. The order is rebuilt
+  only when it runs out while candidates may remain, and is discarded at flush.
+- **A record is dropped only when every held series has absorbed this window.** It's counted as
   `logit.transform.metrics.dropped{reason="series_limit"}`, with a throttled diagnostic that names
   the cap and points at `keep`, `keep_values`, and raising `max_series`. The diagnostic prints the
   cap and no other config.
-- **An active series is never evicted to make room.** `cumulative_to_delta`'s and
-  `prometheus_out`'s `max_series` evict the least recently updated series instead. They hold one
-  baseline or one exposed sample per series, which the next point rebuilds. An `aggregate` series
-  updated this window holds the window's only copy of what it absorbed, so evicting it would lose
-  a window of one series' data to admit one record.
+- **A series that has absorbed this window is never evicted to make room.**
+  `cumulative_to_delta`'s and `prometheus_out`'s `max_series` evict the least recently updated
+  series instead, whatever it holds. In `cumulative_to_delta` that loses the counts between the
+  evicted series' last point and its next, which arrives as a first point. An `aggregate` series
+  that has absorbed this window holds the window's only copy of what it absorbed, so evicting it
+  would lose a window of one series' data to admit one record.
 - **A refused record leaves no group behind.** `group_for` opens and memoizes a `ResourceGroup`
   on a miss, and a group leaves only at flush, through
   `self.groups.retain(|g| !g.series.is_empty())`. A record whose group doesn't exist opens a new
   series by definition, so the lookup takes a path that creates nothing: at a full cap the record
-  is refused before any group opens or is memoized. Every group holds at least one series, and
-  `max_series` also bounds the group count.
+  is refused before any group opens or is memoized.
+- **The group count is at most twice `max_series` within a window.** An admission eviction can
+  empty a group, and the empty group stays until flush's `retain`, so `process`'s `group_index`
+  and the `last_group` memo stay valid. Every other group holds at least one series, so the count
+  is at most `max_series` plus the window's admission evictions, and each eviction admits one
+  series, which bounds both at `max_series`.
 - **The existing-series path gains no allocation and no second hash.** The cap is read only on the
   vacant-entry path, where a series is about to be built anyway. An allocation pin in
   `crates/logit-bench/tests/allocations.rs` that moves for the cap is a defect, not a constant to
@@ -1096,14 +1108,17 @@ The "Accounting identities" records identity gains a term:
 `metrics_in == absorbed + passed_through{reason} + dropped{reason}`
 
 where `dropped{reason}` is `logit.transform.metrics.dropped{reason}`, whose one reason is
-`series_limit`. The series identity is unchanged, because a refused record never opens a series.
+`series_limit`. The series identity covers flush-time removals only. A series evicted between
+flushes was never in `series_at_flush_start`, so it adds no term there; it's counted under
+`series.evicted{reason="series_limit"}`, and a refused record never opens a series.
 
 ### `max_series_per_metric`: an overflow series per name
 
 `max_series_per_metric` counts the series held for each metric **name** (the record's `name`
 symbol) across the whole stage, not per group, scope, or unit. It counts active and retained
-series, and a series removed at flush (emitted and removed, evicted as idle, or evicted by the
-cardinality cap) frees its name's slot. Graph rule 39 rejects `0`.
+series. A series removed at flush (emitted and removed, evicted as idle, or evicted by the
+cardinality cap) frees its name's slot, as does one evicted between flushes to admit a new series
+under `max_series`. Graph rule 39 rejects `0`.
 
 Past the limit, a record that would open a new series folds into an **overflow series** instead:
 
@@ -1112,8 +1127,8 @@ Past the limit, a record that would open a new series folds into an **overflow s
   keys (after the `_logit.field.*` pruning) and its `host.name`. The private keys carry the
   protocol carriers and metric flags a sink in the record's family reads, and `host.name` is the
   host every sink writes, so dropping either would change what the sink sends for the folded
-  point. One name can split into a few overflow series this way, one per distinct carrier set and
-  host, and `max_series` bounds them.
+  point. One name can split into an overflow series per group, carrier set, and host, and
+  `max_series` bounds how many.
 - **`logit.overflow` is public**, a `logit.` attribute, not a private `_logit.` one: it reaches
   the backend, where it marks the point as folded. A `keep` placed after `aggregate` strips it
   unless `keep` lists it.
