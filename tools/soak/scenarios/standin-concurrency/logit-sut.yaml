@@ -1,0 +1,25 @@
+# The system under test in `script/soak`'s standin-concurrency scenario: standin-at-most-once's
+# SUT with a 250 ms aggregate window and the sink at `concurrency: 8`, so with the scenario's
+# 1 s delay on its egress several batches are in flight when a cue lands on one of them. Its
+# `internal` telemetry goes to stdout as NDJSON for the harness to read; `script/soak` runs it
+# with `--log-format json`.
+admin: { bind: 127.0.0.1:9600 }     # the image HEALTHCHECK's probe address
+components:
+  statsd: { type: statsd_in, bind: 0.0.0.0:8125 }   # receive: defaults (drop_oldest)
+  window:
+    type: aggregate
+    sources: [statsd]
+    # Four batches a second: over a 1 s round trip, about four in flight.
+    interval: 250ms
+    temporality: cumulative
+    series_retention: 14400         # an hour of windows: a fault must never evict a series
+  remote_write:
+    type: prometheus_out
+    sources: [window]
+    endpoint: http://standin:8080/api/v1/write
+    version: 1
+    compression: snappy
+    concurrency: 8
+    buffer: { delivery: at_most_once }
+  self: { type: internal, interval: 5s, span_sample_rate: 0.0, logs: off }
+  telemetry: { type: stdio_out, sources: [self], format: json }

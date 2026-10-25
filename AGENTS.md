@@ -852,6 +852,12 @@ the operator-facing account of all of this.
   `events.sent − (events.received − events.discarded)`, against 4 × its events received less
   its `lines.dropped`, and every row after it reads the listener's counts carried through the
   chain (W′).
+  `otlp-fan-out-conc` is that run with the generator at `concurrency: 8`, and
+  `http-concurrency` and `http-concurrency-1` send InfluxDB points from `influxdb_out` at
+  `concurrency: 8` and `1` into `http-ingress`'s SUT under a 200 ms delay on its answers, each
+  with `[[expect]]` rows on `logit.output.in_flight` and the generator's `overflow_newest`
+  drops ([plan `sink-request-concurrency`](docs/plans/sink-request-concurrency.md)'s
+  "Findings").
   `tail-rotate` has a writer `generate_in -> file_out` rotate a file in a directory it shares
   with the SUT's `tail_in` (`wire = "file"`, `<run>/shared` mounted by an override): G is the
   writer's `events.delivered`, held to the lines the driver counts in that directory at the end
@@ -899,7 +905,11 @@ the operator-facing account of all of this.
   bucket and org configured, both carried by a `set`, and the bucket carried beside
   `default_org:`, cueing every row of its table with the class each configuration expects; V is
   the stored delta points' sum, one per series and timestamp, since InfluxDB overwrites a
-  resend, and `ledger.standin` holds a rejected step's points to the whole egress gap. See
+  resend, and `ledger.standin` holds a rejected step's points to the whole egress gap.
+  `standin-concurrency` points `prometheus_out` at `concurrency: 8` and `at_most_once` at the
+  remote-write stand-in with several batches in flight, and its `respond` steps' `count = 1`
+  lands a `401`, a `400`, and a reset on one write each: a held head, a batch dropped alone,
+  and one dropped alone `ambiguous_at_most_once`. See
   [tools/soak/README.md](tools/soak/README.md) and [ADR `soak-harness`](docs/adr/soak-harness.md).
 - **Differential corpora**: `script/differential <corpus>` regenerates a corpus of generated
   cases under `testdata/differential/`, each committed beside a reference implementation's
