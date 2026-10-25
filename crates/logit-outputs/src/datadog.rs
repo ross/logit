@@ -872,6 +872,8 @@ pub struct DatadogOutput {
     /// Replaces every route's [`Route::caps`], so a test can bisect a small body.
     #[cfg(test)]
     caps_override: Option<Caps>,
+    /// The operator's `concurrency:`, which the HTTP slot helper reads as this sink's window.
+    concurrency: u32,
 }
 
 impl DatadogOutput {
@@ -886,6 +888,7 @@ impl DatadogOutput {
         })?;
         api_key.set_sensitive(true);
         let mut output = Self {
+            concurrency: 1,
             api_key,
             site: DEFAULT_SITE.to_string(),
             endpoints: DatadogEndpoints::default(),
@@ -940,6 +943,12 @@ impl DatadogOutput {
 
     pub fn with_compression(mut self, compression: DatadogCompression) -> Self {
         self.compression = compression;
+        self
+    }
+
+    /// Sets how many batches may be in flight at once (`concurrency:` in config, default 1).
+    pub fn with_concurrency(mut self, concurrency: u32) -> Self {
+        self.concurrency = concurrency;
         self
     }
 

@@ -116,6 +116,9 @@ pub trait Output {
     /// Writes `batch` without waiting for its delivery, under a window above 1
     /// (`docs/adr/native-hop-send-window.md`, decision 4). `ctx` and `seq` are the batch's, as
     /// [`Output::observe_batch`] last saw them for it; a resubmitted batch isn't observed again.
+    /// After a retryable [`HeadOnly`] fault, `write_loop` submits the oldest batch again alone,
+    /// with every later submission still outstanding: the sink puts it back in the oldest
+    /// position, and its next [`Output::await_ack`] answers it first.
     ///
     /// A failure with nothing in flight is this batch's own, classified as a `send` failure is.
     /// A failure with batches in flight is never classified: `write_loop` stops submitting and
@@ -138,12 +141,16 @@ pub trait Output {
     /// unacknowledged batch. The `Err` carries a [`Fault`], as a `send` failure does. The default
     /// returns `Ok`, matching the default `submit`, which has already delivered.
     ///
-    /// One exception: an `Err` that also carries [`HeadOnly`] (`.context(HeadOnly)`) settles the
-    /// oldest submission alone. The sink kept its connection, and every later submission is still
-    /// outstanding in order, so `write_loop` drops that one batch and goes on waiting for the
-    /// next. The `Fault` with it must be [`Fault::Rejected`]: a retried head would have to be
-    /// resubmitted behind batches already in flight. `logit_out` returns it for a rejected `Ack`
-    /// (`docs/adr/native-hop-ack-status.md`).
+    /// One exception: an `Err` that also carries [`HeadOnly`] (`.context(HeadOnly)`) is the
+    /// oldest submission's fault alone. The sink kept every later submission outstanding, in
+    /// order, and the [`Fault`] beside it decides that one batch's fate as it does for a `send`
+    /// (`docs/adr/sink-request-concurrency.md`, decision 2):
+    /// - [`Fault::Rejected`] drops it, and `write_loop` goes on waiting for the next. `logit_out`
+    ///   returns this for a rejected `Ack` (`docs/adr/native-hop-ack-status.md`).
+    /// - A retryable fault backs off on the loop's schedule, then resubmits it alone through
+    ///   [`Output::submit`] and waits for it again.
+    /// - [`Fault::Ambiguous`] under at-most-once drops it alone; the later submissions stay
+    ///   outstanding.
     async fn await_ack(&mut self) -> anyhow::Result<()> {
         Ok(())
     }
@@ -212,9 +219,9 @@ impl std::fmt::Display for Fault {
     }
 }
 
-/// Marks an [`Output::await_ack`] failure as settling the oldest submission alone, with the
-/// sink's connection and every later submission untouched (that method's doc). Travels as
-/// `anyhow` context beside a [`Fault::Rejected`], read back by [`is_head_only`].
+/// Marks an [`Output::await_ack`] failure as the oldest submission's alone, with every later
+/// submission still outstanding (that method's doc). Travels as `anyhow` context beside any
+/// [`Fault`], read back by [`is_head_only`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HeadOnly;
 

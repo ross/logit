@@ -250,6 +250,8 @@ pub struct InfluxDbOutput {
     /// final send, so it's never repeated by a retry and needs no gate.
     diag: Diagnostics,
     accounting: BatchAccounting,
+    /// The operator's `concurrency:`, which the HTTP slot helper reads as this sink's window.
+    concurrency: u32,
 }
 
 impl InfluxDbOutput {
@@ -260,6 +262,7 @@ impl InfluxDbOutput {
         token: String,
     ) -> Self {
         Self {
+            concurrency: 1,
             url,
             organization,
             destination,
@@ -271,6 +274,12 @@ impl InfluxDbOutput {
             diag: Diagnostics::default(),
             accounting: BatchAccounting::default(),
         }
+    }
+
+    /// Sets how many batches may be in flight at once (`concurrency:` in config, default 1).
+    pub fn with_concurrency(mut self, concurrency: u32) -> Self {
+        self.concurrency = concurrency;
+        self
     }
 
     /// Overrides the default 10s request timeout. Rebuilds the underlying HTTP client.

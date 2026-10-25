@@ -504,6 +504,8 @@ pub struct DatadogTraceOutput {
     /// Replaces [`CAPS`], so a test can drop a small trace as oversize.
     #[cfg(test)]
     caps_override: Option<Caps>,
+    /// The operator's `concurrency:`, which the HTTP slot helper reads as this sink's window.
+    concurrency: u32,
 }
 
 /// The batch accounting's unit for the trace route's encode and tracer headers.
@@ -514,6 +516,7 @@ const STATS_UNIT: u32 = 1;
 impl DatadogTraceOutput {
     fn with_client(client: Client) -> Self {
         let mut output = Self {
+            concurrency: 1,
             client,
             version: TracerApiForm::V04,
             compression: DatadogTraceCompression::default(),
@@ -551,6 +554,12 @@ impl DatadogTraceOutput {
 
     pub fn with_compression(mut self, compression: DatadogTraceCompression) -> Self {
         self.compression = compression;
+        self
+    }
+
+    /// Sets how many batches may be in flight at once (`concurrency:` in config, default 1).
+    pub fn with_concurrency(mut self, concurrency: u32) -> Self {
+        self.concurrency = concurrency;
         self
     }
 

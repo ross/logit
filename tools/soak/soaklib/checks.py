@@ -1359,7 +1359,7 @@ def component_duration(text, component, key):
 
 # The aggregate window assumed when the SUT config names none.
 DEFAULT_AGGREGATE_INTERVAL_S = 10.0
-# `logit_out`'s `window` and a disk spool's `checkpoint_interval` when the config names none
+# `logit_out`'s `concurrency` and a disk spool's `checkpoint_interval` when the config names none
 # (crates/logit-config, `LogitOut` and `DiskBufferConfig`).
 DEFAULT_HOP_WINDOW = 32
 DEFAULT_CHECKPOINT_INTERVAL_S = 1.0
@@ -1986,7 +1986,7 @@ class Ledger:
         self.per_frame = max((events.get(ts, 0) / n for ts, n in batches.items() if n),
                              default=0.0)
         text = self._sut_config_text(self.inn.service)
-        self.window = component_int(text, sink, "window") or DEFAULT_HOP_WINDOW
+        self.window = component_int(text, sink, "concurrency") or DEFAULT_HOP_WINDOW
         self.hop_checkpoint = (component_duration(text, sink, "checkpoint_interval")
                                or DEFAULT_CHECKPOINT_INTERVAL_S)
 

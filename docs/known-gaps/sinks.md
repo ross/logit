@@ -112,9 +112,10 @@ Entry format and the other areas: [the known-gaps index](README.md).
   (`crates/logit-pipeline/src/runtime.rs`) takes the head batch, calls the sink's `send`, and
   takes the next only after `send` returns. It submits
   several batches together only for a sink whose `Output::window` reads above 1, and the default
-  is 1. Only `logit_out` overrides it (`window:`, [ADR
-  `native-hop-send-window`](../adr/native-hop-send-window.md)). No other sink has a concurrency or
-  pipelining field. The limit holds for `otlp_out` over OTLP/HTTP and OTLP/gRPC alike (the pooled
+  is 1. Only `logit_out` overrides it (`concurrency:`, [ADR
+  `native-hop-send-window`](../adr/native-hop-send-window.md)). The sinks this entry names take a
+  `concurrency:` field too, but each still reports a window of 1 whatever it's set to. The limit
+  holds for `otlp_out` over OTLP/HTTP and OTLP/gRPC alike (the pooled
   gRPC client could multiplex, but `send` never has two requests outstanding), `influxdb_out`,
   `datadog_out`, `datadog_trace_out`, `splunk_hec_out`, and `prometheus_out`'s remote-write mode.
   A batch that needs several requests sends them in turn: `otlp_out` one per signal, and the
@@ -140,7 +141,7 @@ Entry format and the other areas: [the known-gaps index](README.md).
     partition of the SUT also overflowed the 50-batch buffer, and the plan does not split the
     count by fault.
   - **Workaround:** put the long link under `logit_out` to a `logit_in`, which keeps up to
-    `window:` frames in flight, and send from the receiving `logit` to the destination over a
+    `concurrency:` frames in flight, and send from the receiving `logit` to the destination over a
     short hop. Otherwise, move the sink nearer to its destination. Size `buffer.max_batches` and
     `buffer.max_bytes` to ride out a burst, and pick `overflow` for the loss you accept; none
     raises the sustained bound. Fewer, larger batches raise it: a listener that takes

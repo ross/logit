@@ -117,6 +117,7 @@ mod tests {
                     default_bucket: None,
                     default_org: None,
                     token: "T".to_string(),
+                    concurrency: 1,
                 },
             },
         );
@@ -147,6 +148,7 @@ mod tests {
                     default_bucket: None,
                     default_org: None,
                     token: "T".to_string(),
+                    concurrency: 1,
                 },
             },
         );

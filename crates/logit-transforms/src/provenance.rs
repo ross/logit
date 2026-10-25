@@ -427,6 +427,7 @@ mod tests {
                     default_bucket: None,
                     default_org: None,
                     token: "TOKEN".to_string(),
+                    concurrency: 1,
                 },
             },
         );

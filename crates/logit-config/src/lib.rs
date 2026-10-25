@@ -3535,6 +3535,17 @@ pub enum ComponentKind {
         /// The API token. A plain string: write `!env INFLUXDB_TOKEN` to pull it from the
         /// environment rather than inlining it. `!env` works on every other field too.
         token: String,
+        /// How many batches may be in flight at once, each sent before the ones ahead of it are
+        /// answered. At `1` this sink sends one batch per round trip to the destination, which caps
+        /// its throughput on a high-latency link; raise it there. Above `1`, batches can land at
+        /// the destination out of order, and under `buffer.delivery: at_most_once` each batch
+        /// in flight is its own unknown outcome: one whose send fails that way is dropped alone.
+        /// Defaults to `1`; must be between `1` and `1024`.
+        ///
+        /// Of two writes of one point that land out of order, InfluxDB keeps the one that lands
+        /// last.
+        #[serde(default = "default_sink_concurrency")]
+        concurrency: u32,
     },
     /// OTLP logs, metrics, and traces over OTLP/HTTP or OTLP/gRPC. TLS is selected by
     /// `endpoint`'s `https://` scheme.
@@ -3564,6 +3575,19 @@ pub enum ComponentKind {
         /// `http://`/`grpc://` endpoint is rejected.
         #[serde(default)]
         tls: TlsClientConfig,
+        /// How many batches may be in flight at once, each sent before the ones ahead of it are
+        /// answered. At `1` this sink sends one batch per round trip to the destination, which caps
+        /// its throughput on a high-latency link; raise it there. Above `1`, batches can land at
+        /// the destination out of order, and under `buffer.delivery: at_most_once` each batch
+        /// in flight is its own unknown outcome: one whose send fails that way is dropped alone.
+        /// Defaults to `1`; must be between `1` and `1024`.
+        ///
+        /// Logs and traces don't depend on order. Metrics sent to a Prometheus-backed receiver
+        /// need it to accept a series' samples out of timestamp order: VictoriaMetrics does with no
+        /// setting, while Prometheus and Mimir do only with their out-of-order time window open,
+        /// which is off by default, and reject a late sample otherwise.
+        #[serde(default = "default_sink_concurrency")]
+        concurrency: u32,
     },
     /// Sends logs, metrics, events, service checks, APM traces, and APM stats straight to Datadog's
     /// intake API, one request per route a batch needs. Host, service, source, and tags come from
@@ -3624,6 +3648,17 @@ pub enum ComponentKind {
         /// for a histogram, so it's rejected, as the exporter rejects it.
         #[serde(default)]
         histograms: DatadogHistograms,
+        /// How many batches may be in flight at once, each sent before the ones ahead of it are
+        /// answered. At `1` this sink sends one batch per round trip to the destination, which caps
+        /// its throughput on a high-latency link; raise it there. Above `1`, batches can land at
+        /// the destination out of order, and under `buffer.delivery: at_most_once` each batch
+        /// in flight is its own unknown outcome: one whose send fails that way is dropped alone.
+        /// Defaults to `1`; must be between `1` and `1024`.
+        ///
+        /// Datadog keeps one series point per second: of two that land out of order, it keeps
+        /// the one that lands last.
+        #[serde(default = "default_sink_concurrency")]
+        concurrency: u32,
     },
     /// Sends APM traces and tracer-computed stats to a Datadog Agent's trace API (port 8126, or
     /// its Unix socket), as a dd-trace tracer does: the sending half of `datadog_trace_in`, so a
@@ -3668,6 +3703,14 @@ pub enum ComponentKind {
         /// `socket`.
         #[serde(default)]
         tls: TlsClientConfig,
+        /// How many batches may be in flight at once, each sent before the ones ahead of it are
+        /// answered. At `1` this sink sends one batch per round trip to the destination, which caps
+        /// its throughput on a high-latency link; raise it there. Above `1`, batches can land at
+        /// the destination out of order, and under `buffer.delivery: at_most_once` each batch
+        /// in flight is its own unknown outcome: one whose send fails that way is dropped alone.
+        /// Defaults to `1`; must be between `1` and `1024`.
+        #[serde(default = "default_sink_concurrency")]
+        concurrency: u32,
     },
     /// Sends logs, metrics, and spans to Splunk's HTTP Event Collector (HEC) as `/event` JSON, in
     /// the shape the OpenTelemetry Collector's `splunk_hec` exporter writes, so a Splunk index fed
@@ -3733,6 +3776,14 @@ pub enum ComponentKind {
         #[serde(default = "default_splunk_max_body_bytes", with = "human_bytes")]
         #[schemars(with = "String")]
         max_body_bytes: u64,
+        /// How many batches may be in flight at once, each sent before the ones ahead of it are
+        /// answered. At `1` this sink sends one batch per round trip to the destination, which caps
+        /// its throughput on a high-latency link; raise it there. Above `1`, batches can land at
+        /// the destination out of order, and under `buffer.delivery: at_most_once` each batch
+        /// in flight is its own unknown outcome: one whose send fails that way is dropped alone.
+        /// Defaults to `1`; must be between `1` and `1024`.
+        #[serde(default = "default_sink_concurrency")]
+        concurrency: u32,
     },
     /// Produces events to an Apache Kafka topic (3.x and 4.x, or anything that speaks the same
     /// protocol from Kafka 2.4 on) with the Java producer's defaults: `acks: all`, idempotence
@@ -3852,11 +3903,13 @@ pub enum ComponentKind {
         /// How many batches may be sent before the oldest is acknowledged. Raise it on a
         /// high-latency link, where waiting for each acknowledgment before the next batch caps
         /// throughput at one batch per round trip. `1` keeps one batch in flight. The peer may
-        /// answer a smaller window. Under `buffer.delivery: at_most_once`, a fault whose outcome
-        /// is unknown drops every batch in flight, so `1` is the safer choice there. Defaults to
-        /// `32`; must be between `1` and `1024`.
-        #[serde(default = "default_logit_out_window")]
-        window: u32,
+        /// answer a smaller window; on a connection whose peer answered at or above this value,
+        /// the connection's window (`logit.output.window`) is this number. Under
+        /// `buffer.delivery: at_most_once`, a fault whose outcome is unknown drops every batch in
+        /// flight, so `1` is the safer choice there. Defaults to `32`; must be between `1` and
+        /// `1024`.
+        #[serde(default = "default_logit_out_concurrency")]
+        concurrency: u32,
     },
     /// A human-facing debug sink: writes every event as a readable text block to stdout (the
     /// default), stderr, or a file. The dev loop for seeing a whole pipeline's output without a
@@ -4411,6 +4464,21 @@ pub enum ComponentKind {
         /// until the old process exits.
         #[serde(default)]
         reuse_port: bool,
+        /// How many batches may be in flight at once, each sent before the ones ahead of it are
+        /// answered. At `1` this sink sends one batch per round trip to the destination, which caps
+        /// its throughput on a high-latency link; raise it there. Above `1`, batches can land at
+        /// the destination out of order, and under `buffer.delivery: at_most_once` each batch
+        /// in flight is its own unknown outcome: one whose send fails that way is dropped alone.
+        /// Defaults to `1`; must be between `1` and `1024`.
+        ///
+        /// A remote-write receiver expects each series' samples in timestamp order, and one with
+        /// no out-of-order window answers a batch that lands behind a newer one with `400`, which
+        /// drops that batch. VictoriaMetrics accepts out-of-order samples with no setting;
+        /// Prometheus (`storage.tsdb.out_of_order_time_window`) and Mimir
+        /// (`out_of_order_time_window`) accept them only with that window open, which is off by
+        /// default. Sender mode only.
+        #[serde(default = "default_sink_concurrency")]
+        concurrency: u32,
     },
     /// A sink that discards everything, as cheaply as the runtime allows, while the runtime's
     /// own telemetry still counts what it received. Name it as a consumer to discard events by
@@ -4953,8 +5021,14 @@ fn default_logit_out_request_timeout() -> Duration {
 }
 
 /// Mirrors `logit_outputs::logit::DEFAULT_WINDOW`, kept in sync by hand.
-fn default_logit_out_window() -> u32 {
+fn default_logit_out_concurrency() -> u32 {
     32
+}
+
+/// The `concurrency` default of every sink that waits for a response, `logit_out` apart: one
+/// batch in flight.
+pub fn default_sink_concurrency() -> u32 {
+    1
 }
 
 /// Mirrors `logit_outputs::statsd::DEFAULT_MAX_PACKET_BYTES`, kept in sync by hand.
@@ -8108,7 +8182,16 @@ mod tests {
         )
         .unwrap();
         match component.kind {
-            ComponentKind::OtlpOut { endpoint, protocol, headers, paths, compression, tls } => {
+            ComponentKind::OtlpOut {
+                endpoint,
+                protocol,
+                headers,
+                paths,
+                compression,
+                tls,
+                concurrency,
+            } => {
+                assert_eq!(concurrency, 1);
                 assert_eq!(endpoint, "http://tempo:4318");
                 assert_eq!(protocol, OtlpProtocol::Http);
                 assert!(headers.is_empty());
@@ -8283,7 +8366,9 @@ mod tests {
                 headers,
                 tls,
                 histograms,
+                concurrency,
             } => {
+                assert_eq!(concurrency, 1);
                 assert_eq!(api_key, "k");
                 assert_eq!(site, "datadoghq.com");
                 assert_eq!(histograms.mode, DatadogHistogramMode::Distributions);
@@ -8332,7 +8417,9 @@ mod tests {
                 timeout,
                 headers,
                 tls,
+                concurrency,
             } => {
+                assert_eq!(concurrency, 1);
                 assert_eq!(endpoint.as_deref(), Some("http://127.0.0.1:8126"));
                 assert_eq!(socket, None);
                 assert_eq!(version, DatadogTraceVersion::V04);
@@ -8523,7 +8610,9 @@ mod tests {
                 timeout,
                 tls,
                 max_body_bytes,
+                concurrency,
             } => {
+                assert_eq!(concurrency, 1);
                 assert_eq!(endpoint, "https://splunk:8088/services/collector");
                 assert_eq!(token, "t");
                 assert_eq!(compression, SplunkCompression::Gzip);
@@ -9130,21 +9219,27 @@ mod tests {
         )
         .unwrap();
         match component.kind {
-            ComponentKind::LogitOut { endpoint, compression, tls, request_timeout, window } => {
+            ComponentKind::LogitOut {
+                endpoint,
+                compression,
+                tls,
+                request_timeout,
+                concurrency,
+            } => {
                 assert_eq!(endpoint, "central:5140");
                 assert_eq!(compression, Compression::None);
                 assert_eq!(tls, None);
                 assert_eq!(request_timeout, Duration::from_secs(10));
-                assert_eq!(window, 32);
+                assert_eq!(concurrency, 32);
             }
             other => panic!("expected LogitOut, got {other:?}"),
         }
     }
 
     #[test]
-    fn logit_out_window_defaults_to_32() {
+    fn logit_out_concurrency_defaults_to_32() {
         let parse = |json: &str| match serde_json::from_str::<Component>(json).unwrap().kind {
-            ComponentKind::LogitOut { window, .. } => window,
+            ComponentKind::LogitOut { concurrency, .. } => concurrency,
             other => panic!("expected LogitOut, got {other:?}"),
         };
         assert_eq!(
@@ -9154,10 +9249,14 @@ mod tests {
         assert_eq!(
             parse(
                 r#"{"type": "logit_out", "sources": ["in"], "endpoint": "central:5140",
-                    "window": 1}"#
+                    "concurrency": 1}"#
             ),
             1
         );
+        let old_name = serde_json::from_str::<Component>(
+            r#"{"type": "logit_out", "sources": ["in"], "endpoint": "central:5140", "window": 1}"#,
+        );
+        assert!(old_name.is_err(), "'window' has no alias: {old_name:?}");
     }
 
     #[test]
@@ -9409,7 +9508,9 @@ mod tests {
                 headers,
                 endpoint_tls,
                 reuse_port,
+                concurrency,
             } => {
+                assert_eq!(concurrency, 1);
                 assert!(!reuse_port, "opt-in -- no SO_REUSEPORT unless asked for");
                 assert_eq!(bind.as_deref(), Some("127.0.0.1:9464"));
                 assert_eq!(path, "/metrics");

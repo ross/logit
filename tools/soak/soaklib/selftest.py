@@ -7565,7 +7565,7 @@ def _two_sut_driver(root):
 # `window` and `sink`. A kill on collector over +203..+213 ends its life 0.
 TWO_SUT_KILL = (203, 213)
 TWO_SUT_HOP = {"from": "logit", "sink": "hop", "to": "collector", "listener": "hop_in"}
-TWO_SUT_HOP_CONFIG = "  hop: { type: logit_out, endpoint: collector:7400, window: 8 }\n"
+TWO_SUT_HOP_CONFIG = "  hop: { type: logit_out, endpoint: collector:7400, concurrency: 8 }\n"
 TWO_SUT_COLLECTOR_CONFIG = ("components:\n"
                             "  window:\n"
                             "    type: aggregate\n"

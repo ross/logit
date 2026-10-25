@@ -216,6 +216,8 @@ pub struct OtlpOutput {
     /// `Some` once [`OtlpOutput::with_tls`] set a non-empty `tls:`. `None` means each transport's
     /// default TLS config, not "TLS off": the scheme decides TLS.
     tls: Option<rustls::ClientConfig>,
+    /// The operator's `concurrency:`, which the HTTP slot helper reads as this sink's window.
+    concurrency: u32,
 }
 
 impl OtlpOutput {
@@ -223,6 +225,7 @@ impl OtlpOutput {
         let accounting = BatchAccounting::default();
         let (telemetry, diag) = (Telemetry::default(), Diagnostics::default());
         Ok(Self {
+            concurrency: 1,
             endpoint,
             transport,
             client: build_client(DEFAULT_TIMEOUT, None),
@@ -238,6 +241,12 @@ impl OtlpOutput {
             compression: OtlpCompression::default(),
             tls: None,
         })
+    }
+
+    /// Sets how many batches may be in flight at once (`concurrency:` in config, default 1).
+    pub fn with_concurrency(mut self, concurrency: u32) -> Self {
+        self.concurrency = concurrency;
+        self
     }
 
     /// Overrides the default 10s request timeout. Over HTTP it's `reqwest`'s timeout; over gRPC

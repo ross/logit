@@ -236,7 +236,7 @@ Entry format and the other areas: [the known-gaps index](README.md).
   - **Revisit trigger:** `logit.input.batches.resends` climbing after reconnects that the resume
     should have absorbed.
 
-- **Coalesced acks cost about 2 points of a window's ceiling under 10 ms RTT.** At `window: 32`
+- **Coalesced acks cost about 2 points of a window's ceiling under 10 ms RTT.** At `concurrency: 32`
   and a 10 ms round trip (`tc qdisc ... netem delay 5ms`), `logit_in`'s named acks
   ([ADR `native-hop-named-acks`](../adr/native-hop-named-acks.md)) reach 97.2% of the 3,174
   batches/s ceiling against 99.5% for per-frame acks, over 8 repeats each, and every named-ack

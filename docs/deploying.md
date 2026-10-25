@@ -4502,11 +4502,11 @@ components:
       client_ca_file: /etc/logit/tls/ca.pem   # omit for server-auth-only TLS
 ```
 
-**Send window.** `logit_out` keeps up to `window` frames in flight on one connection before it
-waits for the oldest one's `Ack` ([ADR `native-hop-send-window`](adr/native-hop-send-window.md)).
+**Send window.** `logit_out` keeps up to `concurrency` frames in flight on one connection before
+it waits for the oldest one's `Ack` ([ADR `native-hop-send-window`](adr/native-hop-send-window.md)).
 The default is `32`. With one frame in flight, throughput is capped at one batch per round trip,
-whatever the hardware: about 100 batches/s on a link with a 10 ms round-trip time. Raise `window`
-on a link with higher latency, up to `1024`:
+whatever the hardware: about 100 batches/s on a link with a 10 ms round-trip time. Raise
+`concurrency` on a link with higher latency, up to `1024`:
 
 ```yaml
 # edge
@@ -4514,12 +4514,14 @@ on a link with higher latency, up to `1024`:
     type: logit_out
     sources: [edge_in]
     endpoint: central.internal:5140
-    window: 256
+    concurrency: 256
 ```
 
-The connection uses the smaller of `window` and what `logit_in` answers, which is the offered
-window capped at `1024`. A memory buffer's `max_batches` also caps it, since a batch in flight
-stays in the sink's queue until its `Ack` arrives. `window: 1` keeps one frame in flight.
+`concurrency` is the window `logit_out` offers in its handshake. The connection's window, which
+`logit.output.window` reports, is the smaller of `concurrency` and what `logit_in` answers, the
+offered value capped at `1024`, so it equals `concurrency` whenever `logit_in` answers at or above
+it. A memory buffer's `max_batches` also caps it, since a batch in flight stays in the sink's queue
+until its `Ack` arrives. `concurrency: 1` keeps one frame in flight.
 
 **What an `Ack` means.** An `Ack` names a sender identity and a sequence, and covers every frame of
 that identity up to the sequence that its connection carried, so one `Ack` can answer several
@@ -4545,7 +4547,7 @@ same connection, with no reconnect. A frame whose compressed size is past that b
 `logit_out` checks the cap before sending and never sends either oversize frame, so in practice the
 decode budget is the case you meet: to stop it, send smaller batches.
 
-**Under `buffer.delivery: at_most_once`, set `window: 1`.** An ambiguous fault (a lost or late
+**Under `buffer.delivery: at_most_once`, set `concurrency: 1`.** An ambiguous fault (a lost or late
 `Ack`, a reset) drops every batch in flight, not only the oldest, because each one may or may not
 have been forwarded. Under the default `at_least_once`, the same fault retries the window from the
 oldest unacknowledged batch, resuming rather than resending (below). Nothing enforces the pairing;
@@ -4683,9 +4685,9 @@ reconnecting doesn't show as `connection_error` on the far end.
   of resending), `logit.output.ack.duration` (one sample per read of the wire for an `Ack`, so a
   coalesced `Ack` is timed once), `logit.output.in_flight` (a gauge of frames not yet committed, set
   from the first connection on and 0 after any drop; one that sits at the window means the round
-  trip or the peer's forwarding is the limit, and raising `window` helps only in the first case),
+  trip or the peer's forwarding is the limit, and raising `concurrency` helps only in the first case),
   and `logit.output.window` (a gauge of the live connection's negotiated window, set from the first
-  connection on and 1 after any drop or a shutdown; below the configured `window` on a live
+  connection on and 1 after any drop or a shutdown; below the configured `concurrency` on a live
   connection means `logit_in` answered less).
 - `logit_in`: `logit.input.connections` (a gauge that should match the number of connected
   `logit_out` peers), `logit.input.acks` (`Ack`s written; against

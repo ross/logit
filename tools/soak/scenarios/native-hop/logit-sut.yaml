@@ -9,7 +9,7 @@ components:
     type: logit_out
     sources: [statsd]
     endpoint: collector:7400
-    window: 32
+    concurrency: 32
     request_timeout: 10s
     # The driver kills and starts this container but never recreates it, so a directory in its
     # own filesystem survives the kill with no volume.

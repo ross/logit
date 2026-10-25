@@ -1234,22 +1234,26 @@ pub(crate) fn build_spec(
             DropProvenanceTransform::new(origin.clone(), previous.clone()),
         )),
 
-        InfluxDbOut { url, org, default_org, bucket, default_bucket, token } => NodeSpec::Output(
-            Box::new(
-                InfluxDbOutput::new(
-                    url.clone(),
-                    Organization::from_config(org.clone(), default_org.clone()),
-                    Destination::from_config(bucket.clone(), default_bucket.clone()),
-                    token.clone(),
-                )
-                .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
-                .with_telemetry(telemetry.clone()),
-            ),
-            queue_config(&component.buffer, base_dir),
-            write_config(&component.buffer),
-        ),
-        OtlpOut { endpoint, protocol, headers, paths, compression, tls } => {
+        InfluxDbOut { url, org, default_org, bucket, default_bucket, token, concurrency } => {
+            NodeSpec::Output(
+                Box::new(
+                    InfluxDbOutput::new(
+                        url.clone(),
+                        Organization::from_config(org.clone(), default_org.clone()),
+                        Destination::from_config(bucket.clone(), default_bucket.clone()),
+                        token.clone(),
+                    )
+                    .with_concurrency(*concurrency)
+                    .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
+                    .with_telemetry(telemetry.clone()),
+                ),
+                queue_config(&component.buffer, base_dir),
+                write_config(&component.buffer),
+            )
+        }
+        OtlpOut { endpoint, protocol, headers, paths, compression, tls, concurrency } => {
             let output = OtlpOutput::new(endpoint.clone(), otlp_out_transport(*protocol))?
+                .with_concurrency(*concurrency)
                 .with_headers(headers)?
                 .with_paths(to_signal_paths(paths))
                 .with_compression(to_otlp_compression(*compression))
@@ -1262,8 +1266,19 @@ pub(crate) fn build_spec(
                 write_config(&component.buffer),
             )
         }
-        DatadogOut { api_key, site, endpoints, compression, timeout, headers, tls, histograms } => {
+        DatadogOut {
+            api_key,
+            site,
+            endpoints,
+            compression,
+            timeout,
+            headers,
+            tls,
+            histograms,
+            concurrency,
+        } => {
             let output = DatadogOutput::new(api_key)?
+                .with_concurrency(*concurrency)
                 .with_site(site.clone())
                 .with_default_host(hostname.clone())
                 .with_histograms(to_datadog_histograms(histograms))
@@ -1287,7 +1302,16 @@ pub(crate) fn build_spec(
                 write_config(&component.buffer),
             )
         }
-        DatadogTraceOut { endpoint, socket, version, compression, timeout, headers, tls } => {
+        DatadogTraceOut {
+            endpoint,
+            socket,
+            version,
+            compression,
+            timeout,
+            headers,
+            tls,
+            concurrency,
+        } => {
             // Rule 67 has already required one of `endpoint`/`socket`, not both.
             let output = match (endpoint, socket) {
                 (Some(endpoint), _) => DatadogTraceOutput::http(endpoint.clone()),
@@ -1295,6 +1319,7 @@ pub(crate) fn build_spec(
                 (None, None) => anyhow::bail!("datadog_trace_out needs 'endpoint' or 'socket'"),
             };
             let output = output
+                .with_concurrency(*concurrency)
                 .with_version(match version {
                     logit_config::DatadogTraceVersion::V04 => TracerApiForm::V04,
                     logit_config::DatadogTraceVersion::V07 => TracerApiForm::V07,
@@ -1324,8 +1349,10 @@ pub(crate) fn build_spec(
             timeout,
             tls,
             max_body_bytes,
+            concurrency,
         } => {
             let output = SplunkHecOutput::new(endpoint.clone(), token)?
+                .with_concurrency(*concurrency)
                 .with_compression(splunk_compression(*compression))
                 .with_multi_value(splunk_multi_value(*multi_value))
                 // Rule 70 allows `ack_timeout` only with `ack`; the default applies under `ack`.
@@ -1428,11 +1455,11 @@ pub(crate) fn build_spec(
                 write_config(&component.buffer),
             )
         }
-        LogitOut { endpoint, compression, tls, request_timeout, window } => {
+        LogitOut { endpoint, compression, tls, request_timeout, concurrency } => {
             let mut output = LogitOutput::new(endpoint.clone())
                 .with_compression(to_native_compression(*compression))
                 .with_timeout(*request_timeout)
-                .with_window(*window)
+                .with_concurrency(*concurrency)
                 .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
                 .with_telemetry(telemetry.clone());
             if let Some(tls) = tls {
@@ -1629,6 +1656,7 @@ pub(crate) fn build_spec(
             headers,
             endpoint_tls,
             reuse_port,
+            concurrency,
         } => {
             // Graph rule 56 guarantees exactly one mode field; `PrometheusOutput` carries the
             // choice as a variant from here on.
@@ -1646,6 +1674,7 @@ pub(crate) fn build_spec(
                         .into()
                 }
                 (None, Some(endpoint)) => RemoteWriteOutput::new(endpoint.clone())
+                    .with_concurrency(*concurrency)
                     .with_version(to_remote_write_version(*version))
                     .with_compression(to_remote_write_encoding(*compression))
                     .with_timeout(*timeout)
@@ -2696,6 +2725,7 @@ mod tests {
                 default_bucket: None,
                 default_org: None,
                 token: "test-token".to_string(),
+                concurrency: 1,
             },
         }
     }
@@ -2742,6 +2772,7 @@ mod tests {
                         timeout: logit_config::default_splunk_timeout(),
                         tls: logit_config::TlsClientConfig::default(),
                         max_body_bytes: 800 * 1024 * 1024,
+                        concurrency: 1,
                     },
                 },
             ),
@@ -2926,6 +2957,7 @@ mod tests {
                 default_bucket: None,
                 default_org: None,
                 token: "test-token".to_string(),
+                concurrency: 1,
             },
         };
         assert!(matches!(
@@ -3221,6 +3253,7 @@ mod tests {
                 headers: HashMap::new(),
                 endpoint_tls: logit_config::TlsClientConfig::default(),
                 reuse_port: false,
+                concurrency: 1,
             },
         };
         assert!(matches!(
@@ -3255,6 +3288,7 @@ mod tests {
                     headers: HashMap::from([("X-Scope-OrgID".to_string(), "tenant-a".to_string())]),
                     endpoint_tls: logit_config::TlsClientConfig::default(),
                     reuse_port: false,
+                    concurrency: 1,
                 },
             };
             assert!(
@@ -3936,6 +3970,7 @@ mod tests {
                     paths: logit_config::OtlpPaths::default(),
                     compression: logit_config::OtlpCompression::default(),
                     tls: logit_config::TlsClientConfig::default(),
+                    concurrency: 1,
                 },
             };
             assert!(
@@ -3965,6 +4000,7 @@ mod tests {
                 paths: logit_config::OtlpPaths::default(),
                 compression: logit_config::OtlpCompression::default(),
                 tls: logit_config::TlsClientConfig::default(),
+                concurrency: 1,
             },
         };
         assert!(matches!(
@@ -4061,6 +4097,7 @@ mod tests {
                     ca_file: Some("ca.pem".to_string()),
                     ..Default::default()
                 },
+                concurrency: 1,
             },
         };
         assert!(matches!(
@@ -4089,6 +4126,7 @@ mod tests {
                     ca_file: Some("does-not-exist.pem".to_string()),
                     ..Default::default()
                 },
+                concurrency: 1,
             },
         };
         let err = match build_spec("out", &component, &testdata_tls_dir(), None) {
@@ -4862,7 +4900,7 @@ mod tests {
                 compression: logit_config::Compression::Lz4,
                 tls: None,
                 request_timeout: Duration::from_secs(10),
-                window: 32,
+                concurrency: 32,
             },
         };
         assert!(matches!(
@@ -4887,7 +4925,7 @@ mod tests {
                     ..Default::default()
                 }),
                 request_timeout: Duration::from_secs(10),
-                window: 32,
+                concurrency: 32,
             },
         };
         assert!(matches!(
@@ -4921,6 +4959,7 @@ mod tests {
                 default_bucket: None,
                 default_org: None,
                 token: "test-token".to_string(),
+                concurrency: 1,
             },
         };
         let NodeSpec::Output(_, store_config, write_config) =
@@ -4972,6 +5011,7 @@ mod tests {
                 default_bucket: None,
                 default_org: None,
                 token: "test-token".to_string(),
+                concurrency: 1,
             },
         };
         let NodeSpec::Output(_, store_config, _) =
@@ -6406,7 +6446,7 @@ mod tests {
                         compression: logit_config::Compression::None,
                         tls: Some(logit_config::TlsClientConfig::default()),
                         request_timeout: Duration::from_secs(10),
-                        window: 32,
+                        concurrency: 32,
                     },
                 },
             ),

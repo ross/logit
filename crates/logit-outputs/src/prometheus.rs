@@ -878,6 +878,8 @@ pub struct RemoteWriteOutput {
     diag: Diagnostics,
     telemetry: Telemetry,
     accounting: BatchAccounting,
+    /// The operator's `concurrency:`, which the HTTP slot helper reads as this sink's window.
+    concurrency: u32,
 }
 
 impl RemoteWriteOutput {
@@ -886,6 +888,7 @@ impl RemoteWriteOutput {
         let accounting = BatchAccounting::default();
         let (diag, telemetry) = (Diagnostics::default(), Telemetry::default());
         Self {
+            concurrency: 1,
             endpoint: endpoint.into(),
             version: remote_write::Version::V1,
             encoding: Encoding::Snappy,
@@ -909,6 +912,12 @@ impl RemoteWriteOutput {
     /// How each request body is compressed (`compression:`). No negotiation, no fallback.
     pub fn with_compression(mut self, encoding: Encoding) -> Self {
         self.encoding = encoding;
+        self
+    }
+
+    /// Sets how many batches may be in flight at once (`concurrency:` in config, default 1).
+    pub fn with_concurrency(mut self, concurrency: u32) -> Self {
+        self.concurrency = concurrency;
         self
     }
 

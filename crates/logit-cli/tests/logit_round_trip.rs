@@ -427,7 +427,7 @@ mod tls {
 }
 
 /// Through the node runtime with a send window (ADR `native-hop-send-window`): a `logit_out`
-/// with `window: 32` over a disk spool, driven by `write_loop`, in front of a real `logit_in`.
+/// with `concurrency: 32` over a disk spool, driven by `write_loop`, in front of a real `logit_in`.
 mod window {
     use super::*;
     use logit_config::{BufferConfig, Component, ComponentKind, Config, ReceiveConfig};
@@ -516,7 +516,7 @@ mod window {
                         compression: logit_config::Compression::None,
                         tls: None,
                         request_timeout: Duration::from_secs(10),
-                        window: 32,
+                        concurrency: 32,
                     },
                 ),
             ),
@@ -615,7 +615,7 @@ mod window {
     async fn a_window_of_32_through_the_runtime_forwards_every_spooled_batch_once_in_order() {
         let mut probe = TelemetryProbe::new();
         let (addr, marks) = spawn_listener(&probe).await;
-        let output = LogitOutput::new(addr).with_window(32).with_telemetry(probe.telemetry(
+        let output = LogitOutput::new(addr).with_concurrency(32).with_telemetry(probe.telemetry(
             "out",
             "logit_out",
             "sink",
@@ -643,7 +643,7 @@ mod window {
         let mut probe = TelemetryProbe::new();
         // A 1 KiB cap's decode budget is 4 KiB: five empty events exceed it in a few dozen bytes.
         let (addr, marks) = spawn_listener_capped(&probe, 1024).await;
-        let output = LogitOutput::new(addr).with_window(32).with_telemetry(probe.telemetry(
+        let output = LogitOutput::new(addr).with_concurrency(32).with_telemetry(probe.telemetry(
             "out",
             "logit_out",
             "sink",
@@ -831,7 +831,7 @@ mod window {
         let (listener_addr, marks) = spawn_listener(&probe).await;
         let relay = spawn_relay(listener_addr).await;
         let output = LogitOutput::new(relay.addr.clone())
-            .with_window(32)
+            .with_concurrency(32)
             .with_telemetry(probe.telemetry("out", "logit_out", "sink"));
         let dir = scratch_dir("logit-round-trip-window-cut");
         let (graph, specs) = specs(output, dir.clone());

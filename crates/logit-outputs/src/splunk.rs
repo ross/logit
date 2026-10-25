@@ -386,6 +386,8 @@ pub struct SplunkHecOutput {
     diag: Diagnostics,
     telemetry: Telemetry,
     accounting: BatchAccounting,
+    /// The operator's `concurrency:`, which the HTTP slot helper reads as this sink's window.
+    concurrency: u32,
 }
 
 impl SplunkHecOutput {
@@ -402,6 +404,7 @@ impl SplunkHecOutput {
         authorization.set_sensitive(true);
         let endpoint = endpoint.into().trim_end_matches('/').to_string();
         let mut output = Self {
+            concurrency: 1,
             endpoint,
             token: token.to_string(),
             authorization,
@@ -450,6 +453,12 @@ impl SplunkHecOutput {
     pub fn with_ack(mut self, ack: bool, timeout: Duration) -> Self {
         self.ack = ack;
         self.ack_timeout = timeout;
+        self
+    }
+
+    /// Sets how many batches may be in flight at once (`concurrency:` in config, default 1).
+    pub fn with_concurrency(mut self, concurrency: u32) -> Self {
+        self.concurrency = concurrency;
         self
     }
 
