@@ -51,7 +51,7 @@
 //! and it's evicted last by both the flush cap and an admission eviction. A record whose kind
 //! conflicts with the overflow series passes through as `kind_conflict`. A folded record counts as
 //! `absorbed` and `logit.transform.metrics.overflowed`, never `*.dropped`; `flush` reports how
-//! many names folded a record that window as `logit.transform.metrics.overflowing`, and only the
+//! many names had a record past their limit that window as `logit.transform.metrics.overflowing`, and only the
 //! throttled `series_per_metric_overflow` diagnostic names a metric. A record absorbed into an
 //! upstream overflow series isn't a fold here and counts toward neither. With the limit off, no
 //! name is counted and nothing on the hot path changes.
@@ -641,7 +641,7 @@ struct SeriesBudget {
 struct NameCount {
     /// Its held series, overflow series excluded: what `max_series_per_metric` limits.
     series: usize,
-    /// Records that reached the limit since the last flush, folded or not: what
+    /// Records past the limit since the last flush, whether or not the fold settled: what
     /// `logit.transform.metrics.overflowing` counts names by, and the diagnostic's ranking. A
     /// record absorbed into an overflow series that arrived from upstream never reaches the limit
     /// here, so each process reports only its own folding.

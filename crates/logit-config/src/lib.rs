@@ -2786,9 +2786,9 @@ pub enum ComponentKind {
         /// marker. Under `temporality: cumulative` an overflow total stays monotonic while it's
         /// retained, and a series admitted later starts from zero. A folded metric counts in
         /// `logit.transform.metrics.overflowed`, never as dropped, and
-        /// `logit.transform.metrics.overflowing` reports how many metric names folded a metric
-        /// since the last flush; a throttled warning names the worst one and the attribute key with the most
-        /// distinct values among its series. A `keep` placed after this component removes
+        /// `logit.transform.metrics.overflowing` reports how many metric names had a metric
+        /// past the limit since the last flush; a throttled warning names the worst one and the
+        /// attribute key with the most distinct values among its series. A `keep` placed after this component removes
         /// `logit.overflow` unless it lists it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         max_series_per_metric: Option<usize>,

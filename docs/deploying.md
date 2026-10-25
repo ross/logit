@@ -2666,7 +2666,8 @@ value, the mitigation is on the sending side: send an absolute value periodicall
   one sustained means more distinct attribute sets reach `aggregate` than `max_series` holds;
   bound them with `keep` or `keep_values`, or raise `max_series`.
 - `logit.transform.metrics.overflowed` and `logit.transform.metrics.overflowing` (gauge): records
-  folded into an overflow series, and how many metric names folded one this window. Each
+  folded into an overflow series, and how many metric names had a record past their limit this
+  window. Each
   process counts only its own folds, not records absorbed into an overflow series from upstream. A
   fold isn't loss, but it gives up attribute detail. The throttled `series_per_metric_overflow`
   warning names the worst metric and the attribute key with the most distinct values among its
