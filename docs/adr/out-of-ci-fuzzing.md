@@ -80,7 +80,7 @@ covers is described in prose under the "untrusted-input parsers" amendment below
   limits, because an allocation-limit crash reproduces only under `-malloc_limit_mb`. Any other
   crash gets none, because under the limit libFuzzer can minimize a panic down to an empty file
   that doesn't reproduce.
-- `fuzz-seed` runs `seedgen` to regenerate `fuzz/seeds/`.
+- `fuzz-seed` runs `seedgen` to regenerate `fuzz/seeds/`. `script/lint` runs `seedgen --check`, which writes nothing and fails on any added, removed, or changed generated seed, so an encoding change can't land with stale seeds.
 
 Every run passes the target's `-max_len` and `-malloc_limit_mb` from `FUZZ_TARGETS`, plus
 `-rss_limit_mb=4096`, `-timeout=10`, and `-max_total_time=${FUZZ_SECONDS:-600}`. Caller arguments
@@ -175,8 +175,8 @@ manual and nightly.
   lands. ADR `out-of-ci-unsafe-verification`'s deferral of `cargo-fuzz` is superseded by its
   amendment of the same date.
 - CI type-checks `fuzz/` but never runs a target, so a decoder change that breaks a target's
-  oracle passes CI. Run `script/unsafe-check fuzz-seed` and a short `fuzz-all` after changing a
-  decoder a target calls.
+  oracle passes CI. Run a short `fuzz-all` after changing a
+  decoder a target calls, and `script/unsafe-check fuzz-seed` after a change `script/lint` reports as stale seeds.
 - A new decoder of untrusted input should get a target: one `[[bin]]`, one `FUZZ_TARGETS` entry,
   and seeds from `seedgen`.
 - A target can only call code in `logit-core` or `logit-proto`. Parsing logic that lives in a
