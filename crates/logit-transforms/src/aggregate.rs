@@ -40,6 +40,21 @@
 //! eviction, at most twice `max_series`. Admission is first come, first served within a window;
 //! `flush` frees the slot of every series it drains or evicts.
 //!
+//! # The per-name limit
+//!
+//! `max_series_per_metric`, off by default, counts the series held per metric name across every
+//! group ([`NameCount`]). Past it, a record that would open a series folds into its name's
+//! overflow series instead: the record's name, unit, and group, with the attributes cut to
+//! `logit.overflow: true`, the private `_logit.*` keys, and `host.name` ([`OverflowKey`]). An
+//! overflow series is known by that key alone, so one from an upstream stage is one here too. It
+//! doesn't count against the per-name limit, but it's admitted under `max_series` like any series,
+//! and it's evicted last by both the flush cap and an admission eviction. A record whose kind
+//! conflicts with the overflow series passes through as `kind_conflict`. A folded record counts as
+//! `absorbed` and `logit.transform.metrics.overflowed`, never `*.dropped`; `flush` reports how
+//! many names hold an overflow series or folded a record as `logit.transform.metrics.overflowing`,
+//! and only the throttled `series_per_metric_overflow` diagnostic names a metric. With the limit
+//! off, no name is counted and nothing on the hot path changes.
+//!
 //! # Temporality: what a flushed `Sum`/`Histogram` means
 //!
 //! `temporality: delta` ([`AggregateTemporality::Delta`], the default) is strictly tumbling: each
@@ -77,7 +92,7 @@
 //!
 //! A series is its record's name and unit and its event's attributes. On an event flagged
 //! `_logit.metrics.fields`, the attributes under the field namespace (`_logit.field.*`,
-//! [`StringFieldKeys`]) and the flag itself are left out, and a flushed series doesn't carry them
+//! [`KeyClasses`]) and the flag itself are left out, and a flushed series doesn't carry them
 //! either. On an unflagged event, no key is scanned for and a `_logit.field.*` key is identity like
 //! any other. Every other private attribute is identity and stays. A record that passes through
 //! keeps its event's attributes whole. The ADR's "Amendment: InfluxDB string fields aren't series
@@ -85,7 +100,8 @@
 
 use bytes::Bytes;
 use logit_core::attrs::{
-    CLOSED_BUCKETED, CLOSED_FLAGGED, CLOSED_TIMESTAMPED, METRICS_CLOSED, METRICS_FIELDS,
+    CLOSED_BUCKETED, CLOSED_FLAGGED, CLOSED_TIMESTAMPED, HOST_NAME, METRICS_CLOSED,
+    METRICS_FIELDS, OVERFLOW,
 };
 use logit_core::interner::Symbol;
 use logit_core::{
@@ -235,7 +251,7 @@ pub struct Aggregator {
     /// The series a full `max_series` evicts this window, last to evict first, with each one's
     /// group index; `Aggregator::evict_one`'s. Empty until a window's first eviction, and cleared
     /// at `flush`.
-    eviction_order: Vec<(u32, u64, usize, SeriesKey)>,
+    eviction_order: Vec<(EvictionRank, usize, SeriesKey)>,
     /// Whether this window's `eviction_order` is built; it's never rebuilt before `flush`.
     eviction_order_built: bool,
     /// Whether a flushed `Sum`/`Histogram` is this window's increment (the default) or a running
@@ -266,7 +282,8 @@ pub struct Aggregator {
     /// The current batch's resource half of the flags, read once in `begin_batch`. An event's own
     /// value wins over it.
     batch_flags: BatchFlags,
-    string_field_keys: StringFieldKeys,
+    key_classes: KeyClasses,
+    overflow: OverflowKey,
 }
 
 /// The flag keys of ADR `metric-flags` (`docs/adr/metric-flags.md`, "The flags"), interned once so
@@ -511,7 +528,8 @@ impl Opener<'_> {
 /// Per-`process`-call totals behind `logit.transform.metrics.absorbed`,
 /// `logit.transform.metrics.passed_through{reason}`, and `logit.transform.metrics.dropped{reason}`:
 /// every record `process` receives lands in one field, except `widened` and
-/// `series_limit_evicted`, which count folds and series.
+/// `series_limit_evicted`, which count folds and series, and `overflowed`, a subset of
+/// `absorbed`.
 /// Reported once per non-zero field after the loop, because `Telemetry::count` locks and
 /// hashes on every call.
 #[derive(Default)]
@@ -529,6 +547,8 @@ struct Tally {
     series_limit: u32,
     /// Series evicted to make room under `max_series`; not a record count.
     series_limit_evicted: u32,
+    /// Absorbed records that folded into an overflow series under `max_series_per_metric`.
+    overflowed: u32,
     /// Folds whose `MetricValue::checked_add` changed the type; not a pass-through.
     widened: u32,
 }
@@ -579,6 +599,9 @@ impl Tally {
                 &[("reason", "series_limit")],
             );
         }
+        if self.overflowed > 0 {
+            telemetry.count("logit.transform.metrics.overflowed", f64::from(self.overflowed), &[]);
+        }
         if self.widened > 0 {
             telemetry.count(
                 "logit.transform.metrics.normalized",
@@ -589,16 +612,43 @@ impl Tally {
     }
 }
 
-/// The `max_series` bound: how many series the stage holds, active and retained across every
-/// group, against how many it may. Kept as counts, so a full cap with nothing to evict answers
+/// The `max_series` bound and the `max_series_per_metric` limit: how many series the stage
+/// holds, active and retained across every group, against how many it may, and, with the limit
+/// set, how many each name holds. Kept as counts, so a full cap with nothing to evict answers
 /// without a scan of the groups: `admit`, `process`, and `Aggregator::evict_one` move them, and
-/// `flush` resets both from the series it keeps.
+/// `flush` resets them from the series it keeps.
 struct SeriesBudget {
     held: usize,
     /// The held series not updated this window: retained across the last flush, and the
     /// candidates a full cap evicts.
     idle: usize,
     max: usize,
+    /// `max_series_per_metric`; `None` leaves `names` empty and untouched.
+    per_name: Option<usize>,
+    /// The held series per metric name, under `per_name` only. A name enters when it's admitted,
+    /// never when it's refused, so the map holds at most `max` names plus that window's admission
+    /// evictions. `flush` rebuilds it from its survivors, keeping the allocation.
+    names: HashMap<Symbol, NameCount>,
+}
+
+/// One metric name's entry in [`SeriesBudget::names`].
+#[derive(Default, Clone, Copy)]
+struct NameCount {
+    /// Its held series, overflow series excluded: what `max_series_per_metric` limits.
+    series: usize,
+    /// Its held overflow series, one per group, carrier set, and host it folded under.
+    overflow: usize,
+    /// Records that reached the limit since the last flush, folded or not; the diagnostic's
+    /// ranking.
+    folded: u32,
+}
+
+impl NameCount {
+    /// Whether the name is over its limit: it holds an overflow series, or a record reached the
+    /// limit this window. Read by `logit.transform.metrics.overflowing` and the diagnostic.
+    fn overflowing(&self) -> bool {
+        self.overflow > 0 || self.folded > 0
+    }
 }
 
 /// [`SeriesBudget::admit`]'s answer for a record that would open a series.
@@ -611,13 +661,43 @@ enum Admission {
     EvictIdle,
     /// Drop the record: the cap is full and every held series was updated this window.
     Refused,
+    /// Fold the record into its name's overflow series: the name holds `max_series_per_metric`
+    /// series. Nothing is counted yet; the overflow series is admitted on its own if it's new.
+    Overflow,
 }
 
 impl SeriesBudget {
-    /// Decides whether a record may open a new series, and counts the slot when it may. The one
-    /// place a new series is admitted: `process` asks only where a record would open a series,
-    /// so a held series never pays for it.
-    fn admit(&mut self) -> Admission {
+    /// Decides whether a record may open the series `key`, and counts the slot when it may. The
+    /// one place a new series is admitted: `process` asks only where a record would open a
+    /// series, so a held series never pays for it. `is_overflow` is asked only under the per-name
+    /// limit.
+    fn admit(&mut self, key: &SeriesKey, is_overflow: impl FnOnce(&SeriesKey) -> bool) -> Admission {
+        let Some(limit) = self.per_name else {
+            return self.admit_slot();
+        };
+        let is_overflow = is_overflow(key);
+        if !is_overflow {
+            if let Some(count) = self.names.get_mut(&key.name) {
+                if count.series >= limit {
+                    count.folded = count.folded.saturating_add(1);
+                    return Admission::Overflow;
+                }
+            }
+        }
+        let admission = self.admit_slot();
+        if admission != Admission::Refused {
+            let count = self.names.entry(key.name).or_default();
+            if is_overflow {
+                count.overflow += 1;
+            } else {
+                count.series += 1;
+            }
+        }
+        admission
+    }
+
+    /// The `max_series` half of [`SeriesBudget::admit`].
+    fn admit_slot(&mut self) -> Admission {
         if self.held < self.max {
             self.held += 1;
             Admission::Open
@@ -628,6 +708,77 @@ impl SeriesBudget {
             Admission::Refused
         }
     }
+
+    /// Frees the slot of an idle series evicted to make room.
+    fn release(&mut self, name: Symbol, is_overflow: bool) {
+        self.held -= 1;
+        self.idle -= 1;
+        if let Some(count) = self.names.get_mut(&name) {
+            if is_overflow {
+                count.overflow -= 1;
+            } else {
+                count.series -= 1;
+            }
+        }
+    }
+
+    /// Resets every count to the series `flush` keeps, none updated yet in the window it opens.
+    /// `is_overflow` is asked of each survivor only under the per-name limit.
+    fn reset<'k>(
+        &mut self,
+        survivors: impl ExactSizeIterator<Item = &'k SeriesKey>,
+        mut is_overflow: impl FnMut(&SeriesKey) -> bool,
+    ) {
+        self.held = survivors.len();
+        self.idle = self.held;
+        if self.per_name.is_none() {
+            return;
+        }
+        self.names.clear();
+        for key in survivors {
+            let overflow = is_overflow(key);
+            let count = self.names.entry(key.name).or_default();
+            if overflow {
+                count.overflow += 1;
+            } else {
+                count.series += 1;
+            }
+        }
+    }
+
+    /// How many names are over the per-name limit ([`NameCount::overflowing`]).
+    fn overflowing(&self) -> usize {
+        self.names.values().filter(|count| count.overflowing()).count()
+    }
+}
+
+/// The order an eviction takes held series in, ascending from the first evicted: an ordinary
+/// series before an overflow series, then the most idle, then the newest. Shared by the flush cap
+/// and `Aggregator::evict_one`. An overflow series goes last because it's opened after its name's
+/// other series, so it's always the newest, and evicting it first would restart a cumulative
+/// overflow total every window. `open_seq` is unique, so the order is total.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct EvictionRank(bool, std::cmp::Reverse<u32>, std::cmp::Reverse<u64>);
+
+impl EvictionRank {
+    fn of(state: &SeriesState, is_overflow: bool) -> Self {
+        EvictionRank(
+            is_overflow,
+            std::cmp::Reverse(state.idle_windows),
+            std::cmp::Reverse(state.open_seq),
+        )
+    }
+
+    fn is_overflow(&self) -> bool {
+        self.0
+    }
+}
+
+/// [`Aggregator::settle_admission`]'s answer for an admitted record: the series key to open or
+/// absorb into, and whether the record folded into an overflow series to get it.
+struct Settled {
+    key: SeriesKey,
+    folded: bool,
 }
 
 /// Whether two histograms have the same bucket layout, and so can be added bucket by bucket.
@@ -723,7 +874,13 @@ impl Aggregator {
             current_batch_context: TraceContext::default(),
             series_retention: 0,
             max_retained_series: 0,
-            budget: SeriesBudget { held: 0, idle: 0, max: 100_000 },
+            budget: SeriesBudget {
+                held: 0,
+                idle: 0,
+                max: 100_000,
+                per_name: None,
+                names: HashMap::new(),
+            },
             eviction_order: Vec::new(),
             eviction_order_built: false,
             temporality: AggregateTemporality::default(),
@@ -739,7 +896,11 @@ impl Aggregator {
                 fields: logit_core::interner::intern(METRICS_FIELDS),
             },
             batch_flags: BatchFlags::default(),
-            string_field_keys: StringFieldKeys::default(),
+            key_classes: KeyClasses::default(),
+            overflow: OverflowKey {
+                marker: logit_core::interner::intern(OVERFLOW),
+                host_name: logit_core::interner::intern(HOST_NAME),
+            },
         }
     }
 
@@ -756,6 +917,14 @@ impl Aggregator {
     /// doesn't check it.
     pub fn with_max_series(mut self, max_series: usize) -> Self {
         self.budget.max = max_series;
+        self
+    }
+
+    /// Limits how many series each metric name holds, folding the rest into an overflow series
+    /// (this module's "The per-name limit"). `None`, the default, turns the limit off. Graph
+    /// validation rejects `Some(0)`; this builder doesn't check it.
+    pub fn with_max_series_per_metric(mut self, limit: Option<usize>) -> Self {
+        self.budget.per_name = limit;
         self
     }
 
@@ -942,7 +1111,7 @@ impl Aggregator {
 
             let string_fields = string_fields.get_or_insert_with(|| {
                 if scan_fields {
-                    self.string_field_keys.of(&event.attributes, self.flags.fields)
+                    self.key_classes.string_fields(&event.attributes, self.flags.fields)
                 } else {
                     SmallVec::new()
                 }
@@ -959,38 +1128,50 @@ impl Aggregator {
             let open_seq = self.next_open_seq;
             // A record whose group doesn't exist opens a series by definition, so it's admitted
             // before the group is: a refusal creates and memoizes nothing.
-            let (gi, key, admitted) =
+            let (gi, key, admitted, mut folded) =
                 match group_index.or_else(|| self.find_group(resource, &scope)) {
-                    Some(gi) => (gi, key, false),
+                    Some(gi) => (gi, key, false, false),
                     None => {
-                        let admission = self.budget.admit();
-                        let Some(key) = self.settle_admission(admission, key, &mut tally) else {
+                        let (overflow, classes) = (&self.overflow, &mut self.key_classes);
+                        let admission = self.budget.admit(&key, |k| overflow.is(k, classes));
+                        let Some(settled) =
+                            self.settle_admission(None, admission, key, &mut tally)
+                        else {
                             continue;
                         };
-                        (self.open_group(resource, &scope), key, true)
+                        (self.open_group(resource, &scope), settled.key, true, settled.folded)
                     }
                 };
             group_index = Some(gi);
             let entry = self.groups[gi].series.entry(key);
-            // Whether this metric opened a new series. Not derivable afterward: a real
-            // `Gauge(0.0)` at `at: i64::MIN` looks identical to an unseeded delta's result. The
-            // `Sum` and `GaugeDelta` arms seed the series' value from it, and `GaugeDelta`'s
-            // unseeded count reads it.
-            let was_vacant = matches!(entry, std::collections::hash_map::Entry::Vacant(_));
+            // Whether this metric opened a new series: the overflow series' entry when it folded.
+            // Not derivable afterward: a real `Gauge(0.0)` at `at: i64::MIN` looks identical to an
+            // unseeded delta's result. The `Sum` and `GaugeDelta` arms seed the series' value from
+            // it, and `GaugeDelta`'s unseeded count reads it.
+            let mut was_vacant = matches!(entry, std::collections::hash_map::Entry::Vacant(_));
             // `admit` is asked in place, beside the entry: only an answer other than `Open` gives
-            // the entry up, so only an admission eviction pays a second hash.
-            let entry = match (was_vacant && !admitted).then(|| self.budget.admit()) {
-                None | Some(Admission::Open) => entry,
-                Some(admission) => {
-                    let std::collections::hash_map::Entry::Vacant(vacant) = entry else {
-                        unreachable!("admit is asked only of a vacant entry")
-                    };
-                    let key = vacant.into_key();
-                    let Some(key) = self.settle_admission(admission, key, &mut tally) else {
-                        continue;
-                    };
-                    self.groups[gi].series.entry(key)
+            // the entry up, so only an admission eviction or a fold pays a second hash.
+            let entry = match entry {
+                std::collections::hash_map::Entry::Vacant(vacant) if !admitted => {
+                    let (overflow, classes) = (&self.overflow, &mut self.key_classes);
+                    match self.budget.admit(vacant.key(), |k| overflow.is(k, classes)) {
+                        Admission::Open => std::collections::hash_map::Entry::Vacant(vacant),
+                        admission => {
+                            let key = vacant.into_key();
+                            let Some(settled) =
+                                self.settle_admission(Some(gi), admission, key, &mut tally)
+                            else {
+                                continue;
+                            };
+                            folded = settled.folded;
+                            let entry = self.groups[gi].series.entry(settled.key);
+                            was_vacant =
+                                matches!(entry, std::collections::hash_map::Entry::Vacant(_));
+                            entry
+                        }
+                    }
                 }
+                entry => entry,
             };
             let state = entry.or_insert_with(|| SeriesState {
                 accumulator: opener.open(),
@@ -1208,6 +1389,7 @@ impl Aggregator {
             };
             if accumulated {
                 tally.absorbed += 1;
+                tally.overflowed += u32::from(folded);
                 // Only on a real merge: a kind-conflicted metric isn't a contributor.
                 state.contexts.observe(ctx);
                 if !was_vacant && !state.updated_this_window {
@@ -1369,34 +1551,49 @@ impl Aggregator {
     }
 
     /// Acts on [`SeriesBudget::admit`]'s answer for a record that would open the series `key`,
-    /// at both places `process` asks: before the record's group exists, and on a vacant entry.
-    /// Returns the key to open, or `None` for a refused record, counted and diagnosed.
+    /// at both places `process` asks: before the record's group exists (`gi` is `None`), and on a
+    /// vacant entry in group `gi`. Returns the key to open or absorb into, or `None` for a
+    /// refused record, counted and diagnosed. A fold swaps in the overflow key and, when that
+    /// series isn't held yet, asks `admit` again for it, which never answers `Overflow`.
     fn settle_admission(
         &mut self,
+        gi: Option<usize>,
         admission: Admission,
         key: SeriesKey,
         tally: &mut Tally,
-    ) -> Option<SeriesKey> {
+    ) -> Option<Settled> {
         match admission {
-            Admission::Open => Some(key),
+            Admission::Open => Some(Settled { key, folded: false }),
             Admission::EvictIdle => {
                 self.evict_one(tally);
-                Some(key)
+                Some(Settled { key, folded: false })
             }
             Admission::Refused => {
                 tally.series_limit += 1;
                 self.refuse(key.name);
                 None
             }
+            Admission::Overflow => {
+                self.report_overflow();
+                let key = self.overflow.of(key, &mut self.key_classes);
+                if gi.is_some_and(|gi| self.groups[gi].series.contains_key(&key)) {
+                    return Some(Settled { key, folded: true });
+                }
+                let (overflow, classes) = (&self.overflow, &mut self.key_classes);
+                let admission = self.budget.admit(&key, |k| overflow.is(k, classes));
+                debug_assert_ne!(admission, Admission::Overflow, "an overflow key never folds");
+                let settled = self.settle_admission(gi, admission, key, tally)?;
+                Some(Settled { key: settled.key, folded: true })
+            }
         }
     }
 
     /// Makes room under a full `max_series` by evicting one held series not updated this window,
-    /// in the flush cap's order: the most idle first, then the newest. The order is built on the
-    /// window's first eviction, the one scan and sort this path pays, and each later eviction
-    /// pops it, skipping a series that absorbed since. A group this empties stays until `flush`
-    /// removes it, so `group_index`, the memo, and the order's group indices stay valid; the
-    /// groups a window holds are then at most `max_series` plus its evictions.
+    /// in the flush cap's order ([`EvictionRank`]). The order is built on the window's first
+    /// eviction, the one scan and sort this path pays, and each later eviction pops it, skipping
+    /// a series that absorbed since. A group this empties stays until `flush` removes it, so
+    /// `group_index`, the memo, and the order's group indices stay valid; the groups a window
+    /// holds are then at most `max_series` plus its evictions.
     fn evict_one(&mut self, tally: &mut Tally) {
         // Built once per window: no series becomes a candidate between flushes, so an exhausted
         // order means none is left, which `budget.idle` already says.
@@ -1405,26 +1602,22 @@ impl Aggregator {
             for (gi, group) in self.groups.iter().enumerate() {
                 for (key, state) in &group.series {
                     if !state.updated_this_window {
-                        self.eviction_order.push((
-                            state.idle_windows,
-                            state.open_seq,
-                            gi,
-                            key.clone(),
-                        ));
+                        let rank =
+                            EvictionRank::of(state, self.overflow.is(key, &mut self.key_classes));
+                        self.eviction_order.push((rank, gi, key.clone()));
                     }
                 }
             }
-            // Ascending, so `pop` takes the most idle, then the newest. `open_seq` is unique.
-            self.eviction_order.sort_unstable_by_key(|(idle, seq, _, _)| (*idle, *seq));
+            // Descending, so `pop` takes the rank that evicts first.
+            self.eviction_order.sort_unstable_by(|(a, _, _), (b, _, _)| b.cmp(a));
         }
-        while let Some((_, _, gi, key)) = self.eviction_order.pop() {
+        while let Some((rank, gi, key)) = self.eviction_order.pop() {
             let series = &mut self.groups[gi].series;
             if series.get(&key).is_none_or(|state| state.updated_this_window) {
                 continue; // absorbed since the order was built
             }
             series.remove(&key);
-            self.budget.held -= 1;
-            self.budget.idle -= 1;
+            self.budget.release(key.name, rank.is_overflow());
             tally.series_limit_evicted += 1;
             // Warned like the flush cap's eviction, for the same two consequences.
             self.diag.warn_throttled(
@@ -1439,6 +1632,17 @@ impl Aggregator {
             return;
         }
         debug_assert!(false, "budget.idle > 0 with no series left in the eviction order");
+    }
+
+    /// The throttled diagnostic for a record that reached `max_series_per_metric`, the one place
+    /// a metric name over the limit is named. The report scans every held series of the worst
+    /// name, so it's built only when the throttle will let it out.
+    fn report_overflow(&mut self) {
+        const KEY: &str = "series_per_metric_overflow";
+        let report = self.diag.would_report(KEY).then(|| {
+            OverflowReport::of(&self.budget, &self.groups, self.overflow.marker).to_string()
+        });
+        self.diag.warn_throttled(KEY, format_args!("{}", report.as_deref().unwrap_or_default()));
     }
 
     /// The diagnostic for a record `max_series` refused; `settle_admission` counts it.
@@ -1487,6 +1691,10 @@ impl Aggregator {
         self.telemetry.gauge("logit.transform.series.active", active_series as f64, &[]);
         self.telemetry.gauge("logit.transform.series.retained", retained_series as f64, &[]);
         self.telemetry.gauge("logit.transform.resource.groups", self.groups.len() as f64, &[]);
+        if self.budget.per_name.is_some() {
+            let overflowing = self.budget.overflowing();
+            self.telemetry.gauge("logit.transform.metrics.overflowing", overflowing as f64, &[]);
+        }
 
         // Series this flush keeps, not yet placed back: the cap is whole-`Aggregator`, so it must
         // see every group's candidates first. Each group's `series` map is taken (not
@@ -1569,17 +1777,18 @@ impl Aggregator {
             }
         }
 
-        // Cardinality cap, evicting the most idle first and the newest among equally idle. Without
-        // it, C never-repeating series names per window would hold C * series_retention series
-        // indefinitely. Newest first keeps a series updated every window ahead of the one-off
-        // series opened after it. `open_seq` is unique, so the key is total and an unstable sort
-        // gives one order.
+        // Cardinality cap, in `EvictionRank`'s order: the most idle first and the newest among
+        // equally idle, an overflow series last. Without it, C never-repeating series names per
+        // window would hold C * series_retention series indefinitely. Newest first keeps a series
+        // updated every window ahead of the one-off series opened after it. The rank is total, so
+        // an unstable sort gives one order.
         let mut evicted_active: u64 = 0;
         let mut evicted_cardinality_idle: u64 = 0;
         if survivors.len() > self.max_retained_series {
             let excess = survivors.len() - self.max_retained_series;
-            survivors.sort_unstable_by_key(|(_, _, state)| {
-                (std::cmp::Reverse(state.idle_windows), std::cmp::Reverse(state.open_seq))
+            let (overflow, classes) = (&self.overflow, &mut self.key_classes);
+            survivors.sort_unstable_by_key(|(_, key, state)| {
+                EvictionRank::of(state, overflow.is(key, classes))
             });
             for (_, _, state) in survivors.drain(0..excess) {
                 // An updated survivor left the loop above with `idle_windows == 0`.
@@ -1595,8 +1804,8 @@ impl Aggregator {
         // Survivors go back to their group; a group left empty is dropped. Every other series left
         // the stage above, so the survivors are what the budget holds, none updated yet in the
         // window this flush opens. The eviction order's group indices end here.
-        self.budget.held = survivors.len();
-        self.budget.idle = survivors.len();
+        let (overflow, classes) = (&self.overflow, &mut self.key_classes);
+        self.budget.reset(survivors.iter().map(|(_, key, _)| key), |k| overflow.is(k, classes));
         self.eviction_order.clear();
         self.eviction_order_built = false;
         for (gi, key, state) in survivors {
@@ -1741,49 +1950,170 @@ fn record_temporality(temporality: AggregateTemporality) -> Temporality {
     }
 }
 
-/// Which attribute keys are in the field namespace (`_logit.field.*`), which a series key leaves
-/// out: such a key is data about a point, not identity of its series, and an aggregate summarizes
-/// numbers. Keyed on them, two readings of one series that differ only
-/// in a string such as Telegraf's `uptime_format` would flush as two series that every protocol
-/// sink but `influxdb_out` renders with the same labels. Every other private key stays in the key:
-/// `_logit.influxdb.measurement` and other protocols' carriers are identity that a sink reads after
-/// this stage.
+/// Which attribute keys are private (`_logit.*`), and which of those are in the field namespace
+/// (`_logit.field.*`), which a series key leaves out on a flagged event: such a key is data about
+/// a point, not identity of its series, and an aggregate summarizes numbers. Keyed on them, two
+/// readings of one series that differ only in a string such as Telegraf's `uptime_format` would
+/// flush as two series that every protocol sink but `influxdb_out` renders with the same labels.
+/// Every other private key stays in the key: `_logit.influxdb.measurement` and other protocols'
+/// carriers are identity that a sink reads after this stage, and an overflow series keeps them
+/// ([`OverflowKey`]).
 ///
 /// Memoized by the key's interner index, so only a key's first sighting resolves it: `resolve`
 /// takes a shard lock and a hash. One byte per index up to the highest key seen, which the
 /// process-wide interner bounds.
 #[derive(Default)]
-struct StringFieldKeys {
-    /// Per interner index: [`UNSEEN`], [`STRING_FIELD`], or [`OTHER_KEY`].
+struct KeyClasses {
+    /// Per interner index: [`UNSEEN`], [`STRING_FIELD`], [`PRIVATE_KEY`], or [`OTHER_KEY`].
     seen: Vec<u8>,
 }
 
 const UNSEEN: u8 = 0;
 const STRING_FIELD: u8 = 1;
-const OTHER_KEY: u8 = 2;
+const PRIVATE_KEY: u8 = 2;
+const OTHER_KEY: u8 = 3;
 
-impl StringFieldKeys {
+impl KeyClasses {
     /// The field-namespace keys among `attributes`, plus `fields_flag` when present: the flag
     /// announces those keys, so it leaves the series key with them, and a series whose readings
     /// differ only in whether they carried a string field stays one series.
-    fn of(&mut self, attributes: &AttrMap, fields_flag: Symbol) -> SmallVec<[Symbol; 4]> {
+    fn string_fields(&mut self, attributes: &AttrMap, fields_flag: Symbol) -> SmallVec<[Symbol; 4]> {
         attributes
             .iter()
             .map(|(key, _)| key)
-            .filter(|&key| key == fields_flag || self.is_string_field(key))
+            .filter(|&key| key == fields_flag || self.class(key) == STRING_FIELD)
             .collect()
     }
 
-    fn is_string_field(&mut self, key: Symbol) -> bool {
+    /// Whether `key` is in the private namespace, field keys included.
+    fn is_private(&mut self, key: Symbol) -> bool {
+        matches!(self.class(key), STRING_FIELD | PRIVATE_KEY)
+    }
+
+    fn class(&mut self, key: Symbol) -> u8 {
         let i = logit_core::interner::index(key);
         if i >= self.seen.len() {
             self.seen.resize(i + 1, UNSEEN);
         }
         if self.seen[i] == UNSEEN {
-            let field = logit_core::attrs::is_field(logit_core::interner::resolve(key));
-            self.seen[i] = if field { STRING_FIELD } else { OTHER_KEY };
+            let name = logit_core::interner::resolve(key);
+            self.seen[i] = if logit_core::attrs::is_field(name) {
+                STRING_FIELD
+            } else if logit_core::attrs::is_private(name) {
+                PRIVATE_KEY
+            } else {
+                OTHER_KEY
+            };
         }
-        self.seen[i] == STRING_FIELD
+        self.seen[i]
+    }
+}
+
+/// The overflow series' attribute set under `max_series_per_metric`: `logit.overflow: true`, the
+/// record's private `_logit.*` keys (protocol carriers and metric flags a sink in its family
+/// reads), and `host.name` (the host every sink writes). Everything else is the detail the fold
+/// gives up. A series is an overflow series when its key has that shape, never by a flag on its
+/// state, so an upstream stage's overflow series is one here too.
+struct OverflowKey {
+    /// `logit.overflow`.
+    marker: Symbol,
+    /// `host.name`.
+    host_name: Symbol,
+}
+
+impl OverflowKey {
+    /// `key`'s overflow series: its name and unit, and the attributes it keeps.
+    fn of(&self, key: SeriesKey, classes: &mut KeyClasses) -> SeriesKey {
+        let mut attributes = AttrMap::new();
+        for (k, v) in key.attributes.into_pairs() {
+            if k == self.host_name || classes.is_private(k) {
+                attributes.insert_sym(k, v);
+            }
+        }
+        attributes.insert_sym(self.marker, Value::Bool(true));
+        SeriesKey { name: key.name, unit: key.unit, attributes }
+    }
+
+    /// Whether `key` is an overflow series' key: `logit.overflow: true` and no attribute
+    /// [`OverflowKey::of`] would remove. A key without the marker answers after one lookup.
+    fn is(&self, key: &SeriesKey, classes: &mut KeyClasses) -> bool {
+        matches!(key.attributes.get_sym(self.marker), Some(Value::Bool(true)))
+            && key.attributes.iter().all(|(k, _)| {
+                k == self.marker || k == self.host_name || classes.is_private(k)
+            })
+    }
+}
+
+/// The text of the `series_per_metric_overflow` diagnostic: the overflowing name with the most
+/// records folded since the last flush (every overflowing name holds the limit's count of series,
+/// so the series count can't rank them), the attribute key whose values differ most among that
+/// name's held series, and how many other names are overflowing. Names and keys only: an
+/// attribute value never appears.
+struct OverflowReport {
+    limit: usize,
+    name: Symbol,
+    folded: u32,
+    /// The key with the most distinct values, and how many.
+    widest: Option<(Symbol, usize)>,
+    others: usize,
+}
+
+impl OverflowReport {
+    fn of(budget: &SeriesBudget, groups: &[ResourceGroup], marker: Symbol) -> Self {
+        let overflowing = budget.names.iter().filter(|(_, count)| count.overflowing());
+        // Ties go to the earlier-interned name, so the report is deterministic.
+        let (name, folded) = overflowing
+            .clone()
+            .map(|(name, count)| (*name, count.folded))
+            .max_by_key(|&(name, folded)| {
+                (folded, std::cmp::Reverse(logit_core::interner::index(name)))
+            })
+            .expect("a record reached the limit, so its name is overflowing");
+        let others = overflowing.count() - 1;
+        // Distinct values per key, as value hashes: `Value` has no `Hash`, and two values that
+        // collide only undercount a key.
+        let mut values: HashMap<Symbol, std::collections::HashSet<u64>> = HashMap::new();
+        for key in groups.iter().flat_map(|g| g.series.keys()) {
+            if key.name != name || key.attributes.get_sym(marker).is_some() {
+                continue;
+            }
+            for (k, v) in key.attributes.iter() {
+                let mut hasher = DefaultHasher::new();
+                hash_value(v, &mut hasher);
+                values.entry(k).or_default().insert(hasher.finish());
+            }
+        }
+        let widest = values
+            .into_iter()
+            .map(|(k, distinct)| (k, distinct.len()))
+            .max_by_key(|&(k, n)| (n, std::cmp::Reverse(logit_core::interner::index(k))));
+        OverflowReport { limit: budget.per_name.unwrap_or(0), name, folded, widest, others }
+    }
+}
+
+impl std::fmt::Display for OverflowReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "max_series_per_metric ({}) reached; folding new series of metric '{}' into its \
+             logit.overflow series ({} records this window)",
+            self.limit,
+            logit_core::interner::resolve(self.name),
+            self.folded
+        )?;
+        if let Some((key, n)) = self.widest {
+            write!(
+                f,
+                ", whose attribute '{}' has the most distinct values ({n})",
+                logit_core::interner::resolve(key)
+            )?;
+        }
+        write!(
+            f,
+            "; {} other metric names are over the limit -- bound attribute cardinality upstream \
+             with keep or keep_values, or raise max_series_per_metric",
+            self.others
+        )
     }
 }
 
@@ -4962,6 +5292,14 @@ mod tests {
             agg.flush(200);
             feed(&mut agg, &resource, metric_event("b", MetricKind::gauge(1.0), 250));
 
+            // series_per_metric_overflow.
+            let mut agg =
+                Aggregator::new(Duration::from_secs(10)).with_max_series_per_metric(Some(1));
+            for path in ["/a", "/b"] {
+                let event = metric_event_with_tags("p", MetricKind::counter(1.0), 0, &[("path", path)]);
+                feed(&mut agg, &resource, event);
+            }
+
             // histogram_bounds_mismatch, and series_retention_full from the flush.
             let mut agg = cumulative_agg().with_series_retention(5, 1);
             let h = |bounds: &[(f64, u64)]| delta_histogram_event("h", bounds, None, None, None, 0);
@@ -4972,7 +5310,7 @@ mod tests {
         });
 
         let messages = captured.0.lock().unwrap_or_else(|p| p.into_inner()).clone();
-        assert_eq!(messages.len(), 12, "one report per diagnostic key: {messages:#?}");
+        assert_eq!(messages.len(), 13, "one report per diagnostic key: {messages:#?}");
         for message in &messages {
             assert!(!message.contains("  "), "a run of spaces in {message:?}");
         }
@@ -5993,6 +6331,388 @@ mod tests {
         let dropped = counter_total(&events, "logit.transform.metrics.dropped");
         let passed = counter_total(&events, "logit.transform.metrics.passed_through");
         assert_eq!(metrics_in, absorbed(&events) + passed + dropped);
+    }
+
+    // -- `max_series_per_metric` ----------------------------------------------------------------
+
+    fn overflowed(events: &[Event]) -> f64 {
+        counter_total(events, "logit.transform.metrics.overflowed")
+    }
+
+    /// Whether a flushed or held attribute set is an overflow series': the marker set.
+    fn is_marked(attributes: &AttrMap) -> bool {
+        matches!(attributes.get(OVERFLOW), Some(Value::Bool(true)))
+    }
+
+    /// The flushed events of `name`, with their attributes.
+    fn flushed_named<'a>(
+        flushed: &'a [(Arc<Resource>, Vec<Event>)],
+        name: &'a str,
+    ) -> impl Iterator<Item = &'a Event> {
+        flushed
+            .iter()
+            .flat_map(|(_, events)| events)
+            .filter(move |e| logit_core::interner::resolve(e.metrics[0].name) == name)
+    }
+
+    /// The budget's per-name counts against a scan of every group, overflow series apart.
+    fn assert_names_match_the_groups(agg: &mut Aggregator) {
+        assert_budget_matches_the_groups(agg);
+        let mut expected: HashMap<Symbol, (usize, usize)> = HashMap::new();
+        for key in agg.groups.iter().flat_map(|g| g.series.keys()) {
+            let entry = expected.entry(key.name).or_default();
+            if agg.overflow.is(key, &mut agg.key_classes) {
+                entry.1 += 1;
+            } else {
+                entry.0 += 1;
+            }
+        }
+        for (name, count) in &agg.budget.names {
+            let (series, overflow) = expected.remove(name).unwrap_or_default();
+            assert_eq!((count.series, count.overflow), (series, overflow), "{name:?}");
+        }
+        assert!(expected.is_empty(), "held names the budget doesn't count: {expected:?}");
+    }
+
+    fn tagged_counter(name: &str, value: f64, tags: &[(&str, &str)]) -> Event {
+        metric_event_with_tags(name, MetricKind::counter(value), 0, tags)
+    }
+
+    /// Past the limit, a new series of the name folds into one overflow series: the name's
+    /// total stays correct, the fold is counted as absorbed and overflowed, and nothing drops.
+    #[test]
+    fn past_max_series_per_metric_a_new_series_folds_into_the_overflow_series() {
+        let (mut agg, registry) = with_registry(
+            Aggregator::new(Duration::from_secs(10)).with_max_series_per_metric(Some(2)),
+        );
+        let resource = default_resource();
+        for (i, path) in ["/a", "/b", "/c", "/d", "/e"].into_iter().enumerate() {
+            let event = tagged_counter("req", (i + 1) as f64, &[("path", path)]);
+            assert!(feed(&mut agg, &resource, event).is_none());
+        }
+        // Another name keeps its own count.
+        feed(&mut agg, &resource, tagged_counter("other", 1.0, &[("path", "/z")]));
+        assert_names_match_the_groups(&mut agg);
+
+        let flushed = flush_events(&mut agg, 100);
+        let req: Vec<&Event> = flushed_named(&flushed, "req").collect();
+        assert_eq!(req.len(), 3, "two admitted series and one overflow series");
+        let overflow: Vec<&&Event> = req.iter().filter(|e| is_marked(&e.attributes)).collect();
+        assert_eq!(overflow.len(), 1);
+        assert_eq!(overflow[0].attributes.len(), 1, "the marker alone: no host or private key");
+        assert_eq!(counter_value(kind_of(overflow[0])), 3.0 + 4.0 + 5.0);
+        let total: f64 = req.iter().map(|e| counter_value(kind_of(e))).sum();
+        assert_eq!(total, 15.0, "every record of the name accounted for");
+
+        let events = registry.drain(0);
+        assert_eq!(absorbed(&events), 6.0);
+        assert_eq!(overflowed(&events), 3.0);
+        assert_eq!(counter_total(&events, "logit.transform.metrics.dropped"), 0.0);
+        assert_eq!(gauge_value(&events, "logit.transform.metrics.overflowing"), Some(1.0));
+    }
+
+    /// The overflow series keeps the record's private keys (after the field pruning) and its
+    /// `host.name`, so one name splits into an overflow series per host.
+    #[test]
+    fn the_overflow_series_keeps_private_keys_and_the_host() {
+        let mut agg = Aggregator::new(Duration::from_secs(10)).with_max_series_per_metric(Some(1));
+        let resource = default_resource();
+        let mut event = |path: &str, host: &str| {
+            let mut event = tagged_counter("req", 1.0, &[("path", path), (HOST_NAME, host)]);
+            event.attributes.insert("_logit.statsd.type", "c");
+            event.attributes.insert(METRICS_FIELDS, true);
+            event.attributes.insert("_logit.field.note", "free text");
+            feed(&mut agg, &resource, event);
+        };
+        event("/a", "h1");
+        event("/b", "h1");
+        event("/c", "h1");
+        event("/d", "h2");
+        let flushed = flush_events(&mut agg, 100);
+        let mut overflow: Vec<AttrMap> = flushed_named(&flushed, "req")
+            .filter(|e| is_marked(&e.attributes))
+            .map(|e| e.attributes.clone())
+            .collect();
+        overflow.sort_by_key(|a| a.get(HOST_NAME).and_then(Value::as_str).map(str::to_owned));
+        assert_eq!(overflow.len(), 2, "one overflow series per host");
+        for (attributes, host) in overflow.iter().zip(["h1", "h2"]) {
+            let mut expected = AttrMap::new();
+            expected.insert(OVERFLOW, true);
+            expected.insert(HOST_NAME, host);
+            expected.insert("_logit.statsd.type", "c");
+            assert_eq!(attributes, &expected, "no path, no field key, no fields flag");
+        }
+    }
+
+    /// The limit counts a name across every group, and a fold lands in the record's own group.
+    #[test]
+    fn the_per_metric_limit_counts_a_name_across_groups() {
+        let mut agg = Aggregator::new(Duration::from_secs(10)).with_max_series_per_metric(Some(1));
+        let a = default_resource();
+        let b = Arc::new(Resource { dropped_attributes_count: 1, ..Resource::default() });
+        feed(&mut agg, &a, tagged_counter("req", 1.0, &[("path", "/a")]));
+        feed(&mut agg, &b, tagged_counter("req", 1.0, &[("path", "/b")]));
+        assert_names_match_the_groups(&mut agg);
+        let flushed = flush_events(&mut agg, 100);
+        let in_b = flushed.iter().find(|(r, _)| Arc::ptr_eq(r, &b)).expect("b's group opened");
+        assert_eq!(in_b.1.len(), 1);
+        assert!(is_marked(&in_b.1[0].attributes), "b's record folded, in b's group");
+    }
+
+    /// The overflow series doesn't count against the per-name limit, but it does count against
+    /// `max_series`, which drops a fold that would open it at a full cap.
+    #[test]
+    fn the_overflow_series_counts_against_max_series_only() {
+        let (mut agg, registry) = with_registry(
+            Aggregator::new(Duration::from_secs(10))
+                .with_max_series(2)
+                .with_max_series_per_metric(Some(1)),
+        );
+        let resource = default_resource();
+        feed(&mut agg, &resource, tagged_counter("req", 1.0, &[("path", "/a")]));
+        feed(&mut agg, &resource, tagged_counter("req", 1.0, &[("path", "/b")])); // opens overflow
+        feed(&mut agg, &resource, tagged_counter("req", 1.0, &[("path", "/c")])); // folds into it
+        feed(&mut agg, &resource, tagged_counter("other", 1.0, &[])); // cap full: dropped
+        assert_names_match_the_groups(&mut agg);
+        let events = registry.drain(0);
+        assert_eq!(overflowed(&events), 2.0);
+        assert_eq!(series_limit_dropped(&events), Some(1.0));
+
+        // A full `max_series` drops a fold whose overflow series isn't open yet.
+        let (mut agg, registry) = with_registry(
+            Aggregator::new(Duration::from_secs(10))
+                .with_max_series(1)
+                .with_max_series_per_metric(Some(1)),
+        );
+        feed(&mut agg, &resource, tagged_counter("req", 1.0, &[("path", "/a")]));
+        feed(&mut agg, &resource, tagged_counter("req", 1.0, &[("path", "/b")]));
+        assert_names_match_the_groups(&mut agg);
+        let events = registry.drain(0);
+        assert_eq!(overflowed(&events), 0.0, "a dropped record isn't an absorbed one");
+        assert_eq!(series_limit_dropped(&events), Some(1.0));
+        assert_eq!(absorbed(&events), 1.0);
+    }
+
+    /// A flush frees the slot of every series it drains: the next window admits new series of
+    /// the name again before it folds.
+    #[test]
+    fn a_flush_frees_a_names_slots() {
+        let mut agg = Aggregator::new(Duration::from_secs(10)).with_max_series_per_metric(Some(1));
+        let resource = default_resource();
+        feed(&mut agg, &resource, tagged_counter("req", 1.0, &[("path", "/a")]));
+        feed(&mut agg, &resource, tagged_counter("req", 1.0, &[("path", "/b")]));
+        agg.flush(100);
+        assert!(agg.budget.names.is_empty(), "rebuilt from no survivors");
+        feed(&mut agg, &resource, tagged_counter("req", 1.0, &[("path", "/b")]));
+        let flushed = flush_events(&mut agg, 200);
+        let req: Vec<&Event> = flushed_named(&flushed, "req").collect();
+        assert_eq!(req.len(), 1);
+        assert!(!is_marked(&req[0].attributes), "/b is admitted as itself");
+    }
+
+    /// Retained series hold their name's slots across a flush, and an admission eviction frees
+    /// one. The name counts stay equal to a scan of the groups throughout.
+    #[test]
+    fn retained_series_hold_a_names_slots_and_an_eviction_frees_one() {
+        let (mut agg, registry) = with_registry(
+            Aggregator::new(Duration::from_secs(10))
+                .with_series_retention(5, 100)
+                .with_max_series(2)
+                .with_max_series_per_metric(Some(1)),
+        );
+        let resource = default_resource();
+        let gauge = |path: &str| metric_event_with_tags("g", MetricKind::gauge(1.0), 150, &[("path", path)]);
+        feed(&mut agg, &resource, gauge("/a"));
+        feed(&mut agg, &resource, gauge("/b")); // opens the overflow series
+        agg.flush(100);
+        assert_names_match_the_groups(&mut agg);
+        assert_eq!(agg.budget.names[&intern("g")].series, 1);
+        assert_eq!(agg.budget.names[&intern("g")].overflow, 1);
+
+        // A new name at the full cap evicts /a, the ordinary series, though the idle overflow
+        // series is newer, and frees g's slot.
+        feed(&mut agg, &resource, metric_event("h", MetricKind::gauge(1.0), 150));
+        assert_names_match_the_groups(&mut agg);
+        assert_eq!(agg.budget.names[&intern("g")].series, 0);
+        assert!(agg.groups.iter().flat_map(|g| g.series.keys()).any(|k| is_marked(&k.attributes)));
+        // So /c opens as itself, evicting the overflow series, the last idle one.
+        feed(&mut agg, &resource, gauge("/c"));
+        assert_names_match_the_groups(&mut agg);
+        assert_eq!(held_names(&agg), ["g", "h"]);
+        assert!(!agg.groups.iter().flat_map(|g| g.series.keys()).any(|k| is_marked(&k.attributes)));
+        let events = registry.drain(0);
+        assert_eq!(evicted_for_series_limit(&events), Some(2.0));
+        assert_eq!(overflowed(&events), 1.0, "window one's /b");
+    }
+
+    /// The flush cap evicts an overflow series last, so a cumulative overflow total survives
+    /// the one-off series opened before it.
+    #[test]
+    fn the_flush_cap_evicts_an_overflow_series_last() {
+        let mut agg = cumulative_agg()
+            .with_series_retention(5, 2)
+            .with_max_series_per_metric(Some(2));
+        let resource = default_resource();
+        for path in ["/a", "/b", "/c"] {
+            feed(&mut agg, &resource, tagged_counter("req", 1.0, &[("path", path)]));
+        }
+        // Three survivors over a cap of two; the overflow series opened last, so it's the
+        // newest and would go first by `open_seq` alone.
+        agg.flush(100);
+        let held: Vec<&SeriesKey> = agg.groups.iter().flat_map(|g| g.series.keys()).collect();
+        assert_eq!(held.len(), 2);
+        assert!(held.iter().any(|k| is_marked(&k.attributes)), "the overflow series survived");
+        assert_names_match_the_groups(&mut agg);
+    }
+
+    /// Under `temporality: cumulative` the overflow total stays monotonic while retained, and a
+    /// series admitted once a slot frees starts at zero: nothing counts twice.
+    #[test]
+    fn a_cumulative_overflow_total_is_monotonic_and_a_later_series_starts_at_zero() {
+        let mut agg = cumulative_agg().with_series_retention(1, 100).with_max_series_per_metric(Some(1));
+        let resource = default_resource();
+        feed(&mut agg, &resource, tagged_counter("req", 1.0, &[("path", "/a")]));
+        feed(&mut agg, &resource, tagged_counter("req", 2.0, &[("path", "/b")]));
+        agg.flush(100);
+        // /a goes idle and is evicted at the next flush; the overflow series keeps absorbing.
+        feed(&mut agg, &resource, tagged_counter("req", 3.0, &[("path", "/b")]));
+        let flushed = flush_events(&mut agg, 200);
+        let overflow = flushed_named(&flushed, "req").find(|e| is_marked(&e.attributes)).unwrap();
+        assert_eq!(counter_value(kind_of(overflow)), 5.0, "2, then 3 more");
+        // /a's slot is free, so /c opens as itself, from zero.
+        feed(&mut agg, &resource, tagged_counter("req", 4.0, &[("path", "/c")]));
+        let flushed = flush_events(&mut agg, 300);
+        let c = flushed_named(&flushed, "req")
+            .find(|e| e.attributes.get("path").and_then(Value::as_str) == Some("/c"))
+            .expect("/c admitted");
+        assert_eq!(counter_value(kind_of(c)), 4.0);
+    }
+
+    /// A record whose kind conflicts with its name's overflow series passes through as a
+    /// `kind_conflict`, with its own attributes, and isn't counted as overflowed.
+    #[test]
+    fn a_kind_conflict_with_the_overflow_series_passes_through() {
+        let (mut agg, registry) = with_registry(
+            Aggregator::new(Duration::from_secs(10)).with_max_series_per_metric(Some(1)),
+        );
+        let resource = default_resource();
+        feed(&mut agg, &resource, tagged_counter("m", 1.0, &[("path", "/a")]));
+        feed(&mut agg, &resource, tagged_counter("m", 1.0, &[("path", "/b")]));
+        let gauge = metric_event_with_tags("m", MetricKind::gauge(1.0), 0, &[("path", "/c")]);
+        let forwarded = feed(&mut agg, &resource, gauge).expect("the gauge passes through");
+        assert_eq!(forwarded.attributes.get("path").and_then(Value::as_str), Some("/c"));
+        let events = registry.drain(0);
+        assert_eq!(passed_through(&events, "kind_conflict"), 1.0);
+        assert_eq!(overflowed(&events), 1.0, "only /b folded");
+        assert_names_match_the_groups(&mut agg);
+    }
+
+    /// An upstream stage's overflow series is an overflow series here too: known by its key, so
+    /// it never counts against the name's limit, and a local fold merges into it.
+    #[test]
+    fn an_upstream_overflow_series_is_one_here_too() {
+        let (mut agg, registry) = with_registry(
+            Aggregator::new(Duration::from_secs(10)).with_max_series_per_metric(Some(1)),
+        );
+        let resource = default_resource();
+        let mut upstream = tagged_counter("req", 10.0, &[]);
+        upstream.attributes.insert(OVERFLOW, true);
+        feed(&mut agg, &resource, upstream);
+        feed(&mut agg, &resource, tagged_counter("req", 1.0, &[("path", "/a")]));
+        feed(&mut agg, &resource, tagged_counter("req", 2.0, &[("path", "/b")]));
+        assert_names_match_the_groups(&mut agg);
+        let flushed = flush_events(&mut agg, 100);
+        let req: Vec<&Event> = flushed_named(&flushed, "req").collect();
+        assert_eq!(req.len(), 2, "/a admitted, /b folded into the upstream overflow series");
+        let overflow = req.iter().find(|e| is_marked(&e.attributes)).unwrap();
+        assert_eq!(counter_value(kind_of(overflow)), 12.0);
+        assert_eq!(overflowed(&registry.drain(0)), 1.0);
+
+        // A marker beside an attribute the fold removes isn't an overflow key: it counts.
+        let mut classes = KeyClasses::default();
+        let mut attributes = AttrMap::new();
+        attributes.insert(OVERFLOW, true);
+        attributes.insert("path", "/a");
+        let key = SeriesKey { name: intern("req"), unit: None, attributes };
+        assert!(!agg.overflow.is(&key, &mut classes));
+        assert!(agg.overflow.is(&agg.overflow.of(key, &mut classes), &mut classes));
+    }
+
+    /// With the limit off, no name is counted, the gauge isn't reported, and every series opens.
+    #[test]
+    fn with_the_limit_off_no_name_is_counted() {
+        let (mut agg, registry) = with_registry(Aggregator::new(Duration::from_secs(10)));
+        let resource = default_resource();
+        for path in ["/a", "/b", "/c"] {
+            feed(&mut agg, &resource, tagged_counter("req", 1.0, &[("path", path)]));
+        }
+        assert!(agg.budget.names.is_empty());
+        let flushed = flush_events(&mut agg, 100);
+        assert_eq!(flushed_named(&flushed, "req").count(), 3);
+        let events = registry.drain(0);
+        assert_eq!(gauge_value(&events, "logit.transform.metrics.overflowing"), None);
+        assert_eq!(overflowed(&events), 0.0);
+    }
+
+    /// `overflowing` counts the names over the limit at the flush, before any series is touched:
+    /// a name that only reached its limit isn't over it.
+    #[test]
+    fn overflowing_counts_the_names_over_the_limit() {
+        let (mut agg, registry) = with_registry(
+            Aggregator::new(Duration::from_secs(10)).with_max_series_per_metric(Some(1)),
+        );
+        let resource = default_resource();
+        for name in ["a", "b", "c"] {
+            feed(&mut agg, &resource, tagged_counter(name, 1.0, &[("path", "/1")]));
+        }
+        for name in ["a", "b"] {
+            feed(&mut agg, &resource, tagged_counter(name, 1.0, &[("path", "/2")]));
+        }
+        agg.flush(100);
+        let events = registry.drain(0);
+        assert_eq!(gauge_value(&events, "logit.transform.metrics.overflowing"), Some(2.0));
+        agg.flush(200);
+        let events = registry.drain(0);
+        assert_eq!(gauge_value(&events, "logit.transform.metrics.overflowing"), Some(0.0));
+    }
+
+    /// The diagnostic names the name with the most folds and the attribute key whose values
+    /// differ most among its series, never a value, and counts the other overflowing names.
+    #[test]
+    fn the_overflow_diagnostic_names_the_worst_metric_and_its_widest_key() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let captured = CapturedWarnings::default();
+        let subscriber = tracing_subscriber::registry().with(captured.clone());
+        tracing::subscriber::with_default(subscriber, || {
+            let mut agg =
+                Aggregator::new(Duration::from_secs(10)).with_max_series_per_metric(Some(2));
+            let resource = default_resource();
+            let feed_req = |agg: &mut Aggregator, name: &str, id: &str| {
+                let event =
+                    tagged_counter(name, 1.0, &[("region", "eu"), ("request_id", id)]);
+                feed(agg, &resource, event);
+            };
+            feed_req(&mut agg, "quiet", "q1");
+            feed_req(&mut agg, "quiet", "q2");
+            feed_req(&mut agg, "quiet", "q3"); // the 1st fold reports
+            feed_req(&mut agg, "loud", "secret-1");
+            feed_req(&mut agg, "loud", "secret-2");
+            feed_req(&mut agg, "loud", "secret-3"); // the 2nd reports
+            feed_req(&mut agg, "loud", "secret-4"); // the 3rd is suppressed
+            feed_req(&mut agg, "loud", "secret-5"); // the 4th reports
+        });
+        let messages = captured.0.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        assert_eq!(messages.len(), 3, "{messages:#?}");
+        assert!(messages[0].contains("metric 'quiet'") && messages[0].contains("0 other"));
+        let last = &messages[2];
+        assert!(last.contains("metric 'loud'"), "{last}");
+        assert!(last.contains("3 records this window"), "{last}");
+        assert!(last.contains("attribute 'request_id' has the most distinct values (2)"), "{last}");
+        assert!(last.contains("1 other metric names"), "{last}");
+        for message in &messages {
+            assert!(!message.contains("secret") && !message.contains("eu"), "{message}");
+        }
     }
 
     /// An unseeded delta opens the series with its own type, as a `Sum`'s first record does.

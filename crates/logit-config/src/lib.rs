@@ -2772,6 +2772,25 @@ pub enum ComponentKind {
         /// raise this.
         #[serde(default = "default_aggregate_max_series")]
         max_series: usize,
+        /// A limit on how many series one metric name holds at once, across every resource,
+        /// in the shape of the OpenTelemetry SDK's cardinality limit. Off by default, must be at
+        /// least `1`, and recommended: it's the cap that keeps every metric's totals correct.
+        /// Past it, a metric that would open a new series for its name folds into one overflow
+        /// series instead, with the same name and unit and the attributes replaced by
+        /// `logit.overflow: true`, keeping only `host.name` and the private `_logit.*` keys. The
+        /// overflow series doesn't count against this limit but does count against
+        /// `max_series`. A flush frees the slot of every series it drains or evicts. Counters,
+        /// distributions, sets, and histograms stay correct as totals; an overflow gauge's
+        /// value is whichever unrelated series wrote last, so it carries no meaning beyond the
+        /// marker. Under `temporality: cumulative` an overflow total stays monotonic while it's
+        /// retained, and a series admitted later starts from zero. A folded metric counts in
+        /// `logit.transform.metrics.overflowed`, never as dropped, and
+        /// `logit.transform.metrics.overflowing` reports how many metric names are over the
+        /// limit; a throttled warning names the worst one and the attribute key with the most
+        /// distinct values among its series. A `keep` placed after this component removes
+        /// `logit.overflow` unless it lists it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_series_per_metric: Option<usize>,
         /// Whether a raw samples series (statsd `ms`/`h`/`d`) absorbs into this window as a
         /// sketch (`sketch`, the default: error-bounded quantiles, no raw values retained) or
         /// keeps its raw observations for the whole window (`samples`), falling back to a sketch,
@@ -6528,6 +6547,7 @@ mod tests {
                 series_retention,
                 max_retained_series,
                 max_series,
+                max_series_per_metric,
                 distributions,
                 max_samples_per_series,
                 sets,
@@ -6539,6 +6559,7 @@ mod tests {
                 assert_eq!(series_retention, 5);
                 assert_eq!(max_retained_series, 10_000);
                 assert_eq!(max_series, 100_000);
+                assert_eq!(max_series_per_metric, None);
                 assert_eq!(distributions, Distributions::Sketch);
                 assert_eq!(max_samples_per_series, 1000);
                 assert_eq!(sets, Sets::Estimate);

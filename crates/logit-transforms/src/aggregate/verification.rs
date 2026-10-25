@@ -18,6 +18,11 @@
 //!   cap (most idle first, then newest), and clamps its start time into its window. The model
 //!   checks every survivor's state and the series accounting identity. `aggregate`'s own tests
 //!   drive the cap at volume (`cap_soak`).
+//! - The series budget: [`Model::absorb`] restates `max_series` (an idle series evicted to make
+//!   room, else the record dropped) and `max_series_per_metric` (a new series past a name's limit
+//!   folded into its overflow series), and `run_model` checks the budget's counts against a scan
+//!   after every event and the records identity with its `dropped` term. Model configs draw both
+//!   caps small, so a run reaches them.
 //! - XFORM-05, contributing contexts:
 //!   `contributing_contexts_cap_per_series_and_count_only_new_and_full` drives the per-series
 //!   context cap with more contexts than it holds, against [`ref_links`].
@@ -833,8 +838,9 @@ fn record_spec() -> impl Strategy<Value = RecordSpec> {
 }
 
 /// Attribute sets an event draws from: two distinct series keys, a `NaN` one, one per
-/// `_logit.metrics.closed` reason, and every protocol carrier with no flag, which is an ordinary
-/// series key.
+/// `_logit.metrics.closed` reason, a protocol carrier with no flag, which is an ordinary series
+/// key, one with a host, an upstream stage's overflow series, and the overflow marker beside an
+/// ordinary attribute, which isn't an overflow series' key.
 fn event_attributes(i: usize) -> AttrMap {
     let mut attrs = AttrMap::new();
     match i {
@@ -844,8 +850,15 @@ fn event_attributes(i: usize) -> AttrMap {
         3 => attrs.insert("_logit.metrics.closed", Value::str("timestamped")),
         4 => attrs.insert("_logit.metrics.closed", Value::Bool(true)),
         5 => attrs.insert("_logit.metrics.closed", Value::str("bucketed")),
+        6 => attrs.insert("_logit.datadog.stats.name", Value::str("web.request")),
+        7 => {
+            attrs.insert("k0", Value::str("b"));
+            attrs.insert(HOST_NAME, Value::str("h"));
+        }
+        8 => attrs.insert(OVERFLOW, Value::Bool(true)),
         _ => {
-            attrs.insert("_logit.datadog.stats.name", Value::str("web.request"));
+            attrs.insert(OVERFLOW, Value::Bool(true));
+            attrs.insert("k0", Value::str("a"));
         }
     }
     attrs
@@ -894,7 +907,7 @@ fn event_spec() -> impl Strategy<Value = EventSpec> {
         // 1000 runs ahead of every flush clock a run reaches, for the start-time clamp.
         prop_oneof![1 => Just(i64::MIN), 6 => 0..=5i64, 1 => Just(1_000)],
         // The flagged and carrier sets are rarer, so most events still reach a series.
-        prop_oneof![6 => 0..3usize, 1 => 3..6usize, 1 => Just(6usize)],
+        prop_oneof![6 => 0..3usize, 1 => 3..6usize, 1 => Just(6usize), 3 => 7..10usize],
         prop::collection::vec(record_spec(), 0..=3),
         prop::bool::weighted(0.2),
     )
@@ -940,6 +953,8 @@ struct ModelConfig {
     members_cap: Option<usize>,
     series_retention: u32,
     max_retained_series: usize,
+    max_series: usize,
+    max_series_per_metric: Option<usize>,
 }
 
 impl ModelConfig {
@@ -965,13 +980,30 @@ impl ModelConfig {
             .with_distributions(distributions, samples_cap)
             .with_sets(sets, members_cap)
             .with_series_retention(self.series_retention, self.max_retained_series)
+            .with_max_series(self.max_series)
+            .with_max_series_per_metric(self.max_series_per_metric)
     }
 }
 
-/// Every mode, and every retention bound rule 39 accepts ([`ModelConfig::valid`]): cumulative
-/// draws retention from 1, and retention above 0 draws the cap from 1. Generated, not filtered, so
-/// a deep run can't exhaust proptest's global reject budget.
+/// Every mode, and every bound rule 39 accepts ([`ModelConfig::valid`]): cumulative draws
+/// retention from 1, retention above 0 draws the cap from 1, and `max_series` and
+/// `max_series_per_metric` draw from 1, mostly small enough for a run to reach. Generated, not
+/// filtered, so a deep run can't exhaust proptest's global reject budget.
 fn model_config() -> impl Strategy<Value = ModelConfig> {
+    (
+        retention_config(),
+        prop_oneof![1 => Just(100_000usize), 3 => 1..=6usize],
+        prop::option::of(1..=3usize),
+    )
+        .prop_map(|(config, max_series, max_series_per_metric)| ModelConfig {
+            max_series,
+            max_series_per_metric,
+            ..config
+        })
+}
+
+/// [`model_config`]'s modes and retention bounds, with both series caps off.
+fn retention_config() -> impl Strategy<Value = ModelConfig> {
     (
         prop_oneof![Just(AggregateTemporality::Delta), Just(AggregateTemporality::Cumulative)],
         prop::option::of(1..=8usize),
@@ -999,6 +1031,8 @@ fn model_config() -> impl Strategy<Value = ModelConfig> {
                     members_cap,
                     series_retention,
                     max_retained_series,
+                    max_series: 100_000,
+                    max_series_per_metric: None,
                 }
             },
         )
@@ -1082,6 +1116,12 @@ struct RefFlush {
     /// Cap evictions of a series updated this flush, and of an idle one.
     evicted_active: u64,
     evicted_cap_idle: u64,
+    /// The groups held at the flush's start, emptied ones included.
+    groups: usize,
+    /// `logit.transform.metrics.overflowing`, reported only under `max_series_per_metric`.
+    overflowing: Option<usize>,
+    /// Series evicted to make room under `max_series` in the window this flush closes.
+    evicted_for_limit: u64,
 }
 
 /// Counters the model expects between two flushes, keyed by counter name and tag value.
@@ -1105,8 +1145,12 @@ const SAMPLES_FALLBACK: &str = "logit.transform.samples.fallback";
 const MEMBERS_FALLBACK: &str = "logit.transform.set_members.fallback";
 const LINKS_OMITTED: &str = "logit.transform.links.omitted";
 const EVICTED: &str = "logit.transform.series.evicted";
+const DROPPED: &str = "logit.transform.metrics.dropped";
+const OVERFLOWED: &str = "logit.transform.metrics.overflowed";
 /// Every counter the model predicts, and the tag each is read under ("" for none).
-const MODELED_COUNTERS: [(&str, &str); 8] = [
+const MODELED_COUNTERS: [(&str, &str); 10] = [
+    (DROPPED, "reason"),
+    (OVERFLOWED, ""),
     (ABSORBED, ""),
     (PASSED, "reason"),
     (UNSEEDED, ""),
@@ -1120,6 +1164,8 @@ const MODELED_COUNTERS: [(&str, &str); 8] = [
 enum Fate {
     Absorbed,
     Passed(&'static str),
+    /// Dropped under `max_series`.
+    Dropped,
 }
 
 struct Model {
@@ -1129,6 +1175,43 @@ struct Model {
     next_open_seq: u64,
     /// The previous flush's clock, `None` before the first flush.
     window_start: Option<i64>,
+    /// `(resource, scope)` classes with a group: every class a series opened under since the
+    /// last flush, and the classes of its survivors. An admission eviction can empty a class; its
+    /// group stays until the flush.
+    groups: std::collections::BTreeSet<(usize, usize)>,
+    /// Series evicted to make room under `max_series` since the last flush.
+    evicted_for_limit: u64,
+    /// Names with a record that reached `max_series_per_metric` since the last flush.
+    folded_names: std::collections::BTreeSet<String>,
+}
+
+/// Whether `key` is an overflow series' key, restated: the marker, and only private keys and
+/// `host.name` beside it.
+fn ref_is_overflow(key: &RefKey) -> bool {
+    key.attrs.iter().any(|(k, v)| k == OVERFLOW && matches!(v, Value::Bool(true)))
+        && key.attrs.iter().all(|(k, _)| k == OVERFLOW || k == HOST_NAME || k.starts_with("_logit."))
+}
+
+/// `key`'s overflow series: the private keys and `host.name`, plus the marker.
+fn ref_overflow_key(key: &RefKey) -> RefKey {
+    let mut attrs: Vec<(String, Value)> = key
+        .attrs
+        .iter()
+        .filter(|(k, _)| k == HOST_NAME || k.starts_with("_logit."))
+        .cloned()
+        .collect();
+    attrs.push((OVERFLOW.to_string(), Value::Bool(true)));
+    attrs.sort_by(|a, b| a.0.cmp(&b.0));
+    RefKey { name: key.name.clone(), unit: key.unit.clone(), attrs }
+}
+
+/// The order both evictions take series in: an ordinary series before an overflow series, then
+/// the most idle, then the newest.
+fn ref_eviction_order(a: &RefSeries, b: &RefSeries) -> std::cmp::Ordering {
+    ref_is_overflow(&a.key)
+        .cmp(&ref_is_overflow(&b.key))
+        .then(b.idle.cmp(&a.idle))
+        .then(b.open_seq.cmp(&a.open_seq))
 }
 
 impl Model {
@@ -1139,6 +1222,9 @@ impl Model {
             counts: RefCounts::default(),
             next_open_seq: 0,
             window_start: None,
+            groups: Default::default(),
+            evicted_for_limit: 0,
+            folded_names: Default::default(),
         }
     }
 
@@ -1167,6 +1253,7 @@ impl Model {
         for (i, spec) in event.records.iter().enumerate() {
             match self.absorb(resource, scope, ctx, event, spec) {
                 Fate::Absorbed => self.counts.add(ABSORBED, "", 1),
+                Fate::Dropped => self.counts.add(DROPPED, "series_limit", 1),
                 Fate::Passed(reason) => {
                     self.counts.add(PASSED, reason, 1);
                     forwarded.push(i);
@@ -1203,16 +1290,47 @@ impl Model {
             return Fate::Passed("non_finite");
         }
 
-        let key = RefKey::of(
+        let mut key = RefKey::of(
             intern(spec.name),
             spec.unit.map(intern),
             &event_attributes(event.attributes),
         );
-        let found = self
-            .series
-            .iter()
-            .position(|s| s.resource == resource && s.scope == scope && ref_key_eq(&s.key, &key));
+        let find = |series: &[RefSeries], key: &RefKey| {
+            series
+                .iter()
+                .position(|s| s.resource == resource && s.scope == scope && ref_key_eq(&s.key, key))
+        };
+        let mut found = find(&self.series, &key);
+        let mut folded = false;
+        if let (None, Some(limit)) = (found, self.config.max_series_per_metric) {
+            let held = self
+                .series
+                .iter()
+                .filter(|s| s.key.name == key.name && !ref_is_overflow(&s.key))
+                .count();
+            if !ref_is_overflow(&key) && held >= limit {
+                self.folded_names.insert(key.name.clone());
+                key = ref_overflow_key(&key);
+                folded = true;
+                found = find(&self.series, &key);
+            }
+        }
+        if found.is_none() && self.series.len() >= self.config.max_series {
+            let victim = (0..self.series.len())
+                .filter(|&i| !self.series[i].updated)
+                .min_by(|&a, &b| ref_eviction_order(&self.series[a], &self.series[b]));
+            match victim {
+                Some(i) => {
+                    self.series.remove(i);
+                    self.evicted_for_limit += 1;
+                }
+                None => return Fate::Dropped,
+            }
+        }
         let opened = found.is_none();
+        if opened {
+            self.groups.insert((resource, scope));
+        }
         let index = found.unwrap_or_else(|| {
             let acc = self.open(&spec.kind);
             let first_seen = match self.window_start {
@@ -1242,6 +1360,9 @@ impl Model {
         let fate = merge(&mut series.acc, &spec.kind, event.timestamp, config, counts);
         if let Fate::Absorbed = fate {
             series.updated = true;
+            if folded {
+                counts.add(OVERFLOWED, "", 1);
+            }
             if opened && matches!(kind, MetricKind::GaugeDelta(_)) {
                 counts.add(UNSEEDED, "", 1);
             }
@@ -1288,10 +1409,20 @@ impl Model {
 
     /// Emits every updated series and keeps the retainable ones: a gauge, or a cumulative-mode
     /// `Sum`/`Histogram`, while `series_retention > 0`. An idle series emits nothing and is evicted
-    /// at its `series_retention`th idle flush. Past `max_retained_series`, the most idle go first
-    /// and the newest among equally idle ones.
+    /// at its `series_retention`th idle flush. Past `max_retained_series`, series go in
+    /// [`ref_eviction_order`].
     fn flush(&mut self, now: i64) -> RefFlush {
         let config = self.config;
+        let overflowing = config.max_series_per_metric.map(|_| {
+            let mut names = std::mem::take(&mut self.folded_names);
+            names.extend(
+                self.series.iter().filter(|s| ref_is_overflow(&s.key)).map(|s| s.key.name.clone()),
+            );
+            names.len()
+        });
+        self.folded_names.clear();
+        let groups = self.groups.len();
+        let evicted_for_limit = std::mem::take(&mut self.evicted_for_limit);
         let cumulative = config.temporality == AggregateTemporality::Cumulative;
         let mut out = RefFlush {
             emitted: Vec::new(),
@@ -1299,6 +1430,9 @@ impl Model {
             evicted_idle: 0,
             evicted_active: 0,
             evicted_cap_idle: 0,
+            groups,
+            overflowing,
+            evicted_for_limit,
         };
         let mut kept = Vec::new();
         for mut series in std::mem::take(&mut self.series) {
@@ -1339,7 +1473,7 @@ impl Model {
         }
         if kept.len() > config.max_retained_series {
             let excess = kept.len() - config.max_retained_series;
-            kept.sort_by(|a, b| b.idle.cmp(&a.idle).then(b.open_seq.cmp(&a.open_seq)));
+            kept.sort_by(ref_eviction_order);
             for series in kept.drain(..excess) {
                 if series.idle == 0 {
                     out.evicted_active += 1;
@@ -1348,6 +1482,7 @@ impl Model {
                 }
             }
         }
+        self.groups = kept.iter().map(|s| (s.resource, s.scope)).collect();
         self.series = kept;
         self.window_start = Some(now);
         out
@@ -1626,7 +1761,7 @@ fn telemetry_gauge(events: &[Event], name: &str) -> Option<f64> {
 }
 
 /// Tag values the tagged counters are read under.
-const TAG_VALUES: [&str; 11] = [
+const TAG_VALUES: [&str; 12] = [
     "bucketed",
     "timestamped",
     "flagged",
@@ -1638,6 +1773,7 @@ const TAG_VALUES: [&str; 11] = [
     "rate_mismatch",
     "cap",
     "contexts",
+    "series_limit",
 ];
 
 /// Every counter the model predicts, read back from drained telemetry. A tagged counter must
@@ -1659,6 +1795,37 @@ fn observed_counts(events: &[Event]) -> Result<RefCounts, TestCaseError> {
         prop_assert_eq!(tagged, total, "{} carries an unlisted {}", name, tag);
     }
     Ok(observed)
+}
+
+/// The budget's counts against the model's series: held, idle, every name's ordinary and
+/// overflow series under the per-name limit, and the group bound of twice `max_series`.
+fn check_budget(agg: &mut Aggregator, model: &Model) -> Result<(), TestCaseError> {
+    let config = model.config;
+    prop_assert_eq!(agg.budget.held, model.series.len());
+    prop_assert_eq!(agg.budget.idle, model.series.iter().filter(|s| !s.updated).count());
+    prop_assert!(agg.budget.held <= config.max_series);
+    prop_assert!(agg.groups.len() <= 2 * config.max_series);
+    prop_assert_eq!(agg.groups.len(), model.groups.len());
+    let mut expected: std::collections::BTreeMap<String, (usize, usize)> = Default::default();
+    if config.max_series_per_metric.is_some() {
+        for series in &model.series {
+            let count = expected.entry(series.key.name.clone()).or_default();
+            if ref_is_overflow(&series.key) {
+                count.1 += 1;
+            } else {
+                count.0 += 1;
+            }
+        }
+    }
+    let actual: std::collections::BTreeMap<String, (usize, usize)> = agg
+        .budget
+        .names
+        .iter()
+        .filter(|(_, c)| c.series + c.overflow > 0)
+        .map(|(name, c)| (resolve(*name).to_string(), (c.series, c.overflow)))
+        .collect();
+    prop_assert_eq!(actual, expected);
+    Ok(())
 }
 
 fn run_model(config: ModelConfig, ops: &[ModelOp]) -> Result<(), TestCaseError> {
@@ -1688,6 +1855,7 @@ fn run_model(config: ModelConfig, ops: &[ModelOp]) -> Result<(), TestCaseError> 
                     let kept = agg.process(&resources[*resource], &mut event);
                     let forwarded =
                         model.process(resource_class[*resource], scope_class[*scope], *ctx, spec);
+                    check_budget(&mut agg, &model)?;
 
                     // (2) Forwarded records are untouched, in order, and `process` returns false
                     // only when nothing is left.
@@ -1702,13 +1870,6 @@ fn run_model(config: ModelConfig, ops: &[ModelOp]) -> Result<(), TestCaseError> 
             }
             ModelOp::Flush => {
                 now += 10;
-                let groups = {
-                    let mut classes: Vec<(usize, usize)> =
-                        model.series.iter().map(|s| (s.resource, s.scope)).collect();
-                    classes.sort_unstable();
-                    classes.dedup();
-                    classes.len()
-                };
                 let active = model.series.iter().filter(|s| s.updated).count();
                 let retained = model.series.len() - active;
                 let series_before: usize = agg.groups.iter().map(|g| g.series.len()).sum();
@@ -1720,6 +1881,9 @@ fn run_model(config: ModelConfig, ops: &[ModelOp]) -> Result<(), TestCaseError> 
                     evicted_idle,
                     evicted_active,
                     evicted_cap_idle,
+                    groups,
+                    overflowing,
+                    evicted_for_limit,
                 } = model.flush(now);
                 let mut counts = std::mem::take(&mut model.counts);
                 counts.add(
@@ -1787,8 +1951,18 @@ fn run_model(config: ModelConfig, ops: &[ModelOp]) -> Result<(), TestCaseError> 
                     TAG_VALUES.iter().map(|r| telemetry_total(&events, PASSED, "reason", r)).sum();
                 prop_assert_eq!(
                     metrics_in,
-                    telemetry_total(&events, ABSORBED, "", "") + passed,
-                    "metrics_in == absorbed + passed_through"
+                    telemetry_total(&events, ABSORBED, "", "")
+                        + passed
+                        + telemetry_total(&events, DROPPED, "reason", "series_limit"),
+                    "metrics_in == absorbed + passed_through + dropped"
+                );
+                prop_assert_eq!(
+                    telemetry_gauge(&events, "logit.transform.metrics.overflowing"),
+                    overflowing.map(|n| n as f64)
+                );
+                prop_assert_eq!(
+                    telemetry_total(&events, EVICTED, "reason", "series_limit"),
+                    evicted_for_limit
                 );
                 metrics_in = 0;
                 prop_assert_eq!(observed_counts(&events)?, counts);
@@ -1819,6 +1993,8 @@ fn run_model(config: ModelConfig, ops: &[ModelOp]) -> Result<(), TestCaseError> 
                 );
                 // (6) The cap holds, and retention 0 keeps nothing.
                 prop_assert!(series_after <= config.max_retained_series);
+                prop_assert!(series_after <= config.max_series);
+                check_budget(&mut agg, &model)?;
                 if config.series_retention == 0 {
                     prop_assert_eq!(series_after, 0);
                 }
@@ -1904,6 +2080,8 @@ fn family_config(family: usize) -> BoxedStrategy<ModelConfig> {
             // only the emitted start time, which the laws don't compare.
             series_retention: u32::from(family == 5),
             max_retained_series: usize::from(family == 5),
+            max_series: 100_000,
+            max_series_per_metric: None,
         })
         .boxed()
 }
@@ -2027,6 +2205,8 @@ fn model_config_validity_matches_rule_39() {
                     members_cap: None,
                     series_retention,
                     max_retained_series,
+                    max_series: 100_000,
+                    max_series_per_metric: None,
                 };
                 let cumulative = temporality == AggregateTemporality::Cumulative;
                 let rule_39 = !(cumulative && (series_retention == 0 || max_retained_series == 0))
@@ -2060,6 +2240,8 @@ fn the_model_caps_links_per_series() {
         members_cap: None,
         series_retention: 0,
         max_retained_series: 0,
+        max_series: 100_000,
+        max_series_per_metric: None,
     };
     let mut ops: Vec<ModelOp> = (0..CONTEXTS)
         .map(|context| ModelOp::Batch {

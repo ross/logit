@@ -120,6 +120,13 @@ impl Diagnostics {
         self.lock_counts().get(key).copied().unwrap_or(0)
     }
 
+    /// Whether the next [`Diagnostics::warn_throttled`] of `key` will report, so a caller whose
+    /// message costs a scan builds it only then. Advances nothing. Exact while one task reports
+    /// `key`; a clone reporting it in between can only make the answer stale by one occurrence.
+    pub fn would_report(&self, key: &str) -> bool {
+        !self.telemetry.is_muted() && (self.occurrences(key) + 1).is_power_of_two()
+    }
+
     /// The shared counts, tolerating poison: a clone panicking mid-report leaves them usable, and
     /// losing the throttle would be worse.
     fn lock_counts(&self) -> std::sync::MutexGuard<'_, HashMap<&'static str, u64>> {
@@ -256,6 +263,24 @@ mod tests {
             MetricKind::Sum(s) => assert_eq!(s.value, MetricValue::F64(10.0)),
             other => panic!("expected Sum, got {other:?}"),
         }
+    }
+
+    /// `would_report` answers what the next `warn_throttled` returns, advances nothing, and is
+    /// `false` while the gate is muted.
+    #[test]
+    fn would_report_predicts_the_next_warn_throttled() {
+        let mut diag = Diagnostics::new("test");
+        for _ in 0..10 {
+            let predicted = diag.would_report("k");
+            assert_eq!(diag.would_report("k"), predicted, "asking advances nothing");
+            assert_eq!(diag.warn_throttled("k", "x"), predicted);
+        }
+        let gate = CountGate::new();
+        let gated = diag.gated(&gate);
+        gate.set_muted(true);
+        assert!(!gated.would_report("other"), "a muted value never reports");
+        gate.set_muted(false);
+        assert!(gated.would_report("other"));
     }
 
     #[test]

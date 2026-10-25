@@ -116,7 +116,8 @@
 //!     `series_retention` or `max_retained_series` of `0` (nothing survives a flush, so each
 //!     window's increment would be labeled a running total); in either mode, `series_retention`
 //!     above `0` with `max_retained_series: 0` (every retained series evicted at every flush), a
-//!     `max_series` of `0` (every new series refused), and a `max_samples_per_series` or
+//!     `max_series` of `0` (every new series refused), a `max_series_per_metric` of `0` (every
+//!     series folded into its name's overflow series), and a `max_samples_per_series` or
 //!     `max_set_members_per_series` of `0` (every record falls back)
 //!     (`docs/adr/aggregation-window-semantics.md`).
 //! 40. A scrape-mode `prometheus_in` with a target that isn't an absolute `http(s)://` URL
@@ -2005,6 +2006,7 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
             series_retention,
             max_retained_series,
             max_series,
+            max_series_per_metric,
             max_samples_per_series,
             max_set_members_per_series,
             ..
@@ -2031,6 +2033,13 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                 anyhow::bail!(
                     "component '{id}': max_series must be at least 1 -- at 0 every metric that \
                      would open a series is dropped"
+                );
+            }
+            if *max_series_per_metric == Some(0) {
+                anyhow::bail!(
+                    "component '{id}': max_series_per_metric must be at least 1 -- at 0 every \
+                     metric folds into its name's overflow series; leave it unset to turn the \
+                     limit off"
                 );
             }
             if *max_samples_per_series == 0 {
@@ -5503,6 +5512,7 @@ mod tests {
                     series_retention: 5,
                     max_retained_series: 10_000,
                     max_series: 100_000,
+                    max_series_per_metric: None,
                     distributions: logit_config::Distributions::default(),
                     max_samples_per_series: 1000,
                     sets: logit_config::Sets::default(),
@@ -10401,6 +10411,7 @@ mod tests {
                     series_retention: 5,
                     max_retained_series: 10_000,
                     max_series: 100_000,
+                    max_series_per_metric: None,
                     distributions: logit_config::Distributions::default(),
                     max_samples_per_series: 1000,
                     sets: logit_config::Sets::default(),
@@ -10579,6 +10590,7 @@ mod tests {
                     series_retention: 5,
                     max_retained_series: 10_000,
                     max_series: 100_000,
+                    max_series_per_metric: None,
                     distributions: logit_config::Distributions::default(),
                     max_samples_per_series: 1000,
                     sets: logit_config::Sets::default(),
@@ -12468,6 +12480,7 @@ mod tests {
             series_retention,
             max_retained_series,
             max_series,
+            max_series_per_metric: None,
             distributions: logit_config::Distributions::default(),
             max_samples_per_series,
             sets: logit_config::Sets::default(),
@@ -12569,6 +12582,37 @@ mod tests {
                 ("out", vec!["agg"], sink()),
             ]));
             assert!(err.contains("'agg'") && err.contains("max_series must be"), "got: {err}");
+        }
+    }
+
+    /// Rule 39: a `max_series_per_metric` of 0 folds every series, in either mode; `1` and the
+    /// absent default resolve.
+    #[test]
+    fn an_aggregate_with_a_zero_per_metric_limit_is_rejected() {
+        for temporality in [
+            logit_config::AggregateTemporality::Delta,
+            logit_config::AggregateTemporality::Cumulative,
+        ] {
+            for (limit, ok) in [(Some(0), false), (Some(1), true), (None, true)] {
+                let mut kind = aggregate(temporality, 5, 10);
+                if let ComponentKind::Aggregate { max_series_per_metric, .. } = &mut kind {
+                    *max_series_per_metric = limit;
+                }
+                let config = cfg(vec![
+                    ("in", vec![], listener()),
+                    ("agg", vec!["in"], kind),
+                    ("out", vec!["agg"], sink()),
+                ]);
+                if ok {
+                    resolve(config).expect("a per-metric limit of at least 1 holds something");
+                } else {
+                    let err = expect_err(config);
+                    assert!(
+                        err.contains("'agg'") && err.contains("max_series_per_metric must be"),
+                        "got: {err}"
+                    );
+                }
+            }
         }
     }
 
