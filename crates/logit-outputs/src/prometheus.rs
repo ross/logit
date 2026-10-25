@@ -212,6 +212,8 @@
 //! | Mimir | accepted inside the `out_of_order_time_window` limit, off by default |
 //! | Thanos receive | answered `409`; whether a setting opens a window hasn't been checked |
 //!
+//! Over TLS to a server that picks h2 through ALPN, the batches in flight share one connection as
+//! concurrent streams; otherwise they open up to `concurrency` connections.
 //! `logit.output.in_flight` reads the batches in flight, and `logit.component.send.duration`
 //! times each batch's request from its send to its response.
 //!

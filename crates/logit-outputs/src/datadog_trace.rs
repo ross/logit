@@ -139,6 +139,8 @@
 //! settles the batches oldest first. A fault on one batch resends or drops that batch alone,
 //! under the table below, and its resend skips the requests that batch already settled. Batches
 //! can land out of order, and the Agent stores traces and stats as it receives them.
+//! Over TLS to a server that picks h2 through ALPN, the batches in flight share one connection as
+//! concurrent streams; otherwise they open up to `concurrency` connections.
 //! `logit.output.in_flight` reads the batches in flight, and `logit.component.send.duration` times
 //! each batch's requests from the first send to the last response.
 //!

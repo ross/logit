@@ -117,8 +117,11 @@ pub(crate) async fn exchange(request: reqwest::RequestBuilder) -> Exchange {
 /// Builds an HTTP sink's client.
 ///
 /// `tls` is `None` when no `tls:` block is set: `reqwest`'s default already trusts the bundled
-/// Mozilla roots for an `https://` endpoint. `Some` carries a config built from operator settings
-/// by `logit_pipeline::tls::build_client_config`.
+/// Mozilla roots for an `https://` endpoint, and offers `h2` and `http/1.1` through ALPN. `Some`
+/// carries a config built from operator settings by `logit_pipeline::tls::build_client_config`,
+/// which leaves ALPN empty for `otlp_out`'s gRPC connector; `reqwest` uses a preconfigured config
+/// as given and speaks h2 only when the server picks it through ALPN, so [`client_builder`] sets
+/// the same two protocols on its own copy.
 ///
 /// `timeout` is the client-wide default; both callers also set a per-request `.timeout(..)`,
 /// which is what bounds each request.
@@ -149,6 +152,10 @@ pub(crate) fn build_client(
         .expect("reqwest client should build with the configured TLS settings")
 }
 
+/// The protocols an HTTP sink offers through ALPN, in `reqwest`'s own order for its default
+/// config: h2 when the server speaks it, else HTTP/1.1.
+const HTTP_ALPN: [&[u8]; 2] = [b"h2", b"http/1.1"];
+
 /// [`build_client`]'s settings, unbuilt, for a caller that changes one, such as the proxy.
 pub(crate) fn client_builder(
     timeout: Duration,
@@ -157,7 +164,9 @@ pub(crate) fn client_builder(
     let mut builder =
         reqwest::Client::builder().timeout(timeout).redirect(reqwest::redirect::Policy::none());
     if let Some(cfg) = tls {
-        builder = builder.use_preconfigured_tls(cfg.clone());
+        let mut cfg = cfg.clone();
+        cfg.alpn_protocols = HTTP_ALPN.iter().map(|p| p.to_vec()).collect();
+        builder = builder.use_preconfigured_tls(cfg);
     }
     builder
 }
@@ -545,6 +554,31 @@ pub(crate) fn skip_field(bytes: &[u8], pos: &mut usize, wire_type: u64) -> Optio
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// With no `tls:` block, `reqwest`'s own config offers h2 through ALPN, so four requests at
+    /// once to an h2 server share one connection. The test CA stands in for the bundled roots;
+    /// adding it keeps `reqwest` building its own config.
+    #[tokio::test]
+    async fn the_default_tls_config_offers_h2() {
+        let tls = crate::test_support::fixture_server_config("server", None, &[b"h2", b"http/1.1"]);
+        let mux = held::Mux::start(Some(tls)).await;
+        let ca = std::fs::read(crate::test_support::testdata_dir().join("ca.pem")).unwrap();
+        let client = client_builder(Duration::from_secs(60), None)
+            .add_root_certificate(reqwest::Certificate::from_pem(&ca).unwrap())
+            .build()
+            .unwrap();
+        let requests: Vec<_> =
+            (0..4).map(|_| tokio::spawn(client.post(mux.url()).body("x").send())).collect();
+        logit_pipeline::test_util::wait_until("four requests open at once", || mux.open() == 4)
+            .await;
+        mux.release();
+        for request in requests {
+            assert_eq!(request.await.unwrap().unwrap().status(), 204);
+        }
+        let carriers = mux.carriers();
+        assert_eq!(carriers.len(), 1, "four requests on one connection: {carriers:?}");
+        assert_eq!(carriers[0].1.as_deref(), Some(&b"h2"[..]));
+    }
 
     #[test]
     fn a_short_body_is_trimmed_and_not_truncated() {

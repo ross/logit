@@ -1034,6 +1034,13 @@ That sink isn't refusing anything: each batch waits for the one before it to be 
 round trip bounds its throughput. On a sink with a `concurrency:` field, raising it keeps more
 batches in flight; see the sink's own docs for what that costs in ordering.
 
+An HTTP sink offers HTTP/2 (h2) and HTTP/1.1 through TLS's ALPN on an `https://` endpoint, and
+its batches in flight share one connection when the server picks h2. That connection is one
+failure domain: a reset or a `GOAWAY` fails every request on it at once, each an ambiguous
+fault, and packet loss on it stalls every request (TCP head-of-line blocking). Over HTTP/1.1,
+including every `http://` endpoint, each batch in flight has its own connection, up to
+`concurrency`, and a fault reaches one. `otlp_out`'s gRPC transport already carries both costs.
+
 While the buffer stays full, the warning repeats at most once a minute with the batches and events
 shed so far, or how long intake has been held. Once the buffer's utilization falls below
 `buffer.recover_below` (default `0.75`), the sink logs one `buffer_recovered` line with the
@@ -4127,7 +4134,9 @@ at that moment fails as ambiguous, because the server may have processed it, and
 default `at_least_once` posture retries it, at the cost of a duplicate span whenever
 VictoriaTraces had stored the first attempt. `buffer: { delivery: at_most_once }` drops the batch
 instead. The
-HTTP endpoint has neither problem (`docs/known-gaps/otlp.md` has the row).
+HTTP endpoint has neither problem over `http://` (`docs/known-gaps/otlp.md` has the row). Over
+`https://`, a VictoriaTraces that picks h2 puts the batches in flight on one connection, and
+whether it closes that connection the same way hasn't been checked.
 
 ### Sending with `compression: zstd`
 
