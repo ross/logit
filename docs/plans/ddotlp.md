@@ -125,9 +125,9 @@ the Rust code under test.
 
 | # | Branch | PR title | Size | Depends on | Status |
 |---|---|---|---|---|---|
-| W0 | `ddotlp/w0` | `ddotlp/w0: ADRs and plan for OTLP metric kinds into datadog_out` | S | — | in review |
-| W1 | `ddotlp/w1` | `ddotlp/w1: datadog_out maps OTLP sums, histograms, and summaries as Datadog's exporter does` | L | W0 | in review |
-| W2 | `ddotlp/w2` | `ddotlp/w2: Summary temporality and the cumulative_to_delta transform` | L | W1 | in review |
+| W0 | `ddotlp/w0` | `ddotlp/w0: ADRs and plan for OTLP metric kinds into datadog_out` | S | — | merged 2026-10-21 |
+| W1 | `ddotlp/w1` | `ddotlp/w1: datadog_out maps OTLP sums, histograms, and summaries as Datadog's exporter does` | L | W0 | merged 2026-10-21 |
+| W2 | `ddotlp/w2` | `ddotlp/w2: Summary temporality and the cumulative_to_delta transform` | L | W1 | merged 2026-10-21 |
 
 ## Settled questions
 

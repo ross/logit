@@ -63,6 +63,14 @@ Entry format and the other areas: [the known-gaps index](README.md).
   4. **A resource key is all-or-nothing per resource.** `key: {resource: ..}` gives every event of
      one resource the same verdict, which is the point of keying on one. At a low resource count
      the kept fraction is lumpy, not `rate`: two services at `rate: 0.5` keep zero, one, or both.
+- **`remove` matches whole attribute names only, with no prefix form.** It can't drop every
+  attribute under `foo.`, such as the flat keys a `flatten` produced or a `json` parse wrote, so
+  each name has to be listed, and a key that appears later isn't covered. `keep` is an allowlist of
+  whole names too, so it has no prefix form either.
+  - **Workaround:** list the names you know in `remove`; or use `keep` to name the attributes you
+    want and drop the rest; or loop over `event.attributes` with `pairs` in a `lua` component and
+    assign `nil` to each key with the prefix, at the cost the first entry above describes.
+  - **To close:** a prefix form on `remove`, if a measured pipeline needs one.
 
 ## `shape` observer
 

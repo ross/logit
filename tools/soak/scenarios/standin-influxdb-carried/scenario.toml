@@ -171,12 +171,12 @@ apply = true
 class = "ambiguous"
 for = "20s"
 
-[[step]]                  # c0s16: 408, a status the table doesn't name: dropped
+[[step]]                  # c0s16: 408, a request timeout: retried
 at = "26m15s"
 action = "respond"
 on = "standin"
 status = 408
-class = "rejected"
+class = "ambiguous"
 for = "20s"
 
 [[step]]                  # c0s17: a redirect, never followed: dropped
@@ -255,13 +255,12 @@ reduce = "delta"
 min = 1
 
 [[expect]]
-name = "other-status-drops"
+name = "request-timeout-retries"
 service = "logit"
-metric = "logit.component.batches.dropped"
+metric = "logit.component.retries"
 component = "influx"
-attrs = { reason = "rejected" }
 step = "c0s16"
-window = "through"
+window = "during"
 reduce = "delta"
 min = 1
 

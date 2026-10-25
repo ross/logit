@@ -394,7 +394,7 @@ W1 comes before any code, because it fixes the dialect every encoder row depends
 Landing order: W0 → W1 → … → W7, linear. Each PR is based on and targets its parent's branch and
 is brought up to date with `git merge origin/main`, never a rebase.
 
-**Status (2026-09-24):** W0 open.
+**Status (2026-10-24):** W0 merged 2026-09-24. W1 hasn't started.
 
 ## Verification
 

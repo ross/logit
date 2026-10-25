@@ -58,11 +58,11 @@ The ADR holds the vocabulary. The pieces this plan adds to it:
 
 | # | Branch | PR title | Size | Depends on | Status |
 |---|---|---|---|---|---|
-| W0 | `flags/w0` | `flags/w0: ADR and plan for producer-set metric flags` | S | — | in review |
-| W1a | `flags/w1a` | `flags/w1a: string fields move to the _logit.field. namespace` | M | W0 | in review |
-| W1b | `flags/w1b` | `flags/w1b: decoders set _logit.metrics.* flags, and aggregate reads flags only` | L | W1a | in review |
-| W2 | `flags/w2` | `flags/w2: VM measurement of the flag reads and the series-key copy` | S | W1b | in review |
-| W3 | `flags/w3` | `flags/w3: ADR and plan for keeping protocol knowledge in family` | S | W1b | in review |
+| W0 | `flags/w0` | `flags/w0: ADR and plan for producer-set metric flags` | S | — | merged 2026-10-23 |
+| W1a | `flags/w1a` | `flags/w1a: string fields move to the _logit.field. namespace` | M | W0 | merged 2026-10-23 |
+| W1b | `flags/w1b` | `flags/w1b: decoders set _logit.metrics.* flags, and aggregate reads flags only` | L | W1a | merged 2026-10-23 |
+| W2 | `flags/w2` | `flags/w2: VM measurement of the flag reads and the series-key copy` | S | W1b | merged 2026-10-23 |
+| W3 | `flags/w3` | `flags/w3: ADR and plan for keeping protocol knowledge in family` | S | W1b | merged 2026-10-23 |
 
 - **W1a.** `FIELD_PREFIX`/`is_field` in `logit_core::attrs`; the InfluxDB decoder and encoder,
   `line_protocol`, and `aggregate`'s scan under the new name (no behavior change);

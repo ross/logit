@@ -50,8 +50,9 @@ assumption baked in permanently. `crates/logit-bench`'s `CountingAlloc` is gener
 allocator for the same reason — allocation *counts* are allocator-independent, but what those
 counts cost is not.
 
-It also closes the profiling gap: jemalloc's built-in heap profiling (`MALLOC_CONF=prof:true`,
-then `jeprof`) is available on the same binary, with no separate instrumented build. See
+It also closes the profiling gap: jemalloc's built-in heap profiling (`_RJEM_MALLOC_CONF=prof:true`,
+then `jeprof`) works on the same code with `tikv-jemallocator`'s `profiling` feature, not on the
+default build. See
 `docs/design/memory.md`'s profiling section for the recipe.
 
 ## Alternatives considered
@@ -80,7 +81,8 @@ then `jeprof`) is available on the same binary, with no separate instrumented bu
 - The default `logit` binary links jemalloc statically. The builder stage already has the C
   toolchain it needs (`rust:1-bookworm`), and `debian:bookworm-slim` needs no new runtime package.
 - Binary size and build time both go up modestly.
-- Heap profiling becomes available on the shipped binary via `MALLOC_CONF`, with no rebuild.
+- Heap profiling becomes available through `_RJEM_MALLOC_CONF` in a build with
+  `tikv-jemallocator/profiling`.
 - Any measurement comparing the two allocators must say which one it used. The numbers in
   `docs/design/memory.md` are allocation *counts*, which don't depend on the allocator; its timing
   numbers do, and it names the allocator they were taken under.
