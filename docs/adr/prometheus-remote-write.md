@@ -1,6 +1,6 @@
 ---
 created: 2026-09-17
-updated: 2026-10-23
+updated: 2026-10-24
 ---
 
 # Prometheus remote-write: a receiver on `prometheus_in`, a sender on `prometheus_out`
@@ -570,6 +570,13 @@ whose body opens with a receiver's decompression error, as `Refused`, since both
 sink's `version:` or `compression:` rather than the batch. The table, with its evidence, is the
 "Faults, retries and duplicate safety (sender mode)" section of
 `crates/logit-outputs/src/prometheus.rs`'s module doc.
+
+## Amendment: a 408 is `Ambiguous` (2026-10-24)
+
+The sender reads a `408` as `Ambiguous` and retries it under `at_least_once`, where "Any other
+4xx → permanent" above would drop the batch. A `408` is a proxy or receiver giving up on the
+request's arrival, not a verdict on the samples. The rationale is in
+[ADR `sink-fault-classes`](sink-fault-classes.md), "Amendment: 408 is `Ambiguous` (2026-10-24)".
 
 ## Amendment (2026-10-13): loss counters follow the telemetry loss vocabulary
 

@@ -84,6 +84,7 @@
 //! |---|---|---|---|
 //! | HTTP `2xx`, gRPC `OK`, a `partial_success` included | `Ok` | "The client MUST NOT retry the request when it receives a partial success response" | [partial success][partial-success] |
 //! | HTTP `429`, `502`, `503`, `504` | `Ambiguous` | the specification's retryable set: "SHOULD be retried" | [retryable response codes][retryable] |
+//! | HTTP `408` | `Ambiguous` | the receiver or a proxy in front of it gave up waiting for the request to arrive, and RFC 9110 lets a client repeat it. `otlp_out` departs from the specification, which doesn't list `408` as retryable: under `Rejected` a transient proxy timeout would drop the batch. A `408` that repeats every attempt holds the queue. See `docs/adr/sink-fault-classes.md`, "Amendment: 408 is `Ambiguous` (2026-10-24)" | [RFC 9110, 15.5.9](https://www.rfc-editor.org/rfc/rfc9110#name-408-request-timeout), [retryable response codes][retryable] |
 //! | HTTP `400` | `Rejected` | "The client MUST NOT retry the request when it receives `HTTP 400 Bad Request`" | [bad data][bad-data] |
 //! | HTTP `401`, `403`, `404`, `501` | `Rejected` | outside the retryable set; and they name one signal's request: a credential scoped per signal, or a backend that serves only some signals (above) | [retryable response codes][retryable] |
 //! | HTTP `405`, `407` | `Refused` | a wrong method or a proxy credential describes the path to the receiver, the same for every signal and every batch; holding resends nothing the receiver refused for its content | [`crate::http::classify_status`] |
@@ -1646,6 +1647,7 @@ mod tests {
         for code in [429, 502, 503, 504] {
             assert_eq!(fault(code), Fault::Ambiguous, "the retryable set: {code}");
         }
+        assert_eq!(fault(408), Fault::Ambiguous, "a proxy's timeout on the request's arrival");
         for code in [500, 505, 511] {
             assert_eq!(fault(code), Fault::Ambiguous, "the server failed, not the batch: {code}");
         }
@@ -1655,7 +1657,7 @@ mod tests {
         for code in [401, 403, 404, 501] {
             assert_eq!(fault(code), Fault::Rejected, "one signal's request: {code}");
         }
-        for code in [400, 408, 409, 413, 415, 422] {
+        for code in [400, 409, 413, 415, 422] {
             assert_eq!(fault(code), Fault::Rejected, "MUST NOT be retried: {code}");
         }
         for code in [301, 302, 307, 308] {
@@ -1699,7 +1701,7 @@ mod tests {
             let status = reqwest::StatusCode::from_u16(code).unwrap();
             assert_eq!(http_status_fault(status), Fault::Rejected, "{code}");
         }
-        for code in [400, 405, 407, 429, 503] {
+        for code in [400, 405, 407, 408, 429, 503] {
             let status = reqwest::StatusCode::from_u16(code).unwrap();
             assert_eq!(http_status_fault(status), classify_status(status), "{code}");
         }

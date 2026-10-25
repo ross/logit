@@ -85,6 +85,7 @@
 //! | `404` `not found` naming the org, org carried | `Rejected` | this batch's org doesn't exist; a batch naming another may land | verified against InfluxDB 2.7.12 |
 //! | `404` with any other body, bucket or org carried | `Rejected` | the body names neither, and holding would wedge the sink on a value one sender chose | -- |
 //! | `404` with any other body, nothing carried | `Refused` | every value came from the config | [`crate::http::classify_status`] |
+//! | `408` | `Ambiguous` | the server or a proxy in front of it (nginx `client_body_timeout`, HAProxy `timeout http-request`) gave up waiting for the request to arrive, and RFC 9110 lets a client repeat it; InfluxDB doesn't document the status, so this is [`crate::http::classify_status`]'s class. A `408` that repeats every attempt holds the queue | [RFC 9110, 15.5.9](https://www.rfc-editor.org/rfc/rfc9110#name-408-request-timeout) |
 //! | `413` | `Rejected` | the body is over the server's limit, "no data written"; a smaller batch would land | [write API](https://docs.influxdata.com/influxdb/v2/api/write/) |
 //! | `422` `unprocessable entity` (`failure writing points to database`, a partial write such as points outside the bucket's retention) | `Rejected` | the server applied what it could and refused the rest for its content; a resend repeats the refusal and overwrites what landed | [write API](https://docs.influxdata.com/influxdb/v2/api/write/), [troubleshoot writes](https://docs.influxdata.com/influxdb/v2/write-data/troubleshoot/) |
 //! | `429` `too many requests` (Cloud) | `Ambiguous` | a rate or quota limit, `Retry-After` set; the next attempt may land | [write API](https://docs.influxdata.com/influxdb/v2/api/write/) |
@@ -757,15 +758,20 @@ mod tests {
         assert_eq!(fault, Fault::Refused, "a body that names neither value");
     }
 
-    /// A status the route doesn't document reads as `classify_status` does, and a redirect is
-    /// `Rejected` because the client follows none.
+    /// A `408` reads as `classify_status` does, `Ambiguous`: a proxy gave up on the request's
+    /// arrival, and a resend can land.
     #[tokio::test]
-    async fn an_undocumented_status_and_a_redirect_are_rejected() {
+    async fn a_408_request_timeout_is_ambiguous() {
         let request_timeout = "HTTP/1.1 408 Request Timeout\r\nContent-Length: 0\r\n\
                                Connection: close\r\n\r\n";
+        assert_eq!(class_of(request_timeout).await.0, Fault::Ambiguous, "408");
+    }
+
+    /// A redirect is `Rejected` because the client follows none.
+    #[tokio::test]
+    async fn a_redirect_is_rejected() {
         let redirect = "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:1/api/v2/write\r\n\
                         Content-Length: 0\r\nConnection: close\r\n\r\n";
-        assert_eq!(class_of(request_timeout).await.0, Fault::Rejected, "408");
         assert_eq!(class_of(redirect).await.0, Fault::Rejected, "302");
     }
 
