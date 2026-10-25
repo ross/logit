@@ -14,6 +14,7 @@ warmup = "60s"
 cooldown = "60s"          # >= recovery_bound
 recovery_bound = "45s"
 cycle = "7m45s"           # the delay, its recovery, and two progress windows
+compose = "compose.override.yaml"   # the stand-in's idle keep-alive timeout
 
 [configs]
 sut = "logit-sut.yaml"

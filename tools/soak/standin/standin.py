@@ -51,7 +51,7 @@ NO_BODY_STATUSES = (204, 304)
 # The cue key only the `datadog` shape takes.
 DATADOG_SHAPE = "datadog"
 # How long a keep-alive connection may sit idle before its thread lets it go, which bounds a
-# SIGTERM's wait for the threads.
+# SIGTERM's wait for the threads; `--idle-timeout` overrides it.
 IDLE_TIMEOUT_S = 5
 
 _print_lock = threading.Lock()
@@ -153,10 +153,10 @@ def series_errors_body(count):
     return bytes(out)
 
 
-def data_handler(state):
+def data_handler(state, idle_timeout=IDLE_TIMEOUT_S):
     class Handler(http.server.BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
-        timeout = IDLE_TIMEOUT_S
+        timeout = idle_timeout
 
         def log_message(self, *args):
             pass
@@ -278,9 +278,16 @@ def main(argv=None):
     parser.add_argument("--path", help="the write path; the shape's own by default")
     parser.add_argument("--data-port", type=int, default=8080)
     parser.add_argument("--control-port", type=int, default=8081)
+    # A client that writes on a pooled connection as this side's idle close reaches it sees a
+    # reset, an ambiguous answer no cue gave. Over a delayed link that race window is the
+    # delay, so a scenario that delays the SUT's egress sets this above the client's own pool
+    # idle timeout (90 s for `reqwest`).
+    parser.add_argument("--idle-timeout", type=float, default=IDLE_TIMEOUT_S,
+                        help="seconds a keep-alive connection may sit idle")
     args = parser.parse_args(argv)
     state = State(args.shape, args.path or DEFAULT_PATH[args.shape])
-    data = http.server.ThreadingHTTPServer(("0.0.0.0", args.data_port), data_handler(state))
+    data = http.server.ThreadingHTTPServer(("0.0.0.0", args.data_port),
+                                           data_handler(state, args.idle_timeout))
     control = http.server.ThreadingHTTPServer(("0.0.0.0", args.control_port),
                                               control_handler(state))
     # Joined on close, so a SIGTERM waits for each request in flight.

@@ -1,0 +1,8 @@
+# Keeps the stand-in's idle keep-alive connections open past `reqwest`'s 90 s pool idle timeout.
+# Under the scenario's 1 s delay on the SUT's egress, a request the sink writes on a pooled
+# connection up to 1 s before the stand-in's default 5 s idle close arrives after it and is
+# reset, an ambiguous answer no step cued, which `at_most_once` drops.
+services:
+  standin:
+    command: ["python", "-u", "/standin/standin.py", "--shape",
+              "${SOAK_STANDIN_SHAPE:-remote_write}", "--idle-timeout", "120"]
