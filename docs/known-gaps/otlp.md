@@ -70,7 +70,9 @@ Entry format and the other areas: [the known-gaps index](README.md).
     dropped batches. `script/victoria-interop`'s leg-7 row can pass a run in which no request
     raced a close; it counts `send_failed` lines but can't force the race.
   - **Workaround:** OTLP over HTTP to VictoriaTraces (`docs/deploying.md`'s "VictoriaMetrics,
-    VictoriaLogs, and VictoriaTraces").
+    VictoriaLogs, and VictoriaTraces"), checked over `http://`. Over `https://`, a VictoriaTraces
+    that picks h2 carries every batch in flight on one connection, as gRPC does, and whether its
+    HTTP listener closes connections the same way hasn't been checked.
   - **Revisit trigger:** VictoriaTraces sending a `GOAWAY` (the upstream fix). Whether `otlp_out`
     should retry a gRPC request that got no response frame before the connection closed is a
     larger question: without a `GOAWAY`, the request may have been processed.
