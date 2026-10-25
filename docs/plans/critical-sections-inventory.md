@@ -1483,9 +1483,9 @@ against commit `2f387ee`; later paragraphs say which workstream they were writte
   decoder's own `bad_line`. That asymmetry between drivers and decoders is worth one shared check.
 - `docs/known-gaps/` documents, as deliberate: one reader per UDP listener (no `SO_REUSEPORT`
   fan-out); read and decode sharing one task; the `ReceiveQueue` being in-memory only (no
-  crash-recovery for intake, unlike the disk-backed *sink* buffer); `read_batch` being Linux-only;
-  and a connection still within its idle budget at shutdown. None of these should be reported as
-  surprises.
+  crash-recovery for intake, unlike the disk-backed *sink* buffer); and a connection still within
+  its idle budget at shutdown. `read_batch` being Linux-only is in `docs/deploying.md`'s
+  `read_batch` section. None of these should be reported as surprises.
 
 
 ---
@@ -3347,8 +3347,9 @@ and out of scope. The only `unsafe` in `logit-pipeline` is in `sockstat.rs` (`me
     simultaneously and tokio picks pseudo-randomly. Both arms map to `Ok(())`/the input's own result here, so it
     looks benign — but an input that returns `Err` at exactly the same instant can have that error swallowed by
     the grace arm. Low confidence this is reachable in practice; worth one look.
-  - **Context (documented, not a surprise):** `docs/known-gaps/` records that a datagram in flight at signal
-    time is lost uncounted, and that `logit_in`/`internal` grace is fixed at 5s.
+  - **Context (documented, not a surprise):** ADR `service-lifecycle-and-output-retry` accepts that a datagram in
+    flight at signal time is lost uncounted, and `docs/known-gaps/` records that `logit_in`/`internal`
+    grace is fixed at 5s.
 - **Existing coverage:** `run_with_shutdown_flushes_an_in_flight_window_before_exiting`,
   `a_non_overriding_input_returns_at_the_instant_shutdown_fires_not_after_the_grace`,
   `an_overriding_input_draining_within_its_grace_completes_and_delivers`,
@@ -4220,8 +4221,8 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
   - Re-interning an attacker-supplied dictionary cannot grow the process-global interner without
     bound across many connections (the interner never evicts — this is an unbounded-growth vector
     distinct from per-request memory caps). **Documented non-goal** under
-    [ADR `deployment-threat-model`](../adr/deployment-threat-model.md): `docs/known-gaps/`'s
-    interner entry names the native dictionary, and `dict.rs`'s module doc points there.
+    [ADR `deployment-threat-model`](../adr/deployment-threat-model.md): `docs/design/memory.md` §4
+    names the native dictionary, and `dict.rs`'s module doc points there.
   - ✅ `Str` is UTF-8-validated (the `TAG_STR` arm of `read_value_at`) and `Bytes` deliberately is
     not. **Holds.**
 - **Observed concerns:**
@@ -4237,12 +4238,12 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
   - ~~`Dict::read` interns every entry into the *global* interner before any of the batch has been
     validated (`Dict::read`).~~ **Documented non-goal**, not changed: CRC-32C rejects accidental
     corruption before the dictionary is read, and a lazy interner would change the ordinary decode
-    path for a case only crafted input produces. `docs/known-gaps/` names the native dictionary
+    path for a case only crafted input produces. `docs/design/memory.md` §4 names the native dictionary
     as an interner feeder; `dict.rs`'s module doc points there. The dictionary's per-frame
     strings are now charged to the decode budget (WIRE-03).
   - **New, documented non-goal:** `read_attr_map_at` inserts through `AttrMap::insert_sym`, which
     is quadratic for a large map whose keys arrive in descending symbol order (refuter measured
-    80,000 keys at 3.4 s descending against 20 ms ascending). `docs/known-gaps/` records it;
+    80,000 keys at 3.4 s descending against 20 ms ascending). ADR `deployment-threat-model` records it;
     `value.rs`'s module doc points there.
   - Unknown `Value` tag → `Value::Null` (the `_unknown` arm of `read_value_at`) is documented, but it means a lossy-transit
     failure that no counter records — no `logit.proto.errors` or skip counter fires.
@@ -5036,7 +5037,7 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
     That is the intended trade-off (better than losing the batch), but it means `idle_timeout` is
     not an upper bound on connection lifetime. **High confidence in the behavior; it is argued for
     in the comment, so this is a "confirm it's the intended contract" item.** **Holds** as the
-    contract: `docs/known-gaps/` ("TLS and connection lifecycle") records that a handler blocked
+    contract: ADR `idle-connection-timeout`'s 2026-09-25 amendments decide that a handler blocked
     forever in a send holds its connection and permit.
   - ~~`otlp_in`'s accept loop (`OtlpInput::run` in `otlp.rs`) does not race shutdown at all, and connections hold
     `Fanout` clones — already recorded in `docs/known-gaps/` ("`otlp_in` can hold the graph open
@@ -5749,8 +5750,8 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
    decoding". That makes `logit-core::metric`'s `HllBytesReader` a P0 for the `logit-core` surveyor,
    not a P2.
 2. **The process-global interner has no eviction and no budget**, and every decoded dictionary
-   entry, trailer string, and OTLP attribute key is interned into it permanently. `docs/known-gaps/`
-   discusses this for `otlp_in`/`json` cardinality; I did not find the native-path case named.
+   entry, trailer string, and OTLP attribute key is interned into it permanently. `docs/design/memory.md`
+   §4 lists what feeds it, the native dictionary included.
    Whoever surveys `logit-core::interner` should treat "a remote peer can grow it without bound"
    as in-scope.
 3. **A repeated, mechanical pattern: telemetry gauges decremented by a bare statement rather than a
@@ -6395,7 +6396,7 @@ socket/driver glue and the native wire format are out of scope (other surveys co
   `otlp_nesting_stays_under_the_native_depth_cap`), so a dependency bump that moves either fails
   a test. `otlp/common.rs`'s module doc records the rule. The same section's
   `otlp_json_peak_memory_per_input_byte_is_documented` pins OTLP/JSON's peak heap per input byte
-  (about 19 ordinary, 98 crafted; `docs/known-gaps/`'s OTLP section).
+  (about 19 ordinary, 98 crafted; ADR `deployment-threat-model`'s non-goals amendment).
 
 ### CODEC-17 — OTLP decode — unguarded `u64 as i64` timestamp cast on every wire timestamp field (logs/traces/metrics)
 - **Location:** `crates/logit-proto/src/otlp/logs.rs` (`decode_log_record`'s `time_unix_nano`/`observed_time_unix_nano`, including the `observed_timestamp` field it sets); `crates/logit-proto/src/otlp/traces.rs` (`decode_span`'s `start_time_unix_nano`/`end_time_unix_nano`); `crates/logit-proto/src/otlp/metrics.rs` (`decode_exemplar` and every data-point branch of `decode_metric`: `time_unix_nano`/`start_time_unix_nano`)
@@ -6555,7 +6556,7 @@ the telemetry buffers are `std::collections::HashMap`.
   outside `1..=AGENT_INF_KEY` are now malformed (`an_agent_key_outside_the_int16_range_is_malformed`).
   `datadog_out` also drops, counted, a sketch past `MAX_DOGSKETCH_ENTRIES` instead of expanding
   large counts into unbounded `k`/`n` entries. A decoded summary stays trusted, recorded in
-  `docs/known-gaps/`.
+  ADR `deployment-threat-model`'s non-goals amendment.
 
 ---
 
@@ -6892,14 +6893,14 @@ interner's eternal-symbols premise, `DdSketch`'s single-config premise, `LogProx
 all correct today and all silently breakable by a plausible future change. Where a cheap guard test
 exists (as `hll_slice_len_matches_upstream_constant` does), it is worth adding one.
 
-**Nothing in this area is a surprise relative to `docs/known-gaps/`.** The interner never freeing
-(its "The attribute/metric-name interner never frees" entry), the `cardinality-estimator`
-allocation-layout workaround (the "`HyperLogLog::from_bytes` ... works around an upstream" entry), the
-statsd sample-rate extrapolation (the "Sample-rate extrapolation for distributions" entry), Lua's
-cost per event (the "Predicate-shaped work ... costs a Lua VM" entry), the listener span window and
-Lua `flush()`'s link-less root (the internal-telemetry entry's open items), and the Lua interner
-exposure (the "Lua-authored telemetry ... convention-enforced" entry) are all documented,
-deliberate, and listed above as context rather than as findings.
+**Nothing in this area is a surprise relative to what the docs record.** The interner never
+freeing (`docs/design/memory.md` §4), the `cardinality-estimator` allocation-layout workaround
+(`docs/known-gaps/`'s "`HyperLogLog::from_bytes` ... works around an upstream" entry), the statsd
+sample-rate handling (ADR `metrics-model-v2`), Lua's cost per event (`docs/known-gaps/`'s
+"Predicate-shaped work ... costs a Lua VM" entry), the listener span window and Lua `flush()`'s
+link-less root (`docs/known-gaps/`'s internal-spans entry), and the Lua interner exposure (ADR
+`lua-authored-telemetry-cardinality`) are all documented, deliberate, and listed above as context
+rather than as findings.
 
 
 ---
@@ -7166,8 +7167,8 @@ processing is synchronous CPU work called from the node runtime in `logit-pipeli
   never moves while the series lives. Rule 39 exists and is tested; it now also rejects retention
   with `max_retained_series: 0` and a zero `max_samples_per_series` or
   `max_set_members_per_series`, and `flush` `debug_assert!`s cumulative mode's bounds. Remaining,
-  in `docs/known-gaps/`: retention counts flushes, not wall time, and the `SystemTime` flush
-  clock can step backwards.
+  retention counts flushes, not wall time (`docs/known-gaps/`), and the `SystemTime` flush
+  clock can step backwards (ADR `aggregation-window-semantics`'s 2026-10-25 amendment).
 
 ### XFORM-05 — Aggregate: contributing-context span-link bookkeeping
 - **Location:** `aggregate.rs` (`ContributingContexts`, `MAX_CONTRIBUTING_CONTEXTS_PER_SERIES`)

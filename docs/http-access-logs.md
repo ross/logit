@@ -1206,7 +1206,9 @@ and the corpus of real user agents and paths they were checked against are `cons
 ## What it does not do
 
 [`docs/known-gaps/transforms.md`](known-gaps/transforms.md#http-access-logs-nginx-haproxy-and-http_access)
-tracks each of these:
+tracks the ones still open. `forwarded:`'s trust is a non-goal
+([ADR `forwarded-header-parsing`](adr/forwarded-header-parsing.md)), and a missing user agent
+follows the absent rule:
 
 - **No per-server presets.** `http_access` never learns a server's native variable names; you
   write the mapping in the server's own log-format language, or, for Caddy and Traefik, in a Lua

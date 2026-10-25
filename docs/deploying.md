@@ -1539,17 +1539,22 @@ socket. Only two things reset it: bytes read from the peer, and the listener fin
 on the connection (a batch handed downstream, a resend recognized, a response completed). Time spent
 blocked handing a batch to a full downstream never counts, because the clock isn't re-armed until
 that work returns. So a connection stalled on backpressure never looks idle, however long the
-stall. An HTTP request handler parked on a full downstream isn't closed by `idle_timeout` or the
-grace after it either: it holds its connection and its permit until the send completes or the
-client goes away, because closing it would drop a batch that never reached the fan-out. A periodic flush tick that finds nothing to send touches neither event, so it never re-arms
-the clock by itself.
+stall. On `otlp_in` and `prometheus_in`'s remote-write receiver, a request handler parked on a
+full downstream isn't closed by `idle_timeout` or the grace after it either: it holds its
+connection and its permit until the send completes or the client goes away, because closing it
+would drop a batch that never reached the fan-out. The other HTTP listeners don't park: a request
+still waiting on a full downstream after 5 s (`datadog_in`, `influxdb_in`, `splunk_hec_in`) or 2 s
+(`datadog_trace_in`) is answered `503` with `Retry-After: 1` and delivers nothing. A periodic
+flush tick that finds nothing to send touches neither event, so it never re-arms the clock by
+itself.
 
 **A request body is bounded per read, not in total.** `idle_timeout` is also the stall bound on
 each read of an HTTP request body or a `logit_in` frame. Without it, a body that stops arriving
 holds its request and its connection permit indefinitely. With it, a peer that sends one byte per
-read, each slightly under the bound, holds them for up to `MAX_REQUEST_BYTES × idle_timeout` per
-request on an HTTP listener, or `max_frame_bytes × idle_timeout` per frame on `logit_in`, and
-enough such peers hold the whole `max_connections` cap. There's no total body deadline, because a
+read, each slightly under the bound, holds them for up to one `idle_timeout` per byte of the
+listener's request-size cap on an HTTP listener (`max_request_bytes` on `splunk_hec_in` and
+`influxdb_in`, fixed on the others), or `max_frame_bytes × idle_timeout` per frame on
+`logit_in`, and enough such peers hold the whole `max_connections` cap. There's no total body deadline, because a
 slow link sending a large legitimate body looks the same; keep untrusted peers out instead
 ([Trust boundary](#trust-boundary)).
 
@@ -4901,7 +4906,7 @@ a loss:
   task forwarded one while the sender's resend of it arrived on a new connection. Both copies are
   forwarded when both are checked before either forward lands, most often when the first is
   waiting for room in a full downstream inbox. The duplicate can arrive after later batches
-  ([ADR `native-hop-send-window`](adr/native-hop-send-window.md)'s Consequences).
+  (`docs/known-gaps/native-hop.md`, "A resend can race the frames an ended connection still holds").
 
 `Reject{code: REJECT_GOING_AWAY}` is different. It has three causes: the peer's own shutdown, an
 idle close, and no consumer taking the frame (every consumer directly downstream of `logit_in` has

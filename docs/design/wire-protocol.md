@@ -455,7 +455,7 @@ decision record.
   reports `logit.input.batches.resends`, `logit.input.senders`, and
   `logit.input.senders.evicted`. No lock spans a forward, so a frame a connection still holds
   after a fault ends it can be forwarded beside the sender's resend of it on a new connection
-  ([ADR `native-hop-send-window`](../adr/native-hop-send-window.md)'s Consequences).
+  (`docs/known-gaps/native-hop.md`, "A resend can race the frames an ended connection still holds").
 - **Acknowledgement point:** for a frame above its sender's mark, after
   `Fanout::send` returns, not when it decodes. `Fanout::send` returns whether any consumer took
   the batch: if one did, the frame joins `logit_in`'s pending `Ack`; if none did, because every

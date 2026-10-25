@@ -1,6 +1,6 @@
 ---
 created: 2026-09-08
-updated: 2026-10-21
+updated: 2026-10-25
 ---
 
 # `file_out`: a rotating file sink, sharing `stdio_out`'s implementation
@@ -327,7 +327,7 @@ read, and an fsync per batch or per rotation would cost every deployment for a g
 them need. A sink that must survive a power loss belongs behind `buffer.disk:`
 ([ADR `disk-backed-sink-buffer`](disk-backed-sink-buffer.md)) with a destination that has its own
 durability. [ADR `durable-checkpoint-writes-and-fault-injection`](durable-checkpoint-writes-and-fault-injection.md)
-records this as its decision 6, and `docs/known-gaps/sinks.md` lists it.
+records this as its decision 6, and `docs/deploying.md` states it for operators.
 
 ## Amendment: a max_files ceiling and a symmetric truncate policy (2026-09-24)
 

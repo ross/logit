@@ -2156,8 +2156,7 @@ where it needs them, and a small check extension.
 
 1. **Lua in the path (built in W7a).** `statsd_in → lua → aggregate → prometheus_out`, which
    drives `run_lua` and `/readyz`'s `stalled`, the one not-ready answer for a node that hasn't
-   exited ([`docs/known-gaps/runtime.md`](../known-gaps/runtime.md), "Admin endpoint, readiness,
-   and release image"). Three scenarios
+   exited ([`docs/deploying.md`](../deploying.md#what-to-watch-on-readyz)). Three scenarios
    ([ADR `lua-runaway-script-bounds`](../adr/lua-runaway-script-bounds.md)):
    - `lua-path`: under the `statsd-vm` schedule in §2, the script rewrites each event, discards every
      53rd (`events.discarded`), fails on every 97th (`events.dropped{reason="script_error"}` beside
