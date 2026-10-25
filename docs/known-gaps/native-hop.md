@@ -22,14 +22,14 @@ Entry format and the other areas: [the known-gaps index](README.md).
 - **`internal`'s and the six HTTP listeners' shutdown grace is fixed at 5s, not operator-tunable.**
   Graph rule 17 rejects a `receive:` block on these seven and on `logit_in` (the six are
   `otlp_in`, `datadog_in`, `datadog_trace_in`, `splunk_hec_in`, `influxdb_in`, and
-  `prometheus_in`'s remote-write receiver), because none is a datagram, stream, or tail listener, so each always gets
-  `ReceiveConfig::default().shutdown_grace`. The HTTP listeners use it as the deadline at which
-  `run_input` aborts any connection still open, and `InternalInput` for its final drain of
-  buffered self-telemetry (`crates/logit-inputs/src/internal.rs`). It's a gap if a deployment
-  needs a different number; no `receive:`-shaped knob exists. `logit_in` gets the same default
-  but doesn't use it: its accept loop returns when shutdown fires, and each connection, a task of
-  its own, answers `GOING_AWAY` and closes at the next frame boundary (see the module doc of
-  `crates/logit-inputs/src/logit.rs`, "Shutdown").
+  `prometheus_in`'s remote-write receiver), because none is a datagram, stream, or tail
+  listener, so each always gets `ReceiveConfig::default().shutdown_grace`. The HTTP listeners use
+  it as the deadline at which `run_input` aborts any connection still open, and `InternalInput`
+  for its final drain of buffered self-telemetry (`crates/logit-inputs/src/internal.rs`). It's a
+  gap if a deployment needs a different number; no `receive:`-shaped knob exists. `logit_in` gets
+  the same default but doesn't use it: its accept loop returns when shutdown fires, and each
+  connection, a task of its own, answers `GOING_AWAY` and closes at the next frame boundary (see
+  the module doc of `crates/logit-inputs/src/logit.rs`, "Shutdown").
 - **`otlp_in`'s TLS-arm `handshake_timeout` bounds the TLS accept and nothing after it.** `hyper`'s
   `hyper_util::server::conn::auto::Builder` reads the first bytes itself to tell HTTP/1.1 from an
   h2 preface, a read `crate::otlp` can't wrap without reimplementing that sniff. The plaintext arm
