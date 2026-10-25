@@ -4200,7 +4200,8 @@ Replace `TOKEN` with the configured value.
 empty, the default, accepts every request. The check runs before the body is read, so a refused
 sender costs a header read. `logit validate` rejects an empty token, a token with leading or
 trailing whitespace (a secret file's trailing newline, say), and an empty username or password,
-since no client could match them.
+since no client could match them, and a username containing `:`, which basic authentication can't
+carry.
 
 **What a refused sender sees, and does:**
 
@@ -4229,7 +4230,9 @@ environment with `!env`, then rotate in two restarts:
 2. Move every sender to the new value.
 3. Remove the old value, and restart.
 
-**What isn't built in.** OAuth2 and OIDC, JWT validation, AWS SigV4, Azure AD, Google IAM, matching
+**What isn't built in.** OAuth2 and OIDC (including Prometheus's `oauth2:`, vmagent's
+`-remoteWrite.oauth2.*`, and the Collector's `oauth2client`, whose tokens change on every refresh),
+JWT validation, AWS SigV4, Azure AD, Google IAM, matching
 a client certificate's subject, and rate limiting all belong in a proxy or service mesh in front of
 the listener. `client_ca_file` admits any certificate that chains to its CA. `datadog_trace_in`
 takes no credential, because dd-trace tracers send none to a local Agent, and `admin:` takes none.

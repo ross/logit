@@ -33,6 +33,14 @@ own behind it, so the set of mechanisms needed deciding before code.
 
 ## Decision
 
+**The rule: a listener accepts the static credentials its protocol's standard clients send, so
+a stock client configuration works against it.** An OTel SDK or Collector exporter, a Prometheus
+`remote_write` block or scrape config, and vmagent each send a configured bearer token or basic
+pair in `Authorization`, so those are what the three HTTP surfaces accept. A listener that stands
+in for a vendor's endpoint authenticates the way that vendor does: `datadog_in`'s `api_keys:`,
+`splunk_hec_in`'s `tokens:`, and `influxdb_in`'s `tokens:` stay as they are, and get no second
+mechanism beside them.
+
 **Static credentials only.** Each of the three HTTP surfaces takes an optional block of bearer
 tokens and basic username and password pairs. The protocol tokens stay as they are, and mutual
 TLS by CA (`client_ca_file`) stays the certificate-based option. Nothing else is built in.
@@ -59,7 +67,9 @@ auth:
   in constant time over its whole length. One copy of this lives in `logit_proto::auth`, beside
   the comparison the protocol tokens share, and has a fuzz target (`http_auth`).
 - **Validation.** Graph rule 97 rejects an empty token, a token with surrounding whitespace, and
-  an empty username or password, none of which a client could ever match. A no-op block is legal.
+  an empty username or password, none of which a client could ever match. It also rejects a basic
+  username containing `:`, which RFC 7617 forbids: `a:b` with password `c` encodes the same as `a`
+  with password `b:c`, so it would alias another entry. A no-op block is legal.
 - **The credential is checked before the body.** A refused request costs a header read, never a
   body read, a decompression, or a decode, so a sender with a bad credential can't spend
   `logit`'s CPU on its payload. The check runs after routing, so a wrong path is still a `404`.
@@ -87,6 +97,12 @@ introspection, AWS SigV4, Azure AD, Google IAM, matching a client certificate's 
 and rate limiting. Each needs a key fetch, a clock, a policy language, or a vendor SDK, and each is
 what an ingress, a service mesh, or an authenticating reverse proxy already does well.
 
+OAuth2 client-credentials senders are on this list even though they send `Authorization: Bearer`:
+Prometheus's `oauth2:`, vmagent's `-remoteWrite.oauth2.*`, and the Collector's `oauth2client`
+extension. The token they send is minted by an identity provider and changes on every refresh, so
+no static list can match it. Accepting one means validating it against that provider, which is
+the token-validation work above.
+
 **Not an auth gate:** Envoy's `X-Forwarded-Client-Cert` and the `Client-Cert` header (RFC 9440)
 name a certificate a proxy terminated. They may become labels on an event, as `forwarded:`
 records a client address. They never admit or refuse a request, since any client that can reach
@@ -112,8 +128,10 @@ the listener can write them.
 - **An auth block on every listener, the protocol-token ones and the TCP ones included.** Rejected.
   The protocol listeners already check what their senders send, and a TCP or UDP wire has no
   header to carry a credential. Mutual TLS covers the stream listeners.
-- **Reading credentials from a file, reloaded like certificates.** Deferred. `!env` and a restart
-  cover rotation with both values live, and no operator has asked.
+- **Reading credentials from a file, reloaded like certificates.** Open, for the maintainer to
+  decide. Rotation is restart-based today: add the new value beside the old with `!env`, restart,
+  move the senders, remove the old value, and restart again. A file reloaded on
+  `tls_reload_interval:` and SIGHUP, as certificates are, would make that restart-free.
 - **One `auth:` key on every kind.** Rejected for the two Prometheus kinds, which serve both a
   client and a server role. `bind_auth:` beside `bind_tls:` names the role, as the TLS keys do.
 
