@@ -74,17 +74,19 @@ Entry format and the other areas: [the known-gaps index](README.md).
   - **Workaround:** no sender is authenticated, so, as in "The remote-write receiver has TLS but
     no authentication", don't point a `bind:` at senders you don't control. `max_families: 0`
     turns off the sharing along with the typing.
-- **The remote-write sender does no cross-batch reordering, so a fan-in topology can draw
-  out-of-order `400`s.** `prometheus_out(endpoint)` sends samples in batch order ([ADR
-  `prometheus-remote-write`](../adr/prometheus-remote-write.md)'s "Sender behaviour"; the sink's
-  module doc). Both specs require one series' samples in timestamp order, so two upstream branches
-  writing the same series into one `prometheus_out` can send an older sample after a newer one. A
-  single chain into one `prometheus_out` can't hit this.
+- **The remote-write sender does no cross-batch reordering, so a fan-in topology, or any
+  topology under `concurrency:` above 1, can draw out-of-order `400`s.** `prometheus_out(endpoint)`
+  sends samples in batch order ([ADR `prometheus-remote-write`](../adr/prometheus-remote-write.md)'s
+  "Sender behaviour"; the sink's module doc, "Concurrency"). Both specs require one series' samples
+  in timestamp order, so two upstream branches writing the same series into one `prometheus_out`
+  can send an older sample after a newer one. A single chain can too once `concurrency:` is above
+  1: batches in flight together can land in any order. At the default of 1, a single chain can't
+  hit this.
   - **Consequence:** a receiver with no out-of-order window (stock Prometheus, Mimir without
     `out_of_order_time_window`) answers `400`, which the sink classifies `Fault::Rejected` and
     drops.
-  - **Workaround:** use a topology that doesn't split one series across branches, or a receiver
-    with an out-of-order window. The sink won't buffer its way out: a reorder window is
+  - **Workaround:** use a topology that doesn't split one series across branches and keep
+    `concurrency:` at 1, or a receiver with an out-of-order window. The sink won't buffer its way out: a reorder window is
     `aggregate`-shaped state a sink doesn't hold.
 - **A later batch repeating a series and millisecond with a new value draws a `400` that drops
   the whole batch.** `prometheus_out(endpoint)` collapses readings of one series that share a

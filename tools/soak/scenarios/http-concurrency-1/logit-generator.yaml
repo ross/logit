@@ -1,0 +1,36 @@
+# The load source in `script/soak`'s http-concurrency-1 scenario: 500 InfluxDB points a second
+# to the system under test over `/api/v2/write`, each batch of 50 one request, one request in
+# flight at a time. Its `internal` telemetry goes to stdout as NDJSON, so the harness reads what
+# it sent.
+admin: { bind: 127.0.0.1:9600 }
+components:
+  load:
+    type: generate_in               # unbounded
+    rate: 500
+    batch: 50
+    event:
+      # One point per event, `soak_requests,series=<n> n="1"`: the carrier names the
+      # measurement, and a string field rides as a field, so the SUT decodes no metric of its
+      # own and its `kv_metrics` counts one per point. A batch holds each `series` once, so
+      # no two points in one body share a series and timestamp, which the SUT's decoder would
+      # merge.
+      attributes:
+        _logit.influxdb.measurement: soak_requests
+        series: "{seq%50}"
+        _logit.field.n: "1"
+  influx:
+    type: influxdb_out
+    sources: [load]
+    url: http://logit:8086
+    org: soak
+    bucket: soak
+    token: soak
+    # The default, written out: one batch per round trip, about five a second under the
+    # scenario's 200 ms delay, against the ten a second offered.
+    concurrency: 1
+    # 50 batches is 5 s of load, so a SUT that answers too slowly overflows it and the loss
+    # is counted here; never stall generate_in. The default posture, at_least_once, resends a
+    # batch whose answer was lost.
+    buffer: { max_batches: 50, overflow: drop_newest, retry_max_delay: 1s }
+  self: { type: internal, interval: 5s, span_sample_rate: 0.0, logs: off }
+  telemetry: { type: stdio_out, sources: [self], format: json }

@@ -1,12 +1,15 @@
 ---
 created: 2026-10-04
-updated: 2026-10-24
+updated: 2026-10-25
 ---
 
 # Sink fault classes: a rejected batch drops, a refused destination holds, and the process never exits for a sink
 
 ## Status
-Accepted
+Accepted. Superseded in part on 2026-10-25 by [ADR
+`sink-request-concurrency`](sink-request-concurrency.md): the "Order is kept" section and the
+rejected alternative "Give up order for concurrency slots". Order stays the default; a sink's
+`concurrency:` above 1 gives it up, and each in-flight batch settles on its own outcome.
 
 ## Context
 
@@ -194,7 +197,10 @@ the table can't resolve, and is a follow-up with its own record.
 One batch at a time per sink, in queue order. There are no concurrency slots that let a failing
 request sit while later batches proceed, and no probing with a later batch. The native hop's
 sequence numbers and remote write's per-series order rule both out, and with `Rejected` dropped at
-once nothing poisonous is held.
+once nothing poisonous is held. [Superseded in part on 2026-10-25 by [ADR
+`sink-request-concurrency`](sink-request-concurrency.md): order is the default, `concurrency: 1`.
+Above it, a sink keeps several batches in flight and a fault settles the head alone, which keeps
+the hold rule: a held head stops the fill at one window.]
 
 ### The native hop's acknowledgment carries a status
 
@@ -261,7 +267,9 @@ What the peers agree on:
 - **Give up order for concurrency slots**, as Vector and the Collector do, so a failing request
   doesn't block the queue. Rejected: the native hop's sequence and remote write's per-series order
   need in-order delivery, and once a rejection drops at once there's nothing poisonous left to
-  block on.
+  block on. [Taken up in part on 2026-10-25 by [ADR
+  `sink-request-concurrency`](sink-request-concurrency.md): opt-in per sink, with the remote-write
+  doc naming the receivers that accept out-of-order samples.]
 - **Treat every `4xx` other than `429` as `Rejected`**, as the specifications define it. Rejected
   as the whole rule: a `401`, `403`, or `404` describes the destination or the config, not the
   batch, and dropping a good batch on each is the Vector behavior operators filed issues against.
@@ -454,10 +462,10 @@ failed request's own:
   is skipped. The gate mutes their encode-side counters on a repeat.
 - Under `at_most_once`, `logit.component.events.dropped{reason="ambiguous_at_most_once"}` counts
   every event of a dropped batch, including events whose requests were delivered; the per-route
-  `records.dropped` is the precise count. A later route's count is the plan's weight for `datadog_out`
-  and the stats group count for `datadog_trace_out`, an upper bound: it includes entries the encode
-  would have skipped or dropped `oversize`, which no reason counts because the batch dropped before
-  that route.
+  `records.dropped` is the precise count. [Amended on 2026-10-25 by [ADR
+  `sink-request-concurrency`](sink-request-concurrency.md): every route is encoded before the
+  first request, so each route counts the entries its unsent requests carry, and an entry the
+  encode skipped or dropped `oversize` keeps its own reason.]
 - A request's `rejected` drop, a `413`'s `oversize`, and `records` for an accepted request count
   once per batch, not once per attempt.
 - The memory is in-process, and the request that drew an `Ambiguous` answer is resent under

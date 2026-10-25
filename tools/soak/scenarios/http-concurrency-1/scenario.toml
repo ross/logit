@@ -1,0 +1,93 @@
+# `http-concurrency` at `concurrency: 1`, the default: 500 InfluxDB points a second in batches
+# of 50 into `logit`'s `influxdb_in` over HTTP, under a 200 ms delay on the SUT's answers and
+# then a backend stop. One request at a time moves about five batches a second over that round
+# trip against the ten offered, so the generator's queue overflows, counted. The pair measures
+# the field's gain on a slow link (docs/plans/sink-request-concurrency.md's "Findings"). The
+# schema is docs/plans/soak-harness.md's "The scenario schema".
+
+name = "http-concurrency-1"
+description = "generator influxdb_out concurrency 1 -> influxdb_in (HTTP) -> kv_metrics -> aggregate 500ms cumulative -> prometheus_out RW1 zstd -> VictoriaMetrics, a 200ms answer delay then a backend stop"
+duration = "10m30s"       # warmup + one cycle + cooldown; --duration overrides
+warmup = "60s"            # no faults: baseline rate, RSS, fds
+cooldown = "120s"         # no faults at the end; >= recovery_bound
+recovery_bound = "45s"    # the generator's retry_max_delay 1s, the sink's 10s, and a drain
+cycle = "7m30s"           # >= last recovery (6m30s) + 2 x progress_window
+
+[configs]
+sut = "logit-sut.yaml"
+generator = "logit-generator.yaml"
+
+[ledger]                  # component ids the checker reads; no rates here
+sut_aggregate = "window"
+wire_loss_outside_faults = 0.0
+
+[[ledger.source]]
+service = "generator"
+generator_input = "load"
+generator_sink = "influx"
+sut_listener = "influx"
+sut_transforms = ["count"]
+wire = "http"             # G events.delivered, W the listener's events.sent
+
+[[ledger.sink]]
+id = "victoria_metrics"
+backend = "victoria-metrics"
+vm_selector = '{__name__="soak_requests_total"}'
+
+[thresholds]
+progress_window = "30s"
+rss_growth_mib_per_hour = 64   # WARN under 1h, FAIL above
+fd_growth = 8
+
+# The SUT's egress carries its answers, so each request's round trip is about 200 ms: a slow
+# link, well under the generator's 10 s timeout.
+[[step]]
+at = "0s"
+action = "netem"
+on = "logit"
+args = "delay 200ms 50ms"
+for = "3m30s"
+
+# The sink's two-batch queue, its inbox, `aggregate`'s, and `count`'s fill in under a minute,
+# and then the listener holds each request 5 s and answers `503`, deferring the batch to the
+# client.
+[[step]]
+at = "4m15s"
+action = "stop"
+on = "victoria-metrics"
+for = "90s"
+
+# One batch per round trip falls behind the ten a second offered, and the 50-batch queue
+# overflows.
+[[expect]]
+name = "overflow-under-delay"
+service = "generator"
+metric = "logit.component.batches.dropped"
+component = "influx"
+attrs = { reason = "overflow_newest" }
+step = "c0s1"
+window = "during"
+reduce = "delta"
+min = 1
+
+[[expect]]
+name = "generator-retries-503s"
+service = "generator"
+metric = "logit.output.requests"
+component = "influx"
+attrs = { class = "5xx" }
+step = "c0s2"
+window = "through"
+reduce = "delta"
+min = 1
+
+# Backpressure never reaches the sink as a drop: `block` holds every batch.
+[[expect]]
+name = "sink-never-drops"
+service = "logit"
+metric = "logit.component.batches.dropped"
+component = "victoria_metrics"
+step = "c0s2"
+window = "through"
+reduce = "delta"
+max = 0

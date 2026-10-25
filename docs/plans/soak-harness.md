@@ -358,6 +358,12 @@ for = "20s"
   The step's `class` is the harness's only copy of `datadog_out`'s response-class table, so the
   loader checks that one is there, not which one it is; `ledger.standin` judges it against the
   sink. W16 holds `shape = "influxdb"` to the same rule, for `influxdb_out`'s table.
+- `count = N`, a positive integer on a `respond` (the `conc` stream's W5), spends the cue on
+  the next N writes to the stand-in's path, after which it answers the default with no cue
+  until the revert. A sink at `concurrency:` above 1 has several requests in flight, so a cue
+  in force for the whole span would answer all of them; a counted cue lands on one.
+  `ledger.standin` FAILs a counted step whose cue answered another number of writes, since
+  that step tested less than it names.
 
 **Signals and renames (W12c)** drive a `logit` process's SIGHUP handling
 ([ADR `signal-handling`](../adr/signal-handling.md)): the signal bumps the reopen generation,
@@ -1756,7 +1762,7 @@ write would answer `404`, which a carried-mode sink reads as `Rejected`, a silen
 the series route's `errors` list, protobuf field 1 (`repeated string`), with N entries; the
 stand-in decodes nothing, so the entries name series by their place in the request. Its control port takes the driver's
 cues and answers `/health`. It prints one JSON line per request to stdout: the time, the path and the
-query string apart, `Content-Encoding`, the cue in force, how it answered (`status` or `reset`), whether it stored
+query string apart, `Content-Encoding`, the cue in force (none once a counted cue is spent), how it answered (`status` or `reset`), whether it stored
 the write (`apply`, else whether the status is `2xx`), the cue's `series_errors` when it set one,
 and the raw body, base64. The driver's
 log capture collects that stdout with every other service's, so a `stop` and `start` of the

@@ -107,7 +107,9 @@ snap = "1"
 ruzstd = { version = "0.9", features = ["hash"] }
 # rustls, not the default native-tls/OpenSSL backend -- keeps "no host toolchain needed"
 # (ADR `containerized-development`) intact, since rustls has no system OpenSSL to link against.
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+# `http2` lets an HTTP sink's concurrent requests share one connection to an h2 server
+# (docs/adr/sink-request-concurrency.md, decision 4).
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2"] }
 # otlp_in/otlp_out's hand-rolled unary gRPC transport (docs/adr/hand-rolled-grpc-over-hyper.md)
 # -- direct deps at the exact versions `reqwest` already pins in Cargo.lock, so pulling them in
 # adds no new version of any of the four to the dependency graph. `reqwest` itself stays the OTLP/

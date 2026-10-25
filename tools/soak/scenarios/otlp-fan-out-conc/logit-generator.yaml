@@ -1,0 +1,33 @@
+# The load source in `script/soak`'s otlp-fan-out-conc scenario: otlp-fan-out's, with up to
+# eight requests in flight. 500 OTLP log records a second to the system under test over
+# OTLP/HTTP, each batch of 50 one request, each record's body four lines of InfluxDB line
+# protocol. Its `internal` telemetry goes to stdout as NDJSON, so the harness reads what it
+# sent.
+admin: { bind: 127.0.0.1:9600 }
+components:
+  load:
+    type: generate_in               # unbounded
+    rate: 500
+    batch: 50
+    event:
+      # Four points per body, each with its own `p`, so none merge: points of one message
+      # with the same measurement, tag set, and timestamp become one event in the SUT's
+      # `line_protocol`. A string field alone, so the SUT decodes no metric of its own and its
+      # `kv_metrics` counts one per point. `|-` keeps the newlines and adds none at the end.
+      log: |-
+        soak_points,series={seq%10},p=0 n="1"
+        soak_points,series={seq%10},p=1 n="1"
+        soak_points,series={seq%10},p=2 n="1"
+        soak_points,series={seq%10},p=3 n="1"
+  otlp:
+    type: otlp_out
+    sources: [load]
+    endpoint: http://logit:4318
+    # Ten batches a second over the scenario's 200 ms round trip need two or three in flight.
+    concurrency: 8
+    # 50 batches is 5 s of load, so a SUT that answers nothing for longer overflows it and the
+    # loss is counted here; never stall generate_in. The default posture, at_least_once,
+    # resends a batch whose answer was lost.
+    buffer: { max_batches: 50, overflow: drop_newest, retry_max_delay: 1s }
+  self: { type: internal, interval: 5s, span_sample_rate: 0.0, logs: off }
+  telemetry: { type: stdio_out, sources: [self], format: json }

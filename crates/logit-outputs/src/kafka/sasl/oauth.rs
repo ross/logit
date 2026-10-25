@@ -91,7 +91,7 @@ impl OAuthBearer {
         timeout: Duration,
     ) -> Self {
         let endpoint = Endpoint {
-            client: crate::http::build_client(timeout, None),
+            client: crate::http::build_client(timeout, crate::http::DEFAULT_IDLE_TIMEOUT, None),
             url,
             client_id: client_id.to_string(),
             authorization: basic_authorization(client_id, client_secret),

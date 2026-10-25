@@ -11,7 +11,8 @@
 //! `self.stream` partway through a frame, and every frame in flight on it with it.
 //!
 //! **Send window** (`docs/adr/native-hop-send-window.md`, decision 5). `Hello` offers the
-//! configured window and the connection uses `max(1, min(offered, answered))`.
+//! configured `concurrency:` as its window, and the connection uses
+//! `max(1, min(offered, answered))`.
 //! [`Output::submit`] writes a frame without waiting for its `Ack` and appends its sender pair
 //! to the connection's in-flight list; [`Output::await_ack`] commits the oldest.
 //! - **Acks name frames** (`docs/adr/native-hop-named-acks.md`, decision 3). An accepted
@@ -312,7 +313,8 @@ pub struct LogitOutput {
     resend_senders: Vec<[u8; 16]>,
 }
 
-/// The window offered when none is configured, `default_logit_out_window` in `logit-config`.
+/// The window offered when no `concurrency:` is configured, `default_logit_out_concurrency` in
+/// `logit-config`.
 const DEFAULT_WINDOW: u32 = 32;
 
 impl LogitOutput {
@@ -333,11 +335,11 @@ impl LogitOutput {
         }
     }
 
-    /// Sets the window offered in `Hello` (default 32): how many frames may be in flight before
-    /// the oldest is acknowledged. The connection uses the smaller of this and the peer's answer.
-    /// Graph rule 75 keeps the configured value at 1 or more.
-    pub fn with_window(mut self, window: u32) -> Self {
-        self.window = window;
+    /// Sets `concurrency:`, the window offered in `Hello` (default 32): how many frames may be in
+    /// flight before the oldest is acknowledged. The connection uses the smaller of this and the
+    /// peer's answer. Graph rule 75 keeps the configured value at 1 or more.
+    pub fn with_concurrency(mut self, concurrency: u32) -> Self {
+        self.window = concurrency;
         self
     }
 
@@ -2806,11 +2808,9 @@ mod tests {
             }
         });
         let mut probe = TelemetryProbe::new();
-        let mut output = LogitOutput::new(addr).with_window(16).with_telemetry(probe.telemetry(
-            "out",
-            "logit_out",
-            "sink",
-        ));
+        let mut output = LogitOutput::new(addr)
+            .with_concurrency(16)
+            .with_telemetry(probe.telemetry("out", "logit_out", "sink"));
 
         for _ in 0..3 {
             submit_next(&mut output, &sample_batch()).await.expect("a submit");
@@ -3288,11 +3288,9 @@ mod tests {
         tokio::spawn(async move { input.run(sink).await });
 
         let mut probe = TelemetryProbe::new();
-        let mut output = LogitOutput::new(addr).with_window(8).with_telemetry(probe.telemetry(
-            "out",
-            "logit_out",
-            "sink",
-        ));
+        let mut output = LogitOutput::new(addr)
+            .with_concurrency(8)
+            .with_telemetry(probe.telemetry("out", "logit_out", "sink"));
         // Five empty events decode past a 1 KiB cap's 4 KiB budget in a few dozen bytes, under
         // `logit_out`'s own size check.
         let events = (0..5).map(|i| Event::empty(i, AttrMap::new())).collect();
@@ -3462,11 +3460,9 @@ mod tests {
             marks
         });
         let mut probe = TelemetryProbe::new();
-        let mut output = LogitOutput::new(addr).with_window(8).with_telemetry(probe.telemetry(
-            "out",
-            "logit_out",
-            "sink",
-        ));
+        let mut output = LogitOutput::new(addr)
+            .with_concurrency(8)
+            .with_telemetry(probe.telemetry("out", "logit_out", "sink"));
         let batches: Vec<_> = (1..=20).map(batch_marked).collect();
 
         send_windowed(&mut output, &batches, |i| SeqId { id: [3; 16], seq: i as u64 + 1 }).await;
@@ -3487,7 +3483,7 @@ mod tests {
             probe.telemetry("logit_in", "logit_in", "listener"),
         )
         .await;
-        let mut output = LogitOutput::new(addr).with_window(8);
+        let mut output = LogitOutput::new(addr).with_concurrency(8);
         let pair = |i: usize| SeqId { id: [4; 16], seq: i as u64 + 1 };
         let batches: Vec<_> = (1..=6).map(batch_marked).collect();
 

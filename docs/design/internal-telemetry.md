@@ -576,7 +576,7 @@ receive and processing side from their own loops, which already see every batch 
 | `logit.component.events.copied` | count | `run_router` (`route_batch`) and `run_route_signals` (`route_signals_batch`): one per delivery past an event's first, for an event a `route` list sends to several destinations, or a `route_signals` sends whole (`strip: false`) or splits into parts (`strip: true`, one per part past the first). Counted on the shared-`Arc` path too, so it counts deliveries, not deep clones. Untagged, and recorded only when nonzero |
 | `logit.component.events.dropped{reason="script_error"}` | count | `run_lua`, one per event whose `process()` call raised an error: that event is lost. Counted beside `errors{reason="process"}` |
 | `logit.component.flush.events` / `.flush.duration` | count / timing | a flush-bearing node's `flush()` |
-| `logit.component.send.duration` | timing | one delivery attempt, `deliver_with_retry` (`write_loop`); for a sink with a send window above 1, one windowed round (the fill and the head's acknowledgment wait), `deliver_window` |
+| `logit.component.send.duration` | timing | one delivery attempt, `deliver_with_retry` (`write_loop`); for a sink with a send window above 1, one windowed round (the fill and the head's acknowledgment wait), `deliver_window`, except on a sink that times each batch (`Output::send_duration_per_batch`: every sink on the HTTP slot helper, which is `influxdb_out`, `prometheus_out`'s remote-write sender, `otlp_out`, `datadog_out`, `datadog_trace_out`, and `splunk_hec_out`), where it's one sample per answer to the oldest batch: that batch's requests, from the first one's send to the last one's response (`Output::answered_send_duration`) |
 | `logit.component.retries` | count | a retried delivery attempt or windowed round, `deliver_with_retry` or `deliver_window` (`write_loop`) |
 | `logit.component.errors` | count | `Output::send` failed (any attempt), or a Lua script error |
 | `logit.component.diagnostics{key=...}` | count | every `Diagnostics::warn_throttled` occurrence, throttled or not |
@@ -686,7 +686,9 @@ its backend:
 - `buffer_full` (warn): a push found no room. It names the bound (`buffer.max_batches`,
   `buffer.max_bytes`, or `buffer.disk.max_bytes`, with its value) and the `overflow` policy, then
   repeats at most once a minute with the batches and events shed so far, or how long intake has
-  been held.
+  been held. Written while the write loop has every batch its concurrency allows in flight, it
+  ends with that concurrency and the last send's duration (`sending at its concurrency of 1, the
+  last send took 200ms`), naming the round trip as what bounds the sink.
 - `buffer_recovered` (info): utilization fell below `buffer.recover_below` (default `0.75`), with
   the episode's duration and totals.
 - `buffer_full_at_shutdown` (info): the sink finished with the buffer still full.
@@ -2077,6 +2079,9 @@ itself. The sink emits each once per batch, however many attempts the runtime ma
 - `logit.output.requests{class="2xx|4xx|5xx|network_error"}`, `logit.output.request.duration` (per
   attempt), and `logit.output.batch.bytes`: the encode and HTTP-response detail a generic
   `send.duration` timer can't distinguish.
+- `logit.output.in_flight` (gauge, `concurrency:` above 1 only): batches whose request is in
+  flight or answered and not yet acknowledged to the write loop, set on every change. A value that
+  sits at `concurrency` means the round trip bounds this sink, as `logit_out`'s does.
 
 | Counter | What it counts |
 |---|---|
@@ -2355,9 +2360,11 @@ under one component id, as for `collectd_out`. The sink adds only what a socket 
   `i64::MAX`, written as a `DoubleValue` because `IntValue` is signed, once per value; and
   `logit.output.events.skipped{reason="no_payload"}`, an event with no metric, log, or span, which
   no signal carries.
+- `logit.output.in_flight` (gauge, `concurrency:` above 1 only): `influxdb_out`'s, with the same
+  meaning.
 
 There's no `logit.output.request.duration`; layer 2's `logit.component.send.duration` times each
-attempt. The class table above says which of this sink's counters count once per batch and which
+attempt, or above a `concurrency:` of 1, each batch's requests. The class table above says which of this sink's counters count once per batch and which
 once per attempt.
 
 ##### `datadog_out`
@@ -2376,7 +2383,8 @@ One `send` is up to eight routes' requests, so every point carries `route`: `ser
 | `logit.output.records.dropped{route, reason="too_many_tags"}` | count | a distribution point or sketch record whose `tags` list holds more than 100 strings, over Datadog's limit, or a series whose list does with its own tags (a `.bucket` series' bounds, a `.quantile` series' quantile) added, one per series; once per batch |
 | `logit.output.records.dropped{route, reason="oversize"}` | count | an event whose body alone is over the route's byte limit, once per batch; or every entry of a request Datadog answered `413`, once per batch |
 | `logit.output.records.dropped{route, reason="rejected"}` | count | every entry of a request Datadog answered with a 3xx or a `Rejected` 4xx (a `400`, say), once per batch, because a rejected request isn't resent. The send goes on to the next request. A `413` counts as `oversize` instead; a `401`, `403`, `404`, `405`, or `407` is `Refused` and a `408` or `429` `Ambiguous`, and none of them counts here. On the series route, also a series Datadog accepted the request for but dropped, one per `errors` entry in its `202` body (a point too far in the future, say), at most the request's entries, and taken out of `records`; once per batch, because an accepted request isn't resent |
-| `logit.output.records.dropped{route, reason="ambiguous_at_most_once"}` | count | under `buffer.delivery: at_most_once`, the entries an `Ambiguous` stop drops: the failed request's, the rest of its route's unsettled requests', and every later route's. A later route's count is the plan's weight, an upper bound that includes entries its encode would have skipped or dropped `oversize` or `too_many_tags` |
+| `logit.output.records.dropped{route, reason="ambiguous_at_most_once"}` | count | under `buffer.delivery: at_most_once`, the entries an `Ambiguous` stop drops: the failed request's, the rest of its route's unsettled requests', and every later route's. Every route is encoded before the first request, so a later route counts its requests' entries, not those its encode skipped or dropped `oversize` or `too_many_tags` |
+| `logit.output.in_flight` | gauge | `concurrency:` above 1 only: batches whose requests are in flight or answered and not yet acknowledged to the write loop, as `influxdb_out`'s |
 | `logit.output.records.dropped{route="traces", reason="needs_agent_processing"\|"not_datadog_origin"}` | count | a span whose chunk's root has no `_top_level` mark: raw tracer output, or not a Datadog span at all; once per batch |
 
 A dropped record is never sent, so a `buffer.disk:` replay after a long outage shows up here as
@@ -2409,7 +2417,8 @@ One `send` is up to two routes' requests, so every point carries `route`: `trace
 | `logit.output.records{route}` | count | spans (`traces`) or stats groups (`stats`) in a request the Agent accepted |
 | `logit.output.records.dropped{route, reason="oversize"}` | count | a trace's spans, or a stats group, too large for the Agent's 25 MiB request limit alone, once per batch; or every record of a request the Agent answered `413`, once per batch |
 | `logit.output.records.dropped{route, reason="rejected"}` | count | every record of a request the Agent answered with a 3xx or a `Rejected` 4xx (a `400`, say), once per batch, because a rejected request isn't resent. The send goes on to the next request. A `413` counts as `oversize` instead; a `401`, `403`, `404`, `405`, `407`, or `415` is `Refused`, a `408` `Ambiguous`, and a `429` `Clean`, and none of them counts here |
-| `logit.output.records.dropped{route, reason="ambiguous_at_most_once"}` | count | under `buffer.delivery: at_most_once`, the records an `Ambiguous` stop drops: the failed request's, the rest of its route's unsettled requests', and, when the trace route stopped, every stats group in the batch. The stats count is an upper bound that includes a group its encode would have dropped `oversize` |
+| `logit.output.records.dropped{route, reason="ambiguous_at_most_once"}` | count | under `buffer.delivery: at_most_once`, the records an `Ambiguous` stop drops: the failed request's, the rest of its route's unsettled requests', and, when the trace route stopped, the stats route's requests' groups. Both routes are encoded before the first request, so a group its encode dropped `oversize` isn't counted here |
+| `logit.output.in_flight` | gauge | `concurrency:` above 1 only: batches whose requests are in flight or answered and not yet acknowledged to the write loop, as `influxdb_out`'s |
 
 The codec's own points are the `datadog` codec's, under [Codecs](#codecs), and this sink doesn't
 repeat them. They count once per batch, per route (the class table above). The one to watch here
@@ -2440,6 +2449,7 @@ batch).
 | `logit.output.records.dropped{reason="invalid_event"}` | count | the object a `400` per-object code (6, 7, 12, 13, or 15) named, dropped before the rest of its body is resent once |
 | `logit.output.requests.rejected{code}` | count | one per `/event` request answered with a non-retryable status: `code` is the body's HEC code when Splunk documents it (`4` for an invalid token, `6` for invalid data, …), else `other` |
 | `logit.output.acks{result}` | count | under `ack: true`, one per `/event` request: `acked`, `timeout` (still unacknowledged at `ack_timeout`, which fails the batch as ambiguous), or `unsupported` (a `200` with no `ackId`, or a poll answered `400` code 14: the token doesn't acknowledge, and the request counts as delivered) |
+| `logit.output.in_flight` | gauge | `concurrency:` above 1 only: batches whose requests are in flight or answered and not yet acknowledged to the write loop, as `influxdb_out`'s |
 
 The codec's own counters (`logit.output.metrics.skipped` and `metrics.degraded` by `metric_kind`
 under `multi_value`, `metrics.degraded{reason="non_finite_component"}` for an expanded
@@ -2505,7 +2515,7 @@ but `requests` and `reconnects` is met once per batch.
   reads 0 after every connection drop, a cancelled call's included. A value that sits at
   `logit.output.window` means the round trip, or the peer's forwarding, bounds this sink.
 - `logit.output.window` (gauge): the window the live connection negotiated, the smaller of the
-  configured `window` and the peer's answer, and at least 1. It reads 1 after every connection
+  configured `concurrency` and the peer's answer, and at least 1. It reads 1 after every connection
   drop.
 - `logit.output.reconnects` (count): every connect *after* the first whose `HelloAck` passed
   validation. A climbing count in steady state means the peer or the network, not this sink, is
@@ -2573,8 +2583,10 @@ but `requests` and `reconnects` is met once per batch.
   counted them while encoding, not guessed from family counts, because one `Series` is one sample
   for a gauge and several for a histogram. It mirrors `prometheus_in`'s `logit.input.samples` in
   bind mode, so the two ends of a remote-write relay are comparable.
+- `logit.output.in_flight` (gauge, `concurrency:` above 1 only): `influxdb_out`'s, with the same
+  meaning.
 
-A batch that produces no series issues no request and reports none of the three.
+A batch that produces no series issues no request and reports none of the first three.
 
 **The codec's `PrometheusEncoder` counts in both modes.** In registry mode it's shared by `send`
 and render, so both total under one component, and counts on every `send` and every render; in

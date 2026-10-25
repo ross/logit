@@ -1,12 +1,17 @@
 ---
 created: 2026-10-04
-updated: 2026-10-15
+updated: 2026-10-25
 ---
 
 # Native hop ack status: the sender pair leads the hop payload, and a rejected `Ack` settles one frame by name
 
 ## Status
-Accepted. Supersedes in part:
+Accepted. Superseded in part on 2026-10-25 by [ADR
+`sink-request-concurrency`](sink-request-concurrency.md): decision 4's "The marker is legal only
+beside `Fault::Rejected`" holds for `logit_out`, whose resubmitted head would land behind frames
+in flight; a sink whose requests settle on their own returns `HeadOnly` beside any class.
+
+Supersedes in part:
 
 - [ADR `native-hop-named-acks`](native-hop-named-acks.md): decision 1's `Ack` wire (two fields)
   and "Meaning" (every `Ack` covers a run), decision 2's flush point 4 (`FRAME_TOO_LARGE` for a
@@ -155,7 +160,9 @@ trailer_bytes := (tag: u8, len: uvarint, value: [u8; len])*     -- tag 1 origin,
   head as `batches.dropped{reason="rejected"}`, prints the destination's text in the
   `send_failed` diagnostic, and goes on to the next head with nothing resubmitted. A disk spool
   commits the head, so it never replays. The marker is legal only beside `Fault::Rejected`: a
-  retried head would have to be resubmitted behind frames already in flight.
+  retried head would have to be resubmitted behind frames already in flight. [Superseded in part
+  on 2026-10-25 by [ADR `sink-request-concurrency`](sink-request-concurrency.md): the marker is
+  legal beside any class for a sink whose requests settle on their own.]
 - **Counted** as `logit.output.requests{class="rejected"}`, once.
 - **The sender learns of a rejection only from the rejected `Ack` it reads.** A mark carries no
   status. If the connection fails after `logit_in` raised the mark and before `logit_out` read the

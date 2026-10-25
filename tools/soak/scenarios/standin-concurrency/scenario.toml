@@ -1,0 +1,151 @@
+# standin-at-most-once's stand-in against a sink at `concurrency: 8`: a 1 s delay on the SUT's
+# egress keeps four or more batches in flight (up to eight when a closed idle connection makes
+# a batch redial under the delay), and each `respond` step's `count = 1` lands its
+# cue on the next write alone, one slot among several. A `401` holds that batch when it
+# reaches the head while the slots behind it are answered, and its resend releases it; a `400`
+# drops that batch alone; and a reset drops that batch alone `ambiguous_at_most_once`.
+# `ledger.standin` checks each step's class and that each cue answered one write, and the
+# expectations count each drop. The stand-in closes a keep-alive connection idle for 5 s, its
+# default, and the sink's `idle_timeout: 1s` closes one first, so no write lands on a connection
+# the stand-in has closed: the reset step's is the run's only ambiguous drop. The schema is
+# docs/plans/soak-harness.md's "The scenario schema".
+
+name = "standin-concurrency"
+description = "standin-at-most-once at concurrency 8 under a 1s egress delay: one write each answered 401 (held, then released), 400 (dropped alone), and reset (dropped alone)"
+duration = "9m45s"        # warmup + one cycle + cooldown
+warmup = "60s"
+cooldown = "60s"          # >= recovery_bound
+recovery_bound = "45s"
+cycle = "7m45s"           # the delay, its recovery, and two progress windows
+
+[configs]
+sut = "logit-sut.yaml"
+generator = "logit-generator.yaml"
+
+[target]
+kind = "standin"
+
+[ledger]
+sut_aggregate = "window"
+wire_loss_outside_faults = 0.0
+
+[[ledger.source]]
+service = "generator"
+generator_input = "load"
+generator_sink = "statsd"
+sut_listener = "statsd"
+
+[[ledger.sink]]           # the one sink, whose writes the stand-in records
+id = "remote_write"
+
+[thresholds]
+progress_window = "30s"
+rss_growth_mib_per_hour = 64
+fd_growth = 8
+
+# c0s1: the slow link the respond steps run inside. Four batches a second over a 1 s round
+# trip keep four or more in flight (up to eight when a closed idle connection makes a batch
+# redial under the delay).
+[[step]]
+at = "0s"
+action = "netem"
+on = "logit"
+args = "delay 1s"
+for = "6m"
+
+[[step]]                  # c0s2: credentials, on one write: that batch holds, then its resend lands
+at = "1m"
+action = "respond"
+on = "standin"
+status = 401
+count = 1
+class = "refused"
+for = "20s"
+
+[[step]]                  # c0s3: invalid samples, on one write: that batch alone drops
+at = "2m35s"
+action = "respond"
+on = "standin"
+status = 400
+body = "out of order sample"
+count = 1
+class = "rejected"
+for = "20s"
+
+[[step]]                  # c0s4: a transport error on one write: that batch alone drops
+at = "4m10s"
+action = "respond"
+on = "standin"
+answer = "reset"
+count = 1
+class = "ambiguous"
+for = "20s"
+
+[[expect]]
+name = "in-flight-overlaps"
+service = "logit"
+metric = "logit.output.in_flight"
+component = "remote_write"
+step = "c0s1"
+window = "during"
+reduce = "max"
+min = 2
+max = 8
+
+# The refused batch is retried and never dropped.
+[[expect]]
+name = "refused-retries"
+service = "logit"
+metric = "logit.component.retries"
+component = "remote_write"
+step = "c0s2"
+window = "during"
+reduce = "delta"
+min = 1
+
+[[expect]]
+name = "refused-never-drops"
+service = "logit"
+metric = "logit.component.batches.dropped"
+component = "remote_write"
+step = "c0s2"
+window = "through"
+reduce = "delta"
+max = 0
+
+# One write answered 400, one batch dropped, and the batches in flight beside it land.
+[[expect]]
+name = "rejected-drops-one"
+service = "logit"
+metric = "logit.component.batches.dropped"
+component = "remote_write"
+attrs = { reason = "rejected" }
+step = "c0s3"
+window = "through"
+reduce = "delta"
+min = 1
+max = 1
+
+# One write reset, one batch dropped unanswered, never retried. A write on a connection the
+# stand-in closed idle would be a second.
+[[expect]]
+name = "ambiguous-drops-one"
+service = "logit"
+metric = "logit.component.batches.dropped"
+component = "remote_write"
+attrs = { reason = "ambiguous_at_most_once" }
+step = "c0s4"
+window = "through"
+reduce = "delta"
+min = 1
+max = 1
+
+[[expect]]
+name = "ambiguous-never-retries"
+service = "logit"
+metric = "logit.component.retries"
+component = "remote_write"
+step = "c0s4"
+window = "through"
+reduce = "delta"
+max = 0

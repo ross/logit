@@ -693,7 +693,7 @@ that recorded the point.
 | `degraded` | warn | A sink's first dropped batch since it was last healthy. |
 | `retrying` | error | A sink's held head failed a retryable send; logged on the first failure, then at most once a minute while the head keeps failing. |
 | `recovered` | info | A sink's first successful delivery after `degraded` or a retried failure. |
-| `buffer_full` | warn | A sink's buffer, or a datagram listener's receive queue, found no room for a push. Names the bound and the `overflow` policy; repeats at most once a minute while it stays full, with what was shed or how long intake has been held. |
+| `buffer_full` | warn | A sink's buffer, or a datagram listener's receive queue, found no room for a push. Names the bound and the `overflow` policy; repeats at most once a minute while it stays full, with what was shed or how long intake has been held. On a sink with every send its `concurrency` allows in flight, it also names that concurrency and the last send's duration. |
 | `buffer_recovered` | info | A full buffer's utilization fell below its `recover_below`. Carries the episode's duration and totals. |
 | `buffer_full_at_shutdown` | info | A sink or listener stopped with its buffer still full. |
 | `telemetry left undrained at exit` | debug/warn | One line per internal metric point no `internal` drain exported, logged after every node has exited and before `exiting`, on exit `0` or `2` alike. `warn` for any nonzero `*.dropped` count, whatever its `reason`; `debug` for everything else, including timings and routine counts. Only with an `internal` component. |
@@ -1022,6 +1022,40 @@ signal. A sink whose buffer fills logs a `buffer_full` warning that names the bo
 ```text
 buffer full (buffer.max_batches 1024); overflow block is holding intake
 ```
+
+If the sink has as many batches in flight as its concurrency allows when the line is written, the
+line ends with that concurrency and the last send's duration:
+
+```text
+buffer full (buffer.max_batches 1024); overflow block is holding intake; sending at its concurrency of 1, the last send took 200ms
+```
+
+That sink isn't refusing anything: each batch waits for the one before it to be answered, so the
+round trip bounds its throughput. On a sink with a `concurrency:` field, raising it keeps more
+batches in flight; see the sink's own docs for what that costs in ordering. Against a 200 ms
+round trip, a sink offered ten batches a second delivered five at 1 and all ten at 8, with two
+in flight on average.
+
+An HTTP sink offers HTTP/2 (h2) and HTTP/1.1 through TLS's ALPN on an `https://` endpoint, and
+its batches in flight share one connection when the server picks h2. That connection is one
+failure domain: a reset or a `GOAWAY` fails every request on it at once, each an ambiguous
+fault, and packet loss on it stalls every request (TCP head-of-line blocking). Over HTTP/1.1,
+including every `http://` endpoint, each batch in flight has its own connection, and a fault
+reaches one. The pool can hold more connections than `concurrency`, since it dials one for each
+request waiting while none is free, and it keeps each idle up to the sink's `idle_timeout:`.
+`otlp_out`'s gRPC transport already carries both costs of h2.
+
+An HTTP sink closes a pooled connection idle longer than its `idle_timeout:`, `30s` by default,
+instead of reusing it. Keep the value below the destination's keep-alive idle timeout: a
+destination that closes an idle connection first can receive a write on it as the close crosses,
+and resets it, which the sink reads as an ambiguous fault that `at_most_once` drops and
+`at_least_once` resends. Keep it above the interval between the sink's batches if the connection
+should be reused; a sink that sends less often opens a new connection, handshake included, for
+each batch. The default sits below the timeouts of the common destinations, tabled in
+[ADR `sink-request-concurrency`](adr/sink-request-concurrency.md)'s decision 7; lower it for a
+server that closes at 5 s, as Node.js, Apache, and uvicorn do by default. `0s` opens a connection
+per request. A destination that closes a connection for another reason, such as a restart or a
+per-connection request cap, can still reset a write; see [known gaps: sinks](known-gaps/sinks.md).
 
 While the buffer stays full, the warning repeats at most once a minute with the batches and events
 shed so far, or how long intake has been held. Once the buffer's utilization falls below
@@ -4117,7 +4151,9 @@ at that moment fails as ambiguous, because the server may have processed it, and
 default `at_least_once` posture retries it, at the cost of a duplicate span whenever
 VictoriaTraces had stored the first attempt. `buffer: { delivery: at_most_once }` drops the batch
 instead. The
-HTTP endpoint has neither problem (`docs/known-gaps/otlp.md` has the row).
+HTTP endpoint has neither problem over `http://` (`docs/known-gaps/otlp.md` has the row). Over
+`https://`, a VictoriaTraces that picks h2 puts the batches in flight on one connection, and
+whether it closes that connection the same way hasn't been checked.
 
 ### Sending with `compression: zstd`
 
@@ -4521,11 +4557,11 @@ components:
       client_ca_file: /etc/logit/tls/ca.pem   # omit for server-auth-only TLS
 ```
 
-**Send window.** `logit_out` keeps up to `window` frames in flight on one connection before it
-waits for the oldest one's `Ack` ([ADR `native-hop-send-window`](adr/native-hop-send-window.md)).
+**Send window.** `logit_out` keeps up to `concurrency` frames in flight on one connection before
+it waits for the oldest one's `Ack` ([ADR `native-hop-send-window`](adr/native-hop-send-window.md)).
 The default is `32`. With one frame in flight, throughput is capped at one batch per round trip,
-whatever the hardware: about 100 batches/s on a link with a 10 ms round-trip time. Raise `window`
-on a link with higher latency, up to `1024`:
+whatever the hardware: about 100 batches/s on a link with a 10 ms round-trip time. Raise
+`concurrency` on a link with higher latency, up to `1024`:
 
 ```yaml
 # edge
@@ -4533,12 +4569,14 @@ on a link with higher latency, up to `1024`:
     type: logit_out
     sources: [edge_in]
     endpoint: central.internal:5140
-    window: 256
+    concurrency: 256
 ```
 
-The connection uses the smaller of `window` and what `logit_in` answers, which is the offered
-window capped at `1024`. A memory buffer's `max_batches` also caps it, since a batch in flight
-stays in the sink's queue until its `Ack` arrives. `window: 1` keeps one frame in flight.
+`concurrency` is the window `logit_out` offers in its handshake. The connection's window, which
+`logit.output.window` reports, is the smaller of `concurrency` and what `logit_in` answers, the
+offered value capped at `1024`, so it equals `concurrency` whenever `logit_in` answers at or above
+it. A memory buffer's `max_batches` also caps it, since a batch in flight stays in the sink's queue
+until its `Ack` arrives. `concurrency: 1` keeps one frame in flight.
 
 **What an `Ack` means.** An `Ack` names a sender identity and a sequence, and covers every frame of
 that identity up to the sequence that its connection carried, so one `Ack` can answer several
@@ -4564,7 +4602,7 @@ same connection, with no reconnect. A frame whose compressed size is past that b
 `logit_out` checks the cap before sending and never sends either oversize frame, so in practice the
 decode budget is the case you meet: to stop it, send smaller batches.
 
-**Under `buffer.delivery: at_most_once`, set `window: 1`.** An ambiguous fault (a lost or late
+**Under `buffer.delivery: at_most_once`, set `concurrency: 1`.** An ambiguous fault (a lost or late
 `Ack`, a reset) drops every batch in flight, not only the oldest, because each one may or may not
 have been forwarded. Under the default `at_least_once`, the same fault retries the window from the
 oldest unacknowledged batch, resuming rather than resending (below). Nothing enforces the pairing;
@@ -4702,9 +4740,9 @@ reconnecting doesn't show as `connection_error` on the far end.
   of resending), `logit.output.ack.duration` (one sample per read of the wire for an `Ack`, so a
   coalesced `Ack` is timed once), `logit.output.in_flight` (a gauge of frames not yet committed, set
   from the first connection on and 0 after any drop; one that sits at the window means the round
-  trip or the peer's forwarding is the limit, and raising `window` helps only in the first case),
+  trip or the peer's forwarding is the limit, and raising `concurrency` helps only in the first case),
   and `logit.output.window` (a gauge of the live connection's negotiated window, set from the first
-  connection on and 1 after any drop or a shutdown; below the configured `window` on a live
+  connection on and 1 after any drop or a shutdown; below the configured `concurrency` on a live
   connection means `logit_in` answered less).
 - `logit_in`: `logit.input.connections` (a gauge that should match the number of connected
   `logit_out` peers), `logit.input.acks` (`Ack`s written; against

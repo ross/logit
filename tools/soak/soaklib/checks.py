@@ -231,6 +231,9 @@ class Fault:
     answer: object = None
     fault_class: object = None
     series_errors: object = None
+    # A `respond`'s `count`: the writes its cue answered before it was spent; None for a cue that
+    # answers every write in its span.
+    count: object = None
     # Whether the fault can lose lines on a `tcp`, a `file`, or an `http` source's wire, as
     # `affects_udp_ingress` is for a `udp` one (faults.py's `INGRESS_KEYS`).
     affects_tcp_ingress: bool = False
@@ -419,6 +422,7 @@ class RunData:
             ready=apply.get("ready"), code=apply.get("code"), key=apply.get("key"),
             status=apply.get("status"), answer=apply.get("answer"),
             fault_class=apply.get("class"), series_errors=apply.get("series_errors"),
+            count=apply.get("count"),
             affects_tcp_ingress=apply.get("affects_tcp_ingress", False),
             affects_file_ingress=apply.get("affects_file_ingress", False),
             affects_http_ingress=apply.get("affects_http_ingress", False),
@@ -1359,7 +1363,7 @@ def component_duration(text, component, key):
 
 # The aggregate window assumed when the SUT config names none.
 DEFAULT_AGGREGATE_INTERVAL_S = 10.0
-# `logit_out`'s `window` and a disk spool's `checkpoint_interval` when the config names none
+# `logit_out`'s `concurrency` and a disk spool's `checkpoint_interval` when the config names none
 # (crates/logit-config, `LogitOut` and `DiskBufferConfig`).
 DEFAULT_HOP_WINDOW = 32
 DEFAULT_CHECKPOINT_INTERVAL_S = 1.0
@@ -1986,7 +1990,7 @@ class Ledger:
         self.per_frame = max((events.get(ts, 0) / n for ts, n in batches.items() if n),
                              default=0.0)
         text = self._sut_config_text(self.inn.service)
-        self.window = component_int(text, sink, "window") or DEFAULT_HOP_WINDOW
+        self.window = component_int(text, sink, "concurrency") or DEFAULT_HOP_WINDOW
         self.hop_checkpoint = (component_duration(text, sink, "checkpoint_interval")
                                or DEFAULT_CHECKPOINT_INTERVAL_S)
 
@@ -5061,7 +5065,8 @@ def _class_signature(data, led, sink, fault, at_most_once, slack):
             f"{_reasons(drops)}")
     where = (f"{fault.step} ({fault.action} on {fault.on}"
              + (f", {fault.status}" if fault.status is not None else "")
-             + (f", {fault.answer}" if fault.answer is not None else "") + ")")
+             + (f", {fault.answer}" if fault.answer is not None else "")
+             + (f", count {fault.count}" if fault.count is not None else "") + ")")
     return ok, f"{where}: {want}: {seen}" + ("" if ok else f"; expected {expected}")
 
 
@@ -5073,7 +5078,8 @@ def check_ledger_standin(data):
     record's requests by status class equal the sink's `logit.output.requests` for 2xx to 5xx,
     and its resets are at most the sink's `network_error`, which a connect failure also counts;
     every answer other than the default carries the cue of a `respond` step and falls inside
-    its span, and every write went to the stand-in's path; and each step with a `class` shows
+    its span, and every write went to the stand-in's path; each step with a `count` answered
+    that many writes to the path under its cue; and each step with a `class` shows
     that class's effect at the sink (`_class_signature`). A killed life's mismatch WARNs, since
     a kill loses that life's last telemetry interval. Every other target SKIPs.
 
@@ -5197,6 +5203,13 @@ def check_ledger_standin(data):
     for step, fault in sorted(responds.items()):
         if not seen_cues.get(step) and fault.fault_class is None:
             flag(WARN, f"{step}: no request reached the stand-in under its cue")
+        if fault.count is not None:
+            # A counted cue answers that many writes and no more, so a shortfall means the
+            # step's span closed before the sink sent them, and the step tested less than it says.
+            spent = sum(1 for r in requests if r.get("cue") == step and r.get("path") == path)
+            if spent != fault.count:
+                flag(FAIL, f"{step}: its cue answered {_n(spent)} write(s), not its count "
+                           f"{_n(fault.count)}")
 
     drains = led.sut.drains
     gaps = [b - a for a, b in zip(drains, drains[1:])]

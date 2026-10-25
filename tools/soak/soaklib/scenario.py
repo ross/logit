@@ -145,8 +145,10 @@ READY_WORDS = ("starting", "stalled", "draining", "degraded")
 # A `respond` step's keys. It sets the stand-in's answer for its span: a `status` (with an
 # optional `body`) or `answer = "reset"`, and `apply`, whether the stand-in stores the write it
 # answers that way (by default, when the status is 2xx). Under the `datadog` shape a 2xx can
-# carry `series_errors`, the number of the request's series its body names as dropped.
-RESPOND_KEYS = ("status", "body", "apply", "answer", "series_errors")
+# carry `series_errors`, the number of the request's series its body names as dropped. `count`
+# spends the cue on the next N writes, after which the stand-in answers its default again, so a
+# cue can land on one request among several in flight.
+RESPOND_KEYS = ("status", "body", "apply", "answer", "series_errors", "count")
 RESPOND_ANSWERS = ("reset",)
 # The sink fault classes a step's `class` may name (docs/adr/sink-fault-classes.md), which the
 # checks read the SUT's telemetry and self-log against. `class` is for a `respond`, and for a
@@ -427,6 +429,7 @@ class StepSpec:
     apply: object = None
     answer: object = None
     series_errors: object = None
+    count: object = None
     fault_class: object = None
     # A `signal`'s signal, and a `rename`'s file and new name in the shared directory.
     signal: object = None
@@ -444,7 +447,7 @@ class StepSpec:
 # scenario key.
 STEP_FIELDS = (("ready", "ready"), ("code", "code"), ("key", "key"), ("status", "status"),
                ("body", "body"), ("apply", "apply"), ("answer", "answer"),
-               ("series_errors", "series_errors"), ("fault_class", "class"),
+               ("series_errors", "series_errors"), ("count", "count"), ("fault_class", "class"),
                ("signal", "signal"), ("path", "path"), ("to", "to"), ("cert", "cert"),
                ("days", "days"), ("broken", "broken"), ("port", "port"))
 
@@ -503,6 +506,7 @@ class Step:
     apply: object = None
     answer: object = None
     series_errors: object = None
+    count: object = None
     fault_class: object = None
     signal: object = None
     path: object = None
@@ -897,7 +901,8 @@ def from_dict(raw, path):
             ready=raw_step.get("ready"), code=raw_step.get("code"), key=raw_step.get("key"),
             status=raw_step.get("status"), body=raw_step.get("body"),
             apply=raw_step.get("apply"), answer=raw_step.get("answer"),
-            series_errors=raw_step.get("series_errors"), fault_class=raw_step.get("class"),
+            series_errors=raw_step.get("series_errors"), count=raw_step.get("count"),
+            fault_class=raw_step.get("class"),
             signal=raw_step.get("signal"), path=raw_step.get("path"), to=raw_step.get("to"),
             cert=raw_step.get("cert"), days=raw_step.get("days"), broken=raw_step.get("broken"),
             port=raw_step.get("port"),
@@ -2324,6 +2329,7 @@ def _expected_event_problems(spec, where):
 def _respond_problems(spec, where, shape=None):
     """What a step breaks of the `respond` rules: one of `status` (an integer from 100 to 599) and
     `answer` (one of `RESPOND_ANSWERS`), `body` a string with `status` only, `apply` true or false,
+    `count` a positive integer,
     `series_errors` a positive integer with a 2xx `status` and no `body` under the `datadog` shape
     only, none of them on another action; and `class` one of `FAULT_CLASSES`, on a `respond` or a
     `stop` only, and under the `datadog` and `influxdb` shapes required on a `respond` other than a
@@ -2345,6 +2351,9 @@ def _respond_problems(spec, where, shape=None):
             problems.append(f"{where}: `body` is a string, and goes with `status` only")
         if spec.apply is not None and not isinstance(spec.apply, bool):
             problems.append(f"{where}: `apply` must be true or false")
+        if spec.count is not None and (not isinstance(spec.count, int)
+                                       or isinstance(spec.count, bool) or spec.count < 1):
+            problems.append(f"{where}: `count` must be a positive integer, got {spec.count!r}")
         if spec.series_errors is not None:
             count = spec.series_errors
             if shape != DATADOG_SHAPE:
@@ -3020,7 +3029,8 @@ def expand(scenario, duration=None, seed=None):
                     action=spec.action, on=spec.on, args=spec.args, start=start, end=end,
                     ready=spec.ready, code=spec.code, key=spec.key, status=spec.status,
                     body=spec.body, apply=spec.apply, answer=spec.answer,
-                    series_errors=spec.series_errors, fault_class=spec.fault_class,
+                    series_errors=spec.series_errors, count=spec.count,
+                    fault_class=spec.fault_class,
                     signal=spec.signal, path=spec.path, to=spec.to, cert=spec.cert,
                     days=spec.days, broken=spec.broken, port=spec.port,
                 ))

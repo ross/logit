@@ -1092,11 +1092,16 @@ async fn deliver_with_retry(
             return Delivery::GraceExpired;
         }
         attempt = attempt.saturating_add(1);
-        let timer = telemetry.timer("logit.component.send.duration");
+        let limit = store.send_limit();
+        limit.set(1, 1);
+        let started = tokio::time::Instant::now();
         *sending = true;
         let result = output.send(batch).await;
         *sending = false;
-        drop(timer);
+        let took = started.elapsed();
+        telemetry.timing("logit.component.send.duration", took, &[]);
+        limit.answered(took);
+        limit.set(1, 0);
 
         let Err(err) = result else {
             return Delivery::Delivered;
@@ -1118,7 +1123,8 @@ async fn deliver_with_retry(
 #[derive(Debug, Default)]
 struct InFlight {
     /// Batches submitted and not yet acknowledged: always the store's first `outstanding` items.
-    /// A fault resets it to 0, since the sink dropped its connection.
+    /// A fault resets it to 0, since the sink dropped its connection. A [`HeadOnly`] fault keeps
+    /// counting the head while it waits to be resubmitted.
     outstanding: usize,
     /// The store's first `observed` items have had `Output::observe_batch` called. A commit
     /// lowers it by one; a fault doesn't reset it, so a resubmitted batch isn't observed again.
@@ -1129,9 +1135,26 @@ struct InFlight {
     /// Set by [`deliver_window`] before it returns `Delivery::Dropped`: how many of the store's
     /// first items the fault left with an unknown outcome, the head included.
     at_fault: usize,
+    /// When each outstanding item was last submitted, the head first: one per `outstanding`.
+    submitted: std::collections::VecDeque<tokio::time::Instant>,
+    /// How long the head's last submission took to be answered, set by [`window_round`] when its
+    /// `await_ack` returns for the head alone, and taken by [`deliver_window`].
+    head_answered: Option<Duration>,
 }
 
 impl InFlight {
+    /// The head left the window, delivered or dropped.
+    fn settle_head(&mut self) {
+        self.outstanding = self.outstanding.saturating_sub(1);
+        self.submitted.pop_front();
+    }
+
+    /// The sink dropped its connection: nothing is outstanding.
+    fn cut(&mut self) {
+        self.outstanding = 0;
+        self.submitted.clear();
+    }
+
     /// How many of the store's first items have left the process, wholly or in part, and are
     /// unacknowledged: what a grace cut leaves with an unknown outcome.
     fn left_the_process(&self) -> usize {
@@ -1158,13 +1181,23 @@ impl InFlight {
 ///   every item that was outstanding. One marked [`crate::HeadOnly`] covers the head alone and
 ///   leaves `state.outstanding` counting it, for `write_loop`'s commit to lower; the items behind
 ///   it stay submitted.
+/// - **A retryable [`crate::HeadOnly`] fault** resubmits the head alone after the backoff: the
+///   next round submits it at position 0 without observing it again, keeps `state.outstanding`,
+///   and goes on filling behind the batches still in flight. A failure of that resubmit marked
+///   [`crate::HeadOnly`] is the head's own fault and keeps the batches behind it outstanding, as
+///   a [`crate::HeadOnly`] acknowledgment does; one without the mark means the sink dropped its
+///   connection, as a failed `await_ack` does, and sets `state.outstanding` to 0. A grace cut
+///   while the head waits for its resubmit counts it with the items behind it, since
+///   `state.outstanding` still covers it.
 ///
 /// The shutdown grace is the one thing that cuts a round short (`write_loop`'s `DeliverStep`).
 /// Before returning `Delivery::Dropped` it has set `state.at_fault`; `write_loop` commits and
 /// counts the drops. Telemetry per round matches [`deliver_with_retry`]'s per attempt: one
-/// `send.duration` sample, one `errors` per failed round, and one `retries` per retry. As there,
-/// a grace deadline already reached before a round returns [`Delivery::GraceExpired`] with
-/// nothing new submitted.
+/// `send.duration` sample, one `errors` per failed round, and one `retries` per retry. A sink
+/// whose `Output::send_duration_per_batch` says so gets its `send.duration` sample per head
+/// answer instead, the head's request time `Output::answered_send_duration` reports, and none
+/// per round. As there, a grace deadline
+/// already reached before a round returns [`Delivery::GraceExpired`] with nothing new submitted.
 #[allow(clippy::too_many_arguments)]
 async fn deliver_window(
     output: &mut (dyn Output + Send),
@@ -1179,14 +1212,22 @@ async fn deliver_window(
 ) -> Delivery {
     debug_assert!(!retry.max_delay.is_zero(), "a zero retry max delay");
     let mut attempt: u32 = 0;
+    let mut resubmit_head = false;
+    let per_batch = output.send_duration_per_batch();
     loop {
         if grace_deadline.get().is_some_and(|&due| tokio::time::Instant::now() >= due) {
             return Delivery::GraceExpired;
         }
         attempt = attempt.saturating_add(1);
-        let timer = telemetry.timer("logit.component.send.duration");
-        let result = window_round(output, store, head, state).await;
+        let timer = (!per_batch).then(|| telemetry.timer("logit.component.send.duration"));
+        let result = window_round(output, store, head, state, resubmit_head).await;
         drop(timer);
+        if let Some(took) = state.head_answered.take() {
+            store.send_limit().answered(took);
+            if per_batch {
+                telemetry.timing("logit.component.send.duration", took, &[]);
+            }
+        }
 
         let Err(err) = result else {
             return Delivery::Delivered;
@@ -1196,20 +1237,45 @@ async fn deliver_window(
         if !is_retryable(fault, posture) {
             return Delivery::Dropped { fault, err };
         }
+        resubmit_head = is_head_only(&err);
         retrying.failed(fault, &err, store.queued());
         telemetry.count("logit.component.retries", 1.0, &[]);
+        // A backoff waits on no send: the `retrying` line names the cause.
+        let limit = store.send_limit();
+        limit.set(output.window().min(store.max_in_flight()).max(1), 0);
         tokio::time::sleep(backoff_for(retry, attempt)).await;
     }
 }
 
-/// One [`deliver_window`] round: the fill, then the head's `await_ack`. `Ok` means the head was
-/// acknowledged. Every `Err` has set `state.at_fault`.
+/// One [`deliver_window`] round: the head's resubmit when `resubmit_head` is set, the fill, then
+/// the head's `await_ack`. `Ok` means the head was acknowledged. Every `Err` has set
+/// `state.at_fault`.
 async fn window_round(
     output: &mut (dyn Output + Send),
     store: &SinkStore,
     head: &StoreItem,
     state: &mut InFlight,
+    resubmit_head: bool,
 ) -> anyhow::Result<()> {
+    // The head's earlier fault was its own, and the batches behind it are still in flight. It
+    // stays counted in `state.outstanding` and was observed with its first submit. The sink says
+    // what a failed resubmit means, as for an acknowledgment (`Output::submit`'s doc).
+    if resubmit_head && state.outstanding > 0 {
+        let (batch, ctx, seq) = head;
+        let started = tokio::time::Instant::now();
+        if let Err(err) = output.submit(batch, *ctx, *seq).await {
+            if is_head_only(&err) {
+                state.at_fault = 1;
+            } else {
+                state.at_fault = state.outstanding;
+                state.cut();
+            }
+            return Err(err);
+        }
+        if let Some(front) = state.submitted.front_mut() {
+            *front = started;
+        }
+    }
     loop {
         let window = output.window().min(store.max_in_flight()).max(1);
         if state.outstanding >= window {
@@ -1229,10 +1295,14 @@ async fn window_round(
             state.observed = position + 1;
         }
         state.submitting = true;
+        let started = tokio::time::Instant::now();
         let result = output.submit(&batch, ctx, seq).await;
         state.submitting = false;
         match result {
-            Ok(()) => state.outstanding += 1,
+            Ok(()) => {
+                state.outstanding += 1;
+                state.submitted.push_back(started);
+            }
             Err(err) if position == 0 => {
                 state.at_fault = 1;
                 return Err(err);
@@ -1242,19 +1312,32 @@ async fn window_round(
         }
     }
     debug_assert!(state.outstanding > 0, "the fill submits the head or returns its fault");
-    let err = match output.await_ack().await {
-        Ok(()) => return Ok(()),
+    let window = output.window().min(store.max_in_flight()).max(1);
+    store.send_limit().set(window, state.outstanding);
+    let result = output.await_ack().await;
+    // A batch behind a held head may have been answered while the loop retried the head, so its
+    // submit time would count that wait; a sink timing its own requests reports the request's.
+    let head_answered = if output.send_duration_per_batch() {
+        output.answered_send_duration()
+    } else {
+        state.submitted.front().map(|started| started.elapsed())
+    };
+    let err = match result {
+        Ok(()) => {
+            state.head_answered = head_answered;
+            return Ok(());
+        }
         Err(err) => err,
     };
-    // The head alone failed and the sink kept the rest in flight: `write_loop` commits the head
-    // and lowers `outstanding` past it, as for a delivered head.
+    // The head alone failed and the sink kept the rest in flight. A dropped head is committed
+    // and `outstanding` lowered past it, as for a delivered head; a retried one stays counted.
     if is_head_only(&err) {
-        debug_assert_eq!(classify(&err), Fault::Rejected, "only a Rejected head settles alone");
+        state.head_answered = head_answered;
         state.at_fault = 1;
         return Err(err);
     }
     state.at_fault = state.outstanding;
-    state.outstanding = 0;
+    state.cut();
     Err(err)
 }
 
@@ -1619,7 +1702,7 @@ pub(crate) async fn write_loop(
             }
             Delivery::Delivered => {
                 store.commit();
-                in_flight.outstanding = in_flight.outstanding.saturating_sub(1);
+                in_flight.settle_head();
                 in_flight.observed = in_flight.observed.saturating_sub(1);
                 telemetry.count("logit.component.batches.delivered", 1.0, &[]);
                 telemetry.count("logit.component.events.delivered", batch.events.len() as f64, &[]);
@@ -1638,17 +1721,21 @@ pub(crate) async fn write_loop(
                     in_flight.outstanding == 0 || is_head_only(&err),
                     "a dropped round leaves nothing out"
                 );
-                in_flight.outstanding = in_flight.outstanding.saturating_sub(1);
-                // The head, then, under at-most-once, every other batch an `Ambiguous` fault
-                // left with an unknown outcome: each is as ambiguous as the head, and
-                // at-most-once never resends one. A `Rejected` fault drops only the head; the rest
-                // are submitted again.
-                let also_in_flight =
-                    if !fast && fault == Fault::Ambiguous && !is_retryable(fault, posture) {
-                        in_flight.at_fault.saturating_sub(1)
-                    } else {
-                        0
-                    };
+                in_flight.settle_head();
+                // The head, then, under at-most-once, every other batch a connection-level
+                // `Ambiguous` fault left with an unknown outcome: each is as ambiguous as the
+                // head, and at-most-once never resends one. A `Rejected` fault, or any fault
+                // marked `HeadOnly`, drops only the head; the rest are submitted again or stay in
+                // flight.
+                let also_in_flight = if !fast
+                    && !is_head_only(&err)
+                    && fault == Fault::Ambiguous
+                    && !is_retryable(fault, posture)
+                {
+                    in_flight.at_fault.saturating_sub(1)
+                } else {
+                    0
+                };
                 let mut dropped_batches = 1u64;
                 let mut dropped_events = batch.events.len() as u64;
                 store.commit();
@@ -3261,6 +3348,8 @@ mod tests {
                     default_bucket: None,
                     default_org: None,
                     token: "TOKEN".to_string(),
+                    concurrency: 1,
+                    idle_timeout: logit_config::default_sink_idle_timeout(),
                 },
             },
         );
@@ -3371,6 +3460,8 @@ mod tests {
                     default_bucket: None,
                     default_org: None,
                     token: "TOKEN".to_string(),
+                    concurrency: 1,
+                    idle_timeout: logit_config::default_sink_idle_timeout(),
                 },
             },
         );
@@ -3785,6 +3876,8 @@ mod tests {
             default_bucket: None,
             default_org: None,
             token: "TOKEN".to_string(),
+            concurrency: 1,
+            idle_timeout: logit_config::default_sink_idle_timeout(),
         }
     }
 
@@ -3899,6 +3992,8 @@ mod tests {
                     default_bucket: None,
                     default_org: None,
                     token: "TOKEN".to_string(),
+                    concurrency: 1,
+                    idle_timeout: logit_config::default_sink_idle_timeout(),
                 },
             },
         );
@@ -7084,6 +7179,52 @@ mod tests {
         reconcile_every_exit_path(output, 2.0).await;
     }
 
+    /// [`every_run_output_exit_path_reconciles_with_a_window_in_flight`] with every fault marked
+    /// `HeadOnly`: the grace expiry cuts a head waiting on its resubmit, or mid-resubmit, with
+    /// the batch behind it still in flight, and each rejected batch is dropped alone.
+    #[tokio::test(start_paused = true)]
+    async fn every_run_output_exit_path_reconciles_with_a_head_only_retry_in_flight() {
+        let output = |path: ExitPath, delivered: &Arc<AtomicU64>| {
+            let windowed = |delay, ack: AckScript, submit_delays| {
+                let (mut output, log) = windowed_output((4, 4));
+                output.ack_delay = delay;
+                output.ack_script = ack;
+                output.submit_delays = submit_delays;
+                output.delivered = Arc::clone(delivered);
+                drop(log);
+                Box::new(output) as Box<dyn Output + Send>
+            };
+            // As in the windowed exit-path test: the head's submit waits for the second push.
+            let head = (1, Duration::from_millis(1));
+            let every = u32::MAX;
+            match path {
+                ExitPath::DrainFirst => {
+                    windowed(Duration::from_millis(10), AckScript::Ok, Vec::new())
+                }
+                ExitPath::GraceExpiry => windowed(
+                    Duration::from_millis(10),
+                    head_only(Some(1), Fault::Clean, every),
+                    vec![head],
+                ),
+                ExitPath::GraceCutsInFlightSend => {
+                    windowed(Duration::ZERO, AckScript::Hang, vec![head])
+                }
+                ExitPath::GraceCutsInFlightSubmit => windowed(
+                    Duration::ZERO,
+                    AckScript::Hang,
+                    vec![head, (2, Duration::from_secs(3600))],
+                ),
+                ExitPath::Rejected => windowed(
+                    Duration::from_millis(10),
+                    head_only(None, Fault::Rejected, every),
+                    Vec::new(),
+                ),
+                ExitPath::ClosedAndEmpty => windowed(Duration::ZERO, AckScript::Ok, Vec::new()),
+            }
+        };
+        reconcile_every_exit_path(output, 2.0).await;
+    }
+
     /// The matrix behind both exit-path tests. `cut_off` is how many batches a grace cut leaves
     /// with an unknown outcome on a small store: what a disk store under at-most-once counts as
     /// shutdown drops.
@@ -7267,9 +7408,15 @@ mod tests {
         Calls(std::collections::VecDeque<Option<Fault>>),
         /// Fails while this batch is the oldest outstanding; delivers any other.
         Head(u64, Fault),
-        /// Fails this batch alone, `Rejected` marked `HeadOnly`, as `logit_out` does for a
-        /// rejected `Ack`: pops it and keeps the connection and the batches behind it.
-        HeadOnly(u64),
+        /// Fails the oldest outstanding batch alone with `fault` marked `HeadOnly`, `times` times
+        /// (`u32::MAX` for every time), while it is `head` (any batch when `None`): pops it and
+        /// keeps the batches behind it. `Rejected` is what `logit_out` does for a rejected `Ack`.
+        /// A resubmit of the popped batch goes back in the oldest position.
+        HeadOnly {
+            head: Option<u64>,
+            fault: Fault,
+            times: u32,
+        },
         Always(Fault),
         Hang,
     }
@@ -7286,6 +7433,12 @@ mod tests {
         broken: bool,
         /// Batches submitted and not acknowledged, oldest first.
         in_flight: std::collections::VecDeque<u64>,
+        /// The batch a `HeadOnly` acknowledgment popped, which a resubmit puts back first.
+        head_failed: Option<u64>,
+        /// One result per resubmit of `head_failed`, `(fault, head_only)`; success once the list
+        /// runs out. A failure marked `HeadOnly` keeps the batches in flight; one without the mark
+        /// drops the connection.
+        resubmit_script: std::collections::VecDeque<(Fault, bool)>,
         /// The `seq` the last `observe_batch` saw, for `send`.
         pending_seq: Option<SeqId>,
         /// One result per `submit` call, `None` succeeding; success once the list runs out.
@@ -7300,6 +7453,8 @@ mod tests {
         /// The most batches in flight at once.
         peak: Arc<std::sync::atomic::AtomicUsize>,
         delivered: Arc<AtomicU64>,
+        /// What `send_duration_per_batch` answers.
+        per_batch: bool,
     }
 
     struct WindowedLog {
@@ -7334,6 +7489,8 @@ mod tests {
                 connected: false,
                 broken: false,
                 in_flight: std::collections::VecDeque::new(),
+                head_failed: None,
+                resubmit_script: std::collections::VecDeque::new(),
                 pending_seq: None,
                 submit_script: std::collections::VecDeque::new(),
                 submit_fails: None,
@@ -7343,6 +7500,7 @@ mod tests {
                 log: Arc::clone(&log),
                 peak: Arc::clone(&peak),
                 delivered: Arc::new(AtomicU64::new(0)),
+                per_batch: false,
             },
             WindowedLog { log, peak },
         )
@@ -7355,11 +7513,22 @@ mod tests {
 
         fn drop_connection(&mut self) {
             self.in_flight.clear();
+            self.head_failed = None;
             self.connected = false;
             self.broken = false;
         }
 
         fn submit_value(&mut self, value: u64) -> anyhow::Result<()> {
+            if self.head_failed == Some(value) {
+                if let Some((fault, head_only)) = self.resubmit_script.pop_front() {
+                    let err = Err(anyhow::anyhow!("simulated {fault:?} resubmit")).context(fault);
+                    if head_only {
+                        return err.context(HeadOnly);
+                    }
+                    self.drop_connection();
+                    return err;
+                }
+            }
             let scripted = self.submit_script.pop_front().flatten();
             let fault = match self.submit_fails {
                 Some((v, fault)) if v == value => Some(fault),
@@ -7375,7 +7544,12 @@ mod tests {
                 return Err(anyhow::anyhow!("simulated {fault:?} submit")).context(fault);
             }
             self.connected = true;
-            self.in_flight.push_back(value);
+            if self.head_failed == Some(value) {
+                self.head_failed = None;
+                self.in_flight.push_front(value);
+            } else {
+                self.in_flight.push_back(value);
+            }
             self.peak.fetch_max(self.in_flight.len(), std::sync::atomic::Ordering::SeqCst);
             Ok(())
         }
@@ -7404,6 +7578,14 @@ mod tests {
             } else {
                 self.windows.0
             }
+        }
+
+        fn send_duration_per_batch(&self) -> bool {
+            self.per_batch
+        }
+
+        fn answered_send_duration(&self) -> Option<Duration> {
+            self.per_batch.then_some(Duration::from_millis(1))
         }
 
         async fn submit(
@@ -7436,15 +7618,23 @@ mod tests {
             let mut guard = DropOnCancel(Some(self));
             let output = guard.0.as_deref_mut().expect("set above");
             tokio::time::sleep(output.ack_delay).await;
-            if matches!(output.ack_script, AckScript::HeadOnly(v) if v == head) {
-                let output = guard.0.take().expect("set above");
-                output.in_flight.pop_front();
-                return Err(anyhow::anyhow!("simulated rejected head {head}"))
-                    .context(Fault::Rejected)
-                    .context(HeadOnly);
+            if let AckScript::HeadOnly { head: script_head, fault, times } = &mut output.ack_script
+            {
+                if script_head.is_none_or(|v| v == head) && *times > 0 {
+                    let fault = *fault;
+                    if *times != u32::MAX {
+                        *times -= 1;
+                    }
+                    let output = guard.0.take().expect("set above");
+                    output.in_flight.pop_front();
+                    output.head_failed = Some(head);
+                    return Err(anyhow::anyhow!("simulated {fault:?} head {head}"))
+                        .context(fault)
+                        .context(HeadOnly);
+                }
             }
             let fault = match &mut output.ack_script {
-                AckScript::Ok | AckScript::HeadOnly(_) => None,
+                AckScript::Ok | AckScript::HeadOnly { .. } => None,
                 AckScript::Calls(calls) => calls.pop_front().flatten(),
                 AckScript::Head(v, fault) => (*v == head).then_some(*fault),
                 AckScript::Always(fault) => Some(*fault),
@@ -7463,6 +7653,10 @@ mod tests {
             output.delivered.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(())
         }
+    }
+
+    fn head_only(head: Option<u64>, fault: Fault, times: u32) -> AckScript {
+        AckScript::HeadOnly { head, fault, times }
     }
 
     /// Runs `write_loop` until it has drained batches `1..=n`, pushed into a memory store of
@@ -7743,6 +7937,100 @@ mod tests {
         }
     }
 
+    /// The first submit fails with nothing in flight, so the sink answers three heads over four
+    /// rounds: one `send.duration` sample per round by default, one per head answered when the
+    /// sink times each batch.
+    #[tokio::test(start_paused = true)]
+    async fn send_duration_is_one_sample_per_round_or_per_answered_batch() {
+        for (per_batch, samples) in [(false, 4), (true, 3)] {
+            let (mut output, _log) = windowed_output((4, 4));
+            output.per_batch = per_batch;
+            output.submit_script = [Some(Fault::Clean)].into();
+            let totals = drive_windowed(&mut output, 3, 1024, DeliveryPosture::AtLeastOnce).await;
+            assert_eq!(totals.sum("logit.component.batches.delivered", &[]), 3.0);
+            let recorded: usize = totals
+                .events
+                .iter()
+                .flat_map(|e| e.metrics.iter())
+                .filter(|m| {
+                    logit_core::interner::resolve(m.name) == "logit.component.send.duration"
+                })
+                .map(|m| match &m.kind {
+                    MetricKind::Distribution(sketch) => sketch.count(),
+                    other => panic!("send.duration is a distribution, got {other:?}"),
+                })
+                .sum();
+            assert_eq!(recorded, samples, "per batch: {per_batch}");
+        }
+    }
+
+    /// A buffer that fills while the sink's one send is in flight names the concurrency it
+    /// reached in its `buffer_full` line.
+    #[tokio::test]
+    async fn a_full_buffer_behind_a_send_in_flight_names_the_concurrency() {
+        struct Slow {
+            started: Arc<AtomicU64>,
+            release: Arc<tokio::sync::Notify>,
+        }
+        #[async_trait::async_trait]
+        impl Output for Slow {
+            async fn send(&mut self, _batch: &EventBatch) -> anyhow::Result<()> {
+                self.started.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.release.notified().await;
+                Ok(())
+            }
+        }
+
+        let (lines, _guard) = crate::buffer_full::test_support::capture();
+        let started = Arc::new(AtomicU64::new(0));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let mut output = Slow { started: Arc::clone(&started), release: Arc::clone(&release) };
+        let store = Arc::new(SinkStore::Memory(
+            SinkQueue::new(
+                SinkQueueConfig {
+                    max_batches: 1,
+                    max_bytes: u64::MAX,
+                    overflow: OverflowPolicy::DropNewest,
+                    recover_below: crate::queue::DEFAULT_RECOVER_BELOW,
+                },
+                Telemetry::default(),
+            )
+            .with_diagnostics(Diagnostics::new("out")),
+        ));
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let shutdown_dropped = AtomicU64::new(0);
+        let write = write_loop(
+            "out".to_string(),
+            &mut output,
+            Arc::clone(&store),
+            Telemetry::default(),
+            WriteLoopConfig::default(),
+            shutdown_rx,
+            &shutdown_dropped,
+        );
+        let producer = async {
+            store.push((one_event_batch(1.0), BatchContext::default())).await;
+            crate::test_util::wait_until("the first send started", || {
+                started.load(std::sync::atomic::Ordering::SeqCst) == 1
+            })
+            .await;
+            store.push((one_event_batch(2.0), BatchContext::default())).await;
+            let full = lines.with_key("buffer_full");
+            assert_eq!(full.len(), 1, "{full:?}");
+            assert!(
+                full[0].1.ends_with("; sending at its concurrency of 1, no send answered yet"),
+                "{full:?}"
+            );
+            release.notify_one();
+            store.close();
+        };
+        tokio::time::timeout(crate::test_util::RECV_TIMEOUT, async {
+            tokio::join!(write, producer)
+        })
+        .await
+        .expect("write_loop drains a closed store");
+    }
+
     /// The head's ack fails `Rejected` marked `HeadOnly`, under either posture: only the head is
     /// dropped, and the batches behind it stay submitted and are delivered with no resubmit and
     /// no retry (`Output::await_ack`'s doc).
@@ -7751,7 +8039,7 @@ mod tests {
         for posture in [DeliveryPosture::AtLeastOnce, DeliveryPosture::AtMostOnce] {
             let (mut output, log) = windowed_output((4, 4));
             output.ack_delay = Duration::from_millis(10);
-            output.ack_script = AckScript::HeadOnly(2);
+            output.ack_script = head_only(Some(2), Fault::Rejected, u32::MAX);
             let totals = drive_windowed(&mut output, 4, 1024, posture).await;
             assert_eq!(
                 log.calls(),
@@ -7788,7 +8076,7 @@ mod tests {
         let dir = crate::disk_queue::test_support::scratch_dir("head-only-is-committed");
         let (mut output, log) = windowed_output((4, 4));
         output.ack_delay = Duration::from_millis(10);
-        output.ack_script = AckScript::HeadOnly(2);
+        output.ack_script = head_only(Some(2), Fault::Rejected, u32::MAX);
         let (inbox_tx, inbox_rx) = mpsc::channel::<Delivered>(64);
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         let registry = Registry::new();
@@ -7829,6 +8117,196 @@ mod tests {
             "the rejected head is committed, so a restart doesn't replay it"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The second batch's acknowledgment fails once with a retryable fault marked `HeadOnly`:
+    /// the loop backs off and resubmits that batch alone, ahead of the batches still in flight,
+    /// which are never resubmitted and deliver in order after it
+    /// (`docs/adr/sink-request-concurrency.md`, decision 2).
+    #[tokio::test(start_paused = true)]
+    async fn a_retryable_head_only_fault_resubmits_the_head_alone_and_the_rest_deliver_in_order() {
+        for (fault, posture) in [
+            (Fault::Clean, DeliveryPosture::AtMostOnce),
+            (Fault::Refused, DeliveryPosture::AtMostOnce),
+            (Fault::Ambiguous, DeliveryPosture::AtLeastOnce),
+        ] {
+            let at = format!("{fault:?} under {posture:?}");
+            let (mut output, log) = windowed_output((4, 4));
+            output.ack_delay = Duration::from_millis(10);
+            output.ack_script = head_only(Some(2), fault, 1);
+            let totals = drive_windowed(&mut output, 4, 1024, posture).await;
+            assert_eq!(
+                log.calls(),
+                vec![
+                    Call::Observe(1),
+                    Call::Submit(1, 1, 0),
+                    Call::Observe(2),
+                    Call::Submit(2, 2, 1),
+                    Call::Observe(3),
+                    Call::Submit(3, 3, 2),
+                    Call::Observe(4),
+                    Call::Submit(4, 4, 3),
+                    Call::Ack(1),
+                    // 3 and 4 are still in flight: 2 goes back alone, ahead of them.
+                    Call::Submit(2, 2, 2),
+                    Call::Ack(2),
+                    Call::Ack(3),
+                    Call::Ack(4),
+                ],
+                "{at}"
+            );
+            assert_eq!(totals.sum("logit.component.batches.delivered", &[]), 4.0, "{at}");
+            assert_eq!(sent_failed(&totals), 0.0, "{at}");
+            assert_eq!(totals.sum("logit.component.errors", &[]), 1.0, "{at}");
+            assert_eq!(totals.sum("logit.component.retries", &[]), 1.0, "{at}");
+        }
+    }
+
+    /// The head's resubmit after a `HeadOnly` fault fails once, and the sink marks that failure
+    /// `HeadOnly` too: the head's own fault, so the loop backs off and resubmits it alone again,
+    /// and the batches still in flight deliver in order after it.
+    #[tokio::test(start_paused = true)]
+    async fn a_head_only_resubmit_failure_retries_the_head_alone() {
+        let (mut output, log) = windowed_output((4, 4));
+        output.ack_delay = Duration::from_millis(10);
+        output.ack_script = head_only(Some(2), Fault::Clean, 1);
+        output.resubmit_script = [(Fault::Clean, true)].into();
+        let totals = drive_windowed(&mut output, 4, 1024, DeliveryPosture::AtLeastOnce).await;
+        assert_eq!(
+            log.calls(),
+            vec![
+                Call::Observe(1),
+                Call::Submit(1, 1, 0),
+                Call::Observe(2),
+                Call::Submit(2, 2, 1),
+                Call::Observe(3),
+                Call::Submit(3, 3, 2),
+                Call::Observe(4),
+                Call::Submit(4, 4, 3),
+                Call::Ack(1),
+                Call::Submit(2, 2, 2),
+                Call::Submit(2, 2, 2),
+                Call::Ack(2),
+                Call::Ack(3),
+                Call::Ack(4),
+            ]
+        );
+        assert_eq!(totals.sum("logit.component.batches.delivered", &[]), 4.0);
+        assert_eq!(totals.sum("logit.component.retries", &[]), 2.0);
+        assert_eq!(sent_failed(&totals), 0.0);
+    }
+
+    /// The head's resubmit fails without `HeadOnly`: the sink dropped its connection and every
+    /// batch with it, so the loop resubmits the whole window from the head, as after a failed
+    /// `await_ack`, and never commits a batch the sink no longer holds.
+    #[tokio::test(start_paused = true)]
+    async fn a_resubmit_failure_without_head_only_resubmits_the_window_from_the_head() {
+        let (mut output, log) = windowed_output((4, 4));
+        output.ack_delay = Duration::from_millis(10);
+        output.ack_script = head_only(Some(2), Fault::Clean, 1);
+        output.resubmit_script = [(Fault::Clean, false)].into();
+        let totals = drive_windowed(&mut output, 4, 1024, DeliveryPosture::AtLeastOnce).await;
+        assert_eq!(
+            log.calls(),
+            vec![
+                Call::Observe(1),
+                Call::Submit(1, 1, 0),
+                Call::Observe(2),
+                Call::Submit(2, 2, 1),
+                Call::Observe(3),
+                Call::Submit(3, 3, 2),
+                Call::Observe(4),
+                Call::Submit(4, 4, 3),
+                Call::Ack(1),
+                Call::Submit(2, 2, 2),
+                // The connection dropped with 3 and 4: all three go out again from the head.
+                Call::Submit(2, 2, 0),
+                Call::Submit(3, 3, 1),
+                Call::Submit(4, 4, 2),
+                Call::Ack(2),
+                Call::Ack(3),
+                Call::Ack(4),
+            ]
+        );
+        assert_eq!(totals.sum("logit.component.batches.delivered", &[]), 4.0);
+        assert_eq!(totals.sum("logit.component.retries", &[]), 2.0);
+        assert_eq!(sent_failed(&totals), 0.0);
+    }
+
+    /// An `Ambiguous` fault marked `HeadOnly` under at-most-once drops the head alone, counted
+    /// `ambiguous_at_most_once`: the batches behind it stay in flight and deliver, where a
+    /// connection-level `Ambiguous` fault drops every one outstanding.
+    #[tokio::test(start_paused = true)]
+    async fn a_head_only_ambiguous_fault_under_at_most_once_drops_the_head_alone() {
+        let (mut output, log) = windowed_output((4, 4));
+        output.ack_delay = Duration::from_millis(10);
+        output.ack_script = head_only(Some(2), Fault::Ambiguous, 1);
+        let totals = drive_windowed(&mut output, 4, 1024, DeliveryPosture::AtMostOnce).await;
+        assert_eq!(log.submits(), vec![(1, 0), (2, 1), (3, 2), (4, 3)], "nothing resubmitted");
+        assert_eq!(log.count(&Call::Ack(3)), 1);
+        assert_eq!(log.count(&Call::Ack(4)), 1);
+        assert_eq!(totals.sum("logit.component.batches.delivered", &[]), 3.0);
+        assert_eq!(
+            totals.sum("logit.component.batches.dropped", &[("reason", "ambiguous_at_most_once")]),
+            1.0
+        );
+        assert_eq!(
+            totals.sum("logit.component.events.dropped", &[("reason", "ambiguous_at_most_once")]),
+            1.0
+        );
+        assert_eq!(totals.sum("logit.component.retries", &[]), 0.0);
+    }
+
+    /// A destination refusing the head, marked `HeadOnly`, three times with the window full: the
+    /// head alone is resubmitted on each backoff, nothing new is submitted until it delivers,
+    /// and the batches in flight never exceed the window.
+    #[tokio::test(start_paused = true)]
+    async fn a_held_head_only_refused_head_holds_the_fill_at_one_window() {
+        let (mut output, log) = windowed_output((4, 4));
+        output.ack_delay = Duration::from_millis(10);
+        output.ack_script = head_only(Some(1), Fault::Refused, 3);
+        let totals = drive_windowed(&mut output, 8, 1024, DeliveryPosture::AtLeastOnce).await;
+        let calls = log.calls();
+        let first_ack =
+            calls.iter().position(|c| *c == Call::Ack(1)).expect("the head delivers in the end");
+        let held: Vec<_> = calls[..first_ack]
+            .iter()
+            .filter_map(|c| match c {
+                Call::Submit(v, _, in_flight) => Some((*v, *in_flight)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            held,
+            vec![(1, 0), (2, 1), (3, 2), (4, 3), (1, 3), (1, 3), (1, 3)],
+            "one window, then the head alone on each backoff"
+        );
+        assert_eq!(log.peak.load(std::sync::atomic::Ordering::SeqCst), 4);
+        let acks: Vec<_> = calls
+            .iter()
+            .filter_map(|c| match c {
+                Call::Ack(v) => Some(*v),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(acks, (1..=8).collect::<Vec<_>>(), "delivered in order");
+        assert_eq!(totals.sum("logit.component.batches.delivered", &[]), 8.0);
+        assert_eq!(totals.sum("logit.component.retries", &[]), 3.0);
+        assert_eq!(sent_failed(&totals), 0.0);
+    }
+
+    /// A head resubmitted after `HeadOnly` faults is observed once, with its first submit, never
+    /// again: a sink arms its once-per-batch accounting there.
+    #[tokio::test(start_paused = true)]
+    async fn a_head_resubmitted_after_head_only_faults_is_observed_once() {
+        let (mut output, log) = windowed_output((4, 4));
+        output.ack_script = head_only(Some(2), Fault::Clean, 3);
+        let totals = drive_windowed(&mut output, 3, 1024, DeliveryPosture::AtLeastOnce).await;
+        assert_eq!(log.submits().iter().filter(|(v, _)| *v == 2).count(), 4);
+        for value in 1..=3 {
+            assert_eq!(log.count(&Call::Observe(value)), 1, "batch {value} observed once");
+        }
+        assert_eq!(totals.sum("logit.component.batches.delivered", &[]), 3.0);
     }
 
     /// A slowly draining receiver: the submit past the head takes a minute while the head's

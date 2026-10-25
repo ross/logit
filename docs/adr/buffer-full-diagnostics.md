@@ -1,6 +1,6 @@
 ---
 created: 2026-10-21
-updated: 2026-10-21
+updated: 2026-10-25
 ---
 
 # Full-buffer diagnostics: a full sink buffer or receive queue logs once a minute, and a gauge reads a blocked push live
@@ -45,6 +45,9 @@ implements it once for all three; its module doc is the canonical statement of t
    how long intake has been held. `buffer_recovered` (info) when an announced episode ends, with its
    duration and totals. `buffer_full_at_shutdown` (info) when the queue's owner finishes with an
    announced episode still open.
+   A sink's `buffer_full` also names its concurrency and its last send's duration when every
+   batch the concurrency allows is in flight ("Amendment: the line names a saturated
+   concurrency (2026-10-25)").
 3. **The minute repeat under `block` comes from the waiting push.** No new push arrives while one
    waits, so the waiting push awaits its `Notified` under `tokio::time::timeout_at`, writes the
    line on the first wake at or past its due time, and goes around its wait loop as after any
@@ -128,3 +131,21 @@ implements it once for all three; its module doc is the canonical statement of t
   `*.dropped` counters.
 - The consumer side pays one atomic load per gauge update while no episode is open. No allocation
   pin moved: the episode's bookkeeping runs only when a push finds no room or an episode is open.
+
+## Amendment: the line names a saturated concurrency (2026-10-25)
+
+[ADR `sink-request-concurrency`](sink-request-concurrency.md), decision 2, asks the `buffer_full`
+line to name the cause when a sink at its default `concurrency: 1` can't keep up with the round
+trip. A sink's `buffer_full` line, the first and each repeat, gains one suffix:
+
+| Suffix | Written when |
+|---|---|
+| `; sending at its concurrency of N, the last send took D` | the write loop has `N` batches in flight and `N` is the most it may: `concurrency:`, or 1 on a sink without the field. `D` is the last answered send's duration, success or failure: one attempt's on the `send` path; above a window of 1, the batch's own requests on a sink on the HTTP slot helper, from the first send to the last response, and the head frame's on `logit_out`, from its submit to its acknowledgment |
+| `; sending at its concurrency of N, no send answered yet` | as above, before any send was answered |
+
+`write_loop` records the limit, the batches it waits on, and each answered send's duration in the
+store's `SendLimit` (`crates/logit-pipeline/src/buffer_full.rs`), which the line reads when it's
+written. A retried send reads as saturated only while it's in flight, never during its backoff,
+where `retrying` names the cause. A receive queue has no write loop and gets no suffix. The line
+names the limit, not the remedy: raising `concurrency:` reorders batches at the destination, which
+each sink's docs weigh.
