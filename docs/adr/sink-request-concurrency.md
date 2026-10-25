@@ -231,12 +231,12 @@ them.
   to `otlp_out`'s gRPC pool and `datadog_trace_out`'s Unix-socket pool. A `hyper-util` pool with
   no pool timer drops an expired connection only at the next checkout, so its socket would stay
   open; the builder sets `TokioTimer` for that reason.
-- **Default `30s`.** Two bounds decide it. Below the destination's keep-alive idle timeout, by
-  more than a round trip, so the sink closes first; above the interval between a sink's batches,
-  so a sink flushing on a 10 s or 15 s `aggregate` window reuses its connection instead of
-  redialing, handshake included, per batch. 30 s sits under every destination below except the
-  three 5 s servers, and above both cadences. A destination that closes at 5 s is the case for lowering it, and the
-  field's doc says so.
+- **Default `30s`.** Two bounds decide it. Below the destination's keep-alive idle timeout, by more
+  than a round trip, so the sink closes first; above the interval between a sink's batches, so a
+  sink flushing on a 10 s or 15 s `aggregate` window reuses its connection instead of redialing,
+  handshake included, per batch. 30 s sits under every destination below except the three 5 s
+  servers, and above both cadences. A destination that closes at 5 s is the case for lowering it,
+  and the field's doc says so.
 
   | Destination | Keep-alive idle timeout, by default |
   |---|---|
