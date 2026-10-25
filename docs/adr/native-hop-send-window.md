@@ -251,7 +251,9 @@ async fn await_ack(&mut self) -> anyhow::Result<()> { Ok(()) }
 - **Delivered and dropped.** A delivered head is committed, and on the window path `outstanding`
   and `observed` each drop by 1. A dropped head is committed as dropped. Under `at_most_once` an `Ambiguous` fault
   also commits every other outstanding item and counts each `send_failed`, since each is as
-  ambiguous as the head. A `Permanent` fault drops only the head.
+  ambiguous as the head. [Superseded in part on 2026-10-25 by [ADR
+  `sink-request-concurrency`](sink-request-concurrency.md): a `HeadOnly` fault of any class settles
+  the head alone.] A `Permanent` fault drops only the head.
 - **Grace.** The write loop counts as sending while `outstanding > 0` or a submit is in
   progress, including a `GraceExpired` reached before an attempt with `outstanding > 0`. At a
   grace cut, `at_most_once` commits every outstanding item and counts each as a shutdown drop;

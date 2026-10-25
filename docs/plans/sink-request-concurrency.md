@@ -54,8 +54,9 @@ Non-goals:
   `script/schema`. `crates/logit-cli/src/pipeline.rs` passes each through `with_concurrency`.
   Every shipped config naming `window:` on a `logit_out` moves (`examples/`, `fixtures/`,
   `tools/soak/scenarios/`, `demo/`), and `script/validate` confirms it.
-- **Telemetry.** `send.duration` per batch on the window path; `logit.output.in_flight` on
-  `logit_out` is unchanged. [`docs/design/internal-telemetry.md`](../design/internal-telemetry.md)
+- **Telemetry.** `send.duration` per batch on a sink using the slot helper, one per windowed
+  round on `logit_out`; `logit.output.in_flight` on `logit_out` is unchanged.
+  [`docs/design/internal-telemetry.md`](../design/internal-telemetry.md)
   and [`docs/design/pipeline-graph.md`](../design/pipeline-graph.md)'s rule table and
   "Cancellation points" row.
 - **Docs.** [`docs/deploying.md`](../deploying.md)'s "Send window" and its `at_most_once` note
@@ -97,9 +98,11 @@ Non-goals:
 
 ### W4: HTTP/2
 
-- `reqwest`'s `http2` feature in `Cargo.toml`, `cargo deny` clean, and a test that an h2
-  listener (`influxdb_in` under `bind_tls:`, which advertises `h2` through ALPN) sees one
-  connection carrying several slots, where a plaintext listener sees several connections.
+- `reqwest`'s `http2` feature in `Cargo.toml`, `cargo deny` clean, and tests that the default
+  TLS config offers `h2` (`the_default_tls_config_offers_h2` in
+  `crates/logit-outputs/src/http.rs`) and that an h2-capable fixture TLS listener sees one
+  connection carrying several slots, where a plaintext listener sees several
+  (`slots_share_one_connection_to_an_h2_server` in `crates/logit-outputs/src/splunk.rs`).
 - The ADR's decision 4 trade-offs in `docs/deploying.md`'s sink section.
 
 ### W5: soak, findings, and the known-gaps closing

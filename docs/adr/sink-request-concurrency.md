@@ -227,10 +227,11 @@ them.
   reordering. It needs every encoder to take several batches with distinct resources and
   contexts, doesn't help a listener already assembling batches at the destination's size cap,
   and is orthogonal: an operator can raise the listener's batch bounds today.
-- **A default above 1 on the sinks where reordering is harmless.** Rejected. No HTTP sink is
-  free of it: a destination that overwrites keeps the last to arrive, which above 1 can be the
-  older value, and a destination that appends stores what it receives in arrival order. Only the
-  operator knows whether their series repeat a point across batches, so the default stays 1.
+- **A default above 1 on the sinks where reordering is harmless.** Rejected. A default is one
+  value for every sink, and the safe rows share a field with unsafe ones: `otlp_out` sends logs,
+  traces, and metrics through one `concurrency:`, so a default above 1 would reorder its metrics
+  into a Prometheus-backed receiver. Only the operator knows whether their series repeat a point
+  across batches, so the default stays 1.
 - **Refusing `concurrency > 1` on remote write in validation.** Declined. VictoriaMetrics, the
   main remote-write target here, accepts out-of-order samples, and a Prometheus or Mimir with its
   window open does too. The field's doc carries the warning; `logit validate` doesn't know the
@@ -248,8 +249,9 @@ them.
   helper in `http.rs` and each sink's `submit`/`await_ack`; `BatchAccounting` per slot; the
   `http2` feature. [`docs/plans/sink-request-concurrency.md`](../plans/sink-request-concurrency.md)
   sequences it.
-- **Telemetry.** `send.duration` per batch on a windowed sink, `logit.output.in_flight` on every
-  sink above 1, and the `buffer_full` line's cause.
+- **Telemetry.** `send.duration` per batch on a sink using the slot helper and one per windowed
+  round on `logit_out`, `logit.output.in_flight` on every sink above 1, and the `buffer_full`
+  line's cause.
 - **Docs.** [`docs/deploying.md`](../deploying.md)'s "Send window" section and its
   `at_most_once` note move to `concurrency`; each sink's module doc gains the field and its
   ordering note; the remote-write and `otlp_out` docs carry the receiver table;

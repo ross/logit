@@ -160,7 +160,9 @@ trailer_bytes := (tag: u8, len: uvarint, value: [u8; len])*     -- tag 1 origin,
   head as `batches.dropped{reason="rejected"}`, prints the destination's text in the
   `send_failed` diagnostic, and goes on to the next head with nothing resubmitted. A disk spool
   commits the head, so it never replays. The marker is legal only beside `Fault::Rejected`: a
-  retried head would have to be resubmitted behind frames already in flight.
+  retried head would have to be resubmitted behind frames already in flight. [Superseded in part
+  on 2026-10-25 by [ADR `sink-request-concurrency`](sink-request-concurrency.md): the marker is
+  legal beside any class for a sink whose requests settle on their own.]
 - **Counted** as `logit.output.requests{class="rejected"}`, once.
 - **The sender learns of a rejection only from the rejected `Ack` it reads.** A mark carries no
   status. If the connection fails after `logit_in` raised the mark and before `logit_out` read the
