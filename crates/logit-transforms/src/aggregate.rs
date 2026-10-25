@@ -5814,6 +5814,65 @@ mod tests {
         assert_eq!(series_limit_dropped(&events), None);
     }
 
+    /// A record whose group doesn't exist yet still makes room at a full cap: the held series
+    /// under another resource is evicted, and its emptied group stays until the flush.
+    #[test]
+    fn a_record_with_no_group_evicts_to_make_room() {
+        let (mut agg, registry) = with_registry(
+            Aggregator::new(Duration::from_secs(10))
+                .with_series_retention(5, 100)
+                .with_max_series(1),
+        );
+        let a = default_resource();
+        let b = Arc::new(Resource { dropped_attributes_count: 1, ..Resource::default() });
+        feed(&mut agg, &a, metric_event("old", MetricKind::gauge(1.0), 0));
+        agg.flush(100);
+        registry.drain(0);
+
+        feed(&mut agg, &b, metric_event("new", MetricKind::gauge(1.0), 150));
+        let events = registry.drain(0);
+        assert_eq!(evicted_for_series_limit(&events), Some(1.0));
+        assert_eq!(series_limit_dropped(&events), None);
+        assert_eq!(held_names(&agg), ["new"]);
+        assert_eq!(agg.groups.len(), 2, "a's emptied group stays until the flush");
+        assert_budget_matches_the_groups(&agg);
+        agg.flush(200);
+        assert_eq!(agg.groups.len(), 1);
+        assert!(Arc::ptr_eq(&agg.groups[0].resource, &b));
+    }
+
+    /// A flush discards the window's eviction order, so the next window's order holds only the
+    /// series that window holds, indexed by the groups the flush left. Here the flush removes the
+    /// first group, shifting the second group's index.
+    #[test]
+    fn a_flush_discards_the_eviction_order() {
+        let (mut agg, registry) = with_registry(
+            Aggregator::new(Duration::from_secs(10))
+                .with_series_retention(1, 100)
+                .with_max_series(2),
+        );
+        let a = default_resource();
+        let b = Arc::new(Resource { dropped_attributes_count: 1, ..Resource::default() });
+        feed(&mut agg, &a, metric_event("a1", MetricKind::gauge(1.0), 0));
+        feed(&mut agg, &b, metric_event("b1", MetricKind::gauge(1.0), 0));
+        agg.flush(100);
+        // Builds the order (b1, a1) under groups (a, b) and evicts b1, the newer.
+        feed(&mut agg, &b, metric_event("n1", MetricKind::gauge(1.0), 150));
+        assert_eq!(held_names(&agg), ["a1", "n1"]);
+        assert!(!agg.eviction_order.is_empty(), "a1 is still listed");
+
+        agg.flush(200); // a1 idle past `series_retention: 1`: evicted, and group a with it
+        assert!(agg.eviction_order.is_empty());
+        assert_eq!(agg.groups.len(), 1);
+        feed(&mut agg, &b, metric_event("n2", MetricKind::gauge(1.0), 250));
+        feed(&mut agg, &b, metric_event("n3", MetricKind::gauge(1.0), 250));
+        assert_eq!(held_names(&agg), ["n2", "n3"], "n1 makes room for n3");
+        assert_budget_matches_the_groups(&agg);
+        let events = registry.drain(0);
+        assert_eq!(evicted_for_series_limit(&events), Some(2.0));
+        assert_eq!(series_limit_dropped(&events), None);
+    }
+
     /// A series updated this window, retained or new, is never evicted to make room.
     #[test]
     fn an_idle_series_updated_this_window_is_not_evicted_to_make_room() {
