@@ -393,3 +393,48 @@ pub(crate) async fn a_grace_cut_aborts_the_requests_in_flight<O: Output + Send>(
     wait_until("every request in flight aborted", || held.all_closed()).await;
     drop(output);
 }
+
+/// A batch answered at once behind a head held for `HEAD_WAIT` and then retried records its own
+/// request's duration in `logit.component.send.duration`, not the head's wait. Of the three
+/// samples (the head's held attempt, its resend, and the second batch), only the first reaches
+/// `HEAD_WAIT`, so the median is under it.
+pub(crate) async fn a_batch_behind_a_retried_head_times_its_own_request<O: Output + Send>(
+    subject: Subject<O>,
+) {
+    const HEAD_WAIT: Duration = Duration::from_millis(300);
+    let held = Held::start(subject.id_of, |batch, earlier| match (batch, earlier) {
+        (1, 0) => Answer::Hold,
+        _ => Answer::Now(RESP_204),
+    })
+    .await;
+    let (mut output, mut probe, telemetry) = sink(&subject, &held, 2);
+    let control = async {
+        wait_until("both batches sent", || held.batches().len() == 2).await;
+        // Sizes the head's wait, which the second batch's sample must not include.
+        tokio::time::sleep(HEAD_WAIT).await;
+        held.release(1, RESP_500);
+    };
+    let (totals, _) = run(
+        &mut output,
+        &mut probe,
+        telemetry,
+        (1..=2).map(subject.batch).collect(),
+        DeliveryPosture::AtLeastOnce,
+        std::future::pending(),
+        control,
+    )
+    .await;
+    assert_eq!(delivered(&totals), 2.0);
+    let mut durations = logit_core::DdSketch::new();
+    for metric in totals.events.iter().flat_map(|event| event.metrics.iter()) {
+        if logit_core::interner::resolve(metric.name) == "logit.component.send.duration" {
+            match &metric.kind {
+                logit_core::MetricKind::Distribution(sketch) => durations.merge(sketch),
+                other => panic!("send.duration is a distribution, got {other:?}"),
+            }
+        }
+    }
+    assert_eq!(durations.count(), 3, "one sample per answered request");
+    let median = durations.quantile(0.5).expect("three samples");
+    assert!(median < HEAD_WAIT.as_secs_f64() / 2.0, "median {median}s includes the head's wait");
+}

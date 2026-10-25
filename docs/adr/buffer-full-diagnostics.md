@@ -140,12 +140,12 @@ trip. A sink's `buffer_full` line, the first and each repeat, gains one suffix:
 
 | Suffix | Written when |
 |---|---|
-| `; sending at its concurrency of N, the last send took D` | the write loop has `N` batches in flight and `N` is the most it may: `concurrency:`, or 1 on a sink without the field. `D` is the last answered send's duration, from its submit or attempt to its answer, success or failure |
+| `; sending at its concurrency of N, the last send took D` | the write loop has `N` batches in flight and `N` is the most it may: `concurrency:`, or 1 on a sink without the field. `D` is the last answered send's duration, success or failure: one attempt's on the `send` path; above a window of 1, the request's own on a sink on the HTTP slot helper, from its send to its response, and the head frame's on `logit_out`, from its submit to its acknowledgment |
 | `; sending at its concurrency of N, no send answered yet` | as above, before any send was answered |
 
 `write_loop` records the limit, the batches it waits on, and each answered send's duration in the
 store's `SendLimit` (`crates/logit-pipeline/src/buffer_full.rs`), which the line reads when it's
-written. A loop in a retry backoff waits on no send, so a held head never reads as saturated:
-`retrying` names that cause. A receive queue has no write loop and gets no suffix. The line
+written. A retried send reads as saturated only while it's in flight, never during its backoff,
+where `retrying` names the cause. A receive queue has no write loop and gets no suffix. The line
 names the limit, not the remedy: raising `concurrency:` reorders batches at the destination, which
 each sink's docs weigh.

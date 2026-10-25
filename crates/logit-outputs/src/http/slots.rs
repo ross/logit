@@ -30,12 +30,14 @@ use logit_core::{CountGate, Telemetry};
 use logit_pipeline::{DeliveryPosture, Fault, HeadOnly, SeqId};
 use std::collections::VecDeque;
 use std::future::Future;
+use std::time::Duration;
 
 /// The gauge of slots in flight, the name `logit_out` reports its frames under.
 const IN_FLIGHT: &str = "logit.output.in_flight";
 
-/// A spawned transport task, aborted when dropped.
-struct Task<O>(tokio::task::JoinHandle<O>);
+/// A spawned transport task, aborted when dropped. It returns the sink's outcome and how long the
+/// request took.
+struct Task<O>(tokio::task::JoinHandle<(O, Duration)>);
 
 impl<O> Drop for Task<O> {
     fn drop(&mut self) {
@@ -66,6 +68,8 @@ pub(crate) struct Slots<O> {
     posture: DeliveryPosture,
     telemetry: Telemetry,
     slots: VecDeque<Slot<O>>,
+    /// How long the request behind the last `ack` took, `None` when it sent none.
+    answered: Option<Duration>,
 }
 
 impl<O: Send + 'static> Slots<O> {
@@ -77,6 +81,7 @@ impl<O: Send + 'static> Slots<O> {
             posture: DeliveryPosture::AtLeastOnce,
             telemetry: Telemetry::default(),
             slots: VecDeque::new(),
+            answered: None,
         }
     }
 
@@ -141,7 +146,12 @@ impl<O: Send + 'static> Slots<O> {
         slot.state = State::Idle;
         let result = match prepare(&mut slot.accounting) {
             Ok(Some(request)) => {
-                slot.state = State::Running(Task(tokio::spawn(request)));
+                let started = tokio::time::Instant::now();
+                let timed = async move {
+                    let outcome = request.await;
+                    (outcome, started.elapsed())
+                };
+                slot.state = State::Running(Task(tokio::spawn(timed)));
                 Ok(())
             }
             Ok(None) => {
@@ -169,6 +179,7 @@ impl<O: Send + 'static> Slots<O> {
         &mut self,
         apply: impl FnOnce(O) -> anyhow::Result<()>,
     ) -> anyhow::Result<()> {
+        self.answered = None;
         let Some(front) = self.slots.front_mut() else {
             return Ok(());
         };
@@ -196,7 +207,10 @@ impl<O: Send + 'static> Slots<O> {
                 guard.done = true;
                 drop(guard);
                 match joined {
-                    Ok(outcome) => apply(outcome),
+                    Ok((outcome, took)) => {
+                        self.answered = Some(took);
+                        apply(outcome)
+                    }
                     Err(err) if err.is_panic() => std::panic::resume_unwind(err.into_panic()),
                     Err(err) => Err(anyhow::Error::new(err)).context_fault(Fault::Ambiguous),
                 }
@@ -219,6 +233,12 @@ impl<O: Send + 'static> Slots<O> {
         };
         self.report();
         result
+    }
+
+    /// `Output::answered_send_duration`: how long the request behind the last `ack` took, from
+    /// its spawn to its response.
+    pub(crate) fn answered(&self) -> Option<Duration> {
+        self.answered
     }
 
     /// Aborts every request in flight, keeping each slot's accounting: `Output::flush` at

@@ -53,7 +53,7 @@
 //! `(measurement, tag set, timestamp)`, so two batches writing one point with different values
 //! leave whichever landed later, the same outcome as a fan-in topology at concurrency 1.
 //! `logit.output.in_flight` reads the batches in flight, and `logit.component.send.duration`
-//! times each batch from its last submit to its answer.
+//! times each batch's request from its send to its response.
 //!
 //! ## Response classes
 //!
@@ -503,6 +503,10 @@ impl Output for InfluxDbOutput {
 
     fn send_duration_per_batch(&self) -> bool {
         true
+    }
+
+    fn answered_send_duration(&self) -> Option<Duration> {
+        self.slots.answered()
     }
 
     /// Encodes `batch` into its slot and starts its request on a task of its own.
@@ -1791,6 +1795,11 @@ mod tests {
         #[tokio::test]
         async fn a_grace_cut_aborts_the_requests_in_flight() {
             held::a_grace_cut_aborts_the_requests_in_flight(subject()).await;
+        }
+
+        #[tokio::test]
+        async fn a_batch_behind_a_retried_head_times_its_own_request() {
+            held::a_batch_behind_a_retried_head_times_its_own_request(subject()).await;
         }
     }
 }

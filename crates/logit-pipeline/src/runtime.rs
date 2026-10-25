@@ -1195,7 +1195,8 @@ impl InFlight {
 /// counts the drops. Telemetry per round matches [`deliver_with_retry`]'s per attempt: one
 /// `send.duration` sample, one `errors` per failed round, and one `retries` per retry. A sink
 /// whose `Output::send_duration_per_batch` says so gets its `send.duration` sample per head
-/// answer instead, from that head's last submit, and none per round. As there, a grace deadline
+/// answer instead, the head's request time `Output::answered_send_duration` reports, and none
+/// per round. As there, a grace deadline
 /// already reached before a round returns [`Delivery::GraceExpired`] with nothing new submitted.
 #[allow(clippy::too_many_arguments)]
 async fn deliver_window(
@@ -1314,7 +1315,13 @@ async fn window_round(
     let window = output.window().min(store.max_in_flight()).max(1);
     store.send_limit().set(window, state.outstanding);
     let result = output.await_ack().await;
-    let head_answered = state.submitted.front().map(|started| started.elapsed());
+    // A batch behind a held head may have been answered while the loop retried the head, so its
+    // submit time would count that wait; a sink timing its own requests reports the request's.
+    let head_answered = if output.send_duration_per_batch() {
+        output.answered_send_duration()
+    } else {
+        state.submitted.front().map(|started| started.elapsed())
+    };
     let err = match result {
         Ok(()) => {
             state.head_answered = head_answered;
@@ -7571,6 +7578,10 @@ mod tests {
 
         fn send_duration_per_batch(&self) -> bool {
             self.per_batch
+        }
+
+        fn answered_send_duration(&self) -> Option<Duration> {
+            self.per_batch.then_some(Duration::from_millis(1))
         }
 
         async fn submit(

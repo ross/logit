@@ -213,7 +213,7 @@
 //! | Thanos receive | answered `409`; whether a setting opens a window hasn't been checked |
 //!
 //! `logit.output.in_flight` reads the batches in flight, and `logit.component.send.duration`
-//! times each batch from its last submit to its answer.
+//! times each batch's request from its send to its response.
 //!
 //! **Duplicate timestamps.** One series holds one sample per millisecond. Given two in one
 //! request, Prometheus and Mimir answer `2xx`, keep the first, and drop the second silently, so
@@ -645,6 +645,13 @@ impl Output for PrometheusOutput {
         }
     }
 
+    fn answered_send_duration(&self) -> Option<Duration> {
+        match self {
+            PrometheusOutput::Expose(output) => output.answered_send_duration(),
+            PrometheusOutput::Send(output) => output.answered_send_duration(),
+        }
+    }
+
     async fn submit(
         &mut self,
         batch: &EventBatch,
@@ -903,7 +910,7 @@ pub struct RemoteWriteOutput {
     /// The `send` path's batch accounting, at a concurrency of 1.
     accounting: BatchAccounting,
     /// The batches in flight above a concurrency of 1, each with its own accounting over
-    /// `accounting`'s gate (the module doc's "Concurrency (sender mode)"). A task's outcome is
+    /// `accounting`'s gate (the module doc's "Concurrency" paragraph). A task's outcome is
     /// the samples its body carries and the receiver's answer.
     slots: Slots<(u64, Exchange)>,
 }
@@ -1338,6 +1345,10 @@ impl Output for RemoteWriteOutput {
 
     fn send_duration_per_batch(&self) -> bool {
         true
+    }
+
+    fn answered_send_duration(&self) -> Option<Duration> {
+        self.slots.answered()
     }
 
     /// Encodes `batch` into its slot and starts its request on a task of its own.
@@ -3923,6 +3934,11 @@ mod tests {
         #[tokio::test]
         async fn a_grace_cut_aborts_the_requests_in_flight() {
             held::a_grace_cut_aborts_the_requests_in_flight(subject()).await;
+        }
+
+        #[tokio::test]
+        async fn a_batch_behind_a_retried_head_times_its_own_request() {
+            held::a_batch_behind_a_retried_head_times_its_own_request(subject()).await;
         }
     }
 }

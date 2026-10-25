@@ -6,6 +6,7 @@
 use crate::fanout::BatchContext;
 use logit_core::EventBatch;
 use logit_proto::native::SeqId;
+use std::time::Duration;
 
 /// A sink component: takes batches and delivers them somewhere. It has at least one source and is
 /// never a source itself (`docs/design/pipeline-graph.md`'s arity table).
@@ -113,15 +114,24 @@ pub trait Output {
         1
     }
 
-    /// Whether `write_loop` times each batch it submits, from its submit to its acknowledgment,
-    /// as one `logit.component.send.duration` sample per acknowledgment, rather than one sample
-    /// per windowed round (`docs/adr/sink-request-concurrency.md`, decision 2). Read only under a
+    /// Whether `write_loop` records one `logit.component.send.duration` sample per answered
+    /// batch, the duration [`Output::answered_send_duration`] reports, rather than one sample per
+    /// windowed round (`docs/adr/sink-request-concurrency.md`, decision 2). Read only under a
     /// window above 1; the `send` path times each attempt either way. The default, `false`, keeps
     /// one sample per round, what `logit_out` reports. A sink on the HTTP slot helper, whose
     /// batches each run as their own request, says `true`. A type that implements `Output` by
     /// delegating to another must forward this.
     fn send_duration_per_batch(&self) -> bool {
         false
+    }
+
+    /// How long the request behind the last [`Output::await_ack`] answer took, from its send to
+    /// its response, or `None` when that batch sent no request. Read after each `await_ack`, only
+    /// when [`Output::send_duration_per_batch`] says `true`. A batch behind a held head waits for
+    /// the head's retries before its answer is read, so the loop can't measure this itself. A
+    /// type that implements `Output` by delegating to another must forward this.
+    fn answered_send_duration(&self) -> Option<Duration> {
+        None
     }
 
     /// Writes `batch` without waiting for its delivery, under a window above 1
