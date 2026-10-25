@@ -1234,26 +1234,44 @@ pub(crate) fn build_spec(
             DropProvenanceTransform::new(origin.clone(), previous.clone()),
         )),
 
-        InfluxDbOut { url, org, default_org, bucket, default_bucket, token, concurrency } => {
-            NodeSpec::Output(
-                Box::new(
-                    InfluxDbOutput::new(
-                        url.clone(),
-                        Organization::from_config(org.clone(), default_org.clone()),
-                        Destination::from_config(bucket.clone(), default_bucket.clone()),
-                        token.clone(),
-                    )
-                    .with_concurrency(*concurrency)
-                    .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
-                    .with_telemetry(telemetry.clone()),
-                ),
-                queue_config(&component.buffer, base_dir),
-                write_config(&component.buffer),
-            )
-        }
-        OtlpOut { endpoint, protocol, headers, paths, compression, tls, concurrency } => {
+        InfluxDbOut {
+            url,
+            org,
+            default_org,
+            bucket,
+            default_bucket,
+            token,
+            concurrency,
+            idle_timeout,
+        } => NodeSpec::Output(
+            Box::new(
+                InfluxDbOutput::new(
+                    url.clone(),
+                    Organization::from_config(org.clone(), default_org.clone()),
+                    Destination::from_config(bucket.clone(), default_bucket.clone()),
+                    token.clone(),
+                )
+                .with_concurrency(*concurrency)
+                .with_idle_timeout(*idle_timeout)
+                .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
+                .with_telemetry(telemetry.clone()),
+            ),
+            queue_config(&component.buffer, base_dir),
+            write_config(&component.buffer),
+        ),
+        OtlpOut {
+            endpoint,
+            protocol,
+            headers,
+            paths,
+            compression,
+            tls,
+            concurrency,
+            idle_timeout,
+        } => {
             let output = OtlpOutput::new(endpoint.clone(), otlp_out_transport(*protocol))?
                 .with_concurrency(*concurrency)
+                .with_idle_timeout(*idle_timeout)
                 .with_headers(headers)?
                 .with_paths(to_signal_paths(paths))
                 .with_compression(to_otlp_compression(*compression))
@@ -1276,9 +1294,11 @@ pub(crate) fn build_spec(
             tls,
             histograms,
             concurrency,
+            idle_timeout,
         } => {
             let output = DatadogOutput::new(api_key)?
                 .with_concurrency(*concurrency)
+                .with_idle_timeout(*idle_timeout)
                 .with_site(site.clone())
                 .with_default_host(hostname.clone())
                 .with_histograms(to_datadog_histograms(histograms))
@@ -1311,6 +1331,7 @@ pub(crate) fn build_spec(
             headers,
             tls,
             concurrency,
+            idle_timeout,
         } => {
             // Rule 67 has already required one of `endpoint`/`socket`, not both.
             let output = match (endpoint, socket) {
@@ -1320,6 +1341,7 @@ pub(crate) fn build_spec(
             };
             let output = output
                 .with_concurrency(*concurrency)
+                .with_idle_timeout(*idle_timeout)
                 .with_version(match version {
                     logit_config::DatadogTraceVersion::V04 => TracerApiForm::V04,
                     logit_config::DatadogTraceVersion::V07 => TracerApiForm::V07,
@@ -1350,9 +1372,11 @@ pub(crate) fn build_spec(
             tls,
             max_body_bytes,
             concurrency,
+            idle_timeout,
         } => {
             let output = SplunkHecOutput::new(endpoint.clone(), token)?
                 .with_concurrency(*concurrency)
+                .with_idle_timeout(*idle_timeout)
                 .with_compression(splunk_compression(*compression))
                 .with_multi_value(splunk_multi_value(*multi_value))
                 // Rule 70 allows `ack_timeout` only with `ack`; the default applies under `ack`.
@@ -1657,6 +1681,7 @@ pub(crate) fn build_spec(
             endpoint_tls,
             reuse_port,
             concurrency,
+            idle_timeout,
         } => {
             // Graph rule 56 guarantees exactly one mode field; `PrometheusOutput` carries the
             // choice as a variant from here on.
@@ -1675,6 +1700,7 @@ pub(crate) fn build_spec(
                 }
                 (None, Some(endpoint)) => RemoteWriteOutput::new(endpoint.clone())
                     .with_concurrency(*concurrency)
+                    .with_idle_timeout(*idle_timeout)
                     .with_version(to_remote_write_version(*version))
                     .with_compression(to_remote_write_encoding(*compression))
                     .with_timeout(*timeout)
@@ -2726,6 +2752,7 @@ mod tests {
                 default_org: None,
                 token: "test-token".to_string(),
                 concurrency: 1,
+                idle_timeout: logit_config::default_sink_idle_timeout(),
             },
         }
     }
@@ -2773,6 +2800,7 @@ mod tests {
                         tls: logit_config::TlsClientConfig::default(),
                         max_body_bytes: 800 * 1024 * 1024,
                         concurrency: 1,
+                        idle_timeout: logit_config::default_sink_idle_timeout(),
                     },
                 },
             ),
@@ -2958,6 +2986,7 @@ mod tests {
                 default_org: None,
                 token: "test-token".to_string(),
                 concurrency: 1,
+                idle_timeout: logit_config::default_sink_idle_timeout(),
             },
         };
         assert!(matches!(
@@ -3254,6 +3283,7 @@ mod tests {
                 endpoint_tls: logit_config::TlsClientConfig::default(),
                 reuse_port: false,
                 concurrency: 1,
+                idle_timeout: logit_config::default_sink_idle_timeout(),
             },
         };
         assert!(matches!(
@@ -3289,6 +3319,7 @@ mod tests {
                     endpoint_tls: logit_config::TlsClientConfig::default(),
                     reuse_port: false,
                     concurrency: 1,
+                    idle_timeout: logit_config::default_sink_idle_timeout(),
                 },
             };
             assert!(
@@ -3971,6 +4002,7 @@ mod tests {
                     compression: logit_config::OtlpCompression::default(),
                     tls: logit_config::TlsClientConfig::default(),
                     concurrency: 1,
+                    idle_timeout: logit_config::default_sink_idle_timeout(),
                 },
             };
             assert!(
@@ -4001,6 +4033,7 @@ mod tests {
                 compression: logit_config::OtlpCompression::default(),
                 tls: logit_config::TlsClientConfig::default(),
                 concurrency: 1,
+                idle_timeout: logit_config::default_sink_idle_timeout(),
             },
         };
         assert!(matches!(
@@ -4098,6 +4131,7 @@ mod tests {
                     ..Default::default()
                 },
                 concurrency: 1,
+                idle_timeout: logit_config::default_sink_idle_timeout(),
             },
         };
         assert!(matches!(
@@ -4127,6 +4161,7 @@ mod tests {
                     ..Default::default()
                 },
                 concurrency: 1,
+                idle_timeout: logit_config::default_sink_idle_timeout(),
             },
         };
         let err = match build_spec("out", &component, &testdata_tls_dir(), None) {
@@ -4960,6 +4995,7 @@ mod tests {
                 default_org: None,
                 token: "test-token".to_string(),
                 concurrency: 1,
+                idle_timeout: logit_config::default_sink_idle_timeout(),
             },
         };
         let NodeSpec::Output(_, store_config, write_config) =
@@ -5012,6 +5048,7 @@ mod tests {
                 default_org: None,
                 token: "test-token".to_string(),
                 concurrency: 1,
+                idle_timeout: logit_config::default_sink_idle_timeout(),
             },
         };
         let NodeSpec::Output(_, store_config, _) =

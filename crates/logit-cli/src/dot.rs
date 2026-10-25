@@ -118,6 +118,7 @@ mod tests {
                     default_org: None,
                     token: "T".to_string(),
                     concurrency: 1,
+                    idle_timeout: logit_config::default_sink_idle_timeout(),
                 },
             },
         );
@@ -149,6 +150,7 @@ mod tests {
                     default_org: None,
                     token: "T".to_string(),
                     concurrency: 1,
+                    idle_timeout: logit_config::default_sink_idle_timeout(),
                 },
             },
         );

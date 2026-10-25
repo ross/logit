@@ -147,6 +147,7 @@ use http_body_util::{BodyExt, Full};
 use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client as GrpcClient;
+#[cfg(test)]
 use hyper_util::rt::TokioExecutor;
 use logit_core::{redact, CountGate, Diagnostics, EventBatch, Telemetry};
 use logit_pipeline::{BatchContext, DeliveryPosture, Fault, SeqId};
@@ -160,7 +161,8 @@ use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 
 use crate::http::{
     body_snippet, build_client, classify_reqwest_error, classify_status, read_body_prefix,
-    read_varint, skip_field, status_class, Journal, Outcomes, Slots, ERROR_BODY_SNIPPET_BYTES,
+    read_varint, skip_field, status_class, Journal, Outcomes, Slots, DEFAULT_IDLE_TIMEOUT,
+    ERROR_BODY_SNIPPET_BYTES,
 };
 use std::collections::HashMap;
 use std::path::Path;
@@ -236,6 +238,8 @@ pub struct OtlpOutput {
     /// The batches in flight above a concurrency of 1, each with its own accounting over
     /// `accounting`'s gate (the module doc's "Concurrency").
     slots: Slots<Attempted>,
+    /// The operator's `idle_timeout:`, on both transports' pools ([`crate::http::build_client`]).
+    idle_timeout: Duration,
 }
 
 impl OtlpOutput {
@@ -245,8 +249,9 @@ impl OtlpOutput {
         Ok(Self {
             endpoint,
             transport,
-            client: build_client(DEFAULT_TIMEOUT, None),
-            grpc_client: build_grpc_client(&default_client_tls_config()),
+            client: build_client(DEFAULT_TIMEOUT, DEFAULT_IDLE_TIMEOUT, None),
+            grpc_client: build_grpc_client(&default_client_tls_config(), DEFAULT_IDLE_TIMEOUT),
+            idle_timeout: DEFAULT_IDLE_TIMEOUT,
             request_timeout: DEFAULT_TIMEOUT,
             encoder: new_encoder(&telemetry, &diag, accounting.gate()),
             telemetry,
@@ -266,11 +271,24 @@ impl OtlpOutput {
         self
     }
 
+    /// How long a pooled connection may sit idle before it's closed instead of reused
+    /// (`idle_timeout:` in config, default [`crate::http::DEFAULT_IDLE_TIMEOUT`]). Rebuilds both
+    /// transports' clients.
+    pub fn with_idle_timeout(mut self, idle_timeout: Duration) -> Self {
+        self.idle_timeout = idle_timeout;
+        self.client = build_client(self.request_timeout, idle_timeout, self.tls.as_ref());
+        self.grpc_client = match &self.tls {
+            Some(cfg) => build_grpc_client(cfg, idle_timeout),
+            None => build_grpc_client(&default_client_tls_config(), idle_timeout),
+        };
+        self
+    }
+
     /// Overrides the default 10s request timeout. Over HTTP it's `reqwest`'s timeout; over gRPC
     /// it bounds the whole round trip (connect, handshake, request, response) with
     /// `tokio::time::timeout`, so `grpc_client` isn't rebuilt.
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
-        self.client = build_client(timeout, self.tls.as_ref());
+        self.client = build_client(timeout, self.idle_timeout, self.tls.as_ref());
         self.request_timeout = timeout;
         self
     }
@@ -307,8 +325,8 @@ impl OtlpOutput {
             &self.diag,
             &self.telemetry,
         )?;
-        self.client = build_client(self.request_timeout, Some(&cfg));
-        self.grpc_client = build_grpc_client(&cfg);
+        self.client = build_client(self.request_timeout, self.idle_timeout, Some(&cfg));
+        self.grpc_client = build_grpc_client(&cfg, self.idle_timeout);
         self.tls = Some(cfg);
         Ok(self)
     }
@@ -815,6 +833,7 @@ fn default_client_tls_config() -> rustls::ClientConfig {
 /// so the one connector still dials `https://`.
 fn build_grpc_client(
     tls: &rustls::ClientConfig,
+    idle_timeout: Duration,
 ) -> GrpcClient<HttpsConnector<HttpConnector>, Full<Bytes>> {
     let mut http = HttpConnector::new();
     http.enforce_http(false);
@@ -824,7 +843,7 @@ fn build_grpc_client(
         .https_or_http()
         .enable_http2()
         .wrap_connector(http);
-    let mut builder = GrpcClient::builder(TokioExecutor::new());
+    let mut builder = crate::http::hyper_client_builder(idle_timeout);
     builder.http2_only(true);
     builder.build(connector)
 }

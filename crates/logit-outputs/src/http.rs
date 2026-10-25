@@ -142,11 +142,19 @@ pub(crate) async fn exchange(request: reqwest::RequestBuilder) -> Exchange {
 /// [`classify_status`] reads it as `Fault::Rejected`, and the operator sees the misconfiguration
 /// reported against the URL they configured. Nothing legitimate is lost: neither remote-write nor
 /// OTLP defines a redirect, and a moved endpoint is a config change, not something to follow.
+///
+/// `idle_timeout` is the sink's `idle_timeout:`: how long a pooled connection may sit idle
+/// before the pool closes it instead of reusing it, so the sink, not the destination, closes an
+/// idle connection first. A write the destination receives after closing the connection it came
+/// on is reset, and the sink can't tell whether it was applied: an `Ambiguous` fault no fault at
+/// the destination caused. `Duration::ZERO` keeps no idle connection, so every request opens its
+/// own. See `docs/adr/sink-request-concurrency.md`, decision 7.
 pub(crate) fn build_client(
     timeout: Duration,
+    idle_timeout: Duration,
     tls: Option<&rustls::ClientConfig>,
 ) -> reqwest::Client {
-    client_builder(timeout, tls)
+    client_builder(timeout, idle_timeout, tls)
         .build()
         .expect("reqwest client should build with the configured TLS settings")
 }
@@ -154,15 +162,43 @@ pub(crate) fn build_client(
 /// [`build_client`]'s settings, unbuilt, for a caller that changes one, such as the proxy.
 pub(crate) fn client_builder(
     timeout: Duration,
+    idle_timeout: Duration,
     tls: Option<&rustls::ClientConfig>,
 ) -> reqwest::ClientBuilder {
     let mut builder =
         reqwest::Client::builder().timeout(timeout).redirect(reqwest::redirect::Policy::none());
+    builder = if idle_timeout.is_zero() {
+        builder.pool_max_idle_per_host(0)
+    } else {
+        builder.pool_idle_timeout(idle_timeout)
+    };
     if let Some(cfg) = tls {
         builder = builder.use_preconfigured_tls(logit_pipeline::tls::with_http_alpn(cfg));
     }
     builder
 }
+
+/// The pool settings of [`client_builder`] on a `hyper_util` client: `otlp_out`'s gRPC client
+/// and `datadog_trace_out`'s Unix-socket client. The timer is what closes an idle connection once
+/// it expires; without one, the pool only skips it at the next checkout and the socket stays
+/// open.
+pub(crate) fn hyper_client_builder(idle_timeout: Duration) -> hyper_util::client::legacy::Builder {
+    let mut builder =
+        hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new());
+    builder.pool_timer(hyper_util::rt::TokioTimer::new());
+    if idle_timeout.is_zero() {
+        builder.pool_max_idle_per_host(0);
+    } else {
+        builder.pool_idle_timeout(idle_timeout);
+    }
+    builder
+}
+
+/// The `idle_timeout:` default of every HTTP sink: below the 60 s and longer keep-alive idle
+/// timeouts of the common destinations, and above a 10 s or 15 s batch cadence, so such a sink
+/// reuses its connection (`docs/adr/sink-request-concurrency.md`, decision 7, has the table).
+/// `logit_config`'s `default_sink_idle_timeout` mirrors it.
+pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How much of a rejection body to read and quote in an error message and a diagnostic. Enough
 /// for Prometheus's `400` text, which names the offending series and why; short enough that an
@@ -556,7 +592,7 @@ mod tests {
         let tls = crate::test_support::fixture_server_config("server", None, &[b"h2", b"http/1.1"]);
         let mux = held::Mux::start(Some(tls)).await;
         let ca = std::fs::read(crate::test_support::testdata_dir().join("ca.pem")).unwrap();
-        let client = client_builder(Duration::from_secs(60), None)
+        let client = client_builder(Duration::from_secs(60), DEFAULT_IDLE_TIMEOUT, None)
             .add_root_certificate(reqwest::Certificate::from_pem(&ca).unwrap())
             .build()
             .unwrap();
@@ -571,6 +607,88 @@ mod tests {
         let carriers = mux.carriers();
         assert_eq!(carriers.len(), 1, "four requests on one connection: {carriers:?}");
         assert_eq!(carriers[0].1.as_deref(), Some(&b"h2"[..]));
+    }
+
+    /// The `idle_timeout` the tests below set: short enough to wait out, long enough that two
+    /// requests sent back to back never straddle it.
+    const SHORT_IDLE: Duration = Duration::from_millis(200);
+
+    /// Sends one request to `mux` and reads its answer to the end, so the connection is idle.
+    async fn post(client: &reqwest::Client, mux: &held::Mux) {
+        let response = client.post(mux.url()).body("x").send().await.unwrap();
+        assert_eq!(response.status(), 204);
+        response.bytes().await.unwrap();
+    }
+
+    fn connections(mux: &held::Mux) -> Vec<usize> {
+        mux.carriers().into_iter().map(|(id, _)| id).collect()
+    }
+
+    /// A pooled connection idle past `idle_timeout` is closed by the client, and the next request
+    /// opens a new one, so it never lands on a connection the destination may have closed.
+    #[tokio::test]
+    async fn a_connection_idle_past_idle_timeout_is_closed_and_not_reused() {
+        let mux = held::Mux::start(None).await;
+        mux.release();
+        let client = build_client(Duration::from_secs(60), SHORT_IDLE, None);
+        post(&client, &mux).await;
+        logit_pipeline::test_util::wait_until("the client closed the idle connection", || {
+            mux.closed() == 1
+        })
+        .await;
+        post(&client, &mux).await;
+        assert_eq!(connections(&mux), [0, 1], "the second request opened a connection");
+    }
+
+    /// Under the default, a connection idle for longer than [`SHORT_IDLE`] stays open and the
+    /// next request reuses it.
+    #[tokio::test]
+    async fn a_connection_idle_under_idle_timeout_is_reused() {
+        let mux = held::Mux::start(None).await;
+        mux.release();
+        let client = build_client(Duration::from_secs(60), DEFAULT_IDLE_TIMEOUT, None);
+        post(&client, &mux).await;
+        // Sizes a negative window: twice the idle time that closes the connection above.
+        tokio::time::sleep(SHORT_IDLE * 2).await;
+        assert_eq!(mux.closed(), 0, "the default keeps the connection");
+        post(&client, &mux).await;
+        assert_eq!(connections(&mux), [0], "both requests on one connection");
+    }
+
+    /// An `idle_timeout` of zero keeps no idle connection: each request opens its own, and the
+    /// client closes it once answered.
+    #[tokio::test]
+    async fn an_idle_timeout_of_zero_reuses_no_connection() {
+        let mux = held::Mux::start(None).await;
+        mux.release();
+        let client = build_client(Duration::from_secs(60), Duration::ZERO, None);
+        post(&client, &mux).await;
+        logit_pipeline::test_util::wait_until("the client closed the connection", || {
+            mux.closed() == 1
+        })
+        .await;
+        post(&client, &mux).await;
+        assert_eq!(connections(&mux), [0, 1], "each request on its own connection");
+    }
+
+    /// [`hyper_client_builder`]'s pool closes a connection idle past `idle_timeout`, as
+    /// [`build_client`]'s does: `otlp_out`'s gRPC client and `datadog_trace_out`'s socket client.
+    #[tokio::test]
+    async fn the_hyper_pool_closes_a_connection_idle_past_idle_timeout() {
+        let mux = held::Mux::start(None).await;
+        mux.release();
+        let client = hyper_client_builder(SHORT_IDLE).build_http::<http_body_util::Full<Bytes>>();
+        for expected in [1, 2] {
+            let request = http::Request::post(mux.url())
+                .body(http_body_util::Full::new(Bytes::from_static(b"x")))
+                .unwrap();
+            assert_eq!(client.request(request).await.unwrap().status(), 204);
+            logit_pipeline::test_util::wait_until("the client closed the idle connection", || {
+                mux.closed() == expected
+            })
+            .await;
+        }
+        assert_eq!(connections(&mux), [0, 1], "the second request opened a connection");
     }
 
     #[test]

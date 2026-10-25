@@ -166,7 +166,7 @@
 use crate::accounting::BatchAccounting;
 use crate::http::{
     after_delivery, build_client, classify_reqwest_error, error_read_bytes, read_body_prefix,
-    redacted_snippet, status_class, Journal, Slots,
+    redacted_snippet, status_class, Journal, Slots, DEFAULT_IDLE_TIMEOUT,
 };
 /// `tls:`: the shared `crate::tls` type, re-exported as the other sinks do.
 pub use crate::tls::TlsClientSettings;
@@ -406,6 +406,8 @@ pub struct SplunkHecOutput {
     slots: Slots<Attempted>,
     /// Object buffers back from answered slots, for the next batches' encodes.
     spare: Vec<MessageBuf<ObjectMeta>>,
+    /// The operator's `idle_timeout:` ([`crate::http::build_client`]).
+    idle_timeout: Duration,
 }
 
 impl SplunkHecOutput {
@@ -434,6 +436,7 @@ impl SplunkHecOutput {
             ack_timeout: DEFAULT_ACK_TIMEOUT,
             ack_backoff: ACK_BACKOFF,
             request_timeout: DEFAULT_TIMEOUT,
+            idle_timeout: DEFAULT_IDLE_TIMEOUT,
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             client: None,
             tls: None,
@@ -479,6 +482,15 @@ impl SplunkHecOutput {
     /// Sets how many batches may be in flight at once (`concurrency:` in config, default 1).
     pub fn with_concurrency(mut self, concurrency: u32) -> Self {
         self.slots.set_concurrency(concurrency);
+        self
+    }
+
+    /// How long a pooled connection may sit idle before it's closed instead of reused
+    /// (`idle_timeout:` in config, default [`crate::http::DEFAULT_IDLE_TIMEOUT`]). The client is
+    /// rebuilt on first use.
+    pub fn with_idle_timeout(mut self, idle_timeout: Duration) -> Self {
+        self.idle_timeout = idle_timeout;
+        self.client = None;
         self
     }
 
@@ -554,8 +566,8 @@ impl SplunkHecOutput {
 
     /// The client, built on first use when [`Output::bind`] wasn't called.
     fn client(&mut self) -> reqwest::Client {
-        let (timeout, tls) = (self.request_timeout, self.tls.as_ref());
-        self.client.get_or_insert_with(|| build_client(timeout, tls)).clone()
+        let (timeout, idle, tls) = (self.request_timeout, self.idle_timeout, self.tls.as_ref());
+        self.client.get_or_insert_with(|| build_client(timeout, idle, tls)).clone()
     }
 
     /// What one attempt's requests need from this sink, owned so they can run in a task of their

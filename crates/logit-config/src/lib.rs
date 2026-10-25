@@ -3546,6 +3546,20 @@ pub enum ComponentKind {
         /// last.
         #[serde(default = "default_sink_concurrency")]
         concurrency: u32,
+        /// How long a pooled connection may sit idle before this sink closes it instead of
+        /// reusing it. Keep it below the destination's keep-alive idle timeout, so this sink
+        /// closes an idle connection before the destination does: a write sent on a connection
+        /// the destination has already closed has an unknown outcome, resent under
+        /// `buffer.delivery: at_least_once` and dropped under `at_most_once`. Keep it above the
+        /// interval between this sink's batches if the connection should be reused; a sink that
+        /// sends less often opens a new connection, with its handshake, for each batch. Defaults
+        /// to `30s`, below the 60 s and longer idle timeouts of the common destinations
+        /// (`docs/deploying.md`, "Idle connections"); lower it for a destination that closes
+        /// sooner, such as a Node.js, Apache, or uvicorn server at its 5 s default. `0s` never
+        /// reuses an idle connection: every request opens its own.
+        #[serde(default = "default_sink_idle_timeout", with = "humantime_serde_duration")]
+        #[schemars(with = "String")]
+        idle_timeout: Duration,
     },
     /// OTLP logs, metrics, and traces over OTLP/HTTP or OTLP/gRPC. TLS is selected by
     /// `endpoint`'s `https://` scheme.
@@ -3588,6 +3602,22 @@ pub enum ComponentKind {
         /// which is off by default, and reject a late sample otherwise.
         #[serde(default = "default_sink_concurrency")]
         concurrency: u32,
+        /// How long a pooled connection may sit idle before this sink closes it instead of
+        /// reusing it. Keep it below the destination's keep-alive idle timeout, so this sink
+        /// closes an idle connection before the destination does: a write sent on a connection
+        /// the destination has already closed has an unknown outcome, resent under
+        /// `buffer.delivery: at_least_once` and dropped under `at_most_once`. Keep it above the
+        /// interval between this sink's batches if the connection should be reused; a sink that
+        /// sends less often opens a new connection, with its handshake, for each batch. Defaults
+        /// to `30s`, below the 60 s and longer idle timeouts of the common destinations
+        /// (`docs/deploying.md`, "Idle connections"); lower it for a destination that closes
+        /// sooner, such as a Node.js, Apache, or uvicorn server at its 5 s default. `0s` never
+        /// reuses an idle connection: every request opens its own.
+        ///
+        /// Applies to both `protocol`s.
+        #[serde(default = "default_sink_idle_timeout", with = "humantime_serde_duration")]
+        #[schemars(with = "String")]
+        idle_timeout: Duration,
     },
     /// Sends logs, metrics, events, service checks, APM traces, and APM stats straight to Datadog's
     /// intake API, one request per route a batch needs. Host, service, source, and tags come from
@@ -3659,6 +3689,20 @@ pub enum ComponentKind {
         /// the one that lands last.
         #[serde(default = "default_sink_concurrency")]
         concurrency: u32,
+        /// How long a pooled connection may sit idle before this sink closes it instead of
+        /// reusing it. Keep it below the destination's keep-alive idle timeout, so this sink
+        /// closes an idle connection before the destination does: a write sent on a connection
+        /// the destination has already closed has an unknown outcome, resent under
+        /// `buffer.delivery: at_least_once` and dropped under `at_most_once`. Keep it above the
+        /// interval between this sink's batches if the connection should be reused; a sink that
+        /// sends less often opens a new connection, with its handshake, for each batch. Defaults
+        /// to `30s`, below the 60 s and longer idle timeouts of the common destinations
+        /// (`docs/deploying.md`, "Idle connections"); lower it for a destination that closes
+        /// sooner, such as a Node.js, Apache, or uvicorn server at its 5 s default. `0s` never
+        /// reuses an idle connection: every request opens its own.
+        #[serde(default = "default_sink_idle_timeout", with = "humantime_serde_duration")]
+        #[schemars(with = "String")]
+        idle_timeout: Duration,
     },
     /// Sends APM traces and tracer-computed stats to a Datadog Agent's trace API (port 8126, or
     /// its Unix socket), as a dd-trace tracer does: the sending half of `datadog_trace_in`, so a
@@ -3711,6 +3755,22 @@ pub enum ComponentKind {
         /// Defaults to `1`; must be between `1` and `1024`.
         #[serde(default = "default_sink_concurrency")]
         concurrency: u32,
+        /// How long a pooled connection may sit idle before this sink closes it instead of
+        /// reusing it. Keep it below the destination's keep-alive idle timeout, so this sink
+        /// closes an idle connection before the destination does: a write sent on a connection
+        /// the destination has already closed has an unknown outcome, resent under
+        /// `buffer.delivery: at_least_once` and dropped under `at_most_once`. Keep it above the
+        /// interval between this sink's batches if the connection should be reused; a sink that
+        /// sends less often opens a new connection, with its handshake, for each batch. Defaults
+        /// to `30s`, below the 60 s and longer idle timeouts of the common destinations
+        /// (`docs/deploying.md`, "Idle connections"); lower it for a destination that closes
+        /// sooner, such as a Node.js, Apache, or uvicorn server at its 5 s default. `0s` never
+        /// reuses an idle connection: every request opens its own.
+        ///
+        /// Applies to the `socket` connection too.
+        #[serde(default = "default_sink_idle_timeout", with = "humantime_serde_duration")]
+        #[schemars(with = "String")]
+        idle_timeout: Duration,
     },
     /// Sends logs, metrics, and spans to Splunk's HTTP Event Collector (HEC) as `/event` JSON, in
     /// the shape the OpenTelemetry Collector's `splunk_hec` exporter writes, so a Splunk index fed
@@ -3784,6 +3844,20 @@ pub enum ComponentKind {
         /// Defaults to `1`; must be between `1` and `1024`.
         #[serde(default = "default_sink_concurrency")]
         concurrency: u32,
+        /// How long a pooled connection may sit idle before this sink closes it instead of
+        /// reusing it. Keep it below the destination's keep-alive idle timeout, so this sink
+        /// closes an idle connection before the destination does: a write sent on a connection
+        /// the destination has already closed has an unknown outcome, resent under
+        /// `buffer.delivery: at_least_once` and dropped under `at_most_once`. Keep it above the
+        /// interval between this sink's batches if the connection should be reused; a sink that
+        /// sends less often opens a new connection, with its handshake, for each batch. Defaults
+        /// to `30s`, below the 60 s and longer idle timeouts of the common destinations
+        /// (`docs/deploying.md`, "Idle connections"); lower it for a destination that closes
+        /// sooner, such as a Node.js, Apache, or uvicorn server at its 5 s default. `0s` never
+        /// reuses an idle connection: every request opens its own.
+        #[serde(default = "default_sink_idle_timeout", with = "humantime_serde_duration")]
+        #[schemars(with = "String")]
+        idle_timeout: Duration,
     },
     /// Produces events to an Apache Kafka topic (3.x and 4.x, or anything that speaks the same
     /// protocol from Kafka 2.4 on) with the Java producer's defaults: `acks: all`, idempotence
@@ -4479,6 +4553,20 @@ pub enum ComponentKind {
         /// default. Sender mode only.
         #[serde(default = "default_sink_concurrency")]
         concurrency: u32,
+        /// How long a pooled connection may sit idle before this sink closes it instead of
+        /// reusing it. Keep it below the destination's keep-alive idle timeout, so this sink
+        /// closes an idle connection before the destination does: a write sent on a connection
+        /// the destination has already closed has an unknown outcome, resent under
+        /// `buffer.delivery: at_least_once` and dropped under `at_most_once`. Keep it above the
+        /// interval between this sink's batches if the connection should be reused; a sink that
+        /// sends less often opens a new connection, with its handshake, for each batch. Defaults
+        /// to `30s`, below the 60 s and longer idle timeouts of the common destinations
+        /// (`docs/deploying.md`, "Idle connections"); lower it for a destination that closes
+        /// sooner, such as a Node.js, Apache, or uvicorn server at its 5 s default. `0s` never
+        /// reuses an idle connection: every request opens its own. Sender mode only.
+        #[serde(default = "default_sink_idle_timeout", with = "humantime_serde_duration")]
+        #[schemars(with = "String")]
+        idle_timeout: Duration,
     },
     /// A sink that discards everything, as cheaply as the runtime allows, while the runtime's
     /// own telemetry still counts what it received. Name it as a consumer to discard events by
@@ -5029,6 +5117,12 @@ fn default_logit_out_concurrency() -> u32 {
 /// batch in flight.
 pub fn default_sink_concurrency() -> u32 {
     1
+}
+
+/// The `idle_timeout` default of every sink that waits for a response. Mirrors
+/// `logit_outputs::http::DEFAULT_IDLE_TIMEOUT`, kept in sync by hand.
+pub fn default_sink_idle_timeout() -> Duration {
+    Duration::from_secs(30)
 }
 
 /// Mirrors `logit_outputs::statsd::DEFAULT_MAX_PACKET_BYTES`, kept in sync by hand.
@@ -8175,6 +8269,22 @@ mod tests {
         assert!(missing_token.is_err(), "token stays required");
     }
 
+    /// `idle_timeout` takes a duration string, `0s` included.
+    #[test]
+    fn a_sink_idle_timeout_parses_as_a_duration() {
+        for (text, expected) in [("1s", Duration::from_secs(1)), ("0s", Duration::ZERO)] {
+            let component: Component = serde_json::from_str(&format!(
+                r#"{{"type": "influxdb_out", "sources": ["in"], "url": "http://localhost:8086",
+                    "token": "TOKEN", "idle_timeout": "{text}"}}"#
+            ))
+            .unwrap();
+            let ComponentKind::InfluxDbOut { idle_timeout, .. } = component.kind else {
+                panic!("expected an influxdb_out");
+            };
+            assert_eq!(idle_timeout, expected);
+        }
+    }
+
     #[test]
     fn otlp_out_without_protocol_defaults_to_http() {
         let component: Component = serde_json::from_str(
@@ -8190,8 +8300,10 @@ mod tests {
                 compression,
                 tls,
                 concurrency,
+                idle_timeout,
             } => {
                 assert_eq!(concurrency, 1);
+                assert_eq!(idle_timeout, Duration::from_secs(30));
                 assert_eq!(endpoint, "http://tempo:4318");
                 assert_eq!(protocol, OtlpProtocol::Http);
                 assert!(headers.is_empty());
@@ -8367,8 +8479,10 @@ mod tests {
                 tls,
                 histograms,
                 concurrency,
+                idle_timeout,
             } => {
                 assert_eq!(concurrency, 1);
+                assert_eq!(idle_timeout, Duration::from_secs(30));
                 assert_eq!(api_key, "k");
                 assert_eq!(site, "datadoghq.com");
                 assert_eq!(histograms.mode, DatadogHistogramMode::Distributions);
@@ -8418,8 +8532,10 @@ mod tests {
                 headers,
                 tls,
                 concurrency,
+                idle_timeout,
             } => {
                 assert_eq!(concurrency, 1);
+                assert_eq!(idle_timeout, Duration::from_secs(30));
                 assert_eq!(endpoint.as_deref(), Some("http://127.0.0.1:8126"));
                 assert_eq!(socket, None);
                 assert_eq!(version, DatadogTraceVersion::V04);
@@ -8611,8 +8727,10 @@ mod tests {
                 tls,
                 max_body_bytes,
                 concurrency,
+                idle_timeout,
             } => {
                 assert_eq!(concurrency, 1);
+                assert_eq!(idle_timeout, Duration::from_secs(30));
                 assert_eq!(endpoint, "https://splunk:8088/services/collector");
                 assert_eq!(token, "t");
                 assert_eq!(compression, SplunkCompression::Gzip);
@@ -9509,8 +9627,10 @@ mod tests {
                 endpoint_tls,
                 reuse_port,
                 concurrency,
+                idle_timeout,
             } => {
                 assert_eq!(concurrency, 1);
+                assert_eq!(idle_timeout, Duration::from_secs(30));
                 assert!(!reuse_port, "opt-in -- no SO_REUSEPORT unless asked for");
                 assert_eq!(bind.as_deref(), Some("127.0.0.1:9464"));
                 assert_eq!(path, "/metrics");

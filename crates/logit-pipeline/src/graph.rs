@@ -2662,6 +2662,7 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
             endpoint_tls,
             reuse_port,
             concurrency,
+            idle_timeout,
         } = &component.kind
         else {
             continue;
@@ -2722,6 +2723,14 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                         "component '{id}': 'concurrency' bounds the remote-write requests in \
                          flight and only means anything with 'endpoint' -- a prometheus_out with \
                          'bind' serves an exposition and sends no requests"
+                    );
+                }
+                if *idle_timeout != logit_config::default_sink_idle_timeout() {
+                    anyhow::bail!(
+                        "component '{id}': 'idle_timeout' bounds how long the remote-write \
+                         sender's pooled connections sit idle and only means anything with \
+                         'endpoint' -- a prometheus_out with 'bind' serves an exposition and opens \
+                         no connections"
                     );
                 }
             }
@@ -5158,6 +5167,7 @@ mod tests {
             default_org: None,
             token: "TOKEN".to_string(),
             concurrency: 1,
+            idle_timeout: logit_config::default_sink_idle_timeout(),
         }
     }
 
@@ -6121,6 +6131,7 @@ mod tests {
             compression: logit_config::OtlpCompression::default(),
             tls: logit_config::TlsClientConfig::default(),
             concurrency: 1,
+            idle_timeout: logit_config::default_sink_idle_timeout(),
         }
     }
 
@@ -6136,6 +6147,7 @@ mod tests {
             compression: logit_config::OtlpCompression::default(),
             tls: logit_config::TlsClientConfig::default(),
             concurrency: 1,
+            idle_timeout: logit_config::default_sink_idle_timeout(),
         }
     }
 
@@ -6148,6 +6160,7 @@ mod tests {
             compression: logit_config::OtlpCompression::default(),
             tls,
             concurrency: 1,
+            idle_timeout: logit_config::default_sink_idle_timeout(),
         }
     }
 
@@ -8192,6 +8205,7 @@ mod tests {
             tls: logit_config::TlsClientConfig::default(),
             max_body_bytes: logit_config::default_splunk_max_body_bytes(),
             concurrency: 1,
+            idle_timeout: logit_config::default_sink_idle_timeout(),
         }
     }
 
@@ -8545,6 +8559,7 @@ mod tests {
             tls: logit_config::TlsClientConfig::default(),
             histograms: logit_config::DatadogHistograms::default(),
             concurrency: 1,
+            idle_timeout: logit_config::default_sink_idle_timeout(),
         }
     }
 
@@ -8695,6 +8710,7 @@ mod tests {
             headers: HashMap::new(),
             tls: logit_config::TlsClientConfig::default(),
             concurrency: 1,
+            idle_timeout: logit_config::default_sink_idle_timeout(),
         }
     }
 
@@ -13780,6 +13796,7 @@ mod tests {
             endpoint_tls: logit_config::TlsClientConfig::default(),
             reuse_port: false,
             concurrency: 1,
+            idle_timeout: logit_config::default_sink_idle_timeout(),
         }
     }
 
@@ -13798,6 +13815,7 @@ mod tests {
             endpoint_tls: logit_config::TlsClientConfig::default(),
             reuse_port: false,
             concurrency: 1,
+            idle_timeout: logit_config::default_sink_idle_timeout(),
         }
     }
 
@@ -13944,6 +13962,12 @@ mod tests {
             *concurrency = 8;
         }));
         assert!(err.contains("'out'") && err.contains("'concurrency'"), "got: {err}");
+
+        let err = expect_err(expose_cfg(|kind| {
+            let ComponentKind::PrometheusOut { idle_timeout, .. } = kind else { unreachable!() };
+            *idle_timeout = Duration::from_secs(1);
+        }));
+        assert!(err.contains("'out'") && err.contains("'idle_timeout'"), "got: {err}");
     }
 
     /// A *default* sender-only value stays legal under `bind:` -- rule 45's reason for comparing

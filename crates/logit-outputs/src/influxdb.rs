@@ -274,6 +274,8 @@ pub struct InfluxDbOutput {
     /// The batches in flight above a concurrency of 1, each with its own accounting over
     /// `accounting`'s gate (the module doc's "Concurrency").
     slots: Slots<(Carried, Exchange)>,
+    /// The operator's `idle_timeout:` ([`crate::http::build_client`]).
+    idle_timeout: Duration,
 }
 
 /// Where and how a batch is written: everything a request needs from the config.
@@ -302,7 +304,11 @@ impl InfluxDbOutput {
                 organization,
                 destination,
                 token,
-                client: crate::http::build_client(DEFAULT_TIMEOUT, None),
+                client: crate::http::build_client(
+                    DEFAULT_TIMEOUT,
+                    crate::http::DEFAULT_IDLE_TIMEOUT,
+                    None,
+                ),
                 request_timeout: DEFAULT_TIMEOUT,
             },
             encoder: InfluxLineEncoder::default(),
@@ -310,6 +316,7 @@ impl InfluxDbOutput {
             diag: Diagnostics::default(),
             slots: Slots::new(accounting.gate().clone()),
             accounting,
+            idle_timeout: crate::http::DEFAULT_IDLE_TIMEOUT,
         }
     }
 
@@ -319,9 +326,19 @@ impl InfluxDbOutput {
         self
     }
 
+    /// How long a pooled connection may sit idle before it's closed instead of reused
+    /// (`idle_timeout:` in config, default [`crate::http::DEFAULT_IDLE_TIMEOUT`]). Rebuilds the
+    /// client.
+    pub fn with_idle_timeout(mut self, idle_timeout: Duration) -> Self {
+        self.idle_timeout = idle_timeout;
+        self.writer.client =
+            crate::http::build_client(self.writer.request_timeout, idle_timeout, None);
+        self
+    }
+
     /// Overrides the default 10s request timeout. Rebuilds the underlying HTTP client.
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
-        self.writer.client = crate::http::build_client(timeout, None);
+        self.writer.client = crate::http::build_client(timeout, self.idle_timeout, None);
         self.writer.request_timeout = timeout;
         self
     }

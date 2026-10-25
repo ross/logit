@@ -2930,6 +2930,11 @@
                 "null"
               ]
             },
+            "idle_timeout": {
+              "description": "How long a pooled connection may sit idle before this sink closes it instead of reusing it. Keep it below the destination's keep-alive idle timeout, so this sink closes an idle connection before the destination does: a write sent on a connection the destination has already closed has an unknown outcome, resent under `buffer.delivery: at_least_once` and dropped under `at_most_once`. Keep it above the interval between this sink's batches if the connection should be reused; a sink that sends less often opens a new connection, with its handshake, for each batch. Defaults to `30s`, below the 60 s and longer idle timeouts of the common destinations (`docs/deploying.md`, \"Idle connections\"); lower it for a destination that closes sooner, such as a Node.js, Apache, or uvicorn server at its 5 s default. `0s` never reuses an idle connection: every request opens its own.",
+              "default": "30s",
+              "type": "string"
+            },
             "org": {
               "description": "The organization name sent with every write. When set, it replaces any organization an `influxdb_in` upstream received, by name or by ID. When absent, the sink forwards the organization `influxdb_in` received, else `default_org`. Setting this and `default_org` together is an error.",
               "default": null,
@@ -2992,6 +2997,11 @@
               "additionalProperties": {
                 "type": "string"
               }
+            },
+            "idle_timeout": {
+              "description": "How long a pooled connection may sit idle before this sink closes it instead of reusing it. Keep it below the destination's keep-alive idle timeout, so this sink closes an idle connection before the destination does: a write sent on a connection the destination has already closed has an unknown outcome, resent under `buffer.delivery: at_least_once` and dropped under `at_most_once`. Keep it above the interval between this sink's batches if the connection should be reused; a sink that sends less often opens a new connection, with its handshake, for each batch. Defaults to `30s`, below the 60 s and longer idle timeouts of the common destinations (`docs/deploying.md`, \"Idle connections\"); lower it for a destination that closes sooner, such as a Node.js, Apache, or uvicorn server at its 5 s default. `0s` never reuses an idle connection: every request opens its own.\n\nApplies to both `protocol`s.",
+              "default": "30s",
+              "type": "string"
             },
             "paths": {
               "description": "Per-signal HTTP path overrides. `protocol: http` only; a non-empty value under `protocol: grpc` is rejected.",
@@ -3102,6 +3112,11 @@
                 }
               ]
             },
+            "idle_timeout": {
+              "description": "How long a pooled connection may sit idle before this sink closes it instead of reusing it. Keep it below the destination's keep-alive idle timeout, so this sink closes an idle connection before the destination does: a write sent on a connection the destination has already closed has an unknown outcome, resent under `buffer.delivery: at_least_once` and dropped under `at_most_once`. Keep it above the interval between this sink's batches if the connection should be reused; a sink that sends less often opens a new connection, with its handshake, for each batch. Defaults to `30s`, below the 60 s and longer idle timeouts of the common destinations (`docs/deploying.md`, \"Idle connections\"); lower it for a destination that closes sooner, such as a Node.js, Apache, or uvicorn server at its 5 s default. `0s` never reuses an idle connection: every request opens its own.",
+              "default": "30s",
+              "type": "string"
+            },
             "receive": true,
             "site": {
               "description": "The Datadog site your organization is on: `datadoghq.com` (the default), `datadoghq.eu`, `us3.datadoghq.com`, `us5.datadoghq.com`, `ap1.datadoghq.com`, `ap2.datadoghq.com`, `ddog-gov.com`, and so on. Requests go to `https://api.<site>`, `https://http-intake.logs.<site>`, and `https://trace.agent.<site>`. A bare domain: no scheme and no `/`.",
@@ -3177,6 +3192,11 @@
               "additionalProperties": {
                 "type": "string"
               }
+            },
+            "idle_timeout": {
+              "description": "How long a pooled connection may sit idle before this sink closes it instead of reusing it. Keep it below the destination's keep-alive idle timeout, so this sink closes an idle connection before the destination does: a write sent on a connection the destination has already closed has an unknown outcome, resent under `buffer.delivery: at_least_once` and dropped under `at_most_once`. Keep it above the interval between this sink's batches if the connection should be reused; a sink that sends less often opens a new connection, with its handshake, for each batch. Defaults to `30s`, below the 60 s and longer idle timeouts of the common destinations (`docs/deploying.md`, \"Idle connections\"); lower it for a destination that closes sooner, such as a Node.js, Apache, or uvicorn server at its 5 s default. `0s` never reuses an idle connection: every request opens its own.\n\nApplies to the `socket` connection too.",
+              "default": "30s",
+              "type": "string"
             },
             "receive": true,
             "socket": {
@@ -3267,6 +3287,11 @@
             },
             "endpoint": {
               "description": "The collector's base URL, ending in `/services/collector`: `https://splunk.example.com:8088/services/collector`, or `https://http-inputs-<stack>.splunkcloud.com/services/collector` on Splunk Cloud. A Splunk Cloud trial stack serves HEC at `https://<stack>.splunkcloud.com:8088/services/collector` instead, with a self-signed certificate that needs `tls: {insecure_skip_verify: true}`. This sink appends `/event` and `/ack` itself, so a URL ending in a route (`/event`, `/raw`, `/ack`, `/health`) is rejected.",
+              "type": "string"
+            },
+            "idle_timeout": {
+              "description": "How long a pooled connection may sit idle before this sink closes it instead of reusing it. Keep it below the destination's keep-alive idle timeout, so this sink closes an idle connection before the destination does: a write sent on a connection the destination has already closed has an unknown outcome, resent under `buffer.delivery: at_least_once` and dropped under `at_most_once`. Keep it above the interval between this sink's batches if the connection should be reused; a sink that sends less often opens a new connection, with its handshake, for each batch. Defaults to `30s`, below the 60 s and longer idle timeouts of the common destinations (`docs/deploying.md`, \"Idle connections\"); lower it for a destination that closes sooner, such as a Node.js, Apache, or uvicorn server at its 5 s default. `0s` never reuses an idle connection: every request opens its own.",
+              "default": "30s",
               "type": "string"
             },
             "max_body_bytes": {
@@ -4244,6 +4269,11 @@
               "additionalProperties": {
                 "type": "string"
               }
+            },
+            "idle_timeout": {
+              "description": "How long a pooled connection may sit idle before this sink closes it instead of reusing it. Keep it below the destination's keep-alive idle timeout, so this sink closes an idle connection before the destination does: a write sent on a connection the destination has already closed has an unknown outcome, resent under `buffer.delivery: at_least_once` and dropped under `at_most_once`. Keep it above the interval between this sink's batches if the connection should be reused; a sink that sends less often opens a new connection, with its handshake, for each batch. Defaults to `30s`, below the 60 s and longer idle timeouts of the common destinations (`docs/deploying.md`, \"Idle connections\"); lower it for a destination that closes sooner, such as a Node.js, Apache, or uvicorn server at its 5 s default. `0s` never reuses an idle connection: every request opens its own. Sender mode only.",
+              "default": "30s",
+              "type": "string"
             },
             "max_series": {
               "description": "A hard cap on distinct series held in the registry; over it, the least-recently-updated series is evicted to admit a new one, counted `logit.output.series.evicted{reason=\"cardinality\"}`. Defaults to `100000`; `0` is rejected. Registry mode only.",

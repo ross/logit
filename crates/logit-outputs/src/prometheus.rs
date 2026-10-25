@@ -305,7 +305,7 @@
 use crate::accounting::BatchAccounting;
 use crate::http::{
     body_snippet, build_client, classify_reqwest_error, classify_status, Exchange, Reply, Slots,
-    ERROR_BODY_SNIPPET_BYTES,
+    DEFAULT_IDLE_TIMEOUT, ERROR_BODY_SNIPPET_BYTES,
 };
 /// The sender's `endpoint_tls:`: the shared `crate::tls` type, re-exported as the other sinks do.
 pub use crate::tls::TlsClientSettings;
@@ -915,6 +915,8 @@ pub struct RemoteWriteOutput {
     /// `accounting`'s gate (the module doc's "Concurrency" paragraph). A task's outcome is
     /// the samples its body carries and the receiver's answer.
     slots: Slots<(u64, Exchange)>,
+    /// The operator's `idle_timeout:` ([`crate::http::build_client`]).
+    idle_timeout: Duration,
 }
 
 impl RemoteWriteOutput {
@@ -928,7 +930,8 @@ impl RemoteWriteOutput {
             version: remote_write::Version::V1,
             encoding: Encoding::Snappy,
             request_timeout: DEFAULT_ENDPOINT_TIMEOUT,
-            client: build_client(DEFAULT_ENDPOINT_TIMEOUT, None),
+            client: build_client(DEFAULT_ENDPOINT_TIMEOUT, DEFAULT_IDLE_TIMEOUT, None),
+            idle_timeout: DEFAULT_IDLE_TIMEOUT,
             headers: HeaderMap::new(),
             tls: None,
             encoder: new_sender_encoder(&telemetry, &diag, accounting.gate()),
@@ -956,11 +959,20 @@ impl RemoteWriteOutput {
         self
     }
 
+    /// How long a pooled connection may sit idle before it's closed instead of reused
+    /// (`idle_timeout:` in config, default [`crate::http::DEFAULT_IDLE_TIMEOUT`]). Rebuilds the
+    /// client.
+    pub fn with_idle_timeout(mut self, idle_timeout: Duration) -> Self {
+        self.idle_timeout = idle_timeout;
+        self.client = build_client(self.request_timeout, idle_timeout, self.tls.as_ref());
+        self
+    }
+
     /// Per-request timeout (`timeout:`). The per-request `.timeout(..)` in `send` is what bounds
     /// a request; the client is rebuilt so its default agrees.
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.request_timeout = timeout;
-        self.client = build_client(timeout, self.tls.as_ref());
+        self.client = build_client(timeout, self.idle_timeout, self.tls.as_ref());
         self
     }
 
@@ -1018,7 +1030,7 @@ impl RemoteWriteOutput {
             &self.diag,
             &self.telemetry,
         )?;
-        self.client = build_client(self.request_timeout, Some(&cfg));
+        self.client = build_client(self.request_timeout, self.idle_timeout, Some(&cfg));
         self.tls = Some(cfg);
         Ok(self)
     }

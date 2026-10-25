@@ -211,7 +211,8 @@
 use crate::accounting::BatchAccounting;
 use crate::http::{
     body_snippet, build_client, classify_reqwest_error, read_body_prefix, split_encode,
-    status_class, Caps, Encoded, Journal, Outcomes, Slots, ERROR_BODY_SNIPPET_BYTES,
+    status_class, Caps, Encoded, Journal, Outcomes, Slots, DEFAULT_IDLE_TIMEOUT,
+    ERROR_BODY_SNIPPET_BYTES,
 };
 /// `tls:`: the shared `crate::tls` type, re-exported as the other sinks do.
 pub use crate::tls::TlsClientSettings;
@@ -220,7 +221,7 @@ use bytes::Bytes;
 use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use http_body_util::{BodyExt, Full};
 use hyper_util::client::legacy::Client as HyperClient;
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::rt::TokioIo;
 use logit_core::{redact, Diagnostics, EventBatch, Resource, Telemetry, Value};
 use logit_pipeline::{BatchContext, DeliveryPosture, Fault, Output, SeqId};
 pub use logit_proto::datadog::traces_msgpack::TracerApiForm;
@@ -376,11 +377,13 @@ struct Reply {
 }
 
 impl Client {
-    fn unix(path: PathBuf) -> Self {
+    /// A pooled client on the Agent's socket, closing a connection idle past `idle_timeout`
+    /// ([`crate::http::hyper_client_builder`]).
+    fn unix(path: PathBuf, idle_timeout: Duration) -> Self {
         let path: Arc<Path> = Arc::from(path);
         let connector = UnixConnector { path: Arc::clone(&path) };
         Self::Unix {
-            client: Box::new(HyperClient::builder(TokioExecutor::new()).build(connector)),
+            client: Box::new(crate::http::hyper_client_builder(idle_timeout).build(connector)),
             path,
         }
     }
@@ -508,6 +511,8 @@ pub struct DatadogTraceOutput {
     headers: HeaderMap,
     /// Built by [`DatadogTraceOutput::with_tls`]; `None` keeps `reqwest`'s default trust.
     tls: Option<rustls::ClientConfig>,
+    /// The operator's `idle_timeout:` ([`crate::http::build_client`]).
+    idle_timeout: Duration,
     /// Counts through views of `telemetry`/`diag` gated by `accounting`
     /// ([`DatadogTraceOutput::new_encoder`]).
     encoder: DatadogEncoder,
@@ -538,6 +543,7 @@ impl DatadogTraceOutput {
             version: TracerApiForm::V04,
             compression: DatadogTraceCompression::default(),
             request_timeout: DEFAULT_TIMEOUT,
+            idle_timeout: DEFAULT_IDLE_TIMEOUT,
             headers: HeaderMap::new(),
             tls: None,
             encoder: DatadogEncoder::new(),
@@ -555,12 +561,13 @@ impl DatadogTraceOutput {
     /// trailing `/` is dropped.
     pub fn http(endpoint: impl Into<String>) -> Self {
         let base = endpoint.into().trim_end_matches('/').to_string();
-        Self::with_client(Client::Http { client: build_client(DEFAULT_TIMEOUT, None), base })
+        let client = build_client(DEFAULT_TIMEOUT, DEFAULT_IDLE_TIMEOUT, None);
+        Self::with_client(Client::Http { client, base })
     }
 
     /// Sends to the Agent's Unix socket at `path` (`socket:`).
     pub fn unix(path: impl Into<PathBuf>) -> Self {
-        Self::with_client(Client::unix(path.into()))
+        Self::with_client(Client::unix(path.into(), DEFAULT_IDLE_TIMEOUT))
     }
 
     /// The trace form (`version:`).
@@ -580,12 +587,27 @@ impl DatadogTraceOutput {
         self
     }
 
+    /// How long a pooled connection may sit idle before it's closed instead of reused
+    /// (`idle_timeout:` in config, default [`crate::http::DEFAULT_IDLE_TIMEOUT`]). Rebuilds the
+    /// client.
+    pub fn with_idle_timeout(mut self, idle_timeout: Duration) -> Self {
+        self.idle_timeout = idle_timeout;
+        self.client = match &self.client {
+            Client::Http { base, .. } => Client::Http {
+                client: build_client(self.request_timeout, idle_timeout, self.tls.as_ref()),
+                base: base.clone(),
+            },
+            Client::Unix { path, .. } => Client::unix(path.to_path_buf(), idle_timeout),
+        };
+        self
+    }
+
     /// Per-request timeout (`timeout:`). An HTTP client is rebuilt so its default agrees with the
     /// per-request `.timeout(..)` that bounds each request.
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.request_timeout = timeout;
         if let Client::Http { client, .. } = &mut self.client {
-            *client = build_client(timeout, self.tls.as_ref());
+            *client = build_client(timeout, self.idle_timeout, self.tls.as_ref());
         }
         self
     }
@@ -645,7 +667,7 @@ impl DatadogTraceOutput {
             &self.telemetry,
         )?;
         if let Client::Http { client, .. } = &mut self.client {
-            *client = build_client(self.request_timeout, Some(&cfg));
+            *client = build_client(self.request_timeout, self.idle_timeout, Some(&cfg));
         }
         self.tls = Some(cfg);
         Ok(self)

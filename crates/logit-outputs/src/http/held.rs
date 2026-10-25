@@ -582,6 +582,8 @@ pub(crate) struct Mux {
     /// (`None` over plaintext or when none was picked).
     requests: Arc<Mutex<Vec<Carrier>>>,
     open: Arc<std::sync::atomic::AtomicUsize>,
+    /// Connections that have ended, whichever side closed them.
+    closed: Arc<std::sync::atomic::AtomicUsize>,
     release: tokio::sync::watch::Sender<bool>,
 }
 
@@ -604,8 +606,15 @@ impl Mux {
         let scheme = if tls.is_some() { "https" } else { "http" };
         let url = format!("{scheme}://{}", listener.local_addr().unwrap());
         let (release, _) = tokio::sync::watch::channel(false);
-        let mux = Self { url, requests: Arc::default(), open: Arc::default(), release };
+        let mux = Self {
+            url,
+            requests: Arc::default(),
+            open: Arc::default(),
+            closed: Arc::default(),
+            release,
+        };
         let (requests, open) = (Arc::clone(&mux.requests), Arc::clone(&mux.open));
+        let closed = Arc::clone(&mux.closed);
         let release = mux.release.subscribe();
         let acceptor = tls.map(tokio_rustls::TlsAcceptor::from);
         tokio::spawn(async move {
@@ -618,16 +627,18 @@ impl Mux {
                     open: Arc::clone(&open),
                     release: release.clone(),
                 };
-                let acceptor = acceptor.clone();
+                let (acceptor, closed) = (acceptor.clone(), Arc::clone(&closed));
                 tokio::spawn(async move {
                     match acceptor {
                         Some(acceptor) => {
-                            let Ok(stream) = acceptor.accept(stream).await else { return };
-                            conn.alpn = stream.get_ref().1.alpn_protocol().map(<[u8]>::to_vec);
-                            serve_mux(stream, conn).await;
+                            if let Ok(stream) = acceptor.accept(stream).await {
+                                conn.alpn = stream.get_ref().1.alpn_protocol().map(<[u8]>::to_vec);
+                                serve_mux(stream, conn).await;
+                            }
                         }
                         None => serve_mux(stream, conn).await,
                     }
+                    closed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 });
             }
         });
@@ -641,6 +652,11 @@ impl Mux {
     /// Requests received and not yet answered.
     pub(crate) fn open(&self) -> usize {
         self.open.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Connections that have ended, closed by either side.
+    pub(crate) fn closed(&self) -> usize {
+        self.closed.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Each connection that carried a request, by accept order, with its ALPN protocol.

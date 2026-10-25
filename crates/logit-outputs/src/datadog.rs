@@ -335,7 +335,7 @@ use crate::http::classify_status;
 use crate::http::{
     build_client, classify_reqwest_error, error_read_bytes, read_body_bytes, read_body_prefix,
     read_varint, redacted_snippet, skip_field, split_encode, status_class, Caps, Encoded, Journal,
-    Outcomes, Slots,
+    Outcomes, Slots, DEFAULT_IDLE_TIMEOUT,
 };
 /// `tls:`: the shared `crate::tls` type, re-exported as the other sinks do.
 pub use crate::tls::TlsClientSettings;
@@ -869,6 +869,8 @@ pub struct DatadogOutput {
     headers: HeaderMap,
     /// Built by [`DatadogOutput::with_tls`]; `None` keeps `reqwest`'s default trust.
     tls: Option<rustls::ClientConfig>,
+    /// The operator's `idle_timeout:` ([`crate::http::build_client`]).
+    idle_timeout: Duration,
     default_host: Option<Arc<str>>,
     histograms: HistogramOptions,
     /// Counts through views of `telemetry`/`diag` gated by `accounting`
@@ -913,7 +915,8 @@ impl DatadogOutput {
             endpoints: DatadogEndpoints::default(),
             compression: DatadogCompression::default(),
             request_timeout: DEFAULT_TIMEOUT,
-            client: build_client(DEFAULT_TIMEOUT, None),
+            client: build_client(DEFAULT_TIMEOUT, DEFAULT_IDLE_TIMEOUT, None),
+            idle_timeout: DEFAULT_IDLE_TIMEOUT,
             headers: HeaderMap::new(),
             tls: None,
             default_host: None,
@@ -971,11 +974,20 @@ impl DatadogOutput {
         self
     }
 
+    /// How long a pooled connection may sit idle before it's closed instead of reused
+    /// (`idle_timeout:` in config, default [`crate::http::DEFAULT_IDLE_TIMEOUT`]). Rebuilds the
+    /// client.
+    pub fn with_idle_timeout(mut self, idle_timeout: Duration) -> Self {
+        self.idle_timeout = idle_timeout;
+        self.client = build_client(self.request_timeout, idle_timeout, self.tls.as_ref());
+        self
+    }
+
     /// Per-request timeout (`timeout:`). The client is rebuilt so its default agrees with the
     /// per-request `.timeout(..)` that bounds each request.
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.request_timeout = timeout;
-        self.client = build_client(timeout, self.tls.as_ref());
+        self.client = build_client(timeout, self.idle_timeout, self.tls.as_ref());
         self
     }
 
@@ -1029,7 +1041,7 @@ impl DatadogOutput {
             &self.diag,
             &self.telemetry,
         )?;
-        self.client = build_client(self.request_timeout, Some(&cfg));
+        self.client = build_client(self.request_timeout, self.idle_timeout, Some(&cfg));
         self.tls = Some(cfg);
         Ok(self)
     }
