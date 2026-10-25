@@ -2306,6 +2306,7 @@ fn to_tls_client_settings(
         cert_file: tls.cert_file.clone(),
         key_file: tls.key_file.clone(),
         insecure_skip_verify: tls.insecure_skip_verify,
+        server_name: tls.server_name.clone(),
     }
 }
 
@@ -6417,6 +6418,40 @@ mod tests {
         };
         assert!(err.contains("component 'out'"), "got: {err}");
         assert!(err.contains(endpoint), "got: {err}");
+    }
+
+    /// `tls.server_name` reaches the sink through `to_tls_client_settings`: one that doesn't
+    /// parse fails startup naming the field and the component.
+    #[test]
+    fn an_unparsable_tls_server_name_fails_startup() {
+        let cfg = config(vec![
+            ("in", statsd_in()),
+            (
+                "out",
+                Component {
+                    buffer: logit_config::BufferConfig::default(),
+                    receive: logit_config::ReceiveConfig::default(),
+                    sources: vec!["in".to_string()],
+                    targets: Vec::new(),
+                    kind: ComponentKind::LogitOut {
+                        endpoint: "127.0.0.1:5140".to_string(),
+                        compression: logit_config::Compression::None,
+                        tls: Some(logit_config::TlsClientConfig {
+                            server_name: Some("not a name".to_string()),
+                            ..Default::default()
+                        }),
+                        request_timeout: Duration::from_secs(10),
+                        window: 32,
+                    },
+                },
+            ),
+        ]);
+        let err = match prepare(cfg, testdata_tls_dir(), None, &TlsReloader::new()) {
+            Ok(_) => panic!("expected an unparsable server_name to fail startup"),
+            Err(err) => format!("{err:#}"),
+        };
+        assert!(err.contains("component 'out'"), "got: {err}");
+        assert!(err.contains("tls.server_name"), "got: {err}");
     }
 
     /// A TLS endpoint whose host is no valid server name is a startup error that names the
