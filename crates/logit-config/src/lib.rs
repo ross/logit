@@ -2788,8 +2788,8 @@ pub enum ComponentKind {
         /// `logit.transform.metrics.overflowed`, never as dropped, and
         /// `logit.transform.metrics.overflowing` reports how many metric names had a metric
         /// past the limit since the last flush; a throttled warning names the worst one and the
-        /// attribute key with the most distinct values among its series. A `keep` placed after this component removes
-        /// `logit.overflow` unless it lists it.
+        /// attribute key with the most distinct values among its series. A `keep` placed after
+        /// this component removes `logit.overflow` unless it lists it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         max_series_per_metric: Option<usize>,
         /// Whether a raw samples series (statsd `ms`/`h`/`d`) absorbs into this window as a

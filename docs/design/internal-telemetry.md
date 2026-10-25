@@ -1623,9 +1623,10 @@ amendment. A fold that changes a value's type counts
 `Diagnostics` keys: `series_retention_full` and `gauge_delta_unseeded` (mirroring the eviction and
 unseeded counters); `series_limit` and `series_limit_evicted` (a full `max_series` dropping a
 record, and evicting a retained series to make room); `series_per_metric_overflow` (a record
-that reached `max_series_per_metric`, naming the overflowing metric with the most records
-past the limit since the last flush, the attribute key with the most distinct values among its
-series, never a value, and how many other names had a record past the limit; the text is built only when the throttle reports it);
+that reached `max_series_per_metric`, naming the overflowing metric with the most records past
+the limit since the last flush, the attribute key with the most distinct values among its series,
+never a value, and how many other names had a record past the limit; the text is built only when
+the throttle reports it);
 `samples_rate_mismatch`,
 `samples_cap_exceeded`, `set_members_cap_exceeded`, and `sample_rate_clamped` (mirroring the
 raw-retention counters); `kind_conflict` (a metric whose kind conflicts with an already-accumulating

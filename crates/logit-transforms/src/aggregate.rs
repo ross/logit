@@ -51,10 +51,10 @@
 //! and it's evicted last by both the flush cap and an admission eviction. A record whose kind
 //! conflicts with the overflow series passes through as `kind_conflict`. A folded record counts as
 //! `absorbed` and `logit.transform.metrics.overflowed`, never `*.dropped`; `flush` reports how
-//! many names had a record past their limit that window as `logit.transform.metrics.overflowing`, and only the
-//! throttled `series_per_metric_overflow` diagnostic names a metric. A record absorbed into an
-//! upstream overflow series isn't a fold here and counts toward neither. With the limit off, no
-//! name is counted and nothing on the hot path changes.
+//! many names had a record past their limit that window as `logit.transform.metrics.overflowing`,
+//! and only the throttled `series_per_metric_overflow` diagnostic names a metric. A record absorbed
+//! into an upstream overflow series isn't a fold here and counts toward neither. With the limit
+//! off, no name is counted and nothing on the hot path changes.
 //!
 //! # Temporality: what a flushed `Sum`/`Histogram` means
 //!
@@ -632,7 +632,8 @@ struct SeriesBudget {
     per_name: Option<usize>,
     /// The held series per metric name, overflow series excluded, under `per_name` only. A name
     /// enters when one of its series is admitted, never when it's refused, so the map holds at
-    /// most `max` names plus that window's admission evictions. `flush` rebuilds it from its survivors, keeping the allocation.
+    /// most `max` names plus that window's admission evictions. `flush` rebuilds it from its
+    /// survivors, keeping the allocation.
     names: HashMap<Symbol, NameCount>,
 }
 
@@ -2043,9 +2044,9 @@ impl OverflowKey {
 }
 
 /// The text of the `series_per_metric_overflow` diagnostic: the overflowing name with the most
-/// records folded since the last flush (every overflowing name holds the limit's count of series,
-/// so the series count can't rank them), the attribute key whose values differ most among that
-/// name's held series, and how many other names are overflowing. Names and keys only: an
+/// records past its limit since the last flush (every overflowing name holds the limit's count of
+/// series, so the series count can't rank them), the attribute key whose values differ most among
+/// that name's held series, and how many other names are overflowing. Names and keys only: an
 /// attribute value never appears.
 struct OverflowReport {
     limit: usize,
@@ -6739,8 +6740,9 @@ mod tests {
         assert_eq!(agg.overflow_reports_built, 0, "muted");
     }
 
-    /// The diagnostic names the name with the most folds and the attribute key whose values
-    /// differ most among its series, never a value, and counts the other overflowing names.
+    /// The diagnostic names the name with the most records past its limit and the attribute key
+    /// whose values differ most among its series, never a value, and counts the other overflowing
+    /// names.
     #[test]
     fn the_overflow_diagnostic_names_the_worst_metric_and_its_widest_key() {
         use tracing_subscriber::layer::SubscriberExt as _;

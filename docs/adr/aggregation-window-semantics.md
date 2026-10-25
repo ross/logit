@@ -1,6 +1,6 @@
 ---
 created: 2026-08-29
-updated: 2026-10-24
+updated: 2026-10-25
 ---
 
 # `aggregate` transform: tumbling windows, pass-through, and the flush-tick contract
@@ -1187,7 +1187,8 @@ in a throttled diagnostic, a log event that reaches the pipeline through `intern
 names the overflowing name with the most records past its limit since the last flush (every
 overflowing name holds the limit's count of series, so the series count can't rank them), the
 attribute key with the most distinct values among that name's series (keys only, never values),
-and how many other names are overflowing. The scan behind it runs only when the throttled diagnostic will emit.
+and how many other names are overflowing. The scan behind it runs only when the throttled
+diagnostic will emit.
 
 The name-to-count map is an allocation-strategy change, so it's measured with the existing
 `aggregate` benches and perf scenarios
