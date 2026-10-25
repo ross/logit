@@ -9,8 +9,9 @@ Regenerate with `./regen.sh` (see that script's own comment for why and when). I
 name: `./regen.sh rotation` regenerates only the reload tests' set and leaves the rest alone.
 Every key is an unencrypted PKCS#8 EC P-256 key, and every certificate except `utctime.pem` is
 valid for 100 years (the `base` set from 2026-09-03 to 2126-08-10, the `rotation` set from
-2026-10-07 to 2126-09-13), so don't regenerate these for expiry; regenerate only when a test needs
-a different shape, such as a new SAN or a new mutual-TLS case.
+2026-10-07 to 2126-09-13, and the `named` set from 2026-10-25 to 2126-10-01), so don't regenerate
+these for expiry; regenerate only when a test needs a different shape, such as a new SAN or a new
+mutual-TLS case.
 
 | File | What |
 |---|---|
@@ -21,4 +22,5 @@ a different shape, such as a new SAN or a new mutual-TLS case.
 | `server-b.pem` / `server-b.key` | A second leaf signed by `ca.pem`, same subject and SANs as `server.pem`: a renewed certificate, for reload tests. |
 | `server-other.pem` / `server-other.key` | Leaf signed by `other-ca.pem`, same subject and SANs as `server.pem`, for a client whose trusted CA rotates. |
 | `client-other.pem` / `client-other.key` | Leaf signed by `other-ca.pem` (`CN=logit-other-test-client`), for a listener whose `client_ca_file` rotates. |
+| `server-named.pem` / `server-named.key` | Leaf signed by `ca.pem` (`CN=logit.test`), whose only SAN is `DNS:logit.test`, so a client dialing `localhost` or `127.0.0.1` verifies it only against a configured `server_name` (the `named` group). |
 | `utctime.pem` | Self-signed (`CN=logit-utctime`), valid from 2026-01-01 to 2049-12-31T23:59:59Z. A `notAfter` before 2050 is encoded as `UTCTime`, so it tests the expiry reader's `UTCTime` branch. Its key isn't kept. |
