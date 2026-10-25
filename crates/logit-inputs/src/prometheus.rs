@@ -4869,4 +4869,122 @@ mod tests {
             }
         }
     }
+
+    // ---- bind mode: `bind_auth:` ----------------------------------------------------------------
+
+    /// A receiver requiring bearer `token-a` or basic `alice`/`pa:ss`, reporting on `probe`.
+    async fn auth_receiver(
+        probe: &mut logit_pipeline::test_util::TelemetryProbe,
+    ) -> (PrometheusReceiver, String) {
+        let telemetry = probe.telemetry("prometheus_in", "prometheus_in", "listener");
+        let (receiver, addr) = bound_receiver("/api/v1/write").await;
+        let receiver = receiver
+            .with_diagnostics(Diagnostics::new("prometheus_in").with_telemetry(telemetry.clone()))
+            .with_telemetry(telemetry)
+            .with_auth(Credentials::new(["token-a"], [("alice", "pa:ss")]));
+        (receiver, addr)
+    }
+
+    fn basic_header(username: &str, password: &str) -> String {
+        format!("Basic {}", logit_proto::auth::basic_credential(username, password))
+    }
+
+    fn one_gauge_body(version: remote_write::Version) -> Vec<u8> {
+        request_body(&[vec![gauge_family("up", ("job", "a"), 1.0, millis(1_000))]], version)
+    }
+
+    /// Prometheus's `authorization:` and `basic_auth:` spellings are both accepted, the scheme in
+    /// any case, a password holding `:` included.
+    #[tokio::test]
+    async fn a_write_with_a_configured_credential_is_accepted() {
+        let mut probe = logit_pipeline::test_util::TelemetryProbe::new();
+        let (receiver, addr) = auth_receiver(&mut probe).await;
+        let mut rx = spawn_receiver(receiver, 16);
+        let version = remote_write::Version::V1;
+
+        let basic = basic_header("alice", "pa:ss");
+        for authorization in ["Bearer token-a", "BEARER token-a", basic.as_str()] {
+            let headers = format!("{}Authorization: {authorization}\r\n", write_headers(version));
+            let response =
+                post_raw(&addr, "/api/v1/write", &headers, &one_gauge_body(version)).await;
+            assert!(response.starts_with("HTTP/1.1 204"), "{authorization:?} got: {response}");
+            recv_batch(&mut rx).await;
+        }
+        assert_eq!(probe.sum("logit.input.requests.rejected", &[("reason", "auth")]), 0.0);
+        assert_eq!(probe.sum("logit.input.writes", &[("class", "unauthorized")]), 0.0);
+    }
+
+    /// A missing, wrong, or other-scheme credential is a `401` naming both schemes, counted as a
+    /// rejection, as a write of class `unauthorized`, and under `write_rejected`, and delivers
+    /// nothing. A 2.0 write's `401` still reports what it stored: zero.
+    #[tokio::test]
+    async fn a_write_without_a_configured_credential_is_401() {
+        let mut probe = logit_pipeline::test_util::TelemetryProbe::new();
+        let (receiver, addr) = auth_receiver(&mut probe).await;
+        let mut rx = spawn_receiver(receiver, 16);
+
+        let cases = [
+            (remote_write::Version::V1, None),
+            (remote_write::Version::V1, Some("Bearer token-b".to_string())),
+            (remote_write::Version::V1, Some(basic_header("alice", "wrong"))),
+            (remote_write::Version::V1, Some("Token token-a".to_string())),
+            (remote_write::Version::V2, None),
+        ];
+        for (version, authorization) in &cases {
+            let mut headers = write_headers(*version);
+            if let Some(authorization) = authorization {
+                headers.push_str(&format!("Authorization: {authorization}\r\n"));
+            }
+            let response =
+                post_raw(&addr, "/api/v1/write", &headers, &one_gauge_body(*version)).await;
+            assert!(response.starts_with("HTTP/1.1 401"), "{authorization:?} got: {response}");
+            let lower = response.to_ascii_lowercase();
+            assert!(lower.contains("www-authenticate: basic realm=\"logit\""), "{response}");
+            assert!(lower.contains("www-authenticate: bearer"), "{response}");
+            let written =
+                lower.contains(&remote_write::HEADER_SAMPLES_WRITTEN.to_ascii_lowercase());
+            assert_eq!(written, *version == remote_write::Version::V2, "{response}");
+        }
+        let rejected = cases.len() as f64;
+        assert_eq!(probe.sum("logit.input.requests.rejected", &[("reason", "auth")]), rejected);
+        assert_eq!(probe.sum("logit.input.writes", &[("class", "unauthorized")]), rejected);
+        assert_eq!(
+            probe.sum("logit.component.diagnostics", &[("key", "write_rejected")]),
+            rejected
+        );
+        assert!(rx.try_recv().is_err(), "a refused write delivered a batch");
+    }
+
+    /// The credential is checked before the body is read: a write declaring a body over the cap
+    /// and sending none of it gets its `401` at once, and a body that isn't Snappy is a `401`,
+    /// never the `400` it earns.
+    #[tokio::test]
+    async fn a_write_is_authenticated_before_its_body_is_read() {
+        use tokio::io::AsyncWriteExt;
+        let mut probe = logit_pipeline::test_util::TelemetryProbe::new();
+        let (receiver, addr) = auth_receiver(&mut probe).await;
+        let _rx = spawn_receiver(receiver, 16);
+        let headers = keep_alive_write_headers(remote_write::Version::V1);
+
+        let mut stream = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        let head = format!(
+            "POST /api/v1/write HTTP/1.1\r\nHost: {addr}\r\nContent-Length: {}\r\n{headers}\r\n",
+            MAX_REQUEST_BYTES + 1
+        );
+        stream.write_all(head.as_bytes()).await.unwrap();
+        let response = crate::http::read_response(&mut stream, "an unsent oversized body").await;
+        assert!(response.starts_with("HTTP/1.1 401"), "got: {response}");
+
+        let mut stream = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        let body = b"not snappy";
+        let request = format!(
+            "POST /api/v1/write HTTP/1.1\r\nHost: {addr}\r\nContent-Length: {}\r\n{headers}\
+             Authorization: Bearer token-b\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+        stream.write_all(body).await.unwrap();
+        let response = crate::http::read_response(&mut stream, "a body that isn't Snappy").await;
+        assert!(response.starts_with("HTTP/1.1 401"), "got: {response}");
+    }
 }

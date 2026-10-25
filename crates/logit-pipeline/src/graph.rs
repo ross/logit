@@ -15363,6 +15363,100 @@ mod tests {
         assert!(err.contains("'reuse_port' shares the exposition's listening port"), "got: {err}");
     }
 
+    /// Rule 55: `bind_auth` belongs to the remote-write receiver; a scrape client serves nothing.
+    #[test]
+    fn rule_55_rejects_bind_auth_on_a_scrape_client() {
+        let kind = listener_from_json(
+            r#"{"type": "prometheus_in", "scrape_targets": ["http://node-exporter:9100/metrics"],
+                "bind_auth": {"bearer_tokens": ["t"]}}"#,
+        );
+        let err = expect_err(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]));
+        assert!(err.contains("'bind_auth' configures the remote-write receiver"), "got: {err}");
+    }
+
+    /// Rule 56: `bind_tls` and `bind_auth` belong to the exposition; a remote-write sender
+    /// listens on nothing.
+    #[test]
+    fn rule_56_rejects_bind_tls_and_bind_auth_on_a_remote_write_sender() {
+        for (field, value, expected) in [
+            ("bind_tls", r#"{"cert_file": "c.pem", "key_file": "k.pem"}"#, "'bind_tls' terminates"),
+            (
+                "bind_auth",
+                r#"{"basic": [{"username": "u", "password": "p"}]}"#,
+                "'bind_auth' checks",
+            ),
+        ] {
+            let out = listener_from_json(&format!(
+                r#"{{"type": "prometheus_out", "endpoint": "http://vm:8428/api/v1/write",
+                    "{field}": {value}}}"#
+            ));
+            let err = expect_err(cfg(vec![("in", vec![], listener()), ("out", vec!["in"], out)]));
+            assert!(err.contains(expected), "{field}: got: {err}");
+        }
+    }
+
+    /// Rule 56: an exposition takes `bind_tls` and `bind_auth`.
+    #[test]
+    fn rule_56_accepts_bind_tls_and_bind_auth_on_an_exposition() {
+        let out = listener_from_json(
+            r#"{"type": "prometheus_out", "bind": "127.0.0.1:9464",
+                "bind_tls": {"cert_file": "c.pem", "key_file": "k.pem"},
+                "bind_auth": {"bearer_tokens": ["t"], "basic": [{"username": "u", "password": "p"}]}}"#,
+        );
+        resolve(cfg(vec![("in", vec![], listener()), ("out", vec!["in"], out)]))
+            .expect("an exposition with TLS and credentials resolves");
+    }
+
+    /// Rule 97: an empty token, username, or password, or a whitespace-padded token, could never
+    /// match, on each kind that takes credentials. The message names the entry, never its value.
+    #[test]
+    fn rule_97_rejects_a_credential_that_could_never_match() {
+        let cases = [
+            (r#"{"bearer_tokens": ["good", ""]}"#, "'AUTH.bearer_tokens' entry 1 is empty"),
+            (r#"{"bearer_tokens": ["s3cret\n"]}"#, "leading or trailing whitespace"),
+            (r#"{"basic": [{"username": "", "password": "s3cret"}]}"#, "empty username"),
+            (r#"{"basic": [{"username": "u", "password": ""}]}"#, "empty password"),
+        ];
+        for (auth, expected) in cases {
+            let otlp_in =
+                format!(r#"{{"type": "otlp_in", "bind": "0.0.0.0:4318", "auth": {auth}}}"#);
+            let prometheus_in = format!(
+                r#"{{"type": "prometheus_in", "bind": "0.0.0.0:9090", "bind_auth": {auth}}}"#
+            );
+            for (json, field) in [(otlp_in, "auth"), (prometheus_in, "bind_auth")] {
+                let config = cfg(vec![
+                    ("in", vec![], listener_from_json(&json)),
+                    ("out", vec!["in"], sink()),
+                ]);
+                let err = expect_err(config);
+                assert!(err.contains(&expected.replace("AUTH", field)), "{json}: got: {err}");
+                assert!(!err.contains("s3cret"), "{json}: the message carries the value: {err}");
+            }
+            let out = listener_from_json(&format!(
+                r#"{{"type": "prometheus_out", "bind": "127.0.0.1:9464", "bind_auth": {auth}}}"#
+            ));
+            let err = expect_err(cfg(vec![("in", vec![], listener()), ("out", vec!["in"], out)]));
+            assert!(err.contains(&expected.replace("AUTH", "bind_auth")), "got: {err}");
+        }
+    }
+
+    /// Rule 97: credentials with a password holding `:`, and empty lists, resolve.
+    #[test]
+    fn rule_97_accepts_well_formed_credentials_and_empty_lists() {
+        for auth in [
+            r#"{"bearer_tokens": ["t"], "basic": [{"username": "u", "password": "a:b"}]}"#,
+            r#"{"bearer_tokens": [], "basic": []}"#,
+            "{}",
+        ] {
+            let json = format!(r#"{{"type": "otlp_in", "bind": "0.0.0.0:4318", "auth": {auth}}}"#);
+            resolve(cfg(vec![
+                ("in", vec![], listener_from_json(&json)),
+                ("out", vec!["in"], sink()),
+            ]))
+            .unwrap_or_else(|err| panic!("{auth}: {err}"));
+        }
+    }
+
     /// Rule 80: a Unix socket has no port to share.
     #[test]
     fn rule_80_rejects_reuse_port_on_a_unix_transport() {

@@ -4647,6 +4647,120 @@ mod tests {
         drop(first);
     }
 
+    // ---- `auth`/`bind_auth` reach each listener that takes credentials -------------------------
+
+    /// `auth: {bearer_tokens: [token-a]}` as config spells it.
+    fn bearer_auth() -> logit_config::HttpAuthConfig {
+        logit_config::HttpAuthConfig { bearer_tokens: vec!["token-a".to_string()], basic: vec![] }
+    }
+
+    fn resolved(
+        kind: ComponentKind,
+        sources: Vec<String>,
+        consumers: Vec<String>,
+    ) -> ResolvedComponent {
+        ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
+            sources,
+            targets: Vec::new(),
+            consumers,
+            kind,
+        }
+    }
+
+    /// The status `method path` gets at `addr` carrying `authorization`, if any.
+    async fn status_of(method: &str, url: &str, authorization: Option<&str>) -> u16 {
+        let client = reqwest::Client::new();
+        let mut request = client.request(method.parse().unwrap(), url);
+        if let Some(authorization) = authorization {
+            request = request.header("authorization", authorization);
+        }
+        request.send().await.expect("the listener should answer").status().as_u16()
+    }
+
+    #[tokio::test]
+    async fn build_spec_wires_auth_into_each_listener_that_takes_it() {
+        let otlp = free_port().await;
+        let receiver = free_port().await;
+        let exposition = free_port().await;
+        let inputs = [
+            (
+                ComponentKind::OtlpIn {
+                    bind: otlp.clone(),
+                    protocol: logit_config::OtlpProtocol::Http,
+                    tls: None,
+                    auth: bearer_auth(),
+                    handshake_timeout: logit_config::default_handshake_timeout(),
+                    idle_timeout: None,
+                    max_connections: logit_config::default_max_connections(),
+                    peer: false,
+                    reuse_port: false,
+                    proxy_protocol: false,
+                    forwarded: None,
+                },
+                format!("http://{otlp}/v1/traces"),
+            ),
+            (
+                ComponentKind::PrometheusIn {
+                    scrape_targets: vec![],
+                    interval: logit_config::default_prometheus_scrape_interval(),
+                    timeout: logit_config::default_prometheus_scrape_timeout(),
+                    headers: HashMap::new(),
+                    scrape_tls: logit_config::TlsClientConfig::default(),
+                    bind: Some(receiver.clone()),
+                    path: "/api/v1/write".to_string(),
+                    bind_tls: None,
+                    bind_auth: bearer_auth(),
+                    idle_timeout: None,
+                    max_connections: logit_config::default_max_connections(),
+                    metadata_cache: logit_config::MetadataCacheConfig::default(),
+                    peer: false,
+                    proxy_protocol: false,
+                    forwarded: None,
+                    reuse_port: false,
+                },
+                format!("http://{receiver}/api/v1/write"),
+            ),
+        ];
+        for (kind, url) in inputs {
+            let component = resolved(kind, vec![], vec!["out".to_string()]);
+            let (spec, _) = build_spec("in", &component, Path::new(""), None).unwrap();
+            let NodeSpec::Input(mut input, _) = spec else { panic!("expected NodeSpec::Input") };
+            input.bind().await.expect("bind should succeed");
+            let (sink, rx) = logit_pipeline::test_util::fanout_channel(16);
+            tokio::spawn(async move {
+                let _consumer = rx;
+                input.run(sink).await
+            });
+            assert_eq!(status_of("POST", &url, None).await, 401, "{url}");
+            assert_ne!(status_of("POST", &url, Some("Bearer token-a")).await, 401, "{url}");
+        }
+
+        let kind = ComponentKind::PrometheusOut {
+            bind: Some(exposition.clone()),
+            path: logit_config::default_prometheus_path(),
+            expire_after: logit_config::default_prometheus_expire_after(),
+            max_series: logit_config::default_prometheus_max_series(),
+            bind_tls: None,
+            bind_auth: bearer_auth(),
+            endpoint: None,
+            version: logit_config::RemoteWriteVersion::default(),
+            compression: logit_config::RemoteWriteCompression::default(),
+            timeout: logit_config::default_prometheus_endpoint_timeout(),
+            headers: HashMap::new(),
+            endpoint_tls: logit_config::TlsClientConfig::default(),
+            reuse_port: false,
+        };
+        let component = resolved(kind, vec!["in".to_string()], vec![]);
+        let (spec, _) = build_spec("out", &component, Path::new(""), None).unwrap();
+        let NodeSpec::Output(mut output, _, _) = spec else { panic!("expected NodeSpec::Output") };
+        output.bind().await.expect("bind should succeed");
+        let url = format!("http://{exposition}/metrics");
+        assert_eq!(status_of("GET", &url, None).await, 401);
+        assert_eq!(status_of("GET", &url, Some("Bearer token-a")).await, 200);
+    }
+
     // ---- `idle_timeout` reaches each TCP listener that honours it -------------------------------
     //
     // As above, one phase later: a 50ms `idle_timeout` closes a client gone quiet after one frame.

@@ -3748,4 +3748,198 @@ mod tests {
             }
         }
     }
+
+    // ---- authentication: `auth:` ----------------------------------------------------------------
+
+    /// A listener requiring bearer `token-a` or basic `alice`/`pa:ss`, reporting on `probe`.
+    async fn auth_input(
+        transport: OtlpTransport,
+        probe: &mut logit_pipeline::test_util::TelemetryProbe,
+    ) -> (String, OtlpInput) {
+        let telemetry = probe.telemetry("otlp_in", "otlp_in", "listener");
+        let (addr, input) = bound_input(transport).await;
+        let input = input
+            .with_diagnostics(Diagnostics::new("otlp_in").with_telemetry(telemetry.clone()))
+            .with_telemetry(telemetry)
+            .with_auth(Credentials::new(["token-a"], [("alice", "pa:ss")]));
+        (addr, input)
+    }
+
+    fn basic_header(username: &str, password: &str) -> String {
+        format!("Basic {}", logit_proto::auth::basic_credential(username, password))
+    }
+
+    /// The `WWW-Authenticate` values of a raw HTTP/1.1 response, in order.
+    fn challenges(response: &str) -> Vec<&str> {
+        response
+            .lines()
+            .take_while(|line| !line.is_empty())
+            .filter_map(|line| line.split_once(':'))
+            .filter(|(name, _)| name.eq_ignore_ascii_case("www-authenticate"))
+            .map(|(_, value)| value.trim())
+            .collect()
+    }
+
+    /// Either configured credential is accepted, the scheme in any case, a password holding `:`
+    /// included, and nothing is counted as a rejection.
+    #[tokio::test]
+    async fn an_http_request_with_a_configured_credential_is_accepted() {
+        let mut probe = logit_pipeline::test_util::TelemetryProbe::new();
+        let (addr, mut input) = auth_input(OtlpTransport::Http, &mut probe).await;
+        let (sink, mut rx) = fanout_into_channel();
+        tokio::spawn(async move { input.run(sink).await });
+
+        for authorization in [
+            "Bearer token-a".to_string(),
+            "bEaReR   token-a ".to_string(),
+            basic_header("alice", "pa:ss"),
+            basic_header("alice", "pa:ss").replacen("Basic", "BASIC", 1),
+        ] {
+            let headers = format!(
+                "Content-Type: application/json\r\nAuthorization: {authorization}\r\n\
+                 Connection: close\r\n"
+            );
+            let response = post_raw(&addr, "/v1/traces", &headers, &one_span_json()).await;
+            assert!(response.starts_with("HTTP/1.1 200"), "{authorization:?} got: {response}");
+            logit_pipeline::test_util::recv_batch(&mut rx).await;
+        }
+        assert_eq!(probe.sum("logit.input.requests.rejected", &[("reason", "auth")]), 0.0);
+    }
+
+    /// A missing, wrong, or other-scheme credential is a `401` naming both configured schemes,
+    /// counted and diagnosed, and nothing reaches the fanout.
+    #[tokio::test]
+    async fn an_http_request_without_a_configured_credential_is_401() {
+        let mut probe = logit_pipeline::test_util::TelemetryProbe::new();
+        let (addr, mut input) = auth_input(OtlpTransport::Http, &mut probe).await;
+        let (sink, mut rx) = fanout_into_channel();
+        tokio::spawn(async move { input.run(sink).await });
+
+        let cases = [
+            None,
+            Some("Bearer token-b".to_string()),
+            Some("Bearer".to_string()),
+            Some("Token token-a".to_string()),
+            Some(basic_header("alice", "pa")),
+            Some(basic_header("bob", "pa:ss")),
+        ];
+        for authorization in &cases {
+            let mut headers = "Content-Type: application/json\r\nConnection: close\r\n".to_string();
+            if let Some(authorization) = authorization {
+                headers.push_str(&format!("Authorization: {authorization}\r\n"));
+            }
+            let response = post_raw(&addr, "/v1/traces", &headers, &one_span_json()).await;
+            assert!(response.starts_with("HTTP/1.1 401"), "{authorization:?} got: {response}");
+            assert_eq!(challenges(&response), [r#"Basic realm="logit""#, "Bearer"], "{response}");
+        }
+        let rejected = cases.len() as f64;
+        assert_eq!(probe.sum("logit.input.requests.rejected", &[("reason", "auth")]), rejected);
+        assert_eq!(
+            probe.sum("logit.component.diagnostics", &[("key", "request_rejected")]),
+            rejected
+        );
+        assert!(rx.try_recv().is_err(), "a refused request delivered a batch");
+    }
+
+    /// The credential is checked before the body is read. A request declaring a body over the
+    /// cap and sending none of it gets its `401` at once, where reading the body would wait on it,
+    /// and a body that doesn't inflate is a `401`, never the `400` it earns. The connection is
+    /// kept alive, so the response is read before anything closes it.
+    #[tokio::test]
+    async fn an_http_request_is_authenticated_before_its_body_is_read() {
+        let mut probe = logit_pipeline::test_util::TelemetryProbe::new();
+        let (addr, mut input) = auth_input(OtlpTransport::Http, &mut probe).await;
+        let (sink, _rx) = fanout_into_channel();
+        tokio::spawn(async move { input.run(sink).await });
+
+        let mut stream = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        let head = format!(
+            "POST /v1/traces HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/x-protobuf\r\n\
+             Content-Length: {}\r\n\r\n",
+            MAX_REQUEST_BYTES + 1
+        );
+        stream.write_all(head.as_bytes()).await.unwrap();
+        let response = crate::http::read_response(&mut stream, "an unsent oversized body").await;
+        assert!(response.starts_with("HTTP/1.1 401"), "got: {response}");
+
+        let mut stream = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        let body = b"not gzip";
+        let request = format!(
+            "POST /v1/traces HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/x-protobuf\r\n\
+             Content-Encoding: gzip\r\nAuthorization: Bearer token-b\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+        stream.write_all(body).await.unwrap();
+        let response = crate::http::read_response(&mut stream, "a bad gzip body").await;
+        assert!(response.starts_with("HTTP/1.1 401"), "got: {response}");
+    }
+
+    /// A listener with no `auth:` ignores whatever `Authorization` a request carries.
+    #[tokio::test]
+    async fn a_listener_without_auth_accepts_any_credential() {
+        let (addr, mut input) = bound_input(OtlpTransport::Http).await;
+        let (sink, mut rx) = fanout_into_channel();
+        tokio::spawn(async move { input.run(sink).await });
+
+        let headers = "Content-Type: application/json\r\nAuthorization: Bearer anything\r\n\
+                       Connection: close\r\n";
+        let response = post_raw(&addr, "/v1/traces", headers, &one_span_json()).await;
+        assert!(response.starts_with("HTTP/1.1 200"), "got: {response}");
+        logit_pipeline::test_util::recv_batch(&mut rx).await;
+    }
+
+    /// Sends one unary `Export` carrying `authorization` metadata when given, returning the
+    /// response's HTTP status, its headers, and its trailers.
+    async fn grpc_export_authorized(
+        addr: &str,
+        authorization: Option<&str>,
+    ) -> (StatusCode, HeaderMap, HeaderMap) {
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (mut sender, conn) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
+            .handshake(TokioIo::new(stream))
+            .await
+            .unwrap();
+        tokio::spawn(conn);
+        let mut req = http::Request::builder()
+            .method(Method::POST)
+            .uri(Signal::Traces.grpc_method())
+            .header("content-type", "application/grpc+proto")
+            .header("te", "trailers");
+        if let Some(authorization) = authorization {
+            req = req.header("authorization", authorization);
+        }
+        let body = Full::new(Bytes::from(grpc_message(false, &one_span_payload())));
+        let res = sender.send_request(req.body(body).unwrap()).await.unwrap();
+        let (status, headers) = (res.status(), res.headers().clone());
+        let collected = res.into_body().collect().await.unwrap();
+        (status, headers, collected.trailers().expect("should carry trailers").clone())
+    }
+
+    /// Over gRPC a refusal is status `16`, `UNAUTHENTICATED`, in trailers on an HTTP `200` with no
+    /// `WWW-Authenticate`, counted as on the HTTP side; a configured credential in `authorization`
+    /// metadata is accepted.
+    #[tokio::test]
+    async fn a_grpc_call_without_a_configured_credential_is_unauthenticated() {
+        let mut probe = logit_pipeline::test_util::TelemetryProbe::new();
+        let (addr, mut input) = auth_input(OtlpTransport::Grpc, &mut probe).await;
+        let (sink, mut rx) = fanout_into_channel();
+        tokio::spawn(async move { input.run(sink).await });
+
+        for authorization in [None, Some("Bearer token-b")] {
+            let (status, headers, trailers) = grpc_export_authorized(&addr, authorization).await;
+            assert_eq!(status, StatusCode::OK, "{authorization:?}");
+            assert_eq!(headers.get(http::header::WWW_AUTHENTICATE), None, "{authorization:?}");
+            assert_eq!(trailers.get("grpc-status").unwrap(), "16", "{authorization:?}");
+        }
+        assert_eq!(probe.sum("logit.input.requests.rejected", &[("reason", "auth")]), 2.0);
+        assert!(rx.try_recv().is_err(), "a refused call delivered a batch");
+
+        let basic = basic_header("alice", "pa:ss");
+        for authorization in ["Bearer token-a", basic.as_str()] {
+            let (_, _, trailers) = grpc_export_authorized(&addr, Some(authorization)).await;
+            assert_eq!(trailers.get("grpc-status").unwrap(), "0", "{authorization:?}");
+            logit_pipeline::test_util::recv_batch(&mut rx).await;
+        }
+    }
 }

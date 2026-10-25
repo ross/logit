@@ -8915,6 +8915,38 @@ mod tests {
         assert!(!format!("{sasl:?}").contains("static-token-value"));
     }
 
+    /// An `auth:` block parses both credential kinds, and its `Debug` prints counts only, so no
+    /// credential, username included, reaches a message built from a component.
+    #[test]
+    fn http_auth_parses_both_kinds_and_debug_redacts_every_credential() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "otlp_in", "bind": "0.0.0.0:4318", "auth": {
+                "bearer_tokens": ["token-secret"],
+                "basic": [{"username": "alice-name", "password": "pa:ss-secret"}]}}"#,
+        )
+        .unwrap();
+        let ComponentKind::OtlpIn { auth, .. } = &component.kind else { panic!("not otlp_in") };
+        assert_eq!(auth.bearer_tokens, ["token-secret"]);
+        assert_eq!(auth.basic[0].username, "alice-name");
+        assert_eq!(auth.basic[0].password, "pa:ss-secret");
+        assert!(!auth.is_empty());
+        let shown = format!("{component:?}");
+        for secret in ["token-secret", "alice-name", "pa:ss-secret"] {
+            assert!(!shown.contains(secret), "{shown}");
+        }
+        assert!(format!("{:?}", auth.basic[0]).contains("<redacted>"));
+    }
+
+    /// A typo inside `auth:` fails to parse rather than leaving the listener open.
+    #[test]
+    fn http_auth_rejects_an_unknown_field() {
+        for auth in [r#"{"bearer_token": ["t"]}"#, r#"{"basic": [{"user": "u", "password": "p"}]}"#]
+        {
+            let json = format!(r#"{{"type": "otlp_in", "bind": "0.0.0.0:4318", "auth": {auth}}}"#);
+            assert!(serde_json::from_str::<Component>(&json).is_err(), "{auth} parsed");
+        }
+    }
+
     /// The password stays out of `Debug`, and so out of any message built from a component.
     #[test]
     fn kafka_sasl_debug_redacts_the_password() {

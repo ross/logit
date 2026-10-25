@@ -3827,4 +3827,94 @@ mod tests {
             assert_eq!(sum_of(&sums, DUPLICATE.0, DUPLICATE.1), 1.0, "{later}");
         }
     }
+
+    // -- `bind_auth:` and `bind_tls:` --------------------------------------------------------
+
+    /// A registry requiring bearer `token-a` or basic `alice`/`pa:ss`, counting on `registry`.
+    fn auth_sink(registry: &logit_core::Registry) -> ExposeOutput {
+        ExposeOutput::new("127.0.0.1:0")
+            .with_auth(Credentials::new(["token-a"], [("alice", "pa:ss")]))
+            .with_telemetry(registry.telemetry_for("out", "prometheus_out", "sink"))
+    }
+
+    fn basic_header(username: &str, password: &str) -> String {
+        format!("Basic {}", logit_proto::auth::basic_credential(username, password))
+    }
+
+    /// Prometheus's `authorization:` and `basic_auth:` spellings each scrape; a missing, wrong,
+    /// or other-scheme credential is a `401` naming both schemes and counted `unauthorized`. The
+    /// route and method still answer first.
+    #[tokio::test]
+    async fn bind_auth_admits_a_configured_credential_and_refuses_the_rest() {
+        let registry = logit_core::Registry::new();
+        let (_sink, url) = bound(auth_sink(&registry)).await;
+        let metrics = format!("{url}/metrics");
+
+        let basic = basic_header("alice", "pa:ss");
+        for authorization in ["Bearer token-a", "bearer token-a", basic.as_str()] {
+            let response = get(&metrics, &[("authorization", authorization)]).await;
+            assert_eq!(response.status(), 200, "{authorization:?}");
+        }
+        let wrong = basic_header("alice", "pa");
+        let refused: [&[(&str, &str)]; 4] = [
+            &[],
+            &[("authorization", "Bearer token-b")],
+            &[("authorization", wrong.as_str())],
+            &[("authorization", "Token token-a")],
+        ];
+        for headers in refused {
+            let response = get(&metrics, headers).await;
+            assert_eq!(response.status(), 401, "{headers:?}");
+            let challenges: Vec<_> = response
+                .headers()
+                .get_all(http::header::WWW_AUTHENTICATE)
+                .iter()
+                .map(|value| value.to_str().unwrap())
+                .collect();
+            assert_eq!(challenges, [r#"Basic realm="logit""#, "Bearer"], "{headers:?}");
+        }
+        assert_eq!(get(&format!("{url}/nope"), &[]).await.status(), 404);
+        let posted = reqwest::Client::new().post(&metrics).send().await.unwrap();
+        assert_eq!(posted.status(), 405);
+
+        let drained = registry.drain(0);
+        assert_eq!(tagged(&drained, SCRAPES, "class", "ok"), 3.0);
+        assert_eq!(tagged(&drained, SCRAPES, "class", "unauthorized"), 4.0);
+        assert_eq!(tagged(&drained, SCRAPES, "class", "not_found"), 1.0);
+        assert_eq!(tagged(&drained, SCRAPES, "class", "method"), 1.0);
+    }
+
+    /// Under `bind_tls:` the exposition is served over TLS, with `bind_auth:` checked inside it.
+    #[tokio::test]
+    async fn bind_tls_serves_the_exposition_over_tls() {
+        let registry = logit_core::Registry::new();
+        let settings = TlsServerSettings {
+            cert_file: "server.pem".to_string(),
+            key_file: "server.key".to_string(),
+            client_ca_file: None,
+        };
+        let mut sink = auth_sink(&registry)
+            .with_expire_after(Duration::ZERO)
+            .with_bind_tls(&settings, &testdata_tls_dir(), &logit_pipeline::tls::TlsReloader::new())
+            .expect("the fixture certificate loads");
+        sink.send(&batch(vec![metric_event("hits", cumulative_counter(1.0), &[])])).await.unwrap();
+        sink.bind().await.expect("binding an ephemeral port should succeed");
+        let addr = sink.local_addr().expect("bind records the address");
+
+        let ca = std::fs::read(testdata_tls_dir().join("ca.pem")).unwrap();
+        let client = reqwest::Client::builder()
+            .add_root_certificate(reqwest::Certificate::from_pem(&ca).unwrap())
+            .resolve("localhost", addr)
+            .build()
+            .unwrap();
+        let url = format!("https://localhost:{}/metrics", addr.port());
+        let response = client.get(&url).bearer_auth("token-a").send().await.unwrap();
+        assert_eq!(response.status(), 200);
+        assert!(response.text().await.unwrap().contains("hits_total 1"));
+        let response = client.get(&url).send().await.unwrap();
+        assert_eq!(response.status(), 401);
+
+        let plaintext = reqwest::Client::new().get(format!("http://{addr}/metrics")).send().await;
+        assert!(plaintext.is_err(), "a plaintext scrape of a TLS exposition got an answer");
+    }
 }
