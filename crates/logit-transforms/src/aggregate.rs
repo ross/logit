@@ -959,17 +959,17 @@ impl Aggregator {
             let open_seq = self.next_open_seq;
             // A record whose group doesn't exist opens a series by definition, so it's admitted
             // before the group is: a refusal creates and memoizes nothing.
-            let (gi, admitted) = match group_index.or_else(|| self.find_group(resource, &scope)) {
-                Some(gi) => (gi, false),
-                None => {
-                    if !self.admit_new_series(&mut tally) {
-                        tally.series_limit += 1;
-                        self.refuse(record.name);
-                        continue;
+            let (gi, key, admitted) =
+                match group_index.or_else(|| self.find_group(resource, &scope)) {
+                    Some(gi) => (gi, key, false),
+                    None => {
+                        let admission = self.budget.admit();
+                        let Some(key) = self.settle_admission(admission, key, &mut tally) else {
+                            continue;
+                        };
+                        (self.open_group(resource, &scope), key, true)
                     }
-                    (self.open_group(resource, &scope), true)
-                }
-            };
+                };
             group_index = Some(gi);
             let entry = self.groups[gi].series.entry(key);
             // Whether this metric opened a new series. Not derivable afterward: a real
@@ -977,22 +977,18 @@ impl Aggregator {
             // `Sum` and `GaugeDelta` arms seed the series' value from it, and `GaugeDelta`'s
             // unseeded count reads it.
             let was_vacant = matches!(entry, std::collections::hash_map::Entry::Vacant(_));
-            // `admit` is asked in place, beside the entry: only an eviction gives the entry up,
-            // so only an eviction pays a second hash.
+            // `admit` is asked in place, beside the entry: only an answer other than `Open` gives
+            // the entry up, so only an admission eviction pays a second hash.
             let entry = match (was_vacant && !admitted).then(|| self.budget.admit()) {
                 None | Some(Admission::Open) => entry,
-                Some(Admission::Refused) => {
-                    drop(entry);
-                    tally.series_limit += 1;
-                    self.refuse(record.name);
-                    continue;
-                }
-                Some(Admission::EvictIdle) => {
+                Some(admission) => {
                     let std::collections::hash_map::Entry::Vacant(vacant) = entry else {
                         unreachable!("admit is asked only of a vacant entry")
                     };
                     let key = vacant.into_key();
-                    self.evict_one(&mut tally);
+                    let Some(key) = self.settle_admission(admission, key, &mut tally) else {
+                        continue;
+                    };
                     self.groups[gi].series.entry(key)
                 }
             };
@@ -1372,16 +1368,26 @@ impl Aggregator {
         index
     }
 
-    /// [`SeriesBudget::admit`] for a record whose group doesn't exist yet, making room when it
-    /// says to. Returns whether the series may open.
-    fn admit_new_series(&mut self, tally: &mut Tally) -> bool {
-        match self.budget.admit() {
-            Admission::Open => true,
+    /// Acts on [`SeriesBudget::admit`]'s answer for a record that would open the series `key`,
+    /// at both places `process` asks: before the record's group exists, and on a vacant entry.
+    /// Returns the key to open, or `None` for a refused record, counted and diagnosed.
+    fn settle_admission(
+        &mut self,
+        admission: Admission,
+        key: SeriesKey,
+        tally: &mut Tally,
+    ) -> Option<SeriesKey> {
+        match admission {
+            Admission::Open => Some(key),
             Admission::EvictIdle => {
                 self.evict_one(tally);
-                true
+                Some(key)
             }
-            Admission::Refused => false,
+            Admission::Refused => {
+                tally.series_limit += 1;
+                self.refuse(key.name);
+                None
+            }
         }
     }
 
@@ -1435,7 +1441,7 @@ impl Aggregator {
         debug_assert!(false, "budget.idle > 0 with no series left in the eviction order");
     }
 
-    /// The diagnostic for a record `max_series` refused; the caller counts it.
+    /// The diagnostic for a record `max_series` refused; `settle_admission` counts it.
     fn refuse(&mut self, name: Symbol) {
         self.diag.warn_throttled(
             "series_limit",
