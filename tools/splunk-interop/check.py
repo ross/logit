@@ -256,6 +256,7 @@ def delivery(leg):
     requests = telemetry_sum(events, "logit.output.requests", route="event")
     ok = telemetry_sum(events, "logit.output.requests", route="event", **{"class": "2xx"})
     network = telemetry_sum(events, "logit.output.requests", route="event", **{"class": "network_error"})
+    connect = telemetry_sum(events, "logit.output.requests", route="event", **{"class": "connect_error"})
     records = telemetry_sum(events, "logit.output.records")
     dropped = {reason: telemetry_sum(events, "logit.output.records.dropped", reason=reason)
                for reason in ("oversize", "invalid_event")}
@@ -263,7 +264,7 @@ def delivery(leg):
     failed = telemetry_sum(events, "logit.component.batches.dropped", reason="rejected")
     retries = telemetry_sum(events, "logit.component.retries")
     summary = (f"telemetry: {requests} /event requests, {ok} 2xx, {network} network_error, "
-               f"{requests - ok - network} other; {records} records delivered; records dropped "
+               f"{connect} connect_error, {requests - ok - network - connect} other; {records} records delivered; records dropped "
                f"{dropped_total} {dropped}; {failed} batches dropped rejected; {retries} retries")
     problems = []
     if not events:

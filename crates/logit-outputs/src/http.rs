@@ -328,7 +328,10 @@ pub(crate) fn status_class(status: reqwest::StatusCode) -> &'static str {
 /// transport error's [`Fault`]: `connect_error` for a [`Fault::Clean`] connect failure (a refused
 /// or failed dial, a DNS failure, a failed TLS handshake), which the destination never saw, and
 /// `network_error` for the rest (a timeout, a connection reset or closed before the response),
-/// which it may have taken. A soak or an operator reading resends counts only `network_error`.
+/// which it may have taken. A dial still pending when the request's timeout fires is a timeout,
+/// so it counts `network_error` though nothing was sent: [`client_builder`] sets no connect
+/// timeout. `network_error` is therefore an upper bound on the requests the destination may hold
+/// (`docs/adr/sink-send-path-and-attempt-accounting.md`, "Amendment: a failed dial counts `connect_error`").
 pub(crate) fn transport_class(fault: Fault) -> &'static str {
     if fault == Fault::Clean {
         "connect_error"

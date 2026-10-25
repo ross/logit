@@ -1471,8 +1471,9 @@ AMBIGUOUS_DROP = "ambiguous_at_most_once"
 # crates/logit-outputs/src/otlp.rs) and resends the whole batch after such an attempt, so each
 # can leave at most one batch the listener took that G never counts. A connect failure
 # (`HTTP_CONNECT_CLASS`: a refused or failed dial, a DNS failure) sent nothing and adds none.
-# A writer built before the HTTP sinks split the two counts both as `network_error`, so on its
-# run the allowance is an upper bound. A `503` takes nothing or counts what it refused as X
+# A dial still pending when the request times out counts `network_error`, and so does every
+# failed dial on a writer built before the HTTP sinks split the two, so the allowance is an
+# upper bound (docs/adr/sink-send-path-and-attempt-accounting.md, "Amendment: a failed dial counts `connect_error`"). A `503` takes nothing or counts what it refused as X
 # (`HTTP_LISTENERS`), and adds none.
 HTTP_REPORTED_ACTIONS = ("kill", "exit")
 HTTP_AMBIGUOUS_CLASS = "network_error"

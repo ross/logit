@@ -8664,8 +8664,7 @@ def _standin_checks():
                                 for o in (250, 255)) + "\n")
         rows = {r.id: r for r in checks.run_all(run_dir)}
         expect(rows["ledger.standin"].status == checks.PASS,
-               f"network_error at or above the resets PASSes (a connect failure counts there "
-               f"too), got {rows['ledger.standin']}")
+               f"network_error at or above the resets PASSes, got {rows['ledger.standin']}")
 
         def outside(requests):
             requests[-1]["cue"] = "c0s2"

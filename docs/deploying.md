@@ -4367,7 +4367,9 @@ neither a DNS name nor an IP address fails startup.
 
 **What to watch.** A handshake failure on either side surfaces through the same
 `connection_error`/`network_error` diagnostics and `logit.output.requests{class="connect_error"}`/
-listener-side `logit.component.diagnostics` counters as any other transport failure. Certificate
+listener-side `logit.component.diagnostics` counters as any other transport failure. A handshake
+that stalls past the sink's request timeout reads `class="network_error"` instead, since no HTTP
+sink sets a connect timeout of its own. Certificate
 rotation has its own counter, gauge, and diagnostics; see [Certificate rotation](#certificate-rotation).
 `docs/known-gaps/intake.md` tracks one open item: no TLS client can set SNI, so a front end that
 routes on SNI can't be reached by IP.

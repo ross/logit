@@ -258,7 +258,7 @@
 //!
 //! | Point | Meaning |
 //! |---|---|
-//! | `logit.output.requests{class="1xx"\|"2xx"\|"3xx"\|"4xx"\|"5xx"\|"other"\|"connect_error"\|"network_error"}` | one per request, in `otlp_out`'s vocabulary ([`crate::http::status_class`]). No `429` class: a 429 is a `4xx`, and splitting it out would contradict [`crate::http::classify_status`], which picks the `Fault` from the same status. No `timeout` class: a timeout is a transport error, so `network_error`; a failed dial is `connect_error` ([`crate::http::transport_class`]). No `signal` tag, unlike `otlp_out`: this sink has one signal |
+//! | `logit.output.requests{class="1xx"\|"2xx"\|"3xx"\|"4xx"\|"5xx"\|"other"\|"connect_error"\|"network_error"}` | one per request, in `otlp_out`'s vocabulary ([`crate::http::status_class`]). No `429` class: a 429 is a `4xx`, and splitting it out would contradict [`crate::http::classify_status`], which picks the `Fault` from the same status. No `timeout` class: a timeout is a transport error, so `network_error`, a dial still pending when it fires included; a dial that failed sooner is `connect_error` ([`crate::http::transport_class`]). No `signal` tag, unlike `otlp_out`: this sink has one signal |
 //! | `logit.output.request.duration` | one timer per request issued, the spelling `graphite_out`, `collectd_out`, `syslog_out`, `statsd_out` and `influxdb_out` use |
 //! | `logit.output.samples` | samples in the request body, counted by the codec ([`remote_write::encode_counted`]) rather than guessed from family counts: one `Series` is one sample for a gauge and several for a histogram. Mirrors `prometheus_in`'s `logit.input.samples`, so the two ends of a relay compare |
 //!

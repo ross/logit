@@ -1179,9 +1179,13 @@ The rows:
   `Ambiguous` too, but the listener took nothing (busy) or counted what it refused in X
   (`closed_consumer`), so it allows none. A dial that failed, refused, a DNS failure, or a
   failed TLS handshake, counts `class="connect_error"`: it sent nothing, so it allows none
-  either, and the detail counts it apart. A writer built before the HTTP sinks split that class
-  out counts it as `network_error`, and on its run the allowance is an upper bound, loose across
-  a SUT stop.
+  either, and the detail counts it apart. A dial still pending when the request times out counts
+  `network_error`, though it sent nothing ([ADR
+  `sink-send-path-and-attempt-accounting`](../adr/sink-send-path-and-attempt-accounting.md)'s
+  "Amendment: a failed dial counts `connect_error`"), so the allowance stays an upper bound wherever a dial can stall, as
+  in `http-ingress`'s delay past the writer's timeout. A writer built before the HTTP sinks
+  split that class out counts every failed dial as `network_error`, looser still across a SUT
+  stop.
 
   On a file wire (W11b) only a lifecycle fault or an `exit` of the ingress SUT affects the wire.
   A tailer reads behind its writer, so a drain interval's gap is lag, not loss: every run of

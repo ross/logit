@@ -1153,3 +1153,14 @@ may have taken twice, such as the soak harness's resend allowance, counted dials
 nothing; it now reads `network_error` alone. The class follows the request's own fault, so a
 `Clean` fault that `after_delivery` raises to `Ambiguous` still counts `connect_error`. Where
 the sections above say a refused connection counts `network_error`, read `connect_error`.
+
+A dial still pending when the request's timeout fires counts `network_error`, not
+`connect_error`, though nothing was sent. No HTTP sink's client sets a connect timeout of its
+own (`crate::http::client_builder`, and `otlp_out`'s gRPC client), so `reqwest`'s whole-request
+timeout ends a stalled dial as a timeout, which `classify_reqwest_error` reads as `Ambiguous`,
+and `otlp_out`'s gRPC timeout arm counts `network_error` whatever stage it cut. A SYN or a TLS
+handshake whose answer is delayed past the timeout, as netem delaying the destination's egress
+does, lands there. So `network_error` is an upper bound on the requests a destination may hold,
+and a reader that counts it as resends is loose by the stalled dials. A connect timeout would
+make a stalled dial `Clean` and change what `at_most_once` drops, so the sinks set none
+([`docs/known-gaps/telemetry.md`](../known-gaps/telemetry.md)).
