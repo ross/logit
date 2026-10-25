@@ -6272,6 +6272,7 @@ mod tests {
             cert_file: Some("client.pem".to_string()),
             key_file: Some("client.key".to_string()),
             insecure_skip_verify: false,
+            server_name: None,
         };
         resolve(cfg(vec![
             ("in", vec![], listener()),
@@ -11684,6 +11685,7 @@ mod tests {
             cert_file: Some("client.pem".to_string()),
             key_file: Some("client.key".to_string()),
             insecure_skip_verify: false,
+            server_name: None,
         };
         resolve(cfg(vec![
             ("in", vec![], listener()),

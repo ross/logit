@@ -1,6 +1,6 @@
 ---
 created: 2026-09-13
-updated: 2026-10-18
+updated: 2026-10-25
 ---
 
 # `syslog_in` gains TCP and TLS ingress; `syslog_out` gains TLS
@@ -324,7 +324,8 @@ a differently-shaped metric for the same event.
   outright (the latter narrowed to DTLS, which stays open as its own row). Two existing rows
   generalize rather than close: "TLS certificates are loaded once at startup" (since closed by
   [ADR `tls-certificate-reload`](tls-certificate-reload.md)) and "no `server_name`
-  override," both currently scoped to `otlp_in`/`otlp_out`, now also describe
+  override" (since narrowed to SNI by [ADR `tls-client-server-name`](tls-client-server-name.md)),
+  both currently scoped to `otlp_in`/`otlp_out`, now also describe
   `syslog_in`/`syslog_out` (and `logit_in`/`logit_out`), since none of those components' TLS
   construction differs in either respect. A new row: no idle-connection timeout on a TCP listener --
   a handshaken-then-silent connection holds a concurrency-cap permit indefinitely, a gap this

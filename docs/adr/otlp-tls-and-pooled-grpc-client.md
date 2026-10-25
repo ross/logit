@@ -1,6 +1,6 @@
 ---
 created: 2026-09-03
-updated: 2026-10-22
+updated: 2026-10-25
 ---
 
 # TLS for `otlp_out`/`otlp_in`, and a pooled gRPC client to carry it
@@ -141,7 +141,8 @@ An operator reaching a privately-CA'd endpoint sets `tls.ca_file` explicitly.
 - `docs/known-gaps/otlp.md`'s "`otlp_out` has no gRPC TLS" and "opens a fresh connection per
   request" entries are retired; "certificates are loaded once at startup" and "no `server_name`
   override" are filed as new, smaller ones. The first has since closed
-  ([ADR `tls-certificate-reload`](tls-certificate-reload.md)).
+  ([ADR `tls-certificate-reload`](tls-certificate-reload.md)), and the second has narrowed to SNI
+  ([ADR `tls-client-server-name`](tls-client-server-name.md)).
 
 ## Amendment: `otlp_in` rejects at the cap and bounds a plaintext connection's first byte (2026-09-14)
 
