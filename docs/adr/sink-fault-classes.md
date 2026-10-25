@@ -504,9 +504,9 @@ drops the batch. The `standin-remote-write` and `standin-influxdb*` soak scenari
 ## Amendment: a sink's own timeout is the only bound on an attempt (2026-10-25)
 
 The runtime wraps `Output::send` in no timeout, so each sink bounds its own attempts: the HTTP
-and gRPC sinks with `request_timeout`, the stream sinks with `connect_timeout` on each write's
-progress, the Unix datagram send with `send_timeout`, and `logit_out` with `request_timeout` on
-each write and acknowledgment wait. `stdio_out` to a pipe has no bound, because a write to a
+and gRPC sinks with `connect_timeout` on the dial and `request_timeout` on the attempt, the
+stream sinks with `connect_timeout` on each write's progress, the Unix datagram send with
+`send_timeout`, and `logit_out` with `request_timeout` on each write and acknowledgment wait. `stdio_out` to a pipe has no bound, because a write to a
 stalled pipe can't be cancelled (`docs/known-gaps/sinks.md`).
 
 A sink author gives every write and acknowledgment wait its own timeout, and classifies one that
