@@ -4179,9 +4179,9 @@ a request that starts right at the idle deadline.
 
 **`tls.insecure_skip_verify`** disables server-certificate verification. Every client `tls:` block
 honors it, as does `prometheus_in`'s `scrape_tls:`. The connection is still encrypted, but any
-certificate is accepted. `logit` logs a startup warning whenever it's set. Use it only for a throwaway or pre-production endpoint, not a real deployment.
-Validation rejects it together with `ca_file`, because a specific trusted CA and "trust nothing"
-contradict each other.
+certificate is accepted. `logit` logs a startup warning whenever it's set. Use it only for a
+throwaway or pre-production endpoint, not a real deployment. Validation rejects it together with
+`ca_file`, because a specific trusted CA and "trust nothing" contradict each other.
 
 **What to watch.** A handshake failure on either side surfaces through the same
 `connection_error`/`network_error` diagnostics and `logit.output.requests{class="network_error"}`/

@@ -185,10 +185,10 @@ fn event_size() {
     assert_eq!(
         size_of::<Event>(),
         864,
-        "800 (the size before docs/adr/metrics-model-v2.md) + 16 (LogRecord 72 -> 88) + 40 (MetricList 192 -> \
-         232, via MetricRecord 184 -> 224) + 8 (SpanRecord 136 -> 144); the two records stay \
-         niche-free through their enclosing Option -- see docs/adr/metrics-model-v2.md and \
-         metric_kind_is_sized_by_its_two_largest_variants above"
+        "800 (the size before docs/adr/metrics-model-v2.md) + 16 (LogRecord 72 -> 88) + 40 \
+         (MetricList 192 -> 232, via MetricRecord 184 -> 224) + 8 (SpanRecord 136 -> 144); the \
+         two records stay niche-free through their enclosing Option -- see \
+         docs/adr/metrics-model-v2.md and metric_kind_is_sized_by_its_two_largest_variants above"
     );
 
     // The breakdown, so it can't drift from the total.

@@ -20,9 +20,9 @@ Entry format and the other areas: [the known-gaps index](README.md).
   unmodified, so a relay forwards OTLP without re-encoding it into native, is undecided and
   undesigned; see [`design/wire-protocol.md`](../design/wire-protocol.md)'s "Open question".
 - **`internal`'s and the six HTTP listeners' shutdown grace is fixed at 5s, not operator-tunable.**
-  Graph rule 17 rejects a `receive:` block on both and on `logit_in` (`otlp_in`, `datadog_in`,
-  `datadog_trace_in`, `splunk_hec_in`, `influxdb_in`, and `prometheus_in`'s remote-write receiver
-  are the six), because none is a datagram, stream, or tail listener, so each always gets
+  Graph rule 17 rejects a `receive:` block on these seven and on `logit_in` (the six are
+  `otlp_in`, `datadog_in`, `datadog_trace_in`, `splunk_hec_in`, `influxdb_in`, and
+  `prometheus_in`'s remote-write receiver), because none is a datagram, stream, or tail listener, so each always gets
   `ReceiveConfig::default().shutdown_grace`. The HTTP listeners use it as the deadline at which
   `run_input` aborts any connection still open, and `InternalInput` for its final drain of
   buffered self-telemetry (`crates/logit-inputs/src/internal.rs`). It's a gap if a deployment
