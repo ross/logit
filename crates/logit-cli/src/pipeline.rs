@@ -1243,22 +1243,25 @@ pub(crate) fn build_spec(
             token,
             concurrency,
             idle_timeout,
-        } => NodeSpec::Output(
-            Box::new(
-                InfluxDbOutput::new(
-                    url.clone(),
-                    Organization::from_config(org.clone(), default_org.clone()),
-                    Destination::from_config(bucket.clone(), default_bucket.clone()),
-                    token.clone(),
-                )
-                .with_concurrency(*concurrency)
-                .with_idle_timeout(*idle_timeout)
-                .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
-                .with_telemetry(telemetry.clone()),
-            ),
-            queue_config(&component.buffer, base_dir),
-            write_config(&component.buffer),
-        ),
+            tls,
+        } => {
+            let output = InfluxDbOutput::new(
+                url.clone(),
+                Organization::from_config(org.clone(), default_org.clone()),
+                Destination::from_config(bucket.clone(), default_bucket.clone()),
+                token.clone(),
+            )
+            .with_concurrency(*concurrency)
+            .with_idle_timeout(*idle_timeout)
+            .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
+            .with_telemetry(telemetry.clone())
+            .with_tls(&to_tls_client_settings(tls), base_dir, tls_reloader)?;
+            NodeSpec::Output(
+                Box::new(output),
+                queue_config(&component.buffer, base_dir),
+                write_config(&component.buffer),
+            )
+        }
         OtlpOut {
             endpoint,
             protocol,
@@ -2754,6 +2757,7 @@ mod tests {
                 token: "test-token".to_string(),
                 concurrency: 1,
                 idle_timeout: logit_config::default_sink_idle_timeout(),
+                tls: logit_config::TlsClientConfig::default(),
             },
         }
     }
@@ -2988,6 +2992,7 @@ mod tests {
                 token: "test-token".to_string(),
                 concurrency: 1,
                 idle_timeout: logit_config::default_sink_idle_timeout(),
+                tls: logit_config::TlsClientConfig::default(),
             },
         };
         assert!(matches!(
@@ -4073,6 +4078,10 @@ mod tests {
         let sinks = [
             format!("type: otlp_out\n    endpoint: https://localhost:4318\n    tls: {client}"),
             format!("type: datadog_out\n    api_key: placeholder\n    tls: {client}"),
+            format!(
+                "type: influxdb_out\n    url: https://localhost:8086\n    token: placeholder\n    \
+                 tls: {client}"
+            ),
             format!("type: datadog_trace_out\n    endpoint: https://localhost:8126\n    tls: {client}"),
             format!(
                 "type: splunk_hec_out\n    endpoint: https://localhost:8088/services/collector\n    \
@@ -4997,6 +5006,7 @@ mod tests {
                 token: "test-token".to_string(),
                 concurrency: 1,
                 idle_timeout: logit_config::default_sink_idle_timeout(),
+                tls: logit_config::TlsClientConfig::default(),
             },
         };
         let NodeSpec::Output(_, store_config, write_config) =
@@ -5050,6 +5060,7 @@ mod tests {
                 token: "test-token".to_string(),
                 concurrency: 1,
                 idle_timeout: logit_config::default_sink_idle_timeout(),
+                tls: logit_config::TlsClientConfig::default(),
             },
         };
         let NodeSpec::Output(_, store_config, _) =

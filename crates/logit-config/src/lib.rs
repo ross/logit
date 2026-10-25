@@ -3568,6 +3568,10 @@ pub enum ComponentKind {
         #[serde(default = "default_sink_idle_timeout", with = "humantime_serde_duration")]
         #[schemars(with = "String")]
         idle_timeout: Duration,
+        /// Tunes TLS for an `https://` url: a private CA, a client certificate, or no
+        /// verification. A non-default block with an `http://` url is rejected.
+        #[serde(default)]
+        tls: TlsClientConfig,
     },
     /// OTLP logs, metrics, and traces over OTLP/HTTP or OTLP/gRPC. TLS is selected by
     /// `endpoint`'s `https://` scheme.
@@ -8238,6 +8242,35 @@ mod tests {
         .unwrap();
         assert_eq!(component.sources, vec!["enrich".to_string()]);
         assert!(matches!(component.kind, ComponentKind::InfluxDbOut { .. }));
+    }
+
+    /// `tls:` defaults to an empty block and parses a private CA, a client certificate, and an
+    /// unknown key is refused.
+    #[test]
+    fn influxdb_out_tls_defaults_empty_and_parses() {
+        let parse = |tls: &str| {
+            serde_json::from_str::<Component>(&format!(
+                r#"{{"type": "influxdb_out", "sources": ["in"], "url": "https://localhost:8086",
+                    "token": "TOKEN"{tls}}}"#
+            ))
+        };
+        let ComponentKind::InfluxDbOut { tls, .. } = parse("").unwrap().kind else {
+            panic!("expected an influxdb_out");
+        };
+        assert!(tls.is_empty());
+
+        let ComponentKind::InfluxDbOut { tls, .. } =
+            parse(r#", "tls": {"ca_file": "ca.pem", "cert_file": "c.pem", "key_file": "c.key"}"#)
+                .unwrap()
+                .kind
+        else {
+            panic!("expected an influxdb_out");
+        };
+        assert_eq!(tls.ca_file.as_deref(), Some("ca.pem"));
+        assert_eq!(tls.cert_file.as_deref(), Some("c.pem"));
+        assert_eq!(tls.key_file.as_deref(), Some("c.key"));
+
+        assert!(parse(r#", "tls": {"bogus": true}"#).is_err());
     }
 
     /// `org`, `default_org`, `bucket`, and `default_bucket` are optional; `url` and `token`

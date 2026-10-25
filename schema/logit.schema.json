@@ -2946,6 +2946,21 @@
             "receive": true,
             "sources": true,
             "targets": true,
+            "tls": {
+              "description": "Tunes TLS for an `https://` url: a private CA, a client certificate, or no verification. A non-default block with an `http://` url is rejected.",
+              "default": {
+                "ca_file": null,
+                "cert_file": null,
+                "insecure_skip_verify": false,
+                "key_file": null,
+                "server_name": null
+              },
+              "allOf": [
+                {
+                  "$ref": "#/definitions/TlsClientConfig"
+                }
+              ]
+            },
             "token": {
               "description": "The API token. A plain string: write `!env INFLUXDB_TOKEN` to pull it from the environment rather than inlining it. `!env` works on every other field too.",
               "type": "string"

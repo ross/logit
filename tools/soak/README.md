@@ -291,9 +291,8 @@ offered, and its 50-batch queue overflows, counted; at 8 two or three requests i
 At 8, the expectations assert that more than one request was in flight and none overflowed under
 the delay, and that all eight slots filled while the listener held its answers during the stop;
 at 1, that the queue overflowed under the delay. Both assert the generator's `5xx` answers
-around the stop and no sink drop. Neither runs over TLS: `influxdb_out` has no `tls:` field and
-trusts only its built-in roots, so it can't reach a listener whose certificate the run's private
-CA signs, and over plaintext it speaks HTTP/1.1, one connection per request in flight.
+around the stop and no sink drop. Neither runs over TLS, and over plaintext
+`influxdb_out` speaks HTTP/1.1, one connection per request in flight.
 `otlp-concurrency-tls` covers TLS.
 
 `tail-rotate` (13 minutes 45 seconds) has the generator write 1,000 log lines a second with
