@@ -283,8 +283,9 @@ Two things the campaign turned up about the harness, not the decoders:
   argument. `fuzz/` is outside the cargo workspace, and no check built it then; `script/lint`
   now type-checks it (the 2026-10-11 amendment).
   Both targets now decode under `DecodeBudget::default()`, the budget `NativeDecoder` gives a
-  frame under the default cap. "Consequences" already says so: run `fuzz-seed` and a short
-  `fuzz-all` after changing a decoder a target calls.
+  frame under the default cap. At the time, "Consequences" said to run `fuzz-seed` and a short
+  `fuzz-all` after changing a decoder a target calls. The rule now lives in "Consequences", and
+  `script/lint` runs `seedgen --check` to catch stale seeds.
 - **A host suspend reads as a timeout.** The host suspended for about 2.8 hours during the last
   four targets. On resume, libFuzzer counted the whole suspend against the input in flight and
   reported `timeout-*` artifacts in `prom_decompress` and both batch targets, and a
