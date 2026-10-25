@@ -4177,9 +4177,9 @@ for the gap that leaves, which `otlp_in.idle_timeout` (off by default) closes: s
 ["`idle_timeout` on a TCP listener"](#idle_timeout-on-a-tcp-listener) above, including the note on
 a request that starts right at the idle deadline.
 
-**`tls.insecure_skip_verify`** (`otlp_out` only) disables server-certificate verification: the
-connection is still encrypted, but any certificate is accepted. `logit` logs a startup warning
-whenever it's set. Use it only for a throwaway or pre-production endpoint, not a real deployment.
+**`tls.insecure_skip_verify`** disables server-certificate verification. Every client `tls:` block
+honors it, as does `prometheus_in`'s `scrape_tls:`. The connection is still encrypted, but any
+certificate is accepted. `logit` logs a startup warning whenever it's set. Use it only for a throwaway or pre-production endpoint, not a real deployment.
 Validation rejects it together with `ca_file`, because a specific trusted CA and "trust nothing"
 contradict each other.
 
@@ -4340,7 +4340,7 @@ components:
 ```
 
 For mutual TLS, add `cert_file`/`key_file` together to `syslog_out`'s `tls:` block, as in
-`otlp_out`'s mutual TLS example above. `tls.insecure_skip_verify` (`syslog_out` only) behaves
+`otlp_out`'s mutual TLS example above. `tls.insecure_skip_verify` behaves
 identically too, including the rejection alongside `ca_file`. As for `statsd_out`, the TLS server
 name is `endpoint:`'s host, and a host that isn't an IP literal or a DNS name fails startup.
 
