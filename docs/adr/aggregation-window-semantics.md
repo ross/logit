@@ -1147,8 +1147,9 @@ Past the limit, a record that would open a new series folds into an **overflow s
   the record is dropped as `series_limit` only when every held series has absorbed this window.
 - **It merges by its kind's ordinary rules.** The first record to open it decides its kind, and a
   histogram with other bounds takes `histogram_bounds_mismatch`, as for any series. A record whose
-  kind conflicts with its name's overflow series takes the `kind_conflict` pass-through for now;
-  whether it should instead open a second overflow series per kind is an open question.
+  kind conflicts with its name's overflow series takes the `kind_conflict` pass-through, because
+  the case is rare, counted, and handled as every other kind conflict in `aggregate` is. Under
+  `temporality: cumulative`, `prometheus_out` then drops that delta as `unresolved_delta`.
 - **It sorts last for the flush-time `max_retained_series` eviction.** Opened after the name's
   admitted series, it would otherwise be the newest of its idle tier and the first evicted, and
   under `temporality: cumulative` it would restart with a new start time every window.
