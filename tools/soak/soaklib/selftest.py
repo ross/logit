@@ -8363,12 +8363,108 @@ def _standin_driver(root):
 
 
 def _respond_fault(step, start, end, status=None, cls=None, answer=None, action="respond",
-                   on="standin", series_errors=None):
+                   on="standin", series_errors=None, count=None):
     """A clean apply and revert of one step on the stand-in, offsets from `T0`."""
     extra = {k: v for k, v in (("status", status), ("class", cls), ("answer", answer),
-                               ("series_errors", series_errors)) if v is not None}
+                               ("series_errors", series_errors), ("count", count))
+             if v is not None}
     return [_action("apply", step, action, on, start, affects_egress=True, **extra),
             _action("revert", step, action, on, end - 1, end, affects_egress=True, **extra)]
+
+
+def _standin_count(root):
+    """A `respond` step's `count`: its rules in the scenario and on the control port, a counted
+    cue spent by writes to the stand-in's path alone and then answering the default with no cue,
+    the step's cue and timeline carrying it, and `ledger.standin` FAILing a counted step whose
+    cue answered fewer writes than its count."""
+    import http.client
+    import http.server
+    import io
+    import threading
+    server = _load_standin_server(root)
+    for cue in ({"step": "x", "status": 400, "count": 0},
+                {"step": "x", "status": 400, "count": True},
+                {"step": "x", "status": 400, "count": "1"}):
+        problems = server.cue_problems(cue)
+        expect(any("`count` must be a positive integer" in p for p in problems),
+               f"cue {cue} refused for its count, got {problems}")
+    expect(server.cue_problems({"step": "x", "answer": "reset", "count": 2}) == [],
+           "a counted reset is accepted")
+
+    state = server.State("remote_write", "/api/v1/write")
+    data = http.server.ThreadingHTTPServer(("127.0.0.1", 0), server.data_handler(state))
+    control = http.server.ThreadingHTTPServer(("127.0.0.1", 0), server.control_handler(state))
+    for one in (data, control):
+        threading.Thread(target=one.serve_forever, daemon=True).start()
+    printed = io.StringIO()
+    real_stdout = server.sys.stdout
+    server.sys.stdout = printed
+    control_base = f"http://127.0.0.1:{control.server_address[1]}"
+
+    def post(path):
+        conn = http.client.HTTPConnection("127.0.0.1", data.server_address[1], timeout=5)
+        try:
+            conn.request("POST", path, body=b"payload")
+            return conn.getresponse().status
+        finally:
+            conn.close()
+
+    try:
+        rc, _ = faults.post_cue(control_base, {"step": "c0s1", "status": 400, "count": 2})
+        answers = [post("/api/v1/write"), post("/api/v2/write"), post("/api/v1/write"),
+                   post("/api/v1/write")]
+        deadline = time.monotonic() + 5
+        while (printed.getvalue().count('"event": "request"') < 4
+               and time.monotonic() < deadline):
+            time.sleep(0.01)
+    finally:
+        server.sys.stdout = real_stdout
+        for one in (data, control):
+            one.shutdown()
+            one.server_close()
+    requests = [json.loads(line) for line in printed.getvalue().splitlines()
+                if '"event": "request"' in line]
+    got = [(r["status"], r["cue"]) for r in requests]
+    expect(rc == 0 and answers == [400, 404, 400, 200]
+           and got == [(400, "c0s1"), (404, "c0s1"), (400, "c0s1"), (200, None)],
+           f"a cue with count 2 answers two writes, a request off the path spends none, and "
+           f"the next write gets the default with no cue, got {answers} {got}")
+
+    path, base = _standin_base(root)
+    counted = copy.deepcopy(base)
+    counted["step"][0]["count"] = 1
+    first = scenario.expand(scenario.from_dict(counted, path))[0]
+    expect(first.cue() == {"step": "c0s1", "status": 503, "count": 1}
+           and first.expected() == {"status": 503, "count": 1, "class": "ambiguous"},
+           f"`count` travels in the cue and the timeline, got {first.cue()} "
+           f"{first.expected()}")
+    for value in (0, True, "1"):
+        bad = copy.deepcopy(base)
+        bad["step"][0]["count"] = value
+        _refused(path, bad, "`count` must be a positive integer", f"a count of {value!r}")
+    stop = copy.deepcopy(base)
+    stop["step"][18]["count"] = 1
+    _refused(path, stop, "`count` is for respond only", "a count on a stop")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        def counted_run(name, cued):
+            def edit(requests):
+                for request in requests[:cued]:
+                    request["cue"] = "c0s3"
+                return requests
+            # The fixture's four writes all fall inside the step's span.
+            run_dir = _ledger_run(tmp, name, standin_edit=edit,
+                                  timeline_extra=_respond_fault("c0s3", -10, 310, status=200,
+                                                                count=2))
+            return {r.id: r for r in checks.run_all(run_dir)}["ledger.standin"]
+
+        row = counted_run("count-spent", 2)
+        expect(row.status == checks.PASS, f"a counted cue that answered its count PASSes, got "
+               f"{row}")
+        row = counted_run("count-short", 1)
+        expect(row.status == checks.FAIL
+               and "its cue answered 1 write(s), not its count 2" in row.detail,
+               f"a counted cue that answered fewer writes FAILs, got {row}")
 
 
 def _standin_checks():
@@ -11297,8 +11393,8 @@ def run(root, quiet=False):
                      _two_sut_driver, _two_sut_checks, _per_service, _slope_edges,
                      _rss_settle_rules, _rss_settle_checks,
                      _expected_rules, _slope_reducer, _standin_codec, _standin_record_parts,
-                     _standin_server, _respond_rules, _standin_driver, _standin_checks,
-                     _class_signatures, _datadog_codec, _datadog_counts, _datadog_server,
+                     _standin_server, _respond_rules, _standin_count, _standin_driver,
+                     _standin_checks, _class_signatures, _datadog_codec, _datadog_counts, _datadog_server,
                      _datadog_rules, _datadog_checks, _influx_codec, _influx_points,
                      _influx_server, _influx_rules, _influx_checks, _overlap_rules,
                      _overlap_driver, _overlap_checks, _idp_rules, _refresh_checks,
@@ -11314,7 +11410,8 @@ def run(root, quiet=False):
                               _fanin_driver, _tcp_rules, _http_rules, _file_rules, _two_sut_rules,
                               _two_sut_driver,
                               _rss_settle_rules, _expected_rules, _standin_codec, _standin_server,
-                              _respond_rules, _standin_driver, _datadog_codec, _datadog_server,
+                              _respond_rules, _standin_count, _standin_driver, _datadog_codec,
+                              _datadog_server,
                               _datadog_rules, _influx_codec, _influx_server, _influx_rules,
                               _overlap_rules, _overlap_driver, _idp_rules, _signal_rules,
                               _sighup_driver,

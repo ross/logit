@@ -11,7 +11,9 @@ Stdlib only; compose runs it in a stock Python image. It serves two ports:
   other path answers `404`, so a misconfigured endpoint can't pass for a stored write.
 - The control port (`--control-port`) takes `POST /cue` from the driver: a JSON object with
   `step`, and either `status` (with an optional `body`) or `answer: "reset"`, and an optional
-  `apply`. Under the `datadog` shape a `2xx` status can carry `series_errors`, N: the answer's
+  `apply` and `count`. With `count`, N, the cue answers the next N writes on `--path` and is then
+  spent: the stand-in answers the default again, recording no cue, until the next `POST /cue`.
+  With several requests in flight, that lands a cue on one of them. Under the `datadog` shape a `2xx` status can carry `series_errors`, N: the answer's
   body is then the series route's `errors` list, protobuf field 1 (`repeated string`), with N
   entries, which `datadog_out` counts as N series the intake dropped. The stand-in doesn't
   decode the request, so the entries name series by their place in it; the checks take them to
@@ -67,14 +69,27 @@ class State:
         self.path = path
         self.lock = threading.Lock()
         self.cue = {}
+        # The writes a cue with `count` has left to answer; None for a cue without one.
+        self.left = None
         self.seq = 0
         self.stopping = False
 
-    def take(self):
-        """The cue in force and the next request number."""
+    def set_cue(self, cue):
+        with self.lock:
+            self.cue = dict(cue)
+            self.left = cue.get("count")
+
+    def take(self, write):
+        """The cue in force and the next request number. A `write` to the stand-in's path spends
+        one of a counted cue's answers, and the last one clears the cue."""
         with self.lock:
             self.seq += 1
-            return dict(self.cue), self.seq
+            cue = dict(self.cue)
+            if write and self.left is not None:
+                self.left -= 1
+                if self.left <= 0:
+                    self.cue, self.left = {}, None
+            return cue, self.seq
 
 
 def cue_problems(cue, shape="remote_write"):
@@ -83,7 +98,7 @@ def cue_problems(cue, shape="remote_write"):
     if not cue:
         return []
     problems = []
-    unknown = set(cue) - {"step", "status", "body", "answer", "apply", "series_errors"}
+    unknown = set(cue) - {"step", "status", "body", "answer", "apply", "series_errors", "count"}
     if unknown:
         problems.append(f"unknown keys {sorted(unknown)}")
     if not isinstance(cue.get("step"), str) or not cue.get("step"):
@@ -100,6 +115,9 @@ def cue_problems(cue, shape="remote_write"):
         problems.append("`body` is a string, with `status` only")
     if "apply" in cue and not isinstance(cue["apply"], bool):
         problems.append("`apply` must be true or false")
+    if "count" in cue and (not isinstance(cue["count"], int) or isinstance(cue["count"], bool)
+                           or cue["count"] < 1):
+        problems.append("`count` must be a positive integer")
     if "series_errors" in cue:
         count = cue["series_errors"]
         if shape != DATADOG_SHAPE:
@@ -146,8 +164,8 @@ def data_handler(state):
         def do_POST(self):
             length = int(self.headers.get("Content-Length") or 0)
             body = self.rfile.read(length) if length else b""
-            cue, seq = state.take()
             split = urllib.parse.urlsplit(self.path)
+            cue, seq = state.take(split.path == state.path)
             record = {
                 "event": "request", "seq": seq, "t": time.time(), "path": split.path,
                 "query": split.query,
@@ -247,8 +265,7 @@ def control_handler(state):
             if problems:
                 self._reply(400, {"error": "; ".join(problems)})
                 return
-            with state.lock:
-                state.cue = dict(cue)
+            state.set_cue(cue)
             emit({"event": "cue", "t": time.time(), "cue": cue})
             self._reply(200, cue)
 
