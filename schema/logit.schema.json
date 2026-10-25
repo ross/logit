@@ -3009,7 +3009,8 @@
                 "ca_file": null,
                 "cert_file": null,
                 "insecure_skip_verify": false,
-                "key_file": null
+                "key_file": null,
+                "server_name": null
               },
               "allOf": [
                 {
@@ -3100,7 +3101,8 @@
                 "ca_file": null,
                 "cert_file": null,
                 "insecure_skip_verify": false,
-                "key_file": null
+                "key_file": null,
+                "server_name": null
               },
               "allOf": [
                 {
@@ -3172,7 +3174,8 @@
                 "ca_file": null,
                 "cert_file": null,
                 "insecure_skip_verify": false,
-                "key_file": null
+                "key_file": null,
+                "server_name": null
               },
               "allOf": [
                 {
@@ -3262,7 +3265,8 @@
                 "ca_file": null,
                 "cert_file": null,
                 "insecure_skip_verify": false,
-                "key_file": null
+                "key_file": null,
+                "server_name": null
               },
               "allOf": [
                 {
@@ -3386,7 +3390,7 @@
               "type": "string"
             },
             "tls": {
-              "description": "Turns on TLS to every broker when present, and makes it required: a `host:port` has no scheme to select TLS from, so even an empty `tls: {}` means TLS with the bundled Mozilla roots. Each broker's certificate is checked against the host it advertises.",
+              "description": "Turns on TLS to every broker when present, and makes it required: a `host:port` has no scheme to select TLS from, so even an empty `tls: {}` means TLS with the bundled Mozilla roots. Each broker's certificate is checked against the host it advertises, or against `server_name` when it's set.",
               "default": null,
               "anyOf": [
                 {
@@ -4010,7 +4014,8 @@
                 "ca_file": null,
                 "cert_file": null,
                 "insecure_skip_verify": false,
-                "key_file": null
+                "key_file": null,
+                "server_name": null
               },
               "allOf": [
                 {
@@ -4182,7 +4187,8 @@
                 "ca_file": null,
                 "cert_file": null,
                 "insecure_skip_verify": false,
-                "key_file": null
+                "key_file": null,
+                "server_name": null
               },
               "allOf": [
                 {
@@ -6233,6 +6239,14 @@
         },
         "key_file": {
           "description": "Private key (PEM, PKCS#8/PKCS#1/SEC1) for `cert_file`. Requires `cert_file`.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "server_name": {
+          "description": "The name the server's certificate is verified against, in place of the endpoint's host: a DNS name or an IP address. Use it to dial an endpoint by IP address, or through a proxy, when its certificate names another host. It doesn't change SNI: the connection still sends the endpoint's own host (none for an IP address), so it can't reach a front end that routes on SNI. On `kafka_out`, every broker is verified against this one name. Ignored under `insecure_skip_verify`. A name that doesn't parse fails startup.",
           "default": null,
           "type": [
             "string",
