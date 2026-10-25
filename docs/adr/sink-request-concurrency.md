@@ -88,8 +88,8 @@ in flight on its own outcome, so a fault on one batch neither resends nor drops 
 
 - **The field.** `concurrency: u32` on `influxdb_out`, `otlp_out`, `datadog_out`,
   `datadog_trace_out`, `splunk_hec_out`, and `prometheus_out` (read in remote-write mode;
-  exposition mode ignores it under graph rule 56's model: a field the mode doesn't use is
-  rejected). Default 1. Range `1..=1024`, a graph rule in
+  exposition mode rejects it, as graph rule 56 rejects every field the other mode owns).
+  Default 1. Range `1..=1024`, a graph rule in
   [`docs/design/pipeline-graph.md`](../design/pipeline-graph.md)'s rule table.
 - **`logit_out.window` becomes `logit_out.concurrency`**, with no alias, under
   [ADR `native-hop-no-compatibility`](native-hop-no-compatibility.md)'s posture. Graph rule 75
@@ -114,6 +114,10 @@ in flight on its own outcome, so a fault on one batch neither resends nor drops 
   - `Ambiguous` under `at_most_once` drops the head alone, counted
     `ambiguous_at_most_once`, and nothing else is committed. The native hop's "every other
     outstanding item" rule holds for a connection-level fault, which arrives without `HeadOnly`.
+- **A fault behind the head waits its turn.** A slot whose request failed while an older batch
+  is still outstanding keeps that outcome, and the task never retries on its own; the loop reads
+  it from `await_ack` once the batch is the head and handles it as above. In-order commit holds,
+  and the backoff schedule stays one per head.
 - **A non-`HeadOnly` error keeps the connection model.** `logit_out` returns it for a dropped
   connection; the loop zeroes its count and resubmits from the head, as today. An HTTP sink never
   returns one.
@@ -125,8 +129,9 @@ in flight on its own outcome, so a fault on one batch neither resends nor drops 
   can't start a request (the encode failed, or nothing could be spawned) reports it when that
   batch becomes the head.
 - **Telemetry.** `logit.component.send.duration` records one sample per batch, from its submit
-  to its acknowledgment, on every windowed sink; `logit.output.in_flight` becomes a gauge every
-  sink above a concurrency of 1 reports. The `buffer_full` warning on a sink whose `in_flight`
+  to its acknowledgment, on a sink using the slot helper (decision 3); the hop keeps one sample
+  per windowed round. `logit.output.in_flight` becomes a gauge every sink above a concurrency of
+  1 reports. The `buffer_full` warning on a sink whose `in_flight`
   equals its `concurrency` names the limit and the recent send duration, so an operator reading
   the line at the default sees the round trip as the cause and `concurrency:` as the remedy.
   [`docs/design/internal-telemetry.md`](../design/internal-telemetry.md) records each.
