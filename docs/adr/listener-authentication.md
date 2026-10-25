@@ -66,7 +66,7 @@ auth:
   password may hold `:` and nothing is decoded per request. Every entry of the scheme is compared
   in constant time over its whole length. One copy of this lives in `logit_proto::auth`, beside
   the comparison the protocol tokens share, and has a fuzz target (`http_auth`).
-- **Validation.** Graph rule 97 rejects an empty token, a token with surrounding whitespace, and
+- **Validation.** Graph rule 99 rejects an empty token, a token with surrounding whitespace, and
   an empty username or password, none of which a client could ever match. It also rejects a basic
   username containing `:`, which RFC 7617 forbids: `a:b` with password `c` encodes the same as `a`
   with password `b:c`, so it would alias another entry. A no-op block is legal.

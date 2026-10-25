@@ -349,7 +349,7 @@
 //!     (`docs/adr/sink-request-concurrency.md`, decision 1).
 //! 98. An `influxdb_out` whose `tls` fails rule 24's checks, the scheme one included: the `url`'s
 //!     scheme selects TLS, so a block under `http://` does nothing.
-//! 97. An `otlp_in` `auth`, `prometheus_in` `bind_auth`, or `prometheus_out` `bind_auth` with an
+//! 99. An `otlp_in` `auth`, `prometheus_in` `bind_auth`, or `prometheus_out` `bind_auth` with an
 //!     empty bearer token, username, or password, or a bearer token with leading or trailing
 //!     whitespace: none could match a request's credential. Also a basic username containing
 //!     `:`, which RFC 7617 forbids and which would alias another entry's encoding. Empty lists
@@ -4134,7 +4134,7 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 97: an HTTP listener's credentials (`docs/adr/listener-authentication.md`). An empty
+    // Rule 99: an HTTP listener's credentials (`docs/adr/listener-authentication.md`). An empty
     // token, username, or password reads as a request carrying none, so it would admit a request
     // the operator meant to refuse or could never match; a token with leading or trailing
     // whitespace could never match the trimmed header, a typo `!env` makes easy with a secret
@@ -4585,7 +4585,7 @@ fn is_host_port(entry: &str) -> bool {
     })
 }
 
-/// Rule 97's checks on one `auth:` or `bind_auth:` block. The messages name the field and the
+/// Rule 99's checks on one `auth:` or `bind_auth:` block. The messages name the field and the
 /// entry's position, never a value.
 fn check_http_auth(
     id: &str,
@@ -15559,10 +15559,10 @@ mod tests {
             .expect("an exposition with TLS and credentials resolves");
     }
 
-    /// Rule 97: an empty token, username, or password, or a whitespace-padded token, could never
+    /// Rule 99: an empty token, username, or password, or a whitespace-padded token, could never
     /// match, on each kind that takes credentials. The message names the entry, never its value.
     #[test]
-    fn rule_97_rejects_a_credential_that_could_never_match() {
+    fn rule_99_rejects_a_credential_that_could_never_match() {
         let cases = [
             (r#"{"bearer_tokens": ["good", ""]}"#, "'AUTH.bearer_tokens' entry 1 is empty"),
             (r#"{"bearer_tokens": ["s3cret\n"]}"#, "leading or trailing whitespace"),
@@ -15592,10 +15592,10 @@ mod tests {
         }
     }
 
-    /// Rule 97: a basic username holding `:` is rejected on every kind that takes credentials,
+    /// Rule 99: a basic username holding `:` is rejected on every kind that takes credentials,
     /// without the message naming it.
     #[test]
-    fn rule_97_rejects_a_basic_username_containing_a_colon() {
+    fn rule_99_rejects_a_basic_username_containing_a_colon() {
         let auth = r#"{"basic": [{"username": "s3cret:user", "password": "pw"}]}"#;
         for json in [
             format!(r#"{{"type": "otlp_in", "bind": "0.0.0.0:4318", "auth": {auth}}}"#),
@@ -15614,9 +15614,9 @@ mod tests {
         assert!(err.contains("username containing ':'"), "got: {err}");
     }
 
-    /// Rule 97: credentials with a password holding `:`, and empty lists, resolve.
+    /// Rule 99: credentials with a password holding `:`, and empty lists, resolve.
     #[test]
-    fn rule_97_accepts_well_formed_credentials_and_empty_lists() {
+    fn rule_99_accepts_well_formed_credentials_and_empty_lists() {
         for auth in [
             r#"{"bearer_tokens": ["t"], "basic": [{"username": "u", "password": "a:b"}]}"#,
             r#"{"bearer_tokens": [], "basic": []}"#,

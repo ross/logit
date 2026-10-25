@@ -502,7 +502,8 @@ a black hole counts what it discards as `events.discarded`.
 96. A `dedup_timestamps` with a `precision` of `0s`.
 97. A `concurrency` of `0` or past `1024` on an `influxdb_out`, `otlp_out`, `datadog_out`,
     `datadog_trace_out`, `splunk_hec_out`, or `prometheus_out`.
-97. An `otlp_in` `auth`, or a `prometheus_in` or `prometheus_out` `bind_auth`, with an empty bearer
+98. An `influxdb_out` `tls` failing rule 24's checks, including a block under an `http://` `url`.
+99. An `otlp_in` `auth`, or a `prometheus_in` or `prometheus_out` `bind_auth`, with an empty bearer
     token, username, or password, a bearer token with leading or trailing whitespace, or a basic
     username containing `:`.
 
