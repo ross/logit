@@ -854,11 +854,11 @@ the operator-facing account of all of this.
   chain (W′).
   `otlp-fan-out-conc` is that run with the generator at `concurrency: 8`,
   `otlp-concurrency-tls` is that over TLS from a private CA per run, where HTTP/2 carries every
-  request in flight on one connection, and `http-concurrency` and `http-concurrency-1` send InfluxDB points from `influxdb_out` at
-  `concurrency: 8` and `1` into `http-ingress`'s SUT under a 200 ms delay on its answers, each
-  with `[[expect]]` rows on `logit.output.in_flight` and the generator's `overflow_newest`
-  drops ([plan `sink-request-concurrency`](docs/plans/sink-request-concurrency.md)'s
-  "Findings").
+  request in flight on one connection, and `http-concurrency` and `http-concurrency-1` send
+  InfluxDB points from `influxdb_out` at `concurrency: 8` and `1` into `http-ingress`'s SUT under
+  a 200 ms delay on its answers: at 8, `[[expect]]` rows assert `logit.output.in_flight` and no
+  `overflow_newest` drop under the delay, and at 1, that the generator's queue overflowed there
+  ([plan `sink-request-concurrency`](docs/plans/sink-request-concurrency.md)'s "Findings").
   `tail-rotate` has a writer `generate_in -> file_out` rotate a file in a directory it shares
   with the SUT's `tail_in` (`wire = "file"`, `<run>/shared` mounted by an override): G is the
   writer's `events.delivered`, held to the lines the driver counts in that directory at the end

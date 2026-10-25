@@ -5078,7 +5078,8 @@ def check_ledger_standin(data):
     record's requests by status class equal the sink's `logit.output.requests` for 2xx to 5xx,
     and its resets are at most the sink's `network_error`, which a connect failure also counts;
     every answer other than the default carries the cue of a `respond` step and falls inside
-    its span, and every write went to the stand-in's path; and each step with a `class` shows
+    its span, and every write went to the stand-in's path; each step with a `count` answered
+    that many writes to the path under its cue; and each step with a `class` shows
     that class's effect at the sink (`_class_signature`). A killed life's mismatch WARNs, since
     a kill loses that life's last telemetry interval. Every other target SKIPs.
 

@@ -1,5 +1,5 @@
 # standin-at-most-once's stand-in against a sink at `concurrency: 8`: a 1 s delay on the SUT's
-# egress keeps about four batches in flight, and each `respond` step's `count = 1` lands its
+# egress keeps up to four batches in flight, and each `respond` step's `count = 1` lands its
 # cue on the next write alone, one slot among several. A `401` holds that batch when it
 # reaches the head while the slots behind it are answered, and its resend releases it; a `400`
 # drops that batch alone; and a reset drops that batch alone `ambiguous_at_most_once`.
@@ -42,7 +42,7 @@ rss_growth_mib_per_hour = 64
 fd_growth = 8
 
 # c0s1: the slow link the respond steps run inside. Four batches a second over a 1 s round
-# trip keep about four in flight.
+# trip keep up to four in flight.
 [[step]]
 at = "0s"
 action = "netem"

@@ -8467,6 +8467,59 @@ def _standin_count(root):
                f"a counted cue that answered fewer writes FAILs, got {row}")
 
 
+
+def _standin_idle_timeout(root):
+    """`data_handler`'s `idle_timeout`: the stand-in closes a keep-alive connection that stays
+    idle past it, which `--idle-timeout` sets."""
+    import http.server
+    import io
+    import socket
+    import threading
+    server = _load_standin_server(root)
+    state = server.State("remote_write", "/api/v1/write")
+    data = http.server.ThreadingHTTPServer(("127.0.0.1", 0), server.data_handler(state, 0.5))
+    threading.Thread(target=data.serve_forever, daemon=True).start()
+    real_stdout = server.sys.stdout
+    server.sys.stdout = io.StringIO()
+    closed_after = None
+    response = b""
+    try:
+        with socket.create_connection(("127.0.0.1", data.server_address[1]), timeout=5) as sock:
+            sock.sendall(b"POST /api/v1/write HTTP/1.1\r\nHost: standin\r\n"
+                         b"Connection: keep-alive\r\nContent-Length: 7\r\n\r\npayload")
+            while b"\r\n\r\n" not in response:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                response += chunk
+            head, _, body = response.partition(b"\r\n\r\n")
+            length = 0
+            for line in head.split(b"\r\n")[1:]:
+                name, _, value = line.partition(b":")
+                if name.strip().lower() == b"content-length":
+                    length = int(value)
+            while len(body) < length:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                body += chunk
+            sock.settimeout(3)
+            started = time.monotonic()
+            try:
+                if sock.recv(4096) == b"":
+                    closed_after = time.monotonic() - started
+            except socket.timeout:
+                pass
+    finally:
+        server.sys.stdout = real_stdout
+        data.shutdown()
+        data.server_close()
+    expect(response.startswith(b"HTTP/1.1 200"),
+           f"the keep-alive write is answered, got {response[:40]!r}")
+    expect(closed_after is not None and closed_after < 2,
+           f"an idle timeout of 0.5 s closes the idle connection well inside 3 s, closed after "
+           f"{closed_after}")
+
 def _standin_checks():
     """The checks over a stand-in two-life run: V from the record, `ledger.egress` judging it,
     the black-hole control (a 2xx the stand-in didn't store) FAILing as uncounted loss,
@@ -11393,7 +11446,8 @@ def run(root, quiet=False):
                      _two_sut_driver, _two_sut_checks, _per_service, _slope_edges,
                      _rss_settle_rules, _rss_settle_checks,
                      _expected_rules, _slope_reducer, _standin_codec, _standin_record_parts,
-                     _standin_server, _respond_rules, _standin_count, _standin_driver,
+                     _standin_server, _respond_rules, _standin_count, _standin_idle_timeout,
+                     _standin_driver,
                      _standin_checks, _class_signatures, _datadog_codec, _datadog_counts, _datadog_server,
                      _datadog_rules, _datadog_checks, _influx_codec, _influx_points,
                      _influx_server, _influx_rules, _influx_checks, _overlap_rules,
@@ -11410,7 +11464,8 @@ def run(root, quiet=False):
                               _fanin_driver, _tcp_rules, _http_rules, _file_rules, _two_sut_rules,
                               _two_sut_driver,
                               _rss_settle_rules, _expected_rules, _standin_codec, _standin_server,
-                              _respond_rules, _standin_count, _standin_driver, _datadog_codec,
+                              _respond_rules, _standin_count, _standin_idle_timeout,
+                              _standin_driver, _datadog_codec,
                               _datadog_server,
                               _datadog_rules, _influx_codec, _influx_server, _influx_rules,
                               _overlap_rules, _overlap_driver, _idp_rules, _signal_rules,

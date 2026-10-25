@@ -25,7 +25,7 @@ components:
     org: soak
     bucket: soak
     token: soak
-    # The default, written out: one batch per round trip, about four a second under the
+    # The default, written out: one batch per round trip, about five a second under the
     # scenario's 200 ms delay, against the ten a second offered.
     concurrency: 1
     # 50 batches is 5 s of load, so a SUT that answers too slowly overflows it and the loss

@@ -1,6 +1,6 @@
 # `http-concurrency` at `concurrency: 1`, the default: 500 InfluxDB points a second in batches
 # of 50 into `logit`'s `influxdb_in` over HTTP, under a 200 ms delay on the SUT's answers and
-# then a backend stop. One request at a time moves about four batches a second over that round
+# then a backend stop. One request at a time moves about five batches a second over that round
 # trip against the ten offered, so the generator's queue overflows, counted. The pair measures
 # the field's gain on a slow link (docs/plans/sink-request-concurrency.md's "Findings"). The
 # schema is docs/plans/soak-harness.md's "The scenario schema".

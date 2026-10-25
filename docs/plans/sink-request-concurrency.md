@@ -171,7 +171,7 @@ HTTP sink, and the SUT's answers are delayed 200 ms ± 50 ms:
 
 | Run | Sink | Delivered under the delay | `send.duration` mean | `in_flight` max (mean) | Overflowed under the delay |
 |---|---|---|---|---|---|
-| `http-concurrency-1` | `influxdb_out`, 1 | 5.00 batches/s (250 events/s) | 200 ms | 1 | 999 batches in 205 s |
+| `http-concurrency-1` | `influxdb_out`, 1 | 5.00 batches/s (250 events/s) | 200 ms | not published at 1 | 999 batches in 205 s |
 | `http-concurrency` | `influxdb_out`, 8 | 10.00 batches/s (500 events/s) | 202 ms | 3 (2.0) | 0 |
 | `otlp-fan-out-conc` | `otlp_out`, 8 | 10.00 batches/s | 200 ms | 3 (2.0) | 0 |
 | `otlp-concurrency-tls` | `otlp_out`, 8, TLS | 9.99 batches/s | 208 ms | 4 (2.1) | 0 |
