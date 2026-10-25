@@ -693,7 +693,7 @@ that recorded the point.
 | `degraded` | warn | A sink's first dropped batch since it was last healthy. |
 | `retrying` | error | A sink's held head failed a retryable send; logged on the first failure, then at most once a minute while the head keeps failing. |
 | `recovered` | info | A sink's first successful delivery after `degraded` or a retried failure. |
-| `buffer_full` | warn | A sink's buffer, or a datagram listener's receive queue, found no room for a push. Names the bound and the `overflow` policy; repeats at most once a minute while it stays full, with what was shed or how long intake has been held. |
+| `buffer_full` | warn | A sink's buffer, or a datagram listener's receive queue, found no room for a push. Names the bound and the `overflow` policy; repeats at most once a minute while it stays full, with what was shed or how long intake has been held. On a sink with every send its `concurrency` allows in flight, it also names that concurrency and the last send's duration. |
 | `buffer_recovered` | info | A full buffer's utilization fell below its `recover_below`. Carries the episode's duration and totals. |
 | `buffer_full_at_shutdown` | info | A sink or listener stopped with its buffer still full. |
 | `telemetry left undrained at exit` | debug/warn | One line per internal metric point no `internal` drain exported, logged after every node has exited and before `exiting`, on exit `0` or `2` alike. `warn` for any nonzero `*.dropped` count, whatever its `reason`; `debug` for everything else, including timings and routine counts. Only with an `internal` component. |
@@ -1022,6 +1022,17 @@ signal. A sink whose buffer fills logs a `buffer_full` warning that names the bo
 ```text
 buffer full (buffer.max_batches 1024); overflow block is holding intake
 ```
+
+If the sink has as many batches in flight as its concurrency allows when the line is written, the
+line ends with that concurrency and the last send's duration:
+
+```text
+buffer full (buffer.max_batches 1024); overflow block is holding intake; sending at its concurrency of 1, the last send took 200ms
+```
+
+That sink isn't refusing anything: each batch waits for the one before it to be answered, so the
+round trip bounds its throughput. On a sink with a `concurrency:` field, raising it keeps more
+batches in flight; see the sink's own docs for what that costs in ordering.
 
 While the buffer stays full, the warning repeats at most once a minute with the batches and events
 shed so far, or how long intake has been held. Once the buffer's utilization falls below

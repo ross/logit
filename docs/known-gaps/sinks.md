@@ -107,17 +107,17 @@ Entry format and the other areas: [the known-gaps index](README.md).
     (`docs/known-gaps/datadog.md`).
   - **Revisit trigger:** an operator who needs a crash replay to skip delivered requests.
 
-- **Every sink that waits for a response, but `logit_out`, sends one request at a time, so over a
-  slow link its throughput is one batch per round trip.** `write_loop`
+- **`otlp_out`, `datadog_out`, `datadog_trace_out`, and `splunk_hec_out` send one request at a
+  time, so over a slow link their throughput is one batch per round trip.** `write_loop`
   (`crates/logit-pipeline/src/runtime.rs`) takes the head batch, calls the sink's `send`, and
   takes the next only after `send` returns. It submits
   several batches together only for a sink whose `Output::window` reads above 1, and the default
-  is 1. Only `logit_out` overrides it (`concurrency:`, [ADR
-  `native-hop-send-window`](../adr/native-hop-send-window.md)). The sinks this entry names take a
-  `concurrency:` field too, but each still reports a window of 1 whatever it's set to. The limit
-  holds for `otlp_out` over OTLP/HTTP and OTLP/gRPC alike (the pooled
-  gRPC client could multiplex, but `send` never has two requests outstanding), `influxdb_out`,
-  `datadog_out`, `datadog_trace_out`, `splunk_hec_out`, and `prometheus_out`'s remote-write mode.
+  is 1. Three sinks honor their `concurrency:` field: `logit_out` ([ADR
+  `native-hop-send-window`](../adr/native-hop-send-window.md)), `influxdb_out`, and
+  `prometheus_out`'s remote-write mode. The sinks this entry names take the field too, but each
+  still reports a window of 1 whatever it's set to. The limit holds for `otlp_out` over OTLP/HTTP
+  and OTLP/gRPC alike (the pooled gRPC client could multiplex, but `send` never has two requests
+  outstanding).
   A batch that needs several requests sends them in turn: `otlp_out` one per signal, and the
   Datadog and Splunk sinks one per route or body.
   - **Bound:** a sink moves at most (events per batch) ÷ (round-trip time to a response, plus the
@@ -127,8 +127,9 @@ Entry format and the other areas: [the known-gaps index](README.md).
   - **Symptom:** once the offered rate passes the bound, the sink's buffer fills. Under
     `buffer.overflow: drop_newest` (or `drop_oldest`) the sink counts
     `logit.component.batches.dropped{reason="overflow_newest"}` (`overflow_oldest`) and logs a
-    `buffer_full` warning at most once a minute, and nothing names the slow round trip as the
-    cause. Under the default `block` the sources stall instead, and the loss moves to whatever
+    `buffer_full` warning at most once a minute. While the one request is in flight, that warning
+    ends `sending at its concurrency of 1` and names the last send's duration, the round trip
+    that bounds the sink. Under the default `block` the sources stall instead, and the loss moves to whatever
     feeds them.
   - **Evidence:** the `otlp-fan-out` soak scenario (`docs/plans/soak-harness.md`, "Findings",
     "W13b: fan-out transforms", run `20261018T043911Z`). The generator's
@@ -140,18 +141,19 @@ Entry format and the other areas: [the known-gaps index](README.md).
     200 ms round trip allows. Not all of the 101,650 is the delay: the run's pause, stop, and
     partition of the SUT also overflowed the 50-batch buffer, and the plan does not split the
     count by fault.
-  - **Workaround:** put the long link under `logit_out` to a `logit_in`, which keeps up to
-    `concurrency:` frames in flight, and send from the receiving `logit` to the destination over a
+  - **Workaround:** raise `concurrency:` on `influxdb_out` or a remote-write `prometheus_out`, or
+    put the long link under `logit_out` to a `logit_in`, which keeps up to `concurrency:` frames
+    in flight, and send from the receiving `logit` to the destination over a
     short hop. Otherwise, move the sink nearer to its destination. Size `buffer.max_batches` and
     `buffer.max_bytes` to ride out a burst, and pick `overflow` for the loss you accept; none
     raises the sustained bound. Fewer, larger batches raise it: a listener that takes
     `receive.batch_max_events` and `batch_max_bytes` assembles them, and an `aggregate` stage
     sends one batch per window.
-  - **Revisit trigger:** a destination that is a long round trip away and needs more than a
-    batch per round trip, which would mean a window on the shared HTTP driver
-    (`crates/logit-outputs/src/http.rs`) and the `submit`/`await_ack` split for it. Concurrent
-    requests can arrive out of order, so each sink's posture and each destination's tolerance for
-    that need checking first.
+  - **Revisit trigger:** a destination behind one of these four sinks that is a long round trip
+    away and needs more than a batch per round trip. The shared HTTP driver's slot helper
+    (`crates/logit-outputs/src/http.rs`, "Concurrency") is the window `influxdb_out` and remote
+    write use; each remaining sink's posture and its destination's tolerance for out-of-order
+    requests need checking before it joins them.
   - **To close:** [ADR `sink-request-concurrency`](../adr/sink-request-concurrency.md), a
     `concurrency:` field per sink with each in-flight batch settled on its own, through
     [`docs/plans/sink-request-concurrency.md`](../plans/sink-request-concurrency.md). This entry

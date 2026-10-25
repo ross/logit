@@ -36,6 +36,7 @@
 //! headers:                                   # e.g. a tenant header; !env works on a value
 //!   X-Scope-OrgID: tenant-a
 //! endpoint_tls: {}                           # https:// only -- see `TlsClientConfig`
+//! concurrency: 1                             # default; batches in flight, see "Concurrency"
 //! ```
 //!
 //! Setting the other mode's field is a config error, not a no-op (rule 56). `buffer:` works in
@@ -194,10 +195,25 @@
 //! resend changes nothing. `buffer.delivery: at_most_once` would turn every 5xx into a dropped
 //! batch without making delivery safer.
 //!
-//! **Ordering is the topology's, not this sink's.** Samples go out in batch order and nothing
-//! reorders across batches. Two upstream branches writing the same series can draw out-of-order
-//! `400`s from a receiver with no out-of-order window; a single chain into one `prometheus_out`
-//! can't.
+//! **Concurrency.** `concurrency:` (default 1) bounds how many batches are in flight. At 1,
+//! [`RemoteWriteOutput`]'s `send` makes each request in turn and samples leave in batch order.
+//! Above 1, each batch's request runs in its own task through [`crate::http::Slots`], and
+//! `write_loop` settles them oldest first: a fault on one batch resends or drops that batch alone,
+//! under the table above. Nothing reorders across batches, so two batches carrying one series can
+//! land out of order: from two upstream branches at any concurrency, and from a single chain
+//! above 1. Both specs require one series' samples in timestamp order, and a receiver with no
+//! out-of-order window answers the late batch `400` (or Thanos's `409`), which is `Rejected` and
+//! drops it. Before raising `concurrency:`, check the receiver:
+//!
+//! | Receiver | Out-of-order samples |
+//! |---|---|
+//! | VictoriaMetrics | accepted, with no setting ([ADR `victoriametrics-interop`](../../../docs/adr/victoriametrics-interop.md)) |
+//! | Prometheus | accepted inside `storage.tsdb.out_of_order_time_window`, off by default |
+//! | Mimir | accepted inside the `out_of_order_time_window` limit, off by default |
+//! | Thanos receive | answered `409`; whether a setting opens a window hasn't been checked |
+//!
+//! `logit.output.in_flight` reads the batches in flight, and `logit.component.send.duration`
+//! times each batch from its last submit to its answer.
 //!
 //! **Duplicate timestamps.** One series holds one sample per millisecond. Given two in one
 //! request, Prometheus and Mimir answer `2xx`, keep the first, and drop the second silently, so

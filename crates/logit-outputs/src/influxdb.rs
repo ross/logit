@@ -43,6 +43,18 @@
 //! treats an identical `(measurement, tag set, timestamp)` write as an overwrite, not a second
 //! point.
 //!
+//! ## Concurrency
+//!
+//! `concurrency:` (default 1) bounds how many batches are in flight. At 1, [`InfluxDbOutput::send`]
+//! makes each request in turn. Above 1, each batch's request runs in its own task through
+//! [`crate::http::Slots`], and `write_loop` settles them oldest first: a fault on one batch
+//! resends or drops that batch alone, under the same response classes as `send`. Batches can
+//! land out of order. That's safe here: InfluxDB keeps the last write of a point by
+//! `(measurement, tag set, timestamp)`, so two batches writing one point with different values
+//! leave whichever landed later, the same outcome as a fan-in topology at concurrency 1.
+//! `logit.output.in_flight` reads the batches in flight, and `logit.component.send.duration`
+//! times each batch from its last submit to its answer.
+//!
 //! ## Response classes
 //!
 //! A non-2xx answer carries InfluxDB's error JSON (`code` and `message`; a parse error's message
