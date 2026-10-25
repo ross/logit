@@ -1043,9 +1043,8 @@ fault, and packet loss on it stalls every request (TCP head-of-line blocking). O
 including every `http://` endpoint, each batch in flight has its own connection, and a fault
 reaches one. The pool can hold more connections than `concurrency`, since it dials one for each
 request waiting while none is free, and it keeps each idle for 90 s. A destination that closes
-idle connections sooner, behind a link with real delay, can close one while a request written on
-it is still on the way; the sink reads that as an ambiguous fault, resent under `at_least_once`
-and dropped under `at_most_once`. `otlp_out`'s gRPC transport already carries both costs of h2.
+idle connections sooner can reset a write on one; see
+[known gaps: sinks](known-gaps/sinks.md). `otlp_out`'s gRPC transport already carries both costs of h2.
 
 While the buffer stays full, the warning repeats at most once a minute with the batches and events
 shed so far, or how long intake has been held. Once the buffer's utilization falls below

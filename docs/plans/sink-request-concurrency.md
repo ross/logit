@@ -215,12 +215,8 @@ The stand-in recorded 2,365 requests and stored 2,362, and V matched what `aggre
 1,181,300 samples, with only the cued batch rejected.
 
 **Idle keep-alive connections and a slow link.** The first `standin-concurrency` run dropped
-13 batches `ambiguous_at_most_once` where one was cued: 12 requests were reset with "connection
-closed before message completed". At concurrency above 1 the sink's pool holds spare
-connections idle between bursts. A request written on one shortly before the destination's
-keep-alive timeout (the stand-in's 5 s) arrives, 1 s later, after the destination closed it.
-`reqwest` keeps an idle connection for 90 s, so any destination with a shorter keep-alive
-timeout on a link with real delay reads some writes as `Ambiguous`: dropped under
-`at_most_once`, resent under `at_least_once`. The scenario now raises the stand-in's idle timeout
-to 120 s. The race needs both a destination idle timeout under the client's and a delay
-comparable to the gap between them; it isn't a `docs/known-gaps/` entry yet.
+13 batches `ambiguous_at_most_once` where one was cued: a destination idle timeout of 5 s under
+the pool's 90 s, with a 1 s egress delay, reset 12 writes on connections it had already closed.
+The account is [`docs/known-gaps/sinks.md`](../known-gaps/sinks.md)'s "An idle pooled connection
+a destination closed first reads as `Ambiguous`". The scenario now raises the stand-in's idle
+timeout to 120 s.

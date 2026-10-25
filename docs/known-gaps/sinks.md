@@ -123,3 +123,20 @@ Entry format and the other areas: [the known-gaps index](README.md).
     diagnostic for the rejection text.
   - **To close:** a dead-letter sink for rejected batches and a split-on-`413` retry step in the
     shared HTTP driver, each with its own ADR.
+
+- **An idle pooled connection a destination closed first reads as `Ambiguous`.** Above
+  `concurrency: 1`, an HTTP sink's `reqwest` pool keeps spare connections idle between bursts,
+  each for its 90 s default. A destination that closes idle connections sooner, behind a link
+  with real delay, can receive a write on a connection it has already closed: the sink wrote it
+  before the close reached it, and it arrived after. The destination resets the connection, and
+  the sink reads that as `Ambiguous` ("connection closed before message completed"), so
+  `at_most_once` drops the batch, counted `batches.dropped{reason="ambiguous_at_most_once"}`, and
+  `at_least_once` resends it.
+  - **Measured:** under a 1 s delay on the sink's egress at `concurrency: 8`, a destination with a
+    5 s idle timeout reset 12 writes no fault caused in about 2,300 batches; with a 120 s idle
+    timeout, none ([plan `sink-request-concurrency`](../plans/sink-request-concurrency.md)'s
+    "Findings").
+  - **Workaround:** raise the destination's keep-alive idle timeout above 90 s where it's
+    configurable, or keep `at_least_once` so the batch is resent.
+  - **Candidate remedies, not decided:** a sink-side pool idle timeout below common server
+    defaults, or a config field for it. Either needs its own ADR.
