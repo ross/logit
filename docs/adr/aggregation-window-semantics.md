@@ -1067,7 +1067,8 @@ record.
   series emitted at the last flush that hasn't absorbed since. `idle_windows` alone isn't the test:
   `process` sets `updated_this_window` and never writes `idle_windows`, so a retained series that
   absorbs this window still carries the count from before. Each admission evicts one candidate, in
-  the flush cap's order (`idle_windows` descending, then `open_seq` descending), counted as
+  the flush cap's order (`idle_windows` descending, then `open_seq` descending, with a
+  `max_series_per_metric` overflow series last: `EvictionRank`), counted as
   `logit.transform.series.evicted{reason="series_limit"}`, with no `state` tag because the series
   is always idle. `reason="cardinality"` stays the flush-time `max_retained_series` cap's.
 - **The eviction order is built once per window, on the overload path.** The first full-cap
@@ -1075,8 +1076,8 @@ record.
   one, skipping any that has absorbed since. The order clones an owned group index and
   `SeriesKey` per candidate, attribute set included, because a borrow into the series map can't
   outlive the inserts and removals that follow. Those clones and the order's `Vec` are the cap's
-  allocations, made only on the overload path and at most once per window. The order is rebuilt
-  only when it runs out while candidates may remain, and is discarded at flush.
+  allocations, made only on the overload path. The order is built at most once per window and never
+  rebuilt within it, because no series joins the candidate set mid-window. It's discarded at flush.
 - **A record is dropped only when every held series has absorbed this window.** It's counted as
   `logit.transform.metrics.dropped{reason="series_limit"}`, with a throttled diagnostic that names
   the cap and points at `keep`, `keep_values`, and raising `max_series`. The diagnostic prints the
@@ -1139,8 +1140,11 @@ Past the limit, a record that would open a new series folds into an **overflow s
 - **`logit.overflow` is public**, a `logit.` attribute, not a private `_logit.` one: it reaches
   the backend, where it marks the point as folded. A `keep` placed after `aggregate` strips it
   unless `keep` lists it.
-- **An overflow series is known by its key, never by a flag.** In a two-tier topology, an upstream
-  stage's overflow series arrives downstream as an ordinary series carrying `logit.overflow`.
+- **An overflow series is known by its key, never by a flag.** A series is an overflow series when
+  its attributes are the marker plus only `_logit.*` keys and `host.name`. In a two-tier topology,
+  an upstream stage's overflow series is therefore an overflow series downstream too: it has no
+  per-name slot and is evicted last. A record absorbed into it is not a fold here, so it counts
+  toward neither `overflowed` nor `overflowing`, and each process reports only its own folding.
 - **It doesn't count against the per-name limit,** so a name over the limit always has somewhere
   to fold. It counts against `max_series` and is admitted by the same rule: if opening it would
   pass `max_series`, it first evicts one retained series that hasn't absorbed this window, and
@@ -1149,10 +1153,12 @@ Past the limit, a record that would open a new series folds into an **overflow s
   histogram with other bounds takes `histogram_bounds_mismatch`, as for any series. A record whose
   kind conflicts with its name's overflow series takes the `kind_conflict` pass-through, because
   the case is rare, counted, and handled as every other kind conflict in `aggregate` is. Under
-  `temporality: cumulative`, `prometheus_out` then drops that delta as `unresolved_delta`.
-- **It sorts last for the flush-time `max_retained_series` eviction.** Opened after the name's
-  admitted series, it would otherwise be the newest of its idle tier and the first evicted, and
-  under `temporality: cumulative` it would restart with a new start time every window.
+  `temporality: cumulative`, a delta `Sum` in that case is dropped by `prometheus_out` as
+  `unresolved_delta`.
+- **It sorts last for both evictions,** the flush-time `max_retained_series` cap and an admission
+  eviction. Opened after the name's admitted series, it would otherwise be the newest of its idle
+  tier and the first evicted, and under `temporality: cumulative` it would restart with a new
+  start time every window.
 
 What the folded value means depends on the kind:
 
@@ -1171,14 +1177,17 @@ neither carries a metric name in any tag:
 
 - `logit.transform.metrics.overflowed` counts records folded into an overflow series. It's a
   subset of `absorbed`, so it adds no term to the records identity.
-- `logit.transform.metrics.overflowing` is a gauge of how many names are over the limit, sampled
-  at flush before any series is touched, as `logit.transform.series.active` is.
+- `logit.transform.metrics.overflowing` is a gauge of how many names had a record past their limit
+  since the last flush, whether or not the fold then settled (`max_series` may refuse it, and a
+  kind conflict passes through). It's sampled at flush before any series is touched, as
+  `logit.transform.series.active` is.
 
 Both carry only the component's usual tags, plus `host.name` through `internal`. Names appear only
 in a throttled diagnostic, a log event that reaches the pipeline through `internal`'s `logs:`. It
-names the overflowing name with the most series, the attribute key with the most distinct values
-among that name's series (keys only, never values), and how many other names are overflowing. The
-scan behind it runs only when the throttled diagnostic will emit.
+names the overflowing name with the most records past its limit since the last flush (every
+overflowing name holds the limit's count of series, so the series count can't rank them), the
+attribute key with the most distinct values among that name's series (keys only, never values),
+and how many other names are overflowing. The scan behind it runs only when the throttled diagnostic will emit.
 
 The name-to-count map is an allocation-strategy change, so it's measured with the existing
 `aggregate` benches and perf scenarios
