@@ -110,7 +110,10 @@ in flight on its own outcome, so a fault on one batch neither resends nor drops 
   - `Rejected` drops the head alone and commits it, as today.
   - A retryable fault (`Clean`, `Refused`, or `Ambiguous` under `at_least_once`) backs off and
     resubmits the head alone. The sink replaces that slot and the others keep running. The
-    backoff schedule and `logit.component.retrying` stay the loop's, keyed to the head.
+    backoff schedule and `logit.component.retrying` stay the loop's, keyed to the head. A failed
+    resubmit follows the same mark: with `HeadOnly` it's the head's own fault and is handled as
+    above, and without it the sink dropped its connection, so nothing is outstanding and the
+    loop resubmits from the head.
   - `Ambiguous` under `at_most_once` drops the head alone, counted
     `ambiguous_at_most_once`, and nothing else is committed. The native hop's "every other
     outstanding item" rule holds for a connection-level fault, which arrives without `HeadOnly`.
