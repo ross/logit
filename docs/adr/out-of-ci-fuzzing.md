@@ -490,8 +490,9 @@ and CI, where before it showed only at the next campaign's build.
 
 The check doesn't build under the sanitizer, run a target, or lint `fuzz/`. A change to what a
 decoder accepts can still break a target's oracle with every check green, so the
-"Consequences" advice stands: run `script/unsafe-check fuzz-seed` and a short `fuzz-all` after
-changing a decoder a target calls.
+"Consequences" advice stands: run a short `fuzz-all` after changing a decoder a target calls.
+`script/lint` also runs `seedgen --check`, which fails on a stale seed until
+`script/unsafe-check fuzz-seed` regenerates it.
 
 ## Amendment (2026-10-18): a run the host slept through is rerun, not kept awake
 
