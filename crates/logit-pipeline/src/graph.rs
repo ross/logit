@@ -346,6 +346,8 @@
 //! 97. A `concurrency` of 0, which could send nothing, or past 1024 on an `influxdb_out`,
 //!     `otlp_out`, `datadog_out`, `datadog_trace_out`, `splunk_hec_out`, or `prometheus_out`
 //!     (`docs/adr/sink-request-concurrency.md`, decision 1).
+//! 98. An `influxdb_out` whose `tls` fails rule 24's checks, the scheme one included: the `url`'s
+//!     scheme selects TLS, so a block under `http://` does nothing.
 //!
 //! Not validated: that a `by: {provenance: ..}` route key names a component in this graph. Like
 //! 37's ids, it may name a component relayed from another process. Nor is `keep`'s empty `fields`:
@@ -4046,6 +4048,33 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
+    // Rule 98: `influxdb_out`'s `tls:` gets rule 24's checks, the `url`'s scheme selecting TLS.
+    for (id, component) in &components {
+        let ComponentKind::InfluxDbOut { url, tls, .. } = &component.kind else {
+            continue;
+        };
+        if tls.cert_file.is_some() != tls.key_file.is_some() {
+            anyhow::bail!(
+                "component '{id}': 'tls.cert_file' and 'tls.key_file' must both be set for \
+                 mutual TLS, or both omitted -- one alone can't be used"
+            );
+        }
+        if tls.insecure_skip_verify && tls.ca_file.is_some() {
+            anyhow::bail!(
+                "component '{id}': 'tls.insecure_skip_verify' and 'tls.ca_file' can't both be \
+                 set -- 'insecure_skip_verify' trusts any certificate, which makes a specific \
+                 trusted CA meaningless"
+            );
+        }
+        if !tls.is_empty() && !url.to_ascii_lowercase().starts_with("https://") {
+            anyhow::bail!(
+                "component '{id}': 'tls' is set, but 'url' ({url:?}) isn't 'https://' -- TLS is \
+                 selected by the url's scheme, so a 'tls:' block here would have no effect",
+                url = redact::url(url)
+            );
+        }
+    }
+
     // Rule 94: `cumulative_to_delta` (`docs/adr/cumulative-to-delta-transform.md`). Both bounds
     // are impossible at `0`: a zero `max_staleness` evicts every series at the next batch, so no
     // point is ever differenced, and the transform would clamp a zero `max_series` to `1`.
@@ -5168,6 +5197,7 @@ mod tests {
             token: "TOKEN".to_string(),
             concurrency: 1,
             idle_timeout: logit_config::default_sink_idle_timeout(),
+            tls: logit_config::TlsClientConfig::default(),
         }
     }
 
@@ -8519,6 +8549,42 @@ mod tests {
         for _ in 0..8 {
             assert_eq!(resolve_warnings(config()), warnings);
         }
+    }
+
+    /// Rule 98: rule 24's `tls` checks on an `influxdb_out`, including a block under `http://`.
+    #[test]
+    fn an_influxdb_out_tls_block_that_cant_take_effect_is_rejected() {
+        let with = |url: &str, edit: fn(&mut logit_config::TlsClientConfig)| {
+            let mut kind = sink();
+            if let ComponentKind::InfluxDbOut { url: u, tls, .. } = &mut kind {
+                *u = url.to_string();
+                edit(tls);
+            }
+            expect_err(cfg(vec![("in", vec![], listener()), ("out", vec!["in"], kind)]))
+        };
+        let err = with("https://influx:8086", |t| t.cert_file = Some("client.pem".into()));
+        assert!(err.contains("must both be set"), "got: {err}");
+        let err = with("https://influx:8086", |t| {
+            t.insecure_skip_verify = true;
+            t.ca_file = Some("ca.pem".into());
+        });
+        assert!(err.contains("can't both be set"), "got: {err}");
+        let err = with("http://influx:8086", |t| t.insecure_skip_verify = true);
+        assert!(err.contains("isn't 'https://'"), "got: {err}");
+    }
+
+    /// Rule 98 passes a block under `https://` and an empty one under `http://`.
+    #[test]
+    fn an_influxdb_out_tls_block_under_https_validates() {
+        let mut kind = sink();
+        if let ComponentKind::InfluxDbOut { url, tls, .. } = &mut kind {
+            *url = "https://influx:8086".to_string();
+            tls.ca_file = Some("ca.pem".into());
+        }
+        resolve(cfg(vec![("in", vec![], listener()), ("out", vec!["in"], kind)]))
+            .expect("a tls block under https:// is valid");
+        resolve(cfg(vec![("in", vec![], listener()), ("out", vec!["in"], sink())]))
+            .expect("no tls block under http:// is valid");
     }
 
     /// Rule 70: rule 24's `tls` checks, including a block under `http://`.

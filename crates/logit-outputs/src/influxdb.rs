@@ -57,6 +57,10 @@
 //! `logit.output.in_flight` reads the batches in flight, and `logit.component.send.duration`
 //! times each batch's request from its send to its response.
 //!
+//! `tls:` tunes an `https://` url: a private `ca_file`, a client certificate, or
+//! `insecure_skip_verify` ([`InfluxDbOutput::with_tls`]). Empty, the client keeps `reqwest`'s
+//! default trust. The files reload without a restart, as every TLS sink's do.
+//!
 //! `idle_timeout:` (default `30s`) closes a pooled connection idle past it instead of reusing it,
 //! so the sink closes an idle connection before the destination can ([`crate::http::build_client`];
 //! `docs/adr/sink-request-concurrency.md`, decision 7).
@@ -125,7 +129,11 @@ use logit_pipeline::{BatchContext, DeliveryPosture, Fault, SeqId};
 pub use logit_proto::influxdb::encode::{EncodeStats, InfluxLineEncoder};
 use logit_proto::influxdb::{RESOURCE_ATTR_BUCKET, RESOURCE_ATTR_ORG, RESOURCE_ATTR_ORG_ID};
 use logit_proto::Encoder;
+use std::path::Path;
 use std::time::Duration;
+
+/// `tls:`: the shared `crate::tls` type, re-exported as the other sinks do.
+pub use crate::tls::TlsClientSettings;
 
 /// `reqwest` has no request timeout by default; without one, a server that accepts the connection
 /// but never responds hangs `send`, and the pipeline worker driving it, forever.
@@ -280,6 +288,8 @@ pub struct InfluxDbOutput {
     slots: Slots<(Carried, Exchange)>,
     /// The operator's `idle_timeout:` ([`crate::http::build_client`]).
     idle_timeout: Duration,
+    /// Built by [`InfluxDbOutput::with_tls`]; `None` keeps `reqwest`'s default trust.
+    tls: Option<rustls::ClientConfig>,
 }
 
 /// Where and how a batch is written: everything a request needs from the config.
@@ -321,7 +331,17 @@ impl InfluxDbOutput {
             slots: Slots::new(accounting.gate().clone()),
             accounting,
             idle_timeout: crate::http::DEFAULT_IDLE_TIMEOUT,
+            tls: None,
         }
+    }
+
+    /// Rebuilds the client from the timeouts and TLS config set so far.
+    fn rebuild_client(&mut self) {
+        self.writer.client = crate::http::build_client(
+            self.writer.request_timeout,
+            self.idle_timeout,
+            self.tls.as_ref(),
+        );
     }
 
     /// Sets how many batches may be in flight at once (`concurrency:` in config, default 1).
@@ -335,16 +355,45 @@ impl InfluxDbOutput {
     /// client.
     pub fn with_idle_timeout(mut self, idle_timeout: Duration) -> Self {
         self.idle_timeout = idle_timeout;
-        self.writer.client =
-            crate::http::build_client(self.writer.request_timeout, idle_timeout, None);
+        self.rebuild_client();
         self
     }
 
     /// Overrides the default 10s request timeout. Rebuilds the underlying HTTP client.
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
-        self.writer.client = crate::http::build_client(timeout, self.idle_timeout, None);
         self.writer.request_timeout = timeout;
+        self.rebuild_client();
         self
+    }
+
+    /// Client TLS tuning (`tls:`) for an `https://` url. A no-op when `settings` is empty.
+    ///
+    /// Registers the files with `reloader` under this sink's diagnostics and telemetry as they are
+    /// when this runs, so call it after `with_diagnostics` and `with_telemetry`.
+    pub fn with_tls(
+        mut self,
+        settings: &TlsClientSettings,
+        base_dir: &Path,
+        reloader: &logit_pipeline::tls::TlsReloader,
+    ) -> anyhow::Result<Self> {
+        if settings.is_empty() {
+            return Ok(self);
+        }
+        if settings.insecure_skip_verify {
+            self.diag.warn(
+                "tls.insecure_skip_verify is set -- the connection is encrypted, but this output \
+                 will accept any certificate the peer presents, self-signed or otherwise",
+            );
+        }
+        self.tls = Some(logit_pipeline::tls::build_client_config(
+            settings,
+            base_dir,
+            reloader,
+            &self.diag,
+            &self.telemetry,
+        )?);
+        self.rebuild_client();
+        Ok(self)
     }
 
     /// Attaches the encoder's diagnostics handle (per-metric encode failures), gated by this
@@ -1745,6 +1794,119 @@ mod tests {
     async fn a_400_naming_no_organization_is_rejected() {
         let body = r#"{"code":"invalid","message":"Please provide either orgID or org"}"#;
         assert_eq!(carried_class_of(influx_error("400 Bad Request", body)).await, Fault::Rejected);
+    }
+
+    // -- tls: ----------------------------------------------------------------------------------
+
+    /// A receiver over TLS presenting `testdata/tls/server.pem`, answering every write `204`.
+    /// Returns the receiver and a sink dialing it, tuned by `settings`.
+    async fn tls_sink(
+        client_ca: Option<&str>,
+        settings: crate::tls::TlsClientSettings,
+    ) -> (crate::http::held::Mux, InfluxDbOutput) {
+        let server =
+            crate::test_support::fixture_server_config("server", client_ca, &[b"http/1.1"]);
+        let mux = crate::http::held::Mux::start(Some(server)).await;
+        mux.release();
+        let output = InfluxDbOutput::new(
+            mux.url().to_string(),
+            Organization::Fixed("org".into()),
+            Destination::Fixed("bucket".into()),
+            "token".into(),
+        )
+        .with_tls(
+            &settings,
+            &crate::test_support::testdata_dir(),
+            &logit_pipeline::tls::TlsReloader::new(),
+        )
+        .expect("the fixture files load");
+        (mux, output)
+    }
+
+    /// With the private CA in `ca_file`, the write completes over TLS.
+    #[tokio::test]
+    async fn a_ca_file_trusts_a_private_ca_receiver() {
+        let settings = crate::test_support::tls_settings(|s| s.ca_file = Some("ca.pem".into()));
+        let (mux, mut output) = tls_sink(None, settings).await;
+        output.send(&one_metric_batch()).await.expect("the write should verify and land");
+        assert_eq!(mux.carriers().len(), 1, "one request reached the receiver");
+    }
+
+    /// Without `ca_file`, `reqwest`'s default trust refuses the private CA's certificate.
+    #[tokio::test]
+    async fn no_tls_block_refuses_a_private_ca_receiver() {
+        let (mux, mut output) = tls_sink(None, Default::default()).await;
+        output.send(&one_metric_batch()).await.expect_err("the private CA isn't trusted");
+        assert!(mux.carriers().is_empty(), "no request got through the handshake");
+    }
+
+    /// `insecure_skip_verify` accepts the same certificate without a CA.
+    #[tokio::test]
+    async fn insecure_skip_verify_accepts_a_private_ca_receiver() {
+        let settings = crate::test_support::tls_settings(|s| s.insecure_skip_verify = true);
+        let (mux, mut output) = tls_sink(None, settings).await;
+        output.send(&one_metric_batch()).await.expect("verification is off");
+        assert_eq!(mux.carriers().len(), 1);
+    }
+
+    /// A receiver requiring a client certificate admits the sink only with `cert_file` and
+    /// `key_file` set.
+    #[tokio::test]
+    async fn a_client_certificate_satisfies_mutual_tls() {
+        let with_cert = crate::test_support::tls_settings(|s| {
+            s.ca_file = Some("ca.pem".into());
+            s.cert_file = Some("client.pem".into());
+            s.key_file = Some("client.key".into());
+        });
+        let (mux, mut output) = tls_sink(Some("ca"), with_cert).await;
+        output.send(&one_metric_batch()).await.expect("the client certificate is admitted");
+        assert_eq!(mux.carriers().len(), 1);
+
+        let without_cert = crate::test_support::tls_settings(|s| s.ca_file = Some("ca.pem".into()));
+        let (mux, mut output) = tls_sink(Some("ca"), without_cert).await;
+        output.send(&one_metric_batch()).await.expect_err("no client certificate is refused");
+        assert!(mux.carriers().is_empty());
+    }
+
+    /// `with_tls` survives the later timeout and idle-timeout setters, which rebuild the client.
+    #[tokio::test]
+    async fn the_tls_config_survives_a_client_rebuild() {
+        let settings = crate::test_support::tls_settings(|s| s.ca_file = Some("ca.pem".into()));
+        let (mux, output) = tls_sink(None, settings).await;
+        let mut output =
+            output.with_timeout(Duration::from_secs(5)).with_idle_timeout(Duration::from_secs(1));
+        output.send(&one_metric_batch()).await.expect("the rebuilt client still trusts ca.pem");
+        assert_eq!(mux.carriers().len(), 1);
+    }
+
+    /// A reloaded `ca_file` reaches the next request: building the sink registers its files with
+    /// the reloader.
+    #[tokio::test]
+    async fn a_reloaded_ca_file_reaches_the_next_request() {
+        use crate::test_support::{fixture_server_config, rewrite_tls_file, scratch_tls_files};
+        let server = fixture_server_config("server-other", None, &[b"http/1.1"]);
+        let mux = crate::http::held::Mux::start(Some(server)).await;
+        mux.release();
+        let dir = scratch_tls_files("influxdb-out-ca-reload", &[("ca.pem", "ca.pem")]);
+        let reloader = logit_pipeline::tls::TlsReloader::new();
+        let mut output = InfluxDbOutput::new(
+            mux.url().to_string(),
+            Organization::Fixed("org".into()),
+            Destination::Fixed("bucket".into()),
+            "token".into(),
+        )
+        .with_tls(
+            &crate::test_support::tls_settings(|s| s.ca_file = Some("ca.pem".into())),
+            &dir,
+            &reloader,
+        )
+        .unwrap();
+        output.send(&one_metric_batch()).await.expect_err("ca.pem didn't sign server-other");
+
+        rewrite_tls_file(&dir, "ca.pem", "other-ca.pem");
+        reloader.check_now();
+
+        output.send(&one_metric_batch()).await.expect("the reloaded CA trusts the receiver");
     }
 
     // -- concurrency above 1 (`docs/adr/sink-request-concurrency.md`, decision 3) -----------

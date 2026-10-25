@@ -3615,6 +3615,12 @@ choosing the carried form, know what it costs:
 `influxdb-line-protocol-relay`](adr/influxdb-line-protocol-relay.md)'s 2026-10-15 amendment has
 the reasoning.
 
+**TLS to InfluxDB.** The `url`'s scheme selects TLS, and `tls:` tunes an `https://` url: a
+`ca_file` for a private CA, a `cert_file` and `key_file` for mutual TLS, or `insecure_skip_verify`.
+Without a `tls:` block, the sink trusts the bundled Mozilla roots. A non-empty `tls:` block under
+an `http://` url is a `logit validate` error, because it would have no effect. The block behaves
+as on `otlp_out` (see [TLS](#tls)), and the files reload without a restart.
+
 **String fields reach `influxdb_out` alone among the protocol sinks.** Every other protocol sink
 leaves a string field off, uncounted, because its free-text value as a tag or label would start a
 series per value. Sinks that write the whole event keep it, as they keep every private
@@ -4481,6 +4487,7 @@ Which component takes which block:
 | Component | Block | Turned on by | Notes |
 |---|---|---|---|
 | `otlp_out` | `TlsClientConfig` | an `https://` `endpoint` | `tls:` under a plaintext endpoint is rule 24 |
+| `influxdb_out` | `TlsClientConfig` | an `https://` `url` | `tls:` under an `http://` url is rule 98 |
 | `logit_out`, `syslog_out`, `statsd_out` | `TlsClientConfig` | the block's presence | bare `host:port`; stream transport only (rules 34/44/52) |
 | `prometheus_in` (`scrape_tls:`) | `TlsClientConfig` | an `https://` scrape target | scrape mode is a client, not a listener; a set block with no `https://` target is rule 40 |
 | `prometheus_in` (`bind_tls:`) | `TlsServerConfig` | the block's presence | the remote-write receiver's own listener; bind mode only (rule 55) |

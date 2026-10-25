@@ -113,8 +113,7 @@ Non-goals:
   `influxdb_in`, `wire = "http"` as `http-ingress` declares it, 200 ms ± 50 ms netem on
   the responses, run at `concurrency: 1` and `8` as two scenarios (`http-concurrency-1`), with
   `[[expect]]` rows on `logit.output.in_flight` and on
-  `batches.dropped{reason="overflow_newest"}` at 0 under 8. It runs over plaintext:
-  `influxdb_out` has no `tls:` field, so it can't trust the run's private CA.
+  `batches.dropped{reason="overflow_newest"}` at 0 under 8. It runs over plaintext.
   `otlp-concurrency-tls` runs `otlp_out` into `otlp_in` over TLS instead, where ALPN picks
   HTTP/2.
 - **`otlp-fan-out`** at `concurrency: 8`, as a second config or a sibling scenario, judged by the
