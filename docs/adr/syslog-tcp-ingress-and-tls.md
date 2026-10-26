@@ -1,6 +1,6 @@
 ---
 created: 2026-09-13
-updated: 2026-10-25
+updated: 2026-10-26
 ---
 
 # `syslog_in` gains TCP and TLS ingress; `syslog_out` gains TLS
@@ -434,3 +434,57 @@ traffic is expected.
 framing stays detected from its first byte, and `framing:` under `transport: tcp` is a config
 error. `syslog_in` now has a `framing: lines | datagram` field that applies to `transport: udp`
 only. See [ADR `syslog-udp-datagram-framing`](syslog-udp-datagram-framing.md).
+
+## Amendment: the stream sinks wait for a client certificate's acceptance (2026-10-26)
+
+**Decision:** a new TLS 1.3 connection from `syslog_out` or `statsd_out` whose server asked for a
+client certificate reads, before its first write, until the server accepts or rejects that
+certificate, bounded by a new `accept_timeout:` (default `1s`). A rejection is `Fault::Refused`.
+
+**Context.** Under TLS 1.3 the server checks the client certificate after the client's `Finished`,
+so `TlsConnector::connect` returns before the verdict. These sinks never read, so a rejection's
+alert went unseen and the first batch, written into a connection the server was closing, counted
+delivered. On a pooled connection the reuse probe (`crate::tls::poll_pending_close`) read the
+alert as EOF and redialed, so every later batch met the same fate: a rejected sink lost every
+batch, uncounted. "`syslog_out`'s TCP connection becomes TLS-capable" above held that a flush
+before success was enough; it proves the bytes left, not that the server took them.
+
+**What ends the wait** (`crates/logit-outputs/src/stream.rs`'s module doc has the table):
+
+- A session ticket (`ClientConnection::tls13_tickets_received`) is acceptance. Servers send
+  tickets after their checks, so a ticket is a positive signal that costs one round trip. A
+  ticket-only read leaves tokio-rustls's `poll_read` pending, so the wait checks the count after
+  every wake.
+- An alert is `Fault::Refused`, its message naming the alert (`certificate_required`,
+  `bad_certificate`). Refused holds the queue and retries with no budget
+  ([ADR `sink-fault-classes`](sink-fault-classes.md)): a rejected certificate stays rejected until
+  an operator fixes it, so dropping each batch as `Rejected` would lose data the fix could save.
+- EOF, `close_notify`, a reset, or application data from the server is `Fault::Clean`. Nothing
+  was written, and a line receiver never sends data, so data before the first write means the
+  connection isn't one to write into, as `PendingClose::Bytes` already decided for a reused one.
+- `accept_timeout` elapsing is acceptance.
+
+**Only connections whose server sent a CertificateRequest wait.** rustls calls the config's
+client-certificate resolver only on a CertificateRequest, so `TlsTarget::new` wraps that resolver
+once in `RecordsCertRequest`, which sets a task-local flag scoped to the one handshake future and
+delegates to the inner resolver, so certificate reload still works. The wrapper is one `Arc` for
+the config's life, not one per dial: rustls offers a stored ticket only to a config whose resolver
+is the `Arc` the ticket was issued under, so a per-dial wrapper would end session resumption. A
+resumed TLS 1.3 handshake carries no CertificateRequest, so it doesn't wait. TLS 1.2 doesn't
+either: its server checks the certificate inside the handshake, so a rejection already fails the
+dial `Clean`. `logit_out` passes a zero bound, since it reads the peer's answer to its `Hello`.
+
+**On a reused connection, an alert the probe reads is `Fault::Refused` too**, with nothing written
+and no redial (`crate::tls::poll_pending_close_or_alert`). `poll_pending_close` keeps its old
+answer for `logit_out` and `kafka_out`.
+
+**Why `1s`.** A server that sends no ticket and no alert (GnuTLS-based collectors send no TLS 1.3
+ticket by default) is indistinguishable from one still deciding, so it costs the whole bound once
+per new connection, and pooled connections make new ones rare. A rejection on a LAN or a nearby
+region arrives in well under a second. `0s` turns the wait off. The field is accepted without
+`tls:` and has no effect there, so a config can set it ahead of TLS.
+
+**Residual.** A rejection that arrives after `accept_timeout` still loses that connection's first
+batch, as before. The next send's probe then reports the alert as `Refused`, or redials past a
+close that carried none, and the redial's own wait catches the rejection. A server that rejects
+with a bare close instead of an alert, after the bound, looks like an idle close.
