@@ -235,12 +235,12 @@ Entry format and the other areas: [the known-gaps index](README.md).
     `crates/logit-outputs/src/stream.rs`) can pass the name to `connect` directly. SNI has to change
     on every client at once, so the field means the same thing on each.
 - **A client-certificate rejection slower than `accept_timeout` loses one batch on the TLS stream
-  sinks.** Under TLS 1.3 a server checks the client certificate after the handshake completes, so
-  `syslog_out` and `statsd_out` read before a new connection's first write until the server sends
-  a session ticket, an alert, or nothing for `accept_timeout:` (default `1s`), and an alert is
-  `Fault::Refused` ([ADR `syslog-tcp-ingress-and-tls`](../adr/syslog-tcp-ingress-and-tls.md)'s
-  2026-10-26 amendment). Silence is taken as acceptance, because a GnuTLS-based server sends no
-  ticket.
+  sinks.** Under TLS 1.3 a server checks the client certificate after the handshake completes, and
+  TLS sends nothing when it accepts. So before a new connection's first write, `syslog_out` and
+  `statsd_out` read for `accept_timeout:` (default `1s`) when the destination has asked for a
+  client certificate, and an alert or a close in that time is `Fault::Refused`
+  ([ADR `syslog-tcp-ingress-and-tls`](../adr/syslog-tcp-ingress-and-tls.md)'s 2026-10-26
+  amendment). Silence for the whole bound is taken as acceptance.
   - **Consequence:** a server that rejects after the bound, or closes with no alert after it, gets
     the first batch written into a connection it's closing, and the sink counts that batch
     delivered. The next send's probe reads the alert as `Refused`, or redials past the bare close,
@@ -248,6 +248,8 @@ Entry format and the other areas: [the known-gaps index](README.md).
     uncounted.
   - **Workaround:** raise `accept_timeout:` above the server's worst-case verdict time.
   - **To close:** needs an acknowledgment from the receiver; neither syslog nor statsd has one.
+    Established write-only senders (rsyslog's `omfwd`, syslog-ng, Vector's socket sink) accept the
+    same loss on every connection, with no wait at all.
 - **A peer's FIN arriving during a write on a pooled connection is lost silently on the plaintext
   stream sinks.** `syslog_out`, `statsd_out`, and `graphite_out` probe a reused pooled connection
   before writing (`crate::tls::poll_pending_close_or_alert`). That catches a peer that closed while the

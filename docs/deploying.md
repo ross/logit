@@ -916,7 +916,7 @@ An error the sink attaches no fault to is treated as `Rejected`.
 - **An attempt has no runtime timeout.** The sink's own transport timeout bounds each one:
   `request_timeout`, the HTTP client's timeouts, or, on `syslog_out`, `statsd_out`, and
   `graphite_out` over a stream, `connect_timeout`, which also bounds each write's progress, and
-  `accept_timeout` the TLS wait for a client certificate's acceptance. The
+  `accept_timeout` the TLS read for a client-certificate rejection. The
   shutdown grace cuts an attempt short. A write with no such timeout, such as `stdio_out`'s to a
   pipe, holds the queue with no failed attempt, so `logit.component.retrying` stays `0`, and a
   `buffer_full` warning is the first sign once the queue fills
@@ -2322,14 +2322,14 @@ components:
 - **`connect_timeout:` bounds the TCP connect and the TLS handshake as two separate phases**, not
   one combined deadline, so a TLS connect can take up to twice the configured value (`syslog_out`'s
   arrangement). Account for that if you raise it.
-- **A server that asks for a client certificate gets `accept_timeout:` to accept it before the
-  first write.** Under TLS 1.3 the server checks the certificate after the handshake completes, so
-  a new connection waits for the server's session ticket (acceptance) or alert (rejection) before
-  writing a batch. A rejection holds the queue and retries, and `logit.output.requests{class="refused"}`
-  counts each attempt, with the alert (`certificate_required`, say) in the `retrying` log line. A
-  server that sends no ticket, as GnuTLS-based servers don't, costs the whole wait once per new
-  connection; a server that asks for no certificate, or a resumed session, costs none. A rejection
-  slower than the bound still loses that connection's first batch
+- **A new connection to a server that asks for a client certificate waits `accept_timeout:` before
+  its first write.** Under TLS 1.3 the server checks the certificate after the handshake completes,
+  and TLS sends nothing when it accepts, so the sink reads for the whole bound: an alert or a close
+  in that time is a rejection, and silence is acceptance. Every new connection to such a server
+  waits once, a resumed one included; a server that asks for no certificate never costs a wait. A
+  rejection holds the queue and retries, and `logit.output.requests{class="refused"}` counts each
+  attempt, with the alert (`certificate_required`, say) or the close in the `retrying` log line. A
+  rejection slower than the bound still loses that connection's first batch
   ([docs/known-gaps/intake.md](known-gaps/intake.md)), so raise it for a slow verifier, or set `0s`
   to turn the wait off.
 - **A retry never redelivers a batch over TLS, so expect a TLS relay to drop batches a plaintext
@@ -4695,9 +4695,12 @@ phases**, not one combined deadline, so a TLS connect can take up to twice the c
 ([ADR `syslog-tcp-ingress-and-tls`](adr/syslog-tcp-ingress-and-tls.md)'s amendment). Account for
 that if you raise it from the default.
 
-**`syslog_out.accept_timeout` (default `1s`) bounds the wait for a mutual-TLS server's verdict on
-the client certificate**, before a new connection's first write, as for `statsd_out` above: a
-rejection is retried with the queue held rather than counted delivered.
+**`syslog_out.accept_timeout` (default `1s`) is how long a new connection to a server that asks for
+a client certificate reads for a rejection before its first write**, as for `statsd_out` above:
+every such connection, full or resumed, waits the whole bound once, and a rejection is retried
+with the queue held rather than counted delivered. rsyslog turns a certificate away with a bare
+close or `close_notify`, often after sending session tickets, which the wait reads as a rejection
+too.
 
 `syslog_in.handshake_timeout` (default 5s) is the receiving side's equivalent: one budget for the
 TLS accept, then a fresh one for the wait for the connection's first byte, so a TLS peer that
