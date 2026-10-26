@@ -10,11 +10,11 @@
 
 name = "standin-remote-write-v2"
 description = "statsd-vm into prometheus_out RW2 Snappy, against a stand-in answering the 2.0 written-count rows of the sink's response-class table"
-duration = "9m25s"        # warmup + one cycle + cooldown
+duration = "11m10s"       # warmup + one cycle + cooldown
 warmup = "60s"
 cooldown = "60s"          # >= recovery_bound
 recovery_bound = "45s"    # retry_max_delay 10s + two aggregate windows + a drain
-cycle = "7m25s"           # the last step, its recovery, and two progress windows
+cycle = "9m10s"           # the last step, its recovery, and two progress windows
 
 [configs]
 sut = "logit-sut.yaml"
@@ -74,6 +74,14 @@ action = "respond"
 on = "standin"
 status = 415
 class = "refused"
+for = "20s"
+
+[[step]]                  # c0s5: a 2xx whose count isn't a number: settled, reported, nothing dropped
+at = "7m"
+action = "respond"
+on = "standin"
+status = 200
+headers = { "X-Prometheus-Remote-Write-Samples-Written" = "lots" }
 for = "20s"
 
 [[expect]]
@@ -156,3 +164,35 @@ step = "c0s4"
 window = "after"
 reduce = "last"
 max = 0
+
+[[expect]]
+name = "unreadable-count-settles"
+service = "logit"
+metric = "logit.component.retrying"
+component = "remote_write"
+step = "c0s5"
+window = "through"
+reduce = "max"
+max = 0
+
+[[expect]]
+name = "unreadable-count-drops-nothing"
+service = "logit"
+metric = "logit.output.samples.dropped"
+component = "remote_write"
+attrs = { reason = "not_written" }
+step = "c0s5"
+window = "through"
+reduce = "delta"
+max = 0
+
+[[expect]]
+name = "unreadable-count-reported"
+service = "logit"
+metric = "logit.component.diagnostics"
+component = "remote_write"
+attrs = { key = "remote_write_samples_written_unreadable" }
+step = "c0s5"
+window = "through"
+reduce = "delta"
+min = 1

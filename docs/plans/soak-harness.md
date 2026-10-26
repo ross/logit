@@ -1892,10 +1892,11 @@ to it, as on an external target. Under `remote_write` and `influxdb`, `ledger.se
   decompression prefix, `401`, `403`, `407`, `404`, `405`, `501`, `409`, `413`, `415`, `422`,
   `302`, a reset, a `stop` of the stand-in, and a `408`, each with its `class`. Under cumulative
   temporality the next window's totals overwrite a rejected batch, so the egress gap stays 0.
-- `standin-remote-write-v2`: `standin-remote-write` under `version: 2`. Four 20 s steps, 105 s
+- `standin-remote-write-v2`: `standin-remote-write` under `version: 2`. Five 20 s steps, 105 s
   apart, walk the rows that read the written count: a `204` with no count (`refused`, as
   VictoriaMetrics answers 2.0), a `200` counting none of the samples (settled, the samples
-  counted `not_written`), a `202` with no count (settled), and a `415` (`refused`).
+  counted `not_written`), a `202` with no count (settled), a `415` (`refused`), and a `200`
+  whose count isn't a number (settled, reported, nothing counted `not_written`).
 - `standin-at-most-once`: the same SUT with `buffer.delivery: at_most_once`; a `503` and a reset
   drop `ambiguous_at_most_once`, a `401` holds, a `400` drops `rejected`.
 - `standin-datadog` (W9b): `statsd-datadog`'s generator and SUT, with `datadog_out` sending
