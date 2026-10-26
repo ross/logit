@@ -33,6 +33,7 @@ components:
     #                            # and summaries, counted, instead of writing dotted lines
     # max_packet_bytes: "1432"   # one UDP datagram's worth of packed lines; ignored under tcp
     # connect_timeout: 5s        # tcp only -- bounds the connect and the TLS handshake separately
+    # accept_timeout: 1s         # tls only -- wait for the server to accept a client certificate
     # tls:                       # presence turns TLS on and makes it required; tcp only
     #   ca_file: ca.pem
     #   cert_file: client.pem    # cert_file/key_file together, for mutual TLS
