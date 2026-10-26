@@ -4194,7 +4194,7 @@ receiver speaks, as you pick an exposition dialect. The choice depends on the de
   while the throttled `remote_write_rejected` diagnostic reports the misconfiguration.
 
 Under `version: 2`, the sink reads `X-Prometheus-Remote-Write-Samples-Written` on every `2xx`
-other than a `202`:
+other than a `202` to a request that carries samples:
 
 - **No header:** the receiver doesn't speak 2.0 and stored nothing. The sink classifies the
   answer `refused`, holds the batch and retries it, `logit.component.retrying` reads `1`, and the

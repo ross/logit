@@ -427,7 +427,7 @@ Per pair:
     write protocol, `ruzstd`-encoded, `version: 1` only (graph rule 56), with no fallback to
     Snappy. It sends one `POST` per batch with no retry in the sink; its posture is the default
     `at_least_once` because a sample's identity at a receiver is `(label set, timestamp)`. Under
-    `version: 2` it reads a `2xx` other than `202` against its
+    `version: 2` it reads a `2xx` other than `202` to a request carrying samples against its
     `X-Prometheus-Remote-Write-Samples-Written`: no header is `Refused` (the receiver doesn't
     speak 2.0, as VictoriaMetrics doesn't), and a short count settles the batch with the rest
     counted `logit.output.samples.dropped{reason="not_written"}`.

@@ -158,8 +158,8 @@ and in an amendment to the sink's own record:
 - `prometheus_out`: a `415`, and a `400` that opens with a receiver's decompression error, are
   `Refused` (`crates/logit-outputs/src/prometheus.rs`, "Faults, retries and duplicate safety
   (sender mode)"; [ADR `prometheus-remote-write`](prometheus-remote-write.md), "Amendment: the
-  sender's response classes (2026-10-04)"). Under `version: 2`, a `2xx` other than `202` with no
-  `X-Prometheus-Remote-Write-Samples-Written` header is `Refused` too, since the receiver doesn't
+  sender's response classes (2026-10-04)"). Under `version: 2`, a `2xx` other than `202` to a request
+  carrying samples with no `X-Prometheus-Remote-Write-Samples-Written` header is `Refused` too, since the receiver doesn't
   speak 2.0, and a count below the samples sent settles the batch with the shortfall counted
   dropped (the same ADR, "Amendment: a 2.0 write is held to its written count (2026-10-26)").
 - `splunk_hec_out`: a `400` with HEC code 6, 7, 12, 13, or 15 drops the one object it names; a
