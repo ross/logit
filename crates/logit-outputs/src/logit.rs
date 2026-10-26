@@ -409,6 +409,7 @@ impl LogitOutput {
         let dial = Dial {
             target: Target::Tcp { endpoint: &self.endpoint, tls: self.tls.as_ref() },
             connect_timeout: self.timeout,
+            accept_timeout: Duration::ZERO,
             sink: "logit_out",
             nodelay: true,
         };

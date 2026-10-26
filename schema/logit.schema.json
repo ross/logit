@@ -3745,6 +3745,11 @@
             "type"
           ],
           "properties": {
+            "accept_timeout": {
+              "description": "TLS only, ignored without `tls:`. How long a new TLS connection waits, before its first write, for a server that asked for a client certificate to accept it. Under TLS 1.3 the server checks the certificate after the handshake completes, so without this wait a rejected certificate's first batch would be written into a connection the server is closing, and count as delivered. The wait ends as soon as the server sends a session ticket, which most servers do on accepting; a server that sends none (GnuTLS-based collectors, for example) costs the whole wait once per new connection. A rejection read in the wait holds the queue and retries, as for an unreachable destination. A server that sends nothing in time is taken to have accepted, so a slower rejection still loses that connection's first batch. `0s` turns the wait off. Defaults to `1s`.",
+              "default": "1s",
+              "type": "string"
+            },
             "app_name": {
               "description": "APP-NAME fallback, used only when the event carries no `syslog.tag` attribute. No default.",
               "default": null,
@@ -3846,6 +3851,11 @@
             "type"
           ],
           "properties": {
+            "accept_timeout": {
+              "description": "TLS only, ignored without `tls:`. How long a new TLS connection waits, before its first write, for a server that asked for a client certificate to accept it. Under TLS 1.3 the server checks the certificate after the handshake completes, so without this wait a rejected certificate's first batch would be written into a connection the server is closing, and count as delivered. The wait ends as soon as the server sends a session ticket, which most servers do on accepting; a server that sends none (GnuTLS-based collectors, for example) costs the whole wait once per new connection. A rejection read in the wait holds the queue and retries, as for an unreachable destination. A server that sends nothing in time is taken to have accepted, so a slower rejection still loses that connection's first batch. `0s` turns the wait off. Defaults to `1s`.",
+              "default": "1s",
+              "type": "string"
+            },
             "buffer": true,
             "connect_timeout": {
               "description": "How long a connect attempt (including a reconnect after a dropped connection) may take before `send` reports a failure, under `tcp` and `unix_stream`. Also bounds the TLS handshake under `tls:`, as a separate phase, so a TLS connect can take up to twice this value. Under `unix`, bounds each datagram's wait on a receiver whose queue is full (a Unix socket pushes back on the sender where UDP would drop). Under `tcp` and `unix_stream`, a write that accepts nothing for this long fails the attempt and drops the connection; the next attempt dials fresh. Ignored for `udp`. Defaults to `5s`.",

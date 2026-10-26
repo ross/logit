@@ -251,6 +251,7 @@ impl GraphiteOutput {
                 let dial = Dial {
                     target,
                     connect_timeout: *connect_timeout,
+                    accept_timeout: Duration::ZERO,
                     sink: "graphite_out",
                     nodelay: false,
                 };

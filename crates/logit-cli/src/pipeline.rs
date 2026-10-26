@@ -1554,6 +1554,7 @@ pub(crate) fn build_spec(
             app_name,
             max_message_bytes,
             connect_timeout,
+            accept_timeout,
             structured_data,
             tls,
         } => {
@@ -1563,6 +1564,7 @@ pub(crate) fn build_spec(
                 logit_config::SyslogTransport::Udp => SyslogOutput::udp(endpoint.clone())?,
                 logit_config::SyslogTransport::Tcp => {
                     SyslogOutput::tcp(endpoint.clone(), *connect_timeout)
+                        .with_accept_timeout(*accept_timeout)
                 }
             };
             // Filled only where neither an event nor its resource carries a `host.name`.
@@ -1603,6 +1605,7 @@ pub(crate) fn build_spec(
             multi_value,
             max_packet_bytes,
             connect_timeout,
+            accept_timeout,
             tls,
         } => {
             // Eager for UDP, lazy for the Unix and stream transports. A Unix datagram send's wait
@@ -1611,6 +1614,7 @@ pub(crate) fn build_spec(
                 logit_config::StatsdTransport::Udp => StatsdOutput::udp(endpoint.clone())?,
                 logit_config::StatsdTransport::Tcp => {
                     StatsdOutput::tcp(endpoint.clone(), *connect_timeout)
+                        .with_accept_timeout(*accept_timeout)
                 }
                 logit_config::StatsdTransport::Unix => {
                     StatsdOutput::unix_datagram(endpoint.clone(), *connect_timeout)
@@ -3102,6 +3106,7 @@ mod tests {
                     app_name: None,
                     max_message_bytes: 8192,
                     connect_timeout: Duration::from_secs(5),
+                    accept_timeout: Duration::from_secs(1),
                     tls: None,
                     structured_data: None,
                 },
@@ -6614,6 +6619,7 @@ mod tests {
                 multi_value: logit_config::StatsdMultiValue::default(),
                 max_packet_bytes: 1432,
                 connect_timeout: Duration::from_secs(5),
+                accept_timeout: Duration::from_secs(1),
                 tls,
             },
         }
@@ -6737,6 +6743,7 @@ mod tests {
                         multi_value: logit_config::StatsdMultiValue::default(),
                         max_packet_bytes: 1432,
                         connect_timeout: Duration::from_secs(5),
+                        accept_timeout: Duration::from_secs(1),
                         tls: Some(logit_config::TlsClientConfig::default()),
                     },
                 },

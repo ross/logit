@@ -436,7 +436,10 @@
 //! The stream transports send through the driver in `crate::stream`, shared with `syslog_out`
 //! and `graphite_out`; its module doc lists the fault rules. On TLS a write `Err` is
 //! `Fault::Ambiguous`, not retried under this sink's default posture ("Delivery posture" below).
-//! Every transport counts `logit.output.requests` tagged `class=ok|clean|ambiguous|rejected|refused`.
+//! A new TLS 1.3 connection whose server asks for a client certificate waits up to
+//! `accept_timeout:` (default 1 s, [`StatsdOutput::with_accept_timeout`]) before its first write,
+//! so a rejected certificate is a `Fault::Refused` that holds the queue rather than a batch
+//! written into a closing connection; the driver's module doc has the rows. Every transport counts `logit.output.requests` tagged `class=ok|clean|ambiguous|rejected|refused`.
 //!
 //! ## Delivery posture
 //!
@@ -628,6 +631,13 @@ pub const DEFAULT_MAX_PACKET_BYTES: usize = 1432;
 /// TCP only; `syslog::DEFAULT_CONNECT_TIMEOUT`'s value. `logit-config`'s
 /// `default_statsd_connect_timeout` hardcodes the same 5 seconds, kept in sync by hand.
 pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// TCP with TLS only: how long a new connection whose server asked for a client certificate
+/// waits for the server to accept it before the first write (`crate::stream`'s module doc).
+///
+/// `logit-config`'s `default_stream_accept_timeout` hardcodes the same second. Change both
+/// together.
+pub const DEFAULT_ACCEPT_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Which statsd dialect [`StatsdEncoder`] emits. Its own enum rather than
 /// `logit_config::StatsdFormat` because `logit-outputs` never depends on `logit-config`
@@ -2374,6 +2384,8 @@ pub struct StatsdOutput {
     /// TCP only. `Some` exactly when a `tls:` block was configured (presence turns TLS on). Built
     /// once by [`StatsdOutput::with_tls`] and shared by every connect.
     tls: Option<TlsTarget>,
+    /// [`DEFAULT_ACCEPT_TIMEOUT`] unless [`StatsdOutput::with_accept_timeout`] sets it.
+    accept_timeout: Duration,
     /// Ungated: the transport's counts, the `oversize_datagram` drops, and the sink's own
     /// warnings. The encoder holds a view gated by `accounting` (`crate::accounting`).
     diag: Diagnostics,
@@ -2419,6 +2431,7 @@ impl StatsdOutput {
             lines: MessageBuf::default(),
             packet_buf: Vec::new(),
             tls: None,
+            accept_timeout: DEFAULT_ACCEPT_TIMEOUT,
             diag: Diagnostics::default(),
             telemetry: Telemetry::default(),
             accounting: BatchAccounting::default(),
@@ -2449,6 +2462,14 @@ impl StatsdOutput {
         self.max_packet_bytes = max_packet_bytes;
         let cap = self.encoder_cap();
         self.encoder = self.encoder.with_max_packet_bytes(cap);
+        self
+    }
+
+    /// Bounds how long a new TLS connection waits for the server to accept its client certificate
+    /// before the first write (`accept_timeout:` in config); zero turns the wait off. No effect
+    /// without TLS.
+    pub fn with_accept_timeout(mut self, accept_timeout: Duration) -> Self {
+        self.accept_timeout = accept_timeout;
         self
     }
 
@@ -2623,6 +2644,7 @@ impl StatsdOutput {
                 let dial = Dial {
                     target,
                     connect_timeout: *connect_timeout,
+                    accept_timeout: self.accept_timeout,
                     sink: "statsd_out",
                     nodelay: false,
                 };
@@ -2641,6 +2663,7 @@ impl StatsdOutput {
                 let dial = Dial {
                     target,
                     connect_timeout: *connect_timeout,
+                    accept_timeout: self.accept_timeout,
                     sink: "statsd_out",
                     nodelay: false,
                 };
@@ -6044,6 +6067,37 @@ mod tests {
         let got = collector.next().await;
         assert_eq!(collector.accepts(), 1);
         assert!(String::from_utf8_lossy(&got).contains("mutual"));
+    }
+
+    /// No client certificate against a collector requiring one: the acceptance wait reads the
+    /// collector's `certificate_required` alert before any write, so `send` is `Refused` and
+    /// nothing reaches the collector. The hour-long `accept_timeout` against `RECV_TIMEOUT` shows
+    /// the alert, not the bound, ended the wait.
+    #[tokio::test]
+    async fn tls_tcp_without_a_client_certificate_is_refused_by_a_client_ca_requiring_collector() {
+        let mut collector = Collector::tls(server_tls_config(true).into(), ReadMode::ToEof).await;
+        let mut output = StatsdOutput::tcp(
+            format!("localhost:{}", collector.addr().port()),
+            Duration::from_secs(2),
+        )
+        .with_accept_timeout(Duration::from_secs(3600))
+        .with_tls(
+            &tls_settings(|t| t.ca_file = Some("ca.pem".to_string())),
+            &testdata_dir(),
+            &logit_pipeline::tls::TlsReloader::new(),
+        )
+        .expect("a tls: block on the TCP transport is legal");
+        let batch = batch_with(vec![metric_event("rejected", MetricKind::counter(1.0), &[])]);
+        let err = tokio::time::timeout(RECV_TIMEOUT, output.send(&batch))
+            .await
+            .expect("the alert ends the acceptance wait")
+            .expect_err("the collector rejects a client with no certificate");
+        assert_eq!(logit_pipeline::classify(&err), Fault::Refused, "{err:#}");
+        assert!(format!("{err:#}").contains("alert certificate_required"), "{err:#}");
+        drop(output);
+        // Covers the collector reading anything that arrived, well under 1 ms on loopback.
+        collector.assert_quiet(Duration::from_millis(200), "an unauthenticated client").await;
+        assert_eq!(collector.accepts(), 0);
     }
 
     /// `tls:` on UDP is an error here too, not only under `graph::resolve`'s rule 52.

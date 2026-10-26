@@ -289,6 +289,19 @@ pub(crate) fn rewrite_tls_file(dir: &std::path::Path, name: &str, fixture: &str)
 /// `127.0.0.1`), optionally requiring a client certificate chaining to `testdata/tls/ca.pem`. No
 /// ALPN: neither RFC 5425 syslog nor statsd over TLS has an identifier.
 pub(crate) fn server_tls_config(require_client_auth: bool) -> Arc<rustls::ServerConfig> {
+    server_tls_config_for(require_client_auth, rustls::DEFAULT_VERSIONS)
+}
+
+/// [`server_tls_config`] negotiating only TLS 1.2, where a server checks a client certificate
+/// inside the handshake.
+pub(crate) fn tls12_server_tls_config(require_client_auth: bool) -> Arc<rustls::ServerConfig> {
+    server_tls_config_for(require_client_auth, &[&rustls::version::TLS12])
+}
+
+fn server_tls_config_for(
+    require_client_auth: bool,
+    versions: &[&'static rustls::SupportedProtocolVersion],
+) -> Arc<rustls::ServerConfig> {
     use rustls_pki_types::pem::PemObject;
     use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 
@@ -300,7 +313,7 @@ pub(crate) fn server_tls_config(require_client_auth: bool) -> Arc<rustls::Server
     let key = PrivateKeyDer::from_pem_file(dir.join("server.key")).unwrap();
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let builder = rustls::ServerConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
+        .with_protocol_versions(versions)
         .unwrap();
     let cfg = if require_client_auth {
         let mut roots = rustls::RootCertStore::empty();
@@ -316,6 +329,16 @@ pub(crate) fn server_tls_config(require_client_auth: bool) -> Arc<rustls::Server
         builder.with_no_client_auth().with_single_cert(chain, key).unwrap()
     };
     Arc::new(cfg)
+}
+
+/// [`server_tls_config`] with no TLS 1.3 session tickets, as a GnuTLS-based collector sends
+/// none: a client waiting for one to learn its certificate was accepted waits its whole bound.
+pub(crate) fn server_tls_config_without_tickets(
+    require_client_auth: bool,
+) -> Arc<rustls::ServerConfig> {
+    let mut config = (*server_tls_config(require_client_auth)).clone();
+    config.send_tls13_tickets = 0;
+    Arc::new(config)
 }
 
 /// A scripted in-memory stream standing in for the connection behind the sinks'
@@ -760,6 +783,26 @@ where
     let (client, server) =
         tokio::join!(connector.connect(name, client_io), acceptor.accept(server_io));
     (client.expect("client handshake"), server.expect("server handshake"))
+}
+
+/// A tokio-rustls client with no client certificate whose handshake completed against a server
+/// requiring one, as under TLS 1.3: the server has since written its rejection alert into
+/// `server_io` and dropped it.
+pub(crate) async fn rejected_tls_client<C, S>(
+    client_io: C,
+    server_io: S,
+) -> tokio_rustls::client::TlsStream<C>
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let connector = tls_client_connector();
+    let acceptor = TlsAcceptor::from(server_tls_config(true));
+    let name = rustls_pki_types::ServerName::try_from("localhost").unwrap();
+    let (client, server) =
+        tokio::join!(connector.connect(name, client_io), acceptor.accept(server_io));
+    assert!(server.is_err(), "the server must reject a client with no certificate");
+    client.expect("the client's TLS 1.3 handshake completes before the server's check")
 }
 
 /// A tokio-rustls client trusting `testdata/tls/ca.pem`, built as a sink builds its own.
