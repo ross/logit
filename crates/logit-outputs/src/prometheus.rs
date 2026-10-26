@@ -144,8 +144,11 @@
 //!
 //! | Response | Class | Why | Evidence |
 //! |---|---|---|---|
-//! | `2xx` (Mimir's `202` for an HA replica it dedupes included) | `Ok` | written | [1.0 spec][rw1], [2.0 spec][rw2] |
-//! | `2xx` to a `version: 2` request from a 1.0-only receiver | `Ok` | can't be told apart: VictoriaMetrics answers it `2xx` and stores nothing (`docs/known-gaps/prometheus.md`, "VictoriaMetrics discards remote-write 2.0 silently") | `tools/victoria-interop/README.md`, "Recorded run" |
+//! | `2xx` to a `version: 1` request, a `202` (Mimir's for an HA replica it dedupes included), or a `2xx` to a `version: 2` request carrying no samples | `Ok` | written; 1.0 defines no written count, and an asynchronous 2.0 receiver may omit it from a `202` | [1.0 spec][rw1], [2.0 spec][rw2] |
+//! | `2xx` other than `202` to a `version: 2` request carrying samples, with `X-Prometheus-Remote-Write-Samples-Written` at or above the samples sent | `Ok` | written; a count above the samples sent is ignored | [2.0 spec][rw2]; Prometheus 3.15.1 and Mimir 3.2.2 report the samples sent, stale markers included ([ADR `prometheus-remote-write`](../../../docs/adr/prometheus-remote-write.md), "Amendment: a 2.0 write is held to its written count") |
+//! | `2xx` other than `202` to a `version: 2` request carrying samples, with `Samples-Written` below the samples sent | `Ok`, the shortfall counted `logit.output.samples.dropped{reason="not_written"}` | the receiver speaks 2.0 and stored less; the samples it didn't write are lost, and a resend of the batch would draw the same answer | [2.0 spec][rw2]; Prometheus's 2.0 sender counts the shortfall failed |
+//! | `2xx` other than `202` to a `version: 2` request carrying samples, with `Samples-Written` that isn't a decimal count | `Ok` | the receiver knows the 2.0 header, so it speaks 2.0, but how much it stored is unknown; a throttled `remote_write_samples_written_unreadable` diagnostic reports it. Holding the queue would stop a receiver that stores the data | -- |
+//! | `2xx` other than `202` to a `version: 2` request carrying samples, with no `Samples-Written` | `Refused` | a 2.0 receiver MUST send the count on a `2xx`, and the spec lets a sender read its absence as nothing written. A 1.0-only receiver that ignores the `Content-Type` answers this way: VictoriaMetrics v1.152.0 answers `204` and stores nothing. Every batch would get the same, so the sink holds its queue, and the error and a throttled `remote_write_version_unsupported` diagnostic name `version: 1` | [2.0 spec][rw2], `tools/victoria-interop/README.md`, "Recorded run" |
 //! | `400` for invalid samples: `out of order sample`, a duplicate timestamp, Mimir's `err-mimir-sample-out-of-order` and per-series limits | `Rejected` | "Receivers MUST return a HTTP 400 ... for write requests that contain any invalid samples", and senders "MUST NOT retry ... 4xx responses other than 429" | [1.0 spec][rw1], Prometheus's [`write_handler.go`][prom-handler], Mimir's [`distributor/errors.go`][mimir-errors] |
 //! | `400` whose body opens with a receiver's decompression error: VictoriaMetrics' `cannot decompress snappy-encoded request with length %d: %w` (or `zstd-encoded`), or `client_golang`'s Snappy error (`snappy: corrupt input`) | `Refused` | the receiver can't read this sink's `compression:`, so every batch gets the same answer | VictoriaMetrics' [`promremotewrite` stream parser][vm-parser], `client_golang`'s [`remote_api.go`][cg-remote] |
 //! | `401` (Mimir's `no org id` for a missing `X-Scope-OrgID`, Grafana Cloud's invalid credentials), `403`, `407` | `Refused` | a credential or tenant header the sink's `headers:` carries on every request | dskit's [`http_auth.go`][dskit-auth], [`crate::http::classify_status`] |
@@ -268,6 +271,7 @@
 //! | `logit.output.requests{class="1xx"\|"2xx"\|"3xx"\|"4xx"\|"5xx"\|"other"\|"connect_error"\|"network_error"}` | one per request, in `otlp_out`'s vocabulary ([`crate::http::status_class`]). No `429` class: a 429 is a `4xx`, and splitting it out would contradict [`crate::http::classify_status`], which picks the `Fault` from the same status. No `timeout` class: a request timeout is a transport error, so `network_error`; a dial that failed or that `connect_timeout:` ended is `connect_error` ([`crate::http::transport_class`]). No `signal` tag, unlike `otlp_out`: this sink has one signal |
 //! | `logit.output.request.duration` | one timer per request issued, the spelling `graphite_out`, `collectd_out`, `syslog_out`, `statsd_out` and `influxdb_out` use |
 //! | `logit.output.samples` | samples in the request body, counted by the codec ([`remote_write::encode_counted`]) rather than guessed from family counts: one `Series` is one sample for a gauge and several for a histogram. Mirrors `prometheus_in`'s `logit.input.samples`, so the two ends of a relay compare |
+//! | `logit.output.samples.dropped{reason="not_written"}` | under `version: 2`, the samples a `2xx` says the receiver didn't write: the request's samples less its `X-Prometheus-Remote-Write-Samples-Written`. The batch still counts in `logit.output.samples` |
 //!
 //! Both modes also get everything the codec counts on the sink's [`PrometheusEncoder`]:
 //! `logit.output.metrics.{dropped,skipped,degraded}`, `logit.output.events.skipped`,
@@ -412,11 +416,13 @@ const SERIES: &str = "logit.output.series";
 const SERIES_EVICTED: &str = "logit.output.series.evicted";
 const TYPE_CONFLICT: &str = "logit.output.metrics.type_conflict";
 
-// Sender mode's three; the module doc's "Telemetry" has why `requests` has no `signal` tag.
+// Sender mode's; the module doc's "Telemetry" has why `requests` has no `signal` tag.
 const REQUESTS: &str = "logit.output.requests";
 const REQUEST_DURATION: &str = "logit.output.request.duration";
 /// Samples in the request body as the codec counted them: several per histogram `Series`.
 const SAMPLES: &str = "logit.output.samples";
+/// Samples a 2.0 receiver's `2xx` says it didn't write, out of those the body carried.
+const SAMPLES_DROPPED: &str = "logit.output.samples.dropped";
 
 /// What reads "now" for the expiry sweep, a closure so tests can advance time by hand instead of
 /// sleeping through a real `expire_after`.
@@ -1213,9 +1219,8 @@ impl Target<'_> {
         telemetry.timing(REQUEST_DURATION, exchange.took, &[]);
         telemetry.count(REQUESTS, 1.0, &[("class", exchange.reply.class())]);
         match exchange.reply {
-            Reply::Success(_) => {
-                telemetry.count(SAMPLES, samples as f64, &[]);
-                Ok(())
+            Reply::Success { status, headers } => {
+                self.settle_success(telemetry, diag, samples, status, &headers)
             }
             Reply::Failure { status, headers, body } => {
                 let written = written_counts(&headers);
@@ -1250,6 +1255,91 @@ impl Target<'_> {
                 Err(anyhow::Error::new(err)).context(fault)
             }
         }
+    }
+
+    /// A `2xx`, held against a 2.0 receiver's `Samples-Written` count where the 2.0 spec lets a
+    /// sender read it (the module doc's "Faults, retries and duplicate safety"). A `202` may omit
+    /// the count, since an asynchronous receiver hasn't written anything yet, and a 1.0 receiver
+    /// never sends one.
+    fn settle_success(
+        &self,
+        telemetry: &Telemetry,
+        diag: &mut Diagnostics,
+        samples: u64,
+        status: StatusCode,
+        headers: &HeaderMap,
+    ) -> anyhow::Result<()> {
+        let checked = self.version == remote_write::Version::V2
+            && status != StatusCode::ACCEPTED
+            && samples > 0;
+        if checked {
+            match samples_written(headers) {
+                Written::Absent => {
+                    // A receiver that ignores the `Content-Type` answers a 2.0 body `2xx` and
+                    // stores nothing, VictoriaMetrics among them. The next batch gets the same.
+                    let text = format!(
+                        "the receiver answered {status} without an \
+                         X-Prometheus-Remote-Write-Samples-Written header, so it doesn't speak \
+                         remote-write 2.0 and stored nothing; set 'version: 1'"
+                    );
+                    diag.warn_throttled(
+                        "remote_write_version_unsupported",
+                        format_args!("remote-write to {}: {text}", redact::url(self.endpoint)),
+                    );
+                    return Err(anyhow::anyhow!("remote-write unconfirmed: {text}"))
+                        .context(Fault::Refused);
+                }
+                Written::Count(written) if written < samples => {
+                    let lost = samples - written;
+                    telemetry.count(SAMPLES_DROPPED, lost as f64, &[("reason", "not_written")]);
+                    diag.warn_throttled(
+                        "remote_write_samples_not_written",
+                        format_args!(
+                            "remote-write to {} answered {status} having written {written} of \
+                             {samples} samples; {lost} are lost",
+                            redact::url(self.endpoint)
+                        ),
+                    );
+                }
+                Written::Count(_) => {}
+                Written::Unreadable => {
+                    diag.warn_throttled(
+                        "remote_write_samples_written_unreadable",
+                        format_args!(
+                            "remote-write to {} answered {status} with an \
+                             X-Prometheus-Remote-Write-Samples-Written header that isn't a \
+                             count; the batch is counted delivered",
+                            redact::url(self.endpoint)
+                        ),
+                    );
+                }
+            }
+        }
+        telemetry.count(SAMPLES, samples as f64, &[]);
+        Ok(())
+    }
+}
+
+/// A `2xx`'s `X-Prometheus-Remote-Write-Samples-Written`, as [`samples_written`] reads it.
+#[derive(Debug, PartialEq, Eq)]
+enum Written {
+    /// No header: the receiver doesn't speak 2.0.
+    Absent,
+    Count(u64),
+    /// Present but not a decimal count. The receiver knows the 2.0 header, so it speaks 2.0, but
+    /// how much it stored is unknown.
+    Unreadable,
+}
+
+/// Reads the `Samples-Written` header off a `2xx` ([`Written`]).
+fn samples_written(headers: &HeaderMap) -> Written {
+    match headers.get(remote_write::HEADER_SAMPLES_WRITTEN) {
+        None => Written::Absent,
+        Some(value) => value
+            .to_str()
+            .ok()
+            .and_then(|text| text.trim().parse().ok())
+            .map_or(Written::Unreadable, Written::Count),
     }
 }
 
@@ -1391,9 +1481,9 @@ fn names_decompression(body: &str) -> bool {
 fn written_counts(headers: &http::HeaderMap) -> String {
     let count = |name: &str| headers.get(name).and_then(|v| v.to_str().ok()).map(str::to_owned);
     let parts: Vec<String> = [
-        ("samples", "x-prometheus-remote-write-samples-written"),
-        ("histograms", "x-prometheus-remote-write-histograms-written"),
-        ("exemplars", "x-prometheus-remote-write-exemplars-written"),
+        ("samples", remote_write::HEADER_SAMPLES_WRITTEN),
+        ("histograms", remote_write::HEADER_HISTOGRAMS_WRITTEN),
+        ("exemplars", remote_write::HEADER_EXEMPLARS_WRITTEN),
     ]
     .into_iter()
     .filter_map(|(what, name)| count(name).map(|n| format!("{n} {what}")))
@@ -2419,6 +2509,19 @@ mod tests {
             .sum()
     }
 
+    /// Sums `name`'s counter points, whatever their tags, in an already-drained event list.
+    fn total(events: &[Event], name: &str) -> f64 {
+        events
+            .iter()
+            .flat_map(|e| &e.metrics)
+            .filter(|m| logit_core::interner::resolve(m.name) == name)
+            .map(|m| match m.kind {
+                MetricKind::Sum(ref s) => s.value.as_f64(),
+                ref other => panic!("{name} should be a counter, got {other:?}"),
+            })
+            .sum()
+    }
+
     fn counter(registry: &logit_core::Registry, name: &str, tag: &str, value: &str) -> f64 {
         tagged(&registry.drain(0), name, tag, value)
     }
@@ -2475,6 +2578,8 @@ mod tests {
         Fixed(StatusCode, &'static str, Option<&'static str>),
         /// A status whose body never ends, which only a bounded read survives.
         Endless(StatusCode),
+        /// A status, an empty body, and response headers.
+        Headers(StatusCode, &'static [(&'static str, &'static str)]),
     }
 
     type CannedBody = http_body_util::combinators::BoxBody<Bytes, std::convert::Infallible>;
@@ -2521,6 +2626,15 @@ mod tests {
             Some(location),
         ))
         .await
+    }
+
+    /// A receiver answering `status` with `headers`, as a 2.0 receiver sends its
+    /// `X-Prometheus-Remote-Write-*-Written` counts.
+    async fn canned_headers_receiver(
+        status: StatusCode,
+        headers: &'static [(&'static str, &'static str)],
+    ) -> (String, Arc<Mutex<Vec<CapturedRequest>>>) {
+        serve_canned(Canned::Headers(status, headers)).await
     }
 
     async fn canned_endless_receiver(
@@ -2616,15 +2730,21 @@ mod tests {
             headers: parts.headers,
             body: collected.to_vec(),
         });
-        let (status, body, location): (_, CannedBody, _) = match canned {
+        let (status, body, location, headers): (_, CannedBody, _, &[(&str, &str)]) = match canned {
             Canned::Fixed(status, body, location) => {
-                (status, Full::new(Bytes::from_static(body.as_bytes())).boxed(), location)
+                (status, Full::new(Bytes::from_static(body.as_bytes())).boxed(), location, &[])
             }
-            Canned::Endless(status) => (status, CannedBody::new(EndlessBody), None),
+            Canned::Endless(status) => (status, CannedBody::new(EndlessBody), None, &[]),
+            Canned::Headers(status, headers) => {
+                (status, Full::new(Bytes::new()).boxed(), None, headers)
+            }
         };
         let mut builder = http::Response::builder().status(status);
         if let Some(location) = location {
             builder = builder.header(http::header::LOCATION, location);
+        }
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
         }
         builder.body(body).expect("a well-formed response always builds")
     }
@@ -2731,7 +2851,7 @@ mod tests {
 
     #[tokio::test]
     async fn version_2_switches_the_content_type_the_version_header_and_the_message() {
-        let (url, seen) = canned_receiver(StatusCode::OK, "").await;
+        let (url, seen) = canned_headers_receiver(StatusCode::OK, WROTE_ONE).await;
         let mut sink = sender(&url).with_version(remote_write::Version::V2);
         sink.send(&counter_batch(1_700_000_000_000_000_000, 5.0)).await.expect("2xx is Ok");
 
@@ -3033,6 +3153,126 @@ mod tests {
 
     // One test per row of the module doc's "Faults, retries and duplicate safety" table, each
     // answering the body the receiver it names sends.
+
+    /// A 2.0 receiver's answer to [`counter_batch`]'s one sample, as Prometheus and Mimir send it.
+    const WROTE_ONE: &[(&str, &str)] = &[
+        ("x-prometheus-remote-write-samples-written", "1"),
+        ("x-prometheus-remote-write-histograms-written", "0"),
+        ("x-prometheus-remote-write-exemplars-written", "0"),
+    ];
+
+    /// A `version: 2` send of `batch` answered `status` with `headers`: its result, and the
+    /// telemetry it counted.
+    async fn version_2_answered(
+        status: StatusCode,
+        headers: &'static [(&'static str, &'static str)],
+        batch: &EventBatch,
+    ) -> (anyhow::Result<()>, Vec<Event>) {
+        let (url, _seen) = canned_headers_receiver(status, headers).await;
+        let registry = logit_core::Registry::new();
+        let mut sink = sender(&url)
+            .with_version(remote_write::Version::V2)
+            .with_telemetry(registry.telemetry_for("out", "prometheus_out", "sink"));
+        let result = sink.send(batch).await;
+        (result, registry.drain(0))
+    }
+
+    /// Two series at one timestamp: two samples.
+    fn two_sample_batch() -> EventBatch {
+        batch(
+            ["a", "b"]
+                .into_iter()
+                .map(|name| {
+                    Event::metric(
+                        1_700_000_000_000_000_000,
+                        AttrMap::new(),
+                        MetricRecord::new(intern(name), MetricKind::gauge(1.0)),
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_2xx_to_version_2_without_samples_written_is_refused_naming_version_1() {
+        for status in [StatusCode::OK, StatusCode::NO_CONTENT] {
+            let (result, events) =
+                version_2_answered(status, &[], &counter_batch(1_700_000_000_000_000_000, 5.0))
+                    .await;
+            let err = result.expect_err("a receiver that doesn't speak 2.0 stored nothing");
+            assert_eq!(logit_pipeline::classify(&err), Fault::Refused, "{status}");
+            let message = format!("{err:#}");
+            assert!(message.contains("version: 1"), "names the remedy, got: {message}");
+            assert_eq!(tagged(&events, "logit.output.requests", "class", "2xx"), 1.0);
+            assert_eq!(total(&events, "logit.output.samples"), 0.0, "none delivered");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_2xx_to_version_2_writing_every_sample_is_ok_with_nothing_dropped() {
+        let (result, events) = version_2_answered(
+            StatusCode::NO_CONTENT,
+            WROTE_ONE,
+            &counter_batch(1_700_000_000_000_000_000, 5.0),
+        )
+        .await;
+        result.expect("every sample written");
+        assert_eq!(total(&events, "logit.output.samples"), 1.0);
+        assert_eq!(total(&events, "logit.output.samples.dropped"), 0.0);
+    }
+
+    #[tokio::test]
+    async fn a_2xx_to_version_2_writing_fewer_samples_settles_and_counts_the_shortfall() {
+        const WROTE_NONE: &[(&str, &str)] = &[("x-prometheus-remote-write-samples-written", "0")];
+        let (result, events) =
+            version_2_answered(StatusCode::OK, WROTE_NONE, &two_sample_batch()).await;
+        result.expect("a 2.0 receiver's short count settles the batch");
+        assert_eq!(total(&events, "logit.output.samples"), 2.0);
+        assert_eq!(tagged(&events, "logit.output.samples.dropped", "reason", "not_written"), 2.0);
+
+        const WROTE_ONE_OF_TWO: &[(&str, &str)] =
+            &[("x-prometheus-remote-write-samples-written", " 1 ")];
+        let (result, events) =
+            version_2_answered(StatusCode::OK, WROTE_ONE_OF_TWO, &two_sample_batch()).await;
+        result.expect("a 2.0 receiver's short count settles the batch");
+        assert_eq!(tagged(&events, "logit.output.samples.dropped", "reason", "not_written"), 1.0);
+    }
+
+    #[tokio::test]
+    async fn a_2xx_to_version_2_with_a_count_over_or_unreadable_settles_with_nothing_dropped() {
+        const WROTE_THREE: &[(&str, &str)] = &[("x-prometheus-remote-write-samples-written", "3")];
+        const UNREADABLE: &[(&str, &str)] =
+            &[("x-prometheus-remote-write-samples-written", "lots")];
+        for headers in [WROTE_THREE, UNREADABLE] {
+            let (result, events) =
+                version_2_answered(StatusCode::OK, headers, &two_sample_batch()).await;
+            result.expect("a 2.0 receiver answered 2xx");
+            assert_eq!(total(&events, "logit.output.samples"), 2.0, "{headers:?}");
+            assert_eq!(total(&events, "logit.output.samples.dropped"), 0.0, "{headers:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_202_to_version_2_without_samples_written_is_ok() {
+        let (result, events) = version_2_answered(
+            StatusCode::ACCEPTED,
+            &[],
+            &counter_batch(1_700_000_000_000_000_000, 5.0),
+        )
+        .await;
+        result.expect("an asynchronous receiver may omit the count on a 202");
+        assert_eq!(total(&events, "logit.output.samples"), 1.0);
+        assert_eq!(total(&events, "logit.output.samples.dropped"), 0.0);
+    }
+
+    #[tokio::test]
+    async fn a_2xx_to_version_1_without_samples_written_is_ok() {
+        let (url, _seen) = canned_headers_receiver(StatusCode::NO_CONTENT, &[]).await;
+        sender(&url)
+            .send(&counter_batch(1_700_000_000_000_000_000, 5.0))
+            .await
+            .expect("1.0 defines no written counts");
+    }
 
     #[tokio::test]
     async fn a_400_duplicate_or_out_of_order_sample_is_rejected() {
