@@ -5333,6 +5333,7 @@ mod tests {
             multi_value: logit_config::StatsdMultiValue::default(),
             max_packet_bytes,
             connect_timeout: Duration::from_secs(5),
+            accept_timeout: Duration::from_secs(1),
             tls: None,
         }
     }
@@ -11780,6 +11781,7 @@ mod tests {
             app_name: None,
             max_message_bytes: 8192,
             connect_timeout: Duration::from_secs(5),
+            accept_timeout: Duration::from_secs(1),
             structured_data: None,
             tls,
         }
@@ -11844,6 +11846,7 @@ mod tests {
             multi_value: logit_config::StatsdMultiValue::default(),
             max_packet_bytes: 1432,
             connect_timeout: Duration::from_secs(5),
+            accept_timeout: Duration::from_secs(1),
             tls,
         }
     }
@@ -14929,6 +14932,7 @@ mod tests {
             multi_value: logit_config::StatsdMultiValue::default(),
             max_packet_bytes: 8192,
             connect_timeout: Duration::from_secs(5),
+            accept_timeout: Duration::from_secs(1),
             tls: None,
         }
     }

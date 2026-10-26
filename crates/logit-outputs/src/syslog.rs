@@ -182,8 +182,11 @@
 //! TCP sends one octet-counted frame per batch through the pooled-stream driver in
 //! `crate::stream`, shared with `statsd_out` and `graphite_out`; its module doc lists the
 //! fault rules. On TLS a write `Err` is `Fault::Ambiguous`, and on both a batch is called
-//! delivered only after a flush. Both transports count `logit.output.requests` tagged
-//! `class=ok|clean|ambiguous|rejected|refused`. UDP also counts `logit.output.datagrams`, the
+//! delivered only after a flush. A new TLS 1.3 connection to a server that asks for a client
+//! certificate reads for `accept_timeout:` (default 1 s, [`SyslogOutput::with_accept_timeout`])
+//! before its first write, so a rejected certificate is a `Fault::Refused` that holds the queue
+//! rather than a batch written into a closing connection; the driver's module doc has the rows.
+//! Both transports count `logit.output.requests` tagged `class=ok|clean|ambiguous|rejected|refused`. UDP also counts `logit.output.datagrams`, the
 //! datagrams that reached the kernel; it equals `logit.output.messages` there, because each
 //! message is its own datagram, and TCP has no datagrams to count.
 //!
@@ -222,6 +225,13 @@ pub const DEFAULT_MAX_MESSAGE_BYTES: usize = 8192;
 /// `logit-config` can't reference this (the dependency runs the other way), so its
 /// `default_syslog_connect_timeout` hardcodes the same 5 seconds. Change both together.
 pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// TCP with TLS only: how long a new TLS 1.3 connection to a server that asks for a client
+/// certificate reads for a rejection before the first write (`crate::stream`'s module doc).
+///
+/// `logit-config`'s `default_stream_accept_timeout` hardcodes the same second. Change both
+/// together.
+pub const DEFAULT_ACCEPT_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Which syslog dialect [`SyslogEncoder`] emits.
 ///
@@ -1182,6 +1192,8 @@ pub struct SyslogOutput {
     /// TCP only: `Some` exactly when a `tls:` block was configured (module doc's "TLS"). Built
     /// once by [`SyslogOutput::with_tls`], shared by every connect.
     tls: Option<TlsTarget>,
+    /// [`DEFAULT_ACCEPT_TIMEOUT`] unless [`SyslogOutput::with_accept_timeout`] sets it.
+    accept_timeout: Duration,
     /// Ungated: the transport's counts, the `oversize_datagram` drops, and the sink's own
     /// warnings. The encoder holds a view gated by `accounting` (`crate::accounting`).
     diag: Diagnostics,
@@ -1213,6 +1225,7 @@ impl SyslogOutput {
             messages: MessageBuf::default(),
             frame_buf: Vec::new(),
             tls: None,
+            accept_timeout: DEFAULT_ACCEPT_TIMEOUT,
             diag: Diagnostics::default(),
             telemetry: Telemetry::default(),
             accounting: BatchAccounting::default(),
@@ -1234,6 +1247,14 @@ impl SyslogOutput {
             }
             Conn::Tcp { .. } => encoder,
         };
+        self
+    }
+
+    /// How long a new TLS 1.3 connection to a server that asks for a client certificate reads for
+    /// a rejection before the first write (`accept_timeout:` in config); zero turns the wait off.
+    /// No effect without TLS.
+    pub fn with_accept_timeout(mut self, accept_timeout: Duration) -> Self {
+        self.accept_timeout = accept_timeout;
         self
     }
 
@@ -1372,6 +1393,7 @@ impl SyslogOutput {
                 let dial = Dial {
                     target,
                     connect_timeout: *connect_timeout,
+                    accept_timeout: self.accept_timeout,
                     sink: "syslog_out",
                     nodelay: false,
                 };
@@ -1427,7 +1449,7 @@ mod tests {
         ReadMode, ScriptedDest, ScriptedDial, SendStep, WriteStep,
     };
     use logit_core::{BodyFormat, LogRecord, MetricKind, MetricRecord, Registry, Resource};
-    use logit_pipeline::test_util::TelemetryProbe;
+    use logit_pipeline::test_util::{TelemetryProbe, RECV_TIMEOUT};
     use logit_pipeline::Fault;
     use logit_proto::syslog::SyslogDecoder;
     use logit_proto::Decoder;
@@ -2255,61 +2277,68 @@ mod tests {
         assert!(String::from_utf8_lossy(&collector.next().await).contains("rotated"));
     }
 
+    /// A TLS `syslog_out` to `collector`, trusting `ca.pem`, presenting `client.pem` when
+    /// `client_cert`.
+    fn tls_output(
+        collector: &Collector,
+        client_cert: bool,
+        accept_timeout: Duration,
+    ) -> SyslogOutput {
+        SyslogOutput::tcp(format!("localhost:{}", collector.addr().port()), Duration::from_secs(2))
+            .with_accept_timeout(accept_timeout)
+            .with_tls(
+                &tls_settings(|t| {
+                    t.ca_file = Some("ca.pem".to_string());
+                    if client_cert {
+                        t.cert_file = Some("client.pem".to_string());
+                        t.key_file = Some("client.key".to_string());
+                    }
+                }),
+                &testdata_dir(),
+                &logit_pipeline::tls::TlsReloader::new(),
+            )
+            .expect("a tls: block on the TCP transport is legal")
+    }
+
+    /// An hour, against `send` bounded by `RECV_TIMEOUT`: a send that finishes waited on
+    /// something other than the acceptance bound.
+    const NEVER: Duration = Duration::from_secs(3600);
+
+    /// The collector accepts the certificate and sends session tickets. The tickets don't end the
+    /// acceptance wait, since a server may send them before its own code rejects the client:
+    /// silence for the whole bound is acceptance, and the batch is written after it.
     #[tokio::test]
     async fn tls_tcp_with_a_client_certificate_satisfies_a_client_ca_requiring_collector() {
+        const BOUND: Duration = Duration::from_millis(200);
         let mut collector = Collector::tls(server_tls_config(true).into(), ReadMode::ToEof).await;
-        let mut output = SyslogOutput::tcp(
-            format!("localhost:{}", collector.addr().port()),
-            Duration::from_secs(2),
-        )
-        .with_tls(
-            &tls_settings(|t| {
-                t.ca_file = Some("ca.pem".to_string());
-                t.cert_file = Some("client.pem".to_string());
-                t.key_file = Some("client.key".to_string());
-            }),
-            &testdata_dir(),
-            &logit_pipeline::tls::TlsReloader::new(),
-        )
-        .expect("a client certificate is legal on the TCP transport");
+        let mut output = tls_output(&collector, true, BOUND);
         let batch = batch_with(vec![log_event(0, "mutual", None)]);
+        let start = std::time::Instant::now();
         output.send(&batch).await.expect("mutual TLS should succeed");
+        assert!(start.elapsed() >= BOUND, "the wait ran its bound: {:?}", start.elapsed());
         drop(output);
         let got = collector.next().await;
         assert_eq!(collector.accepts(), 1);
         assert!(String::from_utf8_lossy(&got).contains("mutual"));
     }
 
-    /// A sink with no client certificate delivers nothing to a mutual-TLS collector.
-    ///
-    /// Asserted at the collector, not on `send`: under TLS 1.3 the client's `connect` completes
-    /// before the server rejects its certificate, the rejection is an alert this write-only sink
-    /// never reads, and whether the next `write()` fails depends on RST timing.
+    /// Under TLS 1.3 the client's handshake completes before the server checks its certificate.
+    /// The acceptance wait reads the server's `certificate_required` alert before any write, so
+    /// `send` reports `Refused`, which holds the queue, rather than a delivery.
     #[tokio::test]
     async fn tls_tcp_without_a_client_certificate_delivers_nothing_to_a_client_ca_requiring_collector(
     ) {
         let mut collector = Collector::tls(server_tls_config(true).into(), ReadMode::ToEof).await;
-        let mut output = SyslogOutput::tcp(
-            format!("localhost:{}", collector.addr().port()),
-            Duration::from_secs(2),
-        )
-        .with_tls(
-            &tls_settings(|t| t.ca_file = Some("ca.pem".to_string())),
-            &testdata_dir(),
-            &logit_pipeline::tls::TlsReloader::new(),
-        )
-        .expect("a tls: block on the TCP transport is legal");
+        let mut output = tls_output(&collector, false, NEVER);
         let batch = batch_with(vec![log_event(0, "rejected", None)]);
-        // Usually `Ok`, but a fast RST can fail the write; either way never `Rejected` or `Refused`.
-        if let Err(err) = output.send(&batch).await {
-            assert!(
-                matches!(logit_pipeline::classify(&err), Fault::Clean | Fault::Ambiguous),
-                "a rejected-handshake write is never rejected or refused: {err:?}"
-            );
-        }
+        let err = tokio::time::timeout(RECV_TIMEOUT, output.send(&batch))
+            .await
+            .expect("the alert ends the acceptance wait")
+            .expect_err("the collector rejects a client with no certificate");
+        assert_eq!(logit_pipeline::classify(&err), Fault::Refused, "{err:#}");
+        assert!(format!("{err:#}").contains("alert certificate_required"), "{err:#}");
         drop(output);
-        // Covers the collector reading the client's certificate-less flight and rejecting it,
-        // well under 1 ms on loopback.
+        // Covers the collector reading anything that arrived, well under 1 ms on loopback.
         collector
             .assert_quiet(
                 Duration::from_millis(200),
@@ -2321,6 +2350,34 @@ mod tests {
             0,
             "a client with no certificate must not complete the handshake"
         );
+    }
+
+    /// `accept_timeout: 0s` turns the wait off against a collector that asks for a certificate.
+    #[tokio::test]
+    async fn tls_tcp_with_a_zero_accept_timeout_never_waits() {
+        let mut collector = Collector::tls(server_tls_config(true).into(), ReadMode::ToEof).await;
+        let mut output = tls_output(&collector, true, Duration::ZERO);
+        let batch = batch_with(vec![log_event(0, "unwaited", None)]);
+        tokio::time::timeout(RECV_TIMEOUT, output.send(&batch))
+            .await
+            .expect("a zero accept_timeout skips the wait")
+            .expect("delivered");
+        drop(output);
+        assert!(String::from_utf8_lossy(&collector.next().await).contains("unwaited"));
+    }
+
+    /// A collector that asks for no client certificate: no wait runs.
+    #[tokio::test]
+    async fn tls_tcp_to_a_collector_that_requests_no_client_certificate_never_waits() {
+        let mut collector = Collector::tls(server_tls_config(false).into(), ReadMode::ToEof).await;
+        let mut output = tls_output(&collector, true, NEVER);
+        let batch = batch_with(vec![log_event(0, "unrequested", None)]);
+        tokio::time::timeout(RECV_TIMEOUT, output.send(&batch))
+            .await
+            .expect("no CertificateRequest, no wait")
+            .expect("delivered");
+        drop(output);
+        assert!(String::from_utf8_lossy(&collector.next().await).contains("unrequested"));
     }
 
     /// An untrusted server certificate fails the handshake before any batch byte leaves the host,

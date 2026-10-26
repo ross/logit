@@ -4209,6 +4209,20 @@ pub enum ComponentKind {
         #[serde(default = "default_syslog_connect_timeout", with = "humantime_serde_duration")]
         #[schemars(with = "String")]
         connect_timeout: Duration,
+        /// TLS only, ignored without `tls:`. How long a new TLS 1.3 connection to a server that
+        /// asks for a client certificate reads, before its first write, for the server to reject
+        /// that certificate. Under TLS 1.3 the server checks the certificate after the handshake
+        /// completes, and some servers check it again in their own code and reject by closing the
+        /// connection, so without this wait a rejected certificate's first batch would be written
+        /// into a connection the server is closing, and count as delivered. TLS sends nothing
+        /// that means accepted, so every new connection to such a server, resumed ones included,
+        /// waits the whole `accept_timeout` once before its first batch; a server that asks for no
+        /// certificate costs no wait. A rejection read in the wait, an alert or a close, holds
+        /// the queue and retries, as for an unreachable destination. A rejection slower than this
+        /// still loses that connection's first batch. `0s` turns the wait off. Defaults to `1s`.
+        #[serde(default = "default_stream_accept_timeout", with = "humantime_serde_duration")]
+        #[schemars(with = "String")]
+        accept_timeout: Duration,
         /// Turns on TLS for this connection when present (RFC 5425, syslog over TLS over TCP),
         /// and makes it required: a bare `host:port` has no scheme to select TLS from, so even an
         /// empty `tls: {}` means TLS with the bundled Mozilla roots. `transport: tcp` only;
@@ -4293,6 +4307,20 @@ pub enum ComponentKind {
         #[serde(default = "default_statsd_connect_timeout", with = "humantime_serde_duration")]
         #[schemars(with = "String")]
         connect_timeout: Duration,
+        /// TLS only, ignored without `tls:`. How long a new TLS 1.3 connection to a server that
+        /// asks for a client certificate reads, before its first write, for the server to reject
+        /// that certificate. Under TLS 1.3 the server checks the certificate after the handshake
+        /// completes, and some servers check it again in their own code and reject by closing the
+        /// connection, so without this wait a rejected certificate's first batch would be written
+        /// into a connection the server is closing, and count as delivered. TLS sends nothing
+        /// that means accepted, so every new connection to such a server, resumed ones included,
+        /// waits the whole `accept_timeout` once before its first batch; a server that asks for no
+        /// certificate costs no wait. A rejection read in the wait, an alert or a close, holds
+        /// the queue and retries, as for an unreachable destination. A rejection slower than this
+        /// still loses that connection's first batch. `0s` turns the wait off. Defaults to `1s`.
+        #[serde(default = "default_stream_accept_timeout", with = "humantime_serde_duration")]
+        #[schemars(with = "String")]
+        accept_timeout: Duration,
         /// Turns on TLS for this connection when present, and makes it required: a bare
         /// `host:port` has no scheme to select TLS from, so even an empty `tls: {}` means TLS
         /// with the bundled Mozilla roots. `transport: tcp` only; `tls:` under any other
@@ -5288,6 +5316,13 @@ fn default_statsd_max_packet_bytes() -> u64 {
 /// Mirrors `logit_outputs::statsd::DEFAULT_CONNECT_TIMEOUT`, kept in sync by hand.
 fn default_statsd_connect_timeout() -> Duration {
     Duration::from_secs(5)
+}
+
+/// `syslog_out`'s and `statsd_out`'s `accept_timeout` default. Mirrors
+/// `logit_outputs::syslog::DEFAULT_ACCEPT_TIMEOUT` and `logit_outputs::statsd::DEFAULT_ACCEPT_TIMEOUT`,
+/// kept in sync by hand.
+fn default_stream_accept_timeout() -> Duration {
+    Duration::from_secs(1)
 }
 
 /// Mirrors `logit_proto::collectd::DEFAULT_MAX_PACKET_BYTES`, kept in sync by hand.
@@ -9669,6 +9704,7 @@ mod tests {
                 multi_value,
                 max_packet_bytes,
                 connect_timeout,
+                accept_timeout,
                 tls,
             } => {
                 assert_eq!(endpoint, "127.0.0.1:8125");
@@ -9678,6 +9714,7 @@ mod tests {
                 assert_eq!(multi_value, StatsdMultiValue::Expand);
                 assert_eq!(max_packet_bytes, 1432);
                 assert_eq!(connect_timeout, Duration::from_secs(5));
+                assert_eq!(accept_timeout, Duration::from_secs(1));
                 assert_eq!(tls, None);
             }
             other => panic!("expected StatsdOut, got {other:?}"),
@@ -10034,6 +10071,32 @@ mod tests {
                 assert_eq!(connect_timeout, Duration::from_secs(30));
             }
             other => panic!("expected StatsdOut, got {other:?}"),
+        }
+    }
+
+    /// `accept_timeout` takes a duration string, `0s` included, defaults to 1 s on both stream
+    /// sinks that take it, and is accepted without a `tls:` block.
+    #[test]
+    fn stream_sink_accept_timeout_parses_as_a_duration_and_defaults_to_one_second() {
+        let cases = [
+            ("", Duration::from_secs(1)),
+            (r#", "accept_timeout": "250ms""#, Duration::from_millis(250)),
+            (r#", "accept_timeout": "0s""#, Duration::ZERO),
+        ];
+        for kind in ["syslog_out", "statsd_out"] {
+            for (field, expected) in cases {
+                let component: Component = serde_json::from_str(&format!(
+                    r#"{{"type": "{kind}", "sources": ["in"], "endpoint": "127.0.0.1:514",
+                        "transport": "tcp"{field}}}"#
+                ))
+                .unwrap();
+                let accept_timeout = match component.kind {
+                    ComponentKind::SyslogOut { accept_timeout, tls: None, .. }
+                    | ComponentKind::StatsdOut { accept_timeout, tls: None, .. } => accept_timeout,
+                    other => panic!("expected {kind} without tls:, got {other:?}"),
+                };
+                assert_eq!(accept_timeout, expected, "{kind}{field}");
+            }
         }
     }
 

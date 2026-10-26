@@ -1340,8 +1340,9 @@ mod tls {
 
     /// A `statsd_out` trusting `other-ca.pem` fails its own certificate verification before any
     /// batch byte is written, so the error is `Fault::Clean`. That's deterministic because a
-    /// server-cert rejection happens inside `TlsConnector::connect`; a client-cert rejection,
-    /// under TLS 1.3, is one this write-only sink never sees.
+    /// server-cert rejection happens inside `TlsConnector::connect`. A client-cert rejection under
+    /// TLS 1.3 arrives after the handshake, and the sink's acceptance wait reads it as
+    /// `Fault::Refused` (`logit_outputs::stream`'s module doc, "The acceptance wait").
     #[tokio::test]
     async fn a_statsd_out_trusting_the_wrong_ca_is_refused_and_classified_clean() {
         let (addr, _rx) = spawn_tls_input(&server_settings(None)).await;

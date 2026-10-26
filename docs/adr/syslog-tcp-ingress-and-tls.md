@@ -1,6 +1,6 @@
 ---
 created: 2026-09-13
-updated: 2026-10-25
+updated: 2026-10-26
 ---
 
 # `syslog_in` gains TCP and TLS ingress; `syslog_out` gains TLS
@@ -434,3 +434,132 @@ traffic is expected.
 framing stays detected from its first byte, and `framing:` under `transport: tcp` is a config
 error. `syslog_in` now has a `framing: lines | datagram` field that applies to `transport: udp`
 only. See [ADR `syslog-udp-datagram-framing`](syslog-udp-datagram-framing.md).
+
+## Amendment: stream sinks read for a client-certificate rejection (2026-10-26)
+
+### Context
+
+Under TLS 1.3 the server checks the client certificate after the client's `Finished`, so
+`TlsConnector::connect` returns before the verdict. A rejection arrives later, as an alert or a
+bare close, and only a read sees it. Go's maintainers state the same for `crypto/tls`: the client
+can't learn the verdict from `Handshake`, and the error appears on the first `Read`
+([golang/go#32202](https://github.com/golang/go/issues/32202),
+[#34796](https://github.com/golang/go/issues/34796),
+[#42656](https://github.com/golang/go/issues/42656)). OpenSSL's maintainers give the same answer:
+there's no client-auth status to query, and a client learns it only by reading
+([openssl-users, 2021-09](https://mta.openssl.org/pipermail/openssl-users/2021-September/014214.html)).
+RFC 8446 has no message that confirms acceptance (§2), and RFC 5425 has no application-layer
+acknowledgment.
+
+`syslog_out` and `statsd_out` never read. A rejected connection took the first batch, counted it
+delivered, and lost it. On a pooled connection the reuse probe read the alert as EOF and redialed,
+so every later batch went the same way: a sink whose certificate a server rejected lost every
+batch, uncounted. "`syslog_out`'s TCP connection becomes TLS-capable" above held that a flush
+before success was enough; a flush proves the bytes left, not that the server took them.
+
+A session ticket isn't a signal either way. RFC 8446 §4.6.1 makes NewSessionTicket a MAY, sent "at
+any time after the server has received the client Finished", with nothing tying it to client
+authentication. OpenSSL sends its tickets at the end of `SSL_accept`, before the application
+checks the peer's name, so a server that checks the peer in its own code after its TLS library
+finishes the handshake rejects a connection that already holds tickets (verified below).
+
+### Decision
+
+A new TLS 1.3 connection from `syslog_out` or `statsd_out` to a destination that has asked for a
+client certificate reads for `accept_timeout:` (default `1s`, `0s` off) before its first write. An
+alert or a close in that window is `Fault::Refused`; silence for the whole bound is acceptance.
+
+
+`crates/logit-outputs/src/stream.rs`'s module doc, "The acceptance wait", holds the fault table.
+
+- **The wait is a plain bounded read.** Tickets are consumed and ignored. An alert is `Refused`,
+  its message naming the alert (`certificate_required`, `bad_certificate`, or the number of an
+  unnamed one). Any close is `Refused` too: EOF, `close_notify`, a reset, or another read error.
+  Nothing was written, so a close here is the server turning the client away, and a redial meets
+  the same answer. Refused holds the queue and retries with no budget
+  ([ADR `sink-fault-classes`](sink-fault-classes.md)): a rejected certificate stays rejected until
+  an operator fixes it, so dropping batches as `Rejected` would lose data the fix could save.
+- **Application data before the first write stays `Fault::Clean`.** A line receiver never sends
+  any, so the connection isn't one to write into, but nothing says the server rejected a
+  certificate. `PendingClose::Bytes` already reads data on a reused connection the same way.
+  `Clean` says nothing reached the destination without claiming it refuses every batch, so the
+  class and the counter don't report a certificate rejection that didn't happen.
+- **Each destination remembers that it asked.** rustls calls the config's client-certificate
+  resolver only on a CertificateRequest, so `TlsTarget::new` wraps the resolver once in
+  `RecordsCertRequest`, which sets a task-local flag for the one handshake and delegates to the
+  inner resolver, so certificate reload still works. A full handshake that records a request sets
+  `TlsTarget`'s `asks_for_client_cert`, and the flag never clears. A resumed TLS 1.3 handshake
+  carries no CertificateRequest, so the flag is what makes a resumed connection to that
+  destination wait too. The wrapper is one `Arc` for the config's life, not one per dial: rustls
+  offers a stored ticket only to a config whose resolver is the `Arc` the ticket was issued
+  under, so a per-dial wrapper would end session resumption.
+- **A destination that never asked never waits**, on a full or a resumed handshake. TLS 1.2 doesn't
+  wait either: its server checks the certificate inside the handshake, so a rejection already
+  fails the dial `Clean`. `logit_out` and `graphite_out` pass a zero bound.
+- **On a reused connection, an alert the probe reads is `Fault::Refused`**, with nothing written
+  and no redial (`crate::tls::poll_pending_close_or_alert`). A redial would hide a rejection that
+  already cost the batch written on that connection. `poll_pending_close` keeps its old answer for
+  `logit_out` and `kafka_out`.
+- **`accept_timeout` defaults to `1s`.** Silence is the only acceptance TLS gives, so every new
+  connection to a destination that asks for a certificate pays the whole bound once, full or
+  resumed. Pooled connections make new ones rare. A rejection on a LAN or a nearby region arrives
+  well inside a second; the rejections below arrived within 50 ms. The field is accepted without
+  `tls:` and has no effect there, so a config can set it ahead of TLS.
+
+### Consequences
+
+- A rejected client certificate now reads `Refused` and holds the queue, where it lost every batch
+  before.
+- A new connection to a server that asks for a client certificate opens `accept_timeout` later, a
+  resumed one included. A server that asks for none costs nothing.
+- A rejection that arrives after `accept_timeout` still loses that connection's first batch. The
+  next send's probe reports an alert as `Refused`; a bare close looks like an idle close and
+  redials, and the redial's own wait reads the rejection. The write-only senders under
+  "Alternatives considered" accept the same loss on every connection
+  (`docs/known-gaps/intake.md`).
+
+### Alternatives considered
+
+- **A session ticket as the acceptance signal.** The first version of this amendment ended the wait
+  on a ticket, which costs one round trip instead of the whole bound. It's unsound: RFC 8446 makes a
+  ticket optional and unrelated to client authentication, and OpenSSL-based servers send theirs
+  before the application rejects the peer, so an OpenSSL-based server sent two tickets and then
+  closed (verified below). A ticket can't prove acceptance and its absence proves nothing.
+- **Forcing TLS 1.2.** A TLS 1.2 server rejects the certificate inside the handshake, so the dial
+  fails with no wait; Go's maintainers suggest it as the diagnostic. It gives up TLS 1.3 for every
+  destination to fix one failure mode, and a server that allows only 1.3 can't be reached at all.
+- **No wait, the reuse probe only**, as Vector's socket sink does with a one-byte non-blocking
+  read before each flush (`shutdown_check` in
+  [`src/sinks/util/tcp.rs`](https://github.com/vectordotdev/vector/blob/78e5330bb31d8c8b06bf86fad61299a2f62aaaf4/src/sinks/util/tcp.rs)).
+  rsyslog's `omfwd` peeks the raw socket with `MSG_PEEK` in `CheckConnection`, which sees a FIN but
+  not an alert. A probe sees a rejection only after a batch went into the connection, so against a
+  server that rejects every connection it loses every batch, one per connection. That's the loss
+  the ticket design kept on resumed connections, and why resumed connections wait here.
+- **A read watcher armed for the connection's whole life**, as syslog-ng's `logwriter.c` registers
+  an input handler on an idle writer and reconnects on EOF. It catches a late rejection sooner but
+  still after the first batch, and it needs a reader task per pooled connection where the probe
+  reads at the moment it matters. The wait plus the probe covers the window a watcher would.
+
+Telegraf's `socket_writer` and the OpenTelemetry Collector's syslog exporter don't read at all. The
+Exim fix for the same TLS 1.3 behavior ([fc243e94](https://github.com/Exim/exim/commit/fc243e944ec00b59b75f41d07494116f925d58b4))
+works because SMTP reads a response after every command; a syslog or statsd line gets none.
+
+### Verified behavior
+
+Run on 2026-10-26 against two syslog collectors, one built on OpenSSL 3.5.7 and one on GnuTLS
+3.8.9. Each required a client certificate and checked its name. A `logit run` of `generate_in` into
+`syslog_out` (one event a second) ran against each, and `openssl s_client -tls1_3 -msg` recorded
+the wire.
+
+| Case | What the server sent |
+|---|---|
+| OpenSSL, name doesn't match | two NewSessionTickets, then `close_notify` (a warning, no fatal alert), about 50 ms after the client's `Finished` |
+| OpenSSL, no client certificate | fatal `certificate_required` at once |
+| GnuTLS, name doesn't match or no certificate | a bare TCP close, no alert, about 40 ms after the handshake; no tickets |
+
+- `syslog_out` read every rejection as `Refused` before writing (`the peer closed the
+  connection`, `the peer sent alert certificate_required`, and the bare close as `peer closed
+  connection without sending TLS close_notify`), and held the queue: all six batches were still
+  queued at shutdown and none reached the server.
+- Against a permitted certificate, the first message arrived 1.002 to 1.003 s after the handshake
+  under both servers, the `1s` wait, and every message arrived.

@@ -234,26 +234,25 @@ Entry format and the other areas: [the known-gaps index](README.md).
     (`otlp_out`'s gRPC transport, `kafka_out`, `logit_out`, and `syslog_out`/`statsd_out` through
     `crates/logit-outputs/src/stream.rs`) can pass the name to `connect` directly. SNI has to change
     on every client at once, so the field means the same thing on each.
-- **A write-only TLS sink (`syslog_out`, `statsd_out` over TCP) cannot observe a peer's
-  post-handshake rejection.** Under TLS 1.3, the server sends its whole handshake flight,
-  `Finished` included, before it sees the client's certificate. So a client-cert rejection (a
-  `client_ca_file`-requiring collector, no matching cert presented) arrives as an alert after
-  `TlsConnector::connect` has already succeeded.
-  - **Consequence:** these sinks flush before reporting a batch delivered
-    ([ADR `syslog-tcp-ingress-and-tls`](../adr/syslog-tcp-ingress-and-tls.md)), but a flush only
-    proves the bytes left this process, not that the peer accepted them, and the sink never reads
-    the alert. `send` reports the batch delivered, which is why
-    `syslog::tests::tls_tcp_without_a_client_certificate_delivers_nothing_to_a_client_ca_requiring_collector`
-    asserts at the collector.
-  - **Unaffected:** `logit_out`, which reports a batch delivered only on its `Ack`, and a
-    *server*-certificate rejection, which happens inside the client's own handshake, before any
-    write, and always surfaces as `Fault::Clean` (`crates/logit-cli/tests/syslog_round_trip.rs`'s
-    `mod tls`).
-  - **To close:** the client-cert case needs the sink to read and interpret TLS alerts (or
-    application-level acks) it never looks at.
+- **A client-certificate rejection slower than `accept_timeout` loses one batch on the TLS stream
+  sinks.** Under TLS 1.3 a server checks the client certificate after the handshake completes, and
+  TLS sends nothing when it accepts. So before a new connection's first write, `syslog_out` and
+  `statsd_out` read for `accept_timeout:` (default `1s`) when the destination has asked for a
+  client certificate, and an alert or a close in that time is `Fault::Refused`
+  ([ADR `syslog-tcp-ingress-and-tls`](../adr/syslog-tcp-ingress-and-tls.md)'s 2026-10-26
+  amendment). Silence for the whole bound is taken as acceptance.
+  - **Consequence:** a server that rejects after the bound, or closes with no alert after it, gets
+    the first batch written into a connection it's closing, and the sink counts that batch
+    delivered. The next send's probe reads the alert as `Refused`, or redials past the bare close,
+    and the redial's own wait reads the rejection, so one batch per such connection is lost,
+    uncounted.
+  - **Workaround:** raise `accept_timeout:` above the server's worst-case verdict time.
+  - **To close:** needs an acknowledgment from the receiver; neither syslog nor statsd has one.
+    Established write-only senders (rsyslog's `omfwd`, syslog-ng, Vector's socket sink) accept the
+    same loss on every connection, with no wait at all.
 - **A peer's FIN arriving during a write on a pooled connection is lost silently on the plaintext
   stream sinks.** `syslog_out`, `statsd_out`, and `graphite_out` probe a reused pooled connection
-  before writing (`crate::tls::poll_pending_close`). That catches a peer that closed while the
+  before writing (`crate::tls::poll_pending_close_or_alert`). That catches a peer that closed while the
   connection sat idle, but not a FIN that arrives between the probe and the write. Their wire
   protocols give the sender no way to learn the write failed, so that batch is an unclassified
   loss. `logit_out` classifies the same race `Fault::Ambiguous` once the ack wait meets it, and
