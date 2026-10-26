@@ -358,6 +358,9 @@ for = "20s"
   The step's `class` is the harness's only copy of `datadog_out`'s response-class table, so the
   loader checks that one is there, not which one it is; `ledger.standin` judges it against the
   sink. W16 holds `shape = "influxdb"` to the same rule, for `influxdb_out`'s table.
+- `headers`, a table of header names to strings on a `respond` with a `status`, replaces the
+  response headers the stand-in adds itself, so `headers = {}` sends none. Under
+  `remote_write` those are a 2.0 receiver's written counts (§6, "The stand-in").
 - `count = N`, a positive integer on a `respond` (the `conc` stream's W5), spends the cue on
   the next N writes to the stand-in's path, after which it answers the default with no cue
   until the revert. A sink at `concurrency:` above 1 has several requests in flight, so a cue
@@ -1769,10 +1772,14 @@ write to any other path answers `404`. The path is compared without its query st
 `influxdb_out` always sends one (`org`, `orgID`, `bucket`, `precision=ns`); compared whole, every
 write would answer `404`, which a carried-mode sink reads as `Rejected`, a silent drop. Under `datadog`, a cue's `series_errors` makes a `2xx` answer's body
 the series route's `errors` list, protobuf field 1 (`repeated string`), with N entries; the
-stand-in decodes nothing, so the entries name series by their place in the request. Its control port takes the driver's
+stand-in decodes nothing, so the entries name series by their place in the request. Under
+`remote_write`, a `2xx` other than `202` to a remote-write 2.0 request carries
+`X-Prometheus-Remote-Write-{Samples,Histograms,Exemplars}-Written` with the counts the stand-in
+reads from the body, as a 2.0 receiver must, unless the cue's `headers` replaces them. Its control port takes the driver's
 cues and answers `/health`. It prints one JSON line per request to stdout: the time, the path and the
 query string apart, `Content-Encoding`, the cue in force (none once a counted cue is spent), how it answered (`status` or `reset`), whether it stored
 the write (`apply`, else whether the status is `2xx`), the cue's `series_errors` when it set one,
+the response headers it added,
 and the raw body, base64. The driver's
 log capture collects that stdout with every other service's, so a `stop` and `start` of the
 stand-in keep one record, and `check` re-scores a run from it. SIGTERM lets each request in
@@ -1794,7 +1801,11 @@ back after the SUT stops: the record is in `logs/standin.stdout`.
 
 **V.** `soaklib/standin.py` decodes each stored request's body on the host. Under
 `remote_write` it's a Snappy block (a stdlib decoder, pinned against blocks `snap::raw` wrote, in
-`tools/soak/standin/snap-vectors.json`) holding a remote-write 1.0 `WriteRequest`. V is every
+`tools/soak/standin/snap-vectors.json`) holding a remote-write 1.0 `WriteRequest`, or a 2.0
+`Request` when the request's `Content-Type` names one. A `2xx` whose `Samples-Written` is below
+the request's samples told the sink that many weren't written: `ledger.standin` holds them to
+the sink's `logit.output.samples.dropped{reason="not_written"}` per SUT life, and doesn't expect
+that request's samples stored. V is every
 stored sample, with a later write of one `(label set, timestamp)` replacing an earlier one, as a
 remote-write receiver overwrites. The result has the export's shape, so `ledger.egress`,
 `ledger.summary`, and, under `vm_every_window`, `ledger.windows` read it as they read
@@ -1881,6 +1892,10 @@ to it, as on an external target. Under `remote_write` and `influxdb`, `ledger.se
   decompression prefix, `401`, `403`, `407`, `404`, `405`, `501`, `409`, `413`, `415`, `422`,
   `302`, a reset, a `stop` of the stand-in, and a `408`, each with its `class`. Under cumulative
   temporality the next window's totals overwrite a rejected batch, so the egress gap stays 0.
+- `standin-remote-write-v2`: `standin-remote-write` under `version: 2`. Four 20 s steps, 105 s
+  apart, walk the rows that read the written count: a `204` with no count (`refused`, as
+  VictoriaMetrics answers 2.0), a `200` counting none of the samples (settled, the samples
+  counted `not_written`), a `202` with no count (settled), and a `415` (`refused`).
 - `standin-at-most-once`: the same SUT with `buffer.delivery: at_most_once`; a `503` and a reset
   drop `ambiguous_at_most_once`, a `401` holds, a `400` drops `rejected`.
 - `standin-datadog` (W9b): `statsd-datadog`'s generator and SUT, with `datadog_out` sending

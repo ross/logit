@@ -1,0 +1,158 @@
+# The rows of prometheus_out's sender-mode response-class table that read a remote-write 2.0
+# receiver's `X-Prometheus-Remote-Write-Samples-Written` count, against a scripted stand-in under
+# load (crates/logit-outputs/src/prometheus.rs, "Faults, retries and duplicate safety (sender
+# mode)"). With no cue the stand-in answers `200` with the body's own counts, as a 2.0 receiver
+# does; each step replaces those headers for 20 s, 105 s apart, as standin-remote-write spaces
+# its steps. `ledger.standin` checks each classed step's effect, and that the samples a short
+# count said weren't written equal the sink's `samples.dropped{reason="not_written"}`. Those
+# samples are lost, but the next window's cumulative totals overwrite them, so the ledger's gap
+# stays 0. The schema is docs/plans/soak-harness.md's "The scenario schema".
+
+name = "standin-remote-write-v2"
+description = "statsd-vm into prometheus_out RW2 Snappy, against a stand-in answering the 2.0 written-count rows of the sink's response-class table"
+duration = "9m25s"        # warmup + one cycle + cooldown
+warmup = "60s"
+cooldown = "60s"          # >= recovery_bound
+recovery_bound = "45s"    # retry_max_delay 10s + two aggregate windows + a drain
+cycle = "7m25s"           # the last step, its recovery, and two progress windows
+
+[configs]
+sut = "logit-sut.yaml"
+generator = "logit-generator.yaml"
+
+[target]
+kind = "standin"
+
+[ledger]
+sut_aggregate = "window"
+wire_loss_outside_faults = 0.0
+
+[[ledger.source]]
+service = "generator"
+generator_input = "load"
+generator_sink = "statsd"
+sut_listener = "statsd"
+
+[[ledger.sink]]           # the one sink, whose writes the stand-in records
+id = "remote_write"
+
+[thresholds]
+progress_window = "30s"
+rss_growth_mib_per_hour = 64
+fd_growth = 8
+
+[[step]]                  # c0s1: a 2xx with no count, as VictoriaMetrics answers 2.0: held
+at = "0s"
+action = "respond"
+on = "standin"
+status = 204
+headers = {}
+apply = false
+class = "refused"
+for = "20s"
+
+[[step]]                  # c0s2: a 2xx counting none of the samples: settled, the samples dropped
+at = "1m45s"
+action = "respond"
+on = "standin"
+status = 200
+headers = { "X-Prometheus-Remote-Write-Samples-Written" = "0" }
+apply = false
+for = "20s"
+
+[[step]]                  # c0s3: a 202 with no count, which an asynchronous receiver may send: settled
+at = "3m30s"
+action = "respond"
+on = "standin"
+status = 202
+headers = {}
+for = "20s"
+
+[[step]]                  # c0s4: unsupported content type: held
+at = "5m15s"
+action = "respond"
+on = "standin"
+status = 415
+class = "refused"
+for = "20s"
+
+[[expect]]
+name = "no-count-holds"
+service = "logit"
+metric = "logit.component.retrying"
+component = "remote_write"
+step = "c0s1"
+window = "during"
+reduce = "max"
+min = 1
+
+[[expect]]
+name = "no-count-drops-nothing"
+service = "logit"
+metric = "logit.component.batches.dropped"
+component = "remote_write"
+step = "c0s1"
+window = "through"
+reduce = "delta"
+max = 0
+
+[[expect]]
+name = "short-count-counts-samples"
+service = "logit"
+metric = "logit.output.samples.dropped"
+component = "remote_write"
+attrs = { reason = "not_written" }
+step = "c0s2"
+window = "through"
+reduce = "delta"
+min = 1
+
+[[expect]]
+name = "short-count-settles"
+service = "logit"
+metric = "logit.component.retries"
+component = "remote_write"
+step = "c0s2"
+window = "through"
+reduce = "delta"
+max = 0
+
+[[expect]]
+name = "short-count-drops-no-batch"
+service = "logit"
+metric = "logit.component.batches.dropped"
+component = "remote_write"
+step = "c0s2"
+window = "through"
+reduce = "delta"
+max = 0
+
+[[expect]]
+name = "accepted-settles"
+service = "logit"
+metric = "logit.component.retries"
+component = "remote_write"
+step = "c0s3"
+window = "through"
+reduce = "delta"
+max = 0
+
+[[expect]]
+name = "accepted-counts-nothing-dropped"
+service = "logit"
+metric = "logit.output.samples.dropped"
+component = "remote_write"
+step = "c0s3"
+window = "through"
+reduce = "delta"
+max = 0
+
+[[expect]]
+name = "retrying-clears"
+service = "logit"
+metric = "logit.component.retrying"
+component = "remote_write"
+step = "c0s4"
+window = "after"
+reduce = "last"
+max = 0
