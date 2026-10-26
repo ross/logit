@@ -482,8 +482,8 @@ alert or a close in that window is `Fault::Refused`; silence for the whole bound
 - **Application data before the first write stays `Fault::Clean`.** A line receiver never sends
   any, so the connection isn't one to write into, but nothing says the server rejected a
   certificate. `PendingClose::Bytes` already reads data on a reused connection the same way.
-  Calling it `Refused` would hold the queue forever behind a server that greets every connection,
-  where `Clean` retries on a new connection.
+  `Clean` says nothing reached the destination without claiming it refuses every batch, so the
+  class and the counter don't report a certificate rejection that didn't happen.
 - **Each destination remembers that it asked.** rustls calls the config's client-certificate
   resolver only on a CertificateRequest, so `TlsTarget::new` wraps the resolver once in
   `RecordsCertRequest`, which sets a task-local flag for the one handshake and delegates to the
