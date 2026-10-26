@@ -331,16 +331,6 @@ fn server_tls_config_for(
     Arc::new(cfg)
 }
 
-/// [`server_tls_config`] with no TLS 1.3 session tickets, as a GnuTLS-based collector sends
-/// none: a client waiting for one to learn its certificate was accepted waits its whole bound.
-pub(crate) fn server_tls_config_without_tickets(
-    require_client_auth: bool,
-) -> Arc<rustls::ServerConfig> {
-    let mut config = (*server_tls_config(require_client_auth)).clone();
-    config.send_tls13_tickets = 0;
-    Arc::new(config)
-}
-
 /// A scripted in-memory stream standing in for the connection behind the sinks'
 /// `Box<dyn AsyncStream>` seam, with shared state a test inspects after the call under test.
 ///

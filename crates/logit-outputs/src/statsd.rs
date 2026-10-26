@@ -436,10 +436,11 @@
 //! The stream transports send through the driver in `crate::stream`, shared with `syslog_out`
 //! and `graphite_out`; its module doc lists the fault rules. On TLS a write `Err` is
 //! `Fault::Ambiguous`, not retried under this sink's default posture ("Delivery posture" below).
-//! A new TLS 1.3 connection whose server asks for a client certificate waits up to
+//! A new TLS 1.3 connection to a server that asks for a client certificate reads for
 //! `accept_timeout:` (default 1 s, [`StatsdOutput::with_accept_timeout`]) before its first write,
 //! so a rejected certificate is a `Fault::Refused` that holds the queue rather than a batch
-//! written into a closing connection; the driver's module doc has the rows. Every transport counts `logit.output.requests` tagged `class=ok|clean|ambiguous|rejected|refused`.
+//! written into a closing connection; the driver's module doc has the rows. Every transport
+//! counts `logit.output.requests` tagged `class=ok|clean|ambiguous|rejected|refused`.
 //!
 //! ## Delivery posture
 //!
@@ -632,8 +633,8 @@ pub const DEFAULT_MAX_PACKET_BYTES: usize = 1432;
 /// `default_statsd_connect_timeout` hardcodes the same 5 seconds, kept in sync by hand.
 pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// TCP with TLS only: how long a new connection whose server asked for a client certificate
-/// waits for the server to accept it before the first write (`crate::stream`'s module doc).
+/// TCP with TLS only: how long a new TLS 1.3 connection to a server that asks for a client
+/// certificate reads for a rejection before the first write (`crate::stream`'s module doc).
 ///
 /// `logit-config`'s `default_stream_accept_timeout` hardcodes the same second. Change both
 /// together.
@@ -2465,9 +2466,9 @@ impl StatsdOutput {
         self
     }
 
-    /// Bounds how long a new TLS connection waits for the server to accept its client certificate
-    /// before the first write (`accept_timeout:` in config); zero turns the wait off. No effect
-    /// without TLS.
+    /// How long a new TLS 1.3 connection to a server that asks for a client certificate reads for
+    /// a rejection before the first write (`accept_timeout:` in config); zero turns the wait off.
+    /// No effect without TLS.
     pub fn with_accept_timeout(mut self, accept_timeout: Duration) -> Self {
         self.accept_timeout = accept_timeout;
         self

@@ -47,7 +47,7 @@ components:
     # app_name: null              # no host.name/syslog.tag attribute
     # max_message_bytes: "8192"   # bounds one encoded message (PRI + header + MSG)
     # connect_timeout: 5s         # tcp only -- also bounds the tls: handshake, same budget
-    # accept_timeout: 1s          # tls only -- wait for the server to accept a client certificate
+    # accept_timeout: 1s          # tls only -- read for a client-certificate rejection first
     # tls:                       # presence turns TLS on and makes it required, even an empty
     #                             # tls: {}; tcp only
     #   ca_file: ca.pem           # trust this CA instead of the bundled Mozilla set

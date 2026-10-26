@@ -4209,17 +4209,17 @@ pub enum ComponentKind {
         #[serde(default = "default_syslog_connect_timeout", with = "humantime_serde_duration")]
         #[schemars(with = "String")]
         connect_timeout: Duration,
-        /// TLS only, ignored without `tls:`. How long a new TLS connection waits, before its
-        /// first write, for a server that asked for a client certificate to accept it. Under TLS
-        /// 1.3 the server checks the certificate after the handshake completes, so without this
-        /// wait a rejected certificate's first batch would be written into a connection the
-        /// server is closing, and count as delivered. The wait ends as soon as the server sends a
-        /// session ticket, which most servers do on accepting; a server that sends none
-        /// (GnuTLS-based collectors, for example) costs the whole wait once per new connection. A
-        /// rejection read in the wait holds the queue and retries, as for an unreachable
-        /// destination. A server that sends nothing in time is taken to have accepted, so a
-        /// slower rejection still loses that connection's first batch. `0s` turns the wait off.
-        /// Defaults to `1s`.
+        /// TLS only, ignored without `tls:`. How long a new TLS 1.3 connection to a server that
+        /// asks for a client certificate reads, before its first write, for the server to reject
+        /// that certificate. Under TLS 1.3 the server checks the certificate after the handshake
+        /// completes, and some servers check it again in their own code and reject by closing the
+        /// connection, so without this wait a rejected certificate's first batch would be written
+        /// into a connection the server is closing, and count as delivered. TLS sends nothing
+        /// that means accepted, so every new connection to such a server, resumed ones included,
+        /// waits the whole `accept_timeout` once before its first batch; a server that asks for no
+        /// certificate costs no wait. A rejection read in the wait, an alert or a close, holds
+        /// the queue and retries, as for an unreachable destination. A rejection slower than this
+        /// still loses that connection's first batch. `0s` turns the wait off. Defaults to `1s`.
         #[serde(default = "default_stream_accept_timeout", with = "humantime_serde_duration")]
         #[schemars(with = "String")]
         accept_timeout: Duration,
@@ -4307,17 +4307,17 @@ pub enum ComponentKind {
         #[serde(default = "default_statsd_connect_timeout", with = "humantime_serde_duration")]
         #[schemars(with = "String")]
         connect_timeout: Duration,
-        /// TLS only, ignored without `tls:`. How long a new TLS connection waits, before its
-        /// first write, for a server that asked for a client certificate to accept it. Under TLS
-        /// 1.3 the server checks the certificate after the handshake completes, so without this
-        /// wait a rejected certificate's first batch would be written into a connection the
-        /// server is closing, and count as delivered. The wait ends as soon as the server sends a
-        /// session ticket, which most servers do on accepting; a server that sends none
-        /// (GnuTLS-based collectors, for example) costs the whole wait once per new connection. A
-        /// rejection read in the wait holds the queue and retries, as for an unreachable
-        /// destination. A server that sends nothing in time is taken to have accepted, so a
-        /// slower rejection still loses that connection's first batch. `0s` turns the wait off.
-        /// Defaults to `1s`.
+        /// TLS only, ignored without `tls:`. How long a new TLS 1.3 connection to a server that
+        /// asks for a client certificate reads, before its first write, for the server to reject
+        /// that certificate. Under TLS 1.3 the server checks the certificate after the handshake
+        /// completes, and some servers check it again in their own code and reject by closing the
+        /// connection, so without this wait a rejected certificate's first batch would be written
+        /// into a connection the server is closing, and count as delivered. TLS sends nothing
+        /// that means accepted, so every new connection to such a server, resumed ones included,
+        /// waits the whole `accept_timeout` once before its first batch; a server that asks for no
+        /// certificate costs no wait. A rejection read in the wait, an alert or a close, holds
+        /// the queue and retries, as for an unreachable destination. A rejection slower than this
+        /// still loses that connection's first batch. `0s` turns the wait off. Defaults to `1s`.
         #[serde(default = "default_stream_accept_timeout", with = "humantime_serde_duration")]
         #[schemars(with = "String")]
         accept_timeout: Duration,

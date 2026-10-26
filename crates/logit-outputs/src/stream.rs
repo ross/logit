@@ -11,9 +11,10 @@
 //! | Response | Class | Why | Evidence |
 //! |---|---|---|---|
 //! | dial failure: TCP connect refused, DNS failure, TLS handshake failure or stall, Unix connect, each under `connect_timeout` | `Clean`, not retried inside `send` | no byte of the frame left | `a_refused_dial_is_clean_leaves_the_pool_empty_and_counts_no_reconnect`, `a_stalled_tls_handshake_times_out_clean_within_twice_the_connect_timeout`, `unix_stream_dial_failures_are_clean` |
-//! | a new TLS 1.3 connection whose server asked for a client certificate: a session ticket, or no answer within `accept_timeout` | no fault: the frame is written | a ticket follows the server's check; silence is taken as acceptance, since some servers send no ticket | `syslog::tests::tls_tcp_with_a_client_certificate_satisfies_a_client_ca_requiring_collector`, `syslog::tests::tls_tcp_to_a_ticketless_collector_delivers_after_the_accept_timeout` |
+//! | a new TLS 1.3 connection, full or resumed, to a destination whose server asked for a client certificate: nothing but session tickets for `accept_timeout` | no fault: the frame is written | TLS sends no acceptance, so silence for the bound is taken as one; a ticket proves nothing, since a server may send it before its own code rejects the client | `syslog::tests::tls_tcp_with_a_client_certificate_satisfies_a_client_ca_requiring_collector`, `a_resumed_dial_to_a_server_that_asked_for_a_certificate_waits_and_reads_a_close` |
 //! | that connection: an alert before the first write (`certificate_required`, `bad_certificate`, any other) | `Refused`, not retried inside `send` | the server rejected the client certificate or the handshake, so a redial would be rejected the same way | `syslog::tests::tls_tcp_without_a_client_certificate_delivers_nothing_to_a_client_ca_requiring_collector`, `statsd::tests::tls_tcp_without_a_client_certificate_is_refused_by_a_client_ca_requiring_collector` |
-//! | that connection: EOF, `close_notify`, a reset, or data from the server before the first write | `Clean`, not retried inside `send` | no byte of the frame left | `a_close_or_data_during_the_acceptance_wait_is_clean` |
+//! | that connection: a close before the first write (EOF, `close_notify`, a reset, another read error), tickets or none before it | `Refused`, not retried inside `send` | a server that checks the certificate in its own code after the handshake turns the client away by closing, often with no alert | `a_close_after_session_tickets_is_refused_and_data_is_clean`, `a_resumed_dial_to_a_server_that_asked_for_a_certificate_waits_and_reads_a_close` |
+//! | that connection: data from the server before the first write | `Clean`, not retried inside `send` | no byte of the frame left, the bytes are already off the stream, and a line receiver never sends any | `a_close_after_session_tickets_is_refused_and_data_is_clean` |
 //! | a reused connection's probe answers anything but open (EOF, unsolicited bytes, a reset) | no fault: the driver redials, and the redial doesn't consume the retry | the old connection was dead before this frame | `a_reused_connection_that_probes_eof_is_redialed_and_the_retry_survives`, `a_reused_connection_that_probes_unsolicited_bytes_is_redialed_and_the_retry_survives`, `unix_stream_redials_when_the_probe_finds_the_pooled_connection_closed` |
 //! | a reused TLS connection's probe reads an alert | `Refused`, nothing written, no redial | the server ended the session, usually by rejecting the client certificate after the batch before this one was written; a silent redial would hide that | `a_reused_connection_that_probes_a_tls_alert_is_refused_and_never_redialed` |
 //! | the plaintext first `write` fails (`Err`, or `Ok(0)` read as `WriteZero`) | retried once on a fresh connection; a second failure is `Clean` | a failed plaintext first write accepted nothing | `a_plaintext_first_write_error_is_retried_once_then_clean`, `a_plaintext_first_write_of_zero_bytes_is_write_zero_retried_once_then_clean`, `unix_stream_retries_a_first_write_the_peer_refused` |
@@ -23,18 +24,24 @@
 //! | any other write, or the flush, makes no progress for `connect_timeout` | `Ambiguous`, the connection dropped | part of the frame may have left | `a_write_that_makes_no_progress_fails_ambiguous_and_the_next_send_dials_fresh` |
 //!
 //! **The acceptance wait.** Under TLS 1.3 a server checks the client certificate after the client's
-//! last handshake message, so a dial completes before a rejection arrives, and a sink that only
-//! writes would never read the alert: the frame it wrote would count delivered. So a dial whose
-//! TLS 1.3 server sent a CertificateRequest reads before the first write, under `accept_timeout`
-//! ([`await_acceptance`]). A connection whose server asked for no certificate, a resumed one (TLS
-//! 1.3 forbids a CertificateRequest there), and TLS 1.2 (which checks inside the handshake, so a
-//! rejection is a failed dial, `a_tls12_client_certificate_rejection_fails_the_handshake_clean`)
-//! don't wait, and neither does any dial under an `accept_timeout` of zero
-//! (`syslog::tests::tls_tcp_with_a_zero_accept_timeout_never_waits`). [`RecordsCertRequest`] is
-//! how a dial knows the server asked
-//! (`a_full_handshake_records_the_certificate_request_and_a_resumed_one_does_not`). A rejection
-//! that arrives after `accept_timeout` still loses that connection's first frame: the next send's
-//! probe reports its alert, or redials past a close that carried none.
+//! last handshake message, and may check it again in its own code after its TLS library has
+//! accepted it, so a dial completes before a rejection arrives. TLS sends nothing that means
+//! accepted, and a sink that only writes never reads the alert or close that means rejected: the
+//! frame it wrote would count delivered. So before the first write on a new TLS 1.3 connection to
+//! a destination whose server has asked for a client certificate, the driver reads for the whole
+//! `accept_timeout` ([`await_acceptance`]). Session tickets don't end the wait: a server may send
+//! them before its own check. A resumed handshake carries no CertificateRequest, so the target
+//! remembers that the server asked on an earlier full handshake ([`RecordsCertRequest`] is how a
+//! dial knows, `a_full_handshake_records_the_certificate_request_and_a_resumed_one_does_not`),
+//! and a resumed connection waits too; without that, a server that rejects in its own code would
+//! turn away every resumed redial after the first batch, unseen. A destination whose server never asked
+//! doesn't wait (`a_destination_that_never_asked_for_a_certificate_never_waits`), and neither does
+//! TLS 1.2, which checks inside the handshake, so a rejection is a failed dial
+//! (`a_tls12_client_certificate_rejection_fails_the_handshake_clean`), nor any dial under an
+//! `accept_timeout` of zero (`syslog::tests::tls_tcp_with_a_zero_accept_timeout_never_waits`). A
+//! rejection that arrives after `accept_timeout` still loses that connection's first frame: the
+//! next send's probe reports an alert, or redials past a close, and the redial's own wait reads
+//! the rejection.
 //!
 //! `connect_timeout` bounds each write's progress as well as each dial phase
 //! ([`write_with_progress`]), so a peer that accepts the connection and stops reading fails the
@@ -60,8 +67,8 @@ use std::future::poll_fn;
 use std::io;
 use std::path::Path;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::task::Poll;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -84,6 +91,10 @@ use crate::tls::{
 pub(crate) struct TlsTarget {
     config: Arc<rustls::ClientConfig>,
     server_name: ServerName<'static>,
+    /// Set, and never cleared, once a full handshake to this destination carried a
+    /// CertificateRequest. A resumed TLS 1.3 handshake carries none, so this is how a resumed
+    /// connection to a server that checks client certificates knows to wait too.
+    asks_for_client_cert: AtomicBool,
 }
 
 impl TlsTarget {
@@ -102,7 +113,15 @@ impl TlsTarget {
                 endpoint = redact::url(endpoint),
             )
         })?;
-        Ok(Self { config: Arc::new(RecordsCertRequest::install(config)), server_name })
+        Ok(Self {
+            config: Arc::new(RecordsCertRequest::install(config)),
+            server_name,
+            asks_for_client_cert: AtomicBool::new(false),
+        })
+    }
+
+    fn asks_for_client_cert(&self) -> bool {
+        self.asks_for_client_cert.load(Ordering::Relaxed)
     }
 }
 
@@ -134,7 +153,7 @@ pub(crate) struct Dial<'a> {
     pub(crate) target: Target<'a>,
     /// Bounds each dial phase on its own, so a TLS dial takes at most twice this.
     pub(crate) connect_timeout: Duration,
-    /// Bounds [`await_acceptance`] on a new TLS 1.3 connection whose server asked for a client
+    /// Bounds [`await_acceptance`] on a new TLS 1.3 connection to a server that asks for a client
     /// certificate. Zero skips the wait, as `logit_out` does: it reads the peer's answer to its
     /// own `Hello`.
     pub(crate) accept_timeout: Duration,
@@ -183,11 +202,10 @@ pub(crate) async fn connect(dial: &Dial<'_>) -> anyhow::Result<Box<dyn AsyncStre
                     .context(Fault::Clean)?;
             }
             let Some(tls) = tls else { return Ok(Box::new(tcp)) };
-            let (mut stream, cert_requested) =
-                handshake(tls, tcp, dial.connect_timeout, sink).await?;
+            let (mut stream, _) = handshake(tls, tcp, dial.connect_timeout, sink).await?;
             let tls13 =
                 stream.get_ref().1.protocol_version() == Some(rustls::ProtocolVersion::TLSv1_3);
-            if cert_requested && tls13 && !dial.accept_timeout.is_zero() {
+            if tls13 && tls.asks_for_client_cert() && !dial.accept_timeout.is_zero() {
                 await_acceptance(&mut stream, dial.accept_timeout, sink).await?;
             }
             Ok(Box::new(stream))
@@ -214,7 +232,7 @@ pub(crate) async fn connect(dial: &Dial<'_>) -> anyhow::Result<Box<dyn AsyncStre
 }
 
 /// The TLS phase of [`connect`], under its own `connect_timeout`, with whether the server sent a
-/// CertificateRequest ([`record_cert_request`]).
+/// CertificateRequest ([`record_cert_request`]), which it also records on `tls`.
 async fn handshake<IO>(
     tls: &TlsTarget,
     io: IO,
@@ -236,23 +254,23 @@ where
         })
         .and_then(|r| r.with_context(|| format!("TLS handshake with {sink} endpoint")))
         .context(Fault::Clean)?;
+    if cert_requested {
+        tls.asks_for_client_cert.store(true, Ordering::Relaxed);
+    }
     Ok((stream, cert_requested))
 }
 
-/// Waits, before the first write, for a TLS 1.3 server that asked for a client certificate to
-/// accept it (the module doc's "The acceptance wait"). The first of these ends the wait:
+/// Reads for `bound` before the first write on a new TLS 1.3 connection to a server that asks
+/// for a client certificate, so a rejection is read before a frame is written into it (the
+/// module doc's "The acceptance wait"). TLS sends no acceptance, so only `bound` passing in
+/// silence ends the wait as accepted. A session ticket is read and ignored: a server may send one
+/// before its own code rejects the peer. Otherwise:
 ///
-/// - a session ticket (`tls13_tickets_received`): servers send them after the check, so the
-///   certificate was accepted. A ticket-only read leaves `poll_read` pending, so the count is
-///   checked after every wake;
-/// - `bound` elapsing: a server that sends no ticket (GnuTLS-based collectors) and no alert is
-///   taken to have accepted;
-/// - an alert: `Fault::Refused`, naming it;
-/// - EOF, a reset, or another read error: `Fault::Clean`;
-/// - application data: `Fault::Clean`, as [`PendingClose::Bytes`] is for a reused connection;
+/// - an alert, or the server closing the connection by any means (EOF, `close_notify`, a reset,
+///   another read error), is `Fault::Refused`: the server turned the client away before it wrote
+///   anything, and a redial would meet the same answer;
+/// - application data is `Fault::Clean`, as [`PendingClose::Bytes`] is for a reused connection:
 ///   the bytes are already off the stream, and a line receiver never sends any.
-///
-/// Nothing of a frame has been written, so none of these is `Ambiguous`.
 async fn await_acceptance<IO>(
     stream: &mut TlsStream<IO>,
     bound: Duration,
@@ -261,38 +279,32 @@ async fn await_acceptance<IO>(
 where
     IO: AsyncRead + AsyncWrite + Unpin,
 {
-    let accepted = |stream: &TlsStream<IO>| stream.get_ref().1.tls13_tickets_received() > 0;
     let mut buf = [0u8; 1];
     let read = poll_fn(|cx| {
-        if accepted(stream) {
-            return Poll::Ready(None);
-        }
         let mut read_buf = ReadBuf::new(&mut buf);
-        match Pin::new(&mut *stream).poll_read(cx, &mut read_buf) {
-            Poll::Pending if accepted(stream) => Poll::Ready(None),
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(read) => Poll::Ready(Some(read.map(|()| read_buf.filled().len()))),
-        }
+        Pin::new(&mut *stream)
+            .poll_read(cx, &mut read_buf)
+            .map(|read| read.map(|()| read_buf.filled().len()))
     });
-    let why = match tokio::time::timeout(bound, read).await {
-        Err(_) | Ok(None) => return Ok(()),
-        Ok(Some(Ok(0))) => anyhow::anyhow!("the peer closed the connection"),
-        Ok(Some(Ok(_))) => anyhow::anyhow!("the peer sent data before any was written"),
-        Ok(Some(Err(err))) => match alert_in(&err) {
-            Some(alert) => {
-                return Err(anyhow::anyhow!(
-                    "{sink}: the TLS peer ended the connection with alert {} before the first \
-                     write: it rejected the client certificate, or the handshake",
-                    alert_name(alert)
-                )
-                .context(Fault::Refused));
-            }
-            None => anyhow::Error::new(err),
+    let refused = match tokio::time::timeout(bound, read).await {
+        Err(_elapsed) => return Ok(()),
+        Ok(Ok(0)) => anyhow::anyhow!("the peer closed the connection"),
+        Ok(Ok(_)) => {
+            return Err(anyhow::anyhow!("the peer sent data before any was written")
+                .context(format!("{sink}: waiting for the TLS peer to accept the handshake"))
+                .context(Fault::Clean));
+        }
+        Ok(Err(err)) => match alert_in(&err) {
+            Some(alert) => anyhow::anyhow!("the peer sent alert {}", alert_name(alert)),
+            None => anyhow::Error::new(err).context("the peer closed the connection"),
         },
     };
-    Err(why
-        .context(format!("{sink}: waiting for the TLS peer to accept the handshake"))
-        .context(Fault::Clean))
+    Err(refused
+        .context(format!(
+            "{sink}: the TLS peer turned the connection away before the first write, as a \
+             server does when it rejects the client certificate"
+        ))
+        .context(Fault::Refused))
 }
 
 /// The write-chunk size under [`write_with_progress`]: each chunk's write must accept something
@@ -490,9 +502,9 @@ mod tests {
 
     use super::*;
     use crate::test_support::{
-        client_config, read_once, rejected_tls_client, server_tls_config,
-        server_tls_config_without_tickets, tapped_duplex, tls12_server_tls_config, tls_pair,
-        tls_settings, DialStep, FakeStream, ReadStep, ScriptedDial, WriteStep,
+        client_config, read_once, rejected_tls_client, server_tls_config, tapped_duplex,
+        tls12_server_tls_config, tls_pair, tls_settings, DialStep, FakeStream, ReadStep,
+        ScriptedDial, WriteStep,
     };
     use crate::tls::poll_pending_close;
 
@@ -1083,113 +1095,196 @@ mod tests {
 
     // -- The client-certificate request record ----------------------------------------------------
 
-    /// A full handshake with a server requiring a client certificate records the request; the
-    /// next dial resumes on the ticket the acceptance wait read, and records none. Resumption
-    /// needs the config's resolver to be the one `Arc` the ticket was issued under, so this also
-    /// pins that the recording resolver is installed once, not per dial.
-    #[tokio::test]
-    async fn a_full_handshake_records_the_certificate_request_and_a_resumed_one_does_not() {
+    /// What a test server does with each connection once its handshake completed.
+    #[derive(Clone, Copy, Debug)]
+    enum AfterAccept {
+        Hold,
+        CloseNotify,
+        DropWithoutCloseNotify,
+        Reset,
+        Write,
+    }
+
+    /// A TLS server on loopback answering one connection per entry of `then`, in order. Its task
+    /// returns each handshake's kind, keeping held connections open until it's awaited.
+    // `set_linger` is deprecated for blocking the thread on drop; a zero linger doesn't block.
+    #[allow(deprecated)]
+    async fn serve(
+        config: Arc<rustls::ServerConfig>,
+        then: Vec<AfterAccept>,
+    ) -> (String, tokio::task::JoinHandle<Vec<rustls::HandshakeKind>>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let acceptor = tokio_rustls::TlsAcceptor::from(server_tls_config(true));
+        let endpoint = listener.local_addr().unwrap().to_string();
+        let acceptor = tokio_rustls::TlsAcceptor::from(config);
         let server = tokio::spawn(async move {
-            let mut held = Vec::new();
-            for _ in 0..2 {
+            let (mut kinds, mut held) = (Vec::new(), Vec::new());
+            for then in then {
                 let (tcp, _) = listener.accept().await.unwrap();
-                held.push(acceptor.accept(tcp).await.expect("the client certificate is valid"));
+                let mut stream = acceptor.accept(tcp).await.expect("the handshake completes");
+                kinds.push(stream.get_ref().1.handshake_kind().unwrap());
+                match then {
+                    AfterAccept::Hold => held.push(stream),
+                    AfterAccept::CloseNotify => stream.shutdown().await.unwrap(),
+                    AfterAccept::DropWithoutCloseNotify => drop(stream.into_inner().0),
+                    AfterAccept::Reset => {
+                        let tcp = stream.into_inner().0;
+                        tcp.set_linger(Some(Duration::ZERO)).unwrap();
+                        drop(tcp);
+                    }
+                    AfterAccept::Write => {
+                        stream.write_all(b"x").await.unwrap();
+                        stream.flush().await.unwrap();
+                        held.push(stream);
+                    }
+                }
             }
-            held
+            drop(held);
+            kinds
         });
+        (endpoint, server)
+    }
+
+    /// A target presenting `client.pem` and trusting `ca.pem`.
+    fn mtls_target() -> TlsTarget {
         let settings = tls_settings(|t| {
             t.ca_file = Some("ca.pem".to_string());
             t.cert_file = Some("client.pem".to_string());
             t.key_file = Some("client.key".to_string());
         });
-        let tls = TlsTarget::new("test_out", "localhost:1", client_config(&settings)).unwrap();
+        TlsTarget::new("test_out", "localhost:1", client_config(&settings)).unwrap()
+    }
 
-        let tcp = TcpStream::connect(addr).await.unwrap();
+    fn tls_dial<'a>(endpoint: &'a str, tls: &'a TlsTarget, accept_timeout: Duration) -> Dial<'a> {
+        Dial {
+            target: Target::Tcp { endpoint, tls: Some(tls) },
+            connect_timeout: RECV_TIMEOUT,
+            accept_timeout,
+            sink: "test_out",
+            nodelay: false,
+        }
+    }
+
+    /// An hour, against a dial bounded by `RECV_TIMEOUT`: a dial that finishes didn't wait it.
+    const NEVER: Duration = Duration::from_secs(3600);
+
+    /// `connect(dial)`, failing the test if it runs past `RECV_TIMEOUT`.
+    async fn connect_promptly(dial: &Dial<'_>) -> anyhow::Result<Box<dyn AsyncStream>> {
+        tokio::time::timeout(RECV_TIMEOUT, connect(dial)).await.expect("the dial didn't wait")
+    }
+
+    /// Reads `stream` until its session tickets arrive, so the next dial can resume.
+    async fn read_session_tickets(stream: &mut TlsStream<TcpStream>) {
+        let mut buf = [0u8; 1];
+        let tickets = poll_fn(|cx| {
+            let mut read_buf = ReadBuf::new(&mut buf);
+            let read = Pin::new(&mut *stream).poll_read(cx, &mut read_buf);
+            match read {
+                Poll::Pending if stream.get_ref().1.tls13_tickets_received() > 0 => Poll::Ready(()),
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(read) => panic!("expected only session tickets, read {read:?}"),
+            }
+        });
+        tokio::time::timeout(RECV_TIMEOUT, tickets).await.expect("the server sends tickets");
+    }
+
+    /// A full handshake with a server requiring a client certificate records the request on the
+    /// target; the next dial resumes and records none. Resumption needs the config's resolver to
+    /// be the one `Arc` the ticket was issued under, so this also pins that the recording resolver
+    /// is installed once, not per dial.
+    #[tokio::test]
+    async fn a_full_handshake_records_the_certificate_request_and_a_resumed_one_does_not() {
+        let then = vec![AfterAccept::Hold, AfterAccept::Hold];
+        let (endpoint, server) = serve(server_tls_config(true), then).await;
+        let tls = mtls_target();
+        assert!(!tls.asks_for_client_cert());
+
+        let tcp = TcpStream::connect(&endpoint).await.unwrap();
         let (mut first, requested) =
             handshake(&tls, tcp, RECV_TIMEOUT, "test_out").await.expect("full handshake");
         assert!(requested, "the server sent a CertificateRequest");
-        assert_eq!(first.get_ref().1.handshake_kind(), Some(rustls::HandshakeKind::Full));
-        await_acceptance(&mut first, RECV_TIMEOUT, "test_out").await.expect("a ticket");
-        assert!(first.get_ref().1.tls13_tickets_received() > 0);
+        assert!(tls.asks_for_client_cert(), "recorded on the target");
+        read_session_tickets(&mut first).await;
 
-        let tcp = TcpStream::connect(addr).await.unwrap();
-        let (second, requested) =
+        let tcp = TcpStream::connect(&endpoint).await.unwrap();
+        let (_second, requested) =
             handshake(&tls, tcp, RECV_TIMEOUT, "test_out").await.expect("resumed handshake");
-        assert_eq!(second.get_ref().1.handshake_kind(), Some(rustls::HandshakeKind::Resumed));
         assert!(!requested, "a resumed TLS 1.3 handshake carries no CertificateRequest");
-        drop(server.await.unwrap());
+        assert!(tls.asks_for_client_cert(), "the record is never cleared");
+        let kinds = server.await.unwrap();
+        assert_eq!(kinds, [rustls::HandshakeKind::Full, rustls::HandshakeKind::Resumed]);
     }
 
     // -- The acceptance wait ----------------------------------------------------------------------
 
-    /// What a test server does once its handshake with a client certificate completed.
-    #[derive(Clone, Copy, Debug)]
-    enum AfterAccept {
-        CloseNotify,
-        DropWithoutCloseNotify,
-        Write,
-    }
-
-    /// One dial with a client certificate and an hour-long `accept_timeout` to a server that
-    /// requires the certificate, sends no session ticket, and does `then` once it accepts.
-    /// Bounded by `RECV_TIMEOUT`, so a wait that ran to its bound fails the test.
-    async fn dial_a_ticketless_server_that(then: AfterAccept) -> anyhow::Result<()> {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let endpoint = listener.local_addr().unwrap().to_string();
-        let acceptor = tokio_rustls::TlsAcceptor::from(server_tls_config_without_tickets(true));
-        let server = tokio::spawn(async move {
-            let (tcp, _) = listener.accept().await.unwrap();
-            let mut stream = acceptor.accept(tcp).await.expect("the client certificate is valid");
-            match then {
-                AfterAccept::CloseNotify => stream.shutdown().await.unwrap(),
-                AfterAccept::DropWithoutCloseNotify => drop(stream.into_inner().0),
-                AfterAccept::Write => {
-                    stream.write_all(b"x").await.unwrap();
-                    stream.flush().await.unwrap();
-                    // Held open, so the client reads the byte and not a close.
-                    std::future::pending::<()>().await;
-                }
-            }
-        });
-        let settings = tls_settings(|t| {
-            t.ca_file = Some("ca.pem".to_string());
-            t.cert_file = Some("client.pem".to_string());
-            t.key_file = Some("client.key".to_string());
-        });
-        let tls = TlsTarget::new("test_out", "localhost:1", client_config(&settings)).unwrap();
-        let dial = Dial {
-            target: Target::Tcp { endpoint: &endpoint, tls: Some(&tls) },
-            connect_timeout: RECV_TIMEOUT,
-            accept_timeout: Duration::from_secs(3600),
-            sink: "test_out",
-            nodelay: false,
-        };
-        let dialed = tokio::time::timeout(RECV_TIMEOUT, connect(&dial))
-            .await
-            .expect("the server's answer ends the acceptance wait");
-        server.abort();
-        dialed.map(drop)
-    }
-
-    /// A close, with or without `close_notify`, or unsolicited data during the acceptance wait
-    /// is `Clean`: nothing was written, and the connection isn't kept.
+    /// The server accepts the client certificate at the TLS layer and sends its session tickets,
+    /// then turns the connection away in its own code, as rsyslog's permitted-peer check does:
+    /// by any close, with no alert. Each close is `Refused`; data from the server is `Clean`.
     #[tokio::test]
-    async fn a_close_or_data_during_the_acceptance_wait_is_clean() {
+    async fn a_close_after_session_tickets_is_refused_and_data_is_clean() {
         let cases = [
-            (AfterAccept::CloseNotify, "the peer closed the connection"),
-            (AfterAccept::DropWithoutCloseNotify, "close_notify"),
-            (AfterAccept::Write, "the peer sent data before any was written"),
+            (AfterAccept::CloseNotify, Fault::Refused, "the peer closed the connection"),
+            (AfterAccept::DropWithoutCloseNotify, Fault::Refused, "close_notify"),
+            (AfterAccept::Reset, Fault::Refused, "the peer closed the connection"),
+            (AfterAccept::Write, Fault::Clean, "the peer sent data before any was written"),
         ];
-        for (then, why) in cases {
-            let err = dial_a_ticketless_server_that(then).await.expect_err(&format!("{then:?}"));
-            assert_eq!(logit_pipeline::classify(&err), Fault::Clean, "{then:?}: {err:#}");
-            let message = format!("{err:#}");
-            assert!(message.contains("waiting for the TLS peer to accept"), "{then:?}: {message}");
-            assert!(message.contains(why), "{then:?}: {message}");
+        for (then, want, why) in cases {
+            let (endpoint, server) = serve(server_tls_config(true), vec![then]).await;
+            let tls = mtls_target();
+
+            let err = connect_promptly(&tls_dial(&endpoint, &tls, NEVER))
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("{then:?}: the server turned the client away"));
+
+            assert_eq!(logit_pipeline::classify(&err), want, "{then:?}: {err:#}");
+            assert!(format!("{err:#}").contains(why), "{then:?}: {err:#}");
+            server.await.unwrap();
         }
+    }
+
+    /// A resumed TLS 1.3 handshake carries no CertificateRequest, but the destination asked for a
+    /// certificate on its full handshake, so the resumed dial waits too, and reads the server's
+    /// close as `Refused`. The first dial shows silence for the whole bound is acceptance.
+    #[tokio::test]
+    async fn a_resumed_dial_to_a_server_that_asked_for_a_certificate_waits_and_reads_a_close() {
+        const BOUND: Duration = Duration::from_millis(200);
+        let then = vec![AfterAccept::Hold, AfterAccept::DropWithoutCloseNotify];
+        let (endpoint, server) = serve(server_tls_config(true), then).await;
+        let tls = mtls_target();
+
+        let start = std::time::Instant::now();
+        let first = connect(&tls_dial(&endpoint, &tls, BOUND)).await.expect("accepted");
+        assert!(start.elapsed() >= BOUND, "the wait ran its bound: {:?}", start.elapsed());
+
+        let err = connect_promptly(&tls_dial(&endpoint, &tls, NEVER))
+            .await
+            .err()
+            .expect("the resumed dial waits and reads the close");
+        assert_eq!(logit_pipeline::classify(&err), Fault::Refused, "{err:#}");
+        drop(first);
+        let kinds = server.await.unwrap();
+        assert_eq!(kinds, [rustls::HandshakeKind::Full, rustls::HandshakeKind::Resumed]);
+    }
+
+    /// A server that never asks for a client certificate gets no wait on a full or a resumed dial.
+    #[tokio::test]
+    async fn a_destination_that_never_asked_for_a_certificate_never_waits() {
+        let then = vec![AfterAccept::Hold, AfterAccept::Hold, AfterAccept::Hold];
+        let (endpoint, server) = serve(server_tls_config(false), then).await;
+        let tls = mtls_target();
+
+        let full = connect_promptly(&tls_dial(&endpoint, &tls, NEVER)).await.expect("full");
+        // The boxed stream hides its session, so a second full handshake reads the tickets.
+        let tcp = TcpStream::connect(&endpoint).await.unwrap();
+        let (mut ticketed, _) = handshake(&tls, tcp, RECV_TIMEOUT, "test_out").await.unwrap();
+        read_session_tickets(&mut ticketed).await;
+        let resumed = connect_promptly(&tls_dial(&endpoint, &tls, NEVER)).await.expect("resumed");
+
+        assert!(!tls.asks_for_client_cert());
+        drop((full, ticketed, resumed));
+        let kinds = server.await.unwrap();
+        use rustls::HandshakeKind::{Full, Resumed};
+        assert_eq!(kinds, [Full, Full, Resumed]);
     }
 
     /// TLS 1.2 checks a client certificate inside the handshake, so a rejection is a failed dial,
@@ -1205,15 +1300,11 @@ mod tests {
         });
         let settings = tls_settings(|t| t.ca_file = Some("ca.pem".to_string()));
         let tls = TlsTarget::new("test_out", "localhost:1", client_config(&settings)).unwrap();
-        let dial = Dial {
-            target: Target::Tcp { endpoint: &endpoint, tls: Some(&tls) },
-            connect_timeout: RECV_TIMEOUT,
-            accept_timeout: Duration::from_secs(3600),
-            sink: "test_out",
-            nodelay: false,
-        };
 
-        let err = connect(&dial).await.err().expect("the server rejects the handshake");
+        let err = connect_promptly(&tls_dial(&endpoint, &tls, NEVER))
+            .await
+            .err()
+            .expect("the server rejects the handshake");
 
         assert_eq!(logit_pipeline::classify(&err), Fault::Clean, "{err:#}");
         assert!(format!("{err:#}").contains("TLS handshake with test_out endpoint"), "{err:#}");

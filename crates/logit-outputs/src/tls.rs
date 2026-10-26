@@ -132,10 +132,11 @@ pub(crate) fn alert_in(err: &io::Error) -> Option<AlertDescription> {
 }
 
 /// An alert's RFC 8446 name, such as `certificate_required`, for an operator-facing message.
-/// rustls names its variants in camel case (`CertificateRequired`, `UnknownCA`).
+/// rustls names its variants in camel case (`CertificateRequired`, `UnknownCA`). An alert rustls
+/// has no name for is its number, since callers write "alert" before it.
 pub(crate) fn alert_name(alert: AlertDescription) -> String {
     let Some(camel) = alert.as_str() else {
-        return format!("alert {}", u8::from(alert));
+        return u8::from(alert).to_string();
     };
     let chars: Vec<char> = camel.chars().collect();
     let mut name = String::with_capacity(camel.len() + 4);
@@ -199,7 +200,7 @@ impl ResolvesClientCert for RecordsCertRequest {
         root_hint_subjects: &[&[u8]],
         sigschemes: &[SignatureScheme],
     ) -> Option<Arc<CertifiedKey>> {
-        // Outside `record_cert_request` (a `logit_out` dial) there's nothing to record.
+        // Outside `record_cert_request` there's nothing to record.
         let _ = CERT_REQUESTED.try_with(|requested| requested.set(true));
         self.inner.resolve(root_hint_subjects, sigschemes)
     }
@@ -345,7 +346,7 @@ mod tests {
             (AlertDescription::UnknownCA, "unknown_ca"),
             (AlertDescription::UnknownPSKIdentity, "unknown_psk_identity"),
             (AlertDescription::HandshakeFailure, "handshake_failure"),
-            (AlertDescription::Unknown(200), "alert 200"),
+            (AlertDescription::Unknown(200), "200"),
         ];
         for (alert, want) in cases {
             assert_eq!(alert_name(alert), want, "{alert:?}");
