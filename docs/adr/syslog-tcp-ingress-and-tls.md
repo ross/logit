@@ -460,8 +460,8 @@ before success was enough; a flush proves the bytes left, not that the server to
 A session ticket isn't a signal either way. RFC 8446 §4.6.1 makes NewSessionTicket a MAY, sent "at
 any time after the server has received the client Finished", with nothing tying it to client
 authentication. OpenSSL sends its tickets at the end of `SSL_accept`, before the application
-checks the peer's name, so rsyslog's `PermittedPeer` rejects a connection that already holds two
-tickets (verified below).
+checks the peer's name, so a server that checks the peer in its own code after its TLS library
+finishes the handshake rejects a connection that already holds tickets (verified below).
 
 ### Decision
 
@@ -503,8 +503,8 @@ alert or a close in that window is `Fault::Refused`; silence for the whole bound
 - **`accept_timeout` defaults to `1s`.** Silence is the only acceptance TLS gives, so every new
   connection to a destination that asks for a certificate pays the whole bound once, full or
   resumed. Pooled connections make new ones rare. A rejection on a LAN or a nearby region arrives
-  well inside a second; rsyslog's arrived within 50 ms below. The field is accepted without `tls:`
-  and has no effect there, so a config can set it ahead of TLS.
+  well inside a second; the rejections below arrived within 50 ms. The field is accepted without
+  `tls:` and has no effect there, so a config can set it ahead of TLS.
 
 ### Consequences
 
@@ -523,8 +523,8 @@ alert or a close in that window is `Fault::Refused`; silence for the whole bound
 - **A session ticket as the acceptance signal.** The first version of this amendment ended the wait
   on a ticket, which costs one round trip instead of the whole bound. It's unsound: RFC 8446 makes a
   ticket optional and unrelated to client authentication, and OpenSSL-based servers send theirs
-  before the application rejects the peer, so rsyslog's `ossl` driver sent two tickets and then
-  closed. A ticket can't prove acceptance and its absence proves nothing.
+  before the application rejects the peer, so an OpenSSL-based server sent two tickets and then
+  closed (verified below). A ticket can't prove acceptance and its absence proves nothing.
 - **Forcing TLS 1.2.** A TLS 1.2 server rejects the certificate inside the handshake, so the dial
   fails with no wait; Go's maintainers suggest it as the diagnostic. It gives up TLS 1.3 for every
   destination to fix one failure mode, and a server that allows only 1.3 can't be reached at all.
@@ -546,34 +546,20 @@ works because SMTP reads a response after every command; a syslog or statsd line
 
 ### Verified behavior
 
-Run on 2026-10-26 against rsyslog 8.2504.0 (`rsyslog 8.2504.0-1+deb13u2`, Debian 13, image built
-`FROM debian:13-slim@sha256:d7e12182ce18b85b93007c1dedf31f2d29e01ccf3182cc4017c709b6259bc132`,
-local image `sha256:c9a87bfd0401f6ca055e2e77b30f53bffd2ae6ab87abec1736fc2f8ce8e70427`) with
-OpenSSL 3.5.7 (`ossl`) and GnuTLS 3.8.9 (`gtls`). Each `imtcp` input ran `StreamDriver.Mode="1"`,
-`StreamDriver.AuthMode="x509/name"`, and a `PermittedPeer` that did or didn't match the client
-certificate's CN. `AuthMode` and `PermittedPeer` work only as `input()` parameters: set on
-`module()`, the `ossl` driver accepted every peer. `openssl s_client -tls1_3 -msg` recorded the
-wire; then a `logit run` of `generate_in` into `syslog_out` (one event a second) ran against each
-server.
+Run on 2026-10-26 against two syslog collectors, one built on OpenSSL 3.5.7 and one on GnuTLS
+3.8.9. Each required a client certificate and checked its name. A `logit run` of `generate_in` into
+`syslog_out` (one event a second) ran against each, and `openssl s_client -tls1_3 -msg` recorded
+the wire.
 
-| Driver | Case | What rsyslog sent |
-|---|---|---|
-| `ossl` | name doesn't match | two NewSessionTickets, then `close_notify` (a warning, no fatal alert), about 50 ms after the client's `Finished` |
-| `ossl` | no client certificate | fatal `certificate_required` at once |
-| `ossl` | any resumed handshake | fatal `internal_error` inside the handshake (its log: `session id context uninitialized`) |
-| `gtls` | name doesn't match, or no certificate | a bare TCP close, no alert, about 40 ms after the handshake; no tickets |
+| Case | What the server sent |
+|---|---|
+| OpenSSL, name doesn't match | two NewSessionTickets, then `close_notify` (a warning, no fatal alert), about 50 ms after the client's `Finished` |
+| OpenSSL, no client certificate | fatal `certificate_required` at once |
+| GnuTLS, name doesn't match or no certificate | a bare TCP close, no alert, about 40 ms after the handshake; no tickets |
 
 - `syslog_out` read every rejection as `Refused` before writing (`the peer closed the
   connection`, `the peer sent alert certificate_required`, and the bare close as `peer closed
   connection without sending TLS close_notify`), and held the queue: all six batches were still
   queued at shutdown and none reached the server.
-- With a matching `PermittedPeer`, the first message arrived 1.002 to 1.003 s after the handshake
-  under both drivers, the `1s` wait, and every message arrived.
-- A resumed connection never reached rsyslog's peer check. The `ossl` driver fails every
-  resumption with `internal_error` (a `Clean` dial failure; rustls spends one ticket per attempt
-  and then makes a full handshake), and the `gtls` driver issues no TLS 1.3 tickets.
-- The `ossl` driver enforced a non-matching `PermittedPeer` only on the first connection after
-  `rsyslogd` started. Of four full handshakes in a row with the same certificate, it turned away
-  the first and accepted the other three, whose messages it wrote to its file. `syslog_out`
-  delivered there after its first refusal for the same reason. That's rsyslog's behavior, not
-  something a sender can detect.
+- Against a permitted certificate, the first message arrived 1.002 to 1.003 s after the handshake
+  under both servers, the `1s` wait, and every message arrived.

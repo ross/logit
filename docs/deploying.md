@@ -4698,8 +4698,8 @@ that if you raise it from the default.
 **`syslog_out.accept_timeout` (default `1s`) is how long a new connection to a server that asks for
 a client certificate reads for a rejection before its first write**, as for `statsd_out` above:
 every such connection, full or resumed, waits the whole bound once, and a rejection is retried
-with the queue held rather than counted delivered. rsyslog turns a certificate away with a bare
-close or `close_notify`, often after sending session tickets, which the wait reads as a rejection
+with the queue held rather than counted delivered. A server may turn a certificate away with a bare
+close or `close_notify`, often after sending session tickets, and the wait reads that as a rejection
 too.
 
 `syslog_in.handshake_timeout` (default 5s) is the receiving side's equivalent: one budget for the

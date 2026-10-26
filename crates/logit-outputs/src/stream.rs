@@ -1217,8 +1217,8 @@ mod tests {
     // -- The acceptance wait ----------------------------------------------------------------------
 
     /// The server accepts the client certificate at the TLS layer and sends its session tickets,
-    /// then turns the connection away in its own code, as rsyslog's permitted-peer check does:
-    /// by any close, with no alert. Each close is `Refused`; data from the server is `Clean`.
+    /// then turns the connection away in its own code, as a server that checks the peer's name
+    /// after the handshake does: by any close, with no alert. Each close is `Refused`; data from the server is `Clean`.
     #[tokio::test]
     async fn a_close_after_session_tickets_is_refused_and_data_is_clean() {
         let cases = [
