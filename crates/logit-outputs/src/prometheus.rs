@@ -3170,9 +3170,11 @@ mod tests {
     ) -> (anyhow::Result<()>, Vec<Event>) {
         let (url, _seen) = canned_headers_receiver(status, headers).await;
         let registry = logit_core::Registry::new();
+        let telemetry = registry.telemetry_for("out", "prometheus_out", "sink");
         let mut sink = sender(&url)
             .with_version(remote_write::Version::V2)
-            .with_telemetry(registry.telemetry_for("out", "prometheus_out", "sink"));
+            .with_telemetry(telemetry.clone())
+            .with_diagnostics(Diagnostics::new("out").with_telemetry(telemetry));
         let result = sink.send(batch).await;
         (result, registry.drain(0))
     }
@@ -3239,17 +3241,49 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_2xx_to_version_2_with_a_count_over_or_unreadable_settles_with_nothing_dropped() {
+    async fn a_2xx_to_version_2_with_a_count_above_the_samples_sent_settles_with_nothing_dropped() {
         const WROTE_THREE: &[(&str, &str)] = &[("x-prometheus-remote-write-samples-written", "3")];
+        let (result, events) =
+            version_2_answered(StatusCode::OK, WROTE_THREE, &two_sample_batch()).await;
+        result.expect("a count above the samples sent is ignored");
+        assert_eq!(total(&events, "logit.output.samples"), 2.0);
+        assert_eq!(total(&events, "logit.output.samples.dropped"), 0.0);
+    }
+
+    #[tokio::test]
+    async fn a_2xx_to_version_2_with_an_unreadable_count_settles_and_reports_it() {
         const UNREADABLE: &[(&str, &str)] =
             &[("x-prometheus-remote-write-samples-written", "lots")];
-        for headers in [WROTE_THREE, UNREADABLE] {
-            let (result, events) =
-                version_2_answered(StatusCode::OK, headers, &two_sample_batch()).await;
-            result.expect("a 2.0 receiver answered 2xx");
-            assert_eq!(total(&events, "logit.output.samples"), 2.0, "{headers:?}");
-            assert_eq!(total(&events, "logit.output.samples.dropped"), 0.0, "{headers:?}");
-        }
+        let (result, events) =
+            version_2_answered(StatusCode::OK, UNREADABLE, &two_sample_batch()).await;
+        result.expect("a receiver that sends the 2.0 header speaks 2.0");
+        assert_eq!(total(&events, "logit.output.samples"), 2.0);
+        assert_eq!(total(&events, "logit.output.samples.dropped"), 0.0);
+        assert_eq!(
+            tagged(
+                &events,
+                "logit.component.diagnostics",
+                "key",
+                "remote_write_samples_written_unreadable"
+            ),
+            1.0
+        );
+    }
+
+    /// Called on the answer seam: no batch reaches a request with no sample, since the encoder
+    /// sends nothing for a batch that produced nothing and renames an empty metric name.
+    #[test]
+    fn a_2xx_to_version_2_carrying_no_samples_is_ok_without_a_count() {
+        let sink = sender("http://127.0.0.1:1/").with_version(remote_write::Version::V2);
+        let registry = logit_core::Registry::new();
+        let telemetry = registry.telemetry_for("out", "prometheus_out", "sink");
+        let mut diag = Diagnostics::new("out").with_telemetry(telemetry.clone());
+        target!(sink)
+            .settle_success(&telemetry, &mut diag, 0, StatusCode::NO_CONTENT, &HeaderMap::new())
+            .expect("no sample was sent, so none needs counting");
+        let events = registry.drain(0);
+        assert_eq!(total(&events, "logit.output.samples.dropped"), 0.0);
+        assert_eq!(total(&events, "logit.component.diagnostics"), 0.0);
     }
 
     #[tokio::test]
