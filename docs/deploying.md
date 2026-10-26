@@ -4189,17 +4189,31 @@ receiver speaks, as you pick an exposition dialect. The choice depends on the de
   symbol table (smaller bodies for the same series), carries `Metadata` inline on each series instead
   of in separate requests, carries the created timestamp per sample, and answers with
   `X-Prometheus-Remote-Write-{Samples,Histograms,Exemplars}-Written` so a sender learns what was
-  stored. A receiver that doesn't speak 2.0 answers `415`, which this sink classifies as
+  stored. A receiver that doesn't speak 2.0 should answer `415`, which this sink classifies as
   `refused`: every batch would get the same answer, so the sink holds the batch and retries it
   while the throttled `remote_write_rejected` diagnostic reports the misconfiguration.
 
+Under `version: 2`, the sink reads `X-Prometheus-Remote-Write-Samples-Written` on every `2xx`
+other than a `202`:
+
+- **No header:** the receiver doesn't speak 2.0 and stored nothing. The sink classifies the
+  answer `refused`, holds the batch and retries it, `logit.component.retrying` reads `1`, and the
+  throttled `remote_write_version_unsupported` diagnostic names `version: 1` as the fix.
+- **A count below the samples sent:** the receiver speaks 2.0 and stored less. The batch counts as
+  delivered, and the samples it didn't store count as
+  `logit.output.samples.dropped{reason="not_written"}`, with a throttled
+  `remote_write_samples_not_written` diagnostic.
+
+A `202` may omit the count, because an asynchronous receiver hasn't written anything when it
+answers, so the sink takes it as delivered.
+
 **Use `version: 1` for VictoriaMetrics: it discards 2.0 without an error.** VictoriaMetrics doesn't
 accept remote-write 2.0 and doesn't refuse it either. It answers a 2.0 request `204` with an empty
-body, stores nothing, logs nothing, and leaves its `vm_http_request_errors_total` at zero. The
-sender can't detect this: a `204` is success under both specs, and `prometheus_out` doesn't read the
-2.0 `X-Prometheus-Remote-Write-{Samples,Histograms,Exemplars}-Written` response headers, so its counters report every batch
-delivered. Only a query against VictoriaMetrics shows the loss (`docs/known-gaps/prometheus.md` has
-the row).
+body and no written count, stores nothing, logs nothing, and leaves its
+`vm_http_request_errors_total` at zero. Under `version: 2`, `prometheus_out` reads the missing
+count as a receiver that doesn't speak 2.0: the sink holds its queue, `logit.component.retrying`
+reads `1`, and the `remote_write_version_unsupported` diagnostic names `version: 1`. Nothing
+reaches VictoriaMetrics until you change it.
 
 Native histograms are skipped and counted on both wires regardless of version
 (`docs/known-gaps/mappings.md`), so this choice doesn't affect them.
@@ -4212,8 +4226,9 @@ Native histograms are skipped and counted on both wires regardless of version
   where scrape mode counts series), and the
   `metadata_cache` metrics above. A nonzero `logit.input.connections.rejected{reason="limit"}`
   means the `max_connections` cap is binding.
-- Sender: `logit.output.requests{class}`, `logit.output.request.duration`, `logit.output.samples`.
-  A `4xx` other than `401`, `403`, `404`, `405`, `407`, and `415`, or a `400` naming a failed
+- Sender: `logit.output.requests{class}`, `logit.output.request.duration`, `logit.output.samples`,
+  and under `version: 2`, `logit.output.samples.dropped{reason="not_written"}`. A `2xx` held as
+  `refused` counts in `requests{class="2xx"}` but not in `samples`. A `4xx` other than `401`, `403`, `404`, `405`, `407`, and `415`, or a `400` naming a failed
   decompression (which hold the batch and retry it), and other than `408` and `429` (ambiguous,
   retried under `at_least_once`), is `rejected` and the batch is dropped; the
   throttled `remote_write_rejected` diagnostic
@@ -4245,7 +4260,7 @@ and VictoriaTraces `:10428`.
 
 | Surface | Component | Configuration | What to know |
 |---|---|---|---|
-| VictoriaMetrics `/api/v1/write` | `prometheus_out` | `endpoint: http://HOST:8428/api/v1/write`, `version: 1`, optionally `compression: zstd` | `version: 2` is stored nowhere, with a `204` (see "Choosing `version: 1` or `2`" above) |
+| VictoriaMetrics `/api/v1/write` | `prometheus_out` | `endpoint: http://HOST:8428/api/v1/write`, `version: 1`, optionally `compression: zstd` | VictoriaMetrics answers `version: 2` with a `204` and stores nothing; the sink holds its queue and `logit.component.retrying` reads `1` (see "Choosing `version: 1` or `2`" above) |
 | vmagent scraping `logit` | `prometheus_out` | `bind:` | vmagent adds `job` and `instance` |
 | VictoriaMetrics `/api/v2/write` (InfluxDB line protocol) | `influxdb_out` | `url: http://HOST:8428`, `token`, and `bucket` or `default_bucket`; any values work | A field arrives as `<measurement>_<field>`. `org` and `bucket` become no label, but `influxdb_out` drops a batch it has no bucket for |
 | VictoriaMetrics `-graphiteListenAddr` | `graphite_out` | `protocol: plaintext`, `tags: carbon` (the default) | The listener is off until VictoriaMetrics starts with the flag. There's no pickle listener |

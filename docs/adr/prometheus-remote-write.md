@@ -1,6 +1,6 @@
 ---
 created: 2026-09-17
-updated: 2026-10-25
+updated: 2026-10-26
 ---
 
 # Prometheus remote-write: a receiver on `prometheus_in`, a sender on `prometheus_out`
@@ -688,3 +688,67 @@ Consequences anticipated is closed. The exposition's TLS and auth gap that the r
 under "Two additive fields, two mutual-exclusion rules, and mode-prefixed TLS keys" leaves
 untouched is closed by the same ADR, with a `bind_tls:` that follows this ADR's mode-prefixed
 naming.
+
+## Amendment: a 2.0 write is held to its written count (2026-10-26)
+
+Under `version: 2`, a `2xx` other than `202` to a request that carried samples is read against its
+`X-Prometheus-Remote-Write-Samples-Written` header, where "2xx → `Ok`" above read the status alone:
+
+| `Samples-Written` on that `2xx` | Class | What the sink does |
+|---|---|---|
+| absent | `Refused` | holds its queue and retries, as for a `415`; the error and a throttled `remote_write_version_unsupported` diagnostic name `version: 1` |
+| below the samples sent | `Ok` | settles the batch and counts the shortfall `logit.output.samples.dropped{reason="not_written"}`, with a throttled `remote_write_samples_not_written` diagnostic |
+| not a decimal count | `Ok` | settles the batch with a throttled `remote_write_samples_written_unreadable` diagnostic |
+| at or above the samples sent | `Ok` | settles the batch |
+
+A `version: 1` request, a `202`, and a request with no samples keep "2xx → `Ok`". The module doc's
+"Faults, retries and duplicate safety" table in `crates/logit-outputs/src/prometheus.rs` is the
+canonical copy.
+
+**Why.** A receiver that doesn't speak 2.0 and ignores the `Content-Type` answers a 2.0 body `2xx`
+and stores nothing. VictoriaMetrics v1.152.0 does: its `204` carries only `Vary`,
+`X-Server-Hostname`, and `Date` (checked with `curl` on 2026-10-26, and leg 2 of
+`tools/victoria-interop/README.md`). Read as `Ok`, every batch counted delivered while all of it
+was lost, with nothing in any counter to show it. The 2.0 specification closes the gap from the
+receiver side: a receiver MUST send the three `-Written` headers on a `2xx` and a `4xx`, and a
+sender MAY read a missing header as nothing written, except on a `202`, where an asynchronous
+receiver may not know the count yet. Prometheus's own 2.0 sender errors when it sent samples and
+the answer says none were written, and adds a short count to its failed-samples total.
+
+- **A missing header is `Refused`, not `Rejected`.** It answers the sink's `version:`, not the
+  batch, so the next batch gets the same answer. `Rejected` would drop every batch, one at a time,
+  where `Refused` holds the queue (`logit.component.retrying` reads `1`) until the operator sets
+  `version: 1`, as the `415` row already does for a receiver that says so. There's still no
+  fallback to 1.0: no remote-write sender negotiates a version, and switching would hide a
+  misconfiguration the operator should fix.
+- **A short count settles the batch.** The receiver speaks 2.0 and stored what it reports, so a
+  resend would draw the same answer for the same samples. The shortfall is loss and counts under
+  `*.dropped`, in samples, the unit of `logit.output.samples` and of the header, so it's a
+  `samples.dropped` counter and not `metrics.dropped`, which counts readings. It's a destination
+  verdict, met once per attempt, so it isn't gated (ADR `sink-send-path-and-attempt-accounting`).
+- **An unreadable count settles the batch, uncounted.** The header's presence says the receiver
+  speaks 2.0, and the value says nothing about how much it stored. Holding the queue would stop a
+  receiver that may be storing everything, and counting every sample lost would report loss nobody
+  measured, so the sink reports the value and moves on.
+- **A count above the samples sent is ignored**, and only `Samples-Written` decides. The sink
+  writes no native histograms, so `Histograms-Written` is always `0`, and an exemplar rides a
+  sample, so `Exemplars-Written` can't show a lost sample the samples count doesn't.
+
+**Evidence that a 2.0 receiver doesn't trip either row on a clean batch** (2026-10-26).
+`prom/prometheus:v3.15.1` (revision `bae3eced`, run with `--web.enable-remote-write-receiver` and
+both `--web.remote-write-receiver.accepted-protobuf-messages` values) and `grafana/mimir:3.2.2`
+(revision `b1fe15c3`, monolithic, filesystem storage) each answered:
+
+| Request | Prometheus 3.15.1 | Mimir 3.2.2 |
+|---|---|---|
+| `testdata/interop/prometheus/prometheus-v2-000.bin` with its `.headers` (26 samples, 2026-09-18 timestamps) | `400 out of bounds` with `Samples-Written: 0` | `200` with `Samples-Written: 26` |
+| a hand-built 2.0 body with fresh timestamps: 6 samples over 3 series, one series carrying 3 samples and one a stale marker | `204`, `Samples-Written: 6` | `200`, `Samples-Written: 6` |
+| the same 4-series, one-sample body sent twice | `204`, `Samples-Written: 4` both times | `200`, `Samples-Written: 4` both times |
+| 12 `prometheus_out` `version: 2` batches each, from a `prometheus_in` scraping both receivers' own `/metrics` (counters, gauges, histograms, summaries) | `204` every time; `Samples-Written` summed to 22,747 | `200` every time; `Samples-Written` summed to 22,747 |
+
+In the last row the bodies held 22,747 `Sample` entries by an independent decode, and each sink's
+`logit.output.samples` read 22,747: the count `remote_write::encode_pending` returns is the number
+of `Sample` entries in the body, stale markers included, and a 2.0 created timestamp rides on a
+sample as `start_timestamp` without adding one. Every request's `Samples-Written` equalled its
+own sample count. A resend of a body with several samples per series drew a `400 out of order
+sample` from both receivers, which the sink already reads as `Rejected`.

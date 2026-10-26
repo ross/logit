@@ -67,16 +67,6 @@ Entry format and the other areas: [the known-gaps index](README.md).
   that stays open ([ADR `delivery-semantics`](../adr/delivery-semantics.md), item 3, and its W3
   amendment).
   - **Consequence:** the sender counts the write delivered and doesn't resend it.
-- **VictoriaMetrics discards remote-write 2.0 silently, and `prometheus_out` can't tell.**
-  VictoriaMetrics v1.152.0 answers a 2.0 request `204` with an empty body and stores nothing, with
-  nothing in its log and `vm_http_request_errors_total` unchanged
-  ([`tools/victoria-interop/README.md`](../../tools/victoria-interop/README.md)'s "Recorded run",
-  leg 2). A `204` is success under both specs, and the sink doesn't read the 2.0
-  `X-Prometheus-Remote-Write-*-Written` headers, so `prometheus_out` `version: 2` counts every
-  batch delivered while all of it is lost.
-  - **Workaround:** use `version: 1` for VictoriaMetrics (`docs/deploying.md`'s "Choosing
-    `version: 1` or `2`"). Reading the `-Written` headers would help only against a receiver that
-    sends them, which VictoriaMetrics doesn't.
 - **An `ExponentialHistogram` can't reach VictoriaMetrics's native-histogram ingest over
   remote-write.** VictoriaMetrics accepts a remote-write native histogram and converts it to its
   `vmrange` buckets, but `prometheus_out` writes no `ExponentialHistogram` on either wire, and a

@@ -12,7 +12,8 @@
 # and VictoriaTraces" section):
 #
 # - `version: 1`, always. VictoriaMetrics answers a remote-write 2.0 request `204` and stores
-#   nothing, so `version: 2` loses every batch while this sink counts each one delivered.
+#   nothing. Under `version: 2` this sink reads the missing written count as a receiver that
+#   doesn't speak 2.0 and holds its queue until you change it.
 # - `compression: zstd` is optional. VictoriaMetrics accepts the default Snappy too; Prometheus and
 #   Mimir reject zstd, so keep `snappy` for anything else.
 components:

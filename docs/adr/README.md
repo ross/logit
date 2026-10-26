@@ -56,7 +56,7 @@ the same date, write the record, then add a row here.
 | [Listener peer address: opt-in `network.peer.*` on the shared drivers, and PROXY protocol on TCP](listener-peer-address.md) | 2026-10-05 | 2026-10-18 |
 | [`lines_in`: a plain-lines listener that emits one raw log event per line and parses nothing](plain-lines-listener.md) | 2026-10-05 | 2026-10-05 |
 | [Native hop ack status: the sender pair leads the hop payload, and a rejected `Ack` settles one frame by name](native-hop-ack-status.md) | 2026-10-04 | 2026-10-25 |
-| [Sink fault classes: a rejected batch drops, a refused destination holds, and the process never exits for a sink](sink-fault-classes.md) | 2026-10-04 | 2026-10-25 |
+| [Sink fault classes: a rejected batch drops, a refused destination holds, and the process never exits for a sink](sink-fault-classes.md) | 2026-10-04 | 2026-10-26 |
 | [jiff is the one calendar implementation, behind the codecs' strict RFC 5424 contract](jiff-for-calendar-time.md) | 2026-10-04 | 2026-10-04 |
 | [`timestamp`: resolving `event.timestamp` from an attribute, with jiff for calendar time](timestamp-transform.md) | 2026-10-04 | 2026-10-18 |
 | [Lua refusals: `Event.new` raises a refusal from a Lua shim, not as an mlua callback error](lua-refusals-raised-from-lua.md) | 2026-10-03 | 2026-10-03 |
@@ -79,7 +79,7 @@ the same date, write the record, then add a row here.
 | [Untrusted-input bounds: one set of rules for every decoder and listener a peer can reach](untrusted-input-bounds.md) | 2026-09-25 | 2026-10-25 |
 | [Out-of-CI fuzzing: a `cargo-fuzz` workspace in the unsafe-check image, with every crash landed as a stable test](out-of-ci-fuzzing.md) | 2026-09-25 | 2026-10-18 |
 | [Splunk HEC: a lossless pair in the OpenTelemetry exporter's vocabulary, spans as HEC events, and opt-in acknowledgment](splunk-hec-relay.md) | 2026-09-25 | 2026-10-23 |
-| [VictoriaMetrics interop: existing components, plus zstd on Prometheus remote-write](victoriametrics-interop.md) | 2026-09-24 | 2026-10-18 |
+| [VictoriaMetrics interop: existing components, plus zstd on Prometheus remote-write](victoriametrics-interop.md) | 2026-09-24 | 2026-10-26 |
 | [Durable checkpoint writes, observed spool I/O failures, and a feature-gated fault-injection seam](durable-checkpoint-writes-and-fault-injection.md) | 2026-09-24 | 2026-09-28 |
 | [Datadog: two lossless pairs, the Agent's own protocols, and a Datadog-mapped `DdSketch`](datadog-agent-and-intake-relay.md) | 2026-09-23 | 2026-10-25 |
 | [`sample`: consistent, keyed event sampling with an operator override](consistent-sampling-component.md) | 2026-09-22 | 2026-10-25 |
@@ -91,7 +91,7 @@ the same date, write the record, then add a row here.
 | [`shape`: an observer component that turns each event into measurements of its own shape](shape-observer-component.md) | 2026-09-20 | 2026-10-25 |
 | [A disposable Azure VM for perf measurement: `up`/`down` only, no stop and no snapshot](disposable-azure-perf-vm.md) | 2026-09-18 | 2026-10-18 |
 | [UDP intake batching and socket visibility](udp-intake-batching-and-socket-visibility.md) | 2026-09-18 | 2026-10-21 |
-| [Prometheus remote-write: a receiver on `prometheus_in`, a sender on `prometheus_out`](prometheus-remote-write.md) | 2026-09-17 | 2026-10-25 |
+| [Prometheus remote-write: a receiver on `prometheus_in`, a sender on `prometheus_out`](prometheus-remote-write.md) | 2026-09-17 | 2026-10-26 |
 | [`docker_in`: live container identity, and a minimal `inotify` watch set](docker-container-identity-and-minimal-watches.md) | 2026-09-17 | 2026-10-18 |
 | [`Transform::process` transforms in place: `&mut Event -> bool`, not `Event -> Option<Event>`](in-place-transform-process.md) | 2026-09-17 | 2026-10-16 |
 | [`keep_values`: an attribute-value allowlist, and an optional normalize-before-compare step](value-allowlist-cardinality-clamp.md) | 2026-09-15 | 2026-10-21 |

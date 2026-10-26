@@ -1,6 +1,6 @@
 ---
 created: 2026-10-04
-updated: 2026-10-25
+updated: 2026-10-26
 ---
 
 # Sink fault classes: a rejected batch drops, a refused destination holds, and the process never exits for a sink
@@ -158,7 +158,10 @@ and in an amendment to the sink's own record:
 - `prometheus_out`: a `415`, and a `400` that opens with a receiver's decompression error, are
   `Refused` (`crates/logit-outputs/src/prometheus.rs`, "Faults, retries and duplicate safety
   (sender mode)"; [ADR `prometheus-remote-write`](prometheus-remote-write.md), "Amendment: the
-  sender's response classes (2026-10-04)").
+  sender's response classes (2026-10-04)"). Under `version: 2`, a `2xx` other than `202` with no
+  `X-Prometheus-Remote-Write-Samples-Written` header is `Refused` too, since the receiver doesn't
+  speak 2.0, and a count below the samples sent settles the batch with the shortfall counted
+  dropped (the same ADR, "Amendment: a 2.0 write is held to its written count (2026-10-26)").
 - `splunk_hec_out`: a `400` with HEC code 6, 7, 12, 13, or 15 drops the one object it names; a
   `400` with code 10, 11, 16, 21, 22, or 28 is `Refused`; a `408` and a `501` are `Ambiguous`; and a
   `429`, or a `503` with code 9 or no HEC body, is `Clean` before any request of the send was
