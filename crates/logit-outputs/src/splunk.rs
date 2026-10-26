@@ -20,6 +20,7 @@
 //! timeout: 10s                   # default; bounds one request
 //! concurrency: 1                 # default; batches in flight, see "Concurrency"
 //! idle_timeout: 30s              # default; how long a pooled connection idles
+//! connect_timeout: 5s            # default; how long a new connection may take to open
 //! max_body_bytes: 2MiB           # default; one request body, before compression
 //! tls: {}                        # tunes an https:// endpoint
 //! ```
@@ -84,14 +85,16 @@
 //! | any other `3xx` or `4xx` | `Rejected`, with a throttled `request_rejected` diagnostic | about this request; redirects are off | [`crate::http::classify_status`] |
 //! | connect failure, before any `/event` request of this `send` was accepted | `Clean` | nothing left the process | -- |
 //! | connect failure after one was (a 2xx, or a per-object answer whose objects ahead count as delivered) | `Ambiguous` | Splunk holds part of the batch | -- |
-//! | any other transport error, timeout included | `Ambiguous` | the request may have been indexed | -- |
+//! | a dial `connect_timeout:` ended (the DNS lookup, TCP dial, and TLS handshake together), before any `/event` request of this `send` was accepted | `Clean` | nothing left the process | `http::tests::a_stalled_handshake_ends_at_the_connect_timeout_as_connect_error`, `http::tests::a_dial_to_a_full_accept_queue_ends_at_the_connect_timeout_as_connect_error` |
+//! | a dial `connect_timeout:` ended (the DNS lookup, TCP dial, and TLS handshake together), after one was | `Ambiguous` | Splunk holds part of the batch | as the connect-failure row above |
+//! | a request timeout after the connection opened, or a stalled dial `timeout:` ended first because `connect_timeout:` is at or above it; any other transport error | `Ambiguous` | the request may have been indexed | -- |
 //!
 //! [hec-codes]: https://help.splunk.com/en/splunk-enterprise/get-data-in/collect-http-event-data/troubleshoot-http-event-collector
 //!
 //! `Clean` means Splunk didn't take the body. A connect failure, a `429` (codes 26 and 27), and a
 //! `503` code 9 ("Server is busy") each say so ([`is_busy`]); a `500` code 8 may have indexed, and
-//! a `408`, a timeout, or another `5xx` says nothing either way. `Clean` holds only while nothing
-//! of the batch has reached Splunk: `write_loop` retries `Clean` under every posture, and a retry
+//! a `408`, a request timeout, or another `5xx` says nothing either way. `Clean` holds only while
+//! nothing of the batch has reached Splunk: `write_loop` retries `Clean` under every posture, and a retry
 //! re-sends the bodies already indexed, so once one was accepted each of these, and a `Refused`
 //! answer, is `Ambiguous` instead ([`after_delivery`]). A `Retry-After` header is ignored; `write_loop`'s backoff applies.
 //!
@@ -137,6 +140,11 @@
 //! so the sink closes an idle connection before the destination can ([`crate::http::build_client`];
 //! `docs/adr/sink-request-concurrency.md`, decision 7).
 //!
+//! `connect_timeout:` (default `5s`) bounds a new connection's DNS lookup, TCP dial, and TLS
+//! handshake together. A dial it ends sent nothing: `Clean`, counted `connect_error`
+//! ([`crate::http::build_client`]). Keep it below `timeout:`, which
+//! otherwise ends a stalled dial first as a timeout.
+//!
 //! ## Acknowledgment
 //!
 //! Under `ack: true`, each 2xx body's `ackId` is kept. Once every body of the batch is accepted,
@@ -155,7 +163,7 @@
 //!
 //! | Point | Meaning |
 //! |---|---|
-//! | `logit.output.requests{route, class}` | one per request; `route` is `event` or `ack`, `class` is [`crate::http::status_class`]'s, or `network_error` |
+//! | `logit.output.requests{route, class}` | one per request; `route` is `event` or `ack`, `class` is [`crate::http::status_class`]'s, or [`crate::http::transport_class`]'s |
 //! | `logit.output.request.duration{route}` | one timer per request |
 //! | `logit.output.request.bytes{route}` | the body as sent, after compression, for a request that got an answer or failed after it may have left; a refused connection counts none |
 //! | `logit.output.records` | records in a body Splunk accepted, and those ahead of a code-6 object |
@@ -171,7 +179,7 @@
 use crate::accounting::BatchAccounting;
 use crate::http::{
     after_delivery, build_client, classify_reqwest_error, error_read_bytes, read_body_prefix,
-    redacted_snippet, status_class, Journal, Slots, DEFAULT_IDLE_TIMEOUT,
+    redacted_snippet, status_class, transport_class, Journal, Slots, DEFAULT_IDLE_TIMEOUT,
 };
 /// `tls:`: the shared `crate::tls` type, re-exported as the other sinks do.
 pub use crate::tls::TlsClientSettings;
@@ -413,6 +421,8 @@ pub struct SplunkHecOutput {
     spare: Vec<MessageBuf<ObjectMeta>>,
     /// The operator's `idle_timeout:` ([`crate::http::build_client`]).
     idle_timeout: Duration,
+    /// The operator's `connect_timeout:` ([`crate::http::build_client`]).
+    connect_timeout: Duration,
 }
 
 impl SplunkHecOutput {
@@ -442,6 +452,7 @@ impl SplunkHecOutput {
             ack_backoff: ACK_BACKOFF,
             request_timeout: DEFAULT_TIMEOUT,
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
+            connect_timeout: crate::http::DEFAULT_CONNECT_TIMEOUT,
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             client: None,
             tls: None,
@@ -495,6 +506,15 @@ impl SplunkHecOutput {
     /// rebuilt on first use.
     pub fn with_idle_timeout(mut self, idle_timeout: Duration) -> Self {
         self.idle_timeout = idle_timeout;
+        self.client = None;
+        self
+    }
+
+    /// How long a new connection may take to open, DNS lookup, TCP dial, and TLS handshake
+    /// together (`connect_timeout:` in config, default [`crate::http::DEFAULT_CONNECT_TIMEOUT`]).
+    /// The client is rebuilt on first use.
+    pub fn with_connect_timeout(mut self, connect_timeout: Duration) -> Self {
+        self.connect_timeout = connect_timeout;
         self.client = None;
         self
     }
@@ -571,8 +591,9 @@ impl SplunkHecOutput {
 
     /// The client, built on first use when [`Output::bind`] wasn't called.
     fn client(&mut self) -> reqwest::Client {
-        let (timeout, idle, tls) = (self.request_timeout, self.idle_timeout, self.tls.as_ref());
-        self.client.get_or_insert_with(|| build_client(timeout, idle, tls)).clone()
+        let (timeout, connect, idle, tls) =
+            (self.request_timeout, self.connect_timeout, self.idle_timeout, self.tls.as_ref());
+        self.client.get_or_insert_with(|| build_client(timeout, connect, idle, tls)).clone()
     }
 
     /// What one attempt's requests need from this sink, owned so they can run in a task of their
@@ -744,7 +765,11 @@ impl Poster {
                 if fault != Fault::Clean {
                     journal.count(REQUEST_BYTES, wire_len as f64, &tags);
                 }
-                journal.count(REQUESTS, 1.0, &[("route", route), ("class", "network_error")]);
+                journal.count(
+                    REQUESTS,
+                    1.0,
+                    &[("route", route), ("class", transport_class(fault))],
+                );
                 Err(anyhow::Error::new(err).context(fault))
             }
         }
@@ -1948,7 +1973,7 @@ mod tests {
         assert_eq!(logit_pipeline::classify(&err), Fault::Clean);
         let points = registry.drain(0);
         assert_eq!(total(&points, REQUEST_BYTES, &[]), 0.0);
-        let refused = [("route", "event"), ("class", "network_error")];
+        let refused = [("route", "event"), ("class", "connect_error")];
         assert_eq!(total(&points, REQUESTS, &refused), 1.0);
     }
 
@@ -1986,7 +2011,7 @@ mod tests {
         let points = registry.drain(0);
         assert!(total(&points, REQUEST_BYTES, &[("route", "event")]) > 0.0);
         assert_eq!(total(&points, REQUEST_BYTES, &[("route", "ack")]), 0.0);
-        let refused = [("route", "ack"), ("class", "network_error")];
+        let refused = [("route", "ack"), ("class", "connect_error")];
         assert!(total(&points, REQUESTS, &refused) >= 1.0, "every poll was refused");
     }
 

@@ -2074,8 +2074,12 @@ none of the counts a dropped future never reaches, and `logit.component.errors` 
 
 `logit.output.requests` has two vocabularies. The stream and datagram sinks and `logit_out` tag
 one count per attempt with `class=ok|clean|ambiguous|rejected|refused`, the `Fault` taxonomy. The HTTP
-sinks tag one count per request with its status class or `network_error`
-(`docs/known-gaps/telemetry.md`).
+sinks tag one count per request with its status class, `connect_error` for a request whose
+connection never opened (a refused or failed dial, a DNS failure, a failed TLS handshake, or a
+dial the sink's `connect_timeout:` ended), or `network_error` for any other transport error, such
+as a timeout or a reset, after which the destination may hold the request
+(`docs/known-gaps/telemetry.md`). A request timeout shorter than `connect_timeout:` ends a
+stalled dial first and counts it `network_error` ([ADR `sink-send-path-and-attempt-accounting`](../adr/sink-send-path-and-attempt-accounting.md)'s "Amendment: a failed dial counts `connect_error`").
 
 ##### `influxdb_out`
 
@@ -2083,7 +2087,7 @@ The sink is `crates/logit-outputs/src/influxdb.rs`; the encoder is `crates/logit
 whose `EncodeStats` is the source for the counters below except `no_bucket`, which the sink counts
 itself. The sink emits each once per batch, however many attempts the runtime makes.
 
-- `logit.output.requests{class="2xx|4xx|5xx|network_error"}`, `logit.output.request.duration` (per
+- `logit.output.requests{class="2xx|4xx|5xx|connect_error|network_error"}`, `logit.output.request.duration` (per
   attempt), and `logit.output.batch.bytes`: the encode and HTTP-response detail a generic
   `send.duration` timer can't distinguish.
 - `logit.output.in_flight` (gauge, `concurrency:` above 1 only): batches whose request is in
@@ -2328,7 +2332,8 @@ under one component id, as for `collectd_out`. The sink adds only what a socket 
   name (`"ok"|"cancelled"|"unknown"|"invalid_argument"|"deadline_exceeded"|"permission_denied"|
   "resource_exhausted"|"aborted"|"out_of_range"|"unimplemented"|"internal"|"unavailable"|
   "data_loss"|"unauthenticated"|"other"`). On either
-  transport, a transport error or a timeout is `network_error`.
+  transport, a failed dial, `connect_timeout:` ending one included, is `connect_error`, and any
+  other transport error or a timeout is `network_error`.
 - `logit.output.records.dropped{signal, reason="rejected"}` (count): the records of a signal's
   request the destination answered with a `Rejected` verdict (an HTTP 3xx, or a 4xx other than
   405, 407, and 429; or any gRPC status but the transient ones). An auth answer is counted here
@@ -2382,7 +2387,7 @@ One `send` is up to eight routes' requests, so every point carries `route`: `ser
 
 | Name | Kind | Meaning |
 |---|---|---|
-| `logit.output.requests{route, class}` | count | one per request; `class` is the status class (`status_class`), or `network_error` for a transport error or timeout |
+| `logit.output.requests{route, class}` | count | one per request; `class` is the status class (`status_class`), `connect_error` for a failed dial (a dial `connect_timeout:` ended included), or `network_error` for any other transport error or a timeout |
 | `logit.output.request.duration{route}` | timing | one per request |
 | `logit.output.request.bytes{route}` | count | the body as sent, after compression, for a request that got an answer or failed after it may have left (a timeout); a refused connection counts none |
 | `logit.output.records{route}` | count | entries in a request Datadog accepted: series points, samples records, and sketches by record; logs, events, checks, spans, and stats groups by event. On the series route, less the series the `202` body names as dropped |
@@ -2418,7 +2423,7 @@ One `send` is up to two routes' requests, so every point carries `route`: `trace
 
 | Name | Kind | Meaning |
 |---|---|---|
-| `logit.output.requests{route, class}` | count | one per request; `class` is the status class (`status_class`), or `network_error` for a transport error or timeout, over TCP or the Unix socket alike |
+| `logit.output.requests{route, class}` | count | one per request; `class` is the status class (`status_class`), `connect_error` for a failed dial (a dial `connect_timeout:` ended included), or `network_error` for any other transport error or a timeout, over TCP or the Unix socket alike |
 | `logit.output.request.duration{route}` | timing | one per request |
 | `logit.output.request.bytes{route}` | count | the body as sent, after compression, for a request that got an answer or failed after it may have left (a timeout); a refused connection or a missing socket file counts none |
 | `logit.output.records{route}` | count | spans (`traces`) or stats groups (`stats`) in a request the Agent accepted |
@@ -2448,7 +2453,7 @@ batch).
 
 | Name | Kind | Meaning |
 |---|---|---|
-| `logit.output.requests{route, class}` | count | one per request; `class` is the status class (`status_class`), or `network_error` for a transport error or timeout |
+| `logit.output.requests{route, class}` | count | one per request; `class` is the status class (`status_class`), `connect_error` for a failed dial (a dial `connect_timeout:` ended included), or `network_error` for any other transport error or a timeout |
 | `logit.output.request.duration{route}` | timing | one per request |
 | `logit.output.request.bytes{route}` | count | the body as sent, after compression, for a request that got an answer or failed after it may have left (a timeout); a refused connection counts none |
 | `logit.output.records` | count | records in a body Splunk accepted: one per log or span object, one per `metric_name:` field; also the records ahead of an object a `400` per-object code (6, 7, 12, 13, or 15) named, which are assumed indexed |
@@ -2578,10 +2583,11 @@ but `requests` and `reconnects` is met once per batch.
 **exactly**, because it reuses that transport's own `Fault` table as code
 (`crates/logit-outputs/src/http.rs`):
 
-- `logit.output.requests{class="1xx"|"2xx"|"3xx"|"4xx"|"5xx"|"other"|"network_error"}` (count, one
-  per request issued). There's no `429` class: a 429 is a `4xx`, and splitting it out would
-  contradict `classify_status`, which reads the same status to pick the `Fault`. There's
-  no `timeout` class either, because a timeout is a transport error and lands in `network_error`.
+- `logit.output.requests{class="1xx"|"2xx"|"3xx"|"4xx"|"5xx"|"other"|"connect_error"|"network_error"}`
+  (count, one per request issued). There's no `429` class: a 429 is a `4xx`, and splitting it out
+  would contradict `classify_status`, which reads the same status to pick the `Fault`. There's
+  no `timeout` class either, because a timeout is a transport error and lands in `network_error`;
+  a dial that failed or that `connect_timeout:` ended, which sent nothing, is `connect_error`.
   `3xx` is a real class here, because this client doesn't follow redirects. There's no `signal`
   tag, unlike `otlp_out`: this sink carries exactly one signal, and a tag that never varies is
   noise.

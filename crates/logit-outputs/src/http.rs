@@ -86,11 +86,11 @@ pub(crate) enum Reply {
 }
 
 impl Reply {
-    /// The `class` tag on `logit.output.requests`: [`status_class`], or `network_error`.
+    /// The `class` tag on `logit.output.requests`: [`status_class`], or [`transport_class`].
     pub(crate) fn class(&self) -> &'static str {
         match self {
             Reply::Success(status) | Reply::Failure { status, .. } => status_class(*status),
-            Reply::Transport(_) => "network_error",
+            Reply::Transport(err) => transport_class(classify_reqwest_error(err)),
         }
     }
 }
@@ -149,12 +149,19 @@ pub(crate) async fn exchange(request: reqwest::RequestBuilder) -> Exchange {
 /// on is reset, and the sink can't tell whether it was applied: an `Ambiguous` fault no fault at
 /// the destination caused. `Duration::ZERO` keeps no idle connection, so every request opens its
 /// own. See `docs/adr/sink-request-concurrency.md`, decision 7.
+///
+/// `connect_timeout` is the sink's `connect_timeout:`. `reqwest` applies it around its whole
+/// connector, the DNS lookup, the TCP dial, and the TLS handshake together, and a connect it
+/// ends is a connect error, so [`classify_reqwest_error`] reads it as [`Fault::Clean`] and
+/// [`transport_class`] counts `connect_error`. `timeout` still bounds the whole request, so when
+/// it's the shorter of the two it ends a stalled dial first, as a timeout.
 pub(crate) fn build_client(
     timeout: Duration,
+    connect_timeout: Duration,
     idle_timeout: Duration,
     tls: Option<&rustls::ClientConfig>,
 ) -> reqwest::Client {
-    client_builder(timeout, idle_timeout, tls)
+    client_builder(timeout, connect_timeout, idle_timeout, tls)
         .build()
         .expect("reqwest client should build with the configured TLS settings")
 }
@@ -162,11 +169,14 @@ pub(crate) fn build_client(
 /// [`build_client`]'s settings, unbuilt, for a caller that changes one, such as the proxy.
 pub(crate) fn client_builder(
     timeout: Duration,
+    connect_timeout: Duration,
     idle_timeout: Duration,
     tls: Option<&rustls::ClientConfig>,
 ) -> reqwest::ClientBuilder {
-    let mut builder =
-        reqwest::Client::builder().timeout(timeout).redirect(reqwest::redirect::Policy::none());
+    let mut builder = reqwest::Client::builder()
+        .timeout(timeout)
+        .connect_timeout(connect_timeout)
+        .redirect(reqwest::redirect::Policy::none());
     builder = if idle_timeout.is_zero() {
         builder.pool_max_idle_per_host(0)
     } else {
@@ -193,6 +203,65 @@ pub(crate) fn hyper_client_builder(idle_timeout: Duration) -> hyper_util::client
     }
     builder
 }
+
+/// A `hyper_util` connector that bounds a whole connect, the DNS lookup, the TCP dial, and the
+/// TLS handshake together, as `reqwest`'s `connect_timeout` does: `hyper_util`'s own
+/// `HttpConnector::set_connect_timeout` bounds each TCP dial alone, and `hyper_rustls` runs the
+/// handshake after it with no bound. The client wraps a connector's error, this one's timeout
+/// included, as a connect error, so `is_connect()` holds and the request's fault is
+/// [`Fault::Clean`].
+#[derive(Clone)]
+pub(crate) struct ConnectTimeout<C> {
+    inner: C,
+    timeout: Duration,
+}
+
+impl<C> ConnectTimeout<C> {
+    pub(crate) fn new(inner: C, timeout: Duration) -> Self {
+        Self { inner, timeout }
+    }
+}
+
+type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+impl<C> tower_service::Service<http::Uri> for ConnectTimeout<C>
+where
+    C: tower_service::Service<http::Uri>,
+    C::Response: Send + 'static,
+    C::Error: Into<BoxError>,
+    C::Future: Send + 'static,
+{
+    type Response = C::Response;
+    type Error = BoxError;
+    type Future =
+        std::pin::Pin<Box<dyn std::future::Future<Output = Result<C::Response, BoxError>> + Send>>;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), BoxError>> {
+        self.inner.poll_ready(cx).map_err(Into::into)
+    }
+
+    fn call(&mut self, dst: http::Uri) -> Self::Future {
+        let connecting = self.inner.call(dst);
+        let timeout = self.timeout;
+        Box::pin(async move {
+            match tokio::time::timeout(timeout, connecting).await {
+                Ok(result) => result.map_err(Into::into),
+                Err(_) => Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("the connection didn't open within {timeout:?}"),
+                )
+                .into()),
+            }
+        })
+    }
+}
+
+/// The `connect_timeout:` default of every HTTP sink, the stream sinks' default.
+/// `logit_config`'s `default_sink_connect_timeout` mirrors it.
+pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The `idle_timeout:` default of every HTTP sink: below the keep-alive idle timeouts of the
 /// common destinations that close at 60 s and longer, and above a 10 s or 15 s batch cadence, so
@@ -311,8 +380,8 @@ fn strip_secret_remnant(snippet: String, secret: &str) -> String {
 /// A coarse HTTP response-status bucket: the `class` tag on `logit.output.requests`.
 ///
 /// Six values and no more. A `429` stays a `4xx`; [`classify_status`] is what reads it
-/// for the [`Fault`]. A timeout isn't a status, so each caller counts it as `"network_error"` on
-/// its own transport-error arm.
+/// for the [`Fault`]. A timeout isn't a status, so each caller counts a transport error with
+/// [`transport_class`] on its own transport-error arm.
 pub(crate) fn status_class(status: reqwest::StatusCode) -> &'static str {
     match status.as_u16() / 100 {
         1 => "1xx",
@@ -321,6 +390,22 @@ pub(crate) fn status_class(status: reqwest::StatusCode) -> &'static str {
         4 => "4xx",
         5 => "5xx",
         _ => "other",
+    }
+}
+
+/// The `class` tag on `logit.output.requests` of a request that got no response, from its
+/// transport error's [`Fault`]: `connect_error` for a [`Fault::Clean`] connect failure (a refused
+/// or failed dial, a DNS failure, a failed TLS handshake), which the destination never saw, and
+/// `network_error` for the rest (a request timeout, a connection reset or closed before the
+/// response), which it may have taken. A dial `connect_timeout` ends is a connect failure; one the
+/// request's `timeout` ends first, when it is the shorter, is a timeout and counts `network_error`
+/// (`docs/adr/sink-send-path-and-attempt-accounting.md`, "Amendment: a failed dial counts
+/// `connect_error`").
+pub(crate) fn transport_class(fault: Fault) -> &'static str {
+    if fault == Fault::Clean {
+        "connect_error"
+    } else {
+        "network_error"
     }
 }
 
@@ -347,8 +432,9 @@ pub(crate) fn classify_status(status: reqwest::StatusCode) -> Fault {
 }
 
 /// A `reqwest` transport failure's [`Fault`]. [`Fault::Clean`] is reserved for a *connect*
-/// failure, the one case where the destination provably never saw the request; everything else --
-/// a timeout, a connection reset mid-body, a TLS failure after the handshake started -- is
+/// failure, a dial `connect_timeout` ended included, the one case where the destination provably
+/// never saw the request; everything else -- a request timeout after the connection opened, a
+/// connection reset mid-body, a TLS failure after the handshake started -- is
 /// [`Fault::Ambiguous`], since the request may have been received and the response lost.
 pub(crate) fn classify_reqwest_error(err: &reqwest::Error) -> Fault {
     if err.is_connect() {
@@ -593,10 +679,15 @@ mod tests {
         let tls = crate::test_support::fixture_server_config("server", None, &[b"h2", b"http/1.1"]);
         let mux = held::Mux::start(Some(tls)).await;
         let ca = std::fs::read(crate::test_support::testdata_dir().join("ca.pem")).unwrap();
-        let client = client_builder(Duration::from_secs(60), DEFAULT_IDLE_TIMEOUT, None)
-            .add_root_certificate(reqwest::Certificate::from_pem(&ca).unwrap())
-            .build()
-            .unwrap();
+        let client = client_builder(
+            Duration::from_secs(60),
+            crate::http::DEFAULT_CONNECT_TIMEOUT,
+            DEFAULT_IDLE_TIMEOUT,
+            None,
+        )
+        .add_root_certificate(reqwest::Certificate::from_pem(&ca).unwrap())
+        .build()
+        .unwrap();
         let requests: Vec<_> =
             (0..4).map(|_| tokio::spawn(client.post(mux.url()).body("x").send())).collect();
         logit_pipeline::test_util::wait_until("four requests open at once", || mux.open() == 4)
@@ -631,7 +722,12 @@ mod tests {
     async fn a_connection_idle_past_idle_timeout_is_closed_and_not_reused() {
         let mux = held::Mux::start(None).await;
         mux.release();
-        let client = build_client(Duration::from_secs(60), SHORT_IDLE, None);
+        let client = build_client(
+            Duration::from_secs(60),
+            crate::http::DEFAULT_CONNECT_TIMEOUT,
+            SHORT_IDLE,
+            None,
+        );
         post(&client, &mux).await;
         logit_pipeline::test_util::wait_until("the client closed the idle connection", || {
             mux.closed() == 1
@@ -647,7 +743,12 @@ mod tests {
     async fn a_connection_idle_under_idle_timeout_is_reused() {
         let mux = held::Mux::start(None).await;
         mux.release();
-        let client = build_client(Duration::from_secs(60), DEFAULT_IDLE_TIMEOUT, None);
+        let client = build_client(
+            Duration::from_secs(60),
+            crate::http::DEFAULT_CONNECT_TIMEOUT,
+            DEFAULT_IDLE_TIMEOUT,
+            None,
+        );
         post(&client, &mux).await;
         // Sizes a negative window: twice the idle time that closes the connection above.
         tokio::time::sleep(SHORT_IDLE * 2).await;
@@ -662,7 +763,12 @@ mod tests {
     async fn an_idle_timeout_of_zero_reuses_no_connection() {
         let mux = held::Mux::start(None).await;
         mux.release();
-        let client = build_client(Duration::from_secs(60), Duration::ZERO, None);
+        let client = build_client(
+            Duration::from_secs(60),
+            crate::http::DEFAULT_CONNECT_TIMEOUT,
+            Duration::ZERO,
+            None,
+        );
         post(&client, &mux).await;
         logit_pipeline::test_util::wait_until("the client closed the connection", || {
             mux.closed() == 1
@@ -712,6 +818,97 @@ mod tests {
             snippet.trim_end_matches('.').chars().all(|c| c == 'é'),
             "no partial character survives the cut: {snippet}"
         );
+    }
+
+    /// A refused dial took nothing, so its class is `connect_error`, apart from the
+    /// `network_error` a request the destination may have taken counts.
+    #[tokio::test]
+    async fn a_refused_dial_counts_connect_error() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let client = build_client(
+            Duration::from_secs(5),
+            crate::http::DEFAULT_CONNECT_TIMEOUT,
+            DEFAULT_IDLE_TIMEOUT,
+            None,
+        );
+        let exchange = exchange(client.post(format!("http://{addr}/")).body("x")).await;
+        assert!(matches!(exchange.reply, Reply::Transport(_)), "{:?}", exchange.reply);
+        assert_eq!(exchange.reply.class(), "connect_error");
+    }
+
+    /// A request the destination accepted the connection for and never answered may have been
+    /// taken, so its timeout counts `network_error`.
+    #[tokio::test]
+    async fn a_timed_out_request_counts_network_error() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let held = tokio::spawn(async move {
+            // Holds the connection open with no answer until the test ends.
+            let _socket = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let client = build_client(
+            Duration::from_millis(200),
+            crate::http::DEFAULT_CONNECT_TIMEOUT,
+            DEFAULT_IDLE_TIMEOUT,
+            None,
+        );
+        let exchange = exchange(client.post(format!("http://{addr}/")).body("x")).await;
+        held.abort();
+        match &exchange.reply {
+            Reply::Transport(err) => assert!(err.is_timeout(), "{err:?}"),
+            other => panic!("expected a transport error, got {other:?}"),
+        }
+        assert_eq!(exchange.reply.class(), "network_error");
+    }
+
+    /// A TLS handshake the destination never answers ends at `connect_timeout`, long before the
+    /// request's `timeout`, as a connect error: `Clean`, counted `connect_error`.
+    #[tokio::test]
+    async fn a_stalled_handshake_ends_at_the_connect_timeout_as_connect_error() {
+        let (addr, held) = crate::test_support::silent_listener().await;
+        let client = build_client(
+            Duration::from_secs(60),
+            Duration::from_millis(200),
+            DEFAULT_IDLE_TIMEOUT,
+            None,
+        );
+        let exchange = exchange(client.post(format!("https://{addr}/")).body("x")).await;
+        held.abort();
+        match &exchange.reply {
+            Reply::Transport(err) => {
+                assert!(err.is_connect(), "{err:?}");
+                assert_eq!(classify_reqwest_error(err), Fault::Clean);
+            }
+            other => panic!("expected a transport error, got {other:?}"),
+        }
+        assert_eq!(exchange.reply.class(), "connect_error");
+        assert!(exchange.took < Duration::from_secs(10), "took {:?}", exchange.took);
+    }
+
+    /// A TCP dial the kernel never completes, its `SYN` dropped by a full accept queue, ends at
+    /// `connect_timeout` as a connect error.
+    #[tokio::test]
+    async fn a_dial_to_a_full_accept_queue_ends_at_the_connect_timeout_as_connect_error() {
+        let (addr, _listener, _queued) = crate::test_support::full_backlog_listener().await;
+        let client = build_client(
+            Duration::from_secs(60),
+            Duration::from_millis(200),
+            DEFAULT_IDLE_TIMEOUT,
+            None,
+        );
+        let exchange = exchange(client.post(format!("http://{addr}/")).body("x")).await;
+        match &exchange.reply {
+            Reply::Transport(err) => {
+                assert!(err.is_connect(), "{err:?}");
+                assert_eq!(classify_reqwest_error(err), Fault::Clean);
+            }
+            other => panic!("expected a transport error, got {other:?}"),
+        }
+        assert_eq!(exchange.reply.class(), "connect_error");
+        assert!(exchange.took < Duration::from_secs(10), "took {:?}", exchange.took);
     }
 
     /// A `3xx` is its own class and is rejected, so a redirect surfaces as a misconfiguration.

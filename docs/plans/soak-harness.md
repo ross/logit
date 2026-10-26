@@ -1118,16 +1118,18 @@ The rows:
   at the running total (W13b), since a counter exports no point for a drain it didn't move
   in; across a run of steady intervals the interpolation telescopes, and each edge of the run
   errs by at most one batch while acknowledgments arrive steadily. The anchoring applies on
-  every wire and in `ledger.overlap`. On TCP and HTTP a boundary between two judged windows has
-  its own rule (W13b): G's error there is bounded by the G that moved in the generator interval
-  straddling it, which is many batches when acknowledgments bunch, under one request in flight
-  or a restart's backlog flush, and it shows as an opposite-signed pair in the two runs that
-  touch. The part of a surplus past its run's own allowance (below) nets with the loss across
-  that boundary, up to that G, shown in the detail line; the part inside the allowance is
-  excused already and nets nothing, so it can't hide a loss next door, and runs that don't
-  touch never net. A judged run's surplus allowance counts
-  every edge it has, a boundary with another judged run included. Each steady run's gap counts
-  at 0 when W + K exceeds G in it, so a surplus in one run can't net out loss in another. The
+  every wire and in `ledger.overlap`. On TCP and HTTP a boundary that touches a judged window,
+  with a judged or a steady one on its other side, has its own rule (W13b): G's error there is
+  bounded by the G that moved in the generator interval straddling it, which is many batches
+  when acknowledgments bunch, under one request in flight or a restart's backlog flush, and it
+  shows as an opposite-signed pair in the two runs that touch. The pair nets in full, up to that
+  G, before the surplus run's allowance (below) applies to what's left, and the detail line
+  shows each transfer. The cap keeps a resend's surplus, or a steady run's, from hiding more
+  loss next door than interpolation explains; runs that don't touch, and a reported or end run,
+  never net. `checks._boundary_nets`' doc is the full rule. A judged run's surplus allowance
+  counts every edge it has, a boundary with another judged run included. Apart from that
+  netting, each steady run's gap counts at 0 when W + K exceeds G in it, so a surplus in one run
+  can't net out loss in another. The
   generator sink's own
   `drop_newest` loss while the SUT is unreachable is counted and never in G; the row shows it
   beside the wire gap. The generator's `self -> telemetry` pipeline is dedicated too, so its
@@ -1166,8 +1168,8 @@ The rows:
   in every inbox and W had counted it, so no window can lose a point G counted, and only a
   `kill` or an `exit` is reported (`checks.HTTP_REPORTED_ACTIONS`): either can lose up to one
   `internal` interval of the SUT's unexported W. A graceful `stop` or `restart` answers what it
-  took before it exits and is judged. Every judged window's surplus, W − X above G, may not
-  exceed one generator batch per attempt the writer counted
+  took before it exits and is judged. Every judged window's surplus, W − X above G, after the
+  boundary netting above, may not exceed one generator batch per attempt the writer counted
   `logit.output.requests{class="network_error"}` inside it, plus one per edge. The bound comes
   from the writers: `influxdb_out` sends one batch per request with one request in flight
   (`Output::window` is 1; its module doc, "Destination resolution"), as `otlp_out` does for one
@@ -1175,8 +1177,15 @@ The rows:
   same batch under `at_least_once`. The listener may have taken that batch before its answer was
   lost, so each such attempt leaves at most one batch in W that G never counts. A `503` is
   `Ambiguous` too, but the listener took nothing (busy) or counted what it refused in X
-  (`closed_consumer`), so it allows none. `network_error` also counts a refused dial, which
-  takes nothing, so the allowance is an upper bound, loose across a SUT stop.
+  (`closed_consumer`), so it allows none. A dial that failed, refused, a DNS failure, or a
+  failed TLS handshake, or a dial the writer's `connect_timeout:` ended, counts
+  `class="connect_error"`: it sent nothing, so it allows none either, and the detail counts it
+  apart. The allowance is loose only for a writer whose request timeout is below its
+  `connect_timeout:`, which counts a stalled dial `network_error` ([ADR
+  `sink-send-path-and-attempt-accounting`](../adr/sink-send-path-and-attempt-accounting.md)'s
+  "Amendment: a failed dial counts `connect_error`"). A writer built before the HTTP sinks
+  split that class out counts every failed dial as `network_error`, looser still across a SUT
+  stop.
 
   On a file wire (W11b) only a lifecycle fault or an `exit` of the ingress SUT affects the wire.
   A tailer reads behind its writer, so a drain interval's gap is lag, not loss: every run of
@@ -1831,7 +1840,8 @@ to it, as on an external target. Under `remote_write` and `influxdb`, `ledger.se
   hole passes it; this rule, not `ledger.egress`, is what catches one there.
 - Per SUT life, the record's requests by status class equal the sink's
   `logit.output.requests{class}` for `2xx` to `5xx`; its resets are at most the sink's
-  `network_error`, which a connect failure also counts. A killed life's mismatch WARNs.
+  `network_error`. A failed dial, `connect_error`, never reaches the record. A killed life's
+  mismatch WARNs.
 - Every answer other than the default carries the cue of a `respond` step that applied
   cleanly and falls inside its span, and every write went to the stand-in's path.
 - Each step with a `class` shows that class at the sink. `rejected`: a batch dropped `rejected`

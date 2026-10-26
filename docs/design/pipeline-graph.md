@@ -400,7 +400,8 @@ a black hole counts what it discards as `events.discarded`.
     value, or an unknown or unbounded template placeholder.
 43. A `tls:` on a UDP `syslog_in`, `graphite_in`, `statsd_in`, or `lines_in`.
 44. An inconsistent `syslog_out` `tls:`, or one under `transport: udp`.
-45. A `0s` `handshake_timeout`, or a non-default one on a UDP listener.
+45. A `0s` `handshake_timeout`, or a non-default one on a UDP listener, or an HTTP sink's `0s`
+    `connect_timeout`.
 46. A `graphite_in`/`graphite_out` pickle over UDP, a zero size or timeout bound, or an
     out-of-range `max_frame_bytes`.
 47. A `targets:` list on anything but `lua`/`lua_file`.

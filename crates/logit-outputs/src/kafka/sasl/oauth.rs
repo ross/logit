@@ -15,8 +15,10 @@
 //!   with the client id and secret in HTTP Basic authentication as they are, as the Java client
 //!   sends them by default (`sasl.oauthbearer.header.urlencode: false`), not form-urlencoded as
 //!   RFC 6749 §2.3.1 asks.
-//! - It's bounded by the sink's `timeout` and follows no redirect. The endpoint's certificate is
-//!   checked against the bundled Mozilla roots, never the sink's broker `tls:` block.
+//! - It's bounded by the sink's `timeout`, its connection by a fixed 5 s
+//!   (`crate::http::DEFAULT_CONNECT_TIMEOUT`), and follows no redirect. The endpoint's
+//!   certificate is checked against the bundled Mozilla roots, never the sink's broker `tls:`
+//!   block.
 //! - A cached token is reused until 80% of its `expires_in` has passed, measured from before the
 //!   request, the Java client's `sasl.login.refresh.window.factor` default. Without
 //!   `expires_in`, a token that is a JWT is kept until 80% of the time to its `exp` claim, and
@@ -91,7 +93,12 @@ impl OAuthBearer {
         timeout: Duration,
     ) -> Self {
         let endpoint = Endpoint {
-            client: crate::http::build_client(timeout, crate::http::DEFAULT_IDLE_TIMEOUT, None),
+            client: crate::http::build_client(
+                timeout,
+                crate::http::DEFAULT_CONNECT_TIMEOUT,
+                crate::http::DEFAULT_IDLE_TIMEOUT,
+                None,
+            ),
             url,
             client_id: client_id.to_string(),
             authorization: basic_authorization(client_id, client_secret),
@@ -327,9 +334,16 @@ impl Endpoint {
             .send()
             .await
             .map_err(|err| {
+                // reqwest's connect timeout also sets `is_timeout`, so the dial is checked first.
+                let connect_timed_out = err.is_connect() && err.is_timeout();
                 let timed_out = err.is_timeout();
                 let err = anyhow::Error::new(err.without_url());
-                if timed_out {
+                if connect_timed_out {
+                    err.context(format!(
+                        "token endpoint {shown} didn't connect within {:?}",
+                        crate::http::DEFAULT_CONNECT_TIMEOUT
+                    ))
+                } else if timed_out {
                     err.context(format!(
                         "token endpoint {shown} timed out after {:?}",
                         self.timeout

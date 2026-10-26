@@ -1,6 +1,6 @@
 ---
 created: 2026-09-29
-updated: 2026-10-13
+updated: 2026-10-25
 ---
 
 # Sink send path and attempt accounting: counters that say what they count, one pooled-stream driver, and TLS writes that are flushed
@@ -1140,3 +1140,38 @@ this record names, and none changes class:
   `records.dropped{route="series", reason="rejected"}`, still counted per attempt that meets it.
 
 Where the sections above use an old name, read the new one.
+
+## Amendment: a failed dial counts `connect_error` (2026-10-25)
+
+The HTTP sinks (`influxdb_out`, `otlp_out`, `prometheus_out`'s remote-write mode, `datadog_out`,
+`datadog_trace_out`, and `splunk_hec_out`) tag a request whose connection never opened
+`logit.output.requests{class="connect_error"}`: a refused or failed dial, a DNS failure, or a
+failed TLS handshake, each `Fault::Clean`. `network_error` keeps every other transport error,
+after which the destination may hold the request: a timeout, a reset, or a connection closed
+before the response. One class counted both, so a reader counting the requests a destination
+may have taken twice, such as the soak harness's resend allowance, counted dials that sent
+nothing; it now reads `network_error` alone. The class follows the request's own fault, so a
+`Clean` fault that `after_delivery` raises to `Ambiguous` still counts `connect_error`. Where
+the sections above say a refused connection counts `network_error`, read `connect_error`.
+
+Each HTTP sink bounds its dial with its own `connect_timeout:` (default `5s`): the DNS lookup,
+the TCP dial, and the TLS handshake together, as one bound, unlike the stream sinks' two
+phases. A dial it ends is a connect error, so a stalled dial, a SYN or a handshake whose answer
+never comes or comes too late, is `Fault::Clean` and counts `connect_error`, like a refused one.
+`reqwest`'s `connect_timeout` wraps its whole connector, TLS included
+(`crate::http::client_builder`). `otlp_out`'s gRPC client wraps its connector in
+`crate::http::ConnectTimeout`, because `hyper_util`'s `HttpConnector::set_connect_timeout`
+bounds each TCP dial alone and `hyper_rustls` runs the handshake after it unbounded.
+
+This changes what `at_most_once` does with a stalled dial: it was a timeout, `Ambiguous`, so the
+posture dropped the batch; it is `Clean` now, so the posture retries it, as it retries a refused
+dial. Nothing was sent, so the retry can't duplicate.
+
+One case still counts a dial that sent nothing as `network_error`: a request timeout
+(`timeout:`, fixed at 10 s on `influxdb_out` and `otlp_out`) shorter than `connect_timeout:`.
+The request's timeout then ends the stalled dial first, as a timeout,
+`Ambiguous`, and `otlp_out`'s gRPC timeout arm counts `network_error` whatever stage it cut. No
+rule rejects that configuration; the field's doc tells the operator to keep `connect_timeout`
+below the request timeout. Under it, `network_error` is an upper bound on the requests a destination may
+hold, and a reader counting it as resends, such as the soak harness's allowance, is loose by
+the stalled dials.

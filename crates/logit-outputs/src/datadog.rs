@@ -23,6 +23,7 @@
 //! timeout: 10s               # default; bounds one request
 //! concurrency: 1             # default; batches in flight, see "Concurrency"
 //! idle_timeout: 30s          # default; how long a pooled connection idles
+//! connect_timeout: 5s        # default; how long a new connection may take to open
 //! headers: {}                # extra headers; `!env` works on a value
 //! tls: {}                    # tunes every https:// request
 //! histograms:                # how OTLP histograms are written, as Datadog's exporter's block
@@ -249,6 +250,11 @@
 //! so the sink closes an idle connection before the destination can ([`crate::http::build_client`];
 //! `docs/adr/sink-request-concurrency.md`, decision 7).
 //!
+//! `connect_timeout:` (default `5s`) bounds a new connection's DNS lookup, TCP dial, and TLS
+//! handshake together. A dial it ends sent nothing: `Clean`, counted `connect_error`
+//! ([`crate::http::build_client`]). Keep it below `timeout:`, which
+//! otherwise ends a stalled dial first as a timeout.
+//!
 //! Datadog documents its intake statuses by HTTP code, the same on every route, with a free-text
 //! body; no documented body code changes a status's meaning, so the status decides the class.
 //! A series `2xx` body is read too, for what Datadog dropped from an accepted request: it's empty
@@ -282,7 +288,8 @@
 //! | any `5xx`, `501` included | `Ambiguous` | "request should be retried after some time"; may have been applied | [send logs][logs-api] |
 //! | any other `3xx` or `4xx` | `Rejected` | about this request; redirects are off ([`crate::http::build_client`]) | [Agent retry guide][agent-retry] |
 //! | connect failure | `Clean` | nothing of this request left the process; a retry skips the requests already accepted | -- |
-//! | any other transport error, timeout included | `Ambiguous` | the request may have been applied | -- |
+//! | a dial `connect_timeout:` ended (the DNS lookup, TCP dial, and TLS handshake together) | `Clean` | nothing of this request left the process; a retry skips the requests already accepted | `http::tests::a_stalled_handshake_ends_at_the_connect_timeout_as_connect_error`, `http::tests::a_dial_to_a_full_accept_queue_ends_at_the_connect_timeout_as_connect_error` |
+//! | a request timeout after the connection opened, or a stalled dial `timeout:` ended first because `connect_timeout:` is at or above it; any other transport error | `Ambiguous` | the request may have been applied | -- |
 //!
 //! A refusal holds for every batch: the routes share one org-wide key, so a `401` or `403` refuses
 //! them all, and a `404` names a route the configured base will refuse next time too. So a route
@@ -314,7 +321,7 @@
 //!
 //! | Point | Meaning |
 //! |---|---|
-//! | `logit.output.requests{route, class}` | one per request; `class` is [`crate::http::status_class`]'s, or `network_error` |
+//! | `logit.output.requests{route, class}` | one per request; `class` is [`crate::http::status_class`]'s, or [`crate::http::transport_class`]'s |
 //! | `logit.output.request.duration{route}` | one timer per request |
 //! | `logit.output.request.bytes{route}` | the body as sent, after compression, for a request that got an answer or failed after it may have left; not for a refused connection |
 //! | `logit.output.records{route}` | entries in a request Datadog accepted, less those its series `202` body names |
@@ -339,8 +346,8 @@ use crate::accounting::BatchAccounting;
 use crate::http::classify_status;
 use crate::http::{
     build_client, classify_reqwest_error, error_read_bytes, read_body_bytes, read_body_prefix,
-    read_varint, redacted_snippet, skip_field, split_encode, status_class, Caps, Encoded, Journal,
-    Outcomes, Slots, DEFAULT_IDLE_TIMEOUT,
+    read_varint, redacted_snippet, skip_field, split_encode, status_class, transport_class, Caps,
+    Encoded, Journal, Outcomes, Slots, DEFAULT_IDLE_TIMEOUT,
 };
 /// `tls:`: the shared `crate::tls` type, re-exported as the other sinks do.
 pub use crate::tls::TlsClientSettings;
@@ -876,6 +883,8 @@ pub struct DatadogOutput {
     tls: Option<rustls::ClientConfig>,
     /// The operator's `idle_timeout:` ([`crate::http::build_client`]).
     idle_timeout: Duration,
+    /// The operator's `connect_timeout:` ([`crate::http::build_client`]).
+    connect_timeout: Duration,
     default_host: Option<Arc<str>>,
     histograms: HistogramOptions,
     /// Counts through views of `telemetry`/`diag` gated by `accounting`
@@ -920,8 +929,14 @@ impl DatadogOutput {
             endpoints: DatadogEndpoints::default(),
             compression: DatadogCompression::default(),
             request_timeout: DEFAULT_TIMEOUT,
-            client: build_client(DEFAULT_TIMEOUT, DEFAULT_IDLE_TIMEOUT, None),
+            client: build_client(
+                DEFAULT_TIMEOUT,
+                crate::http::DEFAULT_CONNECT_TIMEOUT,
+                DEFAULT_IDLE_TIMEOUT,
+                None,
+            ),
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
+            connect_timeout: crate::http::DEFAULT_CONNECT_TIMEOUT,
             headers: HeaderMap::new(),
             tls: None,
             default_host: None,
@@ -984,7 +999,26 @@ impl DatadogOutput {
     /// client.
     pub fn with_idle_timeout(mut self, idle_timeout: Duration) -> Self {
         self.idle_timeout = idle_timeout;
-        self.client = build_client(self.request_timeout, idle_timeout, self.tls.as_ref());
+        self.client = build_client(
+            self.request_timeout,
+            self.connect_timeout,
+            idle_timeout,
+            self.tls.as_ref(),
+        );
+        self
+    }
+
+    /// How long a new connection may take to open, DNS lookup, TCP dial, and TLS handshake
+    /// together (`connect_timeout:` in config, default [`crate::http::DEFAULT_CONNECT_TIMEOUT`]).
+    /// Rebuilds the client.
+    pub fn with_connect_timeout(mut self, connect_timeout: Duration) -> Self {
+        self.connect_timeout = connect_timeout;
+        self.client = build_client(
+            self.request_timeout,
+            connect_timeout,
+            self.idle_timeout,
+            self.tls.as_ref(),
+        );
         self
     }
 
@@ -992,7 +1026,8 @@ impl DatadogOutput {
     /// per-request `.timeout(..)` that bounds each request.
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.request_timeout = timeout;
-        self.client = build_client(timeout, self.idle_timeout, self.tls.as_ref());
+        self.client =
+            build_client(timeout, self.connect_timeout, self.idle_timeout, self.tls.as_ref());
         self
     }
 
@@ -1046,7 +1081,8 @@ impl DatadogOutput {
             &self.diag,
             &self.telemetry,
         )?;
-        self.client = build_client(self.request_timeout, self.idle_timeout, Some(&cfg));
+        self.client =
+            build_client(self.request_timeout, self.connect_timeout, self.idle_timeout, Some(&cfg));
         self.tls = Some(cfg);
         Ok(self)
     }
@@ -1506,7 +1542,7 @@ impl Poster {
                 journal.count(
                     REQUESTS,
                     1.0,
-                    &[("route", route.name()), ("class", "network_error")],
+                    &[("route", route.name()), ("class", transport_class(fault))],
                 );
                 return Err(anyhow::Error::new(err)).context(fault);
             }
@@ -3559,7 +3595,7 @@ mod tests {
         assert_eq!(logit_pipeline::classify(&err), Fault::Clean);
         let points = registry.drain(0);
         assert_eq!(total(&points, REQUEST_BYTES, &[]), 0.0);
-        let refused = [("route", "series"), ("class", "network_error")];
+        let refused = [("route", "series"), ("class", "connect_error")];
         assert_eq!(total(&points, REQUESTS, &refused), 1.0);
     }
 

@@ -40,6 +40,7 @@
 //! endpoint_tls: {}                           # https:// only -- see `TlsClientConfig`
 //! concurrency: 1                             # default; batches in flight, see "Concurrency"
 //! idle_timeout: 30s                          # default; how long a pooled connection idles
+//! connect_timeout: 5s                        # default; how long a new connection may take to open
 //! ```
 //!
 //! Setting the other mode's field is a config error, not a no-op (rule 56). `buffer:` works in
@@ -157,7 +158,8 @@
 //! | `429` (Mimir's `err-mimir-tenant-max-ingestion-rate`) | `Ambiguous` | "They MAY retry on HTTP 429 responses" | [1.0 spec][rw1], Mimir's [`distributor/errors.go`][mimir-errors] |
 //! | any `5xx` | `Ambiguous` | "MUST retry write requests on HTTP 5xx responses"; may have been partly applied | [1.0 spec][rw1] |
 //! | connect failure | `Clean` | the destination provably never saw it | -- |
-//! | any other transport error, timeout included | `Ambiguous` | the request may have been applied | -- |
+//! | a dial `connect_timeout:` ended (the DNS lookup, TCP dial, and TLS handshake together) | `Clean` | the destination provably never saw it | `http::tests::a_stalled_handshake_ends_at_the_connect_timeout_as_connect_error`, `http::tests::a_dial_to_a_full_accept_queue_ends_at_the_connect_timeout_as_connect_error` |
+//! | a request timeout after the connection opened, or a stalled dial `timeout:` ended first because `connect_timeout:` is at or above it; any other transport error | `Ambiguous` | the request may have been applied | -- |
 //!
 //! Every non-2xx answer's status and first 256 bytes of body are in the error and in a throttled
 //! `remote_write_rejected` diagnostic, so a retried `503` reports once per attempt; Prometheus's
@@ -225,6 +227,11 @@
 //! so the sink closes an idle connection before the destination can ([`crate::http::build_client`];
 //! `docs/adr/sink-request-concurrency.md`, decision 7).
 //!
+//! `connect_timeout:` (default `5s`) bounds a new connection's DNS lookup, TCP dial, and TLS
+//! handshake together. A dial it ends sent nothing: `Clean`, counted `connect_error`
+//! ([`crate::http::build_client`]). Keep it below `timeout:`, which
+//! otherwise ends a stalled dial first as a timeout.
+//!
 //! **Duplicate timestamps.** One series holds one sample per millisecond. Given two in one
 //! request, Prometheus and Mimir answer `2xx`, keep the first, and drop the second silently, so
 //! the sink sends only the later reading of each series and millisecond in a batch. It counts
@@ -258,7 +265,7 @@
 //!
 //! | Point | Meaning |
 //! |---|---|
-//! | `logit.output.requests{class="1xx"\|"2xx"\|"3xx"\|"4xx"\|"5xx"\|"other"\|"network_error"}` | one per request, in `otlp_out`'s vocabulary ([`crate::http::status_class`]). No `429` class: a 429 is a `4xx`, and splitting it out would contradict [`crate::http::classify_status`], which picks the `Fault` from the same status. No `timeout` class: a timeout is a transport error, so `network_error`. No `signal` tag, unlike `otlp_out`: this sink has one signal |
+//! | `logit.output.requests{class="1xx"\|"2xx"\|"3xx"\|"4xx"\|"5xx"\|"other"\|"connect_error"\|"network_error"}` | one per request, in `otlp_out`'s vocabulary ([`crate::http::status_class`]). No `429` class: a 429 is a `4xx`, and splitting it out would contradict [`crate::http::classify_status`], which picks the `Fault` from the same status. No `timeout` class: a request timeout is a transport error, so `network_error`; a dial that failed or that `connect_timeout:` ended is `connect_error` ([`crate::http::transport_class`]). No `signal` tag, unlike `otlp_out`: this sink has one signal |
 //! | `logit.output.request.duration` | one timer per request issued, the spelling `graphite_out`, `collectd_out`, `syslog_out`, `statsd_out` and `influxdb_out` use |
 //! | `logit.output.samples` | samples in the request body, counted by the codec ([`remote_write::encode_counted`]) rather than guessed from family counts: one `Series` is one sample for a gauge and several for a histogram. Mirrors `prometheus_in`'s `logit.input.samples`, so the two ends of a relay compare |
 //!
@@ -972,6 +979,8 @@ pub struct RemoteWriteOutput {
     slots: Slots<(u64, Exchange)>,
     /// The operator's `idle_timeout:` ([`crate::http::build_client`]).
     idle_timeout: Duration,
+    /// The operator's `connect_timeout:` ([`crate::http::build_client`]).
+    connect_timeout: Duration,
 }
 
 impl RemoteWriteOutput {
@@ -985,8 +994,14 @@ impl RemoteWriteOutput {
             version: remote_write::Version::V1,
             encoding: Encoding::Snappy,
             request_timeout: DEFAULT_ENDPOINT_TIMEOUT,
-            client: build_client(DEFAULT_ENDPOINT_TIMEOUT, DEFAULT_IDLE_TIMEOUT, None),
+            client: build_client(
+                DEFAULT_ENDPOINT_TIMEOUT,
+                crate::http::DEFAULT_CONNECT_TIMEOUT,
+                DEFAULT_IDLE_TIMEOUT,
+                None,
+            ),
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
+            connect_timeout: crate::http::DEFAULT_CONNECT_TIMEOUT,
             headers: HeaderMap::new(),
             tls: None,
             encoder: new_sender_encoder(&telemetry, &diag, accounting.gate()),
@@ -1019,7 +1034,26 @@ impl RemoteWriteOutput {
     /// client.
     pub fn with_idle_timeout(mut self, idle_timeout: Duration) -> Self {
         self.idle_timeout = idle_timeout;
-        self.client = build_client(self.request_timeout, idle_timeout, self.tls.as_ref());
+        self.client = build_client(
+            self.request_timeout,
+            self.connect_timeout,
+            idle_timeout,
+            self.tls.as_ref(),
+        );
+        self
+    }
+
+    /// How long a new connection may take to open, DNS lookup, TCP dial, and TLS handshake
+    /// together (`connect_timeout:` in config, default [`crate::http::DEFAULT_CONNECT_TIMEOUT`]).
+    /// Rebuilds the client.
+    pub fn with_connect_timeout(mut self, connect_timeout: Duration) -> Self {
+        self.connect_timeout = connect_timeout;
+        self.client = build_client(
+            self.request_timeout,
+            connect_timeout,
+            self.idle_timeout,
+            self.tls.as_ref(),
+        );
         self
     }
 
@@ -1027,7 +1061,8 @@ impl RemoteWriteOutput {
     /// a request; the client is rebuilt so its default agrees.
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.request_timeout = timeout;
-        self.client = build_client(timeout, self.idle_timeout, self.tls.as_ref());
+        self.client =
+            build_client(timeout, self.connect_timeout, self.idle_timeout, self.tls.as_ref());
         self
     }
 
@@ -1085,7 +1120,8 @@ impl RemoteWriteOutput {
             &self.diag,
             &self.telemetry,
         )?;
-        self.client = build_client(self.request_timeout, self.idle_timeout, Some(&cfg));
+        self.client =
+            build_client(self.request_timeout, self.connect_timeout, self.idle_timeout, Some(&cfg));
         self.tls = Some(cfg);
         Ok(self)
     }
@@ -3200,7 +3236,7 @@ mod tests {
             Fault::Clean,
             "a connect failure provably never reached a receiver"
         );
-        assert_eq!(counter(&registry, "logit.output.requests", "class", "network_error"), 1.0);
+        assert_eq!(counter(&registry, "logit.output.requests", "class", "connect_error"), 1.0);
     }
 
     // -- sender mode: TLS, lifecycle, posture --------------------------------------------------

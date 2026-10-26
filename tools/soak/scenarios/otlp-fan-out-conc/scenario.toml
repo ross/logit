@@ -65,8 +65,8 @@ args = "loss 10%"
 for = "60s"
 
 # The sink's two-batch queue and the inboxes behind it fill, and `otlp_in` holds each request
-# until the generator's 10 s timeout, then takes the resend too: a surplus judged against the
-# generator's transport errors.
+# until the generator's 10 s timeout, then takes the resend too. A backend stop opens no HTTP
+# window, so `ledger.wire` reads it as steady state, where that surplus counts 0.
 [[step]]
 at = "6m30s"
 action = "stop"

@@ -42,7 +42,8 @@ fd_growth = 8
 # The SUT's egress carries its answers. Delayed 11 s, past influxdb_out's 10 s timeout, the
 # answer to a request the SUT took arrives after the generator gave up on it, and the generator
 # resends a batch the SUT holds: a surplus judged against its transport errors. A keep-alive
-# connection is needed for that; a new one's handshake times out first and sends nothing.
+# connection is needed for that: a new one's dial waits on a delayed SYN-ACK, ends at the
+# generator's 5 s `connect_timeout`, counts `connect_error`, and sends nothing.
 [[step]]
 at = "0s"
 action = "netem"
@@ -120,6 +121,18 @@ service = "generator"
 metric = "logit.output.requests"
 component = "influx"
 attrs = { class = "network_error" }
+step = "c0s1"
+window = "through"
+reduce = "delta"
+min = 1
+
+# The delayed SYN-ACK holds every new dial past `connect_timeout`: a connect error, no resend.
+[[expect]]
+name = "generator-dials-time-out"
+service = "generator"
+metric = "logit.output.requests"
+component = "influx"
+attrs = { class = "connect_error" }
 step = "c0s1"
 window = "through"
 reduce = "delta"

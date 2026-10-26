@@ -18,5 +18,6 @@ components:
     version: 1
     compression: zstd               # buffer: defaults (block, at_least_once, retry_max_delay 10s)
     timeout: 2s
+    connect_timeout: 1s             # below `timeout`, so a stalled dial reads connect_error
   self: { type: internal, interval: 5s, span_sample_rate: 0.0, logs: off }
   telemetry: { type: stdio_out, sources: [self], format: json }

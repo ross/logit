@@ -25,6 +25,7 @@
 //! timeout: 10s                      # default; bounds one request
 //! concurrency: 1                    # default; batches in flight, see "Concurrency"
 //! idle_timeout: 30s                 # default; how long a pooled connection idles
+//! connect_timeout: 5s               # default; how long a new connection may take to open
 //! headers: {}                       # extra headers; `!env` works on a value
 //! tls: {}                           # tunes an https:// endpoint
 //! ```
@@ -149,6 +150,11 @@
 //! so the sink closes an idle connection before the destination can, on the socket's pool too
 //! ([`crate::http::build_client`]; `docs/adr/sink-request-concurrency.md`, decision 7).
 //!
+//! `connect_timeout:` (default `5s`) bounds a new connection's DNS lookup, TCP dial, and TLS
+//! handshake together. A dial it ends sent nothing: `Clean`, counted `connect_error`
+//! ([`crate::http::build_client`]). Keep it below `timeout:`, which
+//! otherwise ends a stalled dial first as a timeout.
+//!
 //! The Agent's API has no credential, so only a status that says the endpoint or the body's format
 //! isn't served refuses the sink as a whole.
 //!
@@ -170,7 +176,8 @@
 //! | any `5xx`, `501` included | `Ambiguous` | may have been applied; the Agent's own trace writer retries a `5xx` | the Agent's [`sender.go`][agent-sender] |
 //! | any other `1xx`, `3xx`, or `4xx` | `Rejected` | about this request | [`crate::http::classify_status`] |
 //! | connect failure (refused, no such socket file) | `Clean` | nothing of this request left the process; a retry skips the requests already accepted | -- |
-//! | any other transport error, timeout included | `Ambiguous` | the request may have been applied | -- |
+//! | a dial `connect_timeout:` ended (the DNS lookup, TCP dial, and TLS handshake together), over TCP or the Unix socket | `Clean` | nothing of this request left the process; a retry skips the requests already accepted | `http::tests::a_stalled_handshake_ends_at_the_connect_timeout_as_connect_error`, `http::tests::a_dial_to_a_full_accept_queue_ends_at_the_connect_timeout_as_connect_error` (TCP); the Unix connector shares [`crate::http::ConnectTimeout`] with `otlp_out`'s gRPC client |
+//! | a request timeout after the connection opened, or a stalled dial `timeout:` ended first because `connect_timeout:` is at or above it; any other transport error | `Ambiguous` | the request may have been applied | -- |
 //!
 //! A refused route is refused for every batch: a `404` or `415` answers the sink's `version:`. So
 //! a route answered `Refused` after the other route was accepted stays `Refused` and holds the
@@ -195,7 +202,7 @@
 //!
 //! | Point | Meaning |
 //! |---|---|
-//! | `logit.output.requests{route, class}` | one per request; `route` is `traces` or `stats`, `class` [`crate::http::status_class`]'s or `network_error` |
+//! | `logit.output.requests{route, class}` | one per request; `route` is `traces` or `stats`, `class` [`crate::http::status_class`]'s or [`crate::http::transport_class`]'s |
 //! | `logit.output.request.duration{route}` | one timer per request |
 //! | `logit.output.request.bytes{route}` | the body as sent, after compression, for a request that got an answer or failed after it may have left; not for a refused connection or a missing socket file |
 //! | `logit.output.records{route}` | spans (`traces`) or stats groups (`stats`) in a request the Agent accepted |
@@ -216,7 +223,7 @@
 use crate::accounting::BatchAccounting;
 use crate::http::{
     body_snippet, build_client, classify_reqwest_error, read_body_prefix, split_encode,
-    status_class, Caps, Encoded, Journal, Outcomes, Slots, DEFAULT_IDLE_TIMEOUT,
+    status_class, transport_class, Caps, Encoded, Journal, Outcomes, Slots, DEFAULT_IDLE_TIMEOUT,
     ERROR_BODY_SNIPPET_BYTES,
 };
 /// `tls:`: the shared `crate::tls` type, re-exported as the other sinks do.
@@ -347,7 +354,7 @@ struct RequestMeta {
 }
 
 /// The Unix-socket connector: dials `path` for every connection the pool opens, whatever the
-/// request URI names.
+/// request URI names. The pool wraps it in [`crate::http::ConnectTimeout`].
 #[derive(Clone)]
 struct UnixConnector {
     path: Arc<Path>,
@@ -371,8 +378,14 @@ impl tower_service::Service<http::Uri> for UnixConnector {
 /// The two transports (module doc's "Transports"). `Clone` shares the pool.
 #[derive(Clone)]
 enum Client {
-    Http { client: reqwest::Client, base: String },
-    Unix { client: Box<HyperClient<UnixConnector, Full<Bytes>>>, path: Arc<Path> },
+    Http {
+        client: reqwest::Client,
+        base: String,
+    },
+    Unix {
+        client: Box<HyperClient<crate::http::ConnectTimeout<UnixConnector>, Full<Bytes>>>,
+        path: Arc<Path>,
+    },
 }
 
 /// A response's status and a bounded prefix of its body.
@@ -383,10 +396,13 @@ struct Reply {
 
 impl Client {
     /// A pooled client on the Agent's socket, closing a connection idle past `idle_timeout`
-    /// ([`crate::http::hyper_client_builder`]).
-    fn unix(path: PathBuf, idle_timeout: Duration) -> Self {
+    /// ([`crate::http::hyper_client_builder`]) and giving up on a dial past `connect_timeout`.
+    fn unix(path: PathBuf, connect_timeout: Duration, idle_timeout: Duration) -> Self {
         let path: Arc<Path> = Arc::from(path);
-        let connector = UnixConnector { path: Arc::clone(&path) };
+        let connector = crate::http::ConnectTimeout::new(
+            UnixConnector { path: Arc::clone(&path) },
+            connect_timeout,
+        );
         Self::Unix {
             client: Box::new(crate::http::hyper_client_builder(idle_timeout).build(connector)),
             path,
@@ -518,6 +534,8 @@ pub struct DatadogTraceOutput {
     tls: Option<rustls::ClientConfig>,
     /// The operator's `idle_timeout:` ([`crate::http::build_client`]).
     idle_timeout: Duration,
+    /// The operator's `connect_timeout:` ([`crate::http::build_client`]).
+    connect_timeout: Duration,
     /// Counts through views of `telemetry`/`diag` gated by `accounting`
     /// ([`DatadogTraceOutput::new_encoder`]).
     encoder: DatadogEncoder,
@@ -549,6 +567,7 @@ impl DatadogTraceOutput {
             compression: DatadogTraceCompression::default(),
             request_timeout: DEFAULT_TIMEOUT,
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
+            connect_timeout: crate::http::DEFAULT_CONNECT_TIMEOUT,
             headers: HeaderMap::new(),
             tls: None,
             encoder: DatadogEncoder::new(),
@@ -566,13 +585,22 @@ impl DatadogTraceOutput {
     /// trailing `/` is dropped.
     pub fn http(endpoint: impl Into<String>) -> Self {
         let base = endpoint.into().trim_end_matches('/').to_string();
-        let client = build_client(DEFAULT_TIMEOUT, DEFAULT_IDLE_TIMEOUT, None);
+        let client = build_client(
+            DEFAULT_TIMEOUT,
+            crate::http::DEFAULT_CONNECT_TIMEOUT,
+            DEFAULT_IDLE_TIMEOUT,
+            None,
+        );
         Self::with_client(Client::Http { client, base })
     }
 
     /// Sends to the Agent's Unix socket at `path` (`socket:`).
     pub fn unix(path: impl Into<PathBuf>) -> Self {
-        Self::with_client(Client::unix(path.into(), DEFAULT_IDLE_TIMEOUT))
+        Self::with_client(Client::unix(
+            path.into(),
+            crate::http::DEFAULT_CONNECT_TIMEOUT,
+            DEFAULT_IDLE_TIMEOUT,
+        ))
     }
 
     /// The trace form (`version:`).
@@ -599,10 +627,39 @@ impl DatadogTraceOutput {
         self.idle_timeout = idle_timeout;
         self.client = match &self.client {
             Client::Http { base, .. } => Client::Http {
-                client: build_client(self.request_timeout, idle_timeout, self.tls.as_ref()),
+                client: build_client(
+                    self.request_timeout,
+                    self.connect_timeout,
+                    idle_timeout,
+                    self.tls.as_ref(),
+                ),
                 base: base.clone(),
             },
-            Client::Unix { path, .. } => Client::unix(path.to_path_buf(), idle_timeout),
+            Client::Unix { path, .. } => {
+                Client::unix(path.to_path_buf(), self.connect_timeout, idle_timeout)
+            }
+        };
+        self
+    }
+
+    /// How long a new connection may take to open, DNS lookup, TCP dial, and TLS handshake
+    /// together (`connect_timeout:` in config, default [`crate::http::DEFAULT_CONNECT_TIMEOUT`]).
+    /// Rebuilds the client.
+    pub fn with_connect_timeout(mut self, connect_timeout: Duration) -> Self {
+        self.connect_timeout = connect_timeout;
+        self.client = match &self.client {
+            Client::Http { base, .. } => Client::Http {
+                client: build_client(
+                    self.request_timeout,
+                    connect_timeout,
+                    self.idle_timeout,
+                    self.tls.as_ref(),
+                ),
+                base: base.clone(),
+            },
+            Client::Unix { path, .. } => {
+                Client::unix(path.to_path_buf(), connect_timeout, self.idle_timeout)
+            }
         };
         self
     }
@@ -612,7 +669,8 @@ impl DatadogTraceOutput {
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.request_timeout = timeout;
         if let Client::Http { client, .. } = &mut self.client {
-            *client = build_client(timeout, self.idle_timeout, self.tls.as_ref());
+            *client =
+                build_client(timeout, self.connect_timeout, self.idle_timeout, self.tls.as_ref());
         }
         self
     }
@@ -672,7 +730,12 @@ impl DatadogTraceOutput {
             &self.telemetry,
         )?;
         if let Client::Http { client, .. } = &mut self.client {
-            *client = build_client(self.request_timeout, self.idle_timeout, Some(&cfg));
+            *client = build_client(
+                self.request_timeout,
+                self.connect_timeout,
+                self.idle_timeout,
+                Some(&cfg),
+            );
         }
         self.tls = Some(cfg);
         Ok(self)
@@ -1153,7 +1216,7 @@ impl Poster {
                 journal.count(
                     REQUESTS,
                     1.0,
-                    &[("route", route.name()), ("class", "network_error")],
+                    &[("route", route.name()), ("class", transport_class(fault))],
                 );
                 return Err(err
                     .context(format!(
@@ -1946,7 +2009,7 @@ mod tests {
         assert_eq!(logit_pipeline::classify(&err), Fault::Clean);
         let points = registry.drain(0);
         assert_eq!(
-            total(&points, REQUESTS, &[("route", "traces"), ("class", "network_error")]),
+            total(&points, REQUESTS, &[("route", "traces"), ("class", "connect_error")]),
             1.0
         );
     }
@@ -2586,7 +2649,7 @@ mod tests {
             assert_eq!(logit_pipeline::classify(&err), Fault::Clean, "{err:#}");
             let points = registry.drain(0);
             assert_eq!(total(&points, REQUEST_BYTES, &[]), 0.0, "{err:#}");
-            let refused = [("route", "traces"), ("class", "network_error")];
+            let refused = [("route", "traces"), ("class", "connect_error")];
             assert_eq!(total(&points, REQUESTS, &refused), 1.0);
         }
     }

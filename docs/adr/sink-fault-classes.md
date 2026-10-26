@@ -134,6 +134,13 @@ status-only default:
 | connect failure, DNS failure | `Clean` | unchanged |
 | request timeout | `Ambiguous` | unchanged |
 
+A dial the sink's `connect_timeout:` ends, the DNS lookup, TCP dial, and TLS handshake together,
+is a connect failure, `Clean`, so `at_most_once` retries it. The request-timeout row covers a
+request whose connection opened, and a stalled dial only when the request timeout is shorter
+than `connect_timeout:` and ends it first ([ADR
+`sink-send-path-and-attempt-accounting`](sink-send-path-and-attempt-accounting.md)'s "Amendment:
+a failed dial counts `connect_error`").
+
 A response a sink can't attribute (a bare `400` with no body it can read) is `Rejected`. Holding
 it would be safe when the destination is the fault and a wedge when a stream of bad batches is,
 and the specifications' definition and every peer's behavior read it as the request's fault.
@@ -497,9 +504,9 @@ drops the batch. The `standin-remote-write` and `standin-influxdb*` soak scenari
 ## Amendment: a sink's own timeout is the only bound on an attempt (2026-10-25)
 
 The runtime wraps `Output::send` in no timeout, so each sink bounds its own attempts: the HTTP
-and gRPC sinks with `request_timeout`, the stream sinks with `connect_timeout` on each write's
-progress, the Unix datagram send with `send_timeout`, and `logit_out` with `request_timeout` on
-each write and acknowledgment wait. `stdio_out` to a pipe has no bound, because a write to a
+and gRPC sinks with `connect_timeout` on the dial and `request_timeout` on the attempt, the
+stream sinks with `connect_timeout` on each write's progress, the Unix datagram send with
+`send_timeout`, and `logit_out` with `request_timeout` on each write and acknowledgment wait. `stdio_out` to a pipe has no bound, because a write to a
 stalled pipe can't be cancelled (`docs/known-gaps/sinks.md`).
 
 A sink author gives every write and acknowledgment wait its own timeout, and classifies one that
