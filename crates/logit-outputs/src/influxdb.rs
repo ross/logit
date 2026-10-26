@@ -483,7 +483,7 @@ fn settle(telemetry: &Telemetry, carried: Carried, exchange: Exchange) -> anyhow
     telemetry.timing("logit.output.request.duration", exchange.took, &[]);
     telemetry.count("logit.output.requests", 1.0, &[("class", exchange.reply.class())]);
     match exchange.reply {
-        Reply::Success(_) => Ok(()),
+        Reply::Success { .. } => Ok(()),
         Reply::Failure { status, body, .. } => {
             let fault = carried.classify(status, &body);
             let text = body_snippet(&body, ERROR_BODY_SNIPPET_BYTES);

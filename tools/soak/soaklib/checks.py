@@ -5101,6 +5101,11 @@ def check_ledger_standin(data):
     that class's effect at the sink (`_class_signature`). A killed life's mismatch WARNs, since
     a kill loses that life's last telemetry interval. Every other target SKIPs.
 
+    Under the `remote_write` shape (`_standin_not_written`), also: per SUT life, the samples the
+    stand-in's short `X-Prometheus-Remote-Write-Samples-Written` answers said weren't written
+    equal the sink's `logit.output.samples.dropped{reason="not_written"}`, and those requests
+    are left out of the acknowledged-but-unstored check.
+
     Under the `datadog` shape (`_standin_datadog`), also: per SUT life, the sink's
     `records.dropped{reason="rejected"}` equals the series the `series_errors` answers named
     plus the points of the requests answered under the cue of a step classed `rejected`, other
@@ -5248,6 +5253,7 @@ def check_ledger_standin(data):
     elif data.standin_influxdb:
         resent = _standin_influxdb(data, led, sink, at_most_once, flag, lines)
     else:
+        _standin_not_written(data, led, sink, flag, lines)
         resent = f"{_n(rewrites)} resent sample(s) stored again with the same value"
     summary = (f"{_n(len(requests))} request(s) recorded, {_n(stored)} stored, "
                f"{_n(len(data.standin_cues))} cue(s); {resent}; {len(classed)} classed step(s) "
@@ -5258,6 +5264,35 @@ def check_ledger_standin(data):
     worst_first = sorted(problems, key=lambda item: -_ORDER[item[0]])
     return Result("ledger.standin", status, f"{worst_first[0][1]}; {summary}",
                   [text for _, text in worst_first] + lines)
+
+
+def _standin_not_written(data, led, sink, flag, lines):
+    """A `remote_write` stand-in's short `Samples-Written` answers against the sink, per SUT
+    life: the samples they said weren't written (`standin.unwritten_samples`) equal the sink's
+    `logit.output.samples.dropped{reason="not_written"}`. A killed life's mismatch WARNs."""
+    told = {}
+    for request in data.standin_requests:
+        try:
+            decoded = standin.decode_body(request, standin.REMOTE_WRITE)
+        except standin.DecodeError:
+            continue
+        unwritten = standin.unwritten_samples(request, decoded)
+        if unwritten:
+            life = vm.life_at(led.life_starts, request.get("t") or 0)
+            told[life] = told.get(life, 0) + unwritten
+    counted = {}
+    for point in led.sut.matching("logit.output.samples.dropped", component=sink,
+                                  reason="not_written"):
+        if isinstance(point.value, (int, float)):
+            counted[point.life] = counted.get(point.life, 0) + point.value
+    for life in sorted(set(told) | set(counted)):
+        verdict = WARN if life in led.killed and life != led.final else FAIL
+        if told.get(life, 0) != counted.get(life, 0):
+            flag(verdict, f"life {life}: the stand-in answered {_n(told.get(life, 0))} "
+                          f"sample(s) not written, {sink} counted "
+                          f"{_n(counted.get(life, 0))} samples.dropped{{reason=\"not_written\"}}")
+        lines.append(f"life {life}: {_n(told.get(life, 0))} sample(s) answered not written; "
+                     f"{sink} counted {_n(counted.get(life, 0))} not_written")
 
 
 def _standin_datadog(data, led, sink, at_most_once, flag, lines):
@@ -6108,6 +6143,10 @@ def _balanced_drop(led, service, name, component, reason, batch_drops):
                                                   or led.data.standin_datadog) and name in (
             "logit.output.records.dropped", "logit.output.metrics.dropped"):
         return True  # `ledger.sent` judges these on an external, Kafka, or datadog stand-in target
+    if (sinks_side and component in led.sinks and led.data.standin
+            and led.data.standin_shape == standin.REMOTE_WRITE
+            and name == "logit.output.samples.dropped" and reason == "not_written"):
+        return True  # `ledger.standin` judges these against the stand-in's answers
     return False
 
 

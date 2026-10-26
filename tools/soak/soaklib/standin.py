@@ -11,9 +11,14 @@ Three shapes, each the stand-in's `--shape` and a scenario's `[target] shape`:
 - `remote_write`: a body is a Snappy **block** (never framed) holding a `prometheus.WriteRequest`
   (1.0): `timeseries` is field 1; a `TimeSeries` has `labels` (1) and `samples` (2); a `Label`
   has `name` (1) and `value` (2); a `Sample` has `value` (1, a double) and `timestamp` (2, an
-  int64 of milliseconds). V is every sample of every request the stand-in marked `stored`, in
+  int64 of milliseconds). A request whose `Content-Type` names `io.prometheus.write.v2.Request`
+  holds a 2.0 `Request` instead: `symbols` is field 4 and `timeseries` field 5; a `TimeSeries`
+  has `labels_refs` (1, packed indexes into `symbols`, name then value) and `samples` (2), a
+  `Sample` as in 1.0. V is every sample of every request the stand-in marked `stored`, in
   record order, with a later write of one `(label set, timestamp)` replacing an earlier one, as a
-  remote-write receiver overwrites (`stored_series`).
+  remote-write receiver overwrites (`stored_series`). A `2xx` whose
+  `X-Prometheus-Remote-Write-Samples-Written` is below the request's samples told the sink
+  that many weren't written (`unwritten_samples`).
 - `datadog`: a body is the series route's `MetricPayload`
   (`crates/logit-proto/proto/datadog/agent-payload/proto/metrics/agent_payload.proto`), under
   `Content-Encoding` `gzip`, `deflate` (zlib), or none: `series` is field 1; a `MetricSeries` has
@@ -66,6 +71,9 @@ INFLUXDB_PRECISION_NS = {"ns": 1, "us": 1_000, "ms": 1_000_000, "s": 1_000_000_0
 # The labels a line-protocol sample is named by besides its tags; a tag key equal to one would
 # be lost in the label set, so it doesn't decode.
 INFLUXDB_LABELS = ("__name__", "field")
+# A remote-write 2.0 request's `Content-Type` names this message.
+REMOTE_WRITE_V2_PROTO = "io.prometheus.write.v2.Request"
+SAMPLES_WRITTEN_HEADER = "x-prometheus-remote-write-samples-written"
 # `MetricPayload.MetricType`'s names.
 DATADOG_TYPES = {0: "unspecified", 1: "count", 2: "rate", 3: "gauge"}
 
@@ -214,6 +222,42 @@ def write_request(data):
                     elif field == 2 and field_wire == 0:
                         stamp = _int64(part)
                 samples.append((stamp, sample_value))
+        series.append((labels, samples))
+    return series
+
+
+def write_request_v2(data):
+    """`[(labels, [(timestamp_ms, value)])]` from an uncompressed remote-write 2.0 `Request`."""
+    symbols = []
+    raw_series = []
+    for number, wire, value in _fields(data):
+        if number == 4 and wire == 2:
+            symbols.append(value.decode())
+        elif number == 5 and wire == 2:
+            raw_series.append(value)
+    series = []
+    for raw in raw_series:
+        refs = []
+        samples = []
+        for inner, inner_wire, item in _fields(raw):
+            if inner == 1 and inner_wire == 2:
+                pos = 0
+                while pos < len(item):
+                    ref, pos = _varint(item, pos)
+                    refs.append(ref)
+            elif inner == 1 and inner_wire == 0:
+                refs.append(item)
+            elif inner == 2 and inner_wire == 2:
+                sample_value, stamp = 0.0, 0
+                for field, field_wire, part in _fields(item):
+                    if field == 1 and field_wire == 1:
+                        sample_value = struct.unpack("<d", part)[0]
+                    elif field == 2 and field_wire == 0:
+                        stamp = _int64(part)
+                samples.append((stamp, sample_value))
+        if len(refs) % 2 or any(ref >= len(symbols) for ref in refs):
+            raise DecodeError(f"labels_refs {refs} outside {len(symbols)} symbol(s)")
+        labels = {symbols[name]: symbols[text] for name, text in zip(refs[::2], refs[1::2])}
         series.append((labels, samples))
     return series
 
@@ -551,7 +595,23 @@ def decode_body(request, shape=REMOTE_WRITE):
                 for one in decoded]
     if request.get("content_encoding") != "snappy":
         raise DecodeError(f"Content-Encoding {request.get('content_encoding')!r}, not snappy")
+    if REMOTE_WRITE_V2_PROTO in (request.get("content_type") or ""):
+        return write_request_v2(snappy_decompress(raw))
     return write_request(snappy_decompress(raw))
+
+
+def unwritten_samples(request, decoded):
+    """How many samples of a request's decoded body a `2xx` said weren't written: its samples
+    less the `X-Prometheus-Remote-Write-Samples-Written` the stand-in answered, when that's
+    lower. 0 for any other answer, a missing header included."""
+    if status_class(request) != "2xx":
+        return 0
+    headers = {name.lower(): value for name, value in (request.get("headers") or {}).items()}
+    try:
+        written = int(headers[SAMPLES_WRITTEN_HEADER])
+    except (KeyError, ValueError):
+        return 0
+    return max(0, sum(len(samples) for _, samples in decoded) - written)
 
 
 def named_series(request, decoded):
@@ -710,8 +770,9 @@ def acknowledged_unstored(requests, series, shape=REMOTE_WRITE):
     """`(series key, timestamp)` for each sample of a request the stand-in answered `2xx` that
     `series` (from `stored_series`, `stored_counts`, or `stored_points`) doesn't hold: a write the sink saw
     accepted that the destination never kept. The series a `series_errors` answer named are
-    left out, since the sink saw them dropped, as is a body that doesn't decode, which the
-    caller judges."""
+    left out, since the sink saw them dropped, as is every sample of a request a short
+    `Samples-Written` answered (`unwritten_samples`), since the answer doesn't say which samples
+    the destination kept, and a body that doesn't decode, which the caller judges."""
     stored = {(series_key(one["metric"]), stamp) for one in series
               for stamp in one["timestamps"]}
     missing = []
@@ -721,6 +782,8 @@ def acknowledged_unstored(requests, series, shape=REMOTE_WRITE):
         try:
             decoded = decode_body(request, shape)
         except DecodeError:
+            continue
+        if unwritten_samples(request, decoded):
             continue
         for labels, samples in decoded[named_series(request, decoded):]:
             key = series_key(labels)

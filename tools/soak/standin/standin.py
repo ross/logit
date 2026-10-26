@@ -17,10 +17,18 @@ Stdlib only; compose runs it in a stock Python image. It serves two ports:
   body is then the series route's `errors` list, protobuf field 1 (`repeated string`), with N
   entries, which `datadog_out` counts as N series the intake dropped. The stand-in doesn't
   decode the request, so the entries name series by their place in it; the checks take them to
-  be its first N series. An empty object restores the default. `GET /health` answers `OK`.
+  be its first N series. A cue's `headers`, an object of header names to string values, replaces
+  the response headers the stand-in would add itself (below), so `{}` sends none. An empty cue
+  restores the default. `GET /health` answers `OK`.
+
+Under the `remote_write` shape, a `2xx` other than `202` to a remote-write 2.0 request (its
+`Content-Type` names `io.prometheus.write.v2.Request`) carries
+`X-Prometheus-Remote-Write-{Samples,Histograms,Exemplars}-Written` with the body's own counts,
+as a 2.0 receiver must: the samples and exemplars in the Snappy-compressed `Request`, and `0`
+histograms. A body that doesn't decode gets no headers.
 
 Each request line records the path and the query string apart (`path`, `query`), the raw body
-(`body_b64`), and whether the write counts as stored:
+(`body_b64`), the response headers it added (`headers`), and whether the write counts as stored:
 `apply` when the cue sets it, else whether the answer is `2xx`. A `reset` reads the whole
 request, then closes the connection with an RST and no response. The line is printed after the
 answer is written, so a request the sink saw answered is in the record unless the process died
@@ -50,6 +58,12 @@ DEFAULT_PATH = {"remote_write": "/api/v1/write", "datadog": "/api/v2/series",
 NO_BODY_STATUSES = (204, 304)
 # The cue key only the `datadog` shape takes.
 DATADOG_SHAPE = "datadog"
+REMOTE_WRITE_SHAPE = "remote_write"
+# A remote-write 2.0 request's `Content-Type` names this message.
+REMOTE_WRITE_V2_PROTO = "io.prometheus.write.v2.Request"
+WRITTEN_HEADERS = ("X-Prometheus-Remote-Write-Samples-Written",
+                   "X-Prometheus-Remote-Write-Histograms-Written",
+                   "X-Prometheus-Remote-Write-Exemplars-Written")
 # How long a keep-alive connection may sit idle before its thread lets it go, which bounds a
 # SIGTERM's wait for the threads; `--idle-timeout` overrides it.
 IDLE_TIMEOUT_S = 5
@@ -98,7 +112,8 @@ def cue_problems(cue, shape="remote_write"):
     if not cue:
         return []
     problems = []
-    unknown = set(cue) - {"step", "status", "body", "answer", "apply", "series_errors", "count"}
+    unknown = set(cue) - {"step", "status", "body", "answer", "apply", "series_errors", "count",
+                          "headers"}
     if unknown:
         problems.append(f"unknown keys {sorted(unknown)}")
     if not isinstance(cue.get("step"), str) or not cue.get("step"):
@@ -113,6 +128,10 @@ def cue_problems(cue, shape="remote_write"):
         problems.append("`answer` must be \"reset\"")
     if "body" in cue and (not has_status or not isinstance(cue["body"], str)):
         problems.append("`body` is a string, with `status` only")
+    if "headers" in cue and (not has_status or not isinstance(cue["headers"], dict) or not all(
+            isinstance(name, str) and name and isinstance(value, str)
+            for name, value in cue["headers"].items())):
+        problems.append("`headers` maps header names to strings, with `status` only")
     if "apply" in cue and not isinstance(cue["apply"], bool):
         problems.append("`apply` must be true or false")
     if "count" in cue and (not isinstance(cue["count"], int) or isinstance(cue["count"], bool)
@@ -153,6 +172,102 @@ def series_errors_body(count):
     return bytes(out)
 
 
+def _read_varint(data, pos):
+    result = shift = 0
+    while True:
+        byte = data[pos]
+        pos += 1
+        result |= (byte & 0x7F) << shift
+        if not byte & 0x80:
+            return result, pos
+        shift += 7
+        if shift > 63:
+            raise ValueError("varint over 64 bits")
+
+
+def _snappy_decompress(data):
+    """The bytes a Snappy block holds; raises `ValueError` or `IndexError` for a bad one."""
+    length, pos = _read_varint(data, 0)
+    out = bytearray()
+    while pos < len(data):
+        tag = data[pos]
+        pos += 1
+        kind = tag & 0x03
+        if kind == 0:
+            size = tag >> 2
+            if size >= 60:
+                size = int.from_bytes(data[pos:pos + size - 59], "little")
+                pos += (tag >> 2) - 59
+            size += 1
+            out += data[pos:pos + size]
+            pos += size
+            continue
+        if kind == 1:
+            size, offset = ((tag >> 2) & 0x07) + 4, ((tag >> 5) << 8) | data[pos]
+            pos += 1
+        else:
+            width = 2 if kind == 2 else 4
+            size, offset = (tag >> 2) + 1, int.from_bytes(data[pos:pos + width], "little")
+            pos += width
+        if not 0 < offset <= len(out):
+            raise ValueError("copy offset outside the decoded bytes")
+        start = len(out) - offset
+        for index in range(size):
+            out.append(out[start + index])
+    if len(out) != length:
+        raise ValueError("length mismatch")
+    return bytes(out)
+
+
+def _fields(data):
+    """`(field number, value)` for each length-delimited field of a protobuf message, skipping
+    the rest by wire type."""
+    pos = 0
+    while pos < len(data):
+        key, pos = _read_varint(data, pos)
+        wire = key & 0x07
+        if wire == 0:
+            _, pos = _read_varint(data, pos)
+        elif wire == 1:
+            pos += 8
+        elif wire == 5:
+            pos += 4
+        elif wire == 2:
+            size, pos = _read_varint(data, pos)
+            if pos + size > len(data):
+                raise ValueError("truncated field")
+            yield key >> 3, data[pos:pos + size]
+            pos += size
+        else:
+            raise ValueError(f"unsupported wire type {wire}")
+
+
+def written_counts(body):
+    """`(samples, exemplars)` in a Snappy-compressed remote-write 2.0 `Request`: `timeseries` is
+    field 5, and a `TimeSeries` holds `samples` (2) and `exemplars` (4)."""
+    samples = exemplars = 0
+    for number, series in _fields(_snappy_decompress(body)):
+        if number != 5:
+            continue
+        for inner, _ in _fields(series):
+            samples += inner == 2
+            exemplars += inner == 4
+    return samples, exemplars
+
+
+def default_headers(shape, content_type, status, body):
+    """The response headers the stand-in adds with no cue `headers`: a 2.0 receiver's written
+    counts on a `2xx` other than `202` to a 2.0 request, under the `remote_write` shape."""
+    if (shape != REMOTE_WRITE_SHAPE or REMOTE_WRITE_V2_PROTO not in (content_type or "")
+            or not 200 <= status < 300 or status == 202):
+        return {}
+    try:
+        samples, exemplars = written_counts(body)
+    except (ValueError, IndexError):
+        return {}
+    return dict(zip(WRITTEN_HEADERS, (str(samples), "0", str(exemplars))))
+
+
 def data_handler(state, idle_timeout=IDLE_TIMEOUT_S):
     class Handler(http.server.BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -183,21 +298,28 @@ def data_handler(state, idle_timeout=IDLE_TIMEOUT_S):
             else:
                 status = cue.get("status", DEFAULT_STATUS[state.shape])
                 stored = cue.get("apply", 200 <= status < 300)
-                record.update(answer="status", status=status, stored=bool(stored))
+                headers = cue.get("headers")
+                if headers is None:
+                    headers = default_headers(state.shape, record["content_type"], status, body)
+                record.update(answer="status", status=status, stored=bool(stored),
+                              headers=headers)
                 if "series_errors" in cue:
                     record["series_errors"] = cue["series_errors"]
                     self._answer(status, series_errors_body(cue["series_errors"]),
-                                 "application/x-protobuf")
+                                 "application/x-protobuf", headers)
                 else:
-                    self._answer(status, cue.get("body", "").encode())
+                    self._answer(status, cue.get("body", "").encode(), headers=headers)
             if state.stopping:
                 self.close_connection = True
             emit(record)
 
-        def _answer(self, status, payload, content_type="text/plain; charset=utf-8"):
+        def _answer(self, status, payload, content_type="text/plain; charset=utf-8",
+                    headers=None):
             if isinstance(payload, str):
                 payload = payload.encode()
             self.send_response(status)
+            for name, value in (headers or {}).items():
+                self.send_header(name, value)
             if status in NO_BODY_STATUSES or status < 200:
                 self.end_headers()
                 self.wfile.flush()

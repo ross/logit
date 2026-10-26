@@ -74,7 +74,12 @@ pub(crate) struct Exchange {
 
 #[derive(Debug)]
 pub(crate) enum Reply {
-    Success(reqwest::StatusCode),
+    /// A 2xx answer and its headers, moved out of the response rather than cloned. The body is
+    /// never read.
+    Success {
+        status: reqwest::StatusCode,
+        headers: reqwest::header::HeaderMap,
+    },
     /// A non-2xx answer, with its headers and its body read bounded ([`read_body_prefix`], to
     /// [`ERROR_BODY_SNIPPET_BYTES`]).
     Failure {
@@ -89,7 +94,7 @@ impl Reply {
     /// The `class` tag on `logit.output.requests`: [`status_class`], or [`transport_class`].
     pub(crate) fn class(&self) -> &'static str {
         match self {
-            Reply::Success(status) | Reply::Failure { status, .. } => status_class(*status),
+            Reply::Success { status, .. } | Reply::Failure { status, .. } => status_class(*status),
             Reply::Transport(err) => transport_class(classify_reqwest_error(err)),
         }
     }
@@ -101,7 +106,10 @@ pub(crate) async fn exchange(request: reqwest::RequestBuilder) -> Exchange {
     let result = request.send().await;
     let took = started.elapsed();
     let reply = match result {
-        Ok(response) if response.status().is_success() => Reply::Success(response.status()),
+        Ok(mut response) if response.status().is_success() => Reply::Success {
+            status: response.status(),
+            headers: std::mem::take(response.headers_mut()),
+        },
         Ok(response) => {
             let status = response.status();
             let headers = response.headers().clone();
