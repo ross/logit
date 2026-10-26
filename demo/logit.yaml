@@ -679,7 +679,7 @@ components:
 
   # Remote-write into VictoriaMetrics (docs/deploying.md's "VictoriaMetrics, VictoriaLogs, and
   # VictoriaTraces"). `version: 1` is required: VictoriaMetrics answers a 2.0 request `204` and
-  # stores nothing. `compression: zstd` is the VictoriaMetrics remote write protocol vmagent sends
+  # stores nothing, and under `version: 2` this sink holds its queue. `compression: zstd` is the VictoriaMetrics remote write protocol vmagent sends
   # by default; VictoriaMetrics also accepts Snappy. Each series is labelled with its event
   # attributes and resource attributes, names sanitized (`service.name` becomes `service_name`,
   # `web.requests` becomes `web_requests_total`).

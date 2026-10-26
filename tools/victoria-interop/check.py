@@ -151,14 +151,19 @@ def leg_1z():
 def leg_2():
     stored = names(vm_series('{__name__=~"vi_rw2_.*"}'))
     logged = strip_ansi(log("logit-rw2"))
-    rejected = re.search(r"remote_write_rejected|rejected", logged)
+    # VictoriaMetrics answers 2.0 `204` with no Samples-Written header, which prometheus_out
+    # reads as a receiver that doesn't speak 2.0: it holds its queue and logs this diagnostic.
+    refused = re.search(r"remote_write_version_unsupported", logged)
     if stored:
         return "FAIL", f"VictoriaMetrics stored {stored} from a 2.0 sender"
-    if rejected:
-        return "PASS", "refused: " + rejected.group(0)
-    return "GAP", (
-        "VictoriaMetrics answered every 2.0 request 2xx and stored nothing; prometheus_out logged "
-        "no rejection (see the probe row for the status)"
+    if refused:
+        return "PASS", (
+            "VictoriaMetrics answered 2xx with no Samples-Written and stored nothing; "
+            "prometheus_out refused it: " + refused.group(0)
+        )
+    return "FAIL", (
+        "VictoriaMetrics stored nothing, and prometheus_out logged no "
+        "remote_write_version_unsupported (see the probe row for the status)"
     )
 
 

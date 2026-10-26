@@ -33,7 +33,9 @@ Each `logit-<leg>.yaml` says at its top which leg it is. The legs that need synt
 
 1. `prometheus_out` `version: 1` → VictoriaMetrics `/api/v1/write`. Leg 1z is the same with
    `compression: zstd`.
-2. `prometheus_out` `version: 2` → VictoriaMetrics, recording the status and body it answers.
+2. `prometheus_out` `version: 2` → VictoriaMetrics, which answers `204` and stores nothing. It
+   passes when `prometheus_out` refuses that answer for its missing
+   `X-Prometheus-Remote-Write-Samples-Written` count and logs `remote_write_version_unsupported`.
 3. `prometheus_out` `bind:` scraped by vmagent.
 4. `influxdb_out` → VictoriaMetrics `/api/v2/write`, recording which of `org`, `bucket`, and `db`
    become labels.
@@ -85,13 +87,14 @@ which `check.py` reads with `json.loads`).
 Run 2026-09-24 at `73ca4931` against `victoriametrics/victoria-metrics:v1.152.0`,
 `victoriametrics/vmagent:v1.152.0`, `victoriametrics/victoria-logs:v1.52.0`, and
 `victoriametrics/victoria-traces:v0.11.1`. Legs 1z and 10 are from a rerun at `cacf17bf`, after
-zstd landed on remote-write; leg 11 is from 2026-10-13.
+zstd landed on remote-write; leg 11 is from 2026-10-13; leg 2 is from a rerun on 2026-10-26, after
+`prometheus_out` began reading a 2.0 answer's written count.
 
 | Leg | Result | Detail |
 |---|---|---|
 | 1 | Worked | `vi_rw1_gauge` and `vi_rw1_requests_total` (a `Sum` through `aggregate` `temporality: cumulative`) stored with their `leg` label and nothing added |
 | 1z | Worked | `vi_rw1z_gauge` and `vi_rw1z_requests_total` stored from a zstd body, otherwise as leg 1 |
-| 2 | Gap | VictoriaMetrics answers a remote-write 2.0 request `204` with an empty body and stores nothing, with nothing logged, so `prometheus_out` `version: 2` reports every batch delivered while all of it is lost. Replaying `prometheus-v2-000` gives the same `204` ([`docs/known-gaps/prometheus.md`](../../docs/known-gaps/prometheus.md)) |
+| 2 | Worked | VictoriaMetrics answers a remote-write 2.0 request `204` with an empty body and no `X-Prometheus-Remote-Write-*-Written` headers, and stores nothing, with nothing logged. `prometheus_out` reads the missing count as a receiver that doesn't speak 2.0: it holds its queue (`send failed (refused)`) and logs `remote_write_version_unsupported` naming `version: 1`. Replaying `prometheus-v2-000` gives the same `204` |
 | 3 | Worked | vmagent scrapes `prometheus_out`'s `bind:` and remote-writes `vi_expose_gauge` and `vi_expose_requests_total` to VictoriaMetrics with `job="logit-expose"` and `instance` added |
 | 4 | Worked | `vi_influx_gauge` arrives as `vi_influx_gauge_value{leg="influx"}` (`<measurement>_<field>`); none of `org`, `bucket`, and `db` becomes a label |
 | 5 | Worked | `vi_graphite_gauge{leg="graphite"}`: carbon's `;leg=graphite` segment is a label |
@@ -107,7 +110,7 @@ The harness's own rows from that run:
 ```
 | 1 | prometheus_out version: 1 -> VictoriaMetrics /api/v1/write | PASS | vi_rw1_gauge, vi_rw1_requests_total stored (62 points), labels ['leg'] |
 | 1z | prometheus_out version: 1, compression: zstd -> VictoriaMetrics /api/v1/write | PASS | vi_rw1z_gauge, vi_rw1z_requests_total stored (63 points) via compression: zstd, labels ['leg'] |
-| 2 | prometheus_out version: 2 -> VictoriaMetrics | GAP | VictoriaMetrics answered every 2.0 request 2xx and stored nothing; prometheus_out logged no rejection (see the probe row for the status) |
+| 2 | prometheus_out version: 2 -> VictoriaMetrics | PASS | VictoriaMetrics answered 2xx with no Samples-Written and stored nothing; prometheus_out refused it: remote_write_version_unsupported |
 | 3 | prometheus_out bind: <- vmagent scrape -> VictoriaMetrics | PASS | vi_expose_gauge, vi_expose_requests_total scraped by vmagent, labels ['instance', 'job', 'leg'] |
 | 4 | influxdb_out -> VictoriaMetrics /api/v2/write | PASS | vi_influx_gauge_value, labels ['leg']; of org/bucket/db, none became labels |
 | 5 | graphite_out plaintext, tags: carbon -> VictoriaMetrics :2003 | PASS | vi_graphite_gauge, labels ['leg'] (the ;leg= tag is a label) |

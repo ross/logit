@@ -426,7 +426,11 @@ Per pair:
     `compression: snappy | zstd` is chosen the same way: `zstd` is the VictoriaMetrics remote
     write protocol, `ruzstd`-encoded, `version: 1` only (graph rule 56), with no fallback to
     Snappy. It sends one `POST` per batch with no retry in the sink; its posture is the default
-    `at_least_once` because a sample's identity at a receiver is `(label set, timestamp)`.
+    `at_least_once` because a sample's identity at a receiver is `(label set, timestamp)`. Under
+    `version: 2` it reads a `2xx` other than `202` to a request carrying samples against its
+    `X-Prometheus-Remote-Write-Samples-Written`: no header is `Refused` (the receiver doesn't
+    speak 2.0, as VictoriaMetrics doesn't), and a short count settles the batch with the rest
+    counted `logit.output.samples.dropped{reason="not_written"}`.
   - Native histograms are dropped and counted in both remote-write directions, pending their own
     follow-up, and skipped on exposition, which has no syntax for them.
 
@@ -911,7 +915,9 @@ the operator-facing account of all of this.
   `standin-at-most-once` point `prometheus_out` at a scripted HTTP stand-in (a `standin` target, `tools/soak/standin/`) that
   `respond` steps cue through every row of the sink's response-class table, each step naming the
   fault class the sink must read; the stand-in's stdout records every request, raw body included,
-  and is the ledger's V (`ledger.standin`). `standin-datadog` points `datadog_out` at a
+  and is the ledger's V (`ledger.standin`). `standin-remote-write-v2` runs the same sink under
+  `version: 2` through the rows that read the stand-in's 2.0 written counts, which a step's
+  `headers` replaces. `standin-datadog` points `datadog_out` at a
   Datadog-shaped stand-in (`[target] shape = "datadog"`): a `202` whose body names series dropped
   (`series_errors`), every other row of the sink's table, V as the stored delta points' sum with
   each resent copy reported as a duplicate, and `ledger.sent` judging the sink with what each step

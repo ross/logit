@@ -8958,6 +8958,126 @@ def _datadog_server(root):
            f"the record carries series_errors on the answer that named series, got {got}")
 
 
+def _written_counts(root):
+    """Remote-write 2.0's written counts: the stand-in's default `-Written` headers on a 2.0
+    write (none on a 1.0 write, a `202`, or a non-2xx), a cue's `headers` replacing them and its
+    rules, the 2.0 `Request` walker and `unwritten_samples` on the host, `headers` in a
+    scenario step, and `ledger.standin` holding a short count to the sink's
+    `samples.dropped{reason="not_written"}`."""
+    import http.client
+    import http.server
+    import io
+    import threading
+    server = _load_standin_server(root)
+    v2_body = (root.parent.parent / "testdata" / "interop" / "prometheus"
+               / "prometheus-v2-000.bin").read_bytes()
+    v2_type = "application/x-protobuf;proto=io.prometheus.write.v2.Request"
+    v1_type = "application/x-protobuf;proto=prometheus.WriteRequest"
+    for cue, needle in (({"step": "x", "answer": "reset", "headers": {}}, "`status` only"),
+                        ({"step": "x", "status": 200, "headers": []}, "maps header names"),
+                        ({"step": "x", "status": 200, "headers": {"a": 1}}, "maps header names")):
+        problems = server.cue_problems(cue)
+        expect(any(needle in p for p in problems), f"cue {cue} refused with {needle!r}, got "
+               f"{problems}")
+    expect(server.cue_problems({"step": "x", "status": 200, "headers": {}}) == [],
+           "a 2xx cue with empty headers is accepted")
+
+    state = server.State("remote_write", "/api/v1/write")
+    data = http.server.ThreadingHTTPServer(("127.0.0.1", 0), server.data_handler(state))
+    control = http.server.ThreadingHTTPServer(("127.0.0.1", 0), server.control_handler(state))
+    for one in (data, control):
+        threading.Thread(target=one.serve_forever, daemon=True).start()
+    printed = io.StringIO()
+    real_stdout = server.sys.stdout
+    server.sys.stdout = printed
+    control_base = f"http://127.0.0.1:{control.server_address[1]}"
+    written = "X-Prometheus-Remote-Write-Samples-Written"
+
+    def post(content_type):
+        conn = http.client.HTTPConnection("127.0.0.1", data.server_address[1], timeout=5)
+        try:
+            conn.request("POST", "/api/v1/write", body=v2_body,
+                         headers={"Content-Encoding": "snappy", "Content-Type": content_type})
+            response = conn.getresponse()
+            response.read()
+            return response.status, response.getheader(written)
+        finally:
+            conn.close()
+
+    try:
+        answers = [post(v2_type), post(v1_type)]
+        for cue in ({"step": "c0s1", "status": 204, "headers": {}},
+                    {"step": "c0s2", "status": 200, "headers": {written: "0"}},
+                    {"step": "c0s3", "status": 202}, {"step": "c0s4", "status": 415}):
+            faults.post_cue(control_base, cue)
+            answers.append(post(v2_type))
+        faults.post_cue(control_base, {})
+        deadline = time.monotonic() + 5
+        while (printed.getvalue().count('"event": "request"') < 6
+               and time.monotonic() < deadline):
+            time.sleep(0.01)
+    finally:
+        server.sys.stdout = real_stdout
+        for one in (data, control):
+            one.shutdown()
+            one.server_close()
+    expect(answers == [(200, "26"), (200, None), (204, None), (200, "0"), (202, None),
+                       (415, None)],
+           f"a 2.0 write gets its own count, a 1.0 write, a 202, and a 415 none, and a cue's "
+           f"headers replace it, got {answers}")
+    requests = [json.loads(line) for line in printed.getvalue().splitlines()
+                if '"event": "request"' in line]
+    recorded = [r.get("headers", {}).get(written) for r in requests]
+    expect(recorded == ["26", None, None, "0", None, None],
+           f"each record line carries the headers it answered with, got {recorded}")
+
+    decoded = standin.decode_body(requests[0])
+    expect(len(decoded) == 26 and decoded[0][0].get("__name__") == "go_gc_duration_seconds"
+           and all(len(samples) == 1 for _, samples in decoded),
+           f"the host decodes a 2.0 Request by its Content-Type, got {decoded[:1]}")
+    expect([standin.unwritten_samples(r, decoded) for r in requests] == [0, 0, 0, 26, 0, 0],
+           "only the 2xx whose Samples-Written is short names unwritten samples")
+
+    loaded = scenario.load(root / "scenarios" / "standin-remote-write-v2" / "scenario.toml")
+    first = scenario.expand(loaded)[0]
+    expect(first.cue() == {"step": "c0s1", "status": 204, "apply": False, "headers": {}}
+           and first.expected().get("headers") == {},
+           f"headers travels in the cue and the timeline, got {first.cue()}")
+    spec = scenario.StepSpec(index=0, at=0.0, action="respond", on="standin", args="",
+                             for_=1.0, answer="reset", headers={})
+    expect(any("`headers`" in p for p in scenario._respond_problems(spec, "step 1")),
+           "a respond with headers and no status is refused")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        def short(requests):
+            requests[0].update(stored=False, cue="c0s2",
+                               headers={"X-Prometheus-Remote-Write-Samples-Written": "0"})
+            return requests
+
+        timeline = _respond_fault("c0s2", 0, 400, status=200)
+
+        def rows_for(name, sut_extra=()):
+            run_dir = _ledger_run(tmp, name, standin_edit=short, timeline_extra=timeline,
+                                  sut_extra=sut_extra)
+            requests = standin.read_record((run_dir / "logs" / "standin.stdout").read_text())[0]
+            unwritten = standin.unwritten_samples(requests[0], standin.decode_body(requests[0]))
+            return {r.id: r for r in checks.run_all(run_dir)}, unwritten, requests[0]["t"]
+
+        rows, unwritten, t = rows_for("short-uncounted")
+        expect(unwritten > 0 and rows["ledger.standin"].status == checks.FAIL
+               and "not written" in rows["ledger.standin"].detail
+               and "never stored" not in rows["ledger.standin"].detail,
+               f"a short count the sink didn't count FAILs, and isn't an unstored 2xx, got "
+               f"{rows['ledger.standin']}")
+        counted = [_line(_stamp(t + 1), "logit.output.samples.dropped", "sum", unwritten,
+                         component="sink", attrs={"reason": "not_written"})]
+        rows, _, _ = rows_for("short-counted", counted)
+        expect(rows["ledger.standin"].status == checks.PASS
+               and rows["drops"].status == checks.PASS,
+               f"a short count the sink counted not_written PASSes ledger.standin and drops, "
+               f"got {rows['ledger.standin']} {rows['drops']}")
+
+
 def _datadog_rules(root):
     """`[target] shape`, the `series_errors` key, and the `datadog` shape's `class` rules;
     `standin-datadog` loading with its shape, cue, and compose variable."""
@@ -11506,7 +11626,8 @@ def run(root, quiet=False):
                      _expected_rules, _slope_reducer, _standin_codec, _standin_record_parts,
                      _standin_server, _respond_rules, _standin_count, _standin_idle_timeout,
                      _standin_driver,
-                     _standin_checks, _class_signatures, _datadog_codec, _datadog_counts, _datadog_server,
+                     _standin_checks, _class_signatures, _written_counts, _datadog_codec,
+                     _datadog_counts, _datadog_server,
                      _datadog_rules, _datadog_checks, _influx_codec, _influx_points,
                      _influx_server, _influx_rules, _influx_checks, _overlap_rules,
                      _overlap_driver, _overlap_checks, _idp_rules, _refresh_checks,
@@ -11523,7 +11644,7 @@ def run(root, quiet=False):
                               _two_sut_driver,
                               _rss_settle_rules, _expected_rules, _standin_codec, _standin_server,
                               _respond_rules, _standin_count, _standin_idle_timeout,
-                              _standin_driver, _datadog_codec,
+                              _standin_driver, _written_counts, _datadog_codec,
                               _datadog_server,
                               _datadog_rules, _influx_codec, _influx_server, _influx_rules,
                               _overlap_rules, _overlap_driver, _idp_rules, _signal_rules,

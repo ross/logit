@@ -1,6 +1,6 @@
 ---
 created: 2026-09-24
-updated: 2026-10-18
+updated: 2026-10-26
 ---
 
 # VictoriaMetrics interop: existing components, plus zstd on Prometheus remote-write
@@ -49,7 +49,7 @@ by the existing standard-protocol components:
 
 | Surface | Component and setting |
 |---|---|
-| VictoriaMetrics `/api/v1/write` (remote-write 1.0) | `prometheus_out` with `endpoint:` and `version: 1`. `version: 2` gets a `204` and is stored nowhere |
+| VictoriaMetrics `/api/v1/write` (remote-write 1.0) | `prometheus_out` with `endpoint:` and `version: 1`. `version: 2` gets a `204` with no written count and is stored nowhere, so the sink holds its queue ([ADR `prometheus-remote-write`](prometheus-remote-write.md), "Amendment: a 2.0 write is held to its written count") |
 | vmagent scraping `logit` | `prometheus_out` with `bind:` |
 | VictoriaMetrics `/api/v2/write` (InfluxDB line protocol) | `influxdb_out` |
 | VictoriaMetrics `-graphiteListenAddr` | `graphite_out`, plaintext, `tags: carbon` |
