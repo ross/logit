@@ -1094,8 +1094,8 @@ Recorded per workstream as each lands.
     `{k="v"}` text, and an `Array` as one PARAM per element, read back as an array of strings, or
     one string for a one-element array. A PARAM-VALUE's `"`, `\`, and `]` read back as written.
   - A `Bytes` attribute's PARAM-VALUE is its length, `<N bytes>`, uncounted
-    (`attributes/bytes_value`, `lost`), and an empty `Array` writes no PARAM, uncounted, which no
-    case reaches.
+    (`attributes/bytes_value`, `lost`), and an empty `Array` writes no PARAM, uncounted
+    (`attributes/sd_empty_array`, `lost`, from `tlog/w3`).
   - A key that isn't an SD-NAME is left off, counted `invalid_sd_name`, and every opt-in
     attribute of a log whose own `syslog.sd` holds the configured SD-ID is left off, counted
     `sd_id_collision`. Each reaches a row of its own, `attributes/sd_name_unsafe` and
@@ -1103,3 +1103,29 @@ Recorded per workstream as each lands.
     class.
   - A log's own `syslog.sd` elements are written beside the opt-in element
     (`attributes/syslog_sd`, `normalized`), and read back `exact` on a collision.
+- **The `datadog-logs` cases** (`tlog/w3`): hand-written `/api/v2/logs` bodies put every field
+  `datadog_in`'s log decoder reads in front of `datadog_out`, `otlp_out`, and `syslog_out`, the
+  last under all three of its configurations (`datadog-logs-to-syslog`, `-rfc3164`, and `-sd`).
+  Each behavior below is a cell in `mapping.yaml`, observed at its class; none is fixed.
+  - `datadog_out` writes a log's `container.id` as a `container_id:` entry appended to its
+    `ddtags`, and `datadog_in` lifts only `env:`, `version:`, and `service:` entries, so the id
+    reads back inside the `ddtags` string and no `container.id` does (`attributes/container_id`,
+    `normalized`). The class check's Datadog spelling models the rewrite
+    (`datadog::log_ddtags` in `classes.rs`). Where it appends an entry, the encoder also drops
+    the string's empty entries.
+  - A JSON `null` attribute reaches a row of its own, `attributes/null_value`: `exact` at
+    `datadog_out` and `otlp_out`, and under `structured_data:` an empty PARAM-VALUE that
+    `syslog_in` reads back as `""`, so null and the empty string meet there.
+  - Every `status` form `status_severity` knows maps to its band and stays verbatim as the
+    attribute `status`; an unknown one, `verbose`, stays as the attribute with no severity, and
+    `datadog_out` writes it back as it came, while `syslog_out` stamps PRI severity 6
+    (`log/severity_unset`).
+  - A log with 101 `ddtags` entries and one with 101 attributes leave `datadog_out` whole: the
+    logs route has no tag-count prefilter, which `docs/known-gaps/datadog.md` already lists as an
+    unverified intake answer.
+  - Three planned inputs aren't cases. A body element that isn't an object and a log with no
+    `message` are dropped by `datadog_in` itself, and `cases` refuses a wire file its decoder
+    drops any of, since a case is what the listener produces. A log past `datadog_out`'s 18-hour
+    window can't reach the stale filter, which the driver doesn't run (`transit/wire.rs`'s module
+    doc). And no `datadog-logs` case can put a `trace_id` attribute beside a log's `trace`,
+    since `datadog_in` sets no `trace`: that pair is an `otlp-logs` case's to reach.

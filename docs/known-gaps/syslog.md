@@ -59,7 +59,8 @@ Entry format and the other areas: [the known-gaps index](README.md).
 - **`syslog_out`'s `structured_data:` writes a `Bytes` attribute as its length, and an empty
   array as nothing, uncounted.** A PARAM-VALUE is text, so the encoder renders a `Bytes` value as
   `<N bytes>`, and an `Array` as one PARAM per element, which writes no PARAM for an empty one.
-  Neither moves a counter. A key that isn't an RFC 5424 SD-NAME, and every attribute of a log whose
+  Neither moves a counter. A null attribute, which `datadog_in` decodes from a JSON `null`, is an
+  empty PARAM-VALUE, read back as the empty string. A key that isn't an RFC 5424 SD-NAME, and every attribute of a log whose
   own `syslog.sd` already holds the configured SD-ID, are left off counted, under
   `logit.output.structured_data.omitted{reason=invalid_sd_name}` and `{reason=sd_id_collision}`.
   - **Consequence:** the receiver reads back `<N bytes>` in place of the bytes, and no PARAM for

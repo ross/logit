@@ -144,6 +144,9 @@ Entry format and the other areas: [the known-gaps index](README.md).
     Agent would add, and one that named only an inode carries no container at all.
   - **Workaround:** send DogStatsD through a local Agent with `statsd_out`, which writes `|c:` back
     in the form the Agent reads, or stamp the tags upstream with `set`.
+  - `datadog_in` doesn't read the tag back as `container.id`: a metric's arrives as the
+    attribute `container_id`, and a log's stays an entry of its `ddtags` string, so a log relayed
+    on to `otlp_out` or `syslog_out` carries no `container.id`.
 - **A relayed log keeps one value per service identity key.** `datadog_in` lifts a log's `ddtags`
   `env:`, `version:`, and `service:` entries onto one `deployment.environment.name`,
   `service.version`, and `service.name` each, the log's own `service` field first. A `service:`
