@@ -1,6 +1,6 @@
 ---
 created: 2026-09-02
-updated: 2026-10-25
+updated: 2026-10-28
 ---
 
 # Syslog egress: format, transport, and header-field precedence
@@ -373,3 +373,39 @@ A relay stays a fixed point: a canonical decimal PROCID decodes to `process.pid`
 to the same digits, and every other token keeps its attribute and its bytes. No permitted
 normalization is added. `otlp_out` and `splunk_hec_out` send `process.pid` as an integer attribute,
 and the Datadog log encoder treats it as an ordinary attribute.
+
+## Amendment: an RFC 3164 message always has a TAG (2026-10-28)
+
+Under `format: rfc3164`, `syslog_out` writes a TAG on every message. A log with no `syslog.tag`
+and no `app_name:` takes its TAG from, in order:
+
+1. a non-empty `service.name` on the event;
+2. a non-empty `service.name` on the batch resource;
+3. `logit`, the process name.
+
+The TAG is sanitized as a configured TAG is. The resource step matches HOSTNAME's and PROCID's
+lookups above, and it's where an OTLP sender puts `service.name`.
+
+RFC 3164 makes no header field certain, so a reader tells HOSTNAME from MSG only by the TAG after
+it. `syslog_in`'s header rule (`crates/logit-proto/src/syslog/mod.rs`'s "The RFC 3164 header")
+reads a HOSTNAME only before a TAG-shaped token, so a TAG-less `<PRI>TIMESTAMP HOSTNAME MSG` reads
+back with no `host.name` and the hostname as the first word of its message, and a message whose
+first word is TAG-shaped reads back with that word as `syslog.tag`. Before this amendment, a log
+with no `syslog.tag` and no `app_name:` had no TAG, and that misreading was the result at
+`syslog_in` and at any receiver with the same rule.
+
+Consequences:
+
+- **A new permitted normalization of the syslog pair.** A TAG-less RFC 3164 message relayed
+  through `syslog_in -> syslog_out` under `format: rfc3164` leaves with a TAG, and reads back
+  with `syslog.tag` and `host.name`. It joins the permitted normalizations in
+  `crates/logit-outputs/src/syslog.rs`'s module doc.
+- **A PID always has a TAG to ride in.** A `process.pid` or `syslog.pid` on a log with no
+  `syslog.tag` is written as `TAG[pid]` instead of being left off.
+- **RFC 5424 is unchanged.** Its APP-NAME is positional, so a message with none keeps the
+  NILVALUE `-`.
+- **`app_name:` still wins over `service.name`**, and `syslog.tag` over both, by the
+  header-field precedence above.
+
+The transit spec's row `log/header_in_message` becomes unreachable and goes
+([ADR `transit-spec`](transit-spec.md)'s "Amendment: sink fixes (2026-10-28)").
