@@ -1,6 +1,6 @@
 ---
 created: 2026-10-13
-updated: 2026-10-22
+updated: 2026-10-28
 ---
 
 # Telemetry loss vocabulary: any nonzero `*.dropped` is loss, and intended outcomes use other words
@@ -354,6 +354,39 @@ identical points raises no loss alarm. An equal increment or observation set sta
 two equal delta counts or Datadog rates are two events, and two sets of size 1 can hold different
 members. The exposition registry's overwrite between scrapes is the pull model working, not loss,
 and stays uncounted.
+
+## Amendment (2026-10-28): an ignored signal, and a format the config selects
+
+Two outcomes the 2026-10-21 three-group table didn't place are now settled, and neither moves a
+counter:
+
+| Outcome | Group | Counted as |
+|---|---|---|
+| a signal beside the ones a sink writes: a log beside metrics at `influxdb_out`, `prometheus_out`, `graphite_out`, or `statsd_out`; metrics or a span beside a log at `syslog_out`; a span beside a DogStatsD event at `statsd_out` | ignored signal, a fourth group | nothing |
+| a field with no slot in the format the sink's config selects: every attribute outside `syslog_out`'s header fields under `format: rfc3164`, and under `format: rfc5424` with no `structured_data:`; everything but the body under `kafka_out`'s `format: text` | Structural | nothing; the cell's reason is `structural` |
+
+- **A sink ignores a signal it has no wire for.** It writes the signals it carries and ignores
+  the rest, uncounted: a log has no form at a metrics sink, and metrics have none in a syslog
+  message. The count would track how many mixed events the pipeline makes, which is the
+  pipeline's shape, not loss. An event that produces nothing at the sink is still a record-level
+  outcome and counts `output.events.skipped{reason}`, as each sink does today.
+- **Counting the ignored piece is permitted, not required.** `kafka_out`'s `format: text`
+  counts `output.metrics.omitted{reason="format"}` and `output.spans.omitted{reason="format"}`
+  (this record's 2026-10-13 amendment) and keeps both. Another sink isn't held to it.
+- **A format the config selects defines the sink's slots.** A field with no slot in that format
+  is structural, as a field with no slot in a protocol is: every record at that sink, under that
+  configuration, loses it, so a counter would track the record count. The operator who wants the
+  field picks the format or option that has a slot for it. This extends the Structural group's
+  "a field the destination's format has no slot for" to a format a sink offers several of.
+- **A slot the config leaves unfilled isn't loss to count either.** `syslog_out` under RFC 5424
+  without `structured_data:` has a slot it doesn't write. The loss reads the same to an operator
+  as RFC 3164's, every attribute outside the header on every log, and a counter would say no
+  more than the config does.
+
+In the transit spec, the ignored-signal rule is the `log/beside_metrics` and `span`
+`UNCOUNTED_ALLOWED` entries, whose cells keep `reason: uncounted`, and the structural rule turns
+`syslog_out`'s attribute cells from `lost, uncounted` to `lost, structural`
+([ADR `transit-spec`](transit-spec.md)'s "Amendment: sink fixes (2026-10-28)").
 
 ## Migration record
 The classification of every `*.dropped`, `*.skipped`, `*.degraded`, `*.truncated`, and loss-related
