@@ -446,12 +446,19 @@ allowance follows the mechanism, not the value type. The
 #### Uncounted losses
 
 In W5, `UNCOUNTED_ALLOWED`'s `("log", None, None)` narrows to
-`("log", Some("beside_metrics"), None)`, the two `log/trace_beside_id_attribute` entries the
-`tlog/w5` finding adds, and the `syslog_out` entries above. Two of those carry
-the `structured_data:` encoder's own uncounted losses: a `Bytes` value written as its length, on
-the shared `bytes_value` entry, and an opted-in empty array, which writes one PARAM per element
-and so none, on `attributes/sd_empty_array`. Every other
-uncounted loss of a log field is a format with no slot, and reads `lost, reason: structural`:
+`("log", Some("beside_metrics"), None)` and the entries of three mechanisms that leave a log field
+off uncounted. First, `syslog_out` leaves every attribute outside its header fields off by one
+mechanism, so its entries follow that mechanism, not the value type: the value-type rows and the
+host and service-key rows (`host_beside_host_name`, `hostname`, `log_service`,
+`log_service_field`, `container_id`, `service_identity`, `service_tag`, and
+`service_tag_beside_key`). Second, the `structured_data:` encoder loses two things uncounted: a
+`Bytes` value, written as its length (`<N bytes>`), on the shared `bytes_value` entry, and an
+empty array, which writes one PARAM per element and so none, on its own
+`attributes/sd_empty_array` entry. Its other leave-offs, `sd_name_unsafe` and `sd_id_collision`,
+are counted. Third, at `datadog_out` and `splunk_hec_out` a `trace_id` or `span_id` attribute wins
+over the log's own trace, which is left off uncounted, on two `log/trace_beside_id_attribute`
+entries; both formats have a slot for the trace, so the loss isn't structural. Every other
+uncounted loss of a log field is a format with no slot and reads `lost, structural`:
 
 - Datadog: trace flags, event name, observed time, body format, and dropped-attribute count.
 - syslog: trace, trace flags, event name, observed time, body format, and dropped-attribute
@@ -1216,8 +1223,10 @@ Recorded per workstream as each lands.
     `otlp-logs` `trace` case) leaves `datadog_out` and `splunk_hec_out` with the attribute and
     without the trace, uncounted: each writes the trace only when neither attribute is present.
     The trace's ids and flags reach a row of their own there, `log/trace_beside_id_attribute`,
-    whose two `uncounted` cells take their own `UNCOUNTED_ALLOWED` entries, a deviation from the
-    narrowing above. `docs/known-gaps/datadog.md` and `splunk.md` have it.
+    whose two `uncounted` cells take their own `UNCOUNTED_ALLOWED` entries, the third mechanism
+    of "Uncounted losses" above and of ADR `transit-spec`'s decision 9. Both formats have a slot
+    for the trace, so the loss isn't `structural`. `docs/known-gaps/datadog.md` and `splunk.md`
+    have it.
   - `span/no_wire_form` is reached by a span field a Datadog span has no form for, which isn't
     `splunk_hec_out`'s set: an `ok` status alone reaches the row, and `splunk_hec_out` writes it,
     so a span carrying nothing else reads `exact` against its `degraded` cell. The

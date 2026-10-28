@@ -96,7 +96,9 @@ Entry format and the other areas: [the known-gaps index](README.md).
   the message `null`, and a `Bytes` attribute as base64 text. The trace and span ids arrive as the
   `trace_id` and `span_id` attributes, unless the log already has an attribute of either name:
   then the attribute is written, so a relayed Datadog log leaves as it arrived, and the log's own
-  ids are left off, uncounted (`log/trace_beside_id_attribute` in the transit spec).
+  ids are left off, uncounted (`log/trace_beside_id_attribute` in the transit spec). Revisit:
+  count the left-off trace as `logit.output.tags.omitted{reason="reserved_key"}`, the counter the
+  encoder already uses for an attribute that collides with a reserved key.
   - **Consequence:** an OTLP log relayed to Datadog, or back out of `datadog_in`, can't be
     rebuilt field for field.
   - **Revisit trigger:** an operator needs one of these fields in Datadog.

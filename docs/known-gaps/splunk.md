@@ -134,7 +134,9 @@ Entry format and the other areas: [the known-gaps index](README.md).
   `log/trace_unset` (`normalized`, `log_fields`). The other way, a log that has its own trace and
   a `trace_id` or `span_id` attribute leaves with the attribute only: the encoder writes the
   trace's ids only when neither attribute is present, and leaves them off uncounted
-  (`log/trace_beside_id_attribute`).
+  (`log/trace_beside_id_attribute`). Revisit: count the left-off trace as
+  `logit.output.tags.omitted{reason="reserved_key"}`, the counter this encoder already uses for an
+  attribute it leaves off for a reserved key.
   - **Consequence:** downstream of a `splunk_hec_out` to `splunk_hec_in` hop, such a log
     carries a trace or an event name and not the attribute: `otlp_out` writes it as the
     `LogRecord`'s `trace_id`, `span_id`, or `event_name`, and `syslog_out` leaves it off.

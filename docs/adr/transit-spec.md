@@ -271,17 +271,20 @@ have one case. The `tlog` stream fills that in, and settles these:
 8. **`syslog_out`'s drop of unopted attributes** is `lost, structural` under RFC 3164, where the
    wire has no slot, and `lost, uncounted` under RFC 5424 without `structured_data:`, where the
    slot exists and the loss is real. The missing counter is a sink finding.
-9. **`UNCOUNTED_ALLOWED` narrows** for logs to `log/beside_metrics` and `syslog_out`'s
-   attribute rows: the value-type rows and the host and service-key rows
-   (`host_beside_host_name`, `hostname`, `log_service`, `log_service_field`, `container_id`,
-   `service_identity`, `service_tag`, and `service_tag_beside_key`). `syslog_out` leaves every
-   attribute outside its header fields off by one mechanism, so the allowance follows that
-   mechanism, not the value type. A second mechanism, the `structured_data:` encoder's, loses two
+9. **`UNCOUNTED_ALLOWED` narrows** for logs to `log/beside_metrics` and the entries of three
+   mechanisms that leave a log field off uncounted. First, `syslog_out` leaves every attribute
+   outside its header fields off by one mechanism, so its entries follow that mechanism, not the
+   value type: the value-type rows and the host and service-key rows (`host_beside_host_name`,
+   `hostname`, `log_service`, `log_service_field`, `container_id`, `service_identity`,
+   `service_tag`, and `service_tag_beside_key`). Second, the `structured_data:` encoder loses two
    things uncounted: a `Bytes` value, written as its length (`<N bytes>`), on the shared
-   `bytes_value` entry, and an empty array, which writes one PARAM per element and so none, on
-   its own `attributes/sd_empty_array` entry. Its other leave-offs, `sd_name_unsafe` and
-   `sd_id_collision`, are counted. Every other uncounted loss of a log field is a format with no
-   slot and reads `lost, structural`. The `span` entry stays until spans are classified.
+   `bytes_value` entry, and an empty array, which writes one PARAM per element and so none, on its
+   own `attributes/sd_empty_array` entry. Its other leave-offs, `sd_name_unsafe` and
+   `sd_id_collision`, are counted. Third, at `datadog_out` and `splunk_hec_out` a `trace_id` or
+   `span_id` attribute wins over the log's own trace, which is left off uncounted, on two
+   `log/trace_beside_id_attribute` entries; both formats have a slot for the trace, so the loss
+   isn't structural. Every other uncounted loss of a log field is a format with no slot and reads
+   `lost, structural`. The `span` entry stays until spans are classified.
 10. **Log cases live in log-only directories** (`cases/otlp-logs/`, `cases/datadog-logs/`,
     `cases/syslog/`, `cases/splunk/`), so a log flow never routes a metric case into a sink with
     no metric cells. `decode_wire` picks a decoder by the directory name's prefix before `-`.

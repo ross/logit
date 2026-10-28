@@ -970,8 +970,9 @@ the operator-facing account of all of this.
   `graphite_in`, `syslog_in`, and `splunk_hec_in`; the columns are `statsd_out`,
   `prometheus_out`, `influxdb_out`, `otlp_out`, `datadog_out`, `graphite_out`, `syslog_out`,
   `splunk_hec_out`, and `kafka_out` (`format: json` and `text`, read back by a driver convention,
-  since there's no `kafka_in`), through 19 like-pair flows (statsd, InfluxDB, Prometheus, Datadog,
-  OTLP, Graphite, syslog, and Splunk) and 83 cross-protocol flows ([ADR `transit-spec`](docs/adr/transit-spec.md), [plan](docs/plans/transit-spec.md)).
+  since there's no `kafka_in`), through 23 like-pair flows (statsd, InfluxDB, Prometheus, Datadog,
+  OTLP, Graphite, syslog, and Splunk; 4 of them through an `aggregate`) and 79 cross-protocol
+  flows ([ADR `transit-spec`](docs/adr/transit-spec.md), [plan](docs/plans/transit-spec.md)).
 
 ### Not yet built
 
