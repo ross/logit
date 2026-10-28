@@ -316,7 +316,7 @@ header, and `UNCOUNTED_ALLOWED`'s doc each say:
 - `syslog` and `splunk_hec` lack a source and a column, OTLP logs lack a source, and Datadog logs
   have one case.
 
-Spans follow as their own stream, `tspan`, once logs land.
+Spans follow as their own stream, `tspan`, in §11.
 
 #### Rows
 
@@ -467,7 +467,7 @@ uncounted loss of a log field is a format with no slot and reads `lost, structur
 - Splunk: trace flags, observed time, body format, and dropped-attribute count.
 - `kafka_out`'s `format: text` writes only the body.
 
-The `span` entry stays for `tspan`.
+The `span` entry stays for `tspan`, which narrows it (§11, decision 12).
 
 §10 (`tsink`) closed all three mechanisms: `syslog_out`'s attribute leave-off reads
 `structural`, the `structured_data:` encoder writes a `Bytes` value as base64 and counts an
@@ -562,7 +562,7 @@ would reach it.
 
 - `lines_in` and parsed text logs, and `tail_in` and `docker_in`.
 - `kafka_out`'s `otlp_proto`, `otlp_json`, and `msgpack` formats.
-- Spans, which are `tspan`'s.
+- Spans, which are `tspan`'s (§11).
 - Fixes for the sink findings. Each is recorded under "Findings" as the code behaves and, where
   an operator sees it, in `docs/known-gaps/`, and a later stream fixes them.
 
@@ -602,7 +602,7 @@ the stream leaves alone.
    piece, as `kafka_out`'s `format: text` counts `metrics.omitted{reason="format"}` and
    `spans.omitted{reason="format"}`, but isn't required to. In `UNCOUNTED_ALLOWED` the rule is
    `("log", Some("beside_metrics"), None)` and the span rows, `("span", None, None)` until
-   `tspan` narrows it. `docs/known-gaps/statsd.md`'s "A span
+   `tspan` narrows it (§11, decision 12). `docs/known-gaps/statsd.md`'s "A span
    beside a DogStatsD event is left off uncounted" isn't open work under the rule, so it leaves
    `docs/known-gaps/`, and `statsd_out`'s module doc states the leave-off as the rule.
 2. **A format the config selects defines the sink's slots, and a field with no slot in it is
@@ -686,6 +686,293 @@ Each code PR:
   enforces.
 - Runs each new regression test once with its fix reverted to show it fails, and says so in the
   PR body.
+- Runs `script/check`, and `script/cibuild` before the PR opens.
+
+### 11. Spans
+
+Stream key **`tspan`**. Metric records and log records are classified; span records aren't, as
+`UNCOUNTED_ALLOWED`'s `("span", None, None)` entry, which matches every span row at every sink,
+shows:
+
+- The class check compares a span as one body, `Rec::core`, so a span whose status, flags,
+  events, or links change reads `degraded` in pass 3 with no row naming the change.
+- `span/no_wire_form` is keyed on Datadog's field set (`classes.rs`'s `datadog::otel_only`) and
+  reached at every sink. A span whose only such field is `status: ok` reads `exact` against
+  `splunk_hec_out`'s `degraded` cell, since `splunk_hec_out` writes the status (the `tlog/w5`
+  finding).
+- The driver bypasses `datadog_out`'s trace readiness gate, so `span/alone`'s `exact` cell at
+  `datadog_out` describes spans the running sink drops as `needs_agent_processing` or
+  `not_datadog_origin`.
+- `datadog_trace_out` has no column.
+- No wire source carries spans. Every span case is hand-written, in `cases/statsd/`,
+  `cases/statsd-logs/`, and `cases/splunk/span`.
+
+#### Decisions
+
+1. **Span fields are rows under `kind: span`** in the one table, with the cell schema, class
+   check, and renderer metrics and logs use. `KINDS`' `span` entry, today `alone`, `beside_log`,
+   `no_wire_form`, and `beside_metrics`, becomes the list below. Record-level rows take the five
+   record classes, and field rows take `exact`, `normalized`, or `lost`. A row is chosen from the
+   input alone, before pairing, so two groups of rows split by input value:
+   - `flags`, `trace_state`, and the `dropped_*` rows are reached only by a nonzero or present
+     value. Zero and absent are the wire defaults and read back `exact` at every sink.
+   - The `status_*` and `parent_*` rows split by value, because the sinks differ per value:
+     `status: error` has a Datadog form and `status: ok` doesn't.
+
+   | Feature | Level | What reaches it |
+   |---|---|---|
+   | `alone` | record | A span on an event with no metrics and no log. Every such span reaches it. |
+   | `not_datadog_origin` | record | A span whose trace chunk's root `trace_readiness` doesn't read as a Datadog span. A span reaches this row beside `alone`. `dropped` at `datadog_out`, and `exact`, nothing beyond `alone`, at every other span sink. |
+   | `needs_agent_processing` | record | A span whose trace chunk's root is a Datadog span without the Agent's `_top_level` mark. A span reaches this row beside `alone`. `dropped` at `datadog_out`, and `exact`, nothing beyond `alone`, at every other span sink. |
+   | `name` | field | A `Str` span name. |
+   | `name_structured` | field | A `Map`, `Array`, `Bytes`, or `Null` span name. |
+   | `trace_id` | field | The span's 128-bit trace id. |
+   | `parent_span_id` | field | A span with a parent span id. |
+   | `parent_unset` | field | A span with no parent. |
+   | `kind` | field | The span's kind. |
+   | `status_error` | field | `status: error`. |
+   | `status_ok` | field | `status: ok`. |
+   | `status_unset` | field | `status: unset`. |
+   | `status_message` | field | A status message. |
+   | `timestamp` | field | The span's start, `event.timestamp`. |
+   | `end_timestamp` | field | The span's end. |
+   | `end_before_start` | field | A span whose end is before its start. |
+   | `flags` | field | Nonzero span flags. |
+   | `trace_state` | field | A `trace_state`. |
+   | `dropped_attributes_count` | field | A nonzero dropped-attribute count on the span. |
+   | `dropped_events_count` | field | A nonzero dropped-event count. |
+   | `dropped_links_count` | field | A nonzero dropped-link count. |
+   | `events` | field | The span's events. |
+   | `event_nested_attribute` | field | A span event attribute holding a `Map`, an `Array`, or `Null`. |
+   | `event_name_structured` | field | A span event whose name isn't a `Str`. |
+   | `nested_bytes_attribute` | field | A `Bytes` attribute on a span event or link. |
+   | `nested_u64_attribute` | field | A `U64` attribute on a span event or link. |
+   | `nested_timestamp_attribute` | field | A `Timestamp` attribute on a span event or link. |
+   | `event_dropped_count` | field | A nonzero dropped-attribute count on a span event. |
+   | `links` | field | The span's links. |
+   | `link_flags` | field | Nonzero flags on a link. |
+   | `link_trace_state` | field | A link's `trace_state`. |
+   | `link_dropped_count` | field | A nonzero dropped-attribute count on a link. |
+   | `beside_log` | field | A span on an event that carries a log and no metrics: whether the sink carried it. |
+   | `beside_metrics` | field | A span on an event that carries metrics: whether the sink carried it. |
+
+   A span beside a log or metrics reaches the other field rows as a span alone does.
+2. **A span's identity is its ids**, and `name` is a field row, not the identity. "Identity"
+   below has the pairing and the `name` cells.
+3. **`span/no_wire_form` retires.** It was keyed on Datadog's field set and reached at every
+   sink. Its content becomes decision 1's field rows, each cell stating one sink's outcome:
+   - At `datadog_out` and `datadog_trace_out`, `status_ok`, `status_message`, `flags`,
+     `trace_state`, the three `dropped_*` rows, `event_dropped_count`, and `link_dropped_count`
+     are each `lost`, counted `logit.output.spans.degraded{reason=no_wire_form}` once per field.
+   - At `splunk_hec_out`, `flags`, `trace_state`, the three `dropped_*` rows, `link_flags`,
+     `event_dropped_count`, and `link_dropped_count` are `lost` with the same counter, counted
+     once per span by `has_unwritable_fields`. `status_message` and `link_trace_state` are
+     `exact` there.
+   - `otlp_out` and `kafka_out`'s `format: json` are `exact` on all of them.
+4. **Span timestamps get rows.** `span/timestamp` and `span/end_timestamp` are `exact` at every
+   span sink: Datadog's `duration` restores the end, and Splunk writes `start_time` and
+   `end_time` in nanoseconds. `span/end_before_start` is `lost` at the Datadog sinks, which clamp
+   a negative duration to zero, counted `logit.output.spans.degraded{reason=negative_duration}`,
+   and `exact` at `otlp_out`, `splunk_hec_out`, and `kafka_out`'s `format: json`, which carry it.
+5. **`span/beside_log` becomes a field row**, whether the sink carried the span, as
+   `log/beside_metrics` and `span/beside_metrics` are. It's `exact` at the span sinks; `lost`,
+   uncounted, at `syslog_out` and `statsd_out` (the ignored-signal rule); `lost`, counted
+   `logit.output.spans.omitted{reason=format}`, at `kafka_out`'s `format: text`; and `lost`,
+   counted `logit.output.events.skipped{reason=no_metrics}`, at the three metric sinks that skip
+   the event. Today's `kafka_out` `format: text` cell reads `skipped` though the log beside the
+   span is written; the field row ends that.
+6. **Per-source attribute rows for spans**, keyed by attribute name, where the span sinks treat
+   keys differently:
+   - `attributes/span_numeric`: an `I64`, `U64`, or `F64` event attribute of a span. Datadog
+     writes it to the span's `metrics`, which read back as `F64`: `normalized`, `span_metric`,
+     counted `int_as_f64` only when precision is lost. `exact` elsewhere.
+   - `attributes/datadog_span_identity`: `service.name`, `resource.name`, and `span.type`, a
+     Datadog span's typed fields as the decoder writes them, public attributes. `exact` at every
+     span sink.
+   - `attributes/datadog_span_marks`: `_top_level`, `_sampling_priority_v1`, `_dd.*`, and a
+     `span.kind` the decoder left, public attributes at every sink. `exact` everywhere, with text
+     saying the OTel sinks write Datadog's internals as span attributes (a finding).
+   - `attributes/datadog_carrier_span`: `_logit.datadog.chunk.*` and `_logit.datadog.span.error`
+     on the event. `exact` at `datadog_out`, at `datadog_trace_out` under `version: v0.7`, and at
+     `kafka_out`'s `format: json`; the chunk carriers are `lost`, counted
+     `logit.output.spans.degraded{reason=no_wire_form}`, under `version: v0.4`; `lost`,
+     `structural`, at the OTel sinks and `kafka_out`'s `format: text`. It mirrors
+     `attributes/datadog_carrier_log`.
+   - `attributes/datadog_tracer_resource`: the resource's `_logit.datadog.tracer.*` carriers a
+     `TracerPayload` field carries. With the two rows below, the cells split by key group:
+     - The tracer carriers are `exact` at `datadog_out` and at `datadog_trace_out` under
+       `version: v0.7`. Under `version: v0.4`, every tracer carrier a request header doesn't
+       restore is `lost`, counted `logit.output.spans.degraded{reason=no_wire_form}`
+       (`resource_carriers_lost` in `crates/logit-proto/src/datadog/traces.rs`).
+     - The Agent carriers, `_logit.datadog.agent.*`, have their own row,
+       `attributes/datadog_agent_resource`: `exact` only at `datadog_out`, and `lost`, counted the
+       same way, under both `datadog_trace_out` versions, since that sink encodes the tracer API's
+       forms only.
+     - `datadog_tracer_resource`, `datadog_agent_resource`, and `datadog_tracer_headers` are
+       `lost`, `structural`, at the OTel sinks.
+     - The tracer carriers only a request header carries (`resource_carriers_lost`'s
+       `header_only`) have their own row, `attributes/datadog_tracer_headers`, `lost`, counted
+       `no_wire_form`, at `datadog_out`, since an `AgentPayload` has no field for them. Its
+       `datadog_trace_out` cell is `exact` where that sink restores the request header.
+
+   Other span attributes reach the value-type rows. `attributes/span_kind` and
+   `attributes/trace_id_high`, derived at `datadog_out`, stay as they are.
+7. **`Spelling::derived` grows a `datadog_trace_out` entry**: `span_kind` and `trace_id_high`,
+   as `datadog_out` derives them, and, under `version: v0.4`, the resource's `host.name`,
+   environment, and version written into every span's `meta`. It has no `no_host` entry:
+   `datadog_trace_out` leaves `hostname` empty for the Agent to fill, as its module doc says.
+   `splunk_hec_out`'s span branch stays.
+8. **The driver applies `datadog_out`'s trace readiness gate.** It reaches the verdict the sink's
+   `plan` reads, through `logit_proto::datadog::trace_readiness`, and counts each dropped span as
+   `count_plan_drops` does. So `span/not_datadog_origin` and `span/needs_agent_processing` read
+   `dropped` at `datadog_out`, counted
+   `logit.output.records.dropped{route=traces,reason=not_datadog_origin}` and
+   `{route=traces,reason=needs_agent_processing}`. At every other span sink, `datadog_trace_out`
+   included, which has no gate, they read `exact`, nothing beyond `alone`. The
+   `otlp-traces-to-datadog` flow reaches the first and `ddtrace-to-datadog` the second. The
+   sink's stale filter, tag limit, and size cuts stay bypassed. In W1, `spec/transit/README.md`'s
+   list of drops the driver skips loses `needs_agent_processing` and `not_datadog_origin`, and
+   its sentence saying a span a real `datadog_out` would drop reaches its cells goes.
+
+   Under the gate, no OTLP- or Splunk-origin case reaches `datadog_out`'s `lost` cells:
+   `status_ok`, `status_message`, `flags`, `trace_state`, the `dropped_*` rows, and
+   `end_before_start`. So W2's `datadog-traces` cases include a hand-written `_top_level`-marked
+   span carrying each of those fields, as a span `logit` processed can, and W1 names those cells
+   as unobserved until W2.
+9. **Four span sources and one new column.** The sources are `otlp-traces`, `datadog-traces`
+   (the Agent's `AgentPayload`), `ddtrace` (a tracer's msgpack through `datadog_trace_in`), and
+   `splunk-traces`. The span columns are `otlp_out`, `datadog_out`, `splunk_hec_out`,
+   `kafka_out` under `format: json` and `text`, and the new `datadog_trace_out`:
+   - Its cells on every span and attribute row come as a `when: {version: v0.4}` and a
+     `when: {version: v0.7}` pair.
+   - The driver reads it back through a `pub fn decode_request(path, headers, body)` factored out
+     of `datadog_trace_in`'s `handle`, as `splunk_hec_in`'s was, on `/v0.4/traces` or
+     `/v0.7/traces` by version.
+   - It ignores a log or metrics beside a span it writes, uncounted: the ignored-signal rule,
+     settled. Its log and metric record-level cells read `skipped`, uncounted, where a span case
+     carries one (the `span/beside_log` and `span/beside_metrics` cases), under the rule's
+     `UNCOUNTED_ALLOWED` entries `("log", None, Some("datadog_trace_out"))` and the metric record
+     rows' `(…, None, Some("datadog_trace_out"))`, which stay.
+   - Separately, it counts no `logit.output.events.skipped` for a log-only or metrics-only event,
+     which produces nothing there. That's a finding; no span flow reaches it, since span cases
+     live in span-only directories.
+10. **Span cases live in span-only directories**, so a span flow never routes a metric or log
+    case into a sink with no cells for it. "Case directories" below lists them.
+11. **Sink defects are recorded as the code behaves and fixed in a later stream**, `tspan-sink`,
+    as `tsink` followed `tlog`. Each lands in "Findings" and, where an operator sees it, in
+    `docs/known-gaps/`. An uncounted one gets a narrow `UNCOUNTED_ALLOWED` entry that the fix
+    removes.
+12. **`UNCOUNTED_ALLOWED` narrows** from `("span", None, None)` to the ignored-signal entries
+    `("span", Some("beside_log"), None)`, `("span", Some("beside_metrics"), None)`, and decision
+    9's `datadog_trace_out` entries, which stay, plus decision 2's two finding entries,
+    `("span", Some("name_structured"), Some("otlp_out"))` and
+    `("span", Some("event_name_structured"), Some("otlp_out"))`, which `tspan-sink` removes. Every other
+    uncounted span loss is a format with no slot and reads `lost, structural`.
+13. **The sort key doesn't change.** `report.rs` already orders events by timestamp, then span
+    name.
+
+#### Identity
+
+A span pairs on `(trace_id`'s low 64 bits, `span_id)`. Every span sink carries both: Datadog
+writes the trace id's low half and restores the high half through `_dd.p.tid`, the existing
+derived row `attributes/trace_id_high`. Once a span pairs, `same_value` for it is `true`, and a
+`SPAN_FIELD_KEYS` list, every span body key but the ids, leaves `Rec::core`, so the field rows
+carry each difference in place of pass 3's whole-body `degraded`.
+
+`span/name` takes a `Str` name, `exact` everywhere. `span/name_structured` takes any other name:
+`normalized`, `stringified`, at the Datadog sinks and `splunk_hec_out`; `exact` at `kafka_out`'s
+`format: json`; and `lost`, uncounted, at `otlp_out`, which writes `""`. That cell is a finding,
+with the allowance `("span", Some("name_structured"), Some("otlp_out"))`. A span event's name
+follows the same rule on `span/event_name_structured`, with the allowance
+`("span", Some("event_name_structured"), Some("otlp_out"))`.
+
+#### Case directories
+
+Each source has its own directory and `features/<dir>.yaml`, and `decode_wire` keys on the
+directory name's prefix before `-`:
+
+- `cases/otlp-traces/` (prefix `otlp`): `testdata/interop/otlp/traces.json`, the Collector
+  `file` exporter's lines, whose signal comes from the top-level `resourceSpans` key, and
+  hand-written `/v1/traces` JSON bodies beside a `.headers` file.
+- `cases/datadog-traces/` (prefix `datadog`): the zstd `AgentPayload` capture,
+  `agent-api-v0-2-traces-000`, with a `/api/v0.2/traces` `.headers` file, and hand-written cases
+  as `format: json` event lines in the shape `datadog_in` decodes to.
+- `cases/ddtrace/` (a new `decode_wire` arm over `datadog_trace_in::decode_request`): the v0.4
+  and v0.5 captures, `tracer-v04-v0-4-traces-000` and `tracer-v0-5-traces-000`, and hand-written
+  v0.7 cases as event lines.
+- `cases/splunk-traces/` (prefix `splunk`): the `otel-services-collector-000` capture, and
+  `cases/splunk/span`, moved here.
+
+`cases/statsd/span-*` and `cases/statsd-logs/span-*` stay, reaching the metric and log sinks'
+span cells.
+
+#### The W1 framework
+
+W1 changes `crates/logit-cli/src/transit/`'s `mapping.rs`, `classes.rs`, `spec.rs`, and
+`wire.rs`, `spec/transit/mapping.yaml`, and the case and flow files. W2 adds the
+`datadog_trace_out` arms in `wire.rs`, `crates/logit-cli/src/pipeline.rs`, and `docs.rs`:
+
+- **`mapping.rs`**: `KINDS`' `span` features as decision 1 lists them, a `SPAN_FIELDS` const,
+  `is_field_row` accepting a `span` row whose feature is in `SPAN_FIELDS`, and the module-doc
+  table to match. `UNCOUNTED_ALLOWED` and its doc change in W4, with decision 12's narrowing.
+- **`classes.rs`**:
+  - `SPAN_FIELD_KEYS`, stripped from `Rec::core` for a span, and pairing on the ids, as
+    "Identity" describes.
+  - `Field::SpanBody`, a span body field compared as `Field::LogBody` compares a log's, and
+    `Field::SpanUnset`, `exact` when the read-back is also absent and `normalized` otherwise.
+  - A `field_rows` branch for every span, beside a log or metrics or not, and closures keyed by
+    attribute name for decision 6's rows.
+  - The record features: `alone`, and beside it a readiness row from `trace_readiness`'s
+    verdict, as a span reached `alone` and `no_wire_form`. `datadog::otel_only` and
+    `no_wire_form` go, and `beside_log` moves to the field rows.
+- **`spec.rs`**: an `otlp` wire file with no `.headers` picks `resourceSpans` from its top-level
+  key. W3 adds the `ddtrace` arm.
+- **`wire.rs` and `pipeline.rs`**: W1 applies the readiness gate in the `datadog_out` arm
+  (decision 8), and updates the module doc's account of what the arm bypasses and
+  `spec/transit/README.md`'s. W2 adds
+  `SinkEncoder::DatadogTrace { encoder, version }` and `Spelling::DatadogTrace { version }`, and
+  reads the column back through `datadog_trace_in::decode_request`.
+- **`docs.rs`**: W2 adds a `PROTOCOLS` entry, a `doc:` region in
+  `crates/logit-outputs/src/datadog_trace.rs`, and a `gaps:` region in
+  `docs/known-gaps/mappings.md`.
+
+W1's class-check changes get unit tests in `classes.rs`'s `mod tests`: a span whose status,
+flags, or events differ lands on its row, two spans pair by ids whatever their names, a
+structured name reaches `name_structured`, and a span the gate drops reads `dropped`. Each is run
+once with its change reverted to show it fails. W1's PR names `datadog_out`'s `lost` cells
+that decision 8 leaves unobserved until W2.
+
+#### Not in this stream
+
+- `trace_context`'s `span:` lifting, a transform rather than a wire pair, as `lines_in` was for
+  logs.
+- `datadog_out`'s stale filter, tag limit, and size cuts, which the driver still bypasses.
+- `kafka_out`'s `otlp_proto`, `otlp_json`, and `msgpack` formats.
+- Fixes for the sink findings, which are `tspan-sink`'s (decision 11).
+
+#### Workstreams
+
+The stack is W1 ← W2 ← W3 ← W4: each PR targets its parent and retargets to `main` when the
+parent merges.
+
+| # | Branch | Scope | Size |
+|---|---|---|---|
+| W0 | `tspan/w0` | This section and [ADR `transit-spec`](../adr/transit-spec.md)'s span-records amendment. ADR `telemetry-loss-vocabulary` needs no amendment: its 2026-10-28 amendment covers the ignored signal and the structural cells | S |
+| W1 | `tspan/w1` | The framework above, and the `otlp-traces` source: `traces.json` and hand-written cases covering every kind and status, a status message, `trace_state`, flags, dropped counts, events with nested attributes, links with flags, `trace_state`, and dropped counts, a structured name, an end before its start, a 128-bit trace id, an unset parent, `u64` attributes, and a span beside a log and beside metrics. Flows `otlp-traces-relay`, `otlp-traces-to-datadog`, `otlp-traces-to-splunk`, `otlp-traces-to-kafka`, and `otlp-traces-to-kafka-text`; `otlp_out`, `datadog_out`, `splunk_hec_out`, and `kafka_out` cells on every new row; the `statsd`, `statsd-logs`, and `splunk` span cases reclassified; `spec/transit/README.md`'s bypass list without the two readiness drops | L |
+| W2 | `tspan/w2` | The `datadog_trace_out` column, with no `no_host` derivation and the Agent carriers lost under both versions: `datadog_trace_in::decode_request`, the encoder arm and spelling, its `doc:` and `gaps:` regions, and a `PROTOCOLS` entry. The `datadog-traces` source: the `AgentPayload` capture, and hand-written spans with and without the `_top_level` mark, a `_top_level`-marked span carrying `status: ok`, a status message, `trace_state`, flags, every dropped count, and an end before its start, so `datadog_out`'s `lost` cells are observed, chunk carriers, `meta_struct`, a `_logit.datadog.span.error` other than 1, and the environment and version lift. Flows `datadog-traces-relay`, `datadog-traces-to-otlp`, `datadog-traces-to-datadog-trace`, `datadog-traces-to-datadog-trace-v07`, `datadog-traces-to-splunk`, `datadog-traces-to-kafka`, `datadog-traces-to-kafka-text`, `otlp-traces-to-datadog-trace`, and `otlp-traces-to-datadog-trace-v07`. An entry in `docs/known-gaps/datadog.md` for `datadog_trace_out` counting nothing for a log-only or metrics-only event, the one finding no cell states | L |
+| W3 | `tspan/w3` | The `ddtrace` source: the `decode_wire` arm, the v0.4 and v0.5 captures, the request-header carriers, and hand-written v0.7 cases. Flows `ddtrace-relay` (v0.4), `ddtrace-relay-v07`, `ddtrace-to-datadog` (`needs_agent_processing`), `ddtrace-to-otlp`, `ddtrace-to-splunk`, and `ddtrace-to-kafka` | M |
+| W4 | `tspan/w4` | The `splunk-traces` source: the capture, the moved `span` case, and hand-written cases (a zero parent id, an unknown member read back as a log counted `malformed_span`, events and links). Flows `splunk-traces-relay`, `splunk-traces-to-otlp`, `splunk-traces-to-datadog`, `splunk-traces-to-datadog-trace`, `splunk-traces-to-kafka`, and `splunk-traces-to-kafka-text`. A coverage sweep to no unreached span cell; the `UNCOUNTED_ALLOWED` narrowing; `docs/known-gaps/mappings.md`'s hand-written span rows reconciled with the generated regions; `docs/known-gaps/datadog.md`'s prose; `spec/transit/README.md`'s source and sink lists, `transit/mod.rs`, `features/otlp.yaml`'s header, and `AGENTS.md` | M |
+
+#### Verification
+
+Each code PR:
+
+- Runs `script/transit gen`, then `script/transit check`, green.
+- Observes every moved or new `normalized` or `lost` cell at its class in some flow, or names the
+  missing case, as W1 does for `datadog_out`'s `lost` cells W2's marked span reaches.
+- Runs each new class-check unit test once with its change reverted to show it fails, and says
+  so in the PR body.
+- Quotes `coverage.md`'s unreached cells for the new column in the PR body.
 - Runs `script/check`, and `script/cibuild` before the PR opens.
 
 ## Workstreams
@@ -1362,8 +1649,8 @@ Recorded per workstream as each lands.
   - `span/no_wire_form` is reached by a span field a Datadog span has no form for, which isn't
     `splunk_hec_out`'s set: an `ok` status alone reaches the row, and `splunk_hec_out` writes it,
     so a span carrying nothing else reads `exact` against its `degraded` cell. The
-    `statsd-logs` `span-only` case carries a `trace_state` so both sinks lose a field; spans
-    (`tspan`) need the row split by sink.
+    `statsd-logs` `span-only` case carries a `trace_state` so both sinks lose a field. §11
+    retires the row for per-field rows with a cell per sink (decision 3).
   - The cells still unreached at the log sinks, each with no case that can reach it: the metric
     flags' attribute rows (`timestamped`, `rate`, `interval`, `family_type`, and their per-kind
     rows), which only a metric decoder sets; `private_carrier` at `syslog_out`,
@@ -1411,7 +1698,7 @@ Recorded per workstream as each lands.
     states the rule in place of a list of mechanisms. `("log", Some("beside_metrics"), None)` and
     `("span", None, None)` are ADR `telemetry-loss-vocabulary`'s 2026-10-28 amendment: a sink
     ignores a signal it has no wire for, uncounted, at any sink. The span entry stays wide until
-    `tspan` gives spans sources of their own. `("attributes", Some("datadog_carrier_log"),
+    §11 narrows it (decision 12). `("attributes", Some("datadog_carrier_log"),
     Some("datadog_out"))` is the one outside the rule: a `_logit.datadog.*` carrier the log,
     event, and service-check routes have no field for, left off where the metrics routes count
     one, which predates `tlog` (decision 9). `spec/transit/README.md` and `mapping.yaml`'s header
@@ -1425,3 +1712,80 @@ Recorded per workstream as each lands.
     decided limits, each recorded where it was settled; two of them keep an entry with a revisit
     trigger in `docs/known-gaps/datadog.md`: the 101-tag log at `datadog_out`, and the
     `_logit.otel.severity_*` carriers `datadog_out` leaves off.
+- **Spans, from the survey** (`tspan/w0`): reading the span sinks for §11 found these behaviors,
+  each recorded as the code behaves. None is fixed in this stream: W1 to W4 give each but the
+  first a cell, and an operator-visible one an entry in `docs/known-gaps/`, and the later
+  `tspan-sink` stream fixes them (§11, decision 11).
+  - `datadog_trace_out` counts no `logit.output.events.skipped` for a log-only or metrics-only
+    event, which produces nothing there. A log or metrics beside a span it writes is the
+    ignored-signal rule, not a finding. No span flow reaches it (§11, decision 9), so it's the
+    one `tspan` finding with no cell; W2 records it in `docs/known-gaps/datadog.md` for
+    `tspan-sink` to close.
+  - `otlp_out` writes a span or span-event name that isn't a `Str` as `""`, uncounted, and clamps
+    a negative absolute time to 0, uncounted.
+  - `otlp_out`'s `u64_as_double` count skips span-event and link attributes.
+  - Datadog writes a link attribute as text (`I64` 42 as `"42"`), and counts only a structured
+    value, as `json_text`.
+  - `splunk_hec_out` writes a present, all-zero parent or link id as zero hex. `splunk_hec_in`
+    rejects a zero id, so the span reads back as a log, counted `malformed_span`. An absent parent
+    round-trips as `""`.
+  - `splunk_hec_in` turns a span with any member it doesn't know, such as a future `trace_state`
+    or `flags`, into a log. `docs/known-gaps/mappings.md`'s hand-written `decode (Splunk)` row
+    for `malformed_span` understates it.
+  - `collectd_out` skips a span with no telemetry: its encoder tallies `skipped_no_metrics`, but
+    the sink reports no counter for it, though `docs/known-gaps/mappings.md`'s hand-written
+    collectd notification row says such an event is counted.
+  - `otlp_out` and `splunk_hec_out` write Datadog's internals (`_top_level`,
+    `_sampling_priority_v1`, `_dd.*`) as public span attributes, and `datadog_in` leaves both a
+    span's `kind` and a `span.kind` attribute.
+  - `datadog_out` merges the resource into every span's `meta` and loses the scope, uncounted.
+  - Three stale statements: `mapping.rs`'s `UNCOUNTED_ALLOWED` doc keeps the span entry "until
+    spans have sources of their own"; `docs/known-gaps/datadog.md`'s entry on
+    `datadog_trace_in` doing none of the Agent's processing says its spans are skipped at
+    `datadog_out`, where the counter is `logit.output.records.dropped`; and its entry on numeric
+    span attributes ascribes writing them to `metrics` to `datadog_trace_out` alone, where
+    `datadog_out` does it too.
+- **Spans, from the cases** (`tspan/w1` to `tspan/w4`): each is recorded as the code behaves, with
+  a cell, and an uncounted one with a narrow `UNCOUNTED_ALLOWED` entry, for `tspan-sink` to fix
+  (§11, decision 11).
+  - `otlp_out` writes a span name or a span event name that isn't a `Str` as `""`, uncounted
+    (`span/name_structured`, `span/event_name_structured`, the two finding entries).
+  - `otlp_out` clamps a negative span start, end, or span event time to 0, uncounted
+    (`crates/logit-proto/src/otlp/traces.rs` writes `timestamp.max(0) as u64`). No case holds a
+    time before 1970, so no cell states it; `docs/known-gaps/otlp.md` has the entry, and
+    `tspan-sink` decides whether to count or refuse it.
+  - `otlp_out`'s `u64_as_double` count covers resource, scope, and event attributes and skips a
+    span event's and a link's, so a `U64` above `i64::MAX` there leaves as a double, uncounted
+    (`span/nested_u64_attribute`).
+  - Datadog writes a link attribute as text: an `I64` 42 as `"42"`, a `U64` as its decimal text,
+    and counts only a structured value, as `json_text`. `DatadogTraceEncoder::text`'s doc says a
+    `Bytes` leaves as base64; the code writes it as lossy UTF-8.
+  - `datadog_out` writes a `Null` span or span event attribute as the string `"null"` in `meta`,
+    counted `json_text`; the `null_value` cell's text, which named only a log's JSON null, now
+    says so.
+  - `collectd_out` skips a span, or a log with no `_logit.collectd.severity`, with no telemetry:
+    its encoder tallies `EncodeStats::skipped_no_metrics`, which the sink discards. collectd has no
+    span column, so no cell states it; `docs/known-gaps/mappings.md`'s collectd notification row
+    now does.
+  - `datadog_out`'s trace route leaves a span's `_logit.datadog.*` carrier outside the chunk,
+    span, tracer, and Agent carriers off uncounted, as its log, event, and service-check routes
+    do, where its metrics routes count one as `no_wire_form`. The class check sends such a span
+    carrier to `attributes/datadog_carrier_log` with the others, so the existing entry covers it
+    (`cases/datadog-traces/carrier`). `tspan-sink` counts it `no_wire_form` as the metrics routes
+    do, after which the `("attributes", Some("datadog_carrier_log"), Some("datadog_out"))` entry
+    narrows back to logs.
+  - `otlp_out` writes a Datadog-origin link's flags unmasked, so bit 31, which dd-trace sets on
+    every link and OTLP reserves in `SpanLink.flags`, goes out on the wire. `otlp_in` reads it back
+    unchanged, so the cell reads `exact`; `tspan-sink` decides whether to mask to OTLP's defined
+    bits.
+  - `splunk_hec_out` writes a present, all-zero parent or link id as zero hex, and
+    `splunk_hec_in` reads a span object with one, or with any member the exporter's span object
+    doesn't have, as a log counted `malformed_span`. That's a decode-side outcome, so it has no
+    sink cell: `cases/splunk/span-malformed` holds the three forms as the logs they decode to, and
+    `docs/known-gaps/splunk.md` has the entry.
+  - Coverage: the `splunk-traces` source and three sweep cases (`cases/statsd/span-unmarked` and
+    `cases/statsd-logs/span-unmarked` for `span/needs_agent_processing` at the metric sinks and
+    `syslog_out`, and `cases/statsd/span-beside-log` for `span/beside_log` at the metric sinks)
+    leave no `span/*` cell unreached. `attributes/span_kind` and `attributes/trace_id_high` at
+    `syslog_out` stay unreached: `syslog_out` writes no span, so no span is compared there for the
+    attributes `datadog_out` derives from one.

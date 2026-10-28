@@ -1,0 +1,129 @@
+{
+ "resourceSpans": [
+  {
+   "resource": {
+    "attributes": [
+     {
+      "key": "service.name",
+      "value": {
+       "stringValue": "checkout"
+      }
+     },
+     {
+      "key": "host.name",
+      "value": {
+       "stringValue": "web-1"
+      }
+     },
+     {
+      "key": "deployment.environment.name",
+      "value": {
+       "stringValue": "prod"
+      }
+     }
+    ]
+   },
+   "scopeSpans": [
+    {
+     "scope": {
+      "name": "checkout.tracer",
+      "version": "1.0.0",
+      "attributes": [
+       {
+        "key": "library.language",
+        "value": {
+         "stringValue": "go"
+        }
+       }
+      ]
+     },
+     "spans": [
+      {
+       "traceId": "4bf92f3577b34da6a3ce929d0e0e4703",
+       "spanId": "00f067aa0ba90203",
+       "name": "attributes",
+       "kind": 1,
+       "startTimeUnixNano": "1800000005000000000",
+       "endTimeUnixNano": "1800000005003000000",
+       "attributes": [
+        {
+         "key": "app.string",
+         "value": {
+          "stringValue": "checkout"
+         }
+        },
+        {
+         "key": "app.int",
+         "value": {
+          "intValue": "-42"
+         }
+        },
+        {
+         "key": "app.double",
+         "value": {
+          "doubleValue": 2.5
+         }
+        },
+        {
+         "key": "app.bool",
+         "value": {
+          "boolValue": true
+         }
+        },
+        {
+         "key": "app.bytes",
+         "value": {
+          "bytesValue": "3q2+7w=="
+         }
+        },
+        {
+         "key": "app.array",
+         "value": {
+          "arrayValue": {
+           "values": [
+            {
+             "stringValue": "a"
+            },
+            {
+             "intValue": "1"
+            }
+           ]
+          }
+         }
+        },
+        {
+         "key": "app.map",
+         "value": {
+          "kvlistValue": {
+           "values": [
+            {
+             "key": "region",
+             "value": {
+              "stringValue": "eu-west-1"
+             }
+            },
+            {
+             "key": "zone",
+             "value": {
+              "intValue": "3"
+             }
+            }
+           ]
+          }
+         }
+        },
+        {
+         "key": "_logit.app.private",
+         "value": {
+          "stringValue": "private"
+         }
+        }
+       ]
+      }
+     ]
+    }
+   ],
+   "schemaUrl": "https://opentelemetry.io/schemas/1.40.0"
+  }
+ ]
+}

@@ -1,0 +1,42 @@
+# The dd-trace tracer API features a case under cases/ddtrace/ can exercise, from
+# crates/logit-inputs/src/datadog_trace.rs's module doc and crates/logit-proto/src/datadog/'s
+# traces.rs and traces_msgpack.rs. A case names the ones it exercises in its `.meta.yaml`. The
+# recorded captures are v0.4 and v0.5 requests; a v0.7 `TracerPayload`'s chunk and payload
+# fields, and the span fields no capture carries, are written as event JSON lines in the shape
+# datadog_trace_in decodes to.
+- name: v04_traces
+  text: A `/v0.4/traces` msgpack body, an array of traces each an array of span maps.
+- name: v05_traces
+  text: A `/v0.5/traces` msgpack body, a string dictionary and traces of positional span arrays.
+- name: v07_payload
+  text: A `/v0.7/traces` `TracerPayload`, its fields as `_logit.datadog.tracer.*` resource attributes.
+- name: tracer_headers
+  text: >-
+    A tracer's request headers (`Datadog-Meta-*`, `Datadog-Entity-ID`, `Datadog-External-Env`,
+    `Datadog-Client-Computed-*`) as `_logit.datadog.tracer.*` resource attributes.
+- name: container_id
+  text: A `Datadog-Container-ID` header or a payload's `container_id`, as the resource's `container.id`.
+- name: unmarked_root
+  text: A trace whose root has no Agent `_top_level` mark, as every tracer sends it.
+- name: span_identity
+  text: A span's `service`, `resource`, and `type`, decoded as `service.name`, `resource.name`, and `span.type`.
+- name: span_marks
+  text: A span's `_dd.*`, `_sampling_priority_v1`, and `span.kind` meta and metrics entries.
+- name: span_error_status
+  text: A span with `error` 1, decoded as an error status.
+- name: span_error
+  text: A span whose `error` is neither 0 nor 1, kept as `_logit.datadog.span.error`.
+- name: chunk_carriers
+  text: A v0.7 trace chunk's `priority`, `origin`, `droppedTrace`, and `tags`, as `_logit.datadog.chunk.*`.
+- name: trace_id_128
+  text: A 128-bit trace id, its high 64 bits in the `_dd.p.tid` meta entry.
+- name: meta_struct
+  text: A span's `meta_struct` entry, decoded as a `Bytes` attribute.
+- name: span_links
+  text: A span's `span_links`, each with a trace id, a span id, attributes, flags, and a `tracestate`.
+- name: span_events
+  text: A span's `span_events`, each with a time, a name, and typed attributes.
+- name: env_version
+  text: A span's `env` and `version` meta entries, decoded as `deployment.environment.name` and `service.version`.
+- name: parent_span_id
+  text: A span with a `parent_id`.

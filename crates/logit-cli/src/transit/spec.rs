@@ -352,6 +352,15 @@ impl Headers {
         self.0.iter().find(|(n, _)| n == name).map(|(_, v)| v.as_str())
     }
 
+    /// Every header but the recorded request line's `method:` and `path:`, as a request carries
+    /// them.
+    fn request_headers(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.0
+            .iter()
+            .filter(|(name, _)| name != "method" && name != "path")
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+    }
+
     /// The first value of query parameter `key` in `path:`, `None` when absent or empty, as
     /// `influxdb_in` reads it. The cases' query strings hold no percent-escapes, so none is
     /// decoded.
@@ -386,6 +395,11 @@ const SCRAPE_INSTANCE: &str = "transit:9100";
 /// - `datadog`: one request body through `datadog_in`'s own `decode_request`, which picks the
 ///   route from `path:`, the body form from `content-type:`, and the decompression from
 ///   `content-encoding:`, as the listener does.
+/// - `ddtrace`: one tracer request body through `datadog_trace_in`'s own `decode_request`, which
+///   picks the payload version from `path:` (`/v0.4/traces`, `/v0.5/traces`, or `/v0.7/traces`)
+///   and fills the resource from the tracer's request headers (`Datadog-Meta-*`,
+///   `Datadog-Container-ID`, `Datadog-Client-Computed-*`, and the rest), so every header in the
+///   `.headers` file but `method:` and `path:` goes with the body.
 /// - `otlp`: one request body through `otlp_in`'s own `decode_request`, which picks the signal
 ///   from `path:`, the body encoding from `content-type:` (protobuf when absent), and the
 ///   decompression from `content-encoding:`, as the listener does. A wire file with no `.headers`
@@ -491,6 +505,29 @@ fn decode_wire(
                 decoder,
             )
             .map_err(|err| anyhow::anyhow!("datadog_in refused the request: {err}"))?
+        }
+        "ddtrace" => {
+            let telemetry = probe.telemetry(id, "datadog_trace_in", "listener");
+            let diag = Diagnostics::new(id).with_telemetry(telemetry.clone());
+            let path = headers.get("path").context("the .headers names no path:")?;
+            let mut request = http::HeaderMap::new();
+            for (name, value) in headers.request_headers() {
+                request.append(
+                    http::HeaderName::from_bytes(name.as_bytes())?,
+                    http::HeaderValue::from_str(value)?,
+                );
+            }
+            let decoder =
+                DatadogDecoder::new().with_telemetry(telemetry).with_diagnostics(diag.clone());
+            logit_inputs::datadog_trace::decode_request(
+                path,
+                &request,
+                Bytes::from(bytes),
+                RECEIVED_AT,
+                decoder,
+                &diag,
+            )
+            .map_err(|err| anyhow::anyhow!("datadog_trace_in refused the request: {err}"))?
         }
         "otlp" => {
             let telemetry = probe.telemetry(id, "otlp_in", "listener");
@@ -1197,12 +1234,26 @@ flow_tests! {
     datadog_logs_to_syslog_rfc3164 => "datadog-logs-to-syslog-rfc3164",
     datadog_logs_to_syslog_sd => "datadog-logs-to-syslog-sd",
     datadog_relay => "datadog-relay",
+    datadog_traces_relay => "datadog-traces-relay",
+    datadog_traces_to_datadog_trace => "datadog-traces-to-datadog-trace",
+    datadog_traces_to_datadog_trace_v07 => "datadog-traces-to-datadog-trace-v07",
+    datadog_traces_to_kafka => "datadog-traces-to-kafka",
+    datadog_traces_to_kafka_text => "datadog-traces-to-kafka-text",
+    datadog_traces_to_otlp => "datadog-traces-to-otlp",
+    datadog_traces_to_splunk => "datadog-traces-to-splunk",
     datadog_to_influxdb => "datadog-to-influxdb",
     datadog_to_otlp => "datadog-to-otlp",
     datadog_to_prometheus_remote_write => "datadog-to-prometheus-remote-write",
     datadog_to_prometheus => "datadog-to-prometheus",
     datadog_to_statsd => "datadog-to-statsd",
     datadog_to_graphite => "datadog-to-graphite",
+    ddtrace_relay => "ddtrace-relay",
+    ddtrace_relay_v07 => "ddtrace-relay-v07",
+    ddtrace_to_datadog => "ddtrace-to-datadog",
+    ddtrace_to_kafka => "ddtrace-to-kafka",
+    ddtrace_to_kafka_text => "ddtrace-to-kafka-text",
+    ddtrace_to_otlp => "ddtrace-to-otlp",
+    ddtrace_to_splunk => "ddtrace-to-splunk",
     graphite_to_datadog => "graphite-to-datadog",
     graphite_to_influxdb => "graphite-to-influxdb",
     graphite_to_otlp => "graphite-to-otlp",
@@ -1229,6 +1280,13 @@ flow_tests! {
     otlp_logs_to_syslog => "otlp-logs-to-syslog",
     otlp_logs_to_syslog_rfc3164 => "otlp-logs-to-syslog-rfc3164",
     otlp_logs_to_syslog_sd => "otlp-logs-to-syslog-sd",
+    otlp_traces_relay => "otlp-traces-relay",
+    otlp_traces_to_datadog => "otlp-traces-to-datadog",
+    otlp_traces_to_datadog_trace => "otlp-traces-to-datadog-trace",
+    otlp_traces_to_datadog_trace_v07 => "otlp-traces-to-datadog-trace-v07",
+    otlp_traces_to_kafka => "otlp-traces-to-kafka",
+    otlp_traces_to_kafka_text => "otlp-traces-to-kafka-text",
+    otlp_traces_to_splunk => "otlp-traces-to-splunk",
     otlp_relay => "otlp-relay",
     otlp_to_datadog => "otlp-to-datadog",
     otlp_to_datadog_counters => "otlp-to-datadog-counters",
@@ -1274,6 +1332,12 @@ flow_tests! {
     splunk_to_kafka_text => "splunk-to-kafka-text",
     splunk_to_otlp => "splunk-to-otlp",
     splunk_to_syslog => "splunk-to-syslog",
+    splunk_traces_relay => "splunk-traces-relay",
+    splunk_traces_to_datadog => "splunk-traces-to-datadog",
+    splunk_traces_to_datadog_trace => "splunk-traces-to-datadog-trace",
+    splunk_traces_to_kafka => "splunk-traces-to-kafka",
+    splunk_traces_to_kafka_text => "splunk-traces-to-kafka-text",
+    splunk_traces_to_otlp => "splunk-traces-to-otlp",
     syslog_relay => "syslog-relay",
     syslog_relay_rfc3164 => "syslog-relay-rfc3164",
     syslog_relay_sd => "syslog-relay-sd",
@@ -1297,6 +1361,61 @@ mod tests {
             .find(|c| c.name == "counter")
             .expect("the counter case");
         (flow, case)
+    }
+
+    /// A `ddtrace` wire file decodes through `datadog_trace_in`'s request decoding with its
+    /// `.headers` file's tracer headers: the v0.4 capture's one Flask request is 10 spans
+    /// (`testdata/interop/datadog/README.md`), each under a resource the `Datadog-Meta-*` and
+    /// `Datadog-Client-Computed-*` headers filled.
+    #[test]
+    fn a_ddtrace_capture_decodes_with_its_tracer_headers() {
+        let capture = spec_dir().join("../../testdata/interop/datadog/tracer-v04-v0-4-traces-000");
+        let bytes = std::fs::read(capture.with_extension("bin")).expect("the capture");
+        let headers = std::fs::read_to_string(capture.with_extension("headers")).expect("headers");
+        let headers = Headers::parse(&headers);
+        let text = decode_wire(
+            "ddtrace",
+            bytes,
+            &headers,
+            None,
+            CarbonWire::Plaintext,
+            SyslogFraming::Datagram,
+        )
+        .expect("datadog_trace_in decodes the capture");
+        let events: Vec<Value> =
+            text.lines().map(|line| serde_json::from_str(line).expect("an event line")).collect();
+        assert_eq!(events.len(), 10);
+        for event in &events {
+            assert!(event["span"].is_object(), "{event}");
+            let resource = &event["resource"]["attributes"];
+            assert_eq!(resource["_logit.datadog.tracer.language_name"], "python");
+            assert_eq!(resource["_logit.datadog.tracer.tracer_version"], "4.15.2");
+            assert_eq!(resource["_logit.datadog.tracer.client_computed_stats"], true);
+        }
+    }
+
+    /// `datadog_trace_out`'s cells split on `version:` as the sink's config serializes it: a
+    /// `when: {version: v0.4}` cell applies under the default and not under `version: v0.7`.
+    #[test]
+    fn datadog_trace_cells_split_on_the_sinks_version() {
+        let spec = spec_dir();
+        let table = mapping::load(&spec.join("mapping.yaml")).expect("the table");
+        let case = system_cases(&spec, "datadog-traces")
+            .expect("datadog-traces cases")
+            .into_iter()
+            .find(|c| c.name == "marked")
+            .expect("the marked case");
+        let index = |name: &str| {
+            let flow = flow(&spec, &spec.join(format!("flows/{name}.yaml"))).expect("the flow");
+            let traced = run_traced(&flow.path, &case.json(), Options::default()).expect("runs");
+            let sink = "datadog_trace_out";
+            match table.lookup("attributes", Some("datadog_carrier_span"), sink, &traced.sink) {
+                mapping::Lookup::Cell(_, index) => index,
+                _ => panic!("no datadog_trace_out cell for attributes/datadog_carrier_span"),
+            }
+        };
+        assert_eq!(index("datadog-traces-to-datadog-trace"), 0);
+        assert_eq!(index("datadog-traces-to-datadog-trace-v07"), 1);
     }
 
     /// A record the sink writes only in a lesser form has its field rows left unlooked-up, so a

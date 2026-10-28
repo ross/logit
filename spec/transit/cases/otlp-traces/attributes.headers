@@ -1,0 +1,3 @@
+method: POST
+path: /v1/traces
+content-type: application/json

@@ -46,7 +46,7 @@
 //! and `_logit.metrics.interval` `interval_on_distribution` on a `samples`, `distribution`, or
 //! delta `exponential_histogram`, `interval_on_histogram` on a delta `histogram`, and `interval`
 //! on any other kind, at every sink, a `_logit.datadog.` carrier on a log, a Datadog
-//! event, or a service check `datadog_carrier_log`, `_logit.syslog.severity`
+//! event, a service check, or a span `datadog_carrier_log`, `_logit.syslog.severity`
 //! `severity_carrier_syslog`, any other `_logit.` key `foreign_carrier`, on a log an event
 //! attribute `syslog_out` writes as a header field by its key (`syslog.facility`, `syslog.tag`,
 //! `syslog.pid`, and `process.pid` `syslog_header`, `syslog.msgid` `syslog_msgid`, `syslog.sd`
@@ -71,18 +71,36 @@
 //! `observed_timestamp_unset`, `trace_unset`) where it has none, and `log/timestamp`, or
 //! `log/receipt_timestamp` when it carries `syslog.timestamp` and its timestamp is when it was
 //! received. Those fields are out of a log's own comparison ([`LOG_FIELD_KEYS`]), so a log pairs
-//! on its message, its message's type tags, and its attributes. A span there reaches
-//! `span/beside_log` when its event carries a log, else `span/alone`, and also
-//! `span/no_wire_form` when it carries a field a Datadog span has no form for. An event with no metric, log, or span is a record of kind `event` that reaches
+//! on its message, its message's type tags, and its attributes. A span on an event with no
+//! metric or log reaches `span/alone`, and also `span/not_datadog_origin` or
+//! `span/needs_agent_processing` when `datadog_out`'s readiness gate
+//! (`logit_proto::datadog::trace_readiness`) would hold its trace chunk back; a span beside a
+//! log is a field of its event (below). A span pairs on its trace id's low 64 bits and its span
+//! id ([`span_key`]): its other fields
+//! are out of its comparison ([`SPAN_FIELD_KEYS`]), and it reaches a `span` field row for each,
+//! chosen from the input ([`span_rows`]): `name` or `name_structured`, `trace_id`,
+//! `parent_span_id` or `parent_unset`, `kind`, `status_error`, `status_ok`, or `status_unset`,
+//! `timestamp`, `end_timestamp` or `end_before_start`, a row for each of `status_message`,
+//! `flags`, `trace_state`, and the dropped counts it carries, and `events` and `links` with a row
+//! for each of their fields it carries: a span event's non-`Str` name `event_name_structured`,
+//! and an item attribute of a [`Nest`] that nest's row, out of `events` and `links`. Its
+//! attributes reach `span_numeric`, `datadog_span_identity`, `datadog_span_marks`, or
+//! `datadog_carrier_span` ahead of the value rows, and its resource's Datadog tracer carriers
+//! `datadog_tracer_headers` when only a tracer request header carries one, else
+//! `datadog_tracer_resource`, and its Agent carriers `datadog_agent_resource`. An event
+//! with no metric, log, or span is a record of kind `event` that reaches
 //! `event/string_only` when it carries a non-empty `_logit.influxdb.measurement`, else
 //! `event/attributes_only`, and its attribute rows. A record reaches an `attributes` field row for
 //! each attribute [`derived_rows`] lists, at every sink that compares the record; a sink that writes
 //! none reads it `exact` when nothing stands in its place. A log or span on an event that carries
-//! metrics is a field of that event: it reaches `log/beside_metrics` or `span/beside_metrics`,
+//! metrics, or a span on one that carries a log, is a field of that event: it reaches
+//! `log/beside_metrics`, `span/beside_metrics`, or `span/beside_log`,
 //! read as `exact` when it pairs unchanged, `normalized` when it pairs changed, and `lost` when
 //! nothing read back pairs with it. A log there also reaches the `log` field rows a log alone
 //! does, and the attribute rows, so `log/beside_metrics` says only whether the sink carried it;
-//! once paired, it reaches the message rows [`log_features`] lists, at its pairing's class.
+//! once paired, it reaches the message rows [`log_features`] lists, at its pairing's class. A span
+//! there reaches its readiness row first, and one the gate holds back reads that row's
+//! `dropped`, not its beside row; else, once paired, it reaches its `span` field rows.
 //!
 //! **Pairing.** Each input record is paired with the records read back that account for it, in
 //! passes, each claiming a read-back record at most once: (1) the same name and the same kind,
@@ -121,7 +139,11 @@
 //! record's own fields ([`Spelling::derived`]: the run's hostname on a record with no host, a log's
 //! `status`, `trace_id`, and `span_id`, a span's `span.kind` and `_dd.p.tid`), each accepted only
 //! with the value derived for it; a log's `trace_id` and `span_id` pair only and have no row,
-//! since `log/trace` judges them; `graphite_out`'s forbidden characters as `_` in a
+//! since `log/trace` judges them; a tag's `F64` in Rust's `Display` form, so `1.0` is `1`; and a
+//! span attribute as `datadog_trace_out` shares it ([`datadog::span_value`]: a number as an
+//! `f64`, an array as JSON text). `datadog_trace_out`'s rewrites are those of a span at
+//! `datadog_out`, with no host derived, since the Agent it sends to fills its own
+//! ([`datadog_trace_derived`]); `graphite_out`'s forbidden characters as `_` in a
 //! path, a tag name, and a tag value (and a tag value's leading `~`), a tag value in the encoder's
 //! rendering, and the values it omits as no tag ([`graphite_value`]). Each name, key, and value set
 //! is the encoder's own predicate. `syslog_out`'s rewrites are a log's message as `syslog_in`
@@ -251,6 +273,35 @@ const LOG_FIELD_KEYS: [&str; 8] = [
     "dropped_attributes_count",
 ];
 
+/// Span body keys checked by `span` field rows, not by the record's own comparison, so a span's
+/// core is its ids.
+const SPAN_FIELD_KEYS: [&str; 15] = [
+    "name",
+    "parent_span_id",
+    "kind",
+    "status",
+    "status_message",
+    "trace_state",
+    "flags",
+    "start",
+    "end",
+    "duration_ns",
+    "dropped_attributes_count",
+    "dropped_events_count",
+    "dropped_links_count",
+    "events",
+    "links",
+];
+
+/// The keys of each item of a span's `events` or `links` that a sub-row judges, not the list's
+/// own row ([`SpanPart`]).
+fn span_sub_keys(list: &str) -> &'static [&'static str] {
+    match list {
+        "events" => &["dropped_attributes_count"],
+        _ => &["flags", "trace_state", "dropped_attributes_count"],
+    }
+}
+
 /// Series name suffixes a run's sink counters are checked for.
 const OUTCOMES: [&str; 6] = ["dropped", "skipped", "degraded", "normalized", "omitted", "evicted"];
 
@@ -259,7 +310,8 @@ const OUTCOMES: [&str; 6] = ["dropped", "skipped", "degraded", "normalized", "om
 struct Rec {
     /// The metric kind, `log`, `span`, or `event` for an event that carries none of them.
     kind: String,
-    /// The metric name, the log's message, or the span's name; empty for an `event`.
+    /// The metric name, the log's message, or a span's pairing key ([`span_key`]); empty for an
+    /// `event`.
     name: String,
     /// The metric object, or the `log` or `span` object; an empty object for an `event`.
     body: Value,
@@ -283,6 +335,10 @@ struct Rec {
     /// Whether this span is the one of its trace, in its batch, that `datadog_out` gives a
     /// synthesized `_dd.p.tid` ([`mark_tid_due`]).
     tid_due: bool,
+    /// The `span` row this span's trace chunk reaches when `datadog_out`'s readiness gate holds
+    /// it back: `not_datadog_origin` or `needs_agent_processing`
+    /// (`logit_proto::datadog::trace_readiness` over its batch); `None` for a `Ready` chunk.
+    readiness: Option<&'static str>,
 }
 
 impl Rec {
@@ -317,11 +373,21 @@ impl Rec {
 
     /// The comparison body: the record minus its field-row keys, and its type tags.
     fn core(&self) -> (Value, BTreeMap<String, String>) {
-        let stripped: &[&str] = if self.kind == "log" { &LOG_FIELD_KEYS } else { &FIELD_KEYS };
+        let stripped: &[&str] = match self.kind.as_str() {
+            "log" => &LOG_FIELD_KEYS,
+            "span" => &SPAN_FIELD_KEYS,
+            _ => &FIELD_KEYS,
+        };
         let mut body = self.body.clone();
         if let Some(object) = body.as_object_mut() {
             for &key in stripped {
                 object.remove(key);
+            }
+            // A span pairs on its trace id's low 64 bits, which every span sink writes;
+            // `span/trace_id` judges the whole id.
+            if self.kind == "span" {
+                let low = span_key(&self.body).split('/').next().unwrap_or("").to_string();
+                object.insert("trace_id".to_string(), Value::String(low));
             }
             // Pairing has matched the names already, respelled where the sink respells them.
             if self.is_metric() {
@@ -415,6 +481,11 @@ enum Spelling {
     /// attributes [`Spelling::derived`] lists, which the encoder writes from a record's own fields
     /// and `datadog_in` reads back as attributes the input lacks.
     Datadog,
+    /// `datadog_trace_out`, under either `version:`: names and keys as written, and the
+    /// attributes [`datadog_trace_derived`] lists, which the encoder writes from a span's own
+    /// fields and `datadog_trace_in` reads back as attributes the input lacks. Where the two
+    /// versions differ, the table's cells split by `when:`.
+    DatadogTrace,
     /// `graphite_out`: each character carbon forbids in a path, a tag name, or a tag value as
     /// `_`, and a tag value's leading `~`; a tag value as the encoder renders it (an `f64` in
     /// Rust's shortest form, `3` for `3.0`, and an array's last representable element), and a
@@ -452,6 +523,7 @@ impl Spelling {
             "influxdb_out" => Spelling::Influxdb,
             "otlp_out" => Spelling::Otlp,
             "datadog_out" => Spelling::Datadog,
+            "datadog_trace_out" => Spelling::DatadogTrace,
             "graphite_out" => Spelling::Graphite,
             "syslog_out" => Spelling::Syslog {
                 rfc3164: config["format"] == "rfc3164",
@@ -488,6 +560,7 @@ impl Spelling {
             Spelling::Influxdb
             | Spelling::Otlp
             | Spelling::Datadog
+            | Spelling::DatadogTrace
             | Spelling::Syslog { .. }
             | Spelling::Splunk
             | Spelling::KafkaText
@@ -711,6 +784,9 @@ impl Spelling {
         if self == Spelling::KafkaText {
             return None;
         }
+        if matches!(self, Spelling::Datadog | Spelling::DatadogTrace) && rec.kind == "span" {
+            return Some(datadog::span_value(value));
+        }
         if self == (Spelling::Statsd { dogstatsd: true }) && key == "host" {
             let kept = statsd::host_kept(rec, value)?;
             return Some(self.value(&kept, tags));
@@ -743,6 +819,12 @@ impl Spelling {
         if unified::tag_is_omitted(self, rec, key, value) {
             return None;
         }
+        // A tag writes an `F64` with Rust's `Display`, so `1.0` is `1`; a log's JSON keeps it.
+        if self == Spelling::Datadog && datadog::Route::of(rec) != datadog::Route::Log {
+            if let Some(n) = value.as_number().filter(|n| n.is_f64()) {
+                return Some(n.as_f64().unwrap_or_default().to_string());
+            }
+        }
         if self == Spelling::Graphite {
             return graphite_value(value, tags);
         }
@@ -751,10 +833,11 @@ impl Spelling {
 
     /// The attributes the sink writes from `rec`'s own fields, which its pair decoder reads back
     /// as attributes `rec` lacks ([`Derived`]); empty for a sink that writes none:
-    /// [`datadog_derived`], [`syslog_derived`], and [`splunk::derived`].
+    /// [`datadog_derived`], [`datadog_trace_derived`], [`syslog_derived`], and [`splunk::derived`].
     fn derived(self, rec: &Rec) -> Vec<Derived> {
         match self {
             Spelling::Datadog => datadog_derived(rec),
+            Spelling::DatadogTrace => datadog_trace_derived(rec),
             Spelling::Syslog { rfc3164, facility, .. } => {
                 syslog_derived(rec, rfc3164, facility, self.sd_id())
             }
@@ -865,6 +948,20 @@ fn syslog_derived(
         }
     }
     out
+}
+
+/// The attributes `datadog_trace_out` writes from span `rec`'s own fields, which
+/// `datadog_trace_in` reads back as attributes `rec` lacks: `datadog_out`'s span entries
+/// ([`datadog_derived`]) but `no_host`, since the sink leaves a span's host for the Agent to fill.
+/// Under `version: v0.4` the resource's `host.name`, `deployment.environment.name`, and
+/// `service.version` leave in every span's `meta` and read back as the span's attributes, which
+/// needs no entry: [`Rec::public`] already merges the resource into the event's attributes, and
+/// `attributes/resource_attribute` judges the move.
+fn datadog_trace_derived(rec: &Rec) -> Vec<Derived> {
+    if rec.kind != "span" {
+        return Vec::new();
+    }
+    datadog_derived(rec).into_iter().filter(|(row, _, _)| *row != Some("no_host")).collect()
 }
 
 /// `value` as `format: json` writes it, so a `Bytes` value is its `b"..."` text.
@@ -1111,6 +1208,17 @@ mod datadog {
         }
     }
 
+    /// A span attribute's value as the Datadog span encoders write it and the decoder reads it
+    /// back, as text: a number as a `metrics` entry, read back as an `f64`, and an array as its
+    /// JSON text in `meta`. Every other value reads back as [`super::text`] has it already.
+    pub(super) fn span_value(value: &Value) -> String {
+        match value {
+            Value::Number(n) => super::text(&Value::from(n.as_f64().unwrap_or_default())),
+            Value::Array(_) => value.to_string(),
+            other => super::text(other),
+        }
+    }
+
     /// An attribute, the event's over the resource's.
     fn get<'a>(rec: &'a Rec, key: &str) -> Option<&'a Value> {
         rec.attributes.get(key).or_else(|| rec.resource.get(key))
@@ -1229,15 +1337,6 @@ mod datadog {
         Route::of(rec) == Route::Log
             && !service_name_written(rec)
             && get(rec, "service").is_some_and(|v| v.as_str().is_some())
-    }
-
-    /// Whether a span carries a field a Datadog span has no form for: `status: ok`, a status
-    /// message, `trace_state`, `flags`, or a dropped count.
-    pub(super) fn otel_only(rec: &Rec) -> bool {
-        let body = &rec.body;
-        body["status"] == "ok"
-            || ["status_message", "trace_state", "flags"].iter().any(|k| body.get(*k).is_some())
-            || body.as_object().is_some_and(|o| o.keys().any(|k| k.starts_with("dropped_")))
     }
 
     /// Whether `rec` carries a Datadog hostless mark: `_logit.datadog.hostless` `true`, or a
@@ -1908,12 +2007,26 @@ fn records(batches: &[EventBatch]) -> Vec<Rec> {
     out
 }
 
+/// A span's pairing key: its trace id's low 64 bits and its span id, as hex. `datadog_out` writes
+/// the trace id's low half alone and restores the high half through `_dd.p.tid`, so the low half
+/// is what every span sink carries.
+fn span_key(span: &Value) -> String {
+    let trace = span["trace_id"].as_str().unwrap_or("");
+    let low = trace.get(trace.len().saturating_sub(16)..).unwrap_or(trace);
+    format!("{low}/{}", span["span_id"].as_str().unwrap_or(""))
+}
+
 /// One batch's records, in order.
 fn batch_records(batch: &EventBatch) -> Vec<Rec> {
     let mut lines = String::new();
     render_ndjson(&mut lines, batch);
+    let readiness = if batch.events.iter().any(|event| event.span.is_some()) {
+        logit_proto::datadog::trace_readiness(batch)
+    } else {
+        Vec::new()
+    };
     let mut out = Vec::new();
-    for line in lines.lines() {
+    for (index, line) in lines.lines().enumerate() {
         let event: Value = serde_json::from_str(line).expect("format: json lines parse");
         let types: BTreeMap<String, String> = event["types"]
             .as_object()
@@ -1954,6 +2067,7 @@ fn batch_records(batch: &EventBatch) -> Vec<Rec> {
             scope: scope.clone(),
             timestamp: event["timestamp"].as_str().unwrap_or("").to_string(),
             tid_due: false,
+            readiness: readiness.get(index).copied().flatten().and_then(|r| r.drop_reason()),
         };
         if let Some(log) = event.get("log") {
             let name = log.get("message").map(text).unwrap_or_default();
@@ -1966,7 +2080,7 @@ fn batch_records(batch: &EventBatch) -> Vec<Rec> {
             out.push(rec("log".to_string(), name, log.clone(), types));
         }
         if let Some(span) = event.get("span") {
-            let name = span.get("name").map(text).unwrap_or_default();
+            let name = span_key(span);
             let types = types
                 .iter()
                 .filter_map(|(p, t)| {
@@ -2183,9 +2297,9 @@ fn same_value(a: &Rec, b: &Rec) -> bool {
     match a.kind.as_str() {
         "sum" | "gauge" => same_number(&a.body["value"], &b.body["value"]),
         "gauge_delta" => same_number(&a.body["delta"], &b.body["delta"]),
-        // A log pairs by its message, respelled where the sink respells it; its field rows
-        // compare the rest.
-        "log" => true,
+        // A log pairs by its message, respelled where the sink respells it, and a span by its
+        // ids; their field rows compare the rest.
+        "log" | "span" => true,
         // A histogram whose last bound is finite gains an empty `+Inf` bucket on a wire that
         // states the total as one (Prometheus) or requires an overflow count (OTLP).
         "histogram" => {
@@ -2337,15 +2451,13 @@ fn kind_features(rec: &Rec) -> Vec<Option<String>> {
             features
         }
         "exponential_histogram" | "summary" => vec![Some(temporality())],
-        "log" | "span" if rec.beside_metrics => vec![Some("beside_metrics".to_string())],
-        "span" if rec.beside_log && datadog::otel_only(rec) => {
-            vec![Some("beside_log".to_string()), Some("no_wire_form".to_string())]
+        "log" if rec.beside_metrics => vec![Some("beside_metrics".to_string())],
+        // A span beside another signal is a field of its event ([`beside_row`]).
+        "span" => {
+            let mut features = vec![Some("alone".to_string())];
+            features.extend(rec.readiness.map(|reason| Some(reason.to_string())));
+            features
         }
-        "span" if rec.beside_log => vec![Some("beside_log".to_string())],
-        "span" if datadog::otel_only(rec) => {
-            vec![Some("alone".to_string()), Some("no_wire_form".to_string())]
-        }
-        "span" => vec![Some("alone".to_string())],
         "log" if rec.attributes.contains_key("_logit.statsd.event.title") => {
             vec![Some("dogstatsd_event".to_string())]
         }
@@ -2554,6 +2666,271 @@ enum Field {
     Derived { feature: &'static str },
     /// A `samples` record's rate below 1 that rounds to weight 1 ([`unweighted_rate`]).
     SampleRate,
+    /// A key of the span object, its type tags included: `exact` when the read-back holds the
+    /// same value, `normalized` when it holds another, `lost` when it holds none. A name read back
+    /// empty, and a status read back `unset`, are the value gone, so `lost`.
+    SpanBody(&'static str),
+    /// A key of the span object the input doesn't set, or sets to its default (`status: unset`):
+    /// `exact` when the read-back sets none either, `normalized` when the sink stamped one.
+    SpanUnset(&'static str),
+    /// The span's start, `event.timestamp`, or with `end` its end: `exact` read back the same,
+    /// else `normalized`, except that an end before its start read back elsewhere is `lost`.
+    SpanTimestamp { end: bool },
+    /// One part of each item of the span's `events` or `links` ([`SpanPart`]).
+    SpanItems { list: &'static str, part: SpanPart },
+}
+
+/// What a [`Field::SpanItems`] row compares of each item: `exact` when every item reads back
+/// the same, `normalized` when one reads back changed, and `lost` when the read-back has no list,
+/// or for a [`SpanPart::Key`], holds the key on no item.
+#[derive(Debug, Clone, Copy)]
+enum SpanPart {
+    /// The item but the keys its sub-rows judge ([`span_sub_keys`]) and, on a span event, its
+    /// structured attributes.
+    Rest,
+    /// One key of the item.
+    Key(&'static str),
+    /// An item's attributes of one [`Nest`] ([`nest_attributes`]).
+    Nested(Nest),
+    /// A span event's name, where the input's isn't a string ([`structured_name`]).
+    Name,
+}
+
+/// An item attribute a span sink writes apart from the rest, judged on its own row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Nest {
+    /// A `Map`, an `Array`, or a `Null`, on a span event only: a link's ride in `span/links`.
+    Structured,
+    Bytes,
+    U64,
+    Timestamp,
+}
+
+impl Nest {
+    /// The nests `list`'s `span/events` or `span/links` row leaves to their own rows.
+    fn of(list: &str) -> &'static [Nest] {
+        match list {
+            "events" => &[Nest::Structured, Nest::Bytes, Nest::U64, Nest::Timestamp],
+            _ => &[Nest::Bytes, Nest::U64, Nest::Timestamp],
+        }
+    }
+
+    /// The row a [`span_rows`] item attribute of this nest reaches.
+    fn row(self) -> &'static str {
+        match self {
+            Nest::Structured => "event_nested_attribute",
+            Nest::Bytes => "nested_bytes_attribute",
+            Nest::U64 => "nested_u64_attribute",
+            Nest::Timestamp => "nested_timestamp_attribute",
+        }
+    }
+}
+
+/// The attribute keys of span event or link `item`, at `pointer` (`/events/0`), whose value is
+/// of `nest`.
+fn nest_attributes(
+    item: &Value,
+    pointer: &str,
+    types: &BTreeMap<String, String>,
+    nest: Nest,
+) -> BTreeSet<String> {
+    let attributes = item["attributes"].as_object().into_iter().flatten();
+    attributes
+        .filter(|(key, value)| {
+            let at = format!("{pointer}/attributes/{}", key.replace('~', "~0").replace('/', "~1"));
+            let tag = types.get(&at).map(String::as_str);
+            match nest {
+                Nest::Structured => value.is_object() || value.is_array() || value.is_null(),
+                Nest::Bytes => tag == Some("bytes"),
+                Nest::U64 => tag == Some("u64"),
+                Nest::Timestamp => tag == Some("timestamp"),
+            }
+        })
+        .map(|(key, _)| key.clone())
+        .collect()
+}
+
+/// Whether span event `item`, at `pointer`, has a name that isn't a plain string.
+fn structured_name(item: &Value, pointer: &str, types: &BTreeMap<String, String>) -> bool {
+    !item["name"].is_string() || types.contains_key(&format!("{pointer}/name"))
+}
+
+/// `part` of each item of `rec`'s span list `list`, with the type tags under it; `None` when
+/// `rec` has no such list. The attributes [`SpanPart::Rest`] leaves out and [`SpanPart::Nested`]
+/// keeps, and whether an event's name is [`SpanPart::Name`]'s, are read from `input`'s item at the
+/// same index.
+fn span_items(
+    rec: &Rec,
+    input: &Rec,
+    list: &str,
+    part: SpanPart,
+) -> Option<(Vec<Value>, BTreeMap<String, String>)> {
+    let items = rec.body.get(list)?.as_array()?;
+    let mut projected = Vec::new();
+    for (i, item) in items.iter().enumerate() {
+        let pointer = format!("/{list}/{i}");
+        let own = input.body[list].get(i);
+        let nested = |nests: &[Nest]| -> BTreeSet<String> {
+            let Some(own) = own else { return BTreeSet::new() };
+            nests.iter().flat_map(|&n| nest_attributes(own, &pointer, &input.types, n)).collect()
+        };
+        let named =
+            list == "events" && own.is_some_and(|own| structured_name(own, &pointer, &input.types));
+        let kept = match part {
+            SpanPart::Key(key) => item.get(key).cloned().unwrap_or(Value::Null),
+            SpanPart::Name if named => item.get("name").cloned().unwrap_or(Value::Null),
+            SpanPart::Name => Value::Null,
+            SpanPart::Rest => {
+                let nested = nested(Nest::of(list));
+                let mut item = item.clone();
+                if let Some(object) = item.as_object_mut() {
+                    for key in span_sub_keys(list) {
+                        object.remove(*key);
+                    }
+                    if named {
+                        object.remove("name");
+                    }
+                    if let Some(attributes) =
+                        object.get_mut("attributes").and_then(Value::as_object_mut)
+                    {
+                        attributes.retain(|key, _| !nested.contains(key));
+                        if attributes.is_empty() {
+                            object.remove("attributes");
+                        }
+                    }
+                }
+                item
+            }
+            SpanPart::Nested(nest) => {
+                let attributes = item["attributes"].as_object();
+                let kept: Map<String, Value> = nested(&[nest])
+                    .iter()
+                    .filter_map(|key| Some((key.clone(), attributes?.get(key)?.clone())))
+                    .collect();
+                Value::Object(kept)
+            }
+        };
+        projected.push(kept);
+    }
+    // The type tags under each item's kept keys.
+    let prefix = format!("/{list}/");
+    let types = rec
+        .types
+        .iter()
+        .filter(|(pointer, _)| {
+            let Some(rest) = pointer.strip_prefix(&prefix) else { return false };
+            let mut parts = rest.split('/');
+            let index: Option<usize> = parts.next().and_then(|i| i.parse().ok());
+            let field = parts.next().map(unescape).unwrap_or_default();
+            let attribute = parts.next().map(unescape).unwrap_or_default();
+            let Some(item) = index.and_then(|i| projected.get(i)) else { return false };
+            match part {
+                SpanPart::Key(key) => field == key,
+                SpanPart::Rest if field == "attributes" => {
+                    item["attributes"].get(&attribute).is_some()
+                }
+                SpanPart::Rest => item.get(&field).is_some(),
+                SpanPart::Nested(_) => field == "attributes" && item.get(&attribute).is_some(),
+                SpanPart::Name => field == "name" && !item.is_null(),
+            }
+        })
+        .map(|(pointer, tag)| (pointer.clone(), tag.clone()))
+        .collect();
+    Some((projected, types))
+}
+
+/// The type tags of `rec` at `/key` and below.
+fn tags_under(rec: &Rec, key: &str) -> BTreeMap<String, String> {
+    let at = format!("/{key}");
+    let below = format!("{at}/");
+    rec.types
+        .iter()
+        .filter(|(pointer, _)| **pointer == at || pointer.starts_with(&below))
+        .map(|(pointer, tag)| (pointer.clone(), tag.clone()))
+        .collect()
+}
+
+/// The `span` field rows `rec` reaches (module doc), each chosen from the input alone.
+fn span_rows(rec: &Rec) -> Vec<(&'static str, Field)> {
+    let body = &rec.body;
+    let has = |key: &str| body.get(key).is_some();
+    let mut rows = Vec::new();
+    let named = body["name"].is_string() && !rec.types.contains_key("/name");
+    rows.push((if named { "name" } else { "name_structured" }, Field::SpanBody("name")));
+    rows.push(("trace_id", Field::SpanBody("trace_id")));
+    if has("parent_span_id") {
+        rows.push(("parent_span_id", Field::SpanBody("parent_span_id")));
+    } else {
+        rows.push(("parent_unset", Field::SpanUnset("parent_span_id")));
+    }
+    rows.push(("kind", Field::SpanBody("kind")));
+    match body["status"].as_str() {
+        Some("error") => rows.push(("status_error", Field::SpanBody("status"))),
+        Some("ok") => rows.push(("status_ok", Field::SpanBody("status"))),
+        _ => rows.push(("status_unset", Field::SpanUnset("status"))),
+    }
+    // `format: json` leaves out a zero count, zero flags, and an absent text field, the wire
+    // defaults every sink reads back as they are.
+    for key in [
+        "status_message",
+        "flags",
+        "trace_state",
+        "dropped_attributes_count",
+        "dropped_events_count",
+        "dropped_links_count",
+    ] {
+        if has(key) {
+            rows.push((key, Field::SpanBody(key)));
+        }
+    }
+    rows.push(("timestamp", Field::SpanTimestamp { end: false }));
+    let negative = body["duration_ns"].as_i64().is_some_and(|d| d < 0);
+    let end = if negative { "end_before_start" } else { "end_timestamp" };
+    rows.push((end, Field::SpanTimestamp { end: true }));
+    let items = |list: &str| body[list].as_array().cloned().unwrap_or_default();
+    let events = items("events");
+    if !events.is_empty() {
+        rows.push(("events", Field::SpanItems { list: "events", part: SpanPart::Rest }));
+        let named = events
+            .iter()
+            .enumerate()
+            .any(|(i, item)| structured_name(item, &format!("/events/{i}"), &rec.types));
+        if named {
+            let part = SpanPart::Name;
+            rows.push(("event_name_structured", Field::SpanItems { list: "events", part }));
+        }
+        if events.iter().any(|item| item.get("dropped_attributes_count").is_some()) {
+            let part = SpanPart::Key("dropped_attributes_count");
+            rows.push(("event_dropped_count", Field::SpanItems { list: "events", part }));
+        }
+    }
+    let links = items("links");
+    // An attribute of each nest, on any event or link, reaches that nest's row once per list.
+    for (list, entries) in [("events", &events), ("links", &links)] {
+        for &nest in Nest::of(list) {
+            let carried = entries.iter().enumerate().any(|(i, item)| {
+                !nest_attributes(item, &format!("/{list}/{i}"), &rec.types, nest).is_empty()
+            });
+            if carried {
+                let part = SpanPart::Nested(nest);
+                rows.push((nest.row(), Field::SpanItems { list, part }));
+            }
+        }
+    }
+    if !links.is_empty() {
+        rows.push(("links", Field::SpanItems { list: "links", part: SpanPart::Rest }));
+        for (feature, key) in [
+            ("link_flags", "flags"),
+            ("link_trace_state", "trace_state"),
+            ("link_dropped_count", "dropped_attributes_count"),
+        ] {
+            if links.iter().any(|item| item.get(key).is_some()) {
+                let part = SpanPart::Key(key);
+                rows.push((feature, Field::SpanItems { list: "links", part }));
+            }
+        }
+    }
+    rows
 }
 
 /// A `samples` record's weight, as `Samples::weight` rounds it: the inverse of its rate, 1 for a
@@ -2661,14 +3038,22 @@ fn field_rows_under(
         let feature = if receipt { "receipt_timestamp" } else { "timestamp" };
         push(feature, Field::Timestamp { receipt });
     }
+    if rec.kind == "span" {
+        for (feature, field) in span_rows(rec) {
+            rows.push(("span".to_string(), Some(feature.to_string()), field));
+        }
+    }
     let own = format!("_logit.{protocol}.");
-    // A `_logit.datadog.*` carrier on a log, a Datadog event, or a service check: `datadog_out`'s
-    // routes for those skip one they have no field for without counting it, where its metrics
-    // routes count one.
+    // A `_logit.datadog.*` carrier on a log, a Datadog event, a service check, or a span:
+    // `datadog_out`'s routes for those skip one they have no field for without counting it, where
+    // its metrics routes count one.
     let json_route = rec.kind != "event"
         && matches!(
             datadog::Route::of(rec),
-            datadog::Route::Log | datadog::Route::Event | datadog::Route::Check
+            datadog::Route::Log
+                | datadog::Route::Event
+                | datadog::Route::Check
+                | datadog::Route::Span
         );
     let carrier = |key: &str, value: &Value| {
         if key == METRICS_CLOSED && value.as_str() == Some(CLOSED_TIMESTAMPED) {
@@ -2751,9 +3136,43 @@ fn field_rows_under(
             None
         }
     };
+    // A span's attribute the span sinks treat apart by its key: Datadog's span carriers, typed
+    // fields, and marks, and a number, which Datadog writes to the span's `metrics`.
+    let span_attribute = |key: &str, value: &Value| {
+        if rec.kind != "span" {
+            None
+        } else if key.starts_with("_logit.datadog.chunk.") || key == "_logit.datadog.span.error" {
+            Some("datadog_carrier_span")
+        } else if matches!(key, "service.name" | "resource.name" | "span.type") {
+            Some("datadog_span_identity")
+        } else if matches!(key, "_top_level" | "_sampling_priority_v1" | "span.kind")
+            || key.starts_with("_dd.")
+        {
+            Some("datadog_span_marks")
+        } else if value.is_number() && !key.starts_with("_logit.") {
+            Some("span_numeric")
+        } else {
+            None
+        }
+    };
+    let tracer_resource = |key: &str| {
+        if rec.kind != "span" {
+            None
+        } else if key.starts_with("_logit.datadog.agent.") {
+            Some("datadog_agent_resource")
+        } else if !key.starts_with("_logit.datadog.tracer.") {
+            None
+        } else if logit_proto::datadog::traces::is_tracer_header_only_attr(key) {
+            Some("datadog_tracer_headers")
+        } else {
+            Some("datadog_tracer_resource")
+        }
+    };
     for (key, value) in &rec.attributes {
         let tags = rec.attribute_types.get(key).map(String::as_str).unwrap_or("");
-        let feature = if let Some(feature) = carrier(key, value) {
+        let feature = if let Some(feature) = span_attribute(key, value) {
+            feature
+        } else if let Some(feature) = carrier(key, value) {
             feature
         } else if let Some(feature) = header(key) {
             feature
@@ -2781,7 +3200,8 @@ fn field_rows_under(
         rows.push(("attributes".to_string(), Some(feature.to_string()), field));
     }
     for (key, value) in &rec.resource {
-        let feature = carrier(key, value)
+        let feature = tracer_resource(key)
+            .or_else(|| carrier(key, value))
             .or_else(|| outranked(key, value))
             .or_else(|| splunk::is_envelope(key).then_some("splunk_envelope"))
             .unwrap_or("resource_attribute");
@@ -2899,6 +3319,58 @@ fn observe_field(field: &Field, input: &Rec, out: &Rec, spelling: Spelling) -> C
             Some(_) => Class::Normalized,
             None => Class::Lost,
         },
+        Field::SpanBody(key) => {
+            let want = &input.body[*key];
+            let gone = |read: &Value| match *key {
+                "name" => *read == "" && *want != "",
+                "status" => *read == "unset",
+                _ => false,
+            };
+            match out.body.get(*key) {
+                Some(read) if read == want && tags_under(out, key) == tags_under(input, key) => {
+                    Class::Exact
+                }
+                Some(read) if gone(read) => Class::Lost,
+                Some(_) => Class::Normalized,
+                None => Class::Lost,
+            }
+        }
+        Field::SpanUnset(key) => match out.body.get(*key) {
+            None => Class::Exact,
+            Some(read) if *key == "status" && *read == "unset" => Class::Exact,
+            Some(_) => Class::Normalized,
+        },
+        Field::SpanTimestamp { end } => {
+            let (read, want) = if *end {
+                (out.body["end"].clone(), input.body["end"].clone())
+            } else {
+                (Value::String(out.timestamp.clone()), Value::String(input.timestamp.clone()))
+            };
+            let negative = input.body["duration_ns"].as_i64().is_some_and(|d| d < 0);
+            if read == want {
+                Class::Exact
+            } else if *end && negative {
+                Class::Lost
+            } else {
+                Class::Normalized
+            }
+        }
+        Field::SpanItems { list, part } => {
+            let Some(want) = span_items(input, input, list, *part) else { return Class::Exact };
+            let Some(read) = span_items(out, input, list, *part) else { return Class::Lost };
+            let absent = read.0.iter().all(Value::is_null);
+            // A structured event name the sink writes as `""` is gone, as `span/name_structured`'s.
+            let blank = read.0.iter().filter(|v| !v.is_null()).all(|v| v == "");
+            if read == want {
+                Class::Exact
+            } else if matches!(part, SpanPart::Key(_)) && absent
+                || matches!(part, SpanPart::Name) && blank
+            {
+                Class::Lost
+            } else {
+                Class::Normalized
+            }
+        }
         Field::Attribute { key, resource } => {
             // Under the opt-in, a log's opt-in attribute is a PARAM of the opt-in element, read
             // back nested in `syslog.sd` as the PARAM-VALUE text, where the encoder wrote it.
@@ -3297,6 +3769,21 @@ fn moved(traced: &Traced) -> Vec<Series> {
         .collect()
 }
 
+/// The field row a record that's a field of its event reaches: `beside_metrics` for a log or span
+/// on an event that carries metrics, `beside_log` for a span on one that carries a log and no
+/// metrics; `None` for a record of its own.
+fn beside_row(rec: &Rec) -> Option<&'static str> {
+    if rec.is_metric() {
+        None
+    } else if rec.beside_metrics {
+        Some("beside_metrics")
+    } else if rec.kind == "span" && rec.beside_log {
+        Some("beside_log")
+    } else {
+        None
+    }
+}
+
 /// Checks one run against the table (module doc), returning one failure per disagreement.
 pub(super) fn check(
     mapping: &Mapping,
@@ -3329,17 +3816,53 @@ pub(super) fn check(
             }
         }
 
-        // A log or span beside metrics is a field of its event (module doc).
-        let beside = !input.is_metric() && input.beside_metrics;
-        let observed = if beside {
-            // `beside_metrics` and, once paired, the log's message rows, read together as a log
+        // A log or span beside metrics, or a span beside a log, is a field of its event (module
+        // doc).
+        let observed = if let Some(beside) = beside_row(input) {
+            // A span the sink's readiness gate holds back is dropped whole, whatever it's beside.
+            if let Some(reason) = input.readiness.filter(|_| input.kind == "span") {
+                let label = mapping::row_label("span", Some(reason));
+                match mapping.lookup("span", Some(reason), &sink, &traced.sink) {
+                    Lookup::NoRow => failures.push(format!(
+                        "{here}: span {:?} reaches row {label}, which mapping.yaml doesn't have",
+                        input.name
+                    )),
+                    Lookup::NotSpecified => {
+                        ledger
+                            .unspecified
+                            .entry((sink.clone(), label))
+                            .or_default()
+                            .insert(here.clone());
+                    }
+                    Lookup::Cell(cell, index) => {
+                        named.extend(cell.counter.as_deref().and_then(|c| Series::parse(c).ok()));
+                        ledger.reach(&sink, &label, index);
+                        if matches!(cell.class, Class::Skipped | Class::Dropped) {
+                            let counted = cell.counter.as_deref().is_some_and(&did_move);
+                            if pairing.seen[i].is_none() && counted {
+                                ledger.saw(&sink, &label, index, cell.class);
+                            } else {
+                                failures.push(format!(
+                                    "{here}: span {:?}: the table's row {label} says {}, but it \
+                                     was read back or its counter didn't move\n  sink input: {}",
+                                    input.name,
+                                    cell.class.as_str(),
+                                    input.show()
+                                ));
+                            }
+                            continue;
+                        }
+                    }
+                }
+            }
+            // The beside row and, once paired, the log's message rows, read together as a log
             // alone's record-level rows are: at the worst cell's class.
             let seen = match pairing.seen[i] {
                 Some(Class::Exact) => Class::Exact,
                 Some(_) => Class::Normalized,
                 None => Class::Lost,
             };
-            let mut features = vec!["beside_metrics"];
+            let mut features = vec![beside];
             if seen != Class::Lost {
                 features.extend(log_features(input, spelling));
             }
@@ -3684,6 +4207,143 @@ mod tests {
             .map(|line| format!("{line}\n"))
             .collect();
         records(&EventJsonDecoder::new().decode_batches(text.as_bytes()).expect("JSON lines"))
+    }
+
+    /// A span line with id suffix `n`, `fields` spliced into its object, `rest` after it.
+    fn span_line(n: u8, fields: &str, rest: &str) -> String {
+        format!(
+            r#"{{{{T}},"span":{{"trace_id":"4bf92f3577b34da6a3ce929d0e0e47{n:02x}","span_id":"00f067aa0ba902{n:02x}","kind":"server","start":"2027-01-15T08:00:00.000000000Z","end":"2027-01-15T08:00:00.005000000Z","duration_ns":5000000,{fields}}}{rest}}}"#
+        )
+    }
+
+    fn row_names(rec: &Rec) -> Vec<&'static str> {
+        span_rows(rec).into_iter().map(|(row, _)| row).collect()
+    }
+
+    fn row_field(rec: &Rec, name: &str) -> Field {
+        span_rows(rec).into_iter().find(|(row, _)| *row == name).expect("the row").1
+    }
+
+    /// A span pairs on its ids whatever its status, flags, or `trace_state` read back as, and
+    /// each difference lands on its own field row rather than unpairing the span.
+    #[test]
+    fn a_span_pairs_on_its_ids_and_its_fields_land_on_their_rows() {
+        let ins = recs(&[&span_line(
+            1,
+            r#""name":"GET /cart","status":"ok","flags":257,"trace_state":"rojo=1""#,
+            "",
+        )]);
+        let outs = recs(&[&span_line(1, r#""name":"GET /cart","status":"unset""#, "")]);
+        let pairing = pair(&ins, &outs, Spelling::Verbatim);
+        assert_eq!(pairing.seen, [Some(Class::Exact)]);
+        let rows = row_names(&ins[0]);
+        for row in ["name", "parent_unset", "status_ok", "flags", "trace_state", "end_timestamp"] {
+            assert!(rows.contains(&row), "{row} missing from {rows:?}");
+        }
+        for row in ["status_ok", "flags", "trace_state"] {
+            let field = row_field(&ins[0], row);
+            assert_eq!(observe_field(&field, &ins[0], &outs[0], Spelling::Verbatim), Class::Lost);
+        }
+        let name = row_field(&ins[0], "name");
+        assert_eq!(observe_field(&name, &ins[0], &outs[0], Spelling::Verbatim), Class::Exact);
+    }
+
+    /// A span whose name is a map reaches `name_structured`, still pairs on its ids, and reads
+    /// `lost` when the name comes back empty and `normalized` when it comes back as text.
+    #[test]
+    fn a_structured_name_pairs_on_its_ids() {
+        let ins = recs(&[&span_line(2, r#""name":{"route":"/cart"},"status":"unset""#, "")]);
+        let empty = recs(&[&span_line(2, r#""name":"","status":"unset""#, "")]);
+        let text = recs(&[&span_line(2, r#""name":"{\"route\":\"/cart\"}","status":"unset""#, "")]);
+        assert_eq!(pair(&ins, &empty, Spelling::Verbatim).seen, [Some(Class::Exact)]);
+        let rows = row_names(&ins[0]);
+        assert!(rows.contains(&"name_structured") && !rows.contains(&"name"), "{rows:?}");
+        let name = row_field(&ins[0], "name_structured");
+        assert_eq!(observe_field(&name, &ins[0], &empty[0], Spelling::Verbatim), Class::Lost);
+        assert_eq!(observe_field(&name, &ins[0], &text[0], Spelling::Verbatim), Class::Normalized);
+    }
+
+    /// An unset parent or status reads `exact` when it comes back unset and `normalized` when a
+    /// sink fills one in.
+    #[test]
+    fn an_unset_parent_or_status_reads_exact_only_when_it_stays_unset() {
+        let ins = recs(&[&span_line(3, r#""name":"a","status":"unset""#, "")]);
+        let same = recs(&[&span_line(3, r#""name":"a","status":"unset""#, "")]);
+        let filled = recs(&[&span_line(
+            3,
+            r#""name":"a","status":"error","parent_span_id":"00f067aa0ba90299""#,
+            "",
+        )]);
+        for row in ["parent_unset", "status_unset"] {
+            let field = row_field(&ins[0], row);
+            assert_eq!(observe_field(&field, &ins[0], &same[0], Spelling::Verbatim), Class::Exact);
+            assert_eq!(
+                observe_field(&field, &ins[0], &filled[0], Spelling::Verbatim),
+                Class::Normalized,
+                "{row}"
+            );
+        }
+    }
+
+    /// A span event's `Bytes` and `Null` attributes and structured name each land on their own
+    /// row, so `span/events` reads `exact` when only they changed (a null written as the string
+    /// `"null"`, as `datadog_out` writes it), and a name read back `""` is `lost`.
+    #[test]
+    fn a_span_events_typed_attribute_and_structured_name_land_on_their_rows() {
+        let event = |name: &str, payload: &str, none: &str, tag: &str| {
+            span_line(
+                5,
+                &format!(
+                    r#""name":"a","status":"unset","events":[{{"name":{name},"timestamp":"2027-01-15T08:00:00.001000000Z","attributes":{{"k":"v","none":{none},"payload":{payload}}}}}]"#
+                ),
+                tag,
+            )
+        };
+        let bytes = r#","types":{"/span/events/0/attributes/payload":"bytes"}"#;
+        let ins = recs(&[&event(r#"{"op":"retry"}"#, r#""b\"ok\"""#, "null", bytes)]);
+        let outs = recs(&[&event(r#""""#, r#""b2s=""#, r#""null""#, "")]);
+        let rows = row_names(&ins[0]);
+        for row in
+            ["events", "event_name_structured", "event_nested_attribute", "nested_bytes_attribute"]
+        {
+            assert!(rows.contains(&row), "{row} missing from {rows:?}");
+        }
+        let class = |row: &str| {
+            observe_field(&row_field(&ins[0], row), &ins[0], &outs[0], Spelling::Verbatim)
+        };
+        assert_eq!(class("events"), Class::Exact);
+        assert_eq!(class("event_name_structured"), Class::Lost);
+        assert_eq!(class("event_nested_attribute"), Class::Normalized);
+        assert_eq!(class("nested_bytes_attribute"), Class::Normalized);
+    }
+
+    /// A span reaches `span/alone` and, unless `datadog_out`'s gate would send it, the readiness
+    /// row naming why it wouldn't: an OTel span is `not_datadog_origin`, a tracer's span with no
+    /// `_top_level` is `needs_agent_processing`, and an Agent-processed root reaches `alone` only.
+    #[test]
+    fn a_span_reaches_its_readiness_row() {
+        let features = |line: &str| kind_features(&recs(&[line])[0]);
+        let alone = Some("alone".to_string());
+        assert_eq!(
+            features(&span_line(4, r#""name":"a","status":"unset""#, "")),
+            [alone.clone(), Some("not_datadog_origin".to_string())]
+        );
+        assert_eq!(
+            features(&span_line(
+                4,
+                r#""name":"a","status":"unset""#,
+                r#","attributes":{"span.type":"web"}"#
+            )),
+            [alone.clone(), Some("needs_agent_processing".to_string())]
+        );
+        assert_eq!(
+            features(&span_line(
+                4,
+                r#""name":"a","status":"unset""#,
+                r#","attributes":{"span.type":"web","_top_level":1.0}"#
+            )),
+            [alone]
+        );
     }
 
     /// `prometheus_out` writes a dotted name and label key with `_`, and a counter's sample with
@@ -4295,6 +4955,83 @@ mod tests {
         assert_eq!(observe_field(field, &ins[0], &out[0], Spelling::Datadog), Class::Normalized);
     }
 
+    /// A span's `_logit.datadog.*` carrier outside the chunk, span, tracer, and Agent carriers, on
+    /// the event or the resource, reaches the row of the routes `datadog_out` leaves one off uncounted, as a log's
+    /// does, and never `private_carrier`, whose metrics-route cell names a counter.
+    #[test]
+    fn a_spans_datadog_carrier_reaches_the_uncounted_route_row() {
+        let ins = recs(&[
+            r#"{{T},"span":{"name":"s","trace_id":"0a0b0c0d0e0f10110102030405060708","span_id":"1112131415161718","kind":"internal","status":"unset","start":"2027-01-15T08:00:00.000000000Z","end":"2027-01-15T08:00:00.000000000Z","duration_ns":0},"attributes":{"_logit.datadog.hostless":true,"_logit.datadog.chunk.priority":1},"resource":{"attributes":{"_logit.datadog.units":true}}}"#,
+        ]);
+        let features: Vec<(String, bool)> = field_rows(&ins[0], "datadog")
+            .into_iter()
+            .filter_map(|(_, feature, field)| match field {
+                Field::Attribute { key, resource } if key.starts_with("_logit.datadog.") => {
+                    Some((format!("{key}={}", feature.unwrap_or_default()), resource))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            features,
+            [
+                ("_logit.datadog.chunk.priority=datadog_carrier_span".to_string(), false),
+                ("_logit.datadog.hostless=datadog_carrier_log".to_string(), false),
+                ("_logit.datadog.units=datadog_carrier_log".to_string(), true),
+            ]
+        );
+    }
+
+    /// `datadog_trace_out` derives a span's `span.kind` and `_dd.p.tid` as `datadog_out` does, but
+    /// no host: the Agent it sends to fills its own.
+    #[test]
+    fn datadog_trace_derives_a_spans_kind_and_tid_but_no_host() {
+        let ins = recs(&[
+            r#"{{T},"span":{"name":"s","trace_id":"0a0b0c0d0e0f10110102030405060708","span_id":"1112131415161718","kind":"client","status":"unset","start":"2027-01-15T08:00:00.000000000Z","end":"2027-01-15T08:00:00.000000000Z","duration_ns":0}}"#,
+        ]);
+        let rows = |spelling: Spelling| -> Vec<_> {
+            spelling.derived(&ins[0]).into_iter().map(|(row, _, _)| row).collect()
+        };
+        assert_eq!(
+            rows(Spelling::Datadog),
+            [Some("no_host"), Some("span_kind"), Some("trace_id_high")]
+        );
+        assert_eq!(rows(Spelling::DatadogTrace), [Some("span_kind"), Some("trace_id_high")]);
+    }
+
+    /// A span's number reads back from `metrics` as an `f64` and its array from `meta` as JSON
+    /// text, and the span still pairs at both Datadog span sinks.
+    #[test]
+    fn a_datadog_span_pairs_with_its_numbers_as_f64_and_its_arrays_as_json() {
+        let span = |attributes: &str| {
+            format!(
+                r#"{{{{T}},"span":{{"name":"s","trace_id":"00000000000000000102030405060708","span_id":"1112131415161718","kind":"internal","status":"unset","start":"2027-01-15T08:00:00.000000000Z","end":"2027-01-15T08:00:00.000000000Z","duration_ns":0}},"attributes":{attributes}}}"#
+            )
+        };
+        let ins = recs(&[&span(r#"{"n":-42,"a":["x",1]}"#)]);
+        let out = recs(&[&span(r#"{"n":-42.0,"a":"[\"x\",1]"}"#)]);
+        assert!(pair(&ins, &out, Spelling::DatadogTrace).seen[0].is_some());
+        let hosted = recs(&[&span(r#"{"n":-42.0,"a":"[\"x\",1]","host.name":"transit"}"#)]);
+        assert!(pair(&ins, &hosted, Spelling::Datadog).seen[0].is_some());
+    }
+
+    /// A valued `env` beside `deployment.environment.name` is no tag at `datadog_out`, even as an
+    /// integral-looking `F64`, so a read-back with no `env` tag pairs.
+    #[test]
+    fn datadog_omits_an_f64_env_beside_its_standard_key() {
+        let gauge = |attributes: &str| {
+            format!(
+                r#"{{{{T}},"metrics":[{{"name":"g","kind":"gauge","value":1.0}}],"attributes":{attributes}}}"#
+            )
+        };
+        let ins = recs(&[&gauge(r#"{"deployment.environment.name":"prod","env":1.5}"#)]);
+        let env = ins[0].attributes.get("env").expect("env");
+        assert_eq!(Spelling::Datadog.value_for("env", env, "", &ins[0]), None);
+        let out =
+            recs(&[&gauge(r#"{"deployment.environment.name":"prod","host.name":"transit"}"#)]);
+        assert!(pair(&ins, &out, Spelling::Datadog).seen[0].is_some());
+    }
+
     /// A `_dd.p.tid` other than the trace id's high 64 bits doesn't pair.
     #[test]
     fn datadog_never_pairs_a_trace_id_high_half_it_didnt_derive() {
@@ -4319,10 +5056,6 @@ mod tests {
             observe_field(field, &ins[0], &ins[0], Spelling::Statsd { dogstatsd: true }),
             Class::Exact
         );
-        let span = recs(&[
-            r#"{{T},"span":{"name":"s","trace_id":"0102030405060708090a0b0c0d0e0f10","span_id":"0102030405060708","kind":"server","status":"ok","start":"2027-01-15T08:00:00.000000000Z","end":"2027-01-15T08:00:00.000000000Z","duration_ns":0}}"#,
-        ]);
-        assert!(kind_features(&span[0]).contains(&Some("no_wire_form".to_string())));
     }
 
     /// `datadog_out` synthesizes `_dd.p.tid` on the first span of a trace in a batch only, and

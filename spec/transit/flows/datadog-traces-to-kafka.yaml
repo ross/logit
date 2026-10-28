@@ -1,0 +1,14 @@
+# datadog_in's trace cases into kafka_out with nothing between: each event as one record holding
+# `stdio_out`'s JSON object, which the transit spec reads back with the event JSON reader, since no
+# kafka_in exists.
+# `path:` names one case so `logit run` can run this by hand; the transit spec runs every case in
+# that file's directory (spec/transit/README.md).
+components:
+  case:
+    type: replay_in
+    path: ../cases/datadog-traces/agent.json
+  out:
+    type: kafka_out
+    sources: [case]
+    brokers: ["127.0.0.1:9092"]
+    topic: logs

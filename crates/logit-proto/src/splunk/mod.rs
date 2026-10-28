@@ -110,9 +110,9 @@
 //! | `log/structured_message` | exact | -- | A JSON object or array `event`, read back as the same structure. |
 //! | `log/bytes_message` | normalized | `message_as_text` | A string `event`, read back as a string, as the `log/message_unsafe` row says. |
 //! | `log/blank_message` | dropped | `logit.output.events.dropped{reason=blank_event}` | A log whose message is empty, null, or a non-finite number isn't written, since HEC rejects a whole request holding a blank `event`; the rest of the batch is sent. |
-//! | `span/alone` | exact | -- | A span object in the OpenTelemetry exporter's shape, its resource's attributes as `fields`; the `span/no_wire_form` row has what it can't carry. |
-//! | `span/beside_log` | exact | -- | A span object in the OpenTelemetry exporter's shape, its resource's attributes as `fields`; the `span/no_wire_form` row has what it can't carry. |
-//! | `span/no_wire_form` | degraded | `logit.output.spans.degraded{reason=no_wire_form}` | The exporter's span object has no member for span flags, `trace_state`, or a dropped count, so each is left off, counted once per span, and the span reads back without it. |
+//! | `span/alone` | exact | -- | A span object in the OpenTelemetry exporter's shape, its resource's attributes as `fields`; the `span` field rows have what it can't carry. |
+//! | `span/not_datadog_origin` | exact | -- | Nothing beyond the span's `span/alone`, `span/beside_log`, or `span/beside_metrics` outcome: only `datadog_out` gates a trace chunk. |
+//! | `span/needs_agent_processing` | exact | -- | Nothing beyond the span's `span/alone`, `span/beside_log`, or `span/beside_metrics` outcome: only `datadog_out` gates a trace chunk. |
 //! | `event/attributes_only` | skipped | `logit.output.events.skipped{reason=no_payload}` | An event with no log, metric, or span has no HEC object and isn't sent. |
 //! | `event/string_only` | skipped | `logit.output.events.skipped{reason=no_payload}` | An InfluxDB point whose fields are all strings has no log, metric, or span, so it isn't sent and its fields are lost. |
 //!
@@ -152,6 +152,13 @@
 //! | `attributes/datadog_carrier_log` | lost | structural | A `_logit.` carrier is private and isn't a HEC field, so it's left off. |
 //! | `attributes/severity_carrier_otel` | lost | structural | A `_logit.` carrier is private and isn't a HEC field, so it's left off and the severity reads back at band resolution. |
 //! | `attributes/severity_carrier_syslog` | lost | structural | A `_logit.` carrier is private and isn't a HEC field, so it's left off and the severity reads back at band resolution. |
+//! | `attributes/span_numeric` | exact | -- | A JSON number in the span's `attributes`, read back as the same integer or double; a `u64` above `i64::MAX` stays a `u64`. |
+//! | `attributes/datadog_span_identity` | exact | -- | A string in the span's `attributes`. |
+//! | `attributes/datadog_span_marks` | exact | -- | An ordinary entry of the span's `attributes`: Datadog's internal mark leaves as an OTel attribute. |
+//! | `attributes/datadog_carrier_span` | lost | structural | The exporter's span object has no field for a Datadog trace chunk's fields or a span's raw `error`, and a `_logit.` carrier is private, so it's left off. |
+//! | `attributes/datadog_tracer_resource` | lost | structural | HEC has no field for a `TracerPayload`'s fields, and a `_logit.` carrier is private, so it's left off. |
+//! | `attributes/datadog_tracer_headers` | lost | structural | HEC has no field for a tracer request header, and a `_logit.` carrier is private, so it's left off. |
+//! | `attributes/datadog_agent_resource` | lost | structural | HEC has no field for an `AgentPayload`'s fields, and a `_logit.` carrier is private, so it's left off. |
 //! | `attributes/syslog_header` | normalized | `u64_as_int` | A `fields` string or number; a `u64` `syslog.facility` or `process.pid` reads back as an `i64`. |
 //! | `attributes/syslog_msgid` | exact | -- | A `fields` string. |
 //! | `attributes/syslog_sd` | normalized | `flattened` | `fields` is flat, so `syslog.sd` leaves as one `syslog.sd.<SD-ID>.<PARAM-NAME>` key per PARAM, read back as that many attributes and no `syslog.sd` map. |
@@ -179,6 +186,36 @@
 //! | `log/timestamp` | exact | -- | The object's `time`, in seconds with up to nine decimals. |
 //! | `log/receipt_timestamp` | exact | -- | The object's `time`, the time the log was received. |
 //! | `log/beside_metrics` | lost | `logit.output.events.dropped{reason=blank_event}` | The log is its own HEC object before the event's metric objects, read back as an event of its own; a blank one is dropped and counted, as the `log/blank_message` row says. |
+//! | `span/name` | exact | -- | The span object's `name`. |
+//! | `span/name_structured` | normalized | `stringified` | A name that isn't a `Str` leaves as its text, JSON for a map or an array, read back as a string. |
+//! | `span/trace_id` | exact | -- | 32 lowercase hex digits. |
+//! | `span/parent_span_id` | exact | -- | 16 lowercase hex digits. |
+//! | `span/parent_unset` | exact | -- | An empty `parent_span_id`, read back as no parent. |
+//! | `span/kind` | exact | -- | The exporter's `SPAN_KIND_*` name. |
+//! | `span/status_error` | exact | -- | `status.code` `STATUS_CODE_ERROR`. |
+//! | `span/status_ok` | exact | -- | `status.code` `STATUS_CODE_OK`. |
+//! | `span/status_unset` | exact | -- | `status.code` `STATUS_CODE_UNSET`, read back as unset. |
+//! | `span/status_message` | exact | -- | `status.message`. |
+//! | `span/timestamp` | exact | -- | `start_time`, in Unix nanoseconds. |
+//! | `span/end_timestamp` | exact | -- | `end_time`, in Unix nanoseconds. |
+//! | `span/end_before_start` | exact | -- | `end_time` as it is, earlier than `start_time`. |
+//! | `span/flags` | lost | `logit.output.spans.degraded{reason=no_wire_form}` | The exporter's span object has no member for span flags, so it's left off, counted once per span. |
+//! | `span/trace_state` | lost | `logit.output.spans.degraded{reason=no_wire_form}` | The exporter's span object has no member for a span's `trace_state`, so it's left off, counted once per span. |
+//! | `span/dropped_attributes_count` | lost | `logit.output.spans.degraded{reason=no_wire_form}` | The exporter's span object has no member for a dropped-attribute count, so it's left off, counted once per span. |
+//! | `span/dropped_events_count` | lost | `logit.output.spans.degraded{reason=no_wire_form}` | The exporter's span object has no member for a dropped-event count, so it's left off, counted once per span. |
+//! | `span/dropped_links_count` | lost | `logit.output.spans.degraded{reason=no_wire_form}` | The exporter's span object has no member for a dropped-link count, so it's left off, counted once per span. |
+//! | `span/events` | exact | -- | Each span event's `name`, `timestamp`, and `attributes`. |
+//! | `span/event_nested_attribute` | exact | -- | A map, array, or null attribute of a span event, nesting kept. |
+//! | `span/event_name_structured` | normalized | `stringified` | A name that isn't a `Str` leaves as its text, JSON for a map or an array, read back as a string. |
+//! | `span/nested_bytes_attribute` | normalized | `stringified` | A `Bytes` attribute of a span event or link leaves as a base64 string, read back as the string. |
+//! | `span/nested_u64_attribute` | normalized | `u64_as_int` | A JSON number in the span event's or link's `attributes`, read back as an `i64`, or, above `i64::MAX`, as the `u64` itself. |
+//! | `span/nested_timestamp_attribute` | normalized | `stringified` | A timestamp attribute of a span event or link leaves as an RFC 3339 string, read back as the string. |
+//! | `span/event_dropped_count` | lost | `logit.output.spans.degraded{reason=no_wire_form}` | The exporter's span object has no member for a span event's dropped-attribute count, so it's left off, counted once per span. |
+//! | `span/links` | exact | -- | Each link's `trace_id`, `span_id`, and `attributes`. |
+//! | `span/link_flags` | lost | `logit.output.spans.degraded{reason=no_wire_form}` | The exporter's span object has no member for a link's flags, so it's left off, counted once per span. |
+//! | `span/link_trace_state` | exact | -- | A link's `trace_state`, an absent one written as `""` and read back as none. |
+//! | `span/link_dropped_count` | lost | `logit.output.spans.degraded{reason=no_wire_form}` | The exporter's span object has no member for a link's dropped-attribute count, so it's left off, counted once per span. |
+//! | `span/beside_log` | exact | -- | The span and the log are each their own HEC object, read back as events of their own. |
 //! | `span/beside_metrics` | exact | -- | A span object after the event's metric objects, read back as an event of its own. |
 //!
 //! <!-- transit:end -->

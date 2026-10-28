@@ -1,0 +1,20 @@
+{
+  "attributes": {"events": [], "counters": {
+    "logit.output.events.skipped{component=out,kind=kafka_out,reason=no_log,role=sink}": 1
+  }},
+  "beside": {"events": [
+    {"timestamp":"2027-01-15T08:00:06.000000000Z","log":{"format":"raw","message":"beside its span"}}
+  ], "counters": {
+    "logit.output.events.skipped{component=out,kind=kafka_out,reason=no_log,role=sink}": 4,
+    "logit.output.spans.omitted{component=out,kind=kafka_out,reason=format,role=sink}": 1
+  }},
+  "fields": {"events": [], "counters": {
+    "logit.output.events.skipped{component=out,kind=kafka_out,reason=no_log,role=sink}": 3
+  }},
+  "kinds": {"events": [], "counters": {
+    "logit.output.events.skipped{component=out,kind=kafka_out,reason=no_log,role=sink}": 5
+  }},
+  "telemetrygen": {"events": [], "counters": {
+    "logit.output.events.skipped{component=out,kind=kafka_out,reason=no_log,role=sink}": 6
+  }}
+}

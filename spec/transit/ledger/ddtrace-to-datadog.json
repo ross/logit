@@ -1,0 +1,7 @@
+{
+  "cells": [
+    {"sink":"datadog_out","row":"span/alone","cell":0,"observed":[]},
+    {"sink":"datadog_out","row":"span/needs_agent_processing","cell":0,"observed":["dropped"]}
+  ],
+  "unspecified": []
+}

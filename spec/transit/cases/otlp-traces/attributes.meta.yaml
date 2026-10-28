@@ -1,0 +1,5 @@
+# A hand-written OTLP/JSON body: a span with one attribute of each `AnyValue` kind and one under
+# the private `_logit.` prefix, under a resource with attributes and a schema URL and a scope with
+# a name, a version, and attributes.
+wire: attributes.bin
+exercises: [otlp_json, attribute_string, attribute_int, attribute_double, attribute_bool, attribute_bytes, attribute_array, attribute_kvlist, attribute_private, resource_attributes, schema_url, scope, scope_attributes]

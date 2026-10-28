@@ -1,0 +1,6 @@
+# dd-trace-py 4.15.2's /v0.4/traces request under DD_TRACE_API_VERSION=v0.4, msgpack, one Flask
+# request's 10 spans with no Agent `_top_level` mark, read in place from testdata/interop/ with
+# its .headers, whose `Datadog-Meta-*`, `Datadog-Entity-ID`, `Datadog-External-Env`, and
+# `Datadog-Client-Computed-*` headers fill the resource.
+wire: ../../../../testdata/interop/datadog/tracer-v04-v0-4-traces-000.bin
+exercises: [v04_traces, tracer_headers, unmarked_root, span_identity, span_marks, parent_span_id, trace_id_128, env_version]

@@ -1,0 +1,14 @@
+{
+  "capture": {"events": [], "counters": {
+    "logit.output.records.dropped{component=out,kind=datadog_out,reason=not_datadog_origin,role=sink,route=traces}": 6
+  }},
+  "fields": {"events": [], "counters": {
+    "logit.output.records.dropped{component=out,kind=datadog_out,reason=not_datadog_origin,role=sink,route=traces}": 2
+  }},
+  "kinds": {"events": [], "counters": {
+    "logit.output.records.dropped{component=out,kind=datadog_out,reason=not_datadog_origin,role=sink,route=traces}": 18
+  }},
+  "span": {"events": [], "counters": {
+    "logit.output.records.dropped{component=out,kind=datadog_out,reason=not_datadog_origin,role=sink,route=traces}": 1
+  }}
+}

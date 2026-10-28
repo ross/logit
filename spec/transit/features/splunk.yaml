@@ -1,7 +1,8 @@
 # The Splunk HTTP Event Collector (HEC) features a case under cases/splunk/ can exercise, from
 # crates/logit-proto/src/splunk/'s decode tables and crates/logit-inputs/src/splunk.rs's routes. A
 # case names the ones it exercises in its `.meta.yaml`. HEC metric events aren't cases: a log
-# directory never routes a metric into a log sink.
+# directory never routes a metric into a log sink. A span object is a cases/splunk-traces/ case,
+# unless `splunk_hec_in` keeps it as a log.
 - name: event_route
   text: >-
     A `/services/collector` or `/services/collector/event[/1.0]` body of concatenated JSON
@@ -26,10 +27,15 @@
   text: An array `event`, decoded to an `Array` message with body format `json`.
 - name: scalar_event
   text: A number or bool `event`, decoded to a typed message with body format `raw`.
-- name: span_event
+- name: span_malformed_zero_parent
   text: >-
-    An `event` object carrying `trace_id`, `span_id`, `start_time`, and `end_time`, the
-    exporter's span object, decoded to a span.
+    The exporter's span object with a present, all-zero `parent_span_id`, kept as a log with a
+    `Map` body and counted `logit.input.spans.degraded{reason=malformed_span}`.
+- name: span_malformed_unknown_member
+  text: >-
+    The exporter's span object with a member it never writes, such as `flags` or `trace_state`,
+    kept as a log with a `Map` body and counted
+    `logit.input.spans.degraded{reason=malformed_span}`.
 - name: fields
   text: A `fields` object, decoded to event attributes.
 - name: fields_nested

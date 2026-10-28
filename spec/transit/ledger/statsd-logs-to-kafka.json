@@ -1,5 +1,6 @@
 {
   "cells": [
+    {"sink":"kafka_out","row":"attributes/datadog_span_identity","cell":0,"observed":["exact"]},
     {"sink":"kafka_out","row":"attributes/default_tag","cell":0,"observed":["exact"]},
     {"sink":"kafka_out","row":"attributes/foreign_carrier","cell":1,"observed":["exact"]},
     {"sink":"kafka_out","row":"attributes/host_name","cell":1,"observed":["exact"]},
@@ -24,7 +25,17 @@
     {"sink":"kafka_out","row":"span/alone","cell":1,"observed":["exact"]},
     {"sink":"kafka_out","row":"span/beside_log","cell":1,"observed":["exact"]},
     {"sink":"kafka_out","row":"span/beside_metrics","cell":1,"observed":["exact"]},
-    {"sink":"kafka_out","row":"span/no_wire_form","cell":1,"observed":["exact"]}
+    {"sink":"kafka_out","row":"span/end_timestamp","cell":0,"observed":["exact"]},
+    {"sink":"kafka_out","row":"span/kind","cell":0,"observed":["exact"]},
+    {"sink":"kafka_out","row":"span/name","cell":0,"observed":["exact"]},
+    {"sink":"kafka_out","row":"span/needs_agent_processing","cell":0,"observed":["exact"]},
+    {"sink":"kafka_out","row":"span/not_datadog_origin","cell":0,"observed":["exact"]},
+    {"sink":"kafka_out","row":"span/parent_unset","cell":0,"observed":["exact"]},
+    {"sink":"kafka_out","row":"span/status_ok","cell":0,"observed":["exact"]},
+    {"sink":"kafka_out","row":"span/status_unset","cell":0,"observed":["exact"]},
+    {"sink":"kafka_out","row":"span/timestamp","cell":0,"observed":["exact"]},
+    {"sink":"kafka_out","row":"span/trace_id","cell":0,"observed":["exact"]},
+    {"sink":"kafka_out","row":"span/trace_state","cell":0,"observed":["exact"]}
   ],
   "unspecified": [
     {"sink":"kafka_out","row":"gauge/f64","reached_by":["statsd-logs-to-kafka × span-beside-metrics"]}

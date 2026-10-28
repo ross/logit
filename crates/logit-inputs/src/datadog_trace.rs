@@ -128,6 +128,9 @@
 //! 5. **Delivery**, bounded (below), then the route's `200`. A body that decodes to no events is
 //!    answered without a send.
 //!
+//! [`decode_request`] runs steps 3 and 4 on a request already read, the tracer headers included,
+//! so the transit spec reads `datadog_trace_out`'s requests back through this listener's own code.
+//!
 //! # Backpressure: a short bounded wait, then `503`, which a tracer retries only briefly
 //!
 //! Delivery works as `datadog_in`'s does: the request's one batch is sent through
@@ -1037,27 +1040,18 @@ async fn respond(
     let encoding = if acknowledged {
         Encoding::Identity
     } else {
-        match Encoding::from_headers(req.headers()) {
-            Ok(encoding @ (Encoding::Identity | Encoding::Gzip)) => encoding,
-            Ok(_) | Err(_) => {
-                let sent = req
-                    .headers()
-                    .get(http::header::CONTENT_ENCODING)
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or("");
-                let message = format!(
-                    "unsupported Content-Encoding {sent:?} -- this input speaks identity and gzip"
-                );
+        match body_encoding(req.headers()) {
+            Ok(encoding) => encoding,
+            Err(message) => {
                 let response =
                     reject(shared, "encoding", StatusCode::UNSUPPORTED_MEDIA_TYPE, &message, true);
                 return (name, REJECTED, response);
             }
         }
     };
-    if matches!(route, Route::TracesV04(_)) && media_type(req.headers()) == MediaType::Json {
-        let message = "JSON trace bodies aren't supported -- send application/msgpack";
+    if json_traces(route, req.headers()) {
         let response =
-            reject(shared, "json_traces", StatusCode::UNSUPPORTED_MEDIA_TYPE, message, true);
+            reject(shared, "json_traces", StatusCode::UNSUPPORTED_MEDIA_TYPE, JSON_TRACES, true);
         return (name, REJECTED, response);
     }
 
@@ -1086,50 +1080,35 @@ async fn respond(
         return (name, OK, json_response(StatusCode::OK, Bytes::from_static(b"{}")));
     }
 
-    let body = match decompress(encoding, body, MAX_REQUEST_BYTES) {
-        Ok(body) => body,
-        Err(DecompressError::TooLarge) => {
+    // Built per request, as on `datadog_in`.
+    let decoder = DatadogDecoder::new()
+        .with_telemetry(shared.telemetry.clone())
+        .with_diagnostics(shared.diag.clone());
+    let decoded =
+        decode_body(route, encoding, body, &parts.headers, now_nanos(), decoder, &shared.diag);
+    let mut batch = match decoded {
+        Ok((batch, body)) => {
+            check_trace_count(route, &body, &parts.headers, shared);
+            batch
+        }
+        Err(DecodeFailure::TooLarge) => {
             let message =
                 format!("decompressed request exceeds the {MAX_REQUEST_BYTES}-byte limit");
             let response =
                 reject(shared, "oversize", StatusCode::PAYLOAD_TOO_LARGE, &message, true);
             return (name, REJECTED, response);
         }
-        Err(DecompressError::Malformed(message)) => {
+        Err(DecodeFailure::MalformedEncoding(message)) => {
             let response =
                 reject(shared, "malformed_encoding", StatusCode::BAD_REQUEST, &message, true);
             return (name, REJECTED, response);
         }
-    };
-
-    let received_at = now_nanos();
-    // Built per request, as on `datadog_in`.
-    let mut decoder = DatadogDecoder::new()
-        .with_telemetry(shared.telemetry.clone())
-        .with_diagnostics(shared.diag.clone());
-    let decoded: Result<EventBatch, CodecError> = match route {
-        Route::TracesV04(_) => decoder.decode_traces_v04(&body, received_at),
-        Route::TracesV05 => decoder.decode_traces_v05(&body, received_at),
-        Route::TracesV07 => decoder.decode_tracer_payload_v07(&body, received_at),
-        Route::StatsV06 => decoder.decode_client_stats_v06(&body, received_at),
-        Route::Info | Route::Unsupported(_) | Route::Acknowledged(_) => {
-            unreachable!("answered above")
-        }
-    };
-    let mut batch = match decoded {
-        Ok(batch) => batch,
-        Err(err) => {
+        Err(DecodeFailure::Malformed(err)) => {
             let response =
                 reject(shared, "malformed", StatusCode::BAD_REQUEST, &err.to_string(), true);
             return (name, REJECTED, response);
         }
     };
-    if route.is_traces() {
-        apply_tracer_headers(&mut batch, &parts.headers, &shared.diag);
-        check_trace_count(route, &body, &parts.headers, shared);
-    } else {
-        apply_stats_headers(&mut batch, &parts.headers);
-    }
     shared.peer.request(&parts.headers).stamp_batches(std::slice::from_mut(&mut batch));
     let success = success(route, &parts.headers);
     if batch.events.is_empty() {
@@ -1169,6 +1148,108 @@ async fn respond(
             response.headers_mut().insert(http::header::RETRY_AFTER, HeaderValue::from_static("1"));
             (name, reason, response)
         }
+    }
+}
+
+/// The message a JSON body on `/v0.3` or `/v0.4/traces` is refused with.
+const JSON_TRACES: &str = "JSON trace bodies aren't supported -- send application/msgpack";
+
+/// The request's `Content-Encoding`, when it's one this listener decodes ("Request handling"
+/// step 3); else the `415`'s message.
+fn body_encoding(headers: &HeaderMap) -> Result<Encoding, String> {
+    match Encoding::from_headers(headers) {
+        Ok(encoding @ (Encoding::Identity | Encoding::Gzip)) => Ok(encoding),
+        Ok(_) | Err(_) => {
+            let sent = headers
+                .get(http::header::CONTENT_ENCODING)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            Err(format!(
+                "unsupported Content-Encoding {sent:?} -- this input speaks identity and gzip"
+            ))
+        }
+    }
+}
+
+/// Whether the request is a JSON body on a route that takes msgpack only, which the listener
+/// answers `415`.
+fn json_traces(route: Route, headers: &HeaderMap) -> bool {
+    matches!(route, Route::TracesV04(_)) && media_type(headers) == MediaType::Json
+}
+
+/// Why [`decode_body`] produced no batch: `413` versus `400`, as [`respond`] answers them.
+enum DecodeFailure {
+    TooLarge,
+    MalformedEncoding(String),
+    Malformed(CodecError),
+}
+
+/// "Request handling" steps 3 and 4 for a body already read, on a decoding route: decompress it
+/// under [`MAX_REQUEST_BYTES`], decode it on the route's decoder, and fill the batch's resource
+/// from the request's headers ("Tracer headers"). Returns the decompressed body beside the batch,
+/// which `X-Datadog-Trace-Count` is compared against.
+fn decode_body(
+    route: Route,
+    encoding: Encoding,
+    body: Bytes,
+    headers: &HeaderMap,
+    received_at: i64,
+    mut decoder: DatadogDecoder,
+    diag: &Diagnostics,
+) -> Result<(EventBatch, Bytes), DecodeFailure> {
+    let body = match decompress(encoding, body, MAX_REQUEST_BYTES) {
+        Ok(body) => body,
+        Err(DecompressError::TooLarge) => return Err(DecodeFailure::TooLarge),
+        Err(DecompressError::Malformed(message)) => {
+            return Err(DecodeFailure::MalformedEncoding(message))
+        }
+    };
+    let decoded: Result<EventBatch, CodecError> = match route {
+        Route::TracesV04(_) => decoder.decode_traces_v04(&body, received_at),
+        Route::TracesV05 => decoder.decode_traces_v05(&body, received_at),
+        Route::TracesV07 => decoder.decode_tracer_payload_v07(&body, received_at),
+        Route::StatsV06 => decoder.decode_client_stats_v06(&body, received_at),
+        Route::Info | Route::Unsupported(_) | Route::Acknowledged(_) => {
+            unreachable!("answered before the body is decoded")
+        }
+    };
+    let mut batch = decoded.map_err(DecodeFailure::Malformed)?;
+    if route.is_traces() {
+        apply_tracer_headers(&mut batch, headers, diag);
+    } else {
+        apply_stats_headers(&mut batch, headers);
+    }
+    Ok((batch, body))
+}
+
+/// One recorded request decoded as this listener decodes it, at `received_at`: the route from
+/// `path`, the compression from `Content-Encoding` in `headers`, then [`decode_body`], with the
+/// tracer headers filling the resource as on a live request. A replay of a captured or encoded
+/// request reads it through this, so it takes the listener's own path; the HTTP steps around it
+/// (method, size, delivery, the sender address) don't apply to a body already read. `Err` names
+/// why the listener would have answered something other than its route's success, or that the
+/// route decodes no body. A body that decodes to no event yields no batch.
+pub fn decode_request(
+    path: &str,
+    headers: &HeaderMap,
+    body: Bytes,
+    received_at: i64,
+    decoder: DatadogDecoder,
+    diag: &Diagnostics,
+) -> Result<Vec<EventBatch>, String> {
+    let route = Route::from_path(path)
+        .filter(|route| route.is_traces() || *route == Route::StatsV06)
+        .ok_or_else(|| format!("{path} is no datadog_trace_in route that decodes a body"))?;
+    let encoding = body_encoding(headers)?;
+    if json_traces(route, headers) {
+        return Err(JSON_TRACES.to_string());
+    }
+    match decode_body(route, encoding, body, headers, received_at, decoder, diag) {
+        Ok((batch, _)) if batch.events.is_empty() => Ok(Vec::new()),
+        Ok((batch, _)) => Ok(vec![batch]),
+        Err(DecodeFailure::TooLarge) => Err("the decompressed body is over the cap".to_string()),
+        Err(DecodeFailure::MalformedEncoding(message)) => Err(message),
+        Err(DecodeFailure::Malformed(err)) => Err(err.to_string()),
     }
 }
 
@@ -1978,6 +2059,46 @@ mod tests {
             }
             assert_eq!(attrs.len(), expected.len(), "{path}: nothing else");
         }
+    }
+
+    /// A replayed request reads as the listener reads it: a gzipped v0.4 body's spans, and the
+    /// tracer headers on the resource.
+    #[tokio::test]
+    async fn decode_request_agrees_with_the_listener_on_a_v04_body() {
+        let (addr, mut rx) = start_default().await;
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut gz, &v04(2)).unwrap();
+        let body = gz.finish().unwrap();
+        let sent = format!("{MSGPACK}Content-Encoding: gzip\r\n{ALL_HEADERS}");
+        let response = post_raw(&addr, "/v0.4/traces", &sent, &body).await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let served = recv_batch(&mut rx).await;
+        let mut headers = HeaderMap::new();
+        for line in sent.split("\r\n").filter(|line| !line.is_empty()) {
+            let (name, value) = line.split_once(": ").unwrap();
+            headers.insert(
+                http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                HeaderValue::from_str(value).unwrap(),
+            );
+        }
+        let replayed = decode_request(
+            "/v0.4/traces",
+            &headers,
+            Bytes::from(body),
+            // The v0.4 decoder doesn't read the receipt time: a span's `start` is its timestamp.
+            0,
+            DatadogDecoder::new(),
+            &Diagnostics::new("apm"),
+        )
+        .unwrap();
+        assert_eq!(replayed.len(), 1);
+        assert_eq!(replayed[0].resource, served.resource);
+        assert_eq!(replayed[0].events, served.events);
+        assert_eq!(
+            served.resource.attributes.get(RESOURCE_ATTR_TRACER_LANGUAGE_NAME),
+            Some(&Value::str("python"))
+        );
+        assert_eq!(served.events.len(), 2);
     }
 
     #[tokio::test]

@@ -65,7 +65,9 @@ Entry format and the other areas: [the known-gaps index](README.md).
   ([ADR `datadog-agent-and-intake-relay`](../adr/datadog-agent-and-intake-relay.md), decision 2).
   - **Consequence:** `datadog_trace_in`'s output must reach Datadog through a real Agent
     (`datadog_trace_out`) or go to an OTLP backend. Fed straight to `datadog_out`, its spans are
-    skipped as not yet processed. OTel-origin spans reach Datadog through `otlp_out`.
+    dropped as not yet processed, counted
+    `logit.output.records.dropped{reason="needs_agent_processing"}`. OTel-origin spans reach
+    Datadog through `otlp_out`.
   - **Revisit trigger:** a deployment that needs tracer spans in Datadog with no Agent in the
     path.
 - **A libdatadog tracer sends `datadog_trace_in` no client stats.** dd-trace-py 4.x computes them
@@ -167,8 +169,8 @@ Entry format and the other areas: [the known-gaps index](README.md).
   - **Workaround:** send OTel spans with `otlp_out`, to the Agent's OTLP receiver or to Datadog.
   - **Revisit trigger:** the Agent-equivalent trace processor (the `datadog_trace_in` entry
     above).
-- **`datadog_trace_out` sends every numeric span attribute as a Datadog `metrics` entry.** The
-  span encoder puts each `F64`, `I64`, and `U64` attribute in the span's `metrics` map, each
+- **`datadog_trace_out` and `datadog_out` send every numeric span attribute as a Datadog
+  `metrics` entry.** The span encoder both sinks share puts each `F64`, `I64`, and `U64` attribute in the span's `metrics` map, each
   `Bytes` attribute in `meta_struct`, and strings, bools (as `"true"` or `"false"`), and every
   other value in `meta`. That is right for a span `datadog_trace_in` decoded, because the decoder
   stores a tracer's `metrics` map as `F64` attributes, its `meta` map as strings, and its
@@ -179,11 +181,20 @@ Entry format and the other areas: [the known-gaps index](README.md).
   but not this misclassification. The decode side counts `key_collision` and has no such gap.
   - **Consequence:** numeric attributes from OTel-origin and Lua-authored spans reach Datadog as
     span measures, not tags.
-  - **Workaround:** a `lua` stage ahead of `datadog_trace_out` that rewrites the integer
-    attributes you want as tags into strings.
+  - **Workaround:** a `lua` stage ahead of the sink that rewrites the integer attributes you want
+    as tags into strings.
   - **Revisit trigger:** a user who needs numeric OTel attributes as Datadog tags. Possible fixes,
     not decided: a typed home for span metrics (a `metrics` map on `SpanExt`), or a rule that
     depends on where the span came from.
+- **`datadog_trace_out` counts nothing for an event with no span.** The sink sends spans and APM
+  stats alone. A log-only or metrics-only event takes no route and is left off with no
+  `logit.output.events.skipped` or other counter, where `datadog_out` counts an event with no
+  payload as `events.skipped{reason="no_payload"}`.
+  - **Consequence:** a pipeline that routes logs or metrics to `datadog_trace_out` by mistake
+    loses them with nothing in the sink's telemetry to show it.
+  - **Workaround:** put `has_signal` or `route_signals` ahead of the sink so only span events
+    reach it, and compare the upstream node's `events.sent` with the sink's.
+  - **Revisit trigger:** an operator who loses data this way.
 - **`datadog_out` sends no Agent-style `h`/`ms` aggregates.** An Agent turns a DogStatsD `h` or
   `ms` into `.avg`, `.count`, `.median`, `.95percentile`, and `.max` series. `aggregate` in front
   of `datadog_out` sends a sketch instead, which Datadog computes quantiles from.

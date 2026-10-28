@@ -2,7 +2,8 @@
 # crates/logit-proto/src/otlp/metrics.rs's "Decode", crates/logit-proto/src/otlp/common.rs's
 # `Value` ↔ `AnyValue` and resource and scope mapping, crates/logit-proto/src/otlp/mod.rs's
 # "Nesting", and crates/logit-inputs/src/otlp.rs's OTLP/HTTP request handling. A case names the
-# ones it exercises in its `.meta.yaml`. Logs and traces have none yet.
+# ones it exercises in its `.meta.yaml`. Logs are features/otlp-logs.yaml's and traces
+# features/otlp-traces.yaml's.
 - name: otlp_json
   text: An OTLP/JSON `/v1/metrics` body, chosen by an `application/json` `content-type`.
 - name: protobuf

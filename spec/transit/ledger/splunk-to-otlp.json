@@ -10,11 +10,9 @@
     {"sink":"otlp_out","row":"attributes/number_value","cell":0,"observed":["exact","normalized"]},
     {"sink":"otlp_out","row":"attributes/resource_attribute","cell":0,"observed":["exact"]},
     {"sink":"otlp_out","row":"attributes/service_identity","cell":0,"observed":["exact"]},
-    {"sink":"otlp_out","row":"attributes/span_kind","cell":0,"observed":["exact"]},
     {"sink":"otlp_out","row":"attributes/splunk_envelope","cell":0,"observed":["exact"]},
     {"sink":"otlp_out","row":"attributes/string_value","cell":0,"observed":["exact"]},
     {"sink":"otlp_out","row":"attributes/syslog_facility","cell":0,"observed":["exact"]},
-    {"sink":"otlp_out","row":"attributes/trace_id_high","cell":0,"observed":["exact"]},
     {"sink":"otlp_out","row":"log/body_format","cell":0,"observed":["exact"]},
     {"sink":"otlp_out","row":"log/event_name","cell":0,"observed":["exact"]},
     {"sink":"otlp_out","row":"log/observed_timestamp_unset","cell":0,"observed":["normalized"]},
@@ -25,8 +23,7 @@
     {"sink":"otlp_out","row":"log/timestamp","cell":0,"observed":["exact"]},
     {"sink":"otlp_out","row":"log/trace","cell":0,"observed":["exact"]},
     {"sink":"otlp_out","row":"log/trace_flags","cell":0,"observed":["exact"]},
-    {"sink":"otlp_out","row":"log/trace_unset","cell":0,"observed":["exact"]},
-    {"sink":"otlp_out","row":"span/alone","cell":0,"observed":["exact"]}
+    {"sink":"otlp_out","row":"log/trace_unset","cell":0,"observed":["exact"]}
   ],
   "unspecified": []
 }

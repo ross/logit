@@ -91,8 +91,8 @@
 //! | `log/bytes_message` | exact | -- | A `bytesValue` body. |
 //! | `log/blank_message` | exact | -- | An empty string body, or a log record with no body. |
 //! | `span/alone` | exact | -- | An OTLP span. |
-//! | `span/beside_log` | exact | -- | An OTLP span. |
-//! | `span/no_wire_form` | exact | -- | OTLP carries the status, its message, `trace_state`, flags, and dropped counts. |
+//! | `span/not_datadog_origin` | exact | -- | Nothing beyond the span's `span/alone`, `span/beside_log`, or `span/beside_metrics` outcome: only `datadog_out` gates a trace chunk. |
+//! | `span/needs_agent_processing` | exact | -- | Nothing beyond the span's `span/alone`, `span/beside_log`, or `span/beside_metrics` outcome: only `datadog_out` gates a trace chunk. |
 //! | `event/attributes_only` | skipped | `logit.output.events.skipped{reason=no_payload}` | An event with no metric, log, or span has no OTLP signal and isn't sent. |
 //! | `event/string_only` | skipped | `logit.output.events.skipped{reason=no_payload}` | An InfluxDB point whose fields are all strings has no OTLP signal and isn't sent, so its fields are lost. |
 //!
@@ -137,6 +137,13 @@
 //! | `attributes/datadog_carrier_log` | lost | structural | A `_logit.` carrier is private and isn't an OTLP attribute, so it's left off. |
 //! | `attributes/severity_carrier_otel` | exact | -- | The raw `severity_number` and `severity_text` the carriers hold, which otlp_in reads back into the same carriers beside the band's severity. |
 //! | `attributes/severity_carrier_syslog` | lost | structural | A `_logit.` carrier is private and isn't an OTLP attribute, so it's left off and the severity reads back at band resolution. |
+//! | `attributes/span_numeric` | normalized | `u64_as_int`; `logit.output.attributes.normalized{reason=u64_as_double}` | An integer or double span attribute. A `u64` reads back as an `i64`, or, above `i64::MAX`, as a double, counted once per such value. |
+//! | `attributes/datadog_span_identity` | exact | -- | A string span attribute. |
+//! | `attributes/datadog_span_marks` | exact | -- | An ordinary span attribute: Datadog's internal mark leaves as an OTel attribute. |
+//! | `attributes/datadog_carrier_span` | lost | structural | OTLP has no field for a Datadog trace chunk's fields or a span's raw `error`, and a `_logit.` carrier is private, so it's left off. |
+//! | `attributes/datadog_tracer_resource` | lost | structural | OTLP has no field for a `TracerPayload`'s fields, and a `_logit.` carrier is private, so it's left off. |
+//! | `attributes/datadog_tracer_headers` | lost | structural | OTLP has no field for a tracer request header, and a `_logit.` carrier is private, so it's left off. |
+//! | `attributes/datadog_agent_resource` | lost | structural | OTLP has no field for an `AgentPayload`'s fields, and a `_logit.` carrier is private, so it's left off. |
 //! | `attributes/syslog_header` | normalized | `u64_as_int` | A string or integer attribute; `intValue` is signed, so a `u64` `syslog.facility` or `process.pid` reads back as an `i64`. |
 //! | `attributes/syslog_msgid` | exact | -- | A string attribute. |
 //! | `attributes/syslog_sd` | exact | -- | A key-value list attribute. |
@@ -164,6 +171,36 @@
 //! | `log/timestamp` | exact | -- | The `LogRecord`'s `time_unix_nano`. |
 //! | `log/receipt_timestamp` | exact | -- | The `LogRecord`'s `time_unix_nano`, the time the log was received. |
 //! | `log/beside_metrics` | exact | -- | An OTLP log record in the logs request, beside the metrics in theirs. |
+//! | `span/name` | exact | -- | The span's `name`. |
+//! | `span/name_structured` | lost | uncounted | OTLP's span `name` is a string, and a name that isn't a `Str` leaves as `""`, uncounted. |
+//! | `span/trace_id` | exact | -- | The 16-byte `trace_id`. |
+//! | `span/parent_span_id` | exact | -- | The 8-byte `parent_span_id`. |
+//! | `span/parent_unset` | exact | -- | An empty `parent_span_id`, read back as no parent. |
+//! | `span/kind` | exact | -- | The `SpanKind`. |
+//! | `span/status_error` | exact | -- | `Status.code` `STATUS_CODE_ERROR`. |
+//! | `span/status_ok` | exact | -- | `Status.code` `STATUS_CODE_OK`. |
+//! | `span/status_unset` | exact | -- | `Status.code` `STATUS_CODE_UNSET`, read back as unset. |
+//! | `span/status_message` | exact | -- | `Status.message`. |
+//! | `span/timestamp` | exact | -- | `start_time_unix_nano`. |
+//! | `span/end_timestamp` | exact | -- | `end_time_unix_nano`. |
+//! | `span/end_before_start` | exact | -- | `end_time_unix_nano` as it is, earlier than the start. |
+//! | `span/flags` | exact | -- | The span's `flags`. |
+//! | `span/trace_state` | exact | -- | The span's `trace_state`. |
+//! | `span/dropped_attributes_count` | exact | -- | The span's `dropped_attributes_count`. |
+//! | `span/dropped_events_count` | exact | -- | The span's `dropped_events_count`. |
+//! | `span/dropped_links_count` | exact | -- | The span's `dropped_links_count`. |
+//! | `span/events` | exact | -- | Each span event's time, name, and attributes. |
+//! | `span/event_nested_attribute` | exact | -- | A key-value list, array, or empty attribute of a span event, as OTLP writes any attribute. |
+//! | `span/event_name_structured` | lost | uncounted | OTLP's span event `name` is a string, and a name that isn't a `Str` leaves as `""`, uncounted. |
+//! | `span/nested_bytes_attribute` | exact | -- | A `bytesValue` attribute of a span event or link. |
+//! | `span/nested_u64_attribute` | normalized | `u64_as_int` | A `u64` attribute of a span event or link reads back as an `i64`, or, above `i64::MAX`, as a double, approximate beyond 2^53 and uncounted. |
+//! | `span/nested_timestamp_attribute` | normalized | `timestamp_as_int` | A timestamp attribute of a span event or link leaves as an `intValue` of Unix nanoseconds, read back as an `i64`. |
+//! | `span/event_dropped_count` | exact | -- | A span event's `dropped_attributes_count`. |
+//! | `span/links` | exact | -- | Each link's ids and attributes. |
+//! | `span/link_flags` | exact | -- | A link's `flags`. |
+//! | `span/link_trace_state` | exact | -- | A link's `trace_state`. |
+//! | `span/link_dropped_count` | exact | -- | A link's `dropped_attributes_count`. |
+//! | `span/beside_log` | exact | -- | The span in the traces request and the log in the logs request, each read back as an event of its own. |
 //! | `span/beside_metrics` | exact | -- | An OTLP span in the traces request, beside the metrics in theirs. |
 //!
 //! <!-- transit:end -->

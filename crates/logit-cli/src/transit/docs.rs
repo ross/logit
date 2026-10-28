@@ -36,13 +36,14 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 /// The files holding regions, relative to the repository root.
-const FILES: [&str; 10] = [
+const FILES: [&str; 11] = [
     "crates/logit-outputs/src/statsd.rs",
     "crates/logit-outputs/src/syslog.rs",
     "crates/logit-proto/src/prometheus/mod.rs",
     "crates/logit-proto/src/influxdb/mod.rs",
     "crates/logit-proto/src/otlp/mod.rs",
     "crates/logit-proto/src/datadog/mod.rs",
+    "crates/logit-outputs/src/datadog_trace.rs",
     "crates/logit-proto/src/graphite/mod.rs",
     "crates/logit-proto/src/splunk/mod.rs",
     "crates/logit-outputs/src/kafka/encode.rs",
@@ -53,12 +54,13 @@ const FILES: [&str; 10] = [
 const REGENERATE: &str = "script/transit docs";
 
 /// Each sink's protocol, as `mappings.md`'s `encode (<Protocol>)` labels name it.
-const PROTOCOLS: [(&str, &str); 9] = [
+const PROTOCOLS: [(&str, &str); 10] = [
     ("statsd_out", "statsd"),
     ("prometheus_out", "Prometheus"),
     ("influxdb_out", "InfluxDB"),
     ("otlp_out", "OTLP"),
     ("datadog_out", "Datadog"),
+    ("datadog_trace_out", "Datadog"),
     ("graphite_out", "Graphite"),
     ("syslog_out", "syslog"),
     ("splunk_hec_out", "Splunk"),

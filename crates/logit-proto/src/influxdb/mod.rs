@@ -167,8 +167,8 @@
 //! | `log/dogstatsd_event` | skipped | `logit.output.events.skipped{reason=no_metrics}` | A log has no line-protocol form and isn't written. |
 //! | `log/plain` | skipped | `logit.output.events.skipped{reason=no_metrics}` | A log has no line-protocol form and isn't written. |
 //! | `span/alone` | skipped | `logit.output.events.skipped{reason=no_metrics}` | A span has no line-protocol form and isn't written. |
-//! | `span/beside_log` | skipped | `logit.output.events.skipped{reason=no_metrics}` | A span has no line-protocol form and isn't written. |
-//! | `span/no_wire_form` | exact | -- | Nothing beyond `span/alone`'s outcome. |
+//! | `span/not_datadog_origin` | exact | -- | Nothing beyond the span's `span/alone`, `span/beside_log`, or `span/beside_metrics` outcome: only `datadog_out` gates a trace chunk. |
+//! | `span/needs_agent_processing` | exact | -- | Nothing beyond the span's `span/alone`, `span/beside_log`, or `span/beside_metrics` outcome: only `datadog_out` gates a trace chunk. |
 //! | `event/attributes_only` | skipped | `logit.output.events.skipped{reason=no_metrics}` | An event with no metric, log, or span and no `_logit.influxdb.measurement` carrier has no measurement to write under and isn't written. A stage that drops the carrier leaves an InfluxDB point whose fields are all strings this way: a `remove` of it, or a `keep` under `private: drop`, which drops the string fields too. |
 //! | `event/string_only` | exact | -- | A line of the event's `_logit.field.*` string fields under the measurement its `_logit.influxdb.measurement` carrier names, read back as the same event. |
 //!
@@ -208,6 +208,7 @@
 //! | `attributes/datadog_carrier_log` | lost | structural | Another protocol's `_logit.` carrier is private and isn't a tag, so it's left off. |
 //! | `attributes/no_host` | exact | -- | A record with no host leaves with none. |
 //! | `log/beside_metrics` | lost | uncounted | A log on an event that carries metrics is left off while the metrics are written, uncounted. |
+//! | `span/beside_log` | lost | `logit.output.events.skipped{reason=no_metrics}` | A span has no line-protocol form, and the event, which has no metrics, isn't written. |
 //! | `span/beside_metrics` | lost | uncounted | A span on an event that carries metrics is left off while the metrics are written, uncounted. |
 //!
 //! <!-- transit:end -->

@@ -102,6 +102,12 @@ const TRACER_CARRIERS: [&str; 7] = [
     RESOURCE_ATTR_TRACER_CONTAINER_DEBUG,
 ];
 
+/// Whether `key` is a tracer header's resource carrier that no payload form has a field for, so
+/// only the request header restores it ([`super::is_tracer_header_attr`]).
+pub fn is_tracer_header_only_attr(key: &str) -> bool {
+    super::is_tracer_header_attr(key) && !TRACER_CARRIERS.contains(&key)
+}
+
 const AGENT_CARRIERS: [&str; 7] = [
     RESOURCE_ATTR_AGENT_HOSTNAME,
     RESOURCE_ATTR_AGENT_ENV,
@@ -987,7 +993,7 @@ impl DatadogEncoder {
             .chain(&super::TRACER_FLAG_HEADERS)
             .chain(&super::TRACER_U64_HEADERS)
             .map(|&(_, attr)| attr)
-            .filter(|attr| !TRACER_CARRIERS.contains(attr));
+            .filter(|attr| is_tracer_header_only_attr(attr));
         lost += header_only.filter(|attr| lost_here(attr)).count();
         self.span_out_degraded("no_wire_form", lost);
     }

@@ -1,0 +1,5 @@
+# The Datadog Agent's /api/v0.2/traces AgentPayload, protobuf and zstd, 30 spans across its
+# traces with the Agent's `_top_level` mark on each root, read in place from testdata/interop/
+# with its .headers.
+wire: ../../../../testdata/interop/datadog/agent-api-v0-2-traces-000.bin
+exercises: [agent_payload, zstd]

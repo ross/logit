@@ -96,9 +96,13 @@
   "sc4s-startup-out": {"events": [
     {"timestamp":"2026-09-25T17:50:01.312000000Z","log":{"format":"raw","message":"syslog-ng-config: sc4s version=3.40.0"},"attributes":{"sc4s_class":"events","sc4s_container":"splunk-sc4s-fixture","sc4s_destport":0,"sc4s_fromhostip":"127.0.0.1","sc4s_product":"sc4s","sc4s_proto":0,"sc4s_recv_time":"1790358601.312","sc4s_tags":".source.s_startup_out","sc4s_vendor":"splunk"},"resource":{"attributes":{"com.splunk.index":"main","com.splunk.source":"sc4s","com.splunk.sourcetype":"sc4s:events:startup:out","host.name":"splunk-sc4s-fixture"}}}
   ], "counters": {}},
-  "span": {"events": [
-    {"timestamp":"2026-09-25T17:48:48.548903048Z","span":{"name":"okey-dokey-0","trace_id":"809a1351ec7c321df2b4d977b8de625a","span_id":"d65b3b2ec40507b0","parent_span_id":"0c44d6900d47ee3d","kind":"server","status":"unset","start":"2026-09-25T17:48:48.548903048Z","end":"2026-09-25T17:48:48.549026048Z","duration_ns":123000},"attributes":{"peer":"x"},"resource":{"attributes":{"com.splunk.index":"main","com.splunk.source":"otel:telemetrygen","com.splunk.sourcetype":"otel:traces","host.name":"unknown","service.name":"svc"}}}
-  ], "counters": {}},
+  "span-malformed": {"events": [
+    {"timestamp":"2026-09-25T17:48:48.200000000Z","log":{"format":"json","message":{"trace_id":"a3ce929d0e0e47364bf92f3577b34da6","span_id":"53995c3f42cd8ad8","end_time":1790358528200001000,"kind":"SPAN_KIND_SERVER","name":"zero-parent","parent_span_id":"0000000000000000","start_time":1790358528200000000,"status":{"message":"","code":"STATUS_CODE_UNSET"}}},"attributes":{"service.name":"checkout"},"resource":{"attributes":{"com.splunk.index":"main","com.splunk.source":"otel:app","com.splunk.sourcetype":"otel:traces","host.name":"web-1"}}},
+    {"timestamp":"2026-09-25T17:48:48.200001000Z","log":{"format":"json","message":{"trace_id":"a3ce929d0e0e47364bf92f3577b34da6","span_id":"53995c3f42cd8ad9","end_time":1790358528200002000,"kind":"SPAN_KIND_SERVER","name":"with-flags","parent_span_id":"","start_time":1790358528200001000,"status":{"message":"","code":"STATUS_CODE_UNSET"},"flags":257}},"attributes":{"service.name":"checkout"},"resource":{"attributes":{"com.splunk.index":"main","com.splunk.source":"otel:app","com.splunk.sourcetype":"otel:traces","host.name":"web-1"}}},
+    {"timestamp":"2026-09-25T17:48:48.200002000Z","log":{"format":"json","message":{"trace_id":"a3ce929d0e0e47364bf92f3577b34da6","span_id":"53995c3f42cd8ada","end_time":1790358528200003000,"kind":"SPAN_KIND_SERVER","name":"with-trace-state","parent_span_id":"","start_time":1790358528200002000,"status":{"message":"","code":"STATUS_CODE_UNSET"},"trace_state":"rojo=00f067aa0ba902b7"}},"attributes":{"service.name":"checkout"},"resource":{"attributes":{"com.splunk.index":"main","com.splunk.source":"otel:app","com.splunk.sourcetype":"otel:traces","host.name":"web-1"}}}
+  ], "counters": {
+    "logit.input.spans.degraded{component=transit.decode,kind=splunk_hec_in,reason=malformed_span,role=listener}": 3
+  }},
   "times": {"events": [
     {"timestamp":"2026-09-21T14:13:20.000000000Z","log":{"format":"raw","message":"integer"},"resource":{"attributes":{"host.name":"transit"}}},
     {"timestamp":"2026-09-21T14:13:20.123456789Z","log":{"format":"raw","message":"nine decimals"},"resource":{"attributes":{"host.name":"transit"}}},

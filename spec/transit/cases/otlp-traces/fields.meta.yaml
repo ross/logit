@@ -1,0 +1,7 @@
+# A hand-written OTLP/JSON body: a span with sampled flags, a `trace_state`, each dropped count,
+# two events (scalar attributes, then a key-value list and an array attribute with a dropped
+# count), and two links (one with flags, a `trace_state`, a key-value list attribute, and a dropped
+# count, one with none of them); a span whose end precedes its start; and a span whose trace id's
+# high 64 bits are zero.
+wire: fields.bin
+exercises: [otlp_json, flags, trace_state, dropped_attributes_count, dropped_events_count, dropped_links_count, events, event_attribute_scalar, event_attribute_nested, event_dropped_count, links, link_flags, link_trace_state, link_attribute_nested, link_dropped_count, end_before_start, trace_id_128, trace_id_64]

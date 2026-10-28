@@ -1,0 +1,14 @@
+# otlp_in's trace cases into kafka_out with nothing between, under `format: text`: a record holds a
+# log's body alone, so a span is skipped, or left off beside a log.
+# `path:` names one case so `logit run` can run this by hand; the transit spec runs every case in
+# that file's directory (spec/transit/README.md).
+components:
+  case:
+    type: replay_in
+    path: ../cases/otlp-traces/beside.json
+  out:
+    type: kafka_out
+    sources: [case]
+    brokers: ["127.0.0.1:9092"]
+    topic: logs
+    format: text

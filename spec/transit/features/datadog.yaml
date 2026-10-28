@@ -2,7 +2,9 @@
 # crates/logit-proto/src/datadog/mod.rs's "Decode: series and distribution points → events" and
 # "Decode: sketches → events" tables and crates/logit-inputs/src/datadog.rs's routes. A case names
 # the ones it exercises in its `.meta.yaml`. Service checks have one feature; logs and events are
-# cases/datadog-logs/'s (features/datadog-logs.yaml), and APM traces and stats have none yet.
+# cases/datadog-logs/'s (features/datadog-logs.yaml), APM traces are cases/datadog-traces/'s
+# (features/datadog-traces.yaml) and a tracer's requests cases/ddtrace/'s (features/ddtrace.yaml),
+# and APM stats have none yet.
 - name: series_v1
   text: A `/api/v1/series` JSON body, each point `[timestamp, value]`.
 - name: series_v2_json

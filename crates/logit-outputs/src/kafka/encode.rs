@@ -108,10 +108,8 @@
 //! | `log/blank_message`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
 //! | `span/alone`, under `format: text` | skipped | `logit.output.events.skipped{reason=no_log}` | An event with no log has no `format: text` record. |
 //! | `span/alone`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
-//! | `span/beside_log`, under `format: text` | skipped | `logit.output.spans.omitted{reason=format}` | The record holds the log body alone, so the span beside it is left off, counted. |
-//! | `span/beside_log`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
-//! | `span/no_wire_form`, under `format: text` | skipped | `logit.output.events.skipped{reason=no_log}` | An event with no log has no `format: text` record. |
-//! | `span/no_wire_form`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `span/not_datadog_origin` | exact | -- | Nothing beyond the span's `span/alone`, `span/beside_log`, or `span/beside_metrics` outcome: only `datadog_out` gates a trace chunk. |
+//! | `span/needs_agent_processing` | exact | -- | Nothing beyond the span's `span/alone`, `span/beside_log`, or `span/beside_metrics` outcome: only `datadog_out` gates a trace chunk. |
 //! | `event/attributes_only`, under `format: text` | skipped | `logit.output.events.skipped{reason=no_log}` | An event with no log has no `format: text` record. |
 //! | `event/attributes_only`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
 //! | `event/string_only`, under `format: text` | skipped | `logit.output.events.skipped{reason=no_log}` | An InfluxDB point whose fields are all strings has no log, so it has no `format: text` record. |
@@ -185,6 +183,13 @@
 //! | `attributes/severity_carrier_otel`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
 //! | `attributes/severity_carrier_syslog`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
 //! | `attributes/severity_carrier_syslog`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `attributes/span_numeric` | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
+//! | `attributes/datadog_span_identity` | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
+//! | `attributes/datadog_span_marks` | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
+//! | `attributes/datadog_carrier_span` | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
+//! | `attributes/datadog_tracer_resource` | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
+//! | `attributes/datadog_tracer_headers` | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
+//! | `attributes/datadog_agent_resource` | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
 //! | `attributes/syslog_header`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
 //! | `attributes/syslog_header`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
 //! | `attributes/syslog_msgid`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
@@ -232,6 +237,37 @@
 //! | `log/receipt_timestamp`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
 //! | `log/beside_metrics`, under `format: text` | exact | `logit.output.metrics.omitted{reason=format}` | The log's body as the record; the event's metrics are left off, counted. |
 //! | `log/beside_metrics`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `span/name` | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
+//! | `span/name_structured` | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
+//! | `span/trace_id` | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
+//! | `span/parent_span_id` | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
+//! | `span/parent_unset` | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
+//! | `span/kind` | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
+//! | `span/status_error` | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
+//! | `span/status_ok` | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
+//! | `span/status_unset` | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
+//! | `span/status_message` | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
+//! | `span/timestamp` | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
+//! | `span/end_timestamp` | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
+//! | `span/end_before_start` | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
+//! | `span/flags` | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
+//! | `span/trace_state` | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
+//! | `span/dropped_attributes_count` | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
+//! | `span/dropped_events_count` | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
+//! | `span/dropped_links_count` | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
+//! | `span/events` | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
+//! | `span/event_nested_attribute` | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
+//! | `span/event_name_structured` | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
+//! | `span/nested_bytes_attribute` | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
+//! | `span/nested_u64_attribute` | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
+//! | `span/nested_timestamp_attribute` | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
+//! | `span/event_dropped_count` | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
+//! | `span/links` | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
+//! | `span/link_flags` | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
+//! | `span/link_trace_state` | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
+//! | `span/link_dropped_count` | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
+//! | `span/beside_log`, under `format: text` | lost | `logit.output.spans.omitted{reason=format}` | The record holds the log body alone, so the span beside it is left off, counted. |
+//! | `span/beside_log`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
 //! | `span/beside_metrics`, under `format: text` | lost | `logit.output.events.skipped{reason=no_log}` | An event with no log has no `format: text` record, so the span and its metrics are left off, counted once for the event. |
 //! | `span/beside_metrics`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
 //!

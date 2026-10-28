@@ -1,0 +1,4 @@
+# Hand-written event JSON lines: a `_top_level` span with an attribute of each value kind: an
+# integer an `f64` holds, one it doesn't, a double, a bool, a timestamp, an array, a map, a null,
+# and bytes.
+exercises: [top_level_root, attribute_int, attribute_int_inexact, attribute_double, attribute_bool, attribute_timestamp, attribute_array, attribute_map, attribute_null, attribute_bytes]

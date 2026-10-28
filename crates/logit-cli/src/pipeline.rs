@@ -1357,10 +1357,7 @@ pub(crate) fn build_spec(
                 .with_concurrency(*concurrency)
                 .with_idle_timeout(*idle_timeout)
                 .with_connect_timeout(*connect_timeout)
-                .with_version(match version {
-                    logit_config::DatadogTraceVersion::V04 => TracerApiForm::V04,
-                    logit_config::DatadogTraceVersion::V07 => TracerApiForm::V07,
-                })
+                .with_version(tracer_api_form(*version))
                 .with_compression(match compression {
                     logit_config::DatadogTraceCompression::None => DatadogTraceOutCompression::None,
                     logit_config::DatadogTraceCompression::Gzip => DatadogTraceOutCompression::Gzip,
@@ -1759,6 +1756,10 @@ pub(crate) enum SinkEncoder {
     /// beside it, under `format`. The producer's batching, compression, and per-record size check
     /// aren't run.
     Kafka { encoder: logit_outputs::kafka::KafkaEncoder, format: RecordFormat },
+    /// `datadog_trace_out`: one trace request and one stats request per batch, at `version`'s
+    /// path, with the tracer headers the sink restores
+    /// (`logit_outputs::datadog_trace::encode_requests`).
+    DatadogTrace { encoder: logit_proto::datadog::DatadogEncoder, version: TracerApiForm },
 }
 
 /// The [`SinkEncoder`] for `kind`, its codec counting through `telemetry` and `diag`. Every
@@ -1878,8 +1879,22 @@ pub(crate) fn sink_encoder(
                 format: settings.format,
             }
         }
+        DatadogTraceOut { version, .. } => SinkEncoder::DatadogTrace {
+            encoder: logit_proto::datadog::DatadogEncoder::new()
+                .with_telemetry(telemetry.clone())
+                .with_diagnostics(diag.clone()),
+            version: tracer_api_form(*version),
+        },
         other => anyhow::bail!("{} has no encoder this driver reaches", graph::kind_name(other)),
     })
+}
+
+/// `datadog_trace_out`'s `version:` as its encoder's form.
+fn tracer_api_form(version: logit_config::DatadogTraceVersion) -> TracerApiForm {
+    match version {
+        logit_config::DatadogTraceVersion::V04 => TracerApiForm::V04,
+        logit_config::DatadogTraceVersion::V07 => TracerApiForm::V07,
+    }
 }
 
 /// `datadog_out`'s `histograms:` block as its encoder's options.

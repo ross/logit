@@ -1,0 +1,6 @@
+# Hand-written event JSON lines: a /v0.7/traces TracerPayload's trace as datadog_trace_in decodes
+# it, an unmarked root and an error child, each carrying the chunk's priority, origin,
+# droppedTrace, and tags, under a resource holding the payload's fields (container.id, the
+# tracer carriers, runtime_id, tags, container_debug, host.name, the environment, and the
+# version) beside the carriers only the request headers carry. No capture is v0.7.
+exercises: [v07_payload, tracer_headers, container_id, unmarked_root, chunk_carriers, span_identity, span_marks, span_error_status, parent_span_id]

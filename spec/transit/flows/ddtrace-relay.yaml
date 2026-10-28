@@ -1,0 +1,12 @@
+# datadog_trace_in's tracer cases into datadog_trace_out with nothing between, under the default
+# `version: v0.4`: the like pair, the tracer's carriers restored as request headers.
+# `path:` names one case so `logit run` can run this by hand; the transit spec runs every case in
+# that file's directory (spec/transit/README.md).
+components:
+  case:
+    type: replay_in
+    path: ../cases/ddtrace/v04.json
+  out:
+    type: datadog_trace_out
+    sources: [case]
+    endpoint: http://127.0.0.1:8126

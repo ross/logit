@@ -1,0 +1,81 @@
+{
+ "resourceSpans": [
+  {
+   "resource": {
+    "attributes": [
+     {
+      "key": "service.name",
+      "value": {
+       "stringValue": "checkout"
+      }
+     }
+    ]
+   },
+   "scopeSpans": [
+    {
+     "scope": {
+      "name": "checkout.tracer",
+      "version": "1.0.0"
+     },
+     "spans": [
+      {
+       "traceId": "4bf92f3577b34da6a3ce929d0e0e4701",
+       "spanId": "00f067aa0ba90201",
+       "name": "checkout",
+       "kind": 1,
+       "startTimeUnixNano": "1800000005000000000",
+       "endTimeUnixNano": "1800000005040000000"
+      },
+      {
+       "traceId": "4bf92f3577b34da6a3ce929d0e0e4701",
+       "spanId": "00f067aa0ba90202",
+       "name": "GET /cart",
+       "kind": 2,
+       "startTimeUnixNano": "1800000005001000000",
+       "endTimeUnixNano": "1800000005031000000",
+       "parentSpanId": "00f067aa0ba90201",
+       "status": {
+        "code": 1
+       }
+      },
+      {
+       "traceId": "4bf92f3577b34da6a3ce929d0e0e4701",
+       "spanId": "00f067aa0ba90203",
+       "name": "SELECT cart",
+       "kind": 3,
+       "startTimeUnixNano": "1800000005002000000",
+       "endTimeUnixNano": "1800000005012000000",
+       "parentSpanId": "00f067aa0ba90201",
+       "status": {
+        "code": 2,
+        "message": "connection reset"
+       }
+      },
+      {
+       "traceId": "4bf92f3577b34da6a3ce929d0e0e4701",
+       "spanId": "00f067aa0ba90204",
+       "name": "publish order",
+       "kind": 4,
+       "startTimeUnixNano": "1800000005003000000",
+       "endTimeUnixNano": "1800000005008000000",
+       "parentSpanId": "00f067aa0ba90201",
+       "status": {
+        "code": 2
+       }
+      },
+      {
+       "traceId": "4bf92f3577b34da6a3ce929d0e0e4701",
+       "spanId": "00f067aa0ba90205",
+       "name": "consume order",
+       "kind": 5,
+       "startTimeUnixNano": "1800000005004000000",
+       "endTimeUnixNano": "1800000005009000000",
+       "parentSpanId": "00f067aa0ba90201",
+       "status": {}
+      }
+     ]
+    }
+   ]
+  }
+ ]
+}

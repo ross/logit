@@ -20,7 +20,6 @@
     {"sink":"datadog_out","row":"attributes/syslog_facility","cell":0,"observed":["exact"]},
     {"sink":"datadog_out","row":"attributes/syslog_timestamp","cell":0,"observed":["exact"]},
     {"sink":"datadog_out","row":"attributes/timestamp_value","cell":0,"observed":["normalized"]},
-    {"sink":"datadog_out","row":"attributes/trace_id_high","cell":0,"observed":["normalized"]},
     {"sink":"datadog_out","row":"gauge/i64","cell":0,"observed":["normalized"]},
     {"sink":"datadog_out","row":"log/beside_metrics","cell":0,"observed":["exact"]},
     {"sink":"datadog_out","row":"log/blank_message","cell":0,"observed":["exact"]},
@@ -41,7 +40,7 @@
     {"sink":"datadog_out","row":"log/trace_beside_id_attribute","cell":0,"observed":["lost"]},
     {"sink":"datadog_out","row":"log/trace_flags","cell":0,"observed":["lost"]},
     {"sink":"datadog_out","row":"log/trace_unset","cell":0,"observed":["exact"]},
-    {"sink":"datadog_out","row":"span/beside_log","cell":0,"observed":["exact"]}
+    {"sink":"datadog_out","row":"span/not_datadog_origin","cell":0,"observed":["dropped"]}
   ],
   "unspecified": []
 }

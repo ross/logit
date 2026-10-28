@@ -29,7 +29,7 @@ classes:
 # docs/adr/telemetry-loss-vocabulary.md's amendments "structural loss has no counter" and "an
 # ignored signal, and a format the config selects" have the rules.
 
-sinks: [statsd_out, prometheus_out, influxdb_out, otlp_out, datadog_out, graphite_out, syslog_out, splunk_hec_out, kafka_out]
+sinks: [statsd_out, prometheus_out, influxdb_out, otlp_out, datadog_out, datadog_trace_out, graphite_out, syslog_out, splunk_hec_out, kafka_out]
 
 rows:
   # --- sum: temporality and monotonicity -------------------------------------------------------
@@ -331,6 +331,12 @@ rows:
         text: >-
           A series `gauge` point, a `rate` under the `_logit.metrics.type` flag, or unspecified
           under the `_logit.datadog.type` carrier.
+      datadog_trace_out:
+        class: skipped
+        reason: uncounted
+        text: >-
+          The sink sends spans alone, so a gauge beside a span takes no route and is left off,
+          uncounted.
       graphite_out:
         class: exact
         text: A `path value timestamp` line, or a pickled datapoint.
@@ -361,6 +367,12 @@ rows:
         reason: integer_as_double
         text: >-
           The point's double, the integer's nearest `f64`, read back as a float.
+      datadog_trace_out:
+        class: skipped
+        reason: uncounted
+        text: >-
+          The sink sends spans alone, so a gauge beside a span takes no route and is left off,
+          uncounted.
       graphite_out:
         class: normalized
         reason: f64_value
@@ -2015,6 +2027,9 @@ rows:
         text: >-
           A `key:value` tag, `host` included. `host.name` is the record's host, which datadog_in
           reads back as `host.name` on every route. On a log, a top-level key of the log object.
+      datadog_trace_out:
+        class: exact
+        text: A `meta` entry of the span, read back as the attribute.
       graphite_out:
         - when: {tags: drop}
           class: lost
@@ -2310,6 +2325,16 @@ rows:
           a log, a `container_id:<id>` entry appended to `ddtags`, the Agent's tag for a
           container's logs, which datadog_in keeps in the `ddtags` string, so no `container.id`
           reads back.
+      datadog_trace_out:
+        - when: {version: v0.4}
+          class: exact
+          text: >-
+            On the resource, the `Datadog-Container-ID` request header, which datadog_trace_in reads
+            back as the resource's `container.id`.
+        - class: exact
+          text: >-
+            On the resource, the `TracerPayload`'s `container_id`, which datadog_trace_in reads back
+            as the resource's `container.id`.
       graphite_out:
         - when: {tags: drop}
           class: lost
@@ -2380,6 +2405,11 @@ rows:
         text: >-
           On a metric, an event, or a service check, Datadog's `env`, `version`, or `service`
           tag, the Datadog OTLP exporter's spelling, which datadog_in reads back as the key.
+      datadog_trace_out:
+        class: exact
+        text: >-
+          On a span, `deployment.environment.name` and `service.version` are the span's `env` and
+          `version` meta entries, which datadog_trace_in reads back as the key.
       graphite_out:
         - when: {tags: drop}
           class: lost
@@ -2591,7 +2621,12 @@ rows:
         reason: bool_tag
         text: >-
           `true` is a bare `key` tag and reads back `true`; `false` is `key:false` and reads back as
-          the string. On a log, a JSON boolean, read back as itself.
+          the string. On a log, a JSON boolean, read back as itself. On a span, a `meta` entry of
+          `true` or `false`, read back as the string.
+      datadog_trace_out:
+        class: normalized
+        reason: stringified
+        text: A `meta` entry of `true` or `false`, read back as the string.
       graphite_out:
         - when: {tags: drop}
           class: lost
@@ -2747,7 +2782,14 @@ rows:
         reason: stringified
         text: >-
           One tag per element in order, which datadog_in folds back into an array of strings, so a
-          number element reads back as its text. On a log, a JSON array, read back as itself.
+          number element reads back as its text. On a log, a JSON array, read back as itself. On a
+          span, a `meta` entry of its JSON text, counted as `spans.degraded{reason=json_text}`, read
+          back as a string.
+      datadog_trace_out:
+        class: normalized
+        reason: json_text
+        counter: logit.output.spans.degraded{reason=json_text}
+        text: A `meta` entry of its JSON text, counted, read back as a string.
       graphite_out:
         - when: {tags: drop}
           class: lost
@@ -2821,7 +2863,13 @@ rows:
         counter: logit.output.tags.omitted{reason=unrepresentable}
         text: >-
           A tag has no nested form, so a map is left off, counted. On a log, a JSON object, read
-          back as itself.
+          back as itself. On a span, a `meta` entry of its JSON text, counted as
+          `spans.degraded{reason=json_text}`, read back as a string.
+      datadog_trace_out:
+        class: normalized
+        reason: json_text
+        counter: logit.output.spans.degraded{reason=json_text}
+        text: A `meta` entry of its JSON text, counted, read back as a string.
       graphite_out:
         - when: {tags: drop}
           class: lost
@@ -2894,7 +2942,10 @@ rows:
         counter: logit.output.tags.omitted{reason=unrepresentable}
         text: >-
           A tag has no bytes form, so the value is left off, counted. On a log, its base64 text,
-          read back as a string.
+          read back as a string. On a span, a `meta_struct` entry, read back as bytes.
+      datadog_trace_out:
+        class: exact
+        text: A `meta_struct` entry of the span, read back as bytes.
       graphite_out:
         - when: {tags: drop}
           class: lost
@@ -2964,7 +3015,11 @@ rows:
         reason: stringified
         text: >-
           A `key:<RFC 3339>` tag, read back as a string. On a log, the RFC 3339 text as a JSON
-          string.
+          string. On a span, a `meta` entry of the RFC 3339 text, read back as a string.
+      datadog_trace_out:
+        class: normalized
+        reason: stringified
+        text: A `meta` entry of its RFC 3339 text, read back as a string.
       graphite_out:
         - when: {tags: drop}
           class: lost
@@ -3017,8 +3072,17 @@ rows:
         class: exact
         text: An `AnyValue` with no value set, read back as null.
       datadog_out:
-        class: exact
-        text: On a log, a JSON null, read back as itself.
+        class: normalized
+        reason: json_text
+        counter: logit.output.spans.degraded{reason=json_text}
+        text: >-
+          On a span, a `meta` entry of `null`, counted, read back as the string. On a log, a JSON
+          null, read back as itself.
+      datadog_trace_out:
+        class: normalized
+        reason: json_text
+        counter: logit.output.spans.degraded{reason=json_text}
+        text: A `meta` entry of `null`, counted, read back as the string.
       syslog_out:
         - when: {format: rfc3164}
           class: lost
@@ -3051,7 +3115,9 @@ rows:
         - class: exact
           text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
   # graphite_in stamps no `_logit.graphite.` carrier, so no record reaches this row at
-  # graphite_out and it has no cell.
+  # graphite_out and it has no cell. Nor at datadog_trace_out: the class check takes a sink's own
+  # prefix from its name less `_out`, so that sink's is `_logit.datadog_trace.`, which no decoder
+  # stamps.
   - kind: attributes
     feature: private_carrier
     cells:
@@ -3199,6 +3265,11 @@ rows:
           Another protocol's `_logit.` carrier is private and never a tag, so it's left off. The
           `_logit.statsd.event.*` and `_logit.statsd.service_check.*` carriers are read as the
           Datadog fields they name.
+      datadog_trace_out:
+        class: lost
+        reason: structural
+        text: >-
+          Another protocol's `_logit.` carrier is private and never a span tag, so it's left off.
       graphite_out:
         class: lost
         reason: structural
@@ -3687,6 +3758,20 @@ rows:
         reason: resource_as_tag
         text: >-
           Merged into the record's tags, so it reads back as an event attribute.
+      datadog_trace_out:
+        - when: {version: v0.4}
+          class: normalized
+          reason: resource_as_tag
+          text: >-
+            v0.4 has no `TracerPayload`, so a resource attribute is merged into every span's `meta`
+            or `metrics`, `host.name`, `deployment.environment.name`, and `service.version`
+            included, and reads back as an event attribute.
+        - class: normalized
+          reason: resource_as_tag
+          text: >-
+            Merged into every span's `meta` or `metrics`, so it reads back as an event attribute;
+            `host.name`, `deployment.environment.name`, and `service.version` are the
+            `TracerPayload`'s `hostname`, `env`, and `app_version`, read back on the resource.
       graphite_out:
         - when: {tags: drop}
           class: lost
@@ -3743,6 +3828,10 @@ rows:
         class: lost
         reason: structural
         text: Datadog has no instrumentation scope, so none is written.
+      datadog_trace_out:
+        class: lost
+        reason: structural
+        text: The trace API has no instrumentation scope, so none is written.
       graphite_out:
         class: lost
         reason: structural
@@ -3787,10 +3876,16 @@ rows:
         class: lost
         reason: uncounted
         text: >-
-          A `_logit.datadog.*` carrier on a log, a Datadog event, or a service check that the
-          route has no field for is left off, uncounted, where the metrics routes count one as
+          A `_logit.datadog.*` carrier on a log, a Datadog event, a service check, or a span that
+          the route has no field for is left off, uncounted, where the metrics routes count one as
           `no_wire_form`; the events route's public form has no field for the Agent envelope's
           `_logit.datadog.agent.hostname`.
+      datadog_trace_out:
+        class: lost
+        reason: structural
+        text: >-
+          A `_logit.datadog.*` carrier rides in its own wire field; one the trace API has no field
+          for, outside the chunk, span, tracer, and Agent carriers, is left off.
       graphite_out:
         class: lost
         reason: structural
@@ -3891,6 +3986,233 @@ rows:
   # A log's own `syslog.*`, `process.pid`, and `host.name` attributes. statsd_out writes a log only
   # as a DogStatsD event, prometheus_out, influxdb_out, and graphite_out don't write a log on an
   # event with no metrics, and only `host_name` reaches statsd_out.
+  # A span's attribute the span sinks treat apart by its key, ahead of the carrier and value rows.
+  # `span_numeric` is a span's integer or double event attribute, which Datadog writes to the span's
+  # `metrics`.
+  - kind: attributes
+    feature: span_numeric
+    cells:
+      otlp_out:
+        class: normalized
+        reason: u64_as_int
+        counter: logit.output.attributes.normalized{reason=u64_as_double}
+        text: >-
+          An integer or double span attribute. A `u64` reads back as an `i64`, or, above `i64::MAX`,
+          as a double, counted once per such value.
+      datadog_out:
+        class: normalized
+        reason: span_metric
+        counter: logit.output.spans.degraded{reason=int_as_f64}
+        text: >-
+          An entry of the span's `metrics`, read back as an `f64`; an integer that loses
+          precision as an `f64` is counted.
+      datadog_trace_out:
+        class: normalized
+        reason: span_metric
+        counter: logit.output.spans.degraded{reason=int_as_f64}
+        text: >-
+          An entry of the span's `metrics`, read back as an `f64`; an integer that loses precision
+          as an `f64` is counted.
+      splunk_hec_out:
+        class: exact
+        text: >-
+          A JSON number in the span's `attributes`, read back as the same integer or double; a `u64`
+          above `i64::MAX` stays a `u64`.
+      kafka_out:
+        class: exact
+        text: >-
+          The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A
+          `format: text` record writes no span (`span/alone`), so no field of one is compared.
+  # `service.name`, `resource.name`, or `span.type` on a span's event: a Datadog span's typed
+  # fields.
+  - kind: attributes
+    feature: datadog_span_identity
+    cells:
+      otlp_out:
+        class: exact
+        text: >-
+          A string span attribute.
+      datadog_out:
+        class: exact
+        text: >-
+          The span's `service`, `resource`, or `type` field, read back as the attribute.
+      datadog_trace_out:
+        class: exact
+        text: The span's `service`, `resource`, or `type` field, read back as the attribute.
+      splunk_hec_out:
+        class: exact
+        text: >-
+          A string in the span's `attributes`.
+      kafka_out:
+        class: exact
+        text: >-
+          The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A
+          `format: text` record writes no span (`span/alone`), so no field of one is compared.
+  # `_top_level`, `_sampling_priority_v1`, a `_dd.` key, or `span.kind` on a span's event: the
+  # tracer's and the Agent's marks.
+  - kind: attributes
+    feature: datadog_span_marks
+    cells:
+      otlp_out:
+        class: exact
+        text: >-
+          An ordinary span attribute: Datadog's internal mark leaves as an OTel attribute.
+      datadog_out:
+        class: exact
+        text: >-
+          A `metrics` entry for a number and a `meta` entry for a string, read back as the
+          attribute.
+      datadog_trace_out:
+        class: exact
+        text: >-
+          A `metrics` entry for a number and a `meta` entry for a string, read back as the
+          attribute.
+      splunk_hec_out:
+        class: exact
+        text: >-
+          An ordinary entry of the span's `attributes`: Datadog's internal mark leaves as an OTel
+          attribute.
+      kafka_out:
+        class: exact
+        text: >-
+          The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A
+          `format: text` record writes no span (`span/alone`), so no field of one is compared.
+  # A span's `_logit.datadog.chunk.*` or `_logit.datadog.span.error` carrier.
+  - kind: attributes
+    feature: datadog_carrier_span
+    cells:
+      otlp_out:
+        class: lost
+        reason: structural
+        text: >-
+          OTLP has no field for a Datadog trace chunk's fields or a span's raw `error`, and a
+          `_logit.` carrier is private, so it's left off.
+      datadog_out:
+        class: exact
+        text: >-
+          The chunk's `priority`, `origin`, `droppedTrace`, or `tags`, or the span's `error`, read
+          back into the carrier.
+      datadog_trace_out:
+        - when: {version: v0.4}
+          class: lost
+          counter: logit.output.spans.degraded{reason=no_wire_form}
+          text: >-
+            v0.4 has no trace chunk, so a `_logit.datadog.chunk.*` carrier is left off, counted once
+            per carrier per span. `_logit.datadog.span.error` is the span's `error`, read back into
+            the carrier.
+        - class: exact
+          text: >-
+            The chunk's `priority`, `origin`, `dropped_trace`, or `tags`, or the span's `error`,
+            read back into the carrier.
+      splunk_hec_out:
+        class: lost
+        reason: structural
+        text: >-
+          The exporter's span object has no field for a Datadog trace chunk's fields or a span's raw
+          `error`, and a `_logit.` carrier is private, so it's left off.
+      kafka_out:
+        class: exact
+        text: >-
+          The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A
+          `format: text` record writes no span (`span/alone`), so no field of one is compared.
+  # A `_logit.datadog.tracer.*` or `_logit.datadog.agent.*` resource attribute of a span's batch:
+  # `datadog_tracer_resource` for a tracer carrier a `TracerPayload` field carries,
+  # `datadog_tracer_headers` for one only a tracer request header carries (the interpreter and its
+  # vendor, the entity ID, the external environment, the two client-computed flags, and the two
+  # dropped P0 counts), and `datadog_agent_resource` for an `AgentPayload` field.
+  - kind: attributes
+    feature: datadog_tracer_resource
+    cells:
+      otlp_out:
+        class: lost
+        reason: structural
+        text: >-
+          OTLP has no field for a `TracerPayload`'s fields, and a `_logit.` carrier is private, so
+          it's left off.
+      datadog_out:
+        class: exact
+        text: The `TracerPayload`'s field, read back into the carrier.
+      datadog_trace_out:
+        - when: {version: v0.4}
+          class: lost
+          counter: logit.output.spans.degraded{reason=no_wire_form}
+          text: >-
+            v0.4 has no `TracerPayload`: a carrier a `Datadog-Meta-*` request header restores reads
+            back into the carrier, and every other one (`runtime_id`, `tags`, `container_debug`) is
+            left off, counted once per request.
+        - class: exact
+          text: The `TracerPayload`'s field, read back into the carrier.
+      splunk_hec_out:
+        class: lost
+        reason: structural
+        text: >-
+          HEC has no field for a `TracerPayload`'s fields, and a `_logit.` carrier is private, so
+          it's left off.
+      kafka_out:
+        class: exact
+        text: >-
+          The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A
+          `format: text` record writes no span (`span/alone`), so no field of one is compared.
+  - kind: attributes
+    feature: datadog_tracer_headers
+    cells:
+      otlp_out:
+        class: lost
+        reason: structural
+        text: >-
+          OTLP has no field for a tracer request header, and a `_logit.` carrier is private, so
+          it's left off.
+      datadog_out:
+        class: lost
+        counter: logit.output.spans.degraded{reason=no_wire_form}
+        text: >-
+          An `AgentPayload` has no field for a tracer request header and the intake takes no such
+          header, so the carrier is left off, counted once per request body.
+      datadog_trace_out:
+        class: exact
+        text: >-
+          The tracer request header the carrier names, sent on every trace request under either
+          `version:`, which datadog_trace_in reads back into the carrier.
+      splunk_hec_out:
+        class: lost
+        reason: structural
+        text: >-
+          HEC has no field for a tracer request header, and a `_logit.` carrier is private, so
+          it's left off.
+      kafka_out:
+        class: exact
+        text: >-
+          The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A
+          `format: text` record writes no span (`span/alone`), so no field of one is compared.
+  - kind: attributes
+    feature: datadog_agent_resource
+    cells:
+      otlp_out:
+        class: lost
+        reason: structural
+        text: >-
+          OTLP has no field for an `AgentPayload`'s fields, and a `_logit.` carrier is private, so
+          it's left off.
+      datadog_out:
+        class: exact
+        text: The `AgentPayload`'s field, read back into the carrier.
+      datadog_trace_out:
+        class: lost
+        counter: logit.output.spans.degraded{reason=no_wire_form}
+        text: >-
+          The trace API has no `AgentPayload` under either `version:`, so the carrier is left off,
+          counted once per request.
+      splunk_hec_out:
+        class: lost
+        reason: structural
+        text: >-
+          HEC has no field for an `AgentPayload`'s fields, and a `_logit.` carrier is private, so
+          it's left off.
+      kafka_out:
+        class: exact
+        text: >-
+          The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A
+          `format: text` record writes no span (`span/alone`), so no field of one is compared.
   - kind: attributes
     feature: syslog_header
     cells:
@@ -4113,7 +4435,15 @@ rows:
       datadog_out:
         class: normalized
         reason: resource_as_tag
-        text: Merged into the log's attributes, so it reads back as an event attribute.
+        text: >-
+          Merged into the log's attributes or the span's `meta`, so it reads back as an event
+          attribute.
+      datadog_trace_out:
+        class: normalized
+        reason: resource_as_tag
+        text: >-
+          Merged into every span's `meta` under either version, since neither a v0.4 span nor a
+          v0.7 `TracerPayload` has a field for it, so it reads back as an event attribute.
       syslog_out:
         class: lost
         reason: structural
@@ -4183,6 +4513,11 @@ rows:
           A record with no host and no hostless mark leaves with the process hostname as its host,
           which datadog_in reads back as `host.name`; a span's host is its batch resource's
           `host.name`, filled only when no relaying Agent's hostname rides beside it.
+      datadog_trace_out:
+        class: exact
+        text: >-
+          The sink writes no host for a span that carries none: the Agent it sends to fills its own,
+          so nothing stands in its place.
       graphite_out:
         class: exact
         text: A record with no host leaves with none.
@@ -4300,6 +4635,13 @@ rows:
           A span whose kind isn't internal, with no `span.kind` attribute, leaves with
           `meta["span.kind"]`, which datadog_in reads back as a `span.kind` attribute beside the
           kind.
+      datadog_trace_out:
+        class: normalized
+        reason: span_kind_meta
+        text: >-
+          A span whose kind isn't internal, with no `span.kind` attribute, leaves with
+          `meta["span.kind"]`, which datadog_trace_in reads back as a `span.kind` attribute beside
+          the kind.
       syslog_out:
         class: exact
         text: A span isn't written, so no `span.kind` attribute is.
@@ -4325,6 +4667,13 @@ rows:
           On the first span of a trace in a batch, when no span of the trace carries
           `_dd.p.tid`, a 128-bit trace id's high 64 bits leave as `meta["_dd.p.tid"]`, which
           datadog_in reads back as a `_dd.p.tid` attribute beside the trace id.
+      datadog_trace_out:
+        class: normalized
+        reason: trace_id_high_tag
+        text: >-
+          On the first span of a trace in a batch, when no span of the trace carries `_dd.p.tid`, a
+          128-bit trace id's high 64 bits leave as `meta["_dd.p.tid"]`, which datadog_trace_in reads
+          back as a `_dd.p.tid` attribute beside the trace id.
       syslog_out:
         class: exact
         text: A span isn't written, so no `_dd.p.tid` attribute is.
@@ -4410,6 +4759,12 @@ rows:
         class: exact
         text: >-
           One object of a `/api/v2/logs` body, its attributes as top-level keys.
+      datadog_trace_out:
+        class: skipped
+        reason: uncounted
+        text: >-
+          The sink sends spans alone, so a log beside a span takes no route and is left off,
+          uncounted.
       graphite_out:
         class: skipped
         counter: logit.output.events.skipped{reason=no_metrics}
@@ -4997,7 +5352,10 @@ rows:
         - class: exact
           text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
 
-  # --- spans -----------------------------------------------------------------------------------
+  # --- spans ---------------------------------------------------------------------------------
+  # A span's record-level rows are `alone` and the two readiness rows `datadog_out`'s trace gate
+  # reads. Its field rows have cells at the span sinks only: every other sink skips a span alone or
+  # leaves it off beside another signal, so no field of it is compared there.
   - kind: span
     feature: alone
     cells:
@@ -5019,9 +5377,18 @@ rows:
       datadog_out:
         class: exact
         text: >-
-          A span of an `AgentPayload` chunk on the trace route, read back with its kind as a
-          `span.kind` attribute and its trace id's high half as `_dd.p.tid` (the `attributes`
-          rows).
+          A span of an `AgentPayload` chunk on the trace route, when its chunk passes the readiness
+          gate (`span/not_datadog_origin` and `span/needs_agent_processing` have the spans it holds
+          back), read back with its kind as a `span.kind` attribute and its trace id's high half as
+          `_dd.p.tid` (the `attributes` rows).
+      datadog_trace_out:
+        class: exact
+        text: >-
+          A span of the trace request at `version:`'s path, in the trace array (v0.4) or
+          `TracerPayload` chunk (v0.7) of its trace id, with no readiness gate, read back with its
+          kind as a `span.kind` attribute and its trace id's high half as `_dd.p.tid` (the
+          `attributes` rows). An OTel span with no `service.name`, `resource.name`, or `span.type`
+          leaves with those fields empty.
       graphite_out:
         class: skipped
         counter: logit.output.events.skipped{reason=no_metrics}
@@ -5033,8 +5400,8 @@ rows:
       splunk_hec_out:
         class: exact
         text: >-
-          A span object in the OpenTelemetry exporter's shape, its resource's attributes as `fields`;
-          the `span/no_wire_form` row has what it can't carry.
+          A span object in the OpenTelemetry exporter's shape, its resource's attributes as
+          `fields`; the `span` field rows have what it can't carry.
       kafka_out:
         - when: {format: text}
           class: skipped
@@ -5044,96 +5411,971 @@ rows:
         - class: exact
           text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
   - kind: span
+    feature: not_datadog_origin
+    cells:
+      statsd_out:
+        class: exact
+        text: >-
+          Nothing beyond the span's `span/alone`, `span/beside_log`, or `span/beside_metrics`
+          outcome: only `datadog_out` gates a trace chunk.
+      prometheus_out:
+        class: exact
+        text: >-
+          Nothing beyond the span's `span/alone`, `span/beside_log`, or `span/beside_metrics`
+          outcome: only `datadog_out` gates a trace chunk.
+      influxdb_out:
+        class: exact
+        text: >-
+          Nothing beyond the span's `span/alone`, `span/beside_log`, or `span/beside_metrics`
+          outcome: only `datadog_out` gates a trace chunk.
+      otlp_out:
+        class: exact
+        text: >-
+          Nothing beyond the span's `span/alone`, `span/beside_log`, or `span/beside_metrics`
+          outcome: only `datadog_out` gates a trace chunk.
+      datadog_out:
+        class: dropped
+        counter: logit.output.records.dropped{route=traces,reason=not_datadog_origin}
+        text: >-
+          A trace chunk whose root carries no Datadog span attribute, an OTel or `logit`-made span
+          whose path to Datadog is `otlp_out`, isn't sent: every span of it is dropped and counted,
+          beside its event's other signals or not.
+      datadog_trace_out:
+        class: exact
+        text: >-
+          The sink has no readiness gate, so a trace chunk with no Datadog span attribute is sent as
+          any span is, nothing beyond `span/alone`.
+      graphite_out:
+        class: exact
+        text: >-
+          Nothing beyond the span's `span/alone`, `span/beside_log`, or `span/beside_metrics`
+          outcome: only `datadog_out` gates a trace chunk.
+      syslog_out:
+        class: exact
+        text: >-
+          Nothing beyond the span's `span/alone`, `span/beside_log`, or `span/beside_metrics`
+          outcome: only `datadog_out` gates a trace chunk.
+      splunk_hec_out:
+        class: exact
+        text: >-
+          Nothing beyond the span's `span/alone`, `span/beside_log`, or `span/beside_metrics`
+          outcome: only `datadog_out` gates a trace chunk.
+      kafka_out:
+        class: exact
+        text: >-
+          Nothing beyond the span's `span/alone`, `span/beside_log`, or `span/beside_metrics`
+          outcome: only `datadog_out` gates a trace chunk.
+  - kind: span
+    feature: needs_agent_processing
+    cells:
+      statsd_out:
+        class: exact
+        text: >-
+          Nothing beyond the span's `span/alone`, `span/beside_log`, or `span/beside_metrics`
+          outcome: only `datadog_out` gates a trace chunk.
+      prometheus_out:
+        class: exact
+        text: >-
+          Nothing beyond the span's `span/alone`, `span/beside_log`, or `span/beside_metrics`
+          outcome: only `datadog_out` gates a trace chunk.
+      influxdb_out:
+        class: exact
+        text: >-
+          Nothing beyond the span's `span/alone`, `span/beside_log`, or `span/beside_metrics`
+          outcome: only `datadog_out` gates a trace chunk.
+      otlp_out:
+        class: exact
+        text: >-
+          Nothing beyond the span's `span/alone`, `span/beside_log`, or `span/beside_metrics`
+          outcome: only `datadog_out` gates a trace chunk.
+      datadog_out:
+        class: dropped
+        counter: logit.output.records.dropped{route=traces,reason=needs_agent_processing}
+        text: >-
+          A trace chunk whose root carries Datadog span attributes but not the Agent's `_top_level`
+          mark, raw tracer output an Agent hasn't normalized or computed stats for, isn't sent:
+          every span of it is dropped and counted, beside its event's other signals or not.
+      datadog_trace_out:
+        class: exact
+        text: >-
+          The sink has no readiness gate: the Agent it sends to does the processing a `_top_level`
+          mark stands for, so a trace chunk without one is sent as any span is, nothing beyond
+          `span/alone`.
+      graphite_out:
+        class: exact
+        text: >-
+          Nothing beyond the span's `span/alone`, `span/beside_log`, or `span/beside_metrics`
+          outcome: only `datadog_out` gates a trace chunk.
+      syslog_out:
+        class: exact
+        text: >-
+          Nothing beyond the span's `span/alone`, `span/beside_log`, or `span/beside_metrics`
+          outcome: only `datadog_out` gates a trace chunk.
+      splunk_hec_out:
+        class: exact
+        text: >-
+          Nothing beyond the span's `span/alone`, `span/beside_log`, or `span/beside_metrics`
+          outcome: only `datadog_out` gates a trace chunk.
+      kafka_out:
+        class: exact
+        text: >-
+          Nothing beyond the span's `span/alone`, `span/beside_log`, or `span/beside_metrics`
+          outcome: only `datadog_out` gates a trace chunk.
+  - kind: span
+    feature: name
+    cells:
+      otlp_out:
+        class: exact
+        text: >-
+          The span's `name`.
+      datadog_out:
+        class: exact
+        text: >-
+          The span's `name`.
+      datadog_trace_out:
+        class: exact
+        text: The span's `name`.
+      splunk_hec_out:
+        class: exact
+        text: >-
+          The span object's `name`.
+      kafka_out:
+        class: exact
+        text: >-
+          The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A
+          `format: text` record writes no span (`span/alone`), so no field of one is compared.
+  - kind: span
+    feature: name_structured
+    cells:
+      otlp_out:
+        class: lost
+        reason: uncounted
+        text: >-
+          OTLP's span `name` is a string, and a name that isn't a `Str` leaves as `""`, uncounted.
+      datadog_out:
+        class: normalized
+        reason: stringified
+        counter: logit.output.spans.degraded{reason=json_text}
+        text: >-
+          A name that isn't a `Str` leaves as its text, read back as a string; a map or an array
+          is JSON text, counted.
+      datadog_trace_out:
+        class: normalized
+        reason: stringified
+        counter: logit.output.spans.degraded{reason=json_text}
+        text: >-
+          A name that isn't a `Str` leaves as its text, read back as a string; a map or an array is
+          JSON text, counted.
+      splunk_hec_out:
+        class: normalized
+        reason: stringified
+        text: >-
+          A name that isn't a `Str` leaves as its text, JSON for a map or an array, read back as a
+          string.
+      kafka_out:
+        class: exact
+        text: >-
+          The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A
+          `format: text` record writes no span (`span/alone`), so no field of one is compared.
+  - kind: span
+    feature: trace_id
+    cells:
+      otlp_out:
+        class: exact
+        text: >-
+          The 16-byte `trace_id`.
+      datadog_out:
+        class: exact
+        text: >-
+          The low 64 bits as the span's `trace_id` and the high half as `_dd.p.tid` on the chunk's
+          first span, which datadog_in restores on every span of the chunk.
+      datadog_trace_out:
+        class: exact
+        text: >-
+          The low 64 bits as the span's `trace_id` and the high half as `_dd.p.tid` on the first
+          span of its trace, which datadog_trace_in restores on every span of the trace.
+      splunk_hec_out:
+        class: exact
+        text: >-
+          32 lowercase hex digits.
+      kafka_out:
+        class: exact
+        text: >-
+          The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A
+          `format: text` record writes no span (`span/alone`), so no field of one is compared.
+  - kind: span
+    feature: parent_span_id
+    cells:
+      otlp_out:
+        class: exact
+        text: >-
+          The 8-byte `parent_span_id`.
+      datadog_out:
+        class: exact
+        text: >-
+          The span's `parent_id`.
+      datadog_trace_out:
+        class: exact
+        text: The span's `parent_id`.
+      splunk_hec_out:
+        class: exact
+        text: >-
+          16 lowercase hex digits.
+      kafka_out:
+        class: exact
+        text: >-
+          The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A
+          `format: text` record writes no span (`span/alone`), so no field of one is compared.
+  - kind: span
+    feature: parent_unset
+    cells:
+      otlp_out:
+        class: exact
+        text: >-
+          An empty `parent_span_id`, read back as no parent.
+      datadog_out:
+        class: exact
+        text: >-
+          `parent_id` 0, read back as no parent.
+      datadog_trace_out:
+        class: exact
+        text: >-
+          `parent_id` 0, read back as no parent.
+      splunk_hec_out:
+        class: exact
+        text: >-
+          An empty `parent_span_id`, read back as no parent.
+      kafka_out:
+        class: exact
+        text: >-
+          The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A
+          `format: text` record writes no span (`span/alone`), so no field of one is compared.
+  - kind: span
+    feature: kind
+    cells:
+      otlp_out:
+        class: exact
+        text: >-
+          The `SpanKind`.
+      datadog_out:
+        class: exact
+        text: >-
+          A `span.kind` meta entry for any kind but `internal` (the `attributes/span_kind` row),
+          read back as the span's kind.
+      datadog_trace_out:
+        class: exact
+        text: >-
+          A `span.kind` meta entry for any kind but `internal` (the `attributes/span_kind` row),
+          read back as the span's kind.
+      splunk_hec_out:
+        class: exact
+        text: >-
+          The exporter's `SPAN_KIND_*` name.
+      kafka_out:
+        class: exact
+        text: >-
+          The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A
+          `format: text` record writes no span (`span/alone`), so no field of one is compared.
+  - kind: span
+    feature: status_error
+    cells:
+      otlp_out:
+        class: exact
+        text: >-
+          `Status.code` `STATUS_CODE_ERROR`.
+      datadog_out:
+        class: exact
+        text: >-
+          `error: 1`, read back as an error status.
+      datadog_trace_out:
+        class: exact
+        text: >-
+          `error: 1`, read back as an error status.
+      splunk_hec_out:
+        class: exact
+        text: >-
+          `status.code` `STATUS_CODE_ERROR`.
+      kafka_out:
+        class: exact
+        text: >-
+          The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A
+          `format: text` record writes no span (`span/alone`), so no field of one is compared.
+  - kind: span
+    feature: status_ok
+    cells:
+      otlp_out:
+        class: exact
+        text: >-
+          `Status.code` `STATUS_CODE_OK`.
+      datadog_out:
+        class: lost
+        counter: logit.output.spans.degraded{reason=no_wire_form}
+        text: >-
+          Datadog has no `ok` status, so the span leaves with `error: 0` and reads back unset,
+          counted.
+      datadog_trace_out:
+        class: lost
+        counter: logit.output.spans.degraded{reason=no_wire_form}
+        text: >-
+          The trace API has no `ok` status, so the span leaves with `error: 0` and reads back unset,
+          counted.
+      splunk_hec_out:
+        class: exact
+        text: >-
+          `status.code` `STATUS_CODE_OK`.
+      kafka_out:
+        class: exact
+        text: >-
+          The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A
+          `format: text` record writes no span (`span/alone`), so no field of one is compared.
+  - kind: span
+    feature: status_unset
+    cells:
+      otlp_out:
+        class: exact
+        text: >-
+          `Status.code` `STATUS_CODE_UNSET`, read back as unset.
+      datadog_out:
+        class: exact
+        text: >-
+          `error: 0`, read back as unset.
+      datadog_trace_out:
+        class: exact
+        text: >-
+          `error: 0`, read back as unset.
+      splunk_hec_out:
+        class: exact
+        text: >-
+          `status.code` `STATUS_CODE_UNSET`, read back as unset.
+      kafka_out:
+        class: exact
+        text: >-
+          The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A
+          `format: text` record writes no span (`span/alone`), so no field of one is compared.
+  - kind: span
+    feature: status_message
+    cells:
+      otlp_out:
+        class: exact
+        text: >-
+          `Status.message`.
+      datadog_out:
+        class: lost
+        counter: logit.output.spans.degraded{reason=no_wire_form}
+        text: >-
+          Datadog has no field for a status message, so it's left off, counted once per field.
+      datadog_trace_out:
+        class: lost
+        counter: logit.output.spans.degraded{reason=no_wire_form}
+        text: >-
+          The trace API has no field for a status message, so it's left off, counted once per field.
+      splunk_hec_out:
+        class: exact
+        text: >-
+          `status.message`.
+      kafka_out:
+        class: exact
+        text: >-
+          The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A
+          `format: text` record writes no span (`span/alone`), so no field of one is compared.
+  - kind: span
+    feature: timestamp
+    cells:
+      otlp_out:
+        class: exact
+        text: >-
+          `start_time_unix_nano`.
+      datadog_out:
+        class: exact
+        text: >-
+          The span's `start`, in Unix nanoseconds.
+      datadog_trace_out:
+        class: exact
+        text: The span's `start`, in Unix nanoseconds.
+      splunk_hec_out:
+        class: exact
+        text: >-
+          `start_time`, in Unix nanoseconds.
+      kafka_out:
+        class: exact
+        text: >-
+          The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A
+          `format: text` record writes no span (`span/alone`), so no field of one is compared.
+  - kind: span
+    feature: end_timestamp
+    cells:
+      otlp_out:
+        class: exact
+        text: >-
+          `end_time_unix_nano`.
+      datadog_out:
+        class: exact
+        text: >-
+          The span's `duration`, from which datadog_in restores the end.
+      datadog_trace_out:
+        class: exact
+        text: The span's `duration`, from which datadog_trace_in restores the end.
+      splunk_hec_out:
+        class: exact
+        text: >-
+          `end_time`, in Unix nanoseconds.
+      kafka_out:
+        class: exact
+        text: >-
+          The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A
+          `format: text` record writes no span (`span/alone`), so no field of one is compared.
+  - kind: span
+    feature: end_before_start
+    cells:
+      otlp_out:
+        class: exact
+        text: >-
+          `end_time_unix_nano` as it is, earlier than the start.
+      datadog_out:
+        class: lost
+        counter: logit.output.spans.degraded{reason=negative_duration}
+        text: >-
+          A negative `duration` is written as 0, counted, so the end reads back at the start.
+      datadog_trace_out:
+        class: lost
+        counter: logit.output.spans.degraded{reason=negative_duration}
+        text: A negative `duration` is written as 0, counted, so the end reads back at the start.
+      splunk_hec_out:
+        class: exact
+        text: >-
+          `end_time` as it is, earlier than `start_time`.
+      kafka_out:
+        class: exact
+        text: >-
+          The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A
+          `format: text` record writes no span (`span/alone`), so no field of one is compared.
+  - kind: span
+    feature: flags
+    cells:
+      otlp_out:
+        class: exact
+        text: >-
+          The span's `flags`.
+      datadog_out:
+        class: lost
+        counter: logit.output.spans.degraded{reason=no_wire_form}
+        text: >-
+          Datadog has no field for span flags, so it's left off, counted once per field.
+      datadog_trace_out:
+        class: lost
+        counter: logit.output.spans.degraded{reason=no_wire_form}
+        text: The trace API has no field for span flags, so it's left off, counted once per field.
+      splunk_hec_out:
+        class: lost
+        counter: logit.output.spans.degraded{reason=no_wire_form}
+        text: >-
+          The exporter's span object has no member for span flags, so it's left off, counted once
+          per span.
+      kafka_out:
+        class: exact
+        text: >-
+          The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A
+          `format: text` record writes no span (`span/alone`), so no field of one is compared.
+  - kind: span
+    feature: trace_state
+    cells:
+      otlp_out:
+        class: exact
+        text: >-
+          The span's `trace_state`.
+      datadog_out:
+        class: lost
+        counter: logit.output.spans.degraded{reason=no_wire_form}
+        text: >-
+          Datadog has no field for a span's `trace_state`, so it's left off, counted once per field.
+      datadog_trace_out:
+        class: lost
+        counter: logit.output.spans.degraded{reason=no_wire_form}
+        text: >-
+          The trace API has no field for a span's `trace_state`, so it's left off, counted once per
+          field.
+      splunk_hec_out:
+        class: lost
+        counter: logit.output.spans.degraded{reason=no_wire_form}
+        text: >-
+          The exporter's span object has no member for a span's `trace_state`, so it's left off,
+          counted once per span.
+      kafka_out:
+        class: exact
+        text: >-
+          The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A
+          `format: text` record writes no span (`span/alone`), so no field of one is compared.
+  - kind: span
+    feature: dropped_attributes_count
+    cells:
+      otlp_out:
+        class: exact
+        text: >-
+          The span's `dropped_attributes_count`.
+      datadog_out:
+        class: lost
+        counter: logit.output.spans.degraded{reason=no_wire_form}
+        text: >-
+          Datadog has no field for a dropped-attribute count, so it's left off, counted once per
+          field.
+      datadog_trace_out:
+        class: lost
+        counter: logit.output.spans.degraded{reason=no_wire_form}
+        text: >-
+          The trace API has no field for a dropped-attribute count, so it's left off, counted once
+          per field.
+      splunk_hec_out:
+        class: lost
+        counter: logit.output.spans.degraded{reason=no_wire_form}
+        text: >-
+          The exporter's span object has no member for a dropped-attribute count, so it's left off,
+          counted once per span.
+      kafka_out:
+        class: exact
+        text: >-
+          The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A
+          `format: text` record writes no span (`span/alone`), so no field of one is compared.
+  - kind: span
+    feature: dropped_events_count
+    cells:
+      otlp_out:
+        class: exact
+        text: >-
+          The span's `dropped_events_count`.
+      datadog_out:
+        class: lost
+        counter: logit.output.spans.degraded{reason=no_wire_form}
+        text: >-
+          Datadog has no field for a dropped-event count, so it's left off, counted once per field.
+      datadog_trace_out:
+        class: lost
+        counter: logit.output.spans.degraded{reason=no_wire_form}
+        text: >-
+          The trace API has no field for a dropped-event count, so it's left off, counted once per
+          field.
+      splunk_hec_out:
+        class: lost
+        counter: logit.output.spans.degraded{reason=no_wire_form}
+        text: >-
+          The exporter's span object has no member for a dropped-event count, so it's left off,
+          counted once per span.
+      kafka_out:
+        class: exact
+        text: >-
+          The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A
+          `format: text` record writes no span (`span/alone`), so no field of one is compared.
+  - kind: span
+    feature: dropped_links_count
+    cells:
+      otlp_out:
+        class: exact
+        text: >-
+          The span's `dropped_links_count`.
+      datadog_out:
+        class: lost
+        counter: logit.output.spans.degraded{reason=no_wire_form}
+        text: >-
+          Datadog has no field for a dropped-link count, so it's left off, counted once per field.
+      datadog_trace_out:
+        class: lost
+        counter: logit.output.spans.degraded{reason=no_wire_form}
+        text: >-
+          The trace API has no field for a dropped-link count, so it's left off, counted once per
+          field.
+      splunk_hec_out:
+        class: lost
+        counter: logit.output.spans.degraded{reason=no_wire_form}
+        text: >-
+          The exporter's span object has no member for a dropped-link count, so it's left off,
+          counted once per span.
+      kafka_out:
+        class: exact
+        text: >-
+          The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A
+          `format: text` record writes no span (`span/alone`), so no field of one is compared.
+  - kind: span
+    feature: events
+    cells:
+      otlp_out:
+        class: exact
+        text: >-
+          Each span event's time, name, and attributes.
+      datadog_out:
+        class: exact
+        text: >-
+          Each span event's time, name, and scalar attributes as the span's `span_events`.
+      datadog_trace_out:
+        class: exact
+        text: Each span event's time, name, and scalar attributes as the span's `span_events`.
+      splunk_hec_out:
+        class: exact
+        text: >-
+          Each span event's `name`, `timestamp`, and `attributes`.
+      kafka_out:
+        class: exact
+        text: >-
+          The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A
+          `format: text` record writes no span (`span/alone`), so no field of one is compared.
+  - kind: span
+    feature: event_nested_attribute
+    cells:
+      otlp_out:
+        class: exact
+        text: >-
+          A key-value list, array, or empty attribute of a span event, as OTLP writes any
+          attribute.
+      datadog_out:
+        class: normalized
+        reason: json_text
+        counter: logit.output.spans.degraded{reason=json_text}
+        text: >-
+          A map or null attribute of a span event, or an array holding anything but scalars,
+          leaves as its JSON text (`null` for a null), counted, and reads back as a string; an
+          array of scalars stays an array.
+      datadog_trace_out:
+        class: normalized
+        reason: json_text
+        counter: logit.output.spans.degraded{reason=json_text}
+        text: >-
+          A map or null attribute of a span event, or an array holding anything but scalars, leaves
+          as its JSON text (`null` for a null), counted, and reads back as a string; an array of
+          scalars stays an array.
+      splunk_hec_out:
+        class: exact
+        text: >-
+          A map, array, or null attribute of a span event, nesting kept.
+      kafka_out:
+        class: exact
+        text: >-
+          The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A
+          `format: text` record writes no span (`span/alone`), so no field of one is compared.
+  - kind: span
+    feature: event_name_structured
+    cells:
+      otlp_out:
+        class: lost
+        reason: uncounted
+        text: >-
+          OTLP's span event `name` is a string, and a name that isn't a `Str` leaves as `""`,
+          uncounted.
+      datadog_out:
+        class: normalized
+        reason: stringified
+        counter: logit.output.spans.degraded{reason=json_text}
+        text: >-
+          A name that isn't a `Str` leaves as its text, read back as a string; a map or an array
+          is JSON text, counted.
+      datadog_trace_out:
+        class: normalized
+        reason: stringified
+        counter: logit.output.spans.degraded{reason=json_text}
+        text: >-
+          A name that isn't a `Str` leaves as its text, read back as a string; a map or an array is
+          JSON text, counted.
+      splunk_hec_out:
+        class: normalized
+        reason: stringified
+        text: >-
+          A name that isn't a `Str` leaves as its text, JSON for a map or an array, read back as a
+          string.
+      kafka_out:
+        class: exact
+        text: >-
+          The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A
+          `format: text` record writes no span (`span/alone`), so no field of one is compared.
+  - kind: span
+    feature: nested_bytes_attribute
+    cells:
+      otlp_out:
+        class: exact
+        text: A `bytesValue` attribute of a span event or link.
+      datadog_out:
+        class: normalized
+        reason: stringified
+        text: >-
+          A `Bytes` attribute of a span event or link leaves as its lossy UTF-8 text, read back as
+          a string.
+      datadog_trace_out:
+        class: normalized
+        reason: stringified
+        text: >-
+          A `Bytes` attribute of a span event or link leaves as its lossy UTF-8 text, read back as a
+          string.
+      splunk_hec_out:
+        class: normalized
+        reason: stringified
+        text: >-
+          A `Bytes` attribute of a span event or link leaves as a base64 string, read back as the
+          string.
+      kafka_out:
+        class: exact
+        text: >-
+          The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A
+          `format: text` record writes no span (`span/alone`), so no field of one is compared.
+  - kind: span
+    feature: nested_u64_attribute
+    cells:
+      otlp_out:
+        class: normalized
+        reason: u64_as_int
+        text: >-
+          A `u64` attribute of a span event or link reads back as an `i64`, or, above `i64::MAX`,
+          as a double, approximate beyond 2^53 and uncounted.
+      datadog_out:
+        class: normalized
+        reason: u64_as_int
+        counter: logit.output.spans.degraded{reason=int_as_f64}
+        text: >-
+          A `u64` attribute of a span event reads back as an `i64`, or, above `i64::MAX`, as a
+          double, counted; on a link it leaves as its decimal text, read back as a string.
+      datadog_trace_out:
+        class: normalized
+        reason: u64_as_int
+        counter: logit.output.spans.degraded{reason=int_as_f64}
+        text: >-
+          A `u64` attribute of a span event reads back as an `i64`, or, above `i64::MAX`, as a
+          double, counted; on a link it leaves as its decimal text, read back as a string.
+      splunk_hec_out:
+        class: normalized
+        reason: u64_as_int
+        text: >-
+          A JSON number in the span event's or link's `attributes`, read back as an `i64`, or,
+          above `i64::MAX`, as the `u64` itself.
+      kafka_out:
+        class: exact
+        text: >-
+          The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A
+          `format: text` record writes no span (`span/alone`), so no field of one is compared.
+  - kind: span
+    feature: nested_timestamp_attribute
+    cells:
+      otlp_out:
+        class: normalized
+        reason: timestamp_as_int
+        text: >-
+          A timestamp attribute of a span event or link leaves as an `intValue` of Unix
+          nanoseconds, read back as an `i64`.
+      datadog_out:
+        class: normalized
+        reason: stringified
+        text: >-
+          A timestamp attribute of a span event or link leaves as RFC 3339 text, read back as a
+          string.
+      datadog_trace_out:
+        class: normalized
+        reason: stringified
+        text: >-
+          A timestamp attribute of a span event or link leaves as RFC 3339 text, read back as a
+          string.
+      splunk_hec_out:
+        class: normalized
+        reason: stringified
+        text: >-
+          A timestamp attribute of a span event or link leaves as an RFC 3339 string, read back
+          as the string.
+      kafka_out:
+        class: exact
+        text: >-
+          The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A
+          `format: text` record writes no span (`span/alone`), so no field of one is compared.
+  - kind: span
+    feature: event_dropped_count
+    cells:
+      otlp_out:
+        class: exact
+        text: >-
+          A span event's `dropped_attributes_count`.
+      datadog_out:
+        class: lost
+        counter: logit.output.spans.degraded{reason=no_wire_form}
+        text: >-
+          Datadog has no field for a span event's dropped-attribute count, so it's left off, counted
+          once per field.
+      datadog_trace_out:
+        class: lost
+        counter: logit.output.spans.degraded{reason=no_wire_form}
+        text: >-
+          The trace API has no field for a span event's dropped-attribute count, so it's left off,
+          counted once per field.
+      splunk_hec_out:
+        class: lost
+        counter: logit.output.spans.degraded{reason=no_wire_form}
+        text: >-
+          The exporter's span object has no member for a span event's dropped-attribute count, so
+          it's left off, counted once per span.
+      kafka_out:
+        class: exact
+        text: >-
+          The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A
+          `format: text` record writes no span (`span/alone`), so no field of one is compared.
+  - kind: span
+    feature: links
+    cells:
+      otlp_out:
+        class: exact
+        text: >-
+          Each link's ids and attributes.
+      datadog_out:
+        class: normalized
+        reason: stringified
+        counter: logit.output.spans.degraded{reason=json_text}
+        text: >-
+          Each link's ids, and its attributes as strings, as the span's `span_links`, read back as
+          string attributes; a map, array, or null attribute is JSON text (`null` for a null),
+          counted.
+      datadog_trace_out:
+        class: normalized
+        reason: stringified
+        counter: logit.output.spans.degraded{reason=json_text}
+        text: >-
+          Each link's ids, and its attributes as strings, as the span's `span_links`, read back as
+          string attributes; a map, array, or null attribute is JSON text (`null` for a null),
+          counted.
+      splunk_hec_out:
+        class: exact
+        text: >-
+          Each link's `trace_id`, `span_id`, and `attributes`.
+      kafka_out:
+        class: exact
+        text: >-
+          The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A
+          `format: text` record writes no span (`span/alone`), so no field of one is compared.
+  - kind: span
+    feature: link_flags
+    cells:
+      otlp_out:
+        class: exact
+        text: >-
+          A link's `flags`.
+      datadog_out:
+        class: exact
+        text: >-
+          A span link's `flags`.
+      datadog_trace_out:
+        class: exact
+        text: A span link's `flags`.
+      splunk_hec_out:
+        class: lost
+        counter: logit.output.spans.degraded{reason=no_wire_form}
+        text: >-
+          The exporter's span object has no member for a link's flags, so it's left off, counted
+          once per span.
+      kafka_out:
+        class: exact
+        text: >-
+          The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A
+          `format: text` record writes no span (`span/alone`), so no field of one is compared.
+  - kind: span
+    feature: link_trace_state
+    cells:
+      otlp_out:
+        class: exact
+        text: >-
+          A link's `trace_state`.
+      datadog_out:
+        class: exact
+        text: >-
+          A span link's `tracestate`.
+      datadog_trace_out:
+        class: exact
+        text: A span link's `tracestate`.
+      splunk_hec_out:
+        class: exact
+        text: >-
+          A link's `trace_state`, an absent one written as `""` and read back as none.
+      kafka_out:
+        class: exact
+        text: >-
+          The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A
+          `format: text` record writes no span (`span/alone`), so no field of one is compared.
+  - kind: span
+    feature: link_dropped_count
+    cells:
+      otlp_out:
+        class: exact
+        text: >-
+          A link's `dropped_attributes_count`.
+      datadog_out:
+        class: lost
+        counter: logit.output.spans.degraded{reason=no_wire_form}
+        text: >-
+          Datadog has no field for a link's dropped-attribute count, so it's left off, counted once
+          per field.
+      datadog_trace_out:
+        class: lost
+        counter: logit.output.spans.degraded{reason=no_wire_form}
+        text: >-
+          The trace API has no field for a link's dropped-attribute count, so it's left off, counted
+          once per field.
+      splunk_hec_out:
+        class: lost
+        counter: logit.output.spans.degraded{reason=no_wire_form}
+        text: >-
+          The exporter's span object has no member for a link's dropped-attribute count, so it's
+          left off, counted once per span.
+      kafka_out:
+        class: exact
+        text: >-
+          The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A
+          `format: text` record writes no span (`span/alone`), so no field of one is compared.
+  - kind: span
     feature: beside_log
     cells:
       statsd_out:
-        class: skipped
+        class: lost
         reason: uncounted
         text: >-
           A span has no statsd form. Beside a DogStatsD event, the event's line is written and the
           span left off, uncounted; beside any other log, `log/plain` counts the event skipped.
       otlp_out:
         class: exact
-        text: An OTLP span.
+        text: >-
+          The span in the traces request and the log in the logs request, each read back as an event
+          of its own.
       prometheus_out:
-        class: skipped
+        class: lost
         counter: logit.output.events.skipped{reason=no_metrics}
-        text: A span has no Prometheus form and isn't written.
+        text: >-
+          A span has no Prometheus form, and the event, which has no metrics, isn't written.
       influxdb_out:
-        class: skipped
+        class: lost
         counter: logit.output.events.skipped{reason=no_metrics}
-        text: A span has no line-protocol form and isn't written.
+        text: >-
+          A span has no line-protocol form, and the event, which has no metrics, isn't written.
       datadog_out:
         class: exact
         text: >-
-          A span of an `AgentPayload` chunk on the trace route, read back with its kind as a
-          `span.kind` attribute and its trace id's high half as `_dd.p.tid` (the `attributes`
-          rows).
+          The span on the trace route and the log on the logs route, each read back as an event of
+          its own.
+      datadog_trace_out:
+        class: exact
+        text: >-
+          The span on the trace route; the log beside it has no route here and is left off,
+          uncounted (`log/plain`).
       graphite_out:
-        class: skipped
+        class: lost
         counter: logit.output.events.skipped{reason=no_metrics}
-        text: A span has no carbon form and isn't written.
+        text: >-
+          A span has no carbon form, and the event, which has no metrics, isn't written.
       syslog_out:
-        class: skipped
+        class: lost
         reason: uncounted
-        text: A span beside a log has no syslog form and is left off, uncounted.
+        text: >-
+          A span beside a log has no syslog form and is left off, uncounted, while the log is
+          written.
       splunk_hec_out:
         class: exact
         text: >-
-          A span object in the OpenTelemetry exporter's shape, its resource's attributes as `fields`;
-          the `span/no_wire_form` row has what it can't carry.
+          The span and the log are each their own HEC object, read back as events of their own.
       kafka_out:
         - when: {format: text}
-          class: skipped
+          class: lost
           counter: logit.output.spans.omitted{reason=format}
-          text: The record holds the log body alone, so the span beside it is left off, counted.
-        - class: exact
-          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
-  - kind: span
-    feature: no_wire_form
-    cells:
-      statsd_out:
-        class: exact
-        text: Nothing beyond `span/alone`'s outcome.
-      prometheus_out:
-        class: exact
-        text: Nothing beyond `span/alone`'s outcome.
-      influxdb_out:
-        class: exact
-        text: Nothing beyond `span/alone`'s outcome.
-      otlp_out:
-        class: exact
-        text: OTLP carries the status, its message, `trace_state`, flags, and dropped counts.
-      datadog_out:
-        class: degraded
-        counter: logit.output.spans.degraded{reason=no_wire_form}
-        text: >-
-          Datadog has no field for `status: ok`, a status message, `trace_state`, span flags, or
-          a dropped count, so each is dropped, counted, and the span reads back without it.
-      graphite_out:
-        class: exact
-        text: Nothing beyond `span/alone`'s outcome.
-      syslog_out:
-        class: skipped
-        reason: uncounted
-        text: >-
-          A span has no syslog form and isn't written: on an event with no log, the event is
-          skipped, counted as `logit.output.events.skipped{reason=no_log}`; beside a log, it's left
-          off, uncounted.
-      splunk_hec_out:
-        class: degraded
-        counter: logit.output.spans.degraded{reason=no_wire_form}
-        text: >-
-          The exporter's span object has no member for span flags, `trace_state`, or a dropped count,
-          so each is left off, counted once per span, and the span reads back without it.
-      kafka_out:
-        - when: {format: text}
-          class: skipped
-          counter: logit.output.events.skipped{reason=no_log}
           text: >-
-            An event with no log has no `format: text` record.
+            The record holds the log body alone, so the span beside it is left off, counted.
         - class: exact
-          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
+          text: >-
+            The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
   - kind: span
     feature: beside_metrics
     cells:
@@ -5155,12 +6397,15 @@ rows:
         class: exact
         text: An OTLP span in the traces request, beside the metrics in theirs.
       datadog_out:
-        class: normalized
-        reason: no_wire_form
-        counter: logit.output.spans.degraded{reason=no_wire_form}
+        class: exact
         text: >-
-          The span goes to the trace route, the metrics to theirs, and each reads back as its own
-          event; the span loses the fields Datadog has no form for, as `span/alone` says.
+          The span on the trace route and the metrics on theirs, each read back as an event of its
+          own.
+      datadog_trace_out:
+        class: exact
+        text: >-
+          The span on the trace route; the metrics beside it have no route here and are left off,
+          uncounted (their kinds' rows).
       graphite_out:
         class: lost
         reason: uncounted

@@ -10,11 +10,9 @@
     {"sink":"kafka_out","row":"attributes/number_value","cell":1,"observed":["exact"]},
     {"sink":"kafka_out","row":"attributes/resource_attribute","cell":1,"observed":["exact"]},
     {"sink":"kafka_out","row":"attributes/service_identity","cell":1,"observed":["exact"]},
-    {"sink":"kafka_out","row":"attributes/span_kind","cell":0,"observed":["exact"]},
     {"sink":"kafka_out","row":"attributes/splunk_envelope","cell":1,"observed":["exact"]},
     {"sink":"kafka_out","row":"attributes/string_value","cell":1,"observed":["exact"]},
     {"sink":"kafka_out","row":"attributes/syslog_facility","cell":0,"observed":["exact"]},
-    {"sink":"kafka_out","row":"attributes/trace_id_high","cell":0,"observed":["exact"]},
     {"sink":"kafka_out","row":"log/body_format","cell":1,"observed":["exact"]},
     {"sink":"kafka_out","row":"log/event_name","cell":1,"observed":["exact"]},
     {"sink":"kafka_out","row":"log/observed_timestamp_unset","cell":1,"observed":["exact"]},
@@ -25,8 +23,7 @@
     {"sink":"kafka_out","row":"log/timestamp","cell":1,"observed":["exact"]},
     {"sink":"kafka_out","row":"log/trace","cell":1,"observed":["exact"]},
     {"sink":"kafka_out","row":"log/trace_flags","cell":1,"observed":["exact"]},
-    {"sink":"kafka_out","row":"log/trace_unset","cell":1,"observed":["exact"]},
-    {"sink":"kafka_out","row":"span/alone","cell":1,"observed":["exact"]}
+    {"sink":"kafka_out","row":"log/trace_unset","cell":1,"observed":["exact"]}
   ],
   "unspecified": []
 }

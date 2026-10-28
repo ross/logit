@@ -1,0 +1,4 @@
+# Hand-written event JSON lines: `marked`'s `_top_level` root alone, carrying
+# `_logit.datadog.hostless`, a DogStatsD carrier a stage such as Lua can copy onto a span, which
+# no trace payload has a field for.
+exercises: [top_level_root, span_identity, span_marks, chunk_carriers]
