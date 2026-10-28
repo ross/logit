@@ -347,6 +347,12 @@
 //! | `attributes/scope` | lost | structural | statsd has no instrumentation scope, so none is written. |
 //! | `attributes/datadog_carrier_log` | lost | structural | Another protocol's `_logit.` carrier is private and isn't a tag, so it's left off. |
 //! | `attributes/no_host` | exact | -- | A record with no host leaves with none. |
+//! | `log/severity` | exact | -- | A DogStatsD event's `\|t:` alert type, written from its `_logit.statsd.event.alert_type` carrier, which statsd_in reads back as the severity. |
+//! | `log/severity_unset` | exact | -- | A DogStatsD event with no alert type, read back as no severity. |
+//! | `log/body_format` | exact | -- | A DogStatsD event's text, read back as a `raw` message. |
+//! | `log/observed_timestamp_unset` | exact | -- | No observed time is written, and none reads back. |
+//! | `log/trace_unset` | exact | -- | No trace is written, and none reads back. |
+//! | `log/timestamp` | normalized | `receipt_time` | A DogStatsD event carries `\|d:` whole seconds only when it arrived with one, so any other event's time is the time statsd_in received it. |
 //! | `log/beside_metrics` | lost | uncounted | A log on an event that also carries metrics is left off while the metrics are written, uncounted. |
 //! | `span/beside_metrics` | lost | uncounted | A span on an event that also carries metrics is left off while the metrics are written, uncounted. |
 //!

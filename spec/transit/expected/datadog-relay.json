@@ -1,12 +1,4 @@
 {
-  "agent-events": {"events": [
-    {"timestamp":"2026-09-24T22:40:41.000000000Z","log":{"format":"raw","message":"Version 7.83.3"},"attributes":{"_logit.datadog.event_type":"Agent Startup","_logit.statsd.event.source_type":"System","_logit.statsd.event.title":"Agent Startup","host.name":"record-fixtures"}}
-  ], "counters": {}},
-  "agent-logs": {"events": [
-    {"timestamp":"2026-09-24T22:40:41.787000000Z","log":{"severity":"info","format":"raw","message":"2026-09-24 10:00:00,000 INFO record-fixtures started on port 5050"},"attributes":{"ddsource":"python","ddtags":"filename:app.log,dirname:/var/log/record","host.name":"record-fixtures","service.name":"record-fixtures","status":"info"}},
-    {"timestamp":"2026-09-24T22:40:41.787000000Z","log":{"severity":"info","format":"raw","message":"{\"timestamp\":\"2026-09-24T10:00:01Z\",\"level\":\"warn\",\"message\":\"slow upstream\",\"upstream\":\"payments\",\"duration_ms\":812}"},"attributes":{"ddsource":"python","ddtags":"filename:app.log,dirname:/var/log/record","host.name":"record-fixtures","service.name":"record-fixtures","status":"info"}},
-    {"timestamp":"2026-09-24T22:40:42.787000000Z","log":{"severity":"info","format":"raw","message":"2026-09-24 10:00:02,000 ERROR record-fixtures request failed: status=500 path=/fail"},"attributes":{"ddsource":"python","ddtags":"filename:app.log,dirname:/var/log/record","host.name":"record-fixtures","service.name":"record-fixtures","status":"info"}}
-  ], "counters": {}},
   "agent-series-timestamped": {"events": [
     {"timestamp":"2026-09-21T14:13:20.000000000Z","metrics":[{"name":"record.batch.lag","kind":"gauge","value":2.5}],"attributes":{"_logit.datadog.origin.product":10,"_logit.metrics.interval":10,"deployment.environment.name":"record","host.name":"record-fixtures","service.name":"record-fixtures","service.version":"1.2.3","team":"obs"},"resource":{"attributes":{"_logit.datadog.units":"datadog"}},"types":{"/attributes/_logit.datadog.origin.product":"u64"}}
   ], "counters": {

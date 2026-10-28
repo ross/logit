@@ -1,0 +1,15 @@
+# The Datadog intake log and event features a case under cases/datadog-logs/ can exercise, from
+# crates/logit-proto/src/datadog/mod.rs's decode tables and crates/logit-inputs/src/datadog.rs's
+# routes. A case names the ones it exercises in its `.meta.yaml`. The metric routes are
+# cases/datadog/'s (features/datadog.yaml).
+- name: log
+  text: A `/api/v2/logs` log object, decoded to a log with its fields as attributes.
+- name: event
+  text: >-
+    An event in the Agent's `/intake/` envelope, decoded to a log with the
+    `_logit.statsd.event.*` carriers.
+- name: host
+  text: >-
+    A record's own host, decoded to `host.name`: a log's `hostname` or an event's `host`.
+- name: zstd
+  text: A body sent with `Content-Encoding` `zstd`, the Agent's default, decompressed first.

@@ -1,0 +1,4 @@
+# A log with an observed time, a dropped-attribute count, and an attribute of each value type a
+# metric's tags can't carry, and one carrying a `syslog.timestamp` attribute, both under a named
+# scope and a resource with a schema URL.
+exercises: [observed_timestamp, dropped_attributes_count, named_scope, schema_url, resource_attributes, attribute_values, attribute_u64, attribute_timestamp, syslog_timestamp_attribute]

@@ -1,11 +1,11 @@
-# The transit mapping table: what each sink does with each metric kind and each feature that
-# changes its fate. It's the canonical copy; spec/transit/README.md explains the schema and how a
+# The transit mapping table: what each sink does with each metric kind, each log field, and each
+# feature that changes a record's fate. It's the canonical copy; spec/transit/README.md explains the schema and how a
 # flow checks it. `crates/logit-cli/src/transit/mapping.rs` validates it.
 
 # The class vocabulary, the canonical copy. A record-level row's class is one of exact,
 # normalized, degraded, skipped, or dropped, best to worst; a field-level row's (`record` rows for
-# unit, description, start_timestamp, exemplars, exemplars_on_summary, and min_max, and every
-# `attributes` row) is one of exact, normalized, or lost.
+# unit, description, start_timestamp, exemplars, exemplars_on_summary, and min_max, a `log` row
+# for one of a log's fields, and every `attributes` row) is one of exact, normalized, or lost.
 classes:
   exact: The pair's decoder reads back the same kind, value, and field.
   normalized: >-
@@ -25,9 +25,9 @@ classes:
     The record is lost for a reason the config didn't ask for; the cell names the counter that
     counts it.
 # A cell may still say `reason: uncounted` only on the rows `UNCOUNTED_ALLOWED` names in
-# `crates/logit-cli/src/transit/mapping.rs`: log and span payloads, `datadog_out`'s carrier on a
-# log among them, not yet classified. docs/adr/telemetry-loss-vocabulary.md's amendment
-# "structural loss has no counter" has the rule.
+# `crates/logit-cli/src/transit/mapping.rs`: span payloads, not yet classified, log payloads,
+# classified only at otlp_out and datadog_out, and `datadog_out`'s carrier on a log.
+# docs/adr/telemetry-loss-vocabulary.md's amendment "structural loss has no counter" has the rule.
 
 sinks: [statsd_out, prometheus_out, influxdb_out, otlp_out, datadog_out, graphite_out]
 
@@ -2014,7 +2014,7 @@ rows:
         class: exact
         text: >-
           A `key:value` tag, `host` included. `host.name` is the record's host, which datadog_in
-          reads back as `host.name` on every route.
+          reads back as `host.name` on every route. On a log, a top-level key of the log object.
       graphite_out:
         - when: {tags: drop}
           class: lost
@@ -2295,7 +2295,7 @@ rows:
         reason: bool_tag
         text: >-
           `true` is a bare `key` tag and reads back `true`; `false` is `key:false` and reads back as
-          the string.
+          the string. On a log, a JSON boolean, read back as itself.
       graphite_out:
         - when: {tags: drop}
           class: lost
@@ -2341,7 +2341,8 @@ rows:
         class: normalized
         reason: stringified
         text: >-
-          A `key:<number>` tag, read back as a string.
+          A `key:<number>` tag, read back as a string. On a log, a JSON number, read back as
+          itself.
       graphite_out:
         - when: {tags: drop}
           class: lost
@@ -2386,7 +2387,7 @@ rows:
         reason: stringified
         text: >-
           One tag per element in order, which datadog_in folds back into an array of strings, so a
-          number element reads back as its text.
+          number element reads back as its text. On a log, a JSON array, read back as itself.
       graphite_out:
         - when: {tags: drop}
           class: lost
@@ -2423,7 +2424,8 @@ rows:
         class: lost
         counter: logit.output.tags.omitted{reason=unrepresentable}
         text: >-
-          A tag has no nested form, so a map is left off, counted.
+          A tag has no nested form, so a map is left off, counted. On a log, a JSON object, read
+          back as itself.
       graphite_out:
         - when: {tags: drop}
           class: lost
@@ -2459,7 +2461,8 @@ rows:
         class: lost
         counter: logit.output.tags.omitted{reason=unrepresentable}
         text: >-
-          A tag has no bytes form, so the value is left off, counted.
+          A tag has no bytes form, so the value is left off, counted. On a log, its base64 text,
+          read back as a string.
       graphite_out:
         - when: {tags: drop}
           class: lost
@@ -2496,7 +2499,8 @@ rows:
         class: normalized
         reason: stringified
         text: >-
-          A `key:<RFC 3339>` tag, read back as a string.
+          A `key:<RFC 3339>` tag, read back as a string. On a log, the RFC 3339 text as a JSON
+          string.
       graphite_out:
         - when: {tags: drop}
           class: lost
@@ -3028,6 +3032,23 @@ rows:
         reason: structural
         text: Another protocol's `_logit.` carrier is private and isn't a tag, so it's left off.
 
+  # statsd_out, prometheus_out, influxdb_out, and graphite_out don't write a log on an event with
+  # no metrics, where the carriers ride, so none of them has a cell.
+  - kind: attributes
+    feature: severity_carrier
+    cells:
+      otlp_out:
+        class: exact
+        text: >-
+          The raw `severity_number` and `severity_text` the carriers hold, which otlp_in reads
+          back into the same carriers beside the band's severity.
+      datadog_out:
+        class: lost
+        reason: structural
+        text: >-
+          A Datadog log has a status and no raw OTLP severity, so the carriers are left off and
+          the severity reads back at band resolution.
+
   # --- attributes datadog_out writes from a record's own fields ----------------------------------
   # Every sink reaches these rows; only datadog_out writes the attribute, which its pair decoder
   # reads back beside the field it came from.
@@ -3122,12 +3143,10 @@ rows:
         counter: logit.output.events.skipped{reason=no_metrics}
         text: A log has no line-protocol form and isn't written.
       otlp_out:
-        class: normalized
-        reason: observed_timestamp
+        class: exact
         text: >-
-          An OTLP log record. Its `_logit.statsd.event.*` carriers aren't attributes; otlp_out
-          stamps an observed time on a log that has none, and otlp_in stamps the
-          `_logit.otel.severity_*` carriers.
+          An OTLP log record. Its `_logit.statsd.event.*` carriers aren't attributes; the `log`
+          field rows have its fields.
       datadog_out:
         class: exact
         text: >-
@@ -3153,11 +3172,8 @@ rows:
         counter: logit.output.events.skipped{reason=no_metrics}
         text: A log has no line-protocol form and isn't written.
       otlp_out:
-        class: normalized
-        reason: observed_timestamp
-        text: >-
-          An OTLP log record. otlp_out stamps an observed time on a log that has none, and
-          otlp_in stamps the `_logit.otel.severity_*` carriers.
+        class: exact
+        text: An OTLP log record; the `log` field rows have its fields.
       datadog_out:
         class: exact
         text: >-
@@ -3166,6 +3182,211 @@ rows:
         class: skipped
         counter: logit.output.events.skipped{reason=no_metrics}
         text: A log has no carbon form and isn't written.
+  # A log's own record-level rows, beside `log/plain` or `log/dogstatsd_event`. statsd_out,
+  # prometheus_out, influxdb_out, and graphite_out don't write a log on an event with no metrics,
+  # so none of them has a cell. otlp_out writes every message as an `AnyValue`, so no log reaches
+  # `log/message_unsafe` there.
+  - kind: log
+    feature: message_unsafe
+    cells:
+      datadog_out:
+        class: normalized
+        reason: message_text
+        text: >-
+          The `message` field is a string: a `Bytes` message leaves as lossy UTF-8 and any other
+          non-string message as its JSON text, which datadog_in reads back as a string.
+  - kind: log
+    feature: structured_message
+    cells:
+      otlp_out:
+        class: exact
+        text: A `kvlistValue` or `arrayValue` body.
+      datadog_out:
+        class: normalized
+        reason: message_text
+        text: A map or array message leaves as its JSON text, read back as a string.
+  - kind: log
+    feature: bytes_message
+    cells:
+      otlp_out:
+        class: exact
+        text: A `bytesValue` body.
+      datadog_out:
+        class: normalized
+        reason: message_text
+        text: >-
+          A bytes message leaves as lossy UTF-8 text, read back as a string; an invalid sequence
+          reads back as U+FFFD.
+  - kind: log
+    feature: blank_message
+    cells:
+      otlp_out:
+        class: exact
+        text: An empty string body, or a log record with no body.
+      datadog_out:
+        class: exact
+        text: >-
+          An empty message is an empty `message` field; a log with no message leaves `null` as
+          its text, which the `message_unsafe` row covers.
+
+  # A log's fields, compared on a log on an event with no metrics. statsd_out writes a log only as
+  # a DogStatsD event, so it has a cell in each row such an event reaches.
+  - kind: log
+    feature: severity
+    cells:
+      statsd_out:
+        class: exact
+        text: >-
+          A DogStatsD event's `|t:` alert type, written from its `_logit.statsd.event.alert_type`
+          carrier, which statsd_in reads back as the severity.
+      otlp_out:
+        class: exact
+        text: >-
+          The band's `severity_number` and text, or the raw ones the `_logit.otel.severity_*`
+          carriers hold, read back at band resolution.
+      datadog_out:
+        class: exact
+        text: >-
+          The `status` field, the severity's name unless a `status` attribute stands in its place,
+          which datadog_in reads back as the severity.
+  - kind: log
+    feature: severity_unset
+    cells:
+      statsd_out:
+        class: exact
+        text: A DogStatsD event with no alert type, read back as no severity.
+      otlp_out:
+        class: exact
+        text: '`SEVERITY_NUMBER_UNSPECIFIED` and no text, read back as no severity.'
+      datadog_out:
+        class: exact
+        text: No `status` field, read back as no severity.
+  - kind: log
+    feature: body_format
+    cells:
+      statsd_out:
+        class: exact
+        text: A DogStatsD event's text, read back as a `raw` message.
+      otlp_out:
+        class: exact
+        text: >-
+          OTLP has no body format, so it leaves as the `logit.body_format` attribute, which
+          otlp_in reads back into the format.
+      datadog_out:
+        class: lost
+        reason: structural
+        text: >-
+          A Datadog log has no body format, so a `json` or `structured` format reads back as
+          `raw`.
+  - kind: log
+    feature: event_name
+    cells:
+      otlp_out:
+        class: exact
+        text: The `LogRecord`'s `event_name`.
+      datadog_out:
+        class: lost
+        reason: structural
+        text: A Datadog log has no event name, so none is written.
+  - kind: log
+    feature: observed_timestamp
+    cells:
+      otlp_out:
+        class: exact
+        text: The `LogRecord`'s `observed_time_unix_nano`.
+      datadog_out:
+        class: lost
+        reason: structural
+        text: A Datadog log has no observed time, so none is written.
+  - kind: log
+    feature: observed_timestamp_unset
+    cells:
+      statsd_out:
+        class: exact
+        text: No observed time is written, and none reads back.
+      otlp_out:
+        class: normalized
+        reason: observed_timestamp
+        text: >-
+          otlp_out stamps a log that has no observed time with the time it encodes the request,
+          as `logs.proto` defines the field.
+      datadog_out:
+        class: exact
+        text: No observed time is written, and none reads back.
+  - kind: log
+    feature: trace
+    cells:
+      otlp_out:
+        class: exact
+        text: The `LogRecord`'s `trace_id` and `span_id`.
+      datadog_out:
+        class: normalized
+        reason: trace_as_attributes
+        text: >-
+          The ids leave as hex `trace_id` and `span_id` keys, which Datadog's log intake reads for
+          trace correlation and datadog_in reads back as attributes, not as the log's trace;
+          neither is written when the log carries an attribute of either name.
+  - kind: log
+    feature: trace_unset
+    cells:
+      statsd_out:
+        class: exact
+        text: No trace is written, and none reads back.
+      otlp_out:
+        class: normalized
+        reason: trace_from_span
+        text: >-
+          A log with no trace on an event that carries a span leaves with the span's ids and
+          flags `0`; without a span, the log leaves with no trace.
+      datadog_out:
+        class: exact
+        text: No trace ids are written, and none read back.
+  - kind: log
+    feature: trace_flags
+    cells:
+      otlp_out:
+        class: exact
+        text: The low 8 bits of the `LogRecord`'s `flags`.
+      datadog_out:
+        class: lost
+        reason: structural
+        text: A Datadog log has no trace flags, so none are written.
+  - kind: log
+    feature: dropped_attributes_count
+    cells:
+      otlp_out:
+        class: exact
+        text: The `LogRecord`'s `dropped_attributes_count`.
+      datadog_out:
+        class: lost
+        reason: structural
+        text: A Datadog log has no dropped-attribute count, so none is written.
+  - kind: log
+    feature: timestamp
+    cells:
+      statsd_out:
+        class: normalized
+        reason: receipt_time
+        text: >-
+          A DogStatsD event carries `|d:` whole seconds only when it arrived with one, so any other
+          event's time is the time statsd_in received it.
+      otlp_out:
+        class: exact
+        text: The `LogRecord`'s `time_unix_nano`.
+      datadog_out:
+        class: normalized
+        reason: milliseconds
+        text: The `timestamp` field, in Unix milliseconds, so a finer timestamp is truncated.
+  - kind: log
+    feature: receipt_timestamp
+    cells:
+      otlp_out:
+        class: exact
+        text: The `LogRecord`'s `time_unix_nano`, the time the log was received.
+      datadog_out:
+        class: normalized
+        reason: milliseconds
+        text: The `timestamp` field, in Unix milliseconds, the time the log was received.
   - kind: log
     feature: beside_metrics
     cells:
@@ -3184,8 +3405,7 @@ rows:
         reason: uncounted
         text: A log on an event that carries metrics is left off while the metrics are written, uncounted.
       otlp_out:
-        class: normalized
-        reason: observed_timestamp
+        class: exact
         text: >-
           An OTLP log record in the logs request, beside the metrics in theirs, with an observed
           time stamped when it has none.

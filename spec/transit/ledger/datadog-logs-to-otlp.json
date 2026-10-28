@@ -1,0 +1,17 @@
+{
+  "cells": [
+    {"sink":"otlp_out","row":"attributes/datadog_carrier_log","cell":0,"observed":["lost"]},
+    {"sink":"otlp_out","row":"attributes/foreign_carrier","cell":0,"observed":["lost"]},
+    {"sink":"otlp_out","row":"attributes/service_identity","cell":0,"observed":["exact"]},
+    {"sink":"otlp_out","row":"attributes/string_value","cell":0,"observed":["exact"]},
+    {"sink":"otlp_out","row":"log/body_format","cell":0,"observed":["exact"]},
+    {"sink":"otlp_out","row":"log/dogstatsd_event","cell":0,"observed":["exact"]},
+    {"sink":"otlp_out","row":"log/observed_timestamp_unset","cell":0,"observed":["normalized"]},
+    {"sink":"otlp_out","row":"log/plain","cell":0,"observed":["exact"]},
+    {"sink":"otlp_out","row":"log/severity","cell":0,"observed":["exact"]},
+    {"sink":"otlp_out","row":"log/severity_unset","cell":0,"observed":["exact"]},
+    {"sink":"otlp_out","row":"log/timestamp","cell":0,"observed":["exact"]},
+    {"sink":"otlp_out","row":"log/trace_unset","cell":0,"observed":["exact"]}
+  ],
+  "unspecified": []
+}

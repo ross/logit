@@ -1,0 +1,9 @@
+{"timestamp":"2027-01-15T08:00:01.000000000Z","log":{"severity":"trace","format":"raw","message":"trace band"}}
+{"timestamp":"2027-01-15T08:00:01.001000000Z","log":{"severity":"debug","format":"raw","message":"debug band"}}
+{"timestamp":"2027-01-15T08:00:01.002000000Z","log":{"severity":"info","format":"raw","message":"info band"}}
+{"timestamp":"2027-01-15T08:00:01.003000000Z","log":{"severity":"warn","format":"raw","message":"warn band"}}
+{"timestamp":"2027-01-15T08:00:01.004000000Z","log":{"severity":"error","format":"raw","message":"error band"}}
+{"timestamp":"2027-01-15T08:00:01.005000000Z","log":{"severity":"fatal","format":"raw","message":"fatal band"}}
+{"timestamp":"2027-01-15T08:00:01.006000000Z","log":{"format":"raw","message":"no severity"}}
+{"timestamp":"2027-01-15T08:00:01.007000000Z","log":{"severity":"info","format":"raw","message":"INFO2 from the wire"},"attributes":{"_logit.otel.severity_number":10,"_logit.otel.severity_text":"INFO2"}}
+{"timestamp":"2027-01-15T08:00:01.008000000Z","log":{"severity":"warn","format":"raw","message":"a number only"},"attributes":{"_logit.otel.severity_number":14}}

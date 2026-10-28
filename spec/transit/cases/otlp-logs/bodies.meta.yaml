@@ -1,0 +1,4 @@
+# One log per body kind an OTLP `AnyValue` carries, each named by its `body` attribute: a string,
+# an int, a double, a bool, bytes, a key-value list, an array, no body, an empty string, and JSON
+# text under `format: json`.
+exercises: [body_string, body_int, body_double, body_bool, body_bytes, body_kvlist, body_array, body_absent, body_empty, body_format]

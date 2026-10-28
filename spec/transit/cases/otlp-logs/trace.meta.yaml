@@ -1,0 +1,3 @@
+# A log with an event name and a trace whose flags are sampled, one with a trace id and no span
+# id, and one with no trace on an event that also carries a span.
+exercises: [event_name, trace_context, trace_flags, trace_no_span_id, log_beside_span]

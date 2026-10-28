@@ -1,5 +1,5 @@
-# datadog_in's cases into otlp_out with nothing between: a count as a delta `Sum`, a sketch as
-# a `Summary`, and logs and events as log records.
+# datadog_in's metric cases into otlp_out with nothing between: a count as a delta `Sum`, and a
+# sketch as a `Summary`.
 # `path:` names one case so `logit run` can run this by hand; the transit spec runs every case in
 # that file's directory (spec/transit/README.md).
 components:

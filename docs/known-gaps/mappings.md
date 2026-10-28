@@ -144,7 +144,7 @@ Entry format and the other areas: [the known-gaps index](README.md).
   why the wire or the destination forces it is in the sink's module doc: the Prometheus rows'
   in `crates/logit-proto/src/prometheus/` (`mod.rs`, `text.rs`, `remote_write.rs`), the
   InfluxDB rows' in `crates/logit-proto/src/influxdb/mod.rs`, the OTLP rows' in
-  `crates/logit-proto/src/otlp/metrics.rs`, the statsd rows' in
+  `crates/logit-proto/src/otlp/` (`metrics.rs` and `logs.rs`), the statsd rows' in
   `crates/logit-outputs/src/statsd.rs`, the Datadog rows' in
   `crates/logit-proto/src/datadog/mod.rs`, and the Graphite rows' in
   `crates/logit-proto/src/graphite/mod.rs`.
@@ -426,8 +426,8 @@ Entry format and the other areas: [the known-gaps index](README.md).
   | encode (Datadog) | field `attributes/hostname` → **lost** | `logit.output.tags.omitted{reason=reserved_key}` | A log's `hostname` is `host.name`, so a `hostname` attribute has no key of its own on the wire and is left off, counted. |
   | encode (Datadog) | field `attributes/log_service` → **lost** | `logit.output.tags.omitted{reason=reserved_key}` | A log's `service` is `service.name`, so a `service` attribute beside it has no key of its own on the wire and is left off, counted. |
   | encode (Datadog) | field `attributes/service_tag_beside_key` → **lost** | `logit.output.tags.omitted{reason=unrepresentable}` | On a metric, an event, or a service check, beside its standard key, which leaves as the same tag, a valued `env`, `version`, or `service` would be a second value for the key, so it's left off, counted once per wire tag. |
-  | encode (Datadog) | field `attributes/map_value` → **lost** | `logit.output.tags.omitted{reason=unrepresentable}` | A tag has no nested form, so a map is left off, counted. |
-  | encode (Datadog) | field `attributes/bytes_value` → **lost** | `logit.output.tags.omitted{reason=unrepresentable}` | A tag has no bytes form, so the value is left off, counted. |
+  | encode (Datadog) | field `attributes/map_value` → **lost** | `logit.output.tags.omitted{reason=unrepresentable}` | A tag has no nested form, so a map is left off, counted. On a log, a JSON object, read back as itself. |
+  | encode (Datadog) | field `attributes/bytes_value` → **lost** | `logit.output.tags.omitted{reason=unrepresentable}` | A tag has no bytes form, so the value is left off, counted. On a log, its base64 text, read back as a string. |
   | encode (Datadog) | field `attributes/private_carrier` → **lost** | `logit.output.tags.omitted{reason=no_wire_form}` | A `_logit.datadog.*` carrier rides in its own wire field; one the route has no field for is left off, counted. `_logit.datadog.units`, which marks a decoded batch's units as Datadog names, is read and not written; datadog_in stamps it again on every series batch. The v2 series route writes `_logit.datadog.hostless` as a `host` resource with no name, which datadog_in reads into `_logit.datadog.resources`. |
   | encode (Datadog) | field `attributes/prometheus_target` → **lost** | none (structural) | The scrape target is private and never a tag, so it's left off. |
   | encode (Datadog) | field `attributes/foreign_carrier` → **lost** | none (structural) | Another protocol's `_logit.` carrier is private and never a tag, so it's left off. The `_logit.statsd.event.*` and `_logit.statsd.service_check.*` carriers are read as the Datadog fields they name. |
@@ -439,6 +439,12 @@ Entry format and the other areas: [the known-gaps index](README.md).
   | encode (Datadog) | field `attributes/interval_on_histogram`, not under `histograms: {"mode":"counters","send_aggregation_metrics":true}` and not under `histograms: {"mode":"counters","send_aggregation_metrics":false}` and not under `histograms: {"mode":"nobuckets","send_aggregation_metrics":true}` → **lost** | `logit.output.tags.omitted{reason=no_wire_form}` | Under `histograms.mode: distributions`, the default, the sketches route has no interval field, so a nonzero interval is left off, counted. |
   | encode (Datadog) | field `attributes/scope` → **lost** | none (structural) | Datadog has no instrumentation scope, so none is written. |
   | encode (Datadog) | field `attributes/datadog_carrier_log` → **lost** | none (uncounted) | A `_logit.datadog.*` carrier on a log, a Datadog event, or a service check that the route has no field for is left off, uncounted, where the metrics routes count one as `no_wire_form`; the events route's public form has no field for the Agent envelope's `_logit.datadog.agent.hostname`. |
+  | encode (Datadog) | field `attributes/severity_carrier` → **lost** | none (structural) | A Datadog log has a status and no raw OTLP severity, so the carriers are left off and the severity reads back at band resolution. |
+  | encode (Datadog) | field `log/body_format` → **lost** | none (structural) | A Datadog log has no body format, so a `json` or `structured` format reads back as `raw`. |
+  | encode (Datadog) | field `log/event_name` → **lost** | none (structural) | A Datadog log has no event name, so none is written. |
+  | encode (Datadog) | field `log/observed_timestamp` → **lost** | none (structural) | A Datadog log has no observed time, so none is written. |
+  | encode (Datadog) | field `log/trace_flags` → **lost** | none (structural) | A Datadog log has no trace flags, so none are written. |
+  | encode (Datadog) | field `log/dropped_attributes_count` → **lost** | none (structural) | A Datadog log has no dropped-attribute count, so none is written. |
   | encode (Datadog) | `span/no_wire_form` → **degraded** | `logit.output.spans.degraded{reason=no_wire_form}` | Datadog has no field for `status: ok`, a status message, `trace_state`, span flags, or a dropped count, so each is dropped, counted, and the span reads back without it. |
   | encode (Datadog) | `event/attributes_only` → **skipped** | `logit.output.events.skipped{reason=no_payload}` | An event with no metric, log, or span takes none of the intake's routes, so no request carries it. |
   | encode (Datadog) | `event/string_only` → **skipped** | `logit.output.events.skipped{reason=no_payload}` | An InfluxDB point whose fields are all strings has no metric, so it takes none of the intake's routes and no request carries it. |

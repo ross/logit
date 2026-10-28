@@ -1,8 +1,8 @@
 # The Datadog intake wire features a case under cases/datadog/ can exercise, from
 # crates/logit-proto/src/datadog/mod.rs's "Decode: series and distribution points → events" and
 # "Decode: sketches → events" tables and crates/logit-inputs/src/datadog.rs's routes. A case names
-# the ones it exercises in its `.meta.yaml`. Logs, events, and service checks have one feature
-# each; APM traces and stats have none yet.
+# the ones it exercises in its `.meta.yaml`. Service checks have one feature; logs and events are
+# cases/datadog-logs/'s (features/datadog-logs.yaml), and APM traces and stats have none yet.
 - name: series_v1
   text: A `/api/v1/series` JSON body, each point `[timestamp, value]`.
 - name: series_v2_json
@@ -42,8 +42,7 @@
 - name: host
   text: >-
     A record's own host, decoded to `host.name`: a series' `host` or its first named `host`
-    resource, a sketch's `host`, a log's `hostname`, an event's `host`, or a service check's
-    `host_name`.
+    resource, a sketch's `host`, or a service check's `host_name`.
 - name: hostless
   text: >-
     A `host` of `""`, or a `host` resource with no name, the Agent's hostless sample: the
@@ -79,9 +78,3 @@
   text: >-
     A `/api/v1/check_run` service check, decoded to a gauge of its status with the
     `_logit.statsd.service_check.*` carriers.
-- name: event
-  text: >-
-    An event in the Agent's `/intake/` envelope, decoded to a log with the
-    `_logit.statsd.event.*` carriers.
-- name: log
-  text: A `/api/v2/logs` log object, decoded to a log with its fields as attributes.

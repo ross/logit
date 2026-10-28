@@ -1,0 +1,3 @@
+# A log in each of the six severity bands with no carrier, one with no severity, one whose
+# carriers hold `SEVERITY_NUMBER_INFO2` and the text `INFO2`, and one with a number and no text.
+exercises: [severity_bands, severity_unset, severity_number_and_text, severity_number_only]

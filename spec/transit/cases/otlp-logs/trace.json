@@ -1,0 +1,3 @@
+{"timestamp":"2027-01-15T08:00:02.000000000Z","log":{"severity":"info","format":"raw","message":"checkout completed","event_name":"checkout.completed","trace_id":"5b8efff798038103d269b633813fc60c","span_id":"eee19b7ec3c1b174","trace_flags":1}}
+{"timestamp":"2027-01-15T08:00:02.001000000Z","log":{"severity":"info","format":"raw","message":"no span id","trace_id":"5b8efff798038103d269b633813fc60d","trace_flags":0}}
+{"timestamp":"2027-01-15T08:00:02.002000000Z","log":{"severity":"info","format":"raw","message":"beside its span"},"span":{"name":"GET /cart","trace_id":"5b8efff798038103d269b633813fc60e","span_id":"eee19b7ec3c1b175","kind":"internal","status":"unset","start":"2027-01-15T08:00:02.002000000Z","end":"2027-01-15T08:00:02.012000000Z","duration_ns":10000000}}

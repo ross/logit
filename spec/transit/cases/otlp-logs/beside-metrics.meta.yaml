@@ -1,0 +1,3 @@
+# A log on an event that also carries a gauge, which `otlp_in` never decodes but a stage such as
+# `kv_metrics` produces.
+exercises: [log_beside_metrics]
