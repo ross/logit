@@ -10,10 +10,11 @@
 //! | `prometheus_out`, `endpoint:` | one compressed request per batch | `decompress_bounded`, `remote_write::decode`, then `families_to_events` per timestamp group |
 //! | `datadog_out` | one uncompressed request per route per batch, one per event on the events route, with the sink's routing (`encode_routes`) and none of its stale filter, tag limit, trace readiness gate, or size cuts | `datadog_in`'s `decode_request`, by the request's path and `Content-Type` |
 //! | `graphite_out` | each `MessageBuf` entry: one plaintext line, or one length-prefixed pickle frame, line-capped as the sink's transport caps it | `GraphiteDecoder` of the encoder's protocol, one entry at a time, a pickle frame's length prefix stripped as `graphite_in`'s framer strips it |
+//! | `syslog_out` | each `MessageBuf` entry: one message, capped as the sink's transport caps it | `SyslogDecoder`, one entry at a time: a UDP datagram with line splitting on, `syslog_in`'s default `framing: lines`, or under `transport: tcp` one octet-counted frame's payload with line splitting off |
 //!
-//! The statsd and InfluxDB encoders return their counts, so this counts them through the sink's
-//! own reporting functions; the OTLP, Prometheus, Datadog, and Graphite encoders count through
-//! the handle they hold.
+//! The statsd, InfluxDB, and syslog encoders return their counts, so this counts them through the
+//! sink's own reporting functions; the OTLP, Prometheus, Datadog, and Graphite encoders count
+//! through the handle they hold.
 //! A decode error fails the run: the pair's decoder refusing its own sink's bytes is a finding.
 
 use crate::pipeline::SinkEncoder;
@@ -30,6 +31,7 @@ use logit_proto::otlp::OtlpDecoder;
 use logit_proto::prometheus::compression::decompress_bounded;
 use logit_proto::prometheus::{families_to_events, remote_write, text, Dialect, PrometheusDecoder};
 use logit_proto::statsd::StatsdDecoder;
+use logit_proto::syslog::SyslogDecoder;
 use logit_proto::{Decoder, Encoder, FramedEncoder, MessageBuf, SignalDecoder, SignalEncoder};
 use std::sync::Arc;
 
@@ -217,6 +219,34 @@ pub(super) fn round_trip(
                         )
                         .with_context(|| {
                             format!("graphite_in refused {:?}", String::from_utf8_lossy(entry))
+                        })?;
+                }
+                if !events.is_empty() {
+                    out.push(EventBatch { resource, scope: None, events });
+                }
+            }
+        }
+        SinkEncoder::Syslog { mut encoder, tcp } => {
+            let (telemetry, diag) = decode.handles("syslog_in");
+            let mut decoder = SyslogDecoder::new(empty())
+                .with_line_splitting(!tcp)
+                .with_telemetry(telemetry)
+                .with_diagnostics(diag);
+            let mut messages = MessageBuf::default();
+            for batch in batches {
+                let stats = encoder.encode_into(batch, &mut messages);
+                logit_outputs::syslog::report_encode_stats(sink, &stats);
+                let mut events = Vec::new();
+                let mut resource = empty();
+                for message in messages.iter() {
+                    (resource, _) = decoder
+                        .decode_into(
+                            Bytes::copy_from_slice(message),
+                            decode.received_at,
+                            &mut events,
+                        )
+                        .with_context(|| {
+                            format!("syslog_in refused {:?}", String::from_utf8_lossy(message))
                         })?;
                 }
                 if !events.is_empty() {

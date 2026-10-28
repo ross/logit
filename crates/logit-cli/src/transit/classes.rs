@@ -373,6 +373,13 @@ enum Spelling {
     /// Rust's shortest form, `3` for `3.0`, and an array's last representable element), and a
     /// value it omits, such as a timestamp or bytes, as no tag at all ([`graphite_value`]).
     Graphite,
+    /// `syslog_out`: a log's message as the encoder renders it, C0 and DEL escaped and a structured
+    /// one as `{k="v"}` text; its header attributes as the encoder writes them, sanitized; no
+    /// other attribute; and the attributes [`syslog_derived`] lists. Under RFC 3164 (`rfc3164`),
+    /// a header `syslog_in` doesn't read back as one moves into the message ([`syslog::read`]).
+    /// `facility` is the configured PRI facility; `structured_data` whether `structured_data:` is
+    /// set, which this spelling doesn't model.
+    Syslog { rfc3164: bool, facility: u8, structured_data: bool },
     /// Any other sink: names, keys, and values as written.
     Verbatim,
 }
@@ -387,6 +394,14 @@ impl Spelling {
             "otlp_out" => Spelling::Otlp,
             "datadog_out" => Spelling::Datadog,
             "graphite_out" => Spelling::Graphite,
+            "syslog_out" => Spelling::Syslog {
+                rfc3164: config["format"] == "rfc3164",
+                facility: serde_json::from_value::<logit_config::SyslogFacility>(
+                    config["facility"].clone(),
+                )
+                .map_or(16, |facility| facility.as_u8()),
+                structured_data: !config["structured_data"].is_null(),
+            },
             _ => Spelling::Verbatim,
         }
     }
@@ -398,9 +413,11 @@ impl Spelling {
             Spelling::Statsd { .. } => substituted(name, is_forbidden_in_name),
             Spelling::Prometheus => sanitize_metric_name(name).into_owned(),
             Spelling::Graphite => substituted(name, is_forbidden_in_path),
-            Spelling::Influxdb | Spelling::Otlp | Spelling::Datadog | Spelling::Verbatim => {
-                name.to_string()
-            }
+            Spelling::Influxdb
+            | Spelling::Otlp
+            | Spelling::Datadog
+            | Spelling::Syslog { .. }
+            | Spelling::Verbatim => name.to_string(),
         }
     }
 
@@ -476,7 +493,9 @@ impl Spelling {
     /// at a sink that writes the message as it is. `datadog_out`'s logs route writes
     /// `logit_proto::json::value_text`: a `Bytes` message as lossy UTF-8 and any other non-`Str`
     /// one as its JSON text, which `datadog_in` reads back as a `Str`. `otlp_out` writes every
-    /// message as an `AnyValue`.
+    /// message as an `AnyValue`. `syslog_out` writes [`logit_outputs::syslog::wire_message`],
+    /// which `syslog_in` reads back as a `Str`, or as `Bytes` where it isn't UTF-8, and under RFC
+    /// 3164 with any header token it doesn't read as a header ([`syslog::read`]).
     fn log_message(self, rec: &Rec) -> Option<String> {
         if rec.kind != "log" || rec.beside_metrics {
             return None;
@@ -486,7 +505,27 @@ impl Spelling {
                 let log = model_log(rec)?;
                 Some(logit_proto::json::value_text(&log.message).into_owned())
             }
+            Spelling::Syslog { rfc3164, .. } => {
+                syslog::read(rec, rfc3164).map(|read| text(&json_value(read.message)))
+            }
             _ => None,
+        }
+    }
+
+    /// [`Spelling::log_message`], but at `syslog_out` the message as the encoder renders it,
+    /// before `syslog_in` decides where its header ends: what `log/message_unsafe` compares.
+    fn rendered_message(self, rec: &Rec) -> Option<String> {
+        match self {
+            Spelling::Syslog { .. } if rec.kind == "log" && !rec.beside_metrics => {
+                let log = model_log(rec)?;
+                let bytes = logit_outputs::syslog::wire_message(&log.message);
+                let value = match String::from_utf8(bytes) {
+                    Ok(text) => logit_core::Value::str(text),
+                    Err(err) => logit_core::Value::Bytes(err.into_bytes().into()),
+                };
+                Some(text(&json_value(value)))
+            }
+            _ => self.log_message(rec),
         }
     }
 
@@ -535,6 +574,14 @@ impl Spelling {
     /// sink writes Unified Service Tagging tags, a valued `env`, `version`, or `service` attribute
     /// is that tag, which the pair decoder reads back under its standard key ([`unified::key`]).
     fn key_for(self, key: &str, rec: &Rec) -> String {
+        // A PROCID reads back as `process.pid` when it's canonical decimal, else as `syslog.pid`.
+        if let Spelling::Syslog { rfc3164, .. } = self {
+            if matches!(key, logit_core::attrs::PROCESS_PID | syslog::PID) {
+                if let Some(pid) = syslog::read(rec, rfc3164).and_then(|read| read.pid) {
+                    return syslog::pid_key(&pid).to_string();
+                }
+            }
+        }
         if self == Spelling::Datadog
             && key == logit_core::attrs::CONTAINER_ID
             && datadog::tags_container_id(rec)
@@ -566,6 +613,9 @@ impl Spelling {
     /// host, `datadog_out`'s log `hostname`, and a valued `env`, `version`, or `service` beside its
     /// standard key where the sink writes Unified Service Tagging tags.
     fn value_for(self, key: &str, value: &Value, tags: &str, rec: &Rec) -> Option<String> {
+        if let Spelling::Syslog { rfc3164, facility, .. } = self {
+            return syslog::value_for(rec, key, value, rfc3164, facility);
+        }
         if self == (Spelling::Statsd { dogstatsd: true }) && key == "host" {
             let kept = statsd::host_kept(rec, value)?;
             return Some(self.value(&kept, tags));
@@ -593,11 +643,12 @@ impl Spelling {
     }
 
     /// The attributes the sink writes from `rec`'s own fields, which its pair decoder reads back
-    /// as attributes `rec` lacks ([`Derived`]); empty for a sink that writes none. Only
-    /// `datadog_out` writes any ([`datadog_derived`]).
+    /// as attributes `rec` lacks ([`Derived`]); empty for a sink that writes none:
+    /// [`datadog_derived`] and [`syslog_derived`].
     fn derived(self, rec: &Rec) -> Vec<Derived> {
         match self {
             Spelling::Datadog => datadog_derived(rec),
+            Spelling::Syslog { rfc3164, facility, .. } => syslog_derived(rec, rfc3164, facility),
             _ => Vec::new(),
         }
     }
@@ -638,12 +689,71 @@ type Derived = (Option<&'static str>, &'static str, String);
 /// record reaches them, and one that derives nothing for a row reads it `exact`.
 fn derived_rows(rec: &Rec) -> Vec<&'static str> {
     let mut rows = Vec::new();
-    for (row, _, _) in Spelling::Datadog.derived(rec) {
-        if let Some(row) = row.filter(|row| !rows.contains(row)) {
-            rows.push(row);
+    // `syslog_out`'s rows don't depend on its config.
+    let syslog = Spelling::Syslog { rfc3164: false, facility: 0, structured_data: false };
+    for spelling in [Spelling::Datadog, syslog] {
+        for (row, _, _) in spelling.derived(rec) {
+            if let Some(row) = row.filter(|row| !rows.contains(row)) {
+                rows.push(row);
+            }
         }
     }
     rows
+}
+
+/// The attributes `syslog_out` writes for log `rec` from its own fields or the sink's config,
+/// which `syslog_in` reads back as attributes `rec` lacks (`crates/logit-outputs/src/syslog.rs`'s
+/// "Header-field precedence"):
+///
+/// - `syslog_facility`: the configured facility, on a log with no `syslog.facility`;
+/// - `no_host`: the run's hostname, on a log that carries no host, where `syslog_in` reads it back
+///   as HOSTNAME;
+/// - for pairing only, the `syslog.timestamp` written from `event.timestamp` on a log with none,
+///   which `log/timestamp` compares, and under RFC 3164 a `syslog.tag` and PROCID `syslog_in` reads
+///   from the message's first token.
+fn syslog_derived(rec: &Rec, rfc3164: bool, facility: u8) -> Vec<Derived> {
+    if rec.kind != "log" {
+        return Vec::new();
+    }
+    let Some(read) = syslog::read(rec, rfc3164) else { return Vec::new() };
+    let mut out = Vec::new();
+    if !rec.attributes.contains_key(syslog::FACILITY) {
+        let written = logit_outputs::syslog::wire_facility(&logit_core::AttrMap::new(), facility);
+        out.push((Some("syslog_facility"), syslog::FACILITY, written.to_string()));
+    }
+    if !syslog::carries_host(rec) {
+        if let Some(host) = &read.host {
+            out.push((Some("no_host"), logit_core::attrs::HOST_NAME, host.clone()));
+        }
+    }
+    if !rec.attributes.contains_key(syslog::TIMESTAMP) {
+        if let Some((written, _)) = syslog::written_timestamp(rec, rfc3164) {
+            out.push((None, syslog::TIMESTAMP, text(&written)));
+        }
+    }
+    if !read.tag_from_attribute {
+        if let Some(tag) = &read.tag {
+            out.push((None, syslog::TAG, tag.clone()));
+            if let Some(pid) = &read.pid {
+                out.push((None, syslog::pid_key(pid), pid.clone()));
+            }
+        }
+    }
+    out
+}
+
+/// `value` as `format: json` writes it, so a `Bytes` value is its `b"..."` text.
+fn json_value(value: logit_core::Value) -> Value {
+    let mut attributes = logit_core::AttrMap::new();
+    attributes.insert("v", value);
+    let batch = EventBatch {
+        resource: std::sync::Arc::default(),
+        scope: None,
+        events: vec![logit_core::Event::empty(0, attributes)],
+    };
+    let mut line = String::new();
+    render_ndjson(&mut line, &batch);
+    serde_json::from_str::<Value>(&line).map_or(Value::Null, |line| line["attributes"]["v"].clone())
 }
 
 /// The attributes `datadog_out` writes from `rec`'s own fields, which `datadog_in` reads back as
@@ -944,6 +1054,256 @@ mod datadog {
                     .is_some_and(|v| v.as_str().is_some_and(|h| !h.is_empty()))
                     || rec.resource.contains_key("_logit.datadog.agent.hostname")
             }
+        }
+    }
+}
+
+/// What `syslog_in` reads back from the message `syslog_out` writes for a log
+/// ([`Spelling::Syslog`]): the header fields and message through the encoder's own renderers
+/// (`logit_outputs::syslog`'s `wire_*` functions), and under RFC 3164 the decoder's rule for where
+/// the header ends (`logit_proto::syslog`'s "The RFC 3164 header"). The spelling assumes the
+/// sink's `hostname:` and `app_name:` are unset, as every flow leaves them: its HOSTNAME default is
+/// the run's hostname, and it writes no default APP-NAME.
+mod syslog {
+    use super::{model_attribute, model_log, Rec};
+    use logit_core::attrs::{HOST_NAME, PROCESS_PID};
+    use logit_core::time::{format_rfc3339_utc, parse_rfc3339_to_nanos};
+    use logit_core::AttrMap;
+    use logit_outputs::syslog::{
+        wire_app_name, wire_hostname, wire_message, wire_msgid, wire_procid, wire_timestamp, Format,
+    };
+    use logit_proto::syslog::is_tag_shaped;
+    use serde_json::{Map, Value};
+    use std::collections::BTreeMap;
+
+    pub(super) const FACILITY: &str = "syslog.facility";
+    pub(super) const TAG: &str = "syslog.tag";
+    pub(super) const PID: &str = "syslog.pid";
+    pub(super) const MSGID: &str = "syslog.msgid";
+    pub(super) const SD: &str = "syslog.sd";
+    pub(super) const TIMESTAMP: &str = "syslog.timestamp";
+    pub(super) const SEVERITY: &str = "_logit.syslog.severity";
+
+    /// One day in Unix nanoseconds.
+    const DAY: i64 = 86_400 * 1_000_000_000;
+
+    pub(super) fn format(rfc3164: bool) -> Format {
+        if rfc3164 {
+            Format::Rfc3164
+        } else {
+            Format::Rfc5424
+        }
+    }
+
+    /// `map`'s attributes back in the model, each through its type tags.
+    fn model_attrs(map: &Map<String, Value>, types: &BTreeMap<String, String>) -> AttrMap {
+        let mut attrs = AttrMap::new();
+        for (key, value) in map {
+            let tags = types.get(key).map(String::as_str).unwrap_or("");
+            if let Some(value) = model_attribute(value, tags) {
+                attrs.insert(key, value);
+            }
+        }
+        attrs
+    }
+
+    /// `rec`'s event attributes and its resource's, in the model.
+    fn scopes(rec: &Rec) -> (AttrMap, AttrMap) {
+        (
+            model_attrs(&rec.attributes, &rec.attribute_types),
+            model_attrs(&rec.resource, &rec.resource_types),
+        )
+    }
+
+    /// The event's timestamp in Unix nanoseconds.
+    fn nanos(rec: &Rec) -> Option<i64> {
+        parse_rfc3339_to_nanos(&rec.timestamp).ok()
+    }
+
+    /// Whether `rec` carries a host the encoder writes as HOSTNAME: a non-empty string
+    /// `host.name` on the event or its resource.
+    pub(super) fn carries_host(rec: &Rec) -> bool {
+        let (attrs, resource) = scopes(rec);
+        wire_hostname(Format::Rfc5424, &attrs, &resource, None).is_some()
+    }
+
+    /// The `syslog.timestamp` `syslog_in` reads back for `rec` as `format: json` writes it, and
+    /// whether the encoder wrote it from `rec`'s own `syslog.timestamp` rather than from its
+    /// `event.timestamp`.
+    pub(super) fn written_timestamp(rec: &Rec, rfc3164: bool) -> Option<(Value, bool)> {
+        let (attrs, _) = scopes(rec);
+        let at = nanos(rec)?;
+        let format = format(rfc3164);
+        let text = wire_timestamp(format, &attrs, at);
+        // The attribute's instant doesn't move with the event's.
+        let from_attribute = text == wire_timestamp(format, &attrs, at + DAY);
+        let read = if text == "-" {
+            Value::Null
+        } else if rfc3164 {
+            Value::String(text)
+        } else {
+            Value::String(format_rfc3339_utc(parse_rfc3339_to_nanos(&text).ok()?))
+        };
+        Some((read, from_attribute))
+    }
+
+    /// Whether `token` is a canonical decimal PROCID, which `syslog_in` reads back as
+    /// `process.pid` rather than `syslog.pid`.
+    fn canonical_pid(token: &str) -> bool {
+        token.bytes().all(|b| b.is_ascii_digit())
+            && (token == "0" || !token.starts_with('0'))
+            && token.parse::<u64>().is_ok()
+    }
+
+    /// What `syslog_in` reads back from the header and message `syslog_out` writes for a log.
+    pub(super) struct Read {
+        /// HOSTNAME, read back as `host.name`.
+        pub host: Option<String>,
+        /// TAG or APP-NAME, read back as `syslog.tag`, and whether it's the input's `syslog.tag`.
+        pub tag: Option<String>,
+        pub tag_from_attribute: bool,
+        /// PROCID, read back as `process.pid` when canonical decimal, else as `syslog.pid`; and
+        /// whether it's the input's `process.pid` rather than its `syslog.pid`.
+        pub pid: Option<String>,
+        pub pid_from_process: bool,
+        /// MSG as `format: json` writes it.
+        pub message: logit_core::Value,
+        /// Whether MSG reads back other than written: under RFC 3164, a header token read into
+        /// the message, or the message's first token read as a TAG.
+        pub boundary_moved: bool,
+    }
+
+    pub(super) fn read(rec: &Rec, rfc3164: bool) -> Option<Read> {
+        let log = model_log(rec)?;
+        let (attrs, resource) = scopes(rec);
+        let format = format(rfc3164);
+        let host = wire_hostname(format, &attrs, &resource, Some(super::super::HOSTNAME));
+        let tag = wire_app_name(format, &attrs, None);
+        let pid = wire_procid(format, &attrs, &resource);
+        let mut without_pid = attrs.clone();
+        without_pid.remove(PID);
+        let pid_from_process = wire_procid(format, &without_pid, &resource).is_some();
+        let message = wire_message(&log.message);
+        if !rfc3164 {
+            return Some(Read {
+                host,
+                tag_from_attribute: tag.is_some(),
+                tag,
+                pid,
+                pid_from_process,
+                message: as_value(message),
+                boundary_moved: false,
+            });
+        }
+        // `<PRI>TIMESTAMP` then each token after one space, as `write_rfc3164_header` writes them,
+        // and MSG after one more when it isn't empty.
+        let mut tokens: Vec<String> = Vec::new();
+        tokens.extend(host.clone());
+        let tag_pid = tag.as_ref().map(|tag| match &pid {
+            Some(pid) => (format!("{tag}[{pid}]:"), true),
+            None => (format!("{tag}:"), false),
+        });
+        tokens.extend(tag_pid.as_ref().map(|(token, _)| token.clone()));
+        let mut after_ts = tokens.join(" ").into_bytes();
+        if !message.is_empty() {
+            if !after_ts.is_empty() {
+                after_ts.push(b' ');
+            }
+            after_ts.extend_from_slice(&message);
+        }
+        let split = |s: &[u8]| -> (Vec<u8>, Vec<u8>) {
+            match s.iter().position(|&b| b == b' ') {
+                Some(i) => (s[..i].to_vec(), s[i + 1..].to_vec()),
+                None => (s.to_vec(), Vec::new()),
+            }
+        };
+        let (first, after_first) = split(&after_ts);
+        let (read_host, read_tag, read_message) = if is_tag_shaped(&first) {
+            (None, Some(first), after_first)
+        } else {
+            let (second, after_second) = split(&after_first);
+            if is_tag_shaped(&second) {
+                (Some(first), Some(second), after_second)
+            } else {
+                (None, None, after_ts.clone())
+            }
+        };
+        let read_host =
+            read_host.filter(|h| !h.is_empty()).map(|h| String::from_utf8_lossy(&h).into_owned());
+        let (read_tag, read_pid) = match read_tag {
+            None => (None, None),
+            Some(token) => {
+                let body = String::from_utf8_lossy(&token[..token.len() - 1]).into_owned();
+                match body.rfind('[') {
+                    Some(open) => (
+                        Some(body[..open].to_string()),
+                        Some(body[open + 1..body.len() - 1].to_string()),
+                    ),
+                    None => (Some(body), None),
+                }
+            }
+        };
+        let written_tag = tag_pid.map(|(token, _)| token);
+        let tag_from_attribute = read_tag.is_some()
+            && written_tag.is_some()
+            && read_tag.as_deref() == tag.as_deref();
+        Some(Read {
+            host: read_host,
+            tag: read_tag,
+            tag_from_attribute,
+            pid: read_pid,
+            pid_from_process,
+            boundary_moved: read_message != message,
+            message: as_value(read_message),
+        })
+    }
+
+    /// MSG's bytes as `syslog_in` reads them: a string when valid UTF-8, else bytes.
+    fn as_value(bytes: Vec<u8>) -> logit_core::Value {
+        match String::from_utf8(bytes) {
+            Ok(text) => logit_core::Value::str(&text),
+            Err(err) => logit_core::Value::Bytes(err.into_bytes().into()),
+        }
+    }
+
+    /// The key `syslog_in` reads a written PROCID back under.
+    pub(super) fn pid_key(pid: &str) -> &'static str {
+        if canonical_pid(pid) {
+            PROCESS_PID
+        } else {
+            PID
+        }
+    }
+
+    /// Attribute `key` of `rec` as `syslog_in` reads it back, as text; `None` where `syslog_out`
+    /// writes nothing for it. Only the header's attributes are written: `host.name`, `syslog.tag`,
+    /// `syslog.facility`, `syslog.msgid`, `syslog.sd`, `syslog.timestamp`, and the PROCID's
+    /// `process.pid` or `syslog.pid`.
+    pub(super) fn value_for(
+        rec: &Rec,
+        key: &str,
+        value: &Value,
+        rfc3164: bool,
+        facility: u8,
+    ) -> Option<String> {
+        let on_event = rec.attributes.get(key) == Some(value);
+        let read = read(rec, rfc3164)?;
+        match key {
+            HOST_NAME => read.host,
+            TAG if on_event && read.tag_from_attribute => read.tag,
+            PROCESS_PID if read.pid_from_process => read.pid,
+            PID if !read.pid_from_process => read.pid,
+            FACILITY if on_event => {
+                let (attrs, _) = scopes(rec);
+                Some(logit_outputs::syslog::wire_facility(&attrs, facility).to_string())
+            }
+            MSGID if on_event => {
+                let (attrs, _) = scopes(rec);
+                wire_msgid(format(rfc3164), &attrs)
+            }
+            SD if on_event && !rfc3164 && value.is_object() => Some(super::text(value)),
+            TIMESTAMP if on_event => written_timestamp(rec, rfc3164).map(|(read, _)| super::text(&read)),
+            _ => None,
         }
     }
 }
@@ -1567,8 +1927,13 @@ fn log_features(rec: &Rec, spelling: Spelling) -> Vec<&'static str> {
         return features;
     }
     let message = &rec.body["message"];
-    if spelling.log_message(rec).is_some_and(|m| *message != Value::String(m)) {
+    if spelling.rendered_message(rec).is_some_and(|m| *message != Value::String(m)) {
         features.push("message_unsafe");
+    }
+    if let Spelling::Syslog { rfc3164: true, .. } = spelling {
+        if syslog::read(rec, true).is_some_and(|read| read.boundary_moved) {
+            features.push("header_in_message");
+        }
     }
     if message.is_object() || message.is_array() {
         features.push("structured_message");
@@ -1818,6 +2183,9 @@ fn field_rows(rec: &Rec, protocol: &str) -> Vec<(String, Option<String>, Field)>
         } else if key.starts_with("_logit.otel.severity_") {
             // OTLP's raw severity, which `Severity` holds only at band resolution.
             Some("severity_carrier_otel")
+        } else if key == syslog::SEVERITY {
+            // syslog's PRI severity, which `Severity` holds only at band resolution.
+            Some("severity_carrier_syslog")
         } else if key.starts_with("_logit.datadog.") && json_route {
             Some("datadog_carrier_log")
         } else if key.starts_with(&own) || (protocol == "influxdb" && is_field(key)) {
@@ -1828,6 +2196,22 @@ fn field_rows(rec: &Rec, protocol: &str) -> Vec<(String, Option<String>, Field)>
             Some("foreign_carrier")
         } else {
             None
+        }
+    };
+    // A log's attribute the log sinks treat by its key: `syslog_out`'s header fields.
+    let header = |key: &str| {
+        if rec.kind != "log" || rec.beside_metrics {
+            return None;
+        }
+        match key {
+            syslog::FACILITY | syslog::TAG | syslog::PID | logit_core::attrs::PROCESS_PID => {
+                Some("syslog_header")
+            }
+            syslog::MSGID => Some("syslog_msgid"),
+            syslog::SD => Some("syslog_sd"),
+            syslog::TIMESTAMP => Some("syslog_timestamp"),
+            logit_core::attrs::HOST_NAME => Some("host_name"),
+            _ => None,
         }
     };
     // A host attribute a sink leaves off for the record's own host: `statsd_out`'s `host` beside
@@ -1869,6 +2253,8 @@ fn field_rows(rec: &Rec, protocol: &str) -> Vec<(String, Option<String>, Field)>
         let tags = rec.attribute_types.get(key).map(String::as_str).unwrap_or("");
         let feature = if let Some(feature) = carrier(key, value) {
             feature
+        } else if let Some(feature) = header(key) {
+            feature
         } else if let Some(feature) = outranked(key, value) {
             feature
         } else if let Some(feature) = service(key, value) {
@@ -1891,8 +2277,10 @@ fn field_rows(rec: &Rec, protocol: &str) -> Vec<(String, Option<String>, Field)>
         rows.push(("attributes".to_string(), Some(feature.to_string()), field));
     }
     for (key, value) in &rec.resource {
-        let feature =
-            carrier(key, value).or_else(|| outranked(key, value)).unwrap_or("resource_attribute");
+        let feature = carrier(key, value)
+            .or_else(|| header(key))
+            .or_else(|| outranked(key, value))
+            .unwrap_or("resource_attribute");
         let field = Field::Attribute { key: key.clone(), resource: true };
         rows.push(("attributes".to_string(), Some(feature.to_string()), field));
     }
@@ -1953,6 +2341,21 @@ fn observe_field(field: &Field, input: &Rec, out: &Rec, spelling: Spelling) -> C
             Some(_) => Class::Normalized,
             None => Class::Exact,
         },
+        // `syslog_in` stamps `event.timestamp` with its receipt time, so the instant written is the
+        // read-back `syslog.timestamp`, and it's the event's only where the encoder wrote that.
+        Field::Timestamp { .. } if matches!(spelling, Spelling::Syslog { .. }) => {
+            let Spelling::Syslog { rfc3164, .. } = spelling else { return Class::Lost };
+            match syslog::written_timestamp(input, rfc3164) {
+                Some((written, false)) if out.attributes.get(syslog::TIMESTAMP) == Some(&written) => {
+                    if written == Value::String(input.timestamp.clone()) {
+                        Class::Exact
+                    } else {
+                        Class::Normalized
+                    }
+                }
+                _ => Class::Lost,
+            }
+        }
         // A receipt time read back outside its own second is another instant, which no
         // precision explains.
         Field::Timestamp { receipt } => {
@@ -2019,6 +2422,15 @@ fn observe_field(field: &Field, input: &Rec, out: &Rec, spelling: Spelling) -> C
                 && datadog::hostless_mark(out)
             {
                 return Class::Normalized;
+            }
+            // `syslog_out` writes `event.timestamp` where it can't render `syslog.timestamp`, so
+            // what reads back is another instant.
+            if let Spelling::Syslog { rfc3164, .. } = spelling {
+                if key == syslog::TIMESTAMP && !*resource {
+                    if let Some((_, false)) = syslog::written_timestamp(input, rfc3164) {
+                        return Class::Lost;
+                    }
+                }
             }
             // A key the sink respells reads back under its wire spelling, which is a change.
             let wire = spelling.key_for(key, input);

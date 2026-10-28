@@ -41,7 +41,7 @@
 //! `lua_file`, `route`, `route_signals`, and `target`; `has_stale` and `drop_stale`, which read
 //! the wall clock per batch; and a sink [`sink_encoder`] has no arm
 //! for (today `statsd_out`, `influxdb_out`, `otlp_out`, `prometheus_out` in both modes,
-//! `datadog_out`, and `graphite_out`).
+//! `datadog_out`, `graphite_out`, and `syslog_out`).
 //!
 //! Exposition has no configured dialect: a scraper negotiates one, so the driver takes it as
 //! [`Options::dialect`], OpenMetrics by default, which is what a Prometheus scrape negotiates.

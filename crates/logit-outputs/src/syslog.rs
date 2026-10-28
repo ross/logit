@@ -654,19 +654,21 @@ fn write_rfc5424_header(
     let _ = write!(out, "<{pri}>1 ");
     write_5424_timestamp(out, attrs, event_timestamp);
     out.push(' ');
-    push_5424_field(out, scratch, hostname, 255);
+    push_5424_field(out, scratch, hostname, HeaderField::Hostname.max_len(Format::Rfc5424));
     out.push(' ');
-    push_5424_field(out, scratch, app_name, 48);
+    push_5424_field(out, scratch, app_name, HeaderField::AppName.max_len(Format::Rfc5424));
     out.push(' ');
     match pid {
         Some(Pid::U64(p)) => {
             let _ = write!(out, "{p}");
         }
-        Some(Pid::Str(s)) => push_5424_field(out, scratch, Some(s), 128),
+        Some(Pid::Str(s)) => {
+            push_5424_field(out, scratch, Some(s), HeaderField::ProcId.max_len(Format::Rfc5424))
+        }
         None => out.push('-'),
     }
     out.push(' ');
-    push_5424_field(out, scratch, msgid, 32);
+    push_5424_field(out, scratch, msgid, HeaderField::MsgId.max_len(Format::Rfc5424));
     out.push(' ');
     write_structured_data(out, scratch, attrs, structured_data, stats, diag);
 }
@@ -726,14 +728,14 @@ fn write_rfc3164_header(
     let _ = write!(out, "<{pri}>");
     write_3164_timestamp(out, attrs, event_timestamp);
     if let Some(h) = hostname {
-        sanitize_3164_token(scratch, h, 255);
+        sanitize_3164_token(scratch, h, HeaderField::Hostname.max_len(Format::Rfc3164));
         if !scratch.is_empty() {
             out.push(' ');
             out.push_str(scratch);
         }
     }
     if let Some(t) = tag {
-        sanitize_3164_token(scratch, t, 32);
+        sanitize_3164_token(scratch, t, HeaderField::AppName.max_len(Format::Rfc3164));
         if !scratch.is_empty() {
             out.push(' ');
             out.push_str(scratch);
@@ -744,7 +746,7 @@ fn write_rfc3164_header(
                         let _ = write!(out, "{n}");
                     }
                     Pid::Str(s) => {
-                        sanitize_3164_token(scratch, s, 128);
+                        sanitize_3164_token(scratch, s, HeaderField::ProcId.max_len(Format::Rfc3164));
                         out.push_str(scratch);
                     }
                 }
@@ -1130,6 +1132,122 @@ fn sanitize_msg_bytes(out: &mut Vec<u8>, msg: &[u8]) {
     }
 }
 
+/// A log message as [`SyslogEncoder`] writes it after the header, before `max_message_bytes`
+/// truncates it: [`render_message`] then [`sanitize_msg`], or [`sanitize_msg_bytes`] for a
+/// `Value::Bytes` message, the encoder's own passes.
+pub fn wire_message(value: &Value) -> Vec<u8> {
+    let mut out = Vec::new();
+    match value {
+        Value::Bytes(raw) => sanitize_msg_bytes(&mut out, raw),
+        other => {
+            let mut raw = String::new();
+            render_message(&mut raw, other);
+            let mut sanitized = String::new();
+            sanitize_msg(&mut sanitized, &raw);
+            out = sanitized.into_bytes();
+        }
+    }
+    out
+}
+
+/// A string header field [`wire_header_field`] renders.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeaderField {
+    Hostname,
+    /// RFC 5424's APP-NAME, RFC 3164's TAG.
+    AppName,
+    ProcId,
+    /// RFC 5424 only.
+    MsgId,
+}
+
+impl HeaderField {
+    /// RFC 5424 section 6's cap on the field. RFC 3164 caps only TAG, at 32 characters; the
+    /// encoder applies RFC 5424's caps to its other fields.
+    fn max_len(self, format: Format) -> usize {
+        match (self, format) {
+            (HeaderField::Hostname, _) => 255,
+            (HeaderField::AppName, Format::Rfc5424) => 48,
+            (HeaderField::AppName, Format::Rfc3164) => 32,
+            (HeaderField::ProcId, _) => 128,
+            (HeaderField::MsgId, _) => 32,
+        }
+    }
+}
+
+/// A string header field's value as [`SyslogEncoder`] writes it under `format`, sanitized and
+/// capped ([`sanitize_5424_field`], [`sanitize_3164_token`]). Empty where the encoder writes RFC
+/// 5424's NILVALUE or omits the RFC 3164 token.
+pub fn wire_header_field(format: Format, field: HeaderField, value: &str) -> String {
+    let mut out = String::new();
+    match format {
+        Format::Rfc5424 => sanitize_5424_field(&mut out, value, field.max_len(format)),
+        Format::Rfc3164 => sanitize_3164_token(&mut out, value, field.max_len(format)),
+    }
+    out
+}
+
+/// The TIMESTAMP [`SyslogEncoder`] writes under `format` for an event with attributes `attrs` and
+/// timestamp `event_timestamp` (the module doc's "Timestamp semantics").
+pub fn wire_timestamp(format: Format, attrs: &AttrMap, event_timestamp: i64) -> String {
+    let mut out = String::new();
+    match format {
+        Format::Rfc5424 => write_5424_timestamp(&mut out, attrs, event_timestamp),
+        Format::Rfc3164 => write_3164_timestamp(&mut out, attrs, event_timestamp),
+    }
+    out
+}
+
+/// The PRI facility [`SyslogEncoder`] writes for an event with attributes `attrs` when its
+/// configured facility is `default`.
+pub fn wire_facility(attrs: &AttrMap, default: u8) -> u8 {
+    resolve_facility(attrs, default.min(23))
+}
+
+/// The HOSTNAME [`SyslogEncoder`] writes under `format` for an event with attributes `attrs` in a
+/// batch whose resource attributes are `resource`, when its configured default is `default`;
+/// `None` where it writes none (the module doc's "Header-field precedence").
+pub fn wire_hostname(
+    format: Format,
+    attrs: &AttrMap,
+    resource: &AttrMap,
+    default: Option<&str>,
+) -> Option<String> {
+    let hostname =
+        resolve_str(attrs, HOST_NAME).or_else(|| resolve_str(resource, HOST_NAME)).or(default)?;
+    Some(wire_header_field(format, HeaderField::Hostname, hostname)).filter(|h| !h.is_empty())
+}
+
+/// The APP-NAME, or RFC 3164's TAG, [`SyslogEncoder`] writes under `format` for an event with
+/// attributes `attrs`, when its configured default is `default`; `None` where it writes none.
+pub fn wire_app_name(format: Format, attrs: &AttrMap, default: Option<&str>) -> Option<String> {
+    let app_name = resolve_str(attrs, "syslog.tag").or(default)?;
+    Some(wire_header_field(format, HeaderField::AppName, app_name)).filter(|a| !a.is_empty())
+}
+
+/// The PROCID [`SyslogEncoder`] resolves under `format` for an event with attributes `attrs` in a
+/// batch whose resource attributes are `resource`; `None` where it resolves none. An RFC 3164
+/// output writes it only inside a TAG.
+pub fn wire_procid(format: Format, attrs: &AttrMap, resource: &AttrMap) -> Option<String> {
+    let mut stats = EncodeStats::default();
+    match resolve_pid(attrs, resource, &mut stats)? {
+        Pid::U64(n) => Some(n.to_string()),
+        Pid::Str(s) => {
+            Some(wire_header_field(format, HeaderField::ProcId, s)).filter(|p| !p.is_empty())
+        }
+    }
+}
+
+/// The MSGID [`SyslogEncoder`] writes under `format` for an event with attributes `attrs`; `None`
+/// where it writes none, which is always under RFC 3164.
+pub fn wire_msgid(format: Format, attrs: &AttrMap) -> Option<String> {
+    if format == Format::Rfc3164 {
+        return None;
+    }
+    let msgid = resolve_str(attrs, "syslog.msgid")?;
+    Some(wire_header_field(format, HeaderField::MsgId, msgid)).filter(|m| !m.is_empty())
+}
+
 /// Truncates `s` to at most `budget` bytes on a UTF-8 character boundary; `true` if it cut.
 fn truncate_on_char_boundary(s: &mut String, budget: usize) -> bool {
     if s.len() <= budget {
@@ -1242,7 +1360,7 @@ impl SyslogOutput {
         let encoder = encoder.with_diagnostics(self.diag.gated(self.accounting.gate()));
         self.encoder = match self.conn {
             Conn::Udp(_) => {
-                let cap = encoder.max_message_bytes().min(MAX_UDP_PAYLOAD_BYTES);
+                let cap = message_cap(false, encoder.max_message_bytes());
                 encoder.with_max_message_bytes(cap)
             }
             Conn::Tcp { .. } => encoder,
@@ -1314,9 +1432,19 @@ impl SyslogOutput {
     }
 }
 
+/// The longest message the encoder may write for a transport: `max_message_bytes`, at most
+/// [`MAX_UDP_PAYLOAD_BYTES`] over UDP (module doc's "Sizing").
+pub fn message_cap(tcp: bool, max_message_bytes: usize) -> usize {
+    if tcp {
+        max_message_bytes
+    } else {
+        max_message_bytes.min(MAX_UDP_PAYLOAD_BYTES)
+    }
+}
+
 /// Turns one `encode_into` call's [`EncodeStats`] into `logit.output.*` telemetry points.
 /// A free function so it's testable without a real socket.
-fn report_encode_stats(telemetry: &Telemetry, stats: &EncodeStats) {
+pub fn report_encode_stats(telemetry: &Telemetry, stats: &EncodeStats) {
     telemetry.count("logit.output.events.skipped", stats.skipped_no_log as f64, &[]);
     telemetry.count("logit.output.messages.truncated", stats.truncated as f64, &[]);
     telemetry.count(

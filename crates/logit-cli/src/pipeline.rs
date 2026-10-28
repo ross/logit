@@ -1567,20 +1567,15 @@ pub(crate) fn build_spec(
                         .with_accept_timeout(*accept_timeout)
                 }
             };
-            // Filled only where neither an event nor its resource carries a `host.name`.
-            let default_hostname = configured_hostname.as_deref().unwrap_or(&**hostname);
-            let mut encoder = SyslogEncoder::new(syslog_format(*format), facility.as_u8())
-                .with_max_message_bytes(*max_message_bytes as usize)
-                .with_hostname(default_hostname);
-            if let Some(app_name) = app_name {
-                encoder = encoder.with_app_name(app_name.clone());
-            }
-            if let Some(structured_data) = structured_data {
-                encoder =
-                    encoder.with_structured_data(structured_data.sd_id.clone()).with_context(
-                        || format!("component {id:?}: syslog_out structured_data.sd_id is invalid"),
-                    )?;
-            }
+            let encoder = syslog_encoder(
+                *format,
+                *facility,
+                configured_hostname.as_deref().unwrap_or(&**hostname),
+                app_name.as_deref(),
+                *max_message_bytes,
+                structured_data.as_ref(),
+            )
+            .with_context(|| format!("component {id:?}: syslog_out structured_data.sd_id is invalid"))?;
             output = output
                 .with_encoder(encoder)
                 .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
@@ -1820,6 +1815,10 @@ pub(crate) enum SinkEncoder {
     /// `graphite_out`: one plaintext line, or one length-prefixed pickle frame, per
     /// [`logit_proto::MessageBuf`] entry, line-capped as the sink's transport caps it.
     Graphite(GraphiteEncoder),
+    /// `syslog_out`: one message per [`logit_proto::MessageBuf`] entry, capped as the sink's
+    /// transport caps it; `tcp` under `transport: tcp`, where the sink frames each entry with an
+    /// octet count and `syslog_in` reads it with line splitting off.
+    Syslog { encoder: SyslogEncoder, tcp: bool },
 }
 
 /// The [`SinkEncoder`] for `kind`, its codec counting through `telemetry` and `diag`. Every
@@ -1898,6 +1897,31 @@ pub(crate) fn sink_encoder(
                     .with_diagnostics(diag.clone()),
             )
         }
+        SyslogOut {
+            transport,
+            format,
+            facility,
+            hostname: configured_hostname,
+            app_name,
+            max_message_bytes,
+            structured_data,
+            ..
+        } => {
+            let tcp = matches!(transport, logit_config::SyslogTransport::Tcp);
+            let encoder = syslog_encoder(
+                *format,
+                *facility,
+                configured_hostname.as_deref().unwrap_or(hostname),
+                app_name.as_deref(),
+                *max_message_bytes,
+                structured_data.as_ref(),
+            )?;
+            let cap = logit_outputs::syslog::message_cap(tcp, encoder.max_message_bytes());
+            SinkEncoder::Syslog {
+                encoder: encoder.with_max_message_bytes(cap).with_diagnostics(diag.clone()),
+                tcp,
+            }
+        }
         other => anyhow::bail!("{} has no encoder this driver reaches", graph::kind_name(other)),
     })
 }
@@ -1927,6 +1951,30 @@ fn statsd_encoder(
     StatsdEncoder::new(statsd_format(format))
         .with_relative_gauges(relative_gauges)
         .with_multi_value(statsd_multi_value(multi_value))
+}
+
+/// `syslog_out`'s encoder from its config fields, before the sink applies its transport's message
+/// cap. `default_hostname` is the sink's `hostname:`, else the process hostname, written only
+/// where neither an event nor its resource carries a `host.name`. Fails for an invalid
+/// `structured_data.sd_id`.
+fn syslog_encoder(
+    format: logit_config::SyslogFormat,
+    facility: logit_config::SyslogFacility,
+    default_hostname: &str,
+    app_name: Option<&str>,
+    max_message_bytes: u64,
+    structured_data: Option<&logit_config::SyslogStructuredData>,
+) -> anyhow::Result<SyslogEncoder> {
+    let mut encoder = SyslogEncoder::new(syslog_format(format), facility.as_u8())
+        .with_max_message_bytes(max_message_bytes as usize)
+        .with_hostname(default_hostname);
+    if let Some(app_name) = app_name {
+        encoder = encoder.with_app_name(app_name);
+    }
+    if let Some(structured_data) = structured_data {
+        encoder = encoder.with_structured_data(structured_data.sd_id.clone())?;
+    }
+    Ok(encoder)
 }
 
 /// `graphite_out`'s encoder from its config fields, before the sink applies its line cap.

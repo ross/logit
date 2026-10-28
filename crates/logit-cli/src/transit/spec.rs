@@ -36,9 +36,10 @@
 //! the features from `features/<system>.yaml` the case `exercises`, an optional `wire:` file
 //! (relative to the case's directory) the `.json` is decoded from by `<system>_in`'s decoder at
 //! [`RECEIVED_AT`] (with the request's `name: value` headers from a `.headers` sidecar beside
-//! the wire file, for a collectd case the `types.db` file an optional `types_db:` names, and for
-//! a graphite case the carbon protocol an optional `protocol: plaintext | pickle` names, as
-//! [`decode_wire`] reads them), and optional `tolerance:` entries (`{path, abs}`: an RFC 6901
+//! the wire file, for a collectd case the `types.db` file an optional `types_db:` names, for a
+//! graphite case the carbon protocol an optional `protocol: plaintext | pickle` names, and for a
+//! syslog case the transport an optional `framing: datagram | stream` names, as [`decode_wire`]
+//! reads them), and optional `tolerance:` entries (`{path, abs}`: an RFC 6901
 //! pointer into each event of the document, and the most the number there may differ by). A hand-written case
 //! has no `wire:`, and its `.json` must read back to itself through `logit_proto::event_json`
 //! and `format: json`, so each case has one spelling.
@@ -67,7 +68,7 @@ use logit_pipeline::test_util::TelemetryProbe;
 use logit_proto::collectd::{CollectdDecoder, TypesDb};
 use logit_proto::datadog::DatadogDecoder;
 use logit_proto::event_json::EventJsonDecoder;
-use logit_proto::framing::{Framer, FramingMode};
+use logit_proto::framing::{Framer, FramingMode, MAX_FRAME_BYTES};
 use logit_proto::graphite::{GraphiteDecoder, Protocol, DEFAULT_MAX_FRAME_BYTES};
 use logit_proto::influxdb::{write_resource, InfluxDecoder, Precision};
 use logit_proto::otlp::OtlpDecoder;
@@ -75,6 +76,7 @@ use logit_proto::prometheus::{
     families_to_events, text, Dialect, PrometheusDecoder, ATTR_TARGET, LABEL_INSTANCE,
 };
 use logit_proto::statsd::StatsdDecoder;
+use logit_proto::syslog::SyslogDecoder;
 use logit_proto::{Decoder, Signal};
 use serde::Deserialize;
 use serde_json::Value;
@@ -113,7 +115,21 @@ struct Meta {
     #[serde(default)]
     protocol: Option<CarbonProtocol>,
     #[serde(default)]
+    framing: Option<SyslogFraming>,
+    #[serde(default)]
     tolerance: Vec<Tolerance>,
+}
+
+/// How a syslog case's wire file reached `syslog_in` ([`decode_wire`]).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum SyslogFraming {
+    /// One UDP datagram, read with line splitting on, the listener's default `framing: lines`.
+    #[default]
+    Datagram,
+    /// A TCP connection's byte stream, split by `syslog_in`'s RFC 6587 framer, each frame read
+    /// with line splitting off.
+    Stream,
 }
 
 /// A graphite case's `protocol:`, `graphite_in`'s setting of that name.
@@ -307,7 +323,11 @@ fn canonical(case: &Case) -> anyhow::Result<String> {
         !wire.ends_with(".pkl") || matches!(carbon, CarbonWire::PicklePayload),
         "a .pkl wire file is a pickle payload, so its case needs protocol: pickle"
     );
-    decode_wire(&case.system, bytes, &headers, types_db.as_deref(), carbon)
+    if case.meta.framing.is_some() {
+        ensure!(case.system == "syslog", "framing: names how a syslog_in case arrived");
+    }
+    let framing = case.meta.framing.unwrap_or_default();
+    decode_wire(&case.system, bytes, &headers, types_db.as_deref(), carbon, framing)
         .with_context(|| format!("decoding {}", path.display()))
 }
 
@@ -377,12 +397,17 @@ const SCRAPE_INSTANCE: &str = "transit:9100";
 ///   under an empty resource. Plaintext is the whole file, which the decoder splits into lines. A
 ///   pickle file is a connection's stream, split into payloads by `graphite_in`'s length-prefix
 ///   `Framer`, or under a `.pkl` extension one payload with no prefix.
+/// - `syslog`: through `SyslogDecoder`, under an empty resource, in the meta's `framing:`
+///   (`datagram` when absent): one datagram with line splitting on, as `syslog_in` reads UDP by
+///   default, or a TCP stream split by `Framer::new(FramingMode::Rfc6587Auto, …)`, each frame
+///   read with line splitting off, as `SyslogInput::tcp` reads it.
 fn decode_wire(
     system: &str,
     bytes: Vec<u8>,
     headers: &Headers,
     types_db: Option<&str>,
     carbon: CarbonWire,
+    framing: SyslogFraming,
 ) -> anyhow::Result<String> {
     let mut probe = TelemetryProbe::new();
     let id = "transit.case";
@@ -556,6 +581,34 @@ fn decode_wire(
             let mut resource = Arc::new(Resource::default());
             for payload in payloads {
                 (resource, _) = decoder.decode_into(payload, RECEIVED_AT, &mut events)?;
+            }
+            vec![EventBatch { resource, scope: None, events }]
+        }
+        "syslog" => {
+            let telemetry = probe.telemetry(id, "syslog_in", "listener");
+            let diag = Diagnostics::new(id).with_telemetry(telemetry.clone());
+            let stream = framing == SyslogFraming::Stream;
+            let mut decoder = SyslogDecoder::new(Arc::new(Resource::default()))
+                .with_line_splitting(!stream)
+                .with_telemetry(telemetry)
+                .with_diagnostics(diag);
+            let units = if stream {
+                let refused = |err| anyhow::anyhow!("syslog_in's framer refused: {err}");
+                let mut framer = Framer::new(FramingMode::Rfc6587Auto, MAX_FRAME_BYTES);
+                framer.push(&bytes);
+                let mut frames = Vec::new();
+                while let Some(frame) = framer.next_frame().map_err(refused)? {
+                    frames.push(frame);
+                }
+                frames.extend(framer.finish().map_err(refused)?);
+                frames
+            } else {
+                vec![Bytes::from(bytes)]
+            };
+            let mut events = Vec::new();
+            let mut resource = Arc::new(Resource::default());
+            for unit in units {
+                (resource, _) = decoder.decode_into(unit, RECEIVED_AT, &mut events)?;
             }
             vec![EventBatch { resource, scope: None, events }]
         }

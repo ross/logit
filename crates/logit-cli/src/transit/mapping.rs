@@ -93,10 +93,17 @@ use std::path::Path;
 /// is `structural`. Spans aren't classified yet, and log records only at `otlp_out`,
 /// `datadog_out`, and, for a DogStatsD event, `statsd_out`; a `_logit.datadog.*` carrier
 /// `datadog_out` leaves off a log is uncounted too.
-const UNCOUNTED_ALLOWED: [(&str, Option<&str>, Option<&str>); 3] = [
+const UNCOUNTED_ALLOWED: [(&str, Option<&str>, Option<&str>); 10] = [
     ("log", None, None),
     ("span", None, None),
     ("attributes", Some("datadog_carrier_log"), Some("datadog_out")),
+    ("attributes", Some("string_value"), Some("syslog_out")),
+    ("attributes", Some("bool_value"), Some("syslog_out")),
+    ("attributes", Some("number_value"), Some("syslog_out")),
+    ("attributes", Some("array_value"), Some("syslog_out")),
+    ("attributes", Some("map_value"), Some("syslog_out")),
+    ("attributes", Some("bytes_value"), Some("syslog_out")),
+    ("attributes", Some("timestamp_value"), Some("syslog_out")),
 ];
 
 /// Whether the cell of `sink` in row `kind`/`feature` may be `uncounted` ([`UNCOUNTED_ALLOWED`]).
@@ -194,10 +201,17 @@ const KINDS: [(&str, &[&str]); 15] = [
             "scope",
             "datadog_carrier_log",
             "severity_carrier_otel",
+            "severity_carrier_syslog",
+            "syslog_header",
+            "syslog_msgid",
+            "syslog_sd",
+            "syslog_timestamp",
+            "host_name",
             "no_host",
             "log_status",
             "span_kind",
             "trace_id_high",
+            "syslog_facility",
         ],
     ),
     (
@@ -209,6 +223,7 @@ const KINDS: [(&str, &[&str]); 15] = [
             "structured_message",
             "bytes_message",
             "blank_message",
+            "header_in_message",
             "severity",
             "severity_unset",
             "body_format",
