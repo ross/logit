@@ -96,9 +96,11 @@
   "sc4s-startup-out": {"events": [
     {"timestamp":"2026-09-25T17:50:01.312000000Z","log":{"format":"raw","message":"syslog-ng-config: sc4s version=3.40.0"}}
   ], "counters": {}},
-  "span": {"events": [], "counters": {
-    "logit.output.events.skipped{component=out,kind=kafka_out,reason=no_log,role=sink}": 1
-  }},
+  "span-malformed": {"events": [
+    {"timestamp":"2026-09-25T17:48:48.200000000Z","log":{"format":"raw","message":"{\"span_id\":\"53995c3f42cd8ad8\",\"trace_id\":\"a3ce929d0e0e47364bf92f3577b34da6\",\"end_time\":1790358528200001000,\"kind\":\"SPAN_KIND_SERVER\",\"name\":\"zero-parent\",\"parent_span_id\":\"0000000000000000\",\"start_time\":1790358528200000000,\"status\":{\"message\":\"\",\"code\":\"STATUS_CODE_UNSET\"}}"}},
+    {"timestamp":"2026-09-25T17:48:48.200000000Z","log":{"format":"raw","message":"{\"span_id\":\"53995c3f42cd8ad9\",\"trace_id\":\"a3ce929d0e0e47364bf92f3577b34da6\",\"end_time\":1790358528200002000,\"kind\":\"SPAN_KIND_SERVER\",\"name\":\"with-flags\",\"parent_span_id\":\"\",\"start_time\":1790358528200001000,\"status\":{\"message\":\"\",\"code\":\"STATUS_CODE_UNSET\"},\"flags\":257}"}},
+    {"timestamp":"2026-09-25T17:48:48.200000000Z","log":{"format":"raw","message":"{\"span_id\":\"53995c3f42cd8ada\",\"trace_id\":\"a3ce929d0e0e47364bf92f3577b34da6\",\"end_time\":1790358528200003000,\"kind\":\"SPAN_KIND_SERVER\",\"name\":\"with-trace-state\",\"parent_span_id\":\"\",\"start_time\":1790358528200002000,\"status\":{\"message\":\"\",\"code\":\"STATUS_CODE_UNSET\"},\"trace_state\":\"rojo=00f067aa0ba902b7\"}"}}
+  ], "counters": {}},
   "times": {"events": [
     {"timestamp":"2026-09-21T14:13:20.000000000Z","log":{"format":"raw","message":"integer"}},
     {"timestamp":"2026-09-21T14:13:20.123000000Z","log":{"format":"raw","message":"nine decimals"}},

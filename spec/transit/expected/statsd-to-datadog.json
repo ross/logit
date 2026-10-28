@@ -132,6 +132,11 @@
   "set-sanitized": {"events": [], "counters": {
     "logit.output.metrics.skipped{component=out,kind=datadog_out,metric_kind=set_members,role=sink}": 1
   }},
+  "span-beside-log": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"format":"raw","message":"rolled out"},"attributes":{"_logit.statsd.event.title":"Deploy","host.name":"transit"}}
+  ], "counters": {
+    "logit.output.records.dropped{component=out,kind=datadog_out,reason=not_datadog_origin,role=sink,route=traces}": 1
+  }},
   "span-beside-metrics": {"events": [
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"requests.inflight","kind":"gauge","value":3.0}],"attributes":{"host.name":"transit"},"resource":{"attributes":{"_logit.datadog.units":"datadog"}}}
   ], "counters": {
@@ -145,6 +150,9 @@
   }},
   "span-pair": {"events": [], "counters": {
     "logit.output.records.dropped{component=out,kind=datadog_out,reason=not_datadog_origin,role=sink,route=traces}": 2
+  }},
+  "span-unmarked": {"events": [], "counters": {
+    "logit.output.records.dropped{component=out,kind=datadog_out,reason=needs_agent_processing,role=sink,route=traces}": 1
   }},
   "sub-millisecond": {"events": [
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"queue.depth","kind":"gauge","value":4.0}],"attributes":{"host.name":"transit"},"resource":{"attributes":{"_logit.datadog.units":"datadog"}}}

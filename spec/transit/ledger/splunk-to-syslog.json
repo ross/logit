@@ -24,9 +24,7 @@
     {"sink":"syslog_out","row":"log/timestamp","cell":1,"observed":["exact","normalized"]},
     {"sink":"syslog_out","row":"log/trace","cell":0,"observed":["lost"]},
     {"sink":"syslog_out","row":"log/trace_flags","cell":0,"observed":["lost"]},
-    {"sink":"syslog_out","row":"log/trace_unset","cell":0,"observed":["exact"]},
-    {"sink":"syslog_out","row":"span/alone","cell":0,"observed":["skipped"]},
-    {"sink":"syslog_out","row":"span/not_datadog_origin","cell":0,"observed":[]}
+    {"sink":"syslog_out","row":"log/trace_unset","cell":0,"observed":["exact"]}
   ],
   "unspecified": []
 }

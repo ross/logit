@@ -1,0 +1,4 @@
+# A hand-written DogStatsD event with a span on the same event, as
+# `cases/statsd-logs/event-beside-span` holds it, so the metric sinks reach `log/dogstatsd_event`
+# and `span/beside_log` together.
+exercises: [event]

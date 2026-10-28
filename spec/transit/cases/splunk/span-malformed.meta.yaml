@@ -1,0 +1,6 @@
+# A hand-written /event body of three span objects `splunk_hec_in` keeps as logs, each counted
+# `logit.input.spans.degraded{reason=malformed_span}`: one whose `parent_span_id` is present and
+# all zero, as `splunk_hec_out` writes a zero parent id, and two carrying a member the exporter's
+# span object doesn't have, `flags` and `trace_state`, as a future exporter could.
+wire: span-malformed.bin
+exercises: [event_route, object_event, fields, envelope, time_fractional, span_malformed_zero_parent, span_malformed_unknown_member]

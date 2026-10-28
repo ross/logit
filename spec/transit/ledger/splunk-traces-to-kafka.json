@@ -1,0 +1,33 @@
+{
+  "cells": [
+    {"sink":"kafka_out","row":"attributes/array_value","cell":1,"observed":["exact"]},
+    {"sink":"kafka_out","row":"attributes/bool_value","cell":1,"observed":["exact"]},
+    {"sink":"kafka_out","row":"attributes/map_value","cell":1,"observed":["exact"]},
+    {"sink":"kafka_out","row":"attributes/resource_attribute","cell":1,"observed":["exact"]},
+    {"sink":"kafka_out","row":"attributes/span_kind","cell":0,"observed":["exact"]},
+    {"sink":"kafka_out","row":"attributes/span_numeric","cell":0,"observed":["exact"]},
+    {"sink":"kafka_out","row":"attributes/splunk_envelope","cell":1,"observed":["exact"]},
+    {"sink":"kafka_out","row":"attributes/string_value","cell":1,"observed":["exact"]},
+    {"sink":"kafka_out","row":"attributes/trace_id_high","cell":0,"observed":["exact"]},
+    {"sink":"kafka_out","row":"span/alone","cell":1,"observed":["exact"]},
+    {"sink":"kafka_out","row":"span/end_before_start","cell":0,"observed":["exact"]},
+    {"sink":"kafka_out","row":"span/end_timestamp","cell":0,"observed":["exact"]},
+    {"sink":"kafka_out","row":"span/event_nested_attribute","cell":0,"observed":["exact"]},
+    {"sink":"kafka_out","row":"span/events","cell":0,"observed":["exact"]},
+    {"sink":"kafka_out","row":"span/kind","cell":0,"observed":["exact"]},
+    {"sink":"kafka_out","row":"span/link_trace_state","cell":0,"observed":["exact"]},
+    {"sink":"kafka_out","row":"span/links","cell":0,"observed":["exact"]},
+    {"sink":"kafka_out","row":"span/name","cell":0,"observed":["exact"]},
+    {"sink":"kafka_out","row":"span/nested_u64_attribute","cell":0,"observed":["exact"]},
+    {"sink":"kafka_out","row":"span/not_datadog_origin","cell":0,"observed":["exact"]},
+    {"sink":"kafka_out","row":"span/parent_span_id","cell":0,"observed":["exact"]},
+    {"sink":"kafka_out","row":"span/parent_unset","cell":0,"observed":["exact"]},
+    {"sink":"kafka_out","row":"span/status_error","cell":0,"observed":["exact"]},
+    {"sink":"kafka_out","row":"span/status_message","cell":0,"observed":["exact"]},
+    {"sink":"kafka_out","row":"span/status_ok","cell":0,"observed":["exact"]},
+    {"sink":"kafka_out","row":"span/status_unset","cell":0,"observed":["exact"]},
+    {"sink":"kafka_out","row":"span/timestamp","cell":0,"observed":["exact"]},
+    {"sink":"kafka_out","row":"span/trace_id","cell":0,"observed":["exact"]}
+  ],
+  "unspecified": []
+}

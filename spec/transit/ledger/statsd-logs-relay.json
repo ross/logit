@@ -21,6 +21,7 @@
     {"sink":"statsd_out","row":"span/alone","cell":0,"observed":["skipped"]},
     {"sink":"statsd_out","row":"span/beside_log","cell":0,"observed":["lost"]},
     {"sink":"statsd_out","row":"span/beside_metrics","cell":0,"observed":["lost"]},
+    {"sink":"statsd_out","row":"span/needs_agent_processing","cell":0,"observed":[]},
     {"sink":"statsd_out","row":"span/not_datadog_origin","cell":0,"observed":[]}
   ],
   "unspecified": []

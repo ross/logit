@@ -282,7 +282,7 @@
 //! | `attributes/interval_on_histogram`, otherwise | lost | `logit.output.tags.omitted{reason=no_wire_form}` | Under `histograms.mode: distributions`, the default, the sketches route has no interval field, so a nonzero interval is left off, counted. |
 //! | `attributes/resource_attribute` | normalized | `resource_as_tag` | Merged into the record's tags, so it reads back as an event attribute. |
 //! | `attributes/scope` | lost | structural | Datadog has no instrumentation scope, so none is written. |
-//! | `attributes/datadog_carrier_log` | lost | uncounted | A `_logit.datadog.*` carrier on a log, a Datadog event, or a service check that the route has no field for is left off, uncounted, where the metrics routes count one as `no_wire_form`; the events route's public form has no field for the Agent envelope's `_logit.datadog.agent.hostname`. |
+//! | `attributes/datadog_carrier_log` | lost | uncounted | A `_logit.datadog.*` carrier on a log, a Datadog event, a service check, or a span that the route has no field for is left off, uncounted, where the metrics routes count one as `no_wire_form`; the events route's public form has no field for the Agent envelope's `_logit.datadog.agent.hostname`. |
 //! | `attributes/severity_carrier_otel` | lost | structural | A Datadog log has a status and no raw OTLP severity, so the carriers are left off and the severity reads back at band resolution. |
 //! | `attributes/severity_carrier_syslog` | lost | structural | A Datadog log has a status and no raw syslog severity, so the carrier is left off and the severity reads back at band resolution. |
 //! | `attributes/span_numeric` | normalized | `span_metric`; `logit.output.spans.degraded{reason=int_as_f64}` | An entry of the span's `metrics`, read back as an `f64`; an integer that loses precision as an `f64` is counted. |
@@ -297,7 +297,7 @@
 //! | `attributes/syslog_sd` | exact | -- | A JSON object in the log object, read back as itself. |
 //! | `attributes/syslog_timestamp` | normalized | `stringified` | A top-level key of the log object: an RFC 5424 timestamp as its RFC 3339 text, read back as a string. |
 //! | `attributes/host_name` | exact | -- | The log's `hostname`, or the event's `host`, read back as `host.name`. |
-//! | `attributes/splunk_envelope` | normalized | `resource_as_tag` | Merged into the log's attributes, so it reads back as an event attribute. |
+//! | `attributes/splunk_envelope` | normalized | `resource_as_tag` | Merged into the log's attributes or the span's `meta`, so it reads back as an event attribute. |
 //! | `attributes/syslog_facility` | exact | -- | A log with no `syslog.facility` leaves with none. |
 //! | `attributes/no_host` | normalized | `default_host` | A record with no host and no hostless mark leaves with the process hostname as its host, which datadog_in reads back as `host.name`; a span's host is its batch resource's `host.name`, filled only when no relaying Agent's hostname rides beside it. |
 //! | `attributes/default_tag` | exact | -- | A log with no `syslog.tag` leaves with none. |

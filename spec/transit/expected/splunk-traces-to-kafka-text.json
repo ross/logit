@@ -1,0 +1,14 @@
+{
+  "capture": {"events": [], "counters": {
+    "logit.output.events.skipped{component=out,kind=kafka_out,reason=no_log,role=sink}": 6
+  }},
+  "fields": {"events": [], "counters": {
+    "logit.output.events.skipped{component=out,kind=kafka_out,reason=no_log,role=sink}": 2
+  }},
+  "kinds": {"events": [], "counters": {
+    "logit.output.events.skipped{component=out,kind=kafka_out,reason=no_log,role=sink}": 18
+  }},
+  "span": {"events": [], "counters": {
+    "logit.output.events.skipped{component=out,kind=kafka_out,reason=no_log,role=sink}": 1
+  }}
+}

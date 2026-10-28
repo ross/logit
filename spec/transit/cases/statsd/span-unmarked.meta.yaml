@@ -1,0 +1,4 @@
+# A hand-written dd-trace span with no `_top_level` mark, as a tracer sends it, so `datadog_out`'s
+# readiness gate reads it as a Datadog span the Agent hasn't processed and every other sink reaches
+# `span/needs_agent_processing` beside `span/alone`.
+exercises: []

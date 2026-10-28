@@ -190,6 +190,9 @@
     "logit.component.events.discarded{component=window,kind=aggregate,role=transform}": 1,
     "logit.output.messages.normalized{component=out,kind=statsd_out,reason=member_sanitized,role=sink}": 2
   }},
+  "span-beside-log": {"events": [
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","log":{"format":"raw","message":"rolled out"},"attributes":{"_logit.statsd.event.title":"Deploy"}}
+  ], "counters": {}},
   "span-beside-metrics": {"events": [
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"requests.inflight","kind":"gauge","value":3.0}]}
   ], "counters": {
@@ -203,6 +206,9 @@
   }},
   "span-pair": {"events": [], "counters": {
     "logit.output.events.skipped{component=out,kind=statsd_out,reason=no_metrics,role=sink}": 2
+  }},
+  "span-unmarked": {"events": [], "counters": {
+    "logit.output.events.skipped{component=out,kind=statsd_out,reason=no_metrics,role=sink}": 1
   }},
   "sub-millisecond": {"events": [
     {"timestamp":"2027-01-15T08:00:01.000000500Z","metrics":[{"name":"queue.depth","kind":"gauge","value":4.0}]}

@@ -1,0 +1,9 @@
+# A hand-written /event body: a server span with a string, an integer, a float, a bool, a `u64`
+# above `i64::MAX`, an object, and an array attribute, two events (one with scalar, `u64`, object,
+# and array attributes and a timestamp, one bare), and two links (one with a `trace_state` and
+# scalar and object attributes, one with an empty `trace_state`), whose envelope `time` is half a
+# second off its `start_time` and whose `fields` hold a nested object and a `com.splunk.index` the
+# envelope's `index` wins over; and a client span ending before it starts, with no carriers and a
+# `host.name` in its `fields`.
+wire: fields.bin
+exercises: [event_route, span_object, attributes, attribute_numeric, attribute_u64, attribute_nested, events, event_attributes, links, link_trace_state, link_attributes, parent_empty, parent_span_id, envelope, envelope_absent, fields_resource, fields_nested, fields_host_name, carrier_collision, time_ignored, end_before_start]

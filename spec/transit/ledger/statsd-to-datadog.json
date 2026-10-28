@@ -63,6 +63,7 @@
     {"sink":"datadog_out","row":"set","cell":0,"observed":["degraded"]},
     {"sink":"datadog_out","row":"set_members","cell":0,"observed":["skipped"]},
     {"sink":"datadog_out","row":"span/alone","cell":0,"observed":[]},
+    {"sink":"datadog_out","row":"span/needs_agent_processing","cell":0,"observed":["dropped"]},
     {"sink":"datadog_out","row":"span/not_datadog_origin","cell":0,"observed":["dropped"]},
     {"sink":"datadog_out","row":"sum/bool","cell":0,"observed":["normalized"]},
     {"sink":"datadog_out","row":"sum/cumulative_monotonic","cell":0,"observed":["dropped"]},

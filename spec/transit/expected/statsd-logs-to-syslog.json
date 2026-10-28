@@ -18,5 +18,8 @@
   }},
   "span-only": {"events": [], "counters": {
     "logit.output.events.skipped{component=out,kind=syslog_out,reason=no_log,role=sink}": 1
+  }},
+  "span-unmarked": {"events": [], "counters": {
+    "logit.output.events.skipped{component=out,kind=syslog_out,reason=no_log,role=sink}": 1
   }}
 }

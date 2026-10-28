@@ -119,11 +119,11 @@
 //! | `attributes/bytes_value` | exact | -- | A `meta_struct` entry of the span, read back as bytes. |
 //! | `attributes/timestamp_value` | normalized | `stringified` | A `meta` entry of its RFC 3339 text, read back as a string. |
 //! | `attributes/null_value` | normalized | `json_text`; `logit.output.spans.degraded{reason=json_text}` | A `meta` entry of `null`, counted, read back as the string. |
-//! | `attributes/private_carrier` | lost | structural | A `_logit.datadog.*` carrier rides in its own wire field; one the trace API has no field for is left off. |
 //! | `attributes/foreign_carrier` | lost | structural | Another protocol's `_logit.` carrier is private and never a span tag, so it's left off. |
 //! | `attributes/resource_attribute`, under `version: v0.4` | normalized | `resource_as_tag` | v0.4 has no `TracerPayload`, so a resource attribute is merged into every span's `meta` or `metrics`, `host.name`, `deployment.environment.name`, and `service.version` included, and reads back as an event attribute. |
 //! | `attributes/resource_attribute`, otherwise | normalized | `resource_as_tag` | Merged into every span's `meta` or `metrics`, so it reads back as an event attribute; `host.name`, `deployment.environment.name`, and `service.version` are the `TracerPayload`'s `hostname`, `env`, and `app_version`, read back on the resource. |
 //! | `attributes/scope` | lost | structural | The trace API has no instrumentation scope, so none is written. |
+//! | `attributes/datadog_carrier_log` | lost | structural | A `_logit.datadog.*` carrier rides in its own wire field; one the trace API has no field for, outside the chunk, span, tracer, and Agent carriers, is left off. |
 //! | `attributes/span_numeric` | normalized | `span_metric`; `logit.output.spans.degraded{reason=int_as_f64}` | An entry of the span's `metrics`, read back as an `f64`; an integer that loses precision as an `f64` is counted. |
 //! | `attributes/datadog_span_identity` | exact | -- | The span's `service`, `resource`, or `type` field, read back as the attribute. |
 //! | `attributes/datadog_span_marks` | exact | -- | A `metrics` entry for a number and a `meta` entry for a string, read back as the attribute. |
@@ -133,6 +133,7 @@
 //! | `attributes/datadog_tracer_resource`, otherwise | exact | -- | The `TracerPayload`'s field, read back into the carrier. |
 //! | `attributes/datadog_tracer_headers` | exact | -- | The tracer request header the carrier names, sent on every trace request under either `version:`, which datadog_trace_in reads back into the carrier. |
 //! | `attributes/datadog_agent_resource` | lost | `logit.output.spans.degraded{reason=no_wire_form}` | The trace API has no `AgentPayload` under either `version:`, so the carrier is left off, counted once per request. |
+//! | `attributes/splunk_envelope` | normalized | `resource_as_tag` | Merged into every span's `meta` under either version, since neither a v0.4 span nor a v0.7 `TracerPayload` has a field for it, so it reads back as an event attribute. |
 //! | `attributes/no_host` | exact | -- | The sink writes no host for a span that carries none: the Agent it sends to fills its own, so nothing stands in its place. |
 //! | `attributes/span_kind` | normalized | `span_kind_meta` | A span whose kind isn't internal, with no `span.kind` attribute, leaves with `meta["span.kind"]`, which datadog_trace_in reads back as a `span.kind` attribute beside the kind. |
 //! | `attributes/trace_id_high` | normalized | `trace_id_high_tag` | On the first span of a trace in a batch, when no span of the trace carries `_dd.p.tid`, a 128-bit trace id's high 64 bits leave as `meta["_dd.p.tid"]`, which datadog_trace_in reads back as a `_dd.p.tid` attribute beside the trace id. |

@@ -8,6 +8,9 @@
     "logit.output.events.skipped{component=out,kind=kafka_out,reason=no_log,role=sink}": 3,
     "logit.output.spans.omitted{component=out,kind=kafka_out,reason=format,role=sink}": 1
   }},
+  "carrier": {"events": [], "counters": {
+    "logit.output.events.skipped{component=out,kind=kafka_out,reason=no_log,role=sink}": 1
+  }},
   "marked": {"events": [], "counters": {
     "logit.output.events.skipped{component=out,kind=kafka_out,reason=no_log,role=sink}": 3
   }},

@@ -1,0 +1,8 @@
+# A hand-written /event body: one trace of 18 spans, each kind under its exporter name
+# (`SPAN_KIND_*`), its short name (`Server`), and its integer (`0` to `5`), `Unspecified` and `0`
+# among them; status codes under the same three spellings, with and without a `message`, an empty
+# status object, a `null` status, and none at all; and a root whose parent is `""`, one whose parent
+# is `null`, and one with no `parent_span_id`. Every object carries the full envelope and a
+# `service.name` field.
+wire: kinds.bin
+exercises: [event_route, span_object, kind_name, kind_short_name, kind_integer, kind_unspecified, status_unset, status_ok, status_error, status_name, status_short_name, status_integer, status_message, status_empty, status_null, status_absent, parent_span_id, parent_empty, parent_null, parent_absent, envelope, fields_resource]

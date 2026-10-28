@@ -96,9 +96,11 @@
   "sc4s-startup-out": {"events": [
     {"timestamp":"2026-09-25T17:50:01.312000000Z","log":{"format":"raw","message":"syslog-ng-config: sc4s version=3.40.0"},"attributes":{"com.splunk.index":"main","com.splunk.source":"sc4s","com.splunk.sourcetype":"sc4s:events:startup:out","host.name":"splunk-sc4s-fixture","sc4s_class":"events","sc4s_container":"splunk-sc4s-fixture","sc4s_destport":0,"sc4s_fromhostip":"127.0.0.1","sc4s_product":"sc4s","sc4s_proto":0,"sc4s_recv_time":"1790358601.312","sc4s_tags":".source.s_startup_out","sc4s_vendor":"splunk"}}
   ], "counters": {}},
-  "span": {"events": [], "counters": {
-    "logit.output.records.dropped{component=out,kind=datadog_out,reason=not_datadog_origin,role=sink,route=traces}": 1
-  }},
+  "span-malformed": {"events": [
+    {"timestamp":"2026-09-25T17:48:48.200000000Z","log":{"format":"raw","message":"{\"status\":{\"message\":\"\",\"code\":\"STATUS_CODE_UNSET\"},\"trace_id\":\"a3ce929d0e0e47364bf92f3577b34da6\",\"span_id\":\"53995c3f42cd8ad8\",\"end_time\":1790358528200001000,\"kind\":\"SPAN_KIND_SERVER\",\"name\":\"zero-parent\",\"parent_span_id\":\"0000000000000000\",\"start_time\":1790358528200000000}"},"attributes":{"com.splunk.index":"main","com.splunk.source":"otel:app","com.splunk.sourcetype":"otel:traces","host.name":"web-1","service.name":"checkout"}},
+    {"timestamp":"2026-09-25T17:48:48.200000000Z","log":{"format":"raw","message":"{\"status\":{\"message\":\"\",\"code\":\"STATUS_CODE_UNSET\"},\"trace_id\":\"a3ce929d0e0e47364bf92f3577b34da6\",\"span_id\":\"53995c3f42cd8ad9\",\"end_time\":1790358528200002000,\"kind\":\"SPAN_KIND_SERVER\",\"name\":\"with-flags\",\"parent_span_id\":\"\",\"start_time\":1790358528200001000,\"flags\":257}"},"attributes":{"com.splunk.index":"main","com.splunk.source":"otel:app","com.splunk.sourcetype":"otel:traces","host.name":"web-1","service.name":"checkout"}},
+    {"timestamp":"2026-09-25T17:48:48.200000000Z","log":{"format":"raw","message":"{\"status\":{\"message\":\"\",\"code\":\"STATUS_CODE_UNSET\"},\"trace_id\":\"a3ce929d0e0e47364bf92f3577b34da6\",\"span_id\":\"53995c3f42cd8ada\",\"end_time\":1790358528200003000,\"kind\":\"SPAN_KIND_SERVER\",\"name\":\"with-trace-state\",\"parent_span_id\":\"\",\"start_time\":1790358528200002000,\"trace_state\":\"rojo=00f067aa0ba902b7\"}"},"attributes":{"com.splunk.index":"main","com.splunk.source":"otel:app","com.splunk.sourcetype":"otel:traces","host.name":"web-1","service.name":"checkout"}}
+  ], "counters": {}},
   "times": {"events": [
     {"timestamp":"2026-09-21T14:13:20.000000000Z","log":{"format":"raw","message":"integer"},"attributes":{"host.name":"transit"}},
     {"timestamp":"2026-09-21T14:13:20.123000000Z","log":{"format":"raw","message":"nine decimals"},"attributes":{"host.name":"transit"}},

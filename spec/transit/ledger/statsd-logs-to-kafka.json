@@ -1,5 +1,6 @@
 {
   "cells": [
+    {"sink":"kafka_out","row":"attributes/datadog_span_identity","cell":0,"observed":["exact"]},
     {"sink":"kafka_out","row":"attributes/default_tag","cell":0,"observed":["exact"]},
     {"sink":"kafka_out","row":"attributes/foreign_carrier","cell":1,"observed":["exact"]},
     {"sink":"kafka_out","row":"attributes/host_name","cell":1,"observed":["exact"]},
@@ -27,6 +28,7 @@
     {"sink":"kafka_out","row":"span/end_timestamp","cell":0,"observed":["exact"]},
     {"sink":"kafka_out","row":"span/kind","cell":0,"observed":["exact"]},
     {"sink":"kafka_out","row":"span/name","cell":0,"observed":["exact"]},
+    {"sink":"kafka_out","row":"span/needs_agent_processing","cell":0,"observed":["exact"]},
     {"sink":"kafka_out","row":"span/not_datadog_origin","cell":0,"observed":["exact"]},
     {"sink":"kafka_out","row":"span/parent_unset","cell":0,"observed":["exact"]},
     {"sink":"kafka_out","row":"span/status_ok","cell":0,"observed":["exact"]},

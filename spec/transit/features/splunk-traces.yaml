@@ -1,0 +1,91 @@
+# The Splunk HTTP Event Collector (HEC) span features a case under cases/splunk-traces/ can
+# exercise, from crates/logit-proto/src/splunk/spans.rs's decode table: the OpenTelemetry
+# Collector `splunk_hec` exporter's span object. A case names the ones it exercises in its
+# `.meta.yaml`. A span object `splunk_hec_in` keeps as a log is a `cases/splunk/` case, since a
+# span directory never routes a log into a span sink.
+- name: event_route
+  text: A `/services/collector` or `/services/collector/event` body of concatenated JSON objects.
+- name: gzip
+  text: A body sent with `Content-Encoding` `gzip`, decompressed first.
+- name: span_object
+  text: >-
+    An `event` object carrying `trace_id`, `span_id`, `start_time`, and `end_time`, the
+    exporter's span object, decoded to a span on its own event.
+- name: kind_name
+  text: A `kind` under the exporter's name, such as `SPAN_KIND_SERVER`.
+- name: kind_short_name
+  text: A `kind` under its short name, such as `Server`.
+- name: kind_integer
+  text: A `kind` as its OTLP integer, `0` to `5`.
+- name: kind_unspecified
+  text: >-
+    An unspecified `kind` (`SPAN_KIND_UNSPECIFIED`, `Unspecified`, or `0`), decoded to
+    `internal`, since the model has no unspecified kind.
+- name: status_unset
+  text: A `status.code` of unset, or no code.
+- name: status_ok
+  text: A `status.code` of ok.
+- name: status_error
+  text: A `status.code` of error.
+- name: status_name
+  text: A `status.code` under the exporter's name, such as `STATUS_CODE_ERROR`.
+- name: status_short_name
+  text: A `status.code` under its short name, such as `Error`.
+- name: status_integer
+  text: A `status.code` as its OTLP integer, `0` to `2`.
+- name: status_message
+  text: A non-empty `status.message`, beside an ok or an error code.
+- name: status_empty
+  text: An empty `status` object, decoded to unset.
+- name: status_null
+  text: A `null` `status`, decoded to unset.
+- name: status_absent
+  text: An object with no `status`, decoded to unset.
+- name: parent_span_id
+  text: A 16-hex `parent_span_id`.
+- name: parent_empty
+  text: A `parent_span_id` of `""`, the exporter's root span, decoded to no parent.
+- name: parent_null
+  text: A `null` `parent_span_id`, decoded to no parent.
+- name: parent_absent
+  text: An object with no `parent_span_id`, decoded to no parent.
+- name: attributes
+  text: An `attributes` object, decoded to the span's event attributes.
+- name: attribute_numeric
+  text: An integer, a float, and a bool attribute.
+- name: attribute_u64
+  text: An integer attribute above `i64::MAX`, decoded to a `U64`.
+- name: attribute_nested
+  text: An object or an array attribute, its nesting kept.
+- name: events
+  text: An `events` array of `{attributes, name, timestamp}` objects.
+- name: event_attributes
+  text: A span event's attributes, scalar, `u64`, object, and array among them.
+- name: links
+  text: A `links` array of `{attributes, trace_id, span_id, trace_state}` objects.
+- name: link_trace_state
+  text: A link's non-empty `trace_state`, and an empty one, decoded to none.
+- name: link_attributes
+  text: A link's attributes, scalar and object.
+- name: envelope
+  text: >-
+    All four carriers, `host`, `source`, `sourcetype`, and `index`, decoded to the resource's
+    `host.name`, `com.splunk.source`, `com.splunk.sourcetype`, and `com.splunk.index`.
+- name: envelope_absent
+  text: An object carrying no carrier, its resource only its `fields`.
+- name: fields_resource
+  text: >-
+    A `fields` object, decoded to the batch resource's attributes beside the carriers, where the
+    exporter writes a span's resource attributes.
+- name: fields_nested
+  text: An object inside `fields`, flattened to dotted resource keys.
+- name: fields_host_name
+  text: A `fields` `host.name` with no envelope `host`, kept as the resource's `host.name`.
+- name: carrier_collision
+  text: >-
+    A `fields` key spelled like a carrier the envelope also sets, which loses to the envelope,
+    counted `logit.input.spans.degraded{reason=carrier_collision}`.
+- name: time_ignored
+  text: An envelope `time` other than `start_time`, ignored, since `start_time` is the span's start.
+- name: end_before_start
+  text: An `end_time` before `start_time`, kept as written.

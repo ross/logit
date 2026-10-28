@@ -46,7 +46,7 @@
 //! and `_logit.metrics.interval` `interval_on_distribution` on a `samples`, `distribution`, or
 //! delta `exponential_histogram`, `interval_on_histogram` on a delta `histogram`, and `interval`
 //! on any other kind, at every sink, a `_logit.datadog.` carrier on a log, a Datadog
-//! event, or a service check `datadog_carrier_log`, `_logit.syslog.severity`
+//! event, a service check, or a span `datadog_carrier_log`, `_logit.syslog.severity`
 //! `severity_carrier_syslog`, any other `_logit.` key `foreign_carrier`, on a log an event
 //! attribute `syslog_out` writes as a header field by its key (`syslog.facility`, `syslog.tag`,
 //! `syslog.pid`, and `process.pid` `syslog_header`, `syslog.msgid` `syslog_msgid`, `syslog.sd`
@@ -3044,13 +3044,16 @@ fn field_rows_under(
         }
     }
     let own = format!("_logit.{protocol}.");
-    // A `_logit.datadog.*` carrier on a log, a Datadog event, or a service check: `datadog_out`'s
-    // routes for those skip one they have no field for without counting it, where its metrics
-    // routes count one.
+    // A `_logit.datadog.*` carrier on a log, a Datadog event, a service check, or a span:
+    // `datadog_out`'s routes for those skip one they have no field for without counting it, where
+    // its metrics routes count one.
     let json_route = rec.kind != "event"
         && matches!(
             datadog::Route::of(rec),
-            datadog::Route::Log | datadog::Route::Event | datadog::Route::Check
+            datadog::Route::Log
+                | datadog::Route::Event
+                | datadog::Route::Check
+                | datadog::Route::Span
         );
     let carrier = |key: &str, value: &Value| {
         if key == METRICS_CLOSED && value.as_str() == Some(CLOSED_TIMESTAMPED) {
@@ -4950,6 +4953,33 @@ mod tests {
         let rows = field_rows(&ins[0], "datadog");
         let (_, _, field) = rows.iter().find(|(_, f, _)| f.as_deref() == Some("no_host")).unwrap();
         assert_eq!(observe_field(field, &ins[0], &out[0], Spelling::Datadog), Class::Normalized);
+    }
+
+    /// A span's `_logit.datadog.*` carrier outside the chunk and span ones, on the event or the
+    /// resource, reaches the row of the routes `datadog_out` leaves one off uncounted, as a log's
+    /// does, and never `private_carrier`, whose metrics-route cell names a counter.
+    #[test]
+    fn a_spans_datadog_carrier_reaches_the_uncounted_route_row() {
+        let ins = recs(&[
+            r#"{{T},"span":{"name":"s","trace_id":"0a0b0c0d0e0f10110102030405060708","span_id":"1112131415161718","kind":"internal","status":"unset","start":"2027-01-15T08:00:00.000000000Z","end":"2027-01-15T08:00:00.000000000Z","duration_ns":0},"attributes":{"_logit.datadog.hostless":true,"_logit.datadog.chunk.priority":1},"resource":{"attributes":{"_logit.datadog.units":true}}}"#,
+        ]);
+        let features: Vec<(String, bool)> = field_rows(&ins[0], "datadog")
+            .into_iter()
+            .filter_map(|(_, feature, field)| match field {
+                Field::Attribute { key, resource } if key.starts_with("_logit.datadog.") => {
+                    Some((format!("{key}={}", feature.unwrap_or_default()), resource))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            features,
+            [
+                ("_logit.datadog.chunk.priority=datadog_carrier_span".to_string(), false),
+                ("_logit.datadog.hostless=datadog_carrier_log".to_string(), false),
+                ("_logit.datadog.units=datadog_carrier_log".to_string(), true),
+            ]
+        );
     }
 
     /// `datadog_trace_out` derives a span's `span.kind` and `_dd.p.tid` as `datadog_out` does, but

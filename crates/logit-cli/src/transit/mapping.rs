@@ -38,7 +38,7 @@
 //! like a resource attribute, so it's an `attributes` row rather than a kind of its own. A
 //! resource attribute under `_logit.` reaches `private_carrier`, `foreign_carrier`, or a flag row, as an event
 //! attribute does, not `resource_attribute`; a `_logit.datadog.*` carrier on a log, a Datadog event,
-//! or a service check reaches `datadog_carrier_log` in their place, at every sink.
+//! a service check, or a span reaches `datadog_carrier_log` in their place, at every sink.
 //! `record/non_finite` is a `sum` or `gauge` holding
 //! `NaN` or an infinity, a value some wires can't write. `record/superseded` is a metric record a
 //! later record of the same series (name, kind, and public attributes) follows in the same run,
@@ -102,8 +102,9 @@ use std::path::Path;
 /// it carries ignores a signal it has no wire for, uncounted, so `log/beside_metrics`,
 /// `span/beside_log`, and `span/beside_metrics` match at any sink. The next two are a sink
 /// finding: `otlp_out` writes a span or span event name that isn't a `Str` as `""`, uncounted.
-/// The third from last is a `_logit.datadog.*` carrier `datadog_out`'s log, event, and
-/// service-check routes have no field for, left off where its metrics routes count one. The last
+/// The third from last is a `_logit.datadog.*` carrier `datadog_out`'s log, event,
+/// service-check, and trace routes have no field for, left off where its metrics routes count
+/// one. The last
 /// two follow the first three's rule at `datadog_trace_out`, whose one signal is spans: a log or a
 /// gauge beside a span is ignored, uncounted.
 const UNCOUNTED_ALLOWED: [(&str, Option<&str>, Option<&str>); 8] = [

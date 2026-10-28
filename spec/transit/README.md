@@ -24,7 +24,9 @@ the span fields no capture has and for a v0.7 `TracerPayload`'s trace), `collect
 (`cases/otlp/`), logs (`cases/otlp-logs/`), and traces (`cases/otlp-traces/`), `graphite_in`,
 plaintext and pickle, `syslog_in`, RFC 3164 and RFC 5424 over UDP and as a TCP stream, and
 `splunk_hec_in`'s `/event` and `/raw` routes (`cases/splunk/`: the four recorded HEC clients'
-captures and hand-written bodies), with no metric cases. A
+captures and hand-written bodies, a span object it keeps as a log among them), with no metric
+cases, and its span objects (`cases/splunk-traces/`: the OpenTelemetry Collector exporter's
+capture and hand-written bodies). A
 source directory's name before its first `-` names its system, so
 `datadog-logs` cases decode through `datadog_in`. The sink columns are `statsd_out`,
 `prometheus_out` (exposition and remote-write), `influxdb_out`, `otlp_out`, `datadog_out`,
@@ -43,7 +45,7 @@ source meets which sink: `statsd-relay`, `statsd-logs-relay`, `influxdb-relay`, 
 `datadog-logs-relay`, `datadog-traces-relay`, `ddtrace-relay`, `ddtrace-relay-v07`,
 `otlp-relay`, `otlp-logs-relay`,
 `otlp-traces-relay`, `graphite-relay`, `syslog-relay`,
-`splunk-relay`, `prometheus-to-prometheus`, and `prometheus-to-prometheus-remote-write` are like
+`splunk-relay`, `splunk-traces-relay`, `prometheus-to-prometheus`, and `prometheus-to-prometheus-remote-write` are like
 pairs, and `influxdb-to-prometheus` a cross-protocol one.
 
 `datadog_out` makes two drops above its encoders that the driver leaves out: `stale` and
@@ -175,7 +177,7 @@ rate below 1 that rounds to weight 1), `span/not_datadog_origin` and
 `span/needs_agent_processing` (a span whose trace chunk `datadog_out`'s readiness gate holds
 back), `log/trace_beside_id_attribute` (a log's trace beside a `trace_id` or `span_id`
 attribute, which `datadog_out` and `splunk_hec_out` write in the trace's place), `attributes/datadog_carrier_log` (a `_logit.datadog.*` carrier on a log, a Datadog
-event, or a service check), `attributes/host_beside_host_name` (a `host` attribute beside a
+event, a service check, or a span), `attributes/host_beside_host_name` (a `host` attribute beside a
 non-empty string `host.name` or the hostless mark, which `statsd_out` leaves off) and
 `attributes/hostname` and `attributes/log_service` (a log's `hostname` attribute, or its
 `service` beside `service.name`, which `datadog_out` leaves off), `attributes/log_service_field`
@@ -207,8 +209,8 @@ a format the config selects": a sink ignores a signal it has no wire for, such a
 metrics, uncounted, at any sink, and `datadog_trace_out`, whose one signal is spans, ignores a
 log or a gauge beside a span. Two are a sink finding: `otlp_out` writes a span name or a span
 event name that isn't a `Str` as `""` (`span/name_structured`, `span/event_name_structured`).
-One is a `_logit.datadog.*` carrier `datadog_out`'s log, event, and service-check routes have no
-field for. Under that amendment too, `syslog_out`'s leave-off of every attribute
+One is a `_logit.datadog.*` carrier `datadog_out`'s log, event, service-check, and trace routes
+have no field for. Under that amendment too, `syslog_out`'s leave-off of every attribute
 outside its header fields, under RFC 3164 and under RFC 5424 with no `structured_data:`, is
 `structural`: the format the config selected has no slot for it.
 When a sink's behavior depends on its config, the sink's entry is a list: each cell but the last

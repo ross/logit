@@ -968,12 +968,12 @@ the operator-facing account of all of this.
   Cases come from `statsd_in`'s metrics and DogStatsD events, `influxdb_in`, `prometheus_in`'s
   scrape, `datadog_in`'s metrics, logs, and traces, `datadog_trace_in`'s tracer requests,
   `collectd_in`, `otlp_in`'s metrics, logs, and
-  traces, `graphite_in`, `syslog_in`, and `splunk_hec_in`; the columns are `statsd_out`,
+  traces, `graphite_in`, `syslog_in`, and `splunk_hec_in`'s logs and spans; the columns are `statsd_out`,
   `prometheus_out`, `influxdb_out`, `otlp_out`, `datadog_out`, `datadog_trace_out` (read back
   through `datadog_trace_in`'s decoding), `graphite_out`, `syslog_out`, `splunk_hec_out`, and
   `kafka_out` (`format: json` and `text`, read back by a driver convention, since there's no
-  `kafka_in`), through 27 like-pair flows (statsd, InfluxDB, Prometheus, Datadog, the Datadog tracer API,
-  OTLP, Graphite, syslog, and Splunk; 4 of them through an `aggregate`) and 96 cross-protocol
+  `kafka_in`), through 28 like-pair flows (statsd, InfluxDB, Prometheus, Datadog, the Datadog tracer API,
+  OTLP, Graphite, syslog, and Splunk; 4 of them through an `aggregate`) and 101 cross-protocol
   flows ([ADR `transit-spec`](docs/adr/transit-spec.md), [plan](docs/plans/transit-spec.md)).
 
 ### Not yet built

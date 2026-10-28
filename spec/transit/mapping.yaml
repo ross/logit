@@ -3115,7 +3115,9 @@ rows:
         - class: exact
           text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
   # graphite_in stamps no `_logit.graphite.` carrier, so no record reaches this row at
-  # graphite_out and it has no cell.
+  # graphite_out and it has no cell. Nor at datadog_trace_out, which receives spans alone: a span's
+  # `_logit.datadog.*` attribute reaches `datadog_carrier_span`, one of the resource's tracer or
+  # Agent rows, or `datadog_carrier_log`.
   - kind: attributes
     feature: private_carrier
     cells:
@@ -3152,12 +3154,6 @@ rows:
           Datadog names, is read and not written; datadog_in stamps it again on every series
           batch. The v2 series route writes `_logit.datadog.hostless` as a `host` resource with no
           name, which datadog_in reads into `_logit.datadog.resources`.
-      datadog_trace_out:
-        class: lost
-        reason: structural
-        text: >-
-          A `_logit.datadog.*` carrier rides in its own wire field; one the trace API has no field
-          for is left off.
       syslog_out:
         class: lost
         reason: structural
@@ -3880,10 +3876,16 @@ rows:
         class: lost
         reason: uncounted
         text: >-
-          A `_logit.datadog.*` carrier on a log, a Datadog event, or a service check that the
-          route has no field for is left off, uncounted, where the metrics routes count one as
+          A `_logit.datadog.*` carrier on a log, a Datadog event, a service check, or a span that
+          the route has no field for is left off, uncounted, where the metrics routes count one as
           `no_wire_form`; the events route's public form has no field for the Agent envelope's
           `_logit.datadog.agent.hostname`.
+      datadog_trace_out:
+        class: lost
+        reason: structural
+        text: >-
+          A `_logit.datadog.*` carrier rides in its own wire field; one the trace API has no field
+          for, outside the chunk, span, tracer, and Agent carriers, is left off.
       graphite_out:
         class: lost
         reason: structural
@@ -4433,7 +4435,15 @@ rows:
       datadog_out:
         class: normalized
         reason: resource_as_tag
-        text: Merged into the log's attributes, so it reads back as an event attribute.
+        text: >-
+          Merged into the log's attributes or the span's `meta`, so it reads back as an event
+          attribute.
+      datadog_trace_out:
+        class: normalized
+        reason: resource_as_tag
+        text: >-
+          Merged into every span's `meta` under either version, since neither a v0.4 span nor a
+          v0.7 `TracerPayload` has a field for it, so it reads back as an event attribute.
       syslog_out:
         class: lost
         reason: structural

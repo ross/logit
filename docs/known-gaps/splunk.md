@@ -142,6 +142,17 @@ Entry format and the other areas: [the known-gaps index](README.md).
   - **Workaround:** rename the attribute with a `lua` stage before `splunk_hec_out`, or drop it
     with `remove`.
   - **Revisit trigger:** a producer whose `trace_id` field isn't the log's trace.
+- **`splunk_hec_in` reads a span object it can't take whole as a log.** A span is detected by
+  shape: its four required members, and no member the exporter's span object doesn't have. Any
+  other member, such as a `trace_state` or `flags` a future exporter adds, or a present, all-zero
+  `parent_span_id` or link id, turns the object into a log with a `Map` body, counted
+  `logit.input.spans.degraded{reason="malformed_span"}`. `splunk_hec_out` writes a zero parent or
+  link id as zero hex, so a span carrying one doesn't survive a `splunk_hec_out` to
+  `splunk_hec_in` hop as a span; an absent parent leaves as `""` and round-trips. The transit
+  spec's `cases/splunk/span-malformed` case holds each form.
+  - **Consequence:** a span comes out of the hop as a log, so a span sink downstream skips it.
+  - **Revisit trigger:** an exporter release that adds a member to its span object, or a producer
+    that sends a zero parent id.
 - **`splunk_hec_out` has no `auto_extract_timestamp` option.** Probes against Splunk Enterprise
   10.4.3 showed `/event` runs a sourcetype's `TRANSFORMS-*` (index routing, sourcetype renaming)
   and skips only timestamp extraction, which `/event?auto_extract_timestamp=true` restores
@@ -153,8 +164,9 @@ Entry format and the other areas: [the known-gaps index](README.md).
   - **Revisit trigger:** a user whose sourcetype's extracted time should win over the event's.
 - **What neither the recorded corpus nor the Splunk runs exercised.** Each is implemented from the
   exporter's source or Splunk's docs and covered by the codec's own tests:
-  - the exporter's `Summary` shape and a span link's `trace_state` member (telemetrygen writes
-    neither), and `otel.log.name`;
+  - the exporter's `Summary` shape and a span's events and links, a link's `trace_state` member
+    among them (telemetrygen writes none of them; the transit spec's hand-written
+    `cases/splunk-traces/` bodies do), and `otel.log.name`;
   - Vector's `splunk_hec_logs` and `splunk_hec_metrics` sinks as clients of `splunk_hec_in`;
   - a third-party HEC client using `useACK` against `splunk_hec_in`, whose per-channel ids and
     polls the round-trip tests drive only with `splunk_hec_out` and hand-written requests;

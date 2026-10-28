@@ -1745,3 +1745,40 @@ Recorded per workstream as each lands.
     `datadog_out`, where the counter is `logit.output.records.dropped`; and its entry on numeric
     span attributes ascribes writing them to `metrics` to `datadog_trace_out` alone, where
     `datadog_out` does it too.
+- **Spans, from the cases** (`tspan/w1` to `tspan/w4`): each is recorded as the code behaves, with
+  a cell, and an uncounted one with a narrow `UNCOUNTED_ALLOWED` entry, for `tspan-sink` to fix
+  (§11, decision 11).
+  - `otlp_out` writes a span name or a span event name that isn't a `Str` as `""`, uncounted
+    (`span/name_structured`, `span/event_name_structured`, the two finding entries).
+  - `otlp_out`'s `u64_as_double` count covers resource, scope, and event attributes and skips a
+    span event's and a link's, so a `U64` above `i64::MAX` there leaves as a double, uncounted
+    (`span/nested_u64_attribute`).
+  - Datadog writes a link attribute as text: an `I64` 42 as `"42"`, a `U64` as its decimal text,
+    and counts only a structured value, as `json_text`. `DatadogTraceEncoder::text`'s doc says a
+    `Bytes` leaves as base64; the code writes it as lossy UTF-8.
+  - `datadog_out` writes a `Null` span or span event attribute as the string `"null"` in `meta`,
+    counted `json_text`; the `null_value` cell's text, which named only a log's JSON null, now
+    says so.
+  - `collectd_out` skips a span, or a log with no `_logit.collectd.severity`, with no telemetry:
+    its encoder tallies `EncodeStats::skipped_no_metrics`, which the sink discards. collectd has no
+    span column, so no cell states it; `docs/known-gaps/mappings.md`'s collectd notification row
+    now does.
+  - `datadog_out`'s trace route leaves a span's `_logit.datadog.*` carrier outside the chunk and
+    span ones off uncounted, as its log, event, and service-check routes do, where its metrics
+    routes count one as `no_wire_form`. The class check sends such a span carrier to
+    `attributes/datadog_carrier_log` with the others, so the existing entry covers it, and
+    `attributes/private_carrier` has no `datadog_trace_out` cell, since no span reaches it there
+    (`cases/datadog-traces/carrier`).
+  - `otlp_out` writes a Datadog-origin link's flags unmasked, so bit 31, which dd-trace sets on
+    every link and OTLP reserves in `SpanLink.flags`, goes out on the wire. `otlp_in` reads it back
+    unchanged, so the cell reads `exact`; `tspan-sink` decides whether to mask to OTLP's defined
+    bits.
+  - `splunk_hec_out` writes a present, all-zero parent or link id as zero hex, and
+    `splunk_hec_in` reads a span object with one, or with any member the exporter's span object
+    doesn't have, as a log counted `malformed_span`. That's a decode-side outcome, so it has no
+    sink cell: `cases/splunk/span-malformed` holds the three forms as the logs they decode to, and
+    `docs/known-gaps/splunk.md` has the entry.
+  - Coverage: the `splunk-traces` source and three sweep cases (`cases/statsd/span-unmarked` and
+    `cases/statsd-logs/span-unmarked` for `span/needs_agent_processing` at the metric sinks and
+    `syslog_out`, and `cases/statsd/span-beside-log` for `span/beside_log` at the metric sinks)
+    leave no span cell unreached.
