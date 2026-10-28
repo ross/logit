@@ -770,7 +770,7 @@ fn resolve_app_name<'a>(
     resource: &'a AttrMap,
     default: Option<&'a str>,
 ) -> Option<AppName<'a>> {
-    let app_name = resolve_str(attrs, "syslog.tag").or(default);
+    let app_name = resolve_str(attrs, "syslog.tag").or(default.filter(|s| !s.is_empty()));
     if let Some(text) = app_name {
         return Some(AppName { text, fallback: false });
     }
@@ -2060,6 +2060,10 @@ mod tests {
         let (msgs, _) =
             encode_with(&mut SyslogEncoder::new(Format::Rfc3164, 16), vec![service(&[])]);
         assert_eq!(msgs[0], "<134>Jan  1 00:00:00 myhost check_out[7]: hi");
+
+        let mut empty = SyslogEncoder::new(Format::Rfc3164, 16).with_app_name("");
+        let (msgs, _) = encode_with(&mut empty, vec![service(&[])]);
+        assert_eq!(msgs[0], "<134>Jan  1 00:00:00 myhost check_out[7]: hi", "an empty app_name:");
 
         let mut configured = SyslogEncoder::new(Format::Rfc3164, 16).with_app_name("cfg");
         let (msgs, _) = encode_with(&mut configured, vec![service(&[])]);
