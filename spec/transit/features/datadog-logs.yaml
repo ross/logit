@@ -57,7 +57,7 @@
 - name: fractional_timestamp
   text: >-
     A `timestamp` in fractional milliseconds, read from the number's own text, so every digit of
-    the fraction down to the nanosecond comes back.
+    the fraction down to the nanosecond comes back and any finer digit is dropped.
 - name: rfc3339_timestamp
   text: A `timestamp` as an RFC 3339 string, in UTC or with an offset.
 - name: no_timestamp
