@@ -343,7 +343,7 @@
 //! | `span/nested_u64_attribute` | normalized | `u64_as_int`; `logit.output.spans.degraded{reason=int_as_f64}` | A `u64` attribute of a span event reads back as an `i64`, or, above `i64::MAX`, as a double, counted; on a link it leaves as its decimal text, read back as a string. |
 //! | `span/nested_timestamp_attribute` | normalized | `stringified` | A timestamp attribute of a span event or link leaves as RFC 3339 text, read back as a string. |
 //! | `span/event_dropped_count` | lost | `logit.output.spans.degraded{reason=no_wire_form}` | Datadog has no field for a span event's dropped-attribute count, so it's left off, counted once per field. |
-//! | `span/links` | normalized | `stringified`; `logit.output.spans.degraded{reason=json_text}` | Each link's ids, and its attributes as strings, as the span's `span_links`, read back as string attributes; a map or array attribute is JSON text, counted. |
+//! | `span/links` | normalized | `stringified`; `logit.output.spans.degraded{reason=json_text}` | Each link's ids, and its attributes as strings, as the span's `span_links`, read back as string attributes; a map, array, or null attribute is JSON text (`null` for a null), counted. |
 //! | `span/link_flags` | exact | -- | A span link's `flags`. |
 //! | `span/link_trace_state` | exact | -- | A span link's `tracestate`. |
 //! | `span/link_dropped_count` | lost | `logit.output.spans.degraded{reason=no_wire_form}` | Datadog has no field for a link's dropped-attribute count, so it's left off, counted once per field. |

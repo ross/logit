@@ -4280,24 +4280,27 @@ mod tests {
         }
     }
 
-    /// A span event's `Bytes` attribute and structured name each land on their own row, so
-    /// `span/events` reads `exact` when only they changed, and a name read back `""` is `lost`.
+    /// A span event's `Bytes` and `Null` attributes and structured name each land on their own
+    /// row, so `span/events` reads `exact` when only they changed (a null written as the string
+    /// `"null"`, as `datadog_out` writes it), and a name read back `""` is `lost`.
     #[test]
     fn a_span_events_typed_attribute_and_structured_name_land_on_their_rows() {
-        let event = |name: &str, payload: &str, tag: &str| {
+        let event = |name: &str, payload: &str, none: &str, tag: &str| {
             span_line(
                 5,
                 &format!(
-                    r#""name":"a","status":"unset","events":[{{"name":{name},"timestamp":"2027-01-15T08:00:00.001000000Z","attributes":{{"k":"v","payload":{payload}}}}}]"#
+                    r#""name":"a","status":"unset","events":[{{"name":{name},"timestamp":"2027-01-15T08:00:00.001000000Z","attributes":{{"k":"v","none":{none},"payload":{payload}}}}}]"#
                 ),
                 tag,
             )
         };
         let bytes = r#","types":{"/span/events/0/attributes/payload":"bytes"}"#;
-        let ins = recs(&[&event(r#"{"op":"retry"}"#, r#""b\"ok\"""#, bytes)]);
-        let outs = recs(&[&event(r#""""#, r#""b2s=""#, "")]);
+        let ins = recs(&[&event(r#"{"op":"retry"}"#, r#""b\"ok\"""#, "null", bytes)]);
+        let outs = recs(&[&event(r#""""#, r#""b2s=""#, r#""null""#, "")]);
         let rows = row_names(&ins[0]);
-        for row in ["events", "event_name_structured", "nested_bytes_attribute"] {
+        for row in
+            ["events", "event_name_structured", "event_nested_attribute", "nested_bytes_attribute"]
+        {
             assert!(rows.contains(&row), "{row} missing from {rows:?}");
         }
         let class = |row: &str| {
@@ -4305,6 +4308,7 @@ mod tests {
         };
         assert_eq!(class("events"), Class::Exact);
         assert_eq!(class("event_name_structured"), Class::Lost);
+        assert_eq!(class("event_nested_attribute"), Class::Normalized);
         assert_eq!(class("nested_bytes_attribute"), Class::Normalized);
     }
 
