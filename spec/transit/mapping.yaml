@@ -2570,7 +2570,7 @@ rows:
           text: >-
             Under `structured_data:`, a PARAM of the opt-in SD-ELEMENT, which syslog_in reads back
             as a string inside `syslog.sd`, under the SD-ID and the attribute's key. The PARAM-VALUE
-            is its decimal text, an `f64` in Rust's shortest form.
+            is an integer's decimal text, or a float as an `f64` in Rust's shortest form.
         - class: lost
           reason: uncounted
           text: >-
