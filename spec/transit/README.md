@@ -114,8 +114,7 @@ is one nothing checks: add a case or a flow that reaches it.
   `same_millisecond`, `same_millisecond_equal`), and the `log` rows for a message a log's
   record reaches beside its kind's row (`message_unsafe`, a message the sink rewrites, such as
   `datadog_out`'s JSON text of a structured one; `structured_message`; `bytes_message`;
-  `blank_message`; `header_in_message`, a log RFC 3164's header rule reads back with a header
-  token in its message): `exact`, `normalized`, `degraded`, `skipped`, or `dropped`, best to
+  `blank_message`): `exact`, `normalized`, `degraded`, `skipped`, or `dropped`, best to
   worst.
 - **Field level**, for the `record` rows `unit`, `description`, `start_timestamp`, `exemplars`,
   `exemplars_on_summary`, `unit_on_distribution`, `min_max`, and `sample_rate_unweighted`, every `attributes` row (`rate`,
@@ -178,10 +177,9 @@ rewritten name, is counted. The table's schema accepts `reason: uncounted`, the 
 as it stands, only on the cells `crates/logit-cli/src/transit/mapping.rs`'s `UNCOUNTED_ALLOWED`
 names: a span at any sink, until spans have sources of their own; a log beside metrics at a sink
 that writes the metrics; the trace `datadog_out` and `splunk_hec_out` leave off a log for a
-`trace_id` or `span_id` attribute; `datadog_out`'s carrier on a log; and `syslog_out`'s attribute
-rows, since it leaves every attribute outside its header fields
-off a log by one mechanism, and under `structured_data:` writes a `Bytes` one as its length (on
-the `bytes_value` entry) and an empty array as no PARAM (on `sd_empty_array`).
+`trace_id` or `span_id` attribute; and `datadog_out`'s carrier on a log. `syslog_out`'s leave-off
+of every attribute outside its header fields, under RFC 3164 and under RFC 5424 with no
+`structured_data:`, is `structural`: the format the config selected has no slot for it.
 When a sink's behavior depends on its config, the sink's entry is a list: each cell but the last
 has a `when:` map of config fields, the first that matches the flow's sink config applies, and
 the last applies otherwise:

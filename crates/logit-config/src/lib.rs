@@ -4188,8 +4188,10 @@ pub enum ComponentKind {
         /// hostname.
         #[serde(default)]
         hostname: Option<String>,
-        /// APP-NAME fallback, used only when the event carries no `syslog.tag` attribute. No
-        /// default.
+        /// APP-NAME (RFC 3164's TAG) fallback, used only when the event carries no `syslog.tag`
+        /// attribute. Under `format: rfc5424` there's no default, and APP-NAME is `-`. Under
+        /// `format: rfc3164` every message has a TAG: the event's `service.name` attribute, else
+        /// its batch resource's, else `logit`, since a receiver reads HOSTNAME only before a TAG.
         #[serde(default)]
         app_name: Option<String>,
         /// Bounds one encoded message (PRI + header + MSG). A byte-count string. Defaults to
