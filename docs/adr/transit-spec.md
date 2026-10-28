@@ -374,25 +374,35 @@ that in, and settles these:
 6. **Attribute rows keyed by name** where the span sinks treat keys differently:
    `span_numeric`, `datadog_span_identity`, `datadog_span_marks`, `datadog_carrier_span`, and
    `datadog_tracer_resource`. Other span attributes reach the value-type rows.
-7. **`Spelling::derived` grows a `datadog_trace_out` entry**, what `datadog_out` derives plus,
-   under `version: v0.4`, the resource fields it writes into every span's `meta`.
+   `datadog_tracer_resource`'s cells split by key group, since `datadog_trace_out` writes the
+   tracer API's forms only: its Agent carriers are `lost`, counted, under both versions.
+7. **`Spelling::derived` grows a `datadog_trace_out` entry**: `span_kind` and `trace_id_high`,
+   as `datadog_out` derives them, and, under `version: v0.4`, the resource fields it writes into
+   every span's `meta`. It derives no `no_host`, since it leaves `hostname` empty for the Agent
+   to fill.
 8. **The driver applies `datadog_out`'s trace readiness gate**, through
    `logit_proto::datadog::trace_readiness`, the verdict the sink reads, and counts its drops as
    the sink does, so `span/not_datadog_origin` and `span/needs_agent_processing` read `dropped`
-   there, counted `logit.output.records.dropped{route=traces}`. The stale filter, tag limit, and
-   size cuts stay bypassed.
+   there, counted `logit.output.records.dropped{route=traces}`. A span reaches `alone` and a
+   readiness row together, and the readiness rows read `exact`, nothing beyond `alone`, at every
+   other span sink. Under the gate no OTLP- or Splunk-origin span reaches `datadog_out`'s `lost`
+   cells, so a hand-written `_top_level`-marked Datadog case carries those fields. The stale
+   filter, tag limit, and size cuts stay bypassed.
 9. **Four span sources and one new column.** The sources are `otlp-traces`, `datadog-traces`,
    `ddtrace`, and `splunk-traces`, each in its own span-only case directory. `datadog_trace_out`
    joins `otlp_out`, `datadog_out`, `splunk_hec_out`, and `kafka_out` under `format: json` and
-   `text` as a span column, with `when: {version: v0.4}` and `{version: v0.7}` cells.
+   `text` as a span column, with `when: {version: v0.4}` and `{version: v0.7}` cells. It ignores
+   a log or metrics beside a span it writes, uncounted, under the ignored-signal rule, so its log
+   and metric record-level cells read `skipped`, uncounted, where a span case carries one.
 10. **Sink defects are recorded as the code behaves** and fixed in a later stream, `tspan-sink`,
     as `tsink` followed `tlog`. An uncounted one gets a narrow `UNCOUNTED_ALLOWED` entry the fix
     removes.
 11. **`UNCOUNTED_ALLOWED` narrows** from `("span", None, None)` to the ignored-signal entries
-    `("span", Some("beside_log"), None)` and `("span", Some("beside_metrics"), None)`, plus the
-    entries of decision 10's findings: `otlp_out`'s empty name for a structured one, and
-    `datadog_trace_out`'s uncounted leave-off of a log or metrics. Every other uncounted span
-    loss is a format with no slot and reads `lost, structural`.
+    `("span", Some("beside_log"), None)`, `("span", Some("beside_metrics"), None)`, and
+    `datadog_trace_out`'s log and metric record-row entries, which stay as the rule's, plus one
+    finding entry under decision 10, `otlp_out`'s empty name for a structured one, which
+    `tspan-sink` removes. Every other uncounted span loss is a format with no slot and reads
+    `lost, structural`.
 12. **The sort key doesn't change.** Events already order by timestamp, then span name.
 
 Consequences: `KINDS`' `span` entry and the class check grow a span path, with id pairing and
