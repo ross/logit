@@ -1129,3 +1129,52 @@ Recorded per workstream as each lands.
     window can't reach the stale filter, which the driver doesn't run (`transit/wire.rs`'s module
     doc). And no `datadog-logs` case can put a `trace_id` attribute beside a log's `trace`,
     since `datadog_in` sets no `trace`: that pair is an `otlp-logs` case's to reach.
+- **The splunk source and `splunk_hec_out`** (`tlog/w4`): the `splunk` cases (the four recorded
+  HEC clients' log captures and hand-written bodies), and the `otlp-logs`, `syslog`, and
+  `datadog-logs` cases, put every log field, the envelope, and `fields`' value types in front of
+  `splunk_hec_out`, and the `splunk` cases in front of `otlp_out`, `datadog_out`, and
+  `syslog_out`. Each behavior below is a cell in `mapping.yaml`, observed at its class; none is
+  fixed, and `docs/known-gaps/splunk.md` has the one an operator wouldn't find in the codec's
+  tables.
+  - `splunk-relay` reads `exact` on every row but three, each a permitted normalization of
+    `crates/logit-proto/src/splunk/mod.rs`'s list: an object with no `host` leaves with the
+    process hostname (`attributes/no_host`, item 10), and a `fields` `host.name` becomes the
+    object's `host`, replacing the envelope's, so it reads back on the resource
+    (`attributes/host_name`, and the replaced resource `host.name` on
+    `attributes/resource_attribute`, item 11). Elsewhere a log's non-carrier resource attributes
+    read back as event attributes (`attributes/resource_attribute`, `normalized`).
+  - A log with a severity and neither `otel.log.severity.*` attribute leaves with both, which
+    `splunk_hec_in` keeps as attributes beside the severity: a row of its own,
+    `attributes/log_severity_fields` (`normalized`), derived as `log_status` is at `datadog_out`.
+  - An event's `host.name` leaves as the object's `host` and reads back on the resource
+    (`attributes/host_name`, `normalized`); `com.splunk.source`, `.sourcetype`, and `.index` read
+    back where they were (`attributes/splunk_envelope`, a row of its own, `exact`).
+  - `fields` is flat: a map attribute reads back as dotted keys, an empty one not at all
+    (`attributes/map_value`, `normalized`), `syslog.sd` as one key per PARAM
+    (`attributes/syslog_sd`, `normalized`), and an array holding a container as its JSON text
+    (`attributes/array_value`, `normalized`). A `Bytes` or timestamp attribute reads back as its
+    base64 or RFC 3339 text (`stringified`).
+  - HEC has no body format: a `structured` message reads back as `json` and a string with a
+    `json` format as `raw` (`log/body_format`, `lost`). A `Bytes` message reads back as lossy
+    text (`log/message_unsafe`, `log/bytes_message`, `normalized`). A log's trace reads back
+    with flags `0` (`log/trace_flags`, `normalized`); its observed time and dropped count have no
+    field (`lost`, `structural`).
+  - A log whose message is empty or null is dropped, counted `blank_event`
+    (`log/blank_message`, `dropped`); beside metrics, its event's metric objects still leave, so
+    `log/beside_metrics` is `lost` with that counter. No `splunk` case holds a blank `event`,
+    since `splunk_hec_in` drops one and a case is what the listener produces: the `otlp-logs` and
+    `datadog-logs` cases reach the row.
+  - `splunk_hec_in` reads a log attribute named `otel.log.name`, or `trace_id` and `span_id`
+    that parse as ids, into the log's own fields, so a `datadog-logs` case's `trace_id`
+    attribute comes back as a trace (`attributes/string_value` and `log/trace_unset`,
+    `normalized`, `log_fields`).
+  - `syslog_out` skips a span-only event, counted `events.skipped`, and leaves a span beside a
+    log off, uncounted. `span/alone`'s cell now names the counter beside `reason: uncounted`,
+    which the class check reads as covering both paths.
+  - `otlp_out` writes a log stamped at the Unix epoch, which `splunk_hec_in` reads from
+    `time: 0`, as `time_unix_nano` 0, which `logs.proto` defines as unknown, so `otlp_in` reads
+    it back at the encode time `otlp_out` stamps as its observed time
+    (`crates/logit-proto/src/otlp/logs.rs`'s module doc). `log/timestamp` at `otlp_out` holds
+    one class, so the `times` case has no `time: 0` object.
+  - The `otlp-logs` `beside-metrics` case's gauge reaches `gauge/i64` unspecified at
+    `splunk_hec_out`, which has no metric-kind cells.

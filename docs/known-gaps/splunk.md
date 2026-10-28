@@ -124,6 +124,20 @@ Entry format and the other areas: [the known-gaps index](README.md).
     that needn't be indexed before the sink.
   - **Revisit trigger:** a deployment where one of these consequences shows: acknowledgment
     timeouts under load, a Splunk index size complaint, or a throughput shortfall to Cloud.
+- **A log attribute named `trace_id`, `span_id`, or `otel.log.name` changes meaning through a
+  Splunk hop.** `splunk_hec_out` writes every attribute into `fields`, and `splunk_hec_in` reads
+  those three keys as the OpenTelemetry exporter's log fields: a non-empty `otel.log.name` becomes
+  the log's event name, and a `trace_id` that parses as a trace id, with a `span_id` that parses
+  or none, becomes its trace with flags `0`, each consumed. A log from another protocol carrying
+  one of those keys as an ordinary attribute, a JSON log's own `trace_id` field or a Datadog
+  log's, comes back without it. The transit spec reads it on `attributes/string_value` and
+  `log/trace_unset` (`normalized`, `log_fields`).
+  - **Consequence:** downstream of a `splunk_hec_out` to `splunk_hec_in` hop, such a log
+    carries a trace or an event name and not the attribute: `otlp_out` writes it as the
+    `LogRecord`'s `trace_id`, `span_id`, or `event_name`, and `syslog_out` leaves it off.
+  - **Workaround:** rename the attribute with a `lua` stage before `splunk_hec_out`, or drop it
+    with `remove`.
+  - **Revisit trigger:** a producer whose `trace_id` field isn't the log's trace.
 - **`splunk_hec_out` has no `auto_extract_timestamp` option.** Probes against Splunk Enterprise
   10.4.3 showed `/event` runs a sourcetype's `TRANSFORMS-*` (index routing, sourcetype renaming)
   and skips only timestamp extraction, which `/event?auto_extract_timestamp=true` restores
