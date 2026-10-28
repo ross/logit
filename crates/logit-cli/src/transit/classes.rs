@@ -4985,6 +4985,23 @@ mod tests {
         assert!(pair(&ins, &hosted, Spelling::Datadog).seen[0].is_some());
     }
 
+    /// A valued `env` beside `deployment.environment.name` is no tag at `datadog_out`, even as an
+    /// integral-looking `F64`, so a read-back with no `env` tag pairs.
+    #[test]
+    fn datadog_omits_an_f64_env_beside_its_standard_key() {
+        let gauge = |attributes: &str| {
+            format!(
+                r#"{{{{T}},"metrics":[{{"name":"g","kind":"gauge","value":1.0}}],"attributes":{attributes}}}"#
+            )
+        };
+        let ins = recs(&[&gauge(r#"{"deployment.environment.name":"prod","env":1.5}"#)]);
+        let env = ins[0].attributes.get("env").expect("env");
+        assert_eq!(Spelling::Datadog.value_for("env", env, "", &ins[0]), None);
+        let out =
+            recs(&[&gauge(r#"{"deployment.environment.name":"prod","host.name":"transit"}"#)]);
+        assert!(pair(&ins, &out, Spelling::Datadog).seen[0].is_some());
+    }
+
     /// A `_dd.p.tid` other than the trace id's high 64 bits doesn't pair.
     #[test]
     fn datadog_never_pairs_a_trace_id_high_half_it_didnt_derive() {

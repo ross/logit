@@ -798,9 +798,8 @@ shows:
      `logit.output.spans.degraded{reason=no_wire_form}`, under `version: v0.4`; `lost`,
      `structural`, at the OTel sinks and `kafka_out`'s `format: text`. It mirrors
      `attributes/datadog_carrier_log`.
-   - `attributes/datadog_tracer_resource`: the resource's `_logit.datadog.tracer.*` and
-     `_logit.datadog.agent.*` carriers a `TracerPayload` or `AgentPayload` field carries. The
-     cells split by key group:
+   - `attributes/datadog_tracer_resource`: the resource's `_logit.datadog.tracer.*` carriers a
+     `TracerPayload` field carries. With the two rows below, the cells split by key group:
      - The tracer carriers are `exact` at `datadog_out` and at `datadog_trace_out` under
        `version: v0.7`. Under `version: v0.4`, every tracer carrier a request header doesn't
        restore is `lost`, counted `logit.output.spans.degraded{reason=no_wire_form}`
@@ -809,7 +808,8 @@ shows:
        `attributes/datadog_agent_resource`: `exact` only at `datadog_out`, and `lost`, counted the
        same way, under both `datadog_trace_out` versions, since that sink encodes the tracer API's
        forms only.
-     - Both groups are `lost`, `structural`, at the OTel sinks.
+     - `datadog_tracer_resource`, `datadog_agent_resource`, and `datadog_tracer_headers` are
+       `lost`, `structural`, at the OTel sinks.
      - The tracer carriers only a request header carries (`resource_carriers_lost`'s
        `header_only`) have their own row, `attributes/datadog_tracer_headers`, `lost`, counted
        `no_wire_form`, at `datadog_out`, since an `AgentPayload` has no field for them. Its
