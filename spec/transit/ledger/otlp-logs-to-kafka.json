@@ -34,6 +34,7 @@
     {"sink":"kafka_out","row":"log/structured_message","cell":1,"observed":["exact"]},
     {"sink":"kafka_out","row":"log/timestamp","cell":1,"observed":["exact"]},
     {"sink":"kafka_out","row":"log/trace","cell":1,"observed":["exact"]},
+    {"sink":"kafka_out","row":"log/trace_beside_id_attribute","cell":1,"observed":["exact"]},
     {"sink":"kafka_out","row":"log/trace_flags","cell":1,"observed":["exact"]},
     {"sink":"kafka_out","row":"log/trace_unset","cell":1,"observed":["exact"]},
     {"sink":"kafka_out","row":"span/beside_log","cell":1,"observed":["exact"]}

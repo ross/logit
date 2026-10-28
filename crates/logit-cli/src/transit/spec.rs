@@ -1263,6 +1263,7 @@ flow_tests! {
     statsd_to_prometheus => "statsd-to-prometheus",
     statsd_to_graphite => "statsd-to-graphite",
     statsd_to_graphite_expand => "statsd-to-graphite-expand",
+    statsd_logs_relay => "statsd-logs-relay",
     statsd_logs_to_kafka => "statsd-logs-to-kafka",
     statsd_logs_to_kafka_text => "statsd-logs-to-kafka-text",
     statsd_logs_to_splunk => "statsd-logs-to-splunk",

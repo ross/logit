@@ -306,6 +306,7 @@
 //! | `log/trace` | normalized | `trace_as_attributes` | The ids leave as hex `trace_id` and `span_id` keys, which Datadog's log intake reads for trace correlation and datadog_in reads back as attributes, not as the log's trace. |
 //! | `log/trace_unset` | exact | -- | No trace ids are written, and none read back. |
 //! | `log/trace_flags` | lost | structural | A Datadog log has no trace flags, so none are written. |
+//! | `log/trace_beside_id_attribute` | lost | uncounted | A `trace_id` or `span_id` attribute is written under its own name and the log's own ids are left off, uncounted, so a relayed Datadog log leaves as it arrived. |
 //! | `log/dropped_attributes_count` | lost | structural | A Datadog log has no dropped-attribute count, so none is written. |
 //! | `log/timestamp` | normalized | `milliseconds` | The `timestamp` field, in Unix milliseconds, so a finer timestamp is truncated. |
 //! | `log/receipt_timestamp` | normalized | `milliseconds` | The `timestamp` field, in Unix milliseconds, the time the log was received. |

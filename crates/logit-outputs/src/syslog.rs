@@ -273,6 +273,7 @@
 //! | `log/trace` | lost | structural | Syslog has no trace context, so the trace and span ids are left off. |
 //! | `log/trace_unset` | exact | -- | A log with no trace context leaves with none. |
 //! | `log/trace_flags` | lost | structural | Syslog has no trace flags, so they're left off. |
+//! | `log/trace_beside_id_attribute` | lost | structural | Syslog has no trace or span ids, so they're left off, as `log/trace` has. |
 //! | `log/dropped_attributes_count` | lost | structural | Syslog has no dropped-attributes count, so it's left off. |
 //! | `log/timestamp`, under `format: rfc3164` | normalized | `timestamp_precision` | Under RFC 3164, a log with no `syslog.timestamp` leaves with its timestamp as TIMESTAMP in whole seconds with no year or zone, which syslog_in reads back as `syslog.timestamp`, with `event.timestamp` as the receipt time. |
 //! | `log/timestamp`, otherwise | normalized | `timestamp_precision` | A log with no `syslog.timestamp` leaves with its timestamp as TIMESTAMP in microseconds, which syslog_in reads back as `syslog.timestamp`, with `event.timestamp` as the receipt time. |

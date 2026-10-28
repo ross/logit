@@ -42,7 +42,8 @@
   "trace": {"events": [
     {"timestamp":"2027-01-15T08:00:02.000000000Z","log":{"format":"raw","message":"checkout completed"}},
     {"timestamp":"2027-01-15T08:00:02.001000000Z","log":{"format":"raw","message":"no span id"}},
-    {"timestamp":"2027-01-15T08:00:02.002000000Z","log":{"format":"raw","message":"beside its span"}}
+    {"timestamp":"2027-01-15T08:00:02.002000000Z","log":{"format":"raw","message":"beside its span"}},
+    {"timestamp":"2027-01-15T08:00:02.003000000Z","log":{"format":"raw","message":"an id attribute beside the trace"}}
   ], "counters": {
     "logit.output.spans.omitted{component=out,kind=kafka_out,reason=format,role=sink}": 1
   }}

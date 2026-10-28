@@ -158,6 +158,7 @@
 //! | `log/trace` | exact | -- | The `LogRecord`'s `trace_id` and `span_id`. |
 //! | `log/trace_unset` | normalized | `trace_from_span` | A log with no trace on an event that carries a span leaves with the span's ids and flags `0`; without a span, the log leaves with no trace. |
 //! | `log/trace_flags` | exact | -- | The low 8 bits of the `LogRecord`'s `flags`. |
+//! | `log/trace_beside_id_attribute` | exact | -- | The `LogRecord`'s trace, span ids, and flags, beside the attributes, as `log/trace` has. |
 //! | `log/dropped_attributes_count` | exact | -- | The `LogRecord`'s `dropped_attributes_count`. |
 //! | `log/timestamp` | exact | -- | The `LogRecord`'s `time_unix_nano`. |
 //! | `log/receipt_timestamp` | exact | -- | The `LogRecord`'s `time_unix_nano`, the time the log was received. |

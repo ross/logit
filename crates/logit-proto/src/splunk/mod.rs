@@ -173,6 +173,7 @@
 //! | `log/trace` | exact | -- | The `trace_id` and `span_id` fields, lowercase hex, read back into the trace, unless the log carries either as an attribute. |
 //! | `log/trace_unset` | normalized | `log_fields` | No trace fields are written, and splunk_hec_in reads back no trace, unless the log carries a `trace_id` attribute that parses as a trace id, with a `span_id` that parses or none, which it reads into the trace. |
 //! | `log/trace_flags` | normalized | `flags_zero` | HEC has no trace flags, so a log's trace reads back with flags `0`. |
+//! | `log/trace_beside_id_attribute` | lost | uncounted | A `trace_id` or `span_id` attribute is written as that field and the log's own ids are left off, uncounted; an attribute that isn't a hex id reads back as an attribute, with no trace. |
 //! | `log/dropped_attributes_count` | lost | structural | HEC has no dropped count, so it's left off. |
 //! | `log/timestamp` | exact | -- | The object's `time`, in seconds with up to nine decimals. |
 //! | `log/receipt_timestamp` | exact | -- | The object's `time`, the time the log was received. |

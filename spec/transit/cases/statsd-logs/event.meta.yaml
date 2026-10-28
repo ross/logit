@@ -1,4 +1,6 @@
 # The DogStatsD events of cases/statsd/event, from the same wire, so the log sinks reach
-# `log/dogstatsd_event` from statsd_in's own form.
+# `log/dogstatsd_event` from statsd_in's own form, and one more whose `e:` and `card:` fields
+# decode to `_logit.statsd.*` carriers, which `statsd_out` writes back and every other sink leaves
+# off.
 wire: event.statsd
 exercises: [event, tags, host]

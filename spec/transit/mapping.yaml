@@ -4438,15 +4438,13 @@ rows:
           A `Bytes` message leaves as its text, an invalid UTF-8 sequence replaced, and a timestamp
           message as its RFC 3339 text, each read back as a string.
       kafka_out:
-        - when: {format: text}
-          class: normalized
-          reason: message_as_text
-          text: >-
-            A message that isn't a string leaves as its text: a number or a boolean as its decimal
-            or `true`/`false`, a timestamp as RFC 3339, no message as an empty record, and a map or
-            array as its JSON text; each reads back as a string.
-        - class: exact
-          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
+        class: normalized
+        reason: message_as_text
+        text: >-
+          Under `format: text`, a message that isn't a string leaves as its text: a number or a
+          boolean as its decimal or `true`/`false`, a timestamp as RFC 3339, no message as an empty
+          record, and a map or array as its JSON text; each reads back as a string. `format: json`
+          writes the message as it is.
   - kind: log
     feature: structured_message
     cells:
@@ -4815,6 +4813,38 @@ rows:
         - class: exact
           text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
   - kind: log
+    feature: trace_beside_id_attribute
+    cells:
+      otlp_out:
+        class: exact
+        text: The `LogRecord`'s trace, span ids, and flags, beside the attributes, as `log/trace` has.
+      datadog_out:
+        class: lost
+        reason: uncounted
+        text: >-
+          A `trace_id` or `span_id` attribute is written under its own name and the log's own ids
+          are left off, uncounted, so a relayed Datadog log leaves as it arrived.
+      syslog_out:
+        class: lost
+        reason: structural
+        text: Syslog has no trace or span ids, so they're left off, as `log/trace` has.
+      splunk_hec_out:
+        class: lost
+        reason: uncounted
+        text: >-
+          A `trace_id` or `span_id` attribute is written as that field and the log's own ids are
+          left off, uncounted; an attribute that isn't a hex id reads back as an attribute, with no
+          trace.
+      kafka_out:
+        - when: {format: text}
+          class: lost
+          reason: structural
+          text: >-
+            A `format: text` record holds the log body alone, so the log's trace is left off, as
+            `log/trace` has.
+        - class: exact
+          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
+  - kind: log
     feature: dropped_attributes_count
     cells:
       otlp_out:
@@ -5017,8 +5047,10 @@ rows:
     cells:
       statsd_out:
         class: skipped
-        counter: logit.output.events.skipped{reason=no_metrics}
-        text: A span on an event with no metrics has no statsd form and isn't written.
+        reason: uncounted
+        text: >-
+          A span has no statsd form. Beside a DogStatsD event, the event's line is written and the
+          span left off, uncounted; beside any other log, `log/plain` counts the event skipped.
       otlp_out:
         class: exact
         text: An OTLP span.

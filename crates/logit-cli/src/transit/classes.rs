@@ -66,7 +66,8 @@
 //! attribute rows, with `_logit.otel.severity_*` as `severity_carrier_otel`; it also reaches a `log`
 //! field row for each of its fields (`severity`, `body_format`, `event_name`,
 //! `observed_timestamp`, `trace` for its trace and span ids, `trace_flags`,
-//! `dropped_attributes_count`), or the field's `_unset` row (`severity_unset`,
+//! `dropped_attributes_count`; its ids and flags reach `trace_beside_id_attribute` instead when
+//! it also carries a `trace_id` or `span_id` attribute), or the field's `_unset` row (`severity_unset`,
 //! `observed_timestamp_unset`, `trace_unset`) where it has none, and `log/timestamp`, or
 //! `log/receipt_timestamp` when it carries `syslog.timestamp` and its timestamp is when it was
 //! received. Those fields are out of a log's own comparison ([`LOG_FIELD_KEYS`]), so a log pairs
@@ -2637,11 +2638,19 @@ fn field_rows_under(
             push("observed_timestamp_unset", Field::LogUnset("observed_timestamp"));
         }
         if has("trace_id") {
-            push("trace", Field::LogBody("trace_id"));
+            // `datadog_out` and `splunk_hec_out` write a trace under these two attribute names,
+            // and write neither id when an attribute holds one.
+            let beside = ["trace_id", "span_id"].iter().any(|k| rec.attributes.contains_key(*k));
+            let (ids, flags) = if beside {
+                ("trace_beside_id_attribute", "trace_beside_id_attribute")
+            } else {
+                ("trace", "trace_flags")
+            };
+            push(ids, Field::LogBody("trace_id"));
             if has("span_id") {
-                push("trace", Field::LogBody("span_id"));
+                push(ids, Field::LogBody("span_id"));
             }
-            push("trace_flags", Field::LogBody("trace_flags"));
+            push(flags, Field::LogBody("trace_flags"));
         } else {
             push("trace_unset", Field::LogUnset("trace_id"));
         }

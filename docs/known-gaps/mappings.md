@@ -230,7 +230,7 @@ Entry format and the other areas: [the known-gaps index](README.md).
   | encode (statsd) | `log/plain` → **skipped** | `logit.output.events.skipped{reason=no_metrics}` | Any other log on an event with no metrics has no statsd form and isn't written. |
   | encode (statsd) | field `log/beside_metrics` → **lost** | none (uncounted) | A log on an event that also carries metrics is left off while the metrics are written, uncounted. |
   | encode (statsd) | `span/alone` → **skipped** | `logit.output.events.skipped{reason=no_metrics}` | A span on an event with no metrics has no statsd form and isn't written. |
-  | encode (statsd) | `span/beside_log` → **skipped** | `logit.output.events.skipped{reason=no_metrics}` | A span on an event with no metrics has no statsd form and isn't written. |
+  | encode (statsd) | `span/beside_log` → **skipped** | none (uncounted) | A span has no statsd form. Beside a DogStatsD event, the event's line is written and the span left off, uncounted; beside any other log, `log/plain` counts the event skipped. |
   | encode (statsd) | field `span/beside_metrics` → **lost** | none (uncounted) | A span on an event that also carries metrics is left off while the metrics are written, uncounted. |
   | encode (statsd) | `event/attributes_only` → **skipped** | `logit.output.events.skipped{reason=no_metrics}` | An event with no metric, log, or span has no statsd line and isn't written. |
   | encode (statsd) | `event/string_only` → **skipped** | `logit.output.events.skipped{reason=no_metrics}` | An InfluxDB point whose fields are all strings has no metric, so it has no statsd line and isn't written. |
@@ -450,6 +450,7 @@ Entry format and the other areas: [the known-gaps index](README.md).
   | encode (Datadog) | field `log/event_name` → **lost** | none (structural) | A Datadog log has no event name, so none is written. |
   | encode (Datadog) | field `log/observed_timestamp` → **lost** | none (structural) | A Datadog log has no observed time, so none is written. |
   | encode (Datadog) | field `log/trace_flags` → **lost** | none (structural) | A Datadog log has no trace flags, so none are written. |
+  | encode (Datadog) | field `log/trace_beside_id_attribute` → **lost** | none (uncounted) | A `trace_id` or `span_id` attribute is written under its own name and the log's own ids are left off, uncounted, so a relayed Datadog log leaves as it arrived. |
   | encode (Datadog) | field `log/dropped_attributes_count` → **lost** | none (structural) | A Datadog log has no dropped-attribute count, so none is written. |
   | encode (Datadog) | `span/no_wire_form` → **degraded** | `logit.output.spans.degraded{reason=no_wire_form}` | Datadog has no field for `status: ok`, a status message, `trace_state`, span flags, or a dropped count, so each is dropped, counted, and the span reads back without it. |
   | encode (Datadog) | `event/attributes_only` → **skipped** | `logit.output.events.skipped{reason=no_payload}` | An event with no metric, log, or span takes none of the intake's routes, so no request carries it. |
@@ -607,6 +608,7 @@ Entry format and the other areas: [the known-gaps index](README.md).
   | encode (syslog) | field `log/observed_timestamp` → **lost** | none (structural) | Syslog has no observed timestamp, so it's left off. |
   | encode (syslog) | field `log/trace` → **lost** | none (structural) | Syslog has no trace context, so the trace and span ids are left off. |
   | encode (syslog) | field `log/trace_flags` → **lost** | none (structural) | Syslog has no trace flags, so they're left off. |
+  | encode (syslog) | field `log/trace_beside_id_attribute` → **lost** | none (structural) | Syslog has no trace or span ids, so they're left off, as `log/trace` has. |
   | encode (syslog) | field `log/dropped_attributes_count` → **lost** | none (structural) | Syslog has no dropped-attributes count, so it's left off. |
   | encode (syslog) | field `log/receipt_timestamp` → **lost** | none (structural) | A log whose `syslog.timestamp` is written as TIMESTAMP leaves its own timestamp, the receipt time, unwritten; syslog_in stamps its own receipt time. |
   | encode (syslog) | `span/alone` → **skipped** | `logit.output.events.skipped` | A span on an event with no log has no syslog form, so the event is skipped. |
@@ -640,6 +642,7 @@ Entry format and the other areas: [the known-gaps index](README.md).
   | encode (Splunk) | `log/blank_message` → **dropped** | `logit.output.events.dropped{reason=blank_event}` | A log whose message is empty, null, or a non-finite number isn't written, since HEC rejects a whole request holding a blank `event`; the rest of the batch is sent. |
   | encode (Splunk) | field `log/body_format` → **lost** | none (structural) | HEC has no body format, so splunk_hec_in reads `json` for an object or array `event` and `raw` for any other: a `structured` message reads back as `json`, and a string message's `json` format as `raw`. |
   | encode (Splunk) | field `log/observed_timestamp` → **lost** | none (structural) | HEC has no observed time, so it's left off. |
+  | encode (Splunk) | field `log/trace_beside_id_attribute` → **lost** | none (uncounted) | A `trace_id` or `span_id` attribute is written as that field and the log's own ids are left off, uncounted; an attribute that isn't a hex id reads back as an attribute, with no trace. |
   | encode (Splunk) | field `log/dropped_attributes_count` → **lost** | none (structural) | HEC has no dropped count, so it's left off. |
   | encode (Splunk) | field `log/beside_metrics` → **lost** | `logit.output.events.dropped{reason=blank_event}` | The log is its own HEC object before the event's metric objects, read back as an event of its own; a blank one is dropped and counted, as the `log/blank_message` row says. |
   | encode (Splunk) | `span/no_wire_form` → **degraded** | `logit.output.spans.degraded{reason=no_wire_form}` | The exporter's span object has no member for span flags, `trace_state`, or a dropped count, so each is left off, counted once per span, and the span reads back without it. |
@@ -696,6 +699,7 @@ Entry format and the other areas: [the known-gaps index](README.md).
   | encode (Kafka) | field `log/observed_timestamp`, under `format: text` → **lost** | none (structural) | A `format: text` record holds the log body alone, so the log's observed time is left off. |
   | encode (Kafka) | field `log/trace`, under `format: text` → **lost** | none (structural) | A `format: text` record holds the log body alone, so the log's trace and span ids are left off. |
   | encode (Kafka) | field `log/trace_flags`, under `format: text` → **lost** | none (structural) | A `format: text` record holds the log body alone, so the log's trace flags are left off. |
+  | encode (Kafka) | field `log/trace_beside_id_attribute`, under `format: text` → **lost** | none (structural) | A `format: text` record holds the log body alone, so the log's trace is left off, as `log/trace` has. |
   | encode (Kafka) | field `log/dropped_attributes_count`, under `format: text` → **lost** | none (structural) | A `format: text` record holds the log body alone, so the log's dropped-attribute count is left off. |
   | encode (Kafka) | `span/alone`, under `format: text` → **skipped** | `logit.output.events.skipped{reason=no_log}` | An event with no log has no `format: text` record. |
   | encode (Kafka) | `span/beside_log`, under `format: text` → **skipped** | `logit.output.spans.omitted{reason=format}` | The record holds the log body alone, so the span beside it is left off, counted. |

@@ -99,8 +99,7 @@
 //! | `log/dogstatsd_event`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
 //! | `log/plain`, under `format: text` | exact | -- | The log's message as the record's value, read back as one log per record. |
 //! | `log/plain`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
-//! | `log/message_unsafe`, under `format: text` | normalized | `message_as_text` | A message that isn't a string leaves as its text: a number or a boolean as its decimal or `true`/`false`, a timestamp as RFC 3339, no message as an empty record, and a map or array as its JSON text; each reads back as a string. |
-//! | `log/message_unsafe`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `log/message_unsafe` | normalized | `message_as_text` | Under `format: text`, a message that isn't a string leaves as its text: a number or a boolean as its decimal or `true`/`false`, a timestamp as RFC 3339, no message as an empty record, and a map or array as its JSON text; each reads back as a string. `format: json` writes the message as it is. |
 //! | `log/structured_message`, under `format: text` | normalized | `message_as_text` | A `Map` or `Array` message leaves as its JSON text, which reads back as a string. |
 //! | `log/structured_message`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
 //! | `log/bytes_message`, under `format: text` | exact | -- | A `Bytes` message leaves as its raw bytes, the record's value, which carries no type: a consumer that reads values as text sees a UTF-8 one as a string. |
@@ -222,6 +221,8 @@
 //! | `log/trace_unset`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
 //! | `log/trace_flags`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the log's trace flags are left off. |
 //! | `log/trace_flags`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `log/trace_beside_id_attribute`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the log's trace is left off, as `log/trace` has. |
+//! | `log/trace_beside_id_attribute`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
 //! | `log/dropped_attributes_count`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the log's dropped-attribute count is left off. |
 //! | `log/dropped_attributes_count`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
 //! | `log/timestamp`, under `format: text` | normalized | `timestamp_precision` | The record's timestamp, in whole milliseconds. |

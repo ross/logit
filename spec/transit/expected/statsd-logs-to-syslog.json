@@ -1,7 +1,11 @@
 {
   "event": {"events": [
     {"timestamp":"2027-01-15T08:00:01.000000000Z","log":{"severity":"info","format":"raw","message":"abc"},"attributes":{"_logit.syslog.severity":6,"host.name":"transit","syslog.facility":16,"syslog.timestamp":"2027-01-15T08:00:00.000000000Z"},"types":{"/attributes/_logit.syslog.severity":"u64","/attributes/syslog.facility":"u64","/attributes/syslog.timestamp":"timestamp"}},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","log":{"severity":"info","format":"raw","message":"text"},"attributes":{"_logit.syslog.severity":6,"host.name":"transit","syslog.facility":16,"syslog.timestamp":"2027-01-15T08:00:00.000000000Z"},"types":{"/attributes/_logit.syslog.severity":"u64","/attributes/syslog.facility":"u64","/attributes/syslog.timestamp":"timestamp"}},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","log":{"severity":"warn","format":"raw","message":"first\\nline"},"attributes":{"_logit.syslog.severity":4,"host.name":"web-07","syslog.facility":16,"syslog.timestamp":"2027-01-15T08:00:00.000000000Z"},"types":{"/attributes/_logit.syslog.severity":"u64","/attributes/syslog.facility":"u64","/attributes/syslog.timestamp":"timestamp"}}
+  ], "counters": {}},
+  "event-beside-span": {"events": [
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","log":{"severity":"info","format":"raw","message":"rolled out"},"attributes":{"_logit.syslog.severity":6,"host.name":"transit","syslog.facility":16,"syslog.timestamp":"2027-01-15T08:00:00.000000000Z"},"types":{"/attributes/_logit.syslog.severity":"u64","/attributes/syslog.facility":"u64","/attributes/syslog.timestamp":"timestamp"}}
   ], "counters": {}},
   "log-only": {"events": [
     {"timestamp":"2027-01-15T08:00:01.000000000Z","log":{"severity":"info","format":"raw","message":"request served"},"attributes":{"_logit.syslog.severity":6,"host.name":"transit","syslog.facility":16,"syslog.timestamp":"2027-01-15T08:00:00.000000000Z"},"types":{"/attributes/_logit.syslog.severity":"u64","/attributes/syslog.facility":"u64","/attributes/syslog.timestamp":"timestamp"}}
