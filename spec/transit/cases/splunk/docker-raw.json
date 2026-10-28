@@ -1,0 +1,2 @@
+{"timestamp":"2026-09-25T17:49:48.345092000Z","log":{"format":"raw","message":"298ce556c084 {\"level\":\"info\",\"msg\":\"splunk-docker fixture raw\",\"n\":1}"},"resource":{"attributes":{"host.name":"splunk-docker-fixture"}}}
+{"timestamp":"2026-09-25T17:49:48.345110000Z","log":{"format":"raw","message":"298ce556c084 splunk-docker fixture plain line (raw)"},"resource":{"attributes":{"host.name":"splunk-docker-fixture"}}}

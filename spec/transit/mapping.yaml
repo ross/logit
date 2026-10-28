@@ -26,12 +26,14 @@ classes:
     counts it.
 # A cell may still say `reason: uncounted` only on the rows `UNCOUNTED_ALLOWED` names in
 # `crates/logit-cli/src/transit/mapping.rs`: span payloads, not yet classified, log payloads,
-# classified only at otlp_out, datadog_out, syslog_out, and, for a DogStatsD event, statsd_out,
-# `datadog_out`'s carrier on a log, and syslog_out's attribute rows, where it leaves every
-# attribute outside its header fields off a log.
+# classified only at otlp_out, datadog_out, syslog_out, splunk_hec_out, and, for a DogStatsD
+# event, statsd_out, `datadog_out`'s carrier on a log, and syslog_out's attribute rows, where it
+# leaves every attribute outside its header fields off a log. A skipped or dropped cell may name
+# a counter beside `reason: uncounted` where the sink counts the loss on one path and not
+# another.
 # docs/adr/telemetry-loss-vocabulary.md's amendment "structural loss has no counter" has the rule.
 
-sinks: [statsd_out, prometheus_out, influxdb_out, otlp_out, datadog_out, graphite_out, syslog_out]
+sinks: [statsd_out, prometheus_out, influxdb_out, otlp_out, datadog_out, graphite_out, syslog_out, splunk_hec_out]
 
 rows:
   # --- sum: temporality and monotonicity -------------------------------------------------------
@@ -2051,6 +2053,14 @@ rows:
             `structured_data:` writes each public event attribute other than `host.name`,
             `process.pid`, and the `syslog.*` keys as an SD-PARAM, which syslog_in reads back
             inside `syslog.sd`.
+      splunk_hec_out:
+        class: normalized
+        reason: log_fields
+        text: >-
+          A `fields` string, or on a span a string in its `attributes` object, read back as itself.
+          On a log, splunk_hec_in reads a non-empty `otel.log.name` into the event name, and a
+          `trace_id` that parses as a trace id, with a `span_id` that parses or none, into the trace,
+          so none of them reads back as an attribute.
   - kind: attributes
     feature: host_beside_host_name
     cells:
@@ -2113,6 +2123,9 @@ rows:
             `structured_data:` writes each public event attribute other than `host.name`,
             `process.pid`, and the `syslog.*` keys as an SD-PARAM, which syslog_in reads back
             inside `syslog.sd`.
+      splunk_hec_out:
+        class: exact
+        text: A `host` field, an ordinary key beside the object's own `host`.
   # statsd_out, prometheus_out, influxdb_out, and graphite_out don't write a log on an event with
   # no metrics, so its fields are never compared there and none of them has a cell.
   - kind: attributes
@@ -2147,6 +2160,9 @@ rows:
             `structured_data:` writes each public event attribute other than `host.name`,
             `process.pid`, and the `syslog.*` keys as an SD-PARAM, which syslog_in reads back
             inside `syslog.sd`.
+      splunk_hec_out:
+        class: exact
+        text: A `fields` key.
   - kind: attributes
     feature: log_service
     cells:
@@ -2179,6 +2195,9 @@ rows:
             `structured_data:` writes each public event attribute other than `host.name`,
             `process.pid`, and the `syslog.*` keys as an SD-PARAM, which syslog_in reads back
             inside `syslog.sd`.
+      splunk_hec_out:
+        class: exact
+        text: A `fields` key.
   - kind: attributes
     feature: log_service_field
     cells:
@@ -2211,6 +2230,9 @@ rows:
             `structured_data:` writes each public event attribute other than `host.name`,
             `process.pid`, and the `syslog.*` keys as an SD-PARAM, which syslog_in reads back
             inside `syslog.sd`.
+      splunk_hec_out:
+        class: exact
+        text: A `fields` key.
   - kind: attributes
     feature: container_id
     cells:
@@ -2275,6 +2297,9 @@ rows:
             `structured_data:` writes each public event attribute other than `host.name`,
             `process.pid`, and the `syslog.*` keys as an SD-PARAM, which syslog_in reads back
             inside `syslog.sd`.
+      splunk_hec_out:
+        class: exact
+        text: A `fields` key.
   - kind: attributes
     feature: service_identity
     cells:
@@ -2333,6 +2358,9 @@ rows:
             `structured_data:` writes each public event attribute other than `host.name`,
             `process.pid`, and the `syslog.*` keys as an SD-PARAM, which syslog_in reads back
             inside `syslog.sd`.
+      splunk_hec_out:
+        class: exact
+        text: A `fields` key.
   - kind: attributes
     feature: service_tag
     cells:
@@ -2390,6 +2418,9 @@ rows:
             `structured_data:` writes each public event attribute other than `host.name`,
             `process.pid`, and the `syslog.*` keys as an SD-PARAM, which syslog_in reads back
             inside `syslog.sd`.
+      splunk_hec_out:
+        class: exact
+        text: A `fields` key.
   - kind: attributes
     feature: service_tag_beside_key
     cells:
@@ -2448,6 +2479,9 @@ rows:
             `structured_data:` writes each public event attribute other than `host.name`,
             `process.pid`, and the `syslog.*` keys as an SD-PARAM, which syslog_in reads back
             inside `syslog.sd`.
+      splunk_hec_out:
+        class: exact
+        text: A `fields` key, beside the standard key's.
   - kind: attributes
     feature: bool_value
     cells:
@@ -2513,6 +2547,9 @@ rows:
             `structured_data:` writes each public event attribute other than `host.name`,
             `process.pid`, and the `syslog.*` keys as an SD-PARAM, which syslog_in reads back
             inside `syslog.sd`.
+      splunk_hec_out:
+        class: exact
+        text: A JSON boolean, read back as itself.
   - kind: attributes
     feature: number_value
     cells:
@@ -2581,6 +2618,9 @@ rows:
             `structured_data:` writes each public event attribute other than `host.name`,
             `process.pid`, and the `syslog.*` keys as an SD-PARAM, which syslog_in reads back
             inside `syslog.sd`.
+      splunk_hec_out:
+        class: exact
+        text: A JSON number, read back as the same integer or double; a `u64` above `i64::MAX` stays a `u64`.
   - kind: attributes
     feature: array_value
     cells:
@@ -2644,6 +2684,12 @@ rows:
             `structured_data:` writes each public event attribute other than `host.name`,
             `process.pid`, and the `syslog.*` keys as an SD-PARAM, which syslog_in reads back
             inside `syslog.sd`.
+      splunk_hec_out:
+        class: normalized
+        reason: flattened
+        text: >-
+          A JSON array; one holding a map or an array leaves as its JSON text, read back as a string,
+          since `fields` is flat.
   - kind: attributes
     feature: map_value
     cells:
@@ -2701,6 +2747,13 @@ rows:
             `structured_data:` writes each public event attribute other than `host.name`,
             `process.pid`, and the `syslog.*` keys as an SD-PARAM, which syslog_in reads back
             inside `syslog.sd`.
+      splunk_hec_out:
+        class: normalized
+        reason: flattened
+        text: >-
+          `fields` is flat, so a map leaves as one dotted key per leaf (`http.method`), read back as
+          that many attributes, and an empty map is left off. A span's `attributes` object keeps its
+          nesting.
   - kind: attributes
     feature: bytes_value
     cells:
@@ -2757,6 +2810,10 @@ rows:
             `structured_data:` writes each public event attribute other than `host.name`,
             `process.pid`, and the `syslog.*` keys as an SD-PARAM, which syslog_in reads back
             inside `syslog.sd`.
+      splunk_hec_out:
+        class: normalized
+        reason: stringified
+        text: Its base64 text as a JSON string, read back as a string.
   - kind: attributes
     feature: timestamp_value
     cells:
@@ -2815,6 +2872,10 @@ rows:
             `structured_data:` writes each public event attribute other than `host.name`,
             `process.pid`, and the `syslog.*` keys as an SD-PARAM, which syslog_in reads back
             inside `syslog.sd`.
+      splunk_hec_out:
+        class: normalized
+        reason: stringified
+        text: Its RFC 3339 text as a JSON string, read back as a string.
   # Only datadog_in's logs decode a JSON null attribute, so only the log sinks have a cell.
   - kind: attributes
     feature: null_value
@@ -2844,6 +2905,9 @@ rows:
             `structured_data:` writes each public event attribute other than `host.name`,
             `process.pid`, and the `syslog.*` keys as an SD-PARAM, which syslog_in reads back
             inside `syslog.sd`.
+      splunk_hec_out:
+        class: exact
+        text: A JSON null, read back as itself.
   # graphite_in stamps no `_logit.graphite.` carrier, so no record reaches this row at
   # graphite_out and it has no cell.
   - kind: attributes
@@ -2886,6 +2950,10 @@ rows:
         class: lost
         reason: structural
         text: A `_logit.` carrier or flag is private and isn't a header field, so it's left off.
+      splunk_hec_out:
+        class: lost
+        reason: structural
+        text: A `_logit.` carrier or flag is private and isn't a HEC field, so it's left off.
   - kind: attributes
     feature: prometheus_target
     cells:
@@ -2923,6 +2991,10 @@ rows:
         class: lost
         reason: structural
         text: A `_logit.` carrier or flag is private and isn't a header field, so it's left off.
+      splunk_hec_out:
+        class: lost
+        reason: structural
+        text: The scrape target is private and isn't a HEC field, so it's left off.
   - kind: attributes
     feature: foreign_carrier
     cells:
@@ -2977,6 +3049,10 @@ rows:
         class: lost
         reason: structural
         text: A `_logit.` carrier or flag is private and isn't a header field, so it's left off.
+      splunk_hec_out:
+        class: lost
+        reason: structural
+        text: Another protocol's `_logit.` carrier is private and isn't a HEC field, so it's left off.
   # `_logit.metrics.closed: timestamped`, the neutral flag that says the event's timestamp is its
   # source's own. statsd_in and prometheus_in's scrape set it, and statsd_out and prometheus_out
   # read it, whichever decoder set it.
@@ -3035,6 +3111,10 @@ rows:
         class: lost
         reason: structural
         text: A `_logit.` carrier or flag is private and isn't a header field, so it's left off.
+      splunk_hec_out:
+        class: lost
+        reason: structural
+        text: The flag is private and isn't a HEC field, so it's left off. `time` carries the timestamp.
   # `_logit.metrics.type: rate` and `_logit.metrics.interval`, the neutral flags that say a gauge
   # is a per-second rate over an interval. datadog_in sets them, and datadog_out reads them,
   # whichever producer set them.
@@ -3073,6 +3153,10 @@ rows:
         class: lost
         reason: structural
         text: A `_logit.` carrier or flag is private and isn't a header field, so it's left off.
+      splunk_hec_out:
+        class: lost
+        reason: structural
+        text: The flag is private and isn't a HEC field, so it's left off.
   - kind: attributes
     feature: interval
     cells:
@@ -3106,6 +3190,10 @@ rows:
         class: lost
         reason: structural
         text: A `_logit.` carrier or flag is private and isn't a header field, so it's left off.
+      splunk_hec_out:
+        class: lost
+        reason: structural
+        text: The flag is private and isn't a HEC field, so it's left off.
   # `_logit.metrics.type: rate` on a record that isn't a gauge: the flag applies to gauges only.
   - kind: attributes
     feature: rate_on_non_gauge
@@ -3141,6 +3229,10 @@ rows:
         class: lost
         reason: structural
         text: A `_logit.` carrier or flag is private and isn't a header field, so it's left off.
+      splunk_hec_out:
+        class: lost
+        reason: structural
+        text: The flag is private and isn't a HEC field, so it's left off.
   # `_logit.metrics.type: info` or `stateset` on a gauge, or `gaugehistogram` on a histogram, the
   # neutral flag that names an OpenMetrics family type the model has no kind for. prometheus_in
   # sets it, and prometheus_out and otlp_out read it, whichever producer set it.
@@ -3180,6 +3272,10 @@ rows:
         class: lost
         reason: structural
         text: A `_logit.` carrier or flag is private and isn't a header field, so it's left off.
+      splunk_hec_out:
+        class: lost
+        reason: structural
+        text: The flag is private and isn't a HEC field, so it's left off.
   # `_logit.metrics.type: info`, `stateset`, or `gaugehistogram` on a record of a kind the value
   # doesn't name: each reader ignores it.
   - kind: attributes
@@ -3218,6 +3314,10 @@ rows:
         class: lost
         reason: structural
         text: A `_logit.` carrier or flag is private and isn't a header field, so it's left off.
+      splunk_hec_out:
+        class: lost
+        reason: structural
+        text: The flag is private and isn't a HEC field, so it's left off.
   # `_logit.metrics.interval` on a record that takes datadog_out's distribution-points or
   # sketches route, neither of which has an interval field: a `samples`, `distribution`, or delta
   # `exponential_histogram` record.
@@ -3255,6 +3355,10 @@ rows:
         class: lost
         reason: structural
         text: A `_logit.` carrier or flag is private and isn't a header field, so it's left off.
+      splunk_hec_out:
+        class: lost
+        reason: structural
+        text: The flag is private and isn't a HEC field, so it's left off.
   # `_logit.metrics.interval` on a delta `histogram`, which datadog_out sends as a sketch under
   # the default `histograms.mode: distributions` and as series under the other modes.
   - kind: attributes
@@ -3306,6 +3410,10 @@ rows:
         class: lost
         reason: structural
         text: A `_logit.` carrier or flag is private and isn't a header field, so it's left off.
+      splunk_hec_out:
+        class: lost
+        reason: structural
+        text: The flag is private and isn't a HEC field, so it's left off.
   - kind: attributes
     feature: resource_attribute
     cells:
@@ -3358,6 +3466,12 @@ rows:
           Syslog has no resource, so a resource attribute is left off, apart from `host.name` and
           `process.pid`, which are HOSTNAME and PROCID when the event carries neither and read back
           on the event.
+      splunk_hec_out:
+        class: normalized
+        reason: resource_as_field
+        text: >-
+          A `fields` key beside the event's own, so on a log or a metric it reads back as an event
+          attribute, an event attribute of the same key winning; a span's reads back on the resource.
   - kind: attributes
     feature: scope
     cells:
@@ -3388,6 +3502,10 @@ rows:
         class: lost
         reason: structural
         text: Syslog has no instrumentation scope, so none is written.
+      splunk_hec_out:
+        class: lost
+        reason: structural
+        text: HEC has no instrumentation scope, so none is written.
 
   - kind: attributes
     feature: datadog_carrier_log
@@ -3424,6 +3542,10 @@ rows:
         class: lost
         reason: structural
         text: A `_logit.` carrier or flag is private and isn't a header field, so it's left off.
+      splunk_hec_out:
+        class: lost
+        reason: structural
+        text: A `_logit.` carrier is private and isn't a HEC field, so it's left off.
 
   # OTLP's raw severity carriers. `_logit.syslog.severity` gets its own row,
   # `severity_carrier_syslog`, with the syslog source, since otlp_out keeps one carrier and not the
@@ -3450,6 +3572,12 @@ rows:
         text: >-
           Syslog has no raw OTLP severity, so the carriers are left off and the severity reads back
           from PRI at syslog's resolution.
+      splunk_hec_out:
+        class: lost
+        reason: structural
+        text: >-
+          A `_logit.` carrier is private and isn't a HEC field, so it's left off and the severity
+          reads back at band resolution.
   - kind: attributes
     feature: severity_carrier_syslog
     cells:
@@ -3468,6 +3596,12 @@ rows:
       syslog_out:
         class: exact
         text: PRI's severity, which syslog_in reads back into the same carrier.
+      splunk_hec_out:
+        class: lost
+        reason: structural
+        text: >-
+          A `_logit.` carrier is private and isn't a HEC field, so it's left off and the severity
+          reads back at band resolution.
 
   # --- a log's attributes syslog_out writes as header fields -------------------------------------
   # A log's own `syslog.*`, `process.pid`, and `host.name` attributes. statsd_out writes a log only
@@ -3500,6 +3634,12 @@ rows:
           text: >-
             `syslog.facility` is PRI's facility, `syslog.tag` APP-NAME, and `process.pid` or
             `syslog.pid` PROCID, each read back as written.
+      splunk_hec_out:
+        class: normalized
+        reason: u64_as_int
+        text: >-
+          A `fields` string or number; a `u64` `syslog.facility` or `process.pid` reads back as an
+          `i64`.
   - kind: attributes
     feature: syslog_msgid
     cells:
@@ -3516,6 +3656,9 @@ rows:
           text: RFC 3164 has no MSGID, so it's left off.
         - class: exact
           text: MSGID.
+      splunk_hec_out:
+        class: exact
+        text: A `fields` string.
   - kind: attributes
     feature: syslog_sd
     cells:
@@ -3539,6 +3682,12 @@ rows:
             SD-ID is the log's own, and the opt-in one is left off.
         - class: exact
           text: STRUCTURED-DATA, its elements and their params in name order.
+      splunk_hec_out:
+        class: normalized
+        reason: flattened
+        text: >-
+          `fields` is flat, so `syslog.sd` leaves as one `syslog.sd.<SD-ID>.<PARAM-NAME>` key per
+          PARAM, read back as that many attributes and no `syslog.sd` map.
   - kind: attributes
     feature: syslog_timestamp
     cells:
@@ -3569,6 +3718,12 @@ rows:
             Under RFC 5424, a typed timestamp is TIMESTAMP and a null is the nil `-`, each written
             as it is; any string, an RFC 5424-shaped one included, gives way to the log's timestamp
             and the attribute is left off.
+      splunk_hec_out:
+        class: normalized
+        reason: stringified
+        text: >-
+          A `fields` string: an RFC 3164 timestamp as itself, an RFC 5424 one as its RFC 3339 text,
+          read back as a string.
   - kind: attributes
     feature: sd_id_collision
     cells:
@@ -3620,6 +3775,31 @@ rows:
             `host.name` back.
         - class: exact
           text: HOSTNAME.
+      splunk_hec_out:
+        class: normalized
+        reason: host_on_resource
+        text: >-
+          A non-empty string `host.name` is the object's `host`, the event's over the resource's,
+          which splunk_hec_in reads back as the resource's `host.name`.
+  - kind: attributes
+    feature: splunk_envelope
+    cells:
+      otlp_out:
+        class: exact
+        text: A resource attribute.
+      datadog_out:
+        class: normalized
+        reason: resource_as_tag
+        text: Merged into the log's attributes, so it reads back as an event attribute.
+      syslog_out:
+        class: lost
+        reason: structural
+        text: Syslog has no resource and no field for Splunk's envelope, so it's left off.
+      splunk_hec_out:
+        class: exact
+        text: >-
+          The object's `source`, `sourcetype`, or `index`, read back onto the resource; a value that
+          isn't a string is omitted, counted once per batch.
   - kind: attributes
     feature: syslog_facility
     cells:
@@ -3638,6 +3818,9 @@ rows:
         text: >-
           A log with no `syslog.facility` leaves with the sink's `facility:`, `local0` by default,
           as PRI's facility, which syslog_in reads back as `syslog.facility`.
+      splunk_hec_out:
+        class: exact
+        text: A log with no `syslog.facility` leaves with none.
 
   # --- attributes datadog_out writes from a record's own fields ----------------------------------
   # Every sink reaches these rows; only datadog_out writes the attribute, which its pair decoder
@@ -3680,6 +3863,12 @@ rows:
           text: >-
             A log with no host leaves with the sink's `hostname:`, else the process hostname, as
             HOSTNAME, which syslog_in reads back as `host.name`.
+      splunk_hec_out:
+        class: normalized
+        reason: default_host
+        text: >-
+          A record with no `host.name` leaves with the process hostname as its `host`, which
+          splunk_hec_in reads back as the resource's `host.name`.
   # statsd_out, prometheus_out, influxdb_out, and graphite_out don't write a log on an event with
   # no metrics, so its fields are never compared there and none of them has a cell.
   - kind: attributes
@@ -3697,6 +3886,31 @@ rows:
       syslog_out:
         class: exact
         text: The severity is PRI's; no `status` attribute is written.
+      splunk_hec_out:
+        class: exact
+        text: No `status` attribute is written.
+  - kind: attributes
+    feature: log_severity_fields
+    cells:
+      statsd_out:
+        class: exact
+        text: No `otel.log.severity.*` attribute is written.
+      otlp_out:
+        class: exact
+        text: The severity is the `LogRecord`'s own; no `otel.log.severity.*` attribute is written.
+      datadog_out:
+        class: exact
+        text: The severity is `status`'s; no `otel.log.severity.*` attribute is written.
+      syslog_out:
+        class: exact
+        text: The severity is PRI's; no `otel.log.severity.*` attribute is written.
+      splunk_hec_out:
+        class: normalized
+        reason: severity_fields
+        text: >-
+          A log with a severity and neither `otel.log.severity.*` attribute leaves with both, the
+          severity's name and its band's base number, which splunk_hec_in reads back as attributes
+          beside the severity.
   # statsd_out, prometheus_out, influxdb_out, and graphite_out don't write a span, so its fields
   # are never compared there and none of them has a cell.
   - kind: attributes
@@ -3715,6 +3929,9 @@ rows:
       syslog_out:
         class: exact
         text: A span isn't written, so no `span.kind` attribute is.
+      splunk_hec_out:
+        class: exact
+        text: The kind is the span object's `kind`; no `span.kind` attribute is written.
   # statsd_out, prometheus_out, influxdb_out, and graphite_out don't write a span, so its fields
   # are never compared there and none of them has a cell.
   - kind: attributes
@@ -3733,6 +3950,9 @@ rows:
       syslog_out:
         class: exact
         text: A span isn't written, so no `_dd.p.tid` attribute is.
+      splunk_hec_out:
+        class: exact
+        text: The 128-bit trace id is the span object's `trace_id`; no `_dd.p.tid` attribute is written.
 
   # --- logs ------------------------------------------------------------------------------------
   - kind: log
@@ -3773,6 +3993,11 @@ rows:
         text: >-
           One syslog message, the event's text as MSG; its `_logit.statsd.event.*` carriers aren't
           written (the `attributes` rows).
+      splunk_hec_out:
+        class: exact
+        text: >-
+          One HEC object whose `event` is the message. Its `_logit.statsd.event.*` carriers are
+          private and aren't written; the `log` field rows have its fields.
   - kind: log
     feature: plain
     cells:
@@ -3804,6 +4029,9 @@ rows:
         text: >-
           One syslog message, the message as MSG and the severity in PRI; the `log` and `attributes`
           rows have its fields.
+      splunk_hec_out:
+        class: exact
+        text: One HEC object whose `event` is the message; the `log` field rows have its fields.
   # A log's own record-level rows, beside `log/plain` or `log/dogstatsd_event`. statsd_out writes a
   # log only as a DogStatsD event, and this row has no statsd_out cell; prometheus_out,
   # influxdb_out, and graphite_out don't write a log on an event with no metrics, so none of them
@@ -3825,6 +4053,12 @@ rows:
           Every C0 control character and DEL in MSG, a newline included, is escaped as its backslash
           form, so a multi-line message reads back as one line holding the escapes as text; a
           number or bool message leaves as its text and reads back as a string.
+      splunk_hec_out:
+        class: normalized
+        reason: message_as_text
+        text: >-
+          A `Bytes` message leaves as its text, an invalid UTF-8 sequence replaced, and a timestamp
+          message as its RFC 3339 text, each read back as a string.
   - kind: log
     feature: structured_message
     cells:
@@ -3841,6 +4075,9 @@ rows:
         text: >-
           A `Map` or `Array` message is written as its inline text, which syslog_in reads back as a
           string.
+      splunk_hec_out:
+        class: exact
+        text: A JSON object or array `event`, read back as the same structure.
   - kind: log
     feature: bytes_message
     cells:
@@ -3858,6 +4095,10 @@ rows:
         text: >-
           A `Bytes` message is written as its bytes, escaped as a string's are, and reads back as
           `Bytes`; one that's valid UTF-8 reads back as a string (the `log/message_unsafe` row).
+      splunk_hec_out:
+        class: normalized
+        reason: message_as_text
+        text: A string `event`, read back as a string, as the `log/message_unsafe` row says.
   - kind: log
     feature: blank_message
     cells:
@@ -3874,6 +4115,12 @@ rows:
         text: >-
           A log with an empty message or none leaves with an empty MSG, which syslog_in reads back
           as an empty string.
+      splunk_hec_out:
+        class: dropped
+        counter: logit.output.events.dropped{reason=blank_event}
+        text: >-
+          A log whose message is empty, null, or a non-finite number isn't written, since HEC
+          rejects a whole request holding a blank `event`; the rest of the batch is sent.
   # syslog_out's alone: under RFC 3164, syslog_in reads its header back by a two-token rule.
   - kind: log
     feature: header_in_message
@@ -3913,6 +4160,11 @@ rows:
           PRI's severity: a `_logit.syslog.severity` carrier's value, else the band's syslog
           severity, which syslog_in reads back at syslog's resolution, so `trace` reads back as
           `debug`.
+      splunk_hec_out:
+        class: exact
+        text: >-
+          `otel.log.severity.text` and `.number`, the band's name and base number unless the log
+          carries either as an attribute, which splunk_hec_in reads back at band resolution.
   - kind: log
     feature: severity_unset
     cells:
@@ -3931,6 +4183,9 @@ rows:
         text: >-
           A log with no severity leaves at syslog's `info` (6), which syslog_in reads back as
           `info`.
+      splunk_hec_out:
+        class: exact
+        text: No severity fields, read back as no severity.
   - kind: log
     feature: body_format
     cells:
@@ -3952,6 +4207,13 @@ rows:
         class: lost
         reason: structural
         text: Syslog has no body format, so MSG reads back as `raw`.
+      splunk_hec_out:
+        class: lost
+        reason: structural
+        text: >-
+          HEC has no body format, so splunk_hec_in reads `json` for an object or array `event` and
+          `raw` for any other: a `structured` message reads back as `json`, and a string message's
+          `json` format as `raw`.
   - kind: log
     feature: event_name
     cells:
@@ -3966,6 +4228,9 @@ rows:
         class: lost
         reason: structural
         text: Syslog has no event name, so it's left off.
+      splunk_hec_out:
+        class: exact
+        text: The `otel.log.name` field, read back into the event name.
   - kind: log
     feature: observed_timestamp
     cells:
@@ -3980,6 +4245,10 @@ rows:
         class: lost
         reason: structural
         text: Syslog has no observed timestamp, so it's left off.
+      splunk_hec_out:
+        class: lost
+        reason: structural
+        text: HEC has no observed time, so it's left off.
   - kind: log
     feature: observed_timestamp_unset
     cells:
@@ -3998,6 +4267,9 @@ rows:
       syslog_out:
         class: exact
         text: A log with no observed timestamp leaves with none.
+      splunk_hec_out:
+        class: exact
+        text: No observed time is written, and splunk_hec_in reads back none.
   - kind: log
     feature: trace
     cells:
@@ -4014,6 +4286,11 @@ rows:
         class: lost
         reason: structural
         text: Syslog has no trace context, so the trace and span ids are left off.
+      splunk_hec_out:
+        class: exact
+        text: >-
+          The `trace_id` and `span_id` fields, lowercase hex, read back into the trace, unless the
+          log carries either as an attribute.
   - kind: log
     feature: trace_unset
     cells:
@@ -4032,6 +4309,12 @@ rows:
       syslog_out:
         class: exact
         text: A log with no trace context leaves with none.
+      splunk_hec_out:
+        class: normalized
+        reason: log_fields
+        text: >-
+          No trace fields are written, and splunk_hec_in reads back no trace, unless the log carries
+          `trace_id` and `span_id` attributes that parse as ids, which it reads into the trace.
   - kind: log
     feature: trace_flags
     cells:
@@ -4046,6 +4329,10 @@ rows:
         class: lost
         reason: structural
         text: Syslog has no trace flags, so they're left off.
+      splunk_hec_out:
+        class: normalized
+        reason: flags_zero
+        text: HEC has no trace flags, so a log's trace reads back with flags `0`.
   - kind: log
     feature: dropped_attributes_count
     cells:
@@ -4060,6 +4347,10 @@ rows:
         class: lost
         reason: structural
         text: Syslog has no dropped-attributes count, so it's left off.
+      splunk_hec_out:
+        class: lost
+        reason: structural
+        text: HEC has no dropped count, so it's left off.
   - kind: log
     feature: timestamp
     cells:
@@ -4090,6 +4381,9 @@ rows:
             A log with no `syslog.timestamp` leaves with its timestamp as TIMESTAMP in microseconds,
             which syslog_in reads back as `syslog.timestamp`, with `event.timestamp` as the receipt
             time.
+      splunk_hec_out:
+        class: exact
+        text: The object's `time`, in seconds with up to nine decimals.
   - kind: log
     feature: receipt_timestamp
     cells:
@@ -4106,6 +4400,9 @@ rows:
         text: >-
           A log whose `syslog.timestamp` is written as TIMESTAMP leaves its own timestamp, the
           receipt time, unwritten; syslog_in stamps its own receipt time.
+      splunk_hec_out:
+        class: exact
+        text: The object's `time`, the time the log was received.
   - kind: log
     feature: beside_metrics
     cells:
@@ -4149,6 +4446,12 @@ rows:
           text: >-
             The log is one syslog message; the metrics beside it have no syslog form and are left
             off, uncounted.
+      splunk_hec_out:
+        class: lost
+        counter: logit.output.events.dropped{reason=blank_event}
+        text: >-
+          The log is its own HEC object before the event's metric objects, read back as an event of
+          its own; a blank one is dropped and counted, as the `log/blank_message` row says.
 
   # --- spans -----------------------------------------------------------------------------------
   - kind: span
@@ -4182,10 +4485,16 @@ rows:
       syslog_out:
         class: skipped
         reason: uncounted
+        counter: logit.output.events.skipped
         text: >-
           A span has no syslog form and isn't written: on an event with no log, the event is
           skipped, counted as `logit.output.events.skipped`; beside a log, it's left off,
           uncounted.
+      splunk_hec_out:
+        class: exact
+        text: >-
+          A span object in the OpenTelemetry exporter's shape, its resource's attributes as `fields`;
+          the `span/no_wire_form` row has what it can't carry.
   - kind: span
     feature: no_wire_form
     cells:
@@ -4217,6 +4526,12 @@ rows:
           A span has no syslog form and isn't written: on an event with no log, the event is
           skipped, counted as `logit.output.events.skipped`; beside a log, it's left off,
           uncounted.
+      splunk_hec_out:
+        class: degraded
+        counter: logit.output.spans.degraded{reason=no_wire_form}
+        text: >-
+          The exporter's span object has no member for span flags, `trace_state`, or a dropped count,
+          so each is left off, counted once per span, and the span reads back without it.
   - kind: span
     feature: beside_metrics
     cells:
@@ -4256,6 +4571,9 @@ rows:
         text: >-
           A span has no syslog form, so it isn't written beside its event's metrics, which have none
           either.
+      splunk_hec_out:
+        class: exact
+        text: A span object after the event's metric objects, read back as an event of its own.
 
   # --- events with no metric, log, or span ------------------------------------------------------
   # `string_only` is an InfluxDB point whose fields are all strings, its measurement carrier
@@ -4299,6 +4617,10 @@ rows:
         class: skipped
         counter: logit.output.events.skipped
         text: An event with no log has no syslog form and isn't written.
+      splunk_hec_out:
+        class: skipped
+        counter: logit.output.events.skipped{reason=no_payload}
+        text: An event with no log, metric, or span has no HEC object and isn't sent.
   - kind: event
     feature: string_only
     cells:
@@ -4343,3 +4665,9 @@ rows:
         text: >-
           An InfluxDB point whose fields are all strings has no log, so it isn't written and its
           fields are lost.
+      splunk_hec_out:
+        class: skipped
+        counter: logit.output.events.skipped{reason=no_payload}
+        text: >-
+          An InfluxDB point whose fields are all strings has no log, metric, or span, so it isn't
+          sent and its fields are lost.

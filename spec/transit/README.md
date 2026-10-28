@@ -17,16 +17,19 @@ aren't written yet), `datadog_in`'s metrics routes and service checks (`cases/da
 logs and events (`cases/datadog-logs/`: the Agent's captures and hand-written `/api/v2/logs`
 bodies), with no APM cases yet, `collectd_in`, `otlp_in`'s metrics
 (`cases/otlp/`) and logs (`cases/otlp-logs/`), with no trace cases yet, `graphite_in`,
-plaintext and pickle, and `syslog_in`, RFC 3164 and RFC 5424 over UDP and as a TCP stream. A
+plaintext and pickle, `syslog_in`, RFC 3164 and RFC 5424 over UDP and as a TCP stream, and
+`splunk_hec_in`'s `/event` and `/raw` routes (`cases/splunk/`: the four recorded HEC clients'
+captures and hand-written bodies), with no metric cases. A
 source directory's name before its first `-` names its system, so
 `datadog-logs` cases decode through `datadog_in`. The sink columns are `statsd_out`,
 `prometheus_out` (exposition and remote-write), `influxdb_out`, `otlp_out`, `datadog_out`,
-`graphite_out`, and `syslog_out`, which has cells on the log, span, event, and attribute rows and
-none on a metric kind's. A log record's rows have cells at `otlp_out`, `datadog_out`,
-`syslog_out`, and, for a DogStatsD event, `statsd_out`. Each flow's name says which source meets
+`graphite_out`, `syslog_out`, and `splunk_hec_out`; the last two have cells on the log, span,
+event, and attribute rows and none on a metric kind's. A log record's rows have cells at
+`otlp_out`, `datadog_out`, `syslog_out`, `splunk_hec_out`, and, for a DogStatsD event,
+`statsd_out`. Each flow's name says which source meets
 which sink: `statsd-relay`, `influxdb-relay`, `datadog-relay`, `datadog-logs-relay`, `otlp-relay`,
-`otlp-logs-relay`, `graphite-relay`, `syslog-relay`, `prometheus-to-prometheus`, and
-`prometheus-to-prometheus-remote-write` are like pairs, and `influxdb-to-prometheus` a
+`otlp-logs-relay`, `graphite-relay`, `syslog-relay`, `splunk-relay`, `prometheus-to-prometheus`,
+and `prometheus-to-prometheus-remote-write` are like pairs, and `influxdb-to-prometheus` a
 cross-protocol one.
 
 `datadog_out` makes four drops above its encoders: `stale` and `too_many_tags`, which read the
@@ -168,9 +171,12 @@ counter would add anything
 rewritten name, is counted. The table's schema accepts `reason: uncounted`, the sink's behavior
 as it stands, only on the cells `crates/logit-cli/src/transit/mapping.rs`'s `UNCOUNTED_ALLOWED`
 names: span payloads, which aren't classified yet, log records at a sink other than `otlp_out`,
-`datadog_out`, `syslog_out`, and `statsd_out`; `datadog_out`'s carrier on a log; and
-`syslog_out`'s attribute rows, since it leaves every attribute outside its header fields off a
-log by one mechanism, and under `structured_data:` writes a `Bytes` one as its length.
+`datadog_out`, `syslog_out`, `splunk_hec_out`, and `statsd_out`; `datadog_out`'s carrier on a
+log; and `syslog_out`'s attribute rows, since it leaves every attribute outside its header fields
+off a log by one mechanism, and under `structured_data:` writes a `Bytes` one as its length. A
+`skipped` or `dropped` cell may name a counter beside `reason: uncounted` where the sink counts
+the loss on one path and not another: `syslog_out` counts a span-only event it skips and not a
+span it leaves off beside a log.
 When a sink's behavior depends on its config, the sink's entry is a list: each cell but the last
 has a `when:` map of config fields, the first that matches the flow's sink config applies, and
 the last applies otherwise:
@@ -284,6 +290,7 @@ Each sink column has two regions:
 | `doc:datadog_out` | `crates/logit-proto/src/datadog/mod.rs` | Every cell of the column |
 | `doc:graphite_out` | `crates/logit-proto/src/graphite/mod.rs` | Every cell of the column |
 | `doc:syslog_out` | `crates/logit-outputs/src/syslog.rs` | Every cell of the column |
+| `doc:splunk_hec_out` | `crates/logit-proto/src/splunk/mod.rs` | Every cell of the column |
 | `gaps:<sink>`, one per sink | `docs/known-gaps/mappings.md` | The column's `degraded`, `lost`, `skipped`, and `dropped` cells, in that file's row format |
 
 A region opens on a line ending `<!-- transit:doc:<sink> -->` or `<!-- transit:gaps:<sink> -->`
@@ -313,6 +320,9 @@ and a protocol name in `docs.rs`'s `PROTOCOLS`, or the check fails.
 1. Pick the source system's directory under `cases/`.
 2. For a case that starts on the wire, write the wire file (`<case>.statsd`, `<case>.lp`,
    `<case>.prom`, `<case>.bin`, `<case>.raw`, `<case>.graphite`, `<case>.pkl`, or `<case>.syslog`) and `<case>.meta.yaml` with `wire: <case>.statsd`.
+   A Splunk case's `.headers` gives the request's `path:`, its query string included, which picks
+   `/event` or `/raw` and, for `/raw`, the envelope, and its `content-encoding:`; the body decodes
+   through `splunk_hec_in`'s own request decoding.
    An InfluxDB case needs a `<case>.headers` beside its wire file whose `path:` names a `bucket` and an `org` or `orgID`,
    as `influxdb_in` requires; a Prometheus case reads text 0.0.4 unless its `.headers` gives an
    OpenMetrics `content-type:`. A Datadog case's `.headers` gives the request's `path:`, which

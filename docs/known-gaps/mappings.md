@@ -597,6 +597,7 @@ Entry format and the other areas: [the known-gaps index](README.md).
   | encode (syslog) | field `attributes/sd_name_unsafe` → **lost** | `logit.output.structured_data.omitted{reason=invalid_sd_name}` | Under `structured_data:`, an attribute key that isn't an RFC 5424 SD-NAME (1 to 32 printable ASCII characters, none of them `=`, space, `]`, or `"`) has no PARAM-NAME, so its PARAM is left off, counted. |
   | encode (syslog) | field `attributes/sd_empty_array` → **lost** | none (uncounted) | Under `structured_data:`, an empty array writes one PARAM per element, so none, and the attribute is left off, uncounted. |
   | encode (syslog) | field `attributes/host_name`, under `format: rfc3164` → **lost** | none (structural) | Under RFC 3164, a log with no `syslog.tag` has no TAG, so syslog_in reads its HOSTNAME as the first word of its message (the `log/header_in_message` row) and reads no `host.name` back. |
+  | encode (syslog) | field `attributes/splunk_envelope` → **lost** | none (structural) | Syslog has no resource and no field for Splunk's envelope, so it's left off. |
   | encode (syslog) | field `log/body_format` → **lost** | none (structural) | Syslog has no body format, so MSG reads back as `raw`. |
   | encode (syslog) | field `log/event_name` → **lost** | none (structural) | Syslog has no event name, so it's left off. |
   | encode (syslog) | field `log/observed_timestamp` → **lost** | none (structural) | Syslog has no observed timestamp, so it's left off. |
@@ -604,11 +605,41 @@ Entry format and the other areas: [the known-gaps index](README.md).
   | encode (syslog) | field `log/trace_flags` → **lost** | none (structural) | Syslog has no trace flags, so they're left off. |
   | encode (syslog) | field `log/dropped_attributes_count` → **lost** | none (structural) | Syslog has no dropped-attributes count, so it's left off. |
   | encode (syslog) | field `log/receipt_timestamp` → **lost** | none (structural) | A log whose `syslog.timestamp` is written as TIMESTAMP leaves its own timestamp, the receipt time, unwritten; syslog_in stamps its own receipt time. |
-  | encode (syslog) | `span/alone` → **skipped** | none (uncounted) | A span has no syslog form and isn't written: on an event with no log, the event is skipped, counted as `logit.output.events.skipped`; beside a log, it's left off, uncounted. |
+  | encode (syslog) | `span/alone` → **skipped** | `logit.output.events.skipped` | A span has no syslog form and isn't written: on an event with no log, the event is skipped, counted as `logit.output.events.skipped`; beside a log, it's left off, uncounted. |
   | encode (syslog) | `span/no_wire_form` → **skipped** | none (uncounted) | A span has no syslog form and isn't written: on an event with no log, the event is skipped, counted as `logit.output.events.skipped`; beside a log, it's left off, uncounted. |
   | encode (syslog) | field `span/beside_metrics` → **lost** | `logit.output.events.skipped` | A span has no syslog form, so it isn't written beside its event's metrics, which have none either. |
   | encode (syslog) | `event/attributes_only` → **skipped** | `logit.output.events.skipped` | An event with no log has no syslog form and isn't written. |
   | encode (syslog) | `event/string_only` → **skipped** | `logit.output.events.skipped` | An InfluxDB point whose fields are all strings has no log, so it isn't written and its fields are lost. |
+
+  <!-- transit:end -->
+
+  <!-- transit:gaps:splunk_hec_out -->
+
+  | Direction | Mapping | Counter | Why |
+  |---|---|---|---|
+  | encode (Splunk) | field `attributes/private_carrier` → **lost** | none (structural) | A `_logit.` carrier or flag is private and isn't a HEC field, so it's left off. |
+  | encode (Splunk) | field `attributes/prometheus_target` → **lost** | none (structural) | The scrape target is private and isn't a HEC field, so it's left off. |
+  | encode (Splunk) | field `attributes/foreign_carrier` → **lost** | none (structural) | Another protocol's `_logit.` carrier is private and isn't a HEC field, so it's left off. |
+  | encode (Splunk) | field `attributes/timestamped` → **lost** | none (structural) | The flag is private and isn't a HEC field, so it's left off. `time` carries the timestamp. |
+  | encode (Splunk) | field `attributes/rate` → **lost** | none (structural) | The flag is private and isn't a HEC field, so it's left off. |
+  | encode (Splunk) | field `attributes/interval` → **lost** | none (structural) | The flag is private and isn't a HEC field, so it's left off. |
+  | encode (Splunk) | field `attributes/rate_on_non_gauge` → **lost** | none (structural) | The flag is private and isn't a HEC field, so it's left off. |
+  | encode (Splunk) | field `attributes/family_type` → **lost** | none (structural) | The flag is private and isn't a HEC field, so it's left off. |
+  | encode (Splunk) | field `attributes/family_type_on_other_kind` → **lost** | none (structural) | The flag is private and isn't a HEC field, so it's left off. |
+  | encode (Splunk) | field `attributes/interval_on_distribution` → **lost** | none (structural) | The flag is private and isn't a HEC field, so it's left off. |
+  | encode (Splunk) | field `attributes/interval_on_histogram` → **lost** | none (structural) | The flag is private and isn't a HEC field, so it's left off. |
+  | encode (Splunk) | field `attributes/scope` → **lost** | none (structural) | HEC has no instrumentation scope, so none is written. |
+  | encode (Splunk) | field `attributes/datadog_carrier_log` → **lost** | none (structural) | A `_logit.` carrier is private and isn't a HEC field, so it's left off. |
+  | encode (Splunk) | field `attributes/severity_carrier_otel` → **lost** | none (structural) | A `_logit.` carrier is private and isn't a HEC field, so it's left off and the severity reads back at band resolution. |
+  | encode (Splunk) | field `attributes/severity_carrier_syslog` → **lost** | none (structural) | A `_logit.` carrier is private and isn't a HEC field, so it's left off and the severity reads back at band resolution. |
+  | encode (Splunk) | `log/blank_message` → **dropped** | `logit.output.events.dropped{reason=blank_event}` | A log whose message is empty, null, or a non-finite number isn't written, since HEC rejects a whole request holding a blank `event`; the rest of the batch is sent. |
+  | encode (Splunk) | field `log/body_format` → **lost** | none (structural) | HEC has no body format, so splunk_hec_in reads `json` for an object or array `event` and `raw` for any other: a `structured` message reads back as `json`, and a string message's `json` format as `raw`. |
+  | encode (Splunk) | field `log/observed_timestamp` → **lost** | none (structural) | HEC has no observed time, so it's left off. |
+  | encode (Splunk) | field `log/dropped_attributes_count` → **lost** | none (structural) | HEC has no dropped count, so it's left off. |
+  | encode (Splunk) | field `log/beside_metrics` → **lost** | `logit.output.events.dropped{reason=blank_event}` | The log is its own HEC object before the event's metric objects, read back as an event of its own; a blank one is dropped and counted, as the `log/blank_message` row says. |
+  | encode (Splunk) | `span/no_wire_form` → **degraded** | `logit.output.spans.degraded{reason=no_wire_form}` | The exporter's span object has no member for span flags, `trace_state`, or a dropped count, so each is left off, counted once per span, and the span reads back without it. |
+  | encode (Splunk) | `event/attributes_only` → **skipped** | `logit.output.events.skipped{reason=no_payload}` | An event with no log, metric, or span has no HEC object and isn't sent. |
+  | encode (Splunk) | `event/string_only` → **skipped** | `logit.output.events.skipped{reason=no_payload}` | An InfluxDB point whose fields are all strings has no log, metric, or span, so it isn't sent and its fields are lost. |
 
   <!-- transit:end -->
 

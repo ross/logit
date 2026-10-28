@@ -1,0 +1,3 @@
+method: POST
+path: /services/collector/raw?host=web%201&source=%2Fvar%2Flog%2Fapp.log&sourcetype=app%3Alog&index=main&channel=abc
+content-type: text/plain

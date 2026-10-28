@@ -1,0 +1,5 @@
+{"timestamp":"2026-09-21T14:13:20.000000000Z","log":{"format":"raw","message":"integer"}}
+{"timestamp":"2026-09-21T14:13:20.123456789Z","log":{"format":"raw","message":"nine decimals"}}
+{"timestamp":"2026-09-21T14:13:20.500000000Z","log":{"format":"raw","message":"string"}}
+{"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"format":"raw","message":"absent"}}
+{"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"format":"raw","message":"bad"}}

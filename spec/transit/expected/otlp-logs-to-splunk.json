@@ -1,0 +1,51 @@
+{
+  "beside-metrics": {"events": [
+    {"timestamp":"2027-01-15T08:00:04.000000000Z","log":{"severity":"warn","format":"raw","message":"queue depth high"},"attributes":{"hostname":"web-1","otel.log.severity.number":13,"otel.log.severity.text":"Warn","queue":"orders","service":"orders-api","service.name":"orders"},"resource":{"attributes":{"host.name":"transit"}}},
+    {"timestamp":"2027-01-15T08:00:04.000000000Z","metrics":[{"name":"queue.depth","kind":"gauge","value":17.0}],"attributes":{"hostname":"web-1","queue":"orders","service":"orders-api","service.name":"orders"},"resource":{"attributes":{"host.name":"transit"}}},
+    {"timestamp":"2027-01-15T08:00:04.001000000Z","log":{"severity":"info","format":"json","message":{"queue":"orders","depth":17}},"attributes":{"otel.log.severity.number":9,"otel.log.severity.text":"Info","queue":"payments"},"resource":{"attributes":{"host.name":"transit"}}},
+    {"timestamp":"2027-01-15T08:00:04.001000000Z","metrics":[{"name":"queue.depth","kind":"gauge","value":18.0}],"attributes":{"queue":"payments"},"resource":{"attributes":{"host.name":"transit"}}},
+    {"timestamp":"2027-01-15T08:00:04.002000000Z","log":{"severity":"info","format":"raw","message":"caf�"},"attributes":{"otel.log.severity.number":9,"otel.log.severity.text":"Info","queue":"refunds"},"resource":{"attributes":{"host.name":"transit"}}},
+    {"timestamp":"2027-01-15T08:00:04.002000000Z","metrics":[{"name":"queue.depth","kind":"gauge","value":19.0}],"attributes":{"queue":"refunds"},"resource":{"attributes":{"host.name":"transit"}}},
+    {"timestamp":"2027-01-15T08:00:04.003000000Z","metrics":[{"name":"queue.depth","kind":"gauge","value":20.0}],"attributes":{"queue":"returns"},"resource":{"attributes":{"host.name":"transit"}}}
+  ], "counters": {
+    "logit.output.events.dropped{component=out,kind=splunk_hec_out,reason=blank_event,role=sink}": 1
+  }},
+  "bodies": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"severity":"info","format":"raw","message":"a plain line"},"attributes":{"body":"string","otel.log.severity.number":9,"otel.log.severity.text":"Info"},"resource":{"attributes":{"host.name":"transit"}}},
+    {"timestamp":"2027-01-15T08:00:00.001000000Z","log":{"severity":"info","format":"raw","message":42},"attributes":{"body":"int","otel.log.severity.number":9,"otel.log.severity.text":"Info"},"resource":{"attributes":{"host.name":"transit"}}},
+    {"timestamp":"2027-01-15T08:00:00.002000000Z","log":{"severity":"info","format":"raw","message":2.5},"attributes":{"body":"double","otel.log.severity.number":9,"otel.log.severity.text":"Info"},"resource":{"attributes":{"host.name":"transit"}}},
+    {"timestamp":"2027-01-15T08:00:00.003000000Z","log":{"severity":"info","format":"raw","message":true},"attributes":{"body":"bool","otel.log.severity.number":9,"otel.log.severity.text":"Info"},"resource":{"attributes":{"host.name":"transit"}}},
+    {"timestamp":"2027-01-15T08:00:00.004000000Z","log":{"severity":"info","format":"raw","message":"caf�"},"attributes":{"body":"bytes","otel.log.severity.number":9,"otel.log.severity.text":"Info"},"resource":{"attributes":{"host.name":"transit"}}},
+    {"timestamp":"2027-01-15T08:00:00.005000000Z","log":{"severity":"info","format":"json","message":{"attempts":3,"user":"ada"}},"attributes":{"body":"map","otel.log.severity.number":9,"otel.log.severity.text":"Info"},"resource":{"attributes":{"host.name":"transit"}}},
+    {"timestamp":"2027-01-15T08:00:00.006000000Z","log":{"severity":"info","format":"json","message":["checkout",7]},"attributes":{"body":"array","otel.log.severity.number":9,"otel.log.severity.text":"Info"},"resource":{"attributes":{"host.name":"transit"}}},
+    {"timestamp":"2027-01-15T08:00:00.009000000Z","log":{"severity":"info","format":"raw","message":"{\"level\":\"info\",\"msg\":\"started\"}"},"attributes":{"body":"json_text","otel.log.severity.number":9,"otel.log.severity.text":"Info"},"resource":{"attributes":{"host.name":"transit"}}}
+  ], "counters": {
+    "logit.output.events.dropped{component=out,kind=splunk_hec_out,reason=blank_event,role=sink}": 2
+  }},
+  "fields": {"events": [
+    {"timestamp":"2027-01-15T08:00:03.000000000Z","log":{"severity":"info","format":"raw","message":"observed later"},"attributes":{"big":18446744073709551615,"flag":true,"labels":["a",1],"nested.k":"v","otel.log.severity.number":9,"otel.log.severity.text":"Info","raw":"Y2Fm6Q==","seen":"2027-01-15T07:59:00.000000000Z","service.name":"checkout"},"resource":{"attributes":{"host.name":"transit"}},"types":{"/attributes/big":"u64"}},
+    {"timestamp":"2027-01-15T08:00:03.000500000Z","log":{"severity":"info","format":"raw","message":"<13>Jan 15 07:59:59 host app: relayed"},"attributes":{"otel.log.severity.number":9,"otel.log.severity.text":"Info","service.name":"checkout","syslog.timestamp":"2027-01-15T07:59:59.000000000Z"},"resource":{"attributes":{"host.name":"transit"}}}
+  ], "counters": {}},
+  "severity": {"events": [
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","log":{"severity":"trace","format":"raw","message":"trace band"},"attributes":{"otel.log.severity.number":1,"otel.log.severity.text":"Trace"},"resource":{"attributes":{"host.name":"transit"}}},
+    {"timestamp":"2027-01-15T08:00:01.001000000Z","log":{"severity":"debug","format":"raw","message":"debug band"},"attributes":{"otel.log.severity.number":5,"otel.log.severity.text":"Debug"},"resource":{"attributes":{"host.name":"transit"}}},
+    {"timestamp":"2027-01-15T08:00:01.002000000Z","log":{"severity":"info","format":"raw","message":"info band"},"attributes":{"otel.log.severity.number":9,"otel.log.severity.text":"Info"},"resource":{"attributes":{"host.name":"transit"}}},
+    {"timestamp":"2027-01-15T08:00:01.003000000Z","log":{"severity":"warn","format":"raw","message":"warn band"},"attributes":{"otel.log.severity.number":13,"otel.log.severity.text":"Warn"},"resource":{"attributes":{"host.name":"transit"}}},
+    {"timestamp":"2027-01-15T08:00:01.004000000Z","log":{"severity":"error","format":"raw","message":"error band"},"attributes":{"otel.log.severity.number":17,"otel.log.severity.text":"Error"},"resource":{"attributes":{"host.name":"transit"}}},
+    {"timestamp":"2027-01-15T08:00:01.005000000Z","log":{"severity":"fatal","format":"raw","message":"fatal band"},"attributes":{"otel.log.severity.number":21,"otel.log.severity.text":"Fatal"},"resource":{"attributes":{"host.name":"transit"}}},
+    {"timestamp":"2027-01-15T08:00:01.006000000Z","log":{"format":"raw","message":"no severity"},"resource":{"attributes":{"host.name":"transit"}}},
+    {"timestamp":"2027-01-15T08:00:01.007000000Z","log":{"severity":"info","format":"raw","message":"INFO2 from the wire"},"attributes":{"otel.log.severity.number":9,"otel.log.severity.text":"Info"},"resource":{"attributes":{"host.name":"transit"}}},
+    {"timestamp":"2027-01-15T08:00:01.008000000Z","log":{"severity":"warn","format":"raw","message":"a number only"},"attributes":{"otel.log.severity.number":13,"otel.log.severity.text":"Warn"},"resource":{"attributes":{"host.name":"transit"}}}
+  ], "counters": {}},
+  "telemetrygen": {"events": [
+    {"timestamp":"2026-09-10T21:22:17.985247299Z","log":{"severity":"info","format":"raw","message":"the message"},"attributes":{"app":"server","otel.log.severity.number":9,"otel.log.severity.text":"Info","service.name":"telemetrygen"},"resource":{"attributes":{"host.name":"transit"}}},
+    {"timestamp":"2026-09-10T21:22:17.985276594Z","log":{"severity":"info","format":"raw","message":"the message"},"attributes":{"app":"server","otel.log.severity.number":9,"otel.log.severity.text":"Info","service.name":"telemetrygen"},"resource":{"attributes":{"host.name":"transit"}}},
+    {"timestamp":"2026-09-10T21:22:18.985695167Z","log":{"severity":"info","format":"raw","message":"the message"},"attributes":{"app":"server","otel.log.severity.number":9,"otel.log.severity.text":"Info","service.name":"telemetrygen"},"resource":{"attributes":{"host.name":"transit"}}}
+  ], "counters": {}},
+  "trace": {"events": [
+    {"timestamp":"2027-01-15T08:00:02.000000000Z","log":{"severity":"info","format":"raw","message":"checkout completed","event_name":"checkout.completed","trace_id":"5b8efff798038103d269b633813fc60c","span_id":"eee19b7ec3c1b174","trace_flags":0},"attributes":{"otel.log.severity.number":9,"otel.log.severity.text":"Info"},"resource":{"attributes":{"host.name":"transit"}}},
+    {"timestamp":"2027-01-15T08:00:02.001000000Z","log":{"severity":"info","format":"raw","message":"no span id","trace_id":"5b8efff798038103d269b633813fc60d","trace_flags":0},"attributes":{"otel.log.severity.number":9,"otel.log.severity.text":"Info"},"resource":{"attributes":{"host.name":"transit"}}},
+    {"timestamp":"2027-01-15T08:00:02.002000000Z","log":{"severity":"info","format":"raw","message":"beside its span"},"attributes":{"otel.log.severity.number":9,"otel.log.severity.text":"Info"},"resource":{"attributes":{"host.name":"transit"}}},
+    {"timestamp":"2027-01-15T08:00:02.002000000Z","span":{"name":"GET /cart","trace_id":"5b8efff798038103d269b633813fc60e","span_id":"eee19b7ec3c1b175","kind":"internal","status":"unset","start":"2027-01-15T08:00:02.002000000Z","end":"2027-01-15T08:00:02.012000000Z","duration_ns":10000000},"resource":{"attributes":{"host.name":"transit"}}}
+  ], "counters": {}}
+}

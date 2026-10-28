@@ -141,9 +141,11 @@
 //! | `attributes/syslog_sd` | exact | -- | A key-value list attribute. |
 //! | `attributes/syslog_timestamp` | normalized | `timestamp_as_int` | An RFC 3164 timestamp is a string attribute; OTLP has no timestamp value, so an RFC 5424 one is an integer of Unix nanoseconds. |
 //! | `attributes/host_name` | exact | -- | A string attribute. |
+//! | `attributes/splunk_envelope` | exact | -- | A resource attribute. |
 //! | `attributes/syslog_facility` | exact | -- | A log with no `syslog.facility` leaves with none. |
 //! | `attributes/no_host` | exact | -- | A record with no host leaves with none. |
 //! | `attributes/log_status` | exact | -- | The severity is the `LogRecord`'s own; no `status` attribute is written. |
+//! | `attributes/log_severity_fields` | exact | -- | The severity is the `LogRecord`'s own; no `otel.log.severity.*` attribute is written. |
 //! | `attributes/span_kind` | exact | -- | The kind is the `Span`'s own; no `span.kind` attribute is written. |
 //! | `attributes/trace_id_high` | exact | -- | The 128-bit trace id is the `Span`'s own; no `_dd.p.tid` attribute is written. |
 //! | `log/severity` | exact | -- | The band's `severity_number` and text, or the raw ones the `_logit.otel.severity_*` carriers hold, read back at band resolution. |

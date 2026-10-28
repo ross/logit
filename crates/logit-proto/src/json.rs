@@ -145,7 +145,7 @@ pub(crate) const FLATTEN_MAX_DEPTH: usize = 32;
 /// than stringifying it, and writes a depth-capped map back whole rather than as text. A key
 /// collision is last write wins, as in `flatten`: `out` is an [`AttrMap`], so a later insert
 /// overwrites.
-pub(crate) fn flatten_into(prefix: &str, value: &Value, out: &mut AttrMap) {
+pub fn flatten_into(prefix: &str, value: &Value, out: &mut AttrMap) {
     let mut path = String::from(prefix);
     flatten_at(&mut path, value, out, 0);
 }

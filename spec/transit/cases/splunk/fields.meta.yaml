@@ -1,0 +1,6 @@
+# A hand-written /event body: `fields` holding nested objects, flattened to dotted keys, an
+# array holding an object, an empty object, a scalar array, and each scalar type; a `fields`
+# `host.name` beside the envelope `host`; and a `fields` that isn't an object, ignored and
+# counted `events.degraded{reason=bad_fields}`.
+wire: fields.bin
+exercises: [event_route, string_event, fields, fields_nested, fields_array, fields_host_name, fields_not_object, time_integer, envelope_partial, envelope_absent]

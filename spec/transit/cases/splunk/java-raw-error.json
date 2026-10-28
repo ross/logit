@@ -1,0 +1,1 @@
+{"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"format":"raw","message":"ERROR splunk-java-fixture splunk-java fixture: request failed"},"resource":{"attributes":{"com.splunk.index":"main","com.splunk.source":"java:logback","com.splunk.sourcetype":"java:raw","host.name":"splunk-java-fixture"}}}

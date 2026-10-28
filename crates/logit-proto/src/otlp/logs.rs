@@ -59,7 +59,7 @@ use crate::otlp::generated::opentelemetry::proto::logs::v1 as pb;
 use logit_core::interner::{intern, resolve};
 use logit_core::{AttrMap, BodyFormat, Event, LogRecord, Severity, TraceRef, Value};
 
-pub(crate) fn severity_number(sev: Severity) -> i32 {
+pub fn severity_number(sev: Severity) -> i32 {
     let n = match sev {
         Severity::Trace => pb::SeverityNumber::Trace,
         Severity::Debug => pb::SeverityNumber::Debug,
@@ -73,7 +73,7 @@ pub(crate) fn severity_number(sev: Severity) -> i32 {
 
 /// The `severity_text` encode writes: the variant's name, matching the `{:?}` convention for tag
 /// values elsewhere.
-pub(crate) fn severity_text(sev: Severity) -> &'static str {
+pub fn severity_text(sev: Severity) -> &'static str {
     match sev {
         Severity::Trace => "Trace",
         Severity::Debug => "Debug",

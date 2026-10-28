@@ -1,0 +1,4 @@
+# A hand-written /event body whose objects name two hosts, interleaved, decoded to one batch
+# per envelope in first-appearance order.
+wire: two-envelopes.bin
+exercises: [event_route, string_event, time_integer, envelope_partial, two_envelopes]

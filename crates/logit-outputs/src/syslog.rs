@@ -168,7 +168,7 @@
 //! | `log/bytes_message` | exact | -- | A `Bytes` message is written as its bytes, escaped as a string's are, and reads back as `Bytes`; one that's valid UTF-8 reads back as a string (the `log/message_unsafe` row). |
 //! | `log/blank_message` | exact | -- | A log with an empty message or none leaves with an empty MSG, which syslog_in reads back as an empty string. |
 //! | `log/header_in_message` | normalized | `header_in_message` | Under RFC 3164, a log with no `syslog.tag` reads back with its HOSTNAME at the front of its message, and a message whose first word is TAG-shaped reads back with that word as `syslog.tag`; syslog_in decides where the header ends by its first two words. |
-//! | `span/alone` | skipped | uncounted | A span has no syslog form and isn't written: on an event with no log, the event is skipped, counted as `logit.output.events.skipped`; beside a log, it's left off, uncounted. |
+//! | `span/alone` | skipped | uncounted; `logit.output.events.skipped` | A span has no syslog form and isn't written: on an event with no log, the event is skipped, counted as `logit.output.events.skipped`; beside a log, it's left off, uncounted. |
 //! | `span/no_wire_form` | skipped | uncounted | A span has no syslog form and isn't written: on an event with no log, the event is skipped, counted as `logit.output.events.skipped`; beside a log, it's left off, uncounted. |
 //! | `event/attributes_only` | skipped | `logit.output.events.skipped` | An event with no log has no syslog form and isn't written. |
 //! | `event/string_only` | skipped | `logit.output.events.skipped` | An InfluxDB point whose fields are all strings has no log, so it isn't written and its fields are lost. |
@@ -255,10 +255,12 @@
 //! | `attributes/sd_empty_array` | lost | uncounted | Under `structured_data:`, an empty array writes one PARAM per element, so none, and the attribute is left off, uncounted. |
 //! | `attributes/host_name`, under `format: rfc3164` | lost | structural | Under RFC 3164, a log with no `syslog.tag` has no TAG, so syslog_in reads its HOSTNAME as the first word of its message (the `log/header_in_message` row) and reads no `host.name` back. |
 //! | `attributes/host_name`, otherwise | exact | -- | HOSTNAME. |
+//! | `attributes/splunk_envelope` | lost | structural | Syslog has no resource and no field for Splunk's envelope, so it's left off. |
 //! | `attributes/syslog_facility` | normalized | `default_facility` | A log with no `syslog.facility` leaves with the sink's `facility:`, `local0` by default, as PRI's facility, which syslog_in reads back as `syslog.facility`. |
 //! | `attributes/no_host`, under `format: rfc3164` | exact | -- | Under RFC 3164, a log with no host and no `syslog.tag` has no TAG, so syslog_in reads the default HOSTNAME as the first word of its message (the `log/header_in_message` row) and reads no `host.name` back. A log with a `syslog.tag` and no host reads back the default HOSTNAME as `host.name`, as under RFC 5424, and no case reaches it. |
 //! | `attributes/no_host`, otherwise | normalized | `default_host` | A log with no host leaves with the sink's `hostname:`, else the process hostname, as HOSTNAME, which syslog_in reads back as `host.name`. |
 //! | `attributes/log_status` | exact | -- | The severity is PRI's; no `status` attribute is written. |
+//! | `attributes/log_severity_fields` | exact | -- | The severity is PRI's; no `otel.log.severity.*` attribute is written. |
 //! | `attributes/span_kind` | exact | -- | A span isn't written, so no `span.kind` attribute is. |
 //! | `attributes/trace_id_high` | exact | -- | A span isn't written, so no `_dd.p.tid` attribute is. |
 //! | `log/severity` | normalized | `severity_band` | PRI's severity: a `_logit.syslog.severity` carrier's value, else the band's syslog severity, which syslog_in reads back at syslog's resolution, so `trace` reads back as `debug`. |

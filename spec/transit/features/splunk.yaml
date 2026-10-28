@@ -1,0 +1,89 @@
+# The Splunk HTTP Event Collector (HEC) features a case under cases/splunk/ can exercise, from
+# crates/logit-proto/src/splunk/'s decode tables and crates/logit-inputs/src/splunk.rs's routes. A
+# case names the ones it exercises in its `.meta.yaml`. HEC metric events aren't cases: a log
+# directory never routes a metric into a log sink.
+- name: event_route
+  text: >-
+    A `/services/collector` or `/services/collector/event[/1.0]` body of concatenated JSON
+    objects, one batch per distinct envelope.
+- name: array_body
+  text: A `/event` body sent as one JSON array of objects.
+- name: raw_route
+  text: >-
+    A `/services/collector/raw[/1.0]` body, one `Str` log per LF-delimited line, a trailing CR
+    stripped and an empty line skipped, each stamped with the receipt time.
+- name: query_envelope
+  text: >-
+    A `/raw` request's `host`, `source`, `sourcetype`, and `index` from its query string,
+    percent-decoded, as the batch's resource.
+- name: gzip
+  text: A body sent with `Content-Encoding` `gzip`, decompressed first.
+- name: string_event
+  text: A string `event`, decoded to a `Str` message with body format `raw`.
+- name: object_event
+  text: An object `event` that isn't a span, decoded to a `Map` message with body format `json`.
+- name: array_event
+  text: An array `event`, decoded to an `Array` message with body format `json`.
+- name: scalar_event
+  text: A number or bool `event`, decoded to a typed message with body format `raw`.
+- name: span_event
+  text: >-
+    An `event` object carrying `trace_id`, `span_id`, `start_time`, and `end_time`, the
+    exporter's span object, decoded to a span.
+- name: fields
+  text: A `fields` object, decoded to event attributes.
+- name: fields_nested
+  text: >-
+    An object inside `fields`, flattened to dotted keys, and an empty one, dropped.
+- name: fields_array
+  text: >-
+    An array in `fields`: of scalars kept as an array, holding an object kept as its JSON text.
+- name: fields_host_name
+  text: >-
+    A `fields` `host.name` beside the envelope's `host`, kept as an event attribute.
+- name: fields_not_object
+  text: >-
+    A `fields` that isn't an object, ignored and counted
+    `logit.input.events.degraded{reason=bad_fields}`.
+- name: envelope
+  text: >-
+    All four carriers, `host`, `source`, `sourcetype`, and `index`, decoded to the resource's
+    `host.name` and `com.splunk.*`.
+- name: envelope_partial
+  text: An object carrying some carriers and not others, or a `null` one, read as absent.
+- name: envelope_absent
+  text: An object carrying no carrier, decoded under an empty resource.
+- name: envelope_non_string
+  text: >-
+    A carrier that isn't a string, kept as its JSON text and counted
+    `logit.input.events.degraded{reason=non_string_envelope}`.
+- name: unknown_envelope_key
+  text: >-
+    An envelope key HEC doesn't define, dropped and counted
+    `logit.input.events.degraded{reason=unknown_envelope_key}`.
+- name: two_envelopes
+  text: A body whose objects name different envelopes, decoded to one batch per resource.
+- name: time_integer
+  text: An integer `time` in seconds.
+- name: time_fractional
+  text: A fractional `time`, every digit kept, nine decimals included.
+- name: time_string
+  text: A `time` sent as a string holding a number.
+- name: time_absent
+  text: An object with no `time`, stamped with the receipt time.
+- name: time_bad
+  text: >-
+    A `time` that isn't a number or a string holding one, stamped with the receipt time and
+    counted `logit.input.events.degraded{reason=bad_time}`.
+- name: otel_severity
+  text: >-
+    The exporter's `otel.log.severity.number` and/or `.text`, decoded to the log's severity by
+    OTLP's band rule and kept as attributes.
+- name: otel_log_name
+  text: The exporter's `otel.log.name`, decoded to the log's event name and consumed.
+- name: trace_ids
+  text: >-
+    Valid `trace_id` and `span_id` fields, in either case, or a `trace_id` alone, decoded to the
+    log's trace with flags 0 and consumed.
+- name: trace_ids_invalid
+  text: A `trace_id` or `span_id` that doesn't parse, so both stay attributes and no trace is set.

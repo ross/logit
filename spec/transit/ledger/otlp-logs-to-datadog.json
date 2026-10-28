@@ -5,6 +5,7 @@
     {"sink":"datadog_out","row":"attributes/bytes_value","cell":0,"observed":["normalized"]},
     {"sink":"datadog_out","row":"attributes/hostname","cell":0,"observed":["lost"]},
     {"sink":"datadog_out","row":"attributes/log_service","cell":0,"observed":["lost"]},
+    {"sink":"datadog_out","row":"attributes/log_severity_fields","cell":0,"observed":["exact"]},
     {"sink":"datadog_out","row":"attributes/log_status","cell":0,"observed":["normalized"]},
     {"sink":"datadog_out","row":"attributes/map_value","cell":0,"observed":["exact"]},
     {"sink":"datadog_out","row":"attributes/no_host","cell":0,"observed":["normalized"]},

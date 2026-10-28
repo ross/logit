@@ -349,6 +349,7 @@
 //! | `attributes/host_name` | exact | -- | A DogStatsD event's `h:` field, read back as `host.name`. |
 //! | `attributes/syslog_facility` | exact | -- | A log with no `syslog.facility` leaves with none. |
 //! | `attributes/no_host` | exact | -- | A record with no host leaves with none. |
+//! | `attributes/log_severity_fields` | exact | -- | No `otel.log.severity.*` attribute is written. |
 //! | `log/severity` | exact | -- | A DogStatsD event's `\|t:` alert type, written from its `_logit.statsd.event.alert_type` carrier, which statsd_in reads back as the severity. |
 //! | `log/severity_unset` | exact | -- | A DogStatsD event with no alert type, read back as no severity. |
 //! | `log/body_format` | exact | -- | A DogStatsD event's text, read back as a `raw` message. |

@@ -1,0 +1,5 @@
+# An RFC 5424 line with structured data relayed by SC4S: `event` the message after the header,
+# `fields` with `sc4s_syslog_severity` and `sc4s_syslog_facility`.
+# Read in place from testdata/interop/splunk/ with its .headers.
+wire: ../../../../testdata/interop/splunk/sc4s-services-collector-event-004.bin
+exercises: [event_route, string_event, fields, envelope, time_string]

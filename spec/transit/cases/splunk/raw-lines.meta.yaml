@@ -1,0 +1,4 @@
+# A hand-written /raw body of three lines, one CRLF-terminated and one empty line between, with
+# a percent-encoded envelope and a channel in the query string.
+wire: raw-lines.bin
+exercises: [raw_route, query_envelope]

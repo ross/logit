@@ -5,6 +5,7 @@
     {"sink":"syslog_out","row":"attributes/bytes_value","cell":2,"observed":["lost"]},
     {"sink":"syslog_out","row":"attributes/hostname","cell":2,"observed":["lost"]},
     {"sink":"syslog_out","row":"attributes/log_service","cell":2,"observed":["lost"]},
+    {"sink":"syslog_out","row":"attributes/log_severity_fields","cell":0,"observed":["exact"]},
     {"sink":"syslog_out","row":"attributes/log_status","cell":0,"observed":["exact"]},
     {"sink":"syslog_out","row":"attributes/map_value","cell":2,"observed":["lost"]},
     {"sink":"syslog_out","row":"attributes/no_host","cell":1,"observed":["normalized"]},

@@ -13,8 +13,8 @@
 //! | `samples`, `set_members`, `distribution`, `set` | none | record |
 //! | `record` | `no_recorded_value`, `no_recorded_value_delta_sum`, `no_recorded_value_other_kind`, `service_check`, `name_unsafe`, `exemplar_key_unsafe`, `exemplar_key_unsafe_histogram`, `sample_rate`, `non_finite`, `superseded`, `same_instant`, `same_instant_equal`, `same_millisecond`, `same_millisecond_equal` | record |
 //! | `record` | `unit`, `description`, `start_timestamp`, `exemplars`, `exemplars_on_summary`, `unit_on_distribution`, `min_max`, `sample_rate_unweighted` | field |
-//! | `attributes` | `string_value`, `bool_value`, `number_value`, `array_value`, `map_value`, `bytes_value`, `timestamp_value`, `null_value`, `private_carrier`, `prometheus_target` (`_logit.prometheus.target`, at every sink), `foreign_carrier`, `timestamped` (`_logit.metrics.closed: "timestamped"`, at every sink), `rate` and `rate_on_non_gauge` (`_logit.metrics.type: "rate"` on a gauge and on any other metric kind, at every sink), `family_type` and `family_type_on_other_kind` (`_logit.metrics.type: "info"` or `"stateset"` on a gauge and `"gaugehistogram"` on a histogram, and any of the three on another metric kind, at every sink), `interval`, `interval_on_distribution`, and `interval_on_histogram` (`_logit.metrics.interval` on a metric record, on a `samples`, `distribution`, or delta `exponential_histogram`, and on a delta `histogram`, at every sink), `datadog_carrier_log`, `severity_carrier_otel` (`_logit.otel.severity_number` and `_logit.otel.severity_text`, ahead of the private and foreign carrier rows), `severity_carrier_syslog` (`_logit.syslog.severity`, beside it), `syslog_header`, `syslog_msgid`, `syslog_sd`, `syslog_timestamp`, `host_name` (a log's event attribute `syslog_out` writes as a header field, by key), `sd_id_collision`, `sd_name_unsafe`, and `sd_empty_array` (a log's attribute `syslog_out`'s `structured_data:` leaves out of its SD-ELEMENT), `resource_attribute`, `scope` | field |
-//! | `attributes` | `no_host`, `log_status`, `span_kind`, `trace_id_high`, `syslog_facility` (a record `datadog_out` or `syslog_out` writes an attribute for from the record's own fields or the sink's config) | field |
+//! | `attributes` | `string_value`, `bool_value`, `number_value`, `array_value`, `map_value`, `bytes_value`, `timestamp_value`, `null_value`, `private_carrier`, `prometheus_target` (`_logit.prometheus.target`, at every sink), `foreign_carrier`, `timestamped` (`_logit.metrics.closed: "timestamped"`, at every sink), `rate` and `rate_on_non_gauge` (`_logit.metrics.type: "rate"` on a gauge and on any other metric kind, at every sink), `family_type` and `family_type_on_other_kind` (`_logit.metrics.type: "info"` or `"stateset"` on a gauge and `"gaugehistogram"` on a histogram, and any of the three on another metric kind, at every sink), `interval`, `interval_on_distribution`, and `interval_on_histogram` (`_logit.metrics.interval` on a metric record, on a `samples`, `distribution`, or delta `exponential_histogram`, and on a delta `histogram`, at every sink), `datadog_carrier_log`, `severity_carrier_otel` (`_logit.otel.severity_number` and `_logit.otel.severity_text`, ahead of the private and foreign carrier rows), `severity_carrier_syslog` (`_logit.syslog.severity`, beside it), `syslog_header`, `syslog_msgid`, `syslog_sd`, `syslog_timestamp`, `host_name` (a log's event attribute `syslog_out` writes as a header field, by key), `splunk_envelope` (a `com.splunk.` resource attribute, the HEC envelope), `sd_id_collision`, `sd_name_unsafe`, and `sd_empty_array` (a log's attribute `syslog_out`'s `structured_data:` leaves out of its SD-ELEMENT), `resource_attribute`, `scope` | field |
+//! | `attributes` | `no_host`, `log_status`, `log_severity_fields`, `span_kind`, `trace_id_high`, `syslog_facility` (a record `datadog_out`, `syslog_out`, or `splunk_hec_out` writes an attribute for from the record's own fields or the sink's config) | field |
 //! | `log` | `dogstatsd_event`, `plain` (each on an event with no metrics), `message_unsafe` (a message the sink's encoder rewrites), `structured_message` (a `Map` or `Array` message), `bytes_message`, `blank_message` (an empty message, or none), `header_in_message` (a log RFC 3164's header rule reads back with a header token in its message) | record |
 //! | `log` | `severity`, `severity_unset`, `body_format`, `event_name`, `observed_timestamp`, `observed_timestamp_unset`, `trace`, `trace_unset`, `trace_flags`, `dropped_attributes_count`, `timestamp`, `receipt_timestamp` (a field of any log, beside metrics or not, [`LOG_FIELDS`]) | field |
 //! | `span` | `alone` (on an event with no metrics); `no_wire_form` (one of those carrying a field a Datadog span has no form for) | record |
@@ -81,7 +81,9 @@
 //!   record; a record written as another kind or shape names its counter (ADR
 //!   `telemetry-loss-vocabulary`'s amendment "structural loss has no counter"). `uncounted`, a
 //!   loss the sink doesn't count yet, is accepted only on a cell [`UNCOUNTED_ALLOWED`] names, and
-//!   the class check accepts it for a record nothing reads back.
+//!   the class check accepts it for a record nothing reads back. A `skipped` or `dropped` cell may
+//!   name both, where the sink counts the loss on one path and not on another: `syslog_out`'s
+//!   `span/alone` counts a span-only event it skips and not a span it leaves off beside a log.
 
 use anyhow::{bail, ensure, Context};
 use serde::{Deserialize, Serialize};
@@ -91,7 +93,7 @@ use std::path::Path;
 /// The cells whose loss may still be `uncounted`, as `(row kind, feature, sink)`, where `None`
 /// matches any. Every other `skipped`, `dropped`, or `lost` cell names a counter, or a `lost` one
 /// is `structural`. Spans aren't classified yet, and log records only at `otlp_out`,
-/// `datadog_out`, `syslog_out`, and, for a DogStatsD event, `statsd_out`. A `_logit.datadog.*`
+/// `datadog_out`, `syslog_out`, `splunk_hec_out`, and, for a DogStatsD event, `statsd_out`. A `_logit.datadog.*`
 /// carrier `datadog_out` leaves off a log is uncounted too, and so is a public attribute outside
 /// its header fields that `syslog_out` leaves off a log, one entry per row such an attribute
 /// reaches; `bytes_value`'s also covers a `Bytes` PARAM-VALUE `structured_data:` writes as its
@@ -221,11 +223,13 @@ const KINDS: [(&str, &[&str]); 15] = [
             "syslog_sd",
             "syslog_timestamp",
             "host_name",
+            "splunk_envelope",
             "sd_id_collision",
             "sd_name_unsafe",
             "sd_empty_array",
             "no_host",
             "log_status",
+            "log_severity_fields",
             "span_kind",
             "trace_id_high",
             "syslog_facility",

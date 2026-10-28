@@ -6,6 +6,7 @@
     {"sink":"syslog_out","row":"attributes/host_beside_host_name","cell":1,"observed":["normalized"]},
     {"sink":"syslog_out","row":"attributes/host_name","cell":1,"observed":["exact"]},
     {"sink":"syslog_out","row":"attributes/log_service_field","cell":1,"observed":["normalized"]},
+    {"sink":"syslog_out","row":"attributes/log_severity_fields","cell":0,"observed":["exact"]},
     {"sink":"syslog_out","row":"attributes/log_status","cell":0,"observed":["exact"]},
     {"sink":"syslog_out","row":"attributes/map_value","cell":1,"observed":["normalized"]},
     {"sink":"syslog_out","row":"attributes/no_host","cell":1,"observed":["normalized"]},

@@ -1,0 +1,5 @@
+# Docker's driver under `splunk-format=json` with all four carriers: a JSON line parsed into an
+# object inside `event`.
+# Read in place from testdata/interop/splunk/ with its .headers.
+wire: ../../../../testdata/interop/splunk/docker-services-collector-event-1-0-003.bin
+exercises: [event_route, object_event, envelope, time_string]

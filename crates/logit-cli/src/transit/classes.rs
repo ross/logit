@@ -56,8 +56,10 @@
 //! holds the configured SD-ID, `sd_name_unsafe` for a key that isn't an SD-NAME,
 //! `sd_empty_array` for an empty array), an event
 //! attribute by its value (`string_value`, `bool_value`, `number_value`, `array_value`,
-//! `map_value`, `bytes_value`, `timestamp_value`, `null_value`), and any other resource attribute
-//! `resource_attribute`; and `attributes/scope` when its batch has a scope. A log
+//! `map_value`, `bytes_value`, `timestamp_value`, `null_value`), a resource attribute under
+//! `com.splunk.` (the HEC envelope's `source`, `sourcetype`, and `index`) `splunk_envelope`, and
+//! any other resource attribute `resource_attribute`; and `attributes/scope` when its batch has a
+//! scope. A log
 //! record on an event with no metrics reaches `log/dogstatsd_event` when it carries
 //! `_logit.statsd.event.title`, else `log/plain`, the message rows [`log_features`] lists, and its
 //! attribute rows, with `_logit.otel.severity_*` as `severity_carrier_otel`; it also reaches a `log`
@@ -127,7 +129,15 @@
 //! `syslog.pid` otherwise, and the attributes it fills in ([`Spelling::derived`]: its configured
 //! facility on a log with no `syslog.facility`, the run's hostname on a log with no host, and for
 //! pairing only, `syslog.timestamp` written from the log's timestamp and under RFC 3164 a TAG read
-//! from the message's first word). Under `structured_data:` on RFC 5424, an opt-in attribute
+//! from the message's first word). `splunk_hec_out`'s rewrites ([`splunk`]) are a log's message
+//! as its text (`Bytes` as lossy UTF-8, a timestamp as RFC 3339), every attribute as the
+//! encoder's `fields` (a resource's non-carrier attributes beside the event's, each map flattened
+//! to dotted keys, each value through the codec's JSON writer), an event's `host.name` as the
+//! object's `host`, read back on the resource, a log's `otel.log.name` and parseable `trace_id`
+//! and `span_id` consumed into its own fields, and the attributes it fills in
+//! ([`Spelling::derived`]: the run's hostname on a record with no host, a log's
+//! `otel.log.severity.text` and `.number` where it has neither, and for pairing only, a
+//! flattened map's dotted keys). Under `structured_data:` on RFC 5424, an opt-in attribute
 //! (`logit_outputs::syslog::is_opt_in_param`) is no attribute of its own: it reads back inside
 //! `syslog.sd` under the SD-ID, and `syslog.sd` pairs as the encoder's STRUCTURED-DATA field read
 //! through `syslog_in`'s decoder ([`syslog::read_sd`]). A candidate's public attributes (no `_logit.`
@@ -136,7 +146,7 @@
 //! may also carry the `lower_bound`, `upper_bound`, or `quantile` tag of the bucket or quantile it
 //! expands. An input left unpaired was skipped or
 //! dropped: the class is the one whose counter moved, or the cell's when it says the loss is
-//! `uncounted`, or the expected class when it reached a `normalized` cell whose counter moved for
+//! `uncounted` (with or without a counter for the path the sink counts), or the expected class when it reached a `normalized` cell whose counter moved for
 //! an equal point that was read back: a sink that collapses two equal readings sends one of them. One exception: under `prometheus_out` exposition (`bind:` set), an unpaired
 //! record whose series has a later record in the case that was read back was overwritten in the
 //! registry, and reads at its expected class when that's `normalized` or `degraded`. A read-back
@@ -169,7 +179,10 @@
 //! which the encoder writes as its length, and every opt-in attribute of a log whose `syslog.sd`
 //! holds the SD-ID. `prometheus_out` compares a value too:
 //! `_logit.prometheus.target` absent reads `normalized` when the read-back's `instance` equals the
-//! input's, and `lost` otherwise. The observed class may be better than the cell's but never worse. A
+//! input's, and `lost` otherwise. At `splunk_hec_out`, a log's map attribute read back as
+//! dotted keys holding its leaves (none, for an empty map) is `normalized`, and a log's
+//! `otel.log.name`, `trace_id`, or `span_id` attribute read back in the log's own field is
+//! `normalized`. The observed class may be better than the cell's but never worse. A
 //! degraded, skipped, or dropped record's field rows aren't looked up, so they're neither reached
 //! nor unspecified there: the carriers that describe its wire form describe a shape that's gone.
 //!
@@ -411,6 +424,12 @@ enum Spelling {
     /// `structured_data.sd_id`, under which RFC 5424 writes each opt-in attribute as a PARAM of
     /// that element, read back nested in `syslog.sd` ([`Spelling::sd_id`], [`syslog::read_sd`]).
     Syslog { rfc3164: bool, facility: u8, structured_data: Option<&'static str> },
+    /// `splunk_hec_out`: a log's `Bytes` message as lossy UTF-8 and a timestamp one as RFC 3339
+    /// text; its attributes as `fields`, flattened to dotted keys, with the resource's beside the
+    /// event's; `host.name` and the resource's `com.splunk.*` as the envelope, read back on the
+    /// resource; and the attributes [`splunk::derived`] lists, which `splunk_hec_in` reads back
+    /// as attributes the input lacks.
+    Splunk,
     /// Any other sink: names, keys, and values as written.
     Verbatim,
 }
@@ -435,6 +454,7 @@ impl Spelling {
                     logit_core::interner::resolve(logit_core::interner::intern(sd_id))
                 }),
             },
+            "splunk_hec_out" => Spelling::Splunk,
             _ => Spelling::Verbatim,
         }
     }
@@ -459,6 +479,7 @@ impl Spelling {
             | Spelling::Otlp
             | Spelling::Datadog
             | Spelling::Syslog { .. }
+            | Spelling::Splunk
             | Spelling::Verbatim => name.to_string(),
         }
     }
@@ -550,6 +571,7 @@ impl Spelling {
             Spelling::Syslog { rfc3164, .. } => {
                 syslog::read(rec, rfc3164).map(|read| text(&json_value(read.message)))
             }
+            Spelling::Splunk => splunk::message(rec),
             _ => None,
         }
     }
@@ -658,6 +680,11 @@ impl Spelling {
         if let Spelling::Syslog { rfc3164, facility, .. } = self {
             return syslog::value_for(rec, key, value, rfc3164, facility, self.sd_id());
         }
+        if self == Spelling::Splunk {
+            if let Some(read) = splunk::read_back(rec) {
+                return read.get(key).cloned();
+            }
+        }
         if self == (Spelling::Statsd { dogstatsd: true }) && key == "host" {
             let kept = statsd::host_kept(rec, value)?;
             return Some(self.value(&kept, tags));
@@ -698,13 +725,14 @@ impl Spelling {
 
     /// The attributes the sink writes from `rec`'s own fields, which its pair decoder reads back
     /// as attributes `rec` lacks ([`Derived`]); empty for a sink that writes none:
-    /// [`datadog_derived`] and [`syslog_derived`].
+    /// [`datadog_derived`], [`syslog_derived`], and [`splunk::derived`].
     fn derived(self, rec: &Rec) -> Vec<Derived> {
         match self {
             Spelling::Datadog => datadog_derived(rec),
             Spelling::Syslog { rfc3164, facility, .. } => {
                 syslog_derived(rec, rfc3164, facility, self.sd_id())
             }
+            Spelling::Splunk => splunk::derived(rec),
             _ => Vec::new(),
         }
     }
@@ -749,7 +777,7 @@ fn derived_rows(rec: &Rec) -> Vec<&'static str> {
     // with no TAG derives no `no_host`, since syslog_in reads its HOSTNAME into MSG, and that
     // row's cell there reads it `exact`.
     let syslog = Spelling::Syslog { rfc3164: false, facility: 0, structured_data: None };
-    for spelling in [Spelling::Datadog, syslog] {
+    for spelling in [Spelling::Datadog, syslog, Spelling::Splunk] {
         for (row, _, _) in spelling.derived(rec) {
             if let Some(row) = row.filter(|row| !rows.contains(row)) {
                 rows.push(row);
@@ -1246,7 +1274,10 @@ mod syslog {
     }
 
     /// `map`'s attributes back in the model, each through its type tags.
-    fn model_attrs(map: &Map<String, Value>, types: &BTreeMap<String, String>) -> AttrMap {
+    pub(super) fn model_attrs(
+        map: &Map<String, Value>,
+        types: &BTreeMap<String, String>,
+    ) -> AttrMap {
         let mut attrs = AttrMap::new();
         for (key, value) in map {
             let tags = types.get(key).map(String::as_str).unwrap_or("");
@@ -1258,7 +1289,7 @@ mod syslog {
     }
 
     /// `rec`'s event attributes and its resource's, in the model.
-    fn scopes(rec: &Rec) -> (AttrMap, AttrMap) {
+    pub(super) fn scopes(rec: &Rec) -> (AttrMap, AttrMap) {
         (
             model_attrs(&rec.attributes, &rec.attribute_types),
             model_attrs(&rec.resource, &rec.resource_types),
@@ -1603,6 +1634,219 @@ fn model_attribute(value: &Value, tags: &str) -> Option<logit_core::Value> {
     let batches = EventJsonDecoder::new().decode_batches(line.to_string().as_bytes()).ok()?;
     let event = batches.into_iter().next()?.events.into_iter().next()?;
     event.attributes.get("v").cloned()
+}
+
+/// What [`Spelling::Splunk`] reads of a log record: the envelope, `fields`, and message
+/// `splunk_hec_out` writes, through the codec's own flattening and JSON writer, as
+/// `splunk_hec_in` reads them back (`crates/logit-proto/src/splunk/logs.rs`'s tables).
+mod splunk {
+    use super::{model_log, syslog, text, Class, Derived, Rec};
+    use logit_core::attrs::{is_private, HOST_NAME};
+    use logit_core::interner::{intern, resolve};
+    use logit_core::trace::{parse_span_id, parse_trace_id};
+    use logit_core::{AttrMap, Value as Model};
+    use logit_proto::json::{flatten_into, write_value};
+    use logit_proto::otlp::logs::{severity_number, severity_text};
+    use logit_proto::splunk::{
+        ATTR_LOG_NAME, ATTR_SEVERITY_NUMBER, ATTR_SEVERITY_TEXT, ATTR_SPAN_ID, ATTR_TRACE_ID,
+        RESOURCE_ATTR_INDEX, RESOURCE_ATTR_SOURCE, RESOURCE_ATTR_SOURCETYPE,
+    };
+    use serde_json::Value;
+    use std::collections::BTreeMap;
+
+    /// The resource attributes the envelope's `source`, `sourcetype`, and `index` carry.
+    pub(super) const ENVELOPE_PREFIX: &str = "com.splunk.";
+
+    /// One predicted attribute: the row of the field it's derived from, if any, and its value as
+    /// text.
+    type Predicted = (Option<&'static str>, String);
+
+    /// `value` as `splunk_hec_in` reads back the JSON `write_value` writes for it, as text.
+    fn written(value: &Model) -> String {
+        let mut json = Vec::new();
+        write_value(&mut json, value);
+        serde_json::from_slice::<Value>(&json).map(|read| text(&read)).unwrap_or_default()
+    }
+
+    /// The `host` the encoder takes from the event: a non-empty `Str` `host.name`, which then
+    /// isn't also a field.
+    fn event_host(attrs: &AttrMap) -> Option<&str> {
+        attrs.get(HOST_NAME).and_then(Model::as_str).filter(|host| !host.is_empty())
+    }
+
+    /// The `fields` object the encoder writes before a log's own fields: every non-carrier,
+    /// non-private resource attribute, then every event attribute but the host the envelope took,
+    /// flattened.
+    fn fields(attrs: &AttrMap, resource: &AttrMap) -> AttrMap {
+        let mut fields = AttrMap::new();
+        let carrier = |name: &str| name == HOST_NAME || name.starts_with(ENVELOPE_PREFIX);
+        for (key, value) in resource.iter() {
+            let name = resolve(key);
+            if !carrier(name) && !is_private(name) {
+                flatten_into(name, value, &mut fields);
+            }
+        }
+        let consumed = event_host(attrs).is_some();
+        for (key, value) in attrs.iter() {
+            let name = resolve(key);
+            if !(consumed && name == HOST_NAME) && !is_private(name) {
+                flatten_into(name, value, &mut fields);
+            }
+        }
+        fields
+    }
+
+    /// Whether `splunk_hec_in` reads `fields`' `trace_id` and `span_id` into the log's `trace`,
+    /// consuming both: a valid `trace_id` with a valid or absent `span_id`.
+    fn trace_consumed(fields: &AttrMap) -> bool {
+        let trace = fields.get(ATTR_TRACE_ID).and_then(Model::as_str).and_then(parse_trace_id);
+        let span = match fields.get(ATTR_SPAN_ID) {
+            None => true,
+            Some(value) => value.as_str().and_then(parse_span_id).is_some(),
+        };
+        trace.is_some() && span
+    }
+
+    /// The public attributes `splunk_hec_in` reads back for `rec`, the resource's and the event's
+    /// together. The rows name what the encoder derives: `no_host` for the process hostname as
+    /// the `host`, read back on the resource, and `log_severity_fields` for the
+    /// `otel.log.severity.*` fields it writes from a log's `severity` where neither is an
+    /// attribute. A log's `otel.log.name` and a valid `trace_id` and `span_id` read back into its
+    /// own fields, so none of them is an attribute. A span's event attributes leave in its
+    /// `attributes` object unflattened, and its resource's in `fields`. `None` for an event the
+    /// encoder writes no object for.
+    fn predicted(rec: &Rec) -> Option<BTreeMap<String, Predicted>> {
+        let log = if rec.kind == "log" { Some(model_log(rec)?) } else { None };
+        let span = rec.kind == "span";
+        if log.is_none() && !span && !rec.is_metric() {
+            return None;
+        }
+        let (attrs, resource) = syslog::scopes(rec);
+        let mut out = BTreeMap::new();
+        let host = match (event_host(&attrs), resource.get(HOST_NAME)) {
+            (Some(host), _) => Some((None, host.to_string())),
+            (None, Some(value)) => value.as_str().map(|host| (None, host.to_string())),
+            (None, None) => Some((Some("no_host"), super::super::HOSTNAME.to_string())),
+        };
+        if let Some(host) = host {
+            out.insert(HOST_NAME.to_string(), host);
+        }
+        for key in [RESOURCE_ATTR_SOURCE, RESOURCE_ATTR_SOURCETYPE, RESOURCE_ATTR_INDEX] {
+            if let Some(value) = resource.get(key).and_then(Model::as_str) {
+                out.insert(key.to_string(), (None, value.to_string()));
+            }
+        }
+        let fields = if span {
+            let consumed = event_host(&attrs).is_some();
+            for (key, value) in attrs.iter() {
+                let name = resolve(key);
+                if !(consumed && name == HOST_NAME) && !is_private(name) {
+                    out.insert(name.to_string(), (None, written(value)));
+                }
+            }
+            fields(&AttrMap::new(), &resource)
+        } else {
+            fields(&attrs, &resource)
+        };
+        let Some(log) = log else {
+            for (key, value) in fields.iter() {
+                out.insert(resolve(key).to_string(), (None, written(value)));
+            }
+            return Some(out);
+        };
+        let has = |key: &str| fields.get(key).is_some();
+        // An attribute of either name wins over the log's `trace`.
+        let consumed = if has(ATTR_TRACE_ID) || has(ATTR_SPAN_ID) {
+            trace_consumed(&fields)
+        } else {
+            log.trace.is_some()
+        };
+        for (key, value) in fields.iter() {
+            let name = resolve(key);
+            let named = name == ATTR_LOG_NAME && value.as_str().is_some_and(|n| !n.is_empty());
+            let trace = consumed && (name == ATTR_TRACE_ID || name == ATTR_SPAN_ID);
+            if !named && !trace {
+                out.insert(name.to_string(), (None, written(value)));
+            }
+        }
+        if let Some(severity) = log.severity {
+            if !has(ATTR_SEVERITY_TEXT) && !has(ATTR_SEVERITY_NUMBER) {
+                let row = Some("log_severity_fields");
+                let number = i64::from(severity_number(severity)).to_string();
+                out.insert(ATTR_SEVERITY_TEXT.to_string(), (row, severity_text(severity).into()));
+                out.insert(ATTR_SEVERITY_NUMBER.to_string(), (row, number));
+            }
+        }
+        Some(out)
+    }
+
+    /// [`predicted`]'s attributes, each as text; `None` where the encoder writes no object.
+    pub(super) fn read_back(rec: &Rec) -> Option<BTreeMap<String, String>> {
+        let predicted = predicted(rec)?;
+        Some(predicted.into_iter().map(|(key, (_, value))| (key, value)).collect())
+    }
+
+    /// The attributes `splunk_hec_out` writes for log `rec` that `splunk_hec_in` reads back under
+    /// a key `rec` has no attribute of: the derived `host` and severity fields, and, for pairing
+    /// only, a flattened map's dotted keys.
+    pub(super) fn derived(rec: &Rec) -> Vec<Derived> {
+        let Some(predicted) = predicted(rec) else { return Vec::new() };
+        predicted
+            .into_iter()
+            .filter(|(key, _)| !rec.attributes.contains_key(key) && !rec.resource.contains_key(key))
+            .map(|(key, (row, value))| (row, resolve(intern(&key)), value))
+            .collect()
+    }
+
+    /// The message `splunk_hec_in` reads back where the encoder rewrites it: a `Bytes` one as
+    /// lossy UTF-8 and a `Timestamp` one as its RFC 3339 text, each a string.
+    pub(super) fn message(rec: &Rec) -> Option<String> {
+        let log = model_log(rec)?;
+        match &log.message {
+            Model::Bytes(bytes) => Some(String::from_utf8_lossy(bytes).into_owned()),
+            Model::Timestamp(ns) => Some(logit_core::format_rfc3339_utc(*ns)),
+            _ => None,
+        }
+    }
+
+    /// What log `input`'s attribute `key` reads back as in `out` where `splunk_hec_out` doesn't
+    /// write it under its own key, else `None` for the ordinary comparison: a map flattened to
+    /// dotted keys is `normalized` when every one of them reads back as written; an
+    /// `otel.log.name`, `trace_id`, or `span_id` the decoder reads into the log's own fields is
+    /// `normalized` when that field holds it.
+    pub(super) fn observe_attribute(
+        input: &Rec,
+        out: &Rec,
+        key: &str,
+        resource: bool,
+    ) -> Option<Class> {
+        let (attrs, resource_attrs) = syslog::scopes(input);
+        let want = if resource { resource_attrs.get(key)? } else { attrs.get(key)? };
+        if matches!(want, Model::Map(_)) {
+            let mut flat = AttrMap::new();
+            flatten_into(key, want, &mut flat);
+            // An empty map has no leaf, and is left off.
+            let found = flat.iter().all(|(k, v)| {
+                let k = resolve(k);
+                let read = out.attributes.get(k).or(out.resource.get(k));
+                read.is_some_and(|read| text(read) == written(v))
+            });
+            return Some(if found { Class::Normalized } else { Class::Lost });
+        }
+        if resource {
+            return None;
+        }
+        let fields = fields(&attrs, &resource_attrs);
+        let field = match key {
+            ATTR_LOG_NAME if want.as_str().is_some_and(|n| !n.is_empty()) => "event_name",
+            ATTR_TRACE_ID if trace_consumed(&fields) => "trace_id",
+            ATTR_SPAN_ID if trace_consumed(&fields) => "span_id",
+            _ => return None,
+        };
+        let held = out.body.get(field).and_then(Value::as_str);
+        let same = held.zip(want.as_str()).is_some_and(|(a, b)| a.eq_ignore_ascii_case(b));
+        Some(if same { Class::Normalized } else { Class::Lost })
+    }
 }
 
 /// RFC 6901's unescaping of one pointer token.
@@ -2485,8 +2729,10 @@ fn field_rows_under(
         rows.push(("attributes".to_string(), Some(feature.to_string()), field));
     }
     for (key, value) in &rec.resource {
-        let feature =
-            carrier(key, value).or_else(|| outranked(key, value)).unwrap_or("resource_attribute");
+        let feature = carrier(key, value)
+            .or_else(|| outranked(key, value))
+            .or_else(|| key.starts_with(splunk::ENVELOPE_PREFIX).then_some("splunk_envelope"))
+            .unwrap_or("resource_attribute");
         let field = Field::Attribute { key: key.clone(), resource: true };
         rows.push(("attributes".to_string(), Some(feature.to_string()), field));
     }
@@ -2513,22 +2759,32 @@ fn observe_field(field: &Field, input: &Rec, out: &Rec, spelling: Spelling) -> C
         Field::Derived { feature } => {
             // A sink that derives nothing for the row reads back only the record's own
             // attributes under the key, such as `statsd_out`'s `host` read back as `host.name`.
-            let Some((_, key, value)) =
-                spelling.derived(input).into_iter().find(|(row, _, _)| *row == Some(*feature))
-            else {
+            // A row may derive several attributes, such as `splunk_hec_out`'s two severity
+            // fields; each must read back with its value.
+            let entries: Vec<Derived> = spelling
+                .derived(input)
+                .into_iter()
+                .filter(|(row, _, _)| *row == Some(*feature))
+                .collect();
+            if entries.is_empty() {
                 return Class::Exact;
-            };
-            // A span's derived host is its tracer payload's, on the resource, ahead of any
-            // `host.name` span tag; every other derived field is the record's own.
-            let span_host = key == "host.name" && datadog::Route::of(input) == datadog::Route::Span;
-            let read = if span_host {
-                out.resource.get(key).or(out.attributes.get(key))
+            }
+            let found = entries.iter().all(|(_, key, value)| {
+                // A span's derived host is its tracer payload's, on the resource, ahead of any
+                // `host.name` span tag; every other derived field is the record's own.
+                let span_host =
+                    *key == "host.name" && datadog::Route::of(input) == datadog::Route::Span;
+                let read = if span_host {
+                    out.resource.get(*key).or(out.attributes.get(*key))
+                } else {
+                    out.attributes.get(*key).or(out.resource.get(*key))
+                };
+                read.is_some_and(|read| text(read) == *value)
+            });
+            if found {
+                Class::Normalized
             } else {
-                out.attributes.get(key).or(out.resource.get(key))
-            };
-            match read {
-                Some(read) if text(read) == value => Class::Normalized,
-                _ => Class::Lost,
+                Class::Lost
             }
         }
         Field::LogBody(key) => match out.body.get(*key) {
@@ -2612,6 +2868,11 @@ fn observe_field(field: &Field, input: &Rec, out: &Rec, spelling: Spelling) -> C
                         Some(read) if Some(&read) == want.as_ref() => Class::Normalized,
                         _ => Class::Lost,
                     };
+                }
+            }
+            if spelling == Spelling::Splunk && input.kind == "log" {
+                if let Some(class) = splunk::observe_attribute(input, out, key, *resource) {
+                    return class;
                 }
             }
             if matches!(spelling, Spelling::Prometheus) {
@@ -3186,10 +3447,10 @@ pub(super) fn check(
                     let counted = loss
                         .and_then(|(_, cell, _)| cell.counter.as_deref())
                         .is_some_and(&did_move);
-                    // A cell that says its loss is uncounted accounts for a record no counter does.
-                    let uncounted = loss.is_some_and(|(_, cell, _)| {
-                        cell.counter.is_none() && cell.reason.as_deref() == Some("uncounted")
-                    });
+                    // A cell that says its loss is uncounted accounts for a record no counter does,
+                    // also where its counter names the path the sink does count.
+                    let uncounted = loss
+                        .is_some_and(|(_, cell, _)| cell.reason.as_deref() == Some("uncounted"));
                     // A sink that collapses two equal readings counts the one it removes under a
                     // `normalized` cell and sends the other, so the removed one reads as the other
                     // does: at its worst cell, which is that one unless the kind is written in a
@@ -3255,7 +3516,8 @@ pub(super) fn check(
             }
             if let Some((label, cell, index)) = deciding {
                 ledger.saw(&sink, label, *index, observed);
-                let loss = matches!(cell.class, Class::Degraded | Class::Skipped | Class::Dropped);
+                let loss = matches!(cell.class, Class::Degraded | Class::Skipped | Class::Dropped)
+                    && cell.reason.as_deref() != Some("uncounted");
                 if let (true, Some(counter)) = (loss && observed == cell.class, &cell.counter) {
                     if !did_move(counter) {
                         failures.push(format!(
@@ -4633,5 +4895,79 @@ mod tests {
             assert_eq!(feature, "string_value");
             assert_eq!(observe_field(&field, &ins[0], &outs[0], spelling), Class::Lost);
         }
+    }
+
+    /// The field row `key` of `rec` reaches under `splunk_hec_out`, as `(feature, field)`.
+    fn splunk_row(rec: &Rec, key: &str) -> (String, Field) {
+        field_rows(rec, "splunk_hec")
+            .into_iter()
+            .find(|(kind, _, field)| {
+                kind == "attributes" && matches!(field, Field::Attribute { key: k, .. } if k == key)
+            })
+            .map(|(_, feature, field)| (feature.unwrap_or_default(), field))
+            .expect("an attribute row")
+    }
+
+    /// `splunk_hec_out` writes `otel.log.severity.*` from a log's severity and the process
+    /// hostname as its `host`, so the read-back carries attributes the input lacks and still pairs.
+    #[test]
+    fn a_splunk_read_back_pairs_beside_the_severity_fields_it_adds() {
+        let ins = recs(&[&log_line(r#""severity":"warn","format":"raw","message":"m""#, "{}")]);
+        let outs = recs(&[&format!(
+            r#"{{{{T}},"log":{{"severity":"warn","format":"raw","message":"m"}},"attributes":{{"otel.log.severity.number":13,"otel.log.severity.text":"Warn"}},"resource":{{"attributes":{{"host.name":"{}"}}}}}}"#,
+            super::super::HOSTNAME,
+        )]);
+        assert_eq!(pair(&ins, &outs, Spelling::Splunk).seen, [Some(Class::Exact)]);
+    }
+
+    /// `fields` is flat, so a nested attribute reads back as dotted keys: `normalized` when every
+    /// leaf does, `lost` when one is missing.
+    #[test]
+    fn a_nested_attribute_read_back_flattened_is_normalized() {
+        let body = r#""severity":"info","format":"raw","message":"m""#;
+        let ins = recs(&[&log_line(body, r#"{"http":{"method":"GET","status":200}}"#)]);
+        let outs = recs(&[
+            &log_line(body, r#"{"http.method":"GET","http.status":200}"#),
+            &log_line(body, r#"{"http.method":"GET"}"#),
+        ]);
+        let (feature, field) = splunk_row(&ins[0], "http");
+        assert_eq!(feature, "map_value");
+        assert_eq!(observe_field(&field, &ins[0], &outs[0], Spelling::Splunk), Class::Normalized);
+        assert_eq!(observe_field(&field, &ins[0], &outs[1], Spelling::Splunk), Class::Lost);
+    }
+
+    /// An event's `host.name` leaves as the object's `host`, over the resource's, and
+    /// `splunk_hec_in` reads it back onto the resource: the record pairs, and `host_name` reads
+    /// `normalized`.
+    #[test]
+    fn a_splunk_host_name_moved_to_the_resource_is_normalized() {
+        let body = r#""severity":"info","format":"raw","message":"m""#;
+        let ins = recs(&[&format!(
+            r#"{{{{T}},"log":{{{body}}},"attributes":{{"host.name":"web-1"}},"resource":{{"attributes":{{"host.name":"collector"}}}}}}"#
+        )]);
+        let outs = recs(&[&format!(
+            r#"{{{{T}},"log":{{{body}}},"attributes":{{"otel.log.severity.number":9,"otel.log.severity.text":"Info"}},"resource":{{"attributes":{{"host.name":"web-1"}}}}}}"#
+        )]);
+        assert_eq!(pair(&ins, &outs, Spelling::Splunk).seen, [Some(Class::Exact)]);
+        let (feature, field) = splunk_row(&ins[0], "host.name");
+        assert_eq!(feature, "host_name");
+        assert_eq!(observe_field(&field, &ins[0], &outs[0], Spelling::Splunk), Class::Normalized);
+    }
+
+    /// `com.splunk.index` is the object's `index`, read back onto the resource: its own row,
+    /// `exact`.
+    #[test]
+    fn a_splunk_index_reads_exact_on_its_envelope_row() {
+        let line = r#"{{T},"log":{"severity":"info","format":"raw","message":"m"},"resource":{"attributes":{"com.splunk.index":"main"}}}"#;
+        let ins = recs(&[line]);
+        let (feature, field) = field_rows(&ins[0], "splunk_hec")
+            .into_iter()
+            .find(|(_, _, field)| {
+                matches!(field, Field::Attribute { key, resource: true } if key == "com.splunk.index")
+            })
+            .map(|(_, feature, field)| (feature.unwrap_or_default(), field))
+            .expect("a resource attribute row");
+        assert_eq!(feature, "splunk_envelope");
+        assert_eq!(observe_field(&field, &ins[0], &ins[0], Spelling::Splunk), Class::Exact);
     }
 }

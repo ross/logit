@@ -1,0 +1,5 @@
+{"time":1790000000,"event":"started","fields":{"otel.log.severity.number":10,"otel.log.severity.text":"INFO2","otel.log.name":"app.start","trace_id":"0AF7651916CD43DD8448EB211C80319C","span_id":"B7AD6B7169203331","k":"v"}}
+{"time":1790000001,"event":"text only","fields":{"otel.log.severity.text":"error"}}
+{"time":1790000002,"event":"number only","fields":{"otel.log.severity.number":21}}
+{"time":1790000003,"event":"trace with no span","fields":{"trace_id":"0af7651916cd43dd8448eb211c80319c"}}
+{"time":1790000004,"event":"bad trace","fields":{"trace_id":"xyz","span_id":"b7ad6b7169203331"}}

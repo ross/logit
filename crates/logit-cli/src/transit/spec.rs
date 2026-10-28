@@ -75,6 +75,7 @@ use logit_proto::otlp::OtlpDecoder;
 use logit_proto::prometheus::{
     families_to_events, text, Dialect, PrometheusDecoder, ATTR_TARGET, LABEL_INSTANCE,
 };
+use logit_proto::splunk::SplunkDecoder;
 use logit_proto::statsd::StatsdDecoder;
 use logit_proto::syslog::SyslogDecoder;
 use logit_proto::{Decoder, Signal};
@@ -401,6 +402,9 @@ const SCRAPE_INSTANCE: &str = "transit:9100";
 ///   (`datagram` when absent): one datagram with line splitting on, as `syslog_in` reads UDP by
 ///   default, or a TCP stream split by `Framer::new(FramingMode::Rfc6587Auto, …)`, each frame
 ///   read with line splitting off, as `SyslogInput::tcp` reads it.
+/// - `splunk`: one request body through `splunk_hec_in`'s own `decode_request`, which picks the
+///   route from `path:`, a `/raw` body's envelope from its percent-decoded query string, and the
+///   decompression from `content-encoding:`, as the listener does.
 fn decode_wire(
     system: &str,
     bytes: Vec<u8>,
@@ -611,6 +615,26 @@ fn decode_wire(
                 (resource, _) = decoder.decode_into(unit, RECEIVED_AT, &mut events)?;
             }
             vec![EventBatch { resource, scope: None, events }]
+        }
+        "splunk" => {
+            let telemetry = probe.telemetry(id, "splunk_hec_in", "listener");
+            let diag = Diagnostics::new(id).with_telemetry(telemetry.clone());
+            let target = headers.get("path").context("the .headers names no path:")?;
+            let mut request = http::HeaderMap::new();
+            for name in [http::header::CONTENT_TYPE, http::header::CONTENT_ENCODING] {
+                if let Some(value) = headers.get(name.as_str()) {
+                    request.insert(name, http::HeaderValue::from_str(value)?);
+                }
+            }
+            let decoder = SplunkDecoder::new().with_telemetry(telemetry).with_diagnostics(diag);
+            logit_inputs::splunk::decode_request(
+                target,
+                &request,
+                Bytes::from(bytes),
+                RECEIVED_AT,
+                decoder,
+            )
+            .map_err(|err| anyhow::anyhow!("splunk_hec_in refused the request: {err}"))?
         }
         other => bail!("no wire decoder for a {other} case yet"),
     };
@@ -1166,6 +1190,7 @@ flow_tests! {
     collectd_to_graphite => "collectd-to-graphite",
     datadog_logs_relay => "datadog-logs-relay",
     datadog_logs_to_otlp => "datadog-logs-to-otlp",
+    datadog_logs_to_splunk => "datadog-logs-to-splunk",
     datadog_logs_to_syslog => "datadog-logs-to-syslog",
     datadog_logs_to_syslog_rfc3164 => "datadog-logs-to-syslog-rfc3164",
     datadog_logs_to_syslog_sd => "datadog-logs-to-syslog-sd",
@@ -1196,6 +1221,7 @@ flow_tests! {
     otlp_delta_to_datadog => "otlp-delta-to-datadog",
     otlp_logs_relay => "otlp-logs-relay",
     otlp_logs_to_datadog => "otlp-logs-to-datadog",
+    otlp_logs_to_splunk => "otlp-logs-to-splunk",
     otlp_logs_to_syslog => "otlp-logs-to-syslog",
     otlp_logs_to_syslog_rfc3164 => "otlp-logs-to-syslog-rfc3164",
     otlp_logs_to_syslog_sd => "otlp-logs-to-syslog-sd",
@@ -1233,11 +1259,16 @@ flow_tests! {
     statsd_to_prometheus => "statsd-to-prometheus",
     statsd_to_graphite => "statsd-to-graphite",
     statsd_to_graphite_expand => "statsd-to-graphite-expand",
+    splunk_relay => "splunk-relay",
+    splunk_to_datadog => "splunk-to-datadog",
+    splunk_to_otlp => "splunk-to-otlp",
+    splunk_to_syslog => "splunk-to-syslog",
     syslog_relay => "syslog-relay",
     syslog_relay_rfc3164 => "syslog-relay-rfc3164",
     syslog_relay_sd => "syslog-relay-sd",
     syslog_to_datadog => "syslog-to-datadog",
     syslog_to_otlp => "syslog-to-otlp",
+    syslog_to_splunk => "syslog-to-splunk",
 }
 
 #[cfg(test)]

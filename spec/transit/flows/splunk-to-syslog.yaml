@@ -1,0 +1,12 @@
+# splunk_hec_in's cases into syslog_out under its default RFC 5424 with nothing
+# between: each log's message as MSG and its envelope `host` as HOSTNAME.
+# `path:` names one case so `logit run` can run this by hand; the transit spec runs every case in
+# that file's directory (spec/transit/README.md).
+components:
+  case:
+    type: replay_in
+    path: ../cases/splunk/otel-logs.json
+  out:
+    type: syslog_out
+    sources: [case]
+    endpoint: 127.0.0.1:514

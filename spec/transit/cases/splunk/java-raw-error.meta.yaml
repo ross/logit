@@ -1,0 +1,5 @@
+# splunk-library-javalogging's `type=raw` appender, an ERROR line: the envelope in the
+# query string, `java%3Araw` percent-encoded, and a channel.
+# Read in place from testdata/interop/splunk/ with its .headers.
+wire: ../../../../testdata/interop/splunk/java-services-collector-raw-002.bin
+exercises: [raw_route, query_envelope]
