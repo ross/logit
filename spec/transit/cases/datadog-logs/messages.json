@@ -1,0 +1,6 @@
+{"timestamp":"2027-01-15T07:59:50.000000000Z","log":{"format":"raw","message":"{\"event\":\"login\",\"user\":{\"id\":7,\"roles\":[\"admin\"]}}"},"attributes":{"host.name":"web-1"}}
+{"timestamp":"2027-01-15T07:59:50.001000000Z","log":{"format":"raw","message":"[\"a\",1,true]"},"attributes":{"host.name":"web-1"}}
+{"timestamp":"2027-01-15T07:59:50.002000000Z","log":{"format":"raw","message":"42"},"attributes":{"host.name":"web-1"}}
+{"timestamp":"2027-01-15T07:59:50.003000000Z","log":{"format":"raw","message":"1.5"},"attributes":{"host.name":"web-1"}}
+{"timestamp":"2027-01-15T07:59:50.004000000Z","log":{"format":"raw","message":"true"},"attributes":{"host.name":"web-1"}}
+{"timestamp":"2027-01-15T07:59:50.005000000Z","log":{"format":"raw","message":""},"attributes":{"host.name":"web-1"}}

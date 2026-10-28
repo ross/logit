@@ -1,0 +1,4 @@
+# A hand-written /api/v2/logs body: a log whose `ddtags` holds 101 entries and one with 101
+# attributes, past the 100 tags Datadog documents for a log.
+wire: many-tags.bin
+exercises: [log, many_tags, host]

@@ -120,6 +120,7 @@
 //! | `attributes/map_value` | exact | -- | A key-value list attribute. |
 //! | `attributes/bytes_value` | exact | -- | A bytes attribute. |
 //! | `attributes/timestamp_value` | normalized | `timestamp_as_int` | OTLP has no timestamp value, so it's an integer of Unix nanoseconds. |
+//! | `attributes/null_value` | exact | -- | An `AnyValue` with no value set, read back as null. |
 //! | `attributes/prometheus_target` | lost | structural | The scrape target is private and isn't an OTLP attribute, so it's left off. |
 //! | `attributes/foreign_carrier` | lost | structural | A `_logit.` carrier is private and isn't an OTLP attribute, so it's left off. The `_logit.prometheus.type` carrier changes nothing; the `family_type` row has the `_logit.metrics.type` values the sink reads. |
 //! | `attributes/timestamped` | lost | structural | The flag is private and isn't an OTLP attribute, so it's left off. The point's time carries the timestamp. |

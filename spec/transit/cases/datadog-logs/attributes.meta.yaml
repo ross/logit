@@ -1,0 +1,4 @@
+# A hand-written /api/v2/logs body: attributes of every JSON type, nested objects and
+# arrays, empty ones, and an integer past `i64::MAX`.
+wire: attributes.bin
+exercises: [log, nested_attributes, u64_attribute, host]

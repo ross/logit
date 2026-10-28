@@ -1,0 +1,28 @@
+{
+  "cells": [
+    {"sink":"syslog_out","row":"attributes/array_value","cell":0,"observed":["lost"]},
+    {"sink":"syslog_out","row":"attributes/bool_value","cell":0,"observed":["lost"]},
+    {"sink":"syslog_out","row":"attributes/container_id","cell":0,"observed":["lost"]},
+    {"sink":"syslog_out","row":"attributes/datadog_carrier_log","cell":0,"observed":["lost"]},
+    {"sink":"syslog_out","row":"attributes/foreign_carrier","cell":0,"observed":["lost"]},
+    {"sink":"syslog_out","row":"attributes/host_name","cell":0,"observed":["lost"]},
+    {"sink":"syslog_out","row":"attributes/map_value","cell":0,"observed":["lost"]},
+    {"sink":"syslog_out","row":"attributes/no_host","cell":0,"observed":["exact"]},
+    {"sink":"syslog_out","row":"attributes/null_value","cell":0,"observed":["lost"]},
+    {"sink":"syslog_out","row":"attributes/number_value","cell":0,"observed":["lost"]},
+    {"sink":"syslog_out","row":"attributes/service_identity","cell":0,"observed":["lost"]},
+    {"sink":"syslog_out","row":"attributes/string_value","cell":0,"observed":["lost"]},
+    {"sink":"syslog_out","row":"attributes/syslog_facility","cell":0,"observed":["normalized"]},
+    {"sink":"syslog_out","row":"log/blank_message","cell":0,"observed":[]},
+    {"sink":"syslog_out","row":"log/body_format","cell":0,"observed":["exact"]},
+    {"sink":"syslog_out","row":"log/dogstatsd_event","cell":0,"observed":[]},
+    {"sink":"syslog_out","row":"log/header_in_message","cell":0,"observed":["normalized"]},
+    {"sink":"syslog_out","row":"log/observed_timestamp_unset","cell":0,"observed":["exact"]},
+    {"sink":"syslog_out","row":"log/plain","cell":0,"observed":[]},
+    {"sink":"syslog_out","row":"log/severity","cell":0,"observed":["exact","normalized"]},
+    {"sink":"syslog_out","row":"log/severity_unset","cell":0,"observed":["normalized"]},
+    {"sink":"syslog_out","row":"log/timestamp","cell":0,"observed":["normalized"]},
+    {"sink":"syslog_out","row":"log/trace_unset","cell":0,"observed":["exact"]}
+  ],
+  "unspecified": []
+}

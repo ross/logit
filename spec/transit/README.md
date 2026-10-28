@@ -14,7 +14,8 @@ limits, and [the plan](../../docs/plans/transit-spec.md) the workstreams.
 
 The sources are `statsd_in`, `influxdb_in`, `prometheus_in`'s scrape (remote-write cases
 aren't written yet), `datadog_in`'s metrics routes and service checks (`cases/datadog/`) and its
-logs and events (`cases/datadog-logs/`), with no APM cases yet, `collectd_in`, `otlp_in`'s metrics
+logs and events (`cases/datadog-logs/`: the Agent's captures and hand-written `/api/v2/logs`
+bodies), with no APM cases yet, `collectd_in`, `otlp_in`'s metrics
 (`cases/otlp/`) and logs (`cases/otlp-logs/`), with no trace cases yet, `graphite_in`,
 plaintext and pickle, and `syslog_in`, RFC 3164 and RFC 5424 over UDP and as a TCP stream. A
 source directory's name before its first `-` names its system, so
@@ -145,10 +146,10 @@ non-empty string `host.name` or the hostless mark, which `statsd_out` leaves off
 `attributes/hostname` and `attributes/log_service` (a log's `hostname` attribute, or its
 `service` beside `service.name`, which `datadog_out` leaves off), `attributes/log_service_field`
 (a log's string `service` with no `service.name`, which `datadog_out` writes as the log's
-`service`), `attributes/sd_id_collision` and `attributes/sd_name_unsafe` (a log's attribute
-`syslog_out` leaves out of its `structured_data:` SD-ELEMENT, on a log whose `syslog.sd` already
-holds the configured SD-ID or under a key that isn't an SD-NAME, reached only at that sink under
-the opt-in), and
+`service`), `attributes/sd_id_collision`, `attributes/sd_name_unsafe`, and
+`attributes/sd_empty_array` (a log's attribute `syslog_out` leaves out of its `structured_data:`
+SD-ELEMENT, on a log whose `syslog.sd` already holds the configured SD-ID, under a key that isn't
+an SD-NAME, or holding an empty array, reached only at that sink under the opt-in), and
 the attributes `datadog_out` writes from a record's own fields,
 `attributes/no_host`, `log_status`, `span_kind`, and `trace_id_high`. A flagged record's `no_recorded_value` row goes ahead of its kind's counted
 loss where that loss's counter didn't move, since most sinks test the flag first

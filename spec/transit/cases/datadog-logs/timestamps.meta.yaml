@@ -1,0 +1,5 @@
+# A hand-written /api/v2/logs body: `timestamp` as integer and fractional milliseconds, RFC
+# 3339 in UTC and with an offset, absent, zero, and unparseable; the last three are the
+# receipt time.
+wire: timestamps.bin
+exercises: [log, timestamp_ms, fractional_timestamp, rfc3339_timestamp, no_timestamp, bad_timestamp, host]

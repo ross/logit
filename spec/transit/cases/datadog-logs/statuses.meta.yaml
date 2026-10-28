@@ -1,0 +1,4 @@
+# A hand-written /api/v2/logs body: a log per `status` form datadog_in maps to a severity,
+# one in mixed case, an unknown status, and one with none.
+wire: statuses.bin
+exercises: [log, status, status_unknown, status_absent, ddsource, host]

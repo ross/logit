@@ -1167,6 +1167,8 @@ flow_tests! {
     datadog_logs_relay => "datadog-logs-relay",
     datadog_logs_to_otlp => "datadog-logs-to-otlp",
     datadog_logs_to_syslog => "datadog-logs-to-syslog",
+    datadog_logs_to_syslog_rfc3164 => "datadog-logs-to-syslog-rfc3164",
+    datadog_logs_to_syslog_sd => "datadog-logs-to-syslog-sd",
     datadog_relay => "datadog-relay",
     datadog_to_influxdb => "datadog-to-influxdb",
     datadog_to_otlp => "datadog-to-otlp",

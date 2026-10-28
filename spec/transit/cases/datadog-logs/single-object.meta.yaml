@@ -1,0 +1,3 @@
+# A hand-written /api/v2/logs body that is one object, not an array.
+wire: single-object.bin
+exercises: [log, single_object, ddsource, host]

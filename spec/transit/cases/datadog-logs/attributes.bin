@@ -1,0 +1,1 @@
+[{"message": "attributes typed", "timestamp": 1799999990000, "hostname": "web-1", "http": {"method": "GET", "status_code": 200, "headers": {"accept": "*/*"}}, "tags_list": ["a", "b"], "mixed": [1, "two", {"three": 3}], "count": 3, "negative": -5, "big": 18446744073709551615, "ratio": 0.25, "ok": false, "nothing": null, "empty_map": {}, "empty_list": [], "numeric_text": "42"}]

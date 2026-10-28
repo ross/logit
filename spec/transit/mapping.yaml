@@ -2243,7 +2243,10 @@ rows:
         reason: respelled
         text: >-
           On a metric, an event, or a service check, Datadog's `container_id` tag, the Datadog
-          OTLP exporter's spelling, which datadog_in reads back as a `container_id` attribute.
+          OTLP exporter's spelling, which datadog_in reads back as a `container_id` attribute. On
+          a log, a `container_id:<id>` entry appended to `ddtags`, the Agent's tag for a
+          container's logs, which datadog_in keeps in the `ddtags` string, so no `container.id`
+          reads back.
       graphite_out:
         - when: {tags: drop}
           class: lost
@@ -2805,6 +2808,35 @@ rows:
             Under `structured_data:`, a PARAM of the opt-in SD-ELEMENT, which syslog_in reads back
             as a string inside `syslog.sd`, under the SD-ID and the attribute's key. The PARAM-VALUE
             is its RFC 3339 text with nanoseconds.
+        - class: lost
+          reason: uncounted
+          text: >-
+            An attribute outside the header fields is left off, uncounted; under RFC 5424,
+            `structured_data:` writes each public event attribute other than `host.name`,
+            `process.pid`, and the `syslog.*` keys as an SD-PARAM, which syslog_in reads back
+            inside `syslog.sd`.
+  # Only datadog_in's logs decode a JSON null attribute, so only the log sinks have a cell.
+  - kind: attributes
+    feature: null_value
+    cells:
+      otlp_out:
+        class: exact
+        text: An `AnyValue` with no value set, read back as null.
+      datadog_out:
+        class: exact
+        text: On a log, a JSON null, read back as itself.
+      syslog_out:
+        - when: {format: rfc3164}
+          class: lost
+          reason: structural
+          text: >-
+            RFC 3164 has no structured data, so an attribute outside the header fields is left off.
+        - when: {format: rfc5424, structured_data: {sd_id: transit@32473}}
+          class: normalized
+          reason: structured_data
+          text: >-
+            Under `structured_data:`, a PARAM of the opt-in SD-ELEMENT with an empty PARAM-VALUE,
+            which syslog_in reads back as an empty string inside `syslog.sd`.
         - class: lost
           reason: uncounted
           text: >-
@@ -3557,6 +3589,15 @@ rows:
           Under `structured_data:`, an attribute key that isn't an RFC 5424 SD-NAME (1 to 32
           printable ASCII characters, none of them `=`, space, `]`, or `"`) has no PARAM-NAME, so
           its PARAM is left off, counted.
+  - kind: attributes
+    feature: sd_empty_array
+    cells:
+      syslog_out:
+        class: lost
+        reason: uncounted
+        text: >-
+          Under `structured_data:`, an empty array writes one PARAM per element, so none, and the
+          attribute is left off, uncounted.
   - kind: attributes
     feature: host_name
     cells:

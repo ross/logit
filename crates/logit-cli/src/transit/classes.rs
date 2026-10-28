@@ -53,9 +53,10 @@
 //! `syslog_sd`, `syslog.timestamp` `syslog_timestamp`, and `host.name` `host_name`), at a
 //! `syslog_out` with `structured_data:` under RFC 5424 a log's attribute the encoder leaves out
 //! of the opt-in SD-ELEMENT ([`syslog::opt_in_row`]: `sd_id_collision` on a log whose `syslog.sd`
-//! holds the configured SD-ID, `sd_name_unsafe` for a key that isn't an SD-NAME), an event
+//! holds the configured SD-ID, `sd_name_unsafe` for a key that isn't an SD-NAME,
+//! `sd_empty_array` for an empty array), an event
 //! attribute by its value (`string_value`, `bool_value`, `number_value`, `array_value`,
-//! `map_value`, `bytes_value`, `timestamp_value`), and any other resource attribute
+//! `map_value`, `bytes_value`, `timestamp_value`, `null_value`), and any other resource attribute
 //! `resource_attribute`; and `attributes/scope` when its batch has a scope. A log
 //! record on an event with no metrics reaches `log/dogstatsd_event` when it carries
 //! `_logit.statsd.event.title`, else `log/plain`, the message rows [`log_features`] lists, and its
@@ -110,7 +111,9 @@
 //! OpenMetrics `info` or `stateset` gauge read back as a cumulative non-monotonic sum, an `info`
 //! one under `<name>_info`; `datadog_out`'s hostless mark read back as a v2 `host` resource with no
 //! name, a log's message as its text ([`Spelling::log_message`]: a structured message as JSON,
-//! bytes as lossy UTF-8), a bytes attribute on a log as base64, and the attributes it writes from a
+//! bytes as lossy UTF-8), a bytes attribute on a log as base64, a log's `ddtags` as the encoder
+//! rewrites it and `datadog_in` lifts it, with its `container.id` a `container_id:` entry of that
+//! string and no attribute of its own ([`datadog::log_ddtags`]), and the attributes it writes from a
 //! record's own fields ([`Spelling::derived`]: the run's hostname on a record with no host, a log's
 //! `status`, `trace_id`, and `span_id`, a span's `span.kind` and `_dd.p.tid`), each accepted only
 //! with the value derived for it; a log's `trace_id` and `span_id` pair only and have no row,
@@ -662,6 +665,18 @@ impl Spelling {
         if self == Spelling::Datadog && datadog::reserved_log_key_is_omitted(rec, key) {
             return None;
         }
+        // A log's `ddtags` the encoder rewrites reads back as [`datadog::log_ddtags`] has it, and
+        // its `container.id` is an entry of that string, no attribute of its own.
+        if self == Spelling::Datadog && rec.kind == "log" {
+            if key == "ddtags" {
+                if let Some(read) = datadog::log_ddtags(rec) {
+                    return read;
+                }
+            }
+            if key == logit_core::attrs::CONTAINER_ID && datadog::log_container_id_in_ddtags(rec) {
+                return None;
+            }
+        }
         // A log's attribute is a key of its JSON object, a `Bytes` value its base64 text.
         if self == Spelling::Datadog
             && rec.kind == "log"
@@ -857,6 +872,13 @@ fn datadog_derived(rec: &Rec) -> Vec<Derived> {
                     out.push((Some("log_status"), "status", severity.to_string()));
                 }
             }
+            // A `ddtags` the encoder writes where the log had none, for pairing only: the
+            // attribute rows of the keys it holds judge it.
+            if route == datadog::Route::Log && !has("ddtags") {
+                if let Some(Some(ddtags)) = datadog::log_ddtags(rec) {
+                    out.push((None, "ddtags", ddtags));
+                }
+            }
             // An attribute of either name suppresses both ids, so a relayed Datadog log leaves
             // with its own.
             if route == datadog::Route::Log && !has("trace_id") && !has("span_id") {
@@ -1048,6 +1070,79 @@ mod datadog {
     /// back under that key: on a metric, a Datadog event, or a service check.
     pub(super) fn tags_container_id(rec: &Rec) -> bool {
         matches!(Route::of(rec), Route::Metric | Route::Event | Route::Check)
+    }
+
+    /// The `ddtags` `datadog_in` reads back from a log whose string `datadog_out` rewrites, `None`
+    /// for one it leaves as it is (`logit_proto::datadog::logs`'s `encode_log`): a log with a
+    /// non-empty `Str` `deployment.environment.name`, `service.version`, or `container.id`, beside
+    /// a `ddtags` that is text or absent. The encoder drops the string's empty entries and each
+    /// entry naming one of those keys, and appends `env:`, `version:`, and `container_id:` from
+    /// them. The decoder then lifts the `env:`, `version:`, and `service:` entries of a key with a
+    /// winner (`lift_service_identity`) and keeps the rest, `container_id:` among them; the inner
+    /// `None` is a string emptied by the lift, which reads back as no `ddtags`.
+    pub(super) fn log_ddtags(rec: &Rec) -> Option<Option<String>> {
+        use logit_core::attrs::{
+            CONTAINER_ID, DEPLOYMENT_ENVIRONMENT_NAME, SERVICE_NAME, SERVICE_VERSION,
+        };
+        use logit_proto::datadog::tags::split_joined;
+        if Route::of(rec) != Route::Log {
+            return None;
+        }
+        let entries: Vec<(&str, &str)> = [
+            ("env", DEPLOYMENT_ENVIRONMENT_NAME),
+            ("version", SERVICE_VERSION),
+            ("container_id", CONTAINER_ID),
+        ]
+        .into_iter()
+        .filter_map(|(tag, key)| {
+            let value = get(rec, key)?.as_str().filter(|v| !v.is_empty())?;
+            Some((tag, value))
+        })
+        .collect();
+        let ddtags = match get(rec, "ddtags") {
+            None => "",
+            Some(Value::String(ddtags)) => ddtags.as_str(),
+            Some(_) => return None,
+        };
+        if entries.is_empty() {
+            return None;
+        }
+        let key_of = |tag: &str| tag.split(':').next().unwrap_or("").to_string();
+        let written: Vec<String> = split_joined(ddtags)
+            .filter(|tag| !entries.iter().any(|(entry, _)| key_of(tag) == *entry))
+            .map(str::to_string)
+            .chain(entries.iter().map(|(tag, value)| format!("{tag}:{value}")))
+            .collect();
+        // The decoder's winners: the `service` field (the log's `service.name`, else its
+        // `service`) for `service`, and for every lifted key the first entry with a value.
+        let service_field = get(rec, SERVICE_NAME)
+            .filter(|v| v.as_str() != Some(""))
+            .or_else(|| get(rec, "service"))
+            .is_some_and(|v| v.as_str() != Some(""));
+        let won = |key: &str| {
+            (key == "service" && service_field)
+                || written
+                    .iter()
+                    .any(|tag| tag.split_once(':').is_some_and(|(k, v)| k == key && !v.is_empty()))
+        };
+        let rest: Vec<&str> = written
+            .iter()
+            .map(String::as_str)
+            .filter(|tag| {
+                let key = key_of(tag);
+                !(matches!(key.as_str(), "env" | "version" | "service") && won(&key))
+            })
+            .collect();
+        Some((!rest.is_empty()).then(|| rest.join(",")))
+    }
+
+    /// Whether a log's `container.id` leaves inside its `ddtags` string, as a `container_id:`
+    /// entry `datadog_in` keeps there ([`log_ddtags`]), rather than as an attribute of its own.
+    pub(super) fn log_container_id_in_ddtags(rec: &Rec) -> bool {
+        let named = get(rec, logit_core::attrs::CONTAINER_ID)
+            .and_then(Value::as_str)
+            .is_some_and(|v| !v.is_empty());
+        named && log_ddtags(rec).is_some()
     }
 
     /// Whether a log's `hostname` attribute, or its `service` attribute beside a `service.name`
@@ -1341,7 +1436,8 @@ mod syslog {
     /// The attribute row an opt-in attribute `key` of log `rec` reaches in place of its value's
     /// under the `sd_id` opt-in, where the encoder leaves it off, counted: `sd_id_collision` on a
     /// log whose own `syslog.sd` holds an element under `sd_id`, and `sd_name_unsafe` for a key
-    /// that isn't an RFC 5424 SD-NAME.
+    /// that isn't an RFC 5424 SD-NAME; and uncounted, `sd_empty_array` for an empty `Array`, which
+    /// writes one PARAM per element and so none.
     pub(super) fn opt_in_row(rec: &Rec, key: &str, sd_id: &str) -> Option<&'static str> {
         if rec.kind != "log" || !is_opt_in_param(key) {
             return None;
@@ -1350,6 +1446,8 @@ mod syslog {
             Some("sd_id_collision")
         } else if !is_valid_sd_name(key) {
             Some("sd_name_unsafe")
+        } else if rec.attributes.get(key).and_then(Value::as_array).is_some_and(Vec::is_empty) {
+            Some("sd_empty_array")
         } else {
             None
         }
@@ -2546,6 +2644,39 @@ fn observe_field(field: &Field, input: &Rec, out: &Rec, spelling: Spelling) -> C
             if outranked {
                 return Class::Lost;
             }
+            // A log's `container.id` reads back as a `container_id:` entry of its `ddtags`, and
+            // its `ddtags` as the encoder rewrites it, which is the string as it came once that
+            // entry is set aside.
+            if spelling == Spelling::Datadog && input.kind == "log" && !*resource {
+                let read = out.attributes.get("ddtags").and_then(Value::as_str);
+                if key == logit_core::attrs::CONTAINER_ID
+                    && datadog::log_container_id_in_ddtags(input)
+                {
+                    let entry = format!("container_id:{}", text(want));
+                    let found = read.is_some_and(|r| r.split(',').any(|tag| tag == entry));
+                    return if found { Class::Normalized } else { Class::Lost };
+                }
+                if key == "ddtags" {
+                    if let Some(written) = datadog::log_ddtags(input) {
+                        let id = either_side(input, logit_core::attrs::CONTAINER_ID, false);
+                        let entry = datadog::log_container_id_in_ddtags(input)
+                            .then(|| format!("container_id:{}", id.map(text).unwrap_or_default()));
+                        let own = |ddtags: Option<&str>| -> Vec<String> {
+                            logit_proto::datadog::tags::split_joined(ddtags.unwrap_or(""))
+                                .filter(|tag| Some(*tag) != entry.as_deref())
+                                .map(str::to_string)
+                                .collect()
+                        };
+                        return match read {
+                            None if written.is_none() => Class::Normalized,
+                            None => Class::Lost,
+                            Some(_) if read != written.as_deref() => Class::Normalized,
+                            Some(_) if own(read) == own(want.as_str()) => Class::Exact,
+                            Some(_) => Class::Normalized,
+                        };
+                    }
+                }
+            }
             // The v2 series route spells the hostless mark as a `host` resource with no name,
             // which `datadog_in` reads into `_logit.datadog.resources`.
             if spelling == Spelling::Datadog
@@ -3733,6 +3864,57 @@ mod tests {
         assert_eq!(pair(&ins, &other, Spelling::Datadog).seen, [None]);
     }
 
+    /// A log's `container.id` leaves as a `container_id:` entry appended to its `ddtags`, which
+    /// `datadog_in` keeps in the string: the log pairs with that read-back, `container.id` reads
+    /// `normalized`, and the string's own entries `exact`. With no `ddtags`, the entry is the
+    /// whole string.
+    #[test]
+    fn datadog_spells_a_logs_container_id_as_a_ddtags_entry() {
+        let body = r#""format":"raw","message":"m""#;
+        let ins = recs(&[
+            &log_line(body, r#"{"host.name":"h","ddtags":"team:a","container.id":"c1"}"#),
+            &log_line(body, r#"{"host.name":"h","container.id":"c1"}"#),
+        ]);
+        let outs = recs(&[
+            &log_line(body, r#"{"host.name":"h","ddtags":"team:a,container_id:c1"}"#),
+            &log_line(body, r#"{"host.name":"h","ddtags":"container_id:c1"}"#),
+        ]);
+        for i in 0..2 {
+            let (input, out) = (&ins[i..=i], &outs[i..=i]);
+            assert_eq!(pair(input, out, Spelling::Datadog).seen, [Some(Class::Exact)], "{i}");
+            let id = Field::Attribute { key: "container.id".to_string(), resource: false };
+            let class = observe_field(&id, &ins[i], &outs[i], Spelling::Datadog);
+            assert_eq!(class, Class::Normalized, "{i}");
+        }
+        let ddtags = Field::Attribute { key: "ddtags".to_string(), resource: false };
+        assert_eq!(observe_field(&ddtags, &ins[0], &outs[0], Spelling::Datadog), Class::Exact);
+        // Without the entry, the container id is lost.
+        let bare = recs(&[&log_line(body, r#"{"host.name":"h","ddtags":"team:a"}"#)]);
+        let id = Field::Attribute { key: "container.id".to_string(), resource: false };
+        assert_eq!(observe_field(&id, &ins[0], &bare[0], Spelling::Datadog), Class::Lost);
+    }
+
+    /// The `ddtags` `datadog_in` reads back from a log: the encoder drops empty entries and any
+    /// entry naming a key it appends, and the decoder lifts `env:` and `version:` entries back
+    /// onto their keys and a `service:` entry beside the log's `service`.
+    #[test]
+    fn datadog_log_ddtags_follows_the_encoder_and_the_lift() {
+        let body = r#""format":"raw","message":"m""#;
+        let ddtags =
+            |attributes: &str| datadog::log_ddtags(&recs(&[&log_line(body, attributes)])[0]);
+        assert_eq!(ddtags(r#"{"ddtags":"team:a,,b"}"#), None);
+        assert_eq!(
+            ddtags(r#"{"ddtags":"team:a,,container_id:old,b","container.id":"c1"}"#),
+            Some(Some("team:a,b,container_id:c1".to_string()))
+        );
+        assert_eq!(
+            ddtags(r#"{"ddtags":"service:x,team:a","service.name":"s","service.version":"1"}"#),
+            Some(Some("team:a".to_string()))
+        );
+        assert_eq!(ddtags(r#"{"deployment.environment.name":"prod"}"#), Some(None));
+        assert_eq!(ddtags(r#"{"ddtags":7,"container.id":"c1"}"#), None);
+    }
+
     /// A span leaves with `span.kind` from its kind and `_dd.p.tid` from its trace id's high 64
     /// bits, each read back as an attribute; a `span.kind` with another value doesn't pair.
     #[test]
@@ -4396,7 +4578,8 @@ mod tests {
 
     /// Under `structured_data:`, a key that isn't an SD-NAME and every opt-in attribute of a log
     /// whose `syslog.sd` already holds the SD-ID reach their own rows and read `lost`, and so does
-    /// a `Bytes` value, which the encoder writes as `<N bytes>`.
+    /// an empty array, which writes no PARAM, and a `Bytes` value, which the encoder writes as
+    /// `<N bytes>`.
     #[test]
     fn an_opt_in_attribute_the_encoder_leaves_off_reads_lost() {
         let body = r#""severity":"info","format":"raw","message":"m""#;
@@ -4404,17 +4587,20 @@ mod tests {
             &log_line(body, r#"{"bad key":"x","syslog.tag":"app"}"#),
             &log_line(body, r#"{"syslog.sd":{"transit@32473":{"team":"db"}},"team":"web"}"#),
             r#"{{T},"log":{"severity":"info","format":"raw","message":"m"},"attributes":{"raw":"b\"ab\""},"types":{"/attributes/raw":"bytes"}}"#,
+            &log_line(body, r#"{"none":[],"team":"web"}"#),
         ]);
         // What syslog_in reads back from each: the encoder's own element, nothing else.
         let outs = recs(&[
             &log_line(body, r#"{"syslog.tag":"app"}"#),
             &log_line(body, r#"{"syslog.sd":{"transit@32473":{"team":"db"}}}"#),
             &log_line(body, r#"{"syslog.sd":{"transit@32473":{"raw":"<2 bytes>"}}}"#),
+            &log_line(body, r#"{"syslog.sd":{"transit@32473":{"team":"web"}}}"#),
         ]);
         for (i, key, row) in [
             (0, "bad key", "sd_name_unsafe"),
             (1, "team", "sd_id_collision"),
             (2, "raw", "bytes_value"),
+            (3, "none", "sd_empty_array"),
         ] {
             let (feature, field) = attribute_row(&ins[i], key, Some(SD_ID));
             assert_eq!(feature, row, "{key}");

@@ -1,0 +1,6 @@
+# A hand-written /api/v2/logs body: `ddtags` whose `env:`, `version:`, and `service:` entries
+# datadog_in lifts onto the standard keys beside plain entries, a repeated entry, empty
+# entries, a `service` beside a `ddtags` `service:`, `ddsource` present and absent, and a
+# `container.id` key beside a `ddtags` and alone.
+wire: ddtags.bin
+exercises: [log, ddtags_lift, ddtags_repeated, ddtags_empty_entry, service_beside_ddtags, ddsource, container_id, host]

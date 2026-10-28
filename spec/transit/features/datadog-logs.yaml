@@ -13,3 +13,64 @@
     A record's own host, decoded to `host.name`: a log's `hostname` or an event's `host`.
 - name: zstd
   text: A body sent with `Content-Encoding` `zstd`, the Agent's default, decompressed first.
+- name: status
+  text: >-
+    A log's `status` in each form datadog_in maps to a severity, matched without regard to case,
+    kept verbatim as the attribute `status`.
+- name: status_unknown
+  text: A `status` outside that vocabulary, kept as the attribute with no severity.
+- name: status_absent
+  text: A log with no `status`, decoded with no severity.
+- name: ddsource
+  text: A log's `ddsource`, decoded to the attribute of that name.
+- name: ddtags_lift
+  text: >-
+    A `ddtags` whose `env:`, `version:`, and `service:` entries are lifted onto
+    `deployment.environment.name`, `service.version`, and `service.name`, the rest kept as one
+    `ddtags` string, and no `ddtags` once every entry is lifted.
+- name: ddtags_repeated
+  text: >-
+    A `ddtags` naming a lifted key twice, where the first valued entry wins and the other is left
+    off, counted `tags.omitted{reason=reserved_key}`, and a plain entry repeated, kept as it is.
+- name: ddtags_empty_entry
+  text: A `ddtags` with empty entries, kept as it came when no entry is lifted.
+- name: service_beside_ddtags
+  text: >-
+    A log's `service` beside a `ddtags` `service:` entry: the field wins, and the entry is left
+    off, counted `tags.omitted{reason=reserved_key}`.
+- name: no_hostname
+  text: A log with no `hostname`, or an empty one, decoded with no `host.name`.
+- name: hostname_displaces_host_name
+  text: >-
+    A `host.name` key beside a log's `hostname`, displaced by it, counted
+    `tags.omitted{reason=reserved_key}`.
+- name: container_id
+  text: A log's `container.id` key, decoded to the attribute of that name.
+- name: structured_message
+  text: An object or array `message`, decoded to its JSON text.
+- name: scalar_message
+  text: A number or bool `message`, decoded to its JSON text.
+- name: blank_message
+  text: An empty `message`.
+- name: timestamp_ms
+  text: A `timestamp` in integer milliseconds.
+- name: fractional_timestamp
+  text: A `timestamp` in fractional milliseconds, kept to the nanosecond.
+- name: rfc3339_timestamp
+  text: A `timestamp` as an RFC 3339 string, in UTC or with an offset.
+- name: no_timestamp
+  text: A log with no `timestamp`, or `0`, stamped with the receipt time.
+- name: bad_timestamp
+  text: A `timestamp` that isn't RFC 3339, stamped with the receipt time and reported.
+- name: trace_id_attributes
+  text: >-
+    The OTel-form `trace_id` and `span_id` keys and dd-trace's `dd.trace_id` and `dd.span_id`,
+    each decoded to an attribute, never to the log's trace.
+- name: nested_attributes
+  text: An object or array value, decoded to a nested `Map` or `Array` attribute.
+- name: u64_attribute
+  text: An integer past `i64::MAX`, decoded to a `u64` attribute.
+- name: single_object
+  text: A body that is one log object, not an array.
+- name: many_tags
+  text: A log with 101 `ddtags` entries, and one with 101 attributes.
