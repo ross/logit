@@ -417,7 +417,7 @@
 //! | `message` of another JSON type | `Str` of its JSON text | -- |
 //! | `message` absent or `null` | item dropped | `logit.input.logs.dropped{reason="no_message"}` |
 //! | `status` | attribute `status`, verbatim; `severity` by case-insensitive match: `emergency`/`emerg`/`alert`/`critical`/`crit`/`fatal` → `Fatal`, `error`/`err` → `Error`, `warning`/`warn` → `Warn`, `notice`/`info` → `Info`, `debug` → `Debug`, `trace` → `Trace`, else `None` | -- |
-//! | `timestamp`: integer (or fractional) milliseconds, or an RFC 3339 string | `Event::timestamp`; a fractional number is read from its own text, every digit to the nanosecond kept ([`time::millis_text_to_nanos`]) | -- |
+//! | `timestamp`: integer (or fractional) milliseconds, or an RFC 3339 string | `Event::timestamp`; a fractional number is read from its own text, every digit to the nanosecond kept and any finer digit dropped ([`time::millis_text_to_nanos`]) | -- |
 //! | `timestamp` absent, `null`, or `0` | `received_at` | -- |
 //! | `timestamp` another type, or an unparseable string | `received_at` | diag `bad_timestamp` |
 //! | `hostname`, a non-empty string | [`ATTR_HOST_NAME`], displacing a `host.name` key | `logit.input.tags.omitted{reason="reserved_key"}` for a displaced key |
