@@ -1140,7 +1140,8 @@ Recorded per workstream as each lands.
     ([ADR `log-record-trace-context`](../adr/log-record-trace-context.md)'s "Amendment: Datadog id
     formats"; §10, decision 9).
   - `DatadogEncoder::with_default_source` (`crates/logit-proto/src/datadog/mod.rs`) is called
-    only from tests, so `datadog_out` never writes a default `ddsource`.
+    only from tests, so `datadog_out` never writes a default `ddsource`. `tsink/w2` removed the
+    dead path; an operator who wants a `ddsource` on every log sets it upstream with `set`.
   - `splunk_hec_out` and `datadog_out` read neither `_logit.otel.severity_*` nor
     `_logit.syslog.severity` (`crates/logit-proto/src/splunk/logs.rs`,
     `crates/logit-proto/src/datadog/logs.rs`). Each writes a public severity attribute verbatim
@@ -1249,7 +1250,8 @@ Recorded per workstream as each lands.
     value written as its length (ADR `transit-spec`'s log-records amendment, decision 9).
   - `datadog_in` reads a fractional-millisecond `timestamp` through an `f64`, so
     `1799999990001.5` reads `07:59:50.001499904Z`, a sub-microsecond error, and `datadog_out`
-    writes whole milliseconds (`log/timestamp`, `normalized`).
+    writes whole milliseconds (`log/timestamp`, `normalized`). Fixed in `tsink/w2`: the number's
+    own text is read, and the case reads `07:59:50.001500000Z`.
   - Every `status` form `status_severity` knows maps to its band and stays verbatim as the
     attribute `status`; an unknown one, `verbose`, stays as the attribute with no severity, and
     `datadog_out` writes it back as it came, while `syslog_out` stamps PRI severity 6
@@ -1339,7 +1341,8 @@ Recorded per workstream as each lands.
     whose two `uncounted` cells take their own `UNCOUNTED_ALLOWED` entries, the third mechanism
     of "Uncounted losses" above and of ADR `transit-spec`'s decision 9. Both formats have a slot
     for the trace, so the loss isn't `structural`. `docs/known-gaps/datadog.md` and `splunk.md`
-    have it.
+    have it. Fixed in `tsink/w2`: both count the trace as
+    `logit.output.tags.omitted{reason="reserved_key"}`.
   - `span/no_wire_form` is reached by a span field a Datadog span has no form for, which isn't
     `splunk_hec_out`'s set: an `ok` status alone reaches the row, and `splunk_hec_out` writes it,
     so a span carrying nothing else reads `exact` against its `degraded` cell. The
@@ -1373,3 +1376,16 @@ Recorded per workstream as each lands.
     case reaches it. `crates/logit-cli/tests/syslog_round_trip.rs`'s permitted-normalization list
     gains the TAG default as its tenth entry, since the Python handler's captures now relay with
     `logit:`.
+  - **`datadog_out`, `splunk_hec_out`, and `datadog_in`** (`tsink/w2`): both
+    `log/trace_beside_id_attribute` cells read `lost`, counted `reserved_key`, observed in
+    `otlp-logs-to-datadog` and `otlp-logs-to-splunk` with the counter moving once, and their two
+    `UNCOUNTED_ALLOWED` entries go, leaving three. The `timestamps` case's fractional log reads
+    `07:59:50.001500000Z`. The `f64` held `1799999990001.5` without error; the old read lost the
+    digits in `ms * 1e6`, past 2^53, so the `f64` fallback for an exponent form or a fraction
+    finer than a nanosecond now splits whole and fractional milliseconds, as
+    `seconds_f64_to_nanos` does for seconds. The decoder parses the body into
+    `serde_json::Value`, which keeps a fractional number's `f64` and not its text, so it splits
+    the body's items out as raw JSON only on the first item whose `timestamp` isn't an integer;
+    an integer timestamp pays nothing. With the fraction exact, `datadog-logs-to-syslog` and
+    `datadog-logs-to-syslog-sd` observe `log/timestamp` at `syslog_out` as `exact` only, since
+    no sub-microsecond digits are left for RFC 5424's six fractional digits to truncate.
