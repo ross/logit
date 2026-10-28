@@ -1821,6 +1821,11 @@ pub(crate) enum SinkEncoder {
     /// transport caps it; `tcp` under `transport: tcp`, where the sink frames each entry with an
     /// octet count and `syslog_in` reads it with line splitting off.
     Syslog { encoder: SyslogEncoder, tcp: bool },
+    /// `splunk_hec_out`: one HEC object per [`logit_proto::MessageBuf`] entry
+    /// (`SplunkEncoder::encode_objects`), filling the host of an object that carries none with the
+    /// process hostname, as the sink does; an object over `max_body_bytes` is dropped, counted as
+    /// the sink counts it.
+    Splunk { encoder: logit_proto::splunk::SplunkEncoder, max_body_bytes: usize },
 }
 
 /// The [`SinkEncoder`] for `kind`, its codec counting through `telemetry` and `diag`. Every
@@ -1924,6 +1929,15 @@ pub(crate) fn sink_encoder(
                 tcp,
             }
         }
+        SplunkHecOut { multi_value, max_body_bytes, .. } => SinkEncoder::Splunk {
+            encoder: logit_outputs::splunk::encoder(
+                telemetry.clone(),
+                diag.clone(),
+                splunk_multi_value(*multi_value),
+                Some(hostname.clone()),
+            ),
+            max_body_bytes: usize::try_from(*max_body_bytes).unwrap_or(usize::MAX),
+        },
         other => anyhow::bail!("{} has no encoder this driver reaches", graph::kind_name(other)),
     })
 }

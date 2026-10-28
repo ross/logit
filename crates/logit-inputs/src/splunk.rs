@@ -1096,31 +1096,18 @@ async fn respond(
     let mut decoder = SplunkDecoder::new()
         .with_telemetry(shared.telemetry.clone())
         .with_diagnostics(shared.diag.clone());
-    // A code 6 naming object `N > 0` still delivers objects `0..N`, as Splunk indexes them, and
-    // is answered once they are delivered; a client resends from `N + 1`.
-    let mut invalid: Option<HecError> = None;
-    let mut batches: Vec<EventBatch> = match route {
-        Route::Event => {
-            let decoded = decoder.decode_events_prefix(&body, received_at);
-            if let Some(err) = decoded.error {
-                if err.invalid_event_number.unwrap_or(0) == 0 {
-                    return (name, REJECTED, reject_hec_error(shared, &err, None));
-                }
-                invalid = Some(err);
+    let (mut batches, invalid) =
+        match decode_route(route, &body, &query.envelope, received_at, &mut decoder) {
+            Ok(decoded) => decoded,
+            Err(RouteFailure::Malformed(err)) => {
+                return (name, REJECTED, reject_hec_error(shared, &err, None));
             }
-            decoded.batches.into_iter().filter(|batch| !batch.events.is_empty()).collect()
-        }
-        Route::Raw => {
-            let batch = decoder.decode_raw(&body, &query.envelope, received_at);
-            if batch.events.is_empty() {
+            Err(RouteFailure::NoRawLine) => {
                 let response = hec_response(HecStatus::NO_DATA);
                 let message = "a /raw body with no non-empty line";
                 return (name, REJECTED, reject(shared, "no_data", Some(message), response));
             }
-            vec![batch]
-        }
-        Route::Ack | Route::Health => unreachable!("answered above"),
-    };
+        };
 
     // Every batch, before the first is delivered: the split below delivers a prefix that a code 6
     // or a closed consumer can follow.
@@ -1170,6 +1157,91 @@ async fn respond(
         return (name, REJECTED, reject_hec_error(shared, &err, ack_id));
     }
     (name, OK, json_response(StatusCode::OK, Bytes::from(encode_success(ack_id))))
+}
+
+/// Why a decoded `/event` or `/raw` body delivers nothing ([`decode_route`]).
+enum RouteFailure {
+    /// A `/event` body whose first object is bad: code 6 naming object 0, or code 5.
+    Malformed(HecError),
+    /// A `/raw` body with no non-empty line: code 5.
+    NoRawLine,
+}
+
+/// "Request handling" step 7 for a decompressed, non-empty `/event` or `/raw` body: its batches
+/// that hold an event, and for a body cut short at object `N > 0`, the code 6 naming `N`, whose
+/// prefix Splunk still indexes and a client resends from `N + 1`. `envelope` is the query
+/// string's, which only `/raw` reads.
+fn decode_route(
+    route: Route,
+    body: &[u8],
+    envelope: &Envelope,
+    received_at: i64,
+    decoder: &mut SplunkDecoder,
+) -> Result<(Vec<EventBatch>, Option<HecError>), RouteFailure> {
+    match route {
+        Route::Event => {
+            let decoded = decoder.decode_events_prefix(body, received_at);
+            if let Some(err) = decoded.error {
+                if err.invalid_event_number.unwrap_or(0) == 0 {
+                    return Err(RouteFailure::Malformed(err));
+                }
+            }
+            let batches =
+                decoded.batches.into_iter().filter(|batch| !batch.events.is_empty()).collect();
+            Ok((batches, decoded.error))
+        }
+        Route::Raw => {
+            let batch = decoder.decode_raw(body, envelope, received_at);
+            if batch.events.is_empty() {
+                return Err(RouteFailure::NoRawLine);
+            }
+            Ok((vec![batch], None))
+        }
+        Route::Ack | Route::Health => unreachable!("answered before the body is decoded"),
+    }
+}
+
+/// One recorded `/event` or `/raw` request decoded as this listener decodes it, at
+/// `received_at`: the route and, for `/raw`, the envelope from `target`'s path and query string
+/// (percent-decoded), the compression from `Content-Encoding` in `headers`, then the listener's
+/// own decode step. A replay of a captured request reads it through this, so it takes the
+/// listener's path; the HTTP steps around it (method, size, authentication, channels, delivery)
+/// don't apply to a body already read. `Err` names why the listener would have answered
+/// something other than its route's success, a code 6 after a delivered prefix included.
+pub fn decode_request(
+    target: &str,
+    headers: &HeaderMap,
+    body: Bytes,
+    received_at: i64,
+    mut decoder: SplunkDecoder,
+) -> Result<Vec<EventBatch>, String> {
+    let (path, query) = target.split_once('?').map_or((target, None), |(p, q)| (p, Some(q)));
+    let route =
+        Route::from_path(path).ok_or_else(|| format!("{path} is no splunk_hec_in route"))?;
+    if matches!(route, Route::Ack | Route::Health) {
+        return Err(format!("{path} decodes no event body"));
+    }
+    let query = Query::parse(query);
+    let encoding = match Encoding::from_headers(headers) {
+        Ok(encoding @ (Encoding::Identity | Encoding::Gzip)) => encoding,
+        Ok(_) => return Err("unsupported Content-Encoding".to_string()),
+        Err(sent) => return Err(format!("unsupported Content-Encoding {sent:?}")),
+    };
+    let body = match decompress(encoding, body, DEFAULT_MAX_REQUEST_BYTES) {
+        Ok(body) => body,
+        Err(DecompressError::TooLarge) => {
+            return Err("the decompressed body is over the cap".into())
+        }
+        Err(DecompressError::Malformed(message)) => return Err(message),
+    };
+    if body.is_empty() {
+        return Err("an empty body".to_string());
+    }
+    match decode_route(route, &body, &query.envelope, received_at, &mut decoder) {
+        Ok((batches, None)) => Ok(batches),
+        Ok((_, Some(err))) | Err(RouteFailure::Malformed(err)) => Err(err.to_string()),
+        Err(RouteFailure::NoRawLine) => Err("a /raw body with no non-empty line".to_string()),
+    }
 }
 
 /// `503` code 9 with `Retry-After: 1`: nothing of the body was taken, so the client resends it
@@ -1491,6 +1563,33 @@ mod tests {
                 .collect();
             assert_eq!(lines, ["one", "two", "three"]);
         }
+    }
+
+    /// A replayed `/raw` request reads as the listener reads it: the percent-decoded envelope on
+    /// the resource and one log per line.
+    #[tokio::test]
+    async fn decode_request_agrees_with_the_listener_on_a_raw_body() {
+        let (addr, mut rx) = start_default().await;
+        let target = "/services/collector/raw?host=web%201&source=%2Fvar%2Flog&index=main&x=y";
+        let body = b"one\r\ntwo\n\nthree";
+        let response = post_raw(&addr, target, "", body).await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let served = recv_batch(&mut rx).await;
+        let replayed = decode_request(
+            target,
+            &HeaderMap::new(),
+            Bytes::from_static(body),
+            served.events[0].timestamp,
+            SplunkDecoder::new(),
+        )
+        .unwrap();
+        assert_eq!(replayed.len(), 1);
+        assert_eq!(replayed[0].resource, served.resource);
+        assert_eq!(replayed[0].events, served.events);
+        assert_eq!(
+            served.resource.attributes.get("host.name"),
+            Some(&logit_core::Value::str("web 1"))
+        );
     }
 
     #[tokio::test]

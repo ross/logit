@@ -11,10 +11,11 @@
 //! | `datadog_out` | one uncompressed request per route per batch, one per event on the events route, with the sink's routing (`encode_routes`) and none of its stale filter, tag limit, trace readiness gate, or size cuts | `datadog_in`'s `decode_request`, by the request's path and `Content-Type` |
 //! | `graphite_out` | each `MessageBuf` entry: one plaintext line, or one length-prefixed pickle frame, line-capped as the sink's transport caps it | `GraphiteDecoder` of the encoder's protocol, one entry at a time, a pickle frame's length prefix stripped as `graphite_in`'s framer strips it |
 //! | `syslog_out` | each `MessageBuf` entry: one message, capped as the sink's transport caps it | `SyslogDecoder`, one entry at a time: a UDP datagram with line splitting on, `syslog_in`'s default `framing: lines`, or under `transport: tcp` one octet-counted frame's payload with line splitting off |
+//! | `splunk_hec_out` | each `MessageBuf` entry: one HEC object (`encode_objects`), an object over `max_body_bytes` dropped and counted as the sink drops it, the rest joined into one `/event` body per batch | `SplunkDecoder::decode_events` |
 //!
 //! The statsd, InfluxDB, and syslog encoders return their counts, so this counts them through the
-//! sink's own reporting functions; the OTLP, Prometheus, Datadog, and Graphite encoders count
-//! through the handle they hold.
+//! sink's own reporting functions; the OTLP, Prometheus, Datadog, Graphite, and Splunk encoders
+//! count through the handle they hold.
 //! A decode error fails the run: the pair's decoder refusing its own sink's bytes is a finding.
 
 use crate::pipeline::SinkEncoder;
@@ -30,6 +31,7 @@ use logit_proto::influxdb::{write_resource, InfluxDecoder, Precision};
 use logit_proto::otlp::OtlpDecoder;
 use logit_proto::prometheus::compression::decompress_bounded;
 use logit_proto::prometheus::{families_to_events, remote_write, text, Dialect, PrometheusDecoder};
+use logit_proto::splunk::SplunkDecoder;
 use logit_proto::statsd::StatsdDecoder;
 use logit_proto::syslog::SyslogDecoder;
 use logit_proto::{Decoder, Encoder, FramedEncoder, MessageBuf, SignalDecoder, SignalEncoder};
@@ -252,6 +254,35 @@ pub(super) fn round_trip(
                 if !events.is_empty() {
                     out.push(EventBatch { resource, scope: None, events });
                 }
+            }
+        }
+        SinkEncoder::Splunk { mut encoder, max_body_bytes } => {
+            let (telemetry, diag) = decode.handles("splunk_hec_in");
+            let mut decoder = SplunkDecoder::new().with_telemetry(telemetry).with_diagnostics(diag);
+            let mut sink_diag = sink_diag.clone();
+            let mut objects = MessageBuf::default();
+            for batch in batches {
+                encoder.encode_objects(batch, &mut objects);
+                logit_outputs::splunk::count_oversize(
+                    &objects,
+                    max_body_bytes,
+                    sink,
+                    &mut sink_diag,
+                );
+                let mut body = Vec::new();
+                for object in objects.iter().filter(|object| object.len() <= max_body_bytes) {
+                    body.extend_from_slice(object);
+                }
+                if body.is_empty() {
+                    continue;
+                }
+                let decoded = decoder.decode_events(&body, decode.received_at).map_err(|err| {
+                    anyhow::anyhow!(
+                        "splunk_hec_in refused {:?}: {err}",
+                        String::from_utf8_lossy(&body)
+                    )
+                })?;
+                out.extend(decoded);
             }
         }
         SinkEncoder::PrometheusRemoteWrite { mut encoder, version, compression } => {
