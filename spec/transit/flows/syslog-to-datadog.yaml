@@ -1,0 +1,16 @@
+# syslog_in's cases into datadog_out with nothing between: each log as one object of a
+# `/api/v2/logs` body.
+# `path:` names one case so `logit run` can run this by hand; the transit spec runs every case in
+# that file's directory (spec/transit/README.md).
+components:
+  case:
+    type: replay_in
+    path: ../cases/syslog/logger-rfc5424-basic.json
+  out:
+    type: datadog_out
+    sources: [case]
+    api_key: transit-unused   # the spec sends nothing; a real config reads !env DD_API_KEY
+    endpoints:
+      api: http://127.0.0.1:8080
+      logs: http://127.0.0.1:8080
+      traces: http://127.0.0.1:8080

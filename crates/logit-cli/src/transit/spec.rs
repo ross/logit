@@ -1166,6 +1166,7 @@ flow_tests! {
     collectd_to_graphite => "collectd-to-graphite",
     datadog_logs_relay => "datadog-logs-relay",
     datadog_logs_to_otlp => "datadog-logs-to-otlp",
+    datadog_logs_to_syslog => "datadog-logs-to-syslog",
     datadog_relay => "datadog-relay",
     datadog_to_influxdb => "datadog-to-influxdb",
     datadog_to_otlp => "datadog-to-otlp",
@@ -1193,6 +1194,8 @@ flow_tests! {
     otlp_delta_to_datadog => "otlp-delta-to-datadog",
     otlp_logs_relay => "otlp-logs-relay",
     otlp_logs_to_datadog => "otlp-logs-to-datadog",
+    otlp_logs_to_syslog => "otlp-logs-to-syslog",
+    otlp_logs_to_syslog_rfc3164 => "otlp-logs-to-syslog-rfc3164",
     otlp_relay => "otlp-relay",
     otlp_to_datadog => "otlp-to-datadog",
     otlp_to_datadog_counters => "otlp-to-datadog-counters",
@@ -1227,6 +1230,10 @@ flow_tests! {
     statsd_to_prometheus => "statsd-to-prometheus",
     statsd_to_graphite => "statsd-to-graphite",
     statsd_to_graphite_expand => "statsd-to-graphite-expand",
+    syslog_relay => "syslog-relay",
+    syslog_relay_rfc3164 => "syslog-relay-rfc3164",
+    syslog_to_datadog => "syslog-to-datadog",
+    syslog_to_otlp => "syslog-to-otlp",
 }
 
 #[cfg(test)]

@@ -139,15 +139,16 @@ Entry format and the other areas: [the known-gaps index](README.md).
   by `script/transit docs`, one per sink with a column there, and a test fails when one is stale:
   change the mapping table, not these. Each holds that sink's `degraded`, `lost`, `skipped`, and
   `dropped` cells in the table's row order, a cell that depends on the sink's config naming its
-  condition. The hand-written rows above for the same six sinks are the outcomes the spec has no
+  condition. The hand-written rows above for the same seven sinks are the outcomes the spec has no
   row for, or details its cells don't state. A generated row states the mapping and its counter;
   why the wire or the destination forces it is in the sink's module doc: the Prometheus rows'
   in `crates/logit-proto/src/prometheus/` (`mod.rs`, `text.rs`, `remote_write.rs`), the
   InfluxDB rows' in `crates/logit-proto/src/influxdb/mod.rs`, the OTLP rows' in
   `crates/logit-proto/src/otlp/` (`metrics.rs` and `logs.rs`), the statsd rows' in
   `crates/logit-outputs/src/statsd.rs`, the Datadog rows' in
-  `crates/logit-proto/src/datadog/mod.rs`, and the Graphite rows' in
-  `crates/logit-proto/src/graphite/mod.rs`.
+  `crates/logit-proto/src/datadog/mod.rs`, the Graphite rows' in
+  `crates/logit-proto/src/graphite/mod.rs`, and the syslog rows' in
+  `crates/logit-outputs/src/syslog.rs`.
 
   <!-- transit:gaps:statsd_out -->
 
@@ -378,6 +379,7 @@ Entry format and the other areas: [the known-gaps index](README.md).
   | encode (OTLP) | field `attributes/interval_on_distribution` → **lost** | none (structural) | The flag is private and isn't an OTLP attribute, so it's left off. |
   | encode (OTLP) | field `attributes/interval_on_histogram` → **lost** | none (structural) | The flag is private and isn't an OTLP attribute, so it's left off. |
   | encode (OTLP) | field `attributes/datadog_carrier_log` → **lost** | none (structural) | A `_logit.` carrier is private and isn't an OTLP attribute, so it's left off. |
+  | encode (OTLP) | field `attributes/severity_carrier_syslog` → **lost** | none (structural) | A `_logit.` carrier is private and isn't an OTLP attribute, so it's left off and the severity reads back at band resolution. |
   | encode (OTLP) | `event/attributes_only` → **skipped** | `logit.output.events.skipped{reason=no_payload}` | An event with no metric, log, or span has no OTLP signal and isn't sent. |
   | encode (OTLP) | `event/string_only` → **skipped** | `logit.output.events.skipped{reason=no_payload}` | An InfluxDB point whose fields are all strings has no OTLP signal and isn't sent, so its fields are lost. |
 
@@ -440,6 +442,7 @@ Entry format and the other areas: [the known-gaps index](README.md).
   | encode (Datadog) | field `attributes/scope` → **lost** | none (structural) | Datadog has no instrumentation scope, so none is written. |
   | encode (Datadog) | field `attributes/datadog_carrier_log` → **lost** | none (uncounted) | A `_logit.datadog.*` carrier on a log, a Datadog event, or a service check that the route has no field for is left off, uncounted, where the metrics routes count one as `no_wire_form`; the events route's public form has no field for the Agent envelope's `_logit.datadog.agent.hostname`. |
   | encode (Datadog) | field `attributes/severity_carrier_otel` → **lost** | none (structural) | A Datadog log has a status and no raw OTLP severity, so the carriers are left off and the severity reads back at band resolution. |
+  | encode (Datadog) | field `attributes/severity_carrier_syslog` → **lost** | none (structural) | A Datadog log has a status and no raw syslog severity, so the carrier is left off and the severity reads back at band resolution. |
   | encode (Datadog) | field `log/body_format` → **lost** | none (structural) | A Datadog log has no body format, so a `json` or `structured` format reads back as `raw`. |
   | encode (Datadog) | field `log/event_name` → **lost** | none (structural) | A Datadog log has no event name, so none is written. |
   | encode (Datadog) | field `log/observed_timestamp` → **lost** | none (structural) | A Datadog log has no observed time, so none is written. |
@@ -530,6 +533,76 @@ Entry format and the other areas: [the known-gaps index](README.md).
   | encode (Graphite) | field `span/beside_metrics` → **lost** | none (uncounted) | A span on an event that carries metrics is left off while the metrics are written, uncounted. |
   | encode (Graphite) | `event/attributes_only` → **skipped** | `logit.output.events.skipped{reason=no_metrics}` | An event with no metric, log, or span has no datapoint and isn't written. |
   | encode (Graphite) | `event/string_only` → **skipped** | `logit.output.events.skipped{reason=no_metrics}` | An InfluxDB point whose fields are all strings has no metric, so it has no datapoint and isn't written. |
+
+  <!-- transit:end -->
+
+  <!-- transit:gaps:syslog_out -->
+
+  | Direction | Mapping | Counter | Why |
+  |---|---|---|---|
+  | encode (syslog) | field `attributes/string_value`, under `format: rfc3164` → **lost** | none (structural) | RFC 3164 has no structured data, so an attribute outside the header fields is left off. |
+  | encode (syslog) | field `attributes/string_value`, otherwise → **lost** | none (uncounted) | An attribute outside the header fields is left off, uncounted; under RFC 5424, `structured_data:` writes every public event attribute as an SD-PARAM, which syslog_in reads back inside `syslog.sd`. |
+  | encode (syslog) | field `attributes/host_beside_host_name`, under `format: rfc3164` → **lost** | none (structural) | RFC 3164 has no structured data, so an attribute outside the header fields is left off. |
+  | encode (syslog) | field `attributes/host_beside_host_name`, otherwise → **lost** | none (uncounted) | An attribute outside the header fields is left off, uncounted; under RFC 5424, `structured_data:` writes every public event attribute as an SD-PARAM, which syslog_in reads back inside `syslog.sd`. |
+  | encode (syslog) | field `attributes/hostname`, under `format: rfc3164` → **lost** | none (structural) | RFC 3164 has no structured data, so an attribute outside the header fields is left off. |
+  | encode (syslog) | field `attributes/hostname`, otherwise → **lost** | none (uncounted) | An attribute outside the header fields is left off, uncounted; under RFC 5424, `structured_data:` writes every public event attribute as an SD-PARAM, which syslog_in reads back inside `syslog.sd`. |
+  | encode (syslog) | field `attributes/log_service`, under `format: rfc3164` → **lost** | none (structural) | RFC 3164 has no structured data, so an attribute outside the header fields is left off. |
+  | encode (syslog) | field `attributes/log_service`, otherwise → **lost** | none (uncounted) | An attribute outside the header fields is left off, uncounted; under RFC 5424, `structured_data:` writes every public event attribute as an SD-PARAM, which syslog_in reads back inside `syslog.sd`. |
+  | encode (syslog) | field `attributes/log_service_field`, under `format: rfc3164` → **lost** | none (structural) | RFC 3164 has no structured data, so an attribute outside the header fields is left off. |
+  | encode (syslog) | field `attributes/log_service_field`, otherwise → **lost** | none (uncounted) | An attribute outside the header fields is left off, uncounted; under RFC 5424, `structured_data:` writes every public event attribute as an SD-PARAM, which syslog_in reads back inside `syslog.sd`. |
+  | encode (syslog) | field `attributes/container_id`, under `format: rfc3164` → **lost** | none (structural) | RFC 3164 has no structured data, so an attribute outside the header fields is left off. |
+  | encode (syslog) | field `attributes/container_id`, otherwise → **lost** | none (uncounted) | An attribute outside the header fields is left off, uncounted; under RFC 5424, `structured_data:` writes every public event attribute as an SD-PARAM, which syslog_in reads back inside `syslog.sd`. |
+  | encode (syslog) | field `attributes/service_identity`, under `format: rfc3164` → **lost** | none (structural) | RFC 3164 has no structured data, so an attribute outside the header fields is left off. |
+  | encode (syslog) | field `attributes/service_identity`, otherwise → **lost** | none (uncounted) | An attribute outside the header fields is left off, uncounted; under RFC 5424, `structured_data:` writes every public event attribute as an SD-PARAM, which syslog_in reads back inside `syslog.sd`. |
+  | encode (syslog) | field `attributes/service_tag`, under `format: rfc3164` → **lost** | none (structural) | RFC 3164 has no structured data, so an attribute outside the header fields is left off. |
+  | encode (syslog) | field `attributes/service_tag`, otherwise → **lost** | none (uncounted) | An attribute outside the header fields is left off, uncounted; under RFC 5424, `structured_data:` writes every public event attribute as an SD-PARAM, which syslog_in reads back inside `syslog.sd`. |
+  | encode (syslog) | field `attributes/service_tag_beside_key`, under `format: rfc3164` → **lost** | none (structural) | RFC 3164 has no structured data, so an attribute outside the header fields is left off. |
+  | encode (syslog) | field `attributes/service_tag_beside_key`, otherwise → **lost** | none (uncounted) | An attribute outside the header fields is left off, uncounted; under RFC 5424, `structured_data:` writes every public event attribute as an SD-PARAM, which syslog_in reads back inside `syslog.sd`. |
+  | encode (syslog) | field `attributes/bool_value`, under `format: rfc3164` → **lost** | none (structural) | RFC 3164 has no structured data, so an attribute outside the header fields is left off. |
+  | encode (syslog) | field `attributes/bool_value`, otherwise → **lost** | none (uncounted) | An attribute outside the header fields is left off, uncounted; under RFC 5424, `structured_data:` writes every public event attribute as an SD-PARAM, which syslog_in reads back inside `syslog.sd`. |
+  | encode (syslog) | field `attributes/number_value`, under `format: rfc3164` → **lost** | none (structural) | RFC 3164 has no structured data, so an attribute outside the header fields is left off. |
+  | encode (syslog) | field `attributes/number_value`, otherwise → **lost** | none (uncounted) | An attribute outside the header fields is left off, uncounted; under RFC 5424, `structured_data:` writes every public event attribute as an SD-PARAM, which syslog_in reads back inside `syslog.sd`. |
+  | encode (syslog) | field `attributes/array_value`, under `format: rfc3164` → **lost** | none (structural) | RFC 3164 has no structured data, so an attribute outside the header fields is left off. |
+  | encode (syslog) | field `attributes/array_value`, otherwise → **lost** | none (uncounted) | An attribute outside the header fields is left off, uncounted; under RFC 5424, `structured_data:` writes every public event attribute as an SD-PARAM, which syslog_in reads back inside `syslog.sd`. |
+  | encode (syslog) | field `attributes/map_value`, under `format: rfc3164` → **lost** | none (structural) | RFC 3164 has no structured data, so an attribute outside the header fields is left off. |
+  | encode (syslog) | field `attributes/map_value`, otherwise → **lost** | none (uncounted) | An attribute outside the header fields is left off, uncounted; under RFC 5424, `structured_data:` writes every public event attribute as an SD-PARAM, which syslog_in reads back inside `syslog.sd`. |
+  | encode (syslog) | field `attributes/bytes_value`, under `format: rfc3164` → **lost** | none (structural) | RFC 3164 has no structured data, so an attribute outside the header fields is left off. |
+  | encode (syslog) | field `attributes/bytes_value`, otherwise → **lost** | none (uncounted) | An attribute outside the header fields is left off, uncounted; under RFC 5424, `structured_data:` writes every public event attribute as an SD-PARAM, which syslog_in reads back inside `syslog.sd`. |
+  | encode (syslog) | field `attributes/timestamp_value`, under `format: rfc3164` → **lost** | none (structural) | RFC 3164 has no structured data, so an attribute outside the header fields is left off. |
+  | encode (syslog) | field `attributes/timestamp_value`, otherwise → **lost** | none (uncounted) | An attribute outside the header fields is left off, uncounted; under RFC 5424, `structured_data:` writes every public event attribute as an SD-PARAM, which syslog_in reads back inside `syslog.sd`. |
+  | encode (syslog) | field `attributes/private_carrier` → **lost** | none (structural) | A `_logit.` carrier or flag is private and isn't a header field, so it's left off. |
+  | encode (syslog) | field `attributes/prometheus_target` → **lost** | none (structural) | A `_logit.` carrier or flag is private and isn't a header field, so it's left off. |
+  | encode (syslog) | field `attributes/foreign_carrier` → **lost** | none (structural) | A `_logit.` carrier or flag is private and isn't a header field, so it's left off. |
+  | encode (syslog) | field `attributes/timestamped` → **lost** | none (structural) | A `_logit.` carrier or flag is private and isn't a header field, so it's left off. |
+  | encode (syslog) | field `attributes/rate` → **lost** | none (structural) | A `_logit.` carrier or flag is private and isn't a header field, so it's left off. |
+  | encode (syslog) | field `attributes/interval` → **lost** | none (structural) | A `_logit.` carrier or flag is private and isn't a header field, so it's left off. |
+  | encode (syslog) | field `attributes/rate_on_non_gauge` → **lost** | none (structural) | A `_logit.` carrier or flag is private and isn't a header field, so it's left off. |
+  | encode (syslog) | field `attributes/family_type` → **lost** | none (structural) | A `_logit.` carrier or flag is private and isn't a header field, so it's left off. |
+  | encode (syslog) | field `attributes/family_type_on_other_kind` → **lost** | none (structural) | A `_logit.` carrier or flag is private and isn't a header field, so it's left off. |
+  | encode (syslog) | field `attributes/interval_on_distribution` → **lost** | none (structural) | A `_logit.` carrier or flag is private and isn't a header field, so it's left off. |
+  | encode (syslog) | field `attributes/interval_on_histogram` → **lost** | none (structural) | A `_logit.` carrier or flag is private and isn't a header field, so it's left off. |
+  | encode (syslog) | field `attributes/resource_attribute` → **lost** | none (structural) | Syslog has no resource, so a resource attribute is left off, apart from `host.name` and `process.pid`, which are HOSTNAME and PROCID when the event carries neither and read back on the event. |
+  | encode (syslog) | field `attributes/scope` → **lost** | none (structural) | Syslog has no instrumentation scope, so none is written. |
+  | encode (syslog) | field `attributes/datadog_carrier_log` → **lost** | none (structural) | A `_logit.` carrier or flag is private and isn't a header field, so it's left off. |
+  | encode (syslog) | field `attributes/severity_carrier_otel` → **lost** | none (structural) | Syslog has no raw OTLP severity, so the carriers are left off and the severity reads back from PRI at syslog's resolution. |
+  | encode (syslog) | field `attributes/syslog_header`, under `format: rfc3164` → **lost** | none (structural) | Under RFC 3164, `syslog.facility` is PRI's facility and `syslog.tag` the TAG, and a PID is written only inside a TAG, so `process.pid` or `syslog.pid` on a log with no `syslog.tag` is left off. |
+  | encode (syslog) | field `attributes/syslog_msgid`, under `format: rfc3164` → **lost** | none (structural) | RFC 3164 has no MSGID, so it's left off. |
+  | encode (syslog) | field `attributes/syslog_sd`, under `format: rfc3164` → **lost** | none (structural) | RFC 3164 has no STRUCTURED-DATA, so it's left off. |
+  | encode (syslog) | field `attributes/syslog_timestamp`, under `format: rfc3164` → **lost** | none (structural) | Under RFC 3164, an RFC 5424 timestamp is TIMESTAMP in whole seconds with no year or zone, which syslog_in reads back as that text; an RFC 3164 one is written as it is; and a null one has no RFC 3164 form, so TIMESTAMP is the log's timestamp and the attribute is left off. |
+  | encode (syslog) | field `attributes/syslog_timestamp`, otherwise → **lost** | none (structural) | An RFC 3164 timestamp has no year or zone to write under RFC 5424, so TIMESTAMP is the log's timestamp and the attribute is left off; an RFC 5424 or null one is written as it is. |
+  | encode (syslog) | field `attributes/host_name`, under `format: rfc3164` → **lost** | none (structural) | Under RFC 3164, a log with no `syslog.tag` has no TAG, so syslog_in reads its HOSTNAME as the first word of its message (the `log/header_in_message` row) and reads no `host.name` back. |
+  | encode (syslog) | field `log/body_format` → **lost** | none (structural) | Syslog has no body format, so MSG reads back as `raw`. |
+  | encode (syslog) | field `log/event_name` → **lost** | none (structural) | Syslog has no event name, so it's left off. |
+  | encode (syslog) | field `log/observed_timestamp` → **lost** | none (structural) | Syslog has no observed timestamp, so it's left off. |
+  | encode (syslog) | field `log/trace` → **lost** | none (structural) | Syslog has no trace context, so the trace and span ids are left off. |
+  | encode (syslog) | field `log/trace_flags` → **lost** | none (structural) | Syslog has no trace flags, so they're left off. |
+  | encode (syslog) | field `log/dropped_attributes_count` → **lost** | none (structural) | Syslog has no dropped-attributes count, so it's left off. |
+  | encode (syslog) | field `log/receipt_timestamp` → **lost** | none (structural) | A log whose `syslog.timestamp` is written as TIMESTAMP leaves its own timestamp, the receipt time, unwritten; syslog_in stamps its own receipt time. |
+  | encode (syslog) | `span/alone` → **skipped** | none (uncounted) | A span has no syslog form and isn't written: on an event with no log, the event is skipped, counted as `logit.output.events.skipped`; beside a log, it's left off, uncounted. |
+  | encode (syslog) | `span/no_wire_form` → **skipped** | none (uncounted) | A span has no syslog form and isn't written: on an event with no log, the event is skipped, counted as `logit.output.events.skipped`; beside a log, it's left off, uncounted. |
+  | encode (syslog) | field `span/beside_metrics` → **lost** | `logit.output.events.skipped` | A span has no syslog form, so it isn't written beside its event's metrics, which have none either. |
+  | encode (syslog) | `event/attributes_only` → **skipped** | `logit.output.events.skipped` | An event with no log has no syslog form and isn't written. |
+  | encode (syslog) | `event/string_only` → **skipped** | `logit.output.events.skipped` | An InfluxDB point whose fields are all strings has no log, so it isn't written and its fields are lost. |
 
   <!-- transit:end -->
 

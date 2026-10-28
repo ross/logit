@@ -1,0 +1,40 @@
+{
+  "cells": [
+    {"sink":"syslog_out","row":"attributes/array_value","cell":1,"observed":["lost"]},
+    {"sink":"syslog_out","row":"attributes/bool_value","cell":1,"observed":["lost"]},
+    {"sink":"syslog_out","row":"attributes/bytes_value","cell":1,"observed":["lost"]},
+    {"sink":"syslog_out","row":"attributes/log_status","cell":0,"observed":["exact"]},
+    {"sink":"syslog_out","row":"attributes/map_value","cell":1,"observed":["lost"]},
+    {"sink":"syslog_out","row":"attributes/no_host","cell":0,"observed":["normalized"]},
+    {"sink":"syslog_out","row":"attributes/number_value","cell":1,"observed":["lost"]},
+    {"sink":"syslog_out","row":"attributes/resource_attribute","cell":0,"observed":["lost"]},
+    {"sink":"syslog_out","row":"attributes/scope","cell":0,"observed":["lost"]},
+    {"sink":"syslog_out","row":"attributes/severity_carrier_otel","cell":0,"observed":["lost"]},
+    {"sink":"syslog_out","row":"attributes/string_value","cell":1,"observed":["lost"]},
+    {"sink":"syslog_out","row":"attributes/syslog_facility","cell":0,"observed":["normalized"]},
+    {"sink":"syslog_out","row":"attributes/syslog_timestamp","cell":1,"observed":["lost"]},
+    {"sink":"syslog_out","row":"attributes/timestamp_value","cell":1,"observed":["lost"]},
+    {"sink":"syslog_out","row":"log/beside_metrics","cell":1,"observed":["exact"]},
+    {"sink":"syslog_out","row":"log/blank_message","cell":0,"observed":["exact"]},
+    {"sink":"syslog_out","row":"log/body_format","cell":0,"observed":["exact","lost"]},
+    {"sink":"syslog_out","row":"log/bytes_message","cell":0,"observed":["exact"]},
+    {"sink":"syslog_out","row":"log/dropped_attributes_count","cell":0,"observed":["lost"]},
+    {"sink":"syslog_out","row":"log/event_name","cell":0,"observed":["lost"]},
+    {"sink":"syslog_out","row":"log/message_unsafe","cell":0,"observed":["normalized"]},
+    {"sink":"syslog_out","row":"log/observed_timestamp","cell":0,"observed":["lost"]},
+    {"sink":"syslog_out","row":"log/observed_timestamp_unset","cell":0,"observed":["exact"]},
+    {"sink":"syslog_out","row":"log/plain","cell":0,"observed":["exact"]},
+    {"sink":"syslog_out","row":"log/receipt_timestamp","cell":0,"observed":["exact"]},
+    {"sink":"syslog_out","row":"log/severity","cell":0,"observed":["exact","normalized"]},
+    {"sink":"syslog_out","row":"log/severity_unset","cell":0,"observed":["normalized"]},
+    {"sink":"syslog_out","row":"log/structured_message","cell":0,"observed":["normalized"]},
+    {"sink":"syslog_out","row":"log/timestamp","cell":1,"observed":["exact","normalized"]},
+    {"sink":"syslog_out","row":"log/trace","cell":0,"observed":["lost"]},
+    {"sink":"syslog_out","row":"log/trace_flags","cell":0,"observed":["lost"]},
+    {"sink":"syslog_out","row":"log/trace_unset","cell":0,"observed":["exact"]},
+    {"sink":"syslog_out","row":"span/alone","cell":0,"observed":["skipped"]}
+  ],
+  "unspecified": [
+    {"sink":"syslog_out","row":"gauge/i64","reached_by":["otlp-logs-to-syslog × beside-metrics"]}
+  ]
+}

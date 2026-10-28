@@ -46,8 +46,11 @@
 //! and `_logit.metrics.interval` `interval_on_distribution` on a `samples`, `distribution`, or
 //! delta `exponential_histogram`, `interval_on_histogram` on a delta `histogram`, and `interval`
 //! on any other kind, at every sink, a `_logit.datadog.` carrier on a log, a Datadog
-//! event, or a service check `datadog_carrier_log`, any other `_logit.` key `foreign_carrier`, an
-//! event
+//! event, or a service check `datadog_carrier_log`, `_logit.syslog.severity`
+//! `severity_carrier_syslog`, any other `_logit.` key `foreign_carrier`, on a log an event
+//! attribute `syslog_out` writes as a header field by its key (`syslog.facility`, `syslog.tag`,
+//! `syslog.pid`, and `process.pid` `syslog_header`, `syslog.msgid` `syslog_msgid`, `syslog.sd`
+//! `syslog_sd`, `syslog.timestamp` `syslog_timestamp`, and `host.name` `host_name`), an event
 //! attribute by its value (`string_value`, `bool_value`, `number_value`, `array_value`,
 //! `map_value`, `bytes_value`, `timestamp_value`), and any other resource attribute
 //! `resource_attribute`; and `attributes/scope` when its batch has a scope. A log
@@ -111,7 +114,14 @@
 //! since `log/trace` judges them; `graphite_out`'s forbidden characters as `_` in a
 //! path, a tag name, and a tag value (and a tag value's leading `~`), a tag value in the encoder's
 //! rendering, and the values it omits as no tag ([`graphite_value`]). Each name, key, and value set
-//! is the encoder's own predicate. A candidate's public attributes (no `_logit.`
+//! is the encoder's own predicate. `syslog_out`'s rewrites are a log's message as `syslog_in`
+//! reads it back ([`Spelling::log_message`]: the encoder's rendering, and under RFC 3164 with any
+//! header token the decoder reads as MSG), a header attribute in the encoder's rendering
+//! ([`syslog::value_for`]), a PROCID read back as `process.pid` when canonical decimal and as
+//! `syslog.pid` otherwise, and the attributes it fills in ([`Spelling::derived`]: its configured
+//! facility on a log with no `syslog.facility`, the run's hostname on a log with no host, and for
+//! pairing only, `syslog.timestamp` written from the log's timestamp and under RFC 3164 a TAG read
+//! from the message's first word). A candidate's public attributes (no `_logit.`
 //! key, values compared as text, each key and value as the sink writes it) must equal the
 //! input's, or failing any that do, be a subset of them; a `datadog_out` series under `<name>.`
 //! may also carry the `lower_bound`, `upper_bound`, or `quantile` tag of the bucket or quantile it
@@ -139,7 +149,12 @@
 //! format read back as another is `lost`, since the format names how to read the message; an
 //! `_unset` row is `exact` when the field reads back absent and `normalized` when the sink fills
 //! it in; and a receipt timestamp read back outside its own second is `lost`, another instant
-//! that no precision explains. `prometheus_out` has one exception, which compares a value:
+//! that no precision explains. At `syslog_out`, `syslog_in` stamps its own receipt time, so
+//! `log/timestamp` compares the TIMESTAMP written, read back as `syslog.timestamp`: the input's
+//! RFC 3339 text is `exact`, another rendering of its instant (microseconds, or RFC 3164's whole
+//! seconds with no year) `normalized`, and a TIMESTAMP written from the log's own
+//! `syslog.timestamp` leaves it `lost`; a `syslog.timestamp` the encoder can't render under the
+//! sink's format reads `lost`. `prometheus_out` has one exception, which compares a value:
 //! `_logit.prometheus.target` absent reads `normalized` when the read-back's `instance` equals the
 //! input's, and `lost` otherwise. The observed class may be better than the cell's but never worse. A
 //! degraded, skipped, or dropped record's field rows aren't looked up, so they're neither reached
@@ -491,19 +506,21 @@ impl Spelling {
     }
 
     /// The message the sink's pair decoder reads log `rec` back with, as text, where the sink's
-    /// encoder rewrites it; `None` for a record that isn't a log on an event with no metrics, and
-    /// at a sink that writes the message as it is. `datadog_out`'s logs route writes
+    /// encoder rewrites it; `None` for a record that isn't a log, and at a sink that writes the
+    /// message as it is. For a log alone, `datadog_out`'s logs route writes
     /// `logit_proto::json::value_text`: a `Bytes` message as lossy UTF-8 and any other non-`Str`
     /// one as its JSON text, which `datadog_in` reads back as a `Str`. `otlp_out` writes every
     /// message as an `AnyValue`. `syslog_out` writes [`logit_outputs::syslog::wire_message`],
     /// which `syslog_in` reads back as a `Str`, or as `Bytes` where it isn't UTF-8, and under RFC
     /// 3164 with any header token it doesn't read as a header ([`syslog::read`]).
     fn log_message(self, rec: &Rec) -> Option<String> {
-        if rec.kind != "log" || rec.beside_metrics {
+        if rec.kind != "log" {
             return None;
         }
         match self {
-            Spelling::Datadog if datadog::Route::of(rec) == datadog::Route::Log => {
+            Spelling::Datadog
+                if !rec.beside_metrics && datadog::Route::of(rec) == datadog::Route::Log =>
+            {
                 let log = model_log(rec)?;
                 Some(logit_proto::json::value_text(&log.message).into_owned())
             }
@@ -1246,9 +1263,8 @@ mod syslog {
             }
         };
         let written_tag = tag_pid.map(|(token, _)| token);
-        let tag_from_attribute = read_tag.is_some()
-            && written_tag.is_some()
-            && read_tag.as_deref() == tag.as_deref();
+        let tag_from_attribute =
+            read_tag.is_some() && written_tag.is_some() && read_tag.as_deref() == tag.as_deref();
         Some(Read {
             host: read_host,
             tag: read_tag,
@@ -1304,7 +1320,9 @@ mod syslog {
                 wire_msgid(format(rfc3164), &attrs)
             }
             SD if on_event && !rfc3164 && value.is_object() => Some(super::text(value)),
-            TIMESTAMP if on_event => written_timestamp(rec, rfc3164).map(|(read, _)| super::text(&read)),
+            TIMESTAMP if on_event => {
+                written_timestamp(rec, rfc3164).map(|(read, _)| super::text(&read))
+            }
             _ => None,
         }
     }
@@ -2200,7 +2218,8 @@ fn field_rows(rec: &Rec, protocol: &str) -> Vec<(String, Option<String>, Field)>
             None
         }
     };
-    // A log's attribute the log sinks treat by its key: `syslog_out`'s header fields.
+    // A log's own attribute `syslog_out` writes as a header field. On the resource it's a
+    // resource attribute, which the header reads back from the event.
     let header = |key: &str| {
         if rec.kind != "log" || rec.beside_metrics {
             return None;
@@ -2279,10 +2298,8 @@ fn field_rows(rec: &Rec, protocol: &str) -> Vec<(String, Option<String>, Field)>
         rows.push(("attributes".to_string(), Some(feature.to_string()), field));
     }
     for (key, value) in &rec.resource {
-        let feature = carrier(key, value)
-            .or_else(|| header(key))
-            .or_else(|| outranked(key, value))
-            .unwrap_or("resource_attribute");
+        let feature =
+            carrier(key, value).or_else(|| outranked(key, value)).unwrap_or("resource_attribute");
         let field = Field::Attribute { key: key.clone(), resource: true };
         rows.push(("attributes".to_string(), Some(feature.to_string()), field));
     }
@@ -2348,7 +2365,9 @@ fn observe_field(field: &Field, input: &Rec, out: &Rec, spelling: Spelling) -> C
         Field::Timestamp { .. } if matches!(spelling, Spelling::Syslog { .. }) => {
             let Spelling::Syslog { rfc3164, .. } = spelling else { return Class::Lost };
             match syslog::written_timestamp(input, rfc3164) {
-                Some((written, false)) if out.attributes.get(syslog::TIMESTAMP) == Some(&written) => {
+                Some((written, false))
+                    if out.attributes.get(syslog::TIMESTAMP) == Some(&written) =>
+                {
                     if written == Value::String(input.timestamp.clone()) {
                         Class::Exact
                     } else {
@@ -4102,5 +4121,71 @@ mod tests {
             log_field(&ins[0], &same[0], "datadog", "trace", Spelling::Datadog),
             Class::Normalized
         );
+    }
+
+    const SYSLOG_5424: Spelling =
+        Spelling::Syslog { rfc3164: false, facility: 16, structured_data: false };
+    const SYSLOG_3164: Spelling =
+        Spelling::Syslog { rfc3164: true, facility: 16, structured_data: false };
+
+    /// A log `syslog_in` reads back from `syslog_out` with the facility, host, and timestamp the
+    /// sink filled in still pairs with the log that carried none of them.
+    #[test]
+    fn a_syslog_read_back_pairs_beside_the_header_it_fills_in() {
+        let ins = recs(&[&log_line(r#""severity":"info","format":"raw","message":"m""#, "{}")]);
+        let outs = recs(&[&format!(
+            r#"{{{{T}},"log":{{"severity":"info","format":"raw","message":"m"}},"attributes":{{"_logit.syslog.severity":6,"host.name":"{host}","syslog.facility":16,"syslog.timestamp":"2027-01-15T08:00:00.000000000Z"}},"types":{{"/attributes/_logit.syslog.severity":"u64","/attributes/syslog.facility":"u64","/attributes/syslog.timestamp":"timestamp"}}}}"#,
+            host = super::super::HOSTNAME,
+        )]);
+        assert_eq!(pair(&ins, &outs, SYSLOG_5424).seen, [Some(Class::Exact)]);
+    }
+
+    /// Under RFC 3164 the log's timestamp leaves in whole seconds with no year, read back as
+    /// `syslog.timestamp`'s text beside a receipt time that happens to equal it.
+    #[test]
+    fn an_rfc3164_timestamp_reads_normalized() {
+        let ins = recs(&[&log_line(r#""severity":"info","format":"raw","message":"m""#, "{}")]);
+        let outs = recs(&[&log_line(
+            r#""severity":"info","format":"raw","message":"m""#,
+            r#"{"syslog.timestamp":"Jan 15 08:00:00"}"#,
+        )]);
+        assert_eq!(
+            log_field(&ins[0], &outs[0], "otlp", "timestamp", SYSLOG_3164),
+            Class::Normalized
+        );
+    }
+
+    /// `_logit.syslog.severity` has its own row, beside every other protocol's carriers.
+    #[test]
+    fn the_syslog_severity_carrier_lands_on_its_own_row() {
+        let ins = recs(&[
+            r#"{{T},"log":{"severity":"info","format":"raw","message":"m"},"attributes":{"_logit.syslog.severity":5},"types":{"/attributes/_logit.syslog.severity":"u64"}}"#,
+        ]);
+        for protocol in ["syslog", "otlp"] {
+            let features: Vec<_> = field_rows(&ins[0], protocol)
+                .into_iter()
+                .filter(|(kind, _, _)| kind == "attributes")
+                .filter_map(|(_, feature, _)| feature)
+                .collect();
+            assert!(features.contains(&"severity_carrier_syslog".to_string()), "{features:?}");
+        }
+    }
+
+    /// RFC 3164 has no MSGID: a log's `syslog.msgid` reaches its own row and reads `lost` there,
+    /// and `exact` under RFC 5424.
+    #[test]
+    fn a_msgid_under_rfc3164_reads_lost() {
+        let body = r#""severity":"info","format":"raw","message":"m""#;
+        let ins = recs(&[&log_line(body, r#"{"syslog.msgid":"req","syslog.tag":"app"}"#)]);
+        let without = recs(&[&log_line(body, r#"{"syslog.tag":"app"}"#)]);
+        let rows = field_rows(&ins[0], "syslog");
+        let (_, _, field) = rows
+            .iter()
+            .find(|(kind, feature, _)| {
+                kind == "attributes" && feature.as_deref() == Some("syslog_msgid")
+            })
+            .expect("a syslog_msgid row");
+        assert_eq!(observe_field(field, &ins[0], &without[0], SYSLOG_3164), Class::Lost);
+        assert_eq!(observe_field(field, &ins[0], &ins[0], SYSLOG_5424), Class::Exact);
     }
 }

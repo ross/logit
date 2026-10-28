@@ -1,0 +1,3 @@
+# Lines that sniff as RFC 5424 but fail its parse, read as tag-less RFC 3164.
+wire: sniff-fallback.syslog
+exercises: [rfc3164, sniff_fallback, tagless, multi_line]

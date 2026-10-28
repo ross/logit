@@ -1575,7 +1575,9 @@ pub(crate) fn build_spec(
                 *max_message_bytes,
                 structured_data.as_ref(),
             )
-            .with_context(|| format!("component {id:?}: syslog_out structured_data.sd_id is invalid"))?;
+            .with_context(|| {
+                format!("component {id:?}: syslog_out structured_data.sd_id is invalid")
+            })?;
             output = output
                 .with_encoder(encoder)
                 .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))

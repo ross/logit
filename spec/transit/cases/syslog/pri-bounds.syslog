@@ -1,0 +1,4 @@
+<0>Jan 15 07:59:09 web-1 kernel: kern.emerg
+<191>1 2027-01-15T07:59:10Z web-1 app - - - local7.debug
+<184>1 2027-01-15T07:59:11Z web-1 app - - - local7.emerg
+<7>Jan 15 07:59:12 web-1 kernel: kern.debug

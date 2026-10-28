@@ -1,0 +1,5 @@
+# rsyslog's omfwd forwarding over TCP with its default LF-terminated framing, one
+# connection's bytes read in place from testdata/interop/.
+wire: ../../../../testdata/interop/syslog/rsyslog-tcp-000.raw
+framing: stream
+exercises: [rfc3164, forwarder, stream]

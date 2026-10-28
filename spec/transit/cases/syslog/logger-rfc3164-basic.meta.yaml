@@ -1,0 +1,3 @@
+# util-linux logger(1) in RFC 3164 mode, read in place from testdata/interop/.
+wire: ../../../../testdata/interop/syslog/logger-rfc3164-basic-000.raw
+exercises: [rfc3164]

@@ -1,0 +1,1 @@
+{"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"severity":"info","format":"raw","message":"every optional field nil"},"attributes":{"_logit.syslog.severity":5,"syslog.facility":20,"syslog.timestamp":null},"types":{"/attributes/_logit.syslog.severity":"u64","/attributes/syslog.facility":"u64"}}

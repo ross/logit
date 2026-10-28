@@ -1052,3 +1052,30 @@ Recorded per workstream as each lands.
     (`log/observed_timestamp_unset`, `normalized`).
   - `otlp_in` reads a `u64` attribute above `i64::MAX`, which `otlp_out` writes as a
     `doubleValue`, back as an `F64`; the class check's OTLP spelling compares it as that double.
+- **The syslog source and `syslog_out`** (`tlog/w2`): the `syslog` cases, and the `otlp-logs` and
+  `datadog-logs` cases, put every log field and header attribute in front of `syslog_out` under
+  both formats. Each behavior below is a cell in `mapping.yaml`, observed at its class; none is
+  fixed, and `docs/known-gaps/syslog.md` has the ones an operator meets.
+  - Under RFC 3164, a log with no `syslog.tag` leaves with a HOSTNAME and no TAG, and
+    `syslog_in`'s two-token header rule (`crates/logit-proto/src/syslog/mod.rs`'s "The RFC 3164
+    header") reads the HOSTNAME as the first word of MSG: the log reads back with `transit ` in
+    front of its message and no `host.name`. A message whose first word is TAG-shaped reads back
+    with that word as `syslog.tag`. The record-level row `log/header_in_message` (`normalized`)
+    holds it, since a log's record level has no other class to observe it at, and
+    `attributes/host_name` reads `lost` under RFC 3164. Python's `SysLogHandler` cases, the sniff
+    fallbacks, the PROCID with a nil APP-NAME, and every `otlp-logs` case under
+    `otlp-logs-to-syslog-rfc3164` reach it.
+  - Under RFC 3164, a PID is written only inside a TAG, so a `process.pid` or `syslog.pid` on a log
+    with no `syslog.tag` is left off, uncounted (`attributes/syslog_header`, `lost`).
+  - Every public attribute outside the header fields is left off, uncounted, with no
+    `structured_data:`: the value-type rows and the host- and service-key rows each have a
+    `syslog_out` entry in `UNCOUNTED_ALLOWED`.
+  - A `syslog.timestamp` the encoder can't render under its format, an RFC 3164 string under RFC
+    5424 or a null under RFC 3164, gives way to `event.timestamp` (`attributes/syslog_timestamp`,
+    `lost`); where it renders, the log's own receipt time has no slot (`log/receipt_timestamp`,
+    `lost`).
+  - A log's metrics and a span beside it are left off, uncounted (`log/beside_metrics`,
+    `span/alone`). `syslog_out` has no metric-kind cells, so the `otlp-logs` `beside-metrics`
+    case's gauge reaches `gauge/i64` unspecified there.
+  - `otlp_out` and `datadog_out` write a `u64` `syslog.facility` or `process.pid` that their pair
+    decoders read back as an `i64` (`attributes/syslog_header`, `normalized`).

@@ -1,0 +1,13 @@
+# otlp_in's log cases into syslog_out under `format: rfc3164` with nothing between: each log's
+# message as MSG, its severity as PRI, and its timestamp in whole seconds with no year.
+# `path:` names one case so `logit run` can run this by hand; the transit spec runs every case in
+# that file's directory (spec/transit/README.md).
+components:
+  case:
+    type: replay_in
+    path: ../cases/otlp-logs/bodies.json
+  out:
+    type: syslog_out
+    sources: [case]
+    endpoint: 127.0.0.1:514
+    format: rfc3164

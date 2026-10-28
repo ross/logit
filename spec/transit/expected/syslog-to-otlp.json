@@ -1,0 +1,51 @@
+{
+  "bytes-message": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"severity":"info","format":"raw","message":"b\"caf\\xe9 \\xff\\xfe binary\"","observed_timestamp":"2027-01-15T08:00:01.000000000Z"},"attributes":{"_logit.otel.severity_number":9,"_logit.otel.severity_text":"Info","host.name":"web-1","process.pid":4242,"syslog.facility":1,"syslog.msgid":"req","syslog.tag":"app","syslog.timestamp":1799999941000001000},"types":{"/log/message":"bytes"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"severity":"info","format":"raw","message":"b\"caf\\xe9 latin-1\"","observed_timestamp":"2027-01-15T08:00:01.000000000Z"},"attributes":{"_logit.otel.severity_number":9,"_logit.otel.severity_text":"Info","host.name":"web-1","syslog.facility":1,"syslog.tag":"app","syslog.timestamp":"Jan 15 07:59:02"},"types":{"/log/message":"bytes"}}
+  ], "counters": {}},
+  "logger-rfc3164-basic": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"severity":"info","format":"raw","message":"hello from logger(1), captured for logit interop fixtures","observed_timestamp":"2027-01-15T08:00:01.000000000Z"},"attributes":{"_logit.otel.severity_number":9,"_logit.otel.severity_text":"Info","host.name":"2676410b1513","syslog.facility":1,"syslog.tag":"logit-fixture","syslog.timestamp":"Sep 10 21:21:44"}}
+  ], "counters": {}},
+  "logger-rfc3164-unicode": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"severity":"info","format":"raw","message":"héllo wörld — ünïcödé ✓ (UTF-8 multibyte smoke test)","observed_timestamp":"2027-01-15T08:00:01.000000000Z"},"attributes":{"_logit.otel.severity_number":9,"_logit.otel.severity_text":"Info","host.name":"222237a384c4","syslog.facility":1,"syslog.tag":"logit-fixture","syslog.timestamp":"Sep 10 21:21:46"}}
+  ], "counters": {}},
+  "logger-rfc5424-basic": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"severity":"info","format":"raw","message":"hello from logger(1) in RFC 5424 mode, captured for logit interop fixtures","observed_timestamp":"2027-01-15T08:00:01.000000000Z"},"attributes":{"_logit.otel.severity_number":9,"_logit.otel.severity_text":"Info","host.name":"f750585defea","syslog.facility":1,"syslog.sd":{"timeQuality":{"isSynced":"1","syncAccuracy":"69277","tzKnown":"1"}},"syslog.tag":"logit-fixture","syslog.timestamp":1789075308174343000}}
+  ], "counters": {}},
+  "nil-fields": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"severity":"info","format":"raw","message":"every optional field nil","observed_timestamp":"2027-01-15T08:00:01.000000000Z"},"attributes":{"_logit.otel.severity_number":9,"_logit.otel.severity_text":"Info","syslog.facility":20,"syslog.timestamp":null}}
+  ], "counters": {}},
+  "pid": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"severity":"info","format":"raw","message":"bracketed pid","observed_timestamp":"2027-01-15T08:00:01.000000000Z"},"attributes":{"_logit.otel.severity_number":9,"_logit.otel.severity_text":"Info","host.name":"web-1","process.pid":123,"syslog.facility":1,"syslog.tag":"app","syslog.timestamp":"Jan 15 07:59:06"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"severity":"info","format":"raw","message":"decimal procid","observed_timestamp":"2027-01-15T08:00:01.000000000Z"},"attributes":{"_logit.otel.severity_number":9,"_logit.otel.severity_text":"Info","host.name":"web-1","process.pid":4242,"syslog.facility":1,"syslog.tag":"app","syslog.timestamp":1799999943000000000}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"severity":"info","format":"raw","message":"leading-zero procid","observed_timestamp":"2027-01-15T08:00:01.000000000Z"},"attributes":{"_logit.otel.severity_number":9,"_logit.otel.severity_text":"Info","host.name":"web-1","syslog.facility":1,"syslog.pid":"007","syslog.tag":"app","syslog.timestamp":1799999945000000000}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"severity":"info","format":"raw","message":"procid with no app-name","observed_timestamp":"2027-01-15T08:00:01.000000000Z"},"attributes":{"_logit.otel.severity_number":9,"_logit.otel.severity_text":"Info","host.name":"web-1","process.pid":4243,"syslog.facility":1,"syslog.timestamp":1799999947000000000}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"severity":"info","format":"raw","message":"token procid","observed_timestamp":"2027-01-15T08:00:01.000000000Z"},"attributes":{"_logit.otel.severity_number":9,"_logit.otel.severity_text":"Info","host.name":"web-1","syslog.facility":1,"syslog.pid":"web.1","syslog.tag":"app","syslog.timestamp":1799999944000000000}}
+  ], "counters": {}},
+  "pri-bounds": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"severity":"debug","format":"raw","message":"kern.debug","observed_timestamp":"2027-01-15T08:00:01.000000000Z"},"attributes":{"_logit.otel.severity_number":5,"_logit.otel.severity_text":"Debug","host.name":"web-1","syslog.facility":0,"syslog.tag":"kernel","syslog.timestamp":"Jan 15 07:59:12"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"severity":"debug","format":"raw","message":"local7.debug","observed_timestamp":"2027-01-15T08:00:01.000000000Z"},"attributes":{"_logit.otel.severity_number":5,"_logit.otel.severity_text":"Debug","host.name":"web-1","syslog.facility":23,"syslog.tag":"app","syslog.timestamp":1799999950000000000}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"severity":"fatal","format":"raw","message":"kern.emerg","observed_timestamp":"2027-01-15T08:00:01.000000000Z"},"attributes":{"_logit.otel.severity_number":21,"_logit.otel.severity_text":"Fatal","host.name":"web-1","syslog.facility":0,"syslog.tag":"kernel","syslog.timestamp":"Jan 15 07:59:09"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"severity":"fatal","format":"raw","message":"local7.emerg","observed_timestamp":"2027-01-15T08:00:01.000000000Z"},"attributes":{"_logit.otel.severity_number":21,"_logit.otel.severity_text":"Fatal","host.name":"web-1","syslog.facility":23,"syslog.tag":"app","syslog.timestamp":1799999951000000000}}
+  ], "counters": {}},
+  "python-handler": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"severity":"info","format":"raw","message":"hello from python logging.handlers.SysLogHandler, captured for logit interop fixtures","observed_timestamp":"2027-01-15T08:00:01.000000000Z"},"attributes":{"_logit.otel.severity_number":9,"_logit.otel.severity_text":"Info","syslog.facility":1}}
+  ], "counters": {}},
+  "python-handler-json": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"severity":"info","format":"raw","message":"{\"level\": \"info\", \"msg\": \"request handled\", \"path\": \"/\", \"status\": 200}","observed_timestamp":"2027-01-15T08:00:01.000000000Z"},"attributes":{"_logit.otel.severity_number":9,"_logit.otel.severity_text":"Info","syslog.facility":1}}
+  ], "counters": {}},
+  "rsyslog": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"severity":"info","format":"raw","message":"hello from rsyslog, captured for logit interop fixtures","observed_timestamp":"2027-01-15T08:00:01.000000000Z"},"attributes":{"_logit.otel.severity_number":9,"_logit.otel.severity_text":"Info","host.name":"66221ea5a62b","syslog.facility":1,"syslog.tag":"logit-fixture","syslog.timestamp":"Sep 10 21:22:06"}}
+  ], "counters": {}},
+  "rsyslog-tcp": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"severity":"info","format":"raw","message":"hello from rsyslog, captured for logit interop fixtures","observed_timestamp":"2027-01-15T08:00:01.000000000Z"},"attributes":{"_logit.otel.severity_number":9,"_logit.otel.severity_text":"Info","host.name":"5f296f2c68a7","syslog.facility":1,"syslog.tag":"logit-fixture","syslog.timestamp":"Sep 13 11:09:50"}}
+  ], "counters": {}},
+  "sniff-fallback": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"severity":"info","format":"raw","message":"1 2027-01-15T07:59:08Z web-1 app - - [unclosed sd","observed_timestamp":"2027-01-15T08:00:01.000000000Z"},"attributes":{"_logit.otel.severity_number":9,"_logit.otel.severity_text":"Info","syslog.facility":1}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"severity":"info","format":"raw","message":"1 not-a-timestamp web-1 app - - - bad timestamp","observed_timestamp":"2027-01-15T08:00:01.000000000Z"},"attributes":{"_logit.otel.severity_number":9,"_logit.otel.severity_text":"Info","syslog.facility":1}}
+  ], "counters": {}},
+  "timestamps": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"severity":"info","format":"raw","message":"offset and fraction","observed_timestamp":"2027-01-15T08:00:01.000000000Z"},"attributes":{"_logit.otel.severity_number":9,"_logit.otel.severity_text":"Info","host.name":"web-1","syslog.facility":1,"syslog.tag":"app","syslog.timestamp":1799999947500000000}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"severity":"info","format":"raw","message":"out of range","observed_timestamp":"2027-01-15T08:00:01.000000000Z"},"attributes":{"_logit.otel.severity_number":9,"_logit.otel.severity_text":"Info","host.name":"web-1","syslog.facility":1,"syslog.tag":"app"}}
+  ], "counters": {}}
+}

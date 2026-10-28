@@ -1,8 +1,10 @@
 {
   "cells": [
     {"sink":"otlp_out","row":"attributes/foreign_carrier","cell":0,"observed":["lost"]},
+    {"sink":"otlp_out","row":"attributes/host_name","cell":0,"observed":["exact"]},
     {"sink":"otlp_out","row":"attributes/log_status","cell":0,"observed":["exact"]},
     {"sink":"otlp_out","row":"attributes/string_value","cell":0,"observed":["exact"]},
+    {"sink":"otlp_out","row":"attributes/syslog_facility","cell":0,"observed":["exact"]},
     {"sink":"otlp_out","row":"gauge/f64","cell":0,"observed":["exact"]},
     {"sink":"otlp_out","row":"log/body_format","cell":0,"observed":["exact"]},
     {"sink":"otlp_out","row":"log/observed_timestamp_unset","cell":0,"observed":["normalized"]},

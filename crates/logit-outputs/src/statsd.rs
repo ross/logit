@@ -346,6 +346,8 @@
 //! | `attributes/resource_attribute`, otherwise | normalized | `resource_merged` | A resource attribute is written as a tag, the event's value winning on a shared key, and reads back as an event attribute. |
 //! | `attributes/scope` | lost | structural | statsd has no instrumentation scope, so none is written. |
 //! | `attributes/datadog_carrier_log` | lost | structural | Another protocol's `_logit.` carrier is private and isn't a tag, so it's left off. |
+//! | `attributes/host_name` | exact | -- | A DogStatsD event's `h:` field, read back as `host.name`. |
+//! | `attributes/syslog_facility` | exact | -- | A log with no `syslog.facility` leaves with none. |
 //! | `attributes/no_host` | exact | -- | A record with no host leaves with none. |
 //! | `log/severity` | exact | -- | A DogStatsD event's `\|t:` alert type, written from its `_logit.statsd.event.alert_type` carrier, which statsd_in reads back as the severity. |
 //! | `log/severity_unset` | exact | -- | A DogStatsD event with no alert type, read back as no severity. |

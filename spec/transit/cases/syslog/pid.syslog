@@ -1,0 +1,5 @@
+<14>1 2027-01-15T07:59:03Z web-1 app 4242 - - decimal procid
+<14>1 2027-01-15T07:59:04Z web-1 app web.1 - - token procid
+<14>1 2027-01-15T07:59:05Z web-1 app 007 - - leading-zero procid
+<14>Jan 15 07:59:06 web-1 app[123]: bracketed pid
+<14>1 2027-01-15T07:59:07Z web-1 - 4243 - - procid with no app-name

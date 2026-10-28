@@ -15,15 +15,18 @@ limits, and [the plan](../../docs/plans/transit-spec.md) the workstreams.
 The sources are `statsd_in`, `influxdb_in`, `prometheus_in`'s scrape (remote-write cases
 aren't written yet), `datadog_in`'s metrics routes and service checks (`cases/datadog/`) and its
 logs and events (`cases/datadog-logs/`), with no APM cases yet, `collectd_in`, `otlp_in`'s metrics
-(`cases/otlp/`) and logs (`cases/otlp-logs/`), with no trace cases yet, and `graphite_in`,
-plaintext and pickle. A source directory's name before its first `-` names its system, so
+(`cases/otlp/`) and logs (`cases/otlp-logs/`), with no trace cases yet, `graphite_in`,
+plaintext and pickle, and `syslog_in`, RFC 3164 and RFC 5424 over UDP and as a TCP stream. A
+source directory's name before its first `-` names its system, so
 `datadog-logs` cases decode through `datadog_in`. The sink columns are `statsd_out`,
-`prometheus_out` (exposition and remote-write), `influxdb_out`, `otlp_out`, `datadog_out`, and
-`graphite_out`. A log record's rows have cells at `otlp_out`, `datadog_out`, and, for a DogStatsD
-event, `statsd_out`. Each flow's name says which source meets which sink: `statsd-relay`,
-`influxdb-relay`, `datadog-relay`, `datadog-logs-relay`, `otlp-relay`, `otlp-logs-relay`,
-`graphite-relay`, `prometheus-to-prometheus`, and `prometheus-to-prometheus-remote-write` are like
-pairs, and `influxdb-to-prometheus` a cross-protocol one.
+`prometheus_out` (exposition and remote-write), `influxdb_out`, `otlp_out`, `datadog_out`,
+`graphite_out`, and `syslog_out`, which has cells on the log, span, event, and attribute rows and
+none on a metric kind's. A log record's rows have cells at `otlp_out`, `datadog_out`,
+`syslog_out`, and, for a DogStatsD event, `statsd_out`. Each flow's name says which source meets
+which sink: `statsd-relay`, `influxdb-relay`, `datadog-relay`, `datadog-logs-relay`, `otlp-relay`,
+`otlp-logs-relay`, `graphite-relay`, `syslog-relay`, `prometheus-to-prometheus`, and
+`prometheus-to-prometheus-remote-write` are like pairs, and `influxdb-to-prometheus` a
+cross-protocol one.
 
 `datadog_out` makes four drops above its encoders: `stale` and `too_many_tags`, which read the
 wall clock or apply an intake limit, and `needs_agent_processing` and `not_datadog_origin`, which
@@ -45,7 +48,7 @@ key, a stale document, and a key no case has each fail naming the flow and the c
 |---|---|
 | `mapping.yaml` | The table: the class vocabulary, the sinks, and one row per kind and feature |
 | `features/<system>.yaml` | The wire features a source's cases can exercise, one `{name, text}` each |
-| `cases/<system>/<case>.meta.yaml` | What the case exercises, and its wire file, a collectd case's `types_db:` file, a graphite case's `protocol:`, and tolerances if any |
+| `cases/<system>/<case>.meta.yaml` | What the case exercises, and its wire file, a collectd case's `types_db:` file, a graphite case's `protocol:`, a syslog case's `framing:`, and tolerances if any |
 | `cases/<system>/<case>.json` | The case's events, one `format: json` line each |
 | `cases/<system>/<case>.<wire>` | The wire bytes a generated case decodes from, recorded, written as text, or hand-built ("Adding a case"): `.statsd` lines, InfluxDB line protocol in `.lp`, a Prometheus scrape body in `.prom`, a Datadog or OTLP/HTTP request body, compressed as sent, in `.bin`, one collectd datagram in `.raw`, carbon plaintext lines in `.graphite`, or one pickle payload with no length prefix in `.pkl` |
 | `cases/<system>/<case>.headers` | The request beside an HTTP wire file, one `name: value` per line as `testdata/interop/` records it: `path:` with an InfluxDB write's `org`, `orgID`, `bucket`, and `precision`, a scrape's `content-type:` choosing its dialect, or a Datadog or OTLP/HTTP request's `path:`, `content-type:`, and `content-encoding:` |
@@ -103,7 +106,9 @@ is one nothing checks: add a case or a flow that reaches it.
   `same_millisecond`, `same_millisecond_equal`), and the `log` rows for a message a log's
   record reaches beside its kind's row (`message_unsafe`, a message the sink rewrites, such as
   `datadog_out`'s JSON text of a structured one; `structured_message`; `bytes_message`;
-  `blank_message`): `exact`, `normalized`, `degraded`, `skipped`, or `dropped`, best to worst.
+  `blank_message`; `header_in_message`, a log RFC 3164's header rule reads back with a header
+  token in its message): `exact`, `normalized`, `degraded`, `skipped`, or `dropped`, best to
+  worst.
 - **Field level**, for the `record` rows `unit`, `description`, `start_timestamp`, `exemplars`,
   `exemplars_on_summary`, `unit_on_distribution`, `min_max`, and `sample_rate_unweighted`, every `attributes` row (`rate`,
   `rate_on_non_gauge`, `family_type`, `family_type_on_other_kind`, `interval`, `interval_on_distribution`, and `interval_on_histogram` among them), a log or span beside metrics
@@ -267,6 +272,7 @@ Each sink column has two regions:
 | `doc:otlp_out` | `crates/logit-proto/src/otlp/mod.rs` | Every cell of the column |
 | `doc:datadog_out` | `crates/logit-proto/src/datadog/mod.rs` | Every cell of the column |
 | `doc:graphite_out` | `crates/logit-proto/src/graphite/mod.rs` | Every cell of the column |
+| `doc:syslog_out` | `crates/logit-outputs/src/syslog.rs` | Every cell of the column |
 | `gaps:<sink>`, one per sink | `docs/known-gaps/mappings.md` | The column's `degraded`, `lost`, `skipped`, and `dropped` cells, in that file's row format |
 
 A region opens on a line ending `<!-- transit:doc:<sink> -->` or `<!-- transit:gaps:<sink> -->`
@@ -295,7 +301,7 @@ and a protocol name in `docs.rs`'s `PROTOCOLS`, or the check fails.
 
 1. Pick the source system's directory under `cases/`.
 2. For a case that starts on the wire, write the wire file (`<case>.statsd`, `<case>.lp`,
-   `<case>.prom`, `<case>.bin`, `<case>.raw`, `<case>.graphite`, or `<case>.pkl`) and `<case>.meta.yaml` with `wire: <case>.statsd`.
+   `<case>.prom`, `<case>.bin`, `<case>.raw`, `<case>.graphite`, `<case>.pkl`, or `<case>.syslog`) and `<case>.meta.yaml` with `wire: <case>.statsd`.
    An InfluxDB case needs a `<case>.headers` beside its wire file whose `path:` names a `bucket` and an `org` or `orgID`,
    as `influxdb_in` requires; a Prometheus case reads text 0.0.4 unless its `.headers` gives an
    OpenMetrics `content-type:`. A Datadog case's `.headers` gives the request's `path:`, which
@@ -310,7 +316,10 @@ and a protocol name in `docs.rs`'s `PROTOCOLS`, or the check fails.
    `collectd_in`'s `types_db:` setting does. A graphite case reads plaintext unless its
    `protocol: pickle` says otherwise; a pickle wire file is a connection's length-prefixed frames,
    as `testdata/interop/graphite/` records them, or under `.pkl` one payload with no prefix, as
-   `testdata/differential/graphite-pickle/` holds them. Run `script/transit gen` to write `<case>.json`.
+   `testdata/differential/graphite-pickle/` holds them. A syslog case is one UDP datagram, read
+   one message per line as `syslog_in` reads UDP, unless `framing: stream` says it's a TCP
+   connection's bytes, split by RFC 6587's framer as `testdata/interop/syslog/rsyslog-tcp-000.raw`
+   records them. Run `script/transit gen` to write `<case>.json`.
 3. For an edge case no producer sends, write `<case>.json` by hand and leave `wire:` out. The check
    requires it to read back to itself through `format: json`, and prints the form to use when it
    doesn't.

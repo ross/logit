@@ -134,6 +134,13 @@
 //! | `attributes/scope` | exact | -- | The `InstrumentationScope` of the batch. |
 //! | `attributes/datadog_carrier_log` | lost | structural | A `_logit.` carrier is private and isn't an OTLP attribute, so it's left off. |
 //! | `attributes/severity_carrier_otel` | exact | -- | The raw `severity_number` and `severity_text` the carriers hold, which otlp_in reads back into the same carriers beside the band's severity. |
+//! | `attributes/severity_carrier_syslog` | lost | structural | A `_logit.` carrier is private and isn't an OTLP attribute, so it's left off and the severity reads back at band resolution. |
+//! | `attributes/syslog_header` | normalized | `u64_as_int` | A string or integer attribute; `intValue` is signed, so a `u64` `syslog.facility` or `process.pid` reads back as an `i64`. |
+//! | `attributes/syslog_msgid` | exact | -- | A string attribute. |
+//! | `attributes/syslog_sd` | exact | -- | A key-value list attribute. |
+//! | `attributes/syslog_timestamp` | normalized | `timestamp_as_int` | An RFC 3164 timestamp is a string attribute; OTLP has no timestamp value, so an RFC 5424 one is an integer of Unix nanoseconds. |
+//! | `attributes/host_name` | exact | -- | A string attribute. |
+//! | `attributes/syslog_facility` | exact | -- | A log with no `syslog.facility` leaves with none. |
 //! | `attributes/no_host` | exact | -- | A record with no host leaves with none. |
 //! | `attributes/log_status` | exact | -- | The severity is the `LogRecord`'s own; no `status` attribute is written. |
 //! | `attributes/span_kind` | exact | -- | The kind is the `Span`'s own; no `span.kind` attribute is written. |
