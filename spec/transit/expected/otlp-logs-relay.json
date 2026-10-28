@@ -1,7 +1,13 @@
 {
   "beside-metrics": {"events": [
-    {"timestamp":"2027-01-15T08:00:04.000000000Z","log":{"severity":"warn","format":"raw","message":"queue depth high","observed_timestamp":"2027-01-15T08:00:05.000000000Z"},"attributes":{"_logit.otel.severity_number":13,"_logit.otel.severity_text":"Warn","hostname":"web-1","queue":"orders","service":"orders-api","service.name":"orders"}},
-    {"timestamp":"2027-01-15T08:00:04.000000000Z","metrics":[{"name":"queue.depth","kind":"gauge","value":17}],"attributes":{"hostname":"web-1","queue":"orders","service":"orders-api","service.name":"orders"}}
+    {"timestamp":"2027-01-15T08:00:04.000000000Z","log":{"severity":"warn","format":"raw","message":"queue depth high","observed_timestamp":"2027-01-15T08:00:05.003000000Z"},"attributes":{"_logit.otel.severity_number":13,"_logit.otel.severity_text":"Warn","hostname":"web-1","queue":"orders","service":"orders-api","service.name":"orders"}},
+    {"timestamp":"2027-01-15T08:00:04.000000000Z","metrics":[{"name":"queue.depth","kind":"gauge","value":17}],"attributes":{"hostname":"web-1","queue":"orders","service":"orders-api","service.name":"orders"}},
+    {"timestamp":"2027-01-15T08:00:04.001000000Z","log":{"severity":"info","format":"structured","message":{"queue":"orders","depth":17},"observed_timestamp":"2027-01-15T08:00:05.003000000Z"},"attributes":{"_logit.otel.severity_number":9,"_logit.otel.severity_text":"Info","queue":"payments"}},
+    {"timestamp":"2027-01-15T08:00:04.001000000Z","metrics":[{"name":"queue.depth","kind":"gauge","value":18}],"attributes":{"queue":"payments"}},
+    {"timestamp":"2027-01-15T08:00:04.002000000Z","log":{"severity":"info","format":"raw","message":"b\"caf\\xe9\"","observed_timestamp":"2027-01-15T08:00:05.003000000Z"},"attributes":{"_logit.otel.severity_number":9,"_logit.otel.severity_text":"Info","queue":"refunds"},"types":{"/log/message":"bytes"}},
+    {"timestamp":"2027-01-15T08:00:04.002000000Z","metrics":[{"name":"queue.depth","kind":"gauge","value":19}],"attributes":{"queue":"refunds"}},
+    {"timestamp":"2027-01-15T08:00:04.003000000Z","log":{"severity":"info","format":"raw","message":null,"observed_timestamp":"2027-01-15T08:00:05.003000000Z"},"attributes":{"_logit.otel.severity_number":9,"_logit.otel.severity_text":"Info","queue":"returns"}},
+    {"timestamp":"2027-01-15T08:00:04.003000000Z","metrics":[{"name":"queue.depth","kind":"gauge","value":20}],"attributes":{"queue":"returns"}}
   ], "counters": {}},
   "bodies": {"events": [
     {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"severity":"info","format":"raw","message":"a plain line","observed_timestamp":"2027-01-15T08:00:01.009000000Z"},"attributes":{"_logit.otel.severity_number":9,"_logit.otel.severity_text":"Info","body":"string"}},

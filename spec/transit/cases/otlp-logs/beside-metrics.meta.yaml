@@ -1,4 +1,5 @@
 # A log on an event that also carries a gauge, which `otlp_in` never decodes but a stage such as
 # `kv_metrics` produces. Its `hostname`, and `service` beside `service.name`, are the attributes
-# `datadog_out`'s logs route treats apart.
-exercises: [log_beside_metrics]
+# `datadog_out`'s logs route treats apart. Three more logs beside a gauge carry a key-value list,
+# bytes, and no body, so a log beside metrics reaches the message rows a log alone does.
+exercises: [log_beside_metrics, body_kvlist, body_bytes, body_absent]

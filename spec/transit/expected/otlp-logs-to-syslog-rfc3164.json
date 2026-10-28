@@ -1,6 +1,9 @@
 {
   "beside-metrics": {"events": [
-    {"timestamp":"2027-01-15T08:00:05.000000000Z","log":{"severity":"warn","format":"raw","message":"transit queue depth high"},"attributes":{"_logit.syslog.severity":4,"syslog.facility":16,"syslog.timestamp":"Jan 15 08:00:04"},"types":{"/attributes/_logit.syslog.severity":"u64","/attributes/syslog.facility":"u64"}}
+    {"timestamp":"2027-01-15T08:00:05.003000000Z","log":{"severity":"info","format":"raw","message":"b\"transit caf\\xe9\""},"attributes":{"_logit.syslog.severity":6,"syslog.facility":16,"syslog.timestamp":"Jan 15 08:00:04"},"types":{"/attributes/_logit.syslog.severity":"u64","/attributes/syslog.facility":"u64","/log/message":"bytes"}},
+    {"timestamp":"2027-01-15T08:00:05.003000000Z","log":{"severity":"info","format":"raw","message":"transit {queue=\"orders\", depth=17}"},"attributes":{"_logit.syslog.severity":6,"syslog.facility":16,"syslog.timestamp":"Jan 15 08:00:04"},"types":{"/attributes/_logit.syslog.severity":"u64","/attributes/syslog.facility":"u64"}},
+    {"timestamp":"2027-01-15T08:00:05.003000000Z","log":{"severity":"info","format":"raw","message":"transit"},"attributes":{"_logit.syslog.severity":6,"syslog.facility":16,"syslog.timestamp":"Jan 15 08:00:04"},"types":{"/attributes/_logit.syslog.severity":"u64","/attributes/syslog.facility":"u64"}},
+    {"timestamp":"2027-01-15T08:00:05.003000000Z","log":{"severity":"warn","format":"raw","message":"transit queue depth high"},"attributes":{"_logit.syslog.severity":4,"syslog.facility":16,"syslog.timestamp":"Jan 15 08:00:04"},"types":{"/attributes/_logit.syslog.severity":"u64","/attributes/syslog.facility":"u64"}}
   ], "counters": {}},
   "bodies": {"events": [
     {"timestamp":"2027-01-15T08:00:01.009000000Z","log":{"severity":"info","format":"raw","message":"b\"transit caf\\xe9\""},"attributes":{"_logit.syslog.severity":6,"syslog.facility":16,"syslog.timestamp":"Jan 15 08:00:00"},"types":{"/attributes/_logit.syslog.severity":"u64","/attributes/syslog.facility":"u64","/log/message":"bytes"}},

@@ -73,7 +73,8 @@
 //! metrics is a field of that event: it reaches `log/beside_metrics` or `span/beside_metrics`,
 //! read as `exact` when it pairs unchanged, `normalized` when it pairs changed, and `lost` when
 //! nothing read back pairs with it. A log there also reaches the `log` field rows a log alone
-//! does, and the attribute rows, so `log/beside_metrics` says only whether the sink carried it.
+//! does, and the attribute rows, so `log/beside_metrics` says only whether the sink carried it;
+//! once paired, it reaches the message rows [`log_features`] lists, at its pairing's class.
 //!
 //! **Pairing.** Each input record is paired with the records read back that account for it, in
 //! passes, each claiming a read-back record at most once: (1) the same name and the same kind,
@@ -506,7 +507,7 @@ impl Spelling {
 
     /// The message the sink's pair decoder reads log `rec` back with, as text, where the sink's
     /// encoder rewrites it; `None` for a record that isn't a log, and at a sink that writes the
-    /// message as it is. For a log alone, `datadog_out`'s logs route writes
+    /// message as it is. `datadog_out`'s logs route writes
     /// `logit_proto::json::value_text`: a `Bytes` message as lossy UTF-8 and any other non-`Str`
     /// one as its JSON text, which `datadog_in` reads back as a `Str`. `otlp_out` writes every
     /// message as an `AnyValue`. `syslog_out` writes [`logit_outputs::syslog::wire_message`],
@@ -517,9 +518,7 @@ impl Spelling {
             return None;
         }
         match self {
-            Spelling::Datadog
-                if !rec.beside_metrics && datadog::Route::of(rec) == datadog::Route::Log =>
-            {
+            Spelling::Datadog if datadog::Route::of(rec) == datadog::Route::Log => {
                 let log = model_log(rec)?;
                 Some(logit_proto::json::value_text(&log.message).into_owned())
             }
@@ -534,7 +533,7 @@ impl Spelling {
     /// before `syslog_in` decides where its header ends: what `log/message_unsafe` compares.
     fn rendered_message(self, rec: &Rec) -> Option<String> {
         match self {
-            Spelling::Syslog { .. } if rec.kind == "log" && !rec.beside_metrics => {
+            Spelling::Syslog { .. } if rec.kind == "log" => {
                 let log = model_log(rec)?;
                 let bytes = logit_outputs::syslog::wire_message(&log.message);
                 let value = match String::from_utf8(bytes) {
@@ -1936,13 +1935,13 @@ fn model_log(rec: &Rec) -> Option<logit_core::LogRecord> {
     batches.into_iter().next()?.events.into_iter().next()?.log
 }
 
-/// The record-level `log` features a log on an event with no metrics reaches beside its kind's
-/// row: `message_unsafe` when the sink rewrites its message ([`Spelling::log_message`]),
+/// The `log` message features a log reaches beside its kind's row, or beside metrics beside
+/// `log/beside_metrics`: `message_unsafe` when the sink rewrites its message ([`Spelling::log_message`]),
 /// `structured_message` for a `Map` or `Array` message, `bytes_message` for a `Bytes` one, and
 /// `blank_message` for an empty message or none.
 fn log_features(rec: &Rec, spelling: Spelling) -> Vec<&'static str> {
     let mut features = Vec::new();
-    if rec.kind != "log" || rec.beside_metrics {
+    if rec.kind != "log" {
         return features;
     }
     let message = &rec.body["message"];
@@ -2773,35 +2772,55 @@ pub(super) fn check(
         // A log or span beside metrics is a field of its event (module doc).
         let beside = !input.is_metric() && input.beside_metrics;
         let observed = if beside {
-            let label = mapping::row_label(&input.kind, Some("beside_metrics"));
-            match mapping.lookup(&input.kind, Some("beside_metrics"), &sink, &traced.sink) {
-                Lookup::NoRow => failures.push(format!(
-                    "{here}: {} {:?} reaches row {label}, which mapping.yaml doesn't have",
-                    input.kind, input.name
-                )),
-                Lookup::NotSpecified => {
-                    ledger
-                        .unspecified
-                        .entry((sink.clone(), label))
-                        .or_default()
-                        .insert(here.clone());
-                }
-                Lookup::Cell(cell, index) => {
-                    named.extend(cell.counter.as_deref().and_then(|c| Series::parse(c).ok()));
-                    let seen = match pairing.seen[i] {
-                        Some(Class::Exact) => Class::Exact,
-                        Some(_) => Class::Normalized,
-                        None => Class::Lost,
-                    };
-                    failures.extend(field_verdict(&here, input, &label, cell, seen, &did_move));
-                    ledger.saw(&sink, &label, index, seen);
-                }
-            }
-            match pairing.seen[i] {
+            // `beside_metrics` and, once paired, the log's message rows, read together as a log
+            // alone's record-level rows are: at the worst cell's class.
+            let seen = match pairing.seen[i] {
                 Some(Class::Exact) => Class::Exact,
                 Some(_) => Class::Normalized,
-                None => continue,
+                None => Class::Lost,
+            };
+            let mut features = vec!["beside_metrics"];
+            if seen != Class::Lost {
+                features.extend(log_features(input, spelling));
             }
+            let mut cells = Vec::new();
+            for feature in features {
+                let label = mapping::row_label(&input.kind, Some(feature));
+                match mapping.lookup(&input.kind, Some(feature), &sink, &traced.sink) {
+                    Lookup::NoRow => failures.push(format!(
+                        "{here}: {} {:?} reaches row {label}, which mapping.yaml doesn't have",
+                        input.kind, input.name
+                    )),
+                    Lookup::NotSpecified => {
+                        ledger
+                            .unspecified
+                            .entry((sink.clone(), label))
+                            .or_default()
+                            .insert(here.clone());
+                    }
+                    Lookup::Cell(cell, index) => {
+                        named.extend(cell.counter.as_deref().and_then(|c| Series::parse(c).ok()));
+                        ledger.reach(&sink, &label, index);
+                        cells.push((label, cell, index));
+                    }
+                }
+            }
+            let expected = cells.iter().map(|(_, cell, _)| cell.class).fold(Class::Exact, worse);
+            if let Some((label, cell, index)) =
+                cells.iter().find(|(_, cell, _)| cell.class == expected)
+            {
+                failures.extend(field_verdict(&here, input, label, cell, seen, &did_move));
+                ledger.saw(&sink, label, *index, seen);
+                for (other, cell, index) in &cells {
+                    if other != label && cell.class == seen {
+                        ledger.saw(&sink, other, *index, seen);
+                    }
+                }
+            }
+            if seen == Class::Lost {
+                continue;
+            }
+            seen
         } else {
             // Record level.
             let mut rows: Vec<(String, Option<String>)> =

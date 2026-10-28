@@ -1,7 +1,13 @@
 {
   "beside-metrics": {"events": [
     {"timestamp":"2027-01-15T08:00:04.000000000Z","log":{"severity":"warn","format":"raw","message":"queue depth high"},"attributes":{"host.name":"transit","queue":"orders","service.name":"orders","status":"warn"}},
-    {"timestamp":"2027-01-15T08:00:04.000000000Z","metrics":[{"name":"queue.depth","kind":"gauge","value":17.0}],"attributes":{"host.name":"transit","hostname":"web-1","queue":"orders","service.name":"orders"},"resource":{"attributes":{"_logit.datadog.units":"datadog"}}}
+    {"timestamp":"2027-01-15T08:00:04.000000000Z","metrics":[{"name":"queue.depth","kind":"gauge","value":17.0}],"attributes":{"host.name":"transit","hostname":"web-1","queue":"orders","service.name":"orders"},"resource":{"attributes":{"_logit.datadog.units":"datadog"}}},
+    {"timestamp":"2027-01-15T08:00:04.000000000Z","metrics":[{"name":"queue.depth","kind":"gauge","value":18.0}],"attributes":{"host.name":"transit","queue":"payments"},"resource":{"attributes":{"_logit.datadog.units":"datadog"}}},
+    {"timestamp":"2027-01-15T08:00:04.000000000Z","metrics":[{"name":"queue.depth","kind":"gauge","value":19.0}],"attributes":{"host.name":"transit","queue":"refunds"},"resource":{"attributes":{"_logit.datadog.units":"datadog"}}},
+    {"timestamp":"2027-01-15T08:00:04.000000000Z","metrics":[{"name":"queue.depth","kind":"gauge","value":20.0}],"attributes":{"host.name":"transit","queue":"returns"},"resource":{"attributes":{"_logit.datadog.units":"datadog"}}},
+    {"timestamp":"2027-01-15T08:00:04.001000000Z","log":{"severity":"info","format":"raw","message":"{\"queue\":\"orders\",\"depth\":17}"},"attributes":{"host.name":"transit","queue":"payments","status":"info"}},
+    {"timestamp":"2027-01-15T08:00:04.002000000Z","log":{"severity":"info","format":"raw","message":"caf�"},"attributes":{"host.name":"transit","queue":"refunds","status":"info"}},
+    {"timestamp":"2027-01-15T08:00:04.003000000Z","log":{"severity":"info","format":"raw","message":"null"},"attributes":{"host.name":"transit","queue":"returns","status":"info"}}
   ], "counters": {
     "logit.output.tags.omitted{component=out,kind=datadog_out,reason=reserved_key,role=sink}": 2,
     "logit.output.tags.omitted{component=out,kind=datadog_out,reason=unrepresentable,role=sink}": 1
