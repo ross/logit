@@ -160,6 +160,7 @@
 //! | `attributes/splunk_envelope` | exact | -- | The object's `source`, `sourcetype`, or `index`, read back onto the resource; a value that isn't a string is omitted, counted once per batch. |
 //! | `attributes/syslog_facility` | exact | -- | A log with no `syslog.facility` leaves with none. |
 //! | `attributes/no_host` | normalized | `default_host` | A record with no `host.name` leaves with the process hostname as its `host`, which splunk_hec_in reads back as the resource's `host.name`. |
+//! | `attributes/default_tag` | exact | -- | A log with no `syslog.tag` leaves with none. |
 //! | `attributes/log_status` | exact | -- | No `status` attribute is written. |
 //! | `attributes/log_severity_fields` | normalized | `severity_fields` | A log with a severity and neither `otel.log.severity.*` attribute leaves with both, the severity's name and its band's base number, which splunk_hec_in reads back as attributes beside the severity. |
 //! | `attributes/span_kind` | exact | -- | The kind is the span object's `kind`; no `span.kind` attribute is written. |

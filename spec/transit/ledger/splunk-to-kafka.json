@@ -2,6 +2,7 @@
   "cells": [
     {"sink":"kafka_out","row":"attributes/array_value","cell":1,"observed":["exact"]},
     {"sink":"kafka_out","row":"attributes/bool_value","cell":1,"observed":["exact"]},
+    {"sink":"kafka_out","row":"attributes/default_tag","cell":0,"observed":["exact"]},
     {"sink":"kafka_out","row":"attributes/host_name","cell":1,"observed":["exact"]},
     {"sink":"kafka_out","row":"attributes/log_status","cell":0,"observed":["exact"]},
     {"sink":"kafka_out","row":"attributes/no_host","cell":0,"observed":["exact"]},

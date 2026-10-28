@@ -3,6 +3,7 @@
     {"sink":"splunk_hec_out","row":"attributes/array_value","cell":0,"observed":["exact"]},
     {"sink":"splunk_hec_out","row":"attributes/bool_value","cell":0,"observed":["exact"]},
     {"sink":"splunk_hec_out","row":"attributes/bytes_value","cell":0,"observed":["normalized"]},
+    {"sink":"splunk_hec_out","row":"attributes/default_tag","cell":0,"observed":["exact"]},
     {"sink":"splunk_hec_out","row":"attributes/hostname","cell":0,"observed":["exact"]},
     {"sink":"splunk_hec_out","row":"attributes/log_service","cell":0,"observed":["exact"]},
     {"sink":"splunk_hec_out","row":"attributes/log_severity_fields","cell":0,"observed":["normalized"]},

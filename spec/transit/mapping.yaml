@@ -4203,6 +4203,39 @@ rows:
         class: exact
         text: >-
           `kafka_out` writes no attribute from a record's own fields or its config.
+  # syslog_out's RFC 3164 TAG on a log with no `syslog.tag`. Every sink that compares a log reaches
+  # it; only syslog_out writes one.
+  - kind: attributes
+    feature: default_tag
+    cells:
+      statsd_out:
+        class: exact
+        text: A log with no `syslog.tag` leaves with none.
+      otlp_out:
+        class: exact
+        text: A log with no `syslog.tag` leaves with none.
+      datadog_out:
+        class: exact
+        text: A log with no `syslog.tag` leaves with none.
+      syslog_out:
+        - when: {format: rfc3164}
+          class: normalized
+          reason: default_tag
+          text: >-
+            Under RFC 3164, a log with no `syslog.tag` and no `app_name:` leaves with its
+            `service.name`, else its resource's, else `logit`, as its TAG, narrowed to letters,
+            digits, `_`, `-`, `.`, and `/`, which syslog_in reads back as `syslog.tag`.
+        - class: exact
+          text: >-
+            Under RFC 5424, a log with no `syslog.tag` leaves with APP-NAME `-` and reads back with
+            none.
+      splunk_hec_out:
+        class: exact
+        text: A log with no `syslog.tag` leaves with none.
+      kafka_out:
+        class: exact
+        text: >-
+          `kafka_out` writes no attribute from a record's own fields or its config.
   # statsd_out, prometheus_out, influxdb_out, and graphite_out don't write a log on an event with
   # no metrics, so its fields are never compared there and none of them has a cell.
   - kind: attributes
