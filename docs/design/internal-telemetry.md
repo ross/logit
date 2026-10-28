@@ -2161,16 +2161,17 @@ itself. The sink emits each once per batch, however many attempts the runtime ma
 - `logit.output.messages` (count): messages sent.
 - `logit.output.datagrams` (count, UDP only): datagrams that reached the kernel, even when the
   batch then failed. Each message is its own datagram, so it equals `messages`.
-- `logit.output.events.skipped`: events with no `log` record, so nothing to render as a syslog
-  message (ADR `multi-payload-events`).
+- `logit.output.events.skipped{reason="no_log"}`: events with no `log` record, so nothing to
+  render as a syslog message (ADR `multi-payload-events`).
 - `logit.output.messages.truncated` and
   `logit.output.messages.dropped{reason="oversize_header"|"oversize_datagram"}`: per-message size
   handling (`docs/adr/syslog-output.md`'s "Sizing" section).
-- `logit.output.structured_data.omitted{reason="invalid_sd_name"|"not_a_map"|"sd_id_collision"}`:
+- `logit.output.structured_data.omitted{reason="invalid_sd_name"|"not_a_map"|"sd_id_collision"|"empty_array"}`:
   a piece of STRUCTURED-DATA left off a message that is still sent. An SD-ID or PARAM-NAME that
   isn't a valid RFC 5424 `SD-NAME` (an invalid SD-ID omits the element, an invalid PARAM-NAME that
   param); a `syslog.sd` element whose value isn't a map of PARAM-NAME to value; the opt-in element
-  colliding with an SD-ID the event already carries.
+  colliding with an SD-ID the event already carries; a PARAM whose value is an empty array, which
+  has no item to write.
 - `logit.output.fields.omitted{reason="invalid_value"}`: a `process.pid` with no PROCID form (a
   negative integer, or a value that isn't an integer or a string of digits) left off a message that
   is still sent.
