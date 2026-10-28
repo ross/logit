@@ -2815,7 +2815,9 @@ rows:
             `structured_data:` writes each public event attribute other than `host.name`,
             `process.pid`, and the `syslog.*` keys as an SD-PARAM, which syslog_in reads back
             inside `syslog.sd`.
-  # Only datadog_in's logs decode a JSON null attribute, so only the log sinks have a cell.
+  # datadog_in decodes a JSON null attribute on a log, and otlp_in an `AnyValue` with no value
+  # set on any signal, but no case puts a null on a metric's attributes, so only the log sinks
+  # have a cell.
   - kind: attributes
     feature: null_value
     cells:
