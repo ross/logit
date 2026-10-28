@@ -1,3 +1,5 @@
-# A hand-written span on an event with no metric or log, its `ok` status a field a Datadog span
-# has no form for, so it reaches `span/no_wire_form` beside `span/alone`.
+# A hand-written span on an event with no metric or log, its `ok` status and `trace_state`
+# fields a Datadog span has no form for, so it reaches `span/no_wire_form` beside `span/alone`. A
+# `trace_state` is also one `splunk_hec_out` has no slot for, where an `ok` status alone is
+# written.
 exercises: []

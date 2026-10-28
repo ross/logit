@@ -1,0 +1,45 @@
+{
+  "beside-metrics": {"events": [
+    {"timestamp":"2027-01-15T08:00:04.000000000Z","log":{"severity":"warn","format":"raw","message":"queue depth high"},"metrics":[{"name":"queue.depth","kind":"gauge","value":17}],"attributes":{"hostname":"web-1","queue":"orders","service":"orders-api","service.name":"orders"}},
+    {"timestamp":"2027-01-15T08:00:04.001000000Z","log":{"severity":"info","format":"structured","message":{"queue":"orders","depth":17}},"metrics":[{"name":"queue.depth","kind":"gauge","value":18}],"attributes":{"queue":"payments"}},
+    {"timestamp":"2027-01-15T08:00:04.002000000Z","log":{"severity":"info","format":"raw","message":"b\"caf\\xe9\""},"metrics":[{"name":"queue.depth","kind":"gauge","value":19}],"attributes":{"queue":"refunds"},"types":{"/log/message":"bytes"}},
+    {"timestamp":"2027-01-15T08:00:04.003000000Z","log":{"severity":"info","format":"raw","message":null},"metrics":[{"name":"queue.depth","kind":"gauge","value":20}],"attributes":{"queue":"returns"}}
+  ], "counters": {}},
+  "bodies": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"severity":"info","format":"raw","message":"a plain line"},"attributes":{"body":"string"}},
+    {"timestamp":"2027-01-15T08:00:00.001000000Z","log":{"severity":"info","format":"raw","message":42},"attributes":{"body":"int"}},
+    {"timestamp":"2027-01-15T08:00:00.002000000Z","log":{"severity":"info","format":"raw","message":2.5},"attributes":{"body":"double"}},
+    {"timestamp":"2027-01-15T08:00:00.003000000Z","log":{"severity":"info","format":"raw","message":true},"attributes":{"body":"bool"}},
+    {"timestamp":"2027-01-15T08:00:00.004000000Z","log":{"severity":"info","format":"raw","message":"b\"caf\\xe9\""},"attributes":{"body":"bytes"},"types":{"/log/message":"bytes"}},
+    {"timestamp":"2027-01-15T08:00:00.005000000Z","log":{"severity":"info","format":"structured","message":{"attempts":3,"user":"ada"}},"attributes":{"body":"map"}},
+    {"timestamp":"2027-01-15T08:00:00.006000000Z","log":{"severity":"info","format":"structured","message":["checkout",7]},"attributes":{"body":"array"}},
+    {"timestamp":"2027-01-15T08:00:00.007000000Z","log":{"severity":"info","format":"raw","message":null},"attributes":{"body":"null"}},
+    {"timestamp":"2027-01-15T08:00:00.008000000Z","log":{"severity":"info","format":"raw","message":""},"attributes":{"body":"empty"}},
+    {"timestamp":"2027-01-15T08:00:00.009000000Z","log":{"severity":"info","format":"json","message":"{\"level\":\"info\",\"msg\":\"started\"}"},"attributes":{"body":"json_text"}}
+  ], "counters": {}},
+  "fields": {"events": [
+    {"timestamp":"2027-01-15T08:00:03.000000000Z","log":{"severity":"info","format":"raw","message":"observed later","observed_timestamp":"2027-01-15T08:00:03.250000000Z","dropped_attributes_count":2},"attributes":{"big":18446744073709551615,"flag":true,"labels":["a",1],"nested":{"k":"v"},"raw":"b\"caf\\xe9\"","seen":"2027-01-15T07:59:00.000000000Z"},"resource":{"attributes":{"service.name":"checkout"},"schema_url":"https://opentelemetry.io/schemas/1.40.0"},"scope":{"name":"checkout.logger","version":"1.2.0","schema_url":"https://opentelemetry.io/schemas/1.40.0"},"types":{"/attributes/big":"u64","/attributes/raw":"bytes","/attributes/seen":"timestamp"}},
+    {"timestamp":"2027-01-15T08:00:03.000500000Z","log":{"severity":"info","format":"raw","message":"<13>Jan 15 07:59:59 host app: relayed"},"attributes":{"syslog.timestamp":"2027-01-15T07:59:59.000000000Z"},"resource":{"attributes":{"service.name":"checkout"},"schema_url":"https://opentelemetry.io/schemas/1.40.0"},"scope":{"name":"checkout.logger","version":"1.2.0","schema_url":"https://opentelemetry.io/schemas/1.40.0"}}
+  ], "counters": {}},
+  "severity": {"events": [
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","log":{"severity":"trace","format":"raw","message":"trace band"}},
+    {"timestamp":"2027-01-15T08:00:01.001000000Z","log":{"severity":"debug","format":"raw","message":"debug band"}},
+    {"timestamp":"2027-01-15T08:00:01.002000000Z","log":{"severity":"info","format":"raw","message":"info band"}},
+    {"timestamp":"2027-01-15T08:00:01.003000000Z","log":{"severity":"warn","format":"raw","message":"warn band"}},
+    {"timestamp":"2027-01-15T08:00:01.004000000Z","log":{"severity":"error","format":"raw","message":"error band"}},
+    {"timestamp":"2027-01-15T08:00:01.005000000Z","log":{"severity":"fatal","format":"raw","message":"fatal band"}},
+    {"timestamp":"2027-01-15T08:00:01.006000000Z","log":{"format":"raw","message":"no severity"}},
+    {"timestamp":"2027-01-15T08:00:01.007000000Z","log":{"severity":"info","format":"raw","message":"INFO2 from the wire"},"attributes":{"_logit.otel.severity_number":10,"_logit.otel.severity_text":"INFO2"}},
+    {"timestamp":"2027-01-15T08:00:01.008000000Z","log":{"severity":"warn","format":"raw","message":"a number only"},"attributes":{"_logit.otel.severity_number":14}}
+  ], "counters": {}},
+  "telemetrygen": {"events": [
+    {"timestamp":"2026-09-10T21:22:17.985247299Z","log":{"severity":"info","format":"raw","message":"the message","dropped_attributes_count":1},"attributes":{"_logit.otel.severity_number":9,"_logit.otel.severity_text":"Info","app":"server"},"resource":{"attributes":{"service.name":"telemetrygen"},"schema_url":"https://opentelemetry.io/schemas/1.40.0"}},
+    {"timestamp":"2026-09-10T21:22:17.985276594Z","log":{"severity":"info","format":"raw","message":"the message","dropped_attributes_count":1},"attributes":{"_logit.otel.severity_number":9,"_logit.otel.severity_text":"Info","app":"server"},"resource":{"attributes":{"service.name":"telemetrygen"},"schema_url":"https://opentelemetry.io/schemas/1.40.0"}},
+    {"timestamp":"2026-09-10T21:22:18.985695167Z","log":{"severity":"info","format":"raw","message":"the message","dropped_attributes_count":1},"attributes":{"_logit.otel.severity_number":9,"_logit.otel.severity_text":"Info","app":"server"},"resource":{"attributes":{"service.name":"telemetrygen"},"schema_url":"https://opentelemetry.io/schemas/1.40.0"}}
+  ], "counters": {}},
+  "trace": {"events": [
+    {"timestamp":"2027-01-15T08:00:02.000000000Z","log":{"severity":"info","format":"raw","message":"checkout completed","event_name":"checkout.completed","trace_id":"5b8efff798038103d269b633813fc60c","span_id":"eee19b7ec3c1b174","trace_flags":1}},
+    {"timestamp":"2027-01-15T08:00:02.001000000Z","log":{"severity":"info","format":"raw","message":"no span id","trace_id":"5b8efff798038103d269b633813fc60d","trace_flags":0}},
+    {"timestamp":"2027-01-15T08:00:02.002000000Z","log":{"severity":"info","format":"raw","message":"beside its span"},"span":{"name":"GET /cart","trace_id":"5b8efff798038103d269b633813fc60e","span_id":"eee19b7ec3c1b175","kind":"internal","status":"unset","start":"2027-01-15T08:00:02.002000000Z","end":"2027-01-15T08:00:02.012000000Z","duration_ns":10000000}}
+  ], "counters": {}}
+}

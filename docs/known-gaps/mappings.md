@@ -643,6 +643,10 @@ Entry format and the other areas: [the known-gaps index](README.md).
 
   <!-- transit:end -->
 
+  <!-- transit:gaps:kafka_out -->
+
+  <!-- transit:end -->
+
   **Too narrow for a row:** `BodyFormat` has no OTLP field and round-trips through a reserved
   attribute (`logit.body_format`), lossless but attribute-shaped (`otlp/logs.rs`'s module doc).
   [ADR `lossless-transit`](../adr/lossless-transit.md) rule (c) names it the standing example of a

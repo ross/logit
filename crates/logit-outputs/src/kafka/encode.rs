@@ -15,12 +15,14 @@
 //! MessagePack value forms. A native frame is uncompressed: `compression:` compresses the record
 //! batch it travels in.
 //!
-//! `format: text` skips an event with no log record and counts it in
-//! [`EncodeStats::no_log`]. An event whose body it writes leaves its metrics and span behind,
-//! counted in [`EncodeStats::metrics_omitted`] and [`EncodeStats::spans_omitted`] at encode, so
-//! a record the producer later drops as oversize, or the broker rejects or names, has still
-//! counted them. An event dropped as `oversize` under `record: batch` counts only there. A text body that contains `\n`
-//! can't be told from two bodies in a batch record.
+//! `format: text` counts an event it skips for having no log record in [`EncodeStats::no_log`],
+//! and the metrics and span an event whose body it writes leaves behind in
+//! [`EncodeStats::metrics_omitted`] and [`EncodeStats::spans_omitted`], at encode, so a record
+//! the producer later drops as oversize, or the broker rejects or names, has still counted them.
+//! An event dropped as `oversize` under `record: batch` counts only there. A text body that
+//! contains `\n` can't be told from two bodies in a batch record. What each log field, span, and
+//! attribute becomes under `json` and `text` is the generated table under "What each log, span,
+//! and attribute becomes".
 //!
 //! Under `record: batch`, events go into a record in batch order until the next would push its
 //! value over the encoder's `budget`, which the sink sets so a value that fits never trips the
@@ -76,6 +78,19 @@
 //! the gate [`KafkaEncoder::with_counters`] takes muted. A record's timestamp is the time the
 //! encoder wrote it: a request holds many events, and one future-stamped event would otherwise
 //! lose the whole request to Kafka's rule against records stamped more than an hour ahead.
+//!
+//! # What each log, span, and attribute becomes
+//!
+//! The tables below are generated from `kafka_out`'s column of `spec/transit/mapping.yaml`, the
+//! canonical copy, by `script/transit docs`, and a test fails when they're stale: change the
+//! table there, not here. They cover `format: json` and `format: text`, the latter as each cell's
+//! `format: text` condition, and logs, spans, and attributes: the spec has no metric cells for
+//! `kafka_out`. No `kafka_in` exists, so "consumer" means the transit driver's reading of a record
+//! (`crates/logit-cli/src/transit/wire.rs`'s module doc): a `format: json` record through the
+//! event JSON reader, and a `format: text` record as one log whose message is the value.
+//!
+//! <!-- transit:doc:kafka_out -->
+//! <!-- transit:end -->
 
 use std::collections::HashMap;
 use std::fmt::Write;
