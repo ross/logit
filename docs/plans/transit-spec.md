@@ -1422,5 +1422,6 @@ Recorded per workstream as each lands.
     `syslog_out`'s TAG-less RFC 3164 messages, untagged skip count, `<N bytes>` PARAM-VALUE, and
     uncounted empty array, the uncounted trace at `datadog_out` and `splunk_hec_out`,
     `datadog_in`'s `f64` timestamp, and the dead `ddsource` default. What stays is decision 9's
-    decided limits, each recorded where it was settled; of those, only the 101-tag log at
-    `datadog_out` is open work, in `docs/known-gaps/datadog.md`.
+    decided limits, each recorded where it was settled; two of them keep an entry with a revisit
+    trigger in `docs/known-gaps/datadog.md`: the 101-tag log at `datadog_out`, and the
+    `_logit.otel.severity_*` carriers `datadog_out` leaves off.
