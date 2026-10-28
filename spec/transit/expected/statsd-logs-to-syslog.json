@@ -11,12 +11,12 @@
     {"timestamp":"2027-01-15T08:00:01.000000000Z","log":{"severity":"info","format":"raw","message":"request served"},"attributes":{"_logit.syslog.severity":6,"host.name":"transit","syslog.facility":16,"syslog.timestamp":"2027-01-15T08:00:00.000000000Z"},"types":{"/attributes/_logit.syslog.severity":"u64","/attributes/syslog.facility":"u64","/attributes/syslog.timestamp":"timestamp"}}
   ], "counters": {}},
   "payload-less": {"events": [], "counters": {
-    "logit.output.events.skipped{component=out,kind=syslog_out,role=sink}": 2
+    "logit.output.events.skipped{component=out,kind=syslog_out,reason=no_log,role=sink}": 2
   }},
   "span-beside-metrics": {"events": [], "counters": {
-    "logit.output.events.skipped{component=out,kind=syslog_out,role=sink}": 1
+    "logit.output.events.skipped{component=out,kind=syslog_out,reason=no_log,role=sink}": 1
   }},
   "span-only": {"events": [], "counters": {
-    "logit.output.events.skipped{component=out,kind=syslog_out,role=sink}": 1
+    "logit.output.events.skipped{component=out,kind=syslog_out,reason=no_log,role=sink}": 1
   }}
 }

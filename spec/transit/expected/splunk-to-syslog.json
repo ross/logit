@@ -97,7 +97,7 @@
     {"timestamp":"2026-09-25T17:50:02.312000000Z","log":{"severity":"info","format":"raw","message":"syslog-ng-config: sc4s version=3.40.0"},"attributes":{"_logit.syslog.severity":6,"host.name":"splunk-sc4s-fixture","syslog.facility":16,"syslog.timestamp":"2026-09-25T17:50:01.312000000Z"},"types":{"/attributes/_logit.syslog.severity":"u64","/attributes/syslog.facility":"u64","/attributes/syslog.timestamp":"timestamp"}}
   ], "counters": {}},
   "span": {"events": [], "counters": {
-    "logit.output.events.skipped{component=out,kind=syslog_out,role=sink}": 1
+    "logit.output.events.skipped{component=out,kind=syslog_out,reason=no_log,role=sink}": 1
   }},
   "times": {"events": [
     {"timestamp":"2027-01-15T08:00:01.000000000Z","log":{"severity":"info","format":"raw","message":"absent"},"attributes":{"_logit.syslog.severity":6,"host.name":"transit","syslog.facility":16,"syslog.timestamp":"2027-01-15T08:00:00.000000000Z"},"types":{"/attributes/_logit.syslog.severity":"u64","/attributes/syslog.facility":"u64","/attributes/syslog.timestamp":"timestamp"}},
