@@ -23,11 +23,13 @@ use crate::pipeline::SinkEncoder;
 use anyhow::Context;
 use bytes::Bytes;
 use http::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
-use logit_core::{BodyFormat, Diagnostics, Event, EventBatch, LogRecord, Resource, Telemetry, Value};
+use logit_core::{
+    BodyFormat, Diagnostics, Event, EventBatch, LogRecord, Resource, Telemetry, Value,
+};
 use logit_outputs::kafka::RecordFormat;
-use logit_proto::event_json::EventJsonDecoder;
 use logit_pipeline::test_util::TelemetryProbe;
 use logit_proto::datadog::DatadogDecoder;
+use logit_proto::event_json::EventJsonDecoder;
 use logit_proto::graphite::pickle::LENGTH_PREFIX_BYTES;
 use logit_proto::graphite::{GraphiteDecoder, Protocol as GraphiteProtocol};
 use logit_proto::influxdb::{write_resource, InfluxDecoder, Precision};

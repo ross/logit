@@ -104,6 +104,6 @@ pub use encode::{
 };
 pub use sasl::{KafkaSasl, OAuthToken};
 pub use sink::{
-    encoder, report_encode_stats, KafkaAcks, KafkaCompression, KafkaOutput, KafkaSettings, SignalTopics, TlsClientSettings,
-    DEFAULT_MAX_REQUEST_BYTES, DEFAULT_TIMEOUT,
+    encoder, report_encode_stats, KafkaAcks, KafkaCompression, KafkaOutput, KafkaSettings,
+    SignalTopics, TlsClientSettings, DEFAULT_MAX_REQUEST_BYTES, DEFAULT_TIMEOUT,
 };
