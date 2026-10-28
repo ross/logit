@@ -160,6 +160,7 @@
 //! | `attributes/splunk_envelope` | exact | -- | The object's `source`, `sourcetype`, or `index`, read back onto the resource; a value that isn't a string is omitted, counted once per batch. |
 //! | `attributes/syslog_facility` | exact | -- | A log with no `syslog.facility` leaves with none. |
 //! | `attributes/no_host` | normalized | `default_host` | A record with no `host.name` leaves with the process hostname as its `host`, which splunk_hec_in reads back as the resource's `host.name`. |
+//! | `attributes/default_tag` | exact | -- | A log with no `syslog.tag` leaves with none. |
 //! | `attributes/log_status` | exact | -- | No `status` attribute is written. |
 //! | `attributes/log_severity_fields` | normalized | `severity_fields` | A log with a severity and neither `otel.log.severity.*` attribute leaves with both, the severity's name and its band's base number, which splunk_hec_in reads back as attributes beside the severity. |
 //! | `attributes/span_kind` | exact | -- | The kind is the span object's `kind`; no `span.kind` attribute is written. |
@@ -173,7 +174,7 @@
 //! | `log/trace` | exact | -- | The `trace_id` and `span_id` fields, lowercase hex, read back into the trace, unless the log carries either as an attribute. |
 //! | `log/trace_unset` | normalized | `log_fields` | No trace fields are written, and splunk_hec_in reads back no trace, unless the log carries a `trace_id` attribute that parses as a trace id, with a `span_id` that parses or none, which it reads into the trace. |
 //! | `log/trace_flags` | normalized | `flags_zero` | HEC has no trace flags, so a log's trace reads back with flags `0`. |
-//! | `log/trace_beside_id_attribute` | lost | uncounted | A `trace_id` or `span_id` attribute is written as that field and the log's own ids are left off, uncounted; an attribute that isn't a hex id reads back as an attribute, with no trace. |
+//! | `log/trace_beside_id_attribute` | lost | `logit.output.tags.omitted{reason=reserved_key}` | A `trace_id` or `span_id` attribute wins and is written as that field, and the log's own ids are left off, counted once per log; an attribute that isn't a hex id reads back as an attribute, with no trace. |
 //! | `log/dropped_attributes_count` | lost | structural | HEC has no dropped count, so it's left off. |
 //! | `log/timestamp` | exact | -- | The object's `time`, in seconds with up to nine decimals. |
 //! | `log/receipt_timestamp` | exact | -- | The object's `time`, the time the log was received. |

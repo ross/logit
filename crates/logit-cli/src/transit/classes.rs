@@ -177,9 +177,8 @@
 //! `syslog.timestamp` leaves it `lost`; a `syslog.timestamp` the encoder can't render under the
 //! sink's format reads `lost`. Under `syslog_out`'s `structured_data:` on RFC 5424, an opt-in
 //! attribute compares a value: read back in `syslog.sd` under the SD-ID with the PARAM-VALUE text
-//! [`syslog::read_sd`] expects is `normalized`, and anything else `lost`, as is a `Bytes` value,
-//! which the encoder writes as its length, and every opt-in attribute of a log whose `syslog.sd`
-//! holds the SD-ID. `prometheus_out` compares a value too:
+//! [`syslog::read_sd`] expects is `normalized` (a `Bytes` value's is its base64 text), and
+//! anything else `lost`, as is every opt-in attribute of a log whose `syslog.sd` holds the SD-ID. `prometheus_out` compares a value too:
 //! `_logit.prometheus.target` absent reads `normalized` when the read-back's `instance` equals the
 //! input's, and `lost` otherwise. At `splunk_hec_out`, a log's map attribute read back as
 //! dotted keys holding its leaves (none, for an empty map) is `normalized`, and a log's
@@ -800,11 +799,10 @@ type Derived = (Option<&'static str>, &'static str, String);
 /// record reaches them, and one that derives nothing for a row reads it `exact`.
 fn derived_rows(rec: &Rec) -> Vec<&'static str> {
     let mut rows = Vec::new();
-    // Under RFC 5424 `syslog_out` derives every row any of its configs does. Under RFC 3164 a log
-    // with no TAG derives no `no_host`, since syslog_in reads its HOSTNAME into MSG, and that
-    // row's cell there reads it `exact`.
-    let syslog = Spelling::Syslog { rfc3164: false, facility: 0, structured_data: None };
-    for spelling in [Spelling::Datadog, syslog, Spelling::Splunk] {
+    // RFC 5424 derives every row any of `syslog_out`'s configs does but `default_tag`, which only
+    // RFC 3164 does.
+    let syslog = |rfc3164| Spelling::Syslog { rfc3164, facility: 0, structured_data: None };
+    for spelling in [Spelling::Datadog, syslog(false), syslog(true), Spelling::Splunk] {
         for (row, _, _) in spelling.derived(rec) {
             if let Some(row) = row.filter(|row| !rows.contains(row)) {
                 rows.push(row);
@@ -824,7 +822,9 @@ fn derived_rows(rec: &Rec) -> Vec<&'static str> {
 /// - for pairing only, the `syslog.timestamp` written from `event.timestamp` on a log with none,
 ///   which `log/timestamp` compares, under RFC 3164 a `syslog.tag` and PROCID `syslog_in` reads
 ///   from the message's first token, and under the `sd_id` opt-in the `syslog.sd` holding the
-///   opt-in element on a log with none.
+///   opt-in element on a log with none;
+/// - `default_tag`: under RFC 3164, the fallback TAG (`service.name`, else `logit`) on a log that
+///   carries no `syslog.tag`, which `syslog_in` reads back as `syslog.tag`.
 fn syslog_derived(
     rec: &Rec,
     rfc3164: bool,
@@ -857,7 +857,8 @@ fn syslog_derived(
     }
     if !read.tag_from_attribute {
         if let Some(tag) = &read.tag {
-            out.push((None, syslog::TAG, tag.clone()));
+            let row = (rfc3164 && !read.tag_carried).then_some("default_tag");
+            out.push((row, syslog::TAG, tag.clone()));
             if let Some(pid) = &read.pid {
                 out.push((None, syslog::pid_key(pid), pid.clone()));
             }
@@ -1373,18 +1374,17 @@ mod syslog {
     pub(super) struct Read {
         /// HOSTNAME, read back as `host.name`.
         pub host: Option<String>,
-        /// TAG or APP-NAME, read back as `syslog.tag`, and whether it's the input's `syslog.tag`.
+        /// TAG or APP-NAME, read back as `syslog.tag`, whether it's the input's `syslog.tag`, and
+        /// whether the input carries one.
         pub tag: Option<String>,
         pub tag_from_attribute: bool,
+        pub tag_carried: bool,
         /// PROCID, read back as `process.pid` when canonical decimal, else as `syslog.pid`; and
         /// whether it's the input's `process.pid` rather than its `syslog.pid`.
         pub pid: Option<String>,
         pub pid_from_process: bool,
         /// MSG as `format: json` writes it.
         pub message: logit_core::Value,
-        /// Whether MSG reads back other than written: under RFC 3164, a header token read into
-        /// the message, or the message's first token read as a TAG.
-        pub boundary_moved: bool,
     }
 
     pub(super) fn read(rec: &Rec, rfc3164: bool) -> Option<Read> {
@@ -1392,7 +1392,8 @@ mod syslog {
         let (attrs, resource) = scopes(rec);
         let format = format(rfc3164);
         let host = wire_hostname(format, &attrs, &resource, Some(super::super::HOSTNAME));
-        let tag = wire_app_name(format, &attrs, None);
+        let tag = wire_app_name(format, &attrs, &resource, None);
+        let carries_tag = wire_app_name(Format::Rfc5424, &attrs, &resource, None).is_some();
         let pid = wire_procid(format, &attrs, &resource);
         let mut without_pid = attrs.clone();
         without_pid.remove(PID);
@@ -1402,11 +1403,11 @@ mod syslog {
             return Some(Read {
                 host,
                 tag_from_attribute: tag.is_some(),
+                tag_carried: carries_tag,
                 tag,
                 pid,
                 pid_from_process,
                 message: as_value(message),
-                boundary_moved: false,
             });
         }
         // `<PRI>TIMESTAMP` then each token after one space, as `write_rfc3164_header` writes them,
@@ -1458,15 +1459,17 @@ mod syslog {
             }
         };
         let written_tag = tag_pid.map(|(token, _)| token);
-        let tag_from_attribute =
-            read_tag.is_some() && written_tag.is_some() && read_tag.as_deref() == tag.as_deref();
+        let tag_from_attribute = carries_tag
+            && read_tag.is_some()
+            && written_tag.is_some()
+            && read_tag.as_deref() == tag.as_deref();
         Some(Read {
             host: read_host,
             tag: read_tag,
             tag_from_attribute,
+            tag_carried: carries_tag,
             pid: read_pid,
             pid_from_process,
-            boundary_moved: read_message != message,
             message: as_value(read_message),
         })
     }
@@ -1499,9 +1502,9 @@ mod syslog {
 
     /// The attribute row an opt-in attribute `key` of log `rec` reaches in place of its value's
     /// under the `sd_id` opt-in, where the encoder leaves it off, counted: `sd_id_collision` on a
-    /// log whose own `syslog.sd` holds an element under `sd_id`, and `sd_name_unsafe` for a key
-    /// that isn't an RFC 5424 SD-NAME; and uncounted, `sd_empty_array` for an empty `Array`, which
-    /// writes one PARAM per element and so none.
+    /// log whose own `syslog.sd` holds an element under `sd_id`, `sd_name_unsafe` for a key that
+    /// isn't an RFC 5424 SD-NAME, and `sd_empty_array` for an empty `Array`, which writes one PARAM
+    /// per element and so none.
     pub(super) fn opt_in_row(rec: &Rec, key: &str, sd_id: &str) -> Option<&'static str> {
         if rec.kind != "log" || !is_opt_in_param(key) {
             return None;
@@ -2414,11 +2417,6 @@ fn log_features(rec: &Rec, spelling: Spelling) -> Vec<&'static str> {
     if spelling.rendered_message(rec).is_some_and(|m| *message != Value::String(m)) {
         features.push("message_unsafe");
     }
-    if let Spelling::Syslog { rfc3164: true, .. } = spelling {
-        if syslog::read(rec, true).is_some_and(|read| read.boundary_moved) {
-            features.push("header_in_message");
-        }
-    }
     if message.is_object() || message.is_array() {
         features.push("structured_message");
     }
@@ -2909,11 +2907,6 @@ fn observe_field(field: &Field, input: &Rec, out: &Rec, spelling: Spelling) -> C
                 {
                     // On a collision, the element under `sd_id` is the log's own.
                     if syslog::opt_in_row(input, key, sd_id) == Some("sd_id_collision") {
-                        return Class::Lost;
-                    }
-                    // The encoder writes a `Bytes` PARAM-VALUE as its length, `<N bytes>`.
-                    let tags = input.attribute_types.get(key).map(String::as_str).unwrap_or("");
-                    if tags.contains("=bytes") {
                         return Class::Lost;
                     }
                     let param = |rec: Option<&Value>| rec?.get(sd_id)?.get(key).cloned();
@@ -4875,6 +4868,51 @@ mod tests {
         assert_eq!(pair(&ins, &outs, SYSLOG_5424).seen, [Some(Class::Exact)]);
     }
 
+    /// Under RFC 3164 a log with no `syslog.tag` derives `default_tag`: its resource's
+    /// `service.name`, narrowed to the TAG class, else `logit`. A log with a `syslog.tag`, or under
+    /// RFC 5424 any log, derives none, and every sink reaches the row.
+    #[test]
+    fn an_rfc3164_log_with_no_tag_derives_the_default_tag() {
+        let body = r#""severity":"info","format":"raw","message":"m""#;
+        let ins = recs(&[
+            &format!(
+                r#"{{{{T}},"log":{{{body}}},"resource":{{"attributes":{{"service.name":"api@v2"}}}}}}"#
+            ),
+            &log_line(body, "{}"),
+            &log_line(body, r#"{"syslog.tag":"app"}"#),
+        ]);
+        let tag = |spelling: Spelling, rec: &Rec| {
+            spelling
+                .derived(rec)
+                .into_iter()
+                .find(|(row, _, _)| *row == Some("default_tag"))
+                .map(|(_, _, value)| value)
+        };
+        assert_eq!(tag(SYSLOG_3164, &ins[0]).as_deref(), Some("api_v2"));
+        assert_eq!(tag(SYSLOG_3164, &ins[1]).as_deref(), Some("logit"));
+        assert_eq!(tag(SYSLOG_3164, &ins[2]), None);
+        assert_eq!(tag(SYSLOG_5424, &ins[1]), None);
+        assert!(derived_rows(&ins[1]).contains(&"default_tag"));
+        assert!(!derived_rows(&ins[2]).contains(&"default_tag"));
+    }
+
+    /// Under RFC 3164 a log with no `syslog.tag` leaves with the default TAG, so `syslog_in` reads
+    /// its HOSTNAME back as `host.name` and its message whole, and the TAG pairs as an attribute
+    /// the sink filled in.
+    #[test]
+    fn an_rfc3164_log_with_no_tag_reads_back_its_host_and_message() {
+        let body = r#""severity":"info","format":"raw","message":"error: disk full""#;
+        let ins = recs(&[&log_line(body, r#"{"host.name":"h"}"#)]);
+        let outs = recs(&[&log_line(
+            body,
+            r#"{"_logit.syslog.severity":6,"host.name":"h","syslog.facility":16,"syslog.tag":"logit","syslog.timestamp":"Jan 15 08:00:00"}"#,
+        )]);
+        assert_eq!(pair(&ins, &outs, SYSLOG_3164).seen, [Some(Class::Exact)]);
+        let (feature, field) = attribute_row(&ins[0], "host.name", None);
+        assert_eq!(feature, "host_name");
+        assert_eq!(observe_field(&field, &ins[0], &outs[0], SYSLOG_3164), Class::Exact);
+    }
+
     /// Under RFC 3164 the log's timestamp leaves in whole seconds with no year, read back as
     /// `syslog.timestamp`'s text beside a receipt time that happens to equal it.
     #[test]
@@ -4958,10 +4996,10 @@ mod tests {
         assert_eq!(observe_field(&field, &ins[0], &outs[1], SYSLOG_SD), Class::Lost);
     }
 
-    /// Under `structured_data:`, a key that isn't an SD-NAME and every opt-in attribute of a log
-    /// whose `syslog.sd` already holds the SD-ID reach their own rows and read `lost`, and so does
-    /// an empty array, which writes no PARAM, and a `Bytes` value, which the encoder writes as
-    /// `<N bytes>`.
+    /// Under `structured_data:`, a key that isn't an SD-NAME, every opt-in attribute of a log
+    /// whose `syslog.sd` already holds the SD-ID, and an empty array, which writes no PARAM, reach
+    /// their own rows and read `lost`. A `Bytes` value is its base64 text, read back as a string,
+    /// and reads `normalized`.
     #[test]
     fn an_opt_in_attribute_the_encoder_leaves_off_reads_lost() {
         let body = r#""severity":"info","format":"raw","message":"m""#;
@@ -4975,19 +5013,21 @@ mod tests {
         let outs = recs(&[
             &log_line(body, r#"{"syslog.tag":"app"}"#),
             &log_line(body, r#"{"syslog.sd":{"transit@32473":{"team":"db"}}}"#),
-            &log_line(body, r#"{"syslog.sd":{"transit@32473":{"raw":"<2 bytes>"}}}"#),
+            &log_line(body, r#"{"syslog.sd":{"transit@32473":{"raw":"YWI="}}}"#),
             &log_line(body, r#"{"syslog.sd":{"transit@32473":{"team":"web"}}}"#),
         ]);
         for (i, key, row) in [
             (0, "bad key", "sd_name_unsafe"),
             (1, "team", "sd_id_collision"),
-            (2, "raw", "bytes_value"),
             (3, "none", "sd_empty_array"),
         ] {
             let (feature, field) = attribute_row(&ins[i], key, Some(SD_ID));
             assert_eq!(feature, row, "{key}");
             assert_eq!(observe_field(&field, &ins[i], &outs[i], SYSLOG_SD), Class::Lost, "{key}");
         }
+        let (feature, field) = attribute_row(&ins[2], "raw", Some(SD_ID));
+        assert_eq!(feature, "bytes_value");
+        assert_eq!(observe_field(&field, &ins[2], &outs[2], SYSLOG_SD), Class::Normalized);
     }
 
     /// With `structured_data:` unset, or under RFC 3164, which has no STRUCTURED-DATA, an

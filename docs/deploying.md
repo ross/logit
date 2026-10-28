@@ -4664,6 +4664,17 @@ newline ([ADR `syslog-output`](adr/syslog-output.md)). Structured data leaves wi
 PARAM-NAMEs sorted by name, not in wire order
 ([ADR `syslog-structured-data-convention`](adr/syslog-structured-data-convention.md)).
 
+`syslog_out` writes only an event's header attributes (`syslog.*`, `host.name`, `process.pid`):
+every other attribute has no field under `format: rfc3164`, and none under `format: rfc5424`
+unless you set `structured_data:` with an SD-ID of your own (`myapp@<your PEN>`). With it, each
+public attribute is an SD-PARAM of that element, a `Bytes` value as base64 text; an attribute
+whose key isn't a valid SD-NAME, or whose value is an empty array, is left off and counted
+`logit.output.structured_data.omitted`. Under `format: rfc3164` every message has a TAG: the
+event's `syslog.tag`, else `app_name:`, else `service.name`, else `logit`, so a receiver reads
+the HOSTNAME before it as a HOSTNAME. A `service.name` TAG keeps only letters, digits, `_`, `-`,
+`.`, and `/`, with every other character written as `_`; a `syslog.tag` or `app_name:` is
+written as you set it, so keep it to those characters too.
+
 ### Syslog over TLS (RFC 5425)
 
 `syslog_in`/`syslog_out` can speak TLS too: RFC 5425, syslog framed per RFC 6587 over TLS over TCP

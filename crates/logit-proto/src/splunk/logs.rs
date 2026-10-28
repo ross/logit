@@ -27,6 +27,7 @@
 //! | either severity attribute | that attribute alone, verbatim | -- |
 //! | `event_name`, when no `otel.log.name` attribute | `otel.log.name` | -- |
 //! | `trace`, when neither a `trace_id` nor a `span_id` attribute is present | `trace_id` and, when the ref has one, `span_id`, lowercase hex; `flags` has no field | -- |
+//! | `trace` beside a `trace_id` or `span_id` attribute | omitted: the attribute is written under its own name, and the log's own ids are left off | `logit.output.tags.omitted{reason="reserved_key"}`, one per log |
 //! | on a log whose message (`Str` or `Bytes`) is the text `metric`: an attribute starting `metric_name:`, and `metric_name` and `_value` when both are present | omitted: the decoder would read the object as a metric event | `logit.output.tags.omitted{reason="reserved_key"}`, one per key |
 //!
 //! What a log's fields with no HEC field read back as is in the parent module's generated
@@ -205,12 +206,14 @@ impl SplunkEncoder {
         }
         if let Some(trace) = &log.trace {
             // An attribute of either name wins and suppresses both, so ids from two sources are
-            // never mixed on one object.
+            // never mixed on one object. The log's own ids are then left off, counted once.
             if fields.get_sym(keys.trace_id).is_none() && fields.get_sym(keys.span_id).is_none() {
                 fields.insert_sym(keys.trace_id, Value::str(to_hex(&trace.trace_id)));
                 if let Some(span_id) = &trace.span_id {
                     fields.insert_sym(keys.span_id, Value::str(to_hex(span_id)));
                 }
+            } else {
+                self.reserved_key_omitted(1);
             }
         }
 
@@ -362,6 +365,48 @@ mod tests {
         assert!(body.starts_with(
             r#"{"time":1700000000.25,"host":"web-1","sourcetype":"otel","event":"hello","fields":{"#
         ));
+    }
+
+    /// A `trace_id` or `span_id` attribute wins over the log's trace, which is counted once per
+    /// log; a trace with neither attribute beside it is written and not counted.
+    #[test]
+    fn an_id_attribute_suppresses_the_trace_counted() {
+        let trace = TraceRef { trace_id: [0xab; 16], span_id: Some([0xcd; 8]), flags: 0 };
+        // `counted` accumulates per registry, so one registry and a running total.
+        let registry = Registry::new();
+        let mut total = 0.0;
+        for (key, expected, omitted) in [
+            (Some("trace_id"), r#"{"time":0,"event":"m","fields":{"trace_id":"1234"}}"#, 1.0),
+            (Some("span_id"), r#"{"time":0,"event":"m","fields":{"span_id":"1234"}}"#, 1.0),
+            (
+                None,
+                r#"{"time":0,"event":"m","fields":{"span_id":"cdcdcdcdcdcdcdcd","trace_id":"abababababababababababababababab"}}"#,
+                0.0,
+            ),
+        ] {
+            let mut attrs = AttrMap::new();
+            if let Some(key) = key {
+                attrs.insert(key, Value::str("1234"));
+            }
+            let mut record = log_record(Value::str("m"), BodyFormat::Raw);
+            record.trace = Some(trace);
+            let batch = EventBatch {
+                resource: Arc::new(Resource::default()),
+                scope: None,
+                events: vec![Event::log(0, attrs, record)],
+            };
+            let mut out = MessageBuf::default();
+            encoder(&registry).encode_objects(&batch, &mut out);
+            let object = std::str::from_utf8(out.iter().next().unwrap()).unwrap();
+            let object: Json = serde_json::from_str(object).unwrap();
+            assert_eq!(object, serde_json::from_str::<Json>(expected).unwrap(), "{key:?}");
+            total += omitted;
+            assert_eq!(
+                counted(&registry, "logit.output.tags.omitted", ("reason", "reserved_key")),
+                total,
+                "{key:?}"
+            );
+        }
     }
 
     /// A private attribute, on the event or the resource, never becomes a field and is never

@@ -61,6 +61,11 @@
 //!    `host.name` attribute and reports a throttled `hostname_not_utf8` diagnostic. Pinned by
 //!    a unit test in `logit_proto::syslog`:
 //!    `a_non_utf8_rfc3164_hostname_is_skipped_with_a_throttled_diagnostic`.
+//! 10. **RFC 3164 output always carries a TAG.** With no `syslog.tag` and no `app_name:`, the TAG
+//!     is `service.name`, else `logit`, so `syslog_in` reads the HOSTNAME before it back as one
+//!     (`crates/logit-outputs/src/syslog.rs`'s "Header-field precedence"). A tag-less capture
+//!     (`python-syslog-handler-*`) relays with `logit:` ahead of its MSG, asserted by
+//!     `python_syslog_handler_captures_relay_with_a_receipt_time_timestamp`.
 //!
 //! `mod tcp` and `mod tls` add no entry to this list: both transports share
 //! `SyslogEncoder`/`SyslogDecoder`, and TCP (and TLS, RFC 5425) changes only the framing
@@ -380,9 +385,10 @@ async fn rfc3164_non_numeric_pid_stays_a_str_through_the_relay() {
     assert_eq!(decoded.events[0].attributes.get("syslog.pid").and_then(Value::as_str), Some("abc"));
 }
 
-/// Normalization (3) for a capture with no TIMESTAMP token (`python-syslog-handler-*`, Python's
-/// stdlib `SysLogHandler`). The relay adds a receipt-time TIMESTAMP, so the assertion is
-/// structural: a well-formed RFC 3164 TIMESTAMP after the PRI, and everything after it unchanged.
+/// Normalizations (3) and (10) for a capture with no TIMESTAMP token and no TAG
+/// (`python-syslog-handler-*`, Python's stdlib `SysLogHandler`). The relay adds a receipt-time
+/// TIMESTAMP and the `logit` TAG, so the assertion is structural: a well-formed RFC 3164
+/// TIMESTAMP after the PRI, and everything after it as `expected_rest` says.
 async fn assert_receipt_time_relay(
     harness: &mut Harness,
     testdata_name: &str,
@@ -406,7 +412,7 @@ async fn assert_receipt_time_relay(
     let rest = &text[pri_end + 15..];
     assert_eq!(
         rest, expected_rest,
-        "{testdata_name}: everything after the TIMESTAMP must be unchanged"
+        "{testdata_name}: everything after the TIMESTAMP must be the TAG and the input's MSG"
     );
 }
 
@@ -442,13 +448,13 @@ async fn python_syslog_handler_captures_relay_with_a_receipt_time_timestamp() {
     assert_receipt_time_relay(
         &mut harness,
         "python-syslog-handler-000.raw",
-        " hello from python logging.handlers.SysLogHandler, captured for logit interop fixtures",
+        " logit: hello from python logging.handlers.SysLogHandler, captured for logit interop fixtures",
     )
     .await;
     assert_receipt_time_relay(
         &mut harness,
         "python-syslog-handler-001.raw",
-        " {\"level\": \"info\", \"msg\": \"request handled\", \"path\": \"/\", \"status\": 200}",
+        " logit: {\"level\": \"info\", \"msg\": \"request handled\", \"path\": \"/\", \"status\": 200}",
     )
     .await;
 }

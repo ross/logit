@@ -350,6 +350,7 @@
 //! | `attributes/host_name` | exact | -- | A DogStatsD event's `h:` field, read back as `host.name`. |
 //! | `attributes/syslog_facility` | exact | -- | A log with no `syslog.facility` leaves with none. |
 //! | `attributes/no_host` | exact | -- | A record with no host leaves with none. |
+//! | `attributes/default_tag` | exact | -- | A log with no `syslog.tag` leaves with none. |
 //! | `attributes/log_severity_fields` | exact | -- | No `otel.log.severity.*` attribute is written. |
 //! | `log/severity` | exact | -- | A DogStatsD event's `\|t:` alert type, written from its `_logit.statsd.event.alert_type` carrier, which statsd_in reads back as the severity. |
 //! | `log/severity_unset` | exact | -- | A DogStatsD event with no alert type, read back as no severity. |
@@ -542,6 +543,10 @@
 //! Either way the full walk into [`Carriers`] is where
 //! `_logit.statsd.type`, `container.id`, and the `timestamped` flag are captured too,
 //! so `event.attributes` is never read a second time.
+//!
+//! A span on a DogStatsD event has no statsd form, so the sink writes the event's line and ignores
+//! the span, uncounted, as a sink ignores any signal it has no wire for (ADR
+//! `telemetry-loss-vocabulary`'s amendment "an ignored signal, and a format the config selects").
 //!
 //! **Event wire form**, one line: `_e{tlen,xlen}:title|text`, then, in this order and only when
 //! present and valid: `|d:<secs>` (for a `timestamped` event, as for `|T`; `d:`, never `|T`,

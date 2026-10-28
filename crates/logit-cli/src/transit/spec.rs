@@ -1735,7 +1735,7 @@ mod tests {
     }
 
     /// A log cell may be `uncounted` only where the allowance names it: beside metrics at any
-    /// sink, and a trace beside an id attribute at `datadog_out` and `splunk_hec_out`.
+    /// sink. A trace beside an id attribute is counted at every sink.
     #[test]
     fn an_uncounted_log_cell_needs_its_own_allowance() {
         let table = |row: &str| {
@@ -1752,18 +1752,17 @@ mod tests {
             ("dogstatsd_event", "syslog_out", "skipped"),
             ("trace", "datadog_out", "lost"),
             ("trace_beside_id_attribute", "syslog_out", "lost"),
+            ("trace_beside_id_attribute", "datadog_out", "lost"),
+            ("trace_beside_id_attribute", "splunk_hec_out", "lost"),
         ] {
             let row = format!("{{kind: log, feature: {feature}, cells: {}}}", cell(sink, class));
             let err = mapping::parse(&table(&row)).expect_err(&row);
             assert!(format!("{err:#}").contains("an uncounted loss is counted"), "{row}: {err:#}");
         }
-        for (feature, sink, class) in [
-            ("beside_metrics", "statsd_out", "lost"),
-            ("trace_beside_id_attribute", "datadog_out", "lost"),
-            ("trace_beside_id_attribute", "splunk_hec_out", "lost"),
-        ] {
-            let row = format!("{{kind: log, feature: {feature}, cells: {}}}", cell(sink, class));
-            assert!(mapping::parse(&table(&row)).is_ok(), "{row}");
-        }
+        let row = format!(
+            "{{kind: log, feature: beside_metrics, cells: {}}}",
+            cell("statsd_out", "lost")
+        );
+        assert!(mapping::parse(&table(&row)).is_ok(), "{row}");
     }
 }

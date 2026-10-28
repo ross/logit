@@ -302,3 +302,41 @@ behaves and fixed in a later stream. Lines parsed from text (`lines_in`, `tail_i
 `kafka_out`'s OTLP and MessagePack formats, and spans stay out.
 [`docs/plans/transit-spec.md`](../plans/transit-spec.md)'s "9. Logs" has the feature table, the
 framework's changes, and the workstreams, and its "Findings" the sink behaviors already known.
+
+## Amendment: sink fixes (2026-10-28)
+
+The log-records amendment recorded each log sink's behavior as the code had it and left the
+fixes to a later stream. The `tsink` stream makes those fixes, and its loss rules change two of
+that amendment's decisions:
+
+- **Decision 8 is reversed.** `syslog_out`'s leave-off of every attribute outside its header
+  fields is `lost, structural` under RFC 5424 without `structured_data:`, as it already was
+  under RFC 3164. The reasoning that the slot exists and the config didn't opt in, so the loss is
+  real, doesn't hold: every log at that sink under that configuration loses the fields, so a
+  counter would track the log count. [ADR
+  `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md)'s "Amendment (2026-10-28): an
+  ignored signal, and a format the config selects" states the rule: a format the config selects
+  defines the sink's slots.
+- **Decision 9's three mechanisms close.** The first, `syslog_out`'s attribute leave-off, is
+  structural by the rule above, so its entries go. The second, the `structured_data:` encoder's
+  two uncounted losses, is fixed: a `Bytes` value is written as base64 text and reads back
+  `normalized`, `stringified`, as at `datadog_out` and `splunk_hec_out`, and an empty array it
+  writes no PARAM for counts `logit.output.structured_data.omitted{reason="empty_array"}`. The
+  third, the trace `datadog_out` and `splunk_hec_out` leave off a log for a `trace_id` or
+  `span_id` attribute, is counted as `logit.output.tags.omitted{reason="reserved_key"}`, the
+  counter each encoder already uses for an attribute that collides with a reserved key; the
+  attribute still wins.
+- **Decision 9 now reads:** `UNCOUNTED_ALLOWED` holds three entries.
+  `("log", Some("beside_metrics"), None)` and `("span", None, None)` are the ignored-signal rule
+  of the same `telemetry-loss-vocabulary` amendment: a sink that writes some of an event's
+  signals ignores the rest, uncounted, and `tspan` narrows the span entry when spans are
+  classified. `("attributes", Some("datadog_carrier_log"), Some("datadog_out"))` predates logs
+  and is outside this stream. Every other uncounted loss of a log field is a format with no slot
+  and reads `lost, structural`.
+
+Under RFC 3164, `syslog_out` also writes a TAG for every message, so the record-level row
+`log/header_in_message` has nothing left to hold and goes
+([ADR `syslog-output`](syslog-output.md)'s "Amendment: an RFC 3164 message always has a TAG
+(2026-10-28)").
+[`docs/plans/transit-spec.md`](../plans/transit-spec.md)'s "10. Sink fixes" has every decision,
+the workstreams, and the limits the stream leaves as decided.

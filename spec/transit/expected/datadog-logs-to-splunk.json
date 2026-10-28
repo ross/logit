@@ -63,7 +63,7 @@
   ], "counters": {}},
   "timestamps": {"events": [
     {"timestamp":"2027-01-15T07:59:50.000000000Z","log":{"format":"raw","message":"timestamp integer"},"resource":{"attributes":{"host.name":"web-1"}}},
-    {"timestamp":"2027-01-15T07:59:50.001499904Z","log":{"format":"raw","message":"timestamp fractional"},"resource":{"attributes":{"host.name":"web-1"}}},
+    {"timestamp":"2027-01-15T07:59:50.001500000Z","log":{"format":"raw","message":"timestamp fractional"},"resource":{"attributes":{"host.name":"web-1"}}},
     {"timestamp":"2027-01-15T07:59:50.123456000Z","log":{"format":"raw","message":"timestamp rfc3339"},"resource":{"attributes":{"host.name":"web-1"}}},
     {"timestamp":"2027-01-15T07:59:51.000000000Z","log":{"format":"raw","message":"timestamp offset"},"resource":{"attributes":{"host.name":"web-1"}}},
     {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"format":"raw","message":"timestamp absent"},"resource":{"attributes":{"host.name":"web-1"}}},

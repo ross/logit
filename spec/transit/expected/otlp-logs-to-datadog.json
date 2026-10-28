@@ -51,5 +51,7 @@
     {"timestamp":"2027-01-15T08:00:02.002000000Z","log":{"severity":"info","format":"raw","message":"beside its span"},"attributes":{"host.name":"transit","status":"info"}},
     {"timestamp":"2027-01-15T08:00:02.002000000Z","span":{"name":"GET /cart","trace_id":"5b8efff798038103d269b633813fc60e","span_id":"eee19b7ec3c1b175","kind":"internal","status":"unset","start":"2027-01-15T08:00:02.002000000Z","end":"2027-01-15T08:00:02.012000000Z","duration_ns":10000000},"attributes":{"_dd.p.tid":"5b8efff798038103"},"resource":{"attributes":{"host.name":"transit"}}},
     {"timestamp":"2027-01-15T08:00:02.003000000Z","log":{"severity":"info","format":"raw","message":"an id attribute beside the trace"},"attributes":{"host.name":"transit","span_id":"app-0042","status":"info","trace_id":"app-7f3a"}}
-  ], "counters": {}}
+  ], "counters": {
+    "logit.output.tags.omitted{component=out,kind=datadog_out,reason=reserved_key,role=sink}": 1
+  }}
 }

@@ -2161,16 +2161,17 @@ itself. The sink emits each once per batch, however many attempts the runtime ma
 - `logit.output.messages` (count): messages sent.
 - `logit.output.datagrams` (count, UDP only): datagrams that reached the kernel, even when the
   batch then failed. Each message is its own datagram, so it equals `messages`.
-- `logit.output.events.skipped`: events with no `log` record, so nothing to render as a syslog
-  message (ADR `multi-payload-events`).
+- `logit.output.events.skipped{reason="no_log"}`: events with no `log` record, so nothing to
+  render as a syslog message (ADR `multi-payload-events`).
 - `logit.output.messages.truncated` and
   `logit.output.messages.dropped{reason="oversize_header"|"oversize_datagram"}`: per-message size
   handling (`docs/adr/syslog-output.md`'s "Sizing" section).
-- `logit.output.structured_data.omitted{reason="invalid_sd_name"|"not_a_map"|"sd_id_collision"}`:
+- `logit.output.structured_data.omitted{reason="invalid_sd_name"|"not_a_map"|"sd_id_collision"|"empty_array"}`:
   a piece of STRUCTURED-DATA left off a message that is still sent. An SD-ID or PARAM-NAME that
   isn't a valid RFC 5424 `SD-NAME` (an invalid SD-ID omits the element, an invalid PARAM-NAME that
   param); a `syslog.sd` element whose value isn't a map of PARAM-NAME to value; the opt-in element
-  colliding with an SD-ID the event already carries.
+  colliding with an SD-ID the event already carries; a PARAM whose value is an empty array, which
+  has no item to write.
 - `logit.output.fields.omitted{reason="invalid_value"}`: a `process.pid` with no PROCID form (a
   negative integer, or a value that isn't an integer or a string of digits) left off a message that
   is still sent.
@@ -2734,7 +2735,7 @@ The module doc of `logit_proto::datadog` has the full mapping-to-counter tables.
 | `logit.input.events.dropped{reason="malformed"\|"no_title"}` | count | an events-envelope group that isn't an array or an item that isn't an object, or an event with neither a title nor a text |
 | `logit.input.metrics.dropped{reason="malformed"\|"no_name"\|"invalid_status"}` | count | a service check that isn't an object, has no `check` name, or has a status outside 0 to 3 |
 | `logit.output.metrics.dropped{reason="invalid_status"}` | count | a service-check event with no status in 0 to 3, on either its `_logit.statsd.service_check.status` or its gauge |
-| `logit.output.tags.omitted{reason="reserved_key"}` | count | a log attribute that would collide with the log's own wire fields: one named `message`, `timestamp`, or `hostname`, or a `service` beside a `service.name` the sink writes as `service`; and a `ddtags` entry naming `env`, `version`, or `container_id` beside the key the sink appends that entry from |
+| `logit.output.tags.omitted{reason="reserved_key"}` | count | a log attribute that would collide with the log's own wire fields: one named `message`, `timestamp`, or `hostname`, or a `service` beside a `service.name` the sink writes as `service`; a `ddtags` entry naming `env`, `version`, or `container_id` beside the key the sink appends that entry from; and a log's own trace, left off because the log carries a `trace_id` or `span_id` attribute, once per log |
 | `logit.input.stats.dropped{reason="malformed_payload"\|"malformed_bucket"\|"malformed_group"}` | count | an APM stats `ClientStatsPayload` (in an intake `StatsPayload`), bucket, or group that isn't a well-formed map, dropped while the rest decodes |
 | `logit.input.stats.skipped{reason="empty_bucket"}` | count | an APM stats bucket with no groups, which decodes to no events |
 | `logit.input.stats.dropped{reason="interpolation"\|"bad_sketch"}` | count | an `OkSummary`/`ErrorSummary` dropped from its group: an interpolated DDSketch mapping, which isn't implemented, or bytes that aren't a usable DDSketch |

@@ -199,6 +199,7 @@
 //! | `attributes/splunk_envelope`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
 //! | `attributes/syslog_facility` | exact | -- | `kafka_out` writes no attribute from a record's own fields or its config. |
 //! | `attributes/no_host` | exact | -- | `kafka_out` writes no attribute from a record's own fields or its config. |
+//! | `attributes/default_tag` | exact | -- | `kafka_out` writes no attribute from a record's own fields or its config. |
 //! | `attributes/log_status` | exact | -- | `kafka_out` writes no attribute from a record's own fields or its config. |
 //! | `attributes/log_severity_fields` | exact | -- | `kafka_out` writes no attribute from a record's own fields or its config. |
 //! | `attributes/span_kind` | exact | -- | `kafka_out` writes no attribute from a record's own fields or its config. |

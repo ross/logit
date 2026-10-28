@@ -3,7 +3,9 @@
 //! conversion and ordered writer it shares with the other JSON routes live in [`crate::json`].
 
 use super::tags::split_joined;
-use super::time::{millis_to_nanos, nanos_to_millis, or_received};
+use super::time::{
+    millis_f64_to_nanos, millis_text_to_nanos, millis_to_nanos, nanos_to_millis, or_received,
+};
 use super::{
     insert_wire_host, is_datadog_event, DatadogDecoder, DatadogEncoder,
     ATTR_DEPLOYMENT_ENVIRONMENT_NAME, ATTR_HOST_NAME, ATTR_SERVICE_NAME, ATTR_SERVICE_VERSION,
@@ -19,7 +21,9 @@ use logit_core::{
     parse_rfc3339_to_nanos, AttrMap, BodyFormat, Event, EventBatch, LogRecord, Resource, Severity,
     Symbol, Value,
 };
+use serde_json::value::RawValue;
 use serde_json::Value as Json;
+use std::collections::BTreeMap;
 use std::sync::{Arc, LazyLock};
 
 /// `status`: a log's raw Datadog status, kept verbatim beside the normalized severity.
@@ -105,15 +109,23 @@ impl DatadogDecoder {
             }
         };
         let mut events = Vec::with_capacity(items.len());
-        for item in items {
-            if let Some(event) = self.decode_log_item(item, received_at) {
+        let mut raw = RawItems { body, array: json.is_array(), items: None };
+        for (index, item) in items.iter().enumerate() {
+            if let Some(event) =
+                self.decode_log_item(item, received_at, &mut || raw.timestamp(index))
+            {
                 events.push(event);
             }
         }
         Ok(new_batch(Resource::default(), events))
     }
 
-    fn decode_log_item(&mut self, item: &Json, received_at: i64) -> Option<Event> {
+    fn decode_log_item<'a>(
+        &mut self,
+        item: &Json,
+        received_at: i64,
+        raw_timestamp: &mut dyn FnMut() -> Option<&'a str>,
+    ) -> Option<Event> {
         let Json::Object(obj) = item else {
             self.drop_log("not_an_object");
             self.diagnostics.warn_throttled("malformed_log", "datadog log item is not an object");
@@ -135,7 +147,7 @@ impl DatadogDecoder {
         for (key, value) in obj {
             match key.as_str() {
                 "message" => {}
-                "timestamp" => timestamp = self.log_timestamp(value),
+                "timestamp" => timestamp = self.log_timestamp(value, raw_timestamp),
                 _ => {
                     if key == ATTR_STATUS {
                         severity = value.as_str().and_then(status_severity);
@@ -254,8 +266,14 @@ impl DatadogDecoder {
     }
 
     /// Integer (or fractional) milliseconds, or an RFC 3339 string. Anything else is reported and
-    /// falls back to `received_at`.
-    fn log_timestamp(&mut self, value: &Json) -> Option<i64> {
+    /// falls back to `received_at`. A fractional number is read from its own text, through
+    /// `raw_timestamp`, since an epoch-magnitude millisecond count with a sub-millisecond fraction
+    /// has more significant digits than its `f64` keeps.
+    fn log_timestamp<'a>(
+        &mut self,
+        value: &Json,
+        raw_timestamp: &mut dyn FnMut() -> Option<&'a str>,
+    ) -> Option<i64> {
         match value {
             Json::Null => None,
             Json::Number(n) => {
@@ -264,8 +282,9 @@ impl DatadogDecoder {
                 } else if n.as_u64().is_some() {
                     Some(i64::MAX)
                 } else {
-                    // `as` saturates, and `serde_json` never yields a non-finite number.
-                    n.as_f64().map(|ms| (ms * 1e6) as i64)
+                    raw_timestamp()
+                        .and_then(millis_text_to_nanos)
+                        .or_else(|| n.as_f64().and_then(millis_f64_to_nanos))
                 }
             }
             Json::String(s) => match parse_rfc3339_to_nanos(s) {
@@ -288,6 +307,35 @@ impl DatadogDecoder {
 
     fn drop_log(&self, reason: &'static str) {
         self.telemetry.count("logit.input.logs.dropped", 1.0, &[("reason", reason)]);
+    }
+}
+
+/// A logs body's items as raw JSON, split out of the body the first time an item's `timestamp`
+/// needs its number text: `serde_json::Value` keeps only a fractional number's `f64`, and an
+/// integer timestamp, the common case, never pays for the second parse.
+struct RawItems<'a> {
+    body: &'a [u8],
+    /// The body is an array of items, not one bare object.
+    array: bool,
+    items: Option<Vec<&'a RawValue>>,
+}
+
+impl<'a> RawItems<'a> {
+    /// Item `index`'s `timestamp` member as its JSON text; on duplicate keys the last, as
+    /// `serde_json::Value` keeps.
+    fn timestamp(&mut self, index: usize) -> Option<&'a str> {
+        let body = self.body;
+        let array = self.array;
+        let items = self.items.get_or_insert_with(|| {
+            if array {
+                serde_json::from_slice::<Vec<&RawValue>>(body).unwrap_or_default()
+            } else {
+                serde_json::from_slice::<&RawValue>(body).map(|item| vec![item]).unwrap_or_default()
+            }
+        });
+        let item: &'a RawValue = items.get(index)?;
+        let members: BTreeMap<String, &'a RawValue> = serde_json::from_str(item.get()).ok()?;
+        members.get("timestamp").map(|raw| raw.get())
     }
 }
 
@@ -396,8 +444,6 @@ impl DatadogEncoder {
         } else if let Some(source) = find(keys.source) {
             write_value(obj.key("ddsource"), source);
             consumed.push(keys.source);
-        } else if let Some(source) = &self.default_source {
-            write_str(obj.key("ddsource"), source);
         }
         // `deployment.environment.name`, `service.version`, and `container.id` are `ddtags`
         // entries (`env`, `version`, and the `container_id` tag the Agent gives a container's
@@ -465,13 +511,20 @@ impl DatadogEncoder {
             write_value(obj.key(resolve(*key)), value);
         }
         // An attribute of either name wins and suppresses both, so a relayed Datadog log goes
-        // back out as it arrived and its ids are never mixed with a `TraceRef`'s.
+        // back out as it arrived and its ids are never mixed with a `TraceRef`'s. The log's own
+        // ids are then left off, counted once.
         if let Some(trace) = &log.trace {
             if find(keys.trace_id).is_none() && find(keys.span_id).is_none() {
                 write_str(obj.key(WIRE_TRACE_ID), &to_hex(&trace.trace_id));
                 if let Some(span_id) = &trace.span_id {
                     write_str(obj.key(WIRE_SPAN_ID), &to_hex(span_id));
                 }
+            } else {
+                self.telemetry.count(
+                    "logit.output.tags.omitted",
+                    1.0,
+                    &[("reason", "reserved_key")],
+                );
             }
         }
         obj.finish();
@@ -755,6 +808,24 @@ pub(super) mod tests {
         assert_eq!(counted(&registry, "logit.input.logs.dropped", ("reason", "no_message")), 2.0);
     }
 
+    /// A fractional millisecond `timestamp` keeps every digit of its text, in an array, a bare
+    /// object, and beside a non-object item that shifts no index.
+    #[test]
+    fn fractional_millisecond_timestamps_are_read_from_their_text() {
+        let batch = decode(
+            r#"[{"message":"a","timestamp":1799999990001.5},7,{"message":"b","timestamp":1799999990001.123456},{"message":"c","timestamp":1799999990001}]"#,
+        );
+        let stamps: Vec<i64> = batch.events.iter().map(|e| e.timestamp).collect();
+        assert_eq!(
+            stamps,
+            [1_799_999_990_001_500_000, 1_799_999_990_001_123_456, 1_799_999_990_001_000_000]
+        );
+        let bare = decode(r#"{"message":"a","timestamp":1.5e12,"x":1}"#);
+        assert_eq!(bare.events[0].timestamp, 1_500_000_000_000_000_000, "an exponent form");
+        let bare = decode(r#"{"timestamp":1,"message":"a","timestamp":1799999990001.25}"#);
+        assert_eq!(bare.events[0].timestamp, 1_799_999_990_001_250_000, "the last duplicate");
+    }
+
     /// An Agent's connectivity check: no log, and nothing counted dropped. An empty object
     /// inside an array is still a log item with no message.
     #[test]
@@ -806,7 +877,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn encode_falls_back_to_model_names_and_the_default_source() {
+    fn encode_falls_back_to_model_names() {
         let mut resource = Resource::default();
         resource.attributes.insert("service.name", Value::str("checkout"));
         resource.attributes.insert("host.name", Value::str("res-host"));
@@ -815,6 +886,7 @@ pub(super) mod tests {
         attrs.insert("n", Value::I64(3));
         attrs.insert("bin", Value::Bytes(Bytes::from_static(b"\x00\x01")));
         attrs.insert("at", Value::Timestamp(0));
+        attrs.insert("ddsource", Value::str("logit"));
         let log = LogRecord {
             message: Value::Map(Box::new(AttrMap::from_iter([("k", Value::str("v"))]))),
             severity: Some(Severity::Error),
@@ -829,7 +901,7 @@ pub(super) mod tests {
             scope: None,
             events: vec![Event::log(1_700_000_000_000_000_000, attrs, log), metric_event()],
         };
-        let out = DatadogEncoder::new().with_default_source("logit").encode_logs(&batch).unwrap();
+        let out = DatadogEncoder::new().encode_logs(&batch).unwrap();
         let json: Json = serde_json::from_slice(&out).unwrap();
         assert_eq!(json.as_array().unwrap().len(), 1);
         let item = &json[0];
@@ -1010,10 +1082,21 @@ pub(super) mod tests {
             span_id: Some(987_654_321_u64.to_be_bytes()),
             flags: 1,
         };
+        let registry = Registry::new();
+        let encoder = DatadogEncoder::new().with_telemetry(registry.telemetry_for(
+            "datadog_out",
+            "datadog_out",
+            "sink",
+        ));
         let batch = with_trace(decode(r#"{"message":"m","timestamp":1000,"k":"v"}"#), trace);
         assert_eq!(
-            encode(&batch),
+            encode_with(&encoder, &batch),
             r#"[{"message":"m","timestamp":1000,"k":"v","trace_id":"64de8e2b0000000012345678abcdef12","span_id":"000000003ade68b1"}]"#
+        );
+        assert_eq!(
+            counted(&registry, "logit.output.tags.omitted", ("reason", "reserved_key")),
+            0.0,
+            "a ref written is nothing left off"
         );
 
         let no_span = logit_core::TraceRef { span_id: None, ..trace };
@@ -1024,6 +1107,7 @@ pub(super) mod tests {
         );
     }
 
+    /// The attribute wins, and the ref it suppresses is counted once per log.
     #[test]
     fn a_trace_id_or_span_id_attribute_wins_over_the_trace_ref() {
         let trace =
@@ -1031,9 +1115,25 @@ pub(super) mod tests {
         for body in [
             r#"{"message":"m","timestamp":1000,"trace_id":"1234"}"#,
             r#"{"message":"m","timestamp":1000,"span_id":"5678"}"#,
+            r#"{"message":"m","timestamp":1000,"trace_id":"1234","span_id":"5678"}"#,
         ] {
+            let registry = Registry::new();
+            let encoder = DatadogEncoder::new().with_telemetry(registry.telemetry_for(
+                "datadog_out",
+                "datadog_out",
+                "sink",
+            ));
             let batch = with_trace(decode(body), trace);
-            assert_eq!(encode(&batch), format!("[{body}]"), "the attribute alone goes out");
+            assert_eq!(
+                encode_with(&encoder, &batch),
+                format!("[{body}]"),
+                "the attribute alone goes out"
+            );
+            assert_eq!(
+                counted(&registry, "logit.output.tags.omitted", ("reason", "reserved_key")),
+                1.0,
+                "{body}"
+            );
         }
     }
 

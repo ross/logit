@@ -14,8 +14,8 @@
 //! | `record` | `no_recorded_value`, `no_recorded_value_delta_sum`, `no_recorded_value_other_kind`, `service_check`, `name_unsafe`, `exemplar_key_unsafe`, `exemplar_key_unsafe_histogram`, `sample_rate`, `non_finite`, `superseded`, `same_instant`, `same_instant_equal`, `same_millisecond`, `same_millisecond_equal` | record |
 //! | `record` | `unit`, `description`, `start_timestamp`, `exemplars`, `exemplars_on_summary`, `unit_on_distribution`, `min_max`, `sample_rate_unweighted` | field |
 //! | `attributes` | `string_value`, `bool_value`, `number_value`, `array_value`, `map_value`, `bytes_value`, `timestamp_value`, `null_value`, `private_carrier`, `prometheus_target` (`_logit.prometheus.target`, at every sink), `foreign_carrier`, `timestamped` (`_logit.metrics.closed: "timestamped"`, at every sink), `rate` and `rate_on_non_gauge` (`_logit.metrics.type: "rate"` on a gauge and on any other metric kind, at every sink), `family_type` and `family_type_on_other_kind` (`_logit.metrics.type: "info"` or `"stateset"` on a gauge and `"gaugehistogram"` on a histogram, and any of the three on another metric kind, at every sink), `interval`, `interval_on_distribution`, and `interval_on_histogram` (`_logit.metrics.interval` on a metric record, on a `samples`, `distribution`, or delta `exponential_histogram`, and on a delta `histogram`, at every sink), `datadog_carrier_log`, `severity_carrier_otel` (`_logit.otel.severity_number` and `_logit.otel.severity_text`, ahead of the private and foreign carrier rows), `severity_carrier_syslog` (`_logit.syslog.severity`, beside it), `syslog_header`, `syslog_msgid`, `syslog_sd`, `syslog_timestamp`, `host_name` (a log's event attribute `syslog_out` writes as a header field, by key), `splunk_envelope` (`com.splunk.source`, `.sourcetype`, or `.index` on the resource, the HEC envelope), `sd_id_collision`, `sd_name_unsafe`, and `sd_empty_array` (a log's attribute `syslog_out`'s `structured_data:` leaves out of its SD-ELEMENT), `resource_attribute`, `scope` | field |
-//! | `attributes` | `no_host`, `log_status`, `log_severity_fields`, `span_kind`, `trace_id_high`, `syslog_facility` (a record `datadog_out`, `syslog_out`, or `splunk_hec_out` writes an attribute for from the record's own fields or the sink's config) | field |
-//! | `log` | `dogstatsd_event`, `plain` (each on an event with no metrics), `message_unsafe` (a message the sink's encoder rewrites), `structured_message` (a `Map` or `Array` message), `bytes_message`, `blank_message` (an empty message, or none), `header_in_message` (a log RFC 3164's header rule reads back with a header token in its message) | record |
+//! | `attributes` | `no_host`, `default_tag` (`syslog_out`'s RFC 3164 fallback TAG), `log_status`, `log_severity_fields`, `span_kind`, `trace_id_high`, `syslog_facility` (a record `datadog_out`, `syslog_out`, or `splunk_hec_out` writes an attribute for from the record's own fields or the sink's config) | field |
+//! | `log` | `dogstatsd_event`, `plain` (each on an event with no metrics), `message_unsafe` (a message the sink's encoder rewrites), `structured_message` (a `Map` or `Array` message), `bytes_message`, `blank_message` (an empty message, or none) | record |
 //! | `log` | `severity`, `severity_unset`, `body_format`, `event_name`, `observed_timestamp`, `observed_timestamp_unset`, `trace`, `trace_unset`, `trace_flags`, `trace_beside_id_attribute`, `dropped_attributes_count`, `timestamp`, `receipt_timestamp` (a field of any log, beside metrics or not, [`LOG_FIELDS`]) | field |
 //! | `span` | `alone` (on an event with no metrics or log), `beside_log` (on an event with a log and no metrics); `no_wire_form` (one of those carrying a field a Datadog span has no form for) | record |
 //! | `log`, `span` | `beside_metrics` (on an event that carries metrics) | field |
@@ -80,7 +80,7 @@
 //!   kind and shape), so every such record loses it and the table is its
 //!   record; a record written as another kind or shape names its counter (ADR
 //!   `telemetry-loss-vocabulary`'s amendment "structural loss has no counter"). `uncounted`, a
-//!   loss the sink doesn't count yet, is accepted only on a cell [`UNCOUNTED_ALLOWED`] names, and
+//!   loss no counter tracks, is accepted only on a cell [`UNCOUNTED_ALLOWED`] names, and
 //!   the class check accepts it for a record nothing reads back.
 
 use anyhow::{bail, ensure, Context};
@@ -88,38 +88,18 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
 
-/// The cells whose loss may still be `uncounted`, as `(row kind, feature, sink)`, where `None`
-/// matches any. Every other `skipped`, `dropped`, or `lost` cell names a counter, or a `lost` one
-/// is `structural`. A span is uncounted at any sink, and a log in two places: beside metrics, at
-/// a metrics sink that writes the metrics, and a log's own trace that `datadog_out` and
-/// `splunk_hec_out` leave off for a `trace_id` or `span_id` attribute. A `_logit.datadog.*`
-/// carrier `datadog_out` leaves off a log is uncounted too, and so is a public attribute outside
-/// its header fields that `syslog_out` leaves off a log, one entry per row such an attribute
-/// reaches; `bytes_value`'s also covers a `Bytes` PARAM-VALUE `structured_data:` writes as its
-/// length, and `sd_empty_array`'s is an empty array `structured_data:` writes no PARAM for.
-const UNCOUNTED_ALLOWED: [(&str, Option<&str>, Option<&str>); 22] = [
+/// The cells whose loss may be `uncounted`, as `(row kind, feature, sink)`, where `None` matches
+/// any. Every other `skipped`, `dropped`, or `lost` cell names a counter, or a `lost` one is
+/// `structural`. The first two entries are the rule in ADR `telemetry-loss-vocabulary`'s amendment
+/// "an ignored signal, and a format the config selects": a sink that writes the signals it carries
+/// ignores a signal it has no wire for, uncounted, so `log/beside_metrics` matches at any sink, and
+/// so does every `span` row until spans have sources of their own. The third is the one entry
+/// outside that rule: a `_logit.datadog.*` carrier `datadog_out`'s log, event, and service-check
+/// routes have no field for, left off where its metrics routes count one.
+const UNCOUNTED_ALLOWED: [(&str, Option<&str>, Option<&str>); 3] = [
     ("log", Some("beside_metrics"), None),
-    ("log", Some("trace_beside_id_attribute"), Some("datadog_out")),
-    ("log", Some("trace_beside_id_attribute"), Some("splunk_hec_out")),
     ("span", None, None),
     ("attributes", Some("datadog_carrier_log"), Some("datadog_out")),
-    ("attributes", Some("string_value"), Some("syslog_out")),
-    ("attributes", Some("bool_value"), Some("syslog_out")),
-    ("attributes", Some("number_value"), Some("syslog_out")),
-    ("attributes", Some("array_value"), Some("syslog_out")),
-    ("attributes", Some("map_value"), Some("syslog_out")),
-    ("attributes", Some("bytes_value"), Some("syslog_out")),
-    ("attributes", Some("timestamp_value"), Some("syslog_out")),
-    ("attributes", Some("null_value"), Some("syslog_out")),
-    ("attributes", Some("sd_empty_array"), Some("syslog_out")),
-    ("attributes", Some("host_beside_host_name"), Some("syslog_out")),
-    ("attributes", Some("hostname"), Some("syslog_out")),
-    ("attributes", Some("log_service"), Some("syslog_out")),
-    ("attributes", Some("log_service_field"), Some("syslog_out")),
-    ("attributes", Some("container_id"), Some("syslog_out")),
-    ("attributes", Some("service_identity"), Some("syslog_out")),
-    ("attributes", Some("service_tag"), Some("syslog_out")),
-    ("attributes", Some("service_tag_beside_key"), Some("syslog_out")),
 ];
 
 /// Whether the cell of `sink` in row `kind`/`feature` may be `uncounted` ([`UNCOUNTED_ALLOWED`]).
@@ -229,6 +209,7 @@ const KINDS: [(&str, &[&str]); 15] = [
             "sd_name_unsafe",
             "sd_empty_array",
             "no_host",
+            "default_tag",
             "log_status",
             "log_severity_fields",
             "span_kind",
@@ -245,7 +226,6 @@ const KINDS: [(&str, &[&str]); 15] = [
             "structured_message",
             "bytes_message",
             "blank_message",
-            "header_in_message",
             "severity",
             "severity_unset",
             "body_format",

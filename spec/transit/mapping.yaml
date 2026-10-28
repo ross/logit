@@ -24,12 +24,10 @@ classes:
   dropped: >-
     The record is lost for a reason the config didn't ask for; the cell names the counter that
     counts it.
-# A cell may still say `reason: uncounted` only on the rows `UNCOUNTED_ALLOWED` names in
-# `crates/logit-cli/src/transit/mapping.rs`: a span at any sink, a log beside metrics at a sink
-# that writes the metrics, the trace datadog_out and splunk_hec_out leave off a log for a
-# `trace_id` or `span_id` attribute, datadog_out's carrier on a log, and syslog_out's attribute
-# rows, where it leaves every attribute outside its header fields off a log.
-# docs/adr/telemetry-loss-vocabulary.md's amendment "structural loss has no counter" has the rule.
+# A cell may say `reason: uncounted` only on the rows `UNCOUNTED_ALLOWED` names in
+# `crates/logit-cli/src/transit/mapping.rs`, whose doc says which rule each entry follows.
+# docs/adr/telemetry-loss-vocabulary.md's amendments "structural loss has no counter" and "an
+# ignored signal, and a format the config selects" have the rules.
 
 sinks: [statsd_out, prometheus_out, influxdb_out, otlp_out, datadog_out, graphite_out, syslog_out, splunk_hec_out, kafka_out]
 
@@ -2045,12 +2043,12 @@ rows:
             as a string inside `syslog.sd`, under the SD-ID and the attribute's key. The PARAM-VALUE
             is the string.
         - class: lost
-          reason: uncounted
+          reason: structural
           text: >-
-            An attribute outside the header fields is left off, uncounted; under RFC 5424,
-            `structured_data:` writes each public event attribute other than `host.name`,
-            `process.pid`, and the `syslog.*` keys as an SD-PARAM, which syslog_in reads back
-            inside `syslog.sd`.
+            Under RFC 5424 with no `structured_data:`, an attribute outside the header fields has
+            no slot, so it's left off; `structured_data:` writes each public event attribute other
+            than `host.name`, `process.pid`, and the `syslog.*` keys as an SD-PARAM, which
+            syslog_in reads back inside `syslog.sd`.
       splunk_hec_out:
         class: normalized
         reason: log_fields
@@ -2124,12 +2122,12 @@ rows:
             as a string inside `syslog.sd`, under the SD-ID and the attribute's key. The PARAM-VALUE
             is the string.
         - class: lost
-          reason: uncounted
+          reason: structural
           text: >-
-            An attribute outside the header fields is left off, uncounted; under RFC 5424,
-            `structured_data:` writes each public event attribute other than `host.name`,
-            `process.pid`, and the `syslog.*` keys as an SD-PARAM, which syslog_in reads back
-            inside `syslog.sd`.
+            Under RFC 5424 with no `structured_data:`, an attribute outside the header fields has
+            no slot, so it's left off; `structured_data:` writes each public event attribute other
+            than `host.name`, `process.pid`, and the `syslog.*` keys as an SD-PARAM, which
+            syslog_in reads back inside `syslog.sd`.
       splunk_hec_out:
         class: exact
         text: A `host` field, an ordinary key beside the object's own `host`.
@@ -2170,12 +2168,12 @@ rows:
             as a string inside `syslog.sd`, under the SD-ID and the attribute's key. The PARAM-VALUE
             is the string.
         - class: lost
-          reason: uncounted
+          reason: structural
           text: >-
-            An attribute outside the header fields is left off, uncounted; under RFC 5424,
-            `structured_data:` writes each public event attribute other than `host.name`,
-            `process.pid`, and the `syslog.*` keys as an SD-PARAM, which syslog_in reads back
-            inside `syslog.sd`.
+            Under RFC 5424 with no `structured_data:`, an attribute outside the header fields has
+            no slot, so it's left off; `structured_data:` writes each public event attribute other
+            than `host.name`, `process.pid`, and the `syslog.*` keys as an SD-PARAM, which
+            syslog_in reads back inside `syslog.sd`.
       splunk_hec_out:
         class: exact
         text: A `fields` key.
@@ -2214,12 +2212,12 @@ rows:
             as a string inside `syslog.sd`, under the SD-ID and the attribute's key. The PARAM-VALUE
             is the string.
         - class: lost
-          reason: uncounted
+          reason: structural
           text: >-
-            An attribute outside the header fields is left off, uncounted; under RFC 5424,
-            `structured_data:` writes each public event attribute other than `host.name`,
-            `process.pid`, and the `syslog.*` keys as an SD-PARAM, which syslog_in reads back
-            inside `syslog.sd`.
+            Under RFC 5424 with no `structured_data:`, an attribute outside the header fields has
+            no slot, so it's left off; `structured_data:` writes each public event attribute other
+            than `host.name`, `process.pid`, and the `syslog.*` keys as an SD-PARAM, which
+            syslog_in reads back inside `syslog.sd`.
       splunk_hec_out:
         class: exact
         text: A `fields` key.
@@ -2258,12 +2256,12 @@ rows:
             as a string inside `syslog.sd`, under the SD-ID and the attribute's key. The PARAM-VALUE
             is the string.
         - class: lost
-          reason: uncounted
+          reason: structural
           text: >-
-            An attribute outside the header fields is left off, uncounted; under RFC 5424,
-            `structured_data:` writes each public event attribute other than `host.name`,
-            `process.pid`, and the `syslog.*` keys as an SD-PARAM, which syslog_in reads back
-            inside `syslog.sd`.
+            Under RFC 5424 with no `structured_data:`, an attribute outside the header fields has
+            no slot, so it's left off; `structured_data:` writes each public event attribute other
+            than `host.name`, `process.pid`, and the `syslog.*` keys as an SD-PARAM, which
+            syslog_in reads back inside `syslog.sd`.
       splunk_hec_out:
         class: exact
         text: A `fields` key.
@@ -2334,12 +2332,12 @@ rows:
             as a string inside `syslog.sd`, under the SD-ID and the attribute's key. The PARAM-VALUE
             is the string.
         - class: lost
-          reason: uncounted
+          reason: structural
           text: >-
-            An attribute outside the header fields is left off, uncounted; under RFC 5424,
-            `structured_data:` writes each public event attribute other than `host.name`,
-            `process.pid`, and the `syslog.*` keys as an SD-PARAM, which syslog_in reads back
-            inside `syslog.sd`.
+            Under RFC 5424 with no `structured_data:`, an attribute outside the header fields has
+            no slot, so it's left off; `structured_data:` writes each public event attribute other
+            than `host.name`, `process.pid`, and the `syslog.*` keys as an SD-PARAM, which
+            syslog_in reads back inside `syslog.sd`.
       splunk_hec_out:
         class: exact
         text: A `fields` key.
@@ -2404,12 +2402,12 @@ rows:
             as a string inside `syslog.sd`, under the SD-ID and the attribute's key. The PARAM-VALUE
             is the string.
         - class: lost
-          reason: uncounted
+          reason: structural
           text: >-
-            An attribute outside the header fields is left off, uncounted; under RFC 5424,
-            `structured_data:` writes each public event attribute other than `host.name`,
-            `process.pid`, and the `syslog.*` keys as an SD-PARAM, which syslog_in reads back
-            inside `syslog.sd`.
+            Under RFC 5424 with no `structured_data:`, an attribute outside the header fields has
+            no slot, so it's left off; `structured_data:` writes each public event attribute other
+            than `host.name`, `process.pid`, and the `syslog.*` keys as an SD-PARAM, which
+            syslog_in reads back inside `syslog.sd`.
       splunk_hec_out:
         class: exact
         text: A `fields` key.
@@ -2473,12 +2471,12 @@ rows:
             as a string inside `syslog.sd`, under the SD-ID and the attribute's key. The PARAM-VALUE
             is the string.
         - class: lost
-          reason: uncounted
+          reason: structural
           text: >-
-            An attribute outside the header fields is left off, uncounted; under RFC 5424,
-            `structured_data:` writes each public event attribute other than `host.name`,
-            `process.pid`, and the `syslog.*` keys as an SD-PARAM, which syslog_in reads back
-            inside `syslog.sd`.
+            Under RFC 5424 with no `structured_data:`, an attribute outside the header fields has
+            no slot, so it's left off; `structured_data:` writes each public event attribute other
+            than `host.name`, `process.pid`, and the `syslog.*` keys as an SD-PARAM, which
+            syslog_in reads back inside `syslog.sd`.
       splunk_hec_out:
         class: exact
         text: A `fields` key.
@@ -2543,12 +2541,12 @@ rows:
             as a string inside `syslog.sd`, under the SD-ID and the attribute's key. The PARAM-VALUE
             is the string.
         - class: lost
-          reason: uncounted
+          reason: structural
           text: >-
-            An attribute outside the header fields is left off, uncounted; under RFC 5424,
-            `structured_data:` writes each public event attribute other than `host.name`,
-            `process.pid`, and the `syslog.*` keys as an SD-PARAM, which syslog_in reads back
-            inside `syslog.sd`.
+            Under RFC 5424 with no `structured_data:`, an attribute outside the header fields has
+            no slot, so it's left off; `structured_data:` writes each public event attribute other
+            than `host.name`, `process.pid`, and the `syslog.*` keys as an SD-PARAM, which
+            syslog_in reads back inside `syslog.sd`.
       splunk_hec_out:
         class: exact
         text: A `fields` key, beside the standard key's.
@@ -2620,12 +2618,12 @@ rows:
             as a string inside `syslog.sd`, under the SD-ID and the attribute's key. The PARAM-VALUE
             is `true` or `false`.
         - class: lost
-          reason: uncounted
+          reason: structural
           text: >-
-            An attribute outside the header fields is left off, uncounted; under RFC 5424,
-            `structured_data:` writes each public event attribute other than `host.name`,
-            `process.pid`, and the `syslog.*` keys as an SD-PARAM, which syslog_in reads back
-            inside `syslog.sd`.
+            Under RFC 5424 with no `structured_data:`, an attribute outside the header fields has
+            no slot, so it's left off; `structured_data:` writes each public event attribute other
+            than `host.name`, `process.pid`, and the `syslog.*` keys as an SD-PARAM, which
+            syslog_in reads back inside `syslog.sd`.
       splunk_hec_out:
         class: exact
         text: A JSON boolean, read back as itself.
@@ -2700,12 +2698,12 @@ rows:
             as a string inside `syslog.sd`, under the SD-ID and the attribute's key. The PARAM-VALUE
             is an integer's decimal text, or a float as an `f64` in Rust's shortest form.
         - class: lost
-          reason: uncounted
+          reason: structural
           text: >-
-            An attribute outside the header fields is left off, uncounted; under RFC 5424,
-            `structured_data:` writes each public event attribute other than `host.name`,
-            `process.pid`, and the `syslog.*` keys as an SD-PARAM, which syslog_in reads back
-            inside `syslog.sd`.
+            Under RFC 5424 with no `structured_data:`, an attribute outside the header fields has
+            no slot, so it's left off; `structured_data:` writes each public event attribute other
+            than `host.name`, `process.pid`, and the `syslog.*` keys as an SD-PARAM, which
+            syslog_in reads back inside `syslog.sd`.
       splunk_hec_out:
         class: exact
         text: A JSON number, read back as the same integer or double; a `u64` above `i64::MAX` stays a `u64`.
@@ -2775,12 +2773,12 @@ rows:
             is one PARAM per element, each element's text, which syslog_in reads back as an array of
             strings, or one string for a one-element array.
         - class: lost
-          reason: uncounted
+          reason: structural
           text: >-
-            An attribute outside the header fields is left off, uncounted; under RFC 5424,
-            `structured_data:` writes each public event attribute other than `host.name`,
-            `process.pid`, and the `syslog.*` keys as an SD-PARAM, which syslog_in reads back
-            inside `syslog.sd`.
+            Under RFC 5424 with no `structured_data:`, an attribute outside the header fields has
+            no slot, so it's left off; `structured_data:` writes each public event attribute other
+            than `host.name`, `process.pid`, and the `syslog.*` keys as an SD-PARAM, which
+            syslog_in reads back inside `syslog.sd`.
       splunk_hec_out:
         class: normalized
         reason: flattened
@@ -2847,12 +2845,12 @@ rows:
             as a string inside `syslog.sd`, under the SD-ID and the attribute's key. The PARAM-VALUE
             is its inline `{k="v"}` text.
         - class: lost
-          reason: uncounted
+          reason: structural
           text: >-
-            An attribute outside the header fields is left off, uncounted; under RFC 5424,
-            `structured_data:` writes each public event attribute other than `host.name`,
-            `process.pid`, and the `syslog.*` keys as an SD-PARAM, which syslog_in reads back
-            inside `syslog.sd`.
+            Under RFC 5424 with no `structured_data:`, an attribute outside the header fields has
+            no slot, so it's left off; `structured_data:` writes each public event attribute other
+            than `host.name`, `process.pid`, and the `syslog.*` keys as an SD-PARAM, which
+            syslog_in reads back inside `syslog.sd`.
       splunk_hec_out:
         class: normalized
         reason: flattened
@@ -2913,18 +2911,18 @@ rows:
           text: >-
             RFC 3164 has no structured data, so an attribute outside the header fields is left off.
         - when: {format: rfc5424, structured_data: {sd_id: transit@32473}}
-          class: lost
-          reason: uncounted
+          class: normalized
+          reason: stringified
           text: >-
             Under `structured_data:`, a PARAM of the opt-in SD-ELEMENT whose PARAM-VALUE is the
-            value's length, `<N bytes>`, so its bytes are left off, uncounted.
+            value's base64 text, which syslog_in reads back as a string inside `syslog.sd`.
         - class: lost
-          reason: uncounted
+          reason: structural
           text: >-
-            An attribute outside the header fields is left off, uncounted; under RFC 5424,
-            `structured_data:` writes each public event attribute other than `host.name`,
-            `process.pid`, and the `syslog.*` keys as an SD-PARAM, which syslog_in reads back
-            inside `syslog.sd`.
+            Under RFC 5424 with no `structured_data:`, an attribute outside the header fields has
+            no slot, so it's left off; `structured_data:` writes each public event attribute other
+            than `host.name`, `process.pid`, and the `syslog.*` keys as an SD-PARAM, which
+            syslog_in reads back inside `syslog.sd`.
       splunk_hec_out:
         class: normalized
         reason: stringified
@@ -2990,12 +2988,12 @@ rows:
             as a string inside `syslog.sd`, under the SD-ID and the attribute's key. The PARAM-VALUE
             is its RFC 3339 text with nanoseconds.
         - class: lost
-          reason: uncounted
+          reason: structural
           text: >-
-            An attribute outside the header fields is left off, uncounted; under RFC 5424,
-            `structured_data:` writes each public event attribute other than `host.name`,
-            `process.pid`, and the `syslog.*` keys as an SD-PARAM, which syslog_in reads back
-            inside `syslog.sd`.
+            Under RFC 5424 with no `structured_data:`, an attribute outside the header fields has
+            no slot, so it's left off; `structured_data:` writes each public event attribute other
+            than `host.name`, `process.pid`, and the `syslog.*` keys as an SD-PARAM, which
+            syslog_in reads back inside `syslog.sd`.
       splunk_hec_out:
         class: normalized
         reason: stringified
@@ -3034,12 +3032,12 @@ rows:
             Under `structured_data:`, a PARAM of the opt-in SD-ELEMENT with an empty PARAM-VALUE,
             which syslog_in reads back as an empty string inside `syslog.sd`.
         - class: lost
-          reason: uncounted
+          reason: structural
           text: >-
-            An attribute outside the header fields is left off, uncounted; under RFC 5424,
-            `structured_data:` writes each public event attribute other than `host.name`,
-            `process.pid`, and the `syslog.*` keys as an SD-PARAM, which syslog_in reads back
-            inside `syslog.sd`.
+            Under RFC 5424 with no `structured_data:`, an attribute outside the header fields has
+            no slot, so it's left off; `structured_data:` writes each public event attribute other
+            than `host.name`, `process.pid`, and the `syslog.*` keys as an SD-PARAM, which
+            syslog_in reads back inside `syslog.sd`.
       splunk_hec_out:
         class: exact
         text: A JSON null, read back as itself.
@@ -3910,12 +3908,11 @@ rows:
           number, which datadog_in reads back as an `i64`.
       syslog_out:
         - when: {format: rfc3164}
-          class: lost
-          reason: structural
+          class: exact
           text: >-
-            Under RFC 3164, `syslog.facility` is PRI's facility and `syslog.tag` the TAG, and a PID
-            is written only inside a TAG, so `process.pid` or `syslog.pid` on a log with no
-            `syslog.tag` is left off.
+            Under RFC 3164, `syslog.facility` is PRI's facility, `syslog.tag` the TAG, and
+            `process.pid` or `syslog.pid` the PID inside the TAG, which a log with no `syslog.tag`
+            still has: its `service.name`, else `logit`. Each reads back as written.
         - class: exact
           text: >-
             `syslog.facility` is PRI's facility, `syslog.tag` APP-NAME, and `process.pid` or
@@ -4071,10 +4068,10 @@ rows:
     cells:
       syslog_out:
         class: lost
-        reason: uncounted
+        counter: logit.output.structured_data.omitted{reason=empty_array}
         text: >-
           Under `structured_data:`, an empty array writes one PARAM per element, so none, and the
-          attribute is left off, uncounted.
+          attribute is left off, counted.
   - kind: attributes
     feature: host_name
     cells:
@@ -4088,15 +4085,10 @@ rows:
         class: exact
         text: The log's `hostname`, or the event's `host`, read back as `host.name`.
       syslog_out:
-        - when: {format: rfc3164}
-          class: lost
-          reason: structural
-          text: >-
-            Under RFC 3164, a log with no `syslog.tag` has no TAG, so syslog_in reads its HOSTNAME
-            as the first word of its message (the `log/header_in_message` row) and reads no
-            `host.name` back.
-        - class: exact
-          text: HOSTNAME.
+        class: exact
+        text: >-
+          HOSTNAME. Under RFC 3164 every message has a TAG, `logit` or the log's `service.name`
+          when it has no `syslog.tag`, so syslog_in reads the token before it as HOSTNAME.
       splunk_hec_out:
         class: normalized
         reason: host_on_resource
@@ -4195,24 +4187,50 @@ rows:
         class: exact
         text: A record with no host leaves with none.
       syslog_out:
-        - when: {format: rfc3164}
-          class: exact
-          text: >-
-            Under RFC 3164, a log with no host and no `syslog.tag` has no TAG, so syslog_in reads the
-            default HOSTNAME as the first word of its message (the `log/header_in_message` row) and
-            reads no `host.name` back. A log with a `syslog.tag` and no host reads back the default
-            HOSTNAME as `host.name`, as under RFC 5424, and no case reaches it.
-        - class: normalized
-          reason: default_host
-          text: >-
-            A log with no host leaves with the sink's `hostname:`, else the process hostname, as
-            HOSTNAME, which syslog_in reads back as `host.name`.
+        class: normalized
+        reason: default_host
+        text: >-
+          A log with no host leaves with the sink's `hostname:`, else the process hostname, as
+          HOSTNAME, which syslog_in reads back as `host.name`.
       splunk_hec_out:
         class: normalized
         reason: default_host
         text: >-
           A record with no `host.name` leaves with the process hostname as its `host`, which
           splunk_hec_in reads back as the resource's `host.name`.
+      kafka_out:
+        class: exact
+        text: >-
+          `kafka_out` writes no attribute from a record's own fields or its config.
+  # syslog_out's RFC 3164 TAG on a log with no `syslog.tag`. Every sink that compares a log reaches
+  # it; only syslog_out writes one.
+  - kind: attributes
+    feature: default_tag
+    cells:
+      statsd_out:
+        class: exact
+        text: A log with no `syslog.tag` leaves with none.
+      otlp_out:
+        class: exact
+        text: A log with no `syslog.tag` leaves with none.
+      datadog_out:
+        class: exact
+        text: A log with no `syslog.tag` leaves with none.
+      syslog_out:
+        - when: {format: rfc3164}
+          class: normalized
+          reason: default_tag
+          text: >-
+            Under RFC 3164, a log with no `syslog.tag` and no `app_name:` leaves with its
+            `service.name`, else its resource's, else `logit`, as its TAG, narrowed to letters,
+            digits, `_`, `-`, `.`, and `/`, which syslog_in reads back as `syslog.tag`.
+        - class: exact
+          text: >-
+            Under RFC 5424, a log with no `syslog.tag` leaves with APP-NAME `-` and reads back with
+            none.
+      splunk_hec_out:
+        class: exact
+        text: A log with no `syslog.tag` leaves with none.
       kafka_out:
         class: exact
         text: >-
@@ -4532,18 +4550,6 @@ rows:
             back as the empty string.
         - class: exact
           text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
-  # syslog_out's alone: under RFC 3164, syslog_in reads its header back by a two-token rule.
-  - kind: log
-    feature: header_in_message
-    cells:
-      syslog_out:
-        class: normalized
-        reason: header_in_message
-        text: >-
-          Under RFC 3164, a log with no `syslog.tag` reads back with its HOSTNAME at the front of
-          its message, and a message whose first word is TAG-shaped reads back with that word as
-          `syslog.tag`; syslog_in decides where the header ends by its first two words.
-
   # A log's fields, compared on a log on an event with no metrics. statsd_out writes a log only as
   # a DogStatsD event, so it has a cell in each row such an event reaches.
   - kind: log
@@ -4821,21 +4827,22 @@ rows:
         text: The `LogRecord`'s trace, span ids, and flags, beside the attributes, as `log/trace` has.
       datadog_out:
         class: lost
-        reason: uncounted
+        counter: logit.output.tags.omitted{reason=reserved_key}
         text: >-
-          A `trace_id` or `span_id` attribute is written under its own name and the log's own ids
-          are left off, uncounted, so a relayed Datadog log leaves as it arrived.
+          A `trace_id` or `span_id` attribute wins and is written under its own name, so a relayed
+          Datadog log leaves as it arrived, and the log's own ids are left off, counted once per
+          log.
       syslog_out:
         class: lost
         reason: structural
         text: Syslog has no trace or span ids, so they're left off, as `log/trace` has.
       splunk_hec_out:
         class: lost
-        reason: uncounted
+        counter: logit.output.tags.omitted{reason=reserved_key}
         text: >-
-          A `trace_id` or `span_id` attribute is written as that field and the log's own ids are
-          left off, uncounted; an attribute that isn't a hex id reads back as an attribute, with no
-          trace.
+          A `trace_id` or `span_id` attribute wins and is written as that field, and the log's own
+          ids are left off, counted once per log; an attribute that isn't a hex id reads back as an
+          attribute, with no trace.
       kafka_out:
         - when: {format: text}
           class: lost
@@ -4972,17 +4979,10 @@ rows:
           A log on an event that carries metrics is left off while the metrics are written,
           uncounted.
       syslog_out:
-        - when: {format: rfc3164}
-          class: normalized
-          reason: header_in_message
-          text: >-
-            The log is one syslog message, and the metrics beside it have no syslog form and are
-            left off, uncounted. Under RFC 3164, a log with no `syslog.tag` reads back with its
-            HOSTNAME at the front of its message, as the `log/header_in_message` row says.
-        - class: exact
-          text: >-
-            The log is one syslog message; the metrics beside it have no syslog form and are left
-            off, uncounted.
+        class: exact
+        text: >-
+          The log is one syslog message; the metrics beside it have no syslog form and are left
+          off, uncounted.
       splunk_hec_out:
         class: lost
         counter: logit.output.events.dropped{reason=blank_event}
@@ -5028,7 +5028,7 @@ rows:
         text: A span has no carbon form and isn't written.
       syslog_out:
         class: skipped
-        counter: logit.output.events.skipped
+        counter: logit.output.events.skipped{reason=no_log}
         text: A span on an event with no log has no syslog form, so the event is skipped.
       splunk_hec_out:
         class: exact
@@ -5118,8 +5118,8 @@ rows:
         reason: uncounted
         text: >-
           A span has no syslog form and isn't written: on an event with no log, the event is
-          skipped, counted as `logit.output.events.skipped`; beside a log, it's left off,
-          uncounted.
+          skipped, counted as `logit.output.events.skipped{reason=no_log}`; beside a log, it's left
+          off, uncounted.
       splunk_hec_out:
         class: degraded
         counter: logit.output.spans.degraded{reason=no_wire_form}
@@ -5169,7 +5169,7 @@ rows:
           uncounted.
       syslog_out:
         class: lost
-        counter: logit.output.events.skipped
+        counter: logit.output.events.skipped{reason=no_log}
         text: >-
           A span has no syslog form, so it isn't written beside its event's metrics, which have none
           either.
@@ -5226,7 +5226,7 @@ rows:
         text: An event with no metric, log, or span has no datapoint and isn't written.
       syslog_out:
         class: skipped
-        counter: logit.output.events.skipped
+        counter: logit.output.events.skipped{reason=no_log}
         text: An event with no log has no syslog form and isn't written.
       splunk_hec_out:
         class: skipped
@@ -5280,7 +5280,7 @@ rows:
           isn't written.
       syslog_out:
         class: skipped
-        counter: logit.output.events.skipped
+        counter: logit.output.events.skipped{reason=no_log}
         text: >-
           An InfluxDB point whose fields are all strings has no log, so it isn't written and its
           fields are lost.

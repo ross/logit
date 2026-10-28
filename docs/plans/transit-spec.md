@@ -1,6 +1,6 @@
 ---
 created: 2026-10-19
-updated: 2026-10-19
+updated: 2026-10-28
 ---
 
 # Enabling plan: a transit spec — reference inputs, flows, and a mapping table that generates the docs
@@ -439,7 +439,8 @@ so the loss is real: the cells are `lost, uncounted`, with narrow `UNCOUNTED_ALL
 (`host_beside_host_name`, `hostname`, `log_service`, `log_service_field`, `container_id`,
 `service_identity`, `service_tag`, and `service_tag_beside_key`), and the missing counter is a
 sink finding. One mechanism leaves every attribute outside the header fields off, so the
-allowance follows the mechanism, not the value type. The
+allowance follows the mechanism, not the value type. §10's decision 2 later read the
+RFC 5424 cells as `lost, structural` too, and those entries went in `tsink/w1`. The
 `structured_data:` opt-in is its own PR after W2, since attributes come back nested in
 `syslog.sd` and need a nested-key spelling.
 
@@ -467,6 +468,11 @@ uncounted loss of a log field is a format with no slot and reads `lost, structur
 - `kafka_out`'s `format: text` writes only the body.
 
 The `span` entry stays for `tspan`.
+
+§10 (`tsink`) closed all three mechanisms: `syslog_out`'s attribute leave-off reads
+`structural`, the `structured_data:` encoder writes a `Bytes` value as base64 and counts an
+empty array, and the trace beside an id attribute is counted `reserved_key`. `UNCOUNTED_ALLOWED`
+holds three entries after it (§10, decision 10).
 
 `otlp_out`'s `log/plain`, `log/dogstatsd_event`, and `log/beside_metrics` cells move from
 `normalized`, reason `observed_timestamp`, to `exact`, and the stamp lives on
@@ -574,6 +580,113 @@ when the parent merges.
 | W3 | `tlog/w3` | The `datadog-logs` cases: hand-written `/api/v2/logs` bodies covering status forms, `ddsource`, the `ddtags` `env:`, `version:`, and `service:` lift, `service` beside `service.name`, `hostname`, a nested and a non-string `message`, RFC 3339 and fractional-millisecond `timestamp`s, `trace_id` and `span_id` attributes, and 101 tags. `datadog-logs-to-syslog` grows to match | M |
 | W4 | `tlog/w4` | The `splunk` source and the `splunk_hec_out` column: `pub fn decode_request` factored out of `handle` in `crates/logit-inputs/src/splunk.rs` (route, gzip, and the percent-decoded `/raw` envelope query); cases from the log `POST` captures under `testdata/interop/splunk/` (the OTel exporter's `otel-services-collector-001` and `-raw-000`, SC4S's, Docker's, and the Java appender's), not Docker's three `OPTIONS` probes or the `/health` GET, and hand-written ones (`otel.log.*` including `otel.log.name`, `fields` nesting, `time` forms, a non-string envelope, a blank event, an array body). Flows `splunk-relay`, `splunk-to-otlp`, `splunk-to-datadog`, `splunk-to-syslog`, `otlp-logs-to-splunk`, `datadog-logs-to-splunk`, and `syslog-to-splunk` | L |
 | W5 | `tlog/w5` | The `kafka_out` column under `format: json` and `text`: the `otlp-logs`, `syslog`, `datadog-logs`, and `splunk` sources' `-to-kafka` and `-to-kafka-text` flows. `log/dogstatsd_event` through the new sinks; a coverage sweep to no unreached log cell; the `UNCOUNTED_ALLOWED` narrowing; `docs/known-gaps/mappings.md`'s hand-written Splunk and syslog log rows reconciled with the generated regions; `spec/transit/README.md`'s source and sink lists, `transit/mod.rs`'s account of what the driver rejects, and `AGENTS.md` | M |
+
+### 10. Sink fixes
+
+Stream key **`tsink`**. §9 recorded every log-sink defect as the code behaves and left the fixes
+to a later stream; this is that stream. Its "Findings" bullets, `docs/known-gaps/`, and
+`UNCOUNTED_ALLOWED` name what's left: `syslog_out`'s 17 `UNCOUNTED_ALLOWED` entries, its
+TAG-less RFC 3164 messages, its untagged skip count, and its `structured_data:` losses; the trace
+`datadog_out` and `splunk_hec_out` leave off uncounted; `datadog_in`'s `f64` timestamp; and a
+dead `ddsource` default. Some are fixed, some are restated as rules, and some are decided limits
+the stream leaves alone.
+
+#### Decisions
+
+1. **A sink ignores a signal it has no wire for, uncounted.** When an event carries a signal
+   beside the ones a sink writes, the sink writes what it carries and ignores the rest with no
+   counter: a log beside metrics at `influxdb_out`, `prometheus_out`, `graphite_out`, and
+   `statsd_out`; metrics or a span beside a log at `syslog_out`; a span beside a DogStatsD event
+   at `statsd_out`. An event that produces nothing still counts `events.skipped{reason}`;
+   `syslog_out` gains its `reason="no_log"` in W1 (decision 5). A sink may count the ignored
+   piece, as `kafka_out`'s `format: text` counts `metrics.omitted{reason="format"}` and
+   `spans.omitted{reason="format"}`, but isn't required to. In `UNCOUNTED_ALLOWED` the rule is
+   `("log", Some("beside_metrics"), None)` and the span rows, `("span", None, None)` until
+   `tspan` narrows it. `docs/known-gaps/statsd.md`'s "A span
+   beside a DogStatsD event is left off uncounted" isn't open work under the rule, so it leaves
+   `docs/known-gaps/`, and `statsd_out`'s module doc states the leave-off as the rule.
+2. **A format the config selects defines the sink's slots, and a field with no slot in it is
+   structural, uncounted.** This extends the "Structural" group of
+   [ADR `telemetry-loss-vocabulary`](../adr/telemetry-loss-vocabulary.md)'s 2026-10-21 amendment,
+   and `kafka_out`'s `format: text` already reads this way. So `syslog_out`'s leave-off of every
+   attribute outside its header fields, under RFC 3164 and under RFC 5424 with no
+   `structured_data:`, is `lost, structural` with no counter: every log at that sink loses the
+   fields, so a counter would track the log count. With decision 4, all 17 of `syslog_out`'s
+   `UNCOUNTED_ALLOWED` entries go. This reverses decision 8 of
+   [ADR `transit-spec`](../adr/transit-spec.md)'s log-records amendment and the first mechanism
+   of its decision 9.
+3. **Under `format: rfc3164`, `syslog_out` always writes a TAG.** With no `syslog.tag` and no
+   `app_name:`, the TAG is the event's `service.name` attribute, else the batch resource's
+   `service.name`, else `logit`, sanitized as a configured TAG is. HOSTNAME and PROCID fall back
+   to the resource the same way, and OTLP senders put `service.name` there. RFC 3164 lets a reader tell HOSTNAME from MSG only by the TAG after it, so
+   `syslog_in` reads a TAG-less message's HOSTNAME as the first word of MSG. A relayed TAG-less
+   message gains a TAG and reads back with `syslog.tag` and `host.name`: a new permitted
+   normalization of the syslog pair, recorded in [ADR `syslog-output`](../adr/syslog-output.md).
+   The row `log/header_in_message` becomes unreachable and goes. A `process.pid` or `syslog.pid`
+   then rides in `TAG[pid]`, so `attributes/syslog_header`'s RFC 3164 cell changes too.
+4. **`syslog_out`'s `structured_data:` writes a `Bytes` value as base64 text**, as `datadog_out`
+   and `splunk_hec_out` do, read back `normalized`, `stringified`, in place of `<N bytes>`. It
+   **counts an empty array** it writes no PARAM for as
+   `logit.output.structured_data.omitted{reason="empty_array"}`, since most arrays survive and
+   the loss depends on the value. `bytes_value`@`syslog_out` and `sd_empty_array`@`syslog_out`
+   leave `UNCOUNTED_ALLOWED`, and the second mechanism of the log-records amendment's decision 9
+   closes.
+5. **`syslog_out` tags its skipped count** as `logit.output.events.skipped{reason="no_log"}`, as
+   `kafka_out`'s `format: text` does.
+6. **`datadog_out` and `splunk_hec_out` count the trace they leave off** when a `trace_id` or
+   `span_id` attribute is present, as `logit.output.tags.omitted{reason="reserved_key"}`, once
+   per log: the counter each encoder already uses for an attribute that collides with a reserved
+   key. The attribute still wins, so the Datadog pair keeps its fixed point
+   ([ADR `log-record-trace-context`](../adr/log-record-trace-context.md)'s "Amendment: Datadog id
+   formats"). The two `log/trace_beside_id_attribute` entries leave `UNCOUNTED_ALLOWED`, and the
+   third mechanism of decision 9 closes.
+7. **`datadog_in` parses a fractional-millisecond `timestamp` from the number's own text**,
+   through `logit_core::parse_decimal_nanos` as `parse_hec_time` does
+   (`crates/logit-proto/src/splunk/time.rs`). The `f64` stays only for exponent forms, so the
+   `tlog/w3` finding's sub-microsecond error goes.
+8. **`DatadogEncoder::with_default_source` is removed**, since only a test calls it. A log's
+   `ddsource` comes from the `ddsource` attribute or the `_logit.datadog.source` carrier, and an
+   operator who wants a default sets it upstream with `set`.
+9. **Decided limits stay as they are**, each settled elsewhere:
+   - `datadog_in` reads `trace_id` and `span_id` back as attributes, which is the Datadog pair's
+     fixed point (ADR `log-record-trace-context`'s "Amendment: Datadog id formats").
+   - `otlp_out` writes the event's span ids for a log with no trace (`log/trace_unset`,
+     `trace_from_span`), the one fallback that ADR's "Sensible by default, `logit`'s code never
+     invents one" allows.
+   - `splunk_hec_out` and `datadog_out` don't read `_logit.otel.severity_*`. The model's
+     `Severity` has six variants, and reading another family's carrier is barred by
+     [ADR `protocol-knowledge-stays-in-family`](../adr/protocol-knowledge-stays-in-family.md).
+   - A log with 101 tags leaves `datadog_out` whole, since the intake's answer to one is
+     unverified (`docs/known-gaps/datadog.md`).
+   - `attributes/datadog_carrier_log`@`datadog_out`, which predates `tlog`.
+10. **After the stream, `UNCOUNTED_ALLOWED` holds three entries**:
+    `("log", Some("beside_metrics"), None)` and `("span", None, None)` by decision 1, and
+    `("attributes", Some("datadog_carrier_log"), Some("datadog_out"))`, outside this stream. The
+    log-records amendment's decision 9 is restated to match in
+    [ADR `transit-spec`](../adr/transit-spec.md)'s "Amendment: sink fixes (2026-10-28)".
+
+#### Workstreams
+
+The stack is W0 ← W1 ← W2 ← W3: each PR targets its parent and retargets to `main` when the
+parent merges.
+
+| # | Branch | Scope | Size |
+|---|---|---|---|
+| W0 | `tsink/w0` | This section, and amendments to ADRs `telemetry-loss-vocabulary` (decisions 1 and 2), `transit-spec` (decisions 2, 4, 6, and 10), and `syslog-output` (decision 3) | S |
+| W1 | `tsink/w1` | `syslog_out`, decisions 2 to 5: its cells reclassified; `log/header_in_message` removed, and the RFC 3164 cells that point at it (`attributes/host_name`, `attributes/no_host`, `log/beside_metrics`) revisited; the `attributes/syslog_header` RFC 3164 cell decided; `docs/known-gaps/syslog.md`'s entries removed or rewritten; the TAG default added to the permitted normalizations in `crates/logit-outputs/src/syslog.rs`'s module doc | L |
+| W2 | `tsink/w2` | Decisions 6 to 8: `datadog_in`'s timestamp, the `reserved_key` count at `datadog_out` and `splunk_hec_out`, and `with_default_source` removed; the cells gain the counter; the revisits in `docs/known-gaps/datadog.md` and `splunk.md` closed | M |
+| W3 | `tsink/w3` | Decisions 1 and 10: `UNCOUNTED_ALLOWED` down to three entries, with a doc comment stating the rule; the uncounted wording in `mapping.rs`, `spec/transit/README.md`, and `mapping.yaml`'s header, which describe the beside-metrics allowance as limited to a metrics sink where the code matches any sink; `docs/known-gaps/statsd.md`'s entry removed, with the rule in `statsd_out`'s module doc; the `tsink` findings closed | S |
+
+#### Verification
+
+Each code PR:
+
+- Runs `script/transit gen`, then `script/transit check`, green.
+- Observes every moved cell at its new class in some flow, which the ledger's cross-flow bound
+  enforces.
+- Runs each new regression test once with its fix reverted to show it fails, and says so in the
+  PR body.
+- Runs `script/check`, and `script/cibuild` before the PR opens.
 
 ## Workstreams
 
@@ -1030,22 +1143,30 @@ Recorded per workstream as each lands.
   - `datadog_out` writes `trace_id` and `span_id` from `LogRecord::trace`
     (`crates/logit-proto/src/datadog/logs.rs`, under `WIRE_TRACE_ID` and `WIRE_SPAN_ID`), but
     `datadog_in`'s `decode_log_item` sets no `trace` and keeps them as attributes, so the pair
-    isn't symmetric for trace context.
+    isn't symmetric for trace context. Decided, not a defect: it's the Datadog pair's fixed point
+    ([ADR `log-record-trace-context`](../adr/log-record-trace-context.md)'s "Amendment: Datadog id
+    formats"; §10, decision 9).
   - `DatadogEncoder::with_default_source` (`crates/logit-proto/src/datadog/mod.rs`) is called
-    only from tests, so `datadog_out` never writes a default `ddsource`.
+    only from tests, so `datadog_out` never writes a default `ddsource`. `tsink/w2` removed the
+    dead path; an operator who wants a `ddsource` on every log sets it upstream with `set`.
   - `splunk_hec_out` and `datadog_out` read neither `_logit.otel.severity_*` nor
     `_logit.syslog.severity` (`crates/logit-proto/src/splunk/logs.rs`,
     `crates/logit-proto/src/datadog/logs.rs`). Each writes a public severity attribute verbatim
     when the log carries one (`otel.log.severity.*`, Datadog's `status`), and otherwise the band
-    `Severity`, so OTLP's `INFO2` (10) leaves Splunk as 9, `Info`.
+    `Severity`, so OTLP's `INFO2` (10) leaves Splunk as 9, `Info`. Decided, not a defect: reading
+    another family's carrier is barred by
+    [ADR `protocol-knowledge-stays-in-family`](../adr/protocol-knowledge-stays-in-family.md)
+    (§10, decision 9).
   - `syslog_out` counts `logit.output.events.skipped` with no `reason` tag
     (`crates/logit-outputs/src/syslog.rs`, from `EncodeStats::skipped_no_log`), where every other
     sink that counts the series tags it. It drops MSGID under RFC 3164, since `write_rfc3164_header` takes no
     `msgid`, and every attribute outside its header and carriers, uncounted, unless
-    `structured_data:` is set under RFC 5424.
+    `structured_data:` is set under RFC 5424. `tsink/w1` tagged the skip `reason="no_log"` and
+    read the attribute leave-off as `structural` (§10, decisions 2 and 5).
   - `otlp_out`'s `encode_trace` (`crates/logit-proto/src/otlp/logs.rs`) writes the event's span
     ids for a log with no `trace`, so `otlp_in` reads back a `trace` the input didn't have: not a
-    fixed point.
+    fixed point. Decided, not a defect: it's the one fallback ADR `log-record-trace-context`'s
+    "Sensible by default, `logit`'s code never invents one" allows (§10, decision 9).
 - **Logs through `otlp_out` and `datadog_out`** (`tlog/w1`): the `otlp-logs` and `datadog-logs`
   cases put every log field in front of both sinks. Each behavior below is a cell in
   `mapping.yaml`, observed at its class; none is fixed.
@@ -1062,7 +1183,7 @@ Recorded per workstream as each lands.
     `dropped_attributes_count`, each `lost`, structural). Its timestamp leaves in milliseconds.
   - A log's trace and span ids read back from `datadog_in` as the `trace_id` and `span_id`
     attributes, not as the log's `trace` (`log/trace`, `normalized`), as the `tlog/w0` finding
-    above has it.
+    above has it. Decided, as that finding's note says.
   - `otlp_out` writes `_logit.otel.severity_number` and `_logit.otel.severity_text` back as the
     record's own fields, and `datadog_out` leaves both off
     (`attributes/severity_carrier_otel`); `otlp_out` stamps a log with no observed time
@@ -1072,7 +1193,8 @@ Recorded per workstream as each lands.
 - **The syslog source and `syslog_out`** (`tlog/w2`): the `syslog` cases, and the `otlp-logs` and
   `datadog-logs` cases, put every log field and header attribute in front of `syslog_out` under
   both formats. Each behavior below is a cell in `mapping.yaml`, observed at its class; none is
-  fixed, and `docs/known-gaps/syslog.md` has the ones an operator meets.
+  fixed here, and `docs/known-gaps/syslog.md` has the ones an operator meets. `tsink/w1` changed
+  the first three (§10, decisions 2 and 3).
   - Under RFC 3164, a log with no `syslog.tag` leaves with a HOSTNAME and no TAG, and
     `syslog_in`'s two-token header rule (`crates/logit-proto/src/syslog/mod.rs`'s "The RFC 3164
     header") reads the HOSTNAME as the first word of MSG: the log reads back with `transit ` in
@@ -1081,19 +1203,23 @@ Recorded per workstream as each lands.
     holds it, since a log's record level has no other class to observe it at, and
     `attributes/host_name` reads `lost` under RFC 3164. Python's `SysLogHandler` cases, the sniff
     fallbacks, the PROCID with a nil APP-NAME, and every `otlp-logs` case under
-    `otlp-logs-to-syslog-rfc3164` reach it.
+    `otlp-logs-to-syslog-rfc3164` reach it. `tsink/w1` writes a TAG on every RFC 3164 message, and
+    the row went.
   - Under RFC 3164, a PID is written only inside a TAG, so a `process.pid` or `syslog.pid` on a log
-    with no `syslog.tag` is left off, uncounted (`attributes/syslog_header`, `lost`).
+    with no `syslog.tag` is left off, uncounted (`attributes/syslog_header`, `lost`). With a TAG
+    on every message since `tsink/w1`, the PID rides in `TAG[pid]` and the cell reads `exact`.
   - Every public attribute outside the header fields is left off, uncounted, with no
     `structured_data:`: the value-type rows and the host- and service-key rows each have a
-    `syslog_out` entry in `UNCOUNTED_ALLOWED`.
+    `syslog_out` entry in `UNCOUNTED_ALLOWED`. `tsink/w1` read these cells `lost, structural`,
+    and the entries went.
   - A `syslog.timestamp` the encoder can't render under its format gives way to
     `event.timestamp` (`attributes/syslog_timestamp`, `lost`). Under RFC 5424 a typed timestamp
     or a null is written and any string falls back; under RFC 3164 a typed timestamp or an RFC
     3164-shaped string is written and anything else falls back. Where it renders, the log's own
     receipt time has no slot (`log/receipt_timestamp`, `lost`).
   - A log's metrics and a span beside it are left off, uncounted (`log/beside_metrics`,
-    `span/beside_log`, from `tlog/w4`). `syslog_out` has no metric-kind cells, so the
+    `span/beside_log`, from `tlog/w4`), which §10's decision 1 settles as the rule for a signal a
+    sink has no wire for. `syslog_out` has no metric-kind cells, so the
     `otlp-logs` `beside-metrics` case's gauge reaches `gauge/i64` unspecified there.
   - `otlp_out` and `datadog_out` write a `u64` `syslog.facility` or `process.pid` that their pair
     decoders read back as an `i64` (`attributes/syslog_header`, `normalized`).
@@ -1108,7 +1234,8 @@ Recorded per workstream as each lands.
     one string for a one-element array. A PARAM-VALUE's `"`, `\`, and `]` read back as written.
   - A `Bytes` attribute's PARAM-VALUE is its length, `<N bytes>`, uncounted
     (`attributes/bytes_value`, `lost`), and an empty `Array` writes no PARAM, uncounted
-    (`attributes/sd_empty_array`, `lost`, from `tlog/w3`).
+    (`attributes/sd_empty_array`, `lost`, from `tlog/w3`). `tsink/w1` writes the base64 text
+    (`normalized`, `stringified`) and counts the empty array `empty_array` (§10, decision 4).
   - A key that isn't an SD-NAME is left off, counted `invalid_sd_name`, and every opt-in
     attribute of a log whose own `syslog.sd` holds the configured SD-ID is left off, counted
     `sd_id_collision`. Each reaches a row of its own, `attributes/sd_name_unsafe` and
@@ -1135,16 +1262,19 @@ Recorded per workstream as each lands.
     SD-ID collision are each counted. Its `UNCOUNTED_ALLOWED` entry is one of the two for the
     `structured_data:` encoder's own uncounted losses, beside `bytes_value`'s for a `Bytes`
     value written as its length (ADR `transit-spec`'s log-records amendment, decision 9).
+    `tsink/w1` counts it `empty_array`, and both entries went (§10, decision 4).
   - `datadog_in` reads a fractional-millisecond `timestamp` through an `f64`, so
     `1799999990001.5` reads `07:59:50.001499904Z`, a sub-microsecond error, and `datadog_out`
-    writes whole milliseconds (`log/timestamp`, `normalized`).
+    writes whole milliseconds (`log/timestamp`, `normalized`). Fixed in `tsink/w2`: the number's
+    own text is read, and the case reads `07:59:50.001500000Z`.
   - Every `status` form `status_severity` knows maps to its band and stays verbatim as the
     attribute `status`; an unknown one, `verbose`, stays as the attribute with no severity, and
     `datadog_out` writes it back as it came, while `syslog_out` stamps PRI severity 6
     (`log/severity_unset`).
   - A log with 101 `ddtags` entries and one with 101 attributes leave `datadog_out` whole: the
     logs route has no tag-count prefilter, which `docs/known-gaps/datadog.md` already lists as an
-    unverified intake answer.
+    unverified intake answer. Decided, not a defect, until the intake's answer is verified (§10,
+    decision 9).
   - Three planned inputs aren't cases. A body element that isn't an object and a log with no
     `message` are dropped by `datadog_in` itself, and `cases` refuses a wire file its decoder
     drops any of, since a case is what the listener produces. A log past `datadog_out`'s 18-hour
@@ -1191,7 +1321,7 @@ Recorded per workstream as each lands.
     `datadog-logs` case's `trace_id` attribute comes back as a trace
     (`attributes/string_value` and `log/trace_unset`, `normalized`, `log_fields`).
   - `syslog_out` skips a span-only event, counted `events.skipped` (`span/alone`), and leaves a
-    span beside a log off, uncounted. The `splunk` `span` case is the first to reach the counted
+    span beside a log off, uncounted, which §10's decision 1 settles as the rule. The `splunk` `span` case is the first to reach the counted
     path, so a span on an event with a log has a row of its own, `span/beside_log`, chosen by the
     event's shape as `span/beside_metrics` is, with `span/alone`'s cells at every other sink.
   - `otlp_out` writes a log stamped at the Unix epoch, which `splunk_hec_in` reads from
@@ -1218,7 +1348,8 @@ Recorded per workstream as each lands.
   - `statsd_out` writes a DogStatsD event's line and leaves a span on the same event off,
     uncounted, where a span beside any other log counts the event `no_metrics`. The new
     `statsd-logs-relay` flow and `event-beside-span` case reach it: `span/beside_log` at
-    `statsd_out` is `skipped`, `uncounted`, and `docs/known-gaps/statsd.md` has the entry.
+    `statsd_out` is `skipped`, `uncounted`. `docs/known-gaps/statsd.md` had the entry until
+    `tsink/w3` removed it, since §10's decision 1 makes the leave-off the rule.
   - A log with its own trace and a `trace_id` or `span_id` attribute (a new line in the
     `otlp-logs` `trace` case) leaves `datadog_out` and `splunk_hec_out` with the attribute and
     without the trace, uncounted: each writes the trace only when neither attribute is present.
@@ -1226,7 +1357,8 @@ Recorded per workstream as each lands.
     whose two `uncounted` cells take their own `UNCOUNTED_ALLOWED` entries, the third mechanism
     of "Uncounted losses" above and of ADR `transit-spec`'s decision 9. Both formats have a slot
     for the trace, so the loss isn't `structural`. `docs/known-gaps/datadog.md` and `splunk.md`
-    have it.
+    have it. Fixed in `tsink/w2`: both count the trace as
+    `logit.output.tags.omitted{reason="reserved_key"}`.
   - `span/no_wire_form` is reached by a span field a Datadog span has no form for, which isn't
     `splunk_hec_out`'s set: an `ok` status alone reaches the row, and `splunk_hec_out` writes it,
     so a span carrying nothing else reads `exact` against its `degraded` cell. The
@@ -1245,3 +1377,51 @@ Recorded per workstream as each lands.
     and the span row keeps what `span/no_wire_form` doesn't name. Syslog has no hand-written log
     row. The collectd notification row read `uncounted` for `attributes/foreign_carrier`, whose
     cells are `structural`, and now says so.
+- **Sink fixes** (`tsink`): each workstream of §10 records what it finds here as it lands.
+  - **`syslog_out`** (`tsink/w1`): every value-type and host- and service-key cell that read
+    `lost`, `uncounted` reads `lost`, `structural`, and its 16 `UNCOUNTED_ALLOWED` entries and
+    `sd_empty_array`'s go, leaving five. `bytes_value` under `structured_data:` reads
+    `normalized`, `stringified`; `sd_empty_array` reads `lost`, counted `empty_array`; the four
+    skip cells count `reason=no_log`. With a TAG on every RFC 3164 message, `log/header_in_message`
+    goes, `attributes/host_name` and `attributes/syslog_header` read `exact` there, and
+    `attributes/no_host` reads `normalized`, `default_host`, under both formats, each observed
+    in `syslog-relay-rfc3164` and the other RFC 3164 flows. `log/beside_metrics` is one `exact`
+    cell. The default TAG has a row of its own, `attributes/default_tag` (`normalized`,
+    `default_tag` under RFC 3164 at `syslog_out`, `exact` everywhere else), which a resource
+    `service.name` (`otlp-logs` `telemetrygen`) and the `logit` fallback both reach. A fallback
+    TAG is narrowed to `syslog_in`'s TAG class, so it always reads back as a TAG; a carried
+    `syslog.tag` outside the class still reads back as MSG, so the class check's model of the RFC
+    3164 header stays, and no case reaches that. `crates/logit-cli/tests/syslog_round_trip.rs`'s permitted-normalization list
+    gains the TAG default as its tenth entry, since the Python handler's captures now relay with
+    `logit:`.
+  - **`datadog_out`, `splunk_hec_out`, and `datadog_in`** (`tsink/w2`): both
+    `log/trace_beside_id_attribute` cells read `lost`, counted `reserved_key`, observed in
+    `otlp-logs-to-datadog` and `otlp-logs-to-splunk` with the counter moving once, and their two
+    `UNCOUNTED_ALLOWED` entries go, leaving three. The `timestamps` case's fractional log reads
+    `07:59:50.001500000Z`. The `f64` held `1799999990001.5` without error; the old read lost the
+    digits in `ms * 1e6`, past 2^53, so the `f64` fallback for an exponent form or a fraction
+    finer than a nanosecond now splits whole and fractional milliseconds, as
+    `seconds_f64_to_nanos` does for seconds. The decoder parses the body into
+    `serde_json::Value`, which keeps a fractional number's `f64` and not its text, so it splits
+    the body's items out as raw JSON only on the first item whose `timestamp` isn't an integer;
+    an integer timestamp pays nothing. With the fraction exact, `datadog-logs-to-syslog` and
+    `datadog-logs-to-syslog-sd` observe `log/timestamp` at `syslog_out` as `exact` only, since
+    no sub-microsecond digits are left for RFC 5424's six fractional digits to truncate.
+  - **The stream's end state** (`tsink/w3`): `UNCOUNTED_ALLOWED` holds three entries, and its doc
+    states the rule in place of a list of mechanisms. `("log", Some("beside_metrics"), None)` and
+    `("span", None, None)` are ADR `telemetry-loss-vocabulary`'s 2026-10-28 amendment: a sink
+    ignores a signal it has no wire for, uncounted, at any sink. The span entry stays wide until
+    `tspan` gives spans sources of their own. `("attributes", Some("datadog_carrier_log"),
+    Some("datadog_out"))` is the one outside the rule: a `_logit.datadog.*` carrier the log,
+    event, and service-check routes have no field for, left off where the metrics routes count
+    one, which predates `tlog` (decision 9). `spec/transit/README.md` and `mapping.yaml`'s header
+    had described the beside-metrics entry as limited to a sink that writes the metrics and still
+    listed the two trace entries `tsink/w2` removed; each now points at the doc and the ADR.
+    `docs/known-gaps/statsd.md`'s span-beside-a-DogStatsD-event entry is gone, and
+    `statsd_out`'s module doc states the leave-off as the rule. Every defect §10 named is fixed:
+    `syslog_out`'s TAG-less RFC 3164 messages, untagged skip count, `<N bytes>` PARAM-VALUE, and
+    uncounted empty array, the uncounted trace at `datadog_out` and `splunk_hec_out`,
+    `datadog_in`'s `f64` timestamp, and the dead `ddsource` default. What stays is decision 9's
+    decided limits, each recorded where it was settled; two of them keep an entry with a revisit
+    trigger in `docs/known-gaps/datadog.md`: the 101-tag log at `datadog_out`, and the
+    `_logit.otel.severity_*` carriers `datadog_out` leaves off.

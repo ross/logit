@@ -293,6 +293,7 @@
 //! | `attributes/splunk_envelope` | normalized | `resource_as_tag` | Merged into the log's attributes, so it reads back as an event attribute. |
 //! | `attributes/syslog_facility` | exact | -- | A log with no `syslog.facility` leaves with none. |
 //! | `attributes/no_host` | normalized | `default_host` | A record with no host and no hostless mark leaves with the process hostname as its host, which datadog_in reads back as `host.name`; a span's host is its batch resource's `host.name`, filled only when no relaying Agent's hostname rides beside it. |
+//! | `attributes/default_tag` | exact | -- | A log with no `syslog.tag` leaves with none. |
 //! | `attributes/log_status` | normalized | `status_from_severity` | A log with a severity and no `status` attribute leaves with `status` set to the severity's name, which datadog_in reads back as a `status` attribute beside the severity. |
 //! | `attributes/log_severity_fields` | exact | -- | The severity is `status`'s; no `otel.log.severity.*` attribute is written. |
 //! | `attributes/span_kind` | normalized | `span_kind_meta` | A span whose kind isn't internal, with no `span.kind` attribute, leaves with `meta["span.kind"]`, which datadog_in reads back as a `span.kind` attribute beside the kind. |
@@ -306,7 +307,7 @@
 //! | `log/trace` | normalized | `trace_as_attributes` | The ids leave as hex `trace_id` and `span_id` keys, which Datadog's log intake reads for trace correlation and datadog_in reads back as attributes, not as the log's trace. |
 //! | `log/trace_unset` | exact | -- | No trace ids are written, and none read back. |
 //! | `log/trace_flags` | lost | structural | A Datadog log has no trace flags, so none are written. |
-//! | `log/trace_beside_id_attribute` | lost | uncounted | A `trace_id` or `span_id` attribute is written under its own name and the log's own ids are left off, uncounted, so a relayed Datadog log leaves as it arrived. |
+//! | `log/trace_beside_id_attribute` | lost | `logit.output.tags.omitted{reason=reserved_key}` | A `trace_id` or `span_id` attribute wins and is written under its own name, so a relayed Datadog log leaves as it arrived, and the log's own ids are left off, counted once per log. |
 //! | `log/dropped_attributes_count` | lost | structural | A Datadog log has no dropped-attribute count, so none is written. |
 //! | `log/timestamp` | normalized | `milliseconds` | The `timestamp` field, in Unix milliseconds, so a finer timestamp is truncated. |
 //! | `log/receipt_timestamp` | normalized | `milliseconds` | The `timestamp` field, in Unix milliseconds, the time the log was received. |
@@ -416,7 +417,7 @@
 //! | `message` of another JSON type | `Str` of its JSON text | -- |
 //! | `message` absent or `null` | item dropped | `logit.input.logs.dropped{reason="no_message"}` |
 //! | `status` | attribute `status`, verbatim; `severity` by case-insensitive match: `emergency`/`emerg`/`alert`/`critical`/`crit`/`fatal` → `Fatal`, `error`/`err` → `Error`, `warning`/`warn` → `Warn`, `notice`/`info` → `Info`, `debug` → `Debug`, `trace` → `Trace`, else `None` | -- |
-//! | `timestamp`: integer (or fractional) milliseconds, or an RFC 3339 string | `Event::timestamp` | -- |
+//! | `timestamp`: integer (or fractional) milliseconds, or an RFC 3339 string | `Event::timestamp`; a fractional number is read from its own text, every digit to the nanosecond kept and any finer digit dropped ([`time::millis_text_to_nanos`]) | -- |
 //! | `timestamp` absent, `null`, or `0` | `received_at` | -- |
 //! | `timestamp` another type, or an unparseable string | `received_at` | diag `bad_timestamp` |
 //! | `hostname`, a non-empty string | [`ATTR_HOST_NAME`], displacing a `host.name` key | `logit.input.tags.omitted{reason="reserved_key"}` for a displaced key |
@@ -493,12 +494,12 @@
 //! | a `hostname` attribute | omitted: it would collide with the wire's own | `logit.output.tags.omitted{reason="reserved_key"}` |
 //! | `service.name` other than an empty `Str`, else a `service` attribute (a decoded `service` that isn't a string) | `service`, omitted when neither; `service.name` itself is never an attribute | -- |
 //! | a `service` attribute beside a `service.name` written | omitted: it would be a second `service` | `logit.output.tags.omitted{reason="reserved_key"}` |
-//! | `ddsource`, else [`ATTR_SOURCE`], else [`DatadogEncoder::with_default_source`] | `ddsource`, omitted when none | -- |
+//! | `ddsource`, else [`ATTR_SOURCE`] | `ddsource`, omitted when neither; an operator who wants one on every log sets `ddsource` upstream with `set` | -- |
 //! | `ddtags` | `ddtags`, verbatim, but for the next row | -- |
 //! | `deployment.environment.name`, `service.version`, [`ATTR_CONTAINER_ID`], each a non-empty `Str`, beside a text `ddtags` or none | `env:<v>`, `version:<v>`, and `container_id:<id>` (the tag the Agent gives a container's logs) appended to `ddtags` in that order, after its other entries; an entry already in the string naming one of the three tags written is left off. Beside a `ddtags` that isn't text, each key leaves as an attribute | the left-off entry: `logit.output.tags.omitted{reason="reserved_key"}` |
 //! | every other attribute | a top-level key: `Map`/`Array` nested, `Bytes` → base64, `Timestamp` → RFC 3339, non-finite `F64` → `null` | -- |
 //! | an attribute named `message` or `timestamp` | omitted: it would collide with the wire's own | `logit.output.tags.omitted{reason="reserved_key"}` |
-//! | `LogRecord::trace`, when no `trace_id` or `span_id` attribute is present | `trace_id` (32 lowercase hex) and, when the ref has one, `span_id` (16 lowercase hex), after the attributes: the OTel form Datadog's log intake detects. An attribute of either name suppresses both, so a relayed intake log re-encodes unchanged | -- |
+//! | `LogRecord::trace`, when no `trace_id` or `span_id` attribute is present | `trace_id` (32 lowercase hex) and, when the ref has one, `span_id` (16 lowercase hex), after the attributes: the OTel form Datadog's log intake detects. An attribute of either name suppresses both, so a relayed intake log re-encodes unchanged, and the log's own ids are left off | the suppressed ids, once per log: `logit.output.tags.omitted{reason="reserved_key"}` |
 //! | **events** ([`DatadogEncoder::encode_events`]): an event with a `log` carrying `_logit.statsd.event.title` | [`events::EventFormat::AgentEnvelope`] (the default): one envelope for the batch, `apiKey` `""`, groups keyed by `_logit.statsd.event.source_type` (else `api`) in sorted order; [`events::EventFormat::PublicV1`]: one object per event | -- |
 //! | resource [`RESOURCE_ATTR_AGENT_HOSTNAME`] | envelope `internalHostname`, `""` when absent | -- |
 //! | the event fields | Agent item keys in the Agent's order: `msg_title`, `msg_text`, `timestamp` (seconds), `priority`, `host`, `tags`, `alert_type`, `aggregation_key`, `source_type_name`, `event_type`, then `device_name`, `related_event_id`; the public form uses `title`, `text`, `date_happened` and omits an absent `host`. Empty optional fields are omitted | -- |
@@ -1221,9 +1222,6 @@ impl DatadogDecoder {
 pub struct DatadogEncoder {
     telemetry: Telemetry,
     diagnostics: Diagnostics,
-    /// `ddsource` for a log that carries neither `ddsource` nor `_logit.datadog.source`; `None`
-    /// omits it.
-    default_source: Option<String>,
     /// The host of a series, sketch, log, event, or service check that carries none of its own;
     /// `None` leaves it empty or absent.
     default_host: Option<Arc<str>>,
@@ -1273,11 +1271,6 @@ impl DatadogEncoder {
 
     pub fn with_diagnostics(mut self, diagnostics: Diagnostics) -> Self {
         self.diagnostics = diagnostics;
-        self
-    }
-
-    pub fn with_default_source(mut self, source: impl Into<String>) -> Self {
-        self.default_source = Some(source.into());
         self
     }
 
