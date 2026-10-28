@@ -330,9 +330,8 @@ uncounted:
     replaces `degraded{reason="set_estimate"}`; and `"delta_sum"` for the stale marker
     `prometheus_out`'s remote-write sends for a flagged delta monotonic `Sum`, which reads back
     cumulative.
-- **`uncounted` remains only where this change doesn't reach.** The table's schema accepts it on
-  the `log` and `span` rows and on `datadog_out`'s carrier on a log, not yet classified
-  (`crates/logit-cli/src/transit/mapping.rs`'s `UNCOUNTED_ALLOWED`).
+- **`uncounted` remains only where this change doesn't reach.** The table's schema accepts it
+  only on the cells `crates/logit-cli/src/transit/mapping.rs`'s `UNCOUNTED_ALLOWED` names.
 - **Each new count is encode-side**, once per batch however many attempts the sink makes,
   through the sink's batch accounting, and counts a rewrite only on a record or line the sink
   writes.

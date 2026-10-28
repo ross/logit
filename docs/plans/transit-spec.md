@@ -446,7 +446,8 @@ allowance follows the mechanism, not the value type. The
 #### Uncounted losses
 
 In W5, `UNCOUNTED_ALLOWED`'s `("log", None, None)` narrows to
-`("log", Some("beside_metrics"), None)` plus the `syslog_out` entries above. Two of those carry
+`("log", Some("beside_metrics"), None)`, the two `log/trace_beside_id_attribute` entries the
+`tlog/w5` finding adds, and the `syslog_out` entries above. Two of those carry
 the `structured_data:` encoder's own uncounted losses: a `Bytes` value written as its length, on
 the shared `bytes_value` entry, and an opted-in empty array, which writes one PARAM per element
 and so none, on `attributes/sd_empty_array`. Every other
@@ -1193,3 +1194,45 @@ Recorded per workstream as each lands.
     one class, so the `times` case has no `time: 0` object.
   - The `otlp-logs` `beside-metrics` case's gauge reaches `gauge/i64` unspecified at
     `splunk_hec_out`, which has no metric-kind cells.
+- **The `kafka_out` column and the log sweep** (`tlog/w5`): the `otlp-logs`, `syslog`,
+  `datadog-logs`, `splunk`, and new `statsd-logs` sources run into `kafka_out` under `format: json`
+  and `format: text`. There's no `kafka_in`, so the driver reads a json record back through the
+  event JSON reader and a text record as one log of its value, at the record's millisecond
+  timestamp (`crates/logit-cli/src/transit/wire.rs`). No `kafka_out` defect turned up, so
+  `docs/known-gaps/kafka.md` has no new entry.
+  - `format: json` writes the event whole: every cell it reaches reads `exact`.
+  - `format: text` writes the log's body alone. Every attribute, carrier, resource, and scope,
+    and the severity, body format, event name, observed time, trace, trace flags, and dropped
+    count are `lost`, `structural`. The timestamp leaves in whole milliseconds
+    (`timestamp_precision`), and a message that isn't a string, a UTF-8 `Bytes` one included,
+    reads back as its text (`message_as_text`). A span beside the log is counted
+    `spans.omitted{reason=format}` and metrics beside it `metrics.omitted{reason=format}`; an
+    event with no log is skipped, counted `events.skipped{reason=no_log}`.
+  - `statsd_out` writes a DogStatsD event's line and leaves a span on the same event off,
+    uncounted, where a span beside any other log counts the event `no_metrics`. The new
+    `statsd-logs-relay` flow and `event-beside-span` case reach it: `span/beside_log` at
+    `statsd_out` is `skipped`, `uncounted`, and `docs/known-gaps/statsd.md` has the entry.
+  - A log with its own trace and a `trace_id` or `span_id` attribute (a new line in the
+    `otlp-logs` `trace` case) leaves `datadog_out` and `splunk_hec_out` with the attribute and
+    without the trace, uncounted: each writes the trace only when neither attribute is present.
+    The trace's ids and flags reach a row of their own there, `log/trace_beside_id_attribute`,
+    whose two `uncounted` cells take their own `UNCOUNTED_ALLOWED` entries, a deviation from the
+    narrowing above. `docs/known-gaps/datadog.md` and `splunk.md` have it.
+  - `span/no_wire_form` is reached by a span field a Datadog span has no form for, which isn't
+    `splunk_hec_out`'s set: an `ok` status alone reaches the row, and `splunk_hec_out` writes it,
+    so a span carrying nothing else reads `exact` against its `degraded` cell. The
+    `statsd-logs` `span-only` case carries a `trace_state` so both sinks lose a field; spans
+    (`tspan`) need the row split by sink.
+  - The cells still unreached at the log sinks, each with no case that can reach it: the metric
+    flags' attribute rows (`timestamped`, `rate`, `interval`, `family_type`, and their per-kind
+    rows), which only a metric decoder sets; `private_carrier` at `syslog_out`,
+    `splunk_hec_out`, and `kafka_out`, since it's the sink's own family's carrier and no log
+    source writes one beyond the severity carrier, which has its own row; `prometheus_target`,
+    stamped only on a scrape's metrics; and `syslog_out`'s `span_kind` and `trace_id_high`,
+    derived from a Datadog span, which no flow sends to `syslog_out`. A DogStatsD event's `e:` and
+    `card:` fields now reach `private_carrier` at `statsd_out` and `foreign_carrier` elsewhere.
+  - `docs/known-gaps/mappings.md`: the hand-written Splunk log row keeps only the severity
+    attributes, since the generated region states body format, observed time, and dropped count,
+    and the span row keeps what `span/no_wire_form` doesn't name. Syslog has no hand-written log
+    row. The collectd notification row read `uncounted` for `attributes/foreign_carrier`, whose
+    cells are `structural`, and now says so.
