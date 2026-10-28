@@ -2699,7 +2699,7 @@ enum SpanPart {
 /// An item attribute a span sink writes apart from the rest, judged on its own row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Nest {
-    /// A `Map` or an `Array`, on a span event only: a link's ride in `span/links`.
+    /// A `Map`, an `Array`, or a `Null`, on a span event only: a link's ride in `span/links`.
     Structured,
     Bytes,
     U64,
@@ -2740,7 +2740,7 @@ fn nest_attributes(
             let at = format!("{pointer}/attributes/{}", key.replace('~', "~0").replace('/', "~1"));
             let tag = types.get(&at).map(String::as_str);
             match nest {
-                Nest::Structured => value.is_object() || value.is_array(),
+                Nest::Structured => value.is_object() || value.is_array() || value.is_null(),
                 Nest::Bytes => tag == Some("bytes"),
                 Nest::U64 => tag == Some("u64"),
                 Nest::Timestamp => tag == Some("timestamp"),

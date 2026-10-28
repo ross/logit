@@ -189,7 +189,7 @@
 //! | `span/dropped_events_count` | exact | -- | The span's `dropped_events_count`. |
 //! | `span/dropped_links_count` | exact | -- | The span's `dropped_links_count`. |
 //! | `span/events` | exact | -- | Each span event's time, name, and attributes. |
-//! | `span/event_nested_attribute` | exact | -- | A key-value list or array attribute of a span event, as OTLP writes any attribute. |
+//! | `span/event_nested_attribute` | exact | -- | A key-value list, array, or empty attribute of a span event, as OTLP writes any attribute. |
 //! | `span/event_name_structured` | lost | uncounted | OTLP's span event `name` is a string, and a name that isn't a `Str` leaves as `""`, uncounted. |
 //! | `span/nested_bytes_attribute` | exact | -- | A `bytesValue` attribute of a span event or link. |
 //! | `span/nested_u64_attribute` | normalized | `u64_as_int` | A `u64` attribute of a span event or link reads back as an `i64`, or, above `i64::MAX`, as a double, approximate beyond 2^53 and uncounted. |
