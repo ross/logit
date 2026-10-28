@@ -9,7 +9,7 @@
     {"sink":"datadog_out","row":"attributes/number_value","cell":0,"observed":["exact"]},
     {"sink":"datadog_out","row":"attributes/resource_attribute","cell":0,"observed":["normalized"]},
     {"sink":"datadog_out","row":"attributes/scope","cell":0,"observed":["lost"]},
-    {"sink":"datadog_out","row":"attributes/severity_carrier","cell":0,"observed":["lost"]},
+    {"sink":"datadog_out","row":"attributes/severity_carrier_otel","cell":0,"observed":["lost"]},
     {"sink":"datadog_out","row":"attributes/string_value","cell":0,"observed":["exact"]},
     {"sink":"datadog_out","row":"attributes/timestamp_value","cell":0,"observed":["normalized"]},
     {"sink":"datadog_out","row":"attributes/trace_id_high","cell":0,"observed":["normalized"]},

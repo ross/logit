@@ -133,7 +133,7 @@
 //! | `attributes/resource_attribute` | exact | -- | A resource attribute. |
 //! | `attributes/scope` | exact | -- | The `InstrumentationScope` of the batch. |
 //! | `attributes/datadog_carrier_log` | lost | structural | A `_logit.` carrier is private and isn't an OTLP attribute, so it's left off. |
-//! | `attributes/severity_carrier` | exact | -- | The raw `severity_number` and `severity_text` the carriers hold, which otlp_in reads back into the same carriers beside the band's severity. |
+//! | `attributes/severity_carrier_otel` | exact | -- | The raw `severity_number` and `severity_text` the carriers hold, which otlp_in reads back into the same carriers beside the band's severity. |
 //! | `attributes/no_host` | exact | -- | A record with no host leaves with none. |
 //! | `attributes/log_status` | exact | -- | The severity is the `LogRecord`'s own; no `status` attribute is written. |
 //! | `attributes/span_kind` | exact | -- | The kind is the `Span`'s own; no `span.kind` attribute is written. |

@@ -3032,10 +3032,12 @@ rows:
         reason: structural
         text: Another protocol's `_logit.` carrier is private and isn't a tag, so it's left off.
 
-  # statsd_out, prometheus_out, influxdb_out, and graphite_out don't write a log on an event with
-  # no metrics, where the carriers ride, so none of them has a cell.
+  # OTLP's raw severity carriers. `_logit.syslog.severity` gets its own row,
+  # `severity_carrier_syslog`, with the syslog source, since otlp_out keeps one carrier and not the
+  # other. statsd_out, prometheus_out, influxdb_out, and graphite_out don't write a log on an event
+  # with no metrics, where the carriers ride, so none of them has a cell.
   - kind: attributes
-    feature: severity_carrier
+    feature: severity_carrier_otel
     cells:
       otlp_out:
         class: exact

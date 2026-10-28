@@ -381,10 +381,12 @@ is needed: `otlp_out`'s observed stamp is the one place the driver reads the clo
 #### Severity carriers
 
 The model's six-variant `Severity` reads back equal whether OTLP's severity 10 comes back as 10
-or 9, so the loss is the carrier's. A new `attributes/severity_carrier` row takes
-`_logit.otel.severity_*` and `_logit.syslog.severity` ahead of the private and foreign carrier
-rows. It's `exact` at the family's own sink and `lost, structural` elsewhere, with text saying
-the severity comes back at band resolution.
+or 9, so the loss is the carrier's. Two new rows, ahead of the private and foreign carrier
+rows, take the carriers: `attributes/severity_carrier_otel` for `_logit.otel.severity_*` (W1),
+and `attributes/severity_carrier_syslog` for `_logit.syslog.severity` (W2). Each is `exact` at
+its family's own sink and `lost, structural` elsewhere, with text saying the severity comes back
+at band resolution. One row can't hold both, since `otlp_out` keeps OTel's carrier and not
+syslog's.
 
 #### Per-source attribute rows
 
@@ -484,8 +486,9 @@ W1 changes `crates/logit-cli/src/transit/`'s `mapping.rs`, `classes.rs`, `spec.r
     is also absent and `normalized` otherwise; and `Field::Timestamp { receipt }`, as
     "Timestamps" describes.
   - A `field_rows` branch for a log not beside metrics that pushes the field rows, and closures
-    keyed by attribute name for `severity_carrier`, `syslog_header`, `syslog_msgid`, `syslog_sd`,
-    `syslog_timestamp`, `host_name`, and `splunk_envelope`.
+    keyed by attribute name for `severity_carrier_otel`, `severity_carrier_syslog`,
+    `syslog_header`, `syslog_msgid`, `syslog_sd`, `syslog_timestamp`, `host_name`, and
+    `splunk_envelope`.
   - `log_features` beside `kind_features`, since `record_features` returns early for a record
     that isn't a metric: `message_unsafe` when `Spelling::log_message` differs from the input's
     message, `structured_message`, `bytes_message`, and `blank_message`.
@@ -1045,7 +1048,7 @@ Recorded per workstream as each lands.
     above has it.
   - `otlp_out` writes `_logit.otel.severity_number` and `_logit.otel.severity_text` back as the
     record's own fields, and `datadog_out` leaves both off
-    (`attributes/severity_carrier`); `otlp_out` stamps a log with no observed time
+    (`attributes/severity_carrier_otel`); `otlp_out` stamps a log with no observed time
     (`log/observed_timestamp_unset`, `normalized`).
   - `otlp_in` reads a `u64` attribute above `i64::MAX`, which `otlp_out` writes as a
     `doubleValue`, back as an `F64`; the class check's OTLP spelling compares it as that double.

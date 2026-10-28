@@ -253,9 +253,11 @@ have one case. The `tlog` stream fills that in, and settles these:
    writes, and `log/receipt_timestamp` for the receipt time of an event that carries
    `syslog.timestamp`, which `syslog_out` has no slot for.
 4. **Severity resolution loss belongs to the carrier.** The six-variant `Severity` reads back
-   equal at band resolution, so `attributes/severity_carrier` takes `_logit.otel.severity_*` and
-   `_logit.syslog.severity` ahead of the private and foreign carrier rows: `exact` at the
-   family's own sink, `lost, structural` elsewhere.
+   equal at band resolution, so two rows ahead of the private and foreign carrier rows take the
+   carriers, `attributes/severity_carrier_otel` for `_logit.otel.severity_*` and
+   `attributes/severity_carrier_syslog` for `_logit.syslog.severity`: each `exact` at its
+   family's own sink, `lost, structural` elsewhere. One row can't hold both, since `otlp_out`
+   keeps OTel's carrier and not syslog's.
 5. **Attribute rows keyed by name** where the log sinks treat keys differently: `syslog_header`,
    `syslog_msgid`, `syslog_sd`, `syslog_timestamp`, `host_name`, and `splunk_envelope`. Other
    log attributes reach the value-type rows.

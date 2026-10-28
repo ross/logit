@@ -53,7 +53,7 @@
 //! `resource_attribute`; and `attributes/scope` when its batch has a scope. A log
 //! record on an event with no metrics reaches `log/dogstatsd_event` when it carries
 //! `_logit.statsd.event.title`, else `log/plain`, the message rows [`log_features`] lists, and its
-//! attribute rows, with `_logit.otel.severity_*` as `severity_carrier`; it also reaches a `log`
+//! attribute rows, with `_logit.otel.severity_*` as `severity_carrier_otel`; it also reaches a `log`
 //! field row for each of its fields (`severity`, `body_format`, `event_name`,
 //! `observed_timestamp`, `trace` for its trace and span ids, `trace_flags`,
 //! `dropped_attributes_count`), or the field's `_unset` row (`severity_unset`,
@@ -1817,7 +1817,7 @@ fn field_rows(rec: &Rec, protocol: &str) -> Vec<(String, Option<String>, Field)>
             Some("prometheus_target")
         } else if key.starts_with("_logit.otel.severity_") {
             // OTLP's raw severity, which `Severity` holds only at band resolution.
-            Some("severity_carrier")
+            Some("severity_carrier_otel")
         } else if key.starts_with("_logit.datadog.") && json_route {
             Some("datadog_carrier_log")
         } else if key.starts_with(&own) || (protocol == "influxdb" && is_field(key)) {

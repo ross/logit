@@ -281,7 +281,7 @@
 //! | `attributes/resource_attribute` | normalized | `resource_as_tag` | Merged into the record's tags, so it reads back as an event attribute. |
 //! | `attributes/scope` | lost | structural | Datadog has no instrumentation scope, so none is written. |
 //! | `attributes/datadog_carrier_log` | lost | uncounted | A `_logit.datadog.*` carrier on a log, a Datadog event, or a service check that the route has no field for is left off, uncounted, where the metrics routes count one as `no_wire_form`; the events route's public form has no field for the Agent envelope's `_logit.datadog.agent.hostname`. |
-//! | `attributes/severity_carrier` | lost | structural | A Datadog log has a status and no raw OTLP severity, so the carriers are left off and the severity reads back at band resolution. |
+//! | `attributes/severity_carrier_otel` | lost | structural | A Datadog log has a status and no raw OTLP severity, so the carriers are left off and the severity reads back at band resolution. |
 //! | `attributes/no_host` | normalized | `default_host` | A record with no host and no hostless mark leaves with the process hostname as its host, which datadog_in reads back as `host.name`; a span's host is its batch resource's `host.name`, filled only when no relaying Agent's hostname rides beside it. |
 //! | `attributes/log_status` | normalized | `status_from_severity` | A log with a severity and no `status` attribute leaves with `status` set to the severity's name, which datadog_in reads back as a `status` attribute beside the severity. |
 //! | `attributes/span_kind` | normalized | `span_kind_meta` | A span whose kind isn't internal, with no `span.kind` attribute, leaves with `meta["span.kind"]`, which datadog_in reads back as a `span.kind` attribute beside the kind. |
