@@ -722,8 +722,8 @@ shows:
    | Feature | Level | What reaches it |
    |---|---|---|
    | `alone` | record | A span on an event with no metrics and no log. Every such span reaches it. |
-   | `not_datadog_origin` | record | A span whose trace chunk's root `trace_readiness` doesn't read as a Datadog span,, which it reaches beside `alone`. `dropped` at `datadog_out`, and `exact`, nothing beyond `alone`, at every other span sink. |
-   | `needs_agent_processing` | record | A span whose trace chunk's root is a Datadog span without the Agent's `_top_level` mark,, which it reaches beside `alone`. `dropped` at `datadog_out`, and `exact`, nothing beyond `alone`, at every other span sink. |
+   | `not_datadog_origin` | record | A span whose trace chunk's root `trace_readiness` doesn't read as a Datadog span. A span reaches this row beside `alone`. `dropped` at `datadog_out`, and `exact`, nothing beyond `alone`, at every other span sink. |
+   | `needs_agent_processing` | record | A span whose trace chunk's root is a Datadog span without the Agent's `_top_level` mark. A span reaches this row beside `alone`. `dropped` at `datadog_out`, and `exact`, nothing beyond `alone`, at every other span sink. |
    | `name` | field | A `Str` span name. |
    | `name_structured` | field | A `Map`, `Array`, `Bytes`, or `Null` span name. |
    | `trace_id` | field | The span's 128-bit trace id. |
@@ -947,7 +947,7 @@ parent merges.
 |---|---|---|---|
 | W0 | `tspan/w0` | This section and [ADR `transit-spec`](../adr/transit-spec.md)'s span-records amendment. ADR `telemetry-loss-vocabulary` needs no amendment: its 2026-10-28 amendment covers the ignored signal and the structural cells | S |
 | W1 | `tspan/w1` | The framework above, and the `otlp-traces` source: `traces.json` and hand-written cases covering every kind and status, a status message, `trace_state`, flags, dropped counts, events with nested attributes, links with flags, `trace_state`, and dropped counts, a structured name, an end before its start, a 128-bit trace id, an unset parent, `u64` attributes, and a span beside a log and beside metrics. Flows `otlp-traces-relay`, `otlp-traces-to-datadog`, `otlp-traces-to-splunk`, `otlp-traces-to-kafka`, and `otlp-traces-to-kafka-text`; `otlp_out`, `datadog_out`, `splunk_hec_out`, and `kafka_out` cells on every new row; the `statsd`, `statsd-logs`, and `splunk` span cases reclassified; `spec/transit/README.md`'s bypass list without the two readiness drops | L |
-| W2 | `tspan/w2` | The `datadog_trace_out` column, with no `no_host` derivation and the Agent carriers lost under both versions: `datadog_trace_in::decode_request`, the encoder arm and spelling, its `doc:` and `gaps:` regions, and a `PROTOCOLS` entry. The `datadog-traces` source: the `AgentPayload` capture, and hand-written spans with and without the `_top_level` mark, a `_top_level`-marked span carrying `status: ok`, a status message, `trace_state`, flags, every dropped count, and an end before its start, so `datadog_out`'s `lost` cells are observed, chunk carriers, `meta_struct`, a `_logit.datadog.span.error` other than 1, and the environment and version lift. Flows `datadog-traces-relay`, `datadog-traces-to-otlp`, `datadog-traces-to-datadog-trace`, `datadog-traces-to-datadog-trace-v07`, `datadog-traces-to-splunk`, `datadog-traces-to-kafka`, `datadog-traces-to-kafka-text`, `otlp-traces-to-datadog-trace`, and `otlp-traces-to-datadog-trace-v07` | L |
+| W2 | `tspan/w2` | The `datadog_trace_out` column, with no `no_host` derivation and the Agent carriers lost under both versions: `datadog_trace_in::decode_request`, the encoder arm and spelling, its `doc:` and `gaps:` regions, and a `PROTOCOLS` entry. The `datadog-traces` source: the `AgentPayload` capture, and hand-written spans with and without the `_top_level` mark, a `_top_level`-marked span carrying `status: ok`, a status message, `trace_state`, flags, every dropped count, and an end before its start, so `datadog_out`'s `lost` cells are observed, chunk carriers, `meta_struct`, a `_logit.datadog.span.error` other than 1, and the environment and version lift. Flows `datadog-traces-relay`, `datadog-traces-to-otlp`, `datadog-traces-to-datadog-trace`, `datadog-traces-to-datadog-trace-v07`, `datadog-traces-to-splunk`, `datadog-traces-to-kafka`, `datadog-traces-to-kafka-text`, `otlp-traces-to-datadog-trace`, and `otlp-traces-to-datadog-trace-v07`. An entry in `docs/known-gaps/datadog.md` for `datadog_trace_out` counting nothing for a log-only or metrics-only event, the one finding no cell states | L |
 | W3 | `tspan/w3` | The `ddtrace` source: the `decode_wire` arm, the v0.4 and v0.5 captures, the request-header carriers, and hand-written v0.7 cases. Flows `ddtrace-relay` (v0.4), `ddtrace-relay-v07`, `ddtrace-to-datadog` (`needs_agent_processing`), `ddtrace-to-otlp`, `ddtrace-to-splunk`, and `ddtrace-to-kafka` | M |
 | W4 | `tspan/w4` | The `splunk-traces` source: the capture, the moved `span` case, and hand-written cases (a zero parent id, an unknown member read back as a log counted `malformed_span`, events and links). Flows `splunk-traces-relay`, `splunk-traces-to-otlp`, `splunk-traces-to-datadog`, `splunk-traces-to-datadog-trace`, `splunk-traces-to-kafka`, and `splunk-traces-to-kafka-text`. A coverage sweep to no unreached span cell; the `UNCOUNTED_ALLOWED` narrowing; `docs/known-gaps/mappings.md`'s hand-written span rows reconciled with the generated regions; `docs/known-gaps/datadog.md`'s prose; `spec/transit/README.md`'s source and sink lists, `transit/mod.rs`, `features/otlp.yaml`'s header, and `AGENTS.md` | M |
 
@@ -1701,12 +1701,14 @@ Recorded per workstream as each lands.
     trigger in `docs/known-gaps/datadog.md`: the 101-tag log at `datadog_out`, and the
     `_logit.otel.severity_*` carriers `datadog_out` leaves off.
 - **Spans, from the survey** (`tspan/w0`): reading the span sinks for §11 found these behaviors,
-  each recorded as the code behaves. None is fixed in this stream: W1 to W4 give each a cell,
-  and an operator-visible one an entry in `docs/known-gaps/`, and the later `tspan-sink` stream
-  fixes them (§11, decision 11).
+  each recorded as the code behaves. None is fixed in this stream: W1 to W4 give each but the
+  first a cell, and an operator-visible one an entry in `docs/known-gaps/`, and the later
+  `tspan-sink` stream fixes them (§11, decision 11).
   - `datadog_trace_out` counts no `logit.output.events.skipped` for a log-only or metrics-only
     event, which produces nothing there. A log or metrics beside a span it writes is the
-    ignored-signal rule, not a finding. No span flow reaches it (§11, decision 9).
+    ignored-signal rule, not a finding. No span flow reaches it (§11, decision 9), so it's the
+    one `tspan` finding with no cell; W2 records it in `docs/known-gaps/datadog.md` for
+    `tspan-sink` to close.
   - `otlp_out` writes a span or span-event name that isn't a `Str` as `""`, uncounted, and clamps
     a negative absolute time to 0, uncounted.
   - `otlp_out`'s `u64_as_double` count skips span-event and link attributes.
