@@ -406,6 +406,17 @@ Consequences:
   NILVALUE `-`.
 - **`app_name:` still wins over `service.name`**, and `syslog.tag` over both, by the
   header-field precedence above.
+- **A TAG is read back as one only in `syslog_in`'s TAG class** (letters, digits, `_`, `-`, `.`,
+  `/`). The fallback is sanitized as a configured TAG is, which keeps other printable characters,
+  so a `service.name` such as `api@v2` still leaves a message `syslog_in` reads with no HOSTNAME.
+  No transit case reaches it.
+- **An attribute outside the header fields stays off the wire, uncounted, under RFC 3164.** The
+  format has no field for it, a structural limit ([ADR
+  `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md)'s "Amendment (2026-10-28): an
+  ignored signal, and a format the config selects"); the same holds under RFC 5424 with no
+  `structured_data:`. An operator who needs the attributes uses `format: rfc5424` with
+  `structured_data:`, which writes each one as an SD-PARAM (`docs/deploying.md`'s
+  "`syslog_out` over UDP: the message-size bound" notes).
 
 The transit spec's row `log/header_in_message` becomes unreachable and goes
 ([ADR `transit-spec`](transit-spec.md)'s "Amendment: sink fixes (2026-10-28)").

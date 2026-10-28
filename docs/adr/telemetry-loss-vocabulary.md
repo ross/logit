@@ -370,8 +370,8 @@ counter:
   the rest, uncounted: a log has no form at a metrics sink, and metrics have none in a syslog
   message. The count would track how many mixed events the pipeline makes, which is the
   pipeline's shape, not loss. An event that produces nothing at the sink is still a record-level
-  outcome and counts `output.events.skipped{reason}`. `syslog_out` counts its skip untagged
-  until the `tsink` stream tags it `reason="no_log"`.
+  outcome and counts `output.events.skipped{reason}`; at `syslog_out` that's
+  `reason="no_log"`, as at `kafka_out` under `format: text`.
 - **Counting the ignored piece is permitted, not required.** `kafka_out`'s `format: text`
   counts `output.metrics.omitted{reason="format"}` and `output.spans.omitted{reason="format"}`
   (this record's 2026-10-13 amendment) and keeps both. Another sink isn't held to it.

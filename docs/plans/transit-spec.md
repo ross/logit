@@ -1358,5 +1358,18 @@ Recorded per workstream as each lands.
     and the span row keeps what `span/no_wire_form` doesn't name. Syslog has no hand-written log
     row. The collectd notification row read `uncounted` for `attributes/foreign_carrier`, whose
     cells are `structural`, and now says so.
-- **Sink fixes** (`tsink`): none yet. Each workstream of §10 records what it finds here as it
-  lands.
+- **Sink fixes** (`tsink`): each workstream of §10 records what it finds here as it lands.
+  - **`syslog_out`** (`tsink/w1`): every value-type and host- and service-key cell that read
+    `lost`, `uncounted` reads `lost`, `structural`, and its 16 `UNCOUNTED_ALLOWED` entries and
+    `sd_empty_array`'s go, leaving five. `bytes_value` under `structured_data:` reads
+    `normalized`, `stringified`; `sd_empty_array` reads `lost`, counted `empty_array`; the four
+    skip cells count `reason=no_log`. With a TAG on every RFC 3164 message, `log/header_in_message`
+    goes, `attributes/host_name` and `attributes/syslog_header` read `exact` there, and
+    `attributes/no_host` reads `normalized`, `default_host`, under both formats, each observed
+    in `syslog-relay-rfc3164` and the other RFC 3164 flows. `log/beside_metrics` is one `exact`
+    cell. The read-back default TAG is paired as an attribute the sink filled in, with no row of
+    its own, as the message's first word read as a TAG was. A TAG outside `syslog_in`'s TAG
+    class still reads back as MSG, so the class check's model of the RFC 3164 header stays; no
+    case reaches it. `crates/logit-cli/tests/syslog_round_trip.rs`'s permitted-normalization list
+    gains the TAG default as its tenth entry, since the Python handler's captures now relay with
+    `logit:`.
