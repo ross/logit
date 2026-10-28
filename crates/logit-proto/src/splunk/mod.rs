@@ -111,6 +111,7 @@
 //! | `log/bytes_message` | normalized | `message_as_text` | A string `event`, read back as a string, as the `log/message_unsafe` row says. |
 //! | `log/blank_message` | dropped | `logit.output.events.dropped{reason=blank_event}` | A log whose message is empty, null, or a non-finite number isn't written, since HEC rejects a whole request holding a blank `event`; the rest of the batch is sent. |
 //! | `span/alone` | exact | -- | A span object in the OpenTelemetry exporter's shape, its resource's attributes as `fields`; the `span/no_wire_form` row has what it can't carry. |
+//! | `span/beside_log` | exact | -- | A span object in the OpenTelemetry exporter's shape, its resource's attributes as `fields`; the `span/no_wire_form` row has what it can't carry. |
 //! | `span/no_wire_form` | degraded | `logit.output.spans.degraded{reason=no_wire_form}` | The exporter's span object has no member for span flags, `trace_state`, or a dropped count, so each is left off, counted once per span, and the span reads back without it. |
 //! | `event/attributes_only` | skipped | `logit.output.events.skipped{reason=no_payload}` | An event with no log, metric, or span has no HEC object and isn't sent. |
 //! | `event/string_only` | skipped | `logit.output.events.skipped{reason=no_payload}` | An InfluxDB point whose fields are all strings has no log, metric, or span, so it isn't sent and its fields are lost. |
@@ -170,7 +171,7 @@
 //! | `log/observed_timestamp` | lost | structural | HEC has no observed time, so it's left off. |
 //! | `log/observed_timestamp_unset` | exact | -- | No observed time is written, and splunk_hec_in reads back none. |
 //! | `log/trace` | exact | -- | The `trace_id` and `span_id` fields, lowercase hex, read back into the trace, unless the log carries either as an attribute. |
-//! | `log/trace_unset` | normalized | `log_fields` | No trace fields are written, and splunk_hec_in reads back no trace, unless the log carries `trace_id` and `span_id` attributes that parse as ids, which it reads into the trace. |
+//! | `log/trace_unset` | normalized | `log_fields` | No trace fields are written, and splunk_hec_in reads back no trace, unless the log carries a `trace_id` attribute that parses as a trace id, with a `span_id` that parses or none, which it reads into the trace. |
 //! | `log/trace_flags` | normalized | `flags_zero` | HEC has no trace flags, so a log's trace reads back with flags `0`. |
 //! | `log/dropped_attributes_count` | lost | structural | HEC has no dropped count, so it's left off. |
 //! | `log/timestamp` | exact | -- | The object's `time`, in seconds with up to nine decimals. |

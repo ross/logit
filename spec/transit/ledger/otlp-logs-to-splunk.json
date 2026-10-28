@@ -37,7 +37,7 @@
     {"sink":"splunk_hec_out","row":"log/trace","cell":0,"observed":["exact"]},
     {"sink":"splunk_hec_out","row":"log/trace_flags","cell":0,"observed":["exact","normalized"]},
     {"sink":"splunk_hec_out","row":"log/trace_unset","cell":0,"observed":["exact"]},
-    {"sink":"splunk_hec_out","row":"span/alone","cell":0,"observed":["exact"]}
+    {"sink":"splunk_hec_out","row":"span/beside_log","cell":0,"observed":["exact"]}
   ],
   "unspecified": [
     {"sink":"splunk_hec_out","row":"gauge/i64","reached_by":["otlp-logs-to-splunk × beside-metrics"]}

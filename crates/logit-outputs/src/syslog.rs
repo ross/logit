@@ -168,7 +168,8 @@
 //! | `log/bytes_message` | exact | -- | A `Bytes` message is written as its bytes, escaped as a string's are, and reads back as `Bytes`; one that's valid UTF-8 reads back as a string (the `log/message_unsafe` row). |
 //! | `log/blank_message` | exact | -- | A log with an empty message or none leaves with an empty MSG, which syslog_in reads back as an empty string. |
 //! | `log/header_in_message` | normalized | `header_in_message` | Under RFC 3164, a log with no `syslog.tag` reads back with its HOSTNAME at the front of its message, and a message whose first word is TAG-shaped reads back with that word as `syslog.tag`; syslog_in decides where the header ends by its first two words. |
-//! | `span/alone` | skipped | uncounted; `logit.output.events.skipped` | A span has no syslog form and isn't written: on an event with no log, the event is skipped, counted as `logit.output.events.skipped`; beside a log, it's left off, uncounted. |
+//! | `span/alone` | skipped | `logit.output.events.skipped` | A span on an event with no log has no syslog form, so the event is skipped. |
+//! | `span/beside_log` | skipped | uncounted | A span beside a log has no syslog form and is left off, uncounted. |
 //! | `span/no_wire_form` | skipped | uncounted | A span has no syslog form and isn't written: on an event with no log, the event is skipped, counted as `logit.output.events.skipped`; beside a log, it's left off, uncounted. |
 //! | `event/attributes_only` | skipped | `logit.output.events.skipped` | An event with no log has no syslog form and isn't written. |
 //! | `event/string_only` | skipped | `logit.output.events.skipped` | An InfluxDB point whose fields are all strings has no log, so it isn't written and its fields are lost. |

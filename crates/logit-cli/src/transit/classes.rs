@@ -56,8 +56,9 @@
 //! holds the configured SD-ID, `sd_name_unsafe` for a key that isn't an SD-NAME,
 //! `sd_empty_array` for an empty array), an event
 //! attribute by its value (`string_value`, `bool_value`, `number_value`, `array_value`,
-//! `map_value`, `bytes_value`, `timestamp_value`, `null_value`), a resource attribute under
-//! `com.splunk.` (the HEC envelope's `source`, `sourcetype`, and `index`) `splunk_envelope`, and
+//! `map_value`, `bytes_value`, `timestamp_value`, `null_value`), `com.splunk.source`,
+//! `com.splunk.sourcetype`, or `com.splunk.index` on the resource (the HEC envelope)
+//! `splunk_envelope`, and
 //! any other resource attribute `resource_attribute`; and `attributes/scope` when its batch has a
 //! scope. A log
 //! record on an event with no metrics reaches `log/dogstatsd_event` when it carries
@@ -70,8 +71,8 @@
 //! `log/receipt_timestamp` when it carries `syslog.timestamp` and its timestamp is when it was
 //! received. Those fields are out of a log's own comparison ([`LOG_FIELD_KEYS`]), so a log pairs
 //! on its message, its message's type tags, and its attributes. A span there reaches
-//! `span/alone`, and also `span/no_wire_form` when it carries a field a Datadog span has no form
-//! for. An event with no metric, log, or span is a record of kind `event` that reaches
+//! `span/beside_log` when its event carries a log, else `span/alone`, and also
+//! `span/no_wire_form` when it carries a field a Datadog span has no form for. An event with no metric, log, or span is a record of kind `event` that reaches
 //! `event/string_only` when it carries a non-empty `_logit.influxdb.measurement`, else
 //! `event/attributes_only`, and its attribute rows. A record reaches an `attributes` field row for
 //! each attribute [`derived_rows`] lists, at every sink that compares the record; a sink that writes
@@ -146,7 +147,7 @@
 //! may also carry the `lower_bound`, `upper_bound`, or `quantile` tag of the bucket or quantile it
 //! expands. An input left unpaired was skipped or
 //! dropped: the class is the one whose counter moved, or the cell's when it says the loss is
-//! `uncounted` (with or without a counter for the path the sink counts), or the expected class when it reached a `normalized` cell whose counter moved for
+//! `uncounted`, or the expected class when it reached a `normalized` cell whose counter moved for
 //! an equal point that was read back: a sink that collapses two equal readings sends one of them. One exception: under `prometheus_out` exposition (`bind:` set), an unpaired
 //! record whose series has a later record in the case that was read back was overwritten in the
 //! registry, and reads at its expected class when that's `normalized` or `degraded`. A read-back
@@ -265,6 +266,9 @@ struct Rec {
     /// Whether the record's event also carries metrics: a log or span beside them is a field of
     /// that event, not a record of its own.
     beside_metrics: bool,
+    /// Whether the record's event also carries a log: a span beside one reaches `span/beside_log`,
+    /// since a sink that writes only logs leaves it off without skipping the event.
+    beside_log: bool,
     /// The line's type tags under the record, keyed by the pointer below it (`/value`).
     types: BTreeMap<String, String>,
     attributes: Map<String, Value>,
@@ -1681,8 +1685,15 @@ mod splunk {
     use serde_json::Value;
     use std::collections::BTreeMap;
 
-    /// The resource attributes the envelope's `source`, `sourcetype`, and `index` carry.
-    pub(super) const ENVELOPE_PREFIX: &str = "com.splunk.";
+    /// The resource attributes the envelope's `source`, `sourcetype`, and `index` carry. Any
+    /// other `com.splunk.` key is an ordinary attribute, written into `fields`.
+    const ENVELOPE: [&str; 3] =
+        [RESOURCE_ATTR_SOURCE, RESOURCE_ATTR_SOURCETYPE, RESOURCE_ATTR_INDEX];
+
+    /// Whether resource attribute `key` is one of the envelope's carriers but `host`.
+    pub(super) fn is_envelope(key: &str) -> bool {
+        ENVELOPE.contains(&key)
+    }
 
     /// One predicted attribute: the row of the field it's derived from, if any, and its value as
     /// text.
@@ -1706,7 +1717,7 @@ mod splunk {
     /// flattened.
     fn fields(attrs: &AttrMap, resource: &AttrMap) -> AttrMap {
         let mut fields = AttrMap::new();
-        let carrier = |name: &str| name == HOST_NAME || name.starts_with(ENVELOPE_PREFIX);
+        let carrier = |name: &str| name == HOST_NAME || is_envelope(name);
         for (key, value) in resource.iter() {
             let name = resolve(key);
             if !carrier(name) && !is_private(name) {
@@ -1758,7 +1769,7 @@ mod splunk {
         if let Some(host) = host {
             out.insert(HOST_NAME.to_string(), host);
         }
-        for key in [RESOURCE_ATTR_SOURCE, RESOURCE_ATTR_SOURCETYPE, RESOURCE_ATTR_INDEX] {
+        for key in ENVELOPE {
             if let Some(value) = resource.get(key).and_then(Model::as_str) {
                 out.insert(key.to_string(), (None, value.to_string()));
             }
@@ -1923,11 +1934,13 @@ fn batch_records(batch: &EventBatch) -> Vec<Rec> {
         let resource_types = tagged("/resource/attributes/");
         let beside_metrics = event["metrics"].as_array().is_some_and(|m| !m.is_empty());
         let scope = event.get("scope").cloned();
+        let beside_log = event.get("log").is_some_and(|l| !l.is_null());
         let rec = |kind: String, name: String, body: Value, types| Rec {
             kind,
             name,
             body,
             beside_metrics,
+            beside_log,
             types,
             attributes: attributes.clone(),
             attribute_types: attribute_types.clone(),
@@ -2320,6 +2333,10 @@ fn kind_features(rec: &Rec) -> Vec<Option<String>> {
         }
         "exponential_histogram" | "summary" => vec![Some(temporality())],
         "log" | "span" if rec.beside_metrics => vec![Some("beside_metrics".to_string())],
+        "span" if rec.beside_log && datadog::otel_only(rec) => {
+            vec![Some("beside_log".to_string()), Some("no_wire_form".to_string())]
+        }
+        "span" if rec.beside_log => vec![Some("beside_log".to_string())],
         "span" if datadog::otel_only(rec) => {
             vec![Some("alone".to_string()), Some("no_wire_form".to_string())]
         }
@@ -2758,7 +2775,7 @@ fn field_rows_under(
     for (key, value) in &rec.resource {
         let feature = carrier(key, value)
             .or_else(|| outranked(key, value))
-            .or_else(|| key.starts_with(splunk::ENVELOPE_PREFIX).then_some("splunk_envelope"))
+            .or_else(|| splunk::is_envelope(key).then_some("splunk_envelope"))
             .unwrap_or("resource_attribute");
         let field = Field::Attribute { key: key.clone(), resource: true };
         rows.push(("attributes".to_string(), Some(feature.to_string()), field));
@@ -3482,10 +3499,10 @@ pub(super) fn check(
                     let counted = loss
                         .and_then(|(_, cell, _)| cell.counter.as_deref())
                         .is_some_and(&did_move);
-                    // A cell that says its loss is uncounted accounts for a record no counter does,
-                    // also where its counter names the path the sink does count.
-                    let uncounted = loss
-                        .is_some_and(|(_, cell, _)| cell.reason.as_deref() == Some("uncounted"));
+                    // A cell that says its loss is uncounted accounts for a record no counter does.
+                    let uncounted = loss.is_some_and(|(_, cell, _)| {
+                        cell.counter.is_none() && cell.reason.as_deref() == Some("uncounted")
+                    });
                     // A sink that collapses two equal readings counts the one it removes under a
                     // `normalized` cell and sends the other, so the removed one reads as the other
                     // does: at its worst cell, which is that one unless the kind is written in a
@@ -3551,8 +3568,7 @@ pub(super) fn check(
             }
             if let Some((label, cell, index)) = deciding {
                 ledger.saw(&sink, label, *index, observed);
-                let loss = matches!(cell.class, Class::Degraded | Class::Skipped | Class::Dropped)
-                    && cell.reason.as_deref() != Some("uncounted");
+                let loss = matches!(cell.class, Class::Degraded | Class::Skipped | Class::Dropped);
                 if let (true, Some(counter)) = (loss && observed == cell.class, &cell.counter) {
                     if !did_move(counter) {
                         failures.push(format!(
@@ -5033,5 +5049,21 @@ mod tests {
             .expect("a resource attribute row");
         assert_eq!(feature, "splunk_envelope");
         assert_eq!(observe_field(&field, &ins[0], &ins[0], Spelling::Splunk), Class::Exact);
+    }
+
+    /// A `com.splunk.` resource attribute that isn't `source`, `sourcetype`, or `index` has no
+    /// envelope slot: the encoder writes it into `fields`, so it's an ordinary resource attribute.
+    #[test]
+    fn another_com_splunk_resource_attribute_is_no_envelope_field() {
+        let line = r#"{{T},"log":{"severity":"info","format":"raw","message":"m"},"resource":{"attributes":{"com.splunk.hec.access_token":"t"}}}"#;
+        let ins = recs(&[line]);
+        let feature = field_rows(&ins[0], "splunk_hec")
+            .into_iter()
+            .find(|(_, _, field)| {
+                matches!(field, Field::Attribute { key, resource: true } if key == "com.splunk.hec.access_token")
+            })
+            .and_then(|(_, feature, _)| feature)
+            .expect("a resource attribute row");
+        assert_eq!(feature, "resource_attribute");
     }
 }

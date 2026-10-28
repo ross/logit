@@ -91,6 +91,7 @@
 //! | `log/bytes_message` | exact | -- | A `bytesValue` body. |
 //! | `log/blank_message` | exact | -- | An empty string body, or a log record with no body. |
 //! | `span/alone` | exact | -- | An OTLP span. |
+//! | `span/beside_log` | exact | -- | An OTLP span. |
 //! | `span/no_wire_form` | exact | -- | OTLP carries the status, its message, `trace_state`, flags, and dropped counts. |
 //! | `event/attributes_only` | skipped | `logit.output.events.skipped{reason=no_payload}` | An event with no metric, log, or span has no OTLP signal and isn't sent. |
 //! | `event/string_only` | skipped | `logit.output.events.skipped{reason=no_payload}` | An InfluxDB point whose fields are all strings has no OTLP signal and isn't sent, so its fields are lost. |
