@@ -49,15 +49,17 @@
 //! [`syslog_severity_of`] is the fallback for a log record that didn't come from `syslog_in`.
 //!
 //! **RFC 3164's TAG is never absent.** With no `syslog.tag` and no `app_name:`, it's `service.name`
-//! on the event, else on the batch resource, else [`DEFAULT_RFC3164_TAG`] (`logit`), sanitized as
-//! a configured TAG is ([`resolve_app_name`]). `syslog_in` reads a HOSTNAME only before a
-//! TAG-shaped token (`logit_proto::syslog`'s "The RFC 3164 header"), so a TAG-less message would
-//! read back with its HOSTNAME at the front of MSG and no PID. The fallback TAG is a permitted
-//! normalization of the pair under `docs/adr/lossless-transit.md`, beside the default facility
-//! and HOSTNAME: the sink fills a header field the event didn't carry. A TAG still reads back as
-//! one only when its characters are in `syslog_in`'s TAG class (letters, digits, `_`, `-`, `.`,
-//! `/`); this sink doesn't narrow a configured or carried TAG to that class. RFC 5424's APP-NAME
-//! keeps its NILVALUE `-`, since its header fields are positional.
+//! on the event, else on the batch resource, else [`DEFAULT_RFC3164_TAG`] (`logit`)
+//! ([`resolve_app_name`]). `syslog_in` reads a HOSTNAME only before a TAG-shaped token
+//! (`logit_proto::syslog`'s "The RFC 3164 header"), so a TAG-less message would read back with its
+//! HOSTNAME at the front of MSG and no PID. A fallback TAG is narrowed to `syslog_in`'s TAG class
+//! (letters, digits, `_`, `-`, `.`, `/`, every other character `_`; [`sanitize_3164_tag_name`]),
+//! so it always reads back as a TAG. A carried `syslog.tag` or a configured `app_name:` is the
+//! operator's and keeps [`sanitize_3164_token`]'s wider set, so one with, say, an `@` still reads
+//! back as part of MSG. The fallback TAG is a permitted normalization of the pair under
+//! `docs/adr/lossless-transit.md`, beside the default facility and HOSTNAME: the sink fills a
+//! header field the event didn't carry. RFC 5424's APP-NAME keeps its NILVALUE `-`, since its
+//! header fields are positional.
 //!
 //! **PROCID** is the standard `process.pid` on the event, else on the batch resource, rendered as
 //! decimal; else the `syslog.pid` string `syslog_in` leaves for a PROCID that wasn't canonical
@@ -283,6 +285,8 @@
 //! | `attributes/splunk_envelope` | lost | structural | Syslog has no resource and no field for Splunk's envelope, so it's left off. |
 //! | `attributes/syslog_facility` | normalized | `default_facility` | A log with no `syslog.facility` leaves with the sink's `facility:`, `local0` by default, as PRI's facility, which syslog_in reads back as `syslog.facility`. |
 //! | `attributes/no_host` | normalized | `default_host` | A log with no host leaves with the sink's `hostname:`, else the process hostname, as HOSTNAME, which syslog_in reads back as `host.name`. |
+//! | `attributes/default_tag`, under `format: rfc3164` | normalized | `default_tag` | Under RFC 3164, a log with no `syslog.tag` and no `app_name:` leaves with its `service.name`, else its resource's, else `logit`, as its TAG, narrowed to letters, digits, `_`, `-`, `.`, and `/`, which syslog_in reads back as `syslog.tag`. |
+//! | `attributes/default_tag`, otherwise | exact | -- | Under RFC 5424, a log with no `syslog.tag` leaves with APP-NAME `-` and reads back with none. |
 //! | `attributes/log_status` | exact | -- | The severity is PRI's; no `status` attribute is written. |
 //! | `attributes/log_severity_fields` | exact | -- | The severity is PRI's; no `otel.log.severity.*` attribute is written. |
 //! | `attributes/span_kind` | exact | -- | A span isn't written, so no `span.kind` attribute is. |
@@ -581,7 +585,7 @@ impl SyslogEncoder {
                 attrs,
                 event.timestamp,
                 hostname,
-                app_name,
+                app_name.map(|a| a.text),
                 pid,
                 msgid,
                 self.structured_data.as_ref(),
@@ -755,9 +759,9 @@ fn resolve_str<'a>(attrs: &'a AttrMap, key: &str) -> Option<&'a str> {
 /// no `app_name:`.
 pub const DEFAULT_RFC3164_TAG: &str = "logit";
 
-/// APP-NAME, or RFC 3164's TAG: `syslog.tag`, then the configured `app_name:`. Under RFC 3164 it
-/// falls back to `service.name` on the event, else on the batch resource, then
-/// [`DEFAULT_RFC3164_TAG`], so every message has a TAG:
+/// APP-NAME, or RFC 3164's TAG, and whether it's RFC 3164's fallback: `syslog.tag`, then the
+/// configured `app_name:`. Under RFC 3164 it falls back to `service.name` on the event, else on
+/// the batch resource, then [`DEFAULT_RFC3164_TAG`], so every message has a TAG:
 /// `syslog_in` reads a HOSTNAME only before a TAG-shaped token, so a TAG-less message would read
 /// back with its HOSTNAME as the start of MSG (module doc's "Header-field precedence").
 fn resolve_app_name<'a>(
@@ -765,17 +769,28 @@ fn resolve_app_name<'a>(
     attrs: &'a AttrMap,
     resource: &'a AttrMap,
     default: Option<&'a str>,
-) -> Option<&'a str> {
+) -> Option<AppName<'a>> {
     let app_name = resolve_str(attrs, "syslog.tag").or(default);
-    match format {
-        Format::Rfc5424 => app_name,
-        Format::Rfc3164 => Some(
-            app_name
-                .or_else(|| resolve_str(attrs, SERVICE_NAME))
-                .or_else(|| resolve_str(resource, SERVICE_NAME))
-                .unwrap_or(DEFAULT_RFC3164_TAG),
-        ),
+    if let Some(text) = app_name {
+        return Some(AppName { text, fallback: false });
     }
+    match format {
+        Format::Rfc5424 => None,
+        Format::Rfc3164 => {
+            let text = resolve_str(attrs, SERVICE_NAME)
+                .or_else(|| resolve_str(resource, SERVICE_NAME))
+                .unwrap_or(DEFAULT_RFC3164_TAG);
+            Some(AppName { text, fallback: true })
+        }
+    }
+}
+
+/// [`resolve_app_name`]'s result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AppName<'a> {
+    text: &'a str,
+    /// RFC 3164's fallback TAG, which [`sanitize_3164_tag_name`] narrows.
+    fallback: bool,
 }
 
 /// A PROCID: a decimal number, or the text of a non-numeric one (module doc's "PROCID" note).
@@ -912,7 +927,7 @@ fn write_rfc3164_header(
     attrs: &AttrMap,
     event_timestamp: i64,
     hostname: Option<&str>,
-    tag: Option<&str>,
+    tag: Option<AppName<'_>>,
     pid: Option<Pid<'_>>,
 ) {
     let _ = write!(out, "<{pri}>");
@@ -925,7 +940,7 @@ fn write_rfc3164_header(
         }
     }
     if let Some(t) = tag {
-        sanitize_3164_token(scratch, t, HeaderField::AppName.max_len(Format::Rfc3164));
+        sanitize_3164_tag(scratch, t);
         if !scratch.is_empty() {
             out.push(' ');
             out.push_str(scratch);
@@ -1004,6 +1019,31 @@ fn sanitize_3164_token(scratch: &mut String, s: &str, max_len: usize) {
         }
         let forbidden = matches!(c, ':' | '[' | ']');
         scratch.push(if is_printusascii(c) && !forbidden { c } else { '_' });
+    }
+}
+
+/// A TAG as [`write_rfc3164_header`] writes it: a fallback through [`sanitize_3164_tag_name`],
+/// anything else through [`sanitize_3164_token`], each capped at RFC 3164's 32 characters.
+fn sanitize_3164_tag(scratch: &mut String, tag: AppName<'_>) {
+    let max_len = HeaderField::AppName.max_len(Format::Rfc3164);
+    if tag.fallback {
+        sanitize_3164_tag_name(scratch, tag.text, max_len);
+    } else {
+        sanitize_3164_token(scratch, tag.text, max_len);
+    }
+}
+
+/// `s` narrowed to the characters `logit_proto::syslog::is_tag_shaped` accepts in a TAG's name
+/// (ASCII letters and digits, `_`, `-`, `.`, `/`), every other character `_`, so `syslog_in`
+/// reads the token as a TAG.
+fn sanitize_3164_tag_name(scratch: &mut String, s: &str, max_len: usize) {
+    scratch.clear();
+    for c in s.chars() {
+        if scratch.len() >= max_len {
+            break;
+        }
+        let allowed = c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/');
+        scratch.push(if allowed { c } else { '_' });
     }
 }
 
@@ -1429,7 +1469,14 @@ pub fn wire_app_name(
     default: Option<&str>,
 ) -> Option<String> {
     let app_name = resolve_app_name(format, attrs, resource, default)?;
-    Some(wire_header_field(format, HeaderField::AppName, app_name)).filter(|a| !a.is_empty())
+    let mut out = String::new();
+    match format {
+        Format::Rfc5424 => {
+            sanitize_5424_field(&mut out, app_name.text, HeaderField::AppName.max_len(format))
+        }
+        Format::Rfc3164 => sanitize_3164_tag(&mut out, app_name),
+    }
+    Some(out).filter(|a| !a.is_empty())
 }
 
 /// The PROCID [`SyslogEncoder`] resolves under `format` for an event with attributes `attrs` in a
@@ -1996,8 +2043,8 @@ mod tests {
         assert_eq!(msgs[0], "<134>Jan  1 00:00:00 logit: hi");
     }
 
-    /// `service.name` is the TAG when there's no `syslog.tag` and no `app_name:`, sanitized as a
-    /// configured TAG is, and loses to either.
+    /// `service.name` is the TAG when there's no `syslog.tag` and no `app_name:`, narrowed to
+    /// `syslog_in`'s TAG class, and loses to either.
     #[test]
     fn rfc3164_tag_falls_back_to_service_name() {
         let service = |extra: &[(&str, &str)]| {
@@ -2043,6 +2090,35 @@ mod tests {
         SyslogEncoder::new(Format::Rfc3164, 16).encode_into(&batch, &mut out);
         let msg = String::from_utf8(out.iter().next().unwrap().to_vec()).unwrap();
         assert_eq!(msg, "<134>Jan  1 00:00:00 from-event: hi");
+    }
+
+    /// A fallback TAG is narrowed to `syslog_in`'s TAG class and capped at 32 characters, so
+    /// `syslog_in` reads it back as `syslog.tag` with the HOSTNAME before it intact; a carried
+    /// `syslog.tag` keeps its `@`.
+    #[test]
+    fn a_fallback_tag_is_narrowed_to_the_tag_class_and_reads_back_as_a_tag() {
+        let event = |key: &str, value: &str| {
+            let mut attrs = AttrMap::new();
+            attrs.insert(HOST_NAME, Value::str("myhost"));
+            attrs.insert(key, Value::str(value));
+            log_event_with_attrs(0, Value::str("hi there"), None, attrs)
+        };
+        let mut encoder = SyslogEncoder::new(Format::Rfc3164, 16);
+        let (msgs, _) = encode_with(&mut encoder, vec![event(SERVICE_NAME, "api@v2")]);
+        assert_eq!(msgs[0], "<134>Jan  1 00:00:00 myhost api_v2: hi there");
+        let mut decoder = SyslogDecoder::new(Arc::new(Resource::default()));
+        let decoded = decoder.decode(bytes::Bytes::from(msgs[0].clone())).expect("should decode");
+        let attrs = &decoded.events[0].attributes;
+        assert_eq!(attrs.get("syslog.tag").and_then(Value::as_str), Some("api_v2"));
+        assert_eq!(attrs.get(HOST_NAME).and_then(Value::as_str), Some("myhost"));
+        let message = &decoded.events[0].log.as_ref().unwrap().message;
+        assert_eq!(message.as_str(), Some("hi there"));
+
+        let (msgs, _) = encode_with(&mut encoder, vec![event(SERVICE_NAME, &"s".repeat(40))]);
+        assert_eq!(msgs[0], format!("<134>Jan  1 00:00:00 myhost {}: hi there", "s".repeat(32)));
+
+        let (msgs, _) = encode_with(&mut encoder, vec![event("syslog.tag", "api@v2")]);
+        assert_eq!(msgs[0], "<134>Jan  1 00:00:00 myhost api@v2: hi there");
     }
 
     /// RFC 5424's APP-NAME keeps its NILVALUE: `service.name` and `logit` are RFC 3164 fallbacks
