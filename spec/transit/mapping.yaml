@@ -335,8 +335,8 @@ rows:
         class: skipped
         reason: uncounted
         text: >-
-          The sink sends spans alone, so a gauge takes no route and is left off, uncounted, beside a
-          span or alone.
+          The sink sends spans alone, so a gauge beside a span takes no route and is left off,
+          uncounted.
       graphite_out:
         class: exact
         text: A `path value timestamp` line, or a pickled datapoint.
@@ -371,8 +371,8 @@ rows:
         class: skipped
         reason: uncounted
         text: >-
-          The sink sends spans alone, so a gauge takes no route and is left off, uncounted, beside a
-          span or alone.
+          The sink sends spans alone, so a gauge beside a span takes no route and is left off,
+          uncounted.
       graphite_out:
         class: normalized
         reason: f64_value
@@ -2325,6 +2325,16 @@ rows:
           a log, a `container_id:<id>` entry appended to `ddtags`, the Agent's tag for a
           container's logs, which datadog_in keeps in the `ddtags` string, so no `container.id`
           reads back.
+      datadog_trace_out:
+        - when: {version: v0.4}
+          class: exact
+          text: >-
+            On the resource, the `Datadog-Container-ID` request header, which datadog_trace_in reads
+            back as the resource's `container.id`.
+        - class: exact
+          text: >-
+            On the resource, the `TracerPayload`'s `container_id`, which datadog_trace_in reads back
+            as the resource's `container.id`.
       graphite_out:
         - when: {tags: drop}
           class: lost
@@ -3764,9 +3774,8 @@ rows:
           reason: resource_as_tag
           text: >-
             Merged into every span's `meta` or `metrics`, so it reads back as an event attribute;
-            `host.name`, `deployment.environment.name`, `service.version`, and `container.id` are
-            the `TracerPayload`'s `hostname`, `env`, `app_version`, and `container_id`, read back on
-            the resource.
+            `host.name`, `deployment.environment.name`, and `service.version` are the
+            `TracerPayload`'s `hostname`, `env`, and `app_version`, read back on the resource.
       graphite_out:
         - when: {tags: drop}
           class: lost
@@ -4105,10 +4114,10 @@ rows:
           The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A
           `format: text` record writes no span (`span/alone`), so no field of one is compared.
   # A `_logit.datadog.tracer.*` or `_logit.datadog.agent.*` resource attribute of a span's batch:
-  # `datadog_tracer_resource` for one a `TracerPayload` or `AgentPayload` field carries,
+  # `datadog_tracer_resource` for a tracer carrier a `TracerPayload` field carries,
   # `datadog_tracer_headers` for one only a tracer request header carries (the interpreter and its
   # vendor, the entity ID, the external environment, the two client-computed flags, and the two
-  # dropped P0 counts).
+  # dropped P0 counts), and `datadog_agent_resource` for an `AgentPayload` field.
   - kind: attributes
     feature: datadog_tracer_resource
     cells:
@@ -4116,33 +4125,27 @@ rows:
         class: lost
         reason: structural
         text: >-
-          OTLP has no field for a `TracerPayload`'s or an `AgentPayload`'s fields, and a `_logit.`
-          carrier is private, so it's left off.
+          OTLP has no field for a `TracerPayload`'s fields, and a `_logit.` carrier is private, so
+          it's left off.
       datadog_out:
         class: exact
-        text: >-
-          The `TracerPayload`'s or `AgentPayload`'s field, read back into the carrier.
+        text: The `TracerPayload`'s field, read back into the carrier.
       datadog_trace_out:
         - when: {version: v0.4}
           class: lost
           counter: logit.output.spans.degraded{reason=no_wire_form}
           text: >-
-            v0.4 has no `TracerPayload`: a `_logit.datadog.tracer.*` carrier a `Datadog-Meta-*`
-            request header restores reads back into the carrier, and every other one (`runtime_id`,
-            `tags`, `container_debug`), and every `_logit.datadog.agent.*` carrier, is left off,
-            counted once per request.
-        - class: lost
-          counter: logit.output.spans.degraded{reason=no_wire_form}
-          text: >-
-            A `_logit.datadog.tracer.*` carrier is the `TracerPayload`'s field, read back into the
-            carrier. The trace API has no `AgentPayload`, so a `_logit.datadog.agent.*` carrier is
+            v0.4 has no `TracerPayload`: a carrier a `Datadog-Meta-*` request header restores reads
+            back into the carrier, and every other one (`runtime_id`, `tags`, `container_debug`) is
             left off, counted once per request.
+        - class: exact
+          text: The `TracerPayload`'s field, read back into the carrier.
       splunk_hec_out:
         class: lost
         reason: structural
         text: >-
-          HEC has no field for a `TracerPayload`'s or an `AgentPayload`'s fields, and a `_logit.`
-          carrier is private, so it's left off.
+          HEC has no field for a `TracerPayload`'s fields, and a `_logit.` carrier is private, so
+          it's left off.
       kafka_out:
         class: exact
         text: >-
@@ -4173,6 +4176,35 @@ rows:
         reason: structural
         text: >-
           HEC has no field for a tracer request header, and a `_logit.` carrier is private, so
+          it's left off.
+      kafka_out:
+        class: exact
+        text: >-
+          The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A
+          `format: text` record writes no span (`span/alone`), so no field of one is compared.
+  - kind: attributes
+    feature: datadog_agent_resource
+    cells:
+      otlp_out:
+        class: lost
+        reason: structural
+        text: >-
+          OTLP has no field for an `AgentPayload`'s fields, and a `_logit.` carrier is private, so
+          it's left off.
+      datadog_out:
+        class: exact
+        text: The `AgentPayload`'s field, read back into the carrier.
+      datadog_trace_out:
+        class: lost
+        counter: logit.output.spans.degraded{reason=no_wire_form}
+        text: >-
+          The trace API has no `AgentPayload` under either `version:`, so the carrier is left off,
+          counted once per request.
+      splunk_hec_out:
+        class: lost
+        reason: structural
+        text: >-
+          HEC has no field for an `AgentPayload`'s fields, and a `_logit.` carrier is private, so
           it's left off.
       kafka_out:
         class: exact
@@ -4721,8 +4753,8 @@ rows:
         class: skipped
         reason: uncounted
         text: >-
-          The sink sends spans alone, so a log takes no route and is left off, uncounted, beside a
-          span or alone.
+          The sink sends spans alone, so a log beside a span takes no route and is left off,
+          uncounted.
       graphite_out:
         class: skipped
         counter: logit.output.events.skipped{reason=no_metrics}
@@ -6187,8 +6219,7 @@ rows:
         counter: logit.output.spans.degraded{reason=json_text}
         text: >-
           Each link's ids, and its attributes as strings, as the span's `span_links`, read back as
-          string attributes; a map, array, or null attribute is JSON text (`null` for a null),
-          counted.
+          string attributes; a map or array attribute is JSON text, counted.
       splunk_hec_out:
         class: exact
         text: >-

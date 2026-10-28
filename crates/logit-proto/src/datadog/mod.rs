@@ -289,8 +289,9 @@
 //! | `attributes/datadog_span_identity` | exact | -- | The span's `service`, `resource`, or `type` field, read back as the attribute. |
 //! | `attributes/datadog_span_marks` | exact | -- | A `metrics` entry for a number and a `meta` entry for a string, read back as the attribute. |
 //! | `attributes/datadog_carrier_span` | exact | -- | The chunk's `priority`, `origin`, `droppedTrace`, or `tags`, or the span's `error`, read back into the carrier. |
-//! | `attributes/datadog_tracer_resource` | exact | -- | The `TracerPayload`'s or `AgentPayload`'s field, read back into the carrier. |
+//! | `attributes/datadog_tracer_resource` | exact | -- | The `TracerPayload`'s field, read back into the carrier. |
 //! | `attributes/datadog_tracer_headers` | lost | `logit.output.spans.degraded{reason=no_wire_form}` | An `AgentPayload` has no field for a tracer request header and the intake takes no such header, so the carrier is left off, counted once per request body. |
+//! | `attributes/datadog_agent_resource` | exact | -- | The `AgentPayload`'s field, read back into the carrier. |
 //! | `attributes/syslog_header` | normalized | `u64_as_int` | A top-level key of the log object; a `u64` `syslog.facility` or `process.pid` is a JSON number, which datadog_in reads back as an `i64`. |
 //! | `attributes/syslog_msgid` | exact | -- | A top-level key of the log object. |
 //! | `attributes/syslog_sd` | exact | -- | A JSON object in the log object, read back as itself. |

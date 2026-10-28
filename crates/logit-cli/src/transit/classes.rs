@@ -85,9 +85,9 @@
 //! for each of their fields it carries: a span event's non-`Str` name `event_name_structured`,
 //! and an item attribute of a [`Nest`] that nest's row, out of `events` and `links`. Its
 //! attributes reach `span_numeric`, `datadog_span_identity`, `datadog_span_marks`, or
-//! `datadog_carrier_span` ahead of the value rows, and its resource's Datadog tracer and Agent
-//! carriers `datadog_tracer_headers` when only a tracer request header carries one, else
-//! `datadog_tracer_resource`. An event
+//! `datadog_carrier_span` ahead of the value rows, and its resource's Datadog tracer carriers
+//! `datadog_tracer_headers` when only a tracer request header carries one, else
+//! `datadog_tracer_resource`, and its Agent carriers `datadog_agent_resource`. An event
 //! with no metric, log, or span is a record of kind `event` that reaches
 //! `event/string_only` when it carries a non-empty `_logit.influxdb.measurement`, else
 //! `event/attributes_only`, and its attribute rows. A record reaches an `attributes` field row for
@@ -787,12 +787,6 @@ impl Spelling {
         if matches!(self, Spelling::Datadog | Spelling::DatadogTrace) && rec.kind == "span" {
             return Some(datadog::span_value(value));
         }
-        // A tag writes an `F64` with Rust's `Display`, so `1.0` is `1`; a log's JSON keeps it.
-        if self == Spelling::Datadog && datadog::Route::of(rec) != datadog::Route::Log {
-            if let Some(n) = value.as_number().filter(|n| n.is_f64()) {
-                return Some(n.as_f64().unwrap_or_default().to_string());
-            }
-        }
         if self == (Spelling::Statsd { dogstatsd: true }) && key == "host" {
             let kept = statsd::host_kept(rec, value)?;
             return Some(self.value(&kept, tags));
@@ -824,6 +818,12 @@ impl Spelling {
         }
         if unified::tag_is_omitted(self, rec, key, value) {
             return None;
+        }
+        // A tag writes an `F64` with Rust's `Display`, so `1.0` is `1`; a log's JSON keeps it.
+        if self == Spelling::Datadog && datadog::Route::of(rec) != datadog::Route::Log {
+            if let Some(n) = value.as_number().filter(|n| n.is_f64()) {
+                return Some(n.as_f64().unwrap_or_default().to_string());
+            }
         }
         if self == Spelling::Graphite {
             return graphite_value(value, tags);
@@ -3153,9 +3153,11 @@ fn field_rows_under(
         }
     };
     let tracer_resource = |key: &str| {
-        let tracer =
-            key.starts_with("_logit.datadog.tracer.") || key.starts_with("_logit.datadog.agent.");
-        if rec.kind != "span" || !tracer {
+        if rec.kind != "span" {
+            None
+        } else if key.starts_with("_logit.datadog.agent.") {
+            Some("datadog_agent_resource")
+        } else if !key.starts_with("_logit.datadog.tracer.") {
             None
         } else if logit_proto::datadog::traces::is_tracer_header_only_attr(key) {
             Some("datadog_tracer_headers")

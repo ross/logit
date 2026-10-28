@@ -189,6 +189,7 @@
 //! | `attributes/datadog_carrier_span` | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
 //! | `attributes/datadog_tracer_resource` | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
 //! | `attributes/datadog_tracer_headers` | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
+//! | `attributes/datadog_agent_resource` | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
 //! | `attributes/syslog_header`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
 //! | `attributes/syslog_header`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
 //! | `attributes/syslog_msgid`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |

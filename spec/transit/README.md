@@ -200,8 +200,8 @@ rewritten name, is counted. The table's schema accepts `reason: uncounted` only 
 `crates/logit-cli/src/transit/mapping.rs`'s `UNCOUNTED_ALLOWED` names, whose doc says which rule
 each follows. It has eight entries. Five follow the same ADR's amendment "an ignored signal, and
 a format the config selects": a sink ignores a signal it has no wire for, such as a log beside
-metrics, uncounted, at any sink, and `datadog_trace_out`, whose one signal is spans, ignores every
-log and gauge it reaches. Two are a sink finding: `otlp_out` writes a span name or a span
+metrics, uncounted, at any sink, and `datadog_trace_out`, whose one signal is spans, ignores a
+log or a gauge beside a span. Two are a sink finding: `otlp_out` writes a span name or a span
 event name that isn't a `Str` as `""` (`span/name_structured`, `span/event_name_structured`).
 One is a `_logit.datadog.*` carrier `datadog_out`'s log, event, and service-check routes have no
 field for. Under that amendment too, `syslog_out`'s leave-off of every attribute
