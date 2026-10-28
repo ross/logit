@@ -730,7 +730,9 @@ type Derived = (Option<&'static str>, &'static str, String);
 /// record reaches them, and one that derives nothing for a row reads it `exact`.
 fn derived_rows(rec: &Rec) -> Vec<&'static str> {
     let mut rows = Vec::new();
-    // `syslog_out`'s rows don't depend on its config.
+    // Under RFC 5424 `syslog_out` derives every row any of its configs does. Under RFC 3164 a log
+    // with no TAG derives no `no_host`, since syslog_in reads its HOSTNAME into MSG, and that
+    // row's cell there reads it `exact`.
     let syslog = Spelling::Syslog { rfc3164: false, facility: 0, structured_data: None };
     for spelling in [Spelling::Datadog, syslog] {
         for (row, _, _) in spelling.derived(rec) {

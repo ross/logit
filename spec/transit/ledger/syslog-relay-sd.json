@@ -8,7 +8,7 @@
     {"sink":"syslog_out","row":"attributes/log_service_field","cell":1,"observed":["normalized"]},
     {"sink":"syslog_out","row":"attributes/log_status","cell":0,"observed":["exact"]},
     {"sink":"syslog_out","row":"attributes/map_value","cell":1,"observed":["normalized"]},
-    {"sink":"syslog_out","row":"attributes/no_host","cell":0,"observed":["normalized"]},
+    {"sink":"syslog_out","row":"attributes/no_host","cell":1,"observed":["normalized"]},
     {"sink":"syslog_out","row":"attributes/number_value","cell":1,"observed":["normalized"]},
     {"sink":"syslog_out","row":"attributes/sd_id_collision","cell":0,"observed":["lost"]},
     {"sink":"syslog_out","row":"attributes/sd_name_unsafe","cell":0,"observed":["lost"]},

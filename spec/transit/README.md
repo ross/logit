@@ -167,8 +167,9 @@ counter would add anything
 rewritten name, is counted. The table's schema accepts `reason: uncounted`, the sink's behavior
 as it stands, only on the cells `crates/logit-cli/src/transit/mapping.rs`'s `UNCOUNTED_ALLOWED`
 names: span payloads, which aren't classified yet, log records at a sink other than `otlp_out`,
-`datadog_out`, `syslog_out`, and `statsd_out`; `datadog_out`'s carrier on a log; and the attributes
-outside its header fields that `syslog_out` leaves off a log.
+`datadog_out`, `syslog_out`, and `statsd_out`; `datadog_out`'s carrier on a log; and
+`syslog_out`'s attribute rows, since it leaves every attribute outside its header fields off a
+log by one mechanism, and under `structured_data:` writes a `Bytes` one as its length.
 When a sink's behavior depends on its config, the sink's entry is a list: each cell but the last
 has a `when:` map of config fields, the first that matches the flow's sink config applies, and
 the last applies otherwise:
