@@ -1196,6 +1196,7 @@ flow_tests! {
     otlp_logs_to_datadog => "otlp-logs-to-datadog",
     otlp_logs_to_syslog => "otlp-logs-to-syslog",
     otlp_logs_to_syslog_rfc3164 => "otlp-logs-to-syslog-rfc3164",
+    otlp_logs_to_syslog_sd => "otlp-logs-to-syslog-sd",
     otlp_relay => "otlp-relay",
     otlp_to_datadog => "otlp-to-datadog",
     otlp_to_datadog_counters => "otlp-to-datadog-counters",
@@ -1232,6 +1233,7 @@ flow_tests! {
     statsd_to_graphite_expand => "statsd-to-graphite-expand",
     syslog_relay => "syslog-relay",
     syslog_relay_rfc3164 => "syslog-relay-rfc3164",
+    syslog_relay_sd => "syslog-relay-sd",
     syslog_to_datadog => "syslog-to-datadog",
     syslog_to_otlp => "syslog-to-otlp",
 }

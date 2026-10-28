@@ -178,34 +178,49 @@
 //! | Row | Class | Reason or counter | What a consumer sees |
 //! |---|---|---|---|
 //! | `attributes/string_value`, under `format: rfc3164` | lost | structural | RFC 3164 has no structured data, so an attribute outside the header fields is left off. |
+//! | `attributes/string_value`, under `format: rfc5424` and under `structured_data: {"sd_id":"transit@32473"}` | normalized | `structured_data` | Under `structured_data:`, a PARAM of the opt-in SD-ELEMENT, which syslog_in reads back as a string inside `syslog.sd`, under the SD-ID and the attribute's key. The PARAM-VALUE is the string. |
 //! | `attributes/string_value`, otherwise | lost | uncounted | An attribute outside the header fields is left off, uncounted; under RFC 5424, `structured_data:` writes every public event attribute as an SD-PARAM, which syslog_in reads back inside `syslog.sd`. |
 //! | `attributes/host_beside_host_name`, under `format: rfc3164` | lost | structural | RFC 3164 has no structured data, so an attribute outside the header fields is left off. |
+//! | `attributes/host_beside_host_name`, under `format: rfc5424` and under `structured_data: {"sd_id":"transit@32473"}` | normalized | `structured_data` | Under `structured_data:`, a PARAM of the opt-in SD-ELEMENT, which syslog_in reads back as a string inside `syslog.sd`, under the SD-ID and the attribute's key. The PARAM-VALUE is the string. |
 //! | `attributes/host_beside_host_name`, otherwise | lost | uncounted | An attribute outside the header fields is left off, uncounted; under RFC 5424, `structured_data:` writes every public event attribute as an SD-PARAM, which syslog_in reads back inside `syslog.sd`. |
 //! | `attributes/hostname`, under `format: rfc3164` | lost | structural | RFC 3164 has no structured data, so an attribute outside the header fields is left off. |
+//! | `attributes/hostname`, under `format: rfc5424` and under `structured_data: {"sd_id":"transit@32473"}` | normalized | `structured_data` | Under `structured_data:`, a PARAM of the opt-in SD-ELEMENT, which syslog_in reads back as a string inside `syslog.sd`, under the SD-ID and the attribute's key. The PARAM-VALUE is the string. |
 //! | `attributes/hostname`, otherwise | lost | uncounted | An attribute outside the header fields is left off, uncounted; under RFC 5424, `structured_data:` writes every public event attribute as an SD-PARAM, which syslog_in reads back inside `syslog.sd`. |
 //! | `attributes/log_service`, under `format: rfc3164` | lost | structural | RFC 3164 has no structured data, so an attribute outside the header fields is left off. |
+//! | `attributes/log_service`, under `format: rfc5424` and under `structured_data: {"sd_id":"transit@32473"}` | normalized | `structured_data` | Under `structured_data:`, a PARAM of the opt-in SD-ELEMENT, which syslog_in reads back as a string inside `syslog.sd`, under the SD-ID and the attribute's key. The PARAM-VALUE is the string. |
 //! | `attributes/log_service`, otherwise | lost | uncounted | An attribute outside the header fields is left off, uncounted; under RFC 5424, `structured_data:` writes every public event attribute as an SD-PARAM, which syslog_in reads back inside `syslog.sd`. |
 //! | `attributes/log_service_field`, under `format: rfc3164` | lost | structural | RFC 3164 has no structured data, so an attribute outside the header fields is left off. |
+//! | `attributes/log_service_field`, under `format: rfc5424` and under `structured_data: {"sd_id":"transit@32473"}` | normalized | `structured_data` | Under `structured_data:`, a PARAM of the opt-in SD-ELEMENT, which syslog_in reads back as a string inside `syslog.sd`, under the SD-ID and the attribute's key. The PARAM-VALUE is the string. |
 //! | `attributes/log_service_field`, otherwise | lost | uncounted | An attribute outside the header fields is left off, uncounted; under RFC 5424, `structured_data:` writes every public event attribute as an SD-PARAM, which syslog_in reads back inside `syslog.sd`. |
 //! | `attributes/container_id`, under `format: rfc3164` | lost | structural | RFC 3164 has no structured data, so an attribute outside the header fields is left off. |
+//! | `attributes/container_id`, under `format: rfc5424` and under `structured_data: {"sd_id":"transit@32473"}` | normalized | `structured_data` | Under `structured_data:`, a PARAM of the opt-in SD-ELEMENT, which syslog_in reads back as a string inside `syslog.sd`, under the SD-ID and the attribute's key. The PARAM-VALUE is the string. |
 //! | `attributes/container_id`, otherwise | lost | uncounted | An attribute outside the header fields is left off, uncounted; under RFC 5424, `structured_data:` writes every public event attribute as an SD-PARAM, which syslog_in reads back inside `syslog.sd`. |
 //! | `attributes/service_identity`, under `format: rfc3164` | lost | structural | RFC 3164 has no structured data, so an attribute outside the header fields is left off. |
+//! | `attributes/service_identity`, under `format: rfc5424` and under `structured_data: {"sd_id":"transit@32473"}` | normalized | `structured_data` | Under `structured_data:`, a PARAM of the opt-in SD-ELEMENT, which syslog_in reads back as a string inside `syslog.sd`, under the SD-ID and the attribute's key. The PARAM-VALUE is the string. |
 //! | `attributes/service_identity`, otherwise | lost | uncounted | An attribute outside the header fields is left off, uncounted; under RFC 5424, `structured_data:` writes every public event attribute as an SD-PARAM, which syslog_in reads back inside `syslog.sd`. |
 //! | `attributes/service_tag`, under `format: rfc3164` | lost | structural | RFC 3164 has no structured data, so an attribute outside the header fields is left off. |
+//! | `attributes/service_tag`, under `format: rfc5424` and under `structured_data: {"sd_id":"transit@32473"}` | normalized | `structured_data` | Under `structured_data:`, a PARAM of the opt-in SD-ELEMENT, which syslog_in reads back as a string inside `syslog.sd`, under the SD-ID and the attribute's key. The PARAM-VALUE is the string. |
 //! | `attributes/service_tag`, otherwise | lost | uncounted | An attribute outside the header fields is left off, uncounted; under RFC 5424, `structured_data:` writes every public event attribute as an SD-PARAM, which syslog_in reads back inside `syslog.sd`. |
 //! | `attributes/service_tag_beside_key`, under `format: rfc3164` | lost | structural | RFC 3164 has no structured data, so an attribute outside the header fields is left off. |
+//! | `attributes/service_tag_beside_key`, under `format: rfc5424` and under `structured_data: {"sd_id":"transit@32473"}` | normalized | `structured_data` | Under `structured_data:`, a PARAM of the opt-in SD-ELEMENT, which syslog_in reads back as a string inside `syslog.sd`, under the SD-ID and the attribute's key. The PARAM-VALUE is the string. |
 //! | `attributes/service_tag_beside_key`, otherwise | lost | uncounted | An attribute outside the header fields is left off, uncounted; under RFC 5424, `structured_data:` writes every public event attribute as an SD-PARAM, which syslog_in reads back inside `syslog.sd`. |
 //! | `attributes/bool_value`, under `format: rfc3164` | lost | structural | RFC 3164 has no structured data, so an attribute outside the header fields is left off. |
+//! | `attributes/bool_value`, under `format: rfc5424` and under `structured_data: {"sd_id":"transit@32473"}` | normalized | `structured_data` | Under `structured_data:`, a PARAM of the opt-in SD-ELEMENT, which syslog_in reads back as a string inside `syslog.sd`, under the SD-ID and the attribute's key. The PARAM-VALUE is `true` or `false`. |
 //! | `attributes/bool_value`, otherwise | lost | uncounted | An attribute outside the header fields is left off, uncounted; under RFC 5424, `structured_data:` writes every public event attribute as an SD-PARAM, which syslog_in reads back inside `syslog.sd`. |
 //! | `attributes/number_value`, under `format: rfc3164` | lost | structural | RFC 3164 has no structured data, so an attribute outside the header fields is left off. |
+//! | `attributes/number_value`, under `format: rfc5424` and under `structured_data: {"sd_id":"transit@32473"}` | normalized | `structured_data` | Under `structured_data:`, a PARAM of the opt-in SD-ELEMENT, which syslog_in reads back as a string inside `syslog.sd`, under the SD-ID and the attribute's key. The PARAM-VALUE is its decimal text, an `f64` in Rust's shortest form. |
 //! | `attributes/number_value`, otherwise | lost | uncounted | An attribute outside the header fields is left off, uncounted; under RFC 5424, `structured_data:` writes every public event attribute as an SD-PARAM, which syslog_in reads back inside `syslog.sd`. |
 //! | `attributes/array_value`, under `format: rfc3164` | lost | structural | RFC 3164 has no structured data, so an attribute outside the header fields is left off. |
+//! | `attributes/array_value`, under `format: rfc5424` and under `structured_data: {"sd_id":"transit@32473"}` | normalized | `structured_data` | Under `structured_data:`, a PARAM of the opt-in SD-ELEMENT, which syslog_in reads back as a string inside `syslog.sd`, under the SD-ID and the attribute's key. The PARAM-VALUE is one PARAM per element, each element's text, which syslog_in reads back as an array of strings, or one string for a one-element array. |
 //! | `attributes/array_value`, otherwise | lost | uncounted | An attribute outside the header fields is left off, uncounted; under RFC 5424, `structured_data:` writes every public event attribute as an SD-PARAM, which syslog_in reads back inside `syslog.sd`. |
 //! | `attributes/map_value`, under `format: rfc3164` | lost | structural | RFC 3164 has no structured data, so an attribute outside the header fields is left off. |
+//! | `attributes/map_value`, under `format: rfc5424` and under `structured_data: {"sd_id":"transit@32473"}` | normalized | `structured_data` | Under `structured_data:`, a PARAM of the opt-in SD-ELEMENT, which syslog_in reads back as a string inside `syslog.sd`, under the SD-ID and the attribute's key. The PARAM-VALUE is its inline `{k="v"}` text. |
 //! | `attributes/map_value`, otherwise | lost | uncounted | An attribute outside the header fields is left off, uncounted; under RFC 5424, `structured_data:` writes every public event attribute as an SD-PARAM, which syslog_in reads back inside `syslog.sd`. |
 //! | `attributes/bytes_value`, under `format: rfc3164` | lost | structural | RFC 3164 has no structured data, so an attribute outside the header fields is left off. |
+//! | `attributes/bytes_value`, under `format: rfc5424` and under `structured_data: {"sd_id":"transit@32473"}` | lost | uncounted | Under `structured_data:`, a PARAM of the opt-in SD-ELEMENT whose PARAM-VALUE is the value's length, `<N bytes>`, so its bytes are left off, uncounted. |
 //! | `attributes/bytes_value`, otherwise | lost | uncounted | An attribute outside the header fields is left off, uncounted; under RFC 5424, `structured_data:` writes every public event attribute as an SD-PARAM, which syslog_in reads back inside `syslog.sd`. |
 //! | `attributes/timestamp_value`, under `format: rfc3164` | lost | structural | RFC 3164 has no structured data, so an attribute outside the header fields is left off. |
+//! | `attributes/timestamp_value`, under `format: rfc5424` and under `structured_data: {"sd_id":"transit@32473"}` | normalized | `structured_data` | Under `structured_data:`, a PARAM of the opt-in SD-ELEMENT, which syslog_in reads back as a string inside `syslog.sd`, under the SD-ID and the attribute's key. The PARAM-VALUE is its RFC 3339 text with nanoseconds. |
 //! | `attributes/timestamp_value`, otherwise | lost | uncounted | An attribute outside the header fields is left off, uncounted; under RFC 5424, `structured_data:` writes every public event attribute as an SD-PARAM, which syslog_in reads back inside `syslog.sd`. |
 //! | `attributes/private_carrier` | lost | structural | A `_logit.` carrier or flag is private and isn't a header field, so it's left off. |
 //! | `attributes/prometheus_target` | lost | structural | A `_logit.` carrier or flag is private and isn't a header field, so it's left off. |
@@ -228,9 +243,12 @@
 //! | `attributes/syslog_msgid`, under `format: rfc3164` | lost | structural | RFC 3164 has no MSGID, so it's left off. |
 //! | `attributes/syslog_msgid`, otherwise | exact | -- | MSGID. |
 //! | `attributes/syslog_sd`, under `format: rfc3164` | lost | structural | RFC 3164 has no STRUCTURED-DATA, so it's left off. |
+//! | `attributes/syslog_sd`, under `format: rfc5424` and under `structured_data: {"sd_id":"transit@32473"}` | normalized | `structured_data` | Under `structured_data:`, the log's own elements are written beside the opt-in SD-ELEMENT, so `syslog.sd` reads back with it added. An element under the configured SD-ID is the log's own, and the opt-in one is left off. |
 //! | `attributes/syslog_sd`, otherwise | exact | -- | STRUCTURED-DATA, its elements and their params in name order. |
 //! | `attributes/syslog_timestamp`, under `format: rfc3164` | lost | structural | Under RFC 3164, an RFC 5424 timestamp is TIMESTAMP in whole seconds with no year or zone, which syslog_in reads back as that text; an RFC 3164 one is written as it is; and a null one has no RFC 3164 form, so TIMESTAMP is the log's timestamp and the attribute is left off. |
 //! | `attributes/syslog_timestamp`, otherwise | lost | structural | An RFC 3164 timestamp has no year or zone to write under RFC 5424, so TIMESTAMP is the log's timestamp and the attribute is left off; an RFC 5424 or null one is written as it is. |
+//! | `attributes/sd_id_collision` | lost | `logit.output.structured_data.omitted{reason=sd_id_collision}` | Under `structured_data:`, a log whose own `syslog.sd` already holds an element under the configured SD-ID keeps its own, and the opt-in SD-ELEMENT is left off, counted once per log: syslog_in refuses a repeated SD-ID. |
+//! | `attributes/sd_name_unsafe` | lost | `logit.output.structured_data.omitted{reason=invalid_sd_name}` | Under `structured_data:`, an attribute key that isn't an RFC 5424 SD-NAME (1 to 32 printable ASCII characters, none of them `=`, space, `]`, or `"`) has no PARAM-NAME, so its PARAM is left off, counted. |
 //! | `attributes/host_name`, under `format: rfc3164` | lost | structural | Under RFC 3164, a log with no `syslog.tag` has no TAG, so syslog_in reads its HOSTNAME as the first word of its message (the `log/header_in_message` row) and reads no `host.name` back. |
 //! | `attributes/host_name`, otherwise | exact | -- | HOSTNAME. |
 //! | `attributes/syslog_facility` | normalized | `default_facility` | A log with no `syslog.facility` leaves with the sink's `facility:`, `local0` by default, as PRI's facility, which syslog_in reads back as `syslog.facility`. |
@@ -933,7 +951,7 @@ fn is_printusascii(c: char) -> bool {
 /// RFC 5424 section 6.3.2's `SD-NAME`: 1 to 32 `PRINTUSASCII` characters excluding `=`, `]`, `"`
 /// (SP is outside `PRINTUSASCII`). Checks SD-IDs, PARAM-NAMEs, and the opt-in `sd_id`. Byte-wise
 /// is exact here: no non-ASCII byte is `PRINTUSASCII`.
-fn is_valid_sd_name(s: &str) -> bool {
+pub fn is_valid_sd_name(s: &str) -> bool {
     (1..=32).contains(&s.len())
         && s.bytes().all(|b| {
             let c = b as char;
@@ -1036,14 +1054,7 @@ fn write_structured_data(
         }
     }
     if let Some(cfg) = structured_data {
-        // `host.name` and `process.pid` are HOSTNAME's and PROCID's keys, so they're header fields like
-        // `syslog.*`, not SD-PARAMs.
-        let is_extra = |key: &str| {
-            !key.starts_with("syslog.")
-                && key != HOST_NAME
-                && key != PROCESS_PID
-                && !crate::attrs::is_private(key)
-        };
+        let is_extra = is_opt_in_param;
         // Checked before the collision, so an event with only `syslog.*` and private attributes,
         // which would emit no opt-in element anyway, isn't counted as a drop.
         let has_extra_attrs = attrs.iter().any(|(sym, _)| is_extra(interner::resolve(sym)));
@@ -1083,6 +1094,16 @@ fn write_structured_data(
     if out.len() == start {
         out.push('-');
     }
+}
+
+/// Whether event attribute `key` is a PARAM of the opt-in `structured_data` element (module doc's
+/// "Opt-in `structured_data`"). `host.name` and `process.pid` are HOSTNAME's and PROCID's keys, so
+/// they're header fields like `syslog.*`, not SD-PARAMs.
+pub fn is_opt_in_param(key: &str) -> bool {
+    !key.starts_with("syslog.")
+        && key != HOST_NAME
+        && key != PROCESS_PID
+        && !crate::attrs::is_private(key)
 }
 
 /// One SD-ELEMENT: `[SD-ID PARAM-NAME="value" ...]`. An invalid `sd_id` skips the whole element
@@ -1359,6 +1380,24 @@ pub fn wire_msgid(format: Format, attrs: &AttrMap) -> Option<String> {
     }
     let msgid = resolve_str(attrs, "syslog.msgid")?;
     Some(wire_header_field(format, HeaderField::MsgId, msgid)).filter(|m| !m.is_empty())
+}
+
+/// The STRUCTURED-DATA field [`SyslogEncoder`] writes under RFC 5424 for an event with attributes
+/// `attrs`, when its opt-in `structured_data.sd_id` is `sd_id`, and the omissions it counts: the
+/// encoder's own pass, `-` where it writes no element.
+pub fn wire_structured_data(attrs: &AttrMap, sd_id: Option<&str>) -> (String, EncodeStats) {
+    let mut out = String::new();
+    let mut stats = EncodeStats::default();
+    let config = sd_id.map(|sd_id| StructuredDataConfig { sd_id: sd_id.to_string() });
+    write_structured_data(
+        &mut out,
+        &mut String::new(),
+        attrs,
+        config.as_ref(),
+        &mut stats,
+        &mut Diagnostics::default(),
+    );
+    (out, stats)
 }
 
 /// Truncates `s` to at most `budget` bytes on a UTF-8 character boundary; `true` if it cut.

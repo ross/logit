@@ -2036,6 +2036,13 @@ rows:
           reason: structural
           text: >-
             RFC 3164 has no structured data, so an attribute outside the header fields is left off.
+        - when: {format: rfc5424, structured_data: {sd_id: transit@32473}}
+          class: normalized
+          reason: structured_data
+          text: >-
+            Under `structured_data:`, a PARAM of the opt-in SD-ELEMENT, which syslog_in reads back
+            as a string inside `syslog.sd`, under the SD-ID and the attribute's key. The PARAM-VALUE
+            is the string.
         - class: lost
           reason: uncounted
           text: >-
@@ -2090,6 +2097,13 @@ rows:
           reason: structural
           text: >-
             RFC 3164 has no structured data, so an attribute outside the header fields is left off.
+        - when: {format: rfc5424, structured_data: {sd_id: transit@32473}}
+          class: normalized
+          reason: structured_data
+          text: >-
+            Under `structured_data:`, a PARAM of the opt-in SD-ELEMENT, which syslog_in reads back
+            as a string inside `syslog.sd`, under the SD-ID and the attribute's key. The PARAM-VALUE
+            is the string.
         - class: lost
           reason: uncounted
           text: >-
@@ -2116,6 +2130,13 @@ rows:
           reason: structural
           text: >-
             RFC 3164 has no structured data, so an attribute outside the header fields is left off.
+        - when: {format: rfc5424, structured_data: {sd_id: transit@32473}}
+          class: normalized
+          reason: structured_data
+          text: >-
+            Under `structured_data:`, a PARAM of the opt-in SD-ELEMENT, which syslog_in reads back
+            as a string inside `syslog.sd`, under the SD-ID and the attribute's key. The PARAM-VALUE
+            is the string.
         - class: lost
           reason: uncounted
           text: >-
@@ -2140,6 +2161,13 @@ rows:
           reason: structural
           text: >-
             RFC 3164 has no structured data, so an attribute outside the header fields is left off.
+        - when: {format: rfc5424, structured_data: {sd_id: transit@32473}}
+          class: normalized
+          reason: structured_data
+          text: >-
+            Under `structured_data:`, a PARAM of the opt-in SD-ELEMENT, which syslog_in reads back
+            as a string inside `syslog.sd`, under the SD-ID and the attribute's key. The PARAM-VALUE
+            is the string.
         - class: lost
           reason: uncounted
           text: >-
@@ -2164,6 +2192,13 @@ rows:
           reason: structural
           text: >-
             RFC 3164 has no structured data, so an attribute outside the header fields is left off.
+        - when: {format: rfc5424, structured_data: {sd_id: transit@32473}}
+          class: normalized
+          reason: structured_data
+          text: >-
+            Under `structured_data:`, a PARAM of the opt-in SD-ELEMENT, which syslog_in reads back
+            as a string inside `syslog.sd`, under the SD-ID and the attribute's key. The PARAM-VALUE
+            is the string.
         - class: lost
           reason: uncounted
           text: >-
@@ -2217,6 +2252,13 @@ rows:
           reason: structural
           text: >-
             RFC 3164 has no structured data, so an attribute outside the header fields is left off.
+        - when: {format: rfc5424, structured_data: {sd_id: transit@32473}}
+          class: normalized
+          reason: structured_data
+          text: >-
+            Under `structured_data:`, a PARAM of the opt-in SD-ELEMENT, which syslog_in reads back
+            as a string inside `syslog.sd`, under the SD-ID and the attribute's key. The PARAM-VALUE
+            is the string.
         - class: lost
           reason: uncounted
           text: >-
@@ -2267,6 +2309,13 @@ rows:
           reason: structural
           text: >-
             RFC 3164 has no structured data, so an attribute outside the header fields is left off.
+        - when: {format: rfc5424, structured_data: {sd_id: transit@32473}}
+          class: normalized
+          reason: structured_data
+          text: >-
+            Under `structured_data:`, a PARAM of the opt-in SD-ELEMENT, which syslog_in reads back
+            as a string inside `syslog.sd`, under the SD-ID and the attribute's key. The PARAM-VALUE
+            is the string.
         - class: lost
           reason: uncounted
           text: >-
@@ -2316,6 +2365,13 @@ rows:
           reason: structural
           text: >-
             RFC 3164 has no structured data, so an attribute outside the header fields is left off.
+        - when: {format: rfc5424, structured_data: {sd_id: transit@32473}}
+          class: normalized
+          reason: structured_data
+          text: >-
+            Under `structured_data:`, a PARAM of the opt-in SD-ELEMENT, which syslog_in reads back
+            as a string inside `syslog.sd`, under the SD-ID and the attribute's key. The PARAM-VALUE
+            is the string.
         - class: lost
           reason: uncounted
           text: >-
@@ -2366,6 +2422,13 @@ rows:
           reason: structural
           text: >-
             RFC 3164 has no structured data, so an attribute outside the header fields is left off.
+        - when: {format: rfc5424, structured_data: {sd_id: transit@32473}}
+          class: normalized
+          reason: structured_data
+          text: >-
+            Under `structured_data:`, a PARAM of the opt-in SD-ELEMENT, which syslog_in reads back
+            as a string inside `syslog.sd`, under the SD-ID and the attribute's key. The PARAM-VALUE
+            is the string.
         - class: lost
           reason: uncounted
           text: >-
@@ -2423,6 +2486,13 @@ rows:
           reason: structural
           text: >-
             RFC 3164 has no structured data, so an attribute outside the header fields is left off.
+        - when: {format: rfc5424, structured_data: {sd_id: transit@32473}}
+          class: normalized
+          reason: structured_data
+          text: >-
+            Under `structured_data:`, a PARAM of the opt-in SD-ELEMENT, which syslog_in reads back
+            as a string inside `syslog.sd`, under the SD-ID and the attribute's key. The PARAM-VALUE
+            is `true` or `false`.
         - class: lost
           reason: uncounted
           text: >-
@@ -2483,6 +2553,13 @@ rows:
           reason: structural
           text: >-
             RFC 3164 has no structured data, so an attribute outside the header fields is left off.
+        - when: {format: rfc5424, structured_data: {sd_id: transit@32473}}
+          class: normalized
+          reason: structured_data
+          text: >-
+            Under `structured_data:`, a PARAM of the opt-in SD-ELEMENT, which syslog_in reads back
+            as a string inside `syslog.sd`, under the SD-ID and the attribute's key. The PARAM-VALUE
+            is its decimal text, an `f64` in Rust's shortest form.
         - class: lost
           reason: uncounted
           text: >-
@@ -2537,6 +2614,14 @@ rows:
           reason: structural
           text: >-
             RFC 3164 has no structured data, so an attribute outside the header fields is left off.
+        - when: {format: rfc5424, structured_data: {sd_id: transit@32473}}
+          class: normalized
+          reason: structured_data
+          text: >-
+            Under `structured_data:`, a PARAM of the opt-in SD-ELEMENT, which syslog_in reads back
+            as a string inside `syslog.sd`, under the SD-ID and the attribute's key. The PARAM-VALUE
+            is one PARAM per element, each element's text, which syslog_in reads back as an array of
+            strings, or one string for a one-element array.
         - class: lost
           reason: uncounted
           text: >-
@@ -2586,6 +2671,13 @@ rows:
           reason: structural
           text: >-
             RFC 3164 has no structured data, so an attribute outside the header fields is left off.
+        - when: {format: rfc5424, structured_data: {sd_id: transit@32473}}
+          class: normalized
+          reason: structured_data
+          text: >-
+            Under `structured_data:`, a PARAM of the opt-in SD-ELEMENT, which syslog_in reads back
+            as a string inside `syslog.sd`, under the SD-ID and the attribute's key. The PARAM-VALUE
+            is its inline `{k="v"}` text.
         - class: lost
           reason: uncounted
           text: >-
@@ -2635,6 +2727,12 @@ rows:
           reason: structural
           text: >-
             RFC 3164 has no structured data, so an attribute outside the header fields is left off.
+        - when: {format: rfc5424, structured_data: {sd_id: transit@32473}}
+          class: lost
+          reason: uncounted
+          text: >-
+            Under `structured_data:`, a PARAM of the opt-in SD-ELEMENT whose PARAM-VALUE is the
+            value's length, `<N bytes>`, so its bytes are left off, uncounted.
         - class: lost
           reason: uncounted
           text: >-
@@ -2685,6 +2783,13 @@ rows:
           reason: structural
           text: >-
             RFC 3164 has no structured data, so an attribute outside the header fields is left off.
+        - when: {format: rfc5424, structured_data: {sd_id: transit@32473}}
+          class: normalized
+          reason: structured_data
+          text: >-
+            Under `structured_data:`, a PARAM of the opt-in SD-ELEMENT, which syslog_in reads back
+            as a string inside `syslog.sd`, under the SD-ID and the attribute's key. The PARAM-VALUE
+            is its RFC 3339 text with nanoseconds.
         - class: lost
           reason: uncounted
           text: >-
@@ -3377,6 +3482,13 @@ rows:
           class: lost
           reason: structural
           text: RFC 3164 has no STRUCTURED-DATA, so it's left off.
+        - when: {format: rfc5424, structured_data: {sd_id: transit@32473}}
+          class: normalized
+          reason: structured_data
+          text: >-
+            Under `structured_data:`, the log's own elements are written beside the opt-in
+            SD-ELEMENT, so `syslog.sd` reads back with it added. An element under the configured
+            SD-ID is the log's own, and the opt-in one is left off.
         - class: exact
           text: STRUCTURED-DATA, its elements and their params in name order.
   - kind: attributes
@@ -3409,6 +3521,26 @@ rows:
             An RFC 3164 timestamp has no year or zone to write under RFC 5424, so TIMESTAMP is the
             log's timestamp and the attribute is left off; an RFC 5424 or null one is written as it
             is.
+  - kind: attributes
+    feature: sd_id_collision
+    cells:
+      syslog_out:
+        class: lost
+        counter: logit.output.structured_data.omitted{reason=sd_id_collision}
+        text: >-
+          Under `structured_data:`, a log whose own `syslog.sd` already holds an element under the
+          configured SD-ID keeps its own, and the opt-in SD-ELEMENT is left off, counted once per
+          log: syslog_in refuses a repeated SD-ID.
+  - kind: attributes
+    feature: sd_name_unsafe
+    cells:
+      syslog_out:
+        class: lost
+        counter: logit.output.structured_data.omitted{reason=invalid_sd_name}
+        text: >-
+          Under `structured_data:`, an attribute key that isn't an RFC 5424 SD-NAME (1 to 32
+          printable ASCII characters, none of them `=`, space, `]`, or `"`) has no PARAM-NAME, so
+          its PARAM is left off, counted.
   - kind: attributes
     feature: host_name
     cells:

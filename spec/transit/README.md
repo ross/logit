@@ -120,7 +120,10 @@ is one nothing checks: add a case or a flow that reaches it.
   sink carried the log. A field the log doesn't set reaches its
   `_unset` row (`severity_unset`, `observed_timestamp_unset`, `trace_unset`), `normalized` where
   the sink fills it in. A log's record pairs on its message and attributes alone, so a log read
-  back with another severity still pairs and the difference lands on `log/severity`.
+  back with another severity still pairs and the difference lands on `log/severity`. Under
+  `syslog_out`'s `structured_data:` on RFC 5424, a log's attribute outside the header fields
+  reads back nested, as the PARAM of its key in `syslog.sd`'s element under the configured
+  SD-ID, holding its PARAM-VALUE text; its row reads that `normalized`.
 
 Where a sink's outcome depends on the record's kind, the kind is in the feature's name, since a
 `when:` key names sink config only: `no_recorded_value` is a flagged cumulative `sum` or
@@ -142,7 +145,10 @@ non-empty string `host.name` or the hostless mark, which `statsd_out` leaves off
 `attributes/hostname` and `attributes/log_service` (a log's `hostname` attribute, or its
 `service` beside `service.name`, which `datadog_out` leaves off), `attributes/log_service_field`
 (a log's string `service` with no `service.name`, which `datadog_out` writes as the log's
-`service`), and
+`service`), `attributes/sd_id_collision` and `attributes/sd_name_unsafe` (a log's attribute
+`syslog_out` leaves out of its `structured_data:` SD-ELEMENT, on a log whose `syslog.sd` already
+holds the configured SD-ID or under a key that isn't an SD-NAME, reached only at that sink under
+the opt-in), and
 the attributes `datadog_out` writes from a record's own fields,
 `attributes/no_host`, `log_status`, `span_kind`, and `trace_id_high`. A flagged record's `no_recorded_value` row goes ahead of its kind's counted
 loss where that loss's counter didn't move, since most sinks test the flag first
@@ -161,7 +167,8 @@ counter would add anything
 rewritten name, is counted. The table's schema accepts `reason: uncounted`, the sink's behavior
 as it stands, only on the cells `crates/logit-cli/src/transit/mapping.rs`'s `UNCOUNTED_ALLOWED`
 names: span payloads, which aren't classified yet, log records at a sink other than `otlp_out`,
-`datadog_out`, and `statsd_out`, and `datadog_out`'s carrier on a log.
+`datadog_out`, `syslog_out`, and `statsd_out`; `datadog_out`'s carrier on a log; and the attributes
+outside its header fields that `syslog_out` leaves off a log.
 When a sink's behavior depends on its config, the sink's entry is a list: each cell but the last
 has a `when:` map of config fields, the first that matches the flow's sink config applies, and
 the last applies otherwise:

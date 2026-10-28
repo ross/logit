@@ -56,6 +56,15 @@ Entry format and the other areas: [the known-gaps index](README.md).
   it, no counter moves. A log's metrics, and a span beside a log, are left off the same way.
   - **Workaround:** under RFC 5424, set `structured_data:`, which `syslog_in` reads back inside
     `syslog.sd`.
+- **`syslog_out`'s `structured_data:` writes a `Bytes` attribute as its length, and an empty
+  array as nothing, uncounted.** A PARAM-VALUE is text, so the encoder renders a `Bytes` value as
+  `<N bytes>`, and an `Array` as one PARAM per element, which writes no PARAM for an empty one.
+  Neither moves a counter. A key that isn't an RFC 5424 SD-NAME, and every attribute of a log whose
+  own `syslog.sd` already holds the configured SD-ID, are left off counted, under
+  `logit.output.structured_data.omitted{reason=invalid_sd_name}` and `{reason=sd_id_collision}`.
+  - **Consequence:** the receiver reads back `<N bytes>` in place of the bytes, and no PARAM for
+    an empty array.
+  - **Workaround:** rewrite a `Bytes` attribute as text in a `lua` stage ahead of `syslog_out`.
 - **`syslog_out` counts a skipped event with no `reason` tag.** An event with no log, a span or
   metrics alone, counts `logit.output.events.skipped` with no tag, where every other sink that
   counts the series tags it (`EncodeStats::skipped_no_log` in

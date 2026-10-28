@@ -15,6 +15,13 @@
   "nil-fields": {"events": [
     {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"severity":"info","format":"raw","message":"every optional field nil"},"attributes":{"host.name":"transit","status":"info","syslog.facility":20,"syslog.timestamp":null}}
   ], "counters": {}},
+  "opt-in-attributes": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"severity":"info","format":"raw","message":"every value type"},"attributes":{"bad key":"spaced","big":18446744073709551615,"count":42,"flag":true,"host.name":"web-1","labels":["a",1],"nested":{"k":"v"},"note":"say \"hi\" \\ [x]","plain":"text","ratio":1.5,"raw":"Y2Fm6Q==","seen":"2027-01-15T07:59:00.000000000Z","status":"info","syslog.tag":"app"},"types":{"/attributes/big":"u64"}},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","log":{"severity":"info","format":"raw","message":"beside its own element"},"attributes":{"host.name":"web-1","status":"info","syslog.sd":{"origin@32473":{"ip":"10.0.0.1"}},"syslog.tag":"app","team":"web"}},
+    {"timestamp":"2027-01-15T08:00:02.000000000Z","log":{"severity":"info","format":"raw","message":"colliding element"},"attributes":{"host.name":"web-1","status":"info","syslog.sd":{"transit@32473":{"origin":"upstream"}},"syslog.tag":"app","team":"web"}},
+    {"timestamp":"2027-01-15T08:00:03.000000000Z","log":{"severity":"info","format":"raw","message":"host and service keys"},"attributes":{"env":"prod","host":"edge","host.name":"web-1","service.name":"checkout","status":"info","syslog.tag":"app","version":"1.2"}},
+    {"timestamp":"2027-01-15T08:00:04.000000000Z","log":{"severity":"info","format":"raw","message":"service beside its key"},"attributes":{"deployment.environment.name":"prod","env":"prod","host.name":"web-1","status":"info","syslog.tag":"app"}}
+  ], "counters": {}},
   "pid": {"events": [
     {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"severity":"info","format":"raw","message":"bracketed pid"},"attributes":{"host.name":"web-1","process.pid":123,"status":"info","syslog.facility":1,"syslog.tag":"app","syslog.timestamp":"Jan 15 07:59:06"}},
     {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"severity":"info","format":"raw","message":"decimal procid"},"attributes":{"host.name":"web-1","process.pid":4242,"status":"info","syslog.facility":1,"syslog.tag":"app","syslog.timestamp":"2027-01-15T07:59:03.000000000Z"}},

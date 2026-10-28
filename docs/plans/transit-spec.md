@@ -553,7 +553,7 @@ when the parent merges.
 | W0 | `tlog/w0` | This section and [ADR `transit-spec`](../adr/transit-spec.md)'s log-records amendment | S |
 | W1 | `tlog/w1` | The framework above, and the `otlp-logs` source: `/v1/logs` cases from `testdata/interop/otlp/logs.json`, whose signal comes from its top-level `resourceLogs` key, and hand-written ones covering every body kind, severity bands and carriers, `event_name`, a trace with flags, dropped counts, scope and `schema_url`, and a log beside metrics. Flows `otlp-logs-relay` and `otlp-logs-to-datadog`; the `datadog-logs` directory split, with `datadog-logs-relay` and `datadog-logs-to-otlp`; `otlp_out` and `datadog_out` cells on every new row; `datadog_out`'s derived `trace_id` and `span_id` entries; `otlp_out`'s region moved to `otlp/mod.rs` | L |
 | W2 | `tlog/w2` | The `syslog` source and the `syslog_out` column: cases from `testdata/interop/syslog/*.raw` (logger's RFC 3164, RFC 5424, and Unicode lines, the Python handler, and rsyslog over UDP and as a TCP stream through the RFC 6587 `Framer`) and hand-written ones (structured data, nil fields, a `Bytes` MSG, PROCID forms, an out-of-range timestamp). Flows `syslog-relay` under `format: rfc3164` and `rfc5424`, `syslog-to-otlp`, `syslog-to-datadog`, `otlp-logs-to-syslog`, and `datadog-logs-to-syslog` | L |
-| W2b | `tlog/w2b` | The `structured_data:` opt-in: a nested-key spelling for `syslog.sd`, and a `syslog-relay-sd` flow | S |
+| W2b | `tlog/w2b` | The `structured_data:` opt-in: a nested-key spelling for `syslog.sd`, the `syslog-relay-sd` and `otlp-logs-to-syslog-sd` flows, and the `opt-in-attributes` case | S |
 | W3 | `tlog/w3` | The `datadog-logs` cases: hand-written `/api/v2/logs` bodies covering status forms, `ddsource`, the `ddtags` `env:`, `version:`, and `service:` lift, `service` beside `service.name`, `hostname`, a nested and a non-string `message`, RFC 3339 and fractional-millisecond `timestamp`s, `trace_id` and `span_id` attributes, and 101 tags. `datadog-logs-to-syslog` grows to match | M |
 | W4 | `tlog/w4` | The `splunk` source and the `splunk_hec_out` column: `pub fn decode_request` factored out of `handle` in `crates/logit-inputs/src/splunk.rs` (route, gzip, and the percent-decoded `/raw` envelope query); cases from the log `POST` captures under `testdata/interop/splunk/` (the OTel exporter's `otel-services-collector-001` and `-raw-000`, SC4S's, Docker's, and the Java appender's), not Docker's three `OPTIONS` probes or the `/health` GET, and hand-written ones (`otel.log.*` including `otel.log.name`, `fields` nesting, `time` forms, a non-string envelope, a blank event, an array body). Flows `splunk-relay`, `splunk-to-otlp`, `splunk-to-datadog`, `splunk-to-syslog`, `otlp-logs-to-splunk`, `datadog-logs-to-splunk`, and `syslog-to-splunk` | L |
 | W5 | `tlog/w5` | The `kafka_out` column under `format: json` and `text`: the `otlp-logs`, `syslog`, `datadog-logs`, and `splunk` sources' `-to-kafka` and `-to-kafka-text` flows. `log/dogstatsd_event` through the new sinks; a coverage sweep to no unreached log cell; the `UNCOUNTED_ALLOWED` narrowing; `docs/known-gaps/mappings.md`'s hand-written Splunk and syslog log rows reconciled with the generated regions; `spec/transit/README.md`'s source and sink lists, `transit/mod.rs`'s account of what the driver rejects, and `AGENTS.md` | M |
@@ -1079,3 +1079,22 @@ Recorded per workstream as each lands.
     case's gauge reaches `gauge/i64` unspecified there.
   - `otlp_out` and `datadog_out` write a `u64` `syslog.facility` or `process.pid` that their pair
     decoders read back as an `i64` (`attributes/syslog_header`, `normalized`).
+- **`syslog_out`'s `structured_data:` opt-in** (`tlog/w2b`): the `syslog-relay-sd` and
+  `otlp-logs-to-syslog-sd` flows, and the `syslog` case `opt-in-attributes`, put every value type
+  and the host and service keys in front of the opt-in under RFC 5424. Each behavior below is a
+  `when:` cell in `mapping.yaml`, observed at its class; none is fixed.
+  - Every opt-in attribute reads back as a string PARAM inside `syslog.sd`, under the SD-ID and
+    its own key (`structured_data`, `normalized`): a number in its decimal text, a bool as
+    `true` or `false`, a timestamp in RFC 3339 with nanoseconds, a `Map` as its inline
+    `{k="v"}` text, and an `Array` as one PARAM per element, read back as an array of strings, or
+    one string for a one-element array. A PARAM-VALUE's `"`, `\`, and `]` read back as written.
+  - A `Bytes` attribute's PARAM-VALUE is its length, `<N bytes>`, uncounted
+    (`attributes/bytes_value`, `lost`), and an empty `Array` writes no PARAM, uncounted, which no
+    case reaches.
+  - A key that isn't an SD-NAME is left off, counted `invalid_sd_name`, and every opt-in
+    attribute of a log whose own `syslog.sd` holds the configured SD-ID is left off, counted
+    `sd_id_collision`. Each reaches a row of its own, `attributes/sd_name_unsafe` and
+    `attributes/sd_id_collision`, chosen only under the opt-in, so the value-type rows keep one
+    class.
+  - A log's own `syslog.sd` elements are written beside the opt-in element
+    (`attributes/syslog_sd`, `normalized`), and read back `exact` on a collision.

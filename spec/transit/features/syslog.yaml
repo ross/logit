@@ -41,3 +41,7 @@
   text: A line that sniffs as RFC 5424 but doesn't parse as one, reparsed as RFC 3164.
 - name: pri_bounds
   text: The PRI range's ends, facility 0 and 23 at severity 0 and 7.
+- name: opt_in_attributes
+  text: >-
+    A log with attributes outside the header fields, as a stage after `syslog_in` adds them, which
+    `syslog_out`'s `structured_data:` writes as PARAMs of its own SD-ELEMENT.

@@ -50,7 +50,10 @@
 //! `severity_carrier_syslog`, any other `_logit.` key `foreign_carrier`, on a log an event
 //! attribute `syslog_out` writes as a header field by its key (`syslog.facility`, `syslog.tag`,
 //! `syslog.pid`, and `process.pid` `syslog_header`, `syslog.msgid` `syslog_msgid`, `syslog.sd`
-//! `syslog_sd`, `syslog.timestamp` `syslog_timestamp`, and `host.name` `host_name`), an event
+//! `syslog_sd`, `syslog.timestamp` `syslog_timestamp`, and `host.name` `host_name`), at a
+//! `syslog_out` with `structured_data:` under RFC 5424 a log's attribute the encoder leaves out
+//! of the opt-in SD-ELEMENT ([`syslog::opt_in_row`]: `sd_id_collision` on a log whose `syslog.sd`
+//! holds the configured SD-ID, `sd_name_unsafe` for a key that isn't an SD-NAME), an event
 //! attribute by its value (`string_value`, `bool_value`, `number_value`, `array_value`,
 //! `map_value`, `bytes_value`, `timestamp_value`), and any other resource attribute
 //! `resource_attribute`; and `attributes/scope` when its batch has a scope. A log
@@ -121,7 +124,10 @@
 //! `syslog.pid` otherwise, and the attributes it fills in ([`Spelling::derived`]: its configured
 //! facility on a log with no `syslog.facility`, the run's hostname on a log with no host, and for
 //! pairing only, `syslog.timestamp` written from the log's timestamp and under RFC 3164 a TAG read
-//! from the message's first word). A candidate's public attributes (no `_logit.`
+//! from the message's first word). Under `structured_data:` on RFC 5424, an opt-in attribute
+//! (`logit_outputs::syslog::is_opt_in_param`) is no attribute of its own: it reads back inside
+//! `syslog.sd` under the SD-ID, and `syslog.sd` pairs as the encoder's STRUCTURED-DATA field read
+//! through `syslog_in`'s decoder ([`syslog::read_sd`]). A candidate's public attributes (no `_logit.`
 //! key, values compared as text, each key and value as the sink writes it) must equal the
 //! input's, or failing any that do, be a subset of them; a `datadog_out` series under `<name>.`
 //! may also carry the `lower_bound`, `upper_bound`, or `quantile` tag of the bucket or quantile it
@@ -154,7 +160,11 @@
 //! RFC 3339 text is `exact`, another rendering of its instant (microseconds, or RFC 3164's whole
 //! seconds with no year) `normalized`, and a TIMESTAMP written from the log's own
 //! `syslog.timestamp` leaves it `lost`; a `syslog.timestamp` the encoder can't render under the
-//! sink's format reads `lost`. `prometheus_out` has one exception, which compares a value:
+//! sink's format reads `lost`. Under `syslog_out`'s `structured_data:` on RFC 5424, an opt-in
+//! attribute compares a value: read back in `syslog.sd` under the SD-ID with the PARAM-VALUE text
+//! [`syslog::read_sd`] expects is `normalized`, and anything else `lost`, as is a `Bytes` value,
+//! which the encoder writes as its length, and every opt-in attribute of a log whose `syslog.sd`
+//! holds the SD-ID. `prometheus_out` compares a value too:
 //! `_logit.prometheus.target` absent reads `normalized` when the read-back's `instance` equals the
 //! input's, and `lost` otherwise. The observed class may be better than the cell's but never worse. A
 //! degraded, skipped, or dropped record's field rows aren't looked up, so they're neither reached
@@ -394,9 +404,10 @@ enum Spelling {
     /// one as `{k="v"}` text; its header attributes as the encoder writes them, sanitized; no
     /// other attribute; and the attributes [`syslog_derived`] lists. Under RFC 3164 (`rfc3164`),
     /// a header `syslog_in` doesn't read back as one moves into the message ([`syslog::read`]).
-    /// `facility` is the configured PRI facility; `structured_data` whether `structured_data:` is
-    /// set, which this spelling doesn't model.
-    Syslog { rfc3164: bool, facility: u8, structured_data: bool },
+    /// `facility` is the configured PRI facility; `structured_data` the configured
+    /// `structured_data.sd_id`, under which RFC 5424 writes each opt-in attribute as a PARAM of
+    /// that element, read back nested in `syslog.sd` ([`Spelling::sd_id`], [`syslog::read_sd`]).
+    Syslog { rfc3164: bool, facility: u8, structured_data: Option<&'static str> },
     /// Any other sink: names, keys, and values as written.
     Verbatim,
 }
@@ -417,9 +428,20 @@ impl Spelling {
                     config["facility"].clone(),
                 )
                 .map_or(16, |facility| facility.as_u8()),
-                structured_data: !config["structured_data"].is_null(),
+                structured_data: config["structured_data"]["sd_id"].as_str().map(|sd_id| {
+                    logit_core::interner::resolve(logit_core::interner::intern(sd_id))
+                }),
             },
             _ => Spelling::Verbatim,
+        }
+    }
+
+    /// The SD-ID `syslog_out` writes a log's opt-in attributes under: its `structured_data.sd_id`
+    /// under RFC 5424, which RFC 3164 has no STRUCTURED-DATA for. `None` at any other sink.
+    fn sd_id(self) -> Option<&'static str> {
+        match self {
+            Spelling::Syslog { rfc3164: false, structured_data, .. } => structured_data,
+            _ => None,
         }
     }
 
@@ -631,7 +653,7 @@ impl Spelling {
     /// standard key where the sink writes Unified Service Tagging tags.
     fn value_for(self, key: &str, value: &Value, tags: &str, rec: &Rec) -> Option<String> {
         if let Spelling::Syslog { rfc3164, facility, .. } = self {
-            return syslog::value_for(rec, key, value, rfc3164, facility);
+            return syslog::value_for(rec, key, value, rfc3164, facility, self.sd_id());
         }
         if self == (Spelling::Statsd { dogstatsd: true }) && key == "host" {
             let kept = statsd::host_kept(rec, value)?;
@@ -665,7 +687,9 @@ impl Spelling {
     fn derived(self, rec: &Rec) -> Vec<Derived> {
         match self {
             Spelling::Datadog => datadog_derived(rec),
-            Spelling::Syslog { rfc3164, facility, .. } => syslog_derived(rec, rfc3164, facility),
+            Spelling::Syslog { rfc3164, facility, .. } => {
+                syslog_derived(rec, rfc3164, facility, self.sd_id())
+            }
             _ => Vec::new(),
         }
     }
@@ -707,7 +731,7 @@ type Derived = (Option<&'static str>, &'static str, String);
 fn derived_rows(rec: &Rec) -> Vec<&'static str> {
     let mut rows = Vec::new();
     // `syslog_out`'s rows don't depend on its config.
-    let syslog = Spelling::Syslog { rfc3164: false, facility: 0, structured_data: false };
+    let syslog = Spelling::Syslog { rfc3164: false, facility: 0, structured_data: None };
     for spelling in [Spelling::Datadog, syslog] {
         for (row, _, _) in spelling.derived(rec) {
             if let Some(row) = row.filter(|row| !rows.contains(row)) {
@@ -726,9 +750,15 @@ fn derived_rows(rec: &Rec) -> Vec<&'static str> {
 /// - `no_host`: the run's hostname, on a log that carries no host, where `syslog_in` reads it back
 ///   as HOSTNAME;
 /// - for pairing only, the `syslog.timestamp` written from `event.timestamp` on a log with none,
-///   which `log/timestamp` compares, and under RFC 3164 a `syslog.tag` and PROCID `syslog_in` reads
-///   from the message's first token.
-fn syslog_derived(rec: &Rec, rfc3164: bool, facility: u8) -> Vec<Derived> {
+///   which `log/timestamp` compares, under RFC 3164 a `syslog.tag` and PROCID `syslog_in` reads
+///   from the message's first token, and under the `sd_id` opt-in the `syslog.sd` holding the
+///   opt-in element on a log with none.
+fn syslog_derived(
+    rec: &Rec,
+    rfc3164: bool,
+    facility: u8,
+    sd_id: Option<&'static str>,
+) -> Vec<Derived> {
     if rec.kind != "log" {
         return Vec::new();
     }
@@ -746,6 +776,11 @@ fn syslog_derived(rec: &Rec, rfc3164: bool, facility: u8) -> Vec<Derived> {
     if !rec.attributes.contains_key(syslog::TIMESTAMP) {
         if let Some((written, _)) = syslog::written_timestamp(rec, rfc3164) {
             out.push((None, syslog::TIMESTAMP, text(&written)));
+        }
+    }
+    if sd_id.is_some() && !rec.attributes.contains_key(syslog::SD) {
+        if let Some(sd) = syslog::read_sd(rec, sd_id) {
+            out.push((None, syslog::SD, text(&sd)));
         }
     }
     if !read.tag_from_attribute {
@@ -1087,7 +1122,8 @@ mod syslog {
     use logit_core::time::{format_rfc3339_utc, parse_rfc3339_to_nanos};
     use logit_core::AttrMap;
     use logit_outputs::syslog::{
-        wire_app_name, wire_hostname, wire_message, wire_msgid, wire_procid, wire_timestamp, Format,
+        is_opt_in_param, is_valid_sd_name, wire_app_name, wire_hostname, wire_message, wire_msgid,
+        wire_procid, wire_structured_data, wire_timestamp, Format,
     };
     use logit_proto::syslog::is_tag_shaped;
     use serde_json::{Map, Value};
@@ -1282,6 +1318,41 @@ mod syslog {
         }
     }
 
+    /// The `syslog.sd` `syslog_in` reads back for log `rec` under RFC 5424, as `format: json`
+    /// writes it, when the sink's opt-in SD-ID is `sd_id`: the encoder's STRUCTURED-DATA field
+    /// ([`wire_structured_data`]) through `syslog_in`'s decoder. `None` where it writes none.
+    pub(super) fn read_sd(rec: &Rec, sd_id: Option<&str>) -> Option<Value> {
+        let (attrs, _) = scopes(rec);
+        let (field, _) = wire_structured_data(&attrs, sd_id);
+        if field == "-" {
+            return None;
+        }
+        let line = format!("<14>1 - - - - - {field} m");
+        let mut decoder = logit_proto::syslog::SyslogDecoder::new(std::sync::Arc::default());
+        let mut events = Vec::new();
+        logit_proto::Decoder::decode_into(&mut decoder, bytes::Bytes::from(line), 0, &mut events)
+            .ok()?;
+        let sd = events.first()?.attributes.get(SD)?.clone();
+        Some(super::json_value(sd))
+    }
+
+    /// The attribute row an opt-in attribute `key` of log `rec` reaches in place of its value's
+    /// under the `sd_id` opt-in, where the encoder leaves it off, counted: `sd_id_collision` on a
+    /// log whose own `syslog.sd` holds an element under `sd_id`, and `sd_name_unsafe` for a key
+    /// that isn't an RFC 5424 SD-NAME.
+    pub(super) fn opt_in_row(rec: &Rec, key: &str, sd_id: &str) -> Option<&'static str> {
+        if rec.kind != "log" || !is_opt_in_param(key) {
+            return None;
+        }
+        if rec.attributes.get(SD).and_then(|sd| sd.get(sd_id)).is_some() {
+            Some("sd_id_collision")
+        } else if !is_valid_sd_name(key) {
+            Some("sd_name_unsafe")
+        } else {
+            None
+        }
+    }
+
     /// The key `syslog_in` reads a written PROCID back under.
     pub(super) fn pid_key(pid: &str) -> &'static str {
         if canonical_pid(pid) {
@@ -1294,16 +1365,21 @@ mod syslog {
     /// Attribute `key` of `rec` as `syslog_in` reads it back, as text; `None` where `syslog_out`
     /// writes nothing for it. Only the header's attributes are written: `host.name`, `syslog.tag`,
     /// `syslog.facility`, `syslog.msgid`, `syslog.sd`, `syslog.timestamp`, and the PROCID's
-    /// `process.pid` or `syslog.pid`.
+    /// `process.pid` or `syslog.pid`. Under the `sd_id` opt-in, an opt-in attribute reads back
+    /// inside `syslog.sd`, never under its own key, and `syslog.sd` holds the opt-in element.
     pub(super) fn value_for(
         rec: &Rec,
         key: &str,
         value: &Value,
         rfc3164: bool,
         facility: u8,
+        sd_id: Option<&str>,
     ) -> Option<String> {
         let on_event = rec.attributes.get(key) == Some(value);
         let read = read(rec, rfc3164)?;
+        if sd_id.is_some() && key == SD && on_event {
+            return read_sd(rec, sd_id).map(|sd| super::text(&sd));
+        }
         match key {
             HOST_NAME => read.host,
             TAG if on_event && read.tag_from_attribute => read.tag,
@@ -2110,8 +2186,19 @@ fn unweighted_rate(rec: &Rec) -> bool {
         && weight(rec) == 1
 }
 
-/// The field rows `rec` reaches, for a sink of `protocol`.
+/// The field rows `rec` reaches, for a sink of `protocol` with no `structured_data:` opt-in.
 fn field_rows(rec: &Rec, protocol: &str) -> Vec<(String, Option<String>, Field)> {
+    field_rows_under(rec, protocol, None)
+}
+
+/// [`field_rows`] at a sink whose spelling's opt-in SD-ID is `sd_id` ([`Spelling::sd_id`]): an
+/// opt-in attribute the encoder leaves off reaches [`syslog::opt_in_row`]'s row in place of its
+/// value's.
+fn field_rows_under(
+    rec: &Rec,
+    protocol: &str,
+    sd_id: Option<&str>,
+) -> Vec<(String, Option<String>, Field)> {
     let mut rows = Vec::new();
     if rec.is_metric() {
         for key in mapping::RECORD_FIELDS {
@@ -2274,6 +2361,8 @@ fn field_rows(rec: &Rec, protocol: &str) -> Vec<(String, Option<String>, Field)>
             feature
         } else if let Some(feature) = header(key) {
             feature
+        } else if let Some(feature) = sd_id.and_then(|sd_id| syslog::opt_in_row(rec, key, sd_id)) {
+            feature
         } else if let Some(feature) = outranked(key, value) {
             feature
         } else if let Some(feature) = service(key, value) {
@@ -2403,6 +2492,28 @@ fn observe_field(field: &Field, input: &Rec, out: &Rec, spelling: Spelling) -> C
             None => Class::Lost,
         },
         Field::Attribute { key, resource } => {
+            // Under the opt-in, a log's opt-in attribute is a PARAM of the opt-in element, read
+            // back nested in `syslog.sd` as the PARAM-VALUE text, where the encoder wrote it.
+            if let Some(sd_id) = spelling.sd_id() {
+                if !*resource && input.kind == "log" && logit_outputs::syslog::is_opt_in_param(key)
+                {
+                    // On a collision, the element under `sd_id` is the log's own.
+                    if syslog::opt_in_row(input, key, sd_id) == Some("sd_id_collision") {
+                        return Class::Lost;
+                    }
+                    // The encoder writes a `Bytes` PARAM-VALUE as its length, `<N bytes>`.
+                    let tags = input.attribute_types.get(key).map(String::as_str).unwrap_or("");
+                    if tags.contains("=bytes") {
+                        return Class::Lost;
+                    }
+                    let param = |rec: Option<&Value>| rec?.get(sd_id)?.get(key).cloned();
+                    let want = param(syslog::read_sd(input, Some(sd_id)).as_ref());
+                    return match param(out.attributes.get(syslog::SD)) {
+                        Some(read) if Some(&read) == want.as_ref() => Class::Normalized,
+                        _ => Class::Lost,
+                    };
+                }
+            }
             if matches!(spelling, Spelling::Prometheus) {
                 // A relay re-targets: a scrape of `prometheus_out` stamps its own URL, and the
                 // original target survives as the `instance` label.
@@ -2761,7 +2872,7 @@ pub(super) fn check(
     for (i, input) in ins.iter().enumerate() {
         // A record reaches its field rows whether or not it's read back, and a sink may move a
         // field row's counter before it skips the record.
-        for (kind, feature, _) in field_rows(input, &protocol) {
+        for (kind, feature, _) in field_rows_under(input, &protocol, spelling.sd_id()) {
             if let Lookup::Cell(cell, _) =
                 mapping.lookup(&kind, feature.as_deref(), &sink, &traced.sink)
             {
@@ -3037,7 +3148,7 @@ pub(super) fn check(
         // Field level.
         let first = pairing.claimed[i].first().copied();
         let checked = matches!(observed, Class::Exact | Class::Normalized);
-        for (kind, feature, field) in field_rows(input, &protocol) {
+        for (kind, feature, field) in field_rows_under(input, &protocol, spelling.sd_id()) {
             // A field row is reached only where its record is compared: a record written in a
             // lesser form, or not at all, has no field to compare.
             let Some(first) = first.filter(|_| checked) else { continue };
@@ -4182,9 +4293,9 @@ mod tests {
     }
 
     const SYSLOG_5424: Spelling =
-        Spelling::Syslog { rfc3164: false, facility: 16, structured_data: false };
+        Spelling::Syslog { rfc3164: false, facility: 16, structured_data: None };
     const SYSLOG_3164: Spelling =
-        Spelling::Syslog { rfc3164: true, facility: 16, structured_data: false };
+        Spelling::Syslog { rfc3164: true, facility: 16, structured_data: None };
 
     /// A log `syslog_in` reads back from `syslog_out` with the facility, host, and timestamp the
     /// sink filled in still pairs with the log that carried none of them.
@@ -4245,5 +4356,94 @@ mod tests {
             .expect("a syslog_msgid row");
         assert_eq!(observe_field(field, &ins[0], &without[0], SYSLOG_3164), Class::Lost);
         assert_eq!(observe_field(field, &ins[0], &ins[0], SYSLOG_5424), Class::Exact);
+    }
+
+    const SD_ID: &str = "transit@32473";
+    const SYSLOG_SD: Spelling =
+        Spelling::Syslog { rfc3164: false, facility: 16, structured_data: Some(SD_ID) };
+
+    /// The attribute row `key` of `rec` reaches under `sd_id`.
+    fn attribute_row(rec: &Rec, key: &str, sd_id: Option<&str>) -> (String, Field) {
+        field_rows_under(rec, "syslog", sd_id)
+            .into_iter()
+            .find(|(kind, _, field)| {
+                kind == "attributes" && matches!(field, Field::Attribute { key: k, .. } if k == key)
+            })
+            .map(|(_, feature, field)| (feature.unwrap_or_default(), field))
+            .expect("an attribute row")
+    }
+
+    /// Under `structured_data:`, an opt-in attribute reads back nested in `syslog.sd` under the
+    /// SD-ID, as its PARAM-VALUE text: `normalized`, and `lost` where it's missing there.
+    #[test]
+    fn an_opt_in_attribute_reads_back_nested_as_normalized() {
+        let body = r#""severity":"info","format":"raw","message":"m""#;
+        let ins = recs(&[&log_line(body, r#"{"count":42,"syslog.tag":"app","team":"web"}"#)]);
+        let outs = recs(&[
+            &log_line(
+                body,
+                r#"{"syslog.sd":{"transit@32473":{"count":"42","team":"web"}},"syslog.tag":"app"}"#,
+            ),
+            &log_line(body, r#"{"syslog.sd":{"transit@32473":{"team":"web"}},"syslog.tag":"app"}"#),
+        ]);
+        let (feature, field) = attribute_row(&ins[0], "count", Some(SD_ID));
+        assert_eq!(feature, "number_value");
+        assert_eq!(observe_field(&field, &ins[0], &outs[0], SYSLOG_SD), Class::Normalized);
+        assert_eq!(observe_field(&field, &ins[0], &outs[1], SYSLOG_SD), Class::Lost);
+    }
+
+    /// Under `structured_data:`, a key that isn't an SD-NAME and every opt-in attribute of a log
+    /// whose `syslog.sd` already holds the SD-ID reach their own rows and read `lost`, and so does
+    /// a `Bytes` value, which the encoder writes as `<N bytes>`.
+    #[test]
+    fn an_opt_in_attribute_the_encoder_leaves_off_reads_lost() {
+        let body = r#""severity":"info","format":"raw","message":"m""#;
+        let ins = recs(&[
+            &log_line(body, r#"{"bad key":"x","syslog.tag":"app"}"#),
+            &log_line(body, r#"{"syslog.sd":{"transit@32473":{"team":"db"}},"team":"web"}"#),
+            r#"{{T},"log":{"severity":"info","format":"raw","message":"m"},"attributes":{"raw":"b\"ab\""},"types":{"/attributes/raw":"bytes"}}"#,
+        ]);
+        // What syslog_in reads back from each: the encoder's own element, nothing else.
+        let outs = recs(&[
+            &log_line(body, r#"{"syslog.tag":"app"}"#),
+            &log_line(body, r#"{"syslog.sd":{"transit@32473":{"team":"db"}}}"#),
+            &log_line(body, r#"{"syslog.sd":{"transit@32473":{"raw":"<2 bytes>"}}}"#),
+        ]);
+        for (i, key, row) in [
+            (0, "bad key", "sd_name_unsafe"),
+            (1, "team", "sd_id_collision"),
+            (2, "raw", "bytes_value"),
+        ] {
+            let (feature, field) = attribute_row(&ins[i], key, Some(SD_ID));
+            assert_eq!(feature, row, "{key}");
+            assert_eq!(observe_field(&field, &ins[i], &outs[i], SYSLOG_SD), Class::Lost, "{key}");
+        }
+    }
+
+    /// With `structured_data:` unset, or under RFC 3164, which has no STRUCTURED-DATA, an
+    /// attribute keeps its value's row and reads `lost` even when `syslog.sd` holds it.
+    #[test]
+    fn the_opt_in_spelling_is_off_without_structured_data_under_rfc5424() {
+        let unset = Spelling::of("syslog_out", &serde_json::json!({"format": "rfc5424"}));
+        let rfc3164 = Spelling::of(
+            "syslog_out",
+            &serde_json::json!({"format": "rfc3164", "structured_data": {"sd_id": SD_ID}}),
+        );
+        let set = Spelling::of(
+            "syslog_out",
+            &serde_json::json!({"format": "rfc5424", "structured_data": {"sd_id": SD_ID}}),
+        );
+        assert_eq!((unset.sd_id(), rfc3164.sd_id(), set.sd_id()), (None, None, Some(SD_ID)));
+        let body = r#""severity":"info","format":"raw","message":"m""#;
+        let ins = recs(&[&log_line(body, r#"{"bad key":"x","syslog.tag":"app"}"#)]);
+        let outs = recs(&[&log_line(
+            body,
+            r#"{"syslog.sd":{"transit@32473":{"bad key":"x"}},"syslog.tag":"app"}"#,
+        )]);
+        for spelling in [unset, rfc3164] {
+            let (feature, field) = attribute_row(&ins[0], "bad key", spelling.sd_id());
+            assert_eq!(feature, "string_value");
+            assert_eq!(observe_field(&field, &ins[0], &outs[0], spelling), Class::Lost);
+        }
     }
 }
