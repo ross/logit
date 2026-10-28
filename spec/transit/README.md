@@ -18,7 +18,8 @@ hand-written spans and payload-less events beside them (`cases/statsd-logs/`), `
 logs and events (`cases/datadog-logs/`: the Agent's captures and hand-written `/api/v2/logs`
 bodies) and its APM traces (`cases/datadog-traces/`: the Agent's capture and hand-written event
 JSON lines), with no APM stats cases, `datadog_trace_in`'s tracer requests (`cases/ddtrace/`:
-dd-trace-py's v0.4 and v0.5 captures and hand-written v0.7 event JSON lines), `collectd_in`,
+dd-trace-py's v0.4 and v0.5 captures, and hand-written event JSON lines for a v0.4 trace carrying
+the span fields no capture has and for a v0.7 `TracerPayload`'s trace), `collectd_in`,
 `otlp_in`'s metrics
 (`cases/otlp/`), logs (`cases/otlp-logs/`), and traces (`cases/otlp-traces/`), `graphite_in`,
 plaintext and pickle, `syslog_in`, RFC 3164 and RFC 5424 over UDP and as a TCP stream, and
