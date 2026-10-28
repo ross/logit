@@ -90,17 +90,14 @@ use std::path::Path;
 
 /// The cells whose loss may still be `uncounted`, as `(row kind, feature, sink)`, where `None`
 /// matches any. Every other `skipped`, `dropped`, or `lost` cell names a counter, or a `lost` one
-/// is `structural`. A span is uncounted at any sink, and a log in two places: beside metrics, at
-/// a metrics sink that writes the metrics, and a log's own trace that `datadog_out` and
-/// `splunk_hec_out` leave off for a `trace_id` or `span_id` attribute. A `_logit.datadog.*`
+/// is `structural`. A span is uncounted at any sink, and a log beside metrics, at a metrics sink
+/// that writes the metrics. A `_logit.datadog.*`
 /// carrier `datadog_out` leaves off a log is uncounted too, and so is a public attribute outside
 /// its header fields that `syslog_out` leaves off a log, one entry per row such an attribute
 /// reaches; `bytes_value`'s also covers a `Bytes` PARAM-VALUE `structured_data:` writes as its
 /// length, and `sd_empty_array`'s is an empty array `structured_data:` writes no PARAM for.
-const UNCOUNTED_ALLOWED: [(&str, Option<&str>, Option<&str>); 22] = [
+const UNCOUNTED_ALLOWED: [(&str, Option<&str>, Option<&str>); 20] = [
     ("log", Some("beside_metrics"), None),
-    ("log", Some("trace_beside_id_attribute"), Some("datadog_out")),
-    ("log", Some("trace_beside_id_attribute"), Some("splunk_hec_out")),
     ("span", None, None),
     ("attributes", Some("datadog_carrier_log"), Some("datadog_out")),
     ("attributes", Some("string_value"), Some("syslog_out")),

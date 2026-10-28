@@ -4821,21 +4821,22 @@ rows:
         text: The `LogRecord`'s trace, span ids, and flags, beside the attributes, as `log/trace` has.
       datadog_out:
         class: lost
-        reason: uncounted
+        counter: logit.output.tags.omitted{reason=reserved_key}
         text: >-
-          A `trace_id` or `span_id` attribute is written under its own name and the log's own ids
-          are left off, uncounted, so a relayed Datadog log leaves as it arrived.
+          A `trace_id` or `span_id` attribute wins and is written under its own name, so a relayed
+          Datadog log leaves as it arrived, and the log's own ids are left off, counted once per
+          log.
       syslog_out:
         class: lost
         reason: structural
         text: Syslog has no trace or span ids, so they're left off, as `log/trace` has.
       splunk_hec_out:
         class: lost
-        reason: uncounted
+        counter: logit.output.tags.omitted{reason=reserved_key}
         text: >-
-          A `trace_id` or `span_id` attribute is written as that field and the log's own ids are
-          left off, uncounted; an attribute that isn't a hex id reads back as an attribute, with no
-          trace.
+          A `trace_id` or `span_id` attribute wins and is written as that field, and the log's own
+          ids are left off, counted once per log; an attribute that isn't a hex id reads back as an
+          attribute, with no trace.
       kafka_out:
         - when: {format: text}
           class: lost
