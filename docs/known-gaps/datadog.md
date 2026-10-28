@@ -88,6 +88,17 @@ Entry format and the other areas: [the known-gaps index](README.md).
   - **Consequence:** extra requests on these routes, never a `413`.
   - **Revisit trigger:** Datadog documents these routes' limits, or the extra requests show up in
     a sink's request rate.
+- **`datadog_out` drops the OTLP log fields a Datadog log has no slot for, and writes a
+  non-string message as text.** A log's `event_name`, observed time, body format, trace flags,
+  and dropped-attribute count leave nowhere, and `_logit.otel.severity_number` and
+  `_logit.otel.severity_text` are left off, so OTLP's `INFO2` arrives as `info`. A `Map` or
+  `Array` message arrives as its JSON text, a `Bytes` one as lossy UTF-8, a log with no body as
+  the message `null`, and a `Bytes` attribute as base64 text. The trace and span ids arrive as the
+  `trace_id` and `span_id` attributes.
+  - **Consequence:** an OTLP log relayed to Datadog, or back out of `datadog_in`, can't be
+    rebuilt field for field.
+  - **Revisit trigger:** an operator needs one of these fields in Datadog.
+  - The transit spec's `otlp-logs-to-datadog` flow states each as a cell.
 - **A `datadog_out` or `datadog_trace_out` resend isn't idempotent: Datadog stores a resent log
   twice.** Both sinks remember which requests of a batch the destination settled, so a retry
   resends only the rest ([ADR `sink-fault-classes`](../adr/sink-fault-classes.md), "Amendment: the

@@ -1017,3 +1017,26 @@ Recorded per workstream as each lands.
   - `otlp_out`'s `encode_trace` (`crates/logit-proto/src/otlp/logs.rs`) writes the event's span
     ids for a log with no `trace`, so `otlp_in` reads back a `trace` the input didn't have: not a
     fixed point.
+- **Logs through `otlp_out` and `datadog_out`** (`tlog/w1`): the `otlp-logs` and `datadog-logs`
+  cases put every log field in front of both sinks. Each behavior below is a cell in
+  `mapping.yaml`, observed at its class; none is fixed.
+  - `datadog_out` writes a log's message through `logit_proto::json::value_text`
+    (`crates/logit-proto/src/datadog/logs.rs`): a `Map`, `Array`, number, or bool message as its
+    JSON text, a `Bytes` one as lossy UTF-8, and a log with no body as the message `"null"`.
+    `datadog_in` reads each back as a string (`log/message_unsafe`, `structured_message`,
+    `bytes_message`).
+  - `datadog_out` writes a `Bytes` attribute on a log as base64 text, which `datadog_in` reads
+    back as a string (`attributes/bytes_value`).
+  - `datadog_out` writes a log's `event_name`, observed time, body format, trace flags, and
+    dropped-attribute count nowhere, and `datadog_in` reads every log's format back as `raw`
+    (`log/event_name`, `observed_timestamp`, `body_format`, `trace_flags`,
+    `dropped_attributes_count`, each `lost`, structural). Its timestamp leaves in milliseconds.
+  - A log's trace and span ids read back from `datadog_in` as the `trace_id` and `span_id`
+    attributes, not as the log's `trace` (`log/trace`, `normalized`), as the `tlog/w0` finding
+    above has it.
+  - `otlp_out` writes `_logit.otel.severity_number` and `_logit.otel.severity_text` back as the
+    record's own fields, and `datadog_out` leaves both off
+    (`attributes/severity_carrier`); `otlp_out` stamps a log with no observed time
+    (`log/observed_timestamp_unset`, `normalized`).
+  - `otlp_in` reads a `u64` attribute above `i64::MAX`, which `otlp_out` writes as a
+    `doubleValue`, back as an `F64`; the class check's OTLP spelling compares it as that double.
