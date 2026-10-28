@@ -1109,24 +1109,12 @@ mod datadog {
     /// winner (`lift_service_identity`) and keeps the rest, `container_id:` among them; the inner
     /// `None` is a string emptied by the lift, which reads back as no `ddtags`.
     pub(super) fn log_ddtags(rec: &Rec) -> Option<Option<String>> {
-        use logit_core::attrs::{
-            CONTAINER_ID, DEPLOYMENT_ENVIRONMENT_NAME, SERVICE_NAME, SERVICE_VERSION,
-        };
+        use logit_core::attrs::SERVICE_NAME;
         use logit_proto::datadog::tags::split_joined;
         if Route::of(rec) != Route::Log {
             return None;
         }
-        let entries: Vec<(&str, &str)> = [
-            ("env", DEPLOYMENT_ENVIRONMENT_NAME),
-            ("version", SERVICE_VERSION),
-            ("container_id", CONTAINER_ID),
-        ]
-        .into_iter()
-        .filter_map(|(tag, key)| {
-            let value = get(rec, key)?.as_str().filter(|v| !v.is_empty())?;
-            Some((tag, value))
-        })
-        .collect();
+        let entries = log_ddtags_appended(rec);
         let ddtags = match get(rec, "ddtags") {
             None => "",
             Some(Value::String(ddtags)) => ddtags.as_str(),
@@ -1162,6 +1150,24 @@ mod datadog {
             })
             .collect();
         Some((!rest.is_empty()).then(|| rest.join(",")))
+    }
+
+    /// The `env:`, `version:`, and `container_id:` entries `datadog_out` appends to a log's
+    /// `ddtags`, as `(tag, value)`: one per non-empty `Str` `deployment.environment.name`,
+    /// `service.version`, and `container.id`.
+    pub(super) fn log_ddtags_appended(rec: &Rec) -> Vec<(&'static str, &str)> {
+        use logit_core::attrs::{CONTAINER_ID, DEPLOYMENT_ENVIRONMENT_NAME, SERVICE_VERSION};
+        [
+            ("env", DEPLOYMENT_ENVIRONMENT_NAME),
+            ("version", SERVICE_VERSION),
+            ("container_id", CONTAINER_ID),
+        ]
+        .into_iter()
+        .filter_map(|(tag, key)| {
+            let value = get(rec, key)?.as_str().filter(|v| !v.is_empty())?;
+            Some((tag, value))
+        })
+        .collect()
     }
 
     /// Whether a log's `container.id` leaves inside its `ddtags` string, as a `container_id:`
@@ -2906,8 +2912,9 @@ fn observe_field(field: &Field, input: &Rec, out: &Rec, spelling: Spelling) -> C
                 return Class::Lost;
             }
             // A log's `container.id` reads back as a `container_id:` entry of its `ddtags`, and
-            // its `ddtags` as the encoder rewrites it, which is the string as it came once that
-            // entry is set aside.
+            // its `ddtags` as the encoder rewrites it: `exact` only where the string, less the
+            // entries the encoder appends, reads back as it came, since the rewrite drops empty
+            // entries.
             if spelling == Spelling::Datadog && input.kind == "log" && !*resource {
                 let read = out.attributes.get("ddtags").and_then(Value::as_str);
                 if key == logit_core::attrs::CONTAINER_ID
@@ -2919,20 +2926,27 @@ fn observe_field(field: &Field, input: &Rec, out: &Rec, spelling: Spelling) -> C
                 }
                 if key == "ddtags" {
                     if let Some(written) = datadog::log_ddtags(input) {
-                        let id = either_side(input, logit_core::attrs::CONTAINER_ID, false);
-                        let entry = datadog::log_container_id_in_ddtags(input)
-                            .then(|| format!("container_id:{}", id.map(text).unwrap_or_default()));
-                        let own = |ddtags: Option<&str>| -> Vec<String> {
-                            logit_proto::datadog::tags::split_joined(ddtags.unwrap_or(""))
-                                .filter(|tag| Some(*tag) != entry.as_deref())
-                                .map(str::to_string)
-                                .collect()
+                        let appended: Vec<String> = datadog::log_ddtags_appended(input)
+                            .into_iter()
+                            .map(|(tag, value)| format!("{tag}:{value}"))
+                            .collect();
+                        let own = |ddtags: &str| -> String {
+                            let tags =
+                                ddtags.split(',').filter(|tag| !appended.iter().any(|a| a == tag));
+                            tags.collect::<Vec<_>>().join(",")
                         };
                         return match read {
                             None if written.is_none() => Class::Normalized,
                             None => Class::Lost,
                             Some(_) if read != written.as_deref() => Class::Normalized,
-                            Some(_) if own(read) == own(want.as_str()) => Class::Exact,
+                            // A string that already ended with an appended entry reads back as
+                            // it came: the encoder drops that entry and appends it again.
+                            Some(read)
+                                if Some(read) == want.as_str()
+                                    || Some(own(read).as_str()) == want.as_str() =>
+                            {
+                                Class::Exact
+                            }
                             Some(_) => Class::Normalized,
                         };
                     }
@@ -4154,6 +4168,35 @@ mod tests {
         let bare = recs(&[&log_line(body, r#"{"host.name":"h","ddtags":"team:a"}"#)]);
         let id = Field::Attribute { key: "container.id".to_string(), resource: false };
         assert_eq!(observe_field(&id, &ins[0], &bare[0], Spelling::Datadog), Class::Lost);
+    }
+
+    /// Datadog rewrites a log's `ddtags` when it appends to it, dropping empty entries: the log
+    /// still pairs, and the string reads `normalized`, not `exact`.
+    #[test]
+    fn datadog_reads_a_rewritten_logs_ddtags_with_empty_entries_as_normalized() {
+        let body = r#""format":"raw","message":"m""#;
+        let ins = recs(&[&log_line(
+            body,
+            r#"{"host.name":"h","ddtags":"team:a,,b","container.id":"c1"}"#,
+        )]);
+        let outs =
+            recs(&[&log_line(body, r#"{"host.name":"h","ddtags":"team:a,b,container_id:c1"}"#)]);
+        assert_eq!(pair(&ins, &outs, Spelling::Datadog).seen, [Some(Class::Exact)]);
+        let ddtags = Field::Attribute { key: "ddtags".to_string(), resource: false };
+        assert_eq!(observe_field(&ddtags, &ins[0], &outs[0], Spelling::Datadog), Class::Normalized);
+    }
+
+    /// A log's `ddtags` that already ends with the `container_id:` entry its `container.id`
+    /// appends reads back byte for byte, and reads `exact`.
+    #[test]
+    fn datadog_reads_a_logs_ddtags_ending_with_its_appended_entry_as_exact() {
+        let body = r#""format":"raw","message":"m""#;
+        let tags = r#"{"host.name":"h","ddtags":"team:a,container_id:c1""#;
+        let ins = recs(&[&log_line(body, &format!(r#"{tags},"container.id":"c1"}}"#))]);
+        let outs = recs(&[&log_line(body, &format!("{tags}}}"))]);
+        assert_eq!(pair(&ins, &outs, Spelling::Datadog).seen, [Some(Class::Exact)]);
+        let ddtags = Field::Attribute { key: "ddtags".to_string(), resource: false };
+        assert_eq!(observe_field(&ddtags, &ins[0], &outs[0], Spelling::Datadog), Class::Exact);
     }
 
     /// The `ddtags` `datadog_in` reads back from a log: the encoder drops empty entries and any

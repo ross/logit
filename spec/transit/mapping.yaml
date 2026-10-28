@@ -2876,7 +2876,9 @@ rows:
         class: normalized
         reason: stringified
         text: Its RFC 3339 text as a JSON string, read back as a string.
-  # Only datadog_in's logs decode a JSON null attribute, so only the log sinks have a cell.
+  # datadog_in decodes a JSON null attribute on a log, and otlp_in an `AnyValue` with no value
+  # set on any signal, but no case puts a null on a metric's attributes, so only the log sinks
+  # have a cell.
   - kind: attributes
     feature: null_value
     cells:

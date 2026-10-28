@@ -444,7 +444,10 @@ allowance follows the mechanism, not the value type. The
 #### Uncounted losses
 
 In W5, `UNCOUNTED_ALLOWED`'s `("log", None, None)` narrows to
-`("log", Some("beside_metrics"), None)` plus the `syslog_out` entries above. Every other
+`("log", Some("beside_metrics"), None)` plus the `syslog_out` entries above. Two of those carry
+the `structured_data:` encoder's own uncounted losses: a `Bytes` value written as its length, on
+the shared `bytes_value` entry, and an opted-in empty array, which writes one PARAM per element
+and so none, on `attributes/sd_empty_array`. Every other
 uncounted loss of a log field is a format with no slot, and reads `lost, reason: structural`:
 
 - Datadog: trace flags, event name, observed time, body format, and dropped-attribute count.
@@ -1111,11 +1114,20 @@ Recorded per workstream as each lands.
     `ddtags`, and `datadog_in` lifts only `env:`, `version:`, and `service:` entries, so the id
     reads back inside the `ddtags` string and no `container.id` does (`attributes/container_id`,
     `normalized`). The class check's Datadog spelling models the rewrite
-    (`datadog::log_ddtags` in `classes.rs`). Where it appends an entry, the encoder also drops
-    the string's empty entries.
+    (`datadog::log_ddtags` in `classes.rs`). Datadog rewrites `ddtags` when it appends to it,
+    dropping the string's empty entries, and the check reads such a string `normalized`; no case
+    reaches that, since `attributes/string_value`'s `datadog_out` cell is `exact`.
   - A JSON `null` attribute reaches a row of its own, `attributes/null_value`: `exact` at
     `datadog_out` and `otlp_out`, and under `structured_data:` an empty PARAM-VALUE that
     `syslog_in` reads back as `""`, so null and the empty string meet there.
+  - Under `structured_data:`, an opted-in empty array leaves no PARAM and moves no counter
+    (`attributes/sd_empty_array`, `lost`, uncounted), where a key that isn't an SD-NAME and an
+    SD-ID collision are each counted. Its `UNCOUNTED_ALLOWED` entry is one of the two for the
+    `structured_data:` encoder's own uncounted losses, beside `bytes_value`'s for a `Bytes`
+    value written as its length (ADR `transit-spec`'s log-records amendment, decision 9).
+  - `datadog_in` reads a fractional-millisecond `timestamp` through an `f64`, so
+    `1799999990001.5` reads `07:59:50.001499904Z`, a sub-microsecond error, and `datadog_out`
+    writes whole milliseconds (`log/timestamp`, `normalized`).
   - Every `status` form `status_severity` knows maps to its band and stays verbatim as the
     attribute `status`; an unknown one, `verbose`, stays as the attribute with no severity, and
     `datadog_out` writes it back as it came, while `syslog_out` stamps PRI severity 6

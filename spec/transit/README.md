@@ -173,10 +173,11 @@ as it stands, only on the cells `crates/logit-cli/src/transit/mapping.rs`'s `UNC
 names: span payloads, which aren't classified yet, log records at a sink other than `otlp_out`,
 `datadog_out`, `syslog_out`, `splunk_hec_out`, and `statsd_out`; `datadog_out`'s carrier on a
 log; and `syslog_out`'s attribute rows, since it leaves every attribute outside its header fields
-off a log by one mechanism, and under `structured_data:` writes a `Bytes` one as its length. A
-`skipped` or `dropped` cell may name a counter beside `reason: uncounted` where the sink counts
-the loss on one path and not another: `syslog_out` counts a span-only event it skips and not a
-span it leaves off beside a log.
+off a log by one mechanism, and under `structured_data:` writes a `Bytes` one as its length (on
+the `bytes_value` entry) and an empty array as no PARAM (on `sd_empty_array`). A `skipped` or
+`dropped` cell may name a counter beside `reason: uncounted` where the sink counts the loss on
+one path and not another: `syslog_out` counts a span-only event it skips and not a span it leaves
+off beside a log.
 When a sink's behavior depends on its config, the sink's entry is a list: each cell but the last
 has a `when:` map of config fields, the first that matches the flow's sink config applies, and
 the last applies otherwise:
