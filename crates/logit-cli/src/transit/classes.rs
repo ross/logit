@@ -2678,7 +2678,14 @@ fn observe_field(field: &Field, input: &Rec, out: &Rec, spelling: Spelling) -> C
                             None if written.is_none() => Class::Normalized,
                             None => Class::Lost,
                             Some(_) if read != written.as_deref() => Class::Normalized,
-                            Some(read) if Some(own(read).as_str()) == want.as_str() => Class::Exact,
+                            // A string that already ended with an appended entry reads back as
+                            // it came: the encoder drops that entry and appends it again.
+                            Some(read)
+                                if Some(read) == want.as_str()
+                                    || Some(own(read).as_str()) == want.as_str() =>
+                            {
+                                Class::Exact
+                            }
                             Some(_) => Class::Normalized,
                         };
                     }
@@ -3915,6 +3922,19 @@ mod tests {
         assert_eq!(pair(&ins, &outs, Spelling::Datadog).seen, [Some(Class::Exact)]);
         let ddtags = Field::Attribute { key: "ddtags".to_string(), resource: false };
         assert_eq!(observe_field(&ddtags, &ins[0], &outs[0], Spelling::Datadog), Class::Normalized);
+    }
+
+    /// A log's `ddtags` that already ends with the `container_id:` entry its `container.id`
+    /// appends reads back byte for byte, and reads `exact`.
+    #[test]
+    fn datadog_reads_a_logs_ddtags_ending_with_its_appended_entry_as_exact() {
+        let body = r#""format":"raw","message":"m""#;
+        let tags = r#"{"host.name":"h","ddtags":"team:a,container_id:c1""#;
+        let ins = recs(&[&log_line(body, &format!(r#"{tags},"container.id":"c1"}}"#))]);
+        let outs = recs(&[&log_line(body, &format!("{tags}}}"))]);
+        assert_eq!(pair(&ins, &outs, Spelling::Datadog).seen, [Some(Class::Exact)]);
+        let ddtags = Field::Attribute { key: "ddtags".to_string(), resource: false };
+        assert_eq!(observe_field(&ddtags, &ins[0], &outs[0], Spelling::Datadog), Class::Exact);
     }
 
     /// The `ddtags` `datadog_in` reads back from a log: the encoder drops empty entries and any
