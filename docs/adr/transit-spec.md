@@ -276,7 +276,10 @@ have one case. The `tlog` stream fills that in, and settles these:
    (`host_beside_host_name`, `hostname`, `log_service`, `log_service_field`, `container_id`,
    `service_identity`, `service_tag`, and `service_tag_beside_key`). `syslog_out` leaves every
    attribute outside its header fields off by one mechanism, so the allowance follows that
-   mechanism, not the value type. Every other uncounted loss of a log field is a format with no
+   mechanism, not the value type. A second mechanism, the `structured_data:` encoder's, has one
+   entry too: `attributes/sd_empty_array`, an opted-in empty array, which writes one PARAM per
+   element and so none, with no counter, where its siblings `sd_name_unsafe` and
+   `sd_id_collision` are counted. Every other uncounted loss of a log field is a format with no
    slot and reads `lost, structural`. The `span` entry stays until spans are classified.
 10. **Log cases live in log-only directories** (`cases/otlp-logs/`, `cases/datadog-logs/`,
     `cases/syslog/`, `cases/splunk/`), so a log flow never routes a metric case into a sink with

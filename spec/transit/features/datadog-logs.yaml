@@ -55,7 +55,9 @@
 - name: timestamp_ms
   text: A `timestamp` in integer milliseconds.
 - name: fractional_timestamp
-  text: A `timestamp` in fractional milliseconds, kept to the nanosecond.
+  text: >-
+    A `timestamp` in fractional milliseconds, read through an `f64`, so the fraction comes back
+    with a sub-microsecond error.
 - name: rfc3339_timestamp
   text: A `timestamp` as an RFC 3339 string, in UTC or with an offset.
 - name: no_timestamp
