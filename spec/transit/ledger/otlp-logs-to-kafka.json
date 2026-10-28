@@ -36,7 +36,7 @@
     {"sink":"kafka_out","row":"log/trace","cell":1,"observed":["exact"]},
     {"sink":"kafka_out","row":"log/trace_flags","cell":1,"observed":["exact"]},
     {"sink":"kafka_out","row":"log/trace_unset","cell":1,"observed":["exact"]},
-    {"sink":"kafka_out","row":"span/alone","cell":1,"observed":["exact"]}
+    {"sink":"kafka_out","row":"span/beside_log","cell":1,"observed":["exact"]}
   ],
   "unspecified": [
     {"sink":"kafka_out","row":"gauge/i64","reached_by":["otlp-logs-to-kafka × beside-metrics"]}

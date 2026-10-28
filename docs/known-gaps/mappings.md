@@ -650,6 +650,60 @@ Entry format and the other areas: [the known-gaps index](README.md).
 
   <!-- transit:gaps:kafka_out -->
 
+  | Direction | Mapping | Counter | Why |
+  |---|---|---|---|
+  | encode (Kafka) | field `attributes/string_value`, under `format: text` → **lost** | none (structural) | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
+  | encode (Kafka) | field `attributes/host_beside_host_name`, under `format: text` → **lost** | none (structural) | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
+  | encode (Kafka) | field `attributes/hostname`, under `format: text` → **lost** | none (structural) | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
+  | encode (Kafka) | field `attributes/log_service`, under `format: text` → **lost** | none (structural) | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
+  | encode (Kafka) | field `attributes/log_service_field`, under `format: text` → **lost** | none (structural) | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
+  | encode (Kafka) | field `attributes/container_id`, under `format: text` → **lost** | none (structural) | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
+  | encode (Kafka) | field `attributes/service_identity`, under `format: text` → **lost** | none (structural) | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
+  | encode (Kafka) | field `attributes/service_tag`, under `format: text` → **lost** | none (structural) | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
+  | encode (Kafka) | field `attributes/service_tag_beside_key`, under `format: text` → **lost** | none (structural) | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
+  | encode (Kafka) | field `attributes/bool_value`, under `format: text` → **lost** | none (structural) | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
+  | encode (Kafka) | field `attributes/number_value`, under `format: text` → **lost** | none (structural) | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
+  | encode (Kafka) | field `attributes/array_value`, under `format: text` → **lost** | none (structural) | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
+  | encode (Kafka) | field `attributes/map_value`, under `format: text` → **lost** | none (structural) | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
+  | encode (Kafka) | field `attributes/bytes_value`, under `format: text` → **lost** | none (structural) | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
+  | encode (Kafka) | field `attributes/timestamp_value`, under `format: text` → **lost** | none (structural) | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
+  | encode (Kafka) | field `attributes/null_value`, under `format: text` → **lost** | none (structural) | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
+  | encode (Kafka) | field `attributes/private_carrier`, under `format: text` → **lost** | none (structural) | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
+  | encode (Kafka) | field `attributes/prometheus_target`, under `format: text` → **lost** | none (structural) | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
+  | encode (Kafka) | field `attributes/foreign_carrier`, under `format: text` → **lost** | none (structural) | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
+  | encode (Kafka) | field `attributes/timestamped`, under `format: text` → **lost** | none (structural) | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
+  | encode (Kafka) | field `attributes/rate`, under `format: text` → **lost** | none (structural) | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
+  | encode (Kafka) | field `attributes/interval`, under `format: text` → **lost** | none (structural) | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
+  | encode (Kafka) | field `attributes/rate_on_non_gauge`, under `format: text` → **lost** | none (structural) | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
+  | encode (Kafka) | field `attributes/family_type`, under `format: text` → **lost** | none (structural) | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
+  | encode (Kafka) | field `attributes/family_type_on_other_kind`, under `format: text` → **lost** | none (structural) | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
+  | encode (Kafka) | field `attributes/interval_on_distribution`, under `format: text` → **lost** | none (structural) | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
+  | encode (Kafka) | field `attributes/interval_on_histogram`, under `format: text` → **lost** | none (structural) | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
+  | encode (Kafka) | field `attributes/resource_attribute`, under `format: text` → **lost** | none (structural) | A `format: text` record holds the log body alone, so the resource is left off. |
+  | encode (Kafka) | field `attributes/scope`, under `format: text` → **lost** | none (structural) | A `format: text` record holds the log body alone, so the scope is left off. |
+  | encode (Kafka) | field `attributes/datadog_carrier_log`, under `format: text` → **lost** | none (structural) | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
+  | encode (Kafka) | field `attributes/severity_carrier_otel`, under `format: text` → **lost** | none (structural) | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
+  | encode (Kafka) | field `attributes/severity_carrier_syslog`, under `format: text` → **lost** | none (structural) | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
+  | encode (Kafka) | field `attributes/syslog_header`, under `format: text` → **lost** | none (structural) | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
+  | encode (Kafka) | field `attributes/syslog_msgid`, under `format: text` → **lost** | none (structural) | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
+  | encode (Kafka) | field `attributes/syslog_sd`, under `format: text` → **lost** | none (structural) | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
+  | encode (Kafka) | field `attributes/syslog_timestamp`, under `format: text` → **lost** | none (structural) | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
+  | encode (Kafka) | field `attributes/host_name`, under `format: text` → **lost** | none (structural) | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
+  | encode (Kafka) | field `attributes/splunk_envelope`, under `format: text` → **lost** | none (structural) | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
+  | encode (Kafka) | field `log/severity`, under `format: text` → **lost** | none (structural) | A `format: text` record holds the log body alone, so the log's severity is left off. |
+  | encode (Kafka) | field `log/body_format`, under `format: text` → **lost** | none (structural) | A `format: text` record holds the log body alone, so the log's body format is left off. |
+  | encode (Kafka) | field `log/event_name`, under `format: text` → **lost** | none (structural) | A `format: text` record holds the log body alone, so the log's event name is left off. |
+  | encode (Kafka) | field `log/observed_timestamp`, under `format: text` → **lost** | none (structural) | A `format: text` record holds the log body alone, so the log's observed time is left off. |
+  | encode (Kafka) | field `log/trace`, under `format: text` → **lost** | none (structural) | A `format: text` record holds the log body alone, so the log's trace and span ids are left off. |
+  | encode (Kafka) | field `log/trace_flags`, under `format: text` → **lost** | none (structural) | A `format: text` record holds the log body alone, so the log's trace flags are left off. |
+  | encode (Kafka) | field `log/dropped_attributes_count`, under `format: text` → **lost** | none (structural) | A `format: text` record holds the log body alone, so the log's dropped-attribute count is left off. |
+  | encode (Kafka) | `span/alone`, under `format: text` → **skipped** | `logit.output.events.skipped{reason=no_log}` | An event with no log has no `format: text` record. |
+  | encode (Kafka) | `span/beside_log`, under `format: text` → **skipped** | `logit.output.spans.omitted{reason=format}` | The record holds the log body alone, so the span beside it is left off, counted. |
+  | encode (Kafka) | `span/no_wire_form`, under `format: text` → **skipped** | `logit.output.events.skipped{reason=no_log}` | An event with no log has no `format: text` record. |
+  | encode (Kafka) | field `span/beside_metrics`, under `format: text` → **lost** | `logit.output.events.skipped{reason=no_log}` | An event with no log has no `format: text` record, so the span and its metrics are left off, counted once for the event. |
+  | encode (Kafka) | `event/attributes_only`, under `format: text` → **skipped** | `logit.output.events.skipped{reason=no_log}` | An event with no log has no `format: text` record. |
+  | encode (Kafka) | `event/string_only`, under `format: text` → **skipped** | `logit.output.events.skipped{reason=no_log}` | An InfluxDB point whose fields are all strings has no log, so it has no `format: text` record. |
+
   <!-- transit:end -->
 
   **Too narrow for a row:** `BodyFormat` has no OTLP field and round-trips through a reserved

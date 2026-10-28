@@ -90,6 +90,149 @@
 //! event JSON reader, and a `format: text` record as one log whose message is the value.
 //!
 //! <!-- transit:doc:kafka_out -->
+//!
+//! Per metric kind, and per record feature that decides a record's fate:
+//!
+//! | Row | Class | Reason or counter | What a consumer sees |
+//! |---|---|---|---|
+//! | `log/dogstatsd_event`, under `format: text` | exact | -- | The event's text as the record's value; its title and the other `_logit.statsd.event.*` carriers are attributes, left off. |
+//! | `log/dogstatsd_event`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `log/plain`, under `format: text` | exact | -- | The log's message as the record's value, read back as one log per record. |
+//! | `log/plain`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `log/message_unsafe`, under `format: text` | normalized | `message_as_text` | A message that isn't a string leaves as its text: a number or a boolean as its decimal or `true`/`false`, a timestamp as RFC 3339, no message as an empty record, and a map or array as its JSON text; each reads back as a string. |
+//! | `log/message_unsafe`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `log/structured_message`, under `format: text` | normalized | `message_as_text` | A `Map` or `Array` message leaves as its JSON text, which reads back as a string. |
+//! | `log/structured_message`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `log/bytes_message`, under `format: text` | exact | -- | A `Bytes` message leaves as its raw bytes, the record's value, which carries no type: a consumer that reads values as text sees a UTF-8 one as a string. |
+//! | `log/bytes_message`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `log/blank_message`, under `format: text` | normalized | `message_as_text` | An empty message leaves an empty record, and a log with no message one too, which reads back as the empty string. |
+//! | `log/blank_message`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `span/alone`, under `format: text` | skipped | `logit.output.events.skipped{reason=no_log}` | An event with no log has no `format: text` record. |
+//! | `span/alone`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `span/beside_log`, under `format: text` | skipped | `logit.output.spans.omitted{reason=format}` | The record holds the log body alone, so the span beside it is left off, counted. |
+//! | `span/beside_log`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `span/no_wire_form`, under `format: text` | skipped | `logit.output.events.skipped{reason=no_log}` | An event with no log has no `format: text` record. |
+//! | `span/no_wire_form`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `event/attributes_only`, under `format: text` | skipped | `logit.output.events.skipped{reason=no_log}` | An event with no log has no `format: text` record. |
+//! | `event/attributes_only`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `event/string_only`, under `format: text` | skipped | `logit.output.events.skipped{reason=no_log}` | An InfluxDB point whose fields are all strings has no log, so it has no `format: text` record. |
+//! | `event/string_only`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//!
+//! Per field of a record that reaches the wire, attribute shape, and payload beside metrics:
+//!
+//! | Row | Class | Reason or counter | What a consumer sees |
+//! |---|---|---|---|
+//! | `attributes/string_value`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
+//! | `attributes/string_value`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `attributes/host_beside_host_name`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
+//! | `attributes/host_beside_host_name`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `attributes/hostname`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
+//! | `attributes/hostname`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `attributes/log_service`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
+//! | `attributes/log_service`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `attributes/log_service_field`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
+//! | `attributes/log_service_field`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `attributes/container_id`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
+//! | `attributes/container_id`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `attributes/service_identity`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
+//! | `attributes/service_identity`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `attributes/service_tag`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
+//! | `attributes/service_tag`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `attributes/service_tag_beside_key`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
+//! | `attributes/service_tag_beside_key`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `attributes/bool_value`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
+//! | `attributes/bool_value`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `attributes/number_value`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
+//! | `attributes/number_value`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `attributes/array_value`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
+//! | `attributes/array_value`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `attributes/map_value`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
+//! | `attributes/map_value`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `attributes/bytes_value`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
+//! | `attributes/bytes_value`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `attributes/timestamp_value`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
+//! | `attributes/timestamp_value`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `attributes/null_value`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
+//! | `attributes/null_value`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `attributes/private_carrier`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
+//! | `attributes/private_carrier`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `attributes/prometheus_target`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
+//! | `attributes/prometheus_target`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `attributes/foreign_carrier`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
+//! | `attributes/foreign_carrier`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `attributes/timestamped`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
+//! | `attributes/timestamped`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `attributes/rate`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
+//! | `attributes/rate`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `attributes/interval`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
+//! | `attributes/interval`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `attributes/rate_on_non_gauge`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
+//! | `attributes/rate_on_non_gauge`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `attributes/family_type`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
+//! | `attributes/family_type`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `attributes/family_type_on_other_kind`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
+//! | `attributes/family_type_on_other_kind`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `attributes/interval_on_distribution`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
+//! | `attributes/interval_on_distribution`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `attributes/interval_on_histogram`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
+//! | `attributes/interval_on_histogram`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `attributes/resource_attribute`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the resource is left off. |
+//! | `attributes/resource_attribute`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `attributes/scope`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the scope is left off. |
+//! | `attributes/scope`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `attributes/datadog_carrier_log`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
+//! | `attributes/datadog_carrier_log`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `attributes/severity_carrier_otel`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
+//! | `attributes/severity_carrier_otel`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `attributes/severity_carrier_syslog`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
+//! | `attributes/severity_carrier_syslog`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `attributes/syslog_header`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
+//! | `attributes/syslog_header`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `attributes/syslog_msgid`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
+//! | `attributes/syslog_msgid`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `attributes/syslog_sd`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
+//! | `attributes/syslog_sd`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `attributes/syslog_timestamp`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
+//! | `attributes/syslog_timestamp`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `attributes/host_name`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
+//! | `attributes/host_name`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `attributes/splunk_envelope`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
+//! | `attributes/splunk_envelope`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `attributes/syslog_facility` | exact | -- | `kafka_out` writes no attribute from a record's own fields or its config. |
+//! | `attributes/no_host` | exact | -- | `kafka_out` writes no attribute from a record's own fields or its config. |
+//! | `attributes/log_status` | exact | -- | `kafka_out` writes no attribute from a record's own fields or its config. |
+//! | `attributes/log_severity_fields` | exact | -- | `kafka_out` writes no attribute from a record's own fields or its config. |
+//! | `attributes/span_kind` | exact | -- | `kafka_out` writes no attribute from a record's own fields or its config. |
+//! | `attributes/trace_id_high` | exact | -- | `kafka_out` writes no attribute from a record's own fields or its config. |
+//! | `log/severity`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the log's severity is left off. |
+//! | `log/severity`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `log/severity_unset`, under `format: text` | exact | -- | Nothing is written, and nothing reads back. |
+//! | `log/severity_unset`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `log/body_format`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the log's body format is left off. |
+//! | `log/body_format`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `log/event_name`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the log's event name is left off. |
+//! | `log/event_name`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `log/observed_timestamp`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the log's observed time is left off. |
+//! | `log/observed_timestamp`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `log/observed_timestamp_unset`, under `format: text` | exact | -- | Nothing is written, and nothing reads back. |
+//! | `log/observed_timestamp_unset`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `log/trace`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the log's trace and span ids are left off. |
+//! | `log/trace`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `log/trace_unset`, under `format: text` | exact | -- | Nothing is written, and nothing reads back. |
+//! | `log/trace_unset`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `log/trace_flags`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the log's trace flags are left off. |
+//! | `log/trace_flags`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `log/dropped_attributes_count`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the log's dropped-attribute count is left off. |
+//! | `log/dropped_attributes_count`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `log/timestamp`, under `format: text` | normalized | `timestamp_precision` | The record's timestamp, in whole milliseconds. |
+//! | `log/timestamp`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `log/receipt_timestamp`, under `format: text` | normalized | `timestamp_precision` | The record's timestamp, the receipt time in whole milliseconds; the `syslog.timestamp` beside it is an attribute, left off. |
+//! | `log/receipt_timestamp`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `log/beside_metrics`, under `format: text` | exact | `logit.output.metrics.omitted{reason=format}` | The log's body as the record; the event's metrics are left off, counted. |
+//! | `log/beside_metrics`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `span/beside_metrics`, under `format: text` | lost | `logit.output.events.skipped{reason=no_log}` | An event with no log has no `format: text` record, so the span and its metrics are left off, counted once for the event. |
+//! | `span/beside_metrics`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//!
 //! <!-- transit:end -->
 
 use std::collections::HashMap;
