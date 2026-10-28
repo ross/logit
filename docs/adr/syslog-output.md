@@ -390,9 +390,9 @@ RFC 3164 makes no header field certain, so a reader tells HOSTNAME from MSG only
 it. `syslog_in`'s header rule (`crates/logit-proto/src/syslog/mod.rs`'s "The RFC 3164 header")
 reads a HOSTNAME only before a TAG-shaped token, so a TAG-less `<PRI>TIMESTAMP HOSTNAME MSG` reads
 back with no `host.name` and the hostname as the first word of its message, and a message whose
-first word is TAG-shaped reads back with that word as `syslog.tag`. Before this amendment, the
-fallback chain above ended in an omitted TAG, and that misreading was the result at `syslog_in`
-and at any receiver with the same rule.
+first word is TAG-shaped reads back with that word as `syslog.tag`. Before this amendment, a log
+with no `syslog.tag` and no `app_name:` had no TAG, and that misreading was the result at
+`syslog_in` and at any receiver with the same rule.
 
 Consequences:
 

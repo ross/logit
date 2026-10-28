@@ -363,13 +363,15 @@ counter:
 | Outcome | Group | Counted as |
 |---|---|---|
 | a signal beside the ones a sink writes: a log beside metrics at `influxdb_out`, `prometheus_out`, `graphite_out`, or `statsd_out`; metrics or a span beside a log at `syslog_out`; a span beside a DogStatsD event at `statsd_out` | ignored signal, a fourth group | nothing |
-| a field with no slot in the format the sink's config selects: every attribute outside `syslog_out`'s header fields under `format: rfc3164`, and under `format: rfc5424` with no `structured_data:`; everything but the body under `kafka_out`'s `format: text` | Structural | nothing; the cell's reason is `structural` |
+| metrics or a span beside a log at `kafka_out` under `format: text` | ignored signal | counted, see below |
+| a field with no slot in the format the sink's config selects: every attribute outside `syslog_out`'s header fields under `format: rfc3164`, and under `format: rfc5424` with no `structured_data:`; the log's own fields other than the body under `kafka_out`'s `format: text` | Structural | nothing; the cell's reason is `structural` |
 
 - **A sink ignores a signal it has no wire for.** It writes the signals it carries and ignores
   the rest, uncounted: a log has no form at a metrics sink, and metrics have none in a syslog
   message. The count would track how many mixed events the pipeline makes, which is the
   pipeline's shape, not loss. An event that produces nothing at the sink is still a record-level
-  outcome and counts `output.events.skipped{reason}`, as each sink does today.
+  outcome and counts `output.events.skipped{reason}`. `syslog_out` counts its skip untagged
+  until the `tsink` stream tags it `reason="no_log"`.
 - **Counting the ignored piece is permitted, not required.** `kafka_out`'s `format: text`
   counts `output.metrics.omitted{reason="format"}` and `output.spans.omitted{reason="format"}`
   (this record's 2026-10-13 amendment) and keeps both. Another sink isn't held to it.

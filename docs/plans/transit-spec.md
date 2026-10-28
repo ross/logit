@@ -591,11 +591,12 @@ the stream leaves alone.
    beside the ones a sink writes, the sink writes what it carries and ignores the rest with no
    counter: a log beside metrics at `influxdb_out`, `prometheus_out`, `graphite_out`, and
    `statsd_out`; metrics or a span beside a log at `syslog_out`; a span beside a DogStatsD event
-   at `statsd_out`. An event that produces nothing still counts `events.skipped{reason}`, as
-   today. A sink may count the ignored piece, as `kafka_out`'s `format: text` counts
-   `metrics.omitted{reason="format"}` and `spans.omitted{reason="format"}`, but isn't required
-   to. In `UNCOUNTED_ALLOWED` the rule is `("log", Some("beside_metrics"), None)` and the span
-   rows, `("span", None, None)` until `tspan` narrows it. `docs/known-gaps/statsd.md`'s "A span
+   at `statsd_out`. An event that produces nothing still counts `events.skipped{reason}`;
+   `syslog_out` gains its `reason="no_log"` in W1 (decision 5). A sink may count the ignored
+   piece, as `kafka_out`'s `format: text` counts `metrics.omitted{reason="format"}` and
+   `spans.omitted{reason="format"}`, but isn't required to. In `UNCOUNTED_ALLOWED` the rule is
+   `("log", Some("beside_metrics"), None)` and the span rows, `("span", None, None)` until
+   `tspan` narrows it. `docs/known-gaps/statsd.md`'s "A span
    beside a DogStatsD event is left off uncounted" becomes a statement of the rule, not a revisit.
 2. **A format the config selects defines the sink's slots, and a field with no slot in it is
    structural, uncounted.** This extends the "Structural" group of
