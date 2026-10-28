@@ -311,9 +311,10 @@ header, and `UNCOUNTED_ALLOWED`'s doc each say:
 - The class check compares a log as one body. Pass 2's `same_value` is message equality, so a
   log whose severity, trace, or observed time changes reads `normalized` with no row naming the
   change.
-- Four of the six sink columns have only `skipped` or `lost, uncounted` log cells.
-- The four pairs that carry logs, `syslog`, OTLP logs, Datadog logs, and `splunk_hec`, each lack
-  a column, a source, or both.
+- Three of the six columns (`prometheus_out`, `influxdb_out`, `graphite_out`) have only
+  `skipped` or `lost, uncounted` log cells, and `statsd_out` writes only DogStatsD events.
+- `syslog` and `splunk_hec` lack a source and a column, OTLP logs lack a source, and Datadog logs
+  have one case.
 
 Spans follow as their own stream, `tspan`, once logs land.
 
@@ -334,8 +335,8 @@ changes a value.
 | `plain` | record | A log on an event with no metrics. Every such log reaches it. |
 | `dogstatsd_event` | record | A DogStatsD event on an event with no metrics. |
 | `message_unsafe` | record | A message the sink's encoder rewrites, such as `syslog_out`'s C0 and DEL sanitizing. |
-| `structured_message` | record | A `Map` or `Array` message, which a text wire writes as JSON text. |
-| `bytes_message` | record | A `Bytes` message, which a text wire writes lossily. |
+| `structured_message` | record | A `Map` or `Array` message: JSON text at `datadog_out` and `kafka_out`'s `format: text`, `{k=v}` text at `syslog_out`, and a JSON value at `splunk_hec_out`. |
+| `bytes_message` | record | A `Bytes` message: lossy UTF-8 at `datadog_out` and `splunk_hec_out`, and raw bytes at `syslog_out` (C0 and DEL escaped) and `kafka_out`'s `format: text`. |
 | `blank_message` | record | An empty message. |
 | `severity` | field | The log's `Severity`. |
 | `severity_unset` | field | A log with no severity, which a sink may stamp. |
@@ -355,10 +356,11 @@ changes a value.
 
 A log's identity is its message, respelled per sink. For a log, `Spelling::written` is the
 message as the sink's encoder renders it and the pair's decoder reads it back: `syslog_out`'s
-C0 and DEL sanitizing, Datadog's JSON text of a `Map`, Splunk's lossy `Bytes`, and the body
-`kafka_out`'s `format: text` writes. A rewritten message pairs in the respelled pass and reads
-record-level `normalized` through `log/message_unsafe` or `log/structured_message`, as
-`record/name_unsafe` works for a metric. Once a log pairs, `same_value` for it is `true`, and the
+C0 and DEL sanitizing and `{k=v}` text of a `Map`, Datadog's JSON text of a `Map` and lossy
+`Bytes`, Splunk's lossy `Bytes`, and the body `kafka_out`'s `format: text` writes. A rewritten
+message pairs in the respelled pass and reads record-level `normalized` through
+`log/message_unsafe` or `log/structured_message`, and a lossy `Bytes` through
+`log/bytes_message`, as `record/name_unsafe` works for a metric. Once a log pairs, `same_value` for it is `true`, and the
 field rows carry every other difference.
 
 #### Timestamps
@@ -372,7 +374,8 @@ log's time is a field its consumer reads:
   `event.timestamp`, which `syslog_out` has no slot for (`lost, structural`).
 
 At `syslog_out` the check reads the written instant from the read-back `syslog.timestamp`, since
-`syslog_in` stamps `event.timestamp` with the driver's fixed `RECEIVED_AT`. No wall-clock clamp
+`syslog_in` stamps `event.timestamp` with the read-back's `received_at`, the driver's fixed
+`Options::now` (the case's latest timestamp plus one second). No wall-clock clamp
 is needed: `otlp_out`'s observed stamp is the one place the driver reads the clock (§4).
 
 #### Severity carriers
@@ -437,9 +440,14 @@ per value-type row at `syslog_out`, and the missing counter is a sink finding. T
 In W5, `UNCOUNTED_ALLOWED`'s `("log", None, None)` narrows to
 `("log", Some("beside_metrics"), None)` plus the `syslog_out` entries above. Every other
 uncounted loss of a log field is a format with no slot, and reads `lost, reason: structural`:
-Datadog's trace flags, event name, observed time, and body format; syslog's trace, event name,
-and observed time; and Splunk's observed time and dropped-attribute count. The `span` entry
-stays for `tspan`.
+
+- Datadog: trace flags, event name, observed time, body format, and dropped-attribute count.
+- syslog: trace, trace flags, event name, observed time, body format, and dropped-attribute
+  count.
+- Splunk: trace flags, observed time, body format, and dropped-attribute count.
+- `kafka_out`'s `format: text` writes only the body.
+
+The `span` entry stays for `tspan`.
 
 `otlp_out`'s `log/plain`, `log/dogstatsd_event`, and `log/beside_metrics` cells move from
 `normalized`, reason `observed_timestamp`, to `exact`, and the stamp lives on
@@ -489,8 +497,9 @@ W1 changes `crates/logit-cli/src/transit/`'s `mapping.rs`, `classes.rs`, `spec.r
     per sink. The `score` subset rule is what keeps a log from pairing at `syslog_out`,
     `splunk_hec_out`, and `datadog_out` today, since each decoder adds public attributes
     (`syslog.facility`, `syslog.timestamp`, and `host.name`; `otel.log.severity.*`; `trace_id`
-    and `span_id`). The derived entries make those pair. W1 lands the mechanism, and W2 and W4
-    the entries.
+    and `span_id`). The derived entries make those pair. W1 lands the mechanism and
+    `datadog_out`'s `trace_id` and `span_id` entries, and W2 and W4 the syslog and Splunk
+    entries.
 - **`spec.rs`**: `decode_wire` keys on the directory prefix, and an `otlp` wire file with no
   `.headers` picks its signal from the top-level key. W2 adds a `syslog` arm: `SyslogDecoder` at
   `RECEIVED_AT`, a datagram capture read as one datagram with line splitting, the listener's
@@ -539,11 +548,11 @@ when the parent merges.
 | # | Branch | Scope | Size |
 |---|---|---|---|
 | W0 | `tlog/w0` | This section and [ADR `transit-spec`](../adr/transit-spec.md)'s log-records amendment | S |
-| W1 | `tlog/w1` | The framework above, and the `otlp-logs` source: `/v1/logs` cases from `testdata/interop/otlp/logs.json`, whose signal comes from its top-level `resourceLogs` key, and hand-written ones covering every body kind, severity bands and carriers, `event_name`, a trace with flags, dropped counts, scope and `schema_url`, and a log beside metrics. Flows `otlp-logs-relay` and `otlp-logs-to-datadog`; the `datadog-logs` directory split, with `datadog-logs-relay` and `datadog-logs-to-otlp`; `otlp_out` and `datadog_out` cells on every new row; `otlp_out`'s region moved to `otlp/mod.rs` | L |
+| W1 | `tlog/w1` | The framework above, and the `otlp-logs` source: `/v1/logs` cases from `testdata/interop/otlp/logs.json`, whose signal comes from its top-level `resourceLogs` key, and hand-written ones covering every body kind, severity bands and carriers, `event_name`, a trace with flags, dropped counts, scope and `schema_url`, and a log beside metrics. Flows `otlp-logs-relay` and `otlp-logs-to-datadog`; the `datadog-logs` directory split, with `datadog-logs-relay` and `datadog-logs-to-otlp`; `otlp_out` and `datadog_out` cells on every new row; `datadog_out`'s derived `trace_id` and `span_id` entries; `otlp_out`'s region moved to `otlp/mod.rs` | L |
 | W2 | `tlog/w2` | The `syslog` source and the `syslog_out` column: cases from `testdata/interop/syslog/*.raw` (logger's RFC 3164, RFC 5424, and Unicode lines, the Python handler, and rsyslog over UDP and as a TCP stream through the RFC 6587 `Framer`) and hand-written ones (structured data, nil fields, a `Bytes` MSG, PROCID forms, an out-of-range timestamp). Flows `syslog-relay` under `format: rfc3164` and `rfc5424`, `syslog-to-otlp`, `syslog-to-datadog`, `otlp-logs-to-syslog`, and `datadog-logs-to-syslog` | L |
 | W2b | `tlog/w2b` | The `structured_data:` opt-in: a nested-key spelling for `syslog.sd`, and a `syslog-relay-sd` flow | S |
 | W3 | `tlog/w3` | The `datadog-logs` cases: hand-written `/api/v2/logs` bodies covering status forms, `ddsource`, the `ddtags` `env:`, `version:`, and `service:` lift, `service` beside `service.name`, `hostname`, a nested and a non-string `message`, RFC 3339 and fractional-millisecond `timestamp`s, `trace_id` and `span_id` attributes, and 101 tags. `datadog-logs-to-syslog` grows to match | M |
-| W4 | `tlog/w4` | The `splunk` source and the `splunk_hec_out` column: `pub fn decode_request` factored out of `handle` in `crates/logit-inputs/src/splunk.rs` (route, gzip, and the percent-decoded `/raw` envelope query); cases from `testdata/interop/splunk/`'s `services-collector-event-1-0` and `raw` captures, not the `OPTIONS` one, and hand-written ones (`otel.log.*` including `otel.log.name`, `fields` nesting, `time` forms, a non-string envelope, a blank event, an array body). Flows `splunk-relay`, `splunk-to-otlp`, `splunk-to-datadog`, `splunk-to-syslog`, `otlp-logs-to-splunk`, `datadog-logs-to-splunk`, and `syslog-to-splunk` | L |
+| W4 | `tlog/w4` | The `splunk` source and the `splunk_hec_out` column: `pub fn decode_request` factored out of `handle` in `crates/logit-inputs/src/splunk.rs` (route, gzip, and the percent-decoded `/raw` envelope query); cases from the log `POST` captures under `testdata/interop/splunk/` (the OTel exporter's `otel-services-collector-001` and `-raw-000`, SC4S's, Docker's, and the Java appender's), not Docker's three `OPTIONS` probes or the `/health` GET, and hand-written ones (`otel.log.*` including `otel.log.name`, `fields` nesting, `time` forms, a non-string envelope, a blank event, an array body). Flows `splunk-relay`, `splunk-to-otlp`, `splunk-to-datadog`, `splunk-to-syslog`, `otlp-logs-to-splunk`, `datadog-logs-to-splunk`, and `syslog-to-splunk` | L |
 | W5 | `tlog/w5` | The `kafka_out` column under `format: json` and `text`: the `otlp-logs`, `syslog`, `datadog-logs`, and `splunk` sources' `-to-kafka` and `-to-kafka-text` flows. `log/dogstatsd_event` through the new sinks; a coverage sweep to no unreached log cell; the `UNCOUNTED_ALLOWED` narrowing; `docs/known-gaps/mappings.md`'s hand-written Splunk and syslog log rows reconciled with the generated regions; `spec/transit/README.md`'s source and sink lists, `transit/mod.rs`'s account of what the driver rejects, and `AGENTS.md` | M |
 
 ## Workstreams
@@ -1005,10 +1014,10 @@ Recorded per workstream as each lands.
   - `DatadogEncoder::with_default_source` (`crates/logit-proto/src/datadog/mod.rs`) is called
     only from tests, so `datadog_out` never writes a default `ddsource`.
   - `splunk_hec_out` and `datadog_out` read neither `_logit.otel.severity_*` nor
-    `_logit.syslog.severity`. Each writes the band `Severity` alone, through `severity_number`
-    and `severity_text` (`crates/logit-proto/src/splunk/logs.rs`) and the `status` field
-    (`crates/logit-proto/src/datadog/logs.rs`), so OTLP's `INFO2` (10) leaves Splunk as 9,
-    `Info`.
+    `_logit.syslog.severity` (`crates/logit-proto/src/splunk/logs.rs`,
+    `crates/logit-proto/src/datadog/logs.rs`). Each writes a public severity attribute verbatim
+    when the log carries one (`otel.log.severity.*`, Datadog's `status`), and otherwise the band
+    `Severity`, so OTLP's `INFO2` (10) leaves Splunk as 9, `Info`.
   - `syslog_out` counts `logit.output.events.skipped` with no `reason` tag
     (`crates/logit-outputs/src/syslog.rs`, from `EncodeStats::skipped_no_log`), where every other
     sink that counts the series tags it. It drops MSGID under RFC 3164, since `write_rfc3164_header` takes no

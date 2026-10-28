@@ -233,9 +233,10 @@ and names the failing flow, with two more tests beside them:
 
 The table classifies metric records only. The class check compares a log as one body, its
 `same_value` message equality, so any other change to a log reads `normalized` with no row
-naming it, and four of the six columns have only `skipped` or `lost, uncounted` log cells. The
-four pairs that carry logs, `syslog`, OTLP logs, Datadog logs, and `splunk_hec`, each lack a
-column, a source, or both. The `tlog` stream fills that in, and settles these:
+naming it. Three of the six columns (`prometheus_out`, `influxdb_out`, `graphite_out`) have only
+`skipped` or `lost, uncounted` log cells, and `statsd_out` writes only DogStatsD events.
+`syslog` and `splunk_hec` lack a source and a column, OTLP logs lack a source, and Datadog logs
+have one case. The `tlog` stream fills that in, and settles these:
 
 1. **Log fields are rows under `kind: log`** in the one table, with the cell schema, class check,
    and renderer metrics use. Record-level rows (`plain`, `dogstatsd_event`, `message_unsafe`,
