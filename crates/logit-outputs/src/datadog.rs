@@ -632,14 +632,67 @@ struct Plan {
     too_many_tags: [usize; 8],
     /// Per route, the first such record's metric name and tag count, for the diagnostic.
     too_many_tags_first: [Option<(Symbol, usize)>; 8],
-    /// Spans the trace route drops, per [`TraceReadiness::drop_reason`].
-    needs_agent_processing: usize,
-    not_datadog_origin: usize,
+    /// Spans the trace readiness gate holds back.
+    gated: Gated,
     /// The series points left off as duplicates of a later point of their series and second,
     /// planned over the whole batch so no request cut or bisection splits a pair.
     duplicates: Arc<SeriesDuplicates>,
     /// Events no route carries ([`Routing::unrouted`]).
     unrouted: usize,
+}
+
+/// The spans the trace readiness gate (module doc) holds back, per
+/// [`TraceReadiness::drop_reason`].
+#[derive(Debug, Default)]
+struct Gated {
+    needs_agent_processing: usize,
+    not_datadog_origin: usize,
+}
+
+impl Gated {
+    /// Each event's verdict for `batch` ([`trace_readiness`]), or none when it carries no span.
+    fn readiness(batch: &EventBatch) -> Vec<Option<TraceReadiness>> {
+        if batch.events.iter().any(|e| e.span.is_some()) {
+            trace_readiness(batch)
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Whether the span event at `index` goes out under `readiness`; one that doesn't is counted
+    /// here.
+    fn admits(&mut self, readiness: &[Option<TraceReadiness>], index: usize) -> bool {
+        match readiness[index] {
+            Some(TraceReadiness::Ready) => true,
+            Some(TraceReadiness::NeedsAgentProcessing) => {
+                self.needs_agent_processing += 1;
+                false
+            }
+            Some(TraceReadiness::NotDatadogOrigin) => {
+                self.not_datadog_origin += 1;
+                false
+            }
+            None => unreachable!("trace_readiness gives every span event a verdict"),
+        }
+    }
+
+    /// Counts what the gate held back on `telemetry`.
+    fn count(&self, telemetry: &Telemetry) {
+        count_dropped(
+            telemetry,
+            Route::Traces,
+            "needs_agent_processing",
+            self.needs_agent_processing,
+        );
+        count_dropped(telemetry, Route::Traces, "not_datadog_origin", self.not_datadog_origin);
+    }
+}
+
+/// Counts `n` records `route` dropped for `reason`, when there are any.
+fn count_dropped(telemetry: &Telemetry, route: Route, reason: &'static str, n: usize) {
+    if n > 0 {
+        telemetry.count(RECORDS_DROPPED, n as f64, &[("route", route.name()), ("reason", reason)]);
+    }
 }
 
 /// Plans the series route's duplicates over the whole batch, after the stale filter and the tag
@@ -728,11 +781,7 @@ fn partition(batch: &EventBatch, histograms: HistogramOptions) -> Routing {
 /// repeats the plan.
 fn plan(batch: &EventBatch, now: i64, histograms: HistogramOptions) -> Plan {
     let resource = &batch.resource;
-    let readiness = if batch.events.iter().any(|e| e.span.is_some()) {
-        trace_readiness(batch)
-    } else {
-        Vec::new()
-    };
+    let readiness = Gated::readiness(batch);
     let mut plan = Plan::default();
     let routing = partition(batch, histograms);
     plan.unrouted = routing.unrouted;
@@ -749,13 +798,8 @@ fn plan(batch: &EventBatch, now: i64, histograms: HistogramOptions) -> Plan {
                     age <= METRIC_MAX_AGE && event.timestamp.saturating_sub(now) <= METRIC_MAX_AHEAD
                 }
                 Route::Traces => {
-                    match readiness[item.index] {
-                        Some(TraceReadiness::Ready) => plan.routes[r].push(item),
-                        Some(TraceReadiness::NeedsAgentProcessing) => {
-                            plan.needs_agent_processing += 1;
-                        }
-                        Some(TraceReadiness::NotDatadogOrigin) => plan.not_datadog_origin += 1,
-                        None => unreachable!("trace_readiness gives every span event a verdict"),
+                    if plan.gated.admits(&readiness, item.index) {
+                        plan.routes[r].push(item);
                     }
                     continue;
                 }
@@ -835,16 +879,26 @@ pub struct RouteRequest {
     pub body: Bytes,
 }
 
-/// The requests `batch` encodes to on each route, in route order: [`partition`]'s routing and
-/// [`Route::encode`]'s bodies, one per route and one per event on the events route, with no
-/// stale filter, tag limit, trace readiness gate, or size cut, which sit above the encoder. A
-/// caller that needs the bytes this sink would send without its transport (the transit flow
-/// driver) reads them here.
-pub fn encode_routes(encoder: &mut DatadogEncoder, batch: &EventBatch) -> Vec<RouteRequest> {
+/// The requests `batch` encodes to on each route, in route order: [`partition`]'s routing,
+/// the trace readiness gate, counted on `telemetry` as the sink counts it, and [`Route::encode`]'s
+/// bodies, one per route and one per event on the events route. The stale filter, the tag limit,
+/// and the size cuts read the clock or apply an intake limit, so they're left out. A caller that
+/// needs the bytes this sink would send without its transport (the transit flow driver) reads
+/// them here.
+pub fn encode_routes(
+    encoder: &mut DatadogEncoder,
+    batch: &EventBatch,
+    telemetry: &Telemetry,
+) -> Vec<RouteRequest> {
     let mut out = Vec::new();
     let routing = partition(batch, encoder.histograms());
     encoder.events_without_payload(routing.unrouted);
-    for (route, items) in ROUTES.into_iter().zip(routing.routes) {
+    let readiness = Gated::readiness(batch);
+    let mut gated = Gated::default();
+    for (route, mut items) in ROUTES.into_iter().zip(routing.routes) {
+        if route == Route::Traces {
+            items.retain(|item| gated.admits(&readiness, item.index));
+        }
         if items.is_empty() {
             continue;
         }
@@ -862,6 +916,7 @@ pub fn encode_routes(encoder: &mut DatadogEncoder, batch: &EventBatch) -> Vec<Ro
             }
         }
     }
+    gated.count(telemetry);
     out
 }
 
@@ -1233,13 +1288,7 @@ struct Encoding<'a> {
 
 impl Encoding<'_> {
     fn dropped(&self, route: Route, reason: &'static str, n: usize) {
-        if n > 0 {
-            self.telemetry.count(
-                RECORDS_DROPPED,
-                n as f64,
-                &[("route", route.name()), ("reason", reason)],
-            );
-        }
+        count_dropped(self.telemetry, route, reason, n);
     }
 
     /// The batch's plan at send time `now`, unit 0 of `accounting`; what it dropped counts on the
@@ -1278,8 +1327,7 @@ impl Encoding<'_> {
                 );
             }
         }
-        self.dropped(Route::Traces, "needs_agent_processing", plan.needs_agent_processing);
-        self.dropped(Route::Traces, "not_datadog_origin", plan.not_datadog_origin);
+        plan.gated.count(self.telemetry);
         self.encoder.count_duplicates(plan.duplicates.differing(), plan.duplicates.equal());
     }
 

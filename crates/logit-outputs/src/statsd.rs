@@ -291,8 +291,8 @@
 //! | `log/dogstatsd_event`, otherwise | exact | -- | A log carrying the `_logit.statsd.event.*` carriers is a DogStatsD `_e` line again. |
 //! | `log/plain` | skipped | `logit.output.events.skipped{reason=no_metrics}` | Any other log on an event with no metrics has no statsd form and isn't written. |
 //! | `span/alone` | skipped | `logit.output.events.skipped{reason=no_metrics}` | A span on an event with no metrics has no statsd form and isn't written. |
-//! | `span/beside_log` | skipped | uncounted | A span has no statsd form. Beside a DogStatsD event, the event's line is written and the span left off, uncounted; beside any other log, `log/plain` counts the event skipped. |
-//! | `span/no_wire_form` | exact | -- | Nothing beyond `span/alone`'s outcome. |
+//! | `span/not_datadog_origin` | exact | -- | Nothing beyond the span's `span/alone`, `span/beside_log`, or `span/beside_metrics` outcome: only `datadog_out` gates a trace chunk. |
+//! | `span/needs_agent_processing` | exact | -- | Nothing beyond the span's `span/alone`, `span/beside_log`, or `span/beside_metrics` outcome: only `datadog_out` gates a trace chunk. |
 //! | `event/attributes_only` | skipped | `logit.output.events.skipped{reason=no_metrics}` | An event with no metric, log, or span has no statsd line and isn't written. |
 //! | `event/string_only` | skipped | `logit.output.events.skipped{reason=no_metrics}` | An InfluxDB point whose fields are all strings has no metric, so it has no statsd line and isn't written. |
 //!
@@ -359,6 +359,7 @@
 //! | `log/trace_unset` | exact | -- | No trace is written, and none reads back. |
 //! | `log/timestamp` | normalized | `receipt_time` | A DogStatsD event carries `\|d:` whole seconds only when it arrived with one, so any other event's time is the time statsd_in received it. |
 //! | `log/beside_metrics` | lost | uncounted | A log on an event that also carries metrics is left off while the metrics are written, uncounted. |
+//! | `span/beside_log` | lost | uncounted | A span has no statsd form. Beside a DogStatsD event, the event's line is written and the span left off, uncounted; beside any other log, `log/plain` counts the event skipped. |
 //! | `span/beside_metrics` | lost | uncounted | A span on an event that also carries metrics is left off while the metrics are written, uncounted. |
 //!
 //! <!-- transit:end -->

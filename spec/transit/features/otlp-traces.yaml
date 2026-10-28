@@ -1,0 +1,99 @@
+# The OTLP traces wire features a case under cases/otlp-traces/ can exercise, from
+# crates/logit-proto/src/otlp/traces.rs's module doc, crates/logit-proto/src/otlp/common.rs's
+# `Value` ↔ `AnyValue` and resource and scope mapping, and crates/logit-inputs/src/otlp.rs's
+# OTLP/HTTP request handling. A case names the ones it exercises in its `.meta.yaml`. The last
+# four are forms `otlp_in` never decodes, written as event JSON lines.
+- name: collector_file_export
+  text: >-
+    The OTel Collector `file` exporter's OTLP/JSON lines, one request per line, its signal named
+    by the line's top-level key, as `testdata/interop/otlp/` records them.
+- name: otlp_json
+  text: An OTLP/JSON `/v1/traces` body.
+- name: kind_internal
+  text: A `SPAN_KIND_INTERNAL` span.
+- name: kind_server
+  text: A `SPAN_KIND_SERVER` span.
+- name: kind_client
+  text: A `SPAN_KIND_CLIENT` span.
+- name: kind_producer
+  text: A `SPAN_KIND_PRODUCER` span.
+- name: kind_consumer
+  text: A `SPAN_KIND_CONSUMER` span.
+- name: parent_span_id
+  text: A span with a `parentSpanId`.
+- name: parent_unset
+  text: A root span, with no `parentSpanId`.
+- name: status_unset
+  text: A span with no status code, or an empty status object.
+- name: status_ok
+  text: A span with `STATUS_CODE_OK`.
+- name: status_error
+  text: A span with `STATUS_CODE_ERROR`.
+- name: status_message
+  text: A status with a `message`.
+- name: flags
+  text: A span's `flags`, such as 257 for sampled and remote.
+- name: trace_state
+  text: A span's W3C `traceState`.
+- name: dropped_attributes_count
+  text: A span's `droppedAttributesCount`.
+- name: dropped_events_count
+  text: A span's `droppedEventsCount`.
+- name: dropped_links_count
+  text: A span's `droppedLinksCount`.
+- name: events
+  text: A span's events, each with a time and a name.
+- name: event_attribute_scalar
+  text: A span event's string, int, double, and bool attributes.
+- name: event_attribute_nested
+  text: A span event's key-value list and array attributes.
+- name: event_dropped_count
+  text: A span event's `droppedAttributesCount`.
+- name: links
+  text: A span's links, each with a trace id, a span id, and attributes.
+- name: link_flags
+  text: A link's `flags`.
+- name: link_trace_state
+  text: A link's `traceState`.
+- name: link_attribute_nested
+  text: A link's key-value list attribute.
+- name: link_dropped_count
+  text: A link's `droppedAttributesCount`.
+- name: end_before_start
+  text: A span whose `endTimeUnixNano` precedes its `startTimeUnixNano`.
+- name: trace_id_128
+  text: A trace id whose high 64 bits are nonzero.
+- name: trace_id_64
+  text: A trace id whose high 64 bits are zero.
+- name: attribute_string
+  text: A `stringValue` span attribute.
+- name: attribute_int
+  text: An `intValue` span attribute, decoded to an `I64`.
+- name: attribute_double
+  text: A `doubleValue` span attribute.
+- name: attribute_bool
+  text: A `boolValue` span attribute.
+- name: attribute_bytes
+  text: A `bytesValue` span attribute.
+- name: attribute_array
+  text: An `arrayValue` span attribute.
+- name: attribute_kvlist
+  text: A `kvlistValue` span attribute.
+- name: attribute_private
+  text: A span attribute under the private `_logit.` prefix.
+- name: resource_attributes
+  text: Resource attributes, such as `service.name`.
+- name: schema_url
+  text: A resource's `schemaUrl`.
+- name: scope
+  text: An `InstrumentationScope` with a name and a version.
+- name: scope_attributes
+  text: An `InstrumentationScope`'s attributes.
+- name: span_beside_log
+  text: A span on an event that also carries a log.
+- name: span_beside_metrics
+  text: A span on an event that also carries metrics.
+- name: name_structured
+  text: A span whose name is a key-value list, which a Lua script can build.
+- name: attribute_u64
+  text: A `u64` span attribute above `i64::MAX`, which an `Event` carries and no OTLP `AnyValue` can.

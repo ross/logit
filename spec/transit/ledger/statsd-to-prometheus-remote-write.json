@@ -54,7 +54,7 @@
     {"sink":"prometheus_out","row":"set_members","cell":0,"observed":["degraded"]},
     {"sink":"prometheus_out","row":"span/alone","cell":0,"observed":["skipped"]},
     {"sink":"prometheus_out","row":"span/beside_metrics","cell":0,"observed":["lost"]},
-    {"sink":"prometheus_out","row":"span/no_wire_form","cell":0,"observed":[]},
+    {"sink":"prometheus_out","row":"span/not_datadog_origin","cell":0,"observed":[]},
     {"sink":"prometheus_out","row":"sum/bool","cell":0,"observed":[]},
     {"sink":"prometheus_out","row":"sum/cumulative_monotonic","cell":0,"observed":["normalized"]},
     {"sink":"prometheus_out","row":"sum/cumulative_nonmonotonic","cell":0,"observed":["degraded"]},

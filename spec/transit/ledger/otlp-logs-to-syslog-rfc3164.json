@@ -38,7 +38,8 @@
     {"sink":"syslog_out","row":"log/trace_beside_id_attribute","cell":0,"observed":["lost"]},
     {"sink":"syslog_out","row":"log/trace_flags","cell":0,"observed":["lost"]},
     {"sink":"syslog_out","row":"log/trace_unset","cell":0,"observed":["exact"]},
-    {"sink":"syslog_out","row":"span/beside_log","cell":0,"observed":["skipped"]}
+    {"sink":"syslog_out","row":"span/beside_log","cell":0,"observed":["lost"]},
+    {"sink":"syslog_out","row":"span/not_datadog_origin","cell":0,"observed":[]}
   ],
   "unspecified": [
     {"sink":"syslog_out","row":"gauge/i64","reached_by":["otlp-logs-to-syslog-rfc3164 × beside-metrics"]}

@@ -1,0 +1,182 @@
+{
+ "resourceSpans": [
+  {
+   "resource": {
+    "attributes": [
+     {
+      "key": "service.name",
+      "value": {
+       "stringValue": "checkout"
+      }
+     }
+    ]
+   },
+   "scopeSpans": [
+    {
+     "scope": {
+      "name": "checkout.tracer",
+      "version": "1.0.0"
+     },
+     "spans": [
+      {
+       "traceId": "4bf92f3577b34da6a3ce929d0e0e4702",
+       "spanId": "00f067aa0ba90202",
+       "name": "GET /orders",
+       "kind": 2,
+       "startTimeUnixNano": "1800000005000000000",
+       "endTimeUnixNano": "1800000005025000000",
+       "flags": 257,
+       "traceState": "rojo=00f067aa0ba902b7,congo=t61rcWkgMzE",
+       "droppedAttributesCount": 1,
+       "droppedEventsCount": 2,
+       "droppedLinksCount": 3,
+       "attributes": [
+        {
+         "key": "http.request.method",
+         "value": {
+          "stringValue": "GET"
+         }
+        }
+       ],
+       "events": [
+        {
+         "timeUnixNano": "1800000005005000000",
+         "name": "cache.miss",
+         "attributes": [
+          {
+           "key": "cache.key",
+           "value": {
+            "stringValue": "orders:42"
+           }
+          },
+          {
+           "key": "cache.attempt",
+           "value": {
+            "intValue": "2"
+           }
+          },
+          {
+           "key": "cache.hit_ratio",
+           "value": {
+            "doubleValue": 0.25
+           }
+          },
+          {
+           "key": "cache.cold",
+           "value": {
+            "boolValue": true
+           }
+          }
+         ]
+        },
+        {
+         "timeUnixNano": "1800000005006000000",
+         "name": "exception",
+         "attributes": [
+          {
+           "key": "exception.detail",
+           "value": {
+            "kvlistValue": {
+             "values": [
+              {
+               "key": "code",
+               "value": {
+                "stringValue": "E42"
+               }
+              },
+              {
+               "key": "retry",
+               "value": {
+                "boolValue": false
+               }
+              }
+             ]
+            }
+           }
+          },
+          {
+           "key": "exception.frames",
+           "value": {
+            "arrayValue": {
+             "values": [
+              {
+               "stringValue": "main"
+              },
+              {
+               "stringValue": "handle"
+              }
+             ]
+            }
+           }
+          }
+         ],
+         "droppedAttributesCount": 1
+        }
+       ],
+       "links": [
+        {
+         "traceId": "0af7651916cd43dd8448eb211c80319c",
+         "spanId": "b7ad6b7169203331",
+         "flags": 257,
+         "traceState": "rojo=00f067aa0ba902b7",
+         "attributes": [
+          {
+           "key": "link.reason",
+           "value": {
+            "stringValue": "retry"
+           }
+          },
+          {
+           "key": "link.context",
+           "value": {
+            "kvlistValue": {
+             "values": [
+              {
+               "key": "attempt",
+               "value": {
+                "intValue": "1"
+               }
+              }
+             ]
+            }
+           }
+          }
+         ],
+         "droppedAttributesCount": 2
+        },
+        {
+         "traceId": "0af7651916cd43dd8448eb211c80319d",
+         "spanId": "b7ad6b7169203332",
+         "attributes": [
+          {
+           "key": "link.reason",
+           "value": {
+            "stringValue": "follows"
+           }
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "traceId": "4bf92f3577b34da6a3ce929d0e0e4702",
+       "spanId": "00f067aa0ba90206",
+       "name": "clock skew",
+       "kind": 1,
+       "startTimeUnixNano": "1800000005030000000",
+       "endTimeUnixNano": "1800000005027000000"
+      },
+      {
+       "traceId": "0000000000000000a3ce929d0e0e4736",
+       "spanId": "00f067aa0ba90207",
+       "name": "low trace id",
+       "kind": 1,
+       "startTimeUnixNano": "1800000005040000000",
+       "endTimeUnixNano": "1800000005042000000"
+      }
+     ]
+    }
+   ]
+  }
+ ]
+}

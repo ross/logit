@@ -40,7 +40,15 @@
     {"sink":"otlp_out","row":"log/trace_beside_id_attribute","cell":0,"observed":["exact"]},
     {"sink":"otlp_out","row":"log/trace_flags","cell":0,"observed":["exact"]},
     {"sink":"otlp_out","row":"log/trace_unset","cell":0,"observed":["exact","normalized"]},
-    {"sink":"otlp_out","row":"span/beside_log","cell":0,"observed":["exact"]}
+    {"sink":"otlp_out","row":"span/beside_log","cell":0,"observed":["exact"]},
+    {"sink":"otlp_out","row":"span/end_timestamp","cell":0,"observed":["exact"]},
+    {"sink":"otlp_out","row":"span/kind","cell":0,"observed":["exact"]},
+    {"sink":"otlp_out","row":"span/name","cell":0,"observed":["exact"]},
+    {"sink":"otlp_out","row":"span/not_datadog_origin","cell":0,"observed":[]},
+    {"sink":"otlp_out","row":"span/parent_unset","cell":0,"observed":["exact"]},
+    {"sink":"otlp_out","row":"span/status_unset","cell":0,"observed":["exact"]},
+    {"sink":"otlp_out","row":"span/timestamp","cell":0,"observed":["exact"]},
+    {"sink":"otlp_out","row":"span/trace_id","cell":0,"observed":["exact"]}
   ],
   "unspecified": []
 }

@@ -147,8 +147,8 @@
 //! | `log/dogstatsd_event` | skipped | `logit.output.events.skipped{reason=no_metrics}` | A log has no Prometheus form and isn't written. |
 //! | `log/plain` | skipped | `logit.output.events.skipped{reason=no_metrics}` | A log has no Prometheus form and isn't written. |
 //! | `span/alone` | skipped | `logit.output.events.skipped{reason=no_metrics}` | A span has no Prometheus form and isn't written. |
-//! | `span/beside_log` | skipped | `logit.output.events.skipped{reason=no_metrics}` | A span has no Prometheus form and isn't written. |
-//! | `span/no_wire_form` | exact | -- | Nothing beyond `span/alone`'s outcome. |
+//! | `span/not_datadog_origin` | exact | -- | Nothing beyond the span's `span/alone`, `span/beside_log`, or `span/beside_metrics` outcome: only `datadog_out` gates a trace chunk. |
+//! | `span/needs_agent_processing` | exact | -- | Nothing beyond the span's `span/alone`, `span/beside_log`, or `span/beside_metrics` outcome: only `datadog_out` gates a trace chunk. |
 //! | `event/attributes_only` | skipped | `logit.output.events.skipped{reason=no_metrics}` | An event with no metric, log, or span has no sample and isn't written. |
 //! | `event/string_only` | skipped | `logit.output.events.skipped{reason=no_metrics}` | An InfluxDB point whose fields are all strings has no metric, so it has no sample and isn't written. |
 //!
@@ -194,6 +194,7 @@
 //! | `attributes/datadog_carrier_log` | lost | structural | Another protocol's `_logit.` carrier is private and isn't a label, so it's left off. |
 //! | `attributes/no_host` | exact | -- | A record with no host leaves with none. |
 //! | `log/beside_metrics` | lost | uncounted | A log on an event that carries metrics is left off while the metrics are written, uncounted. |
+//! | `span/beside_log` | lost | `logit.output.events.skipped{reason=no_metrics}` | A span has no Prometheus form, and the event, which has no metrics, isn't written. |
 //! | `span/beside_metrics` | lost | uncounted | A span on an event that carries metrics is left off while the metrics are written, uncounted. |
 //!
 //! <!-- transit:end -->

@@ -1,0 +1,11 @@
+# otlp_in's trace cases relayed to otlp_out, the like pair with nothing between.
+# `path:` names one case so `logit run` can run this by hand; the transit spec runs every case in
+# that file's directory (spec/transit/README.md).
+components:
+  case:
+    type: replay_in
+    path: ../cases/otlp-traces/beside.json
+  out:
+    type: otlp_out
+    sources: [case]
+    endpoint: http://127.0.0.1:4318

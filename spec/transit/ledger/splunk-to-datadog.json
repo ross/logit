@@ -8,13 +8,11 @@
     {"sink":"datadog_out","row":"attributes/no_host","cell":0,"observed":["normalized"]},
     {"sink":"datadog_out","row":"attributes/null_value","cell":0,"observed":["exact"]},
     {"sink":"datadog_out","row":"attributes/number_value","cell":0,"observed":["exact"]},
-    {"sink":"datadog_out","row":"attributes/resource_attribute","cell":0,"observed":["exact","normalized"]},
+    {"sink":"datadog_out","row":"attributes/resource_attribute","cell":0,"observed":["normalized"]},
     {"sink":"datadog_out","row":"attributes/service_identity","cell":0,"observed":["exact"]},
-    {"sink":"datadog_out","row":"attributes/span_kind","cell":0,"observed":["normalized"]},
     {"sink":"datadog_out","row":"attributes/splunk_envelope","cell":0,"observed":["normalized"]},
     {"sink":"datadog_out","row":"attributes/string_value","cell":0,"observed":["exact"]},
     {"sink":"datadog_out","row":"attributes/syslog_facility","cell":0,"observed":["exact"]},
-    {"sink":"datadog_out","row":"attributes/trace_id_high","cell":0,"observed":["normalized"]},
     {"sink":"datadog_out","row":"log/body_format","cell":0,"observed":["exact","lost"]},
     {"sink":"datadog_out","row":"log/event_name","cell":0,"observed":["lost"]},
     {"sink":"datadog_out","row":"log/message_unsafe","cell":0,"observed":["normalized"]},
@@ -27,7 +25,8 @@
     {"sink":"datadog_out","row":"log/trace","cell":0,"observed":["normalized"]},
     {"sink":"datadog_out","row":"log/trace_flags","cell":0,"observed":["lost"]},
     {"sink":"datadog_out","row":"log/trace_unset","cell":0,"observed":["exact"]},
-    {"sink":"datadog_out","row":"span/alone","cell":0,"observed":["exact"]}
+    {"sink":"datadog_out","row":"span/alone","cell":0,"observed":[]},
+    {"sink":"datadog_out","row":"span/not_datadog_origin","cell":0,"observed":["dropped"]}
   ],
   "unspecified": []
 }

@@ -1,0 +1,5 @@
+# A hand-written OTLP/JSON body: one trace of five spans, one per span kind, a root with no
+# parent and four children, with the status unset, ok, an error with a message, an error with
+# none, and an empty status object.
+wire: kinds.bin
+exercises: [otlp_json, kind_internal, kind_server, kind_client, kind_producer, kind_consumer, parent_unset, parent_span_id, status_unset, status_ok, status_error, status_message]

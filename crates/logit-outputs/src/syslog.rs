@@ -196,8 +196,8 @@
 //! | `log/bytes_message` | exact | -- | A `Bytes` message is written as its bytes, escaped as a string's are, and reads back as `Bytes`; one that's valid UTF-8 reads back as a string (the `log/message_unsafe` row). |
 //! | `log/blank_message` | exact | -- | A log with an empty message or none leaves with an empty MSG, which syslog_in reads back as an empty string. |
 //! | `span/alone` | skipped | `logit.output.events.skipped{reason=no_log}` | A span on an event with no log has no syslog form, so the event is skipped. |
-//! | `span/beside_log` | skipped | uncounted | A span beside a log has no syslog form and is left off, uncounted. |
-//! | `span/no_wire_form` | skipped | uncounted | A span has no syslog form and isn't written: on an event with no log, the event is skipped, counted as `logit.output.events.skipped{reason=no_log}`; beside a log, it's left off, uncounted. |
+//! | `span/not_datadog_origin` | exact | -- | Nothing beyond the span's `span/alone`, `span/beside_log`, or `span/beside_metrics` outcome: only `datadog_out` gates a trace chunk. |
+//! | `span/needs_agent_processing` | exact | -- | Nothing beyond the span's `span/alone`, `span/beside_log`, or `span/beside_metrics` outcome: only `datadog_out` gates a trace chunk. |
 //! | `event/attributes_only` | skipped | `logit.output.events.skipped{reason=no_log}` | An event with no log has no syslog form and isn't written. |
 //! | `event/string_only` | skipped | `logit.output.events.skipped{reason=no_log}` | An InfluxDB point whose fields are all strings has no log, so it isn't written and its fields are lost. |
 //!
@@ -306,6 +306,7 @@
 //! | `log/timestamp`, otherwise | normalized | `timestamp_precision` | A log with no `syslog.timestamp` leaves with its timestamp as TIMESTAMP in microseconds, which syslog_in reads back as `syslog.timestamp`, with `event.timestamp` as the receipt time. |
 //! | `log/receipt_timestamp` | lost | structural | A log whose `syslog.timestamp` is written as TIMESTAMP leaves its own timestamp, the receipt time, unwritten; syslog_in stamps its own receipt time. |
 //! | `log/beside_metrics` | exact | -- | The log is one syslog message; the metrics beside it have no syslog form and are left off, uncounted. |
+//! | `span/beside_log` | lost | uncounted | A span beside a log has no syslog form and is left off, uncounted, while the log is written. |
 //! | `span/beside_metrics` | lost | `logit.output.events.skipped{reason=no_log}` | A span has no syslog form, so it isn't written beside its event's metrics, which have none either. |
 //!
 //! <!-- transit:end -->

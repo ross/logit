@@ -1,0 +1,4 @@
+# The recorded capture: telemetrygen's three traces through a Collector's `file` exporter, each a
+# client span and its server child with sampled, remote flags, under a resource with a schema URL.
+wire: ../../../../testdata/interop/otlp/traces.json
+exercises: [collector_file_export, otlp_json, kind_server, kind_client, parent_span_id, parent_unset, status_unset, flags, attribute_string, resource_attributes, schema_url]

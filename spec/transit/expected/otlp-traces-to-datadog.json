@@ -1,0 +1,20 @@
+{
+  "attributes": {"events": [], "counters": {
+    "logit.output.records.dropped{component=out,kind=datadog_out,reason=not_datadog_origin,role=sink,route=traces}": 1
+  }},
+  "beside": {"events": [
+    {"timestamp":"2027-01-15T08:00:06.000000000Z","log":{"severity":"info","format":"raw","message":"beside its span"},"attributes":{"host.name":"transit","status":"info"}},
+    {"timestamp":"2027-01-15T08:00:06.000000000Z","metrics":[{"name":"cart.items","kind":"gauge","value":3.0}],"attributes":{"host.name":"transit"},"resource":{"attributes":{"_logit.datadog.units":"datadog"}}}
+  ], "counters": {
+    "logit.output.records.dropped{component=out,kind=datadog_out,reason=not_datadog_origin,role=sink,route=traces}": 4
+  }},
+  "fields": {"events": [], "counters": {
+    "logit.output.records.dropped{component=out,kind=datadog_out,reason=not_datadog_origin,role=sink,route=traces}": 3
+  }},
+  "kinds": {"events": [], "counters": {
+    "logit.output.records.dropped{component=out,kind=datadog_out,reason=not_datadog_origin,role=sink,route=traces}": 5
+  }},
+  "telemetrygen": {"events": [], "counters": {
+    "logit.output.records.dropped{component=out,kind=datadog_out,reason=not_datadog_origin,role=sink,route=traces}": 6
+  }}
+}

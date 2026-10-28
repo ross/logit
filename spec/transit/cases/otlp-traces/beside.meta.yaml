@@ -1,0 +1,4 @@
+# Spans otlp_in never decodes but a stage such as `kv_metrics` or a Lua script produces: one
+# beside a log, one beside a gauge, one whose name is a key-value list, and one with a `u64`
+# attribute above `i64::MAX`.
+exercises: [span_beside_log, span_beside_metrics, name_structured, attribute_u64]

@@ -8,7 +8,7 @@
 //! | `otlp_out` | one protobuf request per signal per batch; a log with no observed time is stamped with the wall clock, which the driver reads back as the run's clock | `OtlpDecoder::decode_signal` |
 //! | `prometheus_out`, `bind:` | one scrape after the last batch, in the run's dialect, held to `max_series:` (no expiry: it reads a clock) | `text::parse_with`, then `families_to_events` |
 //! | `prometheus_out`, `endpoint:` | one compressed request per batch | `decompress_bounded`, `remote_write::decode`, then `families_to_events` per timestamp group |
-//! | `datadog_out` | one uncompressed request per route per batch, one per event on the events route, with the sink's routing (`encode_routes`) and none of its stale filter, tag limit, trace readiness gate, or size cuts | `datadog_in`'s `decode_request`, by the request's path and `Content-Type` |
+//! | `datadog_out` | one uncompressed request per route per batch, one per event on the events route, with the sink's routing and trace readiness gate (`encode_routes`), a span the gate holds back counted as the sink counts it, and none of its stale filter, tag limit, or size cuts, which read the clock or apply an intake limit | `datadog_in`'s `decode_request`, by the request's path and `Content-Type` |
 //! | `graphite_out` | each `MessageBuf` entry: one plaintext line, or one length-prefixed pickle frame, line-capped as the sink's transport caps it | `GraphiteDecoder` of the encoder's protocol, one entry at a time, a pickle frame's length prefix stripped as `graphite_in`'s framer strips it |
 //! | `syslog_out` | each `MessageBuf` entry: one message, capped as the sink's transport caps it | `SyslogDecoder`, one entry at a time: a UDP datagram with line splitting on, `syslog_in`'s default `framing: lines`, or under `transport: tcp` one octet-counted frame's payload with line splitting off |
 //! | `splunk_hec_out` | each `MessageBuf` entry: one HEC object (`encode_objects`), an object over `max_body_bytes` dropped and counted as the sink drops it, the rest joined into one `/event` body per batch | `SplunkDecoder::decode_events` |
@@ -179,7 +179,7 @@ pub(super) fn round_trip(
         }
         SinkEncoder::Datadog(mut encoder) => {
             for batch in batches {
-                for request in logit_outputs::datadog::encode_routes(&mut encoder, batch) {
+                for request in logit_outputs::datadog::encode_routes(&mut encoder, batch, sink) {
                     let (telemetry, diag) = decode.handles("datadog_in");
                     let decoder =
                         DatadogDecoder::new().with_telemetry(telemetry).with_diagnostics(diag);

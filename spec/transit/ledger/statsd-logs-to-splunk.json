@@ -21,10 +21,19 @@
     {"sink":"splunk_hec_out","row":"log/severity_unset","cell":0,"observed":["exact"]},
     {"sink":"splunk_hec_out","row":"log/timestamp","cell":0,"observed":["exact"]},
     {"sink":"splunk_hec_out","row":"log/trace_unset","cell":0,"observed":["exact"]},
-    {"sink":"splunk_hec_out","row":"span/alone","cell":0,"observed":[]},
+    {"sink":"splunk_hec_out","row":"span/alone","cell":0,"observed":["exact"]},
     {"sink":"splunk_hec_out","row":"span/beside_log","cell":0,"observed":["exact"]},
     {"sink":"splunk_hec_out","row":"span/beside_metrics","cell":0,"observed":["exact"]},
-    {"sink":"splunk_hec_out","row":"span/no_wire_form","cell":0,"observed":["degraded"]}
+    {"sink":"splunk_hec_out","row":"span/end_timestamp","cell":0,"observed":["exact"]},
+    {"sink":"splunk_hec_out","row":"span/kind","cell":0,"observed":["exact"]},
+    {"sink":"splunk_hec_out","row":"span/name","cell":0,"observed":["exact"]},
+    {"sink":"splunk_hec_out","row":"span/not_datadog_origin","cell":0,"observed":["exact"]},
+    {"sink":"splunk_hec_out","row":"span/parent_unset","cell":0,"observed":["exact"]},
+    {"sink":"splunk_hec_out","row":"span/status_ok","cell":0,"observed":["exact"]},
+    {"sink":"splunk_hec_out","row":"span/status_unset","cell":0,"observed":["exact"]},
+    {"sink":"splunk_hec_out","row":"span/timestamp","cell":0,"observed":["exact"]},
+    {"sink":"splunk_hec_out","row":"span/trace_id","cell":0,"observed":["exact"]},
+    {"sink":"splunk_hec_out","row":"span/trace_state","cell":0,"observed":["lost"]}
   ],
   "unspecified": [
     {"sink":"splunk_hec_out","row":"gauge/f64","reached_by":["statsd-logs-to-splunk × span-beside-metrics"]}

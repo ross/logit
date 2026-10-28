@@ -50,7 +50,7 @@
     {"sink":"statsd_out","row":"record/unit","cell":0,"observed":["lost"]},
     {"sink":"statsd_out","row":"set","cell":0,"observed":["skipped"]},
     {"sink":"statsd_out","row":"span/alone","cell":0,"observed":["skipped"]},
-    {"sink":"statsd_out","row":"span/no_wire_form","cell":0,"observed":[]},
+    {"sink":"statsd_out","row":"span/not_datadog_origin","cell":0,"observed":[]},
     {"sink":"statsd_out","row":"sum/bool","cell":0,"observed":["normalized"]},
     {"sink":"statsd_out","row":"sum/cumulative_monotonic","cell":0,"observed":["skipped"]},
     {"sink":"statsd_out","row":"sum/cumulative_nonmonotonic","cell":0,"observed":["skipped"]},
