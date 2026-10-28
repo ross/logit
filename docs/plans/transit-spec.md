@@ -805,9 +805,10 @@ shows:
        `version: v0.7`. Under `version: v0.4`, every tracer carrier a request header doesn't
        restore is `lost`, counted `logit.output.spans.degraded{reason=no_wire_form}`
        (`resource_carriers_lost` in `crates/logit-proto/src/datadog/traces.rs`).
-     - The Agent carriers, `_logit.datadog.agent.*`, are `exact` only at `datadog_out`. They're
-       `lost`, counted the same way, under both `datadog_trace_out` versions, since that sink
-       encodes the tracer API's forms only.
+     - The Agent carriers, `_logit.datadog.agent.*`, have their own row,
+       `attributes/datadog_agent_resource`: `exact` only at `datadog_out`, and `lost`, counted the
+       same way, under both `datadog_trace_out` versions, since that sink encodes the tracer API's
+       forms only.
      - Both groups are `lost`, `structural`, at the OTel sinks.
      - The tracer carriers only a request header carries (`resource_carriers_lost`'s
        `header_only`) have their own row, `attributes/datadog_tracer_headers`, `lost`, counted

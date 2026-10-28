@@ -23,6 +23,8 @@
   text: A `TracerPayload`'s fields as `_logit.datadog.tracer.*` resource attributes.
 - name: agent_carriers
   text: An `AgentPayload`'s fields as `_logit.datadog.agent.*` resource attributes.
+- name: container_id
+  text: A `TracerPayload`'s `container_id`, as the resource's `container.id`.
 - name: parent_span_id
   text: A span with a `parent_id`.
 - name: status_ok

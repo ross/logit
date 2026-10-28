@@ -187,16 +187,14 @@ Entry format and the other areas: [the known-gaps index](README.md).
     not decided: a typed home for span metrics (a `metrics` map on `SpanExt`), or a rule that
     depends on where the span came from.
 - **`datadog_trace_out` counts nothing for an event with no span.** The sink sends spans and APM
-  stats alone. A log-only or metrics-only event takes no route and is left off, and so is a log
-  or a metric beside a span, with no `logit.output.events.skipped` or other counter, where
-  `datadog_out` counts an event with no payload as `events.skipped{reason="no_payload"}`. The
-  transit spec's `log` and `gauge` cells for the sink say `skipped`, uncounted.
+  stats alone. A log-only or metrics-only event takes no route and is left off with no
+  `logit.output.events.skipped` or other counter, where `datadog_out` counts an event with no
+  payload as `events.skipped{reason="no_payload"}`.
   - **Consequence:** a pipeline that routes logs or metrics to `datadog_trace_out` by mistake
     loses them with nothing in the sink's telemetry to show it.
   - **Workaround:** put `has_signal` or `route_signals` ahead of the sink so only span events
     reach it, and compare the upstream node's `events.sent` with the sink's.
-  - **Revisit trigger:** an operator who loses data this way, or a sink-wide rule that an ignored
-    signal is counted.
+  - **Revisit trigger:** an operator who loses data this way.
 - **`datadog_out` sends no Agent-style `h`/`ms` aggregates.** An Agent turns a DogStatsD `h` or
   `ms` into `.avg`, `.count`, `.median`, `.95percentile`, and `.max` series. `aggregate` in front
   of `datadog_out` sends a sketch instead, which Datadog computes quantiles from.

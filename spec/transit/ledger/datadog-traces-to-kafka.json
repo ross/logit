@@ -3,6 +3,8 @@
     {"sink":"kafka_out","row":"attributes/array_value","cell":1,"observed":["exact"]},
     {"sink":"kafka_out","row":"attributes/bool_value","cell":1,"observed":["exact"]},
     {"sink":"kafka_out","row":"attributes/bytes_value","cell":1,"observed":["exact"]},
+    {"sink":"kafka_out","row":"attributes/container_id","cell":1,"observed":["exact"]},
+    {"sink":"kafka_out","row":"attributes/datadog_agent_resource","cell":0,"observed":["exact"]},
     {"sink":"kafka_out","row":"attributes/datadog_carrier_span","cell":0,"observed":["exact"]},
     {"sink":"kafka_out","row":"attributes/datadog_span_identity","cell":0,"observed":["exact"]},
     {"sink":"kafka_out","row":"attributes/datadog_span_marks","cell":0,"observed":["exact"]},

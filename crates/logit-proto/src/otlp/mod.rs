@@ -141,8 +141,9 @@
 //! | `attributes/datadog_span_identity` | exact | -- | A string span attribute. |
 //! | `attributes/datadog_span_marks` | exact | -- | An ordinary span attribute: Datadog's internal mark leaves as an OTel attribute. |
 //! | `attributes/datadog_carrier_span` | lost | structural | OTLP has no field for a Datadog trace chunk's fields or a span's raw `error`, and a `_logit.` carrier is private, so it's left off. |
-//! | `attributes/datadog_tracer_resource` | lost | structural | OTLP has no field for a `TracerPayload`'s or an `AgentPayload`'s fields, and a `_logit.` carrier is private, so it's left off. |
+//! | `attributes/datadog_tracer_resource` | lost | structural | OTLP has no field for a `TracerPayload`'s fields, and a `_logit.` carrier is private, so it's left off. |
 //! | `attributes/datadog_tracer_headers` | lost | structural | OTLP has no field for a tracer request header, and a `_logit.` carrier is private, so it's left off. |
+//! | `attributes/datadog_agent_resource` | lost | structural | OTLP has no field for an `AgentPayload`'s fields, and a `_logit.` carrier is private, so it's left off. |
 //! | `attributes/syslog_header` | normalized | `u64_as_int` | A string or integer attribute; `intValue` is signed, so a `u64` `syslog.facility` or `process.pid` reads back as an `i64`. |
 //! | `attributes/syslog_msgid` | exact | -- | A string attribute. |
 //! | `attributes/syslog_sd` | exact | -- | A key-value list attribute. |
