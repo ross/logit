@@ -139,6 +139,7 @@
 //! | `log/dogstatsd_event` | skipped | `logit.output.events.skipped{reason=no_metrics}` | A log has no carbon form and isn't written. |
 //! | `log/plain` | skipped | `logit.output.events.skipped{reason=no_metrics}` | A log has no carbon form and isn't written. |
 //! | `span/alone` | skipped | `logit.output.events.skipped{reason=no_metrics}` | A span has no carbon form and isn't written. |
+//! | `span/beside_log` | skipped | `logit.output.events.skipped{reason=no_metrics}` | A span has no carbon form and isn't written. |
 //! | `span/no_wire_form` | exact | -- | Nothing beyond `span/alone`'s outcome. |
 //! | `event/attributes_only` | skipped | `logit.output.events.skipped{reason=no_metrics}` | An event with no metric, log, or span has no datapoint and isn't written. |
 //! | `event/string_only` | skipped | `logit.output.events.skipped{reason=no_metrics}` | An InfluxDB point whose fields are all strings has no metric, so it has no datapoint and isn't written. |

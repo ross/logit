@@ -28,9 +28,7 @@ classes:
 # `crates/logit-cli/src/transit/mapping.rs`: span payloads, not yet classified, log payloads,
 # classified only at otlp_out, datadog_out, syslog_out, splunk_hec_out, and, for a DogStatsD
 # event, statsd_out, `datadog_out`'s carrier on a log, and syslog_out's attribute rows, where it
-# leaves every attribute outside its header fields off a log. A skipped or dropped cell may name
-# a counter beside `reason: uncounted` where the sink counts the loss on one path and not
-# another.
+# leaves every attribute outside its header fields off a log.
 # docs/adr/telemetry-loss-vocabulary.md's amendment "structural loss has no counter" has the rule.
 
 sinks: [statsd_out, prometheus_out, influxdb_out, otlp_out, datadog_out, graphite_out, syslog_out, splunk_hec_out]
@@ -4316,7 +4314,8 @@ rows:
         reason: log_fields
         text: >-
           No trace fields are written, and splunk_hec_in reads back no trace, unless the log carries
-          `trace_id` and `span_id` attributes that parse as ids, which it reads into the trace.
+          a `trace_id` attribute that parses as a trace id, with a `span_id` that parses or none,
+          which it reads into the trace.
   - kind: log
     feature: trace_flags
     cells:
@@ -4486,12 +4485,45 @@ rows:
         text: A span has no carbon form and isn't written.
       syslog_out:
         class: skipped
-        reason: uncounted
         counter: logit.output.events.skipped
+        text: A span on an event with no log has no syslog form, so the event is skipped.
+      splunk_hec_out:
+        class: exact
         text: >-
-          A span has no syslog form and isn't written: on an event with no log, the event is
-          skipped, counted as `logit.output.events.skipped`; beside a log, it's left off,
-          uncounted.
+          A span object in the OpenTelemetry exporter's shape, its resource's attributes as `fields`;
+          the `span/no_wire_form` row has what it can't carry.
+  - kind: span
+    feature: beside_log
+    cells:
+      statsd_out:
+        class: skipped
+        counter: logit.output.events.skipped{reason=no_metrics}
+        text: A span on an event with no metrics has no statsd form and isn't written.
+      otlp_out:
+        class: exact
+        text: An OTLP span.
+      prometheus_out:
+        class: skipped
+        counter: logit.output.events.skipped{reason=no_metrics}
+        text: A span has no Prometheus form and isn't written.
+      influxdb_out:
+        class: skipped
+        counter: logit.output.events.skipped{reason=no_metrics}
+        text: A span has no line-protocol form and isn't written.
+      datadog_out:
+        class: exact
+        text: >-
+          A span of an `AgentPayload` chunk on the trace route, read back with its kind as a
+          `span.kind` attribute and its trace id's high half as `_dd.p.tid` (the `attributes`
+          rows).
+      graphite_out:
+        class: skipped
+        counter: logit.output.events.skipped{reason=no_metrics}
+        text: A span has no carbon form and isn't written.
+      syslog_out:
+        class: skipped
+        reason: uncounted
+        text: A span beside a log has no syslog form and is left off, uncounted.
       splunk_hec_out:
         class: exact
         text: >-

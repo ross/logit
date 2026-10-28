@@ -230,6 +230,7 @@ Entry format and the other areas: [the known-gaps index](README.md).
   | encode (statsd) | `log/plain` → **skipped** | `logit.output.events.skipped{reason=no_metrics}` | Any other log on an event with no metrics has no statsd form and isn't written. |
   | encode (statsd) | field `log/beside_metrics` → **lost** | none (uncounted) | A log on an event that also carries metrics is left off while the metrics are written, uncounted. |
   | encode (statsd) | `span/alone` → **skipped** | `logit.output.events.skipped{reason=no_metrics}` | A span on an event with no metrics has no statsd form and isn't written. |
+  | encode (statsd) | `span/beside_log` → **skipped** | `logit.output.events.skipped{reason=no_metrics}` | A span on an event with no metrics has no statsd form and isn't written. |
   | encode (statsd) | field `span/beside_metrics` → **lost** | none (uncounted) | A span on an event that also carries metrics is left off while the metrics are written, uncounted. |
   | encode (statsd) | `event/attributes_only` → **skipped** | `logit.output.events.skipped{reason=no_metrics}` | An event with no metric, log, or span has no statsd line and isn't written. |
   | encode (statsd) | `event/string_only` → **skipped** | `logit.output.events.skipped{reason=no_metrics}` | An InfluxDB point whose fields are all strings has no metric, so it has no statsd line and isn't written. |
@@ -287,6 +288,7 @@ Entry format and the other areas: [the known-gaps index](README.md).
   | encode (Prometheus) | `log/plain` → **skipped** | `logit.output.events.skipped{reason=no_metrics}` | A log has no Prometheus form and isn't written. |
   | encode (Prometheus) | field `log/beside_metrics` → **lost** | none (uncounted) | A log on an event that carries metrics is left off while the metrics are written, uncounted. |
   | encode (Prometheus) | `span/alone` → **skipped** | `logit.output.events.skipped{reason=no_metrics}` | A span has no Prometheus form and isn't written. |
+  | encode (Prometheus) | `span/beside_log` → **skipped** | `logit.output.events.skipped{reason=no_metrics}` | A span has no Prometheus form and isn't written. |
   | encode (Prometheus) | field `span/beside_metrics` → **lost** | none (uncounted) | A span on an event that carries metrics is left off while the metrics are written, uncounted. |
   | encode (Prometheus) | `event/attributes_only` → **skipped** | `logit.output.events.skipped{reason=no_metrics}` | An event with no metric, log, or span has no sample and isn't written. |
   | encode (Prometheus) | `event/string_only` → **skipped** | `logit.output.events.skipped{reason=no_metrics}` | An InfluxDB point whose fields are all strings has no metric, so it has no sample and isn't written. |
@@ -346,6 +348,7 @@ Entry format and the other areas: [the known-gaps index](README.md).
   | encode (InfluxDB) | `log/plain` → **skipped** | `logit.output.events.skipped{reason=no_metrics}` | A log has no line-protocol form and isn't written. |
   | encode (InfluxDB) | field `log/beside_metrics` → **lost** | none (uncounted) | A log on an event that carries metrics is left off while the metrics are written, uncounted. |
   | encode (InfluxDB) | `span/alone` → **skipped** | `logit.output.events.skipped{reason=no_metrics}` | A span has no line-protocol form and isn't written. |
+  | encode (InfluxDB) | `span/beside_log` → **skipped** | `logit.output.events.skipped{reason=no_metrics}` | A span has no line-protocol form and isn't written. |
   | encode (InfluxDB) | field `span/beside_metrics` → **lost** | none (uncounted) | A span on an event that carries metrics is left off while the metrics are written, uncounted. |
   | encode (InfluxDB) | `event/attributes_only` → **skipped** | `logit.output.events.skipped{reason=no_metrics}` | An event with no metric, log, or span and no `_logit.influxdb.measurement` carrier has no measurement to write under and isn't written. A stage that drops the carrier leaves an InfluxDB point whose fields are all strings this way: a `remove` of it, or a `keep` under `private: drop`, which drops the string fields too. |
 
@@ -530,6 +533,7 @@ Entry format and the other areas: [the known-gaps index](README.md).
   | encode (Graphite) | `log/plain` → **skipped** | `logit.output.events.skipped{reason=no_metrics}` | A log has no carbon form and isn't written. |
   | encode (Graphite) | field `log/beside_metrics` → **lost** | none (uncounted) | A log on an event that carries metrics is left off while the metrics are written, uncounted. |
   | encode (Graphite) | `span/alone` → **skipped** | `logit.output.events.skipped{reason=no_metrics}` | A span has no carbon form and isn't written. |
+  | encode (Graphite) | `span/beside_log` → **skipped** | `logit.output.events.skipped{reason=no_metrics}` | A span has no carbon form and isn't written. |
   | encode (Graphite) | field `span/beside_metrics` → **lost** | none (uncounted) | A span on an event that carries metrics is left off while the metrics are written, uncounted. |
   | encode (Graphite) | `event/attributes_only` → **skipped** | `logit.output.events.skipped{reason=no_metrics}` | An event with no metric, log, or span has no datapoint and isn't written. |
   | encode (Graphite) | `event/string_only` → **skipped** | `logit.output.events.skipped{reason=no_metrics}` | An InfluxDB point whose fields are all strings has no metric, so it has no datapoint and isn't written. |
@@ -605,7 +609,8 @@ Entry format and the other areas: [the known-gaps index](README.md).
   | encode (syslog) | field `log/trace_flags` → **lost** | none (structural) | Syslog has no trace flags, so they're left off. |
   | encode (syslog) | field `log/dropped_attributes_count` → **lost** | none (structural) | Syslog has no dropped-attributes count, so it's left off. |
   | encode (syslog) | field `log/receipt_timestamp` → **lost** | none (structural) | A log whose `syslog.timestamp` is written as TIMESTAMP leaves its own timestamp, the receipt time, unwritten; syslog_in stamps its own receipt time. |
-  | encode (syslog) | `span/alone` → **skipped** | `logit.output.events.skipped` | A span has no syslog form and isn't written: on an event with no log, the event is skipped, counted as `logit.output.events.skipped`; beside a log, it's left off, uncounted. |
+  | encode (syslog) | `span/alone` → **skipped** | `logit.output.events.skipped` | A span on an event with no log has no syslog form, so the event is skipped. |
+  | encode (syslog) | `span/beside_log` → **skipped** | none (uncounted) | A span beside a log has no syslog form and is left off, uncounted. |
   | encode (syslog) | `span/no_wire_form` → **skipped** | none (uncounted) | A span has no syslog form and isn't written: on an event with no log, the event is skipped, counted as `logit.output.events.skipped`; beside a log, it's left off, uncounted. |
   | encode (syslog) | field `span/beside_metrics` → **lost** | `logit.output.events.skipped` | A span has no syslog form, so it isn't written beside its event's metrics, which have none either. |
   | encode (syslog) | `event/attributes_only` → **skipped** | `logit.output.events.skipped` | An event with no log has no syslog form and isn't written. |

@@ -1083,8 +1083,8 @@ Recorded per workstream as each lands.
     3164-shaped string is written and anything else falls back. Where it renders, the log's own
     receipt time has no slot (`log/receipt_timestamp`, `lost`).
   - A log's metrics and a span beside it are left off, uncounted (`log/beside_metrics`,
-    `span/alone`). `syslog_out` has no metric-kind cells, so the `otlp-logs` `beside-metrics`
-    case's gauge reaches `gauge/i64` unspecified there.
+    `span/beside_log`, from `tlog/w4`). `syslog_out` has no metric-kind cells, so the
+    `otlp-logs` `beside-metrics` case's gauge reaches `gauge/i64` unspecified there.
   - `otlp_out` and `datadog_out` write a `u64` `syslog.facility` or `process.pid` that their pair
     decoders read back as an `i64` (`attributes/syslog_header`, `normalized`).
 - **`syslog_out`'s `structured_data:` opt-in** (`tlog/w2b`): the `syslog-relay-sd` and
@@ -1176,13 +1176,14 @@ Recorded per workstream as each lands.
     `log/beside_metrics` is `lost` with that counter. No `splunk` case holds a blank `event`,
     since `splunk_hec_in` drops one and a case is what the listener produces: the `otlp-logs` and
     `datadog-logs` cases reach the row.
-  - `splunk_hec_in` reads a log attribute named `otel.log.name`, or `trace_id` and `span_id`
-    that parse as ids, into the log's own fields, so a `datadog-logs` case's `trace_id`
-    attribute comes back as a trace (`attributes/string_value` and `log/trace_unset`,
-    `normalized`, `log_fields`).
-  - `syslog_out` skips a span-only event, counted `events.skipped`, and leaves a span beside a
-    log off, uncounted. `span/alone`'s cell now names the counter beside `reason: uncounted`,
-    which the class check reads as covering both paths.
+  - `splunk_hec_in` reads a log attribute named `otel.log.name`, or a `trace_id` that parses as
+    a trace id with a `span_id` that parses or none, into the log's own fields, so a
+    `datadog-logs` case's `trace_id` attribute comes back as a trace
+    (`attributes/string_value` and `log/trace_unset`, `normalized`, `log_fields`).
+  - `syslog_out` skips a span-only event, counted `events.skipped` (`span/alone`), and leaves a
+    span beside a log off, uncounted. The `splunk` `span` case is the first to reach the counted
+    path, so a span on an event with a log has a row of its own, `span/beside_log`, chosen by the
+    event's shape as `span/beside_metrics` is, with `span/alone`'s cells at every other sink.
   - `otlp_out` writes a log stamped at the Unix epoch, which `splunk_hec_in` reads from
     `time: 0`, as `time_unix_nano` 0, which `logs.proto` defines as unknown, so `otlp_in` reads
     it back at the encode time `otlp_out` stamps as its observed time

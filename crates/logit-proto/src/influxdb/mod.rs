@@ -167,6 +167,7 @@
 //! | `log/dogstatsd_event` | skipped | `logit.output.events.skipped{reason=no_metrics}` | A log has no line-protocol form and isn't written. |
 //! | `log/plain` | skipped | `logit.output.events.skipped{reason=no_metrics}` | A log has no line-protocol form and isn't written. |
 //! | `span/alone` | skipped | `logit.output.events.skipped{reason=no_metrics}` | A span has no line-protocol form and isn't written. |
+//! | `span/beside_log` | skipped | `logit.output.events.skipped{reason=no_metrics}` | A span has no line-protocol form and isn't written. |
 //! | `span/no_wire_form` | exact | -- | Nothing beyond `span/alone`'s outcome. |
 //! | `event/attributes_only` | skipped | `logit.output.events.skipped{reason=no_metrics}` | An event with no metric, log, or span and no `_logit.influxdb.measurement` carrier has no measurement to write under and isn't written. A stage that drops the carrier leaves an InfluxDB point whose fields are all strings this way: a `remove` of it, or a `keep` under `private: drop`, which drops the string fields too. |
 //! | `event/string_only` | exact | -- | A line of the event's `_logit.field.*` string fields under the measurement its `_logit.influxdb.measurement` carrier names, read back as the same event. |
