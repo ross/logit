@@ -12,8 +12,9 @@ doesn't cover sink behavior above the encoder (retries, request packing, stale-p
 a backend stores. [ADR `transit-spec`](../../docs/adr/transit-spec.md) records the decision and its
 limits, and [the plan](../../docs/plans/transit-spec.md) the workstreams.
 
-The sources are `statsd_in`, `influxdb_in`, `prometheus_in`'s scrape (remote-write cases
-aren't written yet), `datadog_in`'s metrics routes and service checks (`cases/datadog/`) and its
+The sources are `statsd_in`'s metrics (`cases/statsd/`) and its DogStatsD events, with
+hand-written spans and payload-less events beside them (`cases/statsd-logs/`), `influxdb_in`,
+`prometheus_in`'s scrape (remote-write cases aren't written yet), `datadog_in`'s metrics routes and service checks (`cases/datadog/`) and its
 logs and events (`cases/datadog-logs/`: the Agent's captures and hand-written `/api/v2/logs`
 bodies), with no APM cases yet, `collectd_in`, `otlp_in`'s metrics
 (`cases/otlp/`) and logs (`cases/otlp-logs/`), with no trace cases yet, `graphite_in`,
@@ -23,14 +24,17 @@ captures and hand-written bodies), with no metric cases. A
 source directory's name before its first `-` names its system, so
 `datadog-logs` cases decode through `datadog_in`. The sink columns are `statsd_out`,
 `prometheus_out` (exposition and remote-write), `influxdb_out`, `otlp_out`, `datadog_out`,
-`graphite_out`, `syslog_out`, and `splunk_hec_out`; the last two have cells on the log, span,
-event, and attribute rows and none on a metric kind's. A log record's rows have cells at
-`otlp_out`, `datadog_out`, `syslog_out`, `splunk_hec_out`, and, for a DogStatsD event,
-`statsd_out`. Each flow's name says which source meets
-which sink: `statsd-relay`, `influxdb-relay`, `datadog-relay`, `datadog-logs-relay`, `otlp-relay`,
-`otlp-logs-relay`, `graphite-relay`, `syslog-relay`, `splunk-relay`, `prometheus-to-prometheus`,
-and `prometheus-to-prometheus-remote-write` are like pairs, and `influxdb-to-prometheus` a
-cross-protocol one.
+`graphite_out`, `syslog_out`, `splunk_hec_out`, and `kafka_out` (`format: json` and `text`); the
+last three have cells on the log, span, event, and attribute rows and none on a metric kind's. A
+log record's rows have cells at `otlp_out`, `datadog_out`, `syslog_out`, `splunk_hec_out`,
+`kafka_out`, and, for a DogStatsD event, `statsd_out`. `kafka_out` has no pair input, so the
+driver reads its records back by convention: a `format: json` record through the event JSON
+reader, and a `format: text` record as one log holding the record's value, at the record's
+millisecond timestamp (`crates/logit-cli/src/transit/wire.rs`). Each flow's name says which
+source meets which sink: `statsd-relay`, `statsd-logs-relay`, `influxdb-relay`, `datadog-relay`,
+`datadog-logs-relay`, `otlp-relay`, `otlp-logs-relay`, `graphite-relay`, `syslog-relay`,
+`splunk-relay`, `prometheus-to-prometheus`, and `prometheus-to-prometheus-remote-write` are like
+pairs, and `influxdb-to-prometheus` a cross-protocol one.
 
 `datadog_out` makes four drops above its encoders: `stale` and `too_many_tags`, which read the
 wall clock or apply an intake limit, and `needs_agent_processing` and `not_datadog_origin`, which
@@ -119,7 +123,8 @@ is one nothing checks: add a case or a flow that reaches it.
   (`beside_metrics`), which is a field of its event, and a field of any log, beside metrics or
   not (`severity`, `body_format`, `event_name`, `observed_timestamp`, `trace`, `trace_flags`,
   `dropped_attributes_count`, and `timestamp`, or `receipt_timestamp` for a log carrying
-  `syslog.timestamp`): `exact`, `normalized`, or `lost`. A log beside metrics reaches those rows
+  `syslog.timestamp`; a trace's ids and flags reach `trace_beside_id_attribute` instead on a log
+  that also carries a `trace_id` or `span_id` attribute): `exact`, `normalized`, or `lost`. A log beside metrics reaches those rows
   and its attribute rows as a log alone does, so `log/beside_metrics` records only whether the
   sink carried the log. A field the log doesn't set reaches its
   `_unset` row (`severity_unset`, `observed_timestamp_unset`, `trace_unset`), `normalized` where
@@ -143,7 +148,8 @@ whose written exemplar has an attribute key `prometheus_out` sanitizes into a la
 rows name a shape one sink treats apart, and every sink that compares the record reaches them: `record/sample_rate` (a
 `samples` record whose rate rounds to a weight above 1) and `record/sample_rate_unweighted` (a
 rate below 1 that rounds to weight 1), `span/no_wire_form` (a span field a Datadog span has no
-form for), `attributes/datadog_carrier_log` (a `_logit.datadog.*` carrier on a log, a Datadog
+form for), `log/trace_beside_id_attribute` (a log's trace beside a `trace_id` or `span_id`
+attribute, which `datadog_out` and `splunk_hec_out` write in the trace's place), `attributes/datadog_carrier_log` (a `_logit.datadog.*` carrier on a log, a Datadog
 event, or a service check), `attributes/host_beside_host_name` (a `host` attribute beside a
 non-empty string `host.name` or the hostless mark, which `statsd_out` leaves off) and
 `attributes/hostname` and `attributes/log_service` (a log's `hostname` attribute, or its
@@ -170,9 +176,10 @@ counter would add anything
 "structural loss has no counter"). A loss that depends on the value, such as `false` or a
 rewritten name, is counted. The table's schema accepts `reason: uncounted`, the sink's behavior
 as it stands, only on the cells `crates/logit-cli/src/transit/mapping.rs`'s `UNCOUNTED_ALLOWED`
-names: span payloads, which aren't classified yet, log records at a sink other than `otlp_out`,
-`datadog_out`, `syslog_out`, `splunk_hec_out`, and `statsd_out`; `datadog_out`'s carrier on a
-log; and `syslog_out`'s attribute rows, since it leaves every attribute outside its header fields
+names: a span at any sink, until spans have sources of their own; a log beside metrics at a sink
+that writes the metrics; the trace `datadog_out` and `splunk_hec_out` leave off a log for a
+`trace_id` or `span_id` attribute; `datadog_out`'s carrier on a log; and `syslog_out`'s attribute
+rows, since it leaves every attribute outside its header fields
 off a log by one mechanism, and under `structured_data:` writes a `Bytes` one as its length (on
 the `bytes_value` entry) and an empty array as no PARAM (on `sd_empty_array`).
 When a sink's behavior depends on its config, the sink's entry is a list: each cell but the last
@@ -289,6 +296,7 @@ Each sink column has two regions:
 | `doc:graphite_out` | `crates/logit-proto/src/graphite/mod.rs` | Every cell of the column |
 | `doc:syslog_out` | `crates/logit-outputs/src/syslog.rs` | Every cell of the column |
 | `doc:splunk_hec_out` | `crates/logit-proto/src/splunk/mod.rs` | Every cell of the column |
+| `doc:kafka_out` | `crates/logit-outputs/src/kafka/encode.rs` | Every cell of the column |
 | `gaps:<sink>`, one per sink | `docs/known-gaps/mappings.md` | The column's `degraded`, `lost`, `skipped`, and `dropped` cells, in that file's row format |
 
 A region opens on a line ending `<!-- transit:doc:<sink> -->` or `<!-- transit:gaps:<sink> -->`
