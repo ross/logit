@@ -3276,7 +3276,7 @@ rows:
   # `severity_carrier_syslog`, with the syslog source, since otlp_out keeps one carrier and not the
   # other. statsd_out writes a log only as a DogStatsD event, and this row has no statsd_out cell;
   # prometheus_out, influxdb_out, and graphite_out don't write a log on an event with no metrics,
-  # where the carriers ride, so neither has a cell.
+  # where the carriers ride, so none of them has a cell.
   - kind: attributes
     feature: severity_carrier_otel
     cells:

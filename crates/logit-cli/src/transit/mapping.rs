@@ -16,7 +16,7 @@
 //! | `attributes` | `string_value`, `bool_value`, `number_value`, `array_value`, `map_value`, `bytes_value`, `timestamp_value`, `private_carrier`, `prometheus_target` (`_logit.prometheus.target`, at every sink), `foreign_carrier`, `timestamped` (`_logit.metrics.closed: "timestamped"`, at every sink), `rate` and `rate_on_non_gauge` (`_logit.metrics.type: "rate"` on a gauge and on any other metric kind, at every sink), `family_type` and `family_type_on_other_kind` (`_logit.metrics.type: "info"` or `"stateset"` on a gauge and `"gaugehistogram"` on a histogram, and any of the three on another metric kind, at every sink), `interval`, `interval_on_distribution`, and `interval_on_histogram` (`_logit.metrics.interval` on a metric record, on a `samples`, `distribution`, or delta `exponential_histogram`, and on a delta `histogram`, at every sink), `datadog_carrier_log`, `severity_carrier_otel` (`_logit.otel.severity_number` and `_logit.otel.severity_text`, ahead of the private and foreign carrier rows), `severity_carrier_syslog` (`_logit.syslog.severity`, beside it), `syslog_header`, `syslog_msgid`, `syslog_sd`, `syslog_timestamp`, `host_name` (a log's event attribute `syslog_out` writes as a header field, by key), `resource_attribute`, `scope` | field |
 //! | `attributes` | `no_host`, `log_status`, `span_kind`, `trace_id_high`, `syslog_facility` (a record `datadog_out` or `syslog_out` writes an attribute for from the record's own fields or the sink's config) | field |
 //! | `log` | `dogstatsd_event`, `plain` (each on an event with no metrics), `message_unsafe` (a message the sink's encoder rewrites), `structured_message` (a `Map` or `Array` message), `bytes_message`, `blank_message` (an empty message, or none), `header_in_message` (a log RFC 3164's header rule reads back with a header token in its message) | record |
-//! | `log` | `severity`, `severity_unset`, `body_format`, `event_name`, `observed_timestamp`, `observed_timestamp_unset`, `trace`, `trace_unset`, `trace_flags`, `dropped_attributes_count`, `timestamp`, `receipt_timestamp` (a field of a log on an event with no metrics, [`LOG_FIELDS`]) | field |
+//! | `log` | `severity`, `severity_unset`, `body_format`, `event_name`, `observed_timestamp`, `observed_timestamp_unset`, `trace`, `trace_unset`, `trace_flags`, `dropped_attributes_count`, `timestamp`, `receipt_timestamp` (a field of any log, beside metrics or not, [`LOG_FIELDS`]) | field |
 //! | `span` | `alone` (on an event with no metrics); `no_wire_form` (one of those carrying a field a Datadog span has no form for) | record |
 //! | `log`, `span` | `beside_metrics` (on an event that carries metrics) | field |
 //! | `event` | `string_only` (an InfluxDB point whose fields are all strings, its measurement carrier intact), `attributes_only` (any other event with no metric, log, or span) | record |
@@ -256,8 +256,8 @@ const KINDS: [(&str, &[&str]); 15] = [
 /// The `record` features that are field-level (module doc).
 pub(super) const RECORD_FIELDS: [&str; 4] = ["unit", "description", "start_timestamp", "exemplars"];
 
-/// The `log` features that are field-level (module doc), each a field of a log on an event with
-/// no metrics.
+/// The `log` features that are field-level (module doc), each a field of any log, beside metrics
+/// or not.
 pub(super) const LOG_FIELDS: [&str; 12] = [
     "severity",
     "severity_unset",

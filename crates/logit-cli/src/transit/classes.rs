@@ -73,8 +73,7 @@
 //! metrics is a field of that event: it reaches `log/beside_metrics` or `span/beside_metrics`,
 //! read as `exact` when it pairs unchanged, `normalized` when it pairs changed, and `lost` when
 //! nothing read back pairs with it. A log there also reaches the `log` field rows a log alone
-//! does, so `log/beside_metrics` says only whether the sink carried it; its attributes are its
-//! event's, judged on the event's metric records.
+//! does, and the attribute rows, so `log/beside_metrics` says only whether the sink carried it.
 //!
 //! **Pairing.** Each input record is paired with the records read back that account for it, in
 //! passes, each claiming a read-back record at most once: (1) the same name and the same kind,
@@ -2221,7 +2220,7 @@ fn field_rows(rec: &Rec, protocol: &str) -> Vec<(String, Option<String>, Field)>
     // A log's own attribute `syslog_out` writes as a header field. On the resource it's a
     // resource attribute, which the header reads back from the event.
     let header = |key: &str| {
-        if rec.kind != "log" || rec.beside_metrics {
+        if rec.kind != "log" {
             return None;
         }
         match key {
@@ -3016,14 +3015,10 @@ pub(super) fn check(
             observed
         };
 
-        // Field level. A log beside metrics reaches its `log` rows; its attributes are its
-        // event's, judged on the event's metric records.
+        // Field level.
         let first = pairing.claimed[i].first().copied();
         let checked = matches!(observed, Class::Exact | Class::Normalized);
         for (kind, feature, field) in field_rows(input, &protocol) {
-            if beside && kind != "log" {
-                continue;
-            }
             // A field row is reached only where its record is compared: a record written in a
             // lesser form, or not at all, has no field to compare.
             let Some(first) = first.filter(|_| checked) else { continue };
@@ -3947,6 +3942,19 @@ mod tests {
     /// [`check`] over `ins` read back as `outs` by a `prometheus_out` with `config`, against the
     /// committed table.
     fn check_prometheus(ins: &[&str], outs: &[&str], config: Value) -> Vec<String> {
+        check_sink(ins, outs, config, &[], &mut Ledger::default())
+    }
+
+    /// [`check`] over `ins` read back as `outs` by a sink with `config`, resolved with its
+    /// defaults as the flow driver resolves it, whose run moved `counters`, against the committed
+    /// table, into `ledger`.
+    fn check_sink(
+        ins: &[&str],
+        outs: &[&str],
+        config: Value,
+        counters: &[(&str, f64)],
+        ledger: &mut Ledger,
+    ) -> Vec<String> {
         let batches = |lines: &[&str]| {
             let text: String = lines
                 .iter()
@@ -3958,14 +3966,45 @@ mod tests {
         let table = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../spec/transit/mapping.yaml");
         let mapping = mapping::load(&table).expect("the committed table loads");
+        let kind: logit_config::ComponentKind =
+            serde_json::from_value(config).expect("a sink config");
+        let counters = counters.iter().map(|&(series, n)| (series.to_string(), n)).collect();
         let traced = Traced {
-            outcome: super::super::Outcome { events: Vec::new(), counters: BTreeMap::new() },
+            outcome: super::super::Outcome { events: Vec::new(), counters },
             sunk: batches(ins),
             decoded: batches(outs),
-            sink: config,
+            sink: serde_json::to_value(&kind).expect("the sink config serializes"),
         };
         let at = At { flow: "test", case: "test" };
-        check(&mapping, &at, &traced, &mut Ledger::default())
+        check(&mapping, &at, &traced, ledger)
+    }
+
+    /// A log beside metrics reaches the attribute rows a log alone does: at `datadog_out`, a
+    /// `hostname` attribute on it reaches `attributes/hostname`, which no metric record reaches.
+    #[test]
+    fn a_log_beside_metrics_reaches_its_attribute_rows() {
+        let ins = [
+            r#"{{T},"log":{"severity":"warn","format":"raw","message":"m"},"metrics":[{"name":"g","kind":"gauge","value":17}],"attributes":{"hostname":"web-1"}}"#,
+        ];
+        let host = super::super::HOSTNAME;
+        let log = format!(
+            r#"{{T}},"log":{{"severity":"warn","format":"raw","message":"m"}},"attributes":{{"host.name":"{host}","status":"warn"}}}}"#
+        );
+        let metric = format!(
+            r#"{{T}},"metrics":[{{"name":"g","kind":"gauge","value":17.0}}],"attributes":{{"host.name":"{host}","hostname":"web-1"}},"resource":{{"attributes":{{"_logit.datadog.units":"datadog"}}}}}}"#
+        );
+        let (log, metric) = (format!("{{{log}"), format!("{{{metric}"));
+        let mut ledger = Ledger::default();
+        let config = serde_json::json!({"type": "datadog_out", "api_key": "unused"});
+        let omitted = "logit.output.tags.omitted{component=out,kind=datadog_out,reason=reserved_key,role=sink}";
+        let failures = check_sink(&ins, &[&log, &metric], config, &[(omitted, 1.0)], &mut ledger);
+        let reached = |row: &str| {
+            ledger.cells.iter().any(|((sink, r, _), seen)| {
+                sink == "datadog_out" && r == row && seen.contains(&Class::Lost)
+            })
+        };
+        assert!(reached("attributes/hostname"), "{:#?}", ledger.cells.keys().collect::<Vec<_>>());
+        assert!(failures.is_empty(), "{failures:#?}");
     }
 
     /// Under exposition, a record a later record of its series overwrote in the registry is

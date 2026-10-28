@@ -1,1 +1,1 @@
-{"timestamp":"2027-01-15T08:00:04.000000000Z","log":{"severity":"warn","format":"raw","message":"queue depth high"},"metrics":[{"name":"queue.depth","kind":"gauge","value":17}],"attributes":{"queue":"orders"}}
+{"timestamp":"2027-01-15T08:00:04.000000000Z","log":{"severity":"warn","format":"raw","message":"queue depth high"},"metrics":[{"name":"queue.depth","kind":"gauge","value":17}],"attributes":{"hostname":"web-1","queue":"orders","service":"orders-api","service.name":"orders"}}
