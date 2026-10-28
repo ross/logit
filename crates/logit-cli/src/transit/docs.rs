@@ -40,7 +40,7 @@ const FILES: [&str; 7] = [
     "crates/logit-outputs/src/statsd.rs",
     "crates/logit-proto/src/prometheus/mod.rs",
     "crates/logit-proto/src/influxdb/mod.rs",
-    "crates/logit-proto/src/otlp/metrics.rs",
+    "crates/logit-proto/src/otlp/mod.rs",
     "crates/logit-proto/src/datadog/mod.rs",
     "crates/logit-proto/src/graphite/mod.rs",
     "docs/known-gaps/mappings.md",

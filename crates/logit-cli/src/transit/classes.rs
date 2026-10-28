@@ -52,12 +52,20 @@
 //! `map_value`, `bytes_value`, `timestamp_value`), and any other resource attribute
 //! `resource_attribute`; and `attributes/scope` when its batch has a scope. A log
 //! record on an event with no metrics reaches `log/dogstatsd_event` when it carries
-//! `_logit.statsd.event.title`, else `log/plain`, and its attribute rows; a span there reaches
+//! `_logit.statsd.event.title`, else `log/plain`, the message rows [`log_features`] lists, and its
+//! attribute rows, with `_logit.otel.severity_*` as `severity_carrier`; it also reaches a `log`
+//! field row for each of its fields (`severity`, `body_format`, `event_name`,
+//! `observed_timestamp`, `trace` for its trace and span ids, `trace_flags`,
+//! `dropped_attributes_count`), or the field's `_unset` row (`severity_unset`,
+//! `observed_timestamp_unset`, `trace_unset`) where it has none, and `log/timestamp`, or
+//! `log/receipt_timestamp` when it carries `syslog.timestamp` and its timestamp is when it was
+//! received. Those fields are out of a log's own comparison ([`LOG_FIELD_KEYS`]), so a log pairs
+//! on its message, its message's type tags, and its attributes. A span there reaches
 //! `span/alone`, and also `span/no_wire_form` when it carries a field a Datadog span has no form
 //! for. An event with no metric, log, or span is a record of kind `event` that reaches
 //! `event/string_only` when it carries a non-empty `_logit.influxdb.measurement`, else
 //! `event/attributes_only`, and its attribute rows. A record reaches an `attributes` field row for
-//! each attribute [`derived`] lists, at every sink that compares the record; a sink that writes
+//! each attribute [`derived_rows`] lists, at every sink that compares the record; a sink that writes
 //! none reads it `exact` when nothing stands in its place. A log or span on an event that carries
 //! metrics is a field of that event: it reaches `log/beside_metrics` or `span/beside_metrics` alone, read as `exact` when it pairs
 //! unchanged, `normalized` when it pairs changed, and `lost` when nothing read back pairs with
@@ -80,7 +88,8 @@
 //! the name as the sink writes it, where an `exact` pairing reads as `normalized`, before pass
 //! (3) runs either way, so a dotted expansion never claims a record a respelling reads back
 //! whole. Within a pass the latest record goes first, so where a sink keeps one point per series,
-//! the earlier point is the one left over.
+//! the earlier point is the one left over; among logs, one with the input's timestamp goes first,
+//! so logs with one message pair by time.
 //!
 //! [`Spelling`] holds each sink's rewrites, from its codec's module doc: `statsd_out`'s reserved
 //! characters as `_` in a name, a tag key, and a tag value (`:` allowed there), and under `format:
@@ -88,12 +97,16 @@
 //! or, empty, as the hostless mark ([`statsd`]); `prometheus_out`'s `sanitize_metric_name`,
 //! `_total` on a counter, a label key's `sanitize_label_name`, and an array's last element;
 //! `influxdb_out`'s `<name>.value` for a `sum`, `gauge`, or `set` off the carrier path, and an
-//! array's last element; `otlp_out`'s timestamp value as an integer of nanoseconds, and an
+//! array's last element; `otlp_out`'s timestamp value as an integer of nanoseconds, a `u64` above
+//! `i64::MAX` as a double, and an
 //! OpenMetrics `info` or `stateset` gauge read back as a cumulative non-monotonic sum, an `info`
 //! one under `<name>_info`; `datadog_out`'s hostless mark read back as a v2 `host` resource with no
-//! name, and the attributes it writes from a record's own fields ([`Spelling::derived`]: the run's
-//! hostname on a record with no host, a log's `status`, a span's `span.kind` and `_dd.p.tid`), each
-//! accepted only with the value derived for it; `graphite_out`'s forbidden characters as `_` in a
+//! name, a log's message as its text ([`Spelling::log_message`]: a structured message as JSON,
+//! bytes as lossy UTF-8), a bytes attribute on a log as base64, and the attributes it writes from a
+//! record's own fields ([`Spelling::derived`]: the run's hostname on a record with no host, a log's
+//! `status`, `trace_id`, and `span_id`, a span's `span.kind` and `_dd.p.tid`), each accepted only
+//! with the value derived for it; a log's `trace_id` and `span_id` pair only and have no row,
+//! since `log/trace` judges them; `graphite_out`'s forbidden characters as `_` in a
 //! path, a tag name, and a tag value (and a tag value's leading `~`), a tag value in the encoder's
 //! rendering, and the values it omits as no tag ([`graphite_value`]). Each name, key, and value set
 //! is the encoder's own predicate. A candidate's public attributes (no `_logit.`
@@ -120,7 +133,11 @@
 //! input's field with its first pairing's: the same value in the same place is `exact`, present
 //! but changed, moved (a resource attribute read back as an event attribute), or under the
 //! sink's spelling of its key is `normalized`,
-//! and absent is `lost`. `prometheus_out` has one exception, which compares a value:
+//! and absent is `lost`. A log's fields follow the same rule, with three differences: a body
+//! format read back as another is `lost`, since the format names how to read the message; an
+//! `_unset` row is `exact` when the field reads back absent and `normalized` when the sink fills
+//! it in; and a receipt timestamp read back outside its own second is `lost`, another instant
+//! that no precision explains. `prometheus_out` has one exception, which compares a value:
 //! `_logit.prometheus.target` absent reads `normalized` when the read-back's `instance` equals the
 //! input's, and `lost` otherwise. The observed class may be better than the cell's but never worse. A
 //! degraded, skipped, or dropped record's field rows aren't looked up, so they're neither reached
@@ -176,6 +193,19 @@ use std::collections::{BTreeMap, BTreeSet};
 /// Body keys checked by `record` field rows, not by the record's own comparison.
 const FIELD_KEYS: [&str; 6] =
     ["unit", "description", "start_timestamp", "exemplars", "flags", "no_recorded_value"];
+
+/// Log body keys checked by `log` field rows, not by the record's own comparison, so a log's core
+/// is its message and the message's type tags.
+const LOG_FIELD_KEYS: [&str; 8] = [
+    "severity",
+    "format",
+    "event_name",
+    "observed_timestamp",
+    "trace_id",
+    "span_id",
+    "trace_flags",
+    "dropped_attributes_count",
+];
 
 /// Series name suffixes a run's sink counters are checked for.
 const OUTCOMES: [&str; 6] = ["dropped", "skipped", "degraded", "normalized", "omitted", "evicted"];
@@ -240,9 +270,10 @@ impl Rec {
 
     /// The comparison body: the record minus its field-row keys, and its type tags.
     fn core(&self) -> (Value, BTreeMap<String, String>) {
+        let stripped: &[&str] = if self.kind == "log" { &LOG_FIELD_KEYS } else { &FIELD_KEYS };
         let mut body = self.body.clone();
         if let Some(object) = body.as_object_mut() {
-            for key in FIELD_KEYS {
+            for &key in stripped {
                 object.remove(key);
             }
             // Pairing has matched the names already, respelled where the sink respells them.
@@ -269,7 +300,7 @@ impl Rec {
             .types
             .iter()
             .filter(|(pointer, _)| {
-                !FIELD_KEYS.iter().any(|key| pointer.starts_with(&format!("/{key}")))
+                !stripped.iter().any(|key| pointer.starts_with(&format!("/{key}")))
                     && (body.get("value").is_some() || pointer.as_str() != "/value")
             })
             .map(|(pointer, tag)| (pointer.clone(), tag.clone()))
@@ -400,8 +431,12 @@ impl Spelling {
         reaches.then_some(feature)
     }
 
-    /// The name the sink's pair decoder reads `rec`, a sink input, back under.
+    /// The name the sink's pair decoder reads `rec`, a sink input, back under: for a log, its
+    /// message ([`Spelling::log_message`]).
     fn written(self, rec: &Rec) -> String {
+        if let Some(message) = self.log_message(rec) {
+            return message;
+        }
         match self {
             Spelling::Prometheus => {
                 let mut name = self.sanitize(&rec.name);
@@ -433,6 +468,25 @@ impl Spelling {
                 format!("{}_info", rec.name)
             }
             _ => self.sanitize(&rec.name),
+        }
+    }
+
+    /// The message the sink's pair decoder reads log `rec` back with, as text, where the sink's
+    /// encoder rewrites it; `None` for a record that isn't a log on an event with no metrics, and
+    /// at a sink that writes the message as it is. `datadog_out`'s logs route writes
+    /// `logit_proto::json::value_text`: a `Bytes` message as lossy UTF-8 and any other non-`Str`
+    /// one as its JSON text, which `datadog_in` reads back as a `Str`. `otlp_out` writes every
+    /// message as an `AnyValue`.
+    fn log_message(self, rec: &Rec) -> Option<String> {
+        if rec.kind != "log" || rec.beside_metrics {
+            return None;
+        }
+        match self {
+            Spelling::Datadog if datadog::Route::of(rec) == datadog::Route::Log => {
+                let log = model_log(rec)?;
+                Some(logit_proto::json::value_text(&log.message).into_owned())
+            }
+            _ => None,
         }
     }
 
@@ -519,6 +573,16 @@ impl Spelling {
         if self == Spelling::Datadog && datadog::reserved_log_key_is_omitted(rec, key) {
             return None;
         }
+        // A log's attribute is a key of its JSON object, a `Bytes` value its base64 text.
+        if self == Spelling::Datadog
+            && rec.kind == "log"
+            && datadog::Route::of(rec) == datadog::Route::Log
+            && tags.contains("=bytes")
+        {
+            let mut json = Vec::new();
+            logit_proto::json::write_value(&mut json, &model_attribute(value, tags)?);
+            return serde_json::from_slice(&json).ok().map(|read: Value| text(&read));
+        }
         if unified::tag_is_omitted(self, rec, key, value) {
             return None;
         }
@@ -528,13 +592,13 @@ impl Spelling {
         Some(self.value(value, tags))
     }
 
-    /// [`derived`] where the sink writes those attributes, which only `datadog_out` does; empty
-    /// for every other sink.
-    fn derived(self, rec: &Rec) -> Vec<(&'static str, &'static str, String)> {
-        if self == Spelling::Datadog {
-            derived(rec)
-        } else {
-            Vec::new()
+    /// The attributes the sink writes from `rec`'s own fields, which its pair decoder reads back
+    /// as attributes `rec` lacks ([`Derived`]); empty for a sink that writes none. Only
+    /// `datadog_out` writes any ([`datadog_derived`]).
+    fn derived(self, rec: &Rec) -> Vec<Derived> {
+        match self {
+            Spelling::Datadog => datadog_derived(rec),
+            _ => Vec::new(),
         }
     }
 
@@ -549,6 +613,13 @@ impl Spelling {
                 logit_core::time::parse_rfc3339_to_nanos(s)
                     .map_or_else(|_| s.clone(), |nanos| nanos.to_string())
             }
+            // `intValue` is signed, so a `u64` above `i64::MAX` leaves as a double.
+            (Spelling::Otlp, Value::Number(n))
+                if tags.contains("=u64") && n.as_u64().is_some_and(|u| u > i64::MAX as u64) =>
+            {
+                let wide = n.as_u64().unwrap_or_default() as f64;
+                Value::from(wide).to_string()
+            }
             (Spelling::Statsd { .. }, Value::String(s)) => {
                 substituted(s, |c| c != ':' && is_forbidden_in_name(c))
             }
@@ -557,10 +628,26 @@ impl Spelling {
     }
 }
 
+/// An attribute a sink writes from a record's own fields: its `attributes` field row, its key,
+/// and its value as text. A `None` row is an attribute used only for pairing, whose field another
+/// row compares.
+type Derived = (Option<&'static str>, &'static str, String);
+
+/// The `attributes` field rows `rec` reaches for what any sink derives ([`Spelling::derived`]):
+/// the union of every sink's rows, chosen from the record alone, so every sink that compares the
+/// record reaches them, and one that derives nothing for a row reads it `exact`.
+fn derived_rows(rec: &Rec) -> Vec<&'static str> {
+    let mut rows = Vec::new();
+    for (row, _, _) in Spelling::Datadog.derived(rec) {
+        if let Some(row) = row.filter(|row| !rows.contains(row)) {
+            rows.push(row);
+        }
+    }
+    rows
+}
+
 /// The attributes `datadog_out` writes from `rec`'s own fields, which `datadog_in` reads back as
-/// attributes `rec` lacks: each one's `attributes` field row, key, and value as text. Every sink
-/// that compares the record reaches the rows, chosen from the record alone; only
-/// [`Spelling::derived`] predicts the values (`logit_proto::datadog`'s encode tables):
+/// attributes `rec` lacks (`logit_proto::datadog`'s encode tables):
 ///
 /// - `no_host`: the run's hostname, on a record that carries no host and no hostless mark (the
 ///   encoder's default host), under the key `datadog_in` reads the route's host back as
@@ -572,8 +659,10 @@ impl Spelling {
 ///   has no `span.kind` attribute;
 /// - `trace_id_high`: `_dd.p.tid` as the trace id's high 64 bits in hex, on the first span of its
 ///   trace in the batch, when the high half is nonzero and no span of the trace carries one
-///   ([`Rec::tid_due`]).
-fn derived(rec: &Rec) -> Vec<(&'static str, &'static str, String)> {
+///   ([`Rec::tid_due`]);
+/// - for pairing only, `trace_id` and `span_id` as the hex ids of a log's `trace`, on a log with
+///   no attribute of either name; `log/trace` compares them.
+fn datadog_derived(rec: &Rec) -> Vec<Derived> {
     // An event with no metric, log, or span takes no `datadog_out` route.
     if rec.kind == "event" {
         return Vec::new();
@@ -583,25 +672,34 @@ fn derived(rec: &Rec) -> Vec<(&'static str, &'static str, String)> {
     match datadog::Route::of(rec) {
         datadog::Route::Span => {
             if !datadog::carries_host(rec, datadog::Route::Span) {
-                out.push(("no_host", "host.name", super::HOSTNAME.to_string()));
+                out.push((Some("no_host"), "host.name", super::HOSTNAME.to_string()));
             }
             let kind = rec.body["kind"].as_str().unwrap_or("internal");
             if kind != "internal" && !has("span.kind") {
-                out.push(("span_kind", "span.kind", kind.to_string()));
+                out.push((Some("span_kind"), "span.kind", kind.to_string()));
             }
             if rec.tid_due {
                 let high = rec.body["trace_id"].as_str().and_then(|t| t.get(..16)).unwrap_or("");
-                out.push(("trace_id_high", "_dd.p.tid", high.to_string()));
+                out.push((Some("trace_id_high"), "_dd.p.tid", high.to_string()));
             }
         }
         route => {
             if !datadog::carries_host(rec, route) {
-                out.push(("no_host", "host.name", super::HOSTNAME.to_string()));
+                out.push((Some("no_host"), "host.name", super::HOSTNAME.to_string()));
             }
             let severity = rec.body["severity"].as_str();
             if let (datadog::Route::Log, Some(severity)) = (route, severity) {
                 if !has("status") {
-                    out.push(("log_status", "status", severity.to_string()));
+                    out.push((Some("log_status"), "status", severity.to_string()));
+                }
+            }
+            // An attribute of either name suppresses both ids, so a relayed Datadog log leaves
+            // with its own.
+            if route == datadog::Route::Log && !has("trace_id") && !has("span_id") {
+                for key in ["trace_id", "span_id"] {
+                    if let Some(id) = rec.body[key].as_str() {
+                        out.push((None, key, id.to_string()));
+                    }
                 }
             }
         }
@@ -926,6 +1024,33 @@ fn model_value(value: &Value, tags: &str, pointer: &str) -> logit_core::Value {
     }
 }
 
+/// A `format: json` attribute value as the model [`logit_core::Value`] it was written from, read
+/// back through `logit_proto::event_json` with its `types` entry `tags`, so a `Bytes` value keeps
+/// its bytes.
+fn model_attribute(value: &Value, tags: &str) -> Option<logit_core::Value> {
+    let types: Map<String, Value> = tags
+        .split(';')
+        .filter_map(|entry| entry.split_once('='))
+        .map(|(pointer, tag)| {
+            let below = pointer.strip_prefix('/').unwrap_or(pointer);
+            let pointer = if below.is_empty() {
+                "/attributes/v".to_string()
+            } else {
+                format!("/attributes/v/{below}")
+            };
+            (pointer, Value::String(tag.to_string()))
+        })
+        .collect();
+    let line = serde_json::json!({
+        "timestamp": "1970-01-01T00:00:00.000000000Z",
+        "attributes": {"v": value},
+        "types": types,
+    });
+    let batches = EventJsonDecoder::new().decode_batches(line.to_string().as_bytes()).ok()?;
+    let event = batches.into_iter().next()?.events.into_iter().next()?;
+    event.attributes.get("v").cloned()
+}
+
 /// RFC 6901's unescaping of one pointer token.
 fn unescape(token: &str) -> String {
     token.replace("~1", "/").replace("~0", "~")
@@ -1059,7 +1184,7 @@ fn pair(ins: &[Rec], outs: &[Rec], spelling: Spelling) -> Pairing {
             .collect();
         let candidates = |i: usize, used: &[bool]| -> Vec<usize> {
             let input = &ins[i];
-            let scored: Vec<(usize, u8)> = outs
+            let mut scored: Vec<(usize, u8)> = outs
                 .iter()
                 .enumerate()
                 .filter(|(o, out)| {
@@ -1068,6 +1193,14 @@ fn pair(ins: &[Rec], outs: &[Rec], spelling: Spelling) -> Pairing {
                 .map(|(o, out)| (o, score(input, out, spelling)))
                 .filter(|(_, s)| *s > 0)
                 .collect();
+            // Logs of one message pair by their time, so a log's time row compares it with its
+            // own read-back: the same instant first, then the same millisecond.
+            if input.kind == "log" {
+                let millis = |rec: &Rec| rec.timestamp.get(..23).map(str::to_string);
+                scored.sort_by_key(|(o, _)| {
+                    (outs[*o].timestamp != input.timestamp, millis(&outs[*o]) != millis(input))
+                });
+            }
             let best = scored.iter().map(|(_, s)| *s).max().unwrap_or(0);
             scored.into_iter().filter(|(_, s)| *s == best).map(|(o, _)| o).collect()
         };
@@ -1207,7 +1340,9 @@ fn same_value(a: &Rec, b: &Rec) -> bool {
     match a.kind.as_str() {
         "sum" | "gauge" => same_number(&a.body["value"], &b.body["value"]),
         "gauge_delta" => same_number(&a.body["delta"], &b.body["delta"]),
-        "log" => a.body["message"] == b.body["message"],
+        // A log pairs by its message, respelled where the sink respells it; its field rows
+        // compare the rest.
+        "log" => true,
         // A histogram whose last bound is finite gains an empty `+Inf` bucket on a wire that
         // states the total as one (Prometheus) or requires an overflow count (OTLP).
         "histogram" => {
@@ -1410,6 +1545,43 @@ fn model_record(rec: &Rec) -> Option<logit_core::MetricRecord> {
     batches.into_iter().next()?.events.into_iter().next()?.metrics.into_iter().next()
 }
 
+/// `rec`'s log record in the model, read back from its `format: json` body and type tags.
+fn model_log(rec: &Rec) -> Option<logit_core::LogRecord> {
+    let types: Map<String, Value> = rec
+        .types
+        .iter()
+        .map(|(pointer, tag)| (format!("/log{pointer}"), Value::String(tag.clone())))
+        .collect();
+    let line = serde_json::json!({"timestamp": rec.timestamp, "log": rec.body, "types": types});
+    let batches = EventJsonDecoder::new().decode_batches(line.to_string().as_bytes()).ok()?;
+    batches.into_iter().next()?.events.into_iter().next()?.log
+}
+
+/// The record-level `log` features a log on an event with no metrics reaches beside its kind's
+/// row: `message_unsafe` when the sink rewrites its message ([`Spelling::log_message`]),
+/// `structured_message` for a `Map` or `Array` message, `bytes_message` for a `Bytes` one, and
+/// `blank_message` for an empty message or none.
+fn log_features(rec: &Rec, spelling: Spelling) -> Vec<&'static str> {
+    let mut features = Vec::new();
+    if rec.kind != "log" || rec.beside_metrics {
+        return features;
+    }
+    let message = &rec.body["message"];
+    if spelling.log_message(rec).is_some_and(|m| *message != Value::String(m)) {
+        features.push("message_unsafe");
+    }
+    if message.is_object() || message.is_array() {
+        features.push("structured_message");
+    }
+    if rec.types.get("/message").is_some_and(|tag| tag == "bytes") {
+        features.push("bytes_message");
+    }
+    if message.is_null() || *message == "" {
+        features.push("blank_message");
+    }
+    features
+}
+
 /// The record-level `record` features `rec` reaches.
 fn record_features(rec: &Rec, spelling: Spelling) -> Vec<&'static str> {
     let mut features = Vec::new();
@@ -1515,12 +1687,24 @@ fn moved_apart(pairing: &Pairing, i: usize, j: usize, outs: &[Rec]) -> bool {
 enum Field {
     /// A key of the metric object.
     Body(&'static str),
+    /// A key of the log object: `exact` when the read-back holds the same value, `normalized`
+    /// when it holds another, `lost` when it holds none. A body format has no changed reading: a
+    /// read-back format other than the input's is the pair decoder's default standing in for a
+    /// format the wire has no slot for, so it reads `lost`. At `datadog_out`, a trace or span id
+    /// read back as the attribute of its name instead reads `normalized`.
+    LogBody(&'static str),
+    /// A key of the log object the input doesn't set: `exact` when the read-back sets none
+    /// either, `normalized` when the sink stamped one.
+    LogUnset(&'static str),
+    /// `event.timestamp`: `exact` read back the same, else `normalized`, a timestamp written at
+    /// the sink's precision. A receipt time (`receipt`) read back outside its second is `lost`.
+    Timestamp { receipt: bool },
     /// An event attribute, or a resource attribute.
     Attribute { key: String, resource: bool },
     /// The batch's scope.
     Scope,
-    /// An attribute `datadog_out` derives from the record's own fields ([`derived`]).
-    Derived { key: &'static str, value: String },
+    /// An attribute a sink derives from the record's own fields, by its row ([`derived_rows`]).
+    Derived { feature: &'static str },
     /// A `samples` record's rate below 1 that rounds to weight 1 ([`unweighted_rate`]).
     SampleRate,
 }
@@ -1575,6 +1759,42 @@ fn field_rows(rec: &Rec, protocol: &str) -> Vec<(String, Option<String>, Field)>
             }
         }
     }
+    if rec.kind == "log" && !rec.beside_metrics {
+        let has = |key: &str| rec.body.get(key).is_some();
+        let mut push = |feature: &str, field: Field| {
+            rows.push(("log".to_string(), Some(feature.to_string()), field));
+        };
+        if has("severity") {
+            push("severity", Field::LogBody("severity"));
+        } else {
+            push("severity_unset", Field::LogUnset("severity"));
+        }
+        push("body_format", Field::LogBody("format"));
+        if has("event_name") {
+            push("event_name", Field::LogBody("event_name"));
+        }
+        if has("observed_timestamp") {
+            push("observed_timestamp", Field::LogBody("observed_timestamp"));
+        } else {
+            push("observed_timestamp_unset", Field::LogUnset("observed_timestamp"));
+        }
+        if has("trace_id") {
+            push("trace", Field::LogBody("trace_id"));
+            if has("span_id") {
+                push("trace", Field::LogBody("span_id"));
+            }
+            push("trace_flags", Field::LogBody("trace_flags"));
+        } else {
+            push("trace_unset", Field::LogUnset("trace_id"));
+        }
+        if has("dropped_attributes_count") {
+            push("dropped_attributes_count", Field::LogBody("dropped_attributes_count"));
+        }
+        let receipt = rec.attributes.contains_key("syslog.timestamp")
+            || rec.resource.contains_key("syslog.timestamp");
+        let feature = if receipt { "receipt_timestamp" } else { "timestamp" };
+        push(feature, Field::Timestamp { receipt });
+    }
     let own = format!("_logit.{protocol}.");
     // A `_logit.datadog.*` carrier on a log, a Datadog event, or a service check: `datadog_out`'s
     // routes for those skip one they have no field for without counting it, where its metrics
@@ -1595,6 +1815,9 @@ fn field_rows(rec: &Rec, protocol: &str) -> Vec<(String, Option<String>, Field)>
             Some(interval_row(rec))
         } else if key == ATTR_TARGET {
             Some("prometheus_target")
+        } else if key.starts_with("_logit.otel.severity_") {
+            // OTLP's raw severity, which `Severity` holds only at band resolution.
+            Some("severity_carrier")
         } else if key.starts_with("_logit.datadog.") && json_route {
             Some("datadog_carrier_log")
         } else if key.starts_with(&own) || (protocol == "influxdb" && is_field(key)) {
@@ -1676,8 +1899,8 @@ fn field_rows(rec: &Rec, protocol: &str) -> Vec<(String, Option<String>, Field)>
     if rec.scope.is_some() {
         rows.push(("attributes".to_string(), Some("scope".to_string()), Field::Scope));
     }
-    for (feature, key, value) in derived(rec) {
-        let field = Field::Derived { key, value };
+    for feature in derived_rows(rec) {
+        let field = Field::Derived { feature };
         rows.push(("attributes".to_string(), Some(feature.to_string()), field));
     }
     rows
@@ -1691,24 +1914,55 @@ fn observe_field(field: &Field, input: &Rec, out: &Rec, spelling: Spelling) -> C
             Some(_) => Class::Normalized,
             None => Class::Lost,
         },
-        // A sink that derives none reads back only the record's own attributes under the key,
-        // such as `statsd_out`'s `host` read back as `host.name`.
-        Field::Derived { .. } if spelling.derived(input).is_empty() => Class::Exact,
         // An attribute the input lacks, read back with the value derived for it, is the sink's
         // rewrite of a field the record already holds.
-        Field::Derived { key, value } => {
+        Field::Derived { feature } => {
+            // A sink that derives nothing for the row reads back only the record's own
+            // attributes under the key, such as `statsd_out`'s `host` read back as `host.name`.
+            let Some((_, key, value)) =
+                spelling.derived(input).into_iter().find(|(row, _, _)| *row == Some(*feature))
+            else {
+                return Class::Exact;
+            };
             // A span's derived host is its tracer payload's, on the resource, ahead of any
             // `host.name` span tag; every other derived field is the record's own.
-            let span_host =
-                *key == "host.name" && datadog::Route::of(input) == datadog::Route::Span;
+            let span_host = key == "host.name" && datadog::Route::of(input) == datadog::Route::Span;
             let read = if span_host {
-                out.resource.get(*key).or(out.attributes.get(*key))
+                out.resource.get(key).or(out.attributes.get(key))
             } else {
-                out.attributes.get(*key).or(out.resource.get(*key))
+                out.attributes.get(key).or(out.resource.get(key))
             };
             match read {
-                Some(read) if text(read) == *value => Class::Normalized,
+                Some(read) if text(read) == value => Class::Normalized,
                 _ => Class::Lost,
+            }
+        }
+        Field::LogBody(key) => match out.body.get(*key) {
+            Some(value) if *value == input.body[*key] => Class::Exact,
+            Some(_) if *key == "format" => Class::Lost,
+            Some(_) => Class::Normalized,
+            None if spelling == Spelling::Datadog
+                && matches!(*key, "trace_id" | "span_id")
+                && out.attributes.get(*key) == Some(&input.body[*key]) =>
+            {
+                Class::Normalized
+            }
+            None => Class::Lost,
+        },
+        Field::LogUnset(key) => match out.body.get(*key) {
+            Some(_) => Class::Normalized,
+            None => Class::Exact,
+        },
+        // A receipt time read back outside its own second is another instant, which no
+        // precision explains.
+        Field::Timestamp { receipt } => {
+            let second = |rec: &Rec| rec.timestamp.get(..19).map(str::to_string);
+            if out.timestamp == input.timestamp {
+                Class::Exact
+            } else if *receipt && second(out) != second(input) {
+                Class::Lost
+            } else {
+                Class::Normalized
             }
         }
         // A rate read back as 1 is the rate gone.
@@ -2116,6 +2370,11 @@ pub(super) fn check(
         // Record level.
         let mut rows: Vec<(String, Option<String>)> =
             kind_features(input).into_iter().map(|f| (input.kind.clone(), f)).collect();
+        rows.extend(
+            log_features(input, spelling)
+                .into_iter()
+                .map(|feature| ("log".to_string(), Some(feature.to_string()))),
+        );
         let mut features = record_features(input, spelling);
         let later: Vec<usize> = (i + 1..ins.len())
             .filter(|&j| input.is_metric() && same_series(input, &ins[j]))
@@ -2812,7 +3071,7 @@ mod tests {
         let kept = recs(&[&gauge(r#"{"collectd.host":"web-1"}"#)]);
         assert_eq!(pair(&ins, &moved, Spelling::Datadog).seen, [None]);
         assert_eq!(pair(&ins, &kept, Spelling::Datadog).seen, [Some(Class::Exact)]);
-        assert!(derived(&ins[0]).iter().any(|(feature, _, _)| *feature == "no_host"));
+        assert!(derived_rows(&ins[0]).contains(&"no_host"));
     }
 
     const DOGSTATSD: Spelling = Spelling::Statsd { dogstatsd: true };
@@ -3094,7 +3353,7 @@ mod tests {
     fn a_log_with_an_empty_host_name_is_due_the_default_host() {
         let log =
             recs(&[r#"{{T},"log":{"format":"raw","message":"m"},"attributes":{"host.name":""}}"#]);
-        assert!(derived(&log[0]).iter().any(|(feature, _, _)| *feature == "no_host"));
+        assert!(derived_rows(&log[0]).contains(&"no_host"));
     }
 
     /// The latest point of a series claims what a sink holding one value per series read back,
@@ -3289,5 +3548,110 @@ mod tests {
         let failures = check_prometheus(&ins, &outs, exposed);
         assert_eq!(failures.len(), 1, "{failures:#?}");
         assert!(failures[0].contains("isn't read back"), "{failures:#?}");
+    }
+
+    /// A log with `body` and `attributes`, at the fixed timestamp.
+    fn log_line(body: &str, attributes: &str) -> String {
+        format!(r#"{{{{T}},"log":{{{body}}},"attributes":{attributes}}}"#)
+    }
+
+    /// The class `out` reads at for `input`'s row `log/<feature>` under `spelling`.
+    fn log_field(
+        input: &Rec,
+        out: &Rec,
+        protocol: &str,
+        feature: &str,
+        spelling: Spelling,
+    ) -> Class {
+        let rows = field_rows(input, protocol);
+        let (_, _, field) = rows
+            .iter()
+            .find(|(kind, f, _)| kind == "log" && f.as_deref() == Some(feature))
+            .unwrap_or_else(|| panic!("no log/{feature} row"));
+        observe_field(field, input, out, spelling)
+    }
+
+    /// A log read back with another severity still pairs, and the difference lands on
+    /// `log/severity`, not on the record.
+    #[test]
+    fn a_log_whose_severity_differs_lands_on_its_severity_row() {
+        let ins = recs(&[&log_line(r#""severity":"warn","format":"raw","message":"m""#, "{}")]);
+        let outs = recs(&[&log_line(r#""severity":"info","format":"raw","message":"m""#, "{}")]);
+        assert_eq!(pair(&ins, &outs, Spelling::Otlp).seen, [Some(Class::Exact)]);
+        assert_eq!(
+            log_field(&ins[0], &outs[0], "otlp", "severity", Spelling::Otlp),
+            Class::Normalized
+        );
+    }
+
+    /// A log read back with another observed time still pairs, and the difference lands on
+    /// `log/observed_timestamp`.
+    #[test]
+    fn a_log_whose_observed_time_differs_lands_on_its_observed_timestamp_row() {
+        let body = |observed: &str| {
+            format!(r#""format":"raw","message":"m","observed_timestamp":"{observed}""#)
+        };
+        let ins = recs(&[&log_line(&body("2027-01-15T08:00:01.000000000Z"), "{}")]);
+        let outs = recs(&[&log_line(&body("2027-01-15T08:00:02.000000000Z"), "{}")]);
+        assert_eq!(pair(&ins, &outs, Spelling::Otlp).seen, [Some(Class::Exact)]);
+        assert_eq!(
+            log_field(&ins[0], &outs[0], "otlp", "observed_timestamp", Spelling::Otlp),
+            Class::Normalized
+        );
+    }
+
+    /// `datadog_out` writes a structured message as its JSON text, so the log pairs respelled
+    /// and reaches `log/message_unsafe`, which the check reads at the pairing's class.
+    #[test]
+    fn datadog_pairs_a_rewritten_message_respelled() {
+        let ins = recs(&[&log_line(
+            r#""severity":"warn","format":"raw","message":{"a":1}"#,
+            r#"{"host.name":"h"}"#,
+        )]);
+        let outs = recs(&[&log_line(
+            r#""severity":"warn","format":"raw","message":"{\"a\":1}""#,
+            r#"{"host.name":"h","status":"warn"}"#,
+        )]);
+        assert_eq!(pair(&ins, &outs, Spelling::Datadog).seen, [Some(Class::Normalized)]);
+        assert_eq!(pair(&ins, &outs, Spelling::Verbatim).seen, [None]);
+        assert!(log_features(&ins[0], Spelling::Datadog).contains(&"message_unsafe"));
+        assert!(!log_features(&ins[0], Spelling::Otlp).contains(&"message_unsafe"));
+    }
+
+    /// A log with no severity reads `log/severity_unset` exact when it reads back with none, and
+    /// normalized when the sink stamps one.
+    #[test]
+    fn a_log_with_no_severity_reads_normalized_only_when_stamped() {
+        let ins = recs(&[&log_line(r#""format":"raw","message":"m""#, "{}")]);
+        let bare = recs(&[&log_line(r#""format":"raw","message":"m""#, "{}")]);
+        let stamped = recs(&[&log_line(r#""severity":"info","format":"raw","message":"m""#, "{}")]);
+        let at = |out: &Rec| log_field(&ins[0], out, "otlp", "severity_unset", Spelling::Otlp);
+        assert_eq!(at(&bare[0]), Class::Exact);
+        assert_eq!(at(&stamped[0]), Class::Normalized);
+    }
+
+    /// `datadog_out` writes a log's trace and span ids as `trace_id` and `span_id` keys, read
+    /// back as attributes; they pair only holding the log's own ids.
+    #[test]
+    fn datadog_pairs_a_logs_trace_ids_read_back_as_attributes() {
+        let trace = r#""trace_id":"0102030405060708090a0b0c0d0e0f10","span_id":"1112131415161718""#;
+        let ins = recs(&[&log_line(
+            &format!(r#""severity":"warn","format":"raw","message":"m",{trace}"#),
+            r#"{"host.name":"h"}"#,
+        )]);
+        let read = |attributes: &str| {
+            recs(&[&log_line(r#""severity":"warn","format":"raw","message":"m""#, attributes)])
+        };
+        let same = read(&format!(r#"{{"host.name":"h","status":"warn",{trace}}}"#));
+        let other = read(
+            r#"{"host.name":"h","status":"warn","trace_id":"00000000000000000000000000000001","span_id":"1112131415161718"}"#,
+        );
+        assert_eq!(pair(&ins, &same, Spelling::Datadog).seen, [Some(Class::Exact)]);
+        assert_eq!(pair(&ins, &same, Spelling::Verbatim).seen, [None]);
+        assert_eq!(pair(&ins, &other, Spelling::Datadog).seen, [None]);
+        assert_eq!(
+            log_field(&ins[0], &same[0], "datadog", "trace", Spelling::Datadog),
+            Class::Normalized
+        );
     }
 }

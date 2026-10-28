@@ -350,7 +350,8 @@ const SCRAPE_URL: &str = "http://transit:9100/metrics";
 const SCRAPE_INSTANCE: &str = "transit:9100";
 
 /// `system`'s wire bytes as its listener's decoder reads them, at [`RECEIVED_AT`], under the
-/// resource the listener would stamp. A source system joins with an arm here:
+/// resource the listener would stamp. The arm is the directory name's prefix before any `-`, so
+/// `otlp-logs` decodes as `otlp`. A source system joins with an arm here:
 ///
 /// - `statsd`: one datagram through `StatsdDecoder`, under an empty resource.
 /// - `influxdb`: one write body through `InfluxDecoder::decode_body`, under the resource
@@ -368,7 +369,8 @@ const SCRAPE_INSTANCE: &str = "transit:9100";
 ///   from `path:`, the body encoding from `content-type:` (protobuf when absent), and the
 ///   decompression from `content-encoding:`, as the listener does. A wire file with no `.headers`
 ///   is the OTel Collector `file` exporter's output, as `testdata/interop/otlp/` records it: one
-///   OTLP/JSON metrics request per line.
+///   OTLP/JSON request per line, its signal named by the line's top-level key (`resourceLogs`,
+///   `resourceMetrics`, or `resourceSpans`).
 /// - `collectd`: one datagram through `CollectdDecoder`, under an empty resource, naming data
 ///   sources from the meta's `types_db:` file when it names one.
 /// - `graphite`: through `GraphiteDecoder` in the meta's `protocol:` (plaintext when absent),
@@ -384,7 +386,7 @@ fn decode_wire(
 ) -> anyhow::Result<String> {
     let mut probe = TelemetryProbe::new();
     let id = "transit.case";
-    let batches = match system {
+    let batches = match system.split('-').next().unwrap_or(system) {
         "statsd" => {
             let telemetry = probe.telemetry(id, "statsd_in", "listener");
             let diag = Diagnostics::new(id).with_telemetry(telemetry.clone());
@@ -491,7 +493,18 @@ fn decode_wire(
                     );
                     let mut batches = Vec::new();
                     for line in bytes.split(|&b| b == b'\n').filter(|line| !line.is_empty()) {
-                        batches.extend(decode(Signal::Metrics.path(), &request, line)?);
+                        let parsed: Value = serde_json::from_slice(line)
+                            .context("a Collector file export line isn't JSON")?;
+                        let signal = [
+                            ("resourceLogs", Signal::Logs),
+                            ("resourceMetrics", Signal::Metrics),
+                            ("resourceSpans", Signal::Traces),
+                        ]
+                        .into_iter()
+                        .find(|(key, _)| parsed.get(key).is_some())
+                        .map(|(_, signal)| signal)
+                        .context("a Collector file export line names no signal")?;
+                        batches.extend(decode(signal.path(), &request, line)?);
                     }
                     batches
                 }
@@ -1098,6 +1111,8 @@ flow_tests! {
     collectd_to_prometheus => "collectd-to-prometheus",
     collectd_to_statsd => "collectd-to-statsd",
     collectd_to_graphite => "collectd-to-graphite",
+    datadog_logs_relay => "datadog-logs-relay",
+    datadog_logs_to_otlp => "datadog-logs-to-otlp",
     datadog_relay => "datadog-relay",
     datadog_to_influxdb => "datadog-to-influxdb",
     datadog_to_otlp => "datadog-to-otlp",
@@ -1123,6 +1138,8 @@ flow_tests! {
     influxdb_to_statsd => "influxdb-to-statsd",
     influxdb_to_graphite => "influxdb-to-graphite",
     otlp_delta_to_datadog => "otlp-delta-to-datadog",
+    otlp_logs_relay => "otlp-logs-relay",
+    otlp_logs_to_datadog => "otlp-logs-to-datadog",
     otlp_relay => "otlp-relay",
     otlp_to_datadog => "otlp-to-datadog",
     otlp_to_datadog_counters => "otlp-to-datadog-counters",
