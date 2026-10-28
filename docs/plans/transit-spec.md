@@ -1367,9 +1367,11 @@ Recorded per workstream as each lands.
     goes, `attributes/host_name` and `attributes/syslog_header` read `exact` there, and
     `attributes/no_host` reads `normalized`, `default_host`, under both formats, each observed
     in `syslog-relay-rfc3164` and the other RFC 3164 flows. `log/beside_metrics` is one `exact`
-    cell. The read-back default TAG is paired as an attribute the sink filled in, with no row of
-    its own, as the message's first word read as a TAG was. A TAG outside `syslog_in`'s TAG
-    class still reads back as MSG, so the class check's model of the RFC 3164 header stays; no
-    case reaches it. `crates/logit-cli/tests/syslog_round_trip.rs`'s permitted-normalization list
+    cell. The default TAG has a row of its own, `attributes/default_tag` (`normalized`,
+    `default_tag` under RFC 3164 at `syslog_out`, `exact` everywhere else), which a resource
+    `service.name` (`otlp-logs` `telemetrygen`) and the `logit` fallback both reach. A fallback
+    TAG is narrowed to `syslog_in`'s TAG class, so it always reads back as a TAG; a carried
+    `syslog.tag` outside the class still reads back as MSG, so the class check's model of the RFC
+    3164 header stays, and no case reaches that. `crates/logit-cli/tests/syslog_round_trip.rs`'s permitted-normalization list
     gains the TAG default as its tenth entry, since the Python handler's captures now relay with
     `logit:`.

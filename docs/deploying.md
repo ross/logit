@@ -4671,7 +4671,9 @@ public attribute is an SD-PARAM of that element, a `Bytes` value as base64 text;
 whose key isn't a valid SD-NAME, or whose value is an empty array, is left off and counted
 `logit.output.structured_data.omitted`. Under `format: rfc3164` every message has a TAG: the
 event's `syslog.tag`, else `app_name:`, else `service.name`, else `logit`, so a receiver reads
-the HOSTNAME before it as a HOSTNAME.
+the HOSTNAME before it as a HOSTNAME. A `service.name` TAG keeps only letters, digits, `_`, `-`,
+`.`, and `/`, with every other character written as `_`; a `syslog.tag` or `app_name:` is
+written as you set it, so keep it to those characters too.
 
 ### Syslog over TLS (RFC 5425)
 

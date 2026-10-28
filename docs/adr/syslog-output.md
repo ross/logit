@@ -383,8 +383,8 @@ and no `app_name:` takes its TAG from, in order:
 2. a non-empty `service.name` on the batch resource;
 3. `logit`, the process name.
 
-The TAG is sanitized as a configured TAG is. The resource step matches HOSTNAME's and PROCID's
-lookups above, and it's where an OTLP sender puts `service.name`.
+The TAG is narrowed as the consequences below say. The resource step matches HOSTNAME's and
+PROCID's lookups above, and it's where an OTLP sender puts `service.name`.
 
 RFC 3164 makes no header field certain, so a reader tells HOSTNAME from MSG only by the TAG after
 it. `syslog_in`'s header rule (`crates/logit-proto/src/syslog/mod.rs`'s "The RFC 3164 header")
@@ -406,10 +406,12 @@ Consequences:
   NILVALUE `-`.
 - **`app_name:` still wins over `service.name`**, and `syslog.tag` over both, by the
   header-field precedence above.
-- **A TAG is read back as one only in `syslog_in`'s TAG class** (letters, digits, `_`, `-`, `.`,
-  `/`). The fallback is sanitized as a configured TAG is, which keeps other printable characters,
-  so a `service.name` such as `api@v2` still leaves a message `syslog_in` reads with no HOSTNAME.
-  No transit case reaches it.
+- **A fallback TAG is narrowed to `syslog_in`'s TAG class** (letters, digits, `_`, `-`, `.`,
+  `/`), every other character written as `_` and the whole capped at RFC 3164's 32 characters,
+  so a `service.name` such as `api@v2` leaves as `api_v2:` and reads back as `syslog.tag` with
+  the HOSTNAME before it intact. The misread is unreachable on the fallback path. A carried
+  `syslog.tag` or a configured `app_name:` is the operator's own and keeps the wider
+  sanitization above, so one outside the class still reads back as part of MSG.
 - **An attribute outside the header fields stays off the wire, uncounted, under RFC 3164.** The
   format has no field for it, a structural limit ([ADR
   `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md)'s "Amendment (2026-10-28): an
