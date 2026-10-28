@@ -26,7 +26,8 @@ classes:
     counts it.
 # A cell may still say `reason: uncounted` only on the rows `UNCOUNTED_ALLOWED` names in
 # `crates/logit-cli/src/transit/mapping.rs`: span payloads, not yet classified, log payloads,
-# classified only at otlp_out and datadog_out, and `datadog_out`'s carrier on a log.
+# classified only at otlp_out, datadog_out, and, for a DogStatsD event, statsd_out, and
+# `datadog_out`'s carrier on a log.
 # docs/adr/telemetry-loss-vocabulary.md's amendment "structural loss has no counter" has the rule.
 
 sinks: [statsd_out, prometheus_out, influxdb_out, otlp_out, datadog_out, graphite_out]
@@ -3034,8 +3035,9 @@ rows:
 
   # OTLP's raw severity carriers. `_logit.syslog.severity` gets its own row,
   # `severity_carrier_syslog`, with the syslog source, since otlp_out keeps one carrier and not the
-  # other. statsd_out, prometheus_out, influxdb_out, and graphite_out don't write a log on an event
-  # with no metrics, where the carriers ride, so none of them has a cell.
+  # other. statsd_out writes a log only as a DogStatsD event, and this row has no statsd_out cell;
+  # prometheus_out, influxdb_out, and graphite_out don't write a log on an event with no metrics,
+  # where the carriers ride, so neither has a cell.
   - kind: attributes
     feature: severity_carrier_otel
     cells:
@@ -3184,9 +3186,10 @@ rows:
         class: skipped
         counter: logit.output.events.skipped{reason=no_metrics}
         text: A log has no carbon form and isn't written.
-  # A log's own record-level rows, beside `log/plain` or `log/dogstatsd_event`. statsd_out,
-  # prometheus_out, influxdb_out, and graphite_out don't write a log on an event with no metrics,
-  # so none of them has a cell. otlp_out writes every message as an `AnyValue`, so no log reaches
+  # A log's own record-level rows, beside `log/plain` or `log/dogstatsd_event`. statsd_out writes a
+  # log only as a DogStatsD event, and this row has no statsd_out cell; prometheus_out,
+  # influxdb_out, and graphite_out don't write a log on an event with no metrics, so none of them
+  # has a cell. otlp_out writes every message as an `AnyValue`, so no log reaches
   # `log/message_unsafe` there.
   - kind: log
     feature: message_unsafe
@@ -3326,8 +3329,7 @@ rows:
         reason: trace_as_attributes
         text: >-
           The ids leave as hex `trace_id` and `span_id` keys, which Datadog's log intake reads for
-          trace correlation and datadog_in reads back as attributes, not as the log's trace;
-          neither is written when the log carries an attribute of either name.
+          trace correlation and datadog_in reads back as attributes, not as the log's trace.
   - kind: log
     feature: trace_unset
     cells:
@@ -3408,9 +3410,7 @@ rows:
         text: A log on an event that carries metrics is left off while the metrics are written, uncounted.
       otlp_out:
         class: exact
-        text: >-
-          An OTLP log record in the logs request, beside the metrics in theirs, with an observed
-          time stamped when it has none.
+        text: An OTLP log record in the logs request, beside the metrics in theirs.
       datadog_out:
         class: exact
         text: >-

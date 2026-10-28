@@ -238,7 +238,7 @@ reads the table alone. Each sink column has two regions:
 
 - `doc:<sink>`, the whole column, in the module doc that holds the sink's encode mapping:
   `crates/logit-outputs/src/statsd.rs`, `crates/logit-proto/src/prometheus/mod.rs`,
-  `crates/logit-proto/src/influxdb/mod.rs`, and `crates/logit-proto/src/otlp/metrics.rs`. A
+  `crates/logit-proto/src/influxdb/mod.rs`, and `crates/logit-proto/src/otlp/mod.rs`. A
   table of the record-level rows, then one of the field-level rows, each a row label, the class,
   the reason and counter, and the cell's text; a `when:` cell is its own row.
 - `gaps:<sink>`, in `docs/known-gaps/mappings.md`: every `degraded`, `lost`, `skipped`, and
@@ -350,7 +350,7 @@ changes a value.
 | `dropped_attributes_count` | field | OTLP's dropped-attribute count. |
 | `timestamp` | field | `event.timestamp`, at the precision the sink writes. |
 | `receipt_timestamp` | field | The receipt-time `event.timestamp` of an event that carries `syslog.timestamp`. |
-| `beside_metrics` | field | A log on an event that carries metrics. |
+| `beside_metrics` | field | A log on an event that carries metrics: whether the sink carried it. Its fields reach the field rows above, as a log alone's do. |
 
 #### Identity and the respelled message
 
@@ -485,8 +485,8 @@ W1 changes `crates/logit-cli/src/transit/`'s `mapping.rs`, `classes.rs`, `spec.r
     `span_id` found in attributes as `Normalized`; `Field::LogUnset`, `exact` when the read-back
     is also absent and `normalized` otherwise; and `Field::Timestamp { receipt }`, as
     "Timestamps" describes.
-  - A `field_rows` branch for a log not beside metrics that pushes the field rows, and closures
-    keyed by attribute name for `severity_carrier_otel`, `severity_carrier_syslog`,
+  - A `field_rows` branch for every log, beside metrics or not, that pushes the field rows, and
+    closures keyed by attribute name for `severity_carrier_otel`, `severity_carrier_syslog`,
     `syslog_header`, `syslog_msgid`, `syslog_sd`, `syslog_timestamp`, `host_name`, and
     `splunk_envelope`.
   - `log_features` beside `kind_features`, since `record_features` returns early for a record

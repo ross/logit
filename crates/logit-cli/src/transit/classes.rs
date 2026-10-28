@@ -67,9 +67,11 @@
 //! `event/attributes_only`, and its attribute rows. A record reaches an `attributes` field row for
 //! each attribute [`derived_rows`] lists, at every sink that compares the record; a sink that writes
 //! none reads it `exact` when nothing stands in its place. A log or span on an event that carries
-//! metrics is a field of that event: it reaches `log/beside_metrics` or `span/beside_metrics` alone, read as `exact` when it pairs
-//! unchanged, `normalized` when it pairs changed, and `lost` when nothing read back pairs with
-//! it.
+//! metrics is a field of that event: it reaches `log/beside_metrics` or `span/beside_metrics`,
+//! read as `exact` when it pairs unchanged, `normalized` when it pairs changed, and `lost` when
+//! nothing read back pairs with it. A log there also reaches the `log` field rows a log alone
+//! does, so `log/beside_metrics` says only whether the sink carried it; its attributes are its
+//! event's, judged on the event's metric records.
 //!
 //! **Pairing.** Each input record is paired with the records read back that account for it, in
 //! passes, each claiming a read-back record at most once: (1) the same name and the same kind,
@@ -2124,7 +2126,7 @@ fn field_rows(rec: &Rec, protocol: &str) -> Vec<(String, Option<String>, Field)>
             }
         }
     }
-    if rec.kind == "log" && !rec.beside_metrics {
+    if rec.kind == "log" {
         let has = |key: &str| rec.body.get(key).is_some();
         let mut push = |feature: &str, field: Field| {
             rows.push(("log".to_string(), Some(feature.to_string()), field));
@@ -2751,7 +2753,8 @@ pub(super) fn check(
         }
 
         // A log or span beside metrics is a field of its event (module doc).
-        if !input.is_metric() && input.beside_metrics {
+        let beside = !input.is_metric() && input.beside_metrics;
+        let observed = if beside {
             let label = mapping::row_label(&input.kind, Some("beside_metrics"));
             match mapping.lookup(&input.kind, Some("beside_metrics"), &sink, &traced.sink) {
                 Lookup::NoRow => failures.push(format!(
@@ -2776,165 +2779,173 @@ pub(super) fn check(
                     ledger.saw(&sink, &label, index, seen);
                 }
             }
-            continue;
-        }
-
-        // Record level.
-        let mut rows: Vec<(String, Option<String>)> =
-            kind_features(input).into_iter().map(|f| (input.kind.clone(), f)).collect();
-        rows.extend(
-            log_features(input, spelling)
-                .into_iter()
-                .map(|feature| ("log".to_string(), Some(feature.to_string()))),
-        );
-        let mut features = record_features(input, spelling);
-        let later: Vec<usize> = (i + 1..ins.len())
-            .filter(|&j| input.is_metric() && same_series(input, &ins[j]))
-            .collect();
-        if !later.is_empty() {
-            features.push("superseded");
-        }
-        // The later point of its series at this record's instant, if any.
-        let twin = later.iter().copied().find(|&j| ins[j].timestamp == input.timestamp);
-        // `datadog_out` collapses a series' points in one second on its series route only. A
-        // `samples` record has the distribution-points route, where Datadog keeps both points, a
-        // `distribution` record the sketches route, and a `set_members` record no Datadog form; the
-        // sketches route also carries every `exponential_histogram`, and a `histogram` under the
-        // default `histograms.mode: distributions`, unless `histograms.send_aggregation_metrics`
-        // also writes its `.count`, `.sum`, `.min`, and `.max` on the series route.
-        let histograms = &traced.sink["histograms"];
-        let aggregations = histograms["send_aggregation_metrics"].as_bool().unwrap_or(false);
-        let distributions = histograms["mode"].as_str().is_none_or(|mode| mode == "distributions");
-        let sketched = !aggregations
-            && (input.kind == "exponential_histogram"
-                || (input.kind == "histogram" && distributions));
-        let collapsible = sink != "datadog_out"
-            || !(matches!(input.kind.as_str(), "samples" | "distribution" | "set_members")
-                || sketched);
-        // The point a sink keeping one per series and millisecond sends in this record's place:
-        // the latest, the later in the run on a tie.
-        let sent = later
-            .iter()
-            .copied()
-            .filter(|&j| same_millisecond(input, &ins[j]))
-            .max_by(|&a, &b| ins[a].timestamp.cmp(&ins[b].timestamp).then(a.cmp(&b)));
-        let equal = sent.filter(|&j| same_reading(input, &ins[j]));
-        if twin.is_some() && collapsible {
-            features.push(if equal.is_some() { "same_instant_equal" } else { "same_instant" });
-        } else if twin.is_none() && collapsible && sent.is_some() {
-            features.push(if equal.is_some() {
-                "same_millisecond_equal"
-            } else {
-                "same_millisecond"
-            });
-        }
-        rows.extend(features.into_iter().map(|f| ("record".to_string(), Some(f.to_string()))));
-        let mut cells = Vec::new();
-        let mut unspecified = false;
-        for (kind, feature) in &rows {
-            let label = mapping::row_label(kind, feature.as_deref());
-            match mapping.lookup(kind, feature.as_deref(), &sink, &traced.sink) {
-                Lookup::NoRow => failures.push(format!(
-                    "{here}: {} {:?} reaches row {label}, which mapping.yaml doesn't have",
-                    input.kind, input.name
-                )),
-                Lookup::NotSpecified => {
-                    unspecified = true;
-                    ledger
-                        .unspecified
-                        .entry((sink.clone(), label))
-                        .or_default()
-                        .insert(here.clone());
-                }
-                Lookup::Cell(cell, index) => {
-                    if let Some(counter) = &cell.counter {
-                        named.extend(Series::parse(counter).ok());
-                    }
-                    cells.push((label, cell, index));
-                }
+            match pairing.seen[i] {
+                Some(Class::Exact) => Class::Exact,
+                Some(_) => Class::Normalized,
+                None => continue,
             }
-        }
-        if unspecified || cells.len() < rows.len() {
-            continue;
-        }
-        for (label, _, index) in &cells {
-            ledger.reach(&sink, label, *index);
-        }
-        // A sink that tests the flag before the kind skips or stale-marks a flagged record without
-        // reaching the kind's loss, so a counted loss cell whose counter didn't move doesn't
-        // count against it (module doc's "Counters").
-        let flagged =
-            cells.iter().any(|(label, _, _)| label.starts_with("record/no_recorded_value"));
-        let cells: Vec<_> = cells
-            .into_iter()
-            .filter(|(label, cell, _)| {
-                !flagged
-                    || label.starts_with("record/no_recorded_value")
-                    || !matches!(cell.class, Class::Degraded | Class::Skipped | Class::Dropped)
-                    || cell.counter.as_deref().is_none_or(&did_move)
-            })
-            .collect();
-        let expected = cells.iter().map(|(_, cell, _)| cell.class).fold(Class::Exact, worse);
-        // A sink skips or drops a record once and counts it once, under whichever reason it meets
-        // first, so of several cells at the worst class the one whose counter moved decides.
-        let worst: Vec<_> = cells.iter().filter(|(_, cell, _)| cell.class == expected).collect();
-        let deciding = worst
-            .iter()
-            .find(|(_, cell, _)| cell.counter.as_deref().is_some_and(&did_move))
-            .or(worst.first())
-            .copied();
-        let observed = match pairing.seen[i] {
-            // Two points sharing an instant that read back at different instants were moved
-            // apart, which only a timestamp comparison shows: the check compares no other.
-            Some(Class::Exact) if twin.is_some_and(|j| moved_apart(&pairing, i, j, &outs)) => {
-                Some(Class::Normalized)
+        } else {
+            // Record level.
+            let mut rows: Vec<(String, Option<String>)> =
+                kind_features(input).into_iter().map(|f| (input.kind.clone(), f)).collect();
+            rows.extend(
+                log_features(input, spelling)
+                    .into_iter()
+                    .map(|feature| ("log".to_string(), Some(feature.to_string()))),
+            );
+            let mut features = record_features(input, spelling);
+            let later: Vec<usize> = (i + 1..ins.len())
+                .filter(|&j| input.is_metric() && same_series(input, &ins[j]))
+                .collect();
+            if !later.is_empty() {
+                features.push("superseded");
             }
-            Some(class) => Some(class),
-            None => {
-                let loss = deciding
-                    .filter(|(_, cell, _)| matches!(cell.class, Class::Skipped | Class::Dropped));
-                let counted =
-                    loss.and_then(|(_, cell, _)| cell.counter.as_deref()).is_some_and(&did_move);
-                // A cell that says its loss is uncounted accounts for a record no counter does.
-                let uncounted = loss.is_some_and(|(_, cell, _)| {
-                    cell.counter.is_none() && cell.reason.as_deref() == Some("uncounted")
-                });
-                // A sink that collapses two equal readings counts the one it removes under a
-                // `normalized` cell and sends the other, so the removed one reads as the other
-                // does: at its worst cell, which is that one unless the kind is written in a
-                // lesser form.
-                let collapsed = cells.iter().any(|(_, cell, _)| {
-                    cell.class == Class::Normalized
-                        && cell.counter.as_deref().is_some_and(&did_move)
-                }) && equal.is_some_and(|j| !pairing.claimed[j].is_empty());
-                if counted || uncounted || collapsed {
-                    Some(expected)
-                } else if matches!(expected, Class::Normalized | Class::Degraded)
-                    && sink == "prometheus_out"
-                    && traced.sink.get("bind").is_some_and(|bind| !bind.is_null())
-                    && later.iter().any(|&j| !pairing.claimed[j].is_empty())
-                {
-                    // The exposition registry keeps one value per series, so a record whose
-                    // series has a later record read back was overwritten by it: the pull
-                    // model's normalization, which leaves the earlier record nothing to pair
-                    // with. A kind the sink writes in a lesser form stays at that class.
-                    Some(expected)
-                } else if moved.iter().any(|s| s.name.ends_with(".skipped")) {
-                    Some(Class::Skipped)
-                } else if moved.iter().any(|s| s.name.ends_with(".dropped")) {
-                    Some(Class::Dropped)
+            // The later point of its series at this record's instant, if any.
+            let twin = later.iter().copied().find(|&j| ins[j].timestamp == input.timestamp);
+            // `datadog_out` collapses a series' points in one second on its series route only. A
+            // `samples` record has the distribution-points route, where Datadog keeps both points, a
+            // `distribution` record the sketches route, and a `set_members` record no Datadog form; the
+            // sketches route also carries every `exponential_histogram`, and a `histogram` under the
+            // default `histograms.mode: distributions`, unless `histograms.send_aggregation_metrics`
+            // also writes its `.count`, `.sum`, `.min`, and `.max` on the series route.
+            let histograms = &traced.sink["histograms"];
+            let aggregations = histograms["send_aggregation_metrics"].as_bool().unwrap_or(false);
+            let distributions =
+                histograms["mode"].as_str().is_none_or(|mode| mode == "distributions");
+            let sketched = !aggregations
+                && (input.kind == "exponential_histogram"
+                    || (input.kind == "histogram" && distributions));
+            let collapsible = sink != "datadog_out"
+                || !(matches!(input.kind.as_str(), "samples" | "distribution" | "set_members")
+                    || sketched);
+            // The point a sink keeping one per series and millisecond sends in this record's place:
+            // the latest, the later in the run on a tie.
+            let sent = later
+                .iter()
+                .copied()
+                .filter(|&j| same_millisecond(input, &ins[j]))
+                .max_by(|&a, &b| ins[a].timestamp.cmp(&ins[b].timestamp).then(a.cmp(&b)));
+            let equal = sent.filter(|&j| same_reading(input, &ins[j]));
+            if twin.is_some() && collapsible {
+                features.push(if equal.is_some() { "same_instant_equal" } else { "same_instant" });
+            } else if twin.is_none() && collapsible && sent.is_some() {
+                features.push(if equal.is_some() {
+                    "same_millisecond_equal"
                 } else {
-                    None
+                    "same_millisecond"
+                });
+            }
+            rows.extend(features.into_iter().map(|f| ("record".to_string(), Some(f.to_string()))));
+            let mut cells = Vec::new();
+            let mut unspecified = false;
+            for (kind, feature) in &rows {
+                let label = mapping::row_label(kind, feature.as_deref());
+                match mapping.lookup(kind, feature.as_deref(), &sink, &traced.sink) {
+                    Lookup::NoRow => failures.push(format!(
+                        "{here}: {} {:?} reaches row {label}, which mapping.yaml doesn't have",
+                        input.kind, input.name
+                    )),
+                    Lookup::NotSpecified => {
+                        unspecified = true;
+                        ledger
+                            .unspecified
+                            .entry((sink.clone(), label))
+                            .or_default()
+                            .insert(here.clone());
+                    }
+                    Lookup::Cell(cell, index) => {
+                        if let Some(counter) = &cell.counter {
+                            named.extend(Series::parse(counter).ok());
+                        }
+                        cells.push((label, cell, index));
+                    }
                 }
             }
-        };
-        let read_back: Vec<String> = pairing.claimed[i].iter().map(|&o| outs[o].show()).collect();
-        let reached: Vec<String> = cells
-            .iter()
-            .map(|(label, cell, _)| format!("{label}: {}", cell.class.as_str()))
-            .collect();
-        let Some(observed) = observed else {
-            failures.push(format!(
+            if unspecified || cells.len() < rows.len() {
+                continue;
+            }
+            for (label, _, index) in &cells {
+                ledger.reach(&sink, label, *index);
+            }
+            // A sink that tests the flag before the kind skips or stale-marks a flagged record without
+            // reaching the kind's loss, so a counted loss cell whose counter didn't move doesn't
+            // count against it (module doc's "Counters").
+            let flagged =
+                cells.iter().any(|(label, _, _)| label.starts_with("record/no_recorded_value"));
+            let cells: Vec<_> = cells
+                .into_iter()
+                .filter(|(label, cell, _)| {
+                    !flagged
+                        || label.starts_with("record/no_recorded_value")
+                        || !matches!(cell.class, Class::Degraded | Class::Skipped | Class::Dropped)
+                        || cell.counter.as_deref().is_none_or(&did_move)
+                })
+                .collect();
+            let expected = cells.iter().map(|(_, cell, _)| cell.class).fold(Class::Exact, worse);
+            // A sink skips or drops a record once and counts it once, under whichever reason it meets
+            // first, so of several cells at the worst class the one whose counter moved decides.
+            let worst: Vec<_> =
+                cells.iter().filter(|(_, cell, _)| cell.class == expected).collect();
+            let deciding = worst
+                .iter()
+                .find(|(_, cell, _)| cell.counter.as_deref().is_some_and(&did_move))
+                .or(worst.first())
+                .copied();
+            let observed = match pairing.seen[i] {
+                // Two points sharing an instant that read back at different instants were moved
+                // apart, which only a timestamp comparison shows: the check compares no other.
+                Some(Class::Exact) if twin.is_some_and(|j| moved_apart(&pairing, i, j, &outs)) => {
+                    Some(Class::Normalized)
+                }
+                Some(class) => Some(class),
+                None => {
+                    let loss = deciding.filter(|(_, cell, _)| {
+                        matches!(cell.class, Class::Skipped | Class::Dropped)
+                    });
+                    let counted = loss
+                        .and_then(|(_, cell, _)| cell.counter.as_deref())
+                        .is_some_and(&did_move);
+                    // A cell that says its loss is uncounted accounts for a record no counter does.
+                    let uncounted = loss.is_some_and(|(_, cell, _)| {
+                        cell.counter.is_none() && cell.reason.as_deref() == Some("uncounted")
+                    });
+                    // A sink that collapses two equal readings counts the one it removes under a
+                    // `normalized` cell and sends the other, so the removed one reads as the other
+                    // does: at its worst cell, which is that one unless the kind is written in a
+                    // lesser form.
+                    let collapsed = cells.iter().any(|(_, cell, _)| {
+                        cell.class == Class::Normalized
+                            && cell.counter.as_deref().is_some_and(&did_move)
+                    }) && equal.is_some_and(|j| !pairing.claimed[j].is_empty());
+                    if counted || uncounted || collapsed {
+                        Some(expected)
+                    } else if matches!(expected, Class::Normalized | Class::Degraded)
+                        && sink == "prometheus_out"
+                        && traced.sink.get("bind").is_some_and(|bind| !bind.is_null())
+                        && later.iter().any(|&j| !pairing.claimed[j].is_empty())
+                    {
+                        // The exposition registry keeps one value per series, so a record whose
+                        // series has a later record read back was overwritten by it: the pull
+                        // model's normalization, which leaves the earlier record nothing to pair
+                        // with. A kind the sink writes in a lesser form stays at that class.
+                        Some(expected)
+                    } else if moved.iter().any(|s| s.name.ends_with(".skipped")) {
+                        Some(Class::Skipped)
+                    } else if moved.iter().any(|s| s.name.ends_with(".dropped")) {
+                        Some(Class::Dropped)
+                    } else {
+                        None
+                    }
+                }
+            };
+            let read_back: Vec<String> =
+                pairing.claimed[i].iter().map(|&o| outs[o].show()).collect();
+            let reached: Vec<String> = cells
+                .iter()
+                .map(|(label, cell, _)| format!("{label}: {}", cell.class.as_str()))
+                .collect();
+            let Some(observed) = observed else {
+                failures.push(format!(
                 "{here}: {} {:?} isn't read back and no sink counter says why; the table expects \
                  {} ({})\n  sink input: {}",
                 input.kind,
@@ -2943,12 +2954,12 @@ pub(super) fn check(
                 reached.join(", "),
                 input.show()
             ));
-            continue;
-        };
-        let agrees =
-            observed == expected || (expected == Class::Normalized && observed == Class::Exact);
-        if !agrees {
-            failures.push(format!(
+                continue;
+            };
+            let agrees =
+                observed == expected || (expected == Class::Normalized && observed == Class::Exact);
+            if !agrees {
+                failures.push(format!(
                 "{here}: {} {:?}: the table expects {} ({}), the flow reads {}\n  sink input: {}\n  \
                  read back: [{}]",
                 input.kind,
@@ -2959,34 +2970,41 @@ pub(super) fn check(
                 input.show(),
                 read_back.join(", ")
             ));
-            continue;
-        }
-        if let Some((label, cell, index)) = deciding {
-            ledger.saw(&sink, label, *index, observed);
-            let loss = matches!(cell.class, Class::Degraded | Class::Skipped | Class::Dropped);
-            if let (true, Some(counter)) = (loss && observed == cell.class, &cell.counter) {
-                if !did_move(counter) {
-                    failures.push(format!(
+                continue;
+            }
+            if let Some((label, cell, index)) = deciding {
+                ledger.saw(&sink, label, *index, observed);
+                let loss = matches!(cell.class, Class::Degraded | Class::Skipped | Class::Dropped);
+                if let (true, Some(counter)) = (loss && observed == cell.class, &cell.counter) {
+                    if !did_move(counter) {
+                        failures.push(format!(
                         "{here}: {} {:?} reads {} under row {label}, but its counter {counter} \
                          didn't move",
                         input.kind,
                         input.name,
                         observed.as_str()
                     ));
+                    }
                 }
             }
-        }
-        for (label, cell, index) in &cells {
-            if *label != deciding.map(|d| d.0.clone()).unwrap_or_default() && cell.class == observed
-            {
-                ledger.saw(&sink, label, *index, observed);
+            for (label, cell, index) in &cells {
+                if *label != deciding.map(|d| d.0.clone()).unwrap_or_default()
+                    && cell.class == observed
+                {
+                    ledger.saw(&sink, label, *index, observed);
+                }
             }
-        }
+            observed
+        };
 
-        // Field level.
+        // Field level. A log beside metrics reaches its `log` rows; its attributes are its
+        // event's, judged on the event's metric records.
         let first = pairing.claimed[i].first().copied();
         let checked = matches!(observed, Class::Exact | Class::Normalized);
         for (kind, feature, field) in field_rows(input, &protocol) {
+            if beside && kind != "log" {
+                continue;
+            }
             // A field row is reached only where its record is compared: a record written in a
             // lesser form, or not at all, has no field to compare.
             let Some(first) = first.filter(|_| checked) else { continue };
@@ -4012,22 +4030,41 @@ mod tests {
         );
     }
 
-    /// `datadog_out` writes a structured message as its JSON text, so the log pairs respelled
-    /// and reaches `log/message_unsafe`, which the check reads at the pairing's class.
+    /// `datadog_out` writes a bytes message as lossy UTF-8, so the log pairs respelled and
+    /// reaches `log/message_unsafe`, which the check reads at the pairing's class.
     #[test]
     fn datadog_pairs_a_rewritten_message_respelled() {
-        let ins = recs(&[&log_line(
-            r#""severity":"warn","format":"raw","message":{"a":1}"#,
-            r#"{"host.name":"h"}"#,
-        )]);
+        let ins = recs(&[
+            r#"{{T},"log":{"severity":"warn","format":"raw","message":"b\"caf\\xe9\""},"attributes":{"host.name":"h"},"types":{"/log/message":"bytes"}}"#,
+        ]);
         let outs = recs(&[&log_line(
-            r#""severity":"warn","format":"raw","message":"{\"a\":1}""#,
+            r#""severity":"warn","format":"raw","message":"caf\ufffd""#,
             r#"{"host.name":"h","status":"warn"}"#,
         )]);
         assert_eq!(pair(&ins, &outs, Spelling::Datadog).seen, [Some(Class::Normalized)]);
         assert_eq!(pair(&ins, &outs, Spelling::Verbatim).seen, [None]);
         assert!(log_features(&ins[0], Spelling::Datadog).contains(&"message_unsafe"));
         assert!(!log_features(&ins[0], Spelling::Otlp).contains(&"message_unsafe"));
+    }
+
+    /// A log beside metrics reaches the `log` field rows a log alone does, so a severity read back
+    /// changed lands on `log/severity` there too.
+    #[test]
+    fn a_log_beside_metrics_reaches_its_field_rows() {
+        let line = |severity: &str| {
+            format!(
+                r#"{{{{T}},"log":{{"severity":"{severity}","format":"raw","message":"m"}},"metrics":[{{"name":"g","kind":"gauge","value":1.0}}]}}"#
+            )
+        };
+        let ins = recs(&[&line("warn")]);
+        let outs = recs(&[&line("info")]);
+        let log = ins.iter().position(|rec| rec.kind == "log").expect("a log record");
+        let out = outs.iter().find(|rec| rec.kind == "log").expect("a log record");
+        assert!(ins[log].beside_metrics);
+        assert_eq!(
+            log_field(&ins[log], out, "otlp", "severity", Spelling::Otlp),
+            Class::Normalized
+        );
     }
 
     /// A log with no severity reads `log/severity_unset` exact when it reads back with none, and
