@@ -544,6 +544,10 @@
 //! `_logit.statsd.type`, `container.id`, and the `timestamped` flag are captured too,
 //! so `event.attributes` is never read a second time.
 //!
+//! A span on a DogStatsD event has no statsd form, so the sink writes the event's line and ignores
+//! the span, uncounted, as a sink ignores any signal it has no wire for (ADR
+//! `telemetry-loss-vocabulary`'s amendment "an ignored signal, and a format the config selects").
+//!
 //! **Event wire form**, one line: `_e{tlen,xlen}:title|text`, then, in this order and only when
 //! present and valid: `|d:<secs>` (for a `timestamped` event, as for `|T`; `d:`, never `|T`,
 //! since an event's timestamp is a named field of its own grammar), `|h:<host>` (a usable
