@@ -444,9 +444,10 @@ allowance follows the mechanism, not the value type. The
 #### Uncounted losses
 
 In W5, `UNCOUNTED_ALLOWED`'s `("log", None, None)` narrows to
-`("log", Some("beside_metrics"), None)` plus the `syslog_out` entries above and one for the
-`structured_data:` encoder's own uncounted loss, `attributes/sd_empty_array`: an opted-in empty
-array writes one PARAM per element, so none, and moves no counter. Every other
+`("log", Some("beside_metrics"), None)` plus the `syslog_out` entries above. Two of those carry
+the `structured_data:` encoder's own uncounted losses: a `Bytes` value written as its length, on
+the shared `bytes_value` entry, and an opted-in empty array, which writes one PARAM per element
+and so none, on `attributes/sd_empty_array`. Every other
 uncounted loss of a log field is a format with no slot, and reads `lost, reason: structural`:
 
 - Datadog: trace flags, event name, observed time, body format, and dropped-attribute count.
@@ -1121,9 +1122,9 @@ Recorded per workstream as each lands.
     `syslog_in` reads back as `""`, so null and the empty string meet there.
   - Under `structured_data:`, an opted-in empty array leaves no PARAM and moves no counter
     (`attributes/sd_empty_array`, `lost`, uncounted), where a key that isn't an SD-NAME and an
-    SD-ID collision are each counted. Its `UNCOUNTED_ALLOWED` entry is the one for the
-    `structured_data:` encoder's own mechanism (ADR `transit-spec`'s log-records amendment,
-    decision 9).
+    SD-ID collision are each counted. Its `UNCOUNTED_ALLOWED` entry is one of the two for the
+    `structured_data:` encoder's own uncounted losses, beside `bytes_value`'s for a `Bytes`
+    value written as its length (ADR `transit-spec`'s log-records amendment, decision 9).
   - `datadog_in` reads a fractional-millisecond `timestamp` through an `f64`, so
     `1799999990001.5` reads `07:59:50.001499904Z`, a sub-microsecond error, and `datadog_out`
     writes whole milliseconds (`log/timestamp`, `normalized`).
