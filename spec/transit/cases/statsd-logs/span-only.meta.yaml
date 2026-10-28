@@ -1,0 +1,3 @@
+# A hand-written span on an event with no metric or log, its `ok` status a field a Datadog span
+# has no form for, so it reaches `span/no_wire_form` beside `span/alone`.
+exercises: []

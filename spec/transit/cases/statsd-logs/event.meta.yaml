@@ -1,0 +1,4 @@
+# The DogStatsD events of cases/statsd/event, from the same wire, so the log sinks reach
+# `log/dogstatsd_event` from statsd_in's own form.
+wire: event.statsd
+exercises: [event, tags, host]

@@ -36,7 +36,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 /// The files holding regions, relative to the repository root.
-const FILES: [&str; 9] = [
+const FILES: [&str; 10] = [
     "crates/logit-outputs/src/statsd.rs",
     "crates/logit-outputs/src/syslog.rs",
     "crates/logit-proto/src/prometheus/mod.rs",
@@ -45,6 +45,7 @@ const FILES: [&str; 9] = [
     "crates/logit-proto/src/datadog/mod.rs",
     "crates/logit-proto/src/graphite/mod.rs",
     "crates/logit-proto/src/splunk/mod.rs",
+    "crates/logit-outputs/src/kafka/encode.rs",
     "docs/known-gaps/mappings.md",
 ];
 
@@ -52,7 +53,7 @@ const FILES: [&str; 9] = [
 const REGENERATE: &str = "script/transit docs";
 
 /// Each sink's protocol, as `mappings.md`'s `encode (<Protocol>)` labels name it.
-const PROTOCOLS: [(&str, &str); 8] = [
+const PROTOCOLS: [(&str, &str); 9] = [
     ("statsd_out", "statsd"),
     ("prometheus_out", "Prometheus"),
     ("influxdb_out", "InfluxDB"),
@@ -61,6 +62,7 @@ const PROTOCOLS: [(&str, &str); 8] = [
     ("graphite_out", "Graphite"),
     ("syslog_out", "syslog"),
     ("splunk_hec_out", "Splunk"),
+    ("kafka_out", "Kafka"),
 ];
 
 const OPEN: &str = "<!-- transit:";
@@ -544,7 +546,7 @@ mod tests {
             ("<!-- transit:end -->\n", "no region open"),
             ("<!-- transit:doc:statsd_out -->\n<!-- transit:gaps:statsd_out -->\n", "opens inside"),
             ("<!-- transit:table:statsd_out -->\n<!-- transit:end -->\n", "neither"),
-            ("<!-- transit:doc:kafka_out -->\n<!-- transit:end -->\n", "doesn't list"),
+            ("<!-- transit:doc:collectd_out -->\n<!-- transit:end -->\n", "doesn't list"),
             ("//! <!-- transit:doc:statsd_out -->\n<!-- transit:end -->\n", "another prefix"),
         ] {
             let error = sync_text(&mapping, "x.md", text).err().expect("a malformed region fails");

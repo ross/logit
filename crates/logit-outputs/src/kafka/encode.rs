@@ -254,6 +254,14 @@ impl Render {
     }
 }
 
+/// The value `format: text` writes for a log whose message is `message`, by the module doc's
+/// table.
+pub fn text_body(message: &Value) -> Vec<u8> {
+    let mut out = Vec::new();
+    push_body(&mut out, &mut String::new(), message);
+    out
+}
+
 /// A log body's text, by the module doc's table.
 fn push_body(out: &mut Vec<u8>, text: &mut String, message: &Value) {
     text.clear();

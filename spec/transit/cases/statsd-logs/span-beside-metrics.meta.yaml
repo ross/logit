@@ -1,0 +1,3 @@
+# A hand-written span beside a gauge, on an event with no log: `span/beside_metrics`. The gauge
+# reaches no cell at the log sinks, which have none for a metric kind.
+exercises: []

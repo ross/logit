@@ -430,6 +430,10 @@ enum Spelling {
     /// resource; and the attributes [`splunk::derived`] lists, which `splunk_hec_in` reads back
     /// as attributes the input lacks.
     Splunk,
+    /// `kafka_out` under `format: text`: a log's message as `text_body` writes it, read back as a
+    /// `Str`, or `Bytes` where it isn't UTF-8; no attribute, resource, or other log field at all.
+    /// Under `format: json`, `kafka_out` is [`Spelling::Verbatim`].
+    KafkaText,
     /// Any other sink: names, keys, and values as written.
     Verbatim,
 }
@@ -455,6 +459,7 @@ impl Spelling {
                 }),
             },
             "splunk_hec_out" => Spelling::Splunk,
+            "kafka_out" if config["format"] == "text" => Spelling::KafkaText,
             _ => Spelling::Verbatim,
         }
     }
@@ -480,6 +485,7 @@ impl Spelling {
             | Spelling::Datadog
             | Spelling::Syslog { .. }
             | Spelling::Splunk
+            | Spelling::KafkaText
             | Spelling::Verbatim => name.to_string(),
         }
     }
@@ -558,7 +564,9 @@ impl Spelling {
     /// one as its JSON text, which `datadog_in` reads back as a `Str`. `otlp_out` writes every
     /// message as an `AnyValue`. `syslog_out` writes [`logit_outputs::syslog::wire_message`],
     /// which `syslog_in` reads back as a `Str`, or as `Bytes` where it isn't UTF-8, and under RFC
-    /// 3164 with any header token it doesn't read as a header ([`syslog::read`]).
+    /// 3164 with any header token it doesn't read as a header ([`syslog::read`]). `kafka_out`'s
+    /// `format: text` writes [`logit_outputs::kafka::text_body`], read back by the driver's
+    /// convention as a `Str`, or as `Bytes` where it isn't UTF-8.
     fn log_message(self, rec: &Rec) -> Option<String> {
         if rec.kind != "log" {
             return None;
@@ -572,6 +580,15 @@ impl Spelling {
                 syslog::read(rec, rfc3164).map(|read| text(&json_value(read.message)))
             }
             Spelling::Splunk => splunk::message(rec),
+            Spelling::KafkaText => {
+                let log = model_log(rec)?;
+                let bytes = logit_outputs::kafka::text_body(&log.message);
+                let value = match String::from_utf8(bytes) {
+                    Ok(text) => logit_core::Value::str(text),
+                    Err(err) => logit_core::Value::Bytes(err.into_bytes().into()),
+                };
+                Some(text(&json_value(value)))
+            }
             _ => None,
         }
     }
@@ -684,6 +701,10 @@ impl Spelling {
             if let Some(read) = splunk::read_back(rec) {
                 return read.get(key).cloned();
             }
+        }
+        // A text record is the log's body alone.
+        if self == Spelling::KafkaText {
+            return None;
         }
         if self == (Spelling::Statsd { dogstatsd: true }) && key == "host" {
             let kept = statsd::host_kept(rec, value)?;

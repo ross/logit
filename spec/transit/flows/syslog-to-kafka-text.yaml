@@ -1,0 +1,14 @@
+# syslog_in's cases into kafka_out with nothing between, under `format: text`: each log's body as
+# one record and nothing else of the event, which the transit spec reads back as one log per record.
+# `path:` names one case so `logit run` can run this by hand; the transit spec runs every case in
+# that file's directory (spec/transit/README.md).
+components:
+  case:
+    type: replay_in
+    path: ../cases/syslog/logger-rfc5424-basic.json
+  out:
+    type: kafka_out
+    sources: [case]
+    brokers: ["127.0.0.1:9092"]
+    topic: logs
+    format: text

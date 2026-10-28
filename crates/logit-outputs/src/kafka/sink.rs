@@ -62,7 +62,7 @@ use logit_proto::{FramedEncoder, MessageBuf};
 use logit_proto::Signal;
 
 use super::batch::{value_budget, ProducerRecord};
-use super::encode::{KafkaEncoder, RecordFormat, RecordKey, RecordMeta, RecordMode};
+use super::encode::{EncodeStats, KafkaEncoder, RecordFormat, RecordKey, RecordMeta, RecordMode};
 use super::fault;
 use super::multi::{MultiPending, MultiProducer};
 use super::producer::{Acks, ProducerConfig, Settlement};
@@ -171,6 +171,42 @@ impl KafkaSettings {
     }
 }
 
+/// The record encoder `settings` configure, its `record: batch` budget the most a value may hold
+/// under `max_request_bytes` beside `headers`; [`KafkaOutput::new`] builds its own through this.
+pub fn encoder(settings: &KafkaSettings) -> KafkaEncoder {
+    let record = settings.record.unwrap_or(settings.format.default_record());
+    let budget = value_budget(settings.max_request_bytes, &record_headers(&settings.headers));
+    KafkaEncoder::new(&settings.key, settings.format, record, budget)
+}
+
+/// `headers` as every record carries them.
+fn record_headers(headers: &[(String, String)]) -> IndexMap<StrBytes, Option<Bytes>> {
+    headers
+        .iter()
+        .map(|(k, v)| (StrBytes::from_string(k.clone()), Some(Bytes::from(v.clone()))))
+        .collect()
+}
+
+/// Counts what one encode of a batch reports, but for the oversize drops, which the sink counts
+/// with a warning naming its `max_request_bytes`: the unkeyed records, the events `format: text`
+/// skips, and the metrics and spans it leaves beside a log body.
+pub fn report_encode_stats(telemetry: &Telemetry, stats: &EncodeStats) {
+    if stats.missing_key > 0 {
+        telemetry.count(RECORDS_UNKEYED, stats.missing_key as f64, &[]);
+    }
+    if stats.no_log > 0 {
+        telemetry.count(EVENTS_SKIPPED, stats.no_log as f64, &[("reason", "no_log")]);
+    }
+    if stats.metrics_omitted > 0 {
+        let n = stats.metrics_omitted as f64;
+        telemetry.count(METRICS_OMITTED, n, &[("reason", "format")]);
+    }
+    if stats.spans_omitted > 0 {
+        let n = stats.spans_omitted as f64;
+        telemetry.count(SPANS_OMITTED, n, &[("reason", "format")]);
+    }
+}
+
 pub struct KafkaOutput {
     producer: MultiProducer,
     /// Every record's topic, or under `topics` each signal's.
@@ -214,6 +250,7 @@ impl KafkaOutput {
             settings.topics.is_some() || !settings.topic.is_empty(),
             "kafka_out has no topic to write to"
         );
+        let encoder = encoder(&settings);
         let config = ProducerConfig {
             brokers: settings.brokers,
             topic: String::new(),
@@ -237,20 +274,14 @@ impl KafkaOutput {
             sasl: settings.sasl.as_ref().map(|sasl| sasl::authenticator(sasl, settings.timeout)),
             telemetry: Telemetry::default(),
         };
-        let headers = settings
-            .headers
-            .into_iter()
-            .map(|(k, v)| (StrBytes::from_string(k), Some(Bytes::from(v))))
-            .collect();
-        let budget = value_budget(settings.max_request_bytes, &headers);
+        let headers = record_headers(&settings.headers);
         let accounting = BatchAccounting::default();
         let (telemetry, diag) = (Telemetry::default(), Diagnostics::default());
         Ok(Self {
             producer: MultiProducer::new(config)?,
+            encoder: encoder.with_counters(&telemetry, &diag, accounting.gate()),
             topic: settings.topic,
             topics: settings.topics,
-            encoder: KafkaEncoder::new(&settings.key, settings.format, record, budget)
-                .with_counters(&telemetry, &diag, accounting.gate()),
             headers,
             messages: MessageBuf::default(),
             pending: None,
@@ -326,20 +357,7 @@ impl KafkaOutput {
             self.accounting.encode(0, || self.encoder.encode_into(batch, &mut messages));
         if first {
             self.telemetry.count(BATCH_BYTES, messages.total_bytes() as f64, &[]);
-            if stats.missing_key > 0 {
-                self.telemetry.count(RECORDS_UNKEYED, stats.missing_key as f64, &[]);
-            }
-            if stats.no_log > 0 {
-                self.telemetry.count(EVENTS_SKIPPED, stats.no_log as f64, &[("reason", "no_log")]);
-            }
-            if stats.metrics_omitted > 0 {
-                let n = stats.metrics_omitted as f64;
-                self.telemetry.count(METRICS_OMITTED, n, &[("reason", "format")]);
-            }
-            if stats.spans_omitted > 0 {
-                let n = stats.spans_omitted as f64;
-                self.telemetry.count(SPANS_OMITTED, n, &[("reason", "format")]);
-            }
+            report_encode_stats(&self.telemetry, &stats);
             self.count_oversize(stats.oversize);
         }
         if messages.is_empty() {
