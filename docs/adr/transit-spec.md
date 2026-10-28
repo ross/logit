@@ -1,6 +1,6 @@
 ---
 created: 2026-10-19
-updated: 2026-10-21
+updated: 2026-10-28
 ---
 
 # Transit spec: a mapping table under `spec/transit/` is the canonical statement of every cross-protocol transition, checked by flows and rendered into the docs
@@ -228,3 +228,63 @@ and names the failing flow, with two more tests beside them:
   then every flow, then `ledger` and the docs test, each as its own nextest run, running every
   phase and every test even when one fails so one run reports every failure. `check` compares
   only, so it runs everything at once.
+
+## Amendment: log records (2026-10-28)
+
+The table classifies metric records only. The class check compares a log as one body, its
+`same_value` message equality, so any other change to a log reads `normalized` with no row
+naming it, and four of the six columns have only `skipped` or `lost, uncounted` log cells. The
+four pairs that carry logs, `syslog`, OTLP logs, Datadog logs, and `splunk_hec`, each lack a
+column, a source, or both. The `tlog` stream fills that in, and settles these:
+
+1. **Log fields are rows under `kind: log`** in the one table, with the cell schema, class check,
+   and renderer metrics use. Record-level rows (`plain`, `dogstatsd_event`, `message_unsafe`,
+   `structured_message`, `bytes_message`, `blank_message`) take the five record classes, and
+   field rows take `exact`, `normalized`, or `lost`. A field the input doesn't set has its own
+   `_unset` row, since a row is chosen from the input before pairing, and a sink that stamps a
+   value where the input had none makes a different statement from one that changes a value.
+2. **A log's identity is its message, respelled per sink.** `Spelling::written` for a log is the
+   message as the sink's encoder renders it and the pair's decoder reads it back, so a rewritten
+   message pairs and reads `normalized` through `log/message_unsafe` or
+   `log/structured_message`, as `record/name_unsafe` works for a metric. Once a log pairs,
+   `same_value` is `true` for it, and the field rows carry the rest.
+3. **Log timestamps get rows**, unlike a metric's: `log/timestamp` for the precision a sink
+   writes, and `log/receipt_timestamp` for the receipt time of an event that carries
+   `syslog.timestamp`, which `syslog_out` has no slot for.
+4. **Severity resolution loss belongs to the carrier.** The six-variant `Severity` reads back
+   equal at band resolution, so `attributes/severity_carrier` takes `_logit.otel.severity_*` and
+   `_logit.syslog.severity` ahead of the private and foreign carrier rows: `exact` at the
+   family's own sink, `lost, structural` elsewhere.
+5. **Attribute rows keyed by name** where the log sinks treat keys differently: `syslog_header`,
+   `syslog_msgid`, `syslog_sd`, `syslog_timestamp`, `host_name`, and `splunk_envelope`. Other
+   log attributes reach the value-type rows.
+6. **Derived attributes are per sink.** `Spelling::derived` lists what each sink writes from a
+   record's own fields, and the field rows take the union: `syslog_out`'s, `splunk_hec_out`'s,
+   and `datadog_out`'s. `no_host` reaches every sink that fills a host.
+7. **Three log columns join `otlp_out` and `datadog_out`**: `syslog_out`, `splunk_hec_out`, and
+   `kafka_out` under `format: json` and `format: text`. With no `kafka_in`, the driver reads
+   `kafka_out` back through `EventJsonDecoder`, or as one `Raw` log per record under
+   `format: text`.
+8. **`syslog_out`'s drop of unopted attributes** is `lost, structural` under RFC 3164, where the
+   wire has no slot, and `lost, uncounted` under RFC 5424 without `structured_data:`, where the
+   slot exists and the loss is real. The missing counter is a sink finding.
+9. **`UNCOUNTED_ALLOWED` narrows** for logs to `log/beside_metrics` and `syslog_out`'s
+   value-type rows. Every other uncounted loss of a log field is a format with no slot and reads
+   `lost, structural`. The `span` entry stays until spans are classified.
+10. **Log cases live in log-only directories** (`cases/otlp-logs/`, `cases/datadog-logs/`,
+    `cases/syslog/`, `cases/splunk/`), so a log flow never routes a metric case into a sink with
+    no metric cells. `decode_wire` picks a decoder by the directory name's prefix before `-`.
+11. **`otlp_out`'s observed-time stamp moves to its own row.** Its `log/plain`,
+    `log/dogstatsd_event`, and `log/beside_metrics` cells become `exact`, and
+    `log/observed_timestamp_unset` carries the stamp, since the cross-flow bound would otherwise
+    fail those cells for never reading `normalized`.
+12. **The sort key doesn't change.** `first_name` stays `""` for a log, and the canonical line
+    already orders logs that share a timestamp.
+
+Consequences: `KINDS`' `log` entry and the class check grow a log path, and the driver gains
+`syslog_out`, `splunk_hec_out`, and `kafka_out` encoder arms and `syslog` and `splunk` source
+arms. Sink behavior the new cells record, an uncounted loss included, is recorded as the code
+behaves and fixed in a later stream. Lines parsed from text (`lines_in`, `tail_in`, `docker_in`),
+`kafka_out`'s OTLP and MessagePack formats, and spans stay out.
+[`docs/plans/transit-spec.md`](../plans/transit-spec.md)'s "9. Logs" has the feature table, the
+framework's changes, and the workstreams, and its "Findings" the sink behaviors already known.
