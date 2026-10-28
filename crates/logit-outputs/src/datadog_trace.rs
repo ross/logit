@@ -82,6 +82,91 @@
 //! `bad_header` diagnostic. The stats route carries no tracer header: `datadog_trace_in` reads
 //! none there, and the `ClientStatsPayload` names its tracer itself.
 //!
+//! ## What each span and attribute becomes
+//!
+//! The tables below are generated from `datadog_trace_out`'s column of
+//! `spec/transit/mapping.yaml`, the canonical copy, by `script/transit docs`, and a test fails
+//! when they're stale: change the table there, not here. They cover the trace route under both
+//! `version:` values, a cell that differs naming its version. "Consumer" means `datadog_trace_in`
+//! reading the request back with the headers this sink sent. The stats route has no case, and an
+//! event with no span takes no route and is left off uncounted, so the log and metric rows a span
+//! reaches beside it read `skipped`.
+//!
+//! <!-- transit:doc:datadog_trace_out -->
+//!
+//! Per metric kind, and per record feature that decides a record's fate:
+//!
+//! | Row | Class | Reason or counter | What a consumer sees |
+//! |---|---|---|---|
+//! | `gauge/f64` | skipped | uncounted | The sink sends spans alone, so a gauge takes no route and is left off, uncounted, beside a span or alone. |
+//! | `gauge/i64` | skipped | uncounted | The sink sends spans alone, so a gauge takes no route and is left off, uncounted, beside a span or alone. |
+//! | `log/plain` | skipped | uncounted | The sink sends spans alone, so a log takes no route and is left off, uncounted, beside a span or alone. |
+//! | `span/alone` | exact | -- | A span of the trace request at `version:`'s path, in the trace array (v0.4) or `TracerPayload` chunk (v0.7) of its trace id, with no readiness gate, read back with its kind as a `span.kind` attribute and its trace id's high half as `_dd.p.tid` (the `attributes` rows). An OTel span with no `service.name`, `resource.name`, or `span.type` leaves with those fields empty. |
+//! | `span/not_datadog_origin` | exact | -- | The sink has no readiness gate, so a trace chunk with no Datadog span attribute is sent as any span is, nothing beyond `span/alone`. |
+//! | `span/needs_agent_processing` | exact | -- | The sink has no readiness gate: the Agent it sends to does the processing a `_top_level` mark stands for, so a trace chunk without one is sent as any span is, nothing beyond `span/alone`. |
+//!
+//! Per field of a record that reaches the wire, attribute shape, and payload beside metrics:
+//!
+//! | Row | Class | Reason or counter | What a consumer sees |
+//! |---|---|---|---|
+//! | `attributes/string_value` | exact | -- | A `meta` entry of the span, read back as the attribute. |
+//! | `attributes/service_identity` | exact | -- | On a span, `deployment.environment.name` and `service.version` are the span's `env` and `version` meta entries, which datadog_trace_in reads back as the key. |
+//! | `attributes/bool_value` | normalized | `stringified` | A `meta` entry of `true` or `false`, read back as the string. |
+//! | `attributes/array_value` | normalized | `json_text`; `logit.output.spans.degraded{reason=json_text}` | A `meta` entry of its JSON text, counted, read back as a string. |
+//! | `attributes/map_value` | normalized | `json_text`; `logit.output.spans.degraded{reason=json_text}` | A `meta` entry of its JSON text, counted, read back as a string. |
+//! | `attributes/bytes_value` | exact | -- | A `meta_struct` entry of the span, read back as bytes. |
+//! | `attributes/timestamp_value` | normalized | `stringified` | A `meta` entry of its RFC 3339 text, read back as a string. |
+//! | `attributes/null_value` | normalized | `json_text`; `logit.output.spans.degraded{reason=json_text}` | A `meta` entry of `null`, counted, read back as the string. |
+//! | `attributes/private_carrier` | lost | structural | A `_logit.datadog.*` carrier rides in its own wire field; one the trace API has no field for is left off. |
+//! | `attributes/foreign_carrier` | lost | structural | Another protocol's `_logit.` carrier is private and never a span tag, so it's left off. |
+//! | `attributes/resource_attribute`, under `version: v0.4` | normalized | `resource_as_tag` | v0.4 has no `TracerPayload`, so a resource attribute is merged into every span's `meta` or `metrics`, `host.name`, `deployment.environment.name`, and `service.version` included, and reads back as an event attribute. |
+//! | `attributes/resource_attribute`, otherwise | normalized | `resource_as_tag` | Merged into every span's `meta` or `metrics`, so it reads back as an event attribute; `host.name`, `deployment.environment.name`, `service.version`, and `container.id` are the `TracerPayload`'s `hostname`, `env`, `app_version`, and `container_id`, read back on the resource. |
+//! | `attributes/scope` | lost | structural | The trace API has no instrumentation scope, so none is written. |
+//! | `attributes/span_numeric` | normalized | `span_metric`; `logit.output.spans.degraded{reason=int_as_f64}` | An entry of the span's `metrics`, read back as an `f64`; an integer that loses precision as an `f64` is counted. |
+//! | `attributes/datadog_span_identity` | exact | -- | The span's `service`, `resource`, or `type` field, read back as the attribute. |
+//! | `attributes/datadog_span_marks` | exact | -- | A `metrics` entry for a number and a `meta` entry for a string, read back as the attribute. |
+//! | `attributes/datadog_carrier_span`, under `version: v0.4` | lost | `logit.output.spans.degraded{reason=no_wire_form}` | v0.4 has no trace chunk, so a `_logit.datadog.chunk.*` carrier is left off, counted once per carrier per span. `_logit.datadog.span.error` is the span's `error`, read back into the carrier. |
+//! | `attributes/datadog_carrier_span`, otherwise | exact | -- | The chunk's `priority`, `origin`, `dropped_trace`, or `tags`, or the span's `error`, read back into the carrier. |
+//! | `attributes/datadog_tracer_resource`, under `version: v0.4` | lost | `logit.output.spans.degraded{reason=no_wire_form}` | v0.4 has no `TracerPayload`: a `_logit.datadog.tracer.*` carrier a `Datadog-Meta-*` request header restores reads back into the carrier, and every other one (`runtime_id`, `tags`, `container_debug`), and every `_logit.datadog.agent.*` carrier, is left off, counted once per request. |
+//! | `attributes/datadog_tracer_resource`, otherwise | lost | `logit.output.spans.degraded{reason=no_wire_form}` | A `_logit.datadog.tracer.*` carrier is the `TracerPayload`'s field, read back into the carrier. The trace API has no `AgentPayload`, so a `_logit.datadog.agent.*` carrier is left off, counted once per request. |
+//! | `attributes/datadog_tracer_headers` | exact | -- | The tracer request header the carrier names, sent on every trace request under either `version:`, which datadog_trace_in reads back into the carrier. |
+//! | `attributes/no_host` | exact | -- | The sink writes no host for a span that carries none: the Agent it sends to fills its own, so nothing stands in its place. |
+//! | `attributes/span_kind` | normalized | `span_kind_meta` | A span whose kind isn't internal, with no `span.kind` attribute, leaves with `meta["span.kind"]`, which datadog_trace_in reads back as a `span.kind` attribute beside the kind. |
+//! | `attributes/trace_id_high` | normalized | `trace_id_high_tag` | On the first span of a trace in a batch, when no span of the trace carries `_dd.p.tid`, a 128-bit trace id's high 64 bits leave as `meta["_dd.p.tid"]`, which datadog_trace_in reads back as a `_dd.p.tid` attribute beside the trace id. |
+//! | `span/name` | exact | -- | The span's `name`. |
+//! | `span/name_structured` | normalized | `stringified`; `logit.output.spans.degraded{reason=json_text}` | A name that isn't a `Str` leaves as its text, read back as a string; a map or an array is JSON text, counted. |
+//! | `span/trace_id` | exact | -- | The low 64 bits as the span's `trace_id` and the high half as `_dd.p.tid` on the first span of its trace, which datadog_trace_in restores on every span of the trace. |
+//! | `span/parent_span_id` | exact | -- | The span's `parent_id`. |
+//! | `span/parent_unset` | exact | -- | `parent_id` 0, read back as no parent. |
+//! | `span/kind` | exact | -- | A `span.kind` meta entry for any kind but `internal` (the `attributes/span_kind` row), read back as the span's kind. |
+//! | `span/status_error` | exact | -- | `error: 1`, read back as an error status. |
+//! | `span/status_ok` | lost | `logit.output.spans.degraded{reason=no_wire_form}` | The trace API has no `ok` status, so the span leaves with `error: 0` and reads back unset, counted. |
+//! | `span/status_unset` | exact | -- | `error: 0`, read back as unset. |
+//! | `span/status_message` | lost | `logit.output.spans.degraded{reason=no_wire_form}` | The trace API has no field for a status message, so it's left off, counted once per field. |
+//! | `span/timestamp` | exact | -- | The span's `start`, in Unix nanoseconds. |
+//! | `span/end_timestamp` | exact | -- | The span's `duration`, from which datadog_trace_in restores the end. |
+//! | `span/end_before_start` | lost | `logit.output.spans.degraded{reason=negative_duration}` | A negative `duration` is written as 0, counted, so the end reads back at the start. |
+//! | `span/flags` | lost | `logit.output.spans.degraded{reason=no_wire_form}` | The trace API has no field for span flags, so it's left off, counted once per field. |
+//! | `span/trace_state` | lost | `logit.output.spans.degraded{reason=no_wire_form}` | The trace API has no field for a span's `trace_state`, so it's left off, counted once per field. |
+//! | `span/dropped_attributes_count` | lost | `logit.output.spans.degraded{reason=no_wire_form}` | The trace API has no field for a dropped-attribute count, so it's left off, counted once per field. |
+//! | `span/dropped_events_count` | lost | `logit.output.spans.degraded{reason=no_wire_form}` | The trace API has no field for a dropped-event count, so it's left off, counted once per field. |
+//! | `span/dropped_links_count` | lost | `logit.output.spans.degraded{reason=no_wire_form}` | The trace API has no field for a dropped-link count, so it's left off, counted once per field. |
+//! | `span/events` | exact | -- | Each span event's time, name, and scalar attributes as the span's `span_events`. |
+//! | `span/event_nested_attribute` | normalized | `json_text`; `logit.output.spans.degraded{reason=json_text}` | A map attribute of a span event, or an array holding anything but scalars, leaves as its JSON text, counted, and reads back as a string; an array of scalars stays an array. |
+//! | `span/event_name_structured` | normalized | `stringified`; `logit.output.spans.degraded{reason=json_text}` | A name that isn't a `Str` leaves as its text, read back as a string; a map or an array is JSON text, counted. |
+//! | `span/nested_bytes_attribute` | normalized | `stringified` | A `Bytes` attribute of a span event or link leaves as its lossy UTF-8 text, read back as a string. |
+//! | `span/nested_u64_attribute` | normalized | `u64_as_int`; `logit.output.spans.degraded{reason=int_as_f64}` | A `u64` attribute of a span event reads back as an `i64`, or, above `i64::MAX`, as a double, counted; on a link it leaves as its decimal text, read back as a string. |
+//! | `span/nested_timestamp_attribute` | normalized | `stringified` | A timestamp attribute of a span event or link leaves as RFC 3339 text, read back as a string. |
+//! | `span/event_dropped_count` | lost | `logit.output.spans.degraded{reason=no_wire_form}` | The trace API has no field for a span event's dropped-attribute count, so it's left off, counted once per field. |
+//! | `span/links` | normalized | `stringified`; `logit.output.spans.degraded{reason=json_text}` | Each link's ids, and its attributes as strings, as the span's `span_links`, read back as string attributes; a map or array attribute is JSON text, counted. |
+//! | `span/link_flags` | exact | -- | A span link's `flags`. |
+//! | `span/link_trace_state` | exact | -- | A span link's `tracestate`. |
+//! | `span/link_dropped_count` | lost | `logit.output.spans.degraded{reason=no_wire_form}` | The trace API has no field for a link's dropped-attribute count, so it's left off, counted once per field. |
+//! | `span/beside_log` | exact | -- | The span on the trace route; the log beside it has no route here and is left off, uncounted (`log/plain`). |
+//! | `span/beside_metrics` | exact | -- | The span on the trace route; the metrics beside it have no route here and are left off, uncounted (their kinds' rows). |
+//!
+//! <!-- transit:end -->
+//!
 //! ## Transports
 //!
 //! `endpoint:` sends over `reqwest`, `http://` or `https://` (tuned by `tls:`), with redirects off
@@ -500,6 +585,102 @@ async fn read_hyper_prefix(mut body: hyper::body::Incoming, max: usize) -> Strin
     String::from_utf8_lossy(&buf).into_owned()
 }
 
+/// The trace route's items: each trace chunk of `batch` ([`trace_chunks`]) as the indices of its
+/// span events other than APM stats, a chunk with none left out.
+fn trace_items(batch: &EventBatch) -> Vec<Vec<usize>> {
+    let stats_name = datadog_stats_name();
+    trace_chunks(batch)
+        .into_iter()
+        .map(|mut members| {
+            members.retain(|&i| !is_datadog_stats(&batch.resource, &batch.events[i], stats_name));
+            members
+        })
+        .filter(|members| !members.is_empty())
+        .collect()
+}
+
+/// One request [`encode_requests`] builds: its path, its protocol headers, and its body,
+/// uncompressed.
+#[derive(Debug)]
+pub struct TraceApiRequest {
+    pub path: &'static str,
+    pub headers: HeaderMap,
+    pub body: Bytes,
+}
+
+/// The requests `batch` leaves as under `version`, built as the sink builds them but with none of
+/// its size cuts or compression: one trace request holding every trace, with the tracer headers
+/// restored and `X-Datadog-Trace-Count`, then one stats request holding every APM stats event.
+/// The transit flow driver (`logit-cli`'s `transit`) reads them back through `datadog_trace_in`;
+/// `encoder` counts as the sink's does, and `diag` takes the `bad_header` diagnostic.
+pub fn encode_requests(
+    encoder: &mut DatadogEncoder,
+    batch: &EventBatch,
+    version: TracerApiForm,
+    diag: &mut Diagnostics,
+) -> Vec<TraceApiRequest> {
+    let mut requests = Vec::new();
+    let mut traces: Vec<usize> = trace_items(batch).into_iter().flatten().collect();
+    traces.sort_unstable();
+    if !traces.is_empty() {
+        if let Some(out) = encoder.encode_tracer_api_traces(&sub_batch(batch, &traces), version) {
+            let mut headers = tracer_headers(&batch.resource, Some(diag));
+            headers.insert(HEADER_TRACE_COUNT, HeaderValue::from(out.traces));
+            requests.push(TraceApiRequest {
+                path: Route::Traces.path(version),
+                headers,
+                body: out.body,
+            });
+        }
+    }
+    let stats = stats_items(batch);
+    if !stats.is_empty() {
+        if let Some(body) = encoder.encode_client_stats_v06(&sub_batch(batch, &stats)) {
+            let path = Route::Stats.path(version);
+            requests.push(TraceApiRequest { path, headers: HeaderMap::new(), body });
+        }
+    }
+    requests
+}
+
+/// The tracer headers restored from `resource` (module doc's "The wire"). A carrier that isn't a
+/// legal header value is diagnosed through `diag` when given: the diagnostic describes the
+/// batch, so a retry passes `None` and doesn't repeat it.
+fn tracer_headers(resource: &Resource, mut diag: Option<&mut Diagnostics>) -> HeaderMap {
+    let attrs = &resource.attributes;
+    let mut headers = HeaderMap::new();
+    for (header, attr) in TRACER_STR_HEADERS {
+        let Some(text) = attrs.get(attr).and_then(Value::as_str) else { continue };
+        match HeaderValue::from_str(text) {
+            Ok(value) => {
+                headers.insert(header, value);
+            }
+            Err(_) => {
+                if let Some(diag) = diag.as_deref_mut() {
+                    diag.warn_throttled(
+                        "bad_header",
+                        format_args!(
+                            "datadog_trace_out: leaving out {header}: the batch's {attr} isn't a \
+                             legal header value"
+                        ),
+                    );
+                }
+            }
+        }
+    }
+    for (header, attr) in TRACER_FLAG_HEADERS {
+        if matches!(attrs.get(attr), Some(Value::Bool(true))) {
+            headers.insert(header, HeaderValue::from_static("true"));
+        }
+    }
+    for (header, attr) in TRACER_U64_HEADERS {
+        if let Some(Value::U64(n)) = attrs.get(attr) {
+            headers.insert(header, HeaderValue::from(*n));
+        }
+    }
+    headers
+}
+
 /// The indices of `batch`'s APM stats events, the stats route's items.
 fn stats_items(batch: &EventBatch) -> Vec<usize> {
     let stats_name = datadog_stats_name();
@@ -878,15 +1059,7 @@ impl Encoding<'_> {
         batch: &EventBatch,
     ) -> Vec<(HeaderMap, Encoded<RequestMeta>)> {
         let resource = &batch.resource;
-        let stats_name = datadog_stats_name();
-        let chunks: Vec<Vec<usize>> = trace_chunks(batch)
-            .into_iter()
-            .map(|mut members| {
-                members.retain(|&i| !is_datadog_stats(resource, &batch.events[i], stats_name));
-                members
-            })
-            .filter(|members| !members.is_empty())
-            .collect();
+        let chunks = trace_items(batch);
         if chunks.is_empty() {
             return Vec::new();
         }
@@ -984,41 +1157,9 @@ impl Encoding<'_> {
         split.requests.into_iter().map(|(_, encoded)| (HeaderMap::new(), encoded)).collect()
     }
 
-    /// The tracer headers restored from `resource` (module doc's "The wire"). A carrier that
-    /// isn't a legal header value is diagnosed only when `report`: the diagnostic describes the
-    /// batch, so a retry doesn't repeat it.
+    /// [`tracer_headers`], diagnosing an illegal value only when `report`.
     fn tracer_headers(&mut self, resource: &Resource, report: bool) -> HeaderMap {
-        let attrs = &resource.attributes;
-        let mut headers = HeaderMap::new();
-        for (header, attr) in TRACER_STR_HEADERS {
-            let Some(text) = attrs.get(attr).and_then(Value::as_str) else { continue };
-            match HeaderValue::from_str(text) {
-                Ok(value) => {
-                    headers.insert(header, value);
-                }
-                Err(_) if report => {
-                    self.diag.warn_throttled(
-                        "bad_header",
-                        format_args!(
-                            "datadog_trace_out: leaving out {header}: the batch's {attr} isn't a \
-                             legal header value"
-                        ),
-                    );
-                }
-                Err(_) => {}
-            }
-        }
-        for (header, attr) in TRACER_FLAG_HEADERS {
-            if matches!(attrs.get(attr), Some(Value::Bool(true))) {
-                headers.insert(header, HeaderValue::from_static("true"));
-            }
-        }
-        for (header, attr) in TRACER_U64_HEADERS {
-            if let Some(Value::U64(n)) = attrs.get(attr) {
-                headers.insert(header, HeaderValue::from(*n));
-            }
-        }
-        headers
+        tracer_headers(resource, report.then_some(&mut *self.diag))
     }
 }
 

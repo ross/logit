@@ -146,7 +146,8 @@ Entry format and the other areas: [the known-gaps index](README.md).
   InfluxDB rows' in `crates/logit-proto/src/influxdb/mod.rs`, the OTLP rows' in
   `crates/logit-proto/src/otlp/` (`metrics.rs` and `logs.rs`), the statsd rows' in
   `crates/logit-outputs/src/statsd.rs`, the Datadog rows' in
-  `crates/logit-proto/src/datadog/mod.rs`, the Graphite rows' in
+  `crates/logit-proto/src/datadog/mod.rs` for `datadog_out` and
+  `crates/logit-outputs/src/datadog_trace.rs` for `datadog_trace_out`, the Graphite rows' in
   `crates/logit-proto/src/graphite/mod.rs`, the syslog rows' in
   `crates/logit-outputs/src/syslog.rs`, the Splunk rows' in `crates/logit-proto/src/splunk/mod.rs`,
   and the Kafka rows' in `crates/logit-outputs/src/kafka/encode.rs`.
@@ -437,8 +438,8 @@ Entry format and the other areas: [the known-gaps index](README.md).
   | encode (Datadog) | field `attributes/hostname` → **lost** | `logit.output.tags.omitted{reason=reserved_key}` | A log's `hostname` is `host.name`, so a `hostname` attribute has no key of its own on the wire and is left off, counted. |
   | encode (Datadog) | field `attributes/log_service` → **lost** | `logit.output.tags.omitted{reason=reserved_key}` | A log's `service` is `service.name`, so a `service` attribute beside it has no key of its own on the wire and is left off, counted. |
   | encode (Datadog) | field `attributes/service_tag_beside_key` → **lost** | `logit.output.tags.omitted{reason=unrepresentable}` | On a metric, an event, or a service check, beside its standard key, which leaves as the same tag, a valued `env`, `version`, or `service` would be a second value for the key, so it's left off, counted once per wire tag. |
-  | encode (Datadog) | field `attributes/map_value` → **lost** | `logit.output.tags.omitted{reason=unrepresentable}` | A tag has no nested form, so a map is left off, counted. On a log, a JSON object, read back as itself. |
-  | encode (Datadog) | field `attributes/bytes_value` → **lost** | `logit.output.tags.omitted{reason=unrepresentable}` | A tag has no bytes form, so the value is left off, counted. On a log, its base64 text, read back as a string. |
+  | encode (Datadog) | field `attributes/map_value` → **lost** | `logit.output.tags.omitted{reason=unrepresentable}` | A tag has no nested form, so a map is left off, counted. On a log, a JSON object, read back as itself. On a span, a `meta` entry of its JSON text, counted as `spans.degraded{reason=json_text}`, read back as a string. |
+  | encode (Datadog) | field `attributes/bytes_value` → **lost** | `logit.output.tags.omitted{reason=unrepresentable}` | A tag has no bytes form, so the value is left off, counted. On a log, its base64 text, read back as a string. On a span, a `meta_struct` entry, read back as bytes. |
   | encode (Datadog) | field `attributes/private_carrier` → **lost** | `logit.output.tags.omitted{reason=no_wire_form}` | A `_logit.datadog.*` carrier rides in its own wire field; one the route has no field for is left off, counted. `_logit.datadog.units`, which marks a decoded batch's units as Datadog names, is read and not written; datadog_in stamps it again on every series batch. The v2 series route writes `_logit.datadog.hostless` as a `host` resource with no name, which datadog_in reads into `_logit.datadog.resources`. |
   | encode (Datadog) | field `attributes/prometheus_target` → **lost** | none (structural) | The scrape target is private and never a tag, so it's left off. |
   | encode (Datadog) | field `attributes/foreign_carrier` → **lost** | none (structural) | Another protocol's `_logit.` carrier is private and never a tag, so it's left off. The `_logit.statsd.event.*` and `_logit.statsd.service_check.*` carriers are read as the Datadog fields they name. |
@@ -473,6 +474,32 @@ Entry format and the other areas: [the known-gaps index](README.md).
   | encode (Datadog) | field `span/link_dropped_count` → **lost** | `logit.output.spans.degraded{reason=no_wire_form}` | Datadog has no field for a link's dropped-attribute count, so it's left off, counted once per field. |
   | encode (Datadog) | `event/attributes_only` → **skipped** | `logit.output.events.skipped{reason=no_payload}` | An event with no metric, log, or span takes none of the intake's routes, so no request carries it. |
   | encode (Datadog) | `event/string_only` → **skipped** | `logit.output.events.skipped{reason=no_payload}` | An InfluxDB point whose fields are all strings has no metric, so it takes none of the intake's routes and no request carries it. |
+
+  <!-- transit:end -->
+
+  <!-- transit:gaps:datadog_trace_out -->
+
+  | Direction | Mapping | Counter | Why |
+  |---|---|---|---|
+  | encode (Datadog) | `gauge/f64` → **skipped** | none (uncounted) | The sink sends spans alone, so a gauge takes no route and is left off, uncounted, beside a span or alone. |
+  | encode (Datadog) | `gauge/i64` → **skipped** | none (uncounted) | The sink sends spans alone, so a gauge takes no route and is left off, uncounted, beside a span or alone. |
+  | encode (Datadog) | field `attributes/private_carrier` → **lost** | none (structural) | A `_logit.datadog.*` carrier rides in its own wire field; one the trace API has no field for is left off. |
+  | encode (Datadog) | field `attributes/foreign_carrier` → **lost** | none (structural) | Another protocol's `_logit.` carrier is private and never a span tag, so it's left off. |
+  | encode (Datadog) | field `attributes/scope` → **lost** | none (structural) | The trace API has no instrumentation scope, so none is written. |
+  | encode (Datadog) | field `attributes/datadog_carrier_span`, under `version: v0.4` → **lost** | `logit.output.spans.degraded{reason=no_wire_form}` | v0.4 has no trace chunk, so a `_logit.datadog.chunk.*` carrier is left off, counted once per carrier per span. `_logit.datadog.span.error` is the span's `error`, read back into the carrier. |
+  | encode (Datadog) | field `attributes/datadog_tracer_resource`, under `version: v0.4` → **lost** | `logit.output.spans.degraded{reason=no_wire_form}` | v0.4 has no `TracerPayload`: a `_logit.datadog.tracer.*` carrier a `Datadog-Meta-*` request header restores reads back into the carrier, and every other one (`runtime_id`, `tags`, `container_debug`), and every `_logit.datadog.agent.*` carrier, is left off, counted once per request. |
+  | encode (Datadog) | field `attributes/datadog_tracer_resource`, otherwise → **lost** | `logit.output.spans.degraded{reason=no_wire_form}` | A `_logit.datadog.tracer.*` carrier is the `TracerPayload`'s field, read back into the carrier. The trace API has no `AgentPayload`, so a `_logit.datadog.agent.*` carrier is left off, counted once per request. |
+  | encode (Datadog) | `log/plain` → **skipped** | none (uncounted) | The sink sends spans alone, so a log takes no route and is left off, uncounted, beside a span or alone. |
+  | encode (Datadog) | field `span/status_ok` → **lost** | `logit.output.spans.degraded{reason=no_wire_form}` | The trace API has no `ok` status, so the span leaves with `error: 0` and reads back unset, counted. |
+  | encode (Datadog) | field `span/status_message` → **lost** | `logit.output.spans.degraded{reason=no_wire_form}` | The trace API has no field for a status message, so it's left off, counted once per field. |
+  | encode (Datadog) | field `span/end_before_start` → **lost** | `logit.output.spans.degraded{reason=negative_duration}` | A negative `duration` is written as 0, counted, so the end reads back at the start. |
+  | encode (Datadog) | field `span/flags` → **lost** | `logit.output.spans.degraded{reason=no_wire_form}` | The trace API has no field for span flags, so it's left off, counted once per field. |
+  | encode (Datadog) | field `span/trace_state` → **lost** | `logit.output.spans.degraded{reason=no_wire_form}` | The trace API has no field for a span's `trace_state`, so it's left off, counted once per field. |
+  | encode (Datadog) | field `span/dropped_attributes_count` → **lost** | `logit.output.spans.degraded{reason=no_wire_form}` | The trace API has no field for a dropped-attribute count, so it's left off, counted once per field. |
+  | encode (Datadog) | field `span/dropped_events_count` → **lost** | `logit.output.spans.degraded{reason=no_wire_form}` | The trace API has no field for a dropped-event count, so it's left off, counted once per field. |
+  | encode (Datadog) | field `span/dropped_links_count` → **lost** | `logit.output.spans.degraded{reason=no_wire_form}` | The trace API has no field for a dropped-link count, so it's left off, counted once per field. |
+  | encode (Datadog) | field `span/event_dropped_count` → **lost** | `logit.output.spans.degraded{reason=no_wire_form}` | The trace API has no field for a span event's dropped-attribute count, so it's left off, counted once per field. |
+  | encode (Datadog) | field `span/link_dropped_count` → **lost** | `logit.output.spans.degraded{reason=no_wire_form}` | The trace API has no field for a link's dropped-attribute count, so it's left off, counted once per field. |
 
   <!-- transit:end -->
 

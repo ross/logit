@@ -1,0 +1,3 @@
+# Hand-written event JSON lines: a raw tracer chunk, a Datadog-origin root and its child with no
+# Agent `_top_level` mark, as datadog_trace_in decodes a tracer's request.
+exercises: [unmarked_root, span_identity, parent_span_id]

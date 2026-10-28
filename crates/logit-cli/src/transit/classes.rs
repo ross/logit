@@ -139,7 +139,11 @@
 //! record's own fields ([`Spelling::derived`]: the run's hostname on a record with no host, a log's
 //! `status`, `trace_id`, and `span_id`, a span's `span.kind` and `_dd.p.tid`), each accepted only
 //! with the value derived for it; a log's `trace_id` and `span_id` pair only and have no row,
-//! since `log/trace` judges them; `graphite_out`'s forbidden characters as `_` in a
+//! since `log/trace` judges them; a tag's `F64` in Rust's `Display` form, so `1.0` is `1`; and a
+//! span attribute as `datadog_trace_out` shares it ([`datadog::span_value`]: a number as an
+//! `f64`, an array as JSON text). `datadog_trace_out`'s rewrites are those of a span at
+//! `datadog_out`, with no host derived, since the Agent it sends to fills its own
+//! ([`datadog_trace_derived`]); `graphite_out`'s forbidden characters as `_` in a
 //! path, a tag name, and a tag value (and a tag value's leading `~`), a tag value in the encoder's
 //! rendering, and the values it omits as no tag ([`graphite_value`]). Each name, key, and value set
 //! is the encoder's own predicate. `syslog_out`'s rewrites are a log's message as `syslog_in`
@@ -477,6 +481,11 @@ enum Spelling {
     /// attributes [`Spelling::derived`] lists, which the encoder writes from a record's own fields
     /// and `datadog_in` reads back as attributes the input lacks.
     Datadog,
+    /// `datadog_trace_out`, under either `version:`: names and keys as written, and the
+    /// attributes [`datadog_trace_derived`] lists, which the encoder writes from a span's own
+    /// fields and `datadog_trace_in` reads back as attributes the input lacks. Where the two
+    /// versions differ, the table's cells split by `when:`.
+    DatadogTrace,
     /// `graphite_out`: each character carbon forbids in a path, a tag name, or a tag value as
     /// `_`, and a tag value's leading `~`; a tag value as the encoder renders it (an `f64` in
     /// Rust's shortest form, `3` for `3.0`, and an array's last representable element), and a
@@ -514,6 +523,7 @@ impl Spelling {
             "influxdb_out" => Spelling::Influxdb,
             "otlp_out" => Spelling::Otlp,
             "datadog_out" => Spelling::Datadog,
+            "datadog_trace_out" => Spelling::DatadogTrace,
             "graphite_out" => Spelling::Graphite,
             "syslog_out" => Spelling::Syslog {
                 rfc3164: config["format"] == "rfc3164",
@@ -550,6 +560,7 @@ impl Spelling {
             Spelling::Influxdb
             | Spelling::Otlp
             | Spelling::Datadog
+            | Spelling::DatadogTrace
             | Spelling::Syslog { .. }
             | Spelling::Splunk
             | Spelling::KafkaText
@@ -773,6 +784,15 @@ impl Spelling {
         if self == Spelling::KafkaText {
             return None;
         }
+        if matches!(self, Spelling::Datadog | Spelling::DatadogTrace) && rec.kind == "span" {
+            return Some(datadog::span_value(value));
+        }
+        // A tag writes an `F64` with Rust's `Display`, so `1.0` is `1`; a log's JSON keeps it.
+        if self == Spelling::Datadog && datadog::Route::of(rec) != datadog::Route::Log {
+            if let Some(n) = value.as_number().filter(|n| n.is_f64()) {
+                return Some(n.as_f64().unwrap_or_default().to_string());
+            }
+        }
         if self == (Spelling::Statsd { dogstatsd: true }) && key == "host" {
             let kept = statsd::host_kept(rec, value)?;
             return Some(self.value(&kept, tags));
@@ -813,10 +833,11 @@ impl Spelling {
 
     /// The attributes the sink writes from `rec`'s own fields, which its pair decoder reads back
     /// as attributes `rec` lacks ([`Derived`]); empty for a sink that writes none:
-    /// [`datadog_derived`], [`syslog_derived`], and [`splunk::derived`].
+    /// [`datadog_derived`], [`datadog_trace_derived`], [`syslog_derived`], and [`splunk::derived`].
     fn derived(self, rec: &Rec) -> Vec<Derived> {
         match self {
             Spelling::Datadog => datadog_derived(rec),
+            Spelling::DatadogTrace => datadog_trace_derived(rec),
             Spelling::Syslog { rfc3164, facility, .. } => {
                 syslog_derived(rec, rfc3164, facility, self.sd_id())
             }
@@ -927,6 +948,20 @@ fn syslog_derived(
         }
     }
     out
+}
+
+/// The attributes `datadog_trace_out` writes from span `rec`'s own fields, which
+/// `datadog_trace_in` reads back as attributes `rec` lacks: `datadog_out`'s span entries
+/// ([`datadog_derived`]) but `no_host`, since the sink leaves a span's host for the Agent to fill.
+/// Under `version: v0.4` the resource's `host.name`, `deployment.environment.name`, and
+/// `service.version` leave in every span's `meta` and read back as the span's attributes, which
+/// needs no entry: [`Rec::public`] already merges the resource into the event's attributes, and
+/// `attributes/resource_attribute` judges the move.
+fn datadog_trace_derived(rec: &Rec) -> Vec<Derived> {
+    if rec.kind != "span" {
+        return Vec::new();
+    }
+    datadog_derived(rec).into_iter().filter(|(row, _, _)| *row != Some("no_host")).collect()
 }
 
 /// `value` as `format: json` writes it, so a `Bytes` value is its `b"..."` text.
@@ -1170,6 +1205,17 @@ mod datadog {
                 "gauge" if get(rec, "_logit.statsd.service_check.name").is_some() => Route::Check,
                 _ => Route::Metric,
             }
+        }
+    }
+
+    /// A span attribute's value as the Datadog span encoders write it and the decoder reads it
+    /// back, as text: a number as a `metrics` entry, read back as an `f64`, and an array as its
+    /// JSON text in `meta`. Every other value reads back as [`super::text`] has it already.
+    pub(super) fn span_value(value: &Value) -> String {
+        match value {
+            Value::Number(n) => super::text(&Value::from(n.as_f64().unwrap_or_default())),
+            Value::Array(_) => value.to_string(),
+            other => super::text(other),
         }
     }
 
@@ -4898,6 +4944,39 @@ mod tests {
         let rows = field_rows(&ins[0], "datadog");
         let (_, _, field) = rows.iter().find(|(_, f, _)| f.as_deref() == Some("no_host")).unwrap();
         assert_eq!(observe_field(field, &ins[0], &out[0], Spelling::Datadog), Class::Normalized);
+    }
+
+    /// `datadog_trace_out` derives a span's `span.kind` and `_dd.p.tid` as `datadog_out` does, but
+    /// no host: the Agent it sends to fills its own.
+    #[test]
+    fn datadog_trace_derives_a_spans_kind_and_tid_but_no_host() {
+        let ins = recs(&[
+            r#"{{T},"span":{"name":"s","trace_id":"0a0b0c0d0e0f10110102030405060708","span_id":"1112131415161718","kind":"client","status":"unset","start":"2027-01-15T08:00:00.000000000Z","end":"2027-01-15T08:00:00.000000000Z","duration_ns":0}}"#,
+        ]);
+        let rows = |spelling: Spelling| -> Vec<_> {
+            spelling.derived(&ins[0]).into_iter().map(|(row, _, _)| row).collect()
+        };
+        assert_eq!(
+            rows(Spelling::Datadog),
+            [Some("no_host"), Some("span_kind"), Some("trace_id_high")]
+        );
+        assert_eq!(rows(Spelling::DatadogTrace), [Some("span_kind"), Some("trace_id_high")]);
+    }
+
+    /// A span's number reads back from `metrics` as an `f64` and its array from `meta` as JSON
+    /// text, and the span still pairs at both Datadog span sinks.
+    #[test]
+    fn a_datadog_span_pairs_with_its_numbers_as_f64_and_its_arrays_as_json() {
+        let span = |attributes: &str| {
+            format!(
+                r#"{{{{T}},"span":{{"name":"s","trace_id":"00000000000000000102030405060708","span_id":"1112131415161718","kind":"internal","status":"unset","start":"2027-01-15T08:00:00.000000000Z","end":"2027-01-15T08:00:00.000000000Z","duration_ns":0}},"attributes":{attributes}}}"#
+            )
+        };
+        let ins = recs(&[&span(r#"{"n":-42,"a":["x",1]}"#)]);
+        let out = recs(&[&span(r#"{"n":-42.0,"a":"[\"x\",1]"}"#)]);
+        assert!(pair(&ins, &out, Spelling::DatadogTrace).seen[0].is_some());
+        let hosted = recs(&[&span(r#"{"n":-42.0,"a":"[\"x\",1]","host.name":"transit"}"#)]);
+        assert!(pair(&ins, &hosted, Spelling::Datadog).seen[0].is_some());
     }
 
     /// A `_dd.p.tid` other than the trace id's high 64 bits doesn't pair.

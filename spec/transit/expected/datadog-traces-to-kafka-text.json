@@ -1,0 +1,23 @@
+{
+  "agent": {"events": [], "counters": {
+    "logit.output.events.skipped{component=out,kind=kafka_out,reason=no_log,role=sink}": 30
+  }},
+  "beside": {"events": [
+    {"timestamp":"2027-01-15T08:00:07.400000000Z","log":{"format":"raw","message":"beside its span"}}
+  ], "counters": {
+    "logit.output.events.skipped{component=out,kind=kafka_out,reason=no_log,role=sink}": 3,
+    "logit.output.spans.omitted{component=out,kind=kafka_out,reason=format,role=sink}": 1
+  }},
+  "marked": {"events": [], "counters": {
+    "logit.output.events.skipped{component=out,kind=kafka_out,reason=no_log,role=sink}": 3
+  }},
+  "otel-fields": {"events": [], "counters": {
+    "logit.output.events.skipped{component=out,kind=kafka_out,reason=no_log,role=sink}": 3
+  }},
+  "unmarked": {"events": [], "counters": {
+    "logit.output.events.skipped{component=out,kind=kafka_out,reason=no_log,role=sink}": 2
+  }},
+  "values": {"events": [], "counters": {
+    "logit.output.events.skipped{component=out,kind=kafka_out,reason=no_log,role=sink}": 1
+  }}
+}

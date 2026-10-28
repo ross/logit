@@ -29,7 +29,7 @@ classes:
 # docs/adr/telemetry-loss-vocabulary.md's amendments "structural loss has no counter" and "an
 # ignored signal, and a format the config selects" have the rules.
 
-sinks: [statsd_out, prometheus_out, influxdb_out, otlp_out, datadog_out, graphite_out, syslog_out, splunk_hec_out, kafka_out]
+sinks: [statsd_out, prometheus_out, influxdb_out, otlp_out, datadog_out, datadog_trace_out, graphite_out, syslog_out, splunk_hec_out, kafka_out]
 
 rows:
   # --- sum: temporality and monotonicity -------------------------------------------------------
@@ -331,6 +331,12 @@ rows:
         text: >-
           A series `gauge` point, a `rate` under the `_logit.metrics.type` flag, or unspecified
           under the `_logit.datadog.type` carrier.
+      datadog_trace_out:
+        class: skipped
+        reason: uncounted
+        text: >-
+          The sink sends spans alone, so a gauge takes no route and is left off, uncounted, beside a
+          span or alone.
       graphite_out:
         class: exact
         text: A `path value timestamp` line, or a pickled datapoint.
@@ -361,6 +367,12 @@ rows:
         reason: integer_as_double
         text: >-
           The point's double, the integer's nearest `f64`, read back as a float.
+      datadog_trace_out:
+        class: skipped
+        reason: uncounted
+        text: >-
+          The sink sends spans alone, so a gauge takes no route and is left off, uncounted, beside a
+          span or alone.
       graphite_out:
         class: normalized
         reason: f64_value
@@ -2015,6 +2027,9 @@ rows:
         text: >-
           A `key:value` tag, `host` included. `host.name` is the record's host, which datadog_in
           reads back as `host.name` on every route. On a log, a top-level key of the log object.
+      datadog_trace_out:
+        class: exact
+        text: A `meta` entry of the span, read back as the attribute.
       graphite_out:
         - when: {tags: drop}
           class: lost
@@ -2380,6 +2395,11 @@ rows:
         text: >-
           On a metric, an event, or a service check, Datadog's `env`, `version`, or `service`
           tag, the Datadog OTLP exporter's spelling, which datadog_in reads back as the key.
+      datadog_trace_out:
+        class: exact
+        text: >-
+          On a span, `deployment.environment.name` and `service.version` are the span's `env` and
+          `version` meta entries, which datadog_trace_in reads back as the key.
       graphite_out:
         - when: {tags: drop}
           class: lost
@@ -2591,7 +2611,12 @@ rows:
         reason: bool_tag
         text: >-
           `true` is a bare `key` tag and reads back `true`; `false` is `key:false` and reads back as
-          the string. On a log, a JSON boolean, read back as itself.
+          the string. On a log, a JSON boolean, read back as itself. On a span, a `meta` entry of
+          `true` or `false`, read back as the string.
+      datadog_trace_out:
+        class: normalized
+        reason: stringified
+        text: A `meta` entry of `true` or `false`, read back as the string.
       graphite_out:
         - when: {tags: drop}
           class: lost
@@ -2747,7 +2772,14 @@ rows:
         reason: stringified
         text: >-
           One tag per element in order, which datadog_in folds back into an array of strings, so a
-          number element reads back as its text. On a log, a JSON array, read back as itself.
+          number element reads back as its text. On a log, a JSON array, read back as itself. On a
+          span, a `meta` entry of its JSON text, counted as `spans.degraded{reason=json_text}`, read
+          back as a string.
+      datadog_trace_out:
+        class: normalized
+        reason: json_text
+        counter: logit.output.spans.degraded{reason=json_text}
+        text: A `meta` entry of its JSON text, counted, read back as a string.
       graphite_out:
         - when: {tags: drop}
           class: lost
@@ -2821,7 +2853,13 @@ rows:
         counter: logit.output.tags.omitted{reason=unrepresentable}
         text: >-
           A tag has no nested form, so a map is left off, counted. On a log, a JSON object, read
-          back as itself.
+          back as itself. On a span, a `meta` entry of its JSON text, counted as
+          `spans.degraded{reason=json_text}`, read back as a string.
+      datadog_trace_out:
+        class: normalized
+        reason: json_text
+        counter: logit.output.spans.degraded{reason=json_text}
+        text: A `meta` entry of its JSON text, counted, read back as a string.
       graphite_out:
         - when: {tags: drop}
           class: lost
@@ -2894,7 +2932,10 @@ rows:
         counter: logit.output.tags.omitted{reason=unrepresentable}
         text: >-
           A tag has no bytes form, so the value is left off, counted. On a log, its base64 text,
-          read back as a string.
+          read back as a string. On a span, a `meta_struct` entry, read back as bytes.
+      datadog_trace_out:
+        class: exact
+        text: A `meta_struct` entry of the span, read back as bytes.
       graphite_out:
         - when: {tags: drop}
           class: lost
@@ -2964,7 +3005,11 @@ rows:
         reason: stringified
         text: >-
           A `key:<RFC 3339>` tag, read back as a string. On a log, the RFC 3339 text as a JSON
-          string.
+          string. On a span, a `meta` entry of the RFC 3339 text, read back as a string.
+      datadog_trace_out:
+        class: normalized
+        reason: stringified
+        text: A `meta` entry of its RFC 3339 text, read back as a string.
       graphite_out:
         - when: {tags: drop}
           class: lost
@@ -3017,8 +3062,17 @@ rows:
         class: exact
         text: An `AnyValue` with no value set, read back as null.
       datadog_out:
-        class: exact
-        text: On a log, a JSON null, read back as itself.
+        class: normalized
+        reason: json_text
+        counter: logit.output.spans.degraded{reason=json_text}
+        text: >-
+          On a span, a `meta` entry of `null`, counted, read back as the string. On a log, a JSON
+          null, read back as itself.
+      datadog_trace_out:
+        class: normalized
+        reason: json_text
+        counter: logit.output.spans.degraded{reason=json_text}
+        text: A `meta` entry of `null`, counted, read back as the string.
       syslog_out:
         - when: {format: rfc3164}
           class: lost
@@ -3088,6 +3142,12 @@ rows:
           Datadog names, is read and not written; datadog_in stamps it again on every series
           batch. The v2 series route writes `_logit.datadog.hostless` as a `host` resource with no
           name, which datadog_in reads into `_logit.datadog.resources`.
+      datadog_trace_out:
+        class: lost
+        reason: structural
+        text: >-
+          A `_logit.datadog.*` carrier rides in its own wire field; one the trace API has no field
+          for is left off.
       syslog_out:
         class: lost
         reason: structural
@@ -3199,6 +3259,11 @@ rows:
           Another protocol's `_logit.` carrier is private and never a tag, so it's left off. The
           `_logit.statsd.event.*` and `_logit.statsd.service_check.*` carriers are read as the
           Datadog fields they name.
+      datadog_trace_out:
+        class: lost
+        reason: structural
+        text: >-
+          Another protocol's `_logit.` carrier is private and never a span tag, so it's left off.
       graphite_out:
         class: lost
         reason: structural
@@ -3687,6 +3752,21 @@ rows:
         reason: resource_as_tag
         text: >-
           Merged into the record's tags, so it reads back as an event attribute.
+      datadog_trace_out:
+        - when: {version: v0.4}
+          class: normalized
+          reason: resource_as_tag
+          text: >-
+            v0.4 has no `TracerPayload`, so a resource attribute is merged into every span's `meta`
+            or `metrics`, `host.name`, `deployment.environment.name`, and `service.version`
+            included, and reads back as an event attribute.
+        - class: normalized
+          reason: resource_as_tag
+          text: >-
+            Merged into every span's `meta` or `metrics`, so it reads back as an event attribute;
+            `host.name`, `deployment.environment.name`, `service.version`, and `container.id` are
+            the `TracerPayload`'s `hostname`, `env`, `app_version`, and `container_id`, read back on
+            the resource.
       graphite_out:
         - when: {tags: drop}
           class: lost
@@ -3743,6 +3823,10 @@ rows:
         class: lost
         reason: structural
         text: Datadog has no instrumentation scope, so none is written.
+      datadog_trace_out:
+        class: lost
+        reason: structural
+        text: The trace API has no instrumentation scope, so none is written.
       graphite_out:
         class: lost
         reason: structural
@@ -3911,6 +3995,13 @@ rows:
         text: >-
           An entry of the span's `metrics`, read back as an `f64`; an integer that loses
           precision as an `f64` is counted.
+      datadog_trace_out:
+        class: normalized
+        reason: span_metric
+        counter: logit.output.spans.degraded{reason=int_as_f64}
+        text: >-
+          An entry of the span's `metrics`, read back as an `f64`; an integer that loses precision
+          as an `f64` is counted.
       splunk_hec_out:
         class: exact
         text: >-
@@ -3934,6 +4025,9 @@ rows:
         class: exact
         text: >-
           The span's `service`, `resource`, or `type` field, read back as the attribute.
+      datadog_trace_out:
+        class: exact
+        text: The span's `service`, `resource`, or `type` field, read back as the attribute.
       splunk_hec_out:
         class: exact
         text: >-
@@ -3953,6 +4047,11 @@ rows:
         text: >-
           An ordinary span attribute: Datadog's internal mark leaves as an OTel attribute.
       datadog_out:
+        class: exact
+        text: >-
+          A `metrics` entry for a number and a `meta` entry for a string, read back as the
+          attribute.
+      datadog_trace_out:
         class: exact
         text: >-
           A `metrics` entry for a number and a `meta` entry for a string, read back as the
@@ -3982,6 +4081,18 @@ rows:
         text: >-
           The chunk's `priority`, `origin`, `droppedTrace`, or `tags`, or the span's `error`, read
           back into the carrier.
+      datadog_trace_out:
+        - when: {version: v0.4}
+          class: lost
+          counter: logit.output.spans.degraded{reason=no_wire_form}
+          text: >-
+            v0.4 has no trace chunk, so a `_logit.datadog.chunk.*` carrier is left off, counted once
+            per carrier per span. `_logit.datadog.span.error` is the span's `error`, read back into
+            the carrier.
+        - class: exact
+          text: >-
+            The chunk's `priority`, `origin`, `dropped_trace`, or `tags`, or the span's `error`,
+            read back into the carrier.
       splunk_hec_out:
         class: lost
         reason: structural
@@ -4011,6 +4122,21 @@ rows:
         class: exact
         text: >-
           The `TracerPayload`'s or `AgentPayload`'s field, read back into the carrier.
+      datadog_trace_out:
+        - when: {version: v0.4}
+          class: lost
+          counter: logit.output.spans.degraded{reason=no_wire_form}
+          text: >-
+            v0.4 has no `TracerPayload`: a `_logit.datadog.tracer.*` carrier a `Datadog-Meta-*`
+            request header restores reads back into the carrier, and every other one (`runtime_id`,
+            `tags`, `container_debug`), and every `_logit.datadog.agent.*` carrier, is left off,
+            counted once per request.
+        - class: lost
+          counter: logit.output.spans.degraded{reason=no_wire_form}
+          text: >-
+            A `_logit.datadog.tracer.*` carrier is the `TracerPayload`'s field, read back into the
+            carrier. The trace API has no `AgentPayload`, so a `_logit.datadog.agent.*` carrier is
+            left off, counted once per request.
       splunk_hec_out:
         class: lost
         reason: structural
@@ -4037,6 +4163,11 @@ rows:
         text: >-
           An `AgentPayload` has no field for a tracer request header and the intake takes no such
           header, so the carrier is left off, counted once per request body.
+      datadog_trace_out:
+        class: exact
+        text: >-
+          The tracer request header the carrier names, sent on every trace request under either
+          `version:`, which datadog_trace_in reads back into the carrier.
       splunk_hec_out:
         class: lost
         reason: structural
@@ -4340,6 +4471,11 @@ rows:
           A record with no host and no hostless mark leaves with the process hostname as its host,
           which datadog_in reads back as `host.name`; a span's host is its batch resource's
           `host.name`, filled only when no relaying Agent's hostname rides beside it.
+      datadog_trace_out:
+        class: exact
+        text: >-
+          The sink writes no host for a span that carries none: the Agent it sends to fills its own,
+          so nothing stands in its place.
       graphite_out:
         class: exact
         text: A record with no host leaves with none.
@@ -4457,6 +4593,13 @@ rows:
           A span whose kind isn't internal, with no `span.kind` attribute, leaves with
           `meta["span.kind"]`, which datadog_in reads back as a `span.kind` attribute beside the
           kind.
+      datadog_trace_out:
+        class: normalized
+        reason: span_kind_meta
+        text: >-
+          A span whose kind isn't internal, with no `span.kind` attribute, leaves with
+          `meta["span.kind"]`, which datadog_trace_in reads back as a `span.kind` attribute beside
+          the kind.
       syslog_out:
         class: exact
         text: A span isn't written, so no `span.kind` attribute is.
@@ -4482,6 +4625,13 @@ rows:
           On the first span of a trace in a batch, when no span of the trace carries
           `_dd.p.tid`, a 128-bit trace id's high 64 bits leave as `meta["_dd.p.tid"]`, which
           datadog_in reads back as a `_dd.p.tid` attribute beside the trace id.
+      datadog_trace_out:
+        class: normalized
+        reason: trace_id_high_tag
+        text: >-
+          On the first span of a trace in a batch, when no span of the trace carries `_dd.p.tid`, a
+          128-bit trace id's high 64 bits leave as `meta["_dd.p.tid"]`, which datadog_trace_in reads
+          back as a `_dd.p.tid` attribute beside the trace id.
       syslog_out:
         class: exact
         text: A span isn't written, so no `_dd.p.tid` attribute is.
@@ -4567,6 +4717,12 @@ rows:
         class: exact
         text: >-
           One object of a `/api/v2/logs` body, its attributes as top-level keys.
+      datadog_trace_out:
+        class: skipped
+        reason: uncounted
+        text: >-
+          The sink sends spans alone, so a log takes no route and is left off, uncounted, beside a
+          span or alone.
       graphite_out:
         class: skipped
         counter: logit.output.events.skipped{reason=no_metrics}
@@ -5183,6 +5339,14 @@ rows:
           gate (`span/not_datadog_origin` and `span/needs_agent_processing` have the spans it holds
           back), read back with its kind as a `span.kind` attribute and its trace id's high half as
           `_dd.p.tid` (the `attributes` rows).
+      datadog_trace_out:
+        class: exact
+        text: >-
+          A span of the trace request at `version:`'s path, in the trace array (v0.4) or
+          `TracerPayload` chunk (v0.7) of its trace id, with no readiness gate, read back with its
+          kind as a `span.kind` attribute and its trace id's high half as `_dd.p.tid` (the
+          `attributes` rows). An OTel span with no `service.name`, `resource.name`, or `span.type`
+          leaves with those fields empty.
       graphite_out:
         class: skipped
         counter: logit.output.events.skipped{reason=no_metrics}
@@ -5234,6 +5398,11 @@ rows:
           A trace chunk whose root carries no Datadog span attribute, an OTel or `logit`-made span
           whose path to Datadog is `otlp_out`, isn't sent: every span of it is dropped and counted,
           beside its event's other signals or not.
+      datadog_trace_out:
+        class: exact
+        text: >-
+          The sink has no readiness gate, so a trace chunk with no Datadog span attribute is sent as
+          any span is, nothing beyond `span/alone`.
       graphite_out:
         class: exact
         text: >-
@@ -5284,6 +5453,12 @@ rows:
           A trace chunk whose root carries Datadog span attributes but not the Agent's `_top_level`
           mark, raw tracer output an Agent hasn't normalized or computed stats for, isn't sent:
           every span of it is dropped and counted, beside its event's other signals or not.
+      datadog_trace_out:
+        class: exact
+        text: >-
+          The sink has no readiness gate: the Agent it sends to does the processing a `_top_level`
+          mark stands for, so a trace chunk without one is sent as any span is, nothing beyond
+          `span/alone`.
       graphite_out:
         class: exact
         text: >-
@@ -5315,6 +5490,9 @@ rows:
         class: exact
         text: >-
           The span's `name`.
+      datadog_trace_out:
+        class: exact
+        text: The span's `name`.
       splunk_hec_out:
         class: exact
         text: >-
@@ -5339,6 +5517,13 @@ rows:
         text: >-
           A name that isn't a `Str` leaves as its text, read back as a string; a map or an array
           is JSON text, counted.
+      datadog_trace_out:
+        class: normalized
+        reason: stringified
+        counter: logit.output.spans.degraded{reason=json_text}
+        text: >-
+          A name that isn't a `Str` leaves as its text, read back as a string; a map or an array is
+          JSON text, counted.
       splunk_hec_out:
         class: normalized
         reason: stringified
@@ -5362,6 +5547,11 @@ rows:
         text: >-
           The low 64 bits as the span's `trace_id` and the high half as `_dd.p.tid` on the chunk's
           first span, which datadog_in restores on every span of the chunk.
+      datadog_trace_out:
+        class: exact
+        text: >-
+          The low 64 bits as the span's `trace_id` and the high half as `_dd.p.tid` on the first
+          span of its trace, which datadog_trace_in restores on every span of the trace.
       splunk_hec_out:
         class: exact
         text: >-
@@ -5382,6 +5572,9 @@ rows:
         class: exact
         text: >-
           The span's `parent_id`.
+      datadog_trace_out:
+        class: exact
+        text: The span's `parent_id`.
       splunk_hec_out:
         class: exact
         text: >-
@@ -5399,6 +5592,10 @@ rows:
         text: >-
           An empty `parent_span_id`, read back as no parent.
       datadog_out:
+        class: exact
+        text: >-
+          `parent_id` 0, read back as no parent.
+      datadog_trace_out:
         class: exact
         text: >-
           `parent_id` 0, read back as no parent.
@@ -5423,6 +5620,11 @@ rows:
         text: >-
           A `span.kind` meta entry for any kind but `internal` (the `attributes/span_kind` row),
           read back as the span's kind.
+      datadog_trace_out:
+        class: exact
+        text: >-
+          A `span.kind` meta entry for any kind but `internal` (the `attributes/span_kind` row),
+          read back as the span's kind.
       splunk_hec_out:
         class: exact
         text: >-
@@ -5440,6 +5642,10 @@ rows:
         text: >-
           `Status.code` `STATUS_CODE_ERROR`.
       datadog_out:
+        class: exact
+        text: >-
+          `error: 1`, read back as an error status.
+      datadog_trace_out:
         class: exact
         text: >-
           `error: 1`, read back as an error status.
@@ -5465,6 +5671,12 @@ rows:
         text: >-
           Datadog has no `ok` status, so the span leaves with `error: 0` and reads back unset,
           counted.
+      datadog_trace_out:
+        class: lost
+        counter: logit.output.spans.degraded{reason=no_wire_form}
+        text: >-
+          The trace API has no `ok` status, so the span leaves with `error: 0` and reads back unset,
+          counted.
       splunk_hec_out:
         class: exact
         text: >-
@@ -5482,6 +5694,10 @@ rows:
         text: >-
           `Status.code` `STATUS_CODE_UNSET`, read back as unset.
       datadog_out:
+        class: exact
+        text: >-
+          `error: 0`, read back as unset.
+      datadog_trace_out:
         class: exact
         text: >-
           `error: 0`, read back as unset.
@@ -5506,6 +5722,11 @@ rows:
         counter: logit.output.spans.degraded{reason=no_wire_form}
         text: >-
           Datadog has no field for a status message, so it's left off, counted once per field.
+      datadog_trace_out:
+        class: lost
+        counter: logit.output.spans.degraded{reason=no_wire_form}
+        text: >-
+          The trace API has no field for a status message, so it's left off, counted once per field.
       splunk_hec_out:
         class: exact
         text: >-
@@ -5526,6 +5747,9 @@ rows:
         class: exact
         text: >-
           The span's `start`, in Unix nanoseconds.
+      datadog_trace_out:
+        class: exact
+        text: The span's `start`, in Unix nanoseconds.
       splunk_hec_out:
         class: exact
         text: >-
@@ -5546,6 +5770,9 @@ rows:
         class: exact
         text: >-
           The span's `duration`, from which datadog_in restores the end.
+      datadog_trace_out:
+        class: exact
+        text: The span's `duration`, from which datadog_trace_in restores the end.
       splunk_hec_out:
         class: exact
         text: >-
@@ -5567,6 +5794,10 @@ rows:
         counter: logit.output.spans.degraded{reason=negative_duration}
         text: >-
           A negative `duration` is written as 0, counted, so the end reads back at the start.
+      datadog_trace_out:
+        class: lost
+        counter: logit.output.spans.degraded{reason=negative_duration}
+        text: A negative `duration` is written as 0, counted, so the end reads back at the start.
       splunk_hec_out:
         class: exact
         text: >-
@@ -5588,6 +5819,10 @@ rows:
         counter: logit.output.spans.degraded{reason=no_wire_form}
         text: >-
           Datadog has no field for span flags, so it's left off, counted once per field.
+      datadog_trace_out:
+        class: lost
+        counter: logit.output.spans.degraded{reason=no_wire_form}
+        text: The trace API has no field for span flags, so it's left off, counted once per field.
       splunk_hec_out:
         class: lost
         counter: logit.output.spans.degraded{reason=no_wire_form}
@@ -5611,6 +5846,12 @@ rows:
         counter: logit.output.spans.degraded{reason=no_wire_form}
         text: >-
           Datadog has no field for a span's `trace_state`, so it's left off, counted once per field.
+      datadog_trace_out:
+        class: lost
+        counter: logit.output.spans.degraded{reason=no_wire_form}
+        text: >-
+          The trace API has no field for a span's `trace_state`, so it's left off, counted once per
+          field.
       splunk_hec_out:
         class: lost
         counter: logit.output.spans.degraded{reason=no_wire_form}
@@ -5635,6 +5876,12 @@ rows:
         text: >-
           Datadog has no field for a dropped-attribute count, so it's left off, counted once per
           field.
+      datadog_trace_out:
+        class: lost
+        counter: logit.output.spans.degraded{reason=no_wire_form}
+        text: >-
+          The trace API has no field for a dropped-attribute count, so it's left off, counted once
+          per field.
       splunk_hec_out:
         class: lost
         counter: logit.output.spans.degraded{reason=no_wire_form}
@@ -5658,6 +5905,12 @@ rows:
         counter: logit.output.spans.degraded{reason=no_wire_form}
         text: >-
           Datadog has no field for a dropped-event count, so it's left off, counted once per field.
+      datadog_trace_out:
+        class: lost
+        counter: logit.output.spans.degraded{reason=no_wire_form}
+        text: >-
+          The trace API has no field for a dropped-event count, so it's left off, counted once per
+          field.
       splunk_hec_out:
         class: lost
         counter: logit.output.spans.degraded{reason=no_wire_form}
@@ -5681,6 +5934,12 @@ rows:
         counter: logit.output.spans.degraded{reason=no_wire_form}
         text: >-
           Datadog has no field for a dropped-link count, so it's left off, counted once per field.
+      datadog_trace_out:
+        class: lost
+        counter: logit.output.spans.degraded{reason=no_wire_form}
+        text: >-
+          The trace API has no field for a dropped-link count, so it's left off, counted once per
+          field.
       splunk_hec_out:
         class: lost
         counter: logit.output.spans.degraded{reason=no_wire_form}
@@ -5703,6 +5962,9 @@ rows:
         class: exact
         text: >-
           Each span event's time, name, and scalar attributes as the span's `span_events`.
+      datadog_trace_out:
+        class: exact
+        text: Each span event's time, name, and scalar attributes as the span's `span_events`.
       splunk_hec_out:
         class: exact
         text: >-
@@ -5726,6 +5988,13 @@ rows:
         text: >-
           A map attribute of a span event, or an array holding anything but scalars, leaves as
           its JSON text, counted, and reads back as a string; an array of scalars stays an array.
+      datadog_trace_out:
+        class: normalized
+        reason: json_text
+        counter: logit.output.spans.degraded{reason=json_text}
+        text: >-
+          A map attribute of a span event, or an array holding anything but scalars, leaves as its
+          JSON text, counted, and reads back as a string; an array of scalars stays an array.
       splunk_hec_out:
         class: exact
         text: >-
@@ -5751,6 +6020,13 @@ rows:
         text: >-
           A name that isn't a `Str` leaves as its text, read back as a string; a map or an array
           is JSON text, counted.
+      datadog_trace_out:
+        class: normalized
+        reason: stringified
+        counter: logit.output.spans.degraded{reason=json_text}
+        text: >-
+          A name that isn't a `Str` leaves as its text, read back as a string; a map or an array is
+          JSON text, counted.
       splunk_hec_out:
         class: normalized
         reason: stringified
@@ -5774,6 +6050,12 @@ rows:
         text: >-
           A `Bytes` attribute of a span event or link leaves as its lossy UTF-8 text, read back as
           a string.
+      datadog_trace_out:
+        class: normalized
+        reason: stringified
+        text: >-
+          A `Bytes` attribute of a span event or link leaves as its lossy UTF-8 text, read back as a
+          string.
       splunk_hec_out:
         class: normalized
         reason: stringified
@@ -5795,6 +6077,13 @@ rows:
           A `u64` attribute of a span event or link reads back as an `i64`, or, above `i64::MAX`,
           as a double, approximate beyond 2^53 and uncounted.
       datadog_out:
+        class: normalized
+        reason: u64_as_int
+        counter: logit.output.spans.degraded{reason=int_as_f64}
+        text: >-
+          A `u64` attribute of a span event reads back as an `i64`, or, above `i64::MAX`, as a
+          double, counted; on a link it leaves as its decimal text, read back as a string.
+      datadog_trace_out:
         class: normalized
         reason: u64_as_int
         counter: logit.output.spans.degraded{reason=int_as_f64}
@@ -5827,6 +6116,12 @@ rows:
         text: >-
           A timestamp attribute of a span event or link leaves as RFC 3339 text, read back as a
           string.
+      datadog_trace_out:
+        class: normalized
+        reason: stringified
+        text: >-
+          A timestamp attribute of a span event or link leaves as RFC 3339 text, read back as a
+          string.
       splunk_hec_out:
         class: normalized
         reason: stringified
@@ -5851,6 +6146,12 @@ rows:
         text: >-
           Datadog has no field for a span event's dropped-attribute count, so it's left off, counted
           once per field.
+      datadog_trace_out:
+        class: lost
+        counter: logit.output.spans.degraded{reason=no_wire_form}
+        text: >-
+          The trace API has no field for a span event's dropped-attribute count, so it's left off,
+          counted once per field.
       splunk_hec_out:
         class: lost
         counter: logit.output.spans.degraded{reason=no_wire_form}
@@ -5870,6 +6171,13 @@ rows:
         text: >-
           Each link's ids and attributes.
       datadog_out:
+        class: normalized
+        reason: stringified
+        counter: logit.output.spans.degraded{reason=json_text}
+        text: >-
+          Each link's ids, and its attributes as strings, as the span's `span_links`, read back as
+          string attributes; a map or array attribute is JSON text, counted.
+      datadog_trace_out:
         class: normalized
         reason: stringified
         counter: logit.output.spans.degraded{reason=json_text}
@@ -5896,6 +6204,9 @@ rows:
         class: exact
         text: >-
           A span link's `flags`.
+      datadog_trace_out:
+        class: exact
+        text: A span link's `flags`.
       splunk_hec_out:
         class: lost
         counter: logit.output.spans.degraded{reason=no_wire_form}
@@ -5918,6 +6229,9 @@ rows:
         class: exact
         text: >-
           A span link's `tracestate`.
+      datadog_trace_out:
+        class: exact
+        text: A span link's `tracestate`.
       splunk_hec_out:
         class: exact
         text: >-
@@ -5940,6 +6254,12 @@ rows:
         text: >-
           Datadog has no field for a link's dropped-attribute count, so it's left off, counted once
           per field.
+      datadog_trace_out:
+        class: lost
+        counter: logit.output.spans.degraded{reason=no_wire_form}
+        text: >-
+          The trace API has no field for a link's dropped-attribute count, so it's left off, counted
+          once per field.
       splunk_hec_out:
         class: lost
         counter: logit.output.spans.degraded{reason=no_wire_form}
@@ -5980,6 +6300,11 @@ rows:
         text: >-
           The span on the trace route and the log on the logs route, each read back as an event of
           its own.
+      datadog_trace_out:
+        class: exact
+        text: >-
+          The span on the trace route; the log beside it has no route here and is left off,
+          uncounted (`log/plain`).
       graphite_out:
         class: lost
         counter: logit.output.events.skipped{reason=no_metrics}
@@ -6029,6 +6354,11 @@ rows:
         text: >-
           The span on the trace route and the metrics on theirs, each read back as an event of its
           own.
+      datadog_trace_out:
+        class: exact
+        text: >-
+          The span on the trace route; the metrics beside it have no route here and are left off,
+          uncounted (their kinds' rows).
       graphite_out:
         class: lost
         reason: uncounted

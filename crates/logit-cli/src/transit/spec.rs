@@ -1197,6 +1197,13 @@ flow_tests! {
     datadog_logs_to_syslog_rfc3164 => "datadog-logs-to-syslog-rfc3164",
     datadog_logs_to_syslog_sd => "datadog-logs-to-syslog-sd",
     datadog_relay => "datadog-relay",
+    datadog_traces_relay => "datadog-traces-relay",
+    datadog_traces_to_datadog_trace => "datadog-traces-to-datadog-trace",
+    datadog_traces_to_datadog_trace_v07 => "datadog-traces-to-datadog-trace-v07",
+    datadog_traces_to_kafka => "datadog-traces-to-kafka",
+    datadog_traces_to_kafka_text => "datadog-traces-to-kafka-text",
+    datadog_traces_to_otlp => "datadog-traces-to-otlp",
+    datadog_traces_to_splunk => "datadog-traces-to-splunk",
     datadog_to_influxdb => "datadog-to-influxdb",
     datadog_to_otlp => "datadog-to-otlp",
     datadog_to_prometheus_remote_write => "datadog-to-prometheus-remote-write",
@@ -1231,6 +1238,8 @@ flow_tests! {
     otlp_logs_to_syslog_sd => "otlp-logs-to-syslog-sd",
     otlp_traces_relay => "otlp-traces-relay",
     otlp_traces_to_datadog => "otlp-traces-to-datadog",
+    otlp_traces_to_datadog_trace => "otlp-traces-to-datadog-trace",
+    otlp_traces_to_datadog_trace_v07 => "otlp-traces-to-datadog-trace-v07",
     otlp_traces_to_kafka => "otlp-traces-to-kafka",
     otlp_traces_to_kafka_text => "otlp-traces-to-kafka-text",
     otlp_traces_to_splunk => "otlp-traces-to-splunk",
@@ -1302,6 +1311,30 @@ mod tests {
             .find(|c| c.name == "counter")
             .expect("the counter case");
         (flow, case)
+    }
+
+    /// `datadog_trace_out`'s cells split on `version:` as the sink's config serializes it: a
+    /// `when: {version: v0.4}` cell applies under the default and not under `version: v0.7`.
+    #[test]
+    fn datadog_trace_cells_split_on_the_sinks_version() {
+        let spec = spec_dir();
+        let table = mapping::load(&spec.join("mapping.yaml")).expect("the table");
+        let case = system_cases(&spec, "datadog-traces")
+            .expect("datadog-traces cases")
+            .into_iter()
+            .find(|c| c.name == "marked")
+            .expect("the marked case");
+        let index = |name: &str| {
+            let flow = flow(&spec, &spec.join(format!("flows/{name}.yaml"))).expect("the flow");
+            let traced = run_traced(&flow.path, &case.json(), Options::default()).expect("runs");
+            let sink = "datadog_trace_out";
+            match table.lookup("attributes", Some("datadog_carrier_span"), sink, &traced.sink) {
+                mapping::Lookup::Cell(_, index) => index,
+                _ => panic!("no datadog_trace_out cell for attributes/datadog_carrier_span"),
+            }
+        };
+        assert_eq!(index("datadog-traces-to-datadog-trace"), 0);
+        assert_eq!(index("datadog-traces-to-datadog-trace-v07"), 1);
     }
 
     /// A record the sink writes only in a lesser form has its field rows left unlooked-up, so a

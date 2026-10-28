@@ -41,7 +41,8 @@
 //! `lua_file`, `route`, `route_signals`, and `target`; `has_stale` and `drop_stale`, which read
 //! the wall clock per batch; a sink [`sink_encoder`] has no arm
 //! for (today `statsd_out`, `influxdb_out`, `otlp_out`, `prometheus_out` in both modes,
-//! `datadog_out`, `graphite_out`, `syslog_out`, `splunk_hec_out`, and `kafka_out`); and a
+//! `datadog_out`, `datadog_trace_out`, `graphite_out`, `syslog_out`, `splunk_hec_out`, and
+//! `kafka_out`); and a
 //! `kafka_out` `format:` other than `json` and `text`, whose records the driver has no reading
 //! of, since no `kafka_in` exists (`wire`'s module doc).
 //!

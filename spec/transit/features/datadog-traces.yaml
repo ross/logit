@@ -1,0 +1,89 @@
+# The Datadog APM trace features a case under cases/datadog-traces/ can exercise, from
+# crates/logit-proto/src/datadog/mod.rs's Traces table and crates/logit-proto/src/datadog/traces.rs.
+# A case names the ones it exercises in its `.meta.yaml`. The OTel-only fields, the value kinds
+# past a string and a number, and a span beside another signal are forms a stage such as Lua
+# produces and datadog_in never decodes, written as event JSON lines.
+- name: agent_payload
+  text: An `AgentPayload` on `/api/v0.2/traces`, protobuf, decoded to one event per span.
+- name: zstd
+  text: A body sent with `Content-Encoding` `zstd`, the Agent's default, decompressed first.
+- name: top_level_root
+  text: A trace chunk whose root span carries the Agent's `_top_level` mark.
+- name: unmarked_root
+  text: A Datadog-origin trace chunk whose root has no `_top_level` mark, as a tracer sends it.
+- name: span_identity
+  text: A span's `service`, `resource`, and `type`, decoded as `service.name`, `resource.name`, and `span.type`.
+- name: span_marks
+  text: A span's `_dd.*`, `_sampling_priority_v1`, and `span.kind` meta and metrics entries.
+- name: span_error
+  text: A span with `error` set, decoded as an error status and `_logit.datadog.span.error`.
+- name: chunk_carriers
+  text: A trace chunk's `priority`, `origin`, `droppedTrace`, and `tags`, as `_logit.datadog.chunk.*`.
+- name: tracer_carriers
+  text: A `TracerPayload`'s fields as `_logit.datadog.tracer.*` resource attributes.
+- name: agent_carriers
+  text: An `AgentPayload`'s fields as `_logit.datadog.agent.*` resource attributes.
+- name: parent_span_id
+  text: A span with a `parent_id`.
+- name: status_ok
+  text: A span with an OTel `ok` status, which a Datadog span can't hold.
+- name: status_message
+  text: An error span with a status message.
+- name: flags
+  text: A span's W3C trace flags.
+- name: trace_state
+  text: A span's W3C `trace_state`.
+- name: dropped_counts
+  text: A span's dropped-attribute, dropped-event, and dropped-link counts.
+- name: events
+  text: A span's events, each with a time, a name, and attributes.
+- name: event_nested_attribute
+  text: A span event's map and array attributes.
+- name: event_dropped_count
+  text: A span event's dropped-attribute count.
+- name: links
+  text: A span's links, each with a trace id, a span id, and attributes.
+- name: link_attribute_nested
+  text: A link's map attribute.
+- name: link_flags
+  text: A link's flags.
+- name: link_trace_state
+  text: A link's `trace_state`.
+- name: link_dropped_count
+  text: A link's dropped-attribute count.
+- name: end_before_start
+  text: A span whose end precedes its start.
+- name: trace_id_128
+  text: A trace id whose high 64 bits are nonzero.
+- name: attribute_int
+  text: An `I64` span attribute an `f64` holds without loss.
+- name: attribute_int_inexact
+  text: An `I64` span attribute above 2^53 that an `f64` can't hold.
+- name: attribute_double
+  text: An `F64` span attribute.
+- name: attribute_bool
+  text: A `Bool` span attribute.
+- name: attribute_timestamp
+  text: A `Timestamp` span attribute.
+- name: attribute_array
+  text: An `Array` span attribute.
+- name: attribute_map
+  text: A `Map` span attribute.
+- name: attribute_null
+  text: A `Null` span attribute.
+- name: attribute_bytes
+  text: A `Bytes` span attribute.
+- name: span_beside_log
+  text: A span on an event that also carries a log.
+- name: span_beside_metrics
+  text: A span on an event that also carries a gauge.
+- name: name_structured
+  text: A span whose name is a map rather than a string.
+- name: event_name_structured
+  text: A span event whose name is a map rather than a string.
+- name: item_attribute_typed
+  text: A span event's and a link's `Bytes`, `U64`, and `Timestamp` attributes.
+- name: tracer_headers
+  text: >-
+    A tracer request header's carrier no payload has a field for, such as
+    `_logit.datadog.tracer.entity_id`.

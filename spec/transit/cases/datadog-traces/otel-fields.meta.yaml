@@ -1,0 +1,7 @@
+# Hand-written event JSON lines: `_top_level` spans of one trace carrying every field an OTel
+# span has and a Datadog span doesn't: an `ok` status, a status message, flags, a `trace_state`,
+# each dropped count, events with a nested attribute and a dropped count, a link with flags, a
+# `trace_state`, a map attribute, and a dropped count, and an end before its start; the client
+# span has no `span.kind` attribute. A stage such as Lua produces them; datadog_in never decodes
+# one.
+exercises: [top_level_root, status_ok, status_message, flags, trace_state, dropped_counts, events, event_nested_attribute, event_dropped_count, links, link_attribute_nested, link_flags, link_trace_state, link_dropped_count, end_before_start, trace_id_128]

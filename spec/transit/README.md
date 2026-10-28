@@ -16,7 +16,8 @@ The sources are `statsd_in`'s metrics (`cases/statsd/`) and its DogStatsD events
 hand-written spans and payload-less events beside them (`cases/statsd-logs/`), `influxdb_in`,
 `prometheus_in`'s scrape (remote-write cases aren't written yet), `datadog_in`'s metrics routes and service checks (`cases/datadog/`) and its
 logs and events (`cases/datadog-logs/`: the Agent's captures and hand-written `/api/v2/logs`
-bodies), with no APM cases yet, `collectd_in`, `otlp_in`'s metrics
+bodies) and its APM traces (`cases/datadog-traces/`: the Agent's capture and hand-written event
+JSON lines), with no APM stats cases, `collectd_in`, `otlp_in`'s metrics
 (`cases/otlp/`), logs (`cases/otlp-logs/`), and traces (`cases/otlp-traces/`), `graphite_in`,
 plaintext and pickle, `syslog_in`, RFC 3164 and RFC 5424 over UDP and as a TCP stream, and
 `splunk_hec_in`'s `/event` and `/raw` routes (`cases/splunk/`: the four recorded HEC clients'
@@ -24,15 +25,20 @@ captures and hand-written bodies), with no metric cases. A
 source directory's name before its first `-` names its system, so
 `datadog-logs` cases decode through `datadog_in`. The sink columns are `statsd_out`,
 `prometheus_out` (exposition and remote-write), `influxdb_out`, `otlp_out`, `datadog_out`,
-`graphite_out`, `syslog_out`, `splunk_hec_out`, and `kafka_out` (`format: json` and `text`); the
-last three have cells on the log, span, event, and attribute rows and none on a metric kind's. A
+`datadog_trace_out` (`version: v0.4` and `v0.7`), `graphite_out`, `syslog_out`, `splunk_hec_out`,
+and `kafka_out` (`format: json` and `text`); the last three have cells on the log, span, event,
+and attribute rows and none on a metric kind's. `datadog_trace_out` sends spans alone, so beside
+its span and attribute cells it has only the `skipped` cells of the log and gauge rows a span
+reaches beside it, and the driver reads its requests back through `datadog_trace_in`'s own
+decoding with the headers the sink sent. A
 log record's rows have cells at `otlp_out`, `datadog_out`, `syslog_out`, `splunk_hec_out`,
 `kafka_out`, and, for a DogStatsD event, `statsd_out`. `kafka_out` has no pair input, so the
 driver reads its records back by convention: a `format: json` record through the event JSON
 reader, and a `format: text` record as one log holding the record's value, at the record's
 millisecond timestamp (`crates/logit-cli/src/transit/wire.rs`). Each flow's name says which
 source meets which sink: `statsd-relay`, `statsd-logs-relay`, `influxdb-relay`, `datadog-relay`,
-`datadog-logs-relay`, `otlp-relay`, `otlp-logs-relay`, `otlp-traces-relay`, `graphite-relay`, `syslog-relay`,
+`datadog-logs-relay`, `datadog-traces-relay`, `otlp-relay`, `otlp-logs-relay`,
+`otlp-traces-relay`, `graphite-relay`, `syslog-relay`,
 `splunk-relay`, `prometheus-to-prometheus`, and `prometheus-to-prometheus-remote-write` are like
 pairs, and `influxdb-to-prometheus` a cross-protocol one.
 
@@ -43,7 +49,10 @@ a row, and the driver encodes each route in one request without them. The driver
 trace readiness gate, which judges a whole trace chunk: a span it holds back is counted as the
 sink counts it and reads `dropped` on `span/not_datadog_origin` or `span/needs_agent_processing`.
 The APM stats routes have no case. `crates/logit-outputs/src/datadog.rs`'s module doc has the
-drops and the cuts.
+drops and the cuts. `datadog_trace_out` has no readiness gate, and the driver sends a batch's
+spans as one trace request without the sink's cut by trace count and size, which drops a trace
+too large to send alone as `oversize` (`crates/logit-outputs/src/datadog_trace.rs`'s "Size
+limits").
 
 ## Layout
 
@@ -141,7 +150,8 @@ is one nothing checks: add a case or a flow that reaches it.
   SD-ID, holding its PARAM-VALUE text; its row reads that `normalized`. A span pairs on its
   trace id's low 64 bits and its span id alone, so a span read back with another status still
   pairs and the difference lands on its status row. A span's field rows have cells only at the span sinks
-  (`otlp_out`, `datadog_out`, `splunk_hec_out`, and `kafka_out`), since every other sink skips a
+  (`otlp_out`, `datadog_out`, `datadog_trace_out`, `splunk_hec_out`, and `kafka_out`), since
+  every other sink skips a
   span alone or leaves it off beside another signal.
 
 Where a sink's outcome depends on the record's kind, the kind is in the feature's name, since a
@@ -188,9 +198,10 @@ counter would add anything
 "structural loss has no counter"). A loss that depends on the value, such as `false` or a
 rewritten name, is counted. The table's schema accepts `reason: uncounted` only on the cells
 `crates/logit-cli/src/transit/mapping.rs`'s `UNCOUNTED_ALLOWED` names, whose doc says which rule
-each follows. It has six entries. Three follow the same ADR's amendment "an ignored signal, and a
-format the config selects": a sink ignores a signal it has no wire for, such as a log beside
-metrics, uncounted, at any sink. Two are a sink finding: `otlp_out` writes a span name or a span
+each follows. It has eight entries. Five follow the same ADR's amendment "an ignored signal, and
+a format the config selects": a sink ignores a signal it has no wire for, such as a log beside
+metrics, uncounted, at any sink, and `datadog_trace_out`, whose one signal is spans, ignores every
+log and gauge it reaches. Two are a sink finding: `otlp_out` writes a span name or a span
 event name that isn't a `Str` as `""` (`span/name_structured`, `span/event_name_structured`).
 One is a `_logit.datadog.*` carrier `datadog_out`'s log, event, and service-check routes have no
 field for. Under that amendment too, `syslog_out`'s leave-off of every attribute
@@ -307,6 +318,7 @@ Each sink column has two regions:
 | `doc:influxdb_out` | `crates/logit-proto/src/influxdb/mod.rs` | Every cell of the column |
 | `doc:otlp_out` | `crates/logit-proto/src/otlp/mod.rs` | Every cell of the column |
 | `doc:datadog_out` | `crates/logit-proto/src/datadog/mod.rs` | Every cell of the column |
+| `doc:datadog_trace_out` | `crates/logit-outputs/src/datadog_trace.rs` | Every cell of the column |
 | `doc:graphite_out` | `crates/logit-proto/src/graphite/mod.rs` | Every cell of the column |
 | `doc:syslog_out` | `crates/logit-outputs/src/syslog.rs` | Every cell of the column |
 | `doc:splunk_hec_out` | `crates/logit-proto/src/splunk/mod.rs` | Every cell of the column |

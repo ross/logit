@@ -102,15 +102,19 @@ use std::path::Path;
 /// it carries ignores a signal it has no wire for, uncounted, so `log/beside_metrics`,
 /// `span/beside_log`, and `span/beside_metrics` match at any sink. The next two are a sink
 /// finding: `otlp_out` writes a span or span event name that isn't a `Str` as `""`, uncounted.
-/// The last is a `_logit.datadog.*` carrier `datadog_out`'s log, event, and service-check routes
-/// have no field for, left off where its metrics routes count one.
-const UNCOUNTED_ALLOWED: [(&str, Option<&str>, Option<&str>); 6] = [
+/// The third from last is a `_logit.datadog.*` carrier `datadog_out`'s log, event, and
+/// service-check routes have no field for, left off where its metrics routes count one. The last
+/// two follow the first three's rule at `datadog_trace_out`, whose one signal is spans: a log or a
+/// gauge it reaches, beside a span or alone, is ignored, uncounted.
+const UNCOUNTED_ALLOWED: [(&str, Option<&str>, Option<&str>); 8] = [
     ("log", Some("beside_metrics"), None),
     ("span", Some("beside_log"), None),
     ("span", Some("beside_metrics"), None),
     ("span", Some("name_structured"), Some("otlp_out")),
     ("span", Some("event_name_structured"), Some("otlp_out")),
     ("attributes", Some("datadog_carrier_log"), Some("datadog_out")),
+    ("log", None, Some("datadog_trace_out")),
+    ("gauge", None, Some("datadog_trace_out")),
 ];
 
 /// Whether the cell of `sink` in row `kind`/`feature` may be `uncounted` ([`UNCOUNTED_ALLOWED`]).

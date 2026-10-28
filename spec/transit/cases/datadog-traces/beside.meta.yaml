@@ -1,0 +1,5 @@
+# Hand-written event JSON lines: `_top_level` spans a stage such as Lua produces and datadog_in
+# never decodes: one beside a log, one beside a gauge, one whose name is a map, and one whose
+# event has a map name and whose event and link each carry a `Bytes`, a `u64`, and a timestamp
+# attribute.
+exercises: [top_level_root, span_beside_log, span_beside_metrics, name_structured, event_name_structured, item_attribute_typed]

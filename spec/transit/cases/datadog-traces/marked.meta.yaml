@@ -1,0 +1,5 @@
+# Hand-written event JSON lines: a `_top_level` root with two children, as an Agent's trace
+# payload decodes, with the Datadog span fields, the chunk carriers, an error child, and the
+# tracer and Agent carriers on the resource, among them the carriers only a tracer request header
+# carries.
+exercises: [top_level_root, span_identity, span_marks, chunk_carriers, span_error, tracer_carriers, tracer_headers, agent_carriers, parent_span_id]
