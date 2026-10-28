@@ -399,7 +399,9 @@ name:
 - `syslog_timestamp`: the `syslog.timestamp` attribute.
 - `host_name`: HOSTNAME at `syslog_out`. At `splunk_hec_out` it moves to the envelope and reads
   back on the resource.
-- `splunk_envelope`: the resource's `com.splunk.*` attributes.
+- `splunk_envelope`: the resource's `com.splunk.source`, `com.splunk.sourcetype`, and
+  `com.splunk.index`, the envelope's carriers. Any other `com.splunk.` key is written into
+  `fields` and reaches `resource_attribute`.
 
 Datadog's `status`, `ddsource`, and `ddtags`, and Splunk's public `otel.log.*`, reach the
 value-type rows (`attributes/string_value` and the rest) and need no row of their own.

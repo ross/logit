@@ -48,7 +48,7 @@
 - name: envelope
   text: >-
     All four carriers, `host`, `source`, `sourcetype`, and `index`, decoded to the resource's
-    `host.name` and `com.splunk.*`.
+    `host.name`, `com.splunk.source`, `com.splunk.sourcetype`, and `com.splunk.index`.
 - name: envelope_partial
   text: An object carrying some carriers and not others, or a `null` one, read as absent.
 - name: envelope_absent
