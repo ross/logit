@@ -743,7 +743,7 @@ shows:
    | `dropped_events_count` | field | A nonzero dropped-event count. |
    | `dropped_links_count` | field | A nonzero dropped-link count. |
    | `events` | field | The span's events. |
-   | `event_nested_attribute` | field | A span event attribute holding a `Map` or `Array`. |
+   | `event_nested_attribute` | field | A span event attribute holding a `Map`, an `Array`, or `Null`. |
    | `event_name_structured` | field | A span event whose name isn't a `Str`. |
    | `nested_bytes_attribute` | field | A `Bytes` attribute on a span event or link. |
    | `nested_u64_attribute` | field | A `U64` attribute on a span event or link. |
@@ -799,8 +799,8 @@ shows:
      `structural`, at the OTel sinks and `kafka_out`'s `format: text`. It mirrors
      `attributes/datadog_carrier_log`.
    - `attributes/datadog_tracer_resource`: the resource's `_logit.datadog.tracer.*` and
-     `_logit.datadog.agent.*`, the `TracerPayload` and `AgentPayload` fields and
-     `datadog_trace_in`'s request headers. The cells split by key group:
+     `_logit.datadog.agent.*` carriers a `TracerPayload` or `AgentPayload` field carries. The
+     cells split by key group:
      - The tracer carriers are `exact` at `datadog_out` and at `datadog_trace_out` under
        `version: v0.7`. Under `version: v0.4`, every tracer carrier a request header doesn't
        restore is `lost`, counted `logit.output.spans.degraded{reason=no_wire_form}`
@@ -811,7 +811,8 @@ shows:
      - Both groups are `lost`, `structural`, at the OTel sinks.
      - The tracer carriers only a request header carries (`resource_carriers_lost`'s
        `header_only`) have their own row, `attributes/datadog_tracer_headers`, `lost`, counted
-       `no_wire_form`, at `datadog_out`, since an `AgentPayload` has no field for them.
+       `no_wire_form`, at `datadog_out`, since an `AgentPayload` has no field for them. Its
+       `datadog_trace_out` cell is `exact` where that sink restores the request header.
 
    Other span attributes reach the value-type rows. `attributes/span_kind` and
    `attributes/trace_id_high`, derived at `datadog_out`, stay as they are.
@@ -862,8 +863,9 @@ shows:
     removes.
 12. **`UNCOUNTED_ALLOWED` narrows** from `("span", None, None)` to the ignored-signal entries
     `("span", Some("beside_log"), None)`, `("span", Some("beside_metrics"), None)`, and decision
-    9's `datadog_trace_out` entries, which stay, plus decision 2's finding entry,
-    `("span", Some("name_structured"), Some("otlp_out"))`, which `tspan-sink` removes. Every other
+    9's `datadog_trace_out` entries, which stay, plus decision 2's two finding entries,
+    `("span", Some("name_structured"), Some("otlp_out"))` and
+    `("span", Some("event_name_structured"), Some("otlp_out"))`, which `tspan-sink` removes. Every other
     uncounted span loss is a format with no slot and reads `lost, structural`.
 13. **The sort key doesn't change.** `report.rs` already orders events by timestamp, then span
     name.
@@ -879,7 +881,9 @@ carry each difference in place of pass 3's whole-body `degraded`.
 `span/name` takes a `Str` name, `exact` everywhere. `span/name_structured` takes any other name:
 `normalized`, `stringified`, at the Datadog sinks and `splunk_hec_out`; `exact` at `kafka_out`'s
 `format: json`; and `lost`, uncounted, at `otlp_out`, which writes `""`. That cell is a finding,
-with the allowance `("span", Some("name_structured"), Some("otlp_out"))`.
+with the allowance `("span", Some("name_structured"), Some("otlp_out"))`. A span event's name
+follows the same rule on `span/event_name_structured`, with the allowance
+`("span", Some("event_name_structured"), Some("otlp_out"))`.
 
 #### Case directories
 

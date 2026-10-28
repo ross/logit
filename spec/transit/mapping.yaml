@@ -5718,18 +5718,20 @@ rows:
       otlp_out:
         class: exact
         text: >-
-          A key-value list or array attribute of a span event, as OTLP writes any attribute.
+          A key-value list, array, or empty attribute of a span event, as OTLP writes any
+          attribute.
       datadog_out:
         class: normalized
         reason: json_text
         counter: logit.output.spans.degraded{reason=json_text}
         text: >-
-          A map attribute of a span event, or an array holding anything but scalars, leaves as
-          its JSON text, counted, and reads back as a string; an array of scalars stays an array.
+          A map or null attribute of a span event, or an array holding anything but scalars,
+          leaves as its JSON text (`null` for a null), counted, and reads back as a string; an
+          array of scalars stays an array.
       splunk_hec_out:
         class: exact
         text: >-
-          A map or array attribute of a span event, nesting kept.
+          A map, array, or null attribute of a span event, nesting kept.
       kafka_out:
         class: exact
         text: >-

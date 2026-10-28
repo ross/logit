@@ -204,7 +204,7 @@
 //! | `span/dropped_events_count` | lost | `logit.output.spans.degraded{reason=no_wire_form}` | The exporter's span object has no member for a dropped-event count, so it's left off, counted once per span. |
 //! | `span/dropped_links_count` | lost | `logit.output.spans.degraded{reason=no_wire_form}` | The exporter's span object has no member for a dropped-link count, so it's left off, counted once per span. |
 //! | `span/events` | exact | -- | Each span event's `name`, `timestamp`, and `attributes`. |
-//! | `span/event_nested_attribute` | exact | -- | A map or array attribute of a span event, nesting kept. |
+//! | `span/event_nested_attribute` | exact | -- | A map, array, or null attribute of a span event, nesting kept. |
 //! | `span/event_name_structured` | normalized | `stringified` | A name that isn't a `Str` leaves as its text, JSON for a map or an array, read back as a string. |
 //! | `span/nested_bytes_attribute` | normalized | `stringified` | A `Bytes` attribute of a span event or link leaves as a base64 string, read back as the string. |
 //! | `span/nested_u64_attribute` | normalized | `u64_as_int` | A JSON number in the span event's or link's `attributes`, read back as an `i64`, or, above `i64::MAX`, as the `u64` itself. |

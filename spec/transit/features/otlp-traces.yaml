@@ -101,5 +101,5 @@
   text: A span event whose name is a key-value list, which a Lua script can build.
 - name: item_attribute_typed
   text: >-
-    A `Bytes`, a `u64`, and a timestamp attribute on a span event and on a link, which an `Event`
-    carries and no OTLP `AnyValue` can.
+    A `Bytes`, a `u64`, and a timestamp attribute on a span event and on a link; the `u64` and
+    the timestamp have no OTLP `AnyValue` form.

@@ -124,8 +124,8 @@ is one nothing checks: add a case or a flow that reaches it.
   (`beside_metrics`) or a span beside a log (`span/beside_log`), each a field of its event, every
   `span` row for a span's own fields (`name`, `trace_id`, `kind`, its status, its timestamps,
   `flags`, `trace_state`, its dropped counts, its events, and its links, with an `_unset` row for
-  an absent parent or status, and a row for a span event's non-`Str` name and for each `Map` or
-  `Array` event attribute and `Bytes`, `U64`, or `Timestamp` event or link attribute), and a
+  an absent parent or status, and a row for a span event's non-`Str` name and for each `Map`,
+  `Array`, or `Null` event attribute and `Bytes`, `U64`, or `Timestamp` event or link attribute), and a
   field of any log, beside metrics or
   not (`severity`, `body_format`, `event_name`, `observed_timestamp`, `trace`, `trace_flags`,
   `dropped_attributes_count`, and `timestamp`, or `receipt_timestamp` for a log carrying

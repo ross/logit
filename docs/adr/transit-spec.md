@@ -401,8 +401,9 @@ that in, and settles these:
     removes.
 11. **`UNCOUNTED_ALLOWED` narrows** from `("span", None, None)` to the ignored-signal entries
     `("span", Some("beside_log"), None)`, `("span", Some("beside_metrics"), None)`, and
-    `datadog_trace_out`'s log and metric record-row entries, which stay as the rule's, plus one
-    finding entry under decision 10, `otlp_out`'s empty name for a structured one, which
+    `datadog_trace_out`'s log and metric record-row entries, which stay as the rule's, plus two
+    finding entries under decision 10, `otlp_out`'s empty name for a structured span name and a
+    structured span event name (`name_structured` and `event_name_structured`), which
     `tspan-sink` removes. Every other uncounted span loss is a format with no slot and reads
     `lost, structural`.
 12. **The sort key doesn't change.** Events already order by timestamp, then span name.
