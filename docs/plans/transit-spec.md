@@ -608,8 +608,9 @@ the stream leaves alone.
    [ADR `transit-spec`](../adr/transit-spec.md)'s log-records amendment and the first mechanism
    of its decision 9.
 3. **Under `format: rfc3164`, `syslog_out` always writes a TAG.** With no `syslog.tag` and no
-   `app_name:`, the TAG is the event's `service.name` attribute, else `logit`, sanitized as a
-   configured TAG is. RFC 3164 lets a reader tell HOSTNAME from MSG only by the TAG after it, so
+   `app_name:`, the TAG is the event's `service.name` attribute, else the batch resource's
+   `service.name`, else `logit`, sanitized as a configured TAG is. HOSTNAME and PROCID fall back
+   to the resource the same way, and OTLP senders put `service.name` there. RFC 3164 lets a reader tell HOSTNAME from MSG only by the TAG after it, so
    `syslog_in` reads a TAG-less message's HOSTNAME as the first word of MSG. A relayed TAG-less
    message gains a TAG and reads back with `syslog.tag` and `host.name`: a new permitted
    normalization of the syslog pair, recorded in [ADR `syslog-output`](../adr/syslog-output.md).

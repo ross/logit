@@ -377,8 +377,14 @@ and the Datadog log encoder treats it as an ordinary attribute.
 ## Amendment: an RFC 3164 message always has a TAG (2026-10-28)
 
 Under `format: rfc3164`, `syslog_out` writes a TAG on every message. A log with no `syslog.tag`
-and no `app_name:` takes its TAG from the event's `service.name` attribute, else `logit`, the
-process name, sanitized as a configured TAG is.
+and no `app_name:` takes its TAG from, in order:
+
+1. a non-empty `service.name` on the event;
+2. a non-empty `service.name` on the batch resource;
+3. `logit`, the process name.
+
+The TAG is sanitized as a configured TAG is. The resource step matches HOSTNAME's and PROCID's
+lookups above, and it's where an OTLP sender puts `service.name`.
 
 RFC 3164 makes no header field certain, so a reader tells HOSTNAME from MSG only by the TAG after
 it. `syslog_in`'s header rule (`crates/logit-proto/src/syslog/mod.rs`'s "The RFC 3164 header")
