@@ -386,7 +386,9 @@ Entry format and the other areas: [the known-gaps index](README.md).
   | encode (OTLP) | field `attributes/severity_carrier_syslog` → **lost** | none (structural) | A `_logit.` carrier is private and isn't an OTLP attribute, so it's left off and the severity reads back at band resolution. |
   | encode (OTLP) | field `attributes/datadog_carrier_span` → **lost** | none (structural) | OTLP has no field for a Datadog trace chunk's fields or a span's raw `error`, and a `_logit.` carrier is private, so it's left off. |
   | encode (OTLP) | field `attributes/datadog_tracer_resource` → **lost** | none (structural) | OTLP has no field for a `TracerPayload`'s or an `AgentPayload`'s fields, and a `_logit.` carrier is private, so it's left off. |
+  | encode (OTLP) | field `attributes/datadog_tracer_headers` → **lost** | none (structural) | OTLP has no field for a tracer request header, and a `_logit.` carrier is private, so it's left off. |
   | encode (OTLP) | field `span/name_structured` → **lost** | none (uncounted) | OTLP's span `name` is a string, and a name that isn't a `Str` leaves as `""`, uncounted. |
+  | encode (OTLP) | field `span/event_name_structured` → **lost** | none (uncounted) | OTLP's span event `name` is a string, and a name that isn't a `Str` leaves as `""`, uncounted. |
   | encode (OTLP) | `event/attributes_only` → **skipped** | `logit.output.events.skipped{reason=no_payload}` | An event with no metric, log, or span has no OTLP signal and isn't sent. |
   | encode (OTLP) | `event/string_only` → **skipped** | `logit.output.events.skipped{reason=no_payload}` | An InfluxDB point whose fields are all strings has no OTLP signal and isn't sent, so its fields are lost. |
 
@@ -450,6 +452,7 @@ Entry format and the other areas: [the known-gaps index](README.md).
   | encode (Datadog) | field `attributes/datadog_carrier_log` → **lost** | none (uncounted) | A `_logit.datadog.*` carrier on a log, a Datadog event, or a service check that the route has no field for is left off, uncounted, where the metrics routes count one as `no_wire_form`; the events route's public form has no field for the Agent envelope's `_logit.datadog.agent.hostname`. |
   | encode (Datadog) | field `attributes/severity_carrier_otel` → **lost** | none (structural) | A Datadog log has a status and no raw OTLP severity, so the carriers are left off and the severity reads back at band resolution. |
   | encode (Datadog) | field `attributes/severity_carrier_syslog` → **lost** | none (structural) | A Datadog log has a status and no raw syslog severity, so the carrier is left off and the severity reads back at band resolution. |
+  | encode (Datadog) | field `attributes/datadog_tracer_headers` → **lost** | `logit.output.spans.degraded{reason=no_wire_form}` | An `AgentPayload` has no field for a tracer request header and the intake takes no such header, so the carrier is left off, counted once per request body. |
   | encode (Datadog) | field `log/body_format` → **lost** | none (structural) | A Datadog log has no body format, so a `json` or `structured` format reads back as `raw`. |
   | encode (Datadog) | field `log/event_name` → **lost** | none (structural) | A Datadog log has no event name, so none is written. |
   | encode (Datadog) | field `log/observed_timestamp` → **lost** | none (structural) | A Datadog log has no observed time, so none is written. |
@@ -652,6 +655,7 @@ Entry format and the other areas: [the known-gaps index](README.md).
   | encode (Splunk) | field `attributes/severity_carrier_syslog` → **lost** | none (structural) | A `_logit.` carrier is private and isn't a HEC field, so it's left off and the severity reads back at band resolution. |
   | encode (Splunk) | field `attributes/datadog_carrier_span` → **lost** | none (structural) | The exporter's span object has no field for a Datadog trace chunk's fields or a span's raw `error`, and a `_logit.` carrier is private, so it's left off. |
   | encode (Splunk) | field `attributes/datadog_tracer_resource` → **lost** | none (structural) | HEC has no field for a `TracerPayload`'s or an `AgentPayload`'s fields, and a `_logit.` carrier is private, so it's left off. |
+  | encode (Splunk) | field `attributes/datadog_tracer_headers` → **lost** | none (structural) | HEC has no field for a tracer request header, and a `_logit.` carrier is private, so it's left off. |
   | encode (Splunk) | `log/blank_message` → **dropped** | `logit.output.events.dropped{reason=blank_event}` | A log whose message is empty, null, or a non-finite number isn't written, since HEC rejects a whole request holding a blank `event`; the rest of the batch is sent. |
   | encode (Splunk) | field `log/body_format` → **lost** | none (structural) | HEC has no body format, so splunk_hec_in reads `json` for an object or array `event` and `raw` for any other: a `structured` message reads back as `json`, and a string message's `json` format as `raw`. |
   | encode (Splunk) | field `log/observed_timestamp` → **lost** | none (structural) | HEC has no observed time, so it's left off. |

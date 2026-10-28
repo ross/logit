@@ -157,6 +157,7 @@
 //! | `attributes/datadog_span_marks` | exact | -- | An ordinary entry of the span's `attributes`: Datadog's internal mark leaves as an OTel attribute. |
 //! | `attributes/datadog_carrier_span` | lost | structural | The exporter's span object has no field for a Datadog trace chunk's fields or a span's raw `error`, and a `_logit.` carrier is private, so it's left off. |
 //! | `attributes/datadog_tracer_resource` | lost | structural | HEC has no field for a `TracerPayload`'s or an `AgentPayload`'s fields, and a `_logit.` carrier is private, so it's left off. |
+//! | `attributes/datadog_tracer_headers` | lost | structural | HEC has no field for a tracer request header, and a `_logit.` carrier is private, so it's left off. |
 //! | `attributes/syslog_header` | normalized | `u64_as_int` | A `fields` string or number; a `u64` `syslog.facility` or `process.pid` reads back as an `i64`. |
 //! | `attributes/syslog_msgid` | exact | -- | A `fields` string. |
 //! | `attributes/syslog_sd` | normalized | `flattened` | `fields` is flat, so `syslog.sd` leaves as one `syslog.sd.<SD-ID>.<PARAM-NAME>` key per PARAM, read back as that many attributes and no `syslog.sd` map. |
@@ -204,6 +205,10 @@
 //! | `span/dropped_links_count` | lost | `logit.output.spans.degraded{reason=no_wire_form}` | The exporter's span object has no member for a dropped-link count, so it's left off, counted once per span. |
 //! | `span/events` | exact | -- | Each span event's `name`, `timestamp`, and `attributes`. |
 //! | `span/event_nested_attribute` | exact | -- | A map or array attribute of a span event, nesting kept. |
+//! | `span/event_name_structured` | normalized | `stringified` | A name that isn't a `Str` leaves as its text, JSON for a map or an array, read back as a string. |
+//! | `span/nested_bytes_attribute` | normalized | `stringified` | A `Bytes` attribute of a span event or link leaves as a base64 string, read back as the string. |
+//! | `span/nested_u64_attribute` | normalized | `u64_as_int` | A JSON number in the span event's or link's `attributes`, read back as an `i64`, or, above `i64::MAX`, as the `u64` itself. |
+//! | `span/nested_timestamp_attribute` | normalized | `stringified` | A timestamp attribute of a span event or link leaves as an RFC 3339 string, read back as the string. |
 //! | `span/event_dropped_count` | lost | `logit.output.spans.degraded{reason=no_wire_form}` | The exporter's span object has no member for a span event's dropped-attribute count, so it's left off, counted once per span. |
 //! | `span/links` | exact | -- | Each link's `trace_id`, `span_id`, and `attributes`. |
 //! | `span/link_flags` | lost | `logit.output.spans.degraded{reason=no_wire_form}` | The exporter's span object has no member for a link's flags, so it's left off, counted once per span. |

@@ -75,15 +75,19 @@
 //! metric or log reaches `span/alone`, and also `span/not_datadog_origin` or
 //! `span/needs_agent_processing` when `datadog_out`'s readiness gate
 //! (`logit_proto::datadog::trace_readiness`) would hold its trace chunk back; a span beside a
-//! log is a field of its event (below). A span pairs on its ids ([`span_key`]): its other fields
+//! log is a field of its event (below). A span pairs on its trace id's low 64 bits and its span
+//! id ([`span_key`]): its other fields
 //! are out of its comparison ([`SPAN_FIELD_KEYS`]), and it reaches a `span` field row for each,
 //! chosen from the input ([`span_rows`]): `name` or `name_structured`, `trace_id`,
 //! `parent_span_id` or `parent_unset`, `kind`, `status_error`, `status_ok`, or `status_unset`,
 //! `timestamp`, `end_timestamp` or `end_before_start`, a row for each of `status_message`,
 //! `flags`, `trace_state`, and the dropped counts it carries, and `events` and `links` with a row
-//! for each of their fields it carries. Its attributes reach `span_numeric`,
-//! `datadog_span_identity`, `datadog_span_marks`, or `datadog_carrier_span` ahead of the value
-//! rows, and its resource's Datadog tracer and Agent carriers `datadog_tracer_resource`. An event
+//! for each of their fields it carries: a span event's non-`Str` name `event_name_structured`,
+//! and an item attribute of a [`Nest`] that nest's row, out of `events` and `links`. Its
+//! attributes reach `span_numeric`, `datadog_span_identity`, `datadog_span_marks`, or
+//! `datadog_carrier_span` ahead of the value rows, and its resource's Datadog tracer and Agent
+//! carriers `datadog_tracer_headers` when only a tracer request header carries one, else
+//! `datadog_tracer_resource`. An event
 //! with no metric, log, or span is a record of kind `event` that reaches
 //! `event/string_only` when it carries a non-empty `_logit.influxdb.measurement`, else
 //! `event/attributes_only`, and its attribute rows. A record reaches an `attributes` field row for
@@ -2640,31 +2644,75 @@ enum SpanPart {
     Rest,
     /// One key of the item.
     Key(&'static str),
-    /// A span event's structured attributes: a `Map`, an `Array`, or `Bytes`
-    /// ([`nested_event_attributes`]).
-    Nested,
+    /// An item's attributes of one [`Nest`] ([`nest_attributes`]).
+    Nested(Nest),
+    /// A span event's name, where the input's isn't a string ([`structured_name`]).
+    Name,
 }
 
-/// The attribute keys of span event `item`, at `pointer` (`/events/0`), whose value is a `Map`,
-/// an `Array`, or `Bytes`.
-fn nested_event_attributes(
+/// An item attribute a span sink writes apart from the rest, judged on its own row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Nest {
+    /// A `Map` or an `Array`, on a span event only: a link's ride in `span/links`.
+    Structured,
+    Bytes,
+    U64,
+    Timestamp,
+}
+
+impl Nest {
+    /// The nests `list`'s `span/events` or `span/links` row leaves to their own rows.
+    fn of(list: &str) -> &'static [Nest] {
+        match list {
+            "events" => &[Nest::Structured, Nest::Bytes, Nest::U64, Nest::Timestamp],
+            _ => &[Nest::Bytes, Nest::U64, Nest::Timestamp],
+        }
+    }
+
+    /// The row a [`span_rows`] item attribute of this nest reaches.
+    fn row(self) -> &'static str {
+        match self {
+            Nest::Structured => "event_nested_attribute",
+            Nest::Bytes => "nested_bytes_attribute",
+            Nest::U64 => "nested_u64_attribute",
+            Nest::Timestamp => "nested_timestamp_attribute",
+        }
+    }
+}
+
+/// The attribute keys of span event or link `item`, at `pointer` (`/events/0`), whose value is
+/// of `nest`.
+fn nest_attributes(
     item: &Value,
     pointer: &str,
     types: &BTreeMap<String, String>,
+    nest: Nest,
 ) -> BTreeSet<String> {
     let attributes = item["attributes"].as_object().into_iter().flatten();
     attributes
         .filter(|(key, value)| {
             let at = format!("{pointer}/attributes/{}", key.replace('~', "~0").replace('/', "~1"));
-            value.is_object() || value.is_array() || types.get(&at).is_some_and(|t| t == "bytes")
+            let tag = types.get(&at).map(String::as_str);
+            match nest {
+                Nest::Structured => value.is_object() || value.is_array(),
+                Nest::Bytes => tag == Some("bytes"),
+                Nest::U64 => tag == Some("u64"),
+                Nest::Timestamp => tag == Some("timestamp"),
+            }
         })
         .map(|(key, _)| key.clone())
         .collect()
 }
 
+/// Whether span event `item`, at `pointer`, has a name that isn't a plain string.
+fn structured_name(item: &Value, pointer: &str, types: &BTreeMap<String, String>) -> bool {
+    !item["name"].is_string() || types.contains_key(&format!("{pointer}/name"))
+}
+
 /// `part` of each item of `rec`'s span list `list`, with the type tags under it; `None` when
-/// `rec` has no such list. The structured attributes [`SpanPart::Rest`] leaves out and
-/// [`SpanPart::Nested`] keeps are those of `input`'s item at the same index.
+/// `rec` has no such list. The attributes [`SpanPart::Rest`] leaves out and [`SpanPart::Nested`]
+/// keeps, and whether an event's name is [`SpanPart::Name`]'s, are read from `input`'s item at the
+/// same index.
 fn span_items(
     rec: &Rec,
     input: &Rec,
@@ -2675,17 +2723,26 @@ fn span_items(
     let mut projected = Vec::new();
     for (i, item) in items.iter().enumerate() {
         let pointer = format!("/{list}/{i}");
-        let nested = match input.body[list].get(i) {
-            Some(own) if list == "events" => nested_event_attributes(own, &pointer, &input.types),
-            _ => BTreeSet::new(),
+        let own = input.body[list].get(i);
+        let nested = |nests: &[Nest]| -> BTreeSet<String> {
+            let Some(own) = own else { return BTreeSet::new() };
+            nests.iter().flat_map(|&n| nest_attributes(own, &pointer, &input.types, n)).collect()
         };
+        let named =
+            list == "events" && own.is_some_and(|own| structured_name(own, &pointer, &input.types));
         let kept = match part {
             SpanPart::Key(key) => item.get(key).cloned().unwrap_or(Value::Null),
+            SpanPart::Name if named => item.get("name").cloned().unwrap_or(Value::Null),
+            SpanPart::Name => Value::Null,
             SpanPart::Rest => {
+                let nested = nested(Nest::of(list));
                 let mut item = item.clone();
                 if let Some(object) = item.as_object_mut() {
                     for key in span_sub_keys(list) {
                         object.remove(*key);
+                    }
+                    if named {
+                        object.remove("name");
                     }
                     if let Some(attributes) =
                         object.get_mut("attributes").and_then(Value::as_object_mut)
@@ -2698,9 +2755,9 @@ fn span_items(
                 }
                 item
             }
-            SpanPart::Nested => {
+            SpanPart::Nested(nest) => {
                 let attributes = item["attributes"].as_object();
-                let kept: Map<String, Value> = nested
+                let kept: Map<String, Value> = nested(&[nest])
                     .iter()
                     .filter_map(|key| Some((key.clone(), attributes?.get(key)?.clone())))
                     .collect();
@@ -2727,7 +2784,8 @@ fn span_items(
                     item["attributes"].get(&attribute).is_some()
                 }
                 SpanPart::Rest => item.get(&field).is_some(),
-                SpanPart::Nested => field == "attributes" && item.get(&attribute).is_some(),
+                SpanPart::Nested(_) => field == "attributes" && item.get(&attribute).is_some(),
+                SpanPart::Name => field == "name" && !item.is_null(),
             }
         })
         .map(|(pointer, tag)| (pointer.clone(), tag.clone()))
@@ -2787,12 +2845,13 @@ fn span_rows(rec: &Rec) -> Vec<(&'static str, Field)> {
     let events = items("events");
     if !events.is_empty() {
         rows.push(("events", Field::SpanItems { list: "events", part: SpanPart::Rest }));
-        let nested = events.iter().enumerate().any(|(i, item)| {
-            !nested_event_attributes(item, &format!("/events/{i}"), &rec.types).is_empty()
-        });
-        if nested {
-            let part = SpanPart::Nested;
-            rows.push(("event_nested_attribute", Field::SpanItems { list: "events", part }));
+        let named = events
+            .iter()
+            .enumerate()
+            .any(|(i, item)| structured_name(item, &format!("/events/{i}"), &rec.types));
+        if named {
+            let part = SpanPart::Name;
+            rows.push(("event_name_structured", Field::SpanItems { list: "events", part }));
         }
         if events.iter().any(|item| item.get("dropped_attributes_count").is_some()) {
             let part = SpanPart::Key("dropped_attributes_count");
@@ -2800,6 +2859,18 @@ fn span_rows(rec: &Rec) -> Vec<(&'static str, Field)> {
         }
     }
     let links = items("links");
+    // An attribute of each nest, on any event or link, reaches that nest's row once per list.
+    for (list, entries) in [("events", &events), ("links", &links)] {
+        for &nest in Nest::of(list) {
+            let carried = entries.iter().enumerate().any(|(i, item)| {
+                !nest_attributes(item, &format!("/{list}/{i}"), &rec.types, nest).is_empty()
+            });
+            if carried {
+                let part = SpanPart::Nested(nest);
+                rows.push((nest.row(), Field::SpanItems { list, part }));
+            }
+        }
+    }
     if !links.is_empty() {
         rows.push(("links", Field::SpanItems { list: "links", part: SpanPart::Rest }));
         for (feature, key) in [
@@ -3038,7 +3109,13 @@ fn field_rows_under(
     let tracer_resource = |key: &str| {
         let tracer =
             key.starts_with("_logit.datadog.tracer.") || key.starts_with("_logit.datadog.agent.");
-        (rec.kind == "span" && tracer).then_some("datadog_tracer_resource")
+        if rec.kind != "span" || !tracer {
+            None
+        } else if logit_proto::datadog::traces::is_tracer_header_only_attr(key) {
+            Some("datadog_tracer_headers")
+        } else {
+            Some("datadog_tracer_resource")
+        }
     };
     for (key, value) in &rec.attributes {
         let tags = rec.attribute_types.get(key).map(String::as_str).unwrap_or("");
@@ -3231,9 +3308,13 @@ fn observe_field(field: &Field, input: &Rec, out: &Rec, spelling: Spelling) -> C
             let Some(want) = span_items(input, input, list, *part) else { return Class::Exact };
             let Some(read) = span_items(out, input, list, *part) else { return Class::Lost };
             let absent = read.0.iter().all(Value::is_null);
+            // A structured event name the sink writes as `""` is gone, as `span/name_structured`'s.
+            let blank = read.0.iter().filter(|v| !v.is_null()).all(|v| v == "");
             if read == want {
                 Class::Exact
-            } else if matches!(part, SpanPart::Key(_)) && absent {
+            } else if matches!(part, SpanPart::Key(_)) && absent
+                || matches!(part, SpanPart::Name) && blank
+            {
                 Class::Lost
             } else {
                 Class::Normalized
@@ -4151,6 +4232,34 @@ mod tests {
                 "{row}"
             );
         }
+    }
+
+    /// A span event's `Bytes` attribute and structured name each land on their own row, so
+    /// `span/events` reads `exact` when only they changed, and a name read back `""` is `lost`.
+    #[test]
+    fn a_span_events_typed_attribute_and_structured_name_land_on_their_rows() {
+        let event = |name: &str, payload: &str, tag: &str| {
+            span_line(
+                5,
+                &format!(
+                    r#""name":"a","status":"unset","events":[{{"name":{name},"timestamp":"2027-01-15T08:00:00.001000000Z","attributes":{{"k":"v","payload":{payload}}}}}]"#
+                ),
+                tag,
+            )
+        };
+        let bytes = r#","types":{"/span/events/0/attributes/payload":"bytes"}"#;
+        let ins = recs(&[&event(r#"{"op":"retry"}"#, r#""b\"ok\"""#, bytes)]);
+        let outs = recs(&[&event(r#""""#, r#""b2s=""#, "")]);
+        let rows = row_names(&ins[0]);
+        for row in ["events", "event_name_structured", "nested_bytes_attribute"] {
+            assert!(rows.contains(&row), "{row} missing from {rows:?}");
+        }
+        let class = |row: &str| {
+            observe_field(&row_field(&ins[0], row), &ins[0], &outs[0], Spelling::Verbatim)
+        };
+        assert_eq!(class("events"), Class::Exact);
+        assert_eq!(class("event_name_structured"), Class::Lost);
+        assert_eq!(class("nested_bytes_attribute"), Class::Normalized);
     }
 
     /// A span reaches `span/alone` and, unless `datadog_out`'s gate would send it, the readiness

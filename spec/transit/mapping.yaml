@@ -3993,7 +3993,11 @@ rows:
         text: >-
           The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A
           `format: text` record writes no span (`span/alone`), so no field of one is compared.
-  # A `_logit.datadog.tracer.*` or `_logit.datadog.agent.*` resource attribute of a span's batch.
+  # A `_logit.datadog.tracer.*` or `_logit.datadog.agent.*` resource attribute of a span's batch:
+  # `datadog_tracer_resource` for one a `TracerPayload` or `AgentPayload` field carries,
+  # `datadog_tracer_headers` for one only a tracer request header carries (the interpreter and its
+  # vendor, the entity ID, the external environment, the two client-computed flags, and the two
+  # dropped P0 counts).
   - kind: attributes
     feature: datadog_tracer_resource
     cells:
@@ -4013,6 +4017,32 @@ rows:
         text: >-
           HEC has no field for a `TracerPayload`'s or an `AgentPayload`'s fields, and a `_logit.`
           carrier is private, so it's left off.
+      kafka_out:
+        class: exact
+        text: >-
+          The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A
+          `format: text` record writes no span (`span/alone`), so no field of one is compared.
+  - kind: attributes
+    feature: datadog_tracer_headers
+    cells:
+      otlp_out:
+        class: lost
+        reason: structural
+        text: >-
+          OTLP has no field for a tracer request header, and a `_logit.` carrier is private, so
+          it's left off.
+      datadog_out:
+        class: lost
+        counter: logit.output.spans.degraded{reason=no_wire_form}
+        text: >-
+          An `AgentPayload` has no field for a tracer request header and the intake takes no such
+          header, so the carrier is left off, counted once per request body.
+      splunk_hec_out:
+        class: lost
+        reason: structural
+        text: >-
+          HEC has no field for a tracer request header, and a `_logit.` carrier is private, so
+          it's left off.
       kafka_out:
         class: exact
         text: >-
@@ -5305,9 +5335,10 @@ rows:
       datadog_out:
         class: normalized
         reason: stringified
+        counter: logit.output.spans.degraded{reason=json_text}
         text: >-
-          A name that isn't a `Str` leaves as its text, JSON for a map or an array, read back as a
-          string.
+          A name that isn't a `Str` leaves as its text, read back as a string; a map or an array
+          is JSON text, counted.
       splunk_hec_out:
         class: normalized
         reason: stringified
@@ -5693,12 +5724,115 @@ rows:
         reason: json_text
         counter: logit.output.spans.degraded{reason=json_text}
         text: >-
-          A map attribute of a span event leaves as its JSON text, counted, and reads back as a
-          string; an array of scalars stays an array.
+          A map attribute of a span event, or an array holding anything but scalars, leaves as
+          its JSON text, counted, and reads back as a string; an array of scalars stays an array.
       splunk_hec_out:
         class: exact
         text: >-
           A map or array attribute of a span event, nesting kept.
+      kafka_out:
+        class: exact
+        text: >-
+          The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A
+          `format: text` record writes no span (`span/alone`), so no field of one is compared.
+  - kind: span
+    feature: event_name_structured
+    cells:
+      otlp_out:
+        class: lost
+        reason: uncounted
+        text: >-
+          OTLP's span event `name` is a string, and a name that isn't a `Str` leaves as `""`,
+          uncounted.
+      datadog_out:
+        class: normalized
+        reason: stringified
+        counter: logit.output.spans.degraded{reason=json_text}
+        text: >-
+          A name that isn't a `Str` leaves as its text, read back as a string; a map or an array
+          is JSON text, counted.
+      splunk_hec_out:
+        class: normalized
+        reason: stringified
+        text: >-
+          A name that isn't a `Str` leaves as its text, JSON for a map or an array, read back as a
+          string.
+      kafka_out:
+        class: exact
+        text: >-
+          The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A
+          `format: text` record writes no span (`span/alone`), so no field of one is compared.
+  - kind: span
+    feature: nested_bytes_attribute
+    cells:
+      otlp_out:
+        class: exact
+        text: A `bytesValue` attribute of a span event or link.
+      datadog_out:
+        class: normalized
+        reason: stringified
+        text: >-
+          A `Bytes` attribute of a span event or link leaves as its lossy UTF-8 text, read back as
+          a string.
+      splunk_hec_out:
+        class: normalized
+        reason: stringified
+        text: >-
+          A `Bytes` attribute of a span event or link leaves as a base64 string, read back as the
+          string.
+      kafka_out:
+        class: exact
+        text: >-
+          The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A
+          `format: text` record writes no span (`span/alone`), so no field of one is compared.
+  - kind: span
+    feature: nested_u64_attribute
+    cells:
+      otlp_out:
+        class: normalized
+        reason: u64_as_int
+        text: >-
+          A `u64` attribute of a span event or link reads back as an `i64`, or, above `i64::MAX`,
+          as a double, approximate beyond 2^53 and uncounted.
+      datadog_out:
+        class: normalized
+        reason: u64_as_int
+        counter: logit.output.spans.degraded{reason=int_as_f64}
+        text: >-
+          A `u64` attribute of a span event reads back as an `i64`, or, above `i64::MAX`, as a
+          double, counted; on a link it leaves as its decimal text, read back as a string.
+      splunk_hec_out:
+        class: normalized
+        reason: u64_as_int
+        text: >-
+          A JSON number in the span event's or link's `attributes`, read back as an `i64`, or,
+          above `i64::MAX`, as the `u64` itself.
+      kafka_out:
+        class: exact
+        text: >-
+          The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A
+          `format: text` record writes no span (`span/alone`), so no field of one is compared.
+  - kind: span
+    feature: nested_timestamp_attribute
+    cells:
+      otlp_out:
+        class: normalized
+        reason: timestamp_as_int
+        text: >-
+          A timestamp attribute of a span event or link leaves as an `intValue` of Unix
+          nanoseconds, read back as an `i64`.
+      datadog_out:
+        class: normalized
+        reason: stringified
+        text: >-
+          A timestamp attribute of a span event or link leaves as RFC 3339 text, read back as a
+          string.
+      splunk_hec_out:
+        class: normalized
+        reason: stringified
+        text: >-
+          A timestamp attribute of a span event or link leaves as an RFC 3339 string, read back
+          as the string.
       kafka_out:
         class: exact
         text: >-

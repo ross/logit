@@ -375,7 +375,9 @@ that in, and settles these:
    `span_numeric`, `datadog_span_identity`, `datadog_span_marks`, `datadog_carrier_span`, and
    `datadog_tracer_resource`. Other span attributes reach the value-type rows.
    `datadog_tracer_resource`'s cells split by key group, since `datadog_trace_out` writes the
-   tracer API's forms only: its Agent carriers are `lost`, counted, under both versions.
+   tracer API's forms only: its Agent carriers are `lost`, counted, under both versions. The
+   tracer carriers only a request header carries split out as `datadog_tracer_headers`, since
+   `datadog_out` loses them, counted, where it writes every other tracer carrier.
 7. **`Spelling::derived` grows a `datadog_trace_out` entry**: `span_kind` and `trace_id_high`,
    as `datadog_out` derives them, and, under `version: v0.4`, the resource fields it writes into
    every span's `meta`. It derives no `no_host`, since it leaves `hostname` empty for the Agent

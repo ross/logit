@@ -142,6 +142,7 @@
 //! | `attributes/datadog_span_marks` | exact | -- | An ordinary span attribute: Datadog's internal mark leaves as an OTel attribute. |
 //! | `attributes/datadog_carrier_span` | lost | structural | OTLP has no field for a Datadog trace chunk's fields or a span's raw `error`, and a `_logit.` carrier is private, so it's left off. |
 //! | `attributes/datadog_tracer_resource` | lost | structural | OTLP has no field for a `TracerPayload`'s or an `AgentPayload`'s fields, and a `_logit.` carrier is private, so it's left off. |
+//! | `attributes/datadog_tracer_headers` | lost | structural | OTLP has no field for a tracer request header, and a `_logit.` carrier is private, so it's left off. |
 //! | `attributes/syslog_header` | normalized | `u64_as_int` | A string or integer attribute; `intValue` is signed, so a `u64` `syslog.facility` or `process.pid` reads back as an `i64`. |
 //! | `attributes/syslog_msgid` | exact | -- | A string attribute. |
 //! | `attributes/syslog_sd` | exact | -- | A key-value list attribute. |
@@ -189,6 +190,10 @@
 //! | `span/dropped_links_count` | exact | -- | The span's `dropped_links_count`. |
 //! | `span/events` | exact | -- | Each span event's time, name, and attributes. |
 //! | `span/event_nested_attribute` | exact | -- | A key-value list or array attribute of a span event, as OTLP writes any attribute. |
+//! | `span/event_name_structured` | lost | uncounted | OTLP's span event `name` is a string, and a name that isn't a `Str` leaves as `""`, uncounted. |
+//! | `span/nested_bytes_attribute` | exact | -- | A `bytesValue` attribute of a span event or link. |
+//! | `span/nested_u64_attribute` | normalized | `u64_as_int` | A `u64` attribute of a span event or link reads back as an `i64`, or, above `i64::MAX`, as a double, approximate beyond 2^53 and uncounted. |
+//! | `span/nested_timestamp_attribute` | normalized | `timestamp_as_int` | A timestamp attribute of a span event or link leaves as an `intValue` of Unix nanoseconds, read back as an `i64`. |
 //! | `span/event_dropped_count` | exact | -- | A span event's `dropped_attributes_count`. |
 //! | `span/links` | exact | -- | Each link's ids and attributes. |
 //! | `span/link_flags` | exact | -- | A link's `flags`. |

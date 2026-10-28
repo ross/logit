@@ -290,6 +290,7 @@
 //! | `attributes/datadog_span_marks` | exact | -- | A `metrics` entry for a number and a `meta` entry for a string, read back as the attribute. |
 //! | `attributes/datadog_carrier_span` | exact | -- | The chunk's `priority`, `origin`, `droppedTrace`, or `tags`, or the span's `error`, read back into the carrier. |
 //! | `attributes/datadog_tracer_resource` | exact | -- | The `TracerPayload`'s or `AgentPayload`'s field, read back into the carrier. |
+//! | `attributes/datadog_tracer_headers` | lost | `logit.output.spans.degraded{reason=no_wire_form}` | An `AgentPayload` has no field for a tracer request header and the intake takes no such header, so the carrier is left off, counted once per request body. |
 //! | `attributes/syslog_header` | normalized | `u64_as_int` | A top-level key of the log object; a `u64` `syslog.facility` or `process.pid` is a JSON number, which datadog_in reads back as an `i64`. |
 //! | `attributes/syslog_msgid` | exact | -- | A top-level key of the log object. |
 //! | `attributes/syslog_sd` | exact | -- | A JSON object in the log object, read back as itself. |
@@ -318,7 +319,7 @@
 //! | `log/receipt_timestamp` | normalized | `milliseconds` | The `timestamp` field, in Unix milliseconds, the time the log was received. |
 //! | `log/beside_metrics` | exact | -- | The log goes to the logs route, the metrics to theirs, and each reads back as its own event. |
 //! | `span/name` | exact | -- | The span's `name`. |
-//! | `span/name_structured` | normalized | `stringified` | A name that isn't a `Str` leaves as its text, JSON for a map or an array, read back as a string. |
+//! | `span/name_structured` | normalized | `stringified`; `logit.output.spans.degraded{reason=json_text}` | A name that isn't a `Str` leaves as its text, read back as a string; a map or an array is JSON text, counted. |
 //! | `span/trace_id` | exact | -- | The low 64 bits as the span's `trace_id` and the high half as `_dd.p.tid` on the chunk's first span, which datadog_in restores on every span of the chunk. |
 //! | `span/parent_span_id` | exact | -- | The span's `parent_id`. |
 //! | `span/parent_unset` | exact | -- | `parent_id` 0, read back as no parent. |
@@ -336,7 +337,11 @@
 //! | `span/dropped_events_count` | lost | `logit.output.spans.degraded{reason=no_wire_form}` | Datadog has no field for a dropped-event count, so it's left off, counted once per field. |
 //! | `span/dropped_links_count` | lost | `logit.output.spans.degraded{reason=no_wire_form}` | Datadog has no field for a dropped-link count, so it's left off, counted once per field. |
 //! | `span/events` | exact | -- | Each span event's time, name, and scalar attributes as the span's `span_events`. |
-//! | `span/event_nested_attribute` | normalized | `json_text`; `logit.output.spans.degraded{reason=json_text}` | A map attribute of a span event leaves as its JSON text, counted, and reads back as a string; an array of scalars stays an array. |
+//! | `span/event_nested_attribute` | normalized | `json_text`; `logit.output.spans.degraded{reason=json_text}` | A map attribute of a span event, or an array holding anything but scalars, leaves as its JSON text, counted, and reads back as a string; an array of scalars stays an array. |
+//! | `span/event_name_structured` | normalized | `stringified`; `logit.output.spans.degraded{reason=json_text}` | A name that isn't a `Str` leaves as its text, read back as a string; a map or an array is JSON text, counted. |
+//! | `span/nested_bytes_attribute` | normalized | `stringified` | A `Bytes` attribute of a span event or link leaves as its lossy UTF-8 text, read back as a string. |
+//! | `span/nested_u64_attribute` | normalized | `u64_as_int`; `logit.output.spans.degraded{reason=int_as_f64}` | A `u64` attribute of a span event reads back as an `i64`, or, above `i64::MAX`, as a double, counted; on a link it leaves as its decimal text, read back as a string. |
+//! | `span/nested_timestamp_attribute` | normalized | `stringified` | A timestamp attribute of a span event or link leaves as RFC 3339 text, read back as a string. |
 //! | `span/event_dropped_count` | lost | `logit.output.spans.degraded{reason=no_wire_form}` | Datadog has no field for a span event's dropped-attribute count, so it's left off, counted once per field. |
 //! | `span/links` | normalized | `stringified`; `logit.output.spans.degraded{reason=json_text}` | Each link's ids, and its attributes as strings, as the span's `span_links`, read back as string attributes; a map or array attribute is JSON text, counted. |
 //! | `span/link_flags` | exact | -- | A span link's `flags`. |

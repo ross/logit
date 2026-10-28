@@ -744,6 +744,10 @@ shows:
    | `dropped_links_count` | field | A nonzero dropped-link count. |
    | `events` | field | The span's events. |
    | `event_nested_attribute` | field | A span event attribute holding a `Map` or `Array`. |
+   | `event_name_structured` | field | A span event whose name isn't a `Str`. |
+   | `nested_bytes_attribute` | field | A `Bytes` attribute on a span event or link. |
+   | `nested_u64_attribute` | field | A `U64` attribute on a span event or link. |
+   | `nested_timestamp_attribute` | field | A `Timestamp` attribute on a span event or link. |
    | `event_dropped_count` | field | A nonzero dropped-attribute count on a span event. |
    | `links` | field | The span's links. |
    | `link_flags` | field | Nonzero flags on a link. |
@@ -805,6 +809,9 @@ shows:
        `lost`, counted the same way, under both `datadog_trace_out` versions, since that sink
        encodes the tracer API's forms only.
      - Both groups are `lost`, `structural`, at the OTel sinks.
+     - The tracer carriers only a request header carries (`resource_carriers_lost`'s
+       `header_only`) have their own row, `attributes/datadog_tracer_headers`, `lost`, counted
+       `no_wire_form`, at `datadog_out`, since an `AgentPayload` has no field for them.
 
    Other span attributes reach the value-type rows. `attributes/span_kind` and
    `attributes/trace_id_high`, derived at `datadog_out`, stay as they are.

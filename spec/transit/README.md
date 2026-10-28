@@ -124,7 +124,9 @@ is one nothing checks: add a case or a flow that reaches it.
   (`beside_metrics`) or a span beside a log (`span/beside_log`), each a field of its event, every
   `span` row for a span's own fields (`name`, `trace_id`, `kind`, its status, its timestamps,
   `flags`, `trace_state`, its dropped counts, its events, and its links, with an `_unset` row for
-  an absent parent or status), and a field of any log, beside metrics or
+  an absent parent or status, and a row for a span event's non-`Str` name and for each `Map` or
+  `Array` event attribute and `Bytes`, `U64`, or `Timestamp` event or link attribute), and a
+  field of any log, beside metrics or
   not (`severity`, `body_format`, `event_name`, `observed_timestamp`, `trace`, `trace_flags`,
   `dropped_attributes_count`, and `timestamp`, or `receipt_timestamp` for a log carrying
   `syslog.timestamp`; a trace's ids and flags reach `trace_beside_id_attribute` instead on a log
@@ -137,8 +139,8 @@ is one nothing checks: add a case or a flow that reaches it.
   `syslog_out`'s `structured_data:` on RFC 5424, a log's attribute outside the header fields
   reads back nested, as the PARAM of its key in `syslog.sd`'s element under the configured
   SD-ID, holding its PARAM-VALUE text; its row reads that `normalized`. A span pairs on its
-  trace and span ids alone, so a span read back with another status still pairs and the
-  difference lands on its status row. A span's field rows have cells only at the span sinks
+  trace id's low 64 bits and its span id alone, so a span read back with another status still
+  pairs and the difference lands on its status row. A span's field rows have cells only at the span sinks
   (`otlp_out`, `datadog_out`, `splunk_hec_out`, and `kafka_out`), since every other sink skips a
   span alone or leaves it off beside another signal.
 
@@ -186,9 +188,12 @@ counter would add anything
 "structural loss has no counter"). A loss that depends on the value, such as `false` or a
 rewritten name, is counted. The table's schema accepts `reason: uncounted` only on the cells
 `crates/logit-cli/src/transit/mapping.rs`'s `UNCOUNTED_ALLOWED` names, whose doc says which rule
-each follows. Two of its three follow the same ADR's amendment "an ignored signal, and a format
-the config selects": a sink ignores a signal it has no wire for, such as a log beside metrics,
-uncounted, at any sink. Under that amendment too, `syslog_out`'s leave-off of every attribute
+each follows. It has six entries. Three follow the same ADR's amendment "an ignored signal, and a
+format the config selects": a sink ignores a signal it has no wire for, such as a log beside
+metrics, uncounted, at any sink. Two are a sink finding: `otlp_out` writes a span name or a span
+event name that isn't a `Str` as `""` (`span/name_structured`, `span/event_name_structured`).
+One is a `_logit.datadog.*` carrier `datadog_out`'s log, event, and service-check routes have no
+field for. Under that amendment too, `syslog_out`'s leave-off of every attribute
 outside its header fields, under RFC 3164 and under RFC 5424 with no `structured_data:`, is
 `structural`: the format the config selected has no slot for it.
 When a sink's behavior depends on its config, the sink's entry is a list: each cell but the last
