@@ -150,7 +150,7 @@
 //! | `log/dropped_attributes_count` | exact | -- | The `LogRecord`'s `dropped_attributes_count`. |
 //! | `log/timestamp` | exact | -- | The `LogRecord`'s `time_unix_nano`. |
 //! | `log/receipt_timestamp` | exact | -- | The `LogRecord`'s `time_unix_nano`, the time the log was received. |
-//! | `log/beside_metrics` | exact | -- | An OTLP log record in the logs request, beside the metrics in theirs, with an observed time stamped when it has none. |
+//! | `log/beside_metrics` | exact | -- | An OTLP log record in the logs request, beside the metrics in theirs. |
 //! | `span/beside_metrics` | exact | -- | An OTLP span in the traces request, beside the metrics in theirs. |
 //!
 //! <!-- transit:end -->

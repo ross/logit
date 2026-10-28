@@ -292,7 +292,7 @@
 //! | `log/event_name` | lost | structural | A Datadog log has no event name, so none is written. |
 //! | `log/observed_timestamp` | lost | structural | A Datadog log has no observed time, so none is written. |
 //! | `log/observed_timestamp_unset` | exact | -- | No observed time is written, and none reads back. |
-//! | `log/trace` | normalized | `trace_as_attributes` | The ids leave as hex `trace_id` and `span_id` keys, which Datadog's log intake reads for trace correlation and datadog_in reads back as attributes, not as the log's trace; neither is written when the log carries an attribute of either name. |
+//! | `log/trace` | normalized | `trace_as_attributes` | The ids leave as hex `trace_id` and `span_id` keys, which Datadog's log intake reads for trace correlation and datadog_in reads back as attributes, not as the log's trace. |
 //! | `log/trace_unset` | exact | -- | No trace ids are written, and none read back. |
 //! | `log/trace_flags` | lost | structural | A Datadog log has no trace flags, so none are written. |
 //! | `log/dropped_attributes_count` | lost | structural | A Datadog log has no dropped-attribute count, so none is written. |
