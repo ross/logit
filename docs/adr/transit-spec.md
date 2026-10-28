@@ -272,8 +272,12 @@ have one case. The `tlog` stream fills that in, and settles these:
    wire has no slot, and `lost, uncounted` under RFC 5424 without `structured_data:`, where the
    slot exists and the loss is real. The missing counter is a sink finding.
 9. **`UNCOUNTED_ALLOWED` narrows** for logs to `log/beside_metrics` and `syslog_out`'s
-   value-type rows. Every other uncounted loss of a log field is a format with no slot and reads
-   `lost, structural`. The `span` entry stays until spans are classified.
+   attribute rows: the value-type rows and the host and service-key rows
+   (`host_beside_host_name`, `hostname`, `log_service`, `log_service_field`, `container_id`,
+   `service_identity`, `service_tag`, and `service_tag_beside_key`). `syslog_out` leaves every
+   attribute outside its header fields off by one mechanism, so the allowance follows that
+   mechanism, not the value type. Every other uncounted loss of a log field is a format with no
+   slot and reads `lost, structural`. The `span` entry stays until spans are classified.
 10. **Log cases live in log-only directories** (`cases/otlp-logs/`, `cases/datadog-logs/`,
     `cases/syslog/`, `cases/splunk/`), so a log flow never routes a metric case into a sink with
     no metric cells. `decode_wire` picks a decoder by the directory name's prefix before `-`.

@@ -432,8 +432,12 @@ pair's decoder. The four metric sinks keep their log cells.
 `syslog_out` writes no attribute outside its header and private carriers, uncounted, unless
 `structured_data:` is set under RFC 5424. Under `when: {format: rfc3164}` the wire has no slot,
 so those cells are `lost, structural`. Otherwise the slot exists and the config didn't opt in,
-so the loss is real: the cells are `lost, uncounted`, with narrow `UNCOUNTED_ALLOWED` entries
-per value-type row at `syslog_out`, and the missing counter is a sink finding. The
+so the loss is real: the cells are `lost, uncounted`, with narrow `UNCOUNTED_ALLOWED` entries at
+`syslog_out` for each attribute row, the value-type rows and the host and service-key rows
+(`host_beside_host_name`, `hostname`, `log_service`, `log_service_field`, `container_id`,
+`service_identity`, `service_tag`, and `service_tag_beside_key`), and the missing counter is a
+sink finding. One mechanism leaves every attribute outside the header fields off, so the
+allowance follows the mechanism, not the value type. The
 `structured_data:` opt-in is its own PR after W2, since attributes come back nested in
 `syslog.sd` and need a nested-key spelling.
 
@@ -1070,10 +1074,11 @@ Recorded per workstream as each lands.
   - Every public attribute outside the header fields is left off, uncounted, with no
     `structured_data:`: the value-type rows and the host- and service-key rows each have a
     `syslog_out` entry in `UNCOUNTED_ALLOWED`.
-  - A `syslog.timestamp` the encoder can't render under its format, an RFC 3164 string under RFC
-    5424 or a null under RFC 3164, gives way to `event.timestamp` (`attributes/syslog_timestamp`,
-    `lost`); where it renders, the log's own receipt time has no slot (`log/receipt_timestamp`,
-    `lost`).
+  - A `syslog.timestamp` the encoder can't render under its format gives way to
+    `event.timestamp` (`attributes/syslog_timestamp`, `lost`). Under RFC 5424 a typed timestamp
+    or a null is written and any string falls back; under RFC 3164 a typed timestamp or an RFC
+    3164-shaped string is written and anything else falls back. Where it renders, the log's own
+    receipt time has no slot (`log/receipt_timestamp`, `lost`).
   - A log's metrics and a span beside it are left off, uncounted (`log/beside_metrics`,
     `span/alone`). `syslog_out` has no metric-kind cells, so the `otlp-logs` `beside-metrics`
     case's gauge reaches `gauge/i64` unspecified there.

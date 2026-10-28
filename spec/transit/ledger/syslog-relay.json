@@ -2,7 +2,7 @@
   "cells": [
     {"sink":"syslog_out","row":"attributes/host_name","cell":1,"observed":["exact"]},
     {"sink":"syslog_out","row":"attributes/log_status","cell":0,"observed":["exact"]},
-    {"sink":"syslog_out","row":"attributes/no_host","cell":0,"observed":["normalized"]},
+    {"sink":"syslog_out","row":"attributes/no_host","cell":1,"observed":["normalized"]},
     {"sink":"syslog_out","row":"attributes/severity_carrier_syslog","cell":0,"observed":["exact"]},
     {"sink":"syslog_out","row":"attributes/syslog_header","cell":1,"observed":["exact"]},
     {"sink":"syslog_out","row":"attributes/syslog_msgid","cell":1,"observed":["exact"]},
