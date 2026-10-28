@@ -17,7 +17,8 @@
     {"timestamp":"2027-01-15T08:00:00.006000000Z","log":{"format":"raw","message":"[\"checkout\",7]"}},
     {"timestamp":"2027-01-15T08:00:00.007000000Z","log":{"format":"raw","message":""}},
     {"timestamp":"2027-01-15T08:00:00.008000000Z","log":{"format":"raw","message":""}},
-    {"timestamp":"2027-01-15T08:00:00.009000000Z","log":{"format":"raw","message":"{\"level\":\"info\",\"msg\":\"started\"}"}}
+    {"timestamp":"2027-01-15T08:00:00.009000000Z","log":{"format":"raw","message":"{\"level\":\"info\",\"msg\":\"started\"}"}},
+    {"timestamp":"2027-01-15T08:00:00.010000000Z","log":{"format":"raw","message":"abc"}}
   ], "counters": {}},
   "fields": {"events": [
     {"timestamp":"2027-01-15T08:00:03.000000000Z","log":{"format":"raw","message":"<13>Jan 15 07:59:59 host app: relayed"}},

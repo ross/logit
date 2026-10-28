@@ -21,7 +21,7 @@
     {"sink":"kafka_out","row":"log/beside_metrics","cell":0,"observed":["exact"]},
     {"sink":"kafka_out","row":"log/blank_message","cell":0,"observed":["exact","normalized"]},
     {"sink":"kafka_out","row":"log/body_format","cell":0,"observed":["exact","lost"]},
-    {"sink":"kafka_out","row":"log/bytes_message","cell":0,"observed":["exact"]},
+    {"sink":"kafka_out","row":"log/bytes_message","cell":0,"observed":["exact","normalized"]},
     {"sink":"kafka_out","row":"log/dropped_attributes_count","cell":0,"observed":["lost"]},
     {"sink":"kafka_out","row":"log/event_name","cell":0,"observed":["lost"]},
     {"sink":"kafka_out","row":"log/message_unsafe","cell":0,"observed":["normalized"]},

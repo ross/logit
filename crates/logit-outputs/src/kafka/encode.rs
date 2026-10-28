@@ -102,7 +102,7 @@
 //! | `log/message_unsafe` | normalized | `message_as_text` | Under `format: text`, a message that isn't a string leaves as its text: a number or a boolean as its decimal or `true`/`false`, a timestamp as RFC 3339, no message as an empty record, and a map or array as its JSON text; each reads back as a string. `format: json` writes the message as it is. |
 //! | `log/structured_message`, under `format: text` | normalized | `message_as_text` | A `Map` or `Array` message leaves as its JSON text, which reads back as a string. |
 //! | `log/structured_message`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
-//! | `log/bytes_message`, under `format: text` | exact | -- | A `Bytes` message leaves as its raw bytes, the record's value, which carries no type: a consumer that reads values as text sees a UTF-8 one as a string. |
+//! | `log/bytes_message`, under `format: text` | normalized | `message_as_text` | A `Bytes` message leaves as its raw bytes, the record's value, which carries no type, so a consumer that reads values as text sees a UTF-8 one as a string. |
 //! | `log/bytes_message`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
 //! | `log/blank_message`, under `format: text` | normalized | `message_as_text` | An empty message leaves an empty record, and a log with no message one too, which reads back as the empty string. |
 //! | `log/blank_message`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |

@@ -22,7 +22,8 @@
     {"timestamp":"2027-01-15T08:00:00.006000000Z","log":{"severity":"info","format":"raw","message":"[\"checkout\",7]"},"attributes":{"body":"array","host.name":"transit","status":"info"}},
     {"timestamp":"2027-01-15T08:00:00.007000000Z","log":{"severity":"info","format":"raw","message":"null"},"attributes":{"body":"null","host.name":"transit","status":"info"}},
     {"timestamp":"2027-01-15T08:00:00.008000000Z","log":{"severity":"info","format":"raw","message":""},"attributes":{"body":"empty","host.name":"transit","status":"info"}},
-    {"timestamp":"2027-01-15T08:00:00.009000000Z","log":{"severity":"info","format":"raw","message":"{\"level\":\"info\",\"msg\":\"started\"}"},"attributes":{"body":"json_text","host.name":"transit","status":"info"}}
+    {"timestamp":"2027-01-15T08:00:00.009000000Z","log":{"severity":"info","format":"raw","message":"{\"level\":\"info\",\"msg\":\"started\"}"},"attributes":{"body":"json_text","host.name":"transit","status":"info"}},
+    {"timestamp":"2027-01-15T08:00:00.010000000Z","log":{"severity":"info","format":"raw","message":"abc"},"attributes":{"body":"bytes_utf8","host.name":"transit","status":"info"}}
   ], "counters": {}},
   "fields": {"events": [
     {"timestamp":"2027-01-15T08:00:03.000000000Z","log":{"severity":"info","format":"raw","message":"<13>Jan 15 07:59:59 host app: relayed"},"attributes":{"host.name":"transit","service.name":"checkout","status":"info","syslog.timestamp":"2027-01-15T07:59:59.000000000Z"}},

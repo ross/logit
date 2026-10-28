@@ -1727,12 +1727,43 @@ mod tests {
             "  - {kind: samples, cells: {statsd_out: {class: exact, text: t}}}\n",
             "  - {kind: record, feature: unit, cells: {statsd_out: {class: lost, \
              reason: structural, text: t}}}\n",
-            "  - {kind: log, feature: plain, cells: {statsd_out: {class: skipped, \
-             reason: uncounted, text: t}}}\n",
             "  - {kind: samples, cells: {statsd_out: {class: degraded, reason: structural, \
              text: t}}}\n",
         ] {
             assert!(mapping::parse(&table(rows)).is_ok(), "{rows}");
+        }
+    }
+
+    /// A log cell may be `uncounted` only where the allowance names it: beside metrics at any
+    /// sink, and a trace beside an id attribute at `datadog_out` and `splunk_hec_out`.
+    #[test]
+    fn an_uncounted_log_cell_needs_its_own_allowance() {
+        let table = |row: &str| {
+            format!(
+                "classes: {{exact: a, normalized: b, degraded: c, lost: d, skipped: e, dropped: f}}\n\
+                 sinks: [statsd_out, datadog_out, syslog_out, splunk_hec_out]\nrows:\n  - {row}\n"
+            )
+        };
+        let cell = |sink: &str, class: &str| {
+            format!("{{{sink}: {{class: {class}, reason: uncounted, text: t}}}}")
+        };
+        for (feature, sink, class) in [
+            ("plain", "statsd_out", "skipped"),
+            ("dogstatsd_event", "syslog_out", "skipped"),
+            ("trace", "datadog_out", "lost"),
+            ("trace_beside_id_attribute", "syslog_out", "lost"),
+        ] {
+            let row = format!("{{kind: log, feature: {feature}, cells: {}}}", cell(sink, class));
+            let err = mapping::parse(&table(&row)).expect_err(&row);
+            assert!(format!("{err:#}").contains("an uncounted loss is counted"), "{row}: {err:#}");
+        }
+        for (feature, sink, class) in [
+            ("beside_metrics", "statsd_out", "lost"),
+            ("trace_beside_id_attribute", "datadog_out", "lost"),
+            ("trace_beside_id_attribute", "splunk_hec_out", "lost"),
+        ] {
+            let row = format!("{{kind: log, feature: {feature}, cells: {}}}", cell(sink, class));
+            assert!(mapping::parse(&table(&row)).is_ok(), "{row}");
         }
     }
 }

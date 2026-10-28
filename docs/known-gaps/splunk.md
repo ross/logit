@@ -131,7 +131,10 @@ Entry format and the other areas: [the known-gaps index](README.md).
   or none, becomes its trace with flags `0`, each consumed. A log from another protocol carrying
   one of those keys as an ordinary attribute, a JSON log's own `trace_id` field or a Datadog
   log's, comes back without it. The transit spec reads it on `attributes/string_value` and
-  `log/trace_unset` (`normalized`, `log_fields`).
+  `log/trace_unset` (`normalized`, `log_fields`). The other way, a log that has its own trace and
+  a `trace_id` or `span_id` attribute leaves with the attribute only: the encoder writes the
+  trace's ids only when neither attribute is present, and leaves them off uncounted
+  (`log/trace_beside_id_attribute`).
   - **Consequence:** downstream of a `splunk_hec_out` to `splunk_hec_in` hop, such a log
     carries a trace or an event name and not the attribute: `otlp_out` writes it as the
     `LogRecord`'s `trace_id`, `span_id`, or `event_name`, and `syslog_out` leaves it off.

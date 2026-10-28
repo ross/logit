@@ -15,7 +15,8 @@
     {"timestamp":"2027-01-15T08:00:00.006000000Z","log":{"severity":"info","format":"structured","message":["checkout",7]},"attributes":{"body":"array"}},
     {"timestamp":"2027-01-15T08:00:00.007000000Z","log":{"severity":"info","format":"raw","message":null},"attributes":{"body":"null"}},
     {"timestamp":"2027-01-15T08:00:00.008000000Z","log":{"severity":"info","format":"raw","message":""},"attributes":{"body":"empty"}},
-    {"timestamp":"2027-01-15T08:00:00.009000000Z","log":{"severity":"info","format":"json","message":"{\"level\":\"info\",\"msg\":\"started\"}"},"attributes":{"body":"json_text"}}
+    {"timestamp":"2027-01-15T08:00:00.009000000Z","log":{"severity":"info","format":"json","message":"{\"level\":\"info\",\"msg\":\"started\"}"},"attributes":{"body":"json_text"}},
+    {"timestamp":"2027-01-15T08:00:00.010000000Z","log":{"severity":"info","format":"raw","message":"b\"abc\""},"attributes":{"body":"bytes_utf8"},"types":{"/log/message":"bytes"}}
   ], "counters": {}},
   "fields": {"events": [
     {"timestamp":"2027-01-15T08:00:03.000000000Z","log":{"severity":"info","format":"raw","message":"observed later","observed_timestamp":"2027-01-15T08:00:03.250000000Z","dropped_attributes_count":2},"attributes":{"big":18446744073709551615,"flag":true,"labels":["a",1],"nested":{"k":"v"},"raw":"b\"caf\\xe9\"","seen":"2027-01-15T07:59:00.000000000Z"},"resource":{"attributes":{"service.name":"checkout"},"schema_url":"https://opentelemetry.io/schemas/1.40.0"},"scope":{"name":"checkout.logger","version":"1.2.0","schema_url":"https://opentelemetry.io/schemas/1.40.0"},"types":{"/attributes/big":"u64","/attributes/raw":"bytes","/attributes/seen":"timestamp"}},

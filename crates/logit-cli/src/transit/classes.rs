@@ -4827,6 +4827,36 @@ mod tests {
         );
     }
 
+    /// A `kafka_out` `format: text` record reads back as the log's body alone, so the log pairs
+    /// on its message with its severity, trace, and every attribute gone, and a read-back with
+    /// another message doesn't pair; another timestamp lands on `log/timestamp`. A UTF-8 `Bytes`
+    /// message pairs respelled with the string it reads back as.
+    #[test]
+    fn kafka_text_pairs_a_log_on_its_message_alone() {
+        let ins = recs(&[&log_line(
+            r#""severity":"warn","format":"raw","message":"m","trace_id":"0102030405060708090a0b0c0d0e0f10""#,
+            r#"{"host.name":"h","k":"v","_logit.statsd.cardinality":"low"}"#,
+        )]);
+        let body = recs(&[&log_line(r#""format":"raw","message":"m""#, "{}")]);
+        let other = recs(&[&log_line(r#""format":"raw","message":"n""#, "{}")]);
+        let later = recs(&[
+            r#"{"timestamp":"2027-01-15T08:00:01.000000000Z","log":{"format":"raw","message":"m"}}"#,
+        ]);
+        assert_eq!(pair(&ins, &body, Spelling::KafkaText).seen, [Some(Class::Exact)]);
+        assert_eq!(pair(&ins, &other, Spelling::KafkaText).seen, [None]);
+        assert_eq!(pair(&ins, &later, Spelling::KafkaText).seen, [Some(Class::Exact)]);
+        let at = |out: &Rec| log_field(&ins[0], out, "statsd", "timestamp", Spelling::KafkaText);
+        assert_eq!(at(&body[0]), Class::Exact);
+        assert_eq!(at(&later[0]), Class::Normalized);
+
+        let bytes = recs(&[
+            r#"{{T},"log":{"format":"raw","message":"b\"abc\""},"attributes":{"k":"v"},"types":{"/log/message":"bytes"}}"#,
+        ]);
+        let text = recs(&[&log_line(r#""format":"raw","message":"abc""#, "{}")]);
+        assert_eq!(pair(&bytes, &text, Spelling::KafkaText).seen, [Some(Class::Normalized)]);
+        assert_eq!(pair(&bytes, &text, Spelling::Verbatim).seen, [None]);
+    }
+
     const SYSLOG_5424: Spelling =
         Spelling::Syslog { rfc3164: false, facility: 16, structured_data: None };
     const SYSLOG_3164: Spelling =

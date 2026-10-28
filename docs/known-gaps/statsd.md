@@ -67,6 +67,17 @@ Entry format and the other areas: [the known-gaps index](README.md).
 
   Tracked as debt against [ADR `lossless-transit`](../adr/lossless-transit.md)'s "Residual debt".
 
+- **A span beside a DogStatsD event is left off uncounted.** `statsd_out` writes an event that
+  carries no metrics only when its log is a DogStatsD event (`_logit.statsd.event.title`), as one
+  `_e{}` line, and a span on that event has no statsd form. The sink writes the line and leaves
+  the span off with no count, where a span beside any other log, or on its own, counts the event
+  `logit.output.events.skipped{reason="no_metrics"}`. No decoder puts a span beside a DogStatsD
+  event; a `lua` stage or a hand-written `replay_in` case can, and the `statsd-logs-relay`
+  transit flow does (`span/beside_log` in `spec/transit/mapping.yaml`).
+
+  **Revisit:** count the span as `logit.output.spans.omitted`, as `kafka_out`'s `format: text`
+  counts a span beside the log it writes, and make the cell name that counter.
+
 - **Relative gauge adjustments: three by-design residuals.** `statsd_in` decodes a leading `+`/`-`
   on a `g` value into an unresolved `MetricKind::GaugeDelta`. `aggregate` resolves it against its
   running gauge value and retains gauge series across flushes under `series_retention` (a

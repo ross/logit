@@ -4494,10 +4494,11 @@ rows:
         text: A string `event`, read back as a string, as the `log/message_unsafe` row says.
       kafka_out:
         - when: {format: text}
-          class: exact
+          class: normalized
+          reason: message_as_text
           text: >-
-            A `Bytes` message leaves as its raw bytes, the record's value, which carries no type: a
-            consumer that reads values as text sees a UTF-8 one as a string.
+            A `Bytes` message leaves as its raw bytes, the record's value, which carries no type,
+            so a consumer that reads values as text sees a UTF-8 one as a string.
         - class: exact
           text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
   - kind: log

@@ -18,7 +18,8 @@
     {"timestamp":"2027-01-15T08:00:00.004000000Z","log":{"severity":"info","format":"raw","message":"caf�"},"attributes":{"body":"bytes","otel.log.severity.number":9,"otel.log.severity.text":"Info"},"resource":{"attributes":{"host.name":"transit"}}},
     {"timestamp":"2027-01-15T08:00:00.005000000Z","log":{"severity":"info","format":"json","message":{"attempts":3,"user":"ada"}},"attributes":{"body":"map","otel.log.severity.number":9,"otel.log.severity.text":"Info"},"resource":{"attributes":{"host.name":"transit"}}},
     {"timestamp":"2027-01-15T08:00:00.006000000Z","log":{"severity":"info","format":"json","message":["checkout",7]},"attributes":{"body":"array","otel.log.severity.number":9,"otel.log.severity.text":"Info"},"resource":{"attributes":{"host.name":"transit"}}},
-    {"timestamp":"2027-01-15T08:00:00.009000000Z","log":{"severity":"info","format":"raw","message":"{\"level\":\"info\",\"msg\":\"started\"}"},"attributes":{"body":"json_text","otel.log.severity.number":9,"otel.log.severity.text":"Info"},"resource":{"attributes":{"host.name":"transit"}}}
+    {"timestamp":"2027-01-15T08:00:00.009000000Z","log":{"severity":"info","format":"raw","message":"{\"level\":\"info\",\"msg\":\"started\"}"},"attributes":{"body":"json_text","otel.log.severity.number":9,"otel.log.severity.text":"Info"},"resource":{"attributes":{"host.name":"transit"}}},
+    {"timestamp":"2027-01-15T08:00:00.010000000Z","log":{"severity":"info","format":"raw","message":"abc"},"attributes":{"body":"bytes_utf8","otel.log.severity.number":9,"otel.log.severity.text":"Info"},"resource":{"attributes":{"host.name":"transit"}}}
   ], "counters": {
     "logit.output.events.dropped{component=out,kind=splunk_hec_out,reason=blank_event,role=sink}": 2
   }},

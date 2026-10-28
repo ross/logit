@@ -8,3 +8,4 @@
 {"timestamp":"2027-01-15T08:00:00.007000000Z","log":{"severity":"info","format":"raw","message":null},"attributes":{"body":"null"}}
 {"timestamp":"2027-01-15T08:00:00.008000000Z","log":{"severity":"info","format":"raw","message":""},"attributes":{"body":"empty"}}
 {"timestamp":"2027-01-15T08:00:00.009000000Z","log":{"severity":"info","format":"json","message":"{\"level\":\"info\",\"msg\":\"started\"}"},"attributes":{"body":"json_text"}}
+{"timestamp":"2027-01-15T08:00:00.010000000Z","log":{"severity":"info","format":"raw","message":"b\"abc\""},"attributes":{"body":"bytes_utf8"},"types":{"/log/message":"bytes"}}

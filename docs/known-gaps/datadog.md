@@ -94,7 +94,9 @@ Entry format and the other areas: [the known-gaps index](README.md).
   `_logit.otel.severity_text` are left off, so OTLP's `INFO2` arrives as `info`. A `Map` or
   `Array` message arrives as its JSON text, a `Bytes` one as lossy UTF-8, a log with no body as
   the message `null`, and a `Bytes` attribute as base64 text. The trace and span ids arrive as the
-  `trace_id` and `span_id` attributes.
+  `trace_id` and `span_id` attributes, unless the log already has an attribute of either name:
+  then the attribute is written, so a relayed Datadog log leaves as it arrived, and the log's own
+  ids are left off, uncounted (`log/trace_beside_id_attribute` in the transit spec).
   - **Consequence:** an OTLP log relayed to Datadog, or back out of `datadog_in`, can't be
     rebuilt field for field.
   - **Revisit trigger:** an operator needs one of these fields in Datadog.
