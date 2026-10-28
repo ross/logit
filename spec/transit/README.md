@@ -174,13 +174,13 @@ format has no slot for the field, so every record loses it, the table is its rec
 counter would add anything
 ([ADR `telemetry-loss-vocabulary`](../../docs/adr/telemetry-loss-vocabulary.md)'s amendment
 "structural loss has no counter"). A loss that depends on the value, such as `false` or a
-rewritten name, is counted. The table's schema accepts `reason: uncounted`, the sink's behavior
-as it stands, only on the cells `crates/logit-cli/src/transit/mapping.rs`'s `UNCOUNTED_ALLOWED`
-names: a span at any sink, until spans have sources of their own; a log beside metrics at a sink
-that writes the metrics; the trace `datadog_out` and `splunk_hec_out` leave off a log for a
-`trace_id` or `span_id` attribute; and `datadog_out`'s carrier on a log. `syslog_out`'s leave-off
-of every attribute outside its header fields, under RFC 3164 and under RFC 5424 with no
-`structured_data:`, is `structural`: the format the config selected has no slot for it.
+rewritten name, is counted. The table's schema accepts `reason: uncounted` only on the cells
+`crates/logit-cli/src/transit/mapping.rs`'s `UNCOUNTED_ALLOWED` names, whose doc says which rule
+each follows. Two of its three follow the same ADR's amendment "an ignored signal, and a format
+the config selects": a sink ignores a signal it has no wire for, such as a log beside metrics,
+uncounted, at any sink. Under that amendment too, `syslog_out`'s leave-off of every attribute
+outside its header fields, under RFC 3164 and under RFC 5424 with no `structured_data:`, is
+`structural`: the format the config selected has no slot for it.
 When a sink's behavior depends on its config, the sink's entry is a list: each cell but the last
 has a `when:` map of config fields, the first that matches the flow's sink config applies, and
 the last applies otherwise:

@@ -1502,9 +1502,9 @@ mod syslog {
 
     /// The attribute row an opt-in attribute `key` of log `rec` reaches in place of its value's
     /// under the `sd_id` opt-in, where the encoder leaves it off, counted: `sd_id_collision` on a
-    /// log whose own `syslog.sd` holds an element under `sd_id`, and `sd_name_unsafe` for a key
-    /// that isn't an RFC 5424 SD-NAME; and uncounted, `sd_empty_array` for an empty `Array`, which
-    /// writes one PARAM per element and so none.
+    /// log whose own `syslog.sd` holds an element under `sd_id`, `sd_name_unsafe` for a key that
+    /// isn't an RFC 5424 SD-NAME, and `sd_empty_array` for an empty `Array`, which writes one PARAM
+    /// per element and so none.
     pub(super) fn opt_in_row(rec: &Rec, key: &str, sd_id: &str) -> Option<&'static str> {
         if rec.kind != "log" || !is_opt_in_param(key) {
             return None;

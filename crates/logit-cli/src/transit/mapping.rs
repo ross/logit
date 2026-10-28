@@ -80,7 +80,7 @@
 //!   kind and shape), so every such record loses it and the table is its
 //!   record; a record written as another kind or shape names its counter (ADR
 //!   `telemetry-loss-vocabulary`'s amendment "structural loss has no counter"). `uncounted`, a
-//!   loss the sink doesn't count yet, is accepted only on a cell [`UNCOUNTED_ALLOWED`] names, and
+//!   loss no counter tracks, is accepted only on a cell [`UNCOUNTED_ALLOWED`] names, and
 //!   the class check accepts it for a record nothing reads back.
 
 use anyhow::{bail, ensure, Context};
@@ -88,11 +88,14 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
 
-/// The cells whose loss may still be `uncounted`, as `(row kind, feature, sink)`, where `None`
-/// matches any. Every other `skipped`, `dropped`, or `lost` cell names a counter, or a `lost` one
-/// is `structural`. A span is uncounted at any sink, and a log beside metrics, at a metrics sink
-/// that writes the metrics. A `_logit.datadog.*` carrier `datadog_out` leaves off a log is
-/// uncounted too.
+/// The cells whose loss may be `uncounted`, as `(row kind, feature, sink)`, where `None` matches
+/// any. Every other `skipped`, `dropped`, or `lost` cell names a counter, or a `lost` one is
+/// `structural`. The first two entries are the rule in ADR `telemetry-loss-vocabulary`'s amendment
+/// "an ignored signal, and a format the config selects": a sink that writes the signals it carries
+/// ignores a signal it has no wire for, uncounted, so `log/beside_metrics` matches at any sink, and
+/// so does every `span` row until spans have sources of their own. The third is the one entry
+/// outside that rule: a `_logit.datadog.*` carrier `datadog_out`'s log, event, and service-check
+/// routes have no field for, left off where its metrics routes count one.
 const UNCOUNTED_ALLOWED: [(&str, Option<&str>, Option<&str>); 3] = [
     ("log", Some("beside_metrics"), None),
     ("span", None, None),

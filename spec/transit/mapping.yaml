@@ -24,11 +24,10 @@ classes:
   dropped: >-
     The record is lost for a reason the config didn't ask for; the cell names the counter that
     counts it.
-# A cell may still say `reason: uncounted` only on the rows `UNCOUNTED_ALLOWED` names in
-# `crates/logit-cli/src/transit/mapping.rs`: a span at any sink, a log beside metrics at a sink
-# that writes the metrics, the trace datadog_out and splunk_hec_out leave off a log for a
-# `trace_id` or `span_id` attribute, and datadog_out's carrier on a log.
-# docs/adr/telemetry-loss-vocabulary.md's amendment "structural loss has no counter" has the rule.
+# A cell may say `reason: uncounted` only on the rows `UNCOUNTED_ALLOWED` names in
+# `crates/logit-cli/src/transit/mapping.rs`, whose doc says which rule each entry follows.
+# docs/adr/telemetry-loss-vocabulary.md's amendments "structural loss has no counter" and "an
+# ignored signal, and a format the config selects" have the rules.
 
 sinks: [statsd_out, prometheus_out, influxdb_out, otlp_out, datadog_out, graphite_out, syslog_out, splunk_hec_out, kafka_out]
 
