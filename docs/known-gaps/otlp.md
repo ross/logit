@@ -79,6 +79,14 @@ Entry format and the other areas: [the known-gaps index](README.md).
   as a `Summary` with a negative quantile value, quantile `0`, its minimum, among them.
   - **Consequence:** a consumer that enforces the rule may refuse the point.
   - **Revisit trigger:** a consumer that refuses one.
+- **`otlp_out` writes a negative span time as 0, uncounted.** OTLP's span and span event times
+  are unsigned nanoseconds, and the model's are signed, so `otlp_out` clamps a span start, end, or
+  span event time before 1970 to 0 (`crates/logit-proto/src/otlp/traces.rs`'s `max(0)`) with no
+  counter. No transit case holds such a time, so no cell states it.
+  - **Consequence:** a span from a producer with a broken clock reaches the backend at the epoch,
+    with a changed duration, and nothing in the sink's telemetry shows it.
+  - **Revisit trigger:** a producer that sends one. The fix is a counter for the clamp, or a
+    drop counted in its place.
 - **`otlp_in` drops `keyStrindex`, `stringValueStrindex`, `entityRefs`, and `metadata`.** These
   fields belong to the profiles signal and to experimental parts of the data model. The JSON
   decoder skips them and the protobuf decoder never maps them

@@ -3115,9 +3115,9 @@ rows:
         - class: exact
           text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
   # graphite_in stamps no `_logit.graphite.` carrier, so no record reaches this row at
-  # graphite_out and it has no cell. Nor at datadog_trace_out, which receives spans alone: a span's
-  # `_logit.datadog.*` attribute reaches `datadog_carrier_span`, one of the resource's tracer or
-  # Agent rows, or `datadog_carrier_log`.
+  # graphite_out and it has no cell. Nor at datadog_trace_out: the class check takes a sink's own
+  # prefix from its name less `_out`, so that sink's is `_logit.datadog_trace.`, which no decoder
+  # stamps.
   - kind: attributes
     feature: private_carrier
     cells:

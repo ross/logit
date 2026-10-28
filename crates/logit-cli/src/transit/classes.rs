@@ -4955,8 +4955,8 @@ mod tests {
         assert_eq!(observe_field(field, &ins[0], &out[0], Spelling::Datadog), Class::Normalized);
     }
 
-    /// A span's `_logit.datadog.*` carrier outside the chunk and span ones, on the event or the
-    /// resource, reaches the row of the routes `datadog_out` leaves one off uncounted, as a log's
+    /// A span's `_logit.datadog.*` carrier outside the chunk, span, tracer, and Agent carriers, on
+    /// the event or the resource, reaches the row of the routes `datadog_out` leaves one off uncounted, as a log's
     /// does, and never `private_carrier`, whose metrics-route cell names a counter.
     #[test]
     fn a_spans_datadog_carrier_reaches_the_uncounted_route_row() {
