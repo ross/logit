@@ -16,7 +16,7 @@ branches and PRs are its record. See [Branches and PR titles](../../AGENTS.md#br
 | [Enabling plan: an index-partition router — a routed batch is a view, not a copy](index-partition-router.md) | 2026-10-23 | 2026-10-23 |
 | [Enabling plan: metric flags — producers set `_logit.metrics.*`, and `aggregate` reads flags, not protocols](metric-flags.md) | 2026-10-22 | 2026-10-23 |
 | [Enabling plan: OTLP metric kinds into `datadog_out`, and a `cumulative_to_delta` transform](ddotlp.md) | 2026-10-20 | 2026-10-20 |
-| [Enabling plan: a transit spec — reference inputs, flows, and a mapping table that generates the docs](transit-spec.md) | 2026-10-19 | 2026-10-19 |
+| [Enabling plan: a transit spec — reference inputs, flows, and a mapping table that generates the docs](transit-spec.md) | 2026-10-19 | 2026-10-28 |
 | [Enabling plan: native encode without per-field scratch buffers](native-encode-allocations.md) | 2026-10-15 | 2026-10-15 |
 | [Enabling plan: a soak harness — faults on a timeline, a watchdog, and a loss ledger](soak-harness.md) | 2026-10-08 | 2026-10-18 |
 | [Research note: live reload, socket handover, and what each deployment world needs](live-reload-and-socket-handover.md) | 2026-10-05 | 2026-10-07 |
