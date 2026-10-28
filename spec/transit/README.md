@@ -107,10 +107,12 @@ is one nothing checks: add a case or a flow that reaches it.
 - **Field level**, for the `record` rows `unit`, `description`, `start_timestamp`, `exemplars`,
   `exemplars_on_summary`, `unit_on_distribution`, `min_max`, and `sample_rate_unweighted`, every `attributes` row (`rate`,
   `rate_on_non_gauge`, `family_type`, `family_type_on_other_kind`, `interval`, `interval_on_distribution`, and `interval_on_histogram` among them), a log or span beside metrics
-  (`beside_metrics`), which is a field of its event, and a log's fields on an event with no
-  metrics (`severity`, `body_format`, `event_name`, `observed_timestamp`, `trace`, `trace_flags`,
+  (`beside_metrics`), which is a field of its event, and a field of any log, beside metrics or
+  not (`severity`, `body_format`, `event_name`, `observed_timestamp`, `trace`, `trace_flags`,
   `dropped_attributes_count`, and `timestamp`, or `receipt_timestamp` for a log carrying
-  `syslog.timestamp`): `exact`, `normalized`, or `lost`. A field the log doesn't set reaches its
+  `syslog.timestamp`): `exact`, `normalized`, or `lost`. A log beside metrics reaches those rows
+  and its attribute rows as a log alone does, so `log/beside_metrics` records only whether the
+  sink carried the log. A field the log doesn't set reaches its
   `_unset` row (`severity_unset`, `observed_timestamp_unset`, `trace_unset`), `normalized` where
   the sink fills it in. A log's record pairs on its message and attributes alone, so a log read
   back with another severity still pairs and the difference lands on `log/severity`.

@@ -1,7 +1,7 @@
 {
   "beside-metrics": {"events": [
-    {"timestamp":"2027-01-15T08:00:04.000000000Z","log":{"severity":"warn","format":"raw","message":"queue depth high","observed_timestamp":"2027-01-15T08:00:05.000000000Z"},"attributes":{"_logit.otel.severity_number":13,"_logit.otel.severity_text":"Warn","queue":"orders"}},
-    {"timestamp":"2027-01-15T08:00:04.000000000Z","metrics":[{"name":"queue.depth","kind":"gauge","value":17}],"attributes":{"queue":"orders"}}
+    {"timestamp":"2027-01-15T08:00:04.000000000Z","log":{"severity":"warn","format":"raw","message":"queue depth high","observed_timestamp":"2027-01-15T08:00:05.000000000Z"},"attributes":{"_logit.otel.severity_number":13,"_logit.otel.severity_text":"Warn","hostname":"web-1","queue":"orders","service":"orders-api","service.name":"orders"}},
+    {"timestamp":"2027-01-15T08:00:04.000000000Z","metrics":[{"name":"queue.depth","kind":"gauge","value":17}],"attributes":{"hostname":"web-1","queue":"orders","service":"orders-api","service.name":"orders"}}
   ], "counters": {}},
   "bodies": {"events": [
     {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"severity":"info","format":"raw","message":"a plain line","observed_timestamp":"2027-01-15T08:00:01.009000000Z"},"attributes":{"_logit.otel.severity_number":9,"_logit.otel.severity_text":"Info","body":"string"}},

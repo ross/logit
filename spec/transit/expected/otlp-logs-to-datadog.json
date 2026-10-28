@@ -1,8 +1,11 @@
 {
   "beside-metrics": {"events": [
-    {"timestamp":"2027-01-15T08:00:04.000000000Z","log":{"severity":"warn","format":"raw","message":"queue depth high"},"attributes":{"host.name":"transit","queue":"orders","status":"warn"}},
-    {"timestamp":"2027-01-15T08:00:04.000000000Z","metrics":[{"name":"queue.depth","kind":"gauge","value":17.0}],"attributes":{"host.name":"transit","queue":"orders"},"resource":{"attributes":{"_logit.datadog.units":"datadog"}}}
-  ], "counters": {}},
+    {"timestamp":"2027-01-15T08:00:04.000000000Z","log":{"severity":"warn","format":"raw","message":"queue depth high"},"attributes":{"host.name":"transit","queue":"orders","service.name":"orders","status":"warn"}},
+    {"timestamp":"2027-01-15T08:00:04.000000000Z","metrics":[{"name":"queue.depth","kind":"gauge","value":17.0}],"attributes":{"host.name":"transit","hostname":"web-1","queue":"orders","service.name":"orders"},"resource":{"attributes":{"_logit.datadog.units":"datadog"}}}
+  ], "counters": {
+    "logit.output.tags.omitted{component=out,kind=datadog_out,reason=reserved_key,role=sink}": 2,
+    "logit.output.tags.omitted{component=out,kind=datadog_out,reason=unrepresentable,role=sink}": 1
+  }},
   "bodies": {"events": [
     {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"severity":"info","format":"raw","message":"a plain line"},"attributes":{"body":"string","host.name":"transit","status":"info"}},
     {"timestamp":"2027-01-15T08:00:00.001000000Z","log":{"severity":"info","format":"raw","message":"42"},"attributes":{"body":"int","host.name":"transit","status":"info"}},
