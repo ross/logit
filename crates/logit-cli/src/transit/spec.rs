@@ -352,6 +352,15 @@ impl Headers {
         self.0.iter().find(|(n, _)| n == name).map(|(_, v)| v.as_str())
     }
 
+    /// Every header but the recorded request line's `method:` and `path:`, as a request carries
+    /// them.
+    fn request_headers(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.0
+            .iter()
+            .filter(|(name, _)| name != "method" && name != "path")
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+    }
+
     /// The first value of query parameter `key` in `path:`, `None` when absent or empty, as
     /// `influxdb_in` reads it. The cases' query strings hold no percent-escapes, so none is
     /// decoded.
@@ -386,6 +395,11 @@ const SCRAPE_INSTANCE: &str = "transit:9100";
 /// - `datadog`: one request body through `datadog_in`'s own `decode_request`, which picks the
 ///   route from `path:`, the body form from `content-type:`, and the decompression from
 ///   `content-encoding:`, as the listener does.
+/// - `ddtrace`: one tracer request body through `datadog_trace_in`'s own `decode_request`, which
+///   picks the payload version from `path:` (`/v0.4/traces`, `/v0.5/traces`, or `/v0.7/traces`)
+///   and fills the resource from the tracer's request headers (`Datadog-Meta-*`,
+///   `Datadog-Container-ID`, `Datadog-Client-Computed-*`, and the rest), so every header in the
+///   `.headers` file but `method:` and `path:` goes with the body.
 /// - `otlp`: one request body through `otlp_in`'s own `decode_request`, which picks the signal
 ///   from `path:`, the body encoding from `content-type:` (protobuf when absent), and the
 ///   decompression from `content-encoding:`, as the listener does. A wire file with no `.headers`
@@ -491,6 +505,29 @@ fn decode_wire(
                 decoder,
             )
             .map_err(|err| anyhow::anyhow!("datadog_in refused the request: {err}"))?
+        }
+        "ddtrace" => {
+            let telemetry = probe.telemetry(id, "datadog_trace_in", "listener");
+            let diag = Diagnostics::new(id).with_telemetry(telemetry.clone());
+            let path = headers.get("path").context("the .headers names no path:")?;
+            let mut request = http::HeaderMap::new();
+            for (name, value) in headers.request_headers() {
+                request.append(
+                    http::HeaderName::from_bytes(name.as_bytes())?,
+                    http::HeaderValue::from_str(value)?,
+                );
+            }
+            let decoder =
+                DatadogDecoder::new().with_telemetry(telemetry).with_diagnostics(diag.clone());
+            logit_inputs::datadog_trace::decode_request(
+                path,
+                &request,
+                Bytes::from(bytes),
+                RECEIVED_AT,
+                decoder,
+                &diag,
+            )
+            .map_err(|err| anyhow::anyhow!("datadog_trace_in refused the request: {err}"))?
         }
         "otlp" => {
             let telemetry = probe.telemetry(id, "otlp_in", "listener");
@@ -1210,6 +1247,13 @@ flow_tests! {
     datadog_to_prometheus => "datadog-to-prometheus",
     datadog_to_statsd => "datadog-to-statsd",
     datadog_to_graphite => "datadog-to-graphite",
+    ddtrace_relay => "ddtrace-relay",
+    ddtrace_relay_v07 => "ddtrace-relay-v07",
+    ddtrace_to_datadog => "ddtrace-to-datadog",
+    ddtrace_to_kafka => "ddtrace-to-kafka",
+    ddtrace_to_kafka_text => "ddtrace-to-kafka-text",
+    ddtrace_to_otlp => "ddtrace-to-otlp",
+    ddtrace_to_splunk => "ddtrace-to-splunk",
     graphite_to_datadog => "graphite-to-datadog",
     graphite_to_influxdb => "graphite-to-influxdb",
     graphite_to_otlp => "graphite-to-otlp",
@@ -1311,6 +1355,37 @@ mod tests {
             .find(|c| c.name == "counter")
             .expect("the counter case");
         (flow, case)
+    }
+
+    /// A `ddtrace` wire file decodes through `datadog_trace_in`'s request decoding with its
+    /// `.headers` file's tracer headers: the v0.4 capture's one Flask request is 10 spans
+    /// (`testdata/interop/datadog/README.md`), each under a resource the `Datadog-Meta-*` and
+    /// `Datadog-Client-Computed-*` headers filled.
+    #[test]
+    fn a_ddtrace_capture_decodes_with_its_tracer_headers() {
+        let capture = spec_dir().join("../../testdata/interop/datadog/tracer-v04-v0-4-traces-000");
+        let bytes = std::fs::read(capture.with_extension("bin")).expect("the capture");
+        let headers = std::fs::read_to_string(capture.with_extension("headers")).expect("headers");
+        let headers = Headers::parse(&headers);
+        let text = decode_wire(
+            "ddtrace",
+            bytes,
+            &headers,
+            None,
+            CarbonWire::Plaintext,
+            SyslogFraming::Datagram,
+        )
+        .expect("datadog_trace_in decodes the capture");
+        let events: Vec<Value> =
+            text.lines().map(|line| serde_json::from_str(line).expect("an event line")).collect();
+        assert_eq!(events.len(), 10);
+        for event in &events {
+            assert!(event["span"].is_object(), "{event}");
+            let resource = &event["resource"]["attributes"];
+            assert_eq!(resource["_logit.datadog.tracer.language_name"], "python");
+            assert_eq!(resource["_logit.datadog.tracer.tracer_version"], "4.15.2");
+            assert_eq!(resource["_logit.datadog.tracer.client_computed_stats"], true);
+        }
     }
 
     /// `datadog_trace_out`'s cells split on `version:` as the sink's config serializes it: a

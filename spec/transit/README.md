@@ -17,7 +17,9 @@ hand-written spans and payload-less events beside them (`cases/statsd-logs/`), `
 `prometheus_in`'s scrape (remote-write cases aren't written yet), `datadog_in`'s metrics routes and service checks (`cases/datadog/`) and its
 logs and events (`cases/datadog-logs/`: the Agent's captures and hand-written `/api/v2/logs`
 bodies) and its APM traces (`cases/datadog-traces/`: the Agent's capture and hand-written event
-JSON lines), with no APM stats cases, `collectd_in`, `otlp_in`'s metrics
+JSON lines), with no APM stats cases, `datadog_trace_in`'s tracer requests (`cases/ddtrace/`:
+dd-trace-py's v0.4 and v0.5 captures and hand-written v0.7 event JSON lines), `collectd_in`,
+`otlp_in`'s metrics
 (`cases/otlp/`), logs (`cases/otlp-logs/`), and traces (`cases/otlp-traces/`), `graphite_in`,
 plaintext and pickle, `syslog_in`, RFC 3164 and RFC 5424 over UDP and as a TCP stream, and
 `splunk_hec_in`'s `/event` and `/raw` routes (`cases/splunk/`: the four recorded HEC clients'
@@ -37,7 +39,8 @@ driver reads its records back by convention: a `format: json` record through the
 reader, and a `format: text` record as one log holding the record's value, at the record's
 millisecond timestamp (`crates/logit-cli/src/transit/wire.rs`). Each flow's name says which
 source meets which sink: `statsd-relay`, `statsd-logs-relay`, `influxdb-relay`, `datadog-relay`,
-`datadog-logs-relay`, `datadog-traces-relay`, `otlp-relay`, `otlp-logs-relay`,
+`datadog-logs-relay`, `datadog-traces-relay`, `ddtrace-relay`, `ddtrace-relay-v07`,
+`otlp-relay`, `otlp-logs-relay`,
 `otlp-traces-relay`, `graphite-relay`, `syslog-relay`,
 `splunk-relay`, `prometheus-to-prometheus`, and `prometheus-to-prometheus-remote-write` are like
 pairs, and `influxdb-to-prometheus` a cross-protocol one.
@@ -359,7 +362,11 @@ and a protocol name in `docs.rs`'s `PROTOCOLS`, or the check fails.
    as `influxdb_in` requires; a Prometheus case reads text 0.0.4 unless its `.headers` gives an
    OpenMetrics `content-type:`. A Datadog case's `.headers` gives the request's `path:`, which
    picks the route, and its `content-type:` and `content-encoding:`, and the body decodes through
-   `datadog_in`'s own request decoding. An OTLP case's `.headers` does the same for `otlp_in`:
+   `datadog_in`'s own request decoding. A `ddtrace` case's `.headers` gives the tracer request's
+   `path:`, which picks the payload version, and its tracer headers (`Datadog-Meta-*`,
+   `Datadog-Container-ID`, `Datadog-Client-Computed-*`, and the rest), which fill the resource;
+   every header but `method:` and `path:` goes to `datadog_trace_in`'s own request decoding with
+   the body, so a header the `.headers` file leaves out leaves its carrier off. An OTLP case's `.headers` does the same for `otlp_in`:
    `path:` picks the signal, `content-type:` protobuf or OTLP/JSON, and `content-encoding:`
    gzip; a capture with no `.headers`, as `testdata/interop/otlp/` records them, is read as the
    OTel Collector `file` exporter's lines, one OTLP/JSON metrics request each. A `wire:` path may point at a capture under `testdata/interop/`

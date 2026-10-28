@@ -160,6 +160,10 @@ these captures.
   every recorded request over a socket, with its recorded headers, and expect the route's `2xx`.
 - `crates/logit-cli/tests/datadog_pair_round_trip.rs` and `datadog_trace_pair_round_trip.rs`
   relay a recorded series request and the recorded tracer requests through each pair unchanged.
+- The transit spec's cases read captures in place: `spec/transit/cases/datadog-traces/agent`
+  decodes the Agent's `/api/v0.2/traces` request through `datadog_in`, and
+  `spec/transit/cases/ddtrace/v04` and `v05` decode the two tracer trace requests through
+  `datadog_trace_in` with their recorded headers.
 
 ## What isn't covered here (yet)
 

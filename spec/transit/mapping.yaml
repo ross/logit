@@ -2353,6 +2353,12 @@ rows:
             no slot, so it's left off; `structured_data:` writes each public event attribute other
             than `host.name`, `process.pid`, and the `syslog.*` keys as an SD-PARAM, which
             syslog_in reads back inside `syslog.sd`.
+      datadog_trace_out:
+        class: exact
+        text: >-
+          The `Datadog-Container-ID` request header under either `version:`, and under
+          `version: v0.7` the `TracerPayload`'s `container_id` too; datadog_trace_in reads it back
+          as the resource's `container.id`.
       splunk_hec_out:
         class: exact
         text: A `fields` key.

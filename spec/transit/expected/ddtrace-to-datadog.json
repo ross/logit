@@ -1,0 +1,14 @@
+{
+  "fields": {"events": [], "counters": {
+    "logit.output.records.dropped{component=out,kind=datadog_out,reason=needs_agent_processing,role=sink,route=traces}": 2
+  }},
+  "v04": {"events": [], "counters": {
+    "logit.output.records.dropped{component=out,kind=datadog_out,reason=needs_agent_processing,role=sink,route=traces}": 10
+  }},
+  "v05": {"events": [], "counters": {
+    "logit.output.records.dropped{component=out,kind=datadog_out,reason=needs_agent_processing,role=sink,route=traces}": 30
+  }},
+  "v07": {"events": [], "counters": {
+    "logit.output.records.dropped{component=out,kind=datadog_out,reason=needs_agent_processing,role=sink,route=traces}": 2
+  }}
+}

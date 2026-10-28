@@ -1,0 +1,33 @@
+{
+  "cells": [
+    {"sink":"splunk_hec_out","row":"attributes/bytes_value","cell":0,"observed":["normalized"]},
+    {"sink":"splunk_hec_out","row":"attributes/container_id","cell":0,"observed":["exact"]},
+    {"sink":"splunk_hec_out","row":"attributes/datadog_carrier_span","cell":0,"observed":["lost"]},
+    {"sink":"splunk_hec_out","row":"attributes/datadog_span_identity","cell":0,"observed":["exact"]},
+    {"sink":"splunk_hec_out","row":"attributes/datadog_span_marks","cell":0,"observed":["exact"]},
+    {"sink":"splunk_hec_out","row":"attributes/datadog_tracer_headers","cell":0,"observed":["lost"]},
+    {"sink":"splunk_hec_out","row":"attributes/datadog_tracer_resource","cell":0,"observed":["lost"]},
+    {"sink":"splunk_hec_out","row":"attributes/no_host","cell":0,"observed":["normalized"]},
+    {"sink":"splunk_hec_out","row":"attributes/resource_attribute","cell":0,"observed":["exact"]},
+    {"sink":"splunk_hec_out","row":"attributes/service_identity","cell":0,"observed":["exact"]},
+    {"sink":"splunk_hec_out","row":"attributes/span_numeric","cell":0,"observed":["exact"]},
+    {"sink":"splunk_hec_out","row":"attributes/string_value","cell":0,"observed":["exact"]},
+    {"sink":"splunk_hec_out","row":"span/alone","cell":0,"observed":["exact"]},
+    {"sink":"splunk_hec_out","row":"span/end_timestamp","cell":0,"observed":["exact"]},
+    {"sink":"splunk_hec_out","row":"span/event_nested_attribute","cell":0,"observed":["exact"]},
+    {"sink":"splunk_hec_out","row":"span/events","cell":0,"observed":["exact"]},
+    {"sink":"splunk_hec_out","row":"span/kind","cell":0,"observed":["exact"]},
+    {"sink":"splunk_hec_out","row":"span/link_flags","cell":0,"observed":["lost"]},
+    {"sink":"splunk_hec_out","row":"span/link_trace_state","cell":0,"observed":["exact"]},
+    {"sink":"splunk_hec_out","row":"span/links","cell":0,"observed":["exact"]},
+    {"sink":"splunk_hec_out","row":"span/name","cell":0,"observed":["exact"]},
+    {"sink":"splunk_hec_out","row":"span/needs_agent_processing","cell":0,"observed":["exact"]},
+    {"sink":"splunk_hec_out","row":"span/parent_span_id","cell":0,"observed":["exact"]},
+    {"sink":"splunk_hec_out","row":"span/parent_unset","cell":0,"observed":["exact"]},
+    {"sink":"splunk_hec_out","row":"span/status_error","cell":0,"observed":["exact"]},
+    {"sink":"splunk_hec_out","row":"span/status_unset","cell":0,"observed":["exact"]},
+    {"sink":"splunk_hec_out","row":"span/timestamp","cell":0,"observed":["exact"]},
+    {"sink":"splunk_hec_out","row":"span/trace_id","cell":0,"observed":["exact"]}
+  ],
+  "unspecified": []
+}

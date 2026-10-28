@@ -1,0 +1,6 @@
+# Hand-written event JSON lines: a /v0.4/traces trace as datadog_trace_in decodes it, carrying the
+# span fields no capture does: a 128-bit trace id through `_dd.p.tid`, a `meta_struct` entry,
+# a span link with flags, a `tracestate`, and an attribute, a span event with typed and array
+# attributes, an `error` of 2, and the `env` and `version` meta entries, under the carriers
+# the request headers carry, a `Datadog-Container-ID` among them.
+exercises: [v04_traces, tracer_headers, container_id, unmarked_root, trace_id_128, meta_struct, span_links, span_events, span_error, env_version, span_identity, span_marks, parent_span_id]

@@ -110,6 +110,7 @@
 //! | Row | Class | Reason or counter | What a consumer sees |
 //! |---|---|---|---|
 //! | `attributes/string_value` | exact | -- | A `meta` entry of the span, read back as the attribute. |
+//! | `attributes/container_id` | exact | -- | The `Datadog-Container-ID` request header under either `version:`, and under `version: v0.7` the `TracerPayload`'s `container_id` too; datadog_trace_in reads it back as the resource's `container.id`. |
 //! | `attributes/service_identity` | exact | -- | On a span, `deployment.environment.name` and `service.version` are the span's `env` and `version` meta entries, which datadog_trace_in reads back as the key. |
 //! | `attributes/bool_value` | normalized | `stringified` | A `meta` entry of `true` or `false`, read back as the string. |
 //! | `attributes/array_value` | normalized | `json_text`; `logit.output.spans.degraded{reason=json_text}` | A `meta` entry of its JSON text, counted, read back as a string. |

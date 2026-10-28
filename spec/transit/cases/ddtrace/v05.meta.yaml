@@ -1,0 +1,5 @@
+# dd-trace-py 4.15.2's /v0.5/traces request with the tracer's defaults, msgpack with a string
+# dictionary, three Flask requests' 30 spans (one answering 500) with no Agent `_top_level` mark,
+# read in place from testdata/interop/ with its .headers.
+wire: ../../../../testdata/interop/datadog/tracer-v0-5-traces-000.bin
+exercises: [v05_traces, tracer_headers, unmarked_root, span_identity, span_marks, span_error_status, parent_span_id, trace_id_128, env_version]
