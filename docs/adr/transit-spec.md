@@ -284,7 +284,8 @@ have one case. The `tlog` stream fills that in, and settles these:
    `span_id` attribute wins over the log's own trace, which is left off uncounted, on two
    `log/trace_beside_id_attribute` entries; both formats have a slot for the trace, so the loss
    isn't structural. Every other uncounted loss of a log field is a format with no slot and reads
-   `lost, structural`. The `span` entry stays until spans are classified.
+   `lost, structural`. The `span` entry stays until spans are classified (the span-records
+   amendment below).
 10. **Log cases live in log-only directories** (`cases/otlp-logs/`, `cases/datadog-logs/`,
     `cases/syslog/`, `cases/splunk/`), so a log flow never routes a metric case into a sink with
     no metric cells. `decode_wire` picks a decoder by the directory name's prefix before `-`.
@@ -329,8 +330,8 @@ that amendment's decisions:
 - **Decision 9 now reads:** `UNCOUNTED_ALLOWED` holds three entries.
   `("log", Some("beside_metrics"), None)` and `("span", None, None)` are the ignored-signal rule
   of the same `telemetry-loss-vocabulary` amendment: a sink that writes some of an event's
-  signals ignores the rest, uncounted, and `tspan` narrows the span entry when spans are
-  classified. `("attributes", Some("datadog_carrier_log"), Some("datadog_out"))` predates logs
+  signals ignores the rest, uncounted, and the span-records amendment below narrows the span
+  entry. `("attributes", Some("datadog_carrier_log"), Some("datadog_out"))` predates logs
   and is outside this stream. Every other uncounted loss of a log field is a format with no slot
   and reads `lost, structural`.
 
@@ -340,3 +341,68 @@ Under RFC 3164, `syslog_out` also writes a TAG for every message, so the record-
 (2026-10-28)").
 [`docs/plans/transit-spec.md`](../plans/transit-spec.md)'s "10. Sink fixes" has every decision,
 the workstreams, and the limits the stream leaves as decided.
+
+## Amendment: span records (2026-10-28)
+
+The table classifies metric and log records, not spans. The class check compares a span as one
+body, so any change to a span's status, flags, events, or links reads `degraded` with no row
+naming it. `span/no_wire_form` is keyed on Datadog's field set and reached at every sink, so its
+`splunk_hec_out` cell reads against fields that sink writes. The driver bypasses `datadog_out`'s
+trace readiness gate, so its `span/alone` cell reads `exact` for spans the running sink drops.
+`datadog_trace_out` has no column, and every span case is hand-written. The `tspan` stream fills
+that in, and settles these:
+
+1. **Span fields are rows under `kind: span`** in the one table. Record-level rows (`alone`,
+   `not_datadog_origin`, `needs_agent_processing`) take the five record classes, and field rows
+   (the name, ids, kind, status, timestamps, flags, `trace_state`, dropped counts, events, and
+   links, and `beside_log` and `beside_metrics`) take `exact`, `normalized`, or `lost`. A row is
+   chosen from the input alone, so `flags`, `trace_state`, and a dropped count reach their rows
+   only when nonzero or present, and the status and parent rows split by value, since the sinks
+   differ per value.
+2. **A span's identity is its ids.** It pairs on the trace id's low 64 bits and its span id,
+   which every span sink carries; Datadog restores the high half through `_dd.p.tid`. Once a span
+   pairs, `same_value` is `true` for it, and every other body key leaves `Rec::core`, so the field
+   rows carry each difference. A name that isn't a `Str` has its own row,
+   `span/name_structured`.
+3. **`span/no_wire_form` retires** for per-field rows with a cell per sink: Datadog's and
+   Splunk's missing fields are each that sink's `lost` cells, counted
+   `logit.output.spans.degraded{reason=no_wire_form}`.
+4. **Span timestamps get rows**: `span/timestamp` for the start, `span/end_timestamp`, and
+   `span/end_before_start`, which the Datadog sinks clamp to a zero duration, counted.
+5. **`span/beside_log` becomes a field row**, whether the sink carried the span, as
+   `span/beside_metrics` is.
+6. **Attribute rows keyed by name** where the span sinks treat keys differently:
+   `span_numeric`, `datadog_span_identity`, `datadog_span_marks`, `datadog_carrier_span`, and
+   `datadog_tracer_resource`. Other span attributes reach the value-type rows.
+7. **`Spelling::derived` grows a `datadog_trace_out` entry**, what `datadog_out` derives plus,
+   under `version: v0.4`, the resource fields it writes into every span's `meta`.
+8. **The driver applies `datadog_out`'s trace readiness gate**, through
+   `logit_proto::datadog::trace_readiness`, the verdict the sink reads, and counts its drops as
+   the sink does, so `span/not_datadog_origin` and `span/needs_agent_processing` read `dropped`
+   there, counted `logit.output.records.dropped{route=traces}`. The stale filter, tag limit, and
+   size cuts stay bypassed.
+9. **Four span sources and one new column.** The sources are `otlp-traces`, `datadog-traces`,
+   `ddtrace`, and `splunk-traces`, each in its own span-only case directory. `datadog_trace_out`
+   joins `otlp_out`, `datadog_out`, `splunk_hec_out`, and `kafka_out` under `format: json` and
+   `text` as a span column, with `when: {version: v0.4}` and `{version: v0.7}` cells.
+10. **Sink defects are recorded as the code behaves** and fixed in a later stream, `tspan-sink`,
+    as `tsink` followed `tlog`. An uncounted one gets a narrow `UNCOUNTED_ALLOWED` entry the fix
+    removes.
+11. **`UNCOUNTED_ALLOWED` narrows** from `("span", None, None)` to the ignored-signal entries
+    `("span", Some("beside_log"), None)` and `("span", Some("beside_metrics"), None)`, plus the
+    entries of decision 10's findings: `otlp_out`'s empty name for a structured one, and
+    `datadog_trace_out`'s uncounted leave-off of a log or metrics. Every other uncounted span
+    loss is a format with no slot and reads `lost, structural`.
+12. **The sort key doesn't change.** Events already order by timestamp, then span name.
+
+Consequences: `KINDS`' `span` entry and the class check grow a span path, with id pairing and
+per-field comparison. The driver gains the readiness gate in its `datadog_out` arm, a
+`datadog_trace_out` encoder arm read back through a `decode_request` factored out of
+`datadog_trace_in`, and a `ddtrace` source arm over it. ADR
+[`telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md)'s "Amendment (2026-10-28): an
+ignored signal, and a format the config selects" already covers the ignored-signal entries and
+the structural cells, so it needs no amendment. `trace_context`'s `span:` lifting, a transform
+rather than a wire pair, `datadog_out`'s other drops above its encoders, and `kafka_out`'s OTLP
+and MessagePack formats stay out.
+[`docs/plans/transit-spec.md`](../plans/transit-spec.md)'s "11. Spans" has the feature table, the
+framework's changes, and the workstreams, and its "Findings" the sink behaviors already known.
