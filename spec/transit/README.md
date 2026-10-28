@@ -159,7 +159,8 @@ non-empty string `host.name` or the hostless mark, which `statsd_out` leaves off
 SD-ELEMENT, on a log whose `syslog.sd` already holds the configured SD-ID, under a key that isn't
 an SD-NAME, or holding an empty array, reached only at that sink under the opt-in), and
 the attributes `datadog_out` writes from a record's own fields,
-`attributes/no_host`, `log_status`, `span_kind`, and `trace_id_high`. A flagged record's `no_recorded_value` row goes ahead of its kind's counted
+`attributes/no_host`, `log_status`, `span_kind`, and `trace_id_high`, and `syslog_out`'s
+`attributes/default_tag`. A flagged record's `no_recorded_value` row goes ahead of its kind's counted
 loss where that loss's counter didn't move, since most sinks test the flag first
 (`classes.rs`'s "Counters").
 

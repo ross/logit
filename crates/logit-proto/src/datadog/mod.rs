@@ -293,6 +293,7 @@
 //! | `attributes/splunk_envelope` | normalized | `resource_as_tag` | Merged into the log's attributes, so it reads back as an event attribute. |
 //! | `attributes/syslog_facility` | exact | -- | A log with no `syslog.facility` leaves with none. |
 //! | `attributes/no_host` | normalized | `default_host` | A record with no host and no hostless mark leaves with the process hostname as its host, which datadog_in reads back as `host.name`; a span's host is its batch resource's `host.name`, filled only when no relaying Agent's hostname rides beside it. |
+//! | `attributes/default_tag` | exact | -- | A log with no `syslog.tag` leaves with none. |
 //! | `attributes/log_status` | normalized | `status_from_severity` | A log with a severity and no `status` attribute leaves with `status` set to the severity's name, which datadog_in reads back as a `status` attribute beside the severity. |
 //! | `attributes/log_severity_fields` | exact | -- | The severity is `status`'s; no `otel.log.severity.*` attribute is written. |
 //! | `attributes/span_kind` | normalized | `span_kind_meta` | A span whose kind isn't internal, with no `span.kind` attribute, leaves with `meta["span.kind"]`, which datadog_in reads back as a `span.kind` attribute beside the kind. |

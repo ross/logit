@@ -145,6 +145,7 @@
 //! | `attributes/splunk_envelope` | exact | -- | A resource attribute. |
 //! | `attributes/syslog_facility` | exact | -- | A log with no `syslog.facility` leaves with none. |
 //! | `attributes/no_host` | exact | -- | A record with no host leaves with none. |
+//! | `attributes/default_tag` | exact | -- | A log with no `syslog.tag` leaves with none. |
 //! | `attributes/log_status` | exact | -- | The severity is the `LogRecord`'s own; no `status` attribute is written. |
 //! | `attributes/log_severity_fields` | exact | -- | The severity is the `LogRecord`'s own; no `otel.log.severity.*` attribute is written. |
 //! | `attributes/span_kind` | exact | -- | The kind is the `Span`'s own; no `span.kind` attribute is written. |

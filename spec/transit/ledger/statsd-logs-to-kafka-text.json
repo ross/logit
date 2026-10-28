@@ -1,5 +1,6 @@
 {
   "cells": [
+    {"sink":"kafka_out","row":"attributes/default_tag","cell":0,"observed":["exact"]},
     {"sink":"kafka_out","row":"attributes/foreign_carrier","cell":0,"observed":["lost"]},
     {"sink":"kafka_out","row":"attributes/host_name","cell":0,"observed":["lost"]},
     {"sink":"kafka_out","row":"attributes/log_severity_fields","cell":0,"observed":["exact"]},

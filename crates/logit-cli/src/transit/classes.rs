@@ -799,9 +799,10 @@ type Derived = (Option<&'static str>, &'static str, String);
 /// record reaches them, and one that derives nothing for a row reads it `exact`.
 fn derived_rows(rec: &Rec) -> Vec<&'static str> {
     let mut rows = Vec::new();
-    // Under RFC 5424 `syslog_out` derives every row any of its configs does.
-    let syslog = Spelling::Syslog { rfc3164: false, facility: 0, structured_data: None };
-    for spelling in [Spelling::Datadog, syslog, Spelling::Splunk] {
+    // RFC 5424 derives every row any of `syslog_out`'s configs does but `default_tag`, which only
+    // RFC 3164 does.
+    let syslog = |rfc3164| Spelling::Syslog { rfc3164, facility: 0, structured_data: None };
+    for spelling in [Spelling::Datadog, syslog(false), syslog(true), Spelling::Splunk] {
         for (row, _, _) in spelling.derived(rec) {
             if let Some(row) = row.filter(|row| !rows.contains(row)) {
                 rows.push(row);
@@ -821,7 +822,9 @@ fn derived_rows(rec: &Rec) -> Vec<&'static str> {
 /// - for pairing only, the `syslog.timestamp` written from `event.timestamp` on a log with none,
 ///   which `log/timestamp` compares, under RFC 3164 a `syslog.tag` and PROCID `syslog_in` reads
 ///   from the message's first token, and under the `sd_id` opt-in the `syslog.sd` holding the
-///   opt-in element on a log with none.
+///   opt-in element on a log with none;
+/// - `default_tag`: under RFC 3164, the fallback TAG (`service.name`, else `logit`) on a log that
+///   carries no `syslog.tag`, which `syslog_in` reads back as `syslog.tag`.
 fn syslog_derived(
     rec: &Rec,
     rfc3164: bool,
@@ -854,7 +857,8 @@ fn syslog_derived(
     }
     if !read.tag_from_attribute {
         if let Some(tag) = &read.tag {
-            out.push((None, syslog::TAG, tag.clone()));
+            let row = (rfc3164 && !read.tag_carried).then_some("default_tag");
+            out.push((row, syslog::TAG, tag.clone()));
             if let Some(pid) = &read.pid {
                 out.push((None, syslog::pid_key(pid), pid.clone()));
             }
@@ -1370,9 +1374,11 @@ mod syslog {
     pub(super) struct Read {
         /// HOSTNAME, read back as `host.name`.
         pub host: Option<String>,
-        /// TAG or APP-NAME, read back as `syslog.tag`, and whether it's the input's `syslog.tag`.
+        /// TAG or APP-NAME, read back as `syslog.tag`, whether it's the input's `syslog.tag`, and
+        /// whether the input carries one.
         pub tag: Option<String>,
         pub tag_from_attribute: bool,
+        pub tag_carried: bool,
         /// PROCID, read back as `process.pid` when canonical decimal, else as `syslog.pid`; and
         /// whether it's the input's `process.pid` rather than its `syslog.pid`.
         pub pid: Option<String>,
@@ -1397,6 +1403,7 @@ mod syslog {
             return Some(Read {
                 host,
                 tag_from_attribute: tag.is_some(),
+                tag_carried: carries_tag,
                 tag,
                 pid,
                 pid_from_process,
@@ -1460,6 +1467,7 @@ mod syslog {
             host: read_host,
             tag: read_tag,
             tag_from_attribute,
+            tag_carried: carries_tag,
             pid: read_pid,
             pid_from_process,
             message: as_value(read_message),
@@ -4858,6 +4866,34 @@ mod tests {
             host = super::super::HOSTNAME,
         )]);
         assert_eq!(pair(&ins, &outs, SYSLOG_5424).seen, [Some(Class::Exact)]);
+    }
+
+    /// Under RFC 3164 a log with no `syslog.tag` derives `default_tag`: its resource's
+    /// `service.name`, narrowed to the TAG class, else `logit`. A log with a `syslog.tag`, or under
+    /// RFC 5424 any log, derives none, and every sink reaches the row.
+    #[test]
+    fn an_rfc3164_log_with_no_tag_derives_the_default_tag() {
+        let body = r#""severity":"info","format":"raw","message":"m""#;
+        let ins = recs(&[
+            &format!(
+                r#"{{{{T}},"log":{{{body}}},"resource":{{"attributes":{{"service.name":"api@v2"}}}}}}"#
+            ),
+            &log_line(body, "{}"),
+            &log_line(body, r#"{"syslog.tag":"app"}"#),
+        ]);
+        let tag = |spelling: Spelling, rec: &Rec| {
+            spelling
+                .derived(rec)
+                .into_iter()
+                .find(|(row, _, _)| *row == Some("default_tag"))
+                .map(|(_, _, value)| value)
+        };
+        assert_eq!(tag(SYSLOG_3164, &ins[0]).as_deref(), Some("api_v2"));
+        assert_eq!(tag(SYSLOG_3164, &ins[1]).as_deref(), Some("logit"));
+        assert_eq!(tag(SYSLOG_3164, &ins[2]), None);
+        assert_eq!(tag(SYSLOG_5424, &ins[1]), None);
+        assert!(derived_rows(&ins[1]).contains(&"default_tag"));
+        assert!(!derived_rows(&ins[2]).contains(&"default_tag"));
     }
 
     /// Under RFC 3164 a log with no `syslog.tag` leaves with the default TAG, so `syslog_in` reads

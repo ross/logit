@@ -4,6 +4,7 @@
     {"sink":"datadog_out","row":"attributes/bool_value","cell":0,"observed":["exact","normalized"]},
     {"sink":"datadog_out","row":"attributes/bytes_value","cell":0,"observed":["lost"]},
     {"sink":"datadog_out","row":"attributes/container_id","cell":0,"observed":["normalized"]},
+    {"sink":"datadog_out","row":"attributes/default_tag","cell":0,"observed":["exact"]},
     {"sink":"datadog_out","row":"attributes/foreign_carrier","cell":0,"observed":["exact","lost"]},
     {"sink":"datadog_out","row":"attributes/host_name","cell":0,"observed":["exact"]},
     {"sink":"datadog_out","row":"attributes/log_severity_fields","cell":0,"observed":["exact"]},
