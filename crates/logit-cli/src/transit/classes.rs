@@ -3511,12 +3511,19 @@ mod tests {
     /// [`check`] over `ins` read back as `outs` by a `prometheus_out` with `config`, against the
     /// committed table.
     fn check_prometheus(ins: &[&str], outs: &[&str], config: Value) -> Vec<String> {
-        check_sink(ins, outs, config, &mut Ledger::default())
+        check_sink(ins, outs, config, &[], &mut Ledger::default())
     }
 
-    /// [`check`] over `ins` read back as `outs` by a sink with `config`, against the committed
+    /// [`check`] over `ins` read back as `outs` by a sink with `config`, resolved with its
+    /// defaults as the flow driver resolves it, whose run moved `counters`, against the committed
     /// table, into `ledger`.
-    fn check_sink(ins: &[&str], outs: &[&str], config: Value, ledger: &mut Ledger) -> Vec<String> {
+    fn check_sink(
+        ins: &[&str],
+        outs: &[&str],
+        config: Value,
+        counters: &[(&str, f64)],
+        ledger: &mut Ledger,
+    ) -> Vec<String> {
         let batches = |lines: &[&str]| {
             let text: String = lines
                 .iter()
@@ -3528,11 +3535,14 @@ mod tests {
         let table = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../spec/transit/mapping.yaml");
         let mapping = mapping::load(&table).expect("the committed table loads");
+        let kind: logit_config::ComponentKind =
+            serde_json::from_value(config).expect("a sink config");
+        let counters = counters.iter().map(|&(series, n)| (series.to_string(), n)).collect();
         let traced = Traced {
-            outcome: super::super::Outcome { events: Vec::new(), counters: BTreeMap::new() },
+            outcome: super::super::Outcome { events: Vec::new(), counters },
             sunk: batches(ins),
             decoded: batches(outs),
-            sink: config,
+            sink: serde_json::to_value(&kind).expect("the sink config serializes"),
         };
         let at = At { flow: "test", case: "test" };
         check(&mapping, &at, &traced, ledger)
@@ -3554,14 +3564,16 @@ mod tests {
         );
         let (log, metric) = (format!("{{{log}"), format!("{{{metric}"));
         let mut ledger = Ledger::default();
-        let config = serde_json::json!({"type": "datadog_out"});
-        check_sink(&ins, &[&log, &metric], config, &mut ledger);
+        let config = serde_json::json!({"type": "datadog_out", "api_key": "unused"});
+        let omitted = "logit.output.tags.omitted{component=out,kind=datadog_out,reason=reserved_key,role=sink}";
+        let failures = check_sink(&ins, &[&log, &metric], config, &[(omitted, 1.0)], &mut ledger);
         let reached = |row: &str| {
             ledger.cells.iter().any(|((sink, r, _), seen)| {
                 sink == "datadog_out" && r == row && seen.contains(&Class::Lost)
             })
         };
         assert!(reached("attributes/hostname"), "{:#?}", ledger.cells.keys().collect::<Vec<_>>());
+        assert!(failures.is_empty(), "{failures:#?}");
     }
 
     /// Under exposition, a record a later record of its series overwrote in the registry is
