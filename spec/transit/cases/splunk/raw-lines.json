@@ -1,0 +1,3 @@
+{"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"format":"raw","message":"first line"},"resource":{"attributes":{"com.splunk.index":"main","com.splunk.source":"/var/log/app.log","com.splunk.sourcetype":"app:log","host.name":"web 1"}}}
+{"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"format":"raw","message":"second line"},"resource":{"attributes":{"com.splunk.index":"main","com.splunk.source":"/var/log/app.log","com.splunk.sourcetype":"app:log","host.name":"web 1"}}}
+{"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"format":"raw","message":"third line"},"resource":{"attributes":{"com.splunk.index":"main","com.splunk.source":"/var/log/app.log","com.splunk.sourcetype":"app:log","host.name":"web 1"}}}

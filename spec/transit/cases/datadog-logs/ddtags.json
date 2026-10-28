@@ -1,0 +1,7 @@
+{"timestamp":"2027-01-15T07:59:50.000000000Z","log":{"format":"raw","message":"tags lifted"},"attributes":{"ddsource":"nginx","ddtags":"team:payments,canary","deployment.environment.name":"prod","host.name":"web-1","service.name":"checkout","service.version":"1.4.2"}}
+{"timestamp":"2027-01-15T07:59:50.001000000Z","log":{"format":"raw","message":"tags only lifted"},"attributes":{"ddsource":"nginx","deployment.environment.name":"prod","host.name":"web-1","service.version":"1.4.2"}}
+{"timestamp":"2027-01-15T07:59:50.002000000Z","log":{"format":"raw","message":"tags repeated"},"attributes":{"ddtags":"team:a,team:a","deployment.environment.name":"prod","host.name":"web-1"}}
+{"timestamp":"2027-01-15T07:59:50.003000000Z","log":{"format":"raw","message":"tags empty entries"},"attributes":{"ddtags":"team:a,,canary,","host.name":"web-1"}}
+{"timestamp":"2027-01-15T07:59:50.004000000Z","log":{"format":"raw","message":"service beside ddtags"},"attributes":{"ddtags":"team:a","host.name":"web-1","service.name":"checkout"}}
+{"timestamp":"2027-01-15T07:59:50.005000000Z","log":{"format":"raw","message":"container with ddtags"},"attributes":{"container.id":"3f1c9e8a2b7d","ddtags":"team:a","host.name":"web-1"}}
+{"timestamp":"2027-01-15T07:59:50.006000000Z","log":{"format":"raw","message":"container alone"},"attributes":{"container.id":"3f1c9e8a2b7d","ddsource":"docker","host.name":"web-1"}}

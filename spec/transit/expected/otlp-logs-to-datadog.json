@@ -1,0 +1,55 @@
+{
+  "beside-metrics": {"events": [
+    {"timestamp":"2027-01-15T08:00:04.000000000Z","log":{"severity":"warn","format":"raw","message":"queue depth high"},"attributes":{"host.name":"transit","queue":"orders","service.name":"orders","status":"warn"}},
+    {"timestamp":"2027-01-15T08:00:04.000000000Z","metrics":[{"name":"queue.depth","kind":"gauge","value":17.0}],"attributes":{"host.name":"transit","hostname":"web-1","queue":"orders","service.name":"orders"},"resource":{"attributes":{"_logit.datadog.units":"datadog"}}},
+    {"timestamp":"2027-01-15T08:00:04.000000000Z","metrics":[{"name":"queue.depth","kind":"gauge","value":18.0}],"attributes":{"host.name":"transit","queue":"payments"},"resource":{"attributes":{"_logit.datadog.units":"datadog"}}},
+    {"timestamp":"2027-01-15T08:00:04.000000000Z","metrics":[{"name":"queue.depth","kind":"gauge","value":19.0}],"attributes":{"host.name":"transit","queue":"refunds"},"resource":{"attributes":{"_logit.datadog.units":"datadog"}}},
+    {"timestamp":"2027-01-15T08:00:04.000000000Z","metrics":[{"name":"queue.depth","kind":"gauge","value":20.0}],"attributes":{"host.name":"transit","queue":"returns"},"resource":{"attributes":{"_logit.datadog.units":"datadog"}}},
+    {"timestamp":"2027-01-15T08:00:04.001000000Z","log":{"severity":"info","format":"raw","message":"{\"queue\":\"orders\",\"depth\":17}"},"attributes":{"host.name":"transit","queue":"payments","status":"info"}},
+    {"timestamp":"2027-01-15T08:00:04.002000000Z","log":{"severity":"info","format":"raw","message":"caf�"},"attributes":{"host.name":"transit","queue":"refunds","status":"info"}},
+    {"timestamp":"2027-01-15T08:00:04.003000000Z","log":{"severity":"info","format":"raw","message":"null"},"attributes":{"host.name":"transit","queue":"returns","status":"info"}}
+  ], "counters": {
+    "logit.output.tags.omitted{component=out,kind=datadog_out,reason=reserved_key,role=sink}": 2,
+    "logit.output.tags.omitted{component=out,kind=datadog_out,reason=unrepresentable,role=sink}": 1
+  }},
+  "bodies": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"severity":"info","format":"raw","message":"a plain line"},"attributes":{"body":"string","host.name":"transit","status":"info"}},
+    {"timestamp":"2027-01-15T08:00:00.001000000Z","log":{"severity":"info","format":"raw","message":"42"},"attributes":{"body":"int","host.name":"transit","status":"info"}},
+    {"timestamp":"2027-01-15T08:00:00.002000000Z","log":{"severity":"info","format":"raw","message":"2.5"},"attributes":{"body":"double","host.name":"transit","status":"info"}},
+    {"timestamp":"2027-01-15T08:00:00.003000000Z","log":{"severity":"info","format":"raw","message":"true"},"attributes":{"body":"bool","host.name":"transit","status":"info"}},
+    {"timestamp":"2027-01-15T08:00:00.004000000Z","log":{"severity":"info","format":"raw","message":"caf�"},"attributes":{"body":"bytes","host.name":"transit","status":"info"}},
+    {"timestamp":"2027-01-15T08:00:00.005000000Z","log":{"severity":"info","format":"raw","message":"{\"attempts\":3,\"user\":\"ada\"}"},"attributes":{"body":"map","host.name":"transit","status":"info"}},
+    {"timestamp":"2027-01-15T08:00:00.006000000Z","log":{"severity":"info","format":"raw","message":"[\"checkout\",7]"},"attributes":{"body":"array","host.name":"transit","status":"info"}},
+    {"timestamp":"2027-01-15T08:00:00.007000000Z","log":{"severity":"info","format":"raw","message":"null"},"attributes":{"body":"null","host.name":"transit","status":"info"}},
+    {"timestamp":"2027-01-15T08:00:00.008000000Z","log":{"severity":"info","format":"raw","message":""},"attributes":{"body":"empty","host.name":"transit","status":"info"}},
+    {"timestamp":"2027-01-15T08:00:00.009000000Z","log":{"severity":"info","format":"raw","message":"{\"level\":\"info\",\"msg\":\"started\"}"},"attributes":{"body":"json_text","host.name":"transit","status":"info"}},
+    {"timestamp":"2027-01-15T08:00:00.010000000Z","log":{"severity":"info","format":"raw","message":"abc"},"attributes":{"body":"bytes_utf8","host.name":"transit","status":"info"}}
+  ], "counters": {}},
+  "fields": {"events": [
+    {"timestamp":"2027-01-15T08:00:03.000000000Z","log":{"severity":"info","format":"raw","message":"<13>Jan 15 07:59:59 host app: relayed"},"attributes":{"host.name":"transit","service.name":"checkout","status":"info","syslog.timestamp":"2027-01-15T07:59:59.000000000Z"}},
+    {"timestamp":"2027-01-15T08:00:03.000000000Z","log":{"severity":"info","format":"raw","message":"observed later"},"attributes":{"big":18446744073709551615,"flag":true,"host.name":"transit","labels":["a",1],"nested":{"k":"v"},"raw":"Y2Fm6Q==","seen":"2027-01-15T07:59:00.000000000Z","service.name":"checkout","status":"info"},"types":{"/attributes/big":"u64"}}
+  ], "counters": {}},
+  "severity": {"events": [
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","log":{"severity":"trace","format":"raw","message":"trace band"},"attributes":{"host.name":"transit","status":"trace"}},
+    {"timestamp":"2027-01-15T08:00:01.001000000Z","log":{"severity":"debug","format":"raw","message":"debug band"},"attributes":{"host.name":"transit","status":"debug"}},
+    {"timestamp":"2027-01-15T08:00:01.002000000Z","log":{"severity":"info","format":"raw","message":"info band"},"attributes":{"host.name":"transit","status":"info"}},
+    {"timestamp":"2027-01-15T08:00:01.003000000Z","log":{"severity":"warn","format":"raw","message":"warn band"},"attributes":{"host.name":"transit","status":"warn"}},
+    {"timestamp":"2027-01-15T08:00:01.004000000Z","log":{"severity":"error","format":"raw","message":"error band"},"attributes":{"host.name":"transit","status":"error"}},
+    {"timestamp":"2027-01-15T08:00:01.005000000Z","log":{"severity":"fatal","format":"raw","message":"fatal band"},"attributes":{"host.name":"transit","status":"fatal"}},
+    {"timestamp":"2027-01-15T08:00:01.006000000Z","log":{"format":"raw","message":"no severity"},"attributes":{"host.name":"transit"}},
+    {"timestamp":"2027-01-15T08:00:01.007000000Z","log":{"severity":"info","format":"raw","message":"INFO2 from the wire"},"attributes":{"host.name":"transit","status":"info"}},
+    {"timestamp":"2027-01-15T08:00:01.008000000Z","log":{"severity":"warn","format":"raw","message":"a number only"},"attributes":{"host.name":"transit","status":"warn"}}
+  ], "counters": {}},
+  "telemetrygen": {"events": [
+    {"timestamp":"2026-09-10T21:22:17.985000000Z","log":{"severity":"info","format":"raw","message":"the message"},"attributes":{"app":"server","host.name":"transit","service.name":"telemetrygen","status":"info"}},
+    {"timestamp":"2026-09-10T21:22:17.985000000Z","log":{"severity":"info","format":"raw","message":"the message"},"attributes":{"app":"server","host.name":"transit","service.name":"telemetrygen","status":"info"}},
+    {"timestamp":"2026-09-10T21:22:18.985000000Z","log":{"severity":"info","format":"raw","message":"the message"},"attributes":{"app":"server","host.name":"transit","service.name":"telemetrygen","status":"info"}}
+  ], "counters": {}},
+  "trace": {"events": [
+    {"timestamp":"2027-01-15T08:00:02.000000000Z","log":{"severity":"info","format":"raw","message":"checkout completed"},"attributes":{"host.name":"transit","span_id":"eee19b7ec3c1b174","status":"info","trace_id":"5b8efff798038103d269b633813fc60c"}},
+    {"timestamp":"2027-01-15T08:00:02.001000000Z","log":{"severity":"info","format":"raw","message":"no span id"},"attributes":{"host.name":"transit","status":"info","trace_id":"5b8efff798038103d269b633813fc60d"}},
+    {"timestamp":"2027-01-15T08:00:02.002000000Z","log":{"severity":"info","format":"raw","message":"beside its span"},"attributes":{"host.name":"transit","status":"info"}},
+    {"timestamp":"2027-01-15T08:00:02.002000000Z","span":{"name":"GET /cart","trace_id":"5b8efff798038103d269b633813fc60e","span_id":"eee19b7ec3c1b175","kind":"internal","status":"unset","start":"2027-01-15T08:00:02.002000000Z","end":"2027-01-15T08:00:02.012000000Z","duration_ns":10000000},"attributes":{"_dd.p.tid":"5b8efff798038103"},"resource":{"attributes":{"host.name":"transit"}}},
+    {"timestamp":"2027-01-15T08:00:02.003000000Z","log":{"severity":"info","format":"raw","message":"an id attribute beside the trace"},"attributes":{"host.name":"transit","span_id":"app-0042","status":"info","trace_id":"app-7f3a"}}
+  ], "counters": {}}
+}

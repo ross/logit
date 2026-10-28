@@ -1,0 +1,4 @@
+# A hand-written /api/v2/logs body: the OTel-form `trace_id` and `span_id` keys beside
+# dd-trace's `dd.trace_id` and `dd.span_id`, and each form alone.
+wire: trace-ids.bin
+exercises: [log, trace_id_attributes, host]

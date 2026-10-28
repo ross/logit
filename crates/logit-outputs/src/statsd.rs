@@ -291,6 +291,7 @@
 //! | `log/dogstatsd_event`, otherwise | exact | -- | A log carrying the `_logit.statsd.event.*` carriers is a DogStatsD `_e` line again. |
 //! | `log/plain` | skipped | `logit.output.events.skipped{reason=no_metrics}` | Any other log on an event with no metrics has no statsd form and isn't written. |
 //! | `span/alone` | skipped | `logit.output.events.skipped{reason=no_metrics}` | A span on an event with no metrics has no statsd form and isn't written. |
+//! | `span/beside_log` | skipped | uncounted | A span has no statsd form. Beside a DogStatsD event, the event's line is written and the span left off, uncounted; beside any other log, `log/plain` counts the event skipped. |
 //! | `span/no_wire_form` | exact | -- | Nothing beyond `span/alone`'s outcome. |
 //! | `event/attributes_only` | skipped | `logit.output.events.skipped{reason=no_metrics}` | An event with no metric, log, or span has no statsd line and isn't written. |
 //! | `event/string_only` | skipped | `logit.output.events.skipped{reason=no_metrics}` | An InfluxDB point whose fields are all strings has no metric, so it has no statsd line and isn't written. |
@@ -346,7 +347,16 @@
 //! | `attributes/resource_attribute`, otherwise | normalized | `resource_merged` | A resource attribute is written as a tag, the event's value winning on a shared key, and reads back as an event attribute. |
 //! | `attributes/scope` | lost | structural | statsd has no instrumentation scope, so none is written. |
 //! | `attributes/datadog_carrier_log` | lost | structural | Another protocol's `_logit.` carrier is private and isn't a tag, so it's left off. |
+//! | `attributes/host_name` | exact | -- | A DogStatsD event's `h:` field, read back as `host.name`. |
+//! | `attributes/syslog_facility` | exact | -- | A log with no `syslog.facility` leaves with none. |
 //! | `attributes/no_host` | exact | -- | A record with no host leaves with none. |
+//! | `attributes/log_severity_fields` | exact | -- | No `otel.log.severity.*` attribute is written. |
+//! | `log/severity` | exact | -- | A DogStatsD event's `\|t:` alert type, written from its `_logit.statsd.event.alert_type` carrier, which statsd_in reads back as the severity. |
+//! | `log/severity_unset` | exact | -- | A DogStatsD event with no alert type, read back as no severity. |
+//! | `log/body_format` | exact | -- | A DogStatsD event's text, read back as a `raw` message. |
+//! | `log/observed_timestamp_unset` | exact | -- | No observed time is written, and none reads back. |
+//! | `log/trace_unset` | exact | -- | No trace is written, and none reads back. |
+//! | `log/timestamp` | normalized | `receipt_time` | A DogStatsD event carries `\|d:` whole seconds only when it arrived with one, so any other event's time is the time statsd_in received it. |
 //! | `log/beside_metrics` | lost | uncounted | A log on an event that also carries metrics is left off while the metrics are written, uncounted. |
 //! | `span/beside_metrics` | lost | uncounted | A span on an event that also carries metrics is left off while the metrics are written, uncounted. |
 //!

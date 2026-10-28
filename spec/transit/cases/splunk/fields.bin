@@ -1,0 +1,3 @@
+{"time":1790000000,"event":"nested","fields":{"http":{"method":"GET","status":200,"tls":{"version":"1.3"}},"tags":[{"a":1},"b"],"empty":{},"list":["x","y"],"n":1.5,"flag":true,"big":18446744073709551615,"nothing":null}}
+{"time":1790000001,"event":"host in fields","host":"envelope-host","fields":{"host.name":"fields-host","k":"v"}}
+{"time":1790000002,"event":"fields not an object","fields":["x"]}

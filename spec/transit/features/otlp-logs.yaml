@@ -1,0 +1,81 @@
+# The OTLP logs wire features a case under cases/otlp-logs/ can exercise, from
+# crates/logit-proto/src/otlp/logs.rs's module doc, crates/logit-proto/src/otlp/common.rs's
+# `Value` ↔ `AnyValue` and resource and scope mapping, and crates/logit-inputs/src/otlp.rs's
+# OTLP/HTTP request handling. A case names the ones it exercises in its `.meta.yaml`. Metrics are
+# cases/otlp/'s (features/otlp.yaml).
+- name: collector_file_export
+  text: >-
+    The OTel Collector `file` exporter's OTLP/JSON lines, one request per line, its signal named
+    by the line's top-level key, as `testdata/interop/otlp/` records them.
+- name: otlp_json
+  text: An OTLP/JSON `/v1/logs` body.
+- name: body_string
+  text: A `stringValue` body, decoded to a `Str` message.
+- name: body_int
+  text: An `intValue` body, decoded to an `I64` message.
+- name: body_double
+  text: A `doubleValue` body, decoded to an `F64` message.
+- name: body_bool
+  text: A `boolValue` body, decoded to a `Bool` message.
+- name: body_bytes
+  text: A `bytesValue` body, decoded to a `Bytes` message.
+- name: body_kvlist
+  text: A `kvlistValue` body, decoded to a `Map` message.
+- name: body_array
+  text: An `arrayValue` body, decoded to an `Array` message.
+- name: body_absent
+  text: A log record with no body, decoded to a `Null` message.
+- name: body_empty
+  text: An empty `stringValue` body.
+- name: body_format
+  text: >-
+    A body format other than `raw`, which `otlp_out` writes as the `logit.body_format`
+    attribute and `otlp_in` reads back into the log's format.
+- name: severity_bands
+  text: >-
+    A `severity_number` at the base of each of the six bands, decoded to its `Severity`, with no
+    raw carrier.
+- name: severity_unset
+  text: A log record with `SEVERITY_NUMBER_UNSPECIFIED` and no severity text.
+- name: severity_number_and_text
+  text: >-
+    A `severity_number` and `severity_text`, kept as the `_logit.otel.severity_number` and
+    `_logit.otel.severity_text` carriers beside the band's `Severity`.
+- name: severity_number_only
+  text: A `severity_number` with no text, kept as the `_logit.otel.severity_number` carrier alone.
+- name: event_name
+  text: A log record's `event_name`.
+- name: trace_context
+  text: A log record's `trace_id` and `span_id`, decoded to the log's trace reference.
+- name: trace_flags
+  text: A log record's `flags`, whose low 8 bits are the W3C trace flags.
+- name: trace_no_span_id
+  text: A log record with a `trace_id` and no `span_id`.
+- name: log_beside_span
+  text: >-
+    A log with no trace on an event that also carries a span, which `otlp_out` writes with the
+    span's ids.
+- name: observed_timestamp
+  text: A log record's `observed_time_unix_nano`.
+- name: dropped_attributes_count
+  text: A log record's `dropped_attributes_count`.
+- name: empty_scope
+  text: An all-empty `InstrumentationScope`, decoded to no scope.
+- name: named_scope
+  text: An `InstrumentationScope` with a name, a version, and a schema URL.
+- name: schema_url
+  text: A resource's `schemaUrl`.
+- name: resource_attributes
+  text: Resource attributes, such as `service.name`.
+- name: attribute_values
+  text: A bool, an array, a key-value list, and a bytes attribute.
+- name: attribute_u64
+  text: A `u64` attribute above `i64::MAX`, which OTLP's `intValue` can't hold.
+- name: attribute_timestamp
+  text: A timestamp attribute, which OTLP has no value type for.
+- name: syslog_timestamp_attribute
+  text: >-
+    A `syslog.timestamp` attribute on a log relayed from syslog, whose `event.timestamp` is when
+    it was received.
+- name: log_beside_metrics
+  text: A log on an event that also carries metrics.

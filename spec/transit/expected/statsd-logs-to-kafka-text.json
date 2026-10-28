@@ -1,0 +1,24 @@
+{
+  "event": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"format":"raw","message":"abc"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"format":"raw","message":"first\nline"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"format":"raw","message":"text"}}
+  ], "counters": {}},
+  "event-beside-span": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"format":"raw","message":"rolled out"}}
+  ], "counters": {
+    "logit.output.spans.omitted{component=out,kind=kafka_out,reason=format,role=sink}": 1
+  }},
+  "log-only": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"format":"raw","message":"request served"}}
+  ], "counters": {}},
+  "payload-less": {"events": [], "counters": {
+    "logit.output.events.skipped{component=out,kind=kafka_out,reason=no_log,role=sink}": 2
+  }},
+  "span-beside-metrics": {"events": [], "counters": {
+    "logit.output.events.skipped{component=out,kind=kafka_out,reason=no_log,role=sink}": 1
+  }},
+  "span-only": {"events": [], "counters": {
+    "logit.output.events.skipped{component=out,kind=kafka_out,reason=no_log,role=sink}": 1
+  }}
+}

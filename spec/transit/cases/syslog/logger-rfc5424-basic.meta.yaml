@@ -1,0 +1,4 @@
+# logger(1) in RFC 5424 mode, with nil PROCID and MSGID and a timeQuality
+# STRUCTURED-DATA element, read in place from testdata/interop/.
+wire: ../../../../testdata/interop/syslog/logger-rfc5424-basic-000.raw
+exercises: [rfc5424, structured_data, nil_fields]

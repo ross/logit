@@ -1,0 +1,5 @@
+# A hand-written /event body of envelope forms: a numeric `index`, kept as its JSON text and
+# counted `events.degraded{reason=non_string_envelope}`; a `null` carrier, read as absent; and an
+# unknown envelope key, dropped and counted `events.degraded{reason=unknown_envelope_key}`.
+wire: envelope.bin
+exercises: [event_route, string_event, time_integer, envelope, envelope_partial, envelope_non_string, unknown_envelope_key, two_envelopes]

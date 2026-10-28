@@ -40,7 +40,7 @@ pub(crate) fn json_to_value(json: &Json) -> Value {
 /// A `Value` as the text a JSON string field carries (a Datadog `message` or check name, a HEC
 /// `event` string): `Str` as-is, `Bytes` as lossy UTF-8 (a raw log line, not binary data), anything else
 /// as its JSON text.
-pub(crate) fn value_text(value: &Value) -> Cow<'_, str> {
+pub fn value_text(value: &Value) -> Cow<'_, str> {
     match value {
         Value::Str(_) => Cow::Borrowed(value.as_str().unwrap_or_default()),
         Value::Bytes(b) => String::from_utf8_lossy(b),
@@ -92,7 +92,7 @@ pub(crate) fn write_i64(out: &mut Vec<u8>, n: i64) {
 
 /// `Value` → JSON: `Bytes` → a base64 string, `Timestamp` → an RFC 3339 string, a non-finite
 /// `F64` → `null` (JSON has no spelling for it), `Map`/`Array` nested.
-pub(crate) fn write_value(out: &mut Vec<u8>, value: &Value) {
+pub fn write_value(out: &mut Vec<u8>, value: &Value) {
     match value {
         Value::Null => out.extend_from_slice(b"null"),
         Value::Bool(b) => out.extend_from_slice(if *b { b"true" } else { b"false" }),
@@ -145,7 +145,7 @@ pub(crate) const FLATTEN_MAX_DEPTH: usize = 32;
 /// than stringifying it, and writes a depth-capped map back whole rather than as text. A key
 /// collision is last write wins, as in `flatten`: `out` is an [`AttrMap`], so a later insert
 /// overwrites.
-pub(crate) fn flatten_into(prefix: &str, value: &Value, out: &mut AttrMap) {
+pub fn flatten_into(prefix: &str, value: &Value, out: &mut AttrMap) {
     let mut path = String::from(prefix);
     flatten_at(&mut path, value, out, 0);
 }

@@ -1,0 +1,4 @@
+# The recorded capture: telemetrygen's three `the message` log records through a Collector's
+# `file` exporter, in one empty scope under one resource, each with a dropped-attribute count.
+wire: ../../../../testdata/interop/otlp/logs.json
+exercises: [collector_file_export, otlp_json, body_string, severity_number_and_text, dropped_attributes_count, empty_scope, schema_url, resource_attributes]

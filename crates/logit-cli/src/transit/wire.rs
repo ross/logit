@@ -10,26 +10,35 @@
 //! | `prometheus_out`, `endpoint:` | one compressed request per batch | `decompress_bounded`, `remote_write::decode`, then `families_to_events` per timestamp group |
 //! | `datadog_out` | one uncompressed request per route per batch, one per event on the events route, with the sink's routing (`encode_routes`) and none of its stale filter, tag limit, trace readiness gate, or size cuts | `datadog_in`'s `decode_request`, by the request's path and `Content-Type` |
 //! | `graphite_out` | each `MessageBuf` entry: one plaintext line, or one length-prefixed pickle frame, line-capped as the sink's transport caps it | `GraphiteDecoder` of the encoder's protocol, one entry at a time, a pickle frame's length prefix stripped as `graphite_in`'s framer strips it |
+//! | `syslog_out` | each `MessageBuf` entry: one message, capped as the sink's transport caps it | `SyslogDecoder`, one entry at a time: a UDP datagram with line splitting on, `syslog_in`'s default `framing: lines`, or under `transport: tcp` one octet-counted frame's payload with line splitting off |
+//! | `splunk_hec_out` | each `MessageBuf` entry: one HEC object (`encode_objects`), an object over `max_body_bytes` dropped and counted as the sink drops it, the rest joined into one `/event` body per batch | `SplunkDecoder::decode_events` |
+//! | `kafka_out` | each `MessageBuf` entry: one record's value, with none of the producer's batching, compression, or per-record size check | no `kafka_in` exists, so a convention, not a pair's decoder: under `format: json`, `EventJsonDecoder::decode_batches` per record; under `format: text`, one log per record, its message the value (a `Str`, or `Bytes` where it isn't UTF-8) with no severity, a `raw` body format, and no other field, at the record's millisecond timestamp, under an empty resource. Any other `format:` fails the run |
 //!
-//! The statsd and InfluxDB encoders return their counts, so this counts them through the sink's
-//! own reporting functions; the OTLP, Prometheus, Datadog, and Graphite encoders count through
-//! the handle they hold.
+//! The statsd, InfluxDB, syslog, and Kafka encoders return their counts, so this counts them through the
+//! sink's own reporting functions; the OTLP, Prometheus, Datadog, Graphite, and Splunk encoders
+//! count through the handle they hold.
 //! A decode error fails the run: the pair's decoder refusing its own sink's bytes is a finding.
 
 use crate::pipeline::SinkEncoder;
 use anyhow::Context;
 use bytes::Bytes;
 use http::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
-use logit_core::{Diagnostics, EventBatch, Resource, Telemetry};
+use logit_core::{
+    BodyFormat, Diagnostics, Event, EventBatch, LogRecord, Resource, Telemetry, Value,
+};
+use logit_outputs::kafka::RecordFormat;
 use logit_pipeline::test_util::TelemetryProbe;
 use logit_proto::datadog::DatadogDecoder;
+use logit_proto::event_json::EventJsonDecoder;
 use logit_proto::graphite::pickle::LENGTH_PREFIX_BYTES;
 use logit_proto::graphite::{GraphiteDecoder, Protocol as GraphiteProtocol};
 use logit_proto::influxdb::{write_resource, InfluxDecoder, Precision};
 use logit_proto::otlp::OtlpDecoder;
 use logit_proto::prometheus::compression::decompress_bounded;
 use logit_proto::prometheus::{families_to_events, remote_write, text, Dialect, PrometheusDecoder};
+use logit_proto::splunk::SplunkDecoder;
 use logit_proto::statsd::StatsdDecoder;
+use logit_proto::syslog::SyslogDecoder;
 use logit_proto::{Decoder, Encoder, FramedEncoder, MessageBuf, SignalDecoder, SignalEncoder};
 use std::sync::Arc;
 
@@ -224,6 +233,94 @@ pub(super) fn round_trip(
                 }
             }
         }
+        SinkEncoder::Syslog { mut encoder, tcp } => {
+            let (telemetry, diag) = decode.handles("syslog_in");
+            let mut decoder = SyslogDecoder::new(empty())
+                .with_line_splitting(!tcp)
+                .with_telemetry(telemetry)
+                .with_diagnostics(diag);
+            let mut messages = MessageBuf::default();
+            for batch in batches {
+                let stats = encoder.encode_into(batch, &mut messages);
+                logit_outputs::syslog::report_encode_stats(sink, &stats);
+                let mut events = Vec::new();
+                let mut resource = empty();
+                for message in messages.iter() {
+                    (resource, _) = decoder
+                        .decode_into(
+                            Bytes::copy_from_slice(message),
+                            decode.received_at,
+                            &mut events,
+                        )
+                        .with_context(|| {
+                            format!("syslog_in refused {:?}", String::from_utf8_lossy(message))
+                        })?;
+                }
+                if !events.is_empty() {
+                    out.push(EventBatch { resource, scope: None, events });
+                }
+            }
+        }
+        SinkEncoder::Splunk { mut encoder, max_body_bytes } => {
+            let (telemetry, diag) = decode.handles("splunk_hec_in");
+            let mut decoder = SplunkDecoder::new().with_telemetry(telemetry).with_diagnostics(diag);
+            let mut sink_diag = sink_diag.clone();
+            let mut objects = MessageBuf::default();
+            for batch in batches {
+                encoder.encode_objects(batch, &mut objects);
+                logit_outputs::splunk::count_oversize(
+                    &objects,
+                    max_body_bytes,
+                    sink,
+                    &mut sink_diag,
+                );
+                let mut body = Vec::new();
+                for object in objects.iter().filter(|object| object.len() <= max_body_bytes) {
+                    body.extend_from_slice(object);
+                }
+                if body.is_empty() {
+                    continue;
+                }
+                let decoded = decoder.decode_events(&body, decode.received_at).map_err(|err| {
+                    anyhow::anyhow!(
+                        "splunk_hec_in refused {:?}: {err}",
+                        String::from_utf8_lossy(&body)
+                    )
+                })?;
+                out.extend(decoded);
+            }
+        }
+        SinkEncoder::Kafka { mut encoder, format } => {
+            let mut decoder = EventJsonDecoder::new();
+            let mut records = MessageBuf::default();
+            for batch in batches {
+                let stats = encoder.encode_into(batch, &mut records);
+                logit_outputs::kafka::report_encode_stats(sink, &stats);
+                match format {
+                    RecordFormat::Json => {
+                        for record in records.iter() {
+                            let decoded = decoder.decode_batches(record).with_context(|| {
+                                format!(
+                                    "the event JSON reader refused {:?}",
+                                    String::from_utf8_lossy(record)
+                                )
+                            })?;
+                            out.extend(decoded);
+                        }
+                    }
+                    RecordFormat::Text => {
+                        let events: Vec<Event> = records
+                            .iter_with()
+                            .map(|(value, meta)| text_record(value, meta.timestamp))
+                            .collect();
+                        if !events.is_empty() {
+                            out.push(EventBatch { resource: empty(), scope: None, events });
+                        }
+                    }
+                    other => anyhow::bail!("kafka_out's {other:?} format has no read-back here"),
+                }
+            }
+        }
         SinkEncoder::PrometheusRemoteWrite { mut encoder, version, compression } => {
             let (telemetry, diag) = decode.handles("prometheus_in");
             // A remote-write sample always carries a timestamp, so `prometheus_in` stamps no
@@ -254,4 +351,23 @@ pub(super) fn round_trip(
         }
     }
     Ok(out)
+}
+
+/// A `format: text` record read back by the driver's convention (module doc): one log whose
+/// message is `value`, stamped at `millis`.
+fn text_record(value: &[u8], millis: i64) -> Event {
+    let message = match std::str::from_utf8(value) {
+        Ok(text) => Value::str(text),
+        Err(_) => Value::Bytes(Bytes::copy_from_slice(value)),
+    };
+    let record = LogRecord {
+        message,
+        severity: None,
+        body_format: BodyFormat::Raw,
+        trace: None,
+        event_name: None,
+        observed_timestamp: 0,
+        dropped_attributes_count: 0,
+    };
+    Event::log(millis.saturating_mul(1_000_000), logit_core::AttrMap::new(), record)
 }

@@ -1,0 +1,28 @@
+{
+  "cells": [
+    {"sink":"kafka_out","row":"attributes/array_value","cell":1,"observed":["exact"]},
+    {"sink":"kafka_out","row":"attributes/bool_value","cell":1,"observed":["exact"]},
+    {"sink":"kafka_out","row":"attributes/container_id","cell":1,"observed":["exact"]},
+    {"sink":"kafka_out","row":"attributes/datadog_carrier_log","cell":1,"observed":["exact"]},
+    {"sink":"kafka_out","row":"attributes/foreign_carrier","cell":1,"observed":["exact"]},
+    {"sink":"kafka_out","row":"attributes/host_name","cell":1,"observed":["exact"]},
+    {"sink":"kafka_out","row":"attributes/log_severity_fields","cell":0,"observed":["exact"]},
+    {"sink":"kafka_out","row":"attributes/map_value","cell":1,"observed":["exact"]},
+    {"sink":"kafka_out","row":"attributes/no_host","cell":0,"observed":["exact"]},
+    {"sink":"kafka_out","row":"attributes/null_value","cell":1,"observed":["exact"]},
+    {"sink":"kafka_out","row":"attributes/number_value","cell":1,"observed":["exact"]},
+    {"sink":"kafka_out","row":"attributes/service_identity","cell":1,"observed":["exact"]},
+    {"sink":"kafka_out","row":"attributes/string_value","cell":1,"observed":["exact"]},
+    {"sink":"kafka_out","row":"attributes/syslog_facility","cell":0,"observed":["exact"]},
+    {"sink":"kafka_out","row":"log/blank_message","cell":1,"observed":["exact"]},
+    {"sink":"kafka_out","row":"log/body_format","cell":1,"observed":["exact"]},
+    {"sink":"kafka_out","row":"log/dogstatsd_event","cell":1,"observed":["exact"]},
+    {"sink":"kafka_out","row":"log/observed_timestamp_unset","cell":1,"observed":["exact"]},
+    {"sink":"kafka_out","row":"log/plain","cell":1,"observed":["exact"]},
+    {"sink":"kafka_out","row":"log/severity","cell":1,"observed":["exact"]},
+    {"sink":"kafka_out","row":"log/severity_unset","cell":1,"observed":["exact"]},
+    {"sink":"kafka_out","row":"log/timestamp","cell":1,"observed":["exact"]},
+    {"sink":"kafka_out","row":"log/trace_unset","cell":1,"observed":["exact"]}
+  ],
+  "unspecified": []
+}

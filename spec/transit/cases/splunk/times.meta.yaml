@@ -1,0 +1,5 @@
+# A hand-written /event body of `time` forms: an integer, a number with nine decimals, a
+# string, none (the receipt time), and a bool, read as the receipt time and counted
+# `events.degraded{reason=bad_time}`.
+wire: times.bin
+exercises: [event_route, string_event, time_integer, time_fractional, time_string, time_absent, time_bad, envelope_absent]

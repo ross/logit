@@ -1,0 +1,5 @@
+{"timestamp":"2026-09-21T14:13:20.000000000Z","log":{"severity":"info","format":"raw","message":"started","event_name":"app.start","trace_id":"0af7651916cd43dd8448eb211c80319c","span_id":"b7ad6b7169203331","trace_flags":0},"attributes":{"k":"v","otel.log.severity.number":10,"otel.log.severity.text":"INFO2"}}
+{"timestamp":"2026-09-21T14:13:21.000000000Z","log":{"severity":"error","format":"raw","message":"text only"},"attributes":{"otel.log.severity.text":"error"}}
+{"timestamp":"2026-09-21T14:13:22.000000000Z","log":{"severity":"fatal","format":"raw","message":"number only"},"attributes":{"otel.log.severity.number":21}}
+{"timestamp":"2026-09-21T14:13:23.000000000Z","log":{"format":"raw","message":"trace with no span","trace_id":"0af7651916cd43dd8448eb211c80319c","trace_flags":0}}
+{"timestamp":"2026-09-21T14:13:24.000000000Z","log":{"format":"raw","message":"bad trace"},"attributes":{"span_id":"b7ad6b7169203331","trace_id":"xyz"}}

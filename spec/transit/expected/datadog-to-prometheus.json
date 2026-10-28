@@ -1,10 +1,4 @@
 {
-  "agent-events": {"events": [], "counters": {
-    "logit.output.events.skipped{component=out,kind=prometheus_out,reason=no_metrics,role=sink}": 1
-  }},
-  "agent-logs": {"events": [], "counters": {
-    "logit.output.events.skipped{component=out,kind=prometheus_out,reason=no_metrics,role=sink}": 3
-  }},
   "agent-series-timestamped": {"events": [
     {"timestamp":"2026-09-21T14:13:21.000000000Z","metrics":[{"name":"record_batch_lag","kind":"gauge","value":2.5}],"attributes":{"deployment_environment_name":"record","host_name":"record-fixtures","service_name":"record-fixtures","service_version":"1.2.3","team":"obs"}}
   ], "counters": {

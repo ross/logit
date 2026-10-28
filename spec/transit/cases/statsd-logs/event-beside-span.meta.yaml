@@ -1,0 +1,4 @@
+# A hand-written DogStatsD event with a span on the same event, so a sink reaches
+# `log/dogstatsd_event` and `span/beside_log` together: `statsd_out` writes the event's line and
+# leaves the span off.
+exercises: [event]

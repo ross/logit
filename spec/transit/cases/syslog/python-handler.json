@@ -1,0 +1,1 @@
+{"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"severity":"info","format":"raw","message":"hello from python logging.handlers.SysLogHandler, captured for logit interop fixtures"},"attributes":{"_logit.syslog.severity":6,"syslog.facility":1},"types":{"/attributes/_logit.syslog.severity":"u64","/attributes/syslog.facility":"u64"}}

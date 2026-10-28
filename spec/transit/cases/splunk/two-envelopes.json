@@ -1,0 +1,3 @@
+{"timestamp":"2026-09-21T14:13:20.000000000Z","log":{"format":"raw","message":"a one"},"resource":{"attributes":{"host.name":"a"}}}
+{"timestamp":"2026-09-21T14:13:22.000000000Z","log":{"format":"raw","message":"a two"},"resource":{"attributes":{"host.name":"a"}}}
+{"timestamp":"2026-09-21T14:13:21.000000000Z","log":{"format":"raw","message":"b one"},"resource":{"attributes":{"host.name":"b"}}}

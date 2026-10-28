@@ -1,0 +1,11 @@
+# The statsd and DogStatsD wire features a case under cases/statsd-logs/ can exercise: the subset
+# of features/statsd.yaml a DogStatsD event line carries. Its other cases are hand-written log,
+# span, and payload-less events, as cases/statsd/'s span cases are, for the log sinks, which have
+# no metric-kind cells. Metric lines are cases/statsd/'s.
+- name: event
+  text: A DogStatsD `_e` event, decoded to a log with its carriers.
+- name: tags
+  text: A DogStatsD `|#` tag segment, valued and bare tags both.
+- name: host
+  text: >-
+    An event's `h:` field, decoded to `host.name` as a DogStatsD Agent reads it.

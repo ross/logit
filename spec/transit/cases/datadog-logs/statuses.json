@@ -1,0 +1,17 @@
+{"timestamp":"2027-01-15T07:59:50.000000000Z","log":{"severity":"fatal","format":"raw","message":"status emergency"},"attributes":{"ddsource":"python","host.name":"web-1","service.name":"checkout","status":"emergency"}}
+{"timestamp":"2027-01-15T07:59:50.001000000Z","log":{"severity":"fatal","format":"raw","message":"status emerg"},"attributes":{"ddsource":"python","host.name":"web-1","service.name":"checkout","status":"emerg"}}
+{"timestamp":"2027-01-15T07:59:50.002000000Z","log":{"severity":"fatal","format":"raw","message":"status alert"},"attributes":{"ddsource":"python","host.name":"web-1","service.name":"checkout","status":"alert"}}
+{"timestamp":"2027-01-15T07:59:50.003000000Z","log":{"severity":"fatal","format":"raw","message":"status critical"},"attributes":{"ddsource":"python","host.name":"web-1","service.name":"checkout","status":"critical"}}
+{"timestamp":"2027-01-15T07:59:50.004000000Z","log":{"severity":"fatal","format":"raw","message":"status crit"},"attributes":{"ddsource":"python","host.name":"web-1","service.name":"checkout","status":"crit"}}
+{"timestamp":"2027-01-15T07:59:50.005000000Z","log":{"severity":"fatal","format":"raw","message":"status fatal"},"attributes":{"ddsource":"python","host.name":"web-1","service.name":"checkout","status":"fatal"}}
+{"timestamp":"2027-01-15T07:59:50.006000000Z","log":{"severity":"error","format":"raw","message":"status error"},"attributes":{"ddsource":"python","host.name":"web-1","service.name":"checkout","status":"error"}}
+{"timestamp":"2027-01-15T07:59:50.007000000Z","log":{"severity":"error","format":"raw","message":"status err"},"attributes":{"ddsource":"python","host.name":"web-1","service.name":"checkout","status":"err"}}
+{"timestamp":"2027-01-15T07:59:50.008000000Z","log":{"severity":"warn","format":"raw","message":"status warning"},"attributes":{"ddsource":"python","host.name":"web-1","service.name":"checkout","status":"warning"}}
+{"timestamp":"2027-01-15T07:59:50.009000000Z","log":{"severity":"warn","format":"raw","message":"status warn"},"attributes":{"ddsource":"python","host.name":"web-1","service.name":"checkout","status":"warn"}}
+{"timestamp":"2027-01-15T07:59:50.010000000Z","log":{"severity":"info","format":"raw","message":"status notice"},"attributes":{"ddsource":"python","host.name":"web-1","service.name":"checkout","status":"notice"}}
+{"timestamp":"2027-01-15T07:59:50.011000000Z","log":{"severity":"info","format":"raw","message":"status info"},"attributes":{"ddsource":"python","host.name":"web-1","service.name":"checkout","status":"info"}}
+{"timestamp":"2027-01-15T07:59:50.012000000Z","log":{"severity":"debug","format":"raw","message":"status debug"},"attributes":{"ddsource":"python","host.name":"web-1","service.name":"checkout","status":"debug"}}
+{"timestamp":"2027-01-15T07:59:50.013000000Z","log":{"severity":"trace","format":"raw","message":"status trace"},"attributes":{"ddsource":"python","host.name":"web-1","service.name":"checkout","status":"trace"}}
+{"timestamp":"2027-01-15T07:59:50.014000000Z","log":{"severity":"warn","format":"raw","message":"status Warning"},"attributes":{"ddsource":"python","host.name":"web-1","service.name":"checkout","status":"Warning"}}
+{"timestamp":"2027-01-15T07:59:50.015000000Z","log":{"format":"raw","message":"status verbose"},"attributes":{"ddsource":"python","host.name":"web-1","service.name":"checkout","status":"verbose"}}
+{"timestamp":"2027-01-15T07:59:50.016000000Z","log":{"format":"raw","message":"status absent"},"attributes":{"ddsource":"python","host.name":"web-1","service.name":"checkout"}}

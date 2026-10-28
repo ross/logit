@@ -1,10 +1,4 @@
 {
-  "agent-events": {"events": [
-    {"timestamp":"2026-09-24T22:40:42.000000000Z","log":{"format":"raw","message":"Version 7.83.3"},"attributes":{"_logit.statsd.event.source_type":"System","_logit.statsd.event.title":"Agent Startup","host.name":"record-fixtures"}}
-  ], "counters": {}},
-  "agent-logs": {"events": [], "counters": {
-    "logit.output.events.skipped{component=out,kind=statsd_out,reason=no_metrics,role=sink}": 3
-  }},
   "agent-series-timestamped": {"events": [
     {"timestamp":"2026-09-21T14:13:21.000000000Z","metrics":[{"name":"record.batch.lag","kind":"gauge","value":2.5}],"attributes":{"deployment.environment.name":"record","host.name":"record-fixtures","service.name":"record-fixtures","service.version":"1.2.3","team":"obs"}},
     {"timestamp":"2026-09-21T14:13:21.000000000Z","metrics":[{"name":"record.batch.lag","kind":"gauge","value":2.5}],"attributes":{"deployment.environment.name":"record","host.name":"record-fixtures","service.name":"record-fixtures","service.version":"1.2.3","team":"obs"}},

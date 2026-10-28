@@ -1,0 +1,58 @@
+{
+  "bytes-message": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"format":"raw","message":"b\"caf\\xe9 \\xff\\xfe binary\""},"types":{"/log/message":"bytes"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"format":"raw","message":"b\"caf\\xe9 latin-1\""},"types":{"/log/message":"bytes"}}
+  ], "counters": {}},
+  "logger-rfc3164-basic": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"format":"raw","message":"hello from logger(1), captured for logit interop fixtures"}}
+  ], "counters": {}},
+  "logger-rfc3164-unicode": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"format":"raw","message":"héllo wörld — ünïcödé ✓ (UTF-8 multibyte smoke test)"}}
+  ], "counters": {}},
+  "logger-rfc5424-basic": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"format":"raw","message":"hello from logger(1) in RFC 5424 mode, captured for logit interop fixtures"}}
+  ], "counters": {}},
+  "nil-fields": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"format":"raw","message":"every optional field nil"}}
+  ], "counters": {}},
+  "opt-in-attributes": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"format":"raw","message":"every value type"}},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","log":{"format":"raw","message":"beside its own element"}},
+    {"timestamp":"2027-01-15T08:00:02.000000000Z","log":{"format":"raw","message":"colliding element"}},
+    {"timestamp":"2027-01-15T08:00:03.000000000Z","log":{"format":"raw","message":"host and service keys"}},
+    {"timestamp":"2027-01-15T08:00:04.000000000Z","log":{"format":"raw","message":"service beside its key"}}
+  ], "counters": {}},
+  "pid": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"format":"raw","message":"bracketed pid"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"format":"raw","message":"decimal procid"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"format":"raw","message":"leading-zero procid"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"format":"raw","message":"procid with no app-name"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"format":"raw","message":"token procid"}}
+  ], "counters": {}},
+  "pri-bounds": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"format":"raw","message":"kern.debug"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"format":"raw","message":"kern.emerg"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"format":"raw","message":"local7.debug"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"format":"raw","message":"local7.emerg"}}
+  ], "counters": {}},
+  "python-handler": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"format":"raw","message":"hello from python logging.handlers.SysLogHandler, captured for logit interop fixtures"}}
+  ], "counters": {}},
+  "python-handler-json": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"format":"raw","message":"{\"level\": \"info\", \"msg\": \"request handled\", \"path\": \"/\", \"status\": 200}"}}
+  ], "counters": {}},
+  "rsyslog": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"format":"raw","message":"hello from rsyslog, captured for logit interop fixtures"}}
+  ], "counters": {}},
+  "rsyslog-tcp": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"format":"raw","message":"hello from rsyslog, captured for logit interop fixtures"}}
+  ], "counters": {}},
+  "sniff-fallback": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"format":"raw","message":"1 2027-01-15T07:59:08Z web-1 app - - [unclosed sd"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"format":"raw","message":"1 not-a-timestamp web-1 app - - - bad timestamp"}}
+  ], "counters": {}},
+  "timestamps": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"format":"raw","message":"offset and fraction"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"format":"raw","message":"out of range"}}
+  ], "counters": {}}
+}

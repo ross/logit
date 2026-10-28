@@ -1,0 +1,5 @@
+# A hand-written /event body of the OpenTelemetry exporter's log fields: a severity number with
+# its text (OTLP's INFO2, 10), `otel.log.name`, uppercase hex ids, the text alone, the number
+# alone, a `trace_id` with no `span_id`, and an id that doesn't parse, which stays an attribute.
+wire: otel-fields.bin
+exercises: [event_route, string_event, fields, otel_severity, otel_log_name, trace_ids, trace_ids_invalid, time_integer, envelope_absent]

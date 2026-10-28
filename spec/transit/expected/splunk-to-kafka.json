@@ -1,0 +1,114 @@
+{
+  "bodies": {"events": [
+    {"timestamp":"2026-09-21T14:13:20.000000000Z","log":{"format":"json","message":{"a":{"b":[1,"x"]},"c":"d"}}},
+    {"timestamp":"2026-09-21T14:13:21.000000000Z","log":{"format":"json","message":[true,null,1]}},
+    {"timestamp":"2026-09-21T14:13:22.000000000Z","log":{"format":"raw","message":42}},
+    {"timestamp":"2026-09-21T14:13:23.000000000Z","log":{"format":"raw","message":1.5}},
+    {"timestamp":"2026-09-21T14:13:24.000000000Z","log":{"format":"raw","message":false}},
+    {"timestamp":"2026-09-21T14:13:25.000000000Z","log":{"format":"raw","message":-7}}
+  ], "counters": {}},
+  "docker-inline": {"events": [
+    {"timestamp":"2026-09-25T17:49:47.350212000Z","log":{"format":"json","message":{"line":"{\"level\":\"info\",\"msg\":\"splunk-docker fixture inline\",\"n\":1}","source":"stdout","tag":"08864e218903"}},"resource":{"attributes":{"host.name":"splunk-docker-fixture"}}},
+    {"timestamp":"2026-09-25T17:49:47.350273000Z","log":{"format":"json","message":{"line":"splunk-docker fixture plain line (inline)","source":"stdout","tag":"08864e218903"}},"resource":{"attributes":{"host.name":"splunk-docker-fixture"}}}
+  ], "counters": {}},
+  "docker-json": {"events": [
+    {"timestamp":"2026-09-25T17:49:47.853642000Z","log":{"format":"json","message":{"line":{"level":"info","msg":"splunk-docker fixture json","n":1},"source":"stdout","tag":"6a47e0a85763"}},"resource":{"attributes":{"com.splunk.index":"main","com.splunk.source":"docker:fixture","com.splunk.sourcetype":"docker:json","host.name":"splunk-docker-fixture"}}},
+    {"timestamp":"2026-09-25T17:49:47.853679000Z","log":{"format":"json","message":{"line":"splunk-docker fixture plain line (json)","source":"stdout","tag":"6a47e0a85763"}},"resource":{"attributes":{"com.splunk.index":"main","com.splunk.source":"docker:fixture","com.splunk.sourcetype":"docker:json","host.name":"splunk-docker-fixture"}}}
+  ], "counters": {}},
+  "docker-raw": {"events": [
+    {"timestamp":"2026-09-25T17:49:48.345092000Z","log":{"format":"raw","message":"298ce556c084 {\"level\":\"info\",\"msg\":\"splunk-docker fixture raw\",\"n\":1}"},"resource":{"attributes":{"host.name":"splunk-docker-fixture"}}},
+    {"timestamp":"2026-09-25T17:49:48.345110000Z","log":{"format":"raw","message":"298ce556c084 splunk-docker fixture plain line (raw)"},"resource":{"attributes":{"host.name":"splunk-docker-fixture"}}}
+  ], "counters": {}},
+  "envelope": {"events": [
+    {"timestamp":"2026-09-21T14:13:20.000000000Z","log":{"format":"raw","message":"numeric index"},"resource":{"attributes":{"com.splunk.index":"7","com.splunk.source":"s","com.splunk.sourcetype":"st","host.name":"h1"}}},
+    {"timestamp":"2026-09-21T14:13:21.000000000Z","log":{"format":"raw","message":"null carrier"},"resource":{"attributes":{"host.name":"h1"}}},
+    {"timestamp":"2026-09-21T14:13:22.000000000Z","log":{"format":"raw","message":"unknown key"},"resource":{"attributes":{"host.name":"h1"}}}
+  ], "counters": {}},
+  "fields": {"events": [
+    {"timestamp":"2026-09-21T14:13:20.000000000Z","log":{"format":"raw","message":"nested"},"attributes":{"big":18446744073709551615,"flag":true,"http.method":"GET","http.status":200,"http.tls.version":"1.3","list":["x","y"],"n":1.5,"nothing":null,"tags":"[{\"a\":1},\"b\"]"},"types":{"/attributes/big":"u64"}},
+    {"timestamp":"2026-09-21T14:13:21.000000000Z","log":{"format":"raw","message":"host in fields"},"attributes":{"host.name":"fields-host","k":"v"},"resource":{"attributes":{"host.name":"envelope-host"}}},
+    {"timestamp":"2026-09-21T14:13:22.000000000Z","log":{"format":"raw","message":"fields not an object"}}
+  ], "counters": {}},
+  "java-json-error": {"events": [
+    {"timestamp":"2026-09-25T17:50:35.875000000Z","log":{"format":"json","message":{"logger":"splunk-java-fixture","message":"splunk-java fixture: request failed","severity":"ERROR","thread":"main"}},"attributes":{"messageFormat":"json"},"resource":{"attributes":{"com.splunk.index":"main","com.splunk.source":"java:logback","com.splunk.sourcetype":"java:json","host.name":"splunk-java-fixture"}}}
+  ], "counters": {}},
+  "java-json-info": {"events": [
+    {"timestamp":"2026-09-25T17:50:35.845000000Z","log":{"format":"json","message":{"logger":"splunk-java-fixture","message":{"action":"start","component":"splunk-java fixture","port":8080},"severity":"INFO","thread":"main"}},"attributes":{"messageFormat":"json"},"resource":{"attributes":{"com.splunk.index":"main","com.splunk.source":"java:logback","com.splunk.sourcetype":"java:json","host.name":"splunk-java-fixture"}}}
+  ], "counters": {}},
+  "java-json-warn": {"events": [
+    {"timestamp":"2026-09-25T17:50:35.871000000Z","log":{"format":"json","message":{"logger":"splunk-java-fixture","message":"splunk-java fixture: slow upstream","severity":"WARN","thread":"main","properties":{"request_id":"req-0001"}}},"attributes":{"messageFormat":"json"},"resource":{"attributes":{"com.splunk.index":"main","com.splunk.source":"java:logback","com.splunk.sourcetype":"java:json","host.name":"splunk-java-fixture"}}}
+  ], "counters": {}},
+  "java-raw-error": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"format":"raw","message":"ERROR splunk-java-fixture splunk-java fixture: request failed"},"resource":{"attributes":{"com.splunk.index":"main","com.splunk.source":"java:logback","com.splunk.sourcetype":"java:raw","host.name":"splunk-java-fixture"}}}
+  ], "counters": {}},
+  "java-raw-info": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"format":"raw","message":"INFO splunk-java-fixture {\"action\":\"start\",\"component\":\"splunk-java fixture\",\"port\":8080}"},"resource":{"attributes":{"com.splunk.index":"main","com.splunk.source":"java:logback","com.splunk.sourcetype":"java:raw","host.name":"splunk-java-fixture"}}}
+  ], "counters": {}},
+  "java-raw-warn": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"format":"raw","message":"WARN splunk-java-fixture splunk-java fixture: slow upstream"},"resource":{"attributes":{"com.splunk.index":"main","com.splunk.source":"java:logback","com.splunk.sourcetype":"java:raw","host.name":"splunk-java-fixture"}}}
+  ], "counters": {}},
+  "java-text-error": {"events": [
+    {"timestamp":"2026-09-25T17:50:35.875000000Z","log":{"format":"json","message":{"logger":"splunk-java-fixture","message":"splunk-java fixture: request failed","severity":"ERROR","thread":"main"}},"resource":{"attributes":{"com.splunk.index":"main","com.splunk.source":"java:logback","com.splunk.sourcetype":"java:text","host.name":"splunk-java-fixture"}}}
+  ], "counters": {}},
+  "java-text-info": {"events": [
+    {"timestamp":"2026-09-25T17:50:35.845000000Z","log":{"format":"json","message":{"logger":"splunk-java-fixture","message":{"action":"start","component":"splunk-java fixture","port":8080},"severity":"INFO","thread":"main"}},"resource":{"attributes":{"com.splunk.index":"main","com.splunk.source":"java:logback","com.splunk.sourcetype":"java:text","host.name":"splunk-java-fixture"}}}
+  ], "counters": {}},
+  "java-text-warn": {"events": [
+    {"timestamp":"2026-09-25T17:50:35.871000000Z","log":{"format":"json","message":{"logger":"splunk-java-fixture","message":"splunk-java fixture: slow upstream","severity":"WARN","thread":"main","properties":{"request_id":"req-0001"}}},"resource":{"attributes":{"com.splunk.index":"main","com.splunk.source":"java:logback","com.splunk.sourcetype":"java:text","host.name":"splunk-java-fixture"}}}
+  ], "counters": {}},
+  "otel-fields": {"events": [
+    {"timestamp":"2026-09-21T14:13:20.000000000Z","log":{"severity":"info","format":"raw","message":"started","event_name":"app.start","trace_id":"0af7651916cd43dd8448eb211c80319c","span_id":"b7ad6b7169203331","trace_flags":0},"attributes":{"k":"v","otel.log.severity.number":10,"otel.log.severity.text":"INFO2"}},
+    {"timestamp":"2026-09-21T14:13:21.000000000Z","log":{"severity":"error","format":"raw","message":"text only"},"attributes":{"otel.log.severity.text":"error"}},
+    {"timestamp":"2026-09-21T14:13:22.000000000Z","log":{"severity":"fatal","format":"raw","message":"number only"},"attributes":{"otel.log.severity.number":21}},
+    {"timestamp":"2026-09-21T14:13:23.000000000Z","log":{"format":"raw","message":"trace with no span","trace_id":"0af7651916cd43dd8448eb211c80319c","trace_flags":0}},
+    {"timestamp":"2026-09-21T14:13:24.000000000Z","log":{"format":"raw","message":"bad trace"},"attributes":{"span_id":"b7ad6b7169203331","trace_id":"xyz"}}
+  ], "counters": {}},
+  "otel-logs": {"events": [
+    {"timestamp":"2026-09-25T17:48:54.230037500Z","log":{"severity":"warn","format":"raw","message":"the message","trace_id":"0af7651916cd43dd8448eb211c80319c","span_id":"b7ad6b7169203331","trace_flags":0},"attributes":{"app":"server","fixture.tags":["a","b"],"otel.log.severity.number":13,"otel.log.severity.text":"Warn","service.name":"splunk-otel-fixture"},"resource":{"attributes":{"com.splunk.index":"main","com.splunk.source":"otel:telemetrygen","com.splunk.sourcetype":"otel:logs","host.name":"unknown"}}},
+    {"timestamp":"2026-09-25T17:48:54.230081800Z","log":{"severity":"warn","format":"raw","message":"the message","trace_id":"0af7651916cd43dd8448eb211c80319c","span_id":"b7ad6b7169203331","trace_flags":0},"attributes":{"app":"server","fixture.tags":["a","b"],"otel.log.severity.number":13,"otel.log.severity.text":"Warn","service.name":"splunk-otel-fixture"},"resource":{"attributes":{"com.splunk.index":"main","com.splunk.source":"otel:telemetrygen","com.splunk.sourcetype":"otel:logs","host.name":"unknown"}}},
+    {"timestamp":"2026-09-25T17:48:54.230087500Z","log":{"severity":"warn","format":"raw","message":"the message","trace_id":"0af7651916cd43dd8448eb211c80319c","span_id":"b7ad6b7169203331","trace_flags":0},"attributes":{"app":"server","fixture.tags":["a","b"],"otel.log.severity.number":13,"otel.log.severity.text":"Warn","service.name":"splunk-otel-fixture"},"resource":{"attributes":{"com.splunk.index":"main","com.splunk.source":"otel:telemetrygen","com.splunk.sourcetype":"otel:logs","host.name":"unknown"}}}
+  ], "counters": {}},
+  "otel-raw": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"format":"raw","message":"the message"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"format":"raw","message":"the message"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"format":"raw","message":"the message"}}
+  ], "counters": {}},
+  "raw-lines": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"format":"raw","message":"first line"},"resource":{"attributes":{"com.splunk.index":"main","com.splunk.source":"/var/log/app.log","com.splunk.sourcetype":"app:log","host.name":"web 1"}}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"format":"raw","message":"second line"},"resource":{"attributes":{"com.splunk.index":"main","com.splunk.source":"/var/log/app.log","com.splunk.sourcetype":"app:log","host.name":"web 1"}}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"format":"raw","message":"third line"},"resource":{"attributes":{"com.splunk.index":"main","com.splunk.source":"/var/log/app.log","com.splunk.sourcetype":"app:log","host.name":"web 1"}}}
+  ], "counters": {}},
+  "sc4s-probe": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"format":"raw","message":"HEC TEST EVENT"},"resource":{"attributes":{"com.splunk.index":"main","com.splunk.sourcetype":"sc4s:probe"}}}
+  ], "counters": {}},
+  "sc4s-rfc3164": {"events": [
+    {"timestamp":"2026-09-25T12:00:02.000000000Z","log":{"format":"raw","message":"fixture-app[1234]: splunk-sc4s fixture: RFC 3164"},"attributes":{"sc4s_container":"splunk-sc4s-fixture","sc4s_destport":514,"sc4s_fromhostip":"172.20.0.4","sc4s_product":"syslog","sc4s_proto":"UDP","sc4s_recv_time":"1790358603.765","sc4s_syslog_facility":"user","sc4s_syslog_severity":"notice","sc4s_tags":"wireformat:rfc|wireformat:rfc3164|.app.app-fallback-nix_syslog|.source.s_DEFAULT","sc4s_vendor":"nix"},"resource":{"attributes":{"com.splunk.index":"osnix","com.splunk.source":"program:fixture-app","com.splunk.sourcetype":"nix:syslog","host.name":"sc4s-fixture-host"}}}
+  ], "counters": {}},
+  "sc4s-rfc5424": {"events": [
+    {"timestamp":"2026-09-25T12:00:01.000000000Z","log":{"format":"raw","message":"- - fixture-app 1234 - -splunk-sc4s fixture: RFC 5424, no structured data"},"attributes":{"sc4s_container":"splunk-sc4s-fixture","sc4s_destport":514,"sc4s_fromhostip":"172.20.0.4","sc4s_product":"syslog","sc4s_proto":"UDP","sc4s_recv_time":"1790358603.564","sc4s_syslog_facility":"local0","sc4s_syslog_severity":"err","sc4s_tags":"wireformat:rfc|wireformat:rfc5424|.app.app-fallback-nix_syslog|.source.s_DEFAULT","sc4s_vendor":"nix"},"resource":{"attributes":{"com.splunk.index":"osnix","com.splunk.source":"program:fixture-app","com.splunk.sourcetype":"nix:syslog","host.name":"sc4s-fixture-host"}}}
+  ], "counters": {}},
+  "sc4s-rfc5424-sd": {"events": [
+    {"timestamp":"2026-09-25T12:00:00.000000000Z","log":{"format":"raw","message":"- - fixture-app 1234 ID47 [exampleSDID@32473 iut=\"3\" eventSource=\"Application\"]splunk-sc4s fixture: RFC 5424 with structured data"},"attributes":{"sc4s_container":"splunk-sc4s-fixture","sc4s_destport":514,"sc4s_fromhostip":"172.20.0.4","sc4s_product":"syslog","sc4s_proto":"UDP","sc4s_recv_time":"1790358603.363","sc4s_syslog_facility":"local0","sc4s_syslog_severity":"info","sc4s_tags":"wireformat:rfc|wireformat:rfc5424|.app.app-fallback-nix_syslog|.source.s_DEFAULT","sc4s_vendor":"nix"},"resource":{"attributes":{"com.splunk.index":"osnix","com.splunk.source":"program:fixture-app","com.splunk.sourcetype":"nix:syslog","host.name":"sc4s-fixture-host"}}}
+  ], "counters": {}},
+  "sc4s-startup": {"events": [
+    {"timestamp":"2026-09-25T17:50:00.355000000Z","log":{"format":"raw","message":"- - syslog-ng 151 - [meta sequenceId=\"1\"]syslog-ng starting up; version='4.22.0'"},"attributes":{"sc4s_class":"events","sc4s_container":"splunk-sc4s-fixture","sc4s_destport":0,"sc4s_fromhostip":"127.0.0.1","sc4s_product":"sc4s","sc4s_proto":0,"sc4s_recv_time":"1790358600.355","sc4s_tags":".source.s_internal","sc4s_vendor":"splunk","sc4s_version":"3.40.0"},"resource":{"attributes":{"com.splunk.index":"main","com.splunk.source":"sc4s","com.splunk.sourcetype":"sc4s:events","host.name":"splunk-sc4s-fixture"}}}
+  ], "counters": {}},
+  "sc4s-startup-out": {"events": [
+    {"timestamp":"2026-09-25T17:50:01.312000000Z","log":{"format":"raw","message":"syslog-ng-config: sc4s version=3.40.0"},"attributes":{"sc4s_class":"events","sc4s_container":"splunk-sc4s-fixture","sc4s_destport":0,"sc4s_fromhostip":"127.0.0.1","sc4s_product":"sc4s","sc4s_proto":0,"sc4s_recv_time":"1790358601.312","sc4s_tags":".source.s_startup_out","sc4s_vendor":"splunk"},"resource":{"attributes":{"com.splunk.index":"main","com.splunk.source":"sc4s","com.splunk.sourcetype":"sc4s:events:startup:out","host.name":"splunk-sc4s-fixture"}}}
+  ], "counters": {}},
+  "span": {"events": [
+    {"timestamp":"2026-09-25T17:48:48.548903048Z","span":{"name":"okey-dokey-0","trace_id":"809a1351ec7c321df2b4d977b8de625a","span_id":"d65b3b2ec40507b0","parent_span_id":"0c44d6900d47ee3d","kind":"server","status":"unset","start":"2026-09-25T17:48:48.548903048Z","end":"2026-09-25T17:48:48.549026048Z","duration_ns":123000},"attributes":{"peer":"x"},"resource":{"attributes":{"com.splunk.index":"main","com.splunk.source":"otel:telemetrygen","com.splunk.sourcetype":"otel:traces","host.name":"unknown","service.name":"svc"}}}
+  ], "counters": {}},
+  "times": {"events": [
+    {"timestamp":"2026-09-21T14:13:20.000000000Z","log":{"format":"raw","message":"integer"}},
+    {"timestamp":"2026-09-21T14:13:20.123456789Z","log":{"format":"raw","message":"nine decimals"}},
+    {"timestamp":"2026-09-21T14:13:20.500000000Z","log":{"format":"raw","message":"string"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"format":"raw","message":"absent"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"format":"raw","message":"bad"}}
+  ], "counters": {}},
+  "two-envelopes": {"events": [
+    {"timestamp":"2026-09-21T14:13:20.000000000Z","log":{"format":"raw","message":"a one"},"resource":{"attributes":{"host.name":"a"}}},
+    {"timestamp":"2026-09-21T14:13:21.000000000Z","log":{"format":"raw","message":"b one"},"resource":{"attributes":{"host.name":"b"}}},
+    {"timestamp":"2026-09-21T14:13:22.000000000Z","log":{"format":"raw","message":"a two"},"resource":{"attributes":{"host.name":"a"}}}
+  ], "counters": {}}
+}

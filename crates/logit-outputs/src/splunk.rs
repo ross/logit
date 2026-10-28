@@ -582,11 +582,12 @@ impl SplunkHecOutput {
     /// changes what the encoder holds call this, so no builder order leaves it ungated.
     fn new_encoder(&self) -> SplunkEncoder {
         let gate = self.accounting.gate();
-        SplunkEncoder::new()
-            .with_telemetry(self.telemetry.gated(gate))
-            .with_diagnostics(self.diag.gated(gate))
-            .with_multi_value(self.multi_value)
-            .with_default_host(self.default_host.clone())
+        encoder(
+            self.telemetry.gated(gate),
+            self.diag.gated(gate),
+            self.multi_value,
+            self.default_host.clone(),
+        )
     }
 
     /// The client, built on first use when [`Output::bind`] wasn't called.
@@ -657,20 +658,45 @@ impl Encoding<'_> {
         if !first {
             return;
         }
-        for (bytes, meta) in objects.iter_with() {
-            if bytes.len() <= self.max_body_bytes {
-                continue;
-            }
-            self.telemetry.count(RECORDS_DROPPED, meta.records as f64, &[("reason", "oversize")]);
-            self.diag.warn_throttled(
-                "oversize",
-                format_args!(
-                    "dropped one HEC object of {} bytes, over 'max_body_bytes' ({})",
-                    bytes.len(),
-                    self.max_body_bytes
-                ),
-            );
+        count_oversize(objects, self.max_body_bytes, self.telemetry, self.diag);
+    }
+}
+
+/// `splunk_hec_out`'s encoder, counting through `telemetry` and `diag`: `multi_value:`, and the
+/// process hostname as `default_host`, the `host` of an object that carries none.
+pub fn encoder(
+    telemetry: Telemetry,
+    diag: Diagnostics,
+    multi_value: MultiValue,
+    default_host: Option<Arc<str>>,
+) -> SplunkEncoder {
+    SplunkEncoder::new()
+        .with_telemetry(telemetry)
+        .with_diagnostics(diag)
+        .with_multi_value(multi_value)
+        .with_default_host(default_host)
+}
+
+/// Counts and diagnoses each object of `objects` over `max_body_bytes`, which the sink never
+/// sends: `records.dropped{reason="oversize"}` for its records.
+pub fn count_oversize(
+    objects: &MessageBuf<ObjectMeta>,
+    max_body_bytes: usize,
+    telemetry: &Telemetry,
+    diag: &mut Diagnostics,
+) {
+    for (bytes, meta) in objects.iter_with() {
+        if bytes.len() <= max_body_bytes {
+            continue;
         }
+        telemetry.count(RECORDS_DROPPED, meta.records as f64, &[("reason", "oversize")]);
+        diag.warn_throttled(
+            "oversize",
+            format_args!(
+                "dropped one HEC object of {} bytes, over 'max_body_bytes' ({max_body_bytes})",
+                bytes.len(),
+            ),
+        );
     }
 }
 

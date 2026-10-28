@@ -1,0 +1,47 @@
+# The syslog features a case under cases/syslog/ can exercise, from
+# crates/logit-proto/src/syslog/mod.rs's grammar and mapping table. A case names the ones it
+# exercises in its `.meta.yaml`.
+- name: rfc3164
+  text: >-
+    An RFC 3164 message, `<PRI>TIMESTAMP HOSTNAME TAG: MSG` with each header field optional.
+- name: rfc5424
+  text: >-
+    An RFC 5424 message, `<PRI>1 TIMESTAMP HOSTNAME APP-NAME PROCID MSGID STRUCTURED-DATA MSG`.
+- name: structured_data
+  text: RFC 5424 STRUCTURED-DATA, decoded to the nested `syslog.sd` map.
+- name: tagless
+  text: >-
+    An RFC 3164 message with no TAG-shaped token in its first two, read as all MSG with no
+    `syslog.tag` or `host.name`.
+- name: non_ascii
+  text: A UTF-8 MSG with multibyte characters.
+- name: forwarder
+  text: A message rsyslog's `omfwd` formatted as a second-hop forwarder.
+- name: stream
+  text: >-
+    A TCP connection's byte stream, split by RFC 6587's non-transparent (LF-terminated) framing.
+- name: multi_line
+  text: A datagram holding several messages, one per line, each its own log.
+- name: nil_fields
+  text: >-
+    RFC 5424 nil (`-`) fields: a nil TIMESTAMP as an explicit `syslog.timestamp` null, and nil
+    HOSTNAME, APP-NAME, PROCID, MSGID, and STRUCTURED-DATA stamping nothing.
+- name: bytes_message
+  text: A MSG that isn't valid UTF-8, decoded to a `Bytes` message.
+- name: pid
+  text: >-
+    A PROCID or `tag[pid]` bracket: a canonical decimal as `process.pid`, any other token as the
+    `syslog.pid` string.
+- name: timestamp_offset
+  text: An RFC 5424 TIMESTAMP with a fraction and a UTC offset.
+- name: timestamp_out_of_range
+  text: >-
+    A well-formed RFC 5424 TIMESTAMP outside the nanosecond range, which omits `syslog.timestamp`.
+- name: sniff_fallback
+  text: A line that sniffs as RFC 5424 but doesn't parse as one, reparsed as RFC 3164.
+- name: pri_bounds
+  text: The PRI range's ends, facility 0 and 23 at severity 0 and 7.
+- name: opt_in_attributes
+  text: >-
+    A log with attributes outside the header fields, as a stage after `syslog_in` adds them, which
+    `syslog_out`'s `structured_data:` writes as PARAMs of its own SD-ELEMENT.

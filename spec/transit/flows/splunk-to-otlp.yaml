@@ -1,0 +1,12 @@
+# splunk_hec_in's cases into otlp_out with nothing between: each log as an OTLP log
+# record, its envelope as resource attributes.
+# `path:` names one case so `logit run` can run this by hand; the transit spec runs every case in
+# that file's directory (spec/transit/README.md).
+components:
+  case:
+    type: replay_in
+    path: ../cases/splunk/otel-logs.json
+  out:
+    type: otlp_out
+    sources: [case]
+    endpoint: http://127.0.0.1:4318

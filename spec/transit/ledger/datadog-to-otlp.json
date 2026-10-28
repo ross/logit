@@ -13,8 +13,6 @@
     {"sink":"otlp_out","row":"distribution","cell":0,"observed":["degraded"]},
     {"sink":"otlp_out","row":"gauge/f64","cell":0,"observed":["exact"]},
     {"sink":"otlp_out","row":"gauge/negative","cell":0,"observed":["exact"]},
-    {"sink":"otlp_out","row":"log/dogstatsd_event","cell":0,"observed":["normalized"]},
-    {"sink":"otlp_out","row":"log/plain","cell":0,"observed":["normalized"]},
     {"sink":"otlp_out","row":"record/same_instant","cell":0,"observed":["exact"]},
     {"sink":"otlp_out","row":"record/same_instant_equal","cell":0,"observed":["exact"]},
     {"sink":"otlp_out","row":"record/service_check","cell":0,"observed":["exact"]},

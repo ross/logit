@@ -1,0 +1,5 @@
+{"timestamp":"2027-01-15T07:59:50.000000000Z","log":{"format":"raw","message":"host from hostname"},"attributes":{"host.name":"web-1"}}
+{"timestamp":"2027-01-15T07:59:50.001000000Z","log":{"format":"raw","message":"host absent"}}
+{"timestamp":"2027-01-15T07:59:50.002000000Z","log":{"format":"raw","message":"host displaced"},"attributes":{"host.name":"web-2"}}
+{"timestamp":"2027-01-15T07:59:50.003000000Z","log":{"format":"raw","message":"host empty"}}
+{"timestamp":"2027-01-15T07:59:50.004000000Z","log":{"format":"raw","message":"host key alone"},"attributes":{"host.name":"only-key"}}

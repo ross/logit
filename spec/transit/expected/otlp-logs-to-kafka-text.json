@@ -1,0 +1,51 @@
+{
+  "beside-metrics": {"events": [
+    {"timestamp":"2027-01-15T08:00:04.000000000Z","log":{"format":"raw","message":"queue depth high"}},
+    {"timestamp":"2027-01-15T08:00:04.001000000Z","log":{"format":"raw","message":"{\"queue\":\"orders\",\"depth\":17}"}},
+    {"timestamp":"2027-01-15T08:00:04.002000000Z","log":{"format":"raw","message":"b\"caf\\xe9\""},"types":{"/log/message":"bytes"}},
+    {"timestamp":"2027-01-15T08:00:04.003000000Z","log":{"format":"raw","message":""}}
+  ], "counters": {
+    "logit.output.metrics.omitted{component=out,kind=kafka_out,reason=format,role=sink}": 4
+  }},
+  "bodies": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"format":"raw","message":"a plain line"}},
+    {"timestamp":"2027-01-15T08:00:00.001000000Z","log":{"format":"raw","message":"42"}},
+    {"timestamp":"2027-01-15T08:00:00.002000000Z","log":{"format":"raw","message":"2.5"}},
+    {"timestamp":"2027-01-15T08:00:00.003000000Z","log":{"format":"raw","message":"true"}},
+    {"timestamp":"2027-01-15T08:00:00.004000000Z","log":{"format":"raw","message":"b\"caf\\xe9\""},"types":{"/log/message":"bytes"}},
+    {"timestamp":"2027-01-15T08:00:00.005000000Z","log":{"format":"raw","message":"{\"attempts\":3,\"user\":\"ada\"}"}},
+    {"timestamp":"2027-01-15T08:00:00.006000000Z","log":{"format":"raw","message":"[\"checkout\",7]"}},
+    {"timestamp":"2027-01-15T08:00:00.007000000Z","log":{"format":"raw","message":""}},
+    {"timestamp":"2027-01-15T08:00:00.008000000Z","log":{"format":"raw","message":""}},
+    {"timestamp":"2027-01-15T08:00:00.009000000Z","log":{"format":"raw","message":"{\"level\":\"info\",\"msg\":\"started\"}"}},
+    {"timestamp":"2027-01-15T08:00:00.010000000Z","log":{"format":"raw","message":"abc"}}
+  ], "counters": {}},
+  "fields": {"events": [
+    {"timestamp":"2027-01-15T08:00:03.000000000Z","log":{"format":"raw","message":"<13>Jan 15 07:59:59 host app: relayed"}},
+    {"timestamp":"2027-01-15T08:00:03.000000000Z","log":{"format":"raw","message":"observed later"}}
+  ], "counters": {}},
+  "severity": {"events": [
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","log":{"format":"raw","message":"trace band"}},
+    {"timestamp":"2027-01-15T08:00:01.001000000Z","log":{"format":"raw","message":"debug band"}},
+    {"timestamp":"2027-01-15T08:00:01.002000000Z","log":{"format":"raw","message":"info band"}},
+    {"timestamp":"2027-01-15T08:00:01.003000000Z","log":{"format":"raw","message":"warn band"}},
+    {"timestamp":"2027-01-15T08:00:01.004000000Z","log":{"format":"raw","message":"error band"}},
+    {"timestamp":"2027-01-15T08:00:01.005000000Z","log":{"format":"raw","message":"fatal band"}},
+    {"timestamp":"2027-01-15T08:00:01.006000000Z","log":{"format":"raw","message":"no severity"}},
+    {"timestamp":"2027-01-15T08:00:01.007000000Z","log":{"format":"raw","message":"INFO2 from the wire"}},
+    {"timestamp":"2027-01-15T08:00:01.008000000Z","log":{"format":"raw","message":"a number only"}}
+  ], "counters": {}},
+  "telemetrygen": {"events": [
+    {"timestamp":"2026-09-10T21:22:17.985000000Z","log":{"format":"raw","message":"the message"}},
+    {"timestamp":"2026-09-10T21:22:17.985000000Z","log":{"format":"raw","message":"the message"}},
+    {"timestamp":"2026-09-10T21:22:18.985000000Z","log":{"format":"raw","message":"the message"}}
+  ], "counters": {}},
+  "trace": {"events": [
+    {"timestamp":"2027-01-15T08:00:02.000000000Z","log":{"format":"raw","message":"checkout completed"}},
+    {"timestamp":"2027-01-15T08:00:02.001000000Z","log":{"format":"raw","message":"no span id"}},
+    {"timestamp":"2027-01-15T08:00:02.002000000Z","log":{"format":"raw","message":"beside its span"}},
+    {"timestamp":"2027-01-15T08:00:02.003000000Z","log":{"format":"raw","message":"an id attribute beside the trace"}}
+  ], "counters": {
+    "logit.output.spans.omitted{component=out,kind=kafka_out,reason=format,role=sink}": 1
+  }}
+}

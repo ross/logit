@@ -99,9 +99,11 @@ mod sink;
 #[cfg(test)]
 mod tests;
 
-pub use encode::{EncodeStats, KafkaEncoder, RecordFormat, RecordKey, RecordMeta, RecordMode};
+pub use encode::{
+    text_body, EncodeStats, KafkaEncoder, RecordFormat, RecordKey, RecordMeta, RecordMode,
+};
 pub use sasl::{KafkaSasl, OAuthToken};
 pub use sink::{
-    KafkaAcks, KafkaCompression, KafkaOutput, KafkaSettings, SignalTopics, TlsClientSettings,
-    DEFAULT_MAX_REQUEST_BYTES, DEFAULT_TIMEOUT,
+    encoder, report_encode_stats, KafkaAcks, KafkaCompression, KafkaOutput, KafkaSettings,
+    SignalTopics, TlsClientSettings, DEFAULT_MAX_REQUEST_BYTES, DEFAULT_TIMEOUT,
 };

@@ -1,0 +1,4 @@
+# A hand-written /api/v2/logs body: `hostname` present, absent, and empty, a `host.name` key
+# the `hostname` displaces, and a `host.name` key alone.
+wire: hosts.bin
+exercises: [log, host, no_hostname, hostname_displaces_host_name]

@@ -1,0 +1,58 @@
+{
+  "bytes-message": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"severity":"info","format":"raw","message":"caf� latin-1"},"attributes":{"host.name":"web-1","status":"info","syslog.facility":1,"syslog.tag":"app","syslog.timestamp":"Jan 15 07:59:02"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"severity":"info","format":"raw","message":"caf� �� binary"},"attributes":{"host.name":"web-1","process.pid":4242,"status":"info","syslog.facility":1,"syslog.msgid":"req","syslog.tag":"app","syslog.timestamp":"2027-01-15T07:59:01.000001000Z"}}
+  ], "counters": {}},
+  "logger-rfc3164-basic": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"severity":"info","format":"raw","message":"hello from logger(1), captured for logit interop fixtures"},"attributes":{"host.name":"2676410b1513","status":"info","syslog.facility":1,"syslog.tag":"logit-fixture","syslog.timestamp":"Sep 10 21:21:44"}}
+  ], "counters": {}},
+  "logger-rfc3164-unicode": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"severity":"info","format":"raw","message":"héllo wörld — ünïcödé ✓ (UTF-8 multibyte smoke test)"},"attributes":{"host.name":"222237a384c4","status":"info","syslog.facility":1,"syslog.tag":"logit-fixture","syslog.timestamp":"Sep 10 21:21:46"}}
+  ], "counters": {}},
+  "logger-rfc5424-basic": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"severity":"info","format":"raw","message":"hello from logger(1) in RFC 5424 mode, captured for logit interop fixtures"},"attributes":{"host.name":"f750585defea","status":"info","syslog.facility":1,"syslog.sd":{"timeQuality":{"isSynced":"1","syncAccuracy":"69277","tzKnown":"1"}},"syslog.tag":"logit-fixture","syslog.timestamp":"2026-09-10T21:21:48.174343000Z"}}
+  ], "counters": {}},
+  "nil-fields": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"severity":"info","format":"raw","message":"every optional field nil"},"attributes":{"host.name":"transit","status":"info","syslog.facility":20,"syslog.timestamp":null}}
+  ], "counters": {}},
+  "opt-in-attributes": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"severity":"info","format":"raw","message":"every value type"},"attributes":{"bad key":"spaced","big":18446744073709551615,"count":42,"flag":true,"host.name":"web-1","labels":["a",1],"nested":{"k":"v"},"note":"say \"hi\" \\ [x]","plain":"text","ratio":1.5,"raw":"Y2Fm6Q==","seen":"2027-01-15T07:59:00.000000000Z","status":"info","syslog.tag":"app"},"types":{"/attributes/big":"u64"}},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","log":{"severity":"info","format":"raw","message":"beside its own element"},"attributes":{"host.name":"web-1","status":"info","syslog.sd":{"origin@32473":{"ip":"10.0.0.1"}},"syslog.tag":"app","team":"web"}},
+    {"timestamp":"2027-01-15T08:00:02.000000000Z","log":{"severity":"info","format":"raw","message":"colliding element"},"attributes":{"host.name":"web-1","status":"info","syslog.sd":{"transit@32473":{"origin":"upstream"}},"syslog.tag":"app","team":"web"}},
+    {"timestamp":"2027-01-15T08:00:03.000000000Z","log":{"severity":"info","format":"raw","message":"host and service keys"},"attributes":{"env":"prod","host":"edge","host.name":"web-1","service.name":"checkout","status":"info","syslog.tag":"app","version":"1.2"}},
+    {"timestamp":"2027-01-15T08:00:04.000000000Z","log":{"severity":"info","format":"raw","message":"service beside its key"},"attributes":{"deployment.environment.name":"prod","env":"prod","host.name":"web-1","status":"info","syslog.tag":"app"}}
+  ], "counters": {}},
+  "pid": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"severity":"info","format":"raw","message":"bracketed pid"},"attributes":{"host.name":"web-1","process.pid":123,"status":"info","syslog.facility":1,"syslog.tag":"app","syslog.timestamp":"Jan 15 07:59:06"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"severity":"info","format":"raw","message":"decimal procid"},"attributes":{"host.name":"web-1","process.pid":4242,"status":"info","syslog.facility":1,"syslog.tag":"app","syslog.timestamp":"2027-01-15T07:59:03.000000000Z"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"severity":"info","format":"raw","message":"leading-zero procid"},"attributes":{"host.name":"web-1","status":"info","syslog.facility":1,"syslog.pid":"007","syslog.tag":"app","syslog.timestamp":"2027-01-15T07:59:05.000000000Z"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"severity":"info","format":"raw","message":"procid with no app-name"},"attributes":{"host.name":"web-1","process.pid":4243,"status":"info","syslog.facility":1,"syslog.timestamp":"2027-01-15T07:59:07.000000000Z"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"severity":"info","format":"raw","message":"token procid"},"attributes":{"host.name":"web-1","status":"info","syslog.facility":1,"syslog.pid":"web.1","syslog.tag":"app","syslog.timestamp":"2027-01-15T07:59:04.000000000Z"}}
+  ], "counters": {}},
+  "pri-bounds": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"severity":"debug","format":"raw","message":"kern.debug"},"attributes":{"host.name":"web-1","status":"debug","syslog.facility":0,"syslog.tag":"kernel","syslog.timestamp":"Jan 15 07:59:12"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"severity":"debug","format":"raw","message":"local7.debug"},"attributes":{"host.name":"web-1","status":"debug","syslog.facility":23,"syslog.tag":"app","syslog.timestamp":"2027-01-15T07:59:10.000000000Z"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"severity":"fatal","format":"raw","message":"kern.emerg"},"attributes":{"host.name":"web-1","status":"fatal","syslog.facility":0,"syslog.tag":"kernel","syslog.timestamp":"Jan 15 07:59:09"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"severity":"fatal","format":"raw","message":"local7.emerg"},"attributes":{"host.name":"web-1","status":"fatal","syslog.facility":23,"syslog.tag":"app","syslog.timestamp":"2027-01-15T07:59:11.000000000Z"}}
+  ], "counters": {}},
+  "python-handler": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"severity":"info","format":"raw","message":"hello from python logging.handlers.SysLogHandler, captured for logit interop fixtures"},"attributes":{"host.name":"transit","status":"info","syslog.facility":1}}
+  ], "counters": {}},
+  "python-handler-json": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"severity":"info","format":"raw","message":"{\"level\": \"info\", \"msg\": \"request handled\", \"path\": \"/\", \"status\": 200}"},"attributes":{"host.name":"transit","status":"info","syslog.facility":1}}
+  ], "counters": {}},
+  "rsyslog": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"severity":"info","format":"raw","message":"hello from rsyslog, captured for logit interop fixtures"},"attributes":{"host.name":"66221ea5a62b","status":"info","syslog.facility":1,"syslog.tag":"logit-fixture","syslog.timestamp":"Sep 10 21:22:06"}}
+  ], "counters": {}},
+  "rsyslog-tcp": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"severity":"info","format":"raw","message":"hello from rsyslog, captured for logit interop fixtures"},"attributes":{"host.name":"5f296f2c68a7","status":"info","syslog.facility":1,"syslog.tag":"logit-fixture","syslog.timestamp":"Sep 13 11:09:50"}}
+  ], "counters": {}},
+  "sniff-fallback": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"severity":"info","format":"raw","message":"1 2027-01-15T07:59:08Z web-1 app - - [unclosed sd"},"attributes":{"host.name":"transit","status":"info","syslog.facility":1}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"severity":"info","format":"raw","message":"1 not-a-timestamp web-1 app - - - bad timestamp"},"attributes":{"host.name":"transit","status":"info","syslog.facility":1}}
+  ], "counters": {}},
+  "timestamps": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"severity":"info","format":"raw","message":"offset and fraction"},"attributes":{"host.name":"web-1","status":"info","syslog.facility":1,"syslog.tag":"app","syslog.timestamp":"2027-01-15T07:59:07.500000000Z"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"severity":"info","format":"raw","message":"out of range"},"attributes":{"host.name":"web-1","status":"info","syslog.facility":1,"syslog.tag":"app"}}
+  ], "counters": {}}
+}

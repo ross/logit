@@ -169,4 +169,4 @@
 
 pub mod decode;
 
-pub use decode::SyslogDecoder;
+pub use decode::{is_tag_shaped, SyslogDecoder};

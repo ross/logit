@@ -1,0 +1,4 @@
+# An RFC 3164 line relayed by SC4S.
+# Read in place from testdata/interop/splunk/ with its .headers.
+wire: ../../../../testdata/interop/splunk/sc4s-services-collector-event-006.bin
+exercises: [event_route, string_event, fields, envelope, time_string]

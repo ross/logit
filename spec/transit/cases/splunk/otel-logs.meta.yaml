@@ -1,0 +1,5 @@
+# The OpenTelemetry Collector splunk_hec exporter's three telemetrygen logs, gzip: `event` the
+# body string, `fields` with `otel.log.severity.*`, `trace_id`, `span_id`, and an array.
+# Read in place from testdata/interop/splunk/ with its .headers.
+wire: ../../../../testdata/interop/splunk/otel-services-collector-001.bin
+exercises: [event_route, gzip, string_event, fields, fields_array, envelope, time_fractional, otel_severity, trace_ids]

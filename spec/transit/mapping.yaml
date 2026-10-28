@@ -1,11 +1,11 @@
-# The transit mapping table: what each sink does with each metric kind and each feature that
-# changes its fate. It's the canonical copy; spec/transit/README.md explains the schema and how a
+# The transit mapping table: what each sink does with each metric kind, each log field, and each
+# feature that changes a record's fate. It's the canonical copy; spec/transit/README.md explains the schema and how a
 # flow checks it. `crates/logit-cli/src/transit/mapping.rs` validates it.
 
 # The class vocabulary, the canonical copy. A record-level row's class is one of exact,
 # normalized, degraded, skipped, or dropped, best to worst; a field-level row's (`record` rows for
-# unit, description, start_timestamp, exemplars, exemplars_on_summary, and min_max, and every
-# `attributes` row) is one of exact, normalized, or lost.
+# unit, description, start_timestamp, exemplars, exemplars_on_summary, and min_max, a `log` row
+# for one of a log's fields, and every `attributes` row) is one of exact, normalized, or lost.
 classes:
   exact: The pair's decoder reads back the same kind, value, and field.
   normalized: >-
@@ -25,11 +25,13 @@ classes:
     The record is lost for a reason the config didn't ask for; the cell names the counter that
     counts it.
 # A cell may still say `reason: uncounted` only on the rows `UNCOUNTED_ALLOWED` names in
-# `crates/logit-cli/src/transit/mapping.rs`: log and span payloads, `datadog_out`'s carrier on a
-# log among them, not yet classified. docs/adr/telemetry-loss-vocabulary.md's amendment
-# "structural loss has no counter" has the rule.
+# `crates/logit-cli/src/transit/mapping.rs`: a span at any sink, a log beside metrics at a sink
+# that writes the metrics, the trace datadog_out and splunk_hec_out leave off a log for a
+# `trace_id` or `span_id` attribute, datadog_out's carrier on a log, and syslog_out's attribute
+# rows, where it leaves every attribute outside its header fields off a log.
+# docs/adr/telemetry-loss-vocabulary.md's amendment "structural loss has no counter" has the rule.
 
-sinks: [statsd_out, prometheus_out, influxdb_out, otlp_out, datadog_out, graphite_out]
+sinks: [statsd_out, prometheus_out, influxdb_out, otlp_out, datadog_out, graphite_out, syslog_out, splunk_hec_out, kafka_out]
 
 rows:
   # --- sum: temporality and monotonicity -------------------------------------------------------
@@ -2014,7 +2016,7 @@ rows:
         class: exact
         text: >-
           A `key:value` tag, `host` included. `host.name` is the record's host, which datadog_in
-          reads back as `host.name` on every route.
+          reads back as `host.name` on every route. On a log, a top-level key of the log object.
       graphite_out:
         - when: {tags: drop}
           class: lost
@@ -2029,6 +2031,43 @@ rows:
             A `;name=value` tag. Each `;`, `!`, `^`, `=`, whitespace, and control character in the
             name, and each `;`, whitespace, and control character and a leading `~` in the value, is
             written as `_`, counted once per record.
+      syslog_out:
+        - when: {format: rfc3164}
+          class: lost
+          reason: structural
+          text: >-
+            RFC 3164 has no structured data, so an attribute outside the header fields is left off.
+        - when: {format: rfc5424, structured_data: {sd_id: transit@32473}}
+          class: normalized
+          reason: structured_data
+          text: >-
+            Under `structured_data:`, a PARAM of the opt-in SD-ELEMENT, which syslog_in reads back
+            as a string inside `syslog.sd`, under the SD-ID and the attribute's key. The PARAM-VALUE
+            is the string.
+        - class: lost
+          reason: uncounted
+          text: >-
+            An attribute outside the header fields is left off, uncounted; under RFC 5424,
+            `structured_data:` writes each public event attribute other than `host.name`,
+            `process.pid`, and the `syslog.*` keys as an SD-PARAM, which syslog_in reads back
+            inside `syslog.sd`.
+      splunk_hec_out:
+        class: normalized
+        reason: log_fields
+        text: >-
+          A `fields` string, or on a span a string in its `attributes` object, read back as itself.
+          On a log, splunk_hec_in reads a non-empty `otel.log.name` into the event name, and a
+          `trace_id` that parses as a trace id, with a `span_id` that parses or none, into the trace,
+          so none of them reads back as an attribute.
+      kafka_out:
+        - when: {format: text}
+          class: lost
+          reason: structural
+          text: >-
+            A `format: text` record holds the log body alone, so the attribute is left off, as
+            every attribute is.
+        - class: exact
+          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
   - kind: attributes
     feature: host_beside_host_name
     cells:
@@ -2071,6 +2110,38 @@ rows:
             A `;name=value` tag. Each `;`, `!`, `^`, `=`, whitespace, and control character in the
             name, and each `;`, whitespace, and control character and a leading `~` in the value, is
             written as `_`, counted once per record.
+      syslog_out:
+        - when: {format: rfc3164}
+          class: lost
+          reason: structural
+          text: >-
+            RFC 3164 has no structured data, so an attribute outside the header fields is left off.
+        - when: {format: rfc5424, structured_data: {sd_id: transit@32473}}
+          class: normalized
+          reason: structured_data
+          text: >-
+            Under `structured_data:`, a PARAM of the opt-in SD-ELEMENT, which syslog_in reads back
+            as a string inside `syslog.sd`, under the SD-ID and the attribute's key. The PARAM-VALUE
+            is the string.
+        - class: lost
+          reason: uncounted
+          text: >-
+            An attribute outside the header fields is left off, uncounted; under RFC 5424,
+            `structured_data:` writes each public event attribute other than `host.name`,
+            `process.pid`, and the `syslog.*` keys as an SD-PARAM, which syslog_in reads back
+            inside `syslog.sd`.
+      splunk_hec_out:
+        class: exact
+        text: A `host` field, an ordinary key beside the object's own `host`.
+      kafka_out:
+        - when: {format: text}
+          class: lost
+          reason: structural
+          text: >-
+            A `format: text` record holds the log body alone, so the attribute is left off, as
+            every attribute is.
+        - class: exact
+          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
   # statsd_out, prometheus_out, influxdb_out, and graphite_out don't write a log on an event with
   # no metrics, so its fields are never compared there and none of them has a cell.
   - kind: attributes
@@ -2085,6 +2156,38 @@ rows:
         text: >-
           A log's `hostname` is `host.name`, so a `hostname` attribute has no key of its own on
           the wire and is left off, counted.
+      syslog_out:
+        - when: {format: rfc3164}
+          class: lost
+          reason: structural
+          text: >-
+            RFC 3164 has no structured data, so an attribute outside the header fields is left off.
+        - when: {format: rfc5424, structured_data: {sd_id: transit@32473}}
+          class: normalized
+          reason: structured_data
+          text: >-
+            Under `structured_data:`, a PARAM of the opt-in SD-ELEMENT, which syslog_in reads back
+            as a string inside `syslog.sd`, under the SD-ID and the attribute's key. The PARAM-VALUE
+            is the string.
+        - class: lost
+          reason: uncounted
+          text: >-
+            An attribute outside the header fields is left off, uncounted; under RFC 5424,
+            `structured_data:` writes each public event attribute other than `host.name`,
+            `process.pid`, and the `syslog.*` keys as an SD-PARAM, which syslog_in reads back
+            inside `syslog.sd`.
+      splunk_hec_out:
+        class: exact
+        text: A `fields` key.
+      kafka_out:
+        - when: {format: text}
+          class: lost
+          reason: structural
+          text: >-
+            A `format: text` record holds the log body alone, so the attribute is left off, as
+            every attribute is.
+        - class: exact
+          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
   - kind: attributes
     feature: log_service
     cells:
@@ -2097,6 +2200,38 @@ rows:
         text: >-
           A log's `service` is `service.name`, so a `service` attribute beside it has no key of
           its own on the wire and is left off, counted.
+      syslog_out:
+        - when: {format: rfc3164}
+          class: lost
+          reason: structural
+          text: >-
+            RFC 3164 has no structured data, so an attribute outside the header fields is left off.
+        - when: {format: rfc5424, structured_data: {sd_id: transit@32473}}
+          class: normalized
+          reason: structured_data
+          text: >-
+            Under `structured_data:`, a PARAM of the opt-in SD-ELEMENT, which syslog_in reads back
+            as a string inside `syslog.sd`, under the SD-ID and the attribute's key. The PARAM-VALUE
+            is the string.
+        - class: lost
+          reason: uncounted
+          text: >-
+            An attribute outside the header fields is left off, uncounted; under RFC 5424,
+            `structured_data:` writes each public event attribute other than `host.name`,
+            `process.pid`, and the `syslog.*` keys as an SD-PARAM, which syslog_in reads back
+            inside `syslog.sd`.
+      splunk_hec_out:
+        class: exact
+        text: A `fields` key.
+      kafka_out:
+        - when: {format: text}
+          class: lost
+          reason: structural
+          text: >-
+            A `format: text` record holds the log body alone, so the attribute is left off, as
+            every attribute is.
+        - class: exact
+          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
   - kind: attributes
     feature: log_service_field
     cells:
@@ -2109,6 +2244,38 @@ rows:
         text: >-
           A log's string `service` attribute with no `service.name` is the log's `service` field,
           which datadog_in reads back as `service.name`.
+      syslog_out:
+        - when: {format: rfc3164}
+          class: lost
+          reason: structural
+          text: >-
+            RFC 3164 has no structured data, so an attribute outside the header fields is left off.
+        - when: {format: rfc5424, structured_data: {sd_id: transit@32473}}
+          class: normalized
+          reason: structured_data
+          text: >-
+            Under `structured_data:`, a PARAM of the opt-in SD-ELEMENT, which syslog_in reads back
+            as a string inside `syslog.sd`, under the SD-ID and the attribute's key. The PARAM-VALUE
+            is the string.
+        - class: lost
+          reason: uncounted
+          text: >-
+            An attribute outside the header fields is left off, uncounted; under RFC 5424,
+            `structured_data:` writes each public event attribute other than `host.name`,
+            `process.pid`, and the `syslog.*` keys as an SD-PARAM, which syslog_in reads back
+            inside `syslog.sd`.
+      splunk_hec_out:
+        class: exact
+        text: A `fields` key.
+      kafka_out:
+        - when: {format: text}
+          class: lost
+          reason: structural
+          text: >-
+            A `format: text` record holds the log body alone, so the attribute is left off, as
+            every attribute is.
+        - class: exact
+          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
   - kind: attributes
     feature: container_id
     cells:
@@ -2141,7 +2308,10 @@ rows:
         reason: respelled
         text: >-
           On a metric, an event, or a service check, Datadog's `container_id` tag, the Datadog
-          OTLP exporter's spelling, which datadog_in reads back as a `container_id` attribute.
+          OTLP exporter's spelling, which datadog_in reads back as a `container_id` attribute. On
+          a log, a `container_id:<id>` entry appended to `ddtags`, the Agent's tag for a
+          container's logs, which datadog_in keeps in the `ddtags` string, so no `container.id`
+          reads back.
       graphite_out:
         - when: {tags: drop}
           class: lost
@@ -2150,6 +2320,38 @@ rows:
             Under `tags: drop`, no tag is written, counted once per attribute.
         - class: exact
           text: A `;container.id=<id>` tag.
+      syslog_out:
+        - when: {format: rfc3164}
+          class: lost
+          reason: structural
+          text: >-
+            RFC 3164 has no structured data, so an attribute outside the header fields is left off.
+        - when: {format: rfc5424, structured_data: {sd_id: transit@32473}}
+          class: normalized
+          reason: structured_data
+          text: >-
+            Under `structured_data:`, a PARAM of the opt-in SD-ELEMENT, which syslog_in reads back
+            as a string inside `syslog.sd`, under the SD-ID and the attribute's key. The PARAM-VALUE
+            is the string.
+        - class: lost
+          reason: uncounted
+          text: >-
+            An attribute outside the header fields is left off, uncounted; under RFC 5424,
+            `structured_data:` writes each public event attribute other than `host.name`,
+            `process.pid`, and the `syslog.*` keys as an SD-PARAM, which syslog_in reads back
+            inside `syslog.sd`.
+      splunk_hec_out:
+        class: exact
+        text: A `fields` key.
+      kafka_out:
+        - when: {format: text}
+          class: lost
+          reason: structural
+          text: >-
+            A `format: text` record holds the log body alone, so the attribute is left off, as
+            every attribute is.
+        - class: exact
+          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
   - kind: attributes
     feature: service_identity
     cells:
@@ -2188,6 +2390,38 @@ rows:
             Under `tags: drop`, no tag is written, counted once per attribute.
         - class: exact
           text: A `;name=value` tag.
+      syslog_out:
+        - when: {format: rfc3164}
+          class: lost
+          reason: structural
+          text: >-
+            RFC 3164 has no structured data, so an attribute outside the header fields is left off.
+        - when: {format: rfc5424, structured_data: {sd_id: transit@32473}}
+          class: normalized
+          reason: structured_data
+          text: >-
+            Under `structured_data:`, a PARAM of the opt-in SD-ELEMENT, which syslog_in reads back
+            as a string inside `syslog.sd`, under the SD-ID and the attribute's key. The PARAM-VALUE
+            is the string.
+        - class: lost
+          reason: uncounted
+          text: >-
+            An attribute outside the header fields is left off, uncounted; under RFC 5424,
+            `structured_data:` writes each public event attribute other than `host.name`,
+            `process.pid`, and the `syslog.*` keys as an SD-PARAM, which syslog_in reads back
+            inside `syslog.sd`.
+      splunk_hec_out:
+        class: exact
+        text: A `fields` key.
+      kafka_out:
+        - when: {format: text}
+          class: lost
+          reason: structural
+          text: >-
+            A `format: text` record holds the log body alone, so the attribute is left off, as
+            every attribute is.
+        - class: exact
+          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
   - kind: attributes
     feature: service_tag
     cells:
@@ -2225,6 +2459,38 @@ rows:
             Under `tags: drop`, no tag is written, counted once per attribute.
         - class: exact
           text: A `;name=value` tag.
+      syslog_out:
+        - when: {format: rfc3164}
+          class: lost
+          reason: structural
+          text: >-
+            RFC 3164 has no structured data, so an attribute outside the header fields is left off.
+        - when: {format: rfc5424, structured_data: {sd_id: transit@32473}}
+          class: normalized
+          reason: structured_data
+          text: >-
+            Under `structured_data:`, a PARAM of the opt-in SD-ELEMENT, which syslog_in reads back
+            as a string inside `syslog.sd`, under the SD-ID and the attribute's key. The PARAM-VALUE
+            is the string.
+        - class: lost
+          reason: uncounted
+          text: >-
+            An attribute outside the header fields is left off, uncounted; under RFC 5424,
+            `structured_data:` writes each public event attribute other than `host.name`,
+            `process.pid`, and the `syslog.*` keys as an SD-PARAM, which syslog_in reads back
+            inside `syslog.sd`.
+      splunk_hec_out:
+        class: exact
+        text: A `fields` key.
+      kafka_out:
+        - when: {format: text}
+          class: lost
+          reason: structural
+          text: >-
+            A `format: text` record holds the log body alone, so the attribute is left off, as
+            every attribute is.
+        - class: exact
+          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
   - kind: attributes
     feature: service_tag_beside_key
     cells:
@@ -2263,6 +2529,38 @@ rows:
             Under `tags: drop`, no tag is written, counted once per attribute.
         - class: exact
           text: A `;name=value` tag.
+      syslog_out:
+        - when: {format: rfc3164}
+          class: lost
+          reason: structural
+          text: >-
+            RFC 3164 has no structured data, so an attribute outside the header fields is left off.
+        - when: {format: rfc5424, structured_data: {sd_id: transit@32473}}
+          class: normalized
+          reason: structured_data
+          text: >-
+            Under `structured_data:`, a PARAM of the opt-in SD-ELEMENT, which syslog_in reads back
+            as a string inside `syslog.sd`, under the SD-ID and the attribute's key. The PARAM-VALUE
+            is the string.
+        - class: lost
+          reason: uncounted
+          text: >-
+            An attribute outside the header fields is left off, uncounted; under RFC 5424,
+            `structured_data:` writes each public event attribute other than `host.name`,
+            `process.pid`, and the `syslog.*` keys as an SD-PARAM, which syslog_in reads back
+            inside `syslog.sd`.
+      splunk_hec_out:
+        class: exact
+        text: A `fields` key, beside the standard key's.
+      kafka_out:
+        - when: {format: text}
+          class: lost
+          reason: structural
+          text: >-
+            A `format: text` record holds the log body alone, so the attribute is left off, as
+            every attribute is.
+        - class: exact
+          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
   - kind: attributes
     feature: bool_value
     cells:
@@ -2295,7 +2593,7 @@ rows:
         reason: bool_tag
         text: >-
           `true` is a bare `key` tag and reads back `true`; `false` is `key:false` and reads back as
-          the string.
+          the string. On a log, a JSON boolean, read back as itself.
       graphite_out:
         - when: {tags: drop}
           class: lost
@@ -2308,6 +2606,38 @@ rows:
           text: >-
             A tag of `true` or `false`, read back as the string. Its name is sanitized as the
             `string_value` row says, counted once per record as `tag_sanitized`.
+      syslog_out:
+        - when: {format: rfc3164}
+          class: lost
+          reason: structural
+          text: >-
+            RFC 3164 has no structured data, so an attribute outside the header fields is left off.
+        - when: {format: rfc5424, structured_data: {sd_id: transit@32473}}
+          class: normalized
+          reason: structured_data
+          text: >-
+            Under `structured_data:`, a PARAM of the opt-in SD-ELEMENT, which syslog_in reads back
+            as a string inside `syslog.sd`, under the SD-ID and the attribute's key. The PARAM-VALUE
+            is `true` or `false`.
+        - class: lost
+          reason: uncounted
+          text: >-
+            An attribute outside the header fields is left off, uncounted; under RFC 5424,
+            `structured_data:` writes each public event attribute other than `host.name`,
+            `process.pid`, and the `syslog.*` keys as an SD-PARAM, which syslog_in reads back
+            inside `syslog.sd`.
+      splunk_hec_out:
+        class: exact
+        text: A JSON boolean, read back as itself.
+      kafka_out:
+        - when: {format: text}
+          class: lost
+          reason: structural
+          text: >-
+            A `format: text` record holds the log body alone, so the attribute is left off, as
+            every attribute is.
+        - class: exact
+          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
   - kind: attributes
     feature: number_value
     cells:
@@ -2341,7 +2671,8 @@ rows:
         class: normalized
         reason: stringified
         text: >-
-          A `key:<number>` tag, read back as a string.
+          A `key:<number>` tag, read back as a string. On a log, a JSON number, read back as
+          itself.
       graphite_out:
         - when: {tags: drop}
           class: lost
@@ -2355,6 +2686,38 @@ rows:
             A tag of the number's text, an `f64` in its shortest form (`3` for `3.0`), read back as
             the string. Its name is sanitized as the `string_value` row says, counted once per
             record as `tag_sanitized`.
+      syslog_out:
+        - when: {format: rfc3164}
+          class: lost
+          reason: structural
+          text: >-
+            RFC 3164 has no structured data, so an attribute outside the header fields is left off.
+        - when: {format: rfc5424, structured_data: {sd_id: transit@32473}}
+          class: normalized
+          reason: structured_data
+          text: >-
+            Under `structured_data:`, a PARAM of the opt-in SD-ELEMENT, which syslog_in reads back
+            as a string inside `syslog.sd`, under the SD-ID and the attribute's key. The PARAM-VALUE
+            is an integer's decimal text, or a float as an `f64` in Rust's shortest form.
+        - class: lost
+          reason: uncounted
+          text: >-
+            An attribute outside the header fields is left off, uncounted; under RFC 5424,
+            `structured_data:` writes each public event attribute other than `host.name`,
+            `process.pid`, and the `syslog.*` keys as an SD-PARAM, which syslog_in reads back
+            inside `syslog.sd`.
+      splunk_hec_out:
+        class: exact
+        text: A JSON number, read back as the same integer or double; a `u64` above `i64::MAX` stays a `u64`.
+      kafka_out:
+        - when: {format: text}
+          class: lost
+          reason: structural
+          text: >-
+            A `format: text` record holds the log body alone, so the attribute is left off, as
+            every attribute is.
+        - class: exact
+          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
   - kind: attributes
     feature: array_value
     cells:
@@ -2386,7 +2749,7 @@ rows:
         reason: stringified
         text: >-
           One tag per element in order, which datadog_in folds back into an array of strings, so a
-          number element reads back as its text.
+          number element reads back as its text. On a log, a JSON array, read back as itself.
       graphite_out:
         - when: {tags: drop}
           class: lost
@@ -2397,6 +2760,42 @@ rows:
           reason: multi_value
           counter: logit.output.tags.normalized{reason=multi_value}
           text: A tag holds one value, so only the last representable element is written, counted.
+      syslog_out:
+        - when: {format: rfc3164}
+          class: lost
+          reason: structural
+          text: >-
+            RFC 3164 has no structured data, so an attribute outside the header fields is left off.
+        - when: {format: rfc5424, structured_data: {sd_id: transit@32473}}
+          class: normalized
+          reason: structured_data
+          text: >-
+            Under `structured_data:`, a PARAM of the opt-in SD-ELEMENT, which syslog_in reads back
+            as a string inside `syslog.sd`, under the SD-ID and the attribute's key. The PARAM-VALUE
+            is one PARAM per element, each element's text, which syslog_in reads back as an array of
+            strings, or one string for a one-element array.
+        - class: lost
+          reason: uncounted
+          text: >-
+            An attribute outside the header fields is left off, uncounted; under RFC 5424,
+            `structured_data:` writes each public event attribute other than `host.name`,
+            `process.pid`, and the `syslog.*` keys as an SD-PARAM, which syslog_in reads back
+            inside `syslog.sd`.
+      splunk_hec_out:
+        class: normalized
+        reason: flattened
+        text: >-
+          A JSON array; one holding a map or an array leaves as its JSON text, read back as a string,
+          since `fields` is flat.
+      kafka_out:
+        - when: {format: text}
+          class: lost
+          reason: structural
+          text: >-
+            A `format: text` record holds the log body alone, so the attribute is left off, as
+            every attribute is.
+        - class: exact
+          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
   - kind: attributes
     feature: map_value
     cells:
@@ -2423,7 +2822,8 @@ rows:
         class: lost
         counter: logit.output.tags.omitted{reason=unrepresentable}
         text: >-
-          A tag has no nested form, so a map is left off, counted.
+          A tag has no nested form, so a map is left off, counted. On a log, a JSON object, read
+          back as itself.
       graphite_out:
         - when: {tags: drop}
           class: lost
@@ -2433,6 +2833,42 @@ rows:
         - class: lost
           counter: logit.output.tags.omitted{reason=unrepresentable}
           text: A map has no tag form and is left off, counted.
+      syslog_out:
+        - when: {format: rfc3164}
+          class: lost
+          reason: structural
+          text: >-
+            RFC 3164 has no structured data, so an attribute outside the header fields is left off.
+        - when: {format: rfc5424, structured_data: {sd_id: transit@32473}}
+          class: normalized
+          reason: structured_data
+          text: >-
+            Under `structured_data:`, a PARAM of the opt-in SD-ELEMENT, which syslog_in reads back
+            as a string inside `syslog.sd`, under the SD-ID and the attribute's key. The PARAM-VALUE
+            is its inline `{k="v"}` text.
+        - class: lost
+          reason: uncounted
+          text: >-
+            An attribute outside the header fields is left off, uncounted; under RFC 5424,
+            `structured_data:` writes each public event attribute other than `host.name`,
+            `process.pid`, and the `syslog.*` keys as an SD-PARAM, which syslog_in reads back
+            inside `syslog.sd`.
+      splunk_hec_out:
+        class: normalized
+        reason: flattened
+        text: >-
+          `fields` is flat, so a map leaves as one dotted key per leaf (`http.method`), read back as
+          that many attributes, and an empty map is left off. A span's `attributes` object keeps its
+          nesting.
+      kafka_out:
+        - when: {format: text}
+          class: lost
+          reason: structural
+          text: >-
+            A `format: text` record holds the log body alone, so the attribute is left off, as
+            every attribute is.
+        - class: exact
+          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
   - kind: attributes
     feature: bytes_value
     cells:
@@ -2459,7 +2895,8 @@ rows:
         class: lost
         counter: logit.output.tags.omitted{reason=unrepresentable}
         text: >-
-          A tag has no bytes form, so the value is left off, counted.
+          A tag has no bytes form, so the value is left off, counted. On a log, its base64 text,
+          read back as a string.
       graphite_out:
         - when: {tags: drop}
           class: lost
@@ -2469,6 +2906,38 @@ rows:
         - class: lost
           counter: logit.output.tags.omitted{reason=unrepresentable}
           text: A bytes value has no tag form and is left off, counted.
+      syslog_out:
+        - when: {format: rfc3164}
+          class: lost
+          reason: structural
+          text: >-
+            RFC 3164 has no structured data, so an attribute outside the header fields is left off.
+        - when: {format: rfc5424, structured_data: {sd_id: transit@32473}}
+          class: lost
+          reason: uncounted
+          text: >-
+            Under `structured_data:`, a PARAM of the opt-in SD-ELEMENT whose PARAM-VALUE is the
+            value's length, `<N bytes>`, so its bytes are left off, uncounted.
+        - class: lost
+          reason: uncounted
+          text: >-
+            An attribute outside the header fields is left off, uncounted; under RFC 5424,
+            `structured_data:` writes each public event attribute other than `host.name`,
+            `process.pid`, and the `syslog.*` keys as an SD-PARAM, which syslog_in reads back
+            inside `syslog.sd`.
+      splunk_hec_out:
+        class: normalized
+        reason: stringified
+        text: Its base64 text as a JSON string, read back as a string.
+      kafka_out:
+        - when: {format: text}
+          class: lost
+          reason: structural
+          text: >-
+            A `format: text` record holds the log body alone, so the attribute is left off, as
+            every attribute is.
+        - class: exact
+          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
   - kind: attributes
     feature: timestamp_value
     cells:
@@ -2496,7 +2965,8 @@ rows:
         class: normalized
         reason: stringified
         text: >-
-          A `key:<RFC 3339>` tag, read back as a string.
+          A `key:<RFC 3339>` tag, read back as a string. On a log, the RFC 3339 text as a JSON
+          string.
       graphite_out:
         - when: {tags: drop}
           class: lost
@@ -2506,6 +2976,82 @@ rows:
         - class: lost
           counter: logit.output.tags.omitted{reason=unrepresentable}
           text: A timestamp value has no tag form and is left off, counted.
+      syslog_out:
+        - when: {format: rfc3164}
+          class: lost
+          reason: structural
+          text: >-
+            RFC 3164 has no structured data, so an attribute outside the header fields is left off.
+        - when: {format: rfc5424, structured_data: {sd_id: transit@32473}}
+          class: normalized
+          reason: structured_data
+          text: >-
+            Under `structured_data:`, a PARAM of the opt-in SD-ELEMENT, which syslog_in reads back
+            as a string inside `syslog.sd`, under the SD-ID and the attribute's key. The PARAM-VALUE
+            is its RFC 3339 text with nanoseconds.
+        - class: lost
+          reason: uncounted
+          text: >-
+            An attribute outside the header fields is left off, uncounted; under RFC 5424,
+            `structured_data:` writes each public event attribute other than `host.name`,
+            `process.pid`, and the `syslog.*` keys as an SD-PARAM, which syslog_in reads back
+            inside `syslog.sd`.
+      splunk_hec_out:
+        class: normalized
+        reason: stringified
+        text: Its RFC 3339 text as a JSON string, read back as a string.
+      kafka_out:
+        - when: {format: text}
+          class: lost
+          reason: structural
+          text: >-
+            A `format: text` record holds the log body alone, so the attribute is left off, as
+            every attribute is.
+        - class: exact
+          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
+  # datadog_in decodes a JSON null attribute on a log, and otlp_in an `AnyValue` with no value
+  # set on any signal, but no case puts a null on a metric's attributes, so only the log sinks
+  # have a cell.
+  - kind: attributes
+    feature: null_value
+    cells:
+      otlp_out:
+        class: exact
+        text: An `AnyValue` with no value set, read back as null.
+      datadog_out:
+        class: exact
+        text: On a log, a JSON null, read back as itself.
+      syslog_out:
+        - when: {format: rfc3164}
+          class: lost
+          reason: structural
+          text: >-
+            RFC 3164 has no structured data, so an attribute outside the header fields is left off.
+        - when: {format: rfc5424, structured_data: {sd_id: transit@32473}}
+          class: normalized
+          reason: structured_data
+          text: >-
+            Under `structured_data:`, a PARAM of the opt-in SD-ELEMENT with an empty PARAM-VALUE,
+            which syslog_in reads back as an empty string inside `syslog.sd`.
+        - class: lost
+          reason: uncounted
+          text: >-
+            An attribute outside the header fields is left off, uncounted; under RFC 5424,
+            `structured_data:` writes each public event attribute other than `host.name`,
+            `process.pid`, and the `syslog.*` keys as an SD-PARAM, which syslog_in reads back
+            inside `syslog.sd`.
+      splunk_hec_out:
+        class: exact
+        text: A JSON null, read back as itself.
+      kafka_out:
+        - when: {format: text}
+          class: lost
+          reason: structural
+          text: >-
+            A `format: text` record holds the log body alone, so the attribute is left off, as
+            every attribute is.
+        - class: exact
+          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
   # graphite_in stamps no `_logit.graphite.` carrier, so no record reaches this row at
   # graphite_out and it has no cell.
   - kind: attributes
@@ -2544,6 +3090,23 @@ rows:
           Datadog names, is read and not written; datadog_in stamps it again on every series
           batch. The v2 series route writes `_logit.datadog.hostless` as a `host` resource with no
           name, which datadog_in reads into `_logit.datadog.resources`.
+      syslog_out:
+        class: lost
+        reason: structural
+        text: A `_logit.` carrier or flag is private and isn't a header field, so it's left off.
+      splunk_hec_out:
+        class: lost
+        reason: structural
+        text: A `_logit.` carrier or flag is private and isn't a HEC field, so it's left off.
+      kafka_out:
+        - when: {format: text}
+          class: lost
+          reason: structural
+          text: >-
+            A `format: text` record holds the log body alone, so the attribute is left off, as
+            every attribute is.
+        - class: exact
+          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
   - kind: attributes
     feature: prometheus_target
     cells:
@@ -2577,6 +3140,23 @@ rows:
         text: >-
           The scrape target is private and isn't a tag, so it's left off, under either `tags:`
           mode.
+      syslog_out:
+        class: lost
+        reason: structural
+        text: A `_logit.` carrier or flag is private and isn't a header field, so it's left off.
+      splunk_hec_out:
+        class: lost
+        reason: structural
+        text: The scrape target is private and isn't a HEC field, so it's left off.
+      kafka_out:
+        - when: {format: text}
+          class: lost
+          reason: structural
+          text: >-
+            A `format: text` record holds the log body alone, so the attribute is left off, as
+            every attribute is.
+        - class: exact
+          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
   - kind: attributes
     feature: foreign_carrier
     cells:
@@ -2627,6 +3207,23 @@ rows:
         text: >-
           Another protocol's `_logit.` carrier is private and isn't a tag, so it's left off, under
           either `tags:` mode.
+      syslog_out:
+        class: lost
+        reason: structural
+        text: A `_logit.` carrier or flag is private and isn't a header field, so it's left off.
+      splunk_hec_out:
+        class: lost
+        reason: structural
+        text: Another protocol's `_logit.` carrier is private and isn't a HEC field, so it's left off.
+      kafka_out:
+        - when: {format: text}
+          class: lost
+          reason: structural
+          text: >-
+            A `format: text` record holds the log body alone, so the attribute is left off, as
+            every attribute is.
+        - class: exact
+          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
   # `_logit.metrics.closed: timestamped`, the neutral flag that says the event's timestamp is its
   # source's own. statsd_in and prometheus_in's scrape set it, and statsd_out and prometheus_out
   # read it, whichever decoder set it.
@@ -2681,6 +3278,23 @@ rows:
         text: >-
           The flag is private and isn't a tag, so it's left off, under either `tags:` mode. Every
           datapoint carries its timestamp.
+      syslog_out:
+        class: lost
+        reason: structural
+        text: A `_logit.` carrier or flag is private and isn't a header field, so it's left off.
+      splunk_hec_out:
+        class: lost
+        reason: structural
+        text: The flag is private and isn't a HEC field, so it's left off. `time` carries the timestamp.
+      kafka_out:
+        - when: {format: text}
+          class: lost
+          reason: structural
+          text: >-
+            A `format: text` record holds the log body alone, so the attribute is left off, as
+            every attribute is.
+        - class: exact
+          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
   # `_logit.metrics.type: rate` and `_logit.metrics.interval`, the neutral flags that say a gauge
   # is a per-second rate over an interval. datadog_in sets them, and datadog_out reads them,
   # whichever producer set them.
@@ -2715,6 +3329,23 @@ rows:
         reason: structural
         text: >-
           The flag is private and isn't a tag, so it's left off, under either `tags:` mode.
+      syslog_out:
+        class: lost
+        reason: structural
+        text: A `_logit.` carrier or flag is private and isn't a header field, so it's left off.
+      splunk_hec_out:
+        class: lost
+        reason: structural
+        text: The flag is private and isn't a HEC field, so it's left off.
+      kafka_out:
+        - when: {format: text}
+          class: lost
+          reason: structural
+          text: >-
+            A `format: text` record holds the log body alone, so the attribute is left off, as
+            every attribute is.
+        - class: exact
+          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
   - kind: attributes
     feature: interval
     cells:
@@ -2744,6 +3375,23 @@ rows:
         reason: structural
         text: >-
           The flag is private and isn't a tag, so it's left off, under either `tags:` mode.
+      syslog_out:
+        class: lost
+        reason: structural
+        text: A `_logit.` carrier or flag is private and isn't a header field, so it's left off.
+      splunk_hec_out:
+        class: lost
+        reason: structural
+        text: The flag is private and isn't a HEC field, so it's left off.
+      kafka_out:
+        - when: {format: text}
+          class: lost
+          reason: structural
+          text: >-
+            A `format: text` record holds the log body alone, so the attribute is left off, as
+            every attribute is.
+        - class: exact
+          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
   # `_logit.metrics.type: rate` on a record that isn't a gauge: the flag applies to gauges only.
   - kind: attributes
     feature: rate_on_non_gauge
@@ -2775,6 +3423,23 @@ rows:
         reason: structural
         text: >-
           The flag is private and isn't a tag, so it's left off, under either `tags:` mode.
+      syslog_out:
+        class: lost
+        reason: structural
+        text: A `_logit.` carrier or flag is private and isn't a header field, so it's left off.
+      splunk_hec_out:
+        class: lost
+        reason: structural
+        text: The flag is private and isn't a HEC field, so it's left off.
+      kafka_out:
+        - when: {format: text}
+          class: lost
+          reason: structural
+          text: >-
+            A `format: text` record holds the log body alone, so the attribute is left off, as
+            every attribute is.
+        - class: exact
+          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
   # `_logit.metrics.type: info` or `stateset` on a gauge, or `gaugehistogram` on a histogram, the
   # neutral flag that names an OpenMetrics family type the model has no kind for. prometheus_in
   # sets it, and prometheus_out and otlp_out read it, whichever producer set it.
@@ -2810,6 +3475,23 @@ rows:
         reason: structural
         text: >-
           The flag is private and isn't a tag, so it's left off, under either `tags:` mode.
+      syslog_out:
+        class: lost
+        reason: structural
+        text: A `_logit.` carrier or flag is private and isn't a header field, so it's left off.
+      splunk_hec_out:
+        class: lost
+        reason: structural
+        text: The flag is private and isn't a HEC field, so it's left off.
+      kafka_out:
+        - when: {format: text}
+          class: lost
+          reason: structural
+          text: >-
+            A `format: text` record holds the log body alone, so the attribute is left off, as
+            every attribute is.
+        - class: exact
+          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
   # `_logit.metrics.type: info`, `stateset`, or `gaugehistogram` on a record of a kind the value
   # doesn't name: each reader ignores it.
   - kind: attributes
@@ -2844,6 +3526,23 @@ rows:
         reason: structural
         text: >-
           The flag is private and isn't a tag, so it's left off, under either `tags:` mode.
+      syslog_out:
+        class: lost
+        reason: structural
+        text: A `_logit.` carrier or flag is private and isn't a header field, so it's left off.
+      splunk_hec_out:
+        class: lost
+        reason: structural
+        text: The flag is private and isn't a HEC field, so it's left off.
+      kafka_out:
+        - when: {format: text}
+          class: lost
+          reason: structural
+          text: >-
+            A `format: text` record holds the log body alone, so the attribute is left off, as
+            every attribute is.
+        - class: exact
+          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
   # `_logit.metrics.interval` on a record that takes datadog_out's distribution-points or
   # sketches route, neither of which has an interval field: a `samples`, `distribution`, or delta
   # `exponential_histogram` record.
@@ -2877,6 +3576,23 @@ rows:
         reason: structural
         text: >-
           The flag is private and isn't a tag, so it's left off, under either `tags:` mode.
+      syslog_out:
+        class: lost
+        reason: structural
+        text: A `_logit.` carrier or flag is private and isn't a header field, so it's left off.
+      splunk_hec_out:
+        class: lost
+        reason: structural
+        text: The flag is private and isn't a HEC field, so it's left off.
+      kafka_out:
+        - when: {format: text}
+          class: lost
+          reason: structural
+          text: >-
+            A `format: text` record holds the log body alone, so the attribute is left off, as
+            every attribute is.
+        - class: exact
+          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
   # `_logit.metrics.interval` on a delta `histogram`, which datadog_out sends as a sketch under
   # the default `histograms.mode: distributions` and as series under the other modes.
   - kind: attributes
@@ -2924,6 +3640,23 @@ rows:
         reason: structural
         text: >-
           The flag is private and isn't a tag, so it's left off, under either `tags:` mode.
+      syslog_out:
+        class: lost
+        reason: structural
+        text: A `_logit.` carrier or flag is private and isn't a header field, so it's left off.
+      splunk_hec_out:
+        class: lost
+        reason: structural
+        text: The flag is private and isn't a HEC field, so it's left off.
+      kafka_out:
+        - when: {format: text}
+          class: lost
+          reason: structural
+          text: >-
+            A `format: text` record holds the log body alone, so the attribute is left off, as
+            every attribute is.
+        - class: exact
+          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
   - kind: attributes
     feature: resource_attribute
     cells:
@@ -2969,6 +3702,27 @@ rows:
             A tag, read back as an event attribute; on a key the event shares, the event's value
             wins, uncounted. Its name and value are sanitized as the `string_value` row says,
             counted once per record as `tag_sanitized`.
+      syslog_out:
+        class: lost
+        reason: structural
+        text: >-
+          Syslog has no resource, so a resource attribute is left off, apart from `host.name` and
+          `process.pid`, which are HOSTNAME and PROCID when the event carries neither and read back
+          on the event.
+      splunk_hec_out:
+        class: normalized
+        reason: resource_as_field
+        text: >-
+          A `fields` key beside the event's own, so on a log or a metric it reads back as an event
+          attribute, an event attribute of the same key winning; a span's reads back on the resource.
+      kafka_out:
+        - when: {format: text}
+          class: lost
+          reason: structural
+          text: >-
+            A `format: text` record holds the log body alone, so the resource is left off.
+        - class: exact
+          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
   - kind: attributes
     feature: scope
     cells:
@@ -2995,6 +3749,22 @@ rows:
         class: lost
         reason: structural
         text: Carbon has no instrumentation scope, so none is written.
+      syslog_out:
+        class: lost
+        reason: structural
+        text: Syslog has no instrumentation scope, so none is written.
+      splunk_hec_out:
+        class: lost
+        reason: structural
+        text: HEC has no instrumentation scope, so none is written.
+      kafka_out:
+        - when: {format: text}
+          class: lost
+          reason: structural
+          text: >-
+            A `format: text` record holds the log body alone, so the scope is left off.
+        - class: exact
+          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
 
   - kind: attributes
     feature: datadog_carrier_log
@@ -3027,6 +3797,374 @@ rows:
         class: lost
         reason: structural
         text: Another protocol's `_logit.` carrier is private and isn't a tag, so it's left off.
+      syslog_out:
+        class: lost
+        reason: structural
+        text: A `_logit.` carrier or flag is private and isn't a header field, so it's left off.
+      splunk_hec_out:
+        class: lost
+        reason: structural
+        text: A `_logit.` carrier is private and isn't a HEC field, so it's left off.
+      kafka_out:
+        - when: {format: text}
+          class: lost
+          reason: structural
+          text: >-
+            A `format: text` record holds the log body alone, so the attribute is left off, as
+            every attribute is.
+        - class: exact
+          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
+
+  # OTLP's raw severity carriers. `_logit.syslog.severity` gets its own row,
+  # `severity_carrier_syslog`, with the syslog source, since otlp_out keeps one carrier and not the
+  # other. statsd_out writes a log only as a DogStatsD event, and this row has no statsd_out cell;
+  # prometheus_out, influxdb_out, and graphite_out don't write a log on an event with no metrics,
+  # where the carriers ride, so none of them has a cell.
+  - kind: attributes
+    feature: severity_carrier_otel
+    cells:
+      otlp_out:
+        class: exact
+        text: >-
+          The raw `severity_number` and `severity_text` the carriers hold, which otlp_in reads
+          back into the same carriers beside the band's severity.
+      datadog_out:
+        class: lost
+        reason: structural
+        text: >-
+          A Datadog log has a status and no raw OTLP severity, so the carriers are left off and
+          the severity reads back at band resolution.
+      syslog_out:
+        class: lost
+        reason: structural
+        text: >-
+          Syslog has no raw OTLP severity, so the carriers are left off and the severity reads back
+          from PRI at syslog's resolution.
+      splunk_hec_out:
+        class: lost
+        reason: structural
+        text: >-
+          A `_logit.` carrier is private and isn't a HEC field, so it's left off and the severity
+          reads back at band resolution.
+      kafka_out:
+        - when: {format: text}
+          class: lost
+          reason: structural
+          text: >-
+            A `format: text` record holds the log body alone, so the attribute is left off, as
+            every attribute is.
+        - class: exact
+          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
+  - kind: attributes
+    feature: severity_carrier_syslog
+    cells:
+      otlp_out:
+        class: lost
+        reason: structural
+        text: >-
+          A `_logit.` carrier is private and isn't an OTLP attribute, so it's left off and the
+          severity reads back at band resolution.
+      datadog_out:
+        class: lost
+        reason: structural
+        text: >-
+          A Datadog log has a status and no raw syslog severity, so the carrier is left off and the
+          severity reads back at band resolution.
+      syslog_out:
+        class: exact
+        text: PRI's severity, which syslog_in reads back into the same carrier.
+      splunk_hec_out:
+        class: lost
+        reason: structural
+        text: >-
+          A `_logit.` carrier is private and isn't a HEC field, so it's left off and the severity
+          reads back at band resolution.
+      kafka_out:
+        - when: {format: text}
+          class: lost
+          reason: structural
+          text: >-
+            A `format: text` record holds the log body alone, so the attribute is left off, as
+            every attribute is.
+        - class: exact
+          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
+
+  # --- a log's attributes syslog_out writes as header fields -------------------------------------
+  # A log's own `syslog.*`, `process.pid`, and `host.name` attributes. statsd_out writes a log only
+  # as a DogStatsD event, prometheus_out, influxdb_out, and graphite_out don't write a log on an
+  # event with no metrics, and only `host_name` reaches statsd_out.
+  - kind: attributes
+    feature: syslog_header
+    cells:
+      otlp_out:
+        class: normalized
+        reason: u64_as_int
+        text: >-
+          A string or integer attribute; `intValue` is signed, so a `u64` `syslog.facility` or
+          `process.pid` reads back as an `i64`.
+      datadog_out:
+        class: normalized
+        reason: u64_as_int
+        text: >-
+          A top-level key of the log object; a `u64` `syslog.facility` or `process.pid` is a JSON
+          number, which datadog_in reads back as an `i64`.
+      syslog_out:
+        - when: {format: rfc3164}
+          class: lost
+          reason: structural
+          text: >-
+            Under RFC 3164, `syslog.facility` is PRI's facility and `syslog.tag` the TAG, and a PID
+            is written only inside a TAG, so `process.pid` or `syslog.pid` on a log with no
+            `syslog.tag` is left off.
+        - class: exact
+          text: >-
+            `syslog.facility` is PRI's facility, `syslog.tag` APP-NAME, and `process.pid` or
+            `syslog.pid` PROCID, each read back as written.
+      splunk_hec_out:
+        class: normalized
+        reason: u64_as_int
+        text: >-
+          A `fields` string or number; a `u64` `syslog.facility` or `process.pid` reads back as an
+          `i64`.
+      kafka_out:
+        - when: {format: text}
+          class: lost
+          reason: structural
+          text: >-
+            A `format: text` record holds the log body alone, so the attribute is left off, as
+            every attribute is.
+        - class: exact
+          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
+  - kind: attributes
+    feature: syslog_msgid
+    cells:
+      otlp_out:
+        class: exact
+        text: A string attribute.
+      datadog_out:
+        class: exact
+        text: A top-level key of the log object.
+      syslog_out:
+        - when: {format: rfc3164}
+          class: lost
+          reason: structural
+          text: RFC 3164 has no MSGID, so it's left off.
+        - class: exact
+          text: MSGID.
+      splunk_hec_out:
+        class: exact
+        text: A `fields` string.
+      kafka_out:
+        - when: {format: text}
+          class: lost
+          reason: structural
+          text: >-
+            A `format: text` record holds the log body alone, so the attribute is left off, as
+            every attribute is.
+        - class: exact
+          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
+  - kind: attributes
+    feature: syslog_sd
+    cells:
+      otlp_out:
+        class: exact
+        text: A key-value list attribute.
+      datadog_out:
+        class: exact
+        text: A JSON object in the log object, read back as itself.
+      syslog_out:
+        - when: {format: rfc3164}
+          class: lost
+          reason: structural
+          text: RFC 3164 has no STRUCTURED-DATA, so it's left off.
+        - when: {format: rfc5424, structured_data: {sd_id: transit@32473}}
+          class: normalized
+          reason: structured_data
+          text: >-
+            Under `structured_data:`, the log's own elements are written beside the opt-in
+            SD-ELEMENT, so `syslog.sd` reads back with it added. An element under the configured
+            SD-ID is the log's own, and the opt-in one is left off.
+        - class: exact
+          text: STRUCTURED-DATA, its elements and their params in name order.
+      splunk_hec_out:
+        class: normalized
+        reason: flattened
+        text: >-
+          `fields` is flat, so `syslog.sd` leaves as one `syslog.sd.<SD-ID>.<PARAM-NAME>` key per
+          PARAM, read back as that many attributes and no `syslog.sd` map.
+      kafka_out:
+        - when: {format: text}
+          class: lost
+          reason: structural
+          text: >-
+            A `format: text` record holds the log body alone, so the attribute is left off, as
+            every attribute is.
+        - class: exact
+          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
+  - kind: attributes
+    feature: syslog_timestamp
+    cells:
+      otlp_out:
+        class: normalized
+        reason: timestamp_as_int
+        text: >-
+          An RFC 3164 timestamp is a string attribute; OTLP has no timestamp value, so an RFC 5424
+          one is an integer of Unix nanoseconds.
+      datadog_out:
+        class: normalized
+        reason: stringified
+        text: >-
+          A top-level key of the log object: an RFC 5424 timestamp as its RFC 3339 text, read back
+          as a string.
+      syslog_out:
+        - when: {format: rfc3164}
+          class: lost
+          reason: structural
+          text: >-
+            Under RFC 3164, a typed timestamp is TIMESTAMP in whole seconds with no year or zone,
+            which syslog_in reads back as that text, and an RFC 3164-shaped string is written as it
+            is; anything else, a null or any other string, gives way to the log's timestamp and the
+            attribute is left off.
+        - class: lost
+          reason: structural
+          text: >-
+            Under RFC 5424, a typed timestamp is TIMESTAMP and a null is the nil `-`, each written
+            as it is; any string, an RFC 5424-shaped one included, gives way to the log's timestamp
+            and the attribute is left off.
+      splunk_hec_out:
+        class: normalized
+        reason: stringified
+        text: >-
+          A `fields` string: an RFC 3164 timestamp as itself, an RFC 5424 one as its RFC 3339 text,
+          read back as a string.
+      kafka_out:
+        - when: {format: text}
+          class: lost
+          reason: structural
+          text: >-
+            A `format: text` record holds the log body alone, so the attribute is left off, as
+            every attribute is.
+        - class: exact
+          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
+  - kind: attributes
+    feature: sd_id_collision
+    cells:
+      syslog_out:
+        class: lost
+        counter: logit.output.structured_data.omitted{reason=sd_id_collision}
+        text: >-
+          Under `structured_data:`, a log whose own `syslog.sd` already holds an element under the
+          configured SD-ID keeps its own, and the opt-in SD-ELEMENT is left off, counted once per
+          log: syslog_in refuses a repeated SD-ID.
+  - kind: attributes
+    feature: sd_name_unsafe
+    cells:
+      syslog_out:
+        class: lost
+        counter: logit.output.structured_data.omitted{reason=invalid_sd_name}
+        text: >-
+          Under `structured_data:`, an attribute key that isn't an RFC 5424 SD-NAME (1 to 32
+          printable ASCII characters, none of them `=`, space, `]`, or `"`) has no PARAM-NAME, so
+          its PARAM is left off, counted.
+  - kind: attributes
+    feature: sd_empty_array
+    cells:
+      syslog_out:
+        class: lost
+        reason: uncounted
+        text: >-
+          Under `structured_data:`, an empty array writes one PARAM per element, so none, and the
+          attribute is left off, uncounted.
+  - kind: attributes
+    feature: host_name
+    cells:
+      statsd_out:
+        class: exact
+        text: A DogStatsD event's `h:` field, read back as `host.name`.
+      otlp_out:
+        class: exact
+        text: A string attribute.
+      datadog_out:
+        class: exact
+        text: The log's `hostname`, or the event's `host`, read back as `host.name`.
+      syslog_out:
+        - when: {format: rfc3164}
+          class: lost
+          reason: structural
+          text: >-
+            Under RFC 3164, a log with no `syslog.tag` has no TAG, so syslog_in reads its HOSTNAME
+            as the first word of its message (the `log/header_in_message` row) and reads no
+            `host.name` back.
+        - class: exact
+          text: HOSTNAME.
+      splunk_hec_out:
+        class: normalized
+        reason: host_on_resource
+        text: >-
+          A non-empty string `host.name` is the object's `host`, the event's over the resource's,
+          which splunk_hec_in reads back as the resource's `host.name`.
+      kafka_out:
+        - when: {format: text}
+          class: lost
+          reason: structural
+          text: >-
+            A `format: text` record holds the log body alone, so the attribute is left off, as
+            every attribute is.
+        - class: exact
+          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
+  - kind: attributes
+    feature: splunk_envelope
+    cells:
+      otlp_out:
+        class: exact
+        text: A resource attribute.
+      datadog_out:
+        class: normalized
+        reason: resource_as_tag
+        text: Merged into the log's attributes, so it reads back as an event attribute.
+      syslog_out:
+        class: lost
+        reason: structural
+        text: Syslog has no resource and no field for Splunk's envelope, so it's left off.
+      splunk_hec_out:
+        class: exact
+        text: >-
+          The object's `source`, `sourcetype`, or `index`, read back onto the resource; a value that
+          isn't a string is omitted, counted once per batch.
+      kafka_out:
+        - when: {format: text}
+          class: lost
+          reason: structural
+          text: >-
+            A `format: text` record holds the log body alone, so the attribute is left off, as
+            every attribute is.
+        - class: exact
+          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
+  - kind: attributes
+    feature: syslog_facility
+    cells:
+      statsd_out:
+        class: exact
+        text: A log with no `syslog.facility` leaves with none.
+      otlp_out:
+        class: exact
+        text: A log with no `syslog.facility` leaves with none.
+      datadog_out:
+        class: exact
+        text: A log with no `syslog.facility` leaves with none.
+      syslog_out:
+        class: normalized
+        reason: default_facility
+        text: >-
+          A log with no `syslog.facility` leaves with the sink's `facility:`, `local0` by default,
+          as PRI's facility, which syslog_in reads back as `syslog.facility`.
+      splunk_hec_out:
+        class: exact
+        text: A log with no `syslog.facility` leaves with none.
+      kafka_out:
+        class: exact
+        text: >-
+          `kafka_out` writes no attribute from a record's own fields or its config.
 
   # --- attributes datadog_out writes from a record's own fields ----------------------------------
   # Every sink reaches these rows; only datadog_out writes the attribute, which its pair decoder
@@ -3056,6 +4194,29 @@ rows:
       graphite_out:
         class: exact
         text: A record with no host leaves with none.
+      syslog_out:
+        - when: {format: rfc3164}
+          class: exact
+          text: >-
+            Under RFC 3164, a log with no host and no `syslog.tag` has no TAG, so syslog_in reads the
+            default HOSTNAME as the first word of its message (the `log/header_in_message` row) and
+            reads no `host.name` back. A log with a `syslog.tag` and no host reads back the default
+            HOSTNAME as `host.name`, as under RFC 5424, and no case reaches it.
+        - class: normalized
+          reason: default_host
+          text: >-
+            A log with no host leaves with the sink's `hostname:`, else the process hostname, as
+            HOSTNAME, which syslog_in reads back as `host.name`.
+      splunk_hec_out:
+        class: normalized
+        reason: default_host
+        text: >-
+          A record with no `host.name` leaves with the process hostname as its `host`, which
+          splunk_hec_in reads back as the resource's `host.name`.
+      kafka_out:
+        class: exact
+        text: >-
+          `kafka_out` writes no attribute from a record's own fields or its config.
   # statsd_out, prometheus_out, influxdb_out, and graphite_out don't write a log on an event with
   # no metrics, so its fields are never compared there and none of them has a cell.
   - kind: attributes
@@ -3070,6 +4231,42 @@ rows:
         text: >-
           A log with a severity and no `status` attribute leaves with `status` set to the
           severity's name, which datadog_in reads back as a `status` attribute beside the severity.
+      syslog_out:
+        class: exact
+        text: The severity is PRI's; no `status` attribute is written.
+      splunk_hec_out:
+        class: exact
+        text: No `status` attribute is written.
+      kafka_out:
+        class: exact
+        text: >-
+          `kafka_out` writes no attribute from a record's own fields or its config.
+  - kind: attributes
+    feature: log_severity_fields
+    cells:
+      statsd_out:
+        class: exact
+        text: No `otel.log.severity.*` attribute is written.
+      otlp_out:
+        class: exact
+        text: The severity is the `LogRecord`'s own; no `otel.log.severity.*` attribute is written.
+      datadog_out:
+        class: exact
+        text: The severity is `status`'s; no `otel.log.severity.*` attribute is written.
+      syslog_out:
+        class: exact
+        text: The severity is PRI's; no `otel.log.severity.*` attribute is written.
+      splunk_hec_out:
+        class: normalized
+        reason: severity_fields
+        text: >-
+          A log with a severity and neither `otel.log.severity.*` attribute leaves with both, the
+          severity's name and its band's base number, which splunk_hec_in reads back as attributes
+          beside the severity.
+      kafka_out:
+        class: exact
+        text: >-
+          `kafka_out` writes no attribute from a record's own fields or its config.
   # statsd_out, prometheus_out, influxdb_out, and graphite_out don't write a span, so its fields
   # are never compared there and none of them has a cell.
   - kind: attributes
@@ -3085,6 +4282,16 @@ rows:
           A span whose kind isn't internal, with no `span.kind` attribute, leaves with
           `meta["span.kind"]`, which datadog_in reads back as a `span.kind` attribute beside the
           kind.
+      syslog_out:
+        class: exact
+        text: A span isn't written, so no `span.kind` attribute is.
+      splunk_hec_out:
+        class: exact
+        text: The kind is the span object's `kind`; no `span.kind` attribute is written.
+      kafka_out:
+        class: exact
+        text: >-
+          `kafka_out` writes no attribute from a record's own fields or its config.
   # statsd_out, prometheus_out, influxdb_out, and graphite_out don't write a span, so its fields
   # are never compared there and none of them has a cell.
   - kind: attributes
@@ -3100,6 +4307,16 @@ rows:
           On the first span of a trace in a batch, when no span of the trace carries
           `_dd.p.tid`, a 128-bit trace id's high 64 bits leave as `meta["_dd.p.tid"]`, which
           datadog_in reads back as a `_dd.p.tid` attribute beside the trace id.
+      syslog_out:
+        class: exact
+        text: A span isn't written, so no `_dd.p.tid` attribute is.
+      splunk_hec_out:
+        class: exact
+        text: The 128-bit trace id is the span object's `trace_id`; no `_dd.p.tid` attribute is written.
+      kafka_out:
+        class: exact
+        text: >-
+          `kafka_out` writes no attribute from a record's own fields or its config.
 
   # --- logs ------------------------------------------------------------------------------------
   - kind: log
@@ -3122,12 +4339,10 @@ rows:
         counter: logit.output.events.skipped{reason=no_metrics}
         text: A log has no line-protocol form and isn't written.
       otlp_out:
-        class: normalized
-        reason: observed_timestamp
+        class: exact
         text: >-
-          An OTLP log record. Its `_logit.statsd.event.*` carriers aren't attributes; otlp_out
-          stamps an observed time on a log that has none, and otlp_in stamps the
-          `_logit.otel.severity_*` carriers.
+          An OTLP log record. Its `_logit.statsd.event.*` carriers aren't attributes; the `log`
+          field rows have its fields.
       datadog_out:
         class: exact
         text: >-
@@ -3137,6 +4352,24 @@ rows:
         class: skipped
         counter: logit.output.events.skipped{reason=no_metrics}
         text: A log has no carbon form and isn't written.
+      syslog_out:
+        class: exact
+        text: >-
+          One syslog message, the event's text as MSG; its `_logit.statsd.event.*` carriers aren't
+          written (the `attributes` rows).
+      splunk_hec_out:
+        class: exact
+        text: >-
+          One HEC object whose `event` is the message. Its `_logit.statsd.event.*` carriers are
+          private and aren't written; the `log` field rows have its fields.
+      kafka_out:
+        - when: {format: text}
+          class: exact
+          text: >-
+            The event's text as the record's value; its title and the other `_logit.statsd.event.*`
+            carriers are attributes, left off.
+        - class: exact
+          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
   - kind: log
     feature: plain
     cells:
@@ -3153,11 +4386,8 @@ rows:
         counter: logit.output.events.skipped{reason=no_metrics}
         text: A log has no line-protocol form and isn't written.
       otlp_out:
-        class: normalized
-        reason: observed_timestamp
-        text: >-
-          An OTLP log record. otlp_out stamps an observed time on a log that has none, and
-          otlp_in stamps the `_logit.otel.severity_*` carriers.
+        class: exact
+        text: An OTLP log record; the `log` field rows have its fields.
       datadog_out:
         class: exact
         text: >-
@@ -3166,6 +4396,550 @@ rows:
         class: skipped
         counter: logit.output.events.skipped{reason=no_metrics}
         text: A log has no carbon form and isn't written.
+      syslog_out:
+        class: exact
+        text: >-
+          One syslog message, the message as MSG and the severity in PRI; the `log` and `attributes`
+          rows have its fields.
+      splunk_hec_out:
+        class: exact
+        text: One HEC object whose `event` is the message; the `log` field rows have its fields.
+      kafka_out:
+        - when: {format: text}
+          class: exact
+          text: The log's message as the record's value, read back as one log per record.
+        - class: exact
+          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
+  # A log's own record-level rows, beside `log/plain` or `log/dogstatsd_event`. statsd_out writes a
+  # log only as a DogStatsD event, and this row has no statsd_out cell; prometheus_out,
+  # influxdb_out, and graphite_out don't write a log on an event with no metrics, so none of them
+  # has a cell. otlp_out writes every message as an `AnyValue`, so no log reaches
+  # `log/message_unsafe` there.
+  - kind: log
+    feature: message_unsafe
+    cells:
+      datadog_out:
+        class: normalized
+        reason: message_text
+        text: >-
+          The `message` field is a string: a `Bytes` message leaves as lossy UTF-8 and any other
+          non-string message as its JSON text, which datadog_in reads back as a string.
+      syslog_out:
+        class: normalized
+        reason: sanitized
+        text: >-
+          Every C0 control character and DEL in MSG, a newline included, is escaped as its backslash
+          form, so a multi-line message reads back as one line holding the escapes as text; a
+          number or bool message leaves as its text and reads back as a string.
+      splunk_hec_out:
+        class: normalized
+        reason: message_as_text
+        text: >-
+          A `Bytes` message leaves as its text, an invalid UTF-8 sequence replaced, and a timestamp
+          message as its RFC 3339 text, each read back as a string.
+      kafka_out:
+        class: normalized
+        reason: message_as_text
+        text: >-
+          Under `format: text`, a message that isn't a string leaves as its text: a number or a
+          boolean as its decimal or `true`/`false`, a timestamp as RFC 3339, no message as an empty
+          record, and a map or array as its JSON text; each reads back as a string. `format: json`
+          writes the message as it is.
+  - kind: log
+    feature: structured_message
+    cells:
+      otlp_out:
+        class: exact
+        text: A `kvlistValue` or `arrayValue` body.
+      datadog_out:
+        class: normalized
+        reason: message_text
+        text: A map or array message leaves as its JSON text, read back as a string.
+      syslog_out:
+        class: normalized
+        reason: message_text
+        text: >-
+          A `Map` or `Array` message is written as its inline text, which syslog_in reads back as a
+          string.
+      splunk_hec_out:
+        class: exact
+        text: A JSON object or array `event`, read back as the same structure.
+      kafka_out:
+        - when: {format: text}
+          class: normalized
+          reason: message_as_text
+          text: A `Map` or `Array` message leaves as its JSON text, which reads back as a string.
+        - class: exact
+          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
+  - kind: log
+    feature: bytes_message
+    cells:
+      otlp_out:
+        class: exact
+        text: A `bytesValue` body.
+      datadog_out:
+        class: normalized
+        reason: message_text
+        text: >-
+          A bytes message leaves as lossy UTF-8 text, read back as a string; an invalid sequence
+          reads back as U+FFFD.
+      syslog_out:
+        class: exact
+        text: >-
+          A `Bytes` message is written as its bytes, escaped as a string's are, and reads back as
+          `Bytes`; one that's valid UTF-8 reads back as a string (the `log/message_unsafe` row).
+      splunk_hec_out:
+        class: normalized
+        reason: message_as_text
+        text: A string `event`, read back as a string, as the `log/message_unsafe` row says.
+      kafka_out:
+        - when: {format: text}
+          class: normalized
+          reason: message_as_text
+          text: >-
+            A `Bytes` message leaves as its raw bytes, the record's value, which carries no type,
+            so a consumer that reads values as text sees a UTF-8 one as a string.
+        - class: exact
+          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
+  - kind: log
+    feature: blank_message
+    cells:
+      otlp_out:
+        class: exact
+        text: An empty string body, or a log record with no body.
+      datadog_out:
+        class: exact
+        text: >-
+          An empty message is an empty `message` field; a log with no message leaves `null` as
+          its text, which the `message_unsafe` row covers.
+      syslog_out:
+        class: exact
+        text: >-
+          A log with an empty message or none leaves with an empty MSG, which syslog_in reads back
+          as an empty string.
+      splunk_hec_out:
+        class: dropped
+        counter: logit.output.events.dropped{reason=blank_event}
+        text: >-
+          A log whose message is empty, null, or a non-finite number isn't written, since HEC
+          rejects a whole request holding a blank `event`; the rest of the batch is sent.
+      kafka_out:
+        - when: {format: text}
+          class: normalized
+          reason: message_as_text
+          text: >-
+            An empty message leaves an empty record, and a log with no message one too, which reads
+            back as the empty string.
+        - class: exact
+          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
+  # syslog_out's alone: under RFC 3164, syslog_in reads its header back by a two-token rule.
+  - kind: log
+    feature: header_in_message
+    cells:
+      syslog_out:
+        class: normalized
+        reason: header_in_message
+        text: >-
+          Under RFC 3164, a log with no `syslog.tag` reads back with its HOSTNAME at the front of
+          its message, and a message whose first word is TAG-shaped reads back with that word as
+          `syslog.tag`; syslog_in decides where the header ends by its first two words.
+
+  # A log's fields, compared on a log on an event with no metrics. statsd_out writes a log only as
+  # a DogStatsD event, so it has a cell in each row such an event reaches.
+  - kind: log
+    feature: severity
+    cells:
+      statsd_out:
+        class: exact
+        text: >-
+          A DogStatsD event's `|t:` alert type, written from its `_logit.statsd.event.alert_type`
+          carrier, which statsd_in reads back as the severity.
+      otlp_out:
+        class: exact
+        text: >-
+          The band's `severity_number` and text, or the raw ones the `_logit.otel.severity_*`
+          carriers hold, read back at band resolution.
+      datadog_out:
+        class: exact
+        text: >-
+          The `status` field, the severity's name unless a `status` attribute stands in its place,
+          which datadog_in reads back as the severity.
+      syslog_out:
+        class: normalized
+        reason: severity_band
+        text: >-
+          PRI's severity: a `_logit.syslog.severity` carrier's value, else the band's syslog
+          severity, which syslog_in reads back at syslog's resolution, so `trace` reads back as
+          `debug`.
+      splunk_hec_out:
+        class: exact
+        text: >-
+          `otel.log.severity.text` and `.number`, the band's name and base number unless the log
+          carries either as an attribute, which splunk_hec_in reads back at band resolution.
+      kafka_out:
+        - when: {format: text}
+          class: lost
+          reason: structural
+          text: >-
+            A `format: text` record holds the log body alone, so the log's severity is left off.
+        - class: exact
+          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
+  - kind: log
+    feature: severity_unset
+    cells:
+      statsd_out:
+        class: exact
+        text: A DogStatsD event with no alert type, read back as no severity.
+      otlp_out:
+        class: exact
+        text: '`SEVERITY_NUMBER_UNSPECIFIED` and no text, read back as no severity.'
+      datadog_out:
+        class: exact
+        text: No `status` field, read back as no severity.
+      syslog_out:
+        class: normalized
+        reason: default_severity
+        text: >-
+          A log with no severity leaves at syslog's `info` (6), which syslog_in reads back as
+          `info`.
+      splunk_hec_out:
+        class: exact
+        text: No severity fields, read back as no severity.
+      kafka_out:
+        - when: {format: text}
+          class: exact
+          text: Nothing is written, and nothing reads back.
+        - class: exact
+          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
+  - kind: log
+    feature: body_format
+    cells:
+      statsd_out:
+        class: exact
+        text: A DogStatsD event's text, read back as a `raw` message.
+      otlp_out:
+        class: exact
+        text: >-
+          OTLP has no body format, so it leaves as the `logit.body_format` attribute, which
+          otlp_in reads back into the format.
+      datadog_out:
+        class: lost
+        reason: structural
+        text: >-
+          A Datadog log has no body format, so a `json` or `structured` format reads back as
+          `raw`.
+      syslog_out:
+        class: lost
+        reason: structural
+        text: Syslog has no body format, so MSG reads back as `raw`.
+      splunk_hec_out:
+        class: lost
+        reason: structural
+        text: >-
+          HEC has no body format, so splunk_hec_in reads `json` for an object or array `event` and
+          `raw` for any other: a `structured` message reads back as `json`, and a string message's
+          `json` format as `raw`.
+      kafka_out:
+        - when: {format: text}
+          class: lost
+          reason: structural
+          text: >-
+            A `format: text` record holds the log body alone, so the log's body format is left off.
+        - class: exact
+          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
+  - kind: log
+    feature: event_name
+    cells:
+      otlp_out:
+        class: exact
+        text: The `LogRecord`'s `event_name`.
+      datadog_out:
+        class: lost
+        reason: structural
+        text: A Datadog log has no event name, so none is written.
+      syslog_out:
+        class: lost
+        reason: structural
+        text: Syslog has no event name, so it's left off.
+      splunk_hec_out:
+        class: exact
+        text: The `otel.log.name` field, read back into the event name.
+      kafka_out:
+        - when: {format: text}
+          class: lost
+          reason: structural
+          text: >-
+            A `format: text` record holds the log body alone, so the log's event name is left off.
+        - class: exact
+          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
+  - kind: log
+    feature: observed_timestamp
+    cells:
+      otlp_out:
+        class: exact
+        text: The `LogRecord`'s `observed_time_unix_nano`.
+      datadog_out:
+        class: lost
+        reason: structural
+        text: A Datadog log has no observed time, so none is written.
+      syslog_out:
+        class: lost
+        reason: structural
+        text: Syslog has no observed timestamp, so it's left off.
+      splunk_hec_out:
+        class: lost
+        reason: structural
+        text: HEC has no observed time, so it's left off.
+      kafka_out:
+        - when: {format: text}
+          class: lost
+          reason: structural
+          text: >-
+            A `format: text` record holds the log body alone, so the log's observed time is left
+            off.
+        - class: exact
+          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
+  - kind: log
+    feature: observed_timestamp_unset
+    cells:
+      statsd_out:
+        class: exact
+        text: No observed time is written, and none reads back.
+      otlp_out:
+        class: normalized
+        reason: observed_timestamp
+        text: >-
+          otlp_out stamps a log that has no observed time with the time it encodes the request,
+          as `logs.proto` defines the field.
+      datadog_out:
+        class: exact
+        text: No observed time is written, and none reads back.
+      syslog_out:
+        class: exact
+        text: A log with no observed timestamp leaves with none.
+      splunk_hec_out:
+        class: exact
+        text: No observed time is written, and splunk_hec_in reads back none.
+      kafka_out:
+        - when: {format: text}
+          class: exact
+          text: Nothing is written, and nothing reads back.
+        - class: exact
+          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
+  - kind: log
+    feature: trace
+    cells:
+      otlp_out:
+        class: exact
+        text: The `LogRecord`'s `trace_id` and `span_id`.
+      datadog_out:
+        class: normalized
+        reason: trace_as_attributes
+        text: >-
+          The ids leave as hex `trace_id` and `span_id` keys, which Datadog's log intake reads for
+          trace correlation and datadog_in reads back as attributes, not as the log's trace.
+      syslog_out:
+        class: lost
+        reason: structural
+        text: Syslog has no trace context, so the trace and span ids are left off.
+      splunk_hec_out:
+        class: exact
+        text: >-
+          The `trace_id` and `span_id` fields, lowercase hex, read back into the trace, unless the
+          log carries either as an attribute.
+      kafka_out:
+        - when: {format: text}
+          class: lost
+          reason: structural
+          text: >-
+            A `format: text` record holds the log body alone, so the log's trace and span ids are
+            left off.
+        - class: exact
+          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
+  - kind: log
+    feature: trace_unset
+    cells:
+      statsd_out:
+        class: exact
+        text: No trace is written, and none reads back.
+      otlp_out:
+        class: normalized
+        reason: trace_from_span
+        text: >-
+          A log with no trace on an event that carries a span leaves with the span's ids and
+          flags `0`; without a span, the log leaves with no trace.
+      datadog_out:
+        class: exact
+        text: No trace ids are written, and none read back.
+      syslog_out:
+        class: exact
+        text: A log with no trace context leaves with none.
+      splunk_hec_out:
+        class: normalized
+        reason: log_fields
+        text: >-
+          No trace fields are written, and splunk_hec_in reads back no trace, unless the log carries
+          a `trace_id` attribute that parses as a trace id, with a `span_id` that parses or none,
+          which it reads into the trace.
+      kafka_out:
+        - when: {format: text}
+          class: exact
+          text: Nothing is written, and nothing reads back.
+        - class: exact
+          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
+  - kind: log
+    feature: trace_flags
+    cells:
+      otlp_out:
+        class: exact
+        text: The low 8 bits of the `LogRecord`'s `flags`.
+      datadog_out:
+        class: lost
+        reason: structural
+        text: A Datadog log has no trace flags, so none are written.
+      syslog_out:
+        class: lost
+        reason: structural
+        text: Syslog has no trace flags, so they're left off.
+      splunk_hec_out:
+        class: normalized
+        reason: flags_zero
+        text: HEC has no trace flags, so a log's trace reads back with flags `0`.
+      kafka_out:
+        - when: {format: text}
+          class: lost
+          reason: structural
+          text: >-
+            A `format: text` record holds the log body alone, so the log's trace flags are left off.
+        - class: exact
+          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
+  - kind: log
+    feature: trace_beside_id_attribute
+    cells:
+      otlp_out:
+        class: exact
+        text: The `LogRecord`'s trace, span ids, and flags, beside the attributes, as `log/trace` has.
+      datadog_out:
+        class: lost
+        reason: uncounted
+        text: >-
+          A `trace_id` or `span_id` attribute is written under its own name and the log's own ids
+          are left off, uncounted, so a relayed Datadog log leaves as it arrived.
+      syslog_out:
+        class: lost
+        reason: structural
+        text: Syslog has no trace or span ids, so they're left off, as `log/trace` has.
+      splunk_hec_out:
+        class: lost
+        reason: uncounted
+        text: >-
+          A `trace_id` or `span_id` attribute is written as that field and the log's own ids are
+          left off, uncounted; an attribute that isn't a hex id reads back as an attribute, with no
+          trace.
+      kafka_out:
+        - when: {format: text}
+          class: lost
+          reason: structural
+          text: >-
+            A `format: text` record holds the log body alone, so the log's trace is left off, as
+            `log/trace` has.
+        - class: exact
+          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
+  - kind: log
+    feature: dropped_attributes_count
+    cells:
+      otlp_out:
+        class: exact
+        text: The `LogRecord`'s `dropped_attributes_count`.
+      datadog_out:
+        class: lost
+        reason: structural
+        text: A Datadog log has no dropped-attribute count, so none is written.
+      syslog_out:
+        class: lost
+        reason: structural
+        text: Syslog has no dropped-attributes count, so it's left off.
+      splunk_hec_out:
+        class: lost
+        reason: structural
+        text: HEC has no dropped count, so it's left off.
+      kafka_out:
+        - when: {format: text}
+          class: lost
+          reason: structural
+          text: >-
+            A `format: text` record holds the log body alone, so the log's dropped-attribute count
+            is left off.
+        - class: exact
+          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
+  - kind: log
+    feature: timestamp
+    cells:
+      statsd_out:
+        class: normalized
+        reason: receipt_time
+        text: >-
+          A DogStatsD event carries `|d:` whole seconds only when it arrived with one, so any other
+          event's time is the time statsd_in received it.
+      otlp_out:
+        class: exact
+        text: The `LogRecord`'s `time_unix_nano`.
+      datadog_out:
+        class: normalized
+        reason: milliseconds
+        text: The `timestamp` field, in Unix milliseconds, so a finer timestamp is truncated.
+      syslog_out:
+        - when: {format: rfc3164}
+          class: normalized
+          reason: timestamp_precision
+          text: >-
+            Under RFC 3164, a log with no `syslog.timestamp` leaves with its timestamp as TIMESTAMP
+            in whole seconds with no year or zone, which syslog_in reads back as `syslog.timestamp`,
+            with `event.timestamp` as the receipt time.
+        - class: normalized
+          reason: timestamp_precision
+          text: >-
+            A log with no `syslog.timestamp` leaves with its timestamp as TIMESTAMP in microseconds,
+            which syslog_in reads back as `syslog.timestamp`, with `event.timestamp` as the receipt
+            time.
+      splunk_hec_out:
+        class: exact
+        text: The object's `time`, in seconds with up to nine decimals.
+      kafka_out:
+        - when: {format: text}
+          class: normalized
+          reason: timestamp_precision
+          text: The record's timestamp, in whole milliseconds.
+        - class: exact
+          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
+  - kind: log
+    feature: receipt_timestamp
+    cells:
+      otlp_out:
+        class: exact
+        text: The `LogRecord`'s `time_unix_nano`, the time the log was received.
+      datadog_out:
+        class: normalized
+        reason: milliseconds
+        text: The `timestamp` field, in Unix milliseconds, the time the log was received.
+      syslog_out:
+        class: lost
+        reason: structural
+        text: >-
+          A log whose `syslog.timestamp` is written as TIMESTAMP leaves its own timestamp, the
+          receipt time, unwritten; syslog_in stamps its own receipt time.
+      splunk_hec_out:
+        class: exact
+        text: The object's `time`, the time the log was received.
+      kafka_out:
+        - when: {format: text}
+          class: normalized
+          reason: timestamp_precision
+          text: >-
+            The record's timestamp, the receipt time in whole milliseconds; the `syslog.timestamp`
+            beside it is an attribute, left off.
+        - class: exact
+          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
   - kind: log
     feature: beside_metrics
     cells:
@@ -3184,11 +4958,8 @@ rows:
         reason: uncounted
         text: A log on an event that carries metrics is left off while the metrics are written, uncounted.
       otlp_out:
-        class: normalized
-        reason: observed_timestamp
-        text: >-
-          An OTLP log record in the logs request, beside the metrics in theirs, with an observed
-          time stamped when it has none.
+        class: exact
+        text: An OTLP log record in the logs request, beside the metrics in theirs.
       datadog_out:
         class: exact
         text: >-
@@ -3200,6 +4971,31 @@ rows:
         text: >-
           A log on an event that carries metrics is left off while the metrics are written,
           uncounted.
+      syslog_out:
+        - when: {format: rfc3164}
+          class: normalized
+          reason: header_in_message
+          text: >-
+            The log is one syslog message, and the metrics beside it have no syslog form and are
+            left off, uncounted. Under RFC 3164, a log with no `syslog.tag` reads back with its
+            HOSTNAME at the front of its message, as the `log/header_in_message` row says.
+        - class: exact
+          text: >-
+            The log is one syslog message; the metrics beside it have no syslog form and are left
+            off, uncounted.
+      splunk_hec_out:
+        class: lost
+        counter: logit.output.events.dropped{reason=blank_event}
+        text: >-
+          The log is its own HEC object before the event's metric objects, read back as an event of
+          its own; a blank one is dropped and counted, as the `log/blank_message` row says.
+      kafka_out:
+        - when: {format: text}
+          class: exact
+          counter: logit.output.metrics.omitted{reason=format}
+          text: The log's body as the record; the event's metrics are left off, counted.
+        - class: exact
+          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
 
   # --- spans -----------------------------------------------------------------------------------
   - kind: span
@@ -3230,6 +5026,69 @@ rows:
         class: skipped
         counter: logit.output.events.skipped{reason=no_metrics}
         text: A span has no carbon form and isn't written.
+      syslog_out:
+        class: skipped
+        counter: logit.output.events.skipped
+        text: A span on an event with no log has no syslog form, so the event is skipped.
+      splunk_hec_out:
+        class: exact
+        text: >-
+          A span object in the OpenTelemetry exporter's shape, its resource's attributes as `fields`;
+          the `span/no_wire_form` row has what it can't carry.
+      kafka_out:
+        - when: {format: text}
+          class: skipped
+          counter: logit.output.events.skipped{reason=no_log}
+          text: >-
+            An event with no log has no `format: text` record.
+        - class: exact
+          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
+  - kind: span
+    feature: beside_log
+    cells:
+      statsd_out:
+        class: skipped
+        reason: uncounted
+        text: >-
+          A span has no statsd form. Beside a DogStatsD event, the event's line is written and the
+          span left off, uncounted; beside any other log, `log/plain` counts the event skipped.
+      otlp_out:
+        class: exact
+        text: An OTLP span.
+      prometheus_out:
+        class: skipped
+        counter: logit.output.events.skipped{reason=no_metrics}
+        text: A span has no Prometheus form and isn't written.
+      influxdb_out:
+        class: skipped
+        counter: logit.output.events.skipped{reason=no_metrics}
+        text: A span has no line-protocol form and isn't written.
+      datadog_out:
+        class: exact
+        text: >-
+          A span of an `AgentPayload` chunk on the trace route, read back with its kind as a
+          `span.kind` attribute and its trace id's high half as `_dd.p.tid` (the `attributes`
+          rows).
+      graphite_out:
+        class: skipped
+        counter: logit.output.events.skipped{reason=no_metrics}
+        text: A span has no carbon form and isn't written.
+      syslog_out:
+        class: skipped
+        reason: uncounted
+        text: A span beside a log has no syslog form and is left off, uncounted.
+      splunk_hec_out:
+        class: exact
+        text: >-
+          A span object in the OpenTelemetry exporter's shape, its resource's attributes as `fields`;
+          the `span/no_wire_form` row has what it can't carry.
+      kafka_out:
+        - when: {format: text}
+          class: skipped
+          counter: logit.output.spans.omitted{reason=format}
+          text: The record holds the log body alone, so the span beside it is left off, counted.
+        - class: exact
+          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
   - kind: span
     feature: no_wire_form
     cells:
@@ -3254,6 +5113,27 @@ rows:
       graphite_out:
         class: exact
         text: Nothing beyond `span/alone`'s outcome.
+      syslog_out:
+        class: skipped
+        reason: uncounted
+        text: >-
+          A span has no syslog form and isn't written: on an event with no log, the event is
+          skipped, counted as `logit.output.events.skipped`; beside a log, it's left off,
+          uncounted.
+      splunk_hec_out:
+        class: degraded
+        counter: logit.output.spans.degraded{reason=no_wire_form}
+        text: >-
+          The exporter's span object has no member for span flags, `trace_state`, or a dropped count,
+          so each is left off, counted once per span, and the span reads back without it.
+      kafka_out:
+        - when: {format: text}
+          class: skipped
+          counter: logit.output.events.skipped{reason=no_log}
+          text: >-
+            An event with no log has no `format: text` record.
+        - class: exact
+          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
   - kind: span
     feature: beside_metrics
     cells:
@@ -3287,6 +5167,24 @@ rows:
         text: >-
           A span on an event that carries metrics is left off while the metrics are written,
           uncounted.
+      syslog_out:
+        class: lost
+        counter: logit.output.events.skipped
+        text: >-
+          A span has no syslog form, so it isn't written beside its event's metrics, which have none
+          either.
+      splunk_hec_out:
+        class: exact
+        text: A span object after the event's metric objects, read back as an event of its own.
+      kafka_out:
+        - when: {format: text}
+          class: lost
+          counter: logit.output.events.skipped{reason=no_log}
+          text: >-
+            An event with no log has no `format: text` record, so the span and its metrics are left
+            off, counted once for the event.
+        - class: exact
+          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
 
   # --- events with no metric, log, or span ------------------------------------------------------
   # `string_only` is an InfluxDB point whose fields are all strings, its measurement carrier
@@ -3326,6 +5224,22 @@ rows:
         class: skipped
         counter: logit.output.events.skipped{reason=no_metrics}
         text: An event with no metric, log, or span has no datapoint and isn't written.
+      syslog_out:
+        class: skipped
+        counter: logit.output.events.skipped
+        text: An event with no log has no syslog form and isn't written.
+      splunk_hec_out:
+        class: skipped
+        counter: logit.output.events.skipped{reason=no_payload}
+        text: An event with no log, metric, or span has no HEC object and isn't sent.
+      kafka_out:
+        - when: {format: text}
+          class: skipped
+          counter: logit.output.events.skipped{reason=no_log}
+          text: >-
+            An event with no log has no `format: text` record.
+        - class: exact
+          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
   - kind: event
     feature: string_only
     cells:
@@ -3364,3 +5278,24 @@ rows:
         text: >-
           An InfluxDB point whose fields are all strings has no metric, so it has no datapoint and
           isn't written.
+      syslog_out:
+        class: skipped
+        counter: logit.output.events.skipped
+        text: >-
+          An InfluxDB point whose fields are all strings has no log, so it isn't written and its
+          fields are lost.
+      splunk_hec_out:
+        class: skipped
+        counter: logit.output.events.skipped{reason=no_payload}
+        text: >-
+          An InfluxDB point whose fields are all strings has no log, metric, or span, so it isn't
+          sent and its fields are lost.
+      kafka_out:
+        - when: {format: text}
+          class: skipped
+          counter: logit.output.events.skipped{reason=no_log}
+          text: >-
+            An InfluxDB point whose fields are all strings has no log, so it has no `format: text`
+            record.
+        - class: exact
+          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.

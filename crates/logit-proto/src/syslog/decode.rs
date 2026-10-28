@@ -345,7 +345,7 @@ fn parse_3164_timestamp(s: &[u8]) -> Option<(&[u8], &[u8])> {
 /// A token is a TAG if it ends in `:` (`name[pid]:` included) and what precedes the colon looks
 /// like a process name; `super`'s module doc's "The RFC 3164 header" says why this is stricter than
 /// "ends in `:`".
-fn is_tag_shaped(token: &[u8]) -> bool {
+pub fn is_tag_shaped(token: &[u8]) -> bool {
     let Some(body) = token.strip_suffix(b":") else { return false };
     if body.is_empty() {
         return false;

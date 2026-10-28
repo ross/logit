@@ -1,0 +1,4 @@
+# A hand-written /event body holding the exporter's span object, in the shape
+# `otel-services-collector-000` records, decoded to a span.
+wire: span.bin
+exercises: [event_route, span_event, fields, envelope, time_fractional]

@@ -1,0 +1,3 @@
+# rsyslog's omfwd forwarding over UDP, read in place from testdata/interop/.
+wire: ../../../../testdata/interop/syslog/rsyslog-000.raw
+exercises: [rfc3164, forwarder]

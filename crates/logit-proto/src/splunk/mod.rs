@@ -90,6 +90,98 @@
 //!
 //! [`logs`], [`metrics`], and [`spans`] each carry their own rows.
 //!
+//! ## What each log, span, and attribute becomes
+//!
+//! The tables below are generated from `splunk_hec_out`'s column of `spec/transit/mapping.yaml`,
+//! the canonical copy, by `script/transit docs`, and a test fails when they're stale: change the
+//! table there, not here. They cover logs, spans, and attributes; the spec has no metric cells
+//! for `splunk_hec_out`, so [`metrics`]' tables are the only copy of the metric mapping.
+//! "Consumer" means `splunk_hec_in` reading the body back.
+//!
+//! <!-- transit:doc:splunk_hec_out -->
+//!
+//! Per metric kind, and per record feature that decides a record's fate:
+//!
+//! | Row | Class | Reason or counter | What a consumer sees |
+//! |---|---|---|---|
+//! | `log/dogstatsd_event` | exact | -- | One HEC object whose `event` is the message. Its `_logit.statsd.event.*` carriers are private and aren't written; the `log` field rows have its fields. |
+//! | `log/plain` | exact | -- | One HEC object whose `event` is the message; the `log` field rows have its fields. |
+//! | `log/message_unsafe` | normalized | `message_as_text` | A `Bytes` message leaves as its text, an invalid UTF-8 sequence replaced, and a timestamp message as its RFC 3339 text, each read back as a string. |
+//! | `log/structured_message` | exact | -- | A JSON object or array `event`, read back as the same structure. |
+//! | `log/bytes_message` | normalized | `message_as_text` | A string `event`, read back as a string, as the `log/message_unsafe` row says. |
+//! | `log/blank_message` | dropped | `logit.output.events.dropped{reason=blank_event}` | A log whose message is empty, null, or a non-finite number isn't written, since HEC rejects a whole request holding a blank `event`; the rest of the batch is sent. |
+//! | `span/alone` | exact | -- | A span object in the OpenTelemetry exporter's shape, its resource's attributes as `fields`; the `span/no_wire_form` row has what it can't carry. |
+//! | `span/beside_log` | exact | -- | A span object in the OpenTelemetry exporter's shape, its resource's attributes as `fields`; the `span/no_wire_form` row has what it can't carry. |
+//! | `span/no_wire_form` | degraded | `logit.output.spans.degraded{reason=no_wire_form}` | The exporter's span object has no member for span flags, `trace_state`, or a dropped count, so each is left off, counted once per span, and the span reads back without it. |
+//! | `event/attributes_only` | skipped | `logit.output.events.skipped{reason=no_payload}` | An event with no log, metric, or span has no HEC object and isn't sent. |
+//! | `event/string_only` | skipped | `logit.output.events.skipped{reason=no_payload}` | An InfluxDB point whose fields are all strings has no log, metric, or span, so it isn't sent and its fields are lost. |
+//!
+//! Per field of a record that reaches the wire, attribute shape, and payload beside metrics:
+//!
+//! | Row | Class | Reason or counter | What a consumer sees |
+//! |---|---|---|---|
+//! | `attributes/string_value` | normalized | `log_fields` | A `fields` string, or on a span a string in its `attributes` object, read back as itself. On a log, splunk_hec_in reads a non-empty `otel.log.name` into the event name, and a `trace_id` that parses as a trace id, with a `span_id` that parses or none, into the trace, so none of them reads back as an attribute. |
+//! | `attributes/host_beside_host_name` | exact | -- | A `host` field, an ordinary key beside the object's own `host`. |
+//! | `attributes/hostname` | exact | -- | A `fields` key. |
+//! | `attributes/log_service` | exact | -- | A `fields` key. |
+//! | `attributes/log_service_field` | exact | -- | A `fields` key. |
+//! | `attributes/container_id` | exact | -- | A `fields` key. |
+//! | `attributes/service_identity` | exact | -- | A `fields` key. |
+//! | `attributes/service_tag` | exact | -- | A `fields` key. |
+//! | `attributes/service_tag_beside_key` | exact | -- | A `fields` key, beside the standard key's. |
+//! | `attributes/bool_value` | exact | -- | A JSON boolean, read back as itself. |
+//! | `attributes/number_value` | exact | -- | A JSON number, read back as the same integer or double; a `u64` above `i64::MAX` stays a `u64`. |
+//! | `attributes/array_value` | normalized | `flattened` | A JSON array; one holding a map or an array leaves as its JSON text, read back as a string, since `fields` is flat. |
+//! | `attributes/map_value` | normalized | `flattened` | `fields` is flat, so a map leaves as one dotted key per leaf (`http.method`), read back as that many attributes, and an empty map is left off. A span's `attributes` object keeps its nesting. |
+//! | `attributes/bytes_value` | normalized | `stringified` | Its base64 text as a JSON string, read back as a string. |
+//! | `attributes/timestamp_value` | normalized | `stringified` | Its RFC 3339 text as a JSON string, read back as a string. |
+//! | `attributes/null_value` | exact | -- | A JSON null, read back as itself. |
+//! | `attributes/private_carrier` | lost | structural | A `_logit.` carrier or flag is private and isn't a HEC field, so it's left off. |
+//! | `attributes/prometheus_target` | lost | structural | The scrape target is private and isn't a HEC field, so it's left off. |
+//! | `attributes/foreign_carrier` | lost | structural | Another protocol's `_logit.` carrier is private and isn't a HEC field, so it's left off. |
+//! | `attributes/timestamped` | lost | structural | The flag is private and isn't a HEC field, so it's left off. `time` carries the timestamp. |
+//! | `attributes/rate` | lost | structural | The flag is private and isn't a HEC field, so it's left off. |
+//! | `attributes/interval` | lost | structural | The flag is private and isn't a HEC field, so it's left off. |
+//! | `attributes/rate_on_non_gauge` | lost | structural | The flag is private and isn't a HEC field, so it's left off. |
+//! | `attributes/family_type` | lost | structural | The flag is private and isn't a HEC field, so it's left off. |
+//! | `attributes/family_type_on_other_kind` | lost | structural | The flag is private and isn't a HEC field, so it's left off. |
+//! | `attributes/interval_on_distribution` | lost | structural | The flag is private and isn't a HEC field, so it's left off. |
+//! | `attributes/interval_on_histogram` | lost | structural | The flag is private and isn't a HEC field, so it's left off. |
+//! | `attributes/resource_attribute` | normalized | `resource_as_field` | A `fields` key beside the event's own, so on a log or a metric it reads back as an event attribute, an event attribute of the same key winning; a span's reads back on the resource. |
+//! | `attributes/scope` | lost | structural | HEC has no instrumentation scope, so none is written. |
+//! | `attributes/datadog_carrier_log` | lost | structural | A `_logit.` carrier is private and isn't a HEC field, so it's left off. |
+//! | `attributes/severity_carrier_otel` | lost | structural | A `_logit.` carrier is private and isn't a HEC field, so it's left off and the severity reads back at band resolution. |
+//! | `attributes/severity_carrier_syslog` | lost | structural | A `_logit.` carrier is private and isn't a HEC field, so it's left off and the severity reads back at band resolution. |
+//! | `attributes/syslog_header` | normalized | `u64_as_int` | A `fields` string or number; a `u64` `syslog.facility` or `process.pid` reads back as an `i64`. |
+//! | `attributes/syslog_msgid` | exact | -- | A `fields` string. |
+//! | `attributes/syslog_sd` | normalized | `flattened` | `fields` is flat, so `syslog.sd` leaves as one `syslog.sd.<SD-ID>.<PARAM-NAME>` key per PARAM, read back as that many attributes and no `syslog.sd` map. |
+//! | `attributes/syslog_timestamp` | normalized | `stringified` | A `fields` string: an RFC 3164 timestamp as itself, an RFC 5424 one as its RFC 3339 text, read back as a string. |
+//! | `attributes/host_name` | normalized | `host_on_resource` | A non-empty string `host.name` is the object's `host`, the event's over the resource's, which splunk_hec_in reads back as the resource's `host.name`. |
+//! | `attributes/splunk_envelope` | exact | -- | The object's `source`, `sourcetype`, or `index`, read back onto the resource; a value that isn't a string is omitted, counted once per batch. |
+//! | `attributes/syslog_facility` | exact | -- | A log with no `syslog.facility` leaves with none. |
+//! | `attributes/no_host` | normalized | `default_host` | A record with no `host.name` leaves with the process hostname as its `host`, which splunk_hec_in reads back as the resource's `host.name`. |
+//! | `attributes/log_status` | exact | -- | No `status` attribute is written. |
+//! | `attributes/log_severity_fields` | normalized | `severity_fields` | A log with a severity and neither `otel.log.severity.*` attribute leaves with both, the severity's name and its band's base number, which splunk_hec_in reads back as attributes beside the severity. |
+//! | `attributes/span_kind` | exact | -- | The kind is the span object's `kind`; no `span.kind` attribute is written. |
+//! | `attributes/trace_id_high` | exact | -- | The 128-bit trace id is the span object's `trace_id`; no `_dd.p.tid` attribute is written. |
+//! | `log/severity` | exact | -- | `otel.log.severity.text` and `.number`, the band's name and base number unless the log carries either as an attribute, which splunk_hec_in reads back at band resolution. |
+//! | `log/severity_unset` | exact | -- | No severity fields, read back as no severity. |
+//! | `log/body_format` | lost | structural | HEC has no body format, so splunk_hec_in reads `json` for an object or array `event` and `raw` for any other: a `structured` message reads back as `json`, and a string message's `json` format as `raw`. |
+//! | `log/event_name` | exact | -- | The `otel.log.name` field, read back into the event name. |
+//! | `log/observed_timestamp` | lost | structural | HEC has no observed time, so it's left off. |
+//! | `log/observed_timestamp_unset` | exact | -- | No observed time is written, and splunk_hec_in reads back none. |
+//! | `log/trace` | exact | -- | The `trace_id` and `span_id` fields, lowercase hex, read back into the trace, unless the log carries either as an attribute. |
+//! | `log/trace_unset` | normalized | `log_fields` | No trace fields are written, and splunk_hec_in reads back no trace, unless the log carries a `trace_id` attribute that parses as a trace id, with a `span_id` that parses or none, which it reads into the trace. |
+//! | `log/trace_flags` | normalized | `flags_zero` | HEC has no trace flags, so a log's trace reads back with flags `0`. |
+//! | `log/trace_beside_id_attribute` | lost | uncounted | A `trace_id` or `span_id` attribute is written as that field and the log's own ids are left off, uncounted; an attribute that isn't a hex id reads back as an attribute, with no trace. |
+//! | `log/dropped_attributes_count` | lost | structural | HEC has no dropped count, so it's left off. |
+//! | `log/timestamp` | exact | -- | The object's `time`, in seconds with up to nine decimals. |
+//! | `log/receipt_timestamp` | exact | -- | The object's `time`, the time the log was received. |
+//! | `log/beside_metrics` | lost | `logit.output.events.dropped{reason=blank_event}` | The log is its own HEC object before the event's metric objects, read back as an event of its own; a blank one is dropped and counted, as the `log/blank_message` row says. |
+//! | `span/beside_metrics` | exact | -- | A span object after the event's metric objects, read back as an event of its own. |
+//!
+//! <!-- transit:end -->
+//!
 //! # Permitted normalizations
 //!
 //! `splunk_hec_in -> splunk_hec_out` is a fixed point modulo this list
@@ -129,9 +221,8 @@
 //!     so it returns on the resource, in a batch of its own per host; when the object also carried
 //!     a `host`, that `host` is replaced.
 //!
-//! The model-side losses (a resource attribute returning as an event attribute, `Sum`
-//! temporality, the multi-number kinds under `MultiValue`) are in [`metrics`], [`logs`], and
-//! [`spans`].
+//! The metric model's losses (`Sum` temporality, the multi-number kinds under `MultiValue`) are
+//! in [`metrics`]; a log's and a span's are in the generated tables above.
 
 pub mod logs;
 pub mod metrics;

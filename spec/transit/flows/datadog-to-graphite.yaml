@@ -1,5 +1,5 @@
 # datadog_in's cases into graphite_out, with nothing between: series points as bare
-# datapoints, tags as carbon tags, sketches skipped, and logs and events not written.
+# datapoints, tags as carbon tags, and sketches skipped.
 # `path:` names one case so `logit run` can run this by hand; the transit spec runs every case in
 # that file's directory (spec/transit/README.md).
 components:

@@ -1,0 +1,4 @@
+# Python's logging.handlers.SysLogHandler: `<PRI>MSG` with no TIMESTAMP, HOSTNAME, or TAG,
+# read in place from testdata/interop/.
+wire: ../../../../testdata/interop/syslog/python-syslog-handler-000.raw
+exercises: [rfc3164, tagless]

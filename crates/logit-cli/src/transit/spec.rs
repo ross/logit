@@ -36,9 +36,10 @@
 //! the features from `features/<system>.yaml` the case `exercises`, an optional `wire:` file
 //! (relative to the case's directory) the `.json` is decoded from by `<system>_in`'s decoder at
 //! [`RECEIVED_AT`] (with the request's `name: value` headers from a `.headers` sidecar beside
-//! the wire file, for a collectd case the `types.db` file an optional `types_db:` names, and for
-//! a graphite case the carbon protocol an optional `protocol: plaintext | pickle` names, as
-//! [`decode_wire`] reads them), and optional `tolerance:` entries (`{path, abs}`: an RFC 6901
+//! the wire file, for a collectd case the `types.db` file an optional `types_db:` names, for a
+//! graphite case the carbon protocol an optional `protocol: plaintext | pickle` names, and for a
+//! syslog case the transport an optional `framing: datagram | stream` names, as [`decode_wire`]
+//! reads them), and optional `tolerance:` entries (`{path, abs}`: an RFC 6901
 //! pointer into each event of the document, and the most the number there may differ by). A hand-written case
 //! has no `wire:`, and its `.json` must read back to itself through `logit_proto::event_json`
 //! and `format: json`, so each case has one spelling.
@@ -67,14 +68,16 @@ use logit_pipeline::test_util::TelemetryProbe;
 use logit_proto::collectd::{CollectdDecoder, TypesDb};
 use logit_proto::datadog::DatadogDecoder;
 use logit_proto::event_json::EventJsonDecoder;
-use logit_proto::framing::{Framer, FramingMode};
+use logit_proto::framing::{Framer, FramingMode, MAX_FRAME_BYTES};
 use logit_proto::graphite::{GraphiteDecoder, Protocol, DEFAULT_MAX_FRAME_BYTES};
 use logit_proto::influxdb::{write_resource, InfluxDecoder, Precision};
 use logit_proto::otlp::OtlpDecoder;
 use logit_proto::prometheus::{
     families_to_events, text, Dialect, PrometheusDecoder, ATTR_TARGET, LABEL_INSTANCE,
 };
+use logit_proto::splunk::SplunkDecoder;
 use logit_proto::statsd::StatsdDecoder;
+use logit_proto::syslog::SyslogDecoder;
 use logit_proto::{Decoder, Signal};
 use serde::Deserialize;
 use serde_json::Value;
@@ -113,7 +116,21 @@ struct Meta {
     #[serde(default)]
     protocol: Option<CarbonProtocol>,
     #[serde(default)]
+    framing: Option<SyslogFraming>,
+    #[serde(default)]
     tolerance: Vec<Tolerance>,
+}
+
+/// How a syslog case's wire file reached `syslog_in` ([`decode_wire`]).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum SyslogFraming {
+    /// One UDP datagram, read with line splitting on, the listener's default `framing: lines`.
+    #[default]
+    Datagram,
+    /// A TCP connection's byte stream, split by `syslog_in`'s RFC 6587 framer, each frame read
+    /// with line splitting off.
+    Stream,
 }
 
 /// A graphite case's `protocol:`, `graphite_in`'s setting of that name.
@@ -307,7 +324,11 @@ fn canonical(case: &Case) -> anyhow::Result<String> {
         !wire.ends_with(".pkl") || matches!(carbon, CarbonWire::PicklePayload),
         "a .pkl wire file is a pickle payload, so its case needs protocol: pickle"
     );
-    decode_wire(&case.system, bytes, &headers, types_db.as_deref(), carbon)
+    if case.meta.framing.is_some() {
+        ensure!(case.system == "syslog", "framing: names how a syslog_in case arrived");
+    }
+    let framing = case.meta.framing.unwrap_or_default();
+    decode_wire(&case.system, bytes, &headers, types_db.as_deref(), carbon, framing)
         .with_context(|| format!("decoding {}", path.display()))
 }
 
@@ -350,7 +371,8 @@ const SCRAPE_URL: &str = "http://transit:9100/metrics";
 const SCRAPE_INSTANCE: &str = "transit:9100";
 
 /// `system`'s wire bytes as its listener's decoder reads them, at [`RECEIVED_AT`], under the
-/// resource the listener would stamp. A source system joins with an arm here:
+/// resource the listener would stamp. The arm is the directory name's prefix before any `-`, so
+/// `otlp-logs` decodes as `otlp`. A source system joins with an arm here:
 ///
 /// - `statsd`: one datagram through `StatsdDecoder`, under an empty resource.
 /// - `influxdb`: one write body through `InfluxDecoder::decode_body`, under the resource
@@ -368,23 +390,32 @@ const SCRAPE_INSTANCE: &str = "transit:9100";
 ///   from `path:`, the body encoding from `content-type:` (protobuf when absent), and the
 ///   decompression from `content-encoding:`, as the listener does. A wire file with no `.headers`
 ///   is the OTel Collector `file` exporter's output, as `testdata/interop/otlp/` records it: one
-///   OTLP/JSON metrics request per line.
+///   OTLP/JSON request per line, its signal named by the line's top-level key (`resourceLogs`,
+///   `resourceMetrics`, or `resourceSpans`).
 /// - `collectd`: one datagram through `CollectdDecoder`, under an empty resource, naming data
 ///   sources from the meta's `types_db:` file when it names one.
 /// - `graphite`: through `GraphiteDecoder` in the meta's `protocol:` (plaintext when absent),
 ///   under an empty resource. Plaintext is the whole file, which the decoder splits into lines. A
 ///   pickle file is a connection's stream, split into payloads by `graphite_in`'s length-prefix
 ///   `Framer`, or under a `.pkl` extension one payload with no prefix.
+/// - `syslog`: through `SyslogDecoder`, under an empty resource, in the meta's `framing:`
+///   (`datagram` when absent): one datagram with line splitting on, as `syslog_in` reads UDP by
+///   default, or a TCP stream split by `Framer::new(FramingMode::Rfc6587Auto, …)`, each frame
+///   read with line splitting off, as `SyslogInput::tcp` reads it.
+/// - `splunk`: one request body through `splunk_hec_in`'s own `decode_request`, which picks the
+///   route from `path:`, a `/raw` body's envelope from its percent-decoded query string, and the
+///   decompression from `content-encoding:`, as the listener does.
 fn decode_wire(
     system: &str,
     bytes: Vec<u8>,
     headers: &Headers,
     types_db: Option<&str>,
     carbon: CarbonWire,
+    framing: SyslogFraming,
 ) -> anyhow::Result<String> {
     let mut probe = TelemetryProbe::new();
     let id = "transit.case";
-    let batches = match system {
+    let batches = match system.split('-').next().unwrap_or(system) {
         "statsd" => {
             let telemetry = probe.telemetry(id, "statsd_in", "listener");
             let diag = Diagnostics::new(id).with_telemetry(telemetry.clone());
@@ -491,7 +522,18 @@ fn decode_wire(
                     );
                     let mut batches = Vec::new();
                     for line in bytes.split(|&b| b == b'\n').filter(|line| !line.is_empty()) {
-                        batches.extend(decode(Signal::Metrics.path(), &request, line)?);
+                        let parsed: Value = serde_json::from_slice(line)
+                            .context("a Collector file export line isn't JSON")?;
+                        let signal = [
+                            ("resourceLogs", Signal::Logs),
+                            ("resourceMetrics", Signal::Metrics),
+                            ("resourceSpans", Signal::Traces),
+                        ]
+                        .into_iter()
+                        .find(|(key, _)| parsed.get(key).is_some())
+                        .map(|(_, signal)| signal)
+                        .context("a Collector file export line names no signal")?;
+                        batches.extend(decode(signal.path(), &request, line)?);
                     }
                     batches
                 }
@@ -545,6 +587,54 @@ fn decode_wire(
                 (resource, _) = decoder.decode_into(payload, RECEIVED_AT, &mut events)?;
             }
             vec![EventBatch { resource, scope: None, events }]
+        }
+        "syslog" => {
+            let telemetry = probe.telemetry(id, "syslog_in", "listener");
+            let diag = Diagnostics::new(id).with_telemetry(telemetry.clone());
+            let stream = framing == SyslogFraming::Stream;
+            let mut decoder = SyslogDecoder::new(Arc::new(Resource::default()))
+                .with_line_splitting(!stream)
+                .with_telemetry(telemetry)
+                .with_diagnostics(diag);
+            let units = if stream {
+                let refused = |err| anyhow::anyhow!("syslog_in's framer refused: {err}");
+                let mut framer = Framer::new(FramingMode::Rfc6587Auto, MAX_FRAME_BYTES);
+                framer.push(&bytes);
+                let mut frames = Vec::new();
+                while let Some(frame) = framer.next_frame().map_err(refused)? {
+                    frames.push(frame);
+                }
+                frames.extend(framer.finish().map_err(refused)?);
+                frames
+            } else {
+                vec![Bytes::from(bytes)]
+            };
+            let mut events = Vec::new();
+            let mut resource = Arc::new(Resource::default());
+            for unit in units {
+                (resource, _) = decoder.decode_into(unit, RECEIVED_AT, &mut events)?;
+            }
+            vec![EventBatch { resource, scope: None, events }]
+        }
+        "splunk" => {
+            let telemetry = probe.telemetry(id, "splunk_hec_in", "listener");
+            let diag = Diagnostics::new(id).with_telemetry(telemetry.clone());
+            let target = headers.get("path").context("the .headers names no path:")?;
+            let mut request = http::HeaderMap::new();
+            for name in [http::header::CONTENT_TYPE, http::header::CONTENT_ENCODING] {
+                if let Some(value) = headers.get(name.as_str()) {
+                    request.insert(name, http::HeaderValue::from_str(value)?);
+                }
+            }
+            let decoder = SplunkDecoder::new().with_telemetry(telemetry).with_diagnostics(diag);
+            logit_inputs::splunk::decode_request(
+                target,
+                &request,
+                Bytes::from(bytes),
+                RECEIVED_AT,
+                decoder,
+            )
+            .map_err(|err| anyhow::anyhow!("splunk_hec_in refused the request: {err}"))?
         }
         other => bail!("no wire decoder for a {other} case yet"),
     };
@@ -1098,6 +1188,14 @@ flow_tests! {
     collectd_to_prometheus => "collectd-to-prometheus",
     collectd_to_statsd => "collectd-to-statsd",
     collectd_to_graphite => "collectd-to-graphite",
+    datadog_logs_relay => "datadog-logs-relay",
+    datadog_logs_to_otlp => "datadog-logs-to-otlp",
+    datadog_logs_to_kafka => "datadog-logs-to-kafka",
+    datadog_logs_to_kafka_text => "datadog-logs-to-kafka-text",
+    datadog_logs_to_splunk => "datadog-logs-to-splunk",
+    datadog_logs_to_syslog => "datadog-logs-to-syslog",
+    datadog_logs_to_syslog_rfc3164 => "datadog-logs-to-syslog-rfc3164",
+    datadog_logs_to_syslog_sd => "datadog-logs-to-syslog-sd",
     datadog_relay => "datadog-relay",
     datadog_to_influxdb => "datadog-to-influxdb",
     datadog_to_otlp => "datadog-to-otlp",
@@ -1123,6 +1221,14 @@ flow_tests! {
     influxdb_to_statsd => "influxdb-to-statsd",
     influxdb_to_graphite => "influxdb-to-graphite",
     otlp_delta_to_datadog => "otlp-delta-to-datadog",
+    otlp_logs_relay => "otlp-logs-relay",
+    otlp_logs_to_datadog => "otlp-logs-to-datadog",
+    otlp_logs_to_kafka => "otlp-logs-to-kafka",
+    otlp_logs_to_kafka_text => "otlp-logs-to-kafka-text",
+    otlp_logs_to_splunk => "otlp-logs-to-splunk",
+    otlp_logs_to_syslog => "otlp-logs-to-syslog",
+    otlp_logs_to_syslog_rfc3164 => "otlp-logs-to-syslog-rfc3164",
+    otlp_logs_to_syslog_sd => "otlp-logs-to-syslog-sd",
     otlp_relay => "otlp-relay",
     otlp_to_datadog => "otlp-to-datadog",
     otlp_to_datadog_counters => "otlp-to-datadog-counters",
@@ -1157,6 +1263,25 @@ flow_tests! {
     statsd_to_prometheus => "statsd-to-prometheus",
     statsd_to_graphite => "statsd-to-graphite",
     statsd_to_graphite_expand => "statsd-to-graphite-expand",
+    statsd_logs_relay => "statsd-logs-relay",
+    statsd_logs_to_kafka => "statsd-logs-to-kafka",
+    statsd_logs_to_kafka_text => "statsd-logs-to-kafka-text",
+    statsd_logs_to_splunk => "statsd-logs-to-splunk",
+    statsd_logs_to_syslog => "statsd-logs-to-syslog",
+    splunk_relay => "splunk-relay",
+    splunk_to_datadog => "splunk-to-datadog",
+    splunk_to_kafka => "splunk-to-kafka",
+    splunk_to_kafka_text => "splunk-to-kafka-text",
+    splunk_to_otlp => "splunk-to-otlp",
+    splunk_to_syslog => "splunk-to-syslog",
+    syslog_relay => "syslog-relay",
+    syslog_relay_rfc3164 => "syslog-relay-rfc3164",
+    syslog_relay_sd => "syslog-relay-sd",
+    syslog_to_datadog => "syslog-to-datadog",
+    syslog_to_kafka => "syslog-to-kafka",
+    syslog_to_kafka_text => "syslog-to-kafka-text",
+    syslog_to_otlp => "syslog-to-otlp",
+    syslog_to_splunk => "syslog-to-splunk",
 }
 
 #[cfg(test)]
@@ -1602,12 +1727,43 @@ mod tests {
             "  - {kind: samples, cells: {statsd_out: {class: exact, text: t}}}\n",
             "  - {kind: record, feature: unit, cells: {statsd_out: {class: lost, \
              reason: structural, text: t}}}\n",
-            "  - {kind: log, feature: plain, cells: {statsd_out: {class: skipped, \
-             reason: uncounted, text: t}}}\n",
             "  - {kind: samples, cells: {statsd_out: {class: degraded, reason: structural, \
              text: t}}}\n",
         ] {
             assert!(mapping::parse(&table(rows)).is_ok(), "{rows}");
+        }
+    }
+
+    /// A log cell may be `uncounted` only where the allowance names it: beside metrics at any
+    /// sink, and a trace beside an id attribute at `datadog_out` and `splunk_hec_out`.
+    #[test]
+    fn an_uncounted_log_cell_needs_its_own_allowance() {
+        let table = |row: &str| {
+            format!(
+                "classes: {{exact: a, normalized: b, degraded: c, lost: d, skipped: e, dropped: f}}\n\
+                 sinks: [statsd_out, datadog_out, syslog_out, splunk_hec_out]\nrows:\n  - {row}\n"
+            )
+        };
+        let cell = |sink: &str, class: &str| {
+            format!("{{{sink}: {{class: {class}, reason: uncounted, text: t}}}}")
+        };
+        for (feature, sink, class) in [
+            ("plain", "statsd_out", "skipped"),
+            ("dogstatsd_event", "syslog_out", "skipped"),
+            ("trace", "datadog_out", "lost"),
+            ("trace_beside_id_attribute", "syslog_out", "lost"),
+        ] {
+            let row = format!("{{kind: log, feature: {feature}, cells: {}}}", cell(sink, class));
+            let err = mapping::parse(&table(&row)).expect_err(&row);
+            assert!(format!("{err:#}").contains("an uncounted loss is counted"), "{row}: {err:#}");
+        }
+        for (feature, sink, class) in [
+            ("beside_metrics", "statsd_out", "lost"),
+            ("trace_beside_id_attribute", "datadog_out", "lost"),
+            ("trace_beside_id_attribute", "splunk_hec_out", "lost"),
+        ] {
+            let row = format!("{{kind: log, feature: {feature}, cells: {}}}", cell(sink, class));
+            assert!(mapping::parse(&table(&row)).is_ok(), "{row}");
         }
     }
 }

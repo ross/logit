@@ -1,0 +1,2 @@
+{"timestamp":"2027-01-15T08:00:00.000000000Z","attributes":{"route":"/api"}}
+{"timestamp":"2027-01-15T08:00:01.000000000Z","attributes":{"_logit.field.version":"v1.2.3","_logit.influxdb.measurement":"deploy","_logit.metrics.fields":true,"host":"web-01"}}

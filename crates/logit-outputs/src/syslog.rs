@@ -148,6 +148,142 @@
 //! [`MessageBuf::push_bytes`], so a non-UTF-8 payload reaches the wire without
 //! `char::REPLACEMENT_CHARACTER` substitutions.
 //!
+//! ## What each record and field becomes
+//!
+//! The tables below are generated from `syslog_out`'s column of `spec/transit/mapping.yaml`, the
+//! canonical copy, by `script/transit docs`, and a test fails when they're stale: change the
+//! table there, not here. "Consumer" means `syslog_in` reading the message back. The sections
+//! above and below are hand-written: the precedence, sanitization, and sizing behind each cell.
+//!
+//! <!-- transit:doc:syslog_out -->
+//!
+//! Per metric kind, and per record feature that decides a record's fate:
+//!
+//! | Row | Class | Reason or counter | What a consumer sees |
+//! |---|---|---|---|
+//! | `log/dogstatsd_event` | exact | -- | One syslog message, the event's text as MSG; its `_logit.statsd.event.*` carriers aren't written (the `attributes` rows). |
+//! | `log/plain` | exact | -- | One syslog message, the message as MSG and the severity in PRI; the `log` and `attributes` rows have its fields. |
+//! | `log/message_unsafe` | normalized | `sanitized` | Every C0 control character and DEL in MSG, a newline included, is escaped as its backslash form, so a multi-line message reads back as one line holding the escapes as text; a number or bool message leaves as its text and reads back as a string. |
+//! | `log/structured_message` | normalized | `message_text` | A `Map` or `Array` message is written as its inline text, which syslog_in reads back as a string. |
+//! | `log/bytes_message` | exact | -- | A `Bytes` message is written as its bytes, escaped as a string's are, and reads back as `Bytes`; one that's valid UTF-8 reads back as a string (the `log/message_unsafe` row). |
+//! | `log/blank_message` | exact | -- | A log with an empty message or none leaves with an empty MSG, which syslog_in reads back as an empty string. |
+//! | `log/header_in_message` | normalized | `header_in_message` | Under RFC 3164, a log with no `syslog.tag` reads back with its HOSTNAME at the front of its message, and a message whose first word is TAG-shaped reads back with that word as `syslog.tag`; syslog_in decides where the header ends by its first two words. |
+//! | `span/alone` | skipped | `logit.output.events.skipped` | A span on an event with no log has no syslog form, so the event is skipped. |
+//! | `span/beside_log` | skipped | uncounted | A span beside a log has no syslog form and is left off, uncounted. |
+//! | `span/no_wire_form` | skipped | uncounted | A span has no syslog form and isn't written: on an event with no log, the event is skipped, counted as `logit.output.events.skipped`; beside a log, it's left off, uncounted. |
+//! | `event/attributes_only` | skipped | `logit.output.events.skipped` | An event with no log has no syslog form and isn't written. |
+//! | `event/string_only` | skipped | `logit.output.events.skipped` | An InfluxDB point whose fields are all strings has no log, so it isn't written and its fields are lost. |
+//!
+//! Per field of a record that reaches the wire, attribute shape, and payload beside metrics:
+//!
+//! | Row | Class | Reason or counter | What a consumer sees |
+//! |---|---|---|---|
+//! | `attributes/string_value`, under `format: rfc3164` | lost | structural | RFC 3164 has no structured data, so an attribute outside the header fields is left off. |
+//! | `attributes/string_value`, under `format: rfc5424` and under `structured_data: {"sd_id":"transit@32473"}` | normalized | `structured_data` | Under `structured_data:`, a PARAM of the opt-in SD-ELEMENT, which syslog_in reads back as a string inside `syslog.sd`, under the SD-ID and the attribute's key. The PARAM-VALUE is the string. |
+//! | `attributes/string_value`, otherwise | lost | uncounted | An attribute outside the header fields is left off, uncounted; under RFC 5424, `structured_data:` writes each public event attribute other than `host.name`, `process.pid`, and the `syslog.*` keys as an SD-PARAM, which syslog_in reads back inside `syslog.sd`. |
+//! | `attributes/host_beside_host_name`, under `format: rfc3164` | lost | structural | RFC 3164 has no structured data, so an attribute outside the header fields is left off. |
+//! | `attributes/host_beside_host_name`, under `format: rfc5424` and under `structured_data: {"sd_id":"transit@32473"}` | normalized | `structured_data` | Under `structured_data:`, a PARAM of the opt-in SD-ELEMENT, which syslog_in reads back as a string inside `syslog.sd`, under the SD-ID and the attribute's key. The PARAM-VALUE is the string. |
+//! | `attributes/host_beside_host_name`, otherwise | lost | uncounted | An attribute outside the header fields is left off, uncounted; under RFC 5424, `structured_data:` writes each public event attribute other than `host.name`, `process.pid`, and the `syslog.*` keys as an SD-PARAM, which syslog_in reads back inside `syslog.sd`. |
+//! | `attributes/hostname`, under `format: rfc3164` | lost | structural | RFC 3164 has no structured data, so an attribute outside the header fields is left off. |
+//! | `attributes/hostname`, under `format: rfc5424` and under `structured_data: {"sd_id":"transit@32473"}` | normalized | `structured_data` | Under `structured_data:`, a PARAM of the opt-in SD-ELEMENT, which syslog_in reads back as a string inside `syslog.sd`, under the SD-ID and the attribute's key. The PARAM-VALUE is the string. |
+//! | `attributes/hostname`, otherwise | lost | uncounted | An attribute outside the header fields is left off, uncounted; under RFC 5424, `structured_data:` writes each public event attribute other than `host.name`, `process.pid`, and the `syslog.*` keys as an SD-PARAM, which syslog_in reads back inside `syslog.sd`. |
+//! | `attributes/log_service`, under `format: rfc3164` | lost | structural | RFC 3164 has no structured data, so an attribute outside the header fields is left off. |
+//! | `attributes/log_service`, under `format: rfc5424` and under `structured_data: {"sd_id":"transit@32473"}` | normalized | `structured_data` | Under `structured_data:`, a PARAM of the opt-in SD-ELEMENT, which syslog_in reads back as a string inside `syslog.sd`, under the SD-ID and the attribute's key. The PARAM-VALUE is the string. |
+//! | `attributes/log_service`, otherwise | lost | uncounted | An attribute outside the header fields is left off, uncounted; under RFC 5424, `structured_data:` writes each public event attribute other than `host.name`, `process.pid`, and the `syslog.*` keys as an SD-PARAM, which syslog_in reads back inside `syslog.sd`. |
+//! | `attributes/log_service_field`, under `format: rfc3164` | lost | structural | RFC 3164 has no structured data, so an attribute outside the header fields is left off. |
+//! | `attributes/log_service_field`, under `format: rfc5424` and under `structured_data: {"sd_id":"transit@32473"}` | normalized | `structured_data` | Under `structured_data:`, a PARAM of the opt-in SD-ELEMENT, which syslog_in reads back as a string inside `syslog.sd`, under the SD-ID and the attribute's key. The PARAM-VALUE is the string. |
+//! | `attributes/log_service_field`, otherwise | lost | uncounted | An attribute outside the header fields is left off, uncounted; under RFC 5424, `structured_data:` writes each public event attribute other than `host.name`, `process.pid`, and the `syslog.*` keys as an SD-PARAM, which syslog_in reads back inside `syslog.sd`. |
+//! | `attributes/container_id`, under `format: rfc3164` | lost | structural | RFC 3164 has no structured data, so an attribute outside the header fields is left off. |
+//! | `attributes/container_id`, under `format: rfc5424` and under `structured_data: {"sd_id":"transit@32473"}` | normalized | `structured_data` | Under `structured_data:`, a PARAM of the opt-in SD-ELEMENT, which syslog_in reads back as a string inside `syslog.sd`, under the SD-ID and the attribute's key. The PARAM-VALUE is the string. |
+//! | `attributes/container_id`, otherwise | lost | uncounted | An attribute outside the header fields is left off, uncounted; under RFC 5424, `structured_data:` writes each public event attribute other than `host.name`, `process.pid`, and the `syslog.*` keys as an SD-PARAM, which syslog_in reads back inside `syslog.sd`. |
+//! | `attributes/service_identity`, under `format: rfc3164` | lost | structural | RFC 3164 has no structured data, so an attribute outside the header fields is left off. |
+//! | `attributes/service_identity`, under `format: rfc5424` and under `structured_data: {"sd_id":"transit@32473"}` | normalized | `structured_data` | Under `structured_data:`, a PARAM of the opt-in SD-ELEMENT, which syslog_in reads back as a string inside `syslog.sd`, under the SD-ID and the attribute's key. The PARAM-VALUE is the string. |
+//! | `attributes/service_identity`, otherwise | lost | uncounted | An attribute outside the header fields is left off, uncounted; under RFC 5424, `structured_data:` writes each public event attribute other than `host.name`, `process.pid`, and the `syslog.*` keys as an SD-PARAM, which syslog_in reads back inside `syslog.sd`. |
+//! | `attributes/service_tag`, under `format: rfc3164` | lost | structural | RFC 3164 has no structured data, so an attribute outside the header fields is left off. |
+//! | `attributes/service_tag`, under `format: rfc5424` and under `structured_data: {"sd_id":"transit@32473"}` | normalized | `structured_data` | Under `structured_data:`, a PARAM of the opt-in SD-ELEMENT, which syslog_in reads back as a string inside `syslog.sd`, under the SD-ID and the attribute's key. The PARAM-VALUE is the string. |
+//! | `attributes/service_tag`, otherwise | lost | uncounted | An attribute outside the header fields is left off, uncounted; under RFC 5424, `structured_data:` writes each public event attribute other than `host.name`, `process.pid`, and the `syslog.*` keys as an SD-PARAM, which syslog_in reads back inside `syslog.sd`. |
+//! | `attributes/service_tag_beside_key`, under `format: rfc3164` | lost | structural | RFC 3164 has no structured data, so an attribute outside the header fields is left off. |
+//! | `attributes/service_tag_beside_key`, under `format: rfc5424` and under `structured_data: {"sd_id":"transit@32473"}` | normalized | `structured_data` | Under `structured_data:`, a PARAM of the opt-in SD-ELEMENT, which syslog_in reads back as a string inside `syslog.sd`, under the SD-ID and the attribute's key. The PARAM-VALUE is the string. |
+//! | `attributes/service_tag_beside_key`, otherwise | lost | uncounted | An attribute outside the header fields is left off, uncounted; under RFC 5424, `structured_data:` writes each public event attribute other than `host.name`, `process.pid`, and the `syslog.*` keys as an SD-PARAM, which syslog_in reads back inside `syslog.sd`. |
+//! | `attributes/bool_value`, under `format: rfc3164` | lost | structural | RFC 3164 has no structured data, so an attribute outside the header fields is left off. |
+//! | `attributes/bool_value`, under `format: rfc5424` and under `structured_data: {"sd_id":"transit@32473"}` | normalized | `structured_data` | Under `structured_data:`, a PARAM of the opt-in SD-ELEMENT, which syslog_in reads back as a string inside `syslog.sd`, under the SD-ID and the attribute's key. The PARAM-VALUE is `true` or `false`. |
+//! | `attributes/bool_value`, otherwise | lost | uncounted | An attribute outside the header fields is left off, uncounted; under RFC 5424, `structured_data:` writes each public event attribute other than `host.name`, `process.pid`, and the `syslog.*` keys as an SD-PARAM, which syslog_in reads back inside `syslog.sd`. |
+//! | `attributes/number_value`, under `format: rfc3164` | lost | structural | RFC 3164 has no structured data, so an attribute outside the header fields is left off. |
+//! | `attributes/number_value`, under `format: rfc5424` and under `structured_data: {"sd_id":"transit@32473"}` | normalized | `structured_data` | Under `structured_data:`, a PARAM of the opt-in SD-ELEMENT, which syslog_in reads back as a string inside `syslog.sd`, under the SD-ID and the attribute's key. The PARAM-VALUE is an integer's decimal text, or a float as an `f64` in Rust's shortest form. |
+//! | `attributes/number_value`, otherwise | lost | uncounted | An attribute outside the header fields is left off, uncounted; under RFC 5424, `structured_data:` writes each public event attribute other than `host.name`, `process.pid`, and the `syslog.*` keys as an SD-PARAM, which syslog_in reads back inside `syslog.sd`. |
+//! | `attributes/array_value`, under `format: rfc3164` | lost | structural | RFC 3164 has no structured data, so an attribute outside the header fields is left off. |
+//! | `attributes/array_value`, under `format: rfc5424` and under `structured_data: {"sd_id":"transit@32473"}` | normalized | `structured_data` | Under `structured_data:`, a PARAM of the opt-in SD-ELEMENT, which syslog_in reads back as a string inside `syslog.sd`, under the SD-ID and the attribute's key. The PARAM-VALUE is one PARAM per element, each element's text, which syslog_in reads back as an array of strings, or one string for a one-element array. |
+//! | `attributes/array_value`, otherwise | lost | uncounted | An attribute outside the header fields is left off, uncounted; under RFC 5424, `structured_data:` writes each public event attribute other than `host.name`, `process.pid`, and the `syslog.*` keys as an SD-PARAM, which syslog_in reads back inside `syslog.sd`. |
+//! | `attributes/map_value`, under `format: rfc3164` | lost | structural | RFC 3164 has no structured data, so an attribute outside the header fields is left off. |
+//! | `attributes/map_value`, under `format: rfc5424` and under `structured_data: {"sd_id":"transit@32473"}` | normalized | `structured_data` | Under `structured_data:`, a PARAM of the opt-in SD-ELEMENT, which syslog_in reads back as a string inside `syslog.sd`, under the SD-ID and the attribute's key. The PARAM-VALUE is its inline `{k="v"}` text. |
+//! | `attributes/map_value`, otherwise | lost | uncounted | An attribute outside the header fields is left off, uncounted; under RFC 5424, `structured_data:` writes each public event attribute other than `host.name`, `process.pid`, and the `syslog.*` keys as an SD-PARAM, which syslog_in reads back inside `syslog.sd`. |
+//! | `attributes/bytes_value`, under `format: rfc3164` | lost | structural | RFC 3164 has no structured data, so an attribute outside the header fields is left off. |
+//! | `attributes/bytes_value`, under `format: rfc5424` and under `structured_data: {"sd_id":"transit@32473"}` | lost | uncounted | Under `structured_data:`, a PARAM of the opt-in SD-ELEMENT whose PARAM-VALUE is the value's length, `<N bytes>`, so its bytes are left off, uncounted. |
+//! | `attributes/bytes_value`, otherwise | lost | uncounted | An attribute outside the header fields is left off, uncounted; under RFC 5424, `structured_data:` writes each public event attribute other than `host.name`, `process.pid`, and the `syslog.*` keys as an SD-PARAM, which syslog_in reads back inside `syslog.sd`. |
+//! | `attributes/timestamp_value`, under `format: rfc3164` | lost | structural | RFC 3164 has no structured data, so an attribute outside the header fields is left off. |
+//! | `attributes/timestamp_value`, under `format: rfc5424` and under `structured_data: {"sd_id":"transit@32473"}` | normalized | `structured_data` | Under `structured_data:`, a PARAM of the opt-in SD-ELEMENT, which syslog_in reads back as a string inside `syslog.sd`, under the SD-ID and the attribute's key. The PARAM-VALUE is its RFC 3339 text with nanoseconds. |
+//! | `attributes/timestamp_value`, otherwise | lost | uncounted | An attribute outside the header fields is left off, uncounted; under RFC 5424, `structured_data:` writes each public event attribute other than `host.name`, `process.pid`, and the `syslog.*` keys as an SD-PARAM, which syslog_in reads back inside `syslog.sd`. |
+//! | `attributes/null_value`, under `format: rfc3164` | lost | structural | RFC 3164 has no structured data, so an attribute outside the header fields is left off. |
+//! | `attributes/null_value`, under `format: rfc5424` and under `structured_data: {"sd_id":"transit@32473"}` | normalized | `structured_data` | Under `structured_data:`, a PARAM of the opt-in SD-ELEMENT with an empty PARAM-VALUE, which syslog_in reads back as an empty string inside `syslog.sd`. |
+//! | `attributes/null_value`, otherwise | lost | uncounted | An attribute outside the header fields is left off, uncounted; under RFC 5424, `structured_data:` writes each public event attribute other than `host.name`, `process.pid`, and the `syslog.*` keys as an SD-PARAM, which syslog_in reads back inside `syslog.sd`. |
+//! | `attributes/private_carrier` | lost | structural | A `_logit.` carrier or flag is private and isn't a header field, so it's left off. |
+//! | `attributes/prometheus_target` | lost | structural | A `_logit.` carrier or flag is private and isn't a header field, so it's left off. |
+//! | `attributes/foreign_carrier` | lost | structural | A `_logit.` carrier or flag is private and isn't a header field, so it's left off. |
+//! | `attributes/timestamped` | lost | structural | A `_logit.` carrier or flag is private and isn't a header field, so it's left off. |
+//! | `attributes/rate` | lost | structural | A `_logit.` carrier or flag is private and isn't a header field, so it's left off. |
+//! | `attributes/interval` | lost | structural | A `_logit.` carrier or flag is private and isn't a header field, so it's left off. |
+//! | `attributes/rate_on_non_gauge` | lost | structural | A `_logit.` carrier or flag is private and isn't a header field, so it's left off. |
+//! | `attributes/family_type` | lost | structural | A `_logit.` carrier or flag is private and isn't a header field, so it's left off. |
+//! | `attributes/family_type_on_other_kind` | lost | structural | A `_logit.` carrier or flag is private and isn't a header field, so it's left off. |
+//! | `attributes/interval_on_distribution` | lost | structural | A `_logit.` carrier or flag is private and isn't a header field, so it's left off. |
+//! | `attributes/interval_on_histogram` | lost | structural | A `_logit.` carrier or flag is private and isn't a header field, so it's left off. |
+//! | `attributes/resource_attribute` | lost | structural | Syslog has no resource, so a resource attribute is left off, apart from `host.name` and `process.pid`, which are HOSTNAME and PROCID when the event carries neither and read back on the event. |
+//! | `attributes/scope` | lost | structural | Syslog has no instrumentation scope, so none is written. |
+//! | `attributes/datadog_carrier_log` | lost | structural | A `_logit.` carrier or flag is private and isn't a header field, so it's left off. |
+//! | `attributes/severity_carrier_otel` | lost | structural | Syslog has no raw OTLP severity, so the carriers are left off and the severity reads back from PRI at syslog's resolution. |
+//! | `attributes/severity_carrier_syslog` | exact | -- | PRI's severity, which syslog_in reads back into the same carrier. |
+//! | `attributes/syslog_header`, under `format: rfc3164` | lost | structural | Under RFC 3164, `syslog.facility` is PRI's facility and `syslog.tag` the TAG, and a PID is written only inside a TAG, so `process.pid` or `syslog.pid` on a log with no `syslog.tag` is left off. |
+//! | `attributes/syslog_header`, otherwise | exact | -- | `syslog.facility` is PRI's facility, `syslog.tag` APP-NAME, and `process.pid` or `syslog.pid` PROCID, each read back as written. |
+//! | `attributes/syslog_msgid`, under `format: rfc3164` | lost | structural | RFC 3164 has no MSGID, so it's left off. |
+//! | `attributes/syslog_msgid`, otherwise | exact | -- | MSGID. |
+//! | `attributes/syslog_sd`, under `format: rfc3164` | lost | structural | RFC 3164 has no STRUCTURED-DATA, so it's left off. |
+//! | `attributes/syslog_sd`, under `format: rfc5424` and under `structured_data: {"sd_id":"transit@32473"}` | normalized | `structured_data` | Under `structured_data:`, the log's own elements are written beside the opt-in SD-ELEMENT, so `syslog.sd` reads back with it added. An element under the configured SD-ID is the log's own, and the opt-in one is left off. |
+//! | `attributes/syslog_sd`, otherwise | exact | -- | STRUCTURED-DATA, its elements and their params in name order. |
+//! | `attributes/syslog_timestamp`, under `format: rfc3164` | lost | structural | Under RFC 3164, a typed timestamp is TIMESTAMP in whole seconds with no year or zone, which syslog_in reads back as that text, and an RFC 3164-shaped string is written as it is; anything else, a null or any other string, gives way to the log's timestamp and the attribute is left off. |
+//! | `attributes/syslog_timestamp`, otherwise | lost | structural | Under RFC 5424, a typed timestamp is TIMESTAMP and a null is the nil `-`, each written as it is; any string, an RFC 5424-shaped one included, gives way to the log's timestamp and the attribute is left off. |
+//! | `attributes/sd_id_collision` | lost | `logit.output.structured_data.omitted{reason=sd_id_collision}` | Under `structured_data:`, a log whose own `syslog.sd` already holds an element under the configured SD-ID keeps its own, and the opt-in SD-ELEMENT is left off, counted once per log: syslog_in refuses a repeated SD-ID. |
+//! | `attributes/sd_name_unsafe` | lost | `logit.output.structured_data.omitted{reason=invalid_sd_name}` | Under `structured_data:`, an attribute key that isn't an RFC 5424 SD-NAME (1 to 32 printable ASCII characters, none of them `=`, space, `]`, or `"`) has no PARAM-NAME, so its PARAM is left off, counted. |
+//! | `attributes/sd_empty_array` | lost | uncounted | Under `structured_data:`, an empty array writes one PARAM per element, so none, and the attribute is left off, uncounted. |
+//! | `attributes/host_name`, under `format: rfc3164` | lost | structural | Under RFC 3164, a log with no `syslog.tag` has no TAG, so syslog_in reads its HOSTNAME as the first word of its message (the `log/header_in_message` row) and reads no `host.name` back. |
+//! | `attributes/host_name`, otherwise | exact | -- | HOSTNAME. |
+//! | `attributes/splunk_envelope` | lost | structural | Syslog has no resource and no field for Splunk's envelope, so it's left off. |
+//! | `attributes/syslog_facility` | normalized | `default_facility` | A log with no `syslog.facility` leaves with the sink's `facility:`, `local0` by default, as PRI's facility, which syslog_in reads back as `syslog.facility`. |
+//! | `attributes/no_host`, under `format: rfc3164` | exact | -- | Under RFC 3164, a log with no host and no `syslog.tag` has no TAG, so syslog_in reads the default HOSTNAME as the first word of its message (the `log/header_in_message` row) and reads no `host.name` back. A log with a `syslog.tag` and no host reads back the default HOSTNAME as `host.name`, as under RFC 5424, and no case reaches it. |
+//! | `attributes/no_host`, otherwise | normalized | `default_host` | A log with no host leaves with the sink's `hostname:`, else the process hostname, as HOSTNAME, which syslog_in reads back as `host.name`. |
+//! | `attributes/log_status` | exact | -- | The severity is PRI's; no `status` attribute is written. |
+//! | `attributes/log_severity_fields` | exact | -- | The severity is PRI's; no `otel.log.severity.*` attribute is written. |
+//! | `attributes/span_kind` | exact | -- | A span isn't written, so no `span.kind` attribute is. |
+//! | `attributes/trace_id_high` | exact | -- | A span isn't written, so no `_dd.p.tid` attribute is. |
+//! | `log/severity` | normalized | `severity_band` | PRI's severity: a `_logit.syslog.severity` carrier's value, else the band's syslog severity, which syslog_in reads back at syslog's resolution, so `trace` reads back as `debug`. |
+//! | `log/severity_unset` | normalized | `default_severity` | A log with no severity leaves at syslog's `info` (6), which syslog_in reads back as `info`. |
+//! | `log/body_format` | lost | structural | Syslog has no body format, so MSG reads back as `raw`. |
+//! | `log/event_name` | lost | structural | Syslog has no event name, so it's left off. |
+//! | `log/observed_timestamp` | lost | structural | Syslog has no observed timestamp, so it's left off. |
+//! | `log/observed_timestamp_unset` | exact | -- | A log with no observed timestamp leaves with none. |
+//! | `log/trace` | lost | structural | Syslog has no trace context, so the trace and span ids are left off. |
+//! | `log/trace_unset` | exact | -- | A log with no trace context leaves with none. |
+//! | `log/trace_flags` | lost | structural | Syslog has no trace flags, so they're left off. |
+//! | `log/trace_beside_id_attribute` | lost | structural | Syslog has no trace or span ids, so they're left off, as `log/trace` has. |
+//! | `log/dropped_attributes_count` | lost | structural | Syslog has no dropped-attributes count, so it's left off. |
+//! | `log/timestamp`, under `format: rfc3164` | normalized | `timestamp_precision` | Under RFC 3164, a log with no `syslog.timestamp` leaves with its timestamp as TIMESTAMP in whole seconds with no year or zone, which syslog_in reads back as `syslog.timestamp`, with `event.timestamp` as the receipt time. |
+//! | `log/timestamp`, otherwise | normalized | `timestamp_precision` | A log with no `syslog.timestamp` leaves with its timestamp as TIMESTAMP in microseconds, which syslog_in reads back as `syslog.timestamp`, with `event.timestamp` as the receipt time. |
+//! | `log/receipt_timestamp` | lost | structural | A log whose `syslog.timestamp` is written as TIMESTAMP leaves its own timestamp, the receipt time, unwritten; syslog_in stamps its own receipt time. |
+//! | `log/beside_metrics`, under `format: rfc3164` | normalized | `header_in_message` | The log is one syslog message, and the metrics beside it have no syslog form and are left off, uncounted. Under RFC 3164, a log with no `syslog.tag` reads back with its HOSTNAME at the front of its message, as the `log/header_in_message` row says. |
+//! | `log/beside_metrics`, otherwise | exact | -- | The log is one syslog message; the metrics beside it have no syslog form and are left off, uncounted. |
+//! | `span/beside_metrics` | lost | `logit.output.events.skipped` | A span has no syslog form, so it isn't written beside its event's metrics, which have none either. |
+//!
+//! <!-- transit:end -->
+//!
 //! ## Sizing
 //!
 //! `max_message_bytes` bounds one whole encoded message (PRI + header + MSG). It defaults to 8192,
@@ -654,19 +790,21 @@ fn write_rfc5424_header(
     let _ = write!(out, "<{pri}>1 ");
     write_5424_timestamp(out, attrs, event_timestamp);
     out.push(' ');
-    push_5424_field(out, scratch, hostname, 255);
+    push_5424_field(out, scratch, hostname, HeaderField::Hostname.max_len(Format::Rfc5424));
     out.push(' ');
-    push_5424_field(out, scratch, app_name, 48);
+    push_5424_field(out, scratch, app_name, HeaderField::AppName.max_len(Format::Rfc5424));
     out.push(' ');
     match pid {
         Some(Pid::U64(p)) => {
             let _ = write!(out, "{p}");
         }
-        Some(Pid::Str(s)) => push_5424_field(out, scratch, Some(s), 128),
+        Some(Pid::Str(s)) => {
+            push_5424_field(out, scratch, Some(s), HeaderField::ProcId.max_len(Format::Rfc5424))
+        }
         None => out.push('-'),
     }
     out.push(' ');
-    push_5424_field(out, scratch, msgid, 32);
+    push_5424_field(out, scratch, msgid, HeaderField::MsgId.max_len(Format::Rfc5424));
     out.push(' ');
     write_structured_data(out, scratch, attrs, structured_data, stats, diag);
 }
@@ -726,14 +864,14 @@ fn write_rfc3164_header(
     let _ = write!(out, "<{pri}>");
     write_3164_timestamp(out, attrs, event_timestamp);
     if let Some(h) = hostname {
-        sanitize_3164_token(scratch, h, 255);
+        sanitize_3164_token(scratch, h, HeaderField::Hostname.max_len(Format::Rfc3164));
         if !scratch.is_empty() {
             out.push(' ');
             out.push_str(scratch);
         }
     }
     if let Some(t) = tag {
-        sanitize_3164_token(scratch, t, 32);
+        sanitize_3164_token(scratch, t, HeaderField::AppName.max_len(Format::Rfc3164));
         if !scratch.is_empty() {
             out.push(' ');
             out.push_str(scratch);
@@ -744,7 +882,11 @@ fn write_rfc3164_header(
                         let _ = write!(out, "{n}");
                     }
                     Pid::Str(s) => {
-                        sanitize_3164_token(scratch, s, 128);
+                        sanitize_3164_token(
+                            scratch,
+                            s,
+                            HeaderField::ProcId.max_len(Format::Rfc3164),
+                        );
                         out.push_str(scratch);
                     }
                 }
@@ -818,7 +960,7 @@ fn is_printusascii(c: char) -> bool {
 /// RFC 5424 section 6.3.2's `SD-NAME`: 1 to 32 `PRINTUSASCII` characters excluding `=`, `]`, `"`
 /// (SP is outside `PRINTUSASCII`). Checks SD-IDs, PARAM-NAMEs, and the opt-in `sd_id`. Byte-wise
 /// is exact here: no non-ASCII byte is `PRINTUSASCII`.
-fn is_valid_sd_name(s: &str) -> bool {
+pub fn is_valid_sd_name(s: &str) -> bool {
     (1..=32).contains(&s.len())
         && s.bytes().all(|b| {
             let c = b as char;
@@ -921,14 +1063,7 @@ fn write_structured_data(
         }
     }
     if let Some(cfg) = structured_data {
-        // `host.name` and `process.pid` are HOSTNAME's and PROCID's keys, so they're header fields like
-        // `syslog.*`, not SD-PARAMs.
-        let is_extra = |key: &str| {
-            !key.starts_with("syslog.")
-                && key != HOST_NAME
-                && key != PROCESS_PID
-                && !crate::attrs::is_private(key)
-        };
+        let is_extra = is_opt_in_param;
         // Checked before the collision, so an event with only `syslog.*` and private attributes,
         // which would emit no opt-in element anyway, isn't counted as a drop.
         let has_extra_attrs = attrs.iter().any(|(sym, _)| is_extra(interner::resolve(sym)));
@@ -968,6 +1103,16 @@ fn write_structured_data(
     if out.len() == start {
         out.push('-');
     }
+}
+
+/// Whether event attribute `key` is a PARAM of the opt-in `structured_data` element (module doc's
+/// "Opt-in `structured_data`"). `host.name` and `process.pid` are HOSTNAME's and PROCID's keys, so
+/// they're header fields like `syslog.*`, not SD-PARAMs.
+pub fn is_opt_in_param(key: &str) -> bool {
+    !key.starts_with("syslog.")
+        && key != HOST_NAME
+        && key != PROCESS_PID
+        && !crate::attrs::is_private(key)
 }
 
 /// One SD-ELEMENT: `[SD-ID PARAM-NAME="value" ...]`. An invalid `sd_id` skips the whole element
@@ -1130,6 +1275,140 @@ fn sanitize_msg_bytes(out: &mut Vec<u8>, msg: &[u8]) {
     }
 }
 
+/// A log message as [`SyslogEncoder`] writes it after the header, before `max_message_bytes`
+/// truncates it: [`render_message`] then [`sanitize_msg`], or [`sanitize_msg_bytes`] for a
+/// `Value::Bytes` message, the encoder's own passes.
+pub fn wire_message(value: &Value) -> Vec<u8> {
+    let mut out = Vec::new();
+    match value {
+        Value::Bytes(raw) => sanitize_msg_bytes(&mut out, raw),
+        other => {
+            let mut raw = String::new();
+            render_message(&mut raw, other);
+            let mut sanitized = String::new();
+            sanitize_msg(&mut sanitized, &raw);
+            out = sanitized.into_bytes();
+        }
+    }
+    out
+}
+
+/// A string header field [`wire_header_field`] renders.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeaderField {
+    Hostname,
+    /// RFC 5424's APP-NAME, RFC 3164's TAG.
+    AppName,
+    ProcId,
+    /// RFC 5424 only.
+    MsgId,
+}
+
+impl HeaderField {
+    /// RFC 5424 section 6's cap on the field. RFC 3164 caps only TAG, at 32 characters; the
+    /// encoder applies RFC 5424's caps to its other fields.
+    fn max_len(self, format: Format) -> usize {
+        match (self, format) {
+            (HeaderField::Hostname, _) => 255,
+            (HeaderField::AppName, Format::Rfc5424) => 48,
+            (HeaderField::AppName, Format::Rfc3164) => 32,
+            (HeaderField::ProcId, _) => 128,
+            (HeaderField::MsgId, _) => 32,
+        }
+    }
+}
+
+/// A string header field's value as [`SyslogEncoder`] writes it under `format`, sanitized and
+/// capped ([`sanitize_5424_field`], [`sanitize_3164_token`]). Empty where the encoder writes RFC
+/// 5424's NILVALUE or omits the RFC 3164 token.
+pub fn wire_header_field(format: Format, field: HeaderField, value: &str) -> String {
+    let mut out = String::new();
+    match format {
+        Format::Rfc5424 => sanitize_5424_field(&mut out, value, field.max_len(format)),
+        Format::Rfc3164 => sanitize_3164_token(&mut out, value, field.max_len(format)),
+    }
+    out
+}
+
+/// The TIMESTAMP [`SyslogEncoder`] writes under `format` for an event with attributes `attrs` and
+/// timestamp `event_timestamp` (the module doc's "Timestamp semantics").
+pub fn wire_timestamp(format: Format, attrs: &AttrMap, event_timestamp: i64) -> String {
+    let mut out = String::new();
+    match format {
+        Format::Rfc5424 => write_5424_timestamp(&mut out, attrs, event_timestamp),
+        Format::Rfc3164 => write_3164_timestamp(&mut out, attrs, event_timestamp),
+    }
+    out
+}
+
+/// The PRI facility [`SyslogEncoder`] writes for an event with attributes `attrs` when its
+/// configured facility is `default`.
+pub fn wire_facility(attrs: &AttrMap, default: u8) -> u8 {
+    resolve_facility(attrs, default.min(23))
+}
+
+/// The HOSTNAME [`SyslogEncoder`] writes under `format` for an event with attributes `attrs` in a
+/// batch whose resource attributes are `resource`, when its configured default is `default`;
+/// `None` where it writes none (the module doc's "Header-field precedence").
+pub fn wire_hostname(
+    format: Format,
+    attrs: &AttrMap,
+    resource: &AttrMap,
+    default: Option<&str>,
+) -> Option<String> {
+    let hostname =
+        resolve_str(attrs, HOST_NAME).or_else(|| resolve_str(resource, HOST_NAME)).or(default)?;
+    Some(wire_header_field(format, HeaderField::Hostname, hostname)).filter(|h| !h.is_empty())
+}
+
+/// The APP-NAME, or RFC 3164's TAG, [`SyslogEncoder`] writes under `format` for an event with
+/// attributes `attrs`, when its configured default is `default`; `None` where it writes none.
+pub fn wire_app_name(format: Format, attrs: &AttrMap, default: Option<&str>) -> Option<String> {
+    let app_name = resolve_str(attrs, "syslog.tag").or(default)?;
+    Some(wire_header_field(format, HeaderField::AppName, app_name)).filter(|a| !a.is_empty())
+}
+
+/// The PROCID [`SyslogEncoder`] resolves under `format` for an event with attributes `attrs` in a
+/// batch whose resource attributes are `resource`; `None` where it resolves none. An RFC 3164
+/// output writes it only inside a TAG.
+pub fn wire_procid(format: Format, attrs: &AttrMap, resource: &AttrMap) -> Option<String> {
+    let mut stats = EncodeStats::default();
+    match resolve_pid(attrs, resource, &mut stats)? {
+        Pid::U64(n) => Some(n.to_string()),
+        Pid::Str(s) => {
+            Some(wire_header_field(format, HeaderField::ProcId, s)).filter(|p| !p.is_empty())
+        }
+    }
+}
+
+/// The MSGID [`SyslogEncoder`] writes under `format` for an event with attributes `attrs`; `None`
+/// where it writes none, which is always under RFC 3164.
+pub fn wire_msgid(format: Format, attrs: &AttrMap) -> Option<String> {
+    if format == Format::Rfc3164 {
+        return None;
+    }
+    let msgid = resolve_str(attrs, "syslog.msgid")?;
+    Some(wire_header_field(format, HeaderField::MsgId, msgid)).filter(|m| !m.is_empty())
+}
+
+/// The STRUCTURED-DATA field [`SyslogEncoder`] writes under RFC 5424 for an event with attributes
+/// `attrs`, when its opt-in `structured_data.sd_id` is `sd_id`, and the omissions it counts: the
+/// encoder's own pass, `-` where it writes no element.
+pub fn wire_structured_data(attrs: &AttrMap, sd_id: Option<&str>) -> (String, EncodeStats) {
+    let mut out = String::new();
+    let mut stats = EncodeStats::default();
+    let config = sd_id.map(|sd_id| StructuredDataConfig { sd_id: sd_id.to_string() });
+    write_structured_data(
+        &mut out,
+        &mut String::new(),
+        attrs,
+        config.as_ref(),
+        &mut stats,
+        &mut Diagnostics::default(),
+    );
+    (out, stats)
+}
+
 /// Truncates `s` to at most `budget` bytes on a UTF-8 character boundary; `true` if it cut.
 fn truncate_on_char_boundary(s: &mut String, budget: usize) -> bool {
     if s.len() <= budget {
@@ -1242,7 +1521,7 @@ impl SyslogOutput {
         let encoder = encoder.with_diagnostics(self.diag.gated(self.accounting.gate()));
         self.encoder = match self.conn {
             Conn::Udp(_) => {
-                let cap = encoder.max_message_bytes().min(MAX_UDP_PAYLOAD_BYTES);
+                let cap = message_cap(false, encoder.max_message_bytes());
                 encoder.with_max_message_bytes(cap)
             }
             Conn::Tcp { .. } => encoder,
@@ -1314,9 +1593,19 @@ impl SyslogOutput {
     }
 }
 
+/// The longest message the encoder may write for a transport: `max_message_bytes`, at most
+/// [`MAX_UDP_PAYLOAD_BYTES`] over UDP (module doc's "Sizing").
+pub fn message_cap(tcp: bool, max_message_bytes: usize) -> usize {
+    if tcp {
+        max_message_bytes
+    } else {
+        max_message_bytes.min(MAX_UDP_PAYLOAD_BYTES)
+    }
+}
+
 /// Turns one `encode_into` call's [`EncodeStats`] into `logit.output.*` telemetry points.
 /// A free function so it's testable without a real socket.
-fn report_encode_stats(telemetry: &Telemetry, stats: &EncodeStats) {
+pub fn report_encode_stats(telemetry: &Telemetry, stats: &EncodeStats) {
     telemetry.count("logit.output.events.skipped", stats.skipped_no_log as f64, &[]);
     telemetry.count("logit.output.messages.truncated", stats.truncated as f64, &[]);
     telemetry.count(

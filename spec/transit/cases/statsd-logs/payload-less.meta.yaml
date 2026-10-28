@@ -1,0 +1,5 @@
+# Hand-written events with no metric, log, or span: one carrying attributes only, and one an
+# InfluxDB point whose fields are all strings, its measurement carrier intact. No statsd line
+# decodes to either; they're here, as the statsd directory's span cases are, so the log sinks
+# reach `event/attributes_only` and `event/string_only`.
+exercises: []

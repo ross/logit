@@ -1,0 +1,6 @@
+# Logs carrying attributes outside the header fields, as a stage between `syslog_in` and
+# `syslog_out` adds them: one of each value type, a PARAM-VALUE holding `"`, `\`, and `]`, and a
+# key that isn't an SD-NAME; one beside its own `syslog.sd` element; one whose `syslog.sd`
+# already holds an element under `syslog-relay-sd`'s SD-ID, `transit@32473`; and two with the
+# host and service keys other sinks treat apart.
+exercises: [rfc5424, structured_data, opt_in_attributes]

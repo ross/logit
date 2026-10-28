@@ -1,0 +1,4 @@
+# A hand-written /api/v2/logs body: an object, an array, a number, a float, a bool, and an
+# empty string as `message`; datadog_in reads each non-string one as its JSON text.
+wire: messages.bin
+exercises: [log, structured_message, scalar_message, blank_message, host]

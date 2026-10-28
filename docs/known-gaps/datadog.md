@@ -88,6 +88,21 @@ Entry format and the other areas: [the known-gaps index](README.md).
   - **Consequence:** extra requests on these routes, never a `413`.
   - **Revisit trigger:** Datadog documents these routes' limits, or the extra requests show up in
     a sink's request rate.
+- **`datadog_out` drops the OTLP log fields a Datadog log has no slot for, and writes a
+  non-string message as text.** A log's `event_name`, observed time, body format, trace flags,
+  and dropped-attribute count leave nowhere, and `_logit.otel.severity_number` and
+  `_logit.otel.severity_text` are left off, so OTLP's `INFO2` arrives as `info`. A `Map` or
+  `Array` message arrives as its JSON text, a `Bytes` one as lossy UTF-8, a log with no body as
+  the message `null`, and a `Bytes` attribute as base64 text. The trace and span ids arrive as the
+  `trace_id` and `span_id` attributes, unless the log already has an attribute of either name:
+  then the attribute is written, so a relayed Datadog log leaves as it arrived, and the log's own
+  ids are left off, uncounted (`log/trace_beside_id_attribute` in the transit spec). Revisit:
+  count the left-off trace as `logit.output.tags.omitted{reason="reserved_key"}`, the counter the
+  encoder already uses for an attribute that collides with a reserved key.
+  - **Consequence:** an OTLP log relayed to Datadog, or back out of `datadog_in`, can't be
+    rebuilt field for field.
+  - **Revisit trigger:** an operator needs one of these fields in Datadog.
+  - The transit spec's `otlp-logs-to-datadog` flow states each as a cell.
 - **A `datadog_out` or `datadog_trace_out` resend isn't idempotent: Datadog stores a resent log
   twice.** Both sinks remember which requests of a batch the destination settled, so a retry
   resends only the rest ([ADR `sink-fault-classes`](../adr/sink-fault-classes.md), "Amendment: the
@@ -133,6 +148,9 @@ Entry format and the other areas: [the known-gaps index](README.md).
     Agent would add, and one that named only an inode carries no container at all.
   - **Workaround:** send DogStatsD through a local Agent with `statsd_out`, which writes `|c:` back
     in the form the Agent reads, or stamp the tags upstream with `set`.
+  - `datadog_in` doesn't read the tag back as `container.id`: a metric's arrives as the
+    attribute `container_id`, and a log's stays an entry of its `ddtags` string, so a log relayed
+    on to `otlp_out` or `syslog_out` carries no `container.id`.
 - **A relayed log keeps one value per service identity key.** `datadog_in` lifts a log's `ddtags`
   `env:`, `version:`, and `service:` entries onto one `deployment.environment.name`,
   `service.version`, and `service.name` each, the log's own `service` field first. A `service:`

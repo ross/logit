@@ -1,0 +1,3 @@
+# An RFC 5424 message with every optional field nil.
+wire: nil-fields.syslog
+exercises: [rfc5424, nil_fields]

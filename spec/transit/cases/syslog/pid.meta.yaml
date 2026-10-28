@@ -1,0 +1,4 @@
+# PROCIDs and `tag[pid]` brackets read as `process.pid` and as `syslog.pid`, one beside a nil
+# APP-NAME.
+wire: pid.syslog
+exercises: [rfc5424, rfc3164, pid, multi_line]

@@ -1411,79 +1411,8 @@ pub(crate) fn build_spec(
                 write_config(&component.buffer),
             )
         }
-        KafkaOut {
-            brokers,
-            topic,
-            topics,
-            key,
-            format,
-            record,
-            compression,
-            acks,
-            idempotent,
-            max_request_bytes,
-            timeout,
-            headers,
-            tls,
-            sasl,
-        } => {
-            let otlp = matches!(
-                format,
-                logit_config::KafkaFormat::OtlpProto | logit_config::KafkaFormat::OtlpJson
-            );
-            // Under an OTLP format, `topic:` sends every signal to one topic; without it, each
-            // signal takes its `topics:` entry or the exporter's default.
-            let signal_topics = (otlp && topic.is_none()).then(|| {
-                let set = topics.clone().unwrap_or_default();
-                let default = SignalTopics::default();
-                SignalTopics {
-                    logs: set.logs.unwrap_or(default.logs),
-                    metrics: set.metrics.unwrap_or(default.metrics),
-                    traces: set.traces.unwrap_or(default.traces),
-                }
-            });
-            let settings = KafkaSettings {
-                brokers: brokers.clone(),
-                topic: topic.clone().unwrap_or_default(),
-                topics: signal_topics,
-                key: match key {
-                    logit_config::KafkaKey::None => RecordKey::None,
-                    logit_config::KafkaKey::TraceId => RecordKey::TraceId,
-                    logit_config::KafkaKey::Attribute(name) => RecordKey::Attribute(name.clone()),
-                    logit_config::KafkaKey::Resource(name) => RecordKey::Resource(name.clone()),
-                },
-                format: match format {
-                    logit_config::KafkaFormat::Json => RecordFormat::Json,
-                    logit_config::KafkaFormat::Text => RecordFormat::Text,
-                    logit_config::KafkaFormat::Msgpack => RecordFormat::Msgpack,
-                    logit_config::KafkaFormat::Native => RecordFormat::Native,
-                    logit_config::KafkaFormat::OtlpProto => RecordFormat::OtlpProto,
-                    logit_config::KafkaFormat::OtlpJson => RecordFormat::OtlpJson,
-                },
-                record: record.map(|record| match record {
-                    logit_config::KafkaRecord::Event => RecordMode::Event,
-                    logit_config::KafkaRecord::Batch => RecordMode::Batch,
-                }),
-                compression: match compression {
-                    logit_config::KafkaCompression::None => KafkaCompression::None,
-                    logit_config::KafkaCompression::Gzip => KafkaCompression::Gzip,
-                    logit_config::KafkaCompression::Snappy => KafkaCompression::Snappy,
-                    logit_config::KafkaCompression::Lz4 => KafkaCompression::Lz4,
-                    logit_config::KafkaCompression::Zstd => KafkaCompression::Zstd,
-                },
-                acks: match acks {
-                    logit_config::KafkaAcks::All => KafkaAcks::All,
-                    logit_config::KafkaAcks::Leader => KafkaAcks::Leader,
-                    logit_config::KafkaAcks::None => KafkaAcks::None,
-                },
-                idempotent: *idempotent,
-                // Saturates on a 32-bit target: a cap past the address space is no cap.
-                max_request_bytes: usize::try_from(*max_request_bytes).unwrap_or(usize::MAX),
-                timeout: *timeout,
-                headers: headers.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
-                client_id: format!("logit-{id}"),
-                sasl: sasl.clone().map(kafka_sasl).transpose()?,
-            };
+        KafkaOut { tls, .. } => {
+            let settings = kafka_settings(id, &component.kind)?;
             let mut output = KafkaOutput::new(settings)?
                 .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
                 .with_telemetry(telemetry.clone());
@@ -1567,20 +1496,17 @@ pub(crate) fn build_spec(
                         .with_accept_timeout(*accept_timeout)
                 }
             };
-            // Filled only where neither an event nor its resource carries a `host.name`.
-            let default_hostname = configured_hostname.as_deref().unwrap_or(&**hostname);
-            let mut encoder = SyslogEncoder::new(syslog_format(*format), facility.as_u8())
-                .with_max_message_bytes(*max_message_bytes as usize)
-                .with_hostname(default_hostname);
-            if let Some(app_name) = app_name {
-                encoder = encoder.with_app_name(app_name.clone());
-            }
-            if let Some(structured_data) = structured_data {
-                encoder =
-                    encoder.with_structured_data(structured_data.sd_id.clone()).with_context(
-                        || format!("component {id:?}: syslog_out structured_data.sd_id is invalid"),
-                    )?;
-            }
+            let encoder = syslog_encoder(
+                *format,
+                *facility,
+                configured_hostname.as_deref().unwrap_or(&**hostname),
+                app_name.as_deref(),
+                *max_message_bytes,
+                structured_data.as_ref(),
+            )
+            .with_context(|| {
+                format!("component {id:?}: syslog_out structured_data.sd_id is invalid")
+            })?;
             output = output
                 .with_encoder(encoder)
                 .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
@@ -1820,6 +1746,19 @@ pub(crate) enum SinkEncoder {
     /// `graphite_out`: one plaintext line, or one length-prefixed pickle frame, per
     /// [`logit_proto::MessageBuf`] entry, line-capped as the sink's transport caps it.
     Graphite(GraphiteEncoder),
+    /// `syslog_out`: one message per [`logit_proto::MessageBuf`] entry, capped as the sink's
+    /// transport caps it; `tcp` under `transport: tcp`, where the sink frames each entry with an
+    /// octet count and `syslog_in` reads it with line splitting off.
+    Syslog { encoder: SyslogEncoder, tcp: bool },
+    /// `splunk_hec_out`: one HEC object per [`logit_proto::MessageBuf`] entry
+    /// (`SplunkEncoder::encode_objects`), filling the host of an object that carries none with the
+    /// process hostname, as the sink does; an object over `max_body_bytes` is dropped, counted as
+    /// the sink counts it.
+    Splunk { encoder: logit_proto::splunk::SplunkEncoder, max_body_bytes: usize },
+    /// `kafka_out`: one record value per [`logit_proto::MessageBuf`] entry, its key and timestamp
+    /// beside it, under `format`. The producer's batching, compression, and per-record size check
+    /// aren't run.
+    Kafka { encoder: logit_outputs::kafka::KafkaEncoder, format: RecordFormat },
 }
 
 /// The [`SinkEncoder`] for `kind`, its codec counting through `telemetry` and `diag`. Every
@@ -1898,6 +1837,47 @@ pub(crate) fn sink_encoder(
                     .with_diagnostics(diag.clone()),
             )
         }
+        SyslogOut {
+            transport,
+            format,
+            facility,
+            hostname: configured_hostname,
+            app_name,
+            max_message_bytes,
+            structured_data,
+            ..
+        } => {
+            let tcp = matches!(transport, logit_config::SyslogTransport::Tcp);
+            let encoder = syslog_encoder(
+                *format,
+                *facility,
+                configured_hostname.as_deref().unwrap_or(hostname),
+                app_name.as_deref(),
+                *max_message_bytes,
+                structured_data.as_ref(),
+            )?;
+            let cap = logit_outputs::syslog::message_cap(tcp, encoder.max_message_bytes());
+            SinkEncoder::Syslog {
+                encoder: encoder.with_max_message_bytes(cap).with_diagnostics(diag.clone()),
+                tcp,
+            }
+        }
+        SplunkHecOut { multi_value, max_body_bytes, .. } => SinkEncoder::Splunk {
+            encoder: logit_outputs::splunk::encoder(
+                telemetry.clone(),
+                diag.clone(),
+                splunk_multi_value(*multi_value),
+                Some(hostname.clone()),
+            ),
+            max_body_bytes: usize::try_from(*max_body_bytes).unwrap_or(usize::MAX),
+        },
+        KafkaOut { .. } => {
+            let settings = kafka_settings("transit", kind)?;
+            SinkEncoder::Kafka {
+                encoder: logit_outputs::kafka::encoder(&settings),
+                format: settings.format,
+            }
+        }
         other => anyhow::bail!("{} has no encoder this driver reaches", graph::kind_name(other)),
     })
 }
@@ -1927,6 +1907,111 @@ fn statsd_encoder(
     StatsdEncoder::new(statsd_format(format))
         .with_relative_gauges(relative_gauges)
         .with_multi_value(statsd_multi_value(multi_value))
+}
+
+/// The settings of `kind`, a `kafka_out`, for a sink named `id`, as both [`build_spec`] and
+/// [`sink_encoder`] read them.
+fn kafka_settings(id: &str, kind: &logit_config::ComponentKind) -> anyhow::Result<KafkaSettings> {
+    let logit_config::ComponentKind::KafkaOut {
+        brokers,
+        topic,
+        topics,
+        key,
+        format,
+        record,
+        compression,
+        acks,
+        idempotent,
+        max_request_bytes,
+        timeout,
+        headers,
+        sasl,
+        ..
+    } = kind
+    else {
+        anyhow::bail!("{} isn't a kafka_out", graph::kind_name(kind));
+    };
+    let otlp = matches!(
+        format,
+        logit_config::KafkaFormat::OtlpProto | logit_config::KafkaFormat::OtlpJson
+    );
+    // Under an OTLP format, `topic:` sends every signal to one topic; without it, each
+    // signal takes its `topics:` entry or the exporter's default.
+    let signal_topics = (otlp && topic.is_none()).then(|| {
+        let set = topics.clone().unwrap_or_default();
+        let default = SignalTopics::default();
+        SignalTopics {
+            logs: set.logs.unwrap_or(default.logs),
+            metrics: set.metrics.unwrap_or(default.metrics),
+            traces: set.traces.unwrap_or(default.traces),
+        }
+    });
+    Ok(KafkaSettings {
+        brokers: brokers.clone(),
+        topic: topic.clone().unwrap_or_default(),
+        topics: signal_topics,
+        key: match key {
+            logit_config::KafkaKey::None => RecordKey::None,
+            logit_config::KafkaKey::TraceId => RecordKey::TraceId,
+            logit_config::KafkaKey::Attribute(name) => RecordKey::Attribute(name.clone()),
+            logit_config::KafkaKey::Resource(name) => RecordKey::Resource(name.clone()),
+        },
+        format: match format {
+            logit_config::KafkaFormat::Json => RecordFormat::Json,
+            logit_config::KafkaFormat::Text => RecordFormat::Text,
+            logit_config::KafkaFormat::Msgpack => RecordFormat::Msgpack,
+            logit_config::KafkaFormat::Native => RecordFormat::Native,
+            logit_config::KafkaFormat::OtlpProto => RecordFormat::OtlpProto,
+            logit_config::KafkaFormat::OtlpJson => RecordFormat::OtlpJson,
+        },
+        record: record.map(|record| match record {
+            logit_config::KafkaRecord::Event => RecordMode::Event,
+            logit_config::KafkaRecord::Batch => RecordMode::Batch,
+        }),
+        compression: match compression {
+            logit_config::KafkaCompression::None => KafkaCompression::None,
+            logit_config::KafkaCompression::Gzip => KafkaCompression::Gzip,
+            logit_config::KafkaCompression::Snappy => KafkaCompression::Snappy,
+            logit_config::KafkaCompression::Lz4 => KafkaCompression::Lz4,
+            logit_config::KafkaCompression::Zstd => KafkaCompression::Zstd,
+        },
+        acks: match acks {
+            logit_config::KafkaAcks::All => KafkaAcks::All,
+            logit_config::KafkaAcks::Leader => KafkaAcks::Leader,
+            logit_config::KafkaAcks::None => KafkaAcks::None,
+        },
+        idempotent: *idempotent,
+        // Saturates on a 32-bit target: a cap past the address space is no cap.
+        max_request_bytes: usize::try_from(*max_request_bytes).unwrap_or(usize::MAX),
+        timeout: *timeout,
+        headers: headers.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+        client_id: format!("logit-{id}"),
+        sasl: sasl.clone().map(kafka_sasl).transpose()?,
+    })
+}
+
+/// `syslog_out`'s encoder from its config fields, before the sink applies its transport's message
+/// cap. `default_hostname` is the sink's `hostname:`, else the process hostname, written only
+/// where neither an event nor its resource carries a `host.name`. Fails for an invalid
+/// `structured_data.sd_id`.
+fn syslog_encoder(
+    format: logit_config::SyslogFormat,
+    facility: logit_config::SyslogFacility,
+    default_hostname: &str,
+    app_name: Option<&str>,
+    max_message_bytes: u64,
+    structured_data: Option<&logit_config::SyslogStructuredData>,
+) -> anyhow::Result<SyslogEncoder> {
+    let mut encoder = SyslogEncoder::new(syslog_format(format), facility.as_u8())
+        .with_max_message_bytes(max_message_bytes as usize)
+        .with_hostname(default_hostname);
+    if let Some(app_name) = app_name {
+        encoder = encoder.with_app_name(app_name);
+    }
+    if let Some(structured_data) = structured_data {
+        encoder = encoder.with_structured_data(structured_data.sd_id.clone())?;
+    }
+    Ok(encoder)
 }
 
 /// `graphite_out`'s encoder from its config fields, before the sink applies its line cap.

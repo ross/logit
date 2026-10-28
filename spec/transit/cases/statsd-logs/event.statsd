@@ -1,0 +1,3 @@
+_e{5,11}:Hello|first\nline|t:warning|p:low|k:deploy|s:ci|h:web-07|#env:prod
+_e{5,3}:Plain|abc
+_e{6,4}:Origin|text|e:it-false,cn-web,pu-1|card:low

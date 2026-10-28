@@ -29,8 +29,8 @@
 //! | `trace`, when neither a `trace_id` nor a `span_id` attribute is present | `trace_id` and, when the ref has one, `span_id`, lowercase hex; `flags` has no field | -- |
 //! | on a log whose message (`Str` or `Bytes`) is the text `metric`: an attribute starting `metric_name:`, and `metric_name` and `_value` when both are present | omitted: the decoder would read the object as a metric event | `logit.output.tags.omitted{reason="reserved_key"}`, one per key |
 //!
-//! `body_format`, `observed_timestamp`, and `dropped_attributes_count` have no HEC field, and
-//! decode from the wire's shape (`Json` for an object or array, else `Raw`; `0`; `0`).
+//! What a log's fields with no HEC field read back as is in the parent module's generated
+//! tables ("What each log, span, and attribute becomes").
 
 use super::metrics::{METRIC_EVENT, MULTI_METRIC_PREFIX, SINGLE_METRIC_NAME, SINGLE_METRIC_VALUE};
 use super::{

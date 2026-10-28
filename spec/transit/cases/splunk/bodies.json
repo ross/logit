@@ -1,0 +1,6 @@
+{"timestamp":"2026-09-21T14:13:20.000000000Z","log":{"format":"json","message":{"a":{"b":[1,"x"]},"c":"d"}}}
+{"timestamp":"2026-09-21T14:13:21.000000000Z","log":{"format":"json","message":[true,null,1]}}
+{"timestamp":"2026-09-21T14:13:22.000000000Z","log":{"format":"raw","message":42}}
+{"timestamp":"2026-09-21T14:13:23.000000000Z","log":{"format":"raw","message":1.5}}
+{"timestamp":"2026-09-21T14:13:24.000000000Z","log":{"format":"raw","message":false}}
+{"timestamp":"2026-09-21T14:13:25.000000000Z","log":{"format":"raw","message":-7}}

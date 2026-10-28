@@ -1,0 +1,5 @@
+# splunk-library-javalogging's `/event` appender with `messageFormat=json`, an
+# WARN line: `event` the appender's object, with an MDC value under `properties`, and a string `time`.
+# Read in place from testdata/interop/splunk/ with its .headers.
+wire: ../../../../testdata/interop/splunk/java-services-collector-event-1-0-002.bin
+exercises: [event_route, object_event, fields, envelope, time_string]

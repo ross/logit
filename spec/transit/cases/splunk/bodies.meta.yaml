@@ -1,0 +1,4 @@
+# A hand-written /event body sent as a JSON array: an object, an array, an integer, a float, a
+# bool, and a negative integer as `event`, each typed as JSON types it.
+wire: bodies.bin
+exercises: [event_route, array_body, object_event, array_event, scalar_event, time_integer, envelope_absent]

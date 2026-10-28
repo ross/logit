@@ -1,0 +1,2 @@
+{"timestamp":"2026-09-25T17:49:47.350212000Z","log":{"format":"json","message":{"tag":"08864e218903","source":"stdout","line":"{\"level\":\"info\",\"msg\":\"splunk-docker fixture inline\",\"n\":1}"}},"resource":{"attributes":{"host.name":"splunk-docker-fixture"}}}
+{"timestamp":"2026-09-25T17:49:47.350273000Z","log":{"format":"json","message":{"tag":"08864e218903","source":"stdout","line":"splunk-docker fixture plain line (inline)"}},"resource":{"attributes":{"host.name":"splunk-docker-fixture"}}}

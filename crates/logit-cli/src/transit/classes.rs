@@ -46,22 +46,43 @@
 //! and `_logit.metrics.interval` `interval_on_distribution` on a `samples`, `distribution`, or
 //! delta `exponential_histogram`, `interval_on_histogram` on a delta `histogram`, and `interval`
 //! on any other kind, at every sink, a `_logit.datadog.` carrier on a log, a Datadog
-//! event, or a service check `datadog_carrier_log`, any other `_logit.` key `foreign_carrier`, an
-//! event
+//! event, or a service check `datadog_carrier_log`, `_logit.syslog.severity`
+//! `severity_carrier_syslog`, any other `_logit.` key `foreign_carrier`, on a log an event
+//! attribute `syslog_out` writes as a header field by its key (`syslog.facility`, `syslog.tag`,
+//! `syslog.pid`, and `process.pid` `syslog_header`, `syslog.msgid` `syslog_msgid`, `syslog.sd`
+//! `syslog_sd`, `syslog.timestamp` `syslog_timestamp`, and `host.name` `host_name`), at a
+//! `syslog_out` with `structured_data:` under RFC 5424 a log's attribute the encoder leaves out
+//! of the opt-in SD-ELEMENT ([`syslog::opt_in_row`]: `sd_id_collision` on a log whose `syslog.sd`
+//! holds the configured SD-ID, `sd_name_unsafe` for a key that isn't an SD-NAME,
+//! `sd_empty_array` for an empty array), an event
 //! attribute by its value (`string_value`, `bool_value`, `number_value`, `array_value`,
-//! `map_value`, `bytes_value`, `timestamp_value`), and any other resource attribute
-//! `resource_attribute`; and `attributes/scope` when its batch has a scope. A log
+//! `map_value`, `bytes_value`, `timestamp_value`, `null_value`), `com.splunk.source`,
+//! `com.splunk.sourcetype`, or `com.splunk.index` on the resource (the HEC envelope)
+//! `splunk_envelope`, and
+//! any other resource attribute `resource_attribute`; and `attributes/scope` when its batch has a
+//! scope. A log
 //! record on an event with no metrics reaches `log/dogstatsd_event` when it carries
-//! `_logit.statsd.event.title`, else `log/plain`, and its attribute rows; a span there reaches
-//! `span/alone`, and also `span/no_wire_form` when it carries a field a Datadog span has no form
-//! for. An event with no metric, log, or span is a record of kind `event` that reaches
+//! `_logit.statsd.event.title`, else `log/plain`, the message rows [`log_features`] lists, and its
+//! attribute rows, with `_logit.otel.severity_*` as `severity_carrier_otel`; it also reaches a `log`
+//! field row for each of its fields (`severity`, `body_format`, `event_name`,
+//! `observed_timestamp`, `trace` for its trace and span ids, `trace_flags`,
+//! `dropped_attributes_count`; its ids and flags reach `trace_beside_id_attribute` instead when
+//! it also carries a `trace_id` or `span_id` attribute), or the field's `_unset` row (`severity_unset`,
+//! `observed_timestamp_unset`, `trace_unset`) where it has none, and `log/timestamp`, or
+//! `log/receipt_timestamp` when it carries `syslog.timestamp` and its timestamp is when it was
+//! received. Those fields are out of a log's own comparison ([`LOG_FIELD_KEYS`]), so a log pairs
+//! on its message, its message's type tags, and its attributes. A span there reaches
+//! `span/beside_log` when its event carries a log, else `span/alone`, and also
+//! `span/no_wire_form` when it carries a field a Datadog span has no form for. An event with no metric, log, or span is a record of kind `event` that reaches
 //! `event/string_only` when it carries a non-empty `_logit.influxdb.measurement`, else
 //! `event/attributes_only`, and its attribute rows. A record reaches an `attributes` field row for
-//! each attribute [`derived`] lists, at every sink that compares the record; a sink that writes
+//! each attribute [`derived_rows`] lists, at every sink that compares the record; a sink that writes
 //! none reads it `exact` when nothing stands in its place. A log or span on an event that carries
-//! metrics is a field of that event: it reaches `log/beside_metrics` or `span/beside_metrics` alone, read as `exact` when it pairs
-//! unchanged, `normalized` when it pairs changed, and `lost` when nothing read back pairs with
-//! it.
+//! metrics is a field of that event: it reaches `log/beside_metrics` or `span/beside_metrics`,
+//! read as `exact` when it pairs unchanged, `normalized` when it pairs changed, and `lost` when
+//! nothing read back pairs with it. A log there also reaches the `log` field rows a log alone
+//! does, and the attribute rows, so `log/beside_metrics` says only whether the sink carried it;
+//! once paired, it reaches the message rows [`log_features`] lists, at its pairing's class.
 //!
 //! **Pairing.** Each input record is paired with the records read back that account for it, in
 //! passes, each claiming a read-back record at most once: (1) the same name and the same kind,
@@ -80,7 +101,8 @@
 //! the name as the sink writes it, where an `exact` pairing reads as `normalized`, before pass
 //! (3) runs either way, so a dotted expansion never claims a record a respelling reads back
 //! whole. Within a pass the latest record goes first, so where a sink keeps one point per series,
-//! the earlier point is the one left over.
+//! the earlier point is the one left over; among logs, one with the input's timestamp goes first,
+//! so logs with one message pair by time.
 //!
 //! [`Spelling`] holds each sink's rewrites, from its codec's module doc: `statsd_out`'s reserved
 //! characters as `_` in a name, a tag key, and a tag value (`:` allowed there), and under `format:
@@ -88,15 +110,39 @@
 //! or, empty, as the hostless mark ([`statsd`]); `prometheus_out`'s `sanitize_metric_name`,
 //! `_total` on a counter, a label key's `sanitize_label_name`, and an array's last element;
 //! `influxdb_out`'s `<name>.value` for a `sum`, `gauge`, or `set` off the carrier path, and an
-//! array's last element; `otlp_out`'s timestamp value as an integer of nanoseconds, and an
+//! array's last element; `otlp_out`'s timestamp value as an integer of nanoseconds, a `u64` above
+//! `i64::MAX` as a double, and an
 //! OpenMetrics `info` or `stateset` gauge read back as a cumulative non-monotonic sum, an `info`
 //! one under `<name>_info`; `datadog_out`'s hostless mark read back as a v2 `host` resource with no
-//! name, and the attributes it writes from a record's own fields ([`Spelling::derived`]: the run's
-//! hostname on a record with no host, a log's `status`, a span's `span.kind` and `_dd.p.tid`), each
-//! accepted only with the value derived for it; `graphite_out`'s forbidden characters as `_` in a
+//! name, a log's message as its text ([`Spelling::log_message`]: a structured message as JSON,
+//! bytes as lossy UTF-8), a bytes attribute on a log as base64, a log's `ddtags` as the encoder
+//! rewrites it and `datadog_in` lifts it, with its `container.id` a `container_id:` entry of that
+//! string and no attribute of its own ([`datadog::log_ddtags`]), and the attributes it writes from a
+//! record's own fields ([`Spelling::derived`]: the run's hostname on a record with no host, a log's
+//! `status`, `trace_id`, and `span_id`, a span's `span.kind` and `_dd.p.tid`), each accepted only
+//! with the value derived for it; a log's `trace_id` and `span_id` pair only and have no row,
+//! since `log/trace` judges them; `graphite_out`'s forbidden characters as `_` in a
 //! path, a tag name, and a tag value (and a tag value's leading `~`), a tag value in the encoder's
 //! rendering, and the values it omits as no tag ([`graphite_value`]). Each name, key, and value set
-//! is the encoder's own predicate. A candidate's public attributes (no `_logit.`
+//! is the encoder's own predicate. `syslog_out`'s rewrites are a log's message as `syslog_in`
+//! reads it back ([`Spelling::log_message`]: the encoder's rendering, and under RFC 3164 with any
+//! header token the decoder reads as MSG), a header attribute in the encoder's rendering
+//! ([`syslog::value_for`]), a PROCID read back as `process.pid` when canonical decimal and as
+//! `syslog.pid` otherwise, and the attributes it fills in ([`Spelling::derived`]: its configured
+//! facility on a log with no `syslog.facility`, the run's hostname on a log with no host, and for
+//! pairing only, `syslog.timestamp` written from the log's timestamp and under RFC 3164 a TAG read
+//! from the message's first word). `splunk_hec_out`'s rewrites ([`splunk`]) are a log's message
+//! as its text (`Bytes` as lossy UTF-8, a timestamp as RFC 3339), every attribute as the
+//! encoder's `fields` (a resource's non-carrier attributes beside the event's, each map flattened
+//! to dotted keys, each value through the codec's JSON writer), an event's `host.name` as the
+//! object's `host`, read back on the resource, a log's `otel.log.name` and parseable `trace_id`
+//! and `span_id` consumed into its own fields, and the attributes it fills in
+//! ([`Spelling::derived`]: the run's hostname on a record with no host, a log's
+//! `otel.log.severity.text` and `.number` where it has neither, and for pairing only, a
+//! flattened map's dotted keys). Under `structured_data:` on RFC 5424, an opt-in attribute
+//! (`logit_outputs::syslog::is_opt_in_param`) is no attribute of its own: it reads back inside
+//! `syslog.sd` under the SD-ID, and `syslog.sd` pairs as the encoder's STRUCTURED-DATA field read
+//! through `syslog_in`'s decoder ([`syslog::read_sd`]). A candidate's public attributes (no `_logit.`
 //! key, values compared as text, each key and value as the sink writes it) must equal the
 //! input's, or failing any that do, be a subset of them; a `datadog_out` series under `<name>.`
 //! may also carry the `lower_bound`, `upper_bound`, or `quantile` tag of the bucket or quantile it
@@ -120,9 +166,25 @@
 //! input's field with its first pairing's: the same value in the same place is `exact`, present
 //! but changed, moved (a resource attribute read back as an event attribute), or under the
 //! sink's spelling of its key is `normalized`,
-//! and absent is `lost`. `prometheus_out` has one exception, which compares a value:
+//! and absent is `lost`. A log's fields follow the same rule, with three differences: a body
+//! format read back as another is `lost`, since the format names how to read the message; an
+//! `_unset` row is `exact` when the field reads back absent and `normalized` when the sink fills
+//! it in; and a receipt timestamp read back outside its own second is `lost`, another instant
+//! that no precision explains. At `syslog_out`, `syslog_in` stamps its own receipt time, so
+//! `log/timestamp` compares the TIMESTAMP written, read back as `syslog.timestamp`: the input's
+//! RFC 3339 text is `exact`, another rendering of its instant (microseconds, or RFC 3164's whole
+//! seconds with no year) `normalized`, and a TIMESTAMP written from the log's own
+//! `syslog.timestamp` leaves it `lost`; a `syslog.timestamp` the encoder can't render under the
+//! sink's format reads `lost`. Under `syslog_out`'s `structured_data:` on RFC 5424, an opt-in
+//! attribute compares a value: read back in `syslog.sd` under the SD-ID with the PARAM-VALUE text
+//! [`syslog::read_sd`] expects is `normalized`, and anything else `lost`, as is a `Bytes` value,
+//! which the encoder writes as its length, and every opt-in attribute of a log whose `syslog.sd`
+//! holds the SD-ID. `prometheus_out` compares a value too:
 //! `_logit.prometheus.target` absent reads `normalized` when the read-back's `instance` equals the
-//! input's, and `lost` otherwise. The observed class may be better than the cell's but never worse. A
+//! input's, and `lost` otherwise. At `splunk_hec_out`, a log's map attribute read back as
+//! dotted keys holding its leaves (none, for an empty map) is `normalized`, and a log's
+//! `otel.log.name`, `trace_id`, or `span_id` attribute read back in the log's own field is
+//! `normalized`. The observed class may be better than the cell's but never worse. A
 //! degraded, skipped, or dropped record's field rows aren't looked up, so they're neither reached
 //! nor unspecified there: the carriers that describe its wire form describe a shape that's gone.
 //!
@@ -177,6 +239,19 @@ use std::collections::{BTreeMap, BTreeSet};
 const FIELD_KEYS: [&str; 6] =
     ["unit", "description", "start_timestamp", "exemplars", "flags", "no_recorded_value"];
 
+/// Log body keys checked by `log` field rows, not by the record's own comparison, so a log's core
+/// is its message and the message's type tags.
+const LOG_FIELD_KEYS: [&str; 8] = [
+    "severity",
+    "format",
+    "event_name",
+    "observed_timestamp",
+    "trace_id",
+    "span_id",
+    "trace_flags",
+    "dropped_attributes_count",
+];
+
 /// Series name suffixes a run's sink counters are checked for.
 const OUTCOMES: [&str; 6] = ["dropped", "skipped", "degraded", "normalized", "omitted", "evicted"];
 
@@ -192,6 +267,9 @@ struct Rec {
     /// Whether the record's event also carries metrics: a log or span beside them is a field of
     /// that event, not a record of its own.
     beside_metrics: bool,
+    /// Whether the record's event also carries a log: a span beside one reaches `span/beside_log`,
+    /// since a sink that writes only logs leaves it off without skipping the event.
+    beside_log: bool,
     /// The line's type tags under the record, keyed by the pointer below it (`/value`).
     types: BTreeMap<String, String>,
     attributes: Map<String, Value>,
@@ -240,9 +318,10 @@ impl Rec {
 
     /// The comparison body: the record minus its field-row keys, and its type tags.
     fn core(&self) -> (Value, BTreeMap<String, String>) {
+        let stripped: &[&str] = if self.kind == "log" { &LOG_FIELD_KEYS } else { &FIELD_KEYS };
         let mut body = self.body.clone();
         if let Some(object) = body.as_object_mut() {
-            for key in FIELD_KEYS {
+            for &key in stripped {
                 object.remove(key);
             }
             // Pairing has matched the names already, respelled where the sink respells them.
@@ -269,7 +348,7 @@ impl Rec {
             .types
             .iter()
             .filter(|(pointer, _)| {
-                !FIELD_KEYS.iter().any(|key| pointer.starts_with(&format!("/{key}")))
+                !stripped.iter().any(|key| pointer.starts_with(&format!("/{key}")))
                     && (body.get("value").is_some() || pointer.as_str() != "/value")
             })
             .map(|(pointer, tag)| (pointer.clone(), tag.clone()))
@@ -342,6 +421,25 @@ enum Spelling {
     /// Rust's shortest form, `3` for `3.0`, and an array's last representable element), and a
     /// value it omits, such as a timestamp or bytes, as no tag at all ([`graphite_value`]).
     Graphite,
+    /// `syslog_out`: a log's message as the encoder renders it, C0 and DEL escaped and a structured
+    /// one as `{k="v"}` text; its header attributes as the encoder writes them, sanitized; no
+    /// other attribute; and the attributes [`syslog_derived`] lists. Under RFC 3164 (`rfc3164`),
+    /// a header `syslog_in` doesn't read back as one moves into the message ([`syslog::read`]).
+    /// `facility` is the configured PRI facility; `structured_data` the configured
+    /// `structured_data.sd_id`, under which RFC 5424 writes each opt-in attribute as a PARAM of
+    /// that element, read back nested in `syslog.sd` ([`Spelling::sd_id`], [`syslog::read_sd`]).
+    Syslog { rfc3164: bool, facility: u8, structured_data: Option<&'static str> },
+    /// `splunk_hec_out`: a log's `Bytes` message as lossy UTF-8 and a timestamp one as RFC 3339
+    /// text; its attributes as `fields`, flattened to dotted keys, with the resource's beside the
+    /// event's; `host.name` and the resource's `com.splunk.source`, `.sourcetype`, and `.index`
+    /// as the envelope, read back on the resource, any other `com.splunk.` key written into
+    /// `fields`; and the attributes [`splunk::derived`] lists, which `splunk_hec_in` reads back
+    /// as attributes the input lacks.
+    Splunk,
+    /// `kafka_out` under `format: text`: a log's message as `text_body` writes it, read back as a
+    /// `Str`, or `Bytes` where it isn't UTF-8; no attribute, resource, or other log field at all.
+    /// Under `format: json`, `kafka_out` is [`Spelling::Verbatim`].
+    KafkaText,
     /// Any other sink: names, keys, and values as written.
     Verbatim,
 }
@@ -356,7 +454,28 @@ impl Spelling {
             "otlp_out" => Spelling::Otlp,
             "datadog_out" => Spelling::Datadog,
             "graphite_out" => Spelling::Graphite,
+            "syslog_out" => Spelling::Syslog {
+                rfc3164: config["format"] == "rfc3164",
+                facility: serde_json::from_value::<logit_config::SyslogFacility>(
+                    config["facility"].clone(),
+                )
+                .map_or(16, |facility| facility.as_u8()),
+                structured_data: config["structured_data"]["sd_id"].as_str().map(|sd_id| {
+                    logit_core::interner::resolve(logit_core::interner::intern(sd_id))
+                }),
+            },
+            "splunk_hec_out" => Spelling::Splunk,
+            "kafka_out" if config["format"] == "text" => Spelling::KafkaText,
             _ => Spelling::Verbatim,
+        }
+    }
+
+    /// The SD-ID `syslog_out` writes a log's opt-in attributes under: its `structured_data.sd_id`
+    /// under RFC 5424, which RFC 3164 has no STRUCTURED-DATA for. `None` at any other sink.
+    fn sd_id(self) -> Option<&'static str> {
+        match self {
+            Spelling::Syslog { rfc3164: false, structured_data, .. } => structured_data,
+            _ => None,
         }
     }
 
@@ -367,9 +486,13 @@ impl Spelling {
             Spelling::Statsd { .. } => substituted(name, is_forbidden_in_name),
             Spelling::Prometheus => sanitize_metric_name(name).into_owned(),
             Spelling::Graphite => substituted(name, is_forbidden_in_path),
-            Spelling::Influxdb | Spelling::Otlp | Spelling::Datadog | Spelling::Verbatim => {
-                name.to_string()
-            }
+            Spelling::Influxdb
+            | Spelling::Otlp
+            | Spelling::Datadog
+            | Spelling::Syslog { .. }
+            | Spelling::Splunk
+            | Spelling::KafkaText
+            | Spelling::Verbatim => name.to_string(),
         }
     }
 
@@ -400,8 +523,12 @@ impl Spelling {
         reaches.then_some(feature)
     }
 
-    /// The name the sink's pair decoder reads `rec`, a sink input, back under.
+    /// The name the sink's pair decoder reads `rec`, a sink input, back under: for a log, its
+    /// message ([`Spelling::log_message`]).
     fn written(self, rec: &Rec) -> String {
+        if let Some(message) = self.log_message(rec) {
+            return message;
+        }
         match self {
             Spelling::Prometheus => {
                 let mut name = self.sanitize(&rec.name);
@@ -433,6 +560,59 @@ impl Spelling {
                 format!("{}_info", rec.name)
             }
             _ => self.sanitize(&rec.name),
+        }
+    }
+
+    /// The message the sink's pair decoder reads log `rec` back with, as text, where the sink's
+    /// encoder rewrites it; `None` for a record that isn't a log, and at a sink that writes the
+    /// message as it is. `datadog_out`'s logs route writes
+    /// `logit_proto::json::value_text`: a `Bytes` message as lossy UTF-8 and any other non-`Str`
+    /// one as its JSON text, which `datadog_in` reads back as a `Str`. `otlp_out` writes every
+    /// message as an `AnyValue`. `syslog_out` writes [`logit_outputs::syslog::wire_message`],
+    /// which `syslog_in` reads back as a `Str`, or as `Bytes` where it isn't UTF-8, and under RFC
+    /// 3164 with any header token it doesn't read as a header ([`syslog::read`]). `kafka_out`'s
+    /// `format: text` writes [`logit_outputs::kafka::text_body`], read back by the driver's
+    /// convention as a `Str`, or as `Bytes` where it isn't UTF-8.
+    fn log_message(self, rec: &Rec) -> Option<String> {
+        if rec.kind != "log" {
+            return None;
+        }
+        match self {
+            Spelling::Datadog if datadog::Route::of(rec) == datadog::Route::Log => {
+                let log = model_log(rec)?;
+                Some(logit_proto::json::value_text(&log.message).into_owned())
+            }
+            Spelling::Syslog { rfc3164, .. } => {
+                syslog::read(rec, rfc3164).map(|read| text(&json_value(read.message)))
+            }
+            Spelling::Splunk => splunk::message(rec),
+            Spelling::KafkaText => {
+                let log = model_log(rec)?;
+                let bytes = logit_outputs::kafka::text_body(&log.message);
+                let value = match String::from_utf8(bytes) {
+                    Ok(text) => logit_core::Value::str(text),
+                    Err(err) => logit_core::Value::Bytes(err.into_bytes().into()),
+                };
+                Some(text(&json_value(value)))
+            }
+            _ => None,
+        }
+    }
+
+    /// [`Spelling::log_message`], but at `syslog_out` the message as the encoder renders it,
+    /// before `syslog_in` decides where its header ends: what `log/message_unsafe` compares.
+    fn rendered_message(self, rec: &Rec) -> Option<String> {
+        match self {
+            Spelling::Syslog { .. } if rec.kind == "log" => {
+                let log = model_log(rec)?;
+                let bytes = logit_outputs::syslog::wire_message(&log.message);
+                let value = match String::from_utf8(bytes) {
+                    Ok(text) => logit_core::Value::str(text),
+                    Err(err) => logit_core::Value::Bytes(err.into_bytes().into()),
+                };
+                Some(text(&json_value(value)))
+            }
+            _ => self.log_message(rec),
         }
     }
 
@@ -481,6 +661,14 @@ impl Spelling {
     /// sink writes Unified Service Tagging tags, a valued `env`, `version`, or `service` attribute
     /// is that tag, which the pair decoder reads back under its standard key ([`unified::key`]).
     fn key_for(self, key: &str, rec: &Rec) -> String {
+        // A PROCID reads back as `process.pid` when it's canonical decimal, else as `syslog.pid`.
+        if let Spelling::Syslog { rfc3164, .. } = self {
+            if matches!(key, logit_core::attrs::PROCESS_PID | syslog::PID) {
+                if let Some(pid) = syslog::read(rec, rfc3164).and_then(|read| read.pid) {
+                    return syslog::pid_key(&pid).to_string();
+                }
+            }
+        }
         if self == Spelling::Datadog
             && key == logit_core::attrs::CONTAINER_ID
             && datadog::tags_container_id(rec)
@@ -512,12 +700,46 @@ impl Spelling {
     /// host, `datadog_out`'s log `hostname`, and a valued `env`, `version`, or `service` beside its
     /// standard key where the sink writes Unified Service Tagging tags.
     fn value_for(self, key: &str, value: &Value, tags: &str, rec: &Rec) -> Option<String> {
+        if let Spelling::Syslog { rfc3164, facility, .. } = self {
+            return syslog::value_for(rec, key, value, rfc3164, facility, self.sd_id());
+        }
+        if self == Spelling::Splunk {
+            if let Some(read) = splunk::read_back(rec) {
+                return read.get(key).cloned();
+            }
+        }
+        // A text record is the log's body alone.
+        if self == Spelling::KafkaText {
+            return None;
+        }
         if self == (Spelling::Statsd { dogstatsd: true }) && key == "host" {
             let kept = statsd::host_kept(rec, value)?;
             return Some(self.value(&kept, tags));
         }
         if self == Spelling::Datadog && datadog::reserved_log_key_is_omitted(rec, key) {
             return None;
+        }
+        // A log's `ddtags` the encoder rewrites reads back as [`datadog::log_ddtags`] has it, and
+        // its `container.id` is an entry of that string, no attribute of its own.
+        if self == Spelling::Datadog && rec.kind == "log" {
+            if key == "ddtags" {
+                if let Some(read) = datadog::log_ddtags(rec) {
+                    return read;
+                }
+            }
+            if key == logit_core::attrs::CONTAINER_ID && datadog::log_container_id_in_ddtags(rec) {
+                return None;
+            }
+        }
+        // A log's attribute is a key of its JSON object, a `Bytes` value its base64 text.
+        if self == Spelling::Datadog
+            && rec.kind == "log"
+            && datadog::Route::of(rec) == datadog::Route::Log
+            && tags.contains("=bytes")
+        {
+            let mut json = Vec::new();
+            logit_proto::json::write_value(&mut json, &model_attribute(value, tags)?);
+            return serde_json::from_slice(&json).ok().map(|read: Value| text(&read));
         }
         if unified::tag_is_omitted(self, rec, key, value) {
             return None;
@@ -528,13 +750,17 @@ impl Spelling {
         Some(self.value(value, tags))
     }
 
-    /// [`derived`] where the sink writes those attributes, which only `datadog_out` does; empty
-    /// for every other sink.
-    fn derived(self, rec: &Rec) -> Vec<(&'static str, &'static str, String)> {
-        if self == Spelling::Datadog {
-            derived(rec)
-        } else {
-            Vec::new()
+    /// The attributes the sink writes from `rec`'s own fields, which its pair decoder reads back
+    /// as attributes `rec` lacks ([`Derived`]); empty for a sink that writes none:
+    /// [`datadog_derived`], [`syslog_derived`], and [`splunk::derived`].
+    fn derived(self, rec: &Rec) -> Vec<Derived> {
+        match self {
+            Spelling::Datadog => datadog_derived(rec),
+            Spelling::Syslog { rfc3164, facility, .. } => {
+                syslog_derived(rec, rfc3164, facility, self.sd_id())
+            }
+            Spelling::Splunk => splunk::derived(rec),
+            _ => Vec::new(),
         }
     }
 
@@ -549,6 +775,13 @@ impl Spelling {
                 logit_core::time::parse_rfc3339_to_nanos(s)
                     .map_or_else(|_| s.clone(), |nanos| nanos.to_string())
             }
+            // `intValue` is signed, so a `u64` above `i64::MAX` leaves as a double.
+            (Spelling::Otlp, Value::Number(n))
+                if tags.contains("=u64") && n.as_u64().is_some_and(|u| u > i64::MAX as u64) =>
+            {
+                let wide = n.as_u64().unwrap_or_default() as f64;
+                Value::from(wide).to_string()
+            }
             (Spelling::Statsd { .. }, Value::String(s)) => {
                 substituted(s, |c| c != ':' && is_forbidden_in_name(c))
             }
@@ -557,10 +790,98 @@ impl Spelling {
     }
 }
 
+/// An attribute a sink writes from a record's own fields: its `attributes` field row, its key,
+/// and its value as text. A `None` row is an attribute used only for pairing, whose field another
+/// row compares.
+type Derived = (Option<&'static str>, &'static str, String);
+
+/// The `attributes` field rows `rec` reaches for what any sink derives ([`Spelling::derived`]):
+/// the union of every sink's rows, chosen from the record alone, so every sink that compares the
+/// record reaches them, and one that derives nothing for a row reads it `exact`.
+fn derived_rows(rec: &Rec) -> Vec<&'static str> {
+    let mut rows = Vec::new();
+    // Under RFC 5424 `syslog_out` derives every row any of its configs does. Under RFC 3164 a log
+    // with no TAG derives no `no_host`, since syslog_in reads its HOSTNAME into MSG, and that
+    // row's cell there reads it `exact`.
+    let syslog = Spelling::Syslog { rfc3164: false, facility: 0, structured_data: None };
+    for spelling in [Spelling::Datadog, syslog, Spelling::Splunk] {
+        for (row, _, _) in spelling.derived(rec) {
+            if let Some(row) = row.filter(|row| !rows.contains(row)) {
+                rows.push(row);
+            }
+        }
+    }
+    rows
+}
+
+/// The attributes `syslog_out` writes for log `rec` from its own fields or the sink's config,
+/// which `syslog_in` reads back as attributes `rec` lacks (`crates/logit-outputs/src/syslog.rs`'s
+/// "Header-field precedence"):
+///
+/// - `syslog_facility`: the configured facility, on a log with no `syslog.facility`;
+/// - `no_host`: the run's hostname, on a log that carries no host, where `syslog_in` reads it back
+///   as HOSTNAME;
+/// - for pairing only, the `syslog.timestamp` written from `event.timestamp` on a log with none,
+///   which `log/timestamp` compares, under RFC 3164 a `syslog.tag` and PROCID `syslog_in` reads
+///   from the message's first token, and under the `sd_id` opt-in the `syslog.sd` holding the
+///   opt-in element on a log with none.
+fn syslog_derived(
+    rec: &Rec,
+    rfc3164: bool,
+    facility: u8,
+    sd_id: Option<&'static str>,
+) -> Vec<Derived> {
+    if rec.kind != "log" {
+        return Vec::new();
+    }
+    let Some(read) = syslog::read(rec, rfc3164) else { return Vec::new() };
+    let mut out = Vec::new();
+    if !rec.attributes.contains_key(syslog::FACILITY) {
+        let written = logit_outputs::syslog::wire_facility(&logit_core::AttrMap::new(), facility);
+        out.push((Some("syslog_facility"), syslog::FACILITY, written.to_string()));
+    }
+    if !syslog::carries_host(rec) {
+        if let Some(host) = &read.host {
+            out.push((Some("no_host"), logit_core::attrs::HOST_NAME, host.clone()));
+        }
+    }
+    if !rec.attributes.contains_key(syslog::TIMESTAMP) {
+        if let Some((written, _)) = syslog::written_timestamp(rec, rfc3164) {
+            out.push((None, syslog::TIMESTAMP, text(&written)));
+        }
+    }
+    if sd_id.is_some() && !rec.attributes.contains_key(syslog::SD) {
+        if let Some(sd) = syslog::read_sd(rec, sd_id) {
+            out.push((None, syslog::SD, text(&sd)));
+        }
+    }
+    if !read.tag_from_attribute {
+        if let Some(tag) = &read.tag {
+            out.push((None, syslog::TAG, tag.clone()));
+            if let Some(pid) = &read.pid {
+                out.push((None, syslog::pid_key(pid), pid.clone()));
+            }
+        }
+    }
+    out
+}
+
+/// `value` as `format: json` writes it, so a `Bytes` value is its `b"..."` text.
+fn json_value(value: logit_core::Value) -> Value {
+    let mut attributes = logit_core::AttrMap::new();
+    attributes.insert("v", value);
+    let batch = EventBatch {
+        resource: std::sync::Arc::default(),
+        scope: None,
+        events: vec![logit_core::Event::empty(0, attributes)],
+    };
+    let mut line = String::new();
+    render_ndjson(&mut line, &batch);
+    serde_json::from_str::<Value>(&line).map_or(Value::Null, |line| line["attributes"]["v"].clone())
+}
+
 /// The attributes `datadog_out` writes from `rec`'s own fields, which `datadog_in` reads back as
-/// attributes `rec` lacks: each one's `attributes` field row, key, and value as text. Every sink
-/// that compares the record reaches the rows, chosen from the record alone; only
-/// [`Spelling::derived`] predicts the values (`logit_proto::datadog`'s encode tables):
+/// attributes `rec` lacks (`logit_proto::datadog`'s encode tables):
 ///
 /// - `no_host`: the run's hostname, on a record that carries no host and no hostless mark (the
 ///   encoder's default host), under the key `datadog_in` reads the route's host back as
@@ -572,8 +893,10 @@ impl Spelling {
 ///   has no `span.kind` attribute;
 /// - `trace_id_high`: `_dd.p.tid` as the trace id's high 64 bits in hex, on the first span of its
 ///   trace in the batch, when the high half is nonzero and no span of the trace carries one
-///   ([`Rec::tid_due`]).
-fn derived(rec: &Rec) -> Vec<(&'static str, &'static str, String)> {
+///   ([`Rec::tid_due`]);
+/// - for pairing only, `trace_id` and `span_id` as the hex ids of a log's `trace`, on a log with
+///   no attribute of either name; `log/trace` compares them.
+fn datadog_derived(rec: &Rec) -> Vec<Derived> {
     // An event with no metric, log, or span takes no `datadog_out` route.
     if rec.kind == "event" {
         return Vec::new();
@@ -583,25 +906,41 @@ fn derived(rec: &Rec) -> Vec<(&'static str, &'static str, String)> {
     match datadog::Route::of(rec) {
         datadog::Route::Span => {
             if !datadog::carries_host(rec, datadog::Route::Span) {
-                out.push(("no_host", "host.name", super::HOSTNAME.to_string()));
+                out.push((Some("no_host"), "host.name", super::HOSTNAME.to_string()));
             }
             let kind = rec.body["kind"].as_str().unwrap_or("internal");
             if kind != "internal" && !has("span.kind") {
-                out.push(("span_kind", "span.kind", kind.to_string()));
+                out.push((Some("span_kind"), "span.kind", kind.to_string()));
             }
             if rec.tid_due {
                 let high = rec.body["trace_id"].as_str().and_then(|t| t.get(..16)).unwrap_or("");
-                out.push(("trace_id_high", "_dd.p.tid", high.to_string()));
+                out.push((Some("trace_id_high"), "_dd.p.tid", high.to_string()));
             }
         }
         route => {
             if !datadog::carries_host(rec, route) {
-                out.push(("no_host", "host.name", super::HOSTNAME.to_string()));
+                out.push((Some("no_host"), "host.name", super::HOSTNAME.to_string()));
             }
             let severity = rec.body["severity"].as_str();
             if let (datadog::Route::Log, Some(severity)) = (route, severity) {
                 if !has("status") {
-                    out.push(("log_status", "status", severity.to_string()));
+                    out.push((Some("log_status"), "status", severity.to_string()));
+                }
+            }
+            // A `ddtags` the encoder writes where the log had none, for pairing only: the
+            // attribute rows of the keys it holds judge it.
+            if route == datadog::Route::Log && !has("ddtags") {
+                if let Some(Some(ddtags)) = datadog::log_ddtags(rec) {
+                    out.push((None, "ddtags", ddtags));
+                }
+            }
+            // An attribute of either name suppresses both ids, so a relayed Datadog log leaves
+            // with its own.
+            if route == datadog::Route::Log && !has("trace_id") && !has("span_id") {
+                for key in ["trace_id", "span_id"] {
+                    if let Some(id) = rec.body[key].as_str() {
+                        out.push((None, key, id.to_string()));
+                    }
                 }
             }
         }
@@ -788,6 +1127,85 @@ mod datadog {
         matches!(Route::of(rec), Route::Metric | Route::Event | Route::Check)
     }
 
+    /// The `ddtags` `datadog_in` reads back from a log whose string `datadog_out` rewrites, `None`
+    /// for one it leaves as it is (`logit_proto::datadog::logs`'s `encode_log`): a log with a
+    /// non-empty `Str` `deployment.environment.name`, `service.version`, or `container.id`, beside
+    /// a `ddtags` that is text or absent. The encoder drops the string's empty entries and each
+    /// entry naming one of those keys, and appends `env:`, `version:`, and `container_id:` from
+    /// them. The decoder then lifts the `env:`, `version:`, and `service:` entries of a key with a
+    /// winner (`lift_service_identity`) and keeps the rest, `container_id:` among them; the inner
+    /// `None` is a string emptied by the lift, which reads back as no `ddtags`.
+    pub(super) fn log_ddtags(rec: &Rec) -> Option<Option<String>> {
+        use logit_core::attrs::SERVICE_NAME;
+        use logit_proto::datadog::tags::split_joined;
+        if Route::of(rec) != Route::Log {
+            return None;
+        }
+        let entries = log_ddtags_appended(rec);
+        let ddtags = match get(rec, "ddtags") {
+            None => "",
+            Some(Value::String(ddtags)) => ddtags.as_str(),
+            Some(_) => return None,
+        };
+        if entries.is_empty() {
+            return None;
+        }
+        let key_of = |tag: &str| tag.split(':').next().unwrap_or("").to_string();
+        let written: Vec<String> = split_joined(ddtags)
+            .filter(|tag| !entries.iter().any(|(entry, _)| key_of(tag) == *entry))
+            .map(str::to_string)
+            .chain(entries.iter().map(|(tag, value)| format!("{tag}:{value}")))
+            .collect();
+        // The decoder's winners: the `service` field (the log's `service.name`, else its
+        // `service`) for `service`, and for every lifted key the first entry with a value.
+        let service_field = get(rec, SERVICE_NAME)
+            .filter(|v| v.as_str() != Some(""))
+            .or_else(|| get(rec, "service"))
+            .is_some_and(|v| v.as_str() != Some(""));
+        let won = |key: &str| {
+            (key == "service" && service_field)
+                || written
+                    .iter()
+                    .any(|tag| tag.split_once(':').is_some_and(|(k, v)| k == key && !v.is_empty()))
+        };
+        let rest: Vec<&str> = written
+            .iter()
+            .map(String::as_str)
+            .filter(|tag| {
+                let key = key_of(tag);
+                !(matches!(key.as_str(), "env" | "version" | "service") && won(&key))
+            })
+            .collect();
+        Some((!rest.is_empty()).then(|| rest.join(",")))
+    }
+
+    /// The `env:`, `version:`, and `container_id:` entries `datadog_out` appends to a log's
+    /// `ddtags`, as `(tag, value)`: one per non-empty `Str` `deployment.environment.name`,
+    /// `service.version`, and `container.id`.
+    pub(super) fn log_ddtags_appended(rec: &Rec) -> Vec<(&'static str, &str)> {
+        use logit_core::attrs::{CONTAINER_ID, DEPLOYMENT_ENVIRONMENT_NAME, SERVICE_VERSION};
+        [
+            ("env", DEPLOYMENT_ENVIRONMENT_NAME),
+            ("version", SERVICE_VERSION),
+            ("container_id", CONTAINER_ID),
+        ]
+        .into_iter()
+        .filter_map(|(tag, key)| {
+            let value = get(rec, key)?.as_str().filter(|v| !v.is_empty())?;
+            Some((tag, value))
+        })
+        .collect()
+    }
+
+    /// Whether a log's `container.id` leaves inside its `ddtags` string, as a `container_id:`
+    /// entry `datadog_in` keeps there ([`log_ddtags`]), rather than as an attribute of its own.
+    pub(super) fn log_container_id_in_ddtags(rec: &Rec) -> bool {
+        let named = get(rec, logit_core::attrs::CONTAINER_ID)
+            .and_then(Value::as_str)
+            .is_some_and(|v| !v.is_empty());
+        named && log_ddtags(rec).is_some()
+    }
+
     /// Whether a log's `hostname` attribute, or its `service` attribute beside a `service.name`
     /// the encoder writes, is left off: it would collide with the wire's own field of that name.
     pub(super) fn reserved_log_key_is_omitted(rec: &Rec, key: &str) -> bool {
@@ -846,6 +1264,304 @@ mod datadog {
                     .is_some_and(|v| v.as_str().is_some_and(|h| !h.is_empty()))
                     || rec.resource.contains_key("_logit.datadog.agent.hostname")
             }
+        }
+    }
+}
+
+/// What `syslog_in` reads back from the message `syslog_out` writes for a log
+/// ([`Spelling::Syslog`]): the header fields and message through the encoder's own renderers
+/// (`logit_outputs::syslog`'s `wire_*` functions), and under RFC 3164 the decoder's rule for where
+/// the header ends (`logit_proto::syslog`'s "The RFC 3164 header"). The spelling assumes the
+/// sink's `hostname:` and `app_name:` are unset, as every flow leaves them: its HOSTNAME default is
+/// the run's hostname, and it writes no default APP-NAME.
+mod syslog {
+    use super::{model_attribute, model_log, Rec};
+    use logit_core::attrs::{HOST_NAME, PROCESS_PID};
+    use logit_core::time::{format_rfc3339_utc, parse_rfc3339_to_nanos};
+    use logit_core::AttrMap;
+    use logit_outputs::syslog::{
+        is_opt_in_param, is_valid_sd_name, wire_app_name, wire_hostname, wire_message, wire_msgid,
+        wire_procid, wire_structured_data, wire_timestamp, Format,
+    };
+    use logit_proto::syslog::is_tag_shaped;
+    use serde_json::{Map, Value};
+    use std::collections::BTreeMap;
+
+    pub(super) const FACILITY: &str = "syslog.facility";
+    pub(super) const TAG: &str = "syslog.tag";
+    pub(super) const PID: &str = "syslog.pid";
+    pub(super) const MSGID: &str = "syslog.msgid";
+    pub(super) const SD: &str = "syslog.sd";
+    pub(super) const TIMESTAMP: &str = "syslog.timestamp";
+    pub(super) const SEVERITY: &str = "_logit.syslog.severity";
+
+    /// One day in Unix nanoseconds.
+    const DAY: i64 = 86_400 * 1_000_000_000;
+
+    pub(super) fn format(rfc3164: bool) -> Format {
+        if rfc3164 {
+            Format::Rfc3164
+        } else {
+            Format::Rfc5424
+        }
+    }
+
+    /// `map`'s attributes back in the model, each through its type tags.
+    pub(super) fn model_attrs(
+        map: &Map<String, Value>,
+        types: &BTreeMap<String, String>,
+    ) -> AttrMap {
+        let mut attrs = AttrMap::new();
+        for (key, value) in map {
+            let tags = types.get(key).map(String::as_str).unwrap_or("");
+            if let Some(value) = model_attribute(value, tags) {
+                attrs.insert(key, value);
+            }
+        }
+        attrs
+    }
+
+    /// `rec`'s event attributes and its resource's, in the model.
+    pub(super) fn scopes(rec: &Rec) -> (AttrMap, AttrMap) {
+        (
+            model_attrs(&rec.attributes, &rec.attribute_types),
+            model_attrs(&rec.resource, &rec.resource_types),
+        )
+    }
+
+    /// The event's timestamp in Unix nanoseconds.
+    fn nanos(rec: &Rec) -> Option<i64> {
+        parse_rfc3339_to_nanos(&rec.timestamp).ok()
+    }
+
+    /// Whether `rec` carries a host the encoder writes as HOSTNAME: a non-empty string
+    /// `host.name` on the event or its resource.
+    pub(super) fn carries_host(rec: &Rec) -> bool {
+        let (attrs, resource) = scopes(rec);
+        wire_hostname(Format::Rfc5424, &attrs, &resource, None).is_some()
+    }
+
+    /// The `syslog.timestamp` `syslog_in` reads back for `rec` as `format: json` writes it, and
+    /// whether the encoder wrote it from `rec`'s own `syslog.timestamp` rather than from its
+    /// `event.timestamp`.
+    pub(super) fn written_timestamp(rec: &Rec, rfc3164: bool) -> Option<(Value, bool)> {
+        let (attrs, _) = scopes(rec);
+        let at = nanos(rec)?;
+        let format = format(rfc3164);
+        let text = wire_timestamp(format, &attrs, at);
+        // The attribute's instant doesn't move with the event's.
+        let from_attribute = text == wire_timestamp(format, &attrs, at + DAY);
+        let read = if text == "-" {
+            Value::Null
+        } else if rfc3164 {
+            Value::String(text)
+        } else {
+            Value::String(format_rfc3339_utc(parse_rfc3339_to_nanos(&text).ok()?))
+        };
+        Some((read, from_attribute))
+    }
+
+    /// Whether `token` is a canonical decimal PROCID, which `syslog_in` reads back as
+    /// `process.pid` rather than `syslog.pid`.
+    fn canonical_pid(token: &str) -> bool {
+        token.bytes().all(|b| b.is_ascii_digit())
+            && (token == "0" || !token.starts_with('0'))
+            && token.parse::<u64>().is_ok()
+    }
+
+    /// What `syslog_in` reads back from the header and message `syslog_out` writes for a log.
+    pub(super) struct Read {
+        /// HOSTNAME, read back as `host.name`.
+        pub host: Option<String>,
+        /// TAG or APP-NAME, read back as `syslog.tag`, and whether it's the input's `syslog.tag`.
+        pub tag: Option<String>,
+        pub tag_from_attribute: bool,
+        /// PROCID, read back as `process.pid` when canonical decimal, else as `syslog.pid`; and
+        /// whether it's the input's `process.pid` rather than its `syslog.pid`.
+        pub pid: Option<String>,
+        pub pid_from_process: bool,
+        /// MSG as `format: json` writes it.
+        pub message: logit_core::Value,
+        /// Whether MSG reads back other than written: under RFC 3164, a header token read into
+        /// the message, or the message's first token read as a TAG.
+        pub boundary_moved: bool,
+    }
+
+    pub(super) fn read(rec: &Rec, rfc3164: bool) -> Option<Read> {
+        let log = model_log(rec)?;
+        let (attrs, resource) = scopes(rec);
+        let format = format(rfc3164);
+        let host = wire_hostname(format, &attrs, &resource, Some(super::super::HOSTNAME));
+        let tag = wire_app_name(format, &attrs, None);
+        let pid = wire_procid(format, &attrs, &resource);
+        let mut without_pid = attrs.clone();
+        without_pid.remove(PID);
+        let pid_from_process = wire_procid(format, &without_pid, &resource).is_some();
+        let message = wire_message(&log.message);
+        if !rfc3164 {
+            return Some(Read {
+                host,
+                tag_from_attribute: tag.is_some(),
+                tag,
+                pid,
+                pid_from_process,
+                message: as_value(message),
+                boundary_moved: false,
+            });
+        }
+        // `<PRI>TIMESTAMP` then each token after one space, as `write_rfc3164_header` writes them,
+        // and MSG after one more when it isn't empty.
+        let mut tokens: Vec<String> = Vec::new();
+        tokens.extend(host.clone());
+        let tag_pid = tag.as_ref().map(|tag| match &pid {
+            Some(pid) => (format!("{tag}[{pid}]:"), true),
+            None => (format!("{tag}:"), false),
+        });
+        tokens.extend(tag_pid.as_ref().map(|(token, _)| token.clone()));
+        let mut after_ts = tokens.join(" ").into_bytes();
+        if !message.is_empty() {
+            if !after_ts.is_empty() {
+                after_ts.push(b' ');
+            }
+            after_ts.extend_from_slice(&message);
+        }
+        let split = |s: &[u8]| -> (Vec<u8>, Vec<u8>) {
+            match s.iter().position(|&b| b == b' ') {
+                Some(i) => (s[..i].to_vec(), s[i + 1..].to_vec()),
+                None => (s.to_vec(), Vec::new()),
+            }
+        };
+        let (first, after_first) = split(&after_ts);
+        let (read_host, read_tag, read_message) = if is_tag_shaped(&first) {
+            (None, Some(first), after_first)
+        } else {
+            let (second, after_second) = split(&after_first);
+            if is_tag_shaped(&second) {
+                (Some(first), Some(second), after_second)
+            } else {
+                (None, None, after_ts.clone())
+            }
+        };
+        let read_host =
+            read_host.filter(|h| !h.is_empty()).map(|h| String::from_utf8_lossy(&h).into_owned());
+        let (read_tag, read_pid) = match read_tag {
+            None => (None, None),
+            Some(token) => {
+                let body = String::from_utf8_lossy(&token[..token.len() - 1]).into_owned();
+                match body.rfind('[') {
+                    Some(open) => (
+                        Some(body[..open].to_string()),
+                        Some(body[open + 1..body.len() - 1].to_string()),
+                    ),
+                    None => (Some(body), None),
+                }
+            }
+        };
+        let written_tag = tag_pid.map(|(token, _)| token);
+        let tag_from_attribute =
+            read_tag.is_some() && written_tag.is_some() && read_tag.as_deref() == tag.as_deref();
+        Some(Read {
+            host: read_host,
+            tag: read_tag,
+            tag_from_attribute,
+            pid: read_pid,
+            pid_from_process,
+            boundary_moved: read_message != message,
+            message: as_value(read_message),
+        })
+    }
+
+    /// MSG's bytes as `syslog_in` reads them: a string when valid UTF-8, else bytes.
+    fn as_value(bytes: Vec<u8>) -> logit_core::Value {
+        match String::from_utf8(bytes) {
+            Ok(text) => logit_core::Value::str(&text),
+            Err(err) => logit_core::Value::Bytes(err.into_bytes().into()),
+        }
+    }
+
+    /// The `syslog.sd` `syslog_in` reads back for log `rec` under RFC 5424, as `format: json`
+    /// writes it, when the sink's opt-in SD-ID is `sd_id`: the encoder's STRUCTURED-DATA field
+    /// ([`wire_structured_data`]) through `syslog_in`'s decoder. `None` where it writes none.
+    pub(super) fn read_sd(rec: &Rec, sd_id: Option<&str>) -> Option<Value> {
+        let (attrs, _) = scopes(rec);
+        let (field, _) = wire_structured_data(&attrs, sd_id);
+        if field == "-" {
+            return None;
+        }
+        let line = format!("<14>1 - - - - - {field} m");
+        let mut decoder = logit_proto::syslog::SyslogDecoder::new(std::sync::Arc::default());
+        let mut events = Vec::new();
+        logit_proto::Decoder::decode_into(&mut decoder, bytes::Bytes::from(line), 0, &mut events)
+            .ok()?;
+        let sd = events.first()?.attributes.get(SD)?.clone();
+        Some(super::json_value(sd))
+    }
+
+    /// The attribute row an opt-in attribute `key` of log `rec` reaches in place of its value's
+    /// under the `sd_id` opt-in, where the encoder leaves it off, counted: `sd_id_collision` on a
+    /// log whose own `syslog.sd` holds an element under `sd_id`, and `sd_name_unsafe` for a key
+    /// that isn't an RFC 5424 SD-NAME; and uncounted, `sd_empty_array` for an empty `Array`, which
+    /// writes one PARAM per element and so none.
+    pub(super) fn opt_in_row(rec: &Rec, key: &str, sd_id: &str) -> Option<&'static str> {
+        if rec.kind != "log" || !is_opt_in_param(key) {
+            return None;
+        }
+        if rec.attributes.get(SD).and_then(|sd| sd.get(sd_id)).is_some() {
+            Some("sd_id_collision")
+        } else if !is_valid_sd_name(key) {
+            Some("sd_name_unsafe")
+        } else if rec.attributes.get(key).and_then(Value::as_array).is_some_and(Vec::is_empty) {
+            Some("sd_empty_array")
+        } else {
+            None
+        }
+    }
+
+    /// The key `syslog_in` reads a written PROCID back under.
+    pub(super) fn pid_key(pid: &str) -> &'static str {
+        if canonical_pid(pid) {
+            PROCESS_PID
+        } else {
+            PID
+        }
+    }
+
+    /// Attribute `key` of `rec` as `syslog_in` reads it back, as text; `None` where `syslog_out`
+    /// writes nothing for it. Only the header's attributes are written: `host.name`, `syslog.tag`,
+    /// `syslog.facility`, `syslog.msgid`, `syslog.sd`, `syslog.timestamp`, and the PROCID's
+    /// `process.pid` or `syslog.pid`. Under the `sd_id` opt-in, an opt-in attribute reads back
+    /// inside `syslog.sd`, never under its own key, and `syslog.sd` holds the opt-in element.
+    pub(super) fn value_for(
+        rec: &Rec,
+        key: &str,
+        value: &Value,
+        rfc3164: bool,
+        facility: u8,
+        sd_id: Option<&str>,
+    ) -> Option<String> {
+        let on_event = rec.attributes.get(key) == Some(value);
+        let read = read(rec, rfc3164)?;
+        if sd_id.is_some() && key == SD && on_event {
+            return read_sd(rec, sd_id).map(|sd| super::text(&sd));
+        }
+        match key {
+            HOST_NAME => read.host,
+            TAG if on_event && read.tag_from_attribute => read.tag,
+            PROCESS_PID if read.pid_from_process => read.pid,
+            PID if !read.pid_from_process => read.pid,
+            FACILITY if on_event => {
+                let (attrs, _) = scopes(rec);
+                Some(logit_outputs::syslog::wire_facility(&attrs, facility).to_string())
+            }
+            MSGID if on_event => {
+                let (attrs, _) = scopes(rec);
+                wire_msgid(format(rfc3164), &attrs)
+            }
+            SD if on_event && !rfc3164 && value.is_object() => Some(super::text(value)),
+            TIMESTAMP if on_event => {
+                written_timestamp(rec, rfc3164).map(|(read, _)| super::text(&read))
+            }
+            _ => None,
         }
     }
 }
@@ -926,6 +1642,253 @@ fn model_value(value: &Value, tags: &str, pointer: &str) -> logit_core::Value {
     }
 }
 
+/// A `format: json` attribute value as the model [`logit_core::Value`] it was written from, read
+/// back through `logit_proto::event_json` with its `types` entry `tags`, so a `Bytes` value keeps
+/// its bytes.
+fn model_attribute(value: &Value, tags: &str) -> Option<logit_core::Value> {
+    let types: Map<String, Value> = tags
+        .split(';')
+        .filter_map(|entry| entry.split_once('='))
+        .map(|(pointer, tag)| {
+            let below = pointer.strip_prefix('/').unwrap_or(pointer);
+            let pointer = if below.is_empty() {
+                "/attributes/v".to_string()
+            } else {
+                format!("/attributes/v/{below}")
+            };
+            (pointer, Value::String(tag.to_string()))
+        })
+        .collect();
+    let line = serde_json::json!({
+        "timestamp": "1970-01-01T00:00:00.000000000Z",
+        "attributes": {"v": value},
+        "types": types,
+    });
+    let batches = EventJsonDecoder::new().decode_batches(line.to_string().as_bytes()).ok()?;
+    let event = batches.into_iter().next()?.events.into_iter().next()?;
+    event.attributes.get("v").cloned()
+}
+
+/// What [`Spelling::Splunk`] reads of a log record: the envelope, `fields`, and message
+/// `splunk_hec_out` writes, through the codec's own flattening and JSON writer, as
+/// `splunk_hec_in` reads them back (`crates/logit-proto/src/splunk/logs.rs`'s tables).
+mod splunk {
+    use super::{model_log, syslog, text, Class, Derived, Rec};
+    use logit_core::attrs::{is_private, HOST_NAME};
+    use logit_core::interner::{intern, resolve};
+    use logit_core::trace::{parse_span_id, parse_trace_id};
+    use logit_core::{AttrMap, Value as Model};
+    use logit_proto::json::{flatten_into, write_value};
+    use logit_proto::otlp::logs::{severity_number, severity_text};
+    use logit_proto::splunk::{
+        ATTR_LOG_NAME, ATTR_SEVERITY_NUMBER, ATTR_SEVERITY_TEXT, ATTR_SPAN_ID, ATTR_TRACE_ID,
+        RESOURCE_ATTR_INDEX, RESOURCE_ATTR_SOURCE, RESOURCE_ATTR_SOURCETYPE,
+    };
+    use serde_json::Value;
+    use std::collections::BTreeMap;
+
+    /// The resource attributes the envelope's `source`, `sourcetype`, and `index` carry. Any
+    /// other `com.splunk.` key is an ordinary attribute, written into `fields`.
+    const ENVELOPE: [&str; 3] =
+        [RESOURCE_ATTR_SOURCE, RESOURCE_ATTR_SOURCETYPE, RESOURCE_ATTR_INDEX];
+
+    /// Whether resource attribute `key` is one of the envelope's carriers but `host`.
+    pub(super) fn is_envelope(key: &str) -> bool {
+        ENVELOPE.contains(&key)
+    }
+
+    /// One predicted attribute: the row of the field it's derived from, if any, and its value as
+    /// text.
+    type Predicted = (Option<&'static str>, String);
+
+    /// `value` as `splunk_hec_in` reads back the JSON `write_value` writes for it, as text.
+    fn written(value: &Model) -> String {
+        let mut json = Vec::new();
+        write_value(&mut json, value);
+        serde_json::from_slice::<Value>(&json).map(|read| text(&read)).unwrap_or_default()
+    }
+
+    /// The `host` the encoder takes from the event: a non-empty `Str` `host.name`, which then
+    /// isn't also a field.
+    fn event_host(attrs: &AttrMap) -> Option<&str> {
+        attrs.get(HOST_NAME).and_then(Model::as_str).filter(|host| !host.is_empty())
+    }
+
+    /// The `fields` object the encoder writes before a log's own fields: every non-carrier,
+    /// non-private resource attribute, then every event attribute but the host the envelope took,
+    /// flattened.
+    fn fields(attrs: &AttrMap, resource: &AttrMap) -> AttrMap {
+        let mut fields = AttrMap::new();
+        let carrier = |name: &str| name == HOST_NAME || is_envelope(name);
+        for (key, value) in resource.iter() {
+            let name = resolve(key);
+            if !carrier(name) && !is_private(name) {
+                flatten_into(name, value, &mut fields);
+            }
+        }
+        let consumed = event_host(attrs).is_some();
+        for (key, value) in attrs.iter() {
+            let name = resolve(key);
+            if !(consumed && name == HOST_NAME) && !is_private(name) {
+                flatten_into(name, value, &mut fields);
+            }
+        }
+        fields
+    }
+
+    /// Whether `splunk_hec_in` reads `fields`' `trace_id` and `span_id` into the log's `trace`,
+    /// consuming both: a valid `trace_id` with a valid or absent `span_id`.
+    fn trace_consumed(fields: &AttrMap) -> bool {
+        let trace = fields.get(ATTR_TRACE_ID).and_then(Model::as_str).and_then(parse_trace_id);
+        let span = match fields.get(ATTR_SPAN_ID) {
+            None => true,
+            Some(value) => value.as_str().and_then(parse_span_id).is_some(),
+        };
+        trace.is_some() && span
+    }
+
+    /// The public attributes `splunk_hec_in` reads back for `rec`, the resource's and the event's
+    /// together. The rows name what the encoder derives: `no_host` for the process hostname as
+    /// the `host`, read back on the resource, and `log_severity_fields` for the
+    /// `otel.log.severity.*` fields it writes from a log's `severity` where neither is an
+    /// attribute. A log's `otel.log.name` and a valid `trace_id` and `span_id` read back into its
+    /// own fields, so none of them is an attribute. A span's event attributes leave in its
+    /// `attributes` object unflattened, and its resource's in `fields`. `None` for an event the
+    /// encoder writes no object for.
+    fn predicted(rec: &Rec) -> Option<BTreeMap<String, Predicted>> {
+        let log = if rec.kind == "log" { Some(model_log(rec)?) } else { None };
+        let span = rec.kind == "span";
+        if log.is_none() && !span && !rec.is_metric() {
+            return None;
+        }
+        let (attrs, resource) = syslog::scopes(rec);
+        let mut out = BTreeMap::new();
+        let host = match (event_host(&attrs), resource.get(HOST_NAME)) {
+            (Some(host), _) => Some((None, host.to_string())),
+            (None, Some(value)) => value.as_str().map(|host| (None, host.to_string())),
+            (None, None) => Some((Some("no_host"), super::super::HOSTNAME.to_string())),
+        };
+        if let Some(host) = host {
+            out.insert(HOST_NAME.to_string(), host);
+        }
+        for key in ENVELOPE {
+            if let Some(value) = resource.get(key).and_then(Model::as_str) {
+                out.insert(key.to_string(), (None, value.to_string()));
+            }
+        }
+        let fields = if span {
+            let consumed = event_host(&attrs).is_some();
+            for (key, value) in attrs.iter() {
+                let name = resolve(key);
+                if !(consumed && name == HOST_NAME) && !is_private(name) {
+                    out.insert(name.to_string(), (None, written(value)));
+                }
+            }
+            fields(&AttrMap::new(), &resource)
+        } else {
+            fields(&attrs, &resource)
+        };
+        let Some(log) = log else {
+            for (key, value) in fields.iter() {
+                out.insert(resolve(key).to_string(), (None, written(value)));
+            }
+            return Some(out);
+        };
+        let has = |key: &str| fields.get(key).is_some();
+        // An attribute of either name wins over the log's `trace`.
+        let consumed = if has(ATTR_TRACE_ID) || has(ATTR_SPAN_ID) {
+            trace_consumed(&fields)
+        } else {
+            log.trace.is_some()
+        };
+        for (key, value) in fields.iter() {
+            let name = resolve(key);
+            let named = name == ATTR_LOG_NAME && value.as_str().is_some_and(|n| !n.is_empty());
+            let trace = consumed && (name == ATTR_TRACE_ID || name == ATTR_SPAN_ID);
+            if !named && !trace {
+                out.insert(name.to_string(), (None, written(value)));
+            }
+        }
+        if let Some(severity) = log.severity {
+            if !has(ATTR_SEVERITY_TEXT) && !has(ATTR_SEVERITY_NUMBER) {
+                let row = Some("log_severity_fields");
+                let number = i64::from(severity_number(severity)).to_string();
+                out.insert(ATTR_SEVERITY_TEXT.to_string(), (row, severity_text(severity).into()));
+                out.insert(ATTR_SEVERITY_NUMBER.to_string(), (row, number));
+            }
+        }
+        Some(out)
+    }
+
+    /// [`predicted`]'s attributes, each as text; `None` where the encoder writes no object.
+    pub(super) fn read_back(rec: &Rec) -> Option<BTreeMap<String, String>> {
+        let predicted = predicted(rec)?;
+        Some(predicted.into_iter().map(|(key, (_, value))| (key, value)).collect())
+    }
+
+    /// The attributes `splunk_hec_out` writes for log `rec` that `splunk_hec_in` reads back under
+    /// a key `rec` has no attribute of: the derived `host` and severity fields, and, for pairing
+    /// only, a flattened map's dotted keys.
+    pub(super) fn derived(rec: &Rec) -> Vec<Derived> {
+        let Some(predicted) = predicted(rec) else { return Vec::new() };
+        predicted
+            .into_iter()
+            .filter(|(key, _)| !rec.attributes.contains_key(key) && !rec.resource.contains_key(key))
+            .map(|(key, (row, value))| (row, resolve(intern(&key)), value))
+            .collect()
+    }
+
+    /// The message `splunk_hec_in` reads back where the encoder rewrites it: a `Bytes` one as
+    /// lossy UTF-8 and a `Timestamp` one as its RFC 3339 text, each a string.
+    pub(super) fn message(rec: &Rec) -> Option<String> {
+        let log = model_log(rec)?;
+        match &log.message {
+            Model::Bytes(bytes) => Some(String::from_utf8_lossy(bytes).into_owned()),
+            Model::Timestamp(ns) => Some(logit_core::format_rfc3339_utc(*ns)),
+            _ => None,
+        }
+    }
+
+    /// What log `input`'s attribute `key` reads back as in `out` where `splunk_hec_out` doesn't
+    /// write it under its own key, else `None` for the ordinary comparison: a map flattened to
+    /// dotted keys is `normalized` when every one of them reads back as written; an
+    /// `otel.log.name`, `trace_id`, or `span_id` the decoder reads into the log's own fields is
+    /// `normalized` when that field holds it.
+    pub(super) fn observe_attribute(
+        input: &Rec,
+        out: &Rec,
+        key: &str,
+        resource: bool,
+    ) -> Option<Class> {
+        let (attrs, resource_attrs) = syslog::scopes(input);
+        let want = if resource { resource_attrs.get(key)? } else { attrs.get(key)? };
+        if matches!(want, Model::Map(_)) {
+            let mut flat = AttrMap::new();
+            flatten_into(key, want, &mut flat);
+            // An empty map has no leaf, and is left off.
+            let found = flat.iter().all(|(k, v)| {
+                let k = resolve(k);
+                let read = out.attributes.get(k).or(out.resource.get(k));
+                read.is_some_and(|read| text(read) == written(v))
+            });
+            return Some(if found { Class::Normalized } else { Class::Lost });
+        }
+        if resource {
+            return None;
+        }
+        let fields = fields(&attrs, &resource_attrs);
+        let field = match key {
+            ATTR_LOG_NAME if want.as_str().is_some_and(|n| !n.is_empty()) => "event_name",
+            ATTR_TRACE_ID if trace_consumed(&fields) => "trace_id",
+            ATTR_SPAN_ID if trace_consumed(&fields) => "span_id",
+            _ => return None,
+        };
+        let held = out.body.get(field).and_then(Value::as_str);
+        let same = held.zip(want.as_str()).is_some_and(|(a, b)| a.eq_ignore_ascii_case(b));
+        Some(if same { Class::Normalized } else { Class::Lost })
+    }
+}
+
 /// RFC 6901's unescaping of one pointer token.
 fn unescape(token: &str) -> String {
     token.replace("~1", "/").replace("~0", "~")
@@ -973,11 +1936,13 @@ fn batch_records(batch: &EventBatch) -> Vec<Rec> {
         let resource_types = tagged("/resource/attributes/");
         let beside_metrics = event["metrics"].as_array().is_some_and(|m| !m.is_empty());
         let scope = event.get("scope").cloned();
+        let beside_log = event.get("log").is_some_and(|l| !l.is_null());
         let rec = |kind: String, name: String, body: Value, types| Rec {
             kind,
             name,
             body,
             beside_metrics,
+            beside_log,
             types,
             attributes: attributes.clone(),
             attribute_types: attribute_types.clone(),
@@ -1059,7 +2024,7 @@ fn pair(ins: &[Rec], outs: &[Rec], spelling: Spelling) -> Pairing {
             .collect();
         let candidates = |i: usize, used: &[bool]| -> Vec<usize> {
             let input = &ins[i];
-            let scored: Vec<(usize, u8)> = outs
+            let mut scored: Vec<(usize, u8)> = outs
                 .iter()
                 .enumerate()
                 .filter(|(o, out)| {
@@ -1068,6 +2033,14 @@ fn pair(ins: &[Rec], outs: &[Rec], spelling: Spelling) -> Pairing {
                 .map(|(o, out)| (o, score(input, out, spelling)))
                 .filter(|(_, s)| *s > 0)
                 .collect();
+            // Logs of one message pair by their time, so a log's time row compares it with its
+            // own read-back: the same instant first, then the same millisecond.
+            if input.kind == "log" {
+                let millis = |rec: &Rec| rec.timestamp.get(..23).map(str::to_string);
+                scored.sort_by_key(|(o, _)| {
+                    (outs[*o].timestamp != input.timestamp, millis(&outs[*o]) != millis(input))
+                });
+            }
             let best = scored.iter().map(|(_, s)| *s).max().unwrap_or(0);
             scored.into_iter().filter(|(_, s)| *s == best).map(|(o, _)| o).collect()
         };
@@ -1207,7 +2180,9 @@ fn same_value(a: &Rec, b: &Rec) -> bool {
     match a.kind.as_str() {
         "sum" | "gauge" => same_number(&a.body["value"], &b.body["value"]),
         "gauge_delta" => same_number(&a.body["delta"], &b.body["delta"]),
-        "log" => a.body["message"] == b.body["message"],
+        // A log pairs by its message, respelled where the sink respells it; its field rows
+        // compare the rest.
+        "log" => true,
         // A histogram whose last bound is finite gains an empty `+Inf` bucket on a wire that
         // states the total as one (Prometheus) or requires an overflow count (OTLP).
         "histogram" => {
@@ -1360,6 +2335,10 @@ fn kind_features(rec: &Rec) -> Vec<Option<String>> {
         }
         "exponential_histogram" | "summary" => vec![Some(temporality())],
         "log" | "span" if rec.beside_metrics => vec![Some("beside_metrics".to_string())],
+        "span" if rec.beside_log && datadog::otel_only(rec) => {
+            vec![Some("beside_log".to_string()), Some("no_wire_form".to_string())]
+        }
+        "span" if rec.beside_log => vec![Some("beside_log".to_string())],
         "span" if datadog::otel_only(rec) => {
             vec![Some("alone".to_string()), Some("no_wire_form".to_string())]
         }
@@ -1408,6 +2387,48 @@ fn model_record(rec: &Rec) -> Option<logit_core::MetricRecord> {
     let line = serde_json::json!({"timestamp": rec.timestamp, "metrics": [rec.body]});
     let batches = EventJsonDecoder::new().decode_batches(line.to_string().as_bytes()).ok()?;
     batches.into_iter().next()?.events.into_iter().next()?.metrics.into_iter().next()
+}
+
+/// `rec`'s log record in the model, read back from its `format: json` body and type tags.
+fn model_log(rec: &Rec) -> Option<logit_core::LogRecord> {
+    let types: Map<String, Value> = rec
+        .types
+        .iter()
+        .map(|(pointer, tag)| (format!("/log{pointer}"), Value::String(tag.clone())))
+        .collect();
+    let line = serde_json::json!({"timestamp": rec.timestamp, "log": rec.body, "types": types});
+    let batches = EventJsonDecoder::new().decode_batches(line.to_string().as_bytes()).ok()?;
+    batches.into_iter().next()?.events.into_iter().next()?.log
+}
+
+/// The `log` message features a log reaches beside its kind's row, or beside metrics beside
+/// `log/beside_metrics`: `message_unsafe` when the sink rewrites its message ([`Spelling::log_message`]),
+/// `structured_message` for a `Map` or `Array` message, `bytes_message` for a `Bytes` one, and
+/// `blank_message` for an empty message or none.
+fn log_features(rec: &Rec, spelling: Spelling) -> Vec<&'static str> {
+    let mut features = Vec::new();
+    if rec.kind != "log" {
+        return features;
+    }
+    let message = &rec.body["message"];
+    if spelling.rendered_message(rec).is_some_and(|m| *message != Value::String(m)) {
+        features.push("message_unsafe");
+    }
+    if let Spelling::Syslog { rfc3164: true, .. } = spelling {
+        if syslog::read(rec, true).is_some_and(|read| read.boundary_moved) {
+            features.push("header_in_message");
+        }
+    }
+    if message.is_object() || message.is_array() {
+        features.push("structured_message");
+    }
+    if rec.types.get("/message").is_some_and(|tag| tag == "bytes") {
+        features.push("bytes_message");
+    }
+    if message.is_null() || *message == "" {
+        features.push("blank_message");
+    }
+    features
 }
 
 /// The record-level `record` features `rec` reaches.
@@ -1515,12 +2536,24 @@ fn moved_apart(pairing: &Pairing, i: usize, j: usize, outs: &[Rec]) -> bool {
 enum Field {
     /// A key of the metric object.
     Body(&'static str),
+    /// A key of the log object: `exact` when the read-back holds the same value, `normalized`
+    /// when it holds another, `lost` when it holds none. A body format has no changed reading: a
+    /// read-back format other than the input's is the pair decoder's default standing in for a
+    /// format the wire has no slot for, so it reads `lost`. At `datadog_out`, a trace or span id
+    /// read back as the attribute of its name instead reads `normalized`.
+    LogBody(&'static str),
+    /// A key of the log object the input doesn't set: `exact` when the read-back sets none
+    /// either, `normalized` when the sink stamped one.
+    LogUnset(&'static str),
+    /// `event.timestamp`: `exact` read back the same, else `normalized`, a timestamp written at
+    /// the sink's precision. A receipt time (`receipt`) read back outside its second is `lost`.
+    Timestamp { receipt: bool },
     /// An event attribute, or a resource attribute.
     Attribute { key: String, resource: bool },
     /// The batch's scope.
     Scope,
-    /// An attribute `datadog_out` derives from the record's own fields ([`derived`]).
-    Derived { key: &'static str, value: String },
+    /// An attribute a sink derives from the record's own fields, by its row ([`derived_rows`]).
+    Derived { feature: &'static str },
     /// A `samples` record's rate below 1 that rounds to weight 1 ([`unweighted_rate`]).
     SampleRate,
 }
@@ -1543,8 +2576,19 @@ fn unweighted_rate(rec: &Rec) -> bool {
         && weight(rec) == 1
 }
 
-/// The field rows `rec` reaches, for a sink of `protocol`.
+/// The field rows `rec` reaches, for a sink of `protocol` with no `structured_data:` opt-in.
 fn field_rows(rec: &Rec, protocol: &str) -> Vec<(String, Option<String>, Field)> {
+    field_rows_under(rec, protocol, None)
+}
+
+/// [`field_rows`] at a sink whose spelling's opt-in SD-ID is `sd_id` ([`Spelling::sd_id`]): an
+/// opt-in attribute the encoder leaves off reaches [`syslog::opt_in_row`]'s row in place of its
+/// value's.
+fn field_rows_under(
+    rec: &Rec,
+    protocol: &str,
+    sd_id: Option<&str>,
+) -> Vec<(String, Option<String>, Field)> {
     let mut rows = Vec::new();
     if rec.is_metric() {
         for key in mapping::RECORD_FIELDS {
@@ -1575,6 +2619,50 @@ fn field_rows(rec: &Rec, protocol: &str) -> Vec<(String, Option<String>, Field)>
             }
         }
     }
+    if rec.kind == "log" {
+        let has = |key: &str| rec.body.get(key).is_some();
+        let mut push = |feature: &str, field: Field| {
+            rows.push(("log".to_string(), Some(feature.to_string()), field));
+        };
+        if has("severity") {
+            push("severity", Field::LogBody("severity"));
+        } else {
+            push("severity_unset", Field::LogUnset("severity"));
+        }
+        push("body_format", Field::LogBody("format"));
+        if has("event_name") {
+            push("event_name", Field::LogBody("event_name"));
+        }
+        if has("observed_timestamp") {
+            push("observed_timestamp", Field::LogBody("observed_timestamp"));
+        } else {
+            push("observed_timestamp_unset", Field::LogUnset("observed_timestamp"));
+        }
+        if has("trace_id") {
+            // `datadog_out` and `splunk_hec_out` write a trace under these two attribute names,
+            // and write neither id when an attribute holds one.
+            let beside = ["trace_id", "span_id"].iter().any(|k| rec.attributes.contains_key(*k));
+            let (ids, flags) = if beside {
+                ("trace_beside_id_attribute", "trace_beside_id_attribute")
+            } else {
+                ("trace", "trace_flags")
+            };
+            push(ids, Field::LogBody("trace_id"));
+            if has("span_id") {
+                push(ids, Field::LogBody("span_id"));
+            }
+            push(flags, Field::LogBody("trace_flags"));
+        } else {
+            push("trace_unset", Field::LogUnset("trace_id"));
+        }
+        if has("dropped_attributes_count") {
+            push("dropped_attributes_count", Field::LogBody("dropped_attributes_count"));
+        }
+        let receipt = rec.attributes.contains_key("syslog.timestamp")
+            || rec.resource.contains_key("syslog.timestamp");
+        let feature = if receipt { "receipt_timestamp" } else { "timestamp" };
+        push(feature, Field::Timestamp { receipt });
+    }
     let own = format!("_logit.{protocol}.");
     // A `_logit.datadog.*` carrier on a log, a Datadog event, or a service check: `datadog_out`'s
     // routes for those skip one they have no field for without counting it, where its metrics
@@ -1595,6 +2683,12 @@ fn field_rows(rec: &Rec, protocol: &str) -> Vec<(String, Option<String>, Field)>
             Some(interval_row(rec))
         } else if key == ATTR_TARGET {
             Some("prometheus_target")
+        } else if key.starts_with("_logit.otel.severity_") {
+            // OTLP's raw severity, which `Severity` holds only at band resolution.
+            Some("severity_carrier_otel")
+        } else if key == syslog::SEVERITY {
+            // syslog's PRI severity, which `Severity` holds only at band resolution.
+            Some("severity_carrier_syslog")
         } else if key.starts_with("_logit.datadog.") && json_route {
             Some("datadog_carrier_log")
         } else if key.starts_with(&own) || (protocol == "influxdb" && is_field(key)) {
@@ -1605,6 +2699,23 @@ fn field_rows(rec: &Rec, protocol: &str) -> Vec<(String, Option<String>, Field)>
             Some("foreign_carrier")
         } else {
             None
+        }
+    };
+    // A log's own attribute `syslog_out` writes as a header field. On the resource it's a
+    // resource attribute, which the header reads back from the event.
+    let header = |key: &str| {
+        if rec.kind != "log" {
+            return None;
+        }
+        match key {
+            syslog::FACILITY | syslog::TAG | syslog::PID | logit_core::attrs::PROCESS_PID => {
+                Some("syslog_header")
+            }
+            syslog::MSGID => Some("syslog_msgid"),
+            syslog::SD => Some("syslog_sd"),
+            syslog::TIMESTAMP => Some("syslog_timestamp"),
+            logit_core::attrs::HOST_NAME => Some("host_name"),
+            _ => None,
         }
     };
     // A host attribute a sink leaves off for the record's own host: `statsd_out`'s `host` beside
@@ -1646,6 +2757,10 @@ fn field_rows(rec: &Rec, protocol: &str) -> Vec<(String, Option<String>, Field)>
         let tags = rec.attribute_types.get(key).map(String::as_str).unwrap_or("");
         let feature = if let Some(feature) = carrier(key, value) {
             feature
+        } else if let Some(feature) = header(key) {
+            feature
+        } else if let Some(feature) = sd_id.and_then(|sd_id| syslog::opt_in_row(rec, key, sd_id)) {
+            feature
         } else if let Some(feature) = outranked(key, value) {
             feature
         } else if let Some(feature) = service(key, value) {
@@ -1668,16 +2783,18 @@ fn field_rows(rec: &Rec, protocol: &str) -> Vec<(String, Option<String>, Field)>
         rows.push(("attributes".to_string(), Some(feature.to_string()), field));
     }
     for (key, value) in &rec.resource {
-        let feature =
-            carrier(key, value).or_else(|| outranked(key, value)).unwrap_or("resource_attribute");
+        let feature = carrier(key, value)
+            .or_else(|| outranked(key, value))
+            .or_else(|| splunk::is_envelope(key).then_some("splunk_envelope"))
+            .unwrap_or("resource_attribute");
         let field = Field::Attribute { key: key.clone(), resource: true };
         rows.push(("attributes".to_string(), Some(feature.to_string()), field));
     }
     if rec.scope.is_some() {
         rows.push(("attributes".to_string(), Some("scope".to_string()), Field::Scope));
     }
-    for (feature, key, value) in derived(rec) {
-        let field = Field::Derived { key, value };
+    for feature in derived_rows(rec) {
+        let field = Field::Derived { feature };
         rows.push(("attributes".to_string(), Some(feature.to_string()), field));
     }
     rows
@@ -1691,24 +2808,82 @@ fn observe_field(field: &Field, input: &Rec, out: &Rec, spelling: Spelling) -> C
             Some(_) => Class::Normalized,
             None => Class::Lost,
         },
-        // A sink that derives none reads back only the record's own attributes under the key,
-        // such as `statsd_out`'s `host` read back as `host.name`.
-        Field::Derived { .. } if spelling.derived(input).is_empty() => Class::Exact,
         // An attribute the input lacks, read back with the value derived for it, is the sink's
         // rewrite of a field the record already holds.
-        Field::Derived { key, value } => {
-            // A span's derived host is its tracer payload's, on the resource, ahead of any
-            // `host.name` span tag; every other derived field is the record's own.
-            let span_host =
-                *key == "host.name" && datadog::Route::of(input) == datadog::Route::Span;
-            let read = if span_host {
-                out.resource.get(*key).or(out.attributes.get(*key))
+        Field::Derived { feature } => {
+            // A sink that derives nothing for the row reads back only the record's own
+            // attributes under the key, such as `statsd_out`'s `host` read back as `host.name`.
+            // A row may derive several attributes, such as `splunk_hec_out`'s two severity
+            // fields; each must read back with its value.
+            let entries: Vec<Derived> = spelling
+                .derived(input)
+                .into_iter()
+                .filter(|(row, _, _)| *row == Some(*feature))
+                .collect();
+            if entries.is_empty() {
+                return Class::Exact;
+            }
+            let found = entries.iter().all(|(_, key, value)| {
+                // A span's derived host is its tracer payload's, on the resource, ahead of any
+                // `host.name` span tag; every other derived field is the record's own.
+                let span_host =
+                    *key == "host.name" && datadog::Route::of(input) == datadog::Route::Span;
+                let read = if span_host {
+                    out.resource.get(*key).or(out.attributes.get(*key))
+                } else {
+                    out.attributes.get(*key).or(out.resource.get(*key))
+                };
+                read.is_some_and(|read| text(read) == *value)
+            });
+            if found {
+                Class::Normalized
             } else {
-                out.attributes.get(*key).or(out.resource.get(*key))
-            };
-            match read {
-                Some(read) if text(read) == *value => Class::Normalized,
+                Class::Lost
+            }
+        }
+        Field::LogBody(key) => match out.body.get(*key) {
+            Some(value) if *value == input.body[*key] => Class::Exact,
+            Some(_) if *key == "format" => Class::Lost,
+            Some(_) => Class::Normalized,
+            None if spelling == Spelling::Datadog
+                && matches!(*key, "trace_id" | "span_id")
+                && out.attributes.get(*key) == Some(&input.body[*key]) =>
+            {
+                Class::Normalized
+            }
+            None => Class::Lost,
+        },
+        Field::LogUnset(key) => match out.body.get(*key) {
+            Some(_) => Class::Normalized,
+            None => Class::Exact,
+        },
+        // `syslog_in` stamps `event.timestamp` with its receipt time, so the instant written is the
+        // read-back `syslog.timestamp`, and it's the event's only where the encoder wrote that.
+        Field::Timestamp { .. } if matches!(spelling, Spelling::Syslog { .. }) => {
+            let Spelling::Syslog { rfc3164, .. } = spelling else { return Class::Lost };
+            match syslog::written_timestamp(input, rfc3164) {
+                Some((written, false))
+                    if out.attributes.get(syslog::TIMESTAMP) == Some(&written) =>
+                {
+                    if written == Value::String(input.timestamp.clone()) {
+                        Class::Exact
+                    } else {
+                        Class::Normalized
+                    }
+                }
                 _ => Class::Lost,
+            }
+        }
+        // A receipt time read back outside its own second is another instant, which no
+        // precision explains.
+        Field::Timestamp { receipt } => {
+            let second = |rec: &Rec| rec.timestamp.get(..19).map(str::to_string);
+            if out.timestamp == input.timestamp {
+                Class::Exact
+            } else if *receipt && second(out) != second(input) {
+                Class::Lost
+            } else {
+                Class::Normalized
             }
         }
         // A rate read back as 1 is the rate gone.
@@ -1727,6 +2902,33 @@ fn observe_field(field: &Field, input: &Rec, out: &Rec, spelling: Spelling) -> C
             None => Class::Lost,
         },
         Field::Attribute { key, resource } => {
+            // Under the opt-in, a log's opt-in attribute is a PARAM of the opt-in element, read
+            // back nested in `syslog.sd` as the PARAM-VALUE text, where the encoder wrote it.
+            if let Some(sd_id) = spelling.sd_id() {
+                if !*resource && input.kind == "log" && logit_outputs::syslog::is_opt_in_param(key)
+                {
+                    // On a collision, the element under `sd_id` is the log's own.
+                    if syslog::opt_in_row(input, key, sd_id) == Some("sd_id_collision") {
+                        return Class::Lost;
+                    }
+                    // The encoder writes a `Bytes` PARAM-VALUE as its length, `<N bytes>`.
+                    let tags = input.attribute_types.get(key).map(String::as_str).unwrap_or("");
+                    if tags.contains("=bytes") {
+                        return Class::Lost;
+                    }
+                    let param = |rec: Option<&Value>| rec?.get(sd_id)?.get(key).cloned();
+                    let want = param(syslog::read_sd(input, Some(sd_id)).as_ref());
+                    return match param(out.attributes.get(syslog::SD)) {
+                        Some(read) if Some(&read) == want.as_ref() => Class::Normalized,
+                        _ => Class::Lost,
+                    };
+                }
+            }
+            if spelling == Spelling::Splunk && input.kind == "log" {
+                if let Some(class) = splunk::observe_attribute(input, out, key, *resource) {
+                    return class;
+                }
+            }
             if matches!(spelling, Spelling::Prometheus) {
                 // A relay re-targets: a scrape of `prometheus_out` stamps its own URL, and the
                 // original target survives as the `instance` label.
@@ -1757,6 +2959,47 @@ fn observe_field(field: &Field, input: &Rec, out: &Rec, spelling: Spelling) -> C
             if outranked {
                 return Class::Lost;
             }
+            // A log's `container.id` reads back as a `container_id:` entry of its `ddtags`, and
+            // its `ddtags` as the encoder rewrites it: `exact` only where the string, less the
+            // entries the encoder appends, reads back as it came, since the rewrite drops empty
+            // entries.
+            if spelling == Spelling::Datadog && input.kind == "log" && !*resource {
+                let read = out.attributes.get("ddtags").and_then(Value::as_str);
+                if key == logit_core::attrs::CONTAINER_ID
+                    && datadog::log_container_id_in_ddtags(input)
+                {
+                    let entry = format!("container_id:{}", text(want));
+                    let found = read.is_some_and(|r| r.split(',').any(|tag| tag == entry));
+                    return if found { Class::Normalized } else { Class::Lost };
+                }
+                if key == "ddtags" {
+                    if let Some(written) = datadog::log_ddtags(input) {
+                        let appended: Vec<String> = datadog::log_ddtags_appended(input)
+                            .into_iter()
+                            .map(|(tag, value)| format!("{tag}:{value}"))
+                            .collect();
+                        let own = |ddtags: &str| -> String {
+                            let tags =
+                                ddtags.split(',').filter(|tag| !appended.iter().any(|a| a == tag));
+                            tags.collect::<Vec<_>>().join(",")
+                        };
+                        return match read {
+                            None if written.is_none() => Class::Normalized,
+                            None => Class::Lost,
+                            Some(_) if read != written.as_deref() => Class::Normalized,
+                            // A string that already ended with an appended entry reads back as
+                            // it came: the encoder drops that entry and appends it again.
+                            Some(read)
+                                if Some(read) == want.as_str()
+                                    || Some(own(read).as_str()) == want.as_str() =>
+                            {
+                                Class::Exact
+                            }
+                            Some(_) => Class::Normalized,
+                        };
+                    }
+                }
+            }
             // The v2 series route spells the hostless mark as a `host` resource with no name,
             // which `datadog_in` reads into `_logit.datadog.resources`.
             if spelling == Spelling::Datadog
@@ -1765,6 +3008,15 @@ fn observe_field(field: &Field, input: &Rec, out: &Rec, spelling: Spelling) -> C
                 && datadog::hostless_mark(out)
             {
                 return Class::Normalized;
+            }
+            // `syslog_out` writes `event.timestamp` where it can't render `syslog.timestamp`, so
+            // what reads back is another instant.
+            if let Spelling::Syslog { rfc3164, .. } = spelling {
+                if key == syslog::TIMESTAMP && !*resource {
+                    if let Some((_, false)) = syslog::written_timestamp(input, rfc3164) {
+                        return Class::Lost;
+                    }
+                }
             }
             // A key the sink respells reads back under its wire spelling, which is a change.
             let wire = spelling.key_for(key, input);
@@ -2076,7 +3328,7 @@ pub(super) fn check(
     for (i, input) in ins.iter().enumerate() {
         // A record reaches its field rows whether or not it's read back, and a sink may move a
         // field row's counter before it skips the record.
-        for (kind, feature, _) in field_rows(input, &protocol) {
+        for (kind, feature, _) in field_rows_under(input, &protocol, spelling.sd_id()) {
             if let Lookup::Cell(cell, _) =
                 mapping.lookup(&kind, feature.as_deref(), &sink, &traced.sink)
             {
@@ -2085,185 +3337,219 @@ pub(super) fn check(
         }
 
         // A log or span beside metrics is a field of its event (module doc).
-        if !input.is_metric() && input.beside_metrics {
-            let label = mapping::row_label(&input.kind, Some("beside_metrics"));
-            match mapping.lookup(&input.kind, Some("beside_metrics"), &sink, &traced.sink) {
-                Lookup::NoRow => failures.push(format!(
-                    "{here}: {} {:?} reaches row {label}, which mapping.yaml doesn't have",
-                    input.kind, input.name
-                )),
-                Lookup::NotSpecified => {
-                    ledger
-                        .unspecified
-                        .entry((sink.clone(), label))
-                        .or_default()
-                        .insert(here.clone());
-                }
-                Lookup::Cell(cell, index) => {
-                    named.extend(cell.counter.as_deref().and_then(|c| Series::parse(c).ok()));
-                    let seen = match pairing.seen[i] {
-                        Some(Class::Exact) => Class::Exact,
-                        Some(_) => Class::Normalized,
-                        None => Class::Lost,
-                    };
-                    failures.extend(field_verdict(&here, input, &label, cell, seen, &did_move));
-                    ledger.saw(&sink, &label, index, seen);
-                }
+        let beside = !input.is_metric() && input.beside_metrics;
+        let observed = if beside {
+            // `beside_metrics` and, once paired, the log's message rows, read together as a log
+            // alone's record-level rows are: at the worst cell's class.
+            let seen = match pairing.seen[i] {
+                Some(Class::Exact) => Class::Exact,
+                Some(_) => Class::Normalized,
+                None => Class::Lost,
+            };
+            let mut features = vec!["beside_metrics"];
+            if seen != Class::Lost {
+                features.extend(log_features(input, spelling));
             }
-            continue;
-        }
-
-        // Record level.
-        let mut rows: Vec<(String, Option<String>)> =
-            kind_features(input).into_iter().map(|f| (input.kind.clone(), f)).collect();
-        let mut features = record_features(input, spelling);
-        let later: Vec<usize> = (i + 1..ins.len())
-            .filter(|&j| input.is_metric() && same_series(input, &ins[j]))
-            .collect();
-        if !later.is_empty() {
-            features.push("superseded");
-        }
-        // The later point of its series at this record's instant, if any.
-        let twin = later.iter().copied().find(|&j| ins[j].timestamp == input.timestamp);
-        // `datadog_out` collapses a series' points in one second on its series route only. A
-        // `samples` record has the distribution-points route, where Datadog keeps both points, a
-        // `distribution` record the sketches route, and a `set_members` record no Datadog form; the
-        // sketches route also carries every `exponential_histogram`, and a `histogram` under the
-        // default `histograms.mode: distributions`, unless `histograms.send_aggregation_metrics`
-        // also writes its `.count`, `.sum`, `.min`, and `.max` on the series route.
-        let histograms = &traced.sink["histograms"];
-        let aggregations = histograms["send_aggregation_metrics"].as_bool().unwrap_or(false);
-        let distributions = histograms["mode"].as_str().is_none_or(|mode| mode == "distributions");
-        let sketched = !aggregations
-            && (input.kind == "exponential_histogram"
-                || (input.kind == "histogram" && distributions));
-        let collapsible = sink != "datadog_out"
-            || !(matches!(input.kind.as_str(), "samples" | "distribution" | "set_members")
-                || sketched);
-        // The point a sink keeping one per series and millisecond sends in this record's place:
-        // the latest, the later in the run on a tie.
-        let sent = later
-            .iter()
-            .copied()
-            .filter(|&j| same_millisecond(input, &ins[j]))
-            .max_by(|&a, &b| ins[a].timestamp.cmp(&ins[b].timestamp).then(a.cmp(&b)));
-        let equal = sent.filter(|&j| same_reading(input, &ins[j]));
-        if twin.is_some() && collapsible {
-            features.push(if equal.is_some() { "same_instant_equal" } else { "same_instant" });
-        } else if twin.is_none() && collapsible && sent.is_some() {
-            features.push(if equal.is_some() {
-                "same_millisecond_equal"
-            } else {
-                "same_millisecond"
-            });
-        }
-        rows.extend(features.into_iter().map(|f| ("record".to_string(), Some(f.to_string()))));
-        let mut cells = Vec::new();
-        let mut unspecified = false;
-        for (kind, feature) in &rows {
-            let label = mapping::row_label(kind, feature.as_deref());
-            match mapping.lookup(kind, feature.as_deref(), &sink, &traced.sink) {
-                Lookup::NoRow => failures.push(format!(
-                    "{here}: {} {:?} reaches row {label}, which mapping.yaml doesn't have",
-                    input.kind, input.name
-                )),
-                Lookup::NotSpecified => {
-                    unspecified = true;
-                    ledger
-                        .unspecified
-                        .entry((sink.clone(), label))
-                        .or_default()
-                        .insert(here.clone());
-                }
-                Lookup::Cell(cell, index) => {
-                    if let Some(counter) = &cell.counter {
-                        named.extend(Series::parse(counter).ok());
+            let mut cells = Vec::new();
+            for feature in features {
+                let label = mapping::row_label(&input.kind, Some(feature));
+                match mapping.lookup(&input.kind, Some(feature), &sink, &traced.sink) {
+                    Lookup::NoRow => failures.push(format!(
+                        "{here}: {} {:?} reaches row {label}, which mapping.yaml doesn't have",
+                        input.kind, input.name
+                    )),
+                    Lookup::NotSpecified => {
+                        ledger
+                            .unspecified
+                            .entry((sink.clone(), label))
+                            .or_default()
+                            .insert(here.clone());
                     }
-                    cells.push((label, cell, index));
+                    Lookup::Cell(cell, index) => {
+                        named.extend(cell.counter.as_deref().and_then(|c| Series::parse(c).ok()));
+                        ledger.reach(&sink, &label, index);
+                        cells.push((label, cell, index));
+                    }
                 }
             }
-        }
-        if unspecified || cells.len() < rows.len() {
-            continue;
-        }
-        for (label, _, index) in &cells {
-            ledger.reach(&sink, label, *index);
-        }
-        // A sink that tests the flag before the kind skips or stale-marks a flagged record without
-        // reaching the kind's loss, so a counted loss cell whose counter didn't move doesn't
-        // count against it (module doc's "Counters").
-        let flagged =
-            cells.iter().any(|(label, _, _)| label.starts_with("record/no_recorded_value"));
-        let cells: Vec<_> = cells
-            .into_iter()
-            .filter(|(label, cell, _)| {
-                !flagged
-                    || label.starts_with("record/no_recorded_value")
-                    || !matches!(cell.class, Class::Degraded | Class::Skipped | Class::Dropped)
-                    || cell.counter.as_deref().is_none_or(&did_move)
-            })
-            .collect();
-        let expected = cells.iter().map(|(_, cell, _)| cell.class).fold(Class::Exact, worse);
-        // A sink skips or drops a record once and counts it once, under whichever reason it meets
-        // first, so of several cells at the worst class the one whose counter moved decides.
-        let worst: Vec<_> = cells.iter().filter(|(_, cell, _)| cell.class == expected).collect();
-        let deciding = worst
-            .iter()
-            .find(|(_, cell, _)| cell.counter.as_deref().is_some_and(&did_move))
-            .or(worst.first())
-            .copied();
-        let observed = match pairing.seen[i] {
-            // Two points sharing an instant that read back at different instants were moved
-            // apart, which only a timestamp comparison shows: the check compares no other.
-            Some(Class::Exact) if twin.is_some_and(|j| moved_apart(&pairing, i, j, &outs)) => {
-                Some(Class::Normalized)
+            let expected = cells.iter().map(|(_, cell, _)| cell.class).fold(Class::Exact, worse);
+            if let Some((label, cell, index)) =
+                cells.iter().find(|(_, cell, _)| cell.class == expected)
+            {
+                failures.extend(field_verdict(&here, input, label, cell, seen, &did_move));
+                ledger.saw(&sink, label, *index, seen);
+                for (other, cell, index) in &cells {
+                    if other != label && cell.class == seen {
+                        ledger.saw(&sink, other, *index, seen);
+                    }
+                }
             }
-            Some(class) => Some(class),
-            None => {
-                let loss = deciding
-                    .filter(|(_, cell, _)| matches!(cell.class, Class::Skipped | Class::Dropped));
-                let counted =
-                    loss.and_then(|(_, cell, _)| cell.counter.as_deref()).is_some_and(&did_move);
-                // A cell that says its loss is uncounted accounts for a record no counter does.
-                let uncounted = loss.is_some_and(|(_, cell, _)| {
-                    cell.counter.is_none() && cell.reason.as_deref() == Some("uncounted")
-                });
-                // A sink that collapses two equal readings counts the one it removes under a
-                // `normalized` cell and sends the other, so the removed one reads as the other
-                // does: at its worst cell, which is that one unless the kind is written in a
-                // lesser form.
-                let collapsed = cells.iter().any(|(_, cell, _)| {
-                    cell.class == Class::Normalized
-                        && cell.counter.as_deref().is_some_and(&did_move)
-                }) && equal.is_some_and(|j| !pairing.claimed[j].is_empty());
-                if counted || uncounted || collapsed {
-                    Some(expected)
-                } else if matches!(expected, Class::Normalized | Class::Degraded)
-                    && sink == "prometheus_out"
-                    && traced.sink.get("bind").is_some_and(|bind| !bind.is_null())
-                    && later.iter().any(|&j| !pairing.claimed[j].is_empty())
-                {
-                    // The exposition registry keeps one value per series, so a record whose
-                    // series has a later record read back was overwritten by it: the pull
-                    // model's normalization, which leaves the earlier record nothing to pair
-                    // with. A kind the sink writes in a lesser form stays at that class.
-                    Some(expected)
-                } else if moved.iter().any(|s| s.name.ends_with(".skipped")) {
-                    Some(Class::Skipped)
-                } else if moved.iter().any(|s| s.name.ends_with(".dropped")) {
-                    Some(Class::Dropped)
+            if seen == Class::Lost {
+                continue;
+            }
+            seen
+        } else {
+            // Record level.
+            let mut rows: Vec<(String, Option<String>)> =
+                kind_features(input).into_iter().map(|f| (input.kind.clone(), f)).collect();
+            rows.extend(
+                log_features(input, spelling)
+                    .into_iter()
+                    .map(|feature| ("log".to_string(), Some(feature.to_string()))),
+            );
+            let mut features = record_features(input, spelling);
+            let later: Vec<usize> = (i + 1..ins.len())
+                .filter(|&j| input.is_metric() && same_series(input, &ins[j]))
+                .collect();
+            if !later.is_empty() {
+                features.push("superseded");
+            }
+            // The later point of its series at this record's instant, if any.
+            let twin = later.iter().copied().find(|&j| ins[j].timestamp == input.timestamp);
+            // `datadog_out` collapses a series' points in one second on its series route only. A
+            // `samples` record has the distribution-points route, where Datadog keeps both points, a
+            // `distribution` record the sketches route, and a `set_members` record no Datadog form; the
+            // sketches route also carries every `exponential_histogram`, and a `histogram` under the
+            // default `histograms.mode: distributions`, unless `histograms.send_aggregation_metrics`
+            // also writes its `.count`, `.sum`, `.min`, and `.max` on the series route.
+            let histograms = &traced.sink["histograms"];
+            let aggregations = histograms["send_aggregation_metrics"].as_bool().unwrap_or(false);
+            let distributions =
+                histograms["mode"].as_str().is_none_or(|mode| mode == "distributions");
+            let sketched = !aggregations
+                && (input.kind == "exponential_histogram"
+                    || (input.kind == "histogram" && distributions));
+            let collapsible = sink != "datadog_out"
+                || !(matches!(input.kind.as_str(), "samples" | "distribution" | "set_members")
+                    || sketched);
+            // The point a sink keeping one per series and millisecond sends in this record's place:
+            // the latest, the later in the run on a tie.
+            let sent = later
+                .iter()
+                .copied()
+                .filter(|&j| same_millisecond(input, &ins[j]))
+                .max_by(|&a, &b| ins[a].timestamp.cmp(&ins[b].timestamp).then(a.cmp(&b)));
+            let equal = sent.filter(|&j| same_reading(input, &ins[j]));
+            if twin.is_some() && collapsible {
+                features.push(if equal.is_some() { "same_instant_equal" } else { "same_instant" });
+            } else if twin.is_none() && collapsible && sent.is_some() {
+                features.push(if equal.is_some() {
+                    "same_millisecond_equal"
                 } else {
-                    None
+                    "same_millisecond"
+                });
+            }
+            rows.extend(features.into_iter().map(|f| ("record".to_string(), Some(f.to_string()))));
+            let mut cells = Vec::new();
+            let mut unspecified = false;
+            for (kind, feature) in &rows {
+                let label = mapping::row_label(kind, feature.as_deref());
+                match mapping.lookup(kind, feature.as_deref(), &sink, &traced.sink) {
+                    Lookup::NoRow => failures.push(format!(
+                        "{here}: {} {:?} reaches row {label}, which mapping.yaml doesn't have",
+                        input.kind, input.name
+                    )),
+                    Lookup::NotSpecified => {
+                        unspecified = true;
+                        ledger
+                            .unspecified
+                            .entry((sink.clone(), label))
+                            .or_default()
+                            .insert(here.clone());
+                    }
+                    Lookup::Cell(cell, index) => {
+                        if let Some(counter) = &cell.counter {
+                            named.extend(Series::parse(counter).ok());
+                        }
+                        cells.push((label, cell, index));
+                    }
                 }
             }
-        };
-        let read_back: Vec<String> = pairing.claimed[i].iter().map(|&o| outs[o].show()).collect();
-        let reached: Vec<String> = cells
-            .iter()
-            .map(|(label, cell, _)| format!("{label}: {}", cell.class.as_str()))
-            .collect();
-        let Some(observed) = observed else {
-            failures.push(format!(
+            if unspecified || cells.len() < rows.len() {
+                continue;
+            }
+            for (label, _, index) in &cells {
+                ledger.reach(&sink, label, *index);
+            }
+            // A sink that tests the flag before the kind skips or stale-marks a flagged record without
+            // reaching the kind's loss, so a counted loss cell whose counter didn't move doesn't
+            // count against it (module doc's "Counters").
+            let flagged =
+                cells.iter().any(|(label, _, _)| label.starts_with("record/no_recorded_value"));
+            let cells: Vec<_> = cells
+                .into_iter()
+                .filter(|(label, cell, _)| {
+                    !flagged
+                        || label.starts_with("record/no_recorded_value")
+                        || !matches!(cell.class, Class::Degraded | Class::Skipped | Class::Dropped)
+                        || cell.counter.as_deref().is_none_or(&did_move)
+                })
+                .collect();
+            let expected = cells.iter().map(|(_, cell, _)| cell.class).fold(Class::Exact, worse);
+            // A sink skips or drops a record once and counts it once, under whichever reason it meets
+            // first, so of several cells at the worst class the one whose counter moved decides.
+            let worst: Vec<_> =
+                cells.iter().filter(|(_, cell, _)| cell.class == expected).collect();
+            let deciding = worst
+                .iter()
+                .find(|(_, cell, _)| cell.counter.as_deref().is_some_and(&did_move))
+                .or(worst.first())
+                .copied();
+            let observed = match pairing.seen[i] {
+                // Two points sharing an instant that read back at different instants were moved
+                // apart, which only a timestamp comparison shows: the check compares no other.
+                Some(Class::Exact) if twin.is_some_and(|j| moved_apart(&pairing, i, j, &outs)) => {
+                    Some(Class::Normalized)
+                }
+                Some(class) => Some(class),
+                None => {
+                    let loss = deciding.filter(|(_, cell, _)| {
+                        matches!(cell.class, Class::Skipped | Class::Dropped)
+                    });
+                    let counted = loss
+                        .and_then(|(_, cell, _)| cell.counter.as_deref())
+                        .is_some_and(&did_move);
+                    // A cell that says its loss is uncounted accounts for a record no counter does.
+                    let uncounted = loss.is_some_and(|(_, cell, _)| {
+                        cell.counter.is_none() && cell.reason.as_deref() == Some("uncounted")
+                    });
+                    // A sink that collapses two equal readings counts the one it removes under a
+                    // `normalized` cell and sends the other, so the removed one reads as the other
+                    // does: at its worst cell, which is that one unless the kind is written in a
+                    // lesser form.
+                    let collapsed = cells.iter().any(|(_, cell, _)| {
+                        cell.class == Class::Normalized
+                            && cell.counter.as_deref().is_some_and(&did_move)
+                    }) && equal.is_some_and(|j| !pairing.claimed[j].is_empty());
+                    if counted || uncounted || collapsed {
+                        Some(expected)
+                    } else if matches!(expected, Class::Normalized | Class::Degraded)
+                        && sink == "prometheus_out"
+                        && traced.sink.get("bind").is_some_and(|bind| !bind.is_null())
+                        && later.iter().any(|&j| !pairing.claimed[j].is_empty())
+                    {
+                        // The exposition registry keeps one value per series, so a record whose
+                        // series has a later record read back was overwritten by it: the pull
+                        // model's normalization, which leaves the earlier record nothing to pair
+                        // with. A kind the sink writes in a lesser form stays at that class.
+                        Some(expected)
+                    } else if moved.iter().any(|s| s.name.ends_with(".skipped")) {
+                        Some(Class::Skipped)
+                    } else if moved.iter().any(|s| s.name.ends_with(".dropped")) {
+                        Some(Class::Dropped)
+                    } else {
+                        None
+                    }
+                }
+            };
+            let read_back: Vec<String> =
+                pairing.claimed[i].iter().map(|&o| outs[o].show()).collect();
+            let reached: Vec<String> = cells
+                .iter()
+                .map(|(label, cell, _)| format!("{label}: {}", cell.class.as_str()))
+                .collect();
+            let Some(observed) = observed else {
+                failures.push(format!(
                 "{here}: {} {:?} isn't read back and no sink counter says why; the table expects \
                  {} ({})\n  sink input: {}",
                 input.kind,
@@ -2272,12 +3558,12 @@ pub(super) fn check(
                 reached.join(", "),
                 input.show()
             ));
-            continue;
-        };
-        let agrees =
-            observed == expected || (expected == Class::Normalized && observed == Class::Exact);
-        if !agrees {
-            failures.push(format!(
+                continue;
+            };
+            let agrees =
+                observed == expected || (expected == Class::Normalized && observed == Class::Exact);
+            if !agrees {
+                failures.push(format!(
                 "{here}: {} {:?}: the table expects {} ({}), the flow reads {}\n  sink input: {}\n  \
                  read back: [{}]",
                 input.kind,
@@ -2288,34 +3574,37 @@ pub(super) fn check(
                 input.show(),
                 read_back.join(", ")
             ));
-            continue;
-        }
-        if let Some((label, cell, index)) = deciding {
-            ledger.saw(&sink, label, *index, observed);
-            let loss = matches!(cell.class, Class::Degraded | Class::Skipped | Class::Dropped);
-            if let (true, Some(counter)) = (loss && observed == cell.class, &cell.counter) {
-                if !did_move(counter) {
-                    failures.push(format!(
+                continue;
+            }
+            if let Some((label, cell, index)) = deciding {
+                ledger.saw(&sink, label, *index, observed);
+                let loss = matches!(cell.class, Class::Degraded | Class::Skipped | Class::Dropped);
+                if let (true, Some(counter)) = (loss && observed == cell.class, &cell.counter) {
+                    if !did_move(counter) {
+                        failures.push(format!(
                         "{here}: {} {:?} reads {} under row {label}, but its counter {counter} \
                          didn't move",
                         input.kind,
                         input.name,
                         observed.as_str()
                     ));
+                    }
                 }
             }
-        }
-        for (label, cell, index) in &cells {
-            if *label != deciding.map(|d| d.0.clone()).unwrap_or_default() && cell.class == observed
-            {
-                ledger.saw(&sink, label, *index, observed);
+            for (label, cell, index) in &cells {
+                if *label != deciding.map(|d| d.0.clone()).unwrap_or_default()
+                    && cell.class == observed
+                {
+                    ledger.saw(&sink, label, *index, observed);
+                }
             }
-        }
+            observed
+        };
 
         // Field level.
         let first = pairing.claimed[i].first().copied();
         let checked = matches!(observed, Class::Exact | Class::Normalized);
-        for (kind, feature, field) in field_rows(input, &protocol) {
+        for (kind, feature, field) in field_rows_under(input, &protocol, spelling.sd_id()) {
             // A field row is reached only where its record is compared: a record written in a
             // lesser form, or not at all, has no field to compare.
             let Some(first) = first.filter(|_| checked) else { continue };
@@ -2812,7 +4101,7 @@ mod tests {
         let kept = recs(&[&gauge(r#"{"collectd.host":"web-1"}"#)]);
         assert_eq!(pair(&ins, &moved, Spelling::Datadog).seen, [None]);
         assert_eq!(pair(&ins, &kept, Spelling::Datadog).seen, [Some(Class::Exact)]);
-        assert!(derived(&ins[0]).iter().any(|(feature, _, _)| *feature == "no_host"));
+        assert!(derived_rows(&ins[0]).contains(&"no_host"));
     }
 
     const DOGSTATSD: Spelling = Spelling::Statsd { dogstatsd: true };
@@ -2896,6 +4185,86 @@ mod tests {
         assert_eq!(pair(&ins, &same, Spelling::Datadog).seen, [Some(Class::Exact)]);
         assert_eq!(pair(&ins, &same, Spelling::Verbatim).seen, [None]);
         assert_eq!(pair(&ins, &other, Spelling::Datadog).seen, [None]);
+    }
+
+    /// A log's `container.id` leaves as a `container_id:` entry appended to its `ddtags`, which
+    /// `datadog_in` keeps in the string: the log pairs with that read-back, `container.id` reads
+    /// `normalized`, and the string's own entries `exact`. With no `ddtags`, the entry is the
+    /// whole string.
+    #[test]
+    fn datadog_spells_a_logs_container_id_as_a_ddtags_entry() {
+        let body = r#""format":"raw","message":"m""#;
+        let ins = recs(&[
+            &log_line(body, r#"{"host.name":"h","ddtags":"team:a","container.id":"c1"}"#),
+            &log_line(body, r#"{"host.name":"h","container.id":"c1"}"#),
+        ]);
+        let outs = recs(&[
+            &log_line(body, r#"{"host.name":"h","ddtags":"team:a,container_id:c1"}"#),
+            &log_line(body, r#"{"host.name":"h","ddtags":"container_id:c1"}"#),
+        ]);
+        for i in 0..2 {
+            let (input, out) = (&ins[i..=i], &outs[i..=i]);
+            assert_eq!(pair(input, out, Spelling::Datadog).seen, [Some(Class::Exact)], "{i}");
+            let id = Field::Attribute { key: "container.id".to_string(), resource: false };
+            let class = observe_field(&id, &ins[i], &outs[i], Spelling::Datadog);
+            assert_eq!(class, Class::Normalized, "{i}");
+        }
+        let ddtags = Field::Attribute { key: "ddtags".to_string(), resource: false };
+        assert_eq!(observe_field(&ddtags, &ins[0], &outs[0], Spelling::Datadog), Class::Exact);
+        // Without the entry, the container id is lost.
+        let bare = recs(&[&log_line(body, r#"{"host.name":"h","ddtags":"team:a"}"#)]);
+        let id = Field::Attribute { key: "container.id".to_string(), resource: false };
+        assert_eq!(observe_field(&id, &ins[0], &bare[0], Spelling::Datadog), Class::Lost);
+    }
+
+    /// Datadog rewrites a log's `ddtags` when it appends to it, dropping empty entries: the log
+    /// still pairs, and the string reads `normalized`, not `exact`.
+    #[test]
+    fn datadog_reads_a_rewritten_logs_ddtags_with_empty_entries_as_normalized() {
+        let body = r#""format":"raw","message":"m""#;
+        let ins = recs(&[&log_line(
+            body,
+            r#"{"host.name":"h","ddtags":"team:a,,b","container.id":"c1"}"#,
+        )]);
+        let outs =
+            recs(&[&log_line(body, r#"{"host.name":"h","ddtags":"team:a,b,container_id:c1"}"#)]);
+        assert_eq!(pair(&ins, &outs, Spelling::Datadog).seen, [Some(Class::Exact)]);
+        let ddtags = Field::Attribute { key: "ddtags".to_string(), resource: false };
+        assert_eq!(observe_field(&ddtags, &ins[0], &outs[0], Spelling::Datadog), Class::Normalized);
+    }
+
+    /// A log's `ddtags` that already ends with the `container_id:` entry its `container.id`
+    /// appends reads back byte for byte, and reads `exact`.
+    #[test]
+    fn datadog_reads_a_logs_ddtags_ending_with_its_appended_entry_as_exact() {
+        let body = r#""format":"raw","message":"m""#;
+        let tags = r#"{"host.name":"h","ddtags":"team:a,container_id:c1""#;
+        let ins = recs(&[&log_line(body, &format!(r#"{tags},"container.id":"c1"}}"#))]);
+        let outs = recs(&[&log_line(body, &format!("{tags}}}"))]);
+        assert_eq!(pair(&ins, &outs, Spelling::Datadog).seen, [Some(Class::Exact)]);
+        let ddtags = Field::Attribute { key: "ddtags".to_string(), resource: false };
+        assert_eq!(observe_field(&ddtags, &ins[0], &outs[0], Spelling::Datadog), Class::Exact);
+    }
+
+    /// The `ddtags` `datadog_in` reads back from a log: the encoder drops empty entries and any
+    /// entry naming a key it appends, and the decoder lifts `env:` and `version:` entries back
+    /// onto their keys and a `service:` entry beside the log's `service`.
+    #[test]
+    fn datadog_log_ddtags_follows_the_encoder_and_the_lift() {
+        let body = r#""format":"raw","message":"m""#;
+        let ddtags =
+            |attributes: &str| datadog::log_ddtags(&recs(&[&log_line(body, attributes)])[0]);
+        assert_eq!(ddtags(r#"{"ddtags":"team:a,,b"}"#), None);
+        assert_eq!(
+            ddtags(r#"{"ddtags":"team:a,,container_id:old,b","container.id":"c1"}"#),
+            Some(Some("team:a,b,container_id:c1".to_string()))
+        );
+        assert_eq!(
+            ddtags(r#"{"ddtags":"service:x,team:a","service.name":"s","service.version":"1"}"#),
+            Some(Some("team:a".to_string()))
+        );
+        assert_eq!(ddtags(r#"{"deployment.environment.name":"prod"}"#), Some(None));
+        assert_eq!(ddtags(r#"{"ddtags":7,"container.id":"c1"}"#), None);
     }
 
     /// A span leaves with `span.kind` from its kind and `_dd.p.tid` from its trace id's high 64
@@ -3094,7 +4463,7 @@ mod tests {
     fn a_log_with_an_empty_host_name_is_due_the_default_host() {
         let log =
             recs(&[r#"{{T},"log":{"format":"raw","message":"m"},"attributes":{"host.name":""}}"#]);
-        assert!(derived(&log[0]).iter().any(|(feature, _, _)| *feature == "no_host"));
+        assert!(derived_rows(&log[0]).contains(&"no_host"));
     }
 
     /// The latest point of a series claims what a sink holding one value per series read back,
@@ -3239,6 +4608,19 @@ mod tests {
     /// [`check`] over `ins` read back as `outs` by a `prometheus_out` with `config`, against the
     /// committed table.
     fn check_prometheus(ins: &[&str], outs: &[&str], config: Value) -> Vec<String> {
+        check_sink(ins, outs, config, &[], &mut Ledger::default())
+    }
+
+    /// [`check`] over `ins` read back as `outs` by a sink with `config`, resolved with its
+    /// defaults as the flow driver resolves it, whose run moved `counters`, against the committed
+    /// table, into `ledger`.
+    fn check_sink(
+        ins: &[&str],
+        outs: &[&str],
+        config: Value,
+        counters: &[(&str, f64)],
+        ledger: &mut Ledger,
+    ) -> Vec<String> {
         let batches = |lines: &[&str]| {
             let text: String = lines
                 .iter()
@@ -3250,14 +4632,45 @@ mod tests {
         let table = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../spec/transit/mapping.yaml");
         let mapping = mapping::load(&table).expect("the committed table loads");
+        let kind: logit_config::ComponentKind =
+            serde_json::from_value(config).expect("a sink config");
+        let counters = counters.iter().map(|&(series, n)| (series.to_string(), n)).collect();
         let traced = Traced {
-            outcome: super::super::Outcome { events: Vec::new(), counters: BTreeMap::new() },
+            outcome: super::super::Outcome { events: Vec::new(), counters },
             sunk: batches(ins),
             decoded: batches(outs),
-            sink: config,
+            sink: serde_json::to_value(&kind).expect("the sink config serializes"),
         };
         let at = At { flow: "test", case: "test" };
-        check(&mapping, &at, &traced, &mut Ledger::default())
+        check(&mapping, &at, &traced, ledger)
+    }
+
+    /// A log beside metrics reaches the attribute rows a log alone does: at `datadog_out`, a
+    /// `hostname` attribute on it reaches `attributes/hostname`, which no metric record reaches.
+    #[test]
+    fn a_log_beside_metrics_reaches_its_attribute_rows() {
+        let ins = [
+            r#"{{T},"log":{"severity":"warn","format":"raw","message":"m"},"metrics":[{"name":"g","kind":"gauge","value":17}],"attributes":{"hostname":"web-1"}}"#,
+        ];
+        let host = super::super::HOSTNAME;
+        let log = format!(
+            r#"{{T}},"log":{{"severity":"warn","format":"raw","message":"m"}},"attributes":{{"host.name":"{host}","status":"warn"}}}}"#
+        );
+        let metric = format!(
+            r#"{{T}},"metrics":[{{"name":"g","kind":"gauge","value":17.0}}],"attributes":{{"host.name":"{host}","hostname":"web-1"}},"resource":{{"attributes":{{"_logit.datadog.units":"datadog"}}}}}}"#
+        );
+        let (log, metric) = (format!("{{{log}"), format!("{{{metric}"));
+        let mut ledger = Ledger::default();
+        let config = serde_json::json!({"type": "datadog_out", "api_key": "unused"});
+        let omitted = "logit.output.tags.omitted{component=out,kind=datadog_out,reason=reserved_key,role=sink}";
+        let failures = check_sink(&ins, &[&log, &metric], config, &[(omitted, 1.0)], &mut ledger);
+        let reached = |row: &str| {
+            ledger.cells.iter().any(|((sink, r, _), seen)| {
+                sink == "datadog_out" && r == row && seen.contains(&Class::Lost)
+            })
+        };
+        assert!(reached("attributes/hostname"), "{:#?}", ledger.cells.keys().collect::<Vec<_>>());
+        assert!(failures.is_empty(), "{failures:#?}");
     }
 
     /// Under exposition, a record a later record of its series overwrote in the registry is
@@ -3289,5 +4702,408 @@ mod tests {
         let failures = check_prometheus(&ins, &outs, exposed);
         assert_eq!(failures.len(), 1, "{failures:#?}");
         assert!(failures[0].contains("isn't read back"), "{failures:#?}");
+    }
+
+    /// A log with `body` and `attributes`, at the fixed timestamp.
+    fn log_line(body: &str, attributes: &str) -> String {
+        format!(r#"{{{{T}},"log":{{{body}}},"attributes":{attributes}}}"#)
+    }
+
+    /// The class `out` reads at for `input`'s row `log/<feature>` under `spelling`.
+    fn log_field(
+        input: &Rec,
+        out: &Rec,
+        protocol: &str,
+        feature: &str,
+        spelling: Spelling,
+    ) -> Class {
+        let rows = field_rows(input, protocol);
+        let (_, _, field) = rows
+            .iter()
+            .find(|(kind, f, _)| kind == "log" && f.as_deref() == Some(feature))
+            .unwrap_or_else(|| panic!("no log/{feature} row"));
+        observe_field(field, input, out, spelling)
+    }
+
+    /// A log read back with another severity still pairs, and the difference lands on
+    /// `log/severity`, not on the record.
+    #[test]
+    fn a_log_whose_severity_differs_lands_on_its_severity_row() {
+        let ins = recs(&[&log_line(r#""severity":"warn","format":"raw","message":"m""#, "{}")]);
+        let outs = recs(&[&log_line(r#""severity":"info","format":"raw","message":"m""#, "{}")]);
+        assert_eq!(pair(&ins, &outs, Spelling::Otlp).seen, [Some(Class::Exact)]);
+        assert_eq!(
+            log_field(&ins[0], &outs[0], "otlp", "severity", Spelling::Otlp),
+            Class::Normalized
+        );
+    }
+
+    /// A log read back with another observed time still pairs, and the difference lands on
+    /// `log/observed_timestamp`.
+    #[test]
+    fn a_log_whose_observed_time_differs_lands_on_its_observed_timestamp_row() {
+        let body = |observed: &str| {
+            format!(r#""format":"raw","message":"m","observed_timestamp":"{observed}""#)
+        };
+        let ins = recs(&[&log_line(&body("2027-01-15T08:00:01.000000000Z"), "{}")]);
+        let outs = recs(&[&log_line(&body("2027-01-15T08:00:02.000000000Z"), "{}")]);
+        assert_eq!(pair(&ins, &outs, Spelling::Otlp).seen, [Some(Class::Exact)]);
+        assert_eq!(
+            log_field(&ins[0], &outs[0], "otlp", "observed_timestamp", Spelling::Otlp),
+            Class::Normalized
+        );
+    }
+
+    /// `datadog_out` writes a bytes message as lossy UTF-8, so the log pairs respelled and
+    /// reaches `log/message_unsafe`, which the check reads at the pairing's class.
+    #[test]
+    fn datadog_pairs_a_rewritten_message_respelled() {
+        let ins = recs(&[
+            r#"{{T},"log":{"severity":"warn","format":"raw","message":"b\"caf\\xe9\""},"attributes":{"host.name":"h"},"types":{"/log/message":"bytes"}}"#,
+        ]);
+        let outs = recs(&[&log_line(
+            r#""severity":"warn","format":"raw","message":"caf\ufffd""#,
+            r#"{"host.name":"h","status":"warn"}"#,
+        )]);
+        assert_eq!(pair(&ins, &outs, Spelling::Datadog).seen, [Some(Class::Normalized)]);
+        assert_eq!(pair(&ins, &outs, Spelling::Verbatim).seen, [None]);
+        assert!(log_features(&ins[0], Spelling::Datadog).contains(&"message_unsafe"));
+        assert!(!log_features(&ins[0], Spelling::Otlp).contains(&"message_unsafe"));
+    }
+
+    /// A log beside metrics reaches the `log` field rows a log alone does, so a severity read back
+    /// changed lands on `log/severity` there too.
+    #[test]
+    fn a_log_beside_metrics_reaches_its_field_rows() {
+        let line = |severity: &str| {
+            format!(
+                r#"{{{{T}},"log":{{"severity":"{severity}","format":"raw","message":"m"}},"metrics":[{{"name":"g","kind":"gauge","value":1.0}}]}}"#
+            )
+        };
+        let ins = recs(&[&line("warn")]);
+        let outs = recs(&[&line("info")]);
+        let log = ins.iter().position(|rec| rec.kind == "log").expect("a log record");
+        let out = outs.iter().find(|rec| rec.kind == "log").expect("a log record");
+        assert!(ins[log].beside_metrics);
+        assert_eq!(
+            log_field(&ins[log], out, "otlp", "severity", Spelling::Otlp),
+            Class::Normalized
+        );
+    }
+
+    /// A log with no severity reads `log/severity_unset` exact when it reads back with none, and
+    /// normalized when the sink stamps one.
+    #[test]
+    fn a_log_with_no_severity_reads_normalized_only_when_stamped() {
+        let ins = recs(&[&log_line(r#""format":"raw","message":"m""#, "{}")]);
+        let bare = recs(&[&log_line(r#""format":"raw","message":"m""#, "{}")]);
+        let stamped = recs(&[&log_line(r#""severity":"info","format":"raw","message":"m""#, "{}")]);
+        let at = |out: &Rec| log_field(&ins[0], out, "otlp", "severity_unset", Spelling::Otlp);
+        assert_eq!(at(&bare[0]), Class::Exact);
+        assert_eq!(at(&stamped[0]), Class::Normalized);
+    }
+
+    /// `datadog_out` writes a log's trace and span ids as `trace_id` and `span_id` keys, read
+    /// back as attributes; they pair only holding the log's own ids.
+    #[test]
+    fn datadog_pairs_a_logs_trace_ids_read_back_as_attributes() {
+        let trace = r#""trace_id":"0102030405060708090a0b0c0d0e0f10","span_id":"1112131415161718""#;
+        let ins = recs(&[&log_line(
+            &format!(r#""severity":"warn","format":"raw","message":"m",{trace}"#),
+            r#"{"host.name":"h"}"#,
+        )]);
+        let read = |attributes: &str| {
+            recs(&[&log_line(r#""severity":"warn","format":"raw","message":"m""#, attributes)])
+        };
+        let same = read(&format!(r#"{{"host.name":"h","status":"warn",{trace}}}"#));
+        let other = read(
+            r#"{"host.name":"h","status":"warn","trace_id":"00000000000000000000000000000001","span_id":"1112131415161718"}"#,
+        );
+        assert_eq!(pair(&ins, &same, Spelling::Datadog).seen, [Some(Class::Exact)]);
+        assert_eq!(pair(&ins, &same, Spelling::Verbatim).seen, [None]);
+        assert_eq!(pair(&ins, &other, Spelling::Datadog).seen, [None]);
+        assert_eq!(
+            log_field(&ins[0], &same[0], "datadog", "trace", Spelling::Datadog),
+            Class::Normalized
+        );
+    }
+
+    /// A `kafka_out` `format: text` record reads back as the log's body alone, so the log pairs
+    /// on its message with its severity, trace, and every attribute gone, and a read-back with
+    /// another message doesn't pair; another timestamp lands on `log/timestamp`. A UTF-8 `Bytes`
+    /// message pairs respelled with the string it reads back as.
+    #[test]
+    fn kafka_text_pairs_a_log_on_its_message_alone() {
+        let ins = recs(&[&log_line(
+            r#""severity":"warn","format":"raw","message":"m","trace_id":"0102030405060708090a0b0c0d0e0f10""#,
+            r#"{"host.name":"h","k":"v","_logit.statsd.cardinality":"low"}"#,
+        )]);
+        let body = recs(&[&log_line(r#""format":"raw","message":"m""#, "{}")]);
+        let other = recs(&[&log_line(r#""format":"raw","message":"n""#, "{}")]);
+        let later = recs(&[
+            r#"{"timestamp":"2027-01-15T08:00:01.000000000Z","log":{"format":"raw","message":"m"}}"#,
+        ]);
+        assert_eq!(pair(&ins, &body, Spelling::KafkaText).seen, [Some(Class::Exact)]);
+        assert_eq!(pair(&ins, &other, Spelling::KafkaText).seen, [None]);
+        assert_eq!(pair(&ins, &later, Spelling::KafkaText).seen, [Some(Class::Exact)]);
+        let at = |out: &Rec| log_field(&ins[0], out, "statsd", "timestamp", Spelling::KafkaText);
+        assert_eq!(at(&body[0]), Class::Exact);
+        assert_eq!(at(&later[0]), Class::Normalized);
+
+        let bytes = recs(&[
+            r#"{{T},"log":{"format":"raw","message":"b\"abc\""},"attributes":{"k":"v"},"types":{"/log/message":"bytes"}}"#,
+        ]);
+        let text = recs(&[&log_line(r#""format":"raw","message":"abc""#, "{}")]);
+        assert_eq!(pair(&bytes, &text, Spelling::KafkaText).seen, [Some(Class::Normalized)]);
+        assert_eq!(pair(&bytes, &text, Spelling::Verbatim).seen, [None]);
+    }
+
+    const SYSLOG_5424: Spelling =
+        Spelling::Syslog { rfc3164: false, facility: 16, structured_data: None };
+    const SYSLOG_3164: Spelling =
+        Spelling::Syslog { rfc3164: true, facility: 16, structured_data: None };
+
+    /// A log `syslog_in` reads back from `syslog_out` with the facility, host, and timestamp the
+    /// sink filled in still pairs with the log that carried none of them.
+    #[test]
+    fn a_syslog_read_back_pairs_beside_the_header_it_fills_in() {
+        let ins = recs(&[&log_line(r#""severity":"info","format":"raw","message":"m""#, "{}")]);
+        let outs = recs(&[&format!(
+            r#"{{{{T}},"log":{{"severity":"info","format":"raw","message":"m"}},"attributes":{{"_logit.syslog.severity":6,"host.name":"{host}","syslog.facility":16,"syslog.timestamp":"2027-01-15T08:00:00.000000000Z"}},"types":{{"/attributes/_logit.syslog.severity":"u64","/attributes/syslog.facility":"u64","/attributes/syslog.timestamp":"timestamp"}}}}"#,
+            host = super::super::HOSTNAME,
+        )]);
+        assert_eq!(pair(&ins, &outs, SYSLOG_5424).seen, [Some(Class::Exact)]);
+    }
+
+    /// Under RFC 3164 the log's timestamp leaves in whole seconds with no year, read back as
+    /// `syslog.timestamp`'s text beside a receipt time that happens to equal it.
+    #[test]
+    fn an_rfc3164_timestamp_reads_normalized() {
+        let ins = recs(&[&log_line(r#""severity":"info","format":"raw","message":"m""#, "{}")]);
+        let outs = recs(&[&log_line(
+            r#""severity":"info","format":"raw","message":"m""#,
+            r#"{"syslog.timestamp":"Jan 15 08:00:00"}"#,
+        )]);
+        assert_eq!(
+            log_field(&ins[0], &outs[0], "otlp", "timestamp", SYSLOG_3164),
+            Class::Normalized
+        );
+    }
+
+    /// `_logit.syslog.severity` has its own row, beside every other protocol's carriers.
+    #[test]
+    fn the_syslog_severity_carrier_lands_on_its_own_row() {
+        let ins = recs(&[
+            r#"{{T},"log":{"severity":"info","format":"raw","message":"m"},"attributes":{"_logit.syslog.severity":5},"types":{"/attributes/_logit.syslog.severity":"u64"}}"#,
+        ]);
+        for protocol in ["syslog", "otlp"] {
+            let features: Vec<_> = field_rows(&ins[0], protocol)
+                .into_iter()
+                .filter(|(kind, _, _)| kind == "attributes")
+                .filter_map(|(_, feature, _)| feature)
+                .collect();
+            assert!(features.contains(&"severity_carrier_syslog".to_string()), "{features:?}");
+        }
+    }
+
+    /// RFC 3164 has no MSGID: a log's `syslog.msgid` reaches its own row and reads `lost` there,
+    /// and `exact` under RFC 5424.
+    #[test]
+    fn a_msgid_under_rfc3164_reads_lost() {
+        let body = r#""severity":"info","format":"raw","message":"m""#;
+        let ins = recs(&[&log_line(body, r#"{"syslog.msgid":"req","syslog.tag":"app"}"#)]);
+        let without = recs(&[&log_line(body, r#"{"syslog.tag":"app"}"#)]);
+        let rows = field_rows(&ins[0], "syslog");
+        let (_, _, field) = rows
+            .iter()
+            .find(|(kind, feature, _)| {
+                kind == "attributes" && feature.as_deref() == Some("syslog_msgid")
+            })
+            .expect("a syslog_msgid row");
+        assert_eq!(observe_field(field, &ins[0], &without[0], SYSLOG_3164), Class::Lost);
+        assert_eq!(observe_field(field, &ins[0], &ins[0], SYSLOG_5424), Class::Exact);
+    }
+
+    const SD_ID: &str = "transit@32473";
+    const SYSLOG_SD: Spelling =
+        Spelling::Syslog { rfc3164: false, facility: 16, structured_data: Some(SD_ID) };
+
+    /// The attribute row `key` of `rec` reaches under `sd_id`.
+    fn attribute_row(rec: &Rec, key: &str, sd_id: Option<&str>) -> (String, Field) {
+        field_rows_under(rec, "syslog", sd_id)
+            .into_iter()
+            .find(|(kind, _, field)| {
+                kind == "attributes" && matches!(field, Field::Attribute { key: k, .. } if k == key)
+            })
+            .map(|(_, feature, field)| (feature.unwrap_or_default(), field))
+            .expect("an attribute row")
+    }
+
+    /// Under `structured_data:`, an opt-in attribute reads back nested in `syslog.sd` under the
+    /// SD-ID, as its PARAM-VALUE text: `normalized`, and `lost` where it's missing there.
+    #[test]
+    fn an_opt_in_attribute_reads_back_nested_as_normalized() {
+        let body = r#""severity":"info","format":"raw","message":"m""#;
+        let ins = recs(&[&log_line(body, r#"{"count":42,"syslog.tag":"app","team":"web"}"#)]);
+        let outs = recs(&[
+            &log_line(
+                body,
+                r#"{"syslog.sd":{"transit@32473":{"count":"42","team":"web"}},"syslog.tag":"app"}"#,
+            ),
+            &log_line(body, r#"{"syslog.sd":{"transit@32473":{"team":"web"}},"syslog.tag":"app"}"#),
+        ]);
+        let (feature, field) = attribute_row(&ins[0], "count", Some(SD_ID));
+        assert_eq!(feature, "number_value");
+        assert_eq!(observe_field(&field, &ins[0], &outs[0], SYSLOG_SD), Class::Normalized);
+        assert_eq!(observe_field(&field, &ins[0], &outs[1], SYSLOG_SD), Class::Lost);
+    }
+
+    /// Under `structured_data:`, a key that isn't an SD-NAME and every opt-in attribute of a log
+    /// whose `syslog.sd` already holds the SD-ID reach their own rows and read `lost`, and so does
+    /// an empty array, which writes no PARAM, and a `Bytes` value, which the encoder writes as
+    /// `<N bytes>`.
+    #[test]
+    fn an_opt_in_attribute_the_encoder_leaves_off_reads_lost() {
+        let body = r#""severity":"info","format":"raw","message":"m""#;
+        let ins = recs(&[
+            &log_line(body, r#"{"bad key":"x","syslog.tag":"app"}"#),
+            &log_line(body, r#"{"syslog.sd":{"transit@32473":{"team":"db"}},"team":"web"}"#),
+            r#"{{T},"log":{"severity":"info","format":"raw","message":"m"},"attributes":{"raw":"b\"ab\""},"types":{"/attributes/raw":"bytes"}}"#,
+            &log_line(body, r#"{"none":[],"team":"web"}"#),
+        ]);
+        // What syslog_in reads back from each: the encoder's own element, nothing else.
+        let outs = recs(&[
+            &log_line(body, r#"{"syslog.tag":"app"}"#),
+            &log_line(body, r#"{"syslog.sd":{"transit@32473":{"team":"db"}}}"#),
+            &log_line(body, r#"{"syslog.sd":{"transit@32473":{"raw":"<2 bytes>"}}}"#),
+            &log_line(body, r#"{"syslog.sd":{"transit@32473":{"team":"web"}}}"#),
+        ]);
+        for (i, key, row) in [
+            (0, "bad key", "sd_name_unsafe"),
+            (1, "team", "sd_id_collision"),
+            (2, "raw", "bytes_value"),
+            (3, "none", "sd_empty_array"),
+        ] {
+            let (feature, field) = attribute_row(&ins[i], key, Some(SD_ID));
+            assert_eq!(feature, row, "{key}");
+            assert_eq!(observe_field(&field, &ins[i], &outs[i], SYSLOG_SD), Class::Lost, "{key}");
+        }
+    }
+
+    /// With `structured_data:` unset, or under RFC 3164, which has no STRUCTURED-DATA, an
+    /// attribute keeps its value's row and reads `lost` even when `syslog.sd` holds it.
+    #[test]
+    fn the_opt_in_spelling_is_off_without_structured_data_under_rfc5424() {
+        let unset = Spelling::of("syslog_out", &serde_json::json!({"format": "rfc5424"}));
+        let rfc3164 = Spelling::of(
+            "syslog_out",
+            &serde_json::json!({"format": "rfc3164", "structured_data": {"sd_id": SD_ID}}),
+        );
+        let set = Spelling::of(
+            "syslog_out",
+            &serde_json::json!({"format": "rfc5424", "structured_data": {"sd_id": SD_ID}}),
+        );
+        assert_eq!((unset.sd_id(), rfc3164.sd_id(), set.sd_id()), (None, None, Some(SD_ID)));
+        let body = r#""severity":"info","format":"raw","message":"m""#;
+        let ins = recs(&[&log_line(body, r#"{"bad key":"x","syslog.tag":"app"}"#)]);
+        let outs = recs(&[&log_line(
+            body,
+            r#"{"syslog.sd":{"transit@32473":{"bad key":"x"}},"syslog.tag":"app"}"#,
+        )]);
+        for spelling in [unset, rfc3164] {
+            let (feature, field) = attribute_row(&ins[0], "bad key", spelling.sd_id());
+            assert_eq!(feature, "string_value");
+            assert_eq!(observe_field(&field, &ins[0], &outs[0], spelling), Class::Lost);
+        }
+    }
+
+    /// The field row `key` of `rec` reaches under `splunk_hec_out`, as `(feature, field)`.
+    fn splunk_row(rec: &Rec, key: &str) -> (String, Field) {
+        field_rows(rec, "splunk_hec")
+            .into_iter()
+            .find(|(kind, _, field)| {
+                kind == "attributes" && matches!(field, Field::Attribute { key: k, .. } if k == key)
+            })
+            .map(|(_, feature, field)| (feature.unwrap_or_default(), field))
+            .expect("an attribute row")
+    }
+
+    /// `splunk_hec_out` writes `otel.log.severity.*` from a log's severity and the process
+    /// hostname as its `host`, so the read-back carries attributes the input lacks and still pairs.
+    #[test]
+    fn a_splunk_read_back_pairs_beside_the_severity_fields_it_adds() {
+        let ins = recs(&[&log_line(r#""severity":"warn","format":"raw","message":"m""#, "{}")]);
+        let outs = recs(&[&format!(
+            r#"{{{{T}},"log":{{"severity":"warn","format":"raw","message":"m"}},"attributes":{{"otel.log.severity.number":13,"otel.log.severity.text":"Warn"}},"resource":{{"attributes":{{"host.name":"{}"}}}}}}"#,
+            super::super::HOSTNAME,
+        )]);
+        assert_eq!(pair(&ins, &outs, Spelling::Splunk).seen, [Some(Class::Exact)]);
+    }
+
+    /// `fields` is flat, so a nested attribute reads back as dotted keys: `normalized` when every
+    /// leaf does, `lost` when one is missing.
+    #[test]
+    fn a_nested_attribute_read_back_flattened_is_normalized() {
+        let body = r#""severity":"info","format":"raw","message":"m""#;
+        let ins = recs(&[&log_line(body, r#"{"http":{"method":"GET","status":200}}"#)]);
+        let outs = recs(&[
+            &log_line(body, r#"{"http.method":"GET","http.status":200}"#),
+            &log_line(body, r#"{"http.method":"GET"}"#),
+        ]);
+        let (feature, field) = splunk_row(&ins[0], "http");
+        assert_eq!(feature, "map_value");
+        assert_eq!(observe_field(&field, &ins[0], &outs[0], Spelling::Splunk), Class::Normalized);
+        assert_eq!(observe_field(&field, &ins[0], &outs[1], Spelling::Splunk), Class::Lost);
+    }
+
+    /// An event's `host.name` leaves as the object's `host`, over the resource's, and
+    /// `splunk_hec_in` reads it back onto the resource: the record pairs, and `host_name` reads
+    /// `normalized`.
+    #[test]
+    fn a_splunk_host_name_moved_to_the_resource_is_normalized() {
+        let body = r#""severity":"info","format":"raw","message":"m""#;
+        let ins = recs(&[&format!(
+            r#"{{{{T}},"log":{{{body}}},"attributes":{{"host.name":"web-1"}},"resource":{{"attributes":{{"host.name":"collector"}}}}}}"#
+        )]);
+        let outs = recs(&[&format!(
+            r#"{{{{T}},"log":{{{body}}},"attributes":{{"otel.log.severity.number":9,"otel.log.severity.text":"Info"}},"resource":{{"attributes":{{"host.name":"web-1"}}}}}}"#
+        )]);
+        assert_eq!(pair(&ins, &outs, Spelling::Splunk).seen, [Some(Class::Exact)]);
+        let (feature, field) = splunk_row(&ins[0], "host.name");
+        assert_eq!(feature, "host_name");
+        assert_eq!(observe_field(&field, &ins[0], &outs[0], Spelling::Splunk), Class::Normalized);
+    }
+
+    /// `com.splunk.index` is the object's `index`, read back onto the resource: its own row,
+    /// `exact`.
+    #[test]
+    fn a_splunk_index_reads_exact_on_its_envelope_row() {
+        let line = r#"{{T},"log":{"severity":"info","format":"raw","message":"m"},"resource":{"attributes":{"com.splunk.index":"main"}}}"#;
+        let ins = recs(&[line]);
+        let (feature, field) = field_rows(&ins[0], "splunk_hec")
+            .into_iter()
+            .find(|(_, _, field)| {
+                matches!(field, Field::Attribute { key, resource: true } if key == "com.splunk.index")
+            })
+            .map(|(_, feature, field)| (feature.unwrap_or_default(), field))
+            .expect("a resource attribute row");
+        assert_eq!(feature, "splunk_envelope");
+        assert_eq!(observe_field(&field, &ins[0], &ins[0], Spelling::Splunk), Class::Exact);
+    }
+
+    /// A `com.splunk.` resource attribute that isn't `source`, `sourcetype`, or `index` has no
+    /// envelope slot: the encoder writes it into `fields`, so it's an ordinary resource attribute.
+    #[test]
+    fn another_com_splunk_resource_attribute_is_no_envelope_field() {
+        let line = r#"{{T},"log":{"severity":"info","format":"raw","message":"m"},"resource":{"attributes":{"com.splunk.hec.access_token":"t"}}}"#;
+        let ins = recs(&[line]);
+        let feature = field_rows(&ins[0], "splunk_hec")
+            .into_iter()
+            .find(|(_, _, field)| {
+                matches!(field, Field::Attribute { key, resource: true } if key == "com.splunk.hec.access_token")
+            })
+            .and_then(|(_, feature, _)| feature)
+            .expect("a resource attribute row");
+        assert_eq!(feature, "resource_attribute");
     }
 }

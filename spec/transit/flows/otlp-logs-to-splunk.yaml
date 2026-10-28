@@ -1,0 +1,13 @@
+# otlp_in's log cases into splunk_hec_out with nothing between: each log as one HEC
+# object, its attributes as flattened `fields`.
+# `path:` names one case so `logit run` can run this by hand; the transit spec runs every case in
+# that file's directory (spec/transit/README.md).
+components:
+  case:
+    type: replay_in
+    path: ../cases/otlp-logs/bodies.json
+  out:
+    type: splunk_hec_out
+    sources: [case]
+    endpoint: http://127.0.0.1:8088/services/collector
+    token: transit-unused   # the spec sends nothing; a real config reads !env SPLUNK_HEC_TOKEN

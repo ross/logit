@@ -1,0 +1,4 @@
+# logger(1) in RFC 3164 mode with a multibyte UTF-8 MSG, read in place from
+# testdata/interop/.
+wire: ../../../../testdata/interop/syslog/logger-rfc3164-unicode-000.raw
+exercises: [rfc3164, non_ascii]

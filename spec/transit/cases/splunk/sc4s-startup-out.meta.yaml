@@ -1,0 +1,4 @@
+# SC4S's second startup event, under sourcetype `sc4s:events:startup:out`.
+# Read in place from testdata/interop/splunk/ with its .headers.
+wire: ../../../../testdata/interop/splunk/sc4s-services-collector-event-003.bin
+exercises: [event_route, string_event, fields, envelope, time_string]

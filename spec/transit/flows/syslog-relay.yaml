@@ -1,0 +1,12 @@
+# syslog_in's cases relayed to syslog_out under its default RFC 5424, the like pair with
+# nothing between.
+# `path:` names one case so `logit run` can run this by hand; the transit spec runs every case in
+# that file's directory (spec/transit/README.md).
+components:
+  case:
+    type: replay_in
+    path: ../cases/syslog/logger-rfc5424-basic.json
+  out:
+    type: syslog_out
+    sources: [case]
+    endpoint: 127.0.0.1:514
