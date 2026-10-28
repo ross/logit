@@ -431,8 +431,9 @@ enum Spelling {
     Syslog { rfc3164: bool, facility: u8, structured_data: Option<&'static str> },
     /// `splunk_hec_out`: a log's `Bytes` message as lossy UTF-8 and a timestamp one as RFC 3339
     /// text; its attributes as `fields`, flattened to dotted keys, with the resource's beside the
-    /// event's; `host.name` and the resource's `com.splunk.*` as the envelope, read back on the
-    /// resource; and the attributes [`splunk::derived`] lists, which `splunk_hec_in` reads back
+    /// event's; `host.name` and the resource's `com.splunk.source`, `.sourcetype`, and `.index`
+    /// as the envelope, read back on the resource, any other `com.splunk.` key written into
+    /// `fields`; and the attributes [`splunk::derived`] lists, which `splunk_hec_in` reads back
     /// as attributes the input lacks.
     Splunk,
     /// `kafka_out` under `format: text`: a log's message as `text_body` writes it, read back as a
