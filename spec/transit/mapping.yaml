@@ -6219,7 +6219,8 @@ rows:
         counter: logit.output.spans.degraded{reason=json_text}
         text: >-
           Each link's ids, and its attributes as strings, as the span's `span_links`, read back as
-          string attributes; a map or array attribute is JSON text, counted.
+          string attributes; a map, array, or null attribute is JSON text (`null` for a null),
+          counted.
       splunk_hec_out:
         class: exact
         text: >-
