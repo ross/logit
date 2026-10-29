@@ -1179,9 +1179,10 @@ The rows:
   shows as an opposite-signed pair in the two runs that touch. The pair nets in full, up to that
   G, before the surplus run's allowance (below) applies to what's left, and the detail line
   shows each transfer. The cap keeps a resend's surplus, or a steady run's, from hiding more
-  loss next door than interpolation explains; runs that don't touch, and a reported or end run,
-  never net. `checks._boundary_nets`' doc is the full rule. A judged run's surplus allowance
-  counts every edge it has, a boundary with another judged run included. Apart from that
+  loss next door than interpolation explains; runs that don't touch, and a reported run, never
+  net. On every wire the end run nets the same way with the run before it, before the end
+  allowance applies (W27). `checks._boundary_nets`' doc is the full rule. A judged run's
+  surplus allowance counts every edge it has, a boundary with another judged run included. Apart from that
   netting, each steady run's gap counts at 0 when W + K exceeds G in it, so a surplus in one run
   can't net out loss in another. The
   generator sink's own
@@ -6245,3 +6246,75 @@ What the runs showed:
   then stayed flat, and in both runs its second life stayed flat. The generator is the load source, not the system under test,
   so the scenario leaves the WARN reported rather than listing it under `[expected]`. The SUT's
   RSS stayed flat (+2.0 MiB/h).
+
+### W27: `syslog_in` over TCP and TLS (2026-10-29)
+
+`syslog-tcp-ingress` and `syslog-tls-ingress` ran at their default 14 minutes on the
+development host, from a private image tag (`SOAK_IMAGE=logit:soak-w27`, `SOAK_SKIP_IMAGE=1`)
+so the branch's build didn't replace the shared `logit:soak`. The first two runs used an image
+built from `soak/w27` before it merged `soak/w26`, and the last two an image built at
+2026-10-29 13:50 PDT from the merge. The first two also ran an earlier cut of each scenario:
+the TCP run had no generator stop and neither had `[[expect]]` rows on resets. Other agents'
+soak runs shared the daemon throughout.
+
+| Run | Scenario | Verdict |
+|---|---|---|
+| `20261029T201032Z` | `syslog-tcp-ingress` | PASS |
+| `20261029T202857Z` | `syslog-tls-ingress` | PASS; re-scored with the final `[[expect]]` rows, PASS |
+| `20261029T205142Z` | `syslog-tcp-ingress` | PASS |
+| `20261029T210657Z` | `syslog-tls-ingress` | FAIL: `ledger.wire` at the end, a harness defect, below; re-scored, PASS |
+
+The last TLS run FAILed one row:
+
+| Check | Status | Detail |
+|---|---|---|
+| `ledger.wire` | FAIL | G falls 100 short of W + K at the end, over the end allowance 100 (the generator sink's last buffer.batches + 1 batch); G 1,366,800 = W 1,357,000 + K 0 + counted 0 + gap 9,800 (9,742 in reported windows, 0 in judged TCP-affecting windows, 159 steady, -100 at the end; loss judged 164, each run at 0 or more, against limit 1,900); the generator's requests: 2 ambiguous attempt(s); its counted loss, not in G: 264,400 event(s) in 2,644 batch(es) (overflow_newest 2,644) |
+
+The last TCP run's ledger rows:
+
+| Check | Status | Detail |
+|---|---|---|
+| `ledger.wire` | PASS | G 1,370,700 = W 1,361,560 + K 0 + counted 8 (truncated 8) + gap 9,132 (9,757 in reported windows, -663 in judged TCP-affecting windows, 65 steady, -26 at the end; loss judged 2, each run at 0 or more, against limit 1,900); the generator's requests: 8 ambiguous attempt(s); its counted loss, not in G: 260,500 event(s) in 2,605 batch(es) (overflow_newest 2,605) |
+| `ledger.egress` | PASS | victoria_metrics: life 0: W − D − B − X − ΣT_disc − V 0 = residual 0 + Ab − V 0, ok; life 1 (killed): Ab 109,200 − V[victoria_metrics] 99,200 = 10,000, within band (band [-10,098, 29,994]: ingest 2,000/s over the last drain interval; below, the residual 100 plus one 5.00002s drain interval of ingest, absorbed after the last drain and flushed before the kill; above, one 10s aggregate window (configured) unflushed at the kill plus one drain interval of queue growth after the last drain); residual W − D − B − X − ΣT_disc − Ab 100 at its last drain, what the kill lost from the receive queue and inbox, by design, not judged here; D has no shutdown part: a SIGKILL counts no shutdown drops; life 2 (final): Ab 684,986 − V[victoria_metrics] 684,986 = 0, ok (split copy; R 327,000 = 0 + 262 x 1,000 + 65 x 1,000) |
+| `ledger.summary` | PASS | final life 2: uncounted 0 = W − D − E − B 0 + E − ΣT_disc − A 0 + A − Ab 0 + Ab − V[victoria_metrics] 0; the transforms' ΣT_disc 0, counted; wire G − (W + K + F) 9,132 over the run, F 8 counted; ledger.wire judges the rest |
+| `expect.generator-ambiguous` | PASS | delta of logit.output.requests{class=ambiguous, component=syslog} on generator, through c0s2: c0s2 (+210s, +285s]: 5 (over 15 drain(s)), want >= 1 |
+| `expect.no-resets` | PASS | delta of logit.input.connections.closed{component=syslog, reason=reset} on logit, run: run (+60s, +840s]: 0 (over 143 drain(s)), want <= 0 |
+
+What the runs showed:
+
+- **An `at_least_once` generator needs the allowance counted from its attempts.** The first
+  TCP run's pause window read 338 more lines than G, the lines of failed attempts the generator
+  resent: re-scored under the rule that allowed one batch per `ambiguous_at_most_once` drop, it
+  FAILed `ledger.wire` ("over the 200 its 0 ambiguous attempt(s) and 2 edge(s) allow"), and
+  under one batch per ambiguous attempt it PASSed with 700 allowed for five. The generator
+  counted 6, 2, 8, and 2 ambiguous attempts over the four runs, under the netem loss, the pause,
+  and the partition, and never an `ambiguous_at_most_once` drop.
+- **No fault reset a connection.** `logit.input.connections.closed{reason="reset"}` read 0 in
+  every run, over plaintext and TLS, through the SUT's pause, stop, kill, and partition and the
+  generator's stop. The listener never writes to a plaintext peer, so a closing generator sends
+  a FIN, and over TLS the generator's close sent no reset either. The scenarios hold the counter
+  at 0; a fault built to reset a connection, such as `ss -K` in the netem image, would be a new
+  action.
+- **A kill showed no loss from the socket buffers.** With each end's buffer capped at 256 KiB,
+  the four kills' gaps were 9,916, 9,812, 9,800, and 9,814 lines, while the killed life's last
+  drain came 5.0 s before each kill, about 10,000 lines at 2,000 a second that it read and never
+  exported. Each gap fell within about 400 lines of that, the estimate's error, so the buffers
+  held little at the kill. The loss they can hold is a [known gap](../known-gaps/sinks.md), and
+  no scenario stalls the receiver behind a full buffer before killing it.
+- **A stop or kill cuts a plaintext frame.** The plaintext runs counted 6 and 8
+  `logit.input.frames.dropped{reason="truncated"}`, octet-counted frames a closing connection
+  ended mid-frame, which `ledger.wire` counts in F. The TLS runs counted none.
+- **A partition kept the SUT's address.** Each partition left the SUT at the same IP, so
+  `ledger.wire` judged it, and its window read no more surplus than one ambiguous attempt
+  allowed.
+- **The rotation reloaded in place.** In both TLS runs the SIGHUP reloaded the server
+  certificate once, its expiry rose by a day, and the probe read the rotated serial; the
+  stop after it made the generator handshake against the new certificate, and lines arrived in
+  every drain after it.
+- **The end run's boundary needed netting.** The last TLS run's steady run before the end read
+  98 of loss and the end run 100.1 of surplus, one batch the generator counted before the
+  boundary and the listener read after it. Only a boundary touching a judged run netted, so
+  the end run met its 100-line allowance whole and FAILed. The end run now nets with the run
+  before it under the same cap ([ADR `soak-harness`](../adr/soak-harness.md)'s "Amendment: the
+  end run nets at its boundary"); re-scored, the run PASSes with 98 netted and 2 left, and the
+  last TCP run reads as before.

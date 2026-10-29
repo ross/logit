@@ -116,10 +116,15 @@ Entry format and the other areas: [the known-gaps index](README.md).
     busy stream. `logit` itself as the receiver loses the same way on a kill, which the
     `logit_in` native hop avoids by acknowledging each frame after it reaches every downstream
     inbox.
-  - **Measured:** not separately. In the soak harness's `tcp-ingress`, `syslog-tcp-ingress`, and
-    `syslog-tls-ingress`, the loss sits inside a kill's wire gap, which is made mostly of the
-    counts the killed process read and never exported, so `ledger.wire` reports those windows
-    rather than judging them.
+  - **Measured:** too small to see against a reader that keeps up, and never against a stalled
+    one. The soak harness's `ledger.wire` reports a kill's window rather than judging it,
+    because its gap is made mostly of the lines the killed process read and never exported. In
+    `syslog-tcp-ingress` and `syslog-tls-ingress`, at 2,000 lines a second with each buffer
+    capped at 256 KiB, four kills' gaps of 9,800 to 9,916 lines each fell within about 400
+    lines, the error of the estimate, of what the listener read after its last export, so the
+    buffers held little at the kill. A receiver stalled behind a full receive buffer when it's
+    killed would lose the whole buffer, and no scenario measures that
+    ([plan `soak-harness`](../plans/soak-harness.md)'s "Findings").
   - **Workaround:** where a lost tail matters, use a protocol with an acknowledgment: the native
     hop, or an HTTP sink whose destination answers after it holds the batch. Smaller socket
     buffers on both ends narrow the window at a throughput cost.
