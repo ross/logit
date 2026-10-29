@@ -101,37 +101,27 @@ Entry format and the other areas: [the known-gaps index](README.md).
   - **To close:** a dead-letter sink for rejected batches and a split-on-`413` retry step in the
     shared HTTP driver, each with its own ADR.
 
-- **A stream sink counts a frame delivered once the kernel takes it.** `syslog_out`,
-  `statsd_out`, and `graphite_out` over TCP, TLS, or a Unix stream count a batch's messages in
-  `logit.output.messages` once the frame's write and flush return
-  (`crates/logit-outputs/src/stream.rs`). A line protocol has no acknowledgment, so at that point
-  the bytes may still be in the sender's send buffer, on the wire, or in the receiver's receive
-  buffer, unread. When the receiving process ends with bytes in either buffer (a kill, a crash, a
-  stop that closes the connection before its reader drains it), those bytes are lost, and
-  neither side counts them: the sink counted them sent, and the listener never read them. The
-  next write meets the reset and fails `Ambiguous` or is retried, but only for the frame it
-  carries, never for the frames already counted.
-  - **Consequence:** the loss per abrupt end is bounded by the two buffers, and Linux autotunes
-    each up to several MiB by default (`net.ipv4.tcp_wmem` and `tcp_rmem`), many seconds of a
-    busy stream. `logit` itself as the receiver loses the same way on a kill, which the
-    `logit_in` native hop avoids by acknowledging each frame after it reaches every downstream
-    inbox.
-  - **Measured:** too small to see against a reader that keeps up, and never against a stalled
-    one. The soak harness's `ledger.wire` reports a kill's window rather than judging it,
-    because its gap is made mostly of the lines the killed process read and never exported. In
-    `syslog-tcp-ingress` and `syslog-tls-ingress`, at 2,000 lines a second with each buffer
-    capped at 256 KiB, four kills' gaps of 9,800 to 9,916 lines each fell within about 400
-    lines, the error of the estimate, of what the listener read after its last export, so the
-    buffers held little at the kill. A receiver stalled behind a full receive buffer when it's
-    killed would lose the whole buffer, and no scenario measures that
-    ([plan `soak-harness`](../plans/soak-harness.md)'s "Findings").
-  - **Workaround:** where a lost tail matters, use a protocol with an acknowledgment: the native
-    hop, or an HTTP sink whose destination answers after it holds the batch. Smaller socket
-    buffers on both ends narrow the window at a throughput cost.
-  - **To close:** the sender's part is countable: on a failed connection, `SIOCOUTQ` (or
-    `TCP_INFO`'s unacknowledged bytes) says how much the peer never acknowledged, and the driver
-    could count that as loss. The receiver's part, acknowledged by its kernel and never read,
-    can't be seen from the sender without an application acknowledgment such as RELP's.
+- **A stream sink doesn't count the bytes its peer never acknowledged.** A stream with no
+  application acknowledgment is best-effort by decision
+  ([ADR `delivery-semantics`](../adr/delivery-semantics.md), item 6, "A wire that can't confirm
+  delivery bounds its hop"), and [Deploying `logit`](../deploying.md#a-stream-sink-has-no-acknowledgment)
+  has the operator's workaround. What's open is counting and measuring that loss.
+  `syslog_out`, `statsd_out`, and `graphite_out` over TCP or TLS, and `statsd_out` over a Unix
+  stream, count a batch's messages in `logit.output.messages` once the frame's write and flush
+  return (`crates/logit-outputs/src/stream.rs`). When the receiver ends with bytes in either
+  socket buffer, the next send's probe finds the connection closed and redials, and nothing
+  reports the frames already counted.
+  - **To close, the sender's part:** on a failed connection, `SIOCOUTQ` (or `TCP_INFO`'s
+    unacknowledged bytes) says how much the peer never acknowledged, and the driver could count
+    that as loss. The receiver's part, acknowledged by its kernel and never read, can't be seen
+    from the sender without an application acknowledgment such as RELP's.
+  - **Unmeasured, a stalled receiver:** against a reader that keeps up, the loss is too small to
+    see. In `syslog-tcp-ingress` and `syslog-tls-ingress`, at 2,000 lines a second with each
+    buffer capped at 256 KiB, four kills' gaps of 9,800 to 9,916 lines each fell within about
+    400 lines, the error of the estimate, of what the listener read after its last export
+    ([plan `soak-harness`](../plans/soak-harness.md)'s "Findings"). A receiver stalled behind a
+    full receive buffer when it's killed would lose the whole buffer, up to several MiB under
+    Linux's default autotuning, and no scenario measures that.
 
 - **A kept-alive connection a destination closed first reads as `Ambiguous`.** An HTTP sink
   closes a pooled connection idle past its `idle_timeout:` (30 s by default) before reusing it,

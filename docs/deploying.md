@@ -882,6 +882,18 @@ at once. Batches queue behind the head up to `max_batches`/`max_bytes`. With the
 `logit.component.buffer.utilization`, and choose a `drop_*` policy, or `at_most_once`, if intake
 matters more than the held batch.
 
+### A stream sink has no acknowledgment
+
+`syslog_out`, `statsd_out`, and `graphite_out` over TCP or TLS, and `statsd_out` over a Unix
+stream, count a batch sent once the kernel or the TLS session takes its bytes. A line protocol
+carries no acknowledgment, so a receiver that dies with bytes still in either socket buffer loses
+them, and neither side counts the loss
+([ADR `delivery-semantics`](adr/delivery-semantics.md), item 6). The posture can't help: no
+fault reaches the sink for those bytes. Where a lost tail matters, use a protocol with an
+acknowledgment: the native hop (`logit_out` to `logit_in`), or an HTTP sink whose destination
+answers after it holds the batch. Smaller socket buffers on both ends (`net.ipv4.tcp_wmem` on
+the sender, `net.ipv4.tcp_rmem` on the receiver) narrow the window, at a throughput cost.
+
 ### Sink failure semantics
 
 A sink classifies each failed send into one of four faults, and none of them ends `logit run`
