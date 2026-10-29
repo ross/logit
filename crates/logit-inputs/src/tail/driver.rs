@@ -6,7 +6,14 @@
 //! the one tracked under it is a rotation: the old inode is read to EOF and closed once it has
 //! stayed there for one `poll_interval` ([`Tailer::reap_drained`]), and the new one opened at the
 //! beginning. A tracked file whose size is below the offset already read was
-//! truncated in place: it's re-read from `0` with its partial-line state discarded.
+//! truncated in place: it's re-read from `0` with its partial-line state discarded, and the bytes
+//! the driver last saw past that offset are counted lost ([`Tailer::reconcile_truncation`]).
+//!
+//! A file whose first bytes are a gzip, zstd, xz, or bzip2 magic is never read as text: it's
+//! closed before any line of it is emitted and counted
+//! `logit.input.files.skipped{reason="compressed"}`, once per inode ([`sniff`],
+//! `Tailer::skipped`). Under a pattern like `app.log*`, its content was already read under the
+//! uncompressed name, so decompressing it would replay it.
 
 use super::checkpoint::{
     CheckpointStore, FileId, Head, Loaded, Persisted, Retained, Source, HEAD_BYTES,
@@ -31,6 +38,45 @@ const READ_CHUNK_BYTES: usize = 64 * 1024;
 /// [`READ_CHUNK_BYTES`] (reclaiming the old allocation if no event still slices it). Above it,
 /// small reads (a wake per short write) share one allocation instead of taking one each.
 const READ_REFILL_BYTES: usize = 16 * 1024;
+
+/// The magic bytes opening each compressed format the driver won't read as text, with the name
+/// the `compressed` diagnostic gives it.
+const COMPRESSED_MAGIC: [(&str, &[u8]); 4] = [
+    ("gzip", &[0x1f, 0x8b]),
+    ("zstd", &[0x28, 0xb5, 0x2f, 0xfd]),
+    ("xz", &[0xfd, b'7', b'z', b'X', b'Z', 0x00]),
+    ("bzip2", b"BZh"),
+];
+
+/// What a file's first bytes say about whether to read it as text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Sniff {
+    Text,
+    /// Opens with the named format's magic.
+    Compressed(&'static str),
+    /// Shorter than a magic it's a prefix of, an empty head included. A compressor creates its
+    /// output before writing the header (logrotate's `compress` does), so a scan can find a
+    /// compressed file empty; reading its first byte as text then would emit garbage.
+    Undecided,
+}
+
+/// Classifies a file by `head`, its first bytes. An undecided file is read no further until more
+/// bytes decide it, so a text file whose whole content is a magic's prefix (a lone `B`, say)
+/// isn't read until it grows past it, and if it's closed first, never.
+fn sniff(head: &[u8]) -> Sniff {
+    let mut undecided = false;
+    for (format, magic) in COMPRESSED_MAGIC {
+        if head.starts_with(magic) {
+            return Sniff::Compressed(format);
+        }
+        undecided |= magic.starts_with(head);
+    }
+    if undecided {
+        Sniff::Undecided
+    } else {
+        Sniff::Text
+    }
+}
 
 /// The fault seam's point for `read_one`'s read of a tracked file.
 pub(crate) const READ: fault::Point = fault::Point::new(fault::sites::TAIL_READ, fault::Op::Read);
@@ -180,6 +226,15 @@ impl Listing {
     }
 }
 
+/// A compressed file the driver skipped, in `Tailer::skipped`.
+struct Skipped {
+    /// Where it was last found.
+    path: PathBuf,
+    /// Its size when last sniffed, or `None` until a scan's `stat` records it (`read_one` skips
+    /// a file without one).
+    len: Option<u64>,
+}
+
 /// A checkpoint entry whose file is gone with `unread` bytes past its offset, held in
 /// `Tailer::gone` until a checkpoint write without it lands.
 struct Gone {
@@ -224,6 +279,9 @@ struct TrackedFile<D> {
     /// them and cleared on a truncation. Invariant: `head.len() >= min(HEAD_BYTES, offset)`, so
     /// the fingerprint written beside any offset covers what `checkpoint.rs`'s module doc says.
     head: Vec<u8>,
+    /// Whether [`sniff`] has found `head` to be text. Until it does, `read_one` emits nothing
+    /// from the file. Cleared with `head` on a truncation, since the new content starts over.
+    sniffed: bool,
     /// When the file became [`FileState::Draining`], set by [`TrackedFile::start_draining`] and
     /// cleared by a rebind. `None` in every other state. `Tailer::reap_drained` reads it.
     draining_since: Option<tokio::time::Instant>,
@@ -267,6 +325,14 @@ pub(crate) struct Tailer<D: TailDecoder, F: DecoderFactory<D>> {
     /// prune instead, a process that ended before that write would leave the entry on disk, and
     /// the next process would count the same bytes again.
     gone: Vec<Gone>,
+    /// Each compressed inode found, so a scan neither reopens nor recounts it
+    /// ([`Tailer::still_skipped`]). Keyed by inode so a rename (`.1.gz` to `.2.gz`) isn't
+    /// counted again. A scan forgets an entry whose inode it found under no path, once its path
+    /// is listed ([`Tailer::prune_skipped`]).
+    skipped: HashMap<FileId, Skipped>,
+    /// File watches `read_one` released with a compressed file, for the next `drain` or `scan`
+    /// to remove: `read_one` has no `Watcher`.
+    unwatch: Vec<super::watch::WatchId>,
     /// Where a file found by the first scan with no `resume` entry starts. Set at `bind`:
     /// `Beginning` after [`Loaded::Unusable`], else from `read_from`.
     first_scan_start: StartOffset,
@@ -314,6 +380,8 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
             checkpoint: None,
             resume: HashMap::new(),
             gone: Vec::new(),
+            skipped: HashMap::new(),
+            unwatch: Vec::new(),
             diag: Diagnostics::default(),
             telemetry: Telemetry::default(),
             watched_dirs: HashSet::new(),
@@ -580,6 +648,7 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
     /// handle is `fstat`ed instead, which still sees an unlinked file and a truncation.
     async fn scan(&mut self, first: bool, watcher: &mut super::watch::Watcher) {
         self.reconcile_watches(watcher);
+        self.release_watches(watcher);
         let mut listing = self.list();
         self.report_scan_errors(&listing, first);
         let mut pruned = self.prune_deselected(&listing);
@@ -607,10 +676,14 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
             self.keep_unlisted(path, id).await;
         }
 
-        // Only needed while a checkpoint entry is unspent, which is rarely past the first scan.
+        // Only needed while a checkpoint entry is unspent, which is rarely past the first scan, or
+        // a compressed file is remembered.
         let unspent = self.resume.values().any(|r| r.source == Source::Checkpoint);
-        let discovered_ids: HashSet<FileId> =
-            if !unspent { HashSet::new() } else { listing.discovered_ids().collect() };
+        let discovered_ids: HashSet<FileId> = if !unspent && self.skipped.is_empty() {
+            HashSet::new()
+        } else {
+            listing.discovered_ids().collect()
+        };
         self.count_rotations(&listing.discovered);
         for (path, meta) in std::mem::take(&mut listing.discovered) {
             self.reconcile_discovered(path, &meta, first, watcher).await;
@@ -626,6 +699,7 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
             self.recheck_length(id).await;
         }
         pruned |= self.prune_checkpoint_entries(&listing, &discovered_ids);
+        self.prune_skipped(&listing, &discovered_ids);
         if pruned {
             if let Some(cp) = &mut self.checkpoint {
                 cp.mark_dirty();
@@ -723,7 +797,7 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
     /// same-path arm runs. A rebound inode may have been truncated in place while it was unbound
     /// (retired by a `stat` that raced a rename, then copytruncated); left unchecked, a refill past
     /// its offset before the next scan would be read from mid-line. `len` is the scan's `stat` of
-    /// `path`, which names `id`.
+    /// `path`, which names `id`. A compressed file already skipped stays closed.
     async fn open_or_rebind(
         &mut self,
         path: PathBuf,
@@ -732,6 +806,11 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
         start: StartOffset,
         watcher: &mut super::watch::Watcher,
     ) {
+        if !self.files.contains_key(&id) && self.still_skipped(&path, id, len) {
+            // Neither `accept` nor `refresh` runs for it, as for a rebind.
+            self.factory.retain(&path);
+            return;
+        }
         let rebind = self.files.get(&id).is_some_and(|f| f.state != FileState::Deselected);
         self.open_tracked(path, id, start, watcher).await;
         if rebind {
@@ -798,6 +877,63 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
             }
         }
         dropped
+    }
+
+    /// Forgets each compressed inode this scan found under no path, once a listing could have
+    /// named its recorded path: removed, or its path now names another inode. A rename keeps it,
+    /// since the inode is found under its new name.
+    fn prune_skipped(&mut self, listing: &Listing, discovered_ids: &HashSet<FileId>) {
+        let patterns = &self.patterns;
+        self.skipped
+            .retain(|id, s| discovered_ids.contains(id) || !listing.listed(patterns, &s.path));
+    }
+
+    /// Whether `id`, found at `path` with size `len`, is a compressed file already skipped, so
+    /// `scan` leaves it closed. Another name, or another size, is sniffed again: a rename keeps
+    /// the inode, but a size change at the same path can be a recycled inode now holding a text
+    /// file, which `FileId` alone can't tell apart. A compressor still writing its output is
+    /// reopened at each scan that sees it grow.
+    fn still_skipped(&mut self, path: &Path, id: FileId, len: u64) -> bool {
+        let Some(skipped) = self.skipped.get_mut(&id) else { return false };
+        if skipped.path != path {
+            return false;
+        }
+        *skipped.len.get_or_insert(len) == len
+    }
+
+    /// Removes the file watches `read_one` released with a compressed file.
+    fn release_watches(&mut self, watcher: &mut super::watch::Watcher) {
+        for id in self.unwatch.drain(..) {
+            watcher.unwatch(id);
+        }
+    }
+
+    /// Records `id`, found at `path` with size `len`, as compressed. Counted and diagnosed only
+    /// the first time this process skips the inode, so sniffing it again after a rename isn't
+    /// counted again. Its resume entry is spent, and the checkpoint drops it at the next write.
+    fn skip_compressed(&mut self, id: FileId, path: PathBuf, len: Option<u64>, format: &str) {
+        let skipped = Skipped { path: path.clone(), len };
+        if self.skipped.insert(id, skipped).is_none() {
+            self.telemetry.count("logit.input.files.skipped", 1.0, &[("reason", "compressed")]);
+            self.diag.warn_throttled("compressed", compressed_message(&path, format));
+        }
+        self.resume.remove(&id);
+        if let Some(cp) = &mut self.checkpoint {
+            cp.mark_dirty();
+        }
+    }
+
+    /// Stops tracking a file `read_one` found compressed, closing its descriptor. Nothing of it
+    /// was emitted, so there's nothing to flush.
+    fn untrack_compressed(&mut self, id: FileId, format: &str) {
+        let Some(tracked) = self.files.remove(&id) else { return };
+        if self.by_path.get(&tracked.path) == Some(&id) {
+            self.by_path.remove(&tracked.path);
+        }
+        if let Some(watch) = tracked.watch {
+            self.unwatch.push(watch);
+        }
+        self.skip_compressed(id, tracked.path, None, format);
     }
 
     /// `scan`'s listing step: every pattern's [`PathPattern::scan`], then one `stat` per distinct
@@ -932,18 +1068,28 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
     /// truncated in place: seek to `0` and reset the splitter and decoder. `len` must come from
     /// the same inode as `id`. Called by `scan`, [`Tailer::on_data_wake`], and `drain` (through
     /// [`Tailer::recheck_length`]).
+    ///
+    /// A truncation counts `logit.input.bytes.dropped{reason="truncated"}`: the bytes the last
+    /// size observation (`TrackedFile::last_len`) saw past the read offset, which no read reached.
+    /// It's usually `0`, since what a `copytruncate` loses is mostly written after the last
+    /// observation, and those writes survive only in the copy, read only if a pattern matches it.
+    /// The held partial line is below the offset and counted in `frames.dropped`, so it's not in
+    /// this count.
     async fn reconcile_truncation(&mut self, id: FileId, len: u64) {
         let max_line_bytes = self.config.max_line_bytes;
         let Some(tracked) = self.files.get_mut(&id) else { return };
-        tracked.last_len = len;
         if len >= tracked.offset {
+            tracked.last_len = len;
             return;
         }
+        // `last_len` is left as it was on a failed seek, so the retry still counts what it saw.
         if let Err(err) = tracked.file.seek(std::io::SeekFrom::Start(0)).await {
             self.diag.warn_throttled("read_error", err);
             return;
         }
         let prev_offset = tracked.offset;
+        let unread = tracked.last_len.saturating_sub(prev_offset);
+        tracked.last_len = len;
         // A decoder holding an entry (`docker_in`'s reassembly, or a drop in progress) has
         // counted its loss, in `reset` or when its drop began, and the unterminated line most
         // often continues that entry, so it isn't counted a second time here.
@@ -957,11 +1103,19 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
         tracked.decoder.reset();
         tracked.held_from = None;
         tracked.head.clear();
+        tracked.sniffed = false;
         let path = tracked.path.clone();
-        self.diag.warn_throttled("truncated", truncated_message(&path, prev_offset, len));
+        self.diag.warn_throttled("truncated", truncated_message(&path, prev_offset, len, unread));
         self.telemetry.count("logit.input.files.truncated", 1.0, &[]);
         if discarded_partial {
             self.telemetry.count("logit.input.frames.dropped", 1.0, &[("reason", "truncated")]);
+        }
+        if unread > 0 {
+            self.telemetry.count(
+                "logit.input.bytes.dropped",
+                unread as f64,
+                &[("reason", "truncated")],
+            );
         }
         // The persisted offset is now past the file's end. A write before the next read must
         // replace it with `0`: the head fingerprint would reject it at a restart, but only as a
@@ -1115,6 +1269,18 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
                 }
             }
         };
+        // `head` is empty for a `Beginning` start, so its first read decides there.
+        let sniffed = match sniff(&head) {
+            Sniff::Text => {
+                self.skipped.remove(&id);
+                true
+            }
+            Sniff::Undecided => false,
+            Sniff::Compressed(format) => {
+                self.skip_compressed(id, path, Some(len), format);
+                return;
+            }
+        };
         // After any head read, even to `0`: the read moved the cursor.
         if start != StartOffset::Beginning {
             if let Err(err) = file.seek(std::io::SeekFrom::Start(offset)).await {
@@ -1154,6 +1320,7 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
             held_from: None,
             watch,
             head,
+            sniffed,
             draining_since: None,
             draining_scan: 0,
             rescanned: false,
@@ -1204,6 +1371,7 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
             ids.extend(self.files.keys().copied());
             at_eof.clear();
             let (any_progress, stopped) = self.read_pass(&ids, &mut at_eof, sink, shutdown).await;
+            self.release_watches(watcher);
             if stopped.is_none() {
                 self.reap_drained(&at_eof, pass_start, sink, watcher).await;
             }
@@ -1293,6 +1461,34 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
         let read_at = now_nanos();
         let bytes = self.read_buf.split().freeze();
 
+        let Some(tracked) = self.files.get_mut(&id) else { return false };
+        capture_head(&mut tracked.head, tracked.offset, &bytes);
+        // Before any line is split, so nothing of a compressed file is emitted.
+        if !tracked.sniffed {
+            match sniff(&tracked.head) {
+                Sniff::Text => {
+                    tracked.sniffed = true;
+                    self.skipped.remove(&id);
+                }
+                Sniff::Undecided => {
+                    // Unconsumed: the next read starts at the same offset, and `capture_head`
+                    // keeps what the head already holds.
+                    let offset = tracked.offset;
+                    if let Err(err) = tracked.file.seek(std::io::SeekFrom::Start(offset)).await {
+                        self.diag.warn_throttled(
+                            "read_error",
+                            format!("{}: {err}", tracked.path.display()),
+                        );
+                    }
+                    return false;
+                }
+                Sniff::Compressed(format) => {
+                    self.untrack_compressed(id, format);
+                    return false;
+                }
+            }
+        }
+
         // Each line with the file offset it starts at, for `TrackedFile::held_from`.
         let mut lines = std::mem::take(&mut self.lines);
         let dropped = {
@@ -1301,7 +1497,6 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
                 None => return false,
             };
             let chunk_start = tracked.offset;
-            capture_head(&mut tracked.head, chunk_start, &bytes);
             let partial_start = chunk_start - tracked.splitter.pending_bytes();
             let stats = tracked.splitter.push(bytes, |line, start| {
                 let start = start.map_or(partial_start, |i| chunk_start + i as u64);
@@ -1729,10 +1924,27 @@ fn ensure_utf8(line: Bytes, diag: &mut Diagnostics) -> Bytes {
 }
 
 /// The `truncated` diagnostic's text. It reports the *pre*-truncation offset, which tells an
-/// operator how much was in flight; a free function so a test can assert that.
-fn truncated_message(path: &Path, prev_offset: u64, len: u64) -> String {
+/// operator how much was in flight, and `unread`, the bytes counted
+/// `bytes.dropped{reason="truncated"}`; a free function so a test can assert both.
+fn truncated_message(path: &Path, prev_offset: u64, len: u64, unread: u64) -> String {
+    let seen = if unread > 0 {
+        format!("{unread} byte(s) seen past that offset were never read, and ")
+    } else {
+        String::new()
+    };
     format!(
-        "{} shrank from an offset of {prev_offset} bytes to {len} -- resuming from the beginning",
+        "{} shrank from an offset of {prev_offset} bytes to {len} -- resuming from the \
+         beginning; {seen}lines written before the truncation may be lost unless a pattern also \
+         matches the copy",
+        path.display()
+    )
+}
+
+/// The `compressed` diagnostic's text.
+fn compressed_message(path: &Path, format: &str) -> String {
+    format!(
+        "{} starts with a {format} header -- not tailed, since a compressed file isn't read as \
+         text",
         path.display()
     )
 }
@@ -3114,6 +3326,11 @@ mod tests {
             1.0,
             "the discarded partial is counted lost"
         );
+        assert_eq!(
+            probe.sum("logit.input.bytes.dropped", &[]),
+            0.0,
+            "the partial was read, so it's below the offset and not counted again as bytes"
+        );
         assert_eq!(probe.sum("logit.input.files.truncated", &[]), 1.0);
 
         running.stop().await;
@@ -3371,9 +3588,14 @@ mod tests {
 
     #[test]
     fn the_truncated_diagnostic_reports_the_pre_truncation_offset() {
-        let msg = truncated_message(Path::new("/var/log/app.log"), 4096, 12);
+        let msg = truncated_message(Path::new("/var/log/app.log"), 4096, 12, 0);
         assert!(msg.contains("from an offset of 4096 bytes to 12"), "{msg}");
         assert!(!msg.contains("offset of 0 bytes"));
+        assert!(msg.contains("may be lost unless a pattern also matches the copy"), "{msg}");
+        assert!(!msg.contains("never read"), "no unread bytes to report: {msg}");
+
+        let msg = truncated_message(Path::new("/var/log/app.log"), 4096, 12, 100);
+        assert!(msg.contains("100 byte(s) seen past that offset were never read"), "{msg}");
     }
 
     // -- the pattern directory's watch is re-armed on every scan -----------------------------
@@ -6298,6 +6520,250 @@ mod tests {
         assert_eq!(probe.gauge("logit.input.files.open", &[]), Some(1.0), "sampled before it");
         tailer.scan(false, &mut crate::tail::watch::Watcher::Poll).await;
         assert_eq!(probe.gauge("logit.input.files.open", &[]), Some(0.0));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // -- compressed files are skipped, never read as text
+
+    fn skipped_compressed(probe: &mut TelemetryProbe) -> f64 {
+        probe.sum("logit.input.files.skipped", &[("reason", "compressed")])
+    }
+
+    fn diagnostics(probe: &mut TelemetryProbe, key: &str) -> f64 {
+        probe.sum("logit.component.diagnostics", &[("key", key)])
+    }
+
+    /// A format's magic followed by a few bytes and newlines, so a text read would emit lines.
+    fn compressed_bytes(magic: &[u8]) -> Vec<u8> {
+        let mut bytes = magic.to_vec();
+        bytes.extend_from_slice(b"\x08\x00\xffgarbage\nmore garbage\n");
+        bytes
+    }
+
+    #[test]
+    fn sniff_names_each_magic_and_waits_on_a_prefix_of_one() {
+        assert_eq!(sniff(b"\x1f\x8b\x08\x00"), Sniff::Compressed("gzip"));
+        assert_eq!(sniff(b"\x28\xb5\x2f\xfd\x00"), Sniff::Compressed("zstd"));
+        assert_eq!(sniff(b"\xfd7zXZ\x00\x00"), Sniff::Compressed("xz"));
+        assert_eq!(sniff(b"BZh91AY"), Sniff::Compressed("bzip2"));
+        assert_eq!(sniff(b"BZh"), Sniff::Compressed("bzip2"), "a whole magic decides");
+        for prefix in [&b""[..], b"\x1f", b"\x28\xb5\x2f", b"\xfd7zXZ", b"B", b"BZ"] {
+            assert_eq!(sniff(prefix), Sniff::Undecided, "{prefix:?}");
+        }
+        for text in [&b"Bob\n"[..], b"BZx", b"\x1f\x00", b"\xfd7zXY", b"2026-10-29 hello\n", b"a"] {
+            assert_eq!(sniff(text), Sniff::Text, "{text:?}");
+        }
+    }
+
+    /// Under `app.log*`, a compressed rotation of every format is skipped and counted once, with
+    /// no line emitted and no descriptor kept, and a later scan doesn't reopen it.
+    #[tokio::test(start_paused = true)]
+    async fn a_compressed_file_of_each_format_is_skipped_counted_once_and_closed() {
+        let dir = scratch_dir("compressed-skipped");
+        std::fs::write(dir.join("app.log"), b"one\n").unwrap();
+        for (i, (_, magic)) in COMPRESSED_MAGIC.iter().enumerate() {
+            std::fs::write(dir.join(format!("app.log.{}.z", i + 1)), compressed_bytes(magic))
+                .unwrap();
+        }
+        let mut probe = TelemetryProbe::new();
+        let mut tailer = probed_tailer(
+            vec![PathPattern::new(dir.join("app.log*"))],
+            ReadFrom::Beginning,
+            &probe,
+        );
+        assert_eq!(tick(&mut tailer, true).await, vec!["one"]);
+        assert_eq!(skipped_compressed(&mut probe), 4.0);
+        assert_eq!(diagnostics(&mut probe, "compressed"), 4.0);
+        assert_eq!(diagnostics(&mut probe, "invalid_utf8"), 0.0);
+        assert_eq!(tailer.tracked_len(), 1, "only app.log is still open");
+
+        tailer.scan(false, &mut crate::tail::watch::Watcher::Poll).await;
+        assert_eq!(tailer.tracked_len(), 1, "a scan leaves a skipped file closed");
+        append(&dir.join("app.log"), b"two\n");
+        assert_eq!(tick(&mut tailer, false).await, vec!["two"]);
+        assert_eq!(skipped_compressed(&mut probe), 4.0, "counted once per inode");
+        assert_eq!(diagnostics(&mut probe, "compressed"), 4.0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Under `read_from: end`, the head read at open finds it, so it's never tracked.
+    #[tokio::test]
+    async fn a_compressed_file_is_skipped_at_open_under_read_from_end() {
+        let dir = scratch_dir("compressed-end");
+        let path = dir.join("app.log.1.gz");
+        std::fs::write(&path, compressed_bytes(&[0x1f, 0x8b])).unwrap();
+        let mut probe = TelemetryProbe::new();
+        let mut tailer = probed_tailer(vec![PathPattern::new(&path)], ReadFrom::End, &probe);
+        tailer.scan(true, &mut crate::tail::watch::Watcher::Poll).await;
+        assert_eq!(tailer.tracked_len(), 0);
+        assert_eq!(skipped_compressed(&mut probe), 1.0);
+        append(&path, b"\nappended\n");
+        assert!(tick(&mut tailer, false).await.is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A compressor creates its output before writing to it: a file found empty, then given a
+    /// first byte that could open a magic, emits nothing until the header decides it.
+    #[tokio::test(start_paused = true)]
+    async fn a_compressed_file_found_empty_is_skipped_once_its_header_arrives() {
+        let dir = scratch_dir("compressed-late");
+        let path = dir.join("app.log.1.gz");
+        std::fs::write(&path, b"").unwrap();
+        let mut probe = TelemetryProbe::new();
+        let mut tailer = probed_tailer(vec![PathPattern::new(&path)], ReadFrom::Beginning, &probe);
+        assert!(tick(&mut tailer, true).await.is_empty());
+        assert_eq!(tailer.tracked_len(), 1, "an empty file is tracked, undecided");
+
+        append(&path, b"\x1f");
+        assert!(tick(&mut tailer, false).await.is_empty());
+        assert_eq!(tailer.tracked_len(), 1, "one byte doesn't decide it");
+        assert_eq!(tailer.files.values().next().map(|f| f.offset), Some(0), "unconsumed");
+
+        append(&path, &compressed_bytes(&[0x8b]));
+        assert!(tick(&mut tailer, false).await.is_empty());
+        assert_eq!(tailer.tracked_len(), 0, "closed once the header decides it");
+        assert_eq!(skipped_compressed(&mut probe), 1.0);
+        assert_eq!(probe.sum("logit.input.lines", &[]), 0.0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A text file whose first byte could open a magic is read whole once it grows past it.
+    #[tokio::test(start_paused = true)]
+    async fn a_text_file_starting_with_a_magic_prefix_is_read_once_it_grows() {
+        let dir = scratch_dir("compressed-prefix-text");
+        let path = dir.join("app.log");
+        std::fs::write(&path, b"B").unwrap();
+        let mut probe = TelemetryProbe::new();
+        let mut tailer = probed_tailer(vec![PathPattern::new(&path)], ReadFrom::Beginning, &probe);
+        assert!(tick(&mut tailer, true).await.is_empty());
+        append(&path, b"ob\n");
+        assert_eq!(tick(&mut tailer, false).await, vec!["Bob"]);
+        assert_eq!(skipped_compressed(&mut probe), 0.0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// logrotate shifting `.1.gz` to `.2.gz` keeps the inode: it's sniffed again under its new
+    /// name, found compressed, and not counted again.
+    #[tokio::test(start_paused = true)]
+    async fn a_skipped_file_renamed_under_the_pattern_is_not_counted_again() {
+        let dir = scratch_dir("compressed-renamed");
+        let (one, two) = (dir.join("app.log.1.gz"), dir.join("app.log.2.gz"));
+        std::fs::write(&one, compressed_bytes(&[0x1f, 0x8b])).unwrap();
+        let id = FileId::from_metadata(&std::fs::metadata(&one).unwrap());
+        let mut probe = TelemetryProbe::new();
+        let mut tailer = probed_tailer(
+            vec![PathPattern::new(dir.join("app.log*"))],
+            ReadFrom::Beginning,
+            &probe,
+        );
+        assert!(tick(&mut tailer, true).await.is_empty());
+        std::fs::rename(&one, &two).unwrap();
+        assert!(tick(&mut tailer, false).await.is_empty());
+        assert_eq!(tailer.skipped.get(&id).map(|s| s.path.clone()), Some(two));
+        assert_eq!(tailer.tracked_len(), 0);
+        assert_eq!(skipped_compressed(&mut probe), 1.0);
+        assert_eq!(diagnostics(&mut probe, "compressed"), 1.0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A size change at a skipped path is sniffed again, since `FileId` can't tell a recycled
+    /// inode at the same path apart: rewritten in place as text, the file is tailed.
+    #[tokio::test(start_paused = true)]
+    async fn a_skipped_file_rewritten_as_text_in_place_is_tailed() {
+        let dir = scratch_dir("compressed-rewritten");
+        let path = dir.join("app.log.1");
+        std::fs::write(&path, compressed_bytes(&[0x1f, 0x8b])).unwrap();
+        let id = FileId::from_metadata(&std::fs::metadata(&path).unwrap());
+        let mut probe = TelemetryProbe::new();
+        let mut tailer = probed_tailer(vec![PathPattern::new(&path)], ReadFrom::Beginning, &probe);
+        assert!(tick(&mut tailer, true).await.is_empty());
+        assert!(tick(&mut tailer, false).await.is_empty(), "this scan records its size");
+        copytruncate_and_refill(&path, b"text\n");
+        assert_eq!(tick(&mut tailer, false).await, vec!["text"]);
+        assert!(!tailer.skipped.contains_key(&id));
+        assert_eq!(skipped_compressed(&mut probe), 1.0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A skipped file is forgotten once a listing shows its path gone.
+    #[tokio::test(start_paused = true)]
+    async fn a_skipped_file_is_forgotten_once_its_path_is_gone() {
+        let dir = scratch_dir("compressed-gone");
+        let path = dir.join("app.log.1.gz");
+        std::fs::write(&path, compressed_bytes(&[0x1f, 0x8b])).unwrap();
+        let probe = TelemetryProbe::new();
+        let mut tailer = probed_tailer(
+            vec![PathPattern::new(dir.join("app.log*"))],
+            ReadFrom::Beginning,
+            &probe,
+        );
+        tick(&mut tailer, true).await;
+        assert_eq!(tailer.skipped.len(), 1);
+        std::fs::remove_file(&path).unwrap();
+        tick(&mut tailer, false).await;
+        assert!(tailer.skipped.is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Under `inotify`, the watch `open_tracked` added for a file found undecided is removed by
+    /// the `drain` whose read skips it.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_skipped_files_watch_is_removed_by_the_drain_that_skips_it() {
+        let dir = scratch_dir("compressed-unwatch");
+        let path = dir.join("app.log.1.gz");
+        std::fs::write(&path, b"").unwrap();
+        let probe = TelemetryProbe::new();
+        let (mut tailer, mut watcher) = inotify_tailer(PathPattern::new(&path), &probe);
+        tailer.scan(true, &mut watcher).await;
+        assert!(tailer.files.values().next().is_some_and(|f| f.watch.is_some()));
+        append(&path, &compressed_bytes(&[0x1f, 0x8b]));
+        let (fanout, _rx) = fanout_channel(8);
+        let (_tx, shutdown) = watch::channel(false);
+        tailer.drain(&fanout, &shutdown, &mut watcher, no_timer_due()).await;
+        assert_eq!(tailer.tracked_len(), 0);
+        assert!(tailer.unwatch.is_empty(), "drain released the watch");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // -- a truncation counts what it knew was unread
+
+    /// A scan saw the file at 14 bytes with 4 read; a copytruncate then empties it before a read
+    /// reaches the other 10, which are counted lost.
+    #[tokio::test(start_paused = true)]
+    async fn a_truncation_counts_the_bytes_last_seen_past_the_offset() {
+        let dir = scratch_dir("truncated-bytes");
+        let path = dir.join("app.log");
+        std::fs::write(&path, b"one\n").unwrap();
+        let mut probe = TelemetryProbe::new();
+        let mut tailer = probed_tailer(vec![PathPattern::new(&path)], ReadFrom::Beginning, &probe);
+        assert_eq!(tick(&mut tailer, true).await, vec!["one"]);
+
+        append(&path, b"two\nthree\n");
+        tailer.scan(false, &mut crate::tail::watch::Watcher::Poll).await;
+        copytruncate_and_refill(&path, b"x\n");
+        assert_eq!(tick(&mut tailer, false).await, vec!["x"]);
+        assert_eq!(probe.sum("logit.input.files.truncated", &[]), 1.0);
+        assert_eq!(probe.sum("logit.input.bytes.dropped", &[("reason", "truncated")]), 10.0);
+        assert_eq!(probe.sum("logit.input.frames.dropped", &[]), 0.0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Bytes written after the last observation are invisible: with the file read to its end
+    /// before the copytruncate, nothing is counted, though the truncation is.
+    #[tokio::test(start_paused = true)]
+    async fn a_truncation_after_a_read_to_the_end_counts_no_bytes() {
+        let dir = scratch_dir("truncated-no-bytes");
+        let path = dir.join("app.log");
+        std::fs::write(&path, b"one\ntwo\n").unwrap();
+        let mut probe = TelemetryProbe::new();
+        let mut tailer = probed_tailer(vec![PathPattern::new(&path)], ReadFrom::Beginning, &probe);
+        assert_eq!(tick(&mut tailer, true).await, vec!["one", "two"]);
+        append(&path, b"unseen\n");
+        copytruncate_and_refill(&path, b"x\n");
+        assert_eq!(tick(&mut tailer, false).await, vec!["x"]);
+        assert_eq!(probe.sum("logit.input.files.truncated", &[]), 1.0);
+        assert!(!probe.poll().has("logit.input.bytes.dropped", &[("reason", "truncated")]));
         std::fs::remove_dir_all(&dir).ok();
     }
 }

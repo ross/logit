@@ -24,7 +24,8 @@
 //!   `by_path`, and the retained resume entries equal the model's;
 //! - the checkpoint on disk equals the model's persisted entries, and every persisted offset is a
 //!   line start or the end of a prefix a clean stop emitted;
-//! - every counter and diagnostic the driver keeps: lines, bytes, drops, truncations, rotations,
+//! - every counter and diagnostic the driver keeps: lines, bytes, drops, truncations and the
+//!   bytes each knew were unread, rotations,
 //!   scan errors, rejected resumes, renames, and flushes by reason; `open_error`, `read_error`,
 //!   and every checkpoint error stay at zero;
 //! - after a scan, the `by_path` invariants the driver relies on (one path per inode, only
@@ -228,6 +229,9 @@ struct MTracked {
     /// Its length so far, dropped or not.
     line_len: u64,
     dropping: bool,
+    /// The size the driver last observed: at the open, a truncation check, a read to the end, or
+    /// an `fstat` that found the file unlinked.
+    last_len: u64,
     head: Vec<u8>,
     draining: Option<Draining>,
     acc: Vec<String>,
@@ -239,6 +243,8 @@ struct Counts {
     line_bytes: u64,
     long_line: u64,
     truncated: u64,
+    /// `bytes.dropped{reason="truncated"}`.
+    truncated_bytes: u64,
     rotated: u64,
     read_dir_errors: u64,
     stat_errors: u64,
@@ -351,11 +357,13 @@ impl Model {
         let t = self.tracked.get_mut(&id).expect("tracked");
         let content = &self.inodes[t.inode].content;
         if content.len() as u64 <= t.offset {
+            t.last_len = t.offset;
             return;
         }
         let chunk = content[t.offset as usize..].to_vec();
         capture_head(&mut t.head, t.offset, &chunk);
         t.offset += chunk.len() as u64;
+        t.last_len = t.offset;
         let mut complete = Vec::new();
         let mut rest = &chunk[..];
         while let Some(nl) = rest.iter().position(|&b| b == b'\n') {
@@ -403,9 +411,13 @@ impl Model {
 
     fn truncation_check(&mut self, id: FileId) {
         let t = self.tracked.get_mut(&id).expect("tracked");
-        if self.inodes[t.inode].content.len() as u64 >= t.offset {
+        let len = self.inodes[t.inode].content.len() as u64;
+        if len >= t.offset {
+            t.last_len = len;
             return;
         }
+        self.counts.truncated_bytes += t.last_len.saturating_sub(t.offset);
+        t.last_len = len;
         t.offset = 0;
         t.line.clear();
         t.line_len = 0;
@@ -451,6 +463,7 @@ impl Model {
                 line: Vec::new(),
                 line_len: 0,
                 dropping: false,
+                last_len: len,
                 head,
                 draining: None,
                 acc: Vec::new(),
@@ -495,6 +508,11 @@ impl Model {
         for (path, id) in bound {
             if discovered.contains_key(&path) {
                 continue;
+            }
+            let inode = &self.inodes[self.tracked[&id].inode];
+            if !listed(&path) && !inode.linked {
+                let len = inode.content.len() as u64;
+                self.tracked.get_mut(&id).expect("tracked").last_len = len;
             }
             if listed(&path) || !self.inodes[self.tracked[&id].inode].linked {
                 self.start_draining(id);
@@ -1174,6 +1192,8 @@ impl World {
             line_bytes: probe.sum("logit.input.line.bytes", &[]) as u64,
             long_line: diag.occurrences("long_line"),
             truncated: probe.sum("logit.input.files.truncated", &[]) as u64,
+            truncated_bytes: probe.sum("logit.input.bytes.dropped", &[("reason", "truncated")])
+                as u64,
             rotated: probe.sum("logit.input.files.rotated", &[]) as u64,
             read_dir_errors: probe.sum("logit.input.scan.errors", &[("op", "read_dir")]) as u64,
             stat_errors: probe.sum("logit.input.scan.errors", &[("op", "stat")]) as u64,
