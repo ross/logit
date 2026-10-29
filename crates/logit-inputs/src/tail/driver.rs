@@ -276,6 +276,11 @@ struct Skipped {
     /// Its size when last sniffed, or `None` until a scan's `stat` records it (`read_one` skips
     /// a file without one).
     len: Option<u64>,
+    /// The `Tailer::scan_generation` of the scan that recorded it at open, or `None` for a
+    /// record `read_one` made between scans. [`Tailer::prune_skipped`] keeps a record from the
+    /// running scan: one made at open under `read_from: end` falls in a scan that may not have
+    /// collected the discovered inodes.
+    scan: Option<u64>,
 }
 
 /// A checkpoint entry whose file is gone with `unread` bytes past its offset, held in
@@ -926,9 +931,12 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
     /// named its recorded path: removed, or its path now names another inode. A rename keeps it,
     /// since the inode is found under its new name.
     fn prune_skipped(&mut self, listing: &Listing, discovered_ids: &HashSet<FileId>) {
-        let patterns = &self.patterns;
-        self.skipped
-            .retain(|id, s| discovered_ids.contains(id) || !listing.listed(patterns, &s.path));
+        let (patterns, generation) = (&self.patterns, self.scan_generation);
+        self.skipped.retain(|id, s| {
+            s.scan == Some(generation)
+                || discovered_ids.contains(id)
+                || !listing.listed(patterns, &s.path)
+        });
     }
 
     /// Whether `id`, found at `path` with size `len`, is a compressed file already skipped, so
@@ -955,7 +963,9 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
     /// the first time this process skips the inode, so sniffing it again after a rename isn't
     /// counted again. Its resume entry is spent, and the checkpoint drops it at the next write.
     fn skip_compressed(&mut self, id: FileId, path: PathBuf, len: Option<u64>, format: &str) {
-        let skipped = Skipped { path: path.clone(), len };
+        // Only an open, inside a scan, knows the size.
+        let scan = len.map(|_| self.scan_generation);
+        let skipped = Skipped { path: path.clone(), len, scan };
         if self.skipped.insert(id, skipped).is_none() {
             self.telemetry.count("logit.input.files.skipped", 1.0, &[("reason", "compressed")]);
             self.diag.warn_throttled("compressed", compressed_message(&path, format));
@@ -6674,6 +6684,11 @@ mod tests {
         tailer.scan(true, &mut crate::tail::watch::Watcher::Poll).await;
         assert_eq!(tailer.tracked_len(), 0);
         assert_eq!(skipped_compressed(&mut probe), 1.0);
+        for _ in 0..3 {
+            assert!(tick(&mut tailer, false).await.is_empty());
+        }
+        assert_eq!(skipped_compressed(&mut probe), 1.0, "the first scan's record outlives it");
+        assert_eq!(diagnostics(&mut probe, "compressed"), 1.0);
         append(&path, b"\nappended\n");
         assert!(tick(&mut tailer, false).await.is_empty());
         std::fs::remove_dir_all(&dir).ok();
