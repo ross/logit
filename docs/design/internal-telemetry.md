@@ -1142,7 +1142,8 @@ These are this component's own spellings, not `otlp_in`'s, which counts only ref
   than downgrading to Snappy, reads as `encoding="zstd"`. It counts a delivered write whose
   sender timed out waiting for the `204` too: the batch went out, and the sender's resend is the
   ordinary at-least-once duplicate. So `ok` and `closed_consumer` sum to the listener's
-  `logit.component.batches.sent`.
+  `logit.component.batches.sent` while no write decodes to nothing: a write that decodes to no
+  events, such as a 1.0 metadata-only request, is answered `204` and counts `ok` with no batch sent.
 - `unauthorized` is a `401` from `bind_auth:`, checked before the body. It's also counted
   `logit.input.requests.rejected{reason="auth"}`, the spelling every listener that checks a
   credential shares.

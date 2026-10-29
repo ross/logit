@@ -2481,6 +2481,30 @@ mod tests {
             .await;
     }
 
+    /// A client that closes while its body's second batch is parked on the detached delivery
+    /// drops the handler. The consumer then closes, so that batch is refused, and the drop is
+    /// still counted: the count runs on the delivery's task, not after the handler's wait.
+    #[tokio::test]
+    async fn a_batch_refused_after_its_client_closed_is_still_counted_dropped() {
+        let (addr, _running, rx, mut probe) = shutdown_listener(plaintext_shutdown_input()).await;
+        let mut client = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        write_event(&mut client, &addr, TWO_ENVELOPES).await;
+        wait_for_a_park(&mut probe, "the second batch to park on the full edge").await;
+
+        drop(client);
+        probe
+            .wait_for("the closed connection to end its task", |t| {
+                t.gauge("logit.input.connections", &[]) == Some(0.0)
+            })
+            .await;
+        drop(rx);
+        probe
+            .wait_for("the refused batch counted dropped", |t| {
+                t.sum("logit.input.batches.dropped", &[("reason", "closed_consumer")]) == 1.0
+            })
+            .await;
+    }
+
     /// A connection still in its TLS accept when shutdown fires ends at once rather than at its
     /// `handshake_timeout`. That timeout is an hour, far past `Running::stop`'s 5s ceiling, so the
     /// stop returns in time only if the prelude races the signal; the gauge reading 0 right after

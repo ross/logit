@@ -670,13 +670,22 @@ so its wire is keyed on the mode its config sets: `bind:` is the receiver, and
   `logit.output.acks{result="timeout"}` allows one batch, an upper bound because one batch can
   hold several ids. A poll the writer counts under `route="ack"` sends no data, so a poll that
   fails in transport allows none.
-- **A judged edge allows one batch per request in flight.** The listener counts a batch in W
-  before the writer reads its answer, and under `ack: true` before its acknowledgment arrives,
-  half a second or more later. So a writer at `concurrency: 8` can hold eight batches in W and
-  not in G across a run's edge, and `splunk-hec-ingress`'s first run FAILed a SUT restart's
-  window by 930 points against 700 allowed with nothing lost. Each edge of a judged run now
-  allows the writer's `concurrency:` in batches, 1 when unset, which leaves every writer at the
-  default where it was.
+- **A judged run's trailing edge allows the batches the writer read in flight there.** The
+  listener counts a batch in W before the writer reads its answer, and under `ack: true` before
+  its acknowledgment arrives, half a second or more later. So a writer at `concurrency: 8`
+  holds batches in W and not in G at any edge, and the lag drifts by up to that many between
+  drains. `splunk-hec-ingress`'s first run FAILed a SUT restart's window, beside a reported
+  kill, by 930 points against 700 allowed with nothing lost. The surplus lag leaves in a run is
+  its lag at the end less its lag at the start, so a judged run's trailing edge now allows
+  `max(1, in_flight)` batches, `in_flight` being the higher of the writer's
+  `logit.output.in_flight` readings at the two generator drains straddling it, whatever the
+  neighbour, and its leading edge one batch. Three other forms were rejected. The writer's
+  `concurrency:` on every edge passes a loss of 300 beside 1,000 duplicates in one judged run
+  where nothing was in flight. The reading on both edges passes 1,500 unexplained with 8 in
+  flight at each. `concurrency:` only at a trailing edge beside a reported run FAILed the
+  rerun's generator-netem window on lag alone: a steady neighbour's own drift hid the opposite
+  sign `_boundary_nets` nets. The gauge measures the batches at the edge that backs a surplus,
+  so it covers the drift and widens nothing it didn't see.
 
 ## Amendment: a scrape wire judges increments per generator life (2026-10-29)
 

@@ -1468,9 +1468,9 @@ class HttpListener:
 # `batches.deferred`. `otlp_in` counts no requests and never answers busy: a slow downstream
 # holds the request, and a client that gives up leaves its batches to be delivered
 # (crates/logit-inputs/src/otlp.rs). `splunk_hec_in` and `datadog_in` answer as `influxdb_in`
-# does on the route each writer posts to, `event` and `series_v2`, under the same 5 s deadline
-# on a request's first batch: a `/event` body decodes to one batch per envelope and a series
-# body to one batch, so the identities hold while each body carries one envelope
+# does on the route each writer posts to, `event` and `series_v2`, under a 5 s deadline
+# (`splunk_hec_in` on a request's first batch, `datadog_in` on every batch): a `/event` body
+# decodes to one batch per envelope and a series body to one batch, so the identities hold while each body carries one envelope
 # (crates/logit-inputs/src/splunk.rs and datadog.rs, "Backpressure"). `prometheus_in`'s
 # remote-write receiver counts each request once in `logit.input.writes{class}`, with no
 # `route` tag, decodes it to one batch, and never answers busy: backpressure delays its `204`
@@ -1539,8 +1539,11 @@ HTTP_CONNECT_CLASS = "connect_error"
 # `HTTP_ACK_ROUTE`, and a poll that fails in transport sends no data, so it allows none.
 HTTP_ACK_TIMEOUT = ("logit.output.acks", {"result": "timeout"})
 HTTP_ACK_ROUTE = "ack"
-# Every HTTP sink's `concurrency:` when its config sets none.
-HTTP_DEFAULT_CONCURRENCY = 1
+# An HTTP writer's batches sent and not yet answered, or under `ack: true` not yet acknowledged:
+# a gauge its slots set on every change at a `concurrency:` above 1, so a drain reads its
+# current value, or no point when it didn't change since the last. A writer at a concurrency of
+# 1 doesn't emit it.
+HTTP_IN_FLIGHT = "logit.output.in_flight"
 
 
 def source_wire(source):
@@ -1999,21 +2002,11 @@ class Ledger:
                         sink_batch[sink] = (total("logit.component.events.received", [sink])
                                             / batches)
                 batch = sum(sink_batch.values())
-            # On an HTTP wire, the batches each edge of a judged run may hold in W and not yet
-            # in G: every request in flight, the writers' `concurrency:` summed
-            # (`HTTP_DEFAULT_CONCURRENCY` when unset), since the listener counts a batch before
-            # the writer reads its answer, or under `ack: true` its acknowledgment.
-            in_flight = 1
-            if source_wire(source) == HTTP_WIRE:
-                text = self._sut_config_text(service) or ""
-                in_flight = sum(component_int(text, sink, "concurrency")
-                                or HTTP_DEFAULT_CONCURRENCY for sink in sinks)
             g = total(self.wires[source.get("sut_listener")].g, sinks)
             if source_wire(source) == SCRAPE_WIRE:
                 sent, lost = _scrape_increments(gen, source)
                 g = sum(sent.values()) - sum(lost.values())
             self.gen_stats[service] = {
-                "in_flight": in_flight,
                 "G": g,
                 "dropped_by": dropped_by,
                 "G_datagrams": total("logit.output.datagrams", sinks),
@@ -3308,6 +3301,33 @@ def _ack_timeouts(led, source):
                       name, component=sink, **attrs))
 
 
+def _in_flight_reader(led, source):
+    """`in_flight_at(at)`: the batches an HTTP source's generator sinks held in flight at `at`,
+    the highest at the two generator drains straddling it (the last at or before it and the
+    first after), each sink counting `max(1, its HTTP_IN_FLIGHT reading)` and a sink that emits
+    no gauge, at a `concurrency:` of 1, counting 1; None when no sink emitted the gauge. A drain
+    with no point carries the sink's last value, since the gauge exports only on a change."""
+    gen = led.gens[source.get("service")]
+    series = [gen.gauge_series(HTTP_IN_FLIGHT, component=sink)
+              for sink in source_ids(source, "generator_sink")]
+    if not any(series):
+        return lambda at: None
+    drains = sorted(gen.drains)
+
+    def value_at(one, drain):
+        stamps = [ts for ts, _, _ in one]
+        index = bisect.bisect_right(stamps, drain) - 1
+        return max(1, int(one[index][1])) if index >= 0 else 1
+
+    def in_flight_at(at):
+        index = bisect.bisect_right(drains, at)
+        straddling = drains[max(0, index - 1):index + 1]
+        return max((sum(value_at(one, drain) if one else 1 for one in series)
+                    for drain in straddling), default=None)
+
+    return in_flight_at
+
+
 def _wire_one(data, led, source, instances=None):
     """`(status, detail, lines)` of `ledger.wire` for one source. Under `[overlap]`,
     `instances` holds each instance's ledger, and W, K, and F are theirs summed."""
@@ -3357,16 +3377,23 @@ def _wire_one(data, led, source, instances=None):
     batch = stats["batch"]
     ambiguous = _ambiguous_drops(led, source)
     acks = _ack_timeouts(led, source) if http else []
-    in_flight = stats.get("in_flight", 1)
+    in_flight_at = _in_flight_reader(led, source) if http else (lambda at: None)
     allowances = {}
+    edge_batches = {}
     for index, (start, end, kind, _, _, _, _) in enumerate(runs):
         if kind == "judged":
             # A judged run's surplus has no pool to fall into, so every edge it has, a boundary
-            # with another judged run included, allows its one batch of interpolation error, or
-            # on an HTTP wire one per request in flight, each counted in W before G.
-            sides = sum(1 for other in (index - 1, index + 1) if 0 <= other < len(runs))
+            # with another judged run included, allows its one batch of interpolation error. On
+            # HTTP the listener counts a request's batch in W before the writer counts it in G,
+            # so the lag at an edge is the batches in flight there, and the surplus lag leaves in
+            # a run is its lag at the end less its lag at the start: only the trailing edge's
+            # reading backs one, whatever the neighbour, so it allows that many batches when
+            # more than one, and the leading edge its one.
+            edge_batches[index] = (
+                [1] * (index > 0)
+                + [max(1, in_flight_at(end) or 1)] * (index + 1 < len(runs)))
             drops = sum(v for ts, v in ambiguous if start < ts <= end)
-            allowances[index] = (drops + sides * in_flight) * batch
+            allowances[index] = (drops + sum(edge_batches[index])) * batch
     connects = (sorted((ts, v) for sink in source_ids(source, "generator_sink")
                        for ts, v, _ in led.gens[service].counter_points(
                            "logit.output.requests", component=sink,
@@ -3416,9 +3443,12 @@ def _wire_one(data, led, source, instances=None):
                 what = (f"transport-error attempt(s) or ack timeout(s) ({_n(timed_out)} ack "
                         "timeout(s))")
             dials = sum(v for ts, v in connects if start < ts <= end)
+            held = edge_batches[index]
+            in_flight_text = (" holding " + " + ".join(_n(one) for one in held)
+                              + " batch(es) read in flight" if any(one > 1 for one in held)
+                              else "")
             lines[-1] += (f", surplus allowed {_n(allowed)} ({_n(drops)} {what} + "
-                          f"{sides} edge(s)"
-                          + (f" x {in_flight} in flight" if in_flight > 1 else "")
+                          f"{sides} edge(s)" + in_flight_text
                           + f", x one {_n(batch)}-line batch"
                           + (f"; {_n(dials)} connect failure(s) allow none" if dials else "")
                           + ")")
@@ -3426,9 +3456,7 @@ def _wire_one(data, led, source, instances=None):
                 took = "W − X" if http else "W + counted"
                 surplus.append(f"{span}: {took} exceeds G by {_n(round(-net))}, over "
                                f"the {_n(allowed)} its {_n(drops)} {what} and "
-                               f"{sides} edge(s)"
-                               + (f" x {in_flight} in flight" if in_flight > 1 else "")
-                               + " allow")
+                               f"{sides} edge(s)" + in_flight_text + " allow")
     if surplus:
         status = FAIL
         lines[:0] = surplus
