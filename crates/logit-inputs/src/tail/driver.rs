@@ -1184,7 +1184,8 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
     /// The first scan defers nothing: `read_from` decides only files it opens.
     ///
     /// Also returns each `Tailer::rejected` index some inode matched, claimed or not: a file
-    /// that matched it ambiguously starts at `0`, so it delivers what the entry described.
+    /// that matched one ambiguously starts at `0` under either `read_from`, so it delivers what
+    /// the entry described.
     fn claim_unmatched(
         &mut self,
         unmatched: &[(PathBuf, std::fs::Metadata)],
@@ -1266,6 +1267,11 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
                         "claim_ambiguous",
                         claim_ambiguous_message(path, matched.len(), files),
                     );
+                    // A rejected entry it matched isn't counted gone (`settle_claims`), so the
+                    // file delivers that entry's bytes from `0`, whatever `read_from` says.
+                    if matched.iter().any(|&c| matches!(candidates[c].0, ClaimFrom::Rejected(_))) {
+                        out[i] = Some((StartOffset::Beginning, None));
+                    }
                     false
                 }
             };
@@ -7658,40 +7664,43 @@ mod tests {
     }
 
     /// `copytruncate` while `logit` was down, with two copies of the original: both match its
-    /// rejected entry, so neither claims it and each is read from `0`, and the entry isn't
-    /// counted gone, since the copies deliver its bytes.
+    /// rejected entry, so neither claims it and each is read from `0`, under `read_from: end` too,
+    /// and the entry isn't counted gone, since the copies deliver its bytes.
     #[tokio::test]
     async fn a_rejected_entry_matched_ambiguously_is_not_counted_gone() {
-        let dir = scratch_dir("claim-rejected-ambiguous");
-        let path = dir.join("app.log");
-        let (one, two) = (long_line("one"), long_line("two"));
-        std::fs::write(&path, format!("{one}\n{two}\n")).unwrap();
-        let patterns = vec![PathPattern::new(dir.join("app.log*"))];
-        let config = checkpointed(&dir, ReadFrom::Beginning);
-        let mut hand = Hand::bind(vec![PathPattern::new(&path)], LineFactory, config.clone()).await;
-        assert_eq!(hand.pump().await.len(), 2);
-        hand.checkpoint().await;
-        drop(hand);
-        // Leave the entry `two` unread: rewind it to the end of `one`.
-        let head = std::fs::read(&path).unwrap();
-        let offset = one.len() as u64 + 1;
-        write_checkpoint_for(&dir, &path, offset, Head::of(&head[..offset as usize]));
+        for read_from in [ReadFrom::Beginning, ReadFrom::End] {
+            let dir = scratch_dir("claim-rejected-ambiguous");
+            let path = dir.join("app.log");
+            let (one, two) = (long_line("one"), long_line("two"));
+            std::fs::write(&path, format!("{one}\n{two}\n")).unwrap();
+            let patterns = vec![PathPattern::new(dir.join("app.log*"))];
+            let config = checkpointed(&dir, ReadFrom::Beginning);
+            let mut hand = Hand::bind(vec![PathPattern::new(&path)], LineFactory, config).await;
+            assert_eq!(hand.pump().await.len(), 2);
+            hand.checkpoint().await;
+            drop(hand);
+            // Leave the entry `two` unread: rewind it to the end of `one`.
+            let head = std::fs::read(&path).unwrap();
+            let offset = one.len() as u64 + 1;
+            write_checkpoint_for(&dir, &path, offset, Head::of(&head[..offset as usize]));
 
-        std::fs::copy(&path, dir.join("app.log.1")).unwrap();
-        std::fs::copy(&path, dir.join("app.log.2")).unwrap();
-        copytruncate_and_refill(&path, b"new\n");
-        let mut hand = Hand::bind(patterns, LineFactory, config).await;
-        let mut lines = hand.pump().await;
-        lines.sort();
-        let mut want = vec![one.clone(), one, two.clone(), two, "new".to_string()];
-        want.sort();
-        assert_eq!(lines, want);
-        assert_eq!(hand.rejected(), 1.0);
-        assert_eq!(hand.diag.occurrences("claim_ambiguous"), 2, "one per copy");
-        hand.checkpoint().await;
-        assert_eq!(gone_bytes(&mut hand.probe), 0.0, "the copies deliver it");
-        assert_eq!(hand.diag.occurrences("file_gone"), 0);
-        std::fs::remove_dir_all(&dir).ok();
+            std::fs::copy(&path, dir.join("app.log.1")).unwrap();
+            std::fs::copy(&path, dir.join("app.log.2")).unwrap();
+            copytruncate_and_refill(&path, b"new\n");
+            let config = checkpointed(&dir, read_from);
+            let mut hand = Hand::bind(patterns, LineFactory, config).await;
+            let mut lines = hand.pump().await;
+            lines.sort();
+            let mut want = vec![one.clone(), one, two.clone(), two, "new".to_string()];
+            want.sort();
+            assert_eq!(lines, want, "{read_from:?}");
+            assert_eq!(hand.rejected(), 1.0);
+            assert_eq!(hand.diag.occurrences("claim_ambiguous"), 2, "one per copy");
+            hand.checkpoint().await;
+            assert_eq!(gone_bytes(&mut hand.probe), 0.0, "the copies deliver it");
+            assert_eq!(hand.diag.occurrences("file_gone"), 0);
+            std::fs::remove_dir_all(&dir).ok();
+        }
     }
 
     /// An entry its own inode rejects and nothing claims is a file that's gone: its unread bytes

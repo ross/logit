@@ -196,13 +196,14 @@ reviewer can check.
 6. **A rejected entry nothing claims is counted as gone.** A checkpoint entry its inode's content
    rejected, and that no new file matches by content by the end of that scan, counts its recorded
    unread bytes as `logit.input.bytes.dropped{reason="gone"}` with a `file_gone` diagnostic. It goes
-   through the path a pruned entry already takes, counted only once a checkpoint write without
-   the entry lands ([ADR
+   through the path a pruned entry already takes, counted only once a checkpoint write without the
+   entry lands ([ADR
    `tail-discovery-failure-and-resume-identity`](tail-discovery-failure-and-resume-identity.md)'s
    2026-10-18 amendment). An entry a new file matched without claiming it (an ambiguous match,
-   decision 5) isn't counted: that file is read from `0`, so it delivers the entry's bytes. A file
-   created and removed wholly while `tail_in` was down can't be counted, because no checkpoint
-   recorded it. That's a decided limit.
+   decision 5) isn't counted: the code starts every file that matched a rejected entry ambiguously
+   at `0`, under `read_from: end` too, so it delivers the entry's bytes, which favors duplicates
+   over loss. A file created and removed wholly while `tail_in` was down can't be counted, because
+   no checkpoint recorded it. That's a decided limit.
 
 7. **An exact-pattern `copytruncate` is counted, not recovered.** At a truncation, the tailer counts
    the bytes it knew existed past its read offset, the last size it saw before the truncation less
@@ -286,7 +287,9 @@ reviewer can check.
   - A copy shorter than what the tailer read from the original (the original read appends the
     copy missed) can't claim, and once its wait runs out it's read from `0`, duplicating the
     original's lines.
-  - A copy whose head is under 64 bytes, or that matches ambiguously, is read from `0`.
+  - A copy whose head is under 64 bytes, or that matches ambiguously, starts where it would
+    have without a claim; one that matched a rejected entry ambiguously starts at `0` whatever
+    `read_from` says (decision 6).
   - A file opened empty whose bytes, once written, match or may grow into a truncated or tracked
     file's candidate is read only after the next scan's claim pass decides it, up to one
     `poll_interval` later. One that matches nothing is read at once.
