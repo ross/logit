@@ -129,8 +129,9 @@ the fault seam extended to reads. Each numbered item is one decision a reviewer 
    - **What it proves.** An append-only file never changes its first bytes and only grows, so
      it is never falsely rejected. A recycled inode is accepted only if its new content shares
      the first `min(256, offset)` bytes with the old file. For an offset of at most 256, that
-     means every skipped byte is identical content. Past 256, two files that share their first
-     256 bytes on a recycled inode are the accepted residual in `docs/known-gaps/tailing.md`.
+     means every skipped byte is identical content. Past 256, two files that shared their first
+     256 bytes on a recycled inode were an accepted residual, closed on 2026-10-29 by [ADR
+     `tail-content-identity`](tail-content-identity.md)'s offset marker (decision 4).
    - **A copytruncate-and-refill that the size check missed fails this check at restart.** The
      refilled file's head no longer matches, so it replays instead of skipping.
    - **A resume entry is spent only once the file is tracked.** That is after the open, the
@@ -272,8 +273,8 @@ the fault seam extended to reads. Each numbered item is one decision a reviewer 
 - **A transient listing error costs one diagnostic, not a replay.** A file whose path is removed
   while its directory can't be listed stays open until a listing succeeds and no longer names it,
   or until its handle shows a link count of 0. An `Active` file is still read.
-- **A recycled inode, or a truncate-and-refill, is a replay, not a skip.** Except for the
-  256-byte residual.
+- **A recycled inode, or a truncate-and-refill, is a replay, not a skip.** The 256-byte residual
+  this left is closed by [ADR `tail-content-identity`](tail-content-identity.md), decision 4.
 - **One release replays once.** The checkpoint version bump makes every existing checkpoint
   `Unusable`, so every file present at the first scan after the upgrade replays from `0`.
 - **A file's head costs a small buffer per tracked file,** one read of at most 256 bytes when a
@@ -284,11 +285,13 @@ the fault seam extended to reads. Each numbered item is one decision a reviewer 
 - **The fault seam is no longer mutation-only.** Every discovery syscall on the tail scan path
   (`read_dir`, each iteration step, `file_type`, and `metadata`) needs a `fault::check` before
   it.
-- **Documented gaps, not fixes.** Eleven entries in `docs/known-gaps/tailing.md` record what this stream leaves open, so a later workstream that closes one can
-  see it was expected:
+- **Documented gaps, not fixes.** Eleven entries in `docs/known-gaps/tailing.md` recorded what
+  this stream left open, so a later workstream that closes one can see it was expected. Three are
+  marked below as closed or decided, and that file no longer lists them; eight remain:
   - copytruncate fast refill (a decided limit since 2026-10-29; see [ADR
     `tail-content-identity`](tail-content-identity.md), decision 8);
-  - the 256-byte fingerprint residual;
+  - the 256-byte fingerprint residual (closed 2026-10-29; see [ADR
+    `tail-content-identity`](tail-content-identity.md), decision 4);
   - a `Draining` read error losing the unread tail;
   - a container name of 12 or more hex characters matching as an id prefix;
   - a directory unreadable at startup replaying under `read_from: end` once it recovers;
