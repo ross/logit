@@ -535,9 +535,9 @@ the first and second are also replayed through the harness:
   neither the scan's truncation checks nor a data wake reached it, and a refill after the
   truncation but before a rebind (or before the reap, with no rebind) was read from the old
   offset. Every scan now `fstat`s each `Draining` file's handle, and `drain` does before each read
-  of one; only a refill past the offset before the first such check stays unseen, the documented
-  size-detection gap. The model's `CopyTruncate` always scans before any append, so that gap
-  can't occur in it.
+  of one; only a refill past the offset before the first such check stays unseen, the decided
+  size-detection limit (ADR `tail-content-identity`, decision 8). The model's `CopyTruncate`
+  always scans before any append, so that limit can't occur in it.
 - **The rotation arm ignored an unspent checkpoint entry.** An inode whose entry survived a
   restart unspent (its `stat` failed), then rotated onto a path still bound to another inode,
   was opened at `0` and replayed, but only in the scan order where that path was reached before

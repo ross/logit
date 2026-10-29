@@ -5694,7 +5694,7 @@ mod tests {
 
     /// A draining file truncated in place is checked by `drain` before each read, so a refill
     /// past the old offset after that check, but before any scan rebinds the file, is still read
-    /// from `0`. Only a refill before the first check goes unseen (`docs/known-gaps/tailing.md`).
+    /// from `0`. Only a refill before the first check goes unseen (`docs/adr/tail-content-identity.md`, decision 8).
     #[tokio::test]
     async fn a_draining_inode_truncated_and_refilled_before_its_rebind_is_read_from_zero() {
         let dir = scratch_dir("draining-truncated-refilled");
