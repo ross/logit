@@ -922,7 +922,8 @@ def from_dict(raw, path):
             problems += _route_problems(ledger, sut_text)
             problems += _transform_problems(ledger, sut_text)
             problems += _delta_problems(ledger, sut_text, target, "overlap" in raw)
-            problems += _scrape_problems(ledger, target, "overlap" in raw, extra_suts)
+            problems += _scrape_problems(ledger, target, "overlap" in raw, extra_suts,
+                                         sut_text, configs, path.parent)
             if target["kind"] == KAFKA_TARGET:
                 target["format"] = kafka_format(ledger, sut_text, target["topic"], problems)
         problems += _writer_problems(ledger, configs, path.parent)
@@ -1787,12 +1788,13 @@ def _scraped(ledger):
                for source in sources)
 
 
-def _scrape_problems(ledger, target, overlap, extra_suts):
+def _scrape_problems(ledger, target, overlap, extra_suts, sut_text, configs, directory):
     """What a scrape wire breaks: it is the one `[[ledger.source]]`, with no `sut_transforms`,
     `fan_out`, or `merge`, into one SUT service with one `[[ledger.sink]]` on the local target,
     whose V the wire reads; and `SCRAPE_REFUSED_KEYS` and `[overlap]` are refused beside it.
     The wire judges the generator's increments against V, so nothing between the listener and
-    the sink may change a sample's value."""
+    the sink may change a sample's value. The listener's scrape `timeout` must be below the
+    generator's `aggregate` window (`_scrape_timing_problem()`)."""
     if not _scraped(ledger):
         return []
     problems = []
@@ -1803,6 +1805,9 @@ def _scrape_problems(ledger, target, overlap, extra_suts):
     for index, source in enumerate(sources):
         if not isinstance(source, dict):
             continue
+        timing = _scrape_timing_problem(source, sut_text, configs, directory)
+        if timing:
+            problems.append(f"ledger.source {index + 1}: {timing}")
         for key in ("sut_transforms", "fan_out", "merge"):
             if key in source:
                 problems.append(f"ledger.source {index + 1}: `{key}` can't be combined with a "
@@ -1822,6 +1827,49 @@ def _scrape_problems(ledger, target, overlap, extra_suts):
     if extra_suts:
         problems.append("a scrape wire needs one SUT service")
     return problems
+
+
+# `prometheus_in`'s scrape `timeout`, and `aggregate`'s window, when the config names none
+# (crates/logit-config).
+SCRAPE_DEFAULT_TIMEOUT_S = 10.0
+AGGREGATE_DEFAULT_WINDOW_S = 10.0
+
+
+def _component_seconds(text, component, key):
+    """A duration field of `component` in config `text`, in seconds, or None."""
+    for block in component_blocks(text, component):
+        found = re.search(rf"\b{key}\s*:\s*[\"']?([0-9][0-9a-z.]*)", _uncommented(block))
+        if found:
+            try:
+                return parse_duration(found.group(1))
+            except ValueError:
+                return None
+    return None
+
+
+def _scrape_timing_problem(source, sut_text, configs, directory):
+    """Why a scrape source's listener `timeout` isn't below its generator's longest `aggregate`
+    window, or None. `ledger.wire` credits a sample to the generator life in force at its scrape
+    time. A scrape that starts before a generator restart can read the new process's totals as
+    long as it waits, and the new process exposes none until its first window ends, so a timeout
+    below the window keeps every sample on the life that made it."""
+    service = source.get("service")
+    name = configs.get(service) if isinstance(configs, dict) else None
+    listener = source.get("sut_listener")
+    if (not isinstance(name, str) or not isinstance(listener, str)
+            or not (directory / name).is_file()):
+        return None
+    text = (directory / name).read_text()
+    ids = re.findall(r"^  ([A-Za-z0-9_][A-Za-z0-9_.-]*)\s*:", text, re.M)
+    windows = [_component_seconds(text, one, "interval") or AGGREGATE_DEFAULT_WINDOW_S
+               for one in ids if listener_wire(text, one)[1] == "aggregate"]
+    window = max(windows or [AGGREGATE_DEFAULT_WINDOW_S])
+    timeout = _component_seconds(sut_text, listener, "timeout") or SCRAPE_DEFAULT_TIMEOUT_S
+    if timeout < window:
+        return None
+    return (f"the scrape `timeout` ({timeout:g}s) must be below the generator's `aggregate` "
+            f"window ({window:g}s), or a scrape that starts before a generator restart can "
+            "read the new process's totals and credit them to the old life")
 
 
 def _hop_problems(ledger, extra_suts):

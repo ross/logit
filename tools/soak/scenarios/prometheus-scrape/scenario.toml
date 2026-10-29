@@ -41,7 +41,7 @@ rss_growth_mib_per_hour = 64   # WARN under 1h, FAIL above
 fd_growth = 8
 
 # Each scrape fails while the generator is off the network. Resolving its name and dialing it
-# don't fail within the 2 s timeout, so each one counts `timeout`, not `network_error`.
+# don't fail within the 500 ms timeout, so each one counts `timeout`, not `network_error`.
 [[step]]
 at = "0s"
 action = "partition"
@@ -56,7 +56,7 @@ action = "pause"
 on = "generator"
 for = "60s"
 
-# The generator's answers arrive past the scrape's 2 s timeout.
+# The generator's answers arrive past the scrape's 500 ms timeout.
 [[step]]
 at = "5m"
 action = "netem"
