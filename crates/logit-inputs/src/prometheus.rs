@@ -313,8 +313,9 @@
 //! see whether a vmagent stayed on zstd. A write that reaches delivery is counted `ok` or
 //! `closed_consumer` on the delivery's own task, so a sender whose timeout fires while
 //! backpressure holds the `204` still counts the write it gave up on, as
-//! `logit.component.batches.sent` counts its batch. A request whose connection closes before its
-//! body is decoded counts no class, since nothing of it was sent. `logit.input.write.duration` --
+//! `logit.component.batches.sent` counts its batch. A request whose connection closes mid-body
+//! counts `oversize` when the handler reads the error, and no class when hyper drops the handler
+//! first; nothing of it was sent either way. `logit.input.write.duration` --
 //! a timing sample per request answered, whatever the outcome. `logit.input.samples` -- reused
 //! from scrape mode, counted with the `ok` write, counting the wire samples of a write a consumer
 //! took: every decoded series' worth minus every series the model
