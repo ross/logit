@@ -7495,6 +7495,45 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// A deferred copy that may still claim a truncation pins it past its two offers, but only
+    /// up to `TRUNCATION_OFFERS + CLAIM_DEFER_SCANS`: a second copy that keeps it pinned once the
+    /// first's wait runs out doesn't hold it longer.
+    #[tokio::test]
+    async fn a_pinned_truncation_is_counted_once_its_wait_runs_out() {
+        let dir = scratch_dir("claim-pinned-cap");
+        let path = dir.join("app.log");
+        let content = format!("{}\n{}\n", long_line("one"), long_line("two"));
+        std::fs::write(&path, &content).unwrap();
+        let mut probe = TelemetryProbe::new();
+        let mut tailer = probed_tailer(
+            vec![PathPattern::new(dir.join("app.log*"))],
+            ReadFrom::Beginning,
+            &probe,
+        );
+        assert_eq!(tick(&mut tailer, true).await.len(), 2);
+
+        // Seen by a drain, so the first scan below offers it once.
+        append(&path, b"x\n");
+        tailer.scan(false, &mut crate::tail::watch::Watcher::Poll).await;
+        truncate(&path);
+        assert!(drain_by_hand(&mut tailer).await.is_empty());
+        // A prefix of the original's head too short to decide: it may grow into a match.
+        let prefix = &content.as_bytes()[..30];
+        std::fs::write(dir.join("app.log.1"), prefix).unwrap();
+        tailer.scan(false, &mut crate::tail::watch::Watcher::Poll).await;
+        assert_eq!(truncated_drops(&mut probe), (0.0, 0.0), "offered once");
+        tailer.scan(false, &mut crate::tail::watch::Watcher::Poll).await;
+        assert_eq!(truncated_drops(&mut probe), (0.0, 0.0), "pinned at two offers");
+        std::fs::write(dir.join("app.log.2"), prefix).unwrap();
+        tailer.scan(false, &mut crate::tail::watch::Watcher::Poll).await;
+        assert!(tailer.files.contains_key(&id_of(&dir.join("app.log.1"))), "its wait ran out");
+        assert_eq!(truncated_drops(&mut probe), (0.0, 0.0), "pinned by the second copy");
+        tailer.scan(false, &mut crate::tail::watch::Watcher::Poll).await;
+        assert_eq!(tailer.truncations.len(), 0);
+        assert_eq!(truncated_drops(&mut probe), (2.0, 0.0), "counted at four offers");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// A scan whose listing failed may have missed a copy, so it holds the truncation it found
     /// through the open handle; a clean stop counts it, since no later scan can offer it.
     #[tokio::test]
