@@ -652,6 +652,124 @@ The node replaces `sut_aggregate` rather than sitting beside one, since an `aggr
 would resum the deltas the row judges. [`docs/plans/soak-harness.md`](../plans/soak-harness.md),
 "10. Next scenarios", item 20, has the rules.
 
+## Amendment: three more HTTP listeners, and an acknowledgment timeout allows a resend (2026-10-29)
+
+The HTTP wire follows `splunk_hec_in`, `datadog_in`, and `prometheus_in`'s remote-write
+receiver, from `splunk_hec_out`, `datadog_out`, and `prometheus_out`. `splunk_hec_in` and
+`datadog_in` count requests and answer busy as `influxdb_in` does, so `ledger.intake` holds them
+to its two identities on their write routes. `prometheus_in` counts `logit.input.writes{class}`,
+with no `route` tag, and never answers busy, so it holds only the first. It has no `transport:`,
+so its wire is keyed on the mode its config sets: `bind:` is the receiver, and
+`scrape_targets:` the scrape wire, the next amendment.
+
+- **An acknowledgment timeout allows one batch of surplus, as a transport error does.**
+  `splunk_hec_out` under `ack: true` counts a batch delivered only once `/ack` answers every id
+  of it, and resends the whole batch once `ack_timeout` passes. `splunk_hec_in` keeps its ack
+  ledger in memory, so a restart forgets ids it issued for bodies it had already delivered, and
+  the resend puts each such batch in W a second time. Each id counted
+  `logit.output.acks{result="timeout"}` allows one batch, an upper bound because one batch can
+  hold several ids. A poll the writer counts under `route="ack"` sends no data, so a poll that
+  fails in transport allows none.
+- **A judged run's trailing edge allows the batches the writer read in flight there.** The
+  listener counts a batch in W before the writer reads its answer, and under `ack: true` before
+  its acknowledgment arrives, half a second or more later. So a writer at `concurrency: 8`
+  holds batches in W and not in G at any edge, and the lag drifts by up to that many between
+  drains. `splunk-hec-ingress`'s first run FAILed a SUT restart's window, beside a reported
+  kill, by 930 points against 700 allowed with nothing lost. The surplus lag leaves in a run is
+  its lag at the end less its lag at the start, so a judged run's trailing edge now allows
+  `max(1, in_flight)` batches, `in_flight` being the higher of the writer's
+  `logit.output.in_flight` readings at the two generator drains straddling it, whatever the
+  neighbour, and its leading edge one batch. Three other forms were rejected. The writer's
+  `concurrency:` on every edge passes a loss of 300 beside 1,000 duplicates in one judged run
+  where nothing was in flight. The reading on both edges passes 1,500 unexplained with 8 in
+  flight at each. `concurrency:` only at a trailing edge beside a reported run FAILed the
+  rerun's generator-netem window on lag alone: a steady neighbour's own drift hid the opposite
+  sign `_boundary_nets` nets. The gauge measures the batches at the edge that backs a surplus,
+  so it covers the drift and widens nothing it didn't see.
+
+## Amendment: a scrape wire judges increments per generator life (2026-10-29)
+
+`prometheus_in` scraping a generator's `prometheus_out` exposition is a fifth wire, `scrape`,
+judged in value: per generator life, G, the increments its `generate_in` sent less what the
+`generate_in`s dropped and its `aggregate`s counted in `logit.transform.metrics.dropped`,
+against V, the stored counters' reset-aware total in that
+life.
+
+A pull carries running totals, not lines. A sample is a series' total at the scrape, so there
+is no count of lines on either side to compare, and the generator's `aggregate` exports no
+per-series total to read G from. The increments are the one quantity both ends hold: the
+generator counts them as it generates, and the backend's reset-aware total sums them back. A
+failed, timed-out, or skipped scrape loses no increment, since the next one reads the total
+that includes it, so the only loss is intermediate values, and no fault window excuses
+anything.
+
+- **V splits at the generator's lives, not the SUT's.** A generator restart resets its totals,
+  which the backend records as a counter reset, and a SUT restart doesn't reset them. So each
+  sample is credited by its scrape time to the generator life in force, and a SUT restart
+  splits nothing. A scrape that starts before a generator restart and waits for the new
+  process could read its totals and credit them to the old life, so `load()` requires the
+  scrape `timeout` below the generator's `aggregate` window, before which the new process
+  exposes nothing.
+- **Only the drops before a total count against G.** A dropped event at a `generate_in`, or a
+  metric an `aggregate` dropped, is an increment no total holds. A drop anywhere else loses
+  none: `internal` and its sinks carry telemetry, and a cumulative point the `aggregate`
+  failed to send is carried by its next one.
+- **Each generator life has an end band.** The increments after a life's last scrape never
+  reach a scrape: up to one scrape `interval`, plus one generator `aggregate` window, since the
+  scraped totals lag the generation by up to a window, plus the scrape `timeout`, since a
+  scrape reads the totals up to that long after it starts. A drain interval more would hide
+  that much uncounted loss, since this band alone judges a life's end values. A life the end
+  sequence stops exports all its counts, so its G − V can't go below 0;
+  a killed life's last drain interval of counts is never exported, so G can fall short of the
+  increments V holds by one drain interval of them. A life outside its band FAILs, a surplus
+  below it and lost increments above it.
+- **A kill on the generator is allowed on this wire alone.** Elsewhere a generator killed
+  after its last drain has sent lines with no G behind them. A scrape target sends nothing; a
+  kill only ends a life early, which its end band covers.
+- **The count rows judge samples.** W is the listener's `logit.input.samples`, which leaves out
+  the three synthetic samples each scrape appends, `up`, `scrape_duration_seconds`, and
+  `scrape_samples_scraped`, failures included. They are Y, three per scrape, so the listener
+  balances W + Y − D == E + B, and the sink's `vm_selector` leaves them out too, so the
+  distinct stored samples per SUT life are judged against W − X. A dropped batch's events
+  count its three synthetic samples too, one batch per scrape, so `ledger.egress` takes
+  3 per dropped batch out of X, and out of the sink's counted drops. The rows that read an
+  `aggregate` SKIP: the SUT relays samples and has none, and a node between the listener and
+  the sink could change the values the wire judges, so `load()` refuses `sut_transforms` and
+  every `[ledger]` key that names such a node.
+
+[`docs/plans/soak-harness.md`](../plans/soak-harness.md), "10. Next scenarios", item 22, has the
+scenario.
+
+## Amendment: a TCP window's resend allowance counts ambiguous attempts (2026-10-29)
+
+A TCP source's judged window allowed one generator batch of surplus per
+`ambiguous_at_most_once` drop, which only a sink under `at_most_once` counts. `statsd_out`
+defaults to that posture, but `syslog_out` and `graphite_out` default to `at_least_once`, which
+resends the batch after an ambiguous attempt and drops nothing, so a `syslog_out` generator at
+its default would have no allowance for the lines its failed attempts left at the SUT.
+
+The allowance now counts the generator sink's ambiguous attempts,
+`logit.output.requests{class="ambiguous"}`, which the stream driver counts once per attempt
+under either posture (`crates/logit-outputs/src/stream.rs`). Under `at_most_once` each such
+attempt is one `ambiguous_at_most_once` drop, so `statsd_out`'s allowance is unchanged; under
+`at_least_once` each leaves at most one batch the SUT read beside the resend G counts. A TLS
+first write that fails is ambiguous, where a plaintext one is clean, and adds to the count the
+same way. A drop counted with no ambiguous attempt beside it allows nothing.
+
+## Amendment: the end run nets at its boundary (2026-10-29)
+
+A `syslog-tls-ingress` run FAILed `ledger.wire` with nothing lost: G fell 100.1 short of W at
+the end, against an end allowance of 100, while the steady run before the end read 98 of loss.
+The generator counted a batch in the drain interval before the end run's boundary and the
+listener read it in the one after, the opposite-signed pair "a boundary pair nets in full" describes. That rule netted only
+at a boundary touching a judged run, so the end run's shortfall met its allowance whole.
+
+The end run now nets with the run before it, steady or judged, on every wire, under the same
+cap: up to the G that moved over the generator interval straddling the boundary, and never past
+either gap. The end allowance then applies to what's left, and the end run's netted gap is what
+the loss outside the reported windows counts. A reported run still never nets. Re-scored, the
+run PASSes with 98 netted across the boundary and 2 left at the end.
+
 ## Amendment: a relay keeps `aggregate` in `logit`, and V splits on its lives (2026-10-29)
 
 A sink whose destination is another `logit` (`otlp_out` over gRPC to `otlp_in`, passed on by
@@ -667,17 +785,6 @@ in the middle of a `logit` life, such as the queue of its own sink at a kill, ch
 stored total, so the egress rows see it only when it holds a life's last value. That's the
 property the scenario soaks: a cumulative relay through a stateless hop. A relay can't be
 combined with a hop, every sink names the same one, and the target is local.
-
-## Amendment: the end run nets with the run before it (2026-10-29)
-
-A `graphite-egress` run FAILed `ledger.wire` with G − W exactly 0 over the run: the end run read
-G 102 short of W + K, past its allowance of 100, and the steady run before it read 102 of loss.
-G's interpolation at the boundary between them put one drain's lines on the wrong side. Every
-wire now nets that boundary, from a judged or a steady run into the end run, as the 2026-10-25
-amendment nets a boundary that touches a judged run: an opposite-signed pair nets up to the G
-that moved over the straddling generator interval. The end allowance covers only the sends the
-generator cancels at shutdown, and it then applies to the end run's net. A reported run still
-never nets. Re-scored, the run PASSes with 0 of steady loss judged.
 
 ## Amendment: OTLP and HEC stand-ins overwrite under cumulative temporality, and name loss by position (2026-10-29)
 

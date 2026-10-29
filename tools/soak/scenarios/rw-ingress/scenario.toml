@@ -1,0 +1,170 @@
+# Generated remote-write 2.0 samples from `prometheus_out` into `logit`'s `prometheus_in` on
+# `bind:` and out to VictoriaMetrics, under network and lifecycle faults on both ends and a
+# backend stop. G counts only the samples the SUT answered `204` for, after they were in its
+# pipeline, so every window but a kill's is judged. The receiver never answers busy: a backend
+# stop holds its `204` past the generator's 10 s timeout, and the generator resends a batch the
+# SUT still delivers, a surplus allowed one batch per transport-error attempt. The schema is
+# docs/plans/soak-harness.md's "The scenario schema".
+
+name = "rw-ingress"
+description = "generator prometheus_out RW2 -> prometheus_in bind (HTTP) -> kv_metrics -> aggregate 500ms cumulative -> prometheus_out RW1 zstd -> VictoriaMetrics"
+duration = "18m"          # warmup + one cycle + cooldown; --duration overrides
+warmup = "60s"            # no faults: baseline rate, RSS, fds
+cooldown = "120s"         # no faults at the end; >= recovery_bound
+recovery_bound = "45s"    # the generator's retry_max_delay 1s, the sink's 10s, and a drain
+cycle = "15m"             # >= last recovery (13m45s) + 2 x progress_window
+
+[configs]
+sut = "logit-sut.yaml"
+generator = "logit-generator.yaml"
+
+[ledger]                  # component ids the checker reads; no rates here
+sut_aggregate = "window"
+wire_loss_outside_faults = 0.0
+
+[[ledger.source]]
+service = "generator"
+generator_input = "load"
+generator_sink = "remote_write"
+sut_listener = "remote_write"
+sut_transforms = ["count"]
+wire = "http"             # G events.delivered, W the listener's events.sent
+
+[[ledger.sink]]
+id = "victoria_metrics"
+backend = "victoria-metrics"
+vm_selector = '{__name__="soak_requests_total"}'
+
+[thresholds]
+progress_window = "30s"
+rss_growth_mib_per_hour = 64   # WARN under 1h, FAIL above
+fd_growth = 8
+
+# The SUT's egress carries its answers. Delayed 11 s, past prometheus_out's 10 s timeout, the
+# answer to a request the SUT took arrives after the generator gave up on it, and the generator
+# resends a batch the SUT holds: a surplus judged against its transport errors.
+[[step]]
+at = "0s"
+action = "netem"
+on = "logit"
+args = "delay 11s"
+for = "60s"
+
+[[step]]
+at = "2m30s"
+action = "netem"
+on = "logit"
+args = "loss 30%"
+for = "90s"
+
+# Netem on the generator delays its requests: judged as well.
+[[step]]
+at = "5m"
+action = "netem"
+on = "generator"
+args = "loss 10%"
+for = "60s"
+
+# The sink's two-batch queue and every inbox back to the listener fill, and the listener then
+# holds each request until its batch is taken: past the generator's 10 s timeout, which
+# resends the batch while the held one still delivers once the backend is back.
+[[step]]
+at = "7m"
+action = "stop"
+on = "victoria-metrics"
+for = "90s"
+
+# The SUT's graceful ends: each answers what it took before it exits, so they're judged.
+[[step]]
+at = "10m"
+action = "stop"
+on = "logit"
+for = "30s"
+
+[[step]]
+at = "11m30s"
+action = "restart"
+on = "logit"
+for = "30s"
+
+# A SIGKILL loses up to one `internal` interval of the SUT's counts: reported.
+[[step]]
+at = "12m30s"
+action = "kill"
+on = "logit"
+for = "30s"
+
+# Held `204`s time out at the generator, which resends.
+[[expect]]
+name = "backend-stop-resends"
+service = "generator"
+metric = "logit.output.requests"
+component = "remote_write"
+attrs = { class = "network_error" }
+step = "c0s4"
+window = "through"
+reduce = "delta"
+min = 1
+
+[[expect]]
+name = "generator-resends"
+service = "generator"
+metric = "logit.output.requests"
+component = "remote_write"
+attrs = { class = "network_error" }
+step = "c0s1"
+window = "through"
+reduce = "delta"
+min = 1
+
+# The receiver counts each write it delivered, and the samples in it.
+[[expect]]
+name = "listener-writes"
+service = "logit"
+metric = "logit.input.writes"
+component = "remote_write"
+attrs = { class = "ok" }
+window = "run"
+reduce = "delta"
+min = 1
+
+[[expect]]
+name = "listener-samples"
+service = "logit"
+metric = "logit.input.samples"
+component = "remote_write"
+window = "run"
+reduce = "delta"
+min = 1
+
+# A write the receiver refuses whole, any class but `ok`, would be a batch neither side counts.
+[[expect]]
+name = "listener-refuses-none"
+service = "logit"
+metric = "logit.input.writes"
+component = "remote_write"
+attrs = { class = "bad_request" }
+window = "run"
+reduce = "delta"
+max = 0
+
+# Under 2.0 the receiver reports every sample it took written.
+[[expect]]
+name = "generator-samples-written"
+service = "generator"
+metric = "logit.output.samples.dropped"
+component = "remote_write"
+window = "run"
+reduce = "delta"
+max = 0
+
+# Backpressure never reaches the sink as a drop: `block` holds every batch.
+[[expect]]
+name = "sink-never-drops"
+service = "logit"
+metric = "logit.component.batches.dropped"
+component = "victoria_metrics"
+step = "c0s4"
+window = "through"
+reduce = "delta"
+max = 0

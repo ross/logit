@@ -858,13 +858,28 @@ the operator-facing account of all of this.
   against the listener's `transport:`: W is `input.frames`, the framer's drops are counted wire
   loss, and the generator's netem is judged at 0 because TCP retransmits. A process-ending
   fault, or a partition that moved or didn't record the SUT's address, is reported; every other
-  TCP window is judged with a surplus allowance (the plan's `ledger.wire` row).
+  TCP window is judged with a surplus allowance (the plan's `ledger.wire` row) of one batch per
+  ambiguous attempt the generator's sink counted, under either posture.
+  `syslog-tcp-ingress` and `syslog-tls-ingress` send RFC 5424 from `syslog_out` at its default
+  `at_least_once`, octet-counted, into `syslog_in` over TCP and over TLS from the run's private
+  CA, through a certificate rotation in the second, with `[[expect]]` rows on the listener's
+  `logit.input.connections.closed{reason="reset"}`.
   `http-ingress` sends InfluxDB points from `influxdb_out` into `influxdb_in`, its source
   declared `wire = "http"`: G is the points the listener answered `204` for and W its
   `events.sent`, a busy `503` and `logit.input.batches.deferred` are a retry, not loss, and only
   a kill or an `exit` of the SUT is reported; every other window is judged with a surplus of one
   batch per transport-error resend allowed. `otlp_in` has rows of its own on that wire
-  (`checks.HTTP_LISTENERS`). `otlp-fan-out` sends OTLP log records over it whose bodies each
+  (`checks.HTTP_LISTENERS`), and so do `splunk_hec_in`, `datadog_in`, and `prometheus_in`'s
+  remote-write receiver, its wire keyed on its `bind:` mode, which `splunk-hec-ingress`,
+  `datadog-ingress`, and `rw-ingress` run from `splunk_hec_out` under `ack: true`,
+  `datadog_out`, and `prometheus_out`; an ack timeout allows a resend as a transport error does.
+  `prometheus-scrape` has `prometheus_in` scrape a generator's `prometheus_out` exposition, on
+  the `scrape` wire its `scrape_targets:` mode keys: G is each generator life's increments and
+  V the stored counters' reset-aware total in that life, a failed scrape loses only intermediate
+  values, and each life's G − V must fall in an end band of one scrape interval, one generator
+  window, and one scrape timeout, which must be below the window; a kill on that generator is
+  allowed.
+  `otlp-fan-out` sends OTLP log records over it whose bodies each
   hold four line-protocol points into `otlp_in -> line_protocol`, its source declaring
   `fan_out = { points = 4 }`: `ledger.edge` judges the node's children,
   `events.sent − (events.received − events.discarded)`, against 4 × its events received less

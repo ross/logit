@@ -12,7 +12,9 @@
 #
 # Not part of script/cibuild: it drives the host's docker daemon, and no test depends on it.
 #
-#   SOAK_SKIP_IMAGE=1   reuse the existing logit:soak and logit-soak-netem:local images
+#   SOAK_IMAGE=<tag>    the `logit` image to build and run (default logit:soak); a private tag
+#                       keeps a branch's build from replacing the image another run shares
+#   SOAK_SKIP_IMAGE=1   reuse the existing SOAK_IMAGE and logit-soak-netem:local images
 #   SOAK_OUT=<dir>      where run directories go (default perf/results/soak)
 #   SOAK_EXTERNAL_ENV=<f>  an external-target scenario's env file: the variables its [target]
 #                       table lists, such as DD_API_KEY, as KEY=value or shell export lines
@@ -24,7 +26,7 @@ SCRIPT_PATH="$(dirname -- "$(readlink -f -- "${0}")")"
 source "${SCRIPT_PATH}/common.sh"
 
 TOOLS_DIR="${ROOT}/tools/soak"
-IMAGE="logit:soak"
+IMAGE="${SOAK_IMAGE:-logit:soak}"
 NETEM_IMAGE="logit-soak-netem:local"
 
 python3 -c 'import sys; sys.exit(sys.version_info < (3, 11))' || {

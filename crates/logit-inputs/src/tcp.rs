@@ -91,7 +91,13 @@
 //! byte ends quietly: no `connection_error`, and nothing counted, since no data was lost. A load
 //! balancer ends a health check this way: HAProxy's PROXY-aware check sends a `LOCAL` header and
 //! then an RST, which reaches [`serve_connection`] while it waits for the first payload byte. A
-//! reset after the first byte is a broken connection, diagnosed as `connection_error`.
+//! reset after the first byte is a broken connection: diagnosed as `connection_error` and counted
+//! `logit.input.connections.closed{reason="reset"}`, with any partial frame it cut off counted
+//! `logit.input.frames.dropped{reason="truncated"}`. The count isn't a loss (`*.dropped`): it
+//! says how often peers break connections, and the truncated frame is the loss. A Unix stream
+//! socket shares the path, but Linux resets a Unix peer only when it closes with bytes it hasn't
+//! read, and this listener never writes to a peer, so a Unix connection doesn't count one in
+//! practice. A reset during a TLS handshake is the handshake's `connection_error`, uncounted.
 //!
 //! **Idle timeout.** [`TcpListener::with_idle_timeout`] (the operator's `idle_timeout:`) is off
 //! unless set, and when set bounds how long a connection may stay quiet before this listener
@@ -1147,6 +1153,9 @@ where
             ReadStep::Failed(err) => {
                 // The connection broke, but what was already decoded is good: deliver it before
                 // surfacing the error as `connection_error`.
+                if err.kind() == std::io::ErrorKind::ConnectionReset {
+                    telemetry.count("logit.input.connections.closed", 1.0, &[("reason", "reset")]);
+                }
                 report_buffered_tail(&mut framer, &telemetry, diag);
                 if let Some(batch) = accumulator.take() {
                     emit(&sink, &telemetry, batch, FlushReason::Closed).await;
@@ -1855,6 +1864,45 @@ mod tests {
         handle.abort();
     }
 
+    /// Under TLS, the socket's `ECONNRESET` reaches the read through `tokio_rustls` with its
+    /// kind intact, so a reset after the first byte counts as over plaintext.
+    #[tokio::test]
+    async fn a_reset_after_payload_bytes_over_tls_counts_a_reset() {
+        let mut probe = TelemetryProbe::new();
+        let (addr, listener) = bound_listener(one_per_frame()).await;
+        let mut listener = listener
+            .with_telemetry(probe.telemetry("syslog_in", "syslog_in", "listener"))
+            .with_tls(
+                &test_tls_settings(None),
+                &testdata_dir(),
+                &logit_pipeline::tls::TlsReloader::new(),
+            )
+            .unwrap();
+        let (sink, mut rx) = fanout_into_channel(16);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let handle =
+            tokio::spawn(async move { listener.run_until_shutdown(sink, shutdown_rx).await });
+
+        let connector = tls_connector("ca.pem", None).await;
+        let mut client = tls_connect(&connector, &addr).await;
+        client.write_all(b"12 <13>over tls").await.unwrap();
+        client.flush().await.unwrap();
+        assert_eq!(payloads(&recv_batch(&mut rx).await), vec!["<13>over tls"]);
+
+        // Dropped with no `close_notify` and `SO_LINGER 0`, so the server reads an RST.
+        socket2::SockRef::from(client.get_ref().0).set_linger(Some(Duration::ZERO)).unwrap();
+        drop(client);
+
+        let totals = probe
+            .wait_for("the TLS reset counted", |t| {
+                t.sum("logit.input.connections.closed", &[("reason", "reset")]) >= 1.0
+            })
+            .await;
+        assert_eq!(totals.sum("logit.input.connections.closed", &[("reason", "reset")]), 1.0);
+
+        handle.abort();
+    }
+
     #[tokio::test]
     async fn a_client_trusting_the_wrong_ca_is_refused_and_the_listener_keeps_serving() {
         let (addr, listener) = bound_listener(one_per_frame()).await;
@@ -2098,6 +2146,11 @@ mod tests {
             drained.sum("logit.input.connections.closed", &[("reason", "idle")]),
             1.0,
             "an idle close is counted"
+        );
+        assert_eq!(
+            drained.sum("logit.input.connections.closed", &[("reason", "reset")]),
+            0.0,
+            "as idle, never as a reset"
         );
         assert_eq!(
             listener_diag.occurrences("connection_error"),
@@ -2885,6 +2938,7 @@ mod tests {
         let batch = next_connection_delivers(&mut running, b"<13>after\n").await;
         assert_eq!(payloads(&batch), vec!["<13>after"]);
         assert_eq!(running.diag.occurrences("connection_error"), 0);
+        assert_eq!(running.probe.sum(CLOSED, &[("reason", "reset")]), 0.0);
         running.handle.abort();
     }
 
@@ -2908,13 +2962,14 @@ mod tests {
                 0.0,
                 "after {header:?}"
             );
+            assert_eq!(running.probe.sum(CLOSED, &[("reason", "reset")]), 0.0, "after {header:?}");
             running.handle.abort();
         }
     }
 
-    /// A reset after payload bytes is a broken connection, diagnosed as before.
+    /// A reset after payload bytes is a broken connection: diagnosed, and counted a reset close.
     #[tokio::test]
-    async fn a_reset_after_payload_bytes_is_still_a_connection_error() {
+    async fn a_reset_after_payload_bytes_is_a_connection_error_and_counts_a_reset() {
         for proxy_protocol in [false, true] {
             let mut running = one_permit(proxy_protocol).await;
             let header: &[u8] = if proxy_protocol { b"PROXY UNKNOWN\r\n" } else { b"" };
@@ -2927,13 +2982,52 @@ mod tests {
                 1,
                 "proxy_protocol: {proxy_protocol}"
             );
+            assert_eq!(
+                running.probe.sum(CLOSED, &[("reason", "reset")]),
+                1.0,
+                "proxy_protocol: {proxy_protocol}"
+            );
             running.handle.abort();
         }
+    }
+
+    /// A reset between frames, with nothing buffered, still counts: the connection broke, though
+    /// nothing was truncated.
+    #[tokio::test]
+    async fn a_reset_between_frames_counts_a_reset_and_nothing_truncated() {
+        let mut running = one_permit(false).await;
+        let mut client = connect(&running.addr).await;
+        client.write_all(b"<13>complete\n").await.unwrap();
+        assert_eq!(payloads(&recv_batch(&mut running.rx).await), vec!["<13>complete"]);
+        socket2::SockRef::from(&client).set_linger(Some(Duration::ZERO)).unwrap();
+        drop(client);
+        next_connection_delivers(&mut running, b"<13>after\n").await;
+        assert_eq!(running.probe.sum(CLOSED, &[("reason", "reset")]), 1.0);
+        assert_eq!(
+            running.probe.sum("logit.input.frames.dropped", &[("reason", "truncated")]),
+            0.0
+        );
+        running.handle.abort();
+    }
+
+    /// A clean close (a FIN) after payload bytes is no reset.
+    #[tokio::test]
+    async fn a_clean_close_after_payload_bytes_counts_no_reset() {
+        let mut running = one_permit(false).await;
+        let mut client = connect(&running.addr).await;
+        client.write_all(b"<13>complete\n").await.unwrap();
+        assert_eq!(payloads(&recv_batch(&mut running.rx).await), vec!["<13>complete"]);
+        drop(client);
+        next_connection_delivers(&mut running, b"<13>after\n").await;
+        assert_eq!(running.probe.sum(CLOSED, &[("reason", "reset")]), 0.0);
+        assert_eq!(running.diag.occurrences("connection_error"), 0);
+        running.handle.abort();
     }
 
     // ---- driver: PROXY protocol ---------------------------------------------------------------
 
     const PROXY_REJECTED: &str = "logit.input.connections.rejected";
+    const CLOSED: &str = "logit.input.connections.closed";
 
     /// A running `proxy_protocol: true` listener with `peer:` as given, and a probe on its
     /// telemetry.

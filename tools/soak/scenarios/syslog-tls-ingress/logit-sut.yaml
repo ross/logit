@@ -1,0 +1,47 @@
+# The system under test in `script/soak`'s syslog-tls-ingress scenario: syslog over TCP with
+# TLS, each message's `id=N` turned into one `soak_lines{id}` increment, a 10 s cumulative
+# aggregate, and remote-write 1.0 (zstd) to VictoriaMetrics over plain HTTP. Its certificate
+# files sit behind the `live` symlink a `rotate` step repoints, and with the poll off only a
+# SIGHUP reloads them. Its `internal` telemetry goes to stdout as NDJSON for the harness to read.
+tls_reload_interval: 0s             # a SIGHUP is the one trigger
+admin: { bind: 127.0.0.1:9600 }     # the image HEALTHCHECK's probe address
+components:
+  syslog:
+    type: syslog_in
+    transport: tcp                  # no receive queue: the connection is the backpressure
+    bind: 0.0.0.0:6514
+    idle_timeout: 60s               # past the 45 s partition
+    tls:
+      cert_file: /tls/syslog/live/cert.pem    # the override mounts <run>/tls here
+      key_file: /tls/syslog/live/key.pem
+  # Every node between `syslog` and `window` forwards every event it receives, which
+  # `ledger.edge` checks hop by hop: `kv` passes a message it can't parse through unchanged, and
+  # `keep_signals` drops only an event left with no payload, which `count`'s metric rules out.
+  parse:
+    type: kv                        # MSG is `id=N`
+    sources: [syslog]
+    pair_sep: " "
+    kv_sep: "="
+  labels: { type: keep, sources: [parse], fields: [id] }   # drops the syslog.* header fields
+  count:
+    type: kv_metrics
+    sources: [labels]
+    counters: [{ name: soak_lines }]   # no `field`: +1 per event
+  metrics_only:                     # else `window` passes each message's log on to the sink
+    type: keep_signals
+    sources: [count]
+    signals: [metrics]
+  window:
+    type: aggregate
+    sources: [metrics_only]
+    interval: 10s
+    temporality: cumulative
+    series_retention: 360           # a fault must never evict a series
+  victoria_metrics:
+    type: prometheus_out
+    sources: [window]
+    endpoint: http://victoria-metrics:8428/api/v1/write
+    version: 1
+    compression: zstd               # buffer: defaults (block, at_least_once, retry_max_delay 10s)
+  self: { type: internal, interval: 5s, span_sample_rate: 0.0, logs: off }
+  telemetry: { type: stdio_out, sources: [self], format: json }

@@ -43,8 +43,10 @@ over the source's `wire` (`WIRES`), which names the counters each symbol reads.
 `ledger.wire` reports one line per source, each judged against the fault windows that affect
 its wire, of its own generator and of every service that isn't a generator (`affects_source`);
 on TCP only a window that can reset the connection is reported, on HTTP only one that can lose
-the SUT's unexported counts, and every other one is judged (`wire_judgment`). `ledger.intake`
-judges each listener's final life alone. From the edge into
+the SUT's unexported counts, and every other one is judged (`wire_judgment`). A scrape source
+is judged in value instead, per generator life against its end band (`_scrape_wire_one`), and
+its count rows in samples. `ledger.intake` judges each listener's final life alone. From the
+edge into
 `aggregate` on, every row sums the listeners' symbols, since their events merge there; a
 source's `sut_transforms` are judged hop by hop in `ledger.edge`, each node's discards
 (`events.discarded`, T_disc) counted there, and their sum leaves the residual, the stopped-life
@@ -109,7 +111,7 @@ from pathlib import Path
 
 from . import collect, faults, standin, telemetry, topic, vm
 from .scenario import (DEFAULT_RSS_SETTLE_S, DEFAULT_WIRE, EXPECT_REDUCERS, FILE_WIRE, EXTERNAL_TARGET, GENERATOR_ROLE,
-                       HTTP_WIRE, KAFKA_TARGET, LOCAL_TARGET, LOGIT_ROLES, NO_WINDOW_ACTIONS,
+                       HTTP_WIRE, KAFKA_TARGET, SCRAPE_WIRE, LOCAL_TARGET, LOGIT_ROLES, NO_WINDOW_ACTIONS,
                        IDP_ROLE, RUN_WINDOW, SHARED_DIR, SHARED_MOUNT, STANDIN_ROLE, STANDIN_TARGET,
                        SUT_CONFIG_ENV, SUT_CONFIG_KEY, SUT_SERVICE, TARGET_SPLIT,
                        component_blocks, config_env,
@@ -1398,7 +1400,7 @@ DEFAULT_HOP_WINDOW = 32
 DEFAULT_CHECKPOINT_INTERVAL_S = 1.0
 
 # The listener symbols the ledger keeps per listener, each also summed over the listeners.
-LISTENER_SYMBOLS = ("W", "K", "D_tel", "D_shutdown", "B", "E", "X", "F")
+LISTENER_SYMBOLS = ("W", "K", "D_tel", "D_shutdown", "B", "E", "X", "F", "Y")
 
 
 @dataclass(frozen=True)
@@ -1438,15 +1440,28 @@ WIRES = {
                  ("oversize", "truncated"), ()),
     "http": Wire("HTTP", "logit.component.events.delivered", "logit.component.events.sent",
                  None, (), ()),
+    "scrape": Wire("scrape", "logit.component.events.sent", "logit.input.samples", None, (), ()),
 }
+# A scrape wire is a pull of running totals, so its G is the increments the generator's
+# `generate_in`s sent, less what they and its `aggregate`s dropped (`_scrape_increments`),
+# and `ledger.wire` judges G against V per generator life (`_scrape_wire_one`). A failed scrape
+# loses only the values between two that succeed. W is the listener's
+# `logit.input.samples`, the target's samples alone: each scrape also appends three synthetic
+# samples, `up`, `scrape_duration_seconds`, and `scrape_samples_scraped`, failures included
+# (crates/logit-inputs/src/prometheus.rs, "Synthetic scrape metrics"), which E counts as Y.
+SCRAPE_SYNTHETIC_SAMPLES = 3
+# `prometheus_in`'s scrape `interval` and `timeout` when the config names none.
+DEFAULT_SCRAPE_INTERVAL_S = 15.0
+DEFAULT_SCRAPE_TIMEOUT_S = 10.0
 
 
 @dataclass(frozen=True)
 class HttpListener:
     """One HTTP listener kind's symbols beside its wire's: `requests`, its per-request counter,
     whose `class` tags `ok`, `busy`, and `closed_consumer` split the answers on its write route
-    `route`, or None for a listener that counts no requests; and `deferred`, the batches a busy
-    `503` left with the client, or None for a listener that never answers busy."""
+    `route`, or None for a listener that counts no requests; `route`, None for a counter with no
+    `route` tag, one the listener counts on its write path alone; and `deferred`, the batches a
+    busy `503` left with the client, or None for a listener that never answers busy."""
 
     requests: object
     route: object
@@ -1460,10 +1475,23 @@ class HttpListener:
 # `closed_consumer` requests sum to its `batches.sent`, and its `busy` requests equal its
 # `batches.deferred`. `otlp_in` counts no requests and never answers busy: a slow downstream
 # holds the request, and a client that gives up leaves its batches to be delivered
-# (crates/logit-inputs/src/otlp.rs).
+# (crates/logit-inputs/src/otlp.rs). `splunk_hec_in` and `datadog_in` answer as `influxdb_in`
+# does on the route each writer posts to, `event` and `series_v2`, under a 5 s deadline
+# (`splunk_hec_in` on a request's first batch, `datadog_in` on every batch): a `/event` body
+# decodes to one batch per envelope and a series body to one batch, so the identities hold while each body carries one envelope
+# (crates/logit-inputs/src/splunk.rs and datadog.rs, "Backpressure"). `prometheus_in`'s
+# remote-write receiver counts each request once in `logit.input.writes{class}`, with no
+# `route` tag, decodes it to one batch, and never answers busy: backpressure delays its `204`
+# (crates/logit-inputs/src/prometheus.rs, "What a decoded request becomes"). It counts a write
+# on the delivery's task, so one whose sender timed out waiting is still `ok` ("Counters").
 HTTP_LISTENERS = {
     "influxdb_in": HttpListener("logit.input.requests", "write", "logit.input.batches.deferred"),
     "otlp_in": HttpListener(None, None, None),
+    "splunk_hec_in": HttpListener("logit.input.requests", "event",
+                                  "logit.input.batches.deferred"),
+    "datadog_in": HttpListener("logit.input.requests", "series_v2",
+                               "logit.input.batches.deferred"),
+    "prometheus_in": HttpListener("logit.input.writes", None, None),
 }
 # A file wire's tailer reads at most this much of one file per read, so a kill can replay up to
 # one read's lines per file past its last checkpoint (docs/known-gaps/tailing.md, "The tail
@@ -1489,10 +1517,14 @@ _SIZE_UNITS = {"B": 1, "KB": 1000, "MB": 1000 ** 2, "GB": 1000 ** 3,
 # address, can lose lines the generator counted as sent: what sat in either side's socket buffers
 # when the connection reset. Their windows are reported, not judged. Every other TCP-affecting
 # window is judged as steady state is, with a surplus allowed of one generator batch per
-# `ambiguous_at_most_once` drop in it: a write that failed partway left whole lines the SUT read
-# and the generator never counted.
+# attempt its stream sink counted `logit.output.requests{class="ambiguous"}` in it: a write that
+# failed partway, or a TLS first write that failed, left whole lines the SUT read and the
+# generator never counted. Under `at_least_once` the sink then resends the whole batch, and under
+# `at_most_once` it drops the batch `ambiguous_at_most_once`, one drop per such attempt; either
+# way the attempt leaves at most one batch of surplus (crates/logit-outputs/src/stream.rs's module
+# table).
 TCP_REPORTED_ACTIONS = ("stop", "kill", "restart", "exit")
-AMBIGUOUS_DROP = "ambiguous_at_most_once"
+TCP_AMBIGUOUS_CLASS = "ambiguous"
 # On an HTTP wire G counts only points the listener answered with a success, which it does once
 # their batch is in every inbox, after W counted it, so no window can lose a point G counted. A
 # SIGKILL or an exit loses up to one `internal` interval of the SUT's unexported W, so those
@@ -1511,6 +1543,19 @@ AMBIGUOUS_DROP = "ambiguous_at_most_once"
 HTTP_REPORTED_ACTIONS = ("kill", "exit")
 HTTP_AMBIGUOUS_CLASS = "network_error"
 HTTP_CONNECT_CLASS = "connect_error"
+# A writer that polls for acknowledgment (`splunk_hec_out` under `ack: true`) resends a batch
+# whose ids weren't acknowledged within its `ack_timeout`, counted once per pending id, after
+# the listener answered every body of it: a listener restart loses its in-memory ack ledger, so
+# the ids it issued before poll unknown. Each timed-out id allows one batch, an upper bound,
+# since one batch can hold several pending ids and resends once. A poll is on its own route,
+# `HTTP_ACK_ROUTE`, and a poll that fails in transport sends no data, so it allows none.
+HTTP_ACK_TIMEOUT = ("logit.output.acks", {"result": "timeout"})
+HTTP_ACK_ROUTE = "ack"
+# An HTTP writer's batches sent and not yet answered, or under `ack: true` not yet acknowledged:
+# a gauge its slots set on every change at a `concurrency:` above 1, so a drain reads its
+# current value, or no point when it didn't change since the last. A writer at a concurrency of
+# 1 doesn't emit it.
+HTTP_IN_FLIGHT = "logit.output.in_flight"
 
 
 def source_wire(source):
@@ -1601,6 +1646,9 @@ class Ledger:
         self.wires = {source.get("sut_listener"): WIRES[source_wire(source)]
                       for source in self.sources}
         self.streams = any(source_wire(source) != DEFAULT_WIRE for source in self.sources)
+        # A scrape wire's SUT relays samples to its one sink with no `aggregate` (scenario.py's
+        # `_scrape_problems`): the rows from `aggregate` on judge samples, or SKIP.
+        self.scraped = any(source_wire(source) == SCRAPE_WIRE for source in self.sources)
         # Under `[ledger] sut_delta`, the `cumulative_to_delta` feeding the sink takes
         # `aggregate`'s place: A is its events received, Ab its events sent, each one delta
         # point, and Δ_disc the events a skipped point left with nothing, counted (`discarded`).
@@ -1647,7 +1695,8 @@ class Ledger:
                                else "ΣT_disc − " if chained else "")
         if self.delta:
             self.discarded_text += "Δ_disc − "
-        self.residual_text = ("E_B − X_B − Ab" if cfg.get("hop")
+        self.residual_text = ("W + Y − D − B − X − S_in" if self.scraped
+                              else "E_B − X_B − Ab" if cfg.get("hop")
                               else "W′ − R_in" if self.reshaped and self.targeted
                               else f"W − D − B − X − {self.discarded_text}R_in" if self.targeted
                               else "W′ − Ab" if self.reshaped
@@ -1722,6 +1771,10 @@ class Ledger:
             # Events the listener counted as sent and then dropped, every reason: a batch sent
             # into the inbox of a node that has failed is `closed_consumer`.
             one["X"] = sut.counter_by_life("logit.component.events.dropped", component=listener)
+            # On a scrape wire, Y: the synthetic samples E counts beside W, three per scrape.
+            one["Y"] = ({life: SCRAPE_SYNTHETIC_SAMPLES * value for life, value in
+                         sut.counter_by_life("logit.input.scrapes", component=listener).items()}
+                        if wire is WIRES[SCRAPE_WIRE] else {})
             # On an HTTP wire, the listener kind's own symbols (`HTTP_LISTENERS`): its batches
             # sent, its write route's requests by class, and the batches it deferred.
             kind = self.http_kinds.get(listener)
@@ -1729,10 +1782,11 @@ class Ledger:
                 symbols = HTTP_LISTENERS[kind]
                 one["batches"] = sut.counter_by_life("logit.component.batches.sent",
                                                      component=listener)
+                route = {} if symbols.route is None else {"route": symbols.route}
                 for cls in ("ok", "busy", "closed_consumer"):
                     one[f"requests_{cls}"] = (
                         sut.counter_by_life(symbols.requests, component=listener,
-                                            route=symbols.route, **{"class": cls})
+                                            **route, **{"class": cls})
                         if symbols.requests else {})
                 one["deferred"] = (sut.counter_by_life(symbols.deferred, component=listener)
                                    if symbols.deferred else {})
@@ -1960,8 +2014,12 @@ class Ledger:
                         sink_batch[sink] = (total("logit.component.events.received", [sink])
                                             / batches)
                 batch = sum(sink_batch.values())
+            g = total(self.wires[source.get("sut_listener")].g, sinks)
+            if source_wire(source) == SCRAPE_WIRE:
+                sent, lost = _scrape_increments(data, gen, source)
+                g = sum(sent.values()) - sum(lost.values())
             self.gen_stats[service] = {
-                "G": total(self.wires[source.get("sut_listener")].g, sinks),
+                "G": g,
                 "dropped_by": dropped_by,
                 "G_datagrams": total("logit.output.datagrams", sinks),
                 "dropped_events": total("logit.component.events.dropped", sinks),
@@ -2379,7 +2437,8 @@ class Ledger:
 
     def residual(self, life, sinks=None):
         """What a life read but neither absorbed nor removed, counted, by its last drain:
-        W − D − B − X − Ab, with a script W − D − B − X − (L_drop + L_err) − (Ab − L_flush), with
+        W − D − B − X − Ab, on a scrape wire W + Y − D − B − X − S_in, what its one sink hadn't
+        received, with a script W − D − B − X − (L_drop + L_err) − (Ab − L_flush), with
         `sut_transforms` W − D − B − X − ΣT_disc − Ab (M cancels where a `merge` node credits
         it), with a `fan_out` W′ − Ab, and across a hop E_B − X_B − Ab.
 
@@ -2387,6 +2446,9 @@ class Ledger:
         `sinks`, the listeners' side: what reached the router's side short of the router,
         W − D − B − X (less ΣT_disc) − R_in. With `sinks`, each sink's branch: what its target
         sent that its `aggregate` hadn't absorbed, `branch_fed` − Ab, summed."""
+        if self.scraped:
+            return (self.fed(life) + self.get("Y", life)
+                    - sum(self.S_in[sink].get(life, 0) for sink in self.sinks))
         if self.targeted:
             if sinks is None:
                 return self.fed(life) - self.discarded(life) - self.get("R_in", life)
@@ -3038,7 +3100,7 @@ def check_ledger_wire(data):
     reported windows of faults that can affect that source's wire and at the end. On UDP that
     loss is by design and every affecting window is reported; on TCP F is the listener's counted
     framer drops, only a process end or a partition that moved an address is reported, and
-    every other affecting window is judged with a surplus allowed for its ambiguous drops
+    every other affecting window is judged with a surplus allowed for its ambiguous attempts
     (`wire_judgment`); on HTTP G counts acknowledged points against W − X, only a kill or an
     exit is reported, and every other affecting window is judged with a surplus allowed for its
     transport-error attempts (`HTTP_REPORTED_ACTIONS`). See `_wire_buckets` for the tolerance.
@@ -3073,11 +3135,112 @@ def check_ledger_wire(data):
     return Result("ledger.wire", worst(statuses), " | ".join(details), lines)
 
 
+def _scrape_increments(data, gen, source):
+    """`({life: sent}, {life: lost})` on a scrape wire's generator `gen`: the events its
+    `generate_in`s sent per life, each one increment, and the increments lost before a total
+    held them: the `generate_in`s' `events.dropped` and each generator `aggregate`'s
+    `transform.metrics.dropped`. A drop anywhere else loses no increment: `internal` and its
+    sinks carry telemetry, and a cumulative point an `aggregate` failed to send is carried by
+    its next one."""
+    inputs = source_ids(source, "generator_input")
+    sent = {}
+    for one in inputs:
+        for life, value in gen.counter_by_life("logit.component.events.sent",
+                                               component=one).items():
+            sent[life] = sent.get(life, 0) + value
+    text = _service_config_text(data, source.get("service"))
+    counted = ([("logit.component.events.dropped", one) for one in inputs]
+               + [("logit.transform.metrics.dropped", one)
+                  for one in config_components(text, "aggregate")])
+    lost = {}
+    for name, component in counted:
+        for life, value in gen.counter_by_life(name, component=component).items():
+            lost[life] = lost.get(life, 0) + value
+    return sent, lost
+
+
+def scrape_band(rate, interval, window, timeout, drain, killed):
+    """`(low, high)`: the G − V one generator life on a scrape wire may show with nothing lost
+    but the increments after its last scrape, at `rate` increments a second.
+
+    Above: the last scrape can start up to one scrape `interval` before the life ends, the
+    totals it read are up to one generator `aggregate` `window` old, and it reads them up to
+    its `timeout` after it starts. Below: 0 for a life that ended in a stop, whose final drain
+    exports every count; a killed life's last drain interval of counts is never exported, so G
+    can fall short of the increments V holds by one `drain` interval of them."""
+    low = -round(rate * drain) if killed else 0
+    return low, round(rate * (interval + window + timeout))
+
+
+def _scrape_wire_one(data, led, source):
+    """`(status, detail, lines)` of `ledger.wire` for a scrape source: per generator life, G,
+    its increments (`_scrape_increments`), against V, the sink's stored counters' reset-aware
+    total in that life, split at the generator's life starts by each sample's timestamp, the
+    SUT's scrape time. A generator restart resets its totals, and a SUT restart doesn't, so V
+    follows the generator's lives alone. A scrape that failed, timed out, or never ran loses
+    only the values between two that succeed, so no fault window excuses anything: each life's
+    gap must fall in its end band (`scrape_band`), and a life whose gap is past it FAILs."""
+    service, listener = source.get("service"), source.get("sut_listener")
+    gen_view = SutLives(data, service)
+    if gen_view.problems:
+        return FAIL, "; ".join(gen_view.problems), []
+    gen = gen_view.tel
+    sent, lost = _scrape_increments(data, gen, source)
+    sink = led.sinks[0] if led.sinks else None
+    by_life, _, resets, mismatched = vm.totals_by_life(led.series.get(sink, []),
+                                                       gen_view.life_starts)
+    text = led._sut_config_text(led.inn.service) or ""
+    interval = component_duration(text, listener, "interval") or DEFAULT_SCRAPE_INTERVAL_S
+    timeout = component_duration(text, listener, "timeout") or DEFAULT_SCRAPE_TIMEOUT_S
+    window = delta_window(data, source) or DEFAULT_AGGREGATE_INTERVAL_S
+    status, parts, lines = PASS, [], []
+    for life in gen_view.lives:
+        drains = gen.life_drains(life)
+        gaps = [b - a for a, b in zip(drains, drains[1:])]
+        drain = statistics.median(gaps) if gaps else 0.0
+        # The life's median rate per drain interval, so a pause inside it doesn't lower it.
+        moved = {}
+        for one in source_ids(source, "generator_input"):
+            for ts, value, point_life in gen.counter_points("logit.component.events.sent",
+                                                            component=one):
+                if point_life == life:
+                    moved[ts] = moved.get(ts, 0) + value
+        rates = [moved.get(b, 0) / (b - a) for a, b in zip(drains, drains[1:]) if b > a]
+        rate = statistics.median(rates) if rates else 0.0
+        killed = life in gen_view.killed
+        g = sent.get(life, 0) - lost.get(life, 0)
+        v = by_life.get(life, 0)
+        low, high = scrape_band(rate, interval, window, timeout, drain, killed)
+        ok = low <= g - v <= high
+        how = "killed" if killed else "stopped"
+        part = (f"generator life {life} ({how}): G {_n(g)} − V {_n(v)} = {_n(g - v)} "
+                f"{'within' if ok else 'outside'} its end band [{_n(low)}, {_n(high)}]")
+        lines.append(f"{part}: G is generate_in sent {_n(sent.get(life, 0))} − lost "
+                     f"{_n(lost.get(life, 0))}; the band is {rate:,.0f}/s over a {interval:g}s "
+                     f"scrape interval, a {window:g}s generator window, and a {timeout:g}s "
+                     "scrape timeout"
+                     + (f", and below, a {drain:g}s drain's unexported counts" if killed
+                        else ""))
+        if not ok:
+            status = FAIL
+            parts.insert(0, part + (", a surplus" if g - v < low else ", increments lost "
+                                    "past the life's last scrape"))
+        else:
+            parts.append(part)
+    if mismatched:
+        lines.append(f"{len(mismatched)} series whose segments don't follow the generator's "
+                     f"lives, such as {mismatched[0]} (resets {resets.get(mismatched[0])})")
+    total_g = sum(sent.values()) - sum(lost.values())
+    total_v = sum(by_life.values())
+    head = f"G {_n(total_g)} − V {_n(total_v)} = {_n(total_g - total_v)} over the run; "
+    return status, head + "; ".join(parts), lines
+
+
 def _boundary_nets(runs, anchors):
     """`(nets, netted)`: each run's gap, G − (W + K + F), after netting across every boundary
-    that touches a judged run, judged or steady on its other side, and the boundary into the
-    end run from a judged or steady one, where the two gaps have opposite signs, and `{index:
-    [(moved, at, straddled)]}` for each run a transfer touched.
+    that touches a judged run, judged or steady on its other side, or the end run, where the two
+    gaps have opposite signs, and `{index: [(moved, at, straddled)]}` for each run a transfer
+    touched.
 
     G is interpolated between generator drains, so at a SUT drain inside a generator interval
     its error is up to the G that moved in that interval: one batch while acknowledgments arrive
@@ -3090,17 +3253,16 @@ def _boundary_nets(runs, anchors):
     at the G that moved over the generator anchor pair straddling the boundary (`straddled`),
     the most interpolation can move, and at either gap, so neither run changes sign. That cap is
     what keeps a surplus from hiding a loss next door: a resend's surplus or a steady run's,
-    which otherwise counts at 0, nets a loss only as far as interpolation could explain it.
-    The end run's own allowance covers only the sends the generator cancels at shutdown, so its
-    boundary with the run before it nets the same way. Runs that don't touch, and a reported
-    run, never net."""
+    which otherwise counts at 0, nets a loss only as far as interpolation could explain it. The
+    end run's boundary is a SUT drain like any other, so a batch the generator counted before
+    it and the listener read after it leaves the same pair, and the end allowance
+    applies to what's left. Runs that don't touch, and a reported run, never net."""
     nets = [g - wk for _, _, _, _, g, wk, _ in runs]
     netted = {}
     stamps = [t for t, _ in anchors]
     for index in range(len(runs) - 1):
         kinds = {runs[index][2], runs[index + 1][2]}
-        into_end = runs[index + 1][2] == "end" and runs[index][2] in ("judged", "steady")
-        if (not (into_end or ("judged" in kinds and kinds <= {"judged", "steady"}))
+        if (not kinds & {"judged", "end"} or not kinds <= {"judged", "steady", "end"}
                 or nets[index] * nets[index + 1] >= 0):
             continue
         at = runs[index][1]
@@ -3124,21 +3286,68 @@ def _boundary_nets(runs, anchors):
 def _ambiguous_drops(led, source):
     """`[(timestamp, count)]` of what can leave one generator batch in W that G doesn't count,
     so `ledger.wire` and `_end_to_end` allow that much surplus per count: on a TCP wire the
-    generator sink's `ambiguous_at_most_once` batch drops, each a write that failed partway, and
+    generator sink's ambiguous attempts under either posture (`TCP_AMBIGUOUS_CLASS`), and
     on an HTTP wire its attempts that ended in an ambiguous transport error
     (`HTTP_AMBIGUOUS_CLASS`), each a request the listener may have taken before the answer was
-    lost; a connect failure (`HTTP_CONNECT_CLASS`) sent nothing and isn't one. Empty on any
-    other wire."""
+    lost, and its pending requests whose acknowledgment wait timed out (`_ack_timeouts`); a
+    connect failure (`HTTP_CONNECT_CLASS`) sent nothing and isn't one. Empty on any other
+    wire."""
     wire = source_wire(source)
     if wire == "tcp":
-        name, attrs = "logit.component.batches.dropped", {"reason": AMBIGUOUS_DROP}
+        name, attrs = "logit.output.requests", {"class": TCP_AMBIGUOUS_CLASS}
     elif wire == HTTP_WIRE:
         name, attrs = "logit.output.requests", {"class": HTTP_AMBIGUOUS_CLASS}
     else:
         return []
+    gen = led.gens[source.get("service")]
+    drops = [(ts, v) for sink in source_ids(source, "generator_sink")
+             for ts, v, _ in gen.counter_points(name, component=sink, **attrs)]
+    if wire == HTTP_WIRE:
+        polls = [(ts, -v) for sink in source_ids(source, "generator_sink")
+                 for ts, v, _ in gen.counter_points(name, component=sink, route=HTTP_ACK_ROUTE,
+                                                    **attrs)]
+        drops += polls + _ack_timeouts(led, source)
+    by_ts = {}
+    for ts, v in drops:
+        by_ts[ts] = by_ts.get(ts, 0) + v
+    return sorted((ts, v) for ts, v in by_ts.items() if v)
+
+
+def _ack_timeouts(led, source):
+    """`[(timestamp, count)]` of an HTTP source's generator sink's requests whose
+    acknowledgment wait timed out (`HTTP_ACK_TIMEOUT`), each a body the listener answered and
+    the writer resends whole."""
+    name, attrs = HTTP_ACK_TIMEOUT
     return sorted((ts, v) for sink in source_ids(source, "generator_sink")
                   for ts, v, _ in led.gens[source.get("service")].counter_points(
                       name, component=sink, **attrs))
+
+
+def _in_flight_reader(led, source):
+    """`in_flight_at(at)`: the batches an HTTP source's generator sinks held in flight at `at`,
+    the highest at the two generator drains straddling it (the last at or before it and the
+    first after), each sink counting `max(1, its HTTP_IN_FLIGHT reading)` and a sink that emits
+    no gauge, at a `concurrency:` of 1, counting 1; None when no sink emitted the gauge. A drain
+    with no point carries the sink's last value, since the gauge exports only on a change."""
+    gen = led.gens[source.get("service")]
+    series = [gen.gauge_series(HTTP_IN_FLIGHT, component=sink)
+              for sink in source_ids(source, "generator_sink")]
+    if not any(series):
+        return lambda at: None
+    drains = sorted(gen.drains)
+
+    def value_at(one, drain):
+        stamps = [ts for ts, _, _ in one]
+        index = bisect.bisect_right(stamps, drain) - 1
+        return max(1, int(one[index][1])) if index >= 0 else 1
+
+    def in_flight_at(at):
+        index = bisect.bisect_right(drains, at)
+        straddling = drains[max(0, index - 1):index + 1]
+        return max((sum(value_at(one, drain) if one else 1 for one in series)
+                    for drain in straddling), default=None)
+
+    return in_flight_at
 
 
 def _wire_one(data, led, source, instances=None):
@@ -3150,6 +3359,8 @@ def _wire_one(data, led, source, instances=None):
     udp = wire_name == DEFAULT_WIRE
     if wire_name == FILE_WIRE:
         return _file_wire_one(data, led, source)
+    if wire_name == SCRAPE_WIRE:
+        return _scrape_wire_one(data, led, source)
     stats = led.gen_stats[service]
     status = PASS
     lines = []
@@ -3187,24 +3398,34 @@ def _wire_one(data, led, source, instances=None):
     sums = {"fault": 0.0, "judged": 0.0, "steady": 0.0, "end": 0.0}
     batch = stats["batch"]
     ambiguous = _ambiguous_drops(led, source)
+    acks = _ack_timeouts(led, source) if http else []
+    in_flight_at = _in_flight_reader(led, source) if http else (lambda at: None)
     allowances = {}
+    edge_batches = {}
     for index, (start, end, kind, _, _, _, _) in enumerate(runs):
         if kind == "judged":
             # A judged run's surplus has no pool to fall into, so every edge it has, a boundary
-            # with another judged run included, allows its one batch of interpolation error.
-            sides = sum(1 for other in (index - 1, index + 1) if 0 <= other < len(runs))
+            # with another judged run included, allows its one batch of interpolation error. On
+            # HTTP the listener counts a request's batch in W before the writer counts it in G,
+            # so the lag at an edge is the batches in flight there, and the surplus lag leaves in
+            # a run is its lag at the end less its lag at the start: only the trailing edge's
+            # reading backs one, whatever the neighbour, so it allows that many batches when
+            # more than one, and the leading edge its one.
+            edge_batches[index] = (
+                [1] * (index > 0)
+                + [max(1, in_flight_at(end) or 1)] * (index + 1 < len(runs)))
             drops = sum(v for ts, v in ambiguous if start < ts <= end)
-            allowances[index] = (drops + sides) * batch
+            allowances[index] = (drops + sum(edge_batches[index])) * batch
     connects = (sorted((ts, v) for sink in source_ids(source, "generator_sink")
                        for ts, v, _ in led.gens[service].counter_points(
                            "logit.output.requests", component=sink,
                            **{"class": HTTP_CONNECT_CLASS}))
                 if http else [])
     # Each steady or judged run counts at 0 when W + K + F exceeds G in it, so a surplus in one
-    # run can't net out loss in another. The one exception is a boundary that touches a judged
-    # run, where an opposite-signed pair nets in full, up to the G that moved over the generator
-    # interval straddling it, before the surplus run's allowance applies to what's left
-    # (`_boundary_nets` says why).
+    # run can't net out loss in another. The exceptions are a boundary that touches a judged run
+    # and the end run's boundary, where an opposite-signed pair nets in full, up to the G that
+    # moved over the generator interval straddling it, before the surplus run's allowance or the
+    # end allowance applies to what's left (`_boundary_nets` says why).
     nets, netted = _boundary_nets(runs, anchors)
     steady_lost = 0.0
     g_steady = 0.0
@@ -3238,24 +3459,32 @@ def _wire_one(data, led, source, instances=None):
             drops = sum(v for ts, v in ambiguous if start < ts <= end)
             sides = sum(1 for other in (index - 1, index + 1) if 0 <= other < len(runs))
             allowed = allowances[index]
-            what = "transport-error attempt(s)" if http else "ambiguous drop(s)"
+            what = "transport-error attempt(s)" if http else "ambiguous attempt(s)"
+            timed_out = sum(v for ts, v in acks if start < ts <= end)
+            if timed_out:
+                what = (f"transport-error attempt(s) or ack timeout(s) ({_n(timed_out)} ack "
+                        "timeout(s))")
             dials = sum(v for ts, v in connects if start < ts <= end)
+            held = edge_batches[index]
+            in_flight_text = (" holding " + " + ".join(_n(one) for one in held)
+                              + " batch(es) read in flight" if any(one > 1 for one in held)
+                              else "")
             lines[-1] += (f", surplus allowed {_n(allowed)} ({_n(drops)} {what} + "
-                          f"{sides} edge(s), x one {_n(batch)}-line batch"
+                          f"{sides} edge(s)" + in_flight_text
+                          + f", x one {_n(batch)}-line batch"
                           + (f"; {_n(dials)} connect failure(s) allow none" if dials else "")
                           + ")")
             if -net > allowed:
                 took = "W − X" if http else "W + counted"
                 surplus.append(f"{span}: {took} exceeds G by {_n(round(-net))}, over "
                                f"the {_n(allowed)} its {_n(drops)} {what} and "
-                               f"{sides} edge(s) allow")
+                               f"{sides} edge(s)" + in_flight_text + " allow")
     if surplus:
         status = FAIL
         lines[:0] = surplus
 
     limit = float(data.ledger.get("wire_loss_outside_faults", 0.0))
     tolerance = batch * edges
-    # The end run after netting across its boundary with the run before it.
     end_net = sum(net for net, run in zip(nets, runs) if run[2] == "end")
     judged = steady_lost + max(0.0, end_net)
     allowed = limit * g_steady + tolerance
@@ -3298,8 +3527,10 @@ def _wire_one(data, led, source, instances=None):
                   f"windows, {_n(round(sums['steady']))} steady, {_n(round(sums['end']))} at "
                   f"the end; loss judged {_n(round(steady_lost))}, each run at 0 or more, "
                   f"against limit {_n(round(allowed))}); the generator's requests: "
-                  f"{_n(sum(v for _, v in ambiguous))} transport-error attempt(s), "
-                  f"{_n(sum(v for _, v in connects))} connect failure(s), {retries}; "
+                  f"{_n(sum(v for _, v in ambiguous) - sum(v for _, v in acks))} "
+                  f"transport-error attempt(s), "
+                  + (f"{_n(sum(v for _, v in acks))} ack timeout(s), " if acks else "")
+                  + f"{_n(sum(v for _, v in connects))} connect failure(s), {retries}; "
                   f"its counted loss, not in G: {_n(stats['dropped_events'])} event(s) in "
                   f"{_n(stats['dropped_batches'])} batch(es)"
                   + (f" ({_reasons(stats['dropped_by'])})" if stats["dropped_by"] else ""))
@@ -3314,7 +3545,9 @@ def _wire_one(data, led, source, instances=None):
                   f"{_n(round(sums['judged']))} in judged {wire.label}-affecting windows, "
                   f"{_n(round(sums['steady']))} steady, {_n(round(sums['end']))} at the end; "
                   f"loss judged {_n(round(steady_lost))}, each run at 0 or more, against limit "
-                  f"{_n(round(allowed))}); the generator's counted loss, not in G: "
+                  f"{_n(round(allowed))}); the generator's requests: "
+                  f"{_n(sum(v for _, v in ambiguous))} ambiguous attempt(s); its counted loss, "
+                  f"not in G: "
                   f"{_n(stats['dropped_events'])} event(s) in {_n(stats['dropped_batches'])} "
                   f"batch(es)" + (f" ({_reasons(stats['dropped_by'])})"
                                   if stats["dropped_by"] else ""))
@@ -3545,6 +3778,8 @@ def _http_intake(led, listener, life):
 
 def _route_text(symbols):
     """An `HttpListener`'s write-route requests, as text."""
+    if symbols.route is None:
+        return symbols.requests
     return f"{symbols.requests}{{route={symbols.route}}}"
 
 
@@ -3567,10 +3802,13 @@ def check_ledger_intake(data):
     life = led.inn.final
     parts = []
     for listener in led.listeners:
-        lhs = led.lget(listener, "W", life) - led.lget(listener, "D_tel", life)
+        # On a scrape wire E also counts Y, the synthetic samples W leaves out.
+        lhs = (led.lget(listener, "W", life) + led.lget(listener, "Y", life)
+               - led.lget(listener, "D_tel", life))
         rhs = led.lget(listener, "E", life) + led.lget(listener, "B", life)
         name = f" {listener}" if len(led.listeners) > 1 else ""
-        part = f"final life {life}{name}: W − D {_n(lhs)} vs E + B {_n(rhs)}"
+        w_text = "W + Y − D" if led.wires[listener] is WIRES[SCRAPE_WIRE] else "W − D"
+        part = f"final life {life}{name}: {w_text} {_n(lhs)} vs E + B {_n(rhs)}"
         if lhs != rhs:
             status = FAIL
             # A listener off its balance leads the detail.
@@ -3687,6 +3925,11 @@ def check_ledger_edge(data):
         edges = [("L_sent", "A", led.L_sent, led.A, "script to aggregate", out)]
     elif led.targeted:
         edges = _target_edges(led, out)
+    elif led.scraped:
+        # No `aggregate`: the listener sends to the sink, the synthetic samples with the rest.
+        sent = {life: led.get("E", life) - led.get("X", life) for life in led.lives}
+        edges = [("E − X", f"S_in[{sink}]", sent, led.S_in[sink], f"listener to {sink}", out)
+                 for sink in led.sinks]
     else:
         edges = _chain_edges(led, out)
         into = {life: sum(led.into_aggregate(life).values()) for life in led.lives}
@@ -3695,7 +3938,7 @@ def check_ledger_edge(data):
         else:
             edges.append(("ΣE" if not any(led.transforms.values()) else "Σ(sent into aggregate)",
                           "A", into, led.A, "listeners to aggregate", out))
-    for sink in led.sinks if not led.targeted else ():
+    for sink in led.sinks if not led.targeted and not led.scraped else ():
         received = led.S_in[sink]
         if led.split == "route":
             target = led.targets.get(sink)
@@ -3901,6 +4144,9 @@ def check_ledger_aggregate(data):
     if _overlapped(data):
         return _per_instance(data, check_ledger_aggregate)
     led = _ledger(data)
+    if led.scraped:
+        return Result("ledger.aggregate", SKIP, "a scrape wire: the SUT relays samples with no "
+                      "aggregate")
     if led.delta and not led.problems:
         return _final_equality(data, "ledger.aggregate", "Ab", "Ad",
                                f"every point {led.delta} didn't skip sent on: Ab its events "
@@ -3955,6 +4201,8 @@ def check_ledger_egress(data):
         return skipped
     if not led.sinks:
         return Result("ledger.egress", FAIL, "no [[ledger.sink]] to judge")
+    if led.scraped:
+        return _scrape_egress(led)
     status = PASS
     lines = []
     groups = []
@@ -4088,6 +4336,77 @@ def check_ledger_egress(data):
     return Result("ledger.egress", status, detail, lines)
 
 
+def stored_samples_by_life(series, life_starts):
+    """`{life: samples}`: the distinct `(series, timestamp)` samples of an export, each credited
+    to the writer's life its timestamp falls in. A resent sample is stored once."""
+    counts = {}
+    for one in series:
+        for stamp in set(one.get("timestamps") or []):
+            life = vm.life_at(life_starts, stamp / 1000)
+            counts[life] = counts.get(life, 0) + 1
+    return counts
+
+
+def _scrape_egress(led):
+    """`ledger.egress` on a scrape wire, in samples: per SUT life, W − X, the target's samples
+    the listener sent, against V_n, the distinct samples the sink's `vm_selector` matches whose
+    scrape time falls in that life (`stored_samples_by_life`). The selector matches the
+    target's series and leaves out the synthetic ones, so the two count one unit. A dropped
+    batch's events also count its synthetic samples, one scrape's `SCRAPE_SYNTHETIC_SAMPLES`
+    per batch, since `prometheus_in` sends one batch per scrape of a target and the sink queues
+    the batches it receives: so X here is the listener's events dropped less 3 x the batches
+    it dropped (its scrapes less the sink's batches received, at most X / 3), and
+    the sink's drops are its events dropped less 3 x its batches dropped.
+
+    0 passes; a stored sample past W − X is a surplus and FAILs; a killed life's gap is
+    reported, since the kill discards the sink's queue and a cumulative series loses only
+    values in between; a stopped life's gap passes up to the samples the sink counted dropped
+    in it, and past that it's uncounted loss. `ledger.wire` judges the values themselves."""
+    status, parts, lines = PASS, [], []
+    sink = led.sinks[0]
+    stored = stored_samples_by_life(led.series.get(sink, []), led.life_starts)
+    sut = led.sut
+    dropped = sut.counter_by_life("logit.component.events.dropped", component=sink)
+    dropped_batches = sut.counter_by_life("logit.component.batches.dropped", component=sink)
+    reached = sut.counter_by_life("logit.component.batches.received", component=sink)
+    if not led.series.get(sink):
+        return Result("ledger.egress", FAIL, f"{sink}: the export has no series")
+    for life in led.lives:
+        scrapes = led.get("Y", life) / SCRAPE_SYNTHETIC_SAMPLES
+        # A batch still on its way at the life's end never reached the sink either, and X
+        # didn't count it, so the batches X dropped are at most its events over 3.
+        lost_batches = max(0, min(scrapes - reached.get(life, 0),
+                                  led.get("X", life) // SCRAPE_SYNTHETIC_SAMPLES))
+        sent = (led.get("W", life) - led.get("X", life)
+                + SCRAPE_SYNTHETIC_SAMPLES * lost_batches)
+        v = stored.get(life, 0)
+        gap = sent - v
+        counted = (dropped.get(life, 0)
+                   - SCRAPE_SYNTHETIC_SAMPLES * dropped_batches.get(life, 0))
+        killed = life in led.killed and life != led.final
+        if gap == 0:
+            verdict = "exact"
+        elif gap < 0:
+            verdict, status = "a surplus: samples stored that the listener never sent", FAIL
+        elif killed:
+            verdict = "reported: a kill discards the sink's queue"
+        elif gap <= counted:
+            verdict = f"counted: within the sink's {_n(counted)} samples dropped"
+        else:
+            verdict, status = (f"uncounted loss, past the sink's {_n(counted)} samples "
+                               "dropped"), FAIL
+        part = (f"life {life}{' (final)' if life == led.final else ''}"
+                f"{' (killed)' if killed else ''}: W − X {_n(sent)} − V_n {_n(v)} = {_n(gap)}, "
+                f"{verdict}")
+        lines.append(part)
+        if verdict.startswith(("a surplus", "uncounted")):
+            parts.insert(0, part)
+        else:
+            parts.append(part)
+    return Result("ledger.egress", status, f"{sink}: " + "; ".join(parts)
+                  + " (V_n the distinct stored samples)", lines)
+
+
 def check_ledger_summary(data):
     """The final life's uncounted = (W − D − E − B) + (E − A) + (A − Ab) + (Ab − V), which must
     be 0, with wire loss beside it by design. There is one Ab − V term per egress group, and
@@ -4109,6 +4428,10 @@ def check_ledger_summary(data):
     skipped = _skip_without_sut("ledger.summary", led)
     if skipped:
         return skipped
+    if led.scraped:
+        return Result("ledger.summary", SKIP, "a scrape wire: ledger.wire judges the "
+                      "generator's increments against V end to end, per generator life, and "
+                      "ledger.intake, ledger.edge, and ledger.egress the samples")
     if led.targeted:
         return _summary_targeted(data, led)
     life = led.final
@@ -4544,8 +4867,9 @@ def _end_to_end(data, led):
     """`(status, text)`: across a hop or from a file or HTTP wire, each egress group's V over
     the whole run against what the generators sent less every counted loss on the way (K, D, B,
     X, the hop sink's drops, X_B, and the path's counted discards; on a TCP or file wire F too;
-    on an HTTP wire no X, which the client resends), plus one generator batch per ambiguous drop
-    on a TCP wire and per transport-error attempt on an HTTP wire, as `ledger.wire` allows, and
+    on an HTTP wire no X, which the client resends), plus one generator batch per ambiguous
+    attempt on a TCP wire and per transport-error attempt or ack timeout on an HTTP wire, as
+    `ledger.wire` allows, and
     on a file wire the replay band's upper edge. With a `fan_out`, each source's share is
     carried through its chain instead (`Ledger.through`). A kill on either side shifts lives but
     never adds increments, so V above that is a surplus whatever was killed; V below it is the
@@ -5963,7 +6287,9 @@ def check_recovery(data):
     its end, that sink's `retrying` is 0, its `buffer.utilization` is under 0.05 or its
     `buffer.batches` at most 1, every UDP listener's `receive.utilization` is under 0.05, and the
     ingest rate summed over the listeners over the drain interval ending there is at least 95%
-    of the generators' summed warmup rate, on an HTTP wire their writers' events received. A
+    of the generators' summed warmup rate, on an HTTP wire their writers' events received. On
+    a scrape wire, whose samples arrive one scrape at a time and whose generator counts
+    increments, not samples, the ingest test is any sample scraped in the interval. A
     drain interval another fault overlaps, or that
     spans two SUT lives, isn't eligible; a fault with no eligible interval is skipped and
     listed. A `rate_behind` diagnostic from any generator turns a throughput shortfall into a
@@ -5994,6 +6320,8 @@ def check_recovery(data):
     behind = 0
     for source in led.sources:
         gen = led.gens[source.get("service")]
+        if source_wire(source) == SCRAPE_WIRE:
+            continue
         # An HTTP writer's events are what the wire carries, and an `aggregate` ahead of it
         # sends one point per series per window, not the input's events.
         rated = ([(sink, "logit.component.events.received")
@@ -6088,7 +6416,11 @@ def check_recovery(data):
         rate = ingested(one, start, end) / (end - start)
         share = rate / baseline if baseline else 0.0
         slow = None
-        if share < RECOVERED_RATE_SHARE:
+        if led.scraped:
+            share = 1.0 if rate > 0 else 0.0
+            if not rate:
+                slow = "no sample scraped"
+        elif share < RECOVERED_RATE_SHARE:
             slow = f"ingest {rate:,.0f}/s is {share:.0%} of the warmup rate"
         return problems, slow, rate, share
 
@@ -6138,7 +6470,8 @@ def check_recovery(data):
     failing = [line for line in lines if "not recovered" in line]
     detail = (f"{judged} of {len(data.faults)} fault(s) judged at {len(led.sinks)} sink(s), "
               f"each recovered within recovery_bound {data.recovery_bound:g}s of its end; "
-              f"warmup rate {baseline:,.0f}/s")
+              + ("each by a sample scraped" if led.scraped
+                 else f"warmup rate {baseline:,.0f}/s"))
     if failing:
         detail = f"{failing[0]}; {judged} of {len(data.faults)} fault(s) judged"
     return Result("recovery", status, detail, lines)

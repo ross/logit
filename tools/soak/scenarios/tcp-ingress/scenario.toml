@@ -55,7 +55,7 @@ on = "generator"
 args = "loss 10%"
 for = "90s"
 
-# Netem on the SUT drops its ACKs: judged, with a surplus allowed per ambiguous drop.
+# Netem on the SUT drops its ACKs: judged, with a surplus allowed per ambiguous attempt.
 [[step]]
 at = "5m30s"
 action = "netem"

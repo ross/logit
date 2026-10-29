@@ -101,6 +101,28 @@ Entry format and the other areas: [the known-gaps index](README.md).
   - **To close:** a dead-letter sink for rejected batches and a split-on-`413` retry step in the
     shared HTTP driver, each with its own ADR.
 
+- **A stream sink doesn't count the bytes its peer never acknowledged.** A stream with no
+  application acknowledgment is best-effort by decision
+  ([ADR `delivery-semantics`](../adr/delivery-semantics.md), item 6, "A wire that can't confirm
+  delivery bounds its hop"), and [Deploying `logit`](../deploying.md#a-stream-sink-has-no-acknowledgment)
+  has the operator's workaround. What's open is counting and measuring that loss.
+  `syslog_out`, `statsd_out`, and `graphite_out` over TCP or TLS, and `statsd_out` over a Unix
+  stream, count a batch's messages in `logit.output.messages` once the frame's write and flush
+  return (`crates/logit-outputs/src/stream.rs`). When the receiver ends with bytes in either
+  socket buffer, the next send's probe finds the connection closed and redials, and nothing
+  reports the frames already counted.
+  - **To close, the sender's part:** on a failed connection, `SIOCOUTQ` (or `TCP_INFO`'s
+    unacknowledged bytes) says how much the peer never acknowledged, and the driver could count
+    that as loss. The receiver's part, acknowledged by its kernel and never read, can't be seen
+    from the sender without an application acknowledgment such as RELP's.
+  - **Unmeasured, a stalled receiver:** against a reader that keeps up, the loss is too small to
+    see. In `syslog-tcp-ingress` and `syslog-tls-ingress`, at 2,000 lines a second with each
+    buffer capped at 256 KiB, four kills' gaps of 9,800 to 9,916 lines each fell within about
+    400 lines, the error of the estimate, of what the listener read after its last export
+    ([plan `soak-harness`](../plans/soak-harness.md)'s "Findings"). A receiver stalled behind a
+    full receive buffer when it's killed would lose the whole buffer, up to several MiB under
+    Linux's default autotuning, and no scenario measures that.
+
 - **A kept-alive connection a destination closed first reads as `Ambiguous`.** An HTTP sink
   closes a pooled connection idle past its `idle_timeout:` (30 s by default) before reusing it,
   so a destination that closes idle connections later doesn't race a write
