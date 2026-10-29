@@ -6348,3 +6348,47 @@ What the runs showed:
   before it under the same cap ([ADR `soak-harness`](../adr/soak-harness.md)'s "Amendment: the
   end run nets at its boundary"); re-scored, the run PASSes with 98 netted and 2 left, and the
   last TCP run reads as before.
+
+### W28: `graphite_out` and `otlp_out` into real receivers (2026-10-29)
+
+Each scenario ran on the development host (`sailfish`, 32 cores, Linux 7.2.13), against
+`logit:soak` built at 2026-10-29 10:00 PDT over `origin/main` at `5d8fd053`, with
+`SOAK_SKIP_IMAGE=1`; the branch touches no product code. Other agents' soak runs shared the
+daemon, one at a time. Every row of every listed run was PASS or SKIP:
+
+| Run | Scenario | Duration | Verdict |
+|---|---|---|---|
+| `20261029T181026Z` | `graphite-egress` | 15m, its default | PASS, re-scored (below) |
+| `20261029T193500Z` | `otlp-egress` | 16m, its default | PASS |
+| `20261029T204424Z` | `otlp-grpc-egress` | 17m, its default | PASS |
+| `20261029T225944Z` | `graphite-egress` | 15m, its default | PASS |
+
+What the runs showed:
+
+- **No stream-sink tail loss through a backend stop or restart.** `graphite_out` held every
+  window through VictoriaMetrics' stop and restart in both runs: `ledger.egress` read Ab == V
+  (1,793,400 in the second run), `ledger.windows` found every 10 s window of all 100 series with
+  only the partition's idle gap excused, and the sink reconnected once after each fault. A
+  graceful stop drains what the kernel took before it closes, so these faults can't show the
+  documented loss of bytes a receiver dies holding; neither scenario kills the backend.
+- **The relay hop through a second `logit` held every running total.** In `otlp-grpc-egress`,
+  `logit`'s killed life read Ab − V of 0 (1,509,800) and the final life 0 (540,200), through a
+  partition, a stop, a pause, and a kill of `collector` and a stop of VictoriaMetrics. Under
+  `temporality: cumulative` a write `collector` lost at its kill changes no stored total, so
+  this is the property under test, not a count of the relay's own loss.
+- **`otlp_out` over HTTP held the queue through the backend's stop**: `logit.component.retrying`
+  read 1 during it, and no batch dropped over the run. The kill of `logit` left Ab − V 10,000,
+  one aggregate window, inside its band.
+- **The first `graphite-egress` run FAILed on two harness defects, both fixed.** Its two
+  `[[expect]]` rows named step ids one too low, since step ids count from 1; with the scenario
+  corrected in its run directory, both PASS on re-score. `ledger.wire` FAILed the end run 102
+  short of W + K, past its 100-line allowance, with G == W over the run: interpolation put one
+  drain's lines across the steady-to-end boundary. W27's end-boundary netting
+  ([ADR `soak-harness`](../adr/soak-harness.md)'s "Amendment: the end run nets at its
+  boundary") covers it, and the re-score PASSes with 0 steady loss judged.
+- **The generator's own queue overflows during a SUT partition.** Each `graphite-egress` run
+  counted 14,800 and 17,900 events `drop_newest` on the generator, outside G, during the
+  partition of `logit`; it's the generator's counted loss, not the SUT's.
+
+Not owed by these runs, but open: a relay has no ledger row of its own, so a loss inside
+`collector` shows only when it holds a `logit` life's last value.
