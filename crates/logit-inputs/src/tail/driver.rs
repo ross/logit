@@ -7409,6 +7409,49 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// A pass reads claimable files before the others, so a tracked file whose head the drain
+    /// grows past 64 bytes isn't in the snapshot a copy of it is decided against, wherever the
+    /// map puts it: the copy is read at once. Files are added until the copy isn't first in the
+    /// map's order, so a pass in that order would read a tracked file, and offer its candidate,
+    /// before the copy.
+    #[tokio::test]
+    async fn a_pass_reads_claimable_files_before_the_others() {
+        let dir = scratch_dir("claim-pass-order");
+        let copy = dir.join("copy.log");
+        let long = long_line("long");
+        std::fs::write(dir.join("f0.log"), "short\n").unwrap();
+        let mut tailer = Tailer::new(
+            vec![PathPattern::new(dir.join("*.log"))],
+            LineFactory,
+            fast_config(ReadFrom::Beginning),
+        );
+        assert_eq!(tick(&mut tailer, true).await.len(), 1);
+        std::fs::File::create_new(&copy).unwrap();
+        assert!(tick(&mut tailer, false).await.is_empty());
+        let mut originals = vec![dir.join("f0.log")];
+        while tailer.files.keys().next() == Some(&id_of(&copy)) {
+            assert!(originals.len() < 32, "the map keeps the copy first");
+            let next = dir.join(format!("f{}.log", originals.len()));
+            std::fs::write(&next, "short\n").unwrap();
+            assert_eq!(tick(&mut tailer, false).await.len(), 1);
+            originals.push(next);
+        }
+        assert!(tailer.files[&id_of(&copy)].claimable);
+
+        for original in &originals {
+            append(original, format!("{long}\n").as_bytes());
+        }
+        std::fs::write(&copy, format!("short\n{long}\n")).unwrap();
+        let mut lines = read_out(&mut tailer).await;
+        lines.sort();
+        let mut expected = vec![long.clone(); originals.len() + 1];
+        expected.push("short".to_owned());
+        expected.sort();
+        assert_eq!(lines, expected, "the copy is read at once");
+        assert!(!tailer.files[&id_of(&copy)].claim_pending);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// A claimable file a read leaves for the scan goes back to `0`: renamed out of every pattern
     /// before any scan decides it, it drains, and its lines are all read.
     #[tokio::test]
