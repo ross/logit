@@ -2648,7 +2648,18 @@ see [ADR
   unterminated line held from before the truncation is discarded and counted
   `logit.input.frames.dropped{reason="truncated"}`. Under `docker_in`, each stream's held
   reassembly is discarded and counted the same way, once with the unterminated line that
-  continues it.
+  continues it. The bytes the last scan or read saw past the read offset, which no read reached,
+  are counted `logit.input.bytes.dropped{reason="truncated"}`. That count is usually `0` and is
+  a floor: under `copytruncate`, what's written after the last look exists only in the copy, and
+  `logit` doesn't look for it. **Treat any nonzero `files.truncated` under `copytruncate` as
+  possible loss**, unless a pattern also matches the copy.
+- `logit.input.files.skipped{reason="compressed"}` and
+  `logit.component.diagnostics{key="compressed"}` (counts): a matched file that starts with a gzip,
+  zstd, xz, or bzip2 header, which `logit` closes without reading a line of it, counted once per
+  file per process, however often a scan finds it, renamed or not. It isn't loss: under a pattern like `app.log*`,
+  the compressed rotation's content was read under its uncompressed name before the rotator
+  compressed it. `logit` never decompresses a file. If a compressed file is the only copy of what
+  you need, decompress it to a path a pattern matches.
 - `logit.component.diagnostics{key="metadata_error"}` (`docker_in` only): a container's
   `config.v2.json` couldn't be read or parsed. That container's lines still flow, with a
   `container.id`-only resource instead of the full identity. A missing file is retried on every poll
@@ -2663,13 +2674,17 @@ see [ADR
   container is renamed back, the retained resume offset is lost.
 
 **Rotation.** Prefer rotating by rename (logrotate's `create` mode) over `copytruncate`. With
-`copytruncate` or `compress`, don't use a pattern that matches the rotated names: `app.log*` reads
-every `copytruncate` copy from its beginning, re-emitting the whole file each rotation, and reads a
-`.gz` as lines of binary. With an exact pattern (`app.log`), the writer must reopen its file on
-HUP within one `poll_interval` of the rename: the renamed file is read until it reaches its end at
-least one `poll_interval` after `logit` saw the rotation, and what the writer appends to it after
-that is lost. `copytruncate` under an exact
-pattern loses what was written after the last read and before the truncate.
+`copytruncate`, don't use a pattern that matches the rotated names: `app.log*` reads every
+`copytruncate` copy from its beginning, re-emitting the whole file each rotation. Under
+`compress`, a pattern that matches the rotated names is safe: each `.gz` is skipped and counted
+`files.skipped{reason="compressed"}`. With an exact pattern (`app.log`), the writer must reopen its
+file on HUP within one `poll_interval` of the rename: the renamed file is read until it reaches its
+end at least one `poll_interval` after `logit` saw the rotation, and what the writer appends to it
+after that is lost. `copytruncate` under an exact pattern loses what was written after the last
+read and before the truncate, by design (ADR `tail-content-identity`): `logit` counts the
+truncation in `files.truncated` and the bytes it saw unread in
+`bytes.dropped{reason="truncated"}`, but doesn't follow the copy. To keep those lines, rotate by
+rename, or match the copy too and accept its replay.
 
 ## Named time zones
 

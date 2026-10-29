@@ -76,19 +76,11 @@ Entry format and the other areas: [the known-gaps index](README.md).
     (`app.log`) closes each rotated file once it's read, but loses the file's unread tail at a
     stop or a crash, counted only as far as the last checkpoint knew (the entry above).
 - **Under a pattern that matches rotated names, `copytruncate` re-emits the whole file on every
-  rotation, and `compress` tails `app.log.N.gz` as text.**
-  - The copy `copytruncate` writes is a new inode, so `app.log*` reads it from `0`; a recorded run
-    re-emitted about 1,600 to 2,000 lines per three rotations.
-  - A `.gz` file is read as lines of binary, diagnosed `invalid_utf8`.
-
-  `docs/deploying.md`'s "What to watch for file tailing" has the guidance. See [ADR
+  rotation.** The copy `copytruncate` writes is a new inode, so `app.log*` reads it from `0`; a
+  recorded run re-emitted about 1,600 to 2,000 lines per three rotations. `docs/deploying.md`'s
+  "What to watch for file tailing" has the guidance. See [ADR
   `file-tailing-and-docker-json-logs`](../adr/file-tailing-and-docker-json-logs.md)'s "Rotation and
   truncation" section.
-- **Under an exact pattern, `copytruncate` loses the lines written after the tailer's last read
-  and before the truncate.** They exist only in the copy, which the pattern doesn't match. The
-  window is up to one `poll_interval` of writes (or one wake). See [ADR
-  `file-tailing-and-docker-json-logs`](../adr/file-tailing-and-docker-json-logs.md)'s 2026-09-28
-  amendment.
 - **`logit.input.files.rotated` misses a rotation when a scan lands in logrotate `create`'s
   rename-to-create gap.** logrotate renames the file away and creates its replacement afterward. A
   scan between the two finds nothing at the path, so it retires the old inode (which drains to its
