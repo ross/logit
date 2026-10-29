@@ -2674,15 +2674,18 @@ see [ADR
   tracked file's length shrinking under it. That's rare, but real for a tool that recreates a log
   file in place instead of renaming it away first. The file is reread from its start, and an
   unterminated line held from before the truncation is discarded and counted
-  `logit.input.frames.dropped{reason="truncated"}`. Under `docker_in`, each stream's held
-  reassembly is discarded and counted the same way, once with the unterminated line that
-  continues it. The bytes the last scan or read saw past the read offset, which no read reached,
-  are counted `logit.input.bytes.dropped{reason="truncated"}`. That count is usually `0` and is
-  a floor: under `copytruncate`, what's written after the last look exists only in the copy.
-  Both drop counts wait for the end of the next scan whose listing succeeded, or a stop: a copy
-  a pattern matches claims the file's state from before the truncation instead, and then only
-  the bytes seen past the copy's end are counted. **Treat any nonzero `files.truncated` under `copytruncate` as possible loss**,
-  unless a pattern also matches the copy and `files.claimed` rose with it.
+  `logit.input.frames.dropped{reason="truncated"}`. Under `docker_in`, each stream's held reassembly
+  is discarded and counted the same way, once with the unterminated line that continues it. The
+  bytes the last scan or read saw past the read offset, which no read reached, are counted
+  `logit.input.bytes.dropped{reason="truncated"}`. That count is usually `0` and is a floor: under
+  `copytruncate`, what's written after the last look exists only in the copy. Both drop counts wait,
+  since a copy a pattern matches may claim the file's state from before the truncation instead, and
+  then only the bytes seen past the copy's end are counted: they're recorded at the end of the
+  second scan that offers the truncated file's state to a claim, whether or not its listing failed,
+  or up to two scans later while a file waiting to claim it could still do so, or at a stop, and a
+  second truncation of the same file records the first's at once. **Treat any nonzero
+  `files.truncated` under `copytruncate` as possible loss**, unless a pattern also matches the copy
+  and `files.claimed` rose with it.
 - `logit.input.files.skipped{reason="compressed"}` and
   `logit.component.diagnostics{key="compressed"}` (counts): a matched file that starts with a gzip,
   zstd, xz, or bzip2 header, which `logit` closes without reading a line of it, counted once per

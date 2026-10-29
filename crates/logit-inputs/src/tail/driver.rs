@@ -57,6 +57,12 @@ const CLAIM_MIN_HEAD: u32 = 64;
 /// the second, a copy a scan found still being written.
 const CLAIM_DEFER_SCANS: u32 = 2;
 
+/// How many scans' claim passes offer a truncated file's state before its counts are recorded
+/// ([`Tailer::count_truncations`]), whether or not their listings failed, so one failed listing
+/// doesn't count a truncation a copy would have claimed and a persistent one doesn't hold it
+/// until a stop. An inode still waiting to claim it keeps it up to [`CLAIM_DEFER_SCANS`] more.
+const TRUNCATION_OFFERS: u32 = 2;
+
 /// One byte of a magic: any value in `lo..=hi`.
 type MagicByte = (u8, u8);
 
@@ -371,8 +377,10 @@ struct Truncation {
     /// Whether the truncation discarded an unterminated line, for
     /// `logit.input.frames.dropped{reason="truncated"}`.
     partial: bool,
-    /// Whether a claim pass has run since: only then can a scan show no copy will claim it.
-    offered: bool,
+    /// The truncated file: a second truncation of it records this one's counts and replaces it.
+    id: FileId,
+    /// How many claim passes have offered it ([`TRUNCATION_OFFERS`]).
+    offers: u32,
     /// Whether an inode deferred in this scan may still claim it, which keeps it a scan longer.
     pinned: bool,
 }
@@ -525,9 +533,10 @@ pub(crate) struct Tailer<D: TailDecoder, F: DecoderFactory<D>> {
     /// prune instead, a process that ended before that write would leave the entry on disk, and
     /// the next process would count the same bytes again.
     gone: Vec<Gone>,
-    /// Truncations not yet claimed or counted ([`Truncation`]). A scan counts each once its
-    /// claim pass has offered it to every inode the listing found, so a copy the truncation
-    /// leaves under a matched name cancels the count instead of being counted and then read.
+    /// Truncations not yet claimed or counted ([`Truncation`]), at most one per file. A scan
+    /// counts each once [`TRUNCATION_OFFERS`] claim passes have offered it, so a copy the
+    /// truncation leaves under a matched name cancels the count instead of being counted and then
+    /// read.
     truncations: Vec<Truncation>,
     /// Checkpoint entries rejected on their own inode's content in this scan, which a new inode
     /// may still claim. Emptied by every scan's claim pass, which counts the unclaimed ones gone.
@@ -909,11 +918,7 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
         self.reconcile_all(discovered, first, &listing, &discovered_ids, watcher).await;
         pruned |= self.prune_checkpoint_entries(&listing, &discovered_ids);
         self.prune_skipped(&listing, &discovered_ids);
-        // A listing that failed or couldn't `stat` a path may have missed a copy that would
-        // claim a truncation's state, so only a clean one counts what's left unclaimed.
-        if listing.failed.is_empty() && listing.unknown.is_empty() {
-            self.count_truncations(false);
-        }
+        self.count_truncations(false);
         if pruned {
             if let Some(cp) = &mut self.checkpoint {
                 cp.mark_dirty();
@@ -1181,7 +1186,7 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
         discovered_ids: &HashSet<FileId>,
     ) -> Vec<Option<(StartOffset, Option<ClaimFrom>)>> {
         for t in &mut self.truncations {
-            t.offered = true;
+            t.offers += 1;
             t.pinned = false;
         }
         let mut out = vec![None; unmatched.len()];
@@ -1395,13 +1400,16 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
         }
     }
 
-    /// Counts each held truncation's unread bytes and discarded line, once a scan's claim pass
-    /// has offered it and no deferred inode may still claim it, or every one when `all` (at
-    /// shutdown, when no later scan can).
+    /// Counts each held truncation's unread bytes and discarded line once [`TRUNCATION_OFFERS`]
+    /// claim passes have offered it and no deferred inode may still claim it, or once
+    /// [`CLAIM_DEFER_SCANS`] more have, or every one when `all` (at shutdown, when no later scan
+    /// can).
     fn count_truncations(&mut self, all: bool) {
         let mut kept = Vec::new();
         for t in std::mem::take(&mut self.truncations) {
-            if !all && (!t.offered || t.pinned) {
+            let due = t.offers >= TRUNCATION_OFFERS
+                && (!t.pinned || t.offers >= TRUNCATION_OFFERS + CLAIM_DEFER_SCANS);
+            if !all && !due {
                 kept.push(t);
                 continue;
             }
@@ -1773,7 +1781,7 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
     /// the copy holds of what the original never read, and only the bytes past the copy's end
     /// are counted ([`Tailer::settle_claims`]). A scan that finds no claimant
     /// counts both ([`Tailer::count_truncations`]): a copy made before the truncate is listable by
-    /// any scan after the truncation is seen. A state no copy can claim (a head under
+    /// any scan after the truncation is seen, and a second scan covers one whose listing failed. A state no copy can claim (a head under
     /// [`CLAIM_MIN_HEAD`], or no known marker at the boundary) is counted at once.
     async fn reconcile_truncation(&mut self, id: FileId, len: u64) {
         let max_line_bytes = self.config.max_line_bytes;
@@ -1824,12 +1832,20 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
         self.telemetry.count("logit.input.files.truncated", 1.0, &[]);
         let truncation = Truncation {
             candidate,
+            id,
             read_offset: prev_offset,
             unread,
             partial: discarded_partial,
-            offered: false,
+            offers: 0,
             pinned: false,
         };
+        // Its content is gone again, so a copy of it can no longer be told from this one's.
+        // Not during a claim pass: no tracked file is truncated between `claim_unmatched` and
+        // `settle_claims`, so no `ClaimFrom::Truncated` index shifts.
+        if let Some(ix) = self.truncations.iter().position(|t| t.id == id) {
+            let earlier = self.truncations.remove(ix);
+            self.count_truncation(&earlier);
+        }
         if truncation.candidate.is_some() {
             self.truncations.push(truncation);
         } else {
@@ -7314,9 +7330,9 @@ mod tests {
     }
 
     /// Under an exact pattern nothing can claim a truncation, and its counts wait only for the
-    /// end of the next clean scan: a drain that finds it emits neither.
+    /// end of the second scan that offers it: a drain that finds it emits neither.
     #[tokio::test]
-    async fn a_truncation_nothing_claims_is_counted_at_the_end_of_the_next_scan() {
+    async fn a_truncation_nothing_claims_is_counted_at_the_end_of_the_second_scan() {
         let dir = scratch_dir("claim-none");
         let path = dir.join("app.log");
         let (one, two) = (long_line("one"), long_line("two"));
@@ -7332,7 +7348,66 @@ mod tests {
         assert_eq!(probe.sum("logit.input.files.truncated", &[]), 1.0, "seen at once");
         assert_eq!(truncated_drops(&mut probe), (0.0, 0.0), "counted only once no copy claims it");
         tailer.scan(false, &mut crate::tail::watch::Watcher::Poll).await;
+        assert_eq!(truncated_drops(&mut probe), (0.0, 0.0), "offered once");
+        tailer.scan(false, &mut crate::tail::watch::Watcher::Poll).await;
         assert_eq!(truncated_drops(&mut probe), (5.0, 1.0));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A listing that keeps failing, of another pattern's directory here, doesn't hold a
+    /// truncation until a stop: it's counted once two scans have offered it, as under clean
+    /// listings. A second truncation of the same file counts the first at once and replaces it,
+    /// so at most one is held per file.
+    #[tokio::test]
+    async fn a_truncation_is_counted_after_two_offers_whatever_the_listings() {
+        let dir = scratch_dir("claim-offers");
+        let path = dir.join("app.log");
+        let locked = dir.join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        let fill =
+            || std::fs::write(&path, format!("{}\n{}\n", long_line("one"), long_line("two")));
+        fill().unwrap();
+        let mut probe = TelemetryProbe::new();
+        let mut tailer = probed_tailer(
+            vec![PathPattern::new(&path), PathPattern::new(locked.join("*.log"))],
+            ReadFrom::Beginning,
+            &probe,
+        );
+        assert_eq!(tick(&mut tailer, true).await.len(), 2);
+        let scope = fault::scope(&locked);
+        scope.fail(READ_DIR, errno::EACCES);
+
+        // Seen by a drain, so neither scan below is the one that finds it.
+        append(&path, b"x\n");
+        tailer.scan(false, &mut crate::tail::watch::Watcher::Poll).await;
+        truncate(&path);
+        assert!(drain_by_hand(&mut tailer).await.is_empty());
+        tailer.scan(false, &mut crate::tail::watch::Watcher::Poll).await;
+        assert_eq!(truncated_drops(&mut probe), (0.0, 0.0), "offered once");
+        tailer.scan(false, &mut crate::tail::watch::Watcher::Poll).await;
+        assert_eq!(truncated_drops(&mut probe), (2.0, 0.0), "offered twice");
+
+        // A second truncation before two scans offer the first counts the first and replaces it.
+        fill().unwrap();
+        assert_eq!(read_out(&mut tailer).await.len(), 2);
+        append(&path, b"z\n");
+        tailer.scan(false, &mut crate::tail::watch::Watcher::Poll).await;
+        truncate(&path);
+        assert!(drain_by_hand(&mut tailer).await.is_empty());
+        fill().unwrap();
+        assert_eq!(read_out(&mut tailer).await.len(), 2);
+        append(&path, b"y\n");
+        tailer.scan(false, &mut crate::tail::watch::Watcher::Poll).await;
+        truncate(&path);
+        assert!(drain_by_hand(&mut tailer).await.is_empty());
+        assert_eq!(tailer.truncations.len(), 1);
+        assert_eq!(truncated_drops(&mut probe), (4.0, 0.0), "the first one's z, offered once");
+        assert_eq!(probe.sum("logit.input.files.truncated", &[]), 3.0);
+        tailer.scan(false, &mut crate::tail::watch::Watcher::Poll).await;
+        tailer.scan(false, &mut crate::tail::watch::Watcher::Poll).await;
+        assert!(tailer.truncations.is_empty());
+        assert_eq!(truncated_drops(&mut probe), (6.0, 0.0));
+        drop(scope);
         std::fs::remove_dir_all(&dir).ok();
     }
 

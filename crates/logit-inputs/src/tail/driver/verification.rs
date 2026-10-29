@@ -19,8 +19,9 @@
 //! [`Model`] restates the driver's rules over the model filesystem: which inode each path names,
 //! what a scan retires, rebinds, opens, resumes, finds truncated, or lets a new inode claim by
 //! content (`docs/adr/tail-content-identity.md`), how a drain splits, drops, batches, and reaps,
-//! and what a checkpoint persists. A truncation's counts wait, as the driver's do, until a clean
-//! scan has offered its state to every new inode, or a stop. After every op the test checks:
+//! and what a checkpoint persists. A truncation's counts wait, as the driver's do, until
+//! `TRUNCATION_OFFERS` scans have offered its state, and up to `CLAIM_DEFER_SCANS` more while an
+//! inode may still claim it, or a stop; a second truncation of the file counts the first. After every op the test checks:
 //!
 //! - the batches received equal the model's, each in file order and in order per inode;
 //! - the tracked set, each file's offset, pending bytes, state, path, head, and `rescanned`,
@@ -257,10 +258,11 @@ enum Start {
 #[derive(Debug)]
 struct MTruncation {
     candidate: Option<Cand>,
+    id: FileId,
     /// The read offset before the truncation.
     read_offset: u64,
     unread: u64,
-    offered: bool,
+    offers: u32,
     pinned: bool,
 }
 
@@ -535,12 +537,16 @@ impl Model {
         t.head.clear();
         t.seen.clear();
         self.counts.truncated += 1;
+        if let Some(ix) = self.truncations.iter().position(|t| t.id == id) {
+            self.counts.truncated_bytes += self.truncations.remove(ix).unread;
+        }
         if candidate.is_some() {
             self.truncations.push(MTruncation {
                 candidate,
+                id,
                 read_offset,
                 unread,
-                offered: false,
+                offers: 0,
                 pinned: false,
             });
         } else {
@@ -573,11 +579,14 @@ impl Model {
         }
     }
 
-    /// Counts each truncation a scan offered and no deferred inode may claim, or all.
+    /// Counts each truncation `TRUNCATION_OFFERS` scans offered and no deferred inode may claim,
+    /// or `CLAIM_DEFER_SCANS` more offered, or all.
     fn count_truncations(&mut self, all: bool) {
         let mut kept = Vec::new();
         for t in std::mem::take(&mut self.truncations) {
-            if !all && (!t.offered || t.pinned) {
+            let due = t.offers >= TRUNCATION_OFFERS
+                && (!t.pinned || t.offers >= TRUNCATION_OFFERS + CLAIM_DEFER_SCANS);
+            if !all && !due {
                 kept.push(t);
             } else {
                 self.counts.truncated_bytes += t.unread;
@@ -768,10 +777,7 @@ impl Model {
 
         // An unspent entry goes once a listing shows nothing can consume it.
         self.resume.retain(|id, e| !listed(&e.path) || found.contains_key(id));
-        // Only a listing that saw every path counts what no copy claimed.
-        if !read_dir_failed && unknown.is_empty() {
-            self.count_truncations(false);
-        }
+        self.count_truncations(false);
 
         let scan = self.scans;
         for t in self.tracked.values_mut() {
@@ -891,7 +897,7 @@ impl Model {
         found: &HashMap<FileId, PathBuf>,
     ) -> Vec<Start> {
         for t in &mut self.truncations {
-            t.offered = true;
+            t.offers += 1;
             t.pinned = false;
         }
         let candidates = self.candidates(listed, found);
@@ -1398,6 +1404,8 @@ impl World {
                     let inode = self.record(f, 1, Vec::new());
                     if empty_first {
                         self.scan(ScanFail::None).await;
+                        // Before the truncate empties an inode this scan resumed mid-line.
+                        self.check();
                     }
                     let content = self.model.inodes[live].content.clone();
                     file.write_all(&content).unwrap();

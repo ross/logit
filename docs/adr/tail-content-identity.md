@@ -202,25 +202,27 @@ reviewer can check.
    2026-10-18 amendment). A file created and removed wholly while `tail_in` was down can't be
    counted, because no checkpoint recorded it. That's a decided limit.
 
-7. **An exact-pattern `copytruncate` is counted, not recovered.** At a truncation, the tailer
-   counts the bytes it knew existed past its read offset, the last size it saw before the
-   truncation less that offset, as `logit.input.bytes.dropped{reason="truncated"}`. That's usually
-   `0`, since the lost lines are writes no scan saw. The `truncated` diagnostic says that lines
-   written before the truncate may be lost unless a pattern also matches the copy. The count is
-   an estimate; `logit.input.files.truncated` is the signal that a truncation happened, and what
-   the operator needs is to know it happened, not the exact count. The tailer doesn't search for
-   the copy outside its patterns. `docs/deploying.md` steers to rename rotation, and, under
-   `copytruncate`, to a pattern that matches the rotated names. A claim of the truncated file's
-   pre-truncation state (decision 5) cancels the discarded line's
-   `logit.input.frames.dropped{reason="truncated"}`, because the copy then resumes where the
-   original stopped and holds the line whole. Of the bytes count it keeps only what the copy
-   lacks: the last size the tailer saw less the larger of the copy's length and the
-   pre-truncation read offset, when that's positive, since those bytes are in neither file. So
-   that neither is counted and then retracted, both wait: they're recorded at
-   the end of the first scan after the truncation whose listing failed nowhere and no waiting
-   inode could still claim the state, or at a stop. A truncated file whose head is under 64 bytes
-   can't be claimed, so its counts are recorded at once. `logit.input.files.truncated` and the
-   `truncated` diagnostic are recorded at once either way.
+7. **An exact-pattern `copytruncate` is counted, not recovered.** At a truncation, the tailer counts
+   the bytes it knew existed past its read offset, the last size it saw before the truncation less
+   that offset, as `logit.input.bytes.dropped{reason="truncated"}`. That's usually `0`, since the
+   lost lines are writes no scan saw. The `truncated` diagnostic says that lines written before the
+   truncate may be lost unless a pattern also matches the copy. The count is an estimate;
+   `logit.input.files.truncated` is the signal that a truncation happened, and what the operator
+   needs is to know it happened, not the exact count. The tailer doesn't search for the copy outside
+   its patterns. `docs/deploying.md` steers to rename rotation, and, under `copytruncate`, to a
+   pattern that matches the rotated names. A claim of the truncated file's pre-truncation state
+   (decision 5) cancels the discarded line's `logit.input.frames.dropped{reason="truncated"}`,
+   because the copy then resumes where the original stopped and holds the line whole. Of the bytes
+   count it keeps only what the copy lacks: the last size the tailer saw less the larger of the
+   copy's length and the pre-truncation read offset, when that's positive, since those bytes are in
+   neither file. So that neither is counted and then retracted, both wait: they're recorded at the
+   end of the second scan that offers the truncated file's state to a claim, whether or not its
+   listing failed, or up to two scans later while a file waiting to claim it could still do so, or
+   at a stop, and a second truncation of the same file records the first's at once. Two scans, not
+   one, so a copy a failed listing missed gets another; a cap, so a listing that keeps failing
+   doesn't hold them until a stop. A truncated file whose head is under 64 bytes can't be claimed,
+   so its counts are recorded at once. `logit.input.files.truncated` and the `truncated` diagnostic
+   are recorded at once either way.
 
 8. **A refill past the old offset while running stays undetected.** A `copytruncate` that the
    writer refills past the tailer's offset before the next size check still looks like an append
