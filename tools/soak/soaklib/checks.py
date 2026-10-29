@@ -77,7 +77,11 @@ SUT, `logit`, both are the same. Two SUT services are joined by a `[[ledger.hop]
 (docs/plans/soak-harness.md's "The native hop (W10b)"): the far side's rows read its
 `logit_in`'s events sent where the listeners' W − D − B − X would be, `ledger.hop` judges the
 hop on run totals, since a life of one service isn't a life of the other, and
-`ledger.summary` bounds V end to end. Without a hop two services SKIP every ledger row.
+`ledger.summary` bounds V end to end. Without a hop two services SKIP every ledger row, unless
+the sinks name the second as their `relay`: then `logit` holds the listeners, `aggregate`, and
+the sinks, and every row reads its lives alone. The relay passes the sinks' writes on to the
+backend with the timestamps `logit`'s `aggregate` gave them, so V splits on `logit`'s lives
+too, and under `temporality: cumulative` a write the relay loses mid-life changes no total.
 
 A rolling overlap (`[overlap]`) runs several instances of one pipeline on one shared port: the
 rows about a process life judge each instance on its own lives, and the wire, `progress`,
@@ -308,10 +312,12 @@ class RunData:
         self.logit_services = sorted(name for name, role in self.services.items()
                                      if role in LOGIT_ROLES)
         # The SUT services in chain order (`Scenario.suts`): the first holds every source's
-        # listener, the last `sut_aggregate` and every sink. A run directory with no `suts` ran
-        # `logit` alone.
+        # listener, and `sink_sut` holds `sut_aggregate` and every sink: the last, or the first
+        # when the sinks name the last as their `relay`, which only carries their writes on to
+        # the backend. A run directory with no `suts` ran `logit` alone.
         self.suts = list(self.resolved.get("suts") or [SUT_SERVICE])
-        self.sut_in, self.sut_out = self.suts[0], self.suts[-1]
+        self.sut_in = self.suts[0]
+        self.sut_out = self.resolved.get("sink_sut") or self.suts[-1]
         # `[overlap]`: `{holder, instances, label}`, or None. Each instance runs the whole
         # pipeline, so the per-life rows read each through `instance_view()`.
         self.overlap = self.resolved.get("overlap") or None
@@ -3069,8 +3075,9 @@ def check_ledger_wire(data):
 
 def _boundary_nets(runs, anchors):
     """`(nets, netted)`: each run's gap, G − (W + K + F), after netting across every boundary
-    that touches a judged run, judged or steady on its other side, where the two gaps have
-    opposite signs, and `{index: [(moved, at, straddled)]}` for each run a transfer touched.
+    that touches a judged run, judged or steady on its other side, and the boundary into the
+    end run from a judged or steady one, where the two gaps have opposite signs, and `{index:
+    [(moved, at, straddled)]}` for each run a transfer touched.
 
     G is interpolated between generator drains, so at a SUT drain inside a generator interval
     its error is up to the G that moved in that interval: one batch while acknowledgments arrive
@@ -3084,13 +3091,16 @@ def _boundary_nets(runs, anchors):
     the most interpolation can move, and at either gap, so neither run changes sign. That cap is
     what keeps a surplus from hiding a loss next door: a resend's surplus or a steady run's,
     which otherwise counts at 0, nets a loss only as far as interpolation could explain it.
-    Runs that don't touch, and a reported or end run, never net."""
+    The end run's own allowance covers only the sends the generator cancels at shutdown, so its
+    boundary with the run before it nets the same way. Runs that don't touch, and a reported
+    run, never net."""
     nets = [g - wk for _, _, _, _, g, wk, _ in runs]
     netted = {}
     stamps = [t for t, _ in anchors]
     for index in range(len(runs) - 1):
         kinds = {runs[index][2], runs[index + 1][2]}
-        if ("judged" not in kinds or not kinds <= {"judged", "steady"}
+        into_end = runs[index + 1][2] == "end" and runs[index][2] in ("judged", "steady")
+        if (not (into_end or ("judged" in kinds and kinds <= {"judged", "steady"}))
                 or nets[index] * nets[index + 1] >= 0):
             continue
         at = runs[index][1]
@@ -3245,7 +3255,9 @@ def _wire_one(data, led, source, instances=None):
 
     limit = float(data.ledger.get("wire_loss_outside_faults", 0.0))
     tolerance = batch * edges
-    judged = steady_lost + max(0.0, sums["end"])
+    # The end run after netting across its boundary with the run before it.
+    end_net = sum(net for net, run in zip(nets, runs) if run[2] == "end")
+    judged = steady_lost + max(0.0, end_net)
     allowed = limit * g_steady + tolerance
     if judged > allowed:
         status = FAIL
@@ -3254,9 +3266,9 @@ def _wire_one(data, led, source, instances=None):
                         f"{limit:g} x {_n(round(g_steady))} + {edges} edge(s) x one "
                         f"{_n(batch)}-line batch")
     end_allow = _end_allowance(led, source)
-    if sums["end"] < -end_allow:
+    if end_net < -end_allow:
         status = FAIL
-        lines.insert(0, f"G falls {_n(round(-sums['end']))} short of W + K at the end, over "
+        lines.insert(0, f"G falls {_n(round(-end_net))} short of W + K at the end, over "
                         f"the end allowance "
                         f"{_n(end_allow)} (the generator sink's last buffer.batches + 1 batch)")
     if udp:

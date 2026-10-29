@@ -74,8 +74,10 @@ ROLES = (SUT_ROLE, GENERATOR_ROLE, BACKEND_ROLE, BROKER_ROLE, STANDIN_ROLE, NETN
 LOGIT_ROLES = (SUT_ROLE, GENERATOR_ROLE)
 # The ingress SUT: the service every generator sends to, whose config `[configs]` names under
 # `sut`. A scenario's override can add one more SUT service, named by its own `[configs]` key
-# and by the `[[ledger.hop]]`'s `to`, after `logit` in the chain (`Scenario.suts`); the last SUT
-# holds `sut_aggregate` and every `[[ledger.sink]]`. Generators are any services with the role,
+# and by the `[[ledger.hop]]`'s `to`, or by a `[[ledger.sink]]`'s `relay`, after `logit` in the
+# chain (`Scenario.suts`). Across a hop the last SUT holds `sut_aggregate` and every
+# `[[ledger.sink]]`; with a relay `logit` holds them, and the relay carries the sinks' writes on
+# to the backend. Generators are any services with the role,
 # each a `[[ledger.source]]`: compose.yaml's `generator`, and any a scenario's override adds.
 SUT_SERVICE = "logit"
 # The role map compose.yaml's labels give with the `local` profile, for what can't run
@@ -317,7 +319,7 @@ ROUTER_KINDS = ("route", "route_signals")
 # and that `aggregate`, in order. A local sink may add `vm_absent_selector`, a selector its
 # backend must hold no series for at the end (checks.py's `check_ledger_absent`).
 SINK_KEYS = {"id", "backend", "vm_selector", "target", "aggregate", "transforms",
-             "vm_absent_selector"}
+             "vm_absent_selector", "relay"}
 _COMPONENT_ID = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]*$")
 THRESHOLD_KEYS = {"progress_window", "rss_growth_mib_per_hour", "fd_growth"}
 EXPECT_KEYS = {"name", "service", "metric", "component", "attrs", "step", "window", "reduce",
@@ -712,10 +714,15 @@ class Scenario:
         return [SUT_SERVICE] + self.extra_suts
 
     @property
+    def relays(self):
+        """The further SUT services a `[[ledger.sink]]`'s `relay` names: none, or one."""
+        return sorted({sink["relay"] for sink in self.sinks if sink.get("relay")})
+
+    @property
     def sink_sut(self):
-        """The SUT service holding `sut_aggregate` and every `[[ledger.sink]]`: the chain's last.
-        Every overlap instance holds them."""
-        return self.suts[-1]
+        """The SUT service holding `sut_aggregate` and every `[[ledger.sink]]`: `logit` when a
+        sink names a `relay`, else the chain's last. Every overlap instance holds them."""
+        return SUT_SERVICE if self.relays else self.suts[-1]
 
     def sut_config_path(self, service):
         """The config of SUT `service`: `[configs] sut` for `logit` and for an overlap instance
@@ -765,6 +772,7 @@ class Scenario:
             "random": None if self.random is None else self.random.to_json(),
             "configs": dict(self.configs),
             "suts": self.suts,
+            "sink_sut": self.sink_sut,
             "overlap": None if self.overlap is None else {
                 **self.overlap, "instances": list(self.overlap["instances"])},
             "compose": self.compose,
@@ -926,6 +934,7 @@ def from_dict(raw, path):
         problems += _extra_sut_problems(extra_suts, ledger)
         if overlap is None:
             problems += _hop_problems(ledger, extra_suts)
+            problems += _relay_problems(ledger, extra_suts, target["kind"])
         elif isinstance(configs, dict):
             problems += _overlap_problems(overlap, ledger, configs, extra_suts, path.parent)
         if overlap is not None and ledger.get("split") == TARGET_SPLIT:
@@ -1766,10 +1775,10 @@ def _hop_problems(ledger, extra_suts):
     or a service; `from` is `SUT_SERVICE` and `to` the one further SUT service `[configs]`
     names; and no `sut_script` or `sut_transforms` beside it, whose rows judge a hop into
     `aggregate` inside one process. Two SUT services need a hop, since the ledger can't join
-    them without one."""
+    them without one, unless the sinks name the second as their `relay` (`_relay_problems()`)."""
     hops = ledger.get("hop")
     if hops is None:
-        if extra_suts:
+        if extra_suts and not _relays(ledger):
             return [f"configs: SUT services {SUT_SERVICE} and {', '.join(extra_suts)} need a "
                     "[[ledger.hop]] naming the logit_out and logit_in between them"]
         return []
@@ -1799,6 +1808,38 @@ def _hop_problems(ledger, extra_suts):
     sources = ledger.get("source") if isinstance(ledger.get("source"), list) else []
     if any(isinstance(source, dict) and "sut_transforms" in source for source in sources):
         problems.append("ledger.hop and a source's `sut_transforms` can't be combined")
+    return problems
+
+
+def _relays(ledger):
+    """The `relay` each `[[ledger.sink]]` table names, in order."""
+    sinks = ledger.get("sink") if isinstance(ledger.get("sink"), list) else []
+    return [sink.get("relay") for sink in sinks if isinstance(sink, dict) and "relay" in sink]
+
+
+def _relay_problems(ledger, extra_suts, kind):
+    """What a `[[ledger.sink]]`'s `relay` breaks. A relay is a further SUT service that takes a
+    sink's writes and passes them on to the sink's backend, so `logit` keeps `sut_aggregate` and
+    the sinks, and V is split on `logit`'s lives. Every sink names the same relay, the one
+    further SUT service `[configs]` names; the target is local, the backend V is read from;
+    and there is no `[[ledger.hop]]`, which puts `aggregate` in the far SUT instead."""
+    relays = _relays(ledger)
+    if not relays:
+        return []
+    problems = []
+    sinks = ledger.get("sink") if isinstance(ledger.get("sink"), list) else []
+    if len(relays) != len(sinks) or len({str(relay) for relay in relays}) != 1:
+        problems.append("ledger.sink: every sink names the same `relay`, or none does")
+    if len(extra_suts) != 1 or relays[0] != extra_suts[0]:
+        problems.append("ledger.sink: `relay` must be the one further SUT service [configs] "
+                        "names" + (f", {extra_suts[0]}" if len(extra_suts) == 1 else
+                                   f"; it names {', '.join(extra_suts) or 'none'}"))
+    if kind != LOCAL_TARGET:
+        problems.append(f"ledger.sink: `relay` carries a sink's writes to a backend, and the "
+                        f"{kind} target has none")
+    if ledger.get("hop") is not None:
+        problems.append("ledger.hop and a sink's `relay` can't be combined: a hop puts "
+                        f"`aggregate` in the far SUT, a relay keeps it in {SUT_SERVICE}")
     return problems
 
 
