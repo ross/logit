@@ -6128,8 +6128,9 @@ What the runs showed:
   hyper dropped that future with the connection: life 0 counted 9,359 `ok` writes against
   9,367 batches sent, and 1,502,500 samples, 100 per counted write. Nothing was lost:
   `ledger.wire`, `ledger.egress`, and `ledger.summary` passed. The module doc's "one count per
-  request" is the claim the identity checks, so the row stays and FAILs until the listener
-  counts a cancelled write.
+  request" is the claim the identity checks, so the row stays. W24b counts a write that reaches
+  delivery on the delivery's own task, `ok` or `closed_consumer`, so a write whose sender gave up
+  still counts `ok` and the identity holds unchanged; `rw-ingress` owes a rerun on it.
 - **`datadog_in` and `splunk_hec_in` held both request identities in every life a kill didn't
   end**: `ok` requests on `series_v2` and `event` equal to `batches.sent`, and the backend
   stop's 9 and 18 busy `503`s equal to `batches.deferred`, with no `closed_consumer` answer.

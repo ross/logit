@@ -1461,7 +1461,8 @@ class HttpListener:
 # (crates/logit-inputs/src/splunk.rs and datadog.rs, "Backpressure"). `prometheus_in`'s
 # remote-write receiver counts each request once in `logit.input.writes{class}`, with no
 # `route` tag, decodes it to one batch, and never answers busy: backpressure delays its `204`
-# (crates/logit-inputs/src/prometheus.rs, "What a decoded request becomes").
+# (crates/logit-inputs/src/prometheus.rs, "What a decoded request becomes"). It counts a write
+# on the delivery's task, so one whose sender timed out waiting is still `ok` ("Counters").
 HTTP_LISTENERS = {
     "influxdb_in": HttpListener("logit.input.requests", "write", "logit.input.batches.deferred"),
     "otlp_in": HttpListener(None, None, None),

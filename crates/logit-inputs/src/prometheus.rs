@@ -309,11 +309,15 @@
 //!
 //! `logit.input.writes{class}` -- one count per request, `class` one of `ok`, `not_found`,
 //! `method`, `unauthorized`, `unsupported`, `oversize`, `timeout`, `bad_request`, or
-//! `closed_consumer`. An `ok`
-//! count also carries `encoding` (`snappy` or `zstd`), which is how to see whether a vmagent
-//! stayed on zstd. `logit.input.write.duration` -- a timing sample per request, recorded
-//! regardless of outcome. `logit.input.samples` -- reused from scrape mode, counting the wire
-//! samples of a write a consumer took: every decoded series' worth minus every series the model
+//! `closed_consumer`. An `ok` count also carries `encoding` (`snappy` or `zstd`), which is how to
+//! see whether a vmagent stayed on zstd. A write that reaches delivery is counted `ok` or
+//! `closed_consumer` on the delivery's own task, so a sender whose timeout fires while
+//! backpressure holds the `204` still counts the write it gave up on, as
+//! `logit.component.batches.sent` counts its batch. A request whose connection closes before its
+//! body is decoded counts no class, since nothing of it was sent. `logit.input.write.duration` --
+//! a timing sample per request answered, whatever the outcome. `logit.input.samples` -- reused
+//! from scrape mode, counted with the `ok` write, counting the wire samples of a write a consumer
+//! took: every decoded series' worth minus every series the model
 //! mapping then dropped, the number the `-Written` header reports. A counter and a header
 //! disagreeing about one request would be a puzzle with no right answer.
 //! `logit.input.batches.dropped{reason="closed_consumer"}` -- the write's batch when no consumer
@@ -1591,7 +1595,9 @@ where
 
 /// One request, timed and counted: every exit from [`write_response`], early rejections included,
 /// contributes one `logit.input.writes{class}` count (plus `encoding` on `ok`) and one
-/// `logit.input.write.duration` timing.
+/// `logit.input.write.duration` timing. A write that reaches delivery is counted on the delivery's
+/// task instead (`write_response`'s `None` class), so the count survives a client that closes
+/// before the response.
 #[allow(clippy::too_many_arguments)]
 async fn handle_write(
     req: http::Request<Incoming>,
@@ -1607,7 +1613,7 @@ async fn handle_write(
     stall: Option<Duration>,
 ) -> Result<http::Response<Full<Bytes>>, std::convert::Infallible> {
     let started = Instant::now();
-    let (class, encoding, response) = write_response(
+    let (counted, response) = write_response(
         req,
         path,
         resource,
@@ -1621,6 +1627,15 @@ async fn handle_write(
         stall,
     )
     .await;
+    if let Some((class, encoding)) = counted {
+        count_write(&telemetry, class, encoding);
+    }
+    telemetry.timing("logit.input.write.duration", started.elapsed(), &[]);
+    Ok(response)
+}
+
+/// Counts one `logit.input.writes{class}`, tagged `encoding` on an `ok`.
+fn count_write(telemetry: &Telemetry, class: &'static str, encoding: Option<Encoding>) {
     match encoding {
         Some(encoding) => {
             let tags = [("class", class), ("encoding", encoding.as_str())];
@@ -1628,13 +1643,11 @@ async fn handle_write(
         }
         None => telemetry.count("logit.input.writes", 1.0, &[("class", class)]),
     }
-    telemetry.timing("logit.input.write.duration", started.elapsed(), &[]);
-    Ok(response)
 }
 
 /// The routes table in this module's doc comment, in order, returning the
 /// `logit.input.writes{class}` label alongside the response, and on `ok` the encoding the request
-/// arrived in.
+/// arrived in. The label is `None` for a write that reached delivery, whose task has counted it.
 #[allow(clippy::too_many_arguments)]
 async fn write_response(
     req: http::Request<Incoming>,
@@ -1648,9 +1661,12 @@ async fn write_response(
     mut diag: Diagnostics,
     activity: &Activity,
     stall: Option<Duration>,
-) -> (&'static str, Option<Encoding>, http::Response<Full<Bytes>>) {
+) -> (Option<(&'static str, Option<Encoding>)>, http::Response<Full<Bytes>>) {
     if req.uri().path() != path {
-        return ("not_found", None, text_response(None, StatusCode::NOT_FOUND, "not found"));
+        return (
+            Some(("not_found", None)),
+            text_response(None, StatusCode::NOT_FOUND, "not found"),
+        );
     }
     // `405 + Allow: POST` where `otlp_in` answers `404`: this matches `prometheus_out`'s
     // exposition server (the module doc's "Routes" section).
@@ -1661,7 +1677,7 @@ async fn write_response(
             "only POST is accepted on a remote-write endpoint",
         );
         response.headers_mut().insert(http::header::ALLOW, HeaderValue::from_static("POST"));
-        return ("method", None, response);
+        return (Some(("method", None)), response);
     }
     // Before the other headers and the body (the module doc's "Authentication"). A 2.0 sender's
     // `401` still carries the `-Written` zeros, so the version is read off `Content-Type` here.
@@ -1671,7 +1687,7 @@ async fn write_response(
             remote_write::Version::from_content_type(header_str(req.headers(), CONTENT_TYPE));
         let mut response = text_response(seen, StatusCode::UNAUTHORIZED, "unauthorized");
         auth.challenge(response.headers_mut());
-        return ("unauthorized", None, response);
+        return (Some(("unauthorized", None)), response);
     }
 
     // Both specs mandate Snappy *block* compression on every request, with no identity mode, so a
@@ -1691,8 +1707,7 @@ async fn write_response(
             format_args!("prometheus_in: rejecting a request from {peer}: {message}"),
         );
         return (
-            "unsupported",
-            None,
+            Some(("unsupported", None)),
             text_response(None, StatusCode::UNSUPPORTED_MEDIA_TYPE, &message),
         );
     };
@@ -1711,8 +1726,7 @@ async fn write_response(
             format_args!("prometheus_in: rejecting a request from {peer}: {message}"),
         );
         return (
-            "unsupported",
-            None,
+            Some(("unsupported", None)),
             text_response(None, StatusCode::UNSUPPORTED_MEDIA_TYPE, &message),
         );
     };
@@ -1738,7 +1752,10 @@ async fn write_response(
                 "write_rejected",
                 format_args!("prometheus_in: rejecting a request from {peer}: {message}"),
             );
-            return ("timeout", None, text_response(seen, StatusCode::REQUEST_TIMEOUT, &message));
+            return (
+                Some(("timeout", None)),
+                text_response(seen, StatusCode::REQUEST_TIMEOUT, &message),
+            );
         }
         Err(BodyReadError::Failed(err)) => {
             let message = body_read_error_message(err.as_ref());
@@ -1747,8 +1764,7 @@ async fn write_response(
                 format_args!("prometheus_in: rejecting a request from {peer}: {message}"),
             );
             return (
-                "oversize",
-                None,
+                Some(("oversize", None)),
                 text_response(seen, StatusCode::PAYLOAD_TOO_LARGE, &message),
             );
         }
@@ -1768,7 +1784,7 @@ async fn write_response(
                 DecompressError::TooLarge { .. } => ("oversize", StatusCode::PAYLOAD_TOO_LARGE),
                 DecompressError::Malformed { .. } => ("bad_request", StatusCode::BAD_REQUEST),
             };
-            return (class, None, text_response(seen, status, &message));
+            return (Some((class, None)), text_response(seen, status, &message));
         }
     };
 
@@ -1796,7 +1812,10 @@ async fn write_response(
                 "write_rejected",
                 format_args!("prometheus_in: rejecting a request from {peer}: {message}"),
             );
-            return ("bad_request", None, text_response(seen, StatusCode::BAD_REQUEST, &message));
+            return (
+                Some(("bad_request", None)),
+                text_response(seen, StatusCode::BAD_REQUEST, &message),
+            );
         }
     };
     // Learned from what *this* request declared, never from the seed: a cache that refreshed
@@ -1835,28 +1854,41 @@ async fn write_response(
     // Both sides walk the same `decoded.groups`, so this cannot underflow; `saturating_sub` only
     // so a bug there is not a panic.
     let written = total.saturating_sub(dropped);
-    if !events.is_empty() {
-        // **Before** the response is built, as in `otlp_in`: channel backpressure delays the
-        // `204` and the sender's queue throttles, remote-write's own flow-control model.
-        // On its own task, so a sender that disconnects mid-wait cancels only the wait, never
-        // part of the fan-out (`crate::http::deliver_detached`).
-        let mut batch = vec![EventBatch { resource, scope: None, events }];
-        request_peer.stamp_batches(&mut batch);
-        if let Err(undelivered) = crate::http::deliver_detached(sink, batch).await {
-            undelivered.record(telemetry);
-            diag.warn_throttled(
-                "closed_consumer",
-                format_args!(
-                    "prometheus_in: refusing a write from {peer}: no consumer took the batch"
-                ),
-            );
-            let message = "no consumer took the batch";
-            let response = text_response(seen, StatusCode::SERVICE_UNAVAILABLE, message);
-            return ("closed_consumer", None, response);
-        }
+    if events.is_empty() {
+        telemetry.count("logit.input.samples", written as f64, &[]);
+        return (Some(("ok", Some(encoding))), no_content(seen, written, decoded.exemplars));
     }
-    telemetry.count("logit.input.samples", written as f64, &[]);
-    ("ok", Some(encoding), no_content(seen, written, decoded.exemplars))
+    // **Before** the response is built, as in `otlp_in`: channel backpressure delays the `204` and
+    // the sender's queue throttles, remote-write's own flow-control model. On its own task, so a
+    // sender that disconnects mid-wait cancels only the wait, never part of the fan-out. Counted
+    // there too: a sender whose request timeout fires during the wait drops this future, and its
+    // write still went out (`crate::http::deliver_detached`).
+    let mut batch = vec![EventBatch { resource, scope: None, events }];
+    request_peer.stamp_batches(&mut batch);
+    let settle = {
+        let (telemetry, peer) = (telemetry.clone(), peer.clone());
+        move |outcome: Result<(), crate::http::Undelivered>| match outcome {
+            Ok(()) => {
+                count_write(&telemetry, "ok", Some(encoding));
+                telemetry.count("logit.input.samples", written as f64, &[]);
+            }
+            Err(undelivered) => {
+                undelivered.record(&telemetry);
+                count_write(&telemetry, "closed_consumer", None);
+                diag.warn_throttled(
+                    "closed_consumer",
+                    format_args!(
+                        "prometheus_in: refusing a write from {peer}: no consumer took the batch"
+                    ),
+                );
+            }
+        }
+    };
+    if crate::http::deliver_detached(sink, batch, settle).await.is_err() {
+        let message = "no consumer took the batch";
+        return (None, text_response(seen, StatusCode::SERVICE_UNAVAILABLE, message));
+    }
+    (None, no_content(seen, written, decoded.exemplars))
 }
 
 /// `""` for an absent or non-ASCII header: either way it says nothing usable, and the caller's
@@ -3906,6 +3938,31 @@ mod tests {
         probe
             .wait_for("the connections gauge to read 0", |t| {
                 t.gauge("logit.input.connections", &[]) == Some(0.0)
+            })
+            .await;
+    }
+
+    /// A sender whose request timeout fires while its write is parked on a full downstream closes
+    /// the connection, and hyper drops the handler before any response. The detached delivery
+    /// still sends the batch, so the write counts `ok` and its samples.
+    #[tokio::test]
+    async fn a_write_whose_sender_closes_while_parked_is_still_counted() {
+        let (addr, _running, mut rx, mut probe) =
+            shutdown_receiver(plaintext_shutdown_receiver()).await;
+        let client = park_a_write(&addr, &mut probe).await;
+
+        drop(client);
+        probe
+            .wait_for("the closed connection to end its task", |t| {
+                t.gauge("logit.input.connections", &[]) == Some(0.0)
+            })
+            .await;
+        test_util::recv_batch(&mut rx).await;
+        test_util::recv_batch(&mut rx).await;
+        probe
+            .wait_for("both writes counted ok, with their samples", |t| {
+                t.sum("logit.input.writes", &[("class", "ok")]) == 2.0
+                    && t.sum("logit.input.samples", &[]) == 2.0
             })
             .await;
     }

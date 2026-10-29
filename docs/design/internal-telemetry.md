@@ -1132,14 +1132,17 @@ would add one point per probe interval to this key forever.
 |---|---|---|---|
 | scrape | `logit.input.scrapes{class="2xx"\|"4xx"\|"5xx"\|"other"\|"network_error"\|"timeout"\|"parse_error"\|"oversize"}` | count | one per target per tick: the HTTP classes plus three ways a scrape fails before or after a status (`parse_error` is a 2xx body that wouldn't decode) |
 | scrape | `logit.input.scrape.duration` | timing | one per target per tick, recorded regardless of outcome |
-| bind | `logit.input.writes{class="ok"\|"not_found"\|"method"\|"unauthorized"\|"unsupported"\|"oversize"\|"timeout"\|"bad_request"\|"closed_consumer"}`, plus `encoding="snappy"\|"zstd"` on `class="ok"` | count | one per request, one class per row of the module doc's routes table. See below. |
-| bind | `logit.input.write.duration` | timing | one per request, every exit included, which is why the count and the timer live in one wrapper around the routing itself |
+| bind | `logit.input.writes{class="ok"\|"not_found"\|"method"\|"unauthorized"\|"unsupported"\|"oversize"\|"timeout"\|"bad_request"\|"closed_consumer"}`, plus `encoding="snappy"\|"zstd"` on `class="ok"` | count | one per request, one class per row of the module doc's routes table. A write that reaches delivery is counted on the delivery's task, so it counts even when its sender closed before the response. See below. |
+| bind | `logit.input.write.duration` | timing | one per request answered, every exit included, which is why the timer lives in one wrapper around the routing itself |
 | both | `logit.input.samples` | count | a different unit in each mode. See below. |
 
 These are this component's own spellings, not `otlp_in`'s, which counts only refused requests. In `logit.input.writes`:
 
 - `ok` carries the body's `encoding`, so a vmagent that stayed on its default zstd wire, rather
-  than downgrading to Snappy, reads as `encoding="zstd"`.
+  than downgrading to Snappy, reads as `encoding="zstd"`. It counts a delivered write whose
+  sender timed out waiting for the `204` too: the batch went out, and the sender's resend is the
+  ordinary at-least-once duplicate. So `ok` and `closed_consumer` sum to the listener's
+  `logit.component.batches.sent`.
 - `unauthorized` is a `401` from `bind_auth:`, checked before the body. It's also counted
   `logit.input.requests.rejected{reason="auth"}`, the spelling every listener that checks a
   credential shares.
