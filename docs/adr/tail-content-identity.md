@@ -182,8 +182,10 @@ reviewer can check.
    rejected one is never opened): one open, a read of at most 256 bytes for the head, one hash per
    distinct candidate head length, and a read of at most 256 bytes per distinct candidate offset
    whose head matches. An inode that waits pays it again at each scan, and a file opened empty pays
-   it once more, with an `fstat`, when a read first returns its bytes, and nothing beyond its read
-   while it stays empty; any other is opened in the scan that probed it and never probed again. What
+   it once more, with an `fstat`, when a read first returns its bytes. That read also builds the
+   drain's copy of the candidates, once per drain and shared by every claimable file the drain
+   reads, so a file pays nothing beyond its read while it stays empty; any other is opened in the
+   scan that probed it and never probed again. What
    it recovers:
 
    - a `copytruncate` copy under `app.log*` resumes at the original's offset instead of replaying
@@ -297,6 +299,10 @@ reviewer can check.
     `poll_interval` later, and up to `CLAIM_DEFER_SCANS` (2) more scans when that pass defers
     it, for a match that may still grow or a tracked file's match found before a truncation.
     One that matches nothing is read at once.
+  - A file opened empty is decided against the candidates as they stood when its drain began. A
+    tracked file that offered no candidate then (a head under 64 bytes, or a held reassembly)
+    and that a later pass of the same drain reads past that point isn't among them, so a copy of
+    it whose first bytes that drain reads is read from `0`, duplicating its lines.
   - A restored file that first appears empty and then fills is read from `0`, not claimed, and
     its entry's unread bytes are also counted `bytes.dropped{reason="gone"}`: the scan that
     opened the file empty pruned the entry, since no inode it found matched it, and the check a

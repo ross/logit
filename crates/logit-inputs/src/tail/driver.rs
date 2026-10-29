@@ -592,9 +592,12 @@ pub(crate) struct Tailer<D: TailDecoder, F: DecoderFactory<D>> {
     /// File watches `read_one` released with a compressed file, for the next `drain` or `scan`
     /// to remove: `read_one` has no `Watcher`.
     unwatch: Vec<super::watch::WatchId>,
-    /// The truncated and tracked files' candidates when the current drain began, while any file
-    /// is claimable ([`Tailer::claim_waits`]); empty otherwise.
-    claim_snapshot: Vec<OwnedCandidate>,
+    /// The truncated and tracked files' candidates, taken at the current drain's first non-empty
+    /// read of a claimable file ([`Tailer::claim_waits`]); `None` until then.
+    claim_snapshot: Option<Vec<OwnedCandidate>>,
+    /// How many times [`Tailer::claim_waits`] has built [`Tailer::claim_snapshot`].
+    #[cfg(test)]
+    snapshot_builds: usize,
     /// Inodes nothing names that `DecoderFactory::accept` took in this scan's first pass, so
     /// `open_tracked` doesn't ask again. Cleared at the end of `reconcile_all`.
     accepted: HashSet<FileId>,
@@ -651,7 +654,9 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
             skipped: HashMap::new(),
             unwatch: Vec::new(),
             accepted: HashSet::new(),
-            claim_snapshot: Vec::new(),
+            claim_snapshot: None,
+            #[cfg(test)]
+            snapshot_builds: 0,
             diag: Diagnostics::default(),
             telemetry: Telemetry::default(),
             watched_dirs: HashSet::new(),
@@ -1101,24 +1106,17 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
         }
     }
 
-    /// Takes [`Tailer::claim_snapshot`] at the start of a drain, while any file is claimable.
-    /// No syscall: the candidates are in memory.
-    fn snapshot_candidates(&mut self) {
-        self.claim_snapshot = if self.files.values().any(|f| f.claimable) {
-            self.read_candidates().iter().map(OwnedCandidate::from).collect()
-        } else {
-            Vec::new()
-        };
-    }
-
     /// Whether `read_one` leaves claimable file `id` unread for the next scan's claim pass, after
     /// a read returned its first `n` bytes: it's `Active`, and its bytes match, or may grow into,
     /// a candidate in [`Tailer::claim_snapshot`] (`docs/adr/tail-content-identity.md`, decision
     /// 5). It then seeks back to `0` and is marked `claim_pending`; otherwise it stops being
     /// claimable and the read goes on, so a rename rotation's new file, which matches nothing, is
-    /// read at once. Decided from the read, so a write landing just before it can't slip past,
-    /// and against the drain's snapshot, so what another file's read adds to the candidates
-    /// during the pass doesn't depend on the order the pass visits files in.
+    /// read at once. Decided from the read, so a write landing just before it can't slip past.
+    ///
+    /// The snapshot is built here, once per drain, so an empty claimable file costs nothing on a
+    /// wake that finds it still empty. `drain` visits claimable files first, so the snapshot
+    /// holds what the other files offered when the drain began, whatever order a pass visits
+    /// them in; what another file's read adds later in the drain isn't seen.
     async fn claim_waits(&mut self, id: FileId, n: usize) -> bool {
         let Some(tracked) = self.files.get_mut(&id) else { return false };
         if !tracked.claimable {
@@ -1126,10 +1124,23 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
         }
         tracked.claimable = false;
         tracked.claim_pending = false;
-        if tracked.state != FileState::Active || self.claim_snapshot.is_empty() {
+        if tracked.state != FileState::Active {
             // Draining: no scan will offer it a claim, so it's read.
             return false;
         }
+        if self.claim_snapshot.is_none() {
+            self.claim_snapshot =
+                Some(self.read_candidates().iter().map(OwnedCandidate::from).collect());
+            #[cfg(test)]
+            {
+                self.snapshot_builds += 1;
+            }
+        }
+        let snapshot = self.claim_snapshot.as_deref().unwrap_or_default();
+        if snapshot.is_empty() {
+            return false;
+        }
+        let Some(tracked) = self.files.get_mut(&id) else { return false };
         let len = match tracked.file.metadata().await {
             Ok(meta) => meta.len().max(n as u64),
             Err(_) => n as u64,
@@ -1137,8 +1148,7 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
         // Probed through the descriptor: the path may name another inode since the last scan.
         let Ok(file) = tracked.file.try_clone().await else { return false };
         let file = file.into_std().await;
-        let candidates: Vec<Candidate<'_>> =
-            self.claim_snapshot.iter().map(OwnedCandidate::borrow).collect();
+        let candidates: Vec<Candidate<'_>> = snapshot.iter().map(OwnedCandidate::borrow).collect();
         let wait = probe_file(&file, &tracked.path, len, &candidates)
             .is_ok_and(|verdicts| verdicts.iter().any(|v| *v != Verdict::No));
         if !wait {
@@ -2187,7 +2197,7 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
         watcher: &mut super::watch::Watcher,
         due: tokio::time::Instant,
     ) -> DrainEnd {
-        self.snapshot_candidates();
+        self.claim_snapshot = None;
         loop {
             if self.untaken {
                 return DrainEnd::Untaken;
@@ -2198,7 +2208,9 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
             let mut ids = std::mem::take(&mut self.pass_ids);
             let mut at_eof = std::mem::take(&mut self.pass_at_eof);
             ids.clear();
-            ids.extend(self.files.keys().copied());
+            // Claimable files first: see `claim_waits`.
+            ids.extend(self.files.iter().filter(|(_, f)| f.claimable).map(|(id, _)| *id));
+            ids.extend(self.files.iter().filter(|(_, f)| !f.claimable).map(|(id, _)| *id));
             at_eof.clear();
             let (any_progress, stopped) = self.read_pass(&ids, &mut at_eof, sink, shutdown).await;
             self.release_watches(watcher);
@@ -7365,6 +7377,35 @@ mod tests {
             assert_eq!(truncated_drops(&mut probe), (0.0, 0.0));
             std::fs::remove_dir_all(&dir).ok();
         }
+    }
+
+    /// A claimable file that stays empty costs a drain no candidate snapshot: it's built at the
+    /// drain's first read that returns a claimable file's bytes, once.
+    #[tokio::test]
+    async fn an_empty_claimable_file_builds_no_candidate_snapshot() {
+        let dir = scratch_dir("claim-snapshot-lazy");
+        let (path, copy, other) =
+            (dir.join("app.log"), dir.join("app.log.1"), dir.join("app.log.2"));
+        std::fs::write(&path, format!("{}\n{}\n", long_line("one"), long_line("two"))).unwrap();
+        let mut tailer = Tailer::new(
+            vec![PathPattern::new(dir.join("app.log*"))],
+            LineFactory,
+            fast_config(ReadFrom::Beginning),
+        );
+        assert_eq!(tick(&mut tailer, true).await.len(), 2);
+        std::fs::File::create_new(&copy).unwrap();
+        std::fs::File::create_new(&other).unwrap();
+        assert!(tick(&mut tailer, false).await.is_empty());
+        for _ in 0..3 {
+            append(&path, format!("{}\n", long_line("more")).as_bytes());
+            assert_eq!(read_out(&mut tailer).await.len(), 1);
+        }
+        assert_eq!(tailer.snapshot_builds, 0, "no drain built one while both stayed empty");
+        std::fs::copy(&path, &copy).unwrap();
+        std::fs::copy(&path, &other).unwrap();
+        assert!(read_out(&mut tailer).await.is_empty(), "both left for the scan");
+        assert_eq!(tailer.snapshot_builds, 1, "built once for both");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// A claimable file a read leaves for the scan goes back to `0`: renamed out of every pattern
