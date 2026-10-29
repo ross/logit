@@ -1127,7 +1127,11 @@ An in-memory queue is lost on a restart, a `SIGKILL`, or a shutdown grace that e
 To keep it, add a `buffer.disk:` block, which replaces that sink's queue with a crash-recoverable
 spool on disk ([ADR `disk-backed-sink-buffer`](adr/disk-backed-sink-buffer.md)). A restart resumes
 delivery from the last persisted read cursor and replays at most the batches committed since the
-last checkpoint: at-least-once, the same trade `tail_in`'s checkpoint makes.
+last checkpoint: at-least-once, the same trade `tail_in`'s checkpoint makes. A `tail_in` or
+`docker_in` upstream needs one on each of its sinks to survive a clean restart without loss,
+because its checkpoint covers what reached its downstream inboxes, not what a sink delivered. A
+crash still loses checkpointed lines that hadn't reached a spool (see
+[Tailing files and Docker logs](#tailing-files-and-docker-logs)).
 
 **A crash replays a window, under either posture.** After a crash, the spool replays the batches
 that were in flight and every batch committed since the last cursor write. The cursor is written
@@ -2538,6 +2542,20 @@ tracked files, and a pass reads at most 64 KiB per file, so a crash then replays
 at-least-once boundary, the same trade `buffer:`'s sink-side retry makes: it bounds how much a
 crash can replay, and replay is always safe.
 
+**A tail source whose clean restart must not lose lines needs a `buffer.disk:` sink.** The
+checkpoint covers the lines handed to the tail source's downstream inboxes, not the lines a sink
+delivered. A sink with an in-memory queue that's still holding them when its
+`buffer.shutdown_grace` runs out drops them, counted
+`logit.component.batches.dropped{reason="shutdown"}`, and the restart resumes past them. Give
+every sink downstream of the tail source a `buffer.disk:` block (see
+[Durable buffering](#durable-buffering)): its spool keeps those batches across the restart.
+
+A spool doesn't make a crash lossless. A crash loses every line the last checkpoint covers that
+hadn't reached a sink's spool: lines in a transform's inbox, on an edge between components, or in
+an `aggregate` window. `logit` doesn't hold the checkpoint back until a sink delivers, because a
+stage such as `aggregate` emits batches that match no input batch
+([ADR `tail-content-identity`](adr/tail-content-identity.md), decision 1).
+
 **A file gone at a restart is counted as far as the checkpoint knew.** Each checkpoint entry
 records the file's length as `tail_in` last saw it. If a restart finds an entry's file under no
 path, because it was removed or renamed out of every pattern before `logit` read it to its end, it
@@ -2656,9 +2674,9 @@ see [ADR
 - `logit.input.files.skipped{reason="compressed"}` and
   `logit.component.diagnostics{key="compressed"}` (counts): a matched file that starts with a gzip,
   zstd, xz, or bzip2 header, which `logit` closes without reading a line of it, counted once per
-  file per process, however often a scan finds it, renamed or not. It isn't loss: under a pattern like `app.log*`,
-  the compressed rotation's content was read under its uncompressed name before the rotator
-  compressed it. `logit` never decompresses a file. If a compressed file is the only copy of what
+  file per process, however often a scan finds it, renamed or not. It isn't loss: under a pattern
+  like `app.log*`, the compressed rotation's content was read under its uncompressed name before
+  the rotator compressed it. `logit` never decompresses a file. If a compressed file is the only copy of what
   you need, decompress it to a path a pattern matches.
 - `logit.component.diagnostics{key="metadata_error"}` (`docker_in` only): a container's
   `config.v2.json` couldn't be read or parsed. That container's lines still flow, with a
@@ -2676,15 +2694,23 @@ see [ADR
 **Rotation.** Prefer rotating by rename (logrotate's `create` mode) over `copytruncate`. With
 `copytruncate`, don't use a pattern that matches the rotated names: `app.log*` reads every
 `copytruncate` copy from its beginning, re-emitting the whole file each rotation. Under
-`compress`, a pattern that matches the rotated names is safe: each `.gz` is skipped and counted
-`files.skipped{reason="compressed"}`. With an exact pattern (`app.log`), the writer must reopen its
-file on HUP within one `poll_interval` of the rename: the renamed file is read until it reaches its
-end at least one `poll_interval` after `logit` saw the rotation, and what the writer appends to it
-after that is lost. `copytruncate` under an exact pattern loses what was written after the last
-read and before the truncate, by design (ADR `tail-content-identity`): `logit` counts the
-truncation in `files.truncated` and the bytes it saw unread in
-`bytes.dropped{reason="truncated"}`, but doesn't follow the copy. To keep those lines, rotate by
-rename, or match the copy too and accept its replay.
+`compress`, a pattern that matches the rotated names is safe: each compressed file is skipped and
+counted `files.skipped{reason="compressed"}`
+([ADR `tail-content-identity`](adr/tail-content-identity.md), decision 2). With an exact pattern
+(`app.log`), the writer must reopen its file on HUP within one `poll_interval` of the rename: the
+renamed file is read until it reaches its end at least one `poll_interval` after `logit` saw the
+rotation, and what the writer appends to it after that is lost. `copytruncate` under an exact
+pattern loses what was written after the last read and before the truncate, a decided limit
+(decision 7 of the same ADR): `logit` counts the truncation in `files.truncated` and the bytes it
+saw unread in `bytes.dropped{reason="truncated"}`, but doesn't follow the copy. To keep those
+lines, rotate by rename.
+
+A `copytruncate` that the writer refills past `logit`'s read offset before the next size check (one
+`poll_interval`, or one wake) isn't detected while `logit` runs: it reads on from the old offset,
+and the refilled bytes before that offset aren't emitted. A restart catches it and replays the
+file, unless the refilled file starts with the same bytes `logit` recorded from the old file's head
+(up to 256), in which case those skipped bytes are lost. Rotating by rename has no such window
+([ADR `tail-content-identity`](adr/tail-content-identity.md), decision 8).
 
 ## Named time zones
 

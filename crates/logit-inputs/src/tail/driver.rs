@@ -1080,7 +1080,8 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
     /// offset. `scan` runs it for every `Draining` file, and `drain` before each read of one, since
     /// the drain loop runs far more often than `scan` and a refill past the offset before the
     /// first check is the one truncation size-based detection can't see
-    /// (`docs/known-gaps/tailing.md`). An `fstat` error says nothing; a later check decides.
+    /// (`docs/adr/tail-content-identity.md`, decision 8). An `fstat` error says nothing; a later
+    /// check decides.
     async fn recheck_length(&mut self, id: FileId) {
         let Some(tracked) = self.files.get(&id) else { return };
         let Ok(meta) = tracked.file.metadata().await else { return };
@@ -5959,7 +5960,8 @@ mod tests {
 
     /// A draining file truncated in place is checked by `drain` before each read, so a refill
     /// past the old offset after that check, but before any scan rebinds the file, is still read
-    /// from `0`. Only a refill before the first check goes unseen (`docs/known-gaps/tailing.md`).
+    /// from `0`. Only a refill before the first check goes unseen
+    /// (`docs/adr/tail-content-identity.md`, decision 8).
     #[tokio::test]
     async fn a_draining_inode_truncated_and_refilled_before_its_rebind_is_read_from_zero() {
         let dir = scratch_dir("draining-truncated-refilled");
