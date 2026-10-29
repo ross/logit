@@ -1,0 +1,26 @@
+# The system under test in `script/soak`'s datadog-ingress scenario: Datadog series over HTTP,
+# a 500 ms cumulative aggregate of their counts, and remote-write 1.0 (zstd) to VictoriaMetrics
+# behind a two-batch blocking queue. Its `internal` telemetry goes to stdout as NDJSON for the
+# harness to read; `script/soak` runs it with `--log-format json`.
+admin: { bind: 127.0.0.1:9600 }     # the image HEALTHCHECK's probe address
+components:
+  datadog:
+    # One batch per series request, one event per point; 503 after 5 s busy, with nothing taken.
+    type: datadog_in
+    bind: 0.0.0.0:8080
+  window:
+    # Each point is a delta count of 1, so the cumulative total counts the points.
+    type: aggregate
+    sources: [datadog]
+    interval: 500ms                 # one batch per window, so a backend stop backs up in seconds
+    temporality: cumulative
+    series_retention: 7200          # an hour of windows: a fault must never evict a series
+  victoria_metrics:
+    type: prometheus_out
+    sources: [window]
+    endpoint: http://victoria-metrics:8428/api/v1/write
+    version: 1
+    compression: zstd
+    buffer: { max_batches: 2 }      # overflow: block, the default
+  self: { type: internal, interval: 5s, span_sample_rate: 0.0, logs: off }
+  telemetry: { type: stdio_out, sources: [self], format: json }

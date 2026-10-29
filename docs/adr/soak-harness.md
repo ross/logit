@@ -1,6 +1,6 @@
 ---
 created: 2026-10-08
-updated: 2026-10-25
+updated: 2026-10-29
 ---
 
 # A soak harness: real containers over ordinary config, one-shot netem, and a reset-aware ledger as the loss oracle
@@ -577,3 +577,153 @@ Re-scored, the failed run PASSes with 90 of loss judged against 650, and the pas
 96 as before. A backend stop still opens no judged HTTP window: whether it reaches the wire
 depends on the listener (`otlp_in` holds a request past the writer's timeout, `influxdb_in`
 answers a busy `503`), so its resends' surplus counts 0 as steady state's does.
+
+## Amendment: a merge is credited back as delivered, and a keyed discard is judged by absence (2026-10-29)
+
+Two transforms in the path need rules a counted discard doesn't give.
+
+- **A merge is no loss.** `dedup_timestamps` folds a series' records of one timestamp bucket
+  into one record carrying their sum, counts each folded record in
+  `logit.transform.metrics.merged` (M), and counts an event it leaves with nothing in
+  `events.discarded`. Under the discard amendment above, the ledger would read each merge as
+  counted loss and V, which holds the folded increments, as a surplus of M. A source now names
+  such a node in `merge`. `ledger.edge` still judges its discards as for any node, and holds
+  them to M, which is exact while each event carries one record, as a statsd line does. Every
+  later row credits M back: Ab + M wherever it reads `aggregate`'s Ab, and ΣT_disc − M wherever
+  it subtracts the discards. The node's `logit.transform.metrics.absorbed`, a superseded gauge
+  or cumulative reading, loses that reading's value, so `ledger.edge` requires it to stay 0 in
+  every life a kill didn't end. The declaration is per node, and `load()` takes only a
+  `dedup_timestamps` there, so the credit applies only where a merge is known to carry its
+  value.
+- **A keyed discard is judged by what never arrives.** `sample`'s discards balance under the
+  discard amendment, but a balanced count can't tell a stable verdict from one that changed
+  across a restart: a life that kept the wrong half would still balance. A sink may name a
+  `vm_absent_selector`, exported beside its `vm_selector` at the end, and `ledger.absent` FAILs
+  any series it matches, from any SUT life, and an export that failed or never ran. The kept set
+  is computed before the run from the frozen hash (`soaklib/sampling.py`, an XXH64 checked
+  against xxHash's published vectors and `logit_core::sampling`'s pinned ones), so a scenario
+  states it in its selectors rather than learning it from the run.
+
+[`docs/plans/soak-harness.md`](../plans/soak-harness.md), item 19 of "10. Next scenarios", has
+the scenarios that use them.
+
+## Amendment: a delta transform's value is judged beside its points (2026-10-29)
+
+A `cumulative_to_delta` node's point counts can balance while its values don't: a delta that
+leaves a series' baseline wrong carries the wrong value in a point the count rows accept. So a
+scenario that names the node in `[ledger] sut_delta` gains `ledger.value`, which holds the sum
+of the deltas a Datadog-shaped stand-in stored, V, to the increments the generator's
+`generate_in` sent less its counted drops, I.
+
+- **The record holds the values a cue loses.** A `rejected` step and a `202` naming
+  `series_errors` lose deltas the sink counts only as records, and the transform has already
+  moved its baseline past them. The stand-in records every request body, so the row reads each
+  never-stored point whose last request drew one of those answers, U, and judges I − V − U
+  exactly. Reporting those cues instead, as first planned, would excuse whatever else their
+  windows lost.
+- **A first point the transform skips is reported inside a bound.** Under `initial_value: auto`
+  the transform skips a series' first point after its start, a restart, or an idle eviction,
+  and no counter gives that point's value. Each drain that counts `skipped{reason="initial"}`
+  or `series.evicted` opens a window back to the node's previous receiving drain. Each window
+  is bounded alone by what it can lose: its skipped series times one generator window of one
+  series' increments, plus one window of every series as slack. It widens to its span's
+  increments only when the generator's sink counted a drop in it, which moves the first point
+  the SUT sees further on. After a kill, which loses the deltas the SUT's sink still held, the
+  window adds the points that killed life lost, its Ab − V, each up to the largest stored delta,
+  rather than widening: a kill's span holds its whole outage, which would excuse a loss
+  anywhere in it. The gap is reported if it fits the sum of the windows' bounds, and FAILs past
+  it. Bounding the windows' whole spans instead, a first version did, let a loss of 13% of the
+  run's increments outside every window pass on the first run: the windows bound the loss they
+  explain, and excuse none elsewhere.
+- **The count rows judge points with the node in `aggregate`'s place.** Ab is its
+  `events.sent`, its skipped points leave every row as a transform's counted discards do, and V
+  is the stand-in's distinct points, each credited to the life its request arrived in, because a
+  point's timestamp is the generator's window and can precede the SUT life that sent it.
+
+- **Two values at one second under the `datadog` shape are a WARN, not a changed resend.**
+  `datadog_out` re-encodes a resend's points unchanged, so a second value of one series in one
+  second is a second point its whole-second timestamps merged, sent in another request. The
+  first run met one when the generator's `aggregate` flushed a partial window on shutdown.
+  Datadog keeps the later, an uncounted loss
+  [`docs/known-gaps/datadog.md`](../known-gaps/datadog.md) lists, so `ledger.standin` reports it
+  rather than failing every run whose generator restarts at the wrong phase.
+
+The node replaces `sut_aggregate` rather than sitting beside one, since an `aggregate` after it
+would resum the deltas the row judges. [`docs/plans/soak-harness.md`](../plans/soak-harness.md),
+"10. Next scenarios", item 20, has the rules.
+
+## Amendment: three more HTTP listeners, and an acknowledgment timeout allows a resend (2026-10-29)
+
+The HTTP wire follows `splunk_hec_in`, `datadog_in`, and `prometheus_in`'s remote-write
+receiver, from `splunk_hec_out`, `datadog_out`, and `prometheus_out`. `splunk_hec_in` and
+`datadog_in` count requests and answer busy as `influxdb_in` does, so `ledger.intake` holds them
+to its two identities on their write routes. `prometheus_in` counts `logit.input.writes{class}`,
+with no `route` tag, and never answers busy, so it holds only the first. It has no `transport:`,
+so its wire is keyed on the mode its config sets: `bind:` is the receiver, and
+`scrape_targets:` the scrape wire, the next amendment.
+
+- **An acknowledgment timeout allows one batch of surplus, as a transport error does.**
+  `splunk_hec_out` under `ack: true` counts a batch delivered only once `/ack` answers every id
+  of it, and resends the whole batch once `ack_timeout` passes. `splunk_hec_in` keeps its ack
+  ledger in memory, so a restart forgets ids it issued for bodies it had already delivered, and
+  the resend puts each such batch in W a second time. Each id counted
+  `logit.output.acks{result="timeout"}` allows one batch, an upper bound because one batch can
+  hold several ids. A poll the writer counts under `route="ack"` sends no data, so a poll that
+  fails in transport allows none.
+- **A judged run's trailing edge allows the batches the writer read in flight there.** The
+  listener counts a batch in W before the writer reads its answer, and under `ack: true` before
+  its acknowledgment arrives, half a second or more later. So a writer at `concurrency: 8`
+  holds batches in W and not in G at any edge, and the lag drifts by up to that many between
+  drains. `splunk-hec-ingress`'s first run FAILed a SUT restart's window, beside a reported
+  kill, by 930 points against 700 allowed with nothing lost. The surplus lag leaves in a run is
+  its lag at the end less its lag at the start, so a judged run's trailing edge now allows
+  `max(1, in_flight)` batches, `in_flight` being the higher of the writer's
+  `logit.output.in_flight` readings at the two generator drains straddling it, whatever the
+  neighbour, and its leading edge one batch. Three other forms were rejected. The writer's
+  `concurrency:` on every edge passes a loss of 300 beside 1,000 duplicates in one judged run
+  where nothing was in flight. The reading on both edges passes 1,500 unexplained with 8 in
+  flight at each. `concurrency:` only at a trailing edge beside a reported run FAILed the
+  rerun's generator-netem window on lag alone: a steady neighbour's own drift hid the opposite
+  sign `_boundary_nets` nets. The gauge measures the batches at the edge that backs a surplus,
+  so it covers the drift and widens nothing it didn't see.
+
+## Amendment: a scrape wire judges increments per generator life (2026-10-29)
+
+`prometheus_in` scraping a generator's `prometheus_out` exposition is a fifth wire, `scrape`,
+judged in value: per generator life, G, the increments its `generate_in` sent less what its
+components before the sink dropped, against V, the stored counters' reset-aware total in that
+life.
+
+A pull carries running totals, not lines. A sample is a series' total at the scrape, so there
+is no count of lines on either side to compare, and the generator's `aggregate` exports no
+per-series total to read G from. The increments are the one quantity both ends hold: the
+generator counts them as it generates, and the backend's reset-aware total sums them back. A
+failed, timed-out, or skipped scrape loses no increment, since the next one reads the total
+that includes it, so the only loss is intermediate values, and no fault window excuses
+anything.
+
+- **V splits at the generator's lives, not the SUT's.** A generator restart resets its totals,
+  which the backend records as a counter reset, and a SUT restart doesn't reset them. So each
+  sample is credited by its scrape time to the generator life in force, and a SUT restart
+  splits nothing.
+- **Each generator life has an end band.** The increments after a life's last scrape never
+  reach a scrape: up to one scrape `interval`, plus one generator `aggregate` window, since the
+  scraped totals lag the generation by up to a window, plus one generator drain interval as
+  slack. A life the end sequence stops exports all its counts, so its G − V can't go below 0;
+  a killed life's last drain interval of counts is never exported, so G can fall short of the
+  increments V holds by one drain interval of them. A life outside its band FAILs, a surplus
+  below it and lost increments above it.
+- **A kill on the generator is allowed on this wire alone.** Elsewhere a generator killed
+  after its last drain has sent lines with no G behind them. A scrape target sends nothing; a
+  kill only ends a life early, which its end band covers.
+- **The count rows judge samples.** W is the listener's `logit.input.samples`, which leaves out
+  the three synthetic samples each scrape appends, `up`, `scrape_duration_seconds`, and
+  `scrape_samples_scraped`, failures included. They are Y, three per scrape, so the listener
+  balances W + Y − D == E + B, and the sink's `vm_selector` leaves them out too, so the
+  distinct stored samples per SUT life are judged against W − X. The rows that read an
+  `aggregate` SKIP: the SUT relays samples and has none, and a node between the listener and
+  the sink could change the values the wire judges, so `load()` refuses `sut_transforms` and
+  every `[ledger]` key that names such a node.
+
+[`docs/plans/soak-harness.md`](../plans/soak-harness.md), "10. Next scenarios", item 22, has the
+scenario.

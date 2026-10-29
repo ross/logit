@@ -42,7 +42,8 @@ needs at the code:
   `[[ledger.sink]]` sinks, once their stored totals hold or their queues are empty.
 - Every `backend` service has its own published port, re-read after any revert of a fault on
   it. Freshness is sampled per `[[ledger.sink]]`, the end sequence waits until every sink's stored
-  total holds, and each sink's export lands in `vm-export/<sink>.jsonl`.
+  total holds, and each sink's export lands in `vm-export/<sink>.jsonl`, and what its
+  `vm_absent_selector` matches, if it has one, in `vm-export/<sink>.absent.jsonl`.
 - An external target (`[target] kind = "external"`) runs without the `local` compose profile,
   so with no backend. It passes compose a second `--env-file`: a plain `KEY=value` copy of the
   variables `SOAK_EXTERNAL_ENV` sets for the target, in a private temporary directory outside
@@ -791,7 +792,22 @@ class Run:
             except (vm.VmError, TypeError) as err:
                 export_path.write_text("")
                 self.phase("vm_export_failed", sink=sink["id"], error=str(err))
+            if sink.get("vm_absent_selector"):
+                self.export_absent(export_dir, sink, base)
         self.phase("end_end")
+
+    def export_absent(self, export_dir, sink, base):
+        """Exports what `sink`'s `vm_absent_selector` matches into
+        `vm-export/<sink>.absent.jsonl`, which `ledger.absent` requires to hold no series. The
+        phase records the export, so the check tells an empty one from one that never ran."""
+        path = export_dir / f"{sink['id']}{checks.ABSENT_SUFFIX}"
+        try:
+            text = vm.export_raw(base, sink["vm_absent_selector"], 0, timeout=120)
+            path.write_text(text)
+            self.phase("vm_absent_exported", sink=sink["id"], series=len(vm.parse_export(text)))
+        except (vm.VmError, TypeError) as err:
+            path.write_text("")
+            self.phase("vm_absent_export_failed", sink=sink["id"], error=str(err))
 
     def read_topic(self):
         """Reads the Kafka target's topic back from the broker after the SUT stopped: each
