@@ -375,8 +375,9 @@ pub(crate) struct Tailer<D: TailDecoder, F: DecoderFactory<D>> {
     /// prune instead, a process that ended before that write would leave the entry on disk, and
     /// the next process would count the same bytes again.
     gone: Vec<Gone>,
-    /// Each compressed inode found, so a scan neither reopens nor recounts it
-    /// ([`Tailer::still_skipped`]). Keyed by inode so a rename (`.1.gz` to `.2.gz`) isn't
+    /// Each compressed inode found, so it's never counted again. A scan leaves it closed while
+    /// its path and size are unchanged, and sniffs it again, uncounted, after a rename or a size
+    /// change ([`Tailer::still_skipped`]). Keyed by inode so a rename (`.1.gz` to `.2.gz`) isn't
     /// counted again. A scan forgets an entry whose inode it found under no path, once its path
     /// is listed ([`Tailer::prune_skipped`]).
     skipped: HashMap<FileId, Skipped>,
