@@ -939,8 +939,13 @@ def from_dict(raw, path):
         if overlap is None:
             problems += _hop_problems(ledger, extra_suts)
             problems += _relay_problems(ledger, extra_suts, target["kind"])
-        elif isinstance(configs, dict):
-            problems += _overlap_problems(overlap, ledger, configs, extra_suts, path.parent)
+        else:
+            if _relays(ledger):
+                problems.append("[overlap] can't be combined with a sink's `relay`: each "
+                                "overlap instance runs the whole pipeline")
+            if isinstance(configs, dict):
+                problems += _overlap_problems(overlap, ledger, configs, extra_suts,
+                                              path.parent)
         if overlap is not None and ledger.get("split") == TARGET_SPLIT:
             problems.append("[overlap] can't be combined with split = \"target\"")
 

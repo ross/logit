@@ -7868,6 +7868,11 @@ def _relay_rules(root):
     ext["ledger"]["sink"][0]["relay"] = "collector"
     _refused(ext_path, ext, "`relay` carries a sink's writes to a backend, and the external "
              "target has none", "a relay to an external target")
+    over_path = root / "scenarios" / "rolling-overlap" / "scenario.toml"
+    over = tomllib.loads(over_path.read_text())
+    over["ledger"]["sink"][0]["relay"] = "logit-b"
+    _refused(over_path, over, "[overlap] can't be combined with a sink's `relay`",
+             "a relay under [overlap]", roles=OVERLAP_ROLES)
 
 
 def _relay_driver(root):
