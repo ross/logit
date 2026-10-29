@@ -891,8 +891,10 @@ them, and neither side counts the loss
 ([ADR `delivery-semantics`](adr/delivery-semantics.md), item 6). The posture can't help: no
 fault reaches the sink for those bytes. Where a lost tail matters, use a protocol with an
 acknowledgment: the native hop (`logit_out` to `logit_in`), or an HTTP sink whose destination
-answers after it holds the batch. Smaller socket buffers on both ends (`net.ipv4.tcp_wmem` on
-the sender, `net.ipv4.tcp_rmem` on the receiver) narrow the window, at a throughput cost.
+answers after it holds the batch. Smaller socket buffers narrow the window, at a throughput
+cost. Over TCP and TLS they're `net.ipv4.tcp_wmem` on the sender and `net.ipv4.tcp_rmem` on the
+receiver. Those settings cover TCP sockets only: a Unix stream's buffer is the sending socket's
+`SO_SNDBUF`, which defaults to `net.core.wmem_default`.
 
 ### Sink failure semantics
 
