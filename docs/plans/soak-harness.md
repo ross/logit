@@ -2294,8 +2294,10 @@ where it needs them, and a small check extension.
    `logit.internal.spans.dropped{reason="buffer_full"}` and a killed life's last drain interval
    of spans.
 8. **TCP ingress (built in W11a).** `statsd_in` with `transport: tcp` from the generator's
-   `statsd_out` over TCP; a `syslog_in` TCP source is item 24, and a TCP reset counter item 23. A
-   stalled SUT backs up into the sender
+   `statsd_out` over TCP; a `syslog_in` TCP source is item 24. The SUT's listener counts a reset
+   after a connection's first payload byte as `logit.input.connections.closed{reason="reset"}`
+   (item 23), so an `[[expect]]` can bound the resets a fault causes; a reset before the first
+   byte isn't counted. A stalled SUT backs up into the sender
    ([ADR `syslog-tcp-ingress-and-tls`](../adr/syslog-tcp-ingress-and-tls.md), "No receive queue on
    TCP -- the connection itself is the backpressure"): the SUT's kernel keeps ACKing until its
    receive buffer fills, then the generator's write makes no progress for `connect_timeout`.
@@ -2659,15 +2661,17 @@ under "Deferred to a later round" wait.
     forgets its series; a generator kill, whose counter reset `prometheus_in` passes on and
     VictoriaMetrics' totals absorb; and a generator slowed past the scrape `timeout`. Rows:
     `[[expect]]` on `logit.input.scrapes{class}`.
-23. **A TCP reset counter (W26, product, decided with Ross).** A reset after a stream
-    connection's first byte is only a throttled `connection_error` diagnostic today, and one
-    before it is silent (`docs/design/internal-telemetry.md`'s `connection_error` key). W26 adds
-    a counter on the shared TCP driver, `crates/logit-inputs/src/tcp.rs`, such as a
-    `reason="reset"` on `logit.input.connections.closed`, named against
-    [internal-telemetry.md](../design/internal-telemetry.md)'s loss vocabulary. It isn't
-    `*.dropped`: a partial frame lost to a reset is already
-    `logit.input.frames.dropped{reason="truncated"}`. Its own PR, ahead of item 24, which
-    asserts on it; it updates `internal-telemetry.md` and item 8.
+23. **A TCP reset counter (built in W26, product, decided with Ross).** The shared TCP driver,
+    `crates/logit-inputs/src/tcp.rs`, counts a reset (`ECONNRESET`) after a stream connection's
+    first payload byte as `logit.input.connections.closed{reason="reset"}`, beside the throttled
+    `connection_error` diagnostic it already reported. A reset before the first byte stays
+    uncounted, since a load balancer's health check ends that way. It isn't `*.dropped`: a
+    partial frame lost to a reset is already `logit.input.frames.dropped{reason="truncated"}`
+    ([internal-telemetry.md](../design/internal-telemetry.md)'s loss vocabulary). It covers
+    plaintext and TLS on `syslog_in`, `statsd_in`, `graphite_in`, and `lines_in`; their Unix
+    stream sockets share the code but don't count one in practice, because the driver never
+    writes to a peer ([ADR `idle-connection-timeout`](../adr/idle-connection-timeout.md)'s
+    "Amendment: a reset is a third reason on the stream driver"). Item 24 asserts on it.
 24. **`syslog_in` over TCP and TLS (W27).** Generator `syslog_out` over TCP, then over TLS from
     the run's private CA (item 12's `[tls]` table and `rotate` action) → SUT `syslog_in`
     (`transport: tcp`) → `kv` → `kv_metrics` → `aggregate`, on the `tcp` wire, framed by octet

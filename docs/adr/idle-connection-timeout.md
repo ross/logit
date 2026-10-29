@@ -1,6 +1,6 @@
 ---
 created: 2026-09-14
-updated: 2026-10-25
+updated: 2026-10-29
 ---
 
 # Idle-connection timeouts on TCP listeners: an opt-in `idle_timeout`, a next-byte deadline, and a client-side pooled-connection probe
@@ -447,3 +447,30 @@ never completes. A reviewer can answer each decision below yes or no.
   code PRs file it as a follow-up in [`docs/known-gaps/intake.md`](../known-gaps/intake.md).
 - Every new `select!` or `timeout` this work adds gets a row in the "Cancellation points" table of
   [`docs/design/pipeline-graph.md`](../design/pipeline-graph.md), in the PR that adds it.
+
+## Amendment: a reset is a third reason on the stream driver (2026-10-29)
+
+The shared TCP stream driver (`crates/logit-inputs/src/tcp.rs`) counts a connection reset after
+its first payload byte as `logit.input.connections.closed{reason="reset"}`. Before this, that
+reset was only a throttled `connection_error` diagnostic, so a soak run or an operator couldn't
+assert how often peers broke connections. Each decision below is a yes or no:
+
+1. **It's a reason on `connections.closed`, not a new metric.** The counter now says how a
+   connection ended, by reason. `idle` and `shutdown` are policy closes; `reset` is a peer's
+   fault. "An idle close is policy, not a fault" above still holds for `idle`.
+2. **It isn't `*.dropped`.** A reset loses data only when it cuts off a partial frame, and that
+   frame is already counted `logit.input.frames.dropped{reason="truncated"}`. A reset between
+   frames loses nothing the driver read
+   ([ADR `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md)).
+3. **A reset before the first payload byte stays uncounted.** A load balancer ends a health check
+   that way, so counting it would add one point per probe interval forever. A PROXY header
+   isn't a payload byte.
+4. **The diagnostic stays.** A counted reset still reports `connection_error`, which carries the
+   error text the counter can't.
+5. **Only `ECONNRESET` counts.** A TLS session that ends without `close_notify`, a reset during
+   the TLS handshake, and any other I/O error stay `connection_error` alone.
+6. **The Unix stream path shares the code but doesn't count one in practice.** Linux resets a
+   Unix stream peer only when the other end closes with bytes it hasn't read, and the driver
+   never writes to a peer.
+
+The HTTP listeners and `logit_in` don't count `reset`.

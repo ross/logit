@@ -4745,7 +4745,9 @@ listener"](#idle_timeout-on-a-tcp-listener) above.
   connections are counted the same way, since both take the same connect path.
 - `syslog_in`: `logit.input.connections` (a gauge that should match the number of connected
   `syslog_out` peers) and `logit.input.connections.rejected{reason="limit"}` (nonzero means the
-  `max_connections` cap is binding).
+  `max_connections` cap is binding), and `logit.input.connections.closed{reason="reset"}`, a
+  peer that reset its connection after sending data. A reset that cut off a partial frame is also
+  counted `frames.dropped{reason="truncated"}`.
 - Both: a handshake failure, a framing violation, or an oversize or malformed frame surfaces through
   `logit.component.diagnostics{key="connection_error"|"framing_error"}` and
   `logit.input.frames.dropped{reason="oversize"|"malformed"|"truncated"}`. There is no separate
